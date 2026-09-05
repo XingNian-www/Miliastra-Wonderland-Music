@@ -39,6 +39,10 @@ impl<W: WallClock + ?Sized> WallClock for Arc<W> {
     fn unix_seconds(&self) -> u64 {
         W::unix_seconds(self)
     }
+
+    fn unix_millis(&self) -> u64 {
+        W::unix_millis(self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -223,12 +227,13 @@ mod tests {
     }
 
     #[test]
-    fn manual_wall_clock_preserves_subsecond_metadata() {
+    fn shared_wall_clock_preserves_millisecond_precision() {
         let clock = ManualClock::with_unix_seconds(Instant::now(), 100);
+        let shared: Arc<dyn WallClock> = Arc::new(clock.clone());
 
         clock.advance(Duration::from_millis(1_500)).unwrap();
 
-        assert_eq!(clock.unix_millis(), 101_500);
-        assert_eq!(clock.unix_seconds(), 101);
+        assert_eq!(shared.unix_seconds(), 101);
+        assert_eq!(shared.unix_millis(), 101_500);
     }
 }

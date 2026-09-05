@@ -24,8 +24,6 @@ use crate::features::song_request::{SongCommand, SongSource};
 use crate::features::turtle_soup::TurtleSoupCommand;
 #[cfg(test)]
 use crate::features::undercover::UndercoverCommand;
-#[cfg(test)]
-use std::collections::HashMap;
 
 mod router;
 
@@ -147,26 +145,6 @@ impl ConsoleCommandIntent {
     }
 }
 
-#[derive(Clone, Debug)]
-#[cfg(test)]
-struct CommandLock {
-    command: RoutedCommand,
-}
-
-#[derive(Default, Debug)]
-#[cfg(test)]
-pub struct CommandLockState {
-    locks: HashMap<String, CommandLock>,
-}
-
-#[derive(Default, Debug)]
-#[cfg(test)]
-pub struct LockUpdate {
-    pub accepted: Vec<PendingCommand>,
-    pub skipped: Vec<String>,
-    pub unlocked: Vec<String>,
-}
-
 fn extract_bracket_username(text: &str) -> Option<String> {
     let (start, close) = if let Some(start) = text.find('[') {
         (start, ']')
@@ -182,64 +160,6 @@ fn extract_bracket_username(text: &str) -> Option<String> {
     }
 }
 
-#[cfg(test)]
-impl CommandLockState {
-    pub fn update(
-        &mut self,
-        visible_commands: &[RoutedCommand],
-        command_executing: bool,
-    ) -> LockUpdate {
-        let mut update = LockUpdate::default();
-
-        let lock_keys = self.locks.keys().cloned().collect::<Vec<_>>();
-        for lock_key in lock_keys {
-            let Some(lock) = self.locks.get_mut(&lock_key) else {
-                continue;
-            };
-            let visible = visible_commands
-                .iter()
-                .any(|item| same_lock_command(&lock.command, item));
-            if visible {
-                continue;
-            }
-            if command_executing {
-                continue;
-            }
-            let removed = self.locks.remove(&lock_key).map(|lock| lock.command.raw);
-            if let Some(command) = removed {
-                update.unlocked.push(command);
-            }
-        }
-
-        for parsed in visible_commands {
-            if let Some(locked) = self.find_locked_command(parsed) {
-                update.skipped.push(locked.raw.clone());
-                continue;
-            }
-            let lock_key = lock_key(parsed);
-            self.locks.insert(
-                lock_key.clone(),
-                CommandLock {
-                    command: parsed.clone(),
-                },
-            );
-            update.accepted.push(PendingCommand {
-                lock_key,
-                routed: parsed.clone(),
-            });
-        }
-
-        update
-    }
-
-    fn find_locked_command(&self, command: &RoutedCommand) -> Option<&RoutedCommand> {
-        self.locks
-            .values()
-            .find(|lock| same_lock_command(&lock.command, command))
-            .map(|lock| &lock.command)
-    }
-}
-
 pub fn lock_key(command: &RoutedCommand) -> String {
     let key = command.command.lock_key();
     if command.command.scopes_lock_to_actor() {
@@ -247,17 +167,6 @@ pub fn lock_key(command: &RoutedCommand) -> String {
     } else {
         key
     }
-}
-
-#[cfg(test)]
-pub fn same_lock_command(left: &RoutedCommand, right: &RoutedCommand) -> bool {
-    if left.command.scopes_lock_to_actor()
-        && right.command.scopes_lock_to_actor()
-        && command_identity(&left.username) != command_identity(&right.username)
-    {
-        return false;
-    }
-    left.command.same_request(&right.command)
 }
 
 fn is_feedback_text(text: &str) -> bool {
@@ -616,7 +525,6 @@ mod tests {
             parse_entertainment_shortcut("乙：#加入", "blue", Some(EntertainmentKind::Landlord))
                 .unwrap();
 
-        assert!(!same_lock_command(&left, &right));
         assert_ne!(lock_key(&left), lock_key(&right));
     }
 
@@ -930,18 +838,7 @@ mod tests {
         let plain = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse plain song");
         let ai = parse_text("用户：@AI点歌 晴天 周杰伦", "blue").expect("parse ai song");
 
-        assert!(same_lock_command(&plain, &ai));
-    }
-
-    #[test]
-    fn command_lock_accepts_only_one_ai_or_plain_hall_song_request() {
-        let plain = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse plain song");
-        let ai = parse_text("用户：@AI点歌 晴天 周杰伦", "blue").expect("parse ai song");
-        let mut locks = CommandLockState::default();
-
-        let update = locks.update(&[plain, ai], false);
-
-        assert_eq!(update.accepted.len(), 1);
+        assert_eq!(lock_key(&plain), lock_key(&ai));
     }
 
     #[test]
@@ -950,14 +847,9 @@ mod tests {
         let bob_disable = parse_text("[Bob]：@禁用", "pink").expect("parse disable");
         let alice_enable = parse_text("[Alice]：@启用", "pink").expect("parse enable");
         let bob_enable = parse_text("[Bob]：@启用", "pink").expect("parse enable");
-        let mut locks = CommandLockState::default();
-
-        assert!(same_lock_command(&alice_disable, &bob_disable));
-        assert!(same_lock_command(&alice_enable, &bob_enable));
-
-        let update = locks.update(&[alice_disable, bob_disable], false);
-
-        assert_eq!(update.accepted.len(), 1);
+        assert_eq!(lock_key(&alice_disable), lock_key(&bob_disable));
+        assert_eq!(lock_key(&alice_enable), lock_key(&bob_enable));
+        assert_ne!(lock_key(&alice_disable), lock_key(&alice_enable));
     }
 
     #[test]
@@ -1000,7 +892,7 @@ mod tests {
         let netease =
             parse_text("用户：@网易点歌 晴天 周杰伦", "blue").expect("parse netease song");
 
-        assert!(!same_lock_command(&qq, &netease));
+        assert_ne!(lock_key(&qq), lock_key(&netease));
     }
 
     #[test]

@@ -380,15 +380,6 @@ impl AdministrationCommand {
             Self::ChatListenerMode(mode) => format!("chat_listener:{}", mode.label()),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::IdleExit { minutes: left }, Self::IdleExit { minutes: right }) => left == right,
-            (Self::ChatListenerMode(left), Self::ChatListenerMode(right)) => left == right,
-            _ => self.lock_key() == other.lock_key(),
-        }
-    }
 }
 
 #[cfg(test)]

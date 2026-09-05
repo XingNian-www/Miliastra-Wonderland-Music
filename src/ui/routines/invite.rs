@@ -718,6 +718,18 @@ mod tests {
 
     fn invite_frames(config: &AppConfig) -> InviteFrameSet {
         let (secondary, friend_avatar) = secondary_frame(config);
+        let mut friend_frame = secondary.clone();
+        let friend_list = config.invite.friend_list_region;
+        fill_rect(
+            &mut friend_frame,
+            Rect::new(
+                friend_list.x - 70,
+                friend_list.y + 50,
+                friend_list.width + 110,
+                70,
+            ),
+            Rgba([65, 73, 86, 255]),
+        );
         let mut view_frame = secondary.clone();
         let view_star = place_template(
             &mut view_frame,
@@ -745,7 +757,7 @@ mod tests {
         );
         let frames = HashMap::from([
             (InvitePhase::Hall, secondary.clone()),
-            (InvitePhase::Friend, secondary),
+            (InvitePhase::Friend, friend_frame),
             (InvitePhase::ViewStar, view_frame),
             (InvitePhase::GotoHall, goto_frame),
             (InvitePhase::EnterHall, enter_frame),

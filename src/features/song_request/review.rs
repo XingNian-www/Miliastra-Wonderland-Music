@@ -457,14 +457,6 @@ fn parse_review_result(text: &str) -> Result<SongReviewResult> {
     })
 }
 
-pub(crate) fn split_candidate_title_artist(text: &str) -> (String, String) {
-    let text = text.trim().trim_start_matches('#').trim();
-    if let Some((title, artist)) = text.rsplit_once(" - ") {
-        return (title.trim().to_string(), artist.trim().to_string());
-    }
-    (text.to_string(), String::new())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -578,14 +570,6 @@ mod tests {
         assert!(parse_review_result(r#"{"level":11,"reason":"x"}"#).is_err());
         assert!(parse_review_result(r#"{"level":0,"reason":"x"}"#).is_err());
         assert!(parse_review_result(r#"{"reason":"x"}"#).is_err());
-    }
-
-    #[test]
-    fn splits_candidate_text() {
-        let (title, artist) = split_candidate_title_artist("# 晴天 - 周杰伦");
-
-        assert_eq!(title, "晴天");
-        assert_eq!(artist, "周杰伦");
     }
 
     #[test]

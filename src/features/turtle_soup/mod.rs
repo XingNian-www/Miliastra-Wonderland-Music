@@ -158,11 +158,6 @@ impl TurtleSoupCommand {
             Self::End => "turtle_soup:end",
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        self == other
-    }
 }
 
 #[derive(Debug)]

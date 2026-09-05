@@ -407,17 +407,6 @@ impl HallCommand {
             }
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn same_request(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::ToggleMicrophone { username: left },
-                Self::ToggleMicrophone { username: right },
-            ) => command_identity(left) == command_identity(right),
-            _ => self.lock_key() == other.lock_key(),
-        }
-    }
 }
 
 #[cfg(test)]

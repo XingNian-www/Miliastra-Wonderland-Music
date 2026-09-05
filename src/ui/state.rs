@@ -348,15 +348,6 @@ mod tests {
     }
 
     #[test]
-    fn back_anchor_identifies_secondary_chat_without_the_hall_row() {
-        let state = UiState::secondary_chat();
-
-        assert_eq!(state.to_string(), "secondary:chat");
-        assert!(state.secondary_visible);
-        assert_eq!(state.source, "back");
-    }
-
-    #[test]
     fn fixed_scrolled_friend_list_uses_the_back_anchor_for_secondary_state() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml"))
             .expect("load default config");

@@ -40,6 +40,19 @@ fn primary_rescan_can_publish(stable_kind: Option<UiStateKind>) -> bool {
     stable_kind == Some(UiStateKind::Primary)
 }
 
+fn chat_listener_mode_dispatch(parsed: &RoutedCommand) -> Option<ChatListenerModeCommand> {
+    if parsed.permission_required.is_some() {
+        return None;
+    }
+    let ModuleCommand::Administration(command) = &parsed.command else {
+        return None;
+    };
+    let AdministrationDispatch::ChatListenerMode(command) = command.dispatch() else {
+        return None;
+    };
+    Some(command)
+}
+
 fn listener_ready_after_recheck(
     evidence: Option<ListenerReadyEvidence>,
     snapshot: &ChatListenerSnapshot,
@@ -1542,10 +1555,7 @@ impl ApplicationRuntime {
     }
 
     fn enqueue_chat_listener_command(&self, parsed: &RoutedCommand) -> Result<bool> {
-        let ModuleCommand::Administration(command) = &parsed.command else {
-            return Ok(false);
-        };
-        let AdministrationDispatch::ChatListenerMode(command) = command.dispatch() else {
+        let Some(command) = chat_listener_mode_dispatch(parsed) else {
             return Ok(false);
         };
         match command {
@@ -1814,6 +1824,15 @@ pub(super) fn scan_chat_with_shared_ocr(
 
 #[cfg(test)]
 mod tests {
+    use crate::features::command::{CommandEnvelope, CommandObservation};
+    use crate::features::custom_workflow::{
+        CustomWorkflowConfig, CustomWorkflowService, WorkflowDefaults,
+    };
+    use crate::features::identity::{
+        IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
+    };
+    use crate::interfaces::chat::ChatCommandRouter;
+
     use super::{
         CHAT_LISTENER_UNRESOLVED_UI_GRACE, CONFIG_RELOAD_UI_FALLBACK_GRACE, ChatListenerMode,
         ListenerReadyEvidence, ObservedInput, attach_question_orders, listener_mode_matches_ui,
@@ -1849,6 +1868,60 @@ mod tests {
                 ObservedInput::Command(label) | ObservedInput::Question(label) => label,
             })
             .collect()
+    }
+
+    #[test]
+    fn listener_mode_dispatch_preserves_router_permissions() {
+        let identity = IdentityAccess::new(IdentityConfig {
+            mappings: vec![IdentityMapping {
+                nickname: "管理员".to_string(),
+                id: uuid::Uuid::from_u128(1),
+                role: IdentityRole::Admin,
+                note: String::new(),
+            }],
+        });
+        let workflows = CustomWorkflowService::new(
+            CustomWorkflowConfig::default(),
+            WorkflowDefaults {
+                default_timeout_ms: 1000,
+                default_poll_ms: 100,
+                default_step_wait_ms: 100,
+                decision_timeout_ms: 1000,
+                decision_poll_ms: 100,
+                after_activate_ms: 100,
+                clipboard_hold_ms: 100,
+                stability_mean_threshold: 1.0,
+                stability_changed_ratio_threshold: 0.1,
+            },
+        );
+        let router = ChatCommandRouter::with_identity(&workflows, &identity);
+        for (username, message_type, permitted) in [
+            ("访客", "blue", false),
+            ("管理员", "blue", true),
+            ("访客", "pink", true),
+        ] {
+            for (text, expected) in [
+                ("@监听模式 一级", super::ChatListenerModeCommand::Primary),
+                ("@监听模式 二级", super::ChatListenerModeCommand::Secondary),
+                ("@监听模式 状态", super::ChatListenerModeCommand::Status),
+            ] {
+                let envelope = CommandEnvelope::new(
+                    format!("{username}：{text}"),
+                    username,
+                    message_type,
+                    text,
+                    CommandObservation::default(),
+                )
+                .unwrap();
+                let routed = router.route(&envelope, None).expect("listener command");
+                assert_eq!(routed.permission_required.is_none(), permitted);
+                assert_eq!(
+                    super::chat_listener_mode_dispatch(&routed),
+                    permitted.then_some(expected),
+                    "username={username} source={message_type} command={text}"
+                );
+            }
+        }
     }
 
     #[test]

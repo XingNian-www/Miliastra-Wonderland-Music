@@ -162,14 +162,6 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
         self.dispatch(PlayerControl::Resume)
     }
 
-    fn next(&self) -> Result<String> {
-        self.dispatch(PlayerControl::Next)
-    }
-
-    fn previous(&self) -> Result<String> {
-        self.dispatch(PlayerControl::Previous)
-    }
-
     fn set_volume(&self, volume: &str) -> Result<String> {
         let volume = volume
             .trim()

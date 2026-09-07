@@ -61,6 +61,9 @@ impl ApplicationRuntime {
             } => {
                 let frame = self.latest_frame()?;
                 let default_threshold = match &template {
+                    WebToolTemplate::WorldWish => {
+                        self.lifecycle.config.templates.world_wish_threshold
+                    }
                     WebToolTemplate::WonderlandConfirm => {
                         self.lifecycle.config.startup.wonderland_confirm_threshold
                     }
@@ -87,6 +90,9 @@ impl ApplicationRuntime {
                     }
                     WebToolTemplate::SecondaryHall => {
                         self.lifecycle.config.templates.secondary_hall.clone()
+                    }
+                    WebToolTemplate::WorldWish => {
+                        self.lifecycle.config.templates.world_wish.clone()
                     }
                     WebToolTemplate::InviteViewStar => {
                         self.lifecycle.config.templates.invite_view_star.clone()

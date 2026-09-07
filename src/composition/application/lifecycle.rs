@@ -243,6 +243,20 @@ mod tests {
     }
 
     #[test]
+    fn automatic_entry_is_not_unconditionally_queued_at_startup() {
+        let mut config = crate::config::AppConfig::default();
+        config.startup.enabled = true;
+        config.startup.enter_game = true;
+        config.startup.enter_wonderland = true;
+        config.startup.launch_game = false;
+        assert!(ReloadStartupActions::from_startup_config(&config).is_empty());
+        config.startup.launch_game = true;
+        let actions = ReloadStartupActions::from_startup_config(&config);
+        assert!(actions.includes_start_game());
+        assert!(!actions.includes_enter_wonderland());
+    }
+
+    #[test]
     fn startup_success_before_a_reload_requirement_does_not_acknowledge_it() {
         let gate = ReloadStartupGate::default();
         gate.record_success(StartupTaskKind::StartGame);

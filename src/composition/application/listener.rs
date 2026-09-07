@@ -13,6 +13,7 @@ const CONFIG_RELOAD_UI_FALLBACK_GRACE: Duration = Duration::from_secs(15);
 enum ListenerReadyEvidence {
     PrimaryScan,
     SecondaryCurrentHall,
+    GameLocation,
 }
 
 fn chat_listener_mode_path(playback_state_path: &Path) -> PathBuf {
@@ -38,6 +39,27 @@ fn listener_mode_matches_ui(
 
 fn primary_rescan_can_publish(stable_kind: Option<UiStateKind>) -> bool {
     stable_kind == Some(UiStateKind::Primary)
+}
+
+fn automatic_startup_task(config: &AppConfig, kind: UiStateKind) -> Option<StartupTask> {
+    if !config.startup.enabled {
+        return None;
+    }
+    match kind {
+        UiStateKind::GameGate if config.startup.enter_game => {
+            Some(StartupTask::start_game(StartupSource::AUTOMATIC_UI))
+        }
+        UiStateKind::Overworld if config.startup.enter_wonderland => {
+            Some(StartupTask::enter_wonderland(StartupSource::AUTOMATIC_UI))
+        }
+        _ => None,
+    }
+}
+
+fn game_location_probe_blocks_residency(observation: Option<&UiStateObservation>) -> bool {
+    matches!(observation, Some(UiStateObservation::Classified(state))
+        if matches!(state.classification().kind(), UiStateKind::GameGate | UiStateKind::Overworld)
+            || state.classification().label() == "unknown:game_probe")
 }
 
 fn chat_listener_mode_dispatch(parsed: &RoutedCommand) -> Option<ChatListenerModeCommand> {
@@ -79,6 +101,7 @@ fn listener_ready_after_recheck(
                 && !snapshot.initial_unread_clear
                 && !snapshot.hall_round_required
         }
+        Some(ListenerReadyEvidence::GameLocation) => true,
         None => false,
     }
 }
@@ -574,6 +597,8 @@ impl ApplicationRuntime {
         let mut secondary_hall_command_tracker = SecondaryHallCommandTracker::default();
         let mut secondary_identity: Option<SecondaryChatIdentity> = None;
         let mut listener_residency_retry_after = Instant::now();
+        let mut automatic_startup_pending = false;
+        let mut automatic_startup_retry_after = Instant::now();
         let config_reload_child = std::env::var_os(crate::CONFIG_RELOAD_CHILD_ENV).is_some();
         let mut reload_startup_retry_after = Instant::now() + CONFIG_RELOAD_STARTUP_RETRY_INTERVAL;
         let mut replacement_ui_unverified_since = config_reload_child.then(Instant::now);
@@ -586,6 +611,14 @@ impl ApplicationRuntime {
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) {
             self.poll_hall_expiry(&mut hall_expiry_pause_applied, &mut hall_expiry_check_after);
             let live_config = self.lifecycle.live_configs.snapshot();
+            if automatic_startup_pending
+                && self.ui.coordinator.scan_may_run()
+                && self.business.task_engine.is_idle()?
+            {
+                automatic_startup_pending = false;
+                automatic_startup_retry_after =
+                    Instant::now() + CONFIG_RELOAD_STARTUP_RETRY_INTERVAL;
+            }
             self.retry_reload_startup_if_needed(
                 config_reload_child,
                 &mut reload_startup_retry_after,
@@ -701,10 +734,13 @@ impl ApplicationRuntime {
                             )),
                         };
                     match &ui_state_result {
-                        Ok((ui_state, _)) => self
-                            .lifecycle
-                            .monitor
-                            .publish(MonitorEvent::UiState(ui_state.clone())),
+                        Ok((ui_state, _)) => self.lifecycle.monitor.publish(MonitorEvent::UiState(
+                            match ui_state.as_str() {
+                                "game_gate" => "大门界面".to_string(),
+                                "overworld" => "主世界".to_string(),
+                                _ => ui_state.clone(),
+                            },
+                        )),
                         Err(_) => self
                             .lifecycle
                             .monitor
@@ -720,6 +756,21 @@ impl ApplicationRuntime {
                         Ok((_, Some(_))) => None,
                     };
                     match &ui_state_result {
+                        Ok((_, Some(kind @ (UiStateKind::GameGate | UiStateKind::Overworld)))) => {
+                            unresolved_ui_since = None;
+                            if !command_executing
+                                && listener_snapshot.pending_mode.is_none()
+                                && Instant::now() >= automatic_startup_retry_after
+                                && let Some(task) = automatic_startup_task(&live_config, *kind)
+                            {
+                                log::info!("界面已稳定，排队执行自动进入: {}", task.label());
+                                self.push_pending_task(PendingTask::Startup(task))?;
+                                automatic_startup_pending = true;
+                                residency_recovery_attempted = true;
+                            } else if automatic_startup_task(&live_config, *kind).is_none() {
+                                listener_ready_evidence = Some(ListenerReadyEvidence::GameLocation);
+                            }
+                        }
                         Ok((ui_state, Some(ui_kind))) => {
                             unresolved_ui_since = None;
                             let mode_matches = listener_mode_matches_ui(
@@ -764,13 +815,15 @@ impl ApplicationRuntime {
                                 .expect("unresolved UI reason is present");
                             let now = Instant::now();
                             let unresolved_since = *unresolved_ui_since.get_or_insert(now);
-                            if unresolved_ui_recovery_due(
-                                Some(unresolved_since),
-                                now,
-                                listener_residency_retry_after,
-                                listener_snapshot.pending_mode.is_some(),
-                                command_executing,
-                            ) {
+                            if !game_location_probe_blocks_residency(frame.ui_state.as_ref())
+                                && unresolved_ui_recovery_due(
+                                    Some(unresolved_since),
+                                    now,
+                                    listener_residency_retry_after,
+                                    listener_snapshot.pending_mode.is_some(),
+                                    command_executing,
+                                )
+                            {
                                 let target = listener_residency(
                                     listener_snapshot.mode,
                                     listener_snapshot.temporary_primary,
@@ -813,6 +866,14 @@ impl ApplicationRuntime {
                         log::debug!("驻留恢复后废弃当前旧观察帧，下一轮重新验证");
                     } else {
                         match ui_state_result {
+                            Ok((_, Some(UiStateKind::GameGate | UiStateKind::Overworld))) => {
+                                primary_visible = false;
+                                last_fingerprint = None;
+                                secondary_friend_bubble_fingerprint = None;
+                                secondary_hall_bubble_sequence = None;
+                                secondary_hall_command_tracker.reset();
+                                secondary_identity = None;
+                            }
                             Ok((ui_state, None)) => {
                                 log::debug!("界面仍在过渡，暂停聊天扫描: {}", ui_state);
                                 log::info!(target: "timing",
@@ -1899,6 +1960,82 @@ mod tests {
             unread_task_pending: false,
             hall_round_required: false,
         }
+    }
+
+    #[test]
+    fn automatic_entry_requires_the_matching_stable_location_and_switch() {
+        use crate::config::AppConfig;
+        use crate::features::startup::StartupTaskKind;
+        use crate::runtime::ui::UiStateKind;
+
+        let mut config = AppConfig::default();
+        config.startup.enabled = true;
+        config.startup.enter_game = true;
+        config.startup.enter_wonderland = false;
+        assert_eq!(
+            super::automatic_startup_task(&config, UiStateKind::GameGate)
+                .unwrap()
+                .kind(),
+            StartupTaskKind::StartGame,
+        );
+        assert!(super::automatic_startup_task(&config, UiStateKind::Overworld).is_none());
+        config.startup.enter_wonderland = true;
+        assert_eq!(
+            super::automatic_startup_task(&config, UiStateKind::Overworld)
+                .unwrap()
+                .kind(),
+            StartupTaskKind::EnterWonderland,
+        );
+        for kind in [
+            UiStateKind::Primary,
+            UiStateKind::Secondary,
+            UiStateKind::Unknown,
+        ] {
+            assert!(super::automatic_startup_task(&config, kind).is_none());
+        }
+        config.startup.enabled = false;
+        assert!(super::automatic_startup_task(&config, UiStateKind::GameGate).is_none());
+        assert!(super::automatic_startup_task(&config, UiStateKind::Overworld).is_none());
+    }
+
+    #[test]
+    fn observing_a_game_location_can_finish_reload_without_automatic_entry() {
+        let state = listener_snapshot(ChatListenerMode::Secondary);
+        assert!(listener_ready_after_recheck(
+            Some(ListenerReadyEvidence::GameLocation),
+            &state,
+            false,
+            false,
+            true,
+        ));
+        assert!(!listener_ready_after_recheck(
+            Some(ListenerReadyEvidence::GameLocation),
+            &state,
+            true,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn game_location_confirmation_prevents_generic_residency_recovery() {
+        use crate::runtime::ui::{UiStateClassification, UiStateKind, UiStateTracker};
+        let mut tracker = UiStateTracker::new(2);
+        for (frame, kind, label) in [
+            (1, UiStateKind::Unknown, "unknown:game_probe"),
+            (2, UiStateKind::GameGate, "game_gate"),
+            (3, UiStateKind::Overworld, "overworld"),
+        ] {
+            let observation = tracker.observe(frame, UiStateClassification::new(kind, label));
+            assert!(super::game_location_probe_blocks_residency(Some(
+                &observation
+            )));
+        }
+        let unknown = tracker.observe(
+            4,
+            UiStateClassification::new(UiStateKind::Unknown, "unknown"),
+        );
+        assert!(!super::game_location_probe_blocks_residency(Some(&unknown)));
     }
 
     fn labels(inputs: Vec<ObservedInput<&'static str, &'static str>>) -> Vec<&'static str> {

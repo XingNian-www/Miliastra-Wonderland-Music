@@ -181,6 +181,8 @@ impl CapturedFrame {
 pub enum UiStateKind {
     Primary,
     Secondary,
+    GameGate,
+    Overworld,
     Unknown,
 }
 
@@ -1642,6 +1644,38 @@ mod tests {
         assert_eq!(first, duplicate);
         assert_eq!(duplicate.classified().unwrap().candidate_count(), 1);
         assert!(duplicate.classified().unwrap().is_transitioning());
+    }
+
+    #[test]
+    fn game_states_use_shared_stability_and_do_not_survive_unknown_frames() {
+        for kind in [UiStateKind::GameGate, UiStateKind::Overworld] {
+            let mut tracker = UiStateTracker::new(2);
+            assert!(
+                tracker
+                    .observe(1, classified(kind))
+                    .classified()
+                    .unwrap()
+                    .is_transitioning()
+            );
+            assert_eq!(
+                tracker
+                    .observe(2, classified(kind))
+                    .classified()
+                    .unwrap()
+                    .stable_kind(),
+                Some(kind)
+            );
+            let unknown = tracker.observe(3, classified(UiStateKind::Unknown));
+            assert_eq!(unknown.classified().unwrap().stable_kind(), None);
+            assert_eq!(unknown.classified().unwrap().last_stable_kind(), Some(kind));
+            assert!(
+                tracker
+                    .observe(4, classified(kind))
+                    .classified()
+                    .unwrap()
+                    .is_transitioning()
+            );
+        }
     }
 
     #[test]

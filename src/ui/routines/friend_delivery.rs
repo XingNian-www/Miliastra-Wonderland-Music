@@ -883,6 +883,13 @@ fn ensure_secondary_chat(
     if state == UiStateKind::Secondary {
         return Ok(());
     }
+    if matches!(state, UiStateKind::GameGate | UiStateKind::Overworld) {
+        return Err(UiRoutineFailure::new(
+            InputCertainty::BeforeInput,
+            "open_secondary_chat",
+            "chat residency is unavailable at the game gate or in the overworld",
+        ));
+    }
     context
         .device()
         .press_key(Key::Return)
@@ -1224,6 +1231,13 @@ fn restore_primary(
     )?;
     if state == UiStateKind::Primary {
         return Ok(());
+    }
+    if matches!(state, UiStateKind::GameGate | UiStateKind::Overworld) {
+        return Err(UiRoutineFailure::new(
+            InputCertainty::BeforeInput,
+            "restore_primary_residency",
+            "chat residency is unavailable at the game gate or in the overworld",
+        ));
     }
     if state == UiStateKind::Unknown {
         log::warn!("一级驻留持续稳定为 Unknown，按 Esc 尝试关闭残留面板后重新确认一级界面");

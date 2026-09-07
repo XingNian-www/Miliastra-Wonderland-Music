@@ -219,6 +219,7 @@ pub struct StartupSource(&'static str);
 impl StartupSource {
     pub const STARTUP_CONFIG: Self = Self("启动配置");
     pub const REMOTE_CONSOLE: Self = Self("远程指挥台");
+    pub const AUTOMATIC_UI: Self = Self("界面自动识别");
 
     pub const fn new(label: &'static str) -> Self {
         Self(label)
@@ -273,10 +274,13 @@ pub trait StartupExecutionPort {
 
     fn request_window_rescan(&self, reason: &'static str) -> Result<()>;
 
-    fn run_start_game(&self, on_window_detection_reset: &mut dyn FnMut(&'static str))
-    -> Result<()>;
+    fn run_start_game(
+        &self,
+        automatic: bool,
+        on_window_detection_reset: &mut dyn FnMut(&'static str),
+    ) -> Result<()>;
 
-    fn run_enter_wonderland(&self) -> Result<()>;
+    fn run_enter_wonderland(&self, automatic: bool) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -304,7 +308,10 @@ impl StartupService {
                 log::error!("请求重置窗口检测退避失败: {error:#}");
             }
         };
-        port.run_start_game(&mut reset_window_detection)
+        port.run_start_game(
+            source == StartupSource::AUTOMATIC_UI,
+            &mut reset_window_detection,
+        )
     }
 
     fn enter_wonderland(
@@ -315,7 +322,7 @@ impl StartupService {
         log::info!("执行进入千星任务: {}", source);
         port.invalidate_chat_context(ENTER_WONDERLAND_CONTEXT_LOSS_REASON);
         port.request_window_rescan(ENTER_WONDERLAND_RESCAN_REASON)?;
-        port.run_enter_wonderland()?;
+        port.run_enter_wonderland(source == StartupSource::AUTOMATIC_UI)?;
 
         port.request_window_rescan(ENTER_WONDERLAND_COMPLETE_RESCAN_REASON)
     }
@@ -374,6 +381,7 @@ mod tests {
 
         fn run_start_game(
             &self,
+            _automatic: bool,
             on_window_detection_reset: &mut dyn FnMut(&'static str),
         ) -> Result<()> {
             self.record("run:start-game");
@@ -386,7 +394,7 @@ mod tests {
             Ok(())
         }
 
-        fn run_enter_wonderland(&self) -> Result<()> {
+        fn run_enter_wonderland(&self, _automatic: bool) -> Result<()> {
             self.record("run:enter-wonderland");
             if self.fail_enter {
                 bail!("enter wonderland failed");

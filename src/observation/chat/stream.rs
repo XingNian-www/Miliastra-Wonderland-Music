@@ -423,6 +423,10 @@ fn track_primary_partial_messages(
     state: &mut ChatObservationState,
     messages: Vec<ChatMessage>,
 ) -> Vec<PrimaryObservedMessage> {
+    if !state.primary_initialized {
+        return establish_primary_baseline(state, messages);
+    }
+
     // Keep the full-frame anchor while retaining identities that can be acknowledged.
     let anchor = std::mem::take(&mut state.primary_visible);
     let initialized = state.primary_initialized;
@@ -879,6 +883,72 @@ mod tests {
                 .iter()
                 .all(|message| !message.is_new)
         );
+    }
+
+    #[test]
+    fn primary_visual_session_baselines_the_first_nonempty_frame_of_any_size() {
+        for count in [1, 2, 6] {
+            let shared = ChatObservationShared::new();
+            publish_primary(
+                &shared,
+                vec![
+                    message_at("old message", 0, 0),
+                    message_at("old command", 20, 0),
+                ],
+            );
+            publish_primary(&shared, vec![message_at("old partial command", 0, 0)]);
+
+            let session = shared.begin_visual_session().unwrap();
+            let empty = publish_primary(&shared, Vec::new());
+            assert!(primary_messages(&empty).is_empty());
+            assert!(shared.primary_cursor().unwrap().is_none());
+
+            let mut visible = (0..count)
+                .map(|index| message_at(&format!("command {index}"), index * 20, 0))
+                .collect::<Vec<_>>();
+            let baseline = publish_primary(&shared, visible.clone());
+            let baseline_messages = primary_messages(&baseline);
+            assert_eq!(baseline_messages.len(), count as usize);
+            assert!(baseline_messages.iter().all(|message| !message.is_new));
+            assert!(
+                baseline_messages
+                    .iter()
+                    .all(|message| message.id.visual_session == session)
+            );
+
+            let repeated_text = visible.last().unwrap().text.clone();
+            visible.push(message_at(&repeated_text, count * 20, 0));
+            let appended = publish_primary(&shared, visible.clone());
+            let appended_messages = primary_messages(&appended);
+            assert_eq!(appended_messages.len(), count as usize + 1);
+            for (previous, current) in baseline_messages.iter().zip(appended_messages.iter()) {
+                assert_eq!(current.id, previous.id);
+                assert!(!current.is_new);
+            }
+            let repeated_command = appended_messages.last().unwrap();
+            assert!(repeated_command.is_new);
+            assert_ne!(repeated_command.id, baseline_messages.last().unwrap().id);
+            assert!(shared.acknowledge_primary(&repeated_command.id).unwrap());
+
+            let unchanged = publish_primary(&shared, visible.clone());
+            assert!(
+                primary_messages(&unchanged)
+                    .iter()
+                    .all(|message| !message.is_new)
+            );
+
+            visible.push(message_at("new command", (count + 1) * 20, 0));
+            let updated = publish_primary(&shared, visible);
+            let updated_messages = primary_messages(&updated);
+            assert_eq!(
+                updated_messages
+                    .iter()
+                    .filter(|message| message.is_new)
+                    .count(),
+                1
+            );
+            assert!(updated_messages.last().unwrap().is_new);
+        }
     }
 
     #[test]

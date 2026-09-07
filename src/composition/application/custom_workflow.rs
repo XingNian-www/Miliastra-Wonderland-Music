@@ -128,9 +128,6 @@ impl ApplicationRuntime {
         log::info!("已进入新大厅，重置命令识别状态");
         self.abort_entertainment_for_context_loss("邀请流程已进入新大厅");
         self.business.business.set_commands_enabled(true)?;
-        self.ui
-            .chat_baseline_primed
-            .store(false, AtomicOrdering::SeqCst);
         self.clear_hall_countdown_cache_for_new_visual_session("已进入新大厅")?;
         Ok(())
     }

@@ -15,10 +15,10 @@ use crate::runtime::ui::{
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::change_detection::{change_stats, rect_chat_change_fingerprint};
 use crate::ui::geometry::{Point, Rect, crop_canvas};
+use crate::ui::state::find_enter_game_text as locate_enter_game_text;
 use crate::ui::template::best_template_hit;
 use enigo::Key;
 
-const ENTER_GAME_TEXT: &str = "点击进入";
 const TEMPLATE_STABLE_HITS: u32 = 2;
 
 struct TemplateAbsence<'a> {
@@ -40,44 +40,45 @@ struct TemplateHit<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct EnterGame;
+pub(crate) struct EnterGame {
+    pub(crate) require_gate: bool,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct EnterWonderland;
+pub(crate) struct EnterWonderland {
+    pub(crate) require_overworld: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EnterGameEffect {
     WindowReady,
     Entered,
+    Skipped,
     Failed(UiRoutineFailure),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EnterGameOutcome {
     effect: EnterGameEffect,
-    residency: UiResidencyOutcome,
 }
 
 impl EnterGameOutcome {
     pub(crate) fn effect(&self) -> &EnterGameEffect {
         &self.effect
     }
-
-    pub(crate) fn residency(&self) -> &UiResidencyOutcome {
-        &self.residency
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EnterWonderlandEffect {
     Entered,
+    Skipped,
     Failed(UiRoutineFailure),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EnterWonderlandOutcome {
     effect: EnterWonderlandEffect,
-    residency: UiResidencyOutcome,
+    residency: Option<UiResidencyOutcome>,
 }
 
 impl EnterWonderlandOutcome {
@@ -85,8 +86,8 @@ impl EnterWonderlandOutcome {
         &self.effect
     }
 
-    pub(crate) fn residency(&self) -> &UiResidencyOutcome {
-        &self.residency
+    pub(crate) fn residency(&self) -> Option<&UiResidencyOutcome> {
+        self.residency.as_ref()
     }
 }
 
@@ -162,8 +163,10 @@ pub(crate) struct StartupUiConfig {
     pub(crate) stable_changed_ratio_threshold: f32,
     pub(crate) template_threshold: f32,
     pub(crate) wonderland_confirm_threshold: f32,
+    pub(crate) world_wish_threshold: f32,
     pub(crate) templates: StartupUiTemplates,
     pub(crate) enter_game_text_region: Rect,
+    pub(crate) world_wish_region: Rect,
     pub(crate) wonderland_hall_ocr_region: Rect,
     pub(crate) wonderland_confirm_region: Rect,
     pub(crate) main_ui_region: Rect,
@@ -175,6 +178,7 @@ pub(crate) struct StartupUiTemplates {
     pub(crate) wonderland_map_star: PathBuf,
     pub(crate) wonderland_confirm: PathBuf,
     pub(crate) paimon_menu: PathBuf,
+    pub(crate) world_wish: PathBuf,
 }
 
 impl StartupRoutineConfig {
@@ -203,16 +207,30 @@ impl UiRoutine for EnterGameRoutine {
     type Output = EnterGameOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let _ = self.request;
-        let effect = match execute_enter_game(context, &self.ocr, &self.config) {
+        let mut config = self.config;
+        if self.request.require_gate {
+            match confirm_automatic_entry(context, &self.ocr, &config, UiStateKind::GameGate) {
+                Ok(true) => {
+                    config.startup.launch_game = false;
+                    config.startup.enter_game = true;
+                }
+                Ok(false) => {
+                    return EnterGameOutcome {
+                        effect: EnterGameEffect::Skipped,
+                    };
+                }
+                Err(failure) => {
+                    return EnterGameOutcome {
+                        effect: EnterGameEffect::Failed(failure),
+                    };
+                }
+            }
+        }
+        let effect = match execute_enter_game(context, &self.ocr, &config) {
             Ok(effect) => effect,
             Err(failure) => EnterGameEffect::Failed(failure),
         };
-        let residency = match &effect {
-            EnterGameEffect::Entered => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
-            _ => observe_primary(context, &self.config),
-        };
-        EnterGameOutcome { effect, residency }
+        EnterGameOutcome { effect }
     }
 }
 
@@ -228,7 +246,24 @@ impl UiRoutine for EnterWonderlandRoutine {
     type Output = EnterWonderlandOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let _ = self.request;
+        if self.request.require_overworld {
+            match confirm_automatic_entry(context, &self.ocr, &self.config, UiStateKind::Overworld)
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return EnterWonderlandOutcome {
+                        effect: EnterWonderlandEffect::Skipped,
+                        residency: None,
+                    };
+                }
+                Err(failure) => {
+                    return EnterWonderlandOutcome {
+                        effect: EnterWonderlandEffect::Failed(failure),
+                        residency: None,
+                    };
+                }
+            }
+        }
         let mut goal_attempted = false;
         let effect =
             match execute_enter_wonderland(context, &self.ocr, &self.config, &mut goal_attempted) {
@@ -241,8 +276,46 @@ impl UiRoutine for EnterWonderlandRoutine {
             !goal_attempted,
             self.config.startup.final_primary_timeout_ms,
         );
-        EnterWonderlandOutcome { effect, residency }
+        EnterWonderlandOutcome {
+            effect,
+            residency: Some(residency),
+        }
     }
+}
+
+fn confirm_automatic_entry(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &StartupRoutineConfig,
+    expected: UiStateKind,
+) -> Result<bool, UiRoutineFailure> {
+    for _ in 0..TEMPLATE_STABLE_HITS {
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "recheck_automatic_entry",
+            InputCertainty::BeforeInput,
+        )?;
+        let visible = match expected {
+            UiStateKind::GameGate => {
+                find_enter_game_text(ocr, &image, config, InputCertainty::BeforeInput)?.is_some()
+            }
+            UiStateKind::Overworld => template_visible(
+                &image,
+                config.startup.world_wish_region,
+                &config.startup.templates.world_wish,
+                config.startup.world_wish_threshold,
+                InputCertainty::BeforeInput,
+            )?,
+            _ => unreachable!("automatic entry only starts from the gate or overworld"),
+        };
+        if !visible {
+            log::info!("自动进入前界面已变化，跳过本次任务: expected={expected:?}");
+            return Ok(false);
+        }
+        sleep_ms(config.startup.poll_ms);
+    }
+    Ok(true)
 }
 
 fn execute_enter_game(
@@ -648,6 +721,11 @@ fn wait_for_primary(
                 )
             }
             Ok(UiStateKind::Unknown) => unreachable!("unknown UI state is never stable"),
+            Ok(UiStateKind::GameGate | UiStateKind::Overworld) => Err(UiRoutineFailure::new(
+                InputCertainty::ConfirmedFailure,
+                "confirm_startup_primary",
+                "game is still at the gate or in the overworld",
+            )),
             Err(failure) => Err(failure),
         }
     } else {
@@ -667,49 +745,15 @@ fn wait_for_primary(
     }
 }
 
-fn observe_primary(
-    context: &mut UiRoutineContext<'_>,
-    config: &StartupRoutineConfig,
-) -> UiResidencyOutcome {
-    match wait_for_stable_ui_kind(
-        context,
-        config.residency.state_observation(),
-        Some(UiStateKind::Primary),
-        config.startup.final_primary_timeout_ms,
-        "observe_startup_residency",
-        InputCertainty::ConfirmedFailure,
-    ) {
-        Ok(UiStateKind::Primary) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
-        Ok(_) => unreachable!("primary wait returned a non-primary state"),
-        Err(failure) => UiResidencyOutcome::Failed(failure),
-    }
-}
-
 fn find_enter_game_text(
     ocr: &OcrRuntimeHandle,
     image: &image::DynamicImage,
     config: &StartupRoutineConfig,
     certainty: InputCertainty,
 ) -> Result<Option<Point>, UiRoutineFailure> {
-    let region = config.startup.enter_game_text_region;
-    let crop = crop_canvas(image, region).map_err(|error| {
-        UiRoutineFailure::new(certainty, "crop_enter_game_text", format!("{error:#}"))
-    })?;
-    let target = normalize_lock_text(ENTER_GAME_TEXT);
-    let lines = ocr
-        .recognize_lines(crop, OcrPriority::UiConfirmation)
-        .map_err(|error| {
-            UiRoutineFailure::new(certainty, "ocr_enter_game_text", format!("{error:#}"))
-        })?;
-    Ok(lines.into_iter().find_map(|line| {
-        let recognized = normalize_lock_text(&line.text);
-        (recognized == target || recognized.contains(&target)).then(|| {
-            Point::new(
-                region.x + line.bbox.center().x,
-                region.y + line.bbox.center().y,
-            )
-        })
-    }))
+    locate_enter_game_text(ocr, image, config.startup.enter_game_text_region).map_err(|error| {
+        UiRoutineFailure::new(certainty, "ocr_enter_game_text", format!("{error:#}"))
+    })
 }
 
 fn wait_template_absent(
@@ -944,12 +988,15 @@ mod tests {
                 stable_changed_ratio_threshold: startup.stable_changed_ratio_threshold,
                 template_threshold: startup.template_threshold,
                 wonderland_confirm_threshold: startup.wonderland_confirm_threshold,
+                world_wish_threshold: app.templates.world_wish_threshold,
                 templates: StartupUiTemplates {
                     wonderland_map_star: startup.templates.wonderland_map_star.clone(),
                     wonderland_confirm: startup.templates.wonderland_confirm.clone(),
                     paimon_menu: startup.templates.paimon_menu.clone(),
+                    world_wish: app.templates.world_wish.clone(),
                 },
                 enter_game_text_region: startup.enter_game_text_region.into(),
+                world_wish_region: app.screen.world_wish_rect.into(),
                 wonderland_hall_ocr_region: startup.wonderland_hall_ocr_region.into(),
                 wonderland_confirm_region: startup.wonderland_confirm_region.into(),
                 main_ui_region: startup.main_ui_region.into(),
@@ -988,7 +1035,7 @@ mod tests {
         let outcome = ui_runtime
             .handle()
             .submit(EnterWonderlandRoutine {
-                request: EnterWonderland,
+                request: EnterWonderland::default(),
                 ocr: ocr_runtime.handle(),
                 config,
             })
@@ -1002,6 +1049,75 @@ mod tests {
         assert_eq!(failure.stage(), "locate_wonderland_map_star");
         assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
         assert_eq!(keys.lock().unwrap().as_slice(), &[Key::M]);
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn automatic_entry_skips_both_actions_when_the_screen_changed() {
+        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = test_startup_config(&app);
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(
+            PaimonOnlyDevice {
+                frame: DynamicImage::new_rgba8(1920, 1080),
+                keys: keys.clone(),
+            },
+            4,
+        )
+        .unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let startup = StartupUi::new(ui_runtime.handle(), ocr_runtime.handle(), config);
+        let gate = startup
+            .submit_enter_game(EnterGame { require_gate: true })
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(gate.effect(), &EnterGameEffect::Skipped);
+        let world = startup
+            .submit_enter_wonderland(EnterWonderland {
+                require_overworld: true,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(world.effect(), &EnterWonderlandEffect::Skipped);
+        assert!(world.residency().is_none());
+        assert!(keys.lock().unwrap().is_empty());
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn entering_game_finishes_in_the_overworld_without_claiming_chat_residency() {
+        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut config = test_startup_config(&app);
+        config.startup.enter_game = true;
+        let mut frame = DynamicImage::new_rgba8(1920, 1080);
+        frame
+            .copy_from(
+                &image::open(&config.startup.templates.paimon_menu).unwrap(),
+                0,
+                0,
+            )
+            .unwrap();
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(
+            PaimonOnlyDevice {
+                frame,
+                keys: keys.clone(),
+            },
+            4,
+        )
+        .unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let outcome = StartupUi::new(ui_runtime.handle(), ocr_runtime.handle(), config)
+            .submit_enter_game(EnterGame::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(outcome.effect(), &EnterGameEffect::Entered);
+        assert!(keys.lock().unwrap().is_empty());
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }

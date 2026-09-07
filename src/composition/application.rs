@@ -267,12 +267,15 @@ impl ResolvedApplicationConfig {
                 stable_changed_ratio_threshold: app.startup.stable_changed_ratio_threshold,
                 template_threshold: app.startup.template_threshold,
                 wonderland_confirm_threshold: app.startup.wonderland_confirm_threshold,
+                world_wish_threshold: app.templates.world_wish_threshold,
                 templates: StartupUiTemplates {
                     wonderland_map_star: app.startup.templates.wonderland_map_star.clone(),
                     wonderland_confirm: app.startup.templates.wonderland_confirm.clone(),
                     paimon_menu: app.startup.templates.paimon_menu.clone(),
+                    world_wish: app.templates.world_wish.clone(),
                 },
                 enter_game_text_region: app.startup.enter_game_text_region.into(),
+                world_wish_region: app.screen.world_wish_rect.into(),
                 wonderland_hall_ocr_region: app.startup.wonderland_hall_ocr_region.into(),
                 wonderland_confirm_region: app.startup.wonderland_confirm_region.into(),
                 main_ui_region: app.startup.main_ui_region.into(),
@@ -495,11 +498,7 @@ impl ReloadStartupActions {
     const ENTER_WONDERLAND: u8 = 1 << 1;
 
     fn from_startup_config(config: &AppConfig) -> Self {
-        Self::from_flags(
-            config.startup.enabled,
-            config.startup.launch_game || config.startup.enter_game,
-            config.startup.enter_wonderland,
-        )
+        Self::from_flags(config.startup.enabled, config.startup.launch_game, false)
     }
 
     const fn from_flags(enabled: bool, start_game: bool, enter_wonderland: bool) -> Self {
@@ -1370,7 +1369,12 @@ impl ApplicationRuntime {
         );
         let ui_state_stable_count = config.resolve_stability_count(config.stability.ui_state_count);
         let ui_state_classifier =
-            TemplateUiStateClassifier::new(ui_templates.clone(), config.screen.clone());
+            TemplateUiStateClassifier::new(ui_templates.clone(), config.screen.clone())
+                .with_game_entry_detection(
+                    ocr.clone(),
+                    config.startup.enter_game_text_region.into(),
+                    ui_state_stable_count,
+                );
         let ui_runtime = UiRuntime::start_with_progress_and_state_classifier(
             WindowsUiDevice::new(config.window.clone()),
             UI_RUNTIME_QUEUE_CAPACITY,

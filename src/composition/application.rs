@@ -1482,6 +1482,10 @@ impl ApplicationRuntime {
             PlaybackTimePorts::new(system_clock.clone(), system_clock.clone()),
             live_configs.clone(),
         );
+        if business.hall_state_snapshot()?.remaining_minutes_now() == Some(0) {
+            business.update_playback_state(PlaybackStateUpdate::UserPaused)?;
+            log::info!("关闭期间大厅倒计时已结束，恢复歌曲时保持暂停");
+        }
         // 重启恢复：上次会话有活动歌曲时，从最后可靠进度恢复播放（新引擎会话）。
         // 音量已持久化，恢复前由控制器重新应用；原用户暂停的歌曲恢复后保持暂停。
         match player.play_restored() {

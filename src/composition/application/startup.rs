@@ -17,39 +17,41 @@ impl StartupExecutionPort for ApplicationRuntime {
 
     fn run_start_game(
         &self,
+        automatic: bool,
         on_window_detection_reset: &mut dyn FnMut(&'static str),
     ) -> Result<()> {
         let outcome = self
             .ui
             .startup_ui
-            .submit_enter_game(EnterGame)
+            .submit_enter_game(EnterGame {
+                require_gate: automatic,
+            })
             .context("提交进入游戏 UI 事务")?
             .wait()
             .context("等待进入游戏 UI 事务")?;
         match outcome.effect() {
-            EnterGameEffect::WindowReady | EnterGameEffect::Entered => {}
+            EnterGameEffect::WindowReady | EnterGameEffect::Entered | EnterGameEffect::Skipped => {}
             EnterGameEffect::Failed(failure) => return Err(anyhow!(failure.to_string())),
-        }
-        if let UiResidencyOutcome::Failed(failure) = outcome.residency() {
-            return Err(anyhow!("启动游戏目标已完成，但一级驻留未确认: {failure}"));
         }
         on_window_detection_reset("启动游戏 UI 事务已完成");
         Ok(())
     }
 
-    fn run_enter_wonderland(&self) -> Result<()> {
+    fn run_enter_wonderland(&self, automatic: bool) -> Result<()> {
         let outcome = self
             .ui
             .startup_ui
-            .submit_enter_wonderland(EnterWonderland)
+            .submit_enter_wonderland(EnterWonderland {
+                require_overworld: automatic,
+            })
             .context("提交进入千星 UI 事务")?
             .wait()
             .context("等待进入千星 UI 事务")?;
         match outcome.effect() {
-            EnterWonderlandEffect::Entered => {}
+            EnterWonderlandEffect::Entered | EnterWonderlandEffect::Skipped => {}
             EnterWonderlandEffect::Failed(failure) => return Err(anyhow!(failure.to_string())),
         }
-        if let UiResidencyOutcome::Failed(failure) = outcome.residency() {
+        if let Some(UiResidencyOutcome::Failed(failure)) = outcome.residency() {
             return Err(anyhow!("进入千星已确认，但一级驻留恢复失败：{failure}"));
         }
         Ok(())

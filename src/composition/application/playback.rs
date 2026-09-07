@@ -11,6 +11,10 @@ use crate::features::playback::{
 };
 
 impl ApplicationRuntime {
+    pub(super) fn stop_background_lyrics_output(&self) -> Result<bool> {
+        self.business.background_commands.stop("lyrics")
+    }
+
     pub(super) fn execute_playback_intent(
         &mut self,
         parsed: &RoutedCommand,
@@ -342,6 +346,15 @@ impl PlaybackCommandPort for ApplicationRuntime {
         if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
             return Ok(true);
         }
+        if self
+            .business
+            .business
+            .hall_state_snapshot()?
+            .remaining_minutes_now()
+            == Some(0)
+        {
+            return Ok(true);
+        }
         Ok(!self
             .business
             .task_engine
@@ -375,7 +388,7 @@ impl PlaybackCommandPort for ApplicationRuntime {
     }
 
     fn stop_background_lyrics(&mut self) -> Result<bool> {
-        self.business.background_commands.stop("lyrics")
+        self.stop_background_lyrics_output()
     }
 
     fn wait(&mut self, duration: Duration) {

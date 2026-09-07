@@ -503,6 +503,23 @@ impl ApplicationRuntime {
         Ok(())
     }
 
+    fn poll_hall_expiry(&self, pause_applied: &mut bool, check_after: &mut Instant) {
+        if Instant::now() < *check_after {
+            return;
+        }
+        let retry_delay = match self.maybe_pause_expired_hall(*pause_applied) {
+            Ok(applied) => {
+                *pause_applied = applied;
+                Duration::from_secs(1)
+            }
+            Err(error) => {
+                log::error!("大厅到期暂停失败，将重试: {error:#}");
+                Duration::from_secs(5)
+            }
+        };
+        *check_after = Instant::now() + retry_delay;
+    }
+
     pub(super) fn run_scan_loop(&mut self) -> Result<()> {
         let mut completion_subscriber = self
             .ui
@@ -563,8 +580,11 @@ impl ApplicationRuntime {
         let mut unresolved_ui_since: Option<Instant> = None;
         let mut target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
         let mut target_missing = false;
+        let mut hall_expiry_pause_applied = false;
+        let mut hall_expiry_check_after = Instant::now();
         log::info!("自动化扫描已启动");
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            self.poll_hall_expiry(&mut hall_expiry_pause_applied, &mut hall_expiry_check_after);
             let live_config = self.lifecycle.live_configs.snapshot();
             self.retry_reload_startup_if_needed(
                 config_reload_child,
@@ -659,7 +679,11 @@ impl ApplicationRuntime {
                     );
                     if target_missing {
                         log::info!("目标窗口已恢复，重置截图退避");
-                        self.clear_hall_countdown_cache_for_new_visual_session("目标窗口恢复")?;
+                        let visual_session = self.ui.chat_observations.begin_visual_session()?;
+                        log::info!(
+                            "目标窗口恢复，聊天观察进入新视觉会话: {}",
+                            visual_session.get()
+                        );
                         target_missing = false;
                     }
                     target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
@@ -1208,10 +1232,31 @@ impl ApplicationRuntime {
                         reload_startup_retry_after =
                             Instant::now() + CONFIG_RELOAD_STARTUP_RETRY_INTERVAL;
                     }
-                    if self.ui.window_detection_signal.wait_for_change(
-                        observed_window_detection_generation,
-                        target_missing_wait,
-                    )? {
+                    let window_retry_at = Instant::now() + target_missing_wait;
+                    // Keep window capture backoff while still checking the hall deadline.
+                    let window_reset = loop {
+                        self.poll_hall_expiry(
+                            &mut hall_expiry_pause_applied,
+                            &mut hall_expiry_check_after,
+                        );
+                        let now = Instant::now();
+                        if !self.lifecycle.running.load(AtomicOrdering::SeqCst)
+                            || now >= window_retry_at
+                        {
+                            break false;
+                        }
+                        let wait = window_retry_at
+                            .saturating_duration_since(now)
+                            .min(hall_expiry_check_after.saturating_duration_since(now));
+                        if self
+                            .ui
+                            .window_detection_signal
+                            .wait_for_change(observed_window_detection_generation, wait)?
+                        {
+                            break true;
+                        }
+                    };
+                    if window_reset {
                         log::info!("收到窗口检测重置请求，立即重试并重置截图退避");
                         target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
                     } else {

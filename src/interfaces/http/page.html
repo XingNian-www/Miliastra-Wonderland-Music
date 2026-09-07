@@ -2040,6 +2040,13 @@ function showConfigMessage(text,kind){
   el.classList.remove('hidden')
 }
 function clearConfigMessage(){const el=$('configMessage');if(el)el.classList.add('hidden')}
+// 生成适合作为游戏内备注的短昵称，避开 OCR 容易混淆的字符。
+const REMARK_CHARSET='347ACDEFGHKNPQRTUVWXYacdefhknprtuwxy'
+function randomRemarkNickname(){
+  const bytes=new Uint8Array(6)
+  crypto.getRandomValues(bytes)
+  return [...bytes].map(byte=>REMARK_CHARSET[byte%REMARK_CHARSET.length]).join('')
+}
 function identityRandomUuid(){
   if(typeof crypto.randomUUID==='function')return crypto.randomUUID()
   const bytes=new Uint8Array(16)
@@ -2117,7 +2124,7 @@ function identityAddRow(){
   let nickname=String($('identityNewNickname').value||'').trim()
   const note=String($('identityNewNote').value||'').trim()
   const role=$('identityNewRole').value||'friend'
-  if(!nickname){showConfigMessage('请输入游戏内昵称','err');return}
+  if(!nickname){nickname=randomRemarkNickname()}
   if(items.some(m=>m&&m.nickname===nickname)){showConfigMessage('昵称 '+nickname+' 已存在','err');return}
   if(role==='owner'&&items.some(m=>m&&m.role==='owner')){showConfigMessage('主人只能有一位','err');return}
   items.push({nickname:nickname,id:identityRandomUuid(),role:role,note:note})
@@ -2126,11 +2133,18 @@ function identityAddRow(){
   $('identityNewNickname').value='';$('identityNewNote').value=''
   showConfigMessage('已添加「'+nickname+'」，记得保存','ok')
 }
+async function identityCopyRandomNickname(){
+  const nick=randomRemarkNickname()
+  $('identityNewNickname').value=nick
+  try{await navigator.clipboard.writeText(nick);showConfigMessage('已生成并填入/复制昵称: '+nick,'ok')}
+  catch{showConfigMessage('已生成昵称: '+nick,'ok')}
+}
 function identityMappingsEditor(path,value){
   const id=configControlId(path)
   const text=value==null?'[]':JSON.stringify(value,null,2)
   return '<textarea id="'+id+'" data-cfg="'+path+'" data-cfg-object="1" style="display:none" data-identity-editor="1">'+esc(text)+'</textarea>'
-    +'<div class="identity-add-row"><input id="identityNewNickname" placeholder="游戏内昵称">'
+    +'<div class="identity-add-row"><button type="button" class="btn small" onclick="identityCopyRandomNickname()">生成随机昵称</button>'
+    +'<input id="identityNewNickname" placeholder="游戏内昵称（留空自动随机）">'
     +'<input id="identityNewNote" placeholder="显示昵称（可选）">'
     +'<select id="identityNewRole"><option value="friend">好友</option><option value="admin">管理员</option><option value="owner">主人</option></select>'
     +'<button type="button" class="btn small primary" onclick="identityAddRow()">添加</button></div>'

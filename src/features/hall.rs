@@ -33,6 +33,7 @@ pub(crate) struct HallStateService {
     clock: Arc<dyn Clock>,
     wall_clock: Arc<dyn WallClock>,
     countdown_updated_at: Option<Instant>,
+    countdown_elapsed_before_start: Duration,
 }
 
 impl HallStateService {
@@ -43,11 +44,7 @@ impl HallStateService {
         wall_clock: Arc<dyn WallClock>,
     ) -> Result<Self> {
         let state = PersistentHallState::load(path, store)?;
-        let mut service = Self::from_state(state, clock, wall_clock);
-        if service.clear_countdown_cache()? {
-            log::info!("启动时已清理上次运行的大厅倒计时缓存，等待本次大厅检测重新确认");
-        }
-        Ok(service)
+        Ok(Self::from_state(state, clock, wall_clock))
     }
 
     #[cfg(test)]
@@ -69,6 +66,7 @@ impl HallStateService {
             clock,
             wall_clock,
             countdown_updated_at: None,
+            countdown_elapsed_before_start: Duration::ZERO,
         };
         service.refresh_countdown_anchor();
         service
@@ -80,12 +78,12 @@ impl HallStateService {
             (snapshot.remaining_minutes, self.countdown_updated_at)
         {
             let elapsed_minutes = self
-                .clock
-                .now()
-                .saturating_duration_since(updated_at)
+                .countdown_elapsed_before_start
+                .saturating_add(self.clock.now().saturating_duration_since(updated_at))
                 .as_secs()
                 / 60;
-            snapshot.remaining_minutes = Some(minutes.saturating_sub(elapsed_minutes as u32));
+            snapshot.remaining_minutes =
+                Some(u64::from(minutes).saturating_sub(elapsed_minutes) as u32);
         }
         snapshot
     }
@@ -109,7 +107,8 @@ impl HallStateService {
             state.update_remaining_minutes(minutes, updated_at);
             true
         })?;
-        self.countdown_updated_at = (minutes > 0).then(|| self.clock.now());
+        self.countdown_updated_at = Some(self.clock.now());
+        self.countdown_elapsed_before_start = Duration::ZERO;
         Ok(())
     }
 
@@ -119,24 +118,28 @@ impl HallStateService {
             true
         })?;
         self.countdown_updated_at = None;
+        self.countdown_elapsed_before_start = Duration::ZERO;
         Ok(())
     }
 
     pub(crate) fn clear_countdown_cache(&mut self) -> Result<bool> {
         let cleared = self.state.update(HallRuntimeState::clear_countdown_cache)?;
         self.countdown_updated_at = None;
+        self.countdown_elapsed_before_start = Duration::ZERO;
         Ok(cleared)
     }
 
     fn refresh_countdown_anchor(&mut self) {
+        self.countdown_elapsed_before_start = Duration::ZERO;
         self.countdown_updated_at = match (
             self.state.state().remaining_minutes,
             self.state.state().remaining_updated_at,
         ) {
-            (Some(minutes), Some(updated_at)) if minutes > 0 => {
-                let now = self.clock.now();
-                let elapsed = self.wall_clock.unix_seconds().saturating_sub(updated_at);
-                now.checked_sub(Duration::from_secs(elapsed)).or(Some(now))
+            (Some(_), Some(updated_at)) => {
+                // Wall time accounts for downtime; active countdowns use the monotonic clock.
+                self.countdown_elapsed_before_start =
+                    Duration::from_secs(self.wall_clock.unix_seconds().saturating_sub(updated_at));
+                Some(self.clock.now())
             }
             _ => None,
         };
@@ -482,6 +485,61 @@ mod tests {
         assert_eq!(snapshot.remaining_minutes_now(), Some(4));
         assert_eq!(snapshot.remaining_updated_at, Some(1_234));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restarting_preserves_countdown_deadline_and_expiry_warning() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "miliastra-hall-restart-{}-{suffix}.json",
+            std::process::id()
+        ));
+        let store = crate::test_support::test_state_store();
+        let initial_clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_234));
+        let mut service = HallStateService::load(
+            path.clone(),
+            store.clone(),
+            initial_clock.clone(),
+            initial_clock,
+        )
+        .unwrap();
+        service.update_remaining_minutes(5).unwrap();
+        service
+            .patch(HallStatePatch {
+                expiring_warning_sent: Some(true),
+                ..HallStatePatch::default()
+            })
+            .unwrap();
+        drop(service);
+
+        let restarted_clock = Arc::new(ManualClock::with_unix_seconds(Instant::now(), 1_234 + 121));
+        let service = HallStateService::load(
+            path.clone(),
+            store.clone(),
+            restarted_clock.clone(),
+            restarted_clock.clone(),
+        )
+        .unwrap();
+        assert_eq!(service.snapshot().remaining_minutes_now(), Some(3));
+        assert!(service.snapshot().expiring_warning_sent);
+
+        restarted_clock.advance(Duration::from_secs(179)).unwrap();
+        assert_eq!(service.snapshot().remaining_minutes_now(), Some(0));
+        drop(service);
+
+        restarted_clock.advance(Duration::from_secs(60)).unwrap();
+        let expired = HallStateService::load(
+            path.clone(),
+            store,
+            restarted_clock.clone(),
+            restarted_clock,
+        )
+        .unwrap();
+        assert_eq!(expired.snapshot().remaining_minutes_now(), Some(0));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

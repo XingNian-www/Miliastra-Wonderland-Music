@@ -22,6 +22,7 @@ use crate::ui::locator::{
 };
 
 const HALL_MEMBER_SCROLL_THRESHOLD: u32 = 7;
+const HALL_PAGE_READY_TIMEOUT_MS: u64 = 15_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReadHallInfo;
@@ -321,15 +322,9 @@ fn read_hall_info_transaction(
         )
     })?;
     *opened = true;
-    sleep_ms(config.page_settle_ms);
-
-    let initial_image = capture_normalized(
-        context,
-        &config.residency,
-        "capture_hall_screenshot",
-        InputCertainty::AfterInputUnknown,
-    )?;
-    let mut detection_image = initial_image.clone();
+    let (initial_image, initial_sample) = wait_for_hall_page_ready(context, ocr, config)?;
+    let mut samples = Vec::with_capacity(HALL_INFO_OCR_SAMPLES);
+    samples.push(initial_sample);
     let mut screenshot = initial_image.clone();
     match read_hall_member_count(ocr, &initial_image, config) {
         Ok(Some(member_count)) => {
@@ -344,26 +339,14 @@ fn read_hall_info_transaction(
                     .device()
                     .drag_point(from.x, from.y, to.x, to.y)
                     .map_err(|error| after_input_failure("drag_hall_member_list", error))?;
-                sleep_ms(config.page_settle_ms);
-                let top_image = capture_normalized(
-                    context,
-                    &config.residency,
-                    "capture_top_hall_screenshot",
-                    InputCertainty::AfterInputUnknown,
-                );
+                let top_image = wait_for_hall_page_ready(context, ocr, config);
                 context
                     .device()
                     .drag_point(to.x, to.y, from.x, from.y)
                     .map_err(|error| after_input_failure("restore_hall_member_list", error))?;
-                sleep_ms(config.page_settle_ms);
-                let bottom_image = capture_normalized(
-                    context,
-                    &config.residency,
-                    "capture_bottom_hall_screenshot",
-                    InputCertainty::AfterInputUnknown,
-                )?;
-                let top_image = top_image?;
-                detection_image = bottom_image.clone();
+                let (top_image, top_sample) = top_image?;
+                let (bottom_image, bottom_sample) = wait_for_hall_page_ready(context, ocr, config)?;
+                samples.extend([top_sample, bottom_sample]);
                 screenshot = merge_hall_screenshots(&top_image, &bottom_image);
             }
         }
@@ -371,23 +354,17 @@ fn read_hall_info_transaction(
         Err(failure) => log::warn!("大厅成员人数 OCR 失败，跳过成员列表滚动: {failure}"),
     }
     let screenshot = Arc::new(screenshot);
-    let mut samples = Vec::with_capacity(HALL_INFO_OCR_SAMPLES);
-    for index in 0..HALL_INFO_OCR_SAMPLES {
-        if index > 0 {
-            sleep_ms(config.sample_interval_ms);
-        }
-        let image = if index == 0 {
-            &detection_image
-        } else {
-            detection_image = capture_normalized(
-                context,
-                &config.residency,
-                "capture_hall_info",
-                InputCertainty::AfterInputUnknown,
-            )?;
-            &detection_image
-        };
-        let sample = read_hall_sample(ocr, image, config)?;
+    while samples.len() < HALL_INFO_OCR_SAMPLES {
+        sleep_ms(config.sample_interval_ms);
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "capture_hall_info",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        samples.push(read_hall_sample(ocr, &image, config)?);
+    }
+    for (index, sample) in samples.iter().enumerate() {
         log::info!(
             "大厅检测 OCR 采样: {}/{} name={} time={} minutes={}",
             index + 1,
@@ -399,9 +376,66 @@ fn read_hall_info_transaction(
                 .map(|minutes| minutes.to_string())
                 .unwrap_or_else(|| "未知".to_string())
         );
-        samples.push(sample);
     }
     Ok((merge_hall_info_samples(&samples), screenshot))
+}
+
+fn wait_for_hall_page_ready(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &HallRoutineConfig,
+) -> Result<(image::DynamicImage, HallInfoSample), UiRoutineFailure> {
+    // F2 can leave a black transition frame longer than the normal settle delay. Do not
+    // return that frame as the screenshot; wait for visible hall content and reuse its OCR
+    // result in the normal hall-info samples.
+    sleep_ms(config.page_settle_ms);
+    let timeout_ms = HALL_PAGE_READY_TIMEOUT_MS.max(config.page_settle_ms);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let poll_ms = config.sample_interval_ms.max(50);
+    loop {
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "wait_hall_page_ready",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        if hall_page_has_content(&image, config)? {
+            let sample = read_hall_sample(ocr, &image, config)?;
+            if !sample.name.trim().is_empty()
+                || sample.remaining_minutes.is_some()
+                || !sample.time_text.trim().is_empty()
+            {
+                return Ok((image, sample));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
+                "wait_hall_page_ready",
+                "hall page did not produce visible OCR content before timeout",
+            ));
+        }
+        sleep_ms(poll_ms);
+    }
+}
+
+fn hall_page_has_content(
+    image: &image::DynamicImage,
+    config: &HallRoutineConfig,
+) -> Result<bool, UiRoutineFailure> {
+    for region in [config.hall_name_region, config.hall_time_region] {
+        let crop = crop_canvas(image, region)
+            .map_err(|error| after_input_failure("check_hall_page_visibility", error))?;
+        let lit_pixels = crop
+            .to_luma8()
+            .pixels()
+            .filter(|pixel| pixel[0] >= 24)
+            .count();
+        if lit_pixels >= 8 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn read_hall_member_count(
@@ -544,6 +578,8 @@ mod tests {
     struct TransitionHallDevice {
         primary: DynamicImage,
         keys: Arc<Mutex<Vec<Key>>>,
+        fail_entry_capture: bool,
+        captures_after_f2: usize,
         captures_after_escape: usize,
     }
 
@@ -552,6 +588,20 @@ mod tests {
             let last_key = self.keys.lock().unwrap().last().cloned();
             match last_key {
                 None => Ok(self.primary.clone()),
+                Some(Key::F2) => {
+                    self.captures_after_f2 += 1;
+                    if self.fail_entry_capture && self.captures_after_f2 > 2 {
+                        anyhow::bail!("hall capture failed");
+                    }
+                    if self.captures_after_f2 <= 2 {
+                        Ok(DynamicImage::new_rgba8(
+                            self.primary.width(),
+                            self.primary.height(),
+                        ))
+                    } else {
+                        Ok(self.primary.clone())
+                    }
+                }
                 Some(Key::Escape) => {
                     self.captures_after_escape += 1;
                     if self.captures_after_escape <= 2 {
@@ -732,7 +782,16 @@ mod tests {
     }
 
     #[test]
-    fn hall_exit_treats_unknown_frames_as_transition_until_primary_is_stable() {
+    fn hall_screenshot_skips_black_entry_frames_and_waits_for_primary_after_exit() {
+        assert_hall_transition_outcome(false);
+    }
+
+    #[test]
+    fn hall_screenshot_failure_after_black_frames_still_recovers_primary() {
+        assert_hall_transition_outcome(true);
+    }
+
+    fn assert_hall_transition_outcome(fail_entry_capture: bool) {
         let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.click_ms = 0;
@@ -745,6 +804,8 @@ mod tests {
             TransitionHallDevice {
                 primary: primary_frame(&config),
                 keys: keys.clone(),
+                fail_entry_capture,
+                captures_after_f2: 0,
                 captures_after_escape: 0,
             },
             &config,
@@ -762,16 +823,21 @@ mod tests {
             HallRoutineConfig::from_app(&config),
         );
 
-        let outcome = hall_ui
-            .submit_detect(DetectPublicHall)
-            .unwrap()
-            .wait()
-            .unwrap();
+        let outcome = hall_ui.submit_read(ReadHallInfo).unwrap().wait().unwrap();
 
-        assert!(matches!(
-            outcome.effect(),
-            DetectPublicHallEffect::Detected { .. }
-        ));
+        if fail_entry_capture {
+            assert!(matches!(outcome.effect(), ReadHallInfoEffect::Failed(_)));
+            assert!(outcome.screenshot().is_none());
+        } else {
+            assert!(matches!(outcome.effect(), ReadHallInfoEffect::Read(_)));
+            assert_eq!(
+                outcome
+                    .screenshot()
+                    .expect("visible hall screenshot")
+                    .to_rgba8(),
+                primary_frame(&config).to_rgba8()
+            );
+        }
         assert!(
             matches!(
                 outcome.residency(),
@@ -797,6 +863,14 @@ mod tests {
                 config.screen.friend_rect.y as u32,
             )
             .unwrap();
+        for y in config.screen.hall_name_rect.y as u32..(config.screen.hall_name_rect.y as u32 + 10)
+        {
+            for x in
+                config.screen.hall_name_rect.x as u32..(config.screen.hall_name_rect.x as u32 + 10)
+            {
+                frame.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
         frame
     }
 }

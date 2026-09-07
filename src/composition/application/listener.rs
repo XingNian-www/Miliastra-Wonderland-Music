@@ -309,12 +309,23 @@ impl ApplicationRuntime {
         reason: &str,
     ) -> Result<bool> {
         let cleared = self.business.business.clear_hall_countdown_cache()?;
-        let visual_session = self.ui.chat_observations.begin_visual_session()?;
+        self.reset_chat_observation_baseline(reason)?;
         if cleared {
             log::info!("{reason}，已清理大厅倒计时缓存，等待本次大厅检测重新确认");
         }
-        log::info!("{reason}，聊天观察进入新视觉会话: {}", visual_session.get());
         Ok(cleared)
+    }
+
+    pub(super) fn reset_chat_observation_baseline(&self, reason: &str) -> Result<()> {
+        self.ui
+            .chat_baseline_primed
+            .store(false, AtomicOrdering::SeqCst);
+        let visual_session = self.ui.chat_observations.begin_visual_session()?;
+        log::info!(
+            "{reason}，聊天观察进入新视觉会话，下一屏消息仅建立基线: {}",
+            visual_session.get()
+        );
+        Ok(())
     }
 
     pub(super) fn scan_chat_with_shared_ocr(
@@ -592,6 +603,7 @@ impl ApplicationRuntime {
         let mut force_scan_after: Option<Instant> = None;
         let mut force_scan_reason: Option<&'static str> = None;
         let mut primary_visible = false;
+        let mut game_location_baseline_reset = false;
         let mut secondary_friend_bubble_fingerprint: Option<ChangeFingerprint> = None;
         let mut secondary_hall_bubble_sequence: Option<Vec<SecondaryHallBubble>> = None;
         let mut secondary_hall_command_tracker = SecondaryHallCommandTracker::default();
@@ -712,11 +724,7 @@ impl ApplicationRuntime {
                     );
                     if target_missing {
                         log::info!("目标窗口已恢复，重置截图退避");
-                        let visual_session = self.ui.chat_observations.begin_visual_session()?;
-                        log::info!(
-                            "目标窗口恢复，聊天观察进入新视觉会话: {}",
-                            visual_session.get()
-                        );
+                        self.reset_chat_observation_baseline("目标窗口恢复")?;
                         target_missing = false;
                     }
                     target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
@@ -758,6 +766,10 @@ impl ApplicationRuntime {
                     match &ui_state_result {
                         Ok((_, Some(kind @ (UiStateKind::GameGate | UiStateKind::Overworld)))) => {
                             unresolved_ui_since = None;
+                            if !game_location_baseline_reset {
+                                self.reset_chat_observation_baseline("已确认处于大门或主世界")?;
+                                game_location_baseline_reset = true;
+                            }
                             if !command_executing
                                 && listener_snapshot.pending_mode.is_none()
                                 && Instant::now() >= automatic_startup_retry_after
@@ -773,6 +785,7 @@ impl ApplicationRuntime {
                         }
                         Ok((ui_state, Some(ui_kind))) => {
                             unresolved_ui_since = None;
+                            game_location_baseline_reset = false;
                             let mode_matches = listener_mode_matches_ui(
                                 listener_snapshot.mode,
                                 listener_snapshot.temporary_primary,
@@ -1527,7 +1540,6 @@ impl ApplicationRuntime {
             log::debug!("没有找到聊天标志，本轮不更新命令锁");
             return Ok(());
         }
-
         let mut parsed = Vec::new();
         for (_, observed) in primary_command_candidates(&observed_messages) {
             let message = &observed.message;

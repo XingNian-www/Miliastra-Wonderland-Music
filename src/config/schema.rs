@@ -698,6 +698,12 @@ fn screen_section() -> Vec<ConfigFieldSchema> {
             "二级大厅/面板界面模板检测区域",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "world_wish_rect",
+            "主世界祈愿区域",
+            FieldKind::Rect,
+            "主世界右上角祈愿图标搜索区域，覆盖图标栏以适应横向位置变化；仅持续未知时探测",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "hall_name_rect",
             "大厅名称区域",
             FieldKind::Rect,
@@ -918,7 +924,7 @@ fn ocr_section() -> Vec<ConfigFieldSchema> {
     ]
 }
 
-/// templates 段：15 个模板图片路径与匹配阈值。
+/// templates 段：模板图片路径与匹配阈值。
 fn templates_section() -> Vec<ConfigFieldSchema> {
     vec![
         ConfigFieldSchema::db_idle_reload(
@@ -956,6 +962,12 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
             "二级大厅模板",
             FieldKind::Path,
             "二级大厅/面板界面模板",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "world_wish",
+            "主世界祈愿模板",
+            FieldKind::Path,
+            "主世界右上角祈愿图标的透明 PNG 模板；仅持续未知时参与状态识别",
         ),
         ConfigFieldSchema::db_idle_reload(
             "invite_view_star",
@@ -1016,6 +1028,12 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
             "匹配阈值",
             float(0.0, 1.0),
             "UI/聊天标志模板匹配阈值，越高越严格",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "world_wish_threshold",
+            "祈愿匹配阈值",
+            float(0.0, 1.0),
+            "主世界祈愿模板的独立匹配阈值，越高越严格",
         ),
     ]
 }
@@ -1712,7 +1730,7 @@ fn startup_section() -> Vec<ConfigFieldSchema> {
             "enabled",
             "启用启动流程",
             FieldKind::Bool,
-            "程序启动后是否按配置自动排队执行“启动游戏”和“进入千星”",
+            "启用游戏启动及根据界面状态自动进入游戏、进入千星",
         ),
         ConfigFieldSchema::db_idle_reload(
             "launch_game",
@@ -1722,15 +1740,15 @@ fn startup_section() -> Vec<ConfigFieldSchema> {
         ),
         ConfigFieldSchema::db_idle_reload(
             "enter_game",
-            "进入游戏",
+            "自动进入游戏",
             FieldKind::Bool,
-            "是否处理“点击进入”等开门按钮",
+            "持续未知时 OCR 检测到“点击进入”，确认大门界面后自动进入游戏",
         ),
         ConfigFieldSchema::db_idle_reload(
             "enter_wonderland",
-            "进入千星",
+            "自动进入千星",
             FieldKind::Bool,
-            "是否按 M 打开地图，进入千星奇域大厅后停止",
+            "持续未知时匹配到祈愿图标，确认主世界后自动进入千星奇域大厅",
         ),
         ConfigFieldSchema::db_idle_reload(
             "exe_path",

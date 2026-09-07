@@ -37,10 +37,6 @@ pub(crate) struct HallStatePatch {
 
 impl HallRuntimeState {
     pub(crate) fn update_remaining_minutes(&mut self, minutes: u32, updated_at: u64) {
-        if minutes == 0 {
-            self.clear_remaining_minutes();
-            return;
-        }
         self.remaining_minutes = Some(minutes);
         self.remaining_updated_at = Some(updated_at);
         if minutes > HALL_EXPIRING_WARNING_MINUTES {
@@ -147,6 +143,18 @@ mod tests {
         let mut state = HallRuntimeState::default();
 
         assert!(!state.clear_countdown_cache());
+    }
+
+    #[test]
+    fn zero_minutes_records_an_expired_hall_until_the_hall_changes() {
+        let mut state = HallRuntimeState::default();
+
+        state.update_remaining_minutes(0, 123);
+
+        assert_eq!(state.remaining_minutes_now(), Some(0));
+        assert_eq!(state.remaining_updated_at, Some(123));
+        assert!(state.clear_countdown_cache());
+        assert_eq!(state.remaining_minutes_now(), None);
     }
 
     #[test]

@@ -157,6 +157,28 @@ impl ApplicationRuntime {
             .map_err(anyhow::Error::from)
     }
 
+    pub(super) fn maybe_pause_expired_hall(&self, pause_applied: bool) -> Result<bool> {
+        if self
+            .business
+            .business
+            .hall_state_snapshot()?
+            .remaining_minutes_now()
+            != Some(0)
+        {
+            return Ok(false);
+        }
+        if pause_applied {
+            return Ok(true);
+        }
+        let lyrics_result = self.stop_background_lyrics_output();
+        let pause_result = self.playback.player.pause_for_hall_expiry();
+        self.update_monitor_playback_controller();
+        lyrics_result?;
+        pause_result?;
+        log::info!("大厅倒计时已结束，未确认进入新大厅，已暂停播放并停止歌词");
+        Ok(true)
+    }
+
     pub(super) fn maybe_idle_exit(&self) -> Result<()> {
         let Some(timeout) = self.business.business.claim_idle_exit(Instant::now())? else {
             return Ok(());

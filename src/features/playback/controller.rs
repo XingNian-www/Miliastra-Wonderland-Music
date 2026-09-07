@@ -409,23 +409,42 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     /// the first operation; the backend pause remains best effort and its error
     /// is returned to the caller for logging.
     pub(crate) fn pause_for_idle_exit(&self) -> Result<String> {
+        self.pause_automatically("idle_exit", "闲置退出")
+    }
+
+    pub(crate) fn pause_for_hall_expiry(&self) -> Result<String> {
+        // Block automatic advances now, then pause the session after any in-flight load finishes.
+        self.playback_state
+            .update(PlaybackStateUpdate::UserPaused)?;
+        let _lease = self
+            .playback_operation_lease
+            .lock()
+            .map_err(|_| anyhow!("播放操作 lease 锁已损坏"))?;
+        self.pause_automatically("hall_expired", "大厅到期")
+    }
+
+    fn pause_automatically(&self, reason: &str, label: &str) -> Result<String> {
         self.playback_state
             .update(PlaybackStateUpdate::UserPaused)?;
         let tracker_result = self.clear_external_playback_tracker();
         let requested_at_ms = self.wall_clock.unix_millis();
         let pause_result = self.backend.pause();
-        self.record_control_outcome("pause_idle_exit", requested_at_ms, pause_result.is_ok());
+        self.record_control_outcome(
+            &format!("pause_{reason}"),
+            requested_at_ms,
+            pause_result.is_ok(),
+        );
         match (tracker_result, pause_result) {
             (Ok(()), Ok(message)) => {
-                log::info!("播放器状态转移: pause_reason=user reason=idle_exit");
+                log::info!("播放器状态转移: pause_reason=user reason={reason}");
                 Ok(message)
             }
             (Err(tracker_error), Ok(_)) => Err(anyhow!(
-                "闲置退出暂停成功，但清理外部播放追踪失败: {tracker_error:#}"
+                "{label}暂停成功，但清理外部播放追踪失败: {tracker_error:#}"
             )),
             (Ok(()), Err(pause_error)) => Err(pause_error),
             (Err(tracker_error), Err(pause_error)) => Err(anyhow!(
-                "闲置退出清理外部播放追踪失败: {tracker_error:#}; 暂停播放器失败: {pause_error:#}"
+                "{label}清理外部播放追踪失败: {tracker_error:#}; 暂停播放器失败: {pause_error:#}"
             )),
         }
     }
@@ -5056,12 +5075,90 @@ mod tests {
     }
 
     #[test]
-    fn idle_pause_keeps_the_auto_advance_gate_when_backend_pause_fails() {
+    fn automatic_pause_keeps_the_auto_advance_gate_when_backend_pause_fails() {
         let backend = FakeBackend::new(vec![]).with_pause_error();
         let controller = controller(backend);
 
         assert!(controller.pause_for_idle_exit().is_err());
         assert!(controller.user_pause_active().unwrap());
+        assert!(controller.pause_for_hall_expiry().is_err());
+        assert!(controller.user_pause_active().unwrap());
+    }
+
+    #[test]
+    fn hall_expiry_pause_keeps_the_active_song_and_blocks_automatic_advance() {
+        let controller = controller(FakeBackend::new(vec![]));
+        enter_confirmed_playing(&controller);
+        let before = controller.playback_state.snapshot().unwrap();
+
+        controller.pause_for_hall_expiry().unwrap();
+
+        let paused = controller.playback_state.snapshot().unwrap();
+        assert_eq!(paused.state, ConfirmedPlaybackState::PausedByUser);
+        assert_eq!(paused.pause_reason, PauseReason::User);
+        assert_eq!(
+            paused
+                .active_request
+                .as_ref()
+                .and_then(ActivePlaybackRequest::identity),
+            before
+                .active_request
+                .as_ref()
+                .and_then(ActivePlaybackRequest::identity),
+        );
+        assert_eq!(paused.last_observation, before.last_observation);
+        assert_eq!(*controller.backend.paused.lock().unwrap(), 1);
+        assert_eq!(
+            controller
+                .maybe_advance_queue(
+                    status("目标", "miliastra://track/qqmusic/1", 42.0, 180.0),
+                    QueueAdvanceContext {
+                        queue_empty: false,
+                        has_pending_playback_task: false,
+                        command_executing: false,
+                    },
+                )
+                .unwrap(),
+            QueueAdvanceDecision::None,
+        );
+    }
+
+    #[test]
+    fn hall_expiry_waits_for_in_flight_recovery_before_pausing() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let backend =
+            FakeBackend::new(vec![]).with_restore_barriers(entered.clone(), release.clone());
+        let controller = controller(backend.clone());
+        enter_confirmed_playing(&controller);
+        let recovering = controller.clone();
+        let recovery = std::thread::spawn(move || recovering.play_restored());
+        entered.wait();
+
+        let (pause_result_tx, pause_result_rx) = mpsc::channel();
+        let pausing = controller.clone();
+        let pause = std::thread::spawn(move || {
+            pause_result_tx
+                .send(pausing.pause_for_hall_expiry())
+                .unwrap();
+        });
+        let early_pause = pause_result_rx.recv_timeout(Duration::from_millis(100));
+        release.wait();
+        recovery.join().unwrap().unwrap();
+        pause.join().unwrap();
+
+        assert!(matches!(early_pause, Err(RecvTimeoutError::Timeout)));
+        pause_result_rx.recv().unwrap().unwrap();
+        assert_eq!(*backend.paused.lock().unwrap(), 1);
+        assert!(controller.user_pause_active().unwrap());
+        assert!(
+            controller
+                .playback_state
+                .snapshot()
+                .unwrap()
+                .active_request
+                .is_some()
+        );
     }
 
     #[test]

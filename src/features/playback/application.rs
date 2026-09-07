@@ -433,6 +433,9 @@ pub(crate) struct LyricTracker {
 
 impl LyricTracker {
     pub(crate) fn observe(&mut self, status: &PlayerStatus) -> bool {
+        if status.status != "playing" {
+            return false;
+        }
         let key = status
             .current_track
             .as_ref()
@@ -693,7 +696,7 @@ impl PlaybackApplication {
 
         loop {
             if port.should_stop_continuous_lyrics()? {
-                log::info!("持续歌词输出因正式任务到来结束");
+                log::info!("持续歌词输出已结束");
                 break;
             }
 
@@ -1467,6 +1470,39 @@ mod tests {
     use super::*;
     use crate::features::playback::{test_candidate, test_track};
     use miliastra_kernel::clock::{Clock, ManualClock};
+
+    #[test]
+    fn lyrics_wait_for_playback_and_resume_without_repeating_the_previous_line() {
+        let mut tracker = LyricTracker::default();
+        let mut status = PlayerStatus {
+            current_track: Some(test_track("miliastra://track/qqmusic/1", "song - artist")),
+            status: "paused".to_string(),
+            lyric_line_text: "第一句".to_string(),
+            ..PlayerStatus::default()
+        };
+
+        assert!(!tracker.observe(&status));
+        status.status = "playing".to_string();
+        assert!(tracker.observe(&status));
+        status.status = "paused".to_string();
+        assert!(!tracker.observe(&status));
+        status.status = "playing".to_string();
+        assert!(!tracker.observe(&status));
+
+        status.status = "paused".to_string();
+        status.lyric_line_text = "第二句".to_string();
+        assert!(!tracker.observe(&status));
+        status.status = "playing".to_string();
+        assert!(tracker.observe(&status));
+
+        status.status = "stopped".to_string();
+        status.lyric_line_text = "第三句".to_string();
+        assert!(!tracker.observe(&status));
+        status.status = "playing".to_string();
+        status.current_track = Some(test_track("miliastra://track/qqmusic/2", "next - artist"));
+        status.lyric_line_text = "第二句".to_string();
+        assert!(tracker.observe(&status));
+    }
 
     struct MonitorPort {
         clock: Arc<ManualClock>,

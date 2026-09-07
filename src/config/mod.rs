@@ -782,11 +782,21 @@ pub struct ScreenConfig {
     pub friend_rect: RectConfig,
     pub secondary_back_rect: RectConfig,
     pub secondary_hall_rect: RectConfig,
+    #[serde(default = "default_world_wish_rect")]
     pub world_wish_rect: RectConfig,
     pub hall_name_rect: RectConfig,
     pub hall_member_count_rect: RectConfig,
     pub hall_time_rect: RectConfig,
     pub hall_member_list_rect: RectConfig,
+}
+
+fn default_world_wish_rect() -> RectConfig {
+    RectConfig {
+        x: 1300,
+        y: 0,
+        width: 620,
+        height: 110,
+    }
 }
 
 impl Default for ScreenConfig {
@@ -822,12 +832,7 @@ impl Default for ScreenConfig {
                 width: 65,
                 height: 55,
             },
-            world_wish_rect: RectConfig {
-                x: 1300,
-                y: 0,
-                width: 620,
-                height: 110,
-            },
+            world_wish_rect: default_world_wish_rect(),
             hall_name_rect: RectConfig {
                 x: 75,
                 y: 425,
@@ -1291,6 +1296,7 @@ pub struct TemplateConfig {
     pub friend: PathBuf,
     pub secondary_back: PathBuf,
     pub secondary_hall: PathBuf,
+    #[serde(default = "default_world_wish_template")]
     pub world_wish: PathBuf,
     pub invite_view_star: PathBuf,
     pub invite_goto_hall: PathBuf,
@@ -1302,7 +1308,16 @@ pub struct TemplateConfig {
     pub friend_blacklist: PathBuf,
     pub friend_confirm: PathBuf,
     pub marker_threshold: f32,
+    #[serde(default = "default_world_wish_threshold")]
     pub world_wish_threshold: f32,
+}
+
+fn default_world_wish_template() -> PathBuf {
+    PathBuf::from("deps/assets/world-wish.png")
+}
+
+fn default_world_wish_threshold() -> f32 {
+    0.95
 }
 
 impl Default for TemplateConfig {
@@ -1317,7 +1332,7 @@ impl Default for TemplateConfig {
             friend: PathBuf::from("deps/assets/ui-primary-friend.png"),
             secondary_back: PathBuf::from("deps/assets/ui-secondary-back.png"),
             secondary_hall: PathBuf::from("deps/assets/ui-secondary-hall.png"),
-            world_wish: PathBuf::from("deps/assets/world-wish.png"),
+            world_wish: default_world_wish_template(),
             invite_view_star: PathBuf::from("deps/assets/invite-view-star.png"),
             invite_goto_hall: PathBuf::from("deps/assets/invite-goto-hall.png"),
             invite_enter_hall: PathBuf::from("deps/assets/invite-enter-hall.png"),
@@ -1328,7 +1343,7 @@ impl Default for TemplateConfig {
             friend_blacklist: PathBuf::from("deps/assets/friend-blacklist.png"),
             friend_confirm: PathBuf::from("deps/assets/friend-confirm.png"),
             marker_threshold: 0.9,
-            world_wish_threshold: 0.95,
+            world_wish_threshold: default_world_wish_threshold(),
         }
     }
 }

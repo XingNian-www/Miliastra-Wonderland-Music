@@ -395,7 +395,7 @@ fn timing_section() -> Vec<ConfigFieldSchema> {
             "hall.page_settle_ms",
             "大厅页面稳定等待",
             int(1, MAX_TIMEOUT_MS),
-            "进入/退出大厅页面后等待页面稳定的时间，单位毫秒",
+            "进入大厅页面或滚动成员列表后的初始等待时间，单位毫秒；之后继续检测页面是否可读",
         ),
         ConfigFieldSchema::db_idle_reload(
             "hall.ocr_sample_interval_ms",

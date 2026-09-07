@@ -1910,6 +1910,11 @@ fn web_tool_templates_expose_configured_fixed_regions() {
             marker_threshold,
         ),
         (
+            "world-wish",
+            state.config.screen.world_wish_rect,
+            state.config.templates.world_wish_threshold,
+        ),
+        (
             "invite-view-star",
             state.config.invite.view_star_region,
             marker_threshold,

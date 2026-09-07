@@ -595,6 +595,7 @@ impl AppConfig {
             &mut self.templates.friend,
             &mut self.templates.secondary_back,
             &mut self.templates.secondary_hall,
+            &mut self.templates.world_wish,
             &mut self.templates.invite_view_star,
             &mut self.templates.invite_goto_hall,
             &mut self.templates.invite_enter_hall,
@@ -781,6 +782,7 @@ pub struct ScreenConfig {
     pub friend_rect: RectConfig,
     pub secondary_back_rect: RectConfig,
     pub secondary_hall_rect: RectConfig,
+    pub world_wish_rect: RectConfig,
     pub hall_name_rect: RectConfig,
     pub hall_member_count_rect: RectConfig,
     pub hall_time_rect: RectConfig,
@@ -820,6 +822,12 @@ impl Default for ScreenConfig {
                 width: 65,
                 height: 55,
             },
+            world_wish_rect: RectConfig {
+                x: 1300,
+                y: 0,
+                width: 620,
+                height: 110,
+            },
             hall_name_rect: RectConfig {
                 x: 75,
                 y: 425,
@@ -855,6 +863,7 @@ impl ScreenConfig {
             (self.friend_rect, "screen.friend_rect"),
             (self.secondary_back_rect, "screen.secondary_back_rect"),
             (self.secondary_hall_rect, "screen.secondary_hall_rect"),
+            (self.world_wish_rect, "screen.world_wish_rect"),
             (self.hall_name_rect, "screen.hall_name_rect"),
             (self.hall_member_count_rect, "screen.hall_member_count_rect"),
             (self.hall_time_rect, "screen.hall_time_rect"),
@@ -1282,6 +1291,7 @@ pub struct TemplateConfig {
     pub friend: PathBuf,
     pub secondary_back: PathBuf,
     pub secondary_hall: PathBuf,
+    pub world_wish: PathBuf,
     pub invite_view_star: PathBuf,
     pub invite_goto_hall: PathBuf,
     pub invite_enter_hall: PathBuf,
@@ -1292,6 +1302,7 @@ pub struct TemplateConfig {
     pub friend_blacklist: PathBuf,
     pub friend_confirm: PathBuf,
     pub marker_threshold: f32,
+    pub world_wish_threshold: f32,
 }
 
 impl Default for TemplateConfig {
@@ -1306,6 +1317,7 @@ impl Default for TemplateConfig {
             friend: PathBuf::from("deps/assets/ui-primary-friend.png"),
             secondary_back: PathBuf::from("deps/assets/ui-secondary-back.png"),
             secondary_hall: PathBuf::from("deps/assets/ui-secondary-hall.png"),
+            world_wish: PathBuf::from("deps/assets/world-wish.png"),
             invite_view_star: PathBuf::from("deps/assets/invite-view-star.png"),
             invite_goto_hall: PathBuf::from("deps/assets/invite-goto-hall.png"),
             invite_enter_hall: PathBuf::from("deps/assets/invite-enter-hall.png"),
@@ -1316,6 +1328,7 @@ impl Default for TemplateConfig {
             friend_blacklist: PathBuf::from("deps/assets/friend-blacklist.png"),
             friend_confirm: PathBuf::from("deps/assets/friend-confirm.png"),
             marker_threshold: 0.9,
+            world_wish_threshold: 0.95,
         }
     }
 }
@@ -1323,6 +1336,7 @@ impl Default for TemplateConfig {
 impl TemplateConfig {
     fn validate(&self) -> Result<()> {
         validate_unit_interval(self.marker_threshold, "templates.marker_threshold")?;
+        validate_unit_interval(self.world_wish_threshold, "templates.world_wish_threshold")?;
         for (path, field) in [
             (&self.blue_marker, "templates.blue_marker"),
             (&self.yellow_marker, "templates.yellow_marker"),
@@ -1330,6 +1344,7 @@ impl TemplateConfig {
             (&self.friend, "templates.friend"),
             (&self.secondary_back, "templates.secondary_back"),
             (&self.secondary_hall, "templates.secondary_hall"),
+            (&self.world_wish, "templates.world_wish"),
             (&self.invite_view_star, "templates.invite_view_star"),
             (&self.invite_goto_hall, "templates.invite_goto_hall"),
             (&self.invite_enter_hall, "templates.invite_enter_hall"),

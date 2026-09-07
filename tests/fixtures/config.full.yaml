@@ -46,6 +46,12 @@ screen:
     y: 190
     width: 65
     height: 55
+  # 主世界右上角祈愿图标搜索区域，覆盖图标栏以适应横向位置变化
+  world_wish_rect:
+    x: 1300
+    y: 0
+    width: 620
+    height: 110
   # F2 大厅页顶部大厅名称 OCR 区域
   hall_name_rect:
     x: 75
@@ -247,6 +253,8 @@ templates:
   secondary_back: assets/ui-secondary-back.png
   # 二级大厅/面板界面模板
   secondary_hall: assets/ui-secondary-hall.png
+  # 主世界右上角祈愿图标透明模板，仅持续未知时探测
+  world_wish: assets/world-wish.png
   # 邀请流程里的“查看千星”按钮模板
   invite_view_star: assets/invite-view-star.png
   # 邀请流程里的“前往其大厅”按钮模板
@@ -267,6 +275,8 @@ templates:
   friend_confirm: assets/friend-confirm.png
   # UI/聊天标志模板匹配阈值，越高越严格
   marker_threshold: 0.9
+  # 祈愿图标独立匹配阈值
+  world_wish_threshold: 0.95
 
 output:
   # 是否真的向游戏内发送回复；false 时只写日志
@@ -609,13 +619,13 @@ hotkeys:
   exit_key: F12
 
 startup:
-  # 程序启动后是否按配置自动排队执行“启动游戏”和“进入千星”
+  # 启用启动游戏及按界面状态持续执行自动进入
   enabled: false
   # 找不到游戏窗口时是否启动游戏
   launch_game: true
-  # 是否处理“点击进入”等开门按钮
+  # 持续未知时识别到“点击进入”，自动进入游戏
   enter_game: true
-  # 是否按 M 打开地图，进入千星奇域大厅后停止
+  # 持续未知时匹配到祈愿图标，自动进入千星奇域大厅
   enter_wonderland: true
   # 启动 EXE 路径；可填完整 exe 文件路径，也可填 exe 所在目录；留空时自动从米哈游启动器注册表查找官服/国际服
   exe_path: ""

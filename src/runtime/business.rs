@@ -5211,10 +5211,11 @@ mod tests {
 
     #[test]
     fn hall_state_patch_is_applied_by_the_business_owner() {
-        let suffix = std::time::SystemTime::now()
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+            .unwrap();
+        let suffix = now.as_nanos();
+        let updated_at = now.as_secs();
         let directory = std::env::temp_dir().join(format!("mwm-business-state-{suffix}"));
         let queue = crate::features::playback::PersistentQueue::new_for_test(4).unwrap();
         let playback_state =
@@ -5232,14 +5233,14 @@ mod tests {
         handle
             .patch_hall_state(HallStatePatch {
                 remaining_minutes: Some(Some(42)),
-                remaining_updated_at: Some(Some(1234)),
+                remaining_updated_at: Some(Some(updated_at)),
                 expiring_warning_sent: Some(true),
             })
             .unwrap();
         let snapshot = handle.hall_state_snapshot().unwrap();
 
         assert_eq!(snapshot.remaining_minutes, Some(42));
-        assert_eq!(snapshot.remaining_updated_at, Some(1234));
+        assert_eq!(snapshot.remaining_updated_at, Some(updated_at));
         assert!(snapshot.expiring_warning_sent);
         runtime.shutdown().unwrap();
     }

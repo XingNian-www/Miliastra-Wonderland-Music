@@ -3,8 +3,8 @@ use miliastra_playback::TrackKey;
 use std::collections::HashMap;
 
 use crate::features::playback::{
-    BackgroundLyricsScope, LyricTracker, PlaybackMonitorPort, PlaybackWorkload, PlayerStatus,
-    QueueAdvanceContext, QueueAdvanceDecision,
+    BackgroundLyricsScope, LyricTracker, PauseReason, PlaybackMonitorPort, PlaybackWorkload,
+    PlayerStatus, QueueAdvanceContext, QueueAdvanceDecision,
 };
 
 pub(super) struct BackgroundCommandManager {
@@ -384,6 +384,16 @@ impl DeferredChatSender {
                         continue;
                     }
                 }
+            }
+
+            if let DeferredChatItem::Message(message) = &item
+                && message.background_key.as_deref() == Some("lyrics")
+                && (self.business.playback_state_snapshot()?.pause_reason == PauseReason::User
+                    || self.business.hall_state_snapshot()?.remaining_minutes_now() == Some(0))
+            {
+                log::debug!("播放已暂停或大厅已到期，丢弃待发送歌词");
+                drop(sending);
+                continue;
             }
 
             if let DeferredChatItem::Batch(batch) = &item

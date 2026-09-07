@@ -1648,6 +1648,157 @@ mod tests {
     }
 
     #[test]
+    fn legacy_database_without_world_wish_fields_survives_load_web_save_and_rollback() {
+        let (root, database_path) = temp_database("legacy-world-wish-fields");
+        let bootstrap = test_bootstrap(&database_path);
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let original_created_at = store.revisions().unwrap()[0].created_at_ms;
+
+        // Simulate a revision written before the three world-wish fields existed while
+        // retaining custom values and a relative path through every round trip.
+        let mut legacy_snapshot = Value::Object(store.read_all_sections().unwrap());
+        legacy_snapshot["screen"]
+            .as_object_mut()
+            .unwrap()
+            .remove("world_wish_rect");
+        legacy_snapshot["templates"]
+            .as_object_mut()
+            .unwrap()
+            .remove("world_wish");
+        legacy_snapshot["templates"]
+            .as_object_mut()
+            .unwrap()
+            .remove("world_wish_threshold");
+        legacy_snapshot["templates"]["friend"] = json!("legacy-assets/friend.png");
+        legacy_snapshot["window"]["target_process"] = json!("legacy-game.exe");
+        let legacy_snapshot_text = serde_json::to_string(&legacy_snapshot).unwrap();
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        for section in ["screen", "templates", "window"] {
+            connection
+                .execute(
+                    "UPDATE config_sections SET value_json = ?1 WHERE section = ?2",
+                    rusqlite::params![
+                        serde_json::to_string(&legacy_snapshot[section]).unwrap(),
+                        section
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE config_revisions SET snapshot_json = ?1 WHERE revision = 1",
+                rusqlite::params![legacy_snapshot_text],
+            )
+            .unwrap();
+        drop(connection);
+        drop(store);
+
+        let mut reopened = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let loaded = reopened.load_full().unwrap();
+        let mut expected = expected_loaded_config(&bootstrap, &root);
+        expected.templates.friend = root.join("legacy-assets/friend.png");
+        expected.window.target_process = "legacy-game.exe".to_string();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(loaded.state.playback_state_path, database_path);
+
+        let current = reopened.current_value().unwrap();
+        assert_eq!(
+            current["screen"]["world_wish_rect"],
+            json!({"x": 1300, "y": 0, "width": 620, "height": 110})
+        );
+        assert_eq!(
+            current["templates"]["world_wish"],
+            json!("deps/assets/world-wish.png")
+        );
+        assert_eq!(
+            current["templates"]["world_wish_threshold"],
+            json!(0.95_f32)
+        );
+        assert_eq!(
+            current["templates"]["friend"],
+            json!("legacy-assets/friend.png")
+        );
+        assert_eq!(
+            Value::Object(reopened.read_all_sections().unwrap()),
+            legacy_snapshot
+        );
+        assert_eq!(latest_snapshot(&database_path), legacy_snapshot);
+        assert_eq!(stored_revision(&database_path), 1);
+        assert_eq!(
+            reopened
+                .revisions()
+                .unwrap()
+                .iter()
+                .map(|revision| (revision.revision, revision.created_at_ms))
+                .collect::<Vec<_>>(),
+            vec![(1, original_created_at)]
+        );
+
+        // Saving the Web-visible screen/template values materializes the defaults without
+        // changing unrelated legacy fields or the bootstrap-owned database path.
+        let mut sections = Map::new();
+        sections.insert("screen".to_string(), current["screen"].clone());
+        sections.insert("templates".to_string(), current["templates"].clone());
+        assert!(reopened.validate_candidate(&sections).unwrap().is_empty());
+        let saved = reopened.save(1, sections).unwrap();
+        assert_eq!(saved.revision, 2);
+        let mut expected_saved_snapshot = legacy_snapshot.clone();
+        expected_saved_snapshot["screen"] = current["screen"].clone();
+        expected_saved_snapshot["templates"] = current["templates"].clone();
+        assert_eq!(
+            Value::Object(reopened.read_all_sections().unwrap()),
+            expected_saved_snapshot
+        );
+        assert_eq!(latest_snapshot(&database_path), expected_saved_snapshot);
+        assert_eq!(
+            serde_json::to_value(reopened.load_full().unwrap()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+
+        // Rolling back the old snapshot (which still lacks the fields) must remain readable;
+        // defaults are applied again while the revision chain records a new revision.
+        let rolled_back = reopened.rollback(1, 2).unwrap();
+        assert_eq!(rolled_back.revision, 3);
+        assert_eq!(
+            serde_json::to_value(reopened.load_full().unwrap()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(reopened.current_value().unwrap(), current);
+        assert_eq!(
+            Value::Object(reopened.read_all_sections().unwrap()),
+            legacy_snapshot
+        );
+        assert_eq!(latest_snapshot(&database_path), legacy_snapshot);
+        assert_eq!(reopened.current_revision().unwrap(), 3);
+        assert_eq!(
+            reopened
+                .revisions()
+                .unwrap()
+                .iter()
+                .map(|revision| revision.revision)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        let original_history: (String, u64) = reopened
+            .connection
+            .query_row(
+                "SELECT snapshot_json, created_at_ms FROM config_revisions WHERE revision = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            original_history,
+            (legacy_snapshot_text, original_created_at)
+        );
+        drop(reopened);
+        cleanup(&root);
+    }
+
+    #[test]
     fn prune_keeps_nested_object_fields_declared_in_schema() {
         let mut sections = Map::new();
         sections.insert(

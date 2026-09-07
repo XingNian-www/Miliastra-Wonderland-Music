@@ -30,7 +30,8 @@ impl StartupExecutionPort for ApplicationRuntime {
             .wait()
             .context("等待进入游戏 UI 事务")?;
         match outcome.effect() {
-            EnterGameEffect::WindowReady | EnterGameEffect::Entered | EnterGameEffect::Skipped => {}
+            EnterGameEffect::Entered => self.reset_chat_observation_baseline("已进入游戏")?,
+            EnterGameEffect::WindowReady | EnterGameEffect::Skipped => {}
             EnterGameEffect::Failed(failure) => return Err(anyhow!(failure.to_string())),
         }
         on_window_detection_reset("启动游戏 UI 事务已完成");
@@ -48,7 +49,10 @@ impl StartupExecutionPort for ApplicationRuntime {
             .wait()
             .context("等待进入千星 UI 事务")?;
         match outcome.effect() {
-            EnterWonderlandEffect::Entered | EnterWonderlandEffect::Skipped => {}
+            EnterWonderlandEffect::Entered => {
+                self.reset_chat_observation_baseline("已进入千星")?;
+            }
+            EnterWonderlandEffect::Skipped => {}
             EnterWonderlandEffect::Failed(failure) => return Err(anyhow!(failure.to_string())),
         }
         if let Some(UiResidencyOutcome::Failed(failure)) = outcome.residency() {

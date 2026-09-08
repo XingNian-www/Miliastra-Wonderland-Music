@@ -1029,12 +1029,6 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
             float(0.0, 1.0),
             "UI/聊天标志模板匹配阈值，越高越严格",
         ),
-        ConfigFieldSchema::db_idle_reload(
-            "world_wish_threshold",
-            "祈愿匹配阈值",
-            float(0.0, 1.0),
-            "主世界祈愿模板的独立匹配阈值，越高越严格",
-        ),
     ]
 }
 

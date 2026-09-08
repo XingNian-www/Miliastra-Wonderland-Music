@@ -1,4 +1,4 @@
-//! Minimal native NetEase Cloud Music adapter.
+//! 精简的原生网易云音乐适配器。
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -530,8 +530,7 @@ impl SourceAdapter for NeteaseAdapter {
         };
         Ok(StreamSource {
             url,
-            // The response URL carries its own signed token; never forward
-            // account cookies to a provider-selected CDN.
+            // 响应 URL 自带签名令牌；绝不向提供商指定的 CDN 转发账号 Cookie。
             headers: BTreeMap::from([("Referer".to_owned(), "https://music.163.com/".to_owned())]),
             expires_at_epoch_ms: expiry_seconds.and_then(|seconds| {
                 std::time::SystemTime::now()

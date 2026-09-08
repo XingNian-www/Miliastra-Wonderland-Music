@@ -16,34 +16,32 @@ pub mod observation;
 
 pub mod runtime;
 
-/// Watchdog child exit code reserved for a normal configuration reload.
+/// 看门狗子进程用于正常配置重载的退出码。
 pub const CONFIG_RELOAD_EXIT_CODE: u8 = 75;
 
-/// Configuration reload exit code that asks the replacement to run startup automation.
+/// 请求替代进程执行启动自动化的配置重载退出码。
 pub const CONFIG_RELOAD_WITH_STARTUP_EXIT_CODE: u8 = 77;
 
-/// One-shot marker set only for the child launched after a configuration reload.
+/// 仅由配置重载后启动的子进程设置的一次性标记。
 pub const CONFIG_RELOAD_CHILD_ENV: &str = "MILIASTRA_CONFIG_RELOAD_CHILD";
 
-/// One-shot flag carried by the watchdog when changed startup fields must run in the replacement.
+/// 启动字段发生变化时由看门狗传递给替代进程的一次性标记。
 pub const CONFIG_RELOAD_RUN_STARTUP_ENV: &str = "MILIASTRA_CONFIG_RELOAD_RUN_STARTUP";
 
-/// Child exit code used when a replacement process fails before reaching its ready point.
+/// 替代进程在达到就绪点前失败时使用的退出码。
 pub const CONFIG_RELOAD_STARTUP_FAILURE_EXIT_CODE: u8 = 76;
 
-/// Per-child marker path used by the watchdog to observe replacement readiness.
+/// 看门狗用于观察替代进程就绪状态的子进程标记路径。
 pub const CONFIG_RELOAD_READY_FILE_ENV: &str = "MILIASTRA_CONFIG_RELOAD_READY_FILE";
 
-/// Exact contents atomically published when a replacement child becomes ready.
+/// 替代子进程就绪时原子写入的固定标记内容。
 pub const CONFIG_RELOAD_READY_MARKER: &[u8] = b"miliastra-config-reload-ready-v1\n";
 
 static CONFIG_RELOAD_CHILD_READY: AtomicBool = AtomicBool::new(false);
 
-/// Mark the replacement child ready after its HTTP/worker/scan runtime is usable.
+/// HTTP、工作线程和扫描运行时可用后，将替代子进程标记为就绪。
 ///
-/// The in-process flag selects the child's exit code. The marker file lets the
-/// watchdog retain the hot-reload handoff even if this child later panics or is
-/// terminated without returning through `main`.
+/// 进程内标志决定子进程退出码。标记文件让看门狗即使在子进程随后崩溃或未返回 `main` 就终止时，仍能保留热重载交接信息。
 pub(crate) fn mark_config_reload_child_ready() -> anyhow::Result<bool> {
     if CONFIG_RELOAD_CHILD_READY.load(Ordering::SeqCst) {
         return Ok(false);
@@ -60,12 +58,12 @@ pub(crate) fn mark_config_reload_child_ready() -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Whether this child reached the ready point before returning an error.
+/// 当前子进程在返回错误前是否已达到就绪点。
 pub fn config_reload_child_ready() -> bool {
     CONFIG_RELOAD_CHILD_READY.load(Ordering::SeqCst)
 }
 
-/// Result of a fully torn-down application runtime.
+/// 应用运行时完整退出后的结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
     Stopped,

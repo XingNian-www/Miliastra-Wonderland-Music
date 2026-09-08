@@ -110,30 +110,30 @@ impl EffectiveConfig {
 pub struct LiveConfigs {
     effective: EffectiveConfig,
     pending_reload: Arc<Mutex<PendingReload>>,
-    /// queue.protect_current_song_until_finished
+    /// `queue.protect_current_song_until_finished`
     pub queue_protect_current_song: Arc<RwLock<bool>>,
-    /// queue.external_playback_protect_after_seconds
+    /// `queue.external_playback_protect_after_seconds`
     pub queue_external_protect_seconds: Arc<RwLock<u64>>,
-    /// timing.playback.status_poll_ms
+    /// `timing.playback.status_poll_ms`
     pub status_poll_ms: Arc<RwLock<u64>>,
-    /// timing.playback.monitor_status_ms
+    /// `timing.playback.monitor_status_ms`
     pub monitor_status_ms: Arc<RwLock<u64>>,
-    /// timing.playback.monitor_tick_ms
+    /// `timing.playback.monitor_tick_ms`
     pub monitor_tick_ms: Arc<RwLock<u64>>,
-    /// timing.playback.lyrics_lead_seconds
+    /// `timing.playback.lyrics_lead_seconds`
     pub lyrics_lead_seconds: Arc<RwLock<f64>>,
-    /// timing.chat_scan.change_debounce_ms
+    /// `timing.chat_scan.change_debounce_ms`
     pub change_debounce_ms: Arc<RwLock<u64>>,
     /// song_dedup.enabled / window_seconds / max_count（整段共享，
     /// history_path/console_bypass 不热更新）
     pub song_dedup: Arc<RwLock<SongDedupConfig>>,
-    /// friend_delivery.auto_retry_count
+    /// `friend_delivery.auto_retry_count`
     pub friend_delivery_auto_retry_count: Arc<RwLock<u32>>,
-    /// output.send_enabled
+    /// `output.send_enabled`
     pub output_send_enabled: Arc<RwLock<bool>>,
-    /// matching.*
+    /// `matching.*`
     pub matching: Arc<RwLock<MatchConfig>>,
-    /// custom_workflows.*
+    /// `custom_workflows.*`
     pub custom_workflows: Arc<RwLock<CustomWorkflowConfig>>,
     /// identity.mappings（整段共享，身份查询直接挂在该句柄上）
     pub identity: IdentityAccess,

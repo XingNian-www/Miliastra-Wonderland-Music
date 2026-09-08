@@ -101,8 +101,7 @@ pub(crate) enum BusinessMutationOutcome {
     TurtleSoup(Box<TurtleSoupMutationOutcome>),
 }
 
-/// Narrow projection port for business-owned public state. Implementations must only retain
-/// the already-redacted snapshots; business internals never depend on the monitor shape.
+/// 业务公开状态的窄投影接口。实现只能保留已经脱敏的快照，业务内部不依赖监控展示结构。
 pub(crate) trait BusinessStateSink: Send + Sync {
     fn publish_turtle_soup(&self, snapshot: TurtleSoupSnapshot);
     fn publish_undercover(&self, snapshot: UndercoverSnapshot);
@@ -2759,8 +2758,7 @@ fn sync_undercover_deadline(
     Ok(())
 }
 
-// The deadline bridge passes each module's state and correlation lanes explicitly so the
-// orchestrator cannot accidentally share one module's pending effects with another.
+// 截止时间桥接会显式传递各模块的状态和关联通道，避免编排器误将一个模块的待处理效果共享给另一个模块。
 #[allow(clippy::too_many_arguments)]
 fn handle_business_timer(
     event: BusinessDeadlineEvent,

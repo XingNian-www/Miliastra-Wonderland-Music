@@ -76,7 +76,7 @@ fn classify_secondary_hall_routed_message(
         routed.map(|command| &command.command),
         accepts_turtle_questions,
     );
-    // The first route uses a placeholder, so authorization needs the real speaker.
+    // 第一条路由使用占位发言者，因此授权判断需要真实发言者。
     classification.requires_sender |= routed
         .is_some_and(|command| command.permission_required.is_some())
         || (!commands_enabled && classification.kind == SecondaryHallMessageKind::Command);

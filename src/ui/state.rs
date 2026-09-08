@@ -291,7 +291,7 @@ impl GameFallbackState {
             return Ok(observation);
         }
 
-        // Only a fresh OCR/template probe advances confirmation; cached frames never do.
+        // 只有新的 OCR/模板探测才能推进确认，缓存画面不能推进。
         if self.candidate == Some(observation.kind()) {
             self.candidate_count = self.candidate_count.saturating_add(1);
         } else {

@@ -87,11 +87,9 @@ pub(crate) fn batch_recognize_blocks<Id: Clone>(
 
     let mut block_lines: Vec<Vec<OcrLine>> = vec![Vec::new(); blocks.len()];
     for mut line in lines {
-        // The DB detector expands detection boxes (especially with unclip_ratio=2.0),
-        // so a valid line can cross a block edge or the gray separator.  The
-        // center is stable enough to assign it without rejecting the message.
+        // DB 检测器会扩展检测框（尤其是 unclip_ratio=2.0），有效文本可能跨越区块边缘或灰色分隔线；使用中心点分配即可，无需拒绝消息。
         let Some(owner) = center_owner(line.bbox, &y_offsets, &crops)? else {
-            // A center in the separator is stitching noise, not a message.
+            // 中心点落在分隔线中属于拼接噪声，不是消息。
             continue;
         };
         line.bbox.y -= y_offsets[owner] as i32;

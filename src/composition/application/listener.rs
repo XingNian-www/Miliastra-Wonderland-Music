@@ -126,15 +126,13 @@ fn unresolved_ui_recovery_due(
 }
 
 fn secondary_hall_recovery_allowed(now: Instant, retry_after: Instant) -> bool {
-    // A pending reload can remain blocked indefinitely by external or uncertain playback.
-    // Recovery itself becomes a formal task, so it safely delays shutdown without leaving a
-    // secondary listener stranded outside its current hall.
+    // 待处理重载可能因外部播放或不确定状态长期阻塞。恢复本身作为正式任务执行，
+    // 可安全延迟停机，不会让好友监听器停在当前大厅之外。
     now >= retry_after
 }
 
-// A pending reload may remain blocked indefinitely by external or uncertain playback. It is
-// deliberately not a gate for replacement startup recovery: the child must finish startup and
-// publish readiness before the watchdog can treat it as a normal process.
+// 待处理重载可能因外部播放或不确定状态长期阻塞，因此不将其作为替代进程启动恢复的闸门：
+// 子进程必须先完成启动并发布就绪，看门狗才能按正常进程处理。
 fn replacement_startup_retry_due(
     config_reload_child: bool,
     child_ready: bool,
@@ -1307,7 +1305,7 @@ impl ApplicationRuntime {
                             Instant::now() + CONFIG_RELOAD_STARTUP_RETRY_INTERVAL;
                     }
                     let window_retry_at = Instant::now() + target_missing_wait;
-                    // Keep window capture backoff while still checking the hall deadline.
+                    // 保持窗口捕获退避，同时继续检查大厅截止时间。
                     let window_reset = loop {
                         self.poll_hall_expiry(
                             &mut hall_expiry_pause_applied,
@@ -1371,8 +1369,7 @@ impl ApplicationRuntime {
                     log::info!("配置重载替代进程已 ready");
                 }
             } else if listener_ready {
-                // Required startup work is still running or has failed. A verified screen alone
-                // must not acknowledge an exit-77 handoff as ready.
+                // 必需的启动工作仍在运行或已经失败。仅验证屏幕不能确认退出码 77 的交接已就绪。
                 replacement_ui_unverified_since = None;
             } else {
                 self.maybe_activate_reload_startup_after_ui_grace(

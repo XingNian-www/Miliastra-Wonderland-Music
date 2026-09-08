@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const SUPPORTED_PROVIDERS: &[&str] = &["qqmusic", "netease", "bilibili", "kugou"];
-/// Successful credential and account-status checks are intentionally sparse.
-/// Playback failures and explicit user actions remain separate recovery paths.
+/// 凭据和账号状态检查成功后仅保留必要信息。
+/// 播放失败与用户主动操作使用独立的恢复路径。
 pub(crate) const DAILY_REFRESH_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 const CREDENTIAL_SCHEMA_VERSION: u32 = 2;
@@ -23,9 +23,8 @@ struct CredentialEnvelope {
     credential: ProviderCredential,
 }
 
-/// Plaintext account state captured by the provider login helper. The store
-/// never exposes secret values through its status APIs; native adapters read a
-/// clone only when they need to make a provider request.
+/// 提供商登录助手获取的明文账号状态。存储层不会通过状态接口暴露密钥，
+/// 原生适配器仅在发起提供商请求时读取副本。
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     rename_all = "camelCase",
@@ -360,9 +359,9 @@ pub(crate) struct CredentialSnapshot {
     pub revision: u64,
 }
 
-/// A per-provider refresh lease shared by explicit and implicit refresh paths.
+/// 每个提供商一份刷新租约，由显式和隐式刷新路径共享。
 ///
-/// Dropping the lease releases the provider even when an async task exits early.
+/// 即使异步任务提前退出，丢弃租约也会释放对应提供商。
 pub(crate) struct CredentialRefreshLease {
     inflight: Arc<Mutex<BTreeSet<&'static str>>>,
     provider: &'static str,
@@ -532,8 +531,7 @@ impl CredentialStore {
                     error,
                 })
         {
-            // The durable write did not complete, so do not leave a task that never started
-            // represented as permanently "refreshing" in this process.
+            // 持久化写入未完成，不能让尚未真正开始的任务在本进程中永久显示为“刷新中”。
             let mut metadata = self
                 .refresh_metadata
                 .write()
@@ -600,7 +598,7 @@ impl CredentialStore {
         };
         if !current {
             drop(mutation);
-            // A newer login/save owns the metadata; release only this request's lease.
+            // 更新的登录/保存操作已接管元数据，此处仅释放当前请求的租约。
             self.release_refresh_lease(provider);
             return Ok(false);
         }
@@ -610,9 +608,8 @@ impl CredentialStore {
         persisted.map(|_| true)
     }
 
-    /// Whether a configured provider is due for the background account/VIP
-    /// status refresh. This schedule is intentionally independent from the
-    /// credential-renewal deadline because NetEase has no credential refresh.
+    /// 判断已配置提供商是否到了后台账号/VIP 状态刷新时间。
+    /// 此日程与凭据续期截止时间独立，因为网易云没有凭据刷新机制。
     pub(crate) fn account_status_check_due(
         &self,
         provider: &str,
@@ -636,8 +633,7 @@ impl CredentialStore {
             .is_none_or(|next_check| next_check <= now_ms))
     }
 
-    /// Record the next forced account/VIP status check only when the
-    /// credential observed before the network request is still current.
+    /// 仅当网络请求前观察到的凭据仍为当前版本时，记录下一次强制账号/VIP 状态检查。
     pub(crate) fn mark_account_status_check_finished_if_current_revision(
         &self,
         provider: &str,
@@ -1089,9 +1085,8 @@ fn qq_refresh_ready(cookies: &BTreeMap<String, String>) -> bool {
     web_ready || oauth_ready
 }
 
-/// The refresh protocol family is encoded in the music key. The WebView
-/// callback's `login_type` is a page-flow value and must not select this API
-/// contract.
+/// 刷新协议族编码在 music key 中。WebView 回调的 `login_type` 仅表示页面流程，
+/// 不能据此选择此 API 约定。
 fn qq_refresh_key_is_wechat(cookies: &BTreeMap<String, String>) -> bool {
     ["qqmusic_key", "qm_keyst", "lqm_keyst"]
         .iter()
@@ -1242,7 +1237,7 @@ fn secure_windows_path(path: &Path) -> Result<(), CredentialError> {
     }
 
     let mut token = HANDLE::default();
-    // The SID buffer remains alive until SetNamedSecurityInfoW has copied the ACL.
+    // SID 缓冲区必须保持有效，直到 SetNamedSecurityInfoW 完成 ACL 复制。
     let result = (|| -> Result<(), CredentialError> {
         unsafe {
             OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
@@ -1618,8 +1613,8 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
         let store = CredentialStore::open(directory.clone()).unwrap();
-        // `write_atomic` cannot create a file at an existing directory. This causes the durable
-        // refresh-state write to fail without depending on platform-specific file permissions.
+        // `write_atomic` 无法在已有目录路径上创建文件；借此让持久化刷新状态写入失败，
+        // 无需依赖平台特定的文件权限。
         fs::create_dir(directory.join("refresh-state.tmp")).unwrap();
 
         assert!(store.try_mark_refresh_started("qqmusic").is_err());
@@ -1641,7 +1636,7 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
         let store = CredentialStore::open(directory.clone()).unwrap();
-        // `write_atomic` cannot create a temporary file at this directory.
+        // `write_atomic` 无法在该目录路径创建临时文件。
         fs::create_dir(directory.join("refresh-state.tmp")).unwrap();
 
         let result = store.save(

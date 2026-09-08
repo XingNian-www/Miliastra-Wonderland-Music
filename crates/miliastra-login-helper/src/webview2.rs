@@ -23,9 +23,7 @@ pub enum CaptureError {
     Io(String),
 }
 
-/// A bounded request handed to the WebView2-only KuGou bridge.  Keeping this
-/// as a separate input type prevents request details from being encoded in the
-/// helper command line or mixed into the interactive login state machine.
+/// 交给仅限 WebView2 的酷狗桥接层的有界请求。使用独立输入类型，避免将请求细节编码到辅助进程命令行，或混入交互式登录状态机。
 #[derive(Clone, Debug)]
 pub struct KugouRequestInput {
     pub url: String,
@@ -63,9 +61,7 @@ pub fn request_kugou_json(
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
-    // The official KgUser/getBaseInfo scripts read these browser-cookie
-    // aliases, while captured credentials commonly expose the same values as
-    // `dfid`/`mid`.
+    // 官方 KgUser/getBaseInfo 脚本读取这些浏览器 Cookie 别名；捕获的凭据通常以 `dfid`/`mid` 形式提供相同值。
     if let Some(value) = filtered_cookies.get("dfid").cloned() {
         filtered_cookies
             .entry("kg_dfid".to_owned())
@@ -122,10 +118,7 @@ fn kugou_request_url(url: &str) -> Result<String, CaptureError> {
     Ok(parsed.into())
 }
 
-/// Build the page-side request. The retry host is the normal browser path for
-/// a request that the primary host has marked with an SSA challenge. A request
-/// without a challenge is returned immediately; the page is not turned into a
-/// verification dialog merely because the endpoint returned a business error.
+/// 构造页面侧请求。主机返回 SSA 挑战时，重试主机是浏览器的标准路径。未触发挑战的请求立即返回；仅因接口返回业务错误不会弹出验证对话框。
 fn kugou_request_script(input: &KugouRequestInput) -> Result<String, CaptureError> {
     let url = serde_json::to_string(&input.url)
         .map_err(|error| CaptureError::Io(format!("酷狗请求 URL 编码失败: {error}")))?;
@@ -265,9 +258,7 @@ fn kugou_request_script(input: &KugouRequestInput) -> Result<String, CaptureErro
                   diagnostics
                 }};
               }}
-              // KgUser.search switches from the primary API host to the
-              // retry host after antiBrush succeeds. songinfo follows the
-              // same browser-side contract.
+              // antiBrush 成功后，KgUser.search 会从主 API 主机切换到重试主机；songinfo 遵循相同的浏览器端约定。
               try {{
                 const retry = new URL(requestUrl);
                 if (retry.hostname === 'wwwapi.kugou.com') {{
@@ -294,8 +285,7 @@ fn kugou_request_script(input: &KugouRequestInput) -> Result<String, CaptureErro
               cookieNames: cookieNames()
             }}
           }}));
-          // ExecuteScript does not await a returned Promise. The actual
-          // result is delivered through WebMessageReceived above.
+          // ExecuteScript 不会等待返回的 Promise，实际结果通过上方的 WebMessageReceived 传递。
           return true;
         }})()"#,
         url = url,
@@ -367,16 +357,13 @@ fn log_kugou_script_result_shape(raw: &str, parsed: Option<&Value>) {
 
 fn login_url(provider: &str) -> Option<&'static str> {
     match provider {
-        // The OAuth document owns the ptlogin iframe and redirects the top
-        // level document to wx_redirect.html after a successful scan. Opening
-        // the iframe's xlogin document directly loses that parent callback.
+        // OAuth 文档负责 ptlogin iframe，扫码成功后会将顶层文档重定向到 wx_redirect.html。直接打开 iframe 的 xlogin 文档会丢失父页面回调。
         "qqmusic" => Some(
             "https://graph.qq.com/oauth2.0/authorize?response_type=code&client_id=100497308&redirect_uri=https%3A%2F%2Fy.qq.com%2Fportal%2Fwx_redirect.html%3Flogin_type%3D1%26surl%3Dhttps%253A%252F%252Fy.qq.com%252Fn%252Fryqq_v2%252Fprofile&state=state&display=pc&scope=get_user_info%2Cget_app_friends",
         ),
         "netease" => Some("https://music.163.com/"),
         "bilibili" => Some("https://www.bilibili.com/"),
-        // Official web login page. It renders the QR as a data URL and sets
-        // the same KuGoo cookie after a scan.
+        // 官方网页登录页：将二维码渲染为 data URL，扫码后写入同一个 KuGoo Cookie。
         "kugou" => Some(
             "https://login-user.kugou.com/login/?appid=1014&ref=https%3A%2F%2Fwww.kugou.com%2Freg%2Fweb%2F&redirect_uri=https%3A%2F%2Fstaticssl.kugou.com%2Fcommon%2Fhtml%2Flogin%2Fregok.html",
         ),
@@ -390,10 +377,7 @@ const WEB_QR_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 const WEB_QR_SCRIPT_INSTALL_FALLBACK: Duration = Duration::from_millis(750);
 const WEB_QR_REPEAT_FETCH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Install before the first navigation so QR images and Bilibili's browser
-/// refresh token can be reported through the top-level WebView2 host bridge.
-/// It only observes Bilibili's documented login response and exact storage
-/// keys; it never reads document cookies or arbitrary page storage.
+/// 在首次导航前注入脚本，使二维码图像和 B 站浏览器 refresh token 能通过顶层 WebView2 主机桥接上报。脚本仅监听 B 站公开的登录响应和指定存储键，不读取页面 Cookie 或其他存储内容。
 fn web_qr_bridge_script() -> &'static str {
     r#"(() => {
       const bridge = '__miliastra_login_helper__';
@@ -409,8 +393,7 @@ fn web_qr_bridge_script() -> &'static str {
         } catch (_) {}
       };
 
-      // A child frame cannot call the host bridge reliably on every Runtime.
-      // Forward its bounded QR/login payload to the injected top-level bridge.
+      // 子框架在不同 Runtime 中无法始终可靠调用主机桥接；将其有界二维码/登录数据转发给注入的顶层桥接。
       if (isTop) {
         window.addEventListener('message', (event) => {
           const data = event && event.data;
@@ -562,8 +545,7 @@ fn web_qr_bridge_script() -> &'static str {
       };
 
       const bilibiliLogin = () => {
-        // Bilibili moved the login entry from an anchor/button to several
-        // clickable div variants. Prefer stable classes before text fallback.
+        // B 站将登录入口从链接/按钮改为多个可点击 div 变体；优先使用稳定类名，最后再按文本匹配。
         const selectors = [
           '.right-entry__outside.go-login-btn',
           '.header-login-entry',
@@ -668,10 +650,7 @@ fn web_qr_bridge_script() -> &'static str {
     })()"#
 }
 
-/// Extract a QR image from the provider page currently displayed in WebView2.
-/// NetEase needs its login link clicked first; QQ and KuGou expose an image on
-/// their direct official login pages. The result is a data URL or an image URL
-/// that the native side validates before publishing to the HTTP UI.
+/// 从当前 WebView2 显示的服务商页面提取二维码图像。网易云需先点击登录链接；QQ 和酷狗在官方登录页直接提供图像。结果为 data URL 或图像 URL，由本地侧校验后再发布到 HTTP 界面。
 fn web_qr_probe_script() -> &'static str {
     r#"(() => {
       const visible = (node) => {
@@ -714,7 +693,7 @@ fn web_qr_probe_script() -> &'static str {
         node.getAttribute('data-url') || ''
       ).trim();
 
-      // NetEase keeps the QR dialog behind the login link on its home page.
+      // 网易云在首页将二维码对话框隐藏在登录链接之后。
       if (location.hostname === 'music.163.com' &&
           ![...document.querySelectorAll('[role="dialog"]')].some(visible)) {
         const login = document.querySelector('[data-action="login"]') ||
@@ -763,9 +742,7 @@ fn web_qr_probe_script() -> &'static str {
           node.getAttribute('aria-label')].join(' ').toLowerCase();
         const marked = /qr|qrcode|qrlogin|二维码|登录二维码/.test(marker);
         const inline = source.startsWith('data:image/png') || source.startsWith('data:image/jpeg');
-        // Do not mistake a square album/advertisement image for a QR. The
-        // known provider QR images are either explicitly marked or inline
-        // data URLs; unmarked remote images are ignored.
+        // 不要将方形专辑图或广告图误判为二维码。已知服务商二维码会带明确标记或使用内联 data URL；未标记的远程图像会被忽略。
         if (!marked && !inline) continue;
         let score = marked ? 120 : 20;
         if (inline) score += 20;
@@ -819,8 +796,7 @@ fn bilibili_login_endpoint_url(raw: &str) -> bool {
     })
 }
 
-/// QQ's `ptqrshow` response is stateful: a second request creates a different
-/// QR ticket. Read only the response that WebView2 actually rendered.
+/// QQ 的 `ptqrshow` 响应带状态：再次请求会生成不同的二维码票据。只读取 WebView2 实际渲染的那份响应。
 fn qq_web_qr_response_url(raw: &str) -> bool {
     Url::parse(raw).ok().is_some_and(|url| {
         web_qr_url_allowed("qqmusic", &url) && matches!(url.path(), "/ptqrshow" | "/ssl/ptqrshow")
@@ -943,8 +919,7 @@ fn parse_web_qr_probe_result(raw: &str) -> Option<(String, String)> {
     (kind == "image" && !value.trim().is_empty()).then_some((kind, value))
 }
 
-// WebView2 may return the script result as either a JSON value or a quoted
-// JSON string containing that value, depending on the runtime version.
+// 根据 Runtime 版本不同，WebView2 可能将脚本结果返回为 JSON 值，或包含该值的带引号 JSON 字符串。
 fn parse_execute_script_value(raw: &str) -> Option<Value> {
     let value = serde_json::from_str::<Value>(raw).ok()?;
     match value {
@@ -968,8 +943,7 @@ fn web_qr_image_data_url_from_bytes(bytes: &[u8]) -> Result<String, String> {
     validate_web_qr_data_url(&format!("data:{mime};base64,{encoded}"))
 }
 
-/// Download an image URL discovered in the WebView2 DOM. This is only an
-/// image fetch; cookies, redirects and login state remain owned by WebView2.
+/// 下载从 WebView2 DOM 中发现的图像 URL。此处仅获取图像，Cookie、重定向和登录状态仍由 WebView2 管理。
 fn download_web_qr_image(provider: &str, raw_url: &str) -> Result<String, String> {
     let url = Url::parse(raw_url).map_err(|_| "网页登录二维码地址无效".to_owned())?;
     if !web_qr_url_allowed(provider, &url) {
@@ -1104,11 +1078,7 @@ fn has_required_cookies(provider: &str, cookies: &BTreeMap<String, String>) -> b
                 && has_any_nonempty(cookies, &["qqmusic_key", "qm_keyst", "lqm_keyst"])
         }
         "netease" => has_any_nonempty(cookies, &["MUSIC_U"]),
-        // Bilibili assigns an anonymous SESSDATA-like session before QR
-        // login completes. DedeUserID is only present after the account
-        // session has been established, so requiring both prevents the
-        // refresh-token probe from timing out while the user is still
-        // looking at the QR code.
+        // B 站在扫码完成前会先分配类似 SESSDATA 的匿名会话。DedeUserID 仅在账号会话建立后出现，同时要求两者可避免用户仍停留在二维码页面时刷新令牌探测超时。
         "bilibili" => {
             has_any_nonempty(cookies, &["SESSDATA"]) && has_any_nonempty(cookies, &["DedeUserID"])
         }
@@ -1203,10 +1173,7 @@ fn parse_qq_login_callback(raw_url: &str) -> Option<(String, String)> {
             _ => {}
         }
     }
-    // The direct QQ QR page uses the official `graph.qq.com/login_jump`
-    // callback and may omit the wrapper's `login_type=1` query parameter.
-    // It is unambiguously the QQ OAuth flow, so infer type 1 only for that
-    // callback host/path; never infer it from arbitrary page URLs.
+    // QQ 直接二维码页使用官方 `graph.qq.com/login_jump` 回调，可能省略外层的 `login_type=1` 查询参数。该主机路径明确属于 QQ OAuth 流程，仅对该回调推断类型 1，不能从任意页面 URL 推断。
     let login_type = login_type.or_else(|| {
         (url.host_str() == Some("graph.qq.com") && url.path().ends_with("/oauth2.0/login_jump"))
             .then(|| "1".to_owned())
@@ -1595,12 +1562,7 @@ where
             || !callback_has_refresh_material)
         && let Ok(web_fields) = refresh_web_session(cookies)
     {
-        // A partial callback can contain a new token while the WebView still
-        // holds the old key/openid tuple.  Once the browser-session refresh
-        // succeeds, its fields are the coherent credential set.  Remove every
-        // callback alias from the same credential groups before applying the
-        // web result; otherwise a stale `psrf_*` value can survive beside a
-        // fresh `wx*` value and the next refresh may combine two sessions.
+        // 部分回调可能含有新令牌，但 WebView 仍保留旧的 key/openid 组合。浏览器会话刷新成功后，其字段才是完整一致的凭据集。应用网页结果前先移除同组的所有回调别名，否则过期的 `psrf_*` 可能与新的 `wx*` 并存，下一次刷新会混用两个会话。
         for alias in [
             "wxopenid",
             "psrf_qqopenid",
@@ -1630,20 +1592,14 @@ where
         callback_error = None;
     }
     if let Some(error) = callback_error.take() {
-        // A failed OAuth exchange may still return a few fields.  Never merge
-        // those untrusted partial values with the browser session: doing so
-        // can persist a half credential that fails only after a restart.  The
-        // browser cookie snapshot is the trusted fallback for a basic login;
-        // the next poll can still capture refresh material that arrives late.
+        // OAuth 交换失败时仍可能返回少数字段。不要将这些不可信的部分值与浏览器会话合并，否则可能持久化半成凭据，直到重启后才失败。基础登录应以浏览器 Cookie 快照作为可信兜底；后续轮询仍可捕获延迟到达的刷新信息。
         if !has_required_cookies("qqmusic", cookies) {
             return Err(error);
         }
         fields.clear();
     }
     if !fields.is_empty() {
-        // Preserve the WebView flow marker for account-status presentation.
-        // The refresh API's numeric `tmeLoginType` is a different contract
-        // marker and must not be inferred from this field later.
+        // 保留 WebView 流程标记，用于展示账号状态。刷新接口的数字 `tmeLoginType` 属于另一套协议标记，之后不能由此字段推断。
         fields.insert("login_type".to_owned(), login_type.to_owned());
     }
     Ok(fields)
@@ -1881,9 +1837,7 @@ fn should_complete_capture(
     if refresh_ready {
         return true;
     }
-    // The Bilibili refresh token is part of the persisted credential, not an
-    // optional enhancement. Cookie polling drives a bounded browser probe
-    // and reports an explicit capture failure when that probe is exhausted.
+    // B 站 refresh token 是持久化凭据的一部分，不是可选增强项。Cookie 轮询会执行有界浏览器探测，达到上限后明确报告捕获失败。
     if provider == "bilibili" {
         return false;
     }
@@ -2099,10 +2053,7 @@ mod platform {
         }
 
         fn new_kugou_request(hwnd: HWND, input: KugouRequestInput) -> Result<Self, CaptureError> {
-            // Execute the request from the API origin itself.  The KuGou API
-            // response does not consistently grant credentialed CORS from
-            // www.kugou.com, while a WebView2 page loaded at the request URL
-            // keeps the browser cookie jar and makes the request same-origin.
+            // 在 API 自身的源上执行请求。酷狗 API 并不总是允许来自 www.kugou.com 的带凭据 CORS；将 WebView2 页面加载到请求 URL 可保留浏览器 Cookie，并使请求处于同源。
             let navigation_url = input.url.clone();
             Ok(Self {
                 provider: "kugou".to_owned(),
@@ -2115,8 +2066,7 @@ mod platform {
 
         fn finish_error(&self, error: CaptureError) {
             if let CaptureError::Com(detail) = &error {
-                // HRESULTs are safe diagnostics: do not print page URLs or
-                // cookie values while still making COM failures actionable.
+                // HRESULT 可安全用于诊断：不要打印页面 URL 或 Cookie 值，同时保留可定位的 COM 错误信息。
                 eprintln!("[webview2] COM error: {detail}");
             }
             let mut state = self.state.lock().expect("capture state mutex poisoned");
@@ -2227,8 +2177,7 @@ mod platform {
             state
                 .latest_cookies
                 .insert("ac_time_value".to_owned(), value.to_owned());
-            // Re-read the cookie jar so the token is paired with the final
-            // browser session before completing the capture.
+            // 重新读取 Cookie 存储，确保令牌与最终浏览器会话配对后再完成捕获。
             state.next_cookie_poll = Some(Instant::now());
         }
 
@@ -2280,9 +2229,7 @@ mod platform {
             }
         }
 
-        /// Execute the signed songinfo request in the browser origin.  The
-        /// page-side script owns the official SSA challenge lifecycle and
-        /// returns only the JSON response to the host.
+        /// 在浏览器源中执行带签名的 songinfo 请求。页面脚本负责官方 SSA 挑战流程，仅将 JSON 响应返回主机。
         fn poll_kugou_request(self: &Rc<Self>) {
             let input = match self.kugou_request.as_ref() {
                 Some(input) => input,
@@ -2349,10 +2296,7 @@ mod platform {
                     })
             };
             if !fallback {
-                // The completion callback is preferred because it guarantees
-                // document-created script registration. This watchdog keeps a
-                // Runtime callback failure from leaving a permanently white
-                // host window.
+                // 优先使用完成回调，以确保注册文档创建脚本。看门狗可避免 Runtime 回调失败导致主机窗口永久空白。
                 self.start_initial_navigation();
             }
         }
@@ -2391,10 +2335,7 @@ mod platform {
                     }
                 }
                 "qq_event" if self.provider == "qqmusic" => {
-                    // The outer OAuth document normally redirects on its own;
-                    // force an immediate source check when the iframe reports
-                    // qclogin_success so a slow navigation cannot look like a
-                    // successful scan followed by a blank window.
+                    // 外层 OAuth 文档通常会自行重定向；iframe 报告 qclogin_success 时立即检查来源，避免导航缓慢被误判为扫码成功后出现空白窗口。
                     self.poll_navigation();
                 }
                 "bilibili_refresh" if self.provider == "bilibili" => {
@@ -2544,10 +2485,7 @@ mod platform {
             }
         }
 
-        /// Ask the currently loaded provider page for its QR image. The
-        /// injected bridge is the primary path; this ExecuteScript probe is a
-        /// top-level fallback for runtimes that do not deliver child-frame
-        /// messages. All four providers stay inside the same WebView2 flow.
+        /// 向当前服务商页面请求二维码图像。注入桥接是主路径；ExecuteScript 探测作为无法传递子框架消息的 Runtime 的顶层兜底。四个服务商均保持在同一 WebView2 流程中。
         fn poll_web_qr(self: &Rc<Self>) -> Option<String> {
             if !matches!(
                 self.provider.as_str(),
@@ -2585,11 +2523,7 @@ mod platform {
                         Err(_) => {
                             state.web_qr_fetch_source = None;
                             state.web_qr_failures = state.web_qr_failures.saturating_add(1);
-                            // QR extraction is an auxiliary display path. A
-                            // transient image URL/content-type failure must
-                            // not abort the credential wait; the DOM bridge
-                            // may publish another candidate and cookie polling
-                            // must continue until login succeeds or times out.
+                            // 二维码提取仅用于显示。临时图像 URL 或内容类型失败不应中止凭据等待；DOM 桥接可能发布其他候选，Cookie 轮询应持续到登录成功或超时。
                             if state.web_qr_failures >= 3 {
                                 state.web_qr_failures = 0;
                             }
@@ -2664,10 +2598,7 @@ mod platform {
         }
 
         fn start_web_qr_fetch(self: &Rc<Self>, source: String) {
-            // QQ's ptqrshow endpoint creates a fresh ticket for every GET.
-            // The WebResourceResponseReceived handler captures the response
-            // that the WebView actually rendered, so a second request would
-            // publish an unusable QR code.
+            // QQ 的 ptqrshow 接口每次 GET 都会生成新票据。WebResourceResponseReceived 处理器捕获 WebView 实际渲染的响应，再次请求会发布无法使用的二维码。
             if self.provider == "qqmusic" {
                 return;
             }
@@ -2721,7 +2652,7 @@ mod platform {
                 PCWSTR,
                 *mut c_void,
             ) -> HRESULT = unsafe { vtable_fn(manager, 5) };
-            // Persist only the provider allowlist from the disposable profile cookies.
+            // 仅从临时配置文件 Cookie 中持久化服务商允许列表内的字段。
             let result = unsafe { get_cookies(manager, null(), handler) };
             unsafe { release_com(handler) };
             if result < 0 {
@@ -2754,11 +2685,7 @@ mod platform {
             let navigate: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT =
                 unsafe { vtable_fn(webview, 5) };
             let url = wide("https://www.bilibili.com/");
-            // A successful QR scan often leaves the top-level document on
-            // passport.bilibili.com. Navigate home once, then wait for its
-            // login bootstrap to write ac_time_value before probing again.
-            // Repeated immediate reloads used to exhaust every probe before
-            // that asynchronous write had a chance to run.
+            // 扫码成功后顶层文档常停留在 passport.bilibili.com。先导航回首页，再等待登录引导写入 ac_time_value 后重新探测。连续立即刷新可能在异步写入前耗尽所有探测次数。
             if !on_bilibili {
                 super::log_bilibili_capture_diagnostics(
                     "refresh probe navigating to Bilibili home before storage read",
@@ -3295,8 +3222,7 @@ mod platform {
             return S_OK;
         }
 
-        // ICoreWebView2_2 inherits the full ICoreWebView2 vtable. The SDK header
-        // places get_CookieManager at slot 66 in that combined vtable.
+        // ICoreWebView2_2 继承完整的 ICoreWebView2 vtable；SDK 头文件将 get_CookieManager 放在合并 vtable 的第 66 槽。
         let get_manager: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
             vtable_fn(webview2, 66);
         let mut cookie_manager = null_mut();
@@ -3322,8 +3248,7 @@ mod platform {
             return S_OK;
         }
 
-        // WebMessageReceived is enabled by default, but set it explicitly so
-        // the bridge remains correct with enterprise Runtime policies.
+        // WebMessageReceived 默认启用，但显式设置以确保企业 Runtime 策略下桥接仍正常。
         let get_settings: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
             vtable_fn(webview, 3);
         let mut settings = null_mut();
@@ -3417,7 +3342,7 @@ mod platform {
                     refs: AtomicU32::new(1),
                     context: Rc::clone(&context),
                 })) as *mut c_void;
-                // ICoreWebView2_2::add_WebResourceResponseReceived.
+                // ICoreWebView2_2::add_WebResourceResponseReceived。
                 let add_response: unsafe extern "system" fn(
                     *mut c_void,
                     *mut c_void,
@@ -3444,9 +3369,7 @@ mod platform {
         }
         release_com(webview2);
 
-        // The completion callback is the only place that starts the first
-        // navigation. WebView2 otherwise may miss the document-created script
-        // on the initial page, especially for QQ's cross-origin iframe.
+        // 只有完成回调会启动首次导航；否则 WebView2 可能错过初始页面的文档创建脚本，QQ 的跨域 iframe 尤其如此。
         let script_handler = Box::into_raw(Box::new(ScriptInstallHandler {
             vtbl: &SCRIPT_INSTALL_HANDLER_VTABLE,
             refs: AtomicU32::new(1),
@@ -3504,8 +3427,7 @@ mod platform {
         if context.provider == "bilibili"
             && let Some(refresh_token) = state.bilibili_refresh_token.clone()
         {
-            // GetCookies returns only browser cookies. Keep the refresh token
-            // received from the bounded page bridge across later polls.
+            // GetCookies 仅返回浏览器 Cookie；保留有界页面桥接收到的 refresh token，供后续轮询使用。
             state
                 .latest_cookies
                 .insert("ac_time_value".to_owned(), refresh_token);
@@ -3873,10 +3795,7 @@ mod platform {
         S_OK
     }
 
-    /// Seed the WebView2 cookie jar before navigating to the page origin.  The
-    /// request bridge deliberately uses browser cookies rather than an HTTP
-    /// client cookie header so SameSite, origin and challenge state follow the
-    /// normal web flow.
+    /// 导航到页面源之前先填充 WebView2 Cookie 存储。请求桥接刻意使用浏览器 Cookie，而不是 HTTP 客户端 Cookie 头，以便 SameSite、源和挑战状态遵循正常网页流程。
     unsafe fn set_kugou_request_cookies(
         manager: *mut c_void,
         cookies: &BTreeMap<String, String>,
@@ -4181,16 +4100,12 @@ mod platform {
         publish_qr_code: &mut dyn FnMut(&str) -> Result<(), CaptureError>,
     ) -> Result<BTreeMap<String, String>, CaptureError> {
         set_process_dpi_awareness();
-        // Include QR creation and WebView2 initialization in the same absolute
-        // deadline used by the polling loop. This prevents a slow provider
-        // endpoint from extending the advertised login timeout.
+        // 将二维码创建和 WebView2 初始化纳入轮询循环的绝对截止时间，避免服务商接口缓慢导致实际登录超时超过提示时长。
         let deadline = Instant::now() + timeout;
         let _runtime = runtime_executable().ok_or(CaptureError::RuntimeMissing)?;
         let _com = ComApartment::initialize()?;
         let window = HostWindow::create()?;
-        // Every provider uses its official page, DOM bridge, and CookieManager
-        // in the same WebView2 profile. No provider-specific native API is
-        // started before or alongside this flow.
+        // 每个服务商都在同一 WebView2 配置文件中使用官方页面、DOM 桥接和 CookieManager；流程前后不会启动服务商专用的本地 API。
         let context = Rc::new(CaptureContext::new(provider, window.hwnd)?);
         window.attach_context(&context);
         let environment_handler = Box::into_raw(Box::new(EnvironmentHandler {
@@ -4223,8 +4138,7 @@ mod platform {
             if let Some(image) = context.poll_web_qr()
                 && let Err(error) = publish_qr_code(&image)
             {
-                // Convert callback failures into the normal outcome path so
-                // COM interfaces and the WebView2 profile are released.
+                // 将回调失败转换为正常结果路径，以释放 COM 接口和 WebView2 配置文件。
                 context.finish_error(error);
             }
             context.poll_cookies();
@@ -4348,9 +4262,7 @@ mod platform {
         unsafe {
             if !webview.is_null() {
                 if let Some(token) = web_resource_response_token {
-                    // remove_WebResourceResponseReceived lives on
-                    // ICoreWebView2_2, so reacquire that interface before
-                    // releasing the base WebView2 object.
+                    // remove_WebResourceResponseReceived 位于 ICoreWebView2_2，因此释放基础 WebView2 对象前需重新获取该接口。
                     let query: unsafe extern "system" fn(
                         *mut c_void,
                         *const GUID,

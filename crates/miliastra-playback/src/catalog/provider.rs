@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::Song;
 
-/// Stable provider identity used by the new provider contract.
+/// 新提供商契约使用的稳定提供商标识。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderId {
@@ -61,7 +61,7 @@ impl FromStr for ProviderId {
 #[error("unknown provider: {0}")]
 pub struct UnknownProvider(pub String);
 
-/// Registry for the providers that are always present in the native runtime.
+/// 原生运行时始终存在的提供商注册表。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProviderRegistry;
 
@@ -141,8 +141,7 @@ impl ProviderSearchOutcome {
 
     pub fn failed(provider: impl Into<String>, failure: crate::catalog::Failure) -> Self {
         let provider = provider.into();
-        // An outcome belongs to exactly one requested provider. Do not let a
-        // lower-level error accidentally attribute this branch to another one.
+        // 一个结果只属于一个请求中的提供商，底层错误不能误将此分支归因到其他提供商。
         let failure = failure.with_provider(provider.clone());
         Self {
             provider,

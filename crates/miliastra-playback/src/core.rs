@@ -1014,8 +1014,8 @@ impl PlaybackCore {
             {
                 return;
             }
-            // A stream failure means both the origin URL and any local proxy
-            // file may be stale. Drop them before resolving the replacement.
+            // 流失败表示源站 URL 和本地代理文件都可能已过期，
+            // 解析替代音源前先将两者删除。
             if let Some(cache) = &audio_cache {
                 cache.invalidate(&song_key).await;
             }

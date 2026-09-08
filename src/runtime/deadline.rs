@@ -5,8 +5,7 @@ use crate::features::undercover::UndercoverDeadlineToken;
 
 use miliastra_kernel::timer::{DeadlineIdentity, TimerRuntimeEvent};
 
-/// The sole timer-runtime identity. It routes only by vertical module; deadline meaning stays in
-/// each module's typed token.
+/// 唯一的计时器运行时标识。仅按业务模块路由，截止时间含义保留在各模块的类型化令牌中。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BusinessDeadlineToken {
     CardGame(CardGameDeadlineToken),

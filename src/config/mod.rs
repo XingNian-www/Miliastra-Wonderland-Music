@@ -1085,12 +1085,10 @@ impl Default for ExternalTimingConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcrConfig {
-    /// MNN/PaddleOCR detection model. It is only required when an MNN backend
-    /// is selected; OpenVINO-only deployments can omit it.
+    /// MNN/PaddleOCR 检测模型。仅选择 MNN 后端时必需；仅使用 OpenVINO 时可省略。
     #[serde(default)]
     pub det_model: Option<PathBuf>,
-    /// MNN/PaddleOCR recognition model. It is only required when an MNN backend
-    /// is selected; OpenVINO-only deployments can omit it.
+    /// MNN/PaddleOCR 识别模型。仅选择 MNN 后端时必需；仅使用 OpenVINO 时可省略。
     #[serde(default)]
     pub rec_model: Option<PathBuf>,
     pub charset: PathBuf,
@@ -1099,8 +1097,7 @@ pub struct OcrConfig {
     pub request_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
     pub backend_priority: Vec<String>,
-    /// Optional OpenVINO IR model configuration. This is ignored unless
-    /// `openvino` appears in `backend_priority`.
+    /// 可选的 OpenVINO IR 模型配置。除非 `backend_priority` 包含 `openvino`，否则忽略。
     #[serde(default)]
     pub openvino: OpenVinoConfig,
     pub det_max_side_len: u32,
@@ -1125,22 +1122,22 @@ pub struct OcrConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenVinoConfig {
-    /// Detection model XML file exported as OpenVINO IR.
+    /// 导出为 OpenVINO IR 的检测模型 XML 文件。
     #[serde(default)]
     pub det_model: Option<PathBuf>,
-    /// Detection model weights file paired with `det_model`.
+    /// 与 `det_model` 配套的检测模型权重文件。
     #[serde(default)]
     pub det_weights: Option<PathBuf>,
-    /// Recognition model XML file exported as OpenVINO IR.
+    /// 导出为 OpenVINO IR 的识别模型 XML 文件。
     #[serde(default)]
     pub rec_model: Option<PathBuf>,
-    /// Recognition model weights file paired with `rec_model`.
+    /// 与 `rec_model` 配套的识别模型权重文件。
     #[serde(default)]
     pub rec_weights: Option<PathBuf>,
-    /// OpenVINO device name, normally `CPU` (also `GPU`/`NPU` when installed).
+    /// OpenVINO 设备名称，通常为 `CPU`（安装相应插件后也可用 `GPU`/`NPU`）。
     #[serde(default = "default_openvino_device")]
     pub device: String,
-    /// Persistent OpenVINO plugin/model cache. Set to null to disable caching.
+    /// 持久化 OpenVINO 插件/模型缓存；设为 null 可禁用缓存。
     #[serde(default = "default_openvino_cache_dir")]
     pub cache_dir: Option<PathBuf>,
 }
@@ -1698,7 +1695,7 @@ pub(crate) fn parse_hotkey_virtual_code(key: &str) -> Result<u16> {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FriendDeliveryConfig {
-    /// Maximum automatic retries for a message that is confirmed not to have been sent.
+    /// 已确认未发送消息的最大自动重试次数。
     pub auto_retry_count: u32,
 }
 

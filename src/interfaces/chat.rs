@@ -35,10 +35,9 @@ pub struct PendingCommand {
     pub routed: RoutedCommand,
 }
 
-/// Observation context retained when a chat message becomes a queued command.
+/// 聊天消息转为排队命令后保留的观察上下文。
 ///
-/// This is deliberately runtime-only metadata. It is useful for correlating execution with
-/// the frame and message that produced it, but it is not part of the external command protocol.
+/// 这是仅供运行时使用的元数据，用于将执行与产生它的画面和消息关联，但不属于外部命令协议。
 pub(crate) fn parse_command_envelope(
     text: &str,
     message_type: &str,
@@ -52,7 +51,7 @@ pub(crate) fn parse_command_envelope(
     }
 
     if text.trim_start().starts_with("歌曲名") {
-        // Apply feedback filtering only to implicit song requests, never to @/# arguments.
+        // 反馈过滤只作用于隐式点歌请求，不能作用于 @/# 参数。
         if is_feedback_text(text) {
             return None;
         }
@@ -95,11 +94,11 @@ pub(crate) fn parse_command_envelope(
     })
 }
 
-/// Creates the normal point-song envelope for a metadata line that came from OCR.
+/// 为 OCR 识别到的元数据行创建标准点歌信封。
 ///
-/// Keeping this at the chat boundary means primary and secondary listeners can feed structured
-/// text through the same router, lock state, and song-request application as an explicit `@点歌`
-/// command. The original OCR text remains attached to the envelope for observation correlation.
+/// 将逻辑放在聊天边界后，主监听器和好友监听器都能提供结构化
+/// 文本会经过与显式 `@点歌` 相同的路由、锁状态和点歌应用处理。
+/// 命令。原始 OCR 文本仍附在信封上，用于观察关联。
 pub(crate) fn parse_structured_song_envelope(
     text: &str,
     username: &str,
@@ -116,11 +115,10 @@ pub(crate) fn parse_structured_song_envelope(
     )
 }
 
-/// A command submitted by a local control surface rather than read from chat.
+/// 由本地控制界面提交、而非从聊天读取的命令。
 ///
-/// Control surfaces should describe the business command and its display text; the chat-shaped
-/// envelope is created here at the command boundary so HTTP and other adapters do not fabricate
-/// `RoutedCommand` values independently.
+/// 控制界面应提供业务命令和展示文本；在命令边界统一创建聊天形状的
+/// 信封，避免 HTTP 等适配器各自伪造 `RoutedCommand`。
 #[derive(Clone, Debug)]
 pub(crate) struct ConsoleCommandIntent {
     matched: String,

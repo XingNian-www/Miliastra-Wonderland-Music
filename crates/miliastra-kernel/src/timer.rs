@@ -9,19 +9,19 @@ use std::time::Instant;
 
 use super::identity::{BusinessOperationId, SessionGeneration};
 
-/// Names the vertical module that owns a family of deadlines.
+/// 命名一组截止时间所属的垂直模块。
 pub trait DeadlineModule: Send + Sync + 'static {
     const NAME: &'static str;
 }
 
-/// Describes one module-specific deadline kind.
+/// 描述模块专属的截止时间类型。
 ///
-/// Each deadline kind is bound to its owning vertical module.
+/// 每种截止时间类型都绑定到所属的垂直模块。
 pub trait DeadlineKind: Clone + Debug + Eq + Hash + Send + 'static {
     type Module: DeadlineModule;
 }
 
-/// A typed identity for a deadline owned by one vertical module.
+/// 由某个垂直模块拥有的截止时间类型化标识。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeadlineToken<K: DeadlineKind> {
     id: u64,
@@ -42,7 +42,7 @@ impl<K: DeadlineKind> DeadlineToken<K> {
     }
 }
 
-/// Common routing contract for typed tokens and a future top-level token enum.
+/// 类型化令牌及未来顶层令牌枚举的通用路由约定。
 pub trait DeadlineIdentity: Clone + Debug + Eq + Hash + Send + 'static {
     fn module_name(&self) -> &'static str;
 }
@@ -53,7 +53,7 @@ impl<K: DeadlineKind> DeadlineIdentity for DeadlineToken<K> {
     }
 }
 
-/// One requested deadline, correlated to the operation and session that created it.
+/// 一个请求的截止时间，与创建它的操作和会话关联。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeadlineSchedule<T> {
     token: T,
@@ -103,7 +103,7 @@ impl<T> DeadlineSchedule<T> {
     }
 }
 
-/// A cancellation request has its own correlation identity, separate from the schedule it targets.
+/// 取消请求拥有独立的关联标识，与目标日程分离。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeadlineCancellation<T> {
     token: T,
@@ -137,7 +137,7 @@ impl<T> DeadlineCancellation<T> {
     }
 }
 
-/// A timer event. The timer reports timing facts and leaves all business decisions to the owner.
+/// 计时器事件。计时器仅报告时间事实，业务决策由所属模块处理。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeadlineExpired<T> {
     schedule: DeadlineSchedule<T>,
@@ -307,8 +307,8 @@ impl Display for TimerCoreError {
 
 impl Error for TimerCoreError {}
 
-/// Pure deadline ordering and lifecycle state.
-/// A runtime drives it with a real clock; tests can drive it with `ManualClock`.
+/// 仅包含截止时间排序和生命周期状态。
+/// 运行时使用真实时钟驱动，测试可使用 `ManualClock` 驱动。
 #[derive(Debug)]
 pub struct TimerCore<T: DeadlineIdentity> {
     state: TimerCoreState,
@@ -350,7 +350,7 @@ impl<T: DeadlineIdentity> TimerCore<T> {
         Ok(())
     }
 
-    /// Replaces an existing token's complete correlation data and gives it a new stable order.
+    /// 替换令牌的完整关联数据，并为其分配新的稳定顺序。
     pub fn reschedule(
         &mut self,
         schedule: DeadlineSchedule<T>,
@@ -404,10 +404,9 @@ impl<T: DeadlineIdentity> TimerCore<T> {
         Ok(expired)
     }
 
-    /// Closes the core and returns every pending deadline in its deterministic due order.
+    /// 关闭核心，并按确定性的到期顺序返回所有待处理截止时间。
     ///
-    /// Closing is idempotent. Once closed, no deadline can be scheduled, changed, cancelled, or
-    /// emitted.
+    /// 关闭操作幂等。关闭后不能再创建、修改、取消或发出截止时间。
     pub fn close(&mut self) -> Vec<DeadlineSchedule<T>> {
         if self.state == TimerCoreState::Closed {
             return Vec::new();

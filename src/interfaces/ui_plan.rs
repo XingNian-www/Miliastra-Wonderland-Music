@@ -34,8 +34,8 @@ pub enum WorkflowMouseButton {
     Right,
 }
 
-/// A feature-owned workflow can request only these mechanical UI operations.
-/// The UI runtime owns their execution semantics and never sees feature configuration.
+/// 业务模块拥有的流程只能请求这些机械 UI 操作。
+/// UI 运行时负责执行语义，不读取业务模块配置。
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkflowOperation {
     Wait {
@@ -57,7 +57,7 @@ pub enum WorkflowOperation {
     EnsureResidency {
         target: WorkflowResidency,
     },
-    /// Restore the active chat-listener residency; resolved by the application layer.
+    /// 恢复当前聊天监听器驻留状态，由应用层解析。
     ReturnListenerResidency,
     ClickPoint {
         point: WorkflowPoint,

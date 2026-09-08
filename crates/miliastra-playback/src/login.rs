@@ -5,9 +5,8 @@ use uuid::Uuid;
 
 use crate::catalog::{Failure, ProviderId};
 
-/// Process-wide lease used by the optional Windows login helper. Capturing
-/// cookies is serialized across providers because WebView2 profile creation
-/// and credential activation are both setup-time critical sections.
+/// 可选 Windows 登录辅助程序使用的进程级租约。Cookie 捕获在提供商之间串行化，
+/// 因为 WebView2 配置文件创建和凭据启用都属于初始化关键区。
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(180);
 
 #[derive(Clone, Debug)]
@@ -51,9 +50,8 @@ impl LoginCoordinator {
         })
     }
 
-    /// Reserve a lease for an external helper. The returned identifier remains
-    /// active until `release_id` is called, which lets the HTTP helper keep the
-    /// capture lifetime across multiple requests without holding a Rust guard.
+    /// 为外部辅助程序预留租约。返回的标识会一直有效到调用 `release_id`，
+    /// 允许 HTTP 辅助程序跨多个请求保持捕获生命周期，而无需持有 Rust 守卫。
     pub fn acquire(&self, provider: ProviderId) -> Result<(Uuid, ProviderId), Failure> {
         let active = self.reserve(provider)?;
         Ok((active.id, active.provider))

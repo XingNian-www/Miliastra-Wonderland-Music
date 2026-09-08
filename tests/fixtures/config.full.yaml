@@ -484,6 +484,10 @@ turtle_soup:
   retry_count: 2
   # AI 请求重试间隔，单位毫秒
   retry_delay_ms: 500
+  # 留空使用内置系统提示词；可使用 {{role}}、{{verification_rules}} 占位符
+  system_prompt: ""
+  # 留空使用内置裁决提示词；可使用 {{verification_instruction}}、{{context}}、{{custom_prompt}}
+  review_prompt: ""
   # 附加在固定裁决提示词后的房间规则；不要要求模型输出自由解释或汤底
   custom_prompt: |
     裁决备注若以“主持裁决：问题=结果”的形式明确列出标准问法，语义等价的玩家问题优先遵循该结果。
@@ -530,6 +534,14 @@ ai:
   # 模型名；点歌默认使用低延迟模型，custom 必须填写。
   # 网关可用模型以其 /v1/models 返回结果为准。
   model: "gpt-5.6-mini"
+  # 留空使用内置系统提示词。
+  system_prompt: ""
+  # 留空使用内置提示词；可使用 {{text}}。
+  recognize_prompt: ""
+  # 留空使用内置提示词；可使用 {{request}}、{{songName}}、{{songSinger}}。
+  match_prompt: ""
+  # 留空使用内置提示词；可使用 {{request}}、{{preferAccompaniment}}、{{preferAccompanimentInstruction}}、{{candidates}}。
+  candidate_pick_prompt: ""
   # 可选的独立 HTTP(S) 代理；只作用于点歌 AI，留空时沿用环境代理设置
   http_proxy: ""
   # 第三方兼容字段。必须是 JSON object；默认空对象。
@@ -562,6 +574,10 @@ song_review:
   retry_delay_ms: 500
   # 游戏内拒绝原因最多显示的字符数；完整原因写日志
   reply_reason_max_chars: 40
+  # 留空使用内置系统提示词。
+  system_prompt: ""
+  # 留空使用内置审核提示词；可使用 {{policy_prompt}}、{{custom_prompt}}、{{candidate}}。
+  review_prompt: ""
   # 审核条件；可以按房间氛围修改，但不要要求模型改变 JSON 输出格式
   policy_prompt: |
     审核目标：只通过整体听感偏舒缓、柔和、轻松、安静、治愈、抒情、慢节奏或中低强度的歌曲。

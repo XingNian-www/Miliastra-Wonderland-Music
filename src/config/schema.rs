@@ -48,6 +48,8 @@ pub enum FieldKind {
     },
     /// 自由字符串
     String,
+    /// 多行文本（提示词等长文本）
+    Text,
     /// 文件/目录路径（相对 EXE 根目录）
     Path,
     /// 枚举：值 + 中文说明
@@ -1465,8 +1467,20 @@ fn turtle_soup_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "custom_prompt",
             "自定义规则",
-            FieldKind::String,
-            "附加在固定裁决提示词后的房间规则；不要要求模型输出自由解释或汤底",
+            FieldKind::Text,
+            "附加在裁决提示词后的房间规则；不要要求模型输出自由解释或汤底",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "system_prompt",
+            "AI 系统提示词",
+            FieldKind::Text,
+            "海龟汤 AI 的系统提示词；留空使用内置默认值，可使用 {{role}}、{{verification_rules}}",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "review_prompt",
+            "AI 裁决提示词",
+            FieldKind::Text,
+            "海龟汤 AI 的裁决模板；可使用 {{verification_instruction}}、{{context}}、{{custom_prompt}}",
         ),
         ConfigFieldSchema::db_idle_reload(
             "ai.endpoint",
@@ -1546,6 +1560,30 @@ fn ai_section() -> Vec<ConfigFieldSchema> {
             "可选的独立 HTTP(S) 代理；只作用于点歌 AI，留空时沿用环境代理设置",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "system_prompt",
+            "系统提示词",
+            FieldKind::Text,
+            "点歌 AI 的系统提示词；留空使用内置默认值",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "recognize_prompt",
+            "识别提示词",
+            FieldKind::Text,
+            "识别点歌文本的模板；可使用 {{text}}",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "match_prompt",
+            "匹配提示词",
+            FieldKind::Text,
+            "判断歌曲匹配的模板；可使用 {{request}}、{{songName}}、{{songSinger}}",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "candidate_pick_prompt",
+            "选歌提示词",
+            FieldKind::Text,
+            "从候选中选歌的模板；可使用 {{request}}、{{preferAccompaniment}}、{{preferAccompanimentInstruction}}、{{candidates}}",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "extra_body",
             "第三方兼容字段",
             FieldKind::Object,
@@ -1594,15 +1632,27 @@ fn song_review_section() -> Vec<ConfigFieldSchema> {
             "游戏内拒绝原因最多显示的字符数；完整原因写日志",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "system_prompt",
+            "系统提示词",
+            FieldKind::Text,
+            "歌曲审核 AI 的系统提示词；留空使用内置默认值",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "review_prompt",
+            "审核提示词",
+            FieldKind::Text,
+            "歌曲审核提示词模板；可使用 {{policy_prompt}}、{{custom_prompt}}、{{candidate}}",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "policy_prompt",
             "审核条件",
-            FieldKind::String,
+            FieldKind::Text,
             "审核条件；可以按房间氛围修改，但不要要求模型改变 JSON 输出格式",
         ),
         ConfigFieldSchema::db_idle_reload(
             "custom_prompt",
             "追加规则",
-            FieldKind::String,
+            FieldKind::Text,
             "追加审核规则；会附加在 policy_prompt 后面，用于临时补充口径",
         ),
         ConfigFieldSchema::db_idle_reload(
@@ -2582,6 +2632,7 @@ mod tests {
                         );
                     }
                     FieldKind::String
+                    | FieldKind::Text
                     | FieldKind::Path
                     | FieldKind::Secret
                     | FieldKind::Enum(_) => {

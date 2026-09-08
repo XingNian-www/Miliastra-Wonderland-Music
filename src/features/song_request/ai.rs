@@ -28,6 +28,18 @@ pub struct AiConfig {
     pub api_key: String,
     pub endpoint: String,
     pub model: String,
+    /// Chat Completions 的系统提示词；留空时使用内置默认值。
+    #[serde(default = "default_ai_system_prompt")]
+    pub system_prompt: String,
+    /// 识别点歌文本的提示词模板，可使用 {{text}} 占位符。
+    #[serde(default = "default_recognize_prompt")]
+    pub recognize_prompt: String,
+    /// 判断歌曲是否匹配的提示词模板，可使用 {{request}}、{{songName}}、{{songSinger}}。
+    #[serde(default = "default_match_prompt")]
+    pub match_prompt: String,
+    /// 从候选中选歌的提示词模板，可使用 {{request}}、{{preferAccompaniment}}、{{candidates}}。
+    #[serde(default = "default_candidate_pick_prompt")]
+    pub candidate_pick_prompt: String,
     #[serde(default)]
     pub http_proxy: String,
     pub extra_body: HashMap<String, Value>,
@@ -40,6 +52,10 @@ impl Default for AiConfig {
             api_key: String::new(),
             endpoint: String::new(),
             model: "gpt-5.6-mini".to_string(),
+            system_prompt: default_ai_system_prompt(),
+            recognize_prompt: default_recognize_prompt(),
+            match_prompt: default_match_prompt(),
+            candidate_pick_prompt: default_candidate_pick_prompt(),
             http_proxy: String::new(),
             extra_body: HashMap::new(),
         }
@@ -132,6 +148,7 @@ struct AiProviderConfig {
     endpoint: String,
     api_key: String,
     model: String,
+    system_prompt: String,
     extra_body: HashMap<String, Value>,
 }
 
@@ -171,7 +188,12 @@ impl AiClient {
         let reply = call_ai(
             &self.openai,
             provider,
-            &build_match_prompt(&request, &song_name, &song_singer),
+            &build_match_prompt(
+                &self.config.match_prompt,
+                &request,
+                &song_name,
+                &song_singer,
+            ),
             1024,
             self.request_timeout,
         )?;
@@ -195,7 +217,12 @@ impl AiClient {
         let reply = call_ai(
             &self.openai,
             &provider,
-            &build_candidate_pick_prompt(&request, prefer_accompaniment, &candidates),
+            &build_candidate_pick_prompt(
+                &self.config.candidate_pick_prompt,
+                &request,
+                prefer_accompaniment,
+                &candidates,
+            ),
             2048,
             self.request_timeout,
         )?;
@@ -233,7 +260,7 @@ impl AiClient {
         let reply = call_ai(
             &self.openai,
             &provider,
-            &build_recognize_prompt(&text),
+            &build_recognize_prompt(&self.config.recognize_prompt, &text),
             1024,
             self.request_timeout,
         )?;
@@ -264,7 +291,12 @@ impl AiClient {
         let reply = call_ai(
             &self.openai,
             &provider,
-            &build_candidate_pick_prompt(&request, prefer_accompaniment, &indexed_candidates),
+            &build_candidate_pick_prompt(
+                &self.config.candidate_pick_prompt,
+                &request,
+                prefer_accompaniment,
+                &indexed_candidates,
+            ),
             2048,
             self.request_timeout,
         )?;
@@ -323,6 +355,11 @@ fn resolve_provider_config(
         endpoint,
         api_key,
         model,
+        system_prompt: if config.system_prompt.trim().is_empty() {
+            default_ai_system_prompt()
+        } else {
+            config.system_prompt.clone()
+        },
         extra_body: if provider_override.is_none()
             || parse_provider(&config.provider).is_ok_and(|configured| configured == provider)
         {
@@ -406,7 +443,11 @@ fn assert_no_control_chars<'a>(value: &'a str, name: &str) -> Result<&'a str> {
     Ok(value)
 }
 
-fn build_recognize_prompt(text: &str) -> String {
+fn default_ai_system_prompt() -> String {
+    "你是点歌 JSON 结构化输出助手。必须只返回合法 JSON。".to_string()
+}
+
+fn default_recognize_prompt() -> String {
     [
         "任务：读点歌文本。",
         "只返回 JSON，不要解释、不要注释、不要 Markdown 代码块。",
@@ -418,12 +459,12 @@ fn build_recognize_prompt(text: &str) -> String {
         "recognizedText=命令后的完整原文；searchText 默认等于 recognizedText，只能去掉首尾空白。",
         "songName/songSinger 只是附加猜测；如果分不清，就 songName=recognizedText，songSinger 置空。",
         "示例：{\"recognizedText\":\"晴天 周杰伦\",\"songName\":\"晴天\",\"songSinger\":\"周杰伦\",\"searchText\":\"晴天 周杰伦\",\"confidence\":0.95}",
-        &format!("文本补充：{}", text),
+        "文本补充：{{text}}",
     ]
     .join("\n")
 }
 
-fn build_match_prompt(request: &str, song_name: &str, song_singer: &str) -> String {
+fn default_match_prompt() -> String {
     [
         "任务：判断用户点歌文字和平台返回歌曲是否同一首。",
         "只返回 JSON，不要解释、不要注释、不要 Markdown 代码块。",
@@ -434,18 +475,107 @@ fn build_match_prompt(request: &str, song_name: &str, song_singer: &str) -> Stri
         "如果基本确定同一首，decision=match；不确定或明显不同，decision=no_match。",
         "decision=match 时 match=true；decision=no_match 时 match=false。",
         "示例：{\"match\":false,\"decision\":\"no_match\",\"score\":0.12,\"reason\":\"歌名不同\"}",
-        &format!("用户点歌：{}", request),
-        &format!("平台歌名：{}", song_name),
-        &format!("平台歌手：{}", song_singer),
+        "用户点歌：{{request}}",
+        "平台歌名：{{songName}}",
+        "平台歌手：{{songSinger}}",
     ]
     .join("\n")
 }
 
+fn default_candidate_pick_prompt() -> String {
+    [
+        "任务：从播放器搜索候选中选出最适合用户点歌的一首。",
+        "只返回 JSON，不要解释、不要注释、不要 Markdown 代码块。",
+        "必须输出结构：{\"index\":number,\"score\":number,\"reason\":string}。",
+        "index 必须是候选列表中的整数索引，不能编造，不能改写。",
+        "歌名和歌手以字面匹配为主：用户输入的每个关键词应在候选标题中找到对应文字（允许大小写、空格、标点差异）。",
+        "翻译名、别名、罗马音可作为补充匹配，但优先级低于字面匹配。",
+        "不要仅凭语义相近就选择字面完全不同的歌名或歌手。",
+        "优先原唱、正式版、清晰标题。",
+        "避开翻唱、DJ、钢琴版、纯音乐、Live、片段、伴奏，除非用户明确要求。",
+        "伴奏标记包括但不限于：伴奏、伴唱、纯伴奏、纯伴唱、Inst.、Instrumental、Karaoke、KTV、消音、minus one，看到这些标记视为伴奏版。",
+        "{{preferAccompanimentInstruction}}",
+        "不要因为平台偏好压过歌名和歌手的匹配度。",
+        "score 范围 0 到 1，reason 简短说明选择原因。",
+        "用户点歌：{{request}}",
+        "候选列表：{{candidates}}",
+    ]
+    .join("\n")
+}
+
+fn render_prompt(template: &str, replacements: &[(&str, &str)], fallback_context: &str) -> String {
+    let mut rendered = template.to_string();
+    let mut replaced = false;
+    for (placeholder, value) in replacements {
+        if rendered.contains(placeholder) {
+            replaced = true;
+            rendered = rendered.replace(placeholder, value);
+        }
+    }
+    // 若旧配置或用户自定义模板没有占位符，仍把必要上下文附在末尾，避免空请求。
+    if !replaced && !fallback_context.is_empty() {
+        rendered.push('\n');
+        rendered.push_str(fallback_context);
+    }
+    rendered
+}
+
+fn build_recognize_prompt(template: &str, text: &str) -> String {
+    let template = if template.trim().is_empty() {
+        default_recognize_prompt()
+    } else {
+        template.to_string()
+    };
+    let mut rendered = render_prompt(&template, &[("{{text}}", text)], "");
+    if !template.contains("{{text}}") {
+        rendered.push_str(&format!("\n文本补充：{text}"));
+    }
+    rendered
+}
+
+fn build_match_prompt(template: &str, request: &str, song_name: &str, song_singer: &str) -> String {
+    let template = if template.trim().is_empty() {
+        default_match_prompt()
+    } else {
+        template.to_string()
+    };
+    let mut rendered = render_prompt(
+        &template,
+        &[
+            ("{{request}}", request),
+            ("{{songName}}", song_name),
+            ("{{songSinger}}", song_singer),
+        ],
+        "",
+    );
+    let mut missing_context = Vec::new();
+    if !template.contains("{{request}}") {
+        missing_context.push(format!("用户点歌：{request}"));
+    }
+    if !template.contains("{{songName}}") {
+        missing_context.push(format!("平台歌名：{song_name}"));
+    }
+    if !template.contains("{{songSinger}}") {
+        missing_context.push(format!("平台歌手：{song_singer}"));
+    }
+    if !missing_context.is_empty() {
+        rendered.push('\n');
+        rendered.push_str(&missing_context.join("\n"));
+    }
+    rendered
+}
+
 fn build_candidate_pick_prompt(
+    template: &str,
     request: &str,
     prefer_accompaniment: bool,
     candidates: &[(usize, SearchCandidate)],
 ) -> String {
+    let template = if template.trim().is_empty() {
+        default_candidate_pick_prompt()
+    } else {
+        template.to_string()
+    };
     let candidates_json = candidates
         .iter()
         .map(|(index, candidate)| {
@@ -455,28 +585,49 @@ fn build_candidate_pick_prompt(
             })
         })
         .collect::<Vec<_>>();
-    [
-        "任务：从播放器搜索候选中选出最适合用户点歌的一首。".to_string(),
-        "只返回 JSON，不要解释、不要注释、不要 Markdown 代码块。".to_string(),
-        "必须输出结构：{\"index\":number,\"score\":number,\"reason\":string}。".to_string(),
-        "index 必须是候选列表中的整数索引，不能编造，不能改写。".to_string(),
-        "歌名和歌手以字面匹配为主：用户输入的每个关键词应在候选标题中找到对应文字（允许大小写、空格、标点差异）。".to_string(),
-        "翻译名、别名、罗马音可作为补充匹配，但优先级低于字面匹配。".to_string(),
-        "不要仅凭语义相近就选择字面完全不同的歌名或歌手。".to_string(),
-        "优先原唱、正式版、清晰标题。".to_string(),
-        "避开翻唱、DJ、钢琴版、纯音乐、Live、片段、伴奏，除非用户明确要求。".to_string(),
-        "伴奏标记包括但不限于：伴奏、伴唱、纯伴奏、纯伴唱、Inst.、Instrumental、Karaoke、KTV、消音、minus one，看到这些标记视为伴奏版。".to_string(),
-        if prefer_accompaniment {
-            "用户明确要求伴奏或伴唱，优先选择伴奏/伴唱候选。".to_string()
-        } else {
-            "用户没有要求伴奏，不要选择任何带伴奏标记的候选。".to_string()
-        },
-        "不要因为平台偏好压过歌名和歌手的匹配度。".to_string(),
-        "score 范围 0 到 1，reason 简短说明选择原因。".to_string(),
-        format!("用户点歌：{}", request),
-        format!("候选列表：{}", serde_json::to_string(&candidates_json).unwrap_or_default()),
-    ]
-    .join("\n")
+    let accompaniment_instruction = if prefer_accompaniment {
+        "用户明确要求伴奏或伴唱，优先选择伴奏/伴唱候选。"
+    } else {
+        "用户没有要求伴奏，不要选择任何带伴奏标记的候选。"
+    };
+    let candidates_text = serde_json::to_string(&candidates_json).unwrap_or_default();
+    let mut rendered = render_prompt(
+        &template,
+        &[
+            ("{{request}}", request),
+            (
+                "{{preferAccompaniment}}",
+                if prefer_accompaniment {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+            (
+                "{{preferAccompanimentInstruction}}",
+                accompaniment_instruction,
+            ),
+            ("{{candidates}}", &candidates_text),
+        ],
+        "",
+    );
+    let mut missing_context = Vec::new();
+    if !template.contains("{{request}}") {
+        missing_context.push(format!("用户点歌：{request}"));
+    }
+    if !template.contains("{{preferAccompaniment}}")
+        && !template.contains("{{preferAccompanimentInstruction}}")
+    {
+        missing_context.push(format!("是否偏好伴奏：{prefer_accompaniment}"));
+    }
+    if !template.contains("{{candidates}}") {
+        missing_context.push(format!("候选列表：{candidates_text}"));
+    }
+    if !missing_context.is_empty() {
+        rendered.push('\n');
+        rendered.push_str(&missing_context.join("\n"));
+    }
+    rendered
 }
 
 fn parse_candidate_pick_result(text: &str) -> Result<AiCandidatePickResult> {
@@ -540,7 +691,7 @@ fn build_ai_request(
         .model(config.model.clone())
         .messages(vec![
             ChatCompletionRequestSystemMessageArgs::default()
-                .content("你是点歌 JSON 结构化输出助手。必须只返回合法 JSON。")
+                .content(config.system_prompt.as_str())
                 .build()?
                 .into(),
             ChatCompletionRequestUserMessageArgs::default()
@@ -569,13 +720,14 @@ fn call_ai_http(
         Authentication::Bearer
     };
     let target = Target::chat(&config.endpoint, &config.api_key, auth)?;
-    let value = openai
+    let response = openai
         .chat_completion(target, request, &config.extra_body, request_timeout)?
         .wait()
         .with_context(|| format!("AI请求失败({:?})", config.provider))?;
-    value
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
+    response
+        .choices
+        .first()
+        .and_then(|choice| choice.message.content.as_deref())
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_string)
@@ -682,7 +834,12 @@ mod tests {
                 test_candidate("third", "miliastra://track/netease/third"),
             ),
         ];
-        let prompt = build_candidate_pick_prompt("third", false, &candidates);
+        let prompt = build_candidate_pick_prompt(
+            &default_candidate_pick_prompt(),
+            "third",
+            false,
+            &candidates,
+        );
 
         assert!(prompt.contains(r#""index":1"#));
         assert!(prompt.contains(r#""index":3"#));
@@ -699,6 +856,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn configured_prompt_templates_preserve_required_dynamic_context() {
+        let candidates = vec![(
+            0,
+            test_candidate("first", "miliastra://track/qqmusic/first"),
+        )];
+        let prompt = build_candidate_pick_prompt("自定义规则", "晴天", true, &candidates);
+        assert!(prompt.contains("自定义规则"));
+        assert!(prompt.contains("用户点歌：晴天"));
+        assert!(prompt.contains("候选列表："));
+
+        let recognize = build_recognize_prompt("只输出 JSON", "@点歌 晴天");
+        assert!(recognize.contains("文本补充：@点歌 晴天"));
+        let matched = build_match_prompt(
+            "{{request}}/{{songName}}/{{songSinger}}",
+            "晴天",
+            "晴天",
+            "周杰伦",
+        );
+        assert_eq!(matched, "晴天/晴天/周杰伦");
     }
 
     #[test]
@@ -737,6 +916,7 @@ mod tests {
                 model: "test-model".to_string(),
                 http_proxy: String::new(),
                 extra_body: HashMap::new(),
+                ..AiConfig::default()
             };
 
             let error = config.validate().expect_err("removed provider alias");
@@ -759,6 +939,7 @@ mod tests {
                 model: String::new(),
                 http_proxy: String::new(),
                 extra_body: HashMap::new(),
+                ..AiConfig::default()
             };
 
             let resolved = resolve_provider_config(&config, None).expect("official provider");
@@ -775,6 +956,7 @@ mod tests {
             model: String::new(),
             http_proxy: String::new(),
             extra_body: HashMap::from([("user_id".to_string(), json!("含中文"))]),
+            ..AiConfig::default()
         };
         assert!(config.validate().is_err());
 
@@ -792,6 +974,7 @@ mod tests {
             model: "test-model".to_string(),
             http_proxy: "socks5://127.0.0.1:1080".to_string(),
             extra_body: HashMap::new(),
+            ..AiConfig::default()
         };
 
         assert!(config.validate().is_err());
@@ -806,6 +989,7 @@ mod tests {
             model: String::new(),
             http_proxy: "socks5://127.0.0.1:1080".to_string(),
             extra_body: HashMap::new(),
+            ..AiConfig::default()
         };
 
         assert!(config.validate().is_err());
@@ -818,6 +1002,7 @@ mod tests {
             endpoint: MIMO_ENDPOINT.to_string(),
             api_key: "secret".to_string(),
             model: MIMO_MODEL.to_string(),
+            system_prompt: default_ai_system_prompt(),
             extra_body: HashMap::new(),
         };
         let request = build_ai_request(&config, "返回 JSON", 1_024).expect("chat request");
@@ -843,6 +1028,7 @@ mod tests {
             model: MIMO_MODEL.to_string(),
             http_proxy: String::new(),
             extra_body: compatibility_fields.clone(),
+            ..AiConfig::default()
         };
 
         let configured = resolve_provider_config(&config, None).expect("configured provider");

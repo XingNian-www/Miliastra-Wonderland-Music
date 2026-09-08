@@ -58,6 +58,8 @@ turtle_soup:
 
 `api_key`、`endpoint` 和 `model` 必须填写。网络请求超时或裁决失败时会按 `retry_count` 重试；AI 不可用不会泄露汤底，也不会自动结束对局。
 
+系统提示词和裁决提示词可以在配置中心直接编辑，字段是 `turtle_soup.system_prompt` 与 `turtle_soup.review_prompt`，留空使用内置内容。模板支持 `{{role}}`、`{{verification_rules}}`、`{{verification_instruction}}`、`{{context}}` 和 `{{custom_prompt}}`；其中 `{{context}}` 会由程序填入汤面、汤底、裁决备注和本次提问。`custom_prompt` 仍用于追加房间规则。接口使用标准 OpenAI Chat Completions 协议，兼容网关需要返回标准响应结构。
+
 ## Web 控制
 
 Web 面板可以开始指定题目、查看状态和结束对局，但不会显示进行中的汤底。题库管理接口只接收已经整理好的题目内容，建议在提交前自行检查题面和汤底。

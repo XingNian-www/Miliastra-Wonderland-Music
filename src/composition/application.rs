@@ -267,7 +267,7 @@ impl ResolvedApplicationConfig {
                 stable_changed_ratio_threshold: app.startup.stable_changed_ratio_threshold,
                 template_threshold: app.startup.template_threshold,
                 wonderland_confirm_threshold: app.startup.wonderland_confirm_threshold,
-                world_wish_threshold: app.templates.world_wish_threshold,
+                world_wish_threshold: app.templates.marker_threshold,
                 templates: StartupUiTemplates {
                     wonderland_map_star: app.startup.templates.wonderland_map_star.clone(),
                     wonderland_confirm: app.startup.templates.wonderland_confirm.clone(),

@@ -213,6 +213,7 @@ button,input,select,textarea{font:inherit}
 /* ===== 表单控件 ===== */
 input,select,textarea{width:100%;height:var(--btn-h);min-width:0;border:1px solid var(--sep-1);background:var(--bg-input);color:var(--text-1);border-radius:var(--radius-s);padding:0 var(--sp-2);outline:none;transition:border-color .2s ease,box-shadow .2s ease,background-color .2s ease}
 textarea{height:auto;min-height:74px;padding:var(--sp-1) var(--sp-2);resize:vertical}
+.config-prompt-text{min-height:220px;line-height:1.5;white-space:pre-wrap}
 input::placeholder,textarea::placeholder{color:var(--text-3)}
 input:hover,select:hover,textarea:hover{border-color:var(--text-3)}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
@@ -2287,6 +2288,9 @@ function configControlHtml(field,value){
     const step=kind==='float'?' step="any"':''
     return '<input id="'+id+'" type="number" data-cfg="'+path+'" data-cfg-sub="1"'+min+max+step+' value="'+(value==null?'':esc(String(value)))+'"'+disabledAttr+parentAttr+'>'
   }
+  if(kind==='text'){
+    return '<textarea id="'+id+'" data-cfg="'+path+'" class="config-prompt-text" placeholder="'+(field.nullable?'留空表示 null':'')+'"'+disabledAttr+parentAttr+'>'+((value==null)?'':esc(String(value)))+'</textarea>'
+  }
   if(kind==='string'||kind==='path'){
     return '<input id="'+id+'" type="text" data-cfg="'+path+'" value="'+(value==null?'':esc(String(value)))+'" placeholder="'+(field.nullable?'留空表示 null':'')+'"'+disabledAttr+parentAttr+'>'
   }
@@ -2529,7 +2533,7 @@ function collectConfigFieldValue(field,sectionName){
     if((fieldKind.min!=null&&n<fieldKind.min)||(fieldKind.max!=null&&n>fieldKind.max))return {invalid:true}
     return {value:n}
   }
-  if(kind==='string'||kind==='path'){
+  if(kind==='text'||kind==='string'||kind==='path'){
     const v=el.value
     if(field.nullable&&String(v||'').trim()==='')return {value:null}
     return {value:v}

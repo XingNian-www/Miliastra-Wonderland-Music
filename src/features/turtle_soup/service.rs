@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ResponseFormat,
+    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+    FinishReason, ResponseFormat,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -57,6 +58,12 @@ pub struct TurtleSoupConfig {
     pub request_timeout_seconds: u64,
     pub retry_count: u32,
     pub retry_delay_ms: u64,
+    /// AI 系统提示词；支持 {{verification_rules}} 占位符，留空使用内置默认值。
+    #[serde(default = "default_turtle_system_prompt")]
+    pub system_prompt: String,
+    /// AI 裁决提示词模板；支持 {{verification_instruction}}、{{context}}、{{custom_prompt}}。
+    #[serde(default = "default_turtle_review_prompt")]
+    pub review_prompt: String,
     pub custom_prompt: String,
     pub ai: TurtleSoupAiConfig,
 }
@@ -77,6 +84,8 @@ impl Default for TurtleSoupConfig {
             request_timeout_seconds: 20,
             retry_count: 2,
             retry_delay_ms: 500,
+            system_prompt: default_turtle_system_prompt(),
+            review_prompt: default_turtle_review_prompt(),
             custom_prompt: String::new(),
             ai: TurtleSoupAiConfig::default(),
         }
@@ -1876,8 +1885,9 @@ impl TurtleSoupWorker {
         validate_provider_config(&self.config.ai)?;
         let request = build_ai_request(
             &self.config.ai,
-            core_system_prompt(verification),
-            build_review_prompt(
+            &render_turtle_system_prompt(&self.config.system_prompt, verification),
+            render_turtle_review_prompt(
+                &self.config.review_prompt,
                 &job.question,
                 context,
                 &self.config.custom_prompt,
@@ -2286,17 +2296,17 @@ fn build_ai_request(
         .build()?)
 }
 
-fn model_reply_content(value: &Value) -> Result<String> {
-    if value
-        .pointer("/choices/0/finish_reason")
-        .and_then(Value::as_str)
-        == Some("length")
-    {
+fn model_reply_content(value: &CreateChatCompletionResponse) -> Result<String> {
+    let Some(choice) = value.choices.first() else {
+        bail!("海龟汤 AI 响应缺少 choices[0]");
+    };
+    if choice.finish_reason == Some(FinishReason::Length) {
         bail!("海龟汤 AI 响应达到 max_tokens 上限，JSON 可能不完整");
     }
-    value
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
+    choice
+        .message
+        .content
+        .as_deref()
         .map(str::trim)
         .filter(|content| !content.is_empty())
         .map(str::to_string)
@@ -2322,6 +2332,99 @@ fn validate_provider_config(config: &TurtleSoupAiConfig) -> Result<()> {
     Ok(())
 }
 
+fn default_turtle_system_prompt() -> String {
+    "{{role}}{{verification_rules}}只返回合法 json 对象。".to_string()
+}
+
+fn render_turtle_system_prompt(template: &str, verification: bool) -> String {
+    let role = if verification {
+        "你是海龟汤谜题的独立复核裁判。"
+    } else {
+        "你是海龟汤谜题裁判。"
+    };
+    let verification_rules = if verification {
+        "你不得沿用首次裁决结论，只根据汤面、汤底、裁决备注和本次提问，独立判断本次提问是否完整还原核心真相。不得假设或引用其他玩家此前的问答。"
+    } else {
+        "你必须只根据汤面、汤底、裁决备注和本次提问进行独立裁决。不得假设或引用其他玩家此前的问答。"
+    };
+    let template = if template.trim().is_empty() {
+        default_turtle_system_prompt()
+    } else {
+        template.to_string()
+    };
+    let rendered = template
+        .replace("{{role}}", role)
+        .replace("{{verification_rules}}", verification_rules);
+    let mut rendered = if rendered.trim().is_empty() {
+        core_system_prompt(verification).to_string()
+    } else {
+        rendered
+    };
+    if !template.contains("{{role}}") {
+        rendered.push('\n');
+        rendered.push_str(role);
+    }
+    if !template.contains("{{verification_rules}}") {
+        rendered.push('\n');
+        rendered.push_str(verification_rules);
+    }
+    rendered
+}
+
+fn default_turtle_review_prompt() -> String {
+    [
+        "输出必须是合法 json 对象，格式严格为：{\"decision\":\"yes|no|irrelevant|partial|complete|refuse\"}。",
+        JUDGMENT_PROTOCOL,
+        JUDGMENT_BOUNDARY_EXAMPLES,
+        "不要输出理由、解释、Markdown、汤底或其他字段。",
+        "{{verification_instruction}}",
+        "题目与提问上下文：\n{{context}}",
+        "追加裁决规则：\n{{custom_prompt}}",
+    ]
+    .join("\n")
+}
+
+fn render_turtle_review_prompt(
+    template: &str,
+    question: &str,
+    context: &ReviewContext,
+    custom_prompt: &str,
+    verification: bool,
+) -> String {
+    let context_json = json!({
+        "汤面": context.puzzle.surface.as_str(),
+        "汤底": context.puzzle.bottom.as_str(),
+        "裁决备注": context.puzzle.adjudication_notes.as_str(),
+        "本次提问": question,
+    });
+    let verification_instruction = if verification {
+        "这是完全正确的独立复核。只有本次提问本身足以完整还原核心真相时才能返回 complete；不一致或不完整一律返回 partial。"
+    } else {
+        ""
+    };
+    let custom_prompt = if custom_prompt.trim().is_empty() {
+        "无"
+    } else {
+        custom_prompt.trim()
+    };
+    let context_text = context_json.to_string();
+    let template = if template.trim().is_empty() {
+        default_turtle_review_prompt()
+    } else {
+        template.to_string()
+    };
+    let mut rendered = template
+        .replace("{{verification_instruction}}", verification_instruction)
+        .replace("{{context}}", &context_text)
+        .replace("{{custom_prompt}}", custom_prompt);
+    if !template.contains("{{context}}") {
+        // 自定义模板漏掉上下文时仍附加题面和本次提问，避免请求失去裁决依据。
+        rendered.push_str("\n题目与提问上下文：\n");
+        rendered.push_str(&context_text);
+    }
+    rendered
+}
+
 fn core_system_prompt(verification: bool) -> &'static str {
     if verification {
         "你是海龟汤谜题的独立复核裁判。你不得沿用首次裁决结论，只根据汤面、汤底、裁决备注和本次提问，独立判断本次提问是否完整还原核心真相。不得假设或引用其他玩家此前的问答。只返回合法 json 对象。"
@@ -2345,39 +2448,20 @@ const JUDGMENT_BOUNDARY_EXAMPLES: &str = r#"以下只是假设真相为“男人
 - “他关闭的是卧室的灯吗？” -> no；“卧室”是与真相矛盾的具体对象替换，单独提到关灯不构成正确核心关系。
 - “他是港口管理员，关闭航标灯导致船只事故吗？” -> partial；错误身份与正确事故因果关系同时存在。"#;
 
+#[cfg(test)]
 fn build_review_prompt(
     question: &str,
     context: &ReviewContext,
     custom_prompt: &str,
     verification: bool,
 ) -> String {
-    let context_json = json!({
-        "汤面": context.puzzle.surface.as_str(),
-        "汤底": context.puzzle.bottom.as_str(),
-        "裁决备注": context.puzzle.adjudication_notes.as_str(),
-        "本次提问": question,
-    });
-    let context_text = context_json.to_string();
-    [
-        "输出必须是合法 json 对象，格式严格为：{\"decision\":\"yes|no|irrelevant|partial|complete|refuse\"}。",
-        JUDGMENT_PROTOCOL,
-        JUDGMENT_BOUNDARY_EXAMPLES,
-        "不要输出理由、解释、Markdown、汤底或其他字段。",
-        if verification {
-            "这是完全正确的独立复核。只有本次提问本身足以完整还原核心真相时才能返回 complete；不一致或不完整一律返回 partial。"
-        } else {
-            ""
-        },
-        "题目与提问上下文：",
-        context_text.as_str(),
-        "追加裁决规则：",
-        if custom_prompt.trim().is_empty() {
-            "无"
-        } else {
-            custom_prompt.trim()
-        },
-    ]
-    .join("\n")
+    render_turtle_review_prompt(
+        &default_turtle_review_prompt(),
+        question,
+        context,
+        custom_prompt,
+        verification,
+    )
 }
 
 fn parse_judgment(reply: &str) -> Result<Judgment> {
@@ -2579,25 +2663,49 @@ mod tests {
 
     #[test]
     fn model_reply_content_rejects_empty_or_truncated_json_output() {
-        let valid = json!({
+        let valid: CreateChatCompletionResponse = serde_json::from_value(json!({
+            "id": "chat-test",
+            "created": 0,
+            "model": "test-model",
+            "object": "chat.completion",
             "choices": [{
                 "finish_reason": "stop",
-                "message": { "content": "{\"decision\":\"yes\"}" }
+                "index": 0,
+                "message": { "role": "assistant", "content": "{\"decision\":\"yes\"}" }
             }]
-        });
+        }))
+        .expect("typed valid response");
         assert_eq!(
             model_reply_content(&valid).unwrap(),
             r#"{"decision":"yes"}"#
         );
 
-        let truncated = json!({
-            "choices": [{ "finish_reason": "length", "message": { "content": "{}" } }]
-        });
+        let truncated: CreateChatCompletionResponse = serde_json::from_value(json!({
+            "id": "chat-test",
+            "created": 0,
+            "model": "test-model",
+            "object": "chat.completion",
+            "choices": [{
+                "finish_reason": "length",
+                "index": 0,
+                "message": { "role": "assistant", "content": "{}" }
+            }]
+        }))
+        .expect("typed truncated response");
         assert!(model_reply_content(&truncated).is_err());
 
-        let empty = json!({
-            "choices": [{ "finish_reason": "stop", "message": { "content": "" } }]
-        });
+        let empty: CreateChatCompletionResponse = serde_json::from_value(json!({
+            "id": "chat-test",
+            "created": 0,
+            "model": "test-model",
+            "object": "chat.completion",
+            "choices": [{
+                "finish_reason": "stop",
+                "index": 0,
+                "message": { "role": "assistant", "content": "" }
+            }]
+        }))
+        .expect("typed empty response");
         assert!(model_reply_content(&empty).is_err());
     }
 
@@ -2692,6 +2800,34 @@ mod tests {
         assert!(!prompt.contains("当前玩家"));
         assert!(!prompt.contains("上一位玩家"));
         assert!(!prompt.contains("上一条问题只用于监控"));
+    }
+
+    #[test]
+    fn configured_turtle_prompts_replace_variables_and_keep_context() {
+        let context = ReviewContext {
+            puzzle: TurtleSoupPuzzle {
+                id: "configured-prompt-test".to_string(),
+                title: "自定义提示词".to_string(),
+                surface: "汤面内容".to_string(),
+                bottom: "汤底内容".to_string(),
+                adjudication_notes: "裁决备注内容".to_string(),
+                enabled: true,
+            },
+        };
+        let system =
+            render_turtle_system_prompt("角色={{role}}\n规则={{verification_rules}}", false);
+        assert!(system.contains("海龟汤谜题裁判"));
+        assert!(system.contains("只根据汤面"));
+        let review = render_turtle_review_prompt(
+            "上下文={{context}}\n附加={{custom_prompt}}",
+            "本次问题",
+            &context,
+            "只判当前问题",
+            false,
+        );
+        assert!(review.contains("汤面内容"));
+        assert!(review.contains("本次问题"));
+        assert!(review.contains("只判当前问题"));
     }
 
     #[test]

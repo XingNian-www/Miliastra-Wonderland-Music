@@ -415,6 +415,9 @@ impl SongRequestExecution<'_> {
         context: &SongRequestContext,
         song: &SongCommand,
     ) -> Result<()> {
+        if self.queue_is_full(context)? {
+            return Ok(());
+        }
         let Some(mut request) = self.resolve_and_confirm_song(song)? else {
             return Ok(());
         };
@@ -500,6 +503,16 @@ impl SongRequestExecution<'_> {
 
         let result = self.play_request_confirmed(&request)?;
         self.log_play_request_outcome(context, &request, &result)
+    }
+
+    fn queue_is_full(&self, context: &SongRequestContext) -> Result<bool> {
+        let queue = self.port.playback_queue()?;
+        if queue.len() < self.queue_max_size {
+            return Ok(false);
+        }
+        self.log_executed_command(context, "queue-full-early")?;
+        self.reply(QUEUE_PUSH_FEEDBACK.full_reply)?;
+        Ok(true)
     }
 
     fn report_player_search_failure(
@@ -1608,6 +1621,30 @@ mod tests {
             )]
         );
         assert!(port.logs.borrow()[0].starts_with("play keyword=晴天 - 周杰伦"));
+    }
+
+    #[test]
+    fn full_queue_replies_before_searching_for_a_song() {
+        let mut port = FakePort::idle(std::iter::empty());
+        port.queue.borrow_mut().push(QueueItem {
+            keyword: "已有歌曲".to_string(),
+            ..QueueItem::default()
+        });
+        let application = SongRequestApplication::with_gateways(
+            Arc::new(DisabledAiGateway),
+            Arc::new(DisabledReviewGateway),
+            1,
+            true,
+        );
+
+        application
+            .execute(&context(), &command(), &mut port)
+            .expect("full queue should be handled");
+
+        assert_eq!(port.replies.borrow().as_slice(), ["队列已满，请稍后再试"]);
+        assert!(port.search_sources.borrow().is_empty());
+        assert!(port.played.borrow().is_empty());
+        assert_eq!(port.logs.borrow().as_slice(), ["queue-full-early"]);
     }
 
     #[test]

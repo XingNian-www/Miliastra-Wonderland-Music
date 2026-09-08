@@ -298,9 +298,9 @@ fn pick_playable_candidate(
             .iter()
             .find(|candidate| is_accompaniment(&candidate.text))
             .cloned()
-            .or_else(|| SearchCandidate::select_preferred_equivalent(&playable))
+            .or_else(|| playable.first().cloned())
     } else {
-        SearchCandidate::select_preferred_equivalent(&playable)
+        playable.first().cloned()
     };
     let formatted = format_candidates(&playable);
     preferred.map(|candidate| PickedCandidate::with_snapshot(candidate, playable, formatted))

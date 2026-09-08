@@ -695,28 +695,55 @@ impl AppConfig {
 /// 只用于**库中已有数据**：启动加载、保存时未提交段（current）与回滚快照。
 /// 客户端提交段不经过此处，未知字段照旧被 save 拒绝（防篡改语义不变）。
 fn prune_unknown_schema_fields(sections: &mut Map<String, Value>) {
-    let known_by_section = config_sections()
-        .into_iter()
-        .map(|section| {
-            let mut keys = BTreeSet::new();
-            for field in &section.fields {
-                if let Some(rest) = field.path.strip_prefix(&format!("{}.", section.name))
-                    && let Some(leaf) = rest.split('.').next()
-                {
-                    keys.insert(leaf.to_string());
-                }
-            }
-            (section.name, keys)
-        })
-        .collect::<BTreeMap<_, _>>();
-    for (name, value) in sections.iter_mut() {
-        let Some(known) = known_by_section.get(name) else {
-            continue;
+    let schema = config_schema_tree();
+    sections.retain(|name, value| {
+        let Some(node) = schema.get(name) else {
+            return false;
         };
-        if let Some(object) = value.as_object_mut() {
-            object.retain(|key, _| known.contains(key));
+        prune_schema_value(value, node);
+        true
+    });
+}
+
+#[derive(Default)]
+struct ConfigSchemaNode {
+    children: BTreeMap<String, ConfigSchemaNode>,
+}
+
+fn config_schema_tree() -> BTreeMap<String, ConfigSchemaNode> {
+    let mut roots: BTreeMap<String, ConfigSchemaNode> = BTreeMap::new();
+    for section in config_sections() {
+        let root = roots.entry(section.name.clone()).or_default();
+        for field in section.fields {
+            let Some(path) = field.path.strip_prefix(&format!("{}.", section.name)) else {
+                continue;
+            };
+            let mut node = &mut *root;
+            for segment in path.split('.') {
+                node = node.children.entry(segment.to_owned()).or_default();
+            }
         }
     }
+    roots
+}
+
+fn prune_schema_value(value: &mut Value, node: &ConfigSchemaNode) {
+    // Leaf objects such as rectangles, points, and free-form Object fields have
+    // no child paths in the schema and must be preserved as-is. Only declared
+    // containers (for example playback.audio_cache) are pruned recursively.
+    if node.children.is_empty() {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.retain(|key, value| {
+        let Some(child) = node.children.get(key) else {
+            return false;
+        };
+        prune_schema_value(value, child);
+        true
+    });
 }
 
 /// Existing databases can omit fields introduced with a serde default. Expose those fields to
@@ -1813,7 +1840,8 @@ mod tests {
                 "credential_directory": "deps/data/credentials",
                 "audio_cache": {
                     "enabled": true,
-                    "directory": ""
+                    "directory": "",
+                    "stale_nested_field": "remove-me"
                 },
                 "stale_legacy_field": "remove-me"
             }),
@@ -1823,6 +1851,49 @@ mod tests {
         assert!(playback.contains_key("credential_directory"));
         assert!(playback.contains_key("audio_cache"));
         assert!(!playback.contains_key("stale_legacy_field"));
+        assert!(
+            !playback["audio_cache"]
+                .as_object()
+                .unwrap()
+                .contains_key("stale_nested_field")
+        );
+    }
+
+    #[test]
+    fn prune_removes_unknown_sections_but_keeps_free_form_objects() {
+        let mut sections = Map::new();
+        sections.insert("removed_section".to_string(), json!({"old_value": true}));
+        sections.insert(
+            "custom_workflows".to_string(),
+            json!({
+                "enabled": true,
+                "templates": {"legacy_template": "legacy.png"},
+                "workflows": {"legacy_workflow": {"steps": []}}
+            }),
+        );
+        sections.insert(
+            "identity".to_string(),
+            json!({
+                "mappings": {"游戏昵称": {"display_name": "显示昵称", "role": "friend"}}
+            }),
+        );
+
+        prune_unknown_schema_fields(&mut sections);
+
+        assert!(!sections.contains_key("removed_section"));
+        assert_eq!(
+            sections["custom_workflows"]["templates"]["legacy_template"],
+            json!("legacy.png")
+        );
+        assert!(
+            sections["custom_workflows"]["workflows"]
+                .get("legacy_workflow")
+                .is_some()
+        );
+        assert_eq!(
+            sections["identity"]["mappings"]["游戏昵称"]["display_name"],
+            json!("显示昵称")
+        );
     }
 
     #[test]

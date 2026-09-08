@@ -10,3 +10,4 @@
 /crates/miliastra-playback/examples/
 /.tmp-kugou-reference/
 .clippy-report.txt
+/.bitfun/search/flashgrep-index/

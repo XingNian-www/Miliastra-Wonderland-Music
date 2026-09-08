@@ -46,6 +46,7 @@ fn kind_json(kind: &FieldKind) -> Value {
         FieldKind::Int { min, max } => json!({ "type": "int", "min": min, "max": max }),
         FieldKind::Float { min, max } => json!({ "type": "float", "min": min, "max": max }),
         FieldKind::String => json!({ "type": "string" }),
+        FieldKind::Text => json!({ "type": "text" }),
         FieldKind::Path => json!({ "type": "path" }),
         FieldKind::Enum(pairs) => json!({
             "type": "enum",

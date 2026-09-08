@@ -245,8 +245,7 @@ pub enum EndCause {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackSnapshot {
-    /// Unique for the lifetime of one native playback runtime. Session references from
-    /// another runtime must never be treated as valid after a restart.
+    /// 在单个原生播放运行时生命周期内唯一。重启后不能将其他运行时的会话引用视为有效。
     #[serde(default)]
     pub runtime_identity: String,
     pub generation: u64,

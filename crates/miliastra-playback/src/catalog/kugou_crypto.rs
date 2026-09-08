@@ -10,14 +10,14 @@ use rsa::Pkcs1v15Encrypt;
 use rsa::pkcs8::DecodePublicKey;
 use std::io::Read;
 
-/// Public key used by the KuGou test/lite login endpoints.
+/// 酷狗测试版/lite 登录端点使用的公钥。
 pub const KUGOU_LITE_RSA_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDECi0Np2UR87scwrvTr72L6oO01rBbbBPriSDFPxr3Z5syug0O24QyQO8bg27+0+4kBzTBTBOZ/WWU0WryL1JSXRTXLgFVxtzIY41Pe7lPOgsfTCn5kZcvKhYKJesKnnJDNr5/abvTGf+rHG3YRwsCHcQ08/q6ifSioBszvb3QiwIDAQAB\n-----END PUBLIC KEY-----";
 
 const KRC_XOR_KEY: &[u8; 16] = &[
     64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105,
 ];
 
-/// Errors returned by the pure crypto helpers.
+/// 纯加密辅助函数返回的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum KugouCryptoError {
     #[error("invalid AES key or IV length (key={key}, iv={iv})")]
@@ -92,9 +92,8 @@ fn validate_aes_lengths(key: &[u8], iv: &[u8]) -> Result<(), KugouCryptoError> {
     Ok(())
 }
 
-/// Encrypt the playlist/device-registration payload used by
-/// `/risk/v2/r_register_dev`. The temporary six-character key is derived with
-/// MD5 into an AES-128 key and IV, matching the upstream JS helper.
+/// 加密 `/risk/v2/r_register_dev` 使用的歌单/设备注册载荷。
+/// 临时六字符密钥通过 MD5 派生 AES-128 密钥和 IV，与上游 JS 辅助函数一致。
 pub fn playlist_aes_encrypt_base64(
     plaintext: &[u8],
     temporary_key: &str,
@@ -108,7 +107,7 @@ pub fn playlist_aes_encrypt_base64(
     Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
 }
 
-/// Decrypt a playlist AES response from `/risk/v2/r_register_dev`.
+/// 解密 `/risk/v2/r_register_dev` 返回的歌单 AES 响应。
 pub fn playlist_aes_decrypt_base64(
     ciphertext: &[u8],
     temporary_key: &str,
@@ -135,14 +134,14 @@ pub fn playlist_aes_decrypt_base64(
     )
 }
 
-/// RSAES-PKCS1-v1_5 encryption used for the registration `p` query field.
+/// 注册 `p` 查询字段使用的 RSAES-PKCS1-v1_5 加密。
 pub fn rsa_pkcs1_encrypt_hex(
     plaintext: &[u8],
     public_key_pem: &str,
 ) -> Result<String, KugouCryptoError> {
     let normalized_pem = public_key_pem.replace("\\n", "\n");
-    // The RSA crate rejects some valid PEM values when the Base64 body is
-    // unwrapped. Decode the DER payload directly so line wrapping is irrelevant.
+    // RSA crate 在 PEM 的 Base64 正文未换行时可能拒绝部分有效值。
+    // 直接解码 DER 载荷，消除换行差异影响。
     let der = normalized_pem
         .lines()
         .filter(|line| !line.trim_start().starts_with("-----"))
@@ -160,7 +159,7 @@ pub fn rsa_pkcs1_encrypt_hex(
     Ok(to_hex(&encrypted))
 }
 
-/// Decode a base64-encoded KRC file (the `krc1` header plus XOR/zlib body).
+/// 解码 Base64 编码的 KRC 文件（`krc1` 头和 XOR/zlib 正文）。
 pub fn decode_krc_base64(encoded: &str) -> Result<String, KugouCryptoError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
@@ -168,7 +167,7 @@ pub fn decode_krc_base64(encoded: &str) -> Result<String, KugouCryptoError> {
     decode_krc(&bytes)
 }
 
-/// Decode raw KRC bytes.
+/// 解码原始 KRC 字节。
 pub fn decode_krc(bytes: &[u8]) -> Result<String, KugouCryptoError> {
     if bytes.len() < 4 {
         return Err(KugouCryptoError::KrcHeader);

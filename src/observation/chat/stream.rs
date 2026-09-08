@@ -427,7 +427,7 @@ fn track_primary_partial_messages(
         return establish_primary_baseline(state, messages);
     }
 
-    // Keep the full-frame anchor while retaining identities that can be acknowledged.
+    // 保留整帧锚点，同时保留可确认的消息身份。
     let anchor = std::mem::take(&mut state.primary_visible);
     let initialized = state.primary_initialized;
     state.primary_visible = if state.primary_partial.is_empty() {
@@ -462,7 +462,7 @@ fn reuse_primary_message_ids(
         if message.id.bubble_sequence.get() < first_new_sequence {
             continue;
         }
-        // Match each old bubble once so an appended identical command stays new.
+        // 每个旧气泡只匹配一次，追加的相同命令仍会被视为新消息。
         let Some(previous) = previous.iter().find(|previous| {
             previous.message_type == tracked.message_type
                 && previous.text_key == tracked.text_key

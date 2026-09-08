@@ -928,17 +928,14 @@ let configSecretDraft={}
 function navigateTo(route,updateHash=true){
   if(!pageRoutes.includes(route))route='overview'
   const currentRoute=document.querySelector('.page-section.active')?.dataset.page
-  // Only leaving the config page needs a discard confirmation. Once the user
-  // has accepted leaving, navigating back to config must not prompt again.
+  // 只有离开配置页时需要确认丢弃修改；用户确认离开后，再返回配置页不再重复提示。
   if(configUnsaved&&currentRoute==='config'&&route!==currentRoute){
     if(!confirm('有未保存的配置修改，确定离开配置中心？')){
-      // A browser Back/Forward already changed the hash before hashchange runs;
-      // restore it when the user keeps the current page.
+      // 浏览器的前进/后退会在 hashchange 触发前修改哈希；用户留在当前页时恢复原哈希。
       if(!updateHash&&currentRoute&&location.hash!=='#'+currentRoute)history.replaceState(null,'','#'+currentRoute)
       return
     }
-    // Discard the local draft so returning to the config page reads the
-    // server version instead of showing changes the user just abandoned.
+    // 丢弃本地草稿，返回配置页时重新读取服务端版本，不显示刚刚放弃的修改。
     configUnsaved=false
     configDirty.clear()
     configData=null
@@ -1098,8 +1095,7 @@ function renderProgress(d){
   const progress=safeNum(d.progress)
   const duration=safeNum(d.duration)
   currentDuration=duration
-  // `hidden` is a native boolean attribute; toggling only the CSS helper class
-  // cannot override it, so keep both states in sync.
+  // `hidden` 是原生布尔属性，只切换 CSS 辅助类无法覆盖它，因此需要同步两种状态。
   if(progress==null&&duration==null){box.hidden=true;box.classList.add('hidden');return}
   box.hidden=false
   box.classList.remove('hidden')

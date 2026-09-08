@@ -794,10 +794,8 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
     }
 }
 
-/// Let the playback controller finish its terminal-state bookkeeping, but do
-/// not turn that state transition into a new automatic playback request while
-/// the child process is waiting to reload. The persisted queue survives the
-/// teardown and is consumed by the replacement process.
+/// 让播放控制器完成终态记录，但子进程等待重载期间不要将该状态转换为新的自动播放请求。
+/// 持久化队列会跨越拆除过程，由替代进程继续消费。
 fn suppress_automatic_advance_for_reload(
     decision: QueueAdvanceDecision,
     pending_reload: bool,

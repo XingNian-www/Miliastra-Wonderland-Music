@@ -55,7 +55,7 @@ struct RuntimeControl {
 }
 
 impl FfmpegEngine {
-    /// Starts the process-local FFmpeg decoder and CPAL output stream.
+    /// 启动进程内 FFmpeg 解码器和 CPAL 输出流。
     pub async fn spawn(config: FfmpegConfig) -> Result<Self, EngineError> {
         if config.command_timeout.is_zero()
             || config.io_timeout.is_zero()
@@ -953,8 +953,7 @@ async fn handle_worker_event(
             state.publish(snapshots);
         }
         WorkerEvent::Looping { identity } if state.active_attempt_matches(identity) => {
-            // The next repeat attempt starts from the beginning. Retain that
-            // trustworthy position so an expired URL can be refreshed safely.
+            // 下一次循环从头开始。保留可信的当前位置，确保可安全刷新已过期 URL。
             state.position_base_seconds = Some(0.0);
             state.snapshot.position_seconds = Some(0.0);
             state.snapshot.state = EngineState::Loading;
@@ -1457,9 +1456,8 @@ fn drain_decoder_frames(
                 if eof_drain_eagain {
                     return FrameDrain::Failed(DecodeFailureStage::DecoderDrain);
                 }
-                // A few decoders report one EAGAIN after the NULL packet before
-                // reporting EOF. Retry once so their delayed frame queue is not
-                // mistaken for a truncated stream.
+                // 部分解码器在 NULL 数据包后、报告 EOF 前会先返回一次 EAGAIN。
+                // 重试一次，避免将延迟帧队列误判为流被截断。
                 eof_drain_eagain = true;
             }
             Err(_) if cancelled.load(Ordering::Acquire) => return FrameDrain::Cancelled,
@@ -1568,8 +1566,7 @@ fn enqueue_resampled_frame(
 fn initialize_ffmpeg() -> Result<(), EngineError> {
     if FFMPEG_INITIALIZED
         .get_or_init(|| {
-            // FFmpeg's process-global logger can otherwise emit signed input
-            // URLs or request headers before the actor classifies an error.
+            // 否则 FFmpeg 的进程级日志可能在执行器分类错误前输出带签名的输入 URL 或请求头。
             ffmpeg::log::set_level(ffmpeg::log::Level::Quiet);
             ffmpeg::init().map_err(|_| ())?;
             ffmpeg::format::network::init();

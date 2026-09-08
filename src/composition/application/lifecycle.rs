@@ -12,8 +12,7 @@ fn should_run_startup_automation(
 fn committed_run_result(result: Result<()>, reason: ShutdownReason) -> Result<RunOutcome> {
     match (result, reason) {
         (Err(error), ShutdownReason::ConfigReload | ShutdownReason::ConfigReloadWithStartup) => {
-            // Once the task engine has stopped accepting work, process replacement is
-            // irreversible. Preserve the watchdog handoff even if a final forwarding step fails.
+            // 任务引擎停止接收工作后，进程替代不可逆。即使最后一次转发失败，也要保留看门狗交接信息。
             log::error!("配置重载已提交，关停尾部错误: {error:#}");
             Ok(match reason {
                 ShutdownReason::ConfigReload => RunOutcome::Reload,
@@ -22,8 +21,7 @@ fn committed_run_result(result: Result<()>, reason: ShutdownReason) -> Result<Ru
             })
         }
         (Err(error), ShutdownReason::UserExit) => {
-            // A concurrent tail failure must not turn an explicit user exit into watchdog error
-            // recovery and restart the process the user just stopped.
+            // 并发收尾失败不能把用户明确退出变成看门狗错误恢复，重新启动刚被用户停止的进程。
             log::error!("用户退出已提交，关停尾部错误: {error:#}");
             Ok(RunOutcome::Stopped)
         }

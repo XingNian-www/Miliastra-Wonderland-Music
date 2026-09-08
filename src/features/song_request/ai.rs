@@ -136,7 +136,7 @@ pub struct AiClient {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AiCandidatePickResult {
-    /// One-based index into the original candidate list.
+    /// 原始候选列表中的从 1 开始的索引。
     pub index: usize,
     pub reason: String,
     pub score: f64,

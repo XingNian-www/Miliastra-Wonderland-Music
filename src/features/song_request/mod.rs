@@ -39,12 +39,11 @@ impl StructuredSongInput {
     }
 }
 
-/// Parses the metadata format emitted by the song-list OCR source.
+/// 解析歌曲列表 OCR 源输出的元数据格式。
 ///
-/// The album field is accepted (and may be empty) so that a partially populated metadata line
-/// still becomes a song request. The player daemon search endpoint accepts a title/artist query more
-/// reliably than an album suffix, so the album is retained for diagnostics but is not appended to
-/// the search keyword.
+/// 接受专辑字段且允许为空，使不完整的元数据行也能生成点歌请求。
+/// 播放器搜索接口对歌名/歌手查询的支持比附带专辑后缀更稳定，因此专辑仅保留用于诊断，
+/// 不追加到搜索关键词。
 pub(crate) fn parse_structured_song_text(text: &str) -> Option<StructuredSongInput> {
     let text = text.trim();
     let title_start = text.find("歌曲名")?;

@@ -121,10 +121,9 @@ struct KugouDeviceIdentity {
     mac: String,
 }
 
-/// Body structs below intentionally follow the property order used by the
-/// corresponding KuGouMusicApi JavaScript modules.  Android signatures cover
-/// the serialized body bytes, so an equivalent but differently ordered JSON
-/// object is not interchangeable on the wire.
+/// 以下请求体结构刻意遵循对应 KuGouMusicApi JavaScript 模块的属性顺序。
+/// Android 签名覆盖序列化后的请求体字节，因此字段顺序不同的等价 JSON 对象
+/// 不能直接替换发送。
 #[derive(Serialize)]
 struct KugouAdPlayReportBody {
     ad_id: u64,
@@ -158,11 +157,10 @@ pub fn kugou_android_signature(params: &BTreeMap<String, String>, body: &str) ->
     format!("{digest:x}")
 }
 
-/// Build the `key` accepted by the concept/lite `/v5/url` endpoint.
+/// 构造测试版/lite `/v5/url` 端点接受的 `key`。
 ///
-/// This is separate from the request `signature`: the upstream `song_url`
-/// module enables `encryptKey`, so playback requests carry this hash key and
-/// use the endpoint's fixed playback parameter map.
+/// 该值与请求 `signature` 分开：上游 `song_url` 模块启用 `encryptKey`，
+/// 因此播放请求携带此哈希密钥，并使用端点固定的播放参数映射。
 fn kugou_lite_sign_key(hash: &str, mid: &str, userid: &str) -> String {
     let digest = compute(format!(
         "{hash}{KUGOU_LITE_SIGN_KEY_SALT}{KUGOU_LITE_APPID}{mid}{userid}"
@@ -185,10 +183,8 @@ pub fn kugou_web_signature(params: &BTreeMap<String, String>) -> String {
     format!("{digest:x}")
 }
 
-/// Register the persistent device used by the lite client and obtain a
-/// server-issued `dfid`. This is the Rust equivalent of the upstream
-/// `/risk/v2/r_register_dev` module that the old sidecar called before URL
-/// resolution.
+/// 注册 lite 客户端使用的持久化设备，并获取服务器下发的 `dfid`。
+/// 这是旧侧车在解析 URL 前调用的上游 `/risk/v2/r_register_dev` 模块的 Rust 等价实现。
 pub fn kugou_register_device(
     token: &str,
     userid: &str,
@@ -201,8 +197,8 @@ pub fn kugou_register_device(
         available_ram_size: u64,
         #[serde(rename = "availableRomSize")]
         available_rom_size: u64,
-        // KuGou's register_dev payload preserves the acronym casing here;
-        // serde's generic camelCase would emit `availableSdSize`.
+        // 酷狗 register_dev 载荷在此保留缩写大小写；serde 的通用 camelCase 会输出
+        // `availableSdSize`。
         #[serde(rename = "availableSDSize")]
         available_sd_size: u64,
         baseband_ver: &'a str,
@@ -396,8 +392,7 @@ pub fn kugou_register_device(
             ),
         ]))
         .header("Cookie", cookie_header(&cookie_values))
-        // Axios 1.10 forwards this encrypted string without assigning a
-        // content type; the registration endpoint expects that exact shape.
+        // Axios 1.10 会直接转发此加密字符串，不设置 Content-Type；注册端点要求保持该格式。
         .body(encrypted_body.clone())
         .send()
         .map_err(classify_request_error_blocking)?;
@@ -452,10 +447,9 @@ pub fn kugou_calculate_mid(guid: &str) -> String {
         .unwrap_or_else(|_| "-".to_owned())
 }
 
-/// Match KuGouMusicApi's device bootstrap: UUIDv4 values are first reduced
-/// to their MD5 hex form, while already-normalized device identifiers are
-/// kept unchanged. Older sidecars persisted the UUID form, so this helper is
-/// also used when loading the shared device file after an upgrade.
+/// 对齐 KuGouMusicApi 的设备初始化：UUIDv4 先转换为 MD5 十六进制值，
+/// 已规范化的设备标识保持不变。旧侧车可能持久化 UUID 形式，升级后读取共享设备文件时
+/// 也要使用此辅助函数。
 pub fn kugou_normalize_guid(guid: &str) -> String {
     let guid = guid.trim();
     let bytes = guid.as_bytes();
@@ -580,9 +574,8 @@ impl KugouAdapter {
         let ProviderCredential::Kugou { .. } = credential else {
             return cookie_header(&cookies);
         };
-        // Lite requests use the separately registered device identity. The
-        // browser-only KuGoo cookie belongs to the Web session and must not
-        // be mixed into this request family.
+        // Lite 请求使用单独注册的设备标识。仅供浏览器使用的 KuGoo Cookie 属于 Web 会话，
+        // 不能混入此请求族。
         cookies.remove("KuGoo");
         let ProviderCredential::Kugou { token, userid, .. } = credential else {
             unreachable!();
@@ -603,8 +596,7 @@ impl KugouAdapter {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| format!("t={token}&KugooID={userid}"));
 
-        // Do not leak the synthetic Lite identity into the browser request.
-        // The raw KuGoo value and the Web dfid remain paired.
+        // 不要将合成的 Lite 标识泄露到浏览器请求中；原始 KuGoo 值与 Web dfid 保持配对。
         for name in [
             "KUGOU_API_DFID",
             "KUGOU_API_GUID",
@@ -615,8 +607,7 @@ impl KugouAdapter {
             cookies.remove(name);
         }
         cookies.insert("KuGoo".to_owned(), ku_goo);
-        // Some Web API deployments still read the split aliases even when
-        // KuGoo is present. Keep both representations consistent.
+        // 部分 Web API 部署即使存在 KuGoo 仍会读取拆分别名，需保持两种表示一致。
         cookies.insert("token".to_owned(), token.clone());
         cookies.insert("userid".to_owned(), userid.clone());
         cookies.insert("dfid".to_owned(), Self::web_credential_dfid(credential));
@@ -771,11 +762,10 @@ impl KugouAdapter {
         params
     }
 
-    /// Build the exact concept/lite `module/song_url` parameter map.
+    /// 构造测试版/lite `module/song_url` 的完整参数映射。
     ///
-    /// The upstream module overwrites the default client version with 11430,
-    /// adds the fixed lite playback identifiers, and enables `encryptKey`.
-    /// It does not use the Web session signature or the Web playback endpoint.
+    /// 上游模块会将默认客户端版本覆盖为 11430，加入固定的 lite 播放标识并启用 `encryptKey`。
+    /// 该流程不使用 Web 会话签名或 Web 播放端点。
     fn lite_song_url_params(
         credential: &ProviderCredential,
         hash: &str,
@@ -802,8 +792,7 @@ impl KugouAdapter {
             ("ppage_id".to_owned(), KUGOU_LITE_URL_PPAGE_ID.to_owned()),
             ("cdnBackup".to_owned(), "1".to_owned()),
             ("module".to_owned(), String::new()),
-            // `song_url.js` supplies this endpoint-specific version after the
-            // request helper's default clientver has been merged.
+            // `song_url.js` 会在合并请求辅助函数的默认 clientver 后提供该端点专用版本。
             ("clientver".to_owned(), KUGOU_LITE_URL_VERSION.to_owned()),
         ]);
         let mid = params.get("mid").map(String::as_str).unwrap_or("-");
@@ -815,9 +804,8 @@ impl KugouAdapter {
                 if userid.is_empty() { "0" } else { userid },
             ),
         );
-        // The upstream module passes `notSign` (rather than the request
-        // helper's `notSignature` flag), so request.js still adds the normal
-        // Android signature after injecting `key`. Mirror that wire contract.
+        // 上游模块传递 `notSign`（而非请求辅助函数的 `notSignature` 标志），
+        // 因此 request.js 注入 `key` 后仍会添加标准 Android 签名。此处保持相同线协议。
         params.insert("signature".to_owned(), kugou_android_signature(&params, ""));
         if !token.is_empty() {
             params.insert("token".to_owned(), token.to_owned());
@@ -846,7 +834,7 @@ impl KugouAdapter {
             .header("kg-rf", KUGOU_KG_RFC)
     }
 
-    /// Build the query used by `wwwapi.kugou.com/play/songinfo`.
+    /// 构造 `wwwapi.kugou.com/play/songinfo` 使用的查询参数。
     fn web_songinfo_params(
         credential: &ProviderCredential,
         selector: Option<(&str, String)>,
@@ -906,8 +894,8 @@ impl KugouAdapter {
             return BTreeMap::new();
         };
         let mut result = cookies.clone();
-        // WebView2 must use the browser session identity only. Mixing the
-        // Lite device cookies with KuGoo makes SSA see two device sessions.
+        // WebView2 必须只使用浏览器会话标识。将 Lite 设备 Cookie 与 KuGoo 混用会让 SSA
+        // 识别到两个设备会话。
         for name in [
             "KUGOU_API_DFID",
             "KUGOU_API_GUID",
@@ -959,8 +947,7 @@ impl KugouAdapter {
             "cookies": Self::web_request_cookies(credential),
         });
         let executable = executable.to_owned();
-        // Keep the child below the 15s playback source timeout so cancellation
-        // cannot release the profile lock while the helper is still running.
+        // 将子进程超时控制在 15 秒播放源超时以内，避免辅助程序仍运行时取消操作释放配置文件锁。
         let timeout = Duration::from_secs(14);
         tokio::task::spawn_blocking(move || {
             run_kugou_web_helper(&executable, &profile, timeout, &request)
@@ -1000,9 +987,8 @@ impl KugouAdapter {
         }
     }
 
-    /// Send a Web songinfo request without interpreting its business status.
-    /// Resolve needs the complete error envelope so it can distinguish a VIP
-    /// restriction from an invalid credential.
+    /// 发送 Web songinfo 请求，不解释其业务状态。
+    /// resolve 需要完整错误信封，以区分 VIP 限制和凭据无效。
     async fn web_songinfo_json(
         &self,
         credential: &ProviderCredential,
@@ -1032,8 +1018,7 @@ impl KugouAdapter {
         &self,
         credential: &ProviderCredential,
     ) -> Result<(), CatalogError> {
-        // Omitting the selector makes the endpoint return err_code=20010 for
-        // a valid session, while an expired Web token returns err_code=30020.
+        // 省略 selector 时，有效会话返回 err_code=20010，而过期 Web 令牌返回 err_code=30020。
         let response = self.web_songinfo_json(credential, None).await?;
         validate_web_credential_response(&response)
     }
@@ -1041,9 +1026,8 @@ impl KugouAdapter {
     fn web_union_vip_params(
         credential: &ProviderCredential,
     ) -> Result<BTreeMap<String, String>, CatalogError> {
-        // The union-VIP endpoint is served on a different Web origin, but it
-        // expects the same signed Web session shape as play/songinfo. A bare
-        // cookie request returns 20010 and has no membership data.
+        // union-VIP 端点位于不同 Web 域名，但要求与 play/songinfo 相同的签名 Web 会话格式。
+        // 仅携带 Cookie 的请求会返回 20010，且不包含会员数据。
         let mut params = Self::web_songinfo_params(credential, None)?;
         params.insert("busi_type".to_owned(), "concept".to_owned());
         params.insert("opt_product_types".to_owned(), "dvip,qvip".to_owned());
@@ -1137,10 +1121,9 @@ impl KugouAdapter {
         Ok(value)
     }
 
-    /// Send a request whose query is supplied verbatim, without a signature.
-    /// The upstream lyric-search module opts into `clearDefaultParams` and
-    /// `notSign`, so `lyrics.kugou.com/v1/search` only carries the
-    /// endpoint-specific fields and no device defaults or signature.
+    /// 按原样发送调用方提供的查询参数，不附加签名。
+    /// 上游歌词搜索模块启用 `clearDefaultParams` 和 `notSign`，因此
+    /// `lyrics.kugou.com/v1/search` 仅携带端点专用字段，不包含设备默认参数或签名。
     async fn get_json_explicit_params(
         &self,
         endpoint: &str,
@@ -1196,12 +1179,10 @@ impl KugouAdapter {
         .await
     }
 
-    /// Send a JSON body whose serialized bytes are supplied by the caller.
+    /// 发送调用方提供序列化字节的 JSON 请求体。
     ///
-    /// KuGou's Android signature includes the raw body text.  Keeping this
-    /// path separate from `serde_json::Value` lets protocol-specific callers
-    /// preserve the insertion order emitted by the upstream JavaScript
-    /// `JSON.stringify` implementation.
+    /// 酷狗 Android 签名包含原始请求体文本。将此路径与 `serde_json::Value` 分开，
+    /// 可让协议调用方保留上游 JavaScript `JSON.stringify` 产生的插入顺序。
     async fn post_json_text_direct_with_headers(
         &self,
         endpoint: &str,
@@ -1350,10 +1331,9 @@ impl KugouAdapter {
         credential: &ProviderCredential,
     ) -> Result<ProviderCredential, CatalogError> {
         let credential = self.credential_with_device(credential);
-        // Web QR login returns a Web session token. KuGou has no compatible
-        // Lite `login_by_token` refresh path for that session, so a refresh is
-        // an authenticated Web validation and the still-valid snapshot is
-        // returned unchanged.
+        // Web 二维码登录返回 Web 会话令牌。酷狗没有兼容该会话的 lite
+        // `login_by_token` 刷新路径，因此刷新操作只进行已认证的 Web 校验，并原样返回
+        // 仍有效的快照。
         self.validate_web_credential(&credential).await?;
         Ok(credential)
     }
@@ -1737,9 +1717,8 @@ impl SourceAdapter for KugouAdapter {
         }
         let (hash, album_id, album_audio_id) = resolver_parts(key, locator)?;
         let credential = self.credential()?;
-        // Follow the concept/lite Android route used by the upstream
-        // `module/song_url.js`. This keeps playback on `/v5/url` and avoids
-        // mixing a Web KuGoo session with the Lite device identity.
+        // 遵循上游 `module/song_url.js` 使用的测试版/lite Android 路径。
+        // 播放固定走 `/v5/url`，避免将 Web KuGoo 会话与 Lite 设备标识混用。
         let response = self
             .get_lite_song_url(&credential, &hash, &album_id, &album_audio_id)
             .await?;
@@ -1770,17 +1749,15 @@ impl SourceAdapter for KugouAdapter {
                 "song key provider does not match Kugou adapter".to_owned(),
             ));
         }
-        // Resolve through the same Lite `/v5/url` request that playback uses;
-        // this avoids a separate privilege/Web endpoint and keeps probe
-        // behavior aligned with the actual stream URL contract.
+        // 使用与播放相同的 Lite `/v5/url` 请求进行解析，避免额外的 privilege/Web 端点，
+        // 并确保探测行为与实际流 URL 契约一致。
         let _ = self.resolve(key, locator).await?;
         Ok(PlaybackEligibility::Eligible)
     }
 
     fn probe_unknown_candidates(&self) -> bool {
-        // Search can return several unknown tracks at once. Resolving each
-        // one hits the playback endpoint and creates a request burst; defer
-        // the authoritative check to the selected track's play request.
+        // 搜索可能一次返回多个未知曲目。逐个解析会命中播放端点并形成请求突发，
+        // 因此将权威检查延迟到选中曲目的播放请求。
         false
     }
 
@@ -1872,9 +1849,8 @@ fn classify_kugou_resolve_failure(response: &Value) -> CatalogError {
     CatalogError::Unavailable("Kugou returned no playable stream".to_owned())
 }
 
-/// Web songinfo can return an SSA challenge as HTTP 200 JSON. Let the
-/// WebView2 helper perform the verification instead of treating it as a dead
-/// credential.
+/// Web songinfo 可能以 HTTP 200 JSON 返回 SSA 挑战。交由 WebView2 辅助程序完成验证，
+/// 不要将其误判为凭据失效。
 fn is_web_challenge_response(response: &Value) -> bool {
     let data = response_data(response);
     let code = [response, data].into_iter().find_map(|value| {
@@ -2144,9 +2120,8 @@ fn cookie_header(cookies: &BTreeMap<String, String>) -> String {
         .join("; ")
 }
 
-/// Invoke the WebView2-only helper with a bounded JSON-over-stdio protocol.
-/// The helper owns the browser session and SSA verification; this function
-/// intentionally does not inspect or reproduce the challenge protocol.
+/// 通过有界的 JSON-over-stdio 协议调用仅支持 WebView2 的辅助程序。
+/// 辅助程序负责浏览器会话和 SSA 验证；此函数不解析或复现挑战协议。
 fn run_kugou_web_helper(
     executable: &Path,
     profile: &Path,
@@ -2164,8 +2139,7 @@ fn run_kugou_web_helper(
         .arg(timeout.as_secs().max(1).to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // The helper must never forward browser diagnostics or request data
-        // into the main process log.
+        // 辅助程序不得将浏览器诊断信息或请求数据转发到主进程日志。
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| CatalogError::Transient(error.to_string()))?;
@@ -2303,10 +2277,8 @@ fn decode_lrc_content(content: &str) -> Result<String, CatalogError> {
 
 fn response_data(value: &Value) -> &Value {
     let mut current = value;
-    // A few gateway deployments wrap the normal payload more than once as
-    // `{data:{data:...}}`.  Unwrap only bounded, object-shaped protocol
-    // envelopes so an ordinary payload field named `data` is not traversed
-    // indefinitely.
+    // 少数网关会将普通载荷多层包装为 `{data:{data:...}}`。
+    // 只解包有限层数且形状为对象的协议信封，避免无限遍历普通载荷中的 `data` 字段。
     for _ in 0..3 {
         let Some(data) = current.get("data") else {
             break;
@@ -2351,9 +2323,8 @@ fn validate_web_credential_response(response: &Value) -> Result<(), CatalogError
     let status = find_kugou_business_number(response, &["status"]);
     let error_code =
         find_kugou_business_number(response, &["err_code", "error_code", "errorCode", "code"]);
-    // With no hash the Web endpoint intentionally answers 20010 (missing
-    // required song parameters). That response still proves the token was
-    // accepted; 30020 is the explicit invalid-session response.
+    // 未携带哈希时，Web 端点会按设计返回 20010（缺少必要歌曲参数）。
+    // 该响应仍能证明令牌已被接受；30020 才是明确的会话无效响应。
     if status.is_some_and(|status| status == 0)
         && error_code.is_some_and(|code| code != 20010 && code != 0)
     {
@@ -2491,8 +2462,8 @@ fn classify_business_response(value: &Value) -> Result<(), CatalogError> {
     Ok(())
 }
 
-/// Find a protocol status/error field through the small set of envelopes used
-/// by KuGou gateways. Song metadata is deliberately not traversed.
+/// 在酷狗网关使用的有限信封集合中查找协议状态/错误字段。
+/// 不遍历歌曲元数据。
 fn find_kugou_business_number(value: &Value, fields: &[&str]) -> Option<i64> {
     fn visit(value: &Value, fields: &[&str], depth: u8) -> Option<i64> {
         if depth > 4 {
@@ -2518,9 +2489,8 @@ fn find_kugou_business_number(value: &Value, fields: &[&str]) -> Option<i64> {
     visit(value, fields, 0)
 }
 
-/// `code` is used by a few gateway envelopes, but song metadata can also have
-/// a field with that name.  Restrict this lookup to the root and one known
-/// response wrapper; never recurse through lists or arbitrary nested objects.
+/// 部分网关信封使用 `code`，歌曲元数据也可能包含同名字段。
+/// 只在根对象和一个已知响应包装层查找，绝不递归列表或任意嵌套对象。
 fn find_kugou_root_business_number(value: &Value, field: &str) -> Option<i64> {
     let object = value.as_object()?;
     object.get(field).and_then(value_i64).or_else(|| {

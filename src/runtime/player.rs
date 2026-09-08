@@ -30,9 +30,7 @@ pub struct RawPlayerSample {
     pub duration: Option<Duration>,
     pub playback_rate: Option<f64>,
     pub volume: Option<i64>,
-    /// Opaque native playback runtime/session data. Keeping it adjacent to the raw
-    /// transport sample lets the controller distinguish a durable terminal
-    /// outcome from a generic stopped observation.
+    /// 不透明的原生播放运行时/会话数据。与原始传输样本并置，使控制器能区分持久化终态结果和普通停止观察。
     pub runtime: PlayerRuntimeMetadata,
 }
 
@@ -161,7 +159,7 @@ impl PlayerObservation {
         })
     }
 
-    /// Returns a fresh identity whose stable track-key evidence was sampled at or after `not_before`.
+    /// 返回新的身份信息，其稳定曲目标识证据采样时间不早于 `not_before`。
     pub fn fresh_identity_sampled_after(&self, not_before: Instant) -> Option<PlaybackIdentity> {
         let identity = self.fresh_identity()?;
         (self.track_key_evidence.as_ref()?.last_sampled_at >= not_before).then_some(identity)
@@ -176,17 +174,15 @@ impl PlayerObservation {
         (evidence.confirmed_at.is_some() && evidence.value == transport).then_some(transport)
     }
 
-    /// Returns a fresh transport fact sampled at or after `not_before`.
+    /// 返回新的传输事实，采样时间不早于 `not_before`。
     pub fn fresh_transport_sampled_after(&self, not_before: Instant) -> Option<TransportState> {
         let transport = self.fresh_transport()?;
         (self.transport_evidence.as_ref()?.last_sampled_at >= not_before).then_some(transport)
     }
 
-    /// Re-evaluates a cached snapshot without claiming that another player RPC occurred.
+    /// 重新评估缓存快照，但不声称执行过新的播放器 RPC。
     ///
-    /// Stable evidence older than `stale_timeout` is removed. A still-fresh playing snapshot
-    /// advances its displayed progress from the prior evaluation time, while stale or incomplete
-    /// observations keep their last sampled progress.
+    /// 删除早于 `stale_timeout` 的稳定证据。仍新鲜的播放快照会从上次评估时间推进显示进度，过期或不完整的观察保留上次采样进度。
     pub fn reevaluated_at(&self, now: Instant, stale_timeout: Duration) -> Self {
         let mut reevaluated = self.clone();
         reevaluated.evaluated_at = now;
@@ -422,10 +418,9 @@ impl TrackEvidence {
     }
 }
 
-/// Converts raw player samples into independently stabilized track-key and transport observations.
+/// 将原始播放器样本转换为分别稳定的曲目标识和传输观察。
 ///
-/// Request failures must be reported with [`Self::observe_failure`]. A successful but partial
-/// response is still useful: each present field advances only its own stability counter.
+/// 请求失败必须通过 [`Self::observe_failure`] 报告。成功但不完整的响应仍然有用：每个存在的字段只推进自己的稳定计数。
 pub struct PlayerObserver<C> {
     clock: C,
     config: PlayerObservationConfig,

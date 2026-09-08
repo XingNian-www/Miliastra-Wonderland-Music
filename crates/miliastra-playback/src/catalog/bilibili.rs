@@ -1,8 +1,7 @@
-//! Native Bilibili video-audio catalog adapter.
+//! B 站原生视频音频目录适配器。
 //!
-//! Bilibili search results identify a video rather than a conventional music
-//! track.  The adapter uses the stable BV id as the track id, then resolves its
-//! current first-page CID and DASH audio URL only when playback starts.
+//! B 站搜索结果标识的是视频而非传统音乐曲目。适配器使用稳定的 BV 号作为曲目标识，
+//! 仅在开始播放时解析当前首页面 CID 和 DASH 音频地址。
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -388,7 +387,7 @@ impl BilibiliAdapter {
         let mut params = vec![
             ("bvid".to_owned(), bvid.to_owned()),
             ("cid".to_owned(), cid.to_string()),
-            // 16 requests independent DASH streams.  We consume audio only.
+            // 16 表示请求独立的 DASH 流；这里只消费音频。
             ("fnval".to_owned(), "16".to_owned()),
             ("fnver".to_owned(), "0".to_owned()),
             ("fourk".to_owned(), "0".to_owned()),
@@ -667,8 +666,7 @@ impl SourceAdapter for BilibiliAdapter {
         let url = bilibili_dash_audio_url(&response)?;
         Ok(StreamSource {
             url,
-            // CDN URLs are signed, so only provider-origin headers are needed.
-            // Credentials must never be forwarded to a CDN URL.
+            // CDN 地址已签名，只需发送服务商源站请求头；凭据不能转发到 CDN 地址。
             headers: BTreeMap::from([
                 ("Referer".to_owned(), REFERER.to_owned()),
                 ("User-Agent".to_owned(), USER_AGENT.to_owned()),
@@ -859,7 +857,7 @@ fn strip_html(value: &str) -> String {
 ///
 /// 真实 BV 号恒为 12 位：固定前缀 `BV1` + 9 位表内字符。
 /// 参考 bilibili-API-collect 文档：
-/// <https://github.com/SocialSisterYi/bilibili-API-collect/blob/master/docs/misc/bvid_desc.md>
+/// 参见 B 站 BV 号说明：<https://github.com/SocialSisterYi/bilibili-API-collect/blob/master/docs/misc/bvid_desc.md>
 const BVID_TABLE: &str = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf";
 
 fn is_bvid_char(character: char) -> bool {
@@ -911,8 +909,7 @@ fn normalize_bvid_candidates(input: &str) -> Vec<String> {
             let options = if is_bvid_char(character) {
                 vec![character]
             } else if let Some(corrected) = correct_bvid_char(character) {
-                // `correct_bvid_char` supplies the conservative legacy mapping for characters
-                // such as O/0 and brackets. J/I/1 ambiguity is handled explicitly above.
+                // `correct_bvid_char` 提供 O/0、括号等字符的保守兼容映射；J/I/1 歧义已在上方单独处理。
                 if matches!(character, 'I' | 'l' | '|' | '\'' | '`') {
                     bvid_char_options(character, offset).to_vec()
                 } else {
@@ -952,12 +949,12 @@ pub(crate) fn normalize_bvid(input: &str) -> Option<String> {
     normalize_bvid_candidates(input).into_iter().next()
 }
 
-/// Public input normalizer used by chat command parsing.
+/// 聊天命令解析使用的公开输入归一化函数。
 pub fn bilibili_normalize_bvid(input: &str) -> Option<String> {
     normalize_bvid(input)
 }
 
-/// Strict official-format validator used by external track-reference handlers.
+/// 外部曲目引用处理器使用的严格官方格式校验函数。
 pub fn bilibili_is_bvid(value: &str) -> bool {
     is_bvid(value)
 }

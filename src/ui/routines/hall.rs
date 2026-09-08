@@ -385,9 +385,8 @@ fn wait_for_hall_page_ready(
     ocr: &OcrRuntimeHandle,
     config: &HallRoutineConfig,
 ) -> Result<(image::DynamicImage, HallInfoSample), UiRoutineFailure> {
-    // F2 can leave a black transition frame longer than the normal settle delay. Do not
-    // return that frame as the screenshot; wait for visible hall content and reuse its OCR
-    // result in the normal hall-info samples.
+    // F2 可能让黑色过渡画面持续超过常规稳定等待。不要把该画面作为截图返回，
+    // 应等待大厅内容可见，并在正常大厅信息样本中复用 OCR 结果。
     sleep_ms(config.page_settle_ms);
     let timeout_ms = HALL_PAGE_READY_TIMEOUT_MS.max(config.page_settle_ms);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);

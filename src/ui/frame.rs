@@ -25,20 +25,16 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
-    /// Returns marker hits in the coordinate space of [`Self::image`].
+    /// 返回 [`Self::image`] 坐标系中的标记命中位置。
     ///
-    /// The UI-state classifier may normalize a captured image before finding
-    /// markers. Only reuse its hits when OCR uses that same coordinate space;
-    /// otherwise the listener must run the normal marker search again.
+    /// UI 状态分类器可能在查找标记前归一化截图。只有 OCR 使用同一坐标系时才能复用命中位置，否则监听器必须重新执行常规标记搜索。
     pub(crate) fn marker_hits_for_image(&self) -> Option<Vec<TemplateHit>> {
         let UiStateObservation::Classified(state) = self.ui_state.as_ref()? else {
             return None;
         };
         let probe = state.classification().evidence().marker_probe()?;
         let hits = probe.marker_hits();
-        // An unknown/transitional classification records an empty probe. That
-        // is not reusable evidence: callers must run the normal marker search
-        // instead of treating it as a conclusive empty chat scan.
+        // 未知/过渡分类会记录空探测，这不是可复用证据；调用方必须重新执行常规标记搜索，不能将其当成确定的空聊天扫描。
         if hits.is_empty() || probe.coordinate_size() != (self.image.width(), self.image.height()) {
             return None;
         }
@@ -133,9 +129,7 @@ mod tests {
 
     #[test]
     fn marker_hits_are_reused_in_the_classifier_coordinate_space() {
-        // The classifier normalizes a 4K capture to the configured 1920x1080
-        // canvas before scanning. Hits are relative to the chat crop in that
-        // normalized coordinate space and must not be scaled a second time.
+        // 分类器会先将 4K 截图归一化到配置的 1920x1080 画布，再进行扫描。命中位置相对该归一化坐标系中的聊天裁剪区，不能再次缩放。
         let classifier_hit = TemplateHit {
             kind: "blue".to_owned(),
             x: 48,

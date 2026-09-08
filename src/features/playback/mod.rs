@@ -84,7 +84,7 @@ pub struct PlaybackTimingConfig {
     pub status_poll_ms: u64,
     pub monitor_tick_ms: u64,
     pub monitor_status_ms: u64,
-    /// Amount added to the current playback position when selecting a lyric line.
+    /// 选择歌词行时加到当前播放位置的偏移量。
     #[serde(default = "default_lyrics_lead_seconds")]
     pub lyrics_lead_seconds: f64,
     pub uri_stable_samples: u32,
@@ -311,13 +311,12 @@ pub(crate) struct PlayerStatus {
     pub(crate) playback_rate: f64,
     pub(crate) volume: i64,
     pub(crate) requester: String,
-    /// The player runtime which produced this observation, when the backend
-    /// exposes a stable process identity.
+    /// 产生此观察结果的播放器运行时；后端提供稳定进程标识时才有值。
     pub(crate) runtime_identity: String,
-    /// Session reference carried by native playback terminal outcomes.
+    /// 原生播放终态结果携带的会话引用。
     pub(crate) session_id: String,
     pub(crate) generation: u64,
-    /// Native playback end behavior and durable terminal outcome metadata.
+    /// 原生播放结束行为及持久化终态结果元数据。
     pub(crate) end_behavior: String,
     pub(crate) last_end_cause: String,
     pub(crate) failure_code: String,

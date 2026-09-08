@@ -29,15 +29,13 @@ pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
     fn play_restored(&self, track: &PlayableTrack, _seek_seconds: Option<f64>) -> Result<String> {
         self.play(track, false)
     }
-    /// Reports a provider-level "this candidate cannot be played" error.
+    /// 报告服务商级别的“此候选不可播放”错误。
     ///
-    /// Backends use this hook to preserve the distinction between a stale or
-    /// ineligible song and an unavailable player/transport. The default keeps
-    /// existing backends unchanged.
+    /// 后端通过此接口区分过期/不符合条件的歌曲与不可用的播放器/传输。默认实现保持现有后端行为。
     fn is_track_unavailable_error(&self, _error: &anyhow::Error) -> bool {
         false
     }
-    /// A rejected source/request can be skipped without declaring the player unusable.
+    /// 被拒绝的音源或请求可以跳过，不必将播放器判定为不可用。
     fn item_scoped_playback_error_message(&self, _error: &anyhow::Error) -> Option<&'static str> {
         None
     }
@@ -59,10 +57,9 @@ pub(crate) trait MusicPlayerBackend: Clone + Send + Sync + 'static {
 pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
     fn snapshot(&self) -> Result<PlaybackRuntimeState>;
     fn update(&self, update: PlaybackStateUpdate) -> Result<bool>;
-    /// Atomically records an observation only while the expected request remains active.
+    /// 仅在预期请求仍处于活动状态时原子记录观察结果。
     ///
-    /// `true` means the identity matched (the observation itself may have been throttled);
-    /// `false` means a newer request owns the durable state.
+    /// `true` 表示身份匹配（观察本身可能被限流）；`false` 表示持久化状态已归新请求所有。
     fn record_observation_if_active(
         &self,
         expected: ActivePlaybackIdentity,
@@ -86,9 +83,7 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
         protect_after: Duration,
     ) -> Result<super::ExternalPlaybackObservation>;
     fn clear_external_playback_tracker(&self) -> Result<()>;
-    /// Records and compares the playback runtime/session responsible for an
-    /// active request. The persistent implementation makes a process restart
-    /// distinguishable from an ordinary stopped transport sample.
+    /// 记录并比较负责活动请求的播放运行时/会话。持久化实现使进程重启与普通停止传输样本可区分。
     fn inspect_player_session(
         &self,
         _binding: Option<PlaybackSessionBinding>,
@@ -96,8 +91,7 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
         Ok(SessionReconciliation::Unknown)
     }
 
-    /// Accepts the incoming binding after the controller has confirmed that it belongs to a live
-    /// session, or after a recovery dispatch has completed.
+    /// 控制器确认绑定属于活动会话，或恢复派发完成后，接受传入绑定。
     fn reconcile_player_session(
         &self,
         _binding: Option<PlaybackSessionBinding>,
@@ -117,8 +111,7 @@ pub(crate) trait PlaybackStatePort: Clone + Send + Sync + 'static {
     ) -> Result<bool> {
         self.update(update)
     }
-    /// Atomically claims a terminal outcome. Non-persistent test ports retain
-    /// the old one-shot semantics; the production state store deduplicates it.
+    /// 原子认领终态结果。非持久化测试端口保留旧的一次性语义；生产状态存储负责去重。
     fn claim_terminal_outcome(
         &self,
         _request_id: u64,
@@ -167,11 +160,9 @@ pub(crate) struct PlayerController<B: MusicPlayerBackend, S: PlaybackStatePort> 
     /// 用 Arc 共享：副本各自记录起点会把同一失败当作新的首次失败，
     /// 窗口被无限重置，导致失败曲目永不推进。
     engine_failure_at_ms: Arc<AtomicU64>,
-    /// A runtime restart that cannot be recovered immediately must remain recoverable on the next
-    /// monitor round even though persistent session reconciliation has already seen the runtime.
+    /// 无法立即恢复的运行时重启，即使持久化会话协调已经看见该运行时，也必须在下一轮监听中继续可恢复。
     runtime_recovery: Arc<Mutex<Option<RuntimeRecoveryState>>>,
-    /// Serializes monitor reconciliation/recovery with formal playback dispatches across all
-    /// controller clones. A stale monitor sample must not write state while a new request starts.
+    /// 在所有控制器副本之间串行化监听协调/恢复和正式播放派发。新请求开始时，过期监听样本不能写入状态。
     playback_operation_lease: Arc<Mutex<()>>,
 }
 
@@ -269,8 +260,7 @@ pub(crate) struct PlaybackRequest {
     pub(crate) track: Option<PlayableTrack>,
     pub(crate) requester: String,
     pub(crate) navigation: PlaybackNavigation,
-    /// Immutable results from the request's initial provider search. A
-    /// fallback selection must reuse these entries instead of searching again.
+    /// 请求首次服务商搜索得到的不可变结果。回退选择必须复用这些条目，不能再次搜索。
     pub(crate) candidate_snapshot: Vec<SearchCandidate>,
     /// 队列消费来源时携带队首 queue_item_id：确认成功时与播放状态原子出队，
     /// 崩溃后重启不会重播已确认消费的队首。手动点歌/恢复播放为 None。
@@ -311,11 +301,9 @@ pub(crate) enum PlaybackVerification {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlaybackOutcome {
     Success,
-    /// A deterministic failure of this Song Request only.  The queue may
-    /// discard it after the outcome is recorded and consider the next item.
+    /// 仅表示本次点歌请求的确定性失败。记录结果后可以丢弃队列项并处理下一项。
     ItemScopedFailure,
-    /// The player or recovery state is not known to be usable for the next
-    /// request. Keep the queue head for retry/skip.
+    /// 无法确认播放器或恢复状态可供下一请求使用。保留队首，以便重试或跳过。
     QueueBlockingFailure,
     DedupLimited,
 }
@@ -402,18 +390,15 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         Ok(message)
     }
 
-    /// Arm the user-pause state before attempting the backend RPC.
+    /// 在尝试后端 RPC 前先设置用户暂停状态。
     ///
-    /// Idle exit must prevent an already-queued automatic advance even when the
-    /// player backend is unavailable. The state transition is therefore kept as
-    /// the first operation; the backend pause remains best effort and its error
-    /// is returned to the caller for logging.
+    /// 即使播放器后端不可用，空闲退出也必须阻止已排队的自动推进。因此状态转换必须先执行；后端暂停尽力而为，错误返回调用方记录日志。
     pub(crate) fn pause_for_idle_exit(&self) -> Result<String> {
         self.pause_automatically("idle_exit", "闲置退出")
     }
 
     pub(crate) fn pause_for_hall_expiry(&self) -> Result<String> {
-        // Block automatic advances now, then pause the session after any in-flight load finishes.
+        // 立即阻止自动推进，等待正在加载的操作完成后再暂停会话。
         self.playback_state
             .update(PlaybackStateUpdate::UserPaused)?;
         let _lease = self
@@ -860,9 +845,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             !status.last_end_cause.trim().is_empty() || !status.failure_code.trim().is_empty();
         let incoming_live_session_verified =
             runtime_is_active && runtime_has_session && status_matches_active;
-        // A first observed session may legitimately be a terminal notification. It is not a
-        // replacement of an existing runtime, and binding it is required to process the matching
-        // natural-end/failure event once. Replacements themselves still require live transport.
+        // 首次观察到的会话可能合法地就是终态通知。它不是现有运行时的替代者，但必须绑定才能处理一次匹配的自然结束/失败事件；替代运行时仍需有活动传输。
         let incoming_initial_terminal_session_verified =
             runtime_has_session && status_matches_active && has_terminal_evidence;
         let restart_recovery_ready = runtime_is_idle
@@ -876,7 +859,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 .map_err(|_| anyhow!("待恢复播放器 runtime 锁已损坏"))?;
             match recovery.clone() {
                 Some(RuntimeRecoveryState::Pending(_)) if runtime_identity.is_empty() => {
-                    // An identity-less sample cannot supersede a known replacement runtime.
+                    // 没有身份的样本不能取代已知的替代运行时。
                     return Ok(QueueAdvanceDecision::None);
                 }
                 Some(RuntimeRecoveryState::Recovering(expected_runtime)) => {
@@ -885,17 +868,16 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     }
                     if expected_runtime == runtime_identity {
                         if incoming_live_session_verified {
-                            // The recovery dispatch is now observable. Accept its session below.
+                            // 恢复派发现在已可观察，下面接受其会话。
                         } else if has_terminal_evidence {
                             *recovery =
                                 Some(RuntimeRecoveryState::Pending(runtime_identity.to_string()));
                         } else {
-                            // Suppress duplicate recovery and stale stopped/unknown persistence
-                            // until the dispatched session becomes active or terminal.
+                            // 在派发的会话变为活动或终态前，抑制重复恢复以及过期的 stopped/unknown 持久化。
                             return Ok(QueueAdvanceDecision::None);
                         }
                     } else if incoming_live_session_verified {
-                        // A newer runtime established a live session; accept it below.
+                        // 新运行时已建立活动会话，下面接受它。
                     } else {
                         *recovery =
                             Some(RuntimeRecoveryState::Pending(runtime_identity.to_string()));
@@ -987,8 +969,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             && runtime_identity.is_empty()
             && !runtime_is_active
         {
-            // A stopped/unknown sample without runtime identity cannot replace a durable resume point;
-            // a later identified sample reconciles it.
+            // 没有运行时身份的 stopped/unknown 样本不能替换持久化续播点，后续带身份的样本会协调它。
             return Ok(QueueAdvanceDecision::None);
         }
         if runtime_snapshot.active_request.is_some()
@@ -998,8 +979,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             log::debug!("忽略与当前活动 TrackKey 不一致的播放器观测");
             return Ok(QueueAdvanceDecision::None);
         }
-        // Only observations from the accepted runtime may replace the durable resume point.
-        // In particular, a replacement runtime starts out stopped before recovery is dispatched.
+        // 只有已接受运行时的观察才能替换持久化续播点。替代运行时在恢复派发前尤其会先处于停止状态。
         if let Some(active) = runtime_snapshot.active_request.as_ref() {
             let Some(expected_active) = active.identity() else {
                 return Ok(QueueAdvanceDecision::None);
@@ -1237,8 +1217,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         }
 
         if status.status == "stopped" || status.status == "stoped" {
-            // A bare stopped observation can be user action, a provider
-            // failure, or a stale sample. It is never queue ownership.
+            // 单独的停止观察可能来自用户操作、服务商失败或过期样本，不能据此认定队列归属。
             return Ok(QueueAdvanceDecision::None);
         }
 
@@ -1367,9 +1346,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 "检测到 playback runtime 重启，控制器授权新恢复会话: previous_uri={}",
                 request.uri()
             );
-            // `maybe_advance_queue*` already holds the shared playback-operation lease. Recheck
-            // the exact active identity before dispatch so a request that won the lease earlier
-            // cannot be replaced by this stale recovery decision.
+            // `maybe_advance_queue*` 已持有共享播放操作租约。派发前重新检查精确活动身份，避免较早取得租约的请求被过期恢复决策替换。
             match self.play_restored_with_lease(Some(&expected_active)) {
                 Ok(true) => return Ok(QueueAdvanceDecision::PlaybackStateChanged),
                 Ok(false) => return Ok(QueueAdvanceDecision::None),
@@ -1380,8 +1357,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 }
             }
         }
-        // A new runtime must not inherit an old session automatically. Wait
-        // for an idle observation that the controller can explicitly recover.
+        // 新运行时不能自动继承旧会话。等待控制器可以明确恢复的空闲观察。
         Ok(QueueAdvanceDecision::None)
     }
 
@@ -2710,8 +2686,7 @@ mod tests {
             Some(42.0)
         );
 
-        // A replacement that exits after restoration but before listener readiness must leave
-        // the same durable seek point for the watchdog's next replacement attempt.
+        // 替代进程在恢复后、监听器就绪前退出时，必须为看门狗下一次替代尝试保留相同的持久化定位点。
         assert!(controller.play_restored().unwrap());
         assert_eq!(
             *controller.backend.restored_seeks.lock().unwrap(),
@@ -3138,8 +3113,7 @@ mod tests {
             command_executing: false,
         };
 
-        // The first observation creates the durable binding; it cannot also
-        // consume a terminal record observed before that binding existed.
+        // 首次观察会创建持久化绑定，不能同时消费创建绑定前观察到的终态记录。
         assert_eq!(
             controller
                 .maybe_advance_queue(terminal.clone(), context.clone())
@@ -3706,7 +3680,7 @@ mod tests {
             has_pending_playback_task: false,
             command_executing: false,
         };
-        // Bind the original runtime before it becomes unavailable.
+        // 在原运行时不可用前先绑定它。
         assert_eq!(
             controller
                 .maybe_advance_queue(old_runtime, context.clone())
@@ -3907,7 +3881,7 @@ mod tests {
             controller.runtime_recovery.lock().unwrap().clone(),
             Some(RuntimeRecoveryState::Pending("runtime-new".to_string()))
         );
-        // Repeated unstable samples while the command remains busy must not consume the restart.
+        // 命令仍忙碌期间反复出现的不稳定样本不能消耗重启机会。
         assert_eq!(
             controller.maybe_advance_queue(unknown, busy).unwrap(),
             QueueAdvanceDecision::None
@@ -4978,7 +4952,7 @@ mod tests {
         let monitor_status_ms: u64 = 1000;
         let status_poll_ms: u64 = 1000;
         let active_request = ActivePlaybackRequest {
-            // System clock moved back three seconds after playback began.
+            // 播放开始后系统时钟回拨了三秒。
             started_at_ms: 1_700_000_003_000,
             guard_started_at: Some(started_at),
             ..ActivePlaybackRequest::default()

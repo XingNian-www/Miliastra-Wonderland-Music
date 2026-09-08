@@ -308,7 +308,7 @@ impl UiMarkerProbeEvidence {
         self.search_rect
     }
 
-    /// Dimensions of the normalized image on which the marker hits were found.
+    /// 发现标记命中位置的归一化图像尺寸。
     pub(crate) fn coordinate_size(&self) -> (u32, u32) {
         self.coordinate_size
     }

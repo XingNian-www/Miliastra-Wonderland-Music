@@ -28,8 +28,7 @@ use windows::core::BOOL;
 
 use crate::config::{PointConfig, WindowConfig};
 
-// BGI keeps the pointer at the drag origin and each interpolated point long
-// enough for the game's UI event loop to observe the pressed state.
+// BGI 会在拖动起点和每个插值点停留足够时间，使游戏 UI 事件循环能观察到按下状态。
 const DRAG_START_SETTLE_MS: u64 = 100;
 const DRAG_PRESS_SETTLE_MS: u64 = 100;
 const DRAG_STEPS: i32 = 8;

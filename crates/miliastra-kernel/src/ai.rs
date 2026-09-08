@@ -120,6 +120,7 @@ fn normalize_endpoint(endpoint: &str, expected_path: &str) -> Result<String> {
 }
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::Duration;
@@ -127,8 +128,8 @@ use std::time::Duration;
 use async_openai::Client;
 use async_openai::error::OpenAIError;
 use async_openai::middleware::ReqwestService;
-use async_openai::types::chat::CreateChatCompletionRequest;
-use async_openai::types::responses::CreateResponse;
+use async_openai::types::chat::{CreateChatCompletionRequest, CreateChatCompletionResponse};
+use async_openai::types::responses::{CreateResponse, Response};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
@@ -153,8 +154,8 @@ struct OpenAiRuntimeState {
     submit_lock: Mutex<()>,
 }
 
-pub struct OpenAiOperation {
-    receiver: mpsc::Receiver<Result<Value>>,
+pub struct OpenAiOperation<T> {
+    receiver: mpsc::Receiver<Result<T>>,
     response_name: &'static str,
 }
 
@@ -232,12 +233,13 @@ impl OpenAiRuntimeHandle {
         request: CreateChatCompletionRequest,
         extra_body: &HashMap<String, Value>,
         timeout: Duration,
-    ) -> Result<OpenAiOperation> {
-        self.submit_chat(
-            target,
-            merge_extra_body(&request, extra_body)?,
-            validate_timeout(timeout)?,
-        )
+    ) -> Result<OpenAiOperation<CreateChatCompletionResponse>> {
+        let timeout = validate_timeout(timeout)?;
+        if extra_body.values().any(|value| !value.is_null()) {
+            self.submit_chat_byot(target, merge_extra_body(&request, extra_body)?, timeout)
+        } else {
+            self.submit_chat_typed(target, request, timeout)
+        }
     }
 
     pub fn create_response(
@@ -246,12 +248,13 @@ impl OpenAiRuntimeHandle {
         request: CreateResponse,
         extra_body: &HashMap<String, Value>,
         timeout: Duration,
-    ) -> Result<OpenAiOperation> {
-        self.submit_response(
-            target,
-            merge_extra_body(&request, extra_body)?,
-            validate_timeout(timeout)?,
-        )
+    ) -> Result<OpenAiOperation<Response>> {
+        let timeout = validate_timeout(timeout)?;
+        if extra_body.values().any(|value| !value.is_null()) {
+            self.submit_response_byot(target, merge_extra_body(&request, extra_body)?, timeout)
+        } else {
+            self.submit_response_typed(target, request, timeout)
+        }
     }
 
     fn begin_submission(&self) -> Result<MutexGuard<'_, ()>> {
@@ -266,65 +269,94 @@ impl OpenAiRuntimeHandle {
         Ok(guard)
     }
 
-    fn submit_chat(
+    fn submit_chat_typed(
+        &self,
+        target: Target,
+        request: CreateChatCompletionRequest,
+        timeout: Duration,
+    ) -> Result<OpenAiOperation<CreateChatCompletionResponse>> {
+        self.submit_request(
+            target,
+            timeout,
+            "Chat Completions",
+            move |client| async move { client.chat().create(request).await },
+        )
+    }
+
+    fn submit_chat_byot(
         &self,
         target: Target,
         request: Value,
         timeout: Duration,
-    ) -> Result<OpenAiOperation> {
-        let _submission = self.begin_submission()?;
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let http = self.http.clone();
-        self.runtime.spawn(async move {
-            let service = ReqwestService::new(http.clone());
-            let client = Client::build(http, target.config).with_http_service(service);
-            let result =
-                match tokio::time::timeout(timeout, client.chat().create_byot::<_, Value>(request))
+    ) -> Result<OpenAiOperation<CreateChatCompletionResponse>> {
+        self.submit_request(
+            target,
+            timeout,
+            "Chat Completions",
+            move |client| async move {
+                client
+                    .chat()
+                    .create_byot::<_, CreateChatCompletionResponse>(request)
                     .await
-                {
-                    Ok(result) => result.map_err(sdk_error),
-                    Err(_) => Err(anyhow!("OpenAI Chat Completions 请求超时")),
-                };
-            let _ = sender.send(result);
-        });
-        Ok(OpenAiOperation {
-            receiver,
-            response_name: "Chat Completions",
+            },
+        )
+    }
+
+    fn submit_response_typed(
+        &self,
+        target: Target,
+        request: CreateResponse,
+        timeout: Duration,
+    ) -> Result<OpenAiOperation<Response>> {
+        self.submit_request(target, timeout, "Responses", move |client| async move {
+            client.responses().create(request).await
         })
     }
 
-    fn submit_response(
+    fn submit_response_byot(
         &self,
         target: Target,
         request: Value,
         timeout: Duration,
-    ) -> Result<OpenAiOperation> {
+    ) -> Result<OpenAiOperation<Response>> {
+        self.submit_request(target, timeout, "Responses", move |client| async move {
+            client.responses().create_byot::<_, Response>(request).await
+        })
+    }
+
+    fn submit_request<T, F, Fut>(
+        &self,
+        target: Target,
+        timeout: Duration,
+        response_name: &'static str,
+        send: F,
+    ) -> Result<OpenAiOperation<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(Client<EndpointConfig>) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<T, OpenAIError>> + Send + 'static,
+    {
         let _submission = self.begin_submission()?;
         let (sender, receiver) = mpsc::sync_channel(1);
         let http = self.http.clone();
         self.runtime.spawn(async move {
             let service = ReqwestService::new(http.clone());
             let client = Client::build(http, target.config).with_http_service(service);
-            let result = match tokio::time::timeout(
-                timeout,
-                client.responses().create_byot::<_, Value>(request),
-            )
-            .await
-            {
+            let result = match tokio::time::timeout(timeout, send(client)).await {
                 Ok(result) => result.map_err(sdk_error),
-                Err(_) => Err(anyhow!("OpenAI Responses 请求超时")),
+                Err(_) => Err(anyhow!("OpenAI {response_name} 请求超时")),
             };
             let _ = sender.send(result);
         });
         Ok(OpenAiOperation {
             receiver,
-            response_name: "Responses",
+            response_name,
         })
     }
 }
 
-impl OpenAiOperation {
-    pub fn wait(self) -> Result<Value> {
+impl<T> OpenAiOperation<T> {
+    pub fn wait(self) -> Result<T> {
         self.receiver
             .recv()
             .with_context(|| format!("OpenAI runtime 在返回 {} 结果前停止", self.response_name))?
@@ -445,6 +477,26 @@ mod tests {
     };
     use reqwest::header::AUTHORIZATION;
 
+    const CHAT_COMPLETION_RESPONSE: &str = r#"{
+        "id":"chatcmpl-test",
+        "choices":[{
+            "index":0,
+            "message":{"role":"assistant","content":"ok"},
+            "finish_reason":"stop"
+        }],
+        "created":0,
+        "model":"test-model",
+        "object":"chat.completion"
+    }"#;
+    const RESPONSES_RESPONSE: &str = r#"{
+        "id":"resp-test",
+        "created_at":0,
+        "model":"test-model",
+        "object":"response",
+        "output":[],
+        "status":"completed"
+    }"#;
+
     #[test]
     fn target_preserves_full_custom_resource_url_and_auth_scheme() {
         let bearer = Target::chat(
@@ -495,8 +547,12 @@ mod tests {
     #[test]
     fn sdk_transport_uses_exact_endpoint_and_api_key_header() {
         let runtime = OpenAiRuntime::start().expect("OpenAI runtime");
-        let (origin, requests, server) =
-            mock_server(200, r#"{"choices":[]}"#, Duration::from_millis(300), 32);
+        let (origin, requests, server) = mock_server(
+            200,
+            CHAT_COMPLETION_RESPONSE,
+            Duration::from_millis(300),
+            32,
+        );
         let target = Target::chat(
             &format!("{origin}/custom/v1/chat/completions?tenant=a"),
             "secret",
@@ -509,13 +565,17 @@ mod tests {
             .chat_completion(
                 target,
                 chat_request(),
-                &HashMap::new(),
+                &HashMap::from([(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "disabled"}),
+                )]),
                 Duration::from_secs(2),
             )
             .expect("submit chat request")
             .wait()
             .expect("chat response");
-        assert_eq!(response, serde_json::json!({ "choices": [] }));
+        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.choices[0].message.content.as_deref(), Some("ok"));
         server.join().expect("mock server");
 
         let requests = requests.lock().expect("captured requests");
@@ -530,9 +590,9 @@ mod tests {
     fn provider_handles_use_independent_http_proxies() {
         let runtime = OpenAiRuntime::start().expect("OpenAI runtime");
         let (proxy_a, requests_a, server_a) =
-            mock_server(200, r#"{"choices":[]}"#, Duration::from_secs(2), 32);
+            mock_server(200, CHAT_COMPLETION_RESPONSE, Duration::from_secs(2), 32);
         let (proxy_b, requests_b, server_b) =
-            mock_server(200, r#"{"choices":[]}"#, Duration::from_secs(2), 32);
+            mock_server(200, CHAT_COMPLETION_RESPONSE, Duration::from_secs(2), 32);
         let handle_a = runtime
             .handle()
             .with_http_proxy(&proxy_a)
@@ -585,6 +645,32 @@ mod tests {
         assert_eq!(requests_b.len(), 1);
         assert!(requests_a[0].starts_with("POST http://provider-a.invalid/v1/chat/completions"));
         assert!(requests_b[0].starts_with("POST http://provider-b.invalid/v1/chat/completions"));
+    }
+
+    #[test]
+    fn sdk_responses_transport_decodes_typed_response() {
+        let runtime = OpenAiRuntime::start().expect("OpenAI runtime");
+        let (origin, requests, server) =
+            mock_server(200, RESPONSES_RESPONSE, Duration::from_millis(300), 32);
+        let target =
+            Target::responses(&format!("{origin}/v1/responses"), "secret").expect("target");
+
+        let response = runtime
+            .handle()
+            .create_response(
+                target,
+                CreateResponse::default(),
+                &HashMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("submit response request")
+            .wait()
+            .expect("response result");
+
+        assert_eq!(response.id, "resp-test");
+        assert!(response.output.is_empty());
+        server.join().expect("mock server");
+        assert_eq!(requests.lock().expect("captured requests").len(), 1);
     }
 
     #[test]

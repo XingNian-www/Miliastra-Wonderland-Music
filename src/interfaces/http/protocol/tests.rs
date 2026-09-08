@@ -3105,6 +3105,13 @@ fn config_schema_route_lists_all_sections_with_defaults() {
         .find(|field| field["path"] == "ai.api_key")
         .expect("ai.api_key field");
     assert_eq!(api_key["kind"]["type"], "secret");
+    let system_prompt = ai["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["path"] == "ai.system_prompt")
+        .expect("ai.system_prompt field");
+    assert_eq!(system_prompt["kind"]["type"], "text");
     // audio_cache 默认 null，但其子字段 default 用"启用后默认对象"提供
     // （Web「启用」开关预填来源，避免用户手填 JSON）。
     let playback = sections

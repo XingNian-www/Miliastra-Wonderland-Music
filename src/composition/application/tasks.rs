@@ -320,8 +320,7 @@ impl ApplicationRuntime {
                 .store(false, AtomicOrdering::SeqCst);
             return;
         }
-        // Reserve the reload outcome before sealing the task engine. A user exit records a
-        // higher-priority reason and can therefore win on either side of this claim.
+        // 在封存任务引擎前预留重载结果。用户退出记录的优先级更高，因此可以在此声明前后覆盖它。
         if !self.lifecycle.shutdown.try_claim_config_reload() {
             self.lifecycle
                 .http_reload_draining

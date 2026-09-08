@@ -150,10 +150,9 @@ pub(crate) fn hall_bubble_sequences_stable(
             .all(|(left, right)| same_hall_bubble(left, right))
 }
 
-/// Checks only the relative geometry of the visible hall bubbles.
+/// 仅检查可见大厅气泡的相对几何关系。
 ///
-/// Absolute y coordinates are intentionally ignored because the chat panel scrolls as new
-/// messages arrive. This is a settle check, not a message identity check.
+/// 有新消息时聊天面板会滚动，因此有意忽略绝对 y 坐标。这里用于稳定性检查，不用于消息身份判断。
 pub(crate) fn hall_bubble_layout_is_stable(
     previous: &[SecondaryHallBubble],
     current: &[SecondaryHallBubble],

@@ -40,7 +40,7 @@ const REFRESH_FAILURE_BACKOFF_MS: u64 = 15 * 60 * 1000;
 
 type Reply<T> = std_mpsc::SyncSender<Result<T, PlaybackError>>;
 
-/// Owns the dedicated Tokio thread, provider adapters, and the sole FFmpeg engine.
+/// 持有专用 Tokio 线程、提供商适配器及唯一的 FFmpeg 引擎。
 pub struct PlaybackRuntime {
     handle: PlaybackHandle,
     thread: Option<JoinHandle<()>>,
@@ -304,7 +304,7 @@ impl PlaybackRuntime {
         )
     }
 
-    /// Starts the runtime with a lead time shared with the live configuration layer.
+    /// 使用与实时配置层共享的歌词提前量启动运行时。
     pub fn start_with_lyrics_lead(
         credential_directory: impl Into<PathBuf>,
         audio_cache_config: Option<crate::cache::AudioCacheConfig>,
@@ -318,9 +318,8 @@ impl PlaybackRuntime {
         )
     }
 
-    /// Starts the runtime and optionally routes KuGou Web requests through the
-    /// WebView2 login helper.  The existing start methods remain unchanged for
-    /// embedders and tests that do not provide a helper executable.
+    /// 启动运行时，并可选地通过 WebView2 登录辅助程序转发酷狗 Web 请求。
+    /// 现有启动方法保持不变，供未提供辅助程序可执行文件的嵌入方和测试使用。
     pub fn start_with_lyrics_lead_and_helper(
         credential_directory: impl Into<PathBuf>,
         audio_cache_config: Option<crate::cache::AudioCacheConfig>,
@@ -796,8 +795,7 @@ async fn run_commands(
     // 必须按 id 找回 key 才能释放对应 in-flight 标记，防止该曲目被永久堵住。
     let mut preload_task_keys: HashMap<TaskId, TrackKey> = HashMap::new();
     let mut pending_preloads: VecDeque<PlayableTrack> = VecDeque::new();
-    // A slow provider must not let later minute ticks start overlapping daily
-    // background refresh passes against the same accounts.
+    // 慢速提供商不能让后续分钟 tick 与同一账号的每日后台刷新重叠执行。
     let background_refresh_lock = Arc::new(AsyncMutex::new(()));
     let mut refresh_tick = tokio::time::interval(Duration::from_secs(60));
     refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1757,8 +1755,8 @@ async fn finish_refresh(
         REFRESH_FAILURE_BACKOFF_MS
     }));
     let Some(started_revision) = started_revision else {
-        // No credential snapshot was captured. This can happen for an unconfigured provider or
-        // when logout won the race; neither case may leave a failed refresh state behind.
+        // 未捕获到凭据快照，可能是提供商未配置或退出登录抢先完成；两种情况都不能留下
+        // 刷新失败状态。
         let _ = credentials.discard_refresh(provider.as_str());
         return result;
     };
@@ -1852,11 +1850,10 @@ async fn refresh_due_credentials(core: &PlaybackCore, credentials: &CredentialSt
     }
 }
 
-/// Daily forced refresh of the account/VIP view for every configured provider.
+/// 每日强制刷新所有已配置提供商的账号/VIP 状态。
 ///
-/// This only reads existing credential snapshots and never starts a login flow.
-/// A stale/error response is retried on the short refresh backoff; a confirmed
-/// status is deferred for the normal daily interval.
+/// 此流程只读取现有凭据快照，不会启动登录流程。过期或错误响应按较短的刷新退避重试；
+/// 已确认的状态则延后到正常的每日间隔再检查。
 async fn refresh_due_account_statuses(core: &PlaybackCore, credentials: &CredentialStore) {
     for provider in ProviderId::ALL {
         let now = current_epoch_ms();

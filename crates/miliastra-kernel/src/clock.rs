@@ -4,17 +4,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Supplies monotonic business time to domain code.
+/// 为业务代码提供单调递增时间。
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
 }
 
-/// Waits for a duration in business gateways.
+/// 在业务网关中等待指定时长。
 pub trait Delay: Send + Sync + 'static {
     fn wait(&self, duration: Duration);
 }
 
-/// Supplies wall-clock metadata (not used for business deadline decisions).
+/// 提供墙上时钟元数据（不用于业务截止时间判断）。
 pub trait WallClock: Send + Sync + 'static {
     fn unix_seconds(&self) -> u64;
 
@@ -73,10 +73,10 @@ impl WallClock for SystemClock {
     }
 }
 
-/// A cloneable monotonic clock for deterministic tests.
+/// 可克隆的单调时钟，用于确定性测试。
 ///
-/// Clones observe and advance the same instant. The mutex makes concurrent advances additive
-/// rather than allowing one test driver to overwrite another driver's progress.
+/// 所有克隆观察并推进同一时刻。互斥锁确保并发推进会累加，
+/// 不会出现一个测试驱动覆盖另一个驱动进度的情况。
 #[derive(Clone, Debug)]
 pub struct ManualClock {
     time: Arc<Mutex<ManualTime>>,

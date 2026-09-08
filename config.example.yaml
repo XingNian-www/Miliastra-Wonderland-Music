@@ -3,7 +3,7 @@ http:
   host: 127.0.0.1
   port: 18888
   enabled: true
-  # Generated and persisted on first launch.
+  # 首次启动时自动生成并持久化。
   access_token: ""
 logging:
   dir: deps/logs

@@ -2,10 +2,10 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Identifies one asynchronous operation submitted by the business runtime.
+/// 标识业务运行时提交的一个异步操作。
 ///
-/// Separate from runtime-specific identifiers such as `UiOperationId`:
-/// delayed results correlate only by this id.
+/// 与 `UiOperationId` 等运行时专用标识分离；
+/// 延迟结果仅通过此标识关联。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BusinessOperationId(u64);
 
@@ -73,10 +73,9 @@ impl Display for BusinessOperationIdExhausted {
 
 impl std::error::Error for BusinessOperationIdExhausted {}
 
-/// Identifies the current incarnation of a business session.
+/// 标识业务会话的当前代次。
 ///
-/// Ending and restarting a game advances its generation. Results from an older generation can
-/// then be rejected even if their operation identifier is otherwise valid.
+/// 结束并重启游戏会推进代次。旧代次的结果即使操作标识有效，也会被拒绝。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionGeneration(u64);
 

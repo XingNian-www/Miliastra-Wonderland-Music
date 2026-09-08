@@ -136,7 +136,7 @@ impl HallStateService {
             self.state.state().remaining_updated_at,
         ) {
             (Some(_), Some(updated_at)) => {
-                // Wall time accounts for downtime; active countdowns use the monotonic clock.
+                // 墙上时间计入停机时长；活动倒计时使用单调时钟。
                 self.countdown_elapsed_before_start =
                     Duration::from_secs(self.wall_clock.unix_seconds().saturating_sub(updated_at));
                 Some(self.clock.now())

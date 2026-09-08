@@ -199,9 +199,8 @@ fn validate_qr_data_url(value: &str) -> Result<(), ProtocolError> {
     if !matches!(mime_type, "image/png" | "image/jpeg") || encoded.is_empty() {
         return Err(ProtocolError::InvalidQrCode);
     }
-    // Reject an oversized Base64 payload before decoding it. This keeps an
-    // invalid helper/API response from forcing an unbounded temporary
-    // allocation even though the decoded image has a strict size limit.
+    // 解码前先拒绝过大的 Base64 载荷，避免无效的辅助程序/API 响应触发无界临时分配，
+    // 即使解码后的图像有严格大小限制也不能放松此检查。
     let max_encoded_len = MAX_QR_IMAGE_BYTES.div_ceil(3) * 4;
     if encoded.len() > max_encoded_len {
         return Err(ProtocolError::InvalidQrCode);

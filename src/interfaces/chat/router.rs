@@ -33,10 +33,9 @@ pub(crate) enum ChatCommandModule {
 
 type ModuleClaim = (ChatCommandModule, fn(&CommandEnvelope) -> bool);
 
-/// Static module router for chat command envelopes.
+/// 聊天命令信封的静态模块路由器。
 ///
-/// Selection asks each vertical module only whether it owns the syntax. Once selected, only that
-/// module parses its arguments. Hash commands use the active entertainment owner explicitly.
+/// 选择阶段只询问各业务模块是否拥有该语法；选中后仅由该模块解析参数。井号命令显式使用当前娱乐模块所有者。
 pub(crate) struct ChatCommandRouter<'a> {
     custom_workflow: Option<&'a CustomWorkflowService>,
     identity: Option<&'a IdentityAccess>,
@@ -208,8 +207,7 @@ impl<'a> ChatCommandRouter<'a> {
     }
 
     fn select_at_module(&self, envelope: &CommandEnvelope) -> Option<ChatCommandModule> {
-        // Decision replies belong only to the active exclusive reader. Keep their reserved
-        // syntax out of configurable workflows when the same frame is also dispatched normally.
+        // 决策回复只属于当前独占读取器。同一画面正常分发时，也要将其保留语法排除在可配置流程之外。
         if is_reserved_decision_command(envelope) {
             return None;
         }

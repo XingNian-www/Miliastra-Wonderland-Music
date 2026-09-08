@@ -728,9 +728,8 @@ fn config_schema_tree() -> BTreeMap<String, ConfigSchemaNode> {
 }
 
 fn prune_schema_value(value: &mut Value, node: &ConfigSchemaNode) {
-    // Leaf objects such as rectangles, points, and free-form Object fields have
-    // no child paths in the schema and must be preserved as-is. Only declared
-    // containers (for example playback.audio_cache) are pruned recursively.
+    // 矩形、点和自由格式 Object 等叶子对象在 schema 中没有子路径，必须原样保留。
+    // 仅对声明过的容器（例如 playback.audio_cache）递归清理。
     if node.children.is_empty() {
         return;
     }
@@ -746,8 +745,7 @@ fn prune_schema_value(value: &mut Value, node: &ConfigSchemaNode) {
     });
 }
 
-/// Existing databases can omit fields introduced with a serde default. Expose those fields to
-/// configuration clients without changing explicit values (including null) or resolving paths.
+/// 旧数据库可以缺少带 serde 默认值的新字段。向配置客户端展示这些字段时，不改变显式值（包括 null），也不解析路径。
 fn fill_missing_defaults(current: &mut Value, defaults: &Value) {
     let (Some(current), Some(defaults)) = (current.as_object_mut(), defaults.as_object()) else {
         return;
@@ -1684,8 +1682,7 @@ mod tests {
         let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
         let original_created_at = store.revisions().unwrap()[0].created_at_ms;
 
-        // Simulate a revision written before the three world-wish fields existed while
-        // retaining custom values and a relative path through every round trip.
+        // 模拟三个祈愿字段加入前写入的版本，并在每次往返中保留自定义值和相对路径。
         let mut legacy_snapshot = Value::Object(store.read_all_sections().unwrap());
         legacy_snapshot["screen"]
             .as_object_mut()
@@ -1767,8 +1764,7 @@ mod tests {
             vec![(1, original_created_at)]
         );
 
-        // Saving the Web-visible screen/template values materializes the defaults without
-        // changing unrelated legacy fields or the bootstrap-owned database path.
+        // 保存 Web 可见的屏幕/模板值会补齐默认字段，不改变无关旧字段或引导配置拥有的数据库路径。
         let mut sections = Map::new();
         sections.insert("screen".to_string(), current["screen"].clone());
         sections.insert("templates".to_string(), current["templates"].clone());
@@ -1788,8 +1784,7 @@ mod tests {
             serde_json::to_value(&expected).unwrap()
         );
 
-        // Rolling back the old snapshot (which still lacks the fields) must remain readable;
-        // defaults are applied again while the revision chain records a new revision.
+        // 回滚仍缺少这些字段的旧快照后必须继续可读；再次应用默认值，同时在版本链中记录新版本。
         let rolled_back = reopened.rollback(1, 2).unwrap();
         assert_eq!(rolled_back.revision, 3);
         assert_eq!(

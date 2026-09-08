@@ -129,9 +129,7 @@ fn hotkey_loop(
         }
 
         let mut message = MSG::default();
-        // WM_QUIT is the lifecycle stop boundary. Do not short-circuit on `running`: an EXIT
-        // hotkey may already be queued when a reload flips that flag, and it must still override
-        // the reload before shutdown posts WM_QUIT.
+        // WM_QUIT 是生命周期停止边界。不能因 running 为假而提前返回：重载修改标志时 EXIT 热键可能已经入队，仍须在停机发布 WM_QUIT 前覆盖重载。
         while GetMessageW(&mut message, Some(HWND(std::ptr::null_mut())), 0, 0).as_bool() {
             if message.message == WM_HOTKEY {
                 match message.wParam.0 as i32 {

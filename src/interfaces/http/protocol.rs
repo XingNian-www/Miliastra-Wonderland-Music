@@ -702,8 +702,8 @@ struct AppError {
     message: String,
 }
 
-/// Apply the configured public display names to JSON returned by the HTTP API.
-/// Internal game nicknames remain unchanged in commands, targeting and permission checks.
+/// 将配置的公开昵称映射应用到 HTTP API 返回的 JSON。
+/// 游戏内部昵称在命令、目标选择和权限判断中保持不变。
 pub(super) fn map_api_identity_json(value: &mut serde_json::Value, identity: &IdentityAccess) {
     fn visit(value: &mut serde_json::Value, identity: &IdentityAccess, parent_key: Option<&str>) {
         match value {
@@ -778,9 +778,7 @@ pub(super) fn map_api_identity_json(value: &mut serde_json::Value, identity: &Id
         }
     }
 
-    // Diagnostic task results are often JSON encoded in a string. Decode and map
-    // structured results first so a display name containing quotes cannot corrupt
-    // the embedded JSON; plain text results still receive the normal replacement.
+    // 诊断任务结果通常是编码在字符串中的 JSON。先解码并映射结构化结果，避免包含引号的公开昵称破坏内嵌 JSON；普通文本仍执行常规替换。
     fn map_result(value: &mut serde_json::Value, identity: &IdentityAccess) {
         let serde_json::Value::String(text) = value else {
             visit(value, identity, Some("result"));

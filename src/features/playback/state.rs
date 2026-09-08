@@ -12,7 +12,7 @@ use super::PlaybackStateUpdate;
 use super::queue::QueueItem;
 use miliastra_contracts::StateStore;
 
-/// The sole durable snapshot for a requested-playback session.
+/// 点播会话唯一的持久化快照。
 ///
 const REQUEST_STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_HISTORY_ENTRIES: usize = 64;
@@ -338,10 +338,7 @@ impl RequestStateStore {
         self.snapshot.playback.clone()
     }
 
-    /// Records an observation only while the exact active request that produced the monitor
-    /// snapshot is still current. The identity check and durable update share one state-store
-    /// transaction, so a newer request cannot be overwritten between a controller snapshot and
-    /// observation persistence.
+    /// 仅当生成监听快照的精确活动请求仍然有效时记录观察结果。身份检查和持久化更新共用一次状态存储事务，避免控制器快照与观察持久化之间被新请求覆盖。
     pub(crate) fn record_observation_if_active(
         &mut self,
         expected: &ActivePlaybackIdentity,
@@ -737,10 +734,9 @@ pub struct ActivePlaybackRequest {
     #[serde(default)]
     pub requester: String,
     pub started_at_ms: u64,
-    /// Runtime-only monotonic anchor for the short playback-start guard.
+    /// 仅运行时使用的单调时钟锚点，用于短暂的播放启动保护。
     ///
-    /// Persisted wall-clock metadata must never be used to judge a business deadline. A restored
-    /// request therefore has no guard and is reconciled from a fresh player observation.
+    /// 不能使用持久化墙上时间判断业务截止时间。因此恢复的请求没有保护期，必须根据新的播放器观察重新协调。
     #[serde(skip)]
     pub(crate) guard_started_at: Option<Instant>,
     /// 播放确认时观测到的引擎会话归属，用于失败分支校验：
@@ -826,7 +822,7 @@ impl PersistentPlaybackState {
                     != active_request_identity(next.active_request.as_ref())
                     || next.active_request.is_none()
                 {
-                    // A binding only authorizes the exact active request which established it.
+                    // 绑定只授权建立它的那个精确活动请求。
                     snapshot.session_binding = None;
                 }
                 snapshot.playback = next.clone();

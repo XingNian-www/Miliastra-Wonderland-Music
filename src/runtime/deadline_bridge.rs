@@ -170,8 +170,7 @@ fn run_business_deadline_bridge(
     }
 }
 
-/// Owns the timer before the business runtime exists. Its handle can be injected before the event
-/// bridge is attached.
+/// 在业务运行时创建前持有计时器；事件桥接连接前即可注入其句柄。
 pub(crate) struct BusinessRuntimeGroupBuilder {
     timer: Option<TimerRuntime<BusinessDeadlineToken>>,
     events: Option<Receiver<TimerRuntimeEvent<BusinessDeadlineToken>>>,
@@ -267,7 +266,7 @@ fn cleanup_failed_attach(timer: TimerRuntime<BusinessDeadlineToken>, business: B
     }
 }
 
-/// Owns the single business timer and its attached event bridge so shutdown order cannot diverge.
+/// 持有唯一业务计时器及其事件桥接，确保停机顺序一致。
 struct BusinessDeadlineRuntime {
     timer: Option<TimerRuntime<BusinessDeadlineToken>>,
     bridge: Option<BusinessDeadlineBridge>,
@@ -363,8 +362,7 @@ impl Display for BusinessRuntimeGroupShutdownError {
 
 impl Error for BusinessRuntimeGroupShutdownError {}
 
-/// Owns the business worker together with its sole timer and bridge. Shutdown first quiesces
-/// business state and stops external workers, drains the timer bridge, then exits the worker.
+/// 将业务工作线程与唯一计时器及桥接一起持有。停机先静默业务状态并停止外部工作线程，再排空计时器桥接，最后退出工作线程。
 pub(crate) struct BusinessRuntimeGroup {
     deadlines: Option<BusinessDeadlineRuntime>,
     business: Option<BusinessRuntime>,

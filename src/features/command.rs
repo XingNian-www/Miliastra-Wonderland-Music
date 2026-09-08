@@ -37,7 +37,7 @@ pub(crate) struct CommandObservation {
     pub(crate) message_id: Option<ObservedChatMessageId>,
 }
 
-/// Chat input before a vertical feature has been selected or parsed.
+/// 尚未选择或解析业务模块前的聊天输入。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommandEnvelope {
     original_text: String,
@@ -193,10 +193,9 @@ impl<T> FeatureCommandMatch<T> {
     }
 }
 
-/// The small top-level routing enum described by ADR 0059.
+/// ADR 0059 定义的顶层小型路由枚举。
 ///
-/// Every payload type is owned by its vertical feature. This enum identifies the selected
-/// module after chat routing or lets a non-chat adapter submit a typed module command directly.
+/// 每种载荷类型由对应业务模块拥有。聊天路由完成后，此枚举标识选中的模块，也允许非聊天适配器直接提交类型化模块命令。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum ModuleCommand {
     SongRequest(SongCommand),
@@ -291,11 +290,9 @@ impl ModuleCommand {
         matches!(self, Self::CardGame(_) | Self::Undercover(_))
     }
 
-    /// Whether a command observed in the current hall needs the actual speaker identity.
+    /// 当前大厅观察到的命令是否需要真实发言者身份。
     ///
-    /// Logging and audit metadata do not count as an identity dependency. This is reserved for
-    /// commands whose business result, authorization, turn ownership, or delivery target changes
-    /// with the speaker.
+    /// 日志和审计元数据不属于身份依赖。此标志仅用于业务结果、授权、回合归属或投递目标会随发言者变化的命令。
     pub(crate) fn requires_hall_sender(&self) -> bool {
         match self {
             Self::SongRequest(_) | Self::Playback(_) | Self::Hall(_) | Self::Administration(_) => {
@@ -312,8 +309,7 @@ impl ModuleCommand {
             }
             Self::TurtleSoup(command) => matches!(command, TurtleSoupCommand::Start),
             Self::Undercover(command) => !matches!(command, UndercoverCommand::Retry),
-            // These modules are friend-only today, or expose the triggering user as part of their
-            // execution contract. Keep them conservative if a hall route is added later.
+            // 这些模块目前仅对好友开放，或将触发用户作为执行契约的一部分。后续增加大厅路由时仍保持保守处理。
             Self::Invite(_) | Self::Moderation(_) | Self::CustomWorkflow(_) => true,
         }
     }

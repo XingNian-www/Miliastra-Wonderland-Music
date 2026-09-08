@@ -1,8 +1,7 @@
-//! Minimal native QQ Music protocol adapter.
+//! 精简的原生 QQ 音乐协议适配器。
 //!
-//! The adapter deliberately owns the provider-specific JSON shape and rights
-//! flags. The playback core only sees canonical Song values and three-state
-//! PlaybackEligibility.
+//! 适配器负责提供商专用的 JSON 结构和版权标志，播放核心只接触规范化的 Song
+//! 值和三态 PlaybackEligibility。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -58,19 +57,16 @@ pub struct QqMusicAdapter {
     lyrics_url: Url,
     native_lyrics_url: Url,
     device: QqDevice,
-    /// QIMEI is refreshed at most once per 24 hours and shared by concurrent
-    /// credential refreshes in the same adapter instance.
+    /// QIMEI 最多每 24 小时刷新一次，同一适配器实例中的并发凭据刷新共享该值。
     qimei_cache: std::sync::Arc<std::sync::Mutex<Option<QqQimeiCache>>>,
-    /// Single-flight gate for a cache miss.  Without this gate concurrent
-    /// refreshes could issue several QIMEI requests for the same device.
+    /// 缓存未命中时的单飞闸门。没有此闸门时，并发刷新可能为同一设备发起多次 QIMEI 请求。
     qimei_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// 账号 VIP 状态缓存（成功 24 小时/失败 15 分钟），避免轮询频繁打账号接口。
     account_cache: std::sync::Arc<std::sync::Mutex<AccountStatusCache>>,
 }
 
-/// Extra query/header values used by a provider request.  Keeping these
-/// alongside the request body means an auth retry can replay the exact same
-/// native-lyrics request after the credential snapshot is rotated.
+/// 提供商请求使用的额外查询参数/请求头。与请求体一起保存，凭据快照轮换后进行认证重试时，
+/// 可以重放完全相同的原生歌词请求。
 #[derive(Clone, Default)]
 struct QqRequestOptions {
     query: Vec<(String, String)>,
@@ -285,10 +281,8 @@ impl QqMusicAdapter {
     }
 
     async fn lyrics_json_with_translation(&self, song_mid: &str) -> Result<Value, CatalogError> {
-        // Native lyrics now use the same one-shot refresh path as search and
-        // vkey requests.  Only a successful response with no lyric falls back
-        // to the legacy endpoint; auth/rate-limit/provider errors are returned
-        // intact instead of being hidden by an unconditional fallback.
+        // 原生歌词现在与搜索和 vkey 请求共用一次性刷新路径。仅在成功响应但无歌词时回退到旧端点；
+        // 认证、限流和提供商错误保持原样返回，不被无条件回退掩盖。
         let response = self.native_lyrics_json(song_mid).await?;
         if qq_response_code(&response).is_some_and(|code| code != 0) {
             if let Some(error) = qq_response_business_error(&response) {
@@ -430,9 +424,8 @@ impl QqMusicAdapter {
         let ProviderCredential::QqMusic { cookies } = credential else {
             return Ok(None);
         };
-        // A credential may retain both the WebView session and the mobile
-        // OAuth tuple. Prefer the web contract, but do not let a stale web
-        // session prevent a valid mobile refresh from running.
+        // 凭据可能同时保留 WebView 会话和移动端 OAuth 元组。优先使用 Web 契约，
+        // 但不能让过期 Web 会话阻止有效的移动端刷新。
         let web_refresh_error = match self.refresh_web_credential(cookies).await {
             Ok(Some(refreshed)) => return Ok(Some(refreshed)),
             Ok(None) => None,
@@ -533,10 +526,8 @@ impl QqMusicAdapter {
             ));
         };
         let mut refreshed = cookies.clone();
-        // Some mobile responses rotate refresh material through Set-Cookie
-        // instead of (or in addition to) the JSON data object.  Merge those
-        // fields before applying the JSON aliases so either wire form is
-        // persisted for the next refresh.
+        // 部分移动端响应通过 Set-Cookie（而非或同时通过 JSON data 对象）轮换刷新材料。
+        // 应用 JSON 别名之前先合并这些字段，确保两种线格式都能持久化供下次刷新使用。
         merge_qq_web_set_cookie_headers(&mut refreshed, &response_headers);
         replace_cookie_alias(
             &mut refreshed,
@@ -641,10 +632,9 @@ impl QqMusicAdapter {
         }
     }
 
-    /// QQ Music's current web login stores a WeChat refresh session rather
-    /// than the mobile `refresh_key` tuple. The web frontend renews it through
-    /// this endpoint before requesting provider data; mirror that contract so
-    /// a WebView login remains refreshable without exposing a second login UI.
+    /// QQ 音乐当前网页登录保存的是微信刷新会话，而不是移动端 `refresh_key` 元组。
+    /// Web 前端会在请求提供商数据前通过此端点续期；这里保持相同契约，使 WebView 登录
+    /// 可继续刷新，同时无需暴露第二套登录界面。
     async fn refresh_web_credential(
         &self,
         cookies: &BTreeMap<String, String>,
@@ -774,9 +764,7 @@ impl QqMusicAdapter {
             return qimei;
         }
 
-        // Serialize only cache misses.  Re-check after taking the gate because
-        // another caller may have completed the network request while this
-        // task was waiting.
+        // 仅串行化缓存未命中请求。获取闸门后重新检查，因为等待期间其他调用方可能已完成网络请求。
         let _gate = self.qimei_gate.lock().await;
         let now = epoch_secs();
         if let Some(qimei) = self.fresh_qimei(now) {
@@ -842,9 +830,7 @@ impl QqMusicAdapter {
         {
             return Some(cache.value.clone());
         }
-        // A device file written by an older build may contain QIMEI values
-        // without a timestamp. Treat those values as expired; a fresh request
-        // prevents a permanently reused identifier after the 24-hour contract.
+        // 旧版本写入的设备文件可能包含没有时间戳的 QIMEI。将其视为已过期并重新请求，避免超过 24 小时后永久复用标识。
         if let (Some(qimei), Some(saved_at)) =
             (self.device.qimei.clone(), self.device.qimei_saved_at)
             && qimei_is_fresh(&qimei, saved_at, now)
@@ -894,8 +880,7 @@ impl QqMusicAdapter {
                     "guid": "1000000000",
                     "songmid": [song_mid],
                     "songtype": [0],
-                    // M500 is QQ Music's standard-quality MP3. An explicit
-                    // filename is required for the vkey response to have purl.
+                    // M500 是 QQ 音乐标准音质 MP3。必须显式提供文件名，vkey 响应才会包含 purl。
                     "filename": [qq_filename(media_mid, "M500", "mp3")],
                     "uin": uin,
                     "loginflag": 1,
@@ -928,9 +913,8 @@ impl QqMusicAdapter {
             return Ok(Some(status));
         }
 
-        // A normal cache miss joins the in-flight provider query, then reads the
-        // freshly written cache. A caller that explicitly requested refresh still
-        // performs a query unless it had to wait for another refresh already in flight.
+        // 普通缓存未命中会加入正在进行的提供商查询，随后读取刚写入的缓存。
+        // 明确请求刷新的调用方仍会查询，除非它已经等待了另一个进行中的刷新。
         let mut waited_for_refresh = false;
         let _status_refresh = match refresh_gate.try_lock() {
             Ok(guard) => guard,
@@ -1178,8 +1162,7 @@ impl SourceAdapter for QqMusicAdapter {
         };
         Ok(StreamSource {
             url,
-            // The vkey is embedded in purl. Account cookies must not be sent
-            // to an arbitrary CDN host returned by the provider.
+            // vkey 已嵌入 purl，账号 Cookie 不得发送到提供商返回的任意 CDN 主机。
             headers: BTreeMap::from([("Referer".to_owned(), "https://y.qq.com/".to_owned())]),
             expires_at_epoch_ms: None,
         })
@@ -1399,9 +1382,8 @@ struct QqResponseEnvelope<'a> {
     code: Option<i64>,
 }
 
-/// Choose one QQ response envelope once, then use that same envelope for data,
-/// authentication and business-error decisions. Explicit code-0 envelopes win;
-/// if none succeeded, the first explicit failure remains authoritative.
+/// 只选择一次 QQ 响应信封，并用同一信封进行数据、认证和业务错误判断。
+/// 明确 code-0 的信封优先；若没有成功响应，则以第一个明确失败响应为准。
 fn qq_selected_response_envelope(response: &Value) -> Option<QqResponseEnvelope<'_>> {
     let object = response.as_object()?;
     let mut candidates = Vec::new();
@@ -1421,14 +1403,12 @@ fn qq_selected_response_envelope(response: &Value) -> Option<QqResponseEnvelope<
         };
         candidates.push(QqResponseEnvelope {
             data: envelope_object.get("data").unwrap_or(envelope),
-            // Only an envelope's own fields are business codes. Its data may
-            // contain unrelated song metadata with a `code` field.
+            // 只有信封自身字段才是业务码；其中的 data 可能包含带 `code` 字段的无关歌曲元数据。
             code: qq_direct_code(envelope_object),
         });
     }
 
-    // A root code without root data is only a fallback legacy envelope. It
-    // must not turn `{code:0, req:{code:1000}}` into a successful response.
+    // 没有根 data 的根 code 仅是旧版回退信封，不能将 `{code:0, req:{code:1000}}` 判为成功。
     if candidates.is_empty() && qq_direct_code(object).is_some() {
         candidates.push(QqResponseEnvelope {
             data: response,
@@ -1462,8 +1442,7 @@ fn qq_selected_response_envelope(response: &Value) -> Option<QqResponseEnvelope<
         .or_else(|| candidates.first().copied())
 }
 
-// Inspect only one envelope level so song metadata cannot become a provider
-// business code. If direct fields contradict each other, a nonzero code wins.
+// 只检查一层信封，避免歌曲元数据被当作提供商业务码。直接字段冲突时，以非零码为准。
 fn qq_direct_code(object: &serde_json::Map<String, Value>) -> Option<i64> {
     let mut first = None;
     for field in ["code", "ret", "retcode"] {
@@ -1832,8 +1811,7 @@ fn random_hex(rng: &mut impl Rng, length: usize) -> String {
         .collect()
 }
 
-/// QIMEI's beacon is intentionally synthetic, but keeps the same field
-/// layout as the Android SDK so the server can parse the device fingerprint.
+/// QIMEI beacon 有意使用合成值，但保持与 Android SDK 相同的字段布局，以便服务器解析设备指纹。
 fn random_beacon_id(timestamp: u64, rng: &mut impl Rng) -> String {
     let (year, month, _) = civil_from_days((timestamp / 86_400) as i64);
     let month_start = format!("{year:04}-{month:02}-01");
@@ -1864,8 +1842,7 @@ fn random_hex_nonzero(rng: &mut impl Rng, length: usize) -> String {
         .collect()
 }
 
-// Inverse of the civil-date conversion used by the C++/Android SDK. The
-// result is Gregorian year, month, day for a UTC day count since 1970-01-01.
+// C++/Android SDK 使用的公历日期转换逆运算。结果是自 1970-01-01 起 UTC 天数对应的公历年、月、日。
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -2120,9 +2097,8 @@ fn qq_refresh_payload(
     })
 }
 
-/// QQ Music's refresh protocol type follows the credential key family, not
-/// the WebView callback's `login_type` query parameter. `Q_H_L_` is the QQ
-/// mobile contract (type 2); `W_X_` is the WeChat contract (type 1).
+/// QQ 音乐刷新协议类型取决于凭据键族，而不是 WebView 回调的 `login_type` 查询参数。
+/// `Q_H_L_` 是 QQ 移动端契约（类型 2）；`W_X_` 是微信契约（类型 1）。
 fn qq_refresh_login_type(music_key: &str) -> i64 {
     if music_key
         .trim()
@@ -2154,9 +2130,8 @@ fn qq_account_is_vip(identity: &Value, data: &Value) -> bool {
         || qq_vip_flag(identity, "twelve")
 }
 
-/// The response keeps historical tier end dates, so only use dates belonging
-/// to a currently active tier. A user can hold both tiers; the later end date
-/// is when their ability to play VIP tracks changes.
+/// 响应会保留历史层级的结束日期，因此只能使用当前生效层级的日期。
+/// 用户可能同时拥有两个层级；较晚的结束日期决定其 VIP 歌曲播放能力何时变化。
 fn qq_vip_expire_at_ms(identity: &Value, now_ms: u64) -> Option<u64> {
     [
         qq_vip_flag(identity, "HugeVip").then_some("HugeVipEnd"),
@@ -2326,8 +2301,7 @@ fn qq_stream_url(response: &Value) -> Result<Url, CatalogError> {
     Ok(url)
 }
 
-/// Return the first vkey media-info object regardless of which request
-/// envelope (`req`, `req_N`, `search`, or root `data`) QQ used.
+/// 返回第一个 vkey 媒体信息对象，不论 QQ 使用的是哪个请求信封（`req`、`req_N`、`search` 或根 `data`）。
 fn qq_media_info(response: &Value) -> Option<&serde_json::Map<String, Value>> {
     let data = qq_response_data(response).unwrap_or(response).as_object()?;
     let info = data
@@ -2335,9 +2309,8 @@ fn qq_media_info(response: &Value) -> Option<&serde_json::Map<String, Value>> {
         .or_else(|| data.get("midUrlInfo"))
         .or_else(|| data.get("mid_url_info"))?;
     if let Some(items) = info.as_array() {
-        // The provider may put an empty/denied quality first and a playable
-        // quality later in the same response. Prefer the first non-empty purl,
-        // while retaining the first object as a fallback for error metadata.
+        // 提供商可能先返回空质量或拒绝项，再在同一响应中返回可播放质量。
+        // 优先选择第一个非空 purl，同时保留首个对象作为错误元数据回退。
         return items
             .iter()
             .filter_map(Value::as_object)
@@ -2761,8 +2734,7 @@ mod tests {
             Some("fresh-key")
         );
 
-        // A successful empty envelope remains authoritative over a later
-        // error envelope; callers can then classify the empty success normally.
+        // 成功但为空的信封仍优先于后续错误信封；调用方可以按正常流程分类该空成功。
         let response = json!({
             "req_0": {"code": 0, "data": {}},
             "req_1": {"code": 1000, "data": {"error": "expired"}}
@@ -2773,8 +2745,7 @@ mod tests {
                 .is_some_and(|object| object.is_empty())
         );
 
-        // If every envelope is an error, retain the first data object for the
-        // error parser rather than silently selecting a later unrelated one.
+        // 如果所有信封都是错误，保留第一个 data 对象供错误解析器使用，不能静默选择后续无关对象。
         let response = json!({
             "req_0": {"code": 1001, "data": {"first": true}},
             "req_1": {"code": 1002, "data": {"second": true}}
@@ -3310,8 +3281,7 @@ mod tests {
         let store = CredentialStore::memory();
         refresh_credentials(&store);
         let snapshot = store.snapshot("qqmusic").unwrap().unwrap();
-        // A login completion may re-save the same cookie values. Revision, rather than value
-        // equality, identifies that the old request no longer owns this session.
+        // 登录完成可能再次保存相同 Cookie 值。使用版本而非值相等判断旧请求已不再拥有此会话。
         store.save("qqmusic", snapshot.credential.clone()).unwrap();
         let (endpoint, requests) = fixture_server_sequence(vec![Some(
             r#"{"req":{"code":0,"data":{"musickey":"stale-refresh-key","musicid":"42","openid":"stale-open-id","access_token":"stale-access-token","refresh_token":"stale-refresh-token","refresh_key":"stale-refresh-key"}}}"#.to_owned(),

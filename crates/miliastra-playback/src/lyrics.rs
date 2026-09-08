@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-/// Configurable lyric lead is capped to avoid selecting content far ahead of playback.
+/// 对可配置的歌词提前量设上限，避免显示远超播放进度的内容。
 pub const MAX_LYRICS_LEAD_SECONDS: f64 = 60.0;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -29,9 +29,7 @@ const READER_JOIN_GRACE: Duration = Duration::from_secs(3);
 const MAX_LOGIN_HELPER_FRAMES: usize = 8;
 const PROFILE_ROOT_NAME: &str = ".login-profiles";
 
-/// The application owns the login lease and credential store. Keeping this
-/// small trait here makes the process lifecycle testable without starting the
-/// FFmpeg runtime or a WebView2 window.
+/// 登录租约和凭据存储由应用层负责。保留这个小接口可在不启动 FFmpeg 运行时或 WebView2 窗口的情况下测试进程生命周期。
 trait LoginPlaybackPort: Send + Sync {
     fn credential_statuses(&self) -> Result<Vec<CredentialStatus>, PlaybackError>;
     fn refresh_credential(&self, provider: ProviderId) -> Result<CredentialStatus, PlaybackError>;
@@ -140,7 +138,7 @@ impl LoginPlaybackPort for PlaybackHandle {
 }
 
 trait ManagedChild: Send {
-    /// Returns `Some(success)` once the child has been reaped.
+    /// 子进程回收后返回 `Some(success)`。
     fn try_wait(&mut self) -> io::Result<Option<bool>>;
     fn kill(&mut self) -> io::Result<()>;
 }
@@ -203,8 +201,8 @@ struct KugouDeviceIdentity {
     mac: String,
 }
 
-/// Keep the lite device identity stable across helper processes and restarts.
-/// The file shape is compatible with the former sidecar implementation.
+/// 在不同辅助进程和重启之间保持 lite 设备标识稳定。
+/// 文件格式与原侧车实现兼容。
 fn load_or_create_kugou_device(directory: &Path) -> io::Result<KugouDeviceIdentity> {
     fs::create_dir_all(directory)?;
     let path = directory.join(KUGOU_DEVICE_FILE);
@@ -220,8 +218,7 @@ fn load_or_create_kugou_device(directory: &Path) -> io::Result<KugouDeviceIdenti
     };
     let content = serde_json::to_vec_pretty(&device)
         .map_err(|error| io::Error::other(format!("serialize KuGou device identity: {error}")))?;
-    // `create_new` makes the first writer the owner.  A second helper process
-    // must never overwrite an identity that is already in use by playback.
+    // `create_new` 让首个写入者成为所有者。第二个辅助进程不能覆盖播放正在使用的标识。
     match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
             file.write_all(&content)?;
@@ -229,8 +226,7 @@ fn load_or_create_kugou_device(directory: &Path) -> io::Result<KugouDeviceIdenti
             Ok(device)
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            // The winning process may still be writing.  Give it a short,
-            // bounded window to finish before parsing the shared file.
+            // 获胜进程可能仍在写入，解析共享文件前给它一个短暂且有界的完成窗口。
             for _ in 0..10 {
                 match read_kugou_device(&path) {
                     Ok(device) => return Ok(device),
@@ -672,9 +668,8 @@ impl LoginHelperManager {
         let mut state = match self.inner.state.lock() {
             Ok(state) => state,
             Err(_) => {
-                // The child has already been spawned at this point.  Do not
-                // leak it (or its temporary profile) when the manager mutex
-                // is poisoned between spawn and worker registration.
+                // 子进程此时已经启动。管理器互斥锁在启动与工作线程注册之间失败时，
+                // 也不能泄漏子进程或临时配置文件。
                 terminate_child(&child);
                 let _ = self.inner.playback.cancel_login(session.session_id);
                 cleanup_profile(&profile);
@@ -944,11 +939,8 @@ impl LoginHelperManager {
             .as_ref()
             .is_some_and(|active| active.session.session_id == session_id)
         {
-            // A WebView2 descendant can keep stdout/stderr inherited after the
-            // helper has been killed. Do not leave the manager permanently
-            // active waiting for that pipe to close: the session is cancelled,
-            // so detach the bounded worker and let its final cleanup observe
-            // the session-id fence below. A later login can start immediately.
+            // WebView2 子进程可能在辅助程序终止后仍继承 stdout/stderr。不要让管理器永久等待管道关闭：
+            // 会话已取消，应分离有界工作线程，让最终清理通过下方的会话 ID 栅栏完成；后续登录可以立即开始。
             let worker = state.worker.take();
             state.active = None;
             state.phase = LoginPhase::Failed;
@@ -1387,8 +1379,7 @@ fn credential_from_payload_with_device_registration(
                         Some(ProviderId::Kugou),
                     )
                 })?;
-            // The QR request and device registration must use exactly the
-            // identity that will be persisted with the new credential.
+            // 二维码请求和设备注册必须使用将与新凭据一起持久化的同一个标识。
             cookies.insert("KUGOU_API_GUID".to_owned(), device.guid.clone());
             cookies.insert("KUGOU_API_DEV".to_owned(), device.dev.clone());
             cookies.insert("KUGOU_API_MAC".to_owned(), device.mac.clone());
@@ -1427,9 +1418,8 @@ fn credential_from_payload_with_device_registration(
             Ok(ProviderCredential::Kugou {
                 token,
                 userid,
-                // Keep the browser session's dfid paired with KuGoo. A
-                // missing browser dfid is only possible with an old helper;
-                // use the registered value as a compatibility fallback.
+                // 保持浏览器会话 dfid 与 KuGoo 配对。浏览器 dfid 缺失只可能来自旧辅助程序，
+                // 此时使用注册值作为兼容兜底。
                 dfid: web_dfid
                     .unwrap_or_else(|| cookies.get("KUGOU_API_DFID").cloned().unwrap_or_default()),
                 cookies,

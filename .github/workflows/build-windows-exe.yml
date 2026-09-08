@@ -36,8 +36,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   LIBCLANG_PATH: C:\Program Files\LLVM\bin
-  # v2.3.1 resolves to commit 14ac4de60307e7674c9023a9f226dd89ca907171.
-  # The download step below also verifies SHA-256 so a retagged release fails closed.
+  # v2.3.1 当前解析到提交 14ac4de60307e7674c9023a9f226dd89ca907171。
+  # 下面的下载步骤还会校验 SHA-256，标签被重新指向其他内容时直接失败。
   OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/v2.3.1/models
 
 jobs:

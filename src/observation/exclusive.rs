@@ -62,8 +62,7 @@ impl<T> ExclusiveObservationRouter<T> {
     }
 
     pub fn route(&mut self, value: T) -> RoutedObservation<T> {
-        // An exclusive reader owns its decision baseline, but ordinary chat
-        // commands must continue through the shared stream while it waits.
+        // 独占读取器拥有自己的决策基线，但等待期间普通聊天命令仍须继续经过共享流。
         RoutedObservation::Shared(self.shared.publish(value))
     }
 

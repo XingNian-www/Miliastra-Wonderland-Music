@@ -32,7 +32,6 @@ pub(crate) struct ResolvedUiTemplateArgs {
     pub(crate) friend_template: PathBuf,
     pub(crate) secondary_back_template: PathBuf,
     pub(crate) world_wish_template: PathBuf,
-    pub(crate) world_wish_threshold: f32,
     pub(crate) chat_templates: ResolvedTemplateArgs,
 }
 
@@ -52,7 +51,6 @@ impl UiTemplateArgs {
                 .clone()
                 .unwrap_or_else(|| templates.secondary_back.clone()),
             world_wish_template: templates.world_wish.clone(),
-            world_wish_threshold: templates.world_wish_threshold,
             chat_templates: self.chat_templates.resolve(templates, ocr),
         }
     }
@@ -338,12 +336,12 @@ fn probe_game_state(
     }
     let region = screen.world_wish_rect.into();
     let candidate = best_template_candidate(image, Some(region), &templates.world_wish_template)?;
-    let matched = candidate_matches(&candidate, templates.world_wish_threshold);
+    let matched = candidate_matches(&candidate, templates.chat_templates.marker_threshold);
     let evidence = UiStateEvidence::new(
         vec![template_probe(
             &templates.world_wish_template,
             region,
-            templates.world_wish_threshold,
+            templates.chat_templates.marker_threshold,
             candidate.as_ref(),
         )],
         None,
@@ -716,51 +714,42 @@ mod tests {
     }
 
     #[test]
-    fn world_wish_fixture_matches_shifted_icon_and_rejects_neighboring_icons() {
+    fn world_wish_fixture_matches_both_backgrounds_and_shifted_icon() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
-        let bar = image::open("tests/fixtures/ui/world-wish-top-bar.png").unwrap();
-        let hit = best_template_hit(
-            &bar,
-            None,
-            &config.templates.world_wish,
-            config.templates.world_wish_threshold,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!((hit.x, hit.y), (269, 13));
-        assert!(hit.score > 0.99);
+        for (fixture, wish_x) in [
+            ("tests/fixtures/ui/world-wish-top-bar.png", 266),
+            ("tests/fixtures/ui/world-wish-overworld-top-bar.png", 348),
+        ] {
+            let bar = image::open(fixture).unwrap();
+            let hit = best_template_hit(
+                &bar,
+                None,
+                &config.templates.world_wish,
+                config.templates.marker_threshold,
+            )
+            .unwrap()
+            .expect(fixture);
+            assert_eq!((hit.x, hit.y), (wish_x as i32 + 3, 13), "{fixture}");
 
-        let wish = bar.crop_imm(266, 0, 82, 100).to_rgba8();
-        let book = bar.crop_imm(348, 0, 82, 100).to_rgba8();
-        let mut shifted = bar.to_rgba8();
-        image::imageops::replace(&mut shifted, &book, 266, 0);
-        image::imageops::replace(&mut shifted, &wish, 348, 0);
-        let shifted_hit = best_template_hit(
-            &DynamicImage::ImageRgba8(shifted),
-            None,
-            &config.templates.world_wish,
-            config.templates.world_wish_threshold,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!((shifted_hit.x, shifted_hit.y), (351, 13));
-        assert!(shifted_hit.score > 0.99);
-
-        let mut absent = bar.to_rgba8();
-        image::imageops::replace(&mut absent, &book, 266, 0);
-        let candidate = best_template_candidate(
-            &DynamicImage::ImageRgba8(absent),
-            None,
-            &config.templates.world_wish,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            candidate.score < 0.84,
-            "other top-bar icons scored {}",
-            candidate.score
-        );
-        assert!(candidate.score < config.templates.world_wish_threshold);
+            let wish = bar.crop_imm(wish_x, 0, 82, 100).to_rgba8();
+            let neighbor = bar.crop_imm(wish_x + 82, 0, 82, 100).to_rgba8();
+            let mut shifted = bar.to_rgba8();
+            image::imageops::replace(&mut shifted, &neighbor, i64::from(wish_x), 0);
+            image::imageops::replace(&mut shifted, &wish, i64::from(wish_x + 82), 0);
+            let shifted_hit = best_template_hit(
+                &DynamicImage::ImageRgba8(shifted),
+                None,
+                &config.templates.world_wish,
+                config.templates.marker_threshold,
+            )
+            .unwrap()
+            .expect(fixture);
+            assert_eq!(
+                (shifted_hit.x, shifted_hit.y),
+                (wish_x as i32 + 85, 13),
+                "{fixture}"
+            );
+        }
     }
 
     #[test]

@@ -384,7 +384,10 @@ impl ConfigStore {
     /// 保存把绝对路径写回配置库。http/logging 段不落库，这里按启动引导
     /// （config.yaml）原始值注入；state.playback_state_path 注入统一数据库路径。
     pub fn current_value(&self) -> Result<Value> {
-        let mut value = Value::Object(self.read_all_sections()?);
+        let mut sections = self.read_all_sections()?;
+        // Web 展示也沿用启动/保存的 schema 清理规则，避免已删除字段继续出现在页面。
+        prune_unknown_schema_fields(&mut sections);
+        let mut value = Value::Object(sections);
         fill_missing_defaults(&mut value, &AppConfig::default().to_db_value());
         if let Some(object) = value.as_object_mut() {
             object.insert(
@@ -1665,12 +1668,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("world_wish");
-        legacy_snapshot["templates"]
+        legacy_snapshot["templates"]["world_wish_threshold"] = json!(0.95);
+        legacy_snapshot["templates"]["friend"] = json!("legacy-assets/friend.png");
+        legacy_snapshot["window"]["target_process"] = json!("legacy-game.exe");
+        let mut legacy_snapshot_without_unknown = legacy_snapshot.clone();
+        legacy_snapshot_without_unknown["templates"]
             .as_object_mut()
             .unwrap()
             .remove("world_wish_threshold");
-        legacy_snapshot["templates"]["friend"] = json!("legacy-assets/friend.png");
-        legacy_snapshot["window"]["target_process"] = json!("legacy-game.exe");
         let legacy_snapshot_text = serde_json::to_string(&legacy_snapshot).unwrap();
         let connection = rusqlite::Connection::open(&database_path).unwrap();
         for section in ["screen", "templates", "window"] {
@@ -1713,10 +1718,8 @@ mod tests {
             current["templates"]["world_wish"],
             json!("deps/assets/world-wish.png")
         );
-        assert_eq!(
-            current["templates"]["world_wish_threshold"],
-            json!(0.95_f32)
-        );
+        assert_eq!(current["templates"]["marker_threshold"], json!(0.9_f32));
+        assert!(current["templates"].get("world_wish_threshold").is_none());
         assert_eq!(
             current["templates"]["friend"],
             json!("legacy-assets/friend.png")
@@ -1769,9 +1772,12 @@ mod tests {
         assert_eq!(reopened.current_value().unwrap(), current);
         assert_eq!(
             Value::Object(reopened.read_all_sections().unwrap()),
-            legacy_snapshot
+            legacy_snapshot_without_unknown
         );
-        assert_eq!(latest_snapshot(&database_path), legacy_snapshot);
+        assert_eq!(
+            latest_snapshot(&database_path),
+            legacy_snapshot_without_unknown
+        );
         assert_eq!(reopened.current_revision().unwrap(), 3);
         assert_eq!(
             reopened

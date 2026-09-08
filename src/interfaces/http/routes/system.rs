@@ -88,7 +88,7 @@ pub(super) fn tool_templates_route(
         json!({ "name": "friend", "label": "好友按钮", "region": config.screen.friend_rect, "threshold": marker_threshold }),
         json!({ "name": "secondary-back", "label": "二级聊天返回按钮", "region": config.screen.secondary_back_rect, "threshold": marker_threshold }),
         json!({ "name": "secondary-hall", "label": "二级当前大厅", "region": config.screen.secondary_hall_rect, "threshold": marker_threshold }),
-        json!({ "name": "world-wish", "label": "祈愿", "region": config.screen.world_wish_rect, "threshold": config.templates.world_wish_threshold }),
+        json!({ "name": "world-wish", "label": "祈愿", "region": config.screen.world_wish_rect, "threshold": marker_threshold }),
         json!({ "name": "invite-view-star", "label": "邀请查看千星", "region": config.invite.view_star_region, "threshold": marker_threshold }),
         json!({ "name": "invite-goto-hall", "label": "邀请前往大厅", "region": config.invite.goto_hall_region, "threshold": marker_threshold }),
         json!({ "name": "invite-enter-hall", "label": "邀请进入大厅", "region": config.invite.enter_hall_region, "threshold": marker_threshold }),

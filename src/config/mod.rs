@@ -1308,16 +1308,10 @@ pub struct TemplateConfig {
     pub friend_blacklist: PathBuf,
     pub friend_confirm: PathBuf,
     pub marker_threshold: f32,
-    #[serde(default = "default_world_wish_threshold")]
-    pub world_wish_threshold: f32,
 }
 
 fn default_world_wish_template() -> PathBuf {
     PathBuf::from("deps/assets/world-wish.png")
-}
-
-fn default_world_wish_threshold() -> f32 {
-    0.95
 }
 
 impl Default for TemplateConfig {
@@ -1343,7 +1337,6 @@ impl Default for TemplateConfig {
             friend_blacklist: PathBuf::from("deps/assets/friend-blacklist.png"),
             friend_confirm: PathBuf::from("deps/assets/friend-confirm.png"),
             marker_threshold: 0.9,
-            world_wish_threshold: default_world_wish_threshold(),
         }
     }
 }
@@ -1351,7 +1344,6 @@ impl Default for TemplateConfig {
 impl TemplateConfig {
     fn validate(&self) -> Result<()> {
         validate_unit_interval(self.marker_threshold, "templates.marker_threshold")?;
-        validate_unit_interval(self.world_wish_threshold, "templates.world_wish_threshold")?;
         for (path, field) in [
             (&self.blue_marker, "templates.blue_marker"),
             (&self.yellow_marker, "templates.yellow_marker"),

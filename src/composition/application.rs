@@ -486,10 +486,9 @@ impl ShutdownState {
     }
 }
 
-/// Startup actions which must complete before a reload replacement can publish ready.
+/// 配置重载替代进程发布就绪前必须完成的启动动作。
 ///
-/// The requirements are deliberately process-local. They describe the handoff which created
-/// this child, rather than the normal startup automation policy used by an ordinary launch.
+/// 这些要求只对当前进程有效，描述的是创建本子进程的交接过程，而不是普通启动使用的自动化策略。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ReloadStartupActions(u8);
 
@@ -535,11 +534,10 @@ impl ReloadStartupActions {
     }
 }
 
-/// Shared completion gate for startup work requested by a reload replacement.
+/// 配置重载替代进程所需启动工作的共享完成闸门。
 ///
-/// A formal task runs through a reconstructed application facade, so this state must be shared
-/// separately from the owning runtime. Successful actions are monotonic for one child lifetime;
-/// failed actions remain missing and are retried by the listener under a cooldown.
+/// 正式任务通过重建的应用 facade 执行，因此该状态必须与所属运行时分开共享。
+/// 单个子进程生命周期内成功动作只增不减；失败动作保持未完成，由监听器冷却后重试。
 #[derive(Clone, Debug, Default)]
 struct ReloadStartupGate {
     required: Arc<AtomicU8>,

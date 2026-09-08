@@ -16,13 +16,11 @@ edition = "2024"
 license = "MIT"
 
 [features]
-# Build one EXE containing both runtime-discoverable OCR adapters. The optional
-# DLLs are still loaded only when their backend is selected at runtime.
+# 构建包含两种可运行时选择的 OCR 适配器的单个 EXE；仅在选择对应后端时加载 DLL。
 default = ["ocr-mnn", "ocr-openvino"]
-# PaddleOCR/MNN backend. It can be disabled for an OpenVINO-only build.
+# PaddleOCR/MNN 后端；仅使用 OpenVINO 时可以禁用。
 ocr-mnn = ["dep:ocr-rs"]
-# OpenVINO OCR adapter. The OpenVINO runtime is loaded dynamically only when
-# `backend_priority` selects `openvino`.
+# OpenVINO OCR 适配器；仅当 `backend_priority` 选择 `openvino` 时动态加载运行时。
 ocr-openvino = ["dep:imageproc", "dep:openvino", "dep:openvino-sys"]
 
 [workspace.dependencies]
@@ -58,7 +56,7 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm"]
 rusqlite = { version = "0.32", features = ["bundled"] }
 ocr-rs = { git = "https://github.com/zibo-chen/rust-paddle-ocr.git", tag = "v2.3.1", optional = true, features = ["mnn-dynamic"] }
 openvino = { version = "0.11.0", optional = true, default-features = false, features = ["runtime-linking"] }
-# Low-level runtime loader used to prefer a bundled OpenVINO DLL before environment search paths.
+# 底层运行时加载器：优先使用随包提供的 OpenVINO DLL，再搜索环境路径。
 openvino-sys = { version = "0.11.0", optional = true, default-features = false, features = ["runtime-linking"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -91,7 +89,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [profile.release]
-# Favor runtime performance over binary size.
+# 优先运行性能，不以缩小二进制体积为目标。
 opt-level = 3
 lto = "fat"
 codegen-units = 1

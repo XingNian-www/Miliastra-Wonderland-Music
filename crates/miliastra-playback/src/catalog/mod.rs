@@ -17,10 +17,9 @@ use crate::lyrics::TimedLyrics;
 
 #[async_trait]
 pub trait KugouAccountAdapter: Send + Sync + 'static {
-    /// Refresh the explicit credential snapshot supplied by the caller.
+    /// 刷新调用方提供的显式凭据快照。
     ///
-    /// The runtime uses the same snapshot version for the conditional save after
-    /// this request completes, so implementations must not re-read the store.
+    /// 运行时会在请求完成后使用同一快照版本进行条件保存，因此实现不能重新读取存储。
     async fn refresh_token(
         &self,
         credential: &ProviderCredential,
@@ -165,9 +164,8 @@ pub trait SourceAdapter: Send + Sync + 'static {
         let _ = self.resolve(key, locator).await?;
         Ok(PlaybackEligibility::Eligible)
     }
-    /// Whether candidates without an explicit eligibility marker should be
-    /// probed during search. Providers with costly or challenge-prone stream
-    /// endpoints can defer that check until the user actually plays a track.
+    /// 搜索时是否探测没有明确可用性标记的候选。
+    /// 对流端点成本高或容易触发挑战的提供商，可延迟到用户实际播放时再检查。
     fn probe_unknown_candidates(&self) -> bool {
         true
     }
@@ -266,10 +264,9 @@ impl AccountStatusCache {
             if cached_at.elapsed() >= if *failed { failed_ttl } else { success_ttl } {
                 return None;
             }
-            // Expiry fields can belong to one specific VIP tier and may remain in
-            // a response after that tier changes. The provider's `vip` result is
-            // authoritative for this cached observation; daily refreshes and an
-            // explicit playback `VipRequired` response correct it when needed.
+            // 到期字段可能只属于某个 VIP 层级，层级变化后仍可能残留在响应中。
+            // 提供商返回的 `vip` 结果是本次缓存观察的权威依据；每日刷新和明确的
+            // `VipRequired` 播放响应会在需要时修正它。
             Some(status.clone())
         })
     }

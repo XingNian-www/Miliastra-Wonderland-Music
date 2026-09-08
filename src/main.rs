@@ -196,8 +196,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         } else {
             child.wait().context("等待监听子进程退出")?
         };
-        // Close the final check-vs-exit window: the child can publish readiness immediately
-        // before it exits, after the preceding poll but before `try_wait` observes termination.
+        // 消除最后一次检查与退出之间的竞态：子进程可能在上次轮询后、try_wait 观察前发布就绪标记并退出。
         if let Some(path) = ready_file.as_deref() {
             replacement_ready = latch_replacement_ready(replacement_ready, path);
         }

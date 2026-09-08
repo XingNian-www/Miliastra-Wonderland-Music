@@ -778,7 +778,7 @@ impl UndercoverGame {
         }
     }
 
-    /// Return the current game's private answer without changing any game activity.
+    /// 返回当前游戏的私有答案，不改变游戏状态。
     pub fn reveal(&self, requester: &str) -> Result<Vec<String>> {
         let GameState::Playing(game) = &self.state else {
             bail!("当前没有正在进行的谁是卧底牌局");

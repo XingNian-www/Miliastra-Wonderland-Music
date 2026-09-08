@@ -330,8 +330,7 @@ pub(crate) trait PlaybackExecutionPort {
     fn user_pause_active(&mut self) -> Result<bool> {
         Ok(false)
     }
-    /// Whether a monitor-scheduled queue advance may start another track.
-    /// Manual playback commands use a purpose that does not consult this gate.
+    /// 监听器安排的队列推进是否可以开始下一首。手动播放命令使用不检查此闸门的用途。
     fn automatic_queue_advance_allowed(&mut self) -> Result<bool> {
         Ok(true)
     }
@@ -358,7 +357,7 @@ pub(crate) trait PlaybackCommandPort: PlaybackExecutionPort {
         indexes: Vec<usize>,
     ) -> Result<Vec<(usize, QueueItem)>>;
     fn clear_playback_queue(&mut self) -> Result<usize>;
-    /// Returns true when a queued formal task should interrupt continuous lyrics.
+    /// 排队的正式任务需要中断连续歌词时返回 true。
     fn should_stop_continuous_lyrics(&mut self) -> Result<bool> {
         Ok(false)
     }
@@ -1180,8 +1179,7 @@ impl PlaybackApplication {
             None,
             true,
         );
-        // Each alternate provider contributes at most one matching candidate.
-        // SourceRetry never switches recursively, so an unavailable snapshot is finite.
+        // 每个备用提供商最多贡献一个匹配候选。SourceRetry 不会递归切换，因此不可用快照数量有界。
         for candidate in candidates {
             let mut resolved = request.clone();
             resolved.keyword = candidate.text.clone();
@@ -2193,8 +2191,7 @@ mod tests {
         assert!(port.removed_ids.is_empty());
         assert_eq!(port.queue.len(), 1);
 
-        // Replacement process owns a fresh LiveConfigs instance (no pending reload),
-        // so the unchanged queue head can be consumed normally.
+        // 替代进程持有新的 LiveConfigs 实例（没有待处理重载），因此未变化的队首可以正常消费。
         port.reload_pending = false;
         port.verifications.push_back(PlaybackVerification::Success {
             status: PlayerStatus {

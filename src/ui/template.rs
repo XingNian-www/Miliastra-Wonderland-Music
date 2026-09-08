@@ -208,8 +208,7 @@ fn cached_gray_template(template_path: &Path) -> Result<GrayTemplate> {
         rgba.pixels().map(|pixel| pixel[3]).collect(),
     )
     .expect("RGBA alpha plane must have the same dimensions");
-    // Transparent PNG margins must not be compared against the live screen:
-    // those pixels are placeholders, not part of the visual anchor.
+    // 透明 PNG 边缘不能与实时画面比较；这些像素只是占位，不属于视觉锚点。
     let alpha_sum = alpha.as_raw().iter().map(|value| *value as u64).sum();
     let template = GrayTemplate {
         gray,

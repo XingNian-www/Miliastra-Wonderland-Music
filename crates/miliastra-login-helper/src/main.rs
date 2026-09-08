@@ -18,7 +18,7 @@ struct Args {
     profile: PathBuf,
     #[arg(long, default_value_t = 120)]
     timeout_seconds: u64,
-    /// Run the WebView2-only KuGou request bridge instead of the QR login flow.
+    /// 运行仅支持 WebView2 的酷狗请求桥接，不走二维码登录流程。
     #[arg(long)]
     kugou_web_request: bool,
 }
@@ -46,8 +46,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The playback crate sends this small envelope over stdin so the request URL
-/// and browser cookies never appear in the helper process command line.
+/// 播放 crate 通过 stdin 发送此小型信封，避免请求 URL 和浏览器 Cookie 出现在
+/// 辅助进程的命令行中。
 fn run_kugou_web_request(args: &Args) -> Result<()> {
     if args.provider != "kugou" {
         return write_kugou_request_output(&serde_json::json!({
@@ -310,8 +310,7 @@ impl Provider {
             Self::Kugou => {
                 // 酷狗网页登录凭据集中在 KuGoo cookie：
                 // 值形如 t=<token>&KugooID=<userid>&ct=<时间戳>&...
-                // Keep the exact browser value for Web requests. Parse a
-                // decoded copy only to expose the token and user id fields.
+                // Web 请求保留浏览器中的原始值；仅解析解码副本以提取令牌和用户 ID 字段。
                 let ku_goo = cookies
                     .get("KuGoo")
                     .cloned()
@@ -328,13 +327,11 @@ impl Provider {
                     .filter_map(|pair| pair.split_once('='))
                     .map(|(name, value)| (name.to_owned(), value.to_owned()))
                     .collect::<BTreeMap<_, _>>();
-                // These were emitted by an older helper build as an
-                // intermediate QR ticket. Never persist them as a credential.
+                // 这些字段由旧版辅助程序作为临时二维码票据输出，不能作为凭据持久化。
                 cookies.remove("KUGOU_QR_TOKEN");
                 cookies.remove("KUGOU_QR_USERID");
-                // The parent process supplies the persistent lite-device
-                // identity. Include it in the payload so registration and
-                // subsequent playback use the same device.
+                // 父进程提供持久化的 lite 设备标识。将其写入载荷，确保设备注册和后续播放
+                // 使用同一设备。
                 for name in ["KUGOU_API_GUID", "KUGOU_API_DEV", "KUGOU_API_MAC"] {
                     if !cookies.contains_key(name)
                         && let Ok(value) = std::env::var(name)

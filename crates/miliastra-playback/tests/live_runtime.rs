@@ -50,8 +50,7 @@ impl LiveRuntime {
             assert_eq!(credential.provider(), provider.as_str());
             credentials.push((provider, credential));
 
-            // Device identity must exist before adapter construction. Copy it
-            // into the disposable directory and never write to the source.
+            // 构造适配器前必须存在设备标识。将其复制到临时目录，不能写回源文件。
             for file_name in provider_auxiliary_files(provider) {
                 let auxiliary_path = source.join(file_name);
                 if !auxiliary_path.exists() {

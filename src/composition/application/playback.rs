@@ -182,9 +182,8 @@ impl ApplicationRuntime {
     }
 }
 
-/// A pending child-process reload takes precedence over every monitor-scheduled
-/// queue advance. The queue remains persisted and will be available to the
-/// replacement process after the current request reaches its terminal state.
+/// 待处理的子进程重载优先于监听器安排的所有队列推进。
+/// 当前请求进入终态后，队列仍会持久化并由替代进程继续消费。
 fn automatic_advance_allowed(live_configs: &crate::config::LiveConfigs) -> bool {
     !live_configs.has_pending_reload()
 }

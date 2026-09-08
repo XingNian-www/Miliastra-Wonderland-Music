@@ -103,10 +103,9 @@ impl FormalTaskExecutionHandle {
     }
 }
 
-/// Typed submission boundary shared by chat, HTTP and background producers.
+/// 聊天、HTTP 和后台生产者共享的类型化提交边界。
 ///
-/// The private task enum and execution transport stay behind this client so
-/// protocol adapters cannot depend on application-executor internals.
+/// 私有任务枚举和执行传输封装在此客户端之后，协议适配器不依赖应用执行器内部实现。
 #[derive(Clone)]
 pub(crate) struct FormalTaskClient {
     executor: FormalTaskExecutionHandle,
@@ -270,8 +269,8 @@ impl FormalTaskShutdownReport {
     }
 }
 
-/// Owns the one task worker and the application execution context.
-/// Queue order, task history and shared-lane state live in `TaskEngineHandle`.
+/// 持有唯一任务工作线程和应用执行上下文。
+/// 队列顺序、任务历史和共享通道状态由 `TaskEngineHandle` 持有。
 pub(crate) struct FormalTaskRuntime {
     client: FormalTaskClient,
     context: Option<Arc<FormalTaskExecutionState>>,

@@ -15,16 +15,11 @@ use crate::ui::geometry::Rect;
 
 const RECOGNITION_HEIGHT: u32 = 48;
 const RECOGNITION_CHARACTER_THRESHOLD: f32 = 0.3;
-// The default chat region is 416x143 and individual blocks are capped at 120px.  Keep
-// detection shapes finite so the GPU plugin does not compile a new graph for every small
-// change in block height.  The second canvas covers the stitched batch-OCR path.
+// 默认聊天区域为 416x143，单个区块上限为 120px。限制检测形状，避免 GPU 插件因区块高度的小幅变化反复编译图；第二画布覆盖拼接批量 OCR 路径。
 const CHAT_DETECTION_CANVAS_WIDTH: u32 = 416;
-// At most nine marker rows can survive the source dedupe rules in the 143px chat region;
-// 143px of non-overlapping blocks plus eight 12px separators is 239px, so 256px covers the
-// entire batch-concatenation path after the next 32px alignment.
+// 143px 聊天区域经过源去重后最多保留九行标记；不重叠区块占 143px，加八个 12px 分隔线共 239px，因此按下一个 32px 对齐后使用 256px 可覆盖完整批量拼接路径。
 const CHAT_DETECTION_CANVAS_HEIGHTS: &[u32] = &[128, 256];
-// Recognition width is proportional to the text crop aspect ratio.  These buckets cover
-// normal chat lines while keeping the number of GPU shape specializations bounded.
+// 识别宽度与文本裁剪区宽高比成正比。这些分档覆盖常见聊天行，同时限制 GPU 形状特化数量。
 const RECOGNITION_WIDTH_BUCKETS: &[u32] = &[96, 128, 192, 256, 384, 512, 768, 1024];
 const DETECTION_CHANNEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const DETECTION_CHANNEL_STD: [f32; 3] = [0.229, 0.224, 0.225];
@@ -125,8 +120,7 @@ impl OpenVinoEngine {
             det_box_border: args.det_box_border,
         };
 
-        // Compile-time loading is not enough to measure a usable backend. Run both
-        // graphs once so the first production request does not pay plugin setup cost.
+        // 仅完成编译期加载不能证明后端可用。先运行两张图各一次，避免首个生产请求承担插件初始化成本。
         engine.warm_up()?;
         Ok(engine)
     }
@@ -833,14 +827,10 @@ fn required_path<'a>(path: &'a Option<std::path::PathBuf>, field: &str) -> Resul
         .ok_or_else(|| anyhow!("{field} 未配置"))
 }
 
-/// Prefer a runtime shipped beside the application before falling back to the normal
-/// `openvino-finder` environment and system search paths.
+/// 优先使用应用旁随包提供的运行时，再回退到 `openvino-finder` 的环境和系统搜索路径。
 ///
-/// The dependency package keeps OpenVINO in `openvino/runtime/...`, while a local developer
-/// build may put `openvino_c.dll` directly beside the executable.  `openvino-sys` only searches
-/// environment variables and known system locations, so make the local layout visible before
-/// `Core::new()` asks it to load the library.  A failed local load falls back to the
-/// existing `PATH`/`OPENVINO_INSTALL_DIR` search paths.
+/// 依赖包将 OpenVINO 放在 `openvino/runtime/...`，本地开发构建可能直接将 `openvino_c.dll` 放在可执行文件旁。
+/// `openvino-sys` 只搜索环境变量和已知系统位置，因此在 `Core::new()` 加载库前先暴露本地布局；本地加载失败后回退到现有 `PATH`/`OPENVINO_INSTALL_DIR` 搜索路径。
 fn prepare_local_runtime_loading() {
     static PREPARE: std::sync::Once = std::sync::Once::new();
     PREPARE.call_once(|| {
@@ -986,7 +976,7 @@ fn configure_cache(core: &mut Core, device: &DeviceType<'static>, cache_dir: Opt
         device,
         [
             (RwPropertyKey::CacheDir, cache_path.as_ref()),
-            // Larger cache blobs avoid recompiling GPU kernels on the next launch.
+            // 更大的缓存块可避免下次启动重新编译 GPU 内核。
             (RwPropertyKey::CacheMode, "OPTIMIZE_SPEED"),
         ],
     ) {
@@ -1049,11 +1039,9 @@ mod tests {
         assert_eq!(paths[12], PathBuf::from(r"C:\app\openvino"));
     }
 
-    /// Run a real IR + runtime smoke only when the local model directory is supplied.
+    /// 仅在提供本地模型目录时运行真实 IR 与运行时冒烟检查。
     ///
-    /// This keeps normal CI independent from the separately installed OpenVINO runtime while
-    /// providing a release check that exercises model loading, inference, DB postprocessing, and
-    /// CTC decoding together.
+    /// 这样普通 CI 不依赖单独安装的 OpenVINO 运行时，同时为发布检查提供模型加载、推理、DB 后处理和 CTC 解码的完整验证。
     #[test]
     fn configured_ir_models_recognize_fixture() -> Result<()> {
         let Some(model_root) = std::env::var_os("OPENVINO_OCR_IR_ROOT") else {

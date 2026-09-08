@@ -201,7 +201,7 @@ impl ModerationExecutionPort for ApplicationRuntime {
     fn sync_listener_state(&mut self) {}
 
     fn wait_after_action(&mut self) {
-        // The typed UI routine already waits for action confirmation and residency recovery.
+        // 类型化 UI 流程已经等待操作确认和界面驻留恢复。
     }
 }
 

@@ -16,7 +16,7 @@ use crate::features::friend_delivery::{
 };
 use miliastra_kernel::identity::{BusinessOperationId, SessionGeneration};
 
-/// Identifies one UI effect chain owned by the business runtime.
+/// 标识业务运行时拥有的一条 UI 效果链。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UndercoverEffectKey {
     pub operation_id: BusinessOperationId,
@@ -316,7 +316,7 @@ fn handle_late_undercover_effect(policy: UndercoverLatePolicy) -> Result<()> {
     }
 }
 
-/// Runtime-owned undercover application service.
+/// 由运行时拥有的谁是卧底应用服务。
 pub struct UndercoverRuntimeService {
     game: UndercoverGame,
     bank: UndercoverBankStore,

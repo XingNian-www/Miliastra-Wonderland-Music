@@ -302,8 +302,7 @@ fn detect_avatar_anchors(
                 texture_score.visible_texture_samples,
                 texture_scan.total_samples,
             )
-            // Replacing a circular peak requires texture confidence at least as
-            // high as a perfect boundary observation under the current config.
+            // 替换圆形峰值时，纹理置信度至少要达到当前配置下完整边界观测的水平。
             .saturating_mul(total_boundary_samples)
             .div_ceil(config.min_avatar_boundary_edges);
             if (texture_score.line_y - boundary_score.line_y).abs() > MAX_AVATAR_ANCHOR_OFFSET

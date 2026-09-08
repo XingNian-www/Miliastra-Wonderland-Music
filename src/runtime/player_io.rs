@@ -169,10 +169,9 @@ pub enum ControlDispatchOutcome {
     },
     Rejected {
         reason: String,
-        /// Stable backend failure code, when the control port has one.
+        /// 控制端口提供的稳定后端错误码。
         ///
-        /// This keeps provider-level failures distinguishable after a
-        /// control request crosses the player runtime thread boundary.
+        /// 控制请求跨过播放器运行时线程边界后，仍可区分服务商级失败。
         code: Option<String>,
     },
     NotSent {
@@ -950,10 +949,9 @@ impl PlayerRuntimeHandle {
             })
     }
 
-    /// Waits for a publication newer than `revision`.
+    /// 等待版本号晚于 `revision` 的发布。
     ///
-    /// Snapshot aging is evaluated when a value is returned, but aging alone does not wake this
-    /// wait. Only a new publication, runtime closure, or the requested timeout does so.
+    /// 返回值生成时会评估快照老化，但老化本身不会唤醒等待；只有新发布、运行时关闭或达到指定超时才会唤醒。
     pub fn wait_for_observation_after(
         &self,
         revision: PlayerObservationRevision,

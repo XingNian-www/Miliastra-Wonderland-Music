@@ -70,6 +70,8 @@ BV 号点歌使用好友私聊的 `@点歌 BV号` 或 `@B站点歌 BV号`。识�
 
 AI 点歌会先搜索歌曲候选，再从候选中选择，不会凭空生成播放地址。可选的 `song_review` 会在游戏内点歌播放前检查歌曲是否符合房间设置；审核等级越高表示歌曲越吵闹或越容易打扰，超过 `max_allowed_level` 的候选会被拒绝。控制台人工播放和队列操作不受歌曲审核限制。
 
+AI 请求统一使用标准 OpenAI Chat Completions 或 Responses 接口。配置中心中的 `ai`、`turtle_soup` 和 `song_review` 段可以编辑系统提示词和业务提示词模板；提示词留空时使用程序内置默认值。模板变量由程序替换，点歌支持 `{{text}}`、`{{request}}`、`{{songName}}`、`{{songSinger}}`、`{{preferAccompaniment}}`、`{{preferAccompanimentInstruction}}`、`{{candidates}}`，歌曲审核支持 `{{policy_prompt}}`、`{{custom_prompt}}`、`{{candidate}}`，海龟汤支持 `{{role}}`、`{{verification_rules}}`、`{{verification_instruction}}`、`{{context}}`、`{{custom_prompt}}`。自定义网关仍需返回对应标准接口结构；`extra_body` 只用于网关额外字段。
+
 ## 5. 队列和歌词
 
 | 命令 | 作用 |

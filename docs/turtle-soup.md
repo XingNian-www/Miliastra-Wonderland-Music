@@ -42,24 +42,12 @@
 
 ## AI 配置
 
-海龟汤使用独立的 `turtle_soup.ai` 配置，不会复用点歌 AI。该段在配置中心 `turtle_soup` 段中修改，字段结构如下（示意）：
+在配置中心 `turtle_soup` 段填写 AI 服务地址、密钥和模型；需要通过代理连接时，同时填写代理地址。海龟汤使用独立的 AI 配置，不会复用点歌 AI。
 
-```yaml
-turtle_soup:
-  enabled: true
-  question_bank_path: turtle_soup.yaml
-  ai:
-    endpoint: https://api.openai.com/v1/chat/completions
-    api_key: ""
-    model: gpt-5.6
-    max_tokens: 1024
-    http_proxy: ""
-```
+AI 连接信息填写完整后保存。请求超时或裁决失败时，程序会按配置的次数重试；AI 暂时不可用时，对局保持当前进度，汤底继续隐藏。
 
-`api_key`、`endpoint` 和 `model` 必须填写。网络请求超时或裁决失败时会按 `retry_count` 重试；AI 不可用不会泄露汤底，也不会自动结束对局。
-
-系统提示词和裁决提示词可以在配置中心直接编辑，字段是 `turtle_soup.system_prompt` 与 `turtle_soup.review_prompt`，留空使用内置内容。模板支持 `{{role}}`、`{{verification_rules}}`、`{{verification_instruction}}`、`{{context}}` 和 `{{custom_prompt}}`；其中 `{{context}}` 会由程序填入汤面、汤底、裁决备注和本次提问。`custom_prompt` 仍用于追加房间规则。接口使用标准 OpenAI Chat Completions 协议，兼容网关需要返回标准响应结构。
+系统提示词和裁决提示词可在配置中心调整，留空时使用内置内容。可根据房间需要补充规则，程序会结合当前题目和提问进行判断。
 
 ## Web 控制
 
-Web 面板可以开始指定题目、查看状态和结束对局，但不会显示进行中的汤底。题库管理接口只接收已经整理好的题目内容，建议在提交前自行检查题面和汤底。
+Web 面板可以开始指定题目、查看状态和结束对局。进行中的汤底保持隐藏；添加题目前，先检查题面和汤底是否完整。

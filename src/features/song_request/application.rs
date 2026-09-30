@@ -190,16 +190,12 @@ pub(crate) trait SongRequestPort {
         allow_bilibili: bool,
     ) -> Result<Vec<SearchCandidate>>;
 
-    /// 在线候选是否被关键词字面命中：与曲库检索使用同一套匹配规则。
-    /// 普通点歌据此判断在线结果是否理想，不理想且本地有命中时才追加本地推荐。
-    fn online_candidate_matches_keyword(&self, keyword: &str, candidate: &SearchCandidate) -> bool;
-
     /// 在线匹配偏低时是否额外给出本地曲库推荐；默认开启。
     fn local_recommend(&self) -> bool {
         true
     }
 
-    /// 在线候选分数低于该值才去比较本地曲库；本地分数必须严格更高才会推荐。
+    /// AI 点歌时在线候选分数低于该值才去比较本地曲库；本地分数必须严格更高才会推荐。
     fn local_recommend_min_score(&self) -> f64 {
         0.6
     }
@@ -901,9 +897,9 @@ impl SongRequestExecution<'_> {
                     NoCandidateOutcome::Skip => return Ok(None),
                 }
             };
-            // 在线候选没有被关键词字面命中（平台只给了近似结果）而本地库有命中时，
-            // 按 AI 路径同一口径追加一条本地推荐，让普通点歌也能用上本地记录。
+            // 本地匹配度严格高于在线结果时才展示本地搜索结果。
             let local_offer = self.plain_local_offer_after_online_pick(&request.keyword, &picked);
+            let allow_local = local_offer.is_some();
             let song_title = picked.candidate.text.clone();
             let actions = if self.ai.enabled() {
                 "@确认@跳过@换源@AI@选择"
@@ -916,7 +912,7 @@ impl SongRequestExecution<'_> {
                 song_title,
                 actions
             )];
-            if let Some(candidate) = local_offer.first() {
+            if let Some(candidate) = local_offer.as_ref().and_then(|offer| offer.first()) {
                 messages.push(local_library_line(&request.label(), candidate));
             }
             let decision = self.prompt_candidate_decision(
@@ -924,8 +920,8 @@ impl SongRequestExecution<'_> {
                 &picked.candidate_snapshot,
                 true,
                 self.ai.enabled(),
-                !local_offer.is_empty(),
-                local_offer.is_empty(),
+                allow_local,
+                !allow_local,
             )?;
             let selected = match decision {
                 SongRequestDecision::SelectIndex(index) => {
@@ -937,10 +933,11 @@ impl SongRequestExecution<'_> {
                 SongRequestDecision::Confirm | SongRequestDecision::Timeout => picked.candidate,
                 _ => {
                     return match decision {
-                        SongRequestDecision::LocalLibrary if !local_offer.is_empty() => {
-                            let Some(selected) =
-                                self.choose_local_library_candidate(&local_offer)?
-                            else {
+                        SongRequestDecision::LocalLibrary if allow_local => {
+                            let Some(offer) = local_offer.as_ref() else {
+                                return Ok(None);
+                            };
+                            let Some(selected) = self.choose_local_library_candidate(offer)? else {
                                 return Ok(None);
                             };
                             return Ok(Some(ResolvedSongRequest {
@@ -1369,20 +1366,22 @@ impl SongRequestExecution<'_> {
         }
     }
 
-    /// 普通点歌拿到在线候选后的本地推荐：只在线候选没有被关键词字面命中
-    /// （平台给的是近似结果）且本地库存在命中的其它记录时给出，避免打扰正常点歌。
+    /// 普通点歌拿到在线候选后的本地推荐：用匹配度（字面覆盖程度）比较两边，
+    /// 本地最高匹配度严格高于在线最高匹配度时才展示本地搜索结果。
+    /// 匹配度由曲库检索的同一套规则给出，与 AI 语义打分无关。
     fn plain_local_offer_after_online_pick(
         &mut self,
         keyword: &str,
         picked: &PickedCandidate,
-    ) -> Vec<SearchCandidate> {
-        if !self.port.local_recommend()
-            || self
-                .port
-                .online_candidate_matches_keyword(keyword, &picked.candidate)
-        {
-            return Vec::new();
+    ) -> Option<Vec<SearchCandidate>> {
+        if !self.port.local_recommend() {
+            return None;
         }
+        let online_score = picked
+            .candidate_snapshot
+            .iter()
+            .map(|candidate| candidate_match_score(keyword, candidate))
+            .fold(0.0_f64, f64::max);
         let local = match self
             .port
             .search_library_candidates(keyword, self.friend_or_above)
@@ -1390,13 +1389,24 @@ impl SongRequestExecution<'_> {
             Ok(candidates) => candidates,
             Err(error) => {
                 log::warn!("本地曲库检索失败，无法给出本地推荐: {error:#}");
-                return Vec::new();
+                return None;
             }
         };
-        local_library_choices(&local, picked.candidate_snapshot.len())
-            .into_iter()
-            .filter(|candidate| candidate.track_ref.key != picked.candidate.track_ref.key)
-            .collect()
+        if local.is_empty() {
+            return None;
+        }
+        let local_score = local
+            .iter()
+            .map(|candidate| candidate_match_score(keyword, candidate))
+            .fold(0.0_f64, f64::max);
+        if local_score <= online_score {
+            return None;
+        }
+        log::info!("本地曲库推荐: 在线匹配度={online_score:.2} 本地匹配度={local_score:.2}");
+        Some(local_library_choices(
+            &local,
+            picked.candidate_snapshot.len(),
+        ))
     }
 
     /// 普通点歌的本地曲库候选。在线没有可播候选时无事可比较，
@@ -1604,6 +1614,15 @@ impl SongSearchCandidates {
             local: merge_ai_search_rounds(previous.local, next.local),
         }
     }
+}
+
+/// 关键词与候选元数据的匹配度；与曲库检索共用同一套字面匹配规则。
+fn candidate_match_score(keyword: &str, candidate: &SearchCandidate) -> f64 {
+    miliastra_playback::keyword_match_score(
+        keyword,
+        &candidate.metadata.title,
+        &candidate.metadata.artists,
+    )
 }
 
 fn is_playable_candidate(candidate: &SearchCandidate) -> bool {
@@ -2092,8 +2111,6 @@ mod tests {
         library_searches: RefCell<Vec<(String, bool)>>,
         library_error: Cell<bool>,
         local_recommend_enabled: Cell<bool>,
-        /// 在线候选是否被关键词字面命中；默认 true 表示平台结果已经命中关键词。
-        online_candidate_matches: Cell<bool>,
         online_error: Cell<bool>,
         fail_search_call: Cell<usize>,
         queue: RefCell<Vec<QueueItem>>,
@@ -2121,7 +2138,6 @@ mod tests {
                 library_searches: RefCell::new(Vec::new()),
                 library_error: Cell::new(false),
                 local_recommend_enabled: Cell::new(true),
-                online_candidate_matches: Cell::new(true),
                 online_error: Cell::new(false),
                 fail_search_call: Cell::new(0),
                 queue: RefCell::new(Vec::new()),
@@ -2224,14 +2240,6 @@ mod tests {
                 })
                 .cloned()
                 .collect())
-        }
-
-        fn online_candidate_matches_keyword(
-            &self,
-            _keyword: &str,
-            _candidate: &SearchCandidate,
-        ) -> bool {
-            self.online_candidate_matches.get()
         }
 
         fn search_and_pick(
@@ -2824,27 +2832,32 @@ mod tests {
                 .any(|prompt| prompt.contains("曲库"))
         );
     }
-
     #[test]
-    fn plain_request_offers_local_library_when_online_pick_is_not_a_literal_match() {
-        // 在线平台只给了近似结果（未被关键词字面命中）而本地库有命中的记录：
-        // 普通点歌也追加本地推荐，@本地 可用，超时按跳过处理，不会自动播放。
-        let online = local_candidate("online");
-        let local = local_candidate("library");
+    fn plain_request_shows_local_results_when_the_local_match_score_is_higher() {
+        // 普通点歌用匹配度比较在线与本地结果：本地匹配度严格更高才展示本地搜索结果。
+        // 这里用的是关闭 AI 的 application()，说明这条路径不依赖 AI 打分。
+        let song = SongCommand {
+            keyword: "降生 纯享版".to_string(),
+            ..command()
+        };
+        let online = test_candidate("降生 - 喵酱油", "miliastra://track/qqmusic/online");
+        let local = test_candidate(
+            "【小花仙第二季】插曲《降生》纯享版 - 创元-yin",
+            "miliastra://track/bilibili/BV1qqpGe1Egj",
+        );
         let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
             online.clone(),
             vec![online.clone()],
             "",
         ))]);
-        port.online_candidate_matches.set(false);
         port.library_candidates.borrow_mut().push(local.clone());
         port.decisions = VecDeque::from([SongRequestDecision::LocalLibrary]);
         application()
-            .execute(&context(), &command(), &mut port)
+            .execute(&mapped_context(), &song, &mut port)
             .expect("song request");
         assert_eq!(
             port.library_searches.borrow().as_slice(),
-            [("晴天".to_string(), false)]
+            [("降生 纯享版".to_string(), true)]
         );
         assert!(
             port.replies
@@ -2866,49 +2879,58 @@ mod tests {
                 .track_ref
                 .key
                 .id,
-            "library"
+            "BV1qqpGe1Egj"
         );
 
-        // 用户直接 @确认 时仍然播在线候选。
-        let mut confirm = FakePort::idle([Some(PickedCandidate::with_snapshot(
-            online.clone(),
-            vec![online.clone()],
+        // 在线匹配度更高（关键词与歌名歌手完全一致）时不展示本地结果，@本地 保持禁用。
+        let exact = test_candidate("降生 纯享版 - 创元-yin", "miliastra://track/qqmusic/exact");
+        let mut online_better = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            exact.clone(),
+            vec![exact.clone()],
             "",
         ))]);
-        confirm.online_candidate_matches.set(false);
-        confirm.library_candidates.borrow_mut().push(local.clone());
-        confirm.decisions = VecDeque::from([SongRequestDecision::Confirm]);
+        online_better
+            .library_candidates
+            .borrow_mut()
+            .push(local.clone());
         application()
-            .execute(&context(), &command(), &mut confirm)
+            .execute(&mapped_context(), &song, &mut online_better)
             .expect("song request");
+        assert!(!online_better.decision_options.borrow()[0].3);
+        assert!(
+            !online_better
+                .replies
+                .borrow()
+                .iter()
+                .any(|line| line.contains("本地曲库推荐"))
+        );
         assert_eq!(
-            confirm.played.borrow()[0]
+            online_better.played.borrow()[0]
                 .track
                 .as_ref()
                 .unwrap()
                 .track_ref
                 .key
                 .id,
-            "online"
+            "exact"
         );
 
-        // 超时（运行时映射为 Cancelled）时不播放任何候选。
+        // 已有本地推荐时超时（运行时映射为 Cancelled）不播放任何候选。
         let mut timeout = FakePort::idle([Some(PickedCandidate::with_snapshot(
             online.clone(),
             vec![online.clone()],
             "",
         ))]);
-        timeout.online_candidate_matches.set(false);
         timeout.library_candidates.borrow_mut().push(local);
         timeout.decisions = VecDeque::from([SongRequestDecision::Cancelled]);
         application()
-            .execute(&context(), &command(), &mut timeout)
+            .execute(&mapped_context(), &song, &mut timeout)
             .expect("song request");
         assert!(timeout.played.borrow().is_empty());
     }
 
     #[test]
-    fn ai_library_candidates_survive_platform_failure_and_literal_matches_skip_the_library() {
+    fn ai_library_candidates_survive_platform_failure_and_plain_requests_keep_the_online_pick() {
         let ai = Arc::new(RecordingAiGateway::default());
         let application = SongRequestApplication::with_gateways(
             ai.clone(),
@@ -2941,7 +2963,9 @@ mod tests {
         application
             .execute(&context(), &command(), &mut normal)
             .unwrap();
-        assert!(normal.library_searches.borrow().is_empty());
+        // 普通点歌会查曲库做匹配度比较；本地匹配度不占优时不会给出本地推荐。
+        assert_eq!(normal.library_searches.borrow().len(), 1);
+        assert!(!normal.decision_options.borrow()[0].3);
         assert_eq!(
             normal.played.borrow()[0]
                 .track

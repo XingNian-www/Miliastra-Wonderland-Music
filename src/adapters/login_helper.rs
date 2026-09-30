@@ -190,6 +190,8 @@ impl KugouDeviceRegistrar for DirectKugouDeviceRegistrar {
 struct CommandHelperLauncher {
     executable: PathBuf,
     credential_directory: PathBuf,
+    /// 读取用户在设置页填写的酷狗设备信息（实时配置快照）。
+    kugou_device: Arc<dyn Fn() -> crate::config::KugouDeviceConfig + Send + Sync>,
 }
 
 const KUGOU_DEVICE_FILE: &str = "kugou-device.json";
@@ -201,52 +203,67 @@ struct KugouDeviceIdentity {
     mac: String,
 }
 
-/// 在不同辅助进程和重启之间保持 lite 设备标识稳定。
-/// 文件格式与原侧车实现兼容。
-fn load_or_create_kugou_device(directory: &Path) -> io::Result<KugouDeviceIdentity> {
-    fs::create_dir_all(directory)?;
-    let path = directory.join(KUGOU_DEVICE_FILE);
-    if path.is_file() {
-        return read_kugou_device(&path);
+/// 把设置页填写的酷狗设备信息写入 kugou-device.json，供登录辅助进程与播放侧共用。
+///
+/// 三项未全部填写时不做任何改动，沿用已有文件；程序不会自动生成设备信息。
+pub(crate) fn sync_kugou_device_file(
+    config: &crate::config::KugouDeviceConfig,
+    directory: &Path,
+) -> io::Result<bool> {
+    if !config.is_complete() {
+        return Ok(false);
     }
-
-    let guid = Uuid::new_v4().to_string();
     let device = KugouDeviceIdentity {
-        guid: miliastra_playback::kugou_normalize_guid(&guid),
-        dev: Uuid::new_v4().to_string().to_ascii_uppercase(),
-        mac: "02:00:00:00:00:00".to_owned(),
+        guid: miliastra_playback::kugou_normalize_guid(config.device_guid.trim()),
+        dev: config.device_dev.trim().to_ascii_uppercase(),
+        mac: config.device_mac.trim().to_ascii_uppercase(),
     };
+    let path = directory.join(KUGOU_DEVICE_FILE);
+    if path.is_file()
+        && let Ok(existing) = read_kugou_device(&path)
+        && existing.guid == device.guid
+        && existing.dev == device.dev
+        && existing.mac == device.mac
+    {
+        return Ok(false);
+    }
+    fs::create_dir_all(directory)?;
     let content = serde_json::to_vec_pretty(&device)
         .map_err(|error| io::Error::other(format!("serialize KuGou device identity: {error}")))?;
-    // `create_new` 让首个写入者成为所有者。第二个辅助进程不能覆盖播放正在使用的标识。
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(&content)?;
-            file.sync_all()?;
-            Ok(device)
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            // 获胜进程可能仍在写入，解析共享文件前给它一个短暂且有界的完成窗口。
-            for _ in 0..10 {
-                match read_kugou_device(&path) {
-                    Ok(device) => return Ok(device),
-                    Err(read_error)
-                        if matches!(
-                            read_error.kind(),
-                            io::ErrorKind::NotFound
-                                | io::ErrorKind::UnexpectedEof
-                                | io::ErrorKind::InvalidData
-                        ) =>
-                    {
-                        thread::sleep(Duration::from_millis(10))
-                    }
-                    Err(read_error) => return Err(read_error),
-                }
-            }
-            read_kugou_device(&path)
-        }
-        Err(error) => Err(error),
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, &content)?;
+    fs::rename(&temporary, &path)?;
+    Ok(true)
+}
+
+/// 读取 lite 设备标识。
+///
+/// 设备信息由用户在设置页 `kugou.device_*` 填写（经 [`sync_kugou_device_file`] 落盘），
+/// 程序不再自动生成；文件缺失时给出可操作的错误。
+fn load_kugou_device(directory: &Path) -> io::Result<KugouDeviceIdentity> {
+    let path = directory.join(KUGOU_DEVICE_FILE);
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "酷狗设备信息缺失：请在设置页“酷狗设备”中填写设备 GUID、设备型号与设备 MAC；\
+             程序不会自动生成设备信息"
+                .to_owned(),
+        ));
     }
+    read_kugou_device(&path)
+}
+
+/// 按用户填写的设备信息刷新 kugou-device.json，再读取设备标识。
+///
+/// 写盘失败只记录日志：沿用已有文件仍可能让本次登录继续。
+fn prepare_kugou_device(
+    config: &crate::config::KugouDeviceConfig,
+    directory: &Path,
+) -> io::Result<KugouDeviceIdentity> {
+    if let Err(error) = sync_kugou_device_file(config, directory) {
+        log::warn!("写入酷狗设备信息失败，将沿用已有文件: {error}");
+    }
+    load_kugou_device(directory)
 }
 
 fn read_kugou_device(path: &Path) -> io::Result<KugouDeviceIdentity> {
@@ -291,7 +308,7 @@ impl HelperLauncher for CommandHelperLauncher {
             // 二维码 URL 或认证参数，不能转发到主程序日志。
             .stderr(Stdio::piped());
         if provider == ProviderId::Kugou {
-            let device = load_or_create_kugou_device(&self.credential_directory)?;
+            let device = prepare_kugou_device(&(self.kugou_device)(), &self.credential_directory)?;
             let mid = miliastra_playback::kugou_calculate_mid(&device.guid);
             command
                 .env("KUGOU_API_GUID", device.guid)
@@ -350,6 +367,8 @@ struct ManagerInner {
     credential_directory: PathBuf,
     profile_root: PathBuf,
     timeout: Duration,
+    /// 读取用户在设置页填写的酷狗设备信息（实时配置快照）。
+    kugou_device: Arc<dyn Fn() -> crate::config::KugouDeviceConfig + Send + Sync>,
     state: Mutex<ManagerState>,
     changed: Condvar,
 }
@@ -474,16 +493,19 @@ impl LoginHelperManager {
         executable: PathBuf,
         credential_directory: PathBuf,
         timeout: Duration,
+        kugou_device: Arc<dyn Fn() -> crate::config::KugouDeviceConfig + Send + Sync>,
     ) -> Self {
         Self::new_with_dependencies(
             Arc::new(playback),
             Arc::new(CommandHelperLauncher {
                 executable,
                 credential_directory: credential_directory.clone(),
+                kugou_device: Arc::clone(&kugou_device),
             }),
             Arc::new(DirectKugouDeviceRegistrar),
             credential_directory,
             timeout,
+            kugou_device,
         )
     }
 
@@ -493,6 +515,7 @@ impl LoginHelperManager {
         kugou_device_registrar: Arc<dyn KugouDeviceRegistrar>,
         credential_directory: PathBuf,
         timeout: Duration,
+        kugou_device: Arc<dyn Fn() -> crate::config::KugouDeviceConfig + Send + Sync>,
     ) -> Self {
         Self {
             inner: Arc::new(ManagerInner {
@@ -502,6 +525,7 @@ impl LoginHelperManager {
                 credential_directory: credential_directory.clone(),
                 profile_root: credential_directory.join(PROFILE_ROOT_NAME),
                 timeout: timeout.max(Duration::from_millis(1)),
+                kugou_device,
                 state: Mutex::new(ManagerState {
                     active: None,
                     worker: None,
@@ -1371,11 +1395,11 @@ fn credential_from_payload_with_device_registration(
                     Some(ProviderId::Kugou),
                 ));
             }
-            let device =
-                load_or_create_kugou_device(&inner.credential_directory).map_err(|_error| {
+            let device = prepare_kugou_device(&(inner.kugou_device)(), &inner.credential_directory)
+                .map_err(|_error| {
                     manager_failure(
                         "kugou_device_identity_failed",
-                        "酷狗设备标识初始化失败",
+                        "酷狗设备信息缺失，请在设置页“酷狗设备”中填写设备 GUID、设备型号与设备 MAC",
                         Some(ProviderId::Kugou),
                     )
                 })?;
@@ -1493,6 +1517,7 @@ fn playback_code_message(code: &str) -> &'static str {
         "provider_auth_required" => "该平台尚未登录",
         "relogin_required" => "登录凭据已失效，请重新登录",
         "provider_rate_limited" => "上游接口触发限流，请稍后重试",
+        "provider_verification_required" => "上游要求完成人机验证，请稍后再试",
         "provider_timeout" => "上游接口超时，请稍后重试",
         "provider_transient" => "上游服务暂时不可用，请稍后重试",
         "login_in_progress" => "已有登录任务正在进行",
@@ -2080,7 +2105,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_or_create_kugou_device(&directory).unwrap();
+        let loaded = load_kugou_device(&directory).unwrap();
         assert_eq!(
             loaded.guid,
             miliastra_playback::kugou_normalize_guid(legacy_guid)
@@ -2090,6 +2115,37 @@ mod tests {
         let persisted: KugouDeviceIdentity =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted.guid, legacy_guid);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn kugou_device_must_be_provided_by_the_user() {
+        let directory = profile_root("kugou-device-required");
+        fs::create_dir_all(&directory).unwrap();
+        // 不再自动生成设备信息：缺失时给出可操作的错误。
+        let error = load_kugou_device(&directory).expect_err("missing device must fail");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("酷狗设备信息缺失"));
+
+        // 配置页填写后写入文件，随后可被读取。
+        let config = crate::config::KugouDeviceConfig {
+            device_guid: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+            device_dev: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+            device_mac: "aa:bb:cc:dd:ee:ff".to_owned(),
+        };
+        assert!(sync_kugou_device_file(&config, &directory).unwrap());
+        // 内容未变化时不重复写入。
+        assert!(!sync_kugou_device_file(&config, &directory).unwrap());
+        let loaded = load_kugou_device(&directory).unwrap();
+        assert_eq!(loaded.mac, "AA:BB:CC:DD:EE:FF");
+        // 三项没填齐时不动文件。
+        let partial = crate::config::KugouDeviceConfig {
+            device_guid: "other".to_owned(),
+            ..crate::config::KugouDeviceConfig::default()
+        };
+        assert!(!sync_kugou_device_file(&partial, &directory).unwrap());
+        assert_eq!(load_kugou_device(&directory).unwrap().guid, loaded.guid);
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2106,7 +2162,17 @@ mod tests {
             Arc::new(FakeKugouDeviceRegistrar),
             profile_root(name),
             timeout,
+            Arc::new(test_kugou_device_config),
         )
+    }
+
+    /// 测试用设备信息：模拟用户在设置页填写的酷狗设备。
+    fn test_kugou_device_config() -> crate::config::KugouDeviceConfig {
+        crate::config::KugouDeviceConfig {
+            device_guid: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+            device_dev: "550e8400e29b41d4a716446655440001".to_owned(),
+            device_mac: "aa:bb:cc:dd:ee:ff".to_owned(),
+        }
     }
 
     fn wait_idle(manager: &LoginHelperManager) -> LoginManagerStatus {

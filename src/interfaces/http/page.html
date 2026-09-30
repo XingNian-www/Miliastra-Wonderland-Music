@@ -1390,7 +1390,7 @@ function renderLoginState(){
       (isActive?'<button class="btn small warn login-cancel">取消</button>':'')+
       '<button class="btn small" data-refresh-status="'+esc(provider)+'">刷新状态</button>'+
       (item.manualRefreshSupported?'<button class="btn small" data-refresh-provider="'+esc(provider)+'">刷新凭据</button>':'')+
-      (provider==='kugou'?'<button class="btn small good" data-kugou-report>领取VIP</button><button class="btn small good" data-kugou-upgrade>升级VIP</button>':'')+
+      (provider==='kugou'?'<button class="btn small good" data-kugou-report title="仅在点击时领取，不会自动执行">领取VIP</button><button class="btn small good" data-kugou-upgrade title="仅在点击时升级，不会自动执行">升级VIP</button>':'')+
       '<button class="btn small ghost login-logout" data-provider="'+esc(provider)+'" '+(active?'disabled':'')+'>退出</button></div></div><div class="login-progress"><i style="width:'+Math.max(0,Math.min(100,Number(completeness)||0))+'%"></i></div>'+
       accountInfo+
       '<div class="login-fields">'+fields+'</div><div class="login-refresh-info">'+refreshInfo+(item.nextRefreshCheckAtMs?' · 下次检查：'+esc(refreshTime(item.nextRefreshCheckAtMs)):'')+(item.lastRefreshError?' · '+esc(item.lastRefreshError):'')+'</div></div>'

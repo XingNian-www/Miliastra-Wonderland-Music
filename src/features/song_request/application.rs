@@ -635,7 +635,7 @@ impl SongRequestExecution<'_> {
 
         self.reply(&format!("{}AI匹配中", label))?;
 
-        let search_source = ai_candidate_source(song);
+        let search_source = ai_candidate_source(song, self.friend_or_above);
         let allow_bilibili = self.friend_or_above;
         let mut candidates =
             match self.search_ai_candidates(&song.keyword, search_source, allow_bilibili) {
@@ -1680,13 +1680,20 @@ fn merge_ai_search_rounds(
         .collect()
 }
 
-fn ai_candidate_source(song: &SongCommand) -> &'static str {
-    if song.friend_username.trim().is_empty() {
-        // 大厅 AI 点歌仅使用 QQ、网易、酷狗三源；B站 仅好友点歌。
-        "qqmusic,netease,kugou"
-    } else {
-        song.source.as_str()
+/// AI 点歌的在线检索范围。
+///
+/// 未获得好友及以上权限的大厅成员只用 QQ、网易、酷狗三源；好友私聊与大厅里
+/// 靠身份映射获得好友/管理员/主人权限的成员，按好友私聊的语义处理：
+/// `@AI点歌`/`@AI搜索` 搜索全部音源（含 B站），显式指定音源时仍只用该音源。
+fn ai_candidate_source(song: &SongCommand, friend_or_above: bool) -> &'static str {
+    if !friend_or_above && song.friend_username.trim().is_empty() {
+        return "qqmusic,netease,kugou";
     }
+    if song.ai_assisted && song.source == SongSource::QqMusic {
+        // 大厅命令表的 AI 点歌默认写的是 QQ，获得好友及以上权限后按好友表放开全部音源。
+        return "";
+    }
+    song.source.as_str()
 }
 
 fn alternate_music_source(source: &str) -> &'static str {
@@ -3310,14 +3317,22 @@ mod tests {
 
     #[test]
     fn hall_ai_song_search_excludes_bilibili_while_friend_ai_search_keeps_it() {
-        // 大厅 AI 点歌：不提供 B站 音源。
+        // 大厅里未映射的成员：不提供 B站 音源。
         let hall = SongCommand {
             friend_username: String::new(),
             ..command()
         };
-        let source = ai_candidate_source(&hall);
+        let source = ai_candidate_source(&hall, false);
         assert!(!source.split(',').any(|part| part == "bilibili"));
         assert_eq!(source, "qqmusic,netease,kugou");
+
+        // 大厅里靠身份映射获得好友及以上权限的成员：AI 点歌按好友语义搜索全部音源。
+        let mapped = SongCommand {
+            ai_assisted: true,
+            friend_username: String::new(),
+            ..command()
+        };
+        assert_eq!(ai_candidate_source(&mapped, true), "");
 
         // 好友 AI 点歌：按好友命令的 source（All 为空串 → 全平台，含 B站）。
         let friend_ai = SongCommand {
@@ -3325,7 +3340,7 @@ mod tests {
             friend_username: "Alice".to_string(),
             ..command()
         };
-        assert_eq!(ai_candidate_source(&friend_ai), "");
+        assert_eq!(ai_candidate_source(&friend_ai, true), "");
 
         // 好友 B站点歌：明确只搜 B站。
         let friend_bilibili = SongCommand {
@@ -3333,7 +3348,46 @@ mod tests {
             friend_username: "Alice".to_string(),
             ..command()
         };
-        assert_eq!(ai_candidate_source(&friend_bilibili), "bilibili");
+        assert_eq!(ai_candidate_source(&friend_bilibili, true), "bilibili");
+
+        // 显式指定音源的 AI 点歌在映射成员手里也只用该音源。
+        let mapped_netease = SongCommand {
+            source: SongSource::Netease,
+            ai_assisted: true,
+            friend_username: String::new(),
+            ..command()
+        };
+        assert_eq!(ai_candidate_source(&mapped_netease, true), "netease");
+    }
+
+    #[test]
+    fn mapped_hall_member_ai_search_uses_every_platform() {
+        // 权限来自身份映射时，AI 点歌的在线检索范围与好友私聊一致（空串=全部音源）。
+        let application = SongRequestApplication::with_gateways(
+            Arc::new(RecordingAiGateway::default()),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        let song = SongCommand {
+            ai_assisted: true,
+            ..command()
+        };
+        let mut mapped = FakePort::idle([None]);
+        application
+            .execute(&mapped_context(), &song, &mut mapped)
+            .expect("song request");
+        assert_eq!(mapped.search_sources.borrow().as_slice(), [""]);
+
+        // 大厅里未映射的成员仍然只搜 QQ、网易、酷狗。
+        let mut plain = FakePort::idle([None]);
+        application
+            .execute(&context(), &song, &mut plain)
+            .expect("song request");
+        assert_eq!(
+            plain.search_sources.borrow().as_slice(),
+            ["qqmusic,netease,kugou"]
+        );
     }
 
     #[test]

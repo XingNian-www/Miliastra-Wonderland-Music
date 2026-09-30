@@ -98,6 +98,48 @@ pub struct AppConfig {
     /// 昵称身份映射；内嵌段可省略。
     #[serde(default)]
     pub identity: IdentityConfig,
+    /// 酷狗设备信息（由用户填写，程序不再自动生成）；内嵌段可省略。
+    #[serde(default)]
+    pub kugou: KugouDeviceConfig,
+}
+
+/// 酷狗设备标识：GUID、设备型号与 MAC 由用户提供，用于登录与取流请求。
+///
+/// 三项必须同时填写；留空表示沿用凭据目录下已有的 kugou-device.json。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KugouDeviceConfig {
+    #[serde(default)]
+    pub device_guid: String,
+    #[serde(default)]
+    pub device_dev: String,
+    #[serde(default)]
+    pub device_mac: String,
+}
+
+impl KugouDeviceConfig {
+    /// 酷狗设备信息允许整体留空（沿用已有 kugou-device.json），
+    /// 但不允许只填一部分，避免半个设备身份进入登录协议。
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.is_empty() || self.is_complete() {
+            return Ok(());
+        }
+        bail!("kugou.device_guid、kugou.device_dev、kugou.device_mac 必须同时填写");
+    }
+
+    /// 三项是否全部填写。
+    pub fn is_complete(&self) -> bool {
+        !self.device_guid.trim().is_empty()
+            && !self.device_dev.trim().is_empty()
+            && !self.device_mac.trim().is_empty()
+    }
+
+    /// 是否完全没有填写。
+    pub fn is_empty(&self) -> bool {
+        self.device_guid.trim().is_empty()
+            && self.device_dev.trim().is_empty()
+            && self.device_mac.trim().is_empty()
+    }
 }
 
 impl Default for AppConfig {
@@ -167,6 +209,7 @@ impl Default for AppConfig {
             song_dedup: SongDedupConfig::default(),
             idiom_chain: IdiomChainConfig::default(),
             identity: IdentityConfig::default(),
+            kugou: KugouDeviceConfig::default(),
             landlord: LandlordConfig::default(),
             undercover: UndercoverConfig::default(),
             turtle_soup: TurtleSoupConfig::default(),
@@ -421,6 +464,7 @@ impl AppConfig {
         self.song_review.validate()?;
         self.turtle_soup.validate()?;
         self.identity.validate()?;
+        self.kugou.validate()?;
         self.validate_ui_geometry()?;
         Ok(())
     }
@@ -2262,6 +2306,28 @@ stale_timeout_ms: 7500
                 "field={field} error={error}"
             );
         }
+    }
+
+    #[test]
+    fn partial_kugou_device_information_is_rejected() {
+        let mut config: AppConfig =
+            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+        // 整体留空表示沿用已有 kugou-device.json。
+        config.kugou = KugouDeviceConfig::default();
+        config.validate().expect("empty device info is allowed");
+        // 三项齐全时通过。
+        config.kugou = KugouDeviceConfig {
+            device_guid: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+            device_dev: "550e8400e29b41d4a716446655440001".to_owned(),
+            device_mac: "aa:bb:cc:dd:ee:ff".to_owned(),
+        };
+        config.validate().expect("complete device info is allowed");
+        // 只填一部分必须被拒绝，避免半个设备身份进入登录协议。
+        config.kugou.device_mac.clear();
+        let error = config
+            .validate()
+            .expect_err("partial device info must fail");
+        assert!(error.to_string().contains("kugou.device_mac"));
     }
 
     #[test]

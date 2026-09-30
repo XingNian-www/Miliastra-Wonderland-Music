@@ -1102,7 +1102,10 @@ impl SongRequestExecution<'_> {
             candidate_snapshot: request.candidate_snapshot.clone(),
         })?;
         if pushed.accepted {
-            if let Some(track) = &request.track
+            // 只有队首（入队后队列里唯一曲目）才立即解析音源：排在后面的曲目
+            // 交给播放侧的下一首预加载，避免为长时间等待的曲目提前取流。
+            if pushed.size == 1
+                && let Some(track) = &request.track
                 && let Err(error) = self.port.preload_track(track)
             {
                 log::debug!("点歌入队后预加载音源失败，播放时将重试: {error:#}");

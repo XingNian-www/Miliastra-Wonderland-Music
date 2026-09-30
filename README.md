@@ -7,13 +7,13 @@ Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌�
 - 游戏内大厅和好友私聊点歌，支持 QQ 音乐、网易云音乐和酷狗音乐；好友私聊还支持 B 站来源。
 - 播放、暂停、切歌、音量、队列、歌词和大厅信息查询。
 - 一级/二级聊天监听、好友邀请、麦克风切换、UID 拉黑和聊天屏蔽投票。
-- 成语接龙、斗地主、跑得快、海龟汤和谁是卧底等娱乐玩法。
+- 成语接龙、斗地主、跑得快、海龟汤、谁是卧底和每日塔罗等娱乐玩法。
 - 本地 Web 面板、远程控制和高级诊断工具。
 
 运行与配置方法见 [用户使用指南](docs/user-guide.md)。
 
 发布包包含主程序、登录辅助器和运行所需的媒体、OCR 资源；Windows WebView2 Evergreen Runtime 是登录功能的系统前置条件。
-凭据保存在 `deps/data/credentials/`，不通过 HTTP 暴露。
+登录信息保存在本机的 `deps/data/credentials/`。
 
 ## 简易配置流程
 
@@ -35,11 +35,6 @@ Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌�
 - [谁是卧底](docs/undercover.md)：报名、发言、投票和词库配置。
 - [Web 面板使用](docs/web-tools.md)：状态面板、远程控制和高级工具。
 - [平台登录](docs/login-qr-feasibility.md)：登录步骤、凭据和环境要求。
-
-## 项目维护与发展
-
-- [项目导览](docs/project-overview.md)：定位、运行链路、目录与 crate 职责、修改入口和工程现状。
-- [发展路线](docs/roadmap.md)：优先级、阶段交付、验收标准和本次验证范围。
 
 ## 许可证
 

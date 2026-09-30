@@ -1274,6 +1274,13 @@ impl ApplicationRuntime {
         let state_store: Arc<dyn miliastra_contracts::StateStore> =
             Arc::new(crate::adapters::file_store::FsStateStore);
         let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
+        // 酷狗设备信息由用户在设置页填写：落盘后登录辅助进程与播放侧共用同一份标识。
+        if let Err(error) = crate::adapters::login_helper::sync_kugou_device_file(
+            &config.kugou,
+            &config.playback.credential_directory,
+        ) {
+            log::warn!("写入酷狗设备信息失败，将沿用已有文件: {error}");
+        }
         let native_playback_runtime = NativePlaybackRuntime::start_with_lyrics_lead_and_helper(
             config.playback.credential_directory.clone(),
             // 统一数据库：缓存元数据与配置共用同一个 playback.sqlite3。
@@ -1294,6 +1301,10 @@ impl ApplicationRuntime {
             config.playback.login_helper_executable.clone(),
             config.playback.credential_directory.clone(),
             Duration::from_millis(config.playback.login_timeout_ms),
+            Arc::new({
+                let live_configs = live_configs.clone();
+                move || live_configs.snapshot().kugou.clone()
+            }),
         );
         let playback_adapter = NativePlaybackAdapter::new(
             native_playback.clone(),

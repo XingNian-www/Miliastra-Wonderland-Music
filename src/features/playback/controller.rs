@@ -12,7 +12,7 @@ use super::format::format_play_message;
 use super::state::{
     ActivePlaybackIdentity, ActivePlaybackRequest, ConfirmedPlaybackState, ObservationReliability,
     PauseReason, PlaybackObservation, PlaybackRuntimeState, PlaybackSessionBinding,
-    SessionReconciliation,
+    SessionReconciliation, SongRequestEvent,
 };
 use crate::features::playback::{
     MatchConfig, PlaybackControllerSnapshot, PlaybackStateUpdate, PlayerStatus,
@@ -1479,8 +1479,13 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             expected_session_id: status.session_id.trim().to_string(),
             expected_generation: status.generation,
         };
+        // 只统计新的点歌，恢复播放和上一首保留点歌人展示，但不重复计数。
+        let song_request_event = (request.navigation == PlaybackNavigation::Normal)
+            .then(|| self.song_request_event(&active_request, status))
+            .flatten();
         self.playback_state.confirm_playback_and_dequeue(
             PlaybackStateUpdate::Confirmed {
+                song_request_event,
                 request: active_request,
                 navigation: request.navigation,
             },
@@ -1491,6 +1496,40 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .record_playback_pool_track(confirmed_track.clone())?;
         log::info!("播放器状态转移: Starting -> RequestedSongPlaying reason={reason}");
         Ok(())
+    }
+
+    /// 从已确认的播放请求构造点歌事件；非点歌路径（点歌人为空、缺曲目）返回 None。
+    fn song_request_event(
+        &self,
+        request: &ActivePlaybackRequest,
+        status: &PlayerStatus,
+    ) -> Option<SongRequestEvent> {
+        let requester = request.requester.trim();
+        if requester.is_empty() {
+            return None;
+        }
+        let track_key = request.track.as_ref()?.track_ref.key.to_string();
+        let (fallback_title, fallback_artist) = split_title_artist(&request.keyword);
+        let title = if status.name.trim().is_empty() {
+            fallback_title
+        } else {
+            status.name.trim().to_string()
+        };
+        let artist = if status.singer.trim().is_empty() {
+            fallback_artist
+        } else {
+            status.singer.trim().to_string()
+        };
+        Some(SongRequestEvent {
+            requester: requester.to_string(),
+            track_key,
+            started_at_ms: request.started_at_ms,
+            keyword: request.keyword.clone(),
+            title,
+            artist,
+            source: request.source.clone(),
+            recorded_at_ms: self.wall_clock.unix_millis(),
+        })
     }
 
     fn record_song_dedup_playback(
@@ -1964,6 +2003,8 @@ mod tests {
         pool_available: bool,
         /// 原子确认端口收到的 queue_item_id（None 表示手动点歌/恢复播放）。
         confirm_dequeues: Arc<Mutex<Vec<Option<u64>>>>,
+        /// 收到记录的点歌事件（排行榜写入桩）。
+        song_request_events: Arc<Mutex<Vec<SongRequestEvent>>>,
     }
 
     impl PlaybackStatePort for TestPlaybackState {
@@ -2016,7 +2057,17 @@ mod tests {
             queue_item_id: Option<u64>,
         ) -> Result<bool> {
             self.confirm_dequeues.lock().unwrap().push(queue_item_id);
-            self.update(update)
+            let event = match &update {
+                PlaybackStateUpdate::Confirmed {
+                    song_request_event, ..
+                } => song_request_event.clone(),
+                _ => None,
+            };
+            let changed = self.update(update)?;
+            if changed && let Some(event) = event {
+                self.song_request_events.lock().unwrap().push(event);
+            }
+            Ok(changed)
         }
 
         fn record_song_dedup(&self, candidate: SongDedupCandidate) -> Result<()> {
@@ -2348,6 +2399,7 @@ mod tests {
                 pool: Arc::new(Mutex::new(pool)),
                 pool_available,
                 confirm_dequeues: Arc::new(Mutex::new(Vec::new())),
+                song_request_events: Arc::new(Mutex::new(Vec::new())),
             },
             PlaybackTimePorts::new(clock, wall_clock),
             // 测试构造：热更新共享值用默认配置初始化；需要覆盖时直接改写共享值。
@@ -2596,6 +2648,7 @@ mod tests {
         controller
             .playback_state
             .update(PlaybackStateUpdate::Confirmed {
+                song_request_event: None,
                 request: restored_active_request(&track),
                 navigation: PlaybackNavigation::Normal,
             })
@@ -3087,6 +3140,105 @@ mod tests {
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.state, "requested_song_playing");
         assert_eq!(snapshot.active_uri, request.uri());
+    }
+
+    #[test]
+    fn confirmed_playback_records_song_request_event_for_requester() {
+        let mut request = request();
+        request.requester = "Alice".to_string();
+        let controller = controller(FakeBackend::new(Vec::new()));
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+
+        let events = controller
+            .playback_state
+            .song_request_events
+            .lock()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.requester, "Alice");
+        assert_eq!(event.track_key, request.uri());
+        assert_eq!(event.keyword, "目标 - 歌手");
+        assert_eq!(event.title, "目标");
+        assert_eq!(event.artist, "歌手");
+        assert_eq!(event.source, "qqmusic");
+        assert!(event.recorded_at_ms > 0);
+    }
+
+    #[test]
+    fn leaderboard_does_not_count_restore_or_previous_playback() {
+        for navigation in [PlaybackNavigation::Restore, PlaybackNavigation::Previous] {
+            let mut request = request();
+            request.requester = "Alice".to_string();
+            request.navigation = navigation;
+            let controller = controller(FakeBackend::new(Vec::new()));
+            for _ in 0..2 {
+                controller.begin_playback_attempt(&request).unwrap();
+                controller
+                    .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+                    .unwrap();
+            }
+            assert!(
+                controller
+                    .playback_state
+                    .song_request_events
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                controller
+                    .playback_snapshot()
+                    .unwrap()
+                    .active_request
+                    .unwrap()
+                    .requester,
+                "Alice"
+            );
+        }
+    }
+
+    #[test]
+    fn leaderboard_does_not_count_mismatched_confirmation() {
+        let mut request = request();
+        request.requester = "Alice".to_string();
+        let controller = controller(FakeBackend::new(Vec::new()));
+        assert!(
+            controller
+                .confirm_playback_success(
+                    &request,
+                    &status("其它", "miliastra://track/qqmusic/other", 1.0, 180.0)
+                )
+                .is_err()
+        );
+        assert!(
+            controller
+                .playback_state
+                .song_request_events
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn confirmed_playback_without_requester_records_no_song_request_event() {
+        let request = request();
+        let controller = controller(FakeBackend::new(Vec::new()));
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+
+        assert!(
+            controller
+                .playback_state
+                .song_request_events
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

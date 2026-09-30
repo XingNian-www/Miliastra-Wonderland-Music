@@ -684,6 +684,19 @@ impl AudioCache {
         }
     }
 
+    /// AI 曲库检索使用的本地元数据搜索；由运行时在阻塞线程池调用。
+    pub(crate) fn search_library(
+        &self,
+        query: &crate::SearchQuery,
+    ) -> Result<Vec<crate::SearchCandidate>, CacheError> {
+        if !self.inner.config.enabled {
+            return Ok(Vec::new());
+        }
+        lock_metadata_store(&self.inner.metadata_store)
+            .search_library(query)
+            .map_err(|error| CacheError::Metadata(error.to_string()))
+    }
+
     /// 读取曲目的缓存歌词（未命中或无歌词缓存返回 None）。
     /// 歌词正文存于 SQLite，读取在阻塞线程池执行。
     pub async fn get_lyrics(&self, key: &SongKey) -> Option<crate::lyrics::TimedLyrics> {

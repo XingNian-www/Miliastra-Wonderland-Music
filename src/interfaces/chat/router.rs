@@ -25,6 +25,7 @@ pub(crate) enum ChatCommandModule {
     IdiomChain,
     CardGame,
     TurtleSoup,
+    Tarot,
     Undercover,
     Invite,
     Moderation,
@@ -192,6 +193,8 @@ impl<'a> ChatCommandRouter<'a> {
             ChatCommandModule::TurtleSoup => {
                 route_turtle_soup(envelope).map(|matched| matched.map(ModuleCommand::TurtleSoup))
             }
+            ChatCommandModule::Tarot => crate::features::tarot::TarotCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Tarot)),
             ChatCommandModule::Undercover => {
                 route_undercover(envelope).map(|matched| matched.map(ModuleCommand::Undercover))
             }
@@ -251,6 +254,10 @@ impl<'a> ChatCommandRouter<'a> {
         envelope: &CommandEnvelope,
         active_entertainment: Option<EntertainmentKind>,
     ) -> Option<ChatCommandModule> {
+        // 塔罗是一次性回复，不占用或切换其他娱乐会话。
+        if crate::features::tarot::TarotCommand::claims_chat(envelope) {
+            return Some(ChatCommandModule::Tarot);
+        }
         if envelope.authority() == CommandAuthority::HallMember {
             for (module, claims) in [
                 (
@@ -302,6 +309,69 @@ impl<'a> ChatCommandRouter<'a> {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tarot_routing_tests {
+    use super::*;
+    use crate::features::command::CommandObservation;
+    #[test]
+    fn tarot_routes_in_hall_and_private_without_stealing_game_commands() {
+        let router = ChatCommandRouter::without_custom_workflow();
+        for source in ["blue", "pink"] {
+            for active in [
+                None,
+                Some(EntertainmentKind::IdiomChain),
+                Some(EntertainmentKind::Landlord),
+                Some(EntertainmentKind::TurtleSoup),
+                Some(EntertainmentKind::Undercover),
+            ] {
+                let envelope = CommandEnvelope::new(
+                    "#塔罗三张AI 学习",
+                    "用户",
+                    source,
+                    "#塔罗三张AI 学习",
+                    CommandObservation::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    router.select_module(&envelope, active),
+                    Some(ChatCommandModule::Tarot)
+                );
+                let routed = router.route(&envelope, active).unwrap();
+                assert!(matches!(routed.command, ModuleCommand::Tarot(_)));
+                assert!(routed.command.requires_hall_sender());
+                assert!(routed.command.scopes_lock_to_actor());
+            }
+        }
+        let help = CommandEnvelope::new(
+            "#塔罗帮助",
+            "用户",
+            "blue",
+            "#塔罗帮助",
+            CommandObservation::default(),
+        )
+        .unwrap();
+        assert!(
+            !router
+                .route(&help, None)
+                .unwrap()
+                .command
+                .requires_hall_sender()
+        );
+        let active = CommandEnvelope::new(
+            "#提示",
+            "用户",
+            "blue",
+            "#提示",
+            CommandObservation::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            router.select_module(&active, Some(EntertainmentKind::IdiomChain)),
+            Some(ChatCommandModule::IdiomChain)
+        );
     }
 }
 
@@ -450,6 +520,91 @@ mod tests {
         );
         assert!(router.route(&envelope("blue", "@删除"), None).is_none());
         assert!(router.route(&envelope("pink", "@下一首"), None).is_none());
+    }
+
+    #[test]
+    fn moderation_routes_keep_source_and_trusted_role_separate() {
+        for role in [
+            None,
+            Some(IdentityRole::Friend),
+            Some(IdentityRole::Admin),
+            Some(IdentityRole::Owner),
+        ] {
+            let identity = IdentityAccess::new(IdentityConfig {
+                mappings: role
+                    .into_iter()
+                    .map(|role| IdentityMapping {
+                        nickname: "用户".to_string(),
+                        id: uuid::Uuid::from_u128(1),
+                        role,
+                        note: "展示备注".to_string(),
+                    })
+                    .collect(),
+            });
+            let router = ChatCommandRouter {
+                custom_workflow: None,
+                identity: Some(&identity),
+            };
+            for source in ["pink", "blue"] {
+                for (text, action) in [
+                    (
+                        "@拉黑UID123456789",
+                        crate::features::moderation::ModerationAction::Blacklist,
+                    ),
+                    (
+                        "@屏蔽123456789",
+                        crate::features::moderation::ModerationAction::BlockChat,
+                    ),
+                ] {
+                    let routed = router.route(&envelope(source, text), None).unwrap();
+                    assert_eq!(routed.role, role);
+                    assert_eq!(
+                        routed.authority,
+                        if source == "pink" {
+                            CommandAuthority::Friend
+                        } else {
+                            CommandAuthority::HallMember
+                        }
+                    );
+                    assert_eq!(
+                        routed.permission_required.is_some(),
+                        source == "blue" && role.is_none()
+                    );
+                    let ModuleCommand::Moderation(command) = routed.command else {
+                        panic!("moderation command expected");
+                    };
+                    assert_eq!(command.action, action);
+                    assert_eq!(command.uid, "123456789");
+                    assert_eq!(command.requester, "用户");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moderation_admin_routing_keeps_uid_validation() {
+        let identity = IdentityAccess::new(IdentityConfig {
+            mappings: vec![IdentityMapping {
+                nickname: "用户".to_string(),
+                id: uuid::Uuid::from_u128(1),
+                role: IdentityRole::Admin,
+                note: String::new(),
+            }],
+        });
+        let router = ChatCommandRouter {
+            custom_workflow: None,
+            identity: Some(&identity),
+        };
+        for source in ["pink", "blue"] {
+            for text in [
+                "@拉黑12345678",
+                "@拉黑1234567890",
+                "@拉黑UID１２３４５６７８９",
+                "@拉黑123456789abc",
+            ] {
+                assert!(router.route(&envelope(source, text), None).is_none());
+            }
+        }
     }
 
     #[test]

@@ -55,6 +55,44 @@ impl SongRequestPort for ApplicationRuntime {
             .map_err(song_search_failure)
     }
 
+    fn search_library_candidates(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> Result<Vec<SearchCandidate>> {
+        let providers = if source.trim().is_empty() {
+            Vec::new()
+        } else {
+            source
+                .split(',')
+                .map(str::trim)
+                .map(str::parse::<miliastra_playback::ProviderId>)
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let query = miliastra_playback::SearchQuery {
+            keyword: keyword.to_owned(),
+            providers,
+            limit: miliastra_playback::MAX_LIBRARY_SEARCH_RESULTS,
+        };
+        // 播放池保留完整 resolver locator，优先于仅有元数据的缓存记录。
+        let mut tracks = match self.business.business.playback_pool_snapshot() {
+            Ok(tracks) => tracks,
+            Err(error) => {
+                log::warn!("读取AI点歌曲库播放池失败: {error}");
+                Vec::new()
+            }
+        };
+        match self.playback.native_playback.search_library(query.clone()) {
+            Ok(candidates) => tracks.extend(
+                candidates
+                    .into_iter()
+                    .map(|candidate| candidate.playable_track()),
+            ),
+            Err(error) => log::warn!("读取AI点歌曲库缓存失败: {error}"),
+        }
+        Ok(miliastra_playback::search_library_tracks(&query, tracks))
+    }
+
     fn search_and_pick(
         &self,
         keyword: &str,

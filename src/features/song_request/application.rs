@@ -93,6 +93,8 @@ impl SongRequestDecision {
             "搜索到:",
             "AI匹配:",
             "AI匹配中",
+            "AI理解搜索词:",
+            "二次搜索失败，保留首次搜索结果",
             "AI点歌未启用",
             "AI点歌识别失败",
         ]
@@ -171,6 +173,13 @@ pub(crate) trait SongRequestPort {
         source: &str,
     ) -> std::result::Result<Option<Vec<SearchCandidate>>, SongSearchFailure>;
 
+    /// AI 点歌专用的本地曲库候选；普通点歌不调用此入口。
+    fn search_library_candidates(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> Result<Vec<SearchCandidate>>;
+
     fn search_and_pick(
         &self,
         keyword: &str,
@@ -192,6 +201,14 @@ pub(crate) trait SongRequestPort {
 
 pub(crate) trait SongRequestAiGateway: Send + Sync {
     fn enabled(&self) -> bool;
+    fn rewrite_song_search(
+        &self,
+        _request: &str,
+        _prefer_accompaniment: bool,
+        _candidates: &[SearchCandidate],
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn pick_song_candidate(
         &self,
         request: &str,
@@ -217,6 +234,14 @@ pub(crate) fn select_ai_candidate(
 }
 
 impl SongRequestAiGateway for AiClient {
+    fn rewrite_song_search(
+        &self,
+        request: &str,
+        prefer_accompaniment: bool,
+        candidates: &[SearchCandidate],
+    ) -> Result<Option<String>> {
+        AiClient::rewrite_song_search(self, request, prefer_accompaniment, candidates)
+    }
     fn enabled(&self) -> bool {
         AiClient::enabled(self)
     }
@@ -542,6 +567,29 @@ impl SongRequestExecution<'_> {
         self.resolve_ai_song_request(song, true)
     }
 
+    fn search_ai_candidates(
+        &self,
+        keyword: &str,
+        source: &str,
+    ) -> std::result::Result<Vec<SearchCandidate>, SongSearchFailure> {
+        let local = match self.port.search_library_candidates(keyword, source) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                log::warn!("AI点歌曲库检索失败，继续平台搜索: {error:#}");
+                Vec::new()
+            }
+        };
+        let online = match self.port.search_candidates(keyword, source) {
+            Ok(candidates) => candidates.unwrap_or_default(),
+            Err(error) if local.is_empty() => return Err(error),
+            Err(error) => {
+                log::warn!("AI点歌平台搜索失败，使用曲库候选: {error}");
+                Vec::new()
+            }
+        };
+        Ok(merge_ai_search_candidates(local, online))
+    }
+
     fn resolve_ai_song_request(
         &mut self,
         song: &SongCommand,
@@ -564,17 +612,72 @@ impl SongRequestExecution<'_> {
         self.reply(&format!("{}AI匹配中", label))?;
 
         let search_source = ai_candidate_source(song);
-        let mut candidates = match self.port.search_candidates(&song.keyword, search_source) {
-            Ok(Some(candidates)) => candidates,
-            Ok(None) => {
-                self.reply(&format!("{}平台无对应歌曲音源", label))?;
-                return Ok(None);
-            }
+        let mut candidates = match self.search_ai_candidates(&song.keyword, search_source) {
+            Ok(candidates) => candidates,
             Err(error) => {
                 self.report_player_search_failure(&label, "AI点歌搜索候选失败", &error)?;
                 return Ok(None);
             }
         };
+        let usable: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.eligibility,
+                    CandidateEligibility::Eligible | CandidateEligibility::Unknown
+                )
+            })
+            .cloned()
+            .collect();
+        // 版权或账号限制不是点歌语义错误，不能借改写绕过限制。
+        if candidates.is_empty() || !usable.is_empty() {
+            match self
+                .ai
+                .rewrite_song_search(&song.keyword, song.prefer_accompaniment, &usable)
+            {
+                Ok(Some(query)) => {
+                    if let Some(mut query) =
+                        super::ai::validated_search_rewrite(&song.keyword, &query)
+                    {
+                        let lower = query.to_lowercase();
+                        if song.prefer_accompaniment
+                            && ![
+                                "伴奏",
+                                "伴唱",
+                                "instrumental",
+                                "karaoke",
+                                "inst.",
+                                "ktv",
+                                "minus one",
+                            ]
+                            .iter()
+                            .any(|term| lower.contains(term))
+                        {
+                            query.push_str(" 伴奏");
+                        }
+                        if let Some(query) =
+                            super::ai::validated_search_rewrite(&song.keyword, &query)
+                        {
+                            self.reply(&format!("{}AI理解搜索词:{}，再次搜索", label, query))?;
+                            match self.search_ai_candidates(&query, search_source) {
+                                Ok(second) => {
+                                    candidates = merge_ai_search_rounds(candidates, second)
+                                }
+                                Err(error) => {
+                                    log::warn!("AI二次搜索失败，保留首次候选: {error}");
+                                    self.reply(&format!(
+                                        "{}二次搜索失败，保留首次搜索结果",
+                                        label
+                                    ))?;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => log::warn!("AI点歌语义分析失败，沿用首次搜索结果: {error:#}"),
+            }
+        }
         candidates.retain(|candidate| {
             matches!(
                 candidate.eligibility,
@@ -1139,6 +1242,71 @@ impl SongRequestExecution<'_> {
     }
 }
 
+/// 同一曲目以在线结果的当前可播性和元数据为准，不能用本地 Unknown 覆盖限制。
+fn merge_ai_search_candidates(
+    local: Vec<SearchCandidate>,
+    online: Vec<SearchCandidate>,
+) -> Vec<SearchCandidate> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for local_candidate in local {
+        let mut candidate = online
+            .iter()
+            .find(|candidate| candidate.track_ref.key == local_candidate.track_ref.key)
+            .cloned()
+            .unwrap_or(local_candidate);
+        if !candidate.text.contains("曲库]") {
+            candidate.text.push_str(" [曲库]");
+        }
+        if seen.insert(candidate.track_ref.key.clone()) {
+            merged.push(candidate);
+        }
+    }
+    for candidate in online {
+        if seen.insert(candidate.track_ref.key.clone()) {
+            merged.push(candidate);
+        }
+    }
+    merged
+}
+
+/// 二次结果优先进入模型可见窗口；任一轮明确不可播的曲目都不能复活。
+fn merge_ai_search_rounds(
+    first: Vec<SearchCandidate>,
+    second: Vec<SearchCandidate>,
+) -> Vec<SearchCandidate> {
+    let blocked: std::collections::HashSet<_> = first
+        .iter()
+        .chain(second.iter())
+        .filter(|item| {
+            !matches!(
+                item.eligibility,
+                CandidateEligibility::Eligible | CandidateEligibility::Unknown
+            )
+        })
+        .map(|item| item.track_ref.key.clone())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    second
+        .iter()
+        .chain(first.iter())
+        .filter(|item| {
+            !blocked.contains(&item.track_ref.key) && seen.insert(item.track_ref.key.clone())
+        })
+        .map(|item| {
+            if item.eligibility == CandidateEligibility::Unknown {
+                if let Some(previous) = first.iter().find(|previous| {
+                    previous.track_ref.key == item.track_ref.key
+                        && previous.eligibility == CandidateEligibility::Eligible
+                }) {
+                    return previous.clone();
+                }
+            }
+            item.clone()
+        })
+        .collect()
+}
+
 fn ai_candidate_source(song: &SongCommand) -> &'static str {
     if song.friend_username.trim().is_empty() {
         // 大厅 AI 点歌仅使用 QQ、网易、酷狗三源；B站 仅好友点歌。
@@ -1214,6 +1382,49 @@ mod tests {
             20,
             true,
         )
+    }
+
+    struct RewritingAiGateway {
+        query: String,
+        fail: bool,
+        calls: Mutex<Vec<(String, bool)>>,
+        picks: RecordingAiGateway,
+    }
+    impl SongRequestAiGateway for RewritingAiGateway {
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn rewrite_song_search(
+            &self,
+            request: &str,
+            prefer: bool,
+            _candidates: &[SearchCandidate],
+        ) -> Result<Option<String>> {
+            self.calls.lock().unwrap().push((request.into(), prefer));
+            if self.fail {
+                return Err(anyhow!("mock semantic failure"));
+            }
+            Ok((!self.query.is_empty()).then(|| self.query.clone()))
+        }
+        fn pick_song_candidate(
+            &self,
+            request: &str,
+            prefer: bool,
+            candidates: &[SearchCandidate],
+        ) -> Result<AiCandidatePickResult> {
+            self.picks.pick_song_candidate(request, prefer, candidates)
+        }
+    }
+    fn rewriting_ai(query: &str, fail: bool) -> Arc<RewritingAiGateway> {
+        Arc::new(RewritingAiGateway {
+            query: query.into(),
+            fail,
+            calls: Mutex::new(Vec::new()),
+            picks: RecordingAiGateway::default(),
+        })
+    }
+    fn retry_application(ai: Arc<RewritingAiGateway>) -> SongRequestApplication {
+        SongRequestApplication::with_gateways(ai, Arc::new(DisabledReviewGateway), 20, true)
     }
 
     struct DisabledAiGateway;
@@ -1379,6 +1590,11 @@ mod tests {
         decisions: VecDeque<SongRequestDecision>,
         searches: RefCell<VecDeque<Option<PickedCandidate>>>,
         search_sources: RefCell<Vec<String>>,
+        library_candidates: RefCell<Vec<SearchCandidate>>,
+        library_searches: RefCell<Vec<(String, String)>>,
+        library_error: Cell<bool>,
+        online_error: Cell<bool>,
+        fail_search_call: Cell<usize>,
         queue: RefCell<Vec<QueueItem>>,
         status: FakeStatus,
         should_queue: bool,
@@ -1400,6 +1616,11 @@ mod tests {
                 decisions: VecDeque::from([SongRequestDecision::Confirm]),
                 searches: RefCell::new(searches.into_iter().collect()),
                 search_sources: RefCell::new(Vec::new()),
+                library_candidates: RefCell::new(Vec::new()),
+                library_searches: RefCell::new(Vec::new()),
+                library_error: Cell::new(false),
+                online_error: Cell::new(false),
+                fail_search_call: Cell::new(0),
                 queue: RefCell::new(Vec::new()),
                 status: FakeStatus::Available(Box::new(stopped_status())),
                 should_queue: false,
@@ -1465,12 +1686,33 @@ mod tests {
             source: &str,
         ) -> std::result::Result<Option<Vec<SearchCandidate>>, SongSearchFailure> {
             self.search_sources.borrow_mut().push(source.to_string());
+            if self.online_error.get()
+                || self.search_sources.borrow().len() == self.fail_search_call.get()
+            {
+                return Err(SongSearchFailure::Backend(
+                    "test platform unavailable".into(),
+                ));
+            }
             Ok(self
                 .searches
                 .borrow_mut()
                 .pop_front()
                 .flatten()
                 .map(|picked| picked.candidate_snapshot))
+        }
+
+        fn search_library_candidates(
+            &self,
+            keyword: &str,
+            source: &str,
+        ) -> Result<Vec<SearchCandidate>> {
+            self.library_searches
+                .borrow_mut()
+                .push((keyword.into(), source.into()));
+            if self.library_error.get() {
+                return Err(anyhow!("test library unavailable"));
+            }
+            Ok(self.library_candidates.borrow().clone())
         }
 
         fn search_and_pick(
@@ -1795,6 +2037,515 @@ mod tests {
         assert!(port.played.borrow().is_empty());
         assert!(port.queue.borrow().is_empty());
         assert_eq!(port.decision_options.borrow().len(), 3);
+    }
+
+    #[test]
+    fn semantic_retry_searches_twice_with_original_source_and_request() {
+        let ai = rewriting_ai("晴天 周杰伦", false);
+        let app = retry_application(ai.clone());
+        let found = local_candidate("found");
+        let mut port = FakePort::idle([
+            None,
+            Some(PickedCandidate::with_snapshot(
+                found.clone(),
+                vec![found.clone()],
+                "",
+            )),
+        ]);
+        let song = SongCommand {
+            keyword: "周董的晴天".into(),
+            ai_assisted: true,
+            ..command()
+        };
+        app.execute(&context(), &song, &mut port).unwrap();
+        assert_eq!(
+            ai.calls.lock().unwrap().as_slice(),
+            [(song.keyword.clone(), false)]
+        );
+        assert_eq!(
+            port.library_searches.borrow().as_slice(),
+            [
+                (song.keyword.clone(), ai_candidate_source(&song).into()),
+                ("晴天 周杰伦".into(), ai_candidate_source(&song).into())
+            ]
+        );
+        assert_eq!(port.search_sources.borrow().len(), 2);
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key,
+            found.track_ref.key
+        );
+        assert!(
+            port.decision_prompts
+                .borrow()
+                .iter()
+                .any(|text| text.contains("AI匹配"))
+        );
+    }
+
+    #[test]
+    fn semantic_retry_preserves_first_candidates_on_empty_or_failed_second_search() {
+        for fail in [false, true] {
+            let ai = rewriting_ai("晴天 周杰伦", false);
+            let app = retry_application(ai.clone());
+            let first = local_candidate("first");
+            let mut port = FakePort::idle([
+                Some(PickedCandidate::with_snapshot(
+                    first.clone(),
+                    vec![first.clone()],
+                    "",
+                )),
+                None,
+            ]);
+            if fail {
+                port.fail_search_call.set(2);
+            }
+            app.execute(
+                &context(),
+                &SongCommand {
+                    keyword: "周董晴天".into(),
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+            assert_eq!(port.search_sources.borrow().len(), 2);
+            assert_eq!(ai.calls.lock().unwrap().len(), 1);
+            assert_eq!(
+                port.played.borrow()[0]
+                    .track
+                    .as_ref()
+                    .unwrap()
+                    .track_ref
+                    .key,
+                first.track_ref.key
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_retry_skips_duplicate_invalid_or_failed_rewrites() {
+        for (query, fail) in [
+            ("晴天", false),
+            ("", false),
+            ("@点歌 晴天", false),
+            ("晴天 周杰伦", true),
+        ] {
+            let ai = rewriting_ai(query, fail);
+            let app = retry_application(ai.clone());
+            let first = local_candidate("first");
+            let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+                first.clone(),
+                vec![first],
+                "",
+            ))]);
+            app.execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+            assert_eq!(port.search_sources.borrow().len(), 1);
+            assert_eq!(port.played.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn semantic_retry_empty_results_are_bounded_and_skip_does_not_play() {
+        for empty in [false, true] {
+            let ai = rewriting_ai("晴天 周杰伦", false);
+            let app = retry_application(ai.clone());
+            let found = local_candidate("found");
+            let result =
+                (!empty).then(|| PickedCandidate::with_snapshot(found.clone(), vec![found], ""));
+            let mut port = FakePort::idle([None, result]);
+            port.decisions = VecDeque::from([SongRequestDecision::Skip]);
+            app.execute(
+                &context(),
+                &SongCommand {
+                    keyword: "周董晴天".into(),
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+            assert_eq!(port.search_sources.borrow().len(), 2);
+            assert_eq!(ai.calls.lock().unwrap().len(), 1);
+            assert!(port.played.borrow().is_empty());
+            assert!(port.preloaded.borrow().is_empty());
+            assert!(port.queue.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn semantic_retry_preserves_accompaniment_and_does_not_run_for_ordinary_requests() {
+        let ai = rewriting_ai("晴天 周杰伦", false);
+        let app = retry_application(ai.clone());
+        let mut port = FakePort::idle([None, None]);
+        app.execute(
+            &context(),
+            &SongCommand {
+                keyword: "周董晴天".into(),
+                ai_assisted: true,
+                prefer_accompaniment: true,
+                ..command()
+            },
+            &mut port,
+        )
+        .unwrap();
+        assert_eq!(port.library_searches.borrow()[1].0, "晴天 周杰伦 伴奏");
+        let ordinary_ai = rewriting_ai("别的查询", false);
+        let found = local_candidate("found");
+        let mut ordinary = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            found.clone(),
+            vec![found],
+            "",
+        ))]);
+        retry_application(ordinary_ai.clone())
+            .execute(&context(), &command(), &mut ordinary)
+            .unwrap();
+        assert!(ordinary_ai.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn semantic_retry_merge_cannot_resurrect_restricted_tracks() {
+        assert!(SongRequestDecision::is_feedback_text(
+            "AI理解搜索词:晴天 周杰伦，再次搜索"
+        ));
+        assert!(SongRequestDecision::is_feedback_text(
+            "二次搜索失败，保留首次搜索结果"
+        ));
+        let mut blocked = local_candidate("blocked");
+        blocked.eligibility = CandidateEligibility::VipRequired;
+        let first = local_candidate("first");
+        let second = local_candidate("second");
+        let merged = merge_ai_search_rounds(
+            vec![blocked, first.clone()],
+            vec![local_candidate("blocked"), second.clone(), first],
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .map(|item| item.track_ref.key.id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+        let ai = rewriting_ai("晴天 周杰伦", false);
+        let mut blocked = local_candidate("only");
+        blocked.eligibility = CandidateEligibility::NoCopyright;
+        let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            blocked.clone(),
+            vec![blocked],
+            "",
+        ))]);
+        retry_application(ai.clone())
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(ai.calls.lock().unwrap().is_empty());
+        assert!(port.played.borrow().is_empty());
+    }
+
+    fn local_candidate(id: &str) -> SearchCandidate {
+        let mut candidate = test_candidate(id, &format!("miliastra://track/qqmusic/{id}"));
+        candidate.eligibility = CandidateEligibility::Unknown;
+        candidate
+    }
+
+    #[test]
+    fn ai_library_candidates_are_reviewed_and_selected_when_platform_has_no_match() {
+        let ai = Arc::new(RecordingAiGateway::default());
+        let review = Arc::new(AllowingReviewGateway {
+            candidates: Mutex::new(Vec::new()),
+        });
+        let application =
+            SongRequestApplication::with_gateways(ai.clone(), review.clone(), 20, true);
+        let local = local_candidate("local");
+        let mut port = FakePort::idle([None]);
+        port.library_candidates.borrow_mut().push(local.clone());
+        let song = SongCommand {
+            ai_assisted: true,
+            ..command()
+        };
+        application.execute(&context(), &song, &mut port).unwrap();
+        assert_eq!(
+            port.library_searches.borrow().as_slice(),
+            [("晴天".into(), ai_candidate_source(&song).into())]
+        );
+        assert_eq!(ai.candidates.lock().unwrap()[0].len(), 1);
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key,
+            local.track_ref.key
+        );
+        assert_eq!(review.candidates.lock().unwrap().len(), 1);
+        assert!(
+            port.decision_prompts
+                .borrow()
+                .iter()
+                .any(|prompt| prompt.contains("曲库"))
+        );
+    }
+
+    #[test]
+    fn ai_library_candidates_survive_platform_failure_but_normal_requests_do_not_use_library() {
+        let ai = Arc::new(RecordingAiGateway::default());
+        let application = SongRequestApplication::with_gateways(
+            ai.clone(),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        let local = local_candidate("local");
+        let mut port = FakePort::idle([None]);
+        port.library_candidates.borrow_mut().push(local.clone());
+        port.online_error.set(true);
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(port.played.borrow().len(), 1);
+        let online = local_candidate("online");
+        let mut normal = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            online.clone(),
+            vec![online.clone()],
+            "",
+        ))]);
+        normal.library_candidates.borrow_mut().push(local);
+        application
+            .execute(&context(), &command(), &mut normal)
+            .unwrap();
+        assert!(normal.library_searches.borrow().is_empty());
+        assert_eq!(
+            normal.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key,
+            online.track_ref.key
+        );
+    }
+
+    #[test]
+    fn ai_library_failure_does_not_prevent_online_selection() {
+        let ai = Arc::new(RecordingAiGateway::default());
+        let application = SongRequestApplication::with_gateways(
+            ai.clone(),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        let online = local_candidate("online");
+        let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            online.clone(),
+            vec![online.clone()],
+            "",
+        ))]);
+        port.library_error.set(true);
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key,
+            online.track_ref.key
+        );
+    }
+
+    #[test]
+    fn ai_library_unknown_never_overrides_online_ineligibility() {
+        for eligibility in [
+            CandidateEligibility::VipRequired,
+            CandidateEligibility::PaidRequired,
+            CandidateEligibility::NoCopyright,
+            CandidateEligibility::Ineligible,
+        ] {
+            let ai = Arc::new(RecordingAiGateway::default());
+            let application = SongRequestApplication::with_gateways(
+                ai.clone(),
+                Arc::new(DisabledReviewGateway),
+                20,
+                true,
+            );
+            let local = local_candidate("same");
+            let mut online = local.clone();
+            online.eligibility = eligibility;
+            let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+                online.clone(),
+                vec![online],
+                "",
+            ))]);
+            port.library_candidates.borrow_mut().push(local);
+            application
+                .execute(
+                    &context(),
+                    &SongCommand {
+                        ai_assisted: true,
+                        ..command()
+                    },
+                    &mut port,
+                )
+                .unwrap();
+            assert!(ai.candidates.lock().unwrap().is_empty());
+            assert!(port.played.borrow().is_empty());
+            assert!(port.queue.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn ai_library_merge_preserves_online_metadata_and_unique_candidate_numbers() {
+        let local = local_candidate("same");
+        let mut fresh = local.clone();
+        fresh.metadata.title = "新元数据".into();
+        fresh.eligibility = CandidateEligibility::Eligible;
+        let other = local_candidate("other");
+        let merged = merge_ai_search_candidates(
+            vec![local.clone(), local],
+            vec![fresh.clone(), other.clone(), other],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].metadata, fresh.metadata);
+        assert_eq!(merged[0].eligibility, CandidateEligibility::Eligible);
+        assert!(merged[0].text.contains("曲库"));
+    }
+
+    #[test]
+    fn ai_library_and_online_manual_selection_use_the_same_candidate_snapshot() {
+        let ai = Arc::new(RecordingAiGateway::default());
+        let application = SongRequestApplication::with_gateways(
+            ai.clone(),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        let online = local_candidate("online");
+        let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            online.clone(),
+            vec![online.clone()],
+            "",
+        ))]);
+        port.library_candidates
+            .borrow_mut()
+            .push(local_candidate("local"));
+        port.decisions = VecDeque::from([
+            SongRequestDecision::Select,
+            SongRequestDecision::SelectIndex(2),
+        ]);
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        let candidates = ai.candidates.lock().unwrap();
+        assert_eq!(candidates[0].len(), 2);
+        assert_eq!(port.played.borrow()[0].candidate_snapshot, candidates[0]);
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key,
+            online.track_ref.key
+        );
+    }
+
+    #[test]
+    fn ai_library_skip_does_not_play_preload_or_queue() {
+        let ai = Arc::new(RecordingAiGateway::default());
+        let application =
+            SongRequestApplication::with_gateways(ai, Arc::new(DisabledReviewGateway), 20, true);
+        let mut port = FakePort::idle([None]);
+        port.library_candidates
+            .borrow_mut()
+            .push(local_candidate("local"));
+        port.decisions = VecDeque::from([SongRequestDecision::Skip]);
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(port.played.borrow().is_empty());
+        assert!(port.preloaded.borrow().is_empty());
+        assert!(port.queue.borrow().is_empty());
+    }
+
+    #[test]
+    fn ai_library_no_match_and_platform_failure_keep_existing_error_behavior() {
+        let ai = Arc::new(RecordingAiGateway::default());
+        let application = SongRequestApplication::with_gateways(
+            ai.clone(),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        let mut port = FakePort::idle([None]);
+        port.online_error.set(true);
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(ai.candidates.lock().unwrap().is_empty());
+        assert!(port.played.borrow().is_empty());
+        assert!(
+            port.replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.contains("歌曲搜索后端失败"))
+        );
     }
 
     #[test]

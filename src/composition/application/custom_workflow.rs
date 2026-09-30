@@ -457,7 +457,7 @@ impl InviteExecutionPort for ApplicationRuntime {
             .map_err(|error| anyhow!("邀请未进入 UI runtime: {error}"))?
             .wait()
             .map_err(|error| anyhow!("等待邀请 UI 结果失败: {error}"))?;
-        let notification_warning = match outcome.notification() {
+        let mut notification_warning = match outcome.notification() {
             InviteNotificationOutcome::Failed(failure) => {
                 Some(format!("{}: {}", failure.stage(), failure.reason()))
             }
@@ -471,9 +471,14 @@ impl InviteExecutionPort for ApplicationRuntime {
             InviteEffect::Entered => {
                 self.on_entered_new_hall()?;
                 if residency_failure.is_none() {
-                    if let Err(error) = self.reply("BOT已经就绪,可以使用@麦克风指令了")
+                    if let Err(error) = self.reply_invite_ready("BOT已经就绪,可以使用@麦克风指令了")
                     {
                         log::error!("邀请就绪消息发送失败: {error:#}");
+                        let warning = format!("邀请已进入，但就绪消息未确认发送: {error:#}");
+                        notification_warning = Some(match notification_warning.take() {
+                            Some(previous) => format!("{previous}; {warning}"),
+                            None => warning,
+                        });
                     }
                 } else {
                     log::error!("邀请已经进入目标大厅，但未能确认最终监听驻留界面");

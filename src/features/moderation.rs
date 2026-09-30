@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -9,6 +10,7 @@ use crate::config::{PointConfig, RectConfig, validate_rect};
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
+use crate::features::identity::IdentityRole;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,8 +219,16 @@ pub trait ModerationExecutionPort {
 }
 
 pub(crate) trait ModerationWorkflowLedger: Send + Sync {
-    fn acquire(&self, key: ModerationWorkflowKey) -> Result<bool>;
-    fn release(&self, key: ModerationWorkflowKey) -> Result<bool>;
+    fn acquire(
+        &self,
+        key: ModerationWorkflowKey,
+        direct: bool,
+    ) -> Result<Option<Arc<ModerationWorkflowToken>>>;
+    fn release(
+        &self,
+        key: ModerationWorkflowKey,
+        token: Arc<ModerationWorkflowToken>,
+    ) -> Result<bool>;
     #[cfg(test)]
     fn contains(&self, key: ModerationWorkflowKey) -> Result<bool>;
 }
@@ -232,6 +242,7 @@ pub struct ModerationService {
 pub enum ModerationStart {
     Duplicate,
     Started(ModerationVoteWork),
+    Ready(ModerationResultTask),
 }
 
 pub struct ModerationVoteWork {
@@ -244,7 +255,10 @@ pub struct ModerationResultTask {
     command: ModerationCommand,
     approved: bool,
     lease: ModerationWorkflowLease,
-    hold: ModerationHoldLease,
+    // 直接执行不创建投票驻留；UI 事务仍负责定位、确认及恢复。
+    hold: Option<ModerationHoldLease>,
+    // 组合层从路由发送者绑定，正式任务执行前再次检查实时身份。
+    direct_sender: Option<String>,
 }
 
 pub enum ModerationResultExecution {
@@ -254,7 +268,81 @@ pub enum ModerationResultExecution {
 struct ModerationWorkflowLease {
     ledger: Arc<dyn ModerationWorkflowLedger>,
     key: ModerationWorkflowKey,
+    token: Arc<ModerationWorkflowToken>,
     active: bool,
+}
+
+const WORKFLOW_PENDING: u8 = 0;
+const WORKFLOW_EXECUTING: u8 = 1;
+const WORKFLOW_RETIRED: u8 = 2;
+
+/// 令牌身份区分同一 UID 的历次流程；CAS 将投票接管和开始执行串行化。
+#[derive(Debug)]
+pub(crate) struct ModerationWorkflowToken {
+    id: uuid::Uuid,
+    phase: AtomicU8,
+}
+
+#[derive(Default)]
+pub(crate) struct ModerationWorkflowRegistry {
+    active: HashMap<ModerationWorkflowKey, Arc<ModerationWorkflowToken>>,
+}
+
+impl ModerationWorkflowRegistry {
+    pub(crate) fn acquire(
+        &mut self,
+        key: ModerationWorkflowKey,
+        direct: bool,
+    ) -> Option<Arc<ModerationWorkflowToken>> {
+        if let Some(previous) = self.active.get(&key) {
+            // 仅管理员直接请求可接管待决工作；开始执行后永不接管，避免重复 UI。
+            if !direct
+                || previous
+                    .phase
+                    .compare_exchange(
+                        WORKFLOW_PENDING,
+                        WORKFLOW_RETIRED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+            {
+                return None;
+            }
+        }
+        let token = Arc::new(ModerationWorkflowToken {
+            id: uuid::Uuid::new_v4(),
+            phase: AtomicU8::new(if direct {
+                WORKFLOW_EXECUTING
+            } else {
+                WORKFLOW_PENDING
+            }),
+        });
+        self.active.insert(key, token.clone());
+        Some(token)
+    }
+
+    pub(crate) fn release(
+        &mut self,
+        key: &ModerationWorkflowKey,
+        token: &Arc<ModerationWorkflowToken>,
+    ) -> bool {
+        if !self
+            .active
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            return false;
+        }
+        token.phase.store(WORKFLOW_RETIRED, Ordering::Release);
+        self.active.remove(key);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, key: &ModerationWorkflowKey) -> bool {
+        self.active.contains_key(key)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -276,9 +364,17 @@ impl ModerationService {
     pub fn start(
         &self,
         command: &ModerationCommand,
+        requester_role: Option<IdentityRole>,
         port: &mut dyn ModerationCommandPort,
     ) -> Result<ModerationStart> {
-        let Some(lease) = self.try_acquire(command)? else {
+        // 即使绕过聊天解析构造命令，也不能把非法 UID 送入 UI。
+        if command.uid.len() != 9 || !command.uid.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("管理命令 UID 必须为 9 位 ASCII 数字");
+        }
+        if let Some(direct) = self.reserve_direct_blacklist(command, requester_role)? {
+            return Ok(direct);
+        }
+        let Some(lease) = self.try_acquire(command, false)? else {
             log::info!(
                 "{} UID{} 已有投票或执行流程，跳过重复请求",
                 command.action.label(),
@@ -307,13 +403,42 @@ impl ModerationService {
         }))
     }
 
+    /// 只预占/接管租约，不发送消息、不操作 UI，供可信管理员在正式任务入队前使用。
+    pub(crate) fn reserve_direct_blacklist(
+        &self,
+        command: &ModerationCommand,
+        requester_role: Option<IdentityRole>,
+    ) -> Result<Option<ModerationStart>> {
+        if command.action != ModerationAction::Blacklist
+            || !matches!(
+                requester_role,
+                Some(IdentityRole::Admin | IdentityRole::Owner)
+            )
+        {
+            return Ok(None);
+        }
+        if command.uid.len() != 9 || !command.uid.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("管理命令 UID 必须为 9 位 ASCII 数字");
+        }
+        let Some(lease) = self.try_acquire(command, true)? else {
+            return Ok(Some(ModerationStart::Duplicate));
+        };
+        Ok(Some(ModerationStart::Ready(ModerationResultTask {
+            command: command.clone(),
+            approved: true,
+            lease,
+            hold: None,
+            direct_sender: None,
+        })))
+    }
+
     pub fn run_vote(
         &self,
         mut work: ModerationVoteWork,
         vote_port: &mut dyn ModerationVotePort,
         task_port: &dyn ModerationTaskPort,
     ) -> Result<()> {
-        let approved = match self.wait_for_votes(&work.command, vote_port) {
+        let approved = match self.wait_for_votes(&work.command, &work.lease, vote_port) {
             Ok(approved) => approved,
             Err(error) => {
                 log::error!("{}后台投票失败: {error:#}", work.command.action.label());
@@ -321,7 +446,7 @@ impl ModerationService {
             }
         };
         vote_port.finish();
-        if !vote_port.is_running() {
+        if !vote_port.is_running() || !work.lease.is_current() {
             work.cancel();
             task_port.sync_listener_state();
             return Ok(());
@@ -334,7 +459,7 @@ impl ModerationService {
         mut work: ModerationVoteWork,
         task_port: &dyn ModerationTaskPort,
     ) -> Result<()> {
-        if !task_port.is_running() {
+        if !task_port.is_running() || !work.lease.is_current() {
             work.cancel();
             task_port.sync_listener_state();
             return Ok(());
@@ -347,6 +472,13 @@ impl ModerationService {
         mut task: ModerationResultTask,
         port: &mut dyn ModerationExecutionPort,
     ) -> Result<ModerationResultExecution> {
+        // 管理员接管与普通结果开始执行通过同一 token CAS 竞争；失效结果只能清理自身。
+        if !task.lease.begin_result(task.hold.is_none()) {
+            task.release_hold();
+            port.sync_listener_state();
+            task.release_lease();
+            return Ok(ModerationResultExecution::Completed);
+        }
         if !task.approved {
             task.release_hold();
             port.sync_listener_state();
@@ -360,15 +492,29 @@ impl ModerationService {
             return Ok(ModerationResultExecution::Completed);
         }
 
-        if let Err(error) = port.send_hall(&format!(
-            "@UID{}的{}请求已通过,开始执行",
-            task.command.uid,
-            task.command.action.label()
-        )) {
-            task.release_hold();
-            port.sync_listener_state();
-            task.release_lease();
-            return Err(error);
+        let direct = task.hold.is_none();
+        let message = if direct {
+            format!(
+                "管理员直接执行对@UID{}的{}",
+                task.command.uid,
+                task.command.action.label()
+            )
+        } else {
+            format!(
+                "@UID{}的{}请求已通过,开始执行",
+                task.command.uid,
+                task.command.action.label()
+            )
+        };
+        if let Err(error) = port.send_hall(&message) {
+            if !direct {
+                task.release_hold();
+                port.sync_listener_state();
+                task.release_lease();
+                return Err(error);
+            }
+            // 通知不是管理员直接拉黑的审批条件，发送失败也只执行一次 UI 动作。
+            log::error!("管理员直接拉黑开始通告发送失败: {error:#}");
         }
 
         let result = port.execute_action(&task.command);
@@ -411,13 +557,17 @@ impl ModerationService {
     fn wait_for_votes(
         &self,
         command: &ModerationCommand,
+        lease: &ModerationWorkflowLease,
         port: &mut dyn ModerationVotePort,
     ) -> Result<bool> {
         let deadline = port.now() + self.policy.vote_timeout;
         let mut stable_votes: HashMap<String, bool> = HashMap::new();
         let mut samples: HashMap<(String, bool), u32> = HashMap::new();
-        while port.is_running() && port.now() < deadline {
+        while port.is_running() && lease.is_current() && port.now() < deadline {
             port.wait(self.policy.vote_poll_interval);
+            if !lease.is_current() {
+                return Ok(false);
+            }
             match port.poll_visible_friend_messages() {
                 Ok(messages) => {
                     for message in messages {
@@ -454,7 +604,7 @@ impl ModerationService {
                 return Ok(true);
             }
         }
-        if !port.is_running() {
+        if !port.is_running() || !lease.is_current() {
             return Ok(false);
         }
         let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
@@ -489,14 +639,19 @@ impl ModerationService {
         Ok(())
     }
 
-    fn try_acquire(&self, command: &ModerationCommand) -> Result<Option<ModerationWorkflowLease>> {
+    fn try_acquire(
+        &self,
+        command: &ModerationCommand,
+        direct: bool,
+    ) -> Result<Option<ModerationWorkflowLease>> {
         let key = workflow_key(command);
-        if !self.ledger.acquire(key.clone())? {
+        let Some(token) = self.ledger.acquire(key.clone(), direct)? else {
             return Ok(None);
-        }
+        };
         Ok(Some(ModerationWorkflowLease {
             ledger: self.ledger.clone(),
             key,
+            token,
             active: true,
         }))
     }
@@ -517,7 +672,8 @@ impl ModerationVoteWork {
             command: self.command,
             approved,
             lease: self.lease,
-            hold: self.hold,
+            hold: Some(self.hold),
+            direct_sender: None,
         }
     }
 
@@ -528,7 +684,26 @@ impl ModerationVoteWork {
 }
 
 impl ModerationResultTask {
+    pub(crate) fn is_direct(&self) -> bool {
+        self.hold.is_none()
+    }
+
+    pub(crate) fn bind_direct_sender(&mut self, sender: &str) {
+        self.direct_sender = Some(sender.to_string());
+    }
+
+    pub(crate) fn direct_sender(&self) -> Option<&str> {
+        self.direct_sender.as_deref()
+    }
+
     pub fn label(&self) -> String {
+        if self.hold.is_none() {
+            return format!(
+                "{} UID{} 管理员直接执行",
+                self.command.action.label(),
+                self.command.uid
+            );
+        }
         format!(
             "{} UID{} 投票{}",
             self.command.action.label(),
@@ -538,7 +713,12 @@ impl ModerationResultTask {
     }
 
     pub fn dedup_key(&self) -> String {
-        self.command.lock_key()
+        // 结果与命令分开，旧代次结果也不能在队列层吞掉管理员接管任务。
+        format!(
+            "moderation-result:{}:{}",
+            self.command.lock_key(),
+            self.lease.token.id
+        )
     }
 
     pub fn cancel(&mut self) {
@@ -547,7 +727,9 @@ impl ModerationResultTask {
     }
 
     fn release_hold(&mut self) {
-        self.hold.release();
+        if let Some(hold) = &mut self.hold {
+            hold.release();
+        }
     }
 
     fn release_lease(&mut self) {
@@ -556,12 +738,34 @@ impl ModerationResultTask {
 }
 
 impl ModerationWorkflowLease {
+    fn is_current(&self) -> bool {
+        self.active && self.token.phase.load(Ordering::Acquire) != WORKFLOW_RETIRED
+    }
+
+    fn begin_result(&self, direct: bool) -> bool {
+        if !self.active {
+            return false;
+        }
+        if direct {
+            return self.token.phase.load(Ordering::Acquire) == WORKFLOW_EXECUTING;
+        }
+        self.token
+            .phase
+            .compare_exchange(
+                WORKFLOW_PENDING,
+                WORKFLOW_EXECUTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     fn release(&mut self) {
         if !self.active {
             return;
         }
         self.active = false;
-        if let Err(error) = self.ledger.release(self.key.clone()) {
+        if let Err(error) = self.ledger.release(self.key.clone(), self.token.clone()) {
             log::error!(
                 "无法释放管理工作流 {}:{}: {error:#}",
                 self.key.action.label(),
@@ -660,7 +864,7 @@ fn strip_ascii_case_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -669,16 +873,24 @@ mod tests {
 
     #[derive(Default)]
     struct TestLedger {
-        active: Mutex<HashSet<ModerationWorkflowKey>>,
+        active: Mutex<ModerationWorkflowRegistry>,
     }
 
     impl ModerationWorkflowLedger for TestLedger {
-        fn acquire(&self, key: ModerationWorkflowKey) -> Result<bool> {
-            Ok(self.active.lock().unwrap().insert(key))
+        fn acquire(
+            &self,
+            key: ModerationWorkflowKey,
+            direct: bool,
+        ) -> Result<Option<Arc<ModerationWorkflowToken>>> {
+            Ok(self.active.lock().unwrap().acquire(key, direct))
         }
 
-        fn release(&self, key: ModerationWorkflowKey) -> Result<bool> {
-            Ok(self.active.lock().unwrap().remove(&key))
+        fn release(
+            &self,
+            key: ModerationWorkflowKey,
+            token: Arc<ModerationWorkflowToken>,
+        ) -> Result<bool> {
+            Ok(self.active.lock().unwrap().release(&key, &token))
         }
 
         fn contains(&self, key: ModerationWorkflowKey) -> Result<bool> {
@@ -813,6 +1025,8 @@ mod tests {
 
     struct FakeExecutionPort {
         action_result: Result<bool>,
+        on_action: Option<Box<dyn FnMut()>>,
+        fail_notification: bool,
         hold_active: Arc<AtomicBool>,
         events: Vec<String>,
     }
@@ -821,6 +1035,8 @@ mod tests {
         fn ready(hold_active: Arc<AtomicBool>, action_result: Result<bool>) -> Self {
             Self {
                 action_result,
+                on_action: None,
+                fail_notification: false,
                 hold_active,
                 events: Vec::new(),
             }
@@ -834,10 +1050,16 @@ mod tests {
                 message,
                 self.hold_active.load(Ordering::SeqCst)
             ));
+            if self.fail_notification {
+                return Err(anyhow!("notification failed"));
+            }
             Ok(())
         }
 
         fn execute_action(&mut self, _command: &ModerationCommand) -> Result<bool> {
+            if let Some(on_action) = &mut self.on_action {
+                on_action();
+            }
             self.events.push(format!(
                 "action:{}",
                 self.hold_active.load(Ordering::SeqCst)
@@ -879,10 +1101,374 @@ mod tests {
     }
 
     fn start(service: &ModerationService, port: &mut FakeCommandPort) -> ModerationVoteWork {
-        let ModerationStart::Started(work) = service.start(&command(), port).unwrap() else {
+        let ModerationStart::Started(work) = service.start(&command(), None, port).unwrap() else {
             panic!("moderation vote should start");
         };
         work
+    }
+
+    #[test]
+    fn admin_and_owner_blacklist_bypass_vote_without_a_hold() {
+        for role in [IdentityRole::Admin, IdentityRole::Owner] {
+            let service = service(99, 99);
+            let mut port = FakeCommandPort::new();
+            let request = command();
+            let ModerationStart::Ready(task) =
+                service.start(&request, Some(role), &mut port).unwrap()
+            else {
+                panic!("administrator blacklist must execute without a vote");
+            };
+            assert!(port.messages.is_empty());
+            assert!(!port.hold_active.load(Ordering::SeqCst));
+            assert_eq!(task.command.uid, request.uid);
+            assert_ne!(task.dedup_key(), request.lock_key());
+            assert!(task.dedup_key().starts_with("moderation-result:"));
+            assert!(task.label().contains("管理员直接执行"));
+            let mut execution = FakeExecutionPort::ready(port.hold_active.clone(), Ok(true));
+            service.execute_result(task, &mut execution).unwrap();
+            assert_eq!(
+                execution.events,
+                [
+                    "send:管理员直接执行对@UID123456789的拉黑:false",
+                    "action:false",
+                    "sync:false",
+                    "wait",
+                    "send:已对@UID123456789执行拉黑:false",
+                ]
+            );
+            assert!(!service.is_active(&request).unwrap());
+        }
+    }
+
+    #[test]
+    fn friends_and_unmapped_senders_keep_blacklist_vote_flow() {
+        for role in [None, Some(IdentityRole::Friend)] {
+            let service = service(1, 99);
+            let mut port = FakeCommandPort::new();
+            let mut request = command();
+            request.requester = "管理员".to_string();
+            let ModerationStart::Started(work) = service.start(&request, role, &mut port).unwrap()
+            else {
+                panic!("requester display text must not grant administrator privileges");
+            };
+            assert!(port.hold_active.load(Ordering::SeqCst));
+            assert!(port.messages[0].contains("@同意/不同意"));
+            let mut votes = FakeVotePort::new([vec!["[甲]：@不同意".to_string()]]);
+            let tasks = FakeTaskPort::new();
+            service.run_vote(work, &mut votes, &tasks).unwrap();
+            let task = tasks.take();
+            assert!(!task.approved);
+            let mut execution = FakeExecutionPort::ready(port.hold_active.clone(), Ok(true));
+            service.execute_result(task, &mut execution).unwrap();
+            assert!(
+                !execution
+                    .events
+                    .iter()
+                    .any(|event| event.starts_with("action:"))
+            );
+        }
+    }
+
+    #[test]
+    fn block_chat_keeps_vote_flow_for_every_role() {
+        for role in [
+            None,
+            Some(IdentityRole::Friend),
+            Some(IdentityRole::Admin),
+            Some(IdentityRole::Owner),
+        ] {
+            let service = service(1, 1);
+            let mut port = FakeCommandPort::new();
+            let mut request = command();
+            request.action = ModerationAction::BlockChat;
+            let ModerationStart::Started(work) = service.start(&request, role, &mut port).unwrap()
+            else {
+                panic!("block chat must retain the original vote flow");
+            };
+            assert!(port.hold_active.load(Ordering::SeqCst));
+            let mut votes = FakeVotePort::new([vec!["[甲]：@同意".to_string()]]);
+            let tasks = FakeTaskPort::new();
+            service.run_vote(work, &mut votes, &tasks).unwrap();
+            let task = tasks.take();
+            assert!(task.approved);
+            assert_eq!(task.command.action, ModerationAction::BlockChat);
+        }
+    }
+
+    #[test]
+    fn direct_blacklist_still_validates_uid_before_any_effects() {
+        for role in [
+            None,
+            Some(IdentityRole::Friend),
+            Some(IdentityRole::Admin),
+            Some(IdentityRole::Owner),
+        ] {
+            for uid in [
+                "",
+                "12345678",
+                "1234567890",
+                "12345678x",
+                "１２３４５６７８９",
+                "123456789 ",
+            ] {
+                let service = service(1, 1);
+                let mut port = FakeCommandPort::new();
+                let mut request = command();
+                request.uid = uid.to_string();
+                assert!(service.start(&request, role, &mut port).is_err());
+                assert!(port.messages.is_empty());
+                assert!(!port.hold_active.load(Ordering::SeqCst));
+                assert!(!service.is_active(&request).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_blacklist_and_vote_share_the_same_duplicate_guard() {
+        let service = service(1, 1);
+        let mut port = FakeCommandPort::new();
+        let ModerationStart::Ready(mut task) = service
+            .start(&command(), Some(IdentityRole::Admin), &mut port)
+            .unwrap()
+        else {
+            panic!("direct task expected");
+        };
+        for role in [
+            None,
+            Some(IdentityRole::Friend),
+            Some(IdentityRole::Admin),
+            Some(IdentityRole::Owner),
+        ] {
+            assert!(matches!(
+                service.start(&command(), role, &mut port).unwrap(),
+                ModerationStart::Duplicate
+            ));
+        }
+        assert!(service.is_active(&command()).unwrap());
+        task.cancel();
+        assert!(!service.is_active(&command()).unwrap());
+        let mut work = start(&service, &mut port);
+        let ModerationStart::Ready(mut replacement) = service
+            .start(&command(), Some(IdentityRole::Owner), &mut port)
+            .unwrap()
+        else {
+            panic!("administrator must take over pending vote");
+        };
+        work.cancel();
+        assert!(service.is_active(&command()).unwrap());
+        replacement.cancel();
+        assert!(!service.is_active(&command()).unwrap());
+    }
+
+    #[test]
+    fn admin_takes_over_running_vote_without_waiting_or_submitting_old_rejection() {
+        for role in [IdentityRole::Admin, IdentityRole::Owner] {
+            let service = service(1, 99);
+            let mut port = FakeCommandPort::new();
+            let work = start(&service, &mut port);
+            let ModerationStart::Ready(task) =
+                service.start(&command(), Some(role), &mut port).unwrap()
+            else {
+                panic!("pending vote must not block administrator");
+            };
+            let mut votes = FakeVotePort::new([vec!["[甲]：@不同意".to_string()]]);
+            let before = votes.now;
+            let tasks = FakeTaskPort::new();
+            service.run_vote(work, &mut votes, &tasks).unwrap();
+            assert_eq!(votes.now, before);
+            assert_eq!(votes.polls.len(), 1);
+            assert!(votes.finished);
+            assert!(tasks.tasks.lock().unwrap().is_empty());
+            assert!(service.is_active(&command()).unwrap());
+            let mut execution = FakeExecutionPort::ready(port.hold_active.clone(), Ok(true));
+            service.execute_result(task, &mut execution).unwrap();
+            assert_eq!(
+                execution
+                    .events
+                    .iter()
+                    .filter(|event| event.starts_with("action:"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn admin_takeover_invalidates_both_approved_and_rejected_queued_results() {
+        for approved in [false, true] {
+            for finish_old_first in [false, true] {
+                let service = service(1, 1);
+                let mut port = FakeCommandPort::new();
+                let old = start(&service, &mut port).finish(approved);
+                let ModerationStart::Ready(direct) = service
+                    .start(&command(), Some(IdentityRole::Admin), &mut port)
+                    .unwrap()
+                else {
+                    panic!("pending result must be superseded regardless of approval");
+                };
+                let mut old_execution =
+                    FakeExecutionPort::ready(port.hold_active.clone(), Ok(true));
+                let mut direct_execution =
+                    FakeExecutionPort::ready(Arc::new(AtomicBool::new(false)), Ok(true));
+                if finish_old_first {
+                    service.execute_result(old, &mut old_execution).unwrap();
+                    assert!(
+                        service.is_active(&command()).unwrap(),
+                        "old result must not release successor"
+                    );
+                    service
+                        .execute_result(direct, &mut direct_execution)
+                        .unwrap();
+                } else {
+                    service
+                        .execute_result(direct, &mut direct_execution)
+                        .unwrap();
+                    service.execute_result(old, &mut old_execution).unwrap();
+                }
+                assert!(
+                    !old_execution
+                        .events
+                        .iter()
+                        .any(|event| event.starts_with("send:") || event.starts_with("action:"))
+                );
+                assert_eq!(
+                    direct_execution
+                        .events
+                        .iter()
+                        .filter(|event| event.starts_with("action:"))
+                        .count(),
+                    1
+                );
+                assert!(!service.is_active(&command()).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn superseded_vote_drop_and_failure_cannot_release_new_lease() {
+        for fail_vote in [false, true] {
+            let service = service(1, 1);
+            let mut port = FakeCommandPort::new();
+            let old = start(&service, &mut port);
+            let ModerationStart::Ready(mut direct) = service
+                .start(&command(), Some(IdentityRole::Owner), &mut port)
+                .unwrap()
+            else {
+                panic!("direct takeover expected");
+            };
+            if fail_vote {
+                let tasks = FakeTaskPort::new();
+                service.fail_vote(old, &tasks).unwrap();
+                assert!(tasks.tasks.lock().unwrap().is_empty());
+            } else {
+                drop(old);
+            }
+            assert!(service.is_active(&command()).unwrap());
+            assert!(!port.hold_active.load(Ordering::SeqCst));
+            direct.cancel();
+            assert!(!service.is_active(&command()).unwrap());
+        }
+    }
+
+    #[test]
+    fn administrator_cannot_take_over_an_action_already_executing() {
+        for direct in [false, true] {
+            let service = service(1, 1);
+            let mut port = FakeCommandPort::new();
+            let task = if direct {
+                let ModerationStart::Ready(task) = service
+                    .start(&command(), Some(IdentityRole::Admin), &mut port)
+                    .unwrap()
+                else {
+                    panic!("direct task expected");
+                };
+                task
+            } else {
+                start(&service, &mut port).finish(true)
+            };
+            let mut execution = FakeExecutionPort::ready(port.hold_active.clone(), Ok(true));
+            let concurrent_service = service.clone();
+            execution.on_action = Some(Box::new(move || {
+                let mut port = FakeCommandPort::new();
+                for role in [IdentityRole::Admin, IdentityRole::Owner] {
+                    assert!(matches!(
+                        concurrent_service
+                            .start(&command(), Some(role), &mut port)
+                            .unwrap(),
+                        ModerationStart::Duplicate
+                    ));
+                }
+            }));
+            service.execute_result(task, &mut execution).unwrap();
+            assert_eq!(
+                execution
+                    .events
+                    .iter()
+                    .filter(|event| event.starts_with("action:"))
+                    .count(),
+                1
+            );
+            assert!(!service.is_active(&command()).unwrap());
+        }
+    }
+
+    #[test]
+    fn direct_blacklist_confirms_results_without_replaying_the_action() {
+        for result in [Ok(true), Ok(false), Err(anyhow!("result unknown"))] {
+            let service = service(1, 1);
+            let mut port = FakeCommandPort::new();
+            let ModerationStart::Ready(task) = service
+                .start(&command(), Some(IdentityRole::Admin), &mut port)
+                .unwrap()
+            else {
+                panic!("direct task expected");
+            };
+            let unknown = result.is_err();
+            let expected = match &result {
+                Ok(true) => "已对@UID123456789执行拉黑",
+                Ok(false) => "流程出错",
+                Err(_) => "执行结果未知,请勿重复操作",
+            };
+            let mut execution = FakeExecutionPort::ready(port.hold_active.clone(), result);
+            assert_eq!(
+                service.execute_result(task, &mut execution).is_err(),
+                unknown
+            );
+            assert_eq!(
+                execution
+                    .events
+                    .iter()
+                    .filter(|event| event.starts_with("action:"))
+                    .count(),
+                1
+            );
+            assert!(execution.events.last().unwrap().contains(expected));
+            assert!(!service.is_active(&command()).unwrap());
+        }
+    }
+
+    #[test]
+    fn direct_blacklist_does_not_require_successful_notifications() {
+        let service = service(1, 1);
+        let mut port = FakeCommandPort::new();
+        let ModerationStart::Ready(task) = service
+            .start(&command(), Some(IdentityRole::Owner), &mut port)
+            .unwrap()
+        else {
+            panic!("direct task expected");
+        };
+        let mut execution = FakeExecutionPort::ready(port.hold_active.clone(), Ok(true));
+        execution.fail_notification = true;
+        service.execute_result(task, &mut execution).unwrap();
+        assert_eq!(
+            execution
+                .events
+                .iter()
+                .filter(|event| event.starts_with("action:"))
+                .count(),
+            1
+        );
+        assert!(!service.is_active(&command()).unwrap());
     }
 
     #[test]
@@ -892,7 +1478,7 @@ mod tests {
         let mut work = start(&service, &mut port);
 
         assert!(matches!(
-            service.start(&command(), &mut port).unwrap(),
+            service.start(&command(), None, &mut port).unwrap(),
             ModerationStart::Duplicate
         ));
         assert!(service.is_active(&command()).unwrap());
@@ -903,7 +1489,7 @@ mod tests {
         assert!(!service.is_active(&command()).unwrap());
         assert!(!port.hold_active.load(Ordering::SeqCst));
         assert!(matches!(
-            service.start(&command(), &mut port).unwrap(),
+            service.start(&command(), None, &mut port).unwrap(),
             ModerationStart::Started(_)
         ));
     }

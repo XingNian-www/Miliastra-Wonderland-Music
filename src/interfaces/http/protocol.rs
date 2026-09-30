@@ -171,6 +171,12 @@ const ROUTES: &[RouteSpec] = &[
         handler: playback_insights_route,
     },
     RouteSpec {
+        path: "/playback/leaderboard",
+        json: true,
+        mutating: false,
+        handler: playback_leaderboard_route,
+    },
+    RouteSpec {
         path: "/playback/cache/tracks",
         json: true,
         mutating: false,
@@ -1166,6 +1172,7 @@ fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedSta
                 | "/monitor"
                 | "/status"
                 | "/playback/insights"
+                | "/playback/leaderboard"
                 | "/playback/cache/tracks"
                 | "/player/login/status"
                 | "/screenshot"

@@ -410,6 +410,7 @@ struct BusinessBundle {
     administration_application: AdministrationApplication,
     hall_application: HallApplication,
     idiom_chain_application: IdiomChainApplication,
+    tarot_application: crate::features::tarot::TarotApplication,
     turtle_soup_application: TurtleSoupApplication,
     undercover_game: UndercoverApplication,
     moderation: ModerationService,
@@ -659,6 +660,7 @@ struct FormalTaskBusinessContext {
     administration_application: AdministrationApplication,
     hall_application: HallApplication,
     idiom_chain_application: IdiomChainApplication,
+    tarot_application: crate::features::tarot::TarotApplication,
     turtle_soup_application: TurtleSoupApplication,
     undercover_game: UndercoverApplication,
     moderation: ModerationService,
@@ -732,6 +734,7 @@ impl FormalTaskExecutionContext {
                     administration_application: self.business.administration_application,
                     hall_application: self.business.hall_application,
                     idiom_chain_application: self.business.idiom_chain_application,
+                    tarot_application: self.business.tarot_application.clone(),
                     turtle_soup_application: self.business.turtle_soup_application,
                     undercover_game: self.business.undercover_game.clone(),
                     moderation: self.business.moderation.clone(),
@@ -1318,6 +1321,8 @@ impl ApplicationRuntime {
             system_clock.clone(),
             state_store.clone(),
         )?;
+        let tarot_application =
+            crate::features::tarot::TarotApplication::open(&config.state.playback_state_path)?;
         let moderation_policy = ModerationPolicy::new(
             Duration::from_millis(config.timing.moderation.vote_timeout_ms),
             Duration::from_millis(config.timing.moderation.vote_poll_ms),
@@ -1555,6 +1560,7 @@ impl ApplicationRuntime {
                 administration_application,
                 hall_application: HallApplication,
                 idiom_chain_application,
+                tarot_application,
                 turtle_soup_application: TurtleSoupApplication,
                 undercover_game,
                 moderation,

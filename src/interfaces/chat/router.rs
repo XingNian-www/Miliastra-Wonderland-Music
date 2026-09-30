@@ -328,10 +328,10 @@ mod tarot_routing_tests {
                 Some(EntertainmentKind::Undercover),
             ] {
                 let envelope = CommandEnvelope::new(
-                    "#塔罗三张AI 学习",
+                    "#塔罗牌AI 学习",
                     "用户",
                     source,
-                    "#塔罗三张AI 学习",
+                    "#塔罗牌AI 学习",
                     CommandObservation::default(),
                 )
                 .unwrap();
@@ -346,10 +346,10 @@ mod tarot_routing_tests {
             }
         }
         let help = CommandEnvelope::new(
-            "#塔罗帮助",
+            "#塔罗牌帮助",
             "用户",
             "blue",
-            "#塔罗帮助",
+            "#塔罗牌帮助",
             CommandObservation::default(),
         )
         .unwrap();

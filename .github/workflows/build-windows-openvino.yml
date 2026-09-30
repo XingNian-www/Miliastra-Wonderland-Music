@@ -320,7 +320,7 @@ jobs:
 
       - name: 创建 OpenVINO 运行时依赖 GitHub Release
         if: steps.version.outputs.create_release == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.release_tag }}
           name: Miliastra Wonderland Music ${{ steps.version.outputs.version }} OpenVINO runtime

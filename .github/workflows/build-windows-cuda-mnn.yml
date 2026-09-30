@@ -226,7 +226,7 @@ jobs:
 
       - name: 创建 CUDA MNN GitHub Release
         if: ${{ inputs.create_release }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.release_tag }}
           name: Miliastra Wonderland Music ${{ steps.version.outputs.version }} CUDA MNN 运行时

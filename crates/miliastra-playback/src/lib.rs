@@ -24,7 +24,7 @@ pub use domain::{
     EndBehavior, EndCause, EngineState, Failure, ResolverLocator, ResolverLocatorError, SongKey,
     StreamSource,
 };
-pub use library_search::{MAX_LIBRARY_SEARCH_RESULTS, search_library_tracks};
+pub use library_search::{MAX_LIBRARY_SEARCH_RESULTS, keyword_match_score, search_library_tracks};
 pub use lyrics::{
     LyricsParseError, MAX_LYRICS_LEAD_SECONDS, TimedLyricLine, TimedLyrics, parse_lrc_pair,
 };

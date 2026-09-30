@@ -67,17 +67,65 @@ fn covers_joined_fields(keyword: &str, fields: &[String]) -> bool {
     }
     reachable[chars.len()]
 }
+/// 关键词与一条曲目的匹配度（0.0～1.0）：纯字面覆盖程度，不依赖 AI。
+///
+/// 命中判定与曲库检索保持一致（每个词都落在歌名或歌手，或连写片段依次覆盖），
+/// 在命中的基础上再分层：完全相同 1.0；关键词连续出现在歌名 0.9；
+/// 每个词都落在歌名或歌手 0.6；只能靠连写片段拼出（OCR 丢空格）0.5；不命中 0.0。
+pub fn keyword_match_score(keyword: &str, title: &str, artists: &[String]) -> f64 {
+    let keyword = normalize(keyword);
+    let terms: Vec<_> = keyword.split_whitespace().collect();
+    if terms.is_empty() || terms.len() > 16 || keyword.chars().count() > 256 {
+        return 0.0;
+    }
+    let title = normalize(title);
+    if title.is_empty() {
+        return 0.0;
+    }
+    let joined_artists = normalize(&artists.join(" "));
+    let compact_keyword = compact(&keyword);
+    let (compact_title, compact_artists) = (compact(&title), compact(&joined_artists));
+    let forward = format!("{compact_title}{compact_artists}");
+    let backward = format!("{compact_artists}{compact_title}");
+    let all_terms_present = terms
+        .iter()
+        .all(|term| title.contains(term) || joined_artists.contains(term));
+    let mut fields = Vec::with_capacity(artists.len() + 1);
+    fields.push(compact_title.clone());
+    fields.extend(
+        artists
+            .iter()
+            .map(|artist| compact(&normalize(artist)))
+            .filter(|field| !field.is_empty()),
+    );
+    let joined_covered =
+        !compact_keyword.is_empty() && covers_joined_fields(&compact_keyword, &fields);
+    if !all_terms_present && !joined_covered {
+        return 0.0;
+    }
+    if keyword == title
+        || keyword == format!("{title} {joined_artists}")
+        || keyword == format!("{joined_artists} {title}")
+        || (!compact_keyword.is_empty()
+            && (compact_keyword == forward || compact_keyword == backward))
+    {
+        return 1.0;
+    }
+    if !compact_keyword.is_empty() && compact_title.contains(&compact_keyword) {
+        return 0.9;
+    }
+    if all_terms_present { 0.6 } else { 0.5 }
+}
 
 /// 从曲目元数据中选取有限候选；每个关键词必须落在歌名或歌手中，
 /// 或由连写关键词拆分后在歌名/歌手中依次出现（OCR 丢空格的场景）。
-/// 结果保持 Unknown，由正常解析/播放链路验证当前账号和资源是否可用。
+/// 结果按匹配度降序排列，保持 Unknown，由正常解析/播放链路验证当前账号和资源是否可用。
 pub fn search_library_tracks(
     query: &SearchQuery,
     tracks: impl IntoIterator<Item = PlayableTrack>,
 ) -> Vec<SearchCandidate> {
     let keyword = normalize(&query.keyword);
     let terms: Vec<_> = keyword.split_whitespace().collect();
-    let compact_keyword = compact(&keyword);
     let limit = query.limit.min(MAX_LIBRARY_SEARCH_RESULTS);
     if limit == 0 || terms.is_empty() || terms.len() > 16 || keyword.chars().count() > 256 {
         return Vec::new();
@@ -89,41 +137,17 @@ pub fn search_library_tracks(
         if !query.providers.is_empty() && !query.providers.contains(&provider) {
             continue;
         }
-        let title = normalize(&track.metadata.title);
-        let artists = normalize(&track.metadata.artists.join(" "));
-        if title.is_empty() {
-            continue;
-        }
-        let (compact_title, compact_artists) = (compact(&title), compact(&artists));
-        let forward = format!("{compact_title}{compact_artists}");
-        let backward = format!("{compact_artists}{compact_title}");
-        let matched = terms
-            .iter()
-            .all(|term| title.contains(term) || artists.contains(term))
-            || (!compact_keyword.is_empty() && {
-                let mut fields = Vec::with_capacity(track.metadata.artists.len() + 1);
-                fields.push(compact_title.clone());
-                fields.extend(
-                    track
-                        .metadata
-                        .artists
-                        .iter()
-                        .map(|artist| compact(&normalize(artist)))
-                        .filter(|field| !field.is_empty()),
-                );
-                covers_joined_fields(&compact_keyword, &fields)
-            });
-        if !matched {
+        let score = keyword_match_score(
+            &query.keyword,
+            &track.metadata.title,
+            &track.metadata.artists,
+        );
+        if score <= 0.0 {
             continue;
         }
         if !seen.insert(track.track_ref.key.clone()) {
             continue;
         }
-        let exact = keyword == title
-            || keyword == format!("{title} {artists}")
-            || keyword == format!("{artists} {title}")
-            || compact_keyword == forward
-            || compact_keyword == backward;
         let key = track.track_ref.key.to_string();
         let mut candidate = SearchCandidate {
             track_ref: track.track_ref,
@@ -136,8 +160,8 @@ pub fn search_library_tracks(
             candidate.selection_text(),
             provider_label(provider)
         );
-        ranked.push((exact, key, candidate));
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        ranked.push((score, key, candidate));
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         ranked.truncate(limit);
     }
     ranked
@@ -416,5 +440,28 @@ mod tests {
             1
         );
         assert_eq!(search_library_tracks(&query("痒黄龄"), short).len(), 1);
+    }
+
+    #[test]
+    fn keyword_match_score_layers_literal_matches() {
+        let artists = vec!["创元-yin".to_string()];
+        assert_eq!(
+            keyword_match_score("降生 纯享版 创元-yin", "降生 纯享版", &artists),
+            1.0
+        );
+        assert_eq!(
+            keyword_match_score("降生 纯享版", "【小花仙第二季】降生 纯享版", &artists),
+            0.9
+        );
+        assert_eq!(
+            keyword_match_score("降生 纯享版", "【小花仙第二季】《降生》纯享版", &artists),
+            0.6
+        );
+        assert_eq!(
+            keyword_match_score("降生纯享", "降生", &["纯享版".to_string()]),
+            0.5
+        );
+        assert_eq!(keyword_match_score("晴天", "降生", &artists), 0.0);
+        assert_eq!(keyword_match_score("降生 纯享版", "", &artists), 0.0);
     }
 }

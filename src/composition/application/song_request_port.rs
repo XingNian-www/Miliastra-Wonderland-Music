@@ -56,16 +56,17 @@ impl SongRequestPort for ApplicationRuntime {
     fn search_library_candidates(
         &self,
         keyword: &str,
-        source: &str,
+        allow_bilibili: bool,
     ) -> Result<Vec<SearchCandidate>> {
-        let providers = if source.trim().is_empty() {
+        // 本地兜底跨平台：在线检索仍按请求的平台，本地曲库不再跟着某个平台走，
+        // 只在缺少好友及以上权限时排除 B站 音源。
+        let providers = if allow_bilibili {
             Vec::new()
         } else {
-            source
-                .split(',')
-                .map(str::trim)
-                .map(str::parse::<miliastra_playback::ProviderId>)
-                .collect::<std::result::Result<Vec<_>, _>>()?
+            miliastra_playback::ProviderId::ALL
+                .into_iter()
+                .filter(|provider| *provider != miliastra_playback::ProviderId::Bilibili)
+                .collect()
         };
         let query = miliastra_playback::SearchQuery {
             keyword: keyword.to_owned(),

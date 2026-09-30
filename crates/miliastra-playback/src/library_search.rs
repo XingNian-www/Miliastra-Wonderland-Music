@@ -173,6 +173,43 @@ mod tests {
     }
 
     #[test]
+    fn library_search_finds_bracket_decorated_bilibili_titles_only_inside_their_platform() {
+        // 真实曲库记录：B站视频标题带方括号/书名号装饰，歌手是 UP 主，SQL 侧没有定位符。
+        let tracks = vec![track(
+            ProviderId::Bilibili,
+            "BV1qqpGe1Egj",
+            "【小花仙第二季】插曲《降生》纯享版",
+            "创元-yin",
+        )];
+        for keyword in ["降生 纯享版", "降生", "纯享版", "降生纯享版", "纯享版 降生"]
+        {
+            assert_eq!(
+                search_library_tracks(&query(keyword), tracks.clone()).len(),
+                1,
+                "keyword={keyword} 应当命中带装饰的 B站 标题"
+            );
+        }
+        // 平台过滤优先：请求其它平台时这条 B站 记录不会出现。
+        let mut scoped = query("降生 纯享版");
+        scoped.providers = vec![ProviderId::QqMusic];
+        assert!(search_library_tracks(&scoped, tracks.clone()).is_empty());
+        // 本地兜底跨平台（其余三个平台）时命中非 B站 记录，但仍排除 B站 记录。
+        let mut cross_platform = tracks;
+        cross_platform.push(track(
+            ProviderId::Kugou,
+            "78642C20AC3F604F268797FD568A2AF0",
+            "降生 纯享版",
+            "创元-yin",
+        ));
+        let mut without_bilibili = query("降生 纯享版");
+        without_bilibili.providers =
+            vec![ProviderId::QqMusic, ProviderId::Netease, ProviderId::Kugou];
+        let hits = search_library_tracks(&without_bilibili, cross_platform);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].track_ref.key.provider, ProviderId::Kugou);
+    }
+
+    #[test]
     fn library_search_text_uses_the_same_chinese_provider_label_as_online_results() {
         let tracks = vec![
             track(ProviderId::QqMusic, "1", "晴天", "周杰伦"),

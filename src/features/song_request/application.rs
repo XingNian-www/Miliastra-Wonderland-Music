@@ -178,10 +178,13 @@ pub(crate) trait SongRequestPort {
     ) -> std::result::Result<Option<Vec<SearchCandidate>>, SongSearchFailure>;
 
     /// 本地曲库候选；AI 点歌与普通点歌都会调用，供在线匹配偏低时推荐。
+    ///
+    /// 本地检索跨平台进行，不受在线 source 限制；`allow_bilibili` 表示本次请求
+    /// 具备好友及以上权限，只有它才允许把 B站 音源纳入本地兜底。
     fn search_library_candidates(
         &self,
         keyword: &str,
-        source: &str,
+        allow_bilibili: bool,
     ) -> Result<Vec<SearchCandidate>>;
 
     /// 在线匹配偏低时是否额外给出本地曲库推荐；默认开启。
@@ -585,8 +588,9 @@ impl SongRequestExecution<'_> {
         &self,
         keyword: &str,
         source: &str,
+        allow_bilibili: bool,
     ) -> std::result::Result<SongSearchCandidates, SongSearchFailure> {
-        let local = match self.port.search_library_candidates(keyword, source) {
+        let local = match self.port.search_library_candidates(keyword, allow_bilibili) {
             Ok(candidates) => candidates,
             Err(error) => {
                 log::warn!("AI点歌曲库检索失败，继续平台搜索: {error:#}");
@@ -626,13 +630,15 @@ impl SongRequestExecution<'_> {
         self.reply(&format!("{}AI匹配中", label))?;
 
         let search_source = ai_candidate_source(song);
-        let mut candidates = match self.search_ai_candidates(&song.keyword, search_source) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                self.report_player_search_failure(&label, "AI点歌搜索候选失败", &error)?;
-                return Ok(None);
-            }
-        };
+        let allow_bilibili = allows_bilibili_source(song);
+        let mut candidates =
+            match self.search_ai_candidates(&song.keyword, search_source, allow_bilibili) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    self.report_player_search_failure(&label, "AI点歌搜索候选失败", &error)?;
+                    return Ok(None);
+                }
+            };
         let usable: Vec<_> = candidates
             .merged
             .iter()
@@ -674,7 +680,7 @@ impl SongRequestExecution<'_> {
                             super::ai::validated_search_rewrite(&song.keyword, &query)
                         {
                             self.reply(&format!("{}AI理解搜索词:{}，再次搜索", label, query))?;
-                            match self.search_ai_candidates(&query, search_source) {
+                            match self.search_ai_candidates(&query, search_source, allow_bilibili) {
                                 Ok(second) => {
                                     candidates =
                                         SongSearchCandidates::merge_rounds(candidates, second)
@@ -861,7 +867,7 @@ impl SongRequestExecution<'_> {
                     &request.label(),
                     &format!("{}平台无对应歌曲音源", request.label()),
                     &request.keyword,
-                    source,
+                    !request.friend_username.trim().is_empty(),
                     true,
                 )? {
                     NoCandidateOutcome::Local(candidate) => {
@@ -971,7 +977,7 @@ impl SongRequestExecution<'_> {
                 &song_label(song),
                 &format!("{}换源后仍无音源", song_label(song)),
                 &song.keyword,
-                source,
+                !song.friend_username.trim().is_empty(),
                 true,
             )? {
                 NoCandidateOutcome::Local(candidate) => {
@@ -1326,11 +1332,11 @@ impl SongRequestExecution<'_> {
 
     /// 普通点歌的本地曲库候选。在线没有可播候选时无事可比较，
     /// 因此不做分数门槛，直接用曲库检索的排序结果。
-    fn plain_local_offer(&mut self, keyword: &str, source: &str) -> Vec<SearchCandidate> {
+    fn plain_local_offer(&mut self, keyword: &str, allow_bilibili: bool) -> Vec<SearchCandidate> {
         if !self.port.local_recommend() {
             return Vec::new();
         }
-        match self.port.search_library_candidates(keyword, source) {
+        match self.port.search_library_candidates(keyword, allow_bilibili) {
             Ok(candidates) => local_library_choices(&candidates, 0),
             Err(error) => {
                 log::warn!("本地曲库检索失败，无法给出本地推荐: {error:#}");
@@ -1435,10 +1441,10 @@ impl SongRequestExecution<'_> {
         label: &str,
         message: &str,
         keyword: &str,
-        source: &str,
+        allow_bilibili: bool,
         allow_switch_source: bool,
     ) -> Result<NoCandidateOutcome> {
-        let offer = self.plain_local_offer(keyword, source);
+        let offer = self.plain_local_offer(keyword, allow_bilibili);
         let mut actions = String::new();
         if allow_switch_source {
             actions.push_str("@换源");
@@ -1675,6 +1681,11 @@ fn ai_candidate_source(song: &SongCommand) -> &'static str {
     } else {
         song.source.as_str()
     }
+}
+
+/// B站 音源要求好友及以上权限：只有带好友身份的请求才允许把 B站 纳入本地兜底。
+fn allows_bilibili_source(song: &SongCommand) -> bool {
+    !song.friend_username.trim().is_empty()
 }
 
 fn alternate_music_source(source: &str) -> &'static str {
@@ -1997,7 +2008,8 @@ mod tests {
         searches: RefCell<VecDeque<Option<PickedCandidate>>>,
         search_sources: RefCell<Vec<String>>,
         library_candidates: RefCell<Vec<SearchCandidate>>,
-        library_searches: RefCell<Vec<(String, String)>>,
+        /// 记录本地曲库检索的参数：关键词与「是否允许 B站 音源」。
+        library_searches: RefCell<Vec<(String, bool)>>,
         library_error: Cell<bool>,
         local_recommend_enabled: Cell<bool>,
         online_error: Cell<bool>,
@@ -2109,15 +2121,26 @@ mod tests {
         fn search_library_candidates(
             &self,
             keyword: &str,
-            source: &str,
+            allow_bilibili: bool,
         ) -> Result<Vec<SearchCandidate>> {
             self.library_searches
                 .borrow_mut()
-                .push((keyword.into(), source.into()));
+                .push((keyword.into(), allow_bilibili));
             if self.library_error.get() {
                 return Err(anyhow!("test library unavailable"));
             }
-            Ok(self.library_candidates.borrow().clone())
+            // 与生产实现一致：缺少好友及以上权限时本地兜底排除 B站 音源。
+            Ok(self
+                .library_candidates
+                .borrow()
+                .iter()
+                .filter(|candidate| {
+                    allow_bilibili
+                        || candidate.track_ref.key.provider
+                            != miliastra_playback::ProviderId::Bilibili
+                })
+                .cloned()
+                .collect())
         }
 
         fn search_and_pick(
@@ -2470,8 +2493,8 @@ mod tests {
         assert_eq!(
             port.library_searches.borrow().as_slice(),
             [
-                (song.keyword.clone(), ai_candidate_source(&song).into()),
-                ("晴天 周杰伦".into(), ai_candidate_source(&song).into())
+                (song.keyword.clone(), allows_bilibili_source(&song)),
+                ("晴天 周杰伦".into(), allows_bilibili_source(&song))
             ]
         );
         assert_eq!(port.search_sources.borrow().len(), 2);
@@ -2690,7 +2713,7 @@ mod tests {
         application.execute(&context(), &song, &mut port).unwrap();
         assert_eq!(
             port.library_searches.borrow().as_slice(),
-            [("晴天".into(), ai_candidate_source(&song).into())]
+            [("晴天".into(), allows_bilibili_source(&song))]
         );
         assert_eq!(ai.candidates.lock().unwrap()[0].len(), 1);
         assert_eq!(
@@ -3537,6 +3560,81 @@ mod tests {
                 .key
                 .id,
             "local"
+        );
+    }
+    #[test]
+    fn local_library_fallback_is_cross_platform_for_the_hall() {
+        // 在线只搜请求的平台（默认 QQ），本地兜底跨平台：库里只有酷狗候选也要能推荐并播放。
+        let mut port = FakePort::idle([None]);
+        port.library_candidates.borrow_mut().push(test_candidate(
+            "降生 纯享版 - 创元-yin",
+            "miliastra://track/kugou/78642C20AC3F604F268797FD568A2AF0",
+        ));
+        port.decisions = VecDeque::from([SongRequestDecision::LocalLibrary]);
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("song request");
+        assert_eq!(
+            port.library_searches.borrow().as_slice(),
+            [("晴天".to_string(), false)]
+        );
+        let played = port.played.borrow();
+        assert_eq!(
+            played[0].track.as_ref().unwrap().track_ref.key.provider,
+            miliastra_playback::ProviderId::Kugou
+        );
+    }
+
+    #[test]
+    fn local_library_fallback_needs_friend_permission_for_bilibili() {
+        // 大厅请求没有好友及以上权限：本地兜底排除 B站，@本地 不可用，也不会播放。
+        let mut hall = FakePort::idle([None]);
+        hall.library_candidates.borrow_mut().push(test_candidate(
+            "【小花仙第二季】插曲《降生》纯享版 - 创元-yin",
+            "miliastra://track/bilibili/BV1qqpGe1Egj",
+        ));
+        application()
+            .execute(&context(), &command(), &mut hall)
+            .expect("song request");
+        assert_eq!(
+            hall.library_searches.borrow().as_slice(),
+            [("晴天".to_string(), false)]
+        );
+        assert!(!hall.decision_options.borrow()[0].3);
+        assert!(hall.played.borrow().is_empty());
+        assert!(
+            !hall
+                .replies
+                .borrow()
+                .iter()
+                .any(|line| line.contains("@本地"))
+        );
+
+        // 好友请求保留 B站 音源，可推荐并播放。
+        let mut friend = FakePort::idle([None]);
+        friend.library_candidates.borrow_mut().push(test_candidate(
+            "【小花仙第二季】插曲《降生》纯享版 - 创元-yin",
+            "miliastra://track/bilibili/BV1qqpGe1Egj",
+        ));
+        friend.decisions = VecDeque::from([SongRequestDecision::LocalLibrary]);
+        application()
+            .execute(
+                &context(),
+                &SongCommand {
+                    friend_username: "Bob".to_string(),
+                    ..command()
+                },
+                &mut friend,
+            )
+            .expect("song request");
+        assert_eq!(
+            friend.library_searches.borrow().as_slice(),
+            [("晴天".to_string(), true)]
+        );
+        let played = friend.played.borrow();
+        assert_eq!(
+            played[0].track.as_ref().unwrap().track_ref.key.provider,
+            miliastra_playback::ProviderId::Bilibili
         );
     }
 

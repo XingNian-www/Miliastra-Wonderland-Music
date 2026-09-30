@@ -14,6 +14,15 @@ use crate::features::turtle_soup::{
     QuestionSubmitOutcome, TurtleSoupApplicationPort, TurtleSoupCommandOutcome,
 };
 
+/// B站 音源与本地曲库兜底要求好友及以上权限：好友私聊、靠映射获得权限的大厅成员
+/// （好友/管理员/主人），以及控制面板发起的点歌都算。
+fn song_request_allows_bilibili(parsed: &RoutedCommand, command: &SongCommand) -> bool {
+    parsed.authority == CommandAuthority::Friend
+        || parsed.role.is_some()
+        || !command.friend_username.trim().is_empty()
+        || parsed.message_type == "控制台"
+}
+
 pub(super) struct ImmediateAdministrationPort {
     business: BusinessRuntimeHandle,
     task_engine: TaskEngineHandle,
@@ -230,6 +239,7 @@ impl ApplicationRuntime {
                     raw: parsed.raw.clone(),
                     username: command_username(parsed).to_string(),
                     user_command: parsed.user_command.clone(),
+                    friend_or_above: song_request_allows_bilibili(parsed, command),
                 };
                 self.business
                     .song_requests
@@ -696,6 +706,51 @@ impl HallMaintenancePort for ApplicationRuntime {
 mod tests {
     use super::*;
     use crate::features::command::CommandAuthority;
+
+    #[test]
+    fn song_request_bilibili_permission_follows_hall_identity_mapping() {
+        let command = SongCommand {
+            keyword: "降生 纯享版".to_string(),
+            source: crate::features::song_request::SongSource::QqMusic,
+            prefix: "点歌".to_string(),
+            prefer_accompaniment: false,
+            ai_assisted: false,
+            friend_username: String::new(),
+        };
+        let mut routed = RoutedCommand::console(
+            "点歌",
+            "点歌 降生 纯享版",
+            ModuleCommand::SongRequest(command.clone()),
+        );
+        // 大厅里未映射的成员：没有 B站 权限。
+        routed.message_type = "blue".to_string();
+        routed.authority = CommandAuthority::HallMember;
+        routed.role = None;
+        assert!(!song_request_allows_bilibili(&routed, &command));
+
+        // 大厅里靠映射获得好友、管理员或主人权限的成员：算好友及以上。
+        for role in [
+            IdentityRole::Friend,
+            IdentityRole::Admin,
+            IdentityRole::Owner,
+        ] {
+            routed.role = Some(role);
+            assert!(
+                song_request_allows_bilibili(&routed, &command),
+                "mapped role"
+            );
+        }
+
+        // 未映射的好友私聊：命令带 friend_username，同样保留 B站。
+        routed.role = None;
+        routed.authority = CommandAuthority::Friend;
+        assert!(song_request_allows_bilibili(&routed, &command));
+
+        // 控制面板发起的点歌：按好友及以上处理。
+        routed.authority = CommandAuthority::HallMember;
+        routed.message_type = "控制台".to_string();
+        assert!(song_request_allows_bilibili(&routed, &command));
+    }
 
     #[test]
     fn card_game_lane_matches_the_effects_required_by_each_command() {

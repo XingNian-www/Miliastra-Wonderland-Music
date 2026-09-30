@@ -57,8 +57,8 @@ use crate::features::playback::{
     QueueItem, SongDedupCandidate, has_restorable_playback_progress,
 };
 use crate::features::song_request::{
-    AiClient, ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
-    SongReviewClient,
+    AiClient, ResolvedSongRequest, SongCommand, SongRequestApplication, SongRequestContext,
+    SongRequestDecision, SongReviewClient,
 };
 use crate::features::startup::{StartupService, StartupSource, StartupTask, StartupTaskKind};
 use crate::features::turtle_soup::{

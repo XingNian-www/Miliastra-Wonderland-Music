@@ -39,3 +39,4 @@
 **/diagnostics/
 **/dist/
 /crates/miliastra-playback/examples/
+.bitfun/

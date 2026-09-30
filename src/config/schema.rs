@@ -2075,7 +2075,30 @@ fn identity_section() -> Vec<ConfigFieldSchema> {
     )]
 }
 
-/// 全部配置段 schema（28 段：与 AppConfig 顶层段一一对应，含 bootstrap 的 http/logging）。
+fn kugou_section() -> Vec<ConfigFieldSchema> {
+    vec![
+        ConfigFieldSchema::db_idle_reload(
+            "device_guid",
+            "设备 GUID",
+            FieldKind::String,
+            "填写你自己酷狗客户端的设备 GUID（形如 550e8400-e29b-41d4-a716-446655440000）。程序不会自动生成设备信息；三项留空时沿用凭据目录下已有的 kugou-device.json。保存后在下一次酷狗登录时生效。",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "device_dev",
+            "设备型号",
+            FieldKind::String,
+            "填写该设备的型号标识（通常是一串大写十六进制）。三项必须同时填写。保存后在下一次酷狗登录时生效。",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "device_mac",
+            "设备 MAC",
+            FieldKind::String,
+            "填写该设备的 MAC 地址（形如 AA:BB:CC:DD:EE:FF）。三项必须同时填写。保存后在下一次酷狗登录时生效。",
+        ),
+    ]
+}
+
+/// 全部配置段 schema（29 段：与 AppConfig 顶层段一一对应，含 bootstrap 的 http/logging）。
 pub fn config_sections() -> Vec<ConfigSectionSchema> {
     vec![
         ConfigSectionSchema {
@@ -2245,6 +2268,12 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             label: "身份映射".to_string(),
             order: 28,
             fields: with_section_prefix("identity", identity_section()),
+        },
+        ConfigSectionSchema {
+            name: "kugou".to_string(),
+            label: "酷狗设备".to_string(),
+            order: 29,
+            fields: with_section_prefix("kugou", kugou_section()),
         },
     ]
 }

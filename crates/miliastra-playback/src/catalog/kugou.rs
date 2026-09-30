@@ -24,8 +24,9 @@ use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::{TimedLyrics, parse_lrc_pair};
 
 use super::kugou_crypto::{
-    KUGOU_LITE_RSA_PUBLIC_KEY, decode_krc_base64, playlist_aes_decrypt_base64,
-    playlist_aes_encrypt_base64, rsa_pkcs1_encrypt_hex,
+    KUGOU_LITE_RSA_PUBLIC_KEY, KugouCryptoError, aes_cbc_decrypt_hex, aes_cbc_encrypt_hex,
+    decode_krc_base64, md5_hex, playlist_aes_decrypt_base64, playlist_aes_encrypt_base64,
+    rsa_pkcs1_encrypt_hex, rsa_raw_encrypt_hex,
 };
 
 const PROVIDER: &str = "kugou";
@@ -35,6 +36,21 @@ const KUGOU_LITE_SIGN_SALT: &str = "LnT6xpN3khm36zse0QzvmgTZ3waWdRSA";
 const KUGOU_LITE_SIGN_KEY_SALT: &str = "185672dd44712f60bb1736df5a377e82";
 const KUGOU_LITE_APPID: i64 = 3116;
 const KUGOU_LITE_CLIENTVER: i64 = 11440;
+/// 标准 Android 版本参数；歌词等公共接口按官方标准版参数请求。
+const KUGOU_ANDROID_APPID: i64 = 1005;
+const KUGOU_ANDROID_CLIENTVER: i64 = 20489;
+/// 登录续期端点与固定密钥（上游 module/login_token.js）。
+const URL_LOGIN_BY_TOKEN: &str = "https://login.user.kugou.com/v5/login_by_token";
+const KUGOU_LITE_LOGIN_TOKEN_KEY: &str = "c24f74ca2820225badc01946dba4fdf7";
+const KUGOU_LITE_LOGIN_TOKEN_IV: &str = "adc01946dba4fdf7";
+const KUGOU_LITE_LOGIN_T2_KEY: &str = "fd14b35e3f81af3817a20ae7adae7020";
+const KUGOU_LITE_LOGIN_T2_IV: &str = "17a20ae7adae7020";
+const KUGOU_LITE_LOGIN_T1_KEY: &str = "5e4ef500e9597fe004bd09a46d8add98";
+const KUGOU_LITE_LOGIN_T1_IV: &str = "04bd09a46d8add98";
+/// 固定的客户端签名串，官方客户端在此接口上恒定发送。
+const KUGOU_LOGIN_T3: &str = "MCwwLDAsMCwwLDAsMCwwLDA=";
+/// t2 中的固定常量（上游与官方客户端一致）。
+const KUGOU_LOGIN_T2_CONST: &str = "0f607264fc6318a92b9e13c65db7cd3c";
 const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
 const KUGOU_KG_RFC: &str = "B9EDA08A64250DEFFBCADDEE00F8F25F";
 const KUGOU_LITE_URL_VERSION: &str = "11430";
@@ -48,12 +64,16 @@ const KUGOU_WEB_SRCAPPID: &str = "2919";
 const KUGOU_WEB_CLIENTVER: &str = "20000";
 const KUGOU_WEB_APPID: &str = "1014";
 const KUGOU_WEB_PLATID: &str = "4";
+/// 概念版搜索使用的 versionCode；官方客户端在此请求上覆盖默认 clientver。
+const KUGOU_LITE_SEARCH_CLIENTVER: i64 = 201;
 const KUGOU_WEB_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
 
 /// 官方端点
-const URL_SEARCH: &str = "https://gateway.kugou.com/v3/search/song";
+const URL_SEARCH: &str = "https://gateway.kugou.com/v2/search/song";
 const URL_SONG_STREAM: &str = "https://gateway.kugou.com/v5/url";
+/// 官方 VIP 私密取流端点；Lite 的 /v5/url 无法给出地址时作为兜底。
+const URL_PRIV_SONG_STREAM: &str = "https://tracker.kugou.com/v6/priv_url";
 const URL_SEARCH_LYRIC: &str = "https://lyrics.kugou.com/v1/search";
 const URL_DOWNLOAD_LYRIC: &str = "https://lyrics.kugou.com/download";
 const URL_WEB_SONGINFO: &str = "https://wwwapi.kugou.com/play/songinfo";
@@ -131,6 +151,81 @@ struct KugouAdPlayReportBody {
     play_start: u64,
 }
 
+/// /v6/priv_url 请求体；字段顺序沿用官方客户端，Android 签名覆盖该请求体文本。
+#[derive(Serialize)]
+struct KugouPrivUrlBody {
+    area_code: String,
+    behavior: String,
+    qualities: Vec<String>,
+    resource: KugouPrivUrlResource,
+    token: String,
+    tracker_param: KugouPrivUrlTracker,
+    userid: String,
+    vip: i64,
+}
+
+#[derive(Serialize)]
+struct KugouPrivUrlResource {
+    album_audio_id: String,
+    collect_list_id: String,
+    collect_time: u64,
+    hash: String,
+    id: u64,
+    page_id: u64,
+    #[serde(rename = "type")]
+    resource_type: String,
+}
+
+#[derive(Serialize)]
+struct KugouPrivUrlTracker {
+    all_m: u64,
+    auth: String,
+    is_free_part: u64,
+    key: String,
+    module_id: u64,
+    need_climax: u64,
+    need_xcdn: u64,
+    open_time: String,
+    pid: String,
+    pidversion: String,
+    priv_vip_type: String,
+    viptoken: String,
+}
+
+/// 登录续期返回的 Lite 会话令牌；与 Web 会话令牌分开保存，
+/// 让 Lite/Android 请求始终使用设备绑定的令牌。
+pub(crate) const KUGOU_LITE_TOKEN_COOKIE: &str = "KUGOU_API_TOKEN";
+
+/// /v5/login_by_token 的 p3 明文；字段顺序与官方客户端一致。
+#[derive(Serialize)]
+struct KugouLoginP3 {
+    clienttime: u64,
+    token: String,
+}
+
+/// /v5/login_by_token 的 pk 明文：上报本次会话的 AES 密钥种子。
+#[derive(Serialize)]
+struct KugouLoginPk {
+    clienttime_ms: u64,
+    key: String,
+}
+
+/// /v5/login_by_token 请求体；字段顺序沿用官方客户端。
+#[derive(Serialize)]
+struct KugouLoginByTokenBody {
+    dfid: String,
+    p3: String,
+    plat: i64,
+    t1: String,
+    t2: String,
+    t3: String,
+    pk: String,
+    params: String,
+    userid: String,
+    clienttime_ms: u64,
+    dev: String,
+}
+
 fn serialize_kugou_body<T: Serialize>(body: &T) -> Result<String, CatalogError> {
     serde_json::to_string(body).map_err(|error| CatalogError::InvalidResponse(error.to_string()))
 }
@@ -139,6 +234,102 @@ fn serialize_kugou_body<T: Serialize>(body: &T) -> Result<String, CatalogError> 
 const VIP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// 判定失败（接口风控/超时）时的短缓存，尽快重试账号接口。
 const VIP_CACHE_FAILED_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// 命中酷狗 SSA 人机验证后的冷静期。期间不再向酷狗发起任何请求，
+/// 避免重试、换源与继续点歌把风控窗口反复续期（上游 issue 的共识是该状态会自行恢复）。
+const KUGOU_VERIFICATION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+/// 「本次请求需要验证」错误码；出现在任意端点都表示 SSA 人机验证。
+const KUGOU_VERIFICATION_CODE: i64 = 20028;
+
+/// 两次酷狗请求之间的最小间隔。上游风控会观察请求节奏，
+/// 零间隔突发与固定周期都是典型的自动化特征。
+const KUGOU_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(600);
+/// 逐请求抖动上限；用时间纳秒取模产生，避免引入随机数依赖。
+const KUGOU_REQUEST_JITTER_MS: u32 = 150;
+
+/// 异步请求共用的节奏闸门；持锁等待即串行化，保证最小间隔生效。
+static KUGOU_REQUEST_PACER: std::sync::LazyLock<tokio::sync::Mutex<Option<std::time::Instant>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+/// 设备注册等阻塞路径共用的节奏闸门。
+static KUGOU_BLOCKING_PACER: std::sync::LazyLock<std::sync::Mutex<Option<std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+fn kugou_request_jitter() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis(u64::from(nanos % KUGOU_REQUEST_JITTER_MS.max(1)))
+}
+
+/// 按最小间隔 + 抖动等待，然后记录本次请求时间。
+async fn pace_kugou_request() {
+    let mut last = KUGOU_REQUEST_PACER.lock().await;
+    let now = std::time::Instant::now();
+    if let Some(previous) = *last {
+        let target = KUGOU_MIN_REQUEST_INTERVAL + kugou_request_jitter();
+        let elapsed = now.saturating_duration_since(previous);
+        if elapsed < target {
+            tokio::time::sleep(target - elapsed).await;
+        }
+    }
+    *last = Some(std::time::Instant::now());
+}
+
+/// 阻塞路径（登录设备注册）的同等限速。
+fn pace_kugou_request_blocking() {
+    let mut last = KUGOU_BLOCKING_PACER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = std::time::Instant::now();
+    if let Some(previous) = *last {
+        let target = KUGOU_MIN_REQUEST_INTERVAL + kugou_request_jitter();
+        let elapsed = now.saturating_duration_since(previous);
+        if elapsed < target {
+            std::thread::sleep(target - elapsed);
+        }
+    }
+    *last = Some(std::time::Instant::now());
+}
+
+/// 酷狗 SSA 人机验证的全局冷静截止时间。风控按账号与出口 IP 生效，
+/// 因此登录设备注册、播放取流、账号查询共享同一个窗口。
+static KUGOU_VERIFICATION_UNTIL: std::sync::LazyLock<std::sync::Mutex<Option<std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+fn kugou_verification_lock() -> std::sync::MutexGuard<'static, Option<std::time::Instant>> {
+    KUGOU_VERIFICATION_UNTIL
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// 请求前的风控冷静检查：命中过 SSA 挑战时直接短路，不再打扰酷狗。
+fn ensure_kugou_verification_window() -> Result<(), CatalogError> {
+    let guard = kugou_verification_lock();
+    let Some(until) = *guard else {
+        return Ok(());
+    };
+    let remaining = until.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Ok(());
+    }
+    Err(CatalogError::VerificationRequired(format!(
+        "Kugou human verification cooldown remaining {}s",
+        remaining.as_secs()
+    )))
+}
+
+/// 开启（或延长）冷静期，返回可直接上抛的错误。
+fn kugou_verification_error(reason: &str) -> CatalogError {
+    *kugou_verification_lock() = Some(std::time::Instant::now() + KUGOU_VERIFICATION_COOLDOWN);
+    log::warn!(
+        "Kugou SSA human verification required ({reason}); pausing Kugou requests for {}s",
+        KUGOU_VERIFICATION_COOLDOWN.as_secs()
+    );
+    CatalogError::VerificationRequired(format!("Kugou requires human verification ({reason})"))
+}
 
 /// 计算测试版（概念版/lite）Android 请求签名。
 ///
@@ -162,8 +353,33 @@ pub fn kugou_android_signature(params: &BTreeMap<String, String>, body: &str) ->
 /// 该值与请求 `signature` 分开：上游 `song_url` 模块启用 `encryptKey`，
 /// 因此播放请求携带此哈希密钥，并使用端点固定的播放参数映射。
 fn kugou_lite_sign_key(hash: &str, mid: &str, userid: &str) -> String {
+    kugou_stream_key(hash, mid, userid, KUGOU_LITE_APPID)
+}
+
+/// 取流端点的 key 参数：md5(hash + signKey 盐 + appid + mid + userid)。
+///
+/// Lite 的 /v5/url 使用概念版 appid；/v6/priv_url 按上游模块固定使用标准版 appid。
+fn kugou_md5_hex(value: &str) -> String {
+    md5_hex(value)
+}
+
+fn kugou_crypto_error(error: KugouCryptoError) -> CatalogError {
+    CatalogError::InvalidResponse(error.to_string())
+}
+
+/// 生成小写字母数字临时密钥；长度与上游 randomString(16) 一致。
+fn random_lowercase_string(length: usize) -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..length)
+        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .collect()
+}
+
+fn kugou_stream_key(hash: &str, mid: &str, userid: &str, appid: i64) -> String {
     let digest = compute(format!(
-        "{hash}{KUGOU_LITE_SIGN_KEY_SALT}{KUGOU_LITE_APPID}{mid}{userid}"
+        "{hash}{KUGOU_LITE_SIGN_KEY_SALT}{appid}{mid}{userid}"
     ));
     format!("{digest:x}")
 }
@@ -343,12 +559,11 @@ pub fn kugou_register_device(
     }
     let signature = kugou_android_signature(&params, &encrypted_body);
     params.insert("signature".to_owned(), signature);
-    let mut cookie_values = cookies.clone();
-    cookie_values.insert("token".to_owned(), token.to_owned());
-    cookie_values.insert("userid".to_owned(), userid.to_owned());
-    cookie_values.insert("dfid".to_owned(), dfid.to_owned());
+    ensure_kugou_verification_window()?;
+    pace_kugou_request_blocking();
     let response = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
+        .http1_only()
         .user_agent(KUGOU_UA)
         .build()
         .map_err(|error| CatalogError::Transient(error.to_string()))?
@@ -391,7 +606,6 @@ pub fn kugou_register_device(
                 reqwest::header::HeaderValue::from_static(KUGOU_KG_RFC),
             ),
         ]))
-        .header("Cookie", cookie_header(&cookie_values))
         // Axios 1.10 会直接转发此加密字符串，不设置 Content-Type；注册端点要求保持该格式。
         .body(encrypted_body.clone())
         .send()
@@ -521,8 +735,11 @@ impl KugouAdapter {
         timeout: Duration,
         login_helper_executable: Option<PathBuf>,
     ) -> Result<Self, CatalogError> {
+        // 官方客户端是 HTTP/1.1 + OkHttp；HTTP/2 的 ALPN 与头部形态本身
+        // 就是与客户端不同的指纹，因此显式固定为 HTTP/1.1。
         let client = Client::builder()
             .timeout(timeout)
+            .http1_only()
             .user_agent(KUGOU_UA)
             .build()
             .map_err(|error| CatalogError::Transient(error.to_string()))?;
@@ -567,23 +784,6 @@ impl KugouAdapter {
             dfid: dfid.clone(),
             cookies,
         }
-    }
-
-    fn credential_cookie_header(credential: &ProviderCredential) -> String {
-        let mut cookies = credential.cookies().clone();
-        let ProviderCredential::Kugou { .. } = credential else {
-            return cookie_header(&cookies);
-        };
-        // Lite 请求使用单独注册的设备标识。仅供浏览器使用的 KuGoo Cookie 属于 Web 会话，
-        // 不能混入此请求族。
-        cookies.remove("KuGoo");
-        let ProviderCredential::Kugou { token, userid, .. } = credential else {
-            unreachable!();
-        };
-        cookies.insert("token".to_owned(), token.clone());
-        cookies.insert("userid".to_owned(), userid.clone());
-        cookies.insert("dfid".to_owned(), Self::lite_credential_dfid(credential));
-        cookie_header(&cookies)
     }
 
     fn web_credential_cookie_header(credential: &ProviderCredential) -> String {
@@ -721,6 +921,10 @@ impl KugouAdapter {
             .and_then(|cred| Self::credential_fields(cred).ok())
             .map(|(token, userid, _)| (token, userid))
             .unwrap_or(("", ""));
+        // Lite 请求优先使用登录续期得到的设备绑定令牌；Web 会话令牌只留给 Web 端点。
+        let token = credential
+            .and_then(Self::lite_credential_token)
+            .unwrap_or_else(|| token.to_owned());
         let dfid = credential
             .map(Self::lite_credential_dfid)
             .unwrap_or_else(|| "-".to_owned());
@@ -740,7 +944,7 @@ impl KugouAdapter {
             ("uuid".to_owned(), "-".to_owned()),
         ]);
         if !token.is_empty() {
-            params.insert("token".to_owned(), token.to_owned());
+            params.insert("token".to_owned(), token);
         }
         if !userid.is_empty() {
             params.insert("userid".to_owned(), userid.to_owned());
@@ -807,8 +1011,10 @@ impl KugouAdapter {
         // 上游模块传递 `notSign`（而非请求辅助函数的 `notSignature` 标志），
         // 因此 request.js 注入 `key` 后仍会添加标准 Android 签名。此处保持相同线协议。
         params.insert("signature".to_owned(), kugou_android_signature(&params, ""));
+        // Lite 请求使用设备绑定令牌（登录续期产物），Web 会话令牌只留给 Web 端点。
+        let token = Self::lite_credential_token(credential).unwrap_or_else(|| token.to_owned());
         if !token.is_empty() {
-            params.insert("token".to_owned(), token.to_owned());
+            params.insert("token".to_owned(), token);
         }
         Ok(params)
     }
@@ -819,6 +1025,7 @@ impl KugouAdapter {
     ) -> reqwest::RequestBuilder {
         request
             .header("User-Agent", KUGOU_UA)
+            .header("Accept", "*/*")
             .header(
                 "dfid",
                 params.get("dfid").map(String::as_str).unwrap_or("-"),
@@ -1009,8 +1216,8 @@ impl KugouAdapter {
                 .web_request_via_helper(url, credential, executable)
                 .await;
         }
-        Err(CatalogError::Transient(
-            "Kugou SSA challenge requires the WebView2 login helper".to_owned(),
+        Err(kugou_verification_error(
+            "ssa challenge without a WebView2 login helper",
         ))
     }
 
@@ -1054,8 +1261,8 @@ impl KugouAdapter {
                 .web_request_via_helper(url, credential, executable)
                 .await;
         }
-        Err(CatalogError::Transient(
-            "Kugou SSA challenge requires the WebView2 login helper".to_owned(),
+        Err(kugou_verification_error(
+            "ssa challenge without a WebView2 login helper",
         ))
     }
 
@@ -1083,10 +1290,8 @@ impl KugouAdapter {
             request = request.header(*name, *value);
         }
 
-        if let Some(cred) = credential {
-            request = request.header("Cookie", Self::credential_cookie_header(cred));
-        }
-
+        ensure_kugou_verification_window()?;
+        pace_kugou_request().await;
         let response = request.send().await.map_err(classify_request_error)?;
         classify_status(&response)?;
         let value = response
@@ -1109,8 +1314,9 @@ impl KugouAdapter {
         let params = Self::lite_song_url_params(credential, hash, album_id, album_audio_id)?;
         let request =
             Self::apply_device_headers(self.client.get(URL_SONG_STREAM).query(&params), &params)
-                .header("x-router", "trackercdn.kugou.com")
-                .header("Cookie", Self::credential_cookie_header(credential));
+                .header("x-router", "trackercdn.kugou.com");
+        ensure_kugou_verification_window()?;
+        pace_kugou_request().await;
         let response = request.send().await.map_err(classify_request_error)?;
         classify_status(&response)?;
         let value = response
@@ -1131,11 +1337,9 @@ impl KugouAdapter {
         credential: Option<&ProviderCredential>,
     ) -> Result<Value, CatalogError> {
         let device = Self::device_params(credential, KUGOU_LITE_APPID, KUGOU_LITE_CLIENTVER);
-        let mut request =
-            Self::apply_device_headers(self.client.get(endpoint).query(&query), &device);
-        if let Some(cred) = credential {
-            request = request.header("Cookie", Self::credential_cookie_header(cred));
-        }
+        let request = Self::apply_device_headers(self.client.get(endpoint).query(&query), &device);
+        ensure_kugou_verification_window()?;
+        pace_kugou_request().await;
         let response = request.send().await.map_err(classify_request_error)?;
         classify_status(&response)?;
         let value = response
@@ -1198,15 +1402,14 @@ impl KugouAdapter {
             request = request.header(*name, *value);
         }
 
-        if let Some(cred) = credential {
-            request = request.header("Cookie", Self::credential_cookie_header(cred));
-        }
         if let Some(body_text) = body_text {
             request = request
                 .header("Content-Type", "application/json")
                 .body(body_text.to_owned());
         }
 
+        ensure_kugou_verification_window()?;
+        pace_kugou_request().await;
         let response = request.send().await.map_err(classify_request_error)?;
         classify_status(&response)?;
         let headers = response.headers().clone();
@@ -1218,6 +1421,349 @@ impl KugouAdapter {
         Ok((value, headers))
     }
 
+    /// 判断凭据是否带有完整的 Lite 设备标识（GUID/MAC/DEV）。
+    fn has_lite_device_identity(credential: &ProviderCredential) -> bool {
+        ["KUGOU_API_GUID", "KUGOU_API_MAC", "KUGOU_API_DEV"]
+            .into_iter()
+            .all(|name| Self::credential_cookie_value(credential, name).is_some())
+    }
+
+    /// 读取凭据里的一个非空 Cookie 值。
+    fn credential_cookie_value(credential: &ProviderCredential, name: &str) -> Option<String> {
+        credential
+            .cookies()
+            .get(name)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| {
+                !value.is_empty() && !value.eq_ignore_ascii_case("undefined") && value != "-"
+            })
+    }
+
+    /// Lite/Android 请求使用的令牌：优先取登录续期得到的设备绑定令牌。
+    fn lite_credential_token(credential: &ProviderCredential) -> Option<String> {
+        Self::credential_cookie_value(credential, KUGOU_LITE_TOKEN_COOKIE)
+    }
+
+    /// 构造 /v5/login_by_token 请求体。
+    ///
+    /// t1/t2 把登录会话绑定到本机设备标识，密钥由本次调用随机生成并随 pk 一起加密上报；
+    /// 返回的 secu_params 必须用同一密钥解密。
+    fn login_by_token_body(
+        credential: &ProviderCredential,
+        date_now_ms: u64,
+        session_key: &str,
+    ) -> Result<String, CatalogError> {
+        let (token, userid, _) = Self::credential_fields(credential)?;
+        let derived = kugou_md5_hex(session_key);
+        let session_aes_key = derived.get(..32).unwrap_or(derived.as_str()).to_owned();
+        let session_aes_iv = derived
+            .get(derived.len().saturating_sub(16)..)
+            .unwrap_or_default()
+            .to_owned();
+        let p3_plaintext = serde_json::to_vec(&KugouLoginP3 {
+            clienttime: date_now_ms / 1000,
+            token: token.to_owned(),
+        })
+        .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        let p3 = aes_cbc_encrypt_hex(
+            &p3_plaintext,
+            KUGOU_LITE_LOGIN_TOKEN_KEY,
+            KUGOU_LITE_LOGIN_TOKEN_IV,
+        )
+        .map_err(kugou_crypto_error)?;
+        let pk_plaintext = serde_json::to_vec(&KugouLoginPk {
+            clienttime_ms: date_now_ms,
+            key: session_key.to_owned(),
+        })
+        .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        let pk = rsa_raw_encrypt_hex(&pk_plaintext, KUGOU_LITE_RSA_PUBLIC_KEY)
+            .map_err(kugou_crypto_error)?;
+        let params = aes_cbc_encrypt_hex(b"{}", &session_aes_key, &session_aes_iv)
+            .map_err(kugou_crypto_error)?;
+        let guid = Self::credential_cookie_value(credential, "KUGOU_API_GUID").unwrap_or_default();
+        let mac = Self::credential_cookie_value(credential, "KUGOU_API_MAC").unwrap_or_default();
+        let dev = Self::credential_cookie_value(credential, "KUGOU_API_DEV").unwrap_or_default();
+        let t2_plaintext = format!("{guid}|{KUGOU_LOGIN_T2_CONST}|{mac}|{dev}|{date_now_ms}");
+        let t2 = aes_cbc_encrypt_hex(
+            t2_plaintext.as_bytes(),
+            KUGOU_LITE_LOGIN_T2_KEY,
+            KUGOU_LITE_LOGIN_T2_IV,
+        )
+        .map_err(kugou_crypto_error)?;
+        let previous_t1 = Self::credential_cookie_value(credential, "t1").unwrap_or_default();
+        let t1 = aes_cbc_encrypt_hex(
+            format!("{previous_t1}|{date_now_ms}").as_bytes(),
+            KUGOU_LITE_LOGIN_T1_KEY,
+            KUGOU_LITE_LOGIN_T1_IV,
+        )
+        .map_err(kugou_crypto_error)?;
+        let body = KugouLoginByTokenBody {
+            dfid: Self::lite_credential_dfid(credential),
+            p3,
+            plat: 1,
+            t1,
+            t2,
+            t3: KUGOU_LOGIN_T3.to_owned(),
+            pk,
+            params,
+            userid: if userid.is_empty() {
+                "0".to_owned()
+            } else {
+                userid.to_owned()
+            },
+            clienttime_ms: date_now_ms,
+            dev,
+        };
+        serialize_kugou_body(&body)
+    }
+
+    /// 用设备绑定身份续期 Lite 登录令牌。
+    async fn refresh_login_by_token(
+        &self,
+        credential: &ProviderCredential,
+    ) -> Result<ProviderCredential, CatalogError> {
+        let ProviderCredential::Kugou {
+            token: web_token,
+            userid: web_userid,
+            dfid: web_dfid,
+            ..
+        } = credential
+        else {
+            return Err(CatalogError::InvalidResponse(
+                "Kugou login refresh requires Kugou credentials".to_owned(),
+            ));
+        };
+        let date_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        let session_key = random_lowercase_string(16);
+        let body = Self::login_by_token_body(credential, date_now_ms, &session_key)?;
+        let (value, _headers) = self
+            .post_json_text_direct_with_headers(
+                URL_LOGIN_BY_TOKEN,
+                Vec::new(),
+                Some(&body),
+                Some(credential),
+                &[],
+            )
+            .await?;
+        let data = response_data(&value);
+        let mut cookies = credential.cookies().clone();
+        let mut token = data.get("token").and_then(value_string);
+        let mut userid = data.get("userid").and_then(value_string);
+        if let Some(secu_params) = data.get("secu_params").and_then(Value::as_str) {
+            let derived = kugou_md5_hex(&session_key);
+            let key = derived.get(..32).unwrap_or(derived.as_str());
+            let iv = derived
+                .get(derived.len().saturating_sub(16)..)
+                .unwrap_or_default();
+            let decrypted =
+                aes_cbc_decrypt_hex(secu_params, key, iv).map_err(kugou_crypto_error)?;
+            let text = String::from_utf8(decrypted).map_err(|error| {
+                CatalogError::InvalidResponse(format!(
+                    "Kugou login refresh payload is not UTF-8: {error}"
+                ))
+            })?;
+            match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Object(map)) => {
+                    for (name, value) in map {
+                        let value = match value {
+                            Value::String(text) => text,
+                            other => value_string(&other).unwrap_or_default(),
+                        };
+                        if value.is_empty() {
+                            continue;
+                        }
+                        if name == "token" {
+                            token = Some(value.clone());
+                        }
+                        if name == "userid" {
+                            userid = Some(value.clone());
+                        }
+                        cookies.insert(name, value);
+                    }
+                }
+                _ => token = Some(text),
+            }
+        }
+        let token = token
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                CatalogError::CredentialRejected(
+                    "Kugou login refresh returned no session token".to_owned(),
+                )
+            })?;
+        cookies.insert(KUGOU_LITE_TOKEN_COOKIE.to_owned(), token);
+        for name in ["t1", "vip_type", "vip_token"] {
+            if let Some(value) = data.get(name).and_then(value_string) {
+                cookies.insert(name.to_owned(), value);
+            }
+        }
+        if let Some(userid) = userid.filter(|value| !value.trim().is_empty()) {
+            cookies.insert("userid".to_owned(), userid);
+        }
+        Ok(ProviderCredential::Kugou {
+            token: web_token.clone(),
+            userid: web_userid.clone(),
+            dfid: web_dfid.clone(),
+            cookies,
+        })
+    }
+
+    /// 读取凭据里的一个非空 Cookie 值。
+    /// 概念版（lite）歌曲搜索参数。
+    ///
+    /// 官方概念版搜索把 clientver 覆盖为 201，并使用 privilegefilter/area_code/dopicfull；
+    /// 旧的 albumhide/nocollect 组合已经不再是客户端发出的请求形状。
+    fn search_params(keyword: &str, limit: usize) -> Vec<(&'static str, String)> {
+        vec![
+            ("clientver", KUGOU_LITE_SEARCH_CLIENTVER.to_string()),
+            ("area_code", "1".to_owned()),
+            ("dopicfull", "1".to_owned()),
+            ("iscorrection", "1".to_owned()),
+            ("keyword", keyword.to_owned()),
+            ("page", "1".to_owned()),
+            ("pagesize", limit.clamp(1, 30).to_string()),
+            ("platform", "AndroidFilter".to_owned()),
+            ("privilegefilter", "0".to_owned()),
+        ]
+    }
+
+    /// 官方 VIP 私密取流请求体（对应上游 module/song_url_new.js）。
+    ///
+    /// key 按上游模块固定使用标准版 appid 计算；viptoken/vip 来自登录凭据，缺失时留空。
+    fn priv_url_body(
+        credential: &ProviderCredential,
+        hash: &str,
+        album_audio_id: &str,
+        clienttime_ms: u64,
+    ) -> Result<String, CatalogError> {
+        let (token, userid, _) = Self::credential_fields(credential)?;
+        let cookies = credential.cookies();
+        let cookie_value = |name: &str| {
+            cookies
+                .get(name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("undefined"))
+        };
+        let vip_token = cookie_value("vip_token").unwrap_or_default();
+        let vip_type = cookie_value("vip_type")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let normalized_hash = hash.to_ascii_lowercase();
+        let body = KugouPrivUrlBody {
+            area_code: "1".to_owned(),
+            behavior: "play".to_owned(),
+            qualities: [
+                "128",
+                "320",
+                "flac",
+                "high",
+                "multitrack",
+                "viper_atmos",
+                "viper_tape",
+                "viper_clear",
+                "super",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            resource: KugouPrivUrlResource {
+                album_audio_id: album_audio_id.to_owned(),
+                collect_list_id: "3".to_owned(),
+                collect_time: clienttime_ms,
+                hash: normalized_hash.clone(),
+                id: 0,
+                page_id: 1,
+                resource_type: "audio".to_owned(),
+            },
+            token: token.to_owned(),
+            tracker_param: KugouPrivUrlTracker {
+                all_m: 1,
+                auth: String::new(),
+                is_free_part: 0,
+                key: kugou_stream_key(
+                    &normalized_hash,
+                    &Self::credential_mid(Some(credential)),
+                    if userid.is_empty() { "0" } else { userid },
+                    KUGOU_ANDROID_APPID,
+                ),
+                module_id: 0,
+                need_climax: 1,
+                need_xcdn: 1,
+                open_time: String::new(),
+                pid: "411".to_owned(),
+                pidversion: "3001".to_owned(),
+                priv_vip_type: "6".to_owned(),
+                viptoken: vip_token,
+            },
+            userid: if userid.is_empty() {
+                "0".to_owned()
+            } else {
+                userid.to_owned()
+            },
+            vip: vip_type,
+        };
+        serialize_kugou_body(&body)
+    }
+
+    /// 请求 /v6/priv_url：默认参数与 Android 签名由通用 POST 路径补齐。
+    async fn get_priv_song_url(
+        &self,
+        credential: &ProviderCredential,
+        hash: &str,
+        album_audio_id: &str,
+    ) -> Result<Value, CatalogError> {
+        let clienttime_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        let body = Self::priv_url_body(credential, hash, album_audio_id, clienttime_ms)?;
+        let (value, _headers) = self
+            .post_json_text_direct_with_headers(
+                URL_PRIV_SONG_STREAM,
+                Vec::new(),
+                Some(&body),
+                Some(credential),
+                &[],
+            )
+            .await?;
+        Ok(value)
+    }
+
+    /// 取流：先走 Lite /v5/url，拿不到地址时再用 VIP 私密取流兜底。
+    ///
+    /// 正常歌曲只发一次请求；只有 Lite 路径缺少可播放地址或返回会员/不可用错误时，
+    /// 才追加 /v6/priv_url。两步都失败时保留 Lite 的错误语义（除非命中了人机验证）。
+    async fn resolve_song_url_value(
+        &self,
+        credential: &ProviderCredential,
+        hash: &str,
+        album_id: &str,
+        album_audio_id: &str,
+    ) -> Result<Value, CatalogError> {
+        let lite = self
+            .get_lite_song_url(credential, hash, album_id, album_audio_id)
+            .await;
+        if lite
+            .as_ref()
+            .ok()
+            .is_some_and(|value| extract_stream_url(value).is_some())
+        {
+            return lite;
+        }
+        match self
+            .get_priv_song_url(credential, hash, album_audio_id)
+            .await
+        {
+            Ok(value) if extract_stream_url(&value).is_some() => Ok(value),
+            Ok(_) => lite,
+            Err(error) if matches!(error, CatalogError::VerificationRequired(_)) => Err(error),
+            Err(_) => lite,
+        }
+    }
+
     async fn search_json(
         &self,
         keyword: &str,
@@ -1226,15 +1772,7 @@ impl KugouAdapter {
     ) -> Result<Value, CatalogError> {
         self.get_json_direct_with_headers(
             URL_SEARCH,
-            vec![
-                ("albumhide", "0".to_owned()),
-                ("iscorrection", "1".to_owned()),
-                ("keyword", keyword.to_owned()),
-                ("nocollect", "0".to_owned()),
-                ("page", "1".to_owned()),
-                ("pagesize", limit.clamp(1, 30).to_string()),
-                ("platform", "AndroidFilter".to_owned()),
-            ],
+            Self::search_params(keyword, limit),
             Some(credential),
             &[("x-router", "complexsearch.kugou.com")],
         )
@@ -1331,9 +1869,18 @@ impl KugouAdapter {
         credential: &ProviderCredential,
     ) -> Result<ProviderCredential, CatalogError> {
         let credential = self.credential_with_device(credential);
-        // Web 二维码登录返回 Web 会话令牌。酷狗没有兼容该会话的 lite
-        // `login_by_token` 刷新路径，因此刷新操作只进行已认证的 Web 校验，并原样返回
-        // 仍有效的快照。
+        // 首选设备绑定的 Lite 续期（/v5/login_by_token）：它把登录会话绑定到
+        // 本机设备标识，并返回供 Lite/Android 请求使用的令牌。缺少设备标识、
+        // 或上游未返回新令牌时，退回 Web 会话校验并返回仍有效的快照。
+        if Self::has_lite_device_identity(&credential) {
+            match self.refresh_login_by_token(&credential).await {
+                Ok(refreshed) => return Ok(refreshed),
+                Err(error @ CatalogError::VerificationRequired(_)) => return Err(error),
+                Err(error) => {
+                    log::debug!("酷狗 Lite 登录续期未成功，回落到 Web 会话校验: {error}");
+                }
+            }
+        }
         self.validate_web_credential(&credential).await?;
         Ok(credential)
     }
@@ -1610,8 +2157,8 @@ impl KugouAdapter {
     fn lyrics_search_params(hash: &str, album_audio_id: &str) -> BTreeMap<String, String> {
         BTreeMap::from([
             ("album_audio_id".to_owned(), album_audio_id.to_owned()),
-            ("appid".to_owned(), KUGOU_LITE_APPID.to_string()),
-            ("clientver".to_owned(), KUGOU_LITE_CLIENTVER.to_string()),
+            ("appid".to_owned(), KUGOU_ANDROID_APPID.to_string()),
+            ("clientver".to_owned(), KUGOU_ANDROID_CLIENTVER.to_string()),
             ("duration".to_owned(), "0".to_owned()),
             ("hash".to_owned(), hash.to_owned()),
             ("keyword".to_owned(), String::new()),
@@ -1717,10 +2264,10 @@ impl SourceAdapter for KugouAdapter {
         }
         let (hash, album_id, album_audio_id) = resolver_parts(key, locator)?;
         let credential = self.credential()?;
-        // 遵循上游 `module/song_url.js` 使用的测试版/lite Android 路径。
-        // 播放固定走 `/v5/url`，避免将 Web KuGoo 会话与 Lite 设备标识混用。
+        // 遵循上游 module/song_url.js 使用的测试版/lite Android 路径，
+        // 拿不到地址时再由 /v6/priv_url 兜底；两种请求都不混用 Web 会话标识。
         let response = self
-            .get_lite_song_url(&credential, &hash, &album_id, &album_audio_id)
+            .resolve_song_url_value(&credential, &hash, &album_id, &album_audio_id)
             .await?;
         let url = extract_stream_url(&response)
             .map(str::to_owned)
@@ -1854,7 +2401,7 @@ fn classify_kugou_resolve_failure(response: &Value) -> CatalogError {
 fn is_web_challenge_response(response: &Value) -> bool {
     let data = response_data(response);
     let code = [response, data].into_iter().find_map(|value| {
-        ["err_code", "error_code", "errorCode", "code"]
+        ["errcode", "err_code", "error_code", "errorCode", "code"]
             .into_iter()
             .find_map(|field| value.get(field).and_then(value_i64))
     });
@@ -1863,7 +2410,13 @@ fn is_web_challenge_response(response: &Value) -> bool {
             .into_iter()
             .find_map(|field| value.get(field).and_then(Value::as_str))
     });
-    matches!(code, Some(20028 | 30020)) && eventid.is_some_and(|value| !value.is_empty())
+    match code {
+        // 本次请求需要验证：交回 WebView2 真实浏览器上下文完成。
+        Some(20028) => true,
+        // 30020 只在带 eventid 时代表挑战，否则是 Web 令牌过期。
+        Some(30020) => eventid.is_some_and(|value| !value.is_empty()),
+        _ => false,
+    }
 }
 
 fn extract_stream_url(response: &Value) -> Option<&str> {
@@ -2415,6 +2968,9 @@ fn value_u64(value: &Value) -> Option<u64> {
 }
 
 fn classify_status(response: &reqwest::Response) -> Result<(), CatalogError> {
+    if response.headers().contains_key("ssa-code") {
+        return Err(kugou_verification_error("ssa-code response header"));
+    }
     match response.status() {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(CatalogError::CredentialRejected(
             "Kugou rejected credential".to_owned(),
@@ -2432,7 +2988,45 @@ fn classify_status(response: &reqwest::Response) -> Result<(), CatalogError> {
     }
 }
 
+/// 从响应正文中取出酷狗业务错误码。
+fn kugou_business_error_code(value: &Value) -> Option<i64> {
+    let data = response_data(value);
+    [value, data].into_iter().find_map(|candidate| {
+        ["errcode", "err_code", "error_code", "errorCode", "code"]
+            .into_iter()
+            .find_map(|field| candidate.get(field).and_then(value_i64))
+    })
+}
+
+/// 正文里的 SSA 挑战凭据（ssaCode/ssa_code），用于判定与日志。
+fn kugou_business_verification_hint(value: &Value) -> Option<&str> {
+    let data = response_data(value);
+    [value, data].into_iter().find_map(|candidate| {
+        ["ssaCode", "ssa_code"]
+            .into_iter()
+            .find_map(|field| candidate.get(field).and_then(Value::as_str))
+            .filter(|hint| !hint.trim().is_empty())
+    })
+}
+
+/// SSA 人机验证判定：错误码 20028 或返回体带 ssaCode。
+/// 与普通业务失败分开处理：不重试、不换源、不重搜。
+fn kugou_verification_failure(value: &Value) -> Option<CatalogError> {
+    let code = kugou_business_error_code(value);
+    let hint = kugou_business_verification_hint(value);
+    if code != Some(KUGOU_VERIFICATION_CODE) && hint.is_none() {
+        return None;
+    }
+    Some(kugou_verification_error(match hint {
+        Some(hint) => hint,
+        None => "errcode 20028",
+    }))
+}
+
 fn classify_business_response(value: &Value) -> Result<(), CatalogError> {
+    if let Some(error) = kugou_verification_failure(value) {
+        return Err(error);
+    }
     let data = response_data(value);
     let status = find_kugou_business_number(value, &["status"])
         .or_else(|| data.get("status").and_then(value_i64));
@@ -2522,8 +3116,9 @@ mod tests {
 
     use super::{
         KugouAdPlayReportBody, classify_business_response, classify_kugou_resolve_failure,
-        decode_lrc_content, extract_stream_url, is_web_challenge_response, kugou_android_signature,
-        kugou_calculate_mid, kugou_lite_sign_key, kugou_normalize_guid,
+        decode_lrc_content, ensure_kugou_verification_window, extract_stream_url,
+        is_web_challenge_response, kugou_android_signature, kugou_calculate_mid,
+        kugou_lite_sign_key, kugou_normalize_guid, kugou_verification_lock,
         load_legacy_device_identity, parse_kugou_datetime_ms, parse_search_candidates,
         resolver_parts, serialize_kugou_body, validate_web_credential_response,
     };
@@ -2817,22 +3412,186 @@ mod tests {
     }
 
     #[test]
-    fn credential_cookie_header_contains_required_api_cookie_fields() {
+    fn login_by_token_body_binds_the_device_identity() {
         let credential = ProviderCredential::Kugou {
-            token: "token-secret".to_owned(),
+            token: "web-token".to_owned(),
             userid: "123".to_owned(),
-            dfid: "device-id".to_owned(),
-            cookies: BTreeMap::from([("mid".to_owned(), "device-mid".to_owned())]),
+            dfid: "web-dfid".to_owned(),
+            cookies: BTreeMap::from([
+                ("KUGOU_API_GUID".to_owned(), "guid-value".to_owned()),
+                ("KUGOU_API_MAC".to_owned(), "mac-value".to_owned()),
+                ("KUGOU_API_DEV".to_owned(), "dev-value".to_owned()),
+                ("KUGOU_API_DFID".to_owned(), "lite-dfid".to_owned()),
+                ("t1".to_owned(), "previous-t1".to_owned()),
+            ]),
         };
-        let header = super::KugouAdapter::credential_cookie_header(&credential);
-        assert!(header.contains("token=token-secret"));
-        assert!(header.contains("userid=123"));
-        assert!(header.contains("dfid=device-id"));
-        assert!(header.contains("mid=device-mid"));
+        let session_key = "0123456789abcdef";
+        let date_now_ms = 1_700_000_000_000_u64;
+        let body = super::KugouAdapter::login_by_token_body(&credential, date_now_ms, session_key)
+            .expect("login body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["plat"], 1);
+        assert_eq!(value["dfid"], "lite-dfid");
+        assert_eq!(value["dev"], "dev-value");
+        assert_eq!(value["userid"], "123");
+        assert_eq!(value["clienttime_ms"], date_now_ms);
+        assert_eq!(value["t3"], super::KUGOU_LOGIN_T3);
+        // p3 使用固定 Lite 密钥，可解回 clienttime/token。
+        let p3 = super::aes_cbc_decrypt_hex(
+            value["p3"].as_str().unwrap(),
+            super::KUGOU_LITE_LOGIN_TOKEN_KEY,
+            super::KUGOU_LITE_LOGIN_TOKEN_IV,
+        )
+        .expect("p3 ciphertext");
+        assert_eq!(
+            String::from_utf8(p3).unwrap(),
+            format!(
+                "{{\"clienttime\":{},\"token\":\"web-token\"}}",
+                date_now_ms / 1000
+            )
+        );
+        // t2 把登录会话绑定到 GUID/MAC/DEV 与时间戳。
+        let t2 = super::aes_cbc_decrypt_hex(
+            value["t2"].as_str().unwrap(),
+            super::KUGOU_LITE_LOGIN_T2_KEY,
+            super::KUGOU_LITE_LOGIN_T2_IV,
+        )
+        .expect("t2 ciphertext");
+        assert_eq!(
+            String::from_utf8(t2).unwrap(),
+            format!(
+                "guid-value|{}|mac-value|dev-value|{date_now_ms}",
+                super::KUGOU_LOGIN_T2_CONST
+            )
+        );
+        // t1 串接上一次的 t1 值。
+        let t1 = super::aes_cbc_decrypt_hex(
+            value["t1"].as_str().unwrap(),
+            super::KUGOU_LITE_LOGIN_T1_KEY,
+            super::KUGOU_LITE_LOGIN_T1_IV,
+        )
+        .expect("t1 ciphertext");
+        assert_eq!(
+            String::from_utf8(t1).unwrap(),
+            format!("previous-t1|{date_now_ms}")
+        );
+        // params 是本次会话密钥对 "{}" 的加密结果，密钥随 pk 上报。
+        let derived = super::kugou_md5_hex(session_key);
+        let params = super::aes_cbc_decrypt_hex(
+            value["params"].as_str().unwrap(),
+            &derived[..32],
+            &derived[16..32],
+        )
+        .expect("params ciphertext");
+        assert_eq!(params, b"{}");
+        // pk 是裸 RSA（无随机填充），因此同输入必须得到同一密文。
+        let pk = value["pk"].as_str().unwrap();
+        assert_eq!(pk.len(), 256);
+        assert_eq!(
+            pk,
+            super::rsa_raw_encrypt_hex(
+                format!("{{\"clienttime_ms\":{date_now_ms},\"key\":\"{session_key}\"}}").as_bytes(),
+                super::KUGOU_LITE_RSA_PUBLIC_KEY,
+            )
+            .expect("raw rsa")
+        );
     }
 
     #[test]
-    fn web_and_lite_cookie_headers_keep_their_dfid_sessions_separate() {
+    fn priv_url_body_carries_vip_credentials_and_standard_key() {
+        let credential = ProviderCredential::Kugou {
+            token: "web-token".to_owned(),
+            userid: "123".to_owned(),
+            dfid: "web-dfid".to_owned(),
+            cookies: BTreeMap::from([
+                ("KUGOU_API_MID".to_owned(), "987654321".to_owned()),
+                ("vip_token".to_owned(), "vip-token".to_owned()),
+                ("vip_type".to_owned(), "6".to_owned()),
+            ]),
+        };
+        let body =
+            super::KugouAdapter::priv_url_body(&credential, "ABCDEF", "88", 1_700_000_000_000)
+                .expect("priv url body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["behavior"], "play");
+        assert_eq!(value["area_code"], "1");
+        assert_eq!(value["vip"], 6);
+        assert_eq!(value["userid"], "123");
+        assert_eq!(value["resource"]["hash"], "abcdef");
+        assert_eq!(value["resource"]["album_audio_id"], "88");
+        assert_eq!(value["resource"]["collect_list_id"], "3");
+        assert_eq!(value["resource"]["type"], "audio");
+        assert_eq!(value["tracker_param"]["viptoken"], "vip-token");
+        assert_eq!(value["tracker_param"]["priv_vip_type"], "6");
+        assert_eq!(value["tracker_param"]["pid"], "411");
+        assert_eq!(
+            value["tracker_param"]["key"],
+            super::kugou_stream_key("abcdef", "987654321", "123", 1005)
+        );
+        // key 使用标准版 appid，与概念版取流 key 不同。
+        assert_ne!(
+            value["tracker_param"]["key"],
+            super::kugou_stream_key("abcdef", "987654321", "123", 3116)
+        );
+        assert!(super::URL_PRIV_SONG_STREAM.ends_with("/v6/priv_url"));
+    }
+
+    #[test]
+    fn lite_stream_params_prefer_the_refreshed_device_token() {
+        let credential = ProviderCredential::Kugou {
+            token: "web-token".to_owned(),
+            userid: "123".to_owned(),
+            dfid: "web-dfid".to_owned(),
+            cookies: BTreeMap::from([(
+                super::KUGOU_LITE_TOKEN_COOKIE.to_owned(),
+                "lite-token".to_owned(),
+            )]),
+        };
+        let params = super::KugouAdapter::lite_song_url_params(&credential, "ABCDEF", "7", "88")
+            .expect("lite params");
+        assert_eq!(params.get("token").map(String::as_str), Some("lite-token"));
+    }
+
+    #[tokio::test]
+    async fn consecutive_kugou_requests_are_paced_apart() {
+        let start = std::time::Instant::now();
+        super::pace_kugou_request().await;
+        super::pace_kugou_request().await;
+        assert!(
+            start.elapsed() >= super::KUGOU_MIN_REQUEST_INTERVAL,
+            "second request must wait for the pacing interval"
+        );
+    }
+
+    #[test]
+    fn search_request_matches_the_current_concept_client_shape() {
+        assert!(super::URL_SEARCH.ends_with("/v2/search/song"));
+        let params = super::KugouAdapter::search_params("晴天", 12)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(params.get("clientver").map(String::as_str), Some("201"));
+        assert_eq!(params.get("privilegefilter").map(String::as_str), Some("0"));
+        assert_eq!(params.get("area_code").map(String::as_str), Some("1"));
+        assert_eq!(params.get("dopicfull").map(String::as_str), Some("1"));
+        assert_eq!(params.get("iscorrection").map(String::as_str), Some("1"));
+        assert_eq!(
+            params.get("platform").map(String::as_str),
+            Some("AndroidFilter")
+        );
+        assert_eq!(params.get("pagesize").map(String::as_str), Some("12"));
+        assert!(!params.contains_key("albumhide"));
+        assert!(!params.contains_key("nocollect"));
+    }
+
+    #[test]
+    fn lyrics_search_uses_standard_client_parameters() {
+        let params = super::KugouAdapter::lyrics_search_params("ABCDEF", "88");
+        assert_eq!(params.get("appid").map(String::as_str), Some("1005"));
+        assert_eq!(params.get("clientver").map(String::as_str), Some("20489"));
+    }
+
+    #[test]
+    fn web_cookie_header_keeps_its_session_and_lite_requests_carry_no_cookie() {
         let credential = ProviderCredential::Kugou {
             token: "token-secret".to_owned(),
             userid: "123".to_owned(),
@@ -2845,6 +3604,7 @@ mod tests {
                 ("dfid".to_owned(), "web-dfid-cookie".to_owned()),
                 ("KUGOU_API_DFID".to_owned(), "lite-dfid".to_owned()),
                 ("mid".to_owned(), "web-mid".to_owned()),
+                ("kg_mid".to_owned(), "web-kg-mid".to_owned()),
             ]),
         };
         let web = super::KugouAdapter::web_credential_cookie_header(&credential);
@@ -2853,10 +3613,18 @@ mod tests {
         assert!(!web.contains("dfid=lite-dfid"));
         assert!(!web.contains("KUGOU_API_DFID=lite-dfid"));
 
-        let lite = super::KugouAdapter::credential_cookie_header(&credential);
-        assert!(lite.contains("dfid=lite-dfid"));
-        assert!(lite.contains("token=token-secret"));
-        assert!(!lite.contains("KuGoo="));
+        // Lite/Android 请求的 token、userid、dfid、mid 全部走查询参数与设备头，
+        // 不再携带任何浏览器 Cookie，避免 SSA 读到两个设备会话。
+        let params =
+            super::KugouAdapter::lite_song_url_params(&credential, "ABCDEF0123456789", "7", "88")
+                .expect("lite playback params");
+        assert_eq!(params.get("dfid").map(String::as_str), Some("lite-dfid"));
+        assert_eq!(
+            params.get("token").map(String::as_str),
+            Some("token-secret")
+        );
+        assert_eq!(params.get("userid").map(String::as_str), Some("123"));
+        assert!(!params.contains_key("Cookie"));
     }
 
     #[test]
@@ -2962,6 +3730,45 @@ mod tests {
             "err_code": 20010,
             "data": {"eventid": "request-id"}
         })));
+        // 20028 即使没有 eventid 也代表挑战，交回真实浏览器处理。
+        assert!(is_web_challenge_response(&json!({
+            "errcode": 20028,
+            "status": 0,
+            "error": "本次请求需要验证"
+        })));
+    }
+
+    #[test]
+    fn verification_challenges_are_classified_and_pause_kugou_requests() {
+        *kugou_verification_lock() = None;
+        // 20028 与 ssaCode 都按人机验证处理，并且是不可重试的平台故障。
+        let challenge = classify_business_response(&json!({
+            "errcode": 20028,
+            "status": 0,
+            "error": "本次请求需要验证"
+        }))
+        .expect_err("20028 must be a verification failure");
+        assert!(matches!(challenge, CatalogError::VerificationRequired(_)));
+        let failure = challenge.as_failure(Some("kugou"));
+        assert_eq!(failure.code, "provider_verification_required");
+        assert!(!failure.retryable);
+        // 挑战之后进入冷静期：后续请求直接短路，不再打扰酷狗。
+        assert!(ensure_kugou_verification_window().is_err());
+        // 冷静期到期后自动恢复。
+        *kugou_verification_lock() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(ensure_kugou_verification_window().is_ok());
+        // ssaCode 存在时即使没有错误码也按挑战处理。
+        assert!(matches!(
+            classify_business_response(&json!({"data": {"ssaCode": "gz_tx_event"}})),
+            Err(CatalogError::VerificationRequired(_))
+        ));
+        // 普通业务错误仍然按原分类处理。
+        assert!(matches!(
+            classify_business_response(&json!({"status": 0, "error_code": 20018})),
+            Err(CatalogError::CredentialRejected(_))
+        ));
+        *kugou_verification_lock() = None;
     }
 
     #[test]

@@ -8,6 +8,7 @@ use flate2::read::ZlibDecoder;
 use rand::thread_rng;
 use rsa::Pkcs1v15Encrypt;
 use rsa::pkcs8::DecodePublicKey;
+use rsa::traits::PublicKeyParts;
 use std::io::Read;
 
 /// 酷狗测试版/lite 登录端点使用的公钥。
@@ -134,11 +135,7 @@ pub fn playlist_aes_decrypt_base64(
     )
 }
 
-/// 注册 `p` 查询字段使用的 RSAES-PKCS1-v1_5 加密。
-pub fn rsa_pkcs1_encrypt_hex(
-    plaintext: &[u8],
-    public_key_pem: &str,
-) -> Result<String, KugouCryptoError> {
+fn parse_public_key(public_key_pem: &str) -> Result<rsa::RsaPublicKey, KugouCryptoError> {
     let normalized_pem = public_key_pem.replace("\\n", "\n");
     // RSA crate 在 PEM 的 Base64 正文未换行时可能拒绝部分有效值。
     // 直接解码 DER 载荷，消除换行差异影响。
@@ -151,8 +148,83 @@ pub fn rsa_pkcs1_encrypt_hex(
     let der = base64::engine::general_purpose::STANDARD
         .decode(der.as_bytes())
         .map_err(|error| KugouCryptoError::RsaKey(error.to_string()))?;
-    let key = rsa::RsaPublicKey::from_public_key_der(&der)
-        .map_err(|error| KugouCryptoError::RsaKey(error.to_string()))?;
+    rsa::RsaPublicKey::from_public_key_der(&der)
+        .map_err(|error| KugouCryptoError::RsaKey(error.to_string()))
+}
+
+/// MD5 十六进制摘要；用于按上游规则从临时密钥派生 AES 密钥与 IV。
+pub fn md5_hex(value: &str) -> String {
+    md5_key(value)
+}
+
+/// 上游 cryptoAesEncrypt 的显式 key/iv 分支：AES-CBC-Pkcs7，密文输出十六进制。
+pub fn aes_cbc_encrypt_hex(
+    plaintext: &[u8],
+    key: &str,
+    iv: &str,
+) -> Result<String, KugouCryptoError> {
+    let encrypted = aes_cbc_encrypt(plaintext, key.as_bytes(), iv.as_bytes())?;
+    Ok(to_hex(&encrypted))
+}
+
+/// 上游 cryptoAesDecrypt 的十六进制密文分支。
+pub fn aes_cbc_decrypt_hex(
+    ciphertext_hex: &str,
+    key: &str,
+    iv: &str,
+) -> Result<Vec<u8>, KugouCryptoError> {
+    let mut decoded = decode_hex(ciphertext_hex)?;
+    if decoded.is_empty() || !decoded.len().is_multiple_of(16) {
+        return Err(KugouCryptoError::Aes(
+            "hex ciphertext is not a complete AES block sequence".to_owned(),
+        ));
+    }
+    decrypt_in_place(&mut decoded, key.as_bytes(), iv.as_bytes())
+}
+
+/// 上游 cryptoRSAEncrypt：把 UTF-8 字节放到模长缓冲区的开头（尾部补零）后做裸 RSA。
+///
+/// 与 PKCS#1 v1.5 不同，这里没有随机填充，因此结果可复现；酷狗登录接口依赖该形式。
+pub fn rsa_raw_encrypt_hex(
+    plaintext: &[u8],
+    public_key_pem: &str,
+) -> Result<String, KugouCryptoError> {
+    let key = parse_public_key(public_key_pem)?;
+    let key_length = key.n().bits().div_ceil(8);
+    if plaintext.len() > key_length {
+        return Err(KugouCryptoError::RsaKey(
+            "RSA plaintext exceeds the modulus size".to_owned(),
+        ));
+    }
+    let mut padded = vec![0u8; key_length];
+    padded[..plaintext.len()].copy_from_slice(plaintext);
+    let message = rsa::BigUint::from_bytes_be(&padded);
+    let encrypted = message.modpow(key.e(), key.n()).to_bytes_be();
+    let mut bytes = vec![0u8; key_length.saturating_sub(encrypted.len())];
+    bytes.extend_from_slice(&encrypted);
+    Ok(to_hex(&bytes))
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, KugouCryptoError> {
+    let trimmed = value.trim();
+    if !trimmed.len().is_multiple_of(2) {
+        return Err(KugouCryptoError::InvalidHex(value.to_owned()));
+    }
+    (0..trimmed.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&trimmed[index..index + 2], 16)
+                .map_err(|_| KugouCryptoError::InvalidHex(value.to_owned()))
+        })
+        .collect()
+}
+
+/// 注册 p 查询字段使用的 RSAES-PKCS1-v1_5 加密。
+pub fn rsa_pkcs1_encrypt_hex(
+    plaintext: &[u8],
+    public_key_pem: &str,
+) -> Result<String, KugouCryptoError> {
+    let key = parse_public_key(public_key_pem)?;
     let encrypted = key
         .encrypt(&mut thread_rng(), Pkcs1v15Encrypt, plaintext)
         .map_err(|error| KugouCryptoError::Aes(format!("RSA encryption failed: {error}")))?;

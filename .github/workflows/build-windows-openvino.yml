@@ -46,7 +46,7 @@ jobs:
           key: windows-msvc-openvino-release
 
       - name: 安装 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -313,7 +313,7 @@ jobs:
             -Force
 
       - name: 上传 OpenVINO 运行时依赖产物
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.version.outputs.artifact }}
           path: dist/${{ steps.version.outputs.artifact }}

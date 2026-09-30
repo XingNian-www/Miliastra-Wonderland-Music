@@ -1,13 +1,41 @@
-/target
-/logs
-/data
-/turtle_soup.yaml
-/models
-/.build
-/dist
-/diagnostics
-.bitfun/
+# 默认忽略根目录中的新内容，只开放下列项目目录。
+/*
+
+# 源码、构建、测试、资源和公开使用文档。
+!/.cargo/
+!/.github/
+!/assets/
+!/crates/
+!/docs/
+!/examples/
+!/scripts/
+!/src/
+!/tests/
+!/vendor/
+
+# 根目录中随项目发布的必要文件。
+!/.gitattributes
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/build.rs
+!/LICENSE
+!/README.md
+!/THIRD_PARTY_NOTICES.md
+!/config.example.yaml
+!/turtle_soup.example.yaml
+!/undercover.example.yaml
+
+# 本地维护资料和各目录中的生成物。
+/.local/
+**/target/
+**/node_modules/
+**/__pycache__/
+**/.venv/
+**/.cache/
+**/.bitfun/
+**/.build/
+**/logs/
+**/diagnostics/
+**/dist/
 /crates/miliastra-playback/examples/
-/.tmp-kugou-reference/
-.clippy-report.txt
-/.bitfun/search/flashgrep-index/

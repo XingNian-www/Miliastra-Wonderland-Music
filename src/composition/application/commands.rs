@@ -244,6 +244,7 @@ impl ApplicationRuntime {
             ModuleCommand::IdiomChain(command) => self.execute_idiom_chain_intent(parsed, command),
             ModuleCommand::CardGame(command) => self.execute_card_game_intent(parsed, command),
             ModuleCommand::TurtleSoup(command) => self.execute_turtle_soup_intent(parsed, command),
+            ModuleCommand::Tarot(command) => self.execute_tarot_intent(parsed, command),
             ModuleCommand::Undercover(command) => self.execute_undercover_intent(parsed, command),
             ModuleCommand::Invite(command) => self.execute_invite_intent(parsed, command),
             ModuleCommand::Moderation(command) => self.execute_moderation_intent(parsed, command),
@@ -251,6 +252,23 @@ impl ApplicationRuntime {
                 self.execute_custom_workflow_intent(parsed, command)
             }
         }
+    }
+
+    fn execute_tarot_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        command: &crate::features::tarot::TarotCommand,
+    ) -> Result<()> {
+        let actor = self.canonical_actor_name(&parsed.username);
+        let messages = self.business.tarot_application.execute(
+            &actor,
+            command,
+            Instant::now(),
+            &self.business.ai,
+        )?;
+        self.log_executed_command(parsed, "tarot")?;
+        let messages: Vec<_> = messages.iter().map(String::as_str).collect();
+        self.reply_batch(&messages, 0)
     }
 
     fn execute_hall_intent(&mut self, parsed: &RoutedCommand, command: &HallCommand) -> Result<()> {
@@ -386,7 +404,8 @@ impl ApplicationRuntime {
             parsed,
             &format!("{} uid {}", command.action.label(), command.uid),
         )?;
-        self.execute_moderation_with_vote(command).map(|_| ())
+        self.execute_moderation_with_vote(parsed, command)
+            .map(|_| ())
     }
 
     fn execute_custom_workflow_intent(

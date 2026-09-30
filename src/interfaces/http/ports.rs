@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use super::protocol::WebToolRequest;
 use crate::features::hall::{HallCommand, HallRuntimeState};
-use crate::features::playback::{PlaybackCommand, PlaybackRuntimeState, PlayerStatus, QueueItem};
+use crate::features::playback::{
+    PlaybackCommand, PlaybackRuntimeState, PlayerStatus, QueueItem, SongRequestLeaderboardEntry,
+};
 use crate::features::startup::StartupTask;
 use crate::features::turtle_soup::TurtleSoupSnapshot;
 use crate::features::undercover::UndercoverSnapshot;
@@ -113,6 +115,12 @@ pub(crate) trait HttpQueryPort: Send + Sync {
     fn playback_queue_snapshot(&self) -> Result<Vec<QueueItem>>;
     fn playback_state_snapshot(&self) -> Result<PlaybackRuntimeState>;
     fn hall_state_snapshot(&self) -> Result<HallRuntimeState>;
+    /// 成功播放的点歌人排行榜；`since_ms` 为 None 时统计全部历史。
+    fn song_request_leaderboard(
+        &self,
+        since_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SongRequestLeaderboardEntry>>;
 }
 
 pub(crate) trait HttpHallPort: Send + Sync {

@@ -94,6 +94,70 @@ const CACHE_TRACKS_MAX_LIMIT: usize = 500;
 /// 磁盘缓存歌曲列表默认页大小。
 const CACHE_TRACKS_DEFAULT_LIMIT: usize = 100;
 
+/// 排行榜默认返回条数。
+const LEADERBOARD_DEFAULT_LIMIT: usize = 20;
+/// 排行榜单页上限。
+const LEADERBOARD_MAX_LIMIT: usize = 100;
+
+/// GET /playback/leaderboard?days=&limit= ：成功播放的点歌人排行榜。
+/// `days` 省略或为 0 时统计全部历史，否则按最近 N 天过滤；`limit` 省略时返回前 20 名。
+pub(super) fn playback_leaderboard_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let days = match query_value(query, "days")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| bad_request("days参数无效"))?,
+        ),
+        None => None,
+    };
+    let days = days.filter(|days| *days > 0);
+    let limit = match query_value(query, "limit")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| bad_request("limit参数无效"))?
+            .clamp(1, LEADERBOARD_MAX_LIMIT),
+        None => LEADERBOARD_DEFAULT_LIMIT,
+    };
+    let since_ms = days.map(|days| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        now_ms.saturating_sub(days.saturating_mul(24 * 60 * 60 * 1000))
+    });
+    let entries = state
+        .application
+        .queries
+        .song_request_leaderboard(since_ms, limit)
+        .map_err(internal_error)?;
+    let entries: Vec<_> = entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "requester": entry.requester,
+                "count": entry.count,
+                "lastRequestedAtMs": entry.last_requested_at_ms,
+            })
+        })
+        .collect();
+    let mut value = json!({
+        "entries": entries,
+        "days": days,
+        "limit": limit,
+    });
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
+}
+
 pub(super) fn playback_statistics_reset_route(
     query: &[(String, String)],
     state: &HttpSharedState,

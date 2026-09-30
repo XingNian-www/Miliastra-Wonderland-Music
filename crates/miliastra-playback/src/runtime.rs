@@ -188,6 +188,7 @@ enum Command {
         )>,
     ),
     /// 分页查询磁盘缓存歌曲列表（SQLite 查询走 spawn_blocking，不阻塞事件循环）。
+    SearchLibrary(SearchQuery, Reply<Vec<SearchCandidate>>),
     CachedTracks(
         usize,
         usize,
@@ -576,6 +577,14 @@ impl PlaybackHandle {
         ascending: bool,
     ) -> Result<crate::cache::CachedTrackPage, PlaybackError> {
         self.request(|reply| Command::CachedTracks(offset, limit, sort, ascending, reply))
+    }
+
+    /// 仅查询本地曲库元数据，既不搜索平台也不影响正在播放的音频。
+    pub fn search_library(
+        &self,
+        query: SearchQuery,
+    ) -> Result<Vec<SearchCandidate>, PlaybackError> {
+        self.request(|reply| Command::SearchLibrary(query, reply))
     }
 
     /// 清零单曲播放与缓存统计。缓存资产、身份元数据和歌词不变。
@@ -1344,6 +1353,27 @@ async fn run_commands(
                     let _ = reply.send(Ok((None, Vec::new())));
                 }
             },
+            Command::SearchLibrary(query, reply) => {
+                if let Some(cache) = core.audio_cache.clone() {
+                    searches.spawn(async move {
+                        let result =
+                            tokio::task::spawn_blocking(move || cache.search_library(&query))
+                                .await
+                                .map_err(|error| {
+                                    PlaybackError::Internal(format!(
+                                        "library search task failed: {error}"
+                                    ))
+                                })
+                                .and_then(|result| {
+                                    result
+                                        .map_err(|error| PlaybackError::Internal(error.to_string()))
+                                });
+                        let _ = reply.send(result);
+                    });
+                } else {
+                    let _ = reply.send(Ok(Vec::new()));
+                }
+            }
             Command::CachedTracks(offset, limit, sort, ascending, reply) => {
                 match core.audio_cache.clone() {
                     Some(cache) => {
@@ -2936,6 +2966,30 @@ mod tests {
         );
         assert!(matches!(
             handle.preload(playable_track("track-d")),
+            Err(PlaybackError::RuntimeStopped)
+        ));
+    }
+
+    #[test]
+    fn library_search_without_cache_is_empty_and_does_not_control_playback() {
+        let engine = Arc::new(FakeEngine::new());
+        let runtime = test_runtime_with_parts(
+            Arc::new(FakeSource),
+            engine.clone(),
+            CredentialStore::memory(),
+        );
+        let handle = runtime.handle();
+        let result = handle
+            .search_library(SearchQuery {
+                keyword: "Test Song".into(),
+                ..SearchQuery::default()
+            })
+            .unwrap();
+        assert!(result.is_empty());
+        assert!(engine.commands.lock().unwrap().is_empty());
+        runtime.shutdown().unwrap();
+        assert!(matches!(
+            handle.search_library(SearchQuery::default()),
             Err(PlaybackError::RuntimeStopped)
         ));
     }

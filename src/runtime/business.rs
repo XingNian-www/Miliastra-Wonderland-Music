@@ -32,12 +32,15 @@ use crate::features::idiom_chain::{
     IdiomChainService,
 };
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
-use crate::features::moderation::{ModerationWorkflowKey, ModerationWorkflowLedger};
+use crate::features::moderation::{
+    ModerationWorkflowKey, ModerationWorkflowLedger, ModerationWorkflowRegistry,
+    ModerationWorkflowToken,
+};
 use crate::features::playback::{
     ActivePlaybackIdentity, ExternalPlaybackObservation, PlaybackMutationIntent,
     PlaybackMutationOutcome, PlaybackObservation, PlaybackRuntimeState, PlaybackService,
     PlaybackSessionBinding, PlaybackStateUpdate, QueueItem, QueuePushOutcome, QueueRemoval,
-    QueueRemoveOutcome, SessionReconciliation, SongDedupCandidate,
+    QueueRemoveOutcome, SessionReconciliation, SongDedupCandidate, SongRequestLeaderboardEntry,
 };
 use crate::features::turtle_soup::{
     QuestionSubmitOutcome, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupAiCompletion,
@@ -440,10 +443,12 @@ enum RuntimeMessage {
     },
     AcquireModerationWorkflow {
         key: ModerationWorkflowKey,
-        response: SyncSender<bool>,
+        direct: bool,
+        response: SyncSender<Option<Arc<ModerationWorkflowToken>>>,
     },
     ReleaseModerationWorkflow {
         key: ModerationWorkflowKey,
+        token: Arc<ModerationWorkflowToken>,
         response: SyncSender<bool>,
     },
     #[cfg(test)]
@@ -497,6 +502,7 @@ enum PlaybackRuntimeMessage {
         response: SyncSender<Result<bool, BusinessRuntimeError>>,
     },
     QueueSnapshot(SyncSender<Result<Vec<QueueItem>, BusinessRuntimeError>>),
+    PlaybackPoolSnapshot(SyncSender<Result<Vec<PlayableTrack>, BusinessRuntimeError>>),
     PlaybackPoolAvailable(SyncSender<Result<bool, BusinessRuntimeError>>),
     RemovePoolTrack {
         key: TrackKey,
@@ -567,6 +573,11 @@ enum PlaybackRuntimeMessage {
         requested_at_ms: u64,
         completed: bool,
         response: SyncSender<Result<(), BusinessRuntimeError>>,
+    },
+    SongRequestLeaderboard {
+        since_ms: Option<u64>,
+        limit: usize,
+        response: SyncSender<Result<Vec<SongRequestLeaderboardEntry>, BusinessRuntimeError>>,
     },
 }
 
@@ -1225,6 +1236,14 @@ impl BusinessRuntimeHandle {
         })
     }
 
+    pub(crate) fn playback_pool_snapshot(
+        &self,
+    ) -> Result<Vec<PlayableTrack>, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::PlaybackPoolSnapshot(response))
+        })
+    }
+
     pub(crate) fn playback_pool_available(&self) -> Result<bool, BusinessRuntimeError> {
         self.request(|response| {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::PlaybackPoolAvailable(response))
@@ -1248,6 +1267,21 @@ impl BusinessRuntimeHandle {
         self.request(|response| {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::RecordPlaybackPoolTrack {
                 track,
+                response,
+            })
+        })
+    }
+
+    /// 点歌人排行榜查询。
+    pub(crate) fn song_request_leaderboard(
+        &self,
+        since_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SongRequestLeaderboardEntry>, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::SongRequestLeaderboard {
+                since_ms,
+                limit,
                 response,
             })
         })
@@ -1509,15 +1543,25 @@ impl BusinessRuntimeHandle {
     fn acquire_moderation_workflow(
         &self,
         key: ModerationWorkflowKey,
-    ) -> Result<bool, BusinessRuntimeError> {
-        self.request_value(|response| RuntimeMessage::AcquireModerationWorkflow { key, response })
+        direct: bool,
+    ) -> Result<Option<Arc<ModerationWorkflowToken>>, BusinessRuntimeError> {
+        self.request_value(|response| RuntimeMessage::AcquireModerationWorkflow {
+            key,
+            direct,
+            response,
+        })
     }
 
     fn release_moderation_workflow(
         &self,
         key: ModerationWorkflowKey,
+        token: Arc<ModerationWorkflowToken>,
     ) -> Result<bool, BusinessRuntimeError> {
-        self.request_value(|response| RuntimeMessage::ReleaseModerationWorkflow { key, response })
+        self.request_value(|response| RuntimeMessage::ReleaseModerationWorkflow {
+            key,
+            token,
+            response,
+        })
     }
 
     #[cfg(test)]
@@ -1981,13 +2025,21 @@ impl BusinessRuntimeHandle {
 }
 
 impl ModerationWorkflowLedger for BusinessRuntimeHandle {
-    fn acquire(&self, key: ModerationWorkflowKey) -> anyhow::Result<bool> {
-        self.acquire_moderation_workflow(key)
+    fn acquire(
+        &self,
+        key: ModerationWorkflowKey,
+        direct: bool,
+    ) -> anyhow::Result<Option<Arc<ModerationWorkflowToken>>> {
+        self.acquire_moderation_workflow(key, direct)
             .map_err(anyhow::Error::from)
     }
 
-    fn release(&self, key: ModerationWorkflowKey) -> anyhow::Result<bool> {
-        self.release_moderation_workflow(key)
+    fn release(
+        &self,
+        key: ModerationWorkflowKey,
+        token: Arc<ModerationWorkflowToken>,
+    ) -> anyhow::Result<bool> {
+        self.release_moderation_workflow(key, token)
             .map_err(anyhow::Error::from)
     }
 
@@ -3276,11 +3328,19 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             RuntimeMessage::BeginInvite { request, response } => {
                 let _ = response.send(entertainment.begin_invite(request));
             }
-            RuntimeMessage::AcquireModerationWorkflow { key, response } => {
-                task_state.handle_acquire_moderation_workflow(key, response);
+            RuntimeMessage::AcquireModerationWorkflow {
+                key,
+                direct,
+                response,
+            } => {
+                task_state.handle_acquire_moderation_workflow(key, direct, response);
             }
-            RuntimeMessage::ReleaseModerationWorkflow { key, response } => {
-                task_state.handle_release_moderation_workflow(key, response);
+            RuntimeMessage::ReleaseModerationWorkflow {
+                key,
+                token,
+                response,
+            } => {
+                task_state.handle_release_moderation_workflow(key, token, response);
             }
             #[cfg(test)]
             RuntimeMessage::ContainsModerationWorkflow { key, response } => {
@@ -3966,7 +4026,7 @@ fn turtle_soup_operation_failed(error: anyhow::Error) -> BusinessRuntimeError {
 /// 封装操作控制状态与审核工作流占用表。
 struct TaskRuntimeState {
     operational: OperationalState,
-    moderation_workflows: HashSet<ModerationWorkflowKey>,
+    moderation_workflows: ModerationWorkflowRegistry,
     state_sink: Option<Arc<dyn BusinessStateSink>>,
 }
 
@@ -3974,7 +4034,7 @@ impl TaskRuntimeState {
     fn new(state_sink: Option<Arc<dyn BusinessStateSink>>) -> Self {
         Self {
             operational: OperationalState::new(),
-            moderation_workflows: HashSet::new(),
+            moderation_workflows: ModerationWorkflowRegistry::default(),
             state_sink,
         }
     }
@@ -4052,17 +4112,24 @@ impl TaskRuntimeState {
     fn handle_acquire_moderation_workflow(
         &mut self,
         key: ModerationWorkflowKey,
-        response: SyncSender<bool>,
+        direct: bool,
+        response: SyncSender<Option<Arc<ModerationWorkflowToken>>>,
     ) {
-        let _ = response.send(self.moderation_workflows.insert(key));
+        let acquired = self.moderation_workflows.acquire(key.clone(), direct);
+        if let Err(error) = response.send(acquired)
+            && let Some(token) = error.0
+        {
+            self.moderation_workflows.release(&key, &token);
+        }
     }
 
     fn handle_release_moderation_workflow(
         &mut self,
         key: ModerationWorkflowKey,
+        token: Arc<ModerationWorkflowToken>,
         response: SyncSender<bool>,
     ) {
-        let _ = response.send(self.moderation_workflows.remove(&key));
+        let _ = response.send(self.moderation_workflows.release(&key, &token));
     }
 
     #[cfg(test)]

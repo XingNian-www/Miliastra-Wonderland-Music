@@ -82,6 +82,30 @@ pub(crate) struct ControlOperationRecord {
     pub completed: bool,
 }
 
+/// 一次成功播放的点歌事件（点歌人排行榜数据源）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SongRequestEvent {
+    pub requester: String,
+    pub track_key: String,
+    /// 播放请求的发起时刻：与 requester、track_key 一起唯一标识一次播放，
+    /// 同一次点歌的重复确认靠该三元组去重；恢复/上一首不生成新事件。
+    pub started_at_ms: u64,
+    pub keyword: String,
+    pub title: String,
+    pub artist: String,
+    pub source: String,
+    /// 播放确认成功时刻；排行榜时间窗口按该字段过滤。
+    pub recorded_at_ms: u64,
+}
+
+/// 点歌人排行榜条目。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SongRequestLeaderboardEntry {
+    pub requester: String,
+    pub count: u64,
+    pub last_requested_at_ms: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionReconciliation {
     Idle,
@@ -211,7 +235,7 @@ impl RequestStateStore {
         Ok(())
     }
 
-    /// 校验或创建 request_state 单行表。统一数据库允许缓存表与请求状态表共存；
+    /// 校验或创建 request_state 单行表与点歌事件表。统一数据库允许缓存表与请求状态表共存；
     /// request_state 已存在但列结构不匹配时明确失败，不做迁移。
     fn ensure_schema(connection: &rusqlite::Connection, path: &Path) -> Result<()> {
         const EXPECTED_COLUMNS: [&str; 3] = ["id", "schema_version", "snapshot"];
@@ -236,14 +260,31 @@ impl RequestStateStore {
                     path.display()
                 );
             }
-            return Ok(());
+        } else {
+            connection.execute_batch(
+                "CREATE TABLE request_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    schema_version INTEGER NOT NULL,
+                    snapshot TEXT NOT NULL
+                )",
+            )?;
         }
+        // 点歌事件表（排行榜数据源）：与快照同库；已有数据库在这里补建。
         connection.execute_batch(
-            "CREATE TABLE request_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                schema_version INTEGER NOT NULL,
-                snapshot TEXT NOT NULL
-            )",
+            "CREATE TABLE IF NOT EXISTS song_request_events (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                requester      TEXT NOT NULL,
+                track_key      TEXT NOT NULL,
+                started_at_ms  INTEGER NOT NULL,
+                keyword        TEXT NOT NULL DEFAULT '',
+                title          TEXT NOT NULL DEFAULT '',
+                artist         TEXT NOT NULL DEFAULT '',
+                source         TEXT NOT NULL DEFAULT '',
+                recorded_at_ms INTEGER NOT NULL,
+                UNIQUE (requester, track_key, started_at_ms)
+            );
+            CREATE INDEX IF NOT EXISTS idx_song_request_events_recorded_at
+                ON song_request_events (recorded_at_ms);",
         )?;
         Ok(())
     }
@@ -458,7 +499,32 @@ impl RequestStateStore {
         update: PlaybackStateUpdate,
         queue_item_id: Option<u64>,
     ) -> Result<bool> {
-        self.update(|snapshot| {
+        let event = match &update {
+            PlaybackStateUpdate::Confirmed {
+                request,
+                navigation,
+                song_request_event,
+            } => {
+                if let Some(event) = song_request_event {
+                    if *navigation != super::PlaybackNavigation::Normal
+                        || event.requester != request.requester.trim()
+                        || event.started_at_ms != request.started_at_ms
+                        || request
+                            .track
+                            .as_ref()
+                            .is_none_or(|track| track.track_ref.key.to_string() != event.track_key)
+                    {
+                        bail!("点歌事件与确认请求不一致");
+                    }
+                }
+                song_request_event.as_ref()
+            }
+            _ => None,
+        }
+        .cloned();
+        let mut next = self.snapshot.clone();
+        {
+            let snapshot = &mut next;
             // 与 PersistentPlaybackState::update 保持一致：请求身份变化时作废会话绑定。
             // identity 取拥有的数据（TrackKey 克隆），避免借用阻塞 apply 的可变借用。
             let previous_identity = snapshot
@@ -472,7 +538,7 @@ impl RequestStateStore {
                         .map(|track| (track.track_ref.key.clone(), request.started_at_ms))
                 });
             if !update.apply(&mut snapshot.playback) {
-                return false;
+                return Ok(false);
             }
             let next_identity = snapshot
                 .playback
@@ -495,8 +561,11 @@ impl RequestStateStore {
             {
                 snapshot.queue.remove(0);
             }
-            true
-        })
+        }
+        validate_snapshot(&next)?;
+        self.save_with_song_request_event(&next, event.as_ref())?;
+        self.snapshot = next;
+        Ok(true)
     }
 
     pub(crate) fn record_attempt(&mut self, attempt: PlaybackAttemptRecord) -> Result<bool> {
@@ -529,15 +598,86 @@ impl RequestStateStore {
         })
     }
 
+    /// 测试夹具入口；生产事件只能与确认/出队在同一事务内写入。
+    #[cfg(test)]
+    pub(crate) fn record_song_request_event(&self, event: SongRequestEvent) -> Result<bool> {
+        Self::insert_song_request_event(&self.connection, &event)
+    }
+
+    fn insert_song_request_event(
+        connection: &rusqlite::Connection,
+        event: &SongRequestEvent,
+    ) -> Result<bool> {
+        let requester = event.requester.trim();
+        if requester.is_empty() || event.track_key.trim().is_empty() {
+            bail!("点歌事件缺少点歌人或曲目");
+        }
+        let started_at_ms =
+            i64::try_from(event.started_at_ms).context("点歌起始时刻超出数据库范围")?;
+        let recorded_at_ms =
+            i64::try_from(event.recorded_at_ms).context("点歌确认时刻超出数据库范围")?;
+        let inserted = connection.execute(
+            "INSERT INTO song_request_events
+                (requester, track_key, started_at_ms, keyword, title, artist, source, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (requester, track_key, started_at_ms) DO NOTHING",
+            rusqlite::params![requester, event.track_key, started_at_ms, event.keyword, event.title, event.artist, event.source, recorded_at_ms],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// 按点歌人聚合排行榜。`since_ms` 为 None 时统计全部历史；次数降序，并列时最近点歌的在前。
+    pub(crate) fn song_request_leaderboard(
+        &self,
+        since_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SongRequestLeaderboardEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT requester, COUNT(*) AS requests, MAX(recorded_at_ms)
+             FROM song_request_events
+             WHERE recorded_at_ms >= ?1
+             GROUP BY requester
+             ORDER BY requests DESC, MAX(recorded_at_ms) DESC, requester COLLATE BINARY ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                i64::try_from(since_ms.unwrap_or(0)).context("排行榜时间范围无效")?,
+                i64::try_from(limit).context("排行榜条数超出数据库范围")?
+            ],
+            |row| {
+                Ok(SongRequestLeaderboardEntry {
+                    requester: row.get(0)?,
+                    count: row.get::<_, i64>(1)?.max(0) as u64,
+                    last_requested_at_ms: row.get::<_, i64>(2)?.max(0) as u64,
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// 单行快照原子提交：整张快照序列化为 JSON blob 后在一个事务内写入，
     /// 失败时整体回滚，不产生部分写入。
     fn save(&mut self, snapshot: &RequestStateSnapshot) -> Result<()> {
+        self.save_with_song_request_event(snapshot, None)
+    }
+
+    /// 确认、出队和点歌事件一起提交，任一步失败都不修改内存或磁盘快照。
+    fn save_with_song_request_event(
+        &mut self,
+        snapshot: &RequestStateSnapshot,
+        event: Option<&SongRequestEvent>,
+    ) -> Result<()> {
         let text = serde_json::to_string(snapshot)?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT OR REPLACE INTO request_state (id, schema_version, snapshot) VALUES (1, ?1, ?2)",
             rusqlite::params![i64::from(snapshot.schema_version), text],
         )?;
+        if let Some(event) = event {
+            Self::insert_song_request_event(&transaction, event)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1000,6 +1140,7 @@ mod tests {
         started_at_ms: u64,
     ) -> PlaybackStateUpdate {
         PlaybackStateUpdate::Confirmed {
+            song_request_event: None,
             request: ActivePlaybackRequest {
                 keyword: track.metadata.title.clone(),
                 source: track.track_ref.key.provider.as_str().to_string(),
@@ -1663,6 +1804,330 @@ mod tests {
             store.lock().unwrap().playback_snapshot().state,
             ConfirmedPlaybackState::Idle
         );
+        // 已有数据库（含旧库升级）必须补建点歌事件表。
+        let events_table_exists: i64 = store
+            .lock()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'song_request_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events_table_exists, 1);
+        remove_request_state_path(state_path);
+    }
+
+    fn leaderboard_confirmation(
+        track: &PlayableTrack,
+        started_at_ms: u64,
+        recorded_at_ms: u64,
+    ) -> PlaybackStateUpdate {
+        let mut update = confirmed_update(track, started_at_ms);
+        if let PlaybackStateUpdate::Confirmed {
+            request,
+            song_request_event,
+            ..
+        } = &mut update
+        {
+            request.requester = "Alice".to_string();
+            *song_request_event = Some(SongRequestEvent {
+                requester: request.requester.clone(),
+                track_key: track.track_ref.key.to_string(),
+                started_at_ms,
+                keyword: request.keyword.clone(),
+                title: request.title.clone(),
+                artist: request.artist.clone(),
+                source: request.source.clone(),
+                recorded_at_ms,
+            });
+        }
+        update
+    }
+
+    #[test]
+    fn leaderboard_confirmation_commits_with_dequeue_and_survives_reload() {
+        let path = temp_request_state_path("leaderboard-atomic");
+        let store =
+            RequestStateStore::load(path.clone(), crate::test_support::test_state_store()).unwrap();
+        let track = test_track("miliastra://track/qqmusic/leaderboard", "歌曲 - 歌手");
+        let mut queue = PersistentQueue::from_request_store(store.clone(), 10).unwrap();
+        queue
+            .push(QueueItem {
+                track: Some(track.clone()),
+                ..QueueItem::default()
+            })
+            .unwrap();
+        enter_starting(&store, &track, 100);
+        let id = store.lock().unwrap().queue_snapshot().1[0].id;
+        {
+            let mut state = store.lock().unwrap();
+            assert!(
+                state
+                    .confirm_playback_and_dequeue(
+                        leaderboard_confirmation(&track, 100, 200),
+                        Some(id)
+                    )
+                    .unwrap()
+            );
+            // 重复确认不能更新首次确认时间，也不能增加次数。
+            assert!(
+                state
+                    .confirm_playback_and_dequeue(
+                        leaderboard_confirmation(&track, 100, 900),
+                        Some(id)
+                    )
+                    .unwrap()
+            );
+            assert!(state.queue_snapshot().1.is_empty());
+            let entries = state.song_request_leaderboard(None, 20).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].count, 1);
+            assert_eq!(entries[0].last_requested_at_ms, 200);
+            assert!(
+                state
+                    .song_request_leaderboard(Some(201), 20)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        drop(queue);
+        drop(store);
+        let loaded =
+            RequestStateStore::load(path.clone(), crate::test_support::test_state_store()).unwrap();
+        {
+            let state = loaded.lock().unwrap();
+            assert!(state.queue_snapshot().1.is_empty());
+            assert_eq!(
+                state.playback_snapshot().state,
+                ConfirmedPlaybackState::RequestedSongPlaying
+            );
+            assert_eq!(
+                state.song_request_leaderboard(None, 20).unwrap()[0].count,
+                1
+            );
+        }
+        drop(loaded);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn leaderboard_event_failure_rolls_back_confirmation_and_dequeue() {
+        let store = RequestStateStore::new_for_test();
+        let track = test_track("miliastra://track/qqmusic/atomic-failure", "歌曲 - 歌手");
+        let mut queue = PersistentQueue::from_request_store(store.clone(), 10).unwrap();
+        queue
+            .push(QueueItem {
+                track: Some(track.clone()),
+                ..QueueItem::default()
+            })
+            .unwrap();
+        enter_starting(&store, &track, 100);
+        let mut state = store.lock().unwrap();
+        let id = state.queue_snapshot().1[0].id;
+        let before = RequestStateStore::read_snapshot_row(&state.connection).unwrap();
+        state.connection.execute_batch("CREATE TRIGGER fail_song_event BEFORE INSERT ON song_request_events BEGIN SELECT RAISE(ABORT, 'event write failed'); END;").unwrap();
+        assert!(
+            state
+                .confirm_playback_and_dequeue(leaderboard_confirmation(&track, 100, 200), Some(id))
+                .is_err()
+        );
+        assert_eq!(
+            state.playback_snapshot().state,
+            ConfirmedPlaybackState::Starting
+        );
+        assert_eq!(state.queue_snapshot().1[0].id, id);
+        assert_eq!(
+            RequestStateStore::read_snapshot_row(&state.connection).unwrap(),
+            before
+        );
+        assert!(state.song_request_leaderboard(None, 20).unwrap().is_empty());
+        state
+            .connection
+            .execute_batch("DROP TRIGGER fail_song_event")
+            .unwrap();
+        assert!(
+            state
+                .confirm_playback_and_dequeue(leaderboard_confirmation(&track, 100, 200), Some(id))
+                .unwrap()
+        );
+        assert_eq!(
+            state.song_request_leaderboard(None, 20).unwrap()[0].count,
+            1
+        );
+    }
+
+    #[test]
+    fn leaderboard_snapshot_failure_records_no_event() {
+        let store = RequestStateStore::new_for_test();
+        let track = test_track("miliastra://track/qqmusic/snapshot-failure", "歌曲 - 歌手");
+        enter_starting(&store, &track, 100);
+        let mut state = store.lock().unwrap();
+        state.inject_write_failure().unwrap();
+        assert!(
+            state
+                .confirm_playback_and_dequeue(leaderboard_confirmation(&track, 100, 200), None)
+                .is_err()
+        );
+        assert!(state.song_request_leaderboard(None, 20).unwrap().is_empty());
+        assert_eq!(
+            state.playback_snapshot().state,
+            ConfirmedPlaybackState::Starting
+        );
+    }
+
+    #[test]
+    fn leaderboard_rejects_mismatched_events_without_mutation() {
+        let store = RequestStateStore::new_for_test();
+        let track = test_track("miliastra://track/qqmusic/mismatched", "歌曲 - 歌手");
+        enter_starting(&store, &track, 100);
+        let mut update = leaderboard_confirmation(&track, 100, 200);
+        if let PlaybackStateUpdate::Confirmed {
+            song_request_event: Some(event),
+            ..
+        } = &mut update
+        {
+            event.requester = "Mallory".to_string();
+        }
+        let mut state = store.lock().unwrap();
+        assert!(state.confirm_playback_and_dequeue(update, None).is_err());
+        assert_eq!(
+            state.playback_snapshot().state,
+            ConfirmedPlaybackState::Starting
+        );
+        assert!(state.song_request_leaderboard(None, 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn leaderboard_upgrade_preserves_snapshot_without_backfilling_history() {
+        let path = temp_request_state_path("leaderboard-upgrade");
+        let store =
+            RequestStateStore::load(path.clone(), crate::test_support::test_state_store()).unwrap();
+        {
+            let mut state = store.lock().unwrap();
+            state
+                .update(|snapshot| {
+                    snapshot.playback.volume = 37;
+                    true
+                })
+                .unwrap();
+            state
+                .connection
+                .execute_batch("DROP TABLE song_request_events")
+                .unwrap();
+        }
+        drop(store);
+        let reopened =
+            RequestStateStore::load(path.clone(), crate::test_support::test_state_store()).unwrap();
+        {
+            let state = reopened.lock().unwrap();
+            assert_eq!(state.playback_snapshot().volume, 37);
+            assert!(state.song_request_leaderboard(None, 20).unwrap().is_empty());
+        }
+        drop(reopened);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn leaderboard_window_is_inclusive_and_ties_are_deterministic() {
+        let store = RequestStateStore::new_for_test();
+        let state = store.lock().unwrap();
+        for (requester, at) in [("Bob", 200), ("Alice", 200), ("Older", 199)] {
+            state
+                .record_song_request_event(SongRequestEvent {
+                    requester: requester.to_string(),
+                    track_key: "track".to_string(),
+                    started_at_ms: at,
+                    keyword: String::new(),
+                    title: String::new(),
+                    artist: String::new(),
+                    source: String::new(),
+                    recorded_at_ms: at,
+                })
+                .unwrap();
+        }
+        let entries = state.song_request_leaderboard(Some(200), 20).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.requester.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alice", "Bob"]
+        );
+        assert_eq!(
+            state.song_request_leaderboard(None, 1).unwrap()[0].requester,
+            "Alice"
+        );
+        assert!(state.song_request_leaderboard(None, 0).unwrap().is_empty());
+        assert!(state.song_request_leaderboard(Some(u64::MAX), 20).is_err());
+    }
+
+    #[test]
+    fn song_request_events_deduplicate_and_aggregate_by_requester() {
+        let state_path = temp_request_state_path("song-request-events");
+        let store =
+            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
+                .unwrap();
+        let store = store.lock().unwrap();
+        let event = |requester: &str, track_key: &str, started_at_ms: u64, recorded_at_ms: u64| {
+            SongRequestEvent {
+                requester: requester.to_string(),
+                track_key: track_key.to_string(),
+                started_at_ms,
+                keyword: "关键词".to_string(),
+                title: "标题".to_string(),
+                artist: "歌手".to_string(),
+                source: "qqmusic".to_string(),
+                recorded_at_ms,
+            }
+        };
+        assert!(
+            store
+                .record_song_request_event(event("Alice", "miliastra://track/qqmusic/1", 100, 100))
+                .unwrap()
+        );
+        // 重启恢复会重新确认同一播放：相同三元组不再记。
+        assert!(
+            !store
+                .record_song_request_event(event("Alice", "miliastra://track/qqmusic/1", 100, 200))
+                .unwrap()
+        );
+        // 同一首歌再次播放（新的起始时刻）算新事件。
+        assert!(
+            store
+                .record_song_request_event(event("Alice", "miliastra://track/qqmusic/1", 300, 300))
+                .unwrap()
+        );
+        assert!(
+            store
+                .record_song_request_event(event("Bob", "miliastra://track/qqmusic/2", 400, 400))
+                .unwrap()
+        );
+
+        let all = store.song_request_leaderboard(None, 10).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|entry| (entry.requester.as_str(), entry.count))
+                .collect::<Vec<_>>(),
+            vec![("Alice", 2), ("Bob", 1)]
+        );
+        assert_eq!(all[0].last_requested_at_ms, 300);
+
+        // 时间窗口过滤：只保留窗口内的事件。
+        let recent = store.song_request_leaderboard(Some(350), 10).unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|entry| entry.requester.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Bob"]
+        );
+
+        // limit 截断。
+        assert_eq!(store.song_request_leaderboard(None, 1).unwrap().len(), 1);
+
+        drop(store);
         remove_request_state_path(state_path);
     }
 

@@ -610,6 +610,60 @@ impl MetadataStore {
         Ok((total.max(0) as usize, records))
     }
 
+    /// 扫描已完成缓存的元数据索引；不读取音频、不触发下载，也不只查第一页。
+    pub(super) fn search_library(
+        &self,
+        query: &crate::SearchQuery,
+    ) -> Result<Vec<crate::SearchCandidate>, MetadataStoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TRACK_COLUMNS} FROM cached_tracks WHERE complete = 1 AND source IS NOT NULL AND id IS NOT NULL AND title IS NOT NULL ORDER BY hash ASC"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut error = None;
+        let tracks = std::iter::from_fn(|| {
+            loop {
+                let row = match rows.next() {
+                    Ok(Some(row)) => row,
+                    Ok(None) => return None,
+                    Err(cause) => {
+                        error = Some(MetadataStoreError::from(cause));
+                        return None;
+                    }
+                };
+                let record = match track_from_row(row) {
+                    Ok(record) => record,
+                    Err(cause) => {
+                        error = Some(cause);
+                        return None;
+                    }
+                };
+                let (Some(source), Some(id), Some(metadata)) =
+                    (record.source, record.id, record.metadata)
+                else {
+                    continue;
+                };
+                let Ok(provider) = source.parse::<crate::ProviderId>() else {
+                    continue;
+                };
+                let Ok(key) = crate::TrackKey::new(provider, id) else {
+                    continue;
+                };
+                return Some(crate::PlayableTrack {
+                    track_ref: crate::TrackRef {
+                        key,
+                        resolver_locator: None,
+                    },
+                    metadata,
+                });
+            }
+        });
+        let candidates = crate::search_library_tracks(query, tracks);
+        match error {
+            Some(error) => Err(error),
+            None => Ok(candidates),
+        }
+    }
+
     /// 打开连接后的一次性初始化：PRAGMA、建表、schema 版本。
     fn initialize(&self) -> Result<(), MetadataStoreError> {
         // WAL 模式必须在事务外设置；查询返回模式名，忽略。
@@ -750,6 +804,89 @@ mod tests {
             album: Some("示例专辑".to_owned()),
             duration_ms: Some(210_000),
         }
+    }
+
+    #[test]
+    fn library_search_metadata_requires_complete_identified_tracks_and_is_read_only() {
+        let directory = temp_directory();
+        let store = MetadataStore::open(&directory).unwrap();
+        let mut metadata = sample_metadata();
+        metadata.title = "晴天".into();
+        metadata.artists = vec!["周杰伦".into()];
+        for (source, id, complete, with_metadata) in [
+            ("qqmusic", "valid", true, true),
+            ("qqmusic", "partial", false, true),
+            ("qqmusic", "missing-metadata", true, false),
+            ("bilibili", "BV1", true, true),
+        ] {
+            let k = key(source, id);
+            store
+                .upsert_track(&k, with_metadata.then_some(&metadata))
+                .unwrap();
+            if complete {
+                store
+                    .mark_complete(&cache_key_hash(&k), 100, false)
+                    .unwrap();
+            }
+        }
+        let hash = cache_key_hash(&key("qqmusic", "valid"));
+        let before = store.track(&hash).unwrap();
+        let query = crate::SearchQuery {
+            keyword: "周杰伦 晴天".into(),
+            providers: vec![crate::ProviderId::QqMusic],
+            limit: 10,
+        };
+        let result = store.search_library(&query).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].track_ref.key.id, "valid");
+        assert_eq!(result[0].eligibility, crate::PlaybackEligibility::Unknown);
+        assert_eq!(store.track(&hash).unwrap(), before);
+        assert!(
+            store
+                .search_library(&crate::SearchQuery {
+                    keyword: "%".into(),
+                    ..query
+                })
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn library_search_metadata_reaches_tracks_beyond_a_page_and_survives_reopen() {
+        let directory = temp_directory();
+        let store = MetadataStore::open(&directory).unwrap();
+        for i in 0..80 {
+            let k = key("qqmusic", &i.to_string());
+            let mut metadata = sample_metadata();
+            metadata.title = format!("歌曲{i}");
+            store.upsert_track(&k, Some(&metadata)).unwrap();
+            store
+                .mark_complete(&cache_key_hash(&k), 100, false)
+                .unwrap();
+        }
+        drop(store);
+        let store = MetadataStore::open(&directory).unwrap();
+        // 最后一条索引记录不依赖分页读取；搜索不会只看列表前20首。
+        let id: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM cached_tracks ORDER BY hash DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let result = store
+            .search_library(&crate::SearchQuery {
+                keyword: format!("歌曲{id}"),
+                ..crate::SearchQuery::default()
+            })
+            .unwrap();
+        assert_eq!(result[0].track_ref.key.id, id);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -1839,6 +1839,11 @@ impl ApplicationRuntime {
     }
 
     fn enqueue_pending_command(&self, pending: PendingCommand) -> Result<()> {
+        // 可信管理员拉黑先接管待决租约，再进入正式队列；旧结果不能通过去重阻塞它。
+        if self.enqueue_direct_blacklist(&pending.routed)? {
+            self.record_command_activity(command_observed_at(&pending.routed))?;
+            return Ok(());
+        }
         if self.pending_contains_command(&pending.routed)? {
             log::info!("命令已在待处理队列，本轮跳过: {}", pending.routed.raw);
             return Ok(());

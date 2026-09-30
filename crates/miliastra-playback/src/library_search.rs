@@ -2,6 +2,7 @@
 //! OCR 会删除中文之间的空格，因此关键词匹配不依赖空格。
 use std::collections::HashSet;
 
+use crate::model::provider_label;
 use crate::{PlayableTrack, PlaybackEligibility, SearchCandidate, SearchQuery};
 
 pub const MAX_LIBRARY_SEARCH_RESULTS: usize = 10;
@@ -133,7 +134,7 @@ pub fn search_library_tracks(
         candidate.text = format!(
             "{} [{}·曲库]",
             candidate.selection_text(),
-            provider.as_str()
+            provider_label(provider)
         );
         ranked.push((exact, key, candidate));
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -169,6 +170,20 @@ mod tests {
             keyword: keyword.into(),
             ..SearchQuery::default()
         }
+    }
+
+    #[test]
+    fn library_search_text_uses_the_same_chinese_provider_label_as_online_results() {
+        let tracks = vec![
+            track(ProviderId::QqMusic, "1", "晴天", "周杰伦"),
+            track(ProviderId::Kugou, "2", "晴天", "周杰伦"),
+        ];
+        let texts: Vec<String> = search_library_tracks(&query("晴天 周杰伦"), tracks)
+            .into_iter()
+            .map(|candidate| candidate.text)
+            .collect();
+        assert!(texts.contains(&"晴天 - 周杰伦 [QQ·曲库]".to_string()));
+        assert!(texts.contains(&"晴天 - 周杰伦 [酷狗·曲库]".to_string()));
     }
 
     #[test]

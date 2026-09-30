@@ -62,9 +62,9 @@ jobs:
       - name: 安装 PE 导入表检查工具
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
-          install: mingw-w64-x86_64-binutils
+          install: mingw-w64-ucrt-x86_64-binutils
 
       - name: 解析 PE 导入表检查工具路径
         shell: msys2 {0}
@@ -74,7 +74,7 @@ jobs:
           echo "OBJDUMP=$(cygpath -w "$objdump_path")" >> "$GITHUB_ENV"
 
       - name: 缓存 OCR 模型
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: models
           key: pp-ocrv6-small-models-v2.3.1-sha256-2c6277ab-ed59cc29-b5f2bfe2
@@ -241,7 +241,7 @@ jobs:
             -Force
 
       - name: 上传产物
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: miliastra-wonderland-music-windows-x64
           path: dist/miliastra-wonderland-music-windows-x64

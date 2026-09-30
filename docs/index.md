@@ -10,11 +10,6 @@
 - [Web 面板使用](web-tools.md)：本地网页、远程控制和高级工具。
 - [平台登录](login-qr-feasibility.md)：音乐平台登录、二维码和凭据状态。
 
-## 项目维护
-
-- [项目导览](project-overview.md)：架构、目录职责、能力现状和修改入口。
-- [发展路线](roadmap.md)：分阶段优先级、验收标准和验证记录。
-
 ## 配置说明
 
 - 功能配置默认保存在数据库 `deps/data/playback.sqlite3` 中，通过 Web 面板「配置中心」查看与修改（见 [Web 面板使用](web-tools.md)）。

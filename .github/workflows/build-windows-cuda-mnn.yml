@@ -219,7 +219,7 @@ jobs:
             -Force
 
       - name: 上传 CUDA MNN 运行时产物
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.version.outputs.artifact }}
           path: dist/${{ steps.version.outputs.artifact }}

@@ -2087,7 +2087,7 @@ fn kugou_section() -> Vec<ConfigFieldSchema> {
             "device_dev",
             "设备型号",
             FieldKind::String,
-            "填写该设备的型号标识（通常是一串大写十六进制）。三项必须同时填写。保存后在下一次酷狗登录时生效。",
+            "填写该设备上报的设备标识（设备型号名，任意稳定字符串即可，例如 KuGouMusicApi）。三项必须同时填写。保存后在下一次酷狗登录时生效。",
         ),
         ConfigFieldSchema::db_idle_reload(
             "device_mac",

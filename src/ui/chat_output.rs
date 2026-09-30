@@ -81,6 +81,27 @@ impl ChatOutput {
         self.send_primary(message, false)
     }
 
+    pub(crate) fn send_invite_ready(
+        &self,
+        message: &str,
+        residency: UiResidencyTarget,
+        running: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let message = fit_chat_message(message);
+        if !self.enabled() {
+            log::info!("游戏内回复发送已关闭，不发送邀请就绪消息");
+            return Ok(());
+        }
+        let request = SendHallBatch::new([message.clone()], residency, 0)
+            .after_invite_primary_stability(running);
+        self.send_batch_request(request).into_result(1)?;
+        log::info!(
+            "邀请就绪回复已通过标准发送流程: {}",
+            redacted_chat_text(&message)
+        );
+        Ok(())
+    }
+
     pub fn send_for_command(&self, message: &str) -> Result<()> {
         self.send_primary(message, true)
     }
@@ -272,11 +293,15 @@ impl ChatOutput {
         delay_ms: u64,
         residency: UiResidencyTarget,
     ) -> ChatBatchSendOutcome {
-        let operation = match self.hall_batch_ui.submit(SendHallBatch::new(
+        self.send_batch_request(SendHallBatch::new(
             messages.iter().cloned(),
             residency,
             delay_ms,
-        )) {
+        ))
+    }
+
+    fn send_batch_request(&self, request: SendHallBatch) -> ChatBatchSendOutcome {
+        let operation = match self.hall_batch_ui.submit(request) {
             Ok(operation) => operation,
             Err(error) => return ChatBatchSendOutcome::failed(0, anyhow!(error)),
         };

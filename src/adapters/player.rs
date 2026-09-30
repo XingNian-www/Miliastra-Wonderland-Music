@@ -161,6 +161,7 @@ impl MusicPlayerBackend for PlayerRuntimeBackend {
         {
             "provider_auth_required" => Some("尚未登录，请先登录"),
             "relogin_required" => Some("登录凭据已失效，请重新登录"),
+            "provider_verification_required" => Some("上游要求完成人机验证，请稍后再试"),
             "unknown_provider" => Some("不支持该音乐平台"),
             "invalid_request" => Some("播放请求无效"),
             _ => None,
@@ -347,6 +348,10 @@ mod tests {
         for (code, expected) in [
             ("relogin_required", Some("登录凭据已失效，请重新登录")),
             ("provider_auth_required", Some("尚未登录，请先登录")),
+            (
+                "provider_verification_required",
+                Some("上游要求完成人机验证，请稍后再试"),
+            ),
             ("provider_timeout", None),
             ("provider_rate_limited", None),
             ("playback_failed", None),

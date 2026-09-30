@@ -66,6 +66,8 @@ pub enum CatalogError {
     Unavailable(String),
     #[error("source rate limit reached: {0}")]
     RateLimited(String),
+    #[error("source requires human verification: {0}")]
+    VerificationRequired(String),
     #[error("source request timed out: {0}")]
     TimedOut(String),
     #[error("source request failed: {0}")]
@@ -109,6 +111,11 @@ impl CatalogError {
             Self::NoCopyright(_) => ("track_no_copyright", "track has no copyright", false),
             Self::Unavailable(_) => ("track_unavailable", "track is unavailable", false),
             Self::RateLimited(_) => ("provider_rate_limited", "source rate limit reached", true),
+            Self::VerificationRequired(_) => (
+                "provider_verification_required",
+                "source requires human verification",
+                false,
+            ),
             Self::TimedOut(_) => ("provider_timeout", "source request timed out", true),
             Self::Transient(_) => ("provider_transient", "source request failed", true),
             Self::InvalidResponse(_) => (
@@ -336,6 +343,7 @@ pub(crate) fn account_status_error_code(error: &CatalogError) -> &'static str {
     match error {
         CatalogError::AuthRequired(_) | CatalogError::CredentialRejected(_) => "relogin_required",
         CatalogError::RateLimited(_) => "provider_rate_limited",
+        CatalogError::VerificationRequired(_) => "provider_verification_required",
         CatalogError::TimedOut(_) => "provider_timeout",
         CatalogError::Transient(_) => "provider_transient",
         CatalogError::InvalidResponse(_)

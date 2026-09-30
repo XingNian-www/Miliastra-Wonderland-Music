@@ -1688,6 +1688,7 @@ fn login_http_error(error: HttpLoginError) -> AppError {
     let status = match error.code.as_str() {
         "unsupported_provider" | "invalid_helper_provider" | "invalid_helper_credential" => 400,
         "provider_auth_required" | "relogin_required" => 401,
+        "provider_verification_required" => 403,
         "login_not_active" => 404,
         "login_in_progress" | "login_session_invalid" => 409,
         "login_timeout" | "login_cancel_timeout" => 504,

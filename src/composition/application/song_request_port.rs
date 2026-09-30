@@ -92,6 +92,15 @@ impl SongRequestPort for ApplicationRuntime {
         Ok(miliastra_playback::search_library_tracks(&query, tracks))
     }
 
+    fn online_candidate_matches_keyword(&self, keyword: &str, candidate: &SearchCandidate) -> bool {
+        let query = miliastra_playback::SearchQuery {
+            keyword: keyword.to_owned(),
+            providers: vec![candidate.track_ref.key.provider],
+            limit: 1,
+        };
+        !miliastra_playback::search_library_tracks(&query, [candidate.playable_track()]).is_empty()
+    }
+
     fn search_and_pick(
         &self,
         keyword: &str,

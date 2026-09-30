@@ -171,8 +171,8 @@ fn format_duration(duration_ms: u64) -> String {
     format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
 }
 
-/// 点歌展示用的平台简化中文标识。
-fn provider_label(provider: ProviderId) -> &'static str {
+/// 点歌展示用的平台简化中文标识；在线候选与曲库候选共用。
+pub(crate) fn provider_label(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::QqMusic => "QQ",
         ProviderId::Netease => "网易",

@@ -33,6 +33,8 @@ pub(crate) enum SongRequestDecision {
     Cancelled,
     Select,
     SelectIndex(usize),
+    /// 查看/选用本地曲库推荐；与在线候选的序号空间分开，避免误选。
+    LocalLibrary,
 }
 
 impl SongRequestDecision {
@@ -72,6 +74,11 @@ impl SongRequestDecision {
             .is_some_and(|rest| decision_boundary(rest.chars().next()))
         {
             Some(Self::Select)
+        } else if command_text
+            .strip_prefix("@本地")
+            .is_some_and(|rest| decision_boundary(rest.chars().next()))
+        {
+            Some(Self::LocalLibrary)
         } else if let Some(rest) = command_text.strip_prefix('@') {
             let index = rest.parse::<usize>().ok()?;
             (1..=5).contains(&index).then_some(Self::SelectIndex(index))
@@ -97,6 +104,9 @@ impl SongRequestDecision {
             "二次搜索失败，保留首次搜索结果",
             "AI点歌未启用",
             "AI点歌识别失败",
+            "本地曲库推荐",
+            "本地曲库没有更合适的歌曲",
+            "选择本地曲库歌曲",
         ]
         .iter()
         .any(|pattern| text.contains(pattern))
@@ -151,19 +161,13 @@ impl Display for SongSearchFailure {
 pub(crate) trait SongRequestPort {
     fn reply(&self, message: &str) -> Result<()>;
 
-    fn prompt_and_wait_for_decision(
-        &mut self,
-        message: &str,
-        allow_switch_source: bool,
-        allow_ai: bool,
-        default_confirm: bool,
-    ) -> Result<SongRequestDecision>;
-
+    /// allow_local 为 false 时 @本地 会被忽略（继续等待其他确认命令）。
     fn prompt_and_wait_for_decision_batch(
         &mut self,
         messages: &[String],
         allow_switch_source: bool,
         allow_ai: bool,
+        allow_local: bool,
         default_confirm: bool,
     ) -> Result<SongRequestDecision>;
 
@@ -173,12 +177,22 @@ pub(crate) trait SongRequestPort {
         source: &str,
     ) -> std::result::Result<Option<Vec<SearchCandidate>>, SongSearchFailure>;
 
-    /// AI 点歌专用的本地曲库候选；普通点歌不调用此入口。
+    /// 本地曲库候选；AI 点歌与普通点歌都会调用，供在线匹配偏低时推荐。
     fn search_library_candidates(
         &self,
         keyword: &str,
         source: &str,
     ) -> Result<Vec<SearchCandidate>>;
+
+    /// 在线匹配偏低时是否额外给出本地曲库推荐；默认开启。
+    fn local_recommend(&self) -> bool {
+        true
+    }
+
+    /// 在线候选分数低于该值才去比较本地曲库；本地分数必须严格更高才会推荐。
+    fn local_recommend_min_score(&self) -> f64 {
+        0.6
+    }
 
     fn search_and_pick(
         &self,
@@ -571,7 +585,7 @@ impl SongRequestExecution<'_> {
         &self,
         keyword: &str,
         source: &str,
-    ) -> std::result::Result<Vec<SearchCandidate>, SongSearchFailure> {
+    ) -> std::result::Result<SongSearchCandidates, SongSearchFailure> {
         let local = match self.port.search_library_candidates(keyword, source) {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -587,7 +601,7 @@ impl SongRequestExecution<'_> {
                 Vec::new()
             }
         };
-        Ok(merge_ai_search_candidates(local, online))
+        Ok(SongSearchCandidates::from_sources(local, online))
     }
 
     fn resolve_ai_song_request(
@@ -620,6 +634,7 @@ impl SongRequestExecution<'_> {
             }
         };
         let usable: Vec<_> = candidates
+            .merged
             .iter()
             .filter(|candidate| {
                 matches!(
@@ -630,7 +645,7 @@ impl SongRequestExecution<'_> {
             .cloned()
             .collect();
         // 版权或账号限制不是点歌语义错误，不能借改写绕过限制。
-        if candidates.is_empty() || !usable.is_empty() {
+        if candidates.merged.is_empty() || !usable.is_empty() {
             match self
                 .ai
                 .rewrite_song_search(&song.keyword, song.prefer_accompaniment, &usable)
@@ -661,7 +676,8 @@ impl SongRequestExecution<'_> {
                             self.reply(&format!("{}AI理解搜索词:{}，再次搜索", label, query))?;
                             match self.search_ai_candidates(&query, search_source) {
                                 Ok(second) => {
-                                    candidates = merge_ai_search_rounds(candidates, second)
+                                    candidates =
+                                        SongSearchCandidates::merge_rounds(candidates, second)
                                 }
                                 Err(error) => {
                                     log::warn!("AI二次搜索失败，保留首次候选: {error}");
@@ -678,13 +694,13 @@ impl SongRequestExecution<'_> {
                 Err(error) => log::warn!("AI点歌语义分析失败，沿用首次搜索结果: {error:#}"),
             }
         }
-        candidates.retain(|candidate| {
+        candidates.merged.retain(|candidate| {
             matches!(
                 candidate.eligibility,
                 CandidateEligibility::Eligible | CandidateEligibility::Unknown
             )
         });
-        if candidates.is_empty() {
+        if candidates.merged.is_empty() {
             self.reply(&format!("{}平台无对应歌曲音源", label))?;
             return Ok(None);
         }
@@ -693,7 +709,7 @@ impl SongRequestExecution<'_> {
             self.ai,
             &song.keyword,
             song.prefer_accompaniment,
-            &candidates,
+            &candidates.merged,
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -711,14 +727,85 @@ impl SongRequestExecution<'_> {
             pick.score,
             pick.reason
         );
-        let message = format!("{}AI匹配:{},@确认@跳过@选择", label, candidate.text);
-        let decision = self.prompt_candidate_decision(&message, &candidates, false, false)?;
+        // 在线分数偏低时才比较本地曲库：本次选中的是在线候选就直接用它的分数，
+        // 否则单独给在线候选打一次分，保证两边是同一套打分口径。
+        let picked_is_online = candidates
+            .online
+            .iter()
+            .any(|item| item.track_ref.key == candidate.track_ref.key);
+        let online_score = if picked_is_online {
+            Some(pick.score)
+        } else if candidates.online.is_empty() {
+            None
+        } else {
+            let online: Vec<SearchCandidate> = candidates
+                .online
+                .iter()
+                .filter(|item| is_playable_candidate(item))
+                .cloned()
+                .collect();
+            match self
+                .ai
+                .pick_song_candidate(&song.keyword, song.prefer_accompaniment, &online)
+            {
+                Ok(result) => Some(result.score),
+                Err(error) => {
+                    log::warn!("在线候选打分失败，无法比较本地推荐: {error:#}");
+                    None
+                }
+            }
+        };
+        let local_offer = online_score.and_then(|online_score| {
+            self.local_library_offer(
+                &song.keyword,
+                song.prefer_accompaniment,
+                &candidates,
+                online_score,
+            )
+        });
+        let selection = selection_candidates(&candidates.online, &candidates.local);
+        // @本地 只出现在下面那条本地推荐里，不在这里重复列出。
+        let mut messages = vec![format!(
+            "{}AI匹配:{},@确认@跳过@选择",
+            label, candidate.text
+        )];
+        if let Some(offer) = &local_offer {
+            messages.push(local_library_line(&label, &offer[0]));
+        }
+        // 已经给出本地推荐时超时按跳过处理：在线分数本来就低，不能替用户自动播放。
+        let decision = self.prompt_candidate_decision(
+            &messages,
+            &selection,
+            false,
+            false,
+            local_offer.is_some(),
+            local_offer.is_none(),
+        )?;
         let candidate = match decision {
             SongRequestDecision::Confirm | SongRequestDecision::Timeout => candidate,
-            SongRequestDecision::SelectIndex(index) => match candidates.get(index - 1).cloned() {
+            SongRequestDecision::SelectIndex(index) => match selection.get(index - 1).cloned() {
                 Some(candidate) => candidate,
                 None => return Ok(None),
             },
+            SongRequestDecision::LocalLibrary => {
+                let Some(offer) = local_offer else {
+                    return Ok(None);
+                };
+                let Some(selected) = self.choose_local_library_candidate(&offer)? else {
+                    return Ok(None);
+                };
+                return Ok(Some(ResolvedSongRequest {
+                    keyword: selected.text.clone(),
+                    source: String::new(),
+                    prefer_accompaniment: song.prefer_accompaniment,
+                    ai_original_text: song.keyword.clone(),
+                    track: Some(selected.playable_track()),
+                    friend_username: song.friend_username.clone(),
+                    requester: String::new(),
+                    console_bypass_dedup: false,
+                    candidate_snapshot: vec![selected],
+                }));
+            }
             SongRequestDecision::Skip
             | SongRequestDecision::Stopped
             | SongRequestDecision::Select
@@ -735,7 +822,7 @@ impl SongRequestExecution<'_> {
             friend_username: song.friend_username.clone(),
             requester: String::new(),
             console_bypass_dedup: false,
-            candidate_snapshot: candidates,
+            candidate_snapshot: selection,
         }))
     }
 
@@ -768,30 +855,34 @@ impl SongRequestExecution<'_> {
                 }
             };
             let Some(picked) = picked else {
-                let actions = if self.ai.enabled() {
-                    "@换源@AI"
-                } else {
-                    "@换源"
-                };
-                let prompt = format!("{}平台无对应歌曲音源,{}", request.label(), actions);
-                let decision =
-                    self.prompt_and_wait_for_decision(&prompt, true, self.ai.enabled(), true)?;
-                match decision {
-                    SongRequestDecision::SwitchSource => {
+                // 平台没有可播候选时给出本地曲库推荐。这是与在线选歌分开的独立流程，
+                // 超时语义为「跳过」，绝不替用户自动播放本地候选。
+                match self.prompt_without_online_candidate(
+                    &request.label(),
+                    &format!("{}平台无对应歌曲音源", request.label()),
+                    &request.keyword,
+                    source,
+                    true,
+                )? {
+                    NoCandidateOutcome::Local(candidate) => {
+                        return Ok(Some(ResolvedSongRequest {
+                            keyword: candidate.text.clone(),
+                            source: source.to_string(),
+                            prefer_accompaniment: request.prefer_accompaniment,
+                            ai_original_text: String::new(),
+                            track: Some(candidate.playable_track()),
+                            friend_username: request.friend_username.clone(),
+                            requester: request.requester.clone(),
+                            console_bypass_dedup: request.console_bypass_dedup,
+                            candidate_snapshot: vec![candidate],
+                        }));
+                    }
+                    NoCandidateOutcome::SwitchSource => {
                         let next_source = alternate_music_source(source);
                         return self.resolve_and_confirm_song_with_source(song, next_source);
                     }
-                    SongRequestDecision::Ai if self.ai.enabled() => {
-                        return self.resolve_and_confirm_song_ai(song);
-                    }
-                    SongRequestDecision::Confirm
-                    | SongRequestDecision::Skip
-                    | SongRequestDecision::Timeout
-                    | SongRequestDecision::Stopped
-                    | SongRequestDecision::Ai
-                    | SongRequestDecision::Select
-                    | SongRequestDecision::Cancelled
-                    | SongRequestDecision::SelectIndex(_) => return Ok(None),
+                    NoCandidateOutcome::Ai => return self.resolve_and_confirm_song_ai(song),
+                    NoCandidateOutcome::Skip => return Ok(None),
                 }
             };
             let song_title = picked.candidate.text.clone();
@@ -802,10 +893,12 @@ impl SongRequestExecution<'_> {
             };
             let prompt = format!("{}搜索到:{},{}", request.label(), song_title, actions);
             let decision = self.prompt_candidate_decision(
-                &prompt,
+                &[prompt],
                 &picked.candidate_snapshot,
                 true,
                 self.ai.enabled(),
+                false,
+                true,
             )?;
             let selected = match decision {
                 SongRequestDecision::SelectIndex(index) => {
@@ -820,7 +913,8 @@ impl SongRequestExecution<'_> {
                         SongRequestDecision::Skip
                         | SongRequestDecision::Stopped
                         | SongRequestDecision::Select
-                        | SongRequestDecision::Cancelled => Ok(None),
+                        | SongRequestDecision::Cancelled
+                        | SongRequestDecision::LocalLibrary => Ok(None),
                         SongRequestDecision::SwitchSource => {
                             let next_source = alternate_music_source(source);
                             self.resolve_and_confirm_song_with_source(song, next_source)
@@ -871,30 +965,34 @@ impl SongRequestExecution<'_> {
                 }
             };
         let Some(picked) = picked else {
-            let actions = if self.ai.enabled() {
-                "@换源@AI"
-            } else {
-                "@换源"
-            };
-            let prompt = format!("{}换源后仍无音源,{}", song_label(song), actions);
-            let decision =
-                self.prompt_and_wait_for_decision(&prompt, true, self.ai.enabled(), true)?;
-            match decision {
-                SongRequestDecision::SwitchSource => {
+            // 换源后仍无音源时同样给出本地曲库推荐；本地推荐是独立流程，
+            // 超时按「跳过」处理，不会自动播放。
+            match self.prompt_without_online_candidate(
+                &song_label(song),
+                &format!("{}换源后仍无音源", song_label(song)),
+                &song.keyword,
+                source,
+                true,
+            )? {
+                NoCandidateOutcome::Local(candidate) => {
+                    return Ok(Some(ResolvedSongRequest {
+                        keyword: candidate.text.clone(),
+                        source: source.to_string(),
+                        prefer_accompaniment: song.prefer_accompaniment,
+                        ai_original_text: String::new(),
+                        track: Some(candidate.playable_track()),
+                        friend_username: song.friend_username.clone(),
+                        requester: String::new(),
+                        console_bypass_dedup: false,
+                        candidate_snapshot: vec![candidate],
+                    }));
+                }
+                NoCandidateOutcome::SwitchSource => {
                     let next_source = alternate_music_source(source);
                     return self.resolve_and_confirm_song_with_source(song, next_source);
                 }
-                SongRequestDecision::Ai if self.ai.enabled() => {
-                    return self.resolve_and_confirm_song_ai(song);
-                }
-                SongRequestDecision::Confirm
-                | SongRequestDecision::Skip
-                | SongRequestDecision::Timeout
-                | SongRequestDecision::Stopped
-                | SongRequestDecision::Ai
-                | SongRequestDecision::Select
-                | SongRequestDecision::Cancelled
-                | SongRequestDecision::SelectIndex(_) => return Ok(None),
+                NoCandidateOutcome::Ai => return self.resolve_and_confirm_song_ai(song),
+                NoCandidateOutcome::Skip => return Ok(None),
             }
         };
         let actions = if self.ai.enabled() {
@@ -909,10 +1007,12 @@ impl SongRequestExecution<'_> {
             actions
         );
         let decision = self.prompt_candidate_decision(
-            &prompt,
+            &[prompt],
             &picked.candidate_snapshot,
             true,
             self.ai.enabled(),
+            false,
+            true,
         )?;
         match decision {
             SongRequestDecision::Confirm | SongRequestDecision::Timeout => {
@@ -954,7 +1054,8 @@ impl SongRequestExecution<'_> {
             SongRequestDecision::Stopped
             | SongRequestDecision::Ai
             | SongRequestDecision::Select
-            | SongRequestDecision::Cancelled => Ok(None),
+            | SongRequestDecision::Cancelled
+            | SongRequestDecision::LocalLibrary => Ok(None),
         }
     }
 
@@ -1167,30 +1268,24 @@ impl SongRequestExecution<'_> {
         self.port.reply(message)
     }
 
-    fn prompt_and_wait_for_decision(
-        &mut self,
-        message: &str,
-        allow_switch_source: bool,
-        allow_ai: bool,
-        default_confirm: bool,
-    ) -> Result<SongRequestDecision> {
-        self.port.prompt_and_wait_for_decision(
-            message,
-            allow_switch_source,
-            allow_ai,
-            default_confirm,
-        )
-    }
-
+    /// 展示候选并等待选择。messages 是首批消息（在线提示，必要时附带本地推荐行）；
+    /// default_confirm=false 时超时按跳过处理，用于本地推荐场景。
     fn prompt_candidate_decision(
         &mut self,
-        message: &str,
+        messages: &[String],
         candidates: &[SearchCandidate],
         allow_switch_source: bool,
         allow_ai: bool,
+        allow_local: bool,
+        default_confirm: bool,
     ) -> Result<SongRequestDecision> {
-        let mut decision =
-            self.prompt_and_wait_for_decision(message, allow_switch_source, allow_ai, true)?;
+        let mut decision = self.port.prompt_and_wait_for_decision_batch(
+            messages,
+            allow_switch_source,
+            allow_ai,
+            allow_local,
+            default_confirm,
+        )?;
         let candidate_count = candidates.len().min(5);
         let choices = candidates
             .iter()
@@ -1207,8 +1302,8 @@ impl SongRequestExecution<'_> {
             "请输入@1至@{}选择歌曲{}，或@跳过",
             candidate_count, switch_source_action,
         );
-        let mut messages = choices;
-        messages.push(prompt);
+        let mut choice_messages = choices;
+        choice_messages.push(prompt);
         loop {
             match decision {
                 SongRequestDecision::Select => {}
@@ -1217,11 +1312,162 @@ impl SongRequestExecution<'_> {
                 _ => return Ok(decision),
             }
             decision = self.port.prompt_and_wait_for_decision_batch(
-                &messages,
+                &choice_messages,
                 allow_switch_source,
                 false,
                 false,
+                false,
             )?;
+        }
+    }
+
+    /// 普通点歌的本地曲库候选。在线没有可播候选时无事可比较，
+    /// 因此不做分数门槛，直接用曲库检索的排序结果。
+    fn plain_local_offer(&mut self, keyword: &str, source: &str) -> Vec<SearchCandidate> {
+        if !self.port.local_recommend() {
+            return Vec::new();
+        }
+        match self.port.search_library_candidates(keyword, source) {
+            Ok(candidates) => local_library_choices(&candidates, 0),
+            Err(error) => {
+                log::warn!("本地曲库检索失败，无法给出本地推荐: {error:#}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// AI 点歌的本地曲库推荐：在线分数偏低时用同一套 AI 打分比较本地候选，
+    /// 只有本地分数严格高于在线分数才推荐。返回 None 表示不推荐。
+    fn local_library_offer(
+        &mut self,
+        keyword: &str,
+        prefer_accompaniment: bool,
+        candidates: &SongSearchCandidates,
+        online_score: f64,
+    ) -> Option<Vec<SearchCandidate>> {
+        if !self.port.local_recommend() || online_score >= self.port.local_recommend_min_score() {
+            return None;
+        }
+        let local: Vec<SearchCandidate> = candidates
+            .local
+            .iter()
+            .filter(|candidate| is_playable_candidate(candidate))
+            .cloned()
+            .collect();
+        if local.is_empty() {
+            return None;
+        }
+        let online_count = candidates
+            .online
+            .iter()
+            .filter(|item| is_playable_candidate(item))
+            .count();
+        match self
+            .ai
+            .pick_song_candidate(keyword, prefer_accompaniment, &local)
+        {
+            Ok(local_pick) if local_pick.score > online_score => {
+                log::info!(
+                    "本地曲库推荐: 在线score={online_score:.2} 本地score={:.2}",
+                    local_pick.score
+                );
+                Some(local_library_choices(&local, online_count))
+            }
+            Ok(local_pick) => {
+                log::info!(
+                    "本地曲库不推荐: 在线score={online_score:.2} 本地score={:.2}",
+                    local_pick.score
+                );
+                None
+            }
+            Err(error) => {
+                log::warn!("本地曲库候选打分失败，不推荐本地结果: {error:#}");
+                None
+            }
+        }
+    }
+
+    /// 独立的本地曲库推荐流程：按序号展示本地候选并等待用户选择。
+    /// 超时语义为「跳过」（default_confirm=false）：曲库元数据可能已经过期，
+    /// 绝不能替用户自动播放本地候选。
+    fn choose_local_library_candidate(
+        &mut self,
+        choices: &[SearchCandidate],
+    ) -> Result<Option<SearchCandidate>> {
+        if choices.is_empty() {
+            // 没有本地推荐时 @本地 由决策层直接忽略，这里只做兜底。
+            return Ok(None);
+        }
+        let count = choices.len().min(SELECTION_SLOTS);
+        if count == 1 {
+            // 只有一首时直接选用，省一次往返；用户仍需主动发 @本地 才会走到这里。
+            return Ok(choices.first().cloned());
+        }
+        let mut messages: Vec<String> = choices
+            .iter()
+            .take(count)
+            .enumerate()
+            .map(|(index, candidate)| format!("@{} {}", index + 1, candidate.text))
+            .collect();
+        messages.push(format!("请输入@1至@{}选择本地曲库歌曲，或@跳过", count));
+        loop {
+            match self
+                .port
+                .prompt_and_wait_for_decision_batch(&messages, false, false, false, false)?
+            {
+                SongRequestDecision::SelectIndex(index) if (1..=count).contains(&index) => {
+                    return Ok(choices.get(index - 1).cloned());
+                }
+                // @选择 或越界序号：重发列表继续等待；其余（跳过、超时、停止）一律放弃。
+                SongRequestDecision::Select | SongRequestDecision::SelectIndex(_) => continue,
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// 平台（或换源后）没有可播候选时的统一处理：追加本地推荐行并等待用户决定。
+    /// 本地推荐是独立流程，超时按「跳过」处理，不会自动播放。
+    fn prompt_without_online_candidate(
+        &mut self,
+        label: &str,
+        message: &str,
+        keyword: &str,
+        source: &str,
+        allow_switch_source: bool,
+    ) -> Result<NoCandidateOutcome> {
+        let offer = self.plain_local_offer(keyword, source);
+        let mut actions = String::new();
+        if allow_switch_source {
+            actions.push_str("@换源");
+        }
+        if self.ai.enabled() {
+            actions.push_str("@AI");
+        }
+        // @本地 只出现在下面那条本地推荐里，不在这里重复列出。
+        let mut messages = vec![format!("{message},{actions}")];
+        let allow_local = !offer.is_empty();
+        if let Some(candidate) = offer.first() {
+            messages.push(local_library_line(label, candidate));
+        }
+        let decision = self.port.prompt_and_wait_for_decision_batch(
+            &messages,
+            allow_switch_source,
+            self.ai.enabled(),
+            allow_local,
+            true,
+        )?;
+        match decision {
+            SongRequestDecision::LocalLibrary => {
+                match self.choose_local_library_candidate(&offer)? {
+                    Some(candidate) => Ok(NoCandidateOutcome::Local(candidate)),
+                    None => Ok(NoCandidateOutcome::Skip),
+                }
+            }
+            SongRequestDecision::SwitchSource if allow_switch_source => {
+                Ok(NoCandidateOutcome::SwitchSource)
+            }
+            SongRequestDecision::Ai if self.ai.enabled() => Ok(NoCandidateOutcome::Ai),
+            _ => Ok(NoCandidateOutcome::Skip),
         }
     }
 
@@ -1243,6 +1489,118 @@ impl SongRequestExecution<'_> {
 }
 
 /// 同一曲目以在线结果的当前可播性和元数据为准，不能用本地 Unknown 覆盖限制。
+/// 平台无可用候选时的处理结果。
+enum NoCandidateOutcome {
+    Local(SearchCandidate),
+    SwitchSource,
+    Ai,
+    Skip,
+}
+
+/// 序号选择窗口的候选数量上限，与 @1～@5 保持一致。
+const SELECTION_SLOTS: usize = 5;
+
+/// 一次搜索得到的候选：在线平台结果与本地曲库结果分开保留。
+/// 分开是为了在在线分数偏低时单独给本地候选打分并比较，两边互不干扰。
+struct SongSearchCandidates {
+    merged: Vec<SearchCandidate>,
+    online: Vec<SearchCandidate>,
+    local: Vec<SearchCandidate>,
+}
+
+impl SongSearchCandidates {
+    fn from_sources(local: Vec<SearchCandidate>, online: Vec<SearchCandidate>) -> Self {
+        let merged = merge_ai_search_candidates(local.clone(), online.clone());
+        Self {
+            merged,
+            online,
+            local,
+        }
+    }
+
+    /// 二次搜索后按来源分别合并两轮结果，保持与整体列表一致的取舍规则。
+    fn merge_rounds(previous: Self, next: Self) -> Self {
+        Self {
+            merged: merge_ai_search_rounds(previous.merged, next.merged),
+            online: merge_ai_search_rounds(previous.online, next.online),
+            local: merge_ai_search_rounds(previous.local, next.local),
+        }
+    }
+}
+
+fn is_playable_candidate(candidate: &SearchCandidate) -> bool {
+    matches!(
+        candidate.eligibility,
+        CandidateEligibility::Eligible | CandidateEligibility::Unknown
+    )
+}
+
+/// 本地推荐可选项：在线样本足够多（≥5）时只给 1 个本地最高分候选，
+/// 在线不足时用本地候选补足到 5 个。
+fn local_library_choices(local: &[SearchCandidate], online_count: usize) -> Vec<SearchCandidate> {
+    let slots = if online_count >= SELECTION_SLOTS {
+        1
+    } else {
+        SELECTION_SLOTS.saturating_sub(online_count).max(1)
+    };
+    local
+        .iter()
+        .filter(|candidate| is_playable_candidate(candidate))
+        .take(slots)
+        .cloned()
+        .map(mark_library_candidate)
+        .collect()
+}
+
+/// 标注候选来自本地曲库，消息里据此与在线结果区分。
+fn mark_library_candidate(mut candidate: SearchCandidate) -> SearchCandidate {
+    if !candidate.text.contains("曲库]") {
+        candidate.text.push_str(" [曲库]");
+    }
+    candidate
+}
+
+/// @1～@5 的选择列表：在线候选在前，本地候选只补空位，同键只保留一次。
+fn selection_candidates(
+    online: &[SearchCandidate],
+    local: &[SearchCandidate],
+) -> Vec<SearchCandidate> {
+    let online: Vec<SearchCandidate> = online
+        .iter()
+        .filter(|candidate| is_playable_candidate(candidate))
+        .cloned()
+        .collect();
+    let local_choices = local_library_choices(local, online.len());
+    let online_slots = if online.len() >= SELECTION_SLOTS {
+        SELECTION_SLOTS.saturating_sub(local_choices.len().min(1))
+    } else {
+        online.len()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut list = Vec::with_capacity(SELECTION_SLOTS);
+    // 本地候选仍排在前面（与合并顺序一致），在线候选补足剩余名额。
+    for candidate in local_choices
+        .into_iter()
+        .chain(online.into_iter().take(online_slots))
+    {
+        if list.len() >= SELECTION_SLOTS {
+            break;
+        }
+        if seen.insert(candidate.track_ref.key.clone()) {
+            list.push(candidate);
+        }
+    }
+    list
+}
+
+/// 在线匹配偏低时追加的本地推荐消息；不展示任何匹配分数。
+fn local_library_line(label: &str, candidate: &SearchCandidate) -> String {
+    format!(
+        "{label}在线没找到合适的,本地曲库推荐:{},@本地",
+        candidate.text
+    )
+}
+
 fn merge_ai_search_candidates(
     local: Vec<SearchCandidate>,
     online: Vec<SearchCandidate>,
@@ -1461,6 +1819,50 @@ mod tests {
         }
     }
 
+    /// 按调用顺序返回 (候选序号, 分数) 的选歌网关：
+    /// 第一次是在线/合并候选打分，后续调用用于单独比较本地或在线候选。
+    struct ScoredAiGateway {
+        picks: Mutex<Vec<(usize, f64)>>,
+        calls: Mutex<Vec<Vec<SearchCandidate>>>,
+    }
+
+    impl ScoredAiGateway {
+        fn new(picks: Vec<(usize, f64)>) -> Arc<Self> {
+            Arc::new(Self {
+                picks: Mutex::new(picks),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl SongRequestAiGateway for ScoredAiGateway {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn pick_song_candidate(
+            &self,
+            _request: &str,
+            _prefer_accompaniment: bool,
+            candidates: &[SearchCandidate],
+        ) -> Result<AiCandidatePickResult> {
+            self.calls.lock().unwrap().push(candidates.to_vec());
+            let (index, score) = {
+                let mut picks = self.picks.lock().unwrap();
+                if picks.is_empty() {
+                    (1, 0.9)
+                } else {
+                    picks.remove(0)
+                }
+            };
+            Ok(AiCandidatePickResult {
+                index,
+                reason: "test selection".to_string(),
+                score,
+            })
+        }
+    }
+
     impl SongRequestAiGateway for IndexedAiGateway {
         fn enabled(&self) -> bool {
             true
@@ -1586,13 +1988,15 @@ mod tests {
     struct FakePort {
         replies: RefCell<Vec<String>>,
         decision_prompts: RefCell<Vec<String>>,
-        decision_options: RefCell<Vec<(bool, bool, bool)>>,
+        /// 每次等待记录 (允许换源, 允许AI, 允许本地推荐, 超时确认)。
+        decision_options: RefCell<Vec<(bool, bool, bool, bool)>>,
         decisions: VecDeque<SongRequestDecision>,
         searches: RefCell<VecDeque<Option<PickedCandidate>>>,
         search_sources: RefCell<Vec<String>>,
         library_candidates: RefCell<Vec<SearchCandidate>>,
         library_searches: RefCell<Vec<(String, String)>>,
         library_error: Cell<bool>,
+        local_recommend_enabled: Cell<bool>,
         online_error: Cell<bool>,
         fail_search_call: Cell<usize>,
         queue: RefCell<Vec<QueueItem>>,
@@ -1619,6 +2023,7 @@ mod tests {
                 library_candidates: RefCell::new(Vec::new()),
                 library_searches: RefCell::new(Vec::new()),
                 library_error: Cell::new(false),
+                local_recommend_enabled: Cell::new(true),
                 online_error: Cell::new(false),
                 fail_search_call: Cell::new(0),
                 queue: RefCell::new(Vec::new()),
@@ -1646,38 +2051,31 @@ mod tests {
             messages: &[String],
             allow_switch_source: bool,
             allow_ai: bool,
+            allow_local: bool,
             default_confirm: bool,
         ) -> Result<SongRequestDecision> {
             self.decision_options.borrow_mut().push((
                 allow_switch_source,
                 allow_ai,
                 default_confirm,
+                allow_local,
             ));
+            if let Some(first) = messages.first() {
+                self.decision_prompts.borrow_mut().push(first.clone());
+            }
             self.replies.borrow_mut().extend(messages.iter().cloned());
-            Ok(self
+            // 与运行时一致：没有开放本地推荐时 @本地 被忽略，继续等下一个决定。
+            let mut decision = self
                 .decisions
                 .pop_front()
-                .unwrap_or(SongRequestDecision::Timeout))
-        }
-
-        fn prompt_and_wait_for_decision(
-            &mut self,
-            message: &str,
-            allow_switch_source: bool,
-            allow_ai: bool,
-            default_confirm: bool,
-        ) -> Result<SongRequestDecision> {
-            self.decision_options.borrow_mut().push((
-                allow_switch_source,
-                allow_ai,
-                default_confirm,
-            ));
-            self.decision_prompts.borrow_mut().push(message.to_string());
-            self.reply(message)?;
-            Ok(self
-                .decisions
-                .pop_front()
-                .unwrap_or(SongRequestDecision::Timeout))
+                .unwrap_or(SongRequestDecision::Timeout);
+            while !allow_local && matches!(decision, SongRequestDecision::LocalLibrary) {
+                decision = self
+                    .decisions
+                    .pop_front()
+                    .unwrap_or(SongRequestDecision::Timeout);
+            }
+            Ok(decision)
         }
 
         fn search_candidates(
@@ -1699,6 +2097,10 @@ mod tests {
                 .pop_front()
                 .flatten()
                 .map(|picked| picked.candidate_snapshot))
+        }
+
+        fn local_recommend(&self) -> bool {
+            self.local_recommend_enabled.get()
         }
 
         fn search_library_candidates(
@@ -2012,10 +2414,10 @@ mod tests {
         assert_eq!(
             port.decision_options.borrow().as_slice(),
             [
-                (true, false, true),
-                (true, false, false),
-                (true, false, false),
-                (true, false, false),
+                (true, false, true, false),
+                (true, false, false, false),
+                (true, false, false, false),
+                (true, false, false, false),
             ]
         );
     }
@@ -2624,7 +3026,7 @@ mod tests {
         );
         assert_eq!(
             port.decision_options.borrow().as_slice(),
-            [(false, false, true), (false, false, false)]
+            [(false, false, true, false), (false, false, false, false)]
         );
         assert!(
             port.replies
@@ -2896,5 +3298,325 @@ mod tests {
             ..command()
         };
         assert_eq!(ai_candidate_source(&friend_bilibili), "bilibili");
+    }
+
+    #[test]
+    fn local_library_choices_follow_the_online_sample_count() {
+        let local: Vec<_> = (0..6)
+            .map(|index| local_candidate(&format!("local{index}")))
+            .collect();
+        // 在线样本足够多时本地只入 1 个；在线不足时补足到 5 个。
+        assert_eq!(local_library_choices(&local, 5).len(), 1);
+        assert_eq!(local_library_choices(&local, 0).len(), 5);
+        assert_eq!(local_library_choices(&local, 3).len(), 2);
+        let online: Vec<_> = (0..6)
+            .map(|index| {
+                test_candidate(
+                    &format!("online{index}"),
+                    &format!("miliastra://track/qqmusic/online{index}"),
+                )
+            })
+            .collect();
+        let selection = selection_candidates(&online, &local);
+        assert_eq!(selection.len(), 5);
+        assert_eq!(selection[0].metadata.title, "local0");
+        assert!(selection[0].text.contains("曲库"));
+        assert_eq!(selection[1].metadata.title, "online0");
+        assert_eq!(selection[4].metadata.title, "online3");
+    }
+
+    #[test]
+    fn ai_low_score_offers_local_library_when_local_score_is_higher() {
+        // 第一次在合并候选里选中在线候选(序号 2)、分数 0.3；第二次给本地候选打分 0.85。
+        let ai = ScoredAiGateway::new(vec![(2, 0.3), (1, 0.85)]);
+        let application = SongRequestApplication::with_gateways(
+            ai.clone(),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        let online = local_candidate("online");
+        let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            online.clone(),
+            vec![online.clone()],
+            "",
+        ))]);
+        port.library_candidates
+            .borrow_mut()
+            .push(local_candidate("local"));
+        port.decisions = VecDeque::from([SongRequestDecision::LocalLibrary]);
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        // 首批消息不重复列出 @本地，入口只在本地推荐行里出现。
+        assert!(!port.decision_prompts.borrow()[0].contains("@本地"));
+        assert!(
+            port.replies.borrow().iter().any(
+                |line| line.contains("在线没找到合适的,本地曲库推荐") && line.contains("@本地")
+            )
+        );
+        // 出现本地推荐时超时按跳过处理，不自动确认；本次等待开放 @本地。
+        assert!(!port.decision_options.borrow()[0].2);
+        assert!(port.decision_options.borrow()[0].3);
+        // 本地只有一首，@本地 直接选用并播放。
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key
+                .id,
+            "local"
+        );
+        // 第二次打分只针对本地候选。
+        let calls = ai.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].len(), 1);
+        assert_eq!(calls[1][0].metadata.title, "local");
+    }
+
+    #[test]
+    fn ai_low_score_skips_local_library_when_local_score_is_not_higher() {
+        let ai = ScoredAiGateway::new(vec![(2, 0.4), (1, 0.35)]);
+        let application = SongRequestApplication::with_gateways(
+            ai.clone(),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        let online = local_candidate("online");
+        let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            online.clone(),
+            vec![online.clone()],
+            "",
+        ))]);
+        port.library_candidates
+            .borrow_mut()
+            .push(local_candidate("local"));
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(!port.decision_prompts.borrow()[0].contains("@本地"));
+        assert!(
+            !port
+                .replies
+                .borrow()
+                .iter()
+                .any(|line| line.contains("本地曲库推荐"))
+        );
+        // 没有本地推荐时保持原有超时确认语义。
+        assert!(port.decision_options.borrow()[0].2);
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key
+                .id,
+            "online"
+        );
+    }
+
+    #[test]
+    fn ai_confident_online_match_does_not_score_the_local_library() {
+        let ai = ScoredAiGateway::new(vec![(2, 0.95)]);
+        let application = SongRequestApplication::with_gateways(
+            ai.clone(),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        let online = local_candidate("online");
+        let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            online.clone(),
+            vec![online.clone()],
+            "",
+        ))]);
+        port.library_candidates
+            .borrow_mut()
+            .push(local_candidate("local"));
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(ai.calls.lock().unwrap().len(), 1);
+        assert!(!port.decision_prompts.borrow()[0].contains("@本地"));
+    }
+
+    #[test]
+    fn local_library_timeout_never_plays_a_library_track() {
+        // 两首本地候选时，合并列表是 [本地A, 本地B, 在线]，因此在线候选序号是 3。
+        let ai = ScoredAiGateway::new(vec![(3, 0.3), (1, 0.9)]);
+        let application =
+            SongRequestApplication::with_gateways(ai, Arc::new(DisabledReviewGateway), 20, true);
+        let online = local_candidate("online");
+        let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            online.clone(),
+            vec![online.clone()],
+            "",
+        ))]);
+        {
+            let mut library = port.library_candidates.borrow_mut();
+            library.push(local_candidate("local-a"));
+            library.push(local_candidate("local-b"));
+        }
+        // @本地 之后不再响应：超时必须按跳过处理，不播放任何歌曲。
+        port.decisions = VecDeque::from([
+            SongRequestDecision::LocalLibrary,
+            SongRequestDecision::Cancelled,
+        ]);
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(port.played.borrow().is_empty());
+        assert!(
+            port.replies
+                .borrow()
+                .iter()
+                .any(|line| line.contains("选择本地曲库歌曲"))
+        );
+        assert_eq!(port.decision_options.borrow()[1].2, false);
+    }
+
+    #[test]
+    fn plain_request_without_online_candidate_offers_the_local_library() {
+        let mut port = FakePort::idle([None]);
+        port.library_candidates
+            .borrow_mut()
+            .push(local_candidate("local"));
+        port.decisions = VecDeque::from([SongRequestDecision::LocalLibrary]);
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("song request");
+        // 平台无音源时不重复列出 @本地，入口只在本地推荐行里出现。
+        assert!(!port.decision_prompts.borrow()[0].contains("@本地"));
+        assert!(
+            port.replies.borrow().iter().any(
+                |line| line.contains("在线没找到合适的,本地曲库推荐") && line.contains("@本地")
+            )
+        );
+        assert!(port.decision_options.borrow()[0].3);
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key
+                .id,
+            "local"
+        );
+    }
+
+    #[test]
+    fn local_command_without_recommendation_is_ignored() {
+        // 本地分数不高于在线 → 没有本地推荐，此时 @本地 应被忽略而不是终止点歌。
+        let ai = ScoredAiGateway::new(vec![(2, 0.4), (1, 0.35)]);
+        let application =
+            SongRequestApplication::with_gateways(ai, Arc::new(DisabledReviewGateway), 20, true);
+        let online = local_candidate("online");
+        let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            online.clone(),
+            vec![online.clone()],
+            "",
+        ))]);
+        port.library_candidates
+            .borrow_mut()
+            .push(local_candidate("local"));
+        port.decisions = VecDeque::from([
+            SongRequestDecision::LocalLibrary,
+            SongRequestDecision::Confirm,
+        ]);
+        application
+            .execute(
+                &context(),
+                &SongCommand {
+                    ai_assisted: true,
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(!port.decision_options.borrow()[0].3);
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key
+                .id,
+            "online"
+        );
+    }
+
+    #[test]
+    fn local_command_is_ignored_when_the_library_has_no_candidate() {
+        let mut port = FakePort::idle([None]);
+        port.decisions =
+            VecDeque::from([SongRequestDecision::LocalLibrary, SongRequestDecision::Skip]);
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("song request");
+        assert!(!port.decision_options.borrow()[0].3);
+        assert!(port.played.borrow().is_empty());
+        assert!(
+            !port
+                .replies
+                .borrow()
+                .iter()
+                .any(|line| line.contains("本地曲库"))
+        );
+    }
+
+    #[test]
+    fn disabled_local_recommend_never_mentions_the_library() {
+        let mut port = FakePort::idle([None]);
+        port.local_recommend_enabled.set(false);
+        port.library_candidates
+            .borrow_mut()
+            .push(local_candidate("local"));
+        port.decisions = VecDeque::from([SongRequestDecision::Skip]);
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("song request");
+        assert!(!port.decision_prompts.borrow()[0].contains("@本地"));
+        assert!(
+            !port
+                .replies
+                .borrow()
+                .iter()
+                .any(|line| line.contains("本地曲库推荐"))
+        );
+        assert!(port.played.borrow().is_empty());
     }
 }

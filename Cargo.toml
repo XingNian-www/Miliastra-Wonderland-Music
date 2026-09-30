@@ -52,6 +52,8 @@ miliastra-login-protocol = { workspace = true }
 miliastra-playback = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json", "query", "rustls"] }
 pinyin = { version = "0.11", default-features = false, features = ["plain"] }
+rand_chacha = "=0.3.1"
+sha2 = "=0.10.9"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 ocr-rs = { git = "https://github.com/zibo-chen/rust-paddle-ocr.git", tag = "v2.3.1", optional = true, features = ["mnn-dynamic"] }

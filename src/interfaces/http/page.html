@@ -736,6 +736,22 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       </div>
 
       <div class="panel">
+        <div class="panel-head"><h2>点歌榜</h2><small id="leaderboardMeta" role="status" aria-live="polite">等待读取</small></div>
+        <div class="panel-body">
+          <div class="controls" style="margin-bottom:var(--sp-3)">
+            <select id="leaderboardRange" onchange="loadLeaderboard()" style="flex:1">
+              <option value="0">全部</option>
+              <option value="7" selected>最近 7 天</option>
+              <option value="1">最近 24 小时</option>
+              <option value="30">最近 30 天</option>
+            </select>
+            <button class="btn small" type="button" onclick="loadLeaderboard()">刷新</button>
+          </div>
+          <div class="history" id="leaderboard">等待读取点歌榜</div>
+        </div>
+      </div>
+
+      <div class="panel">
         <div class="panel-head"><h2>平台登录</h2><small id="loginMeta">读取中</small></div>
         <div class="panel-body">
           <div class="login-session" id="loginSessionDetail">等待登录状态</div>
@@ -1045,8 +1061,8 @@ function parseResponse(text,status){
     return text
   }
 }
-async function request(url,method){
-  const r=await fetch(url,{method:method||'GET',cache:'no-store',headers:requestHeaders()})
+async function request(url,method,signal){
+  const r=await fetch(url,{method:method||'GET',cache:'no-store',headers:requestHeaders(),signal})
   const text=await r.text()
   if(!r.ok){let detail='HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
   return parseResponse(text,r.status)
@@ -1203,6 +1219,48 @@ async function loadPlaybackInsights(){
   finally{playbackInsightsLoading=false}
   // 与 insights 的 5 秒刷新节奏同步刷新磁盘缓存歌曲列表。
   loadCacheTracks()
+  loadLeaderboard()
+}
+let leaderboardTask=null,leaderboardPending=false,leaderboardVersion=0,leaderboardDays=null
+function leaderboardRangeLabel(days){return days===1?'最近 24 小时':days>0?('最近 '+days+' 天'):'全部'}
+function renderLeaderboard(data){
+  const entries=Array.isArray(data&&data.entries)?data.entries:[]
+  const days=safeNum(data&&data.days)||0
+  const limit=safeNum(data&&data.limit)||20
+  $('leaderboardMeta').textContent=leaderboardRangeLabel(days)+' · 前 '+limit+' 名 · 已显示 '+entries.length+' 人'
+  $('leaderboard').innerHTML=entries.length?entries.map((item,index)=>{
+    const time=item.lastRequestedAtMs?new Date(item.lastRequestedAtMs).toLocaleString('zh-CN',{hour12:false}):'时间未知'
+    return '<div class="history-item"><div><span class="history-time">#'+(index+1)+'</span><b>'+esc(item.requester||'匿名')+'</b> · '+Number(item.count||0)+' 次</div><div class="history-result">最近播放确认时刻 '+esc(time)+'</div></div>'
+  }).join(''):'该时间范围内暂无成功点歌记录'
+}
+function loadLeaderboard(){
+  const days=Number($('leaderboardRange').value)||0
+  const changed=days!==leaderboardDays
+  if(changed){leaderboardDays=days;leaderboardVersion++}
+  leaderboardPending=true
+  if(changed||!leaderboardTask){
+    $('leaderboardMeta').textContent=leaderboardRangeLabel(days)+' · 加载中'
+    $('leaderboard').textContent='正在读取点歌榜…'
+  }
+  // 最多一个在途请求和一个合并后的待刷新，不为每次切换/轮询排队。
+  if(leaderboardTask)return leaderboardTask
+  leaderboardTask=(async()=>{
+    while(leaderboardPending){
+      leaderboardPending=false
+      const version=leaderboardVersion,requestedDays=leaderboardDays
+      const abort=new AbortController(),timeout=setTimeout(()=>abort.abort(),15000)
+      try{
+        const data=await request('/playback/leaderboard'+(requestedDays>0?('?days='+encodeURIComponent(requestedDays)):''),undefined,abort.signal)
+        if(version===leaderboardVersion)renderLeaderboard(data)
+      }catch(e){
+        if(version===leaderboardVersion){
+          $('leaderboardMeta').textContent=leaderboardRangeLabel(requestedDays)+' · 读取失败'
+          $('leaderboard').textContent='读取点歌榜失败: '+(abort.signal.aborted?'请求超时':e.message)+'；可点击刷新重试'
+        }
+      }finally{clearTimeout(timeout)}
+    }
+  })().finally(()=>{leaderboardTask=null})
+  return leaderboardTask
 }
 let cacheTracksLoading=false
 const cacheTracksPageSize=100

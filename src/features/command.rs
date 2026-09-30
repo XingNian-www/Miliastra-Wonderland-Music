@@ -205,6 +205,7 @@ pub(crate) enum ModuleCommand {
     IdiomChain(IdiomChainCommand),
     CardGame(LandlordCommand),
     TurtleSoup(TurtleSoupCommand),
+    Tarot(super::tarot::TarotCommand),
     Undercover(UndercoverCommand),
     Invite(InviteCommand),
     Moderation(ModerationCommand),
@@ -280,6 +281,7 @@ impl ModuleCommand {
             Self::CardGame(command) => command.lock_key(),
             Self::TurtleSoup(command) => command.lock_key().to_string(),
             Self::Undercover(command) => command.lock_key(),
+            Self::Tarot(command) => command.lock_key(),
             Self::Invite(command) => command.lock_key(),
             Self::Moderation(command) => command.lock_key(),
             Self::CustomWorkflow(command) => command.lock_key(),
@@ -287,7 +289,10 @@ impl ModuleCommand {
     }
 
     pub(crate) fn scopes_lock_to_actor(&self) -> bool {
-        matches!(self, Self::CardGame(_) | Self::Undercover(_))
+        matches!(
+            self,
+            Self::CardGame(_) | Self::Undercover(_) | Self::Tarot(_)
+        )
     }
 
     /// 当前大厅观察到的命令是否需要真实发言者身份。
@@ -308,6 +313,7 @@ impl ModuleCommand {
                 !matches!(command, LandlordCommand::Status | LandlordCommand::Retry)
             }
             Self::TurtleSoup(command) => matches!(command, TurtleSoupCommand::Start),
+            Self::Tarot(command) => !matches!(command, super::tarot::TarotCommand::Help),
             Self::Undercover(command) => !matches!(command, UndercoverCommand::Retry),
             // 这些模块目前仅对好友开放，或将触发用户作为执行契约的一部分。后续增加大厅路由时仍保持保守处理。
             Self::Invite(_) | Self::Moderation(_) | Self::CustomWorkflow(_) => true,

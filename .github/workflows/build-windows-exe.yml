@@ -248,7 +248,7 @@ jobs:
 
       - name: 创建 GitHub Release
         if: github.ref_name != 'dev' && steps.version.outputs.create_release == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: Miliastra Wonderland Music ${{ steps.version.outputs.version }}

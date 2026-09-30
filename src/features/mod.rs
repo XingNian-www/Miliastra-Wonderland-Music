@@ -13,5 +13,6 @@ pub(crate) mod moderation;
 pub(crate) mod playback;
 pub(crate) mod song_request;
 pub(crate) mod startup;
+pub(crate) mod tarot;
 pub(crate) mod turtle_soup;
 pub(crate) mod undercover;

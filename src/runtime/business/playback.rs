@@ -81,6 +81,18 @@ impl PlaybackRuntimeState {
                     .ok_or(BusinessRuntimeError::RuntimeStopped);
                 let _ = response.send(result);
             }
+            PlaybackRuntimeMessage::PlaybackPoolSnapshot(response) => {
+                let result = self
+                    .service
+                    .as_ref()
+                    .ok_or(BusinessRuntimeError::RuntimeStopped)
+                    .and_then(|service| {
+                        service
+                            .playback_pool_snapshot()
+                            .map_err(playback_operation_failed)
+                    });
+                let _ = response.send(result);
+            }
             PlaybackRuntimeMessage::PlaybackPoolAvailable(response) => {
                 let result = self
                     .service
@@ -258,6 +270,21 @@ impl PlaybackRuntimeState {
                         .record_control_operation(operation, requested_at_ms, completed)
                         .map_err(playback_operation_failed)
                 });
+                let _ = response.send(result);
+            }
+            PlaybackRuntimeMessage::SongRequestLeaderboard {
+                since_ms,
+                limit,
+                response,
+            } => {
+                let result = self.service.as_ref().map_or(
+                    Err(BusinessRuntimeError::RuntimeStopped),
+                    |service| {
+                        service
+                            .song_request_leaderboard(since_ms, limit)
+                            .map_err(playback_operation_failed)
+                    },
+                );
                 let _ = response.send(result);
             }
         }

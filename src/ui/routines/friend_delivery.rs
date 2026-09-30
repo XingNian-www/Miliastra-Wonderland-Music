@@ -1,4 +1,6 @@
+use miliastra_kernel::clock::{Clock, Delay, SystemClock};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread::sleep;
 use std::time::Duration;
@@ -296,11 +298,17 @@ impl UiRoutine for ObserveResidencyRoutine {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct SendHallBatch {
     messages: Vec<String>,
     residency: UiResidencyTarget,
     delay_ms: u64,
+    ready: Option<InviteReadyGate>,
+}
+
+#[derive(Clone, Debug)]
+struct InviteReadyGate {
+    running: Arc<AtomicBool>,
 }
 
 impl SendHallBatch {
@@ -313,7 +321,13 @@ impl SendHallBatch {
             messages: messages.into_iter().map(Into::into).collect(),
             residency,
             delay_ms,
+            ready: None,
         }
+    }
+
+    pub(crate) fn after_invite_primary_stability(mut self, running: Arc<AtomicBool>) -> Self {
+        self.ready = Some(InviteReadyGate { running });
+        self
     }
 }
 
@@ -678,6 +692,7 @@ fn execute_hall_batch(
         ocr,
         config,
         request.residency,
+        request.ready.as_ref(),
         &mut primary_chat_opened,
     ) {
         status = HallBatchStatus::Failed(failure);
@@ -686,7 +701,12 @@ fn execute_hall_batch(
             if index > 0 {
                 sleep_ms(request.delay_ms);
             }
-            match send_current_chat_message(context, config, message) {
+            match send_current_chat_message_guarded(
+                context,
+                config,
+                message,
+                request.ready.as_ref(),
+            ) {
                 Ok(()) => sent += 1,
                 Err(failure) => {
                     status = HallBatchStatus::Failed(failure);
@@ -696,15 +716,23 @@ fn execute_hall_batch(
         }
     }
 
-    let residency = match finish_hall_batch_residency(
-        context,
-        ocr,
-        config,
-        request.residency,
-        primary_chat_opened,
-    ) {
-        Ok(()) => UiResidencyOutcome::Confirmed(request.residency),
-        Err(failure) => UiResidencyOutcome::Failed(failure),
+    // 就绪闸门失败后不再按键恢复，避免取消后意外提交残留输入。
+    let residency = if request.ready.is_some() && matches!(&status, HallBatchStatus::Failed(_)) {
+        match &status {
+            HallBatchStatus::Failed(failure) => UiResidencyOutcome::Failed(failure.clone()),
+            HallBatchStatus::Complete => unreachable!(),
+        }
+    } else {
+        match finish_hall_batch_residency(
+            context,
+            ocr,
+            config,
+            request.residency,
+            primary_chat_opened,
+        ) {
+            Ok(()) => UiResidencyOutcome::Confirmed(request.residency),
+            Err(failure) => UiResidencyOutcome::Failed(failure),
+        }
     };
     SendHallBatchOutcome {
         sent,
@@ -718,15 +746,29 @@ fn normalize_hall_batch_start(
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
     target: UiResidencyTarget,
+    ready: Option<&InviteReadyGate>,
     primary_chat_opened: &mut bool,
 ) -> std::result::Result<(), UiRoutineFailure> {
+    if let Some(gate) = ready {
+        check_invite_ready_running(gate)?;
+    }
     context
         .device()
         .ensure_ready(config.after_activate_ms)
         .map_err(|error| before_input_failure("prepare_hall_batch", error))?;
+    if let Some(gate) = ready {
+        check_invite_ready_running(gate)?;
+        restore_primary(context, config)?;
+        confirm_invite_primary_stability(context, config, gate)?;
+    }
     match target {
         UiResidencyTarget::Primary => {
-            restore_primary(context, config)?;
+            if ready.is_none() {
+                restore_primary(context, config)?;
+            }
+            if let Some(gate) = ready {
+                check_invite_ready_running(gate)?;
+            }
             context
                 .device()
                 .press_key(Key::Return)
@@ -831,6 +873,39 @@ pub(super) fn send_current_chat_message(
     config: &FriendDeliveryRoutineConfig,
     message: &str,
 ) -> std::result::Result<(), UiRoutineFailure> {
+    send_current_chat_message_guarded(context, config, message, None)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatInputStep {
+    VerifySecondary,
+    Focus,
+    Input,
+    Submit,
+}
+
+fn run_verified_chat_input(
+    mut action: impl FnMut(ChatInputStep) -> Result<(), UiRoutineFailure>,
+) -> Result<(), UiRoutineFailure> {
+    for step in [
+        ChatInputStep::VerifySecondary,
+        ChatInputStep::Focus,
+        ChatInputStep::VerifySecondary,
+        ChatInputStep::Input,
+        ChatInputStep::VerifySecondary,
+        ChatInputStep::Submit,
+    ] {
+        action(step)?;
+    }
+    Ok(())
+}
+
+fn send_current_chat_message_guarded(
+    context: &mut UiRoutineContext<'_>,
+    config: &FriendDeliveryRoutineConfig,
+    message: &str,
+    ready: Option<&InviteReadyGate>,
+) -> Result<(), UiRoutineFailure> {
     if !*config
         .send_enabled
         .read()
@@ -838,29 +913,169 @@ pub(super) fn send_current_chat_message(
     {
         return Ok(());
     }
-    context
-        .device()
-        .click_point(config.chat_click.x, config.chat_click.y)
-        .map_err(|error| after_input_failure("focus_friend_message", error))?;
-    sleep_ms(config.click_ms);
-    if let Err(paste_error) = context.device().paste_text(message, config.text_ms)
-        && let Err(input_error) = context.device().input_text(message, config.text_ms)
-    {
-        return Err(UiRoutineFailure::new(
-            InputCertainty::AfterInputUnknown,
-            "input_friend_message",
-            format!("paste failed: {paste_error:#}; text input failed: {input_error:#}"),
-        ));
+    run_verified_chat_input(|step| {
+        if let Some(gate) = ready {
+            check_invite_ready_running(gate)?;
+        }
+        match step {
+            ChatInputStep::VerifySecondary => {
+                if ready.is_some() {
+                    // 每次capture都会刷新模板分类，不能使用打开聊天前的旧状态。
+                    capture_normalized_ui_state(
+                        context,
+                        &config.state_observation(),
+                        "confirm_ready_secondary",
+                        InputCertainty::ConfirmedFailure,
+                    )?;
+                    match context.latest_ui_state() {
+                        Some(UiStateObservation::Classified(state))
+                            if state.classification().kind() == UiStateKind::Secondary
+                                && state.stable_kind() == Some(UiStateKind::Secondary) => {}
+                        _ => {
+                            return Err(UiRoutineFailure::new(
+                                InputCertainty::ConfirmedFailure,
+                                "confirm_ready_secondary",
+                                "secondary chat is not freshly confirmed; readiness text will not be sent",
+                            ));
+                        }
+                    }
+                    check_invite_ready_running(ready.expect("checked above"))?;
+                }
+            }
+            ChatInputStep::Focus => {
+                context
+                    .device()
+                    .click_point(config.chat_click.x, config.chat_click.y)
+                    .map_err(|error| after_input_failure("focus_friend_message", error))?;
+                sleep_ms(config.click_ms);
+            }
+            ChatInputStep::Input => {
+                if let Err(paste_error) = context.device().paste_text(message, config.text_ms) {
+                    if ready.is_some() {
+                        // 输入可能已经部分生效；就绪消息不能盲目键入重放，也不能继续按发送键。
+                        return Err(UiRoutineFailure::new(
+                            InputCertainty::AfterInputUnknown,
+                            "input_invite_ready_message",
+                            format!("readiness paste failed; do not replay: {paste_error:#}"),
+                        ));
+                    }
+                    if let Err(input_error) = context.device().input_text(message, config.text_ms) {
+                        return Err(UiRoutineFailure::new(
+                            InputCertainty::AfterInputUnknown,
+                            "input_friend_message",
+                            format!(
+                                "paste failed: {paste_error:#}; text input failed: {input_error:#}"
+                            ),
+                        ));
+                    }
+                }
+            }
+            ChatInputStep::Submit => {
+                context.device().press_key(Key::Return).map_err(|error| {
+                    UiRoutineFailure::new(
+                        InputCertainty::AfterInputUnknown,
+                        "send_friend_message",
+                        format!("{error:#}"),
+                    )
+                })?;
+                sleep_ms(config.send_ms);
+            }
+        }
+        Ok(())
+    })
+}
+
+fn check_invite_ready_running(gate: &InviteReadyGate) -> Result<(), UiRoutineFailure> {
+    if gate.running.load(Ordering::SeqCst) {
+        Ok(())
+    } else {
+        Err(UiRoutineFailure::new(
+            InputCertainty::ConfirmedFailure,
+            "invite_ready_cancelled",
+            "invitation readiness sending was cancelled",
+        ))
     }
-    context.device().press_key(Key::Return).map_err(|error| {
-        UiRoutineFailure::new(
-            InputCertainty::AfterInputUnknown,
-            "send_friend_message",
-            format!("{error:#}"),
-        )
-    })?;
-    sleep_ms(config.send_ms);
-    Ok(())
+}
+
+fn wait_for_invite_primary_stability(
+    clock: &dyn Clock,
+    delay: &dyn Delay,
+    timeout: Duration,
+    poll: Duration,
+    running: &AtomicBool,
+    mut observe: impl FnMut() -> Result<bool, UiRoutineFailure>,
+) -> Result<(), UiRoutineFailure> {
+    let deadline = clock.now() + timeout;
+    let mut stable_since = None;
+    let mut last_sample = None;
+    let poll = poll.clamp(Duration::from_millis(10), Duration::from_millis(100));
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            return Err(UiRoutineFailure::new(
+                InputCertainty::ConfirmedFailure,
+                "invite_ready_cancelled",
+                "cancelled before readiness confirmation",
+            ));
+        }
+        let primary = observe().unwrap_or(false);
+        let now = clock.now();
+        if !running.load(Ordering::SeqCst) {
+            return Err(UiRoutineFailure::new(
+                InputCertainty::ConfirmedFailure,
+                "invite_ready_cancelled",
+                "cancelled during readiness observation",
+            ));
+        }
+        // 长时间没有新观测也不能累计稳定时间。
+        if last_sample
+            .is_some_and(|last| now.saturating_duration_since(last) > Duration::from_secs(1))
+        {
+            stable_since = None;
+        }
+        last_sample = Some(now);
+        if primary {
+            let since = *stable_since.get_or_insert(now);
+            if now <= deadline && now.saturating_duration_since(since) >= Duration::from_secs(2) {
+                return Ok(());
+            }
+        } else {
+            stable_since = None;
+        }
+        if now >= deadline {
+            return Err(UiRoutineFailure::new(
+                InputCertainty::ConfirmedFailure,
+                "confirm_invite_primary_stability",
+                "primary UI was not continuously confirmed for two seconds before timeout",
+            ));
+        }
+        delay.wait(poll.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn confirm_invite_primary_stability(
+    context: &mut UiRoutineContext<'_>,
+    config: &FriendDeliveryRoutineConfig,
+    gate: &InviteReadyGate,
+) -> Result<(), UiRoutineFailure> {
+    context.publish_progress(UiRoutineProgressStage::ConfirmingUi);
+    wait_for_invite_primary_stability(
+        &SystemClock,
+        &SystemClock,
+        Duration::from_millis(config.timeout_ms).max(Duration::from_secs(3)),
+        Duration::from_millis(config.poll_ms),
+        &gate.running,
+        || {
+            capture_normalized_ui_state(
+                context,
+                &config.state_observation(),
+                "confirm_invite_primary_stability",
+                InputCertainty::ConfirmedFailure,
+            )?;
+            Ok(
+                matches!(context.latest_ui_state(),Some(UiStateObservation::Classified(state)) if state.classification().kind()==UiStateKind::Primary && state.stable_kind()==Some(UiStateKind::Primary)),
+            )
+        },
+    )
 }
 
 fn ensure_secondary_chat(
@@ -1364,6 +1579,15 @@ fn restore_secondary_hall(
                 .click_point(point.x, point.y)
                 .map_err(|error| after_input_failure("select_secondary_hall", error))?;
             sleep_ms(config.click_ms);
+            // 点击大厅条目不是进入二级的成功凭据，发送前重新确认。
+            wait_for_stable_ui_kind(
+                context,
+                config.state_observation(),
+                Some(UiStateKind::Secondary),
+                config.timeout_ms,
+                "confirm_secondary_hall_selection",
+                InputCertainty::AfterInputUnknown,
+            )?;
             return Ok(());
         }
         let fingerprint = rect_chat_change_fingerprint(&image, config.friend_list_region)
@@ -1516,6 +1740,239 @@ pub(super) fn sleep_ms(ms: u64) {
 
 #[cfg(test)]
 mod tests {
+    use miliastra_kernel::clock::ManualClock;
+
+    fn ready_failure() -> UiRoutineFailure {
+        UiRoutineFailure::new(
+            InputCertainty::ConfirmedFailure,
+            "test_ready",
+            "not confirmed",
+        )
+    }
+
+    #[test]
+    fn invite_ready_requires_full_two_seconds_of_primary_observations() {
+        for (timeout, success) in [(1900, false), (2000, true)] {
+            let clock = ManualClock::new(std::time::Instant::now());
+            let start = clock.now();
+            let running = AtomicBool::new(true);
+            let mut samples = 0;
+            let result = wait_for_invite_primary_stability(
+                &clock,
+                &clock,
+                Duration::from_millis(timeout),
+                Duration::from_millis(100),
+                &running,
+                || {
+                    samples += 1;
+                    Ok(true)
+                },
+            );
+            assert_eq!(result.is_ok(), success);
+            assert_eq!(
+                clock.now().duration_since(start),
+                Duration::from_millis(timeout)
+            );
+            assert!(samples >= 20);
+        }
+    }
+
+    #[test]
+    fn invite_ready_resets_stability_after_non_primary_or_observation_failure() {
+        for failed_capture in [false, true] {
+            let clock = ManualClock::new(std::time::Instant::now());
+            let start = clock.now();
+            let running = AtomicBool::new(true);
+            wait_for_invite_primary_stability(
+                &clock,
+                &clock,
+                Duration::from_secs(5),
+                Duration::from_millis(100),
+                &running,
+                || {
+                    if clock.now().duration_since(start) == Duration::from_millis(1500) {
+                        if failed_capture {
+                            Err(ready_failure())
+                        } else {
+                            Ok(false)
+                        }
+                    } else {
+                        Ok(true)
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                clock.now().duration_since(start),
+                Duration::from_millis(3600)
+            );
+        }
+    }
+
+    #[test]
+    fn invite_ready_never_accepts_flickering_primary_or_unknown() {
+        let clock = ManualClock::new(std::time::Instant::now());
+        let running = AtomicBool::new(true);
+        let mut samples = 0;
+        assert!(
+            wait_for_invite_primary_stability(
+                &clock,
+                &clock,
+                Duration::from_secs(4),
+                Duration::from_millis(100),
+                &running,
+                || {
+                    samples += 1;
+                    Ok(samples % 10 != 0)
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn invite_ready_does_not_count_a_stale_observation_gap() {
+        let clock = ManualClock::new(std::time::Instant::now());
+        let start = clock.now();
+        let running = AtomicBool::new(true);
+        let mut samples = 0;
+        wait_for_invite_primary_stability(
+            &clock,
+            &clock,
+            Duration::from_secs(6),
+            Duration::from_millis(100),
+            &running,
+            || {
+                samples += 1;
+                if samples == 2 {
+                    clock.advance(Duration::from_secs(2)).unwrap();
+                }
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            clock.now().duration_since(start),
+            Duration::from_millis(4100)
+        );
+    }
+
+    #[test]
+    fn invite_ready_cancellation_before_and_during_observation_prevents_success() {
+        let clock = ManualClock::new(std::time::Instant::now());
+        let running = AtomicBool::new(false);
+        assert!(
+            wait_for_invite_primary_stability(
+                &clock,
+                &clock,
+                Duration::from_secs(4),
+                Duration::from_millis(100),
+                &running,
+                || panic!("cancelled must not capture")
+            )
+            .is_err()
+        );
+        running.store(true, Ordering::SeqCst);
+        assert!(
+            wait_for_invite_primary_stability(
+                &clock,
+                &clock,
+                Duration::from_secs(4),
+                Duration::from_millis(100),
+                &running,
+                || {
+                    running.store(false, Ordering::SeqCst);
+                    Ok(true)
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            check_invite_ready_running(&InviteReadyGate {
+                running: Arc::new(AtomicBool::new(false))
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ready_message_requires_secondary_before_focus_input_and_submit() {
+        for failed_check in 1..=3 {
+            let mut calls = Vec::new();
+            let mut checks = 0;
+            let result = run_verified_chat_input(|step| {
+                calls.push(step);
+                if step == ChatInputStep::VerifySecondary {
+                    checks += 1;
+                    if checks == failed_check {
+                        return Err(ready_failure());
+                    }
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(!calls.contains(&ChatInputStep::Submit));
+            if failed_check <= 2 {
+                assert!(!calls.contains(&ChatInputStep::Input));
+            }
+        }
+    }
+
+    #[test]
+    fn ready_message_submits_once_and_never_replays_an_unknown_send() {
+        for fail_send in [false, true] {
+            let mut calls = Vec::new();
+            let result = run_verified_chat_input(|step| {
+                calls.push(step);
+                if step == ChatInputStep::Submit && fail_send {
+                    return Err(ready_failure());
+                }
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), !fail_send);
+            assert_eq!(
+                calls,
+                [
+                    ChatInputStep::VerifySecondary,
+                    ChatInputStep::Focus,
+                    ChatInputStep::VerifySecondary,
+                    ChatInputStep::Input,
+                    ChatInputStep::VerifySecondary,
+                    ChatInputStep::Submit
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ready_input_failure_does_not_press_enter() {
+        let mut sent = 0;
+        assert!(
+            run_verified_chat_input(|step| {
+                if step == ChatInputStep::Input {
+                    return Err(ready_failure());
+                }
+                if step == ChatInputStep::Submit {
+                    sent += 1;
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(sent, 0);
+    }
+
+    #[test]
+    fn readiness_is_an_opt_in_standard_batch_requirement() {
+        let request = SendHallBatch::new(["ready"], UiResidencyTarget::Primary, 0);
+        assert!(request.ready.is_none());
+        let running = Arc::new(AtomicBool::new(true));
+        let request = request.after_invite_primary_stability(running.clone());
+        assert_eq!(request.messages, ["ready"]);
+        assert_eq!(request.residency, UiResidencyTarget::Primary);
+        assert!(Arc::ptr_eq(&request.ready.unwrap().running, &running));
+    }
+
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 

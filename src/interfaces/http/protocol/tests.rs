@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use crate::composition::application::http_facade::ApplicationHttpCommandFacade;
 use crate::features::hall::HallRuntimeState;
-use crate::features::playback::{PlaybackRuntimeState, PlayerStatus, test_candidate, test_track};
+use crate::features::playback::{
+    PlaybackRuntimeState, PlayerStatus, SongRequestLeaderboardEntry, test_candidate, test_track,
+};
 use crate::features::startup::{StartupSource, StartupTaskKind};
 use crate::features::turtle_soup::{TurtleSoupAppendReceipt, TurtleSoupSnapshot};
 use crate::features::undercover::UndercoverSnapshot;
@@ -146,6 +148,9 @@ struct RecordingHttpState {
     queue: Vec<QueueItem>,
     playback: PlaybackRuntimeState,
     hall: HallRuntimeState,
+    leaderboard: Vec<SongRequestLeaderboardEntry>,
+    leaderboard_queries: Vec<(Option<u64>, usize)>,
+    leaderboard_error: bool,
     hall_screenshot_requests: usize,
     hall_screenshot_error: bool,
     listener_enqueue_error: bool,
@@ -170,6 +175,9 @@ impl RecordingHttpState {
             queue: Vec::new(),
             playback: PlaybackRuntimeState::default(),
             hall: HallRuntimeState::default(),
+            leaderboard: Vec::new(),
+            leaderboard_queries: Vec::new(),
+            leaderboard_error: false,
             hall_screenshot_requests: 0,
             hall_screenshot_error: false,
             listener_enqueue_error: false,
@@ -611,6 +619,22 @@ impl HttpQueryPort for RecordingHttpPort {
             .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
             .hall
             .clone())
+    }
+
+    fn song_request_leaderboard(
+        &self,
+        since_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SongRequestLeaderboardEntry>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?;
+        state.leaderboard_queries.push((since_ms, limit));
+        if state.leaderboard_error {
+            return Err(anyhow!("leaderboard query failed"));
+        }
+        Ok(state.leaderboard.iter().take(limit).cloned().collect())
     }
 }
 
@@ -2098,6 +2122,207 @@ fn playback_statistics_reset_is_controlled_and_preserves_cache_assets() {
         playback_statistics_reset_route(&[("provider".to_string(), "qqmusic".to_string())], &state)
             .expect_err("missing id rejected");
     assert_eq!(error.status, 400);
+}
+
+#[test]
+fn playback_leaderboard_returns_entries_and_supports_range_params() {
+    let state = test_state_with_player_port(HttpTestPlayerPort::successful());
+    state
+        .recording
+        .state
+        .lock()
+        .expect("recording state")
+        .leaderboard = vec![
+        SongRequestLeaderboardEntry {
+            requester: "Alice".to_string(),
+            count: 3,
+            last_requested_at_ms: 1_700_000_000_000,
+        },
+        SongRequestLeaderboardEntry {
+            requester: "Bob".to_string(),
+            count: 1,
+            last_requested_at_ms: 1_700_000_100_000,
+        },
+    ];
+
+    let value: Value =
+        serde_json::from_str(&playback_leaderboard_route(&[], &state).expect("leaderboard route"))
+            .expect("leaderboard JSON");
+    assert_eq!(value["entries"][0]["requester"], "Alice");
+    assert_eq!(value["entries"][0]["count"], 3);
+    assert_eq!(
+        value["entries"][0]["lastRequestedAtMs"],
+        1_700_000_000_000i64
+    );
+    assert_eq!(value["entries"][1]["requester"], "Bob");
+    assert_eq!(value["limit"], 20);
+    assert_eq!(value["days"], Value::Null);
+    assert!(is_json_route("/playback/leaderboard"));
+    assert!(!is_mutating_route("/playback/leaderboard"));
+
+    // days/limit 参数透传并约束上限。
+    let value: Value = serde_json::from_str(
+        &playback_leaderboard_route(
+            &[
+                ("days".to_string(), "7".to_string()),
+                ("limit".to_string(), "1".to_string()),
+            ],
+            &state,
+        )
+        .expect("leaderboard route"),
+    )
+    .expect("leaderboard JSON");
+    assert_eq!(value["days"], 7);
+    assert_eq!(value["limit"], 1);
+    assert_eq!(value["entries"].as_array().map(Vec::len), Some(1));
+
+    let error = playback_leaderboard_route(&[("days".to_string(), "x".to_string())], &state)
+        .expect_err("invalid days rejected");
+    assert_eq!(error.status, 400);
+    let error = playback_leaderboard_route(&[("limit".to_string(), "x".to_string())], &state)
+        .expect_err("invalid limit rejected");
+    assert_eq!(error.status, 400);
+}
+
+#[test]
+fn playback_leaderboard_validates_boundaries_and_passes_time_window() {
+    let state = test_state();
+    for value in ["0", "", " 0 "] {
+        let body = playback_leaderboard_route(&[("days".into(), value.into())], &state).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["days"],
+            Value::Null
+        );
+        assert_eq!(
+            state
+                .recording
+                .state
+                .lock()
+                .unwrap()
+                .leaderboard_queries
+                .last(),
+            Some(&(None, 20))
+        );
+    }
+    for (value, expected) in [("0", 1), ("1000", 100), ("", 20)] {
+        let body = playback_leaderboard_route(&[("limit".into(), value.into())], &state).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["limit"],
+            expected
+        );
+    }
+    for field in ["days", "limit"] {
+        for value in ["-1", "1.5", "184467440737095516160"] {
+            assert_eq!(
+                playback_leaderboard_route(&[(field.into(), value.into())], &state)
+                    .unwrap_err()
+                    .status,
+                400
+            );
+        }
+    }
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let before = now();
+    playback_leaderboard_route(&[("days".into(), "7".into())], &state).unwrap();
+    let after = now();
+    let since = state
+        .recording
+        .state
+        .lock()
+        .unwrap()
+        .leaderboard_queries
+        .last()
+        .unwrap()
+        .0
+        .unwrap();
+    assert!(
+        (before.saturating_sub(604_800_000)..=after.saturating_sub(604_800_000)).contains(&since)
+    );
+}
+
+#[test]
+fn playback_leaderboard_maps_display_names_without_merging_people() {
+    use crate::features::identity::{IdentityConfig, IdentityMapping, IdentityRole};
+    let state = test_state();
+    state.live_configs.identity.replace(IdentityConfig {
+        mappings: vec![
+            IdentityMapping {
+                nickname: "Alice".into(),
+                id: Uuid::from_u128(11),
+                role: IdentityRole::Friend,
+                note: "同一备注".into(),
+            },
+            IdentityMapping {
+                nickname: "Bob".into(),
+                id: Uuid::from_u128(12),
+                role: IdentityRole::Friend,
+                note: "同一备注".into(),
+            },
+        ],
+    });
+    state.recording.state.lock().unwrap().leaderboard = vec![
+        SongRequestLeaderboardEntry {
+            requester: "Alice".into(),
+            count: 3,
+            last_requested_at_ms: 200,
+        },
+        SongRequestLeaderboardEntry {
+            requester: "Bob".into(),
+            count: 1,
+            last_requested_at_ms: 100,
+        },
+    ];
+    let body = playback_leaderboard_route(&[], &state).unwrap();
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(value["entries"][0]["requester"], "同一备注");
+    assert_eq!(value["entries"][1]["requester"], "同一备注");
+    assert_eq!(value["entries"][0]["count"], 3);
+    assert_eq!(value["entries"][1]["count"], 1);
+    assert_eq!(
+        state.recording.state.lock().unwrap().leaderboard[0].requester,
+        "Alice"
+    );
+}
+
+#[test]
+fn playback_leaderboard_requires_authentication_and_reports_query_failure() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "leaderboard-secret");
+    for token in [None, Some("wrong-token")] {
+        let response = http_get(server.local_addr(), "/playback/leaderboard", token);
+        assert_eq!(response.status_line, "HTTP/1.1 401 Unauthorized");
+    }
+    assert!(
+        state
+            .recording
+            .state
+            .lock()
+            .unwrap()
+            .leaderboard_queries
+            .is_empty()
+    );
+    let response = http_get(
+        server.local_addr(),
+        "/playback/leaderboard?days=0",
+        Some("leaderboard-secret"),
+    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(
+        serde_json::from_str::<Value>(&response.body).unwrap()["entries"],
+        json!([])
+    );
+    state.recording.state.lock().unwrap().leaderboard_error = true;
+    assert_eq!(
+        playback_leaderboard_route(&[], &state).unwrap_err().status,
+        500
+    );
+    server.shutdown().unwrap();
 }
 
 #[test]

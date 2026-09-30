@@ -10,7 +10,7 @@ use anyhow::{Result, anyhow};
 use super::{FormalTaskExecutionContext, PendingTask, PendingTaskExecution};
 use crate::config::LiveConfigs;
 use crate::features::hall::HallRuntimeState;
-use crate::features::playback::{PlaybackRuntimeState, QueueItem};
+use crate::features::playback::{PlaybackRuntimeState, QueueItem, SongRequestLeaderboardEntry};
 use crate::features::startup::StartupTask;
 use crate::features::turtle_soup::TurtleSoupSnapshot;
 use crate::features::undercover::UndercoverSnapshot;
@@ -250,6 +250,14 @@ impl HttpQueryPort for FormalTaskClient {
 
     fn hall_state_snapshot(&self) -> Result<HallRuntimeState> {
         Ok(self.business.hall_state_snapshot()?)
+    }
+
+    fn song_request_leaderboard(
+        &self,
+        since_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SongRequestLeaderboardEntry>> {
+        Ok(self.business.song_request_leaderboard(since_ms, limit)?)
     }
 }
 

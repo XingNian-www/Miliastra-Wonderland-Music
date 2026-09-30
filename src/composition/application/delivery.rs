@@ -2,6 +2,14 @@ use super::*;
 
 impl ApplicationRuntime {
     pub(super) fn reply(&self, message: &str) -> Result<()> {
+        self.reply_with_ready_gate(message, false)
+    }
+
+    pub(super) fn reply_invite_ready(&self, message: &str) -> Result<()> {
+        self.reply_with_ready_gate(message, true)
+    }
+
+    fn reply_with_ready_gate(&self, message: &str, invite_ready: bool) -> Result<()> {
         let mapped = self
             .lifecycle
             .live_configs
@@ -19,7 +27,21 @@ impl ApplicationRuntime {
         } else {
             mapped.as_str()
         };
-        match self.active_ui_residency()? {
+        let residency = self.active_ui_residency()?;
+        if invite_ready {
+            let target = match residency {
+                UiResidency::Primary => crate::ui::routines::UiResidencyTarget::Primary,
+                UiResidency::SecondaryCurrentHall => {
+                    crate::ui::routines::UiResidencyTarget::SecondaryCurrentHall
+                }
+            };
+            return self.ui.chat_output.send_invite_ready(
+                message,
+                target,
+                self.lifecycle.running.clone(),
+            );
+        }
+        match residency {
             UiResidency::Primary => self.ui.chat_output.send_for_command(message),
             UiResidency::SecondaryCurrentHall => self.ui.chat_output.send_current_chat(message),
         }

@@ -76,6 +76,7 @@ pub(crate) use state::{
     ActivePlaybackIdentity, ActivePlaybackRequest, ConfirmedPlaybackState, ControlOperationRecord,
     PauseReason, PersistentPlaybackState, PlaybackAttemptRecord, PlaybackObservation,
     PlaybackRuntimeState, PlaybackSessionBinding, RequestStateStore, SessionReconciliation,
+    SongRequestEvent, SongRequestLeaderboardEntry,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -567,6 +568,8 @@ pub(crate) enum PlaybackStateUpdate {
         navigation: PlaybackNavigation,
     },
     Confirmed {
+        /// 与确认状态和出队同事务提交；恢复/上一首不生成新点歌事件。
+        song_request_event: Option<SongRequestEvent>,
         request: ActivePlaybackRequest,
         navigation: PlaybackNavigation,
     },
@@ -622,6 +625,7 @@ impl PlaybackStateUpdate {
             Self::Confirmed {
                 request,
                 navigation,
+                ..
             } => {
                 match navigation {
                     PlaybackNavigation::Normal => playback.remember_current_playback(),
@@ -830,6 +834,21 @@ impl PlaybackService {
             .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
             .record_pool_track(track, self.pool_max_size)
             .map(|_| ())
+    }
+
+    /// 点歌人排行榜查询；未接入持久化时返回空表。
+    pub(crate) fn song_request_leaderboard(
+        &self,
+        since_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SongRequestLeaderboardEntry>> {
+        let Some(store) = &self.request_state else {
+            return Ok(Vec::new());
+        };
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
+            .song_request_leaderboard(since_ms, limit)
     }
 
     pub(crate) fn pick_playback_pool_track(
@@ -1250,6 +1269,7 @@ mod tests {
             expected_generation: 0,
         };
         PlaybackStateUpdate::Confirmed {
+            song_request_event: None,
             request,
             navigation: PlaybackNavigation::Normal,
         }
@@ -1543,6 +1563,7 @@ mod tests {
         service
             .confirm_playback_and_dequeue(
                 PlaybackStateUpdate::Confirmed {
+                    song_request_event: None,
                     request: ActivePlaybackRequest {
                         keyword: "歌曲A".to_string(),
                         source: "qqmusic".to_string(),
@@ -1662,6 +1683,7 @@ mod tests {
             service
                 .confirm_playback_and_dequeue(
                     PlaybackStateUpdate::Confirmed {
+                        song_request_event: None,
                         request: ActivePlaybackRequest {
                             keyword: "歌曲A".to_string(),
                             source: "qqmusic".to_string(),

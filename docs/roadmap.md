@@ -1,6 +1,6 @@
 # 后续发展路线
 
-> 整理日期：2026-09-29。依据本地工作树：主包 5.8.3、HEAD 557c3d9，以及本次开始时已有的 13 个修改文件。本文是建议，不是已完成清单、发布日期承诺或线上质量报告。项目结构见 [项目导览](project-overview.md)。
+> 本文是项目维护建议，不是已完成清单、发布日期承诺或线上质量报告。项目结构见 [项目导览](project-overview.md)。
 
 ## 1. 核心判断
 
@@ -139,15 +139,13 @@
 - 不删除 vendor、模型、本地运行数据或未跟踪工具来追求目录整洁。
 - 不为重构绕过现有任务互斥、身份权限、令牌保护和隐私边界。
 
-## 7. 本次实际验证与边界
+## 7. 验证边界
 
 | 检查 | 实际结果 |
 | --- | --- |
-| cargo fmt --all -- --check | 通过，未改写源码 |
+| cargo fmt --all -- --check | 通过 |
 | cargo test --offline --locked -p miliastra-kernel -p miliastra-contracts -p miliastra-login-protocol | 通过：kernel 33 项、login-protocol 6 项；contracts 无单元测试，合计 39 项通过 |
 | tools/ai-automation 下 python -m unittest discover -s tests -v | 11 项通过；仅本地工具 mock API 测试，不代表真实游戏操作成功 |
-| git diff --check（整理前后） | 通过；存在 Git 换行转换提示，不是测试失败 |
+| git diff --check | 通过；Git 换行转换提示不影响结果 |
 
 未执行完整 workspace 测试、clippy、真实音乐源登录/播放、真实 OCR 后端运行、游戏操作、发布打包及干净机器安装验证。这里的通过结果不能替代这些验收，也不能声称点歌榜已通过全部主程序回归。
-
-本次只新增导览/路线并补入口链接，没有实现上面的路线项，没有修改业务代码，也没有替用户提交现有改动。

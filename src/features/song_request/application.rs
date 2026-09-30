@@ -20,6 +20,9 @@ pub(crate) struct SongRequestContext {
     pub(crate) raw: String,
     pub(crate) username: String,
     pub(crate) user_command: String,
+    /// 调用方是否具备好友及以上权限：好友私聊、已映射的好友/管理员/主人，
+    /// 以及控制面板发起的点歌都算；B站 音源与本地曲库兜底以此为门槛。
+    pub(crate) friend_or_above: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,6 +440,7 @@ impl SongRequestApplication {
             song_review: self.song_review.as_ref(),
             queue_max_size: self.queue_max_size,
             console_bypass_dedup: self.console_bypass_dedup,
+            friend_or_above: context.friend_or_above,
             port,
         }
         .execute_song_request_intent(context, song)
@@ -448,6 +452,8 @@ struct SongRequestExecution<'a> {
     song_review: &'a dyn SongReviewGateway,
     queue_max_size: usize,
     console_bypass_dedup: bool,
+    /// 本次请求是否具备好友及以上权限。
+    friend_or_above: bool,
     port: &'a mut dyn SongRequestPort,
 }
 
@@ -630,7 +636,7 @@ impl SongRequestExecution<'_> {
         self.reply(&format!("{}AI匹配中", label))?;
 
         let search_source = ai_candidate_source(song);
-        let allow_bilibili = allows_bilibili_source(song);
+        let allow_bilibili = self.friend_or_above;
         let mut candidates =
             match self.search_ai_candidates(&song.keyword, search_source, allow_bilibili) {
                 Ok(candidates) => candidates,
@@ -867,7 +873,7 @@ impl SongRequestExecution<'_> {
                     &request.label(),
                     &format!("{}平台无对应歌曲音源", request.label()),
                     &request.keyword,
-                    !request.friend_username.trim().is_empty(),
+                    self.friend_or_above,
                     true,
                 )? {
                     NoCandidateOutcome::Local(candidate) => {
@@ -977,7 +983,7 @@ impl SongRequestExecution<'_> {
                 &song_label(song),
                 &format!("{}换源后仍无音源", song_label(song)),
                 &song.keyword,
-                !song.friend_username.trim().is_empty(),
+                self.friend_or_above,
                 true,
             )? {
                 NoCandidateOutcome::Local(candidate) => {
@@ -1683,11 +1689,6 @@ fn ai_candidate_source(song: &SongCommand) -> &'static str {
     }
 }
 
-/// B站 音源要求好友及以上权限：只有带好友身份的请求才允许把 B站 纳入本地兜底。
-fn allows_bilibili_source(song: &SongCommand) -> bool {
-    !song.friend_username.trim().is_empty()
-}
-
 fn alternate_music_source(source: &str) -> &'static str {
     if source == SongSource::Netease.as_str() {
         SongSource::QqMusic.as_str()
@@ -1963,6 +1964,15 @@ mod tests {
             raw: "@点歌 晴天".to_string(),
             username: "Alice".to_string(),
             user_command: "@点歌 晴天".to_string(),
+            friend_or_above: false,
+        }
+    }
+
+    /// 大厅里靠身份映射获得好友及以上权限的成员：命令仍是大厅形状，权限来自映射。
+    fn mapped_context() -> SongRequestContext {
+        SongRequestContext {
+            friend_or_above: true,
+            ..context()
         }
     }
 
@@ -2493,8 +2503,8 @@ mod tests {
         assert_eq!(
             port.library_searches.borrow().as_slice(),
             [
-                (song.keyword.clone(), allows_bilibili_source(&song)),
-                ("晴天 周杰伦".into(), allows_bilibili_source(&song))
+                (song.keyword.clone(), context().friend_or_above),
+                ("晴天 周杰伦".into(), context().friend_or_above)
             ]
         );
         assert_eq!(port.search_sources.borrow().len(), 2);
@@ -2713,7 +2723,7 @@ mod tests {
         application.execute(&context(), &song, &mut port).unwrap();
         assert_eq!(
             port.library_searches.borrow().as_slice(),
-            [("晴天".into(), allows_bilibili_source(&song))]
+            [("晴天".into(), context().friend_or_above)]
         );
         assert_eq!(ai.candidates.lock().unwrap()[0].len(), 1);
         assert_eq!(
@@ -3585,14 +3595,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_library_fallback_needs_friend_permission_for_bilibili() {
-        // 大厅请求没有好友及以上权限：本地兜底排除 B站，@本地 不可用，也不会播放。
-        let mut hall = FakePort::idle([None]);
-        hall.library_candidates.borrow_mut().push(test_candidate(
+    fn bilibili_candidate() -> SearchCandidate {
+        test_candidate(
             "【小花仙第二季】插曲《降生》纯享版 - 创元-yin",
             "miliastra://track/bilibili/BV1qqpGe1Egj",
-        ));
+        )
+    }
+
+    #[test]
+    fn local_library_fallback_needs_friend_permission_for_bilibili() {
+        // 大厅里未映射的成员没有好友及以上权限：本地兜底排除 B站，@本地 不可用，也不会播放。
+        let mut hall = FakePort::idle([None]);
+        hall.library_candidates
+            .borrow_mut()
+            .push(bilibili_candidate());
         application()
             .execute(&context(), &command(), &mut hall)
             .expect("song request");
@@ -3610,16 +3626,37 @@ mod tests {
                 .any(|line| line.contains("@本地"))
         );
 
-        // 好友请求保留 B站 音源，可推荐并播放。
+        // 大厅里靠身份映射获得好友及以上权限的成员：命令形状仍是大厅命令，
+        // 但本地兜底保留 B站 并可以播放。
+        let mut mapped = FakePort::idle([None]);
+        mapped
+            .library_candidates
+            .borrow_mut()
+            .push(bilibili_candidate());
+        mapped.decisions = VecDeque::from([SongRequestDecision::LocalLibrary]);
+        application()
+            .execute(&mapped_context(), &command(), &mut mapped)
+            .expect("song request");
+        assert_eq!(
+            mapped.library_searches.borrow().as_slice(),
+            [("晴天".to_string(), true)]
+        );
+        let played = mapped.played.borrow();
+        assert_eq!(
+            played[0].track.as_ref().unwrap().track_ref.key.provider,
+            miliastra_playback::ProviderId::Bilibili
+        );
+
+        // 好友私聊命令保留 B站 音源，可推荐并播放。
         let mut friend = FakePort::idle([None]);
-        friend.library_candidates.borrow_mut().push(test_candidate(
-            "【小花仙第二季】插曲《降生》纯享版 - 创元-yin",
-            "miliastra://track/bilibili/BV1qqpGe1Egj",
-        ));
+        friend
+            .library_candidates
+            .borrow_mut()
+            .push(bilibili_candidate());
         friend.decisions = VecDeque::from([SongRequestDecision::LocalLibrary]);
         application()
             .execute(
-                &context(),
+                &mapped_context(),
                 &SongCommand {
                     friend_username: "Bob".to_string(),
                     ..command()
@@ -3630,11 +3667,6 @@ mod tests {
         assert_eq!(
             friend.library_searches.borrow().as_slice(),
             [("晴天".to_string(), true)]
-        );
-        let played = friend.played.borrow();
-        assert_eq!(
-            played[0].track.as_ref().unwrap().track_ref.key.provider,
-            miliastra_playback::ProviderId::Bilibili
         );
     }
 

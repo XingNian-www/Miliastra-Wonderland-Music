@@ -68,32 +68,25 @@ impl ApplicationRuntime {
         Ok(result)
     }
 
-    pub(super) fn prompt_and_wait_for_decision(
-        &mut self,
-        message: &str,
-        allow_switch_source: bool,
-        allow_ai: bool,
-        timeout_confirms: bool,
-    ) -> Result<SongRequestDecision> {
-        let messages = [message.to_string()];
-        self.prompt_and_wait_for_decision_batch(
-            &messages,
-            allow_switch_source,
-            allow_ai,
-            timeout_confirms,
-        )
-    }
-
+    /// allow_local 为 false 时 @本地 与未开放的 @换源/@AI 一样被忽略，
+    /// 不会中断本次点歌，而是继续等待其他确认命令。
     pub(super) fn prompt_and_wait_for_decision_batch(
         &mut self,
         messages: &[String],
         allow_switch_source: bool,
         allow_ai: bool,
+        allow_local: bool,
         timeout_confirms: bool,
     ) -> Result<SongRequestDecision> {
         let reader = self.begin_song_decision_reader()?;
         self.reply_batch(messages, 0)?;
-        self.wait_for_decision_with_reader(reader, allow_switch_source, allow_ai, timeout_confirms)
+        self.wait_for_decision_with_reader(
+            reader,
+            allow_switch_source,
+            allow_ai,
+            allow_local,
+            timeout_confirms,
+        )
     }
 
     fn begin_song_decision_reader(&self) -> Result<ChatDecisionReader> {
@@ -111,6 +104,7 @@ impl ApplicationRuntime {
         mut reader: ChatDecisionReader,
         allow_switch_source: bool,
         allow_ai: bool,
+        allow_local: bool,
         timeout_confirms: bool,
     ) -> Result<SongRequestDecision> {
         let timeout = Duration::from_millis(self.lifecycle.config.timing.decision.timeout_ms);
@@ -162,6 +156,7 @@ impl ApplicationRuntime {
                         return Ok(SongRequestDecision::SwitchSource);
                     }
                     SongRequestDecision::Ai if allow_ai => return Ok(SongRequestDecision::Ai),
+                    SongRequestDecision::LocalLibrary if allow_local => return Ok(decision),
                     SongRequestDecision::Select | SongRequestDecision::SelectIndex(_) => {
                         return Ok(decision);
                     }

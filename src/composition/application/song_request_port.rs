@@ -16,6 +16,7 @@ impl SongRequestPort for ApplicationRuntime {
         messages: &[String],
         allow_switch_source: bool,
         allow_ai: bool,
+        allow_local: bool,
         default_confirm: bool,
     ) -> Result<SongRequestDecision> {
         ApplicationRuntime::prompt_and_wait_for_decision_batch(
@@ -23,22 +24,7 @@ impl SongRequestPort for ApplicationRuntime {
             messages,
             allow_switch_source,
             allow_ai,
-            default_confirm,
-        )
-    }
-
-    fn prompt_and_wait_for_decision(
-        &mut self,
-        message: &str,
-        allow_switch_source: bool,
-        allow_ai: bool,
-        default_confirm: bool,
-    ) -> Result<SongRequestDecision> {
-        ApplicationRuntime::prompt_and_wait_for_decision(
-            self,
-            message,
-            allow_switch_source,
-            allow_ai,
+            allow_local,
             default_confirm,
         )
     }
@@ -53,6 +39,18 @@ impl SongRequestPort for ApplicationRuntime {
             .search_candidates(keyword, source)
             .map(|candidates| (!candidates.is_empty()).then_some(candidates))
             .map_err(song_search_failure)
+    }
+
+    fn local_recommend(&self) -> bool {
+        self.lifecycle.live_configs.snapshot().ai.local_recommend
+    }
+
+    fn local_recommend_min_score(&self) -> f64 {
+        self.lifecycle
+            .live_configs
+            .snapshot()
+            .ai
+            .local_recommend_min_score
     }
 
     fn search_library_candidates(

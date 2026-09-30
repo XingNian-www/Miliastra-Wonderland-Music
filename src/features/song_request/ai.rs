@@ -42,7 +42,21 @@ pub struct AiConfig {
     pub candidate_pick_prompt: String,
     #[serde(default)]
     pub http_proxy: String,
+    /// 在线匹配偏低时是否额外给出本地曲库推荐；默认开启。
+    #[serde(default = "default_local_recommend")]
+    pub local_recommend: bool,
+    /// 在线候选分数低于该值才去比较本地曲库；本地分数必须严格更高才会推荐。
+    #[serde(default = "default_local_recommend_min_score")]
+    pub local_recommend_min_score: f64,
     pub extra_body: HashMap<String, Value>,
+}
+
+fn default_local_recommend() -> bool {
+    true
+}
+
+fn default_local_recommend_min_score() -> f64 {
+    0.6
 }
 
 impl Default for AiConfig {
@@ -57,6 +71,8 @@ impl Default for AiConfig {
             match_prompt: default_match_prompt(),
             candidate_pick_prompt: default_candidate_pick_prompt(),
             http_proxy: String::new(),
+            local_recommend: default_local_recommend(),
+            local_recommend_min_score: default_local_recommend_min_score(),
             extra_body: HashMap::new(),
         }
     }
@@ -64,6 +80,11 @@ impl Default for AiConfig {
 
 impl AiConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        if !self.local_recommend_min_score.is_finite()
+            || !(0.0..=1.0).contains(&self.local_recommend_min_score)
+        {
+            bail!("ai.local_recommend_min_score 必须是 0 到 1 之间的有限小数");
+        }
         validate_http_proxy(&self.http_proxy).context("ai.http_proxy 配置无效")?;
         if self.api_key.trim().is_empty() {
             return Ok(());

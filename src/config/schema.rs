@@ -1560,6 +1560,18 @@ fn ai_section() -> Vec<ConfigFieldSchema> {
             "可选的独立 HTTP(S) 代理；只作用于点歌 AI，留空时沿用环境代理设置",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "local_recommend",
+            "本地曲库推荐",
+            FieldKind::Bool,
+            "在线匹配偏低时额外给出本地曲库推荐；默认开启，保存后空闲时生效",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "local_recommend_min_score",
+            "本地推荐触发分数",
+            float(0.0, 1.0),
+            "在线候选分数低于该值才比较本地曲库；只有本地分数更高才会推荐",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "system_prompt",
             "系统提示词",
             FieldKind::Text,

@@ -6,6 +6,7 @@ use enigo::Key;
 use image::DynamicImage;
 
 use crate::config::PointConfig;
+use crate::debug_mode;
 use crate::runtime::ui::{
     CaptureFrame, InputCertainty, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     sealed,
@@ -36,18 +37,30 @@ impl GameUi {
     }
 
     pub(crate) fn press_key(&self, key: Key) -> Result<()> {
+        if !debug_mode::input_allowed() {
+            anyhow::bail!("调试模式已禁用游戏内输入，请通过外部 API 操作");
+        }
         self.backend.press_key(key)
     }
 
     pub(crate) fn click_point(&self, point: PointConfig) -> Result<()> {
+        if !debug_mode::input_allowed() {
+            anyhow::bail!("调试模式已禁用游戏内输入，请通过外部 API 操作");
+        }
         self.backend.click_point(point)
     }
 
     pub(crate) fn ensure_ready(&self, after_activate_ms: u64) -> Result<()> {
+        if !debug_mode::input_allowed() {
+            anyhow::bail!("调试模式已禁用游戏内输入，请通过外部 API 操作");
+        }
         self.backend.ensure_ready(after_activate_ms)
     }
 
     pub(crate) fn close_window(&self) -> Result<()> {
+        if !debug_mode::input_allowed() {
+            anyhow::bail!("调试模式已禁用游戏内输入，请通过外部 API 操作");
+        }
         self.backend.close_window()
     }
 

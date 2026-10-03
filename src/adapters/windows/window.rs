@@ -21,14 +21,22 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetClientRect, GetCursorPos,
-    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
-    SW_RESTORE, SetForegroundWindow, ShowWindow, WM_CLOSE, WindowFromPoint,
+    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    PostMessageW, SW_RESTORE, SetForegroundWindow, ShowWindow, WM_CLOSE, WindowFromPoint,
 };
 use windows::core::BOOL;
 
 use crate::config::{PointConfig, WindowConfig};
 
 // BGI 会在拖动起点和每个插值点停留足够时间，使游戏 UI 事件循环能观察到按下状态。
+/// 移动光标与按下左键之间要留的时间。
+///
+/// 见第 66/67 节：同一套 `click` 在屏幕边缘/底部的独立按钮上全部生效，
+/// 在面板内部的按钮上（奇域主菜单的 20 个入口）一次也没生效；悬停与坐标换算都已排除。
+/// 剩下的差别就是这个间隔——游戏 UI 按帧轮询光标位置，
+/// 同一毫秒内发出移动与点击时，点击可能仍落在上一帧的光标位置上。
+/// 与下面那组 `DRAG_*` 常量同一个道理（项目早就给拖拽加了静默，这里补上点击的）。
+const CLICK_SETTLE_MS: u64 = 80;
 const DRAG_START_SETTLE_MS: u64 = 100;
 const DRAG_PRESS_SETTLE_MS: u64 = 100;
 const DRAG_STEPS: i32 = 8;
@@ -254,6 +262,19 @@ impl GameWindow {
         enigo
             .move_mouse(screen.x, screen.y, Coordinate::Abs)
             .context("move mouse")?;
+        // **移动与点击之间必须留一帧的时间。**
+        //
+        // 第 66 节的证据链：同一套 `click` 在屏幕边缘/底部的 7 个独立按钮上全部生效，
+        // 而在**面板内部的按钮**上（奇域主菜单 20 个入口、左侧竖排图标）一次也没生效。
+        // 悬停与坐标换算都已被排除（`click_screen` 本来就是先移后点）。
+        //
+        // 剩下的差别就是这个间隔：游戏的 UI 按帧轮询光标位置，
+        // 移动与点击在同一毫秒内发出时，那次点击很可能仍然落在**上一帧的光标位置**上，
+        // 于是"面板按钮"吃不到点击；而边缘那几个按钮偏偏在上一帧光标经过的路径附近。
+        //
+        // 60fps 一帧约 17ms，这里给到 80ms（约 5 帧）留足余量。
+        // 这个停顿只影响点击的可靠性，不影响任何坐标或判据。
+        sleep(Duration::from_millis(CLICK_SETTLE_MS));
         enigo
             .button(Button::Left, Direction::Click)
             .context("click mouse")?;
@@ -406,7 +427,22 @@ pub fn ensure_foreground(config: &WindowConfig) -> Result<()> {
 pub fn close_game(config: &WindowConfig) -> Result<()> {
     let hwnd = find_window_by_process_for_close(&config.target_process)?;
     unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }
-        .context("PostMessageW WM_CLOSE failed")
+        .context("PostMessageW WM_CLOSE failed")?;
+    wait_for_window_close(Duration::from_secs(3), || unsafe {
+        IsWindow(Some(hwnd)).as_bool()
+    })
+}
+
+fn wait_for_window_close(timeout: Duration, mut exists: impl FnMut() -> bool) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while exists() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("WM_CLOSE sent but target window did not close within {timeout:?}");
+        }
+        sleep(remaining.min(Duration::from_millis(25)));
+    }
+    Ok(())
 }
 
 fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicImage> {
@@ -708,6 +744,43 @@ fn send_alt_keypress() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a visible running game window on the desktop"]
+    fn live_window_read_only_capture_smoke() {
+        let window = GameWindow::find(&WindowConfig::default()).expect("find live target window");
+        let foreground = window.is_foreground();
+        let image = window
+            .capture()
+            .expect("capture live target window")
+            .to_rgba8();
+        assert!(image.width() > 0 && image.height() > 0);
+        let first = image.get_pixel(0, 0);
+        let varied = image.pixels().any(|pixel| pixel != first);
+        println!(
+            "live target capture: {}x{}, foreground={foreground}, varied={varied}",
+            image.width(),
+            image.height()
+        );
+        assert!(varied, "live target screenshot is a uniform image");
+    }
+
+    #[test]
+    fn close_wait_requires_window_to_disappear() {
+        let mut checks = 0;
+        wait_for_window_close(Duration::from_millis(50), || {
+            checks += 1;
+            checks < 3
+        })
+        .unwrap();
+        assert_eq!(checks, 3);
+        assert!(
+            wait_for_window_close(Duration::ZERO, || true)
+                .unwrap_err()
+                .to_string()
+                .contains("did not close")
+        );
+    }
 
     #[test]
     fn splits_multiple_target_process_names() {

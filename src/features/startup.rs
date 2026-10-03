@@ -220,6 +220,8 @@ impl StartupSource {
     pub const STARTUP_CONFIG: Self = Self("启动配置");
     pub const REMOTE_CONSOLE: Self = Self("远程指挥台");
     pub const AUTOMATIC_UI: Self = Self("界面自动识别");
+    /// 来自调试沙盒的显式调用。独立标注，便于在任务记录里与自动化触发区分开。
+    pub const DEBUG_SANDBOX: Self = Self("调试沙盒");
 
     pub const fn new(label: &'static str) -> Self {
         Self(label)

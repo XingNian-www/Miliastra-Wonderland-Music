@@ -88,6 +88,10 @@ pub(super) fn decision_submit_route(
             status: 409,
             message: error.to_string(),
         })?;
+    crate::debug_events::bus().publish(
+        "decision.submitted",
+        serde_json::json!({"decisionId": id, "action": &action_text}),
+    );
     Ok(json!({ "ok": true, "decisionId": id, "submitted": action_text }).to_string())
 }
 

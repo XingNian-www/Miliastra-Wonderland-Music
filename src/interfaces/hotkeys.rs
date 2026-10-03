@@ -134,6 +134,10 @@ fn hotkey_loop(
             if message.message == WM_HOTKEY {
                 match message.wParam.0 as i32 {
                     PAUSE_ID => {
+                        if crate::debug_mode::enabled() {
+                            log::info!("调试模式中忽略暂停/恢复热键");
+                            continue;
+                        }
                         let now_paused = !paused.load(Ordering::SeqCst);
                         paused.store(now_paused, Ordering::SeqCst);
                         wake_tasks();

@@ -16,6 +16,7 @@ use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::change_detection::{change_stats, rect_chat_change_fingerprint};
 use crate::ui::geometry::{Point, Rect, crop_canvas};
 use crate::ui::state::find_enter_game_text as locate_enter_game_text;
+use crate::ui::state::world_is_teyvat;
 use crate::ui::template::best_template_hit;
 use enigo::Key;
 
@@ -469,6 +470,20 @@ fn execute_enter_wonderland(
         .press_key(Key::M)
         .map_err(|error| after_input_failure("open_wonderland_map", error))?;
 
+    // **先确认地图真的开了，再去找星标。**
+    //
+    // 原来这里直接进 `wait_template_hit` 重试 120 次 x 2.5 秒（最长 5 分钟），
+    // 而 `M` 是有可能不生效的（例如聊天框正开着，`M` 被打进了输入框）。
+    // 那种情况下机器人会白等 5 分钟，最后把失败报成「找不到星标」——
+    // **诊断是错的**，看不到「地图根本没打开」这个真正的原因。
+    //
+    // 为什么不需要给提瓦特地图单独建判据：第 71 节实测，提瓦特地图 4 张 + 千星地图 1 张
+    // **全部不是 `overworld`**，世界判据一律报 `not_applicable`（地图盖住了左上角 HUD）；
+    // 而真·提瓦特大世界 3 张对照全部是 `overworld` / `teyvat`。
+    // 所以「世界判据由真变假」就是地图已开的充分可观测证据。
+    // （第 71 节也试过为提瓦特地图单独建区域/二维统计判据，全部过拟合失败，见该节。）
+    wait_for_wonderland_map_open(context, config)?;
+
     let map_attempts = capped_attempts(
         config.startup.wonderland_map_star_retries,
         config.startup.enter_wonderland_timeout_ms,
@@ -577,6 +592,49 @@ fn execute_enter_wonderland(
             )
         })?;
     confirm_wonderland_transition(context, config)
+}
+
+/// 按 `M` 之后确认「地图真的盖住了大世界」。
+///
+/// 证据（第 71 节，`docs/ui-state-criteria.md` 第 27 章）：
+///
+/// | 帧 | 实际是什么 | app 判定 |
+/// |---|---|---|
+/// | 提瓦特地图 x4（`c01-map` / `c02-map-fresh` / `tv_map_1..4`）| 地图 | **不是 `overworld`**，世界判据 `not_applicable` |
+/// | 千星地图 x1（`map-screen.png`）| 地图 | **不是 `overworld`**，世界判据 `not_applicable` |
+/// | 真·提瓦特大世界 x3（`t-00` / `t-10` / `snow-01`）| 大世界 | `overworld` / 世界判据 `teyvat` |
+///
+/// 所以这里**不需要**为提瓦特地图另建判据，只要看世界判据有没有由真变假。
+/// 连续 `TEMPLATE_STABLE_HITS` 次为假才算数，避免中间夹一帧过渡画面就误判。
+fn wait_for_wonderland_map_open(
+    context: &mut UiRoutineContext<'_>,
+    config: &StartupRoutineConfig,
+) -> Result<(), UiRoutineFailure> {
+    let deadline =
+        Instant::now() + Duration::from_millis(config.startup.wonderland_transition_timeout_ms);
+    let mut left_world = 0_u32;
+    while Instant::now() < deadline {
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "observe_wonderland_map",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        if !world_is_teyvat(&image) {
+            left_world = left_world.saturating_add(1);
+            if left_world >= TEMPLATE_STABLE_HITS {
+                return Ok(());
+            }
+        } else {
+            left_world = 0;
+        }
+        sleep_ms(config.startup.poll_ms);
+    }
+    Err(UiRoutineFailure::new(
+        InputCertainty::AfterInputUnknown,
+        "open_wonderland_map",
+        "pressed M but the world criterion still holds: the map did not open (key likely swallowed by an input box)",
+    ))
 }
 
 fn wait_for_paimon_menu(
@@ -703,7 +761,9 @@ fn wait_for_primary(
             InputCertainty::ConfirmedFailure,
         ) {
             Ok(UiStateKind::Primary) => Ok(UiStateKind::Primary),
-            Ok(UiStateKind::Secondary) => {
+            // 改动前主菜单是被判成 Secondary 的，这里把 MainMenu 并进同一支，
+            // 保持启动流程原有行为：按 Escape 关掉浮层再等一级聊天出现（§44.10）。
+            Ok(UiStateKind::Secondary | UiStateKind::MainMenu) => {
                 if let Err(error) = context.device().press_key(Key::Escape) {
                     return UiResidencyOutcome::Failed(UiRoutineFailure::new(
                         InputCertainty::AfterInputUnknown,
@@ -721,11 +781,15 @@ fn wait_for_primary(
                 )
             }
             Ok(UiStateKind::Unknown) => unreachable!("unknown UI state is never stable"),
-            Ok(UiStateKind::GameGate | UiStateKind::Overworld) => Err(UiRoutineFailure::new(
-                InputCertainty::ConfirmedFailure,
-                "confirm_startup_primary",
-                "game is still at the gate or in the overworld",
-            )),
+            // Loading 也归到失败：等待的稳定状态就是「到大厅了」，
+            // 而稳定停在加载界面说明卡住了，不该被当成还没开始（§55）。
+            Ok(UiStateKind::GameGate | UiStateKind::Overworld | UiStateKind::Loading) => {
+                Err(UiRoutineFailure::new(
+                    InputCertainty::ConfirmedFailure,
+                    "confirm_startup_primary",
+                    "game is still at the gate, loading, or in the overworld",
+                ))
+            }
             Err(failure) => Err(failure),
         }
     } else {

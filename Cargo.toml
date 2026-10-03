@@ -64,10 +64,18 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 thiserror = { workspace = true }
-template-matching = { version = "0.2", default-features = false }
+# 模板匹配主路径：自带的 wgpu 实现（设备/管线进程内复用），失败时由 CPU 兜底。
+wgpu = "0.16"
+pollster = "0.3"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"] }
+# SSE 事件推送：把 tokio broadcast 接成 axum 能消费的 Stream。
+tokio-stream = { version = "0.1", features = ["sync"] }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
+
+[dev-dependencies]
+# 仅用于对拍测试与 GPU 微基准；生产路径已改为自带实现。
+template-matching = { version = "0.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -85,10 +93,23 @@ windows = { version = "0.62", features = [
   "Win32_System_Memory",
   "Win32_System_Registry",
   "Win32_System_Threading",
+  "Win32_System_JobObjects",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[profile.dev]
+# 功能验证用：只要能跑通，不追求运行速度。
+# 全量调试信息在 Windows 上要额外生成并写入 PDB，是编译/链接耗时的主要来源；
+# 保留行号（line-tables-only）仍能让断言失败时定位到源码行，代价小得多。
+debug = "line-tables-only"
+incremental = true
+
+[profile.test]
+# 与 dev 一致：跑用例用快档。
+debug = "line-tables-only"
+incremental = true
 
 [profile.release]
 # 优先运行性能，不以缩小二进制体积为目标。

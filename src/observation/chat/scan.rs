@@ -11,7 +11,7 @@ use crate::runtime::ocr::{OcrImageBlock, OcrPriority, OcrRuntimeHandle, batch_re
 use crate::ui::geometry::{Rect, clamp_i32, crop_canvas};
 use crate::ui::template::{TemplateHit, dedupe_hits, find_color_template_hit_groups};
 
-const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
+pub(crate) const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
 const CHAT_SCAN_RESULT_LOG_TARGET: &str = "chat_scan_result";
 
 #[derive(Clone, Debug, Default)]
@@ -321,7 +321,7 @@ fn chat_marker_counts(markers: &[TemplateHit]) -> ChatMarkerCounts {
     counts
 }
 
-fn dedupe_chat_marker_hits(
+pub(crate) fn dedupe_chat_marker_hits(
     hits: Vec<TemplateHit>,
     tolerance_x: i32,
     tolerance_y: i32,

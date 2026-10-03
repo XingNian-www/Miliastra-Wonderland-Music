@@ -46,6 +46,19 @@ screen:
     y: 190
     width: 65
     height: 55
+  # 千星奇域主菜单右下角「返回提瓦特」按钮的搜索区。该按钮是枢纽节点独有的，
+  # 用来把主菜单挡在 secondary_back 之前（否则 ESC 菜单会被误判成二级聊天）。
+  main_menu_rect:
+    x: 1740
+    y: 1005
+    width: 100
+    height: 40
+  # 千星大厅底栏 👥 O 图标组的搜索区（提瓦特底栏没有这一组）
+  hall_bar_rect:
+    x: 0
+    y: 985
+    width: 600
+    height: 95
   # 主世界右上角祈愿图标搜索区域，覆盖图标栏以适应横向位置变化
   world_wish_rect:
     x: 1300
@@ -253,6 +266,10 @@ templates:
   secondary_back: assets/ui-secondary-back.png
   # 二级大厅/面板界面模板
   secondary_hall: assets/ui-secondary-hall.png
+  # 千星奇域主菜单右下角「返回提瓦特」按钮模板，命中即判为奇域主菜单
+  main_menu: assets/ui-main-menu-return.png
+  # 千星大厅底栏 👥 O 图标组模板
+  hall_bar: assets/ui-hall-bar.png
   # 主世界右上角祈愿图标透明模板，仅持续未知时探测
   world_wish: assets/world-wish.png
   # 邀请流程里的“查看千星”按钮模板

@@ -2,6 +2,17 @@ mod adapters;
 #[cfg(target_os = "windows")]
 mod composition;
 mod config;
+mod debug_events;
+mod debug_http_service;
+mod debug_mode;
+mod debug_plugin_dispatch;
+mod debug_plugin_process;
+mod debug_plugin_session;
+mod debug_plugin_stdio;
+mod debug_sandbox;
+mod debug_sandbox_journal;
+mod debug_sandbox_runner;
+mod debug_sandbox_store;
 mod features;
 mod interfaces;
 mod privacy;

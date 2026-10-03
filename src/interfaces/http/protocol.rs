@@ -32,6 +32,8 @@ mod tools;
 mod ai_routes;
 #[path = "routes/config.rs"]
 mod config_routes;
+#[path = "routes/debug.rs"]
+mod debug_routes;
 #[path = "routes/entertainment.rs"]
 mod entertainment_routes;
 #[path = "routes/operator.rs"]
@@ -45,6 +47,7 @@ mod tasks_chat_routes;
 
 use ai_routes::*;
 use config_routes::*;
+use debug_routes::*;
 use entertainment_routes::*;
 use operator_routes::*;
 use playback_routes::*;
@@ -124,6 +127,18 @@ struct BodyRouteSpec {
 
 const BODY_ROUTES: &[BodyRouteSpec] = &[
     BodyRouteSpec {
+        path: "/debug/tasks",
+        handler: debug_task_save_route,
+    },
+    BodyRouteSpec {
+        path: "/debug/run",
+        handler: debug_run_start_route,
+    },
+    BodyRouteSpec {
+        path: "/debug/command",
+        handler: debug_command_route,
+    },
+    BodyRouteSpec {
         path: "/player/play-track",
         handler: player_play_track_body_route,
     },
@@ -158,6 +173,84 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
 ];
 
 const ROUTES: &[RouteSpec] = &[
+    RouteSpec {
+        path: "/debug/tasks",
+        json: true,
+        mutating: false,
+        handler: debug_tasks_route,
+    },
+    RouteSpec {
+        path: "/debug/runs",
+        json: true,
+        mutating: false,
+        handler: debug_runs_route,
+    },
+    RouteSpec {
+        path: "/debug/run/evidence",
+        json: true,
+        mutating: false,
+        handler: debug_run_evidence_route,
+    },
+    RouteSpec {
+        path: "/debug/run/replay",
+        json: true,
+        mutating: true,
+        handler: debug_run_replay_route,
+    },
+    RouteSpec {
+        path: "/debug/run/step",
+        json: true,
+        mutating: true,
+        handler: debug_run_step_route,
+    },
+    RouteSpec {
+        path: "/debug/run/all",
+        json: true,
+        mutating: true,
+        handler: debug_run_all_route,
+    },
+    RouteSpec {
+        path: "/debug/run/status",
+        json: true,
+        mutating: false,
+        handler: debug_run_status_route,
+    },
+    RouteSpec {
+        path: "/debug/run/cancel",
+        json: true,
+        mutating: true,
+        handler: debug_run_cancel_route,
+    },
+    RouteSpec {
+        path: "/debug/window",
+        json: true,
+        mutating: false,
+        handler: debug_window_route,
+    },
+    RouteSpec {
+        path: "/debug/ui-state",
+        json: true,
+        mutating: false,
+        handler: debug_ui_state_route,
+    },
+    RouteSpec {
+        path: "/debug/ui-catalogue",
+        json: true,
+        mutating: false,
+        handler: debug_ui_catalogue_route,
+    },
+    RouteSpec {
+        path: "/debug/state",
+        json: true,
+        mutating: false,
+        handler: debug_state_route,
+    },
+    RouteSpec {
+        path: "/debug/mode",
+        json: true,
+        mutating: true,
+        handler: debug_mode_route,
+    },
     RouteSpec {
         path: "/status",
         json: true,
@@ -832,6 +925,10 @@ impl HttpSharedState {
             live_configs,
         }
     }
+
+    pub(crate) fn set_debug_port(&mut self, debug: Arc<dyn super::ports::HttpDebugPort>) {
+        self.application.debug = Some(debug);
+    }
 }
 
 pub struct HttpServer {
@@ -1081,6 +1178,12 @@ fn handle_request(
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
+    if request.path == "/debug/screenshot" {
+        return debug_screenshot_response(&request, state);
+    }
+    if request.path == "/debug/events" {
+        return debug_events_response(&request, state);
+    }
     if request.path == "/screenshot" {
         return screenshot_response(&request, state);
     }
@@ -1088,7 +1191,9 @@ fn handle_request(
         return hall_screenshot_response(&request, state);
     }
 
-    let routed = if let Some(spec) = body_route_spec(&request.path) {
+    let routed = if request.method == "POST"
+        && let Some(spec) = body_route_spec(&request.path)
+    {
         if request.body.len() > MAX_JSON_BODY_BYTES {
             Err(AppError {
                 status: 413,
@@ -1389,12 +1494,23 @@ fn enforce_method(
     }
     let reads_playback_mode = request.path == "/playback/mode"
         && query_value(&request.query, "mode").is_none_or(|value| value.trim().is_empty());
-    if is_mutating_route(&request.path) && request.method != "POST" && !reads_playback_mode {
+    let read_only_get =
+        request.method == "GET" && route_spec(&request.path).is_some_and(|route| !route.mutating);
+    if is_mutating_route(&request.path)
+        && request.method != "POST"
+        && !reads_playback_mode
+        && !read_only_get
+    {
         return Err(method_not_allowed("该接口需要POST请求"));
     }
     if matches!(
         request.path.as_str(),
-        "/" | "/tools" | "/screenshot" | "/hall-screenshot" | "/favicon.ico"
+        "/" | "/tools"
+            | "/screenshot"
+            | "/hall-screenshot"
+            | "/debug/screenshot"
+            | "/debug/state"
+            | "/favicon.ico"
     ) && request.method != "GET"
     {
         return Err(method_not_allowed("该资源仅支持GET请求"));
@@ -1407,7 +1523,11 @@ fn is_mutating_route(path: &str) -> bool {
 }
 
 fn request_blocks_idle_reload(path: &str) -> bool {
-    is_mutating_route(path) || matches!(path, "/hall-screenshot" | "/search" | "/search/candidates")
+    is_mutating_route(path)
+        || matches!(
+            path,
+            "/hall-screenshot" | "/debug/screenshot" | "/search" | "/search/candidates"
+        )
 }
 
 fn try_begin_reload_blocking_request(state: &HttpSharedState) -> Option<ActiveConnectionGuard> {

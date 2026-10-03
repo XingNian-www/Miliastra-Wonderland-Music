@@ -2660,6 +2660,7 @@ dependencies = [
  "openvino",
  "openvino-sys",
  "pinyin",
+ "pollster",
  "rand_chacha 0.3.1",
  "ratatui",
  "reqwest",
@@ -2671,8 +2672,10 @@ dependencies = [
  "template-matching",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-stream",
  "url",
  "uuid",
+ "wgpu",
  "windows 0.62.2",
 ]
 
@@ -4537,6 +4540,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

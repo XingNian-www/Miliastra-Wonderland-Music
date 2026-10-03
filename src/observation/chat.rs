@@ -1,4 +1,4 @@
-mod scan;
+pub(crate) mod scan;
 mod secondary_hall_vision;
 mod secondary_unread_vision;
 mod stream;

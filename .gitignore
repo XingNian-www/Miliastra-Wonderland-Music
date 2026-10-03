@@ -40,3 +40,10 @@
 **/dist/
 /crates/miliastra-playback/examples/
 .bitfun/
+
+# UI 状态机的大批量实机证据帧（1099 个文件 / 约 626 MB）。
+# 不直接入库：体积远超代码本身，且属于"可重新采"的过程产物。
+# 判据与结论在 docs/ui-state-criteria.md、docs/ui-state-machine.md、
+# docs/ui-state-transitions.json 里，每一处都注明了用到的帧名与来源目录。
+# 需要核对某一帧时，按文档里的采集方法（第 27 章的复现命令）重采即可。
+/docs/ui-state-evidence/

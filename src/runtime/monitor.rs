@@ -460,6 +460,9 @@ impl BusinessStateSink for MonitorShared {
     }
 
     fn publish_playback_queue(&self, queue: Vec<crate::features::playback::QueueItem>) {
+        // 只发长度：把整个队列塞进事件既大又没必要，需要内容时查 /queue。
+        crate::debug_events::bus()
+            .publish("queue.changed", serde_json::json!({"size": queue.len()}));
         self.publish_async(MonitorEvent::Queue(
             queue
                 .into_iter()
@@ -476,10 +479,21 @@ impl BusinessStateSink for MonitorShared {
     }
 
     fn publish_hall_remaining_minutes(&self, minutes: Option<u32>) {
+        // monitor 是所有可观测状态的唯一汇聚点：在这里发布事件，就不必在应用各处撒钩子。
+        // 依赖是"数据"级的——只发 JSON 载荷，不把应用类型塞进事件通道。
+        crate::debug_events::bus()
+            .publish("hall.remaining", serde_json::json!({"minutes": minutes}));
         self.publish_async(MonitorEvent::HallRemainingMinutes(minutes));
     }
 
     fn publish_chat_listener(&self, snapshot: crate::runtime::chat_listener::ChatListenerSnapshot) {
+        crate::debug_events::bus().publish(
+            "chat_listener.mode",
+            serde_json::json!({
+                "mode": snapshot.display_mode(),
+                "pendingMode": snapshot.pending_mode.map(|mode| mode.label().to_string()),
+            }),
+        );
         self.publish_async(MonitorEvent::ChatListener {
             mode: snapshot.display_mode(),
             pending_mode: snapshot
@@ -490,6 +504,21 @@ impl BusinessStateSink for MonitorShared {
     }
 
     fn publish_decision(&self, snapshot: Option<DecisionSnapshot>) {
+        // 这是 objective 里最难替代的那条通知：**出现**了待裁决项。
+        // 外部控制器从此不必轮询 /monitor 就知道该做决定了，也不会因为轮询间隔错过截止时间。
+        match &snapshot {
+            Some(decision) => crate::debug_events::bus().publish(
+                "decision.pending",
+                serde_json::json!({
+                    "id": decision.id,
+                    "label": decision.label,
+                    "allowSwitchSource": decision.allow_switch_source,
+                    "allowAi": decision.allow_ai,
+                    "deadlineAtMs": decision.deadline_at_ms,
+                }),
+            ),
+            None => crate::debug_events::bus().publish("decision.cleared", serde_json::json!({})),
+        };
         self.publish_async(MonitorEvent::Decision(snapshot));
     }
 
@@ -555,6 +584,50 @@ mod tests {
     use crate::runtime::ui::{
         UiDevice, UiRoutine, UiRoutineContext, UiRoutineProgressStage, UiRuntime, sealed,
     };
+
+    /// monitor 是"关键状态变化"的唯一汇聚点：决策与队列变化必须同步推到事件流，
+    /// 外部控制器才不必轮询 /monitor。这里断言的是"真的发出去了、且载荷够用"。
+    /// 测试用全局总线，因此按类型和 id 筛选，不假设事件之间没有其他用例的事件。
+    #[test]
+    fn monitor_pushes_decision_and_queue_changes_to_the_event_stream() {
+        let monitor = MonitorShared::new(20);
+        let since = crate::debug_events::bus().latest_sequence();
+        monitor.publish_playback_queue(Vec::new());
+        monitor.publish_decision(Some(DecisionSnapshot {
+            id: 4242,
+            label: "点歌确认".to_string(),
+            allow_switch_source: true,
+            allow_ai: false,
+            deadline_at_ms: 1_700_000_000_000,
+        }));
+        monitor.publish_decision(None);
+
+        let events = crate::debug_events::bus().replay_after(since);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "queue.changed" && event.payload["size"] == 0),
+            "队列变化应当被推送: {events:?}"
+        );
+        let pending = events
+            .iter()
+            .position(|event| event.kind == "decision.pending" && event.payload["id"] == 4242)
+            .expect("出现待裁决项时必须推送通知，否则 AI 只能靠轮询发现");
+        assert!(
+            events[pending..]
+                .iter()
+                .any(|event| event.kind == "decision.cleared"),
+            "决策清除也应当被推送"
+        );
+        // 截止时间必须带上：AI 要靠它决定还剩多久可以慢慢想。
+        assert_eq!(
+            events[pending].payload["deadlineAtMs"],
+            1_700_000_000_000u64
+        );
+        assert_eq!(events[pending].payload["label"], "点歌确认");
+        assert_eq!(events[pending].payload["allowSwitchSource"], true);
+        assert_eq!(events[pending].payload["allowAi"], false);
+    }
 
     struct ProgressRoutine;
 

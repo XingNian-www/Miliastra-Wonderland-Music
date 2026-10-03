@@ -97,6 +97,10 @@ pub(crate) trait HttpCommandPort: Send + Sync {
         ai_assisted: bool,
     ) -> Result<String, HttpCommandError>;
     fn play_track(&self, request: PlayTrackRequest) -> Result<String, HttpCommandError>;
+    /// 发送一条游戏内聊天。与点歌一样是**入队**语义：返回成功只代表任务已排队。
+    fn chat_send(&self, text: String, prefix: String) -> Result<String, HttpCommandError>;
+    /// 提交一次游戏启动任务。kind 只接受 start_game / enter_wonderland。
+    fn startup_task(&self, kind: String) -> Result<String, HttpCommandError>;
     fn request_chat_listener_mode(
         &self,
         mode: ChatListenerMode,
@@ -121,6 +125,138 @@ pub(crate) trait HttpQueryPort: Send + Sync {
         since_ms: Option<u64>,
         limit: usize,
     ) -> Result<Vec<SongRequestLeaderboardEntry>>;
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+enum LegacyHttpDebugCommand {
+    Click {
+        x: i32,
+        y: i32,
+    },
+    #[serde(alias = "press_key")]
+    Key {
+        key: String,
+    },
+    Scroll {
+        x: i32,
+        y: i32,
+        amount: i32,
+    },
+    Drag {
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+    },
+    Paste {
+        text: String,
+    },
+    Wait {
+        milliseconds: u64,
+    },
+    Capture,
+}
+
+impl LegacyHttpDebugCommand {
+    fn into_atomic(self) -> crate::debug_sandbox::AtomicCommand {
+        use crate::debug_sandbox::AtomicCommand;
+        match self {
+            Self::Click { x, y } => AtomicCommand::Click { x, y },
+            Self::Key { key } => AtomicCommand::PressKey { key },
+            Self::Scroll { x, y, amount } => AtomicCommand::Scroll { x, y, amount },
+            Self::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            } => AtomicCommand::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            },
+            Self::Paste { text } => AtomicCommand::Paste { text },
+            Self::Wait { milliseconds } => AtomicCommand::Wait { milliseconds },
+            Self::Capture => AtomicCommand::Capture,
+        }
+    }
+}
+
+/// 直接调试命令**就是**任务模型里的同一个 `AtomicCommand`，不再维护第二份词表——
+/// 这次就是因为两套词表才出现"任务模型能跑、/debug/command 不能跑"的分裂。
+///
+/// 兼容旧写法：旧请求把命令字段平铺在 body 上（`{"command":"click","x":1,"y":2}`），
+/// 新写法与任务模型一致（`{"command":{"click":{"x":1,"y":2}}}`）。两者都接受，
+/// 但 `AtomicCommand` 是唯一事实来源，新增原子命令不需要再改这里。
+pub(crate) struct HttpDebugCommand(crate::debug_sandbox::AtomicCommand);
+
+impl HttpDebugCommand {
+    pub(crate) fn into_atomic(self) -> crate::debug_sandbox::AtomicCommand {
+        self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HttpDebugCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(inner) = value.get("command") {
+            if let Ok(command) =
+                serde_json::from_value::<crate::debug_sandbox::AtomicCommand>(inner.clone())
+            {
+                return Ok(Self(command));
+            }
+        }
+        if let Ok(command) =
+            serde_json::from_value::<crate::debug_sandbox::AtomicCommand>(value.clone())
+        {
+            return Ok(Self(command));
+        }
+        serde_json::from_value::<LegacyHttpDebugCommand>(value)
+            .map(|legacy| Self(legacy.into_atomic()))
+            .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct HttpDebugRunRequest {
+    pub task_id: String,
+    #[serde(default = "default_debug_mode")]
+    pub mode: String,
+    pub expected_version: Option<u32>,
+    #[serde(default)]
+    pub assertions: Vec<crate::debug_sandbox_runner::StepAssertion>,
+    pub fixture: Option<crate::debug_sandbox::SandboxFixture>,
+    pub plugin_id: Option<String>,
+    pub manifest: Option<crate::debug_sandbox::PluginManifest>,
+}
+fn default_debug_mode() -> String {
+    "simulated".into()
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HttpDebugEvidence {
+    pub index: usize,
+    pub result: crate::debug_sandbox::SandboxCommandResult,
+    pub mime_type: Option<&'static str>,
+    pub image_png_base64: Option<String>,
+}
+
+pub(crate) trait HttpDebugPort: Send + Sync {
+    fn sandbox(&self) -> &crate::debug_http_service::DebugHttpService;
+
+    fn enabled(&self) -> bool;
+    fn set_enabled(&self, enabled: bool) -> Result<(), HttpCommandError>;
+    fn capture(&self) -> Result<Arc<DynamicImage>, HttpCommandError>;
+    fn window_available(&self) -> Result<bool, HttpCommandError>;
+    /// 只读界面状态详情：当前分类结果 + 判别证据。未分类时如实报告，不伪造状态。
+    fn ui_state_detail(&self) -> Result<String, HttpCommandError>;
 }
 
 pub(crate) trait HttpHallPort: Send + Sync {
@@ -296,6 +432,7 @@ pub(crate) struct HttpApplicationPorts {
     pub tasks: Arc<dyn HttpTaskPort>,
     pub queries: Arc<dyn HttpQueryPort>,
     pub hall: Arc<dyn HttpHallPort>,
+    pub debug: Option<Arc<dyn HttpDebugPort>>,
     pub player: Arc<dyn HttpPlayerPort>,
     pub login: Arc<dyn HttpLoginPort>,
     pub ai: Arc<dyn HttpAiPort>,
@@ -317,6 +454,7 @@ impl HttpApplicationPorts {
             tasks,
             queries,
             hall,
+            debug: None,
             player,
             login,
             ai,

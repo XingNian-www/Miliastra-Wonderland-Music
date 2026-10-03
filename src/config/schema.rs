@@ -700,6 +700,18 @@ fn screen_section() -> Vec<ConfigFieldSchema> {
             "二级大厅/面板界面模板检测区域",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "main_menu_rect",
+            "奇域主菜单区域",
+            FieldKind::Rect,
+            "千星奇域主菜单右下角「返回提瓦特」按钮的搜索区；该按钮只有枢纽节点才有，用来在二级聊天判定的最后一刻否决它",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "hall_bar_rect",
+            "大厅底栏区域",
+            FieldKind::Rect,
+            "千星大厅底栏 👥 O 图标组的搜索区；提瓦特底栏没有这一组，用来把提瓦特的世界聊天气泡与千星聊天标记区分开",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "world_wish_rect",
             "主世界祈愿区域",
             FieldKind::Rect,
@@ -964,6 +976,18 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
             "二级大厅模板",
             FieldKind::Path,
             "二级大厅/面板界面模板",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "main_menu",
+            "奇域主菜单模板",
+            FieldKind::Path,
+            "千星奇域主菜单右下角「返回提瓦特」按钮模板，命中即判为奇域主菜单而不是二级聊天",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "hall_bar",
+            "大厅底栏模板",
+            FieldKind::Path,
+            "千星大厅底栏 👥 O 图标组模板；聊天标记判据必须同时命中它，避免把提瓦特的世界聊天误判成大厅",
         ),
         ConfigFieldSchema::db_idle_reload(
             "world_wish",

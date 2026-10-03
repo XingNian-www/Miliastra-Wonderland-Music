@@ -15,8 +15,8 @@ use crate::features::startup::{StartupSource, StartupTaskKind};
 use crate::features::turtle_soup::{TurtleSoupAppendReceipt, TurtleSoupSnapshot};
 use crate::features::undercover::UndercoverSnapshot;
 use crate::interfaces::http::{
-    HttpAiPort, HttpHallPort, HttpLoginPort, HttpLoginQrCodeView, HttpLoginStatus, HttpPlayerPort,
-    HttpProviderView, HttpQueryPort, HttpTaskPort,
+    HttpAiPort, HttpDebugPort, HttpHallPort, HttpLoginPort, HttpLoginQrCodeView, HttpLoginStatus,
+    HttpPlayerPort, HttpProviderView, HttpQueryPort, HttpTaskPort,
 };
 use crate::runtime::chat_listener::ChatListenerState;
 use crate::runtime::player_io::SearchCandidate;
@@ -25,6 +25,680 @@ use miliastra_playback::{
     AudioCacheStats, AudioCacheTrackStatus, CachedTrackInfo, CachedTrackPage, KugouAccountStatus,
     KugouListenReport, LoginSession, TrackKey,
 };
+
+struct HttpTestDebugPort {
+    sandbox: crate::debug_http_service::DebugHttpService,
+}
+
+impl HttpDebugPort for HttpTestDebugPort {
+    fn sandbox(&self) -> &crate::debug_http_service::DebugHttpService {
+        &self.sandbox
+    }
+
+    fn enabled(&self) -> bool {
+        false
+    }
+    fn set_enabled(&self, _enabled: bool) -> Result<(), HttpCommandError> {
+        Err(HttpCommandError::bad_request("test device unavailable"))
+    }
+    fn capture(&self) -> Result<Arc<DynamicImage>, HttpCommandError> {
+        Err(HttpCommandError::bad_request("test device unavailable"))
+    }
+    fn window_available(&self) -> Result<bool, HttpCommandError> {
+        Err(HttpCommandError::bad_request("test device unavailable"))
+    }
+    fn ui_state_detail(&self) -> Result<String, HttpCommandError> {
+        Err(HttpCommandError::bad_request("test device unavailable"))
+    }
+}
+
+/// /debug/ui-state 是只读查询：必须鉴权；没有真实调试设备时如实报错，
+/// 不能返回一个编出来的界面状态。
+#[test]
+fn debug_ui_state_route_requires_token_and_a_real_debug_device() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+    let unauthorized = http_get(address, "/debug/ui-state", None);
+    assert_eq!(unauthorized.status_line, "HTTP/1.1 401 Unauthorized");
+    let unavailable = http_get(address, "/debug/ui-state", Some("secret"));
+    assert_eq!(
+        unavailable.status_line, "HTTP/1.1 503 Service Unavailable",
+        "{}",
+        unavailable.body
+    );
+    assert!(
+        !unavailable.body.contains("classified"),
+        "接线缺失时不得返回任何分类结果: {}",
+        unavailable.body
+    );
+}
+
+/// 模板目录探针同样要求令牌与真实调试设备：它返回的是"哪个界面成立"的判据，
+/// 接不了线时不得返回任何探针结果。
+#[test]
+fn debug_ui_catalogue_route_requires_token_and_a_real_debug_device() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+    let unauthorized = http_get(address, "/debug/ui-catalogue", None);
+    assert_eq!(unauthorized.status_line, "HTTP/1.1 401 Unauthorized");
+    let unavailable = http_get(address, "/debug/ui-catalogue", Some("secret"));
+    assert_eq!(
+        unavailable.status_line, "HTTP/1.1 503 Service Unavailable",
+        "{}",
+        unavailable.body
+    );
+    assert!(
+        !unavailable.body.contains("bestScore"),
+        "接线缺失时不得返回任何模板得分: {}",
+        unavailable.body
+    );
+}
+
+#[test]
+fn debug_http_window_route_requires_a_real_debug_device() {
+    let mut state = test_state();
+    state.application.debug = Some(Arc::new(HttpTestDebugPort {
+        sandbox: crate::debug_http_service::DebugHttpService::default(),
+    }));
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+    let unauthorized = http_get(address, "/debug/window", None);
+    assert_eq!(unauthorized.status_line, "HTTP/1.1 401 Unauthorized");
+    let response = http_get(address, "/debug/window", Some("secret"));
+    assert_ne!(response.status_line, "HTTP/1.1 200 OK");
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn debug_http_state_lists_all_atomic_commands() {
+    let mut state = test_state();
+    state.application.debug = Some(Arc::new(HttpTestDebugPort {
+        sandbox: crate::debug_http_service::DebugHttpService::default(),
+    }));
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+    let unauthorized = http_get(address, "/debug/state", None);
+    assert_eq!(unauthorized.status_line, "HTTP/1.1 401 Unauthorized");
+    let response = http_get(address, "/debug/state", Some("secret"));
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(value["enabled"], false);
+    assert_eq!(value["gameInputAllowed"], true);
+    let commands = value["commands"].as_array().unwrap();
+    for command in [
+        "capture",
+        "ensure_window",
+        "playback_queue_clear",
+        "playback_queue_remove_front",
+        "task_queue_cancel",
+        "wait",
+    ] {
+        assert!(
+            commands.iter().any(|item| item == command),
+            "missing {command}"
+        );
+    }
+    server.shutdown().unwrap();
+}
+
+/// 直接调试命令与任务模型共用同一个 AtomicCommand：既接受与任务一致的写法，
+/// 也继续接受历史上把命令字段平铺在 body 上的旧写法（否则老客户端会静默失效）。
+/// 这两种写法此前是两套独立词表，直接导致"任务模型能跑、/debug/command 不能跑"。
+#[test]
+fn debug_command_accepts_task_model_shape_and_legacy_shape() {
+    use crate::debug_sandbox::AtomicCommand;
+    use crate::interfaces::http::HttpDebugCommand;
+
+    let cases: [(serde_json::Value, AtomicCommand); 6] = [
+        // 与任务模型一致：单元变体就是裸字符串，结构变体是单键对象。
+        (
+            serde_json::json!({"command": "capture"}),
+            AtomicCommand::Capture,
+        ),
+        (
+            serde_json::json!({"command": "playback_pause"}),
+            AtomicCommand::PlaybackPause,
+        ),
+        (
+            serde_json::json!({"command": {"wait": {"milliseconds": 5}}}),
+            AtomicCommand::Wait { milliseconds: 5 },
+        ),
+        (
+            serde_json::json!({"command": {"playback_set_volume": {"volume": 30}}}),
+            AtomicCommand::PlaybackSetVolume { volume: 30 },
+        ),
+        // 旧写法：字段平铺，仍必须可用。
+        (
+            serde_json::json!({"command": "click", "x": 3, "y": 4}),
+            AtomicCommand::Click { x: 3, y: 4 },
+        ),
+        (
+            serde_json::json!({"command": "wait", "milliseconds": 5}),
+            AtomicCommand::Wait { milliseconds: 5 },
+        ),
+    ];
+
+    for (value, expected) in cases {
+        let command: HttpDebugCommand = serde_json::from_value(value.clone())
+            .unwrap_or_else(|error| panic!("无法解析 {value}: {error}"));
+        assert_eq!(command.into_atomic(), expected, "解析结果不符: {value}");
+    }
+}
+
+/// SSE 事件流：事件必须带 sequence（作为 SSE 的 id），并且能按 since 精确补发。
+/// 这里用 drain=true 把无限的流收成有限响应，否则缓冲式测试客户端会一直等下去。
+#[test]
+fn debug_events_stream_replays_published_events_with_sequence_ids() {
+    let mut state = test_state();
+    let bus = crate::debug_events::bus();
+    let since = bus.latest_sequence();
+    let published = bus.publish(
+        "test.event",
+        serde_json::json!({"marker": "sse-route-test"}),
+    );
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+
+    // 未授权必须被拒：事件流和其他调试接口一样需要令牌。
+    let unauthorized = http_get(address, "/debug/events?drain=true", None);
+    assert_eq!(unauthorized.status_line, "HTTP/1.1 401 Unauthorized");
+
+    let response = http_get(
+        address,
+        &format!("/debug/events?drain=true&since={since}"),
+        Some("secret"),
+    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    assert_eq!(
+        response.headers.get("content-type").map(String::as_str),
+        Some("text/event-stream"),
+        "必须是事件流而不是一次性 JSON"
+    );
+    assert_eq!(
+        response.headers.get("cache-control").map(String::as_str),
+        Some("no-store"),
+        "SSE 必须禁缓存，否则会被中间层攒成批量轮询"
+    );
+    assert!(
+        response
+            .body
+            .contains(&format!("id: {}", published.sequence)),
+        "事件必须带 sequence 作为 SSE id: {} {}",
+        published.sequence,
+        response.body
+    );
+    assert!(response.body.contains("test.event"), "{}", response.body);
+    assert!(
+        response.body.contains("sse-route-test"),
+        "{}",
+        response.body
+    );
+
+    // since 之后没有新事件时必须补发为空，而不是把旧事件又发一遍。
+    let empty = http_get(
+        address,
+        &format!("/debug/events?drain=true&since={}", published.sequence),
+        Some("secret"),
+    );
+    assert!(
+        !empty.body.contains("sse-route-test"),
+        "since 之后不应重复投递边界事件: {} {}",
+        published.sequence,
+        empty.body
+    );
+}
+
+#[test]
+fn debug_command_route_reports_no_frame_unless_capture_is_requested() {
+    use crate::runtime::ui::UiDevice;
+    /// 任何一次截图都会让这一步失败，因此"命令成功"本身就证明没有截图。
+    struct NoScreenshot;
+    impl UiDevice for NoScreenshot {
+        fn capture(&mut self) -> anyhow::Result<DynamicImage> {
+            anyhow::bail!("unexpected screenshot")
+        }
+        fn close_window(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    struct RestoreDebugMode(bool);
+    impl Drop for RestoreDebugMode {
+        fn drop(&mut self) {
+            crate::debug_mode::set_enabled(self.0);
+        }
+    }
+    let runtime = crate::runtime::ui::UiRuntime::start(NoScreenshot, 2).unwrap();
+    let _restore = RestoreDebugMode(crate::debug_mode::set_enabled(true));
+    let mut state = test_state();
+    state.application.debug = Some(Arc::new(HttpTestDebugPort {
+        sandbox: crate::debug_http_service::DebugHttpService::new(Some(runtime.handle())),
+    }));
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+
+    let response = http_post_json(
+        address,
+        "/debug/command",
+        r#"{"command":"wait","milliseconds":0}"#,
+        Some("secret"),
+    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["captured"], false);
+    assert_eq!(value["width"], 0);
+    assert_eq!(value["height"], 0);
+    server.shutdown().unwrap();
+    assert!(!runtime.shutdown().unwrap().timed_out());
+}
+
+#[test]
+fn debug_sandbox_http_task_run_evidence_and_token_round_trip() {
+    let mut state = test_state();
+    state.application.debug = Some(Arc::new(HttpTestDebugPort {
+        sandbox: crate::debug_http_service::DebugHttpService::default(),
+    }));
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+    let unauthorized_command =
+        http_post_json(address, "/debug/command", r#"{"command":"capture"}"#, None);
+    assert_eq!(
+        unauthorized_command.status_line,
+        "HTTP/1.1 401 Unauthorized"
+    );
+    let invalid_command = http_post_json(
+        address,
+        "/debug/command",
+        r#"{"command":"wait","milliseconds":30001}"#,
+        Some("secret"),
+    );
+    assert_ne!(invalid_command.status_line, "HTTP/1.1 200 OK");
+    let task = json!({"id":"http-fixture","version":1,"description":"test","commands":["capture"],"captureAfterEach":true});
+    let unauthorized = http_post_json(address, "/debug/tasks", &task.to_string(), None);
+    assert_eq!(unauthorized.status_line, "HTTP/1.1 401 Unauthorized");
+    let saved = http_post_json(address, "/debug/tasks", &task.to_string(), Some("secret"));
+    assert_eq!(saved.status_line, "HTTP/1.1 200 OK", "{}", saved.body);
+    let invalid = http_post_json(
+        address,
+        "/debug/run",
+        r#"{"taskId":"http-fixture","mode":"live"}"#,
+        Some("secret"),
+    );
+    assert_ne!(invalid.status_line, "HTTP/1.1 200 OK");
+    let start = json!({"taskId":"http-fixture","mode":"simulated","expectedVersion":1,"fixture":{"width":2,"height":2,"rgba":[1,2,3,255]},"assertions":[{"index":0,"assertion":{"pixel":{"x":0,"y":0,"rgba":[1,2,3,255],"tolerance":0}}}]});
+    let response = http_post_json(address, "/debug/run", &start.to_string(), Some("secret"));
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    let run_id = value["run"]["runId"].as_str().expect("run ID");
+    let status = http_get(
+        address,
+        &format!("/debug/run/status?runId={run_id}"),
+        Some("secret"),
+    );
+    assert_eq!(status.status_line, "HTTP/1.1 200 OK");
+    let snapshot: Value = serde_json::from_str(&status.body).unwrap();
+    assert_eq!(snapshot["task"]["version"], 1);
+    assert_eq!(snapshot["task"]["commands"][0], "capture");
+    let stepped = http_post(
+        address,
+        &format!("/debug/run/step?runId={run_id}"),
+        Some("secret"),
+    );
+    assert_eq!(stepped.status_line, "HTTP/1.1 200 OK", "{}", stepped.body);
+    let evidence = http_get(
+        address,
+        &format!("/debug/run/evidence?runId={run_id}"),
+        Some("secret"),
+    );
+    assert_eq!(evidence.status_line, "HTTP/1.1 200 OK", "{}", evidence.body);
+    let evidence: Value = serde_json::from_str(&evidence.body).unwrap();
+    assert_eq!(evidence["evidence"][0]["command"], "capture");
+    assert_eq!(
+        evidence["evidence"][0]["assertions"][0],
+        start["assertions"][0]["assertion"]
+    );
+    assert_eq!(evidence["evidence"][0]["result"]["ok"], true);
+    assert!(
+        evidence["evidence"][0]["imagePngBase64"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    let replay_path = format!("/debug/run/replay?runId={run_id}");
+    assert_eq!(
+        http_post(address, &replay_path, None).status_line,
+        "HTTP/1.1 401 Unauthorized"
+    );
+    let replay = http_post(address, &replay_path, Some("secret"));
+    assert_eq!(replay.status_line, "HTTP/1.1 200 OK", "{}", replay.body);
+    let replay: Value = serde_json::from_str(&replay.body).unwrap();
+    assert_eq!(replay["sourceRunId"], run_id);
+    assert_ne!(replay["run"]["runId"], run_id);
+    assert_eq!(replay["run"]["taskVersion"], 1);
+    let unsupported = json!({"taskId":"http-fixture","mode":"simulated","fixture":{"width":2,"height":2,"rgba":[1,2,3,255]},"assertions":[{"index":0,"assertion":{"window_available":{"expected":false}}}]});
+    let rejected = http_post_json(
+        address,
+        "/debug/run",
+        &unsupported.to_string(),
+        Some("secret"),
+    );
+    assert_ne!(rejected.status_line, "HTTP/1.1 200 OK", "{}", rejected.body);
+    let queue_task = json!({"id":"http-queue-state","version":1,"commands":["playback_queue_clear",{"wait":{"milliseconds":0}}],"captureAfterEach":false});
+    let saved = http_post_json(
+        address,
+        "/debug/tasks",
+        &queue_task.to_string(),
+        Some("secret"),
+    );
+    assert_eq!(saved.status_line, "HTTP/1.1 200 OK", "{}", saved.body);
+    let queue_run = json!({"taskId":"http-queue-state","mode":"simulated","fixture":{"width":1,"height":1,"rgba":[0,0,0,255]},"assertions":[{"index":1,"assertion":{"playback_queue_length":{"expected":0}}}]});
+    let response = http_post_json(
+        address,
+        "/debug/run",
+        &queue_run.to_string(),
+        Some("secret"),
+    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    let queue_id = value["run"]["runId"].as_str().unwrap();
+    let completed = http_post(
+        address,
+        &format!("/debug/run/all?runId={queue_id}"),
+        Some("secret"),
+    );
+    assert_eq!(
+        completed.status_line, "HTTP/1.1 200 OK",
+        "{}",
+        completed.body
+    );
+    let completed: Value = serde_json::from_str(&completed.body).unwrap();
+    assert_eq!(completed["run"]["status"], "passed");
+    assert_eq!(completed["run"]["results"].as_array().unwrap().len(), 2);
+    assert!(
+        completed["run"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["ok"] == true)
+    );
+    let queue_evidence = http_get(
+        address,
+        &format!("/debug/run/evidence?runId={queue_id}"),
+        Some("secret"),
+    );
+    assert_eq!(
+        queue_evidence.status_line, "HTTP/1.1 200 OK",
+        "{}",
+        queue_evidence.body
+    );
+    let queue_evidence: Value = serde_json::from_str(&queue_evidence.body).unwrap();
+    assert_eq!(
+        queue_evidence["evidence"][0]["command"],
+        "playback_queue_clear"
+    );
+    assert_eq!(queue_evidence["evidence"][0]["result"]["ok"], true);
+    assert_eq!(
+        queue_evidence["evidence"][1]["assertions"][0]["playback_queue_length"]["expected"],
+        0
+    );
+    // UI 状态断言：JSON 必须可解析，并且在尚无分类观测时如实失败而不是伪造通过。
+    let ui_task = json!({"id":"http-ui-state","version":1,"commands":[{"wait":{"milliseconds":0}}],"captureAfterEach":false});
+    let saved = http_post_json(
+        address,
+        "/debug/tasks",
+        &ui_task.to_string(),
+        Some("secret"),
+    );
+    assert_eq!(saved.status_line, "HTTP/1.1 200 OK", "{}", saved.body);
+    let ui_run = json!({"taskId":"http-ui-state","mode":"simulated","fixture":{"width":1,"height":1,"rgba":[0,0,0,255]},"assertions":[{"index":0,"assertion":{"ui_state":{"expected":"primary","stable":true}}}]});
+    let response = http_post_json(address, "/debug/run", &ui_run.to_string(), Some("secret"));
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    let ui_id = value["run"]["runId"].as_str().unwrap();
+    let completed = http_post(
+        address,
+        &format!("/debug/run/all?runId={ui_id}"),
+        Some("secret"),
+    );
+    assert_eq!(
+        completed.status_line, "HTTP/1.1 200 OK",
+        "{}",
+        completed.body
+    );
+    let completed: Value = serde_json::from_str(&completed.body).unwrap();
+    assert_eq!(completed["run"]["status"], "failed");
+    assert!(
+        completed["run"]["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("尚无 UI 状态观测")
+    );
+    let runs = http_get(address, "/debug/runs", Some("secret"));
+    let runs: Value = serde_json::from_str(&runs.body).unwrap();
+    assert_eq!(runs["runs"].as_array().unwrap().len(), 4);
+    server.shutdown().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a visible running game window on the desktop"]
+fn debug_http_live_capture_authenticated_read_only_smoke() {
+    struct RestoreDebugMode(bool);
+    impl Drop for RestoreDebugMode {
+        fn drop(&mut self) {
+            crate::debug_mode::set_enabled(self.0);
+        }
+    }
+    let runtime = crate::runtime::ui::UiRuntime::start(
+        crate::adapters::windows::WindowsUiDevice::new(crate::config::WindowConfig::default()),
+        2,
+    )
+    .expect("start UI worker");
+    let _restore = RestoreDebugMode(crate::debug_mode::set_enabled(true));
+    let mut state = test_state();
+    state.application.debug = Some(Arc::new(HttpTestDebugPort {
+        sandbox: crate::debug_http_service::DebugHttpService::new(Some(runtime.handle())),
+    }));
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+    let task = json!({"id":"live-http-capture","version":1,"commands":["capture"],"captureAfterEach":true});
+    assert_eq!(
+        http_post_json(address, "/debug/tasks", &task.to_string(), Some("secret")).status_line,
+        "HTTP/1.1 200 OK"
+    );
+    let start = json!({"taskId":"live-http-capture","mode":"live","expectedVersion":1});
+    assert_eq!(
+        http_post_json(address, "/debug/run", &start.to_string(), None).status_line,
+        "HTTP/1.1 401 Unauthorized"
+    );
+    let response = http_post_json(address, "/debug/run", &start.to_string(), Some("secret"));
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    let run_id = value["run"]["runId"].as_str().unwrap();
+    let completed = http_post(
+        address,
+        &format!("/debug/run/all?runId={run_id}"),
+        Some("secret"),
+    );
+    assert_eq!(
+        completed.status_line, "HTTP/1.1 200 OK",
+        "{}",
+        completed.body
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&completed.body).unwrap()["run"]["status"],
+        "passed"
+    );
+    let status = http_get(
+        address,
+        &format!("/debug/run/status?runId={run_id}"),
+        Some("secret"),
+    );
+    assert_eq!(status.status_line, "HTTP/1.1 200 OK", "{}", status.body);
+    assert_eq!(
+        serde_json::from_str::<Value>(&status.body).unwrap()["task"]["commands"][0],
+        "capture"
+    );
+    let evidence = http_get(
+        address,
+        &format!("/debug/run/evidence?runId={run_id}"),
+        Some("secret"),
+    );
+    assert_eq!(evidence.status_line, "HTTP/1.1 200 OK", "{}", evidence.body);
+    let evidence: Value = serde_json::from_str(&evidence.body).unwrap();
+    let frame = &evidence["evidence"][0];
+    assert_eq!(frame["captured"], true);
+    assert!(frame["width"].as_u64().unwrap() > 0);
+    assert!(frame["height"].as_u64().unwrap() > 0);
+    assert!(
+        frame["imagePngBase64"]
+            .as_str()
+            .is_some_and(|png| png.starts_with("iVBORw0KGgo"))
+    );
+    server.shutdown().unwrap();
+    assert!(!runtime.shutdown().unwrap().timed_out());
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "changes global debug mode while testing concurrent loopback requests"]
+fn debug_http_live_wait_cancel_smoke() {
+    struct RestoreDebugMode(bool);
+    impl Drop for RestoreDebugMode {
+        fn drop(&mut self) {
+            crate::debug_mode::set_enabled(self.0);
+        }
+    }
+    let runtime = crate::runtime::ui::UiRuntime::start(
+        crate::adapters::windows::WindowsUiDevice::new(crate::config::WindowConfig::default()),
+        2,
+    )
+    .expect("start UI worker");
+    let _restore = RestoreDebugMode(crate::debug_mode::set_enabled(true));
+    let mut state = test_state();
+    state.application.debug = Some(Arc::new(HttpTestDebugPort {
+        sandbox: crate::debug_http_service::DebugHttpService::new(Some(runtime.handle())),
+    }));
+    let server = start_test_http_server(&mut state, "secret");
+    let address = server.local_addr();
+    let task = json!({"id":"live-cancel-wait","version":1,"commands":[{"wait":{"milliseconds":2000}}],"captureAfterEach":false});
+    let saved = http_post_json(address, "/debug/tasks", &task.to_string(), Some("secret"));
+    assert_eq!(saved.status_line, "HTTP/1.1 200 OK", "{}", saved.body);
+    let start = json!({"taskId":"live-cancel-wait","mode":"live"});
+    let started = http_post_json(address, "/debug/run", &start.to_string(), Some("secret"));
+    assert_eq!(started.status_line, "HTTP/1.1 200 OK", "{}", started.body);
+    let run: Value = serde_json::from_str(&started.body).unwrap();
+    let run_id = run["run"]["runId"].as_str().unwrap().to_owned();
+    let step_path = format!("/debug/run/all?runId={run_id}");
+    let (sent, received) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sent.send(()).unwrap();
+        http_post(address, &step_path, Some("secret"))
+    });
+    received.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    let cancel = http_post(
+        address,
+        &format!("/debug/run/cancel?runId={run_id}"),
+        Some("secret"),
+    );
+    assert_eq!(cancel.status_line, "HTTP/1.1 200 OK", "{}", cancel.body);
+    let completed = worker.join().unwrap();
+    assert_eq!(
+        completed.status_line, "HTTP/1.1 200 OK",
+        "{}",
+        completed.body
+    );
+    let completed: Value = serde_json::from_str(&completed.body).unwrap();
+    assert_eq!(completed["run"]["status"], "cancelled");
+    assert_eq!(completed["run"]["results"].as_array().unwrap().len(), 1);
+    server.shutdown().unwrap();
+    assert!(!runtime.shutdown().unwrap().timed_out());
+}
+
+#[test]
+fn debug_http_archive_restores_tasks_status_evidence_and_replay_after_restart() {
+    let path = std::env::temp_dir().join(format!("http-debug-{}.db", Uuid::new_v4()));
+    let run_id = {
+        let mut state = test_state();
+        state.application.debug = Some(Arc::new(HttpTestDebugPort {
+            sandbox: crate::debug_http_service::DebugHttpService::with_journal(None, &path)
+                .unwrap(),
+        }));
+        let server = start_test_http_server(&mut state, "secret");
+        let address = server.local_addr();
+        let task =
+            json!({"id":"restart-task","version":1,"commands":["capture"],"captureAfterEach":true});
+        assert_eq!(
+            http_post_json(address, "/debug/tasks", &task.to_string(), Some("secret")).status_line,
+            "HTTP/1.1 200 OK"
+        );
+        let start = json!({"taskId":"restart-task","mode":"simulated","fixture":{"width":2,"height":2,"rgba":[10,20,30,255]}});
+        let response = http_post_json(address, "/debug/run", &start.to_string(), Some("secret"));
+        assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+        let run: Value = serde_json::from_str(&response.body).unwrap();
+        let run_id = run["run"]["runId"].as_str().unwrap().to_owned();
+        let completed = http_post(
+            address,
+            &format!("/debug/run/all?runId={run_id}"),
+            Some("secret"),
+        );
+        assert_eq!(
+            completed.status_line, "HTTP/1.1 200 OK",
+            "{}",
+            completed.body
+        );
+        server.shutdown().unwrap();
+        run_id
+    };
+    {
+        let mut state = test_state();
+        state.application.debug = Some(Arc::new(HttpTestDebugPort {
+            sandbox: crate::debug_http_service::DebugHttpService::with_journal(None, &path)
+                .unwrap(),
+        }));
+        let server = start_test_http_server(&mut state, "secret");
+        let address = server.local_addr();
+        let tasks = http_get(address, "/debug/tasks", Some("secret"));
+        assert_eq!(tasks.status_line, "HTTP/1.1 200 OK", "{}", tasks.body);
+        let tasks: Value = serde_json::from_str(&tasks.body).unwrap();
+        assert_eq!(tasks["tasks"][0]["id"], "restart-task");
+        let runs = http_get(address, "/debug/runs", Some("secret"));
+        let runs: Value = serde_json::from_str(&runs.body).unwrap();
+        assert_eq!(runs["runs"][0]["runId"], run_id);
+        let status = http_get(
+            address,
+            &format!("/debug/run/status?runId={run_id}"),
+            Some("secret"),
+        );
+        let status: Value = serde_json::from_str(&status.body).unwrap();
+        assert_eq!(status["run"]["status"], "passed");
+        assert_eq!(status["task"]["version"], 1);
+        let evidence = http_get(
+            address,
+            &format!("/debug/run/evidence?runId={run_id}"),
+            Some("secret"),
+        );
+        let evidence: Value = serde_json::from_str(&evidence.body).unwrap();
+        assert!(
+            evidence["evidence"][0]["imagePngBase64"]
+                .as_str()
+                .is_some_and(|png| !png.is_empty())
+        );
+        let replay = http_post(
+            address,
+            &format!("/debug/run/replay?runId={run_id}"),
+            Some("secret"),
+        );
+        assert_eq!(replay.status_line, "HTTP/1.1 200 OK", "{}", replay.body);
+        let replay: Value = serde_json::from_str(&replay.body).unwrap();
+        assert_eq!(replay["run"]["taskVersion"], 1);
+        assert_ne!(replay["run"]["runId"], run_id);
+        server.shutdown().unwrap();
+    }
+    std::fs::remove_file(path).unwrap();
+}
 
 #[test]
 fn api_identity_mapping_changes_display_fields_without_changing_track_metadata() {

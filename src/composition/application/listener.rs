@@ -131,6 +131,178 @@ fn secondary_hall_recovery_allowed(now: Instant, retry_after: Instant) -> bool {
     now >= retry_after
 }
 
+/// 上一次已推送的界面状态键。外层的 None 表示"还没推送过任何东西"。
+static LAST_UI_TRANSITION: std::sync::Mutex<Option<UiTransitionKey>> = std::sync::Mutex::new(None);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiTransitionKey {
+    /// 分类尚未稳定。过渡态本身算**一个**状态：
+    /// 一直在抖但始终没稳定时，不重复推送。
+    Unstable,
+    Stable(UiStateKind),
+}
+
+/// 判断这次观测是否构成一次**界面状态迁移**；返回 true 表示应当推送。
+///
+/// 只用**稳定类型**做判据：标签里还带着聊天标记计数，而计数每帧都在变，
+/// 跟着它推会把事件流变成轮询，正是事件通道要消灭的东西。
+fn take_ui_state_transition(kind: Option<UiStateKind>) -> bool {
+    let key = match kind {
+        Some(kind) => UiTransitionKey::Stable(kind),
+        None => UiTransitionKey::Unstable,
+    };
+    let Ok(mut last) = LAST_UI_TRANSITION.lock() else {
+        return false;
+    };
+    if *last == Some(key) {
+        return false;
+    }
+    *last = Some(key);
+    true
+}
+
+/// 事件载荷的文本上限：事件是给控制器看的通知，不是完整日志，
+/// 超长文本会把 256 条的重放缓冲挤满，让真正重要的事件被淘汰。
+const MAX_EVENT_TEXT_CHARS: usize = 512;
+
+fn truncate_for_event(text: &str) -> String {
+    if text.chars().count() <= MAX_EVENT_TEXT_CHARS {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(MAX_EVENT_TEXT_CHARS).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// 归一化聊天文本：只做**不丢信息**的修正，且**空白一律丢弃**。
+///
+/// - 全角 ASCII 折半角：放大实测截图确认，游戏里的冒号本来就是半角，
+///   是 OCR 偶尔读成全角；折半角是把它改回屏幕上的真实字形，属于纠错。
+/// - 空白全部丢弃：实测确认 OCR 的空白**两个方向都会错**——同一位置有时多读
+///   一个空格（`@天子 没头脑`），有时整个漏掉（`@守望天空 只推荐`）。
+///   既然空白不可信，保留它只会让同一句话时而带空格时而不带，
+///   下游比较反而更不稳定；统一丢弃后文本才是确定且可逐字比较的。
+fn normalize_chat_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|ch| match ch {
+            // 全角 ！ 到 ～ 与半角 ASCII 一一对应，码位偏移 0xFEE0。
+            '\u{FF01}'..='\u{FF5E}' => Some(char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch)),
+            ch if ch.is_whitespace() => None,
+            other => Some(other),
+        })
+        .collect()
+}
+
+/// 已推送过的气泡身份（有界）。
+///
+/// 用**气泡身份**而不是文本相等判断"是不是同一条消息"：同一条消息被 OCR
+/// 二次识别时，说话人可能迟到、标点可能全角半角、表情可能被读成乱码，
+/// 这些都不是一条新消息。
+static REMEMBERED_BUBBLES: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// 去重记忆的条数上限。丢掉最旧的只影响去重广度，不会让状态变得不正确。
+const REMEMBERED_BUBBLE_LIMIT: usize = 256;
+
+fn bubble_key(id: &crate::observation::chat::ObservedChatMessageId) -> String {
+    use crate::observation::chat::ChatIdentity;
+    let chat = match &id.chat {
+        ChatIdentity::PrimaryHall => "primary_hall".to_string(),
+        ChatIdentity::SecondaryHall => "secondary_hall".to_string(),
+        ChatIdentity::Friend(name) => format!("friend:{name}"),
+        ChatIdentity::PublicChannel => "public".to_string(),
+        ChatIdentity::StrangerMessages => "strangers".to_string(),
+    };
+    format!(
+        "{}|{chat}|{}",
+        id.visual_session.get(),
+        id.bubble_sequence.get()
+    )
+}
+
+/// 决定一条气泡是否应当出现在事件里：**每条气泡只推一次**。
+///
+/// 为什么不做事后补正：OCR 对特殊字符的抖动（半角/全角标点、表情被读成乱码、
+/// 说话人迟一拍）与真实的"读得更准"在文本层面**无法可靠区分**。任何基于长度或
+/// 相似度的补正规则都会把事件频率交回给 OCR 稳定性，正是要消灭的东西。
+/// 因此这里选择少推：一条气泡产生且仅产生一个事件。这是本模块的明确取舍。
+fn take_bubble_update(key: &str) -> bool {
+    let Ok(mut seen) = REMEMBERED_BUBBLES.lock() else {
+        // 锁中毒时选择推送而不是静默：宁可多推一条，也不要把游戏输入吞掉。
+        return true;
+    };
+    if seen.iter().any(|known| known == key) {
+        return false;
+    }
+    seen.push_back(key.to_string());
+    while seen.len() > REMEMBERED_BUBBLE_LIMIT {
+        seen.pop_front();
+    }
+    true
+}
+
+/// 只在调试模式下调用：把本会被丢弃的聊天观测发布到事件流，不执行任何命令。
+///
+/// 这样外部 AI 在驱动游戏的同时还能收到游戏内的输入，不必轮询；
+/// 而"调试模式不跑自动化"这条安全边界原封不动。
+fn publish_debug_chat_observations(dispatches: &[ChatObservationDispatch]) {
+    let bus = crate::debug_events::bus();
+    for dispatch in dispatches {
+        match dispatch {
+            ChatObservationDispatch::Primary { messages, .. } => {
+                // 判"是不是新消息"用**气泡身份**：不用 is_new（实测会把同一屏每帧都
+                // 标成新的，44 秒 13 条重复事件），也不用文本相等（会被 OCR 抖动击穿：
+                // `:` vs `：`、说话人迟一拍）。
+                let mut fresh = Vec::new();
+                for item in messages {
+                    if !take_bubble_update(&bubble_key(&item.id)) {
+                        continue;
+                    }
+                    // 推送的文本仍然做一次归一化：客户端拿到的是可直接比较的规范串，
+                    // 但这不影响事件频率（频率只由气泡身份决定）。
+                    fresh.push(serde_json::json!({
+                        "bubble": item.id.bubble_sequence.get(),
+                        "type": item.message.message_type,
+                        "text": truncate_for_event(&normalize_chat_text(&item.message.text)),
+                    }));
+                }
+                if !fresh.is_empty() {
+                    bus.publish(
+                        "game.chat",
+                        serde_json::json!({"scope": "primary", "messages": fresh}),
+                    );
+                }
+            }
+            ChatObservationDispatch::Secondary { observation, .. } => {
+                bus.publish(
+                    "game.chat",
+                    serde_json::json!({
+                        "scope": "secondary",
+                        "messageType": observation.message_type,
+                        "friendName": observation.friend_name,
+                        "acceptsTurtleQuestions": observation.accepts_turtle_questions,
+                        "messages": observation
+                            .messages
+                            .iter()
+                            .map(|item| serde_json::json!({
+                                "text": truncate_for_event(&item.text),
+                                "sender": item.sender,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+            }
+            ChatObservationDispatch::Gap(gap) => {
+                // 观测缺口也必须让 AI 知道：否则它会拿不完整的状态当完整状态用。
+                bus.publish(
+                    "game.observation_gap",
+                    serde_json::json!({"detail": format!("{gap:?}")}),
+                );
+            }
+        }
+    }
+}
+
 // 待处理重载可能因外部播放或不确定状态长期阻塞，因此不将其作为替代进程启动恢复的闸门：
 // 子进程必须先完成启动并发布就绪，看门狗才能按正常进程处理。
 fn replacement_startup_retry_due(
@@ -384,13 +556,20 @@ impl ApplicationRuntime {
                 .clone()
                 .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?,
         );
+        // 调试沙盒复用与公开 HTTP 完全相同的播放控制入队路径，不另造旁路：
+        // 这样"沙盒里能做的"和"API 能做的"永远一致，不会各自漂移。
+        let debug_command_port: Arc<dyn http::HttpCommandPort> =
+            Arc::new(http_facade::ApplicationHttpCommandFacade::new(
+                formal_tasks.clone(),
+                self.business.custom_workflow.clone(),
+            ));
         let config_store = self
             .lifecycle
             .config_store
             .clone()
             .ok_or_else(|| anyhow!("配置中心存储尚未初始化"))?;
         let http_config = self.lifecycle.config.http.clone();
-        let http_state = http::HttpSharedState::new(
+        let mut http_state = http::HttpSharedState::new(
             http::HttpInterfaceConfig::new(
                 http_config,
                 self.lifecycle.config.screen.clone(),
@@ -429,6 +608,52 @@ impl ApplicationRuntime {
                 )),
             ),
         );
+        http_state.set_debug_port(Arc::new(http_facade::ApplicationHttpDebugFacade::new(
+            self.ui
+                .ui_runtime
+                .as_ref()
+                .ok_or_else(|| anyhow!("UI运行时尚未启动"))?
+                .handle(),
+            self.ui.ocr.clone(),
+            &self.lifecycle.config.state.playback_state_path,
+            Arc::new({
+                let business = self.business.business.clone();
+                move || {
+                    business
+                        .playback_queue_snapshot()
+                        .map(|queue| queue.len())
+                        .map_err(|e| e.to_string())
+                }
+            }),
+            Arc::new({
+                let business = self.business.business.clone();
+                move || {
+                    business
+                        .clear_playback_queue()
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            }),
+            Arc::new({
+                let business = self.business.business.clone();
+                move || {
+                    business
+                        .remove_playback_queue(crate::features::playback::QueueRemoval::Front)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            }),
+            Arc::new({
+                let task_engine = self.business.task_engine.clone();
+                move |task_id| {
+                    task_engine
+                        .cancel_formal(task_id)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            }),
+            debug_command_port,
+        )?));
         self.lifecycle.http_reload_blockers = http_state.active_reload_blockers.clone();
         self.lifecycle.http_reload_draining = http_state.reload_draining.clone();
         let server = http::start(http_state)?;
@@ -740,13 +965,27 @@ impl ApplicationRuntime {
                             )),
                         };
                     match &ui_state_result {
-                        Ok((ui_state, _)) => self.lifecycle.monitor.publish(MonitorEvent::UiState(
-                            match ui_state.as_str() {
-                                "game_gate" => "大门界面".to_string(),
-                                "overworld" => "主世界".to_string(),
-                                _ => ui_state.clone(),
-                            },
-                        )),
+                        Ok((ui_state, kind)) => {
+                            // 界面状态迁移推送到事件流：迁移图应当能被"听"出来，
+                            // 而不是靠轮询 /monitor 再逐个比对。
+                            if take_ui_state_transition(*kind) {
+                                crate::debug_events::bus().publish(
+                                    "ui.state",
+                                    serde_json::json!({
+                                        "kind": kind.map(|kind| kind.name()),
+                                        "stable": kind.is_some(),
+                                        "label": ui_state,
+                                    }),
+                                );
+                            }
+                            self.lifecycle.monitor.publish(MonitorEvent::UiState(
+                                match ui_state.as_str() {
+                                    "game_gate" => "大门界面".to_string(),
+                                    "overworld" => "主世界".to_string(),
+                                    _ => ui_state.clone(),
+                                },
+                            ))
+                        }
                         Err(_) => self
                             .lifecycle
                             .monitor
@@ -877,7 +1116,19 @@ impl ApplicationRuntime {
                         log::debug!("驻留恢复后废弃当前旧观察帧，下一轮重新验证");
                     } else {
                         match ui_state_result {
-                            Ok((_, Some(UiStateKind::GameGate | UiStateKind::Overworld))) => {
+                            // 主菜单虽然是叠在大厅上的浮层，但它会盖住聊天区，
+                            // 所以和 GameGate/Overworld 一样按"不在聊天界面"处理，
+                            // 顺手丢弃旧的残留观察，菜单关闭后重新验证（§44.10）。
+                            // 加载界面同理：此时根本没有聊天区，旧的观察必须作废（§55）。
+                            Ok((
+                                _,
+                                Some(
+                                    UiStateKind::GameGate
+                                    | UiStateKind::Overworld
+                                    | UiStateKind::MainMenu
+                                    | UiStateKind::Loading,
+                                ),
+                            )) => {
                                 primary_visible = false;
                                 last_fingerprint = None;
                                 secondary_friend_bubble_fingerprint = None;
@@ -1433,6 +1684,15 @@ impl ApplicationRuntime {
         &mut self,
         dispatches: Vec<ChatObservationDispatch>,
     ) -> Result<bool> {
+        if crate::debug_mode::enabled() {
+            // 调试模式下本进程不执行自动化——但"不执行"不等于"看不见"。
+            // 外部 AI 恰恰是在这个模式下驱动游戏的，它必须知道游戏里说了什么、
+            // 观测有没有漏。所以这里把原本要丢弃的观测**原样推送**出去：
+            // 本进程当观察者，AI 当执行者。行为边界不变，仍然不执行任何自动化。
+            publish_debug_chat_observations(&dispatches);
+            log::debug!("调试模式已启用，丢弃游戏内聊天命令与问题，不执行自动化");
+            return Ok(false);
+        }
         let mut processed_secondary = false;
         for dispatch in dispatches {
             match dispatch {
@@ -1939,6 +2199,80 @@ pub(super) fn scan_chat_with_shared_ocr(
 
 #[cfg(test)]
 mod tests {
+    /// 界面状态迁移只在**稳定类型**变化时推送。
+    /// 标签里还带着聊天标记计数，而计数每帧都在变——跟着它推等于自造轮询。
+    #[test]
+    fn ui_state_transition_only_fires_on_stable_kind_change() {
+        use crate::runtime::ui::UiStateKind;
+        // 第一次调用的返回值取决于全局起点，这里只断言**重复**行为。
+        let _ = super::take_ui_state_transition(Some(UiStateKind::Secondary));
+        assert!(
+            !super::take_ui_state_transition(Some(UiStateKind::Secondary)),
+            "同一稳定类型重复观测不得再产生事件"
+        );
+        assert!(
+            super::take_ui_state_transition(None),
+            "稳定 -> 过渡 是一条真实迁移"
+        );
+        assert!(
+            !super::take_ui_state_transition(None),
+            "过渡态内部不断抖动时不得重复推送"
+        );
+        assert!(
+            super::take_ui_state_transition(Some(UiStateKind::Primary)),
+            "过渡 -> 另一个稳定类型 又是一条迁移"
+        );
+        assert!(!super::take_ui_state_transition(Some(UiStateKind::Primary)));
+        assert!(super::take_ui_state_transition(Some(
+            UiStateKind::Overworld
+        )));
+    }
+
+    /// OCR 抖动不得产生新消息。断言来自真机实测加上一个必须正视的事实：
+    /// **OCR 对特殊字符会抖动**——半角/全角标点、表情被读成乱码、说话人迟一拍，
+    /// 都曾让同一条气泡产生独立事件。
+    #[test]
+    fn chat_jitter_does_not_produce_new_messages() {
+        assert_eq!(
+            super::normalize_chat_text("[珐露珊]："),
+            super::normalize_chat_text("[珐露珊]:"),
+            "半角/全角标点属于排版差异，不是内容变化"
+        );
+        assert_eq!(
+            super::normalize_chat_text("  天子 :  你好  "),
+            "天子:你好",
+            "空白一律丢弃：OCR 的空白两个方向都会错，保留它只会让比较更不稳定"
+        );
+        assert_eq!(
+            super::normalize_chat_text("[天子]:@女(禁言7天) 标题党是台好车"),
+            "[天子]:@女(禁言7天)标题党是台好车",
+            "实测中真实存在的空格也要丢弃：同一位置 OCR 时有时无"
+        );
+
+        let key = "jitter-probe|primary_hall|9001";
+        assert!(super::take_bubble_update(key), "第一次看到这条气泡必须推送");
+        // 同一条气泡的**任何**再次识别都不得产生新事件，包括长短变化的抖动。
+        for jitter in [
+            "[珐露珊]:",
+            "[珐露珊]：",
+            "[珐露珊]::",
+            "[]:这在干啥？",
+            "[天子]:这在干啥？",
+            "[]:这在干啥?",
+            "🙂",
+            "",
+        ] {
+            assert!(
+                !super::take_bubble_update(key),
+                "同一条气泡的再次识别不得产生新事件: {jitter:?}"
+            );
+        }
+        assert!(
+            super::take_bubble_update("jitter-probe|primary_hall|9002"),
+            "另一条气泡必须照常推送"
+        );
+    }
+
     use crate::features::command::{CommandEnvelope, CommandObservation};
     use crate::features::custom_workflow::{
         CustomWorkflowConfig, CustomWorkflowService, WorkflowDefaults,

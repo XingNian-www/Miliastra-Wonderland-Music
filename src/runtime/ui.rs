@@ -20,12 +20,28 @@ pub trait UiDevice: Send + 'static {
         bail!("UI device does not support keyboard input")
     }
 
+    fn key_down(&mut self, _key: Key) -> Result<()> {
+        bail!("UI device does not support key-down input")
+    }
+
+    fn key_up(&mut self, _key: Key) -> Result<()> {
+        bail!("UI device does not support key-up input")
+    }
+
     fn click_point(&mut self, _x: i32, _y: i32) -> Result<()> {
         bail!("UI device does not support mouse input")
     }
 
     fn click_button(&mut self, _button: Button) -> Result<()> {
         bail!("UI device does not support mouse button input")
+    }
+
+    fn mouse_down(&mut self, _button: Button) -> Result<()> {
+        bail!("UI device does not support mouse-down input")
+    }
+
+    fn mouse_up(&mut self, _button: Button) -> Result<()> {
+        bail!("UI device does not support mouse-up input")
     }
 
     fn scroll_point(&mut self, _x: i32, _y: i32, _length: i32) -> Result<()> {
@@ -50,6 +66,22 @@ pub trait UiDevice: Send + 'static {
 
     fn ensure_foreground(&mut self) -> Result<()> {
         bail!("UI device does not support foreground validation")
+    }
+
+    fn window_foreground(&mut self) -> Result<bool> {
+        bail!("UI device does not support foreground observation")
+    }
+
+    fn window_available(&mut self) -> Result<bool> {
+        bail!("UI device does not support window availability observation")
+    }
+
+    /// 读取剪贴板文本，用于验证"复制/粘贴"类操作是否真的生效。
+    fn clipboard_text(&mut self) -> Result<Option<String>> {
+        bail!(
+            "UI device does not support clipboard observation (type={})",
+            std::any::type_name::<Self>()
+        )
     }
 
     fn paste_text(&mut self, _text: &str, _clipboard_hold_ms: u64) -> Result<()> {
@@ -79,6 +111,110 @@ pub trait UiDevice: Send + 'static {
 
     fn launch_game(&mut self, _executable: &Path, _args: &[String]) -> Result<()> {
         bail!("UI device does not support game process launch")
+    }
+
+    fn recover(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+// All routines receive this device, including routines bypassing GameUi atoms.
+/// 设备装饰器：给底层设备加"帧观测"和"输入授权"两层，其余方法必须**逐个显式转发**。
+///
+/// 维护注意：新增 UiDevice 方法后，这里若忘记转发，调用会**静默退回 trait 默认实现**。
+/// 只读观测方法的默认实现会报错（真机上表现为 does not support ... observation），
+/// 但默认实现返回 Ok(()) 的方法会无声失败。新增方法时务必同步这里，并补一条转发用例。
+struct IsolatedDevice<D: UiDevice>(D);
+impl<D: UiDevice> UiDevice for IsolatedDevice<D> {
+    fn capture(&mut self) -> Result<DynamicImage> {
+        self.0.capture()
+    }
+    fn ensure_foreground(&mut self) -> Result<()> {
+        self.0.ensure_foreground()
+    }
+    fn window_foreground(&mut self) -> Result<bool> {
+        self.0.window_foreground()
+    }
+    fn window_available(&mut self) -> Result<bool> {
+        self.0.window_available()
+    }
+    /// 只读观测：与 capture / window_* 一致，不做输入授权检查。
+    fn clipboard_text(&mut self) -> Result<Option<String>> {
+        self.0.clipboard_text()
+    }
+    fn ensure_window(&mut self) -> Result<()> {
+        self.0.ensure_window()
+    }
+    fn press_key(&mut self, key: Key) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.press_key(key)
+    }
+    fn key_down(&mut self, key: Key) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.key_down(key)
+    }
+    fn key_up(&mut self, key: Key) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.key_up(key)
+    }
+    fn click_point(&mut self, x: i32, y: i32) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.click_point(x, y)
+    }
+    fn click_button(&mut self, button: Button) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.click_button(button)
+    }
+    fn mouse_down(&mut self, button: Button) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.mouse_down(button)
+    }
+    fn mouse_up(&mut self, button: Button) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.mouse_up(button)
+    }
+    fn scroll_point(&mut self, x: i32, y: i32, length: i32) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.scroll_point(x, y, length)
+    }
+    fn drag_point(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.drag_point(from_x, from_y, to_x, to_y)
+    }
+    fn activate(&mut self, after_activate_ms: u64) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.activate(after_activate_ms)
+    }
+    fn focus(&mut self, after_activate_ms: u64) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.focus(after_activate_ms)
+    }
+    fn ensure_ready(&mut self, after_activate_ms: u64) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.ensure_ready(after_activate_ms)
+    }
+    fn paste_text(&mut self, text: &str, clipboard_hold_ms: u64) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.paste_text(text, clipboard_hold_ms)
+    }
+    fn input_text(&mut self, text: &str, input_settle_ms: u64) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.input_text(text, input_settle_ms)
+    }
+    fn hold_key(&mut self, key: Key, duration: Duration, running: Arc<AtomicBool>) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.hold_key(key, duration, running)
+    }
+    fn close_window(&mut self) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.close_window()
+    }
+    fn launch_game(&mut self, executable: &Path, args: &[String]) -> Result<()> {
+        crate::debug_mode::require_input()?;
+        self.0.launch_game(executable, args)
+    }
+    fn recover(&mut self) -> Result<()> {
+        self.0.recover()
     }
 }
 
@@ -181,9 +317,36 @@ impl CapturedFrame {
 pub enum UiStateKind {
     Primary,
     Secondary,
+    /// 千星奇域主菜单（枢纽节点）。它是一个**独立状态**而不是 unknown：
+    /// 主菜单与二级界面共用左上角返回按钮，但右下角多一个「返回提瓦特」按钮。
+    /// 必须独立成一类，否则它会落进 unknown 并触发游戏态回退，
+    /// 被 world_wish 误报成 overworld（见 docs/ui-state-machine.md §44.10）。
+    MainMenu,
     GameGate,
     Overworld,
+    /// 加载界面。它是**真实界面**，不是 unknown：实测有两种外观，
+    /// 都能用整屏像素占比判出来（见 §55）：
+    /// - **黑底徽记型**（传送等短加载）：暗像素(<40) 占比 98.46~98.53%
+    /// - **白底元素型**（冷启动进世界）：近白像素占比 99.77~100%
+    /// 具体是哪一种由证据里的 finalRule 区分，状态本身按需求统一成 loading。
+    Loading,
     Unknown,
+}
+
+impl UiStateKind {
+    /// 规范名，用作事件与查询接口里的稳定标识。
+    /// 这几个就是当前**全部**可判别的界面状态；`unknown` 是显式的"判不出来"，不是"其它"。
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+            Self::MainMenu => "main_menu",
+            Self::GameGate => "game_gate",
+            Self::Overworld => "overworld",
+            Self::Loading => "loading",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,10 +493,68 @@ impl UiMarkerProbeEvidence {
     }
 }
 
+/// 世界判据（提瓦特 vs 千星）的证据。
+///
+/// 这是一条**正交于界面状态**的判据：它回答"当前画面属于哪个世界"，
+/// 而不是"当前是什么界面"。计数落在两侧实测空档之间时 `guess` 是 `unknown`，
+/// 与 `UiStateKind::Unknown` 同样的纪律：判不出来就不猜。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiWorldProbeEvidence {
+    region: UiEvidenceRect,
+    count: Option<usize>,
+    teyvat_max: usize,
+    qianxing_min: usize,
+    guess: &'static str,
+}
+
+impl UiWorldProbeEvidence {
+    pub fn new(
+        region: UiEvidenceRect,
+        count: Option<usize>,
+        teyvat_max: usize,
+        qianxing_min: usize,
+        guess: &'static str,
+    ) -> Self {
+        Self {
+            region,
+            count,
+            teyvat_max,
+            qianxing_min,
+            guess,
+        }
+    }
+
+    /// 统计区域（相对整帧的绝对坐标）。
+    pub fn region(&self) -> UiEvidenceRect {
+        self.region
+    }
+
+    /// 区域内的青色条纹带像素数；画面太小（不是整帧）时为 `None`。
+    pub fn count(&self) -> Option<usize> {
+        self.count
+    }
+
+    /// 判为提瓦特的计数上限。
+    pub fn teyvat_max(&self) -> usize {
+        self.teyvat_max
+    }
+
+    /// 判为千星的计数下限。与 `teyvat_max` 之间是显式拒判的空档。
+    pub fn qianxing_min(&self) -> usize {
+        self.qianxing_min
+    }
+
+    /// `teyvat` / `qianxing` / `unknown`。
+    pub fn guess(&self) -> &'static str {
+        self.guess
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiStateEvidence {
     template_probes: Vec<UiTemplateProbeEvidence>,
     marker_probe: Option<UiMarkerProbeEvidence>,
+    world_probe: Option<UiWorldProbeEvidence>,
     final_rule: String,
 }
 
@@ -346,6 +567,7 @@ impl UiStateEvidence {
         Self {
             template_probes,
             marker_probe,
+            world_probe: None,
             final_rule: final_rule.into(),
         }
     }
@@ -356,6 +578,17 @@ impl UiStateEvidence {
 
     pub fn marker_probe(&self) -> Option<&UiMarkerProbeEvidence> {
         self.marker_probe.as_ref()
+    }
+
+    pub fn world_probe(&self) -> Option<&UiWorldProbeEvidence> {
+        self.world_probe.as_ref()
+    }
+
+    /// 挂上世界判据证据。用 builder 而不是给 `new` 加参数，
+    /// 是为了不动现有十几个 `UiStateEvidence::new(...)` 调用点。
+    pub fn with_world_probe(mut self, probe: UiWorldProbeEvidence) -> Self {
+        self.world_probe = Some(probe);
+        self
     }
 
     pub fn final_rule(&self) -> &str {
@@ -398,6 +631,23 @@ impl Display for UiStateEvidence {
                 marker.blue_count,
                 marker.yellow_count,
                 marker.pink_count
+            )?;
+        }
+        if let Some(world) = &self.world_probe {
+            write!(
+                formatter,
+                " world_region={},{},{},{} world_count={} world_band={}..{} world_guess={}",
+                world.region.x,
+                world.region.y,
+                world.region.width,
+                world.region.height,
+                world
+                    .count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                world.teyvat_max,
+                world.qianxing_min,
+                world.guess
             )?;
         }
         Ok(())
@@ -878,6 +1128,7 @@ pub struct UiRoutineContext<'a> {
     progress: &'a dyn UiRoutineProgressSink,
     observation: &'a mut UiObservationRuntime,
     latest_frame: &'a Mutex<Option<Arc<CapturedFrame>>>,
+    cancelled: &'a AtomicBool,
 }
 
 impl<'a> UiRoutineContext<'a> {
@@ -887,6 +1138,7 @@ impl<'a> UiRoutineContext<'a> {
         progress: &'a dyn UiRoutineProgressSink,
         observation: &'a mut UiObservationRuntime,
         latest_frame: &'a Mutex<Option<Arc<CapturedFrame>>>,
+        cancelled: &'a AtomicBool,
     ) -> Self {
         Self {
             operation_id,
@@ -894,11 +1146,30 @@ impl<'a> UiRoutineContext<'a> {
             progress,
             observation,
             latest_frame,
+            cancelled,
         }
     }
 
     pub fn operation_id(&self) -> UiOperationId {
         self.operation_id
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn wait_cancellable(&self, duration: Duration) -> Result<()> {
+        let deadline = Instant::now() + duration;
+        loop {
+            if self.is_cancelled() {
+                bail!("UI operation cancelled");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            thread::sleep(remaining.min(Duration::from_millis(25)));
+        }
     }
 
     pub fn device(&mut self) -> &mut dyn UiDevice {
@@ -975,6 +1246,7 @@ impl UiOperationId {
 pub struct UiOperation<T> {
     id: UiOperationId,
     response: Receiver<T>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl<T> UiOperation<T> {
@@ -985,7 +1257,63 @@ impl<T> UiOperation<T> {
     pub fn wait(self) -> Result<T, UiReceiveError> {
         self.response.recv().map_err(|_| UiReceiveError)
     }
+
+    pub fn wait_timeout(self, timeout: Duration) -> Result<T, UiWaitTimeoutError> {
+        match self.response.recv_timeout(timeout) {
+            Ok(value) => Ok(value),
+            Err(RecvTimeoutError::Timeout) => {
+                self.cancelled.store(true, Ordering::Release);
+                Err(UiWaitTimeoutError {
+                    timeout,
+                    disconnected: false,
+                })
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(UiWaitTimeoutError {
+                timeout,
+                disconnected: true,
+            }),
+        }
+    }
+
+    pub fn cancel(self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiWaitTimeoutError {
+    timeout: Duration,
+    /// 真实失败原因：false = 确实等满了 timeout；true = UI runtime 在回传结果之前就结束了。
+    disconnected: bool,
+}
+
+impl UiWaitTimeoutError {
+    /// 是否为"runtime 提前结束"而非"等待超时"。
+    pub fn disconnected(&self) -> bool {
+        self.disconnected
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+impl Display for UiWaitTimeoutError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.disconnected {
+            // 通道断开 = 工作线程没有回传结果就结束了（崩溃或操作被丢弃）。
+            // 以前这里一律报"超过 N 秒"，把排查方向引向超时，实际根本没等那么久。
+            return formatter.write_str("UI runtime stopped before returning the operation result");
+        }
+        write!(
+            formatter,
+            "UI runtime operation exceeded {:?}",
+            self.timeout
+        )
+    }
+}
+
+impl Error for UiWaitTimeoutError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiReceiveError;
@@ -1083,6 +1411,9 @@ struct TypedUiJob<R: UiRoutine> {
     operation_id: UiOperationId,
     routine: R,
     response: SyncSender<R::Output>,
+    generation: u64,
+    external: bool,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl<R: UiRoutine> ErasedUiJob for TypedUiJob<R> {
@@ -1098,9 +1429,26 @@ impl<R: UiRoutine> ErasedUiJob for TypedUiJob<R> {
             operation_id,
             routine,
             response,
+            generation,
+            external,
+            cancelled,
         } = *self;
-        let mut context =
-            UiRoutineContext::new(operation_id, device, progress, observation, latest_frame);
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(_execution_guard) = crate::debug_mode::execution_guard(generation, external)
+        else {
+            // Mode changed after enqueue; dropping the response makes wait() fail without executing.
+            return;
+        };
+        let mut context = UiRoutineContext::new(
+            operation_id,
+            device,
+            progress,
+            observation,
+            latest_frame,
+            &cancelled,
+        );
         let output = routine.execute(&mut context);
         if let Some(publication) = R::frame_publication(&output) {
             publish_frame(publication, demands, latest_frame);
@@ -1140,6 +1488,23 @@ impl UiRuntimeHandle {
         &self,
         routine: R,
     ) -> Result<UiOperation<R::Output>, UiSubmitError> {
+        self.submit_authorized(routine, false)
+    }
+
+    /// Explicit authorization for external debug API commands, carried onto the worker.
+    pub(crate) fn submit_external<R: UiRoutine>(
+        &self,
+        routine: R,
+    ) -> Result<UiOperation<R::Output>, UiSubmitError> {
+        self.submit_authorized(routine, true)
+    }
+
+    fn submit_authorized<R: UiRoutine>(
+        &self,
+        routine: R,
+        external: bool,
+    ) -> Result<UiOperation<R::Output>, UiSubmitError> {
+        let generation = crate::debug_mode::generation();
         let accepting = self
             .channel
             .accepting
@@ -1155,15 +1520,20 @@ impl UiRuntimeHandle {
                 .wrapping_add(1),
         );
         let (response, receiver) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
         let message = RuntimeMessage::Execute(Box::new(TypedUiJob {
             operation_id: id,
             routine,
             response,
+            generation,
+            external,
+            cancelled: Arc::clone(&cancelled),
         }));
         match self.channel.sender.try_send(message) {
             Ok(()) => Ok(UiOperation {
                 id,
                 response: receiver,
+                cancelled,
             }),
             Err(TrySendError::Full(_)) => Err(UiSubmitError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(UiSubmitError::RuntimeStopped),
@@ -1264,11 +1634,60 @@ impl Drop for FrameDemandSubscription {
     }
 }
 
+/// 测试期串行化所有 `UiRuntime` 实例。
+///
+/// UI worker 在执行前会校验入队时记录的 `debug_mode` generation，一旦变化就**丢弃该操作且不回传**
+/// （见 `TypedUiJob::run`，这是防止陈旧外部命令执行的正确安全行为）。而 `debug_mode` 是**进程全局**状态。
+/// 于是并行测试里只要有一个用例切换调试模式，**其他用例正在等待的 live 操作就会被丢弃**，
+/// 表现为随机的 `UI runtime stopped before returning the operation result`。
+///
+/// 生产环境只有一个 runtime，且模式切换是人为动作，因此这条约束只在测试期施加。
+#[cfg(test)]
+mod test_runtime_serial {
+    use std::sync::{Condvar, Mutex};
+
+    static HOLDER: Mutex<Option<usize>> = Mutex::new(None);
+    static RELEASED: Condvar = Condvar::new();
+
+    /// 可重入占有凭据：同一线程可以同时持有多个 runtime，
+    /// 避免同一个用例创建两个 runtime 时自锁。
+    pub(super) struct Permit;
+
+    impl Permit {
+        pub(super) fn acquire() -> Self {
+            let mut holder = HOLDER.lock().unwrap_or_else(|error| error.into_inner());
+            while holder.is_some() {
+                holder = RELEASED
+                    .wait(holder)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+            *holder = Some(1);
+            Self
+        }
+    }
+
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            let mut holder = HOLDER.lock().unwrap_or_else(|error| error.into_inner());
+            // 不校验线程：即使 runtime 被移到别的线程释放，计数也保持平衡，不会永久占锁。
+            if let Some(depth) = holder.as_mut() {
+                *depth -= 1;
+                if *depth == 0 {
+                    *holder = None;
+                    RELEASED.notify_all();
+                }
+            }
+        }
+    }
+}
+
 pub struct UiRuntime {
     handle: UiRuntimeHandle,
     worker: Option<JoinHandle<()>>,
     /// 关闭超时后分离的 join 线程,后续 stop 时回收已结束的线程。
     detached_joins: Vec<JoinHandle<()>>,
+    #[cfg(test)]
+    _serial: test_runtime_serial::Permit,
 }
 
 impl UiRuntime {
@@ -1328,6 +1747,9 @@ impl UiRuntime {
         if queue_capacity == 0 {
             return Err(UiRuntimeStartError::ZeroQueueCapacity);
         }
+        // 测试期串行化：见 test_runtime_serial 的说明。acquire 失败路径上凭据会随栈释放。
+        #[cfg(test)]
+        let _serial = test_runtime_serial::Permit::acquire();
 
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         let stop_requested = Arc::new(AtomicBool::new(false));
@@ -1366,6 +1788,8 @@ impl UiRuntime {
             },
             detached_joins: Vec::new(),
             worker: Some(worker),
+            #[cfg(test)]
+            _serial,
         })
     }
 
@@ -1456,7 +1880,7 @@ fn run_ui_runtime(
     stable_count: u32,
     stop_requested: Arc<AtomicBool>,
 ) {
-    let mut device = device;
+    let mut device = IsolatedDevice(device);
     let mut demands = HashMap::<u64, ActiveFrameDemand>::new();
     let mut observation = UiObservationRuntime::new(classifier, stable_count, latest_ui_state);
     loop {
@@ -1580,6 +2004,97 @@ mod tests {
 
     fn classified(kind: UiStateKind) -> UiStateClassification {
         UiStateClassification::new(kind, format!("{kind:?}"))
+    }
+
+    #[derive(Default)]
+    struct IsolationProbeDevice {
+        captures: Arc<Mutex<usize>>,
+        presses: Arc<Mutex<usize>>,
+        foreground_checks: Arc<Mutex<usize>>,
+    }
+
+    impl UiDevice for IsolationProbeDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            *self.captures.lock().unwrap() += 1;
+            Ok(DynamicImage::new_rgba8(2, 2))
+        }
+
+        fn press_key(&mut self, _key: Key) -> Result<()> {
+            *self.presses.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        fn ensure_foreground(&mut self) -> Result<()> {
+            *self.foreground_checks.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        fn clipboard_text(&mut self) -> Result<Option<String>> {
+            Ok(Some("probe-clipboard".to_owned()))
+        }
+    }
+
+    /// 装饰器必须**逐个显式转发**每个只读观测方法：漏掉一个就会静默退回 trait 默认实现。
+    /// 真机上表现为 does not support ... observation —— 本轮就是这样漏掉了剪贴板读取，
+    /// 而 capture / window_* 因为转发过所以看起来一切正常。
+    #[test]
+    fn isolated_device_forwards_read_only_observations() {
+        let mut isolated = IsolatedDevice(IsolationProbeDevice::default());
+        crate::debug_mode::with_test_execution(true, false, || {
+            assert_eq!(
+                isolated.clipboard_text().unwrap(),
+                Some("probe-clipboard".to_owned())
+            );
+        });
+    }
+
+    #[test]
+    fn isolated_device_rejects_internal_input_but_preserves_capture() {
+        let device = IsolationProbeDevice::default();
+        let captures = device.captures.clone();
+        let presses = device.presses.clone();
+        let mut isolated = IsolatedDevice(device);
+
+        crate::debug_mode::with_test_execution(true, false, || {
+            assert!(isolated.press_key(Key::Return).is_err());
+            let frame = isolated.capture().unwrap();
+            assert_eq!((frame.width(), frame.height()), (2, 2));
+        });
+
+        assert_eq!(*captures.lock().unwrap(), 1);
+        assert_eq!(*presses.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn isolated_device_allows_only_explicit_external_input() {
+        let device = IsolationProbeDevice::default();
+        let presses = device.presses.clone();
+        let foreground_checks = device.foreground_checks.clone();
+        let mut isolated = IsolatedDevice(device);
+
+        crate::debug_mode::with_test_execution(true, true, || {
+            isolated.ensure_foreground().unwrap();
+            isolated.press_key(Key::Return).unwrap();
+        });
+
+        assert_eq!(*foreground_checks.lock().unwrap(), 1);
+        assert_eq!(*presses.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn isolated_device_does_not_leak_test_authorization_between_scopes() {
+        let device = IsolationProbeDevice::default();
+        let presses = device.presses.clone();
+        let mut isolated = IsolatedDevice(device);
+
+        crate::debug_mode::with_test_execution(true, true, || {
+            isolated.press_key(Key::Return).unwrap();
+        });
+        crate::debug_mode::with_test_execution(true, false, || {
+            assert!(isolated.press_key(Key::Return).is_err());
+        });
+
+        assert_eq!(*presses.lock().unwrap(), 1);
     }
 
     #[test]
@@ -1840,6 +2355,87 @@ mod tests {
             let _ = self.started.send(());
             let _ = self.release.recv();
         }
+    }
+
+    struct CancellableWaitRoutine {
+        started: SyncSender<()>,
+        finished: SyncSender<bool>,
+    }
+
+    impl sealed::UiRoutineSealed for CancellableWaitRoutine {}
+
+    impl UiRoutine for CancellableWaitRoutine {
+        type Output = ();
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) {
+            let _ = self.started.send(());
+            let cancelled = context.wait_cancellable(Duration::from_secs(5)).is_err();
+            let _ = self.finished.send(cancelled);
+        }
+    }
+
+    #[test]
+    fn timeout_cancels_running_cooperative_wait() {
+        let runtime = UiRuntime::start(UnusedDevice, 1).unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let operation = runtime
+            .handle()
+            .submit(CancellableWaitRoutine {
+                started: started_tx,
+                finished: finished_tx,
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            operation.wait_timeout(Duration::from_millis(10)),
+            Err(UiWaitTimeoutError { .. })
+        ));
+        assert!(finished_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(!runtime.shutdown().unwrap().timed_out());
+    }
+
+    struct NotifyingRoutine(SyncSender<()>);
+
+    impl sealed::UiRoutineSealed for NotifyingRoutine {}
+
+    impl UiRoutine for NotifyingRoutine {
+        type Output = ();
+
+        fn execute(self, _context: &mut UiRoutineContext<'_>) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[test]
+    fn cancelled_queued_routine_never_executes() {
+        let runtime = UiRuntime::start(UnusedDevice, 2).unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let blocker = runtime
+            .handle()
+            .submit(BlockingRoutine {
+                started: started_tx,
+                release: release_rx,
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (notified_tx, notified_rx) = mpsc::sync_channel(1);
+        let queued = runtime
+            .handle()
+            .submit(NotifyingRoutine(notified_tx))
+            .unwrap();
+        queued.cancel();
+        release_tx.send(()).unwrap();
+        blocker.wait().unwrap();
+        let followup = runtime.handle().submit(ContextProbeRoutine).unwrap();
+        let followup_id = followup.id();
+        assert_eq!(followup_id, followup.wait().unwrap());
+        assert!(matches!(
+            notified_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(!runtime.shutdown().unwrap().timed_out());
     }
 
     #[test]

@@ -826,12 +826,44 @@ pub struct ScreenConfig {
     pub friend_rect: RectConfig,
     pub secondary_back_rect: RectConfig,
     pub secondary_hall_rect: RectConfig,
+    /// 主菜单「返回提瓦特」按钮的搜索区。实测 (1690,1000) 205x60 可把主菜单
+    /// 与其余 58 帧完全分开（见 docs/ui-state-machine.md §35）。
+    #[serde(default = "default_main_menu_rect")]
+    pub main_menu_rect: RectConfig,
+    /// 大厅底栏 👥 O 图标组的搜索区。
+    #[serde(default = "default_hall_bar_rect")]
+    pub hall_bar_rect: RectConfig,
     #[serde(default = "default_world_wish_rect")]
     pub world_wish_rect: RectConfig,
     pub hall_name_rect: RectConfig,
     pub hall_member_count_rect: RectConfig,
     pub hall_time_rect: RectConfig,
     pub hall_member_list_rect: RectConfig,
+}
+
+fn default_hall_bar_rect() -> RectConfig {
+    // 底栏的横向位置会随聊天面板状态移动（实测同一模板在大厅帧上可出现在 x=180 或 x=369），
+    // 所以搜索区必须够宽；过窄会把真实大厅帧漏掉（第 47 节踩过）。
+    RectConfig {
+        // 第 48 节改成"统计这段区域的近白像素占比"，而不是模板匹配。
+        // 该量对位移和缩放都不敏感，正好绕开第 47 节栽的 1:1 SAD 限制。
+        // 阈值就是在**这个区域**上量的，两边必须一致，不能随便改。
+        x: 0,
+        y: 985,
+        width: 600,
+        height: 95,
+    }
+}
+
+fn default_main_menu_rect() -> RectConfig {
+    // 收紧到按钮本身外扩约 20px：按钮在这批帧里位置固定，收紧既省掉
+    // 每个二级帧多付的模板匹配开销，也顺手降低了误报面。
+    RectConfig {
+        x: 1740,
+        y: 1005,
+        width: 100,
+        height: 40,
+    }
 }
 
 fn default_world_wish_rect() -> RectConfig {
@@ -876,6 +908,8 @@ impl Default for ScreenConfig {
                 width: 65,
                 height: 55,
             },
+            main_menu_rect: default_main_menu_rect(),
+            hall_bar_rect: default_hall_bar_rect(),
             world_wish_rect: default_world_wish_rect(),
             hall_name_rect: RectConfig {
                 x: 75,
@@ -912,6 +946,8 @@ impl ScreenConfig {
             (self.friend_rect, "screen.friend_rect"),
             (self.secondary_back_rect, "screen.secondary_back_rect"),
             (self.secondary_hall_rect, "screen.secondary_hall_rect"),
+            (self.main_menu_rect, "screen.main_menu_rect"),
+            (self.hall_bar_rect, "screen.hall_bar_rect"),
             (self.world_wish_rect, "screen.world_wish_rect"),
             (self.hall_name_rect, "screen.hall_name_rect"),
             (self.hall_member_count_rect, "screen.hall_member_count_rect"),
@@ -1337,6 +1373,14 @@ pub struct TemplateConfig {
     pub friend: PathBuf,
     pub secondary_back: PathBuf,
     pub secondary_hall: PathBuf,
+    /// 千星奇域主菜单右下角的「返回提瓦特」按钮。命中即判定当前在奇域主菜单，
+    /// 用来挡住 secondary_back 在 ESC 菜单上的误判（见 docs/ui-state-machine.md §44）。
+    #[serde(default = "default_main_menu_template")]
+    pub main_menu: PathBuf,
+    /// 千星大厅底栏的 👥 O 图标组。提瓦特底栏只有一个 Enter，没有这一组，
+    /// 所以它能把"提瓦特的世界聊天气泡"和"千星聊天标记"区分开（§47）。
+    #[serde(default = "default_hall_bar_template")]
+    pub hall_bar: PathBuf,
     #[serde(default = "default_world_wish_template")]
     pub world_wish: PathBuf,
     pub invite_view_star: PathBuf,
@@ -1355,6 +1399,14 @@ fn default_world_wish_template() -> PathBuf {
     PathBuf::from("deps/assets/world-wish.png")
 }
 
+fn default_main_menu_template() -> PathBuf {
+    PathBuf::from("deps/assets/ui-main-menu-return.png")
+}
+
+fn default_hall_bar_template() -> PathBuf {
+    PathBuf::from("deps/assets/ui-hall-bar.png")
+}
+
 impl Default for TemplateConfig {
     fn default() -> Self {
         // 模板路径默认使用发布布局 deps/assets/，文件名与
@@ -1367,6 +1419,8 @@ impl Default for TemplateConfig {
             friend: PathBuf::from("deps/assets/ui-primary-friend.png"),
             secondary_back: PathBuf::from("deps/assets/ui-secondary-back.png"),
             secondary_hall: PathBuf::from("deps/assets/ui-secondary-hall.png"),
+            main_menu: default_main_menu_template(),
+            hall_bar: default_hall_bar_template(),
             world_wish: default_world_wish_template(),
             invite_view_star: PathBuf::from("deps/assets/invite-view-star.png"),
             invite_goto_hall: PathBuf::from("deps/assets/invite-goto-hall.png"),

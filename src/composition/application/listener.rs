@@ -1126,7 +1126,8 @@ impl ApplicationRuntime {
                                     UiStateKind::GameGate
                                     | UiStateKind::Overworld
                                     | UiStateKind::MainMenu
-                                    | UiStateKind::Loading,
+                                    | UiStateKind::Loading
+                                    | UiStateKind::Panel,
                                 ),
                             )) => {
                                 primary_visible = false;

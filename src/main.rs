@@ -25,6 +25,27 @@ fn config_reload_exit_requires_startup(code: Option<i32>) -> bool {
 #[cfg(target_os = "windows")]
 const DEFAULT_WATCHDOG_RESTART_MS: u64 = 2000;
 
+/// 连续快速失败时的重启间隔上限：避免子进程立即崩溃时无退避重启刷屏。
+#[cfg(target_os = "windows")]
+const WATCHDOG_MAX_BACKOFF_MS: u64 = 60_000;
+
+/// 子进程运行满该时长即视为健康，清零退避计数，防止偶发崩溃后长期慢速重启。
+#[cfg(target_os = "windows")]
+const WATCHDOG_HEALTHY_RUN_MS: u64 = 60_000;
+
+/// 第 `consecutive_failures` 次连续快速失败后的重启等待时间：
+/// 以 `base_ms` 为底数指数退避（1x、2x、4x…），封顶 [`WATCHDOG_MAX_BACKOFF_MS`]。
+#[cfg(target_os = "windows")]
+fn watchdog_backoff_ms(base_ms: u64, consecutive_failures: u32) -> u64 {
+    if consecutive_failures == 0 {
+        return base_ms.min(WATCHDOG_MAX_BACKOFF_MS);
+    }
+    let shift = consecutive_failures.saturating_sub(1).min(16);
+    base_ms
+        .saturating_mul(1u64 << shift)
+        .min(WATCHDOG_MAX_BACKOFF_MS)
+}
+
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct WatchdogChildHandoff {
@@ -102,7 +123,7 @@ fn latch_replacement_ready(latched: bool, path: &std::path::Path) -> bool {
 fn main() -> anyhow::Result<std::process::ExitCode> {
     use std::process::Command;
     use std::thread::sleep;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
@@ -154,6 +175,12 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         Err(_) => None,
     };
 
+    if !config_path.is_file() {
+        eprintln!(
+            "未找到配置文件 {}。请将发布包中的 config.yaml 放到主程序 EXE 同目录后再启动。",
+            config_path.display()
+        );
+    }
     let mut next_child_handoff = WatchdogChildHandoff::default();
     let mut cached_restart_ms = miliastra_wonderland_music::watchdog_restart_ms(&config_path)
         .unwrap_or_else(|error| {
@@ -162,19 +189,23 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             );
             DEFAULT_WATCHDOG_RESTART_MS
         });
+    let mut consecutive_failures: u32 = 0;
     loop {
         let handoff = next_child_handoff;
         let ready_file = handoff.config_reload.then(replacement_ready_file);
         let mut command = Command::new(&current_exe);
         configure_watchdog_child(&mut command, &config_path, handoff, ready_file.as_deref());
+        let child_started = Instant::now();
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let delay_ms = watchdog_backoff_ms(cached_restart_ms, consecutive_failures);
                 eprintln!(
-                    "启动监听子进程失败，将在 {cached_restart_ms}ms 后重试: {}: {error:#}",
+                    "启动监听子进程失败，将在 {delay_ms}ms 后重试: {}: {error:#}",
                     current_exe.display()
                 );
-                sleep(Duration::from_millis(cached_restart_ms));
+                sleep(Duration::from_millis(delay_ms));
                 continue;
             }
         };
@@ -209,17 +240,26 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         if status.success() {
             return Ok(std::process::ExitCode::SUCCESS);
         }
+        // 运行足够久再退出视为健康，清零退避，避免偶发崩溃后长期慢速重启。
+        if child_started.elapsed() >= Duration::from_millis(WATCHDOG_HEALTHY_RUN_MS) {
+            consecutive_failures = 0;
+        }
         next_child_handoff =
             WatchdogChildHandoff::after_exit(handoff, status.code(), replacement_ready);
+        if next_child_handoff.config_reload && is_config_reload_exit(status.code()) {
+            // 主动配置重载：立即重启新进程，不进入退避。
+            consecutive_failures = 0;
+            eprintln!("监听子进程已完成配置重载关停，立即重新启动");
+            continue;
+        }
+
+        consecutive_failures = consecutive_failures.saturating_add(1);
         if next_child_handoff.config_reload {
-            if is_config_reload_exit(status.code()) {
-                eprintln!("监听子进程已完成配置重载关停，立即重新启动");
-            } else {
-                eprintln!(
-                    "配置重载替代进程尚未 ready，继续使用热启动路径；{cached_restart_ms}ms 后重试"
-                );
-                sleep(Duration::from_millis(cached_restart_ms));
-            }
+            let delay_ms = watchdog_backoff_ms(cached_restart_ms, consecutive_failures);
+            eprintln!(
+                "配置重载替代进程尚未 ready，继续使用热启动路径；{delay_ms}ms 后重试"
+            );
+            sleep(Duration::from_millis(delay_ms));
             continue;
         }
 
@@ -229,8 +269,9 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 eprintln!("读取最新看门狗重启间隔失败，继续使用 {cached_restart_ms}ms: {error:#}")
             }
         }
-        eprintln!("监听子进程异常退出: status={status}，{cached_restart_ms}ms 后重启");
-        sleep(Duration::from_millis(cached_restart_ms));
+        let delay_ms = watchdog_backoff_ms(cached_restart_ms, consecutive_failures);
+        eprintln!("监听子进程异常退出: status={status}，{delay_ms}ms 后重启");
+        sleep(Duration::from_millis(delay_ms));
     }
 }
 
@@ -242,8 +283,25 @@ mod tests {
 
     use super::{
         WatchdogChildHandoff, configure_watchdog_child, is_config_reload_exit,
-        latch_replacement_ready, replacement_is_ready,
+        latch_replacement_ready, replacement_is_ready, watchdog_backoff_ms,
     };
+
+    #[test]
+    fn watchdog_backoff_grows_exponentially_then_caps() {
+        assert_eq!(watchdog_backoff_ms(2000, 0), 2000);
+        assert_eq!(watchdog_backoff_ms(2000, 1), 2000);
+        assert_eq!(watchdog_backoff_ms(2000, 2), 4000);
+        assert_eq!(watchdog_backoff_ms(2000, 3), 8000);
+        assert_eq!(watchdog_backoff_ms(2000, 6), 60_000);
+        assert_eq!(watchdog_backoff_ms(2000, 1_000_000), 60_000);
+    }
+
+    #[test]
+    fn watchdog_backoff_stays_bounded_and_failure_free() {
+        assert_eq!(watchdog_backoff_ms(0, 5), 0);
+        assert_eq!(watchdog_backoff_ms(120_000, 1), 60_000);
+        assert_eq!(watchdog_backoff_ms(u64::MAX, 3), 60_000);
+    }
 
     #[test]
     fn watchdog_only_treats_the_reserved_code_as_a_configuration_reload() {

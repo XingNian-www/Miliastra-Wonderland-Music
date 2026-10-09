@@ -627,7 +627,10 @@ mod tests {
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
         config.timing.workflow.default_timeout_ms = 2_000;
-        config.timing.workflow.default_poll_ms = 1;
+        // 轮询间隔是"次数上限 = 超时/间隔"的分母：真帧下每轮要跑一次分类，间隔取 1ms
+        // 会把上限放大到 2000 次——一旦某轮不收敛就变成长时间空转（曾表现为"用例卡住"）。
+        // 取 20ms 既有界（最多 100 次）又仍远快于真实节奏。
+        config.timing.workflow.default_poll_ms = 20;
         config.timing.command.ui_timeout_ms = 2_000;
         let state = Arc::new(Mutex::new(InviteTestState {
             phase: InvitePhase::Hall,
@@ -748,12 +751,14 @@ mod tests {
             &config.templates.invite_enter_hall,
             config.invite.enter_hall_region,
         );
-        let mut primary =
-            DynamicImage::new_rgba8(config.screen.expected_width, config.screen.expected_height);
-        place_template(
-            &mut primary,
-            &config.templates.friend,
-            config.screen.friend_rect,
+        // 一级帧用**真实千星大厅**：合成黑底帧会被状态机的 `loading` 判据吞掉
+        // （`src/ui/state.rs` 第 55 节），代表不了真实执行路径。
+        let primary = image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg")
+            .expect("打开真实大厅帧失败");
+        assert_eq!(
+            (primary.width(), primary.height()),
+            (config.screen.expected_width, config.screen.expected_height),
+            "真实大厅帧尺寸必须与配置画布一致"
         );
         let frames = HashMap::from([
             (InvitePhase::Hall, secondary.clone()),
@@ -767,36 +772,29 @@ mod tests {
     }
 
     fn secondary_frame(config: &AppConfig) -> (DynamicImage, (i32, i32)) {
-        let mut frame =
-            DynamicImage::new_rgba8(config.screen.expected_width, config.screen.expected_height);
-        place_template(
-            &mut frame,
-            &config.templates.secondary_back,
-            config.screen.secondary_back_rect,
+        // 二级帧用**真实私聊截图**：合成黑底帧会被 `loading` 判据吞掉（第 55 节）。
+        // 真实帧上已有返回按钮，状态机会按真实界面判成 `Secondary`。
+        let frame = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
+            .expect("打开真实二级帧失败");
+        assert_eq!(
+            (frame.width(), frame.height()),
+            (config.screen.expected_width, config.screen.expected_height),
+            "真实二级帧尺寸必须与配置画布一致"
         );
-        let avatar = Rect::new(302, 204, 88, 88);
-        let center = avatar.center();
-        draw_avatar(&mut frame, avatar);
-        fill_rect(
-            &mut frame,
-            Rect::new(410, 240, 190, 60),
-            Rgba([62, 71, 89, 255]),
-        );
-        (frame, (center.x, center.y))
-    }
-
-    fn draw_avatar(frame: &mut DynamicImage, rect: Rect) {
-        let center = rect.center();
-        let radius_squared = (rect.width as i32 / 2 - 4).pow(2);
-        for y in rect.y..rect.bottom() {
-            for x in rect.x..rect.right() {
-                let dx = x - center.x;
-                let dy = y - center.y;
-                if dx * dx + dy * dy <= radius_squared {
-                    frame.put_pixel(x as u32, y as u32, Rgba([220, 220, 220, 255]));
-                }
-            }
-        }
+        // 例程点的是**画面最下方**的来消息头像（`click_current_friend_avatar` 取
+        // `max_by_key(avatar_rect().y)`），所以这里必须把设备里"该点哪个头像"设成
+        // **同一张真帧上检测出来的那个点**；再自己画一个头顶像对不上，点击会被判成
+        // 没点中，相位不切换，后续按钮全都找不到（曾把它表现成"用例卡住"）。
+        let (x, y) = secondary_hall_bubbles(&frame)
+            .expect("检测真实二级帧的来消息头像失败")
+            .into_iter()
+            .max_by_key(|bubble| bubble.avatar_rect().y)
+            .map(|bubble| {
+                let center = bubble.avatar_rect().center();
+                (center.x, center.y)
+            })
+            .expect("真实二级帧里应当有来消息头像");
+        (frame, (x, y))
     }
 
     fn fill_rect(frame: &mut DynamicImage, rect: Rect, color: Rgba<u8>) {

@@ -127,7 +127,7 @@ use crate::ui::routines::{
     StartupUiConfig, StartupUiTemplates, ToggleMicrophone, ToggleMicrophoneEffect,
     UiResidencyOutcome, UiResidencyTarget,
 };
-use crate::ui::state::{ResolvedUiTemplateArgs, TemplateUiStateClassifier, UiTemplateArgs};
+use crate::ui::state::{PanelRegions, ResolvedUiTemplateArgs, TemplateUiStateClassifier, UiTemplateArgs};
 use crate::ui::template::{best_template_hit, find_template_hits};
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
@@ -1388,7 +1388,16 @@ impl ApplicationRuntime {
                     ocr.clone(),
                     config.startup.enter_game_text_region.into(),
                     ui_state_stable_count,
-                );
+                )
+                .with_panel_regions(PanelRegions {
+                    friend_panel: config.moderation.friend_panel_region.into(),
+                    friend_search_panel: config.moderation.search_panel_region.into(),
+                    friend_block_chat: config.moderation.block_chat_region.into(),
+                    friend_confirm: config.moderation.confirm_region.into(),
+                    invite_view_star: config.invite.view_star_region.into(),
+                    invite_goto_hall: config.invite.goto_hall_region.into(),
+                    invite_enter_hall: config.invite.enter_hall_region.into(),
+                });
         let ui_runtime = UiRuntime::start_with_progress_and_state_classifier(
             WindowsUiDevice::new(config.window.clone()),
             UI_RUNTIME_QUEUE_CAPACITY,

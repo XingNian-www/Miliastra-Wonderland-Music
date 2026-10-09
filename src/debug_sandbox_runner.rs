@@ -154,6 +154,8 @@ pub(crate) enum SandboxUiStateKind {
     GameGate,
     Overworld,
     Loading,
+    /// 游戏内模态面板覆盖层（好友面板、档案卡、确认弹窗等）。见 `UiStateKind::Panel`。
+    Panel,
     Unknown,
 }
 
@@ -166,6 +168,7 @@ impl SandboxUiStateKind {
             Self::GameGate => "game_gate",
             Self::Overworld => "overworld",
             Self::Loading => "loading",
+            Self::Panel => "panel",
             Self::Unknown => "unknown",
         }
     }
@@ -180,6 +183,7 @@ impl From<UiStateKind> for SandboxUiStateKind {
             UiStateKind::GameGate => Self::GameGate,
             UiStateKind::Overworld => Self::Overworld,
             UiStateKind::Loading => Self::Loading,
+            UiStateKind::Panel => Self::Panel,
             UiStateKind::Unknown => Self::Unknown,
         }
     }

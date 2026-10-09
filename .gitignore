@@ -1,7 +1,9 @@
 # 默认忽略根目录中的新内容，只开放下列项目目录。
 /*
 
-# 源码、构建、测试、资源和公开使用文档。
+# 源码、构建、资源和公开使用文档。
+# 注意:测试内容(含 tests/ 全部夹具)与技术分析文档仅保留在本地,
+# 不进 GitHub——GitHub 只保留编译所需代码及使用文档。
 !/.cargo/
 !/.github/
 !/assets/
@@ -10,8 +12,21 @@
 !/examples/
 !/scripts/
 !/src/
-!/tests/
 !/vendor/
+
+# 技术性/过程性文档仅本地保留(使用文档仍在 docs/ 内跟踪)。
+/docs/archive/
+/docs/architecture-review.md
+/docs/debug-sandbox.md
+/docs/debug-sandbox-flow-audit.md
+/docs/debug-sandbox-live-commands.md
+/docs/game-state-map.md
+/docs/game-state-roundtrip.md
+/docs/template-matching-audit.md
+/docs/ui-state-criteria.md
+/docs/ui-state-machine.md
+/docs/ui-state-transitions.md
+/docs/ui-state-transitions.json
 
 # 根目录中随项目发布的必要文件。
 !/.gitattributes
@@ -47,3 +62,4 @@
 # docs/ui-state-transitions.json 里，每一处都注明了用到的帧名与来源目录。
 # 需要核对某一帧时，按文档里的采集方法（第 27 章的复现命令）重采即可。
 /docs/ui-state-evidence/
+/.bitfun/search/flashgrep-index/

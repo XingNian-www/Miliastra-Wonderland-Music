@@ -783,11 +783,11 @@ fn wait_for_primary(
             Ok(UiStateKind::Unknown) => unreachable!("unknown UI state is never stable"),
             // Loading 也归到失败：等待的稳定状态就是「到大厅了」，
             // 而稳定停在加载界面说明卡住了，不该被当成还没开始（§55）。
-            Ok(UiStateKind::GameGate | UiStateKind::Overworld | UiStateKind::Loading) => {
+            Ok(UiStateKind::GameGate | UiStateKind::Overworld | UiStateKind::Loading | UiStateKind::Panel) => {
                 Err(UiRoutineFailure::new(
                     InputCertainty::ConfirmedFailure,
                     "confirm_startup_primary",
-                    "game is still at the gate, loading, or in the overworld",
+                    "game is still at the gate, loading, in the overworld, or showing a modal panel",
                 ))
             }
             Err(failure) => Err(failure),
@@ -998,6 +998,8 @@ mod tests {
 
     struct PaimonOnlyDevice {
         frame: DynamicImage,
+        /// 按下 M 之后改用的真实帧（例如提瓦特地图）；None 表示画面不变。
+        after_m: Option<DynamicImage>,
         keys: Arc<Mutex<Vec<Key>>>,
     }
 
@@ -1011,6 +1013,11 @@ mod tests {
 
     impl UiDevice for PaimonOnlyDevice {
         fn capture(&mut self) -> Result<DynamicImage> {
+            if let Some(after_m) = &self.after_m {
+                if self.keys.lock().unwrap().contains(&Key::M) {
+                    return Ok(after_m.clone());
+                }
+            }
             Ok(self.frame.clone())
         }
 
@@ -1079,16 +1086,20 @@ mod tests {
         config.startup.wonderland_map_star_retries = 1;
         config.startup.wonderland_map_star_retry_ms = 1;
 
-        let mut frame = DynamicImage::new_rgba8(1920, 1080);
-        let paimon = image::open(&config.startup.templates.paimon_menu).unwrap();
-        frame
-            .copy_from(&paimon, 0, 0)
-            .expect("paimon template should fit in the primary region");
+        // 真实提瓦特大世界帧：派蒙图标天然在左上角，但没有千星家园模板。
+        // 按 M 之后切到真实提瓦特地图帧——地图上没有千星星标，
+        // 所以例程必须失败在 locate_wonderland_map_star。
+        let frame =
+            image::open("tests/fixtures/ui/overworld-teyvat-1920x1080.jpg")
+                .expect("打开真实提瓦特帧失败");
+        let map = image::open("tests/fixtures/ui/map-teyvat-1920x1080.png")
+            .expect("打开真实提瓦特地图帧失败");
 
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = UiRuntime::start(
             PaimonOnlyDevice {
                 frame,
+                after_m: Some(map),
                 keys: keys.clone(),
             },
             4,
@@ -1122,9 +1133,13 @@ mod tests {
         let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let config = test_startup_config(&app);
         let keys = Arc::new(Mutex::new(Vec::new()));
+        // 真实过场（暗色加载屏）帧：游戏还在加载，既没有"点击进入"文案，
+        // 也没有大世界顶栏锚点——"界面已变化"的真实形态，两个自动进入动作都必须跳过。
         let ui_runtime = UiRuntime::start(
             PaimonOnlyDevice {
-                frame: DynamicImage::new_rgba8(1920, 1080),
+                frame: image::open("tests/fixtures/ui/loading-dark-1920x1080.jpg")
+                    .expect("打开真实过场帧失败"),
+                after_m: None,
                 keys: keys.clone(),
             },
             4,
@@ -1157,18 +1172,15 @@ mod tests {
         let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let mut config = test_startup_config(&app);
         config.startup.enter_game = true;
-        let mut frame = DynamicImage::new_rgba8(1920, 1080);
-        frame
-            .copy_from(
-                &image::open(&config.startup.templates.paimon_menu).unwrap(),
-                0,
-                0,
-            )
-            .unwrap();
+        // 真实提瓦特大世界帧：进入游戏后的落地画面，派蒙图标在左上角。
+        let frame =
+            image::open("tests/fixtures/ui/overworld-teyvat-1920x1080.jpg")
+                .expect("打开真实提瓦特帧失败");
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = UiRuntime::start(
             PaimonOnlyDevice {
                 frame,
+                after_m: None,
                 keys: keys.clone(),
             },
             4,

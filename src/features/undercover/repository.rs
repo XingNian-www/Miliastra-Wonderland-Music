@@ -71,7 +71,7 @@ fn load_candidates(path: &Path, store: &dyn StateStore) -> Result<Vec<Undercover
     let text = store
         .read_to_string(path)
         .with_context(|| format!("读取谁是卧底词库失败: {}", path.display()))?;
-    let file: WordBankFile = serde_yaml::from_str(&text)
+    let file: WordBankFile = serde_norway::from_str(&text)
         .with_context(|| format!("解析谁是卧底词库失败: {}", path.display()))?;
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
@@ -115,7 +115,7 @@ fn load_used_pairs(path: &Path, store: &dyn StateStore) -> Result<HashSet<String
     let text = store
         .read_to_string(path)
         .with_context(|| format!("读取谁是卧底永久使用记录失败: {}", path.display()))?;
-    let file: UsedPairFile = serde_yaml::from_str(&text)
+    let file: UsedPairFile = serde_norway::from_str(&text)
         .with_context(|| format!("解析谁是卧底永久使用记录失败: {}", path.display()))?;
     Ok(file
         .pairs
@@ -134,7 +134,7 @@ fn save_used_pairs(path: &Path, keys: &HashSet<String>, store: &dyn StateStore) 
         .collect::<Vec<_>>();
     pairs.sort();
     let text =
-        serde_yaml::to_string(&UsedPairFile { pairs }).context("序列化谁是卧底永久使用记录失败")?;
+        serde_norway::to_string(&UsedPairFile { pairs }).context("序列化谁是卧底永久使用记录失败")?;
     store.write_atomic(path, text.as_bytes(), "谁是卧底记录")
 }
 

@@ -341,7 +341,7 @@ impl BootstrapConfig {
         const BOOTSTRAP_ONLY_HINT: &str = "config.yaml 只允许 database_path、http、logging 三个引导段，其余配置请通过 Web 面板「配置中心」管理";
         let text = fs::read_to_string(path)
             .with_context(|| format!("读取启动配置失败: {}", path.display()))?;
-        let mut bootstrap: BootstrapConfig = serde_yaml::from_str(&text).with_context(|| {
+        let mut bootstrap: BootstrapConfig = serde_norway::from_str(&text).with_context(|| {
             format!(
                 "解析启动配置失败: {}。{BOOTSTRAP_ONLY_HINT}",
                 path.display()
@@ -352,7 +352,7 @@ impl BootstrapConfig {
         }
         if bootstrap.http.access_token.trim().is_empty() {
             bootstrap.http.access_token = uuid::Uuid::new_v4().simple().to_string();
-            let serialized = serde_yaml::to_string(&bootstrap).context("序列化启动配置失败")?;
+            let serialized = serde_norway::to_string(&bootstrap).context("序列化启动配置失败")?;
             write_atomic(path, serialized.as_bytes(), "启动配置")
                 .with_context(|| format!("写入自动生成的访问令牌失败: {}", path.display()))?;
         }
@@ -610,7 +610,7 @@ impl AppConfig {
                 path.display()
             )
         })?;
-        serde_yaml::from_str(&text).with_context(|| format!("解析配置失败: {}", path.display()))
+        serde_norway::from_str(&text).with_context(|| format!("解析配置失败: {}", path.display()))
     }
 
     /// 仅测试：从完整 YAML 加载并解析相对路径。
@@ -835,6 +835,10 @@ pub struct ScreenConfig {
     pub hall_bar_rect: RectConfig,
     #[serde(default = "default_world_wish_rect")]
     pub world_wish_rect: RectConfig,
+    /// 派蒙菜单专属锚点的搜索区：「商城」袋状图标本体（约 x 158..238, y 364..444）。
+    /// 只在这个菜单出现，用来把派蒙菜单从"圆形返回按钮命中的二级"里摘出来。
+    #[serde(default = "default_paimon_menu_rect")]
+    pub paimon_menu_rect: RectConfig,
     pub hall_name_rect: RectConfig,
     pub hall_member_count_rect: RectConfig,
     pub hall_time_rect: RectConfig,
@@ -875,6 +879,19 @@ fn default_world_wish_rect() -> RectConfig {
     }
 }
 
+fn default_paimon_menu_rect() -> RectConfig {
+    // 模板是「商城」的**袋状图标本体**（80×80，高对比、信息密度高），只给 ±6px 余量。
+    // **必须收紧到图标本身**：模板匹配是 1:1 SAD，代价 ≈ 区域位置数 × 模板像素数。
+    // 早先用 596×140 的整行瓦片 + 640×175 区域，debug 下单帧要 ~1.2s；即便收到整块瓦片
+    // （143×128）也比图标大一倍多，而瓦片里大半是纯色底——那部分像素只花时间、不提供信息。
+    RectConfig {
+        x: 152,
+        y: 358,
+        width: 92,
+        height: 92,
+    }
+}
+
 impl Default for ScreenConfig {
     fn default() -> Self {
         // 默认值与 WindowConfig 的 1920x1080 一致，区域沿用完整配置模板
@@ -911,6 +928,7 @@ impl Default for ScreenConfig {
             main_menu_rect: default_main_menu_rect(),
             hall_bar_rect: default_hall_bar_rect(),
             world_wish_rect: default_world_wish_rect(),
+            paimon_menu_rect: default_paimon_menu_rect(),
             hall_name_rect: RectConfig {
                 x: 75,
                 y: 425,
@@ -949,6 +967,7 @@ impl ScreenConfig {
             (self.main_menu_rect, "screen.main_menu_rect"),
             (self.hall_bar_rect, "screen.hall_bar_rect"),
             (self.world_wish_rect, "screen.world_wish_rect"),
+            (self.paimon_menu_rect, "screen.paimon_menu_rect"),
             (self.hall_name_rect, "screen.hall_name_rect"),
             (self.hall_member_count_rect, "screen.hall_member_count_rect"),
             (self.hall_time_rect, "screen.hall_time_rect"),
@@ -1392,7 +1411,15 @@ pub struct TemplateConfig {
     pub friend_block_chat: PathBuf,
     pub friend_blacklist: PathBuf,
     pub friend_confirm: PathBuf,
+    /// 提瓦特派蒙菜单（ESC 系统菜单）的**专属锚点**：「商城」的袋状图标本体（80×80）。
+    /// 圆形返回按钮与二级聊天共用，只靠它会把这个菜单误判成二级（见 `ui/state.rs`）。
+    #[serde(default = "default_paimon_menu_panel_template")]
+    pub paimon_menu_panel: PathBuf,
     pub marker_threshold: f32,
+}
+
+fn default_paimon_menu_panel_template() -> PathBuf {
+    PathBuf::from("deps/assets/ui-paimon-menu-panel.png")
 }
 
 fn default_world_wish_template() -> PathBuf {
@@ -1431,6 +1458,7 @@ impl Default for TemplateConfig {
             friend_block_chat: PathBuf::from("deps/assets/friend-block-chat.png"),
             friend_blacklist: PathBuf::from("deps/assets/friend-blacklist.png"),
             friend_confirm: PathBuf::from("deps/assets/friend-confirm.png"),
+            paimon_menu_panel: default_paimon_menu_panel_template(),
             marker_threshold: 0.9,
         }
     }
@@ -1456,6 +1484,7 @@ impl TemplateConfig {
             (&self.friend_block_chat, "templates.friend_block_chat"),
             (&self.friend_blacklist, "templates.friend_blacklist"),
             (&self.friend_confirm, "templates.friend_confirm"),
+            (&self.paimon_menu_panel, "templates.paimon_menu_panel"),
         ] {
             validate_nonempty_path(path, field)?;
         }
@@ -1804,7 +1833,7 @@ mod tests {
     type ConfigMutation = (&'static str, fn(&mut AppConfig));
 
     fn playback_timing(yaml: &str) -> PlaybackTimingConfig {
-        serde_yaml::from_str(yaml).expect("valid playback timing config")
+        serde_norway::from_str(yaml).expect("valid playback timing config")
     }
 
     #[test]
@@ -1827,7 +1856,7 @@ stale_timeout_ms: 5000
 
     #[test]
     fn playback_observation_rejects_zero_stale_timeout() {
-        let error = serde_yaml::from_str::<PlaybackTimingConfig>(
+        let error = serde_norway::from_str::<PlaybackTimingConfig>(
             r#"
 status_poll_ms: 1000
 monitor_tick_ms: 200
@@ -1877,7 +1906,7 @@ stale_timeout_ms: 7500
     #[test]
     fn app_config_builds_the_complete_player_runtime_config_once() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default app config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default app config");
         config.stability.default_count = 6;
         config.timing.playback.uri_stable_samples = 4;
         config.timing.playback.transport_stable_samples = 1;
@@ -1917,7 +1946,7 @@ stale_timeout_ms: 7500
     #[test]
     fn default_app_config_passes_startup_validation() {
         let config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
 
         config.validate().expect("default config is valid");
     }
@@ -1950,7 +1979,7 @@ stale_timeout_ms: 7500
 
     /// 直接解析发布模板，避免测试读取或改写本机启动配置。
     fn bootstrap_config_yaml() -> BootstrapConfig {
-        serde_yaml::from_str(include_str!("../../config.example.yaml"))
+        serde_norway::from_str(include_str!("../../config.example.yaml"))
             .expect("解析发布启动配置模板")
     }
 
@@ -1965,8 +1994,8 @@ stale_timeout_ms: 7500
         assert!(bootstrap.http.access_token.is_empty());
         assert!(bootstrap.http.validate().is_err());
         assert_eq!(
-            serde_yaml::to_value(&bootstrap.logging).expect("序列化 logging 段"),
-            serde_yaml::to_value(&defaults.logging).expect("序列化默认 logging 段"),
+            serde_norway::to_value(&bootstrap.logging).expect("序列化 logging 段"),
+            serde_norway::to_value(&defaults.logging).expect("序列化默认 logging 段"),
             "发布模板的 logging 段必须与 AppConfig::default() 一致"
         );
     }
@@ -1977,7 +2006,7 @@ stale_timeout_ms: 7500
         fs::create_dir_all(&root).unwrap();
         let mut previous_token = String::new();
         for omit_token in [false, true] {
-            let mut value = serde_yaml::to_value(bootstrap_config_yaml()).unwrap();
+            let mut value = serde_norway::to_value(bootstrap_config_yaml()).unwrap();
             if omit_token {
                 value["http"]
                     .as_mapping_mut()
@@ -1985,7 +2014,7 @@ stale_timeout_ms: 7500
                     .remove("access_token");
             }
             let config_path = root.join("config.yaml");
-            fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
+            fs::write(&config_path, serde_norway::to_string(&value).unwrap()).unwrap();
             let bootstrap = BootstrapConfig::load(&config_path, &root).unwrap();
             bootstrap.http.validate().unwrap();
             assert!(uuid::Uuid::parse_str(&bootstrap.http.access_token).is_ok());
@@ -1993,7 +2022,7 @@ stale_timeout_ms: 7500
             let reloaded = BootstrapConfig::load(&config_path, &root).unwrap();
             assert_eq!(bootstrap.http.access_token, reloaded.http.access_token);
             let persisted: BootstrapConfig =
-                serde_yaml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+                serde_norway::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
             assert!(persisted.database_path.is_relative());
             previous_token = bootstrap.http.access_token;
         }
@@ -2004,7 +2033,7 @@ stale_timeout_ms: 7500
     fn runtime_paths_resolve_against_the_executable_root_and_preserve_absolute_paths() {
         let root = Path::new(r"C:\发布目录");
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("默认配置应可解析");
+            serde_norway::from_str(bundled_config_yaml()).expect("默认配置应可解析");
         config.ocr.openvino.det_model = Some(PathBuf::from("models/det.xml"));
         config.ocr.openvino.det_weights = Some(PathBuf::from("models/det.bin"));
         config.ocr.openvino.rec_model = Some(PathBuf::from("models/rec.xml"));
@@ -2106,7 +2135,7 @@ stale_timeout_ms: 7500
     #[test]
     fn empty_optional_runtime_path_stays_empty() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("默认配置应可解析");
+            serde_norway::from_str(bundled_config_yaml()).expect("默认配置应可解析");
         config.startup.exe_path = PathBuf::new();
 
         config.resolve_runtime_paths(Path::new(r"C:\发布目录"));
@@ -2117,7 +2146,7 @@ stale_timeout_ms: 7500
     #[test]
     fn default_direction_workflows_click_middle_before_every_direction_key() {
         let config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
 
         let workflows = &config.custom_workflows.workflows;
         let direction_start = workflows
@@ -2213,7 +2242,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_rejects_an_empty_target_process() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
         config.window.target_process = " \t ".to_string();
 
         let error = config
@@ -2226,7 +2255,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_rejects_a_zero_ai_request_timeout() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
         config.timing.external.ai_request_timeout_ms = 0;
 
         let error = config
@@ -2244,7 +2273,7 @@ stale_timeout_ms: 7500
     fn lyrics_lead_seconds_accepts_only_finite_values_from_zero_to_sixty() {
         for valid in [0.0, 1.5, miliastra_playback::MAX_LYRICS_LEAD_SECONDS] {
             let mut config: AppConfig =
-                serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+                serde_norway::from_str(bundled_config_yaml()).expect("default config");
             config.timing.playback.lyrics_lead_seconds = valid;
             config.validate().expect("valid lyrics lead seconds");
         }
@@ -2257,7 +2286,7 @@ stale_timeout_ms: 7500
             miliastra_playback::MAX_LYRICS_LEAD_SECONDS + 0.001,
         ] {
             let mut config: AppConfig =
-                serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+                serde_norway::from_str(bundled_config_yaml()).expect("default config");
             config.timing.playback.lyrics_lead_seconds = invalid;
             let error = config
                 .validate()
@@ -2278,7 +2307,7 @@ stale_timeout_ms: 7500
                 "lyrics_lead_seconds: 0.0",
                 &format!("lyrics_lead_seconds: {invalid}"),
             );
-            let error = serde_yaml::from_str::<AppConfig>(&yaml)
+            let error = serde_norway::from_str::<AppConfig>(&yaml)
                 .expect_err("non-numeric lyrics lead must be rejected");
             assert!(error.to_string().contains("lyrics_lead_seconds"));
         }
@@ -2286,15 +2315,15 @@ stale_timeout_ms: 7500
 
     #[test]
     fn missing_lyrics_lead_seconds_defaults_to_zero_for_existing_configurations() {
-        let mut value: serde_yaml::Value =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+        let mut value: serde_norway::Value =
+            serde_norway::from_str(bundled_config_yaml()).expect("default config value");
         value["timing"]["playback"]
             .as_mapping_mut()
             .expect("playback timing mapping")
-            .remove(serde_yaml::Value::String("lyrics_lead_seconds".to_string()));
+            .remove(serde_norway::Value::String("lyrics_lead_seconds".to_string()));
 
         let config: AppConfig =
-            serde_yaml::from_value(value).expect("existing config without lyric lead");
+            serde_norway::from_value(value).expect("existing config without lyric lead");
 
         assert_eq!(config.timing.playback.lyrics_lead_seconds, 0.0);
     }
@@ -2348,7 +2377,7 @@ stale_timeout_ms: 7500
 
         for (field, invalidate) in invalid_fields {
             let mut config: AppConfig =
-                serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+                serde_norway::from_str(bundled_config_yaml()).expect("default config");
             invalidate(&mut config);
 
             let error = config
@@ -2365,7 +2394,7 @@ stale_timeout_ms: 7500
     #[test]
     fn partial_kugou_device_information_is_rejected() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
         // 整体留空表示沿用已有 kugou-device.json。
         config.kugou = KugouDeviceConfig::default();
         config.validate().expect("empty device info is allowed");
@@ -2436,7 +2465,7 @@ stale_timeout_ms: 7500
 
         for (field, invalidate) in invalid_fields {
             let mut config: AppConfig =
-                serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+                serde_norway::from_str(bundled_config_yaml()).expect("default config");
             invalidate(&mut config);
 
             let error = config
@@ -2453,7 +2482,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_requires_openvino_ir_paths_when_selected() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
         config.ocr.backend_priority = vec!["openvino".to_string()];
         config.ocr.det_model = None;
         config.ocr.rec_model = None;
@@ -2475,7 +2504,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_requires_mnn_models_only_for_mnn_backends() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
         config.ocr.backend_priority = vec!["openvino".to_string()];
         config.ocr.det_model = None;
         config.ocr.rec_model = None;
@@ -2497,7 +2526,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_rejects_ui_geometry_outside_the_normalized_canvas() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
         config.invite.friend_chat_region.x = config.screen.expected_width as i32;
 
         let error = config
@@ -2510,7 +2539,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_rejects_an_empty_screen_region() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
         config.screen.chat_rect.width = 0;
 
         let error = config
@@ -2523,7 +2552,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_rejects_a_zero_startup_poll_interval() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
         config.startup.poll_ms = 0;
 
         let error = config
@@ -2536,7 +2565,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_rejects_invalid_thresholds_and_queue_capacity() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
 
         config.templates.marker_threshold = 1.1;
         assert!(config.validate().is_err());
@@ -2549,7 +2578,7 @@ stale_timeout_ms: 7500
     #[test]
     fn startup_validation_rejects_cross_field_feature_invariants() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default config");
         config.undercover.enabled = true;
         config.undercover.min_players = 10;
         config.undercover.max_players = 8;
@@ -2564,14 +2593,14 @@ stale_timeout_ms: 7500
         // 完整模板的核心段（非可拆段）删除后解析必须失败。
         // http/logging/state 由启动引导（BootstrapConfig）提供，允许缺失（走默认值）。
         for section in ["stability", "window", "timing", "output", "tui"] {
-            let mut value: serde_yaml::Value =
-                serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+            let mut value: serde_norway::Value =
+                serde_norway::from_str(bundled_config_yaml()).expect("default config value");
             value
                 .as_mapping_mut()
                 .expect("root mapping")
-                .remove(serde_yaml::Value::String(section.to_string()));
+                .remove(serde_norway::Value::String(section.to_string()));
 
-            let error = serde_yaml::from_value::<AppConfig>(value)
+            let error = serde_norway::from_value::<AppConfig>(value)
                 .expect_err("core top-level section must be required");
 
             assert!(
@@ -2580,8 +2609,8 @@ stale_timeout_ms: 7500
             );
         }
         // 完整模板必须包含全部可拆段（供发布脚本提取）。
-        let full: serde_yaml::Value =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+        let full: serde_norway::Value =
+            serde_norway::from_str(bundled_config_yaml()).expect("default config value");
         for section in [
             "screen",
             "ocr",
@@ -2667,24 +2696,24 @@ stale_timeout_ms: 7500
             "startup.templates.wonderland_map_star",
             "startup.templates.wonderland_confirm",
         ] {
-            let mut value: serde_yaml::Value =
-                serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+            let mut value: serde_norway::Value =
+                serde_norway::from_str(bundled_config_yaml()).expect("default config value");
             let segments = path.split('.').collect::<Vec<_>>();
             let mut parent = &mut value;
             for segment in &segments[..segments.len() - 1] {
                 parent = parent
                     .as_mapping_mut()
                     .expect("configuration path mapping")
-                    .get_mut(serde_yaml::Value::String((*segment).to_string()))
+                    .get_mut(serde_norway::Value::String((*segment).to_string()))
                     .expect("configuration path segment");
             }
             let field = segments.last().expect("configuration field");
             parent
                 .as_mapping_mut()
                 .expect("configuration field parent")
-                .remove(serde_yaml::Value::String((*field).to_string()));
+                .remove(serde_norway::Value::String((*field).to_string()));
 
-            let error = serde_yaml::from_value::<AppConfig>(value)
+            let error = serde_norway::from_value::<AppConfig>(value)
                 .expect_err("current configuration field must be required");
 
             assert!(
@@ -2696,8 +2725,8 @@ stale_timeout_ms: 7500
 
     #[test]
     fn http_proxy_fields_default_when_omitted_from_existing_config() {
-        let mut value: serde_yaml::Value =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+        let mut value: serde_norway::Value =
+            serde_norway::from_str(bundled_config_yaml()).expect("default config value");
         for path in [
             "song_review.provider.http_proxy",
             "ai.http_proxy",
@@ -2709,17 +2738,17 @@ stale_timeout_ms: 7500
                 parent = parent
                     .as_mapping_mut()
                     .expect("configuration path mapping")
-                    .get_mut(serde_yaml::Value::String((*segment).to_string()))
+                    .get_mut(serde_norway::Value::String((*segment).to_string()))
                     .expect("configuration path segment");
             }
             let field = segments.last().expect("configuration field");
             parent
                 .as_mapping_mut()
                 .expect("configuration field parent")
-                .remove(serde_yaml::Value::String((*field).to_string()));
+                .remove(serde_norway::Value::String((*field).to_string()));
         }
 
-        let config: AppConfig = serde_yaml::from_value(value)
+        let config: AppConfig = serde_norway::from_value(value)
             .expect("proxy fields are optional for existing configurations");
 
         assert!(config.ai.http_proxy.is_empty());
@@ -2730,7 +2759,7 @@ stale_timeout_ms: 7500
     #[test]
     fn player_fast_observation_interval_stays_below_low_normal_intervals() {
         let mut config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default app config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default app config");
 
         for (normal_ms, expected_fast) in [
             (300, Duration::from_millis(150)),
@@ -2754,7 +2783,7 @@ stale_timeout_ms: 7500
         assert_eq!(resolve_stability_count(1, 1), 2);
 
         let config: AppConfig =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default app config");
+            serde_norway::from_str(bundled_config_yaml()).expect("default app config");
         assert_eq!(config.stability.ui_state_count, 0);
         assert_eq!(config.stability.secondary_hall_count, 0);
         assert_eq!(
@@ -2769,7 +2798,7 @@ stale_timeout_ms: 7500
 
     #[test]
     fn removed_configuration_names_are_rejected() {
-        let screen = serde_yaml::from_str::<ScreenConfig>(
+        let screen = serde_norway::from_str::<ScreenConfig>(
             r#"
 expected_width: 1920
 expected_height: 1080
@@ -2788,7 +2817,7 @@ hall_member_list_rect: { x: 0, y: 0, width: 1, height: 1 }
         .expect_err("removed screen alias must be rejected");
         assert!(screen.to_string().contains("enter_rect"));
 
-        let templates = serde_yaml::from_str::<TemplateConfig>(
+        let templates = serde_norway::from_str::<TemplateConfig>(
             r#"
 blue_marker: blue.png
 yellow_marker: yellow.png
@@ -2812,20 +2841,20 @@ marker_threshold: 0.9
         .expect_err("removed template alias must be rejected");
         assert!(templates.to_string().contains("enter"));
 
-        let mut startup_value: serde_yaml::Value =
-            serde_yaml::from_str(bundled_config_yaml()).expect("default config value");
+        let mut startup_value: serde_norway::Value =
+            serde_norway::from_str(bundled_config_yaml()).expect("default config value");
         let startup = startup_value
             .get_mut("startup")
-            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(serde_norway::Value::as_mapping_mut)
             .expect("startup mapping");
-        startup.remove(serde_yaml::Value::String(
+        startup.remove(serde_norway::Value::String(
             "wonderland_map_star_retries".to_string(),
         ));
         startup.insert(
-            serde_yaml::Value::String("wonderland_home_retries".to_string()),
-            serde_yaml::Value::Number(120.into()),
+            serde_norway::Value::String("wonderland_home_retries".to_string()),
+            serde_norway::Value::Number(120.into()),
         );
-        let startup_error = serde_yaml::from_value::<AppConfig>(startup_value)
+        let startup_error = serde_norway::from_value::<AppConfig>(startup_value)
             .expect_err("removed Wonderland startup aliases must be rejected");
         assert!(
             startup_error
@@ -2834,11 +2863,11 @@ marker_threshold: 0.9
         );
     }
 
-    fn inline_audio_cache_mapping(config: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping {
+    fn inline_audio_cache_mapping(config: &mut serde_norway::Value) -> &mut serde_norway::Mapping {
         config
             .get_mut("playback")
             .and_then(|playback| playback.get_mut("audio_cache"))
-            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(serde_norway::Value::as_mapping_mut)
             .expect("内嵌音频缓存配置")
     }
 
@@ -2849,10 +2878,10 @@ marker_threshold: 0.9
         let directory =
             std::env::temp_dir().join(format!("config-cache-old-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
-        let value: serde_yaml::Value =
-            serde_yaml::from_str(bundled_config_yaml()).expect("完整配置");
+        let value: serde_norway::Value =
+            serde_norway::from_str(bundled_config_yaml()).expect("完整配置");
         let config_path = directory.join("config.yaml");
-        std::fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
+        std::fs::write(&config_path, serde_norway::to_string(&value).unwrap()).unwrap();
 
         let config = AppConfig::load_from_root(&config_path, &directory).expect("加载配置");
         let audio_cache = config.playback.audio_cache.expect("音频缓存配置");
@@ -2868,14 +2897,14 @@ marker_threshold: 0.9
         let directory =
             std::env::temp_dir().join(format!("config-cache-rej-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
-        let mut value: serde_yaml::Value =
-            serde_yaml::from_str(bundled_config_yaml()).expect("完整配置");
+        let mut value: serde_norway::Value =
+            serde_norway::from_str(bundled_config_yaml()).expect("完整配置");
         inline_audio_cache_mapping(&mut value).insert(
-            serde_yaml::Value::String("metadata_directory".to_string()),
-            serde_yaml::Value::String("deps/data".to_string()),
+            serde_norway::Value::String("metadata_directory".to_string()),
+            serde_norway::Value::String("deps/data".to_string()),
         );
         let config_path = directory.join("config.yaml");
-        std::fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
+        std::fs::write(&config_path, serde_norway::to_string(&value).unwrap()).unwrap();
 
         let error =
             AppConfig::load_from_root(&config_path, &directory).expect_err("必须拒绝未知字段");
@@ -2892,15 +2921,15 @@ marker_threshold: 0.9
         let directory =
             std::env::temp_dir().join(format!("config-cache-rel-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
-        let mut value: serde_yaml::Value =
-            serde_yaml::from_str(bundled_config_yaml()).expect("完整配置");
+        let mut value: serde_norway::Value =
+            serde_norway::from_str(bundled_config_yaml()).expect("完整配置");
         let audio_cache = inline_audio_cache_mapping(&mut value);
         audio_cache.insert(
-            serde_yaml::Value::String("directory".to_string()),
-            serde_yaml::Value::String("cache/audio".to_string()),
+            serde_norway::Value::String("directory".to_string()),
+            serde_norway::Value::String("cache/audio".to_string()),
         );
         let config_path = directory.join("config.yaml");
-        std::fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
+        std::fs::write(&config_path, serde_norway::to_string(&value).unwrap()).unwrap();
 
         let config = AppConfig::load_from_root(&config_path, &directory).expect("加载配置");
         let audio_cache = config.playback.audio_cache.expect("音频缓存配置");
@@ -2917,15 +2946,15 @@ marker_threshold: 0.9
         let absolute_root =
             std::env::temp_dir().join(format!("audio-cache-abs-{}", uuid::Uuid::new_v4()));
         let audio_directory = absolute_root.join("audio");
-        let mut value: serde_yaml::Value =
-            serde_yaml::from_str(bundled_config_yaml()).expect("完整配置");
+        let mut value: serde_norway::Value =
+            serde_norway::from_str(bundled_config_yaml()).expect("完整配置");
         let audio_cache = inline_audio_cache_mapping(&mut value);
         audio_cache.insert(
-            serde_yaml::Value::String("directory".to_string()),
-            serde_yaml::Value::String(audio_directory.to_string_lossy().into_owned()),
+            serde_norway::Value::String("directory".to_string()),
+            serde_norway::Value::String(audio_directory.to_string_lossy().into_owned()),
         );
         let config_path = directory.join("config.yaml");
-        std::fs::write(&config_path, serde_yaml::to_string(&value).unwrap()).unwrap();
+        std::fs::write(&config_path, serde_norway::to_string(&value).unwrap()).unwrap();
 
         let config = AppConfig::load_from_root(&config_path, &directory).expect("加载配置");
         let audio_cache = config.playback.audio_cache.expect("音频缓存配置");

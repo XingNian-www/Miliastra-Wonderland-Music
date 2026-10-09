@@ -76,7 +76,7 @@ impl TurtleSoupBankStore {
             enabled: submission.enabled,
         });
 
-        let text = serde_yaml::to_string(&WrappedQuestionBankRef {
+        let text = serde_norway::to_string(&WrappedQuestionBankRef {
             questions: &questions,
         })
         .context("序列化海龟汤题库失败")?;

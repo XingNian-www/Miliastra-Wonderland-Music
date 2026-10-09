@@ -19,7 +19,9 @@ use crate::runtime::ui::{
 use crate::ui::geometry::{Point, Rect, crop_canvas};
 #[cfg(test)]
 use crate::ui::template::best_template_hit;
-use crate::ui::template::{TemplateHit, best_template_candidate};
+use crate::ui::template::{
+    TemplateHit, best_template_candidate, best_template_candidate_downscaled,
+};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UiTemplateArgs {
@@ -42,6 +44,22 @@ pub(crate) struct ResolvedUiTemplateArgs {
     pub(crate) hall_bar_template: PathBuf,
     pub(crate) world_wish_template: PathBuf,
     pub(crate) chat_templates: ResolvedTemplateArgs,
+    /// 面板判据模板（好友面板 / 更多设置菜单 / 添加好友页 / 确认弹窗 /
+    /// 千星档案卡 · 大厅卡 · 头像弹窗）。取自 `moderation` / `invite` 配置，
+    /// 已在真实帧上逐个验证命中（见 dist/ui-flow/README.md）。
+    ///
+    /// 注意这里**没有** `friend_more_settings`（⋯）：它是共用 chrome，不是专属锚点，
+    /// 更多设置菜单改由 `friend_block_chat_template`（菜单内才有的 `屏蔽聊天`）判定。
+    pub(crate) friend_panel_template: PathBuf,
+    pub(crate) friend_search_panel_template: PathBuf,
+    pub(crate) friend_block_chat_template: PathBuf,
+    pub(crate) friend_confirm_template: PathBuf,
+    pub(crate) invite_view_star_template: PathBuf,
+    pub(crate) invite_goto_hall_template: PathBuf,
+    pub(crate) invite_enter_hall_template: PathBuf,
+    /// 提瓦特派蒙菜单（ESC 系统菜单）的专属锚点。它和二级聊天共用同一个圆形返回
+    /// 按钮，只靠返回按钮会把菜单误判成二级；这个「商城」图标只在该菜单出现。
+    pub(crate) paimon_menu_panel_template: PathBuf,
 }
 
 impl UiTemplateArgs {
@@ -69,6 +87,14 @@ impl UiTemplateArgs {
                 .unwrap_or_else(|| templates.hall_bar.clone()),
             world_wish_template: templates.world_wish.clone(),
             chat_templates: self.chat_templates.resolve(templates, ocr),
+            friend_panel_template: templates.friend_panel.clone(),
+            friend_search_panel_template: templates.friend_search_panel.clone(),
+            friend_block_chat_template: templates.friend_block_chat.clone(),
+            friend_confirm_template: templates.friend_confirm.clone(),
+            invite_view_star_template: templates.invite_view_star.clone(),
+            invite_goto_hall_template: templates.invite_goto_hall.clone(),
+            invite_enter_hall_template: templates.invite_enter_hall.clone(),
+            paimon_menu_panel_template: templates.paimon_menu_panel.clone(),
         }
     }
 }
@@ -146,6 +172,20 @@ impl UiState {
         }
     }
 
+    /// 提瓦特派蒙菜单（ESC 系统菜单）。它属于主菜单一族（`MainMenu`），
+    /// 但用**专属锚点**判定，因此证据里的规则名与奇域主菜单不同。
+    fn paimon_menu() -> Self {
+        Self {
+            state: UiStateKind::MainMenu,
+            blue_count: 0,
+            yellow_count: 0,
+            pink_count: 0,
+            secondary_visible: false,
+            friend_visible: false,
+            source: "paimon_menu",
+        }
+    }
+
     /// 加载界面。两种外观（黑底徽记 / 白底元素）都归到这一个状态，
     /// 具体是哪一种由证据里的 finalRule（loading_dark_screen / loading_white_screen）区分。
     fn loading() -> Self {
@@ -202,12 +242,28 @@ impl std::fmt::Display for UiState {
     }
 }
 
+/// 面板判据用到的区域（来自 `moderation` / `invite` 配置）。
+///
+/// 由 [`TemplateUiStateClassifier::with_panel_regions`] 注入；**未注入时面板判据不跑**，
+/// 行为与从前完全一致（因此现有 `new()` 调用点与测试零改动）。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PanelRegions {
+    pub(crate) friend_panel: Rect,
+    pub(crate) friend_search_panel: Rect,
+    pub(crate) friend_block_chat: Rect,
+    pub(crate) friend_confirm: Rect,
+    pub(crate) invite_view_star: Rect,
+    pub(crate) invite_goto_hall: Rect,
+    pub(crate) invite_enter_hall: Rect,
+}
+
 #[derive(Clone)]
 pub(crate) struct TemplateUiStateClassifier {
     templates: ResolvedUiTemplateArgs,
     screen: config::ScreenConfig,
     game_entry: Option<GameEntryDetection>,
     game_fallback: GameFallbackState,
+    panels: Option<PanelRegions>,
 }
 
 impl TemplateUiStateClassifier {
@@ -217,7 +273,14 @@ impl TemplateUiStateClassifier {
             screen,
             game_entry: None,
             game_fallback: GameFallbackState::new(2),
+            panels: None,
         }
+    }
+
+    /// 注入面板判据区域（好友面板 / 添加好友页 / 更多设置 / 屏蔽聊天 / 确认弹窗 / invite 三步）。
+    pub(crate) fn with_panel_regions(mut self, panels: PanelRegions) -> Self {
+        self.panels = Some(panels);
+        self
     }
 
     pub(crate) fn with_game_entry_detection(
@@ -307,16 +370,105 @@ impl TemplateUiStateClassifier {
             UiStateClassification::with_evidence(state.runtime_kind(), state.to_string(), evidence);
         if base.kind() != RuntimeUiStateKind::Unknown {
             self.game_fallback.reset();
-            return Ok(base);
+            // 面板叠在二级聊天之上时（例如头像弹窗），基础链只看到 secondary；
+            // 这里做一次面板细化，把它认出来。
+            return Ok(self.refine_panel(image).unwrap_or(base));
         }
-        self.game_fallback.observe_unknown(now, base, || {
+        let result = self.game_fallback.observe_unknown(now, base, || {
             probe_game_state(
                 image,
                 &self.templates,
                 &self.screen,
                 self.game_entry.as_ref(),
             )
-        })
+        })?;
+        Ok(self.refine_panel(image).unwrap_or(result))
+    }
+
+    /// 面板细化：好友面板 / 添加好友页 / 更多设置 / 确认弹窗 /
+    /// 千星档案卡 · 大厅卡 · 头像弹窗——这些界面的基础链判不出来（落 `Unknown`），
+    /// 或叠在二级聊天之上（`Secondary`），用**已配置且实测命中**的模板逐个确认。
+    ///
+    /// **锚点必须专属该面板**：`friend-more-settings`（⋯）是**共用 chrome**，
+    /// 在档案卡与⋯菜单上落在同一坐标（实测档案卡 0.992 甚至高于菜单 0.959），
+    /// 因此它**不是**任何面板的判据；更多设置菜单改用**只有菜单展开时才存在**的
+    /// `屏蔽聊天` 条目（实测 0.989，其它帧最高 0.854）。
+    ///
+    /// **顺序也参与判别**：大厅卡与档案卡都含一条深色通栏按钮，`进入该大厅`
+    /// （大厅卡 0.994）排在 `前往其大厅`（档案卡 0.962）之前，避免大厅卡被
+    /// `前往其大厅` 的暗按钮误命中（实测大厅卡 0.905）。
+    ///
+    /// **成本护栏**：便宜且特异的排前面、**命中即停**；大区域靠调用方收窄区域 +
+    /// 帧级短路摊薄（成本实测见 `dist/ui-flow/README.md`）。
+    fn refine_panel(&self, image: &DynamicImage) -> Option<UiStateClassification> {
+        let panels = self.panels.as_ref()?;
+        let threshold = self.templates.chat_templates.marker_threshold;
+        // 最后一个数字是**降采样倍数**：代价 ≈ 候选位置数 × 模板像素数，两个维度都除以
+        // `scale`，总代价降到约 `1/scale⁴`（4 即约 256×）。只给"大模板"降采样；小图标
+        // （friend-panel 49×35 / search 96×33）本身几乎免费，降采样反而把信息抹掉。
+        let cases: [(&str, &PathBuf, Rect, u32); 7] = [
+            (
+                "panel:friend_list",
+                &self.templates.friend_panel_template,
+                panels.friend_panel,
+                1,
+            ),
+            (
+                "panel:more_settings",
+                &self.templates.friend_block_chat_template,
+                panels.friend_block_chat,
+                4,
+            ),
+            (
+                "panel:add_friend",
+                &self.templates.friend_search_panel_template,
+                panels.friend_search_panel,
+                1,
+            ),
+            (
+                "panel:confirm_dialog",
+                &self.templates.friend_confirm_template,
+                panels.friend_confirm,
+                4,
+            ),
+            (
+                "panel:hall_card",
+                &self.templates.invite_enter_hall_template,
+                panels.invite_enter_hall,
+                4,
+            ),
+            (
+                "panel:archive_card",
+                &self.templates.invite_goto_hall_template,
+                panels.invite_goto_hall,
+                4,
+            ),
+            (
+                "panel:avatar_popup",
+                &self.templates.invite_view_star_template,
+                panels.invite_view_star,
+                4,
+            ),
+        ];
+        for (label, path, region, scale) in cases {
+            let candidate = match best_template_candidate_downscaled(image, Some(region), path, scale)
+            {
+                Ok(candidate) => candidate,
+                Err(_) => continue,
+            };
+            if candidate_matches(&candidate, threshold) {
+                return Some(UiStateClassification::with_evidence(
+                    RuntimeUiStateKind::Panel,
+                    label,
+                    UiStateEvidence::new(
+                        vec![template_probe(path, region, threshold, candidate.as_ref())],
+                        None,
+                        label,
+                    ),
+                ));
+            }
+        }
+        None
     }
 }
 
@@ -596,6 +748,35 @@ fn detect_ui_state_with_evidence(
                 UiStateEvidence::new(template_probes, None, "main_menu_template"),
             ));
         }
+        // 提瓦特派蒙菜单（ESC 系统菜单）也挂着**同一个**圆形返回按钮：右侧世界照常，
+        // 左侧换成功能宫格。用「商城」袋状图标作专属锚点，把它从二级聊天里摘出来。
+        // 与主菜单探针同层、同样只在返回按钮命中后才跑，不给常见路径加开销。
+        let paimon_region: Rect = screen.paimon_menu_rect.into();
+        let paimon_candidate = best_template_candidate(
+            image,
+            Some(paimon_region),
+            &templates.paimon_menu_panel_template,
+        )?;
+        let paimon_visible = candidate_matches(&paimon_candidate, threshold);
+        template_probes.push(template_probe(
+            &templates.paimon_menu_panel_template,
+            paimon_region,
+            threshold,
+            paimon_candidate.as_ref(),
+        ));
+        if paimon_visible {
+            let back_ms = elapsed_ms(back_started);
+            log::info!(target: "timing",
+                "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker=0ms state=paimon_menu",
+                elapsed_ms(started),
+                friend_ms,
+                back_ms
+            );
+            return Ok((
+                UiState::paimon_menu(),
+                UiStateEvidence::new(template_probes, None, "paimon_menu_panel_template"),
+            ));
+        }
         log::info!(target: "timing",
             "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker=0ms state=secondary_chat",
             elapsed_ms(started),
@@ -814,8 +995,8 @@ fn world_hud_distances(image: &DynamicImage) -> Option<(f32, f32, f32)> {
         return None;
     }
     let (rect, teyvat_ref, qianxing_ref) = parse_world_hud_ref()?;
-    let rgb = image.to_rgb8();
-    let (image_width, image_height) = rgb.dimensions();
+    let sampler = RgbSampler::new(image);
+    let (image_width, image_height) = sampler.dimensions();
     let width = rect.width as i32;
     let height = rect.height as i32;
     let count = (width * height) as f32;
@@ -823,7 +1004,7 @@ fn world_hud_distances(image: &DynamicImage) -> Option<(f32, f32, f32)> {
     let pixel = |x: i32, y: i32| -> [f32; 3] {
         let clamped_x = x.clamp(0, image_width as i32 - 1) as u32;
         let clamped_y = y.clamp(0, image_height as i32 - 1) as u32;
-        let p = rgb.get_pixel(clamped_x, clamped_y);
+        let p = sampler.pixel(clamped_x, clamped_y);
         [f32::from(p[0]), f32::from(p[1]), f32::from(p[2])]
     };
 
@@ -873,10 +1054,15 @@ fn world_hud_distances(image: &DynamicImage) -> Option<(f32, f32, f32)> {
         };
         for dy in -WORLD_HUD_SEARCH..=WORLD_HUD_SEARCH {
             for dx in -WORLD_HUD_SEARCH..=WORLD_HUD_SEARCH {
+                // 每个格点**只采样一次**，均值/偏差/参考三遍复用同一批样本。
+                // 此前三遍各采样一次，等于同一次比较里把最贵的采样做了三遍。
+                let sampled = windows
+                    .iter()
+                    .map(|window| sample(*window, dx, dy))
+                    .collect::<Vec<[f32; 3]>>();
                 // 第一遍：逐通道均值。
                 let mut sums = [0.0_f32; 3];
-                for window in &windows {
-                    let p = sample(*window, dx, dy);
+                for p in &sampled {
                     sums[0] += p[0];
                     sums[1] += p[1];
                     sums[2] += p[2];
@@ -884,8 +1070,7 @@ fn world_hud_distances(image: &DynamicImage) -> Option<(f32, f32, f32)> {
                 let means = [sums[0] / count, sums[1] / count, sums[2] / count];
                 // 第二遍：逐通道平均绝对偏差。
                 let mut deviations = [0.0_f32; 3];
-                for window in &windows {
-                    let p = sample(*window, dx, dy);
+                for p in &sampled {
                     deviations[0] += (p[0] - means[0]).abs();
                     deviations[1] += (p[1] - means[1]).abs();
                     deviations[2] += (p[2] - means[2]).abs();
@@ -898,8 +1083,7 @@ fn world_hud_distances(image: &DynamicImage) -> Option<(f32, f32, f32)> {
                 // 第三遍：与两组参考比。
                 let mut total_teyvat = 0.0_f32;
                 let mut total_qianxing = 0.0_f32;
-                for (index, window) in windows.iter().enumerate() {
-                    let p = sample(*window, dx, dy);
+                for (index, p) in sampled.iter().enumerate() {
                     for channel in 0..3 {
                         let deviation = if deviations[channel] > 1e-6 {
                             deviations[channel]
@@ -951,13 +1135,59 @@ fn world_hud_scale(image: &DynamicImage) -> Option<f32> {
 const FULL_FRAME_MIN_WIDTH: u32 = 1280;
 const FULL_FRAME_MIN_HEIGHT: u32 = 720;
 
+/// 稀疏采样探针共用的 RGB 取值器：RGB8/RGBA8 **直接取像素、不做整帧转换**；
+/// 其余色彩类型回退到一次性转换。
+///
+/// 整屏统计类判据（色调、青色带、千星地图色调）只采样几千个点，而原来的
+/// `to_rgb8()` 每次都要拷 200 万像素——那是这些判据里最贵的部分，且每帧重复多次。
+enum RgbSampler<'a> {
+    Borrowed(&'a image::RgbImage),
+    Rgba(&'a image::RgbaImage),
+    Owned(image::RgbImage),
+}
+
+impl RgbSampler<'_> {
+    fn new(image: &DynamicImage) -> RgbSampler<'_> {
+        match image {
+            DynamicImage::ImageRgb8(rgb) => RgbSampler::Borrowed(rgb),
+            DynamicImage::ImageRgba8(rgba) => RgbSampler::Rgba(rgba),
+            other => RgbSampler::Owned(other.to_rgb8()),
+        }
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        match self {
+            RgbSampler::Borrowed(rgb) => rgb.dimensions(),
+            RgbSampler::Rgba(rgba) => rgba.dimensions(),
+            RgbSampler::Owned(rgb) => rgb.dimensions(),
+        }
+    }
+
+    fn pixel(&self, x: u32, y: u32) -> [u8; 3] {
+        match self {
+            RgbSampler::Borrowed(rgb) => {
+                let pixel = rgb.get_pixel(x, y);
+                [pixel[0], pixel[1], pixel[2]]
+            }
+            RgbSampler::Rgba(rgba) => {
+                let pixel = rgba.get_pixel(x, y);
+                [pixel[0], pixel[1], pixel[2]]
+            }
+            RgbSampler::Owned(rgb) => {
+                let pixel = rgb.get_pixel(x, y);
+                [pixel[0], pixel[1], pixel[2]]
+            }
+        }
+    }
+}
+
 /// 整屏统计，返回 (暗像素占比, 近白像素占比)。
 ///
 /// 加载界面的两种外观都是**整屏极端色调**（黑底 98%+ 暗 / 白底 99%+ 白），
 /// 与任何游戏画面都不重叠，所以这个量与位置、缩放都无关，非常稳。
 fn screen_tone(image: &DynamicImage) -> (f32, f32) {
-    let rgb = image.to_rgb8();
-    let (width, height) = rgb.dimensions();
+    let sampler = RgbSampler::new(image);
+    let (width, height) = sampler.dimensions();
     let mut total = 0_u32;
     let mut dark = 0_u32;
     let mut white = 0_u32;
@@ -965,9 +1195,9 @@ fn screen_tone(image: &DynamicImage) -> (f32, f32) {
     while y < height {
         let mut x = 0;
         while x < width {
-            let pixel = rgb.get_pixel(x, y);
+            let pixel = sampler.pixel(x, y);
             let luma =
-                0.299 * pixel[0] as f32 + 0.587 * pixel[1] as f32 + 0.114 * pixel[2] as f32;
+                0.299 * f32::from(pixel[0]) + 0.587 * f32::from(pixel[1]) + 0.114 * f32::from(pixel[2]);
             if luma < SCREEN_TONE_DARK_MAX {
                 dark += 1;
             }
@@ -1067,8 +1297,8 @@ fn world_cyan_band_count(image: &DynamicImage, scale: f32) -> Option<usize> {
     if image.width() < FULL_FRAME_MIN_WIDTH || image.height() < FULL_FRAME_MIN_HEIGHT {
         return None;
     }
-    let rgb = image.to_rgb8();
-    let (image_width, image_height) = rgb.dimensions();
+    let sampler = RgbSampler::new(image);
+    let (image_width, image_height) = sampler.dimensions();
     let step = scale.max(1.0);
     let threshold = WORLD_CYAN_CHANNEL_DIFF as f32;
     let mut count = 0_usize;
@@ -1086,7 +1316,7 @@ fn world_cyan_band_count(image: &DynamicImage, scale: f32) -> Option<usize> {
                 for x in first_x..last_x {
                     let clamped_x = x.clamp(0, image_width as i32 - 1) as u32;
                     let clamped_y = y.clamp(0, image_height as i32 - 1) as u32;
-                    let pixel = rgb.get_pixel(clamped_x, clamped_y);
+                    let pixel = sampler.pixel(clamped_x, clamped_y);
                     let red = f32::from(pixel[0]);
                     let green = f32::from(pixel[1]);
                     let blue = f32::from(pixel[2]);
@@ -1275,7 +1505,7 @@ fn parse_qianxing_panel_ref() -> Option<(u32, u32, u32, u32, &'static [u8])> {
 /// 与参考用的是**同一套归一化**（世界判据也是这一套），所以对整体明暗变化不敏感，
 /// 只比"空间花纹"。平均绝对偏差太小时返回 `None`（纯色块没有花纹可比，应当拒判）。
 fn qianxing_panel_sample(
-    image: &DynamicImage,
+    sampler: &RgbSampler<'_>,
     x: u32,
     y: u32,
     width: u32,
@@ -1283,10 +1513,10 @@ fn qianxing_panel_sample(
     offset_x: i32,
     offset_y: i32,
 ) -> Option<Vec<f32>> {
-    if image.width() < FULL_FRAME_MIN_WIDTH || image.height() < FULL_FRAME_MIN_HEIGHT {
+    let (image_width, image_height) = sampler.dimensions();
+    if image_width < FULL_FRAME_MIN_WIDTH || image_height < FULL_FRAME_MIN_HEIGHT {
         return None;
     }
-    let rgb = image.to_rgb8();
     let mut raw = Vec::with_capacity((width * height * 3) as usize);
     for cell_y in y..y + height {
         for cell_x in x..x + width {
@@ -1299,10 +1529,10 @@ fn qianxing_panel_sample(
             // 钳位会把边缘一整行压到同一像素上，凭空制造出一段假花纹。
             let px = (cell_x * QIANXING_PANEL_CELL + QIANXING_PANEL_CELL_OFFSET) as i32 + offset_x;
             let py = (cell_y * QIANXING_PANEL_CELL + QIANXING_PANEL_CELL_OFFSET) as i32 + offset_y;
-            if px < 0 || py < 0 || px >= rgb.width() as i32 || py >= rgb.height() as i32 {
+            if px < 0 || py < 0 || px >= image_width as i32 || py >= image_height as i32 {
                 return None;
             }
-            let pixel = rgb.get_pixel(px as u32, py as u32);
+            let pixel = sampler.pixel(px as u32, py as u32);
             raw.push(f32::from(pixel[0]));
             raw.push(f32::from(pixel[1]));
             raw.push(f32::from(pixel[2]));
@@ -1348,12 +1578,22 @@ fn qianxing_player_panel_distance(image: &DynamicImage) -> Option<f32> {
     //
     // **这是原理性修法，不是调阈值**：阈值 0.22 是实验量出来的空档中点，一个字没动。
     let (x, y, width, height, reference) = parse_qianxing_panel_ref()?;
+    // **整帧不做任何转换**：此前每个偏移各自 `to_rgb8()` 一次（25 个偏移 = 25 次全帧拷贝），
+    // 改用共享取值器后 RGBA 帧零转换，只做逐格点采样。
+    let sampler = RgbSampler::new(image);
     let mut best: Option<f32> = None;
     for offset_y in -QIANXING_PANEL_SEARCH..=QIANXING_PANEL_SEARCH {
         for offset_x in -QIANXING_PANEL_SEARCH..=QIANXING_PANEL_SEARCH {
-            let Some(distance) =
-                qianxing_panel_distance_at(image, reference, x, y, width, height, offset_x, offset_y)
-            else {
+            let Some(distance) = qianxing_panel_distance_at(
+                &sampler,
+                reference,
+                x,
+                y,
+                width,
+                height,
+                offset_x,
+                offset_y,
+            ) else {
                 continue;
             };
             best = Some(best.map_or(distance, |current: f32| current.min(distance)));
@@ -1365,7 +1605,7 @@ fn qianxing_player_panel_distance(image: &DynamicImage) -> Option<f32> {
 /// 在给定平移量下与参考比距离。采样点越界时返回 `None`（该偏移算不了）。
 #[allow(clippy::too_many_arguments)]
 fn qianxing_panel_distance_at(
-    image: &DynamicImage,
+    sampler: &RgbSampler<'_>,
     reference: &[u8],
     x: u32,
     y: u32,
@@ -1374,7 +1614,7 @@ fn qianxing_panel_distance_at(
     offset_x: i32,
     offset_y: i32,
 ) -> Option<f32> {
-    let sample = qianxing_panel_sample(image, x, y, width, height, offset_x, offset_y)?;
+    let sample = qianxing_panel_sample(sampler, x, y, width, height, offset_x, offset_y)?;
     if sample.len() * 2 != reference.len() {
         return None;
     }
@@ -1391,8 +1631,8 @@ fn qianxing_map_tone(image: &DynamicImage) -> Option<(f32, f32)> {
     if image.width() < FULL_FRAME_MIN_WIDTH || image.height() < FULL_FRAME_MIN_HEIGHT {
         return None;
     }
-    let rgb = image.to_rgb8();
-    let (width, height) = rgb.dimensions();
+    let sampler = RgbSampler::new(image);
+    let (width, height) = sampler.dimensions();
     let mut total = 0_u32;
     let mut dark = 0_u32;
     let mut dark_teal = 0_u32;
@@ -1400,7 +1640,7 @@ fn qianxing_map_tone(image: &DynamicImage) -> Option<(f32, f32)> {
     while y < height {
         let mut x = QIANXING_MAP_SAMPLE_OFFSET;
         while x < width {
-            let pixel = rgb.get_pixel(x, y);
+            let pixel = sampler.pixel(x, y);
             let red = f32::from(pixel[0]);
             let green = f32::from(pixel[1]);
             let blue = f32::from(pixel[2]);
@@ -2604,17 +2844,9 @@ mod tests {
             .with_game_entry_detection(ocr.handle(), Rect::new(500, 800, 500, 100), 2);
         let secondary =
             image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg").unwrap();
-        let bar = image::open("tests/fixtures/ui/world-wish-top-bar.png").unwrap();
-        // 合成帧必须**不透明**：真实截图永远是不透明的，而 RgbaImage::new 造出来的是
-        // 全透明黑，转成 RGB 后整屏都是 (0,0,0)，会被第 55 节的 loading 判据
-        // （暗像素占比 ≥ 62.23%）命中所致 —— 那样测的就不是本用例要测的东西了。
-        // 这里铺成中等灰，暗占比与近白占比都是 0，loading 判据不会介入。
-        let mut world = image::RgbaImage::new(1920, 1080);
-        for pixel in world.pixels_mut() {
-            *pixel = image::Rgba([128, 128, 128, 255]);
-        }
-        image::imageops::replace(&mut world, &bar.to_rgba8(), 1300, 0);
-        let world = DynamicImage::ImageRgba8(world);
+        // 真实祈愿页截图：天然带祈愿顶栏、但没有提瓦特 HUD——正是本用例要钉住的
+        // "回退探针被世界判据门拦下"场景的真值来源（tests/fixtures/ui/README.md）。
+        let world = image::open("tests/fixtures/ui/world-wish-page-1920x1080.png").unwrap();
         let now = Instant::now();
         for elapsed in [0, 10] {
             assert_eq!(
@@ -2659,7 +2891,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         *text.lock().unwrap() = String::new();
         // 第 59 节给回退探针加了**世界判据门**之后，这里不再是 `Overworld`。
-        // 合成帧只有一块祈愿顶栏、**没有真实提瓦特 HUD**，所以门必须把它拦下。
+        // 真实祈愿页有祈愿顶栏、但**没有提瓦特 HUD**，所以门必须把它拦下。
         //
         // 注意 `label()` 与判据名是**两个字段**：`probe_game_state` 传给
         // `with_evidence` 的第二个参数是 `"unknown"`，而原因写在 **evidence 的
@@ -2768,9 +3000,10 @@ mod tests {
             .expect("classify fixed secondary-chat screenshot");
         let evidence = classification.evidence();
         assert_eq!(evidence.final_rule(), "secondary_back_template");
-        // 探针顺序：friend、main_menu、secondary_back。主菜单探针是第 44 节新增的，
-        // 它在 secondary_back 之前跑，用来挡住奇域主菜单上的同一个返回按钮。
-        assert_eq!(evidence.template_probes().len(), 3);
+        // 探针顺序：friend、secondary_back，然后是返回按钮命中后才跑的两个否决探针
+        // （main_menu 奇域主菜单、paimon_menu 提瓦特派蒙菜单）。后两者都用来挡住
+        // 和二级聊天共用的那个圆形返回按钮。
+        assert_eq!(evidence.template_probes().len(), 4);
         assert!(
             evidence
                 .template_probes()
@@ -2782,6 +3015,86 @@ mod tests {
         assert!(
             evidence.template_probes()[2].hit_rect().is_none(),
             "二级界面上不该出现主菜单的返回提瓦特按钮"
+        );
+        assert!(
+            evidence.template_probes()[3].hit_rect().is_none(),
+            "二级界面上不该出现派蒙菜单的功能宫格锚点"
+        );
+    }
+
+    fn panel_regions_from(config: &AppConfig) -> PanelRegions {
+        PanelRegions {
+            friend_panel: config.moderation.friend_panel_region.into(),
+            friend_search_panel: config.moderation.search_panel_region.into(),
+            friend_block_chat: config.moderation.block_chat_region.into(),
+            friend_confirm: config.moderation.confirm_region.into(),
+            invite_view_star: config.invite.view_star_region.into(),
+            invite_goto_hall: config.invite.goto_hall_region.into(),
+            invite_enter_hall: config.invite.enter_hall_region.into(),
+        }
+    }
+
+    /// 每个真实面板夹具必须被判成**它自己**的标签——判据锚点必须专属该面板。
+    ///
+    /// 这条用例钉住 2026-10-08 修掉的一个真实缺陷：`friend-more-settings`（⋯）是
+    /// **共用 chrome**，在档案卡与⋯菜单上落在同一坐标（实测档案卡 0.992 甚至高于菜单
+    /// 0.959），于是档案卡被误判成"更多设置菜单"。修法是把更多设置菜单的锚点换成
+    /// **菜单展开时才存在**的「屏蔽聊天」，并按"进入该大厅(大厅卡) → 前往其大厅(档案卡)"
+    /// 排序，避免大厅卡被档案卡那条暗按钮误命中。
+    #[test]
+    fn panel_fixtures_are_labelled_by_their_own_anchor() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let panels = panel_regions_from(&config);
+        for (name, label) in [
+            ("panel-friend-list-1920x1080.jpg", "panel:friend_list"),
+            ("panel-add-friend-1920x1080.jpg", "panel:add_friend"),
+            ("panel-more-settings-1920x1080.jpg", "panel:more_settings"),
+            ("panel-confirm-dialog-1920x1080.jpg", "panel:confirm_dialog"),
+            ("panel-archive-card-1920x1080.jpg", "panel:archive_card"),
+            ("panel-hall-card-1920x1080.jpg", "panel:hall_card"),
+            ("panel-avatar-popup-1920x1080.jpg", "panel:avatar_popup"),
+        ] {
+            let path = format!("tests/fixtures/ui/{name}");
+            let image = image::open(&path).unwrap();
+            let mut classifier =
+                TemplateUiStateClassifier::new(templates.clone(), config.screen.clone())
+                    .with_panel_regions(panels);
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_eq!(
+                classification.kind(),
+                RuntimeUiStateKind::Panel,
+                "{path} 应判为 panel，实际是 {}",
+                classification.kind().name()
+            );
+            assert_eq!(
+                classification.label(),
+                label,
+                "{path} 的面板标签错了——锚点不专属该面板"
+            );
+        }
+    }
+
+    /// 派蒙菜单（提瓦特 ESC 系统菜单）和二级聊天共用**同一个**圆形返回按钮，但它左侧
+    /// 换成功能宫格。只靠 `secondary_back` 会把它误判成二级聊天；改用「商城」图标这个专属
+    /// 锚点后判为 `MainMenu`，证据规则名与奇域主菜单区分开。
+    #[test]
+    fn paimon_menu_is_not_mistaken_for_secondary_chat() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let image = image::open("tests/fixtures/ui/menu-paimon-1920x1080.jpg")
+            .expect("打开派蒙菜单夹具失败");
+        let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
+        let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+        assert_eq!(
+            classification.kind(),
+            RuntimeUiStateKind::MainMenu,
+            "派蒙菜单被误判成 {}",
+            classification.kind().name()
+        );
+        assert_eq!(
+            classification.evidence().final_rule(),
+            "paimon_menu_panel_template"
         );
     }
 }

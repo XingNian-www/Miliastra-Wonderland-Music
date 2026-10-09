@@ -2409,7 +2409,7 @@ fn undercover_routes_are_redacted_json_and_controls_require_post() {
 #[test]
 fn custom_workflow_routes_keep_their_list_and_enqueue_contracts() {
     let mut state = test_state();
-    state.config.custom_workflows = serde_yaml::from_str(
+    state.config.custom_workflows = serde_norway::from_str(
         r#"
 enabled: true
 default_threshold: 0.9
@@ -2435,7 +2435,7 @@ workflows:
     )
     .expect("custom workflow config");
     let default_config: AppConfig =
-        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
+        serde_norway::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
             .expect("default config");
     state.application.commands = Arc::new(ApplicationHttpCommandFacade::new(
         state.recording.clone(),
@@ -2695,7 +2695,7 @@ fn web_tool_templates_expose_configured_fixed_regions() {
 #[test]
 fn remote_http_api_requires_token_when_configured() {
     let mut config: AppConfig =
-        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
+        serde_norway::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
             .expect("default config");
     config.http.host = "0.0.0.0".to_string();
     config.http.access_token = "secret".to_string();
@@ -3820,7 +3820,7 @@ fn test_state_with_player_port_and_bootstrap_token(
     access_token: &str,
 ) -> HttpTestState {
     let mut config: AppConfig =
-        serde_yaml::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
+        serde_norway::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
             .expect("default config");
     // 配置中心的 bootstrap 注入值：非空时用于验证 http.access_token 脱敏。
     config.http.access_token = access_token.to_string();

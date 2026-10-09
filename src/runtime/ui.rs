@@ -330,6 +330,11 @@ pub enum UiStateKind {
     /// - **白底元素型**（冷启动进世界）：近白像素占比 99.77~100%
     /// 具体是哪一种由证据里的 finalRule 区分，状态本身按需求统一成 loading。
     Loading,
+    /// 游戏内**模态面板覆盖层**：好友面板、添加好友页、玩家/千星档案卡、大厅卡、
+    /// 更多设置菜单、确认弹窗、密码键盘、头像弹窗等。它们是真实界面，不该落进
+    /// `unknown`；具体是哪一种由 label 与 finalRule 区分（见 §6x 面板判据）。
+    /// 对例程而言它与 `unknown` 同义（按 Esc 关闭），所以行为不变。
+    Panel,
     Unknown,
 }
 
@@ -344,6 +349,7 @@ impl UiStateKind {
             Self::GameGate => "game_gate",
             Self::Overworld => "overworld",
             Self::Loading => "loading",
+            Self::Panel => "panel",
             Self::Unknown => "unknown",
         }
     }
@@ -940,6 +946,8 @@ struct UiObservationRuntime {
     tracker: UiStateTracker,
     next_frame_id: u64,
     latest_state: Arc<Mutex<Option<UiStateObservation>>>,
+    /// 帧级短路：游戏画面大量时间是静止帧，签名相同即复用上次分类，跳过全部探针。
+    cached_frame: Option<(u64, UiStateClassification)>,
 }
 
 impl UiObservationRuntime {
@@ -953,6 +961,7 @@ impl UiObservationRuntime {
             tracker: UiStateTracker::new(stable_count),
             next_frame_id: 0,
             latest_state,
+            cached_frame: None,
         }
     }
 
@@ -961,18 +970,35 @@ impl UiObservationRuntime {
         let captured_at = Instant::now();
         self.next_frame_id = self.next_frame_id.wrapping_add(1).max(1);
         let frame_id = self.next_frame_id;
-        let ui_state = self.classifier.as_mut().map(|classifier| {
-            let observation = match classifier.classify(&image) {
-                Ok(classification) => self.tracker.observe(frame_id, classification),
-                Err(error) => self
-                    .tracker
-                    .observe_failure(frame_id, Arc::<str>::from(format!("{error:#}"))),
-            };
-            if let Ok(mut latest) = self.latest_state.lock() {
-                *latest = Some(observation.clone());
+        let ui_state = match self.classifier.as_mut() {
+            None => None,
+            Some(classifier) => {
+                let signature = frame_signature(&image);
+                let cached = match &self.cached_frame {
+                    Some((cached_signature, classification)) if *cached_signature == signature => {
+                        Some(classification.clone())
+                    }
+                    _ => None,
+                };
+                let classification = match cached {
+                    Some(classification) => Ok(classification),
+                    None => classifier.classify(&image),
+                };
+                let observation = match classification {
+                    Ok(classification) => {
+                        self.cached_frame = Some((signature, classification.clone()));
+                        self.tracker.observe(frame_id, classification)
+                    }
+                    Err(error) => self
+                        .tracker
+                        .observe_failure(frame_id, Arc::<str>::from(format!("{error:#}"))),
+                };
+                if let Ok(mut latest) = self.latest_state.lock() {
+                    *latest = Some(observation.clone());
+                }
+                Some(observation)
             }
-            observation
-        });
+        };
         Ok(CapturedFrame {
             id: frame_id,
             image,
@@ -980,6 +1006,28 @@ impl UiObservationRuntime {
             ui_state,
         })
     }
+}
+
+/// 帧级短路的签名：整帧稀疏网格采样后哈希。签名不变即认为画面静止，可复用上次分类。
+fn frame_signature(image: &DynamicImage) -> u64 {
+    use image::GenericImageView;
+    use std::hash::{Hash, Hasher};
+
+    const COLS: u32 = 64;
+    const ROWS: u32 = 36;
+    let width = image.width().max(1);
+    let height = image.height().max(1);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            let x = (col * width / COLS).min(width - 1);
+            let y = (row * height / ROWS).min(height - 1);
+            image.get_pixel(x, y).0.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

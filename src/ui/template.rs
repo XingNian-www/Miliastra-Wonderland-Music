@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
+use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
 use serde::Serialize;
 
@@ -11,6 +12,10 @@ use super::geometry::{Point, Rect, crop_canvas};
 
 static RGB_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, RgbImage>>> = OnceLock::new();
 static GRAY_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<GrayTemplate>>>> = OnceLock::new();
+/// 按整数倍降采样后的模板，键为 `(模板路径, 降采样倍数)`。
+static DOWNSCALED_GRAY_TEMPLATE_CACHE: OnceLock<
+    Mutex<HashMap<(PathBuf, u32), Arc<GrayTemplate>>>,
+> = OnceLock::new();
 
 /// 灰度标准差低于该值的模板视为"纯色/近纯色"：对 SAD 几乎没有区分度。
 ///
@@ -176,6 +181,49 @@ fn cached_rgb_template(template_path: &Path) -> Result<RgbImage> {
     Ok(image)
 }
 
+impl GrayTemplate {
+    /// 由灰度平面 + alpha 平面构造；`label` 只用于日志。
+    /// 降采样版本也走这里，因此掩码/下界/纯色告警的口径与全分辨率模板完全一致。
+    fn build(gray: GrayImage, alpha: GrayImage, label: &Path) -> Self {
+        // 透明 PNG 边缘不能与实时画面比较；这些像素只是占位，不属于视觉锚点。
+        let alpha_sum = alpha.as_raw().iter().map(|value| *value as u64).sum();
+        let pixel_count = gray.width() as u64 * gray.height() as u64;
+        let fully_opaque = pixel_count > 0 && alpha_sum == pixel_count * 255;
+        // SEA 下界只在一块“权重恒为 1”的矩形上成立，因此预先算出模板内最大的全不透明矩形，
+        // 之后每次匹配都能零成本地拿到下界。
+        let opaque = if fully_opaque {
+            Some(OpaqueRect {
+                x: 0,
+                y: 0,
+                width: gray.width(),
+                height: gray.height(),
+                gray_sum: gray.as_raw().iter().map(|value| *value as u64).sum(),
+            })
+        } else {
+            largest_opaque_rect(&alpha).map(|rect| OpaqueRect {
+                gray_sum: sum_gray_rect(&gray, rect.x, rect.y, rect.width, rect.height),
+                ..rect
+            })
+        };
+        let gray_stddev = gray_stddev(&gray);
+        if gray_stddev < FLAT_TEMPLATE_STDDEV {
+            log::warn!(
+                "模板 {} 的灰度标准差仅 {:.2}（近纯色），SAD 区分度极低，容易在大面积均匀区域误命中；建议改用多点签名断言",
+                label.display(),
+                gray_stddev
+            );
+        }
+        Self {
+            gray,
+            alpha,
+            alpha_sum,
+            fully_opaque,
+            gray_stddev,
+            opaque,
+        }
+    }
+}
+
 fn cached_gray_template(template_path: &Path) -> Result<Arc<GrayTemplate>> {
     let cache = GRAY_TEMPLATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
@@ -194,43 +242,37 @@ fn cached_gray_template(template_path: &Path) -> Result<Arc<GrayTemplate>> {
         rgba.pixels().map(|pixel| pixel[3]).collect(),
     )
     .expect("RGBA alpha plane must have the same dimensions");
-    // 透明 PNG 边缘不能与实时画面比较；这些像素只是占位，不属于视觉锚点。
-    let alpha_sum = alpha.as_raw().iter().map(|value| *value as u64).sum();
-    let pixel_count = gray.width() as u64 * gray.height() as u64;
-    let fully_opaque = pixel_count > 0 && alpha_sum == pixel_count * 255;
-    // SEA 下界只在一块“权重恒为 1”的矩形上成立，因此预先算出模板内最大的全不透明矩形，
-    // 之后每次匹配都能零成本地拿到下界。
-    let opaque = if fully_opaque {
-        Some(OpaqueRect {
-            x: 0,
-            y: 0,
-            width: gray.width(),
-            height: gray.height(),
-            gray_sum: gray.as_raw().iter().map(|value| *value as u64).sum(),
-        })
-    } else {
-        largest_opaque_rect(&alpha).map(|rect| OpaqueRect {
-            gray_sum: sum_gray_rect(&gray, rect.x, rect.y, rect.width, rect.height),
-            ..rect
-        })
-    };
-    let gray_stddev = gray_stddev(&gray);
-    if gray_stddev < FLAT_TEMPLATE_STDDEV {
-        log::warn!(
-            "模板 {} 的灰度标准差仅 {:.2}（近纯色），SAD 区分度极低，容易在大面积均匀区域误命中；建议改用多点签名断言",
-            template_path.display(),
-            gray_stddev
-        );
-    }
-    let template = Arc::new(GrayTemplate {
-        gray,
-        alpha,
-        alpha_sum,
-        fully_opaque,
-        gray_stddev,
-        opaque,
-    });
+    let template = Arc::new(GrayTemplate::build(gray, alpha, template_path));
     cache.insert(template_path.to_path_buf(), Arc::clone(&template));
+    Ok(template)
+}
+
+/// 模板的降采样版本（缓存）。灰度与 alpha 用**与画面相同的滤波器**缩小，
+/// 保证两侧口径一致——否则同一内容在两边会落到不同的像素上，分数会无谓地掉。
+fn cached_downscaled_gray_template(
+    template_path: &Path,
+    scale: u32,
+) -> Result<Arc<GrayTemplate>> {
+    let scale = scale.max(1);
+    let cache = DOWNSCALED_GRAY_TEMPLATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow!("template cache mutex poisoned"))?;
+    let key = (template_path.to_path_buf(), scale);
+    if let Some(template) = cache.get(&key) {
+        return Ok(Arc::clone(template));
+    }
+    let base = cached_gray_template(template_path)?;
+    let width = (base.gray.width() / scale).max(1);
+    let height = (base.gray.height() / scale).max(1);
+    let gray = DynamicImage::ImageLuma8(base.gray.clone())
+        .resize_exact(width, height, FilterType::Triangle)
+        .to_luma8();
+    let alpha = DynamicImage::ImageLuma8(base.alpha.clone())
+        .resize_exact(width, height, FilterType::Triangle)
+        .to_luma8();
+    let template = Arc::new(GrayTemplate::build(gray, alpha, template_path));
+    cache.insert(key, Arc::clone(&template));
     Ok(template)
 }
 
@@ -358,6 +400,65 @@ pub(crate) fn best_template_candidate(
         y: base_y + found.y as i32,
         width: template.gray.width(),
         height: template.gray.height(),
+        score,
+    }))
+}
+
+/// 与 [`best_template_candidate`] 同样的灰度 SAD，但**先按整数倍降采样再匹配**。
+///
+/// 用途：区域/模板都很大的探针（代价 ≈ 候选位置数 × 模板像素数）。两个维度同时除以
+/// `scale`，总代价降到约 `1/scale⁴`（`scale=4` 即约 256×）。命中坐标乘回 `scale`，
+/// 因此仍在**原图坐标系**里，只是位置精度降到 `scale` 像素——对"这个面板在不在"足够，
+/// 而需要点击精度的路径（例程）仍走全分辨率的 [`best_template_hit`]，不受影响。
+///
+/// `scale=1` 时直接退化为全分辨率匹配。
+pub(crate) fn best_template_candidate_downscaled(
+    image: &DynamicImage,
+    search_rect: Option<Rect>,
+    template_path: &Path,
+    scale: u32,
+) -> Result<Option<TemplateHit>> {
+    let scale = scale.max(1);
+    if scale == 1 {
+        return best_template_candidate(image, search_rect, template_path);
+    }
+    let haystack = match search_rect {
+        Some(rect) => crop_canvas(image, rect)?,
+        None => image.clone(),
+    };
+    // 画面侧与模板侧必须用同一个滤波器、同一个倍数缩小，否则同一内容会落到不同像素上。
+    let haystack_gray = DynamicImage::ImageLuma8(haystack.to_luma8())
+        .resize_exact(
+            (haystack.width() / scale).max(1),
+            (haystack.height() / scale).max(1),
+            FilterType::Triangle,
+        )
+        .to_luma8();
+    let template = cached_downscaled_gray_template(template_path, scale)?;
+    if template.gray.width() > haystack_gray.width()
+        || template.gray.height() > haystack_gray.height()
+    {
+        return Ok(None);
+    }
+    let max_sad = template.alpha_sum;
+    if max_sad == 0 {
+        return Ok(None);
+    }
+    let matcher = GrayMatcher::from_template(&template);
+    let found = best_gray_match(&haystack_gray, &matcher).unwrap_or(GrayMatch {
+        x: 0,
+        y: 0,
+        sad: max_sad.saturating_add(1),
+    });
+    let score = 1.0 - found.sad as f32 / max_sad as f32;
+    let base_x = search_rect.map(|rect| rect.x).unwrap_or(0);
+    let base_y = search_rect.map(|rect| rect.y).unwrap_or(0);
+    Ok(Some(TemplateHit {
+        kind: "template".to_string(),
+        x: base_x + found.x as i32 * scale as i32,
+        y: base_y + found.y as i32 * scale as i32,
+        width: template.gray.width() * scale,
+        height: template.gray.height() * scale,
         score,
     }))
 }

@@ -2359,7 +2359,9 @@ mod tests {
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
-        config.timing.workflow.default_timeout_ms = 200;
+        // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
+        // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
+        config.timing.workflow.default_timeout_ms = 2_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2370,14 +2372,10 @@ mod tests {
             send_attempts: 0,
             fail_send_attempt: None,
         }));
-        let frame = secondary_frame(&config);
+        let frame = secondary_hall_row_frame(&config);
         let friend_list = config.invite.friend_list_region;
         let title = SECONDARY_TITLE_RECT;
-        let hall_template = image::open(&config.templates.secondary_hall).unwrap();
-        let hall_point = (
-            config.screen.secondary_hall_rect.x + hall_template.width() as i32 / 2,
-            config.screen.secondary_hall_rect.y + hall_template.height() as i32 / 2,
-        );
+        let hall_point = hall_row_click_point(&frame, &config);
         let device = RecordingDevice {
             frame,
             state: state.clone(),
@@ -2445,7 +2443,9 @@ mod tests {
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
-        config.timing.workflow.default_timeout_ms = 200;
+        // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
+        // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
+        config.timing.workflow.default_timeout_ms = 2_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2459,14 +2459,11 @@ mod tests {
         let friend_list = config.invite.friend_list_region;
         let title = SECONDARY_TITLE_RECT;
         let friend_chat = config.invite.friend_chat_region;
-        let hall_template = image::open(&config.templates.secondary_hall).unwrap();
-        let hall_point = (
-            config.screen.secondary_hall_rect.x + hall_template.width() as i32 / 2,
-            config.screen.secondary_hall_rect.y + hall_template.height() as i32 / 2,
-        );
+        let frame = secondary_hall_row_frame(&config);
+        let hall_point = hall_row_click_point(&frame, &config);
         let ui_runtime = start_test_ui_runtime(
             RecordingDevice {
-                frame: secondary_frame(&config),
+                frame,
                 state: state.clone(),
                 friend_rows: vec![(friend_list.y + 85, "萌萌".to_string())],
                 hall_point,
@@ -2518,7 +2515,9 @@ mod tests {
         config.timing.input.click_ms = 0;
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
-        config.timing.workflow.default_timeout_ms = 200;
+        // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
+        // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
+        config.timing.workflow.default_timeout_ms = 2_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2531,14 +2530,11 @@ mod tests {
         }));
         let friend_list = config.invite.friend_list_region;
         let title = SECONDARY_TITLE_RECT;
-        let hall_template = image::open(&config.templates.secondary_hall).unwrap();
-        let hall_point = (
-            config.screen.secondary_hall_rect.x + hall_template.width() as i32 / 2,
-            config.screen.secondary_hall_rect.y + hall_template.height() as i32 / 2,
-        );
+        let frame = secondary_hall_row_frame(&config);
+        let hall_point = hall_row_click_point(&frame, &config);
         let ui_runtime = start_test_ui_runtime(
             RecordingDevice {
-                frame: secondary_frame(&config),
+                frame,
                 state: state.clone(),
                 friend_rows: Vec::new(),
                 hall_point,
@@ -2623,7 +2619,9 @@ mod tests {
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
-        config.timing.workflow.default_timeout_ms = 200;
+        // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
+        // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
+        config.timing.workflow.default_timeout_ms = 2_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2699,7 +2697,9 @@ mod tests {
         config.timing.input.text_ms = 0;
         config.timing.input.send_ms = 0;
         config.timing.invite.step_ms = 0;
-        config.timing.workflow.default_timeout_ms = 200;
+        // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
+        // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
+        config.timing.workflow.default_timeout_ms = 2_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2831,10 +2831,7 @@ mod tests {
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(
             UnknownResidencyDevice {
-                frame: DynamicImage::new_rgba8(
-                    config.screen.expected_width,
-                    config.screen.expected_height,
-                ),
+                frame: unknown_frame(&config),
                 keys: keys.clone(),
             },
             &config,
@@ -2895,10 +2892,7 @@ mod tests {
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(
             StableUnknownThenPrimaryDevice {
-                unknown: DynamicImage::new_rgba8(
-                    config.screen.expected_width,
-                    config.screen.expected_height,
-                ),
+                unknown: unknown_frame(&config),
                 primary: primary_frame(&config),
                 keys: keys.clone(),
                 escaped: false,
@@ -2908,7 +2902,7 @@ mod tests {
             2,
         );
         let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
-        routine_config.timeout_ms = 500;
+        routine_config.timeout_ms = 5_000;
         routine_config.poll_ms = 1;
 
         ui_runtime
@@ -2928,6 +2922,7 @@ mod tests {
     struct TransitionResidencyDevice {
         secondary: DynamicImage,
         primary: DynamicImage,
+        unknown: DynamicImage,
         keys: Arc<Mutex<Vec<Key>>>,
         escaped: bool,
         captures_after_escape: usize,
@@ -2940,10 +2935,7 @@ mod tests {
             }
             self.captures_after_escape += 1;
             if self.captures_after_escape <= 2 {
-                return Ok(DynamicImage::new_rgba8(
-                    self.primary.width(),
-                    self.primary.height(),
-                ));
+                return Ok(self.unknown.clone());
             }
             Ok(self.primary.clone())
         }
@@ -2965,6 +2957,7 @@ mod tests {
             TransitionResidencyDevice {
                 secondary: secondary_frame(&config),
                 primary: primary_frame(&config),
+                unknown: unknown_frame(&config),
                 keys: keys.clone(),
                 escaped: false,
                 captures_after_escape: 0,
@@ -3003,6 +2996,7 @@ mod tests {
     struct PreStabilizedRecoveryDevice {
         secondary: DynamicImage,
         primary: DynamicImage,
+        unknown: DynamicImage,
         state: Arc<Mutex<PreStabilizedRecoveryState>>,
     }
 
@@ -3015,10 +3009,7 @@ mod tests {
                 }
                 state.captures_after_escape += 1;
                 if state.captures_after_escape <= 2 {
-                    return Ok(DynamicImage::new_rgba8(
-                        self.primary.width(),
-                        self.primary.height(),
-                    ));
+                    return Ok(self.unknown.clone());
                 }
                 return Ok(self.primary.clone());
             }
@@ -3047,6 +3038,7 @@ mod tests {
             PreStabilizedRecoveryDevice {
                 secondary: secondary_frame(&config),
                 primary: primary_frame(&config),
+                unknown: unknown_frame(&config),
                 state: Arc::clone(&state),
             },
             &config,
@@ -3056,6 +3048,8 @@ mod tests {
         let subscription = handle
             .declare_frame_demand(FrameDemand::new(Duration::from_millis(1)).unwrap())
             .unwrap();
+        // 有界等待：状态机若不再对真实二级帧给出稳定 Secondary，直接失败而不是永久空转。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let publication = subscription.recv().unwrap();
             let FramePublication::Captured(frame) = publication else {
@@ -3068,6 +3062,9 @@ mod tests {
                 == Some(UiStateKind::Secondary)
             {
                 break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("预稳定阶段未在 5s 内观察到稳定 Secondary");
             }
         }
         subscription.cancel().unwrap();
@@ -3148,39 +3145,164 @@ mod tests {
         ui_runtime.shutdown().unwrap();
     }
 
+    /// 真实一级（千星大厅）截图。状态机的 `loading` 判据只认整屏极端色调的真实帧，
+    /// 合成黑底帧会被判成 loading（`src/ui/state.rs` 第 55 节），代表不了真实执行路径；
+    /// 这里统一改用实际运行路径上的真帧，让状态机按真实界面归类。
     fn primary_frame(config: &AppConfig) -> DynamicImage {
-        let mut frame =
-            DynamicImage::new_rgba8(config.screen.expected_width, config.screen.expected_height);
-        let friend = image::open(&config.templates.friend).unwrap();
-        frame
-            .copy_from(
-                &friend,
-                config.screen.friend_rect.x as u32,
-                config.screen.friend_rect.y as u32,
-            )
-            .unwrap();
+        load_real_frame("tests/fixtures/ui/hall-primary-1920x1080.jpg", config)
+    }
+
+    /// 真实二级（私聊）截图，列表**已滚动、无大厅行**（多数好友投递用例的默认帧）。
+    fn secondary_frame(config: &AppConfig) -> DynamicImage {
+        load_real_frame(
+            "tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg",
+            config,
+        )
+    }
+
+    /// 真实二级（私聊）截图，左侧会话列表**含"大厅"那一行**：需要定位大厅行的用例用它。
+    fn secondary_hall_row_frame(config: &AppConfig) -> DynamicImage {
+        load_real_frame(
+            "tests/fixtures/ui/secondary-with-hall-row-1920x1080.png",
+            config,
+        )
+    }
+
+    /// 真实残留面板（大厅信息页）截图：状态机判为 Unknown，代表“非一级/二级”的残留界面。
+    fn unknown_frame(config: &AppConfig) -> DynamicImage {
+        load_real_frame("tests/fixtures/ui/unknown-panel-1920x1080.png", config)
+    }
+
+    fn load_real_frame(path: &str, config: &AppConfig) -> DynamicImage {
+        let frame = image::open(path).unwrap_or_else(|error| panic!("打不开真实帧 {path}: {error}"));
+        assert_eq!(
+            (frame.width(), frame.height()),
+            (config.screen.expected_width, config.screen.expected_height),
+            "{path} 尺寸必须与配置画布一致"
+        );
         frame
     }
 
-    fn secondary_frame(config: &AppConfig) -> DynamicImage {
-        let mut frame =
-            DynamicImage::new_rgba8(config.screen.expected_width, config.screen.expected_height);
-        let back = image::open(&config.templates.secondary_back).unwrap();
-        let hall = image::open(&config.templates.secondary_hall).unwrap();
-        frame
-            .copy_from(
-                &back,
-                config.screen.secondary_back_rect.x as u32,
-                config.screen.secondary_back_rect.y as u32,
-            )
-            .unwrap();
-        frame
-            .copy_from(
-                &hall,
-                config.screen.secondary_hall_rect.x as u32,
-                config.screen.secondary_hall_rect.y as u32,
-            )
-            .unwrap();
-        frame
+    #[test]
+    fn tmp_time_classification() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        for path in [
+            "tests/fixtures/ui/hall-primary-1920x1080.jpg",
+            "tests/fixtures/ui/secondary-with-hall-row-1920x1080.png",
+            "docs/ui-state-evidence/hall-page.png",
+        ] {
+            let image = image::open(path).unwrap();
+            let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let n = 8;
+            let start = std::time::Instant::now();
+            let mut kind = None;
+            for _ in 0..n {
+                kind = Some(
+                    classifier
+                        .classify_at(&image, std::time::Instant::now())
+                        .unwrap()
+                        .kind(),
+                );
+            }
+            println!(
+                "TIMING {path} => {kind:?} avg={:.1}ms",
+                start.elapsed().as_secs_f64() * 1000.0 / f64::from(n)
+            );
+        }
+    }
+
+    /// 用与例程 `restore_secondary_hall` **完全相同**的匹配，算出真实帧里"大厅行"的点击点。
+    /// 之前用例按配置 rect 中心硬算固定点，换成真实帧后与例程实际命中位置不符，`hall_clicks` 收不到。
+    fn hall_row_click_point(frame: &DynamicImage, config: &AppConfig) -> (i32, i32) {
+        let routine = FriendDeliveryRoutineConfig::from_app(config);
+        let hit = best_template_hit(
+            frame,
+            Some(routine.secondary_hall_search_region),
+            &routine.secondary_hall_template,
+            routine.template_threshold,
+        )
+        .unwrap()
+        .expect("真实二级帧里应能定位到大厅行");
+        let center = hit.center();
+        (center.x, center.y)
+    }
+
+    #[test]
+    fn tmp_panel_probe_cost() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let threshold = config.templates.marker_threshold;
+        let cases: Vec<(&str, std::path::PathBuf, Rect)> = vec![
+            (
+                "friend-panel",
+                config.templates.friend_panel.clone(),
+                config.moderation.friend_panel_region.into(),
+            ),
+            (
+                "friend-search-panel",
+                config.templates.friend_search_panel.clone(),
+                config.moderation.search_panel_region.into(),
+            ),
+            (
+                "friend-more-settings",
+                config.templates.friend_more_settings.clone(),
+                config.moderation.more_settings_region.into(),
+            ),
+            (
+                "friend-block-chat",
+                config.templates.friend_block_chat.clone(),
+                config.moderation.block_chat_region.into(),
+            ),
+            (
+                "friend-confirm",
+                config.templates.friend_confirm.clone(),
+                config.moderation.confirm_region.into(),
+            ),
+            (
+                "invite-view-star",
+                config.templates.invite_view_star.clone(),
+                config.invite.view_star_region.into(),
+            ),
+            (
+                "invite-goto-hall",
+                config.templates.invite_goto_hall.clone(),
+                config.invite.goto_hall_region.into(),
+            ),
+            (
+                "invite-enter-hall",
+                config.templates.invite_enter_hall.clone(),
+                config.invite.enter_hall_region.into(),
+            ),
+        ];
+        let frames = [
+            "dist/ui-flow/frames/t1.jpg",
+            "dist/ui-flow/frames/u1.jpg",
+            "dist/ui-flow/frames/w1.jpg",
+            "dist/ui-flow/frames/x1.jpg",
+            "dist/ui-flow/frames/h1.jpg",
+            "dist/ui-flow/frames/o1.jpg",
+            "dist/ui-flow/frames/p1.jpg",
+            "dist/ui-flow/frames/m1.jpg",
+        ];
+        for frame in frames {
+            let image = image::open(frame).unwrap();
+            let rounds = 1;
+            println!("FRAME {frame}");
+            for (name, path, region) in &cases {
+                let start = std::time::Instant::now();
+                let mut best: Option<(f32, i32, i32, u32, u32)> = None;
+                for _ in 0..rounds {
+                    let hit = best_template_hit(&image, Some(*region), path, threshold)
+                        .unwrap();
+                    best = hit.map(|hit| (hit.score, hit.x, hit.y, hit.width, hit.height));
+                }
+                println!(
+                    "  {name} region={:?} hit={:?} avg={:.1}ms",
+                    region,
+                    best,
+                    start.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds)
+                );
+            }
+        }
     }
 }

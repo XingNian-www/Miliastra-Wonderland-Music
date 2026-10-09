@@ -282,7 +282,7 @@ struct WrappedQuestionBank {
 }
 
 pub(crate) fn parse_question_bank(text: &str, path: &Path) -> Result<Vec<TurtleSoupPuzzle>> {
-    let file: WrappedQuestionBank = serde_yaml::from_str(text)
+    let file: WrappedQuestionBank = serde_norway::from_str(text)
         .with_context(|| format!("解析海龟汤题库失败: {}", path.display()))?;
     let mut questions = file.questions;
     if questions.is_empty() {

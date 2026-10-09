@@ -422,13 +422,16 @@ fn hall_page_has_content(
     image: &image::DynamicImage,
     config: &HallRoutineConfig,
 ) -> Result<bool, UiRoutineFailure> {
+    // 亮像素阈值取 64：真实过场/加载帧的暗色底是 (29,28,34)，亮度约 29，
+    // 原阈值 24 连背景都会判成"有内容"（证据：docs/ui-state-evidence/loading-screens/）；
+    // 真实大厅标题区是亮底白字，区域内像素几乎全部 ≥ 128。64 夹在两者之间。
     for region in [config.hall_name_region, config.hall_time_region] {
         let crop = crop_canvas(image, region)
             .map_err(|error| after_input_failure("check_hall_page_visibility", error))?;
         let lit_pixels = crop
             .to_luma8()
             .pixels()
-            .filter(|pixel| pixel[0] >= 24)
+            .filter(|pixel| pixel[0] >= 64)
             .count();
         if lit_pixels >= 8 {
             return Ok(true);
@@ -576,6 +579,7 @@ mod tests {
 
     struct TransitionHallDevice {
         primary: DynamicImage,
+        loading: DynamicImage,
         keys: Arc<Mutex<Vec<Key>>>,
         fail_entry_capture: bool,
         captures_after_f2: usize,
@@ -593,10 +597,7 @@ mod tests {
                         anyhow::bail!("hall capture failed");
                     }
                     if self.captures_after_f2 <= 2 {
-                        Ok(DynamicImage::new_rgba8(
-                            self.primary.width(),
-                            self.primary.height(),
-                        ))
+                        Ok(self.loading.clone())
                     } else {
                         Ok(self.primary.clone())
                     }
@@ -604,18 +605,12 @@ mod tests {
                 Some(Key::Escape) => {
                     self.captures_after_escape += 1;
                     if self.captures_after_escape <= 2 {
-                        Ok(DynamicImage::new_rgba8(
-                            self.primary.width(),
-                            self.primary.height(),
-                        ))
+                        Ok(self.loading.clone())
                     } else {
                         Ok(self.primary.clone())
                     }
                 }
-                Some(_) => Ok(DynamicImage::new_rgba8(
-                    self.primary.width(),
-                    self.primary.height(),
-                )),
+                Some(_) => Ok(self.loading.clone()),
             }
         }
 
@@ -796,12 +791,13 @@ mod tests {
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
         config.timing.hall.ocr_sample_interval_ms = 0;
-        config.timing.workflow.default_timeout_ms = 300;
+        config.timing.workflow.default_timeout_ms = 5_000;
         config.timing.workflow.default_poll_ms = 1;
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(
             TransitionHallDevice {
                 primary: primary_frame(&config),
+                loading: loading_frame(&config),
                 keys: keys.clone(),
                 fail_entry_capture,
                 captures_after_f2: 0,
@@ -851,25 +847,29 @@ mod tests {
         ocr_runtime.shutdown().unwrap();
     }
 
+    /// 真实一级（千星大厅）截图。合成黑底帧会被状态机的 loading 判据吞掉
+    /// （`src/ui/state.rs` 第 55 节），改用实际执行路径上的真帧。
     fn primary_frame(config: &AppConfig) -> DynamicImage {
-        let mut frame =
-            DynamicImage::new_rgba8(config.screen.expected_width, config.screen.expected_height);
-        let friend = image::open(&config.templates.friend).unwrap();
+        let frame = image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg")
+            .expect("打开真实大厅帧失败");
+        assert_eq!(
+            (frame.width(), frame.height()),
+            (config.screen.expected_width, config.screen.expected_height),
+            "真实大厅帧尺寸必须与配置画布一致"
+        );
         frame
-            .copy_from(
-                &friend,
-                config.screen.friend_rect.x as u32,
-                config.screen.friend_rect.y as u32,
-            )
-            .unwrap();
-        for y in config.screen.hall_name_rect.y as u32..(config.screen.hall_name_rect.y as u32 + 10)
-        {
-            for x in
-                config.screen.hall_name_rect.x as u32..(config.screen.hall_name_rect.x as u32 + 10)
-            {
-                frame.put_pixel(x, y, Rgba([255, 255, 255, 255]));
-            }
-        }
+    }
+
+    /// 真实过场（暗色加载屏）截图：F2/ESC 之后画面进入加载的过渡态，
+    /// 状态机的 loading 判据会命中它——这正是例程必须跳过并等待的帧。
+    fn loading_frame(config: &AppConfig) -> DynamicImage {
+        let frame = image::open("tests/fixtures/ui/loading-dark-1920x1080.jpg")
+            .expect("打开真实过场帧失败");
+        assert_eq!(
+            (frame.width(), frame.height()),
+            (config.screen.expected_width, config.screen.expected_height),
+            "真实过场帧尺寸必须与配置画布一致"
+        );
         frame
     }
 }

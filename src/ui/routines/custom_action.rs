@@ -687,13 +687,20 @@ mod tests {
         }
     }
 
+    /// 设备的截屏统一返回真实大厅帧：例程测试一律不喂合成帧
+    /// （见 tests/fixtures/ui/README.md）。
+    fn real_frame() -> DynamicImage {
+        image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg")
+            .expect("打开真实大厅帧失败")
+    }
+
     struct RecordingDevice {
         keys: Arc<Mutex<Vec<Key>>>,
     }
 
     impl UiDevice for RecordingDevice {
         fn capture(&mut self) -> Result<DynamicImage> {
-            Ok(DynamicImage::new_rgba8(1920, 1080))
+            Ok(real_frame())
         }
 
         fn press_key(&mut self, key: Key) -> Result<()> {
@@ -736,7 +743,7 @@ mod tests {
 
     impl UiDevice for OrderedInputDevice {
         fn capture(&mut self) -> Result<DynamicImage> {
-            Ok(DynamicImage::new_rgba8(1920, 1080))
+            Ok(real_frame())
         }
 
         fn press_key(&mut self, key: Key) -> Result<()> {

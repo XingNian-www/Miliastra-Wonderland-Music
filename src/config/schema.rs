@@ -718,6 +718,12 @@ fn screen_section() -> Vec<ConfigFieldSchema> {
             "主世界右上角祈愿图标搜索区域，覆盖图标栏以适应横向位置变化；仅持续未知时探测",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "paimon_menu_rect",
+            "派蒙菜单区域",
+            FieldKind::Rect,
+            "提瓦特派蒙菜单（ESC 系统菜单）「商城」袋状图标本体的搜索区；与二级聊天共用圆形返回按钮，靠它把派蒙菜单摘出来",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "hall_name_rect",
             "大厅名称区域",
             FieldKind::Rect,
@@ -1048,6 +1054,12 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
             "确认按钮模板",
             FieldKind::Path,
             "拉黑/屏蔽弹窗里的确认按钮模板",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "paimon_menu_panel",
+            "派蒙菜单锚点模板",
+            FieldKind::Path,
+            "派蒙菜单（ESC 系统菜单）专属锚点模板：「商城」袋状图标本体",
         ),
         ConfigFieldSchema::db_idle_reload(
             "marker_threshold",

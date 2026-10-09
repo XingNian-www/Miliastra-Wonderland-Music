@@ -62,7 +62,8 @@ openvino = { version = "0.11.0", optional = true, default-features = false, feat
 openvino-sys = { version = "0.11.0", optional = true, default-features = false, features = ["runtime-linking"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_yaml = "0.9"
+# serde_yaml 已废弃，改用其维护中的兼容分支 serde_norway（API 与 0.9 一致）。
+serde_norway = "0.9"
 thiserror = { workspace = true }
 # 模板匹配主路径：自带的 wgpu 实现（设备/管线进程内复用），失败时由 CPU 兜底。
 wgpu = "0.16"
@@ -116,5 +117,6 @@ incremental = true
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# 保持默认的 unwind：进程内有 8 处 catch_unwind 做任务级故障隔离，
+# abort 会让它们在发布版静默失效（任务 panic 直接带走整个进程）。
 strip = "symbols"

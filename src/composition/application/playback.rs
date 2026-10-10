@@ -122,20 +122,17 @@ impl ApplicationRuntime {
         )?;
         let deadline = Instant::now() + timeout;
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-            let wait = Duration::from_millis(
-                reader.poll_interval_ms(self.lifecycle.config.timing.decision.poll_ms),
-            )
-            .min(deadline.saturating_duration_since(Instant::now()));
-            if let Some(decision) = web_decision.wait(wait)? {
+            let messages = self.wait_for_chat_decision_messages(
+                &mut reader,
+                self.lifecycle.config.timing.decision.poll_ms,
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                return Ok(SongRequestDecision::Stopped);
+            }
+            if let Some(decision) = web_decision.wait(Duration::ZERO)? {
                 return Ok(map_web_decision(decision));
             }
-            let messages = match self.poll_chat_decision_reader(&mut reader) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    log::error!("确认命令扫描失败: {error:#}");
-                    continue;
-                }
-            };
             for message in messages {
                 if message.message_type != "blue"
                     || message.text.is_empty()

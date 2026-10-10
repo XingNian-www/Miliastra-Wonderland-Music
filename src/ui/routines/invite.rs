@@ -5,7 +5,7 @@ use enigo::Key;
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
     capture_normalized, current_ui_is_primary, open_friend_conversation, restore_residency,
-    send_current_chat_message, sleep_ms,
+    send_current_chat_message, wait_ms,
 };
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -307,7 +307,12 @@ fn execute_invite_navigation(
     )?;
 
     if let Some(password) = password {
-        sleep_ms(config.password_step_ms);
+        wait_ms(
+            context,
+            config.password_step_ms,
+            "enter_hall_password",
+            InputCertainty::AfterInputUnknown,
+        )?;
         for digit in password.chars() {
             context
                 .device()
@@ -319,7 +324,12 @@ fn execute_invite_navigation(
                         format!("{error:#}"),
                     )
                 })?;
-            sleep_ms(config.password_digit_ms);
+            wait_ms(
+                context,
+                config.password_digit_ms,
+                "enter_hall_password",
+                InputCertainty::AfterInputUnknown,
+            )?;
         }
     }
     confirm_entered_hall(context, config)
@@ -378,11 +388,21 @@ fn click_current_friend_avatar(
                 x,
                 y
             );
-            sleep_ms(config.click_ms);
+            wait_ms(
+                context,
+                config.click_ms,
+                "select_invite_avatar",
+                InputCertainty::AfterInputUnknown,
+            )?;
             return Ok(());
         }
         if attempt + 1 < total_attempts {
-            sleep_ms(config.poll_ms);
+            wait_ms(
+                context,
+                config.poll_ms,
+                "select_invite_avatar",
+                InputCertainty::AfterInputUnknown,
+            )?;
         }
     }
     Err(UiRoutineFailure::new(
@@ -442,11 +462,16 @@ fn click_invite_button(
                     format!("{error:#}"),
                 )
             })?;
-            sleep_ms(config.click_ms);
+            wait_ms(
+                context,
+                config.click_ms,
+                button.stage,
+                InputCertainty::AfterInputUnknown,
+            )?;
             return Ok(());
         }
         if attempt + 1 < total_attempts {
-            sleep_ms(config.poll_ms);
+            wait_ms(context, config.poll_ms, button.stage, click_certainty)?;
         }
     }
     Err(UiRoutineFailure::new(
@@ -481,7 +506,12 @@ fn confirm_entered_hall(
             streak = 0;
         }
         if attempt + 1 < attempts {
-            sleep_ms(config.poll_ms);
+            wait_ms(
+                context,
+                config.poll_ms,
+                "confirm_entered_hall",
+                InputCertainty::AfterInputUnknown,
+            )?;
         }
     }
     Err(UiRoutineFailure::new(

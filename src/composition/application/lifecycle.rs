@@ -36,8 +36,12 @@ impl ApplicationRuntime {
     pub(crate) fn run(&mut self) -> Result<RunOutcome> {
         let mut deferred_chat_sender = None;
         let mut playback_monitor = None;
+        let mut shared_chat_observer = None;
+        let mut shared_chat_subscriber = None;
         let result = (|| -> Result<()> {
             self.start_formal_task_runtime()?;
+            shared_chat_subscriber = Some(self.ui.shared_ocr.subscribe_business()?);
+            shared_chat_observer = Some(self.start_shared_chat_observer()?);
             self.lifecycle
                 .monitor
                 .publish(MonitorEvent::Status("运行中".to_string()));
@@ -83,8 +87,13 @@ impl ApplicationRuntime {
             }
             deferred_chat_sender = Some(self.start_deferred_chat_sender());
             playback_monitor = Some(self.start_playback_monitor());
-            self.run_scan_loop()
+            self.run_scan_loop(
+                shared_chat_subscriber
+                    .take()
+                    .context("shared chat subscriber unavailable")?,
+            )
         })();
+        drop(shared_chat_observer.take());
         self.lifecycle.running.store(false, AtomicOrdering::SeqCst);
         if let Err(error) = self.business.task_engine.wake() {
             log::debug!("关停时唤醒任务引擎等待线程失败: {error}");

@@ -3,18 +3,19 @@ use std::time::{Duration, Instant};
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
-    before_input_failure, capture_normalized, restore_residency, sleep_ms,
+    before_input_failure, capture_normalized, restore_residency, wait_ms,
 };
 use crate::observation::chat::{
-    FriendUnreadLayout, UnreadFriendHit, find_unread_friend_hits, friend_name_region,
-    latest_incoming_bubble_rect, latest_incoming_fingerprint, unread_hit_still_visible,
+    ChatIdentity, ChatOcrSnapshot, FriendUnreadLayout, SharedChatOcr, UnreadFriendHit,
+    find_unread_friend_hits, latest_incoming_bubble_rect, latest_incoming_fingerprint,
+    unread_hit_still_visible,
 };
-use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle, merge_ocr_lines};
+use crate::runtime::ocr::OcrRuntimeHandle;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
 };
-use crate::ui::geometry::{Rect, crop_canvas};
+use crate::ui::geometry::Rect;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessSecondaryUnread {
@@ -61,6 +62,7 @@ impl ProcessSecondaryUnreadOutcome {
 pub(crate) struct SecondaryUnreadUi {
     runtime: UiRuntimeHandle,
     ocr: OcrRuntimeHandle,
+    shared_ocr: SharedChatOcr,
     config: SecondaryUnreadRoutineConfig,
 }
 
@@ -69,10 +71,12 @@ impl SecondaryUnreadUi {
         runtime: UiRuntimeHandle,
         ocr: OcrRuntimeHandle,
         config: SecondaryUnreadRoutineConfig,
+        shared_ocr: SharedChatOcr,
     ) -> Self {
         Self {
             runtime,
             ocr,
+            shared_ocr,
             config,
         }
     }
@@ -84,6 +88,7 @@ impl SecondaryUnreadUi {
         self.runtime.submit(ProcessSecondaryUnreadRoutine {
             request,
             ocr: self.ocr.clone(),
+            shared_ocr: self.shared_ocr.clone(),
             config: self.config.clone(),
         })
     }
@@ -93,14 +98,13 @@ impl SecondaryUnreadUi {
 pub(crate) struct SecondaryUnreadRoutineConfig {
     residency: FriendDeliveryRoutineConfig,
     unread_layout: FriendUnreadLayout,
-    same_line_y_tolerance: i32,
     bubble_poll_ms: Arc<RwLock<u64>>,
 }
 
 impl SecondaryUnreadRoutineConfig {
     pub(crate) fn resolve(
         residency: FriendDeliveryRoutineConfig,
-        same_line_y_tolerance: i32,
+        _same_line_y_tolerance: i32,
         change_debounce_ms: Arc<RwLock<u64>>,
     ) -> Self {
         let unread_layout = FriendUnreadLayout::resolve(
@@ -111,7 +115,6 @@ impl SecondaryUnreadRoutineConfig {
         Self {
             residency,
             unread_layout,
-            same_line_y_tolerance,
             bubble_poll_ms: change_debounce_ms,
         }
     }
@@ -120,6 +123,7 @@ impl SecondaryUnreadRoutineConfig {
 struct ProcessSecondaryUnreadRoutine {
     request: ProcessSecondaryUnread,
     ocr: OcrRuntimeHandle,
+    shared_ocr: SharedChatOcr,
     config: SecondaryUnreadRoutineConfig,
 }
 
@@ -129,7 +133,29 @@ impl UiRoutine for ProcessSecondaryUnreadRoutine {
     type Output = ProcessSecondaryUnreadOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let effect = match process_unread(context, &self.request, &self.ocr, &self.config) {
+        // Acquire before any navigation and keep suppression through restoration,
+        // including failure/cancellation paths. No service lock spans UI waits.
+        let _discard_guard = if self.request.discard_only {
+            match self.shared_ocr.suppress_friend_business() {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    let failure = before_input_failure("suppress_secondary_unread", error);
+                    return ProcessSecondaryUnreadOutcome {
+                        effect: SecondaryUnreadEffect::Failed(failure.clone()),
+                        residency: UiResidencyOutcome::Failed(failure),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let effect = match process_unread(
+            context,
+            &self.request,
+            &self.ocr,
+            &self.shared_ocr,
+            &self.config,
+        ) {
             Ok(effect) => effect,
             Err(failure) => SecondaryUnreadEffect::Failed(failure),
         };
@@ -150,6 +176,7 @@ fn process_unread(
     context: &mut UiRoutineContext<'_>,
     request: &ProcessSecondaryUnread,
     ocr: &OcrRuntimeHandle,
+    shared_ocr: &SharedChatOcr,
     config: &SecondaryUnreadRoutineConfig,
 ) -> Result<SecondaryUnreadEffect, UiRoutineFailure> {
     context
@@ -184,7 +211,12 @@ fn process_unread(
             .device()
             .click_point(hit.row_click.x, hit.row_click.y)
             .map_err(|error| after_input_failure("open_secondary_unread", error))?;
-        sleep_ms(config.residency.click_ms);
+        wait_ms(
+            context,
+            config.residency.click_ms,
+            "open_secondary_unread",
+            InputCertainty::AfterInputUnknown,
+        )?;
         let image = capture_normalized(
             context,
             &config.residency,
@@ -199,53 +231,107 @@ fn process_unread(
     if !opened {
         return Ok(SecondaryUnreadEffect::NoMessage);
     }
-    if request.discard_only {
-        return Ok(SecondaryUnreadEffect::Discarded);
-    }
-
-    let deadline = Instant::now() + Duration::from_millis(config.residency.timeout_ms());
+    let opened_at = Instant::now();
+    let deadline = opened_at + Duration::from_millis(config.residency.timeout_ms());
     loop {
-        let (image, captured_at) = wait_bubble_stable(context, config, deadline)?;
-        let friend_name = confirmed_unread_friend_name(ocr, &image, &hit, config)?;
-        if friend_name.is_empty() {
-            if Instant::now() >= deadline {
-                return Err(unread_message_failure(
-                    "selected friend name did not become stable before timeout",
-                ));
-            }
-            sleep_ms(bubble_poll_ms(config));
-            continue;
+        if !request.discard_only {
+            wait_bubble_stable(context, config, deadline)?;
         }
-        let rect = latest_incoming_bubble_rect(&image).ok_or_else(|| {
-            unread_message_failure("stable incoming bubble disappeared before OCR")
-        })?;
-        let text = merged_text(ocr, &image, rect, config)?;
-        if unread_text_is_usable(&text) {
+        let Some(snapshot) = wait_shared_friend_snapshot(context, shared_ocr, opened_at, deadline)?
+        else {
+            return Err(unread_message_failure(
+                "fresh shared friend chat OCR did not arrive before timeout",
+            ));
+        };
+        let ChatIdentity::Friend(friend_name) = &snapshot.chat else {
+            unreachable!("wait_shared_friend_snapshot only returns confirmed friend chats");
+        };
+        if request.discard_only {
+            for message in &snapshot.messages {
+                shared_ocr
+                    .acknowledge_business(&message.id)
+                    .map_err(|error| after_input_failure("discard_secondary_unread", error))?;
+            }
+            return Ok(SecondaryUnreadEffect::Discarded);
+        }
+        if let Some(message) = latest_unread_message(&snapshot) {
+            shared_ocr
+                .deliver_unread_baseline(&snapshot, &message.id)
+                .map_err(|error| after_input_failure("deliver_secondary_unread", error))?;
             return Ok(SecondaryUnreadEffect::Message {
-                captured_at,
-                friend_name,
-                text,
+                captured_at: snapshot.captured_at,
+                friend_name: friend_name.to_string(),
+                text: message.text.clone(),
             });
         }
         if Instant::now() >= deadline {
             return Err(unread_message_failure(
-                "incoming bubble OCR remained empty until timeout",
+                "shared incoming bubble OCR remained empty until timeout",
             ));
         }
-        sleep_ms(bubble_poll_ms(config));
+        wait_ms(
+            context,
+            bubble_poll_ms(config),
+            "wait_secondary_unread_message",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
 }
 
-fn confirmed_unread_friend_name(
-    ocr: &OcrRuntimeHandle,
-    image: &image::DynamicImage,
-    hit: &UnreadFriendHit,
-    config: &SecondaryUnreadRoutineConfig,
-) -> Result<String, UiRoutineFailure> {
-    // 红点绑定好友列表行；从红点同一行的昵称区域取名，不再从聊天气泡反推好友身份。
-    let name_region = friend_name_region(hit, &config.unread_layout);
-    merged_text(ocr, image, name_region, config)
-        .map(|name| crate::text::normalize_comparison_text(&name))
+fn wait_shared_friend_snapshot(
+    context: &mut UiRoutineContext<'_>,
+    shared_ocr: &SharedChatOcr,
+    opened_at: Instant,
+    deadline: Instant,
+) -> Result<Option<ChatOcrSnapshot>, UiRoutineFailure> {
+    let mut token = shared_ocr
+        .request_refresh()
+        .map_err(|error| after_input_failure("refresh_secondary_unread", error))?;
+    loop {
+        if let Some(snapshot) = shared_ocr
+            .wait_for_snapshot(token, Duration::ZERO)
+            .map_err(|error| after_input_failure("ocr_secondary_unread", error))?
+        {
+            if fresh_friend_snapshot(&snapshot, opened_at) {
+                return Ok(Some(snapshot));
+            }
+            token = shared_ocr
+                .request_refresh()
+                .map_err(|error| after_input_failure("refresh_secondary_unread", error))?;
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        context
+            .wait_cancellable(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(25)),
+            )
+            .map_err(|failure| {
+                UiRoutineFailure::new(
+                    InputCertainty::AfterInputUnknown,
+                    "wait_secondary_unread_message",
+                    failure.reason(),
+                )
+            })?;
+    }
+}
+
+fn latest_unread_message(
+    snapshot: &ChatOcrSnapshot,
+) -> Option<&crate::observation::chat::SharedChatMessage> {
+    snapshot
+        .messages
+        .iter()
+        .filter(|message| message.message_type == "pink")
+        .max_by_key(|message| message.block.y)
+        .filter(|message| unread_text_is_usable(&message.text))
+}
+
+fn fresh_friend_snapshot(snapshot: &ChatOcrSnapshot, opened_at: Instant) -> bool {
+    snapshot.captured_at >= opened_at
+        && matches!(&snapshot.chat, ChatIdentity::Friend(name) if !name.trim().is_empty())
 }
 
 fn reacquire_unread_hit(
@@ -264,7 +350,12 @@ fn reacquire_unread_hit(
     else {
         return Ok(None);
     };
-    sleep_ms(bubble_poll_ms(config));
+    wait_ms(
+        context,
+        bubble_poll_ms(config),
+        "confirm_secondary_unread_hit",
+        InputCertainty::AfterInputUnknown,
+    )?;
     let confirmed = capture_normalized(
         context,
         &config.residency,
@@ -316,13 +407,12 @@ fn wait_bubble_stable(
         if now >= deadline {
             break;
         }
-        sleep_ms(next_bubble_sample_ms(
-            poll_ms,
-            stable_since,
-            now,
-            required_stable,
-            deadline,
-        ));
+        wait_ms(
+            context,
+            next_bubble_sample_ms(poll_ms, stable_since, now, required_stable, deadline),
+            "confirm_secondary_bubble",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
     Err(unread_message_failure(
         "incoming bubble did not appear and stabilize before timeout",
@@ -407,29 +497,84 @@ fn optional_fingerprint_changed(
     }
 }
 
-fn merged_text(
-    ocr: &OcrRuntimeHandle,
-    image: &image::DynamicImage,
-    region: Rect,
-    config: &SecondaryUnreadRoutineConfig,
-) -> Result<String, UiRoutineFailure> {
-    let crop = crop_canvas(image, region)
-        .map_err(|error| after_input_failure("crop_secondary_unread", error))?;
-    let lines = ocr
-        .recognize_lines(crop, OcrPriority::ChatObservation)
-        .map_err(|error| {
-            UiRoutineFailure::new(
-                InputCertainty::AfterInputUnknown,
-                "ocr_secondary_unread",
-                format!("{error:#}"),
-            )
-        })?;
-    Ok(merge_ocr_lines(lines, config.same_line_y_tolerance))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unread_selection_promotes_latest_incoming_without_replaying_history() {
+        use crate::observation::chat::SharedChatInput;
+        let shared = SharedChatOcr::new();
+        let listener = shared.subscribe().unwrap();
+        let make = |text: &str, y, kind: &str| SharedChatInput {
+            text: text.into(),
+            sender: None,
+            raw_sender: None,
+            message_type: kind.into(),
+            block: Rect::new(10, y, 120, 20),
+        };
+        let chat = ChatIdentity::Friend(Arc::from("observer-confirmed friend"));
+        let snapshot = shared
+            .publish(
+                Instant::now(),
+                chat.clone(),
+                vec![
+                    make("old command", 10, "pink"),
+                    make("new unread command", 40, "pink"),
+                    make("my outgoing", 70, "blue"),
+                ],
+            )
+            .unwrap();
+        listener.read().unwrap();
+        let selected = latest_unread_message(&snapshot).unwrap();
+        assert_eq!(selected.text, "new unread command");
+        assert!(
+            shared
+                .deliver_unread_baseline(&snapshot, &selected.id)
+                .unwrap()
+        );
+        let delivery = listener.read().unwrap();
+        assert_eq!(delivery[0].messages[0].id, selected.id);
+        assert_eq!(delivery[0].messages.len(), 1);
+        assert!(shared.acknowledge_business(&selected.id).unwrap());
+        assert!(
+            !shared
+                .deliver_unread_baseline(&snapshot, &selected.id)
+                .unwrap()
+        );
+
+        let waiting = shared
+            .publish(
+                Instant::now(),
+                chat,
+                vec![make("old command", 10, "pink"), make(" ", 40, "pink")],
+            )
+            .unwrap();
+        // Wait for the latest bubble's OCR; never substitute a historical command.
+        assert!(latest_unread_message(&waiting).is_none());
+    }
+
+    #[test]
+    fn shared_friend_snapshot_requires_fresh_observer_identity() {
+        let opened_at = Instant::now();
+        let mut snapshot = ChatOcrSnapshot {
+            visual_session: crate::observation::chat::VisualSessionId::new(1),
+            captured_at: opened_at - Duration::from_millis(1),
+            chat: ChatIdentity::Friend(Arc::from("Alice")),
+            messages: Vec::new(),
+        };
+        assert!(!fresh_friend_snapshot(&snapshot, opened_at));
+        snapshot.captured_at = opened_at;
+        assert!(fresh_friend_snapshot(&snapshot, opened_at));
+        for chat in [
+            ChatIdentity::Unknown,
+            ChatIdentity::SecondaryHall,
+            ChatIdentity::Friend(Arc::from("  ")),
+        ] {
+            snapshot.chat = chat;
+            assert!(!fresh_friend_snapshot(&snapshot, opened_at));
+        }
+    }
     use crate::ui::change_detection::ChangeFingerprint;
     use crate::ui::geometry::Point;
 

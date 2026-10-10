@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -320,7 +320,7 @@ pub enum UiStateKind {
     /// 千星奇域主菜单（枢纽节点）。它是一个**独立状态**而不是 unknown：
     /// 主菜单与二级界面共用左上角返回按钮，但右下角多一个「返回提瓦特」按钮。
     /// 必须独立成一类，否则它会落进 unknown 并触发游戏态回退，
-    /// 被 world_wish 误报成 overworld（见 docs/ui-state-machine.md §44.10）。
+    /// 被 world_wish 误报成 overworld（见 technical-docs/ui-state-machine.md §44.10）。
     MainMenu,
     GameGate,
     Overworld,
@@ -446,6 +446,8 @@ impl UiTemplateProbeEvidence {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiMarkerProbeEvidence {
+    source_frame_id: Option<u64>,
+    validated_frame_id: Option<u64>,
     search_rect: UiEvidenceRect,
     coordinate_size: (u32, u32),
     blue_count: usize,
@@ -464,6 +466,8 @@ impl UiMarkerProbeEvidence {
         marker_hits: Vec<crate::ui::template::TemplateHit>,
     ) -> Self {
         Self {
+            source_frame_id: None,
+            validated_frame_id: None,
             search_rect,
             coordinate_size,
             blue_count,
@@ -475,6 +479,15 @@ impl UiMarkerProbeEvidence {
 
     pub fn search_rect(&self) -> UiEvidenceRect {
         self.search_rect
+    }
+
+    pub(crate) fn source_frame_id(&self) -> Option<u64> {
+        self.source_frame_id
+    }
+
+    /// A later frame may reuse this probe only after exact whole-image equality validation.
+    pub(crate) fn validated_frame_id(&self) -> Option<u64> {
+        self.validated_frame_id
     }
 
     /// 发现标记命中位置的归一化图像尺寸。
@@ -701,6 +714,19 @@ impl UiStateClassification {
         &self.evidence
     }
 
+    pub(crate) fn set_marker_source_frame(&mut self, frame_id: Option<u64>) {
+        if let Some(probe) = self.evidence.marker_probe.as_mut() {
+            probe.source_frame_id = frame_id;
+            probe.validated_frame_id = frame_id;
+        }
+    }
+
+    fn validate_cached_marker_frame(&mut self, frame_id: u64) {
+        if let Some(probe) = self.evidence.marker_probe.as_mut() {
+            probe.validated_frame_id = probe.source_frame_id.map(|_| frame_id);
+        }
+    }
+
     fn same_candidate_as(&self, other: &Self) -> bool {
         self.kind == other.kind && self.label == other.label
     }
@@ -708,6 +734,15 @@ impl UiStateClassification {
 
 pub trait UiStateClassifier: Send + 'static {
     fn classify(&mut self, image: &DynamicImage) -> Result<UiStateClassification>;
+
+    /// Called only for pixel-identical frames. Stateful classifiers must still advance time.
+    fn classify_cached(
+        &mut self,
+        image: &DynamicImage,
+        _cached: &UiStateClassification,
+    ) -> Result<UiStateClassification> {
+        self.classify(image)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -946,8 +981,8 @@ struct UiObservationRuntime {
     tracker: UiStateTracker,
     next_frame_id: u64,
     latest_state: Arc<Mutex<Option<UiStateObservation>>>,
-    /// 帧级短路：游戏画面大量时间是静止帧，签名相同即复用上次分类，跳过全部探针。
-    cached_frame: Option<(u64, UiStateClassification)>,
+    /// 稀疏签名仅作快速排除；必须整帧像素相同才能进入分类器的缓存路径。
+    cached_frame: Option<(u64, Arc<DynamicImage>, UiStateClassification)>,
 }
 
 impl UiObservationRuntime {
@@ -966,8 +1001,12 @@ impl UiObservationRuntime {
     }
 
     fn capture(&mut self, device: &mut dyn UiDevice) -> Result<CapturedFrame> {
+        let capture_started = Instant::now();
         let image = Arc::new(device.capture()?);
         let captured_at = Instant::now();
+        let capture_elapsed = captured_at.duration_since(capture_started);
+        let classification_started = Instant::now();
+        let mut classification_cache_hit = false;
         self.next_frame_id = self.next_frame_id.wrapping_add(1).max(1);
         let frame_id = self.next_frame_id;
         let ui_state = match self.classifier.as_mut() {
@@ -975,23 +1014,37 @@ impl UiObservationRuntime {
             Some(classifier) => {
                 let signature = frame_signature(&image);
                 let cached = match &self.cached_frame {
-                    Some((cached_signature, classification)) if *cached_signature == signature => {
+                    Some((cached_signature, cached_image, classification))
+                        if *cached_signature == signature
+                            && cached_image.as_ref() == image.as_ref() =>
+                    {
                         Some(classification.clone())
                     }
                     _ => None,
                 };
+                let cache_hit = cached.is_some();
+                classification_cache_hit = cache_hit;
                 let classification = match cached {
-                    Some(classification) => Ok(classification),
+                    Some(classification) => classifier.classify_cached(&image, &classification),
                     None => classifier.classify(&image),
                 };
                 let observation = match classification {
-                    Ok(classification) => {
-                        self.cached_frame = Some((signature, classification.clone()));
+                    Ok(mut classification) => {
+                        if cache_hit {
+                            // Exact pixels revalidate evidence without changing its original source.
+                            classification.validate_cached_marker_frame(frame_id);
+                        } else {
+                            classification.set_marker_source_frame(Some(frame_id));
+                        }
+                        self.cached_frame =
+                            Some((signature, Arc::clone(&image), classification.clone()));
                         self.tracker.observe(frame_id, classification)
                     }
-                    Err(error) => self
-                        .tracker
-                        .observe_failure(frame_id, Arc::<str>::from(format!("{error:#}"))),
+                    Err(error) => {
+                        self.cached_frame = None;
+                        self.tracker
+                            .observe_failure(frame_id, Arc::<str>::from(format!("{error:#}")))
+                    }
                 };
                 if let Ok(mut latest) = self.latest_state.lock() {
                     *latest = Some(observation.clone());
@@ -999,6 +1052,10 @@ impl UiObservationRuntime {
                 Some(observation)
             }
         };
+        log::debug!(target: "performance",
+            "ui_observation frame_id={} cache_hit={} capture_ms={} classify_ms={} frame_age_ms={}",
+            frame_id, classification_cache_hit, capture_elapsed.as_millis(),
+            classification_started.elapsed().as_millis(), captured_at.elapsed().as_millis());
         Ok(CapturedFrame {
             id: frame_id,
             image,
@@ -1008,7 +1065,7 @@ impl UiObservationRuntime {
     }
 }
 
-/// 帧级短路的签名：整帧稀疏网格采样后哈希。签名不变即认为画面静止，可复用上次分类。
+/// 缓存的快速排除签名；相同签名不能证明整帧或聊天 ROI 相同。
 fn frame_signature(image: &DynamicImage) -> u64 {
     use image::GenericImageView;
     use std::hash::{Hash, Hasher};
@@ -1058,11 +1115,31 @@ impl Error for FrameDemandError {}
 #[derive(Clone, Default)]
 pub struct UiCoordinator {
     state: Arc<Mutex<UiCoordinatorState>>,
+    scans_drained: Arc<std::sync::Condvar>,
 }
 
 #[derive(Default)]
 struct UiCoordinatorState {
-    formal_leases: usize,
+    next_lease_id: u64,
+    formal_leases: HashMap<u64, UiFormalOwner>,
+    in_flight_scans: usize,
+    scan_drainers: usize,
+    scan_not_before: Option<Instant>,
+}
+
+struct UiFormalOwner {
+    thread: thread::ThreadId,
+    scan_permits: usize,
+}
+
+impl UiCoordinatorState {
+    fn scan_may_run(&self) -> bool {
+        self.scan_drainers == 0
+            && self
+                .formal_leases
+                .values()
+                .all(|lease| lease.scan_permits > 0)
+    }
 }
 
 impl UiCoordinator {
@@ -1070,45 +1147,172 @@ impl UiCoordinator {
         Self::default()
     }
 
+    /// Retain formal ownership and wait for already admitted scans to finish.
+    /// Acquire and use this lease on the thread executing the formal task.
+    /// Never acquire it while holding a scan lease on this thread.
     pub fn acquire_formal(&self) -> UiFormalLease {
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| {
-            log::error!("UI coordinator 状态锁曾发生异常，继续使用已恢复状态");
-            poisoned.into_inner()
-        });
-        state.formal_leases = state.formal_leases.saturating_add(1);
-        UiFormalLease {
-            coordinator: self.clone(),
-            active: true,
-        }
-    }
-
-    pub fn scan_may_run(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .formal_leases
-            == 0
-    }
-
-    fn release_formal(&self) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.formal_leases = state.formal_leases.saturating_sub(1);
+        state.scan_not_before = Some(Instant::now());
+        let id = state.next_lease_id;
+        state.next_lease_id = id.checked_add(1).expect("UI lease IDs exhausted");
+        state.formal_leases.insert(
+            id,
+            UiFormalOwner {
+                thread: thread::current().id(),
+                scan_permits: 0,
+            },
+        );
+        while state.in_flight_scans != 0 {
+            state = self
+                .scans_drained
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        UiFormalLease {
+            coordinator: self.clone(),
+            id,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    /// Temporarily permit scans for the current thread's existing formal leases.
+    /// Other owners and leases acquired later remain independently blocking.
+    /// Nested permits each retain their own contribution. Drop all active permits
+    /// before resuming UI work; each drop revokes its contribution and drains
+    /// admitted scans, but an outer permit can admit scans again afterwards.
+    /// Do not hold a scan lease on this thread when dropping the guard.
+    pub fn permit_scans_for_current_thread(&self) -> UiScanPermit {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let owner = thread::current().id();
+        let mut lease_ids = Vec::new();
+        for (&id, lease) in &mut state.formal_leases {
+            if lease.thread == owner {
+                lease.scan_permits += 1;
+                lease_ids.push(id);
+            }
+        }
+        if !lease_ids.is_empty() {
+            state.scan_not_before = Some(Instant::now());
+        }
+        UiScanPermit {
+            coordinator: self.clone(),
+            lease_ids,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    /// Advisory only. Use try_acquire_scan to authorize actual scan UI work.
+    pub fn scan_may_run(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .scan_may_run()
+    }
+
+    /// Atomically check admission and register an in-flight scan. Keep the
+    /// returned lease alive through all scan UI work, including error paths.
+    pub fn try_acquire_scan(&self) -> Option<UiScanLease> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.scan_may_run() {
+            return None;
+        }
+        state.in_flight_scans += 1;
+        Some(UiScanLease {
+            coordinator: self.clone(),
+            not_before: state.scan_not_before,
+        })
     }
 }
 
+#[must_use = "keep the formal lease alive while performing UI work"]
 pub struct UiFormalLease {
     coordinator: UiCoordinator,
-    active: bool,
+    id: u64,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl Drop for UiFormalLease {
     fn drop(&mut self) {
-        if self.active {
-            self.coordinator.release_formal();
-            self.active = false;
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.formal_leases.remove(&self.id);
+        state.scan_not_before = Some(Instant::now());
+    }
+}
+
+#[must_use = "keep the permit alive only while the formal owner is waiting"]
+pub struct UiScanPermit {
+    coordinator: UiCoordinator,
+    lease_ids: Vec<u64>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for UiScanPermit {
+    fn drop(&mut self) {
+        if self.lease_ids.is_empty() {
+            return;
+        }
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in &self.lease_ids {
+            if let Some(lease) = state.formal_leases.get_mut(id) {
+                lease.scan_permits -= 1;
+            }
+        }
+        // Block new admissions even when an outer permit still exists. This
+        // makes every drop a drain barrier without cancelling nested permits.
+        state.scan_not_before = Some(Instant::now());
+        state.scan_drainers += 1;
+        while state.in_flight_scans != 0 {
+            state = self
+                .coordinator
+                .scans_drained
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.scan_drainers -= 1;
+    }
+}
+
+#[must_use = "keep the scan lease alive through all scan UI work"]
+pub struct UiScanLease {
+    coordinator: UiCoordinator,
+    not_before: Option<Instant>,
+}
+
+impl UiScanLease {
+    /// Reject frames captured before this admission boundary. The snapshot stays
+    /// fixed for this lease; ordinary scans do not advance the boundary.
+    pub fn not_before(&self) -> Option<Instant> {
+        self.not_before
+    }
+}
+
+impl Drop for UiScanLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight_scans -= 1;
+        if state.in_flight_scans == 0 {
+            self.coordinator.scans_drained.notify_all();
         }
     }
 }
@@ -1176,6 +1380,7 @@ pub struct UiRoutineContext<'a> {
     progress: &'a dyn UiRoutineProgressSink,
     observation: &'a mut UiObservationRuntime,
     latest_frame: &'a Mutex<Option<Arc<CapturedFrame>>>,
+    demands: &'a mut HashMap<u64, ActiveFrameDemand>,
     cancelled: &'a AtomicBool,
 }
 
@@ -1186,6 +1391,7 @@ impl<'a> UiRoutineContext<'a> {
         progress: &'a dyn UiRoutineProgressSink,
         observation: &'a mut UiObservationRuntime,
         latest_frame: &'a Mutex<Option<Arc<CapturedFrame>>>,
+        demands: &'a mut HashMap<u64, ActiveFrameDemand>,
         cancelled: &'a AtomicBool,
     ) -> Self {
         Self {
@@ -1194,6 +1400,7 @@ impl<'a> UiRoutineContext<'a> {
             progress,
             observation,
             latest_frame,
+            demands,
             cancelled,
         }
     }
@@ -1206,17 +1413,44 @@ impl<'a> UiRoutineContext<'a> {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    pub fn wait_cancellable(&self, duration: Duration) -> Result<()> {
+    pub fn wait_cancellable(
+        &mut self,
+        duration: Duration,
+    ) -> std::result::Result<(), UiRoutineFailure> {
         let deadline = Instant::now() + duration;
         loop {
             if self.is_cancelled() {
-                bail!("UI operation cancelled");
+                return Err(UiRoutineFailure::new(
+                    InputCertainty::Cancelled,
+                    "wait_cancellable",
+                    "UI operation cancelled",
+                ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(());
             }
-            thread::sleep(remaining.min(Duration::from_millis(25)));
+            if !self.demands.is_empty() {
+                publish_due_frame(
+                    self.device,
+                    self.observation,
+                    self.demands,
+                    self.latest_frame,
+                );
+            }
+            if self.is_cancelled() {
+                return Err(UiRoutineFailure::new(
+                    InputCertainty::Cancelled,
+                    "wait_cancellable",
+                    "UI operation cancelled",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let until_capture = next_frame_timeout(self.demands).unwrap_or(remaining);
+            thread::sleep(remaining.min(until_capture).min(Duration::from_millis(25)));
         }
     }
 
@@ -1225,11 +1459,27 @@ impl<'a> UiRoutineContext<'a> {
     }
 
     pub fn capture_frame(&mut self) -> Result<CapturedFrame> {
-        let frame = self.observation.capture(self.device)?;
-        if let Ok(mut latest) = self.latest_frame.lock() {
-            *latest = Some(Arc::new(frame.clone()));
+        match self.observation.capture(self.device) {
+            Ok(frame) => {
+                publish_frame(
+                    FramePublication::Captured(Arc::new(frame.clone())),
+                    self.demands,
+                    self.latest_frame,
+                );
+                Ok(frame)
+            }
+            Err(error) => {
+                publish_frame(
+                    FramePublication::Failed(FrameCaptureFailure {
+                        failed_at: Instant::now(),
+                        reason: Arc::from(format!("{error:#}")),
+                    }),
+                    self.demands,
+                    self.latest_frame,
+                );
+                Err(error)
+            }
         }
-        Ok(frame)
     }
 
     pub fn latest_ui_state(&self) -> Option<UiStateObservation> {
@@ -1269,16 +1519,6 @@ impl UiRoutine for CaptureFrame {
         context
             .capture_frame()
             .map_err(|error| UiRoutineFailure::before_input("capture_frame", format!("{error:#}")))
-    }
-
-    fn frame_publication(output: &Self::Output) -> Option<FramePublication> {
-        Some(match output {
-            Ok(frame) => FramePublication::Captured(Arc::new(frame.clone())),
-            Err(failure) => FramePublication::Failed(FrameCaptureFailure {
-                failed_at: Instant::now(),
-                reason: Arc::from(failure.to_string()),
-            }),
-        })
     }
 }
 
@@ -1495,6 +1735,7 @@ impl<R: UiRoutine> ErasedUiJob for TypedUiJob<R> {
             progress,
             observation,
             latest_frame,
+            demands,
             &cancelled,
         );
         let output = routine.execute(&mut context);
@@ -1510,7 +1751,7 @@ enum RuntimeMessage {
     AddFrameDemand {
         id: u64,
         demand: FrameDemand,
-        sender: SyncSender<FramePublication>,
+        slot: Arc<FramePublicationSlot>,
     },
     RemoveFrameDemand(u64),
     Shutdown,
@@ -1605,12 +1846,16 @@ impl UiRuntimeHandle {
             .next_frame_demand_id
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let message = RuntimeMessage::AddFrameDemand { id, demand, sender };
+        let slot = Arc::new(FramePublicationSlot::default());
+        let message = RuntimeMessage::AddFrameDemand {
+            id,
+            demand,
+            slot: Arc::clone(&slot),
+        };
         match self.channel.sender.try_send(message) {
             Ok(()) => Ok(FrameDemandSubscription {
                 id,
-                receiver,
+                slot,
                 channel: Arc::clone(&self.channel),
                 active: true,
             }),
@@ -1634,20 +1879,105 @@ impl UiRuntimeHandle {
     }
 }
 
+#[derive(Default)]
+struct FramePublicationSlot {
+    state: Mutex<FramePublicationState>,
+    available: Condvar,
+}
+
+#[derive(Default)]
+struct FramePublicationState {
+    pending: Option<FramePublication>,
+    closed: bool,
+}
+
+impl FramePublicationSlot {
+    fn publish(&self, publication: FramePublication) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.closed {
+            state.pending = Some(publication);
+            self.available.notify_one();
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
+        self.available.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed
+    }
+
+    fn recv(&self) -> Result<FramePublication, RecvError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(publication) = state.pending.take() {
+                return Ok(publication);
+            }
+            if state.closed {
+                return Err(RecvError);
+            }
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<FramePublication, RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(publication) = state.pending.take() {
+                return Ok(publication);
+            }
+            if state.closed {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            state = self
+                .available
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+}
+
 pub struct FrameDemandSubscription {
     id: u64,
-    receiver: Receiver<FramePublication>,
+    slot: Arc<FramePublicationSlot>,
     channel: Arc<RuntimeChannel>,
     active: bool,
 }
 
 impl FrameDemandSubscription {
     pub fn recv(&self) -> Result<FramePublication, RecvError> {
-        self.receiver.recv()
+        self.slot.recv()
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<FramePublication, RecvTimeoutError> {
-        self.receiver.recv_timeout(timeout)
+        self.slot.recv_timeout(timeout)
     }
 
     pub fn cancel(mut self) -> Result<(), UiSubmitError> {
@@ -1667,12 +1997,14 @@ impl FrameDemandSubscription {
                 TrySendError::Disconnected(_) => UiSubmitError::RuntimeStopped,
             })?;
         self.active = false;
+        self.slot.close();
         Ok(())
     }
 }
 
 impl Drop for FrameDemandSubscription {
     fn drop(&mut self) {
+        self.slot.close();
         if self.active {
             let _ = self
                 .channel
@@ -1914,7 +2246,7 @@ impl Drop for UiRuntime {
 struct ActiveFrameDemand {
     interval: Duration,
     next_due: Instant,
-    sender: SyncSender<FramePublication>,
+    slot: Arc<FramePublicationSlot>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1957,21 +2289,31 @@ fn run_ui_runtime(
                 );
                 publish_due_frame(&mut device, &mut observation, &mut demands, &latest_frame);
             }
-            Some(RuntimeMessage::AddFrameDemand { id, demand, sender }) => {
+            Some(RuntimeMessage::AddFrameDemand { id, demand, slot }) => {
                 demands.insert(
                     id,
                     ActiveFrameDemand {
                         interval: demand.interval,
                         next_due: Instant::now(),
-                        sender,
+                        slot,
                     },
                 );
             }
             Some(RuntimeMessage::RemoveFrameDemand(id)) => {
-                demands.remove(&id);
+                if let Some(demand) = demands.remove(&id) {
+                    demand.slot.close();
+                }
             }
             Some(RuntimeMessage::Shutdown) => break,
             None => publish_due_frame(&mut device, &mut observation, &mut demands, &latest_frame),
+        }
+    }
+    for demand in demands.values() {
+        demand.slot.close();
+    }
+    while let Ok(message) = receiver.try_recv() {
+        if let RuntimeMessage::AddFrameDemand { slot, .. } = message {
+            slot.close();
         }
     }
 }
@@ -1990,6 +2332,7 @@ fn publish_due_frame(
     demands: &mut HashMap<u64, ActiveFrameDemand>,
     latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
 ) {
+    demands.retain(|_, demand| !demand.slot.is_closed());
     let now = Instant::now();
     let due = demands
         .iter()
@@ -2027,22 +2370,10 @@ fn publish_frame(
         FramePublication::Captured(frame) => frame.captured_at(),
         FramePublication::Failed(failure) => failure.failed_at(),
     };
-    let ids = demands.keys().copied().collect::<Vec<_>>();
-    let mut disconnected = Vec::new();
-    for id in ids {
-        let Some(demand) = demands.get_mut(&id) else {
-            continue;
-        };
+    demands.retain(|_, demand| !demand.slot.is_closed());
+    for demand in demands.values_mut() {
         demand.next_due = completed_at + demand.interval;
-        match demand.sender.try_send(publication.clone()) {
-            Ok(()) | Err(TrySendError::Full(_)) => {}
-            Err(TrySendError::Disconnected(_)) => {
-                disconnected.push(id);
-            }
-        }
-    }
-    for id in disconnected {
-        demands.remove(&id);
+        demand.slot.publish(publication.clone());
     }
 }
 
@@ -2052,6 +2383,130 @@ mod tests {
 
     fn classified(kind: UiStateKind) -> UiStateClassification {
         UiStateClassification::new(kind, format!("{kind:?}"))
+    }
+
+    struct ImageDevice(DynamicImage);
+
+    impl UiDevice for ImageDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct PixelClassifier(Arc<AtomicU64>);
+
+    impl UiStateClassifier for PixelClassifier {
+        fn classify(&mut self, image: &DynamicImage) -> Result<UiStateClassification> {
+            use image::GenericImageView;
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(UiStateClassification::with_evidence(
+                UiStateKind::Primary,
+                "primary:marker",
+                UiStateEvidence::new(
+                    Vec::new(),
+                    Some(UiMarkerProbeEvidence::new(
+                        UiEvidenceRect::new(0, 0, 128, 72),
+                        (128, 72),
+                        1,
+                        0,
+                        0,
+                        vec![crate::ui::template::TemplateHit {
+                            kind: "blue".into(),
+                            x: i32::from(image.get_pixel(1, 1).0[0]),
+                            y: 1,
+                            width: 1,
+                            height: 1,
+                            score: 1.0,
+                        }],
+                    )),
+                    "pixel_probe",
+                ),
+            ))
+        }
+
+        fn classify_cached(
+            &mut self,
+            _: &DynamicImage,
+            cached: &UiStateClassification,
+        ) -> Result<UiStateClassification> {
+            Ok(cached.clone())
+        }
+    }
+
+    #[test]
+    fn sparse_signature_collision_in_chat_roi_reclassifies_and_identical_pixels_revalidate() {
+        use image::GenericImage;
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut runtime = UiObservationRuntime::new(
+            Some(Box::new(PixelClassifier(calls.clone()))),
+            1,
+            Arc::new(Mutex::new(None)),
+        );
+        let mut device = ImageDevice(DynamicImage::new_rgba8(128, 72));
+        let canvas = crate::ui::frame::Canvas {
+            width: 128,
+            height: 72,
+            resize: false,
+        };
+        let first = runtime.capture(&mut device).unwrap();
+        assert_eq!(
+            crate::ui::frame::from_captured_frame(&first, &canvas)
+                .marker_hits_for_image()
+                .unwrap()[0]
+                .x,
+            0
+        );
+        // The 64x36 grid samples even coordinates; this chat ROI pixel is invisible to it.
+        device.0.put_pixel(1, 1, image::Rgba([7, 0, 0, 255]));
+        assert_eq!(frame_signature(first.image()), frame_signature(&device.0));
+        let changed = runtime.capture(&mut device).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            crate::ui::frame::from_captured_frame(&changed, &canvas)
+                .marker_hits_for_image()
+                .unwrap()[0]
+                .x,
+            7
+        );
+        let identical = runtime.capture(&mut device).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            crate::ui::frame::from_captured_frame(&identical, &canvas)
+                .marker_hits_for_image()
+                .unwrap()[0]
+                .x,
+            7
+        );
+        let probe = identical
+            .ui_state()
+            .unwrap()
+            .classified()
+            .unwrap()
+            .classification()
+            .evidence()
+            .marker_probe()
+            .unwrap();
+        assert_eq!(probe.source_frame_id(), Some(changed.id()));
+        assert_eq!(probe.validated_frame_id(), Some(identical.id()));
+        // Old observation attached to changed pixels has not been revalidated.
+        let stale = CapturedFrame {
+            ui_state: first.ui_state().cloned(),
+            ..changed
+        };
+        assert!(
+            crate::ui::frame::from_captured_frame(&stale, &canvas)
+                .marker_hits_for_image()
+                .is_none()
+        );
+        assert_eq!(
+            identical
+                .ui_state()
+                .unwrap()
+                .classified()
+                .unwrap()
+                .stable_kind(),
+            Some(UiStateKind::Primary)
+        );
     }
 
     #[derive(Default)]
@@ -2169,6 +2624,210 @@ mod tests {
         });
         assert!(unwind.is_err());
         assert!(coordinator.scan_may_run());
+    }
+
+    #[test]
+    fn scan_freshness_boundary_tracks_ui_ownership_but_not_ordinary_scans() {
+        let coordinator = UiCoordinator::new();
+        assert_eq!(coordinator.try_acquire_scan().unwrap().not_before(), None);
+        let empty = coordinator.permit_scans_for_current_thread();
+        drop(empty);
+        assert_eq!(coordinator.try_acquire_scan().unwrap().not_before(), None);
+        let formal = coordinator.acquire_formal();
+        let acquired = coordinator.state.lock().unwrap().scan_not_before.unwrap();
+        let reply_frame_captured_at = Instant::now();
+        let permit = coordinator.permit_scans_for_current_thread();
+        let cutoff = coordinator
+            .try_acquire_scan()
+            .unwrap()
+            .not_before()
+            .unwrap();
+        assert!(cutoff >= acquired);
+        assert!(cutoff >= reply_frame_captured_at);
+        assert_eq!(
+            coordinator.try_acquire_scan().unwrap().not_before(),
+            Some(cutoff)
+        );
+        drop(permit);
+        let revoked = coordinator.state.lock().unwrap().scan_not_before.unwrap();
+        assert!(revoked >= cutoff);
+        assert!(coordinator.try_acquire_scan().is_none());
+        drop(formal);
+        let released = coordinator
+            .try_acquire_scan()
+            .unwrap()
+            .not_before()
+            .unwrap();
+        assert!(released >= revoked);
+        assert_eq!(
+            coordinator.try_acquire_scan().unwrap().not_before(),
+            Some(released)
+        );
+    }
+
+    #[test]
+    fn nested_permit_updates_freshness_without_changing_existing_scan_snapshot() {
+        let coordinator = UiCoordinator::new();
+        let _formal = coordinator.acquire_formal();
+        let outer = coordinator.permit_scans_for_current_thread();
+        let scan = coordinator.try_acquire_scan().unwrap();
+        let snapshot = scan.not_before().unwrap();
+        let inner = coordinator.permit_scans_for_current_thread();
+        let nested = coordinator
+            .try_acquire_scan()
+            .unwrap()
+            .not_before()
+            .unwrap();
+        assert!(nested >= snapshot);
+        assert_eq!(scan.not_before(), Some(snapshot));
+        drop(scan);
+        drop(inner);
+        let reopened = coordinator
+            .try_acquire_scan()
+            .unwrap()
+            .not_before()
+            .unwrap();
+        assert!(reopened >= nested);
+        drop(outer);
+        assert!(coordinator.try_acquire_scan().is_none());
+    }
+
+    #[test]
+    fn scan_permits_are_nested_and_do_not_cover_later_leases() {
+        let coordinator = UiCoordinator::new();
+        let first = coordinator.acquire_formal();
+        let second = coordinator.acquire_formal();
+        let outer = coordinator.permit_scans_for_current_thread();
+        let inner = coordinator.permit_scans_for_current_thread();
+        assert!(coordinator.try_acquire_scan().is_some());
+        drop(outer);
+        assert!(coordinator.try_acquire_scan().is_some());
+        let later = coordinator.acquire_formal();
+        assert!(coordinator.try_acquire_scan().is_none());
+        drop(later);
+        assert!(coordinator.try_acquire_scan().is_some());
+        drop(first);
+        drop(inner);
+        assert!(coordinator.try_acquire_scan().is_none());
+        drop(second);
+        assert!(coordinator.try_acquire_scan().is_some());
+    }
+
+    #[test]
+    fn scan_permits_cannot_override_another_owner() {
+        let coordinator = UiCoordinator::new();
+        let _formal = coordinator.acquire_formal();
+        let other = coordinator.clone();
+        thread::spawn(move || {
+            let _empty = other.permit_scans_for_current_thread();
+            assert!(other.try_acquire_scan().is_none());
+            let _other_formal = other.acquire_formal();
+            let _permit = other.permit_scans_for_current_thread();
+            assert!(other.try_acquire_scan().is_none());
+        })
+        .join()
+        .unwrap();
+        assert!(coordinator.try_acquire_scan().is_none());
+    }
+
+    #[test]
+    fn scan_permit_and_scan_lease_release_during_unwind() {
+        let coordinator = UiCoordinator::new();
+        let _formal = coordinator.acquire_formal();
+        let unwind = std::panic::catch_unwind({
+            let coordinator = coordinator.clone();
+            move || {
+                let _permit = coordinator.permit_scans_for_current_thread();
+                let _scan = coordinator.try_acquire_scan().unwrap();
+                panic!("scan failure");
+            }
+        });
+        assert!(unwind.is_err());
+        assert!(coordinator.try_acquire_scan().is_none());
+        let _permit = coordinator.permit_scans_for_current_thread();
+        assert!(coordinator.try_acquire_scan().is_some());
+    }
+
+    // Observe the actual admission barrier, rather than assuming a sleeping
+    // worker reached it. Bound the wait so a regression fails instead of hangs.
+    fn wait_until_scans_blocked(coordinator: &UiCoordinator) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while coordinator.scan_may_run() {
+            assert!(Instant::now() < deadline, "scan admission was not revoked");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn scan_permit_drop_revokes_before_waiting_for_all_in_flight_scans() {
+        let coordinator = UiCoordinator::new();
+        let (permitted_tx, permitted_rx) = mpsc::channel();
+        let (revoke_tx, revoke_rx) = mpsc::channel();
+        let (resumed_tx, resumed_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let owner = coordinator.clone();
+        let worker = thread::spawn(move || {
+            let _formal = owner.acquire_formal();
+            let permit = owner.permit_scans_for_current_thread();
+            permitted_tx.send(()).unwrap();
+            revoke_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(permit);
+            resumed_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        permitted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let first = coordinator.try_acquire_scan().unwrap();
+        let second = coordinator.try_acquire_scan().unwrap();
+        revoke_tx.send(()).unwrap();
+        wait_until_scans_blocked(&coordinator);
+        assert!(coordinator.try_acquire_scan().is_none());
+        assert!(resumed_rx.try_recv().is_err());
+        drop(first);
+        assert!(resumed_rx.try_recv().is_err());
+        drop(second);
+        resumed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(coordinator.try_acquire_scan().is_none());
+        finish_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(coordinator.try_acquire_scan().is_some());
+    }
+
+    #[test]
+    fn formal_acquisition_waits_for_already_admitted_scan() {
+        let coordinator = UiCoordinator::new();
+        let scan = coordinator.try_acquire_scan().unwrap();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let owner = coordinator.clone();
+        let worker = thread::spawn(move || {
+            let _formal = owner.acquire_formal();
+            acquired_tx.send(()).unwrap();
+        });
+        wait_until_scans_blocked(&coordinator);
+        assert!(coordinator.try_acquire_scan().is_none());
+        assert!(acquired_rx.try_recv().is_err());
+        drop(scan);
+        acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn nested_scan_permit_drop_drains_without_revoking_outer_permit() {
+        let coordinator = UiCoordinator::new();
+        let _formal = coordinator.acquire_formal();
+        let outer = coordinator.permit_scans_for_current_thread();
+        let inner = coordinator.permit_scans_for_current_thread();
+        let scan = coordinator.try_acquire_scan().unwrap();
+        let observer = coordinator.clone();
+        let worker = thread::spawn(move || {
+            wait_until_scans_blocked(&observer);
+            assert!(observer.try_acquire_scan().is_none());
+            drop(scan);
+        });
+        drop(inner);
+        worker.join().unwrap();
+        assert!(coordinator.try_acquire_scan().is_some());
+        drop(outer);
+        assert!(coordinator.try_acquire_scan().is_none());
     }
 
     #[test]
@@ -2290,7 +2949,10 @@ mod tests {
         }
     }
 
-    struct CapturingRoutine;
+    struct CapturingRoutine {
+        captured: SyncSender<u64>,
+        release: Receiver<()>,
+    }
 
     impl sealed::UiRoutineSealed for CapturingRoutine {}
 
@@ -2298,7 +2960,10 @@ mod tests {
         type Output = u64;
 
         fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-            context.capture_frame().unwrap().id()
+            let id = context.capture_frame().unwrap().id();
+            self.captured.send(id).unwrap();
+            self.release.recv().unwrap();
+            id
         }
     }
 
@@ -2311,7 +2976,7 @@ mod tests {
     }
 
     #[test]
-    fn routine_captures_update_state_without_publishing_transient_chat_frames() {
+    fn routine_captures_publish_immediately_and_update_state() {
         let runtime =
             UiRuntime::start_with_state_classifier(BlankDevice, 4, AlwaysPrimaryClassifier, 2)
                 .unwrap();
@@ -2324,14 +2989,196 @@ mod tests {
             FramePublication::Failed(failure) => panic!("initial capture failed: {failure:?}"),
         };
 
-        let routine_id = handle.submit(CapturingRoutine).unwrap().wait().unwrap();
+        let (captured_tx, captured_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let operation = handle
+            .submit(CapturingRoutine {
+                captured: captured_tx,
+                release: release_rx,
+            })
+            .unwrap();
+        let routine_id = captured_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(routine_id > initial_id);
         assert_eq!(handle.latest_ui_state().unwrap().frame_id(), routine_id);
+        match subscription.recv_timeout(Duration::from_secs(1)).unwrap() {
+            FramePublication::Captured(frame) => {
+                assert_eq!(frame.id(), routine_id);
+                assert_eq!(handle.latest_frame().unwrap().id(), routine_id);
+            }
+            FramePublication::Failed(failure) => panic!("routine capture failed: {failure:?}"),
+        }
         assert!(matches!(
             subscription.recv_timeout(Duration::from_millis(50)),
             Err(RecvTimeoutError::Timeout)
         ));
+        release_tx.send(()).unwrap();
+        assert_eq!(operation.wait().unwrap(), routine_id);
 
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn frame_slot_replaces_stale_frames_and_wakes_for_failures() {
+        let slot = Arc::new(FramePublicationSlot::default());
+        let captured = |id| {
+            FramePublication::Captured(Arc::new(CapturedFrame {
+                id,
+                image: Arc::new(DynamicImage::new_rgba8(2, 2)),
+                captured_at: Instant::now(),
+                ui_state: None,
+            }))
+        };
+        slot.publish(captured(1));
+        slot.publish(captured(2));
+        match slot.recv_timeout(Duration::ZERO).unwrap() {
+            FramePublication::Captured(frame) => assert_eq!(frame.id(), 2),
+            FramePublication::Failed(_) => panic!("expected fresh frame"),
+        }
+        let waiting = Arc::clone(&slot);
+        let waiter = thread::spawn(move || waiting.recv_timeout(Duration::from_secs(1)));
+        slot.publish(FramePublication::Failed(FrameCaptureFailure {
+            failed_at: Instant::now(),
+            reason: Arc::from("capture failed"),
+        }));
+        match waiter.join().unwrap().unwrap() {
+            FramePublication::Failed(failure) => assert_eq!(failure.reason(), "capture failed"),
+            FramePublication::Captured(_) => panic!("expected failure wakeup"),
+        }
+        slot.close();
+        assert!(matches!(
+            slot.recv_timeout(Duration::ZERO),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    struct CountingDevice {
+        captures: Arc<AtomicU64>,
+        owner: Option<thread::ThreadId>,
+        fail_after_first: bool,
+    }
+
+    impl UiDevice for CountingDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            let current = thread::current().id();
+            if let Some(owner) = self.owner {
+                assert_eq!(current, owner, "captures must remain on the UI worker");
+            } else {
+                self.owner = Some(current);
+            }
+            let count = self.captures.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_after_first && count > 1 {
+                bail!("synthetic capture failure");
+            }
+            Ok(DynamicImage::new_rgba8(16, 16))
+        }
+    }
+
+    struct WaitingRoutine {
+        started: SyncSender<()>,
+        duration: Duration,
+    }
+
+    impl sealed::UiRoutineSealed for WaitingRoutine {}
+
+    impl UiRoutine for WaitingRoutine {
+        type Output = Result<()>;
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            self.started.send(()).unwrap();
+            Ok(context.wait_cancellable(self.duration)?)
+        }
+    }
+
+    #[test]
+    fn long_routine_wait_publishes_bounded_frames_on_the_ui_worker() {
+        let captures = Arc::new(AtomicU64::new(0));
+        let runtime = UiRuntime::start(
+            CountingDevice {
+                captures: captures.clone(),
+                owner: None,
+                fail_after_first: false,
+            },
+            4,
+        )
+        .unwrap();
+        let handle = runtime.handle();
+        let subscription = handle
+            .declare_frame_demand(FrameDemand::new(Duration::from_millis(35)).unwrap())
+            .unwrap();
+        let initial = match subscription.recv_timeout(Duration::from_secs(1)).unwrap() {
+            FramePublication::Captured(frame) => frame,
+            FramePublication::Failed(failure) => panic!("initial capture failed: {failure:?}"),
+        };
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let operation = handle
+            .submit(WaitingRoutine {
+                started: started_tx,
+                duration: Duration::from_secs(2),
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let first = match subscription
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap()
+        {
+            FramePublication::Captured(frame) => frame,
+            FramePublication::Failed(failure) => panic!("wait capture failed: {failure:?}"),
+        };
+        let second = match subscription
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap()
+        {
+            FramePublication::Captured(frame) => frame,
+            FramePublication::Failed(failure) => panic!("wait capture failed: {failure:?}"),
+        };
+        assert!(initial.id() < first.id() && first.id() < second.id());
+        assert!(captures.load(Ordering::SeqCst) >= 3);
+        operation.cancel();
+        assert!(!runtime.shutdown().unwrap().timed_out());
+        let stopped_at = captures.load(Ordering::SeqCst);
+        let _ = subscription.recv_timeout(Duration::from_millis(80));
+        assert_eq!(captures.load(Ordering::SeqCst), stopped_at);
+    }
+
+    #[test]
+    fn cooperative_wait_publishes_capture_failures_without_aborting_routine() {
+        let captures = Arc::new(AtomicU64::new(0));
+        let runtime = UiRuntime::start(
+            CountingDevice {
+                captures: captures.clone(),
+                owner: None,
+                fail_after_first: true,
+            },
+            4,
+        )
+        .unwrap();
+        let handle = runtime.handle();
+        let subscription = handle
+            .declare_frame_demand(FrameDemand::new(Duration::from_millis(30)).unwrap())
+            .unwrap();
+        assert!(matches!(
+            subscription.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FramePublication::Captured(_)
+        ));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let operation = handle
+            .submit(WaitingRoutine {
+                started: started_tx,
+                duration: Duration::from_millis(180),
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match subscription
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap()
+        {
+            FramePublication::Failed(failure) => {
+                assert!(failure.reason().contains("synthetic capture failure"))
+            }
+            FramePublication::Captured(_) => panic!("expected synthetic failure"),
+        };
+        assert!(operation.wait().unwrap().is_ok());
+        assert!(captures.load(Ordering::SeqCst) >= 2);
         runtime.shutdown().unwrap();
     }
 

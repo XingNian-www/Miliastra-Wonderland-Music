@@ -35,6 +35,28 @@ pub(super) struct DeferredIdiomChainPort {
     task_engine: TaskEngineHandle,
 }
 
+/// 个人歌单的播放侧适配：读取当前播放曲目、直接播放收藏曲目。
+struct PlaylistRuntimePlaybackPort<'a> {
+    runtime: &'a mut ApplicationRuntime,
+}
+
+impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlaybackPort<'_> {
+    fn current_track(&self) -> Option<miliastra_playback::PlayableTrack> {
+        self.runtime
+            .business
+            .business
+            .playback_state_snapshot()
+            .ok()
+            .and_then(|snapshot| snapshot.last_observation)
+            .and_then(|observation| observation.track)
+    }
+
+    fn play(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<()> {
+        let application = self.runtime.playback.playback_application.clone();
+        application.play_structured_track(track, self.runtime)
+    }
+}
+
 struct DeferredCardGamePort {
     task_engine: TaskEngineHandle,
 }
@@ -255,6 +277,7 @@ impl ApplicationRuntime {
             ModuleCommand::CardGame(command) => self.execute_card_game_intent(parsed, command),
             ModuleCommand::TurtleSoup(command) => self.execute_turtle_soup_intent(parsed, command),
             ModuleCommand::Tarot(command) => self.execute_tarot_intent(parsed, command),
+            ModuleCommand::Playlist(command) => self.execute_playlist_intent(parsed, command),
             ModuleCommand::Undercover(command) => self.execute_undercover_intent(parsed, command),
             ModuleCommand::Invite(command) => self.execute_invite_intent(parsed, command),
             ModuleCommand::Moderation(command) => self.execute_moderation_intent(parsed, command),
@@ -277,6 +300,26 @@ impl ApplicationRuntime {
             &self.business.ai,
         )?;
         self.log_executed_command(parsed, "tarot")?;
+        let messages: Vec<_> = messages.iter().map(String::as_str).collect();
+        self.reply_batch(&messages, 0)
+    }
+
+    fn execute_playlist_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        command: &crate::features::playlist::PlaylistCommand,
+    ) -> Result<()> {
+        let actor = self.canonical_actor_name(&parsed.username);
+        let now = Instant::now();
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or_default();
+        // 先克隆 Arc 应用，避免与播放端口同时借用 self。
+        let application = self.business.playlist_application.clone();
+        let mut port = PlaylistRuntimePlaybackPort { runtime: self };
+        let messages = application.execute(&actor, command, &mut port, now, now_epoch)?;
+        self.log_executed_command(parsed, "playlist")?;
         let messages: Vec<_> = messages.iter().map(String::as_str).collect();
         self.reply_batch(&messages, 0)
     }

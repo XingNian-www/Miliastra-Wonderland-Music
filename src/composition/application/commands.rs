@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "playlist_window.rs"]
+mod playlist_window;
+
 use crate::features::administration::{
     AdministrationApplicationPort, AdministrationCommandContext, AdministrationImmediatePort,
 };
@@ -309,6 +312,9 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         command: &crate::features::playlist::PlaylistCommand,
     ) -> Result<()> {
+        if matches!(command, crate::features::playlist::PlaylistCommand::Open) {
+            return self.execute_playlist_window(parsed);
+        }
         let actor = self.canonical_actor_name(&parsed.username);
         let now = Instant::now();
         let now_epoch = std::time::SystemTime::now()

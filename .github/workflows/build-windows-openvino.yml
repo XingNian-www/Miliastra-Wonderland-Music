@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -177,7 +177,7 @@ jobs:
         env:
           OPENVINO_OCR_IR_ROOT: ${{ github.workspace }}\models
           OPENVINO_OCR_CHARSET: ${{ github.workspace }}\models\ppocr_keys_v6_small.txt
-        run: cargo test --locked --no-default-features --features ocr-openvino configured_ir_models_recognize_fixture -- --nocapture
+        run: cargo test --locked --no-default-features --features ocr-openvino configured_ir_models_recognize_fixture -- --ignored --nocapture
 
       - name: 解析发布版本
         id: version

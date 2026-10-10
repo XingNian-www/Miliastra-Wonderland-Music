@@ -45,21 +45,11 @@ impl Drop for SecondaryUnreadTaskCompletionGuard {
     }
 }
 
-fn primary_messages_after_cursor(
-    messages: Vec<PrimaryObservedMessage>,
-    cursor: PrimaryObservationCursor,
-) -> Vec<ChatMessage> {
-    messages
-        .into_iter()
-        .filter(|message| cursor.is_before(&message.id))
-        .map(|message| message.message)
-        .collect()
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct SecondaryObservationOutcome {
     pub(super) processed: bool,
     pub(super) command_dispatched: bool,
+    pub(super) unrecognized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -234,7 +224,10 @@ fn secondary_hall_command_observation(
 ) -> Option<SecondaryHallCommandObservation> {
     let command_key = if let Some(command) = secondary_hall_command_text(&message.text) {
         let command = command.trim();
-        let (prefix, payload) = if let Some(payload) = command.strip_prefix('@') {
+        let (prefix, payload) = if let Some(payload) = command
+            .strip_prefix('@')
+            .or_else(|| command.strip_prefix('＠'))
+        {
             ('@', payload)
         } else {
             (
@@ -503,7 +496,31 @@ impl ApplicationRuntime {
         A: Fn(&str) -> bool,
         P: Fn(&str) -> bool,
     {
-        let observation_session = self.ui.chat_observations.begin_exclusive()?;
+        let deadline = Instant::now()
+            + Duration::from_millis(self.lifecycle.config.timing.decision.timeout_ms);
+        self.begin_chat_decision_reader_until(scope, accepts_message_type, is_decision, deadline)
+    }
+
+    /// 调用方给出整个交互的截止时间，基线采集也计入总期限。
+    pub(super) fn begin_chat_decision_reader_until<A, P>(
+        &self,
+        scope: ChatDecisionScope,
+        accepts_message_type: &A,
+        is_decision: &P,
+        deadline: Instant,
+    ) -> Result<ChatDecisionReader>
+    where
+        A: Fn(&str) -> bool,
+        P: Fn(&str) -> bool,
+    {
+        let observation_session =
+            self.ui
+                .chat_observations
+                .begin_exclusive_until(deadline, || {
+                    !self.lifecycle.running.load(AtomicOrdering::SeqCst)
+                        || self.lifecycle.paused.load(AtomicOrdering::SeqCst)
+                        || self.lifecycle.live_configs.has_pending_reload()
+                })?;
         let listener_mode = self.business.business.chat_listener_snapshot()?.mode;
         let chat = if scope == ChatDecisionScope::CurrentHall
             && self.active_ui_residency()? == UiResidency::SecondaryCurrentHall
@@ -514,11 +531,12 @@ impl ApplicationRuntime {
         };
         let subscriber = self.ui.shared_ocr.subscribe()?;
         let refresh = self.ui.shared_ocr.request_refresh()?;
-        let deadline = Instant::now()
-            + Duration::from_millis(self.lifecycle.config.timing.decision.timeout_ms);
         let baseline = loop {
             if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
                 return Err(anyhow!("运行已停止，已结束确认窗口"));
+            }
+            if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+                return Err(anyhow!("运行已暂停，已结束确认窗口"));
             }
             if self.lifecycle.live_configs.has_pending_reload() {
                 return Err(anyhow!("配置重载待处理，已结束确认窗口"));
@@ -625,6 +643,9 @@ impl ApplicationRuntime {
         &self,
         reader: &mut ChatDecisionReader,
     ) -> Result<Vec<ChatMessage>> {
+        if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+            return Err(anyhow!("运行已暂停，已结束确认窗口"));
+        }
         if self.lifecycle.live_configs.has_pending_reload() {
             return Err(anyhow!("配置重载待处理，已结束确认窗口"));
         }
@@ -722,6 +743,7 @@ impl ApplicationRuntime {
                             .is_none_or(|sender| sender.trim().is_empty()))
                 {
                     log::debug!("二级身份相关输入尚未取得发送者，保留共享消息等待身份修订");
+                    outcome.unrecognized = true;
                     continue;
                 }
             }
@@ -763,8 +785,9 @@ impl ApplicationRuntime {
                     continue;
                 }
             }
-            let Some(index) = text.find('@') else {
+            let Some(index) = text.find(['@', '＠']) else {
                 log::debug!("二级监听气泡不是命令: {}", redacted_chat_text(&text));
+                outcome.unrecognized = true;
                 continue;
             };
             let command_text = text[index..].trim().to_string();
@@ -775,12 +798,14 @@ impl ApplicationRuntime {
                 command_text,
                 command_observation,
             ) else {
+                outcome.unrecognized = true;
                 continue;
             };
             let Some(parsed) =
                 router.route(&envelope, self.business.business.active_entertainment()?)
             else {
                 log::debug!("二级监听气泡未解析为命令");
+                outcome.unrecognized = true;
                 continue;
             };
             outcome.processed = true;
@@ -864,14 +889,6 @@ mod tests {
                 .unwrap();
             assert_eq!(authorized.permission_required, None);
             assert_eq!(authorized.role, Some(IdentityRole::Admin));
-        }
-    }
-
-    fn primary_message(text: &str, y: i32) -> ChatMessage {
-        ChatMessage {
-            message_type: "blue".to_string(),
-            block: Rect::new(0, y, 100, 20),
-            text: text.to_string(),
         }
     }
 
@@ -1019,30 +1036,5 @@ mod tests {
 
         tracker.commit(&current);
         assert!(tracker.preview_new_indexes(&current).is_empty());
-    }
-
-    #[test]
-    fn primary_decision_reader_uses_messages_after_the_shared_ocr_cursor() {
-        let shared = ChatObservationShared::new();
-        shared
-            .observe_primary(vec![
-                primary_message("消息1", 0),
-                primary_message("消息2", 20),
-            ])
-            .unwrap();
-        let cursor = shared.primary_cursor().unwrap().expect("primary cursor");
-        let observed = shared
-            .observe_primary(vec![
-                primary_message("消息2", 0),
-                primary_message("玩家：@确认", 20),
-            ])
-            .unwrap();
-
-        let decisions = primary_messages_after_cursor(observed, cursor)
-            .into_iter()
-            .map(|message| message.text)
-            .collect::<Vec<_>>();
-
-        assert_eq!(decisions, ["玩家：@确认"]);
     }
 }

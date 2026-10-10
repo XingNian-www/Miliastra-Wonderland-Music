@@ -41,10 +41,8 @@ fn classify_saved_frame(
     let templates =
         crate::ui::state::UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     // 分类器消耗一份模板；fallback 探针还要用，所以先克隆一份。
-    let mut classifier = crate::ui::state::TemplateUiStateClassifier::new(
-        templates.clone(),
-        config.screen.clone(),
-    );
+    let mut classifier =
+        crate::ui::state::TemplateUiStateClassifier::new(templates.clone(), config.screen.clone());
     let classification = classifier
         .classify_at(image, std::time::Instant::now())
         .map_err(|error| AppError {
@@ -103,8 +101,7 @@ fn classify_saved_frame(
     // 让离线也能看见 `world-wish` 的分数——但**绝不**据此改写上面的 kind。
     // 注：`game_entry` 需要 OCR 运行时，离线传 None，所以 `game_gate` 这条分支离线测不到。
     let fallback = if classification.kind() == crate::runtime::ui::UiStateKind::Unknown {
-        match crate::ui::state::probe_game_state_without_entry(image, &templates, &config.screen)
-        {
+        match crate::ui::state::probe_game_state_without_entry(image, &templates, &config.screen) {
             Ok(probed) => {
                 let probed_evidence = probed.evidence();
                 let probed_probes: Vec<serde_json::Value> = probed_evidence
@@ -372,14 +369,11 @@ pub(super) fn debug_ui_catalogue_route(
             if path.extension().and_then(|ext| ext.to_str()) != Some("png") {
                 path.set_extension("png");
             }
-            image
-                .save(&path)
-                .map_err(|error| AppError {
-                    status: 500,
-                    message: format!("保存测量帧失败: {error}"),
-                })
-                .map(|()| path.display().to_string())
-                .ok()
+            image.save(&path).map_err(|error| AppError {
+                status: 500,
+                message: format!("保存测量帧失败: {error}"),
+            })?;
+            Some(path.display().to_string())
         }
         _ => None,
     };
@@ -682,6 +676,66 @@ fn sse_frame(event: &crate::debug_events::DebugEvent) -> String {
     )
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReadOnlyModeRequest {
+    enabled: bool,
+    state: crate::debug_read_only::ReadOnlyState,
+}
+pub(super) fn debug_read_only_mode_set_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> Result<String, AppError> {
+    let request = parse_json_body::<ReadOnlyModeRequest>(body, "只读模式")?;
+    let mode = debug_service(state)?
+        .set_read_only_mode(request.enabled, request.state)
+        .map_err(command_error)?;
+    Ok(json!({"ok":true,"mode":mode}).to_string())
+}
+pub(super) fn debug_read_only_mode_route(
+    _: &[(String, String)],
+    state: &HttpSharedState,
+) -> Result<String, AppError> {
+    let _ = debug_service(state)?;
+    Ok(json!({"ok":true,"mode":crate::debug_read_only::observer().state_snapshot()}).to_string())
+}
+pub(super) fn debug_read_only_read_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> Result<String, AppError> {
+    let request =
+        parse_json_body::<crate::debug_http_service::ReadOnlyReadRequest>(body, "只读读取")?;
+    let evidence = debug_service(state)?
+        .read_active(request)
+        .map_err(command_error)?;
+    Ok(json!({"ok":true,"evidence":evidence}).to_string())
+}
+pub(super) fn debug_read_only_evidence_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> Result<String, AppError> {
+    let _ = debug_service(state)?;
+    let id = required_query(query, "id")?;
+    let evidence = crate::debug_read_only::observer()
+        .read_entry(&id)
+        .map_err(|reason| bad_request(&reason))?;
+    Ok(json!({"ok":true,"evidence":evidence}).to_string())
+}
+pub(super) fn debug_read_only_entries_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> Result<String, AppError> {
+    let _ = debug_service(state)?;
+    let since = query_value(query, "since")
+        .unwrap_or("0")
+        .parse::<u64>()
+        .map_err(|_| bad_request("since必须为非负整数"))?;
+    Ok(
+        json!({"ok":true,"entries":crate::debug_read_only::observer().list_after(since)})
+            .to_string(),
+    )
+}
+
 /// GET /debug/tasks：列出已保存的沙盒任务。
 pub(super) fn debug_tasks_route(
     _: &[(String, String)],
@@ -928,9 +982,22 @@ pub(super) fn debug_events_response(
     );
     let since = query_value(&request.query, "since")
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let bus = crate::debug_events::bus();
-    let replay = bus.replay_after(since);
+        .unwrap_or(0)
+        .max(
+            request
+                .headers
+                .get("last-event-id")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0),
+        );
+    let bus = if request.path == "/debug/read-only/events" {
+        let _ = debug_service(state)?;
+        crate::debug_read_only::observer().bus()
+    } else {
+        crate::debug_events::bus()
+    };
+    let (replay, receiver) = bus.subscribe_replay_after(since);
 
     let mut headers = cors_headers(request, &state.config.http.host, state.config.http.port);
     // SSE 必须禁缓存，否则会被中间层攒成批量轮询。
@@ -949,7 +1016,6 @@ pub(super) fn debug_events_response(
         ));
     }
 
-    let receiver = bus.subscribe();
     let replay_stream = tokio_stream::iter(
         replay
             .into_iter()

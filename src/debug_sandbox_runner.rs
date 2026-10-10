@@ -198,6 +198,10 @@ pub(crate) struct SandboxUiStateReading {
 }
 
 pub(crate) trait SandboxExecutor: Send {
+    /// 在创建运行及执行每一步前校验；业务分支也必须经过此边界。
+    fn validate_command(&self, _command: &AtomicCommand) -> Result<(), String> {
+        Ok(())
+    }
     fn set_cancellation_signal(&mut self, _signal: Arc<AtomicBool>) {}
     fn recover(&mut self) -> Result<(), String> {
         Ok(())
@@ -623,6 +627,11 @@ impl<E: SandboxExecutor> DebugSandboxRunner<E> {
         task: &SandboxTask,
         assertions: &[StepAssertion],
     ) -> Result<(), String> {
+        for (index, command) in task.commands.iter().enumerate() {
+            self.executor
+                .validate_command(command)
+                .map_err(|error| format!("命令 {index}: {error}"))?;
+        }
         if self.ocr.is_none()
             && assertions
                 .iter()
@@ -818,8 +827,10 @@ impl<E: SandboxExecutor> DebugSandboxRunner<E> {
             .filter(|a| a.index == index)
             .map(|a| a.assertion.clone())
             .collect();
-        // 按任务策略采集证据；显式 Capture 或截图断言仍强制采集。
-        let should_capture = command.playback_action().is_none()
+        let command_validation = self.executor.validate_command(&command);
+        // 按任务策略采集证据；被拒绝的命令不能触发动作或后置截图。
+        let should_capture = command_validation.is_ok()
+            && command.playback_action().is_none()
             && command.song_request_payload().is_none()
             && command.chat_send_payload().is_none()
             && command.startup_request_payload().is_none()
@@ -845,7 +856,9 @@ impl<E: SandboxExecutor> DebugSandboxRunner<E> {
         let business_clear = matches!(command, AtomicCommand::PlaybackQueueClear);
         let business_remove_front = matches!(command, AtomicCommand::PlaybackQueueRemoveFront);
         let business_task_cancel = matches!(command, AtomicCommand::TaskQueueCancel { .. });
-        let (mut error, captured) = if let Some(action) = command.playback_action() {
+        let (mut error, captured) = if let Err(reason) = command_validation {
+            (Some(reason), None)
+        } else if let Some(action) = command.playback_action() {
             (self.executor.playback_control(action).err(), None)
         } else if let Some(request) = command.song_request_payload() {
             (self.executor.song_request(request).err(), None)
@@ -1129,8 +1142,15 @@ impl UiRoutine for LiveCommandRoutine {
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         use crate::debug_sandbox::AtomicCommand::*;
+        if crate::debug_read_only::observer().enabled() && !self.0.is_read_only() {
+            anyhow::bail!("只读状态拒绝 live 输入或业务命令");
+        }
         let closes_window = matches!(self.0, CloseWindow);
         if self.1.load(Ordering::Acquire) || context.is_cancelled() {
+            anyhow::ensure!(
+                !crate::debug_read_only::observer().enabled(),
+                "只读状态禁止设备恢复"
+            );
             context.device().recover().map_err(|error| {
                 anyhow::anyhow!("live run cancelled; device recovery failed: {error:#}")
             })?;
@@ -1201,6 +1221,10 @@ impl UiRoutine for LiveCommandRoutine {
             }
         }
         if self.1.load(Ordering::Acquire) || context.is_cancelled() {
+            anyhow::ensure!(
+                !crate::debug_read_only::observer().enabled(),
+                "只读状态禁止设备恢复"
+            );
             context.device().recover().map_err(|error| {
                 anyhow::anyhow!("live run cancelled; device recovery failed: {error:#}")
             })?;
@@ -1237,6 +1261,10 @@ impl UiRoutine for LiveRecoveryRoutine {
     type Output = anyhow::Result<()>;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        anyhow::ensure!(
+            !crate::debug_read_only::observer().enabled(),
+            "只读状态禁止设备恢复"
+        );
         context.device().recover()
     }
 }
@@ -1286,6 +1314,197 @@ impl UiRoutine for LiveClipboardRoutine {
     type Output = anyhow::Result<Option<String>>;
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         context.device().clipboard_text()
+    }
+}
+
+/// 只读 routine 与 live 输入 routine 分离，取消/失败/超时均没有设备恢复分支。
+struct ReadOnlyCommandRoutine(AtomicCommand, Arc<AtomicBool>, bool);
+impl crate::runtime::ui::sealed::UiRoutineSealed for ReadOnlyCommandRoutine {}
+impl UiRoutine for ReadOnlyCommandRoutine {
+    type Output = anyhow::Result<Option<DynamicImage>>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        if !self.0.is_read_only() {
+            anyhow::bail!("只读执行器拒绝输入或业务命令");
+        }
+        if self.1.load(Ordering::Acquire) || context.is_cancelled() {
+            anyhow::bail!("read-only run cancelled");
+        }
+        match self.0 {
+            AtomicCommand::Capture => {}
+            AtomicCommand::EnsureWindow => {
+                anyhow::ensure!(context.device().window_available()?, "目标窗口不可用");
+            }
+            AtomicCommand::EnsureForeground => {
+                anyhow::ensure!(context.device().window_foreground()?, "目标窗口不在前台");
+            }
+            AtomicCommand::Wait { milliseconds } => {
+                let deadline = std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_millis(milliseconds))
+                    .ok_or_else(|| anyhow::anyhow!("只读等待时间越界"))?;
+                loop {
+                    if self.1.load(Ordering::Acquire) || context.is_cancelled() {
+                        anyhow::bail!("read-only run cancelled");
+                    }
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    context
+                        .wait_cancellable(remaining.min(std::time::Duration::from_millis(25)))?;
+                }
+            }
+            _ => anyhow::bail!("只读执行器拒绝输入或业务命令"),
+        }
+        if self.1.load(Ordering::Acquire) || context.is_cancelled() {
+            anyhow::bail!("read-only run cancelled");
+        }
+        if self.2 {
+            // 原图交给 runner 保留；后续取消不会把已完成的帧证据替换成缩略图。
+            Ok(Some(context.capture_frame()?.into_image()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// 已有查询 routine 的取消围栏：排队期间取消后不再读取设备。
+struct ReadOnlyQueryRoutine<R>(R, Arc<AtomicBool>);
+impl<R: UiRoutine> crate::runtime::ui::sealed::UiRoutineSealed for ReadOnlyQueryRoutine<R> {}
+impl<R, T> UiRoutine for ReadOnlyQueryRoutine<R>
+where
+    R: UiRoutine<Output = anyhow::Result<T>>,
+    T: Send + 'static,
+{
+    type Output = anyhow::Result<T>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        if self.1.load(Ordering::Acquire) || context.is_cancelled() {
+            anyhow::bail!("read-only run cancelled");
+        }
+        self.0.execute(context)
+    }
+}
+
+/// 主动读取/触发只读流程共用的执行边界，不改变全局调试模式或业务监听。
+/// 刻意只持有读队列接口：无法接入业务 canceller/controller 或任何写 adapter。
+pub(crate) struct ReadOnlyExecutor {
+    handle: UiRuntimeHandle,
+    cancellation: Arc<AtomicBool>,
+    playback_queue: Option<PlaybackQueueLengthReader>,
+}
+
+impl ReadOnlyExecutor {
+    pub(crate) fn new(handle: UiRuntimeHandle) -> Self {
+        Self {
+            handle,
+            cancellation: Arc::new(AtomicBool::new(false)),
+            playback_queue: None,
+        }
+    }
+
+    pub(crate) fn with_playback_queue_reader(mut self, reader: PlaybackQueueLengthReader) -> Self {
+        self.playback_queue = Some(reader);
+        self
+    }
+
+    fn check_cancellation(&self) -> Result<(), String> {
+        if self.cancellation.load(Ordering::Acquire) {
+            Err("read-only run cancelled".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn submit_read<R, T>(&self, routine: R, timeout: std::time::Duration) -> Result<T, String>
+    where
+        R: UiRoutine<Output = anyhow::Result<T>>,
+        T: Send + 'static,
+    {
+        self.check_cancellation()?;
+        // 普通 submit 与主业务共享 UI 串行通道；不要求调试模式、不取得外部输入授权。
+        let operation = self
+            .handle
+            .submit(ReadOnlyQueryRoutine(routine, self.cancellation.clone()))
+            .map_err(|error| format!("提交只读 UI 查询失败: {error}"))?;
+        operation
+            .wait_timeout(timeout)
+            .map_err(|error| {
+                // wait_timeout 也会取消 UI operation；绝不提交 LiveRecoveryRoutine。
+                self.cancellation.store(true, Ordering::Release);
+                format!("等待只读 UI 查询失败: {error}")
+            })?
+            .map_err(|error| format!("只读 UI 查询失败: {error:#}"))
+    }
+
+    fn submit_command(
+        &self,
+        command: &AtomicCommand,
+        capture: bool,
+    ) -> Result<Option<DynamicImage>, String> {
+        self.validate_command(command)?;
+        self.submit_read(
+            ReadOnlyCommandRoutine(command.clone(), self.cancellation.clone(), capture),
+            live_command_timeout(command),
+        )
+    }
+}
+
+impl SandboxExecutor for ReadOnlyExecutor {
+    fn validate_command(&self, command: &AtomicCommand) -> Result<(), String> {
+        if command.is_read_only() {
+            Ok(())
+        } else {
+            // 不回显命令载荷，避免把输入正文误写进只读运行的拒绝错误。
+            Err("只读执行器拒绝输入或业务命令".into())
+        }
+    }
+    fn set_cancellation_signal(&mut self, signal: Arc<AtomicBool>) {
+        self.cancellation = signal;
+    }
+    fn recover(&mut self) -> Result<(), String> {
+        // runner 的统一失败/取消收尾仍可调用此接口；只读运行没有输入需要释放。
+        Ok(())
+    }
+    fn supports_window_available(&self) -> bool {
+        true
+    }
+    fn window_available(&mut self) -> Result<bool, String> {
+        self.submit_read(LiveAvailabilityRoutine, std::time::Duration::from_secs(5))
+    }
+    fn supports_window_foreground(&self) -> bool {
+        true
+    }
+    fn window_foreground(&mut self) -> Result<bool, String> {
+        self.submit_read(LiveForegroundRoutine, std::time::Duration::from_secs(5))
+    }
+    fn supports_ui_state(&self) -> bool {
+        true
+    }
+    fn ui_state(&mut self) -> Result<Option<SandboxUiStateReading>, String> {
+        self.submit_read(LiveUiStateRoutine, std::time::Duration::from_secs(5))
+    }
+    fn supports_playback_queue_length(&self) -> bool {
+        self.playback_queue.is_some()
+    }
+    fn playback_queue_length(&mut self) -> Result<usize, String> {
+        self.check_cancellation()?;
+        self.playback_queue
+            .as_ref()
+            .ok_or_else(|| "只读执行器未配置播放队列状态 reader".to_string())?()
+    }
+    fn execute(&mut self, command: &AtomicCommand) -> Result<(), String> {
+        self.submit_command(command, false).map(|_| ())
+    }
+    fn execute_with_frame(
+        &mut self,
+        command: &AtomicCommand,
+    ) -> Result<Option<DynamicImage>, String> {
+        self.submit_command(command, true)
+    }
+    fn capture(&mut self) -> Result<DynamicImage, String> {
+        self.submit_command(&AtomicCommand::Capture, true)?
+            .ok_or_else(|| "只读 capture 未返回原始帧".into())
     }
 }
 
@@ -1352,6 +1571,9 @@ impl LiveExecutor {
         self
     }
     fn recover_device(&self) -> Result<(), String> {
+        if crate::debug_read_only::observer().enabled() {
+            return Err("只读状态禁止设备恢复".into());
+        }
         self.handle
             .submit_external(LiveRecoveryRoutine)
             .map_err(|error| error.to_string())?
@@ -1365,6 +1587,7 @@ impl LiveExecutor {
         command: AtomicCommand,
         capture: bool,
     ) -> Result<Option<DynamicImage>, String> {
+        self.validate_command(&command)?;
         let signal = self
             .cancellation
             .clone()
@@ -1396,6 +1619,13 @@ impl LiveExecutor {
     }
 }
 impl SandboxExecutor for LiveExecutor {
+    fn validate_command(&self, command: &AtomicCommand) -> Result<(), String> {
+        if crate::debug_read_only::observer().enabled() && !command.is_read_only() {
+            Err("只读状态拒绝 live 输入或业务命令".into())
+        } else {
+            Ok(())
+        }
+    }
     fn supports_playback_queue_length(&self) -> bool {
         self.playback_queue.is_some()
     }
@@ -1517,6 +1747,7 @@ impl SandboxExecutor for LiveExecutor {
         &mut self,
         command: &AtomicCommand,
     ) -> Result<Option<DynamicImage>, String> {
+        self.validate_command(command)?;
         self.submit(command.clone(), true)
     }
     fn capture(&mut self) -> Result<DynamicImage, String> {
@@ -1551,9 +1782,6 @@ impl SimulatedExecutor {
             fixture: Some(image),
             ..Self::default()
         }
-    }
-    pub(crate) fn set_fixture(&mut self, image: DynamicImage) {
-        self.fixture = Some(image);
     }
 }
 impl SandboxExecutor for SimulatedExecutor {
@@ -1644,6 +1872,607 @@ impl SandboxExecutor for SimulatedExecutor {
         self.fixture
             .clone()
             .ok_or_else(|| "模拟设备未提供截图 fixture".into())
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use crate::debug_sandbox::SandboxLimits;
+    use crate::runtime::ui::{UiDevice, UiRuntime};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Calls {
+        writes: AtomicUsize,
+        recoveries: AtomicUsize,
+        captures: AtomicUsize,
+        observations: AtomicUsize,
+        input_authorized: AtomicBool,
+    }
+
+    #[derive(Default)]
+    struct Device {
+        calls: Arc<Calls>,
+        frame: Option<Arc<DynamicImage>>,
+        on_window_check: Option<Box<dyn FnMut() + Send>>,
+    }
+    impl Device {
+        fn write(&self) -> anyhow::Result<()> {
+            self.calls.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn observe(&self) {
+            self.calls.observations.fetch_add(1, Ordering::SeqCst);
+            self.calls
+                .input_authorized
+                .store(crate::debug_mode::input_allowed(), Ordering::SeqCst);
+        }
+    }
+    impl UiDevice for Device {
+        fn capture(&mut self) -> anyhow::Result<DynamicImage> {
+            self.observe();
+            self.calls.captures.fetch_add(1, Ordering::SeqCst);
+            self.frame
+                .as_deref()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no real frame supplied"))
+        }
+        fn ensure_window(&mut self) -> anyhow::Result<()> {
+            self.observe();
+            if let Some(on_check) = &mut self.on_window_check {
+                on_check();
+            }
+            Ok(())
+        }
+        fn ensure_foreground(&mut self) -> anyhow::Result<()> {
+            self.observe();
+            Ok(())
+        }
+        fn window_available(&mut self) -> anyhow::Result<bool> {
+            self.observe();
+            if let Some(on_check) = &mut self.on_window_check {
+                on_check();
+            }
+            Ok(true)
+        }
+        fn window_foreground(&mut self) -> anyhow::Result<bool> {
+            self.observe();
+            Ok(true)
+        }
+        fn ensure_ready(&mut self, _: u64) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn activate(&mut self, _: u64) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn focus(&mut self, _: u64) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn input_text(&mut self, _: &str, _: u64) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn close_window(&mut self) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn press_key(&mut self, _: enigo::Key) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn key_down(&mut self, _: enigo::Key) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn key_up(&mut self, _: enigo::Key) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn mouse_down(&mut self, _: Button) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn mouse_up(&mut self, _: Button) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn click_point(&mut self, _: i32, _: i32) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn scroll_point(&mut self, _: i32, _: i32, _: i32) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn drag_point(&mut self, _: i32, _: i32, _: i32, _: i32) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn paste_text(&mut self, _: &str, _: u64) -> anyhow::Result<()> {
+            self.write()
+        }
+        fn recover(&mut self) -> anyhow::Result<()> {
+            self.calls.recoveries.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RestoreMode(bool);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            crate::debug_mode::set_enabled(self.0);
+        }
+    }
+
+    fn task(commands: Vec<AtomicCommand>, capture_after_each: bool) -> SandboxTask {
+        SandboxTask {
+            id: "read-only".into(),
+            version: 1,
+            description: String::new(),
+            commands,
+            capture_after_each,
+        }
+    }
+
+    fn write_commands() -> Vec<AtomicCommand> {
+        use AtomicCommand::*;
+        vec![
+            EnsureReady {
+                after_activate_ms: 0,
+            },
+            Activate {
+                after_activate_ms: 0,
+            },
+            Focus {
+                after_activate_ms: 0,
+            },
+            InputText {
+                text: "@歌单".into(),
+                settle_ms: 0,
+            },
+            CloseWindow,
+            PressKey { key: "a".into() },
+            KeyDown { key: "a".into() },
+            KeyUp { key: "a".into() },
+            MouseDown {
+                button: "left".into(),
+            },
+            MouseUp {
+                button: "left".into(),
+            },
+            Click { x: 1, y: 2 },
+            Scroll {
+                x: 1,
+                y: 2,
+                amount: 1,
+            },
+            Drag {
+                from_x: 0,
+                from_y: 0,
+                to_x: 1,
+                to_y: 1,
+            },
+            Paste {
+                text: "@歌单".into(),
+            },
+            PlaybackQueueClear,
+            PlaybackQueueRemoveFront,
+            PlaybackPlay,
+            PlaybackPause,
+            PlaybackSkipNext,
+            PlaybackSkipPrevious,
+            PlaybackSetVolume { volume: 50 },
+            RequestSong {
+                keyword: "晴天".into(),
+                source: String::new(),
+                prefer_accompaniment: false,
+            },
+            ChatSend {
+                text: "@歌单".into(),
+                prefix: String::new(),
+            },
+            StartupTask {
+                kind: "start_game".into(),
+            },
+            TaskQueueCancel { task_id: 1 },
+        ]
+    }
+
+    #[test]
+    fn read_only_rejects_every_write_before_run_and_at_executor_and_worker_boundaries() {
+        let calls = Arc::new(Calls::default());
+        let runtime = UiRuntime::start(
+            Device {
+                calls: calls.clone(),
+                ..Device::default()
+            },
+            2,
+        )
+        .unwrap();
+        // 在取得 runtime 测试串行锁后设模式；false 允许设备记录任何意外写调用。
+        let mode = RestoreMode(crate::debug_mode::set_enabled(false));
+        let store = DebugSandboxStore::new(SandboxLimits::default());
+        let mut executor = ReadOnlyExecutor::new(runtime.handle());
+        assert!(!executor.supports_task_queue_cancel());
+        assert!(!executor.supports_playback_queue_clear());
+        assert!(!executor.supports_playback_queue_remove_front());
+        assert!(!executor.supports_playback_control());
+        assert!(!executor.supports_song_request());
+        assert!(!executor.supports_chat_send());
+        assert!(!executor.supports_startup());
+        assert!(executor.task_queue_cancel(1).is_err());
+        assert!(executor.playback_queue_clear().is_err());
+        assert!(executor.playback_queue_remove_front().is_err());
+        assert!(executor.playback_control(PlaybackAction::Play).is_err());
+        let mut runner =
+            DebugSandboxRunner::new(store.clone(), ReadOnlyExecutor::new(runtime.handle()));
+        for (index, command) in write_commands().into_iter().enumerate() {
+            assert!(!command.is_read_only(), "{command:?}");
+            // 放在合法读取之后，确保整个流程预检，不能先执行前缀 Capture。
+            let mut task = task(vec![AtomicCommand::Capture, command.clone()], true);
+            task.version = index as u32 + 1;
+            store.save_task(task.clone()).unwrap();
+            assert!(
+                runner
+                    .start("read-only", None, vec![])
+                    .unwrap_err()
+                    .contains("只读执行器拒绝"),
+                "{command:?}"
+            );
+            assert!(
+                runner
+                    .start_snapshot(task, vec![])
+                    .unwrap_err()
+                    .contains("只读执行器拒绝"),
+                "{command:?}"
+            );
+            assert!(
+                executor
+                    .execute(&command)
+                    .unwrap_err()
+                    .contains("只读执行器拒绝"),
+                "{command:?}"
+            );
+            assert!(
+                executor
+                    .execute_with_frame(&command)
+                    .unwrap_err()
+                    .contains("只读执行器拒绝"),
+                "{command:?}"
+            );
+            // worker 层独立白名单也拒绝，避免将来调用方绕过 executor 的校验。
+            let error = runtime
+                .handle()
+                .submit(ReadOnlyCommandRoutine(
+                    command.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                    true,
+                ))
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("只读执行器拒绝"),
+                "{command:?}: {error}"
+            );
+        }
+        assert!(store.runs().unwrap().is_empty());
+        assert_eq!(calls.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.recoveries.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.captures.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.observations.load(Ordering::SeqCst), 0);
+        drop(mode);
+        assert!(!runtime.shutdown().unwrap().timed_out());
+    }
+
+    #[test]
+    fn runner_rechecks_executor_policy_before_dispatching_business_or_capturing() {
+        struct ChangingPolicy {
+            allowed: Arc<AtomicBool>,
+            dispatched: Arc<AtomicUsize>,
+        }
+        impl SandboxExecutor for ChangingPolicy {
+            fn validate_command(&self, _: &AtomicCommand) -> Result<(), String> {
+                if self.allowed.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err("只读策略拒绝业务命令".into())
+                }
+            }
+            fn supports_playback_queue_clear(&self) -> bool {
+                true
+            }
+            fn playback_queue_clear(&mut self) -> Result<(), String> {
+                self.dispatched.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn execute(&mut self, _: &AtomicCommand) -> Result<(), String> {
+                panic!("rejected command must not execute")
+            }
+            fn capture(&mut self) -> Result<DynamicImage, String> {
+                panic!("rejected command must not capture")
+            }
+        }
+        let allowed = Arc::new(AtomicBool::new(true));
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let mut runner = DebugSandboxRunner::new(
+            DebugSandboxStore::new(SandboxLimits::default()),
+            ChangingPolicy {
+                allowed: allowed.clone(),
+                dispatched: dispatched.clone(),
+            },
+        );
+        let run = runner
+            .start_snapshot(task(vec![AtomicCommand::PlaybackQueueClear], true), vec![])
+            .unwrap();
+        allowed.store(false, Ordering::Release);
+        let done = runner.step(&run.run_id).unwrap();
+        assert_eq!(done.status, SandboxStatus::Failed);
+        assert!(
+            done.results[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("只读策略拒绝")
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert!(runner.evidence(&run.run_id).unwrap()[0].image.is_none());
+    }
+
+    #[test]
+    fn read_only_cancellation_before_step_and_during_check_never_recovers_or_captures() {
+        let calls = Arc::new(Calls::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let runtime = UiRuntime::start(
+            Device {
+                calls: calls.clone(),
+                on_window_check: Some(Box::new(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                })),
+                ..Device::default()
+            },
+            2,
+        )
+        .unwrap();
+        let store = DebugSandboxStore::new(SandboxLimits::default());
+        let mut runner =
+            DebugSandboxRunner::new(store.clone(), ReadOnlyExecutor::new(runtime.handle()));
+        let before = runner
+            .start_snapshot(task(vec![AtomicCommand::Capture], true), vec![])
+            .unwrap();
+        runner.cancel(&before.run_id).unwrap();
+        assert_eq!(
+            runner.step(&before.run_id).unwrap().status,
+            SandboxStatus::Cancelled
+        );
+        assert_eq!(calls.observations.load(Ordering::SeqCst), 0);
+        let run = runner
+            .start_snapshot(
+                task(
+                    vec![AtomicCommand::EnsureWindow, AtomicCommand::Capture],
+                    true,
+                ),
+                vec![],
+            )
+            .unwrap();
+        let id = run.run_id.clone();
+        let worker = std::thread::spawn(move || {
+            let done = runner.step(&id).unwrap();
+            (runner, done)
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        store.cancel_run(&run.run_id).unwrap();
+        release_tx.send(()).unwrap();
+        let (runner, done) = worker.join().unwrap();
+        assert_eq!(done.status, SandboxStatus::Cancelled);
+        assert_eq!(done.results.len(), 1);
+        assert!(
+            done.results[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cancelled")
+        );
+        assert!(runner.evidence(&run.run_id).unwrap()[0].image.is_none());
+        assert_eq!(calls.captures.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.recoveries.load(Ordering::SeqCst), 0);
+        assert!(!runtime.shutdown().unwrap().timed_out());
+    }
+
+    #[test]
+    fn read_only_timeout_cancels_wait_and_never_queues_recovery() {
+        let calls = Arc::new(Calls::default());
+        let runtime = UiRuntime::start(
+            Device {
+                calls: calls.clone(),
+                ..Device::default()
+            },
+            2,
+        )
+        .unwrap();
+        let mut executor = ReadOnlyExecutor::new(runtime.handle());
+        let error = executor
+            .submit_read(
+                ReadOnlyCommandRoutine(
+                    AtomicCommand::Wait { milliseconds: 5000 },
+                    executor.cancellation.clone(),
+                    true,
+                ),
+                Duration::from_millis(10),
+            )
+            .unwrap_err();
+        assert!(error.contains("等待只读 UI 查询失败"), "{error}");
+        assert!(executor.cancellation.load(Ordering::Acquire));
+        assert!(
+            executor
+                .execute(&AtomicCommand::EnsureWindow)
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        assert!(executor.capture().unwrap_err().contains("cancelled"));
+        executor.recover().unwrap();
+        // 普通只读查询作为 worker 排空围栏，确保超时 routine 已经退出。
+        assert!(
+            runtime
+                .handle()
+                .submit(LiveAvailabilityRoutine)
+                .unwrap()
+                .wait_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(calls.captures.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.recoveries.load(Ordering::SeqCst), 0);
+        assert!(!runtime.shutdown().unwrap().timed_out());
+    }
+
+    #[test]
+    fn read_only_failed_capture_and_assertion_keep_failure_without_device_recovery() {
+        let calls = Arc::new(Calls::default());
+        let runtime = UiRuntime::start(
+            Device {
+                calls: calls.clone(),
+                ..Device::default()
+            },
+            2,
+        )
+        .unwrap();
+        let mut runner = DebugSandboxRunner::new(
+            DebugSandboxStore::new(SandboxLimits::default()),
+            ReadOnlyExecutor::new(runtime.handle()).with_playback_queue_reader(Arc::new(|| Ok(2))),
+        );
+        let capture = runner
+            .start_snapshot(task(vec![AtomicCommand::Capture], true), vec![])
+            .unwrap();
+        let done = runner.run_all(&capture.run_id).unwrap();
+        assert_eq!(done.status, SandboxStatus::Failed);
+        assert!(
+            done.results[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("no real frame supplied")
+        );
+        let assertion = runner
+            .start_snapshot(
+                task(vec![AtomicCommand::Wait { milliseconds: 0 }], false),
+                vec![StepAssertion {
+                    index: 0,
+                    assertion: SandboxAssertion::PlaybackQueueLength { expected: 0 },
+                }],
+            )
+            .unwrap();
+        let done = runner.run_all(&assertion.run_id).unwrap();
+        assert_eq!(done.status, SandboxStatus::Failed);
+        assert!(
+            done.results[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("actual=2")
+        );
+        assert_eq!(calls.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.recoveries.load(Ordering::SeqCst), 0);
+        assert!(!runtime.shutdown().unwrap().timed_out());
+    }
+
+    #[test]
+    fn read_only_full_real_frame_and_state_window_queue_assertions_work_without_mode_change() {
+        use crate::config::AppConfig;
+        use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
+        // 来源沿用 friend_delivery.rs secondary_hall_row_frame 的现有真实私聊截图。
+        // 此回归仅验证执行边界和原帧证据保留，不能称为游戏操作验收。
+        let frame = Arc::new(
+            image::open("tests/fixtures/ui/secondary-with-hall-row-1920x1080.png").unwrap(),
+        );
+        assert_eq!(frame.dimensions(), (1920, 1080));
+        let calls = Arc::new(Calls::default());
+        let config =
+            AppConfig::load(std::path::Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let runtime = UiRuntime::start_with_state_classifier(
+            Device {
+                calls: calls.clone(),
+                frame: Some(frame.clone()),
+                ..Device::default()
+            },
+            2,
+            TemplateUiStateClassifier::new(
+                UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+                config.screen.clone(),
+            ),
+            1,
+        )
+        .unwrap();
+        let mode = RestoreMode(crate::debug_mode::set_enabled(false));
+        let generation = crate::debug_mode::generation();
+        // 稳定性跟踪至少需要两次独立帧观测，单张真图不能直接证明稳定。
+        let mut warmup = ReadOnlyExecutor::new(runtime.handle());
+        warmup.capture().unwrap();
+        let mut runner = DebugSandboxRunner::new(
+            DebugSandboxStore::new(SandboxLimits::default()),
+            ReadOnlyExecutor::new(runtime.handle()).with_playback_queue_reader(Arc::new(|| Ok(3))),
+        );
+        let run = runner
+            .start_snapshot(
+                task(
+                    vec![
+                        AtomicCommand::EnsureWindow,
+                        AtomicCommand::EnsureForeground,
+                        AtomicCommand::Capture,
+                        AtomicCommand::Wait { milliseconds: 0 },
+                    ],
+                    false,
+                ),
+                vec![
+                    StepAssertion {
+                        index: 0,
+                        assertion: SandboxAssertion::WindowAvailable { expected: true },
+                    },
+                    StepAssertion {
+                        index: 1,
+                        assertion: SandboxAssertion::WindowForeground { expected: true },
+                    },
+                    StepAssertion {
+                        index: 2,
+                        assertion: SandboxAssertion::Dimensions {
+                            width: 1920,
+                            height: 1080,
+                        },
+                    },
+                    StepAssertion {
+                        index: 2,
+                        assertion: SandboxAssertion::UiState {
+                            expected: SandboxUiStateKind::Secondary,
+                            stable: true,
+                        },
+                    },
+                    StepAssertion {
+                        index: 3,
+                        assertion: SandboxAssertion::PlaybackQueueLength { expected: 3 },
+                    },
+                ],
+            )
+            .unwrap();
+        let done = runner.run_all(&run.run_id).unwrap();
+        assert_eq!(done.status, SandboxStatus::Passed, "{:?}", done.results);
+        let evidence = runner.evidence(&run.run_id).unwrap();
+        let captured = evidence[2].image.as_ref().unwrap();
+        assert_eq!(captured.dimensions(), frame.dimensions());
+        assert_eq!(captured.color(), frame.color());
+        assert_eq!(captured.as_bytes(), frame.as_bytes());
+        assert_eq!(evidence[2].result.frame_sequence, Some(1));
+        assert_eq!(calls.captures.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.recoveries.load(Ordering::SeqCst), 0);
+        assert!(!crate::debug_mode::enabled());
+        assert_eq!(crate::debug_mode::generation(), generation);
+        // 在调试模式下同样读取，但 worker 不获得外部输入授权；模式由测试设置。
+        crate::debug_mode::set_enabled(true);
+        let generation = crate::debug_mode::generation();
+        assert!(runner.executor.window_available().unwrap());
+        assert!(!calls.input_authorized.load(Ordering::SeqCst));
+        assert_eq!(crate::debug_mode::generation(), generation);
+        assert!(crate::debug_mode::enabled());
+        drop(mode);
+        assert!(!runtime.shutdown().unwrap().timed_out());
     }
 }
 

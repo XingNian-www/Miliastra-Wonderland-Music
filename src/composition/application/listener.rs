@@ -1,5 +1,6 @@
 use super::secondary_chat::{SecondaryHallCommandTracker, SecondaryListenerRoundState};
 use super::*;
+use crate::observation::chat::ChatIdentity;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,10 @@ fn listener_mode_matches_ui(
         (UiResidency::Primary, UiStateKind::Primary)
             | (UiResidency::SecondaryCurrentHall, UiStateKind::Secondary)
     )
+}
+
+fn scan_frame_is_fresh(captured_at: Instant, not_before: Option<Instant>) -> bool {
+    not_before.is_none_or(|boundary| captured_at >= boundary)
 }
 
 fn primary_rescan_can_publish(stable_kind: Option<UiStateKind>) -> bool {
@@ -212,6 +217,7 @@ fn bubble_key(id: &crate::observation::chat::ObservedChatMessageId) -> String {
         ChatIdentity::Friend(name) => format!("friend:{name}"),
         ChatIdentity::PublicChannel => "public".to_string(),
         ChatIdentity::StrangerMessages => "strangers".to_string(),
+        ChatIdentity::Unknown => "unknown".to_string(),
     };
     format!(
         "{}|{chat}|{}",
@@ -498,22 +504,6 @@ impl ApplicationRuntime {
         Ok(())
     }
 
-    pub(super) fn scan_chat_with_shared_ocr(
-        &self,
-        image: &DynamicImage,
-        templates: &ResolvedTemplateArgs,
-        marker_hits: Option<Vec<crate::ui::template::TemplateHit>>,
-    ) -> Result<Vec<ChatMessage>> {
-        scan_chat_with_shared_ocr(
-            &self.ui.ocr,
-            &self.lifecycle.monitor,
-            self.lifecycle.config.screen.chat_rect.into(),
-            image,
-            templates,
-            marker_hits,
-        )
-    }
-
     pub(super) fn warn_if_screen_size_mismatch(&self) -> Result<()> {
         let frame = match self.ui.game_ui.capture() {
             Ok(frame) => frame,
@@ -777,13 +767,22 @@ impl ApplicationRuntime {
         *check_after = Instant::now() + retry_delay;
     }
 
-    pub(super) fn run_scan_loop(&mut self) -> Result<()> {
+    pub(super) fn run_scan_loop(
+        &mut self,
+        shared_subscriber: crate::observation::chat::SharedChatSubscriber,
+    ) -> Result<()> {
         let mut completion_subscriber = self
             .ui
             .chat_observations
             .subscribe_completion_advances()
             .context("订阅聊天观察完成推进")?;
-        let scan_result = self.run_scan_loop_inner(&mut completion_subscriber);
+        let scan_result = self.run_scan_loop_inner(&mut completion_subscriber, &shared_subscriber);
+        // A stopped listener cannot produce another Primary observation for decision waiters.
+        let reason = match &scan_result {
+            Ok(()) => "聊天扫描循环已停止".to_string(),
+            Err(error) => format!("聊天扫描循环退出: {error:#}"),
+        };
+        self.report_primary_scan_failure(reason);
         let final_forward_result = self.forward_completion_advances(&mut completion_subscriber);
         match scan_result {
             Err(error) => {
@@ -799,6 +798,7 @@ impl ApplicationRuntime {
     fn run_scan_loop_inner(
         &mut self,
         completion_subscriber: &mut CompletionAdvanceSubscriber,
+        shared_subscriber: &crate::observation::chat::SharedChatSubscriber,
     ) -> Result<()> {
         let template_args = self.ui.chat_templates.clone();
         let canvas = Canvas {
@@ -817,6 +817,7 @@ impl ApplicationRuntime {
         let mut frame_demand = FrameDemand::new(Duration::from_millis(frame_demand_ms))
             .context("创建聊天观察帧需求")?;
         let mut frame_subscription: Option<FrameDemandSubscription> = None;
+        let mut last_scan_boundary: Option<Instant> = None;
         let mut last_fingerprint: Option<ChangeFingerprint> = None;
         let mut last_ocr_at = Instant::now()
             - Duration::from_millis(initial_live_config.timing.chat_scan.fallback_ms);
@@ -842,6 +843,7 @@ impl ApplicationRuntime {
         let mut target_missing = false;
         let mut hall_expiry_pause_applied = false;
         let mut hall_expiry_check_after = Instant::now();
+        let mut shared_backlog = std::collections::VecDeque::new();
         log::info!("自动化扫描已启动");
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) {
             self.poll_hall_expiry(&mut hall_expiry_pause_applied, &mut hall_expiry_check_after);
@@ -869,11 +871,12 @@ impl ApplicationRuntime {
                     .context("更新聊天观察帧需求")?;
                 frame_demand_ms = next_frame_demand_ms;
             }
+            self.consume_shared_chat_snapshots(shared_subscriber, &mut shared_backlog)?;
             self.forward_completion_advances(completion_subscriber)?;
             let loop_started = Instant::now();
             self.update_monitor_operational_state();
             self.tick_entertainment();
-            if !self.ui.coordinator.scan_may_run() {
+            let Some(scan_lease) = self.ui.coordinator.try_acquire_scan() else {
                 if let Some(subscription) = frame_subscription.take()
                     && let Err(error) = subscription.cancel()
                 {
@@ -898,8 +901,33 @@ impl ApplicationRuntime {
                     self.reload_aware_wait(Duration::from_millis(live_config.timing.loop_idle_ms)),
                 );
                 continue;
+            };
+            // Keep the frame, OCR and observation dispatch in one registered scan.
+            // Direct UI routines stay protected; release before housekeeping or idle waits.
+            let scan_boundary = scan_lease.not_before();
+            if scan_boundary != last_scan_boundary {
+                if let Some(subscription) = frame_subscription.take()
+                    && let Err(error) = subscription.cancel()
+                {
+                    log::warn!("扫描新鲜度边界变化时撤销旧观察帧需求失败: {error}");
+                }
+                self.invalidate_latest_frame();
+                primary_visible = false;
+                game_location_baseline_reset = false;
+                last_fingerprint = None;
+                force_scan_after = None;
+                force_scan_reason = None;
+                secondary_friend_bubble_fingerprint = None;
+                secondary_hall_bubble_sequence = None;
+                secondary_hall_command_tracker.reset();
+                secondary_identity = None;
+                unresolved_ui_since = None;
+                suppress_change_until = Instant::now();
+                last_scan_boundary = scan_boundary;
             }
+            let mut scan_lease = Some(scan_lease);
             if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+                drop(scan_lease.take());
                 if let Some(subscription) = frame_subscription.take()
                     && let Err(error) = subscription.cancel()
                 {
@@ -934,6 +962,10 @@ impl ApplicationRuntime {
                 &canvas,
             ) {
                 Ok(Some(frame)) => {
+                    if !scan_frame_is_fresh(frame.captured_at, scan_boundary) {
+                        log::debug!("丢弃扫描新鲜度边界之前捕获的旧观察帧");
+                        continue;
+                    }
                     if let Ok(mut latest_frame) = self.ui.latest_frame.lock() {
                         latest_frame.store(Arc::clone(&frame.image));
                     } else {
@@ -1209,259 +1241,19 @@ impl ApplicationRuntime {
                                 );
                             }
                             Ok((_ui_state, Some(UiStateKind::Primary))) => {
+                                primary_visible = true;
                                 if listener_snapshot.mode == ChatListenerMode::Primary {
                                     secondary_friend_bubble_fingerprint = None;
                                     secondary_hall_bubble_sequence = None;
                                     secondary_hall_command_tracker.reset();
                                     secondary_identity = None;
                                 }
-                                let primary_started = Instant::now();
-                                let entered_primary = !primary_visible;
-                                primary_visible = true;
-                                let fingerprint = match rect_chat_change_fingerprint(
-                                    &frame.image,
-                                    self.lifecycle.config.screen.chat_rect.into(),
-                                ) {
-                                    Ok(fingerprint) => Some(fingerprint),
-                                    Err(error) => {
-                                        log::error!("聊天区变化指纹失败: {error:#}");
-                                        None
-                                    }
-                                };
-                                let now = Instant::now();
-                                if entered_primary && let Some(fingerprint) = fingerprint.clone() {
-                                    last_fingerprint = Some(fingerprint);
-                                    let scan_after = now
-                                        + Duration::from_millis(
-                                            live_config.timing.chat_scan.change_debounce_ms,
-                                        );
-                                    if force_scan_after.is_none_or(|time| scan_after < time) {
-                                        force_scan_after = Some(scan_after);
-                                        force_scan_reason = Some("enter-primary");
-                                    }
-                                    log::info!(target: "timing",
-                                        "进入一级界面，已建立聊天区对比基线，快速扫描延迟={}ms",
-                                        live_config.timing.chat_scan.change_debounce_ms
-                                    );
-                                }
-                                let change_suppressed = now < suppress_change_until;
-                                let forced_scan_due =
-                                    force_scan_after.is_some_and(|time| now >= time);
-                                let cooldown_until = last_change_ocr_at
-                                    + Duration::from_millis(
-                                        live_config.timing.chat_scan.change_cooldown_ms,
-                                    );
-                                let change_stats = fingerprint.as_ref().and_then(|current| {
-                                    last_fingerprint
-                                        .as_ref()
-                                        .map(|previous| change_stats(previous, current))
-                                });
-                                let change_over_threshold = change_stats.is_some_and(|stats| {
-                                    stats.mean_abs_diff
-                                        >= self.lifecycle.config.ocr.change_mean_threshold
-                                        || stats.changed_ratio
-                                            >= self.lifecycle.config.ocr.change_pixel_threshold
-                                });
-                                let change_ready = !change_suppressed && now >= cooldown_until;
-                                let mut keep_previous_fingerprint = false;
-                                if change_over_threshold && !change_ready && !forced_scan_due {
-                                    let scan_after = if change_suppressed {
-                                        suppress_change_until
-                                    } else {
-                                        cooldown_until
-                                    };
-                                    if force_scan_after.is_none_or(|time| scan_after < time) {
-                                        force_scan_after = Some(scan_after);
-                                        force_scan_reason = Some("delayed-change");
-                                    }
-                                    keep_previous_fingerprint = true;
-                                }
-                                let fallback_due = !change_suppressed
-                                    && (forced_scan_due
-                                        || now.duration_since(last_ocr_at)
-                                            >= Duration::from_millis(
-                                                live_config.timing.chat_scan.fallback_ms,
-                                            ));
-                                let change_due = change_over_threshold && change_ready;
-
-                                let mut scanned_this_round = false;
-                                let mut primary_scan_succeeded = false;
-                                if change_due {
-                                    let stats = change_stats.expect("change_due requires stats");
-                                    log::info!(target: "timing",
-                                        "触发聊天扫描: reason=change mean={:.3} ratio={:.5} debounce={}ms",
-                                        stats.mean_abs_diff,
-                                        stats.changed_ratio,
-                                        live_config.timing.chat_scan.change_debounce_ms
-                                    );
-                                    sleep(Duration::from_millis(
-                                        live_config.timing.chat_scan.change_debounce_ms,
-                                    ));
-                                    let rescan_frame_started = Instant::now();
-                                    match receive_observation_frame(
-                                        frame_subscription
-                                            .as_ref()
-                                            .expect("frame subscription initialized above"),
-                                        &canvas,
-                                    ) {
-                                        Ok(Some(frame)) => {
-                                            let rescan_stable_kind = match frame.ui_state.as_ref() {
-                                                Some(UiStateObservation::Classified(state)) => {
-                                                    state.stable_kind()
-                                                }
-                                                Some(UiStateObservation::Failed { .. }) | None => {
-                                                    None
-                                                }
-                                            };
-                                            if !primary_rescan_can_publish(rescan_stable_kind) {
-                                                log::warn!(
-                                                    "变化防抖后的新观察帧已不再是稳定一级界面，废弃本轮 OCR"
-                                                );
-                                                primary_visible = false;
-                                                last_fingerprint = None;
-                                                continue;
-                                            }
-                                            let rescan_frame_ms = elapsed_ms(rescan_frame_started);
-                                            let scan_started = Instant::now();
-                                            let observation_frame = self
-                                                .ui
-                                                .chat_observations
-                                                .begin_frame(frame.captured_at)?;
-                                            let marker_hits = frame.marker_hits_for_image();
-                                            let messages = self.scan_chat_with_shared_ocr(
-                                                &frame.image,
-                                                &template_args,
-                                                marker_hits,
-                                            );
-                                            let scan_ms = elapsed_ms(scan_started);
-                                            log::info!(target: "timing",
-                                                "变化扫描阶段耗时: rescan_frame={}ms scan={}ms",
-                                                rescan_frame_ms,
-                                                scan_ms
-                                            );
-                                            match messages {
-                                                Ok(messages) => {
-                                                    self.publish_primary_chat_observation(
-                                                        observation_frame,
-                                                        messages,
-                                                    )?;
-                                                    primary_scan_succeeded = true;
-                                                }
-                                                Err(error) => {
-                                                    log::error!("聊天扫描失败: {error:#}");
-                                                    if let Err(record_error) = self
-                                                        .ui
-                                                        .chat_observations
-                                                        .record_terminal_failure(
-                                                            observation_frame,
-                                                            format!("{error:#}"),
-                                                        )
-                                                    {
-                                                        log::error!(
-                                                            "记录聊天观察终止失败异常: {record_error:#}"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            last_ocr_at = Instant::now();
-                                            last_change_ocr_at = last_ocr_at;
-                                            force_scan_after = None;
-                                            force_scan_reason = None;
-                                            last_fingerprint = rect_chat_change_fingerprint(
-                                                &frame.image,
-                                                self.lifecycle.config.screen.chat_rect.into(),
-                                            )
-                                            .ok();
-                                            scanned_this_round = true;
-                                        }
-                                        Ok(None) => {
-                                            log::debug!("变化后等待新观察帧超时，本轮稍后重试")
-                                        }
-                                        Err(error) => log::error!("变化后截图失败: {error:#}"),
-                                    }
-                                } else if fallback_due {
-                                    let reason = if forced_scan_due {
-                                        force_scan_reason.unwrap_or("forced")
-                                    } else {
-                                        "poll"
-                                    };
-                                    log::info!(target: "timing",
-                                        "触发聊天扫描: reason={} since_last={}ms",
-                                        reason,
-                                        now.duration_since(last_ocr_at).as_millis()
-                                    );
-                                    let observation_frame =
-                                        self.ui.chat_observations.begin_frame(frame.captured_at)?;
-                                    let marker_hits = frame.marker_hits_for_image();
-                                    let messages = self.scan_chat_with_shared_ocr(
-                                        &frame.image,
-                                        &template_args,
-                                        marker_hits,
-                                    );
-                                    match messages {
-                                        Ok(messages) => {
-                                            self.publish_primary_chat_observation(
-                                                observation_frame,
-                                                messages,
-                                            )?;
-                                            primary_scan_succeeded = true;
-                                        }
-                                        Err(error) => {
-                                            log::error!("聊天扫描失败: {error:#}");
-                                            if let Err(record_error) =
-                                                self.ui.chat_observations.record_terminal_failure(
-                                                    observation_frame,
-                                                    format!("{error:#}"),
-                                                )
-                                            {
-                                                log::error!(
-                                                    "记录聊天观察终止失败异常: {record_error:#}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    last_ocr_at = now;
-                                    force_scan_after = None;
-                                    force_scan_reason = None;
-                                    last_fingerprint = fingerprint.clone();
-                                    scanned_this_round = true;
-                                }
-                                let primary_ms = elapsed_ms(primary_started);
-                                let loop_ms = elapsed_ms(loop_started);
-                                if scanned_this_round || loop_ms >= 80 {
-                                    log::info!(target: "timing",
-                                        "主循环阶段耗时: total={}ms frame={}ms ui={}ms primary={}ms state=primary scanned={}",
-                                        loop_ms,
-                                        frame_ms,
-                                        ui_ms,
-                                        primary_ms,
-                                        scanned_this_round
-                                    );
-                                } else {
-                                    log::info!(target: "timing",
-                                        "主循环阶段耗时: total={}ms frame={}ms ui={}ms primary={}ms state=primary scanned=false",
-                                        loop_ms,
-                                        frame_ms,
-                                        ui_ms,
-                                        primary_ms
-                                    );
-                                }
-
-                                if primary_scan_succeeded {
+                                // Recognition is supplied independently, even while this navigation loop is blocked.
+                                if self.ui.shared_ocr.latest()?.is_some_and(|snapshot| {
+                                    snapshot.chat == ChatIdentity::PrimaryHall
+                                }) {
                                     listener_ready_evidence =
                                         Some(ListenerReadyEvidence::PrimaryScan);
-                                }
-
-                                if change_suppressed {
-                                    last_fingerprint = None;
-                                } else if !scanned_this_round
-                                    && !keep_previous_fingerprint
-                                    && last_fingerprint.is_none()
-                                {
-                                    // 不要每帧滚动更新基线，慢速聊天动画会在超过阈值前被吃掉。
-                                    if let Some(fingerprint) = fingerprint {
-                                        last_fingerprint = Some(fingerprint);
-                                    }
                                 }
                             }
                             Ok((ui_state, Some(UiStateKind::Secondary))) => {
@@ -1499,6 +1291,8 @@ impl ApplicationRuntime {
                     }
                 }
                 Ok(None) => {
+                    // A receive timeout is a normal polling tick, not a capture failure.
+                    drop(scan_lease.take());
                     self.maybe_reload_config_when_idle();
                     if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
                         self.maybe_activate_reload_startup_after_ui_grace(
@@ -1512,6 +1306,8 @@ impl ApplicationRuntime {
                     continue;
                 }
                 Err(error) => {
+                    self.report_primary_scan_failure(format!("截图失败: {error:#}"));
+                    drop(scan_lease.take());
                     self.invalidate_latest_frame();
                     unresolved_ui_since = None;
                     if let Some(subscription) = frame_subscription.take()
@@ -1590,7 +1386,10 @@ impl ApplicationRuntime {
                     continue;
                 }
             }
-            if primary_visible && self.maybe_warn_hall_expiring()? {
+            if primary_visible
+                && self.business.task_engine.is_idle()?
+                && self.maybe_warn_hall_expiring()?
+            {
                 suppress_change_until = Instant::now()
                     + Duration::from_millis(live_config.timing.command.post_settle_ms);
                 force_scan_after = Some(suppress_change_until);
@@ -1598,6 +1397,7 @@ impl ApplicationRuntime {
                 last_fingerprint = None;
                 last_ocr_at = Instant::now();
             }
+            drop(scan_lease.take());
             self.forward_completion_advances(completion_subscriber)?;
             self.maybe_idle_exit()?;
             self.maybe_reload_config_when_idle();
@@ -1642,6 +1442,146 @@ impl ApplicationRuntime {
         }
 
         Ok(())
+    }
+
+    fn consume_shared_chat_snapshots(
+        &mut self,
+        subscriber: &crate::observation::chat::SharedChatSubscriber,
+        backlog: &mut std::collections::VecDeque<crate::observation::chat::ChatOcrSnapshot>,
+    ) -> Result<()> {
+        let snapshots = subscriber.read()?;
+        if backlog.len().saturating_add(snapshots.len()) > 4096 {
+            return Err(anyhow!(
+                "共享聊天业务积压超过 4096 帧，停止监听以避免静默丢失"
+            ));
+        }
+        backlog.extend(snapshots);
+        if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+            return Ok(());
+        }
+        while let Some(snapshot) = backlog.pop_front() {
+            self.consume_shared_chat_snapshot(snapshot)?;
+        }
+        Ok(())
+    }
+
+    fn consume_shared_chat_snapshot(
+        &mut self,
+        snapshot: crate::observation::chat::ChatOcrSnapshot,
+    ) -> Result<()> {
+        let frame = self
+            .ui
+            .chat_observations
+            .begin_frame(snapshot.captured_at)?;
+        let result = (|| {
+            match snapshot.chat {
+                ChatIdentity::PrimaryHall => {
+                    let messages = snapshot
+                        .messages
+                        .into_iter()
+                        .map(|message| {
+                            let is_new = self.ui.shared_ocr.is_business_pending(&message.id)?;
+                            Ok(PrimaryObservedMessage {
+                                id: message.id,
+                                is_new,
+                                message: ChatMessage {
+                                    text: message.text,
+                                    block: message.block,
+                                    message_type: message.message_type,
+                                },
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    self.dispatch_chat_observations(vec![ChatObservationDispatch::Primary {
+                        frame,
+                        messages,
+                    }])?;
+                }
+                chat @ (ChatIdentity::SecondaryHall | ChatIdentity::Friend(_)) => {
+                    let is_hall = chat == ChatIdentity::SecondaryHall;
+                    let accepts_turtle_questions = is_hall
+                        && self.commands_enabled()?
+                        && self.business.business.turtle_soup_accepts_questions()?;
+                    let friend_name = match chat {
+                        ChatIdentity::Friend(name) => name.to_string(),
+                        _ => String::new(),
+                    };
+                    for message in snapshot.messages {
+                        if !self.ui.shared_ocr.is_business_pending(&message.id)? {
+                            continue;
+                        }
+                        let sender = message
+                            .raw_sender
+                            .as_deref()
+                            .map(parse_secondary_sender_identity)
+                            .filter(|identity| !identity.effective_name().trim().is_empty())
+                            .map(|identity| identity.effective_name().to_string())
+                            .or(message.sender)
+                            .filter(|sender| !sender.trim().is_empty());
+                        if is_hall {
+                            let classification = self.classify_secondary_business_message(
+                                &message.text,
+                                accepts_turtle_questions,
+                            )?;
+                            if classification.requires_sender && sender.is_none() {
+                                continue;
+                            }
+                        }
+                        let id = message.id;
+                        // Claim atomically against discard suppression and other
+                        // queued revisions before dispatching business effects.
+                        let Some(claim) = self
+                            .ui
+                            .shared_ocr
+                            .claim_business(&id, snapshot.captured_at)?
+                        else {
+                            continue;
+                        };
+                        self.dispatch_chat_observations(vec![
+                            ChatObservationDispatch::Secondary {
+                                frame,
+                                observation: SecondaryChatObservation {
+                                    message_type: message.message_type,
+                                    friend_name: friend_name.clone(),
+                                    accepts_turtle_questions,
+                                    messages: vec![SecondaryObservedMessage {
+                                        id: id.clone(),
+                                        text: message.text,
+                                        sender,
+                                    }],
+                                },
+                            },
+                        ])?;
+                        claim.complete()?;
+                    }
+                }
+                ChatIdentity::Unknown
+                | ChatIdentity::PublicChannel
+                | ChatIdentity::StrangerMessages => {
+                    // These identities never dispatch business. Sender-pending hall messages
+                    // remain unacknowledged in the hall branch until an OCR revision arrives.
+                    for message in snapshot.messages {
+                        self.ui.shared_ocr.acknowledge_business(&message.id)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.ui.chat_observations.complete_without_messages(frame),
+            Err(error) => {
+                self.ui
+                    .chat_observations
+                    .record_terminal_failure(frame, format!("{error:#}"))?;
+                Err(error)
+            }
+        }
+    }
+
+    fn report_primary_scan_failure(&self, reason: String) {
+        if let Err(error) = self.ui.chat_observations.report_primary_failure(reason) {
+            log::error!("通知一级聊天观察失败异常: {error:#}");
+        }
     }
 
     fn forward_completion_advances(
@@ -1699,7 +1639,7 @@ impl ApplicationRuntime {
             match dispatch {
                 ChatObservationDispatch::Primary { frame, messages } => {
                     let messages = messages.into_iter().collect::<Vec<_>>();
-                    self.handle_scan_messages(frame, messages)?;
+                    self.handle_scan_messages(frame.captured_at(), messages)?;
                 }
                 ChatObservationDispatch::Secondary { frame, observation } => {
                     processed_secondary |=
@@ -1744,7 +1684,7 @@ impl ApplicationRuntime {
 
     fn handle_scan_messages(
         &mut self,
-        frame: ObservedFrame,
+        captured_at: Instant,
         observed_messages: Vec<PrimaryObservedMessage>,
     ) -> Result<()> {
         let messages = observed_messages
@@ -1802,6 +1742,7 @@ impl ApplicationRuntime {
         for (_, observed) in primary_command_candidates(&observed_messages) {
             let message = &observed.message;
             if message.text.is_empty() {
+                self.ui.shared_ocr.acknowledge_business(&observed.id)?;
                 continue;
             }
             log::debug!(
@@ -1810,16 +1751,18 @@ impl ApplicationRuntime {
                 redacted_chat_text(&message.text)
             );
             let observation = CommandObservation {
-                frame_id: Some(frame.id()),
-                captured_at: Some(frame.captured_at()),
+                frame_id: None,
+                captured_at: Some(captured_at),
                 message_id: Some(observed.id.clone()),
             };
             let Some(envelope) =
                 command::parse_command_envelope(&message.text, &message.message_type, observation)
             else {
+                self.ui.shared_ocr.acknowledge_business(&observed.id)?;
                 continue;
             };
             let Some(parsed_command) = command_router.route(&envelope, active_entertainment) else {
+                self.ui.shared_ocr.acknowledge_business(&observed.id)?;
                 continue;
             };
             let parsed_command = self.map_command_actor(parsed_command);
@@ -1828,9 +1771,7 @@ impl ApplicationRuntime {
             {
                 let seq = invite.seq.expect("unsequenced invites are always accepted");
                 log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
-                self.ui
-                    .chat_observations
-                    .acknowledge_primary(&observed.id)?;
+                self.ui.shared_ocr.acknowledge_business(&observed.id)?;
                 continue;
             }
             log::debug!("解析命令: {}", parsed_command.raw);
@@ -1887,7 +1828,7 @@ impl ApplicationRuntime {
             match input {
                 ObservedInput::Question(question) => {
                     if self.commands_enabled()? {
-                        self.enqueue_turtle_soup_question(question, frame.captured_at())?;
+                        self.enqueue_turtle_soup_question(question, captured_at)?;
                     }
                 }
                 ObservedInput::Command(pending) => {
@@ -1923,7 +1864,7 @@ impl ApplicationRuntime {
         let Some(message_id) = command.observation.message_id.as_ref() else {
             return Ok(());
         };
-        if !self.ui.chat_observations.acknowledge_primary(message_id)? {
+        if !self.ui.shared_ocr.acknowledge_business(message_id)? {
             log::debug!("一级命令完成处理时消息已滚出当前画面: id={message_id:?}");
         }
         Ok(())
@@ -2174,30 +2115,6 @@ impl ApplicationRuntime {
     }
 }
 
-pub(super) fn scan_chat_with_shared_ocr(
-    ocr: &OcrRuntimeHandle,
-    monitor: &MonitorShared,
-    chat_rect: Rect,
-    image: &DynamicImage,
-    templates: &ResolvedTemplateArgs,
-    marker_hits: Option<Vec<crate::ui::template::TemplateHit>>,
-) -> Result<Vec<ChatMessage>> {
-    let total_started = Instant::now();
-    let prepared = prepare_chat_scan_with_markers(image, templates, chat_rect, marker_hits)?;
-    let messages = recognize_prepared_chat(
-        ocr,
-        OcrPriority::ChatObservation,
-        templates,
-        prepared,
-        Some(monitor),
-    );
-    log::info!(target: "timing",
-        "聊天扫描端到端耗时: total={}ms",
-        elapsed_ms(total_started)
-    );
-    messages
-}
-
 #[cfg(test)]
 mod tests {
     /// 界面状态迁移只在**稳定类型**变化时推送。
@@ -2289,7 +2206,7 @@ mod tests {
         listener_ready_after_recheck, load_persisted_chat_listener_mode, merge_observed_inputs,
         persist_chat_listener_mode, primary_command_candidates, primary_rescan_can_publish,
         replacement_ready_allowed, replacement_startup_fallback_due, replacement_startup_retry_due,
-        secondary_hall_recovery_allowed, unresolved_ui_recovery_due,
+        scan_frame_is_fresh, secondary_hall_recovery_allowed, unresolved_ui_recovery_due,
     };
     use crate::observation::chat::{
         BubbleSequence, ChatIdentity, ChatMessage, ObservedChatMessageId, PrimaryObservedMessage,
@@ -2543,6 +2460,21 @@ mod tests {
             ChatListenerMode::Secondary,
             true,
             crate::runtime::ui::UiStateKind::Primary
+        ));
+    }
+
+    #[test]
+    fn scan_freshness_rejects_pre_boundary_frames_without_discarding_stable_frames() {
+        let boundary = Instant::now();
+        let old = boundary.checked_sub(Duration::from_millis(1)).unwrap();
+        let fresh = boundary + Duration::from_millis(1);
+        assert!(!scan_frame_is_fresh(old, Some(boundary)));
+        assert!(scan_frame_is_fresh(boundary, Some(boundary)));
+        assert!(scan_frame_is_fresh(fresh, Some(boundary)));
+        assert!(scan_frame_is_fresh(old, None));
+        assert!(!scan_frame_is_fresh(
+            fresh,
+            Some(fresh + Duration::from_millis(1))
         ));
     }
 

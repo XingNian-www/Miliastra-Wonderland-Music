@@ -1,5 +1,7 @@
 mod commands;
 mod custom_workflow;
+#[cfg(test)]
+mod decision_tests;
 mod delivery;
 mod diagnostics;
 pub(crate) mod formal_task;
@@ -9,6 +11,7 @@ mod listener;
 mod moderation;
 mod playback;
 mod secondary_chat;
+mod shared_observer;
 mod song_request_port;
 mod startup;
 mod tasks;
@@ -76,12 +79,13 @@ use crate::interfaces::ui_plan::{WorkflowOperation, WorkflowResidency};
 use crate::observation::chat::{
     ChatMessage, ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
     ChatScanTelemetry, ChatScanTelemetrySink, CompletionAdvanceSubscriber, ObservedFrame,
-    PrimaryObservationCursor, PrimaryObservedMessage, ResolvedTemplateArgs, SecondaryChatIdentity,
-    SecondaryChatObservation, SecondaryHallBubble, SecondaryObservedMessage,
-    SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit, count_chat_markers,
-    find_unread_friend_hits, hall_bubble_layout_is_stable, hall_bubble_sequence_is_retained_prefix,
-    hall_bubble_sequence_overlap, latest_incoming_fingerprint, prepare_chat_scan,
-    prepare_chat_scan_with_markers, recognize_prepared_chat, secondary_hall_bubbles,
+    PrimaryDecisionSubscriber, PrimaryObservationCursor, PrimaryObservedMessage,
+    ResolvedTemplateArgs, SecondaryChatIdentity, SecondaryChatObservation, SecondaryHallBubble,
+    SecondaryObservedMessage, SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit,
+    count_chat_markers, find_unread_friend_hits, hall_bubble_layout_is_stable,
+    hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap,
+    latest_incoming_fingerprint, prepare_chat_scan, prepare_chat_scan_with_markers,
+    recognize_prepared_chat, secondary_hall_bubbles,
 };
 use crate::observation::decision::DecisionScreenLock;
 use crate::observation::shared::ObservationRead;
@@ -107,8 +111,8 @@ use crate::runtime::player_io::{
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::task_engine::TaskEngineHandle;
 use crate::runtime::ui::{
-    FrameDemand, FrameDemandSubscription, FramePublication, UiCoordinator, UiRuntime, UiStateKind,
-    UiStateObservation,
+    FrameDemand, FrameDemandSubscription, FramePublication, UiCoordinator, UiRuntime, UiScanPermit,
+    UiStateKind, UiStateObservation,
 };
 use crate::ui::atoms::GameUi;
 use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
@@ -127,7 +131,9 @@ use crate::ui::routines::{
     StartupUiConfig, StartupUiTemplates, ToggleMicrophone, ToggleMicrophoneEffect,
     UiResidencyOutcome, UiResidencyTarget,
 };
-use crate::ui::state::{PanelRegions, ResolvedUiTemplateArgs, TemplateUiStateClassifier, UiTemplateArgs};
+use crate::ui::state::{
+    PanelRegions, ResolvedUiTemplateArgs, TemplateUiStateClassifier, UiTemplateArgs,
+};
 use crate::ui::template::{best_template_hit, find_template_hits};
 use anyhow::{Context, Result, anyhow};
 use enigo::Key;
@@ -384,6 +390,7 @@ struct UiBundle {
     window_detection_signal: WindowDetectionSignal,
     chat_baseline_primed: Arc<AtomicBool>,
     chat_observations: ChatObservationShared,
+    shared_ocr: crate::observation::chat::SharedChatOcr,
 }
 
 struct PlaybackBundle {
@@ -638,6 +645,7 @@ struct FormalTaskUiContext {
     window_detection_signal: WindowDetectionSignal,
     chat_baseline_primed: Arc<AtomicBool>,
     chat_observations: ChatObservationShared,
+    shared_ocr: crate::observation::chat::SharedChatOcr,
 }
 
 struct FormalTaskPlaybackContext {
@@ -710,6 +718,7 @@ impl FormalTaskExecutionContext {
                     window_detection_signal: self.ui.window_detection_signal.clone(),
                     chat_baseline_primed: self.ui.chat_baseline_primed.clone(),
                     chat_observations: self.ui.chat_observations.clone(),
+                    shared_ocr: self.ui.shared_ocr.clone(),
                 },
                 playback: PlaybackBundle {
                     player: self.playback.player.clone(),
@@ -1171,32 +1180,51 @@ enum ChatDecisionScope {
     MultipleConversations,
 }
 
-enum ChatDecisionReaderKind {
-    Primary {
-        cursor: Option<PrimaryObservationCursor>,
-        pending: Vec<ChatMessage>,
-    },
-    SecondaryCurrentHall {
-        previous: Vec<SecondaryHallBubble>,
-    },
-}
-
 struct ChatDecisionReader {
-    kind: ChatDecisionReaderKind,
+    listener_mode: ChatListenerMode,
+    subscriber: crate::observation::chat::SharedChatSubscriber,
+    chat: crate::observation::chat::ChatIdentity,
+    baseline_at: Instant,
+    baseline_cursor: Option<(crate::observation::chat::VisualSessionId, u64)>,
+    seen: std::collections::HashSet<(crate::observation::chat::ObservedChatMessageId, String)>,
     screen_lock: DecisionScreenLock,
     _observation_session: ChatObservationExclusiveGuard,
 }
 
 impl ChatDecisionReader {
+    fn read_messages(&mut self) -> Result<Vec<ChatMessage>> {
+        let mut messages = Vec::new();
+        for snapshot in self.subscriber.read()? {
+            if snapshot.chat != self.chat || snapshot.captured_at <= self.baseline_at {
+                continue;
+            }
+            for message in snapshot.messages {
+                if self.baseline_cursor.is_some_and(|(session, sequence)| {
+                    message.id.visual_session == session
+                        && message.id.bubble_sequence.get() <= sequence
+                }) || !self.seen.insert((message.id, message.text.clone()))
+                {
+                    continue;
+                }
+                messages.push(ChatMessage {
+                    message_type: message.message_type,
+                    block: message.block,
+                    text: message.text,
+                });
+            }
+        }
+        Ok(messages)
+    }
+
     fn accept_once(&mut self, message: &ChatMessage) -> bool {
         self.screen_lock.accept_once(message)
     }
 
-    fn poll_interval_ms(&self, configured_ms: u64) -> u64 {
-        match &self.kind {
-            ChatDecisionReaderKind::Primary { .. } => configured_ms.max(50),
-            ChatDecisionReaderKind::SecondaryCurrentHall { .. } => configured_ms.clamp(100, 500),
-        }
+    fn wait_for_input(&self, _configured_ms: u64, remaining: Duration) -> Result<()> {
+        // The short cap keeps Web decisions, stop, and reload responsive.
+        self.subscriber
+            .wait(remaining.min(Duration::from_millis(50)))?;
+        Ok(())
     }
 }
 
@@ -1355,6 +1383,7 @@ impl ApplicationRuntime {
             },
         );
         let chat_observations = ChatObservationShared::new();
+        let shared_ocr = crate::observation::chat::SharedChatOcr::new();
         let running = Arc::new(AtomicBool::new(true));
         let task_engine = TaskEngineHandle::new(Some(Arc::new(monitor.clone())));
         let business_runtime_builder =
@@ -1415,8 +1444,12 @@ impl ApplicationRuntime {
         let hall_ui = HallUi::new(ui_handle.clone(), ocr.clone(), hall_config);
         let moderation_ui = ModerationUi::new(ui_handle.clone(), moderation_config);
         let startup_ui = StartupUi::new(ui_handle.clone(), ocr.clone(), startup_config);
-        let secondary_unread_ui =
-            SecondaryUnreadUi::new(ui_handle.clone(), ocr.clone(), secondary_unread_config);
+        let secondary_unread_ui = SecondaryUnreadUi::new(
+            ui_handle.clone(),
+            ocr.clone(),
+            secondary_unread_config,
+            shared_ocr.clone(),
+        );
         let friend_delivery_ui = FriendDeliveryUi::new(
             ui_handle.clone(),
             ocr.clone(),
@@ -1556,6 +1589,7 @@ impl ApplicationRuntime {
                 window_detection_signal: WindowDetectionSignal::new(),
                 chat_baseline_primed: Arc::new(AtomicBool::new(false)),
                 chat_observations,
+                shared_ocr,
             },
             playback: PlaybackBundle {
                 player,

@@ -1,5 +1,4 @@
 use std::sync::atomic::Ordering as AtomicOrdering;
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use super::{ApplicationRuntime, ChatDecisionScope};
@@ -21,7 +20,7 @@ use crate::ui::routines::{
     CustomActionPlan, ExecuteInvite, FriendDelivery, FriendDeliveryMessageStatus, InviteEffect,
     InviteNotificationOutcome, SendFriendDeliveries, UiResidencyTarget,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 enum ChatDecisionWait<T> {
     Found(T),
@@ -69,14 +68,16 @@ impl ApplicationRuntime {
             })?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-            sleep(Duration::from_millis(reader.poll_interval_ms(poll_ms)));
-            let messages = match self.poll_chat_decision_reader(&mut reader) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    log::error!("{}扫描失败: {error:#}", label);
-                    continue;
-                }
-            };
+            let messages = self
+                .wait_for_chat_decision_messages(
+                    &mut reader,
+                    poll_ms,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .with_context(|| format!("{label}读取失败"))?;
+            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                return Ok(ChatDecisionWait::Stopped);
+            }
             for message in messages {
                 if !accepts_message_type(&message.message_type) {
                     continue;

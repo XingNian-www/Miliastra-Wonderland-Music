@@ -1,7 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
@@ -20,7 +19,7 @@ use crate::runtime::ui::{
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::change_detection::{change_stats, rect_chat_change_fingerprint};
 use crate::ui::geometry::{Point, Rect, crop_canvas};
-use crate::ui::template::{TemplateHit, best_template_hit};
+use crate::ui::template::{TemplateHit, best_template_hit, template_exists};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CustomActionPlan {
@@ -179,7 +178,13 @@ fn execute_operation(
     }
     match operation {
         WorkflowOperation::Wait { duration_ms } => {
-            sleep(Duration::from_millis(duration_ms));
+            wait_custom(
+                context,
+                running,
+                Duration::from_millis(duration_ms),
+                input_performed,
+                "wait_custom_action",
+            )?;
             Ok(false)
         }
         WorkflowOperation::PressKey { key } => {
@@ -437,7 +442,13 @@ fn wait_template(
                 "template not found before timeout",
             ));
         }
-        sleep(Duration::from_millis(poll_ms.max(50)));
+        wait_custom(
+            context,
+            running,
+            Duration::from_millis(poll_ms.max(50)),
+            input_performed,
+            "wait_custom_template",
+        )?;
     }
 }
 
@@ -457,10 +468,11 @@ fn wait_template_absent(
     loop {
         ensure_running(running, input_performed)?;
         let image = capture_normalized(context, canvas, input_performed)?;
-        let hit = best_template_hit(&image, Some(rect(region)), template, threshold).map_err(
-            |error| observation_failure(input_performed, "match_custom_template", error),
-        )?;
-        if hit.is_none() {
+        let present =
+            template_exists(&image, Some(rect(region)), template, threshold).map_err(|error| {
+                observation_failure(input_performed, "match_custom_template", error)
+            })?;
+        if !present {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -470,7 +482,13 @@ fn wait_template_absent(
                 "template remained visible before timeout",
             ));
         }
-        sleep(Duration::from_millis(poll_ms.max(50)));
+        wait_custom(
+            context,
+            running,
+            Duration::from_millis(poll_ms.max(50)),
+            input_performed,
+            "wait_custom_template_absent",
+        )?;
     }
 }
 
@@ -491,7 +509,13 @@ fn wait_pixels_stable(
     })?;
     loop {
         ensure_running(running, input_performed)?;
-        sleep(Duration::from_millis(poll_ms.max(50)));
+        wait_custom(
+            context,
+            running,
+            Duration::from_millis(poll_ms.max(50)),
+            input_performed,
+            "wait_custom_pixels_stable",
+        )?;
         let current = capture_normalized(context, canvas, input_performed)?;
         let current = rect_chat_change_fingerprint(&current, region).map_err(|error| {
             observation_failure(input_performed, "fingerprint_custom_region", error)
@@ -569,7 +593,13 @@ fn wait_text(
                 "text not found before timeout",
             ));
         }
-        sleep(Duration::from_millis(poll_ms.max(50)));
+        wait_custom(
+            context,
+            running,
+            Duration::from_millis(poll_ms.max(50)),
+            input_performed,
+            "wait_custom_text",
+        )?;
     }
 }
 
@@ -595,6 +625,33 @@ fn click(context: &mut UiRoutineContext<'_>, point: WorkflowPoint) -> anyhow::Re
 
 fn rect(value: WorkflowRect) -> Rect {
     Rect::new(value.x, value.y, value.width, value.height)
+}
+
+fn wait_custom(
+    context: &mut UiRoutineContext<'_>,
+    running: &AtomicBool,
+    duration: Duration,
+    input_performed: bool,
+    stage: &'static str,
+) -> Result<(), UiRoutineFailure> {
+    let deadline = Instant::now() + duration;
+    loop {
+        ensure_running(running, input_performed)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        context
+            .wait_cancellable(remaining.min(Duration::from_millis(25)))
+            .map_err(|failure| {
+                if context.is_cancelled() {
+                    cancelled_failure(input_performed)
+                } else {
+                    observation_reason(input_performed, stage, failure.reason())
+                }
+            })?;
+        ensure_running(running, input_performed)?;
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+    }
 }
 
 fn ensure_running(running: &AtomicBool, input_performed: bool) -> Result<(), UiRoutineFailure> {
@@ -690,8 +747,7 @@ mod tests {
     /// 设备的截屏统一返回真实大厅帧：例程测试一律不喂合成帧
     /// （见 tests/fixtures/ui/README.md）。
     fn real_frame() -> DynamicImage {
-        image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg")
-            .expect("打开真实大厅帧失败")
+        image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg").expect("打开真实大厅帧失败")
     }
 
     struct RecordingDevice {

@@ -643,6 +643,7 @@ impl ApplicationRuntime {
                 window_detection_signal: self.ui.window_detection_signal.clone(),
                 chat_baseline_primed: self.ui.chat_baseline_primed.clone(),
                 chat_observations: self.ui.chat_observations.clone(),
+                shared_ocr: self.ui.shared_ocr.clone(),
             },
             playback: FormalTaskPlaybackContext {
                 player: self.playback.player.clone(),

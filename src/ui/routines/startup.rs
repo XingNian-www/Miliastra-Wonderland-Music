@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
-    before_input_failure, capture_normalized, sleep_ms,
+    before_input_failure, capture_normalized, wait_ms,
 };
 use super::state_observation::wait_for_stable_ui_kind;
 use crate::adapters::windows::resolve_game_executable;
@@ -314,7 +314,12 @@ fn confirm_automatic_entry(
             log::info!("自动进入前界面已变化，跳过本次任务: expected={expected:?}");
             return Ok(false);
         }
-        sleep_ms(config.startup.poll_ms);
+        wait_ms(
+            context,
+            config.startup.poll_ms,
+            "recheck_automatic_entry",
+            InputCertainty::BeforeInput,
+        )?;
     }
     Ok(true)
 }
@@ -388,7 +393,16 @@ fn execute_enter_game(
                 })?;
             clicked = true;
         }
-        sleep_ms(config.startup.poll_ms);
+        wait_ms(
+            context,
+            config.startup.poll_ms,
+            "confirm_enter_game",
+            if clicked {
+                InputCertainty::AfterInputUnknown
+            } else {
+                InputCertainty::BeforeInput
+            },
+        )?;
     }
     Err(UiRoutineFailure::new(
         if clicked {
@@ -437,7 +451,12 @@ fn ensure_game_window(
             )
         })?;
     for _ in 0..config.startup.launch_retries.max(1) {
-        sleep_ms(config.startup.launch_wait_ms);
+        wait_ms(
+            context,
+            config.startup.launch_wait_ms,
+            "wait_game_window",
+            InputCertainty::AfterInputUnknown,
+        )?;
         if context.device().ensure_window().is_ok() {
             return Ok(());
         }
@@ -596,7 +615,7 @@ fn execute_enter_wonderland(
 
 /// 按 `M` 之后确认「地图真的盖住了大世界」。
 ///
-/// 证据（第 71 节，`docs/ui-state-criteria.md` 第 27 章）：
+/// 证据（第 71 节，`technical-docs/ui-state-criteria.md` 第 27 章）：
 ///
 /// | 帧 | 实际是什么 | app 判定 |
 /// |---|---|---|
@@ -628,7 +647,12 @@ fn wait_for_wonderland_map_open(
         } else {
             left_world = 0;
         }
-        sleep_ms(config.startup.poll_ms);
+        wait_ms(
+            context,
+            config.startup.poll_ms,
+            "open_wonderland_map",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
@@ -664,7 +688,12 @@ fn wait_for_paimon_menu(
         } else {
             streak = 0;
         }
-        sleep_ms(config.startup.poll_ms);
+        wait_ms(
+            context,
+            config.startup.poll_ms,
+            "observe_wonderland_primary",
+            InputCertainty::ConfirmedFailure,
+        )?;
     }
     Err(UiRoutineFailure::new(
         InputCertainty::ConfirmedFailure,
@@ -696,7 +725,12 @@ fn confirm_wonderland_transition(
         )? {
             return wait_region_stable(context, config, region);
         }
-        sleep_ms(config.startup.poll_ms);
+        wait_ms(
+            context,
+            config.startup.poll_ms,
+            "confirm_wonderland_absent",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
@@ -721,7 +755,12 @@ fn wait_region_stable(
     let mut previous = rect_chat_change_fingerprint(&image, region)
         .map_err(|error| after_input_failure("observe_wonderland_transition", error))?;
     while Instant::now() < deadline {
-        sleep_ms(config.startup.poll_ms);
+        wait_ms(
+            context,
+            config.startup.poll_ms,
+            "confirm_wonderland_stable",
+            InputCertainty::AfterInputUnknown,
+        )?;
         let image = capture_normalized(
             context,
             &config.residency,
@@ -783,13 +822,16 @@ fn wait_for_primary(
             Ok(UiStateKind::Unknown) => unreachable!("unknown UI state is never stable"),
             // Loading 也归到失败：等待的稳定状态就是「到大厅了」，
             // 而稳定停在加载界面说明卡住了，不该被当成还没开始（§55）。
-            Ok(UiStateKind::GameGate | UiStateKind::Overworld | UiStateKind::Loading | UiStateKind::Panel) => {
-                Err(UiRoutineFailure::new(
-                    InputCertainty::ConfirmedFailure,
-                    "confirm_startup_primary",
-                    "game is still at the gate, loading, in the overworld, or showing a modal panel",
-                ))
-            }
+            Ok(
+                UiStateKind::GameGate
+                | UiStateKind::Overworld
+                | UiStateKind::Loading
+                | UiStateKind::Panel,
+            ) => Err(UiRoutineFailure::new(
+                InputCertainty::ConfirmedFailure,
+                "confirm_startup_primary",
+                "game is still at the gate, loading, in the overworld, or showing a modal panel",
+            )),
             Err(failure) => Err(failure),
         }
     } else {
@@ -842,7 +884,12 @@ fn wait_template_absent(
         )? {
             return Ok(());
         }
-        sleep_ms(config.startup.poll_ms);
+        wait_ms(
+            context,
+            config.startup.poll_ms,
+            wait.stage,
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
@@ -867,7 +914,12 @@ fn wait_wonderland_hall_text(
         if let Some(point) = find_wonderland_hall_text(ocr, &image, config)? {
             return Ok(Some(point));
         }
-        sleep_ms(config.startup.wonderland_hall_retry_ms.max(100));
+        wait_ms(
+            context,
+            config.startup.wonderland_hall_retry_ms.max(100),
+            "locate_wonderland_hall",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
     Ok(None)
 }
@@ -924,7 +976,12 @@ fn wait_template_hit(
         {
             return Ok(Some(hit.center()));
         }
-        sleep_ms(wait.poll_ms.max(1));
+        wait_ms(
+            context,
+            wait.poll_ms.max(1),
+            "locate_startup_template",
+            wait.certainty,
+        )?;
     }
     Ok(None)
 }
@@ -1089,9 +1146,8 @@ mod tests {
         // 真实提瓦特大世界帧：派蒙图标天然在左上角，但没有千星家园模板。
         // 按 M 之后切到真实提瓦特地图帧——地图上没有千星星标，
         // 所以例程必须失败在 locate_wonderland_map_star。
-        let frame =
-            image::open("tests/fixtures/ui/overworld-teyvat-1920x1080.jpg")
-                .expect("打开真实提瓦特帧失败");
+        let frame = image::open("tests/fixtures/ui/overworld-teyvat-1920x1080.jpg")
+            .expect("打开真实提瓦特帧失败");
         let map = image::open("tests/fixtures/ui/map-teyvat-1920x1080.png")
             .expect("打开真实提瓦特地图帧失败");
 
@@ -1173,9 +1229,8 @@ mod tests {
         let mut config = test_startup_config(&app);
         config.startup.enter_game = true;
         // 真实提瓦特大世界帧：进入游戏后的落地画面，派蒙图标在左上角。
-        let frame =
-            image::open("tests/fixtures/ui/overworld-teyvat-1920x1080.jpg")
-                .expect("打开真实提瓦特帧失败");
+        let frame = image::open("tests/fixtures/ui/overworld-teyvat-1920x1080.jpg")
+            .expect("打开真实提瓦特帧失败");
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = UiRuntime::start(
             PaimonOnlyDevice {

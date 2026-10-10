@@ -646,7 +646,7 @@ pub(super) fn debug_window_route(
 // 丢失了 13 个路由处理器、2 个响应构造函数与 1 个模块可见性声明。
 // 恢复来源：`protocol.rs` 的 RouteSpec/BodyRouteSpec（路径与处理器名）、
 // `protocol/tests.rs` 的契约测试、`DebugHttpService` 的公开方法、
-// `docs/debug-sandbox.md` 与 `src/debug_events.rs` 的说明。
+// `technical-docs/debug-sandbox.md` 与 `src/debug_events.rs` 的说明。
 // **若你手头有原始版本，请以原始版本为准。**
 // ============================================================================
 

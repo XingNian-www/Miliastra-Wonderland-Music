@@ -827,7 +827,7 @@ pub struct ScreenConfig {
     pub secondary_back_rect: RectConfig,
     pub secondary_hall_rect: RectConfig,
     /// 主菜单「返回提瓦特」按钮的搜索区。实测 (1690,1000) 205x60 可把主菜单
-    /// 与其余 58 帧完全分开（见 docs/ui-state-machine.md §35）。
+    /// 与其余 58 帧完全分开（见 technical-docs/ui-state-machine.md §35）。
     #[serde(default = "default_main_menu_rect")]
     pub main_menu_rect: RectConfig,
     /// 大厅底栏 👥 O 图标组的搜索区。
@@ -1393,7 +1393,7 @@ pub struct TemplateConfig {
     pub secondary_back: PathBuf,
     pub secondary_hall: PathBuf,
     /// 千星奇域主菜单右下角的「返回提瓦特」按钮。命中即判定当前在奇域主菜单，
-    /// 用来挡住 secondary_back 在 ESC 菜单上的误判（见 docs/ui-state-machine.md §44）。
+    /// 用来挡住 secondary_back 在 ESC 菜单上的误判（见 technical-docs/ui-state-machine.md §44）。
     #[serde(default = "default_main_menu_template")]
     pub main_menu: PathBuf,
     /// 千星大厅底栏的 👥 O 图标组。提瓦特底栏只有一个 Enter，没有这一组，

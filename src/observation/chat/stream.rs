@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
@@ -15,10 +16,12 @@ use crate::observation::shared::{
     ObservationGap, ObservationRead, ObservationSubscriber, SharedObservationStream,
 };
 const SHARED_CHAT_HISTORY_CAPACITY: usize = 64;
+// Scoped decision windows retain events independently of the business history.
+const PRIMARY_DECISION_CAPACITY: usize = 4096;
 const PRIMARY_VISIBLE_MIN_MESSAGES: usize = 2;
 const PRIMARY_VISIBLE_MAX_MESSAGES: usize = 5;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct PrimaryObservedMessage {
     pub(crate) id: ObservedChatMessageId,
     pub(crate) message: ChatMessage,
@@ -86,6 +89,7 @@ pub(crate) enum ChatObservationDispatch {
 struct ChatObservationState {
     router: ExclusiveObservationRouter<ChatObservation>,
     business: ObservationSubscriber,
+    primary_decisions: Vec<Arc<PrimaryDecisionQueue>>,
     visual_session: VisualSessionId,
     next_bubble_sequence: u64,
     primary_visible: Vec<PrimaryTrackedMessage>,
@@ -119,6 +123,7 @@ impl ChatObservationShared {
             state: Arc::new(Mutex::new(ChatObservationState {
                 router,
                 business,
+                primary_decisions: Vec::new(),
                 visual_session: VisualSessionId::new(1),
                 next_bubble_sequence: 1,
                 primary_visible: Vec::new(),
@@ -131,6 +136,31 @@ impl ChatObservationShared {
                 ),
             })),
         }
+    }
+
+    /// Subscribe before taking the caller-owned baseline or sending a reply.
+    /// Only subsequent publications are delivered; observe_primary is not a publication.
+    pub(crate) fn subscribe_primary_decisions(&self) -> Result<PrimaryDecisionSubscriber> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        let queue = Arc::new(PrimaryDecisionQueue::default());
+        state.primary_decisions.push(queue.clone());
+        Ok(PrimaryDecisionSubscriber {
+            shared: self.clone(),
+            queue,
+        })
+    }
+
+    /// Capture/UI failures have no observed frame, so listeners report them separately.
+    pub(crate) fn report_primary_failure(&self, reason: impl Into<String>) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        fail_primary_decisions(&state, &reason.into());
+        Ok(())
     }
 
     pub(crate) fn publish_primary(
@@ -190,11 +220,21 @@ impl ChatObservationShared {
             .state
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        if !(PRIMARY_VISIBLE_MIN_MESSAGES..=PRIMARY_VISIBLE_MAX_MESSAGES).contains(&messages.len())
+        let observed = if (PRIMARY_VISIBLE_MIN_MESSAGES..=PRIMARY_VISIBLE_MAX_MESSAGES)
+            .contains(&messages.len())
         {
-            return Ok(Vec::new());
+            track_primary_messages(&mut state, messages)
+        } else if messages.is_empty() {
+            Vec::new()
+        } else {
+            // Baselines must establish the same partial anchor publish_primary uses.
+            track_primary_partial_messages(&mut state, messages)
+        };
+        // This records state only: baseline observations intentionally do not notify.
+        for subscriber in &state.primary_decisions {
+            subscriber.record_baseline(&observed);
         }
-        Ok(track_primary_messages(&mut state, messages))
+        Ok(observed)
     }
 
     pub(crate) fn primary_cursor(&self) -> Result<Option<PrimaryObservationCursor>> {
@@ -285,6 +325,11 @@ impl ChatObservationShared {
         state: &mut ChatObservationState,
         observation: ChatObservation,
     ) -> Result<Vec<ChatObservationDispatch>> {
+        if let ChatObservation::Primary { messages, .. } = &observation {
+            for subscriber in &state.primary_decisions {
+                subscriber.publish(messages);
+            }
+        }
         state.router.route(observation);
 
         let mut dispatches = Vec::new();
@@ -317,6 +362,7 @@ impl ChatObservationShared {
             .state
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        fail_primary_decisions(&state, "Primary visual session changed");
         let next = state.visual_session.get().wrapping_add(1);
         state.visual_session = VisualSessionId::new(next);
         state.next_bubble_sequence = 1;
@@ -352,6 +398,8 @@ impl ChatObservationShared {
             .state
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        let reason = reason.into();
+        fail_primary_decisions(&state, &reason);
         let advance = state.ledger.complete_failure(frame.id(), reason)?;
         publish_completion_advance(&mut state, advance);
         Ok(())
@@ -783,6 +831,145 @@ fn publish_completion_advance(state: &mut ChatObservationState, advance: Complet
             watermark.captured_through.elapsed().as_millis()
         );
         state.completion_advances.publish(advance);
+    }
+}
+
+#[derive(Default)]
+struct PrimaryDecisionQueue {
+    state: Mutex<PrimaryDecisionQueueState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct PrimaryDecisionQueueState {
+    pending: Vec<PrimaryObservedMessage>,
+    // Retain the last text per ID even after draining, so unchanged frames cost no queue space.
+    seen: HashMap<ObservedChatMessageId, (String, String)>,
+    failure: Option<String>,
+}
+
+impl PrimaryDecisionQueue {
+    fn record_baseline(&self, messages: &[PrimaryObservedMessage]) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.failure.is_some() {
+            return;
+        }
+        for message in messages {
+            if !state.seen.contains_key(&message.id)
+                && state.seen.len() >= PRIMARY_DECISION_CAPACITY
+            {
+                state.failure = Some("Primary decision subscription overflow".to_string());
+                self.changed.notify_all();
+                return;
+            }
+            state.seen.insert(
+                message.id.clone(),
+                (
+                    message.message.message_type.clone(),
+                    message.message.text.clone(),
+                ),
+            );
+        }
+    }
+
+    fn publish(&self, messages: &[PrimaryObservedMessage]) {
+        let Ok(mut state) = self.state.lock() else {
+            self.changed.notify_all();
+            return;
+        };
+        if state.failure.is_some() {
+            return;
+        }
+        for message in messages {
+            let revision = (
+                message.message.message_type.clone(),
+                message.message.text.clone(),
+            );
+            if state.seen.get(&message.id) == Some(&revision) {
+                continue;
+            }
+            if state.pending.len() >= PRIMARY_DECISION_CAPACITY
+                || (!state.seen.contains_key(&message.id)
+                    && state.seen.len() >= PRIMARY_DECISION_CAPACITY)
+            {
+                state.failure = Some("Primary decision subscription overflow".to_string());
+                break;
+            }
+            state.seen.insert(message.id.clone(), revision);
+            state.pending.push(message.clone());
+        }
+        self.changed.notify_all();
+    }
+
+    fn fail(&self, reason: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.failure.get_or_insert_with(|| reason.to_string());
+        }
+        self.changed.notify_all();
+    }
+}
+
+fn fail_primary_decisions(state: &ChatObservationState, reason: &str) {
+    for subscriber in &state.primary_decisions {
+        subscriber.fail(reason);
+    }
+}
+
+/// A scoped independent decision reader. Drop unregisters it and releases retained history.
+pub(crate) struct PrimaryDecisionSubscriber {
+    shared: ChatObservationShared,
+    queue: Arc<PrimaryDecisionQueue>,
+}
+
+impl PrimaryDecisionSubscriber {
+    /// Drain every retained new ID or OCR revision in publication order.
+    /// Failure is sticky and takes precedence over any pending messages.
+    pub(crate) fn read(&self) -> Result<Vec<PrimaryObservedMessage>> {
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Primary decision queue lock poisoned"))?;
+        if let Some(reason) = &state.failure {
+            return Err(anyhow!("Primary decision observation failed: {reason}"));
+        }
+        Ok(std::mem::take(&mut state.pending))
+    }
+
+    /// Wait without consuming messages. Callers should use <=50ms slices to service web actions.
+    pub(crate) fn wait(&self, timeout: Duration) -> Result<()> {
+        let state = self
+            .queue
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Primary decision queue lock poisoned"))?;
+        let (state, _) = self
+            .queue
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.pending.is_empty() && state.failure.is_none()
+            })
+            .map_err(|_| anyhow!("Primary decision queue lock poisoned"))?;
+        if let Some(reason) = &state.failure {
+            return Err(anyhow!("Primary decision observation failed: {reason}"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PrimaryDecisionSubscriber {
+    fn drop(&mut self) {
+        // Even a poisoned shared lock must not leave the subscriber registered.
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state
+            .primary_decisions
+            .retain(|queue| !Arc::ptr_eq(queue, &self.queue));
     }
 }
 
@@ -1414,6 +1601,154 @@ mod tests {
             panic!("primary observation was not dispatched");
         };
         messages
+    }
+
+    #[test]
+    fn primary_decision_subscriber_retains_more_than_business_history() {
+        let shared = ChatObservationShared::new();
+        let subscriber = shared.subscribe_primary_decisions().unwrap();
+        for number in 0..70 {
+            publish_primary(&shared, vec![message_at(&format!("m{number}"), 0, 0)]);
+        }
+        let messages = subscriber.read().unwrap();
+        assert_eq!(messages.len(), 70);
+        assert_eq!(messages.first().unwrap().message.text, "m0");
+        assert_eq!(messages.last().unwrap().message.text, "m69");
+    }
+
+    #[test]
+    fn primary_decision_subscribers_are_independent_and_only_receive_revisions() {
+        let shared = ChatObservationShared::new();
+        let first = shared.subscribe_primary_decisions().unwrap();
+        let second = shared.subscribe_primary_decisions().unwrap();
+        publish_primary(&shared, vec![message_at("same", 0, 0)]);
+        assert_eq!(first.read().unwrap().len(), 1);
+        assert_eq!(second.read().unwrap().len(), 1);
+        publish_primary(&shared, vec![message_at("same", 0, 0)]);
+        assert!(first.read().unwrap().is_empty());
+        publish_primary(&shared, vec![message_at("revised", 0, 0)]);
+        assert_eq!(first.read().unwrap().len(), 1);
+        assert_eq!(second.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn primary_decision_wait_wakes_on_publication() {
+        let shared = ChatObservationShared::new();
+        let subscriber = Arc::new(shared.subscribe_primary_decisions().unwrap());
+        let waiting = subscriber.clone();
+        let waiter = std::thread::spawn(move || waiting.wait(Duration::from_secs(1)));
+        std::thread::sleep(Duration::from_millis(10));
+        publish_primary(&shared, vec![message_at("wake", 0, 0)]);
+        waiter.join().unwrap().unwrap();
+        assert_eq!(subscriber.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn primary_decision_failure_and_session_change_are_reported() {
+        let shared = ChatObservationShared::new();
+        let failed = shared.subscribe_primary_decisions().unwrap();
+        shared.report_primary_failure("OCR unavailable").unwrap();
+        assert!(
+            failed
+                .read()
+                .unwrap_err()
+                .to_string()
+                .contains("OCR unavailable")
+        );
+        let changed = shared.subscribe_primary_decisions().unwrap();
+        shared.begin_visual_session().unwrap();
+        assert!(
+            changed
+                .wait(Duration::ZERO)
+                .unwrap_err()
+                .to_string()
+                .contains("session changed")
+        );
+    }
+
+    #[test]
+    fn primary_decision_subscriber_drop_unregisters_queue() {
+        let shared = ChatObservationShared::new();
+        let subscriber = shared.subscribe_primary_decisions().unwrap();
+        assert_eq!(shared.state.lock().unwrap().primary_decisions.len(), 1);
+        drop(subscriber);
+        assert!(shared.state.lock().unwrap().primary_decisions.is_empty());
+    }
+
+    #[test]
+    fn observe_primary_tracks_single_message_baseline_without_publishing_it() {
+        let shared = ChatObservationShared::new();
+        let subscriber = shared.subscribe_primary_decisions().unwrap();
+        let baseline = shared
+            .observe_primary(vec![message_at("baseline", 0, 0)])
+            .unwrap();
+        assert_eq!(baseline.len(), 1);
+        assert!(subscriber.read().unwrap().is_empty());
+        publish_primary(
+            &shared,
+            vec![message_at("baseline", 0, 0), message_at("reply", 20, 0)],
+        );
+        let observed = subscriber.read().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].message.text, "reply");
+        assert!(observed[0].is_new);
+    }
+
+    #[test]
+    fn primary_decision_baseline_overflow_is_sticky_without_stopping_business_delivery() {
+        let shared = ChatObservationShared::new();
+        let subscriber = shared.subscribe_primary_decisions().unwrap();
+        let baseline = (0..=PRIMARY_DECISION_CAPACITY)
+            .map(|sequence| PrimaryObservedMessage {
+                id: ObservedChatMessageId::new(
+                    VisualSessionId::new(1),
+                    ChatIdentity::PrimaryHall,
+                    BubbleSequence::new(sequence as u64 + 1),
+                ),
+                message: message_at("baseline", 0, 0),
+                is_new: false,
+            })
+            .collect::<Vec<_>>();
+        subscriber.queue.record_baseline(&baseline);
+        assert!(
+            subscriber
+                .read()
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        assert!(
+            subscriber
+                .wait(Duration::ZERO)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+
+        let dispatches = publish_primary(&shared, vec![message_at("business", 0, 0)]);
+        assert_eq!(primary_messages(&dispatches)[0].message.text, "business");
+    }
+
+    #[test]
+    fn primary_decision_terminal_failure_wakes_waiter() {
+        let shared = ChatObservationShared::new();
+        let subscriber = Arc::new(shared.subscribe_primary_decisions().unwrap());
+        let waiting = subscriber.clone();
+        let waiter = std::thread::spawn(move || waiting.wait(Duration::from_secs(1)));
+        std::thread::sleep(Duration::from_millis(10));
+        let frame = shared.begin_frame(Instant::now()).unwrap();
+        shared
+            .record_terminal_failure(frame, "OCR terminal failure")
+            .unwrap();
+        let error = waiter.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("OCR terminal failure"));
+        assert!(
+            subscriber
+                .read()
+                .unwrap_err()
+                .to_string()
+                .contains("OCR terminal failure")
+        );
     }
 
     fn next_completion_advance(

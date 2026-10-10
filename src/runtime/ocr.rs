@@ -81,6 +81,7 @@ struct OcrJob {
     priority: OcrPriority,
     sequence: u64,
     deadline: Instant,
+    queued_at: Instant,
     image: DynamicImage,
     response: SyncSender<OcrRuntimeResult<Vec<OcrLine>>>,
 }
@@ -132,6 +133,7 @@ impl OcrRuntimeHandle {
                 priority,
                 sequence,
                 deadline,
+                queued_at: Instant::now(),
                 image,
                 response,
             });
@@ -477,13 +479,20 @@ fn run_ocr_runtime(mut device: impl OcrDevice, channel: Arc<OcrChannel>) {
         let Some(job) = job else {
             continue;
         };
-        if Instant::now() >= job.deadline {
+        let started = Instant::now();
+        if log::log_enabled!(target: "performance", log::Level::Debug) {
+            log::debug!(target: "performance", "ocr sequence={} priority={:?} queue_wait_us={} expired={}", job.sequence, job.priority, started.duration_since(job.queued_at).as_micros(), started >= job.deadline);
+        }
+        if started >= job.deadline {
             let _ = job.response.try_send(Err(OcrRuntimeError::TimedOut));
             continue;
         }
         let result = device
             .recognize_lines(&job.image)
             .map_err(OcrRuntimeError::Inference);
+        if log::log_enabled!(target: "performance", log::Level::Debug) {
+            log::debug!(target: "performance", "ocr sequence={} priority={:?} inference_us={} success={}", job.sequence, job.priority, started.elapsed().as_micros(), result.is_ok());
+        }
         let should_respond = match channel.state.lock() {
             Ok(mut state) => {
                 state.active_response.take();

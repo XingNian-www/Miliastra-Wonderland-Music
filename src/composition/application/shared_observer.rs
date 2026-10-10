@@ -5,8 +5,12 @@ use crate::observation::chat::{
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{self, RecvTimeoutError};
 
+#[cfg(all(test, feature = "ocr-mnn"))]
+mod actual_screenshot_tests;
+
 const OBSERVER_WAIT: Duration = Duration::from_millis(100);
-// Same normalized title geometry as the secondary conversation OCR fixtures.
+// Test-only diagnostic crop and ROI microbenchmark coordinate; never identity evidence.
+#[cfg(test)]
 const PASSIVE_SECONDARY_TITLE: Rect = Rect::new(600, 24, 480, 72);
 
 pub(super) struct SharedChatObserverGuard {
@@ -169,6 +173,7 @@ impl ApplicationRuntime {
                                     Some(&monitor),
                                 )?;
                                 ocr_time = finish_observer_stage(&mut stage_started);
+                                crate::debug_read_only::observer().cache_frame(published.clone());
                                 shared.publish(
                                     frame.captured_at,
                                     ChatIdentity::PrimaryHall,
@@ -186,60 +191,19 @@ impl ApplicationRuntime {
                             }
                             PassiveLayout::Secondary {
                                 hall,
+                                selected,
                                 bubbles,
                                 latest,
                             } => {
                                 let started = Instant::now();
-                                // A fresh secondary scan always recognizes the title as well.
-                                let title = passive_text(
-                                    &ocr,
-                                    &frame.image,
-                                    PASSIVE_SECONDARY_TITLE,
-                                    config.ocr.same_line_y_tolerance,
+                                let (identity, messages) = recognize_passive_secondary(
+                                    &ocr, &frame.image, &config, hall, selected, &bubbles, latest,
                                 )?;
-                                let identity = if !hall && !bubbles.is_empty() {
-                                    ChatIdentity::Unknown
-                                } else {
-                                    passive_secondary_identity(hall, &title)
-                                };
-                                let mut messages = Vec::new();
-                                if hall || !bubbles.is_empty() {
-                                    messages = recognize_passive_hall(
-                                        bubbles
-                                            .iter()
-                                            .map(|bubble| (bubble.rect, bubble.sender_rect())),
-                                        |rect| {
-                                            passive_text(
-                                                &ocr,
-                                                &frame.image,
-                                                rect,
-                                                config.ocr.same_line_y_tolerance,
-                                            )
-                                        },
-                                    )?;
-                                } else if let Some(rect) = latest {
-                                    let text = passive_text(
-                                        &ocr,
-                                        &frame.image,
-                                        rect,
-                                        config.ocr.same_line_y_tolerance,
-                                    )?;
-                                    let raw_sender = matches!(&identity, ChatIdentity::Friend(_))
-                                        .then(|| title.clone());
-                                    let sender = raw_sender.as_deref().and_then(passive_sender);
-                                    messages.push(SharedChatInput {
-                                        text,
-                                        sender,
-                                        raw_sender,
-                                        message_type: "pink".into(),
-                                        block: rect,
-                                    });
-                                }
                                 monitor.publish_chat_scan(ChatScanTelemetry {
                                     marker_count: messages.len(),
                                     lines: messages
                                         .iter()
-                                        .map(|message| message.text.clone())
+                                        .map(|message| redacted_chat_text(&message.text).to_string())
                                         .collect(),
                                     marker_ms: 0,
                                     ocr_ms: started.elapsed().as_millis(),
@@ -247,6 +211,7 @@ impl ApplicationRuntime {
                                     scope: "shared-secondary",
                                 });
                                 ocr_time = finish_observer_stage(&mut stage_started);
+                                crate::debug_read_only::observer().cache_frame(published.clone());
                                 shared.publish(frame.captured_at, identity, messages)?;
                             }
                             PassiveLayout::NoChat => {
@@ -314,6 +279,7 @@ enum PassiveLayout {
     Primary(Vec<crate::ui::template::TemplateHit>),
     Secondary {
         hall: bool,
+        selected: Option<Rect>,
         bubbles: Vec<SecondaryHallBubble>,
         latest: Option<Rect>,
     },
@@ -325,6 +291,11 @@ fn passive_layout(
     config: &AppConfig,
     templates: &ResolvedTemplateArgs,
 ) -> Result<PassiveLayout> {
+    // Reuse this frame's classification even before full-screen stabilization.
+    // These are two separately evidenced menus, not every Secondary/panel label.
+    if passive_ui_excludes_chat(frame.ui_state.as_ref()) {
+        return Ok(PassiveLayout::NoChat);
+    }
     // Geometry is from this immutable frame, independent of full-screen stability.
     let markers = match frame.marker_hits_for_image() {
         Some(markers) => markers,
@@ -346,19 +317,21 @@ fn passive_layout(
     }
     let anchor: Rect = config.screen.secondary_hall_rect.into();
     let friends: Rect = config.invite.friend_list_region.into();
-    let hall_search = Rect::new(
-        anchor.x.min(friends.x),
-        anchor.y.min(friends.y),
-        (anchor.right().max(friends.right()) - anchor.x.min(friends.x)) as u32,
-        (anchor.bottom().max(friends.bottom()) - anchor.y.min(friends.y)) as u32,
-    );
-    let hall = best_template_hit(
+    let hall_search = crate::ui::locator::secondary_hall_search_rect(anchor, friends);
+    let hall_hit = best_template_hit(
         &frame.image,
         Some(hall_search),
         &config.templates.secondary_hall,
         config.templates.marker_threshold,
-    )?
-    .is_some();
+    )?;
+    let selected = crate::ui::routines::highlighted_conversation_row(
+        &frame.image,
+        passive_sidebar_region(config),
+    );
+    // A visible hall shortcut does not mean it is the selected conversation.
+    let hall = selected
+        .zip(hall_hit.as_ref())
+        .is_some_and(|(row, hit)| (row.y..row.bottom()).contains(&hit.center().y));
     let latest = latest_incoming_bubble_rect(&frame.image);
     let classified_secondary = matches!(frame.ui_state.as_ref(),
         Some(crate::runtime::ui::UiStateObservation::Classified(state))
@@ -369,6 +342,7 @@ fn passive_layout(
     }
     Ok(PassiveLayout::Secondary {
         hall,
+        selected: selected.map(|row| Rect::new(friends.x, row.y, friends.width, row.height)),
         bubbles,
         latest,
     })
@@ -389,12 +363,16 @@ impl PassiveLayout {
             }
             Self::Secondary {
                 hall,
+                selected,
                 bubbles,
                 latest,
             } => {
                 2_u8.hash(&mut hash);
                 hall.hash(&mut hash);
-                hash_region(image, PASSIVE_SECONDARY_TITLE, &mut hash)?;
+                selected.is_some().hash(&mut hash);
+                if let Some(row) = selected {
+                    hash_region(image, *row, &mut hash)?;
+                }
                 if *hall || !bubbles.is_empty() {
                     for bubble in bubbles {
                         hash_region(image, bubble.rect, &mut hash)?;
@@ -444,6 +422,103 @@ fn hash_region(image: &DynamicImage, rect: Rect, hash: &mut impl Hasher) -> Resu
     Ok(())
 }
 
+fn passive_ui_excludes_chat(observation: Option<&crate::runtime::ui::UiStateObservation>) -> bool {
+    let Some(crate::runtime::ui::UiStateObservation::Classified(state)) = observation else {
+        return false;
+    };
+    let classification = state.classification();
+    match classification.kind() {
+        UiStateKind::MainMenu => matches!(
+            classification.evidence().final_rule(),
+            "main_menu_template" | "paimon_menu_panel_template"
+        ),
+        UiStateKind::Secondary => matches!(
+            classification.label(),
+            "secondary:qianxing_panel" | "secondary:qianxing_map"
+        ),
+        _ => false,
+    }
+}
+
+fn passive_sidebar_region(config: &AppConfig) -> Rect {
+    let friends: Rect = config.invite.friend_list_region.into();
+    // Scrolling can move the selected friend above the active search's y=280.
+    // Include the whole sidebar below Back, while retaining its configured width.
+    let back: Rect = config.screen.secondary_back_rect.into();
+    let top = back.bottom();
+    Rect::new(
+        friends.x.saturating_sub(70),
+        top,
+        friends.width.saturating_add(110),
+        (friends.bottom() - top).max(0) as u32,
+    )
+}
+
+fn recognize_passive_secondary(
+    ocr: &OcrRuntimeHandle,
+    image: &DynamicImage,
+    config: &AppConfig,
+    hall: bool,
+    selected: Option<Rect>,
+    bubbles: &[SecondaryHallBubble],
+    latest: Option<Rect>,
+) -> Result<(ChatIdentity, Vec<SharedChatInput>)> {
+    let selected_name = if !hall {
+        selected
+            .map(|row| -> Result<Option<String>> {
+                let lines =
+                    ocr.recognize_lines(crop_canvas(image, row)?, OcrPriority::ChatObservation)?;
+                let names = lines
+                    .iter()
+                    .map(|line| line.text.trim())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>();
+                // More than one OCR name in the actual highlight is ambiguous.
+                Ok(match names.as_slice() {
+                    [name] => Some((*name).to_owned()),
+                    _ => None,
+                })
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let identity = passive_secondary_identity(hall, selected_name.as_deref());
+    // Secondary bubbles have no primary marker color. Preserve the established
+    // channel mapping: selected private conversation => pink; current hall => blue.
+    // Unknown rows do not acquire either channel's authorization semantics.
+    let message_type = match &identity {
+        ChatIdentity::Friend(_) => "pink",
+        ChatIdentity::SecondaryHall => "blue",
+        _ => "unknown",
+    };
+    let mut messages = recognize_passive_hall(
+        bubbles
+            .iter()
+            .map(|bubble| (bubble.rect, bubble.sender_rect())),
+        |rect| passive_text(ocr, image, rect, config.ocr.same_line_y_tolerance),
+    )?;
+    for message in &mut messages {
+        message.message_type = message_type.into();
+    }
+    if messages.is_empty() && !hall {
+        if let Some(block) = latest {
+            let raw_sender = matches!(&identity, ChatIdentity::Friend(_))
+                .then(|| selected_name.clone())
+                .flatten();
+            messages.push(SharedChatInput {
+                text: passive_text(ocr, image, block, config.ocr.same_line_y_tolerance)?,
+                sender: raw_sender.as_deref().and_then(passive_sender),
+                raw_sender,
+                message_type: message_type.into(),
+                block,
+            });
+        }
+    }
+    Ok((identity, messages))
+}
+
 fn passive_text(
     ocr: &OcrRuntimeHandle,
     image: &DynamicImage,
@@ -483,21 +558,26 @@ fn passive_sender(raw: &str) -> Option<String> {
     (!effective.is_empty()).then(|| effective.to_owned())
 }
 
-fn passive_secondary_identity(hall: bool, title: &str) -> ChatIdentity {
+fn passive_secondary_identity(hall: bool, selected_name: Option<&str>) -> ChatIdentity {
     if hall {
         return ChatIdentity::SecondaryHall;
     }
-    match passive_sender(title) {
+    match selected_name.and_then(passive_sender) {
         Some(name)
-            if !matches!(
-                name.as_str(),
-                "\u{597d}\u{53cb}"
-                    | "\u{804a}\u{5929}"
-                    | "\u{5f53}\u{524d}\u{5927}\u{5385}"
-                    | "\u{5927}\u{5385}"
-                    | "\u{964c}\u{751f}\u{4eba}"
-                    | "\u{4e16}\u{754c}"
-            ) =>
+            if !name.ends_with(['…', '⋯'])
+                && !name.ends_with("...")
+                && !matches!(
+                    name.as_str(),
+                    "\u{597d}\u{53cb}"
+                        | "\u{804a}\u{5929}"
+                        | "\u{5f53}\u{524d}\u{5927}\u{5385}"
+                        | "\u{5927}\u{5385}"
+                        | "\u{964c}\u{751f}\u{4eba}"
+                        | "\u{4e16}\u{754c}"
+                        | "公共频道"
+                        | "陌生人消息"
+                        | "添加会话对象"
+                ) =>
         {
             ChatIdentity::Friend(name.into())
         }
@@ -793,10 +873,11 @@ mod tests {
     }
 
     #[test]
-    fn signature_tracks_title_and_message_but_ignores_unrelated_pixels() {
+    fn signature_tracks_selected_row_and_message_but_ignores_unrelated_pixels() {
         let mut pixels = image::RgbaImage::new(1920, 1080);
         let layout = PassiveLayout::Secondary {
             hall: false,
+            selected: Some(Rect::new(80, 228, 170, 67)),
             bubbles: Vec::new(),
             latest: Some(Rect::new(280, 200, 400, 80)),
         };
@@ -811,14 +892,14 @@ mod tests {
                 .signature(&DynamicImage::ImageRgba8(pixels.clone()), primary)
                 .unwrap()
         );
-        pixels.put_pixel(650, 40, image::Rgba([255, 0, 0, 255]));
-        let title_changed = layout
+        pixels.put_pixel(100, 260, image::Rgba([255, 0, 0, 255]));
+        let selection_changed = layout
             .signature(&DynamicImage::ImageRgba8(pixels.clone()), primary)
             .unwrap();
-        assert_ne!(first, title_changed);
+        assert_ne!(first, selection_changed);
         pixels.put_pixel(300, 220, image::Rgba([255, 0, 0, 255]));
         assert_ne!(
-            title_changed,
+            selection_changed,
             layout
                 .signature(&DynamicImage::ImageRgba8(pixels), primary)
                 .unwrap()
@@ -827,14 +908,32 @@ mod tests {
 
     #[test]
     fn empty_identity_is_unknown_and_remark_is_effective_sender() {
-        assert_eq!(passive_secondary_identity(false, ""), ChatIdentity::Unknown);
+        for name in [
+            "",
+            "公共频道",
+            "陌生人消息",
+            "添加会话对象",
+            "当前大厅",
+            "truncated...",
+            "partial…",
+        ] {
+            assert_eq!(
+                passive_secondary_identity(false, Some(name)),
+                ChatIdentity::Unknown,
+                "{name}"
+            );
+        }
         assert_eq!(
-            passive_secondary_identity(true, ""),
+            passive_secondary_identity(false, None),
+            ChatIdentity::Unknown
+        );
+        assert_eq!(
+            passive_secondary_identity(true, None),
             ChatIdentity::SecondaryHall
         );
         assert_eq!(passive_sender("player(remark)"), Some("remark".into()));
         assert_eq!(
-            passive_secondary_identity(false, "player(remark)"),
+            passive_secondary_identity(false, Some("player(remark)")),
             ChatIdentity::Friend("remark".into())
         );
     }

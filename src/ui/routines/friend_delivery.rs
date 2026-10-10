@@ -233,20 +233,6 @@ impl ResidencyUi {
             config: self.config.clone(),
         })
     }
-
-    pub(crate) fn observe(
-        &self,
-        target: UiResidencyTarget,
-    ) -> std::result::Result<
-        UiOperation<std::result::Result<DynamicImage, UiRoutineFailure>>,
-        UiSubmitError,
-    > {
-        self.runtime.submit(ObserveResidencyRoutine {
-            target,
-            ocr: self.ocr.clone(),
-            config: self.config.clone(),
-        })
-    }
 }
 
 struct EstablishResidencyRoutine {
@@ -269,33 +255,6 @@ impl UiRoutine for EstablishResidencyRoutine {
             Ok(()) => UiResidencyOutcome::Confirmed(self.request.target),
             Err(failure) => UiResidencyOutcome::Failed(failure),
         }
-    }
-}
-
-struct ObserveResidencyRoutine {
-    target: UiResidencyTarget,
-    ocr: OcrRuntimeHandle,
-    config: FriendDeliveryRoutineConfig,
-}
-
-impl sealed::UiRoutineSealed for ObserveResidencyRoutine {}
-
-impl UiRoutine for ObserveResidencyRoutine {
-    type Output = std::result::Result<DynamicImage, UiRoutineFailure>;
-
-    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        context.publish_progress(UiRoutineProgressStage::NormalizingStart);
-        context
-            .device()
-            .ensure_ready(self.config.after_activate_ms)
-            .map_err(|error| before_input_failure("prepare_residency_observation", error))?;
-        restore_residency(context, &self.ocr, &self.config, self.target)?;
-        capture_normalized(
-            context,
-            &self.config,
-            "capture_residency_observation",
-            InputCertainty::AfterInputUnknown,
-        )
     }
 }
 
@@ -1453,6 +1412,22 @@ fn point_in_rect(point: Point, rect: Rect) -> bool {
 }
 
 fn highlighted_row(image: &DynamicImage, region: Rect) -> Option<Rect> {
+    highlighted_rows(image, region)
+        .into_iter()
+        .max_by_key(|row| row.height)
+}
+
+/// Read-only counterpart of active friend confirmation: the current frame must
+/// contain exactly one selected sidebar row. No recipient or click point is assumed.
+pub(crate) fn highlighted_conversation_row(image: &DynamicImage, region: Rect) -> Option<Rect> {
+    let rows = highlighted_rows(image, region);
+    match rows.as_slice() {
+        [row] => Some(*row),
+        _ => None,
+    }
+}
+
+fn highlighted_rows(image: &DynamicImage, region: Rect) -> Vec<Rect> {
     let scan_region = region;
     let start = scan_region.y.max(0);
     let end = scan_region.bottom().min(image.height() as i32);
@@ -1482,13 +1457,17 @@ fn highlighted_row(image: &DynamicImage, region: Rect) -> Option<Rect> {
     {
         runs.push((top, end));
     }
-    let (top, bottom) = runs.into_iter().max_by_key(|(top, bottom)| bottom - top)?;
-    Some(Rect::new(
-        scan_region.x.max(0),
-        top,
-        (scan_region.right().min(image.width() as i32) - scan_region.x.max(0)) as u32,
-        (bottom - top) as u32,
-    ))
+    runs.into_iter()
+        .map(|(top, bottom)| {
+            Rect::new(
+                scan_region.x.max(0),
+                top,
+                (scan_region.right().min(image.width() as i32) - scan_region.x.max(0)).max(0)
+                    as u32,
+                (bottom - top) as u32,
+            )
+        })
+        .collect()
 }
 
 pub(super) fn restore_residency(
@@ -2949,7 +2928,8 @@ mod tests {
             2,
         );
         let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
-        routine_config.timeout_ms = 500;
+        // Classification of real 1920x1080 frames must fit before testing the post-Esc timeout.
+        // Use the configured workflow budget so parallel test load cannot skip the input stage.
         routine_config.poll_ms = 1;
 
         let failure = ui_runtime
@@ -3077,7 +3057,7 @@ mod tests {
             2,
         );
         let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
-        routine_config.timeout_ms = 500;
+        // 真实截图需完成两帧 Unknown 和连续 Primary 分类，沿用 fixture 的超时预算。
         routine_config.poll_ms = 1;
 
         ui_runtime

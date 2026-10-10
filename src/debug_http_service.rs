@@ -5,8 +5,8 @@ use crate::debug_sandbox::{
 };
 use crate::debug_sandbox_journal::SandboxJournal;
 use crate::debug_sandbox_runner::{
-    DebugSandboxRunner, LiveExecutor, OcrTextRecognizer, SandboxExecutor, SimulatedExecutor,
-    StepAssertion,
+    DebugSandboxRunner, LiveExecutor, OcrTextRecognizer, ReadOnlyExecutor, SandboxExecutor,
+    SimulatedExecutor, StepAssertion,
 };
 use crate::debug_sandbox_store::DebugSandboxStore;
 use crate::interfaces::http::{HttpCommandError, HttpDebugRunRequest};
@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Mutex;
 
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -40,7 +40,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// 与 base64_encode 配套的标准字母表解码（含 padding），输入非法时返回 None。
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
     fn symbol_value(byte: u8) -> Option<u32> {
         match byte {
             b'A'..=b'Z' => Some(u32::from(byte - b'A')),
@@ -103,9 +103,48 @@ fn rescale_png_base64(encoded: &str, scale: f64) -> Result<Option<(String, u32, 
     Ok(Some((png_base64(&resized)?, target_width, target_height)))
 }
 
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadOnlyRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReadOnlyReadRequest {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "read_only_ocr_default")]
+    pub ocr: bool,
+    pub rect: Option<ReadOnlyRect>,
+}
+fn read_only_ocr_default() -> bool {
+    true
+}
+struct ReadOnlyFence;
+impl crate::runtime::ui::sealed::UiRoutineSealed for ReadOnlyFence {}
+impl crate::runtime::ui::UiRoutine for ReadOnlyFence {
+    type Output = anyhow::Result<()>;
+    fn execute(self, context: &mut crate::runtime::ui::UiRoutineContext<'_>) -> Self::Output {
+        anyhow::ensure!(!context.is_cancelled(), "只读切换围栏已取消");
+        Ok(())
+    }
+}
+struct ActiveReadRoutine;
+impl crate::runtime::ui::sealed::UiRoutineSealed for ActiveReadRoutine {}
+impl crate::runtime::ui::UiRoutine for ActiveReadRoutine {
+    type Output = anyhow::Result<crate::runtime::ui::CapturedFrame>;
+    fn execute(self, context: &mut crate::runtime::ui::UiRoutineContext<'_>) -> Self::Output {
+        context.capture_frame()
+    }
+}
+
 enum SandboxSession {
     Simulated(DebugSandboxRunner<SimulatedExecutor>),
     Live(DebugSandboxRunner<LiveExecutor>),
+    ReadOnly(DebugSandboxRunner<ReadOnlyExecutor>),
 }
 
 impl SandboxSession {
@@ -113,6 +152,7 @@ impl SandboxSession {
         match self {
             Self::Simulated(runner) => runner.evidence(id),
             Self::Live(runner) => runner.evidence(id),
+            Self::ReadOnly(runner) => runner.evidence(id),
         }
     }
 }
@@ -266,6 +306,96 @@ impl DebugHttpService {
         self
     }
 
+    fn read_only_executor(&self, runtime: UiRuntimeHandle) -> ReadOnlyExecutor {
+        let executor = ReadOnlyExecutor::new(runtime);
+        match &self.playback_queue {
+            Some(reader) => executor.with_playback_queue_reader(reader.clone()),
+            None => executor,
+        }
+    }
+
+    pub(crate) fn set_read_only_mode(
+        &self,
+        enabled: bool,
+        state: crate::debug_read_only::ReadOnlyState,
+    ) -> Result<serde_json::Value, HttpCommandError> {
+        let runners = self.runners.lock().map_err(error)?;
+        if enabled
+            && runners
+                .values()
+                .any(|session| matches!(session, SandboxSession::Live(_)))
+        {
+            return Err(error("请先完成或取消当前live沙盒运行，再开启只读模式"));
+        }
+        if enabled && let Some(runtime) = &self.runtime {
+            // 旧live超时只请求取消；无输入围栏必须排在旧设备调用之后完成，才能承诺只读。
+            runtime
+                .submit(ReadOnlyFence)
+                .map_err(error)?
+                .wait_timeout(std::time::Duration::from_secs(10))
+                .map_err(error)?
+                .map_err(error)?;
+        }
+        Ok(crate::debug_read_only::observer().set_enabled_state(enabled, state))
+    }
+
+    pub(crate) fn read_active(
+        &self,
+        request: ReadOnlyReadRequest,
+    ) -> Result<serde_json::Value, HttpCommandError> {
+        let observer = crate::debug_read_only::observer();
+        if !observer.enabled() || observer.state() != crate::debug_read_only::ReadOnlyState::Active
+        {
+            return Err(error("请开启只读模式的active主动读取状态"));
+        }
+        if request.label.len() > 256 {
+            return Err(error("label最多256字节"));
+        }
+        let runtime = self
+            .runtime
+            .clone()
+            .ok_or_else(|| error("只读 UI runtime未接线"))?;
+        let frame = runtime
+            .submit(ActiveReadRoutine)
+            .map_err(error)?
+            .wait_timeout(std::time::Duration::from_secs(30))
+            .map_err(error)?
+            .map_err(error)?;
+        let image = frame.image();
+        let rect = request.rect.unwrap_or(ReadOnlyRect {
+            x: 0,
+            y: 0,
+            width: image.width(),
+            height: image.height(),
+        });
+        if rect.width == 0
+            || rect.height == 0
+            || u64::from(rect.x) + u64::from(rect.width) > u64::from(image.width())
+            || u64::from(rect.y) + u64::from(rect.height) > u64::from(image.height())
+        {
+            return Err(error("rect必须为原始截图范围内的非空区域"));
+        }
+        let ocr = if request.ocr {
+            match &self.ocr {
+                Some(recognizer) => {
+                    match recognizer(&image.crop_imm(rect.x, rect.y, rect.width, rect.height)) {
+                        Ok(text) => {
+                            serde_json::json!({"available":true,"text":text,"rect":rect,"coordinateSpace":"rawGame"})
+                        }
+                        Err(reason) => {
+                            serde_json::json!({"available":true,"error":reason,"rect":rect})
+                        }
+                    }
+                }
+                None => serde_json::json!({"available":false,"reason":"OCR未接线"}),
+            }
+        } else {
+            serde_json::json!({"requested":false})
+        };
+        let id = observer.record_active(std::sync::Arc::new(frame), serde_json::json!({"request":request,"ocr":ocr,"steps":["capture current game client without input","classify the same captured frame","OCR the requested source region if enabled","save evidence and export JSON plus original PNG"],"reproduce":{"method":"POST","path":"/debug/read-only/read","body":request},"scope":"diagnostic observation; no dispatch or input"})).map_err(error)?;
+        observer.read_entry(&id).map_err(error)
+    }
+
     fn live_executor(&self, runtime: UiRuntimeHandle) -> LiveExecutor {
         let mut executor = LiveExecutor::new(runtime);
         if let Some(reader) = &self.playback_queue {
@@ -351,7 +481,7 @@ impl DebugHttpService {
             .map_err(error)
     }
     pub fn execute_direct(&self, command: AtomicCommand) -> Result<SandboxRun, HttpCommandError> {
-        if !crate::debug_mode::enabled() {
+        if !crate::debug_read_only::observer().enabled() && !crate::debug_mode::enabled() {
             return Err(error("请先启用调试模式"));
         }
         let runtime = self
@@ -371,9 +501,20 @@ impl DebugHttpService {
         let run_id = {
             let mut runners = self.runners.lock().map_err(error)?;
             self.ensure_session_capacity(&mut runners)?;
-            let mut runner = self.runner(self.live_executor(runtime));
-            let run = runner.start_snapshot(task, Vec::new()).map_err(error)?;
-            runners.insert(run.run_id.clone(), SandboxSession::Live(runner));
+            let run = if crate::debug_read_only::observer().enabled() {
+                let mut runner = self.runner(self.read_only_executor(runtime));
+                let run = runner.start_snapshot(task, Vec::new()).map_err(error)?;
+                runners.insert(run.run_id.clone(), SandboxSession::ReadOnly(runner));
+                run
+            } else {
+                if !crate::debug_mode::enabled() {
+                    return Err(error("请先启用调试模式"));
+                }
+                let mut runner = self.runner(self.live_executor(runtime));
+                let run = runner.start_snapshot(task, Vec::new()).map_err(error)?;
+                runners.insert(run.run_id.clone(), SandboxSession::Live(runner));
+                run
+            };
             crate::debug_events::bus().publish(
                 "run.started",
                 serde_json::json!({"runId": run.run_id, "source": "direct"}),
@@ -406,6 +547,11 @@ impl DebugHttpService {
                 if !r.assertions.is_empty() {
                     manifest
                         .authorize(Capability::Assert, PluginApiVersion::new(1, 0), &policy)
+                        .map_err(error)?;
+                }
+                if r.mode == "readOnly" {
+                    manifest
+                        .authorize(Capability::Observe, PluginApiVersion::new(1, 0), &policy)
                         .map_err(error)?;
                 }
                 if r.mode == "live" {
@@ -467,7 +613,25 @@ impl DebugHttpService {
                 runners.insert(run.run_id.clone(), SandboxSession::Simulated(runner));
                 run
             }
+            "readOnly" => {
+                if r.fixture.is_some() {
+                    return Err(error("readOnly运行不接受fixture"));
+                }
+                let runtime = self
+                    .runtime
+                    .clone()
+                    .ok_or_else(|| error("只读 UI runtime未接线"))?;
+                let mut runner = self.runner(self.read_only_executor(runtime));
+                let run = runner
+                    .start(&r.task_id, pinned_version, r.assertions)
+                    .map_err(error)?;
+                runners.insert(run.run_id.clone(), SandboxSession::ReadOnly(runner));
+                run
+            }
             "live" => {
+                if crate::debug_read_only::observer().enabled() {
+                    return Err(error("只读模式禁止live写运行，请使用readOnly"));
+                }
                 if !crate::debug_mode::enabled() {
                     return Err(error("live运行需要先启用调试模式"));
                 }
@@ -485,7 +649,7 @@ impl DebugHttpService {
                 runners.insert(run.run_id.clone(), SandboxSession::Live(runner));
                 run
             }
-            _ => return Err(error("mode必须是simulated或live")),
+            _ => return Err(error("mode必须是simulated、live或readOnly")),
         };
         Ok(run)
     }
@@ -585,6 +749,13 @@ impl DebugHttpService {
                 }
             }
             SandboxSession::Live(runner) => {
+                if all {
+                    runner.run_all(id)
+                } else {
+                    runner.step(id)
+                }
+            }
+            SandboxSession::ReadOnly(runner) => {
                 if all {
                     runner.run_all(id)
                 } else {
@@ -911,6 +1082,83 @@ impl DebugHttpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "global observation state; run isolated; no game input"]
+    fn read_only_observation_preserves_normal_program_execution() {
+        use crate::debug_read_only::{ReadOnlyState, observer};
+        use crate::runtime::ui::{UiDevice, UiRoutine, UiRoutineContext, UiRuntime};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Restore(bool, ReadOnlyState);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                observer().set_enabled_state(self.0, self.1);
+            }
+        }
+        struct Device(Arc<AtomicUsize>);
+        impl UiDevice for Device {
+            fn capture(&mut self) -> anyhow::Result<image::DynamicImage> {
+                anyhow::bail!("no capture requested")
+            }
+            fn press_key(&mut self, _key: enigo::Key) -> anyhow::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        struct NormalBusinessRoutine;
+        impl crate::runtime::ui::sealed::UiRoutineSealed for NormalBusinessRoutine {}
+        impl UiRoutine for NormalBusinessRoutine {
+            type Output = anyhow::Result<()>;
+            fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+                anyhow::ensure!(
+                    crate::debug_mode::input_allowed(),
+                    "normal program permission changed"
+                );
+                context.device().press_key(enigo::Key::Return)
+            }
+        }
+        let _restore = Restore(observer().enabled(), observer().state());
+        assert!(!crate::debug_mode::enabled());
+        let generation = crate::debug_mode::generation();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let runtime = UiRuntime::start(Device(writes.clone()), 8).unwrap();
+        let service = DebugHttpService::new(Some(runtime.handle()));
+        for state in [ReadOnlyState::Active, ReadOnlyState::Push] {
+            service.set_read_only_mode(true, state).unwrap();
+            assert!(
+                service
+                    .execute_direct(AtomicCommand::PressKey {
+                        key: "Enter".into()
+                    })
+                    .is_err()
+            );
+            runtime
+                .handle()
+                .submit(NormalBusinessRoutine)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .unwrap();
+            assert!(!crate::debug_mode::enabled());
+            assert_eq!(crate::debug_mode::generation(), generation);
+        }
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            2,
+            "normal business runs in both observation states"
+        );
+        runtime.shutdown().unwrap();
+        // A stopped worker cannot finish the activation fence. Mode must remain disabled.
+        observer().set_enabled_state(false, ReadOnlyState::Active);
+        assert!(
+            service
+                .set_read_only_mode(true, ReadOnlyState::Active)
+                .is_err()
+        );
+        assert!(!observer().enabled());
+    }
     use crate::debug_sandbox::{AtomicCommand, SandboxFixture, SandboxStatus};
 
     /// 一张有噪声、压缩不掉的 PNG 帧，尺寸固定便于断言归档后的尺寸。

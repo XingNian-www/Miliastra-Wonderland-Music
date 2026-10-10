@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -16,29 +15,12 @@ use crate::observation::shared::{
     ObservationGap, ObservationRead, ObservationSubscriber, SharedObservationStream,
 };
 const SHARED_CHAT_HISTORY_CAPACITY: usize = 64;
-// Scoped decision windows retain events independently of the business history.
-const PRIMARY_DECISION_CAPACITY: usize = 4096;
-const PRIMARY_VISIBLE_MIN_MESSAGES: usize = 2;
-const PRIMARY_VISIBLE_MAX_MESSAGES: usize = 5;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PrimaryObservedMessage {
     pub(crate) id: ObservedChatMessageId,
     pub(crate) message: ChatMessage,
     pub(crate) is_new: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PrimaryObservationCursor {
-    visual_session: VisualSessionId,
-    bubble_sequence: BubbleSequence,
-}
-
-impl PrimaryObservationCursor {
-    pub(crate) fn is_before(self, message_id: &ObservedChatMessageId) -> bool {
-        self.visual_session == message_id.visual_session
-            && self.bubble_sequence.get() < message_id.bubble_sequence.get()
-    }
 }
 
 #[derive(Clone)]
@@ -87,29 +69,21 @@ pub(crate) enum ChatObservationDispatch {
 }
 
 struct ChatObservationState {
+    business_dispatches: usize,
+    exclusive_requested: bool,
+    exclusive_active: bool,
     router: ExclusiveObservationRouter<ChatObservation>,
     business: ObservationSubscriber,
-    primary_decisions: Vec<Arc<PrimaryDecisionQueue>>,
     visual_session: VisualSessionId,
     next_bubble_sequence: u64,
-    primary_visible: Vec<PrimaryTrackedMessage>,
-    primary_partial: Vec<PrimaryTrackedMessage>,
-    primary_initialized: bool,
     ledger: ChatObservationLedger,
     completion_advances: SharedObservationStream<CompletionAdvance>,
 }
 
 #[derive(Clone)]
-struct PrimaryTrackedMessage {
-    id: ObservedChatMessageId,
-    message_type: String,
-    text_key: String,
-    handled: bool,
-}
-
-#[derive(Clone)]
 pub(crate) struct ChatObservationShared {
     state: Arc<Mutex<ChatObservationState>>,
+    dispatch_changed: Arc<Condvar>,
 }
 
 impl ChatObservationShared {
@@ -120,15 +94,15 @@ impl ChatObservationShared {
         );
         let business = router.subscribe();
         Self {
+            dispatch_changed: Arc::new(Condvar::new()),
             state: Arc::new(Mutex::new(ChatObservationState {
+                business_dispatches: 0,
+                exclusive_requested: false,
+                exclusive_active: false,
                 router,
                 business,
-                primary_decisions: Vec::new(),
                 visual_session: VisualSessionId::new(1),
                 next_bubble_sequence: 1,
-                primary_visible: Vec::new(),
-                primary_partial: Vec::new(),
-                primary_initialized: false,
                 ledger: ChatObservationLedger::new(),
                 completion_advances: SharedObservationStream::new(
                     NonZeroUsize::new(SHARED_CHAT_HISTORY_CAPACITY)
@@ -136,142 +110,6 @@ impl ChatObservationShared {
                 ),
             })),
         }
-    }
-
-    /// Subscribe before taking the caller-owned baseline or sending a reply.
-    /// Only subsequent publications are delivered; observe_primary is not a publication.
-    pub(crate) fn subscribe_primary_decisions(&self) -> Result<PrimaryDecisionSubscriber> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        let queue = Arc::new(PrimaryDecisionQueue::default());
-        state.primary_decisions.push(queue.clone());
-        Ok(PrimaryDecisionSubscriber {
-            shared: self.clone(),
-            queue,
-        })
-    }
-
-    /// Capture/UI failures have no observed frame, so listeners report them separately.
-    pub(crate) fn report_primary_failure(&self, reason: impl Into<String>) -> Result<()> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        fail_primary_decisions(&state, &reason.into());
-        Ok(())
-    }
-
-    pub(crate) fn publish_primary(
-        &self,
-        frame: ObservedFrame,
-        messages: Vec<ChatMessage>,
-    ) -> Result<Vec<ChatObservationDispatch>> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        // 消息数不在常见区间（2-5 条）时：空帧按噪声防护整帧置空等待重扫；
-        // 非零帧无条件保留，避免滚动瞬间的单条消息被吞掉导致指令漏执行
-        // （接受残影/UI 文字被误识别为消息的极低概率风险）。
-        if (PRIMARY_VISIBLE_MIN_MESSAGES..=PRIMARY_VISIBLE_MAX_MESSAGES).contains(&messages.len()) {
-        } else if !messages.is_empty() {
-            log::debug!("一级聊天本轮只识别到 {} 条消息，直接保留", messages.len());
-            let observed = track_primary_partial_messages(&mut state, messages);
-            let dispatches = Self::publish_locked(
-                &mut state,
-                ChatObservation::Primary {
-                    frame,
-                    messages: observed,
-                },
-            )?;
-            Self::complete_success(&mut state, frame.id())?;
-            return Ok(dispatches);
-        } else {
-            let dispatches = Self::publish_locked(
-                &mut state,
-                ChatObservation::Primary {
-                    frame,
-                    messages: Vec::new(),
-                },
-            )?;
-            Self::complete_success(&mut state, frame.id())?;
-            return Ok(dispatches);
-        }
-
-        let observed = track_primary_messages(&mut state, messages);
-        let dispatches = Self::publish_locked(
-            &mut state,
-            ChatObservation::Primary {
-                frame,
-                messages: observed,
-            },
-        )?;
-        Self::complete_success(&mut state, frame.id())?;
-        Ok(dispatches)
-    }
-
-    pub(crate) fn observe_primary(
-        &self,
-        messages: Vec<ChatMessage>,
-    ) -> Result<Vec<PrimaryObservedMessage>> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        let observed = if (PRIMARY_VISIBLE_MIN_MESSAGES..=PRIMARY_VISIBLE_MAX_MESSAGES)
-            .contains(&messages.len())
-        {
-            track_primary_messages(&mut state, messages)
-        } else if messages.is_empty() {
-            Vec::new()
-        } else {
-            // Baselines must establish the same partial anchor publish_primary uses.
-            track_primary_partial_messages(&mut state, messages)
-        };
-        // This records state only: baseline observations intentionally do not notify.
-        for subscriber in &state.primary_decisions {
-            subscriber.record_baseline(&observed);
-        }
-        Ok(observed)
-    }
-
-    pub(crate) fn primary_cursor(&self) -> Result<Option<PrimaryObservationCursor>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        if !state.primary_initialized {
-            return Ok(None);
-        }
-        Ok(state
-            .primary_visible
-            .last()
-            .map(|message| PrimaryObservationCursor {
-                visual_session: message.id.visual_session,
-                bubble_sequence: message.id.bubble_sequence,
-            }))
-    }
-
-    pub(crate) fn acknowledge_primary(&self, id: &ObservedChatMessageId) -> Result<bool> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        let ChatObservationState {
-            primary_visible,
-            primary_partial,
-            ..
-        } = &mut *state;
-        let mut acknowledged = false;
-        for message in primary_visible.iter_mut().chain(primary_partial.iter_mut()) {
-            if &message.id == id {
-                message.handled = true;
-                acknowledged = true;
-            }
-        }
-        Ok(acknowledged)
     }
 
     pub(crate) fn publish_secondary(
@@ -325,11 +163,6 @@ impl ChatObservationShared {
         state: &mut ChatObservationState,
         observation: ChatObservation,
     ) -> Result<Vec<ChatObservationDispatch>> {
-        if let ChatObservation::Primary { messages, .. } = &observation {
-            for subscriber in &state.primary_decisions {
-                subscriber.publish(messages);
-            }
-        }
         state.router.route(observation);
 
         let mut dispatches = Vec::new();
@@ -362,13 +195,10 @@ impl ChatObservationShared {
             .state
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
-        fail_primary_decisions(&state, "Primary visual session changed");
         let next = state.visual_session.get().wrapping_add(1);
         state.visual_session = VisualSessionId::new(next);
         state.next_bubble_sequence = 1;
-        state.primary_visible.clear();
-        state.primary_partial.clear();
-        state.primary_initialized = false;
+
         Ok(state.visual_session)
     }
 
@@ -399,7 +229,6 @@ impl ChatObservationShared {
             .lock()
             .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
         let reason = reason.into();
-        fail_primary_decisions(&state, &reason);
         let advance = state.ledger.complete_failure(frame.id(), reason)?;
         publish_completion_advance(&mut state, advance);
         Ok(())
@@ -432,13 +261,68 @@ impl ChatObservationShared {
         Ok(subscriber.inner.read_next(&state.completion_advances))
     }
 
-    pub(crate) fn begin_exclusive(&self) -> Result<ChatObservationExclusiveGuard> {
-        let session = self
+    /// Shared OCR stays live. Only normal business dispatch defers during a decision.
+    pub(crate) fn try_begin_business_dispatch(&self) -> Result<Option<ChatBusinessDispatchGuard>> {
+        let mut state = self
             .state
             .lock()
-            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?
-            .router
-            .begin_exclusive()?;
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        if state.exclusive_requested || state.exclusive_active {
+            return Ok(None);
+        }
+        state.business_dispatches += 1;
+        Ok(Some(ChatBusinessDispatchGuard {
+            shared: self.clone(),
+        }))
+    }
+
+    pub(crate) fn begin_exclusive(&self) -> Result<ChatObservationExclusiveGuard> {
+        self.begin_exclusive_until(Instant::now() + Duration::from_secs(30), || false)
+    }
+
+    pub(crate) fn begin_exclusive_until<F>(
+        &self,
+        deadline: Instant,
+        aborted: F,
+    ) -> Result<ChatObservationExclusiveGuard>
+    where
+        F: Fn() -> bool,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        if state.exclusive_requested || state.exclusive_active {
+            return Err(anyhow!("已有独占聊天观察会话"));
+        }
+        state.exclusive_requested = true;
+        self.dispatch_changed.notify_all();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if aborted() || remaining.is_zero() {
+                state.exclusive_requested = false;
+                self.dispatch_changed.notify_all();
+                return Err(anyhow!("建立独占聊天观察已取消或超时"));
+            }
+            if state.business_dispatches == 0 {
+                break;
+            }
+            state = self
+                .dispatch_changed
+                .wait_timeout(state, remaining.min(Duration::from_millis(50)))
+                .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?
+                .0;
+        }
+        let session = match state.router.begin_exclusive() {
+            Ok(session) => session,
+            Err(error) => {
+                state.exclusive_requested = false;
+                self.dispatch_changed.notify_all();
+                return Err(error.into());
+            }
+        };
+        state.exclusive_requested = false;
+        state.exclusive_active = true;
         Ok(ChatObservationExclusiveGuard {
             shared: self.clone(),
             session: Some(session),
@@ -446,372 +330,15 @@ impl ChatObservationShared {
     }
 
     fn finish_exclusive(&self, session: ExclusiveSessionId) -> Result<()> {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?
-            .router
-            .finish_exclusive(session)?;
+            .map_err(|_| anyhow!("聊天观察流状态锁已损坏"))?;
+        state.router.finish_exclusive(session)?;
+        state.exclusive_active = false;
+        self.dispatch_changed.notify_all();
         Ok(())
     }
-}
-
-fn track_primary_messages(
-    state: &mut ChatObservationState,
-    messages: Vec<ChatMessage>,
-) -> Vec<PrimaryObservedMessage> {
-    let partial = std::mem::take(&mut state.primary_partial);
-    state.primary_initialized |= !partial.is_empty();
-    let first_new_sequence = state.next_bubble_sequence;
-    let mut observed = track_primary_sequence(state, messages, true);
-    reuse_primary_message_ids(state, &mut observed, &partial, first_new_sequence);
-    observed
-}
-
-fn track_primary_partial_messages(
-    state: &mut ChatObservationState,
-    messages: Vec<ChatMessage>,
-) -> Vec<PrimaryObservedMessage> {
-    if !state.primary_initialized {
-        return establish_primary_baseline(state, messages);
-    }
-
-    // 保留整帧锚点，同时保留可确认的消息身份。
-    let anchor = std::mem::take(&mut state.primary_visible);
-    let initialized = state.primary_initialized;
-    state.primary_visible = if state.primary_partial.is_empty() {
-        anchor.clone()
-    } else {
-        std::mem::take(&mut state.primary_partial)
-    };
-    state.primary_initialized = true;
-    let first_new_sequence = state.next_bubble_sequence;
-    let mut observed = track_primary_sequence(state, messages, false);
-    reuse_primary_message_ids(state, &mut observed, &anchor, first_new_sequence);
-    state.primary_partial = std::mem::replace(&mut state.primary_visible, anchor);
-    state.primary_initialized = initialized;
-    observed
-}
-
-fn reuse_primary_message_ids(
-    state: &mut ChatObservationState,
-    observed: &mut [PrimaryObservedMessage],
-    previous: &[PrimaryTrackedMessage],
-    first_new_sequence: u64,
-) {
-    let mut used_ids = observed
-        .iter()
-        .map(|message| message.id.clone())
-        .collect::<Vec<_>>();
-    for (index, (message, tracked)) in observed
-        .iter_mut()
-        .zip(state.primary_visible.iter_mut())
-        .enumerate()
-    {
-        if message.id.bubble_sequence.get() < first_new_sequence {
-            continue;
-        }
-        // 每个旧气泡只匹配一次，追加的相同命令仍会被视为新消息。
-        let Some(previous) = previous.iter().find(|previous| {
-            previous.message_type == tracked.message_type
-                && previous.text_key == tracked.text_key
-                && !used_ids.contains(&previous.id)
-        }) else {
-            continue;
-        };
-        tracked.id = previous.id.clone();
-        tracked.handled = previous.handled;
-        message.id = previous.id.clone();
-        message.is_new = !previous.handled;
-        used_ids[index] = previous.id.clone();
-    }
-}
-
-fn track_primary_sequence(
-    state: &mut ChatObservationState,
-    messages: Vec<ChatMessage>,
-    allow_ocr_revision: bool,
-) -> Vec<PrimaryObservedMessage> {
-    if !state.primary_initialized {
-        return establish_primary_baseline(state, messages);
-    }
-
-    let Some(overlap) = primary_suffix_prefix_overlap(state, &messages, allow_ocr_revision) else {
-        log::debug!("一级聊天当前画面无法与旧画面可靠对应，立即按内容重建基线");
-        return rebase_primary_baseline(state, messages);
-    };
-
-    let previous_start = state.primary_visible.len() - overlap;
-    let mut tracked = Vec::with_capacity(messages.len());
-    let mut observed = Vec::with_capacity(messages.len());
-    for (index, message) in messages.into_iter().enumerate() {
-        let (next, is_new) = if index < overlap {
-            update_primary_tracked_message(&state.primary_visible[previous_start + index], &message)
-        } else {
-            let next = new_primary_tracked_message(state, &message, false);
-            (next, true)
-        };
-        observed.push(PrimaryObservedMessage {
-            id: next.id.clone(),
-            message,
-            is_new,
-        });
-        tracked.push(next);
-    }
-    state.primary_visible = tracked;
-    observed
-}
-
-fn establish_primary_baseline(
-    state: &mut ChatObservationState,
-    messages: Vec<ChatMessage>,
-) -> Vec<PrimaryObservedMessage> {
-    state.primary_initialized = true;
-    let mut tracked = Vec::with_capacity(messages.len());
-    let mut observed = Vec::with_capacity(messages.len());
-    for message in messages {
-        let next = new_primary_tracked_message(state, &message, true);
-        observed.push(PrimaryObservedMessage {
-            id: next.id.clone(),
-            message,
-            is_new: false,
-        });
-        tracked.push(next);
-    }
-    state.primary_visible = tracked;
-    observed
-}
-
-/// 无法与旧画面对应时的新基线建立：按内容对回旧基线。
-/// 旧基线里见过的消息保持原状态（已处理的不重复识别），
-/// 没见过的消息保留为未处理（命令不丢，宁可重复也不丢失）。
-fn rebase_primary_baseline(
-    state: &mut ChatObservationState,
-    messages: Vec<ChatMessage>,
-) -> Vec<PrimaryObservedMessage> {
-    state.primary_initialized = true;
-    let mut consumed = vec![false; state.primary_visible.len()];
-    let mut tracked = Vec::with_capacity(messages.len());
-    let mut observed = Vec::with_capacity(messages.len());
-    for message in messages {
-        let text_key = normalize_primary_text(&message.text);
-        let matched = state
-            .primary_visible
-            .iter()
-            .enumerate()
-            .find(|(index, previous)| {
-                !consumed[*index]
-                    && previous.message_type == message.message_type
-                    && previous.text_key == text_key
-            })
-            .map(|(index, previous)| {
-                consumed[index] = true;
-                previous
-            });
-        match matched {
-            Some(previous) => {
-                let next = PrimaryTrackedMessage {
-                    id: previous.id.clone(),
-                    message_type: message.message_type.clone(),
-                    text_key,
-                    handled: previous.handled,
-                };
-                observed.push(PrimaryObservedMessage {
-                    id: next.id.clone(),
-                    message,
-                    is_new: false,
-                });
-                tracked.push(next);
-            }
-            None => {
-                let next = new_primary_tracked_message(state, &message, false);
-                observed.push(PrimaryObservedMessage {
-                    id: next.id.clone(),
-                    message,
-                    is_new: true,
-                });
-                tracked.push(next);
-            }
-        }
-    }
-    state.primary_visible = tracked;
-    observed
-}
-
-fn new_primary_tracked_message(
-    state: &mut ChatObservationState,
-    message: &ChatMessage,
-    handled: bool,
-) -> PrimaryTrackedMessage {
-    let id = ObservedChatMessageId::new(
-        state.visual_session,
-        ChatIdentity::PrimaryHall,
-        BubbleSequence::new(state.next_bubble_sequence),
-    );
-    state.next_bubble_sequence = state.next_bubble_sequence.wrapping_add(1);
-    PrimaryTrackedMessage {
-        id,
-        message_type: message.message_type.clone(),
-        text_key: normalize_primary_text(&message.text),
-        handled,
-    }
-}
-
-fn update_primary_tracked_message(
-    previous: &PrimaryTrackedMessage,
-    message: &ChatMessage,
-) -> (PrimaryTrackedMessage, bool) {
-    let text_key = normalize_primary_text(&message.text);
-    let is_new = !previous.handled;
-    (
-        PrimaryTrackedMessage {
-            id: previous.id.clone(),
-            message_type: message.message_type.clone(),
-            text_key,
-            handled: previous.handled,
-        },
-        is_new,
-    )
-}
-
-fn normalize_primary_text(text: &str) -> String {
-    text.chars()
-        .flat_map(char::to_lowercase)
-        .filter(|character| character.is_ascii_alphanumeric() || is_cjk(*character))
-        .collect()
-}
-
-fn is_cjk(character: char) -> bool {
-    matches!(
-        character,
-        '\u{3400}'..='\u{4dbf}'
-            | '\u{4e00}'..='\u{9fff}'
-            | '\u{f900}'..='\u{faff}'
-            | '\u{20000}'..='\u{2fa1f}'
-    )
-}
-
-fn primary_suffix_prefix_overlap(
-    state: &ChatObservationState,
-    current: &[ChatMessage],
-    allow_ocr_revision: bool,
-) -> Option<usize> {
-    let previous = &state.primary_visible;
-    let maximum = previous.len().min(current.len());
-    (1..=maximum)
-        .filter_map(|overlap| {
-            let previous_start = previous.len() - overlap;
-            let score = primary_ocr_sequence_score(
-                previous[previous_start..]
-                    .iter()
-                    .zip(&current[..overlap])
-                    .map(|(left, right)| {
-                        (
-                            left.message_type.as_str(),
-                            left.text_key.as_str(),
-                            left.handled,
-                            right.message_type.as_str(),
-                            normalize_primary_text(&right.text),
-                        )
-                    }),
-            );
-            let reliable = if allow_ocr_revision {
-                score.is_reliable()
-            } else {
-                score.exact == overlap
-            };
-            reliable.then_some((overlap, score))
-        })
-        .max_by_key(|(overlap, score)| (score.weight(), score.exact, *overlap))
-        .map(|(overlap, _)| overlap)
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct OcrSequenceScore {
-    exact: usize,
-    close: usize,
-    different: usize,
-    unhandled_different: usize,
-}
-
-impl OcrSequenceScore {
-    fn is_reliable(self) -> bool {
-        (self.different == 0 && (self.exact > 0 || self.close == 1))
-            || (self.different == 1 && self.unhandled_different == 1 && self.exact > 0)
-    }
-
-    fn weight(self) -> usize {
-        self.exact * 2 + self.close
-    }
-}
-
-fn primary_ocr_sequence_score<'a>(
-    pairs: impl Iterator<Item = (&'a str, &'a str, bool, &'a str, String)>,
-) -> OcrSequenceScore {
-    let mut score = OcrSequenceScore::default();
-    for (left_type, left_text, left_handled, right_type, right_text) in pairs {
-        if left_type != right_type {
-            score.different += 1;
-            continue;
-        }
-        match primary_ocr_text_match(left_text, &right_text) {
-            OcrTextMatch::Exact => score.exact += 1,
-            OcrTextMatch::Close => score.close += 1,
-            OcrTextMatch::Different => {
-                score.different += 1;
-                if !left_handled {
-                    score.unhandled_different += 1;
-                }
-            }
-        }
-    }
-    score
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OcrTextMatch {
-    Exact,
-    Close,
-    Different,
-}
-
-fn primary_ocr_text_match(previous: &str, current: &str) -> OcrTextMatch {
-    if previous == current && !previous.is_empty() {
-        return OcrTextMatch::Exact;
-    }
-    if previous.is_empty() || current.is_empty() {
-        return OcrTextMatch::Different;
-    }
-    let previous = previous.chars().collect::<Vec<_>>();
-    let current = current.chars().collect::<Vec<_>>();
-    let maximum_len = previous.len().max(current.len());
-    let tolerance = if maximum_len <= 8 {
-        1
-    } else {
-        (maximum_len / 6).max(1)
-    };
-    let distance = levenshtein_distance(&previous, &current);
-    if distance <= tolerance && distance < maximum_len {
-        OcrTextMatch::Close
-    } else {
-        OcrTextMatch::Different
-    }
-}
-
-fn levenshtein_distance(left: &[char], right: &[char]) -> usize {
-    let mut previous = (0..=right.len()).collect::<Vec<_>>();
-    let mut current = vec![0usize; right.len() + 1];
-    for (left_index, left_character) in left.iter().enumerate() {
-        current[0] = left_index + 1;
-        for (right_index, right_character) in right.iter().enumerate() {
-            let substitution =
-                previous[right_index] + usize::from(left_character != right_character);
-            current[right_index + 1] = (previous[right_index + 1] + 1)
-                .min(current[right_index] + 1)
-                .min(substitution);
-        }
-        std::mem::swap(&mut previous, &mut current);
-    }
-    previous[right.len()]
 }
 
 fn publish_completion_advance(state: &mut ChatObservationState, advance: CompletionAdvance) {
@@ -834,147 +361,23 @@ fn publish_completion_advance(state: &mut ChatObservationState, advance: Complet
     }
 }
 
-#[derive(Default)]
-struct PrimaryDecisionQueue {
-    state: Mutex<PrimaryDecisionQueueState>,
-    changed: Condvar,
-}
-
-#[derive(Default)]
-struct PrimaryDecisionQueueState {
-    pending: Vec<PrimaryObservedMessage>,
-    // Retain the last text per ID even after draining, so unchanged frames cost no queue space.
-    seen: HashMap<ObservedChatMessageId, (String, String)>,
-    failure: Option<String>,
-}
-
-impl PrimaryDecisionQueue {
-    fn record_baseline(&self, messages: &[PrimaryObservedMessage]) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        if state.failure.is_some() {
-            return;
-        }
-        for message in messages {
-            if !state.seen.contains_key(&message.id)
-                && state.seen.len() >= PRIMARY_DECISION_CAPACITY
-            {
-                state.failure = Some("Primary decision subscription overflow".to_string());
-                self.changed.notify_all();
-                return;
-            }
-            state.seen.insert(
-                message.id.clone(),
-                (
-                    message.message.message_type.clone(),
-                    message.message.text.clone(),
-                ),
-            );
-        }
-    }
-
-    fn publish(&self, messages: &[PrimaryObservedMessage]) {
-        let Ok(mut state) = self.state.lock() else {
-            self.changed.notify_all();
-            return;
-        };
-        if state.failure.is_some() {
-            return;
-        }
-        for message in messages {
-            let revision = (
-                message.message.message_type.clone(),
-                message.message.text.clone(),
-            );
-            if state.seen.get(&message.id) == Some(&revision) {
-                continue;
-            }
-            if state.pending.len() >= PRIMARY_DECISION_CAPACITY
-                || (!state.seen.contains_key(&message.id)
-                    && state.seen.len() >= PRIMARY_DECISION_CAPACITY)
-            {
-                state.failure = Some("Primary decision subscription overflow".to_string());
-                break;
-            }
-            state.seen.insert(message.id.clone(), revision);
-            state.pending.push(message.clone());
-        }
-        self.changed.notify_all();
-    }
-
-    fn fail(&self, reason: &str) {
-        if let Ok(mut state) = self.state.lock() {
-            state.failure.get_or_insert_with(|| reason.to_string());
-        }
-        self.changed.notify_all();
-    }
-}
-
-fn fail_primary_decisions(state: &ChatObservationState, reason: &str) {
-    for subscriber in &state.primary_decisions {
-        subscriber.fail(reason);
-    }
-}
-
-/// A scoped independent decision reader. Drop unregisters it and releases retained history.
-pub(crate) struct PrimaryDecisionSubscriber {
-    shared: ChatObservationShared,
-    queue: Arc<PrimaryDecisionQueue>,
-}
-
-impl PrimaryDecisionSubscriber {
-    /// Drain every retained new ID or OCR revision in publication order.
-    /// Failure is sticky and takes precedence over any pending messages.
-    pub(crate) fn read(&self) -> Result<Vec<PrimaryObservedMessage>> {
-        let mut state = self
-            .queue
-            .state
-            .lock()
-            .map_err(|_| anyhow!("Primary decision queue lock poisoned"))?;
-        if let Some(reason) = &state.failure {
-            return Err(anyhow!("Primary decision observation failed: {reason}"));
-        }
-        Ok(std::mem::take(&mut state.pending))
-    }
-
-    /// Wait without consuming messages. Callers should use <=50ms slices to service web actions.
-    pub(crate) fn wait(&self, timeout: Duration) -> Result<()> {
-        let state = self
-            .queue
-            .state
-            .lock()
-            .map_err(|_| anyhow!("Primary decision queue lock poisoned"))?;
-        let (state, _) = self
-            .queue
-            .changed
-            .wait_timeout_while(state, timeout, |state| {
-                state.pending.is_empty() && state.failure.is_none()
-            })
-            .map_err(|_| anyhow!("Primary decision queue lock poisoned"))?;
-        if let Some(reason) = &state.failure {
-            return Err(anyhow!("Primary decision observation failed: {reason}"));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for PrimaryDecisionSubscriber {
-    fn drop(&mut self) {
-        // Even a poisoned shared lock must not leave the subscriber registered.
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        state
-            .primary_decisions
-            .retain(|queue| !Arc::ptr_eq(queue, &self.queue));
-    }
-}
-
 pub(crate) struct CompletionAdvanceSubscriber {
     inner: ObservationSubscriber,
+}
+
+pub(crate) struct ChatBusinessDispatchGuard {
+    shared: ChatObservationShared,
+}
+impl Drop for ChatBusinessDispatchGuard {
+    fn drop(&mut self) {
+        match self.shared.state.lock() {
+            Ok(mut state) => {
+                state.business_dispatches = state.business_dispatches.saturating_sub(1);
+                self.shared.dispatch_changed.notify_all();
+            }
+            Err(_) => log::error!("释放普通聊天派发租约失败"),
+        }
+    }
 }
 
 pub(crate) struct ChatObservationExclusiveGuard {
@@ -994,484 +397,157 @@ impl Drop for ChatObservationExclusiveGuard {
 }
 
 #[cfg(test)]
+mod dispatch_lease_tests {
+    use super::*;
+    use crate::observation::chat::{SharedChatInput, SharedChatOcr};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    #[test]
+    fn decision_waits_for_prior_dispatch_and_reservation_blocks_new_dispatch() {
+        let shared = ChatObservationShared::new();
+        let dispatch = shared.try_begin_business_dispatch().unwrap().unwrap();
+        let worker = shared.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (end_tx, end_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let exclusive = worker
+                .begin_exclusive_until(Instant::now() + Duration::from_secs(2), || false)
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            end_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(exclusive);
+        });
+        {
+            let mut state = shared.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !state.exclusive_requested {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "exclusive reservation did not arrive");
+                state = shared
+                    .dispatch_changed
+                    .wait_timeout(state, remaining)
+                    .unwrap()
+                    .0;
+            }
+        }
+        assert!(shared.try_begin_business_dispatch().unwrap().is_none());
+        assert!(matches!(
+            ready_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(dispatch);
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(shared.try_begin_business_dispatch().unwrap().is_none());
+        end_tx.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(shared.try_begin_business_dispatch().unwrap().is_some());
+    }
+
+    #[test]
+    fn live_shared_input_consumed_in_exclusive_does_not_enter_normal_queue_after_release() {
+        let stream = ChatObservationShared::new();
+        let ocr = SharedChatOcr::new();
+        let business = ocr.subscribe_business().unwrap();
+        let decisions = ocr.subscribe().unwrap();
+        let exclusive = stream.begin_exclusive().unwrap();
+        let source = ocr
+            .publish(
+                Instant::now(),
+                ChatIdentity::SecondaryHall,
+                vec![SharedChatInput {
+                    text: "@1".into(),
+                    sender: Some("甲".into()),
+                    raw_sender: Some("甲".into()),
+                    message_type: "blue".into(),
+                    block: crate::ui::geometry::Rect::new(100, 200, 120, 40),
+                }],
+            )
+            .unwrap();
+        let backlog = business.read().unwrap();
+        assert_eq!(
+            decisions.read().unwrap().len(),
+            1,
+            "OCR and decision subscriber stay live"
+        );
+        assert!(stream.try_begin_business_dispatch().unwrap().is_none());
+        let selected = &source.messages[0];
+        ocr.acknowledge_business(&selected.id).unwrap();
+        drop(exclusive);
+        let _dispatch = stream.try_begin_business_dispatch().unwrap().unwrap();
+        let queued: Vec<_> = backlog
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot
+                    .messages
+                    .iter()
+                    .map(move |message| (snapshot, message))
+            })
+            .filter(|(snapshot, message)| {
+                ocr.is_business_pending_at(&message.id, snapshot.captured_at)
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            queued.is_empty(),
+            "accepted decision cannot be queued after the reader releases"
+        );
+        let fresh = ocr
+            .publish(
+                Instant::now(),
+                ChatIdentity::SecondaryHall,
+                vec![SharedChatInput {
+                    text: "@点歌晴天".into(),
+                    sender: Some("甲".into()),
+                    raw_sender: Some("甲".into()),
+                    message_type: "blue".into(),
+                    block: crate::ui::geometry::Rect::new(100, 240, 120, 40),
+                }],
+            )
+            .unwrap();
+        assert!(
+            ocr.is_business_pending(&fresh.messages[0].id).unwrap(),
+            "normal later input is allowed"
+        );
+    }
+
+    #[test]
+    fn timeout_and_cancellation_release_reservation_without_interrupting_business() {
+        let shared = ChatObservationShared::new();
+        let prior = shared.try_begin_business_dispatch().unwrap().unwrap();
+        assert!(
+            shared
+                .begin_exclusive_until(Instant::now() + Duration::from_millis(10), || false)
+                .is_err()
+        );
+        assert!(shared.try_begin_business_dispatch().unwrap().is_some());
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            shared
+                .begin_exclusive_until(Instant::now() + Duration::from_secs(1), || cancelled
+                    .load(Ordering::SeqCst))
+                .is_err()
+        );
+        assert!(shared.try_begin_business_dispatch().unwrap().is_some());
+        drop(prior);
+        let exclusive = shared.begin_exclusive().unwrap();
+        assert!(
+            shared.begin_exclusive().is_err(),
+            "nested failure cannot release active ownership"
+        );
+        assert!(shared.try_begin_business_dispatch().unwrap().is_none());
+        drop(exclusive);
+        assert!(shared.try_begin_business_dispatch().unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::ui::geometry::Rect;
-
-    #[test]
-    fn primary_ocr_revision_keeps_the_ocr_message_identity() {
-        let shared = ChatObservationShared::new();
-
-        let first_frame = shared.begin_frame(Instant::now()).unwrap();
-        let first = shared
-            .publish_primary(
-                first_frame,
-                vec![
-                    message_at("较早消息", 0, 10),
-                    message_at("用户：@确汄", 20, 20),
-                ],
-            )
-            .unwrap();
-        let first_id = primary_messages(&first)[1].id.clone();
-        let revised_frame = shared.begin_frame(Instant::now()).unwrap();
-        let revised = shared
-            .publish_primary(
-                revised_frame,
-                vec![
-                    message_at("较早消息", 0, 80),
-                    message_at("用户：@确认", 20, 90),
-                ],
-            )
-            .unwrap();
-
-        assert_eq!(primary_messages(&revised)[1].id, first_id);
-    }
-
-    #[test]
-    fn primary_position_and_wrapping_changes_do_not_change_ocr_message_identity() {
-        let shared = ChatObservationShared::new();
-        let baseline = publish_primary(
-            &shared,
-            vec![message_at("消息1", 0, 10), message_at("消息2", 20, 20)],
-        );
-        let baseline_ids = primary_messages(&baseline)
-            .iter()
-            .map(|message| message.id.clone())
-            .collect::<Vec<_>>();
-
-        let mut moved_and_wrapped =
-            vec![message_at("消息1", 35, 180), message_at("消息2", 90, 220)];
-        moved_and_wrapped[0].block.height = 45;
-        moved_and_wrapped[1].block.height = 35;
-        let moved_and_wrapped = publish_primary(&shared, moved_and_wrapped);
-
-        assert_eq!(
-            primary_messages(&moved_and_wrapped)
-                .iter()
-                .map(|message| message.id.clone())
-                .collect::<Vec<_>>(),
-            baseline_ids
-        );
-    }
-
-    #[test]
-    fn primary_baseline_is_not_reported_as_new() {
-        let shared = ChatObservationShared::new();
-
-        let baseline = publish_primary(
-            &shared,
-            vec![message_at("消息1", 0, 10), message_at("@状态", 20, 20)],
-        );
-
-        assert!(
-            primary_messages(&baseline)
-                .iter()
-                .all(|message| !message.is_new)
-        );
-    }
-
-    #[test]
-    fn primary_visual_session_baselines_the_first_nonempty_frame_of_any_size() {
-        for count in [1, 2, 6] {
-            let shared = ChatObservationShared::new();
-            publish_primary(
-                &shared,
-                vec![
-                    message_at("old message", 0, 0),
-                    message_at("old command", 20, 0),
-                ],
-            );
-            publish_primary(&shared, vec![message_at("old partial command", 0, 0)]);
-
-            let session = shared.begin_visual_session().unwrap();
-            let empty = publish_primary(&shared, Vec::new());
-            assert!(primary_messages(&empty).is_empty());
-            assert!(shared.primary_cursor().unwrap().is_none());
-
-            let mut visible = (0..count)
-                .map(|index| message_at(&format!("command {index}"), index * 20, 0))
-                .collect::<Vec<_>>();
-            let baseline = publish_primary(&shared, visible.clone());
-            let baseline_messages = primary_messages(&baseline);
-            assert_eq!(baseline_messages.len(), count as usize);
-            assert!(baseline_messages.iter().all(|message| !message.is_new));
-            assert!(
-                baseline_messages
-                    .iter()
-                    .all(|message| message.id.visual_session == session)
-            );
-
-            let repeated_text = visible.last().unwrap().text.clone();
-            visible.push(message_at(&repeated_text, count * 20, 0));
-            let appended = publish_primary(&shared, visible.clone());
-            let appended_messages = primary_messages(&appended);
-            assert_eq!(appended_messages.len(), count as usize + 1);
-            for (previous, current) in baseline_messages.iter().zip(appended_messages.iter()) {
-                assert_eq!(current.id, previous.id);
-                assert!(!current.is_new);
-            }
-            let repeated_command = appended_messages.last().unwrap();
-            assert!(repeated_command.is_new);
-            assert_ne!(repeated_command.id, baseline_messages.last().unwrap().id);
-            assert!(shared.acknowledge_primary(&repeated_command.id).unwrap());
-
-            let unchanged = publish_primary(&shared, visible.clone());
-            assert!(
-                primary_messages(&unchanged)
-                    .iter()
-                    .all(|message| !message.is_new)
-            );
-
-            visible.push(message_at("new command", (count + 1) * 20, 0));
-            let updated = publish_primary(&shared, visible);
-            let updated_messages = primary_messages(&updated);
-            assert_eq!(
-                updated_messages
-                    .iter()
-                    .filter(|message| message.is_new)
-                    .count(),
-                1
-            );
-            assert!(updated_messages.last().unwrap().is_new);
-        }
-    }
-
-    #[test]
-    fn primary_scroll_retains_the_overlap_and_reports_appended_messages_immediately() {
-        let shared = ChatObservationShared::new();
-        let baseline = publish_primary(
-            &shared,
-            vec![
-                message_at("消息1", 0, 10),
-                message_at("消息2", 20, 20),
-                message_at("消息3", 40, 30),
-                message_at("@状态", 60, 40),
-            ],
-        );
-        let baseline_messages = primary_messages(&baseline);
-        let old_message_3 = baseline_messages[2].id.clone();
-        let old_status = baseline_messages[3].id.clone();
-        let updated = vec![
-            message_at("消息3", 0, 30),
-            message_at("@状态", 20, 40),
-            message_at("状态消息", 40, 50),
-            message_at("@状态", 60, 60),
-        ];
-
-        let first_sample = publish_primary(&shared, updated);
-        let messages = primary_messages(&first_sample);
-
-        assert_eq!(messages[0].id, old_message_3);
-        assert_eq!(messages[1].id, old_status);
-        assert_eq!(
-            messages
-                .iter()
-                .map(|message| message.is_new)
-                .collect::<Vec<_>>(),
-            vec![false, false, true, true]
-        );
-    }
-
-    #[test]
-    fn primary_single_message_is_dispatched_as_new_without_replacing_baseline() {
-        let shared = ChatObservationShared::new();
-        publish_primary(
-            &shared,
-            vec![message_at("旧消息", 0, 10), message_at("旧命令", 20, 20)],
-        );
-
-        let single = publish_primary(&shared, vec![message_at("新命令", 0, 30)]);
-        assert_eq!(primary_messages(&single).len(), 1);
-        assert!(primary_messages(&single)[0].is_new);
-
-        let restored = publish_primary(
-            &shared,
-            vec![message_at("旧消息", 0, 40), message_at("旧命令", 20, 50)],
-        );
-        assert!(
-            primary_messages(&restored)
-                .iter()
-                .all(|message| !message.is_new)
-        );
-    }
-
-    #[test]
-    fn primary_partial_frame_retains_an_already_handled_message() {
-        let shared = ChatObservationShared::new();
-        let baseline = publish_primary(
-            &shared,
-            vec![message_at("旧消息", 0, 10), message_at("@状态", 20, 20)],
-        );
-        let command_id = primary_messages(&baseline)[1].id.clone();
-
-        let partial = publish_primary(&shared, vec![message_at("@状态", 0, 20)]);
-
-        assert_eq!(primary_messages(&partial)[0].id, command_id);
-        assert!(!primary_messages(&partial)[0].is_new);
-    }
-
-    #[test]
-    fn primary_partial_frame_does_not_merge_similar_commands() {
-        let shared = ChatObservationShared::new();
-        let baseline = publish_primary(
-            &shared,
-            vec![message_at("旧消息", 0, 10), message_at("@帮助", 20, 20)],
-        );
-        let mut previous_id = primary_messages(&baseline)[1].id.clone();
-
-        for text in ["@下一首", "@上一首"] {
-            let partial = publish_primary(&shared, vec![message_at(text, 0, 30)]);
-            let command = &primary_messages(&partial)[0];
-            assert_ne!(command.id, previous_id);
-            assert!(command.is_new);
-            assert!(shared.acknowledge_primary(&command.id).unwrap());
-            previous_id = command.id.clone();
-        }
-    }
-
-    #[test]
-    fn primary_partial_frame_message_keeps_identity_when_full_frame_returns() {
-        let shared = ChatObservationShared::new();
-        publish_primary(
-            &shared,
-            vec![message_at("旧消息", 0, 10), message_at("旧命令", 20, 20)],
-        );
-        let partial = publish_primary(&shared, vec![message_at("@状态", 0, 30)]);
-        let command_id = primary_messages(&partial)[0].id.clone();
-        assert!(primary_messages(&partial)[0].is_new);
-        assert!(shared.acknowledge_primary(&command_id).unwrap());
-
-        let empty = publish_primary(&shared, Vec::new());
-        assert!(primary_messages(&empty).is_empty());
-        let repeated = publish_primary(&shared, vec![message_at("@状态", 10, 30)]);
-        assert_eq!(primary_messages(&repeated)[0].id, command_id);
-        assert!(!primary_messages(&repeated)[0].is_new);
-
-        let restored = publish_primary(
-            &shared,
-            vec![message_at("旧命令", 0, 20), message_at("@状态", 20, 30)],
-        );
-        assert_eq!(primary_messages(&restored)[1].id, command_id);
-        assert!(!primary_messages(&restored)[1].is_new);
-
-        let appended = publish_primary(
-            &shared,
-            vec![message_at("@状态", 0, 30), message_at("@状态", 20, 30)],
-        );
-        assert_eq!(primary_messages(&appended)[0].id, command_id);
-        assert!(!primary_messages(&appended)[0].is_new);
-        assert_ne!(primary_messages(&appended)[1].id, command_id);
-        assert!(primary_messages(&appended)[1].is_new);
-    }
-
-    #[test]
-    fn primary_partial_frame_with_extra_markers_keeps_new_bubble_multiplicity() {
-        let shared = ChatObservationShared::new();
-        publish_primary(
-            &shared,
-            vec![message_at("旧消息", 0, 10), message_at("旧命令", 20, 20)],
-        );
-        let expanded = vec![
-            message_at("旧消息", 0, 10),
-            message_at("旧命令", 20, 20),
-            message_at("聊天甲", 40, 30),
-            message_at("聊天乙", 60, 40),
-            message_at("聊天丙", 80, 50),
-            message_at("@状态", 100, 60),
-        ];
-        let first = publish_primary(&shared, expanded.clone());
-        let command_id = primary_messages(&first)[5].id.clone();
-        assert!(shared.acknowledge_primary(&command_id).unwrap());
-
-        let repeated = publish_primary(&shared, expanded.clone());
-        assert_eq!(primary_messages(&repeated)[5].id, command_id);
-        assert!(!primary_messages(&repeated)[5].is_new);
-
-        let mut appended = expanded;
-        appended.remove(0);
-        appended.push(message_at("@状态", 120, 60));
-        let appended = publish_primary(&shared, appended);
-        assert_eq!(primary_messages(&appended)[4].id, command_id);
-        assert!(!primary_messages(&appended)[4].is_new);
-        assert_ne!(primary_messages(&appended)[5].id, command_id);
-        assert!(primary_messages(&appended)[5].is_new);
-    }
-
-    #[test]
-    fn primary_ocr_correction_keeps_an_unhandled_message_new_for_retry() {
-        let shared = ChatObservationShared::new();
-        publish_primary(
-            &shared,
-            vec![message_at("消息1", 0, 10), message_at("消息2", 20, 20)],
-        );
-
-        let incorrect = publish_primary(
-            &shared,
-            vec![message_at("消息2", 0, 70), message_at("丨", 20, 80)],
-        );
-        let command_id = primary_messages(&incorrect)[1].id.clone();
-        assert!(primary_messages(&incorrect)[1].is_new);
-
-        let corrected = publish_primary(
-            &shared,
-            vec![message_at("消息2", 0, 90), message_at("@确认", 20, 100)],
-        );
-        assert_eq!(primary_messages(&corrected)[1].id, command_id);
-        assert!(primary_messages(&corrected)[1].is_new);
-
-        shared.acknowledge_primary(&command_id).unwrap();
-        let handled = publish_primary(
-            &shared,
-            vec![message_at("消息2", 0, 110), message_at("@确认", 20, 120)],
-        );
-        assert_eq!(primary_messages(&handled)[1].id, command_id);
-        assert!(!primary_messages(&handled)[1].is_new);
-    }
-
-    #[test]
-    fn primary_identical_text_in_a_distinct_appended_bubble_is_new() {
-        let shared = ChatObservationShared::new();
-        let baseline = publish_primary(
-            &shared,
-            vec![message_at("消息", 0, 10), message_at("@状态", 20, 20)],
-        );
-        let old_status_id = primary_messages(&baseline)[1].id.clone();
-        let updated = vec![message_at("@状态", 0, 20), message_at("@状态", 20, 20)];
-
-        let current = publish_primary(&shared, updated);
-        let messages = primary_messages(&current);
-
-        assert_eq!(messages[0].id, old_status_id);
-        assert_ne!(messages[1].id, old_status_id);
-        assert_eq!(
-            messages
-                .iter()
-                .map(|message| message.is_new)
-                .collect::<Vec<_>>(),
-            vec![false, true]
-        );
-    }
-
-    #[test]
-    fn primary_overlap_prefers_exact_ocr_text_over_a_longer_fuzzy_alignment() {
-        let shared = ChatObservationShared::new();
-        let baseline = publish_primary(
-            &shared,
-            vec![message_at("消息1", 0, 10), message_at("消息2", 20, 20)],
-        );
-        let old_second_id = primary_messages(&baseline)[1].id.clone();
-
-        let current = publish_primary(
-            &shared,
-            vec![message_at("消息2", 0, 80), message_at("消息3", 20, 90)],
-        );
-        let messages = primary_messages(&current);
-
-        assert_eq!(messages[0].id, old_second_id);
-        assert!(messages[1].is_new);
-    }
-
-    #[test]
-    fn primary_rebase_keeps_unhandled_commands_and_preserves_handled_messages() {
-        let shared = ChatObservationShared::new();
-        publish_primary(
-            &shared,
-            vec![
-                message_at("消息1", 0, 10),
-                message_at("消息2", 20, 20),
-                message_at("消息3", 40, 30),
-            ],
-        );
-
-        // 画面头部多出无法对应的新消息（overlap 失败），画面仍含旧消息「消息3」。
-        let rolling = vec![message_at("不同", 0, 5), message_at("消息3", 40, 30)];
-        let current = publish_primary(&shared, rolling);
-
-        let messages = primary_messages(&current);
-        assert_eq!(messages.len(), 2);
-        // 未见过的新消息保留为未处理（命令不丢）；旧消息保持已处理（不重复识别）。
-        assert_eq!(
-            messages
-                .iter()
-                .map(|message| message.is_new)
-                .collect::<Vec<_>>(),
-            vec![true, false]
-        );
-    }
-
-    #[test]
-    fn primary_rebase_recognizes_the_first_lost_frame_immediately() {
-        let shared = ChatObservationShared::new();
-        publish_primary(
-            &shared,
-            vec![message_at("消息1", 0, 10), message_at("消息2", 20, 20)],
-        );
-
-        let current = publish_primary(
-            &shared,
-            vec![
-                message_at("旧画面已滚出", 0, 30),
-                message_at("用户：@状态", 20, 40),
-            ],
-        );
-        let messages = primary_messages(&current);
-
-        assert_eq!(messages.len(), 2);
-        assert!(messages.iter().all(|message| message.is_new));
-        assert_eq!(messages[1].message.text, "用户：@状态");
-    }
-
-    #[test]
-    fn primary_single_message_frame_is_kept_and_does_not_disturb_the_previous_sequence() {
-        let shared = ChatObservationShared::new();
-        let baseline = publish_primary(
-            &shared,
-            vec![message_at("消息1", 0, 10), message_at("消息2", 20, 20)],
-        );
-        let old_second_id = primary_messages(&baseline)[1].id.clone();
-
-        let incomplete = publish_primary(&shared, vec![message_at("误识别", 0, 99)]);
-        let kept = primary_messages(&incomplete);
-        assert_eq!(kept.len(), 1, "单条非零帧按新契约无条件保留");
-
-        let updated = vec![message_at("消息2", 0, 20), message_at("@确认", 20, 30)];
-        let current = publish_primary(&shared, updated);
-        let messages = primary_messages(&current);
-
-        assert_eq!(messages[0].id, old_second_id);
-        assert!(messages[1].is_new);
-    }
-
-    #[test]
-    fn primary_cursor_recovers_a_message_already_visible_on_the_first_decision_scan() {
-        let shared = ChatObservationShared::new();
-        publish_primary(
-            &shared,
-            vec![message_at("消息1", 0, 10), message_at("消息2", 20, 20)],
-        );
-        let cursor = shared
-            .primary_cursor()
-            .unwrap()
-            .expect("primary baseline cursor");
-        let updated = vec![message_at("消息2", 0, 20), message_at("@确认", 20, 30)];
-
-        let first = shared.observe_primary(updated.clone()).unwrap();
-        let decisions = first
-            .iter()
-            .filter(|message| cursor.is_before(&message.id))
-            .map(|message| message.message.text.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(decisions, ["@确认"]);
-    }
-
-    #[test]
-    fn primary_matching_discards_punctuation_but_keeps_ai_letters() {
-        assert_eq!(normalize_primary_text("【玩家-01】：＠AI！"), "玩家01ai");
-        assert_eq!(primary_ocr_text_match("甲", "乙"), OcrTextMatch::Different);
-    }
 
     #[test]
     fn completion_subscriber_receives_success_with_the_original_capture_time() {
@@ -1578,177 +654,6 @@ mod tests {
         let advance = next_completion_advance(&shared, &mut subscriber);
         assert_eq!(advance.events().len(), 1);
         assert_eq!(advance.events()[0].frame(), frame);
-    }
-
-    fn message_at(text: &str, y: i32, _ignored_image_revision: u8) -> ChatMessage {
-        ChatMessage {
-            message_type: "blue".to_string(),
-            block: Rect::new(0, y, 10, 10),
-            text: text.to_string(),
-        }
-    }
-
-    fn publish_primary(
-        shared: &ChatObservationShared,
-        messages: Vec<ChatMessage>,
-    ) -> Vec<ChatObservationDispatch> {
-        let frame = shared.begin_frame(Instant::now()).unwrap();
-        shared.publish_primary(frame, messages).unwrap()
-    }
-
-    fn primary_messages(dispatches: &[ChatObservationDispatch]) -> &[PrimaryObservedMessage] {
-        let ChatObservationDispatch::Primary { messages, .. } = &dispatches[0] else {
-            panic!("primary observation was not dispatched");
-        };
-        messages
-    }
-
-    #[test]
-    fn primary_decision_subscriber_retains_more_than_business_history() {
-        let shared = ChatObservationShared::new();
-        let subscriber = shared.subscribe_primary_decisions().unwrap();
-        for number in 0..70 {
-            publish_primary(&shared, vec![message_at(&format!("m{number}"), 0, 0)]);
-        }
-        let messages = subscriber.read().unwrap();
-        assert_eq!(messages.len(), 70);
-        assert_eq!(messages.first().unwrap().message.text, "m0");
-        assert_eq!(messages.last().unwrap().message.text, "m69");
-    }
-
-    #[test]
-    fn primary_decision_subscribers_are_independent_and_only_receive_revisions() {
-        let shared = ChatObservationShared::new();
-        let first = shared.subscribe_primary_decisions().unwrap();
-        let second = shared.subscribe_primary_decisions().unwrap();
-        publish_primary(&shared, vec![message_at("same", 0, 0)]);
-        assert_eq!(first.read().unwrap().len(), 1);
-        assert_eq!(second.read().unwrap().len(), 1);
-        publish_primary(&shared, vec![message_at("same", 0, 0)]);
-        assert!(first.read().unwrap().is_empty());
-        publish_primary(&shared, vec![message_at("revised", 0, 0)]);
-        assert_eq!(first.read().unwrap().len(), 1);
-        assert_eq!(second.read().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn primary_decision_wait_wakes_on_publication() {
-        let shared = ChatObservationShared::new();
-        let subscriber = Arc::new(shared.subscribe_primary_decisions().unwrap());
-        let waiting = subscriber.clone();
-        let waiter = std::thread::spawn(move || waiting.wait(Duration::from_secs(1)));
-        std::thread::sleep(Duration::from_millis(10));
-        publish_primary(&shared, vec![message_at("wake", 0, 0)]);
-        waiter.join().unwrap().unwrap();
-        assert_eq!(subscriber.read().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn primary_decision_failure_and_session_change_are_reported() {
-        let shared = ChatObservationShared::new();
-        let failed = shared.subscribe_primary_decisions().unwrap();
-        shared.report_primary_failure("OCR unavailable").unwrap();
-        assert!(
-            failed
-                .read()
-                .unwrap_err()
-                .to_string()
-                .contains("OCR unavailable")
-        );
-        let changed = shared.subscribe_primary_decisions().unwrap();
-        shared.begin_visual_session().unwrap();
-        assert!(
-            changed
-                .wait(Duration::ZERO)
-                .unwrap_err()
-                .to_string()
-                .contains("session changed")
-        );
-    }
-
-    #[test]
-    fn primary_decision_subscriber_drop_unregisters_queue() {
-        let shared = ChatObservationShared::new();
-        let subscriber = shared.subscribe_primary_decisions().unwrap();
-        assert_eq!(shared.state.lock().unwrap().primary_decisions.len(), 1);
-        drop(subscriber);
-        assert!(shared.state.lock().unwrap().primary_decisions.is_empty());
-    }
-
-    #[test]
-    fn observe_primary_tracks_single_message_baseline_without_publishing_it() {
-        let shared = ChatObservationShared::new();
-        let subscriber = shared.subscribe_primary_decisions().unwrap();
-        let baseline = shared
-            .observe_primary(vec![message_at("baseline", 0, 0)])
-            .unwrap();
-        assert_eq!(baseline.len(), 1);
-        assert!(subscriber.read().unwrap().is_empty());
-        publish_primary(
-            &shared,
-            vec![message_at("baseline", 0, 0), message_at("reply", 20, 0)],
-        );
-        let observed = subscriber.read().unwrap();
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].message.text, "reply");
-        assert!(observed[0].is_new);
-    }
-
-    #[test]
-    fn primary_decision_baseline_overflow_is_sticky_without_stopping_business_delivery() {
-        let shared = ChatObservationShared::new();
-        let subscriber = shared.subscribe_primary_decisions().unwrap();
-        let baseline = (0..=PRIMARY_DECISION_CAPACITY)
-            .map(|sequence| PrimaryObservedMessage {
-                id: ObservedChatMessageId::new(
-                    VisualSessionId::new(1),
-                    ChatIdentity::PrimaryHall,
-                    BubbleSequence::new(sequence as u64 + 1),
-                ),
-                message: message_at("baseline", 0, 0),
-                is_new: false,
-            })
-            .collect::<Vec<_>>();
-        subscriber.queue.record_baseline(&baseline);
-        assert!(
-            subscriber
-                .read()
-                .unwrap_err()
-                .to_string()
-                .contains("overflow")
-        );
-        assert!(
-            subscriber
-                .wait(Duration::ZERO)
-                .unwrap_err()
-                .to_string()
-                .contains("overflow")
-        );
-
-        let dispatches = publish_primary(&shared, vec![message_at("business", 0, 0)]);
-        assert_eq!(primary_messages(&dispatches)[0].message.text, "business");
-    }
-
-    #[test]
-    fn primary_decision_terminal_failure_wakes_waiter() {
-        let shared = ChatObservationShared::new();
-        let subscriber = Arc::new(shared.subscribe_primary_decisions().unwrap());
-        let waiting = subscriber.clone();
-        let waiter = std::thread::spawn(move || waiting.wait(Duration::from_secs(1)));
-        std::thread::sleep(Duration::from_millis(10));
-        let frame = shared.begin_frame(Instant::now()).unwrap();
-        shared
-            .record_terminal_failure(frame, "OCR terminal failure")
-            .unwrap();
-        let error = waiter.join().unwrap().unwrap_err();
-        assert!(error.to_string().contains("OCR terminal failure"));
-        assert!(
-            subscriber
-                .read()
-                .unwrap_err()
-                .to_string()
-                .contains("OCR terminal failure")
-        );
     }
 
     fn next_completion_advance(

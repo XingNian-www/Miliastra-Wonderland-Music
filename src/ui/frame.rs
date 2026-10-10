@@ -1,13 +1,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
 use image::DynamicImage;
 use image::GenericImageView;
 use image::imageops::FilterType;
 
 use crate::runtime::ui::{CapturedFrame, UiStateObservation};
-use crate::ui::atoms::GameUi;
 use crate::ui::template::TemplateHit;
 
 #[derive(Clone, Debug)]
@@ -65,19 +63,6 @@ impl LatestFrameCache {
     pub(crate) fn image(&self) -> Option<Arc<DynamicImage>> {
         self.valid.then(|| self.image.clone()).flatten()
     }
-}
-
-pub(crate) fn load_frame(canvas: &Canvas, game_ui: &GameUi) -> Result<Frame> {
-    let started = Instant::now();
-    let image = Arc::new(game_ui.capture()?);
-    let captured_at = Instant::now();
-    let image = normalize_frame(image, canvas, started);
-    Ok(Frame {
-        source_frame_id: None,
-        image,
-        captured_at,
-        ui_state: None,
-    })
 }
 
 pub(crate) fn from_captured_frame(frame: &CapturedFrame, canvas: &Canvas) -> Frame {

@@ -1064,13 +1064,13 @@ function parseResponse(text,status){
 async function request(url,method,signal){
   const r=await fetch(url,{method:method||'GET',cache:'no-store',headers:requestHeaders(),signal})
   const text=await r.text()
-  if(!r.ok){let detail='HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
+  if(!r.ok){let detail=text.trim()&&!text.trim().startsWith('<')?text.trim():'HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
   return parseResponse(text,r.status)
 }
 async function requestJson(url,body){
   const r=await fetch(url,{method:'POST',cache:'no-store',headers:{...requestHeaders(),'Content-Type':'application/json'},body:JSON.stringify(body)})
   const text=await r.text()
-  if(!r.ok){let detail='HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
+  if(!r.ok){let detail=text.trim()&&!text.trim().startsWith('<')?text.trim():'HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
   return parseResponse(text,r.status)
 }
 async function call(url,method){

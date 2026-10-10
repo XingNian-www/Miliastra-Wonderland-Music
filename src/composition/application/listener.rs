@@ -1,4 +1,6 @@
-use super::secondary_chat::{SecondaryHallCommandTracker, SecondaryListenerRoundState};
+use super::secondary_chat::{
+    SecondaryHallCommandTracker, SecondaryListenerRoundState, SecondaryObservationOutcome,
+};
 use super::*;
 use crate::observation::chat::ChatIdentity;
 use std::ffi::OsStr;
@@ -188,14 +190,8 @@ fn truncate_for_event(text: &str) -> String {
 ///   既然空白不可信，保留它只会让同一句话时而带空格时而不带，
 ///   下游比较反而更不稳定；统一丢弃后文本才是确定且可逐字比较的。
 fn normalize_chat_text(text: &str) -> String {
-    text.chars()
-        .filter_map(|ch| match ch {
-            // 全角 ！ 到 ～ 与半角 ASCII 一一对应，码位偏移 0xFEE0。
-            '\u{FF01}'..='\u{FF5E}' => Some(char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch)),
-            ch if ch.is_whitespace() => None,
-            other => Some(other),
-        })
-        .collect()
+    // 唯一实现放在 crate::text：命令锁也必须复用同一份，否则同/全角抖动会互相打不中。
+    crate::text::normalize_chat_text(text)
 }
 
 /// 已推送过的气泡身份（有界）。
@@ -448,6 +444,95 @@ fn primary_command_candidates(
         .iter()
         .enumerate()
         .filter(|(_, message)| message.is_new)
+}
+
+/// 一级命令的收尾：`write_lock` 只在“真正派发成功”点为 true；被禁用/被跳过的路径
+/// 只确认不写锁。启动基线 seed pass 例外地写锁，作为“屏幕上已存在的命令”的种子。
+///
+/// 缺陷 6：`message_text` / `message_y` 任一缺失就**不写锁**并 warn，绝不用
+/// `unwrap_or_default` 退化成空串/0——空文本会静默不写锁，y=0 则会命中任何
+/// `y <= 28` 的同文本气泡，把无关命令错误抑制掉。
+fn acknowledge_primary_command(
+    shared_ocr: &crate::observation::chat::SharedChatOcr,
+    command: &RoutedCommand,
+    write_lock: bool,
+) -> Result<()> {
+    let Some(message_id) = command.observation.message_id.as_ref() else {
+        return Ok(());
+    };
+    let acknowledged = if write_lock {
+        // 用被派发消息自身捕获的文本与 y，绝不回头查当前 tracker。
+        match (
+            command
+                .observation
+                .message_text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty()),
+            command.observation.message_y,
+        ) {
+            (Some(text), Some(y)) => shared_ocr.acknowledge_command(message_id, text, y)?,
+            (text, y) => {
+                log::warn!(
+                    "命令锁未写入：观察缺少可信文本或屏幕 y（chat={:?}, text={:?}, y={:?}, id={message_id:?}），本轮只确认不写锁",
+                    message_id.chat,
+                    text.map(redacted_chat_text),
+                    y,
+                );
+                shared_ocr.acknowledge_business(message_id)?
+            }
+        }
+    } else {
+        shared_ocr.acknowledge_business(message_id)?
+    };
+    if !acknowledged {
+        log::debug!("一级命令完成处理时消息已滚出当前画面: id={message_id:?}");
+    }
+    Ok(())
+}
+
+/// 启动基线 seed pass：帧里已经在屏上的命令**只写锁、不派发**。
+///
+/// 这是有意接受的取舍（R6）：写锁防止机器人自己发言触发的 no_chat 重建把屏上命令
+/// 当新命令重跑；不派发则避免启动瞬间重放历史命令。
+///
+/// 日志用 warn 且带聊天身份与命令文本，便于排查“我发的命令没反应”；本函数每轮基线
+/// 只调用一次，不会刷屏。它只拿到 `&SharedChatOcr`，没有派发队列句柄——“不执行”
+/// 是结构性的，而不是靠一个容易忘记的 early return。
+fn seed_primary_baseline_commands(
+    shared_ocr: &crate::observation::chat::SharedChatOcr,
+    commands: &[PendingCommand],
+) -> Result<()> {
+    for pending in commands {
+        let chat = pending
+            .routed
+            .observation
+            .message_id
+            .as_ref()
+            .map(|id| &id.chat);
+        let text = pending
+            .routed
+            .observation
+            .message_text
+            .as_deref()
+            .map(redacted_chat_text)
+            .unwrap_or_else(|| redacted_chat_text(&pending.routed.raw));
+        log::warn!("聊天观察基线 seed：当前可见命令只写锁不执行 chat={chat:?} command={text}");
+        acknowledge_primary_command(shared_ocr, &pending.routed, true)?;
+    }
+    Ok(())
+}
+
+/// 二级/好友命令派发的唯一提交点：只有真正作为命令派发成功才写命令锁。
+/// 普通闲聊、被禁用/未路由/被邀请去重的命令只确认（不写锁）。
+fn complete_secondary_claim(
+    claim: crate::observation::chat::SharedBusinessClaim,
+    command_dispatched: bool,
+) -> Result<()> {
+    if command_dispatched {
+        claim.complete_as_command()
+    } else {
+        claim.complete_ignored()
+    }
 }
 
 impl ApplicationRuntime {
@@ -1530,14 +1615,16 @@ impl ApplicationRuntime {
                         let id = message.id;
                         // Claim atomically against discard suppression and other
                         // queued revisions before dispatching business effects.
-                        let Some(claim) = self
-                            .ui
-                            .shared_ocr
-                            .claim_business(&id, snapshot.captured_at)?
+                        let Some(claim) = self.ui.shared_ocr.claim_business(
+                            &id,
+                            snapshot.captured_at,
+                            &message.text,
+                            message.block.y,
+                        )?
                         else {
                             continue;
                         };
-                        self.dispatch_chat_observations(vec![
+                        let outcome = self.dispatch_chat_observations(vec![
                             ChatObservationDispatch::Secondary {
                                 frame,
                                 observation: SecondaryChatObservation {
@@ -1552,7 +1639,9 @@ impl ApplicationRuntime {
                                 },
                             },
                         ])?;
-                        claim.complete()?;
+                        // 缺陷 1：只有真正作为命令派发成功才写锁；
+                        // 普通闲聊/被禁用/未路由只 ack，绝不能挤掉真命令条目。
+                        complete_secondary_claim(claim, outcome.command_dispatched)?;
                     }
                 }
                 ChatIdentity::Unknown
@@ -1624,7 +1713,7 @@ impl ApplicationRuntime {
     pub(super) fn dispatch_chat_observations(
         &mut self,
         dispatches: Vec<ChatObservationDispatch>,
-    ) -> Result<bool> {
+    ) -> Result<SecondaryObservationOutcome> {
         if crate::debug_mode::enabled() {
             // 调试模式下本进程不执行自动化——但"不执行"不等于"看不见"。
             // 外部 AI 恰恰是在这个模式下驱动游戏的，它必须知道游戏里说了什么、
@@ -1632,9 +1721,9 @@ impl ApplicationRuntime {
             // 本进程当观察者，AI 当执行者。行为边界不变，仍然不执行任何自动化。
             publish_debug_chat_observations(&dispatches);
             log::debug!("调试模式已启用，丢弃游戏内聊天命令与问题，不执行自动化");
-            return Ok(false);
+            return Ok(SecondaryObservationOutcome::default());
         }
-        let mut processed_secondary = false;
+        let mut secondary = SecondaryObservationOutcome::default();
         for dispatch in dispatches {
             match dispatch {
                 ChatObservationDispatch::Primary { frame, messages } => {
@@ -1642,8 +1731,9 @@ impl ApplicationRuntime {
                     self.handle_scan_messages(frame.captured_at(), messages)?;
                 }
                 ChatObservationDispatch::Secondary { frame, observation } => {
-                    processed_secondary |=
-                        self.process_secondary_chat_observation(frame, observation)?;
+                    let outcome = self.process_secondary_chat_observation(frame, observation)?;
+                    secondary.processed |= outcome.processed;
+                    secondary.command_dispatched |= outcome.command_dispatched;
                 }
                 ChatObservationDispatch::Gap(gap) => {
                     self.ui
@@ -1658,7 +1748,7 @@ impl ApplicationRuntime {
                 }
             }
         }
-        Ok(processed_secondary)
+        Ok(secondary)
     }
 
     pub(super) fn mapped_actor_name(&self, ocr_name: &str) -> String {
@@ -1754,6 +1844,9 @@ impl ApplicationRuntime {
                 frame_id: None,
                 captured_at: Some(captured_at),
                 message_id: Some(observed.id.clone()),
+                // 命令锁只认被派发消息自身的数据：这里连同快照一起捕获文本与 y。
+                message_text: Some(message.text.clone()),
+                message_y: Some(message.block.y),
             };
             let Some(envelope) =
                 command::parse_command_envelope(&message.text, &message.message_type, observation)
@@ -1796,13 +1889,7 @@ impl ApplicationRuntime {
                     question.player
                 );
             }
-            for pending in accepted {
-                log::info!(
-                    "聊天观察基线已记录当前可见命令，不执行: {}",
-                    pending.routed.raw
-                );
-                self.acknowledge_primary_command(&pending.routed)?;
-            }
+            seed_primary_baseline_commands(&self.ui.shared_ocr, &accepted)?;
             return Ok(());
         }
         let questions = attach_question_orders(visible_turtle_questions, new_turtle_questions)?;
@@ -1834,20 +1921,22 @@ impl ApplicationRuntime {
                 ObservedInput::Command(pending) => {
                     if self.command_is_disabled(&pending.routed)? {
                         log::info!("命令识别已禁用，跳过: {}", pending.routed.raw);
-                        self.acknowledge_primary_command(&pending.routed)?;
+                        // 被禁用不是“执行成功”，只确认不写锁。
+                        acknowledge_primary_command(&self.ui.shared_ocr, &pending.routed, false)?;
                         continue;
                     }
                     if self.enqueue_chat_listener_command(&pending.routed)? {
-                        self.acknowledge_primary_command(&pending.routed)?;
+                        // 真正派发成功：写锁作为持久墓碑，重建后同一屏命令不再派发。
+                        acknowledge_primary_command(&self.ui.shared_ocr, &pending.routed, true)?;
                         continue;
                     }
                     if self.apply_immediate_administration(&pending.routed, false)? {
-                        self.acknowledge_primary_command(&pending.routed)?;
+                        acknowledge_primary_command(&self.ui.shared_ocr, &pending.routed, true)?;
                         continue;
                     }
                     let routed = pending.routed.clone();
                     self.enqueue_pending_command(pending)?;
-                    self.acknowledge_primary_command(&routed)?;
+                    acknowledge_primary_command(&self.ui.shared_ocr, &routed, true)?;
                 }
             }
         }
@@ -1858,16 +1947,6 @@ impl ApplicationRuntime {
         Ok(!self.commands_enabled()?
             && command.authority == CommandAuthority::HallMember
             && command.role.is_none())
-    }
-
-    fn acknowledge_primary_command(&self, command: &RoutedCommand) -> Result<()> {
-        let Some(message_id) = command.observation.message_id.as_ref() else {
-            return Ok(());
-        };
-        if !self.ui.shared_ocr.acknowledge_business(message_id)? {
-            log::debug!("一级命令完成处理时消息已滚出当前画面: id={message_id:?}");
-        }
-        Ok(())
     }
 
     fn enqueue_chat_listener_command(&self, parsed: &RoutedCommand) -> Result<bool> {
@@ -2015,29 +2094,32 @@ impl ApplicationRuntime {
         }
     }
 
-    pub(super) fn submit_secondary_command(&self, parsed: RoutedCommand) -> Result<()> {
+    /// 二级/好友命令的派发入口。返回值是**是否真正作为命令派发成功**——只有 true 才允许
+    /// 写命令锁；被禁用、邀请去重、未路由都返回 false（只 ack）。
+    pub(super) fn submit_secondary_command(&self, parsed: RoutedCommand) -> Result<bool> {
         let parsed = self.map_command_actor(parsed);
         if self.enqueue_chat_listener_command(&parsed)? {
-            return Ok(());
+            return Ok(true);
         }
         if self.command_is_disabled(&parsed)? {
             log::info!("命令识别已禁用，跳过二级大厅命令: {}", parsed.raw);
-            return Ok(());
+            return Ok(false);
         }
         if let ModuleCommand::Invite(invite) = &parsed.command
             && !self.business.business.invite_should_accept(invite.seq)?
         {
             let seq = invite.seq.expect("unsequenced invites are always accepted");
             log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
-            return Ok(());
+            return Ok(false);
         }
         if self.apply_immediate_administration(&parsed, true)? {
-            return Ok(());
+            return Ok(true);
         }
         self.enqueue_pending_command(PendingCommand {
             lock_key: command::lock_key(&parsed),
             routed: parsed,
-        })
+        })?;
+        Ok(true)
     }
 
     fn enqueue_pending_command(&self, pending: PendingCommand) -> Result<()> {
@@ -2191,14 +2273,17 @@ mod tests {
         );
     }
 
-    use crate::features::command::{CommandEnvelope, CommandObservation};
+    use crate::features::command::{
+        CommandAuthority, CommandEnvelope, CommandObservation, ModuleCommand, RoutedCommand,
+    };
     use crate::features::custom_workflow::{
         CustomWorkflowConfig, CustomWorkflowService, WorkflowDefaults,
     };
     use crate::features::identity::{
         IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
     };
-    use crate::interfaces::chat::ChatCommandRouter;
+    use crate::features::playback::PlaybackCommand;
+    use crate::interfaces::chat::{ChatCommandRouter, PendingCommand};
 
     use super::{
         CHAT_LISTENER_UNRESOLVED_UI_GRACE, CONFIG_RELOAD_UI_FALLBACK_GRACE, ChatListenerMode,
@@ -2210,7 +2295,7 @@ mod tests {
     };
     use crate::observation::chat::{
         BubbleSequence, ChatIdentity, ChatMessage, ObservedChatMessageId, PrimaryObservedMessage,
-        VisualSessionId,
+        SharedChatInput, SharedChatOcr, VisualSessionId,
     };
     use crate::ui::geometry::Rect;
     use std::time::{Duration, Instant};
@@ -2731,5 +2816,207 @@ mod tests {
             },
             is_new,
         }
+    }
+
+    // ==== 命令锁接线测试（真实格式 "[昵称]:@命令"）====
+
+    fn chat_input(text: &str, y: i32) -> SharedChatInput {
+        SharedChatInput {
+            text: text.into(),
+            sender: None,
+            raw_sender: None,
+            message_type: "blue".into(),
+            block: Rect::new(0, y, 100, 10),
+        }
+    }
+
+    fn primary_route(message_id: ObservedChatMessageId) -> RoutedCommand {
+        RoutedCommand {
+            matched: "状态".into(),
+            raw: "状态".into(),
+            user_command: "@状态".into(),
+            message_type: "blue".into(),
+            username: "甲".into(),
+            authority: CommandAuthority::HallMember,
+            role: None,
+            permission_required: None,
+            command: ModuleCommand::Playback(PlaybackCommand::Status),
+            observation: CommandObservation {
+                frame_id: None,
+                captured_at: Some(Instant::now()),
+                message_id: Some(message_id),
+                message_text: Some("[甲]:@状态".to_string()),
+                message_y: Some(40),
+            },
+        }
+    }
+
+    /// 一级 write_lock 分支：真正派发成功写锁；被禁用只 ack 不写锁。
+    #[test]
+    fn primary_write_lock_only_after_real_dispatch() {
+        let shared = SharedChatOcr::new();
+        let frame = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![chat_input("[甲]:@状态", 40)],
+            )
+            .unwrap();
+        let message = frame.messages[0].clone();
+        let command = primary_route(message.id.clone());
+        super::acknowledge_primary_command(&shared, &command, true).unwrap();
+        assert_eq!(
+            shared.command_lock_texts_for_test(&ChatIdentity::PrimaryHall),
+            vec!["[甲]:@状态".to_string()],
+            "真正派发成功必须写锁"
+        );
+        assert!(!shared.is_business_pending(&message.id).unwrap());
+
+        let shared = SharedChatOcr::new();
+        let frame = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![chat_input("[甲]:@状态", 40)],
+            )
+            .unwrap();
+        let message = frame.messages[0].clone();
+        let command = primary_route(message.id.clone());
+        super::acknowledge_primary_command(&shared, &command, false).unwrap();
+        assert!(
+            !shared.command_lock_bucket_exists_for_test(&ChatIdentity::PrimaryHall),
+            "被禁用命令只 ack 不写锁"
+        );
+        assert!(!shared.is_business_pending(&message.id).unwrap());
+    }
+
+    /// 缺陷 6：缺文本或缺 y 时不得用 unwrap_or_default 退化成空串/0（0 会命中任何
+    /// y<=28 的同文本气泡）；必须 warn 并只确认不写锁。
+    #[test]
+    fn primary_write_lock_skips_missing_text_or_y() {
+        for (text, y) in [(None, Some(40)), (Some("[甲]:@状态"), None)] {
+            let shared = SharedChatOcr::new();
+            let frame = shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PrimaryHall,
+                    vec![chat_input("[甲]:@状态", 40)],
+                )
+                .unwrap();
+            let message = frame.messages[0].clone();
+            let mut command = primary_route(message.id.clone());
+            command.observation.message_text = text.map(str::to_string);
+            command.observation.message_y = y;
+            super::acknowledge_primary_command(&shared, &command, true).unwrap();
+            assert!(
+                !shared.command_lock_bucket_exists_for_test(&ChatIdentity::PrimaryHall),
+                "缺失 text/y 不得写锁 (text={text:?}, y={y:?})"
+            );
+            assert!(
+                !shared.is_business_pending(&message.id).unwrap(),
+                "缺失时仍应确认，避免消息卡在 pending"
+            );
+        }
+    }
+
+    /// R6：基线 seed 帧的命令写锁但不派发。该函数只接收 &SharedChatOcr，没有派发队列
+    /// 句柄，“不执行”是结构性的；这里断言写锁已记录且消息被消费。
+    #[test]
+    fn baseline_seed_records_lock_without_dispatching() {
+        let shared = SharedChatOcr::new();
+        let frame = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![chat_input("[甲]:@状态", 40)],
+            )
+            .unwrap();
+        let message = frame.messages[0].clone();
+        let command = primary_route(message.id.clone());
+        let pending = PendingCommand {
+            lock_key: crate::interfaces::chat::lock_key(&command),
+            routed: command,
+        };
+        super::seed_primary_baseline_commands(&shared, std::slice::from_ref(&pending)).unwrap();
+        assert_eq!(
+            shared.command_lock_texts_for_test(&ChatIdentity::PrimaryHall),
+            vec!["[甲]:@状态".to_string()],
+            "seed 帧必须写锁作为屏幕上已存在命令的种子"
+        );
+        assert!(
+            !shared.is_business_pending(&message.id).unwrap(),
+            "seed 命令被确认消费，不会进入派发"
+        );
+    }
+
+    /// 缺陷 1 反例：二级大厅真命令派发成功写锁；随后 5 条普通闲聊被 claim 也不得写锁、
+    /// 不得把真命令条目挤出；重建后该命令不得重跑。
+    #[test]
+    fn secondary_chatter_claims_do_not_evict_dispatched_command_lock() {
+        let shared = SharedChatOcr::new();
+        let chat = ChatIdentity::SecondaryHall;
+        let mut inputs = vec![chat_input("[甲]:@点歌 起风了", 100)];
+        let first = shared
+            .publish(Instant::now(), chat.clone(), inputs.clone())
+            .unwrap();
+        let command = first.messages[0].clone();
+        let claim = shared
+            .claim_business(
+                &command.id,
+                first.captured_at,
+                &command.text,
+                command.block.y,
+            )
+            .unwrap()
+            .expect("secondary command should be claimable");
+        super::complete_secondary_claim(claim, true).unwrap();
+        assert_eq!(
+            shared.command_lock_texts_for_test(&chat),
+            vec!["[甲]:@点歌起风了".to_string()],
+            "真正派发成功的二级命令必须写锁"
+        );
+
+        for index in 0..5 {
+            inputs.push(chat_input(
+                &format!("[路人{index}]:今天天气不错"),
+                135 + index as i32 * 35,
+            ));
+            let frame = shared
+                .publish(Instant::now(), chat.clone(), inputs.clone())
+                .unwrap();
+            let chatter = frame.messages.last().unwrap().clone();
+            assert!(shared.is_business_pending(&chatter.id).unwrap());
+            let claim = shared
+                .claim_business(
+                    &chatter.id,
+                    frame.captured_at,
+                    &chatter.text,
+                    chatter.block.y,
+                )
+                .unwrap()
+                .expect("chatter should be claimable");
+            super::complete_secondary_claim(claim, false).unwrap();
+        }
+        assert_eq!(
+            shared.command_lock_texts_for_test(&chat),
+            vec!["[甲]:@点歌起风了".to_string()],
+            "普通闲聊不得写锁，更不得把真命令条目按 FIFO 挤出"
+        );
+
+        shared
+            .publish_no_chat(Instant::now(), "view rebuilt")
+            .unwrap();
+        let rebuilt = shared
+            .publish(
+                Instant::now(),
+                chat,
+                vec![chat_input("[甲]:@点歌 起风了", 100)],
+            )
+            .unwrap();
+        assert!(
+            !rebuilt.messages[0].is_new,
+            "重建后已执行的二级命令不得重跑"
+        );
+        assert!(!shared.is_business_pending(&rebuilt.messages[0].id).unwrap());
     }
 }

@@ -748,6 +748,7 @@ mod tests {
     #[test]
     #[ignore = "requires a visible running game window on the desktop"]
     fn live_window_read_only_capture_smoke() {
+        crate::adapters::windows::dpi::set_process_dpi_awareness();
         let window = GameWindow::find(&WindowConfig::default()).expect("find live target window");
         let foreground = window.is_foreground();
         let image = window
@@ -763,6 +764,16 @@ mod tests {
             image.height()
         );
         assert!(varied, "live target screenshot is a uniform image");
+        if let Some(path) = std::env::var_os("MILIASTRA_LIVE_CAPTURE_PATH") {
+            let path = std::path::PathBuf::from(path);
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).expect("create screenshot evidence directory");
+            }
+            image.save(path).expect("save actual game screenshot");
+        }
     }
 
     #[test]

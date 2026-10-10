@@ -437,6 +437,27 @@ fn attach_question_orders<Q: PartialEq>(
         .collect()
 }
 
+fn acknowledge_unrecognized_primary_message(
+    shared_ocr: &crate::observation::chat::SharedChatOcr,
+    observed: &PrimaryObservedMessage,
+    captured_at: Instant,
+    baseline_primed: bool,
+) -> Result<()> {
+    if baseline_primed || observed.message.message_type != "pink" {
+        shared_ocr.acknowledge_ignored(
+            &observed.id,
+            captured_at,
+            &observed.message.text,
+            None,
+            None,
+        )?;
+    } else {
+        // 仅粉色首屏历史永久消费；蓝色首屏的未识别文本仍可由有效修订交付。
+        shared_ocr.acknowledge_business(&observed.id)?;
+    }
+    Ok(())
+}
+
 fn primary_command_candidates(
     messages: &[PrimaryObservedMessage],
 ) -> impl Iterator<Item = (usize, &PrimaryObservedMessage)> {
@@ -446,8 +467,8 @@ fn primary_command_candidates(
         .filter(|(_, message)| message.is_new)
 }
 
-/// 一级命令的收尾：`write_lock` 只在“真正派发成功”点为 true；被禁用/被跳过的路径
-/// 只确认不写锁。启动基线 seed pass 例外地写锁，作为“屏幕上已存在的命令”的种子。
+/// 一级命令的收尾：`write_lock` 只在真正派发成功点为 true；被禁用/被跳过的路径
+/// 只确认不写锁。蓝色首屏允许执行，不再用启动 seed 把它永久跳过。
 ///
 /// 缺陷 6：`message_text` / `message_y` 任一缺失就**不写锁**并 warn，绝不用
 /// `unwrap_or_default` 退化成空串/0——空文本会静默不写锁，y=0 则会命中任何
@@ -486,38 +507,6 @@ fn acknowledge_primary_command(
     };
     if !acknowledged {
         log::debug!("一级命令完成处理时消息已滚出当前画面: id={message_id:?}");
-    }
-    Ok(())
-}
-
-/// 启动基线 seed pass：帧里已经在屏上的命令**只写锁、不派发**。
-///
-/// 这是有意接受的取舍（R6）：写锁防止机器人自己发言触发的 no_chat 重建把屏上命令
-/// 当新命令重跑；不派发则避免启动瞬间重放历史命令。
-///
-/// 日志用 warn 且带聊天身份与命令文本，便于排查“我发的命令没反应”；本函数每轮基线
-/// 只调用一次，不会刷屏。它只拿到 `&SharedChatOcr`，没有派发队列句柄——“不执行”
-/// 是结构性的，而不是靠一个容易忘记的 early return。
-fn seed_primary_baseline_commands(
-    shared_ocr: &crate::observation::chat::SharedChatOcr,
-    commands: &[PendingCommand],
-) -> Result<()> {
-    for pending in commands {
-        let chat = pending
-            .routed
-            .observation
-            .message_id
-            .as_ref()
-            .map(|id| &id.chat);
-        let text = pending
-            .routed
-            .observation
-            .message_text
-            .as_deref()
-            .map(redacted_chat_text)
-            .unwrap_or_else(|| redacted_chat_text(&pending.routed.raw));
-        log::warn!("聊天观察基线 seed：当前可见命令只写锁不执行 chat={chat:?} command={text}");
-        acknowledge_primary_command(shared_ocr, &pending.routed, true)?;
     }
     Ok(())
 }
@@ -583,7 +572,7 @@ impl ApplicationRuntime {
             .store(false, AtomicOrdering::SeqCst);
         let visual_session = self.ui.chat_observations.begin_visual_session()?;
         log::info!(
-            "{reason}，聊天观察进入新视觉会话，下一屏消息仅建立基线: {}",
+            "{reason}，聊天观察进入新视觉会话：仅粉色首屏建立历史基线，其他颜色继续交付: {}",
             visual_session.get()
         );
         Ok(())
@@ -862,12 +851,6 @@ impl ApplicationRuntime {
             .subscribe_completion_advances()
             .context("订阅聊天观察完成推进")?;
         let scan_result = self.run_scan_loop_inner(&mut completion_subscriber, &shared_subscriber);
-        // A stopped listener cannot produce another Primary observation for decision waiters.
-        let reason = match &scan_result {
-            Ok(()) => "聊天扫描循环已停止".to_string(),
-            Err(error) => format!("聊天扫描循环退出: {error:#}"),
-        };
-        self.report_primary_scan_failure(reason);
         let final_forward_result = self.forward_completion_advances(&mut completion_subscriber);
         match scan_result {
             Err(error) => {
@@ -1391,7 +1374,6 @@ impl ApplicationRuntime {
                     continue;
                 }
                 Err(error) => {
-                    self.report_primary_scan_failure(format!("截图失败: {error:#}"));
                     drop(scan_lease.take());
                     self.invalidate_latest_frame();
                     unresolved_ui_since = None;
@@ -1544,7 +1526,14 @@ impl ApplicationRuntime {
         if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
             return Ok(());
         }
-        while let Some(snapshot) = backlog.pop_front() {
+        while !backlog.is_empty() {
+            // 普通派发与独占起点原子协调；期间仍读取共享流并保留业务积压。
+            let Some(_business_dispatch) =
+                self.ui.chat_observations.try_begin_business_dispatch()?
+            else {
+                break;
+            };
+            let snapshot = backlog.pop_front().expect("nonempty business backlog");
             self.consume_shared_chat_snapshot(snapshot)?;
         }
         Ok(())
@@ -1565,7 +1554,10 @@ impl ApplicationRuntime {
                         .messages
                         .into_iter()
                         .map(|message| {
-                            let is_new = self.ui.shared_ocr.is_business_pending(&message.id)?;
+                            let is_new = self
+                                .ui
+                                .shared_ocr
+                                .is_business_pending_at(&message.id, snapshot.captured_at)?;
                             Ok(PrimaryObservedMessage {
                                 id: message.id,
                                 is_new,
@@ -1592,9 +1584,15 @@ impl ApplicationRuntime {
                         _ => String::new(),
                     };
                     for message in snapshot.messages {
-                        if !self.ui.shared_ocr.is_business_pending(&message.id)? {
+                        if !self
+                            .ui
+                            .shared_ocr
+                            .is_business_pending_at(&message.id, snapshot.captured_at)?
+                        {
                             continue;
                         }
+                        let revision_sender = message.sender.clone();
+                        let revision_raw_sender = message.raw_sender.clone();
                         let sender = message
                             .raw_sender
                             .as_deref()
@@ -1641,7 +1639,14 @@ impl ApplicationRuntime {
                         ])?;
                         // 缺陷 1：只有真正作为命令派发成功才写锁；
                         // 普通闲聊/被禁用/未路由只 ack，绝不能挤掉真命令条目。
-                        complete_secondary_claim(claim, outcome.command_dispatched)?;
+                        if outcome.unrecognized {
+                            claim.complete_unrecognized(
+                                revision_sender.as_deref(),
+                                revision_raw_sender.as_deref(),
+                            )?;
+                        } else {
+                            complete_secondary_claim(claim, outcome.command_dispatched)?;
+                        }
                     }
                 }
                 ChatIdentity::Unknown
@@ -1664,12 +1669,6 @@ impl ApplicationRuntime {
                     .record_terminal_failure(frame, format!("{error:#}"))?;
                 Err(error)
             }
-        }
-    }
-
-    fn report_primary_scan_failure(&self, reason: String) {
-        if let Err(error) = self.ui.chat_observations.report_primary_failure(reason) {
-            log::error!("通知一级聊天观察失败异常: {error:#}");
         }
     }
 
@@ -1700,16 +1699,6 @@ impl ApplicationRuntime {
         }
     }
 
-    fn publish_primary_chat_observation(
-        &mut self,
-        frame: ObservedFrame,
-        messages: Vec<ChatMessage>,
-    ) -> Result<()> {
-        let dispatches = self.ui.chat_observations.publish_primary(frame, messages)?;
-        self.dispatch_chat_observations(dispatches)?;
-        Ok(())
-    }
-
     pub(super) fn dispatch_chat_observations(
         &mut self,
         dispatches: Vec<ChatObservationDispatch>,
@@ -1734,13 +1723,14 @@ impl ApplicationRuntime {
                     let outcome = self.process_secondary_chat_observation(frame, observation)?;
                     secondary.processed |= outcome.processed;
                     secondary.command_dispatched |= outcome.command_dispatched;
+                    secondary.unrecognized |= outcome.unrecognized;
                 }
                 ChatObservationDispatch::Gap(gap) => {
                     self.ui
                         .chat_baseline_primed
                         .store(false, AtomicOrdering::SeqCst);
                     log::warn!(
-                        "聊天观察流出现缺口，下一屏仅重建命令基线: kind={:?} missing={:?}..={:?}",
+                        "聊天观察流出现缺口，下一屏重建观察状态（仅粉色建立历史基线）: kind={:?} missing={:?}..={:?}",
                         gap.kind,
                         gap.missing_from,
                         gap.missing_through
@@ -1812,8 +1802,8 @@ impl ApplicationRuntime {
         } else {
             Vec::new()
         };
-        let suppress_new_turtle_questions =
-            !self.ui.chat_baseline_primed.load(AtomicOrdering::SeqCst);
+        // 这里采样的是蓝色大厅提问，粉色首屏抑制由共享消息颜色负责。
+        let suppress_new_turtle_questions = false;
         let new_turtle_questions = self
             .business
             .business
@@ -1828,11 +1818,17 @@ impl ApplicationRuntime {
             log::debug!("没有找到聊天标志，本轮不更新命令锁");
             return Ok(());
         }
+        let baseline_primed = self.ui.chat_baseline_primed.load(AtomicOrdering::SeqCst);
         let mut parsed = Vec::new();
         for (_, observed) in primary_command_candidates(&observed_messages) {
             let message = &observed.message;
             if message.text.is_empty() {
-                self.ui.shared_ocr.acknowledge_business(&observed.id)?;
+                acknowledge_unrecognized_primary_message(
+                    &self.ui.shared_ocr,
+                    observed,
+                    captured_at,
+                    baseline_primed,
+                )?;
                 continue;
             }
             log::debug!(
@@ -1851,11 +1847,21 @@ impl ApplicationRuntime {
             let Some(envelope) =
                 command::parse_command_envelope(&message.text, &message.message_type, observation)
             else {
-                self.ui.shared_ocr.acknowledge_business(&observed.id)?;
+                acknowledge_unrecognized_primary_message(
+                    &self.ui.shared_ocr,
+                    observed,
+                    captured_at,
+                    baseline_primed,
+                )?;
                 continue;
             };
             let Some(parsed_command) = command_router.route(&envelope, active_entertainment) else {
-                self.ui.shared_ocr.acknowledge_business(&observed.id)?;
+                acknowledge_unrecognized_primary_message(
+                    &self.ui.shared_ocr,
+                    observed,
+                    captured_at,
+                    baseline_primed,
+                )?;
                 continue;
             };
             let parsed_command = self.map_command_actor(parsed_command);
@@ -1878,20 +1884,9 @@ impl ApplicationRuntime {
                 routed,
             })
             .collect::<Vec<_>>();
-        if !self
-            .ui
+        self.ui
             .chat_baseline_primed
-            .swap(true, AtomicOrdering::SeqCst)
-        {
-            for question in new_turtle_questions {
-                log::info!(
-                    "启动屏幕锁已记录当前可见海龟汤提问，不执行: nickname={}",
-                    question.player
-                );
-            }
-            seed_primary_baseline_commands(&self.ui.shared_ocr, &accepted)?;
-            return Ok(());
-        }
+            .store(true, AtomicOrdering::SeqCst);
         let questions = attach_question_orders(visible_turtle_questions, new_turtle_questions)?;
         let commands = accepted
             .into_iter()
@@ -1968,6 +1963,11 @@ impl ApplicationRuntime {
                         "{} -> {}",
                         parsed.user_command, message
                     )));
+                crate::debug_read_only::record_command_immediate(
+                    parsed,
+                    "chatListenerStatus",
+                    message,
+                );
             }
             ChatListenerModeCommand::Primary | ChatListenerModeCommand::Secondary => {
                 let target = match command {
@@ -1986,9 +1986,10 @@ impl ApplicationRuntime {
                     return Ok(true);
                 }
                 self.record_command_activity(command_observed_at(parsed))?;
-                if let Err(error) =
-                    self.push_pending_task(PendingTask::SetChatListenerMode { target })
-                {
+                if let Err(error) = self.push_pending_task_with_command_source(
+                    PendingTask::SetChatListenerMode { target },
+                    parsed,
+                ) {
                     self.business
                         .business
                         .cancel_chat_listener_mode_request(target)?;
@@ -2154,7 +2155,7 @@ impl ApplicationRuntime {
             user_command: parsed.user_command.clone(),
         };
         let mut port = self.immediate_administration_port();
-        Ok(matches!(
+        let handled = matches!(
             self.business.administration_application.apply_immediate(
                 &context,
                 command,
@@ -2162,7 +2163,15 @@ impl ApplicationRuntime {
                 &mut port,
             )?,
             ImmediateAdministrationOutcome::Handled
-        ))
+        );
+        if handled {
+            crate::debug_read_only::record_command_immediate(
+                parsed,
+                "immediateAdministration",
+                "immediate administration completed".to_string(),
+            );
+        }
+        Ok(handled)
     }
 
     pub(super) fn execute_console_chat_task(&mut self, text: String, prefix: String) -> Result<()> {
@@ -2851,6 +2860,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn blue_unrecognized_revision_routes_once_including_startup() {
+        for baseline_primed in [false, true] {
+            let shared = SharedChatOcr::new();
+            let first = shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PrimaryHall,
+                    vec![chat_input("[甲]:@点哥 晴天", 40)],
+                )
+                .unwrap();
+            let message = &first.messages[0];
+            let observed = PrimaryObservedMessage {
+                id: message.id.clone(),
+                is_new: true,
+                message: ChatMessage {
+                    text: message.text.clone(),
+                    message_type: "blue".into(),
+                    block: message.block,
+                },
+            };
+            let envelope = crate::interfaces::chat::parse_command_envelope(
+                &message.text,
+                "blue",
+                CommandObservation::default(),
+            )
+            .unwrap();
+            assert!(
+                ChatCommandRouter::without_custom_workflow()
+                    .route(&envelope, None)
+                    .is_none()
+            );
+            super::acknowledge_unrecognized_primary_message(
+                &shared,
+                &observed,
+                first.captured_at,
+                baseline_primed,
+            )
+            .unwrap();
+            let corrected = shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PrimaryHall,
+                    vec![chat_input("[甲]:@点歌 晴天", 40)],
+                )
+                .unwrap();
+            let message = &corrected.messages[0];
+            assert_eq!(message.id, observed.id);
+            assert_eq!(
+                shared
+                    .is_business_pending_at(&message.id, corrected.captured_at)
+                    .unwrap(),
+                true
+            );
+            {
+                let envelope = crate::interfaces::chat::parse_command_envelope(
+                    &message.text,
+                    "blue",
+                    CommandObservation {
+                        message_id: Some(message.id.clone()),
+                        message_text: Some(message.text.clone()),
+                        message_y: Some(message.block.y),
+                        ..CommandObservation::default()
+                    },
+                )
+                .unwrap();
+                let parsed = ChatCommandRouter::without_custom_workflow()
+                    .route(&envelope, None)
+                    .unwrap();
+                super::acknowledge_primary_command(&shared, &parsed, true).unwrap();
+                let repeated = shared
+                    .publish(
+                        Instant::now(),
+                        ChatIdentity::PrimaryHall,
+                        vec![chat_input("[甲]:@点歌 晴天", 40)],
+                    )
+                    .unwrap();
+                assert!(
+                    !shared
+                        .is_business_pending_at(&message.id, repeated.captured_at)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
     /// 一级 write_lock 分支：真正派发成功写锁；被禁用只 ack 不写锁。
     #[test]
     fn primary_write_lock_only_after_real_dispatch() {
@@ -2919,33 +3014,51 @@ mod tests {
         }
     }
 
-    /// R6：基线 seed 帧的命令写锁但不派发。该函数只接收 &SharedChatOcr，没有派发队列
-    /// 句柄，“不执行”是结构性的；这里断言写锁已记录且消息被消费。
     #[test]
-    fn baseline_seed_records_lock_without_dispatching() {
+    fn blue_startup_is_candidate_and_success_lock_survives_view_rebuild() {
         let shared = SharedChatOcr::new();
+        let mut input = chat_input("[甲]:@状态", 40);
+        input.message_type = "blue".into();
         let frame = shared
             .publish(
                 Instant::now(),
                 ChatIdentity::PrimaryHall,
-                vec![chat_input("[甲]:@状态", 40)],
+                vec![input.clone()],
             )
             .unwrap();
-        let message = frame.messages[0].clone();
-        let command = primary_route(message.id.clone());
-        let pending = PendingCommand {
-            lock_key: crate::interfaces::chat::lock_key(&command),
-            routed: command,
+        let message = &frame.messages[0];
+        let observed = PrimaryObservedMessage {
+            id: message.id.clone(),
+            is_new: message.is_new,
+            message: ChatMessage {
+                text: message.text.clone(),
+                message_type: "blue".into(),
+                block: message.block,
+            },
         };
-        super::seed_primary_baseline_commands(&shared, std::slice::from_ref(&pending)).unwrap();
         assert_eq!(
-            shared.command_lock_texts_for_test(&ChatIdentity::PrimaryHall),
-            vec!["[甲]:@状态".to_string()],
-            "seed 帧必须写锁作为屏幕上已存在命令的种子"
+            super::primary_command_candidates(&[observed]).count(),
+            1,
+            "blue startup must enter command handling"
         );
+        assert!(shared.is_business_pending(&message.id).unwrap());
         assert!(
-            !shared.is_business_pending(&message.id).unwrap(),
-            "seed 命令被确认消费，不会进入派发"
+            shared
+                .command_lock_texts_for_test(&ChatIdentity::PrimaryHall)
+                .is_empty(),
+            "capture alone cannot write a success lock"
+        );
+        let command = primary_route(message.id.clone());
+        super::acknowledge_primary_command(&shared, &command, true).unwrap();
+        shared
+            .publish_no_chat(Instant::now(), "transient view rebuild")
+            .unwrap();
+        let rebuilt = shared
+            .publish(Instant::now(), ChatIdentity::PrimaryHall, vec![input])
+            .unwrap();
+        assert!(
+            !shared.is_business_pending(&rebuilt.messages[0].id).unwrap(),
+            "already successful startup command cannot run again"
         );
     }
 

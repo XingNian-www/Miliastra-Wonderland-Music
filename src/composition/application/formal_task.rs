@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
-use super::{FormalTaskExecutionContext, PendingTask, PendingTaskExecution};
+use super::{ApplicationRuntime, FormalTaskExecutionContext, PendingTask, PendingTaskExecution};
 use crate::config::LiveConfigs;
+use crate::features::command::RoutedCommand;
 use crate::features::hall::HallRuntimeState;
 use crate::features::playback::{PlaybackRuntimeState, QueueItem, SongRequestLeaderboardEntry};
 use crate::features::startup::StartupTask;
@@ -173,11 +174,70 @@ impl FormalTaskClient {
         &self,
         task: PendingTask,
     ) -> Result<FormalTaskEnqueueOutcome, TaskEngineError> {
-        self.task_engine.enqueue_formal(formal_task_submission(
+        self.enqueue_with_optional_source(task, None)
+    }
+
+    pub(super) fn enqueue_with_command_source(
+        &self,
+        task: PendingTask,
+        source: &RoutedCommand,
+    ) -> Result<FormalTaskEnqueueOutcome, TaskEngineError> {
+        self.enqueue_with_optional_source(task, Some(source))
+    }
+
+    fn enqueue_with_optional_source(
+        &self,
+        task: PendingTask,
+        source: Option<&RoutedCommand>,
+    ) -> Result<FormalTaskEnqueueOutcome, TaskEngineError> {
+        self.enqueue_with_observer(task, source, crate::debug_read_only::observer())
+    }
+
+    fn enqueue_with_observer(
+        &self,
+        task: PendingTask,
+        source: Option<&RoutedCommand>,
+        observer: &crate::debug_read_only::ReadOnlyObserver,
+    ) -> Result<FormalTaskEnqueueOutcome, TaskEngineError> {
+        // Observation is optional even if serialization panics. Normal queue semantics
+        // and the task itself never depend on the read-only switch or evidence health.
+        let observation = catch_unwind(AssertUnwindSafe(|| {
+            observer
+                .push_enabled()
+                .then(|| read_only_task_parameters_with_source(&task, source))
+        }))
+        .ok()
+        .flatten();
+        let outcome = self.task_engine.enqueue_formal(formal_task_submission(
             self.executor.clone(),
             self.business.clone(),
             task,
-        ))
+        ))?;
+        if let (FormalTaskEnqueueOutcome::Queued(receipt), Some((payload, captured_at))) =
+            (outcome, observation)
+        {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                observer.record_trigger(receipt.task_id, payload, captured_at);
+            }));
+        }
+        Ok(outcome)
+    }
+}
+
+impl ApplicationRuntime {
+    pub(super) fn push_pending_task_with_command_source(
+        &self,
+        task: PendingTask,
+        source: &RoutedCommand,
+    ) -> Result<()> {
+        let tasks = self
+            .business
+            .formal_tasks
+            .as_ref()
+            .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?;
+        // Queued alone emits evidence inside FormalTaskClient; Duplicate stays silent.
+        tasks.enqueue_with_command_source(task, source)?;
+        Ok(())
     }
 }
 
@@ -617,6 +677,81 @@ impl FormalTaskWork for AppFormalTaskWork {
     }
 }
 
+pub(super) fn read_only_task_parameters_with_source(
+    task: &PendingTask,
+    source: Option<&RoutedCommand>,
+) -> (serde_json::Value, Option<Instant>) {
+    let (mut payload, captured_at) = read_only_task_parameters(task);
+    if let Some(source) = source {
+        payload["sourceCommand"] = crate::debug_read_only::command_parameters(source);
+        payload["conversion"] = serde_json::json!({"from": "routedCommand",
+            "commandFamily": payload["sourceCommand"]["commandFamily"], "to": payload["kind"]});
+        return (payload, crate::debug_read_only::command_capture(source));
+    }
+    (payload, captured_at)
+}
+
+/// Explicit operational fields only: never serialize an application context or configuration.
+fn read_only_task_parameters(task: &PendingTask) -> (serde_json::Value, Option<Instant>) {
+    use serde_json::json;
+    match task {
+        PendingTask::Command(pending) => (
+            crate::debug_read_only::command_parameters(&pending.routed),
+            crate::debug_read_only::command_capture(&pending.routed),
+        ),
+        PendingTask::AdvanceQueue { reason } => {
+            (json!({"kind": "advanceQueue", "reason": reason}), None)
+        }
+        PendingTask::ConsoleChat { text, prefix } => (
+            json!({"kind": "consoleChat",
+            "text": crate::privacy::redacted_chat_text(text), "prefix": prefix}),
+            None,
+        ),
+        PendingTask::Startup(task) => (
+            json!({"kind": "startup", "parameters": {
+            "kind": format!("{:?}", task.kind())}}),
+            None,
+        ),
+        PendingTask::ClearIdleExit => (json!({"kind": "clearIdleExit"}), None),
+        PendingTask::ModerationResult(_) => (
+            json!({"kind": "moderationResult",
+            "parametersOmitted": "private moderation context"}),
+            None,
+        ),
+        PendingTask::SetChatListenerMode { target } => (
+            json!({"kind": "setChatListenerMode",
+            "target": target.label()}),
+            None,
+        ),
+        PendingTask::SecondaryUnread { hit, discard_only } => (
+            json!({"kind": "secondaryUnread",
+            "discardOnly": discard_only,
+            "indicator": {"x": hit.indicator.x, "y": hit.indicator.y},
+            "rowClick": {"x": hit.row_click.x, "y": hit.row_click.y}}),
+            None,
+        ),
+        PendingTask::RestoreSecondaryHall => (json!({"kind": "restoreSecondaryHall"}), None),
+        PendingTask::TurtleSoupQuestion {
+            question,
+            observed_at,
+        } => (
+            json!({"kind": "turtleSoupQuestion",
+            "question": crate::privacy::redacted_chat_text(&question.question)}),
+            Some(*observed_at),
+        ),
+        PendingTask::CardGameEffect(_) => (
+            json!({"kind": "cardGameEffect",
+            "parametersOmitted": "private game effect context"}),
+            None,
+        ),
+        PendingTask::UndercoverEffect(_) => (
+            json!({"kind": "undercoverEffect",
+            "parametersOmitted": "private game effect context"}),
+            None,
+        ),
+    }
+}
+
 pub(crate) fn formal_task_submission(
     executor: FormalTaskExecutionHandle,
     business: BusinessRuntimeHandle,
@@ -661,6 +796,257 @@ mod tests {
         FormalTaskCancellationToken, FormalTaskExecutionOutcome, FormalTaskSubmission,
         FormalTaskWork,
     };
+
+    fn listener_source() -> RoutedCommand {
+        use crate::features::administration::{AdministrationCommand, ChatListenerModeCommand};
+        use crate::features::command::{CommandAuthority, ModuleCommand};
+        use crate::observation::chat::{
+            BubbleSequence, ChatIdentity, ObservedChatMessageId, VisualSessionId,
+        };
+        let mut source = RoutedCommand::console(
+            "监听模式",
+            "监听模式二级",
+            ModuleCommand::Administration(AdministrationCommand::ChatListenerMode(
+                ChatListenerModeCommand::Secondary,
+            )),
+        );
+        source.message_type = "pink".into();
+        source.username = "香菜".into();
+        source.authority = CommandAuthority::Friend;
+        source.observation.message_text = Some("香菜：@监听模式二级".into());
+        source.observation.message_y = Some(420);
+        source.observation.message_id = Some(ObservedChatMessageId::new(
+            VisualSessionId::new(7),
+            ChatIdentity::Friend(Arc::from("最好的京子")),
+            BubbleSequence::new(11),
+        ));
+        source
+    }
+
+    fn evidence_client(
+        business: BusinessRuntimeHandle,
+        engine: TaskEngineHandle,
+    ) -> FormalTaskClient {
+        FormalTaskClient::new(
+            FormalTaskExecutionHandle {
+                context: Weak::new(),
+            },
+            business,
+            engine,
+        )
+    }
+
+    #[test]
+    fn read_only_converted_task_keeps_original_typed_parameters_and_instant() {
+        let source = listener_source();
+        let task = PendingTask::SetChatListenerMode {
+            target: ChatListenerMode::Secondary,
+        };
+        let (payload, at) = read_only_task_parameters_with_source(&task, Some(&source));
+        assert_eq!(at, source.observation.captured_at);
+        assert_eq!(payload["kind"], "setChatListenerMode");
+        assert_eq!(payload["target"], ChatListenerMode::Secondary.label());
+        assert_eq!(payload["sourceCommand"]["raw"], "监听模式二级");
+        assert_eq!(
+            payload["sourceCommand"]["originalText"],
+            "香菜：@监听模式二级"
+        );
+        assert_eq!(payload["sourceCommand"]["nickname"], "香菜");
+        assert_eq!(payload["sourceCommand"]["messageType"], "pink");
+        assert_eq!(payload["sourceCommand"]["messageId"]["bubbleSequence"], 11);
+        assert_eq!(
+            payload["sourceCommand"]["parameters"],
+            serde_json::json!(source.command)
+        );
+        assert_eq!(payload["conversion"]["commandFamily"], "administration");
+    }
+
+    #[test]
+    fn read_only_queue_emits_only_queued_not_duplicate_or_error() {
+        use crate::debug_read_only::{ReadOnlyObserver, ReadOnlyState};
+        let (runtime, engine) = business_runtime();
+        let client = evidence_client(runtime.handle(), engine.clone());
+        let observer = ReadOnlyObserver::default();
+        observer.set_enabled_state(true, ReadOnlyState::Push);
+        let source = listener_source();
+        let command = || {
+            PendingTask::Command(Box::new(PendingCommand {
+                lock_key: "test-readonly-source".into(),
+                routed: source.clone(),
+            }))
+        };
+        let FormalTaskEnqueueOutcome::Queued(receipt) = client
+            .enqueue_with_observer(command(), None, &observer)
+            .unwrap()
+        else {
+            panic!("first command must queue");
+        };
+        let evidence = observer.read_entry("readonly-1").unwrap();
+        assert_eq!(evidence["taskId"], receipt.task_id);
+        assert_eq!(evidence["task"]["nickname"], "香菜");
+        assert_eq!(
+            client
+                .enqueue_with_observer(command(), None, &observer)
+                .unwrap(),
+            FormalTaskEnqueueOutcome::Duplicate
+        );
+        assert_eq!(observer.bus().latest_sequence(), 1);
+        engine.begin_shutdown().unwrap();
+        assert!(
+            client
+                .enqueue_with_observer(command(), None, &observer)
+                .is_err()
+        );
+        assert_eq!(observer.bus().latest_sequence(), 1);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn read_only_listener_noop_is_silent_and_switch_never_controls_business() {
+        use crate::debug_read_only::{ReadOnlyObserver, ReadOnlyState};
+        for (enabled, mode) in [
+            (false, ReadOnlyState::Push),
+            (true, ReadOnlyState::Active),
+            (true, ReadOnlyState::Push),
+        ] {
+            let (runtime, engine) = business_runtime();
+            let business = runtime.handle();
+            let client = evidence_client(business.clone(), engine);
+            let observer = ReadOnlyObserver::default();
+            observer.set_enabled_state(enabled, mode);
+            let source = listener_source();
+            for _ in 0..2 {
+                let (queued, _) = business
+                    .request_chat_listener_mode(ChatListenerMode::Secondary)
+                    .unwrap();
+                if queued {
+                    assert!(matches!(
+                        client
+                            .enqueue_with_observer(
+                                PendingTask::SetChatListenerMode {
+                                    target: ChatListenerMode::Secondary
+                                },
+                                Some(&source),
+                                &observer,
+                            )
+                            .unwrap(),
+                        FormalTaskEnqueueOutcome::Queued(_)
+                    ));
+                }
+            }
+            assert_eq!(
+                business.chat_listener_snapshot().unwrap().pending_mode,
+                Some(ChatListenerMode::Secondary)
+            );
+            assert_eq!(
+                observer.bus().latest_sequence(),
+                u64::from(enabled && mode == ReadOnlyState::Push)
+            );
+            runtime.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn read_only_poisoned_observer_does_not_block_business_enqueue() {
+        let (runtime, engine) = business_runtime();
+        let client = evidence_client(runtime.handle(), engine);
+        let observer = crate::debug_read_only::ReadOnlyObserver::default();
+        observer.poison_for_test();
+        assert!(matches!(
+            client
+                .enqueue_with_observer(PendingTask::ClearIdleExit, None, &observer)
+                .unwrap(),
+            FormalTaskEnqueueOutcome::Queued(_)
+        ));
+        assert_eq!(observer.bus().latest_sequence(), 0);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the local real screenshot fixture; no synthetic frames"]
+    fn read_only_converted_task_real_source_receipt_and_export() {
+        use crate::debug_read_only::{ReadOnlyObserver, ReadOnlyState};
+        use crate::runtime::ui::{CaptureFrame, UiDevice, UiRuntime};
+        struct FixtureDevice(image::DynamicImage);
+        impl UiDevice for FixtureDevice {
+            fn capture(&mut self) -> anyhow::Result<image::DynamicImage> {
+                Ok(self.0.clone())
+            }
+        }
+        let image = image::open(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/ui/secondary-with-hall-row-1920x1080.png"),
+        )
+        .unwrap();
+        let ui = UiRuntime::start(FixtureDevice(image), 2).unwrap();
+        let capture = || {
+            Arc::new(
+                ui.handle()
+                    .submit_external(CaptureFrame)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        let first = capture();
+        let newer = capture();
+        let mut source = listener_source();
+        source.observation.captured_at = Some(first.captured_at());
+        let (runtime, engine) = business_runtime();
+        let client = evidence_client(runtime.handle(), engine);
+        let observer = ReadOnlyObserver::default();
+        observer.set_enabled_state(true, ReadOnlyState::Push);
+        observer.cache_frame(first.clone());
+        observer.cache_frame(newer);
+        let FormalTaskEnqueueOutcome::Queued(receipt) = client
+            .enqueue_with_observer(
+                PendingTask::SetChatListenerMode {
+                    target: ChatListenerMode::Secondary,
+                },
+                Some(&source),
+                &observer,
+            )
+            .unwrap()
+        else {
+            panic!("queue required");
+        };
+        let evidence = observer.read_entry("readonly-1").unwrap();
+        assert_eq!(evidence["taskId"], receipt.task_id);
+        assert_eq!(evidence["task"]["sourceCommand"]["raw"], "监听模式二级");
+        assert_eq!(evidence["task"]["sourceCommand"]["nickname"], "香菜");
+        assert_eq!(evidence["source"]["frameId"], first.id());
+        assert_eq!(evidence["source"]["canvas"], "rawGame");
+        assert!(
+            evidence["source"]["imagePngBase64"]
+                .as_str()
+                .unwrap()
+                .starts_with("iVBOR")
+        );
+        // The command text is an injected hook input. The image is an actual local
+        // game fixture, but this test does not claim that OCR saw this command.
+        if let Some(directory) = std::env::var_os("MILIASTRA_READONLY_EVIDENCE_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("converted-listener.json"),
+                serde_json::to_vec_pretty(&evidence).unwrap(),
+            )
+            .unwrap();
+            first
+                .image()
+                .save(directory.join("converted-listener-source.png"))
+                .unwrap();
+            std::fs::write(directory.join("converted-provenance.json"), serde_json::to_vec_pretty(&serde_json::json!({
+                "kind": "formal_task_source_binding_fixture", "actualGameCaptureDuringTest": false,
+                "actualBusinessCommandExecuted": false, "commandTextInjected": true,
+                "fixture": "tests/fixtures/ui/secondary-with-hall-row-1920x1080.png",
+                "checks": ["real queue receipt taskID", "source and converted typed parameters", "exact source Instant", "raw screenshot export"]
+            })).unwrap()).unwrap();
+        }
+        runtime.shutdown().unwrap();
+        ui.shutdown().unwrap();
+    }
 
     struct NotifyWork(mpsc::Sender<()>);
 

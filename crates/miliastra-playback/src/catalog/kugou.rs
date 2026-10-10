@@ -2683,6 +2683,7 @@ fn run_kugou_web_helper(
 ) -> Result<Value, CatalogError> {
     let input = serde_json::to_vec(request)
         .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+    let deadline = std::time::Instant::now() + timeout;
     let mut child = Command::new(executable)
         .arg("kugou")
         .arg("--kugou-web-request")
@@ -2696,39 +2697,7 @@ fn run_kugou_web_helper(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| CatalogError::Transient(error.to_string()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&input)
-            .map_err(|error| CatalogError::Transient(error.to_string()))?;
-    }
-
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CatalogError::TimedOut(
-                    "Kugou WebView2 request timed out".to_owned(),
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CatalogError::Transient(error.to_string()));
-            }
-        }
-    }
-
-    let mut output = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        stdout
-            .take(2 * 1024 * 1024)
-            .read_to_end(&mut output)
-            .map_err(|error| CatalogError::Transient(error.to_string()))?;
-    }
+    let output = collect_kugou_web_helper_output(&mut child, input, deadline)?;
     let line = output
         .split(|byte| *byte == b'\n')
         .find(|line| !line.iter().all(u8::is_ascii_whitespace))
@@ -2750,6 +2719,103 @@ fn run_kugou_web_helper(
     Err(CatalogError::Transient(
         "Kugou WebView2 request was not completed".to_owned(),
     ))
+}
+
+const KUGOU_WEB_HELPER_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+fn read_kugou_web_helper_output(stdout: impl Read) -> Result<Vec<u8>, CatalogError> {
+    let mut output = Vec::new();
+    stdout
+        .take((KUGOU_WEB_HELPER_MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut output)
+        .map_err(|error| CatalogError::Transient(error.to_string()))?;
+    if output.len() > KUGOU_WEB_HELPER_MAX_RESPONSE_BYTES {
+        return Err(CatalogError::InvalidResponse(
+            "Kugou WebView2 helper result exceeds the size limit".to_owned(),
+        ));
+    }
+    Ok(output)
+}
+
+fn collect_kugou_web_helper_output(
+    child: &mut std::process::Child,
+    input: Vec<u8>,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, CatalogError> {
+    let result = (|| {
+        let stdout = child.stdout.take().ok_or_else(|| {
+            CatalogError::Transient("Kugou WebView2 helper stdout is unavailable".to_owned())
+        })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            CatalogError::Transient("Kugou WebView2 helper stdin is unavailable".to_owned())
+        })?;
+        enum IoResult {
+            Input(std::io::Result<()>),
+            Output(Result<Vec<u8>, CatalogError>),
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let output_sender = sender.clone();
+        // Drain stdout before waiting for exit or finishing stdin: either pipe can fill.
+        // Avoid unbounded joins if a descendant retains a pipe beyond the deadline.
+        let _reader = std::thread::Builder::new()
+            .name("kugou-web-helper-stdout".to_owned())
+            .spawn(move || {
+                let result = read_kugou_web_helper_output(stdout);
+                let _ = output_sender.send(IoResult::Output(result));
+            })
+            .map_err(|error| CatalogError::Transient(error.to_string()))?;
+        let _writer = std::thread::Builder::new()
+            .name("kugou-web-helper-stdin".to_owned())
+            .spawn(move || {
+                let result = stdin.write_all(&input);
+                drop(stdin); // The helper reads the request through EOF.
+                let _ = sender.send(IoResult::Input(result));
+            })
+            .map_err(|error| CatalogError::Transient(error.to_string()))?;
+        let mut input_written = false;
+        let mut output = None;
+        loop {
+            let exited = child
+                .try_wait()
+                .map_err(|error| CatalogError::Transient(error.to_string()))?
+                .is_some();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(CatalogError::TimedOut(
+                    "Kugou WebView2 request timed out".to_owned(),
+                ));
+            }
+            if input_written && output.is_some() {
+                if exited {
+                    child
+                        .wait()
+                        .map_err(|error| CatalogError::Transient(error.to_string()))?;
+                    return Ok(output.unwrap());
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(25)));
+                continue;
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                Ok(IoResult::Input(result)) => {
+                    result.map_err(|error| CatalogError::Transient(error.to_string()))?;
+                    input_written = true;
+                }
+                Ok(IoResult::Output(result)) => output = Some(result?),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(CatalogError::Transient(
+                        "Kugou WebView2 helper I/O worker stopped".to_owned(),
+                    ));
+                }
+            }
+        }
+    })();
+    if result.is_err() {
+        // Includes stdin errors, response overflow, worker failures and deadline expiry.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 fn log_kugou_web_vip_response_shape(request: &Value, response: &Value) {
@@ -3105,6 +3171,226 @@ fn classify_request_error(error: reqwest::Error) -> CatalogError {
         CatalogError::TimedOut(error.to_string())
     } else {
         CatalogError::Transient(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod kugou_web_helper_tests {
+    use super::{
+        KUGOU_WEB_HELPER_MAX_RESPONSE_BYTES, collect_kugou_web_helper_output,
+        read_kugou_web_helper_output,
+    };
+    use crate::catalog::CatalogError;
+    use std::io::{Read, Write};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const PAYLOAD_BYTES: usize = 512 * 1024;
+    const FIXTURE_MODE: &str = "MILIASTRA_KUGOU_WEB_HELPER_TEST_MODE";
+
+    struct Fixture(Child);
+
+    impl Fixture {
+        fn spawn(mode: &str) -> Self {
+            Self(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "kugou_web_helper_tests::subprocess_fixture",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env(FIXTURE_MODE, mode)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "Subprocess fixture invoked by the helper I/O regression tests"]
+    fn subprocess_fixture() {
+        let Ok(mode) = std::env::var(FIXTURE_MODE) else {
+            return;
+        };
+        match mode.as_str() {
+            "stdout-first" => {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(b"{\"status\":\"success\",\"response\":\"")
+                    .unwrap();
+                stdout.write_all(&vec![b'x'; PAYLOAD_BYTES]).unwrap();
+                stdout.write_all(b"\"}\n").unwrap();
+                stdout.flush().unwrap();
+                let received =
+                    std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()).unwrap();
+                assert_eq!(received, PAYLOAD_BYTES as u64);
+            }
+            "oversized" => {
+                let _ = std::io::stdout()
+                    .write_all(&vec![b'x'; KUGOU_WEB_HELPER_MAX_RESPONSE_BYTES + 1]);
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            "stdin-closed" => {
+                // Only this isolated fixture owns the process stdin; close it to force BrokenPipe.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+                    unsafe {
+                        drop(std::fs::File::from_raw_handle(
+                            std::io::stdin().as_raw_handle(),
+                        ));
+                    }
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::fd::{AsRawFd, FromRawFd};
+                    unsafe {
+                        drop(std::fs::File::from_raw_fd(std::io::stdin().as_raw_fd()));
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            "sleep" => std::thread::sleep(Duration::from_secs(30)),
+            "exit" => {}
+            _ => panic!("unknown helper fixture mode"),
+        }
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn helper_drains_stdout_while_writing_stdin() {
+        let mut fixture = Fixture::spawn("stdout-first");
+        let output = collect_kugou_web_helper_output(
+            &mut fixture.0,
+            vec![b'y'; PAYLOAD_BYTES],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let line = output
+            .split(|byte| *byte == b'\n')
+            .find(|line| line.starts_with(b"{"))
+            .unwrap();
+        let prefix = b"{\"status\":\"success\",\"response\":\"";
+        assert!(line.starts_with(prefix));
+        assert_eq!(
+            &line[prefix.len()..prefix.len() + PAYLOAD_BYTES],
+            vec![b'x'; PAYLOAD_BYTES]
+        );
+        assert!(line.ends_with(b"\"}"));
+        assert!(fixture.0.try_wait().unwrap().unwrap().success());
+    }
+
+    #[test]
+    fn helper_rejects_oversized_stdout_and_reaps_child() {
+        let mut fixture = Fixture::spawn("oversized");
+        let result = collect_kugou_web_helper_output(
+            &mut fixture.0,
+            Vec::new(),
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(
+            matches!(result, Err(CatalogError::InvalidResponse(_))),
+            "{result:?}"
+        );
+        assert!(fixture.0.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn helper_deadline_covers_blocked_stdin_and_reaps_child() {
+        let mut fixture = Fixture::spawn("sleep");
+        let started = Instant::now();
+        let result = collect_kugou_web_helper_output(
+            &mut fixture.0,
+            vec![b'x'; PAYLOAD_BYTES],
+            started + Duration::from_millis(500),
+        );
+        assert!(
+            matches!(result, Err(CatalogError::TimedOut(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(fixture.0.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn helper_stdin_write_error_reaps_live_child() {
+        let mut fixture = Fixture::spawn("stdin-closed");
+        let result = collect_kugou_web_helper_output(
+            &mut fixture.0,
+            vec![b'x'; PAYLOAD_BYTES],
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(
+            matches!(result, Err(CatalogError::Transient(_))),
+            "{result:?}"
+        );
+        assert!(fixture.0.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn helper_deadline_covers_exit_and_stdout_eof_independently() {
+        for child_exited in [true, false] {
+            let mut exited = Fixture::spawn("exit");
+            // Child::wait closes its stdin; retain it for the subsequent I/O call.
+            let stdin = exited.0.stdin.take();
+            exited.0.wait().unwrap();
+            exited.0.stdin = stdin;
+            let mut live = Fixture::spawn("sleep");
+            // Keep libtest's unused startup pipe open so it cannot cause BrokenPipe.
+            let _live_stdout = if child_exited {
+                None
+            } else {
+                live.0.stdout.take()
+            };
+            // Model both inherited stdout after exit and stdout EOF before exit.
+            let child = if child_exited {
+                exited.0.stdout = live.0.stdout.take();
+                &mut exited.0
+            } else {
+                live.0.stdout = exited.0.stdout.take();
+                &mut live.0
+            };
+            let started = Instant::now();
+            let result = collect_kugou_web_helper_output(
+                child,
+                Vec::new(),
+                started + Duration::from_millis(500),
+            );
+            assert!(
+                matches!(result, Err(CatalogError::TimedOut(_))),
+                "{result:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(child.try_wait().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn helper_response_limit_is_inclusive() {
+        assert_eq!(
+            read_kugou_web_helper_output(
+                std::io::repeat(b'x').take(KUGOU_WEB_HELPER_MAX_RESPONSE_BYTES as u64)
+            )
+            .unwrap()
+            .len(),
+            KUGOU_WEB_HELPER_MAX_RESPONSE_BYTES,
+        );
+        assert!(matches!(
+            read_kugou_web_helper_output(
+                std::io::repeat(b'x').take((KUGOU_WEB_HELPER_MAX_RESPONSE_BYTES + 1) as u64)
+            ),
+            Err(CatalogError::InvalidResponse(_)),
+        ));
     }
 }
 

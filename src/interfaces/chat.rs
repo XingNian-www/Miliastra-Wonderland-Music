@@ -67,20 +67,21 @@ pub(crate) fn parse_command_envelope(
         );
     }
 
-    let separator_index = text.find(['：', ':', ']', '】'])?;
-    let username = if message_type == "pink" {
-        extract_bracket_username(text)?
+    let (username, body) = if message_type == "pink" || text.trim_start().starts_with(['[', '【'])
+    {
+        extract_bracket_sender(text)?
     } else {
-        text[..separator_index]
-            .trim_matches(['[', '【', ']', '】', ' ', '\t'])
-            .to_string()
+        let separator_index = text.find(['：', ':', ']', '】'])?;
+        let separator_len = text[separator_index..].chars().next()?.len_utf8();
+        (
+            text[..separator_index].trim().to_string(),
+            &text[separator_index + separator_len..],
+        )
     };
     if username.is_empty() {
         return None;
     }
-    let separator_len = text[separator_index..].chars().next()?.len_utf8();
-    let raw_command_text = text[separator_index + separator_len..]
-        .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
+    let raw_command_text = body.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
     CommandEnvelope::new(
         text,
         username.clone(),
@@ -148,18 +149,19 @@ impl ConsoleCommandIntent {
     }
 }
 
-fn extract_bracket_username(text: &str) -> Option<String> {
-    let (start, close) = if let Some(start) = text.find('[') {
-        (start, ']')
-    } else {
-        (text.find('【')?, '】')
-    };
-    let end = text[start + 1..].find(close)? + start + 1;
-    let username = text[start + 1..end].trim();
+fn extract_bracket_sender(text: &str) -> Option<(String, &str)> {
+    let (start, open) = text
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '[' | '【'))?;
+    let close = if open == '[' { ']' } else { '】' };
+    let name_start = start + open.len_utf8();
+    let end = name_start + text[name_start..].find(close)?;
+    let username = text[name_start..end].trim();
     if username.is_empty() {
         None
     } else {
-        Some(username.to_string())
+        // Split after the closing bracket so punctuation inside a nickname is preserved.
+        Some((username.to_string(), &text[end + close.len_utf8()..]))
     }
 }
 
@@ -246,6 +248,43 @@ mod tests {
         assert_eq!(envelope.command_text(), "点歌 晴天 周杰伦");
         assert_eq!(envelope.prefix(), CommandPrefix::At);
         assert_eq!(envelope.authority(), CommandAuthority::HallMember);
+    }
+
+    #[test]
+    fn bracket_sender_preserves_unicode_and_nickname_punctuation() {
+        for (text, message_type) in [
+            ("【阿：明】：@点歌 晴天 周杰伦", "pink"),
+            ("前置噪声【阿：明】：@点歌 晴天 周杰伦", "pink"),
+            ("【阿：明】：@点歌 晴天 周杰伦", "blue"),
+            ("[阿：明]：@点歌 晴天 周杰伦", "blue"),
+            ("[阿：明]：@点歌 晴天 周杰伦", "pink"),
+        ] {
+            let parsed = parse_text(text, message_type).expect("valid bracket sender");
+            assert_eq!(parsed.username, "阿：明");
+            assert_eq!(parsed.user_command, "@点歌 晴天 周杰伦");
+        }
+        for text in [
+            "【】：@暂停",
+            "【昵称：@暂停",
+            "[ ]：@暂停",
+            "【昵称]：@暂停",
+        ] {
+            assert!(parse_text(text, "pink").is_none(), "text={text}");
+        }
+    }
+
+    #[test]
+    fn fullwidth_at_prefix_routes_without_changing_song_parameters() {
+        for (text, message_type) in [
+            ("用户：＠点歌 晴天 周杰伦", "blue"),
+            ("【用户】：＠点歌 晴天 周杰伦", "pink"),
+        ] {
+            let parsed = parse_text(text, message_type).expect("fullwidth at command");
+            let ModuleCommand::SongRequest(song) = parsed.command else {
+                panic!("expected song request");
+            };
+            assert_eq!(song.keyword, "晴天 周杰伦");
+        }
     }
 
     #[test]

@@ -2058,7 +2058,6 @@ mod tests {
     /// 保留为本轮实测记录：
     /// 第 46 节实机因此把提瓦特判成了千星大厅。现在标记路径必须同时命中大厅底栏
     /// 的 👥 O 图标组（实测间隔 0.3944），提瓦特底栏只有一个 Enter，会落空。
-    #[test]
     /// **第 47 节：暂时忽略。** 这条测试写的是我们**想要**的行为，但当前做不到：
     /// 试过用「大厅底栏 👥 O」否决提瓦特的世界聊天气泡，实测分离度 0.3944 看着很好，
     /// **但真实大厅帧会漏检**——底栏除了横竖位移还会**缩放**（overworld-hub.png 里
@@ -2074,7 +2073,9 @@ mod tests {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         // 语料跨两个目录：证据目录与运行目录，两边都要找。
         let classify = |name: &str| {
-            let path = if std::path::Path::new(&format!("technical-docs/ui-state-evidence/{name}")).exists() {
+            let path = if std::path::Path::new(&format!("technical-docs/ui-state-evidence/{name}"))
+                .exists()
+            {
                 format!("technical-docs/ui-state-evidence/{name}")
             } else {
                 format!("dist/sandbox-run/{name}")
@@ -2625,7 +2626,6 @@ mod tests {
         }
     }
 
-    #[ignore = "第47节：底栏判据因缩放不可用，等更好的判据"]
     #[test]
     fn chat_markers_need_the_hall_bottom_bar_to_mean_the_hall() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -2825,7 +2825,8 @@ mod tests {
     /// 距离掉回 ≈±1 的水平。**阈值本身一个字没动**——这是原理性修法，不是调阈值。
     #[test]
     fn qianxing_player_panel_survives_small_pixel_shifts() {
-        let base = image::open("technical-docs/ui-state-evidence/qianxing-ui-59/r10-now.jpg").unwrap();
+        let base =
+            image::open("technical-docs/ui-state-evidence/qianxing-ui-59/r10-now.jpg").unwrap();
         let (width, height) = (base.width(), base.height());
         for (dx, dy) in [(1, 0), (-1, 0), (2, 0), (-2, 0), (3, 0), (-3, 0)] {
             // 与扰动生成脚本同样的做法：画到同尺寸画布上，空出来的边角是黑的。
@@ -2840,7 +2841,8 @@ mod tests {
             );
         }
         // 负样本也要能平移：千星大厅整体平移后仍然不能命中。
-        let hall = image::open("technical-docs/ui-state-evidence/qianxing-ui-59/start-hall.jpg").unwrap();
+        let hall =
+            image::open("technical-docs/ui-state-evidence/qianxing-ui-59/start-hall.jpg").unwrap();
         for dx in [0_i64, 1, -1, 3, -3] {
             let mut canvas = image::RgbaImage::new(width, height);
             image::imageops::replace(&mut canvas, &hall.to_rgba8(), dx, 0);

@@ -127,6 +127,14 @@ struct BodyRouteSpec {
 
 const BODY_ROUTES: &[BodyRouteSpec] = &[
     BodyRouteSpec {
+        path: "/debug/read-only/mode",
+        handler: debug_read_only_mode_set_route,
+    },
+    BodyRouteSpec {
+        path: "/debug/read-only/read",
+        handler: debug_read_only_read_route,
+    },
+    BodyRouteSpec {
         path: "/debug/tasks",
         handler: debug_task_save_route,
     },
@@ -173,6 +181,24 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
 ];
 
 const ROUTES: &[RouteSpec] = &[
+    RouteSpec {
+        path: "/debug/read-only/mode",
+        json: true,
+        mutating: false,
+        handler: debug_read_only_mode_route,
+    },
+    RouteSpec {
+        path: "/debug/read-only/evidence",
+        json: true,
+        mutating: false,
+        handler: debug_read_only_evidence_route,
+    },
+    RouteSpec {
+        path: "/debug/read-only/entries",
+        json: true,
+        mutating: false,
+        handler: debug_read_only_entries_route,
+    },
     RouteSpec {
         path: "/debug/tasks",
         json: true,
@@ -1181,7 +1207,7 @@ fn handle_request(
     if request.path == "/debug/screenshot" {
         return debug_screenshot_response(&request, state);
     }
-    if request.path == "/debug/events" {
+    if request.path == "/debug/events" || request.path == "/debug/read-only/events" {
         return debug_events_response(&request, state);
     }
     if request.path == "/screenshot" {
@@ -1270,6 +1296,7 @@ fn parse_json_body<T: DeserializeOwned>(
 
 fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedState) {
     if request.path.starts_with("/tools/")
+        || request.path.starts_with("/debug/read-only/")
         || matches!(
             request.path.as_str(),
             "/history"
@@ -1510,6 +1537,7 @@ fn enforce_method(
             | "/hall-screenshot"
             | "/debug/screenshot"
             | "/debug/state"
+            | "/debug/read-only/events"
             | "/favicon.ico"
     ) && request.method != "GET"
     {

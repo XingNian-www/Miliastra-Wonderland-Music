@@ -239,15 +239,6 @@ fn default_debug_mode() -> String {
     "simulated".into()
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct HttpDebugEvidence {
-    pub index: usize,
-    pub result: crate::debug_sandbox::SandboxCommandResult,
-    pub mime_type: Option<&'static str>,
-    pub image_png_base64: Option<String>,
-}
-
 pub(crate) trait HttpDebugPort: Send + Sync {
     fn sandbox(&self) -> &crate::debug_http_service::DebugHttpService;
 

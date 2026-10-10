@@ -480,6 +480,276 @@ fn debug_sandbox_http_task_run_evidence_and_token_round_trip() {
     server.shutdown().unwrap();
 }
 
+#[cfg(feature = "ocr-mnn")]
+#[test]
+#[ignore = "requires actual local screenshot and CPU MNN assets; run isolated"]
+fn debug_http_read_only_actual_frame_mnn_evidence() {
+    use crate::debug_read_only::{ReadOnlyState, observer};
+    use crate::runtime::ocr::{OcrArgs, OcrPriority, OcrRuntime, ProductionOcrDevice};
+    use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
+    struct Restore(bool, ReadOnlyState);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            observer().set_enabled_state(self.0, self.1);
+        }
+    }
+    struct ImageOnly(DynamicImage);
+    impl crate::runtime::ui::UiDevice for ImageOnly {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            Ok(self.0.clone())
+        }
+    }
+    let _restore = Restore(observer().enabled(), observer().state());
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config = crate::config::AppConfig::load_from_root(
+        &root.join("tests/fixtures/config.full.yaml"),
+        root,
+    )
+    .unwrap();
+    assert_eq!(config.ocr.min_confidence, 0.9);
+    assert_eq!(config.ocr.backend_priority, ["cpu"]);
+    let actual =
+        image::open(root.join("technical-docs/actual-screenshot-test/live/live-01.png")).unwrap();
+    let ui = crate::runtime::ui::UiRuntime::start_with_state_classifier(
+        ImageOnly(actual),
+        8,
+        TemplateUiStateClassifier::new(
+            UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+            config.screen.clone(),
+        ),
+        2,
+    )
+    .unwrap();
+    let ocr = OcrRuntime::start(
+        ProductionOcrDevice::new(OcrArgs::default().resolve(&config.ocr)).unwrap(),
+        8,
+    )
+    .unwrap();
+    let handle = ocr.handle();
+    let mut state = test_state();
+    state.application.debug = Some(Arc::new(HttpTestDebugPort {
+        sandbox: crate::debug_http_service::DebugHttpService::new(Some(ui.handle())).with_ocr(
+            Arc::new(move |image| {
+                handle
+                    .merged_text(image.clone(), 2, OcrPriority::Diagnostic)
+                    .map_err(|e| e.to_string())
+            }),
+        ),
+    }));
+    let server = start_test_http_server(&mut state, "readonly-test");
+    let address = server.local_addr();
+    let enabled = http_post_json(
+        address,
+        "/debug/read-only/mode",
+        &json!({"enabled":true,"state":"active"}).to_string(),
+        Some("readonly-test"),
+    );
+    assert_eq!(enabled.status_line, "HTTP/1.1 200 OK", "{}", enabled.body);
+    let request = json!({"label":"real-original-command-ocr","ocr":true,"rect":{"x":410,"y":502,"width":378,"height":65}});
+    let response = http_post_json(
+        address,
+        "/debug/read-only/read",
+        &request.to_string(),
+        Some("readonly-test"),
+    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(
+        value["evidence"]["task"]["ocr"]["text"],
+        "@点歌Flashbang dance"
+    );
+    assert_eq!(value["evidence"]["source"]["width"], 1920);
+    assert_eq!(value["evidence"]["source"]["height"], 1080);
+    assert_eq!(
+        observer().bus().latest_sequence(),
+        0,
+        "active evidence must not be pushed"
+    );
+    let output = root.join("technical-docs/sandbox-read-only/evidence/actual-frame-mnn");
+    fs::create_dir_all(&output).unwrap();
+    fs::write(
+        output.join("response.json"),
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        output.join("request.json"),
+        serde_json::to_vec_pretty(&request).unwrap(),
+    )
+    .unwrap();
+    let bytes = crate::debug_http_service::base64_decode(
+        value["evidence"]["source"]["imagePngBase64"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(output.join("original.png"), bytes).unwrap();
+    fs::write(output.join("provenance.json"),serde_json::to_vec_pretty(&json!({"source":"actual-screenshot-test/live/live-01.png","actualGameCaptureDuringTest":false,"actualBusinessCommandExecuted":false,"confidence":0.9,"backend":"cpu"})).unwrap()).unwrap();
+    let frame = ui.handle().latest_frame().expect("active capture source");
+    let switched = http_post_json(
+        address,
+        "/debug/read-only/mode",
+        &json!({"enabled":true,"state":"push"}).to_string(),
+        Some("readonly-test"),
+    );
+    assert_eq!(switched.status_line, "HTTP/1.1 200 OK");
+    let cursor = observer().bus().latest_sequence();
+    crate::debug_events::bus().publish(
+        "ordinary.chat",
+        json!({"text":"ordinary chat must not push"}),
+    );
+    let silent = http_get(
+        address,
+        &format!("/debug/read-only/events?drain=true&since={cursor}"),
+        Some("readonly-test"),
+    );
+    assert!(silent.body.is_empty());
+    observer().cache_frame(frame.clone());
+    observer().record_immediate(json!({"kind":"test-hook-command","parameters":{"keyword":"Flashbang dance"},"actualBusinessCommandExecuted":false}),Some(frame.captured_at()),"diagnostic hook only".into());
+    let pushed = http_get(
+        address,
+        &format!("/debug/read-only/events?drain=true&since={cursor}"),
+        Some("readonly-test"),
+    );
+    assert_eq!(pushed.status_line, "HTTP/1.1 200 OK");
+    assert!(pushed.body.contains("event: readonly.triggered"));
+    assert!(!pushed.body.contains("ordinary chat"));
+    let event: Value = serde_json::from_str(
+        pushed
+            .body
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    let detail = http_get(
+        address,
+        event["evidenceUrl"].as_str().unwrap(),
+        Some("readonly-test"),
+    );
+    let pushvalue: Value = serde_json::from_str(&detail.body).unwrap();
+    assert_eq!(pushvalue["evidence"]["source"]["frameId"], frame.id());
+    assert_eq!(
+        pushvalue["evidence"]["source"]["pixelSha256"],
+        value["evidence"]["source"]["pixelSha256"]
+    );
+    fs::write(
+        output.join("push-response.json"),
+        serde_json::to_vec_pretty(&pushvalue).unwrap(),
+    )
+    .unwrap();
+    fs::write(output.join("events.sse"), pushed.body).unwrap();
+    server.shutdown().unwrap();
+    assert!(!ui.shutdown().unwrap().timed_out());
+    ocr.shutdown().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires actual game window; changes global read-only mode; run in isolation"]
+fn debug_http_read_only_active_live_evidence_smoke() {
+    use crate::debug_http_service::base64_decode;
+    use crate::debug_read_only::{ReadOnlyState, observer};
+    use sha2::Digest;
+    struct RestoreMode(bool, ReadOnlyState);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            observer().set_enabled_state(self.0, self.1);
+        }
+    }
+    let _restore = RestoreMode(observer().enabled(), observer().state());
+    crate::adapters::windows::dpi::set_process_dpi_awareness();
+    let runtime = crate::runtime::ui::UiRuntime::start(
+        crate::adapters::windows::WindowsUiDevice::new(crate::config::WindowConfig::default()),
+        8,
+    )
+    .expect("actual UI worker");
+    let mut state = test_state();
+    state.application.debug = Some(Arc::new(HttpTestDebugPort {
+        sandbox: crate::debug_http_service::DebugHttpService::new(Some(runtime.handle())),
+    }));
+    let server = start_test_http_server(&mut state, "readonly-test");
+    let address = server.local_addr();
+    let before = (
+        crate::debug_mode::enabled(),
+        crate::debug_mode::generation(),
+    );
+    let mode = json!({"enabled":true,"state":"active"}).to_string();
+    assert_eq!(
+        http_post_json(address, "/debug/read-only/mode", &mode, None).status_line,
+        "HTTP/1.1 401 Unauthorized"
+    );
+    let response = http_post_json(
+        address,
+        "/debug/read-only/mode",
+        &mode,
+        Some("readonly-test"),
+    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let denied = http_post_json(
+        address,
+        "/debug/command",
+        &json!({"press_key":{"key":"Enter"}}).to_string(),
+        Some("readonly-test"),
+    );
+    assert_eq!(
+        denied.status_line, "HTTP/1.1 400 Bad Request",
+        "{}",
+        denied.body
+    );
+    let response = http_post_json(
+        address,
+        "/debug/read-only/read",
+        &json!({"label":"actual-game-active-read","ocr":false,"rect":null}).to_string(),
+        Some("readonly-test"),
+    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let evidence: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(evidence["evidence"]["kind"], "active");
+    let source = &evidence["evidence"]["source"];
+    assert_eq!(
+        (
+            source["width"].as_u64().unwrap(),
+            source["height"].as_u64().unwrap()
+        ),
+        (1920, 1080)
+    );
+    assert_eq!(source["canvas"], "rawGame");
+    let bytes = base64_decode(source["imagePngBase64"].as_str().unwrap()).unwrap();
+    let image = image::load_from_memory(&bytes).unwrap();
+    assert_eq!((image.width(), image.height()), (1920, 1080));
+    assert_eq!(
+        format!("{:x}", sha2::Sha256::digest(image.as_bytes())),
+        source["pixelSha256"]
+    );
+    let original = image.as_bytes().first().copied().unwrap();
+    assert!(image.as_bytes().iter().any(|pixel| *pixel != original));
+    let since = observer().bus().latest_sequence();
+    let events = http_get(
+        address,
+        &format!("/debug/read-only/events?drain=true&since={since}"),
+        Some("readonly-test"),
+    );
+    assert_eq!(events.status_line, "HTTP/1.1 200 OK");
+    assert!(events.body.is_empty(), "active reads must not push events");
+    let output = PathBuf::from("technical-docs/sandbox-read-only/evidence/live-active");
+    fs::create_dir_all(&output).unwrap();
+    fs::write(
+        output.join("response.json"),
+        serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+    fs::write(output.join("original.png"), bytes).unwrap();
+    fs::write(output.join("requests.json"),serde_json::to_vec_pretty(&json!({"mode":{"enabled":true,"state":"active"},"read":{"label":"actual-game-active-read","ocr":false,"rect":null},"writeRejected":{"press_key":{"key":"Enter"}},"deniedStatus":denied.status_line,"activeSseEvents":0,"scope":"actual live capture through authenticated HTTP; OCR disabled; no business trigger"})).unwrap()).unwrap();
+    let after = (
+        crate::debug_mode::enabled(),
+        crate::debug_mode::generation(),
+    );
+    assert_eq!(before, after, "read-only must not toggle normal debug mode");
+    server.shutdown().unwrap();
+    assert!(!runtime.shutdown().unwrap().timed_out());
+}
+
 #[cfg(windows)]
 #[test]
 #[ignore = "requires a visible running game window on the desktop"]
@@ -2435,8 +2705,7 @@ workflows:
     )
     .expect("custom workflow config");
     let default_config: AppConfig =
-        serde_norway::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
-            .expect("default config");
+        serde_norway::from_str(crate::config::bundled_config_yaml()).expect("default config");
     state.application.commands = Arc::new(ApplicationHttpCommandFacade::new(
         state.recording.clone(),
         custom_workflow_service_from_config_parts(
@@ -2575,6 +2844,18 @@ fn web_tool_ocr_rejects_malformed_rect_as_client_error() {
 }
 
 #[test]
+fn web_tool_ocr_rejects_rects_clamped_to_empty_without_enqueueing() {
+    let state = test_state();
+    for rect in ["1920,0,1,1", "0,1080,1,1", "2147483647,2147483647,1,1"] {
+        let error = tool_ocr_route(&[("rect".to_string(), rect.to_string())], &state)
+            .expect_err("outside rect rejected");
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("rect参数无效"));
+    }
+    assert!(state.recording.diagnostic_requests().is_empty());
+}
+
+#[test]
 fn web_tool_templates_expose_configured_fixed_regions() {
     let state = test_state();
     let body = tool_templates_route(&[], &state).expect("template list");
@@ -2695,8 +2976,7 @@ fn web_tool_templates_expose_configured_fixed_regions() {
 #[test]
 fn remote_http_api_requires_token_when_configured() {
     let mut config: AppConfig =
-        serde_norway::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
-            .expect("default config");
+        serde_norway::from_str(crate::config::bundled_config_yaml()).expect("default config");
     config.http.host = "0.0.0.0".to_string();
     config.http.access_token = "secret".to_string();
     let request = Request {
@@ -3820,8 +4100,7 @@ fn test_state_with_player_port_and_bootstrap_token(
     access_token: &str,
 ) -> HttpTestState {
     let mut config: AppConfig =
-        serde_norway::from_str(include_str!("../../../../tests/fixtures/config.full.yaml"))
-            .expect("default config");
+        serde_norway::from_str(crate::config::bundled_config_yaml()).expect("default config");
     // 配置中心的 bootstrap 注入值：非空时用于验证 http.access_token 脱敏。
     config.http.access_token = access_token.to_string();
     let monitor = MonitorShared::new(20);

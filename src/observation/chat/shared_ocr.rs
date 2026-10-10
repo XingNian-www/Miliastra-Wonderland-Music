@@ -62,6 +62,10 @@ struct State {
     business_pending: HashSet<ObservedChatMessageId>,
     unread_baseline: HashSet<ObservedChatMessageId>,
     business_claimed: HashSet<ObservedChatMessageId>,
+    active_business_claims: HashSet<ObservedChatMessageId>,
+    ignored_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
+    latest_business_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
+    revision_delivery_fences: HashMap<ObservedChatMessageId, Instant>,
     command_locks: HashMap<ChatIdentity, CommandLock>,
     next_command_lock_activity: u64,
     unread_delivery_fences: HashMap<ObservedChatMessageId, Instant>,
@@ -80,6 +84,48 @@ struct Tracker {
     next_sequence: u64,
     initialized: bool,
     visible: Vec<SharedChatMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BusinessMessageRevision {
+    text: String,
+    sender: Option<String>,
+    raw_sender: Option<String>,
+}
+
+impl BusinessMessageRevision {
+    fn new(text: &str, sender: Option<&str>, raw_sender: Option<&str>) -> Self {
+        let identity = |value: Option<&str>| {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        Self {
+            text: text.trim().to_owned(),
+            sender: identity(sender),
+            raw_sender: identity(raw_sender),
+        }
+    }
+
+    fn from_message(message: &SharedChatMessage) -> Self {
+        Self::new(
+            &message.text,
+            message.sender.as_deref(),
+            message.raw_sender.as_deref(),
+        )
+    }
+
+    fn corrects(&self, ignored: &Self) -> bool {
+        !self.text.is_empty() && self != ignored
+    }
+}
+
+#[derive(Clone)]
+struct CapturedBusinessRevision {
+    captured_at: Instant,
+    revision: BusinessMessageRevision,
+    y: Option<i32>,
 }
 
 /// 每个聊天一份的命令锁：记录最近"已认领并派发成功"的命令文本与屏幕位置。
@@ -116,10 +162,12 @@ impl CommandLock {
     /// anchor_matched(msg)：锁中存在条目满足 normalize(entry.text) == normalize(msg.text)
     /// 且 msg.block.y <= entry.y + TOLERANCE（一行高）。
     fn matches(&self, message: &SharedChatMessage) -> bool {
-        let text = normalize_command_lock_text(&message.text);
-        self.entries
-            .iter()
-            .any(|entry| entry.matches(&text, message.block.y))
+        self.matches_text_at(&message.text, message.block.y)
+    }
+
+    fn matches_text_at(&self, text: &str, y: i32) -> bool {
+        let text = normalize_command_lock_text(text);
+        self.entries.iter().any(|entry| entry.matches(&text, y))
     }
 
     /// 同一条文本再次写入时只更新位置并复位缺失计数，不重复追加；超出容量丢弃最旧。
@@ -171,9 +219,28 @@ struct Subscription {
     durable_business: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct NoChatRefreshError(String);
+
+#[derive(Clone)]
+enum RefreshFailure {
+    NoChat(String),
+    Failure(String),
+}
+
+impl RefreshFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::NoChat(reason) => NoChatRefreshError(reason).into(),
+            Self::Failure(reason) => anyhow!(reason),
+        }
+    }
+}
+
 struct Refresh {
     requested_at: Instant,
-    outcome: Option<std::result::Result<Option<ChatOcrSnapshot>, String>>,
+    outcome: Option<std::result::Result<Option<ChatOcrSnapshot>, RefreshFailure>>,
 }
 
 /// Each handle owns its queue; dropping it never changes another subscriber.
@@ -192,6 +259,7 @@ pub(crate) struct SharedBusinessClaim {
     /// （执行完成时气泡可能已经滚出 visible/latest）。
     text: String,
     y: i32,
+    captured_at: Instant,
     committed: bool,
 }
 
@@ -201,11 +269,38 @@ impl SharedBusinessClaim {
         self.commit(true)
     }
 
-    /// 非命令（普通闲聊/未路由/被禁用）的提交点：只确认已处理，**绝不写命令锁**。
+    /// 主动丢弃、被禁用或已处理的非命令永久消费，**绝不写命令锁**。
     /// 缺陷 1：二级/好友路径若在这里也写锁，普通闲聊会把真命令条目 FIFO 挤出，
     /// 重建后仍在屏上的已执行命令会重跑。
     pub(crate) fn complete_ignored(mut self) -> Result<()> {
         self.commit(false)
+    }
+
+    /// 未路由或空正文只忽略被认领的修订；有效正文/身份修订可再次交付。
+    /// 身份参数必须来自被消费的快照，不能回查可能已经更新的 tracker。
+    pub(crate) fn complete_unrecognized(
+        mut self,
+        sender: Option<&str>,
+        raw_sender: Option<&str>,
+    ) -> Result<()> {
+        {
+            let mut state = self.shared.lock()?;
+            if matches!(self.id.chat, ChatIdentity::Friend(_))
+                && state.friend_suppression_generation != self.suppression_generation
+            {
+                acknowledge_business_locked(&mut state, &self.id);
+            } else {
+                acknowledge_ignored_locked(
+                    &mut state,
+                    &self.id,
+                    self.captured_at,
+                    BusinessMessageRevision::new(&self.text, sender, raw_sender),
+                    true,
+                );
+            }
+        }
+        self.committed = true;
+        Ok(())
     }
 
     /// Drop（派发失败）只撤销认领，绝不写记录，否则真失败的命令会被永久吞掉。
@@ -224,13 +319,15 @@ impl SharedBusinessClaim {
 
 impl Drop for SharedBusinessClaim {
     fn drop(&mut self) {
-        // 提交成功后认领墓碑必须保留：一旦 Drop 无条件移除 business_claimed，
-        // 同一 id 就还能再次进入 business_pending，而下游去重只覆盖"已入队未启动"，
-        // 执行完成后不再拦截，会造成真实重复执行。
+        // 命令成功或永久忽略后的墓碑必须保留；可修订忽略已在提交时释放认领。
+        // Drop 只能回滚仍然活动的失败认领，不能撤销期间发生的永久 ACK。
         if self.committed {
             return;
         }
         if let Ok(mut state) = self.shared.inner.state.lock() {
+            if !state.active_business_claims.remove(&self.id) {
+                return;
+            }
             state.business_claimed.remove(&self.id);
             if !matches!(self.id.chat, ChatIdentity::Friend(_))
                 || state.friend_suppression_generation == self.suppression_generation
@@ -267,6 +364,10 @@ impl SharedChatOcr {
                     business_pending: HashSet::new(),
                     unread_baseline: HashSet::new(),
                     business_claimed: HashSet::new(),
+                    active_business_claims: HashSet::new(),
+                    ignored_revisions: HashMap::new(),
+                    latest_business_revisions: HashMap::new(),
+                    revision_delivery_fences: HashMap::new(),
                     command_locks: HashMap::new(),
                     next_command_lock_activity: 0,
                     unread_delivery_fences: HashMap::new(),
@@ -394,7 +495,7 @@ impl SharedChatOcr {
                 anyhow!("unknown or expired shared chat OCR refresh token {request}")
             })?;
             if let Some(outcome) = &refresh.outcome {
-                return outcome.clone().map_err(|reason| anyhow!(reason));
+                return outcome.clone().map_err(RefreshFailure::into_error);
             }
             let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
                 return Ok(None);
@@ -460,8 +561,7 @@ impl SharedChatOcr {
         //   initial 帧（Tracker 新 tracker）：is_new = !anchor_matched(msg)；
         //   非 initial 帧：保留 Tracker::observe 的 is_new，只把命中的强制压回未新，
         //                  绝不把未命中的置新。
-        // 锁为空 + initial ⇒ 所有消息 is_new=true：新命令要执行，启动首屏由
-        // chat_baseline_primed 另行兜底。
+        // 锁为空 + initial ⇒ 蓝色等非粉色消息可以交付；仅粉色首屏历史在下方抑制。
         let lock_empty = {
             // 这是当前视图在用的聊天：刷新活跃度，供桶淘汰时区分一次性抖动桶。
             state.next_command_lock_activity = state.next_command_lock_activity.wrapping_add(1);
@@ -491,6 +591,11 @@ impl SharedChatOcr {
             // 聊天桶清空即移除，避免无界增长。
             state.command_locks.remove(&chat);
         }
+        if !observed.is_empty() {
+            state.ignored_revisions.retain(|id, _| {
+                id.chat != chat || observed.iter().any(|message| message.id == *id)
+            });
+        }
         state.unread_baseline.retain(|id| {
             id.chat != chat
                 || observed.is_empty()
@@ -501,16 +606,96 @@ impl SharedChatOcr {
                 message.is_new = false;
                 state.business_pending.remove(&message.id);
                 state.unread_baseline.remove(&message.id);
-            } else if initial && matches!(chat, ChatIdentity::Friend(_)) {
-                // 好友首屏（含窗口重建后的首帧）保持被动基线：只有用户点未读才交付。
-                // 命令锁的 initial 判定不能改变这条既有语义，所以这里把 is_new 压回未新。
+                state.ignored_revisions.remove(&message.id);
+                state.latest_business_revisions.remove(&message.id);
+                state.revision_delivery_fences.remove(&message.id);
+                state.business_claimed.insert(message.id.clone());
+            } else if initial && message.message_type == "pink" {
+                // 首屏历史仅按粉色消息判定，不按会话权限或昵称角色判定。
+                // 蓝色大厅命令照常交付；粉色首屏只允许未读流程提升所选气泡。
                 message.is_new = false;
                 state.business_pending.remove(&message.id);
-                state.unread_baseline.insert(message.id.clone());
-            } else if message.is_new && !state.business_claimed.contains(&message.id) {
-                state.business_pending.insert(message.id.clone());
+                if state
+                    .command_locks
+                    .get(&chat)
+                    .is_some_and(|lock| lock.matches(message))
+                {
+                    // 未读提升不能把视图重建前已成功的命令重新派发。
+                    state.unread_baseline.remove(&message.id);
+                    state.business_claimed.insert(message.id.clone());
+                } else {
+                    state.unread_baseline.insert(message.id.clone());
+                }
+            } else if state.business_claimed.contains(&message.id) {
+                message.is_new = false;
+            } else {
+                if let Some(ignored) = state.ignored_revisions.get(&message.id) {
+                    let corrected = captured_at >= ignored.captured_at
+                        && BusinessMessageRevision::from_message(message)
+                            .corrects(&ignored.revision);
+                    if corrected {
+                        if state
+                            .command_locks
+                            .get(&chat)
+                            .is_some_and(|lock| lock.matches(message))
+                        {
+                            // 有效修订仍命中已执行命令锁，不能由 ignored 恢复资格绕过它。
+                            acknowledge_business_locked(&mut state, &message.id);
+                            message.is_new = false;
+                        } else {
+                            state.ignored_revisions.remove(&message.id);
+                            state
+                                .revision_delivery_fences
+                                .insert(message.id.clone(), captured_at);
+                            message.is_new = true;
+                            set_business_new_locked(&mut state, &message.id, true);
+                        }
+                    } else {
+                        message.is_new = false;
+                    }
+                }
+                if message.is_new {
+                    state.business_pending.insert(message.id.clone());
+                }
             }
         }
+        for message in &observed {
+            if !suppress
+                && (state.business_pending.contains(&message.id)
+                    || state.active_business_claims.contains(&message.id)
+                    || state.ignored_revisions.contains_key(&message.id))
+            {
+                let revision = BusinessMessageRevision::from_message(message);
+                let retains_nonempty = revision.text.is_empty()
+                    && state
+                        .latest_business_revisions
+                        .get(&message.id)
+                        .is_some_and(|current| !current.revision.text.is_empty());
+                if !retains_nonempty {
+                    // 空 OCR 是退化观测，不能盖掉尚未消费的有效非空正文及其捕获边界。
+                    state.latest_business_revisions.insert(
+                        message.id.clone(),
+                        CapturedBusinessRevision {
+                            captured_at,
+                            revision,
+                            y: Some(message.block.y),
+                        },
+                    );
+                }
+            }
+        }
+        let State {
+            latest_business_revisions,
+            business_pending,
+            active_business_claims,
+            ignored_revisions,
+            ..
+        } = &mut *state;
+        latest_business_revisions.retain(|id, _| {
+            business_pending.contains(id)
+                || active_business_claims.contains(id)
+                || ignored_revisions.contains_key(id)
+        });
         let snapshot = ChatOcrSnapshot {
             captured_at,
             visual_session,
@@ -540,17 +725,21 @@ impl SharedChatOcr {
                     .is_some_and(|session| session != snapshot.visual_session);
                 if session_changed {
                     // 同一个聊天里的视图重建（机器人自己发言、面板滚动、重新申请帧）会让视觉会话号自增。
-                    // 这不是错误：改绑到新会话、重置基线，读者继续等待，窗口不再被自己的回复杀死。
+                    // 确认读者重置基线继续等待；业务读者保留尚未消费的旧会话快照。
                     log::info!(
                         "共享聊天读者改绑新视觉会话: session={:?} -> {:?}",
                         subscriber.session,
                         snapshot.visual_session
                     );
-                    subscriber.queue.clear();
+                    if !subscriber.durable_business {
+                        subscriber.queue.clear();
+                    }
                 } else if subscriber.session.is_none() && subscriber.chat.is_some() {
                     // 聊天视图曾瞬态消失；同一聊天恢复后重新绑定，不丢后续消息。
                     log::info!("共享聊天读者在聊天恢复后重新绑定: chat={:?}", snapshot.chat);
-                    subscriber.queue.clear();
+                    if !subscriber.durable_business {
+                        subscriber.queue.clear();
+                    }
                 }
                 subscriber.session = Some(snapshot.visual_session);
                 subscriber.queue.push_back(snapshot.clone());
@@ -579,6 +768,19 @@ impl SharedChatOcr {
         state.latest = None;
         // A disappeared view starts new visual sessions on its next appearance.
         state.trackers.clear();
+        state.ignored_revisions.clear();
+        let State {
+            revision_delivery_fences,
+            business_pending,
+            business_claimed,
+            active_business_claims,
+            latest_business_revisions,
+            ..
+        } = &mut *state;
+        revision_delivery_fences
+            .retain(|id, _| business_pending.contains(id) || business_claimed.contains(id));
+        latest_business_revisions
+            .retain(|id, _| business_pending.contains(id) || active_business_claims.contains(id));
         // 缺陷 3：视图重建不是“条目已滚出屏幕”的证据。这里清零各条目的 missing_frames
         // （保留条目本身），否则重建前累计到 1 的计数会在重建后第 1 个可信帧凑满 2，
         // 把仍在屏上的条目误删，导致已执行命令重跑。
@@ -596,10 +798,12 @@ impl SharedChatOcr {
             // 聊天视图瞬态消失（机器人自己发言、面板滚动、重新申请帧）不应立刻杀死确认读者。
             // 这里只清空队列并作废已绑定的视觉会话，等同一聊天重新出现后在 publish 里改绑；
             // 真正的失败仍由 report_failure 毒化，窗口自身的超时兜底结束。
-            subscriber.queue.clear();
+            if !subscriber.durable_business {
+                subscriber.queue.clear();
+            }
             subscriber.session = None;
         }
-        complete_refreshes(&mut state, captured_at, Err(reason));
+        complete_refreshes(&mut state, captured_at, Err(RefreshFailure::NoChat(reason)));
         self.inner.changed.notify_all();
         Ok(())
     }
@@ -618,7 +822,7 @@ impl SharedChatOcr {
             .values_mut()
             .filter(|request| request.outcome.is_none())
         {
-            request.outcome = Some(Err(reason.clone()));
+            request.outcome = Some(Err(RefreshFailure::Failure(reason.clone())));
         }
         self.inner.changed.notify_all();
         Ok(())
@@ -635,6 +839,15 @@ impl SharedChatOcr {
             .business_pending
             .retain(|id| !matches!(id.chat, ChatIdentity::Friend(_)));
         state.unread_baseline.clear();
+        state
+            .ignored_revisions
+            .retain(|id, _| !matches!(id.chat, ChatIdentity::Friend(_)));
+        state
+            .latest_business_revisions
+            .retain(|id, _| !matches!(id.chat, ChatIdentity::Friend(_)));
+        state
+            .revision_delivery_fences
+            .retain(|id, _| !matches!(id.chat, ChatIdentity::Friend(_)));
         for (chat, tracker) in &mut state.trackers {
             if matches!(chat, ChatIdentity::Friend(_)) {
                 for message in &mut tracker.visible {
@@ -674,11 +887,38 @@ impl SharedChatOcr {
             })
             .cloned()
             .ok_or_else(|| anyhow!("unread chat changed before baseline delivery"))?;
+        let selected = revision
+            .messages
+            .iter()
+            .find(|message| message.id == *id)
+            .expect("latest unread revision contains selected message");
+        if state
+            .command_locks
+            .get(&snapshot.chat)
+            .is_some_and(|lock| lock.matches(selected))
+        {
+            // 最新 OCR 可从误读修订为已成功文本；提升前再次校验实际修订。
+            acknowledge_business_locked(&mut state, id);
+            return Ok(false);
+        }
         state.unread_baseline.remove(id);
         state
             .unread_delivery_fences
             .insert(id.clone(), revision.captured_at);
         state.business_pending.insert(id.clone());
+        let selected_message = revision
+            .messages
+            .iter()
+            .find(|message| message.id == *id)
+            .expect("latest unread revision contains selected message");
+        state.latest_business_revisions.insert(
+            id.clone(),
+            CapturedBusinessRevision {
+                captured_at: revision.captured_at,
+                revision: BusinessMessageRevision::from_message(selected_message),
+                y: Some(selected_message.block.y),
+            },
+        );
         if let Some(tracker) = state.trackers.get_mut(&id.chat) {
             for message in &mut tracker.visible {
                 if message.id == *id {
@@ -711,6 +951,17 @@ impl SharedChatOcr {
         Ok(self.lock()?.business_pending.contains(id))
     }
 
+    /// 快照消费同时核对修订时间，旧排队 OCR 不能抢先消费较新的有效修订。
+    pub(crate) fn is_business_pending_at(
+        &self,
+        id: &ObservedChatMessageId,
+        captured_at: Instant,
+    ) -> Result<bool> {
+        let state = self.lock()?;
+        Ok(state.business_pending.contains(id)
+            && !snapshot_precedes_delivery_fence(&state, id, captured_at))
+    }
+
     /// `text`/`y` 必须是被派发消息自身的数据（由调用方在认领时连同快照一起捕获），
     /// 不能回头查当前 tracker：执行完成时气泡可能已经滚出 visible/latest，
     /// 那样会静默不写命令锁。
@@ -722,22 +973,21 @@ impl SharedChatOcr {
         y: i32,
     ) -> Result<Option<SharedBusinessClaim>> {
         let mut state = self.lock()?;
-        if state
-            .unread_delivery_fences
-            .get(id)
-            .is_some_and(|fence| captured_at < *fence)
+        if snapshot_precedes_delivery_fence(&state, id, captured_at)
             || state.business_claimed.contains(id)
             || !state.business_pending.remove(id)
         {
             return Ok(None);
         }
         state.business_claimed.insert(id.clone());
+        state.active_business_claims.insert(id.clone());
         Ok(Some(SharedBusinessClaim {
             shared: self.clone(),
             id: id.clone(),
             suppression_generation: state.friend_suppression_generation,
             text: text.to_owned(),
             y,
+            captured_at,
             committed: false,
         }))
     }
@@ -747,9 +997,29 @@ impl SharedChatOcr {
         Ok(acknowledge_business_locked(&mut state, id))
     }
 
+    /// 只忽略本次空/未路由修订；正文或身份有效修订后，同一 ID 可以重新交付。
+    /// 参数全部来自消费快照；启动基线、导航丢弃与成功命令使用永久 ACK。
+    pub(crate) fn acknowledge_ignored(
+        &self,
+        id: &ObservedChatMessageId,
+        captured_at: Instant,
+        text: &str,
+        sender: Option<&str>,
+        raw_sender: Option<&str>,
+    ) -> Result<bool> {
+        let mut state = self.lock()?;
+        Ok(acknowledge_ignored_locked(
+            &mut state,
+            id,
+            captured_at,
+            BusinessMessageRevision::new(text, sender, raw_sender),
+            false,
+        ))
+    }
+
     /// 一级大厅命令路径的"真正派发成功"完成点：确认已处理，并用被派发消息自身的
-    /// 文本与 y 写入命令锁。调用方必须只在成功派发点调用它；被禁用/被跳过/未路由的
-    /// 路径只调 \`acknowledge_business\`，绝不能写锁。
+    /// 文本与 y 写入命令锁。调用方必须只在成功派发点调用它；被禁用/被跳过的
+    /// 路径只调 `acknowledge_business`，未路由修订使用 `acknowledge_ignored`。
     pub(crate) fn acknowledge_command(
         &self,
         id: &ObservedChatMessageId,
@@ -766,22 +1036,116 @@ impl SharedChatOcr {
 fn acknowledge_business_locked(state: &mut State, id: &ObservedChatMessageId) -> bool {
     state.unread_baseline.remove(id);
     state.unread_delivery_fences.remove(id);
+    state.ignored_revisions.remove(id);
+    state.latest_business_revisions.remove(id);
+    state.revision_delivery_fences.remove(id);
+    state.business_claimed.insert(id.clone());
+    state.active_business_claims.remove(id);
     let found = state.business_pending.remove(id);
+    set_business_new_locked(state, id, false);
+    found
+}
+
+fn snapshot_precedes_delivery_fence(
+    state: &State,
+    id: &ObservedChatMessageId,
+    captured_at: Instant,
+) -> bool {
+    state
+        .unread_delivery_fences
+        .get(id)
+        .into_iter()
+        .chain(state.revision_delivery_fences.get(id))
+        .any(|fence| captured_at < *fence)
+}
+
+fn acknowledge_ignored_locked(
+    state: &mut State,
+    id: &ObservedChatMessageId,
+    captured_at: Instant,
+    revision: BusinessMessageRevision,
+    claimed: bool,
+) -> bool {
+    if !claimed
+        && (state.business_claimed.contains(id)
+            || snapshot_precedes_delivery_fence(state, id, captured_at)
+            || (!state.business_pending.contains(id) && !state.ignored_revisions.contains_key(id)))
+    {
+        return false;
+    }
+    if matches!(id.chat, ChatIdentity::Friend(_))
+        && (state.friend_suppressions > 0
+            || state
+                .friend_suppression_ended
+                .is_some_and(|end| captured_at <= end))
+    {
+        return acknowledge_business_locked(state, id);
+    }
+    if claimed {
+        if !state.active_business_claims.remove(id) {
+            // 永久 ACK 已覆盖此认领，迟到的忽略提交不能撤销成功墓碑。
+            return false;
+        }
+        state.business_claimed.remove(id);
+    }
+    let found = state.business_pending.remove(id) || claimed;
+    // 业务快照可能已整批读取，且其 tracker 已在 no_chat 中清空。
+    // 独立保留尚未消费 ID 的最新修订，旧忽略提交不能抹掉积压的正确文字。
+    let current = state.latest_business_revisions.get(id).cloned();
+    let ignored_y = current.as_ref().and_then(|current| current.y);
+    if current.as_ref().is_some_and(|current| {
+        current.captured_at >= captured_at
+            && current.y.is_some_and(|y| {
+                state
+                    .command_locks
+                    .get(&id.chat)
+                    .is_some_and(|lock| lock.matches_text_at(&current.revision.text, y))
+            })
+    }) {
+        // 迟到的忽略提交也必须尊重锁；位置来自实际最新修订，未知位置不猜测。
+        acknowledge_business_locked(state, id);
+        return found;
+    }
+    if let Some(current) = current
+        && current.captured_at >= captured_at
+        && current.revision.corrects(&revision)
+    {
+        // 忽略提交落后于当前有效修订：保留更新并拦住所有更早的排队快照。
+        state.ignored_revisions.remove(id);
+        state
+            .revision_delivery_fences
+            .insert(id.clone(), current.captured_at);
+        state.business_pending.insert(id.clone());
+        set_business_new_locked(state, id, true);
+    } else {
+        state.ignored_revisions.insert(
+            id.clone(),
+            CapturedBusinessRevision {
+                captured_at,
+                revision,
+                y: ignored_y,
+            },
+        );
+        set_business_new_locked(state, id, false);
+    }
+    found
+}
+
+fn set_business_new_locked(state: &mut State, id: &ObservedChatMessageId, is_new: bool) {
     if let Some(tracker) = state.trackers.get_mut(&id.chat) {
         for message in &mut tracker.visible {
             if message.id == *id {
-                message.is_new = false;
+                message.is_new = is_new;
             }
         }
     }
     if let Some(latest) = &mut state.latest {
         for message in &mut latest.messages {
             if message.id == *id {
-                message.is_new = false;
+                message.is_new = is_new;
             }
         }
     }
-    found
 }
 
 /// 认领并派发成功后把命令文本与屏幕位置写入该聊天的命令锁。
@@ -825,16 +1189,39 @@ fn record_command_lock_locked(state: &mut State, chat: &ChatIdentity, text: &str
 /// 复用 `crate::text::normalize_chat_text`（与聊天比较同一份实现）：OCR 的同/全角标点
 /// 抖动（`:` vs `：`）必须互相命中，否则同一屏命令会在重建后被当成新命令执行两次。
 fn normalize_command_lock_text(text: &str) -> String {
-    crate::text::normalize_chat_text(text)
+    let normalized: String = crate::text::normalize_chat_text(text)
         .chars()
         .flat_map(char::to_lowercase)
-        .collect()
+        .collect();
+    let without_noise = normalized.trim_end_matches(crate::text::OCR_TRAILING_NOISE);
+    let command = without_noise.split_once('@').map(|(_, command)| command);
+    // These commands have no parameters. The router already accepts trailing OCR noise.
+    // Preserve song titles and user arguments, where punctuation can be meaningful.
+    if command.is_some_and(|command| {
+        matches!(
+            command,
+            "下一首"
+                | "下一曲"
+                | "上一首"
+                | "上一曲"
+                | "暂停"
+                | "继续"
+                | "恢复"
+                | "播放"
+                | "状态"
+                | "帮助"
+        )
+    }) {
+        without_noise.to_string()
+    } else {
+        normalized
+    }
 }
 
 fn complete_refreshes(
     state: &mut State,
     captured_at: Instant,
-    outcome: std::result::Result<Option<ChatOcrSnapshot>, String>,
+    outcome: std::result::Result<Option<ChatOcrSnapshot>, RefreshFailure>,
 ) {
     for request in state.requests.values_mut() {
         if request.outcome.is_none() && captured_at >= request.requested_at {
@@ -1038,7 +1425,11 @@ mod tests {
             .unwrap()
     }
 
-    fn friend(shared: &SharedChatOcr, messages: Vec<SharedChatInput>) -> ChatOcrSnapshot {
+    fn friend(shared: &SharedChatOcr, mut messages: Vec<SharedChatInput>) -> ChatOcrSnapshot {
+        // 此夹具模拟粉色好友气泡；非粉色同会话见独立颜色矩阵测试。
+        for message in &mut messages {
+            message.message_type = "pink".into();
+        }
         shared
             .publish(
                 Instant::now(),
@@ -1046,6 +1437,123 @@ mod tests {
                 messages,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn unread_promotion_cannot_repeat_success_after_view_rebuild() {
+        let shared = SharedChatOcr::new();
+        let baseline = friend(&shared, vec![input("@点歌晴天", 40)]);
+        let first = &baseline.messages[0];
+        assert!(
+            shared
+                .deliver_unread_baseline(&baseline, &first.id)
+                .unwrap()
+        );
+        claim(&shared, first, baseline.captured_at)
+            .unwrap()
+            .complete_as_command()
+            .unwrap();
+        shared
+            .publish_no_chat(Instant::now(), "view rebuild after successful command")
+            .unwrap();
+        let rebuilt = friend(&shared, vec![input("@点歌晴天", 40)]);
+        let repeated = &rebuilt.messages[0];
+        assert_ne!(first.id, repeated.id);
+        assert!(
+            !shared
+                .deliver_unread_baseline(&rebuilt, &repeated.id)
+                .unwrap()
+        );
+        assert!(claim(&shared, repeated, rebuilt.captured_at).is_none());
+        let fresh = friend(
+            &shared,
+            vec![input("@点歌晴天", 40), input("@点歌七里香", 70)],
+        );
+        assert!(
+            shared.is_business_pending(&fresh.messages[1].id).unwrap(),
+            "a distinct new pink command is still delivered"
+        );
+    }
+
+    #[test]
+    fn unread_promotion_rechecks_latest_corrected_text_against_success_lock() {
+        let shared = SharedChatOcr::new();
+        let baseline = friend(&shared, vec![input("@点歌晴天", 40)]);
+        let first = &baseline.messages[0];
+        assert!(
+            shared
+                .deliver_unread_baseline(&baseline, &first.id)
+                .unwrap()
+        );
+        claim(&shared, first, baseline.captured_at)
+            .unwrap()
+            .complete_as_command()
+            .unwrap();
+        shared
+            .publish_no_chat(Instant::now(), "view rebuild")
+            .unwrap();
+        let mistaken = friend(&shared, vec![input("@点哥晴天", 40)]);
+        let id = &mistaken.messages[0].id;
+        assert!(
+            shared
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .unread_baseline
+                .contains(id)
+        );
+        let corrected = friend(&shared, vec![input("@点歌晴天", 40)]);
+        assert_eq!(*id, corrected.messages[0].id);
+        assert!(
+            !shared.deliver_unread_baseline(&mistaken, id).unwrap(),
+            "old baseline must use latest actual OCR when promoting"
+        );
+        assert!(!shared.is_business_pending(id).unwrap());
+        assert!(claim(&shared, &corrected.messages[0], corrected.captured_at).is_none());
+    }
+
+    #[test]
+    fn startup_history_suppression_is_pink_only_without_permission_or_chat_gate() {
+        for chat in [
+            ChatIdentity::PrimaryHall,
+            ChatIdentity::SecondaryHall,
+            ChatIdentity::Friend(Arc::from("管理员")),
+        ] {
+            for sender in ["主人", "管理员", "普通好友"] {
+                let shared = SharedChatOcr::new();
+                let mut messages = Vec::new();
+                for (index, color) in ["pink", "blue", "ordinary"].into_iter().enumerate() {
+                    messages.push(SharedChatInput {
+                        sender: Some(sender.into()),
+                        raw_sender: Some(sender.into()),
+                        message_type: color.into(),
+                        ..input("@点歌晴天", 20 + index as i32 * 40)
+                    });
+                }
+                let snapshot = shared
+                    .publish(Instant::now(), chat.clone(), messages.clone())
+                    .unwrap();
+                for message in &snapshot.messages {
+                    let eligible = message.message_type != "pink";
+                    assert_eq!(
+                        message.is_new, eligible,
+                        "{chat:?} {sender} {}",
+                        message.message_type
+                    );
+                    assert_eq!(shared.is_business_pending(&message.id).unwrap(), eligible);
+                }
+                let repeated = shared
+                    .publish(Instant::now(), chat.clone(), messages)
+                    .unwrap();
+                assert!(
+                    !shared
+                        .is_business_pending(&repeated.messages[0].id)
+                        .unwrap(),
+                    "pink baseline must not revive"
+                );
+            }
+        }
     }
 
     /// 用被派发消息自身的文本与 y 发起一次业务认领。
@@ -1073,6 +1581,703 @@ mod tests {
             message_type: "blue".into(),
             ..input(&format!("[{nickname}]：{command}"), y)
         }
+    }
+
+    fn ignore_revision(shared: &SharedChatOcr, snapshot: &ChatOcrSnapshot, index: usize) -> bool {
+        let message = &snapshot.messages[index];
+        shared
+            .acknowledge_ignored(
+                &message.id,
+                snapshot.captured_at,
+                &message.text,
+                message.sender.as_deref(),
+                message.raw_sender.as_deref(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn unrecognized_or_empty_text_retries_only_after_a_valid_revision() {
+        for chat in [ChatIdentity::PrimaryHall, ChatIdentity::SecondaryHall] {
+            for text in ["", "   ", "@点哥 晴天"] {
+                let shared = SharedChatOcr::new();
+                let first = shared
+                    .publish(Instant::now(), chat.clone(), vec![input(text, 40)])
+                    .unwrap();
+                let id = &first.messages[0].id;
+                assert!(ignore_revision(&shared, &first, 0));
+                assert!(!shared.is_business_pending(id).unwrap());
+                let repeated = shared
+                    .publish(Instant::now(), chat.clone(), vec![input(text, 40)])
+                    .unwrap();
+                assert_eq!(&repeated.messages[0].id, id);
+                assert!(!repeated.messages[0].is_new);
+                let empty = shared
+                    .publish(Instant::now(), chat.clone(), vec![input("", 40)])
+                    .unwrap();
+                assert!(!shared.is_business_pending(&empty.messages[0].id).unwrap());
+                let corrected = shared
+                    .publish(Instant::now(), chat.clone(), vec![input("@点歌 晴天", 40)])
+                    .unwrap();
+                assert_eq!(&corrected.messages[0].id, id);
+                assert!(corrected.messages[0].is_new);
+                assert!(shared.is_business_pending(id).unwrap());
+                assert!(
+                    !shared
+                        .is_business_pending_at(id, first.captured_at)
+                        .unwrap()
+                );
+                assert!(
+                    shared
+                        .is_business_pending_at(id, corrected.captured_at)
+                        .unwrap()
+                );
+                claim(&shared, &corrected.messages[0], corrected.captured_at)
+                    .unwrap()
+                    .complete_as_command()
+                    .unwrap();
+                let another_revision = shared
+                    .publish(
+                        Instant::now(),
+                        chat.clone(),
+                        vec![input("@点歌 晴天。", 40)],
+                    )
+                    .unwrap();
+                assert_eq!(&another_revision.messages[0].id, id);
+                assert!(!another_revision.messages[0].is_new);
+                assert!(!shared.is_business_pending(id).unwrap());
+                assert!(!ignore_revision(&shared, &first, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn unrecognized_identity_revisions_retry_but_whitespace_does_not() {
+        let shared = SharedChatOcr::new();
+        let first = publish(&shared, vec![input("#加入", 40)]);
+        let id = &first.messages[0].id;
+        ignore_revision(&shared, &first, 0);
+        let mut with_sender = input("#加入", 40);
+        with_sender.sender = Some("甲".into());
+        let identified = publish(&shared, vec![with_sender.clone()]);
+        assert_eq!(&identified.messages[0].id, id);
+        assert!(shared.is_business_pending(id).unwrap());
+        claim(&shared, &identified.messages[0], identified.captured_at)
+            .unwrap()
+            .complete_unrecognized(Some("甲"), None)
+            .unwrap();
+        assert!(!shared.is_business_pending(id).unwrap());
+        let mut whitespace = with_sender.clone();
+        whitespace.text = "  #加入  ".into();
+        whitespace.sender = Some(" 甲 ".into());
+        whitespace.raw_sender = Some("  ".into());
+        let same = publish(&shared, vec![whitespace]);
+        assert_eq!(&same.messages[0].id, id);
+        assert!(!shared.is_business_pending(id).unwrap());
+        with_sender.raw_sender = Some("甲（备注）".into());
+        let remark = publish(&shared, vec![with_sender]);
+        assert_eq!(&remark.messages[0].id, id);
+        assert!(shared.is_business_pending(id).unwrap());
+        assert!(
+            !shared
+                .is_business_pending_at(id, identified.captured_at)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn late_ignored_ack_preserves_newer_text_and_rejects_stale_queue_entries() {
+        let shared = SharedChatOcr::new();
+        let business = shared.subscribe_business().unwrap();
+        let first_at = Instant::now();
+        let first = shared
+            .publish(
+                first_at,
+                ChatIdentity::PrimaryHall,
+                vec![input("@点哥 晴天", 40)],
+            )
+            .unwrap();
+        let repeated = shared
+            .publish(
+                first_at + Duration::from_millis(1),
+                ChatIdentity::PrimaryHall,
+                vec![input("@点哥 晴天", 40)],
+            )
+            .unwrap();
+        let corrected = shared
+            .publish(
+                first_at + Duration::from_millis(2),
+                ChatIdentity::PrimaryHall,
+                vec![input("@点歌 晴天", 40)],
+            )
+            .unwrap();
+        let id = &first.messages[0].id;
+        assert_eq!(&corrected.messages[0].id, id);
+        assert!(ignore_revision(&shared, &first, 0));
+        let queued = business.read().unwrap();
+        let eligibility = queued
+            .iter()
+            .map(|snapshot| {
+                shared
+                    .is_business_pending_at(id, snapshot.captured_at)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(eligibility, vec![false, false, true]);
+        assert!(shared.latest().unwrap().unwrap().messages[0].is_new);
+        assert!(!ignore_revision(&shared, &repeated, 0));
+        assert!(claim(&shared, &first.messages[0], first.captured_at).is_none());
+        let retry = claim(&shared, &corrected.messages[0], corrected.captured_at).unwrap();
+        drop(retry);
+        assert!(
+            shared
+                .is_business_pending_at(id, corrected.captured_at)
+                .unwrap()
+        );
+        assert!(claim(&shared, &repeated.messages[0], repeated.captured_at).is_none());
+        claim(&shared, &corrected.messages[0], corrected.captured_at)
+            .unwrap()
+            .complete_as_command()
+            .unwrap();
+        assert!(!ignore_revision(&shared, &first, 0));
+        assert!(!shared.is_business_pending(id).unwrap());
+    }
+
+    #[test]
+    fn unrecognized_claim_uses_its_own_revision_when_completion_lags_ocr() {
+        let shared = SharedChatOcr::new();
+        let first = publish(&shared, vec![input("@点哥 晴天", 40)]);
+        let active = claim(&shared, &first.messages[0], first.captured_at).unwrap();
+        let corrected = publish(&shared, vec![input("@点歌 晴天", 40)]);
+        let id = &first.messages[0].id;
+        assert_eq!(&corrected.messages[0].id, id);
+        assert!(!shared.is_business_pending(id).unwrap());
+        active.complete_unrecognized(None, None).unwrap();
+        assert!(
+            shared
+                .is_business_pending_at(id, corrected.captured_at)
+                .unwrap()
+        );
+        assert!(
+            !shared
+                .is_business_pending_at(id, first.captured_at)
+                .unwrap()
+        );
+        assert!(claim(&shared, &first.messages[0], first.captured_at).is_none());
+        claim(&shared, &corrected.messages[0], corrected.captured_at)
+            .unwrap()
+            .complete_as_command()
+            .unwrap();
+        assert!(!shared.is_business_pending(id).unwrap());
+    }
+
+    #[test]
+    fn permanent_ack_wins_over_late_unrecognized_completion_and_rollback() {
+        for finish_unrecognized in [false, true] {
+            let shared = SharedChatOcr::new();
+            let first = publish(&shared, vec![input("old ignored text", 40)]);
+            let id = &first.messages[0].id;
+            let active = claim(&shared, &first.messages[0], first.captured_at).unwrap();
+            shared.acknowledge_business(id).unwrap();
+            let corrected = publish(&shared, vec![input("@帮助", 40)]);
+            if finish_unrecognized {
+                active.complete_unrecognized(None, None).unwrap();
+            } else {
+                drop(active);
+            }
+            assert_eq!(&corrected.messages[0].id, id);
+            assert!(!shared.is_business_pending(id).unwrap());
+            assert!(!ignore_revision(&shared, &first, 0));
+            assert!(claim(&shared, &corrected.messages[0], corrected.captured_at).is_none());
+        }
+    }
+
+    #[test]
+    fn permanent_ignored_and_first_friend_baseline_stay_passive_after_corrections() {
+        let shared = SharedChatOcr::new();
+        let first = publish(&shared, vec![input("@旧命令", 40)]);
+        let id = &first.messages[0].id;
+        claim(&shared, &first.messages[0], first.captured_at)
+            .unwrap()
+            .complete_ignored()
+            .unwrap();
+        let corrected = publish(&shared, vec![input("@帮助", 40)]);
+        assert_eq!(&corrected.messages[0].id, id);
+        assert!(!corrected.messages[0].is_new);
+        assert!(!shared.is_business_pending(id).unwrap());
+        assert!(!ignore_revision(&shared, &first, 0));
+
+        let shared = SharedChatOcr::new();
+        let baseline = friend(&shared, vec![input("historical misread", 40)]);
+        assert!(!ignore_revision(&shared, &baseline, 0));
+        let corrected = friend(&shared, vec![input("@帮助", 40)]);
+        assert_eq!(corrected.messages[0].id, baseline.messages[0].id);
+        assert!(!corrected.messages[0].is_new);
+        assert!(
+            !shared
+                .is_business_pending(&corrected.messages[0].id)
+                .unwrap()
+        );
+        assert!(
+            shared
+                .deliver_unread_baseline(&corrected, &corrected.messages[0].id)
+                .unwrap()
+        );
+        assert!(
+            shared
+                .is_business_pending(&corrected.messages[0].id)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn navigation_suppression_cancels_waiting_and_inflight_unrecognized_retries() {
+        for in_flight in [false, true] {
+            let shared = SharedChatOcr::new();
+            friend(&shared, vec![input("history", 10)]);
+            let unread = friend(&shared, vec![input("history", 10), input("@点哥 晴天", 40)]);
+            let id = &unread.messages[1].id;
+            let active = if in_flight {
+                Some(claim(&shared, &unread.messages[1], unread.captured_at).unwrap())
+            } else {
+                assert!(ignore_revision(&shared, &unread, 1));
+                None
+            };
+            let suppression = shared.suppress_friend_business().unwrap();
+            drop(suppression);
+            if let Some(active) = active {
+                active.complete_unrecognized(None, None).unwrap();
+            }
+            let corrected = friend(
+                &shared,
+                vec![
+                    input("history", 10),
+                    input("@点歌 晴天", 40),
+                    input("@帮助", 70),
+                ],
+            );
+            assert_eq!(&corrected.messages[1].id, id);
+            assert!(!shared.is_business_pending(id).unwrap());
+            assert!(!ignore_revision(&shared, &unread, 1));
+            assert!(
+                shared
+                    .is_business_pending(&corrected.messages[2].id)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_revision_records_retire_with_scrolled_or_rebuilt_visual_ids() {
+        let shared = SharedChatOcr::new();
+        for index in 0..8 {
+            let snapshot = publish(
+                &shared,
+                vec![input(&format!("unrecognized {index}"), index * 30)],
+            );
+            assert!(ignore_revision(&shared, &snapshot, 0));
+            assert_eq!(
+                shared.inner.state.lock().unwrap().ignored_revisions.len(),
+                1
+            );
+        }
+        shared
+            .publish_no_chat(Instant::now(), "view rebuilt")
+            .unwrap();
+        assert!(
+            shared
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .ignored_revisions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn durable_business_queue_keeps_unread_commands_when_view_rebuilds() {
+        let shared = SharedChatOcr::new();
+        let baseline = publish(&shared, vec![input("history", 10)]);
+        let business = shared.subscribe_business().unwrap();
+        let decisions = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
+        decisions
+            .bind_chat(ChatIdentity::PrimaryHall, baseline.visual_session)
+            .unwrap();
+        let command = publish(&shared, vec![input("history", 10), input("@帮助", 40)]);
+        let id = &command.messages[1].id;
+        shared
+            .publish_no_chat(Instant::now(), "view rebuilt")
+            .unwrap();
+        let rebuilt = publish(&shared, vec![input("other screen", 100)]);
+        assert_ne!(command.visual_session, rebuilt.visual_session);
+        assert!(!rebuilt.messages.iter().any(|message| message.id == *id));
+        let retained = business.read().unwrap();
+        assert_eq!(retained.len(), 2);
+        assert!(retained[0].messages.iter().any(|message| message.id == *id));
+        assert!(
+            shared
+                .is_business_pending_at(id, command.captured_at)
+                .unwrap()
+        );
+        let new_baseline = decisions.read().unwrap();
+        assert_eq!(new_baseline.len(), 1);
+        assert_eq!(new_baseline[0].visual_session, rebuilt.visual_session);
+    }
+
+    #[test]
+    fn drained_business_revisions_survive_no_chat_before_unrecognized_ack() {
+        for chat in [ChatIdentity::PrimaryHall, ChatIdentity::SecondaryHall] {
+            let shared = SharedChatOcr::new();
+            let business = shared.subscribe_business().unwrap();
+            let first_at = Instant::now();
+            let first = shared
+                .publish(first_at, chat.clone(), vec![input("@点哥 晴天", 40)])
+                .unwrap();
+            let corrected = shared
+                .publish(
+                    first_at + Duration::from_millis(1),
+                    chat.clone(),
+                    vec![input("@点歌 晴天", 40)],
+                )
+                .unwrap();
+            let queued = business.read().unwrap();
+            assert_eq!(queued.len(), 2);
+            let id = &first.messages[0].id;
+            shared
+                .publish_no_chat(first_at + Duration::from_millis(2), "view rebuilt")
+                .unwrap();
+            let rebuilt = shared
+                .publish(
+                    first_at + Duration::from_millis(3),
+                    chat,
+                    vec![input("other screen", 100)],
+                )
+                .unwrap();
+            assert!(!rebuilt.messages.iter().any(|message| message.id == *id));
+            assert!(ignore_revision(&shared, &queued[0], 0));
+            assert!(
+                !shared
+                    .is_business_pending_at(id, first.captured_at)
+                    .unwrap()
+            );
+            assert!(
+                shared
+                    .is_business_pending_at(id, corrected.captured_at)
+                    .unwrap()
+            );
+            assert!(claim(&shared, &queued[0].messages[0], queued[0].captured_at).is_none());
+            claim(&shared, &queued[1].messages[0], queued[1].captured_at)
+                .unwrap()
+                .complete_as_command()
+                .unwrap();
+            assert!(!shared.is_business_pending(id).unwrap());
+            assert!(
+                !shared
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .latest_business_revisions
+                    .contains_key(id)
+            );
+        }
+    }
+
+    #[test]
+    fn inflight_unrecognized_claim_preserves_newer_revision_after_tracker_reset() {
+        let shared = SharedChatOcr::new();
+        let business = shared.subscribe_business().unwrap();
+        let first_at = Instant::now();
+        let first = shared
+            .publish(
+                first_at,
+                ChatIdentity::SecondaryHall,
+                vec![input("#加人", 40)],
+            )
+            .unwrap();
+        let active = claim(&shared, &first.messages[0], first.captured_at).unwrap();
+        let mut corrected_input = input("#加入", 40);
+        corrected_input.sender = Some("甲".into());
+        corrected_input.raw_sender = Some("甲（备注）".into());
+        let corrected = shared
+            .publish(
+                first_at + Duration::from_millis(1),
+                ChatIdentity::SecondaryHall,
+                vec![corrected_input],
+            )
+            .unwrap();
+        let queued = business.read().unwrap();
+        assert_eq!(queued.len(), 2);
+        shared
+            .publish_no_chat(first_at + Duration::from_millis(2), "view rebuilt")
+            .unwrap();
+        active.complete_unrecognized(None, None).unwrap();
+        let id = &first.messages[0].id;
+        assert!(
+            shared
+                .is_business_pending_at(id, corrected.captured_at)
+                .unwrap()
+        );
+        assert!(
+            !shared
+                .is_business_pending_at(id, first.captured_at)
+                .unwrap()
+        );
+        claim(&shared, &queued[1].messages[0], queued[1].captured_at)
+            .unwrap()
+            .complete_as_command()
+            .unwrap();
+        assert!(!shared.is_business_pending(id).unwrap());
+    }
+
+    #[test]
+    fn friend_suppression_clears_pending_revision_metadata_before_late_ignore() {
+        let shared = SharedChatOcr::new();
+        friend(&shared, vec![input("history", 10)]);
+        let unread = friend(&shared, vec![input("history", 10), input("@点哥 晴天", 40)]);
+        let corrected = friend(&shared, vec![input("history", 10), input("@点歌 晴天", 40)]);
+        let id = &unread.messages[1].id;
+        assert!(
+            shared
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .latest_business_revisions
+                .contains_key(id)
+        );
+        let suppression = shared.suppress_friend_business().unwrap();
+        drop(suppression);
+        shared
+            .publish_no_chat(Instant::now(), "view rebuilt")
+            .unwrap();
+        assert!(!ignore_revision(&shared, &unread, 1));
+        assert!(
+            !shared
+                .is_business_pending_at(id, corrected.captured_at)
+                .unwrap()
+        );
+        assert!(
+            !shared
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .latest_business_revisions
+                .contains_key(id)
+        );
+    }
+
+    #[test]
+    fn parameterless_command_locks_survive_routable_punctuation_revisions() {
+        let shared = SharedChatOcr::new();
+        let first = publish(&shared, vec![input("甲:@下一首", 40)]);
+        let message = &first.messages[0];
+        shared
+            .acknowledge_command(&message.id, &message.text, message.block.y)
+            .unwrap();
+        shared
+            .publish_no_chat(Instant::now(), "view hidden")
+            .unwrap();
+        let restored = publish(&shared, vec![input("甲:@下一首。!", 40)]);
+        assert!(
+            !shared
+                .is_business_pending(&restored.messages[0].id)
+                .unwrap()
+        );
+        for noise in crate::text::OCR_TRAILING_NOISE {
+            for command in ["下一首", "下一曲", "上一首", "暂停", "继续", "播放", "帮助"]
+            {
+                let text = format!("甲:@{command}");
+                assert_eq!(
+                    normalize_command_lock_text(&format!("{text}{noise}")),
+                    normalize_command_lock_text(&text),
+                    "noise={noise:?}"
+                );
+            }
+        }
+        assert_ne!(
+            normalize_command_lock_text("甲:@切歌!"),
+            normalize_command_lock_text("甲:@切歌")
+        );
+        assert_ne!(
+            normalize_command_lock_text("甲:@停止!"),
+            normalize_command_lock_text("甲:@停止")
+        );
+        assert_ne!(
+            normalize_command_lock_text("甲:@点歌 HELP!"),
+            normalize_command_lock_text("甲:@点歌 HELP")
+        );
+        assert_ne!(
+            normalize_command_lock_text("甲:@拉黑 昵称!"),
+            normalize_command_lock_text("甲:@拉黑 昵称")
+        );
+    }
+
+    #[test]
+    fn corrected_ignored_bubble_cannot_override_an_existing_command_lock() {
+        let shared = SharedChatOcr::new();
+        let first = publish(
+            &shared,
+            vec![
+                input("anchor", 0),
+                primary("甲", "@点哥 晴天", 40),
+                primary("甲", "@点歌 晴天", 70),
+            ],
+        );
+        let ignored_id = &first.messages[1].id;
+        execute(&shared, &first, 2);
+        assert!(ignore_revision(&shared, &first, 1));
+        let corrected = publish(
+            &shared,
+            vec![
+                input("anchor", 0),
+                primary("甲", "@点歌 晴天", 40),
+                primary("甲", "@点歌 晴天", 70),
+            ],
+        );
+        assert_eq!(&corrected.messages[1].id, ignored_id);
+        assert_ne!(corrected.messages[1].id, corrected.messages[2].id);
+        assert!(!corrected.messages[1].is_new);
+        assert!(!shared.is_business_pending(ignored_id).unwrap());
+        assert!(claim(&shared, &corrected.messages[1], corrected.captured_at).is_none());
+        assert!(!ignore_revision(&shared, &first, 1));
+        assert_eq!(
+            shared
+                .command_lock_texts_for_test(&ChatIdentity::PrimaryHall)
+                .len(),
+            1
+        );
+        let state = shared.inner.state.lock().unwrap();
+        assert!(!state.ignored_revisions.contains_key(ignored_id));
+        assert!(!state.latest_business_revisions.contains_key(ignored_id));
+    }
+
+    #[test]
+    fn late_unrecognized_completion_respects_current_lock_even_after_tracker_reset() {
+        for hold_claim in [false, true] {
+            for rebuild_before_completion in [false, true] {
+                let shared = SharedChatOcr::new();
+                let first = publish(
+                    &shared,
+                    vec![
+                        input("anchor", 0),
+                        primary("甲", "@点哥 晴天", 40),
+                        primary("甲", "@点歌 晴天", 70),
+                    ],
+                );
+                let ignored_id = &first.messages[1].id;
+                let active = if hold_claim {
+                    Some(claim(&shared, &first.messages[1], first.captured_at).unwrap())
+                } else {
+                    None
+                };
+                execute(&shared, &first, 2);
+                let corrected = publish(
+                    &shared,
+                    vec![
+                        input("anchor", 0),
+                        primary("甲", "@点歌 晴天", 40),
+                        primary("甲", "@点歌 晴天", 70),
+                    ],
+                );
+                assert_eq!(&corrected.messages[1].id, ignored_id);
+                if rebuild_before_completion {
+                    shared
+                        .publish_no_chat(Instant::now(), "view rebuilt")
+                        .unwrap();
+                }
+                if let Some(active) = active {
+                    active.complete_unrecognized(None, None).unwrap();
+                } else {
+                    assert!(ignore_revision(&shared, &first, 1));
+                }
+                assert!(!shared.is_business_pending(ignored_id).unwrap());
+                assert!(claim(&shared, &corrected.messages[1], corrected.captured_at).is_none());
+                assert!(!ignore_revision(&shared, &first, 1));
+                assert_eq!(
+                    shared
+                        .command_lock_texts_for_test(&ChatIdentity::PrimaryHall)
+                        .len(),
+                    1
+                );
+                let state = shared.inner.state.lock().unwrap();
+                assert!(!state.ignored_revisions.contains_key(ignored_id));
+                assert!(!state.latest_business_revisions.contains_key(ignored_id));
+            }
+        }
+    }
+
+    #[test]
+    fn queued_nonempty_revision_survives_later_empty_ocr_before_old_ignore() {
+        let shared = SharedChatOcr::new();
+        let business = shared.subscribe_business().unwrap();
+        let first_at = Instant::now();
+        let first = shared
+            .publish(first_at, ChatIdentity::PrimaryHall, vec![input("", 40)])
+            .unwrap();
+        let corrected = shared
+            .publish(
+                first_at + Duration::from_millis(1),
+                ChatIdentity::PrimaryHall,
+                vec![input("@帮助", 40)],
+            )
+            .unwrap();
+        let empty_again = shared
+            .publish(
+                first_at + Duration::from_millis(2),
+                ChatIdentity::PrimaryHall,
+                vec![input("", 40)],
+            )
+            .unwrap();
+        let queued = business.read().unwrap();
+        assert_eq!(queued.len(), 3);
+        let id = &first.messages[0].id;
+        assert_eq!(&corrected.messages[0].id, id);
+        assert_eq!(&empty_again.messages[0].id, id);
+        assert!(ignore_revision(&shared, &queued[0], 0));
+        assert!(
+            !shared
+                .is_business_pending_at(id, first.captured_at)
+                .unwrap()
+        );
+        assert!(
+            shared
+                .is_business_pending_at(id, corrected.captured_at)
+                .unwrap()
+        );
+        let command = claim(&shared, &queued[1].messages[0], queued[1].captured_at)
+            .expect("the actual nonempty revision remains eligible at its own timestamp");
+        command.complete_as_command().unwrap();
+        assert!(
+            !shared
+                .is_business_pending_at(id, empty_again.captured_at)
+                .unwrap()
+        );
+        assert!(claim(&shared, &queued[2].messages[0], queued[2].captured_at).is_none());
+        assert!(!ignore_revision(&shared, &queued[2], 0));
+    }
+
+    #[test]
+    fn no_chat_refresh_errors_are_typed_without_relabeling_capture_failures() {
+        let shared = SharedChatOcr::new();
+        let refresh = shared.request_refresh().unwrap();
+        shared
+            .publish_no_chat(Instant::now(), "chat temporarily hidden")
+            .unwrap();
+        let no_chat = shared
+            .wait_for_snapshot(refresh, Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(no_chat.to_string(), "chat temporarily hidden");
+        assert!(no_chat.downcast_ref::<NoChatRefreshError>().is_some());
+        let refresh = shared.request_refresh().unwrap();
+        shared.report_failure("OCR inference failed").unwrap();
+        let failure = shared
+            .wait_for_snapshot(refresh, Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(failure.to_string(), "OCR inference failed");
+        assert!(failure.downcast_ref::<NoChatRefreshError>().is_none());
     }
 
     #[test]
@@ -1141,9 +2346,18 @@ mod tests {
                 pending_capture,
                 queued.chat,
                 vec![
-                    input("history", 10),
-                    input("queued", 40),
-                    input("delayed", 70),
+                    SharedChatInput {
+                        message_type: "pink".into(),
+                        ..input("history", 10)
+                    },
+                    SharedChatInput {
+                        message_type: "pink".into(),
+                        ..input("queued", 40)
+                    },
+                    SharedChatInput {
+                        message_type: "pink".into(),
+                        ..input("delayed", 70)
+                    },
                 ],
             )
             .unwrap();

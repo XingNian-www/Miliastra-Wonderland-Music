@@ -127,14 +127,6 @@ impl<T> DeadlineCancellation<T> {
     pub const fn token(&self) -> &T {
         &self.token
     }
-
-    pub const fn operation_id(&self) -> BusinessOperationId {
-        self.operation_id
-    }
-
-    pub const fn session_generation(&self) -> SessionGeneration {
-        self.session_generation
-    }
 }
 
 /// 计时器事件。计时器仅报告时间事实，业务决策由所属模块处理。
@@ -145,10 +137,6 @@ pub struct DeadlineExpired<T> {
 }
 
 impl<T> DeadlineExpired<T> {
-    pub const fn schedule(&self) -> &DeadlineSchedule<T> {
-        &self.schedule
-    }
-
     pub const fn token(&self) -> &T {
         self.schedule.token()
     }
@@ -167,10 +155,6 @@ impl<T> DeadlineExpired<T> {
 
     pub const fn emitted_at(&self) -> Instant {
         self.emitted_at
-    }
-
-    pub fn into_schedule(self) -> DeadlineSchedule<T> {
-        self.schedule
     }
 
     pub fn map_token<U>(self, map: impl FnOnce(T) -> U) -> DeadlineExpired<U> {

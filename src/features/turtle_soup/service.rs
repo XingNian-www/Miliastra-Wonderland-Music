@@ -2754,8 +2754,7 @@ mod tests {
     #[test]
     fn default_custom_prompt_does_not_redefine_the_builtin_protocol() {
         let config: serde_norway::Value =
-            serde_norway::from_str(include_str!("../../../tests/fixtures/config.full.yaml"))
-                .expect("default config");
+            serde_norway::from_str(crate::config::bundled_config_yaml()).expect("default config");
         let prompt = config["turtle_soup"]["custom_prompt"]
             .as_str()
             .expect("turtle_soup.custom_prompt");

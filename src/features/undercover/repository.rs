@@ -133,8 +133,8 @@ fn save_used_pairs(path: &Path, keys: &HashSet<String>, store: &dyn StateStore) 
         })
         .collect::<Vec<_>>();
     pairs.sort();
-    let text =
-        serde_norway::to_string(&UsedPairFile { pairs }).context("序列化谁是卧底永久使用记录失败")?;
+    let text = serde_norway::to_string(&UsedPairFile { pairs })
+        .context("序列化谁是卧底永久使用记录失败")?;
     store.write_atomic(path, text.as_bytes(), "谁是卧底记录")
 }
 

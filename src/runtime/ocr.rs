@@ -111,6 +111,11 @@ impl OcrRuntimeHandle {
         image: DynamicImage,
         priority: OcrPriority,
     ) -> OcrRuntimeResult<Vec<OcrLine>> {
+        if image.width() == 0 || image.height() == 0 {
+            return Err(OcrRuntimeError::Inference(anyhow!(
+                "OCR image must have nonzero dimensions"
+            )));
+        }
         let (response, receiver) = mpsc::sync_channel(1);
         let deadline = Instant::now()
             .checked_add(self.channel.request_timeout)
@@ -587,6 +592,24 @@ mod tests {
             .recognize_lines(DynamicImage::new_rgba8(7, 5), OcrPriority::ChatObservation)
             .unwrap();
 
+        assert_eq!(lines[0].text, "7x5");
+        assert!(!runtime.shutdown().unwrap().timed_out);
+    }
+
+    #[test]
+    fn empty_images_are_rejected_without_stopping_the_ocr_worker() {
+        let runtime = OcrRuntime::start(FixedOcrDevice, 2).unwrap();
+        for image in [DynamicImage::new_rgba8(0, 5), DynamicImage::new_rgba8(7, 0)] {
+            let error = runtime
+                .handle()
+                .recognize_lines(image, OcrPriority::Diagnostic)
+                .expect_err("empty image rejected");
+            assert!(matches!(error, OcrRuntimeError::Inference(_)));
+        }
+        let lines = runtime
+            .handle()
+            .recognize_lines(DynamicImage::new_rgba8(7, 5), OcrPriority::ChatObservation)
+            .unwrap();
         assert_eq!(lines[0].text, "7x5");
         assert!(!runtime.shutdown().unwrap().timed_out);
     }

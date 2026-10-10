@@ -788,10 +788,10 @@ mod live;
 pub(crate) use live::*;
 
 #[cfg(test)]
-fn bundled_config_yaml() -> &'static str {
-    // 完整配置模板（含全部功能段）固定在测试夹具中；
+pub(crate) fn bundled_config_yaml() -> &'static str {
+    // 仅供测试的完整配置随源码保存，保证干净检出也能编译单元测试。
     // 仓库与发布包的 config.yaml 已精简为最小启动配置（仅 bootstrap 字段）。
-    include_str!("../../tests/fixtures/config.full.yaml")
+    include_str!("test.full.yaml")
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -1339,8 +1339,60 @@ impl OcrConfig {
         if self.threads <= 0 {
             bail!("ocr.threads 必须大于 0");
         }
-        if self.det_max_side_len == 0 || self.det_min_area == 0 || self.max_block_height <= 0 {
-            bail!("OCR 检测尺寸和文本块高度必须大于 0");
+        if self.det_max_side_len == 0 || self.det_min_area == 0 {
+            bail!("OCR 检测尺寸必须大于 0");
+        }
+        // 配置 API 和数据库加载也必须执行表单声明的几何边界，不能依赖前端限制。
+        for (value, min, max, field) in [
+            (i64::from(self.det_box_border), 0, 100, "ocr.det_box_border"),
+            (i64::from(self.text_left_gap), 0, 1000, "ocr.text_left_gap"),
+            (
+                i64::from(self.block_top_padding),
+                0,
+                1000,
+                "ocr.block_top_padding",
+            ),
+            (
+                i64::from(self.block_bottom_padding),
+                0,
+                1000,
+                "ocr.block_bottom_padding",
+            ),
+            (
+                i64::from(self.max_block_height),
+                1,
+                10_000,
+                "ocr.max_block_height",
+            ),
+            (
+                i64::from(self.same_line_y_tolerance),
+                0,
+                1000,
+                "ocr.same_line_y_tolerance",
+            ),
+            (
+                i64::from(self.marker_dedupe_x),
+                0,
+                1000,
+                "ocr.marker_dedupe_x",
+            ),
+            (
+                i64::from(self.marker_dedupe_y),
+                0,
+                1000,
+                "ocr.marker_dedupe_y",
+            ),
+            (
+                i64::from(self.next_marker_min_gap),
+                0,
+                10_000,
+                "ocr.next_marker_min_gap",
+            ),
+            (i64::from(self.right_padding), 0, 1000, "ocr.right_padding"),
+        ] {
+            if !(min..=max).contains(&value) {
+                bail!("{} 必须在 {} 到 {} 之间", field, min, max);
+            }
         }
         if !self.det_unclip_ratio.is_finite() || self.det_unclip_ratio <= 0.0 {
             bail!("ocr.det_unclip_ratio 必须是正有限小数");
@@ -1380,6 +1432,76 @@ impl OcrConfig {
         }
         validate_nonempty_path(&self.charset, "ocr.charset")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ocr_geometry_validation_tests {
+    use super::OcrConfig;
+
+    #[test]
+    fn ocr_geometry_controls_reject_negative_and_extreme_values() {
+        for field in [
+            "text_left_gap",
+            "block_top_padding",
+            "block_bottom_padding",
+            "max_block_height",
+            "same_line_y_tolerance",
+            "marker_dedupe_x",
+            "marker_dedupe_y",
+            "next_marker_min_gap",
+            "right_padding",
+        ] {
+            for invalid in [-1, i32::MIN, i32::MAX] {
+                let mut value = serde_json::to_value(OcrConfig::default()).unwrap();
+                value[field] = serde_json::json!(invalid);
+                let config: OcrConfig = serde_json::from_value(value).unwrap();
+                let error = config
+                    .validate()
+                    .expect_err("invalid OCR geometry accepted");
+                assert!(
+                    error.to_string().contains(&format!("ocr.{field}")),
+                    "{error}"
+                );
+            }
+        }
+        let config = OcrConfig {
+            det_box_border: u32::MAX,
+            ..OcrConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("ocr.det_box_border")
+        );
+    }
+
+    #[test]
+    fn ocr_geometry_defaults_and_boundaries_are_valid() {
+        OcrConfig::default()
+            .validate()
+            .expect("default OCR geometry");
+        for use_maximum in [false, true] {
+            let mut value = serde_json::to_value(OcrConfig::default()).unwrap();
+            for (field, minimum, maximum) in [
+                ("det_box_border", 0, 100),
+                ("text_left_gap", 0, 1000),
+                ("block_top_padding", 0, 1000),
+                ("block_bottom_padding", 0, 1000),
+                ("max_block_height", 1, 10_000),
+                ("same_line_y_tolerance", 0, 1000),
+                ("marker_dedupe_x", 0, 1000),
+                ("marker_dedupe_y", 0, 1000),
+                ("next_marker_min_gap", 0, 10_000),
+                ("right_padding", 0, 1000),
+            ] {
+                value[field] = serde_json::json!(if use_maximum { maximum } else { minimum });
+            }
+            let config: OcrConfig = serde_json::from_value(value).unwrap();
+            config.validate().expect("valid OCR geometry boundary");
+        }
     }
 }
 
@@ -2320,7 +2442,9 @@ stale_timeout_ms: 7500
         value["timing"]["playback"]
             .as_mapping_mut()
             .expect("playback timing mapping")
-            .remove(serde_norway::Value::String("lyrics_lead_seconds".to_string()));
+            .remove(serde_norway::Value::String(
+                "lyrics_lead_seconds".to_string(),
+            ));
 
         let config: AppConfig =
             serde_norway::from_value(value).expect("existing config without lyric lead");

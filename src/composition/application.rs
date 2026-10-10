@@ -65,8 +65,7 @@ use crate::features::song_request::{
 };
 use crate::features::startup::{StartupService, StartupSource, StartupTask, StartupTaskKind};
 use crate::features::turtle_soup::{
-    self, SecondaryOcrObservation, SecondaryOcrStability, TurtleSoupApplication, TurtleSoupConfig,
-    TurtleSoupService,
+    self, TurtleSoupApplication, TurtleSoupConfig, TurtleSoupService,
 };
 use crate::features::undercover::{
     UndercoverApplication, UndercoverCommand, UndercoverCommandSource, UndercoverDeliveryPort,
@@ -79,13 +78,11 @@ use crate::interfaces::ui_plan::{WorkflowOperation, WorkflowResidency};
 use crate::observation::chat::{
     ChatMessage, ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
     ChatScanTelemetry, ChatScanTelemetrySink, CompletionAdvanceSubscriber, ObservedFrame,
-    PrimaryDecisionSubscriber, PrimaryObservationCursor, PrimaryObservedMessage,
-    ResolvedTemplateArgs, SecondaryChatIdentity, SecondaryChatObservation, SecondaryHallBubble,
-    SecondaryObservedMessage, SecondaryRecognizedMessage, TemplateArgs, UnreadFriendHit,
-    count_chat_markers, find_unread_friend_hits, hall_bubble_layout_is_stable,
-    hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap,
-    latest_incoming_fingerprint, prepare_chat_scan, prepare_chat_scan_with_markers,
-    recognize_prepared_chat, secondary_hall_bubbles,
+    PrimaryObservedMessage, ResolvedTemplateArgs, SecondaryChatIdentity, SecondaryChatObservation,
+    SecondaryHallBubble, SecondaryObservedMessage, TemplateArgs, UnreadFriendHit,
+    count_chat_markers, find_unread_friend_hits, hall_bubble_sequence_is_retained_prefix,
+    hall_bubble_sequence_overlap, latest_incoming_fingerprint, prepare_chat_scan,
+    prepare_chat_scan_with_markers, recognize_prepared_chat, secondary_hall_bubbles,
 };
 use crate::observation::decision::DecisionScreenLock;
 use crate::observation::shared::ObservationRead;
@@ -111,13 +108,13 @@ use crate::runtime::player_io::{
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::task_engine::TaskEngineHandle;
 use crate::runtime::ui::{
-    FrameDemand, FrameDemandSubscription, FramePublication, UiCoordinator, UiRuntime, UiScanPermit,
-    UiStateKind, UiStateObservation,
+    FrameDemand, FrameDemandSubscription, FramePublication, UiCoordinator, UiRuntime, UiStateKind,
+    UiStateObservation,
 };
 use crate::ui::atoms::GameUi;
 use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 use crate::ui::chat_output::{ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput};
-use crate::ui::frame::{Canvas, Frame, LatestFrameCache, from_captured_frame, load_frame};
+use crate::ui::frame::{Canvas, Frame, LatestFrameCache, from_captured_frame};
 use crate::ui::geometry::{Rect, crop_canvas};
 #[cfg(test)]
 use crate::ui::locator::secondary_hall_search_rect;
@@ -360,12 +357,6 @@ fn receive_observation_frame(
             Err(anyhow!("等待 UI runtime 发布观察帧时通道断开"))
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct SecondaryBubbleProcessOutcome {
-    processed: bool,
-    confirmation_pending: bool,
 }
 
 struct UiBundle {
@@ -1800,7 +1791,7 @@ fn secondary_hall_command_text(text: &str) -> Option<&str> {
     if trimmed.starts_with('#') || trimmed.starts_with('＃') {
         return Some(trimmed);
     }
-    text.find('@').map(|index| text[index..].trim())
+    text.find(['@', '＠']).map(|index| text[index..].trim())
 }
 
 fn classify_secondary_hall_message(
@@ -1823,7 +1814,7 @@ fn classify_secondary_hall_message(
         };
     }
     if secondary_hall_command_text(text)
-        .is_some_and(|command| command.trim_start().starts_with('@'))
+        .is_some_and(|command| command.trim_start().starts_with(['@', '＠']))
     {
         return SecondaryHallMessageClassification {
             kind: SecondaryHallMessageKind::Command,
@@ -1974,6 +1965,10 @@ mod tests {
         assert_eq!(
             secondary_hall_command_text("聊天内容 @点歌 测试"),
             Some("@点歌 测试")
+        );
+        assert_eq!(
+            secondary_hall_command_text("聊天内容 ＠点歌 测试"),
+            Some("＠点歌 测试")
         );
         assert_eq!(secondary_hall_command_text("普通聊天"), None);
     }

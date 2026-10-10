@@ -997,6 +997,7 @@ fn configure_cache(core: &mut Core, device: &DeviceType<'static>, cache_dir: Opt
 fn load_charset(path: &Path) -> Result<Vec<char>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取 OCR 字符集失败: {}", path.display()))?;
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
     let mut charset = vec![' '];
     charset.extend(content.chars().filter(|ch| *ch != '\n' && *ch != '\r'));
     charset.push(' ');
@@ -1039,14 +1040,31 @@ mod tests {
         assert_eq!(paths[12], PathBuf::from(r"C:\app\openvino"));
     }
 
+    #[test]
+    fn charset_accepts_utf8_bom_without_shifting_classes() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("miliastra-charset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("charset.txt");
+        let result = (|| -> Result<()> {
+            std::fs::write(&path, "香\r\n菜\r\n")?;
+            let plain = load_charset(&path)?;
+            std::fs::write(&path, "\u{feff}香\r\n菜\r\n")?;
+            assert_eq!(load_charset(&path)?, plain);
+            assert_eq!(plain, vec![' ', '香', '菜', ' ']);
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(root);
+        result
+    }
+
     /// 仅在提供本地模型目录时运行真实 IR 与运行时冒烟检查。
     ///
     /// 这样普通 CI 不依赖单独安装的 OpenVINO 运行时，同时为发布检查提供模型加载、推理、DB 后处理和 CTC 解码的完整验证。
     #[test]
+    #[ignore = "requires local OpenVINO runtime and IR models"]
     fn configured_ir_models_recognize_fixture() -> Result<()> {
-        let Some(model_root) = std::env::var_os("OPENVINO_OCR_IR_ROOT") else {
-            return Ok(());
-        };
+        let model_root = std::env::var_os("OPENVINO_OCR_IR_ROOT")
+            .context("OPENVINO_OCR_IR_ROOT is required for the OpenVINO smoke test")?;
         let model_root = PathBuf::from(model_root);
         let charset = std::env::var_os("OPENVINO_OCR_CHARSET")
             .map(PathBuf::from)
@@ -1074,15 +1092,12 @@ mod tests {
             det_box_border: 0,
         };
         let mut engine = OpenVinoEngine::new(&args)?;
-        let screenshot = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")?;
-        let title = screenshot.crop_imm(
-            crate::observation::chat::SECONDARY_TITLE_RECT.x as u32,
-            crate::observation::chat::SECONDARY_TITLE_RECT.y as u32,
-            crate::observation::chat::SECONDARY_TITLE_RECT.width,
-            crate::observation::chat::SECONDARY_TITLE_RECT.height,
+        let title = image::load_from_memory(include_bytes!("fixtures/chat-title.png"))?;
+        let text = super::super::merge_ocr_lines(engine.recognize_lines(&title)?, 12);
+        assert!(
+            text.contains("香菜"),
+            "unexpected OpenVINO title OCR: {text}"
         );
-        let lines = engine.recognize_lines(&title)?;
-        assert!(!lines.is_empty(), "OpenVINO fixture OCR returned no lines");
         Ok(())
     }
 

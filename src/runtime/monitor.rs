@@ -529,6 +529,7 @@ impl BusinessStateSink for MonitorShared {
 
 impl TaskEngineStateSink for MonitorShared {
     fn publish_task_engine(&self, projection: TaskEngineProjection) {
+        crate::debug_read_only::observer().record_status(&projection);
         self.publish_async(MonitorEvent::TaskEngine(projection));
     }
 }

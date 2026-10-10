@@ -997,6 +997,9 @@ impl crate::runtime::ui::UiRoutine for DebugAtomicRoutine {
     type Output = Result<Arc<image::DynamicImage>>;
     fn execute(self, context: &mut crate::runtime::ui::UiRoutineContext<'_>) -> Self::Output {
         use crate::debug_sandbox::AtomicCommand::*;
+        if crate::debug_read_only::observer().enabled() && !self.0.is_read_only() {
+            anyhow::bail!("只读模式禁止调试输入");
+        }
         match self.0 {
             EnsureWindow => context.device().ensure_window()?,
             EnsureForeground => context.device().ensure_foreground()?,

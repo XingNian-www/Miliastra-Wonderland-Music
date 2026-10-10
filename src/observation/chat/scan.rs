@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use image::DynamicImage;
 use serde::Serialize;
 
 use crate::config::{OcrConfig, RectConfig, TemplateConfig};
 use crate::privacy::redacted_chat_text;
 use crate::runtime::ocr::{OcrImageBlock, OcrPriority, OcrRuntimeHandle, batch_recognize_blocks};
-use crate::ui::geometry::{Rect, clamp_i32, crop_canvas};
+use crate::ui::geometry::{Rect, crop_canvas};
 use crate::ui::template::{TemplateHit, dedupe_hits, find_color_template_hit_groups};
 
 pub(crate) const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
@@ -141,10 +141,10 @@ pub(crate) fn prepare_chat_scan_with_markers(
     let blocks: Vec<(TemplateHit, Rect)> = markers
         .iter()
         .map(|marker| {
-            let block = make_message_block(marker, &markers, chat_rect, templates);
-            (marker.clone(), block)
+            let block = make_message_block(marker, &markers, chat_rect, templates)?;
+            Ok((marker.clone(), block))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let block_ms = elapsed_ms(block_started);
 
     Ok(PreparedChatScan {
@@ -344,37 +344,39 @@ fn make_message_block(
     markers: &[TemplateHit],
     chat_rect: Rect,
     templates: &ResolvedTemplateArgs,
-) -> Rect {
-    let start_y = clamp_i32(
-        marker.y - templates.block_top_padding,
-        0,
-        chat_rect.height as i32 - 1,
-    );
+) -> Result<Rect> {
+    if chat_rect.width == 0
+        || chat_rect.height == 0
+        || chat_rect.width > i32::MAX as u32
+        || chat_rect.height > i32::MAX as u32
+    {
+        bail!("聊天 OCR 区域宽高必须在 1 到 {} 之间", i32::MAX);
+    }
+    let chat_width = i64::from(chat_rect.width);
+    let chat_height = i64::from(chat_rect.height);
+    // 中间计算使用 i64；即使调用方绕过配置校验，极端参数也不能回绕或生成越界裁剪。
+    let start_y = (i64::from(marker.y) - i64::from(templates.block_top_padding.max(0)))
+        .clamp(0, chat_height - 1);
     let next_marker = next_marker(marker, markers, templates.next_marker_min_gap);
-    let max_end_y = clamp_i32(
-        start_y + templates.max_block_height,
-        start_y + 1,
-        chat_rect.height as i32,
-    );
+    let max_end_y = (start_y + i64::from(templates.max_block_height.max(1))).min(chat_height);
     let boundary_end_y = next_marker
-        .map(|hit| hit.y - templates.block_bottom_padding)
+        .map(|hit| i64::from(hit.y) - i64::from(templates.block_bottom_padding.max(0)))
         .unwrap_or(max_end_y);
-    let end_y = clamp_i32(
-        boundary_end_y.min(max_end_y),
-        start_y + 1,
-        chat_rect.height as i32,
-    );
-    let text_x = clamp_i32(
-        marker.x + marker.width as i32 + templates.text_left_gap,
-        0,
-        chat_rect.width as i32 - 1,
-    );
-    let width = clamp_i32(
-        chat_rect.width as i32 - text_x - templates.right_padding,
-        1,
-        chat_rect.width as i32,
-    ) as u32;
-    Rect::new(text_x, start_y, width, (end_y - start_y) as u32)
+    let end_y = boundary_end_y
+        .min(max_end_y)
+        .clamp(start_y + 1, chat_height);
+    let text_x =
+        (i64::from(marker.x) + i64::from(marker.width) + i64::from(templates.text_left_gap.max(0)))
+            .clamp(0, chat_width - 1);
+    let available_width = chat_width - text_x;
+    let width =
+        (available_width - i64::from(templates.right_padding.max(0))).clamp(1, available_width);
+    Ok(Rect::new(
+        text_x as i32,
+        start_y as i32,
+        width as u32,
+        (end_y - start_y) as u32,
+    ))
 }
 
 fn next_marker<'a>(
@@ -382,10 +384,11 @@ fn next_marker<'a>(
     markers: &'a [TemplateHit],
     next_marker_min_gap: i32,
 ) -> Option<&'a TemplateHit> {
-    let min_y = marker.y + next_marker_min_gap.max((marker.height as f32 * 0.6).floor() as i32);
+    let min_y = i64::from(marker.y)
+        + i64::from(next_marker_min_gap.max((marker.height as f32 * 0.6).floor() as i32));
     markers
         .iter()
-        .filter(|candidate| candidate.y >= min_y)
+        .filter(|candidate| i64::from(candidate.y) >= min_y)
         .min_by_key(|candidate| candidate.y)
 }
 
@@ -415,4 +418,119 @@ pub(crate) fn count_scanned_chat_markers(markers: &[TemplateHit]) -> (usize, usi
 
 fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marker(x: i32, y: i32, width: u32, height: u32) -> TemplateHit {
+        TemplateHit {
+            kind: "blue".into(),
+            x,
+            y,
+            width,
+            height,
+            score: 1.0,
+        }
+    }
+
+    fn templates() -> ResolvedTemplateArgs {
+        TemplateArgs::default().resolve(&TemplateConfig::default(), &OcrConfig::default())
+    }
+
+    #[test]
+    fn message_block_preserves_default_geometry() {
+        let markers = [marker(8, 10, 20, 19), marker(8, 45, 20, 19)];
+        let block = make_message_block(
+            &markers[0],
+            &markers,
+            Rect::new(0, 0, 416, 143),
+            &templates(),
+        )
+        .unwrap();
+        assert_eq!(
+            (block.x, block.y, block.width, block.height),
+            (36, 8, 376, 35)
+        );
+    }
+
+    #[test]
+    fn negative_right_padding_cannot_extend_a_crop_past_the_chat_edge() {
+        let mut templates = templates();
+        templates.right_padding = -1;
+        let image = DynamicImage::new_rgb8(416, 143);
+        let prepared = prepare_chat_scan_with_markers(
+            &image,
+            &templates,
+            Rect::new(0, 0, 416, 143),
+            Some(vec![marker(8, 10, 20, 19)]),
+        )
+        .unwrap();
+        let block = prepared.blocks[0].1;
+        assert_eq!((block.x, block.width), (36, 380));
+        crop_canvas(&prepared.chat, block).expect("bounded crop despite negative padding");
+    }
+
+    #[test]
+    fn extreme_message_block_controls_produce_bounded_crops() {
+        let image = DynamicImage::new_rgb8(416, 143);
+        for extreme in [i32::MIN, i32::MAX] {
+            let mut templates = templates();
+            templates.block_top_padding = extreme;
+            templates.block_bottom_padding = extreme;
+            templates.text_left_gap = extreme;
+            templates.max_block_height = extreme;
+            templates.right_padding = extreme;
+            templates.next_marker_min_gap = extreme;
+            let prepared = prepare_chat_scan_with_markers(
+                &image,
+                &templates,
+                Rect::new(0, 0, 416, 143),
+                Some(vec![marker(8, 10, 20, 19), marker(8, 45, 20, 19)]),
+            )
+            .unwrap();
+            for (_, block) in prepared.blocks {
+                assert!(block.width > 0 && block.height > 0);
+                crop_canvas(&prepared.chat, block).expect("extreme controls must stay in bounds");
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_marker_coordinates_produce_bounded_crops() {
+        let image = DynamicImage::new_rgb8(416, 143);
+        for coordinate in [i32::MIN, i32::MAX] {
+            let hit = marker(coordinate, coordinate, u32::MAX, u32::MAX);
+            let block = make_message_block(
+                &hit,
+                std::slice::from_ref(&hit),
+                Rect::new(0, 0, 416, 143),
+                &templates(),
+            )
+            .unwrap();
+            crop_canvas(&image, block).expect("extreme marker must stay in bounds");
+        }
+    }
+
+    #[test]
+    fn next_marker_threshold_does_not_wrap_past_i32_max() {
+        let hit = marker(8, i32::MAX - 1, 20, 19);
+        let markers = [marker(8, i32::MAX, 20, 19)];
+        assert!(next_marker(&hit, &markers, i32::MAX).is_none());
+    }
+
+    #[test]
+    fn message_block_rejects_empty_or_unrepresentable_canvas() {
+        let hit = marker(8, 10, 20, 19);
+        for rect in [
+            Rect::new(0, 0, 0, 143),
+            Rect::new(0, 0, 416, 0),
+            Rect::new(0, 0, u32::MAX, 143),
+        ] {
+            assert!(
+                make_message_block(&hit, std::slice::from_ref(&hit), rect, &templates()).is_err()
+            );
+        }
+    }
 }

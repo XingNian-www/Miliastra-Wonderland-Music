@@ -8,7 +8,7 @@ use crate::features::chat_text::compact_command;
 use crate::text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
 use anyhow::{Result, anyhow};
 use miliastra_playback::PlayableTrack;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,7 @@ pub(crate) const WINDOW_CANDIDATES: usize = 5;
 /// 清空二次确认的有效期；超时后必须重新发起 \`@歌单清空\`。
 const CLEAR_CONFIRM_TTL: Duration = Duration::from_secs(60);
 /// 歌单窗口存活时间：超时后 @1~@5 不再生效。
-const WINDOW_TTL: Duration = Duration::from_secs(20);
+pub(crate) const WINDOW_TTL: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -244,15 +244,7 @@ impl PlaylistApplication {
         Ok(pool.into_iter().nth(index))
     }
 
-    /// 取最近入库的若干首，用于歌单窗口展示。
-    pub(crate) fn recent(&self, owner: &str, limit: usize) -> Result<Vec<PlayableTrack>> {
-        let mut tracks = self.items(owner)?;
-        tracks.reverse();
-        tracks.truncate(limit);
-        Ok(tracks)
-    }
-
-    /// 随机挑最多 count 首，尽量避开 exclude；不足时回填全部。
+    /// 随机挑最多 count 首；本周期有剩余时不补旧歌，耗尽后重新开始。
     fn pick_many(
         &self,
         owner: &str,
@@ -269,7 +261,7 @@ impl PlaylistApplication {
             .filter(|track| !exclude.contains(&track.track_ref.key.to_string()))
             .cloned()
             .collect();
-        if pool.len() < count {
+        if pool.is_empty() {
             pool = all;
         }
         let mut order: Vec<usize> = (0..pool.len()).collect();
@@ -303,12 +295,16 @@ impl PlaylistApplication {
             .lock()
             .map_err(|_| anyhow!("歌单窗口状态不可用"))?;
         windows.retain(|_, window| window.deadline > now);
+        let deadline = windows
+            .get(owner)
+            .map_or(now + WINDOW_TTL, |window| window.deadline);
         windows.insert(
             owner.to_owned(),
             PlaylistWindow {
                 tracks,
                 shown,
-                deadline: now + WINDOW_TTL,
+                // 重抽保持本窗口的总期限，不因换一批而无限延期。
+                deadline,
             },
         );
         Ok(())
@@ -352,7 +348,7 @@ impl PlaylistApplication {
         Ok(track)
     }
 
-    fn window_len(&self, owner: &str, now: Instant) -> Result<usize> {
+    pub(crate) fn window_len(&self, owner: &str, now: Instant) -> Result<usize> {
         let windows = self
             .state
             .windows
@@ -364,13 +360,26 @@ impl PlaylistApplication {
             .map_or(0, |window| window.tracks.len()))
     }
 
-    fn close_window(&self, owner: &str) -> Result<bool> {
+    pub(crate) fn close_window(&self, owner: &str) -> Result<bool> {
         let mut windows = self
             .state
             .windows
             .lock()
             .map_err(|_| anyhow!("歌单窗口状态不可用"))?;
         Ok(windows.remove(owner).is_some())
+    }
+
+    /// 应用层独占窗口包含建立共享基线的时间，覆盖存储层默认 TTL。
+    pub(crate) fn set_window_deadline(&self, owner: &str, deadline: Instant) -> Result<()> {
+        let mut windows = self
+            .state
+            .windows
+            .lock()
+            .map_err(|_| anyhow!("歌单窗口状态不可用"))?;
+        if let Some(window) = windows.get_mut(owner) {
+            window.deadline = deadline;
+        }
+        Ok(())
     }
 
     fn mark_pending_clear(&self, owner: &str, now: Instant) -> Result<()> {
@@ -424,6 +433,7 @@ impl PlaylistApplication {
                 "@歌单 查看收藏并随机推荐；@歌单随机 随机播放一首；@收藏 收藏当前播放；@取消收藏 取消收藏当前播放；@歌单清空 清空收藏（需确认）。",
             )),
             PlaylistCommand::Open => {
+                self.close_window(owner)?;
                 let total = self.count(owner)?;
                 if total == 0 {
                     return Ok(vec!["你的歌单还是空的，先播一首再说 @收藏 吧。".into()]);
@@ -463,7 +473,11 @@ impl PlaylistApplication {
                 if tracks.is_empty() {
                     return Ok(vec!["没有更多可以换的歌了，回复 @关闭 退出。".into()]);
                 }
-                let mut all_shown = shown;
+                // pick_many 只有未展示池耗尽才回到全部曲目，此时重置周期。
+                let restarted = tracks
+                    .iter()
+                    .all(|track| shown.contains(&track.track_ref.key.to_string()));
+                let mut all_shown = if restarted { Vec::new() } else { shown };
                 all_shown.extend(tracks.iter().map(|track| track.track_ref.key.to_string()));
                 self.store_window(owner, tracks.clone(), all_shown, now)?;
                 Ok(fit_messages("歌单", &window_text("换一批", &tracks)))
@@ -854,6 +868,95 @@ mod tests {
             .filter(|key| !first.contains(key))
             .collect();
         assert_eq!(fresh.len(), WINDOW_CANDIDATES);
+    }
+
+    #[test]
+    fn eight_tracks_reroll_as_five_three_then_new_five() {
+        let app = app();
+        let mut port = FakePlayback {
+            current: None,
+            played: Vec::new(),
+        };
+        for index in 0..8 {
+            app.add("甲", &track(&format!("t{index}")), index).unwrap();
+        }
+        let now = Instant::now();
+        app.execute("甲", &PlaylistCommand::Open, &mut port, now, 7)
+            .unwrap();
+        let first = app.window_shown("甲", now).unwrap().unwrap();
+        assert_eq!(app.window_len("甲", now).unwrap(), 5);
+        app.execute("甲", &PlaylistCommand::Reroll, &mut port, now, 8)
+            .unwrap();
+        assert_eq!(app.window_len("甲", now).unwrap(), 3);
+        let shown = app.window_shown("甲", now).unwrap().unwrap();
+        assert_eq!(shown.len(), 8);
+        let windows = app.state.windows.lock().unwrap();
+        assert!(
+            windows["甲"]
+                .tracks
+                .iter()
+                .all(|track| !first.contains(&track.track_ref.key.to_string()))
+        );
+        drop(windows);
+        app.execute("甲", &PlaylistCommand::Reroll, &mut port, now, 9)
+            .unwrap();
+        assert_eq!(app.window_len("甲", now).unwrap(), 5);
+        assert_eq!(app.window_shown("甲", now).unwrap().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn fewer_than_five_shows_all_and_restarts_without_accumulating_old_cycle() {
+        let app = app();
+        let mut port = FakePlayback {
+            current: None,
+            played: Vec::new(),
+        };
+        for id in ["a", "b", "c"] {
+            app.add("甲", &track(id), 0).unwrap();
+        }
+        let now = Instant::now();
+        app.execute("甲", &PlaylistCommand::Open, &mut port, now, 7)
+            .unwrap();
+        let first = app.window_shown("甲", now).unwrap().unwrap();
+        assert_eq!(first.len(), 3);
+        for seed in [8, 9] {
+            app.execute("甲", &PlaylistCommand::Reroll, &mut port, now, seed)
+                .unwrap();
+            let shown = app.window_shown("甲", now).unwrap().unwrap();
+            assert_eq!(app.window_len("甲", now).unwrap(), 3);
+            assert_eq!(shown.len(), 3);
+            assert!(shown.iter().all(|key| first.contains(key)));
+        }
+    }
+
+    #[test]
+    fn reroll_preserves_total_deadline_and_other_owner_cannot_select() {
+        let app = app();
+        let mut port = FakePlayback {
+            current: None,
+            played: Vec::new(),
+        };
+        app.add("甲", &track("a"), 0).unwrap();
+        let now = Instant::now();
+        app.execute("甲", &PlaylistCommand::Open, &mut port, now, 7)
+            .unwrap();
+        app.execute("乙", &PlaylistCommand::Select(1), &mut port, now, 7)
+            .unwrap();
+        assert!(port.played.is_empty());
+        assert_eq!(app.window_len("甲", now).unwrap(), 1);
+        app.execute(
+            "甲",
+            &PlaylistCommand::Reroll,
+            &mut port,
+            now + Duration::from_secs(19),
+            8,
+        )
+        .unwrap();
+        assert_eq!(app.window_len("甲", now + WINDOW_TTL).unwrap(), 0);
+        assert_eq!(
+            app.state.windows.lock().unwrap()["甲"].deadline,
+            now + WINDOW_TTL
+        );
     }
 
     #[test]

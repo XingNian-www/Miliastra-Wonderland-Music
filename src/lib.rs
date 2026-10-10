@@ -9,6 +9,7 @@ mod debug_plugin_dispatch;
 mod debug_plugin_process;
 mod debug_plugin_session;
 mod debug_plugin_stdio;
+mod debug_read_only;
 mod debug_sandbox;
 mod debug_sandbox_journal;
 mod debug_sandbox_runner;

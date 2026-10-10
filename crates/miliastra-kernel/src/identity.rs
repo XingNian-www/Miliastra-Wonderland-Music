@@ -14,10 +14,6 @@ impl BusinessOperationId {
         Self(value)
     }
 
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
     pub const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(value) => Some(Self(value)),
@@ -84,10 +80,6 @@ impl SessionGeneration {
 
     pub const fn new(value: u64) -> Self {
         Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
     }
 
     pub const fn checked_next(self) -> Option<Self> {

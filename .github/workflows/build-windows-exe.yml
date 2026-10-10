@@ -16,12 +16,15 @@ on:
       - .github/workflows/build-windows-exe.yml
       - Cargo.toml
       - Cargo.lock
+      - build.rs
+      - rust-toolchain.toml
       - README.md
       - THIRD_PARTY_NOTICES.md
       - assets/**
       - config.example.yaml
       - crates/**
       - docs/**
+      - examples/**
       - scripts/**
       - turtle_soup.example.yaml
       - undercover.example.yaml
@@ -36,9 +39,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   LIBCLANG_PATH: C:\Program Files\LLVM\bin
-  # v2.3.1 当前解析到提交 14ac4de60307e7674c9023a9f226dd89ca907171。
-  # 下面的下载步骤还会校验 SHA-256，标签被重新指向其他内容时直接失败。
-  OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/v2.3.1/models
+  # OCR 源码与模型固定到 Cargo.lock 锁定的提交。
+  # 下载步骤另外校验 SHA-256，确保模型内容符合预期。
+  OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/7368dfa292ab988e8431de4ec952f015bec40635/models
 
 jobs:
   build-windows-exe:
@@ -50,7 +53,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -116,7 +119,9 @@ jobs:
       - name: 编译 Release EXE
         run: |
           cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Workspace release build failed' }
           cargo build --release --target x86_64-pc-windows-msvc --example ensure-config-db --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Configuration helper build failed' }
 
       - name: 解析发布版本
         id: version

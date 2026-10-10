@@ -242,6 +242,17 @@ pub(crate) enum AtomicCommand {
     },
 }
 
+impl AtomicCommand {
+    /// 只观测白名单；确保窗口/前台仅检查，不激活、聚焦或恢复输入设备。
+    /// 新增命令默认拒绝，业务命令即使不经过 UI runtime 也不属于只读。
+    pub(crate) fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Capture | Self::Wait { .. } | Self::EnsureWindow | Self::EnsureForeground
+        )
+    }
+}
+
 /// 聊天发送的默认前缀，与应用控制台指令保持一致。
 fn default_chat_prefix() -> String {
     "[控制台]: ".to_string()

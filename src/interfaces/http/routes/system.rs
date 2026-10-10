@@ -137,6 +137,9 @@ pub(super) fn tool_ocr_route(
             state.config.screen.expected_height,
         )
     });
+    if rect.is_some_and(|rect| rect.width == 0 || rect.height == 0) {
+        return Err(bad_request("rect参数无效: 裁剪区域必须与画布相交"));
+    }
     enqueue_web_tool(state, WebToolRequest::Ocr { rect })
 }
 

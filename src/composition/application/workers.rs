@@ -665,6 +665,7 @@ impl ApplicationRuntime {
                 hall_application: self.business.hall_application,
                 idiom_chain_application: self.business.idiom_chain_application,
                 tarot_application: self.business.tarot_application.clone(),
+                playlist_application: self.business.playlist_application.clone(),
                 turtle_soup_application: self.business.turtle_soup_application,
                 undercover_game: self.business.undercover_game.clone(),
                 moderation: self.business.moderation.clone(),

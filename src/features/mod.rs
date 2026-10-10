@@ -11,6 +11,7 @@ pub(crate) mod idiom_chain;
 pub(crate) mod invite;
 pub(crate) mod moderation;
 pub(crate) mod playback;
+pub(crate) mod playlist;
 pub(crate) mod song_request;
 pub(crate) mod startup;
 pub(crate) mod tarot;

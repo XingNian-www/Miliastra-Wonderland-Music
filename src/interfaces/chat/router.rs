@@ -26,6 +26,7 @@ pub(crate) enum ChatCommandModule {
     CardGame,
     TurtleSoup,
     Tarot,
+    Playlist,
     Undercover,
     Invite,
     Moderation,
@@ -195,6 +196,10 @@ impl<'a> ChatCommandRouter<'a> {
             }
             ChatCommandModule::Tarot => crate::features::tarot::TarotCommand::parse_chat(envelope)
                 .map(|matched| matched.map(ModuleCommand::Tarot)),
+            ChatCommandModule::Playlist => {
+                crate::features::playlist::PlaylistCommand::parse_chat(envelope)
+                    .map(|matched| matched.map(ModuleCommand::Playlist))
+            }
             ChatCommandModule::Undercover => {
                 route_undercover(envelope).map(|matched| matched.map(ModuleCommand::Undercover))
             }
@@ -237,6 +242,10 @@ impl<'a> ChatCommandRouter<'a> {
                     ModerationCommand::claims_chat,
                 ),
                 (ChatCommandModule::Hall, HallCommand::claims_chat),
+                (
+                    ChatCommandModule::Playlist,
+                    crate::features::playlist::PlaylistCommand::claims_chat,
+                ),
             ],
         };
         candidates

@@ -453,10 +453,7 @@ fn ocr_tolerant_command_text(text: &str) -> Option<String> {
 }
 
 /// 命令尾部常见 OCR 噪声：中文/英文标点、括号、引号、省略号与空白。
-const OCR_TRAILING_NOISE: &[char] = &[
-    '，', ',', '。', '.', '！', '!', '？', '?', '、', '；', ';', '：', ':', '·', '…', '~', '～',
-    '—', '」', '』', '”', '’', '）', ')', '】', ']', ' ', '\t', '　',
-];
+use crate::text::OCR_TRAILING_NOISE;
 
 /// 命令头部常见 OCR 噪声：空白与普通标点（# / @ 前缀在 envelope 中已剥离）。
 const OCR_LEADING_NOISE: &[char] = &[

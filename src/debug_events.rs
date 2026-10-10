@@ -31,17 +31,6 @@ pub(crate) struct DebugEvent {
     pub at_ms: u64,
 }
 
-impl DebugEvent {
-    pub(crate) fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "sequence": self.sequence,
-            "kind": self.kind,
-            "payload": self.payload,
-            "atMs": self.at_ms,
-        })
-    }
-}
-
 pub(crate) struct DebugEventBus {
     sender: broadcast::Sender<DebugEvent>,
     sequence: AtomicU64,
@@ -74,21 +63,42 @@ impl DebugEventBus {
         kind: impl Into<String>,
         payload: serde_json::Value,
     ) -> DebugEvent {
+        // Sequence allocation, replay and broadcast share the same publication order.
+        let mut replay = self
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let event = DebugEvent {
             sequence: self.sequence.fetch_add(1, Ordering::SeqCst) + 1,
             kind: kind.into(),
             payload,
             at_ms: now_ms(),
         };
-        if let Ok(mut replay) = self.replay.lock() {
-            replay.push_back(event.clone());
-            while replay.len() > REPLAY_CAPACITY {
-                replay.pop_front();
-            }
+        replay.push_back(event.clone());
+        while replay.len() > REPLAY_CAPACITY {
+            replay.pop_front();
         }
         // 无订阅者时 send 会返回 Err，这是正常情况，不是错误。
         let _ = self.sender.send(event.clone());
         event
+    }
+
+    /// Atomically join replay and live delivery: no gap or duplicated boundary event.
+    pub(crate) fn subscribe_replay_after(
+        &self,
+        since: u64,
+    ) -> (Vec<DebugEvent>, broadcast::Receiver<DebugEvent>) {
+        let replay = self
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let receiver = self.sender.subscribe();
+        let events = replay
+            .iter()
+            .filter(|event| event.sequence > since)
+            .cloned()
+            .collect();
+        (events, receiver)
     }
 
     /// 序号严格大于 since 的缓存事件，供断线重连补齐。
@@ -138,6 +148,39 @@ mod tests {
         assert_eq!(bus.latest_sequence(), 3);
         // 类型和载荷必须原样保留，不能在这里被改写。
         assert_eq!(second.kind, "b");
+    }
+
+    #[test]
+    fn concurrent_publishers_keep_replay_and_live_in_sequence_order() {
+        let bus = std::sync::Arc::new(DebugEventBus::new());
+        let (replay, mut receiver) = bus.subscribe_replay_after(0);
+        assert!(replay.is_empty());
+        let workers = (0..8)
+            .map(|_| {
+                let bus = bus.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..32 {
+                        bus.publish("parallel", serde_json::json!({}));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let live = (1..=256)
+            .map(|expected| {
+                let event = receiver.try_recv().unwrap();
+                assert_eq!(event.sequence, expected);
+                event
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(live, bus.replay_after(0));
+        let (replay, mut receiver) = bus.subscribe_replay_after(250);
+        assert_eq!(replay.len(), 6);
+        assert!(receiver.try_recv().is_err());
+        let last = bus.publish("after-boundary", serde_json::json!({}));
+        assert_eq!(receiver.try_recv().unwrap(), last);
     }
 
     #[test]

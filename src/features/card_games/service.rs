@@ -439,11 +439,6 @@ impl PendingCardGameEffect {
             )
         )
     }
-
-    fn aborts_after(&self, result: &CardGameEffectResult) -> bool {
-        let _ = result;
-        false
-    }
 }
 
 pub struct CardGameService {
@@ -767,13 +762,7 @@ impl CardGameService {
             bail!("card game effect result does not match the suspended effect");
         }
         let continues = pending_state.effect.continues_after(&result);
-        let aborts = pending_state.effect.aborts_after(&result);
         if continues && let Err(error) = ensure_operation_capacity(&self.state) {
-            reset_transient_state(&mut self.state);
-            Self::release_active_card_game(entertainment);
-            return Err(error);
-        }
-        if aborts && let Err(error) = ensure_generation_capacity(&self.state) {
             reset_transient_state(&mut self.state);
             Self::release_active_card_game(entertainment);
             return Err(error);

@@ -18,22 +18,20 @@ pub(crate) use scan::{
     prepare_chat_scan_with_markers, recognize_prepared_chat, scan_chat_markers,
 };
 pub(crate) use secondary_unread_vision::{
-    FriendUnreadLayout, UnreadFriendHit, find_unread_friend_hits, friend_name_region,
-    unread_hit_still_visible,
+    FriendUnreadLayout, UnreadFriendHit, find_unread_friend_hits, unread_hit_still_visible,
 };
 pub(crate) use stream::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
-    CompletionAdvanceSubscriber, PrimaryDecisionSubscriber, PrimaryObservationCursor,
-    PrimaryObservedMessage, SecondaryChatObservation, SecondaryObservedMessage,
-    SecondaryRecognizedMessage,
+    CompletionAdvanceSubscriber, PrimaryObservedMessage, SecondaryChatObservation,
+    SecondaryObservedMessage,
 };
 pub(crate) use visual::{
-    SecondaryChatIdentity, SecondaryHallBubble, hall_bubble_layout_is_stable,
-    hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap,
-    latest_incoming_bubble_rect, latest_incoming_fingerprint, secondary_hall_bubbles,
+    SecondaryChatIdentity, SecondaryHallBubble, hall_bubble_sequence_is_retained_prefix,
+    hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
+    secondary_hall_bubbles,
 };
 
-#[cfg(all(test, feature = "ocr-mnn"))]
+#[cfg(test)]
 pub(crate) use visual::SECONDARY_TITLE_RECT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

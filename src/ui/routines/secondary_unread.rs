@@ -7,15 +7,13 @@ use super::friend_delivery::{
 };
 use crate::observation::chat::{
     ChatIdentity, ChatOcrSnapshot, FriendUnreadLayout, SharedChatOcr, UnreadFriendHit,
-    find_unread_friend_hits, latest_incoming_bubble_rect, latest_incoming_fingerprint,
-    unread_hit_still_visible,
+    find_unread_friend_hits, latest_incoming_fingerprint, unread_hit_still_visible,
 };
 use crate::runtime::ocr::OcrRuntimeHandle;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
 };
-use crate::ui::geometry::Rect;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessSecondaryUnread {
@@ -500,6 +498,7 @@ fn optional_fingerprint_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::geometry::Rect;
 
     #[test]
     fn unread_selection_promotes_latest_incoming_without_replaying_history() {

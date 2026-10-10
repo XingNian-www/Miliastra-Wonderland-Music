@@ -1049,7 +1049,7 @@ mod tests {
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
     use anyhow::Result;
-    use image::{DynamicImage, GenericImage};
+    use image::DynamicImage;
 
     use super::*;
 

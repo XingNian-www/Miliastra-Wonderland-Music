@@ -256,9 +256,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         consecutive_failures = consecutive_failures.saturating_add(1);
         if next_child_handoff.config_reload {
             let delay_ms = watchdog_backoff_ms(cached_restart_ms, consecutive_failures);
-            eprintln!(
-                "配置重载替代进程尚未 ready，继续使用热启动路径；{delay_ms}ms 后重试"
-            );
+            eprintln!("配置重载替代进程尚未 ready，继续使用热启动路径；{delay_ms}ms 后重试");
             sleep(Duration::from_millis(delay_ms));
             continue;
         }

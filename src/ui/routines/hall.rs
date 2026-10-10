@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
     before_input_failure, capture_normalized, confirm_primary_residency, friend_list_drag_points,
-    restore_residency, sleep_ms,
+    restore_residency, wait_ms,
 };
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -271,8 +271,15 @@ impl UiRoutine for ToggleMicrophoneRoutine {
         let effect = match prepare_primary(context, &self.ocr, &self.config) {
             Ok(()) => match context.device().press_key(Key::Unicode('n')) {
                 Ok(()) => {
-                    sleep_ms(100);
-                    ToggleMicrophoneEffect::Toggled
+                    match wait_ms(
+                        context,
+                        100,
+                        "toggle_microphone",
+                        InputCertainty::AfterInputUnknown,
+                    ) {
+                        Ok(()) => ToggleMicrophoneEffect::Toggled,
+                        Err(failure) => ToggleMicrophoneEffect::Failed(failure),
+                    }
                 }
                 Err(error) => ToggleMicrophoneEffect::Failed(UiRoutineFailure::new(
                     InputCertainty::AfterInputUnknown,
@@ -355,7 +362,12 @@ fn read_hall_info_transaction(
     }
     let screenshot = Arc::new(screenshot);
     while samples.len() < HALL_INFO_OCR_SAMPLES {
-        sleep_ms(config.sample_interval_ms);
+        wait_ms(
+            context,
+            config.sample_interval_ms,
+            "capture_hall_info",
+            InputCertainty::AfterInputUnknown,
+        )?;
         let image = capture_normalized(
             context,
             &config.residency,
@@ -387,7 +399,12 @@ fn wait_for_hall_page_ready(
 ) -> Result<(image::DynamicImage, HallInfoSample), UiRoutineFailure> {
     // F2 可能让黑色过渡画面持续超过常规稳定等待。不要把该画面作为截图返回，
     // 应等待大厅内容可见，并在正常大厅信息样本中复用 OCR 结果。
-    sleep_ms(config.page_settle_ms);
+    wait_ms(
+        context,
+        config.page_settle_ms,
+        "wait_hall_page_ready",
+        InputCertainty::AfterInputUnknown,
+    )?;
     let timeout_ms = HALL_PAGE_READY_TIMEOUT_MS.max(config.page_settle_ms);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let poll_ms = config.sample_interval_ms.max(50);
@@ -414,7 +431,12 @@ fn wait_for_hall_page_ready(
                 "hall page did not produce visible OCR content before timeout",
             ));
         }
-        sleep_ms(poll_ms);
+        wait_ms(
+            context,
+            poll_ms,
+            "wait_hall_page_ready",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
 }
 
@@ -423,7 +445,7 @@ fn hall_page_has_content(
     config: &HallRoutineConfig,
 ) -> Result<bool, UiRoutineFailure> {
     // 亮像素阈值取 64：真实过场/加载帧的暗色底是 (29,28,34)，亮度约 29，
-    // 原阈值 24 连背景都会判成"有内容"（证据：docs/ui-state-evidence/loading-screens/）；
+    // 原阈值 24 连背景都会判成"有内容"（证据：technical-docs/ui-state-evidence/loading-screens/）；
     // 真实大厅标题区是亮底白字，区域内像素几乎全部 ≥ 128。64 夹在两者之间。
     for region in [config.hall_name_region, config.hall_time_region] {
         let crop = crop_canvas(image, region)

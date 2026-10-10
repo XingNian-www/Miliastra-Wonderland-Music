@@ -24,6 +24,17 @@ impl UiStateObservationConfig {
     }
 }
 
+pub(super) fn wait_ms(
+    context: &mut UiRoutineContext<'_>,
+    ms: u64,
+    stage: &'static str,
+    certainty: InputCertainty,
+) -> Result<(), UiRoutineFailure> {
+    context
+        .wait_cancellable(Duration::from_millis(ms))
+        .map_err(|failure| UiRoutineFailure::new(certainty, stage, failure.reason()))
+}
+
 pub(super) fn capture_normalized_ui_state(
     context: &mut UiRoutineContext<'_>,
     config: &UiStateObservationConfig,
@@ -136,6 +147,6 @@ fn wait_for_stable_ui_kind_internal(
                 ),
             ));
         }
-        std::thread::sleep(Duration::from_millis(config.poll_ms));
+        wait_ms(context, config.poll_ms, stage, certainty)?;
     }
 }

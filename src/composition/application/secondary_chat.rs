@@ -276,9 +276,6 @@ fn secondary_hall_command_observation(
     })
 }
 
-type SecondaryHallCommandStability =
-    Option<(Frame, Vec<SecondaryHallBubble>, Vec<SecondaryOcrMessage>)>;
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct SecondaryListenerRoundOutcome {
     pub(super) scanned: bool,
@@ -314,7 +311,18 @@ impl ApplicationRuntime {
             self.lifecycle.config.screen.expected_height,
             self.lifecycle.config.invite.friend_list_region.into(),
         );
-        let observed_identity = self.secondary_identity_from_frame(image)?;
+        let shared_snapshot = self.ui.shared_ocr.latest()?;
+        let observed_identity = if shared_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.chat == crate::observation::chat::ChatIdentity::SecondaryHall
+        }) {
+            SecondaryChatIdentity::CurrentHall
+        } else {
+            SecondaryChatIdentity::Unknown
+        };
+        let scanned = shared_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.chat == crate::observation::chat::ChatIdentity::SecondaryHall
+        });
+        let verified = observed_identity == SecondaryChatIdentity::CurrentHall;
         let identity_changed = identity.as_ref() != Some(&observed_identity);
         if identity_changed {
             hall_bubble_sequence.take();
@@ -344,16 +352,6 @@ impl ApplicationRuntime {
                 return Ok(SecondaryListenerRoundOutcome::default());
             }
             *last_friend_bubble = latest_incoming_fingerprint(image)?;
-            let bubbles = secondary_hall_bubbles(image)?;
-            *hall_bubble_sequence = Some(bubbles.clone());
-            let messages = self.recognize_secondary_bubble_rects(
-                image,
-                bubbles
-                    .iter()
-                    .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
-                "blue",
-            )?;
-            hall_command_tracker.commit(&messages);
             self.business
                 .business
                 .finish_chat_listener_initial_unread_clear()?;
@@ -368,15 +366,10 @@ impl ApplicationRuntime {
         match current_identity {
             SecondaryChatIdentity::CurrentHall => {
                 if state.hall_round_required {
-                    let scanned = self.scan_secondary_hall_if_changed(
-                        image,
-                        hall_bubble_sequence,
-                        hall_command_tracker,
-                    )?;
                     self.business.business.finish_chat_listener_hall_round()?;
                     return Ok(SecondaryListenerRoundOutcome {
                         scanned,
-                        verified: true,
+                        verified,
                         ..Default::default()
                     });
                 }
@@ -387,14 +380,9 @@ impl ApplicationRuntime {
                     self.queue_secondary_unread_task(hit, false)?;
                     return Ok(SecondaryListenerRoundOutcome::default());
                 }
-                let scanned = self.scan_secondary_hall_if_changed(
-                    image,
-                    hall_bubble_sequence,
-                    hall_command_tracker,
-                )?;
                 Ok(SecondaryListenerRoundOutcome {
                     scanned,
-                    verified: true,
+                    verified,
                     ..Default::default()
                 })
             }
@@ -444,108 +432,6 @@ impl ApplicationRuntime {
         Ok(true)
     }
 
-    fn scan_secondary_hall_if_changed(
-        &mut self,
-        image: &DynamicImage,
-        previous: &mut Option<Vec<SecondaryHallBubble>>,
-        tracker: &mut SecondaryHallCommandTracker,
-    ) -> Result<bool> {
-        let live_config = self.lifecycle.live_configs.snapshot();
-        let current = secondary_hall_bubbles(image)?;
-        let delta = secondary_hall_sequence_delta(previous.as_deref(), &current);
-        match delta {
-            SecondaryHallSequenceDelta::EstablishBaseline => {
-                self.business
-                    .business
-                    .clear_turtle_soup_secondary_stability()?;
-                tracker.begin_scan(Instant::now());
-                let messages = self.recognize_secondary_bubble_rects(
-                    image,
-                    current
-                        .iter()
-                        .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
-                    "blue",
-                )?;
-                tracker.commit(&messages);
-                *previous = Some(current);
-                log::debug!("二级大厅气泡序列尚未建立，当前仅记录基线");
-                return Ok(false);
-            }
-            SecondaryHallSequenceDelta::RetainedPrefix => {
-                if !tracker.scan_due(Instant::now(), live_config.timing.chat_scan.fallback_ms) {
-                    log::debug!("二级大厅当前只显示旧序列前缀，保留原基线等待完整观测");
-                    return Ok(false);
-                }
-            }
-            SecondaryHallSequenceDelta::NoChange => {
-                if !tracker.scan_due(Instant::now(), live_config.timing.chat_scan.fallback_ms) {
-                    self.business
-                        .business
-                        .clear_turtle_soup_secondary_stability()?;
-                    return Ok(false);
-                }
-            }
-            SecondaryHallSequenceDelta::LostOverlap | SecondaryHallSequenceDelta::NewFrom(_) => {}
-        }
-
-        tracker.begin_scan(Instant::now());
-
-        let Some((refreshed, refreshed_bubbles, messages)) =
-            self.wait_for_secondary_hall_command_stability()?
-        else {
-            log::debug!("二级大厅新增消息尚未稳定，保留旧基线等待下一轮");
-            return Ok(false);
-        };
-        let same_layout = previous
-            .as_deref()
-            .is_some_and(|previous| hall_bubble_layout_is_stable(previous, &refreshed_bubbles));
-        if tracker.should_hold_incomplete(&messages, same_layout) {
-            *previous = Some(refreshed_bubbles);
-            log::debug!("二级大厅 OCR 候选数量减少但布局未变，保留命令基线等待重试");
-            return Ok(false);
-        }
-        let new_indexes = tracker.preview_new_indexes(&messages);
-        if new_indexes.is_empty() {
-            self.business
-                .business
-                .clear_turtle_soup_secondary_stability()?;
-            tracker.commit(&messages);
-            *previous = Some(refreshed_bubbles);
-            log::debug!("二级大厅命令形式未发现新增，已更新相对位置基线");
-            return Ok(false);
-        }
-        let new_messages = messages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| new_indexes.contains(&index).then_some(message.clone()))
-            .collect::<Vec<_>>();
-        log::info!(
-            "二级大厅命令形式检测到 {} 条新增候选，按相对顺序 OCR 结果处理",
-            new_messages.len()
-        );
-        let observation_frame = self
-            .ui
-            .chat_observations
-            .begin_frame(refreshed.captured_at)?;
-        let accepts_turtle_questions =
-            self.commands_enabled()? && self.business.business.turtle_soup_accepts_questions()?;
-        let outcome = self.process_secondary_recognized_messages(
-            observation_frame,
-            "blue",
-            "",
-            accepts_turtle_questions,
-            new_messages,
-        )?;
-        if outcome.confirmation_pending {
-            log::debug!("二级大厅身份相关输入或海龟汤 OCR 尚未稳定，保留命令形式基线等待下轮复核");
-            *previous = Some(refreshed_bubbles);
-            return Ok(false);
-        }
-        tracker.commit(&messages);
-        *previous = Some(refreshed_bubbles);
-        Ok(outcome.processed)
-    }
-
     pub(super) fn execute_secondary_unread_task(
         &mut self,
         hit: UnreadFriendHit,
@@ -561,35 +447,13 @@ impl ApplicationRuntime {
             .wait()
             .context("等待二级好友未读 UI 事务")?;
         let processed_message = match outcome.effect() {
-            SecondaryUnreadEffect::Message {
-                captured_at,
-                friend_name,
-                text,
-            } => {
-                let frame = self.ui.chat_observations.begin_frame(*captured_at)?;
-                self.lifecycle
-                    .monitor
-                    .publish(MonitorEvent::Ocr(OcrSnapshot::new(
-                        1,
-                        vec![format!("[pink] {}", redacted_chat_text(text))],
-                        0,
-                        0,
-                        0,
-                        "二级好友私聊",
-                    )));
-                let dispatches = self.ui.chat_observations.publish_secondary(
-                    frame,
-                    "pink",
-                    friend_name,
-                    false,
-                    vec![SecondaryRecognizedMessage {
-                        text: text.clone(),
-                        sender: None,
-                    }],
-                )?;
-                completion.mark_message_processed();
-                self.dispatch_chat_observations(dispatches)?;
-                true
+            SecondaryUnreadEffect::Message { .. } => {
+                // The UI transaction waits for fresh shared OCR before restoring the hall.
+                // The retained business subscriber owns dispatch; this task only releases its claim.
+                if !discard_only {
+                    completion.mark_message_processed();
+                }
+                !discard_only
             }
             SecondaryUnreadEffect::Discarded
             | SecondaryUnreadEffect::NoMessage
@@ -623,29 +487,6 @@ impl ApplicationRuntime {
         result.context("二级监听暂时无法恢复当前大厅，已保留二级模式并等待重试")
     }
 
-    fn secondary_identity_from_frame(&self, image: &DynamicImage) -> Result<SecondaryChatIdentity> {
-        let anchor: Rect = self.lifecycle.config.screen.secondary_hall_rect.into();
-        let friend_list: Rect = self.lifecycle.config.invite.friend_list_region.into();
-        let hall_rect = Rect::new(
-            anchor.x.min(friend_list.x),
-            anchor.y.min(friend_list.y),
-            (anchor.right().max(friend_list.right()) - anchor.x.min(friend_list.x)) as u32,
-            (anchor.bottom().max(friend_list.bottom()) - anchor.y.min(friend_list.y)) as u32,
-        );
-        let hall = best_template_hit(
-            image,
-            Some(hall_rect),
-            &self.lifecycle.config.templates.secondary_hall,
-            self.lifecycle.config.templates.marker_threshold,
-        )?
-        .is_some();
-        Ok(if hall {
-            SecondaryChatIdentity::CurrentHall
-        } else {
-            SecondaryChatIdentity::Unknown
-        })
-    }
-
     pub(super) fn begin_chat_decision_reader<A, P>(
         &self,
         scope: ChatDecisionScope,
@@ -657,378 +498,172 @@ impl ApplicationRuntime {
         P: Fn(&str) -> bool,
     {
         let observation_session = self.ui.chat_observations.begin_exclusive()?;
-        let use_secondary = scope == ChatDecisionScope::CurrentHall
-            && self.active_ui_residency()? == UiResidency::SecondaryCurrentHall;
-        if use_secondary {
-            let image = self
-                .ui
-                .residency_ui
-                .observe(UiResidencyTarget::SecondaryCurrentHall)
-                .context("提交二级当前大厅确认基线观察")?
-                .wait()
-                .context("等待二级当前大厅确认基线观察")?
-                .map_err(|failure| anyhow!("建立二级当前大厅确认基线失败：{failure}"))?;
-            let previous = secondary_hall_bubbles(&image)?;
-            let messages = self.recognize_secondary_hall_messages(&image, &previous)?;
-            return Ok(ChatDecisionReader {
-                kind: ChatDecisionReaderKind::SecondaryCurrentHall { previous },
-                screen_lock: DecisionScreenLock::from_messages(
-                    &messages,
-                    accepts_message_type,
-                    is_decision,
-                ),
-                _observation_session: observation_session,
-            });
-        }
-
-        let cursor_before_scan = self.ui.chat_observations.primary_cursor()?;
-        let image = self
-            .ui
-            .residency_ui
-            .observe(UiResidencyTarget::Primary)
-            .context("提交一级聊天确认基线观察")?
-            .wait()
-            .context("等待一级聊天确认基线观察")?
-            .map_err(|failure| anyhow!("建立一级聊天确认基线失败：{failure}"))?;
-        let template_args = self.ui.chat_templates.clone();
-        let messages = self.scan_chat_with_shared_ocr(&image, &template_args, None)?;
-        let observed = self.ui.chat_observations.observe_primary(messages)?;
-        let cursor = match cursor_before_scan {
-            Some(cursor) => Some(cursor),
-            None => self.ui.chat_observations.primary_cursor()?,
+        let listener_mode = self.business.business.chat_listener_snapshot()?.mode;
+        let chat = if scope == ChatDecisionScope::CurrentHall
+            && self.active_ui_residency()? == UiResidency::SecondaryCurrentHall
+        {
+            crate::observation::chat::ChatIdentity::SecondaryHall
+        } else {
+            crate::observation::chat::ChatIdentity::PrimaryHall
         };
-        let pending = cursor_before_scan
-            .map(|cursor| primary_messages_after_cursor(observed, cursor))
-            .unwrap_or_default();
+        let subscriber = self.ui.shared_ocr.subscribe()?;
+        let refresh = self.ui.shared_ocr.request_refresh()?;
+        let deadline = Instant::now()
+            + Duration::from_millis(self.lifecycle.config.timing.decision.timeout_ms);
+        let baseline = loop {
+            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                return Err(anyhow!("运行已停止，已结束确认窗口"));
+            }
+            if self.lifecycle.live_configs.has_pending_reload() {
+                return Err(anyhow!("配置重载待处理，已结束确认窗口"));
+            }
+            let mode = self.business.business.chat_listener_snapshot()?;
+            if mode.mode != listener_mode || mode.pending_mode.is_some() {
+                return Err(anyhow!("监听模式正在切换，已结束确认窗口"));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("等待共享聊天确认基线超时"));
+            }
+            if let Some(snapshot) = self
+                .ui
+                .shared_ocr
+                .wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50)))?
+            {
+                break snapshot;
+            }
+        };
+        if baseline.chat != chat {
+            return Err(anyhow!("共享聊天确认基线会话不匹配"));
+        }
+        subscriber.bind_chat(chat.clone(), baseline.visual_session)?;
+        let baseline_cursor = Some((
+            baseline.visual_session,
+            baseline
+                .messages
+                .iter()
+                .map(|message| message.id.bubble_sequence.get())
+                .max()
+                .unwrap_or(0),
+        ));
+        let messages = baseline
+            .messages
+            .iter()
+            .map(|message| ChatMessage {
+                message_type: message.message_type.clone(),
+                block: message.block,
+                text: message.text.clone(),
+            })
+            .collect::<Vec<_>>();
         Ok(ChatDecisionReader {
-            kind: ChatDecisionReaderKind::Primary { cursor, pending },
-            screen_lock: DecisionScreenLock::default(),
+            listener_mode,
+            subscriber,
+            chat,
+            baseline_at: baseline.captured_at,
+            baseline_cursor,
+            seen: baseline
+                .messages
+                .into_iter()
+                .map(|message| (message.id, message.text))
+                .collect(),
+            screen_lock: DecisionScreenLock::from_messages(
+                &messages,
+                accepts_message_type,
+                is_decision,
+            ),
             _observation_session: observation_session,
         })
+    }
+
+    pub(super) fn wait_for_chat_decision_messages(
+        &self,
+        reader: &mut ChatDecisionReader,
+        configured_ms: u64,
+        remaining: Duration,
+    ) -> Result<Vec<ChatMessage>> {
+        let wait_until = Instant::now() + remaining;
+        let result = (|| {
+            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                return Ok(Vec::new());
+            }
+            let messages = self.poll_chat_decision_reader(reader)?;
+            if !messages.is_empty() {
+                return Ok(messages);
+            }
+            reader.wait_for_input(
+                configured_ms,
+                wait_until.saturating_duration_since(Instant::now()),
+            )?;
+            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                return Ok(Vec::new());
+            }
+            self.poll_chat_decision_reader(reader)
+        })();
+        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            return Ok(Vec::new());
+        }
+        if let Err(error) = &result {
+            log::error!("确认窗口读取失败: {error:#}");
+            if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                if let Err(reply_error) =
+                    self.reply("确认窗口已结束：无法继续读取聊天，请稍后重试。")
+                {
+                    log::warn!("确认窗口失败反馈发送失败: {reply_error:#}");
+                }
+            }
+        }
+        result
     }
 
     pub(super) fn poll_chat_decision_reader(
         &self,
         reader: &mut ChatDecisionReader,
     ) -> Result<Vec<ChatMessage>> {
-        match &mut reader.kind {
-            ChatDecisionReaderKind::Primary { cursor, pending } => {
-                if !pending.is_empty() {
-                    return Ok(std::mem::take(pending));
-                }
-                let template_args = self.ui.chat_templates.clone();
-                let canvas = Canvas {
-                    width: self.lifecycle.config.screen.expected_width,
-                    height: self.lifecycle.config.screen.expected_height,
-                    resize: true,
-                };
-                let frame = load_frame(&canvas, &self.ui.game_ui)?;
-                let messages =
-                    self.scan_chat_with_shared_ocr(&frame.image, &template_args, None)?;
-                let observed = self.ui.chat_observations.observe_primary(messages)?;
-                let Some(current_cursor) = *cursor else {
-                    *cursor = self.ui.chat_observations.primary_cursor()?;
-                    return Ok(Vec::new());
-                };
-                Ok(primary_messages_after_cursor(observed, current_cursor))
-            }
-            ChatDecisionReaderKind::SecondaryCurrentHall { previous } => {
-                self.scan_secondary_decision_messages(previous)
-            }
+        if self.lifecycle.live_configs.has_pending_reload() {
+            return Err(anyhow!("配置重载待处理，已结束确认窗口"));
         }
+        let snapshot = self.business.business.chat_listener_snapshot()?;
+        if snapshot.mode != reader.listener_mode || snapshot.pending_mode.is_some() {
+            return Err(anyhow!("监听模式正在切换，已结束确认窗口"));
+        }
+        reader.read_messages()
     }
 
-    fn scan_secondary_decision_messages(
+    pub(super) fn classify_secondary_business_message(
         &self,
-        previous: &mut Vec<SecondaryHallBubble>,
-    ) -> Result<Vec<ChatMessage>> {
-        let canvas = Canvas {
-            width: self.lifecycle.config.screen.expected_width,
-            height: self.lifecycle.config.screen.expected_height,
-            resize: true,
-        };
-        let frame = load_frame(&canvas, &self.ui.game_ui)?;
-        let current = secondary_hall_bubbles(&frame.image)?;
-        match secondary_hall_sequence_delta(Some(previous), &current) {
-            SecondaryHallSequenceDelta::RetainedPrefix => {
-                log::debug!("二级确认当前只显示旧序列前缀，保留原基线");
-                return Ok(Vec::new());
-            }
-            SecondaryHallSequenceDelta::NoChange => return Ok(Vec::new()),
-            SecondaryHallSequenceDelta::EstablishBaseline => unreachable!("baseline is present"),
-            SecondaryHallSequenceDelta::LostOverlap | SecondaryHallSequenceDelta::NewFrom(_) => {}
-        }
-
-        let Some((refreshed, refreshed_bubbles)) = self.wait_for_secondary_hall_stability()? else {
-            log::debug!("二级确认消息尚未稳定，保留旧基线等待下一轮");
-            return Ok(Vec::new());
-        };
-        let start = match secondary_hall_sequence_delta(Some(previous), &refreshed_bubbles) {
-            SecondaryHallSequenceDelta::NewFrom(start) => start,
-            SecondaryHallSequenceDelta::RetainedPrefix => {
-                log::debug!("二级确认稳定观测仍只是旧序列前缀，保留原基线");
-                return Ok(Vec::new());
-            }
-            SecondaryHallSequenceDelta::NoChange => return Ok(Vec::new()),
-            SecondaryHallSequenceDelta::EstablishBaseline => unreachable!("baseline is present"),
-            SecondaryHallSequenceDelta::LostOverlap => {
-                let messages =
-                    self.recognize_secondary_hall_messages(&refreshed.image, &refreshed_bubbles)?;
-                *previous = refreshed_bubbles;
-                log::debug!("二级确认气泡稳定后失去重叠，重新检查当前可见决策命令");
-                return Ok(messages);
-            }
-        };
-        let messages =
-            self.recognize_secondary_hall_messages(&refreshed.image, &refreshed_bubbles[start..])?;
-        *previous = refreshed_bubbles;
-        Ok(messages)
-    }
-
-    fn recognize_secondary_hall_messages(
-        &self,
-        image: &DynamicImage,
-        bubbles: &[SecondaryHallBubble],
-    ) -> Result<Vec<ChatMessage>> {
-        let started = Instant::now();
-        let mut messages = Vec::with_capacity(bubbles.len());
-        for bubble in bubbles {
-            let crop = crop_canvas(image, bubble.rect)?;
-            let text = self.ui.ocr.merged_text(
-                crop,
-                self.lifecycle.config.ocr.same_line_y_tolerance,
-                OcrPriority::ChatObservation,
-            )?;
-            messages.push(ChatMessage {
-                message_type: "blue".to_string(),
-                block: bubble.rect,
-                text,
-            });
-        }
-        let ocr_ms = elapsed_ms(started);
-        self.lifecycle
-            .monitor
-            .publish(MonitorEvent::Ocr(OcrSnapshot::new(
-                messages.len(),
-                messages
-                    .iter()
-                    .map(|message| format!("[blue] {}", redacted_chat_text(&message.text)))
-                    .collect(),
-                0,
-                ocr_ms,
-                ocr_ms,
-                "二级当前大厅",
-            )));
-        Ok(messages)
-    }
-
-    fn recognize_secondary_bubble_rects(
-        &self,
-        image: &DynamicImage,
-        regions: impl IntoIterator<Item = (Rect, Option<Rect>)>,
-        message_type: &str,
-    ) -> Result<Vec<SecondaryOcrMessage>> {
-        let started = Instant::now();
-        let ocr_started = Instant::now();
-        let commands_enabled = self.commands_enabled()?;
-        let accepts_turtle_questions = message_type == "blue"
-            && commands_enabled
-            && self.business.business.turtle_soup_accepts_questions()?;
-        let active_entertainment = self.business.business.active_entertainment()?;
-        let observes_hall = message_type == "blue";
-        let command_router = ChatCommandRouter::with_identity(
+        text: &str,
+        accepts_turtle_questions: bool,
+    ) -> Result<SecondaryHallMessageClassification> {
+        let router = ChatCommandRouter::with_identity(
             &self.business.custom_workflow,
             &self.lifecycle.live_configs.identity,
         );
-        let mut texts = Vec::new();
-        for (rect, sender_rect) in regions {
-            let crop = crop_canvas(image, rect)?;
-            let text = self.ui.ocr.merged_text(
-                crop,
-                self.lifecycle.config.ocr.same_line_y_tolerance,
-                OcrPriority::ChatObservation,
-            )?;
-            let classification = if observes_hall {
-                let routed = secondary_hall_command_text(&text)
-                    .and_then(|command_text| {
-                        CommandEnvelope::new(
-                            &text,
-                            SECONDARY_HALL_FALLBACK_SENDER,
-                            "blue",
-                            command_text,
-                            CommandObservation::default(),
-                        )
-                    })
-                    .or_else(|| {
-                        command::parse_structured_song_envelope(
-                            &text,
-                            SECONDARY_HALL_FALLBACK_SENDER,
-                            "blue",
-                            CommandObservation::default(),
-                        )
-                    })
-                    .and_then(|envelope| command_router.route(&envelope, active_entertainment));
-                classify_secondary_hall_routed_message(
-                    &text,
-                    routed.as_ref(),
-                    accepts_turtle_questions,
-                    commands_enabled,
+        let active_entertainment = self.business.business.active_entertainment()?;
+        let routed = secondary_hall_command_text(text)
+            .and_then(|command_text| {
+                CommandEnvelope::new(
+                    text,
+                    SECONDARY_HALL_FALLBACK_SENDER,
+                    "blue",
+                    command_text,
+                    CommandObservation::default(),
                 )
-            } else {
-                SecondaryHallMessageClassification {
-                    kind: SecondaryHallMessageKind::Command,
-                    requires_sender: false,
-                }
-            };
-            let sender_identity = if classification.requires_sender
-                && let Some(sender_rect) = sender_rect
-            {
-                let crop = crop_canvas(image, sender_rect)?;
-                let raw_sender = self.ui.ocr.merged_text(
-                    crop,
-                    self.lifecycle.config.ocr.same_line_y_tolerance,
-                    OcrPriority::ChatObservation,
-                )?;
-                let identity = parse_secondary_sender_identity(&raw_sender);
-                (!identity.effective_name().trim().is_empty()).then_some(identity)
-            } else {
-                None
-            };
-            let sender = sender_identity
-                .as_ref()
-                .map(|identity| identity.effective_name().to_string());
-            texts.push(SecondaryOcrMessage {
-                text,
-                sender,
-                sender_identity,
-                kind: classification.kind,
-                requires_sender: classification.requires_sender,
-            });
-        }
-        let ocr_ms = elapsed_ms(ocr_started);
-        self.lifecycle
-            .monitor
-            .publish(MonitorEvent::Ocr(OcrSnapshot::new(
-                texts.len(),
-                texts
-                    .iter()
-                    .map(|message| {
-                        format!("[{}] {}", message_type, redacted_chat_text(&message.text))
-                    })
-                    .collect(),
-                0,
-                ocr_ms,
-                elapsed_ms(started),
-                if message_type == "pink" {
-                    "二级好友私聊"
-                } else {
-                    "二级当前大厅"
-                },
-            )));
-        Ok(texts)
-    }
-
-    fn process_secondary_recognized_messages(
-        &mut self,
-        observation_frame: ObservedFrame,
-        message_type: &str,
-        friend_name: &str,
-        accepts_turtle_questions: bool,
-        texts: Vec<SecondaryOcrMessage>,
-    ) -> Result<SecondaryBubbleProcessOutcome> {
-        if texts.iter().any(|message| {
-            message.requires_sender
-                && message
-                    .sender
-                    .as_deref()
-                    .is_none_or(|sender| sender.trim().is_empty())
-        }) {
-            self.ui
-                .chat_observations
-                .complete_without_messages(observation_frame)?;
-            log::debug!("二级大厅身份相关输入的固定发送者区域 OCR 为空，本轮等待昵称加载");
-            return Ok(SecondaryBubbleProcessOutcome {
-                processed: false,
-                confirmation_pending: true,
-            });
-        }
-
-        let mut texts = texts
-            .into_iter()
-            .filter(|message| {
-                message_type != "blue" || message.kind != SecondaryHallMessageKind::Ignored
             })
-            .collect::<Vec<_>>();
-        let turtle_question_indexes = texts
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| {
-                (message.kind == SecondaryHallMessageKind::TurtleQuestion).then_some(index)
+            .or_else(|| {
+                command::parse_structured_song_envelope(
+                    text,
+                    SECONDARY_HALL_FALLBACK_SENDER,
+                    "blue",
+                    CommandObservation::default(),
+                )
             })
-            .collect::<Vec<_>>();
-        if !turtle_question_indexes.is_empty() {
-            let observations = turtle_question_indexes
-                .iter()
-                .map(|index| SecondaryOcrObservation {
-                    text: texts[*index].text.clone(),
-                    player: texts[*index].sender.clone().unwrap_or_default(),
-                })
-                .collect();
-            match self
-                .business
-                .business
-                .stabilize_turtle_soup_secondary(observations)?
-            {
-                SecondaryOcrStability::Pending => {
-                    self.ui
-                        .chat_observations
-                        .complete_without_messages(observation_frame)?;
-                    return Ok(SecondaryBubbleProcessOutcome {
-                        processed: false,
-                        confirmation_pending: true,
-                    });
-                }
-                SecondaryOcrStability::Stable(observations) => {
-                    if observations.len() != turtle_question_indexes.len() {
-                        return Err(anyhow!(
-                            "二级海龟汤 OCR 稳定结果数量不一致: expected={} actual={}",
-                            turtle_question_indexes.len(),
-                            observations.len()
-                        ));
-                    }
-                    for (index, observation) in
-                        turtle_question_indexes.into_iter().zip(observations)
-                    {
-                        texts[index].text = observation.text;
-                        texts[index].sender = Some(observation.player);
-                    }
-                }
-            }
-        } else {
-            self.business
-                .business
-                .clear_turtle_soup_secondary_stability()?;
-        }
-
-        let messages = texts
-            .into_iter()
-            .map(|message| SecondaryRecognizedMessage {
-                text: message.text,
-                sender: message.sender,
-            })
-            .collect();
-        let dispatches = self.ui.chat_observations.publish_secondary(
-            observation_frame,
-            message_type,
-            friend_name,
+            .and_then(|envelope| router.route(&envelope, active_entertainment));
+        Ok(classify_secondary_hall_routed_message(
+            text,
+            routed.as_ref(),
             accepts_turtle_questions,
-            messages,
-        )?;
-        let processed = self.dispatch_chat_observations(dispatches)?;
-        Ok(SecondaryBubbleProcessOutcome {
-            processed,
-            confirmation_pending: false,
-        })
+            self.commands_enabled()?,
+        ))
     }
 
     pub(super) fn process_secondary_chat_observation(
@@ -1069,6 +704,19 @@ impl ApplicationRuntime {
                 &self.business.custom_workflow,
                 &self.lifecycle.live_configs.identity,
             );
+            if message_type == "blue" {
+                let classification =
+                    self.classify_secondary_business_message(&text, accepts_turtle_questions)?;
+                if classification.kind == SecondaryHallMessageKind::Ignored
+                    || (classification.requires_sender
+                        && message_sender
+                            .as_deref()
+                            .is_none_or(|sender| sender.trim().is_empty()))
+                {
+                    log::debug!("二级身份相关输入尚未取得发送者，保留共享消息等待身份修订");
+                    continue;
+                }
+            }
             if let Some(envelope) = command::parse_structured_song_envelope(
                 &text,
                 &shortcut_player,
@@ -1131,117 +779,6 @@ impl ApplicationRuntime {
             processed = true;
         }
         Ok(processed)
-    }
-
-    fn wait_for_secondary_hall_stability(
-        &self,
-    ) -> Result<Option<(Frame, Vec<SecondaryHallBubble>)>> {
-        let live_config = self.lifecycle.live_configs.snapshot();
-        let canvas = Canvas {
-            width: self.lifecycle.config.screen.expected_width,
-            height: self.lifecycle.config.screen.expected_height,
-            resize: true,
-        };
-        let first = load_frame(&canvas, &self.ui.game_ui)?;
-        let mut previous = secondary_hall_bubbles(&first.image)?;
-        let poll_ms = live_config
-            .timing
-            .chat_scan
-            .change_debounce_ms
-            .clamp(100, 200);
-        let required_samples =
-            live_config.resolve_stability_count(live_config.stability.secondary_hall_count);
-        let mut stable_samples = 1_u32;
-        let timeout_ms = poll_ms
-            .saturating_mul(u64::from(required_samples.saturating_add(1)))
-            .max(500);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-
-        while Instant::now() < deadline {
-            sleep(Duration::from_millis(poll_ms));
-            let frame = load_frame(&canvas, &self.ui.game_ui)?;
-            let current = secondary_hall_bubbles(&frame.image)?;
-            if hall_bubble_layout_is_stable(&previous, &current) {
-                stable_samples = stable_samples.saturating_add(1);
-            } else {
-                stable_samples = 1;
-            }
-            if stable_samples >= required_samples {
-                return Ok(Some((frame, current)));
-            }
-            previous = current;
-        }
-        log::debug!(
-            "二级大厅气泡相对布局稳定等待超时，本轮不进入 OCR: samples={}/{} timeout={}ms",
-            stable_samples,
-            required_samples,
-            timeout_ms
-        );
-        Ok(None)
-    }
-
-    fn wait_for_secondary_hall_command_stability(&self) -> Result<SecondaryHallCommandStability> {
-        let live_config = self.lifecycle.live_configs.snapshot();
-        let canvas = Canvas {
-            width: self.lifecycle.config.screen.expected_width,
-            height: self.lifecycle.config.screen.expected_height,
-            resize: true,
-        };
-        let first = load_frame(&canvas, &self.ui.game_ui)?;
-        let first_bubbles = secondary_hall_bubbles(&first.image)?;
-        let first_messages = self.recognize_secondary_bubble_rects(
-            &first.image,
-            first_bubbles
-                .iter()
-                .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
-            "blue",
-        )?;
-        let mut previous_bubbles = first_bubbles;
-        let mut previous_messages = first_messages;
-        let poll_ms = live_config
-            .timing
-            .chat_scan
-            .change_debounce_ms
-            .clamp(100, 200);
-        let required_samples =
-            live_config.resolve_stability_count(live_config.stability.secondary_hall_count);
-        let mut stable_samples = 1_u32;
-        let timeout_ms = poll_ms
-            .saturating_mul(u64::from(required_samples.saturating_add(1)))
-            .max(500);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-
-        while Instant::now() < deadline {
-            sleep(Duration::from_millis(poll_ms));
-            let frame = load_frame(&canvas, &self.ui.game_ui)?;
-            let bubbles = secondary_hall_bubbles(&frame.image)?;
-            let messages = self.recognize_secondary_bubble_rects(
-                &frame.image,
-                bubbles
-                    .iter()
-                    .map(|bubble| (bubble.rect, Some(bubble.sender_rect()))),
-                "blue",
-            )?;
-            if hall_bubble_layout_is_stable(&previous_bubbles, &bubbles)
-                && SecondaryHallCommandTracker::snapshots_match(&previous_messages, &messages)
-            {
-                stable_samples = stable_samples.saturating_add(1);
-            } else {
-                stable_samples = 1;
-            }
-            if stable_samples >= required_samples {
-                return Ok(Some((frame, bubbles, messages)));
-            }
-            previous_bubbles = bubbles;
-            previous_messages = messages;
-        }
-        log::debug!(
-            "二级大厅命令形式稳定等待超时，本轮不处理: samples={}/{} timeout={}ms",
-            stable_samples,
-            required_samples,
-            timeout_ms
-        );
-        Ok(None)
     }
 }
 

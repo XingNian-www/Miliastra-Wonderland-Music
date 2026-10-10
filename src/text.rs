@@ -1,3 +1,22 @@
+/// 归一化聊天文本：**只做不丢信息的修正**，且**空白一律丢弃**。
+///
+/// - 全角 ASCII 折半角：游戏里的冒号/括号本来就是半角，OCR 偶尔读成全角；
+///   折半角是把它改回屏幕上的真实字形，属于纠错。
+/// - 空白全部丢弃：OCR 的空白两个方向都会错（同一位置有时多读一个空格、有时整段漏掉），
+///   保留它只会让同一句话时而带空格时而不带；统一丢弃后文本才是确定且可逐字比较的。
+///
+/// 命令锁与聊天比较共用这一份实现，禁止再各自复制一份（否则同/全角抖动会互相打不中）。
+pub(crate) fn normalize_chat_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|ch| match ch {
+            // 全角 ！ 到 ～ 与半角 ASCII 一一对应，码位偏移 0xFEE0。
+            '\u{FF01}'..='\u{FF5E}' => Some(char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch)),
+            ch if ch.is_whitespace() => None,
+            other => Some(other),
+        })
+        .collect()
+}
+
 pub(crate) fn normalize_comparison_text(text: &str) -> String {
     text.chars()
         .filter_map(normalize_comparison_char)

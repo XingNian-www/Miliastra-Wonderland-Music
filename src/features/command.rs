@@ -35,6 +35,10 @@ pub(crate) struct CommandObservation {
     pub(crate) frame_id: Option<ObservationFrameId>,
     pub(crate) captured_at: Option<Instant>,
     pub(crate) message_id: Option<ObservedChatMessageId>,
+    /// 被观察消息自身的原始文本；命令锁只认这份数据，不回头查 tracker。
+    pub(crate) message_text: Option<String>,
+    /// 被观察消息自身的屏幕 y（矩形顶部）；命令锁用它做锚点位置判定。
+    pub(crate) message_y: Option<i32>,
 }
 
 /// 尚未选择或解析业务模块前的聊天输入。
@@ -206,6 +210,7 @@ pub(crate) enum ModuleCommand {
     CardGame(LandlordCommand),
     TurtleSoup(TurtleSoupCommand),
     Tarot(super::tarot::TarotCommand),
+    Playlist(super::playlist::PlaylistCommand),
     Undercover(UndercoverCommand),
     Invite(InviteCommand),
     Moderation(ModerationCommand),
@@ -282,6 +287,7 @@ impl ModuleCommand {
             Self::TurtleSoup(command) => command.lock_key().to_string(),
             Self::Undercover(command) => command.lock_key(),
             Self::Tarot(command) => command.lock_key(),
+            Self::Playlist(command) => command.lock_key(),
             Self::Invite(command) => command.lock_key(),
             Self::Moderation(command) => command.lock_key(),
             Self::CustomWorkflow(command) => command.lock_key(),
@@ -291,7 +297,7 @@ impl ModuleCommand {
     pub(crate) fn scopes_lock_to_actor(&self) -> bool {
         matches!(
             self,
-            Self::CardGame(_) | Self::Undercover(_) | Self::Tarot(_)
+            Self::CardGame(_) | Self::Undercover(_) | Self::Tarot(_) | Self::Playlist(_)
         )
     }
 
@@ -314,6 +320,7 @@ impl ModuleCommand {
             }
             Self::TurtleSoup(command) => matches!(command, TurtleSoupCommand::Start),
             Self::Tarot(command) => !matches!(command, super::tarot::TarotCommand::Help),
+            Self::Playlist(command) => !matches!(command, super::playlist::PlaylistCommand::Help),
             Self::Undercover(command) => !matches!(command, UndercoverCommand::Retry),
             // 这些模块目前仅对好友开放，或将触发用户作为执行契约的一部分。后续增加大厅路由时仍保持保守处理。
             Self::Invite(_) | Self::Moderation(_) | Self::CustomWorkflow(_) => true,

@@ -451,11 +451,11 @@ impl TemplateUiStateClassifier {
             ),
         ];
         for (label, path, region, scale) in cases {
-            let candidate = match best_template_candidate_downscaled(image, Some(region), path, scale)
-            {
-                Ok(candidate) => candidate,
-                Err(_) => continue,
-            };
+            let candidate =
+                match best_template_candidate_downscaled(image, Some(region), path, scale) {
+                    Ok(candidate) => candidate,
+                    Err(_) => continue,
+                };
             if candidate_matches(&candidate, threshold) {
                 return Some(UiStateClassification::with_evidence(
                     RuntimeUiStateKind::Panel,
@@ -475,6 +475,21 @@ impl TemplateUiStateClassifier {
 impl UiStateClassifier for TemplateUiStateClassifier {
     fn classify(&mut self, image: &DynamicImage) -> Result<UiStateClassification> {
         self.classify_at(image, Instant::now())
+    }
+
+    fn classify_cached(
+        &mut self,
+        image: &DynamicImage,
+        cached: &UiStateClassification,
+    ) -> Result<UiStateClassification> {
+        // A confirmed fallback also needs periodic revalidation while pixels stay still.
+        if self.game_fallback.unknown_since.is_some()
+            || cached.kind() == RuntimeUiStateKind::Unknown
+        {
+            self.classify(image)
+        } else {
+            Ok(cached.clone())
+        }
     }
 }
 
@@ -629,7 +644,11 @@ fn probe_game_state(
         } else {
             RuntimeUiStateKind::Unknown
         },
-        if world_is_teyvat { "overworld" } else { "unknown" },
+        if world_is_teyvat {
+            "overworld"
+        } else {
+            "unknown"
+        },
         evidence,
     ))
 }
@@ -722,7 +741,7 @@ fn detect_ui_state_with_evidence(
     ));
     if back_visible {
         // 奇域主菜单上也挂着同一个圆形返回按钮，所以"返回按钮命中"并不等于二级聊天。
-        // 再看右下角有没有「返回提瓦特」按钮：有就是主菜单（docs/ui-state-machine.md §44）。
+        // 再看右下角有没有「返回提瓦特」按钮：有就是主菜单（technical-docs/ui-state-machine.md §44）。
         // 这次匹配只在返回按钮命中之后才做——它本来就是用来否决二级判定的，
         // 放在这个位置，让"不是二级界面"的常见路径不必多付一次模板匹配。
         let menu_region: Rect = screen.main_menu_rect.into();
@@ -821,7 +840,11 @@ fn detect_ui_state_with_evidence(
             );
             return Ok((
                 UiState::unknown(),
-                UiStateEvidence::new(template_probes, Some(marker_probe), "markers_without_hall_bar"),
+                UiStateEvidence::new(
+                    template_probes,
+                    Some(marker_probe),
+                    "markers_without_hall_bar",
+                ),
             ));
         }
         log::info!(target: "timing",
@@ -918,7 +941,6 @@ const WORLD_CYAN_QIANXING_MIN: usize = 111;
 /// 与 `unknown` 的纪律一致：判不出来就不猜。
 const WORLD_CYAN_TEYVAT_MAX: usize = 68;
 
-
 /// 世界 HUD 参考块：4 张标注提瓦特 + 6 张标注千星帧在 (40,37)-(71,76) 这 1280 像素上
 /// 逐通道归一化后的均值。生成脚本 \`dist/worlddata/mkref.py\`，格式：
 /// magic("MWW1") + version(u32) + x(i32) + y(i32) + width(u32) + height(u32)
@@ -969,7 +991,9 @@ fn parse_world_hud_ref() -> Option<(Rect, &'static [u8], &'static [u8])> {
     let y = i32::from_le_bytes(bytes[12..16].try_into().ok()?);
     let width = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
     let height = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
-    let values = (width as usize).checked_mul(height as usize)?.checked_mul(3)?;
+    let values = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(3)?;
     if bytes.len() != WORLD_HUD_REF_HEADER + values * 2 * 2 {
         return None;
     }
@@ -1091,11 +1115,12 @@ fn world_hud_distances(image: &DynamicImage) -> Option<(f32, f32, f32)> {
                             1.0
                         };
                         let normalized = (p[channel] - means[channel]) / deviation;
-                        total_teyvat +=
-                            (normalized - world_hud_ref_value(teyvat_ref, index * 3 + channel)).abs();
-                        total_qianxing +=
-                            (normalized - world_hud_ref_value(qianxing_ref, index * 3 + channel))
-                                .abs();
+                        total_teyvat += (normalized
+                            - world_hud_ref_value(teyvat_ref, index * 3 + channel))
+                        .abs();
+                        total_qianxing += (normalized
+                            - world_hud_ref_value(qianxing_ref, index * 3 + channel))
+                        .abs();
                     }
                 }
                 let divisor = count * 3.0;
@@ -1127,7 +1152,6 @@ fn world_hud_scale(image: &DynamicImage) -> Option<f32> {
         None
     }
 }
-
 
 /// 整屏色调判据适用的最小画面尺寸。
 /// 本项目所有实机截图都是 1920x1080；而证据目录里还有大量小裁剪图
@@ -1196,8 +1220,9 @@ fn screen_tone(image: &DynamicImage) -> (f32, f32) {
         let mut x = 0;
         while x < width {
             let pixel = sampler.pixel(x, y);
-            let luma =
-                0.299 * f32::from(pixel[0]) + 0.587 * f32::from(pixel[1]) + 0.114 * f32::from(pixel[2]);
+            let luma = 0.299 * f32::from(pixel[0])
+                + 0.587 * f32::from(pixel[1])
+                + 0.114 * f32::from(pixel[2]);
             if luma < SCREEN_TONE_DARK_MAX {
                 dark += 1;
             }
@@ -1343,7 +1368,6 @@ fn guess_world_from_cyan_count(count: Option<usize>) -> WorldGuess {
         Some(_) => WorldGuess::Unknown,
     }
 }
-
 
 /// 组装世界判据的证据。
 ///
@@ -1492,7 +1516,9 @@ fn parse_qianxing_panel_ref() -> Option<(u32, u32, u32, u32, &'static [u8])> {
     if x < 0 || y < 0 || width == 0 || height == 0 {
         return None;
     }
-    let values = (width as usize).checked_mul(height as usize)?.checked_mul(3)?;
+    let values = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(3)?;
     let body = &bytes[QIANXING_PANEL_REF_HEADER..];
     if body.len() != values * 2 {
         return None;
@@ -1585,14 +1611,7 @@ fn qianxing_player_panel_distance(image: &DynamicImage) -> Option<f32> {
     for offset_y in -QIANXING_PANEL_SEARCH..=QIANXING_PANEL_SEARCH {
         for offset_x in -QIANXING_PANEL_SEARCH..=QIANXING_PANEL_SEARCH {
             let Some(distance) = qianxing_panel_distance_at(
-                &sampler,
-                reference,
-                x,
-                y,
-                width,
-                height,
-                offset_x,
-                offset_y,
+                &sampler, reference, x, y, width, height, offset_x, offset_y,
             ) else {
                 continue;
             };
@@ -1661,10 +1680,7 @@ fn qianxing_map_tone(image: &DynamicImage) -> Option<(f32, f32)> {
     if total == 0 {
         return None;
     }
-    Some((
-        dark as f32 / total as f32,
-        dark_teal as f32 / total as f32,
-    ))
+    Some((dark as f32 / total as f32, dark_teal as f32 / total as f32))
 }
 
 /// 是不是千星奇域地图：两个条件必须**同时**成立；量不了就拒判。
@@ -1937,7 +1953,7 @@ mod tests {
 
     /// 主菜单必须比二级聊天先判：奇域主菜单上有和二级界面同一个圆形返回按钮，
     /// 但右下角多一个「返回提瓦特」按钮。没有这条规则时，8 张主菜单帧会被
-    /// secondary_back 误判成二级聊天（docs/ui-state-machine.md §24/§44）。
+    /// secondary_back 误判成二级聊天（technical-docs/ui-state-machine.md §24/§44）。
     ///
     /// 每帧都用全新分类器：菜单判成 Unknown，连续两帧 Unknown 会触发游戏态回退，
     /// 那会让 final_rule 变成回退规则，测不到我们真正要测的东西。
@@ -1957,11 +1973,10 @@ mod tests {
             "modR-5.png",
         ];
         for name in menus {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap();
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
             assert_eq!(
                 c.evidence().final_rule(),
@@ -1971,11 +1986,10 @@ mod tests {
         }
         // 过渡帧：不要求判成主菜单，但必须不是稳定结果，否则会推出错误的迁移事件。
         for name in ["step-5.png", "step-last.png"] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap();
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
             // 特征化断言：把"已知残留"钉死。淡出帧按钮只剩两成不透明度，
             // 主菜单模板抓不到，于是落到 secondary_back。将来若这条规则改成
@@ -1984,18 +1998,21 @@ mod tests {
             assert_eq!(
                 c.evidence().final_rule(),
                 "secondary_back_template",
-                "{path} 的已知残留行为变了，请更新 docs/ui-state-machine.md §44"
+                "{path} 的已知残留行为变了，请更新 technical-docs/ui-state-machine.md §44"
             );
         }
         let secondaries = ["secondary-full.png", "sec-fixture.jpg", "round78-live.png"];
         for name in secondaries {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap();
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
-            assert_eq!(c.kind(), RuntimeUiStateKind::Secondary, "{path} 必须仍是二级聊天");
+            assert_eq!(
+                c.kind(),
+                RuntimeUiStateKind::Secondary,
+                "{path} 必须仍是二级聊天"
+            );
         }
         // 负样本：这些界面里没有「返回提瓦特」按钮，一条都不许被判成主菜单。
         // 收紧搜索区之后重跑，确认窄区域没有把负样本拉上来。
@@ -2013,11 +2030,10 @@ mod tests {
             "cat-frame-2.jpg",
         ];
         for name in negatives {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap();
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
             assert_ne!(
                 c.evidence().final_rule(),
@@ -2058,16 +2074,18 @@ mod tests {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         // 语料跨两个目录：证据目录与运行目录，两边都要找。
         let classify = |name: &str| {
-            let path = if std::path::Path::new(&format!("docs/ui-state-evidence/{name}")).exists() {
-                format!("docs/ui-state-evidence/{name}")
+            let path = if std::path::Path::new(&format!("technical-docs/ui-state-evidence/{name}")).exists() {
+                format!("technical-docs/ui-state-evidence/{name}")
             } else {
                 format!("dist/sandbox-run/{name}")
             };
             let image = image::open(&path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
-            classifier.classify_at(&image, Instant::now()).unwrap().kind()
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
+            classifier
+                .classify_at(&image, Instant::now())
+                .unwrap()
+                .kind()
         };
         // 正样本：语料里全部近白占比 >= 11.18% 的帧，必须是 primary
         for name in [
@@ -2108,7 +2126,6 @@ mod tests {
         }
     }
 
-
     /// 第 55 节：加载界面是**真实状态**（两种外观），不该像以前那样落进 unknown。
     ///
     /// 这里同时给出**分离度自证**：不只看结论，还直接把两条判据的实测区间算出来并断言
@@ -2119,10 +2136,13 @@ mod tests {
         let classify_with_rule = |path: &str| {
             let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
-            (c.kind(), c.evidence().final_rule().to_string(), screen_tone(&image))
+            (
+                c.kind(),
+                c.evidence().final_rule().to_string(),
+                screen_tone(&image),
+            )
         };
 
         // 黑底徽记型（传送等短加载）：实测暗像素占比 98.46~98.53%
@@ -2135,7 +2155,7 @@ mod tests {
             "loading-screens/loading-dark-E.jpg",
             "loading-screens/loading-dark-teleport.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let (kind, rule, (dark, _white)) = classify_with_rule(&path);
             assert_eq!(
                 kind,
@@ -2154,7 +2174,7 @@ mod tests {
             "cold-start/enter-1.jpg",
             "cold-start/stage-1.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let (kind, rule, (_dark, white)) = classify_with_rule(&path);
             assert_eq!(kind, RuntimeUiStateKind::Loading, "{path} 是白底加载界面");
             assert_eq!(rule, "loading_white_screen", "{path} 应走白底那条规则");
@@ -2190,8 +2210,8 @@ mod tests {
             "modS2-6.png",
             "modClear-2.png",
         ] {
-            let path = if Path::new(&format!("docs/ui-state-evidence/{name}")).exists() {
-                format!("docs/ui-state-evidence/{name}")
+            let path = if Path::new(&format!("technical-docs/ui-state-evidence/{name}")).exists() {
+                format!("technical-docs/ui-state-evidence/{name}")
             } else {
                 format!("dist/sandbox-run/{name}")
             };
@@ -2210,7 +2230,7 @@ mod tests {
         );
     }
 
-/// 世界判据（提瓦特 vs 千星）：左上角**青色条纹带计数**。
+    /// 世界判据（提瓦特 vs 千星）：左上角**青色条纹带计数**。
     ///
     /// 与 `loading_screens_are_classified_as_loading` 同样的纪律：不只看结论，
     /// 而是把**两侧的实测区间**直接算出来并断言它们不重叠，再断言阈值严格落在空档里。
@@ -2242,7 +2262,7 @@ mod tests {
             "teyvat-regions-58/desert-02.jpg",
             "teyvat-regions-58/desert-03.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let count = count_of(&path).unwrap_or_else(|| panic!("{path} 应是整帧截图"));
             assert_eq!(
                 guess_world_from_cyan_count(Some(count)),
@@ -2261,7 +2281,7 @@ mod tests {
             "qianxing-halls-58/hall3-01.jpg",
             "live-hall-day-57/01-hall-day-chat-active.png",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let count = count_of(&path).unwrap_or_else(|| panic!("{path} 应是整帧截图"));
             assert_eq!(
                 guess_world_from_cyan_count(Some(count)),
@@ -2330,7 +2350,7 @@ mod tests {
             "sweep-49/06-wish.jpg",
             "qianxing-entry-56/07-qianxing-map.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
             let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
@@ -2356,7 +2376,9 @@ mod tests {
                 "teyvat",
                 "{path} 的 kind 是 {}，左上角不是 HUD，世界判据必须拒判而不是猜一个世界（实测计数 {}）",
                 c.kind().name(),
-                world.count().map_or_else(|| "null".to_string(), |c| c.to_string())
+                world
+                    .count()
+                    .map_or_else(|| "null".to_string(), |c| c.to_string())
             );
         }
         assert!(
@@ -2365,7 +2387,7 @@ mod tests {
         );
     }
 
-/// 世界判据的**正面能力**：HUD 在场时，提瓦特与千星两侧都要能判出来。
+    /// 世界判据的**正面能力**：HUD 在场时，提瓦特与千星两侧都要能判出来。
     ///
     /// 这是第 58 节第二版门的验收：把门从"界面 kind"换成"HUD 在场检测"之后，
     /// 提瓦特的大世界帧（app 单帧只会判成 unknown）也必须拿到 teyvat。
@@ -2391,7 +2413,7 @@ mod tests {
             "teyvat-regions-58/snow-01.jpg",
             "teyvat-regions-58/desert-01.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let (world, count) = world_of(&path);
             assert_eq!(
                 world, "teyvat",
@@ -2405,7 +2427,7 @@ mod tests {
             "qianxing-halls-58/hall2-01.jpg",
             "qianxing-entry-56/06-hall-before-M.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let (world, count) = world_of(&path);
             assert_eq!(
                 world, "qianxing",
@@ -2432,7 +2454,7 @@ mod tests {
             "teyvat-regions-58/snow-01.jpg",
             "teyvat-regions-58/desert-01.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             present_ceiling = present_ceiling.max(distance_of(&path));
         }
         let mut absent_floor = f32::MAX;
@@ -2446,7 +2468,7 @@ mod tests {
             "cold-start/stage-1.jpg",
             "cold-start/stage-2.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             absent_floor = absent_floor.min(distance_of(&path));
         }
         assert!(
@@ -2458,7 +2480,6 @@ mod tests {
             "HUD 在场阈值 {WORLD_HUD_PRESENT_MAX} 必须严格落在空档 ({present_ceiling}, {absent_floor}) 内"
         );
     }
-
 
     /// 千星奇域地图判据：**两个轴各自的空档都必须存在**，且阈值落在空档内。
     ///
@@ -2483,7 +2504,7 @@ mod tests {
             "qianxing-ui-59/qxmap-b.jpg",
             "qianxing-ui-59/qxmap-c.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let (dark, teal) = tone_of(&path);
             assert!(
                 is_qianxing_map(&image::open(&path).unwrap()),
@@ -2523,7 +2544,7 @@ mod tests {
             "teyvat-regions-58/snow-01.jpg",
             "teyvat-regions-58/desert-01.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let (dark, teal) = tone_of(&path);
             dark_ceiling = dark_ceiling.max(dark);
             teal_ceiling = teal_ceiling.max(teal);
@@ -2584,16 +2605,18 @@ mod tests {
             "modS2-6.png",
             "modClear-2.png",
         ] {
-            let path = if Path::new(&format!("docs/ui-state-evidence/{name}")).exists() {
-                format!("docs/ui-state-evidence/{name}")
+            let path = if Path::new(&format!("technical-docs/ui-state-evidence/{name}")).exists() {
+                format!("technical-docs/ui-state-evidence/{name}")
             } else {
                 format!("dist/sandbox-run/{name}")
             };
             let image = image::open(&path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
-            let kind = classifier.classify_at(&image, Instant::now()).unwrap().kind();
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let kind = classifier
+                .classify_at(&image, Instant::now())
+                .unwrap()
+                .kind();
             assert_ne!(
                 kind,
                 RuntimeUiStateKind::Loading,
@@ -2611,11 +2634,10 @@ mod tests {
             "cold-start/enter-2.jpg",
             "transition-to-overworld/05-overworld-teyvat.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap();
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
             assert_ne!(
                 c.kind(),
@@ -2633,11 +2655,10 @@ mod tests {
             "overworld-hub.png",
             "hall-chat-open.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap();
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
             assert_eq!(c.kind(), RuntimeUiStateKind::Primary, "{path} 仍是千星大厅");
         }
@@ -2646,12 +2667,15 @@ mod tests {
     #[test]
     fn hub_menu_never_falls_through_to_overworld_after_unknown_grace() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
-        for name in ["wonderland-menu.png", "wonderland-menu-escape.png", "modR-5.png"] {
-            let path = format!("docs/ui-state-evidence/{name}");
+        for name in [
+            "wonderland-menu.png",
+            "wonderland-menu-escape.png",
+            "modR-5.png",
+        ] {
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap();
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-            let mut classifier =
-                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let now = Instant::now();
             for i in 0..5u64 {
                 let c = classifier
@@ -2666,7 +2690,7 @@ mod tests {
         }
     }
 
-        /// **第 59 节：回退探针的自信误判，以及世界判据怎么把它拦住。**
+    /// **第 59 节：回退探针的自信误判，以及世界判据怎么把它拦住。**
     ///
     /// 实测经过：站在**千星大厅**里按 `F2` 开多人面板后，实时路径先连续两帧 `Unknown`，
     /// 于是走 `probe_game_state` 回退；回退只看右上角**祈愿顶栏**一个模板，而那个模板在
@@ -2686,7 +2710,7 @@ mod tests {
             "qianxing-ui-59/qxchat-from-hall.jpg",
             "qianxing-ui-59/qxchat-closed2.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap();
             assert!(!world_is_teyvat(&image), "{path} 不是提瓦特大世界");
             let probed =
@@ -2707,9 +2731,12 @@ mod tests {
             "teyvat-regions-58/snow-01.jpg",
             "teyvat-regions-58/desert-01.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let image = image::open(&path).unwrap();
-            assert!(world_is_teyvat(&image), "{path} 是提瓦特大世界，必须判为 true");
+            assert!(
+                world_is_teyvat(&image),
+                "{path} 是提瓦特大世界，必须判为 true"
+            );
         }
     }
 
@@ -2722,8 +2749,7 @@ mod tests {
     fn qianxing_player_panel_is_separated_by_reference_distance() {
         let distance_of = |path: &str| {
             let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
-            qianxing_player_panel_distance(&image)
-                .unwrap_or_else(|| panic!("{path} 应能量出距离"))
+            qianxing_player_panel_distance(&image).unwrap_or_else(|| panic!("{path} 应能量出距离"))
         };
         // 正样本：三帧真实 F2 面板
         let mut positive_ceiling = 0.0_f32;
@@ -2732,7 +2758,7 @@ mod tests {
             "qianxing-ui-59/after-fix-f2.jpg",
             "qianxing-ui-59/r10-now.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let distance = distance_of(&path);
             assert!(
                 is_qianxing_player_panel(&image::open(&path).unwrap()),
@@ -2765,7 +2791,7 @@ mod tests {
             "teyvat-regions-58/desert-01.jpg",
             "loading-screens/01-map.jpg",
         ] {
-            let path = format!("docs/ui-state-evidence/{name}");
+            let path = format!("technical-docs/ui-state-evidence/{name}");
             let distance = distance_of(&path);
             assert!(
                 !is_qianxing_player_panel(&image::open(&path).unwrap()),
@@ -2799,7 +2825,7 @@ mod tests {
     /// 距离掉回 ≈±1 的水平。**阈值本身一个字没动**——这是原理性修法，不是调阈值。
     #[test]
     fn qianxing_player_panel_survives_small_pixel_shifts() {
-        let base = image::open("docs/ui-state-evidence/qianxing-ui-59/r10-now.jpg").unwrap();
+        let base = image::open("technical-docs/ui-state-evidence/qianxing-ui-59/r10-now.jpg").unwrap();
         let (width, height) = (base.width(), base.height());
         for (dx, dy) in [(1, 0), (-1, 0), (2, 0), (-2, 0), (3, 0), (-3, 0)] {
             // 与扰动生成脚本同样的做法：画到同尺寸画布上，空出来的边角是黑的。
@@ -2814,7 +2840,7 @@ mod tests {
             );
         }
         // 负样本也要能平移：千星大厅整体平移后仍然不能命中。
-        let hall = image::open("docs/ui-state-evidence/qianxing-ui-59/start-hall.jpg").unwrap();
+        let hall = image::open("technical-docs/ui-state-evidence/qianxing-ui-59/start-hall.jpg").unwrap();
         for dx in [0_i64, 1, -1, 3, -3] {
             let mut canvas = image::RgbaImage::new(width, height);
             image::imageops::replace(&mut canvas, &hall.to_rgba8(), dx, 0);
@@ -2826,7 +2852,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grace() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
@@ -2941,6 +2967,39 @@ mod tests {
                 .is_err()
         );
         assert!(classifier.game_fallback.unknown_since.is_none());
+        ocr.shutdown().unwrap();
+    }
+
+    #[test]
+    fn pixel_identical_unknown_cache_hit_advances_fallback_time() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ocr = OcrRuntime::start(
+            TestGateOcr {
+                calls: calls.clone(),
+                text: Arc::new(Mutex::new("点击进入".to_string())),
+            },
+            1,
+        )
+        .unwrap();
+        let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone())
+            .with_game_entry_detection(ocr.handle(), Rect::new(500, 800, 500, 100), 2);
+        let image = image::open("tests/fixtures/ui/world-wish-page-1920x1080.png").unwrap();
+        let cached = classifier
+            .classify_at(&image, Instant::now() - GAME_STATE_PROBE_INTERVAL)
+            .unwrap();
+        assert_eq!(cached.kind(), RuntimeUiStateKind::Unknown);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let candidate = classifier.classify_cached(&image, &cached).unwrap();
+        assert_eq!(candidate.label(), "unknown:game_probe");
+        let confirmed = classifier.classify_cached(&image, &candidate).unwrap();
+        assert_eq!(confirmed.kind(), RuntimeUiStateKind::GameGate);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A known fallback result must still be revalidated after its cooldown.
+        classifier.game_fallback.retry_after = Some(Instant::now() - Duration::from_secs(1));
+        classifier.classify_cached(&image, &confirmed).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         ocr.shutdown().unwrap();
     }
 

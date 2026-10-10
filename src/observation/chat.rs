@@ -1,7 +1,9 @@
 pub(crate) mod scan;
 mod secondary_hall_vision;
 mod secondary_unread_vision;
+mod shared_ocr;
 mod stream;
+pub(crate) use shared_ocr::*;
 mod visual;
 
 use std::collections::BTreeMap;
@@ -21,8 +23,9 @@ pub(crate) use secondary_unread_vision::{
 };
 pub(crate) use stream::{
     ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
-    CompletionAdvanceSubscriber, PrimaryObservationCursor, PrimaryObservedMessage,
-    SecondaryChatObservation, SecondaryObservedMessage, SecondaryRecognizedMessage,
+    CompletionAdvanceSubscriber, PrimaryDecisionSubscriber, PrimaryObservationCursor,
+    PrimaryObservedMessage, SecondaryChatObservation, SecondaryObservedMessage,
+    SecondaryRecognizedMessage,
 };
 pub(crate) use visual::{
     SecondaryChatIdentity, SecondaryHallBubble, hall_bubble_layout_is_stable,
@@ -53,6 +56,7 @@ pub enum ChatIdentity {
     Friend(Arc<str>),
     PublicChannel,
     StrangerMessages,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

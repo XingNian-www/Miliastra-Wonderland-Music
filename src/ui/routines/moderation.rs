@@ -5,7 +5,7 @@ use enigo::Key;
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
-    before_input_failure, capture_normalized, sleep_ms,
+    before_input_failure, capture_normalized, wait_ms,
 };
 use super::state_observation::wait_for_stable_ui_kind;
 use crate::runtime::ui::{
@@ -13,7 +13,7 @@ use crate::runtime::ui::{
     UiStateKind, UiStateObservation, UiSubmitError, sealed,
 };
 use crate::ui::geometry::{Point, Rect};
-use crate::ui::template::best_template_hit;
+use crate::ui::template::{best_template_hit, template_exists};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModerationUiAction {
@@ -204,7 +204,12 @@ fn execute_moderation(
         .device()
         .press_key(Key::Unicode('e'))
         .map_err(|error| after_input_failure("open_friend_search", error))?;
-    sleep_ms(config.step_ms);
+    wait_ms(
+        context,
+        config.step_ms,
+        "open_friend_search",
+        InputCertainty::AfterInputUnknown,
+    )?;
     context
         .device()
         .press_key(Key::Unicode('e'))
@@ -223,7 +228,12 @@ fn execute_moderation(
         .device()
         .click_point(config.search_input.x, config.search_input.y)
         .map_err(|error| after_input_failure("focus_uid_input", error))?;
-    sleep_ms(config.residency.click_ms);
+    wait_ms(
+        context,
+        config.residency.click_ms,
+        "focus_uid_input",
+        InputCertainty::AfterInputUnknown,
+    )?;
     context
         .device()
         .paste_text(&request.uid, config.text_ms)
@@ -322,7 +332,12 @@ fn wait_template(
                     .device()
                     .click_point(point.x, point.y)
                     .map_err(|error| after_input_failure(stage, error))?;
-                sleep_ms(config.residency.click_ms);
+                wait_ms(
+                    context,
+                    config.residency.click_ms,
+                    stage,
+                    InputCertainty::AfterInputUnknown,
+                )?;
             }
             return Ok(());
         }
@@ -333,7 +348,12 @@ fn wait_template(
                 "required moderation template was not found before timeout",
             ));
         }
-        sleep_ms(config.residency.poll_ms);
+        wait_ms(
+            context,
+            config.residency.poll_ms,
+            stage,
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
 }
 
@@ -350,7 +370,7 @@ fn confirm_template_absent(
             "confirm_action_applied",
             InputCertainty::AfterInputUnknown,
         )?;
-        let present = best_template_hit(
+        let present = template_exists(
             &image,
             Some(config.confirm_region),
             &config.confirm_template,
@@ -362,8 +382,7 @@ fn confirm_template_absent(
                 "confirm_action_applied",
                 format!("{error:#}"),
             )
-        })?
-        .is_some();
+        })?;
         if present {
             absent_streak = 0;
         } else {
@@ -372,7 +391,12 @@ fn confirm_template_absent(
                 return Ok(());
             }
         }
-        sleep_ms(config.residency.poll_ms);
+        wait_ms(
+            context,
+            config.residency.poll_ms,
+            "confirm_action_applied",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
@@ -428,7 +452,14 @@ fn recover_primary(
         let escape_authorized = stable_kind == Some(UiStateKind::Secondary)
             || panel_stability.observe(panel_candidate, config.residency.stable_count);
         if !escape_authorized {
-            sleep_ms(config.residency.poll_ms);
+            if let Err(failure) = wait_ms(
+                context,
+                config.residency.poll_ms,
+                "recover_moderation",
+                InputCertainty::AfterInputUnknown,
+            ) {
+                return UiResidencyOutcome::Failed(failure);
+            }
             continue;
         }
         if escape_count >= 6 {
@@ -443,7 +474,14 @@ fn recover_primary(
         }
         escape_count += 1;
         panel_stability = PanelStability::default();
-        sleep_ms(config.return_retry_ms);
+        if let Err(failure) = wait_ms(
+            context,
+            config.return_retry_ms,
+            "recover_moderation",
+            InputCertainty::AfterInputUnknown,
+        ) {
+            return UiResidencyOutcome::Failed(failure);
+        }
     }
     UiResidencyOutcome::Failed(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
@@ -490,9 +528,8 @@ fn recoverable_panel_candidate(
     .into_iter()
     .enumerate()
     {
-        if best_template_hit(image, Some(region), template, config.marker_threshold)
+        if template_exists(image, Some(region), template, config.marker_threshold)
             .map_err(|error| after_input_failure("recover_moderation", error))?
-            .is_some()
         {
             return Ok(Some(index));
         }

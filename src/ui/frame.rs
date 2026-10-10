@@ -19,6 +19,7 @@ pub(crate) struct Canvas {
 
 #[derive(Debug)]
 pub(crate) struct Frame {
+    source_frame_id: Option<u64>,
     pub(crate) image: Arc<DynamicImage>,
     pub(crate) captured_at: Instant,
     pub(crate) ui_state: Option<UiStateObservation>,
@@ -33,6 +34,9 @@ impl Frame {
             return None;
         };
         let probe = state.classification().evidence().marker_probe()?;
+        if probe.source_frame_id().is_none() || probe.validated_frame_id() != self.source_frame_id {
+            return None;
+        }
         let hits = probe.marker_hits();
         // 未知/过渡分类会记录空探测，这不是可复用证据；调用方必须重新执行常规标记搜索，不能将其当成确定的空聊天扫描。
         if hits.is_empty() || probe.coordinate_size() != (self.image.width(), self.image.height()) {
@@ -69,6 +73,7 @@ pub(crate) fn load_frame(canvas: &Canvas, game_ui: &GameUi) -> Result<Frame> {
     let captured_at = Instant::now();
     let image = normalize_frame(image, canvas, started);
     Ok(Frame {
+        source_frame_id: None,
         image,
         captured_at,
         ui_state: None,
@@ -79,6 +84,7 @@ pub(crate) fn from_captured_frame(frame: &CapturedFrame, canvas: &Canvas) -> Fra
     let started = Instant::now();
     let source = frame.image_arc();
     Frame {
+        source_frame_id: Some(frame.id()),
         image: normalize_frame(source, canvas, started),
         captured_at: frame.captured_at(),
         ui_state: frame.ui_state().cloned(),
@@ -138,7 +144,7 @@ mod tests {
             height: 10,
             score: 0.98,
         };
-        let classification = UiStateClassification::with_evidence(
+        let mut classification = UiStateClassification::with_evidence(
             UiStateKind::Primary,
             "primary:marker",
             UiStateEvidence::new(
@@ -154,8 +160,10 @@ mod tests {
                 "primary_chat_markers",
             ),
         );
+        classification.set_marker_source_frame(Some(1));
         let observation = UiStateTracker::new(1).observe(1, classification);
         let frame = Frame {
+            source_frame_id: Some(1),
             image: Arc::new(DynamicImage::new_rgba8(1920, 1080)),
             captured_at: Instant::now(),
             ui_state: Some(observation),
@@ -171,11 +179,23 @@ mod tests {
         assert_eq!((marker.width, marker.height), (20, 10));
         assert_eq!(marker.kind, "blue");
         assert_eq!(marker.score, 0.98);
+
+        // Identical dimensions and even identical pixels do not make old evidence fresh.
+        let stale_frame = Frame {
+            source_frame_id: Some(2),
+            ..frame
+        };
+        assert!(stale_frame.marker_hits_for_image().is_none());
+        let untracked_frame = Frame {
+            source_frame_id: None,
+            ..stale_frame
+        };
+        assert!(untracked_frame.marker_hits_for_image().is_none());
     }
 
     #[test]
     fn marker_hits_fall_back_when_ocr_uses_a_different_coordinate_space() {
-        let classification = UiStateClassification::with_evidence(
+        let mut classification = UiStateClassification::with_evidence(
             UiStateKind::Primary,
             "primary:marker",
             UiStateEvidence::new(
@@ -198,8 +218,10 @@ mod tests {
                 "primary_chat_markers",
             ),
         );
+        classification.set_marker_source_frame(Some(1));
         let observation = UiStateTracker::new(1).observe(1, classification);
         let frame = Frame {
+            source_frame_id: Some(1),
             image: Arc::new(DynamicImage::new_rgba8(1280, 720)),
             captured_at: Instant::now(),
             ui_state: Some(observation),
@@ -210,7 +232,7 @@ mod tests {
 
     #[test]
     fn empty_marker_probe_falls_back_to_the_normal_marker_search() {
-        let classification = UiStateClassification::with_evidence(
+        let mut classification = UiStateClassification::with_evidence(
             UiStateKind::Unknown,
             "unknown:no-marker",
             UiStateEvidence::new(
@@ -226,8 +248,10 @@ mod tests {
                 "no_reliable_anchor",
             ),
         );
+        classification.set_marker_source_frame(Some(1));
         let observation = UiStateTracker::new(1).observe(1, classification);
         let frame = Frame {
+            source_frame_id: Some(1),
             image: Arc::new(DynamicImage::new_rgba8(1920, 1080)),
             captured_at: Instant::now(),
             ui_state: Some(observation),

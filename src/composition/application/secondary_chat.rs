@@ -56,6 +56,12 @@ fn primary_messages_after_cursor(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SecondaryObservationOutcome {
+    pub(super) processed: bool,
+    pub(super) command_dispatched: bool,
+}
+
 #[derive(Clone, Debug)]
 struct SecondaryOcrMessage {
     text: String,
@@ -670,14 +676,14 @@ impl ApplicationRuntime {
         &self,
         frame: ObservedFrame,
         observation: SecondaryChatObservation,
-    ) -> Result<bool> {
+    ) -> Result<SecondaryObservationOutcome> {
         let SecondaryChatObservation {
             message_type,
             friend_name,
             accepts_turtle_questions,
             messages,
         } = observation;
-        let mut processed = false;
+        let mut outcome = SecondaryObservationOutcome::default();
         for SecondaryObservedMessage {
             id: message_id,
             text,
@@ -689,6 +695,8 @@ impl ApplicationRuntime {
                 frame_id: Some(frame.id()),
                 captured_at: Some(frame.captured_at()),
                 message_id: Some(message_id.clone()),
+                message_text: Some(text.clone()),
+                message_y: None,
             };
             let shortcut_player = if message_type == "pink" {
                 friend_name.trim().to_string()
@@ -725,8 +733,8 @@ impl ApplicationRuntime {
             ) && let Some(parsed) =
                 router.route(&envelope, self.business.business.active_entertainment()?)
             {
-                self.submit_secondary_command(parsed)?;
-                processed = true;
+                outcome.processed = true;
+                outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
                 continue;
             }
             if let Some(envelope) = CommandEnvelope::new(
@@ -739,8 +747,8 @@ impl ApplicationRuntime {
                 && let Some(parsed) =
                     router.route(&envelope, self.business.business.active_entertainment()?)
             {
-                self.submit_secondary_command(parsed)?;
-                processed = true;
+                outcome.processed = true;
+                outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
                 continue;
             }
             if accepts_turtle_questions {
@@ -751,7 +759,7 @@ impl ApplicationRuntime {
                     .and_then(|player| turtle_soup::parse_question_message(&text, Some(player)));
                 if let Some(question) = question {
                     self.enqueue_turtle_soup_question(question, frame.captured_at())?;
-                    processed = true;
+                    outcome.processed = true;
                     continue;
                 }
             }
@@ -775,10 +783,10 @@ impl ApplicationRuntime {
                 log::debug!("二级监听气泡未解析为命令");
                 continue;
             };
-            self.submit_secondary_command(parsed)?;
-            processed = true;
+            outcome.processed = true;
+            outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
         }
-        Ok(processed)
+        Ok(outcome)
     }
 }
 

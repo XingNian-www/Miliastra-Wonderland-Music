@@ -1,8 +1,9 @@
-use miliastra_kernel::clock::{Clock, Delay, SystemClock};
+#[cfg(test)]
+use miliastra_kernel::clock::Delay;
+use miliastra_kernel::clock::{Clock, SystemClock};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::thread::sleep;
 use std::time::Duration;
 
 use enigo::Key;
@@ -699,7 +700,15 @@ fn execute_hall_batch(
     } else {
         for (index, message) in request.messages.iter().enumerate() {
             if index > 0 {
-                sleep_ms(request.delay_ms);
+                if let Err(failure) = wait_ms(
+                    context,
+                    request.delay_ms,
+                    "wait_hall_batch",
+                    InputCertainty::AfterInputUnknown,
+                ) {
+                    status = HallBatchStatus::Failed(failure);
+                    break;
+                }
             }
             match send_current_chat_message_guarded(
                 context,
@@ -774,7 +783,12 @@ fn normalize_hall_batch_start(
                 .press_key(Key::Return)
                 .map_err(|error| after_input_failure("open_primary_chat", error))?;
             *primary_chat_opened = true;
-            sleep_ms(config.open_chat_ms);
+            wait_ms(
+                context,
+                config.open_chat_ms,
+                "open_primary_chat",
+                InputCertainty::AfterInputUnknown,
+            )?;
             restore_secondary_hall(context, ocr, config)
         }
         UiResidencyTarget::SecondaryCurrentHall => restore_secondary_hall(context, ocr, config),
@@ -793,7 +807,12 @@ fn finish_hall_batch_residency(
             .device()
             .press_key(Key::Escape)
             .map_err(|error| after_input_failure("close_primary_chat", error))?;
-        sleep_ms(config.click_ms);
+        wait_ms(
+            context,
+            config.click_ms,
+            "close_primary_chat",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
     restore_residency(context, ocr, config, target)
 }
@@ -864,7 +883,12 @@ pub(super) fn open_friend_conversation(
         .device()
         .click_point(point.x, point.y)
         .map_err(|error| after_input_failure("select_friend", error))?;
-    sleep_ms(config.friend_step_ms);
+    wait_ms(
+        context,
+        config.friend_step_ms,
+        "select_friend",
+        InputCertainty::AfterInputUnknown,
+    )?;
     confirm_friend_conversation(context, ocr, config, recipient, point)
 }
 
@@ -947,7 +971,12 @@ fn send_current_chat_message_guarded(
                     .device()
                     .click_point(config.chat_click.x, config.chat_click.y)
                     .map_err(|error| after_input_failure("focus_friend_message", error))?;
-                sleep_ms(config.click_ms);
+                wait_ms(
+                    context,
+                    config.click_ms,
+                    "focus_friend_message",
+                    InputCertainty::AfterInputUnknown,
+                )?;
             }
             ChatInputStep::Input => {
                 if let Err(paste_error) = context.device().paste_text(message, config.text_ms) {
@@ -978,7 +1007,12 @@ fn send_current_chat_message_guarded(
                         format!("{error:#}"),
                     )
                 })?;
-                sleep_ms(config.send_ms);
+                wait_ms(
+                    context,
+                    config.send_ms,
+                    "send_friend_message",
+                    InputCertainty::AfterInputUnknown,
+                )?;
             }
         }
         Ok(())
@@ -997,6 +1031,7 @@ fn check_invite_ready_running(gate: &InviteReadyGate) -> Result<(), UiRoutineFai
     }
 }
 
+#[cfg(test)]
 fn wait_for_invite_primary_stability(
     clock: &dyn Clock,
     delay: &dyn Delay,
@@ -1004,6 +1039,23 @@ fn wait_for_invite_primary_stability(
     poll: Duration,
     running: &AtomicBool,
     mut observe: impl FnMut() -> Result<bool, UiRoutineFailure>,
+) -> Result<(), UiRoutineFailure> {
+    wait_for_invite_primary_stability_with_port(clock, timeout, poll, running, |wait| {
+        if let Some(duration) = wait {
+            delay.wait(duration);
+            Ok(false)
+        } else {
+            observe()
+        }
+    })
+}
+
+fn wait_for_invite_primary_stability_with_port(
+    clock: &dyn Clock,
+    timeout: Duration,
+    poll: Duration,
+    running: &AtomicBool,
+    mut port: impl FnMut(Option<Duration>) -> Result<bool, UiRoutineFailure>,
 ) -> Result<(), UiRoutineFailure> {
     let deadline = clock.now() + timeout;
     let mut stable_since = None;
@@ -1017,7 +1069,7 @@ fn wait_for_invite_primary_stability(
                 "cancelled before readiness confirmation",
             ));
         }
-        let primary = observe().unwrap_or(false);
+        let primary = port(None).unwrap_or(false);
         let now = clock.now();
         if !running.load(Ordering::SeqCst) {
             return Err(UiRoutineFailure::new(
@@ -1048,7 +1100,7 @@ fn wait_for_invite_primary_stability(
                 "primary UI was not continuously confirmed for two seconds before timeout",
             ));
         }
-        delay.wait(poll.min(deadline.saturating_duration_since(now)));
+        port(Some(poll.min(deadline.saturating_duration_since(now))))?;
     }
 }
 
@@ -1058,13 +1110,22 @@ fn confirm_invite_primary_stability(
     gate: &InviteReadyGate,
 ) -> Result<(), UiRoutineFailure> {
     context.publish_progress(UiRoutineProgressStage::ConfirmingUi);
-    wait_for_invite_primary_stability(
-        &SystemClock,
+    wait_for_invite_primary_stability_with_port(
         &SystemClock,
         Duration::from_millis(config.timeout_ms).max(Duration::from_secs(3)),
         Duration::from_millis(config.poll_ms),
         &gate.running,
-        || {
+        |wait| {
+            if let Some(duration) = wait {
+                context.wait_cancellable(duration).map_err(|failure| {
+                    UiRoutineFailure::new(
+                        InputCertainty::ConfirmedFailure,
+                        "confirm_invite_primary_stability",
+                        failure.reason(),
+                    )
+                })?;
+                return Ok(false);
+            }
             capture_normalized_ui_state(
                 context,
                 &config.state_observation(),
@@ -1109,7 +1170,12 @@ fn ensure_secondary_chat(
         .device()
         .press_key(Key::Return)
         .map_err(|error| after_input_failure("open_secondary_chat", error))?;
-    sleep_ms(config.open_chat_ms);
+    wait_ms(
+        context,
+        config.open_chat_ms,
+        "open_secondary_chat",
+        InputCertainty::AfterInputUnknown,
+    )?;
     wait_for_stable_ui_kind(
         context,
         config.state_observation(),
@@ -1325,7 +1391,12 @@ fn search_current_friend_page(
             }
         }
         if sample + 1 < config.stable_count {
-            sleep_ms(config.poll_ms);
+            wait_ms(
+                context,
+                config.poll_ms,
+                "locate_friend",
+                InputCertainty::AfterInputUnknown,
+            )?;
         }
     }
     Ok(PageSearch::Missing)
@@ -1545,7 +1616,12 @@ fn confirm_primary_visual_stability(
             );
             return Ok(());
         }
-        sleep_ms(PRIMARY_STABILITY_POLL_MS);
+        wait_ms(
+            context,
+            PRIMARY_STABILITY_POLL_MS,
+            "confirm_primary_residency",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
 }
 
@@ -1578,7 +1654,12 @@ fn restore_secondary_hall(
                 .device()
                 .click_point(point.x, point.y)
                 .map_err(|error| after_input_failure("select_secondary_hall", error))?;
-            sleep_ms(config.click_ms);
+            wait_ms(
+                context,
+                config.click_ms,
+                "select_secondary_hall",
+                InputCertainty::AfterInputUnknown,
+            )?;
             // 点击大厅条目不是进入二级的成功凭据，发送前重新确认。
             wait_for_stable_ui_kind(
                 context,
@@ -1682,7 +1763,12 @@ fn wait_friend_list_stable(
     )
     .map_err(|error| after_input_failure("observe_scrolled_friend_list", error))?;
     for _ in 0..confirmation_attempts(config) {
-        sleep_ms(config.poll_ms);
+        wait_ms(
+            context,
+            config.poll_ms,
+            "confirm_scrolled_friend_list",
+            InputCertainty::AfterInputUnknown,
+        )?;
         let current = rect_chat_change_fingerprint(
             &capture_normalized(
                 context,
@@ -1732,11 +1818,7 @@ pub(super) fn after_input_failure(stage: &'static str, error: anyhow::Error) -> 
     )
 }
 
-pub(super) fn sleep_ms(ms: u64) {
-    if ms > 0 {
-        sleep(Duration::from_millis(ms));
-    }
-}
+pub(super) use super::state_observation::wait_ms;
 
 #[cfg(test)]
 mod tests {
@@ -1748,6 +1830,35 @@ mod tests {
             "test_ready",
             "not confirmed",
         )
+    }
+
+    #[test]
+    fn invite_ready_propagates_cooperative_wait_failure() {
+        let clock = ManualClock::new(std::time::Instant::now());
+        let running = AtomicBool::new(true);
+        let mut observations = 0;
+        let failure = wait_for_invite_primary_stability_with_port(
+            &clock,
+            Duration::from_secs(3),
+            Duration::from_millis(100),
+            &running,
+            |wait| {
+                if wait.is_some() {
+                    Err(UiRoutineFailure::new(
+                        InputCertainty::ConfirmedFailure,
+                        "confirm_invite_primary_stability",
+                        "cooperative wait cancelled",
+                    ))
+                } else {
+                    observations += 1;
+                    Ok(true)
+                }
+            },
+        )
+        .expect_err("a failed wait must not count as another observation");
+        assert_eq!(observations, 1);
+        assert_eq!(failure.stage(), "confirm_invite_primary_stability");
+        assert_eq!(failure.certainty(), InputCertainty::ConfirmedFailure);
     }
 
     #[test]
@@ -3174,7 +3285,8 @@ mod tests {
     }
 
     fn load_real_frame(path: &str, config: &AppConfig) -> DynamicImage {
-        let frame = image::open(path).unwrap_or_else(|error| panic!("打不开真实帧 {path}: {error}"));
+        let frame =
+            image::open(path).unwrap_or_else(|error| panic!("打不开真实帧 {path}: {error}"));
         assert_eq!(
             (frame.width(), frame.height()),
             (config.screen.expected_width, config.screen.expected_height),
@@ -3189,7 +3301,7 @@ mod tests {
         for path in [
             "tests/fixtures/ui/hall-primary-1920x1080.jpg",
             "tests/fixtures/ui/secondary-with-hall-row-1920x1080.png",
-            "docs/ui-state-evidence/hall-page.png",
+            "technical-docs/ui-state-evidence/hall-page.png",
         ] {
             let image = image::open(path).unwrap();
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
@@ -3292,8 +3404,7 @@ mod tests {
                 let start = std::time::Instant::now();
                 let mut best: Option<(f32, i32, i32, u32, u32)> = None;
                 for _ in 0..rounds {
-                    let hit = best_template_hit(&image, Some(*region), path, threshold)
-                        .unwrap();
+                    let hit = best_template_hit(&image, Some(*region), path, threshold).unwrap();
                     best = hit.map(|hit| (hit.score, hit.x, hit.y, hit.width, hit.height));
                 }
                 println!(

@@ -10,12 +10,11 @@ use serde::Serialize;
 
 use super::geometry::{Point, Rect, crop_canvas};
 
-static RGB_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, RgbImage>>> = OnceLock::new();
+static RGB_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<RgbImage>>>> = OnceLock::new();
 static GRAY_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<GrayTemplate>>>> = OnceLock::new();
 /// 按整数倍降采样后的模板，键为 `(模板路径, 降采样倍数)`。
-static DOWNSCALED_GRAY_TEMPLATE_CACHE: OnceLock<
-    Mutex<HashMap<(PathBuf, u32), Arc<GrayTemplate>>>,
-> = OnceLock::new();
+static DOWNSCALED_GRAY_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<(PathBuf, u32), Arc<GrayTemplate>>>> =
+    OnceLock::new();
 
 /// 灰度标准差低于该值的模板视为"纯色/近纯色"：对 SAD 几乎没有区分度。
 ///
@@ -166,18 +165,19 @@ fn find_color_template_hits_in_rgb(
     ))
 }
 
-fn cached_rgb_template(template_path: &Path) -> Result<RgbImage> {
+fn cached_rgb_template(template_path: &Path) -> Result<Arc<RgbImage>> {
     let cache = RGB_TEMPLATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
         .map_err(|_| anyhow!("template cache mutex poisoned"))?;
     if let Some(image) = cache.get(template_path) {
-        return Ok(image.clone());
+        return Ok(Arc::clone(image));
     }
     let image = image::open(template_path)
         .with_context(|| format!("open template {}", template_path.display()))?
         .to_rgb8();
-    cache.insert(template_path.to_path_buf(), image.clone());
+    let image = Arc::new(image);
+    cache.insert(template_path.to_path_buf(), Arc::clone(&image));
     Ok(image)
 }
 
@@ -249,10 +249,7 @@ fn cached_gray_template(template_path: &Path) -> Result<Arc<GrayTemplate>> {
 
 /// 模板的降采样版本（缓存）。灰度与 alpha 用**与画面相同的滤波器**缩小，
 /// 保证两侧口径一致——否则同一内容在两边会落到不同的像素上，分数会无谓地掉。
-fn cached_downscaled_gray_template(
-    template_path: &Path,
-    scale: u32,
-) -> Result<Arc<GrayTemplate>> {
+fn cached_downscaled_gray_template(template_path: &Path, scale: u32) -> Result<Arc<GrayTemplate>> {
     let scale = scale.max(1);
     let cache = DOWNSCALED_GRAY_TEMPLATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
@@ -363,6 +360,28 @@ pub(crate) fn best_template_hit(
 ) -> Result<Option<TemplateHit>> {
     Ok(best_template_candidate(image, search_rect, template_path)?
         .filter(|candidate| candidate.score >= threshold))
+}
+
+/// Check presence without selecting a best position or constructing hit evidence.
+pub(crate) fn template_exists(
+    image: &DynamicImage,
+    search_rect: Option<Rect>,
+    template_path: &Path,
+    threshold: f32,
+) -> Result<bool> {
+    if !threshold.is_finite() || threshold < 0.0 || threshold > 1.0 {
+        return Ok(best_template_hit(image, search_rect, template_path, threshold)?.is_some());
+    }
+    let haystack = match search_rect {
+        Some(rect) => crop_canvas(image, rect)?,
+        None => image.clone(),
+    };
+    let template = cached_gray_template(template_path)?;
+    if template.gray.width() > haystack.width() || template.gray.height() > haystack.height() {
+        return Ok(false);
+    }
+    let matcher = GrayMatcher::from_template(&template);
+    Ok(gray_match_exists(&haystack.to_luma8(), &matcher, threshold))
 }
 
 pub(crate) fn best_template_candidate(
@@ -1004,6 +1023,10 @@ fn cpu_best_gray_match_seeded(
                     opaque.height as usize,
                 );
                 let bound = box_sum.abs_diff(opaque.gray_sum);
+                // Keep equality: an earlier raster position may tie the verified GPU seed.
+                if seed.is_some_and(|seed| bound > seed.sad) {
+                    continue;
+                }
                 bounds.push((
                     bound.min(u32::MAX as u64) as u32,
                     (y * positions_x + x) as u32,
@@ -1047,6 +1070,77 @@ fn cpu_best_gray_match_seeded(
         }
     }
     Some(best)
+}
+
+// Invert the final f32 comparison, not real-number arithmetic: rounding can accept
+// an integer SAD just above ((1 - threshold) * alpha_sum) truncated to u64.
+fn presence_sad_limit(alpha_sum: u64, threshold: f32) -> Option<u64> {
+    let accepts = |sad: u64| 1.0 - sad as f32 / alpha_sum as f32 >= threshold;
+    if alpha_sum == 0 || !accepts(0) {
+        return None;
+    }
+    let (mut low, mut high) = (0, alpha_sum);
+    while low < high {
+        let middle = low + (high - low) / 2 + (high - low) % 2;
+        if accepts(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Some(low)
+}
+
+fn gray_match_exists(haystack: &GrayImage, matcher: &GrayMatcher<'_>, threshold: f32) -> bool {
+    if matcher.gray.width() == 0
+        || matcher.gray.height() == 0
+        || matcher.gray.width() > haystack.width()
+        || matcher.gray.height() > haystack.height()
+    {
+        return false;
+    }
+    let Some(limit) = presence_sad_limit(matcher.alpha_sum, threshold) else {
+        return false;
+    };
+    if let Some((x, y)) = gpu_best_position(haystack, matcher) {
+        // GPU is only a hint. A rejected hint (or unavailable GPU) still scans CPU.
+        if sad_at(haystack, matcher, x, y, limit) <= limit {
+            return true;
+        }
+    }
+    let positions_x = haystack.width() - matcher.gray.width() + 1;
+    let positions_y = haystack.height() - matcher.gray.height() + 1;
+    let sea_rect = matcher.opaque.filter(|opaque| {
+        opaque.width > 0
+            && opaque.height > 0
+            && positions_x as u64
+                * positions_y as u64
+                * matcher.gray.width() as u64
+                * matcher.gray.height() as u64
+                >= SEA_MIN_WORK
+    });
+    let integral = sea_rect.map(|_| integral_image(haystack));
+    for y in 0..positions_y {
+        for x in 0..positions_x {
+            if let (Some(opaque), Some(integral)) = (sea_rect, integral.as_ref()) {
+                let box_sum = integral_rect(
+                    integral,
+                    haystack.width() as usize,
+                    (x + opaque.x) as usize,
+                    (y + opaque.y) as usize,
+                    opaque.width as usize,
+                    opaque.height as usize,
+                );
+                if box_sum.abs_diff(opaque.gray_sum) > limit {
+                    continue;
+                }
+            }
+            if sad_at(haystack, matcher, x, y, limit) <= limit {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 收集区域内全部分数达到阈值的位置（`/tools/template` 的命中列表）。
@@ -1374,6 +1468,15 @@ mod tests {
             .expect("best candidate even below threshold");
         let rejected =
             best_template_hit(&below_threshold, None, &path, 0.99).expect("thresholded candidate");
+        for threshold in [-1.0, -0.001, 0.0, 1.01, f32::NAN, f32::NEG_INFINITY] {
+            assert_eq!(
+                template_exists(&below_threshold, None, &path, threshold).unwrap(),
+                best_template_hit(&below_threshold, None, &path, threshold)
+                    .unwrap()
+                    .is_some(),
+                "threshold={threshold}"
+            );
+        }
         let _ = fs::remove_file(&path);
 
         assert_eq!((hit.x, hit.y), (3, 2));
@@ -1418,6 +1521,360 @@ mod tests {
 
         assert_eq!((hit.x, hit.y), (3, 2));
         assert!(hit.score > 0.999);
+    }
+
+    #[test]
+    fn presence_api_matches_best_and_preserves_crop_load_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "miliastra-presence-test-{}-{}.png",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let template = RgbaImage::from_fn(3, 2, |x, y| {
+            let value = (x * 50 + y * 30) as u8;
+            Rgba([value, value, value, [0, 73, 255][x as usize]])
+        });
+        template.save(&path).unwrap();
+        let image = DynamicImage::ImageLuma8(synthetic_gray(8, 6, 91));
+        for rect in [
+            None,
+            Some(Rect::new(2, 1, 4, 3)),
+            Some(Rect::new(0, 0, 1, 1)),
+        ] {
+            let candidate = best_template_candidate(&image, rect, &path).unwrap();
+            let score = candidate.as_ref().map(|hit| hit.score).unwrap_or(0.5);
+            for threshold in [
+                score,
+                score.next_up(),
+                score.next_down(),
+                0.0,
+                1.0,
+                f32::NAN,
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+            ] {
+                assert_eq!(
+                    template_exists(&image, rect, &path, threshold).unwrap(),
+                    best_template_hit(&image, rect, &path, threshold)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+        let first = cached_rgb_template(&path).unwrap();
+        let second = cached_rgb_template(&path).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_ref(), &image::open(&path).unwrap().to_rgb8());
+        fs::remove_file(&path).unwrap();
+        let missing = path.with_extension("missing.png");
+        assert!(template_exists(&image, None, &missing, 0.5).is_err());
+        let invalid = Some(Rect::new(50, 50, 2, 2));
+        assert!(template_exists(&image, invalid, &path, 0.5).is_err());
+        assert!(best_template_hit(&image, invalid, &path, 0.5).is_err());
+    }
+
+    // Pre-O5 SEA reference: collect every bound before sorting.
+    fn old_seeded_sea(
+        haystack: &GrayImage,
+        matcher: &GrayMatcher<'_>,
+        seed: GrayMatch,
+    ) -> GrayMatch {
+        let opaque = matcher.opaque.expect("SEA rectangle");
+        let positions_x = (haystack.width() - matcher.gray.width() + 1) as usize;
+        let positions_y = (haystack.height() - matcher.gray.height() + 1) as usize;
+        let integral = integral_image(haystack);
+        let mut bounds = Vec::with_capacity(positions_x * positions_y);
+        for y in 0..positions_y {
+            for x in 0..positions_x {
+                let sum = integral_rect(
+                    &integral,
+                    haystack.width() as usize,
+                    x + opaque.x as usize,
+                    y + opaque.y as usize,
+                    opaque.width as usize,
+                    opaque.height as usize,
+                );
+                bounds.push((
+                    sum.abs_diff(opaque.gray_sum).min(u32::MAX as u64) as u32,
+                    (y * positions_x + x) as u32,
+                ));
+            }
+        }
+        bounds.sort_unstable_by_key(|entry| entry.0);
+        let mut best = seed;
+        let mut best_index = seed.y as usize * positions_x + seed.x as usize;
+        for (bound, index) in bounds {
+            if bound as u64 > best.sad {
+                break;
+            }
+            let index = index as usize;
+            let x = (index % positions_x) as u32;
+            let y = (index / positions_x) as u32;
+            let sad = sad_at(haystack, matcher, x, y, best.sad);
+            if sad < best.sad || (sad == best.sad && index < best_index) {
+                best = GrayMatch { x, y, sad };
+                best_index = index;
+            }
+        }
+        best
+    }
+
+    fn synthetic_gray(width: u32, height: u32, mut seed: u32) -> GrayImage {
+        GrayImage::from_fn(width, height, |_, _| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            Luma([(seed >> 24) as u8])
+        })
+    }
+
+    #[test]
+    fn seeded_sea_prefilter_matches_old_and_raster_reference() {
+        for case in 0..12 {
+            let haystack = synthetic_gray(64, 64, 123 + case);
+            let gray = synthetic_gray(16, 16, 456 + case);
+            let alpha = GrayImage::from_fn(16, 16, |x, y| {
+                Luma([if case % 2 == 0 || (x < 12 && y < 12) {
+                    255
+                } else {
+                    73
+                }])
+            });
+            let template = GrayTemplate::build(gray, alpha, Path::new("synthetic"));
+            let matcher = GrayMatcher::from_template(&template);
+            let expected = reference_best(
+                &haystack,
+                &template.gray,
+                &template.alpha,
+                template.alpha_sum,
+            );
+            for (x, y) in [(48, 48), (23, 17), (expected.0, expected.1)] {
+                let seed = GrayMatch {
+                    x,
+                    y,
+                    sad: sad_at(&haystack, &matcher, x, y, u64::MAX),
+                };
+                let actual = cpu_best_gray_match_seeded(&haystack, &matcher, Some(seed)).unwrap();
+                assert_eq!(actual, old_seeded_sea(&haystack, &matcher, seed));
+                assert_eq!((actual.x, actual.y, actual.sad), expected);
+            }
+        }
+        // Every bound equals seed SAD; rejecting equality would lose the earlier tie.
+        let haystack = GrayImage::from_pixel(64, 64, Luma([11]));
+        let gray = GrayImage::from_pixel(16, 16, Luma([10]));
+        let matcher = GrayMatcher::opaque(&gray);
+        let seed = GrayMatch {
+            x: 48,
+            y: 48,
+            sad: 256,
+        };
+        assert_eq!(
+            cpu_best_gray_match_seeded(&haystack, &matcher, Some(seed)),
+            Some(GrayMatch {
+                x: 0,
+                y: 0,
+                sad: 256
+            })
+        );
+    }
+
+    #[test]
+    fn presence_limit_preserves_final_f32_boundary() {
+        for alpha_sum in [1, 73, 255, 1020, 65_280, 16_777_217, 1_000_000_000] {
+            for sad in [0, 1, alpha_sum / 3, alpha_sum / 2, alpha_sum - 1, alpha_sum] {
+                let score = 1.0 - sad as f32 / alpha_sum as f32;
+                for threshold in [
+                    score,
+                    score.next_up(),
+                    score.next_down(),
+                    f32::NAN,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    -0.1,
+                    1.1,
+                ] {
+                    assert_eq!(
+                        presence_sad_limit(alpha_sum, threshold).is_some_and(|limit| sad <= limit),
+                        score >= threshold,
+                        "alpha={alpha_sum} sad={sad} threshold={threshold}"
+                    );
+                }
+            }
+        }
+        assert_eq!(presence_sad_limit(0, -1.0), None);
+        let score = 1.0 - 1.0f32 / 255.0;
+        assert_eq!(((1.0 - score) * 255.0) as u64, 0);
+        assert_eq!(presence_sad_limit(255, score), Some(1));
+    }
+
+    #[test]
+    fn presence_matches_best_for_alpha_floor_sea_and_invalid_dimensions() {
+        for case in 0..16 {
+            let large = case >= 8;
+            let haystack = synthetic_gray(
+                if large { 64 } else { 13 },
+                if large { 64 } else { 11 },
+                700 + case,
+            );
+            let size = if large { 16 } else { 3 };
+            let gray = synthetic_gray(size, size, 900 + case);
+            let alpha = GrayImage::from_fn(size, size, |x, y| {
+                Luma([match case % 4 {
+                    0 => 255,
+                    1 if x < size - 1 && y < size - 1 => 255,
+                    1 => 73,
+                    2 => [0, 1, 73, 254][((x + y) % 4) as usize],
+                    _ => 0,
+                }])
+            });
+            let template = GrayTemplate::build(gray, alpha, Path::new("presence"));
+            let matcher = GrayMatcher::from_template(&template);
+            let expected = reference_best(
+                &haystack,
+                &template.gray,
+                &template.alpha,
+                template.alpha_sum,
+            );
+            let score = 1.0 - expected.2 as f32 / template.alpha_sum as f32;
+            for threshold in [
+                0.0,
+                0.5,
+                0.9,
+                1.0,
+                score,
+                score.next_up(),
+                score.next_down(),
+                f32::NAN,
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+                -0.1,
+                1.1,
+            ] {
+                assert_eq!(
+                    gray_match_exists(&haystack, &matcher, threshold),
+                    template.alpha_sum > 0 && score >= threshold,
+                    "case={case} threshold={threshold}"
+                );
+            }
+        }
+        let gray = GrayImage::from_pixel(1, 1, Luma([0]));
+        let alpha = GrayImage::from_pixel(1, 1, Luma([73]));
+        let template = GrayTemplate::build(gray, alpha, Path::new("floor"));
+        let matcher = GrayMatcher::from_template(&template);
+        assert!(gray_match_exists(
+            &GrayImage::from_pixel(1, 1, Luma([3])),
+            &matcher,
+            1.0
+        ));
+        assert!(!gray_match_exists(
+            &GrayImage::from_pixel(1, 1, Luma([4])),
+            &matcher,
+            1.0
+        ));
+        assert!(!gray_match_exists(&GrayImage::new(0, 0), &matcher, -1.0));
+        assert!(!gray_match_exists(
+            &template.gray,
+            &GrayMatcher::opaque(&GrayImage::new(0, 0)),
+            -1.0
+        ));
+    }
+
+    /// Run explicitly in release, single-threaded; no external fixtures or production switch.
+    #[test]
+    #[ignore]
+    fn template_optimization_old_vs_new_bench() {
+        use std::hint::black_box;
+        fn measure(mut run: impl FnMut(), rounds: usize) -> f64 {
+            for _ in 0..10 {
+                run();
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                run();
+            }
+            start.elapsed().as_secs_f64() * 1_000_000.0 / rounds as f64
+        }
+        assert!(!cfg!(debug_assertions), "run this benchmark with --release");
+        let haystack = synthetic_gray(128, 96, 42);
+        let gray = image::imageops::crop_imm(&haystack, 20, 10, 24, 24).to_image();
+        let matcher = GrayMatcher::opaque(&gray);
+        let seed = GrayMatch {
+            x: 20,
+            y: 10,
+            sad: 0,
+        };
+        assert_eq!(
+            old_seeded_sea(&haystack, &matcher, seed),
+            cpu_best_gray_match_seeded(&haystack, &matcher, Some(seed)).unwrap()
+        );
+        let old = measure(
+            || {
+                black_box(old_seeded_sea(&haystack, &matcher, seed));
+            },
+            200,
+        );
+        let new = measure(
+            || {
+                black_box(cpu_best_gray_match_seeded(&haystack, &matcher, Some(seed)));
+            },
+            200,
+        );
+        println!(
+            "seed SEA old={old:.3}us new={new:.3}us ratio={:.3}",
+            new / old
+        );
+        // Mask one pixel so this CPU existence benchmark never initializes GPU.
+        let mut alpha = GrayImage::from_pixel(24, 24, Luma([255]));
+        alpha.put_pixel(23, 23, Luma([254]));
+        let template = GrayTemplate::build(gray, alpha, Path::new("bench"));
+        let matcher = GrayMatcher::from_template(&template);
+        for (label, image) in [
+            ("positive", haystack),
+            ("negative", GrayImage::from_pixel(128, 96, Luma([0]))),
+        ] {
+            let old_presence = || {
+                cpu_best_gray_match(&image, &matcher)
+                    .is_some_and(|hit| 1.0 - hit.sad as f32 / matcher.alpha_sum as f32 >= 0.99)
+            };
+            assert_eq!(old_presence(), gray_match_exists(&image, &matcher, 0.99));
+            let old = measure(
+                || {
+                    black_box(old_presence());
+                },
+                200,
+            );
+            let new = measure(
+                || {
+                    black_box(gray_match_exists(&image, &matcher, 0.99));
+                },
+                200,
+            );
+            println!(
+                "exists {label} old={old:.3}us new={new:.3}us ratio={:.3}",
+                new / old
+            );
+        }
+        let rgb = Arc::new(RgbImage::from_fn(256, 256, |x, y| {
+            Rgb([x as u8, y as u8, (x + y) as u8])
+        }));
+        assert_eq!(rgb.as_ref(), &rgb.as_ref().clone());
+        let old = measure(
+            || {
+                black_box(rgb.as_ref().clone());
+            },
+            25_000,
+        );
+        let new = measure(
+            || {
+                black_box(Arc::clone(&rgb));
+            },
+            25_000,
+        );
+        println!(
+            "RGB cache clone old={old:.3}us new={new:.3}us ratio={:.3}",
+            new / old
+        );
     }
 
     /// 改造前的朴素扫描，作为逐位对照的基准。

@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 
 use super::formal_task::FormalTaskClient;
 use super::{
-    ApplicationRuntime, PendingTask, PendingTaskExecution, ResidencyPurpose, ResolvedTemplateArgs,
-    TemporaryPrimaryHold, UiResidency,
+    ApplicationRuntime, PendingTask, PendingTaskExecution, ResidencyPurpose, TemporaryPrimaryHold,
+    UiResidency,
 };
 use crate::features::command::{ModuleCommand, RoutedCommand};
 use crate::features::identity::{IdentityAccess, IdentityRole};
@@ -19,78 +19,116 @@ use crate::features::moderation::{
     ModerationTaskPort, ModerationVotePort, ModerationVoteWork, is_moderation_vote_message,
 };
 use crate::interfaces::chat as command;
-use crate::observation::decision::DecisionScreenLock;
-use crate::runtime::monitor::MonitorShared;
-use crate::runtime::ocr::OcrRuntimeHandle;
+use crate::observation::chat::{
+    ChatIdentity, ChatOcrSnapshot, SharedChatOcr, SharedChatSubscriber,
+};
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::ui::InputCertainty;
-use crate::ui::atoms::GameUi;
-use crate::ui::frame::{Canvas, load_frame};
-use crate::ui::geometry::Rect;
 use crate::ui::routines::{
     ExecuteModeration, ModerationEffect, ModerationUiAction, UiResidencyOutcome,
 };
 
 struct ModerationVoteContext {
     running: Arc<AtomicBool>,
-    game_ui: GameUi,
-    ocr: OcrRuntimeHandle,
-    monitor: MonitorShared,
-    template_args: ResolvedTemplateArgs,
-    chat_rect: Rect,
-    canvas: Canvas,
+    shared_ocr: SharedChatOcr,
+    baseline_timeout: Duration,
 }
 
 impl ModerationVoteContext {
     fn open(self) -> Result<AppModerationVotePort> {
-        let mut port = AppModerationVotePort {
-            running: self.running,
-            game_ui: self.game_ui,
-            ocr: self.ocr,
-            monitor: self.monitor,
-            // 投票独立扫描粉色好友消息，只用屏幕基线过滤存量票；不占用聊天观察流，
-            // 一级、二级监听仍可持续发布和执行普通大厅命令。
-            screen_lock: DecisionScreenLock::default(),
-            template_args: self.template_args,
-            chat_rect: self.chat_rect,
-            canvas: self.canvas,
+        // Subscribe before requesting a fresh frame so nothing after the baseline is lost.
+        // This queue is independent of ordinary command delivery and other votes.
+        let subscriber = self.shared_ocr.subscribe()?;
+        let baseline = self.fresh_snapshot()?;
+        AppModerationVotePort::from_baseline(self, subscriber, baseline)
+    }
+
+    fn fresh_snapshot(&self) -> Result<ChatOcrSnapshot> {
+        let refresh = self.shared_ocr.request_refresh()?;
+        let deadline = Instant::now() + self.baseline_timeout;
+        let baseline = loop {
+            if !self.running.load(AtomicOrdering::SeqCst) {
+                anyhow::bail!("运行已停止，已结束管理投票");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("等待共享聊天管理投票基线超时");
+            }
+            if let Some(snapshot) = self
+                .shared_ocr
+                .wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50)))
+                .context("管理投票共享 OCR 基线失败")?
+            {
+                break snapshot;
+            }
         };
-        port.screen_lock = port.collect_screen_lock();
-        Ok(port)
+        Ok(baseline)
     }
 }
 
 struct AppModerationVotePort {
-    running: Arc<AtomicBool>,
-    game_ui: GameUi,
-    ocr: OcrRuntimeHandle,
-    monitor: MonitorShared,
-    screen_lock: DecisionScreenLock,
-    template_args: ResolvedTemplateArgs,
-    chat_rect: Rect,
-    canvas: Canvas,
+    context: ModerationVoteContext,
+    subscriber: SharedChatSubscriber,
+    baseline: ChatOcrSnapshot,
+    baseline_sequence: u64,
+    failed: bool,
 }
 
 impl AppModerationVotePort {
-    fn collect_screen_lock(&self) -> DecisionScreenLock {
-        let Ok(frame) = load_frame(&self.canvas, &self.game_ui) else {
-            return DecisionScreenLock::default();
-        };
-        let Ok(messages) = super::listener::scan_chat_with_shared_ocr(
-            &self.ocr,
-            &self.monitor,
-            self.chat_rect,
-            &frame.image,
-            &self.template_args,
-            None,
-        ) else {
-            return DecisionScreenLock::default();
-        };
-        DecisionScreenLock::from_messages(
-            &messages,
-            &|message_type| message_type == "pink",
-            &is_moderation_vote_message,
-        )
+    fn from_baseline(
+        context: ModerationVoteContext,
+        subscriber: SharedChatSubscriber,
+        baseline: ChatOcrSnapshot,
+    ) -> Result<Self> {
+        if baseline.chat != ChatIdentity::PrimaryHall {
+            anyhow::bail!("管理投票共享 OCR 基线不在一级大厅");
+        }
+        subscriber.bind_chat(baseline.chat.clone(), baseline.visual_session)?;
+        let baseline_sequence = baseline
+            .messages
+            .iter()
+            .map(|message| message.id.bubble_sequence.get())
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
+            context,
+            subscriber,
+            baseline,
+            baseline_sequence,
+            failed: false,
+        })
+    }
+
+    fn read_votes(&self) -> Result<Vec<String>> {
+        let mut votes = Vec::new();
+        for snapshot in self
+            .subscriber
+            .read()
+            .context("管理投票共享 OCR 读取失败")?
+        {
+            if snapshot.captured_at <= self.baseline.captured_at {
+                continue;
+            }
+            if snapshot.chat != self.baseline.chat
+                || snapshot.visual_session != self.baseline.visual_session
+            {
+                anyhow::bail!("管理投票共享 OCR 会话已改变");
+            }
+            // Keep repeated observations and OCR revisions: the vote service requires
+            // stable samples. Business acknowledgement must not consume these votes.
+            votes.extend(
+                snapshot
+                    .messages
+                    .into_iter()
+                    .filter(|message| {
+                        message.id.bubble_sequence.get() > self.baseline_sequence
+                            && message.message_type == "pink"
+                            && is_moderation_vote_message(&message.text)
+                    })
+                    .map(|message| message.text),
+            );
+        }
+        Ok(votes)
     }
 }
 
@@ -100,31 +138,37 @@ impl ModerationVotePort for AppModerationVotePort {
     }
 
     fn wait(&mut self, duration: Duration) {
-        thread::sleep(duration);
+        let deadline = Instant::now() + duration;
+        while self.is_running() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(50)));
+        }
     }
 
     fn is_running(&self) -> bool {
-        self.running.load(AtomicOrdering::SeqCst)
+        !self.failed && self.context.running.load(AtomicOrdering::SeqCst)
     }
 
     fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>> {
-        let frame = load_frame(&self.canvas, &self.game_ui).context("管理投票截图失败")?;
-        let messages = super::listener::scan_chat_with_shared_ocr(
-            &self.ocr,
-            &self.monitor,
-            self.chat_rect,
-            &frame.image,
-            &self.template_args,
-            None,
-        )
-        .context("管理投票 OCR 失败")?;
-        Ok(messages
-            .into_iter()
-            .filter(|message| {
-                message.message_type == "pink" && !self.screen_lock.is_existing(message)
-            })
-            .map(|message| message.text)
-            .collect())
+        let result = (|| {
+            // An unchanged view may be fingerprint-cached by the observer. Request
+            // genuine fresh OCR samples for the service's stable-vote threshold.
+            let votes = self.read_votes()?;
+            if !votes.is_empty() {
+                return Ok(votes);
+            }
+            self.context.fresh_snapshot()?;
+            self.read_votes()
+        })();
+        // The service retries scan errors and otherwise allows an unopposed timeout.
+        // A broken observation stream must end the vote rather than approve it.
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 
     fn finish(&mut self) {}
@@ -345,16 +389,10 @@ impl ApplicationRuntime {
             .map_err(|_| anyhow::anyhow!("管理投票线程句柄锁已损坏"))?;
         let vote_context = ModerationVoteContext {
             running: Arc::clone(&self.lifecycle.running),
-            game_ui: self.ui.game_ui.clone(),
-            ocr: self.ui.ocr.clone(),
-            monitor: self.lifecycle.monitor.clone(),
-            template_args: self.ui.chat_templates.clone(),
-            chat_rect: self.lifecycle.config.screen.chat_rect.into(),
-            canvas: Canvas {
-                width: self.lifecycle.config.screen.expected_width,
-                height: self.lifecycle.config.screen.expected_height,
-                resize: true,
-            },
+            shared_ocr: self.ui.shared_ocr.clone(),
+            baseline_timeout: Duration::from_millis(
+                self.lifecycle.config.timing.decision.timeout_ms,
+            ),
         };
         let task_context = ModerationTaskContext {
             running: Arc::clone(&self.lifecycle.running),
@@ -414,6 +452,150 @@ mod tests {
     use super::*;
     use crate::interfaces::chat::{ModerationAction, ModerationCommand};
     use crate::runtime::ui::UiRoutineFailure;
+
+    fn shared_vote_input(
+        text: &str,
+        color: &str,
+        y: i32,
+    ) -> crate::observation::chat::SharedChatInput {
+        crate::observation::chat::SharedChatInput {
+            text: text.into(),
+            sender: None,
+            raw_sender: None,
+            message_type: color.into(),
+            block: crate::ui::geometry::Rect::new(0, y, 100, 10),
+        }
+    }
+
+    fn shared_vote_context(shared: &SharedChatOcr) -> ModerationVoteContext {
+        ModerationVoteContext {
+            running: Arc::new(AtomicBool::new(true)),
+            shared_ocr: shared.clone(),
+            baseline_timeout: Duration::ZERO,
+        }
+    }
+
+    fn shared_vote_port(shared: &SharedChatOcr) -> AppModerationVotePort {
+        let subscriber = shared.subscribe().unwrap();
+        let baseline = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![shared_vote_input("[旧]：@同", "pink", 10)],
+            )
+            .unwrap();
+        AppModerationVotePort::from_baseline(shared_vote_context(shared), subscriber, baseline)
+            .unwrap()
+    }
+
+    #[test]
+    fn shared_votes_retain_pink_samples_and_revisions_without_consuming_business() {
+        let shared = SharedChatOcr::new();
+        let business = shared.subscribe().unwrap();
+        let mut port = shared_vote_port(&shared);
+        let first = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![
+                    shared_vote_input("[旧]：@同", "pink", 10),
+                    shared_vote_input("[甲]：@同", "pink", 30),
+                ],
+            )
+            .unwrap();
+        // Correct the new bubble before the vote consumer runs; the old bubble's
+        // correction is still baseline, and blue votes never count.
+        for _ in 0..2 {
+            shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PrimaryHall,
+                    vec![
+                        shared_vote_input("[旧]：@同意", "pink", 10),
+                        shared_vote_input("[甲]：@同意", "pink", 30),
+                        shared_vote_input("[乙]：@不同意", "blue", 50),
+                    ],
+                )
+                .unwrap();
+        }
+        // The vote remains observable after it has scrolled off screen.
+        shared
+            .publish(Instant::now(), ChatIdentity::PrimaryHall, vec![])
+            .unwrap();
+        assert_eq!(
+            port.poll_visible_friend_messages().unwrap(),
+            vec!["[甲]：@同意", "[甲]：@同意"]
+        );
+        assert!(port.read_votes().unwrap().is_empty());
+        assert!(shared.is_business_pending(&first.messages[1].id).unwrap());
+        assert_eq!(business.read().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn shared_vote_stream_failures_end_vote_instead_of_allowing_timeout() {
+        for change_chat in [false, true] {
+            let shared = SharedChatOcr::new();
+            let mut port = shared_vote_port(&shared);
+            if change_chat {
+                shared
+                    .publish(Instant::now(), ChatIdentity::SecondaryHall, vec![])
+                    .unwrap();
+            } else {
+                shared.report_failure("OCR unavailable").unwrap();
+            }
+            assert!(port.poll_visible_friend_messages().is_err());
+            assert!(!port.is_running());
+            // Only this vote stops; the application-wide running flag is untouched.
+            assert!(port.context.running.load(AtomicOrdering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn shared_vote_open_rejects_stale_baseline_and_cancelled_runtime() {
+        let shared = SharedChatOcr::new();
+        shared
+            .publish(Instant::now(), ChatIdentity::PrimaryHall, vec![])
+            .unwrap();
+        assert!(shared_vote_context(&shared).open().is_err());
+        let context = shared_vote_context(&shared);
+        context.running.store(false, AtomicOrdering::SeqCst);
+        assert!(context.open().is_err());
+    }
+
+    #[test]
+    fn shared_vote_baseline_binding_preserves_already_queued_new_votes() {
+        let shared = SharedChatOcr::new();
+        let subscriber = shared.subscribe().unwrap();
+        let refresh = shared.request_refresh().unwrap();
+        let baseline = shared
+            .publish(Instant::now(), ChatIdentity::PrimaryHall, vec![])
+            .unwrap();
+        shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![shared_vote_input("[甲]：@不同意", "pink", 10)],
+            )
+            .unwrap();
+        assert_eq!(
+            shared
+                .wait_for_snapshot(refresh, Duration::ZERO)
+                .unwrap()
+                .unwrap()
+                .captured_at,
+            baseline.captured_at
+        );
+        let mut port = AppModerationVotePort::from_baseline(
+            shared_vote_context(&shared),
+            subscriber,
+            baseline,
+        )
+        .unwrap();
+        assert_eq!(
+            port.poll_visible_friend_messages().unwrap(),
+            vec!["[甲]：@不同意"]
+        );
+    }
 
     #[derive(Default)]
     struct TestModerationLedger(

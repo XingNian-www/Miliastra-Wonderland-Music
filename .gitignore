@@ -14,19 +14,9 @@
 !/src/
 !/vendor/
 
-# 技术性/过程性文档仅本地保留(使用文档仍在 docs/ 内跟踪)。
-/docs/archive/
-/docs/architecture-review.md
-/docs/debug-sandbox.md
-/docs/debug-sandbox-flow-audit.md
-/docs/debug-sandbox-live-commands.md
-/docs/game-state-map.md
-/docs/game-state-roundtrip.md
-/docs/template-matching-audit.md
-/docs/ui-state-criteria.md
-/docs/ui-state-machine.md
-/docs/ui-state-transitions.md
-/docs/ui-state-transitions.json
+# GitHub 只保留安装/使用类用户文档(docs/ 内,跟随发布)。
+# 技术性/过程性文档统一放在 technical-docs/,整个目录不入库。
+/technical-docs/
 
 # 根目录中随项目发布的必要文件。
 !/.gitattributes
@@ -56,10 +46,6 @@
 /crates/miliastra-playback/examples/
 .bitfun/
 
-# UI 状态机的大批量实机证据帧（1099 个文件 / 约 626 MB）。
-# 不直接入库：体积远超代码本身，且属于"可重新采"的过程产物。
-# 判据与结论在 docs/ui-state-criteria.md、docs/ui-state-machine.md、
-# docs/ui-state-transitions.json 里，每一处都注明了用到的帧名与来源目录。
-# 需要核对某一帧时，按文档里的采集方法（第 27 章的复现命令）重采即可。
-/docs/ui-state-evidence/
+# 实机证据帧(1099 个文件 / 约 626 MB)属于可重采的过程产物,随 technical-docs/ 一起不入库;
+# 判据与复现方法见 technical-docs/ui-state-criteria.md 与 technical-docs/ui-state-machine.md。
 /.bitfun/search/flashgrep-index/

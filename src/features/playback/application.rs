@@ -970,6 +970,18 @@ impl PlaybackApplication {
         Ok(result)
     }
 
+    /// 直接播放一首已收藏的结构化曲目（个人歌单 @歌单随机 使用）。
+    ///
+    /// 与点歌确认走同一条 play_confirmed 路径，因此同样计入播放池与后续预加载。
+    pub(crate) fn play_structured_track<P: PlaybackExecutionPort + ?Sized>(
+        &self,
+        track: &PlayableTrack,
+        port: &mut P,
+    ) -> Result<()> {
+        let selection = pool_selection(track);
+        self.play_confirmed(&selection, port).map(|_| ())
+    }
+
     /// 预加载下一首曲目音源：解析 + 音频数据预下载（启用缓存时），
     /// 失败静默（播放时重新解析）。
     fn preload_next_track<P: PlaybackExecutionPort + ?Sized>(

@@ -17,12 +17,54 @@ use crate::runtime::ui::CapturedFrame;
 
 const MAX_FRAMES: usize = 8;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-const MAX_ENTRIES: usize = 8;
-const MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
+// Independent budgets: metadata 256 / 16 MiB; evidence images 8 / 32 MiB.
+// Rolling capture sources remain 8 / 64 MiB. All queues evict oldest first.
+// Metadata accounting conservatively includes JSON trees, history, provenance and secret keys.
+// Pre-receipt cache: newest 1000 IDs, each status bounded to 16 KiB plus map overhead.
+// Omitted snapshots/results are exposed through loss or status. History keeps 32
+// records with historyDropped. Metadata loss has a 32-item tail and cumulative
+// unfinished loss. Shared image Arcs count in each evidence slot conservatively.
+const MAX_ENTRIES: usize = 256;
+const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EVIDENCE_IMAGES: usize = 8;
+const MAX_EVIDENCE_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
-const MAX_STATUS_RECORDS: usize = 60;
+const MAX_STATUS_RECORDS: usize = 1000;
+const MAX_STATUS_BYTES: usize = 16 * 1024;
 const MAX_HISTORY: usize = 32;
-const STATUS_HISTORY_RESERVE: usize = (MAX_HISTORY + 1) * 32 * 1024;
+mod paging;
+#[cfg(test)]
+mod state_tests;
+
+/// Metadata keeps provenance without retaining the raw image allocation.
+#[derive(Clone)]
+struct SourceIdentity {
+    captured_at: Instant,
+    metadata: Value,
+}
+
+impl SourceIdentity {
+    fn new(source: &SourceFrame) -> Self {
+        let image = source.frame.image();
+        Self {
+            captured_at: source.frame.captured_at(),
+            metadata: json!({
+                "frameId": source.frame.id(),
+                "capturedAtWallMillis": source.captured_at_wall_millis,
+                "capturedAtWallMillisEstimated": true, "canvas": "rawGame",
+                "width": image.width(), "height": image.height(),
+                "pixelFormat": format!("{:?}", image.color()),
+                "uiState": source.frame.ui_state().map(|s| s.diagnostic())
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EvidenceImage {
+    id: String,
+    source: SourceFrame,
+}
 const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -69,7 +111,12 @@ struct Entry {
     status: Value,
     redactions: Vec<String>,
     history: VecDeque<Value>,
-    source: Option<SourceFrame>,
+    source: Option<SourceIdentity>,
+    image_retained: bool,
+    revision: u64,
+    last_formal_generation: u64,
+    history_dropped: u64,
+    instance: String,
     missing_reason: Option<&'static str>,
     bytes: usize,
 }
@@ -78,8 +125,10 @@ impl Entry {
     fn summary(&self) -> Value {
         json!({"id": self.id, "kind": self.kind, "taskId": self.task_id,
             "schemaVersion": SCHEMA_VERSION, "appVersion": env!("CARGO_PKG_VERSION"),
-            "recordedAtMs": self.recorded_at_ms, "status": self.status,
-            "sourceFrameId": self.source.as_ref().map(|s| s.frame.id()),
+            "recordedAtMs": self.recorded_at_ms, "status": status_summary(&self.status),
+            "sourceFrameId": self.source.as_ref().map(|s| &s.metadata["frameId"]),
+            "instance": self.instance, "revision": self.revision,
+            "imageRetained": self.image_retained, "historyDropped": self.history_dropped,
             "missingReason": self.missing_reason,
             "evidenceUrl": format!("/debug/read-only/evidence?id={}", self.id)})
     }
@@ -93,6 +142,12 @@ struct ObserverData {
     frame_bytes: usize,
     entries: VecDeque<Entry>,
     entry_bytes: usize,
+    images: VecDeque<EvidenceImage>,
+    image_bytes: usize,
+    dropped_images: u64,
+    lost_unfinished: u64,
+    losses: VecDeque<Value>,
+    revision: u64,
     next_id: u64,
     dropped_frames: u64,
     dropped_entries: u64,
@@ -101,11 +156,14 @@ struct ObserverData {
     // Enqueue publishes its projection before the application receives the receipt.
     // Keep bounded latest snapshots so record_trigger can reconcile that race.
     statuses: HashMap<u64, Value>,
+    reconciliation_omitted: usize,
+    dropped_formal_statuses: u64,
 }
 
 pub(crate) struct ReadOnlyObserver {
     data: Mutex<ObserverData>,
     events: DebugEventBus,
+    instance: String,
 }
 
 impl Default for ReadOnlyObserver {
@@ -113,6 +171,7 @@ impl Default for ReadOnlyObserver {
         Self {
             data: Mutex::new(ObserverData::default()),
             events: DebugEventBus::new(),
+            instance: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -129,6 +188,10 @@ impl ReadOnlyObserver {
             let _guard = self.data.lock().unwrap();
             panic!("test observer failure");
         }));
+    }
+
+    pub(crate) fn instance(&self) -> &str {
+        &self.instance
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -149,7 +212,9 @@ impl ReadOnlyObserver {
     pub(crate) fn state_snapshot(&self) -> Value {
         match self.data.lock() {
             Ok(data) => self.describe(&data),
-            Err(_) => json!({"enabled": false, "state": "active", "error": "observer unavailable"}),
+            Err(_) => {
+                json!({"enabled": false, "state": "active", "instance": self.instance, "error": "observer unavailable"})
+            }
         }
     }
 
@@ -163,13 +228,15 @@ impl ReadOnlyObserver {
 
     pub(crate) fn set_enabled_state(&self, enabled: bool, state: ReadOnlyState) -> Value {
         let Ok(mut data) = self.data.lock() else {
-            return json!({"enabled": false, "state": "active", "error": "observer unavailable"});
+            return json!({"enabled": false, "state": "active", "instance": self.instance, "error": "observer unavailable"});
         };
         if data.enabled != enabled || data.mode != state {
             data.frames.clear();
             data.frame_bytes = 0;
             data.statuses.clear();
             data.generation = None;
+            data.reconciliation_omitted = 0;
+            data.revision = data.revision.saturating_add(1);
         }
         data.enabled = enabled;
         data.mode = state;
@@ -178,15 +245,20 @@ impl ReadOnlyObserver {
     }
 
     fn describe(&self, data: &ObserverData) -> Value {
-        json!({"enabled": data.enabled, "state": data.mode,
+        json!({"enabled": data.enabled, "state": data.mode, "instance": self.instance,
+            "revision": data.revision,
             "schemaVersion": SCHEMA_VERSION, "appVersion": env!("CARGO_PKG_VERSION"),
             "latestSequence": self.events.latest_sequence(),
             "memory": {"frames": data.frames.len(), "frameBytes": data.frame_bytes,
-                "entries": data.entries.len(), "entryBytes": data.entry_bytes},
+                "entries": data.entries.len(), "entryBytes": data.entry_bytes,
+                "evidenceImages": data.images.len(), "evidenceImageBytes": data.image_bytes},
             "limits": {"frames": MAX_FRAMES, "frameBytes": MAX_FRAME_BYTES,
-                "entries": MAX_ENTRIES, "entryBytes": MAX_ENTRY_BYTES},
+                "entries": MAX_ENTRIES, "entryBytes": MAX_ENTRY_BYTES,
+                "evidenceImages": MAX_EVIDENCE_IMAGES, "evidenceImageBytes": MAX_EVIDENCE_IMAGE_BYTES,
+                "statuses": MAX_STATUS_RECORDS, "statusBytesEach": MAX_STATUS_BYTES, "history": MAX_HISTORY},
             "droppedFrames": data.dropped_frames, "droppedEntries": data.dropped_entries,
-            "rejectedFrames": data.rejected_frames})
+            "rejectedFrames": data.rejected_frames, "droppedImages": data.dropped_images,
+            "loss": loss_snapshot(data)})
     }
 
     pub(crate) fn bus(&self) -> &DebugEventBus {
@@ -199,6 +271,7 @@ impl ReadOnlyObserver {
         json!({"events": events.iter().map(|event| json!({"sequence": event.sequence,
             "kind": event.kind, "atMs": event.at_ms, "payload": event.payload})).collect::<Vec<_>>(),
             "latestSequence": self.events.latest_sequence(),
+            "instance": self.instance,
             "gap": first.is_some_and(|sequence| sequence > since.saturating_add(1)),
             "retention": self.state_snapshot()})
     }
@@ -248,19 +321,14 @@ impl ReadOnlyObserver {
             return Err("active payload exceeds 64 KiB".into());
         }
         let source = SourceFrame::new(frame);
-        let bytes = source
-            .bytes
-            .saturating_add(payload_bytes)
-            .saturating_add(redactions.iter().map(String::len).sum::<usize>())
-            .saturating_add(4096);
-        if bytes > MAX_ENTRY_BYTES {
-            return Err("active evidence exceeds 32 MiB".into());
+        if source.bytes > MAX_EVIDENCE_IMAGE_BYTES {
+            return Err("active image exceeds 32 MiB".into());
         }
         let mut data = self.data.lock().map_err(|_| "observer unavailable")?;
         if !data.enabled || data.mode != ReadOnlyState::Active {
             return Err("active read requires enabled active state".into());
         }
-        let id = next_id(&mut data);
+        let id = next_id(&mut data)?;
         let entry = Entry {
             id: id.clone(),
             kind: "active",
@@ -270,11 +338,17 @@ impl ReadOnlyObserver {
             status: Value::Null,
             redactions,
             history: VecDeque::new(),
-            source: Some(source),
+            source: Some(SourceIdentity::new(&source)),
+            image_retained: true,
+            revision: 1,
+            last_formal_generation: 0,
+            history_dropped: 0,
+            instance: self.instance.clone(),
             missing_reason: None,
-            bytes,
+            bytes: 0,
         };
         insert_entry(&mut data, entry);
+        insert_image(&mut data, id.clone(), source);
         Ok(id)
     }
 
@@ -325,12 +399,11 @@ impl ReadOnlyObserver {
                 .pointer("/sourceCommand/sourceKind")
                 .and_then(Value::as_str)
                 == Some("nonVisualInput");
-        let mut payload_bytes = serde_json::to_vec(&task)
+        let payload_bytes = serde_json::to_vec(&task)
             .map(|v| v.len())
             .unwrap_or(MAX_PAYLOAD_BYTES + 1);
         if payload_bytes > MAX_PAYLOAD_BYTES {
             task = json!({"kind": task.get("kind"), "parametersOmitted": "payload exceeds 64 KiB"});
-            payload_bytes = 1024;
         }
         // Only equality with the OCR source Instant is valid. Never substitute latest_frame.
         let mut source = captured_at.filter(|_| !private_source).and_then(|at| {
@@ -341,12 +414,8 @@ impl ReadOnlyObserver {
                 // A long-running conversion may outlive the rolling capture cache.
                 // Reuse only a retained evidence frame with the exact same Instant.
                 .or_else(|| {
-                    data.entries.iter().find_map(|entry| {
-                        entry
-                            .source
-                            .as_ref()
-                            .filter(|s| s.frame.captured_at() == at)
-                            .cloned()
+                    data.images.iter().find_map(|image| {
+                        (image.source.frame.captured_at() == at).then(|| image.source.clone())
                     })
                 })
         });
@@ -361,21 +430,18 @@ impl ReadOnlyObserver {
         } else {
             Some("exact_source_frame_not_retained")
         };
-        let overhead = payload_bytes
-            .saturating_add(redactions.iter().map(String::len).sum::<usize>())
-            .saturating_add(STATUS_HISTORY_RESERVE);
+
         if source
             .as_ref()
-            .is_some_and(|s| s.bytes.saturating_add(overhead) > MAX_ENTRY_BYTES)
+            .is_some_and(|s| s.bytes > MAX_EVIDENCE_IMAGE_BYTES)
         {
             source = None;
             missing_reason = Some("source_frame_exceeds_evidence_budget");
         }
-        let bytes = source
-            .as_ref()
-            .map_or(0, |s| s.bytes)
-            .saturating_add(overhead);
-        let id = next_id(&mut data);
+
+        let Ok(id) = next_id(&mut data) else {
+            return;
+        };
         let immediate = completion.is_some();
         let initial = completion.unwrap_or_else(|| json!({"id": task_id, "status": "queued"}));
         let latest_status = task_id.and_then(|id| data.statuses.get(&id).cloned());
@@ -385,19 +451,35 @@ impl ReadOnlyObserver {
             task_id,
             recorded_at_ms: now_ms(),
             task,
-            status: redact_strings(initial, &redactions),
+            status: bounded_status(redact_strings(initial, &redactions)),
             redactions,
             history: VecDeque::new(),
-            source,
+            source: source.as_ref().map(SourceIdentity::new),
+            image_retained: source.is_some(),
+            revision: 1,
+            last_formal_generation: 0,
+            history_dropped: 0,
+            instance: self.instance.clone(),
             missing_reason,
-            bytes,
+            bytes: 0,
         };
-        self.publish_entry(&mut entry, "readonly.triggered");
-        if let Some(status) = latest_status {
-            entry.status = redact_strings(status, &entry.redactions);
-            self.publish_entry(&mut entry, "readonly.task.updated");
+        let latest_status =
+            latest_status.map(|status| bounded_status(redact_strings(status, &entry.redactions)));
+        if let Some(status) = latest_status
+            .as_ref()
+            .filter(|status| !workflow_changed(&entry.status, status))
+        {
+            entry.status = status.clone();
         }
+        self.publish_entry(&mut entry, "readonly.triggered");
+        if let Some(status) = latest_status.filter(|status| entry.status != *status) {
+            self.update_entry_status(&mut entry, status);
+        }
+        let id = entry.id.clone();
         insert_entry(&mut data, entry);
+        if let Some(source) = source {
+            insert_image(&mut data, id, source);
+        }
     }
 
     pub(crate) fn record_status(&self, projection: &TaskEngineProjection) {
@@ -414,12 +496,24 @@ impl ReadOnlyObserver {
             return;
         }
         data.generation = Some(projection.generation);
-        data.statuses = projection
-            .scheduler
-            .tasks()
-            .iter()
+        let omitted = projection
+            .formal_statuses
+            .len()
+            .saturating_sub(MAX_STATUS_RECORDS);
+        if data.dropped_formal_statuses != projection.dropped_formal_statuses
+            || data.reconciliation_omitted != omitted
+        {
+            data.dropped_formal_statuses = projection.dropped_formal_statuses;
+            data.reconciliation_omitted = omitted;
+            data.revision = data.revision.saturating_add(1);
+        }
+        // Highest formal IDs reconcile new receipts first, independently of source ordering.
+        let mut newest: Vec<_> = projection.formal_statuses.iter().collect();
+        newest.sort_unstable_by_key(|snapshot| std::cmp::Reverse(snapshot.id));
+        data.statuses = newest
+            .into_iter()
             .take(MAX_STATUS_RECORDS)
-            .map(|snapshot| (snapshot.id, workflow_status(snapshot)))
+            .map(|snapshot| (snapshot.id, bounded_status(workflow_status(snapshot))))
             .collect();
         // Do not emit whole projections: deferred chat, untracked tasks and elapsed ticks are silent.
         let updates: Vec<_> = data
@@ -427,76 +521,188 @@ impl ReadOnlyObserver {
             .iter()
             .filter_map(|entry| {
                 let task_id = entry.task_id?;
+                if projection.generation < entry.last_formal_generation {
+                    return None;
+                }
+                // The complete formal source, never the 30-item display window or
+                // the bounded pre-receipt cache, drives tracked task transitions.
+                let snapshot = projection
+                    .formal_statuses
+                    .iter()
+                    .find(|s| s.id == task_id)?;
                 let status =
-                    redact_strings(data.statuses.get(&task_id)?.clone(), &entry.redactions);
+                    bounded_status(redact_strings(workflow_status(snapshot), &entry.redactions));
                 (entry.status != status).then(|| (entry.id.clone(), status))
             })
             .collect();
+        let changed = !updates.is_empty();
         for (id, status) in updates {
             if let Some(entry) = data.entries.iter_mut().find(|entry| entry.id == id) {
-                entry.status = status;
-                self.publish_entry(entry, "readonly.task.updated");
+                entry.last_formal_generation = projection.generation;
+                self.update_entry_status(entry, status);
             }
+        }
+        if changed {
+            refresh_entries(&mut data);
+        }
+    }
+
+    /// Optional unversioned test/migration hook; production receipts use the versioned hook.
+    pub(crate) fn record_formal_status(&self, snapshot: &FormalTaskSnapshot) {
+        self.record_formal_status_inner(None, snapshot);
+    }
+
+    /// Reconcile a formal ID lookup captured atomically with its task-engine generation.
+    /// A one-task lookup must not advance the whole-projection generation fence.
+    pub(crate) fn record_formal_status_at(&self, generation: u64, snapshot: &FormalTaskSnapshot) {
+        self.record_formal_status_inner(Some(generation), snapshot);
+    }
+
+    fn record_formal_status_inner(&self, generation: Option<u64>, snapshot: &FormalTaskSnapshot) {
+        let Ok(mut data) = self.data.lock() else {
+            return;
+        };
+        if !data.enabled || data.mode != ReadOnlyState::Push {
+            return;
+        }
+        if generation.is_some_and(|generation| generation < data.generation.unwrap_or(0)) {
+            return;
+        }
+        let status = workflow_status(snapshot);
+        let mut changed = false;
+        for entry in data
+            .entries
+            .iter_mut()
+            .filter(|e| e.task_id == Some(snapshot.id))
+        {
+            if generation.is_some_and(|generation| generation < entry.last_formal_generation) {
+                continue;
+            }
+            let status = bounded_status(redact_strings(status.clone(), &entry.redactions));
+            if let Some(generation) = generation {
+                entry.last_formal_generation = generation;
+            }
+            if entry.status != status {
+                self.update_entry_status(entry, status);
+                changed = true;
+            }
+        }
+        if changed {
+            refresh_entries(&mut data);
+        }
+    }
+
+    fn update_entry_status(&self, entry: &mut Entry, status: Value) {
+        let workflow_changed = workflow_changed(&entry.status, &status);
+        entry.status = status;
+        if workflow_changed {
+            self.publish_entry(entry, "readonly.task.updated");
+        } else {
+            // Filling queuedAtMs/id/default flags is metadata enrichment, not a
+            // second queue transition. It changes pagination content, hence revision.
+            entry.revision = entry.revision.saturating_add(1);
         }
     }
 
     fn publish_entry(&self, entry: &mut Entry, kind: &str) {
+        entry.revision = entry.revision.saturating_add(1);
+        while entry.history.len() >= MAX_HISTORY {
+            entry.history.pop_front();
+            entry.history_dropped = entry.history_dropped.saturating_add(1);
+        }
         let event = self.events.publish(kind, entry.summary());
         entry
             .history
             .push_back(json!({"sequence": event.sequence, "kind": event.kind,
             "atMs": event.at_ms, "status": entry.status}));
-        while entry.history.len() > MAX_HISTORY {
-            entry.history.pop_front();
-        }
     }
 
-    pub(crate) fn read_entry(&self, id: &str) -> Result<Value, String> {
-        let entry = {
-            let data = self.data.lock().map_err(|_| "observer unavailable")?;
-            match data.entries.iter().find(|entry| entry.id == id) {
-                Some(entry) => entry.clone(),
-                None => {
-                    let sequence = id
-                        .strip_prefix("readonly-")
-                        .and_then(|s| s.parse::<u64>().ok());
-                    return Err(if sequence.is_some_and(|s| s > 0 && s <= data.next_id) {
-                        "evidence_expired: bounded evidence retention evicted this entry"
-                    } else {
-                        "evidence_not_found"
-                    }
-                    .into());
+    fn snapshot_entry(&self, id: &str) -> Result<(Entry, Option<SourceFrame>), String> {
+        let data = self.data.lock().map_err(|_| "observer unavailable")?;
+        let entry = data
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| {
+                let sequence = id
+                    .strip_prefix("readonly-")
+                    .and_then(|s| s.parse::<u64>().ok());
+                if sequence.is_some_and(|s| s > 0 && s <= data.next_id) {
+                    let lost = data.losses.iter().find(|v| v["id"] == id);
+                    format!(
+                        "evidence_expired: bounded metadata retention; loss={}",
+                        lost.cloned().unwrap_or_else(|| loss_snapshot(&data))
+                    )
+                } else {
+                    "evidence_not_found".to_owned()
                 }
-            }
-        };
-        // Expensive work is intentionally outside all producer and observer locks.
-        let source = match entry.source.as_ref() {
+            })?
+            .clone();
+        let source = data
+            .images
+            .iter()
+            .find(|image| image.id == id)
+            .map(|image| image.source.clone());
+        Ok((entry, source))
+    }
+
+    /// Lightweight read: provenance only, no PNG encoding or pixel hashing.
+    pub(crate) fn entry_metadata(&self, id: &str) -> Result<Value, String> {
+        let data = self.data.lock().map_err(|_| "observer unavailable")?;
+        if let Some(entry) = data.entries.iter().find(|entry| entry.id == id) {
+            return Ok(entry_metadata_value(entry, true));
+        }
+        drop(data);
+        self.snapshot_entry(id)
+            .map(|(entry, _)| entry_metadata_value(&entry, true))
+    }
+
+    /// The raw original frame is cloned under the lock, then encoded outside it.
+    pub(crate) fn read_image(&self, id: &str) -> Result<(Vec<u8>, Value), String> {
+        let (entry, source) = self.snapshot_entry(id)?;
+        let source = source.ok_or_else(|| {
+            format!(
+                "image_unavailable: {}",
+                entry
+                    .missing_reason
+                    .unwrap_or("exact_source_frame_not_retained")
+            )
+        })?;
+        encode_image(&entry, &source)
+    }
+
+    /// Legacy POST response keeps complete evidence and inline PNG compatibility.
+    pub(crate) fn read_entry(&self, id: &str) -> Result<Value, String> {
+        let (entry, source) = self.snapshot_entry(id)?;
+        let mut result = entry_metadata_value(&entry, true);
+        result["status"] = entry.status.clone();
+        result["task"] = entry.task.clone();
+        result["history"] = json!(entry.history);
+        result["source"] = match source {
             Some(source) => {
-                let image = source.frame.image();
-                let mut png = Cursor::new(Vec::new());
-                image
-                    .write_to(&mut png, image::ImageFormat::Png)
-                    .map_err(|e| e.to_string())?;
-                json!({"frameId": source.frame.id(), "capturedAtWallMillis": source.captured_at_wall_millis,
-                    "capturedAtWallMillisEstimated": true,
-                    "ageMillis": source.frame.captured_at().elapsed().as_millis(),
-                    "canvas": "rawGame", "width": image.width(), "height": image.height(),
-                    "pixelFormat": format!("{:?}", image.color()),
-                    "pixelSha256": format!("{:x}", Sha256::digest(image.as_bytes())),
-                    "uiState": source.frame.ui_state().map(|state| state.diagnostic()),
-                    "imagePngBase64": crate::debug_http_service::base64_encode(png.get_ref())})
+                let (png, mut metadata) = encode_image(&entry, &source)?;
+                metadata["imagePngBase64"] = json!(crate::debug_http_service::base64_encode(&png));
+                metadata
             }
             None => Value::Null,
         };
-        let mut result = entry.summary();
-        result["task"] = entry.task;
-        result["history"] = json!(entry.history);
-        result["source"] = source;
-        result["replay"] = json!({"schemaVersion": SCHEMA_VERSION,
-            "kind": "evidence_only", "executesBusinessActions": false,
-            "parametersAreRedacted": true, "canvas": "rawGame"});
+        result["replay"] = replay_metadata();
         Ok(result)
     }
+}
+
+fn workflow_changed(old: &Value, new: &Value) -> bool {
+    let fields = [
+        "status",
+        "result",
+        "startedAtMs",
+        "finishedAtMs",
+        "resultOmitted",
+        "statusOmitted",
+    ];
+    fields.iter().any(|field| old[*field] != new[*field])
+        || old["cancellationRequested"].as_bool().unwrap_or(false)
+            != new["cancellationRequested"].as_bool().unwrap_or(false)
 }
 
 fn workflow_status(snapshot: &FormalTaskSnapshot) -> Value {
@@ -508,24 +714,223 @@ fn workflow_status(snapshot: &FormalTaskSnapshot) -> Value {
         "result": snapshot.result})
 }
 
-fn next_id(data: &mut ObserverData) -> String {
-    data.next_id = data.next_id.saturating_add(1);
-    format!("readonly-{}", data.next_id)
+fn next_id(data: &mut ObserverData) -> Result<String, String> {
+    // Refuse exhaustion instead of wrapping, reusing IDs, or poisoning the lock.
+    data.next_id = data.next_id.checked_add(1).ok_or("evidence_id_exhausted")?;
+    Ok(format!("readonly-{}", data.next_id))
 }
 
-fn insert_entry(data: &mut ObserverData, entry: Entry) {
-    while data.entries.len() >= MAX_ENTRIES
-        || data.entry_bytes.saturating_add(entry.bytes) > MAX_ENTRY_BYTES
+fn entry_metadata_value(entry: &Entry, age: bool) -> Value {
+    let mut value = entry.summary();
+    value["source"] = entry
+        .source
+        .as_ref()
+        .map(|s| {
+            let mut metadata = s.metadata.clone();
+            metadata["imageRetained"] = json!(entry.image_retained);
+            if age {
+                metadata["ageMillis"] = json!(s.captured_at.elapsed().as_millis());
+            }
+            metadata
+        })
+        .unwrap_or(Value::Null);
+    value["replay"] = replay_metadata();
+    value
+}
+
+fn replay_metadata() -> Value {
+    json!({"schemaVersion": SCHEMA_VERSION, "kind": "evidence_only",
+        "executesBusinessActions": false, "parametersAreRedacted": true, "canvas": "rawGame"})
+}
+
+fn encode_image(entry: &Entry, source: &SourceFrame) -> Result<(Vec<u8>, Value), String> {
+    let image = source.frame.image();
+    let mut png = Cursor::new(Vec::new());
+    image
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    let png = png.into_inner();
+    let mut metadata = SourceIdentity::new(source).metadata;
+    metadata["id"] = json!(entry.id);
+    metadata["instance"] = json!(entry.instance);
+    metadata["revision"] = json!(entry.revision);
+    metadata["ageMillis"] = json!(source.frame.captured_at().elapsed().as_millis());
+    metadata["pixelSha256"] = json!(format!("{:x}", Sha256::digest(image.as_bytes())));
+    metadata["fileSha256"] = json!(format!("{:x}", Sha256::digest(&png)));
+    Ok((png, metadata))
+}
+
+fn status_summary(status: &Value) -> Value {
+    let mut summary = status.clone();
+    if let Some(text) = status["result"].as_str().filter(|s| s.len() > 1024) {
+        let end = utf8_floor(text, 1024);
+        summary["result"] = json!(&text[..end]);
+        summary["resultTruncated"] = json!(true);
+        summary["resultBytes"] = json!(text.len());
+    }
+    summary
+}
+
+fn bounded_status(mut status: Value) -> Value {
+    if value_size(&status) > MAX_STATUS_BYTES
+        || serde_json::to_vec(&status).map_or(true, |v| v.len() > MAX_STATUS_BYTES)
     {
-        if let Some(old) = data.entries.pop_front() {
-            data.entry_bytes = data.entry_bytes.saturating_sub(old.bytes);
-            data.dropped_entries += 1;
-        } else {
-            break;
+        let original_bytes = serde_json::to_vec(&status).map_or(0, |v| v.len());
+        status["result"] = Value::Null;
+        status["resultOmitted"] = json!("status exceeds 16 KiB retention budget");
+        status["originalBytes"] = json!(original_bytes);
+        // Formal snapshots contain only fixed fields besides result. Immediate results
+        // follow the same shape; this fallback also bounds future upstream additions.
+        if serde_json::to_vec(&status).map_or(true, |v| v.len() > MAX_STATUS_BYTES) {
+            return json!({"status": "unknown", "statusOmitted": "oversized status",
+                "originalBytes": original_bytes});
         }
     }
-    data.entry_bytes += entry.bytes;
+    status
+}
+
+fn utf8_floor(text: &str, offset: usize) -> usize {
+    let mut end = offset.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn value_size(value: &Value) -> usize {
+    let children = match value {
+        Value::String(text) => text.capacity(),
+        Value::Array(items) => items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(items.iter().map(value_size).sum::<usize>()),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| {
+                key.capacity()
+                    .saturating_add(64 + std::mem::size_of::<String>())
+                    .saturating_add(value_size(value))
+            })
+            .sum(),
+        _ => 0,
+    };
+    std::mem::size_of::<Value>().saturating_add(children)
+}
+
+fn entry_size(entry: &Entry) -> usize {
+    // No history/payload cloning or JSON encoding is needed for producer accounting.
+    std::mem::size_of::<Entry>()
+        .saturating_add(entry.id.capacity())
+        .saturating_add(entry.instance.capacity())
+        .saturating_add(value_size(&entry.task))
+        .saturating_add(value_size(&entry.status))
+        .saturating_add(
+            entry
+                .source
+                .as_ref()
+                .map_or(0, |source| value_size(&source.metadata)),
+        )
+        .saturating_add(
+            entry
+                .history
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Value>()),
+        )
+        .saturating_add(entry.history.iter().map(value_size).sum::<usize>())
+        .saturating_add(
+            entry
+                .redactions
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+        )
+        .saturating_add(entry.redactions.iter().map(String::capacity).sum::<usize>())
+}
+
+fn unfinished(entry: &Entry) -> bool {
+    entry.task_id.is_some()
+        && !matches!(
+            entry.status["status"].as_str(),
+            Some("completed" | "failed" | "cancelled" | "canceled" | "rejected")
+        )
+}
+
+fn loss_snapshot(data: &ObserverData) -> Value {
+    json!({"metadataEvicted": data.dropped_entries, "unfinishedMetadataEvicted": data.lost_unfinished,
+        "imageEvicted": data.dropped_images, "recent": data.losses,
+        "droppedFormalStatuses": data.dropped_formal_statuses,
+        "preReceiptStatusesOmitted": data.reconciliation_omitted,
+        "oversizedStatuses": data.entries.iter().filter(|e| e.status.get("resultOmitted").is_some() || e.status.get("statusOmitted").is_some()).count()})
+}
+
+fn trim_entries(data: &mut ObserverData) {
+    while data.entries.len() > MAX_ENTRIES || data.entry_bytes > MAX_ENTRY_BYTES {
+        let Some(old) = data.entries.pop_front() else {
+            break;
+        };
+        data.entry_bytes = data.entry_bytes.saturating_sub(old.bytes);
+        data.dropped_entries = data.dropped_entries.saturating_add(1);
+        let incomplete = unfinished(&old);
+        if incomplete {
+            data.lost_unfinished = data.lost_unfinished.saturating_add(1);
+        }
+        data.losses
+            .push_back(json!({"id": old.id, "taskId": old.task_id,
+            "unfinished": incomplete, "reason": "metadata_retention_evicted",
+            "status": old.status["status"], "revision": old.revision}));
+        while data.losses.len() > MAX_HISTORY {
+            data.losses.pop_front();
+        }
+        if let Some(index) = data.images.iter().position(|image| image.id == old.id) {
+            let image = data.images.remove(index).unwrap();
+            data.image_bytes = data.image_bytes.saturating_sub(image.source.bytes);
+            data.dropped_images = data.dropped_images.saturating_add(1);
+        }
+    }
+}
+
+fn refresh_entries(data: &mut ObserverData) {
+    data.entry_bytes = 0;
+    for entry in &mut data.entries {
+        entry.bytes = entry_size(entry);
+        data.entry_bytes = data.entry_bytes.saturating_add(entry.bytes);
+    }
+    trim_entries(data);
+    data.revision = data.revision.saturating_add(1);
+}
+
+fn insert_entry(data: &mut ObserverData, mut entry: Entry) {
+    entry.bytes = entry_size(&entry);
+    data.entry_bytes = data.entry_bytes.saturating_add(entry.bytes);
     data.entries.push_back(entry);
+    trim_entries(data);
+    data.revision = data.revision.saturating_add(1);
+}
+
+fn mark_image_evicted(data: &mut ObserverData, id: &str) {
+    if let Some(entry) = data.entries.iter_mut().find(|entry| entry.id == id) {
+        entry.image_retained = false;
+        entry.missing_reason = Some("source_frame_evicted");
+        entry.revision = entry.revision.saturating_add(1);
+    }
+}
+
+fn insert_image(data: &mut ObserverData, id: String, source: SourceFrame) {
+    if !data.entries.iter().any(|entry| entry.id == id) {
+        return;
+    }
+    while data.images.len() >= MAX_EVIDENCE_IMAGES
+        || data.image_bytes.saturating_add(source.bytes) > MAX_EVIDENCE_IMAGE_BYTES
+    {
+        let Some(old) = data.images.pop_front() else {
+            break;
+        };
+        data.image_bytes = data.image_bytes.saturating_sub(old.source.bytes);
+        data.dropped_images = data.dropped_images.saturating_add(1);
+        mark_image_evicted(data, &old.id);
+    }
+    data.image_bytes = data.image_bytes.saturating_add(source.bytes);
+    data.images.push_back(EvidenceImage { id, source });
+    refresh_entries(data);
 }
 
 /// The source is captured from the routed input, before conversion into another task.
@@ -924,6 +1329,8 @@ mod tests {
         TaskEngineProjection {
             generation,
             scheduler: engine.snapshot().unwrap(),
+            formal_statuses: engine.snapshot().unwrap().tasks().iter().cloned().collect(),
+            dropped_formal_statuses: 0,
             diagnostics: Arc::from([]),
         }
     }
@@ -952,6 +1359,8 @@ mod tests {
         let empty = TaskEngineProjection {
             generation: 1,
             scheduler: FormalSchedulerSnapshot::default(),
+            formal_statuses: Vec::new(),
+            dropped_formal_statuses: 0,
             diagnostics: Arc::from([]),
         };
         observer.record_status(&empty);
@@ -1224,6 +1633,86 @@ mod tests {
             late["source"]["frameId"],
             first.id(),
             "retained evidence keeps the exact old source after cache eviction"
+        );
+        let (png, image_metadata) = observer.read_image(&pushed_id).unwrap();
+        assert_eq!(image_metadata["instance"], observer.instance());
+        assert_eq!(
+            image_metadata["revision"],
+            observer.entry_metadata(&pushed_id).unwrap()["revision"]
+        );
+        assert_eq!(image_metadata["pixelSha256"], expected_hash);
+        assert_eq!(
+            image_metadata["fileSha256"],
+            format!("{:x}", Sha256::digest(&png))
+        );
+        assert_ne!(image_metadata["pixelSha256"], image_metadata["fileSha256"]);
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(image::load_from_memory(&png).unwrap().as_bytes())
+            ),
+            expected_hash
+        );
+        assert_eq!(image_metadata["frameId"], first.id());
+        assert!(
+            observer.entry_metadata(&pushed_id).unwrap()["source"]
+                .get("imagePngBase64")
+                .is_none()
+        );
+        assert!(
+            observer.entry_metadata(&pushed_id).unwrap()["source"]
+                .get("pixelSha256")
+                .is_none()
+        );
+        for task_id in 200..209 {
+            let source = capture();
+            observer.cache_frame(source.clone());
+            observer.record_trigger(
+                task_id,
+                json!({"kind": "imageRetentionFixture"}),
+                Some(source.captured_at()),
+            );
+        }
+        let image_lost = observer.entry_metadata(&pushed_id).unwrap();
+        assert_eq!(image_lost["imageRetained"], false);
+        assert_eq!(image_lost["sourceFrameId"], first.id());
+        assert_eq!(image_lost["missingReason"], "source_frame_evicted");
+        assert!(
+            observer
+                .read_image(&pushed_id)
+                .unwrap_err()
+                .contains("source_frame_evicted")
+        );
+        observer.record_formal_status(&FormalTaskSnapshot {
+            id: 1,
+            label: "fixture-only no game dispatch".into(),
+            status: "completed".into(),
+            queued_at_ms: 1,
+            started_at_ms: Some(2),
+            finished_at_ms: Some(3),
+            elapsed_ms: 0,
+            cancellation_requested: false,
+            result: Some("terminal after real image eviction".into()),
+        });
+        let terminal = observer.read_entry(&pushed_id).unwrap();
+        assert_eq!(terminal["status"]["status"], "completed");
+        assert_eq!(
+            terminal["status"]["result"],
+            "terminal after real image eviction"
+        );
+        assert!(terminal["source"].is_null());
+        assert_eq!(terminal["sourceFrameId"], first.id());
+        assert!(
+            observer.state_snapshot()["memory"]["evidenceImages"]
+                .as_u64()
+                .unwrap()
+                <= MAX_EVIDENCE_IMAGES as u64
+        );
+        assert!(
+            observer.state_snapshot()["memory"]["evidenceImageBytes"]
+                .as_u64()
+                .unwrap()
+                <= MAX_EVIDENCE_IMAGE_BYTES as u64
         );
         observer.set_enabled_state(false, ReadOnlyState::Push);
         assert_eq!(observer.state_snapshot()["memory"]["frames"], 0);

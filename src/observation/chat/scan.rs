@@ -306,6 +306,8 @@ fn find_chat_markers(
         templates.marker_threshold,
     )?;
     let mut markers = Vec::new();
+    // blue = 大厅成员消息；pink = 好友私聊；yellow = **仅用于 OCR 分块**的其它 marker，
+    // 不是大厅命令来源（金色/黄色标签不产生命令）。
     for (mut hits, marker_type) in groups.into_iter().zip(["blue", "yellow", "pink"]) {
         for hit in &mut hits {
             hit.kind = marker_type.to_string();

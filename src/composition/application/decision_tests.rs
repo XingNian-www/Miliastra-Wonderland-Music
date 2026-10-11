@@ -1,9 +1,9 @@
 use super::*;
-use crate::observation::chat::{ChatIdentity, SharedChatInput, SharedChatOcr};
+use crate::observation::chat::{ChatIdentity, ChatTimeline, RecognizedChatMessage};
 use crate::ui::geometry::Rect;
 
-fn message(text: &str, y: i32) -> SharedChatInput {
-    SharedChatInput {
+fn message(text: &str, y: i32) -> RecognizedChatMessage {
+    RecognizedChatMessage {
         message_type: "blue".to_string(),
         block: Rect::new(0, y, 100, 10),
         text: text.to_string(),
@@ -12,15 +12,15 @@ fn message(text: &str, y: i32) -> SharedChatInput {
     }
 }
 
-fn publish(shared: &SharedChatOcr, chat: ChatIdentity, messages: Vec<SharedChatInput>) {
+fn publish(shared: &ChatTimeline, chat: ChatIdentity, messages: Vec<RecognizedChatMessage>) {
     shared.publish(Instant::now(), chat, messages).unwrap();
 }
 
 fn shared_reader(
-    shared: &SharedChatOcr,
+    shared: &ChatTimeline,
     observations: &ChatObservationShared,
     chat: ChatIdentity,
-    baseline: Vec<SharedChatInput>,
+    baseline: Vec<RecognizedChatMessage>,
 ) -> ChatDecisionReader {
     let observation_session = observations.begin_exclusive().unwrap();
     let subscriber = shared.subscribe().unwrap();
@@ -61,7 +61,7 @@ fn shared_reader(
 #[test]
 fn shared_decision_subscribers_preserve_business_delivery_in_both_halls() {
     for chat in [ChatIdentity::PrimaryHall, ChatIdentity::SecondaryHall] {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let observations = ChatObservationShared::new();
         let business = shared.subscribe().unwrap();
         let mut reader = shared_reader(
@@ -97,7 +97,7 @@ fn shared_decision_subscribers_preserve_business_delivery_in_both_halls() {
 #[test]
 fn shared_reader_filters_baseline_revisions_and_accepts_new_duplicate_rows() {
     for chat in [ChatIdentity::PrimaryHall, ChatIdentity::SecondaryHall] {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let observations = ChatObservationShared::new();
         let mut reader = shared_reader(
             &shared,
@@ -130,7 +130,7 @@ fn shared_reader_filters_baseline_revisions_and_accepts_new_duplicate_rows() {
 fn shared_reader_receives_input_under_formal_ownership_without_scan_permit() {
     let coordinator = UiCoordinator::new();
     let _formal = coordinator.acquire_formal();
-    let shared = SharedChatOcr::new();
+    let shared = ChatTimeline::new();
     let observations = ChatObservationShared::new();
     let mut reader = shared_reader(
         &shared,
@@ -154,7 +154,7 @@ fn shared_reader_receives_input_under_formal_ownership_without_scan_permit() {
 
 #[test]
 fn shared_reader_ignores_long_foreign_state_but_reports_observation_failure() {
-    let shared = SharedChatOcr::new();
+    let shared = ChatTimeline::new();
     let observations = ChatObservationShared::new();
     let mut reader = shared_reader(
         &shared,
@@ -174,7 +174,7 @@ fn shared_reader_ignores_long_foreign_state_but_reports_observation_failure() {
     assert_eq!(reader.read_messages().unwrap()[0].text, "user: @confirm");
     drop(reader);
 
-    let failing = SharedChatOcr::new();
+    let failing = ChatTimeline::new();
     let failure_observations = ChatObservationShared::new();
     let mut failed_reader = shared_reader(
         &failing,
@@ -195,7 +195,7 @@ fn shared_reader_ignores_long_foreign_state_but_reports_observation_failure() {
 
 #[test]
 fn shared_reader_accepts_corrected_text_for_a_new_bubble() {
-    let shared = SharedChatOcr::new();
+    let shared = ChatTimeline::new();
     let observations = ChatObservationShared::new();
     let mut reader = shared_reader(
         &shared,
@@ -220,7 +220,7 @@ fn shared_reader_accepts_corrected_text_for_a_new_bubble() {
 
 #[test]
 fn shared_reader_does_not_replay_pending_messages_from_its_fresh_baseline() {
-    let shared = SharedChatOcr::new();
+    let shared = ChatTimeline::new();
     let observations = ChatObservationShared::new();
     publish(
         &shared,

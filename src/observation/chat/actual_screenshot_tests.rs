@@ -1,17 +1,30 @@
 //! Opt-in replay of exact, real screenshots. No game device, input, or business dispatch.
 use super::*;
+use crate::config::AppConfig;
 use crate::features::command::{CommandEnvelope, CommandObservation, CommandPrefix};
-use crate::interfaces::chat::{parse_command_envelope, parse_structured_song_envelope};
-use crate::runtime::ocr::{OcrDevice, OcrLine};
-use crate::runtime::ui::{CaptureFrame, UiDevice};
+use crate::interfaces::chat::{
+    ChatCommandRouter, parse_command_envelope, parse_structured_song_envelope,
+};
+use crate::runtime::ocr::{
+    OcrArgs, OcrDevice, OcrLine, OcrPriority, OcrRuntime, OcrRuntimeConfig, OcrRuntimeHandle,
+    ProductionOcrDevice,
+};
+use crate::runtime::ui::{CaptureFrame, UiDevice, UiRuntime, UiStateKind, UiStateObservation};
+use crate::ui::frame::{Canvas, Frame, from_captured_frame};
+use crate::ui::geometry::{Rect, crop_canvas};
 use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
-use anyhow::{Context, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
+use image::DynamicImage;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+// Test-only diagnostic title crop, same value that lived in shared_observer.
+const PASSIVE_SECONDARY_TITLE: Rect = Rect::new(600, 24, 480, 72);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -97,7 +110,7 @@ fn save_crop(image: &DynamicImage, rect: Rect, path: &Path) -> Result<Value> {
     )
 }
 
-fn observation(message: &SharedChatInput, frame: &Frame) -> CommandObservation {
+fn observation(message: &RecognizedChatMessage, frame: &Frame) -> CommandObservation {
     CommandObservation {
         captured_at: Some(frame.captured_at),
         message_text: Some(message.text.clone()),
@@ -106,7 +119,7 @@ fn observation(message: &SharedChatInput, frame: &Frame) -> CommandObservation {
     }
 }
 
-fn route_diagnostic(message: &SharedChatInput, frame: &Frame, primary: bool) -> Value {
+fn route_diagnostic(message: &RecognizedChatMessage, frame: &Frame, primary: bool) -> Value {
     let router = ChatCommandRouter::without_custom_workflow();
     let obs = observation(message, frame);
     let mut attempts = Vec::new();
@@ -346,7 +359,7 @@ fn replay_frame(
                         ),
                         None,
                     ));
-                    SharedChatInput {
+                    RecognizedChatMessage {
                         text: m.text,
                         sender: None,
                         raw_sender: None,

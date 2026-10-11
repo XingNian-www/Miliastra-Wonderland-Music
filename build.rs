@@ -7,6 +7,11 @@
 // OCR/播放器首次调用对应 API 时才解析；MNN.dll 的依赖（MSVCP140/VCRUNTIME140）、
 // avutil-60.dll 的依赖（libwinpthread-1.dll）以及后续依赖都能从 deps/dll/ 找到。
 fn main() {
+    // The delay-load directives below are MSVC/Windows-only. Skip them on other targets so the
+    // crate (and its test harness) can be built for Linux test runs; Windows output is unchanged.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
     println!("cargo:rustc-link-lib=delayimp");
     for library in [
         "MNN.dll",

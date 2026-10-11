@@ -354,7 +354,7 @@ impl ApplicationRuntime {
         command: &crate::features::playlist::PlaylistCommand,
     ) -> Result<()> {
         if !playlist_command_allows_friend(parsed.authority, parsed.role) {
-            return ApplicationRuntime::reply(self, "♫ 个人歌单功能仅对好友及以上开放");
+            return ApplicationRuntime::reply(self, "个人歌单功能仅对好友及以上开放.");
         }
         if matches!(command, crate::features::playlist::PlaylistCommand::Open) {
             return self.execute_playlist_window(parsed);

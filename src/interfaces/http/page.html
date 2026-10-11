@@ -45,6 +45,10 @@
   --fs-item:13px;--lh-item:19px;
   --fs-meta:12px;--lh-meta:17px;
   --fs-tiny:11px;--lh-tiny:16px;
+  --fs-caption:12px;
+  --bg-2:#262626;
+  --border:rgba(255,255,255,.1);
+  --radius:10px;
   /* 间距 (4px 基准) */
   --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;
   /* 圆角 */
@@ -91,6 +95,10 @@ html[data-theme=light]{
   --fs-item:13px;--lh-item:19px;
   --fs-meta:12px;--lh-meta:17px;
   --fs-tiny:11px;--lh-tiny:16px;
+  --fs-caption:12px;
+  --bg-2:#eeeeea;
+  --border:rgba(0,0,0,.1);
+  --radius:10px;
   /* 间距 (4px 基准) */
   --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;
   /* 圆角 */
@@ -102,19 +110,26 @@ html[data-theme=light]{
 
 /* ===== 基础 ===== */
 body{margin:0;background:var(--bg-ground);color:var(--text-1);font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body)}
+/* 细滚动条：暗/亮主题自适应 */
+*{scrollbar-width:thin;scrollbar-color:var(--fill-2) transparent}
+*::-webkit-scrollbar{width:8px;height:8px}
+*::-webkit-scrollbar-thumb{background:var(--fill-2);border-radius:4px}
+*::-webkit-scrollbar-thumb:hover{background:var(--text-3)}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-corner{background:transparent}
 button,input,select,textarea{font:inherit}
-.shell{max-width:1320px;margin:0 auto;padding:0 var(--sp-5) var(--sp-5)}
+.shell{max-width:1320px;margin:0 auto;padding:0 var(--sp-5) calc(var(--sp-5) + 90px)}
 .topbar{display:grid;grid-template-columns:minmax(180px,220px) minmax(0,1fr) auto;align-items:stretch;position:sticky;top:0;z-index:5;background:var(--bg-ground);border-bottom:1px solid var(--sep-2);padding:var(--sp-3) 0 var(--sp-4);margin:0 0 var(--sp-5)}
 .brand{display:flex;align-items:center;padding:0 var(--sp-4);min-width:0}
 .brand h1{font-size:var(--fs-title);line-height:1;margin:0;font-weight:700;letter-spacing:.2px}
 .brand h1 span{font-weight:500;color:var(--text-2)}
 .status-chips{display:flex;flex-wrap:nowrap;align-items:center;gap:var(--sp-3);padding:0 var(--sp-4);border-left:1px solid var(--sep-2);min-width:0;overflow:hidden}
-.chip{display:inline-flex;align-items:center;gap:var(--sp-1);font-size:var(--fs-body);line-height:1;color:var(--text-2);white-space:nowrap;min-width:0;flex:0 1 auto}
-.chip .dot{width:6px;height:6px;border-radius:50%;background:var(--text-3);flex:none}
+.chip{display:inline-flex;align-items:center;gap:var(--sp-2);font-size:var(--fs-meta);line-height:1;color:var(--text-2);white-space:nowrap;min-width:0;flex:0 1 auto;background:var(--fill-1);border:1px solid var(--sep-2);border-radius:999px;padding:6px var(--sp-3)}
+.chip .dot{width:7px;height:7px;border-radius:50%;background:var(--text-3);flex:none}
 .chip[data-state=ok] .dot{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
 .chip[data-state=warn] .dot{background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
 .chip[data-state=err] .dot{background:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
-.chip em{font-style:normal;font-weight:600;color:var(--text-1);overflow:hidden;text-overflow:ellipsis;max-width:120px;font-variant-numeric:tabular-nums}
+.chip em{font-style:normal;font-weight:600;color:var(--text-1);overflow:hidden;text-overflow:ellipsis;max-width:140px;font-variant-numeric:tabular-nums}
 /* 界面状态可能较长（如 secondary:chat），完整展示不截断 */
 .chip em#uiState{max-width:none;white-space:normal;word-break:break-all;text-overflow:clip;overflow:visible;line-height:1.3}
 .chip[data-state=warn] em{color:var(--warn)}
@@ -140,19 +155,24 @@ button,input,select,textarea{font:inherit}
 .monitor>.panel:nth-child(1){order:3}
 .monitor>.panel:nth-child(4){order:4}
 .monitor>.panel:nth-child(5){order:5}
-.panel{min-width:0;order:0}
+.panel{min-width:0;order:0;background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-l);padding:0 var(--sp-3) var(--sp-3);box-shadow:var(--shadow);transition:border-color .2s ease}
+.panel:hover{border-color:var(--sep-1)}
 .panel.wide{grid-column:1/-1}
-.panel-head{position:relative;height:40px;display:flex;align-items:center;justify-content:space-between;padding:0 var(--sp-1);gap:var(--sp-2)}
+.panel-head{position:relative;height:44px;display:flex;align-items:center;justify-content:space-between;padding:0 var(--sp-1);gap:var(--sp-2)}
 .panel-head::after{content:"";position:absolute;left:0;right:0;bottom:0;height:1px;background:var(--sep-2)}
-.panel h2{font-size:var(--fs-title);line-height:var(--lh-title);font-weight:600;margin:0;color:var(--text-1)}
+.panel h2{font-size:var(--fs-title);line-height:var(--lh-title);font-weight:600;margin:0;color:var(--text-1);display:flex;align-items:center;gap:var(--sp-2)}
+.panel h2::before{content:"";width:3px;height:14px;border-radius:2px;background:var(--accent);flex:none}
 .panel small{color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
-.panel-body{padding:var(--sp-4) var(--sp-1) 0;min-width:0}
+.panel-body{padding:var(--sp-3) var(--sp-1) 0;min-width:0}
 .panel-body>*+*{margin-top:var(--sp-3)}
 .scroll{font-family:var(--font-mono);font-size:var(--fs-meta);line-height:1.5;white-space:pre-wrap;word-break:break-word;overflow:auto;min-height:92px;max-height:260px;color:var(--text-1);background:var(--bg-input);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-2) var(--sp-3)}
 #monitorOcr{min-height:108px;max-height:172px}
+.ocr-meta-wrap{display:inline-flex;align-items:center;gap:var(--sp-2);min-width:0}
+.sparkline{flex:none;background:var(--fill-1);border-radius:var(--radius-s)}
 #monitorLogs{min-height:240px;max-height:420px}
 #monitorCommands{max-height:150px}
 .queue-list{display:flex;flex-direction:column;gap:var(--sp-1);min-height:94px;max-height:180px;overflow:auto}
+.empty-hint{color:var(--text-3);font-size:var(--fs-meta);text-align:center;padding:var(--sp-4) var(--sp-2)}
 .queue-item,.pending-item,.task-item,.candidate-item,.undercover-player{background:var(--bg-input);border:1px solid var(--sep-2);border-radius:var(--radius-s);transition:background-color .2s ease}
 .queue-item:hover,.pending-item:hover,.task-item:hover,.candidate-item:hover,.undercover-player:hover{background:var(--bg-raised)}
 .queue-item{display:grid;grid-template-columns:24px minmax(0,1fr) auto;gap:var(--sp-2);align-items:center;padding:var(--sp-1) var(--sp-2)}
@@ -161,6 +181,7 @@ button,input,select,textarea{font:inherit}
 .queue-meta{color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pending-item{display:grid;grid-template-columns:24px minmax(0,1fr);gap:var(--sp-2);align-items:center;padding:var(--sp-1) var(--sp-2)}
 .task-item{display:grid;grid-template-columns:52px minmax(0,1fr) auto;gap:var(--sp-2);align-items:center;padding:var(--sp-1) var(--sp-2);cursor:pointer}
+.task-item:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .task-status{font-size:var(--fs-tiny);line-height:var(--lh-tiny);color:var(--text-2)}
 .task-status.running{color:var(--info)}
 .task-status.completed{color:var(--ok)}
@@ -180,7 +201,9 @@ button,input,select,textarea{font:inherit}
   .queue-item .btn,.candidate-item .btn{opacity:0;pointer-events:none;transition:opacity .2s ease}
   .queue-item:hover .btn,.queue-item:focus-within .btn,.candidate-item:hover .btn,.candidate-item:focus-within .btn{opacity:1;pointer-events:auto}
 }
-.turtle-toolbar{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:var(--sp-2)}
+.turtle-toolbar{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto auto;gap:var(--sp-2)}
+.turtle-submit{display:flex;flex-direction:column;gap:var(--sp-2);margin-top:var(--sp-2);padding:var(--sp-3);background:var(--bg-input);border:1px solid var(--sep-2);border-radius:var(--radius-m)}
+.turtle-submit textarea{min-height:60px}
 .turtle-stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:var(--sp-2);margin-top:var(--sp-2)}
 .turtle-stat{border-top:1px solid var(--sep-2);padding-top:var(--sp-1);min-width:0}
 .turtle-stat span{display:block;color:var(--text-3);font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
@@ -295,6 +318,11 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .modal-head{display:flex;justify-content:space-between;align-items:center;color:var(--text-1)}
 .modal-body{overflow:auto;text-align:center}
 .modal-body img{max-width:none;height:auto;background:#000;border:1px solid var(--sep-1)}
+.confirm-modal{display:grid;place-items:center;padding:var(--sp-4)}
+.confirm-card{width:min(420px,100%);background:var(--bg-card);border:1px solid var(--sep-1);border-radius:var(--radius-l);padding:var(--sp-4);box-shadow:0 12px 40px rgba(0,0,0,.4)}
+.confirm-card strong{display:block;font-size:var(--fs-title);line-height:var(--lh-title)}
+.confirm-card p{margin:var(--sp-3) 0;color:var(--text-2);font-size:var(--fs-item);line-height:var(--lh-item);white-space:pre-wrap;word-break:break-word}
+.confirm-actions{display:flex;justify-content:flex-end;gap:var(--sp-2)}
 .hidden{display:none!important}
 
 /* ===== 多页面导航 ===== */
@@ -303,15 +331,24 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .nav-brand span{display:block;margin-top:2px;color:var(--text-2);font-size:var(--fs-meta);font-weight:500}
 .nav-links{display:flex;flex-direction:column;gap:var(--sp-1);min-width:0}
 .btn:focus-visible,.nav-link:focus-visible,.tab:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.nav-link{width:100%;height:36px;padding:0 var(--sp-3);border:0;border-radius:var(--radius-s);background:transparent;color:var(--text-2);text-align:left;cursor:pointer}
+.nav-link{position:relative;width:100%;height:38px;padding:0 var(--sp-3);border:0;border-radius:var(--radius-s);background:transparent;color:var(--text-2);text-align:left;cursor:pointer;display:flex;align-items:center;gap:var(--sp-2);font-size:var(--fs-item);transition:background-color .15s ease,color .15s ease}
+.nav-link svg{width:var(--ic);height:var(--ic);flex:none}
 .nav-link:hover{background:var(--fill-1);color:var(--text-1)}
 .nav-link.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.nav-link.active::before{content:"";position:absolute;left:-12px;top:8px;bottom:8px;width:3px;border-radius:2px;background:var(--accent)}
 .nav-tools{margin-top:auto}
 .shell{margin-left:220px;max-width:none}
 .page-section{display:none;max-width:1120px;margin:0 auto}
 .page-section.active{display:block}
-.page-title{margin:0 0 var(--sp-4);font-size:22px;line-height:30px}
+.page-title{margin:0;font-size:22px;line-height:30px}
+.page-subtitle{margin:var(--sp-1) 0 var(--sp-4);color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta)}
 .page-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-5) var(--sp-4);align-items:start}
+.overview-layout{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr)}
+.now-playing-title{font-size:16px;line-height:23px;font-weight:600;color:var(--text-1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.now-playing-sub{margin-top:2px;font-size:var(--fs-meta);line-height:var(--lh-meta);color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.overview-quick-controls{display:flex;align-items:center;gap:var(--sp-2);margin-top:var(--sp-3);flex-wrap:wrap}
+.overview-quick-controls .btn svg{width:var(--ic-sm);height:var(--ic-sm)}
+.overview-now-playing .playback-progress{margin-top:var(--sp-3)}
 .page-grid>.wide{grid-column:1/-1}
 .playback-layout{grid-template-columns:repeat(12,minmax(0,1fr));gap:var(--sp-4)}
 .playback-layout>.playback-player-panel{grid-column:span 7}
@@ -356,9 +393,13 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .login-qr strong,.login-qr small{display:block}
 .login-qr small{margin-top:var(--sp-1);color:var(--text-3);line-height:1.5}
 .global-result{position:fixed;right:var(--sp-4);bottom:var(--sp-4);z-index:9;width:min(420px,calc(100vw - 32px));padding:var(--sp-3);border:1px solid var(--sep-1);border-radius:var(--radius-l);background:var(--bg-card);box-shadow:0 12px 40px rgba(0,0,0,.3)}
+.token-banner{display:flex;align-items:center;gap:var(--sp-2);margin:0 0 var(--sp-4);padding:var(--sp-2) var(--sp-3);border:1px solid var(--danger-soft);border-radius:var(--radius-m);background:var(--danger-soft);color:var(--danger);font-size:var(--fs-item);line-height:var(--lh-item)}
+.token-banner .btn{flex:none}
 .global-result .panel-head{height:28px}
 .global-result .panel-body{padding-top:var(--sp-2)}
 .global-result .result{min-height:0;max-height:100px}
+.global-result.result-ok{border-left:3px solid var(--ok)}
+.global-result.result-err{border-left:3px solid var(--danger)}
 
 /* ===== 高级控制 ===== */
 .tools-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-5)}
@@ -427,7 +468,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 /* ===== 响应式 ===== */
  @media(max-width:1200px){.status-chips{gap:var(--sp-2)}.chip{font-size:var(--fs-meta)}.chip em{max-width:96px}}
  @media(max-width:1050px){.playback-layout{grid-template-columns:1fr}.playback-layout>.panel{grid-column:auto}.playback-queue-panel .queue-list{grid-template-columns:1fr}
- .topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}.config-layout{grid-template-columns:1fr}.config-sidebar{position:static;max-height:none}.config-num-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
+ .topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.overview-layout{grid-template-columns:1fr}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}.config-layout{grid-template-columns:1fr}.config-sidebar{position:static;max-height:none}.config-num-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
  @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts,.login-qr{grid-template-columns:1fr}.login-row .controls{min-width:0}.login-qr img{width:min(180px,100%);justify-self:center}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}.tools-grid{gap:var(--sp-4)}.playback-player-panel,.playback-request-panel{padding-left:var(--sp-2);padding-right:var(--sp-2)}.playback-player-panel .controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls .btn.primary{grid-column:auto}.candidate-item{grid-template-columns:1fr}.candidate-actions{justify-content:flex-start}}
 .identity-table-wrap{overflow-x:auto;border:1px solid var(--sep-2);border-radius:var(--radius-s)}
 .identity-table{width:100%;border-collapse:collapse;font-size:var(--fs-item);min-width:620px}
@@ -442,6 +483,9 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 .identity-add-row input{min-width:160px;flex:1}
 .identity-add-row select{min-width:100px}
 @media(max-width:900px){.identity-add-row{align-items:stretch}.identity-add-row>*{min-width:160px;flex:1}.identity-add-row .btn{flex:0 0 auto}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important;scroll-behavior:auto!important}}
+@media(pointer:coarse){:root{--btn-h:38px;--btn-h-sm:32px;--ctl-h:34px}}
+html.theme-transition body,html.theme-transition .panel,html.theme-transition .app-nav,html.theme-transition .topbar,html.theme-transition input,html.theme-transition select,html.theme-transition textarea,html.theme-transition .scroll,html.theme-transition .result{transition:background-color .3s ease,border-color .3s ease,color .3s ease}
 @media(max-width:720px){
   html,body{overflow-x:hidden}
   .nav-links{scrollbar-width:none}
@@ -456,15 +500,15 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 <nav class="app-nav" aria-label="功能导航">
   <div class="nav-brand">Miliastra<span>远程监控</span></div>
   <div class="nav-links">
-    <button class="nav-link" data-route="overview" onclick="navigateTo('overview')">总览</button>
-    <button class="nav-link" data-route="playback" onclick="navigateTo('playback')">播放与点歌</button>
-    <button class="nav-link" data-route="login" onclick="navigateTo('login')">账号登录</button>
-    <button class="nav-link" data-route="game" onclick="navigateTo('game')">游戏与聊天</button>
-    <button class="nav-link" data-route="entertainment" onclick="navigateTo('entertainment')">娱乐玩法</button>
-    <button class="nav-link" data-route="tasks" onclick="navigateTo('tasks')">任务与日志</button>
-    <button class="nav-link" data-route="tools" onclick="navigateTo('tools')">高级控制</button>
-    <button class="nav-link" data-route="config" onclick="navigateTo('config')">配置中心</button>
-    <button class="nav-link" data-route="settings" onclick="navigateTo('settings')">设置</button>
+    <button class="nav-link" data-route="overview" onclick="navigateTo('overview')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>总览</button>
+    <button class="nav-link" data-route="playback" onclick="navigateTo('playback')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>播放与点歌</button>
+    <button class="nav-link" data-route="login" onclick="navigateTo('login')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/></svg>账号登录</button>
+    <button class="nav-link" data-route="game" onclick="navigateTo('game')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>游戏与聊天</button>
+    <button class="nav-link" data-route="entertainment" onclick="navigateTo('entertainment')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>娱乐玩法</button>
+    <button class="nav-link" data-route="tasks" onclick="navigateTo('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15l2 2 4-4"/></svg>任务与日志</button>
+    <button class="nav-link" data-route="tools" onclick="navigateTo('tools')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>高级控制</button>
+    <button class="nav-link" data-route="config" onclick="navigateTo('config')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/></svg>配置中心</button>
+    <button class="nav-link" data-route="settings" onclick="navigateTo('settings')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>设置</button>
   </div>
 </nav>
 <div class="shell">
@@ -473,36 +517,62 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       <h1>Miliastra <span>远程监控</span></h1>
     </div>
     <div class="status-chips">
-      <span class="chip"><i class="dot"></i><span>服务</span><em id="serviceState" aria-live="polite">未知</em></span>
-      <span class="chip"><i class="dot"></i><span>播放</span><em id="playerState" aria-live="polite">未知</em></span>
-      <span class="chip"><i class="dot"></i><span>队列</span><em id="queueState" aria-live="polite">0 / 0</em></span>
-      <span class="chip"><i class="dot"></i><span>监听</span><em id="listenerState" aria-live="polite">一级监听</em></span>
-      <span class="chip"><i class="dot"></i><span>界面</span><em id="uiState" aria-live="polite">未知</em></span>
+      <span class="chip"><i class="dot"></i><span>服务</span><em id="serviceState">未知</em></span>
+      <span class="chip"><i class="dot"></i><span>播放</span><em id="playerState">未知</em></span>
+      <span class="chip"><i class="dot"></i><span>队列</span><em id="queueState">0 / 0</em></span>
+      <span class="chip"><i class="dot"></i><span>监听</span><em id="listenerState">一级监听</em></span>
+      <span class="chip"><i class="dot"></i><span>界面</span><em id="uiState">未知</em></span>
     </div>
     <div class="top-actions">
       <span class="last-refresh" id="lastRefresh">等待刷新</span>
       <span class="sep"></span>
-      <button class="btn theme-toggle" onclick="toggleTheme()" title="切换日间 / 夜间模式">
-        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <button class="btn theme-toggle" onclick="toggleTheme()" title="切换日间 / 夜间模式" aria-label="切换日间 / 夜间模式">
+        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
       </button>
       <button class="btn" id="refreshToggle" onclick="toggleRefresh()">暂停刷新</button>
     </div>
   </header>
 
+  <div class="token-banner hidden" id="tokenBanner" role="alert">
+    <span>访问令牌无效或已过期，自动刷新已暂停。</span>
+    <button class="btn small" onclick="navigateTo('settings')">前往设置页填入令牌</button>
+    <button class="btn small ghost" onclick="retryAfterToken()">已更新，重试</button>
+  </div>
+
   <main id="pageHost">
-    <section class="page-section" id="page-overview" data-page="overview"><h1 class="page-title">总览</h1><div class="page-grid" id="overviewGrid"><div class="panel wide"><div class="panel-head"><h2>关键摘要</h2><small>实时</small></div><div class="panel-body"><div class="login-facts"><div class="login-fact"><span>待播队列</span><strong id="overviewQueueSummary">0 首</strong></div><div class="login-fact"><span>活动任务</span><strong id="overviewTaskSummary">0 个</strong></div><div class="login-fact"><span>播放器</span><strong id="overviewPlayerSummary">未知</strong></div><div class="login-fact"><span>OCR</span><strong id="overviewOcrSummary">暂无采样</strong></div></div></div></div></div></section>
-    <section class="page-section" id="page-playback" data-page="playback"><h1 class="page-title">播放与点歌</h1><div class="page-grid playback-layout" id="playbackGrid"></div></section>
-    <section class="page-section" id="page-login" data-page="login"><h1 class="page-title">账号登录</h1><div class="page-grid" id="loginGrid"></div></section>
-    <section class="page-section" id="page-game" data-page="game"><h1 class="page-title">游戏与聊天</h1><div class="page-grid" id="gameGrid"></div></section>
-    <section class="page-section" id="page-entertainment" data-page="entertainment"><h1 class="page-title">娱乐玩法</h1><div class="page-grid" id="entertainmentGrid"></div></section>
-    <section class="page-section" id="page-tasks" data-page="tasks"><h1 class="page-title">任务与日志</h1><div class="page-grid" id="tasksGrid"></div></section>
-    <section class="page-section" id="page-tools" data-page="tools"><h1 class="page-title">高级控制</h1><div class="tools-grid">
+    <section class="page-section" id="page-overview" data-page="overview"><h1 class="page-title">总览</h1><p class="page-subtitle">实时聊天、正在播放与关键状态一览</p><div class="page-grid overview-layout" id="overviewGrid">
+      <div class="panel overview-now-playing" id="overviewNowPlayingPanel">
+        <div class="panel-head"><h2>正在播放</h2><small id="overviewPlayingMeta">实时</small></div>
+        <div class="panel-body">
+          <div class="now-playing-title" id="overviewSongTitle">无歌曲</div>
+          <div class="now-playing-sub" id="overviewSongSub">-</div>
+          <div class="playback-progress" id="overviewProgress" hidden>
+            <div class="progress-track"><i id="overviewProgressFill"></i></div>
+            <div class="progress-row"><span id="overviewProgressTime">0:00 / 0:00</span><span id="overviewLyric"></span></div>
+          </div>
+          <div class="overview-quick-controls">
+            <button class="btn small good" onclick="call('/play','POST')" aria-label="继续播放"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15l12-7.5-12-7.5z"/></svg></button>
+            <button class="btn small" onclick="call('/pause','POST')" aria-label="暂停"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6.5 4.5h3.5v15H6.5zM14 4.5h3.5v15H14z"/></svg></button>
+            <button class="btn small" onclick="call('/skip-prev','POST')" aria-label="上一首"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4.5h2.2v15H6zM19.5 4.5 9.8 12l9.7 7.5v-15z"/></svg></button>
+            <button class="btn small" onclick="call('/skip-next','POST')" aria-label="下一首"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M15.8 4.5H18v15h-2.2zM4.5 4.5v15l9.7-7.5-9.7-7.5z"/></svg></button>
+            <button class="btn small ghost" onclick="navigateTo('playback')" style="margin-left:auto">打开播放页 →</button>
+          </div>
+        </div>
+      </div>
+      <div class="panel"><div class="panel-head"><h2>关键摘要</h2><small>实时</small></div><div class="panel-body"><div class="login-facts"><div class="login-fact"><span>待播队列</span><strong id="overviewQueueSummary">0 首</strong></div><div class="login-fact"><span>活动任务</span><strong id="overviewTaskSummary">0 个</strong></div><div class="login-fact"><span>播放器</span><strong id="overviewPlayerSummary">未知</strong></div><div class="login-fact"><span>OCR</span><strong id="overviewOcrSummary">暂无采样</strong></div></div></div></div>
+    </div></section>
+    <section class="page-section" id="page-playback" data-page="playback"><h1 class="page-title">播放与点歌</h1><p class="page-subtitle">播放控制、点歌搜索、队列与缓存管理</p><div class="page-grid playback-layout" id="playbackGrid"></div></section>
+    <section class="page-section" id="page-login" data-page="login"><h1 class="page-title">账号登录</h1><p class="page-subtitle">音乐平台账号登录与凭据状态</p><div class="page-grid" id="loginGrid"></div></section>
+    <section class="page-section" id="page-game" data-page="game"><h1 class="page-title">游戏与聊天</h1><p class="page-subtitle">聊天监听、游戏流程与机器人操作</p><div class="page-grid" id="gameGrid"></div></section>
+    <section class="page-section" id="page-entertainment" data-page="entertainment"><h1 class="page-title">娱乐玩法</h1><p class="page-subtitle">海龟汤与谁是卧底对局管理</p><div class="page-grid" id="entertainmentGrid"></div></section>
+    <section class="page-section" id="page-tasks" data-page="tasks"><h1 class="page-title">任务与日志</h1><p class="page-subtitle">任务队列、事件日志与接口调用记录</p><div class="page-grid" id="tasksGrid"></div></section>
+    <section class="page-section" id="page-tools" data-page="tools"><h1 class="page-title">高级控制</h1><p class="page-subtitle">OCR、模板匹配与手动输入诊断工具</p><div class="tools-grid">
       <div class="panel">
         <div class="panel-head"><h2>画面与识别</h2></div>
         <div class="panel-body">
           <div class="two"><button class="btn primary" onclick="runTool('/tools/ocr')">全屏 OCR</button><button class="btn" onclick="runTool('/tools/scan-chat')">扫描聊天</button></div>
-          <div class="row"><input id="ocrRect" placeholder="OCR 区域 x,y,width,height"><button class="btn" onclick="runTool('/tools/ocr',{rect:val('ocrRect')})">区域 OCR</button></div>
+          <div class="row"><input id="ocrRect" placeholder="OCR 区域 x,y,width,height" aria-label="OCR 区域 x,y,width,height"><button class="btn" onclick="runTool('/tools/ocr',{rect:val('ocrRect')})">区域 OCR</button></div>
           <div class="two"><button class="btn" onclick="runTool('/tools/ui-state')">检测 UI</button><button class="btn" onclick="runTool('/tools/hall-name')">大厅名称</button></div>
           <div class="row"><button class="btn tools-stretch" onclick="loadScreenshot()">获取截图</button></div>
         </div>
@@ -510,26 +580,26 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       <div class="panel">
         <div class="panel-head"><h2>模板</h2></div>
         <div class="panel-body">
-          <div class="row"><select id="template"></select></div>
-          <div class="row"><input id="templateRect" placeholder="匹配区域 x,y,width,height，留空全屏"><button class="btn" onclick="useConfiguredTemplateRegion()">读取配置区域</button></div>
-          <div class="row"><input id="threshold" placeholder="阈值，留空使用配置" inputmode="decimal"></div>
+          <div class="row"><select id="template" aria-label="模板选择"></select></div>
+          <div class="row"><input id="templateRect" placeholder="匹配区域 x,y,width,height，留空全屏" aria-label="匹配区域 x,y,width,height，留空全屏"><button class="btn" onclick="useConfiguredTemplateRegion()">读取配置区域</button></div>
+          <div class="row"><input id="threshold" placeholder="阈值，留空使用配置" inputmode="decimal" aria-label="模板匹配阈值"></div>
           <div class="two"><button class="btn" onclick="matchTemplate(false)">匹配</button><button class="btn warn" onclick="matchTemplate(true)">匹配并点击</button></div>
         </div>
       </div>
       <div class="panel">
         <div class="panel-head"><h2>手动输入</h2></div>
         <div class="panel-body">
-          <div class="row"><input id="x" placeholder="x" inputmode="numeric"><input id="y" placeholder="y" inputmode="numeric"><button class="btn warn" onclick="clickPoint()">点击</button></div>
-          <div class="row"><input id="key" placeholder="按键，如 Escape / Return / F2"><button class="btn warn" onclick="sendKey()">发送</button></div>
+          <div class="row"><input id="x" placeholder="x" inputmode="numeric" aria-label="点击坐标 x"><input id="y" placeholder="y" inputmode="numeric" aria-label="点击坐标 y"><button class="btn warn" onclick="clickPoint()">点击</button></div>
+          <div class="row"><input id="key" placeholder="按键，如 Escape / Return / F2" aria-label="按键名称"><button class="btn warn" onclick="sendKey()">发送</button></div>
         </div>
       </div>
       <div class="panel">
         <div class="panel-head"><h2>诊断</h2></div>
         <div class="panel-body">
           <button class="btn tools-stretch" onclick="runTool('/tools/ocr-backends')">OCR 后端探测</button>
-          <div class="row"><input id="changeSamples" value="10" inputmode="numeric" placeholder="变化采样次数"><button class="btn" onclick="sampleChatChanges()">聊天变化</button></div>
-          <div class="row"><input id="benchmarkRounds" value="3" inputmode="numeric" placeholder="面板基准轮数"><button class="btn warn" onclick="panelBenchmark()">面板基准</button></div>
-          <div class="row"><input id="aiKeyword" placeholder="AI 候选诊断关键词"><button class="btn" onclick="aiPreview()">诊断</button></div>
+          <div class="row"><input id="changeSamples" value="10" inputmode="numeric" placeholder="变化采样次数" aria-label="变化采样次数"><button class="btn" onclick="sampleChatChanges()">聊天变化</button></div>
+          <div class="row"><input id="benchmarkRounds" value="3" inputmode="numeric" placeholder="面板基准轮数" aria-label="面板基准轮数"><button class="btn warn" onclick="panelBenchmark()">面板基准</button></div>
+          <div class="row"><input id="aiKeyword" placeholder="AI 候选诊断关键词" aria-label="AI 候选诊断关键词"><button class="btn" onclick="aiPreview()">诊断</button></div>
           <label class="tools-checkbox"><input id="aiAccompaniment" type="checkbox">优先伴奏</label>
         </div>
       </div>
@@ -543,7 +613,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       </div>
     </div></section>
     <section class="page-section" id="page-config" data-page="config">
-      <h1 class="page-title">配置中心</h1>
+      <h1 class="page-title">配置中心</h1><p class="page-subtitle">全部运行参数；保存后按标注生效</p>
       <div class="config-status" id="configStatusBar">
         <span class="chip"><i class="dot"></i><span>当前版本</span><em id="configRevision">-</em></span>
         <span id="configSavedAt">尚未保存</span>
@@ -553,7 +623,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
         <div class="config-sidebar" id="configSectionList"></div>
         <div class="config-main">
           <div class="config-toolbar">
-            <input id="configSearch" type="text" placeholder="搜索字段（名称 / 路径 / 说明）">
+            <input id="configSearch" type="text" placeholder="搜索字段（名称 / 路径 / 说明）" aria-label="搜索配置字段">
             <button class="btn" onclick="restoreDefaults()">恢复默认</button>
             <button class="btn" onclick="toggleConfigRevisions()">历史版本</button>
             <button class="btn primary" id="configSaveBtn" onclick="saveConfig()">保存全部</button>
@@ -567,21 +637,32 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
         </div>
       </div>
     </section>
-    <section class="page-section" id="page-settings" data-page="settings"><h1 class="page-title">设置</h1><div class="page-grid" id="settingsGrid"></div></section>
+    <section class="page-section" id="page-settings" data-page="settings"><h1 class="page-title">设置</h1><p class="page-subtitle">访问令牌与页面偏好</p><div class="page-grid" id="settingsGrid">
+      <div class="panel">
+        <div class="panel-head"><h2>事件提醒</h2><small>本地偏好</small></div>
+        <div class="panel-body">
+          <div style="display:flex;flex-direction:column;gap:var(--sp-2)">
+            <label class="switch-line"><input type="checkbox" id="notifySound" onchange="notifyPrefs.sound=this.checked;saveNotifyPrefs();if(this.checked)beep('ok')">声音提醒（任务完成/失败、开播）</label>
+            <label class="switch-line"><input type="checkbox" id="notifyDesktop" onchange="toggleDesktopNotify(this)">桌面通知（需浏览器授权）</label>
+          </div>
+          <div class="config-field-hint">设置保存在本浏览器；声音提醒需要至少一次页面交互后才会生效（浏览器自动播放限制）。</div>
+        </div>
+      </div>
+    </div></section>
   </main>
 
   <main class="layout legacy-content" id="legacyContent" aria-hidden="true">
     <section class="monitor">
    <div class="panel wide">
-        <div class="panel-head"><h2>OCR 聊天</h2><small id="ocrMeta">暂无采样</small></div>
+        <div class="panel-head"><h2>OCR 聊天</h2><span class="ocr-meta-wrap"><svg class="sparkline" id="ocrSparkline" width="120" height="24" viewBox="0 0 120 24" preserveAspectRatio="none" aria-hidden="true"><polyline fill="none" stroke="var(--accent)" stroke-width="1.5" points=""/></svg><small id="ocrMeta">暂无采样</small></span></div>
         <div class="panel-body">
           <pre class="scroll" id="monitorOcr">暂无 OCR 内容</pre>
           <div class="ocr-options">
             <label class="switch-line"><input id="consoleChatUsePrefix" type="checkbox" checked>前缀</label>
-            <input id="consoleChatPrefix" value="[控制台]: " placeholder="发言前缀">
+            <input id="consoleChatPrefix" value="[控制台]: " placeholder="发言前缀" aria-label="发言前缀">
           </div>
           <div class="ocr-send">
-            <input id="consoleChatText" placeholder="发送到游戏聊天">
+            <input id="consoleChatText" placeholder="发送到游戏聊天" aria-label="发送到游戏聊天">
             <button class="btn primary" onclick="sendConsoleChat()">发送</button>
           </div>
         </div>
@@ -607,10 +688,17 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
         <div class="panel-body">
           <div class="tab-body" id="turtlePanel" role="tabpanel" aria-labelledby="turtleTab">
             <div class="turtle-toolbar">
-              <input id="turtlePuzzleId" placeholder="未使用题目 ID，可留空随机">
+              <input id="turtlePuzzleId" placeholder="未使用题目 ID，可留空随机" aria-label="海龟汤题目 ID">
               <button class="btn primary" id="turtleRandomStart" onclick="startTurtleSoup(false)" disabled>随机开局</button>
               <button class="btn" id="turtleIdStart" onclick="startTurtleSoup(true)" disabled>按 ID 开局</button>
               <button class="btn warn" id="turtleEnd" onclick="endTurtleSoup()" disabled>结束</button>
+              <button class="btn ghost" onclick="toggleTurtleSubmit()" aria-expanded="false" id="turtleSubmitToggle">投稿新题 ▾</button>
+            </div>
+            <div class="turtle-submit hidden" id="turtleSubmitForm">
+              <input id="turtleNewTitle" placeholder="题目标题" aria-label="新题标题">
+              <textarea id="turtleNewSurface" placeholder="汤面（公布给玩家的谜面）" aria-label="新题汤面" rows="3"></textarea>
+              <textarea id="turtleNewBottom" placeholder="汤底（真相，结算时公布）" aria-label="新题汤底" rows="3"></textarea>
+              <div class="row"><button class="btn primary" onclick="submitTurtleQuestion()">提交题目</button><span class="config-field-hint">提交后进入题库，可按 ID 或随机抽取</span></div>
             </div>
             <div class="turtle-stats">
               <div class="turtle-stat"><span>状态</span><strong id="turtlePhase">空闲</strong></div>
@@ -649,7 +737,10 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
               <button class="tab active" id="logsTab" role="tab" aria-selected="true" aria-controls="monitorLogs" data-target="monitorLogs" onclick="switchTab(this)">事件日志</button>
               <button class="tab" id="commandsTab" role="tab" aria-selected="false" aria-controls="monitorCommands" data-target="monitorCommands" onclick="switchTab(this)">命令记录</button>
           </div>
-          <small>实时</small>
+          <div style="display:flex;align-items:center;gap:var(--sp-2)">
+            <small>实时</small>
+            <button class="btn small ghost" onclick="exportLogs('json')" title="导出事件日志 JSON">导出</button>
+          </div>
         </div>
         <div class="panel-body">
           <pre class="scroll tab-body" id="monitorLogs" role="tabpanel" aria-labelledby="logsTab">暂无日志</pre>
@@ -707,7 +798,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
         <div class="panel-head"><h2>磁盘缓存歌曲</h2><small id="cacheTracksMeta">读取中</small></div>
         <div class="panel-body">
           <div class="controls" style="margin-bottom:var(--sp-3)">
-            <select id="cacheTracksSort" onchange="cacheTracksSortChanged()" style="flex:1">
+            <select id="cacheTracksSort" onchange="cacheTracksSortChanged()" style="flex:1" aria-label="缓存歌曲排序方式">
               <option value="last_used:desc">最近使用（新→旧）</option>
               <option value="last_used:asc">最近使用（旧→新）</option>
               <option value="requested_play_count:desc">点歌次数（多→少）</option>
@@ -731,7 +822,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       </div>
 
       <div class="panel wide">
-        <div class="panel-head"><h2>播放历史</h2><small id="playbackHistoryMeta">最近 0 首</small></div>
+        <div class="panel-head"><h2>播放历史</h2><span style="display:flex;align-items:center;gap:var(--sp-2)"><small id="playbackHistoryMeta">最近 0 首</small><button class="btn small ghost" onclick="exportPlaybackHistory('json')" title="导出播放历史 JSON">导出</button></span></div>
         <div class="panel-body"><div class="history" id="playbackHistory">暂无播放历史</div></div>
       </div>
 
@@ -739,7 +830,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
         <div class="panel-head"><h2>点歌榜</h2><small id="leaderboardMeta" role="status" aria-live="polite">等待读取</small></div>
         <div class="panel-body">
           <div class="controls" style="margin-bottom:var(--sp-3)">
-            <select id="leaderboardRange" onchange="loadLeaderboard()" style="flex:1">
+            <select id="leaderboardRange" onchange="loadLeaderboard()" style="flex:1" aria-label="点歌榜时间范围">
               <option value="0">全部</option>
               <option value="7" selected>最近 7 天</option>
               <option value="1">最近 24 小时</option>
@@ -764,9 +855,9 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       <div class="panel">
         <div class="panel-head"><h2>点歌</h2><small>排队执行</small></div>
         <div class="panel-body">
-          <input id="keyword" placeholder="歌名 / 歌手 / 关键词">
+          <input id="keyword" placeholder="歌名 / 歌手 / 关键词" aria-label="歌名、歌手或关键词">
           <div class="compact-form" style="margin-top:var(--sp-3)">
-            <select id="sourceSelect">
+            <select id="sourceSelect" aria-label="音源平台">
               <option value="qqmusic" selected>QQ音乐</option>
               <option value="netease">网易云</option>
               <option value="bilibili">B站</option>
@@ -793,7 +884,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
         </div>
       </div>
 
-      <div class="panel">
+      <div class="panel" id="queueOpsPanel">
         <div class="panel-head"><h2>队列操作</h2><small>待播队列</small></div>
         <div class="panel-body">
           <div class="two">
@@ -803,7 +894,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
         </div>
       </div>
 
-      <div class="panel">
+      <div class="panel" id="gameFlowPanel">
         <div class="panel-head"><h2>游戏流程</h2><small>排队执行</small></div>
         <div class="panel-body">
           <div class="three">
@@ -837,19 +928,19 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
             <button class="btn warn" onclick="setCommandsEnabled(false)">禁用命令</button>
           </div>
           <div class="row" style="margin-top:var(--sp-3)">
-            <input id="idleExitMinutes" value="30" inputmode="numeric" placeholder="15-1440分钟">
+            <input id="idleExitMinutes" value="30" inputmode="numeric" placeholder="15-1440分钟" aria-label="闲置退出分钟数">
             <button class="btn" onclick="setIdleExit()">闲置退出</button>
             <button class="btn ghost" onclick="clearIdleExit()">取消</button>
           </div>
           <div class="row" style="margin-top:var(--sp-3)">
-            <select id="workflowSelect"><option value="">无可用工作流</option></select>
+            <select id="workflowSelect" aria-label="工作流选择"><option value="">无可用工作流</option></select>
             <button class="btn" onclick="runWorkflow()">执行</button>
           </div>
-          <input id="workflowArgs" style="margin-top:var(--sp-2)" placeholder="工作流参数，可留空">
+          <input id="workflowArgs" style="margin-top:var(--sp-2)" placeholder="工作流参数，可留空" aria-label="工作流参数">
         </div>
       </div>
 
-      <div class="panel">
+      <div class="panel" id="screenshotPanel">
         <div class="panel-head"><h2>游戏截图</h2><small>手动</small></div>
         <div class="panel-body">
           <button class="btn primary" style="width:100%" onclick="loadScreenshot()">获取截图</button>
@@ -865,6 +956,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
         <div class="panel-head">
           <h2>接口记录</h2>
           <div>
+            <button class="btn small ghost" onclick="exportHistory('json')" title="导出接口记录 JSON">导出</button>
             <button class="btn small ghost" onclick="loadHistory()">刷新</button>
             <button class="btn small ghost" onclick="clearHistory()">清空</button>
           </div>
@@ -875,19 +967,34 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
       <div class="panel">
         <div class="panel-head"><h2>访问令牌</h2><small>必填</small></div>
         <div class="panel-body">
-          <input id="accessToken" type="password" placeholder="请输入访问令牌" required oninput="storeAccessToken()" onchange="applyAccessToken()" style="width:100%">
+          <input id="accessToken" type="password" placeholder="请输入访问令牌" required autocomplete="off" aria-label="访问令牌" oninput="storeAccessToken()" onchange="applyAccessToken()" style="width:100%">
         </div>
       </div>
     </aside>
   </main>
 </div>
 
-<div class="modal hidden" id="screenshotModal" role="dialog" aria-modal="true" aria-labelledby="screenshotTitle">
+<div class="modal hidden" id="screenshotModal" role="dialog" aria-modal="true" aria-labelledby="screenshotTitle" onclick="if(event.target===this)closeScreenshot()">
   <div class="modal-head">
     <strong id="screenshotTitle">游戏截图</strong>
-    <button class="btn small" onclick="closeScreenshot()">关闭</button>
+    <span style="display:flex;gap:var(--sp-2)">
+      <button class="btn small" onclick="loadHallScreenshot()" title="主动触发一次大厅检测截图（区别于缓存帧）">重拍大厅</button>
+      <button class="btn small" onclick="downloadScreenshot()">下载</button>
+      <button class="btn small" onclick="closeScreenshot()">关闭</button>
+    </span>
   </div>
   <div class="modal-body"><img id="screenshotImage" alt="游戏截图"></div>
+</div>
+
+<div class="modal hidden confirm-modal" id="confirmModal" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMessage" onclick="if(event.target===this)resolveConfirm(false)">
+  <div class="confirm-card">
+    <strong id="confirmTitle">确认操作</strong>
+    <p id="confirmMessage"></p>
+    <div class="confirm-actions">
+      <button class="btn" id="confirmCancel" onclick="resolveConfirm(false)">取消</button>
+      <button class="btn warn" id="confirmOk" onclick="resolveConfirm(true)">确定</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -903,11 +1010,13 @@ function setupPages(){
     playbackHistory:'playback-history-panel'
   }
   const moves={
-    overview:['monitorOcr','runtimeDetail'],
-    playback:['songState','keyword','monitorQueue','queueMeta','cacheStats','cacheTracks','playbackHistory'],
+    // 总览：实时聊天 OCR（含快捷控制台发言，高频操作放首屏）
+    overview:['monitorOcr'],
+    playback:['songState','keyword','monitorQueue','queueMeta','cacheStats','cacheTracks','playbackHistory','leaderboard','queueOpsPanel'],
     tasks:['monitorPending','monitorLogs','history'],
     login:['loginProviders'],
-    game:['consoleChatText','listenerPrimary','idleExitMinutes','screenshotImage'],
+    // 游戏与聊天：监听切换、游戏流程、机器人操作、手动截图
+    game:['listenerPrimary','idleExitMinutes','gameFlowPanel','screenshotPanel'],
     entertainment:['turtlePanel'],
     settings:['accessToken']
   }
@@ -941,12 +1050,12 @@ let configLatestRevisionAtMs=null // 服务端最新历史版本时间（首次�
 let configSearchText=''
 let configRevisionsOpen=false
 let configSecretDraft={}
-function navigateTo(route,updateHash=true){
+async function navigateTo(route,updateHash=true){
   if(!pageRoutes.includes(route))route='overview'
   const currentRoute=document.querySelector('.page-section.active')?.dataset.page
   // 只有离开配置页时需要确认丢弃修改；用户确认离开后，再返回配置页不再重复提示。
   if(configUnsaved&&currentRoute==='config'&&route!==currentRoute){
-    if(!confirm('有未保存的配置修改，确定离开配置中心？')){
+    if(!await confirmDialog('有未保存的配置修改，确定离开配置中心？',{title:'离开配置中心'})){
       // 浏览器的前进/后退会在 hashchange 触发前修改哈希；用户留在当前页时恢复原哈希。
       if(!updateHash&&currentRoute&&location.hash!=='#'+currentRoute)history.replaceState(null,'','#'+currentRoute)
       return
@@ -1003,15 +1112,20 @@ let loginStatusRequestApplied=0
 let operatorWorkflows=[]
 let taskSnapshots=[]
 let activeDecisionId=0
-function setResult(value){
-  if(value&&typeof value==='object'&&value.duplicate){$('result').textContent='相同任务已在队列中';return}
+function setResult(value,kind){
+  const el=$('result')
+  // 成功/错误着色：左侧色条一眼区分结果性质
+  el.parentElement.classList.remove('result-ok','result-err')
+  if(kind)el.parentElement.classList.add(kind)
+  if(value&&typeof value==='object'&&value.duplicate){el.textContent='相同任务已在队列中';return}
   if(value&&typeof value==='object'&&value.queued){
     const ids=Array.isArray(value.taskIds)?value.taskIds:(value.taskId?[value.taskId]:[])
     const positions=Array.isArray(value.positions)?value.positions:(value.position?[value.position]:[])
-    $('result').textContent=(ids.length?'任务 #'+ids.join('、'):'任务')+' 已入队'+(positions.length?'，位置 '+positions.join('、'):'')
+    el.parentElement.classList.add('result-ok')
+    el.textContent=(ids.length?'任务 #'+ids.join('、'):'任务')+' 已入队'+(positions.length?'，位置 '+positions.join('、'):'')
     return
   }
-  $('result').textContent=typeof value==='string'?value:JSON.stringify(value,null,2)
+  el.textContent=typeof value==='string'?value:JSON.stringify(value,null,2)
 }
 function readTokenCookie(){const match=document.cookie.match(/(?:^|;\s*)miliastraAccessToken=([^;]*)/);return match?decodeURIComponent(match[1]):''}
 function writeTokenCookie(value){
@@ -1020,14 +1134,19 @@ function writeTokenCookie(value){
 }
 function accessToken(){
   const fromCookie=readTokenCookie();if(fromCookie)return fromCookie
-  const legacy=sessionStorage.getItem('miliastraAccessToken')||''
-  if(legacy){writeTokenCookie(legacy);sessionStorage.removeItem('miliastraAccessToken')}
-  return legacy
+  try{
+    const legacy=sessionStorage.getItem('miliastraAccessToken')||''
+    if(legacy){writeTokenCookie(legacy);sessionStorage.removeItem('miliastraAccessToken')}
+    return legacy
+  }catch(e){return ''}
 }
 function storeAccessToken(){writeTokenCookie($('accessToken').value.trim())}
 // 令牌生效后立即重拉全部一次性和周期数据，避免逐个页面手动 F5。
 function applyAccessToken(){
   storeAccessToken()
+  tokenInvalid=false
+  const banner=$('tokenBanner')
+  if(banner)banner.classList.add('hidden')
   refreshAll()
   loadLoginState()
   loadOperatorWorkflows()
@@ -1061,16 +1180,26 @@ function parseResponse(text,status){
     return text
   }
 }
+// 令牌失效（401/403）时置全局标记：暂停轮询、显示引导横幅，避免每秒静默打满失败请求。
+// 重新填入并应用令牌后（applyAccessToken）清除标记恢复轮询。
+let tokenInvalid=false
+function handleAuthFailure(status){
+  if(status!==401&&status!==403)return
+  if(tokenInvalid)return
+  tokenInvalid=true
+  const banner=$('tokenBanner')
+  if(banner)banner.classList.remove('hidden')
+}
 async function request(url,method,signal){
   const r=await fetch(url,{method:method||'GET',cache:'no-store',headers:requestHeaders(),signal})
   const text=await r.text()
-  if(!r.ok){let detail=text.trim()&&!text.trim().startsWith('<')?text.trim():'HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
+  if(!r.ok){handleAuthFailure(r.status);let detail=text.trim()&&!text.trim().startsWith('<')?text.trim():'HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
   return parseResponse(text,r.status)
 }
 async function requestJson(url,body){
   const r=await fetch(url,{method:'POST',cache:'no-store',headers:{...requestHeaders(),'Content-Type':'application/json'},body:JSON.stringify(body)})
   const text=await r.text()
-  if(!r.ok){let detail=text.trim()&&!text.trim().startsWith('<')?text.trim():'HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
+  if(!r.ok){handleAuthFailure(r.status);let detail=text.trim()&&!text.trim().startsWith('<')?text.trim():'HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
   return parseResponse(text,r.status)
 }
 async function call(url,method){
@@ -1084,12 +1213,15 @@ async function call(url,method){
     if(url==='/status'&&typeof data==='object')renderPlayer(data)
     setResult(data)
     succeeded=true
-  }catch(e){setResult('错误: '+e.message)}
+  }catch(e){setResult('错误: '+e.message,'err')}
   finally{if(mutating)actionInFlight=false}
   await Promise.allSettled([loadHistory(),loadMonitor()])
   return succeeded
 }
+let lastPlayerStatus=''
+function getPlayerStatus(){return lastPlayerStatus}
 function renderPlayer(d){
+  lastPlayerStatus=d.status||''
   const title=[d.name,d.singer].filter(Boolean).join(' - ')
   const songText=title+(d.requester?' · 点歌人：'+d.requester:'')
   const st=d.status
@@ -1102,7 +1234,30 @@ function renderPlayer(d){
     $('volumeInput').value=String(value)
   }
   renderProgress(d)
+  renderOverviewNowPlaying(d,title,songText)
+  detectSongChange(title,d.status)
   return title
+}
+// 总览页"正在播放"卡片：与播放页共享 /status 数据，不额外发请求。
+function renderOverviewNowPlaying(d,title,songText){
+  const titleEl=$('overviewSongTitle')
+  if(!titleEl)return
+  titleEl.textContent=title||'无歌曲'
+  const sub=[]
+  if(d.status)sub.push(stMap[d.status]||d.status)
+  if(d.requester)sub.push('点歌人：'+d.requester)
+  if(d.source)sub.push(sourceLabel(d.source))
+  $('overviewSongSub').textContent=sub.join(' · ')||'-'
+  $('overviewPlayingMeta').textContent=d.status==='playing'?'播放中':'已暂停'
+  const box=$('overviewProgress')
+  const progress=safeNum(d.progress),duration=safeNum(d.duration)
+  if(progress==null&&duration==null){box.hidden=true}else{
+    box.hidden=false
+    const fill=(duration!=null&&duration>0)?Math.max(0,Math.min(100,progress/duration*100)):0
+    $('overviewProgressFill').style.width=fill+'%'
+    $('overviewProgressTime').textContent=fmt(progress)+' / '+fmt(duration)
+    $('overviewLyric').textContent=d.lyricLineText||''
+  }
 }
 let progressDragging=false
 let currentDuration=null
@@ -1120,6 +1275,7 @@ function renderProgress(d){
   if(!progressDragging){
     $('progressSlider').value=String(Math.round(fill*10))
     $('progressTime').textContent=fmt(progress)+' / '+fmt(duration)
+    $('progressSlider').setAttribute('aria-valuetext',fmt(progress)+' / '+fmt(duration))
   }
   const failure=d.failureCode?('失败: '+(d.failureMessage||'未知原因')+(d.failureRetryable?'（可重试）':'')):''
   const lyric=d.lyricLineText?('歌词: '+d.lyricLineText):''
@@ -1201,6 +1357,7 @@ function renderPlaybackInsights(data){
     $('cacheDirectory').textContent='播放器未启用音频缓存'
   }
   const history=Array.isArray(data&&data.history)?data.history:[]
+  latestPlaybackHistory=history.slice()
   $('playbackHistoryMeta').textContent='最近 '+history.length+' 首'
   $('playbackHistory').innerHTML=history.length?history.map(item=>{
     const title=[item.title,item.artist].filter(Boolean).join(' - ')||item.keyword||'未知歌曲'
@@ -1293,7 +1450,7 @@ function renderCacheTracks(page){
     const state=t.complete?'已缓存':'未完整'
     const activity='播放 '+(t.playCount||0)+'（点歌 '+(t.requestedPlayCount||0)+' / 池 '+(t.poolPlayCount||0)+'） · 命中 '+(t.cacheHitCount||0)+' · 失败 '+(t.failureCount||0)
     const failure=t.lastFailureCode?' · 最近失败 '+t.lastFailureCode:''
-    const buttons=known?'<button class="btn ghost" onclick="playCachedTrack('+i+')">播放</button><button class="btn ghost" onclick="deleteCachedTrack('+i+')">删除歌曲</button><button class="btn ghost" onclick="resetTrackStatistics(\''+encodeURIComponent(t.source)+'\',\''+encodeURIComponent(t.id)+'\')">清零统计</button>':''
+    const buttons=known?'<button class="btn ghost" onclick="playCachedTrack('+i+')">播放</button><button class="btn ghost" onclick="invalidateCachedTrack('+i+')">仅清缓存</button><button class="btn ghost" onclick="deleteCachedTrack('+i+')">删除歌曲</button><button class="btn ghost" onclick="resetTrackStatistics('+i+')">清零统计</button>':''
     return '<div class="cache-track-item'+(known?'':' orphan')+'"><div><b>'+esc(title)+'</b><span class="cache-track-source">'+esc(source)+'</span>'+buttons+'</div><div class="cache-track-meta">'+esc(size)+' · 最近使用 '+esc(used)+' · '+esc(state)+' · '+esc(activity)+esc(failure)+'</div></div>'
   }).join(''):'暂无磁盘缓存歌曲'
 }
@@ -1306,13 +1463,22 @@ async function playCachedTrack(index){
 async function deleteCachedTrack(index){
   const t=cacheTracksItems[index]
   if(!t||!t.source||!t.id){setResult('缓存曲目信息不完整');return}
-  if(!confirm('删除歌曲「'+(t.title||t.id)+'」？将从歌曲池移除并删除音频缓存,不再随机播放;如需再次播放请重新点歌。'))return
+  if(!await confirmDialog('删除歌曲「'+(t.title||t.id)+'」？将从歌曲池移除并删除音频缓存，不再随机播放；如需再次播放请重新点歌。',{title:'删除歌曲'}))return
   try{await call('/playback/song/delete?provider='+encodeURIComponent(t.source)+'&id='+encodeURIComponent(t.id),'POST')}catch(e){setResult('删除歌曲失败: '+e.message);return}
   await Promise.all([loadPlaybackInsights(),loadCacheTracks()])
 }
-async function resetTrackStatistics(provider,id){
-  if(!confirm('清零该歌曲统计？音频缓存和曲目元数据会保留。'))return
-  await call('/playback/statistics/reset?provider='+provider+'&id='+id,'POST')
+async function invalidateCachedTrack(index){
+  const t=cacheTracksItems[index]
+  if(!t||!t.source||!t.id){setResult('缓存曲目信息不完整','err');return}
+  if(!await confirmDialog('仅清除「'+(t.title||t.id)+'」的磁盘缓存？曲目保留在播放池中，下次播放会重新下载。',{title:'清除缓存'}))return
+  await call('/playback/cache/invalidate?provider='+encodeURIComponent(t.source)+'&id='+encodeURIComponent(t.id),'POST')
+  await Promise.all([loadPlaybackInsights(),loadCacheTracks()])
+}
+async function resetTrackStatistics(index){
+  const t=cacheTracksItems[index]
+  if(!t||!t.source||!t.id){setResult('缓存曲目信息不完整');return}
+  if(!await confirmDialog('清零该歌曲统计？音频缓存和曲目元数据会保留。',{title:'清零统计'}))return
+  await call('/playback/statistics/reset?provider='+encodeURIComponent(t.source)+'&id='+encodeURIComponent(t.id),'POST')
   await Promise.all([loadPlaybackInsights(),loadCacheTracks()])
 }
 async function loadCacheTracks(){
@@ -1343,13 +1509,13 @@ async function loadStatus(){
       '音量: '+(safeNum(d.volume)!=null?Math.round(d.volume)+'%':'未知'),
       d.lyricLineText?'歌词: '+d.lyricLineText:''
     ].filter(Boolean).join('\n'))
-  }catch(e){setResult('错误: '+e.message)}
+  }catch(e){setResult('错误: '+e.message,'err')}
   await loadHistory()
 }
 const providerNames={qqmusic:'QQ音乐',netease:'网易云音乐',bilibili:'哔哩哔哩',kugou:'酷狗音乐'}
 function providerLabel(provider){return providerNames[provider]||provider||'未知平台'}
 function loginTime(value){if(value==null)return '暂未提供';const date=new Date(typeof value==='number'&&value<1e12?value*1000:value);return isNaN(date.getTime())?'暂未提供':date.toLocaleString('zh-CN',{hour12:false})}
-function refreshTime(ms){return Number.isFinite(ms)?new Date(ms).toLocaleString():'未记录'}
+function refreshTime(ms){return Number.isFinite(ms)?new Date(ms).toLocaleString('zh-CN',{hour12:false}):'未记录'}
 function loginQrDataUrl(value){return typeof value==='string'&&value.length<=700000&&/^data:image\/(?:png|jpeg);base64,[A-Za-z0-9+/]+={0,2}$/.test(value)?value:''}
 function renderLoginState(){
   const active=loginRuntimeStatus&&loginRuntimeStatus.active
@@ -1394,7 +1560,7 @@ function renderLoginState(){
       '<button class="btn small ghost login-logout" data-provider="'+esc(provider)+'" '+(active?'disabled':'')+'>退出</button></div></div><div class="login-progress"><i style="width:'+Math.max(0,Math.min(100,Number(completeness)||0))+'%"></i></div>'+
       accountInfo+
       '<div class="login-fields">'+fields+'</div><div class="login-refresh-info">'+refreshInfo+(item.nextRefreshCheckAtMs?' · 下次检查：'+esc(refreshTime(item.nextRefreshCheckAtMs)):'')+(item.lastRefreshError?' · '+esc(item.lastRefreshError):'')+'</div></div>'
-  }).join('')||'<div class="result">没有可用平台</div>'
+  }).join('')||'<div class="result">没有可用平台，请先在「配置中心 → 播放器」填写平台凭据。<div style="margin-top:var(--sp-2)"><button type="button" class="btn small" onclick="navigateTo(\'config\')">打开配置中心</button></div></div>'
   $('loginProviders').querySelectorAll('.login-start').forEach((button)=>{button.addEventListener('click',()=>startLogin(button.dataset.provider||''))})
   $('loginProviders').querySelectorAll('.login-cancel').forEach((button)=>{button.addEventListener('click',cancelLogin)})
   $('loginProviders').querySelectorAll('.login-logout').forEach((button)=>{button.addEventListener('click',()=>logoutProvider(button.dataset.provider||''))})
@@ -1405,14 +1571,14 @@ function renderLoginState(){
       const r=await request('/player/kugou/claim-vip','POST')
       setResult(r&&r.accepted?('领取成功：VIP+'+((r.vipDays||0)+'天')+(r.message?('（'+r.message+'）'):'')):('领取失败：'+((r&&r.message)||'未知原因')))
       await loadLoginState()
-    }catch(e){setResult('错误: '+e.message)}
+    }catch(e){setResult('错误: '+e.message,'err')}
   })})
   $('loginProviders').querySelectorAll('[data-kugou-upgrade]').forEach((button)=>{button.addEventListener('click',async()=>{
     try{
       const r=await request('/player/kugou/upgrade-vip','POST')
       setResult(r&&r.accepted?('升级成功：VIP+'+((r.vipDays||0)+'天')+(r.message?('（'+r.message+'）'):'')):('升级失败：'+((r&&r.message)||'未知原因')))
       await loadLoginState()
-    }catch(e){setResult('错误: '+e.message)}
+    }catch(e){setResult('错误: '+e.message,'err')}
   })})
 }
 async function loadLoginState(){
@@ -1471,12 +1637,12 @@ function formatVipLabel(info){
   }
   return '，非VIP'
 }
-async function jsonAction(url,body){
+async function jsonAction(url,body,skipLoginRefresh){
   if(actionInFlight){setResult('上一项操作仍在请求中');return false}
   actionInFlight=true
   setResult('请求中...')
-  try{setResult(await requestJson(url,body));await loadLoginState();return true}
-  catch(e){setResult('错误: '+e.message);return false}
+  try{setResult(await requestJson(url,body),'ok');if(!skipLoginRefresh)await loadLoginState();return true}
+  catch(e){setResult('错误: '+e.message,'err');return false}
   finally{actionInFlight=false}
 }
 function startLogin(provider){return jsonAction('/player/login/start',{provider})}
@@ -1509,18 +1675,25 @@ function remoteSong(ai){
   if(!ai&&source())url+='&source='+encodeURIComponent(source())
   call(url,'POST')
 }
+let searchRequestVersion=0
 async function searchOnly(){
   const kw=keyword()
   if(!kw){setResult('请输入关键词');return}
   let url='/search/candidates?keyword='+encodeURIComponent(kw)
   if(source())url+='&source='+encodeURIComponent(source())
+  // 版本号防乱序：连发多次搜索时只应用最后一次的结果。
+  const version=++searchRequestVersion
   setResult('搜索中...')
   try{
     const items=await request(url)
+    if(version!==searchRequestVersion)return
     searchCandidateItems=Array.isArray(items)?items:[]
     renderSearchCandidates()
     setResult(searchCandidateItems.length?'找到 '+searchCandidateItems.length+' 个候选':'没有找到候选')
-  }catch(e){searchCandidateItems=[];renderSearchCandidates();setResult('错误: '+e.message)}
+  }catch(e){
+    if(version!==searchRequestVersion)return
+    searchCandidateItems=[];renderSearchCandidates();setResult('错误: '+e.message,'err')
+  }
   await loadHistory()
 }
 const eligibilityLabels={eligible:'可播放',vip:'需要VIP',no_copyright:'无版权',paid:'需购买',ineligible:'不可播放',unknown:'未知'}
@@ -1560,16 +1733,32 @@ function queueAdd(){
   call(url,'POST')
 }
 function removeQueueId(id){call('/queue/remove?id='+encodeURIComponent(id),'POST')}
-function clearQueue(){if(confirm('确定清空全部待播歌曲？'))call('/queue/clear','POST')}
+async function clearQueue(){if(await confirmDialog('确定清空全部待播歌曲？',{title:'清空队列'}))call('/queue/clear','POST')}
 function setChatListener(mode){call('/chat-listener/mode?mode='+encodeURIComponent(mode),'POST')}
 function startTurtleSoup(useId){
   const id=$('turtlePuzzleId').value.trim()
   if(useId&&!id){setResult('请输入题目 ID');return}
   call('/turtle-soup/start'+(useId?'?id='+encodeURIComponent(id):''),'POST')
 }
-function endTurtleSoup(){if(confirm('确定结束当前海龟汤并在大厅公布汤底？'))call('/turtle-soup/end','POST')}
+async function toggleTurtleSubmit(){
+  const form=$('turtleSubmitForm')
+  const open=form.classList.toggle('hidden')
+  $('turtleSubmitToggle').setAttribute('aria-expanded',String(!open))
+  if(!open)$('turtleNewTitle').focus()
+}
+async function submitTurtleQuestion(){
+  const title=$('turtleNewTitle').value.trim()
+  const surface=$('turtleNewSurface').value.trim()
+  const bottom=$('turtleNewBottom').value.trim()
+  if(!title||!surface||!bottom){setResult('标题、汤面、汤底都需要填写','err');return}
+  if(await jsonAction('/turtle-soup/questions',{title:title,surface:surface,bottom:bottom},true)){
+    $('turtleNewTitle').value='';$('turtleNewSurface').value='';$('turtleNewBottom').value=''
+    toggleTurtleSubmit()
+  }
+}
+async function endTurtleSoup(){if(await confirmDialog('确定结束当前海龟汤并在大厅公布汤底？',{title:'结束海龟汤'}))call('/turtle-soup/end','POST')}
 function startUndercover(){call('/undercover/start','POST')}
-function endUndercover(){if(confirm('确定结束当前谁是卧底房间或对局？'))call('/undercover/end','POST')}
+async function endUndercover(){if(await confirmDialog('确定结束当前谁是卧底房间或对局？',{title:'结束谁是卧底'}))call('/undercover/end','POST')}
 function setCommandsEnabled(enabled){call('/operator/commands?enabled='+(enabled?'1':'0'),'POST')}
 function setIdleExit(){
   const value=$('idleExitMinutes').value.trim()
@@ -1616,16 +1805,108 @@ async function loadScreenshot(){
     $('screenshotImage').src=screenshotUrl
     $('screenshotTitle').textContent='游戏截图 '+nowText()
     $('screenshotModal').classList.remove('hidden')
+    // 焦点移入弹窗（关闭按钮），关闭后归还给触发元素
+    screenshotReturnFocus=document.activeElement instanceof HTMLElement?document.activeElement:null
+    const closeBtn=$('screenshotModal').querySelector('.modal-head .btn')
+    if(closeBtn)closeBtn.focus()
     setResult('截图已获取')
-  }catch(e){setResult('错误: '+e.message)}
+  }catch(e){setResult('错误: '+e.message,'err')}
   finally{screenshotLoading=false}
 }
+// 主动触发大厅检测截图（与 loadScreenshot 的缓存帧不同源）
+async function loadHallScreenshot(){
+  if(screenshotLoading)return
+  screenshotLoading=true
+  setResult('正在重拍大厅截图...')
+  try{
+    const r=await fetch('/hall-screenshot?quality=88',{headers:requestHeaders(),cache:'no-store'})
+    if(!r.ok)throw new Error(await r.text()||('HTTP '+r.status))
+    const blob=await r.blob()
+    if(screenshotUrl)URL.revokeObjectURL(screenshotUrl)
+    screenshotUrl=URL.createObjectURL(blob)
+    $('screenshotImage').src=screenshotUrl
+    $('screenshotTitle').textContent='大厅截图（实时） '+nowText()
+    $('screenshotModal').classList.remove('hidden')
+    setResult('大厅截图已获取','ok')
+  }catch(e){setResult('错误: '+e.message,'err')}
+  finally{screenshotLoading=false}
+}
+let screenshotReturnFocus=null
+// 通用下载：生成 Blob 并触发浏览器下载
+function downloadText(filename,text,mime){
+  const blob=new Blob([text],{type:mime||'text/plain;charset=utf-8'})
+  const url=URL.createObjectURL(blob)
+  const a=document.createElement('a')
+  a.href=url;a.download=filename
+  document.body.appendChild(a);a.click();a.remove()
+  setTimeout(()=>URL.revokeObjectURL(url),5000)
+}
+function csvEscape(v){const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s}
+// 导出当前事件日志（最近渲染内容）与接口记录、播放历史
+let latestMonitorLogs=[]
+function exportLogs(format){
+  if(!latestMonitorLogs.length){setResult('当前没有可导出的事件日志');return}
+  const stamp=new Date().toISOString().replace(/[:.]/g,'-').slice(0,19)
+  if(format==='csv')downloadText('miliastra-日志-'+stamp+'.csv','message\n'+latestMonitorLogs.map(l=>csvEscape(l)).join('\n'),'text/csv;charset=utf-8')
+  else downloadText('miliastra-日志-'+stamp+'.json',JSON.stringify(latestMonitorLogs,null,2),'application/json')
+  setResult('已导出 '+latestMonitorLogs.length+' 条日志')
+}
+let latestHistoryItems=[]
+function exportHistory(format){
+  if(!latestHistoryItems.length){setResult('当前没有可导出的接口记录');return}
+  const stamp=new Date().toISOString().replace(/[:.]/g,'-').slice(0,19)
+  if(format==='csv')downloadText('miliastra-接口记录-'+stamp+'.csv','time,command,query,ok,result\n'+latestHistoryItems.map(it=>[csvEscape(it.time),csvEscape(it.command),csvEscape(queryText(it.query)),it.ok?'1':'0',csvEscape(it.result)].join(',')).join('\n'),'text/csv;charset=utf-8')
+  else downloadText('miliastra-接口记录-'+stamp+'.json',JSON.stringify(latestHistoryItems,null,2),'application/json')
+  setResult('已导出 '+latestHistoryItems.length+' 条接口记录')
+}
+let latestPlaybackHistory=[]
+function exportPlaybackHistory(format){
+  if(!latestPlaybackHistory.length){setResult('当前没有可导出的播放历史');return}
+  const stamp=new Date().toISOString().replace(/[:.]/g,'-').slice(0,19)
+  if(format==='csv')downloadText('miliastra-播放历史-'+stamp+'.csv','time,title,artist,source,requester,cached,playCount\n'+latestPlaybackHistory.map(it=>[csvEscape(it.startedAtMs?new Date(it.startedAtMs).toLocaleString('zh-CN',{hour12:false}):''),csvEscape(it.title),csvEscape(it.artist),csvEscape(it.source),csvEscape(it.requester),it.cached?'1':'0',it.playCount||0].join(',')).join('\n'),'text/csv;charset=utf-8')
+  else downloadText('miliastra-播放历史-'+stamp+'.json',JSON.stringify(latestPlaybackHistory,null,2),'application/json')
+  setResult('已导出 '+latestPlaybackHistory.length+' 条播放历史')
+}
+// Promise 化确认弹窗：替代原生 confirm()，支持 Enter 确认 / Esc 取消 / 遮罩点击取消。
+let confirmResolver=null
+function confirmDialog(message,options){
+  options=options||{}
+  $('confirmTitle').textContent=options.title||'确认操作'
+  $('confirmMessage').textContent=message
+  $('confirmOk').textContent=options.okText||'确定'
+  $('confirmOk').className='btn '+(options.danger===false?'primary':'warn')
+  $('confirmModal').classList.remove('hidden')
+  $('confirmOk').focus()
+  return new Promise(resolve=>{confirmResolver=resolve})
+}
+function resolveConfirm(value){
+  $('confirmModal').classList.add('hidden')
+  if(confirmResolver){const r=confirmResolver;confirmResolver=null;r(value)}
+}
+document.addEventListener('keydown',event=>{
+  if(!$('confirmModal').classList.contains('hidden')){
+    if(event.key==='Escape'){resolveConfirm(false);event.preventDefault()}
+    else if(event.key==='Enter'&&!event.isComposing){resolveConfirm(true);event.preventDefault()}
+  }
+})
 function closeScreenshot(){
   $('screenshotModal').classList.add('hidden')
   $('screenshotImage').removeAttribute('src')
   if(screenshotUrl){URL.revokeObjectURL(screenshotUrl);screenshotUrl=''}
+  if(screenshotReturnFocus&&document.contains(screenshotReturnFocus)){screenshotReturnFocus.focus();screenshotReturnFocus=null}
+}
+// 下载当前截图（blob URL 现成，文件名带时间戳）
+function downloadScreenshot(){
+  if(!screenshotUrl){setResult('当前没有可下载的截图');return}
+  const a=document.createElement('a')
+  a.href=screenshotUrl
+  a.download='miliastra-截图-'+new Date().toISOString().replace(/[:.]/g,'-').slice(0,19)+'.jpg'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
 }
 function renderHistory(items){
+  latestHistoryItems=Array.isArray(items)?items.slice():[]
   const el=$('history')
   if(!Array.isArray(items)||!items.length){el.textContent='暂无记录';return}
   el.innerHTML=items.map((it)=>'<div class="history-item '+(it.ok?'':'err')+'"><div><span class="history-time">'+esc(it.time)+'</span><b>'+esc(commandLabels[it.command]||it.command)+'</b>'+esc(queryText(it.query))+'</div><div class="history-result">'+esc(it.result)+'</div></div>').join('')
@@ -1639,7 +1920,7 @@ function taskLine(task){
   const elapsed=task.elapsedMs?Math.max(1,Math.round(task.elapsedMs/1000))+'s':''
   const result=task.result?'<div class="task-result" title="'+esc(task.result)+'">'+esc(task.result)+'</div>':''
   const action=status==='queued'?'<button class="btn small ghost" onclick="event.stopPropagation();cancelTask('+Number(task.id)+')">撤销</button>':'<div class="queue-meta">'+esc(elapsed)+'</div>'
-  return '<div class="task-item" onclick="showTask('+Number(task.id)+')"><div class="task-status '+esc(status)+'">'+esc(taskStatusLabel[status]||status)+'</div><div class="queue-title">#'+esc(task.id)+' '+esc(task.label||'未命名任务')+'</div>'+action+result+'</div>'
+  return '<div class="task-item" role="button" tabindex="0" onclick="showTask('+Number(task.id)+')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();showTask('+Number(task.id)+')}"><div class="task-status '+esc(status)+'">'+esc(taskStatusLabel[status]||status)+'</div><div class="queue-title">#'+esc(task.id)+' '+esc(task.label||'未命名任务')+'</div>'+action+result+'</div>'
 }
 function cancelTask(id){call('/tasks/cancel?id='+encodeURIComponent(id),'POST')}
 function showTask(id){
@@ -1657,9 +1938,14 @@ function showTask(id){
 function listenerLabel(mode){return mode==='secondary'?'二级监听':mode==='primary'?'一级监听':mode||'一级监听'}
 function ageText(timestamp){const age=Math.max(0,Date.now()-Number(timestamp||0));return timestamp?(age<1000?'刚刚':Math.round(age/1000)+'s前'):'未知时间'}
 function renderLiveLog(lines){
+  latestMonitorLogs=Array.isArray(lines)?lines.slice():[]
   const el=$('monitorLogs')
-  const follow=!el.dataset.ready||el.scrollHeight-el.scrollTop-el.clientHeight<28
-  el.textContent=lines.length?lines.slice(-160).join('\n'):'暂无日志'
+  const text=lines.length?lines.slice(-160).join('\n'):'暂无日志'
+  // 内容未变时不重写：避免打断用户上翻阅读；吸底阈值放宽到 60px。
+  if(renderFingerprints.monitorLogs===text)return
+  const follow=!el.dataset.ready||el.scrollHeight-el.scrollTop-el.clientHeight<60
+  renderFingerprints.monitorLogs=text
+  el.textContent=text
   if(follow)el.scrollTop=el.scrollHeight
   el.dataset.ready='1'
 }
@@ -1707,6 +1993,19 @@ function renderUndercover(u){
   $('undercoverStart').disabled=!enabled||phase!=='lobby'
   $('undercoverEnd').disabled=!enabled||phase==='idle'
   $('undercoverPlayers').innerHTML=players.length?players.map((player,index)=>'<div class="undercover-player"><span class="undercover-position">'+esc(player.position||String(index+1))+'</span><span class="undercover-name">'+esc(player.name||'未知玩家')+'</span><span class="undercover-state '+(player.alive?'':'out')+'">'+(player.alive?'在场':'已出局')+'</span></div>').join(''):(enabled?'当前没有报名或进行中的对局':'谁是卧底功能未启用')
+}
+// OCR 耗时 sparkline：最近 90 次采样的 totalMs 走势，突变一眼可见。
+const ocrSparkBuffer=[]
+function pushOcrSpark(value){
+  if(value==null)return
+  ocrSparkBuffer.push(value)
+  if(ocrSparkBuffer.length>90)ocrSparkBuffer.shift()
+  const svg=$('ocrSparkline')
+  if(!svg||ocrSparkBuffer.length<2)return
+  const max=Math.max(...ocrSparkBuffer,1)
+  const w=120,h=24,n=ocrSparkBuffer.length
+  const points=ocrSparkBuffer.map((v,i)=>((i/(90-1))*w).toFixed(1)+','+(h-2-(v/max)*(h-4)).toFixed(1)).join(' ')
+  svg.querySelector('polyline').setAttribute('points',points)
 }
 function renderMonitor(d){
   const operational=d.operational||{}
@@ -1769,21 +2068,23 @@ function renderMonitor(d){
   }
   const o=d.ocr
   if(o){
+    pushOcrSpark(safeNum(o.totalMs))
     $('ocrMeta').textContent=(o.source||'聊天')+' / '+ageText(o.capturedAtMs)+' / 标记 '+o.markers+' / '+o.markerMs+'+'+o.ocrMs+'='+o.totalMs+'ms'
     $('monitorOcr').textContent=(o.messages||[]).join('\n')||'暂无 OCR 文本'
   }else{
     $('ocrMeta').textContent='暂无采样'
     $('monitorOcr').textContent='暂无 OCR 内容'
   }
-  $('monitorQueue').innerHTML=q.length?q.map(queueLine).join(''):'队列为空'
+  setHtmlIfChanged('monitorQueue',q.length?q.map(queueLine).join(''):'队列为空')
   const visibleTasks=[...activeTasks,...tasks.filter(task=>task.status!=='queued'&&task.status!=='running')].slice(0,10)
-  $('monitorPending').innerHTML=visibleTasks.length?visibleTasks.map(taskLine).join(''):'暂无任务'
+  setHtmlIfChanged('monitorPending',visibleTasks.length?visibleTasks.map(taskLine).join(''):'暂无任务')
   renderTurtleSoup(d.turtleSoup)
   renderUndercover(d.undercover)
+  detectNotifyEvents(d)
   const logs=Array.isArray(d.logs)?d.logs:[]
   renderLiveLog(logs)
   const c=Array.isArray(d.commands)?d.commands:[]
-  $('monitorCommands').textContent=c.length?c.slice(-20).join('\n'):'暂无命令'
+  setTextIfChanged('monitorCommands',c.length?c.slice(-20).join('\n'):'暂无命令')
   $('lastRefresh').textContent=(refreshPaused?'已暂停 ':'最后刷新 ')+nowText()
 }
 async function loadMonitor(){
@@ -1802,8 +2103,15 @@ async function loadHistory(){
 }
 async function clearHistory(){
   try{setResult(await request('/clear-history','POST'))}
-  catch(e){setResult('错误: '+e.message)}
+  catch(e){setResult('错误: '+e.message,'err')}
   await loadHistory()
+}
+// 用户确认已更新令牌后手动重试：清标记并全量刷新；若令牌仍无效会再次触发横幅。
+function retryAfterToken(){
+  tokenInvalid=false
+  const banner=$('tokenBanner')
+  if(banner)banner.classList.add('hidden')
+  refreshAll()
 }
 function toggleRefresh(){
   refreshPaused=!refreshPaused
@@ -1836,7 +2144,30 @@ bindEnter('idleExitMinutes',setIdleExit)
 bindEnter('workflowArgs',runWorkflow)
 bindEnter('turtlePuzzleId',()=>startTurtleSoup(true))
 function setState(id,text,state){const el=$(id);el.textContent=text;const chip=el.closest('.chip');if(chip)chip.dataset.state=state}
-function toggleTheme(){const t=document.documentElement.dataset.theme==='light'?'dark':'light';document.documentElement.dataset.theme=t;try{localStorage.setItem('miliastraTheme',t)}catch(e){}}
+// 脏检查渲染：内容指纹未变时跳过 DOM 重建，保留滚动位置与悬停/焦点中的按钮。
+const renderFingerprints={}
+function setHtmlIfChanged(id,html){
+  const el=$(id)
+  if(!el)return
+  if(renderFingerprints[id]===html)return
+  renderFingerprints[id]=html
+  el.innerHTML=html
+}
+function setTextIfChanged(id,text){
+  const el=$(id)
+  if(!el)return
+  if(renderFingerprints[id]===text)return
+  renderFingerprints[id]=text
+  el.textContent=text
+}
+function toggleTheme(){
+  // 切换前启用过渡类，切换后移除，避免首次加载触发全屏动画
+  document.documentElement.classList.add('theme-transition')
+  const t=document.documentElement.dataset.theme==='light'?'dark':'light'
+  document.documentElement.dataset.theme=t
+  try{localStorage.setItem('miliastraTheme',t)}catch(e){}
+  setTimeout(()=>document.documentElement.classList.remove('theme-transition'),350)
+}
 function switchTab(btn){
   const group=btn.parentElement
   group.querySelectorAll('.tab').forEach(t=>{
@@ -1856,14 +2187,18 @@ document.addEventListener('keydown',event=>{
   }
 })
 $('accessToken').value=accessToken()
+initNotifyUI()
 loadOperatorWorkflows()
 refreshAll()
 loadLoginState()
-setInterval(()=>{if(!refreshPaused)loadMonitor()},1000)
-setInterval(()=>{if(!refreshPaused)refreshPlayer().catch(()=>{})},1000)
-setInterval(()=>{if(!refreshPaused)loadPlaybackInsights()},5000)
-setInterval(()=>{if(!refreshPaused)loadPlayMode()},5000)
-setInterval(()=>{if(!refreshPaused&&loginRuntimeStatus&&loginRuntimeStatus.active)refreshLoginProgress()},2000)
+// 页面不可见（切后台/最小化）时暂停全部轮询；回到前台立即补一次全量刷新。
+const pollingActive=()=>!refreshPaused&&!document.hidden&&!tokenInvalid
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!refreshPaused)refreshAll()})
+setInterval(()=>{if(pollingActive())loadMonitor()},1000)
+setInterval(()=>{if(pollingActive())refreshPlayer().catch(()=>{})},1000)
+setInterval(()=>{if(pollingActive())loadPlaybackInsights()},5000)
+setInterval(()=>{if(pollingActive())loadPlayMode()},5000)
+setInterval(()=>{if(pollingActive()&&loginRuntimeStatus&&loginRuntimeStatus.active)refreshLoginProgress()},2000)
 
 /* ===== 高级控制（原 /tools 独立页面，已并入左侧导航） ===== */
 const val=(id)=>{const el=$(id);return el?el.value.trim():''}
@@ -1904,7 +2239,7 @@ function renderToolTasks(items){
   const el=$('toolTasks')
   if(!el)return
   if(!Array.isArray(items)||!items.length){el.textContent='暂无任务';return}
-  el.innerHTML=items.map(item=>'<button class="tools-task" onclick="inspectToolTask('+Number(item.id)+')"><span class="state '+(item.status==='failed'?'err':item.status==='completed'?'ok':'')+'">'+esc(taskStatusLabel[item.status]||item.status)+'</span>#'+item.id+' '+esc(item.label)+'</button>').join('')
+  el.innerHTML=items.map(item=>'<button class="tools-task" onclick="inspectToolTask('+Number(item.id)+')"><span class="state '+(item.status==='failed'?'err':item.status==='completed'?'ok':'')+'">'+esc(taskStatusLabel[item.status]||item.status)+'</span>#'+esc(String(item.id))+' '+esc(item.label)+'</button>').join('')
 }
 function inspectToolTask(id){
   if(toolsBusy)return
@@ -2030,7 +2365,7 @@ function aiExtraBodyEditor(path,value){
   }
   const text=JSON.stringify(body,null,2)
   if(provider==='custom'){
-    return '<div class="config-string-row"><select data-cfg-extra-preset="1" data-cfg-extra-preset-path="'+path+'" onchange="applyExtraBodyPreset(this,\''+path+'\')"><option value="">可选：载入常见网关模板</option>'+EXTRA_BODY_PRESET_OPTIONS+'</select><button type="button" class="btn small ghost" onclick="clearExtraBody(\''+path+'\')">清空</button></div><textarea id="'+configControlId(path)+'" data-cfg="'+path+'" data-cfg-object="1" placeholder="必须是 JSON 对象">'+esc(text)+'</textarea>'
+    return '<div class="config-string-row"><select data-cfg-extra-preset="1" data-cfg-extra-preset-path="'+esc(path)+'" onchange="applyExtraBodyPreset(this,'+esc(JSON.stringify(path))+')"><option value="">可选：载入常见网关模板</option>'+EXTRA_BODY_PRESET_OPTIONS+'</select><button type="button" class="btn small ghost" onclick="clearExtraBody('+esc(JSON.stringify(path))+')">清空</button></div><textarea id="'+configControlId(path)+'" data-cfg="'+path+'" data-cfg-object="1" placeholder="必须是 JSON 对象">'+esc(text)+'</textarea>'
   }
   return '<div class="config-extra-grid">'+controls+'</div><textarea class="hidden" id="'+configControlId(path)+'" data-cfg="'+path+'" data-cfg-object="1">'+esc(text)+'</textarea>'
 }
@@ -2281,7 +2616,7 @@ function renderConfigSectionList(){
     if(!configSectionHasMatch(section))return ''
     const dirty=configDirty.has(section.name)
     const active=section.name===configActiveSection?' active':''
-    return '<button type="button" class="config-section-item'+active+'" onclick="selectConfigSection(\''+section.name+'\')"><span>'+esc(section.label)+'</span><span class="section-name">'+esc(section.name)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
+    return '<button type="button" class="config-section-item'+active+'" onclick="selectConfigSection('+esc(JSON.stringify(section.name))+')"><span>'+esc(section.label)+'</span><span class="section-name">'+esc(section.name)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
   }).join('')||'<div class="config-field-hint" style="padding:var(--sp-2)">没有匹配的配置段</div>'
 }
 function syncConfigFormToData(){
@@ -2358,7 +2693,7 @@ function configControlHtml(field,value){
   if(kind==='stringArray'){
     const items=Array.isArray(value)?value:[]
     const rows=items.map(item=>'<div class="config-string-row" data-cfg-row><input type="text" data-cfg="'+path+'" data-cfg-array="1" value="'+esc(String(item))+'"><button type="button" class="btn small ghost" onclick="configArrayRemove(this)">删除</button></div>').join('')
-    return '<div class="config-array" id="'+id+'">'+rows+'<div class="config-string-row"><button type="button" class="btn small" onclick="configArrayAdd(\''+path+'\')">添加一行</button></div></div>'
+    return '<div class="config-array" id="'+id+'">'+rows+'<div class="config-string-row"><button type="button" class="btn small" onclick="configArrayAdd('+esc(JSON.stringify(path))+')">添加一行</button></div></div>'
   }
   if(kind==='object'){
     // 有子字段 schema 声明的可空对象（如 audio_cache）→ 结构化开关，禁止手填 JSON；
@@ -2378,7 +2713,7 @@ function configControlHtml(field,value){
     if(field.path==='ai.extra_body')return aiExtraBodyEditor(path,value)
     // 其他模块尚无 provider 字段，只提供模板辅助，不伪装成服务商配置。
     if(field.path.endsWith('.extra_body')){
-      html+='<div class="config-string-row"><select id="'+id+'-preset" data-cfg-extra-preset="1" data-cfg-extra-preset-path="'+path+'" onchange="applyExtraBodyPreset(this,\''+path+'\')"><option value="">可选：载入常见网关模板</option>'+EXTRA_BODY_PRESET_OPTIONS+'</select><button type="button" class="btn small ghost" onclick="clearExtraBody(\''+path+'\')">清空</button></div>'
+      html+='<div class="config-string-row"><select id="'+id+'-preset" data-cfg-extra-preset="1" data-cfg-extra-preset-path="'+esc(path)+'" onchange="applyExtraBodyPreset(this,'+esc(JSON.stringify(path))+')"><option value="">可选：载入常见网关模板</option>'+EXTRA_BODY_PRESET_OPTIONS+'</select><button type="button" class="btn small ghost" onclick="clearExtraBody('+esc(JSON.stringify(path))+')">清空</button></div>'
     }
     html+='<textarea id="'+id+'" data-cfg="'+path+'" data-cfg-object="1" placeholder="'+placeholder+'"'+disabledAttr+'>'+esc(text)+'</textarea>'
     if(field.nullable&&value==null)html+='<div class="config-field-hint">当前未启用（null）。填入 JSON 对象后下方子字段自动可用。</div>'
@@ -2392,7 +2727,7 @@ function configControlHtml(field,value){
   }
   if(kind==='secret'){
     const note=value===SECRET_MASK_TEXT?'当前已设置密钥，留空保存表示不修改；点「清除」可移除':'当前未设置'
-    return '<div class="config-string-row"><input id="'+id+'" type="password" data-cfg="'+path+'" value="" placeholder="留空表示不修改" autocomplete="new-password"'+disabledAttr+'><button type="button" class="btn small warn" onclick="clearConfigSecret(\''+path+'\')"'+disabledAttr+'>清除</button></div><div class="config-field-hint">'+note+'</div>'
+    return '<div class="config-string-row"><input id="'+id+'" type="password" data-cfg="'+path+'" value="" placeholder="留空表示不修改" autocomplete="new-password"'+disabledAttr+'><button type="button" class="btn small warn" onclick="clearConfigSecret('+esc(JSON.stringify(path))+')"'+disabledAttr+'>清除</button></div><div class="config-field-hint">'+note+'</div>'
   }
   return ''
 }
@@ -2819,8 +3154,8 @@ function configDefaultSections(){
 }
 async function restoreDefaults(){
   if(configSaving)return
-  if(configUnsaved&&!confirm('有未保存的修改，恢复默认将丢弃这些修改。确定继续？'))return
-  if(!confirm('将恢复所有配置为默认值，此操作会覆盖当前全部配置，确定？'))return
+  if(configUnsaved&&!await confirmDialog('有未保存的修改，恢复默认将丢弃这些修改。确定继续？',{title:'恢复默认配置'}))return
+  if(!await confirmDialog('将恢复所有配置为默认值，此操作会覆盖当前全部配置，确定？',{title:'恢复默认配置'}))return
   const sections=configDefaultSections()
   configSaving=true
   setConfigSavingUI(true)
@@ -2869,7 +3204,7 @@ async function loadConfigRevisions(){
 }
 async function rollbackTo(rev){
   if(configSaving)return
-  if(!confirm('确定回滚到版本 #'+rev+'？当前未保存的修改将被丢弃，回滚会记录为新版本。'))return
+  if(!await confirmDialog('确定回滚到版本 #'+rev+'？当前未保存的修改将被丢弃，回滚会记录为新版本。',{title:'配置回滚'}))return
   configSaving=true
   setConfigSavingUI(true)
   try{
@@ -2893,19 +3228,125 @@ async function rollbackTo(rev){
 }
 $('configForm').addEventListener('input',onConfigFormInput)
 $('configForm').addEventListener('change',onConfigFormChange)
+let configSearchTimer=0
 $('configSearch').addEventListener('input',()=>{
-  if(!syncConfigFormToData()){
-    showConfigMessage('当前配置存在格式错误，暂不能搜索重绘','err')
-    return
-  }
-  configSearchText=$('configSearch').value.trim().toLowerCase()
-  const visible=(configSchema||[]).filter(configSectionHasMatch)
-  if(!visible.some(section=>section.name===configActiveSection))configActiveSection=visible.length?visible[0].name:null
-  renderConfigSectionList()
-  renderConfigForm()
+  // 200ms 防抖：搜索过滤是只读操作，不依赖表单同步成功；校验未通过仅提示，不阻断搜索。
+  clearTimeout(configSearchTimer)
+  configSearchTimer=setTimeout(()=>{
+    if(!syncConfigFormToData())showConfigMessage('当前配置存在格式错误，搜索仅按已加载配置过滤','err')
+    configSearchText=$('configSearch').value.trim().toLowerCase()
+    const visible=(configSchema||[]).filter(configSectionHasMatch)
+    if(!visible.some(section=>section.name===configActiveSection))configActiveSection=visible.length?visible[0].name:null
+    renderConfigSectionList()
+    renderConfigForm()
+  },200)
 })
 window.addEventListener('beforeunload',(e)=>{
   if(configUnsaved){e.preventDefault();e.returnValue='有未保存的配置修改，确定离开？'}
+})
+// 配置中心 Ctrl+S / Cmd+S 快捷保存
+document.addEventListener('keydown',(e)=>{
+  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='s'){
+    const onConfig=document.querySelector('.page-section.active')?.dataset.page==='config'
+    if(onConfig){e.preventDefault();saveConfig()}
+  }
+})
+/* ===== 事件提醒（声音 + 桌面通知） ===== */
+const notifyPrefs={sound:true,desktop:false}
+try{Object.assign(notifyPrefs,JSON.parse(localStorage.getItem('miliastraNotify')||'{}'))}catch(e){}
+function saveNotifyPrefs(){try{localStorage.setItem('miliastraNotify',JSON.stringify(notifyPrefs))}catch(e){}}
+async function toggleDesktopNotify(box){
+  if(box.checked&&'Notification' in window&&Notification.permission==='default'){
+    const p=await Notification.requestPermission()
+    if(p!=='granted'){box.checked=false;setResult('桌面通知未获授权','err');return}
+  }
+  notifyPrefs.desktop=box.checked
+  saveNotifyPrefs()
+}
+function initNotifyUI(){
+  const s=$('notifySound'),d=$('notifyDesktop')
+  if(s)s.checked=notifyPrefs.sound
+  if(d)d.checked=notifyPrefs.desktop&&('Notification' in window)&&Notification.permission==='granted'
+}
+function beep(kind){
+  if(!notifyPrefs.sound)return
+  try{
+    const ctx=beep.ctx||(beep.ctx=new (window.AudioContext||window.webkitAudioContext)())
+    const osc=ctx.createOscillator(),gain=ctx.createGain()
+    osc.connect(gain);gain.connect(ctx.destination)
+    // 成功上行两音；失败下行低音
+    const freq=kind==='error'?[330,220]:[523,784]
+    osc.frequency.setValueAtTime(freq[0],ctx.currentTime)
+    osc.frequency.setValueAtTime(freq[1],ctx.currentTime+0.12)
+    gain.gain.setValueAtTime(0.08,ctx.currentTime)
+    gain.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.3)
+    osc.start();osc.stop(ctx.currentTime+0.32)
+  }catch(e){}
+}
+function desktopNotify(title,body){
+  if(!notifyPrefs.desktop||!('Notification' in window))return
+  if(Notification.permission==='granted'){try{new Notification(title,{body:body||''})}catch(e){}}
+}
+// 事件检测：任务完成/失败、新歌曲开播（基于轮询 diff，无需后端推送）
+let prevTaskStates={}
+let prevSongKey=''
+function detectNotifyEvents(d){
+  const tasks=Array.isArray(d.tasks)?d.tasks:[]
+  for(const t of tasks){
+    const prev=prevTaskStates[t.id]
+    if(prev&&prev!==t.status){
+      if(t.status==='failed'){beep('error');desktopNotify('任务失败 #'+(t.id||''),(t.label||'')+(t.result?'：'+t.result:''))}
+      else if(t.status==='completed'&&prev==='running'){beep('ok');desktopNotify('任务完成 #'+(t.id||''),t.label||'')}
+    }
+    prevTaskStates[t.id]=t.status
+  }
+  // 裁剪已消失的任务 id
+  const ids=new Set(tasks.map(t=>t.id))
+  Object.keys(prevTaskStates).forEach(id=>{if(!ids.has(Number(id)))delete prevTaskStates[id]})
+}
+function detectSongChange(songTitle,status){
+  const key=songTitle+'|'+status
+  if(prevSongKey&&key!==prevSongKey&&status==='playing'&&songTitle){beep('ok');desktopNotify('开始播放',songTitle)}
+  prevSongKey=key
+}
+/* ===== 全局快捷键 =====
+   g+字母 导航；Space 播放/暂停；n/p 下/上一首；r 刷新；t 主题；? 帮助。
+   输入控件聚焦、修饰键按下、弹窗打开时不触发。 */
+const shortcutNavMap={o:'overview',p:'playback',l:'login',g:'game',e:'entertainment',k:'tasks',c:'config',s:'settings'}
+let shortcutPrefix=0
+function shortcutAllowed(e){
+  if(e.ctrlKey||e.metaKey||e.altKey)return false
+  if(!$('screenshotModal').classList.contains('hidden')||!$('confirmModal').classList.contains('hidden'))return false
+  const tag=e.target&&e.target.tagName
+  if(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||(e.target&&e.target.isContentEditable))return false
+  return true
+}
+function showShortcutHelp(){
+  confirmDialog([
+    'g 然后按字母：导航（o 总览 / p 播放 / l 登录 / g 游戏 / e 娱乐 / k 任务 / c 配置 / s 设置）',
+    'Space：播放 / 暂停',
+    'n / p：下一首 / 上一首',
+    'r：立即刷新',
+    't：切换主题',
+    'Esc：关闭弹窗',
+    'Ctrl+S：配置中心保存',
+    '?：本帮助'
+  ].join('\n'),{title:'键盘快捷键',okText:'知道了',danger:false})
+}
+document.addEventListener('keydown',(e)=>{
+  if(!shortcutAllowed(e))return
+  const now=Date.now()
+  const prefixed=shortcutPrefix&&now-shortcutPrefix<1500
+  shortcutPrefix=0
+  const key=e.key.toLowerCase()
+  if(prefixed&&shortcutNavMap[key]){navigateTo(shortcutNavMap[key]);e.preventDefault();return}
+  if(key==='g'){shortcutPrefix=now;e.preventDefault();return}
+  if(key===' '){call(getPlayerStatus()==='playing'?'/pause':'/play','POST');e.preventDefault();return}
+  if(key==='n'){call('/skip-next','POST');e.preventDefault();return}
+  if(key==='p'){call('/skip-prev','POST');e.preventDefault();return}
+  if(key==='r'){refreshAll();e.preventDefault();return}
+  if(key==='t'){toggleTheme();e.preventDefault();return}
+  if(e.key==='?'){showShortcutHelp();e.preventDefault();return}
 })
 </script>
 </body>

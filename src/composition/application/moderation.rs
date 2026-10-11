@@ -38,31 +38,55 @@ impl ModerationVoteContext {
     fn open(self) -> Result<AppModerationVotePort> {
         // Subscribe before requesting a fresh frame so nothing after the baseline is lost.
         // This queue is independent of ordinary command delivery and other votes.
-        let subscriber = self.shared_ocr.subscribe()?;
+        let subscriber = self.shared_ocr.subscribe_chat(ChatIdentity::PrimaryHall)?;
         let baseline = self.fresh_snapshot()?;
         AppModerationVotePort::from_baseline(self, subscriber, baseline)
     }
 
     fn fresh_snapshot(&self) -> Result<ChatOcrSnapshot> {
-        let mut refresh = self.shared_ocr.request_refresh()?;
         let deadline = Instant::now() + self.baseline_timeout;
-        let baseline = loop {
+        self.fresh_snapshot_until(deadline)?
+            .ok_or_else(|| anyhow::anyhow!("等待共享聊天管理投票基线超时"))
+    }
+
+    fn fresh_snapshot_until(&self, deadline: Instant) -> Result<Option<ChatOcrSnapshot>> {
+        if !self.running.load(AtomicOrdering::SeqCst) {
+            anyhow::bail!("运行已停止，已结束管理投票");
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let mut refresh = self.shared_ocr.request_refresh()?;
+        loop {
             if !self.running.load(AtomicOrdering::SeqCst) {
                 anyhow::bail!("运行已停止，已结束管理投票");
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                anyhow::bail!("等待共享聊天管理投票基线超时");
+                return Ok(None);
             }
             match self
                 .shared_ocr
                 .wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50)))
             {
-                Ok(Some(snapshot)) => break snapshot,
+                Ok(Some(snapshot)) => {
+                    if let Some(next) = self
+                        .shared_ocr
+                        .refresh_after_other_hall_panel(&ChatIdentity::PrimaryHall, &snapshot)?
+                    {
+                        refresh = next;
+                        continue;
+                    }
+                    if snapshot.chat != ChatIdentity::PrimaryHall {
+                        refresh = self.shared_ocr.request_refresh()?;
+                        continue;
+                    }
+                    return Ok(Some(snapshot));
+                }
                 Ok(None) => {}
                 Err(error) if error.downcast_ref::<NoChatRefreshError>().is_some() => {
                     // No chat is a transient view gap, not an OCR failure. Rearm
-                    // the capture fence without extending the overall deadline.
+                    // the capture fence without extending the caller's deadline.
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if !remaining.is_zero() && self.running.load(AtomicOrdering::SeqCst) {
                         refresh = self.shared_ocr.request_refresh()?;
@@ -71,8 +95,7 @@ impl ModerationVoteContext {
                 }
                 Err(error) => return Err(error).context("管理投票共享 OCR 基线失败"),
             }
-        };
-        Ok(baseline)
+        }
     }
 }
 
@@ -116,8 +139,11 @@ impl AppModerationVotePort {
             .read()
             .context("管理投票共享 OCR 读取失败")?
         {
+            if crate::observation::chat::other_hall_panel(&self.baseline.chat, &snapshot.chat) {
+                continue;
+            }
             if snapshot.chat != self.baseline.chat {
-                anyhow::bail!("管理投票共享 OCR 会话已改变");
+                continue;
             }
             if snapshot.captured_at <= self.baseline.captured_at {
                 continue;
@@ -182,18 +208,24 @@ impl ModerationVotePort for AppModerationVotePort {
     }
 
     fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>> {
+        let deadline = Instant::now() + self.context.baseline_timeout;
+        self.poll_visible_friend_messages_until(deadline)
+    }
+
+    fn poll_visible_friend_messages_until(&mut self, deadline: Instant) -> Result<Vec<String>> {
         let result = (|| {
             // An unchanged view may be fingerprint-cached by the observer. Request
             // genuine fresh OCR samples for the service's stable-vote threshold.
             let votes = self.read_votes()?;
-            if !votes.is_empty() {
+            if !votes.is_empty() || Instant::now() >= deadline {
                 return Ok(votes);
             }
-            self.context.fresh_snapshot()?;
+            if self.context.fresh_snapshot_until(deadline)?.is_none() {
+                return Ok(Vec::new());
+            }
             self.read_votes()
         })();
-        // The service retries scan errors and otherwise allows an unopposed timeout.
-        // A broken observation stream must end the vote rather than approve it.
+        // Real capture failures end the vote; an expected deadline expiry does not.
         if result.is_err() {
             self.failed = true;
         }
@@ -517,7 +549,7 @@ mod tests {
     }
 
     fn shared_vote_port(shared: &SharedChatOcr) -> AppModerationVotePort {
-        let subscriber = shared.subscribe().unwrap();
+        let subscriber = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
         let baseline = shared
             .publish(
                 Instant::now(),
@@ -527,6 +559,85 @@ mod tests {
             .unwrap();
         AppModerationVotePort::from_baseline(shared_vote_context(shared), subscriber, baseline)
             .unwrap()
+    }
+
+    #[test]
+    fn moderation_vote_open_rearms_after_secondary_panel_baseline() {
+        let shared = SharedChatOcr::new();
+        let publisher = shared.clone();
+        let publish_frames = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while publisher.pending_refresh().unwrap().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "initial vote refresh was not requested"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            publisher
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::SecondaryHall,
+                    vec![shared_vote_input("panel transition", "blue", 10)],
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while publisher.pending_refresh().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "vote refresh was not rearmed");
+                thread::sleep(Duration::from_millis(2));
+            }
+            publisher
+                .publish_no_chat(Instant::now(), "transient view gap")
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while publisher.pending_refresh().unwrap().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "vote refresh was not rearmed after no-chat"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            publisher
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PrimaryHall,
+                    vec![shared_vote_input("baseline", "blue", 10)],
+                )
+                .unwrap();
+        });
+        let context = ModerationVoteContext {
+            running: Arc::new(AtomicBool::new(true)),
+            shared_ocr: shared.clone(),
+            baseline_timeout: Duration::from_secs(2),
+        };
+        let mut port = context.open().unwrap();
+        publish_frames.join().unwrap();
+        assert_eq!(port.baseline.chat, ChatIdentity::PrimaryHall);
+
+        shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::SecondaryHall,
+                vec![shared_vote_input("panel @同意", "pink", 20)],
+            )
+            .unwrap();
+        assert!(port.read_votes().unwrap().is_empty());
+        for _ in 0..2 {
+            shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PrimaryHall,
+                    vec![
+                        shared_vote_input("baseline", "blue", 10),
+                        shared_vote_input("[甲]：@同意", "pink", 30),
+                    ],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            port.read_votes().unwrap(),
+            vec!["[甲]：@同意", "[甲]：@同意"]
+        );
     }
 
     #[test]
@@ -647,41 +758,93 @@ mod tests {
     }
 
     #[test]
-    fn shared_vote_chat_change_after_view_disappears_still_ends_vote() {
+    fn shared_vote_waits_through_long_foreign_state_until_primary_returns() {
         let shared = SharedChatOcr::new();
         let mut port = shared_vote_port(&shared);
         shared
             .publish_no_chat(Instant::now(), "temporary panel transition")
             .unwrap();
+        for _ in 0..32 {
+            shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PublicChannel,
+                    vec![shared_vote_input("[甲]：@同意", "pink", 10)],
+                )
+                .unwrap();
+        }
+        assert!(port.read_votes().unwrap().is_empty());
+        assert!(port.is_running());
+
         shared
             .publish(
                 Instant::now(),
-                ChatIdentity::SecondaryHall,
-                vec![shared_vote_input("[甲]：@同意", "pink", 10)],
+                ChatIdentity::PrimaryHall,
+                vec![shared_vote_input("[旧]：@同", "pink", 10)],
             )
             .unwrap();
-        assert!(port.poll_visible_friend_messages().is_err());
-        assert!(!port.is_running());
-        assert!(port.context.running.load(AtomicOrdering::SeqCst));
+        assert!(port.read_votes().unwrap().is_empty());
+        for _ in 0..2 {
+            shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PrimaryHall,
+                    vec![
+                        shared_vote_input("[旧]：@同", "pink", 10),
+                        shared_vote_input("[甲]：@同意", "pink", 30),
+                    ],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            port.read_votes().unwrap(),
+            vec!["[甲]：@同意", "[甲]：@同意"]
+        );
+        assert!(port.is_running());
+    }
+
+    #[test]
+    fn active_vote_reacquisition_uses_the_vote_deadline_not_baseline_timeout() {
+        let shared = SharedChatOcr::new();
+        let mut port = shared_vote_port(&shared);
+        port.context.baseline_timeout = Duration::from_millis(1);
+        let publisher = shared.clone();
+        let publish_frames = thread::spawn(move || {
+            for _ in 0..32 {
+                wait_for_vote_refresh(&publisher);
+                publisher
+                    .publish(Instant::now(), ChatIdentity::PublicChannel, vec![])
+                    .unwrap();
+            }
+            wait_for_vote_refresh(&publisher);
+            publisher
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PrimaryHall,
+                    vec![shared_vote_input("restored baseline", "blue", 10)],
+                )
+                .unwrap();
+        });
+        let vote_deadline = Instant::now() + Duration::from_secs(2);
+
+        assert!(
+            port.poll_visible_friend_messages_until(vote_deadline)
+                .unwrap()
+                .is_empty()
+        );
+        publish_frames.join().unwrap();
+        assert!(port.is_running());
     }
 
     #[test]
     fn shared_vote_stream_failures_end_vote_instead_of_allowing_timeout() {
-        for change_chat in [false, true] {
-            let shared = SharedChatOcr::new();
-            let mut port = shared_vote_port(&shared);
-            if change_chat {
-                shared
-                    .publish(Instant::now(), ChatIdentity::SecondaryHall, vec![])
-                    .unwrap();
-            } else {
-                shared.report_failure("OCR unavailable").unwrap();
-            }
-            assert!(port.poll_visible_friend_messages().is_err());
-            assert!(!port.is_running());
-            // Only this vote stops; the application-wide running flag is untouched.
-            assert!(port.context.running.load(AtomicOrdering::SeqCst));
-        }
+        let shared = SharedChatOcr::new();
+        let mut port = shared_vote_port(&shared);
+        shared.report_failure("OCR unavailable").unwrap();
+        assert!(port.poll_visible_friend_messages().is_err());
+        assert!(!port.is_running());
+        // Only this vote stops; the application-wide running flag is untouched.
+        assert!(port.context.running.load(AtomicOrdering::SeqCst));
     }
 
     fn wait_for_vote_refresh(shared: &SharedChatOcr) {
@@ -740,8 +903,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_vote_refresh_retry_preserves_real_failure_and_chat_change() {
-        for change_chat in [false, true] {
+    fn shared_vote_refresh_retry_preserves_real_failure_and_waits_through_transitions() {
+        for transition in [false, true] {
             let shared = SharedChatOcr::new();
             let mut port = shared_vote_port(&shared);
             port.context.baseline_timeout = Duration::from_secs(2);
@@ -754,17 +917,32 @@ mod tests {
                 .publish_no_chat(Instant::now(), "same failure text")
                 .unwrap();
             wait_for_vote_refresh(&shared);
-            if change_chat {
+            if transition {
+                for _ in 0..32 {
+                    shared
+                        .publish(Instant::now(), ChatIdentity::PublicChannel, vec![])
+                        .unwrap();
+                    wait_for_vote_refresh(&shared);
+                }
                 shared
-                    .publish(Instant::now(), ChatIdentity::SecondaryHall, vec![])
+                    .publish(
+                        Instant::now(),
+                        ChatIdentity::PrimaryHall,
+                        vec![shared_vote_input("restored baseline", "blue", 10)],
+                    )
                     .unwrap();
             } else {
                 // Identical reason text must not turn a genuine OCR failure into a retry.
                 shared.report_failure("same failure text").unwrap();
             }
             let (port, result) = worker.join().unwrap();
-            assert!(result.is_err());
-            assert!(!port.is_running());
+            if transition {
+                assert!(result.unwrap().is_empty());
+                assert!(port.is_running());
+            } else {
+                assert!(result.is_err());
+                assert!(!port.is_running());
+            }
             assert!(port.context.running.load(AtomicOrdering::SeqCst));
         }
     }
@@ -824,9 +1002,9 @@ mod tests {
             finished_on_deadline,
             "no-chat retries extended the refresh deadline"
         );
-        assert!(gaps > 1, "test must exercise consecutive no-chat refreshes");
-        assert!(result.is_err());
-        assert!(!port.is_running());
+        assert!(gaps >= 1, "test must exercise a no-chat refresh");
+        assert!(result.unwrap().is_empty());
+        assert!(port.is_running());
     }
 
     #[test]

@@ -14,6 +14,8 @@ use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use url::Url;
 
+use crate::catalog::ImportedPlaylist;
+use crate::catalog::playlist_import::{resolve_share_url, response_json};
 use crate::catalog::{
     AccountStatusCache, CatalogError, PlaybackEligibility, ProviderAccountStatus,
     ProviderSearchCandidate, SourceAdapter,
@@ -21,6 +23,7 @@ use crate::catalog::{
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::{TimedLyrics, parse_lrc_pair};
+use crate::model::{PlayableTrack, TrackKey, TrackMetadata, TrackRef};
 
 const SEARCH_URL: &str = "https://music.163.com/api/search/get";
 const PROVIDER: &str = "netease";
@@ -44,6 +47,69 @@ const WEAPI_RSA_E: &str = "010001";
 const WEAPI_RSA_N: &str = "00e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7";
 
 /// AES-128-CBC 加密（PKCS7 填充，固定 IV），返回 base64。
+fn netease_import_track(raw: &Value) -> Result<PlayableTrack, CatalogError> {
+    let id = raw
+        .get("id")
+        .map(Value::to_string)
+        .map(|value| value.trim_matches('"').to_owned())
+        .filter(|value| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
+        .ok_or_else(|| CatalogError::InvalidResponse("网易云曲目包含无效标识".to_owned()))?;
+    let title = raw
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CatalogError::InvalidResponse("网易云曲目缺少名称".to_owned()))?;
+    let artists = raw
+        .get("ar")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("name").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(PlayableTrack {
+        track_ref: TrackRef {
+            key: TrackKey::new(crate::catalog::ProviderId::Netease, id)
+                .map_err(|_| CatalogError::InvalidResponse("网易云曲目标识无效".to_owned()))?,
+            resolver_locator: None,
+        },
+        metadata: TrackMetadata {
+            title: title.to_owned(),
+            artists,
+            album: raw
+                .pointer("/al/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            duration_ms: raw.get("dt").and_then(Value::as_u64),
+        },
+    })
+}
+
+#[cfg(test)]
+mod playlist_import_tests {
+    use super::*;
+
+    #[test]
+    fn maps_netease_song_detail_fields_without_expiring_playback_urls() {
+        let track = netease_import_track(&serde_json::json!({
+            "id": 412187499,
+            "name": "网易云曲目",
+            "ar": [{"name":"歌手"}],
+            "al": {"name":"专辑"},
+            "dt": 263837,
+            "url": "https://expired.invalid/audio",
+        }))
+        .unwrap();
+        assert_eq!(track.track_ref.key.id, "412187499");
+        assert_eq!(track.track_ref.resolver_locator, None);
+        assert_eq!(track.metadata.duration_ms, Some(263_837));
+        assert_eq!(track.metadata.album.as_deref(), Some("专辑"));
+    }
+}
+
 fn weapi_aes_encrypt_base64(text: &str, key: &[u8]) -> Result<String, CatalogError> {
     let encryptor = Encryptor::<Aes128>::new_from_slices(key, WEAPI_AES_IV)
         .map_err(|error| CatalogError::InvalidResponse(format!("weapi AES 初始化失败: {error}")))?;
@@ -131,6 +197,162 @@ impl NeteaseAdapter {
                 std::sync::Mutex::new(AccountStatusCache::default()),
             ),
         })
+    }
+
+    pub async fn import_playlist(&self, input: &str) -> Result<ImportedPlaylist, CatalogError> {
+        let id = resolve_share_url(input, PROVIDER).await?;
+        let detail_url = Url::parse("https://music.163.com/api/v6/playlist/detail")
+            .map_err(|_| CatalogError::InvalidResponse("网易云歌单接口地址无效".to_owned()))?;
+        let mut detail_request = self
+            .client
+            .get(detail_url)
+            .query(&[("id", id.as_str()), ("n", "1000")])
+            .header("Referer", "https://music.163.com/")
+            .header("User-Agent", "Mozilla/5.0");
+        if let Ok(Some(credential)) = self.credentials.get(PROVIDER) {
+            detail_request = detail_request.header("Cookie", cookie_header(credential.cookies()));
+        }
+        let detail = detail_request
+            .send()
+            .await
+            .map_err(|_| CatalogError::Transient("网易云歌单读取失败".to_owned()))?;
+        if !detail.status().is_success() {
+            return Err(CatalogError::Transient("网易云歌单读取失败".to_owned()));
+        }
+        let detail = response_json(detail, "网易云").await?;
+        if detail.get("code").and_then(Value::as_i64) != Some(200) {
+            return Err(CatalogError::Unavailable(
+                "网易云歌单不可用或需要登录".to_owned(),
+            ));
+        }
+        let playlist = detail
+            .get("playlist")
+            .filter(|value| !value.is_null())
+            .ok_or_else(|| CatalogError::Unavailable("网易云歌单不存在".to_owned()))?;
+        let title = playlist
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| CatalogError::InvalidResponse("网易云歌单缺少名称".to_owned()))?
+            .to_owned();
+        let creator = playlist
+            .pointer("/creator/nickname")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        let raw_ids = playlist
+            .get("trackIds")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CatalogError::InvalidResponse("网易云歌单缺少完整曲目标识".to_owned())
+            })?;
+        if raw_ids.len() > 3000 {
+            return Err(CatalogError::InvalidResponse(
+                "网易云歌单超过单次导入上限 3000 首".to_owned(),
+            ));
+        }
+        if playlist
+            .get("trackCount")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count as usize != raw_ids.len())
+        {
+            return Err(CatalogError::InvalidResponse(
+                "网易云歌单曲目标识不完整，未导入任何内容".to_owned(),
+            ));
+        }
+        let mut ids = Vec::with_capacity(raw_ids.len());
+        for entry in raw_ids {
+            let raw = entry.get("id").map(Value::to_string).ok_or_else(|| {
+                CatalogError::InvalidResponse("网易云歌单包含无效曲目标识".to_owned())
+            })?;
+            let id = raw.trim_matches('"');
+            if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_digit()) {
+                return Err(CatalogError::InvalidResponse(
+                    "网易云歌单包含无效曲目标识".to_owned(),
+                ));
+            }
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_owned());
+            }
+        }
+        let tracks = self.netease_playlist_tracks(&ids).await?;
+        Ok(ImportedPlaylist {
+            provider: PROVIDER.to_owned(),
+            id,
+            title,
+            creator,
+            tracks,
+        })
+    }
+
+    async fn netease_playlist_tracks(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<PlayableTrack>, CatalogError> {
+        let endpoint = Url::parse("https://music.163.com/api/v3/song/detail")
+            .map_err(|_| CatalogError::InvalidResponse("网易云曲目接口地址无效".to_owned()))?;
+        let mut tracks = Vec::with_capacity(ids.len());
+        let batch_count = ids.len().div_ceil(300);
+        for (batch_index, batch) in ids.chunks(300).enumerate() {
+            let encoded = serde_json::to_string(
+                &batch
+                    .iter()
+                    .map(|id| serde_json::json!({"id": id}))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_| CatalogError::InvalidResponse("网易云曲目标识编码失败".to_owned()))?;
+            let mut request = self
+                .client
+                .post(endpoint.clone())
+                .header("Referer", "https://music.163.com/")
+                .header("User-Agent", "Mozilla/5.0")
+                .form(&[("c", encoded.as_str()), ("csrf_token", "")]);
+            if let Ok(Some(credential)) = self.credentials.get(PROVIDER) {
+                request = request.header("Cookie", cookie_header(credential.cookies()));
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|_| CatalogError::Transient("网易云曲目详情读取失败".to_owned()))?;
+            if !response.status().is_success() {
+                return Err(CatalogError::Transient("网易云曲目详情读取失败".to_owned()));
+            }
+            let response = response_json(response, "网易云").await?;
+            if response.get("code").and_then(Value::as_i64) != Some(200) {
+                return Err(CatalogError::Unavailable("网易云曲目详情不可用".to_owned()));
+            }
+            let songs = response
+                .get("songs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    CatalogError::InvalidResponse("网易云曲目详情缺少歌曲列表".to_owned())
+                })?;
+            let mapped = songs
+                .iter()
+                .map(netease_import_track)
+                .collect::<Result<Vec<_>, _>>()?;
+            tracks.extend(mapped);
+            if batch_index + 1 < batch_count {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        if tracks.len() != ids.len() {
+            return Err(CatalogError::InvalidResponse(
+                "网易云曲目详情不完整，未导入任何内容".to_owned(),
+            ));
+        }
+        let mut by_id = tracks
+            .into_iter()
+            .map(|track| (track.track_ref.key.id.clone(), track))
+            .collect::<std::collections::HashMap<_, _>>();
+        ids.iter()
+            .map(|id| {
+                by_id.remove(id).ok_or_else(|| {
+                    CatalogError::InvalidResponse("网易云曲目详情缺少歌曲".to_owned())
+                })
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -483,6 +705,10 @@ impl NeteaseAdapter {
 
 #[async_trait]
 impl SourceAdapter for NeteaseAdapter {
+    async fn import_playlist(&self, input: &str) -> Result<ImportedPlaylist, CatalogError> {
+        NeteaseAdapter::import_playlist(self, input).await
+    }
+
     async fn validate_credential(
         &self,
         candidate: &ProviderCredential,

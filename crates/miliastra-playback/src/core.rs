@@ -205,6 +205,17 @@ pub struct PlaybackCore {
 }
 
 impl PlaybackCore {
+    pub async fn import_playlist(
+        &self,
+        provider: &str,
+        input: &str,
+    ) -> Result<crate::catalog::ImportedPlaylist, PlaybackCoreError> {
+        self.catalog
+            .import_playlist(provider, input)
+            .await
+            .map_err(PlaybackCoreError::Catalog)
+    }
+
     #[cfg(test)]
     pub fn new(
         catalog: SourceCatalog,

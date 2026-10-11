@@ -58,6 +58,18 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
         let application = self.runtime.playback.playback_application.clone();
         application.play_structured_track(track, self.runtime)
     }
+
+    fn import_playlist(
+        &mut self,
+        provider: &str,
+        input: &str,
+    ) -> Result<miliastra_playback::PlaylistImportOperation> {
+        self.runtime
+            .playback
+            .native_playback
+            .import_playlist(provider, input)
+            .map_err(anyhow::Error::from)
+    }
 }
 
 struct DeferredCardGamePort {
@@ -325,7 +337,19 @@ impl ApplicationRuntime {
         let application = self.business.playlist_application.clone();
         let mut port = PlaylistRuntimePlaybackPort { runtime: self };
         let messages = application.execute(&actor, command, &mut port, now, now_epoch)?;
-        self.log_executed_command(parsed, "playlist")?;
+        if matches!(
+            command,
+            crate::features::playlist::PlaylistCommand::Import { .. }
+        ) {
+            self.log_executed_command_fields(
+                &parsed.message_type,
+                command_username(parsed),
+                "@导入歌单<链接已隐藏>",
+                "playlist",
+            )?;
+        } else {
+            self.log_executed_command(parsed, "playlist")?;
+        }
         let messages: Vec<_> = messages.iter().map(String::as_str).collect();
         self.reply_batch(&messages, 0)
     }

@@ -399,7 +399,7 @@ impl Drop for ChatObservationExclusiveGuard {
 #[cfg(test)]
 mod dispatch_lease_tests {
     use super::*;
-    use crate::observation::chat::{SharedChatInput, SharedChatOcr};
+    use crate::observation::chat::{ChatTimeline, RecognizedChatMessage};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         mpsc,
@@ -449,7 +449,7 @@ mod dispatch_lease_tests {
     #[test]
     fn live_shared_input_consumed_in_exclusive_does_not_enter_normal_queue_after_release() {
         let stream = ChatObservationShared::new();
-        let ocr = SharedChatOcr::new();
+        let ocr = ChatTimeline::new();
         let business = ocr.subscribe_business().unwrap();
         let decisions = ocr.subscribe().unwrap();
         let exclusive = stream.begin_exclusive().unwrap();
@@ -457,7 +457,7 @@ mod dispatch_lease_tests {
             .publish(
                 Instant::now(),
                 ChatIdentity::SecondaryHall,
-                vec![SharedChatInput {
+                vec![RecognizedChatMessage {
                     text: "@1".into(),
                     sender: Some("甲".into()),
                     raw_sender: Some("甲".into()),
@@ -498,7 +498,7 @@ mod dispatch_lease_tests {
             .publish(
                 Instant::now(),
                 ChatIdentity::SecondaryHall,
-                vec![SharedChatInput {
+                vec![RecognizedChatMessage {
                     text: "@点歌晴天".into(),
                     sender: Some("甲".into()),
                     raw_sender: Some("甲".into()),

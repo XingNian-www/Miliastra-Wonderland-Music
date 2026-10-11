@@ -20,7 +20,7 @@ use crate::features::moderation::{
 };
 use crate::interfaces::chat as command;
 use crate::observation::chat::{
-    ChatIdentity, ChatOcrSnapshot, NoChatRefreshError, SharedChatOcr, SharedChatSubscriber,
+    ChatIdentity, ChatTimeline, ChatTimelineSnapshot, ChatTimelineSubscriber, NoChatRefreshError,
 };
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::ui::InputCertainty;
@@ -30,7 +30,7 @@ use crate::ui::routines::{
 
 struct ModerationVoteContext {
     running: Arc<AtomicBool>,
-    shared_ocr: SharedChatOcr,
+    chat_timeline: ChatTimeline,
     baseline_timeout: Duration,
 }
 
@@ -38,25 +38,27 @@ impl ModerationVoteContext {
     fn open(self) -> Result<AppModerationVotePort> {
         // Subscribe before requesting a fresh frame so nothing after the baseline is lost.
         // This queue is independent of ordinary command delivery and other votes.
-        let subscriber = self.shared_ocr.subscribe_chat(ChatIdentity::PrimaryHall)?;
+        let subscriber = self
+            .chat_timeline
+            .subscribe_chat(ChatIdentity::PrimaryHall)?;
         let baseline = self.fresh_snapshot()?;
         AppModerationVotePort::from_baseline(self, subscriber, baseline)
     }
 
-    fn fresh_snapshot(&self) -> Result<ChatOcrSnapshot> {
+    fn fresh_snapshot(&self) -> Result<ChatTimelineSnapshot> {
         let deadline = Instant::now() + self.baseline_timeout;
         self.fresh_snapshot_until(deadline)?
             .ok_or_else(|| anyhow::anyhow!("等待共享聊天管理投票基线超时"))
     }
 
-    fn fresh_snapshot_until(&self, deadline: Instant) -> Result<Option<ChatOcrSnapshot>> {
+    fn fresh_snapshot_until(&self, deadline: Instant) -> Result<Option<ChatTimelineSnapshot>> {
         if !self.running.load(AtomicOrdering::SeqCst) {
             anyhow::bail!("运行已停止，已结束管理投票");
         }
         if Instant::now() >= deadline {
             return Ok(None);
         }
-        let mut refresh = self.shared_ocr.request_refresh()?;
+        let mut refresh = self.chat_timeline.request_refresh()?;
         loop {
             if !self.running.load(AtomicOrdering::SeqCst) {
                 anyhow::bail!("运行已停止，已结束管理投票");
@@ -66,19 +68,19 @@ impl ModerationVoteContext {
                 return Ok(None);
             }
             match self
-                .shared_ocr
+                .chat_timeline
                 .wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50)))
             {
                 Ok(Some(snapshot)) => {
                     if let Some(next) = self
-                        .shared_ocr
+                        .chat_timeline
                         .refresh_after_other_hall_panel(&ChatIdentity::PrimaryHall, &snapshot)?
                     {
                         refresh = next;
                         continue;
                     }
                     if snapshot.chat != ChatIdentity::PrimaryHall {
-                        refresh = self.shared_ocr.request_refresh()?;
+                        refresh = self.chat_timeline.request_refresh()?;
                         continue;
                     }
                     return Ok(Some(snapshot));
@@ -89,7 +91,7 @@ impl ModerationVoteContext {
                     // the capture fence without extending the caller's deadline.
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if !remaining.is_zero() && self.running.load(AtomicOrdering::SeqCst) {
-                        refresh = self.shared_ocr.request_refresh()?;
+                        refresh = self.chat_timeline.request_refresh()?;
                         thread::sleep(remaining.min(Duration::from_millis(50)));
                     }
                 }
@@ -101,8 +103,8 @@ impl ModerationVoteContext {
 
 struct AppModerationVotePort {
     context: ModerationVoteContext,
-    subscriber: SharedChatSubscriber,
-    baseline: ChatOcrSnapshot,
+    subscriber: ChatTimelineSubscriber,
+    baseline: ChatTimelineSnapshot,
     baseline_sequence: u64,
     failed: bool,
 }
@@ -110,8 +112,8 @@ struct AppModerationVotePort {
 impl AppModerationVotePort {
     fn from_baseline(
         context: ModerationVoteContext,
-        subscriber: SharedChatSubscriber,
-        baseline: ChatOcrSnapshot,
+        subscriber: ChatTimelineSubscriber,
+        baseline: ChatTimelineSnapshot,
     ) -> Result<Self> {
         if baseline.chat != ChatIdentity::PrimaryHall {
             anyhow::bail!("管理投票共享 OCR 基线不在一级大厅");
@@ -461,7 +463,7 @@ impl ApplicationRuntime {
             .map_err(|_| anyhow::anyhow!("管理投票线程句柄锁已损坏"))?;
         let vote_context = ModerationVoteContext {
             running: Arc::clone(&self.lifecycle.running),
-            shared_ocr: self.ui.shared_ocr.clone(),
+            chat_timeline: self.ui.chat_timeline.clone(),
             baseline_timeout: Duration::from_millis(
                 self.lifecycle.config.timing.decision.timeout_ms,
             ),
@@ -530,8 +532,8 @@ mod tests {
         text: &str,
         color: &str,
         y: i32,
-    ) -> crate::observation::chat::SharedChatInput {
-        crate::observation::chat::SharedChatInput {
+    ) -> crate::observation::chat::RecognizedChatMessage {
+        crate::observation::chat::RecognizedChatMessage {
             text: text.into(),
             sender: None,
             raw_sender: None,
@@ -540,15 +542,15 @@ mod tests {
         }
     }
 
-    fn shared_vote_context(shared: &SharedChatOcr) -> ModerationVoteContext {
+    fn shared_vote_context(shared: &ChatTimeline) -> ModerationVoteContext {
         ModerationVoteContext {
             running: Arc::new(AtomicBool::new(true)),
-            shared_ocr: shared.clone(),
+            chat_timeline: shared.clone(),
             baseline_timeout: Duration::ZERO,
         }
     }
 
-    fn shared_vote_port(shared: &SharedChatOcr) -> AppModerationVotePort {
+    fn shared_vote_port(shared: &ChatTimeline) -> AppModerationVotePort {
         let subscriber = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
         let baseline = shared
             .publish(
@@ -563,7 +565,7 @@ mod tests {
 
     #[test]
     fn moderation_vote_open_rearms_after_secondary_panel_baseline() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let publisher = shared.clone();
         let publish_frames = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -607,7 +609,7 @@ mod tests {
         });
         let context = ModerationVoteContext {
             running: Arc::new(AtomicBool::new(true)),
-            shared_ocr: shared.clone(),
+            chat_timeline: shared.clone(),
             baseline_timeout: Duration::from_secs(2),
         };
         let mut port = context.open().unwrap();
@@ -642,7 +644,7 @@ mod tests {
 
     #[test]
     fn shared_votes_retain_pink_samples_and_revisions_without_consuming_business() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let business = shared.subscribe().unwrap();
         let mut port = shared_vote_port(&shared);
         let first = shared
@@ -685,7 +687,7 @@ mod tests {
 
     #[test]
     fn shared_vote_rebinds_same_chat_without_replaying_restored_votes() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let mut port = shared_vote_port(&shared);
         for _ in 0..2 {
             shared
@@ -759,7 +761,7 @@ mod tests {
 
     #[test]
     fn shared_vote_waits_through_long_foreign_state_until_primary_returns() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let mut port = shared_vote_port(&shared);
         shared
             .publish_no_chat(Instant::now(), "temporary panel transition")
@@ -805,7 +807,7 @@ mod tests {
 
     #[test]
     fn active_vote_reacquisition_uses_the_vote_deadline_not_baseline_timeout() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let mut port = shared_vote_port(&shared);
         port.context.baseline_timeout = Duration::from_millis(1);
         let publisher = shared.clone();
@@ -838,7 +840,7 @@ mod tests {
 
     #[test]
     fn shared_vote_stream_failures_end_vote_instead_of_allowing_timeout() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let mut port = shared_vote_port(&shared);
         shared.report_failure("OCR unavailable").unwrap();
         assert!(port.poll_visible_friend_messages().is_err());
@@ -847,7 +849,7 @@ mod tests {
         assert!(port.context.running.load(AtomicOrdering::SeqCst));
     }
 
-    fn wait_for_vote_refresh(shared: &SharedChatOcr) {
+    fn wait_for_vote_refresh(shared: &ChatTimeline) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if shared.pending_refresh().unwrap().is_some() {
@@ -863,7 +865,7 @@ mod tests {
 
     #[test]
     fn shared_vote_refresh_recovers_from_typed_no_chat_without_replaying_votes() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let mut port = shared_vote_port(&shared);
         port.context.baseline_timeout = Duration::from_secs(2);
         let worker = thread::spawn(move || {
@@ -905,7 +907,7 @@ mod tests {
     #[test]
     fn shared_vote_refresh_retry_preserves_real_failure_and_waits_through_transitions() {
         for transition in [false, true] {
-            let shared = SharedChatOcr::new();
+            let shared = ChatTimeline::new();
             let mut port = shared_vote_port(&shared);
             port.context.baseline_timeout = Duration::from_secs(2);
             let worker = thread::spawn(move || {
@@ -949,7 +951,7 @@ mod tests {
 
     #[test]
     fn shared_vote_refresh_retry_remains_responsive_to_runtime_stop() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let mut port = shared_vote_port(&shared);
         port.context.baseline_timeout = Duration::from_secs(2);
         let running = Arc::clone(&port.context.running);
@@ -972,7 +974,7 @@ mod tests {
 
     #[test]
     fn shared_vote_repeated_no_chat_keeps_original_refresh_deadline() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let mut port = shared_vote_port(&shared);
         port.context.baseline_timeout = Duration::from_millis(150);
         let running = Arc::clone(&port.context.running);
@@ -1009,7 +1011,7 @@ mod tests {
 
     #[test]
     fn shared_vote_open_rejects_stale_baseline_and_cancelled_runtime() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         shared
             .publish(Instant::now(), ChatIdentity::PrimaryHall, vec![])
             .unwrap();
@@ -1021,7 +1023,7 @@ mod tests {
 
     #[test]
     fn shared_vote_baseline_binding_preserves_already_queued_new_votes() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let subscriber = shared.subscribe().unwrap();
         let refresh = shared.request_refresh().unwrap();
         let baseline = shared

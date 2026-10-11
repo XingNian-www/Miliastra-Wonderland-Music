@@ -50,3 +50,6 @@
 # 实机证据帧(1099 个文件 / 约 626 MB)属于可重采的过程产物,随 technical-docs/ 一起不入库;
 # 判据与复现方法见 technical-docs/ui-state-criteria.md 与 technical-docs/ui-state-machine.md。
 /.bitfun/search/flashgrep-index/
+
+# Linux 版 MNN 仅为本地测试运行时，不入库；Windows 版仍随 vendor/mnn/3.6.0/windows-x64 保留。
+/vendor/mnn/3.6.0/linux-x64/

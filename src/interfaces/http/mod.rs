@@ -1,4 +1,5 @@
 mod ports;
+pub(crate) mod facade;
 pub(crate) use ports::HttpDebugRunRequest;
 mod protocol;
 

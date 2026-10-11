@@ -140,6 +140,7 @@ impl SequenceFreshness {
             };
             let mut decision = all(phase, Freshness::Unknown);
             if kind == BaselineKind::HallWorldSwitch {
+                // 命令来源只有 blue（大厅）与 pink（好友）；金色/黄色 marker 仅用于 OCR 分块，不在此列。
                 for (slot, bubble) in decision.freshness.iter_mut().zip(frame.bubbles) {
                     if bubble.message_type == "blue" {
                         *slot = Freshness::New;

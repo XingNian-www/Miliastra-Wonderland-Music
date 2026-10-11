@@ -6,8 +6,9 @@ use super::friend_delivery::{
     before_input_failure, capture_normalized, restore_residency, wait_ms,
 };
 use crate::observation::chat::{
-    ChatIdentity, ChatOcrSnapshot, FriendUnreadLayout, SharedChatOcr, UnreadFriendHit,
-    find_unread_friend_hits, latest_incoming_fingerprint, unread_hit_still_visible,
+    ChatIdentity, ChatOcrSnapshot, FriendUnreadLayout, ObservedChatMessageId, SharedChatOcr,
+    UnreadFriendHit, find_unread_friend_hits, latest_incoming_fingerprint,
+    unread_hit_still_visible,
 };
 use crate::runtime::ocr::OcrRuntimeHandle;
 use crate::runtime::ui::{
@@ -245,6 +246,9 @@ fn process_unread(
             unreachable!("wait_shared_friend_snapshot only returns confirmed friend chats");
         };
         if request.discard_only {
+            // 初始红点清场（进入二级监听时那一次）：只建立基线、清红点，历史一律不执行。
+            // 必须在"提升最后一条命令"之前返回；清场全程还持有好友业务抑制
+            // （execute 里的 suppress_friend_business），两层都不允许它派发任何命令。
             for message in &snapshot.messages {
                 shared_ocr
                     .acknowledge_business(&message.id)
@@ -253,9 +257,24 @@ fn process_unread(
             return Ok(SecondaryUnreadEffect::Discarded);
         }
         if let Some(message) = latest_unread_message(&snapshot) {
-            shared_ocr
+            // 用户规则：进入有未读的会话时读取最后发送的那条命令，恰好一次。
+            // 提升只把这条气泡放行给共享观察的业务订阅者；这里必须确认它真的被取走，
+            // 否则 UI 事务立刻恢复大厅，这次提升就没有可消费的后续帧，最后什么都不派发。
+            let promoted = shared_ocr
                 .deliver_unread_baseline(&snapshot, &message.id)
                 .map_err(|error| after_input_failure("deliver_secondary_unread", error))?;
+            if promoted {
+                wait_promoted_unread_consumed(context, shared_ocr, &message.id, deadline)?;
+            } else {
+                // 不在首屏基线里：要么这条气泡已按常规路径交付过（成功命令锁或永久 ACK），
+                // 要么它从未进过基线，此时不会有任何派发。如实记录以区分这两种情况，
+                // 不在这里自行发明"再读一次"的规则。
+                log::warn!(
+                    "二级好友未读提升未生效（气泡不在首屏基线）: friend={} pending={}",
+                    friend_name,
+                    shared_ocr.is_business_pending(&message.id).unwrap_or(false)
+                );
+            }
             return Ok(SecondaryUnreadEffect::Message {
                 captured_at: snapshot.captured_at,
                 friend_name: friend_name.to_string(),
@@ -325,6 +344,57 @@ fn latest_unread_message(
         .filter(|message| message.message_type == "pink")
         .max_by_key(|message| message.block.y)
         .filter(|message| unread_text_is_usable(&message.text))
+}
+
+/// 等待业务订阅者取走这次未读提升。
+///
+/// 提升写入的是一份共享观察资格修订（`deliver_unread_baseline`），真正的消费发生在
+/// 监听循环的业务订阅者里。UI 事务若在提升后立刻恢复大厅，这条唯一候选就没有后续帧，
+/// 可能一直没人消费——用户规则是"进入有未读的会话读取最后发送的那条命令"，
+/// 而不是"提升了却不用"。超时不当作失败：消费方可能已按常规路径处理过同一气泡。
+fn wait_promoted_unread_consumed(
+    context: &mut UiRoutineContext<'_>,
+    shared_ocr: &SharedChatOcr,
+    id: &ObservedChatMessageId,
+    deadline: Instant,
+) -> Result<(), UiRoutineFailure> {
+    let mut token = shared_ocr
+        .request_refresh()
+        .map_err(|error| after_input_failure("refresh_secondary_unread", error))?;
+    loop {
+        if !shared_ocr
+            .is_business_pending(id)
+            .map_err(|error| after_input_failure("confirm_secondary_unread", error))?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            log::warn!("二级好友未读提升在超时前未被消费: id={id:?}");
+            return Ok(());
+        }
+        if shared_ocr
+            .wait_for_snapshot(token, Duration::ZERO)
+            .map_err(|error| after_input_failure("ocr_secondary_unread", error))?
+            .is_some()
+        {
+            token = shared_ocr
+                .request_refresh()
+                .map_err(|error| after_input_failure("refresh_secondary_unread", error))?;
+        }
+        context
+            .wait_cancellable(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(25)),
+            )
+            .map_err(|failure| {
+                UiRoutineFailure::new(
+                    InputCertainty::AfterInputUnknown,
+                    "wait_secondary_unread_message",
+                    failure.reason(),
+                )
+            })?;
+    }
 }
 
 fn fresh_friend_snapshot(snapshot: &ChatOcrSnapshot, opened_at: Instant) -> bool {
@@ -551,6 +621,36 @@ mod tests {
             .unwrap();
         // Wait for the latest bubble's OCR; never substitute a historical command.
         assert!(latest_unread_message(&waiting).is_none());
+    }
+
+    #[test]
+    fn initial_unread_clear_never_promotes_a_command() {
+        // 初始红点清场（进入二级监听那一次）只建立基线、清红点；即使屏幕上就有命令气泡，
+        // 也不能被提升成一次派发。清场期间 UI 事务持有好友业务抑制，共享观察会把看到的
+        // 气泡直接永久 ACK，因此这里既进不了未读基线，也不会变成待派发。
+        use crate::observation::chat::SharedChatInput;
+        let shared = SharedChatOcr::new();
+        let listener = shared.subscribe().unwrap();
+        let command = |text: &str, y| SharedChatInput {
+            text: text.into(),
+            sender: None,
+            raw_sender: None,
+            message_type: "pink".into(),
+            block: Rect::new(10, y, 120, 20),
+        };
+        let chat = ChatIdentity::Friend(Arc::from("clear-baseline friend"));
+        let _suppression = shared.suppress_friend_business().unwrap();
+        let snapshot = shared
+            .publish(Instant::now(), chat, vec![command("@状态", 40)])
+            .unwrap();
+        listener.read().unwrap();
+        let visible = &snapshot.messages[0];
+        // 气泡在画面上可见（因此"最后一条命令"的候选判定本身成立）……
+        assert!(latest_unread_message(&snapshot).is_some());
+        // ……但清场不允许把它提升，也不存在任何待派发状态。
+        assert!(!shared.deliver_unread_baseline(&snapshot, &visible.id).unwrap());
+        assert!(!shared.is_business_pending(&visible.id).unwrap());
+        assert!(!shared.acknowledge_business(&visible.id).unwrap());
     }
 
     #[test]

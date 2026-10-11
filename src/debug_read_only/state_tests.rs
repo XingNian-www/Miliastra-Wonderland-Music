@@ -675,6 +675,27 @@ fn versioned_lookup_cannot_regress_tasks_or_suppress_other_task_projections_and_
 }
 
 #[test]
+fn immediate_failure_status_is_retained_and_published() {
+    let observer = observer_push();
+    observer.record_immediate_with_status(
+        json!({"kind": "command", "flow": "immediatePlayback"}),
+        None,
+        "failed",
+        "handler_error; effects_may_be_partial: pause".into(),
+    );
+    let evidence = observer.read_entry("readonly-1").unwrap();
+    assert_eq!(evidence["status"]["status"], "failed");
+    assert_eq!(
+        evidence["status"]["result"],
+        "handler_error; effects_may_be_partial: pause"
+    );
+    assert_eq!(
+        observer.bus().replay_after(0)[0].payload["status"]["status"],
+        "failed"
+    );
+}
+
+#[test]
 fn queued_metadata_enrichment_is_silent_but_state_restore_and_terminal_are_published() {
     let observer = observer_push();
     observer.record_trigger(1, json!({}), None);

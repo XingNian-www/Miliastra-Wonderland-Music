@@ -10,6 +10,22 @@ use crate::features::playback::{
     QueueRemoval,
 };
 
+fn immediate_playback_evidence(
+    command: &PlaybackCommand,
+    outcome: &anyhow::Result<()>,
+) -> (&'static str, String) {
+    match outcome {
+        Ok(()) => ("completed", command.lock_key()),
+        Err(_) => (
+            "failed",
+            format!(
+                "handler_error; effects_may_be_partial: {}",
+                command.lock_key()
+            ),
+        ),
+    }
+}
+
 impl ApplicationRuntime {
     pub(super) fn stop_background_lyrics_output(&self) -> Result<bool> {
         self.business.background_commands.stop("lyrics")
@@ -25,10 +41,22 @@ impl ApplicationRuntime {
             username: command_username(parsed).to_string(),
             user_command: parsed.user_command.clone(),
         };
-        self.playback
+        let outcome = self
+            .playback
             .playback_application
             .clone()
-            .execute_command(&context, command, self)
+            .execute_command(&context, command, self);
+        // Playback commands are synchronous, but a reply/logging error may follow a
+        // player-side effect. Record the dispatch either way; failed means the handler
+        // returned an error, whose side effects may be partial.
+        let (status, result) = immediate_playback_evidence(command, &outcome);
+        crate::debug_read_only::record_command_immediate_with_status(
+            parsed,
+            "immediatePlayback",
+            status,
+            result,
+        );
+        outcome
     }
 
     pub(super) fn execute_advance_queue_task(&mut self, reason: &'static str) -> Result<()> {
@@ -406,8 +434,23 @@ fn playback_search_failure(error: PlayerSearchClientError) -> PlaybackSearchFail
 
 #[cfg(test)]
 mod tests {
-    use super::automatic_advance_allowed;
+    use super::{automatic_advance_allowed, immediate_playback_evidence};
     use crate::config::LiveConfigs;
+    use crate::features::playback::PlaybackCommand;
+
+    #[test]
+    fn partial_playback_error_is_distinguished_from_completed_command() {
+        let command = PlaybackCommand::Pause;
+        let error: anyhow::Result<()> = Err(anyhow::anyhow!("reply failed after pause"));
+        let (status, result) = immediate_playback_evidence(&command, &error);
+        assert_eq!(status, "failed");
+        assert_eq!(result, "handler_error; effects_may_be_partial: pause");
+
+        let success: anyhow::Result<()> = Ok(());
+        let (status, result) = immediate_playback_evidence(&command, &success);
+        assert_eq!(status, "completed");
+        assert_eq!(result, "pause");
+    }
 
     #[test]
     fn pending_reload_suppresses_automatic_queue_advance() {

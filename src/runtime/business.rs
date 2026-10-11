@@ -488,6 +488,10 @@ enum PlaybackRuntimeMessage {
         item: QueueItem,
         response: SyncSender<Result<QueuePushOutcome, BusinessRuntimeError>>,
     },
+    PushQueueNext {
+        item: QueueItem,
+        response: SyncSender<Result<QueuePushOutcome, BusinessRuntimeError>>,
+    },
     RemoveQueue {
         removal: QueueRemoval,
         response: SyncSender<Result<QueueRemoveOutcome, BusinessRuntimeError>>,
@@ -1200,6 +1204,15 @@ impl BusinessRuntimeHandle {
     ) -> Result<QueuePushOutcome, BusinessRuntimeError> {
         self.request(|response| {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::PushQueue { item, response })
+        })
+    }
+
+    pub(crate) fn push_playback_queue_next(
+        &self,
+        item: QueueItem,
+    ) -> Result<QueuePushOutcome, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::PushQueueNext { item, response })
         })
     }
 

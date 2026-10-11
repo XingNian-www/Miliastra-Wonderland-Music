@@ -1142,6 +1142,7 @@ impl SongRequestExecution<'_> {
             requester: request.requester.clone(),
             dedup_bypass: request.console_bypass_dedup,
             candidate_snapshot: request.candidate_snapshot.clone(),
+            playlist_auto: false,
         })?;
         if pushed.accepted {
             // 只有队首（入队后队列里唯一曲目）才立即解析音源：排在后面的曲目

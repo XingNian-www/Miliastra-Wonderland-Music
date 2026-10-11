@@ -249,6 +249,7 @@ impl HttpCommandPort for ApplicationHttpCommandFacade {
             // 与聊天路径一致：HTTP 默认不绕过去重；协议无权限/参数，不提供显式 bypass。
             dedup_bypass: false,
             candidate_snapshot: Vec::new(),
+            playlist_auto: false,
         };
         // 入队前复用播放队列统一去重策略（结构化/待解析交叉形态同样生效）。
         if self

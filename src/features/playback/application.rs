@@ -237,6 +237,7 @@ pub(crate) enum ConsumedSelection {
 enum PlaybackPurpose {
     Requested,
     Queue { stop_when_user_paused: bool },
+    Playlist { stop_when_user_paused: bool },
     Pool { stop_when_user_paused: bool },
     Repeat,
     Previous,
@@ -247,6 +248,9 @@ impl PlaybackPurpose {
     const fn stop_when_user_paused(self) -> bool {
         match self {
             Self::Queue {
+                stop_when_user_paused,
+            }
+            | Self::Playlist {
                 stop_when_user_paused,
             }
             | Self::Pool {
@@ -267,19 +271,30 @@ impl PlaybackPurpose {
     const fn allows_source_switch(self) -> bool {
         matches!(
             self,
-            Self::Requested | Self::Queue { .. } | Self::Pool { .. } | Self::Repeat
+            Self::Requested
+                | Self::Queue { .. }
+                | Self::Playlist { .. }
+                | Self::Pool { .. }
+                | Self::Repeat
         )
     }
 
     const fn replies_with_play_message(self) -> bool {
-        !matches!(self, Self::SourceRetry { .. } | Self::Pool { .. })
+        !matches!(
+            self,
+            Self::SourceRetry { .. } | Self::Playlist { .. } | Self::Pool { .. }
+        )
     }
 
     fn dedup_reply(self, selection: &PlaybackSelection) -> Option<String> {
         match self {
             Self::Requested => Some(selection.dedup_reject_message()),
             Self::Queue { .. } => Some(selection.dedup_skip_message()),
-            Self::Previous | Self::SourceRetry { .. } | Self::Pool { .. } | Self::Repeat => None,
+            Self::Previous
+            | Self::SourceRetry { .. }
+            | Self::Playlist { .. }
+            | Self::Pool { .. }
+            | Self::Repeat => None,
         }
     }
 }
@@ -319,6 +334,12 @@ pub(crate) trait PlaybackExecutionPort {
     }
     fn player_status(&mut self) -> Result<PlayerStatus>;
     fn playback_queue(&mut self) -> Result<Vec<QueueItem>>;
+    fn enqueue_playlist_item(&mut self, _item: QueueItem) -> Result<bool> {
+        Ok(false)
+    }
+    fn remove_playlist_auto_items(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// 从播放池随机挑一首，排除本轮已尝试的曲目。
     fn pick_playback_pool_track(
         &mut self,
@@ -416,12 +437,22 @@ pub(crate) const PLAY_MODE_REPEAT_ONE: u8 = 1;
 pub(crate) const PLAY_MODE_SHUFFLE: u8 = 2;
 
 #[derive(Clone, Debug)]
+struct PersonalPlaylistQueue {
+    tracks: Vec<PlayableTrack>,
+    cursor: usize,
+    shuffle_state: u64,
+    last_played_key: Option<TrackKey>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PlaybackApplication {
     config: PlaybackApplicationConfig,
     /// 播放模式(Web 运行期设置,不持久化)。
     play_mode: Arc<AtomicU8>,
     /// 最近一次成功播放的选择(单曲循环重播用)。
     last_played: Arc<Mutex<Option<PlaybackRequest>>>,
+    /// 个人歌单自动填充队列；激活时不从默认播放池续播。
+    personal_playlist: Arc<Mutex<Option<PersonalPlaylistQueue>>>,
 }
 
 #[derive(Default)]
@@ -459,13 +490,140 @@ impl LyricTracker {
     }
 }
 
+impl PersonalPlaylistQueue {
+    fn next_track_excluding(&mut self, queued: &HashSet<TrackKey>) -> Option<PlayableTrack> {
+        for _ in 0..self.tracks.len() {
+            if self.cursor >= self.tracks.len() {
+                self.cursor = 0;
+                for index in (1..self.tracks.len()).rev() {
+                    self.shuffle_state = self
+                        .shuffle_state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let swap = (self.shuffle_state as usize) % (index + 1);
+                    self.tracks.swap(index, swap);
+                }
+            }
+            let track = self.tracks[self.cursor].clone();
+            self.cursor += 1;
+            if !queued.contains(&track.track_ref.key) {
+                return Some(track);
+            }
+        }
+        None
+    }
+}
+
+fn playlist_queue_item(track: PlayableTrack) -> QueueItem {
+    QueueItem {
+        keyword: track.metadata.title.clone(),
+        source: track.track_ref.key.provider.as_str().to_owned(),
+        track: Some(track),
+        playlist_auto: true,
+        ..QueueItem::default()
+    }
+}
+
 impl PlaybackApplication {
     pub(crate) fn new(config: PlaybackApplicationConfig) -> Self {
         Self {
             config,
             play_mode: Arc::new(AtomicU8::new(PLAY_MODE_SHUFFLE)),
             last_played: Arc::new(Mutex::new(None)),
+            personal_playlist: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn start_personal_playlist<P: PlaybackExecutionPort + ?Sized>(
+        &self,
+        tracks: Vec<PlayableTrack>,
+        port: &mut P,
+    ) -> Result<usize> {
+        if tracks.is_empty() {
+            return Ok(0);
+        }
+        port.remove_playlist_auto_items()?;
+        let shuffle_state = tracks
+            .iter()
+            .fold(0x9E37_79B9_7F4A_7C15u64, |state, track| {
+                track
+                    .track_ref
+                    .key
+                    .id
+                    .bytes()
+                    .fold(state, |hash, byte| hash.rotate_left(5) ^ u64::from(byte))
+            });
+        *self
+            .personal_playlist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PersonalPlaylistQueue {
+            tracks,
+            cursor: 0,
+            shuffle_state,
+            last_played_key: None,
+        });
+        self.refill_personal_playlist_queue(port)
+    }
+
+    pub(crate) fn stop_personal_playlist<P: PlaybackExecutionPort + ?Sized>(
+        &self,
+        port: &mut P,
+    ) -> Result<bool> {
+        let active = self.personal_playlist_active();
+        port.remove_playlist_auto_items()?;
+        if active {
+            self.personal_playlist
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        Ok(active)
+    }
+
+    fn personal_playlist_active(&self) -> bool {
+        self.personal_playlist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn refill_personal_playlist_queue<P: PlaybackExecutionPort + ?Sized>(
+        &self,
+        port: &mut P,
+    ) -> Result<usize> {
+        let mut queue = port.playback_queue()?;
+        let mut mode = self
+            .personal_playlist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mode) = mode.as_mut() else {
+            return Ok(0);
+        };
+        let max_auto = mode.tracks.len().min(self.config.queue_max_size);
+        let mut added = 0;
+        while queue.len() < self.config.queue_max_size
+            && queue.iter().filter(|item| item.playlist_auto).count() < max_auto
+        {
+            let mut queued_keys = queue
+                .iter()
+                .filter_map(|item| item.track.as_ref().map(|track| track.track_ref.key.clone()))
+                .collect::<HashSet<_>>();
+            if mode.tracks.len() > 1
+                && let Some(last_played) = &mode.last_played_key
+            {
+                queued_keys.insert(last_played.clone());
+            }
+            let Some(track) = mode.next_track_excluding(&queued_keys) else {
+                break;
+            };
+            let item = playlist_queue_item(track);
+            if !port.enqueue_playlist_item(item.clone())? {
+                break;
+            }
+            queue.push(item);
+            added += 1;
+        }
+        Ok(added)
     }
 
     pub(crate) fn play_mode(&self) -> u8 {
@@ -845,10 +1003,12 @@ impl PlaybackApplication {
                 log::info!("自动出队已跳过: 配置重载待处理");
                 return Ok(None);
             }
+            self.refill_personal_playlist_queue(port)?;
             let queue = port.playback_queue()?;
             // 点歌队列独立于播放模式，始终优先按入队顺序消费。
             // 只有队列为空时，单曲循环才作用于自动续播。
             if queue.is_empty()
+                && !self.personal_playlist_active()
                 && purpose.stop_when_user_paused()
                 && self.play_mode() == PLAY_MODE_REPEAT_ONE
             {
@@ -884,6 +1044,9 @@ impl PlaybackApplication {
             }
             let item = queue.into_iter().next();
             let Some(item) = item else {
+                if self.personal_playlist_active() {
+                    return Ok(None);
+                }
                 let Some(track) = port.pick_playback_pool_track(&pool_excluded)? else {
                     return Ok(None);
                 };
@@ -922,7 +1085,14 @@ impl PlaybackApplication {
                 // 确认播放成功时与播放状态原子出队（同一笔持久化）。
                 queue_item_id: Some(item.id),
             };
-            let completion = self.run_selection(&request, purpose, port)?;
+            let item_purpose = if item.playlist_auto {
+                PlaybackPurpose::Playlist {
+                    stop_when_user_paused: purpose.stop_when_user_paused(),
+                }
+            } else {
+                purpose
+            };
+            let completion = self.run_selection(&request, item_purpose, port)?;
             let outcome = completion.result.outcome();
             if matches!(
                 outcome,
@@ -935,6 +1105,17 @@ impl PlaybackApplication {
             let result = self.finish_playback(completion, port)?;
             match result.outcome() {
                 PlaybackOutcome::Success => {
+                    if self.personal_playlist_active()
+                        && let Some(track) = &item.track
+                        && let Some(mode) = self
+                            .personal_playlist
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_mut()
+                    {
+                        mode.last_played_key = Some(track.track_ref.key.clone());
+                    }
+                    self.refill_personal_playlist_queue(port)?;
                     // 预加载后续曲目音源（解析 + 音频预下载），缩短下次切歌延迟；失败静默。
                     self.preload_next_track(port, &pool_excluded)?;
                     return Ok(Some(ConsumedSelection::Queue {
@@ -994,7 +1175,11 @@ impl PlaybackApplication {
             .into_iter()
             .next()
             .and_then(|item| item.track)
-            .or_else(|| port.pick_playback_pool_track(pool_excluded).ok().flatten());
+            .or_else(|| {
+                (!self.personal_playlist_active())
+                    .then(|| port.pick_playback_pool_track(pool_excluded).ok().flatten())
+                    .flatten()
+            });
         if let Some(track) = next
             && let Err(error) = port.preload_track(&track)
         {
@@ -1890,6 +2075,72 @@ mod tests {
             self.queue.retain(|item| item.id != id);
             Ok(())
         }
+    }
+
+    #[test]
+    fn personal_playlist_mode_does_not_fall_back_to_default_pool() {
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(100)),
+            monitor_status_ms: Arc::new(RwLock::new(100)),
+            help_batch_ms: 0,
+        });
+        *application.personal_playlist.lock().unwrap() = Some(PersonalPlaylistQueue {
+            tracks: vec![test_track(
+                "miliastra://track/qqmusic/playlist",
+                "歌单歌曲 - 歌手",
+            )],
+            cursor: 0,
+            shuffle_state: 1,
+            last_played_key: None,
+        });
+        let mut port = FailingPlaybackPort {
+            queue: Vec::new(),
+            removed: Vec::new(),
+            replies: Vec::new(),
+            track_unavailable: false,
+            always_unavailable: false,
+            item_scoped_error: false,
+            play_attempts: 0,
+            pool: vec![test_track(
+                "miliastra://track/qqmusic/default-pool",
+                "大厅曲库歌曲 - 歌手",
+            )],
+        };
+
+        assert!(
+            application
+                .consume_queue("test", &mut port)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(port.play_attempts, 0);
+    }
+
+    #[test]
+    fn personal_playlist_queue_cycles_without_duplicate_pending_tracks() {
+        let tracks = vec![
+            test_track("miliastra://track/qqmusic/a", "A - 歌手"),
+            test_track("miliastra://track/qqmusic/b", "B - 歌手"),
+        ];
+        let mut mode = PersonalPlaylistQueue {
+            tracks,
+            cursor: 0,
+            shuffle_state: 1,
+            last_played_key: None,
+        };
+        let first = mode.next_track_excluding(&HashSet::new()).unwrap();
+        let second = mode
+            .next_track_excluding(&HashSet::from([first.track_ref.key.clone()]))
+            .unwrap();
+        assert_ne!(first.track_ref.key, second.track_ref.key);
+        let repeated = mode.next_track_excluding(&HashSet::new()).unwrap();
+        assert!(
+            mode.tracks
+                .iter()
+                .any(|track| track.track_ref.key == repeated.track_ref.key)
+        );
     }
 
     #[test]

@@ -1,4 +1,7 @@
 use super::*;
+use sha2::Digest;
+#[path = "bridge_contract_tests.rs"]
+mod readonly_bridge_contract_tests;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -622,17 +625,86 @@ fn debug_http_read_only_actual_frame_mnn_evidence() {
             .unwrap(),
     )
     .unwrap();
-    let detail = http_get(
+    // 推送 evidenceUrl 不带 section：仍是旧兼容**完整包**（与主动读取的完整 POST
+    // 响应同形，含 source.imagePngBase64 与 status），不是分页信封。
+    // 旧客户端按这个 URL 取完整证据，不能把它变成需要拼接 page.items 的分页包。
+    let legacy = http_get(
         address,
         event["evidenceUrl"].as_str().unwrap(),
         Some("readonly-test"),
     );
-    let pushvalue: Value = serde_json::from_str(&detail.body).unwrap();
-    assert_eq!(pushvalue["evidence"]["source"]["frameId"], frame.id());
+    assert_eq!(legacy.status_line, "HTTP/1.1 200 OK", "{}", legacy.body);
+    let legacy: Value = serde_json::from_str(&legacy.body).unwrap();
+    assert_eq!(legacy["ok"], true);
+    assert_eq!(legacy["evidence"]["id"], event["id"]);
+    assert!(
+        legacy["evidence"].get("section").is_none() && legacy["evidence"].get("page").is_none(),
+        "no-section GET must not be a paginated section envelope"
+    );
     assert_eq!(
-        pushvalue["evidence"]["source"]["pixelSha256"],
+        legacy["evidence"]["source"]["pixelSha256"], value["evidence"]["source"]["pixelSha256"],
+        "same retained frame pixels as the legacy POST path"
+    );
+    let inline = legacy["evidence"]["source"]["imagePngBase64"]
+        .as_str()
+        .expect("legacy full package keeps the inline source PNG");
+    assert!(inline.starts_with("iVBOR"));
+    assert_eq!(
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                image::load_from_memory(&crate::debug_http_service::base64_decode(inline).unwrap())
+                    .unwrap()
+                    .as_bytes()
+            )
+        ),
+        value["evidence"]["source"]["pixelSha256"],
+        "inline legacy PNG decodes back to the exact retained pixels"
+    );
+    // 显式带 section 才是分页包；同一份证据、同样不内联 PNG。
+    let detail = http_get(
+        address,
+        &format!(
+            "{}&section=metadata&cursor=0&limit=10&maxBytes=8192",
+            event["evidenceUrl"].as_str().unwrap()
+        ),
+        Some("readonly-test"),
+    );
+    let pushpage: Value = serde_json::from_str(&detail.body).unwrap();
+    assert!(!detail.body.contains("imagePngBase64"));
+    assert_eq!(pushpage["evidence"]["section"], "metadata");
+    let metadata_text = pushpage["evidence"]["page"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["text"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(pushpage["evidence"]["page"]["done"], true);
+    let metadata: Value = serde_json::from_str(&metadata_text).unwrap();
+    assert_eq!(metadata["source"]["frameId"], frame.id());
+    // 两条访问路径必须给出同一条证据、同一个状态，不得一个新包一个旧包。
+    assert_eq!(legacy["evidence"]["id"], pushpage["evidence"]["id"]);
+    assert_eq!(legacy["evidence"]["status"], metadata["status"]);
+    // Decode the explicitly downloaded source PNG, never an inline GET body.
+    let url = format!(
+        "/debug/read-only/image?id={}",
+        event["id"].as_str().unwrap()
+    );
+    let mut raw = TcpStream::connect(address).unwrap();
+    write!(raw,"GET {url} HTTP/1.1\r\nHost: localhost\r\nX-Miliastra-Token: readonly-test\r\nConnection: close\r\n\r\n").unwrap();
+    let mut response = Vec::new();
+    raw.read_to_end(&mut response).unwrap();
+    let boundary = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let source = image::load_from_memory(&response[boundary..]).unwrap();
+    assert_eq!(
+        format!("{:x}", sha2::Sha256::digest(source.as_bytes())),
         value["evidence"]["source"]["pixelSha256"]
     );
+    let pushvalue = json!({"evidence":metadata});
     fs::write(
         output.join("push-response.json"),
         serde_json::to_vec_pretty(&pushvalue).unwrap(),

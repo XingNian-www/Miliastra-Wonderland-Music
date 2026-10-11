@@ -533,7 +533,7 @@ impl ApplicationRuntime {
             crate::observation::chat::ChatIdentity::PrimaryHall
         };
         let subscriber = self.ui.shared_ocr.subscribe()?;
-        let refresh = self.ui.shared_ocr.request_refresh()?;
+        let mut refresh = self.ui.shared_ocr.request_refresh()?;
         let baseline = loop {
             if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
                 return Err(anyhow!("运行已停止，已结束确认窗口"));
@@ -552,13 +552,40 @@ impl ApplicationRuntime {
             if remaining.is_zero() {
                 return Err(anyhow!("等待共享聊天确认基线超时"));
             }
-            if let Some(snapshot) = self
+            let refreshed = self
                 .ui
                 .shared_ocr
-                .wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50)))?
+                .wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50)));
+            let snapshot = match refreshed {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => continue,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::observation::chat::NoChatRefreshError>()
+                        .is_some() =>
+                {
+                    refresh = self.ui.shared_ocr.request_refresh()?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            // 一级大厅下发消息必然经过一次二级面板：那是同一大厅的另一块面板，
+            // 属于预期内的瞬时状态，不得用它做基线游标，也不得重用已经完成的刷新 token。
+            if let Some(next) = self
+                .ui
+                .shared_ocr
+                .refresh_after_other_hall_panel(&chat, &snapshot)?
             {
-                break snapshot;
+                refresh = next;
+                continue;
             }
+            if snapshot.chat != chat {
+                // A task may temporarily expose another chat for several seconds.
+                // Keep capturing until its bound chat returns or the outer deadline expires.
+                refresh = self.ui.shared_ocr.request_refresh()?;
+                continue;
+            }
+            break snapshot;
         };
         if baseline.chat != chat {
             return Err(anyhow!("共享聊天确认基线会话不匹配"));

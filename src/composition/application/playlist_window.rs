@@ -25,7 +25,7 @@ impl PlaylistWindowSession {
 
 impl Drop for PlaylistWindowCleanup {
     fn drop(&mut self) {
-        if let Err(error) = self.application.close_window(&self.owner) {
+        if let Err(error) = self.application.discard_window(&self.owner) {
             log::warn!("歌单窗口清理失败: {error:#}");
         }
     }
@@ -337,8 +337,11 @@ mod tests {
             None
         }
         fn play(&mut self, _: &PlayableTrack) -> Result<()> {
+            anyhow::bail!("recommendations should enqueue instead of playing immediately")
+        }
+        fn enqueue_next(&mut self, _: &PlayableTrack) -> Result<bool> {
             self.played += 1;
-            Ok(())
+            Ok(true)
         }
         fn import_playlist(
             &mut self,
@@ -472,7 +475,7 @@ mod tests {
                 drop(session);
                 assert!(observations.begin_exclusive().is_ok(), "{ending}");
                 assert!(
-                    !app.close_window("甲").unwrap(),
+                    !app.close_active_window("甲", now + WINDOW_TTL).unwrap(),
                     "{ending}: stale owner window"
                 );
             }
@@ -532,7 +535,7 @@ mod tests {
             .unwrap();
         assert_eq!(playback.played, 1);
         drop(cleanup);
-        assert!(!app.close_window("甲").unwrap());
+        assert!(!app.close_active_window("甲", now + WINDOW_TTL).unwrap());
     }
 
     #[test]
@@ -627,12 +630,22 @@ mod tests {
     #[test]
     fn numeric_selection_is_not_routed_outside_the_playlist_window() {
         let router = crate::interfaces::chat::ChatCommandRouter::without_custom_workflow();
-        for index in 1..=5 {
-            let text = format!("@{index}");
-            let envelope =
-                CommandEnvelope::new(&text, "甲", "pink", &text, CommandObservation::default())
-                    .unwrap();
-            assert!(router.route(&envelope, None).is_none(), "{text}");
+        for (username, color) in [("大厅成员", "blue"), ("好友", "pink")] {
+            for text in ["@1", "@2", "@3", "@4", "@5", "@换一批", "@关闭"] {
+                let envelope = CommandEnvelope::new(
+                    text,
+                    username,
+                    color,
+                    text,
+                    CommandObservation::default(),
+                )
+                .unwrap();
+                assert!(
+                    router.select_module(&envelope, None).is_none(),
+                    "{text} must not be claimed by modules for {color} chat"
+                );
+                assert!(router.route(&envelope, None).is_none(), "{text}");
+            }
         }
     }
 

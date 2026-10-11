@@ -25,6 +25,9 @@ pub struct QueueItem {
     pub dedup_bypass: bool,
     #[serde(default)]
     pub candidate_snapshot: Vec<SearchCandidate>,
+    /// Personal-playlist auto-fill entry; user requests are ordered before these entries.
+    #[serde(default)]
+    pub playlist_auto: bool,
 }
 
 impl Default for QueueItem {
@@ -40,6 +43,7 @@ impl Default for QueueItem {
             requester: String::new(),
             dedup_bypass: false,
             candidate_snapshot: Vec::new(),
+            playlist_auto: false,
         }
     }
 }
@@ -130,17 +134,23 @@ impl PersistentQueue {
     pub fn contains_duplicate(&self, item: &QueueItem) -> bool {
         self.items
             .iter()
+            .filter(|existing| !existing.playlist_auto)
             .any(|existing| existing.duplicates_with(item))
     }
 
     pub fn push(&mut self, item: QueueItem) -> Result<bool> {
-        if self.is_full() {
-            return Ok(false);
-        }
+        self.push_with_priority(item, false)
+    }
+
+    pub fn push_next(&mut self, item: QueueItem) -> Result<bool> {
+        self.push_with_priority(item, true)
+    }
+
+    fn push_with_priority(&mut self, item: QueueItem, next: bool) -> Result<bool> {
         let mut items = self.items.clone();
         let id = self.next_id;
         let next_id = self.next_id.wrapping_add(1).max(1);
-        items.push(QueueItem {
+        let item = QueueItem {
             id,
             source: normalize_source(&item.source),
             prefer_accompaniment: item.prefer_accompaniment,
@@ -151,7 +161,31 @@ impl PersistentQueue {
             requester: item.requester,
             dedup_bypass: item.dedup_bypass,
             candidate_snapshot: item.candidate_snapshot,
-        });
+            playlist_auto: item.playlist_auto,
+        };
+        if !item.playlist_auto {
+            items.retain(|queued| !(queued.playlist_auto && queued.duplicates_with(&item)));
+        }
+        if items.len() >= self.max_size {
+            if item.playlist_auto {
+                return Ok(false);
+            }
+            let Some(evict) = items.iter().rposition(|queued| queued.playlist_auto) else {
+                return Ok(false);
+            };
+            items.remove(evict);
+        }
+        if item.playlist_auto {
+            items.push(item);
+        } else if next {
+            items.insert(0, item);
+        } else {
+            let index = items
+                .iter()
+                .position(|queued| queued.playlist_auto)
+                .unwrap_or(items.len());
+            items.insert(index, item);
+        }
         self.save_state(&items, next_id)?;
         self.items = items;
         self.next_id = next_id;
@@ -262,6 +296,83 @@ mod tests {
                 "song name - artist",
                 "miliastra://track/netease/42",
             )]
+        );
+    }
+
+    #[test]
+    fn manual_items_precede_auto_playlist_entries_and_evict_one_when_full() {
+        let mut queue = PersistentQueue::new_for_test(3).unwrap();
+        for keyword in ["auto-a", "auto-b", "auto-c"] {
+            queue
+                .push(QueueItem {
+                    keyword: keyword.to_owned(),
+                    playlist_auto: true,
+                    ..QueueItem::default()
+                })
+                .unwrap();
+        }
+        assert!(
+            !queue
+                .push(QueueItem {
+                    keyword: "auto-overflow".to_owned(),
+                    playlist_auto: true,
+                    ..QueueItem::default()
+                })
+                .unwrap()
+        );
+        assert!(
+            queue
+                .push(QueueItem {
+                    keyword: "manual".to_owned(),
+                    ..QueueItem::default()
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            queue
+                .items()
+                .iter()
+                .map(|item| item.keyword.as_str())
+                .collect::<Vec<_>>(),
+            vec!["manual", "auto-a", "auto-b"]
+        );
+        assert!(!queue.contains_duplicate(&QueueItem {
+            keyword: "auto-a".to_owned(),
+            ..QueueItem::default()
+        }));
+    }
+
+    #[test]
+    fn push_next_places_selected_track_before_existing_manual_and_auto_items() {
+        let mut queue = PersistentQueue::new_for_test(4).unwrap();
+        queue
+            .push(QueueItem {
+                keyword: "existing-manual".to_owned(),
+                ..QueueItem::default()
+            })
+            .unwrap();
+        queue
+            .push(QueueItem {
+                keyword: "auto".to_owned(),
+                playlist_auto: true,
+                ..QueueItem::default()
+            })
+            .unwrap();
+
+        queue
+            .push_next(QueueItem {
+                keyword: "selected-next".to_owned(),
+                ..QueueItem::default()
+            })
+            .unwrap();
+
+        assert_eq!(
+            queue
+                .items()
+                .iter()
+                .map(|item| item.keyword.as_str())
+                .collect::<Vec<_>>(),
+            vec!["selected-next", "existing-manual", "auto"]
         );
     }
 

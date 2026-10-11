@@ -202,6 +202,12 @@ pub trait ModerationVotePort {
     fn wait(&mut self, duration: Duration);
     fn is_running(&self) -> bool;
     fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>>;
+    fn poll_visible_friend_messages_until(&mut self, deadline: Instant) -> Result<Vec<String>> {
+        if self.now() >= deadline {
+            return Ok(Vec::new());
+        }
+        self.poll_visible_friend_messages()
+    }
     fn finish(&mut self);
 }
 
@@ -564,11 +570,25 @@ impl ModerationService {
         let mut stable_votes: HashMap<String, bool> = HashMap::new();
         let mut samples: HashMap<(String, bool), u32> = HashMap::new();
         while port.is_running() && lease.is_current() && port.now() < deadline {
-            port.wait(self.policy.vote_poll_interval);
-            if !lease.is_current() {
+            let remaining = deadline.saturating_duration_since(port.now());
+            if remaining.is_zero() {
+                break;
+            }
+            port.wait(self.policy.vote_poll_interval.min(remaining));
+            if !port.is_running() || !lease.is_current() {
                 return Ok(false);
             }
-            match port.poll_visible_friend_messages() {
+            if port.now() >= deadline {
+                break;
+            }
+            let polled = port.poll_visible_friend_messages_until(deadline);
+            if !port.is_running() || !lease.is_current() {
+                return Ok(false);
+            }
+            if port.now() >= deadline {
+                break;
+            }
+            match polled {
                 Ok(messages) => {
                     for message in messages {
                         let Some((username, agreed)) = parse_friend_moderation_vote(&message)
@@ -940,6 +960,7 @@ mod tests {
         now: Instant,
         running: bool,
         finished: bool,
+        poll_advance: Duration,
         polls: VecDeque<Result<Vec<String>>>,
     }
 
@@ -949,6 +970,7 @@ mod tests {
                 now: Instant::now(),
                 running: true,
                 finished: false,
+                poll_advance: Duration::ZERO,
                 polls: polls.into_iter().map(Ok).collect(),
             }
         }
@@ -969,6 +991,14 @@ mod tests {
 
         fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>> {
             self.polls.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        fn poll_visible_friend_messages_until(
+            &mut self,
+            _deadline: Instant,
+        ) -> Result<Vec<String>> {
+            self.now += self.poll_advance;
+            self.poll_visible_friend_messages()
         }
 
         fn finish(&mut self) {
@@ -1509,6 +1539,21 @@ mod tests {
         assert!(task.approved);
         assert!(vote_port.finished);
         assert!(service.is_active(&command()).unwrap());
+    }
+
+    #[test]
+    fn votes_returned_after_deadline_do_not_change_timeout_result() {
+        let service = service(1, 1);
+        let mut command_port = FakeCommandPort::new();
+        let work = start(&service, &mut command_port);
+        let mut vote_port = FakeVotePort::new([vec!["[甲]：@不同意".to_string()]]);
+        vote_port.poll_advance = Duration::from_secs(5);
+        let task_port = FakeTaskPort::new();
+
+        service.run_vote(work, &mut vote_port, &task_port).unwrap();
+
+        assert!(task_port.take().approved);
+        assert!(vote_port.finished);
     }
 
     #[test]

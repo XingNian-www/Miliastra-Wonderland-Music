@@ -153,34 +153,44 @@ fn shared_reader_receives_input_under_formal_ownership_without_scan_permit() {
 }
 
 #[test]
-fn shared_reader_reports_failure_and_chat_change_without_waiting_for_timeout() {
-    for change_chat in [false, true] {
-        let shared = SharedChatOcr::new();
-        let observations = ChatObservationShared::new();
-        let mut reader = shared_reader(
-            &shared,
-            &observations,
-            ChatIdentity::PrimaryHall,
-            vec![message("anchor", 0)],
-        );
-        if change_chat {
-            publish(&shared, ChatIdentity::SecondaryHall, Vec::new());
-        } else {
-            shared.report_failure("capture unavailable").unwrap();
-        }
-        let started = Instant::now();
-        assert!(reader.wait_for_input(500, Duration::from_secs(30)).is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(reader.read_messages().is_err());
-        drop(reader);
-        let mut next = shared_reader(
-            &shared,
-            &observations,
-            ChatIdentity::PrimaryHall,
-            vec![message("anchor", 0)],
-        );
-        assert!(next.read_messages().unwrap().is_empty());
+fn shared_reader_ignores_long_foreign_state_but_reports_observation_failure() {
+    let shared = SharedChatOcr::new();
+    let observations = ChatObservationShared::new();
+    let mut reader = shared_reader(
+        &shared,
+        &observations,
+        ChatIdentity::PrimaryHall,
+        vec![message("anchor", 0)],
+    );
+    for _ in 0..64 {
+        publish(&shared, ChatIdentity::PublicChannel, Vec::new());
     }
+    assert!(reader.read_messages().unwrap().is_empty());
+    publish(
+        &shared,
+        ChatIdentity::PrimaryHall,
+        vec![message("anchor", 0), message("user: @confirm", 20)],
+    );
+    assert_eq!(reader.read_messages().unwrap()[0].text, "user: @confirm");
+    drop(reader);
+
+    let failing = SharedChatOcr::new();
+    let failure_observations = ChatObservationShared::new();
+    let mut failed_reader = shared_reader(
+        &failing,
+        &failure_observations,
+        ChatIdentity::PrimaryHall,
+        vec![message("anchor", 0)],
+    );
+    let started = Instant::now();
+    failing.report_failure("capture unavailable").unwrap();
+    assert!(
+        failed_reader
+            .wait_for_input(500, Duration::from_secs(30))
+            .is_err()
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(failed_reader.read_messages().is_err());
 }
 
 #[test]

@@ -545,6 +545,18 @@ fn complete_secondary_claim(
 }
 
 impl ApplicationRuntime {
+    fn poll_playlist_import_completions(&self) -> Result<()> {
+        for messages in self
+            .business
+            .playlist_application
+            .poll_import_completions(Instant::now())?
+        {
+            let messages = messages.iter().map(String::as_str).collect::<Vec<_>>();
+            self.reply_batch(&messages, 0)?;
+        }
+        Ok(())
+    }
+
     fn persist_listener_mode_best_effort(&self, mode: ChatListenerMode) {
         if let Err(error) =
             persist_chat_listener_mode(&self.lifecycle.config.state.playback_state_path, mode)
@@ -1488,6 +1500,7 @@ impl ApplicationRuntime {
             self.forward_completion_advances(completion_subscriber)?;
             self.maybe_idle_exit()?;
             self.maybe_reload_config_when_idle();
+            self.poll_playlist_import_completions()?;
             if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
                 continue;
             }
@@ -1911,7 +1924,14 @@ impl ApplicationRuntime {
                 self.ui.shared_ocr.acknowledge_business(&observed.id)?;
                 continue;
             }
-            log::debug!("解析命令: {}", parsed_command.raw);
+            if matches!(
+                parsed_command.command,
+                ModuleCommand::Playlist(crate::features::playlist::PlaylistCommand::Import { .. })
+            ) {
+                log::debug!("解析到歌单导入命令（分享链接已隐藏）");
+            } else {
+                log::debug!("解析命令: {}", parsed_command.raw);
+            }
             parsed.push(parsed_command);
         }
 
@@ -2335,11 +2355,11 @@ mod tests {
     use super::{
         CHAT_LISTENER_UNRESOLVED_UI_GRACE, CONFIG_RELOAD_UI_FALLBACK_GRACE, ChatListenerMode,
         ListenerReadyEvidence, ObservedInput, attach_question_orders, hall_consumes_identity,
-        listener_mode_matches_ui,
-        listener_ready_after_recheck, load_persisted_chat_listener_mode, merge_observed_inputs,
-        persist_chat_listener_mode, primary_command_candidates, primary_rescan_can_publish,
-        replacement_ready_allowed, replacement_startup_fallback_due, replacement_startup_retry_due,
-        scan_frame_is_fresh, secondary_hall_recovery_allowed, unresolved_ui_recovery_due,
+        listener_mode_matches_ui, listener_ready_after_recheck, load_persisted_chat_listener_mode,
+        merge_observed_inputs, persist_chat_listener_mode, primary_command_candidates,
+        primary_rescan_can_publish, replacement_ready_allowed, replacement_startup_fallback_due,
+        replacement_startup_retry_due, scan_frame_is_fresh, secondary_hall_recovery_allowed,
+        unresolved_ui_recovery_due,
     };
     use crate::observation::chat::{
         BubbleSequence, ChatIdentity, ChatMessage, ObservedChatMessageId, PrimaryObservedMessage,

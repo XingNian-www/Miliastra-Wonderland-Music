@@ -69,7 +69,7 @@ fn playlist_decision_envelope(
 }
 
 fn playlist_decision(envelope: &CommandEnvelope) -> Option<PlaylistCommand> {
-    let command = PlaylistCommand::parse_chat(envelope)?.command;
+    let command = PlaylistCommand::parse_window_chat(envelope)?.command;
     matches!(
         command,
         PlaylistCommand::Select(_) | PlaylistCommand::Reroll | PlaylistCommand::Close
@@ -188,7 +188,8 @@ impl ApplicationRuntime {
         // Successful choices use the existing text/position lock across visual rebuilds;
         // an invalid index is only consumed and must not evict a real success lock.
         acknowledge_playlist_decision(&self.ui.shared_ocr, envelope, changed)?;
-        let matched = PlaylistCommand::parse_chat(envelope).expect("parsed playlist decision");
+        let matched =
+            PlaylistCommand::parse_window_chat(envelope).expect("parsed playlist decision");
         let interaction =
             RoutedCommand::from_envelope(envelope, matched.map(ModuleCommand::Playlist));
         self.log_executed_command(&interaction, "playlist")?;
@@ -338,6 +339,13 @@ mod tests {
         fn play(&mut self, _: &PlayableTrack) -> Result<()> {
             self.played += 1;
             Ok(())
+        }
+        fn import_playlist(
+            &mut self,
+            _: &str,
+            _: &str,
+        ) -> Result<miliastra_playback::PlaylistImportOperation> {
+            anyhow::bail!("playlist import is unavailable in this test port")
         }
     }
 
@@ -617,20 +625,14 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_friend_numeric_route_reaches_playlist_with_original_pink_color() {
+    fn numeric_selection_is_not_routed_outside_the_playlist_window() {
         let router = crate::interfaces::chat::ChatCommandRouter::without_custom_workflow();
         for index in 1..=5 {
             let text = format!("@{index}");
             let envelope =
                 CommandEnvelope::new(&text, "甲", "pink", &text, CommandObservation::default())
                     .unwrap();
-            let routed = router
-                .route(&envelope, None)
-                .expect("ordinary numeric Playlist route");
-            assert!(
-                matches!(routed.command, ModuleCommand::Playlist(PlaylistCommand::Select(actual)) if actual == index)
-            );
-            assert_eq!(routed.message_type, "pink");
+            assert!(router.route(&envelope, None).is_none(), "{text}");
         }
     }
 

@@ -2186,20 +2186,6 @@ document.addEventListener('keydown',event=>{
     event.preventDefault()
   }
 })
-$('accessToken').value=accessToken()
-initNotifyUI()
-loadOperatorWorkflows()
-refreshAll()
-loadLoginState()
-// 页面不可见（切后台/最小化）时暂停全部轮询；回到前台立即补一次全量刷新。
-const pollingActive=()=>!refreshPaused&&!document.hidden&&!tokenInvalid
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!refreshPaused)refreshAll()})
-setInterval(()=>{if(pollingActive())loadMonitor()},1000)
-setInterval(()=>{if(pollingActive())refreshPlayer().catch(()=>{})},1000)
-setInterval(()=>{if(pollingActive())loadPlaybackInsights()},5000)
-setInterval(()=>{if(pollingActive())loadPlayMode()},5000)
-setInterval(()=>{if(pollingActive()&&loginRuntimeStatus&&loginRuntimeStatus.active)refreshLoginProgress()},2000)
-
 /* ===== 高级控制（原 /tools 独立页面，已并入左侧导航） ===== */
 const val=(id)=>{const el=$(id);return el?el.value.trim():''}
 let toolsBusy=false
@@ -3348,6 +3334,20 @@ document.addEventListener('keydown',(e)=>{
   if(key==='t'){toggleTheme();e.preventDefault();return}
   if(e.key==='?'){showShortcutHelp();e.preventDefault();return}
 })
+/* ===== 初始化执行块（必须位于全部 const/let 声明之后，避免 TDZ） ===== */
+$('accessToken').value=accessToken()
+initNotifyUI()
+loadOperatorWorkflows()
+refreshAll()
+loadLoginState()
+// 页面不可见（切后台/最小化）时暂停全部轮询；回到前台立即补一次全量刷新。
+const pollingActive=()=>!refreshPaused&&!document.hidden&&!tokenInvalid
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!refreshPaused)refreshAll()})
+setInterval(()=>{if(pollingActive())loadMonitor()},1000)
+setInterval(()=>{if(pollingActive())refreshPlayer().catch(()=>{})},1000)
+setInterval(()=>{if(pollingActive())loadPlaybackInsights()},5000)
+setInterval(()=>{if(pollingActive())loadPlayMode()},5000)
+setInterval(()=>{if(pollingActive()&&loginRuntimeStatus&&loginRuntimeStatus.active)refreshLoginProgress()},2000)
 </script>
 </body>
 </html>

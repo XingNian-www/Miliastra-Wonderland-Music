@@ -46,10 +46,7 @@ pub(crate) fn parse_command_envelope(
     if !matches!(message_type, "blue" | "pink") {
         return None;
     }
-    if message_type == "blue" && text.starts_with("播放") && text.contains(" - ") {
-        return None;
-    }
-
+    // 回显过滤已不需要：非 @/# 且非结构化点歌的文本本就会被下面的解析丢弃。
     if text.trim_start().starts_with("歌曲名") {
         // 反馈过滤只作用于隐式点歌请求，不能作用于 @/# 参数。
         if is_feedback_text(text) {

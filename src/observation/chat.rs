@@ -1,4 +1,5 @@
 pub(crate) mod scan;
+pub(crate) mod freshness;
 mod passive;
 mod secondary_hall_vision;
 mod secondary_unread_vision;
@@ -31,6 +32,9 @@ pub(crate) use visual::{
     hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
     secondary_hall_bubbles,
 };
+pub(crate) use freshness::{
+    BaselineKind, FrameDecision, FreshFrame, Freshness, SequenceFreshness, ViewPhase,
+};
 pub(crate) use passive::{
     PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity, hash_region,
     parse_secondary_sender_identity, passive_layout, passive_secondary_identity, passive_sender,
@@ -42,6 +46,8 @@ pub(crate) use visual::SECONDARY_TITLE_RECT;
 
 #[cfg(all(test, feature = "ocr-mnn"))]
 mod actual_screenshot_tests;
+#[cfg(test)]
+mod freshness_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VisualSessionId(u64);

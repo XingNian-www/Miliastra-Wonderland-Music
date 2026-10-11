@@ -554,6 +554,7 @@ impl ApplicationRuntime {
         self.ui
             .chat_baseline_primed
             .store(false, AtomicOrdering::SeqCst);
+        self.ui.chat_timeline.note_baseline(reason)?;
         let visual_session = self.ui.chat_observations.begin_visual_session()?;
         log::info!(
             "{reason}，聊天观察进入新视觉会话：仅粉色首屏建立历史基线，其他颜色继续交付: {}",

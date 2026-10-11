@@ -218,6 +218,15 @@ impl FormalTaskClient {
         {
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 observer.record_trigger(receipt.task_id, payload, captured_at);
+                // The projection may finish before this receipt, or exceed the
+                // bounded pre-receipt cache. Query the authoritative task source
+                // without changing publication order; stale lookups cannot regress it.
+                if let Ok((generation, Some(status))) = self
+                    .task_engine
+                    .formal_task_status_revision(receipt.task_id)
+                {
+                    observer.record_formal_status_at(generation, &status);
+                }
             }));
         }
         Ok(outcome)

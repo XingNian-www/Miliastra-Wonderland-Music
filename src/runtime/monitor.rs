@@ -733,6 +733,8 @@ mod tests {
                 &older_monitor,
                 TaskEngineProjection {
                     generation: 1,
+                    formal_statuses: vec![],
+                    dropped_formal_statuses: 0,
                     scheduler: crate::runtime::scheduler::FormalSchedulerSnapshot::default(),
                     diagnostics: vec![DiagnosticTaskSnapshot {
                         id: 1,
@@ -749,6 +751,8 @@ mod tests {
                 &newer_monitor,
                 TaskEngineProjection {
                     generation: 2,
+                    formal_statuses: vec![],
+                    dropped_formal_statuses: 0,
                     scheduler: crate::runtime::scheduler::FormalSchedulerSnapshot::default(),
                     diagnostics: vec![DiagnosticTaskSnapshot {
                         id: 2,

@@ -13,14 +13,18 @@ use crate::runtime::scheduler::{
     DiagnosticTaskCompletion, DiagnosticTaskLease, DiagnosticTaskSnapshot,
     DiagnosticTaskSubmission, FormalScheduler, FormalSchedulerError, FormalSchedulerSnapshot,
     FormalTaskCancelAction, FormalTaskCancelOutcome, FormalTaskCompletion, FormalTaskDedupKey,
-    FormalTaskEnqueueOutcome, FormalTaskLease, FormalTaskSubmission, SchedulerLane,
-    SchedulerLaneLease,
+    FormalTaskEnqueueOutcome, FormalTaskLease, FormalTaskSnapshot, FormalTaskSubmission,
+    SchedulerLane, SchedulerLaneLease,
 };
 
 #[derive(Clone, Debug)]
 pub(crate) struct TaskEngineProjection {
     pub(crate) generation: u64,
     pub(crate) scheduler: FormalSchedulerSnapshot,
+    /// 正式状态源：全部未完成任务及最多 1000 个最近完成的终态。
+    pub(crate) formal_statuses: Vec<FormalTaskSnapshot>,
+    /// 本进程因终态容量上限淘汰的正式状态数。
+    pub(crate) dropped_formal_statuses: u64,
     pub(crate) diagnostics: Arc<[DiagnosticTaskSnapshot]>,
 }
 
@@ -346,6 +350,22 @@ impl TaskEngineHandle {
         Ok(Self::scheduler_snapshot(&state))
     }
 
+    pub(crate) fn formal_task_snapshot(
+        &self,
+        id: u64,
+    ) -> Result<Option<FormalTaskSnapshot>, TaskEngineError> {
+        Ok(self.lock_state()?.scheduler.formal_task_snapshot(id))
+    }
+
+    /// Read the task and its source revision atomically for receipt reconciliation.
+    pub(crate) fn formal_task_status_revision(
+        &self,
+        id: u64,
+    ) -> Result<(u64, Option<FormalTaskSnapshot>), TaskEngineError> {
+        let state = self.lock_state()?;
+        Ok((state.generation, state.scheduler.formal_task_snapshot(id)))
+    }
+
     pub(crate) fn diagnostic_task_snapshot(
         &self,
         id: u64,
@@ -464,6 +484,8 @@ impl TaskEngineHandle {
         TaskEngineProjection {
             generation: state.generation,
             scheduler: Self::scheduler_snapshot(state),
+            formal_statuses: state.scheduler.formal_statuses(),
+            dropped_formal_statuses: state.scheduler.dropped_formal_statuses(),
             diagnostics: Arc::clone(&state.diagnostics),
         }
     }
@@ -615,6 +637,153 @@ mod tests {
             false,
             Box::new(FormalNoop),
         )
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Option<TaskEngineProjection>>);
+
+    impl TaskEngineStateSink for RecordingSink {
+        fn publish_task_engine(&self, projection: TaskEngineProjection) {
+            *self.0.lock().unwrap() = Some(projection);
+        }
+    }
+
+    impl RecordingSink {
+        fn formal(&self, id: u64) -> FormalTaskSnapshot {
+            self.0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .formal_statuses
+                .iter()
+                .find(|task| task.id == id)
+                .expect("formal projection contains task")
+                .clone()
+        }
+    }
+
+    #[test]
+    fn formal_projection_keeps_window_excluded_task_through_restore_cancel_and_terminals() {
+        // Timeout failures and discard-only successful work use the existing
+        // Failed/Succeeded completion contract; do not invent new business states.
+        for (completion, expected) in [
+            (FormalTaskCompletion::Succeeded("done".into()), "completed"),
+            (
+                FormalTaskCompletion::Failed("execution failed".into()),
+                "failed",
+            ),
+            (
+                FormalTaskCompletion::Failed("task timed out".into()),
+                "failed",
+            ),
+            (
+                FormalTaskCompletion::Succeeded("discard-only work completed".into()),
+                "completed",
+            ),
+            (
+                FormalTaskCompletion::Canceled("cancel observed".into()),
+                "canceled",
+            ),
+        ] {
+            let sink = Arc::new(RecordingSink::default());
+            let engine = TaskEngineHandle::new(Some(sink.clone()));
+            let FormalTaskEnqueueOutcome::Queued(receipt) = engine
+                .enqueue_formal(formal_submission("old #1", None))
+                .unwrap()
+            else {
+                panic!("task should queue");
+            };
+            assert_eq!(sink.formal(receipt.task_id).status, "queued");
+            let active = engine.take_next_formal().unwrap().unwrap();
+            assert_eq!(sink.formal(receipt.task_id).status, "running");
+            for _ in 0..30 {
+                engine
+                    .enqueue_formal(formal_submission("new queued", None))
+                    .unwrap();
+            }
+            let display = engine.snapshot().unwrap();
+            assert_eq!(display.tasks().len(), 30);
+            assert_eq!(display.pending_labels().len(), 30);
+            assert!(
+                display
+                    .tasks()
+                    .iter()
+                    .all(|task| task.id != receipt.task_id)
+            );
+            assert_eq!(sink.formal(receipt.task_id).status, "running");
+            engine.restore_formal(active).unwrap();
+            assert_eq!(sink.formal(receipt.task_id).status, "queued");
+            let active = engine.take_next_formal().unwrap().unwrap();
+            assert_eq!(active.task_id(), receipt.task_id);
+            assert_eq!(sink.formal(receipt.task_id).status, "running");
+            assert_eq!(
+                engine.cancel_formal(receipt.task_id).unwrap(),
+                FormalTaskCancelOutcome::CancellationRequested
+            );
+            assert!(sink.formal(receipt.task_id).cancellation_requested);
+            engine.complete_formal(receipt.task_id, completion).unwrap();
+            let terminal = engine
+                .formal_task_snapshot(receipt.task_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal.status, expected);
+            assert!(terminal.finished_at_ms.is_some());
+            assert_eq!(sink.formal(receipt.task_id), terminal);
+            assert!(
+                engine
+                    .diagnostic_task_snapshot(receipt.task_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .snapshot()
+                    .unwrap()
+                    .tasks()
+                    .iter()
+                    .all(|task| task.id != receipt.task_id)
+            );
+            assert_eq!(
+                sink.0
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .dropped_formal_statuses,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn formal_projection_publishes_window_excluded_queued_cancel_and_shutdown() {
+        let sink = Arc::new(RecordingSink::default());
+        let engine = TaskEngineHandle::new(Some(sink.clone()));
+        for _ in 0..32 {
+            engine
+                .enqueue_formal(formal_submission("queued", None))
+                .unwrap();
+        }
+        assert_eq!(
+            engine.cancel_formal(1).unwrap(),
+            FormalTaskCancelOutcome::CanceledBeforeStart
+        );
+        assert_eq!(sink.formal(1).status, "canceled");
+        assert!(sink.formal(1).finished_at_ms.is_some());
+        engine.begin_shutdown().unwrap();
+        assert_eq!(sink.formal(2).status, "canceled");
+        assert!(sink.formal(2).finished_at_ms.is_some());
+        assert!(engine.formal_task_snapshot(9999).unwrap().is_none());
+        let projection = sink.0.lock().unwrap();
+        let projection = projection.as_ref().unwrap();
+        assert_eq!(projection.formal_statuses.len(), 32);
+        assert!(
+            projection
+                .formal_statuses
+                .iter()
+                .all(|task| task.status == "canceled")
+        );
     }
 
     #[test]

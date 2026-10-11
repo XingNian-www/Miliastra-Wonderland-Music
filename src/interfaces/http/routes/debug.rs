@@ -710,16 +710,82 @@ pub(super) fn debug_read_only_read_route(
         .map_err(command_error)?;
     Ok(json!({"ok":true,"evidence":evidence}).to_string())
 }
+/// GET /debug/read-only/evidence?id=ID[&section=&cursor=&limit=&maxBytes=][&instance=&revision=]
+///
+/// **兼容两种客户端**：
+/// - 不带 `section`：返回与旧 POST 完整响应同形的完整证据（含内联 PNG，只有显式
+///   分页才不内联）。旧客户端和推送事件的 `evidenceUrl` 依赖这条语义，
+///   不能把它悄悄换成默认 metadata 分页。
+/// - 显式 `section`：返回该分区的 UTF-8 JSON 文本分页，按预算分页且不内联 PNG。
+///
+/// `section=` 显式出现但为空是**无效分区**，不回退为完整包——拼错的 URL
+/// 不应该变成"整个证据都发过来"。
+///
+/// 身份校验（`instance`）先于分区与版本解析；指定 `revision` 时两条路径都要核对，
+/// 保留 revision_conflict(409) 与证据不存在(404)/已过期(410) 的既有语义，
+/// 也不会在证据缺失时改抓新帧冒充被请求的旧证据。
 pub(super) fn debug_read_only_evidence_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
     let _ = debug_service(state)?;
     let id = required_query(query, "id")?;
-    let evidence = crate::debug_read_only::observer()
-        .read_entry(&id)
-        .map_err(|reason| bad_request(&reason))?;
-    Ok(json!({"ok":true,"evidence":evidence}).to_string())
+    if query_value(query, "instance")
+        .is_some_and(|expected| expected != crate::debug_read_only::observer().instance())
+    {
+        return Err(readonly_evidence_error("instance_conflict".into()));
+    }
+    let revision = query_value(query, "revision")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| bad_request("revision必须为非负整数"))
+        })
+        .transpose()?;
+    let Some(section) = query_value(query, "section") else {
+        return read_full_evidence(&id, revision)
+            .map(|evidence| json!({"ok": true, "evidence": evidence}).to_string())
+            .map_err(readonly_evidence_error);
+    };
+    if section.is_empty() {
+        return Err(readonly_evidence_error(
+            "invalid_section: metadata|ocr|parameters|history".into(),
+        ));
+    }
+    let cursor = readonly_query_number(query, "cursor", 0usize)?;
+    let limit = readonly_query_number(query, "limit", 10usize)?.clamp(1, 100);
+    let max_bytes = readonly_query_number(query, "maxBytes", 8192usize)?.min(65536);
+    crate::debug_read_only::observer()
+        .read_section(&id, section, cursor, limit, max_bytes, revision)
+        .map(|value| value.to_string())
+        .map_err(readonly_evidence_error)
+}
+
+/// 不带 `section` 的旧 GET 兼容读取：完整证据 + 版本一致性检查。
+///
+/// 先用**现有元数据**核对 `revision`，再 `read_entry`（它带内联 PNG），
+/// 最后核对返回包里的 `revision`：两次读取之间可能有状态更新写入，
+/// 只查一次会让"版本一致"这个承诺落空。任何一步失败都按既有错误语义上报，
+/// 不改抓新帧，也不退回最近一帧冒充被请求的证据。
+fn read_full_evidence(id: &str, revision: Option<u64>) -> Result<serde_json::Value, String> {
+    let observer = crate::debug_read_only::observer();
+    if let Some(expected) = revision {
+        let metadata = observer.entry_metadata(id)?;
+        if metadata["revision"].as_u64() != Some(expected) {
+            return Err(format!(
+                "revision_conflict: current={}",
+                metadata["revision"]
+            ));
+        }
+    }
+    let evidence = observer.read_entry(id)?;
+    if let Some(expected) = revision {
+        let current = evidence["revision"].as_u64().unwrap_or(0);
+        if current != expected {
+            return Err(format!("revision_conflict: current={current}"));
+        }
+    }
+    Ok(evidence)
 }
 pub(super) fn debug_read_only_entries_route(
     query: &[(String, String)],
@@ -730,10 +796,119 @@ pub(super) fn debug_read_only_entries_route(
         .unwrap_or("0")
         .parse::<u64>()
         .map_err(|_| bad_request("since必须为非负整数"))?;
-    Ok(
-        json!({"ok":true,"entries":crate::debug_read_only::observer().list_after(since)})
-            .to_string(),
-    )
+    let limit = readonly_query_number(query, "limit", 10usize)?.clamp(1, 100);
+    let max_bytes = readonly_query_number(query, "maxBytes", 8192usize)?.min(65536);
+    let task_id = query_value(query, "taskId")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| bad_request("taskId必须为非负整数"))
+        })
+        .transpose()?;
+    crate::debug_read_only::observer()
+        .list_page(
+            since,
+            limit,
+            max_bytes,
+            task_id,
+            query_value(query, "instance"),
+        )
+        .map(|value| value.to_string())
+        .map_err(readonly_evidence_error)
+}
+
+fn readonly_query_number<T: std::str::FromStr>(
+    query: &[(String, String)],
+    key: &str,
+    default: T,
+) -> Result<T, AppError> {
+    match query_value(query, key) {
+        Some(value) => value
+            .parse::<T>()
+            .map_err(|_| bad_request(&format!("{key}必须为非负整数"))),
+        None => Ok(default),
+    }
+}
+fn readonly_evidence_error(reason: String) -> AppError {
+    let status = if reason.starts_with("revision_conflict") {
+        409
+    } else if reason.starts_with("instance_conflict") {
+        409
+    } else if reason.starts_with("evidence_expired")
+        || reason.starts_with("image_expired")
+        || reason.starts_with("image_unavailable")
+    {
+        410
+    } else if reason.starts_with("evidence_not_found") {
+        404
+    } else {
+        400
+    };
+    AppError {
+        status,
+        message: reason,
+    }
+}
+
+pub(super) fn debug_read_only_summary_route(
+    _: &[(String, String)],
+    state: &HttpSharedState,
+) -> Result<String, AppError> {
+    Ok(json!({"ok":true,"summary":debug_service(state)?.read_only_summary()}).to_string())
+}
+
+pub(super) fn debug_read_only_image_response(
+    request: &Request,
+    state: &HttpSharedState,
+) -> Result<Response, AppError> {
+    let _ = debug_service(state)?;
+    let id = required_query(&request.query, "id")?;
+    let (bytes, metadata) = crate::debug_read_only::observer()
+        .read_image(&id)
+        .map_err(readonly_evidence_error)?;
+    if query_value(&request.query, "instance")
+        .is_some_and(|expected| metadata["instance"].as_str() != Some(expected))
+    {
+        return Err(readonly_evidence_error("instance_conflict".into()));
+    }
+    if let Some(expected) = query_value(&request.query, "revision") {
+        let expected = expected
+            .parse::<u64>()
+            .map_err(|_| bad_request("revision必须为非负整数"))?;
+        if metadata["revision"].as_u64() != Some(expected) {
+            return Err(readonly_evidence_error("revision_conflict".into()));
+        }
+    }
+    let mut headers = cors_headers(request, &state.config.http.host, state.config.http.port);
+    headers.push(("Cache-Control".into(), "no-store".into()));
+    headers.push((
+        "X-ReadOnly-Instance".into(),
+        crate::debug_read_only::observer().instance().into(),
+    ));
+    if let Some(revision) = metadata.get("revision").and_then(serde_json::Value::as_u64) {
+        headers.push(("X-ReadOnly-Revision".into(), revision.to_string()));
+    }
+    for (key, field) in [
+        ("X-Pixel-Sha256", "pixelSha256"),
+        ("X-File-Sha256", "fileSha256"),
+    ] {
+        if let Some(hash) = metadata.get(field).and_then(serde_json::Value::as_str) {
+            headers.push((key.into(), hash.into()));
+        }
+    }
+    if let Some(hash) = metadata
+        .get("fileSha256")
+        .and_then(serde_json::Value::as_str)
+    {
+        headers.push(("ETag".into(), format!("\"{hash}\"")));
+    }
+    Ok(add_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "image/png")
+            .body(Body::from(bytes)),
+        headers,
+    ))
 }
 
 /// GET /debug/tasks：列出已保存的沙盒任务。
@@ -997,14 +1172,43 @@ pub(super) fn debug_events_response(
     } else {
         crate::debug_events::bus()
     };
-    let (replay, receiver) = bus.subscribe_replay_after(since);
+    // Always obtain the retained prefix and live subscription in a single atomic join.
+    let (retained, receiver, latest) = bus.subscribe_replay_snapshot(0);
+    let instance = (request.path == "/debug/read-only/events")
+        .then(|| crate::debug_read_only::observer().instance().to_string());
+    let reset = since > latest
+        || instance.as_deref().is_some_and(|current| {
+            query_value(&request.query, "instance").is_some_and(|requested| requested != current)
+        });
+    let cursor = if reset { 0 } else { since };
+    let replay = retained
+        .into_iter()
+        .filter(|event| event.sequence > cursor)
+        .collect::<Vec<_>>();
+    let gap = reset
+        || replay
+            .first()
+            .is_some_and(|event| event.sequence > cursor.saturating_add(1));
+    let mut prefix = if drain {
+        String::new()
+    } else {
+        instance
+            .as_ref()
+            .map(|value| format!(": instance {value}\n\n"))
+            .unwrap_or_default()
+    };
+    if gap {
+        prefix.push_str(&format!("event: readonly.gap\ndata: {}\n\n",json!({"kind":"gap","instance":instance,"reset":reset,
+            "since":since,"nextCursor":cursor,"latestSequence":latest,"oldestSequence":replay.first().map(|e|e.sequence),
+            "reason":if reset {"instance_or_cursor_reset"} else {"replay_retention_gap"}})));
+    }
 
     let mut headers = cors_headers(request, &state.config.http.host, state.config.http.port);
     // SSE 必须禁缓存，否则会被中间层攒成批量轮询。
     headers.push(("cache-control".into(), "no-store".into()));
 
     if drain {
-        let mut body = String::new();
+        let mut body = prefix;
         for event in replay {
             body.push_str(&sse_frame(&event));
         }
@@ -1016,17 +1220,26 @@ pub(super) fn debug_events_response(
         ));
     }
 
+    let mut last_sequence = replay.last().map_or(cursor, |event| event.sequence);
     let replay_stream = tokio_stream::iter(
-        replay
-            .into_iter()
-            .map(|event| Ok::<String, std::convert::Infallible>(sse_frame(&event))),
+        std::iter::once(Ok::<String, std::convert::Infallible>(prefix))
+            .chain(replay.into_iter().map(|event| Ok(sse_frame(&event)))),
     );
-    // 慢客户端落后会收到 Lagged：这里跳过而不是断流，客户端可用 since 重新同步。
-    let live = tokio_stream::wrappers::BroadcastStream::new(receiver).filter_map(|item| {
-        item.ok()
-            .map(|event| Ok::<String, std::convert::Infallible>(sse_frame(&event)))
+    let live = tokio_stream::wrappers::BroadcastStream::new(receiver).map(move |item| {
+        let frame=match item {
+            Ok(event)=>{last_sequence=event.sequence;sse_frame(&event)},
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(count))=>
+                format!("event: readonly.gap\ndata: {}\n\n",json!({"kind":"gap","instance":instance,
+                    "reason":"subscriber_lagged","missing":count,"nextCursor":last_sequence,"since":last_sequence})),
+        };
+        Ok::<String,std::convert::Infallible>(frame)
     });
-    let stream = replay_stream.chain(live);
+    // Comments keep an idle connection alive; they are not workflow data or producer events.
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let heartbeat = tokio_stream::wrappers::IntervalStream::new(heartbeat)
+        .map(|_| Ok::<String, std::convert::Infallible>(": heartbeat\n\n".to_string()));
+    let stream = replay_stream.chain(live.merge(heartbeat));
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/event-stream")

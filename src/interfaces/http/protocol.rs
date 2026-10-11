@@ -182,6 +182,12 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
 
 const ROUTES: &[RouteSpec] = &[
     RouteSpec {
+        path: "/debug/read-only/summary",
+        json: true,
+        mutating: false,
+        handler: debug_read_only_summary_route,
+    },
+    RouteSpec {
         path: "/debug/read-only/mode",
         json: true,
         mutating: false,
@@ -1204,6 +1210,12 @@ fn handle_request(
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
+    if request.path == "/debug/read-only/image" {
+        return match debug_read_only_image_response(&request, state) {
+            Ok(response) => Ok(response),
+            Err(error) => Ok(readonly_error_response(&request, state, error)),
+        };
+    }
     if request.path == "/debug/screenshot" {
         return debug_screenshot_response(&request, state);
     }
@@ -1235,6 +1247,9 @@ fn handle_request(
         Ok(body) => (body, true),
         Err(error) => {
             push_history(&request, &error.message, false, state);
+            if request.path.starts_with("/debug/read-only/") {
+                return Ok(readonly_error_response(&request, state, error));
+            }
             return Ok(plain_response(
                 status_code(error.status),
                 format!("错误: {}", error.message),
@@ -1259,6 +1274,25 @@ fn handle_request(
         body,
         response_headers,
     ))
+}
+
+fn readonly_error_response(
+    request: &Request,
+    state: &HttpSharedState,
+    error: AppError,
+) -> Response {
+    let cursor = query_value(&request.query, "cursor")
+        .or_else(|| query_value(&request.query, "since"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    body_response(
+        status_code(error.status),
+        "application/json; charset=utf-8",
+        json!({"ok":false,"error":error.message,"cursor":cursor,"nextCursor":cursor,
+            "instance":crate::debug_read_only::observer().instance()})
+        .to_string(),
+        cors_headers(&request, &state.config.http.host, state.config.http.port),
+    )
 }
 
 fn route(
@@ -1538,6 +1572,10 @@ fn enforce_method(
             | "/debug/screenshot"
             | "/debug/state"
             | "/debug/read-only/events"
+            | "/debug/read-only/image"
+            | "/debug/read-only/summary"
+            | "/debug/read-only/evidence"
+            | "/debug/read-only/entries"
             | "/favicon.ico"
     ) && request.method != "GET"
     {

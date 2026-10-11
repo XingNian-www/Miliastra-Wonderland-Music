@@ -90,6 +90,8 @@ impl CommandEnvelope {
         let (prefix, command_text) = if let Some(text) = user_command
             .strip_prefix('@')
             .or_else(|| user_command.strip_prefix('＠'))
+            .or_else(|| user_command.strip_prefix('&'))
+            .or_else(|| user_command.strip_prefix('＆'))
         {
             (CommandPrefix::At, text)
         } else {

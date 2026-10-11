@@ -15,9 +15,9 @@ pub use cache::{
     CachedTrackInfo, CachedTrackPage, DEFAULT_MAX_REGISTRY_ENTRIES,
 };
 pub use catalog::{
-    BilibiliAdapter, KugouAccountStatus, KugouAdapter, KugouListenReport, PlaybackEligibility,
-    ProviderAccountStatus, ProviderId, SourceAdapter, bilibili_is_bvid, bilibili_normalize_bvid,
-    kugou_calculate_mid, kugou_normalize_guid, kugou_register_device,
+    BilibiliAdapter, ImportedPlaylist, KugouAccountStatus, KugouAdapter, KugouListenReport,
+    PlaybackEligibility, ProviderAccountStatus, ProviderId, SourceAdapter, bilibili_is_bvid,
+    bilibili_normalize_bvid, kugou_calculate_mid, kugou_normalize_guid, kugou_register_device,
 };
 pub use credentials::{CredentialError, CredentialStatus, CredentialStore, ProviderCredential};
 pub use domain::{
@@ -33,5 +33,5 @@ pub use model::{
 };
 pub use runtime::{
     LoginOperation, LoginOperationWaitError, LoginSession, LoginStatus, PlaybackError,
-    PlaybackHandle, PlaybackOperation, PlaybackRuntime, PlaybackSnapshot,
+    PlaybackHandle, PlaybackOperation, PlaybackRuntime, PlaybackSnapshot, PlaylistImportOperation,
 };

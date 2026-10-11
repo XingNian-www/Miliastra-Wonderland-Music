@@ -6,7 +6,7 @@ use super::friend_delivery::{
     before_input_failure, capture_normalized, restore_residency, wait_ms,
 };
 use crate::observation::chat::{
-    ChatIdentity, ChatOcrSnapshot, FriendUnreadLayout, ObservedChatMessageId, SharedChatOcr,
+    ChatIdentity, ChatTimeline, ChatTimelineSnapshot, FriendUnreadLayout, ObservedChatMessageId,
     UnreadFriendHit, find_unread_friend_hits, latest_incoming_fingerprint,
     unread_hit_still_visible,
 };
@@ -61,7 +61,7 @@ impl ProcessSecondaryUnreadOutcome {
 pub(crate) struct SecondaryUnreadUi {
     runtime: UiRuntimeHandle,
     ocr: OcrRuntimeHandle,
-    shared_ocr: SharedChatOcr,
+    chat_timeline: ChatTimeline,
     config: SecondaryUnreadRoutineConfig,
 }
 
@@ -70,12 +70,12 @@ impl SecondaryUnreadUi {
         runtime: UiRuntimeHandle,
         ocr: OcrRuntimeHandle,
         config: SecondaryUnreadRoutineConfig,
-        shared_ocr: SharedChatOcr,
+        chat_timeline: ChatTimeline,
     ) -> Self {
         Self {
             runtime,
             ocr,
-            shared_ocr,
+            chat_timeline,
             config,
         }
     }
@@ -87,7 +87,7 @@ impl SecondaryUnreadUi {
         self.runtime.submit(ProcessSecondaryUnreadRoutine {
             request,
             ocr: self.ocr.clone(),
-            shared_ocr: self.shared_ocr.clone(),
+            chat_timeline: self.chat_timeline.clone(),
             config: self.config.clone(),
         })
     }
@@ -122,7 +122,7 @@ impl SecondaryUnreadRoutineConfig {
 struct ProcessSecondaryUnreadRoutine {
     request: ProcessSecondaryUnread,
     ocr: OcrRuntimeHandle,
-    shared_ocr: SharedChatOcr,
+    chat_timeline: ChatTimeline,
     config: SecondaryUnreadRoutineConfig,
 }
 
@@ -135,7 +135,7 @@ impl UiRoutine for ProcessSecondaryUnreadRoutine {
         // Acquire before any navigation and keep suppression through restoration,
         // including failure/cancellation paths. No service lock spans UI waits.
         let _discard_guard = if self.request.discard_only {
-            match self.shared_ocr.suppress_friend_business() {
+            match self.chat_timeline.suppress_friend_business() {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     let failure = before_input_failure("suppress_secondary_unread", error);
@@ -152,7 +152,7 @@ impl UiRoutine for ProcessSecondaryUnreadRoutine {
             context,
             &self.request,
             &self.ocr,
-            &self.shared_ocr,
+            &self.chat_timeline,
             &self.config,
         ) {
             Ok(effect) => effect,
@@ -175,7 +175,7 @@ fn process_unread(
     context: &mut UiRoutineContext<'_>,
     request: &ProcessSecondaryUnread,
     ocr: &OcrRuntimeHandle,
-    shared_ocr: &SharedChatOcr,
+    chat_timeline: &ChatTimeline,
     config: &SecondaryUnreadRoutineConfig,
 ) -> Result<SecondaryUnreadEffect, UiRoutineFailure> {
     context
@@ -236,7 +236,8 @@ fn process_unread(
         if !request.discard_only {
             wait_bubble_stable(context, config, deadline)?;
         }
-        let Some(snapshot) = wait_shared_friend_snapshot(context, shared_ocr, opened_at, deadline)?
+        let Some(snapshot) =
+            wait_shared_friend_snapshot(context, chat_timeline, opened_at, deadline)?
         else {
             return Err(unread_message_failure(
                 "fresh shared friend chat OCR did not arrive before timeout",
@@ -250,7 +251,7 @@ fn process_unread(
             // 必须在"提升最后一条命令"之前返回；清场全程还持有好友业务抑制
             // （execute 里的 suppress_friend_business），两层都不允许它派发任何命令。
             for message in &snapshot.messages {
-                shared_ocr
+                chat_timeline
                     .acknowledge_business(&message.id)
                     .map_err(|error| after_input_failure("discard_secondary_unread", error))?;
             }
@@ -260,11 +261,11 @@ fn process_unread(
             // 用户规则：进入有未读的会话时读取最后发送的那条命令，恰好一次。
             // 提升只把这条气泡放行给共享观察的业务订阅者；这里必须确认它真的被取走，
             // 否则 UI 事务立刻恢复大厅，这次提升就没有可消费的后续帧，最后什么都不派发。
-            let promoted = shared_ocr
+            let promoted = chat_timeline
                 .deliver_unread_baseline(&snapshot, &message.id)
                 .map_err(|error| after_input_failure("deliver_secondary_unread", error))?;
             if promoted {
-                wait_promoted_unread_consumed(context, shared_ocr, &message.id, deadline)?;
+                wait_promoted_unread_consumed(context, chat_timeline, &message.id, deadline)?;
             } else {
                 // 不在首屏基线里：要么这条气泡已按常规路径交付过（成功命令锁或永久 ACK），
                 // 要么它从未进过基线，此时不会有任何派发。如实记录以区分这两种情况，
@@ -272,7 +273,9 @@ fn process_unread(
                 log::warn!(
                     "二级好友未读提升未生效（气泡不在首屏基线）: friend={} pending={}",
                     friend_name,
-                    shared_ocr.is_business_pending(&message.id).unwrap_or(false)
+                    chat_timeline
+                        .is_business_pending(&message.id)
+                        .unwrap_or(false)
                 );
             }
             return Ok(SecondaryUnreadEffect::Message {
@@ -297,22 +300,22 @@ fn process_unread(
 
 fn wait_shared_friend_snapshot(
     context: &mut UiRoutineContext<'_>,
-    shared_ocr: &SharedChatOcr,
+    chat_timeline: &ChatTimeline,
     opened_at: Instant,
     deadline: Instant,
-) -> Result<Option<ChatOcrSnapshot>, UiRoutineFailure> {
-    let mut token = shared_ocr
+) -> Result<Option<ChatTimelineSnapshot>, UiRoutineFailure> {
+    let mut token = chat_timeline
         .request_refresh()
         .map_err(|error| after_input_failure("refresh_secondary_unread", error))?;
     loop {
-        if let Some(snapshot) = shared_ocr
+        if let Some(snapshot) = chat_timeline
             .wait_for_snapshot(token, Duration::ZERO)
             .map_err(|error| after_input_failure("ocr_secondary_unread", error))?
         {
             if fresh_friend_snapshot(&snapshot, opened_at) {
                 return Ok(Some(snapshot));
             }
-            token = shared_ocr
+            token = chat_timeline
                 .request_refresh()
                 .map_err(|error| after_input_failure("refresh_secondary_unread", error))?;
         }
@@ -336,8 +339,8 @@ fn wait_shared_friend_snapshot(
 }
 
 fn latest_unread_message(
-    snapshot: &ChatOcrSnapshot,
-) -> Option<&crate::observation::chat::SharedChatMessage> {
+    snapshot: &ChatTimelineSnapshot,
+) -> Option<&crate::observation::chat::ChatTimelineMessage> {
     snapshot
         .messages
         .iter()
@@ -354,15 +357,15 @@ fn latest_unread_message(
 /// 而不是"提升了却不用"。超时不当作失败：消费方可能已按常规路径处理过同一气泡。
 fn wait_promoted_unread_consumed(
     context: &mut UiRoutineContext<'_>,
-    shared_ocr: &SharedChatOcr,
+    chat_timeline: &ChatTimeline,
     id: &ObservedChatMessageId,
     deadline: Instant,
 ) -> Result<(), UiRoutineFailure> {
-    let mut token = shared_ocr
+    let mut token = chat_timeline
         .request_refresh()
         .map_err(|error| after_input_failure("refresh_secondary_unread", error))?;
     loop {
-        if !shared_ocr
+        if !chat_timeline
             .is_business_pending(id)
             .map_err(|error| after_input_failure("confirm_secondary_unread", error))?
         {
@@ -372,12 +375,12 @@ fn wait_promoted_unread_consumed(
             log::warn!("二级好友未读提升在超时前未被消费: id={id:?}");
             return Ok(());
         }
-        if shared_ocr
+        if chat_timeline
             .wait_for_snapshot(token, Duration::ZERO)
             .map_err(|error| after_input_failure("ocr_secondary_unread", error))?
             .is_some()
         {
-            token = shared_ocr
+            token = chat_timeline
                 .request_refresh()
                 .map_err(|error| after_input_failure("refresh_secondary_unread", error))?;
         }
@@ -397,7 +400,7 @@ fn wait_promoted_unread_consumed(
     }
 }
 
-fn fresh_friend_snapshot(snapshot: &ChatOcrSnapshot, opened_at: Instant) -> bool {
+fn fresh_friend_snapshot(snapshot: &ChatTimelineSnapshot, opened_at: Instant) -> bool {
     snapshot.captured_at >= opened_at
         && matches!(&snapshot.chat, ChatIdentity::Friend(name) if !name.trim().is_empty())
 }
@@ -572,10 +575,10 @@ mod tests {
 
     #[test]
     fn unread_selection_promotes_latest_incoming_without_replaying_history() {
-        use crate::observation::chat::SharedChatInput;
-        let shared = SharedChatOcr::new();
+        use crate::observation::chat::RecognizedChatMessage;
+        let shared = ChatTimeline::new();
         let listener = shared.subscribe().unwrap();
-        let make = |text: &str, y, kind: &str| SharedChatInput {
+        let make = |text: &str, y, kind: &str| RecognizedChatMessage {
             text: text.into(),
             sender: None,
             raw_sender: None,
@@ -628,10 +631,10 @@ mod tests {
         // 初始红点清场（进入二级监听那一次）只建立基线、清红点；即使屏幕上就有命令气泡，
         // 也不能被提升成一次派发。清场期间 UI 事务持有好友业务抑制，共享观察会把看到的
         // 气泡直接永久 ACK，因此这里既进不了未读基线，也不会变成待派发。
-        use crate::observation::chat::SharedChatInput;
-        let shared = SharedChatOcr::new();
+        use crate::observation::chat::RecognizedChatMessage;
+        let shared = ChatTimeline::new();
         let listener = shared.subscribe().unwrap();
-        let command = |text: &str, y| SharedChatInput {
+        let command = |text: &str, y| RecognizedChatMessage {
             text: text.into(),
             sender: None,
             raw_sender: None,
@@ -648,7 +651,11 @@ mod tests {
         // 气泡在画面上可见（因此"最后一条命令"的候选判定本身成立）……
         assert!(latest_unread_message(&snapshot).is_some());
         // ……但清场不允许把它提升，也不存在任何待派发状态。
-        assert!(!shared.deliver_unread_baseline(&snapshot, &visible.id).unwrap());
+        assert!(
+            !shared
+                .deliver_unread_baseline(&snapshot, &visible.id)
+                .unwrap()
+        );
         assert!(!shared.is_business_pending(&visible.id).unwrap());
         assert!(!shared.acknowledge_business(&visible.id).unwrap());
     }
@@ -656,7 +663,7 @@ mod tests {
     #[test]
     fn shared_friend_snapshot_requires_fresh_observer_identity() {
         let opened_at = Instant::now();
-        let mut snapshot = ChatOcrSnapshot {
+        let mut snapshot = ChatTimelineSnapshot {
             visual_session: crate::observation::chat::VisualSessionId::new(1),
             captured_at: opened_at - Duration::from_millis(1),
             chat: ChatIdentity::Friend(Arc::from("Alice")),

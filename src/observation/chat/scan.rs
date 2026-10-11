@@ -1,3 +1,5 @@
+//! Stateless per-frame chat recognition. Message identity belongs to the timeline.
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -72,6 +74,15 @@ impl TemplateArgs {
             batch_recognize: ocr.batch_recognize,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct RecognizedChatMessage {
+    pub(crate) text: String,
+    pub(crate) sender: Option<String>,
+    pub(crate) raw_sender: Option<String>,
+    pub(crate) message_type: String,
+    pub(crate) block: Rect,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -165,7 +176,7 @@ pub(crate) fn recognize_prepared_chat(
     templates: &ResolvedTemplateArgs,
     prepared: PreparedChatScan,
     telemetry_sink: Option<&dyn ChatScanTelemetrySink>,
-) -> Result<Vec<ChatMessage>> {
+) -> Result<Vec<RecognizedChatMessage>> {
     let mut messages = Vec::new();
     let ocr_started = Instant::now();
     if templates.batch_recognize {
@@ -184,7 +195,9 @@ pub(crate) fn recognize_prepared_chat(
         )?;
         for text in texts {
             let (marker, block) = &prepared.blocks[text.id];
-            messages.push(ChatMessage {
+            messages.push(RecognizedChatMessage {
+                sender: None,
+                raw_sender: None,
                 message_type: marker_type(marker).to_string(),
                 block: *block,
                 text: text.text,
@@ -194,7 +207,9 @@ pub(crate) fn recognize_prepared_chat(
         for (marker, block) in &prepared.blocks {
             let crop = crop_canvas(&prepared.chat, *block)?;
             let text = ocr.merged_text(crop, templates.same_line_y_tolerance, priority)?;
-            messages.push(ChatMessage {
+            messages.push(RecognizedChatMessage {
+                sender: None,
+                raw_sender: None,
                 message_type: marker_type(marker).to_string(),
                 block: *block,
                 text,
@@ -242,7 +257,7 @@ pub(crate) fn recognize_prepared_chat(
     Ok(messages)
 }
 
-fn format_scan_result(messages: &[ChatMessage]) -> String {
+fn format_scan_result(messages: &[RecognizedChatMessage]) -> String {
     if messages.is_empty() {
         return "[]".to_string();
     }

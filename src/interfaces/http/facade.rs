@@ -1012,15 +1012,24 @@ impl crate::runtime::ui::UiRoutine for DebugAtomicRoutine {
             InputText { text, settle_ms } => context.device().input_text(&text, settle_ms)?,
             CloseWindow => context.device().close_window()?,
             Click { x, y } => context.device().click_point(x, y)?,
+            #[cfg(target_os = "windows")]
             PressKey { key } => context
                 .device()
                 .press_key(crate::adapters::windows::parse_key(&key)?)?,
+            #[cfg(not(target_os = "windows"))]
+            PressKey { .. } => anyhow::bail!("按键输入需要 Windows 设备适配层"),
+            #[cfg(target_os = "windows")]
             KeyDown { key } => context
                 .device()
                 .key_down(crate::adapters::windows::parse_key(&key)?)?,
+            #[cfg(not(target_os = "windows"))]
+            KeyDown { .. } => anyhow::bail!("按键输入需要 Windows 设备适配层"),
+            #[cfg(target_os = "windows")]
             KeyUp { key } => context
                 .device()
                 .key_up(crate::adapters::windows::parse_key(&key)?)?,
+            #[cfg(not(target_os = "windows"))]
+            KeyUp { .. } => anyhow::bail!("按键输入需要 Windows 设备适配层"),
             MouseDown { button } => context.device().mouse_down(match button.as_str() {
                 "left" => enigo::Button::Left,
                 "right" => enigo::Button::Right,

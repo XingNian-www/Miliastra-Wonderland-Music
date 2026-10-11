@@ -2,7 +2,7 @@
 use super::*;
 use crate::features::command::{CommandEnvelope, CommandObservation};
 use crate::features::playlist::{PlaylistApplication, PlaylistCommand, WINDOW_TTL};
-use crate::observation::chat::SharedChatMessage;
+use crate::observation::chat::ChatTimelineMessage;
 
 /// Clear business window state on every exit, including failed baseline/output/observation.
 struct PlaylistWindowCleanup {
@@ -32,7 +32,7 @@ impl Drop for PlaylistWindowCleanup {
 }
 
 fn playlist_decision_envelope(
-    message: &SharedChatMessage,
+    message: &ChatTimelineMessage,
     captured_at: Instant,
 ) -> Option<CommandEnvelope> {
     // Point-song decisions read blue messages in CurrentHall even for a pink request.
@@ -84,7 +84,7 @@ fn owner_matches(owner: &str, sender: &str) -> bool {
 }
 
 fn acknowledge_playlist_decision(
-    shared: &crate::observation::chat::SharedChatOcr,
+    shared: &crate::observation::chat::ChatTimeline,
     envelope: &CommandEnvelope,
     changed: bool,
 ) -> Result<()> {
@@ -109,8 +109,8 @@ fn acknowledge_playlist_decision(
 impl ChatDecisionReader {
     fn accept_playlist_message(
         &mut self,
-        shared: &crate::observation::chat::SharedChatOcr,
-        message: &SharedChatMessage,
+        shared: &crate::observation::chat::ChatTimeline,
+        message: &ChatTimelineMessage,
     ) -> Result<bool> {
         let chat_message = ChatMessage {
             message_type: message.message_type.clone(),
@@ -129,7 +129,7 @@ impl ChatDecisionReader {
     /// Keep the ordinary reader's baseline/cursor rule, but preserve shared sender/id evidence.
     /// An unconfirmed sender is deliberately not inserted into seen: a later shared revision
     /// may establish its identity without promoting a historical baseline message.
-    fn read_playlist_messages(&mut self) -> Result<Vec<(SharedChatMessage, Instant)>> {
+    fn read_playlist_messages(&mut self) -> Result<Vec<(ChatTimelineMessage, Instant)>> {
         let mut messages = Vec::new();
         for snapshot in self.subscriber.read()? {
             if snapshot.chat != self.chat || snapshot.captured_at <= self.baseline_at {
@@ -187,7 +187,7 @@ impl ApplicationRuntime {
             application.execute(owner, command, &mut port, Instant::now(), playlist_seed())?;
         // Successful choices use the existing text/position lock across visual rebuilds;
         // an invalid index is only consumed and must not evict a real success lock.
-        acknowledge_playlist_decision(&self.ui.shared_ocr, envelope, changed)?;
+        acknowledge_playlist_decision(&self.ui.chat_timeline, envelope, changed)?;
         let matched =
             PlaylistCommand::parse_window_chat(envelope).expect("parsed playlist decision");
         let interaction =
@@ -222,8 +222,8 @@ impl ApplicationRuntime {
             self.log_executed_command(parsed, "playlist")?;
             return self.reply_batch(&messages.iter().map(String::as_str).collect::<Vec<_>>(), 0);
         }
-        // Include baseline acquisition and output time in the one total 20-second budget.
-        let deadline = Instant::now() + WINDOW_TTL;
+        // Bound setup separately; the full selection period starts after the recommendations send.
+        let setup_deadline = Instant::now() + WINDOW_TTL;
         let reader = self.begin_chat_decision_reader_until(
             ChatDecisionScope::CurrentHall,
             &|message_type| message_type == "blue",
@@ -242,11 +242,11 @@ impl ApplicationRuntime {
                     .and_then(playlist_decision)
                     .is_some()
             },
-            deadline,
+            setup_deadline,
         )?;
         let mut session = PlaylistWindowSession { reader, _cleanup };
         let reader = &mut session.reader;
-        if !self.playlist_window_active(reader, deadline)? {
+        if !self.playlist_window_active(reader, setup_deadline)? {
             return Ok(());
         }
         let mut port = PlaylistRuntimePlaybackPort { runtime: self };
@@ -257,12 +257,13 @@ impl ApplicationRuntime {
             Instant::now(),
             playlist_seed(),
         )?;
-        application.set_window_deadline(&owner, deadline)?;
         self.log_executed_command(parsed, "playlist")?;
-        if !self.playlist_window_active(reader, deadline)? {
+        if !self.playlist_window_active(reader, setup_deadline)? {
             return Ok(());
         }
         self.reply_batch(&messages.iter().map(String::as_str).collect::<Vec<_>>(), 0)?;
+        let mut deadline = Instant::now() + WINDOW_TTL;
+        application.set_window_deadline(&owner, deadline)?;
         while self.playlist_window_active(reader, deadline)? {
             for (message, captured_at) in reader.read_playlist_messages()? {
                 if !self.playlist_window_active(reader, deadline)? {
@@ -277,7 +278,7 @@ impl ApplicationRuntime {
                 let Some(command) = playlist_decision(&envelope) else {
                     continue;
                 };
-                if !reader.accept_playlist_message(&self.ui.shared_ocr, &message)? {
+                if !reader.accept_playlist_message(&self.ui.chat_timeline, &message)? {
                     continue;
                 }
                 let changed = match command {
@@ -306,6 +307,10 @@ impl ApplicationRuntime {
                     &envelope,
                     changed,
                 )?;
+                if changed && matches!(command, PlaylistCommand::Reroll) {
+                    deadline = Instant::now() + WINDOW_TTL;
+                    application.set_window_deadline(&owner, deadline)?;
+                }
                 if application.window_len(&owner, Instant::now())? == 0 {
                     return Ok(());
                 }
@@ -317,7 +322,7 @@ impl ApplicationRuntime {
         }
         drop(session);
         if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
-            ApplicationRuntime::reply(self, "歌单窗口已超时关闭。")?;
+            ApplicationRuntime::reply(self, "推荐已超时关闭,重新发送@歌单可再次推荐.")?;
         }
         Ok(())
     }
@@ -326,7 +331,7 @@ impl ApplicationRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observation::chat::{ChatIdentity, SharedChatInput, SharedChatOcr};
+    use crate::observation::chat::{ChatIdentity, ChatTimeline, RecognizedChatMessage};
     use miliastra_playback::{PlayableTrack, ProviderId, TrackKey, TrackMetadata, TrackRef};
 
     struct Playback {
@@ -352,8 +357,8 @@ mod tests {
         }
     }
 
-    fn input(text: &str, sender: Option<&str>, color: &str, y: i32) -> SharedChatInput {
-        SharedChatInput {
+    fn input(text: &str, sender: Option<&str>, color: &str, y: i32) -> RecognizedChatMessage {
+        RecognizedChatMessage {
             text: text.into(),
             sender: sender.map(str::to_owned),
             raw_sender: sender.map(str::to_owned),
@@ -363,7 +368,7 @@ mod tests {
     }
 
     fn session(
-        shared: &SharedChatOcr,
+        shared: &ChatTimeline,
         observations: &ChatObservationShared,
         application: &PlaylistApplication,
         chat: ChatIdentity,
@@ -435,7 +440,7 @@ mod tests {
     fn selection_cancel_timeout_and_failure_release_exclusive_and_business_window() {
         for chat in [ChatIdentity::PrimaryHall, ChatIdentity::SecondaryHall] {
             for ending in ["select", "close", "timeout", "failure"] {
-                let shared = SharedChatOcr::new();
+                let shared = ChatTimeline::new();
                 let observations = ChatObservationShared::new();
                 let app = application();
                 let mut session = session(&shared, &observations, &app, chat.clone());
@@ -484,7 +489,7 @@ mod tests {
 
     #[test]
     fn terminal_observation_finishes_before_playback_without_removing_selection() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let observations = ChatObservationShared::new();
         let app = application();
         let mut session = session(&shared, &observations, &app, ChatIdentity::PrimaryHall);
@@ -540,7 +545,7 @@ mod tests {
 
     #[test]
     fn decisions_preserve_blue_color_and_only_owner_can_use_primary_or_secondary_sender() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let observations = ChatObservationShared::new();
         let app = application();
         let mut session = session(&shared, &observations, &app, ChatIdentity::PrimaryHall);
@@ -582,7 +587,7 @@ mod tests {
             ("甲:@关闭", true),
             ("甲:@5", false),
         ] {
-            let shared = SharedChatOcr::new();
+            let shared = ChatTimeline::new();
             let observations = ChatObservationShared::new();
             let app = application();
             let mut session = session(&shared, &observations, &app, ChatIdentity::PrimaryHall);
@@ -651,7 +656,7 @@ mod tests {
 
     #[test]
     fn unknown_sender_can_be_confirmed_later_but_baseline_never_reappears() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let observations = ChatObservationShared::new();
         let app = application();
         let mut session = session(&shared, &observations, &app, ChatIdentity::SecondaryHall);

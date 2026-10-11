@@ -9,7 +9,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::composition::application::http_facade::ApplicationHttpCommandFacade;
+use crate::interfaces::http::facade::ApplicationHttpCommandFacade;
 use crate::features::hall::HallRuntimeState;
 use crate::features::playback::{
     PlaybackRuntimeState, PlayerStatus, SongRequestLeaderboardEntry, test_candidate, test_track,

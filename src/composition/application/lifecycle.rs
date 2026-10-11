@@ -40,7 +40,7 @@ impl ApplicationRuntime {
         let mut shared_chat_subscriber = None;
         let result = (|| -> Result<()> {
             self.start_formal_task_runtime()?;
-            shared_chat_subscriber = Some(self.ui.shared_ocr.subscribe_business()?);
+            shared_chat_subscriber = Some(self.ui.chat_timeline.subscribe_business()?);
             shared_chat_observer = Some(self.start_shared_chat_observer()?);
             self.lifecycle
                 .monitor

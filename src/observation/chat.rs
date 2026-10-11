@@ -1,9 +1,10 @@
 pub(crate) mod scan;
+mod passive;
 mod secondary_hall_vision;
 mod secondary_unread_vision;
-mod shared_ocr;
 mod stream;
-pub(crate) use shared_ocr::*;
+mod timeline;
+pub(crate) use timeline::*;
 mod visual;
 
 use std::collections::BTreeMap;
@@ -13,9 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) use scan::{
-    ChatMessage, ChatScanTelemetry, ChatScanTelemetrySink, ResolvedTemplateArgs, TemplateArgs,
-    count_chat_markers, count_scanned_chat_markers, prepare_chat_scan,
-    prepare_chat_scan_with_markers, recognize_prepared_chat, scan_chat_markers,
+    ChatMessage, ChatScanTelemetry, ChatScanTelemetrySink, RecognizedChatMessage,
+    ResolvedTemplateArgs, TemplateArgs, count_chat_markers, count_scanned_chat_markers,
+    prepare_chat_scan, prepare_chat_scan_with_markers, recognize_prepared_chat, scan_chat_markers,
 };
 pub(crate) use secondary_unread_vision::{
     FriendUnreadLayout, UnreadFriendHit, find_unread_friend_hits, unread_hit_still_visible,
@@ -30,9 +31,17 @@ pub(crate) use visual::{
     hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
     secondary_hall_bubbles,
 };
+pub(crate) use passive::{
+    PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity, hash_region,
+    parse_secondary_sender_identity, passive_layout, passive_secondary_identity, passive_sender,
+    passive_text, recognize_passive_hall, recognize_passive_secondary,
+};
 
 #[cfg(test)]
 pub(crate) use visual::SECONDARY_TITLE_RECT;
+
+#[cfg(all(test, feature = "ocr-mnn"))]
+mod actual_screenshot_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VisualSessionId(u64);

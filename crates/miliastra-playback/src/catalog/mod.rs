@@ -2,6 +2,7 @@ mod bilibili;
 mod kugou;
 pub mod kugou_crypto;
 mod netease;
+mod playlist_import;
 mod provider;
 mod qqmusic;
 
@@ -46,6 +47,7 @@ pub use kugou::{
     kugou_register_device,
 };
 pub use netease::NeteaseAdapter;
+pub use playlist_import::ImportedPlaylist;
 pub use provider::{
     PlaybackEligibility, ProviderId, ProviderRegistry, ProviderSearchCandidate,
     ProviderSearchOutcome,
@@ -155,6 +157,11 @@ pub trait SourceAdapter: Send + Sync + 'static {
     }
     async fn search(&self, spec: &SearchSpec)
     -> Result<Vec<ProviderSearchCandidate>, CatalogError>;
+    async fn import_playlist(&self, _input: &str) -> Result<ImportedPlaylist, CatalogError> {
+        Err(CatalogError::Unavailable(
+            "该音乐平台暂不支持歌单导入".to_owned(),
+        ))
+    }
     async fn resolve(
         &self,
         key: &SongKey,
@@ -364,6 +371,18 @@ pub struct SourceCatalog {
 }
 
 impl SourceCatalog {
+    pub async fn import_playlist(
+        &self,
+        provider: &str,
+        input: &str,
+    ) -> Result<ImportedPlaylist, CatalogError> {
+        let adapter = self
+            .adapters
+            .get(provider)
+            .ok_or_else(|| CatalogError::UnknownSource(provider.to_owned()))?;
+        adapter.import_playlist(input).await
+    }
+
     pub fn new(adapters: impl IntoIterator<Item = (String, Arc<dyn SourceAdapter>)>) -> Self {
         let adapters = adapters.into_iter().collect();
         Self {

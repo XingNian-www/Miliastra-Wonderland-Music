@@ -55,6 +55,21 @@ pub struct PlaybackOperation {
     reply: std_mpsc::Receiver<Result<(), PlaybackError>>,
 }
 
+pub struct PlaylistImportOperation {
+    reply: std_mpsc::Receiver<Result<crate::catalog::ImportedPlaylist, PlaybackError>>,
+    _cancellation: oneshot::Sender<()>,
+}
+
+impl PlaylistImportOperation {
+    pub fn try_wait(&self) -> Option<Result<crate::catalog::ImportedPlaylist, PlaybackError>> {
+        match self.reply.try_recv() {
+            Ok(result) => Some(result),
+            Err(std_mpsc::TryRecvError::Empty) => None,
+            Err(std_mpsc::TryRecvError::Disconnected) => Some(Err(PlaybackError::RuntimeStopped)),
+        }
+    }
+}
+
 pub struct LoginOperation {
     reply: std_mpsc::Receiver<Result<CredentialStatus, PlaybackError>>,
 }
@@ -150,6 +165,12 @@ impl PlaybackError {
 
 enum Command {
     Search(SearchQuery, Reply<Vec<SearchCandidate>>),
+    ImportPlaylist(
+        String,
+        String,
+        Reply<crate::catalog::ImportedPlaylist>,
+        oneshot::Receiver<()>,
+    ),
     Play(PlayableTrack, bool, Option<f64>, Reply<()>),
     /// 预加载音源解析结果（fire-and-forget，无回复；失败静默）。
     Preload(PlayableTrack),
@@ -392,6 +413,21 @@ impl Drop for PlaybackRuntime {
 }
 
 impl PlaybackHandle {
+    pub fn import_playlist(
+        &self,
+        provider: impl Into<String>,
+        input: impl Into<String>,
+    ) -> Result<PlaylistImportOperation, PlaybackError> {
+        let (cancellation, cancel_rx) = oneshot::channel();
+        let reply = self.submit(|reply| {
+            Command::ImportPlaylist(provider.into(), input.into(), reply, cancel_rx)
+        })?;
+        Ok(PlaylistImportOperation {
+            reply,
+            _cancellation: cancellation,
+        })
+    }
+
     pub fn search(&self, query: SearchQuery) -> Result<Vec<SearchCandidate>, PlaybackError> {
         self.request(|reply| Command::Search(query, reply))
     }
@@ -1001,6 +1037,18 @@ async fn run_commands(
                 let search_core = core.clone();
                 searches.spawn(async move {
                     let _ = reply.send(search(&search_core, query).await);
+                });
+            }
+            Command::ImportPlaylist(provider, input, reply, cancellation) => {
+                let import_core = core.clone();
+                searches.spawn(async move {
+                    tokio::select! {
+                        _ = cancellation => {}
+                        result = import_core.import_playlist(&provider, &input) => {
+                            let result = result.map_err(|error| PlaybackError::Internal(error.to_string()));
+                            let _ = reply.send(result);
+                        }
+                    }
                 });
             }
             Command::Preload(track) => {

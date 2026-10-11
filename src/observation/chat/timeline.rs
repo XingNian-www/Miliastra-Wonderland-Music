@@ -1,9 +1,12 @@
+//! Stateful message continuity, revision handling, delivery and command deduplication.
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 
+pub(crate) use super::scan::RecognizedChatMessage;
 use super::{BubbleSequence, ChatIdentity, ObservedChatMessageId, VisualSessionId};
 use crate::ui::geometry::Rect;
 
@@ -18,16 +21,7 @@ const COMMAND_LOCK_POSITION_TOLERANCE_PX: i32 = 28;
 const COMMAND_LOCK_MISSING_FRAMES_BEFORE_RELEASE: u8 = 2;
 
 #[derive(Clone, Debug)]
-pub(crate) struct SharedChatInput {
-    pub(crate) text: String,
-    pub(crate) sender: Option<String>,
-    pub(crate) raw_sender: Option<String>,
-    pub(crate) message_type: String,
-    pub(crate) block: Rect,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SharedChatMessage {
+pub(crate) struct ChatTimelineMessage {
     pub(crate) id: ObservedChatMessageId,
     pub(crate) text: String,
     pub(crate) sender: Option<String>,
@@ -39,15 +33,15 @@ pub(crate) struct SharedChatMessage {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChatOcrSnapshot {
+pub(crate) struct ChatTimelineSnapshot {
     pub(crate) visual_session: VisualSessionId,
     pub(crate) captured_at: Instant,
     pub(crate) chat: ChatIdentity,
-    pub(crate) messages: Vec<SharedChatMessage>,
+    pub(crate) messages: Vec<ChatTimelineMessage>,
 }
 
 #[derive(Clone)]
-pub(crate) struct SharedChatOcr {
+pub(crate) struct ChatTimeline {
     inner: Arc<Inner>,
 }
 
@@ -57,7 +51,7 @@ struct Inner {
 }
 
 struct State {
-    latest: Option<ChatOcrSnapshot>,
+    latest: Option<ChatTimelineSnapshot>,
     trackers: HashMap<ChatIdentity, Tracker>,
     business_pending: HashSet<ObservedChatMessageId>,
     unread_baseline: HashSet<ObservedChatMessageId>,
@@ -83,7 +77,7 @@ struct Tracker {
     session: VisualSessionId,
     next_sequence: u64,
     initialized: bool,
-    visible: Vec<SharedChatMessage>,
+    visible: Vec<ChatTimelineMessage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,7 +102,7 @@ impl BusinessMessageRevision {
         }
     }
 
-    fn from_message(message: &SharedChatMessage) -> Self {
+    fn from_message(message: &ChatTimelineMessage) -> Self {
         Self::new(
             &message.text,
             message.sender.as_deref(),
@@ -161,7 +155,7 @@ impl CommandLock {
 
     /// anchor_matched(msg)：锁中存在条目满足 normalize(entry.text) == normalize(msg.text)
     /// 且 msg.block.y <= entry.y + TOLERANCE（一行高）。
-    fn matches(&self, message: &SharedChatMessage) -> bool {
+    fn matches(&self, message: &ChatTimelineMessage) -> bool {
         self.matches_text_at(&message.text, message.block.y)
     }
 
@@ -191,7 +185,7 @@ impl CommandLock {
     /// COMMAND_LOCK_MISSING_FRAMES_BEFORE_RELEASE 个可信帧都判定缺失才真正移除，
     /// 单帧 OCR 抖动（例如末字误读）不会误删条目。
     /// 空帧不构成"屏幕上没有"的证据，沿用 Tracker::observe 对空帧的既有语义。
-    fn release_missing(&mut self, observed: &[SharedChatMessage]) {
+    fn release_missing(&mut self, observed: &[ChatTimelineMessage]) {
         if observed.is_empty() {
             return;
         }
@@ -214,7 +208,7 @@ impl CommandLock {
 struct Subscription {
     chat: Option<ChatIdentity>,
     session: Option<VisualSessionId>,
-    queue: VecDeque<ChatOcrSnapshot>,
+    queue: VecDeque<ChatTimelineSnapshot>,
     failure: Option<String>,
     durable_business: bool,
 }
@@ -255,19 +249,19 @@ impl RefreshFailure {
 
 struct Refresh {
     requested_at: Instant,
-    outcome: Option<std::result::Result<Option<ChatOcrSnapshot>, RefreshFailure>>,
+    outcome: Option<std::result::Result<Option<ChatTimelineSnapshot>, RefreshFailure>>,
 }
 
 /// Each handle owns its queue; dropping it never changes another subscriber.
-pub(crate) struct SharedChatSubscriber {
-    shared: SharedChatOcr,
+pub(crate) struct ChatTimelineSubscriber {
+    shared: ChatTimeline,
     id: u64,
 }
 
 /// A business claim is committed only after dispatch succeeds. On failure it
 /// becomes eligible again unless a discard guard superseded the claim.
 pub(crate) struct SharedBusinessClaim {
-    shared: SharedChatOcr,
+    shared: ChatTimeline,
     id: ObservedChatMessageId,
     suppression_generation: u64,
     /// 被派发消息自身的文本与屏幕位置，认领时就捕获，绝不回头查当前 tracker
@@ -354,7 +348,7 @@ impl Drop for SharedBusinessClaim {
 }
 
 pub(crate) struct FriendBusinessSuppression {
-    shared: SharedChatOcr,
+    shared: ChatTimeline,
 }
 
 impl Drop for FriendBusinessSuppression {
@@ -369,7 +363,7 @@ impl Drop for FriendBusinessSuppression {
     }
 }
 
-impl SharedChatOcr {
+impl ChatTimeline {
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -404,20 +398,20 @@ impl SharedChatOcr {
         self.inner
             .state
             .lock()
-            .map_err(|_| anyhow!("shared chat OCR state lock poisoned"))
+            .map_err(|_| anyhow!("chat timeline state lock poisoned"))
     }
 
-    pub(crate) fn latest(&self) -> Result<Option<ChatOcrSnapshot>> {
+    pub(crate) fn latest(&self) -> Result<Option<ChatTimelineSnapshot>> {
         Ok(self.lock()?.latest.clone())
     }
 
-    pub(crate) fn subscribe(&self) -> Result<SharedChatSubscriber> {
+    pub(crate) fn subscribe(&self) -> Result<ChatTimelineSubscriber> {
         let mut state = self.lock()?;
         Ok(self.subscribe_locked(&mut state, None, false))
     }
 
     /// A business reader survives transient capture/OCR failures and retains its queue.
-    pub(crate) fn subscribe_business(&self) -> Result<SharedChatSubscriber> {
+    pub(crate) fn subscribe_business(&self) -> Result<ChatTimelineSubscriber> {
         let mut state = self.lock()?;
         Ok(self.subscribe_locked(&mut state, None, true))
     }
@@ -425,14 +419,14 @@ impl SharedChatOcr {
     /// Reading the passive baseline and starting the queue is one atomic operation.
     pub(crate) fn subscribe_with_snapshot(
         &self,
-    ) -> Result<(Option<ChatOcrSnapshot>, SharedChatSubscriber)> {
+    ) -> Result<(Option<ChatTimelineSnapshot>, ChatTimelineSubscriber)> {
         let mut state = self.lock()?;
         let latest = state.latest.clone();
         let subscriber = self.subscribe_locked(&mut state, None, false);
         Ok((latest, subscriber))
     }
 
-    pub(crate) fn subscribe_chat(&self, chat: ChatIdentity) -> Result<SharedChatSubscriber> {
+    pub(crate) fn subscribe_chat(&self, chat: ChatIdentity) -> Result<ChatTimelineSubscriber> {
         let mut state = self.lock()?;
         Ok(self.subscribe_locked(&mut state, Some(chat), false))
     }
@@ -442,7 +436,7 @@ impl SharedChatOcr {
         state: &mut State,
         chat: Option<ChatIdentity>,
         durable_business: bool,
-    ) -> SharedChatSubscriber {
+    ) -> ChatTimelineSubscriber {
         let id = state.next_subscriber;
         state.next_subscriber += 1;
         state.subscribers.insert(
@@ -455,7 +449,7 @@ impl SharedChatOcr {
                 durable_business,
             },
         );
-        SharedChatSubscriber {
+        ChatTimelineSubscriber {
             shared: self.clone(),
             id,
         }
@@ -464,7 +458,7 @@ impl SharedChatOcr {
     pub(crate) fn refresh_after_other_hall_panel(
         &self,
         expected: &ChatIdentity,
-        snapshot: &ChatOcrSnapshot,
+        snapshot: &ChatTimelineSnapshot,
     ) -> Result<Option<u64>> {
         if other_hall_panel(expected, &snapshot.chat) {
             self.request_refresh().map(Some)
@@ -482,7 +476,7 @@ impl SharedChatOcr {
                 .iter()
                 .find_map(|(id, request)| request.outcome.as_ref().map(|_| *id));
             let Some(id) = completed else {
-                bail!("shared chat OCR refresh request capacity exceeded");
+                bail!("chat timeline refresh request capacity exceeded");
             };
             state.requests.remove(&id);
         }
@@ -514,12 +508,12 @@ impl SharedChatOcr {
         &self,
         request: u64,
         timeout: Duration,
-    ) -> Result<Option<ChatOcrSnapshot>> {
+    ) -> Result<Option<ChatTimelineSnapshot>> {
         let started = Instant::now();
         let mut state = self.lock()?;
         loop {
             let refresh = state.requests.get(&request).ok_or_else(|| {
-                anyhow!("unknown or expired shared chat OCR refresh token {request}")
+                anyhow!("unknown or expired chat timeline refresh token {request}")
             })?;
             if let Some(outcome) = &refresh.outcome {
                 return outcome.clone().map_err(RefreshFailure::into_error);
@@ -534,7 +528,7 @@ impl SharedChatOcr {
                 .inner
                 .changed
                 .wait_timeout(state, remaining)
-                .map_err(|_| anyhow!("shared chat OCR state lock poisoned"))?;
+                .map_err(|_| anyhow!("chat timeline state lock poisoned"))?;
             state = next;
         }
     }
@@ -544,8 +538,8 @@ impl SharedChatOcr {
         &self,
         captured_at: Instant,
         chat: ChatIdentity,
-        messages: Vec<SharedChatInput>,
-    ) -> Result<ChatOcrSnapshot> {
+        messages: Vec<RecognizedChatMessage>,
+    ) -> Result<ChatTimelineSnapshot> {
         let mut state = self.lock()?;
         // A delayed frame must not roll the passive baseline or trackers backwards.
         if state
@@ -553,7 +547,7 @@ impl SharedChatOcr {
             .as_ref()
             .is_some_and(|latest| latest.captured_at > captured_at)
         {
-            bail!("shared chat OCR received an out-of-order frame");
+            bail!("chat timeline received an out-of-order frame");
         }
         if !state.trackers.contains_key(&chat) {
             let session = VisualSessionId::new(state.next_session);
@@ -723,7 +717,7 @@ impl SharedChatOcr {
                 || active_business_claims.contains(id)
                 || ignored_revisions.contains_key(id)
         });
-        let snapshot = ChatOcrSnapshot {
+        let snapshot = ChatTimelineSnapshot {
             captured_at,
             visual_session,
             chat,
@@ -752,7 +746,7 @@ impl SharedChatOcr {
             }
             if subscriber.queue.len() >= RETAINED_CAPACITY {
                 subscriber.failure =
-                    Some("shared chat OCR subscriber overflow (4096 snapshots)".into());
+                    Some("chat timeline subscriber overflow (4096 snapshots)".into());
                 subscriber.queue.clear();
             } else {
                 let session_changed = subscriber
@@ -798,7 +792,7 @@ impl SharedChatOcr {
             .as_ref()
             .is_some_and(|latest| latest.captured_at > captured_at)
         {
-            bail!("shared chat OCR received an out-of-order no-chat frame");
+            bail!("chat timeline received an out-of-order no-chat frame");
         }
         state.latest = None;
         // A disappeared view starts new visual sessions on its next appearance.
@@ -900,7 +894,7 @@ impl SharedChatOcr {
     /// deliver it again. Historical siblings remain passive.
     pub(crate) fn deliver_unread_baseline(
         &self,
-        snapshot: &ChatOcrSnapshot,
+        snapshot: &ChatTimelineSnapshot,
         id: &ObservedChatMessageId,
     ) -> Result<bool> {
         let mut state = self.lock()?;
@@ -972,7 +966,7 @@ impl SharedChatOcr {
             if subscriber.queue.len() >= RETAINED_CAPACITY {
                 fail_subscription(
                     subscriber,
-                    "shared chat OCR subscriber overflow (4096 snapshots)",
+                    "chat timeline subscriber overflow (4096 snapshots)",
                 );
             } else {
                 subscriber.queue.push_back(revision.clone());
@@ -1256,7 +1250,7 @@ fn normalize_command_lock_text(text: &str) -> String {
 fn complete_refreshes(
     state: &mut State,
     captured_at: Instant,
-    outcome: std::result::Result<Option<ChatOcrSnapshot>, RefreshFailure>,
+    outcome: std::result::Result<Option<ChatTimelineSnapshot>, RefreshFailure>,
 ) {
     for request in state.requests.values_mut() {
         if request.outcome.is_none() && captured_at >= request.requested_at {
@@ -1272,7 +1266,7 @@ fn fail_subscription(subscriber: &mut Subscription, reason: &str) {
     subscriber.queue.clear();
 }
 
-impl SharedChatSubscriber {
+impl ChatTimelineSubscriber {
     /// Bind to the caller's fresh baseline without replacing the retained queue.
     /// The live view may already have transitioned; snapshots from other identities
     /// are filtered until this task's bound chat returns.
@@ -1281,7 +1275,7 @@ impl SharedChatSubscriber {
         let subscriber = state
             .subscribers
             .get_mut(&self.id)
-            .ok_or_else(|| anyhow!("shared chat OCR subscription closed"))?;
+            .ok_or_else(|| anyhow!("chat timeline subscription closed"))?;
         if let Some(reason) = &subscriber.failure {
             bail!("{reason}");
         }
@@ -1292,12 +1286,12 @@ impl SharedChatSubscriber {
         Ok(())
     }
 
-    pub(crate) fn read(&self) -> Result<Vec<ChatOcrSnapshot>> {
+    pub(crate) fn read(&self) -> Result<Vec<ChatTimelineSnapshot>> {
         let mut state = self.shared.lock()?;
         let subscriber = state
             .subscribers
             .get_mut(&self.id)
-            .ok_or_else(|| anyhow!("shared chat OCR subscription closed"))?;
+            .ok_or_else(|| anyhow!("chat timeline subscription closed"))?;
         if let Some(reason) = &subscriber.failure {
             bail!("{reason}");
         }
@@ -1311,7 +1305,7 @@ impl SharedChatSubscriber {
             let subscriber = state
                 .subscribers
                 .get(&self.id)
-                .ok_or_else(|| anyhow!("shared chat OCR subscription closed"))?;
+                .ok_or_else(|| anyhow!("chat timeline subscription closed"))?;
             if let Some(reason) = &subscriber.failure {
                 bail!("{reason}");
             }
@@ -1329,13 +1323,13 @@ impl SharedChatSubscriber {
                 .inner
                 .changed
                 .wait_timeout(state, remaining)
-                .map_err(|_| anyhow!("shared chat OCR state lock poisoned"))?;
+                .map_err(|_| anyhow!("chat timeline state lock poisoned"))?;
             state = next;
         }
     }
 }
 
-impl Drop for SharedChatSubscriber {
+impl Drop for ChatTimelineSubscriber {
     fn drop(&mut self) {
         if let Ok(mut state) = self.shared.inner.state.lock() {
             state.subscribers.remove(&self.id);
@@ -1347,8 +1341,8 @@ impl Tracker {
     fn observe(
         &mut self,
         chat: &ChatIdentity,
-        input: Vec<SharedChatInput>,
-    ) -> Vec<SharedChatMessage> {
+        input: Vec<RecognizedChatMessage>,
+    ) -> Vec<ChatTimelineMessage> {
         // Empty OCR frames are observable but do not erase the last reliable visual anchor.
         if input.is_empty() {
             return Vec::new();
@@ -1388,7 +1382,7 @@ impl Tracker {
                 self.next_sequence += 1;
                 (id, !initial)
             };
-            current.push(SharedChatMessage {
+            current.push(ChatTimelineMessage {
                 id,
                 is_new,
                 text: input.text,
@@ -1405,7 +1399,7 @@ impl Tracker {
 }
 
 #[cfg(test)]
-impl SharedChatOcr {
+impl ChatTimeline {
     /// 测试观测口：指定聊天桶里已写入的命令锁文本（已归一化）。
     /// 仅供接线测试观察命令锁，不参与生产逻辑。
     pub(crate) fn command_lock_texts_for_test(&self, chat: &ChatIdentity) -> Vec<String> {
@@ -1439,8 +1433,8 @@ impl SharedChatOcr {
 mod tests {
     use super::*;
 
-    fn input(text: &str, y: i32) -> SharedChatInput {
-        SharedChatInput {
+    fn input(text: &str, y: i32) -> RecognizedChatMessage {
+        RecognizedChatMessage {
             text: text.into(),
             sender: None,
             raw_sender: None,
@@ -1449,13 +1443,19 @@ mod tests {
         }
     }
 
-    fn publish(shared: &SharedChatOcr, messages: Vec<SharedChatInput>) -> ChatOcrSnapshot {
+    fn publish(
+        shared: &ChatTimeline,
+        messages: Vec<RecognizedChatMessage>,
+    ) -> ChatTimelineSnapshot {
         shared
             .publish(Instant::now(), ChatIdentity::PrimaryHall, messages)
             .unwrap()
     }
 
-    fn friend(shared: &SharedChatOcr, mut messages: Vec<SharedChatInput>) -> ChatOcrSnapshot {
+    fn friend(
+        shared: &ChatTimeline,
+        mut messages: Vec<RecognizedChatMessage>,
+    ) -> ChatTimelineSnapshot {
         // 此夹具模拟粉色好友气泡；非粉色同会话见独立颜色矩阵测试。
         for message in &mut messages {
             message.message_type = "pink".into();
@@ -1470,8 +1470,42 @@ mod tests {
     }
 
     #[test]
+    fn sequence_continuity_ignores_horizontal_position_and_block_size() {
+        let mut tracker = Tracker {
+            session: VisualSessionId::new(1),
+            next_sequence: 1,
+            initialized: false,
+            visible: Vec::new(),
+        };
+        let first = tracker.observe(
+            &ChatIdentity::PrimaryHall,
+            vec![input("older", 40), input("latest", 70)],
+        );
+        let mut corrected_older = input("older", 48);
+        corrected_older.block = Rect::new(24, 48, 96, 26);
+        let mut corrected_latest = input("latest corrected", 78);
+        corrected_latest.block = Rect::new(24, 78, 96, 26);
+        let corrected = tracker.observe(
+            &ChatIdentity::PrimaryHall,
+            vec![corrected_older, corrected_latest],
+        );
+
+        assert_eq!(corrected[0].id, first[0].id);
+        assert_eq!(corrected[1].id, first[1].id);
+
+        let mut retained_latest = input("latest corrected", 40);
+        retained_latest.block = Rect::new(30, 40, 88, 30);
+        let scrolled = tracker.observe(
+            &ChatIdentity::PrimaryHall,
+            vec![retained_latest, input("new message", 70)],
+        );
+        assert_eq!(scrolled[0].id, corrected[1].id);
+        assert!(scrolled[1].is_new);
+    }
+
+    #[test]
     fn unread_promotion_cannot_repeat_success_after_view_rebuild() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = friend(&shared, vec![input("@点歌晴天", 40)]);
         let first = &baseline.messages[0];
         assert!(
@@ -1507,7 +1541,7 @@ mod tests {
 
     #[test]
     fn unread_promotion_rechecks_latest_corrected_text_against_success_lock() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = friend(&shared, vec![input("@点歌晴天", 40)]);
         let first = &baseline.messages[0];
         assert!(
@@ -1551,10 +1585,10 @@ mod tests {
             ChatIdentity::Friend(Arc::from("管理员")),
         ] {
             for sender in ["主人", "管理员", "普通好友"] {
-                let shared = SharedChatOcr::new();
+                let shared = ChatTimeline::new();
                 let mut messages = Vec::new();
                 for (index, color) in ["pink", "blue", "ordinary"].into_iter().enumerate() {
-                    messages.push(SharedChatInput {
+                    messages.push(RecognizedChatMessage {
                         sender: Some(sender.into()),
                         raw_sender: Some(sender.into()),
                         message_type: color.into(),
@@ -1588,8 +1622,8 @@ mod tests {
 
     /// 用被派发消息自身的文本与 y 发起一次业务认领。
     fn claim(
-        shared: &SharedChatOcr,
-        message: &SharedChatMessage,
+        shared: &ChatTimeline,
+        message: &ChatTimelineMessage,
         captured_at: Instant,
     ) -> Option<SharedBusinessClaim> {
         shared
@@ -1598,22 +1632,26 @@ mod tests {
     }
 
     /// 真实一级大厅格式："[昵称]:@命令"，message_type 为 blue。
-    fn primary(nickname: &str, command: &str, y: i32) -> SharedChatInput {
-        SharedChatInput {
+    fn primary(nickname: &str, command: &str, y: i32) -> RecognizedChatMessage {
+        RecognizedChatMessage {
             message_type: "blue".into(),
             ..input(&format!("[{nickname}]:{command}"), y)
         }
     }
 
     /// 真实一级格式但用全角冒号："[昵称]：@命令"（OCR 会把半角冒号读成全角）。
-    fn primary_fullwidth(nickname: &str, command: &str, y: i32) -> SharedChatInput {
-        SharedChatInput {
+    fn primary_fullwidth(nickname: &str, command: &str, y: i32) -> RecognizedChatMessage {
+        RecognizedChatMessage {
             message_type: "blue".into(),
             ..input(&format!("[{nickname}]：{command}"), y)
         }
     }
 
-    fn ignore_revision(shared: &SharedChatOcr, snapshot: &ChatOcrSnapshot, index: usize) -> bool {
+    fn ignore_revision(
+        shared: &ChatTimeline,
+        snapshot: &ChatTimelineSnapshot,
+        index: usize,
+    ) -> bool {
         let message = &snapshot.messages[index];
         shared
             .acknowledge_ignored(
@@ -1630,7 +1668,7 @@ mod tests {
     fn unrecognized_or_empty_text_retries_only_after_a_valid_revision() {
         for chat in [ChatIdentity::PrimaryHall, ChatIdentity::SecondaryHall] {
             for text in ["", "   ", "@点哥 晴天"] {
-                let shared = SharedChatOcr::new();
+                let shared = ChatTimeline::new();
                 let first = shared
                     .publish(Instant::now(), chat.clone(), vec![input(text, 40)])
                     .unwrap();
@@ -1683,7 +1721,7 @@ mod tests {
 
     #[test]
     fn unrecognized_identity_revisions_retry_but_whitespace_does_not() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![input("#加入", 40)]);
         let id = &first.messages[0].id;
         ignore_revision(&shared, &first, 0);
@@ -1717,7 +1755,7 @@ mod tests {
 
     #[test]
     fn late_ignored_ack_preserves_newer_text_and_rejects_stale_queue_entries() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let business = shared.subscribe_business().unwrap();
         let first_at = Instant::now();
         let first = shared
@@ -1775,7 +1813,7 @@ mod tests {
 
     #[test]
     fn unrecognized_claim_uses_its_own_revision_when_completion_lags_ocr() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![input("@点哥 晴天", 40)]);
         let active = claim(&shared, &first.messages[0], first.captured_at).unwrap();
         let corrected = publish(&shared, vec![input("@点歌 晴天", 40)]);
@@ -1804,7 +1842,7 @@ mod tests {
     #[test]
     fn permanent_ack_wins_over_late_unrecognized_completion_and_rollback() {
         for finish_unrecognized in [false, true] {
-            let shared = SharedChatOcr::new();
+            let shared = ChatTimeline::new();
             let first = publish(&shared, vec![input("old ignored text", 40)]);
             let id = &first.messages[0].id;
             let active = claim(&shared, &first.messages[0], first.captured_at).unwrap();
@@ -1824,7 +1862,7 @@ mod tests {
 
     #[test]
     fn permanent_ignored_and_first_friend_baseline_stay_passive_after_corrections() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![input("@旧命令", 40)]);
         let id = &first.messages[0].id;
         claim(&shared, &first.messages[0], first.captured_at)
@@ -1837,7 +1875,7 @@ mod tests {
         assert!(!shared.is_business_pending(id).unwrap());
         assert!(!ignore_revision(&shared, &first, 0));
 
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = friend(&shared, vec![input("historical misread", 40)]);
         assert!(!ignore_revision(&shared, &baseline, 0));
         let corrected = friend(&shared, vec![input("@帮助", 40)]);
@@ -1863,7 +1901,7 @@ mod tests {
     #[test]
     fn navigation_suppression_cancels_waiting_and_inflight_unrecognized_retries() {
         for in_flight in [false, true] {
-            let shared = SharedChatOcr::new();
+            let shared = ChatTimeline::new();
             friend(&shared, vec![input("history", 10)]);
             let unread = friend(&shared, vec![input("history", 10), input("@点哥 晴天", 40)]);
             let id = &unread.messages[1].id;
@@ -1899,7 +1937,7 @@ mod tests {
 
     #[test]
     fn ignored_revision_records_retire_with_scrolled_or_rebuilt_visual_ids() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         for index in 0..8 {
             let snapshot = publish(
                 &shared,
@@ -1927,7 +1965,7 @@ mod tests {
 
     #[test]
     fn durable_business_queue_keeps_unread_commands_when_view_rebuilds() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("history", 10)]);
         let business = shared.subscribe_business().unwrap();
         let decisions = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
@@ -1958,7 +1996,7 @@ mod tests {
     #[test]
     fn drained_business_revisions_survive_no_chat_before_unrecognized_ack() {
         for chat in [ChatIdentity::PrimaryHall, ChatIdentity::SecondaryHall] {
-            let shared = SharedChatOcr::new();
+            let shared = ChatTimeline::new();
             let business = shared.subscribe_business().unwrap();
             let first_at = Instant::now();
             let first = shared
@@ -2016,7 +2054,7 @@ mod tests {
 
     #[test]
     fn inflight_unrecognized_claim_preserves_newer_revision_after_tracker_reset() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let business = shared.subscribe_business().unwrap();
         let first_at = Instant::now();
         let first = shared
@@ -2063,7 +2101,7 @@ mod tests {
 
     #[test]
     fn friend_suppression_clears_pending_revision_metadata_before_late_ignore() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         friend(&shared, vec![input("history", 10)]);
         let unread = friend(&shared, vec![input("history", 10), input("@点哥 晴天", 40)]);
         let corrected = friend(&shared, vec![input("history", 10), input("@点歌 晴天", 40)]);
@@ -2101,7 +2139,7 @@ mod tests {
 
     #[test]
     fn parameterless_command_locks_survive_routable_punctuation_revisions() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![input("甲:@下一首", 40)]);
         let message = &first.messages[0];
         shared
@@ -2147,7 +2185,7 @@ mod tests {
 
     #[test]
     fn corrected_ignored_bubble_cannot_override_an_existing_command_lock() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(
             &shared,
             vec![
@@ -2188,7 +2226,7 @@ mod tests {
     fn late_unrecognized_completion_respects_current_lock_even_after_tracker_reset() {
         for hold_claim in [false, true] {
             for rebuild_before_completion in [false, true] {
-                let shared = SharedChatOcr::new();
+                let shared = ChatTimeline::new();
                 let first = publish(
                     &shared,
                     vec![
@@ -2241,7 +2279,7 @@ mod tests {
 
     #[test]
     fn queued_nonempty_revision_survives_later_empty_ocr_before_old_ignore() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let business = shared.subscribe_business().unwrap();
         let first_at = Instant::now();
         let first = shared
@@ -2291,7 +2329,7 @@ mod tests {
 
     #[test]
     fn no_chat_refresh_errors_are_typed_without_relabeling_capture_failures() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let refresh = shared.request_refresh().unwrap();
         shared
             .publish_no_chat(Instant::now(), "chat temporarily hidden")
@@ -2312,7 +2350,7 @@ mod tests {
 
     #[test]
     fn discard_publishes_to_decisions_before_routine_ack_without_business_race() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = friend(&shared, vec![input("history", 10)]);
         let business = shared.subscribe().unwrap();
         let decision = shared.subscribe_chat(baseline.chat.clone()).unwrap();
@@ -2360,7 +2398,7 @@ mod tests {
 
     #[test]
     fn discard_cancels_queued_claims_and_nested_guards_preserve_suppression() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         friend(&shared, vec![input("history", 10)]);
         let queued = friend(&shared, vec![input("history", 10), input("queued", 40)]);
         assert!(shared.is_business_pending(&queued.messages[1].id).unwrap());
@@ -2376,15 +2414,15 @@ mod tests {
                 pending_capture,
                 queued.chat,
                 vec![
-                    SharedChatInput {
+                    RecognizedChatMessage {
                         message_type: "pink".into(),
                         ..input("history", 10)
                     },
-                    SharedChatInput {
+                    RecognizedChatMessage {
                         message_type: "pink".into(),
                         ..input("queued", 40)
                     },
-                    SharedChatInput {
+                    RecognizedChatMessage {
                         message_type: "pink".into(),
                         ..input("delayed", 70)
                     },
@@ -2410,7 +2448,7 @@ mod tests {
 
     #[test]
     fn deliberate_first_friend_unread_delivers_only_selected_shared_id_once() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let listener = shared.subscribe().unwrap();
         let baseline = friend(
             &shared,
@@ -2448,7 +2486,7 @@ mod tests {
 
     #[test]
     fn failed_business_claim_restores_eligibility_but_discard_wins_rollback() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         friend(&shared, vec![input("history", 10)]);
         let snapshot = friend(&shared, vec![input("history", 10), input("command", 40)]);
         let message = &snapshot.messages[1];
@@ -2469,7 +2507,7 @@ mod tests {
 
     #[test]
     fn baseline_promotion_uses_latest_ocr_and_skips_stale_queued_text() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let listener = shared.subscribe().unwrap();
         let baseline = friend(&shared, vec![input("misread", 10)]);
         let selected = friend(&shared, vec![input("correct command", 10)]);
@@ -2498,7 +2536,7 @@ mod tests {
 
     #[test]
     fn discard_first_friend_baseline_cannot_be_promoted_after_release() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let guard = shared.suppress_friend_business().unwrap();
         let baseline = friend(&shared, vec![input("discard", 10)]);
         drop(guard);
@@ -2513,7 +2551,7 @@ mod tests {
 
     #[test]
     fn atomic_subscription_excludes_old_passive_baseline() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![input("ordinary ignored text", 10)]);
         assert!(first.messages[0].sender.is_none());
         // v3：锁为空的 initial 帧把所有消息都标成新（启动首屏由 chat_baseline_primed 兜底）。
@@ -2527,7 +2565,7 @@ mod tests {
 
     #[test]
     fn independent_readers_retain_more_than_sixty_four_revisions() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let slow = shared.subscribe().unwrap();
         let fast = shared.subscribe().unwrap();
         let dropped = shared.subscribe().unwrap();
@@ -2544,7 +2582,7 @@ mod tests {
 
     #[test]
     fn overflow_is_explicit_and_new_subscription_is_healthy() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let slow = shared.subscribe().unwrap();
         for _ in 0..=RETAINED_CAPACITY {
             publish(&shared, vec![]);
@@ -2559,7 +2597,7 @@ mod tests {
 
     #[test]
     fn refresh_requires_captured_frame_after_request_fence_including_empty_ocr() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let old_time = Instant::now();
         shared
             .publish(old_time, ChatIdentity::PrimaryHall, vec![input("old", 10)])
@@ -2591,7 +2629,7 @@ mod tests {
 
     #[test]
     fn request_tokens_keep_their_own_serviced_snapshots() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let one = shared.request_refresh().unwrap();
         let first = publish(&shared, vec![input("first", 10)]);
         let two = shared.request_refresh().unwrap();
@@ -2616,7 +2654,7 @@ mod tests {
 
     #[test]
     fn publication_wakes_reader_and_refresh_waiters() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let subscriber = shared.subscribe().unwrap();
         let token = shared.request_refresh().unwrap();
         let producer = shared.clone();
@@ -2633,7 +2671,7 @@ mod tests {
 
     #[test]
     fn capture_failure_is_sticky_only_for_existing_readers_and_requests() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let failed = shared.subscribe().unwrap();
         let old_request = shared.request_refresh().unwrap();
         shared.report_failure("capture unavailable").unwrap();
@@ -2658,7 +2696,7 @@ mod tests {
 
     #[test]
     fn transient_capture_failure_preserves_business_but_poison_decision() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let business = shared.subscribe_business().unwrap();
         let decision = shared.subscribe().unwrap();
         shared
@@ -2673,7 +2711,7 @@ mod tests {
 
     #[test]
     fn no_chat_invalidates_session_without_poisoning_bound_decisions() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("first", 10)]);
         let business = shared.subscribe().unwrap();
         let decision = shared.subscribe().unwrap();
@@ -2700,7 +2738,7 @@ mod tests {
 
     #[test]
     fn rebuilt_visual_session_keeps_bound_decision_reader_alive() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("候选", 10)]);
         let decision = shared.subscribe().unwrap();
         decision
@@ -2722,7 +2760,7 @@ mod tests {
 
     #[test]
     fn refresh_after_other_hall_panel_requests_a_new_frame() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first_refresh = shared.request_refresh().unwrap();
         let secondary = shared
             .publish(
@@ -2764,7 +2802,7 @@ mod tests {
 
     #[test]
     fn other_hall_panel_does_not_end_bound_decision_reader() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("候选", 10)]);
         let decision = shared.subscribe().unwrap();
         decision
@@ -2794,7 +2832,7 @@ mod tests {
 
     #[test]
     fn other_hall_panel_never_returns_as_decision_input() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("候选", 10)]);
         let decision = shared.subscribe().unwrap();
         decision
@@ -2815,7 +2853,7 @@ mod tests {
 
     #[test]
     fn decision_reader_waits_through_long_foreign_state_and_no_chat() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("候选", 10)]);
         let decision = shared.subscribe().unwrap();
         decision
@@ -2855,7 +2893,7 @@ mod tests {
 
     #[test]
     fn long_foreign_state_is_filtered_until_bound_identity_returns() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("候选", 10)]);
         let decision = shared.subscribe().unwrap();
         decision
@@ -2879,7 +2917,7 @@ mod tests {
 
     #[test]
     fn bind_accepts_other_hall_panel_baseline() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         // 基线落在二级面板上：这是同一大厅的同一物理会话，不应判为“基线后换会话”。
         let baseline = shared
             .publish(
@@ -2900,7 +2938,7 @@ mod tests {
 
     #[test]
     fn long_foreign_state_is_filtered_for_decision_not_business_reader() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let business = shared.subscribe().unwrap();
         let decision = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
         for y in [10, 20, 30, 40, 50] {
@@ -2918,7 +2956,7 @@ mod tests {
 
     #[test]
     fn repeated_text_and_ocr_revisions_keep_distinct_visual_ids() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![input("anchor", 10), input("same", 40)]);
         let next = publish(&shared, vec![input("same", 10), input("same", 40)]);
         assert_eq!(next.messages[0].id, first.messages[1].id);
@@ -2940,7 +2978,7 @@ mod tests {
 
     #[test]
     fn pending_ids_survive_scroll_and_ack_invalidates_queued_revisions() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         publish(&shared, vec![input("baseline", 10)]);
         let business = shared.subscribe().unwrap();
         let fresh = publish(&shared, vec![input("baseline", 10), input("command", 40)]);
@@ -2956,7 +2994,7 @@ mod tests {
 
     /// 模拟一次"认领并派发成功提交"：命令锁只在 complete() 里写入，
     /// 且写入的文本/y 来自被派发消息自身。
-    fn execute(shared: &SharedChatOcr, snapshot: &ChatOcrSnapshot, index: usize) {
+    fn execute(shared: &ChatTimeline, snapshot: &ChatTimelineSnapshot, index: usize) {
         let message = &snapshot.messages[index];
         assert!(shared.is_business_pending(&message.id).unwrap());
         shared
@@ -2973,19 +3011,19 @@ mod tests {
     }
 
     /// 窗口切换/视图重建：聊天区瞬态消失，tracker 清空，下一帧 visual_session 自增。
-    fn rebuild(shared: &SharedChatOcr) {
+    fn rebuild(shared: &ChatTimeline) {
         shared
             .publish_no_chat(Instant::now(), "view rebuilt")
             .unwrap();
     }
 
-    fn command_lock_bucket_count(shared: &SharedChatOcr) -> usize {
+    fn command_lock_bucket_count(shared: &ChatTimeline) -> usize {
         shared.inner.state.lock().unwrap().command_locks.len()
     }
 
     #[test]
     fn v3_empty_lock_initial_frame_marks_every_message_new() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(
             &shared,
             vec![primary("甲", "@命令1", 10), primary("乙", "@命令2", 40)],
@@ -3004,7 +3042,7 @@ mod tests {
 
     #[test]
     fn v3_example1_rebuilt_screen_executes_only_command2() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         execute(&shared, &first, 0);
         rebuild(&shared);
@@ -3023,7 +3061,7 @@ mod tests {
 
     #[test]
     fn v3_example2_resent_same_text_same_position_is_suppressed() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         execute(&shared, &first, 0);
         rebuild(&shared);
@@ -3040,7 +3078,7 @@ mod tests {
 
     #[test]
     fn v3_example3_rebuilt_screen_of_only_executed_commands_executes_nothing() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(
             &shared,
             vec![primary("甲", "@命令1", 40), primary("甲", "@命令2", 70)],
@@ -3066,7 +3104,7 @@ mod tests {
     /// “命中锁则压回未新”才能抑制它。（旧用例因为 Tracker 复用同一 id/is_new=false 而空过。）
     #[test]
     fn v3_non_initial_fresh_bubble_at_anchor_position_is_suppressed() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         execute(&shared, &first, 0);
         // 命令滚出：同会话内换一条位置完全不同的消息，Tracker 不会复用命令 id。
@@ -3094,7 +3132,7 @@ mod tests {
 
     #[test]
     fn v3_ce1_chatter_above_executed_command_does_not_drag_it_back() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         execute(&shared, &first, 0);
         rebuild(&shared);
@@ -3112,7 +3150,7 @@ mod tests {
 
     #[test]
     fn v3_ce2_unrouted_mention_does_not_drag_executed_command_back() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         execute(&shared, &first, 0);
         rebuild(&shared);
@@ -3130,7 +3168,7 @@ mod tests {
 
     #[test]
     fn v3_ce4_rebuild_shift_down_within_one_line_still_matches() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         execute(&shared, &first, 0);
         rebuild(&shared);
@@ -3143,7 +3181,7 @@ mod tests {
 
     #[test]
     fn v3_ce5_single_frame_ocr_jitter_keeps_entry_until_second_missing_frame() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         execute(&shared, &first, 0);
         // 第一帧抖动：末字误读，条目匹配不上，只累计 1 个缺失帧。
@@ -3180,7 +3218,7 @@ mod tests {
 
     #[test]
     fn v3_command_lock_keeps_only_five_entries_so_evicted_text_is_new_again() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let executed = publish(
             &shared,
             vec![
@@ -3212,7 +3250,7 @@ mod tests {
     /// 因此它的活跃度持续刷新；OCR 好友名抖动产生的桶写一次后再也没人碰。
     #[test]
     fn v3_command_lock_chat_bucket_cap_evicts_idle_jitter_buckets_keeps_active_chat() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@命令", 40)]);
         execute(&shared, &first, 0);
         let primary_hall = ChatIdentity::PrimaryHall;
@@ -3268,7 +3306,7 @@ mod tests {
 
     #[test]
     fn v3_committed_claim_tombstone_blocks_second_dispatch() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let built = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         let message = &built.messages[0];
         let id = message.id.clone();
@@ -3292,7 +3330,7 @@ mod tests {
 
     #[test]
     fn v3_failed_dispatch_does_not_write_command_lock() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let built = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         let message = &built.messages[0];
         let failed = claim(&shared, message, built.captured_at)
@@ -3316,7 +3354,7 @@ mod tests {
     #[test]
     fn v3_fullwidth_and_halfwidth_punctuation_hit_the_same_command_lock_entry() {
         // 半角写入 -> 全角命中
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@点歌 起风了", 40)]);
         execute(&shared, &first, 0);
         rebuild(&shared);
@@ -3332,7 +3370,7 @@ mod tests {
         );
 
         // 全角写入 -> 半角命中
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary_fullwidth("甲", "@点歌 起风了", 40)]);
         execute(&shared, &first, 0);
         rebuild(&shared);
@@ -3347,7 +3385,7 @@ mod tests {
     /// 重建后第 1 帧若再累加就会凑满 2，把仍在屏上的条目误删。
     #[test]
     fn v3_missing_frames_do_not_survive_a_view_rebuild() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
         execute(&shared, &first, 0);
         // 命令滚出 1 帧：missing_frames=1（未释放）。
@@ -3379,9 +3417,9 @@ mod tests {
     /// 若仍释放，两帧“看起来消失”就会误删仍在屏上的条目。
     #[test]
     fn v3_suppressed_friend_frames_do_not_release_command_lock_entries() {
-        let shared = SharedChatOcr::new();
+        let shared = ChatTimeline::new();
         let chat = ChatIdentity::Friend(Arc::from("observed name"));
-        let publish_friend = |messages: Vec<SharedChatInput>| {
+        let publish_friend = |messages: Vec<RecognizedChatMessage>| {
             shared
                 .publish(Instant::now(), chat.clone(), messages)
                 .unwrap()
@@ -3430,17 +3468,19 @@ fn same_rect(left: Rect, right: Rect) -> bool {
 
 /// The existing stream uses suffix/prefix alignment; here relative block geometry
 /// additionally keeps repeated text bubbles distinct during layout changes.
-fn sequence_overlap(previous: &[SharedChatMessage], current: &[SharedChatInput]) -> usize {
-    // A retained first block anchors corrections of later blocks. Prefer that
-    // whole layout to a shorter repeated-text suffix that would invent a bubble.
-    if previous.len() == current.len()
-        && !current.is_empty()
-        && previous[0].text == current[0].text
-        && previous.iter().zip(current).all(|(left, right)| {
-            left.message_type == right.message_type && same_rect(left.block, right.block)
-        })
+fn sequence_overlap(previous: &[ChatTimelineMessage], current: &[RecognizedChatMessage]) -> usize {
+    // A retained first bubble anchors corrections of later bubbles. Match the
+    // message sequence and shared vertical scroll delta, not layout-derived x/size.
+    if previous.len() == current.len() && !current.is_empty() && previous[0].text == current[0].text
     {
-        return current.len();
+        let delta = i64::from(current[0].block.y) - i64::from(previous[0].block.y);
+        if previous.iter().zip(current).all(|(left, right)| {
+            left.message_type == right.message_type
+                && (left.sender == right.sender || left.sender.is_none() || right.sender.is_none())
+                && i64::from(right.block.y) - i64::from(left.block.y) == delta
+        }) {
+            return current.len();
+        }
     }
     (1..=previous.len().min(current.len()))
         .rev()
@@ -3453,9 +3493,6 @@ fn sequence_overlap(previous: &[SharedChatMessage], current: &[SharedChatInput])
                     && (left.sender == right.sender
                         || left.sender.is_none()
                         || right.sender.is_none())
-                    && left.block.x == right.block.x
-                    && left.block.width == right.block.width
-                    && left.block.height == right.block.height
                     && i64::from(right.block.y) - i64::from(left.block.y) == delta
             })
         })

@@ -5,7 +5,9 @@ mod decision_tests;
 mod delivery;
 mod diagnostics;
 pub(crate) mod formal_task;
-pub(crate) mod http_facade;
+/// Cross-platform command/login/player/AI facades, re-exported here so Windows call sites keep
+/// the same `http_facade::` path while Linux test builds can use them without `composition`.
+pub(crate) use crate::interfaces::http::facade as http_facade;
 mod lifecycle;
 mod listener;
 mod moderation;
@@ -381,7 +383,7 @@ struct UiBundle {
     window_detection_signal: WindowDetectionSignal,
     chat_baseline_primed: Arc<AtomicBool>,
     chat_observations: ChatObservationShared,
-    shared_ocr: crate::observation::chat::SharedChatOcr,
+    chat_timeline: crate::observation::chat::ChatTimeline,
 }
 
 struct PlaybackBundle {
@@ -637,7 +639,7 @@ struct FormalTaskUiContext {
     window_detection_signal: WindowDetectionSignal,
     chat_baseline_primed: Arc<AtomicBool>,
     chat_observations: ChatObservationShared,
-    shared_ocr: crate::observation::chat::SharedChatOcr,
+    chat_timeline: crate::observation::chat::ChatTimeline,
 }
 
 struct FormalTaskPlaybackContext {
@@ -711,7 +713,7 @@ impl FormalTaskExecutionContext {
                     window_detection_signal: self.ui.window_detection_signal.clone(),
                     chat_baseline_primed: self.ui.chat_baseline_primed.clone(),
                     chat_observations: self.ui.chat_observations.clone(),
-                    shared_ocr: self.ui.shared_ocr.clone(),
+                    chat_timeline: self.ui.chat_timeline.clone(),
                 },
                 playback: PlaybackBundle {
                     player: self.playback.player.clone(),
@@ -1176,7 +1178,7 @@ enum ChatDecisionScope {
 
 struct ChatDecisionReader {
     listener_mode: ChatListenerMode,
-    subscriber: crate::observation::chat::SharedChatSubscriber,
+    subscriber: crate::observation::chat::ChatTimelineSubscriber,
     chat: crate::observation::chat::ChatIdentity,
     baseline_at: Instant,
     baseline_cursor: Option<(crate::observation::chat::VisualSessionId, u64)>,
@@ -1380,7 +1382,7 @@ impl ApplicationRuntime {
             },
         );
         let chat_observations = ChatObservationShared::new();
-        let shared_ocr = crate::observation::chat::SharedChatOcr::new();
+        let chat_timeline = crate::observation::chat::ChatTimeline::new();
         let running = Arc::new(AtomicBool::new(true));
         let task_engine = TaskEngineHandle::new(Some(Arc::new(monitor.clone())));
         let business_runtime_builder =
@@ -1445,7 +1447,7 @@ impl ApplicationRuntime {
             ui_handle.clone(),
             ocr.clone(),
             secondary_unread_config,
-            shared_ocr.clone(),
+            chat_timeline.clone(),
         );
         let friend_delivery_ui = FriendDeliveryUi::new(
             ui_handle.clone(),
@@ -1586,7 +1588,7 @@ impl ApplicationRuntime {
                 window_detection_signal: WindowDetectionSignal::new(),
                 chat_baseline_primed: Arc::new(AtomicBool::new(false)),
                 chat_observations,
-                shared_ocr,
+                chat_timeline,
             },
             playback: PlaybackBundle {
                 player,
@@ -1756,7 +1758,10 @@ fn secondary_hall_sequence_delta(
     }
 }
 
-const SECONDARY_HALL_FALLBACK_SENDER: &str = "二级大厅";
+
+pub(crate) use crate::observation::chat::{
+    SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity, parse_secondary_sender_identity,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SecondaryHallMessageKind {
@@ -1765,20 +1770,6 @@ enum SecondaryHallMessageKind {
     TurtleQuestion,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct SecondarySenderIdentity {
-    pub(super) nickname: String,
-    pub(super) remark: Option<String>,
-}
-
-impl SecondarySenderIdentity {
-    pub(super) fn effective_name(&self) -> &str {
-        self.remark
-            .as_deref()
-            .filter(|remark| !remark.trim().is_empty())
-            .unwrap_or(&self.nickname)
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SecondaryHallMessageClassification {
@@ -1834,37 +1825,6 @@ fn normalize_secondary_sender_name(value: &str) -> String {
         .to_string()
 }
 
-fn parse_secondary_sender_identity(value: &str) -> SecondarySenderIdentity {
-    let value = value.trim();
-    let mut rightmost_pair = None;
-    for (open, close) in [('(', ')'), ('（', '）')] {
-        let Some(close_index) = value.rfind(close) else {
-            continue;
-        };
-        let Some(open_index) = value[..close_index].rfind(open) else {
-            continue;
-        };
-        if rightmost_pair
-            .as_ref()
-            .is_none_or(|(best_close, _, _)| close_index > *best_close)
-        {
-            rightmost_pair = Some((close_index, open_index, open.len_utf8()));
-        }
-    }
-    if let Some((close_index, open_index, open_len)) = rightmost_pair {
-        let remark = value[open_index + open_len..close_index].trim();
-        if !remark.is_empty() {
-            return SecondarySenderIdentity {
-                nickname: value[..open_index].trim().to_string(),
-                remark: Some(remark.to_string()),
-            };
-        }
-    }
-    SecondarySenderIdentity {
-        nickname: value.to_string(),
-        remark: None,
-    }
-}
 
 fn next_target_missing_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(TARGET_MISSING_BACKOFF_MAX)

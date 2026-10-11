@@ -219,6 +219,21 @@ struct Subscription {
     durable_business: bool,
 }
 
+/// 同一个大厅可能以两个身份出现：`PrimaryHall`（主聊天区 marker 规则判定）与
+/// `SecondaryHall`（二级面板几何判定）。一级大厅下发消息必然经过一次二级面板，
+/// 因此对绑定在大厅上的读者，另一块面板的快照不是“换了会话”，而是同一物理会话的
+/// 另一视角：跳过即可——不入队、不清队列、不失败，让读者继续等它自己身份的消息。
+///
+/// 任务绑定期间出现的其他身份同样只被忽略：它们不能提供本任务输入，也不应仅因
+/// 一个任务内状态停留较久就终止窗口；调用方的整体期限负责结束等待。
+pub(crate) fn other_hall_panel(bound: &ChatIdentity, incoming: &ChatIdentity) -> bool {
+    matches!(
+        (bound, incoming),
+        (ChatIdentity::PrimaryHall, ChatIdentity::SecondaryHall)
+            | (ChatIdentity::SecondaryHall, ChatIdentity::PrimaryHall)
+    )
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct NoChatRefreshError(String);
@@ -443,6 +458,18 @@ impl SharedChatOcr {
         SharedChatSubscriber {
             shared: self.clone(),
             id,
+        }
+    }
+
+    pub(crate) fn refresh_after_other_hall_panel(
+        &self,
+        expected: &ChatIdentity,
+        snapshot: &ChatOcrSnapshot,
+    ) -> Result<Option<u64>> {
+        if other_hall_panel(expected, &snapshot.chat) {
+            self.request_refresh().map(Some)
+        } else {
+            Ok(None)
         }
     }
 
@@ -706,16 +733,24 @@ impl SharedChatOcr {
             if subscriber.failure.is_some() {
                 continue;
             }
-            let chat_changed = subscriber
+            if subscriber
                 .chat
                 .as_ref()
-                .is_some_and(|chat| *chat != snapshot.chat);
-            if chat_changed {
-                // 真正切换了聊天上下文（例如大厅 -> 好友私聊）：确认窗口必须结束，
-                // 否则会把另一个会话里的命令当成当前窗口的确认。
-                subscriber.failure = Some("visible chat identity changed".into());
-                subscriber.queue.clear();
-            } else if subscriber.queue.len() >= RETAINED_CAPACITY {
+                .is_some_and(|bound| other_hall_panel(bound, &snapshot.chat))
+            {
+                continue;
+            }
+            // Only snapshots from the bound chat can feed this task. A different
+            // identity may be a long-lived UI transition, so wait for the target
+            // instead of ending the task based on frame count or elapsed time here.
+            if subscriber
+                .chat
+                .as_ref()
+                .is_some_and(|bound| *bound != snapshot.chat)
+            {
+                continue;
+            }
+            if subscriber.queue.len() >= RETAINED_CAPACITY {
                 subscriber.failure =
                     Some("shared chat OCR subscriber overflow (4096 snapshots)".into());
                 subscriber.queue.clear();
@@ -1238,13 +1273,11 @@ fn fail_subscription(subscriber: &mut Subscription, reason: &str) {
 }
 
 impl SharedChatSubscriber {
-    /// Bind after the fresh baseline without replacing the already-retained queue.
+    /// Bind to the caller's fresh baseline without replacing the retained queue.
+    /// The live view may already have transitioned; snapshots from other identities
+    /// are filtered until this task's bound chat returns.
     pub(crate) fn bind_chat(&self, chat: ChatIdentity, session: VisualSessionId) -> Result<()> {
         let mut state = self.shared.lock()?;
-        let matches = state
-            .latest
-            .as_ref()
-            .is_some_and(|latest| latest.chat == chat && latest.visual_session == session);
         let subscriber = state
             .subscribers
             .get_mut(&self.id)
@@ -1252,11 +1285,8 @@ impl SharedChatSubscriber {
         if let Some(reason) = &subscriber.failure {
             bail!("{reason}");
         }
-        if !matches {
-            fail_subscription(subscriber, "visible chat changed after baseline");
-            self.shared.inner.changed.notify_all();
-            bail!("visible chat changed after baseline");
-        }
+        // The supplied fresh baseline owns this binding. The live view may already
+        // have moved to a temporary identity; publish/read will filter until it returns.
         subscriber.chat = Some(chat);
         subscriber.session = Some(session);
         Ok(())
@@ -2691,19 +2721,199 @@ mod tests {
     }
 
     #[test]
-    fn identity_change_ends_filtered_reader_not_business_reader() {
+    fn refresh_after_other_hall_panel_requests_a_new_frame() {
         let shared = SharedChatOcr::new();
-        let business = shared.subscribe().unwrap();
-        let decision = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
+        let first_refresh = shared.request_refresh().unwrap();
+        let secondary = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::SecondaryHall,
+                vec![input("panel transition", 10)],
+            )
+            .unwrap();
+        assert_eq!(
+            shared
+                .wait_for_snapshot(first_refresh, Duration::ZERO)
+                .unwrap()
+                .unwrap()
+                .chat,
+            ChatIdentity::SecondaryHall
+        );
+        let next_refresh = shared
+            .refresh_after_other_hall_panel(&ChatIdentity::PrimaryHall, &secondary)
+            .unwrap()
+            .expect("opposite panel must rearm the baseline request");
+        assert_ne!(first_refresh, next_refresh);
+
+        let primary = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![input("target baseline", 10)],
+            )
+            .unwrap();
+        assert_eq!(
+            shared
+                .wait_for_snapshot(next_refresh, Duration::ZERO)
+                .unwrap()
+                .unwrap()
+                .chat,
+            primary.chat
+        );
+    }
+
+    #[test]
+    fn other_hall_panel_does_not_end_bound_decision_reader() {
+        let shared = SharedChatOcr::new();
+        let baseline = publish(&shared, vec![input("候选", 10)]);
+        let decision = shared.subscribe().unwrap();
+        decision
+            .bind_chat(ChatIdentity::PrimaryHall, baseline.visual_session)
+            .unwrap();
+        // 队列里先放一条本身份消息，用来验证随后的“临时经过”不会把它清掉。
+        publish(&shared, vec![input("候选", 10), input("确认", 40)]);
+        // 一级大厅下发消息必然经过一次二级面板：那是同一大厅的另一块面板，不是换会话。
         shared
             .publish(
                 Instant::now(),
-                ChatIdentity::Friend(Arc::from("friend")),
-                vec![input("hello", 10)],
+                ChatIdentity::SecondaryHall,
+                vec![input("面板里的闲聊", 10)],
             )
             .unwrap();
-        assert!(decision.read().is_err());
-        assert_eq!(business.read().unwrap().len(), 1);
+        let queued = decision.read().unwrap();
+        assert_eq!(queued.len(), 1, "另一块大厅面板不得清空已排队的本身份消息");
+        assert_eq!(queued[0].chat, ChatIdentity::PrimaryHall);
+        assert_eq!(queued[0].messages[1].text, "确认");
+        // 原绑定仍然活着：主大厅后续消息照常到达。
+        publish(&shared, vec![input("后续", 60)]);
+        let snapshots = decision.read().unwrap();
+        assert_eq!(snapshots.len(), 1, "窗口必须继续接收它自己身份的消息");
+        assert_eq!(snapshots[0].chat, ChatIdentity::PrimaryHall);
+        assert_eq!(snapshots[0].messages[0].text, "后续");
+    }
+
+    #[test]
+    fn other_hall_panel_never_returns_as_decision_input() {
+        let shared = SharedChatOcr::new();
+        let baseline = publish(&shared, vec![input("候选", 10)]);
+        let decision = shared.subscribe().unwrap();
+        decision
+            .bind_chat(ChatIdentity::PrimaryHall, baseline.visual_session)
+            .unwrap();
+        shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::SecondaryHall,
+                vec![input("@1", 20)],
+            )
+            .unwrap();
+        assert!(
+            decision.read().unwrap().is_empty(),
+            "另一块面板的气泡不得作为本窗口的确认输入返回"
+        );
+    }
+
+    #[test]
+    fn decision_reader_waits_through_long_foreign_state_and_no_chat() {
+        let shared = SharedChatOcr::new();
+        let baseline = publish(&shared, vec![input("候选", 10)]);
+        let decision = shared.subscribe().unwrap();
+        decision
+            .bind_chat(ChatIdentity::PrimaryHall, baseline.visual_session)
+            .unwrap();
+
+        for _ in 0..32 {
+            shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::Friend(Arc::from("friend")),
+                    vec![input("not a decision", 10)],
+                )
+                .unwrap();
+        }
+        assert!(decision.read().unwrap().is_empty());
+        shared
+            .publish_no_chat(Instant::now(), "transient view gap")
+            .unwrap();
+        assert!(decision.read().unwrap().is_empty());
+        for _ in 0..32 {
+            shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::Friend(Arc::from("friend")),
+                    vec![input("still not a decision", 10)],
+                )
+                .unwrap();
+        }
+        assert!(decision.read().unwrap().is_empty());
+
+        publish(&shared, vec![input("valid decision", 20)]);
+        let snapshots = decision.read().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].messages[0].text, "valid decision");
+    }
+
+    #[test]
+    fn long_foreign_state_is_filtered_until_bound_identity_returns() {
+        let shared = SharedChatOcr::new();
+        let baseline = publish(&shared, vec![input("候选", 10)]);
+        let decision = shared.subscribe().unwrap();
+        decision
+            .bind_chat(ChatIdentity::PrimaryHall, baseline.visual_session)
+            .unwrap();
+        for index in 0..64 {
+            shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::Friend(Arc::from("friend")),
+                    vec![input(&format!("foreign input {index}"), 20)],
+                )
+                .unwrap();
+        }
+        assert!(decision.read().unwrap().is_empty());
+        publish(&shared, vec![input("valid decision", 30)]);
+        let snapshots = decision.read().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].messages[0].text, "valid decision");
+    }
+
+    #[test]
+    fn bind_accepts_other_hall_panel_baseline() {
+        let shared = SharedChatOcr::new();
+        // 基线落在二级面板上：这是同一大厅的同一物理会话，不应判为“基线后换会话”。
+        let baseline = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::SecondaryHall,
+                vec![input("候选", 10)],
+            )
+            .unwrap();
+        let decision = shared.subscribe().unwrap();
+        decision
+            .bind_chat(ChatIdentity::PrimaryHall, baseline.visual_session)
+            .unwrap();
+        publish(&shared, vec![input("确认", 40)]);
+        let snapshots = decision.read().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].chat, ChatIdentity::PrimaryHall);
+    }
+
+    #[test]
+    fn long_foreign_state_is_filtered_for_decision_not_business_reader() {
+        let shared = SharedChatOcr::new();
+        let business = shared.subscribe().unwrap();
+        let decision = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
+        for y in [10, 20, 30, 40, 50] {
+            shared
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::Friend(Arc::from("friend")),
+                    vec![input("hello", y)],
+                )
+                .unwrap();
+        }
+        assert!(decision.read().unwrap().is_empty());
+        assert_eq!(business.read().unwrap().len(), 5);
     }
 
     #[test]

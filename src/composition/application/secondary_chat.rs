@@ -335,6 +335,9 @@ impl ApplicationRuntime {
         let current_identity = identity.clone().unwrap_or(SecondaryChatIdentity::Unknown);
 
         if state.initial_unread_clear {
+            // 初始红点清场：只建立基线并清红点，历史一律不执行。因此清场期间排出的
+            // 未读任务一律 discard_only=true；只有清场结束、之后真正进入带新未读的
+            // 会话时才排 discard_only=false —— 那时才读取最后发送的那条命令并派发一次。
             if current_identity != SecondaryChatIdentity::CurrentHall {
                 let recovery_requested =
                     allow_hall_recovery && self.queue_secondary_hall_recovery()?;

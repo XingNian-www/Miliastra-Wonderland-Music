@@ -1643,50 +1643,6 @@ mod tests {
         assert!(claim(&shared, &corrected.messages[0], corrected.captured_at).is_none());
     }
 
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn startup_history_suppression_is_pink_only_without_permission_or_chat_gate() {
-        for chat in [
-            ChatIdentity::PrimaryHall,
-            ChatIdentity::SecondaryHall,
-            ChatIdentity::Friend(Arc::from("管理员")),
-        ] {
-            for sender in ["主人", "管理员", "普通好友"] {
-                let shared = ChatTimeline::new();
-                let mut messages = Vec::new();
-                for (index, color) in ["pink", "blue", "ordinary"].into_iter().enumerate() {
-                    messages.push(RecognizedChatMessage {
-                        sender: Some(sender.into()),
-                        raw_sender: Some(sender.into()),
-                        message_type: color.into(),
-                        ..input("@点歌晴天", 20 + index as i32 * 40)
-                    });
-                }
-                let snapshot = shared
-                    .publish(Instant::now(), chat.clone(), messages.clone())
-                    .unwrap();
-                for message in &snapshot.messages {
-                    let eligible = message.message_type != "pink";
-                    assert_eq!(
-                        message.is_new, eligible,
-                        "{chat:?} {sender} {}",
-                        message.message_type
-                    );
-                    assert_eq!(shared.is_business_pending(&message.id).unwrap(), eligible);
-                }
-                let repeated = shared
-                    .publish(Instant::now(), chat.clone(), messages)
-                    .unwrap();
-                assert!(
-                    !shared
-                        .is_business_pending(&repeated.messages[0].id)
-                        .unwrap(),
-                    "pink baseline must not revive"
-                );
-            }
-        }
-    }
-
     /// 用被派发消息自身的文本与 y 发起一次业务认领。
     fn claim(
         shared: &ChatTimeline,
@@ -1904,67 +1860,6 @@ mod tests {
             .complete_as_command()
             .unwrap();
         assert!(!shared.is_business_pending(id).unwrap());
-    }
-
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn permanent_ack_wins_over_late_unrecognized_completion_and_rollback() {
-        for finish_unrecognized in [false, true] {
-            let shared = ChatTimeline::new();
-            let first = publish(&shared, vec![input("old ignored text", 40)]);
-            let id = &first.messages[0].id;
-            let active = claim(&shared, &first.messages[0], first.captured_at).unwrap();
-            shared.acknowledge_business(id).unwrap();
-            let corrected = publish(&shared, vec![input("@帮助", 40)]);
-            if finish_unrecognized {
-                active.complete_unrecognized(None, None).unwrap();
-            } else {
-                drop(active);
-            }
-            assert_eq!(&corrected.messages[0].id, id);
-            assert!(!shared.is_business_pending(id).unwrap());
-            assert!(!ignore_revision(&shared, &first, 0));
-            assert!(claim(&shared, &corrected.messages[0], corrected.captured_at).is_none());
-        }
-    }
-
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn permanent_ignored_and_first_friend_baseline_stay_passive_after_corrections() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![input("@旧命令", 40)]);
-        let id = &first.messages[0].id;
-        claim(&shared, &first.messages[0], first.captured_at)
-            .unwrap()
-            .complete_ignored()
-            .unwrap();
-        let corrected = publish(&shared, vec![input("@帮助", 40)]);
-        assert_eq!(&corrected.messages[0].id, id);
-        assert!(!corrected.messages[0].is_new);
-        assert!(!shared.is_business_pending(id).unwrap());
-        assert!(!ignore_revision(&shared, &first, 0));
-
-        let shared = ChatTimeline::new();
-        let baseline = friend(&shared, vec![input("historical misread", 40)]);
-        assert!(!ignore_revision(&shared, &baseline, 0));
-        let corrected = friend(&shared, vec![input("@帮助", 40)]);
-        assert_eq!(corrected.messages[0].id, baseline.messages[0].id);
-        assert!(!corrected.messages[0].is_new);
-        assert!(
-            !shared
-                .is_business_pending(&corrected.messages[0].id)
-                .unwrap()
-        );
-        assert!(
-            shared
-                .deliver_unread_baseline(&corrected, &corrected.messages[0].id)
-                .unwrap()
-        );
-        assert!(
-            shared
-                .is_business_pending(&corrected.messages[0].id)
-                .unwrap()
-        );
     }
 
     #[test]
@@ -2575,36 +2470,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn baseline_promotion_uses_latest_ocr_and_skips_stale_queued_text() {
-        let shared = ChatTimeline::new();
-        let listener = shared.subscribe().unwrap();
-        let baseline = friend(&shared, vec![input("misread", 10)]);
-        let selected = friend(&shared, vec![input("correct command", 10)]);
-        let latest = friend(&shared, vec![input("latest corrected command", 10)]);
-        let message = &selected.messages[0];
-        let id = &message.id;
-        assert_eq!(id, &baseline.messages[0].id);
-        assert!(shared.deliver_unread_baseline(&selected, id).unwrap());
-        let queue = listener.read().unwrap();
-        assert_eq!(queue.last().unwrap().captured_at, latest.captured_at);
-        assert!(
-            queue
-                .windows(2)
-                .all(|pair| pair[0].captured_at <= pair[1].captured_at)
-        );
-        assert!(claim(&shared, message, baseline.captured_at).is_none());
-        assert!(claim(&shared, message, selected.captured_at).is_none());
-        let claim_handle = claim(&shared, message, latest.captured_at).unwrap();
-        assert_eq!(
-            queue.last().unwrap().messages[0].text,
-            "latest corrected command"
-        );
-        claim_handle.complete_as_command().unwrap();
-        assert!(claim(&shared, message, latest.captured_at).is_none());
-    }
-
-    #[test]
     fn discard_first_friend_baseline_cannot_be_promoted_after_release() {
         let shared = ChatTimeline::new();
         let guard = shared.suppress_friend_business().unwrap();
@@ -3025,29 +2890,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn repeated_text_and_ocr_revisions_keep_distinct_visual_ids() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![input("anchor", 10), input("same", 40)]);
-        let next = publish(&shared, vec![input("same", 10), input("same", 40)]);
-        assert_eq!(next.messages[0].id, first.messages[1].id);
-        assert_ne!(next.messages[0].id, next.messages[1].id);
-        assert!(next.messages[1].is_new);
-        let mut correction = input("corrected OCR", 40);
-        correction.sender = Some("actor".into());
-        correction.raw_sender = Some("actor (remark)".into());
-        let revised = publish(&shared, vec![input("same", 10), correction]);
-        assert_eq!(revised.messages[1].id, next.messages[1].id);
-        assert!(revised.messages[1].is_new);
-        shared
-            .acknowledge_business(&revised.messages[1].id)
-            .unwrap();
-        assert!(!shared.is_business_pending(&revised.messages[1].id).unwrap());
-        let repeat = publish(&shared, vec![input("same", 10), input("corrected OCR", 40)]);
-        assert!(!repeat.messages[1].is_new);
-    }
-
-    #[test]
     fn pending_ids_survive_scroll_and_ack_invalidates_queued_revisions() {
         let shared = ChatTimeline::new();
         publish(&shared, vec![input("baseline", 10)]);
@@ -3112,44 +2954,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_example1_rebuilt_screen_executes_only_command2() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        execute(&shared, &first, 0);
-        rebuild(&shared);
-        let rebuilt = publish(
-            &shared,
-            vec![primary("甲", "@命令1", 10), primary("甲", "@命令2", 40)],
-        );
-        assert!(
-            !rebuilt.messages[0].is_new,
-            "锚点命中：已执行命令不重复派发"
-        );
-        assert!(rebuilt.messages[1].is_new, "未锚定的命令2 是新命令");
-        assert!(!shared.is_business_pending(&rebuilt.messages[0].id).unwrap());
-        assert!(shared.is_business_pending(&rebuilt.messages[1].id).unwrap());
-    }
-
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_example2_resent_same_text_same_position_is_suppressed() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        execute(&shared, &first, 0);
-        rebuild(&shared);
-        // 已知取舍：重发同文本且仍落在同一位置（28px 内）会被墓碑抑制。
-        let rebuilt = publish(
-            &shared,
-            vec![primary("甲", "@命令1", 40), primary("甲", "@命令2", 70)],
-        );
-        assert!(!rebuilt.messages[0].is_new, "同位置同文本的重发被抑制");
-        assert!(rebuilt.messages[1].is_new, "只执行命令2");
-        assert!(!shared.is_business_pending(&rebuilt.messages[0].id).unwrap());
-        assert!(shared.is_business_pending(&rebuilt.messages[1].id).unwrap());
-    }
-
-    #[test]
     fn v3_example3_rebuilt_screen_of_only_executed_commands_executes_nothing() {
         let shared = ChatTimeline::new();
         let first = publish(
@@ -3170,158 +2974,6 @@ mod tests {
                 .iter()
                 .all(|message| !shared.is_business_pending(&message.id).unwrap())
         );
-    }
-
-    /// 非 initial 分支的真实场景：同一 visual session 内旧气泡滚出，新气泡在原锚点
-    /// 同一 y 处重发——Tracker 会给出 **fresh id + is_new=true**，只有非 initial 分支的
-    /// “命中锁则压回未新”才能抑制它。（旧用例因为 Tracker 复用同一 id/is_new=false 而空过。）
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_non_initial_fresh_bubble_at_anchor_position_is_suppressed() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        execute(&shared, &first, 0);
-        // 命令滚出：同会话内换一条位置完全不同的消息，Tracker 不会复用命令 id。
-        publish(&shared, vec![primary("乙", "中间消息", 200)]);
-        // 新气泡在原锚点同一 y 处重发。
-        let repeat = publish(
-            &shared,
-            vec![primary("乙", "中间消息", 200), primary("甲", "@命令1", 40)],
-        );
-        let command = repeat
-            .messages
-            .iter()
-            .find(|message| message.text.contains("@命令1"))
-            .expect("resurfaced command");
-        assert_ne!(
-            command.id, first.messages[0].id,
-            "旧气泡已滚出，重发必须是 fresh id，否则用例又是空过"
-        );
-        assert!(
-            !command.is_new,
-            "非 initial 分支必须把命中锁的 fresh 气泡压回未新"
-        );
-        assert!(!shared.is_business_pending(&command.id).unwrap());
-    }
-
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_ce1_chatter_above_executed_command_does_not_drag_it_back() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        execute(&shared, &first, 0);
-        rebuild(&shared);
-        let rebuilt = publish(
-            &shared,
-            vec![input("[丙]:今天天气不错", 10), primary("甲", "@命令1", 40)],
-        );
-        assert!(rebuilt.messages[0].is_new, "闲聊本身是新消息，交由路由过滤");
-        assert!(
-            !rebuilt.messages[1].is_new,
-            "普通闲聊在已执行命令上方不再连坐"
-        );
-        assert!(!shared.is_business_pending(&rebuilt.messages[1].id).unwrap());
-    }
-
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_ce2_unrouted_mention_does_not_drag_executed_command_back() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        execute(&shared, &first, 0);
-        rebuild(&shared);
-        let rebuilt = publish(
-            &shared,
-            vec![input("[惜月]:@惜月!", 10), primary("甲", "@命令1", 40)],
-        );
-        assert!(rebuilt.messages[0].is_new);
-        assert!(
-            !rebuilt.messages[1].is_new,
-            "@惜月! 这类未路由 @ 文本不造成连坐"
-        );
-        assert!(!shared.is_business_pending(&rebuilt.messages[1].id).unwrap());
-    }
-
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_ce4_rebuild_shift_down_within_one_line_still_matches() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        execute(&shared, &first, 0);
-        rebuild(&shared);
-        let shifted = publish(&shared, vec![primary("甲", "@命令1", 68)]);
-        assert!(!shifted.messages[0].is_new, "整体下移 28px 内仍命中");
-        rebuild(&shared);
-        let beyond = publish(&shared, vec![primary("甲", "@命令1", 69)]);
-        assert!(beyond.messages[0].is_new, "下移超过一行高就不命中");
-    }
-
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_ce5_single_frame_ocr_jitter_keeps_entry_until_second_missing_frame() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        execute(&shared, &first, 0);
-        // 第一帧抖动：末字误读，条目匹配不上，只累计 1 个缺失帧。
-        publish(&shared, vec![primary("甲", "@命令l", 40)]);
-        rebuild(&shared);
-        let recovered = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        assert!(!recovered.messages[0].is_new, "单帧 OCR 抖动不得误删锁条目");
-        assert!(
-            !shared
-                .is_business_pending(&recovered.messages[0].id)
-                .unwrap()
-        );
-        // 边界：连续两个可信帧都判定缺失才真正释放。
-        rebuild(&shared);
-        publish(&shared, vec![primary("甲", "@命令l", 40)]);
-        publish(&shared, vec![primary("甲", "@命令l", 40)]);
-        assert_eq!(
-            command_lock_bucket_count(&shared),
-            0,
-            "聊天桶清空后必须移除，避免无界增长"
-        );
-        rebuild(&shared);
-        let replayed = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        assert!(
-            replayed.messages[0].is_new,
-            "连续两帧缺失后条目被释放，可重新派发"
-        );
-        assert!(
-            shared
-                .is_business_pending(&replayed.messages[0].id)
-                .unwrap()
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_command_lock_keeps_only_five_entries_so_evicted_text_is_new_again() {
-        let shared = ChatTimeline::new();
-        let executed = publish(
-            &shared,
-            vec![
-                primary("甲", "@命令1", 40),
-                primary("甲", "@命令2", 70),
-                primary("甲", "@命令3", 100),
-                primary("甲", "@命令4", 130),
-                primary("甲", "@命令5", 160),
-                primary("甲", "@命令6", 190),
-            ],
-        );
-        for index in 0..6 {
-            execute(&shared, &executed, index);
-        }
-        rebuild(&shared);
-        // 命令1 已被挤出 5 条上限；命令6 仍在锁内。
-        let rebuilt = publish(
-            &shared,
-            vec![primary("甲", "@命令1", 10), primary("甲", "@命令6", 40)],
-        );
-        assert!(rebuilt.messages[0].is_new, "被挤出上限的更早命令应重新派发");
-        assert!(!rebuilt.messages[1].is_new, "仍在锁内的命令6 被抑制");
-        assert!(shared.is_business_pending(&rebuilt.messages[0].id).unwrap());
-        assert!(!shared.is_business_pending(&rebuilt.messages[1].id).unwrap());
     }
 
     /// 桶淘汰不能只断言 len<=32：必须证明“在用桶没被淘汰、新桶写进去了、
@@ -3407,28 +3059,6 @@ mod tests {
         assert!(!shared.is_business_pending(&id).unwrap());
     }
 
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_failed_dispatch_does_not_write_command_lock() {
-        let shared = ChatTimeline::new();
-        let built = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        let message = &built.messages[0];
-        let failed = claim(&shared, message, built.captured_at)
-            .expect("pending message should be claimable");
-        // 派发失败：认领被 Drop 撤销，命令锁绝不能写入，否则真失败的命令会被永久吞掉。
-        drop(failed);
-        assert!(shared.is_business_pending(&message.id).unwrap());
-        assert_eq!(command_lock_bucket_count(&shared), 0);
-        rebuild(&shared);
-        let rebuilt = publish(
-            &shared,
-            vec![primary("甲", "@命令1", 10), primary("甲", "@命令2", 40)],
-        );
-        assert!(rebuilt.messages[0].is_new, "锁为空：命令1 仍是新命令");
-        assert!(rebuilt.messages[1].is_new);
-        assert!(shared.is_business_pending(&rebuilt.messages[0].id).unwrap());
-    }
-
     /// 缺陷 2：命令锁归一化必须折全角。OCR 会把半角冒号读成全角，不折就会让同一条
     /// 已执行命令在重建后以“全角版本”重新命中失败而执行两次。
     #[test]
@@ -3461,84 +3091,6 @@ mod tests {
         );
     }
 
-    /// 缺陷 3：missing 计数不得跨视图重建残留。重建前已累计 1 个缺失帧时，
-    /// 重建后第 1 帧若再累加就会凑满 2，把仍在屏上的条目误删。
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_missing_frames_do_not_survive_a_view_rebuild() {
-        let shared = ChatTimeline::new();
-        let first = publish(&shared, vec![primary("甲", "@命令1", 40)]);
-        execute(&shared, &first, 0);
-        // 命令滚出 1 帧：missing_frames=1（未释放）。
-        publish(&shared, vec![primary("乙", "闲聊", 200)]);
-        rebuild(&shared);
-        // 重建后第 1 帧仍不见命令：计数若残留会在这里凑满 2。
-        publish(&shared, vec![primary("乙", "闲聊", 200)]);
-        assert!(
-            shared
-                .command_lock_texts_for_test(&ChatIdentity::PrimaryHall)
-                .iter()
-                .any(|text| text.contains("@命令1")),
-            "重建后第 1 个可信帧不得释放条目（跨重建计数必须清零）"
-        );
-        let recovered = publish(
-            &shared,
-            vec![primary("乙", "闲聊", 200), primary("甲", "@命令1", 40)],
-        );
-        let command = recovered
-            .messages
-            .iter()
-            .find(|message| message.text.contains("@命令1"))
-            .expect("recovered command");
-        assert!(!command.is_new, "跨重建后条目仍应抑制重跑");
-        assert!(!shared.is_business_pending(&command.id).unwrap());
-    }
-
-    /// 缺陷 4：suppress 帧（好友丢弃视图/导航中）不是可信内容证据，既不匹配也不释放。
-    /// 若仍释放，两帧“看起来消失”就会误删仍在屏上的条目。
-    #[test]
-    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
-    fn v3_suppressed_friend_frames_do_not_release_command_lock_entries() {
-        let shared = ChatTimeline::new();
-        let chat = ChatIdentity::Friend(Arc::from("observed name"));
-        let publish_friend = |messages: Vec<RecognizedChatMessage>| {
-            shared
-                .publish(Instant::now(), chat.clone(), messages)
-                .unwrap()
-        };
-        // 好友首帧是被动基线，不派发。
-        publish_friend(vec![input("history", 10)]);
-        let seeded = publish_friend(vec![input("history", 10), input("[甲]:@命令", 40)]);
-        let command = seeded
-            .messages
-            .iter()
-            .find(|message| message.text.contains("@命令"))
-            .unwrap()
-            .clone();
-        assert!(shared.is_business_pending(&command.id).unwrap());
-        claim(&shared, &command, seeded.captured_at)
-            .expect("pending friend command should be claimable")
-            .complete_as_command()
-            .unwrap();
-
-        let guard = shared.suppress_friend_business().unwrap();
-        for _ in 0..2 {
-            publish_friend(vec![input("history", 10)]);
-        }
-        drop(guard);
-
-        let recovered = publish_friend(vec![input("history", 10), input("[甲]:@命令", 40)]);
-        let command_again = recovered
-            .messages
-            .iter()
-            .find(|message| message.text.contains("@命令"))
-            .unwrap();
-        assert!(
-            !command_again.is_new,
-            "suppress 帧不得释放命令锁条目，否则恢复后命令会重跑"
-        );
-        assert!(!shared.is_business_pending(&command_again.id).unwrap());
-    }
 }
 
 fn same_rect(left: Rect, right: Rect) -> bool {

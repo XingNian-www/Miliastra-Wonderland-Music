@@ -367,7 +367,17 @@ impl ReadOnlyObserver {
         captured_at: Option<Instant>,
         result: String,
     ) {
-        let completion = json!({"status": "completed", "result": result});
+        self.record_immediate_with_status(payload, captured_at, "completed", result);
+    }
+
+    pub(crate) fn record_immediate_with_status(
+        &self,
+        payload: Value,
+        captured_at: Option<Instant>,
+        status: &'static str,
+        result: String,
+    ) {
+        let completion = json!({"status": status, "result": result});
         self.record_flow(None, payload, captured_at, Some(completion));
     }
 
@@ -1054,13 +1064,22 @@ pub(crate) fn command_capture(parsed: &RoutedCommand) -> Option<Instant> {
 }
 
 pub(crate) fn record_command_immediate(parsed: &RoutedCommand, flow: &str, result: String) {
+    record_command_immediate_with_status(parsed, flow, "completed", result);
+}
+
+pub(crate) fn record_command_immediate_with_status(
+    parsed: &RoutedCommand,
+    flow: &str,
+    status: &'static str,
+    result: String,
+) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !observer().push_enabled() {
             return;
         }
         let mut payload = command_parameters(parsed);
         payload["flow"] = json!(flow);
-        observer().record_immediate(payload, command_capture(parsed), result);
+        observer().record_immediate_with_status(payload, command_capture(parsed), status, result);
     }));
 }
 

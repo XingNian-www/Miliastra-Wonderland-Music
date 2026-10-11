@@ -113,6 +113,26 @@ fn listener_ready_after_recheck(
     }
 }
 
+/// 大厅归属闸门：一级监听只消费主大厅，二级监听只消费二级大厅。
+///
+/// 二级大厅与主观察可能是同一个大厅。共享观察里所有跨帧去重结构
+/// （`command_locks`、气泡键 `visual_session|chat|bubble_sequence`、业务认领
+/// `ObservedChatMessageId`）都按 `ChatIdentity` 分桶，两个身份互不相识，
+/// 所以同一条大厅消息会被两个身份各派发一次。互斥只能成立在消费处：
+/// 这里不合并身份，也不改动任何去重结构。
+///
+/// 好友会话与未知/公共/陌生人聊天不是大厅，不参与这道闸门。
+fn hall_consumes_identity(mode: ChatListenerMode, chat: &ChatIdentity) -> bool {
+    match chat {
+        ChatIdentity::PrimaryHall => mode == ChatListenerMode::Primary,
+        ChatIdentity::SecondaryHall => mode == ChatListenerMode::Secondary,
+        ChatIdentity::Friend(_)
+        | ChatIdentity::PublicChannel
+        | ChatIdentity::StrangerMessages
+        | ChatIdentity::Unknown => true,
+    }
+}
+
 fn replacement_ready_allowed(listener_ready: bool, startup_ready: bool) -> bool {
     listener_ready && startup_ready
 }
@@ -1526,6 +1546,12 @@ impl ApplicationRuntime {
         if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
             return Ok(());
         }
+        if backlog.is_empty() {
+            return Ok(());
+        }
+        // 大厅归属闸门按逻辑监听模式判定。本批次取一次模式：批次中途发生模式切换时，
+        // 沿用既有顺序语义，不在这里新增一致性机制。
+        let listener_mode = self.business.business.chat_listener_snapshot()?.mode;
         while !backlog.is_empty() {
             // 普通派发与独占起点原子协调；期间仍读取共享流并保留业务积压。
             let Some(_business_dispatch) =
@@ -1534,7 +1560,7 @@ impl ApplicationRuntime {
                 break;
             };
             let snapshot = backlog.pop_front().expect("nonempty business backlog");
-            self.consume_shared_chat_snapshot(snapshot)?;
+            self.consume_shared_chat_snapshot(snapshot, listener_mode)?;
         }
         Ok(())
     }
@@ -1542,12 +1568,24 @@ impl ApplicationRuntime {
     fn consume_shared_chat_snapshot(
         &mut self,
         snapshot: crate::observation::chat::ChatOcrSnapshot,
+        listener_mode: ChatListenerMode,
     ) -> Result<()> {
         let frame = self
             .ui
             .chat_observations
             .begin_frame(snapshot.captured_at)?;
         let result = (|| {
+            // 二级大厅与主观察可能是同一个大厅，跨身份去重互不相识，因此按模式互斥消费：
+            // 一级监听不消费二级大厅观察，二级监听不消费主大厅观察。
+            // 这里只拦命令消费（不认领、不派发）；共享观察的发布、帧缓存与只读事件保持原样。
+            if !hall_consumes_identity(listener_mode, &snapshot.chat) {
+                log::debug!(
+                    "{}不消费{:?}观察，仅保留只读发布",
+                    listener_mode.label(),
+                    snapshot.chat
+                );
+                return Ok(());
+            }
             match snapshot.chat {
                 ChatIdentity::PrimaryHall => {
                     let messages = snapshot
@@ -2296,7 +2334,8 @@ mod tests {
 
     use super::{
         CHAT_LISTENER_UNRESOLVED_UI_GRACE, CONFIG_RELOAD_UI_FALLBACK_GRACE, ChatListenerMode,
-        ListenerReadyEvidence, ObservedInput, attach_question_orders, listener_mode_matches_ui,
+        ListenerReadyEvidence, ObservedInput, attach_question_orders, hall_consumes_identity,
+        listener_mode_matches_ui,
         listener_ready_after_recheck, load_persisted_chat_listener_mode, merge_observed_inputs,
         persist_chat_listener_mode, primary_command_candidates, primary_rescan_can_publish,
         replacement_ready_allowed, replacement_startup_fallback_due, replacement_startup_retry_due,
@@ -2717,6 +2756,53 @@ mod tests {
             now,
             now + Duration::from_secs(1),
         ));
+    }
+
+    #[test]
+    fn primary_listening_does_not_consume_secondary_hall_observations() {
+        // 一级监听只看主大厅。二级大厅与主观察可能是同一个大厅，同屏可见的二级几何
+        // 是同一个大厅的另一个身份；消费它就会用 SecondaryHall 再派发一次同一条命令。
+        assert!(hall_consumes_identity(
+            ChatListenerMode::Primary,
+            &ChatIdentity::PrimaryHall
+        ));
+        assert!(!hall_consumes_identity(
+            ChatListenerMode::Primary,
+            &ChatIdentity::SecondaryHall
+        ));
+    }
+
+    #[test]
+    fn secondary_listening_does_not_consume_primary_hall_commands() {
+        // 二级监听只看二级大厅。主大厅快照（含审核巡检临时一级驻留期间的帧）
+        // 不在它的消费范围内，命令派发留给一级监听。
+        assert!(hall_consumes_identity(
+            ChatListenerMode::Secondary,
+            &ChatIdentity::SecondaryHall
+        ));
+        assert!(!hall_consumes_identity(
+            ChatListenerMode::Secondary,
+            &ChatIdentity::PrimaryHall
+        ));
+    }
+
+    #[test]
+    fn hall_gate_leaves_friend_and_unknown_identities_untouched() {
+        // 好友未读、未知、公共频道与陌生人聊天都不是大厅，两种监听模式下语义都不变。
+        for mode in [ChatListenerMode::Primary, ChatListenerMode::Secondary] {
+            for chat in [
+                ChatIdentity::Friend("最好的京子".into()),
+                ChatIdentity::Unknown,
+                ChatIdentity::PublicChannel,
+                ChatIdentity::StrangerMessages,
+            ] {
+                assert!(
+                    hall_consumes_identity(mode, &chat),
+                    "{} 不应改变 {chat:?} 的消费语义",
+                    mode.label()
+                );
+            }
+        }
     }
 
     #[test]

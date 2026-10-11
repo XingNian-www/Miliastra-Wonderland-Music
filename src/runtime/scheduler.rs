@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 const MAX_TASK_RECORDS: usize = 60;
+const MAX_FORMAL_TERMINAL_STATUSES: usize = 1000;
 const MAX_TASK_RESULT_CHARS: usize = 4 * 1024;
 const MAX_DIAGNOSTIC_RECORDS: usize = 30;
 const MAX_QUEUED_DIAGNOSTICS: usize = 10;
@@ -343,6 +344,10 @@ pub(crate) struct FormalScheduler {
     queued: VecDeque<QueuedFormalTask>,
     active: Option<ActiveSchedulerWork>,
     records: VecDeque<FormalTaskRecord>,
+    // 正式状态源独立于人的展示窗口；未完成任务不参与终态容量淘汰。
+    formal_records: BTreeMap<u64, FormalTaskRecord>,
+    formal_terminal_ids: VecDeque<u64>,
+    dropped_formal_statuses: u64,
     diagnostic_queued: VecDeque<QueuedDiagnosticTask>,
     diagnostic_records: VecDeque<DiagnosticTaskRecord>,
     accepting: bool,
@@ -357,6 +362,9 @@ impl FormalScheduler {
             queued: VecDeque::new(),
             active: None,
             records: VecDeque::new(),
+            formal_records: BTreeMap::new(),
+            formal_terminal_ids: VecDeque::new(),
+            dropped_formal_statuses: 0,
             diagnostic_queued: VecDeque::new(),
             diagnostic_records: VecDeque::new(),
             accepting: true,
@@ -518,7 +526,7 @@ impl FormalScheduler {
             cancellation: FormalTaskCancellationToken::default(),
             work: submission.work,
         });
-        self.records.push_front(FormalTaskRecord {
+        let record = FormalTaskRecord {
             id,
             label,
             status: "queued",
@@ -527,7 +535,9 @@ impl FormalScheduler {
             finished_at_ms: None,
             cancellation_requested: false,
             result: None,
-        });
+        };
+        self.formal_records.insert(id, record.clone());
+        self.records.push_front(record);
         trim_records(&mut self.records);
         Ok(FormalTaskEnqueueOutcome::Queued(FormalTaskReceipt {
             task_id: id,
@@ -555,6 +565,26 @@ impl FormalScheduler {
             pending_diagnostic: !self.diagnostic_queued.is_empty(),
             pending_deferred: false,
         }
+    }
+
+    /// 全部未完成正式任务及最近完成的有界终态，不受展示窗口限制。
+    pub(crate) fn formal_statuses(&self) -> Vec<FormalTaskSnapshot> {
+        let now = current_unix_millis();
+        self.formal_records
+            .values()
+            .rev()
+            .map(|record| record_snapshot(record, now))
+            .collect()
+    }
+
+    pub(crate) fn formal_task_snapshot(&self, id: u64) -> Option<FormalTaskSnapshot> {
+        self.formal_records
+            .get(&id)
+            .map(|record| record_snapshot(record, current_unix_millis()))
+    }
+
+    pub(crate) const fn dropped_formal_statuses(&self) -> u64 {
+        self.dropped_formal_statuses
     }
 
     pub(crate) fn contains_dedup_key(&self, key: &FormalTaskDedupKey) -> bool {
@@ -775,12 +805,29 @@ impl FormalScheduler {
     }
 
     fn update_record(&mut self, id: u64, update: impl FnOnce(&mut FormalTaskRecord)) {
-        let Some(record) = self.records.iter_mut().find(|record| record.id == id) else {
+        let Some(record) = self.formal_records.get_mut(&id) else {
             log::warn!("正式任务追踪记录不存在: id={id}");
             return;
         };
+        let was_terminal = record.finished_at_ms.is_some();
         update(record);
+        let became_terminal = !was_terminal && record.finished_at_ms.is_some();
+        if let Some(display_record) = self.records.iter_mut().find(|record| record.id == id) {
+            *display_record = record.clone();
+        }
         trim_records(&mut self.records);
+        if became_terminal {
+            self.formal_terminal_ids.push_back(id);
+            // 按完成顺序保留终态：很早入队但刚完成的任务仍可查询。
+            while self.formal_terminal_ids.len() > MAX_FORMAL_TERMINAL_STATUSES {
+                let expired = self
+                    .formal_terminal_ids
+                    .pop_front()
+                    .expect("terminal exists");
+                self.formal_records.remove(&expired);
+                self.dropped_formal_statuses = self.dropped_formal_statuses.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -941,6 +988,90 @@ mod tests {
             .enqueue(submission("自动出队", Some("playback_advance_queue")))
             .expect("re-enqueue after completion");
         assert!(matches!(again, FormalTaskEnqueueOutcome::Queued(_)));
+    }
+
+    #[test]
+    fn formal_statuses_keep_all_unfinished_tasks_and_bound_terminals_by_completion() {
+        let mut scheduler = FormalScheduler::new();
+        scheduler.enqueue(submission("old running", None)).unwrap();
+        let old = scheduler.take_next().unwrap();
+        let mut queued_ids = Vec::new();
+        for _ in 0..1200 {
+            let FormalTaskEnqueueOutcome::Queued(receipt) =
+                scheduler.enqueue(submission("new queued", None)).unwrap()
+            else {
+                panic!("task should queue");
+            };
+            queued_ids.push(receipt.task_id);
+        }
+        assert_eq!(scheduler.snapshot().pending_labels().len(), 1200);
+        assert_eq!(scheduler.snapshot().tasks().len(), 30);
+        assert_eq!(scheduler.formal_statuses().len(), 1201);
+
+        for id in queued_ids.iter().take(1001) {
+            assert!(matches!(
+                scheduler.cancel(*id),
+                FormalTaskCancelAction::CanceledBeforeStart(_)
+            ));
+        }
+        assert_eq!(scheduler.dropped_formal_statuses(), 1);
+        assert!(scheduler.formal_task_snapshot(queued_ids[0]).is_none());
+        // Existing cancellation semantics still use the separate display history.
+        assert!(matches!(
+            scheduler.cancel(queued_ids[0]),
+            FormalTaskCancelAction::AlreadyFinished
+        ));
+        assert_eq!(scheduler.formal_statuses().len(), 1200);
+        assert_eq!(
+            scheduler
+                .formal_task_snapshot(old.task_id())
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(
+            scheduler
+                .formal_task_snapshot(queued_ids[1199])
+                .unwrap()
+                .status,
+            "queued"
+        );
+        assert_eq!(
+            scheduler
+                .formal_task_snapshot(queued_ids[1000])
+                .unwrap()
+                .status,
+            "canceled"
+        );
+
+        scheduler
+            .complete(
+                old.task_id(),
+                FormalTaskCompletion::Succeeded("old done".into()),
+            )
+            .unwrap();
+        assert_eq!(scheduler.dropped_formal_statuses(), 2);
+        assert!(scheduler.formal_task_snapshot(queued_ids[1]).is_none());
+        // Earliest enqueue is the newest terminal, so it stays queryable.
+        let terminal = scheduler.formal_task_snapshot(old.task_id()).unwrap();
+        assert_eq!(terminal.status, "completed");
+        assert_eq!(terminal.result.as_deref(), Some("old done"));
+        assert_eq!(
+            scheduler
+                .formal_statuses()
+                .iter()
+                .filter(|task| task.finished_at_ms.is_some())
+                .count(),
+            1000
+        );
+        assert_eq!(
+            scheduler
+                .formal_statuses()
+                .iter()
+                .filter(|task| task.status == "queued")
+                .count(),
+            199
+        );
     }
 
     #[test]

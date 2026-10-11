@@ -119,10 +119,43 @@ pub(crate) struct ReadOnlyReadRequest {
     #[serde(default = "read_only_ocr_default")]
     pub ocr: bool,
     pub rect: Option<ReadOnlyRect>,
+    #[serde(default)]
+    pub response: ReadOnlyResponse,
+}
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ReadOnlyResponse {
+    #[default]
+    Full,
+    Metadata,
 }
 fn read_only_ocr_default() -> bool {
     true
 }
+fn read_only_ui_summary(
+    observation: Option<crate::runtime::ui::UiStateObservation>,
+) -> serde_json::Value {
+    use crate::runtime::ui::UiStateObservation;
+    match observation {
+        Some(UiStateObservation::Classified(state)) => serde_json::json!({
+            "kind":state.classification().kind().name(), "current":state.classification().kind().name(),
+            "stable":state.stable_kind().is_some(), "lastStableKind":state.last_stable_kind().map(|kind|kind.name()),
+            "frameId":state.frame_id(), "atMs":null,"ageMillis":null,
+            "timeMissingReason":"ui_observation_does_not_store_capture_time"
+        }),
+        Some(UiStateObservation::Failed {
+            frame_id,
+            last_stable_kind,
+            ..
+        }) => serde_json::json!({
+            "kind":null,"current":null,"stable":null,"lastStableKind":last_stable_kind.map(|kind|kind.name()),
+            "frameId":frame_id,"atMs":null,"ageMillis":null,"missingReason":"classification_failed"
+        }),
+        None => serde_json::json!({"kind":null,"current":null,"stable":null,"lastStableKind":null,
+            "frameId":null,"atMs":null,"ageMillis":null,"missingReason":"no_ui_observation"}),
+    }
+}
+
 struct ReadOnlyFence;
 impl crate::runtime::ui::sealed::UiRoutineSealed for ReadOnlyFence {}
 impl crate::runtime::ui::UiRoutine for ReadOnlyFence {
@@ -393,7 +426,33 @@ impl DebugHttpService {
             serde_json::json!({"requested":false})
         };
         let id = observer.record_active(std::sync::Arc::new(frame), serde_json::json!({"request":request,"ocr":ocr,"steps":["capture current game client without input","classify the same captured frame","OCR the requested source region if enabled","save evidence and export JSON plus original PNG"],"reproduce":{"method":"POST","path":"/debug/read-only/read","body":request},"scope":"diagnostic observation; no dispatch or input"})).map_err(error)?;
-        observer.read_entry(&id).map_err(error)
+        match request.response {
+            ReadOnlyResponse::Full => observer.read_entry(&id),
+            ReadOnlyResponse::Metadata => observer.entry_metadata(&id),
+        }
+        .map_err(error)
+    }
+
+    /// Cached runtime state only: no UI submission, capture, inference or event publication.
+    pub(crate) fn read_only_summary(&self) -> serde_json::Value {
+        let mut summary = crate::debug_read_only::observer().summary_snapshot();
+        summary["ui"] = read_only_ui_summary(
+            self.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.latest_ui_state()),
+        );
+        summary["queue"] = match &self.playback_queue {
+            Some(reader) => match reader() {
+                Ok(length) => serde_json::json!({"length":length}),
+                Err(_) => {
+                    serde_json::json!({"length":null,"missingReason":"queue_state_unavailable"})
+                }
+            },
+            None => {
+                serde_json::json!({"length":null,"missingReason":"queue_reader_not_configured"})
+            }
+        };
+        summary
     }
 
     fn live_executor(&self, runtime: UiRuntimeHandle) -> LiveExecutor {
@@ -1082,6 +1141,74 @@ impl DebugHttpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn read_only_summary_does_not_capture_ocr_push_or_change_mode() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct NoCapture(Arc<AtomicUsize>);
+        impl crate::runtime::ui::UiDevice for NoCapture {
+            fn capture(&mut self) -> anyhow::Result<image::DynamicImage> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("summary must never request capture")
+            }
+        }
+        let captures = Arc::new(AtomicUsize::new(0));
+        let inferences = Arc::new(AtomicUsize::new(0));
+        let ocr_calls = inferences.clone();
+        let runtime = crate::runtime::ui::UiRuntime::start(NoCapture(captures.clone()), 4).unwrap();
+        let service = DebugHttpService::new(Some(runtime.handle()))
+            .with_ocr(Arc::new(move |_| {
+                ocr_calls.fetch_add(1, Ordering::SeqCst);
+                Err("summary must not infer".into())
+            }))
+            .with_playback_queue_reader(Arc::new(|| Ok(7)));
+        let observer = crate::debug_read_only::observer();
+        let mode = observer.state_snapshot();
+        let sequence = observer.bus().latest_sequence();
+        for _ in 0..3 {
+            let summary = service.read_only_summary();
+            assert_eq!(summary["queue"]["length"], 7);
+            assert_eq!(summary["ui"]["kind"], serde_json::Value::Null);
+            assert_eq!(summary["ui"]["ageMillis"], serde_json::Value::Null);
+            assert_eq!(summary["instance"], observer.instance());
+            assert!(!summary.to_string().contains("imagePngBase64"));
+            assert!(!summary.to_string().contains("fileSha256"));
+        }
+        assert_eq!(captures.load(Ordering::SeqCst), 0);
+        assert_eq!(inferences.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.bus().latest_sequence(), sequence);
+        assert_eq!(observer.state_snapshot(), mode);
+        runtime.shutdown().unwrap();
+        let missing = DebugHttpService::default().read_only_summary();
+        assert_eq!(missing["queue"]["length"], serde_json::Value::Null);
+        assert_eq!(missing["ui"]["stable"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn active_response_dto_rejects_unknown_fields_and_preserves_full_default() {
+        let legacy: ReadOnlyReadRequest =
+            serde_json::from_value(serde_json::json!({"ocr":false})).unwrap();
+        assert!(matches!(legacy.response, ReadOnlyResponse::Full));
+        let metadata: ReadOnlyReadRequest =
+            serde_json::from_value(serde_json::json!({"response":"metadata"})).unwrap();
+        assert!(matches!(metadata.response, ReadOnlyResponse::Metadata));
+        assert!(
+            serde_json::from_value::<ReadOnlyReadRequest>(serde_json::json!({"response":"tiny"}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ReadOnlyReadRequest>(serde_json::json!({"image":false}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ReadOnlyReadRequest>(
+                serde_json::json!({"rect":{"x":0,"y":0,"width":1,"height":1,"bad":true}})
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     #[ignore = "global observation state; run isolated; no game input"]
     fn read_only_observation_preserves_normal_program_execution() {

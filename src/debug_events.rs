@@ -88,6 +88,15 @@ impl DebugEventBus {
         &self,
         since: u64,
     ) -> (Vec<DebugEvent>, broadcast::Receiver<DebugEvent>) {
+        let (events, receiver, _) = self.subscribe_replay_snapshot(since);
+        (events, receiver)
+    }
+
+    /// The replay boundary and subscription are read under the publication lock.
+    pub(crate) fn subscribe_replay_snapshot(
+        &self,
+        since: u64,
+    ) -> (Vec<DebugEvent>, broadcast::Receiver<DebugEvent>, u64) {
         let replay = self
             .replay
             .lock()
@@ -98,7 +107,8 @@ impl DebugEventBus {
             .filter(|event| event.sequence > since)
             .cloned()
             .collect();
-        (events, receiver)
+        let latest = self.sequence.load(Ordering::SeqCst);
+        (events, receiver, latest)
     }
 
     /// 序号严格大于 since 的缓存事件，供断线重连补齐。

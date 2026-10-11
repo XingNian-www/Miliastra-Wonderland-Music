@@ -325,6 +325,20 @@ impl<'a> ChatCommandRouter<'a> {
 mod tarot_routing_tests {
     use super::*;
     use crate::features::command::CommandObservation;
+
+    #[test]
+    fn playlist_numbers_are_reserved_for_the_exclusive_window() {
+        let router = ChatCommandRouter::without_custom_workflow();
+        for index in 1..=5 {
+            let text = format!("@{index}");
+            let envelope =
+                CommandEnvelope::new(&text, "用户", "pink", &text, CommandObservation::default())
+                    .unwrap();
+            assert!(is_reserved_decision_command(&envelope));
+            assert!(router.route(&envelope, None).is_none());
+        }
+    }
+
     #[test]
     fn tarot_routes_in_hall_and_private_without_stealing_game_commands() {
         let router = ChatCommandRouter::without_custom_workflow();
@@ -385,6 +399,10 @@ mod tarot_routing_tests {
 }
 
 fn is_reserved_decision_command(envelope: &CommandEnvelope) -> bool {
+    // Numeric playlist choices are parsed only by the active exclusive playlist window.
+    if crate::features::playlist::PlaylistCommand::is_window_selection(envelope) {
+        return true;
+    }
     let command = envelope.command_text();
     if ["确认", "跳过", "换源", "AI"]
         .iter()

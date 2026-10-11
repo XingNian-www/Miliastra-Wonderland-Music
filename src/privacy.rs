@@ -1,9 +1,12 @@
 pub(crate) const REDACTED_TURTLE_SOUP_BOTTOM: &str = "[海龟汤汤底已隐藏]";
 pub(crate) const REDACTED_UNDERCOVER_SECRET: &str = "[谁是卧底秘密内容已隐藏]";
 pub(crate) const REDACTED_UNDERCOVER_INPUT: &str = "[谁是卧底私聊内容已隐藏]";
+pub(crate) const REDACTED_PLAYLIST_IMPORT: &str = "[歌单导入命令与分享链接已隐藏]";
 
 pub(crate) fn redacted_chat_text(message: &str) -> &str {
-    if contains_turtle_soup_bottom_marker(message) {
+    if message.contains("@导入QQ歌单") || message.contains("@导入网易歌单") {
+        REDACTED_PLAYLIST_IMPORT
+    } else if contains_turtle_soup_bottom_marker(message) {
         REDACTED_TURTLE_SOUP_BOTTOM
     } else if (message.contains("你的位置：") && message.contains("你的词语："))
         || message.contains("谁是卧底谜底")
@@ -44,6 +47,23 @@ fn contains_undercover_private_input(message: &str) -> bool {
         .next()
         .is_some_and(|position| ('A'..='K').contains(&position.to_ascii_uppercase()))
         && chars.next().is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_playlist_import_links_from_chat_logs() {
+        assert_eq!(
+            redacted_chat_text("@导入网易歌单https://music.163.com/playlist?id=123&uct2=private"),
+            REDACTED_PLAYLIST_IMPORT
+        );
+        assert_eq!(
+            redacted_chat_text("@导入QQ歌单8162013709"),
+            REDACTED_PLAYLIST_IMPORT
+        );
+    }
 }
 
 fn contains_turtle_soup_bottom_marker(message: &str) -> bool {

@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
+use crate::catalog::ImportedPlaylist;
+use crate::catalog::playlist_import::{resolve_share_url, response_json};
 use crate::catalog::{
     AccountStatusCache, CatalogError, CredentialRefreshAdapter, PlaybackEligibility,
     ProviderAccountStatus, ProviderSearchCandidate, SourceAdapter,
@@ -28,6 +30,7 @@ use crate::catalog::{
 use crate::credentials::{CredentialStore, ProviderCredential};
 use crate::domain::{ResolverLocator, SearchSpec, Song, SongKey, StreamSource};
 use crate::lyrics::{TimedLyrics, parse_lrc_pair};
+use crate::model::{PlayableTrack, TrackKey, TrackMetadata, TrackRef};
 
 const SEARCH_URL: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
 const PROVIDER: &str = "qqmusic";
@@ -110,6 +113,96 @@ impl QqMusicAdapter {
             account_cache: std::sync::Arc::new(
                 std::sync::Mutex::new(AccountStatusCache::default()),
             ),
+        })
+    }
+
+    pub async fn import_playlist(&self, input: &str) -> Result<ImportedPlaylist, CatalogError> {
+        let id = resolve_share_url(input, PROVIDER).await?;
+        let endpoint =
+            Url::parse("https://i.y.qq.com/qzone-music/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg")
+                .map_err(|_| CatalogError::InvalidResponse("QQ 歌单接口地址无效".to_owned()))?;
+        let mut request = self
+            .client
+            .get(endpoint)
+            .query(&[
+                ("type", "1"),
+                ("json", "1"),
+                ("utf8", "1"),
+                ("onlysong", "0"),
+                ("disstid", id.as_str()),
+                ("g_tk", "0"),
+                ("loginUin", "0"),
+                ("hostUin", "0"),
+                ("format", "json"),
+                ("inCharset", "utf-8"),
+                ("outCharset", "utf-8"),
+                ("notice", "0"),
+                ("platform", "yqq.json"),
+                ("needNewCode", "0"),
+            ])
+            .header("Referer", "https://y.qq.com/")
+            .header("User-Agent", "Mozilla/5.0");
+        if let Ok(Some(credential)) = self.credentials.get(PROVIDER) {
+            request = request.header("Cookie", cookie_header(credential.cookies()));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| CatalogError::Transient("QQ 歌单读取失败".to_owned()))?;
+        if !response.status().is_success() {
+            return Err(CatalogError::Transient("QQ 歌单读取失败".to_owned()));
+        }
+        let response = response_json(response, "QQ").await?;
+        if response.get("code").and_then(Value::as_i64) != Some(0) {
+            return Err(CatalogError::Unavailable(
+                "QQ 歌单不可用或需要登录".to_owned(),
+            ));
+        }
+        let playlist = response
+            .pointer("/cdlist/0")
+            .ok_or_else(|| CatalogError::Unavailable("QQ 歌单不存在".to_owned()))?;
+        let title = playlist
+            .get("dissname")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| CatalogError::InvalidResponse("QQ 歌单缺少名称".to_owned()))?
+            .to_owned();
+        let expected = playlist
+            .get("songnum")
+            .or_else(|| playlist.get("total_song_num"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| CatalogError::InvalidResponse("QQ 歌单缺少曲目总数".to_owned()))?
+            as usize;
+        if expected > 3000 {
+            return Err(CatalogError::InvalidResponse(
+                "QQ 歌单超过单次导入上限 3000 首".to_owned(),
+            ));
+        }
+        let raw_tracks = playlist
+            .get("songlist")
+            .and_then(Value::as_array)
+            .ok_or_else(|| CatalogError::InvalidResponse("QQ 歌单缺少曲目列表".to_owned()))?;
+        if raw_tracks.len() != expected {
+            return Err(CatalogError::InvalidResponse(
+                "QQ 歌单曲目未完整返回，未导入任何内容".to_owned(),
+            ));
+        }
+        let tracks = raw_tracks
+            .iter()
+            .map(qq_import_track)
+            .collect::<Result<Vec<_>, _>>()?;
+        let creator = playlist
+            .get("nickname")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != "查无此人")
+            .map(str::to_owned);
+        Ok(ImportedPlaylist {
+            provider: PROVIDER.to_owned(),
+            id,
+            title,
+            creator,
+            tracks,
         })
     }
 
@@ -1084,6 +1177,10 @@ impl CredentialRefreshAdapter for QqMusicAdapter {
 
 #[async_trait]
 impl SourceAdapter for QqMusicAdapter {
+    async fn import_playlist(&self, input: &str) -> Result<ImportedPlaylist, CatalogError> {
+        QqMusicAdapter::import_playlist(self, input).await
+    }
+
     async fn validate_credential(
         &self,
         candidate: &ProviderCredential,
@@ -1301,6 +1398,85 @@ pub(crate) fn parse_search_candidates(
         }
     }
     Ok(candidates)
+}
+
+fn qq_import_track(raw: &Value) -> Result<PlayableTrack, CatalogError> {
+    let mid = raw
+        .get("songmid")
+        .and_then(Value::as_str)
+        .filter(|value| is_qq_mid(value))
+        .ok_or_else(|| CatalogError::InvalidResponse("QQ 歌单包含无效曲目标识".to_owned()))?;
+    let title = raw
+        .get("songname")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CatalogError::InvalidResponse("QQ 歌单包含缺少名称的曲目".to_owned()))?;
+    let media_mid = raw
+        .get("strMediaMid")
+        .and_then(Value::as_str)
+        .filter(|value| is_qq_mid(value))
+        .unwrap_or(mid);
+    let artists = raw
+        .get("singer")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("name").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(PlayableTrack {
+        track_ref: TrackRef {
+            key: TrackKey::new(crate::catalog::ProviderId::QqMusic, mid)
+                .map_err(|_| CatalogError::InvalidResponse("QQ 曲目标识无效".to_owned()))?,
+            resolver_locator: ResolverLocator::new(format!("qqmusic:v2:{mid}:{media_mid}")).ok(),
+        },
+        metadata: TrackMetadata {
+            title: title.to_owned(),
+            artists,
+            album: raw
+                .get("albumname")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            duration_ms: raw
+                .get("interval")
+                .and_then(Value::as_u64)
+                .map(|seconds| seconds.saturating_mul(1000)),
+        },
+    })
+}
+
+#[cfg(test)]
+mod playlist_import_tests {
+    use super::*;
+
+    #[test]
+    fn maps_legacy_qq_fields_to_stable_track_metadata_and_resolver_locator() {
+        let track = qq_import_track(&serde_json::json!({
+            "songmid": "abc123",
+            "strMediaMid": "media987",
+            "songname": "旧接口曲目",
+            "singer": [{"name": "歌手一"}, {"name": "歌手二"}],
+            "albumname": "专辑",
+            "interval": 231,
+        }))
+        .unwrap();
+        assert_eq!(track.track_ref.key.id, "abc123");
+        assert_eq!(
+            track.track_ref.resolver_locator.as_ref().unwrap().as_str(),
+            "qqmusic:v2:abc123:media987"
+        );
+        assert_eq!(track.metadata.artists, ["歌手一", "歌手二"]);
+        assert_eq!(track.metadata.duration_ms, Some(231_000));
+    }
+
+    #[test]
+    fn rejects_qq_tracks_missing_stable_ids_or_titles() {
+        assert!(qq_import_track(&serde_json::json!({"songname":"title"})).is_err());
+        assert!(qq_import_track(&serde_json::json!({"songmid":"abc123"})).is_err());
+    }
 }
 
 fn qq_filename(media_mid: &str, prefix: &str, extension: &str) -> String {

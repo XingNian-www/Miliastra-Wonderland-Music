@@ -399,8 +399,8 @@ mod tarot_routing_tests {
 }
 
 fn is_reserved_decision_command(envelope: &CommandEnvelope) -> bool {
-    // Numeric playlist choices are parsed only by the active exclusive playlist window.
-    if crate::features::playlist::PlaylistCommand::is_window_selection(envelope) {
+    // Playlist window decisions are parsed only by its active exclusive reader.
+    if crate::features::playlist::PlaylistCommand::is_window_decision(envelope) {
         return true;
     }
     let command = envelope.command_text();

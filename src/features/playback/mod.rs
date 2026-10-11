@@ -768,6 +768,14 @@ impl PlaybackService {
         })
     }
 
+    pub(crate) fn push_queue_next(&mut self, item: QueueItem) -> Result<QueuePushOutcome> {
+        let accepted = self.queue.push_next(item)?;
+        Ok(QueuePushOutcome {
+            accepted,
+            size: self.queue.len(),
+        })
+    }
+
     pub(crate) fn remove_queue(&mut self, removal: QueueRemoval) -> Result<QueueRemoveOutcome> {
         let removed = match removal {
             QueueRemoval::Id(id) => {

@@ -262,6 +262,30 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         ApplicationRuntime::playback_queue(self)
     }
 
+    fn enqueue_playlist_item(&mut self, item: QueueItem) -> Result<bool> {
+        self.business
+            .business
+            .push_playback_queue(item)
+            .map(|outcome| outcome.accepted)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn remove_playlist_auto_items(&mut self) -> Result<()> {
+        let indexes = self
+            .playback_queue()?
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.playlist_auto.then_some(index))
+            .collect::<Vec<_>>();
+        if !indexes.is_empty() {
+            self.business
+                .business
+                .remove_playback_queue_indexes(indexes)
+                .map_err(anyhow::Error::from)?;
+        }
+        Ok(())
+    }
+
     fn pick_playback_pool_track(
         &mut self,
         excluded: &HashSet<miliastra_playback::TrackKey>,

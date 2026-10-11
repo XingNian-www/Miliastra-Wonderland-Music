@@ -17,6 +17,11 @@ use crate::features::turtle_soup::{
     QuestionSubmitOutcome, TurtleSoupApplicationPort, TurtleSoupCommandOutcome,
 };
 
+/// 歌单与收藏仅对好友及以上开放；好友私聊或大厅身份映射均可授权。
+fn playlist_command_allows_friend(authority: CommandAuthority, role: Option<IdentityRole>) -> bool {
+    authority == CommandAuthority::Friend || role.is_some()
+}
+
 /// B站 音源与本地曲库兜底要求好友及以上权限：好友私聊、靠映射获得权限的大厅成员
 /// （好友/管理员/主人），以及控制面板发起的点歌都算。
 fn song_request_allows_bilibili(parsed: &RoutedCommand, command: &SongCommand) -> bool {
@@ -57,6 +62,30 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
     fn play(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<()> {
         let application = self.runtime.playback.playback_application.clone();
         application.play_structured_track(track, self.runtime)
+    }
+
+    fn enqueue_next(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<bool> {
+        let outcome = self
+            .runtime
+            .business
+            .business
+            .push_playback_queue_next(QueueItem {
+                keyword: track.metadata.title.clone(),
+                source: track.track_ref.key.provider.as_str().to_owned(),
+                track: Some(track.clone()),
+                ..QueueItem::default()
+            })?;
+        Ok(outcome.accepted)
+    }
+
+    fn start_playlist(&mut self, tracks: Vec<miliastra_playback::PlayableTrack>) -> Result<usize> {
+        let application = self.runtime.playback.playback_application.clone();
+        application.start_personal_playlist(tracks, self.runtime)
+    }
+
+    fn stop_playlist(&mut self) -> Result<bool> {
+        let application = self.runtime.playback.playback_application.clone();
+        application.stop_personal_playlist(self.runtime)
     }
 
     fn import_playlist(
@@ -324,6 +353,9 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         command: &crate::features::playlist::PlaylistCommand,
     ) -> Result<()> {
+        if !playlist_command_allows_friend(parsed.authority, parsed.role) {
+            return ApplicationRuntime::reply(self, "♫ 个人歌单功能仅对好友及以上开放");
+        }
         if matches!(command, crate::features::playlist::PlaylistCommand::Open) {
             return self.execute_playlist_window(parsed);
         }
@@ -779,6 +811,28 @@ impl HallMaintenancePort for ApplicationRuntime {
 mod tests {
     use super::*;
     use crate::features::command::CommandAuthority;
+
+    #[test]
+    fn playlist_commands_require_friend_or_above() {
+        assert!(!playlist_command_allows_friend(
+            CommandAuthority::HallMember,
+            None
+        ));
+        assert!(playlist_command_allows_friend(
+            CommandAuthority::Friend,
+            None
+        ));
+        for role in [
+            IdentityRole::Friend,
+            IdentityRole::Admin,
+            IdentityRole::Owner,
+        ] {
+            assert!(playlist_command_allows_friend(
+                CommandAuthority::HallMember,
+                Some(role)
+            ));
+        }
+    }
 
     #[test]
     fn song_request_bilibili_permission_follows_hall_identity_mapping() {

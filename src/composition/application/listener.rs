@@ -1916,6 +1916,19 @@ impl ApplicationRuntime {
                 continue;
             };
             let parsed_command = self.map_command_actor(parsed_command);
+            if let ModuleCommand::Playlist(command) = &parsed_command.command {
+                let owner = self.canonical_actor_name(&parsed_command.username);
+                let application = &self.business.playlist_application;
+                if !application.has_command_context(&owner, command, Instant::now())? {
+                    acknowledge_unrecognized_primary_message(
+                        &self.ui.shared_ocr,
+                        observed,
+                        captured_at,
+                        baseline_primed,
+                    )?;
+                    continue;
+                }
+            }
             if let ModuleCommand::Invite(invite) = &parsed_command.command
                 && !self.business.business.invite_should_accept(invite.seq)?
             {

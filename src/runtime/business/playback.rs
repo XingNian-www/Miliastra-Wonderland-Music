@@ -34,6 +34,17 @@ impl PlaybackRuntimeState {
                 }
                 let _ = response.send(result);
             }
+            PlaybackRuntimeMessage::PushQueueNext { item, response } => {
+                let result = self.service_mut().and_then(|service| {
+                    service
+                        .push_queue_next(item)
+                        .map_err(playback_operation_failed)
+                });
+                if result.is_ok() {
+                    self.publish_queue();
+                }
+                let _ = response.send(result);
+            }
             PlaybackRuntimeMessage::RemoveQueue { removal, response } => {
                 let result = self.service_mut().and_then(|service| {
                     service

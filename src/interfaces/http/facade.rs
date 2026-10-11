@@ -578,7 +578,7 @@ fn is_bilibili_bvid(value: &str) -> bool {
 }
 
 #[derive(Clone)]
-pub(super) struct ApplicationHttpPlayerFacade {
+pub(crate) struct ApplicationHttpPlayerFacade {
     backend: PlayerRuntimeBackend,
     search: PlayerSearchClient,
     playback: PlaybackHandle,
@@ -587,7 +587,7 @@ pub(super) struct ApplicationHttpPlayerFacade {
 }
 
 impl ApplicationHttpPlayerFacade {
-    pub(super) fn new(
+    pub(crate) fn new(
         backend: PlayerRuntimeBackend,
         search: PlayerSearchClient,
         playback: PlaybackHandle,
@@ -682,12 +682,12 @@ fn player_search_error(error: PlayerSearchClientError) -> HttpPlayerSearchError 
 }
 
 #[derive(Clone)]
-pub(super) struct ApplicationHttpLoginFacade {
+pub(crate) struct ApplicationHttpLoginFacade {
     manager: LoginHelperManager,
 }
 
 impl ApplicationHttpLoginFacade {
-    pub(super) fn new(manager: LoginHelperManager) -> Self {
+    pub(crate) fn new(manager: LoginHelperManager) -> Self {
         Self { manager }
     }
 }
@@ -790,13 +790,13 @@ fn login_error(error: LoginHelperFailure) -> HttpLoginError {
     }
 }
 
-pub(super) struct ApplicationHttpDebugFacade {
+pub(crate) struct ApplicationHttpDebugFacade {
     sandbox: crate::debug_http_service::DebugHttpService,
     runtime: crate::runtime::ui::UiRuntimeHandle,
     operation: std::sync::Mutex<()>,
 }
 impl ApplicationHttpDebugFacade {
-    pub(super) fn new(
+    pub(crate) fn new(
         runtime: crate::runtime::ui::UiRuntimeHandle,
         ocr: crate::runtime::ocr::OcrRuntimeHandle,
         database_path: &std::path::Path,
@@ -1127,12 +1127,12 @@ impl crate::interfaces::http::HttpDebugPort for ApplicationHttpDebugFacade {
 }
 
 #[derive(Clone)]
-pub(super) struct ApplicationHttpAiFacade {
+pub(crate) struct ApplicationHttpAiFacade {
     client: AiClient,
 }
 
 impl ApplicationHttpAiFacade {
-    pub(super) fn new(client: AiClient) -> Self {
+    pub(crate) fn new(client: AiClient) -> Self {
         Self { client }
     }
 }

@@ -239,7 +239,20 @@ fn bubble_matches(prev: &Snapshot, cur: &RecognizedChatMessage, delta: i32) -> b
     if (cur.block.y - prev.y - delta).abs() > POS_TOL {
         return false;
     }
-    text_similar(&prev.text, &cur.text)
+    // 命令候选必须精确匹配：命令短、分支多，允许编辑距离会把 &M3 与 &M4 误并成同一气泡。
+    // 只有非命令（闲聊/回复）才允许有界编辑距离的近似匹配。
+    if is_command_candidate(&prev.text) || is_command_candidate(&cur.text) {
+        command_text_equal(&prev.text, &cur.text)
+    } else {
+        text_similar(&prev.text, &cur.text)
+    }
+}
+
+/// 命令候选的精确匹配：归一化（折全角、去空白）后去掉尾部 OCR 噪声，必须完全相等。
+fn command_text_equal(left: &str, right: &str) -> bool {
+    let a = normalize_chat_text(left);
+    let b = normalize_chat_text(right);
+    a.trim_end_matches(OCR_TRAILING_NOISE) == b.trim_end_matches(OCR_TRAILING_NOISE)
 }
 
 /// 文本是否可能是同一条气泡的两次识别（相等 / 尾部噪声 / 截断 / 有界编辑距离）。

@@ -404,7 +404,7 @@ async function loadTools(){
 // Read-only sandbox: separate from mutating tools and their polling lifecycle.
 let readOnlyMode={enabled:false,state:'active'}
 let readOnlyLoaded=false,readOnlyModeBusy=false,readOnlyReadBusy=false
-let readOnlyGeneration=0,readOnlyEventSource=null,readOnlyLastEventId=0
+let readOnlyGeneration=0,readOnlyEventSource=null,readOnlyLastEventId=0,readOnlyInstance=null
 const readOnlyCards=new Map()
 function readOnlyObject(value){return value!==null&&typeof value==='object'&&!Array.isArray(value)}
 function readOnlySummary(value){return JSON.stringify(value,(key,item)=>key==='imagePngBase64'?'[完整 PNG 已保留，可单独下载]':item,2)}
@@ -419,8 +419,78 @@ async function readOnlyRequest(url,body){
   let value
   try{value=JSON.parse(text)}catch{throw new Error('HTTP '+response.status+'：返回内容不是有效 JSON')}
   if(!readOnlyObject(value))throw new Error('HTTP '+response.status+'：JSON 响应必须为对象')
-  if(!response.ok||value.ok!==true)throw new Error(String(value.message||value.error||value.code||('HTTP '+response.status+'：缺少 ok:true')))
+  if(!response.ok||value.ok!==true){const error=new Error(String(value.message||value.error||value.code||('HTTP '+response.status+'：缺少 ok:true')));error.status=response.status;error.code=value.error||value.code;error.response=value;throw error}
   return value
+}
+function readOnlyAcceptInstance(instance){
+  if(typeof instance!=='string'||!instance)throw new Error('缺少服务端 instance')
+  if(readOnlyInstance!==null&&readOnlyInstance!==instance){
+    readOnlyClearCards()
+    $('readOnlyGap').hidden=false;$('readOnlyGap').textContent='服务端实例已变化，旧实例证据已清除；序号从新实例继续。'
+  }
+  readOnlyInstance=instance
+}
+async function readOnlySection(id,section,snapshot={}){
+  let cursor=0,maxBytes=8192,text=''
+  const encoder=new TextEncoder()
+  while(true){
+    let value
+    try{value=await readOnlyRequest('/debug/read-only/evidence'+params({id,section,cursor,limit:10,maxBytes,revision:snapshot.revision}))}
+    catch(error){
+      const budget=error.response
+      if(error.code==='page_budget_too_small'&&budget.cursor===cursor&&budget.nextCursor===cursor&&maxBytes<65536){maxBytes=Math.min(65536,maxBytes*2);continue}
+      throw error
+    }
+    const evidence=value.evidence,page=evidence&&evidence.page
+    if(!readOnlyObject(evidence)||evidence.id!==id||evidence.section!==section||typeof evidence.instance!=='string'||!evidence.instance||!Number.isSafeInteger(evidence.revision)||!readOnlyObject(page)||page.encoding!=='json-utf8'||page.revision!==evidence.revision||page.cursor!==cursor||!Number.isSafeInteger(page.nextCursor)||typeof page.done!=='boolean'||!Array.isArray(page.items))throw new Error('分区分页信封无效')
+    if(snapshot.instance!==undefined&&snapshot.instance!==evidence.instance)throw new Error('分区 instance 冲突；请重新下载')
+    if(snapshot.revision!==undefined&&snapshot.revision!==evidence.revision)throw new Error('分区 revision 冲突；请重新下载')
+    snapshot.instance=evidence.instance;snapshot.revision=evidence.revision
+    let offset=cursor
+    for(const item of page.items){
+      if(!readOnlyObject(item)||item.section!==section||item.offset!==offset||typeof item.text!=='string')throw new Error('分区 UTF-8 片段不连续')
+      text+=item.text;offset+=encoder.encode(item.text).length
+    }
+    if(page.nextCursor!==offset||(!page.done&&offset<=cursor))throw new Error('分区 UTF-8 游标未正确推进')
+    if(page.done)return JSON.parse(text)
+    cursor=page.nextCursor
+  }
+}
+async function readOnlyFullEvidence(id,instance){
+  const snapshot=instance?{instance}:{}
+  const metadata=await readOnlySection(id,'metadata',snapshot)
+  const ocr=await readOnlySection(id,'ocr',snapshot)
+  const parameters=await readOnlySection(id,'parameters',snapshot)
+  const history=await readOnlySection(id,'history',snapshot)
+  if(!readOnlyObject(metadata)||metadata.id!==id||!readOnlyObject(parameters)||!readOnlyObject(parameters.task)||!readOnlyObject(history)||!Array.isArray(history.history))throw new Error('完整证据分区格式无效')
+  const task={...parameters.task};if(ocr!==null)task.ocr=ocr
+  return {evidence:{...metadata,task,...history},snapshot}
+}
+async function readOnlyImage(id,snapshot={}){
+  const response=await fetch('/debug/read-only/image'+params({id,instance:snapshot.instance,revision:snapshot.revision}),{cache:'no-store',credentials:'same-origin',headers:requestHeaders()})
+  if(!response.ok){
+    let value;try{value=JSON.parse(await response.text())}catch{throw new Error('原图 HTTP '+response.status)}
+    if(typeof value.error==='string'&&value.error.startsWith('image_unavailable'))return {blob:null,missingReason:value.message||value.error}
+    throw new Error(value.message||value.error||('原图 HTTP '+response.status))
+  }
+  const instance=response.headers.get('X-ReadOnly-Instance'),revision=response.headers.get('X-ReadOnly-Revision')
+  if(snapshot.instance!==undefined&&instance!==snapshot.instance)throw new Error('原图 instance 冲突；请重新下载')
+  if(snapshot.revision!==undefined&&revision!==String(snapshot.revision))throw new Error('原图 revision 冲突；请重新下载')
+  const blob=await response.blob(),bytes=new Uint8Array(await blob.arrayBuffer()),signature=[137,80,78,71,13,10,26,10]
+  if(bytes.length<8||signature.some((byte,index)=>bytes[index]!==byte))throw new Error('原图路由未返回 PNG')
+  const pixelSha256=response.headers.get('X-Pixel-Sha256'),fileSha256=response.headers.get('X-File-Sha256')
+  if(!/^[a-f0-9]{64}$/i.test(pixelSha256||'')||!/^[a-f0-9]{64}$/i.test(fileSha256||''))throw new Error('原图 SHA-256 响应头缺失或无效')
+  if(globalThis.crypto&&crypto.subtle){const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),byte=>byte.toString(16).padStart(2,'0')).join('');if(digest!==fileSha256.toLowerCase())throw new Error('原图文件 SHA-256 不一致')}
+  return {blob,pixelSha256,fileSha256}
+}
+function readOnlyClearCards(){
+  for(const card of readOnlyCards.values()){if(card.imageUrl)URL.revokeObjectURL(card.imageUrl);card.root.remove()}
+  readOnlyCards.clear();readOnlyLastEventId=0
+}
+async function readOnlyImageBase64(blob){
+  const bytes=new Uint8Array(await blob.arrayBuffer());let binary=''
+  for(let offset=0;offset<bytes.length;offset+=32768)binary+=String.fromCharCode(...bytes.subarray(offset,offset+32768))
+  return btoa(binary)
 }
 function readOnlyCloseEvents(){
   if(readOnlyEventSource){readOnlyEventSource.close();readOnlyEventSource=null}
@@ -437,6 +507,7 @@ function readOnlyControls(){
 function readOnlyAcceptMode(value){
   const mode=value.mode
   if(!readOnlyObject(mode)||typeof mode.enabled!=='boolean'||!['active','push'].includes(mode.state))throw new Error('只读 mode JSON 格式无效')
+  if(mode.instance||value.instance)readOnlyAcceptInstance(mode.instance||value.instance)
   readOnlyMode={enabled:mode.enabled,state:mode.state};readOnlyLoaded=true
   $('readOnlyStatus').textContent=!mode.enabled?'只读已禁用，未连接推送。':mode.state==='active'?'主动读取已启用，等待点击读取一次。':'推送已启用，正在连接专用事件流…'
   if(mode.enabled&&mode.state==='push')readOnlyConnectEvents()
@@ -465,6 +536,7 @@ async function readOnlyReadOnce(){
   try{
     const value=await readOnlyRequest('/debug/read-only/read',{label:val('readOnlyLabel'),ocr:true,rect:null})
     if(generation!==readOnlyGeneration)return
+    if(value.evidence.instance)readOnlyAcceptInstance(value.evidence.instance)
     readOnlyRenderEvidence(value.evidence)
     $('readOnlyStatus').textContent='本次读取已完成；不会定时读取。'
   }catch(error){if(generation===readOnlyGeneration){$('readOnlyStatus').textContent='本次读取失败，已有证据保留。';readOnlyError('主动读取失败',error)}}
@@ -511,23 +583,41 @@ function readOnlyRenderEvidence(evidence){
   try{if(evidence.source&&evidence.source.imagePngBase64)pngBlob=readOnlyPngBlob(evidence.source.imagePngBase64)}
   catch(error){readOnlyError('证据 '+evidence.id+' 图像无效',error);card.note.textContent='图像无效；完整 JSON 仍可下载。'}
   if(card.imageUrl){URL.revokeObjectURL(card.imageUrl);card.imageUrl=null}
-  card.preview.textContent='';card.pngBlob=pngBlob;card.png.disabled=!pngBlob
+  card.preview.textContent='';card.pngBlob=pngBlob;card.png.disabled=!pngBlob&&(!evidence.source||evidence.imageRetained===false||evidence.source.imageRetained===false)
   if(pngBlob){
     card.imageUrl=URL.createObjectURL(pngBlob)
     const image=readOnlyNode('img');image.alt='证据原始游戏帧 '+evidence.source.frameId;image.src=card.imageUrl
     image.onerror=()=>readOnlyError('证据 '+evidence.id+' 图像显示失败','浏览器无法解码原始 PNG，仍可下载核对')
     card.preview.append(image);card.note.textContent='原始 PNG，页面仅按可用宽度显示；下载保留完整像素。'
-  }else if(!card.note.textContent.startsWith('图像无效'))card.note.textContent='无可下载图像：'+(evidence.missingReason||'source.imagePngBase64 未提供')
+  }else if(!card.note.textContent.startsWith('图像无效'))card.note.textContent=card.png.disabled?'无可下载图像：'+(evidence.missingReason||'原始帧未保留'):'原始 PNG 可按需下载；页面当前显示元数据。'
   return card
 }
-function readOnlyDownload(card,kind){
+async function readOnlyDownload(card,kind){
+  if(card.downloadBusy)return
+  card.downloadBusy=true
+  const generation=readOnlyGeneration
   try{
-    const blob=kind==='png'?card.pngBlob:card.evidence?new Blob([JSON.stringify(card.evidence,null,2)],{type:'application/json;charset=utf-8'}):null
-    if(!blob)throw new Error('当前证据没有可下载的 '+kind.toUpperCase())
+    if(!card.evidence)throw new Error('当前证据没有可下载的内容')
+    let blob
+    if(kind==='png'){
+      const image=await readOnlyImage(card.id,{instance:card.evidence.instance,revision:card.evidence.revision})
+      if(!image.blob)throw new Error('无可下载图像：'+image.missingReason)
+      blob=image.blob
+    }else{
+      const {evidence,snapshot}=await readOnlyFullEvidence(card.id,card.evidence.instance)
+      if(evidence.source&&evidence.imageRetained!==false&&evidence.source.imageRetained!==false){
+        const image=await readOnlyImage(card.id,snapshot)
+        if(image.blob)evidence.source={...evidence.source,pixelSha256:image.pixelSha256,fileSha256:image.fileSha256,imagePngBase64:await readOnlyImageBase64(image.blob)}
+        else{evidence.imageRetained=false;evidence.source={...evidence.source,imageRetained:false};evidence.missingReason=image.missingReason}
+      }
+      blob=new Blob([JSON.stringify(evidence,null,2)],{type:'application/json;charset=utf-8'})
+    }
+    if(generation!==readOnlyGeneration||readOnlyCards.get(card.id)!==card)return
     const url=URL.createObjectURL(blob),link=readOnlyNode('a')
     link.href=url;link.download='read-only-'+String(card.id).replace(/[^a-zA-Z0-9_-]/g,'_')+'.'+kind
     document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000)
   }catch(error){readOnlyError('下载失败',error)}
+  finally{card.downloadBusy=false}
 }
 function readOnlyEvidenceUrl(raw){
   if(typeof raw!=='string'||!raw.startsWith('/debug/read-only/evidence?'))throw new Error('推送 evidenceUrl 无效')
@@ -539,33 +629,59 @@ async function readOnlyHandleEvent(event,generation){
   if(generation!==readOnlyGeneration||!readOnlyMode.enabled||readOnlyMode.state!=='push')return
   let card=null,revision=0
   try{
+    let payload
+    try{payload=JSON.parse(event.data)}catch{throw new Error('推送 data 不是有效 JSON')}
+    if(!readOnlyObject(payload)||typeof payload.id!=='string'||!payload.id)throw new Error('推送 JSON 缺少证据 id')
+    readOnlyAcceptInstance(payload.instance)
     const sequence=Number(event.lastEventId)
     if(Number.isSafeInteger(sequence)&&sequence>0){
       if(sequence>readOnlyLastEventId+1){$('readOnlyGap').hidden=false;$('readOnlyGap').textContent='推送序号存在缺口（'+readOnlyLastEventId+' → '+sequence+'），有界历史可能已过期。现有证据保留。'}
       if(sequence<=readOnlyLastEventId)return
       readOnlyLastEventId=sequence
     }
-    let payload
-    try{payload=JSON.parse(event.data)}catch{throw new Error('推送 data 不是有效 JSON')}
-    if(!readOnlyObject(payload)||typeof payload.id!=='string'||!payload.id)throw new Error('推送 JSON 缺少证据 id')
-    const url=readOnlyEvidenceUrl(payload.evidenceUrl)
+    readOnlyEvidenceUrl(payload.evidenceUrl)
     card=readOnlyCard(payload.id);revision=++card.revision
-    card.title.textContent='命令 / 流程触发 · '+payload.id;card.meta.textContent=readOnlyMetadata(payload);card.output.textContent=readOnlySummary(payload);card.note.textContent='正在读取完整证据…'
-    const value=await readOnlyRequest(url)
+    card.title.textContent='命令 / 流程触发 · '+payload.id;card.meta.textContent=readOnlyMetadata(payload);card.output.textContent=readOnlySummary(payload);card.note.textContent='正在读取证据元数据…'
+    const snapshot={instance:payload.instance},evidence=await readOnlySection(payload.id,'metadata',snapshot)
     if(generation!==readOnlyGeneration||revision!==card.revision||readOnlyCards.get(payload.id)!==card)return
-    if(!readOnlyObject(value.evidence)||value.evidence.id!==payload.id)throw new Error('证据响应 id 与推送不一致')
-    readOnlyRenderEvidence(value.evidence)
+    if(!readOnlyObject(evidence)||evidence.id!==payload.id)throw new Error('证据响应 id 与推送不一致')
+    readOnlyRenderEvidence(evidence)
+    if(evidence.source&&evidence.imageRetained!==false&&evidence.source.imageRetained!==false){
+      const image=await readOnlyImage(payload.id,snapshot)
+      if(generation!==readOnlyGeneration||revision!==card.revision||readOnlyCards.get(payload.id)!==card)return
+      if(image.blob){
+        evidence.source={...evidence.source,pixelSha256:image.pixelSha256,fileSha256:image.fileSha256}
+        card.meta.textContent=readOnlyMetadata(evidence);card.output.textContent=readOnlySummary(evidence)
+        card.pngBlob=image.blob;card.imageUrl=URL.createObjectURL(image.blob)
+        const preview=readOnlyNode('img');preview.alt='证据原始游戏帧 '+evidence.source.frameId;preview.src=card.imageUrl;card.preview.append(preview)
+        card.note.textContent='原始 PNG，页面仅按可用宽度显示；下载保留完整像素。'
+      }else{card.png.disabled=true;card.note.textContent='无可下载图像：'+image.missingReason}
+    }
   }catch(error){if(generation===readOnlyGeneration){if(card&&revision===card.revision)card.note.textContent='证据读取失败：'+String(error&&error.message||error)+'；已有完整证据保留。';readOnlyError('读取触发证据失败（已有证据保留）',error)}}
 }
-function readOnlyConnectEvents(){
+async function readOnlyConnectEvents(){
   readOnlyCloseEvents()
   if(!readOnlyMode.enabled||readOnlyMode.state!=='push')return
   if(typeof EventSource==='undefined'){readOnlyError('推送不可用','浏览器不支持 EventSource');return}
   const generation=readOnlyGeneration
-  // Cookie authentication only. Native reconnect carries Last-Event-ID automatically.
-  const source=new EventSource('/debug/read-only/events',{withCredentials:true})
+  if(!readOnlyInstance){
+    try{const value=await readOnlyRequest('/debug/read-only/summary');if(generation!==readOnlyGeneration||!readOnlyMode.enabled||readOnlyMode.state!=='push')return;readOnlyAcceptInstance(value.summary&&value.summary.instance)}
+    catch(error){readOnlyError('读取推送实例失败',error);return}
+  }
+  // Cookie authentication only. Pin server identity even on native reconnect.
+  // Last-Event-ID remains the producer cursor; instance change triggers a reset gap.
+  const source=new EventSource('/debug/read-only/events'+params({instance:readOnlyInstance}),{withCredentials:true})
   readOnlyEventSource=source;readOnlyLastEventId=0
   for(const type of ['readonly.triggered','readonly.task.updated'])source.addEventListener(type,event=>{if(readOnlyEventSource===source)readOnlyHandleEvent(event,generation)})
+  source.addEventListener('readonly.gap',event=>{
+    if(readOnlyEventSource!==source||generation!==readOnlyGeneration)return
+    try{
+      const gap=JSON.parse(event.data),reset=gap.reset===true||(gap.instance&&readOnlyInstance!==gap.instance)
+      if(gap.instance)readOnlyAcceptInstance(gap.instance)
+      $('readOnlyGap').hidden=false;$('readOnlyGap').textContent='推送缺口：'+readOnlySummary(gap)
+      if(reset){readOnlyClearCards();readOnlyCloseEvents();readOnlyConnectEvents()}
+    }catch(error){readOnlyError('推送缺口格式无效',error)}
+  })
   source.onopen=()=>{if(readOnlyEventSource===source)$('readOnlyStatus').textContent='专用推送已连接，等待命令 / 流程触发。'}
   source.onerror=()=>{if(readOnlyEventSource===source){$('readOnlyStatus').textContent='推送连接中断，浏览器自动重连；有界证据可能过期。';readOnlyError('推送连接中断','将使用 Last-Event-ID 自动续传，已有证据保留')}}
 }

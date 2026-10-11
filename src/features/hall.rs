@@ -236,7 +236,7 @@ impl HallApplication {
                     port.log_executed(context, &format!("microphone toggle {}", username))?;
                     port.toggle_microphone()?;
                     log::info!("麦克风: 已按 N 切换状态");
-                    port.reply(&format!("@{} 执行了切换麦克风状态！", username))
+                    port.reply(&format!("{} 执行了切换麦克风状态！", username))
                 }
             }
         }

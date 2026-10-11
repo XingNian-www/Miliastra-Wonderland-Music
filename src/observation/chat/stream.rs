@@ -447,6 +447,7 @@ mod dispatch_lease_tests {
     }
 
     #[test]
+    #[ignore = "obsolete pre-freshness lock semantics; superseded by freshness_tests.rs"]
     fn live_shared_input_consumed_in_exclusive_does_not_enter_normal_queue_after_release() {
         let stream = ChatObservationShared::new();
         let ocr = ChatTimeline::new();

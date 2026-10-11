@@ -1337,7 +1337,7 @@ impl SongRequestExecution<'_> {
             .iter()
             .take(5)
             .enumerate()
-            .map(|(index, candidate)| format!("@{} {}", index + 1, candidate.selection_text()))
+            .map(|(index, candidate)| format!("{}. {}", index + 1, candidate.selection_text()))
             .collect::<Vec<_>>();
         let switch_source_action = if allow_switch_source {
             "，或@换源重新搜索"
@@ -1496,7 +1496,7 @@ impl SongRequestExecution<'_> {
             .iter()
             .take(count)
             .enumerate()
-            .map(|(index, candidate)| format!("@{} {}", index + 1, candidate.text))
+            .map(|(index, candidate)| format!("{}. {}", index + 1, candidate.text))
             .collect();
         messages.push(format!("请输入@1至@{}选择本地曲库歌曲，或@跳过", count));
         loop {
@@ -2472,13 +2472,13 @@ mod tests {
             port.replies
                 .borrow()
                 .iter()
-                .any(|reply| reply.starts_with("@1 "))
+                .any(|reply| reply.starts_with("1. "))
         );
         assert!(
             port.replies
                 .borrow()
                 .iter()
-                .any(|reply| reply.starts_with("@2 "))
+                .any(|reply| reply.starts_with("2. "))
         );
     }
 
@@ -3240,13 +3240,13 @@ mod tests {
             port.replies
                 .borrow()
                 .iter()
-                .any(|reply| reply.starts_with("@1 eligible"))
+                .any(|reply| reply.starts_with("1. eligible"))
         );
         assert!(
             port.replies
                 .borrow()
                 .iter()
-                .any(|reply| reply.starts_with("@2 unknown"))
+                .any(|reply| reply.starts_with("2. unknown"))
         );
         assert_eq!(
             port.decision_options.borrow().as_slice(),

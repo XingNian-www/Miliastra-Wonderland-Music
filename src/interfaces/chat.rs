@@ -117,7 +117,7 @@ pub(crate) fn parse_command_envelope(
 
 /// 为 OCR 识别到的元数据行创建标准点歌信封。
 ///
-/// 将逻辑放在聊天边界后，主监听器和好友监听器都能提供结构化
+/// 将逻辑放在聊天边界后，主值守器和好友值守器都能提供结构化
 /// 文本会经过与显式 `@点歌` 相同的路由、锁状态和点歌应用处理。
 /// 命令。原始 OCR 文本仍附在信封上，用于观察关联。
 pub(crate) fn parse_structured_song_envelope(
@@ -1128,9 +1128,9 @@ mod tests {
 
     #[test]
     fn parses_pink_chat_listener_mode_commands_only() {
-        let primary = parse_text("[Alice]：@监听模式 一级", "pink").expect("primary mode");
-        let secondary = parse_text("[Alice]：@监听模式：二级", "pink").expect("secondary mode");
-        let status = parse_text("[Alice]：@监听模式 状态", "pink").expect("mode status");
+        let primary = parse_text("[Alice]：@值守模式 一级", "pink").expect("primary mode");
+        let secondary = parse_text("[Alice]：@值守模式：二级", "pink").expect("secondary mode");
+        let status = parse_text("[Alice]：@值守模式 状态", "pink").expect("mode status");
 
         assert_eq!(
             primary.command,
@@ -1150,7 +1150,7 @@ mod tests {
                 ChatListenerModeCommand::Status,
             ))
         );
-        assert!(parse_text("大厅：@监听模式 二级", "blue").is_none());
+        assert!(parse_text("大厅：@值守模式 二级", "blue").is_none());
     }
 
     #[test]

@@ -259,17 +259,32 @@ pub use crate::features::song_request::{PickedCandidate, SearchCandidate};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerSearchError {
     message: String,
+    /// 平台稳定错误码（如 provider_auth_required），供上层生成可区分文案。
+    code: Option<String>,
 }
 
 impl PlayerSearchError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            code: None,
+        }
+    }
+
+    pub fn with_code(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: Some(code.into()),
         }
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// 平台错误码；无码时为 None。
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
     }
 }
 

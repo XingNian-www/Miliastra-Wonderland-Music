@@ -775,6 +775,7 @@ pub(super) fn queue_add(
         playlist_auto: false,
     };
     // 入队前复用播放队列统一去重策略，避免直接允许明显重复。
+    let push_keyword = item.keyword.clone();
     if state
         .application
         .tasks
@@ -783,7 +784,7 @@ pub(super) fn queue_add(
     {
         return Err(AppError {
             status: 409,
-            message: format!("队列已有: {}", item.keyword),
+            message: format!("队列已有: {}", push_keyword),
         });
     }
     let BusinessMutationOutcome::Playback(PlaybackMutationOutcome::Pushed(pushed)) = state
@@ -798,6 +799,12 @@ pub(super) fn queue_add(
             "playback queue push intent returned a different outcome",
         ));
     };
+    if pushed.duplicate {
+        return Err(AppError {
+            status: 409,
+            message: format!("队列已有: {}", push_keyword),
+        });
+    }
     if !pushed.accepted {
         return Err(AppError {
             status: 400,

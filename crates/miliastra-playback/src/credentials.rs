@@ -168,6 +168,8 @@ impl ProviderCredential {
                         "KUGOU_API_MID",
                         "KUGOU_API_MAC",
                         "KUGOU_API_DEV",
+                        // 刷新接口下发的概念版（lite）续期令牌，与 Web token 分开保存。
+                        "KUGOU_API_TOKEN",
                         "kg_mid",
                         "mid",
                         "t1",
@@ -379,40 +381,54 @@ impl CredentialStore {
     pub fn open(directory: PathBuf) -> Result<Self, CredentialError> {
         ensure_credential_directory(&directory)?;
         let mut credentials = BTreeMap::new();
-        let refresh_metadata = load_refresh_metadata(&directory)?;
+        let refresh_metadata = match load_refresh_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(%error, "无法读取凭据刷新状态，按空状态继续启动");
+                Default::default()
+            }
+        };
         for provider in SUPPORTED_PROVIDERS {
-            let path = credential_path(&directory, provider);
-            restore_interrupted_write(&path)?;
-            if !path.exists() {
-                continue;
-            }
-            secure_credential_file(&path)?;
-            let text = fs::read_to_string(&path).map_err(|error| CredentialError::Read {
-                path: path.clone(),
-                error: error.to_string(),
-            })?;
-            let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|error| {
-                CredentialError::Invalid(format!("{}: {error}", path.display()))
-            })?;
-            let schema_version = value
-                .get("schemaVersion")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|version| u32::try_from(version).ok());
-            if schema_version != Some(CREDENTIAL_SCHEMA_VERSION) {
-                return Err(CredentialError::UnsupportedSchema {
-                    path,
-                    expected: CREDENTIAL_SCHEMA_VERSION,
-                    actual: schema_version,
-                });
-            }
-            let envelope =
-                serde_json::from_value::<CredentialEnvelope>(value).map_err(|error| {
+            // 单个平台的凭据损坏不能拖垮整个应用：隔离该文件并按「未配置」继续。
+            let loaded = (|| -> Result<(), CredentialError> {
+                let path = credential_path(&directory, provider);
+                restore_interrupted_write(&path)?;
+                if !path.exists() {
+                    return Ok(());
+                }
+                secure_credential_file(&path)?;
+                let text = fs::read_to_string(&path).map_err(|error| CredentialError::Read {
+                    path: path.clone(),
+                    error: error.to_string(),
+                })?;
+                let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|error| {
                     CredentialError::Invalid(format!("{}: {error}", path.display()))
                 })?;
-            let credential = envelope.credential;
-            validate_source(provider, &credential)?;
-            credential.validate()?;
-            credentials.insert(*provider, credential);
+                let schema_version = value
+                    .get("schemaVersion")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|version| u32::try_from(version).ok());
+                if schema_version != Some(CREDENTIAL_SCHEMA_VERSION) {
+                    return Err(CredentialError::UnsupportedSchema {
+                        path,
+                        expected: CREDENTIAL_SCHEMA_VERSION,
+                        actual: schema_version,
+                    });
+                }
+                let envelope =
+                    serde_json::from_value::<CredentialEnvelope>(value).map_err(|error| {
+                        CredentialError::Invalid(format!("{}: {error}", path.display()))
+                    })?;
+                let credential = envelope.credential;
+                validate_source(provider, &credential)?;
+                credential.validate()?;
+                credentials.insert(*provider, credential);
+                Ok(())
+            })();
+            if let Err(error) = loaded {
+                tracing::warn!(provider, %error, "跳过无法读取的凭据文件，继续启动");
+                quarantine_invalid_credential(&directory, provider, &error);
+            }
         }
         Ok(Self {
             directory: Some(directory),
@@ -1098,6 +1114,30 @@ fn qq_refresh_key_is_wechat(cookies: &BTreeMap<String, String>) -> bool {
                 .get(..3)
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"W_X"))
         })
+}
+
+/// 内容损坏/版本不符的凭据文件改名为 `.bad` 隔离；纯读取类错误保持原文件不动。
+fn quarantine_invalid_credential(directory: &Path, provider: &str, error: &CredentialError) {
+    let should_quarantine = match error {
+        CredentialError::UnsupportedSchema { .. }
+        | CredentialError::Invalid(_)
+        | CredentialError::ProviderMismatch { .. } => true,
+        CredentialError::ValidationFailed { retryable, .. } => !retryable,
+        _ => false,
+    };
+    if !should_quarantine {
+        return;
+    }
+    let path = credential_path(directory, provider);
+    if !path.exists() {
+        return;
+    }
+    let mut quarantine = path.clone();
+    quarantine.set_extension("bad");
+    match fs::rename(&path, &quarantine) {
+        Ok(()) => tracing::warn!(provider, path = %quarantine.display(), "已隔离损坏的凭据文件"),
+        Err(rename_error) => tracing::warn!(provider, %rename_error, "隔离损坏凭据文件失败"),
+    }
 }
 
 fn credential_path(directory: &Path, provider: &str) -> PathBuf {

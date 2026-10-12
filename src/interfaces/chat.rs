@@ -42,10 +42,8 @@ pub struct PendingCommand {
 /// 仅用于“读到但没执行”的排查日志，不参与路由。
 pub(crate) fn looks_like_command(text: &str) -> bool {
     let trimmed = text.trim_start();
-    if matches!(
-        trimmed.chars().next(),
-        Some('@' | '＠' | '#' | '＃' | '&' | '＆')
-    ) {
+    // & / ＆ 是测试专用前缀，永不执行，不纳入“读到命令却没执行”的排查日志。
+    if matches!(trimmed.chars().next(), Some('@' | '＠' | '#' | '＃')) {
         return true;
     }
     parse_structured_song_text(text).is_some()

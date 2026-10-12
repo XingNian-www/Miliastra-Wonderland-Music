@@ -130,6 +130,7 @@ impl ApplicationRuntime {
         self.abort_entertainment_for_context_loss("邀请流程已进入新大厅");
         self.business.business.set_commands_enabled(true)?;
         self.clear_hall_countdown_cache_for_new_visual_session("已进入新大厅")?;
+        self.end_personal_playlist_for_context_loss("邀请流程已进入新大厅")?;
         Ok(())
     }
 

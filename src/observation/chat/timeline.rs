@@ -57,6 +57,8 @@ struct State {
     business_pending: HashSet<ObservedChatMessageId>,
     unread_baseline: HashSet<ObservedChatMessageId>,
     business_claimed: HashSet<ObservedChatMessageId>,
+    /// 已经打过“命令未执行原因”日志的消息 id：同一实例只打一次，避免每帧刷屏。
+    not_executed_logged: HashSet<ObservedChatMessageId>,
     active_business_claims: HashSet<ObservedChatMessageId>,
     ignored_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
     latest_business_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
@@ -369,6 +371,12 @@ impl Drop for FriendBusinessSuppression {
 }
 
 impl ChatTimeline {
+    /// 这条消息是否首次被记为“命令未执行”；true 表示应当打日志（同一实例只打一次）。
+    pub(crate) fn note_not_executed_log(&self, id: &ObservedChatMessageId) -> Result<bool> {
+        let mut state = self.lock()?;
+        Ok(state.not_executed_logged.insert(id.clone()))
+    }
+
     /// 标记下一次发布要携带的基线事件（由 reset_chat_observation_baseline 调用）。
     pub(crate) fn note_baseline(&self, reason: &str) -> Result<()> {
         let mut state = self.lock()?;
@@ -385,6 +393,7 @@ impl ChatTimeline {
                     business_pending: HashSet::new(),
                     unread_baseline: HashSet::new(),
                     business_claimed: HashSet::new(),
+                    not_executed_logged: HashSet::new(),
                     active_business_claims: HashSet::new(),
                     ignored_revisions: HashMap::new(),
                     latest_business_revisions: HashMap::new(),
@@ -657,6 +666,11 @@ impl ChatTimeline {
             });
         }
         state.unread_baseline.retain(|id| {
+            id.chat != chat
+                || observed.is_empty()
+                || observed.iter().any(|message| message.id == *id)
+        });
+        state.not_executed_logged.retain(|id| {
             id.chat != chat
                 || observed.is_empty()
                 || observed.iter().any(|message| message.id == *id)

@@ -274,10 +274,11 @@ impl PlaybackCore {
         &self,
         song_key: &SongKey,
         metadata: Option<&TrackMetadata>,
+        locator: Option<&ResolverLocator>,
         stream: StreamSource,
     ) -> StreamSource {
         match &self.audio_cache {
-            Some(cache) => cache.rewrite(song_key, metadata, stream).await,
+            Some(cache) => cache.rewrite(song_key, metadata, locator, stream).await,
             None => stream,
         }
     }
@@ -453,7 +454,9 @@ impl PlaybackCore {
         self.cache_stream(song_key.clone(), stream.clone());
         // 音频数据预下载：播放时直接命中本地文件（下载失败静默，播放时走正常下载）。
         if let Some(cache) = &self.audio_cache {
-            cache.rewrite(&song_key, metadata, stream).await;
+            cache
+                .rewrite(&song_key, metadata, resolver_locator.as_ref(), stream)
+                .await;
             if cache.prefetch(&song_key).await {
                 tracing::debug!(key = %song_key, "音频数据已开始预下载");
             }
@@ -600,7 +603,9 @@ impl PlaybackCore {
                 }
             }
         };
-        let stream = self.route_stream(&song_key, metadata, stream).await;
+        let stream = self
+            .route_stream(&song_key, metadata, resolver_locator.as_ref(), stream)
+            .await;
 
         if self.generation.load(Ordering::SeqCst) != generation {
             return Err(PlaybackCoreError::Engine(EngineError::Rejected(
@@ -1060,7 +1065,11 @@ impl PlaybackCore {
             }
             // 第一轮重试音源同样改写为本地代理地址，保证与初始播放走同一缓存条目。
             let stream = match &audio_cache {
-                Some(cache) => cache.rewrite(&song_key, metadata.as_ref(), stream).await,
+                Some(cache) => {
+                    cache
+                        .rewrite(&song_key, metadata.as_ref(), None, stream)
+                        .await
+                }
                 None => stream,
             };
             if let Err(error) = engine
@@ -1158,7 +1167,7 @@ fn spawn_cache_prefetch(
         {
             return;
         }
-        cache.rewrite(&song_key, metadata.as_ref(), stream).await;
+        cache.rewrite(&song_key, metadata.as_ref(), None, stream).await;
         if cache.prefetch(&song_key).await {
             tracing::info!("直连播放成功后已写回音频缓存: {song_key}");
         }

@@ -87,6 +87,7 @@ async fn proxy_serves_streaming_then_cached_complete_and_range() {
         .rewrite(
             &key,
             None,
+            None,
             sample_stream(format!("http://{origin_addr}/audio.mp3")),
         )
         .await;
@@ -179,6 +180,7 @@ async fn failed_download_is_retried_on_next_request() {
         .rewrite(
             &key,
             None,
+            None,
             sample_stream(format!("http://{addr}/audio.mp3")),
         )
         .await;
@@ -216,6 +218,7 @@ async fn rewrite_points_to_local_proxy_and_preserves_source_headers() {
     let rewritten = cache
         .rewrite(
             &key,
+            None,
             None,
             StreamSource {
                 url: format!("http://{origin_addr}/a.mp3").parse().unwrap(),
@@ -288,6 +291,7 @@ async fn truncated_origin_response_is_not_marked_complete() {
         .rewrite(
             &key,
             None,
+            None,
             sample_stream(format!("http://{addr}/audio.mp3")),
         )
         .await;
@@ -346,7 +350,7 @@ async fn invalidate_removes_cache_entry_and_triggers_redownload() {
 
     // 首次播放：完整下载。
     let rewritten = cache
-        .rewrite(&key, None, sample_stream(format!("http://{addr}/a.mp3")))
+        .rewrite(&key, None,None, sample_stream(format!("http://{addr}/a.mp3")))
         .await;
     let data = reqwest::get(rewritten.url)
         .await
@@ -362,7 +366,7 @@ async fn invalidate_removes_cache_entry_and_triggers_redownload() {
 
     // 重新播放（重新 rewrite）：触发重新下载，数据完整。
     let rewritten = cache
-        .rewrite(&key, None, sample_stream(format!("http://{addr}/a.mp3")))
+        .rewrite(&key, None,None, sample_stream(format!("http://{addr}/a.mp3")))
         .await;
     let data = reqwest::get(rewritten.url)
         .await
@@ -415,7 +419,7 @@ async fn prefetch_downloads_immediately_and_proxy_serves_from_disk() {
         .expect("缓存启动");
     let key = SongKey::new("qq", "e2e-prefetch").unwrap();
     let rewritten = cache
-        .rewrite(&key, None, sample_stream(format!("http://{addr}/a.mp3")))
+        .rewrite(&key, None,None, sample_stream(format!("http://{addr}/a.mp3")))
         .await;
 
     // 主动下载；下载完成后代理请求命中磁盘（不再次访问源站）。
@@ -466,6 +470,7 @@ async fn streaming_nonzero_range_returns_416() {
     let rewritten = cache
         .rewrite(
             &key,
+            None,
             None,
             sample_stream(format!("http://{addr}/audio.mp3")),
         )
@@ -519,6 +524,7 @@ async fn oversized_content_length_is_rejected_without_cache_file() {
     cache
         .rewrite(
             &key,
+            None,
             None,
             sample_stream(format!("http://{addr}/audio.mp3")),
         )

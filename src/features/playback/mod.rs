@@ -717,7 +717,11 @@ impl PlaybackService {
         store: Arc<dyn miliastra_contracts::StateStore>,
     ) -> Result<Self> {
         let request_state = RequestStateStore::load(playback_state_path, store.clone())?;
-        let queue = PersistentQueue::from_request_store(request_state.clone(), queue_max_size)?;
+        let mut queue = PersistentQueue::from_request_store(request_state.clone(), queue_max_size)?;
+        let stale_auto = queue.remove_playlist_auto_items()?;
+        if stale_auto > 0 {
+            log::info!("已清理重启残留的个人歌单自动项: {stale_auto} 首");
+        }
         let playback_state = PersistentPlaybackState::from_request_store(request_state.clone())?;
         let song_dedup_history =
             PersistentSongDedupHistory::load(song_dedup_history_path, wall_clock, store)?;

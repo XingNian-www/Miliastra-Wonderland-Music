@@ -292,6 +292,13 @@ impl ApplicationRuntime {
 
     pub(super) fn execute_command(&mut self, parsed: &RoutedCommand) -> Result<()> {
         if let Some(required) = parsed.permission_required {
+            log::info!(
+                "命令未执行：权限不足（需要 {:?}，authority={:?} role={:?}）text={}",
+                required,
+                parsed.authority,
+                parsed.role,
+                parsed.raw
+            );
             let message = match required {
                 IdentityRole::Admin | IdentityRole::Owner => "权限不足：该命令仅限管理员使用",
                 IdentityRole::Friend => "权限不足：该命令仅限好友使用",
@@ -354,6 +361,12 @@ impl ApplicationRuntime {
         command: &crate::features::playlist::PlaylistCommand,
     ) -> Result<()> {
         if !playlist_command_allows_friend(parsed.authority, parsed.role) {
+            log::info!(
+                "命令未执行：个人歌单仅对好友及以上开放（authority={:?} role={:?}）text={}",
+                parsed.authority,
+                parsed.role,
+                parsed.raw
+            );
             return ApplicationRuntime::reply(self, "个人歌单功能仅对好友及以上开放.");
         }
         if matches!(command, crate::features::playlist::PlaylistCommand::Open) {

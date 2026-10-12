@@ -4,7 +4,10 @@ pub(crate) const REDACTED_UNDERCOVER_INPUT: &str = "[谁是卧底私聊内容已
 pub(crate) const REDACTED_PLAYLIST_IMPORT: &str = "[歌单导入命令与分享链接已隐藏]";
 
 pub(crate) fn redacted_chat_text(message: &str) -> &str {
-    if message.contains("@导入QQ歌单") || message.contains("@导入网易歌单") {
+    if message.contains("@导入QQ歌单")
+        || message.contains("@导入网易歌单")
+        || message.contains("@导入网易云歌单")
+    {
         REDACTED_PLAYLIST_IMPORT
     } else if contains_turtle_soup_bottom_marker(message) {
         REDACTED_TURTLE_SOUP_BOTTOM

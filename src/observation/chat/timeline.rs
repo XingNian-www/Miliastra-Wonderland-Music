@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 
+use super::freshness::{BaselineKind, FreshFrame, Freshness, SequenceFreshness};
 pub(crate) use super::scan::RecognizedChatMessage;
-use super::freshness::{BaselineKind, Freshness, FreshFrame, SequenceFreshness};
 use super::{BubbleSequence, ChatIdentity, ObservedChatMessageId, VisualSessionId};
 use crate::ui::geometry::Rect;
 
@@ -1543,7 +1543,11 @@ mod tests {
             // 1) 先消费 AppStart 基线（进程首帧全旧），让状态 initialized。
             shared.note_baseline("已启动").unwrap();
             let _ = shared
-                .publish(Instant::now(), ChatIdentity::PrimaryHall, vec![input("__seed__", 1)])
+                .publish(
+                    Instant::now(),
+                    ChatIdentity::PrimaryHall,
+                    vec![input("__seed__", 1)],
+                )
                 .unwrap();
             // 2) 真正的场景按“进入大厅”基线处理（蓝色 New、粉色 Old）。
             shared.note_baseline("已进入千星").unwrap();
@@ -2772,7 +2776,6 @@ mod tests {
             "半角冒号必须命中全角写入的命令锁条目"
         );
     }
-
 }
 
 fn same_rect(left: Rect, right: Rect) -> bool {

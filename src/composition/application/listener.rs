@@ -1621,6 +1621,16 @@ impl ApplicationRuntime {
                             .chat_timeline
                             .is_business_pending_at(&message.id, snapshot.captured_at)?
                         {
+                            if command::looks_like_command(&message.text)
+                                && self.ui.chat_timeline.note_not_executed_log(&message.id)?
+                            {
+                                log::info!(
+                                    "命令未执行：二级消息未判为新增追加 state={:?} chat={:?} text={}",
+                                    self.ui.chat_timeline.business_delivery_state(&message.id)?,
+                                    chat,
+                                    compact_for_log(&message.text)
+                                );
+                            }
                             continue;
                         }
                         let revision_sender = message.sender.clone();
@@ -1639,6 +1649,14 @@ impl ApplicationRuntime {
                                 accepts_turtle_questions,
                             )?;
                             if classification.requires_sender && sender.is_none() {
+                                if command::looks_like_command(&message.text)
+                                    && self.ui.chat_timeline.note_not_executed_log(&message.id)?
+                                {
+                                    log::info!(
+                                        "命令未执行：二级消息缺少发送者 text={}",
+                                        compact_for_log(&message.text)
+                                    );
+                                }
                                 continue;
                             }
                         }
@@ -1652,6 +1670,15 @@ impl ApplicationRuntime {
                             message.block.y,
                         )?
                         else {
+                            if command::looks_like_command(&message.text)
+                                && self.ui.chat_timeline.note_not_executed_log(&message.id)?
+                            {
+                                log::info!(
+                                    "命令未执行：二级命令认领失败（已被基线/已消费或修订否决）state={:?} text={}",
+                                    self.ui.chat_timeline.business_delivery_state(&message.id)?,
+                                    compact_for_log(&message.text)
+                                );
+                            }
                             continue;
                         };
                         let outcome = self.dispatch_chat_observations(vec![
@@ -1839,7 +1866,10 @@ impl ApplicationRuntime {
             let command_like = command::looks_like_command(&message.text);
             if !observed.is_new && !sample_as_question {
                 if command_like && self.ui.chat_timeline.note_not_executed_log(&observed.id)? {
-                    let state = self.ui.chat_timeline.business_delivery_state(&observed.id)?;
+                    let state = self
+                        .ui
+                        .chat_timeline
+                        .business_delivery_state(&observed.id)?;
                     log::info!(
                         "命令未执行：未判为新增追加 state={:?}（Pending=仅排队未派发/Claimed=已认领/IgnoredRevision=等待有效修订/Fenced=交付栅栏/NotTracked=未入账，通常为基线或视图不连续）type={} text={}",
                         state,

@@ -112,6 +112,21 @@ impl<'a> ChatCommandRouter<'a> {
             })
     }
 
+    /// 仅用于“读到命令却没执行”的排查日志：解释一个已可解析的命令信封为什么没有模块认领。
+    /// 不参与路由，也不改变任何路由/认领结果；`@选择`/`@本地` 只作为决策语法用于日志归类。
+    pub(crate) fn unclaimed_command_reason(
+        envelope: &CommandEnvelope,
+        active_entertainment: Option<EntertainmentKind>,
+    ) -> &'static str {
+        if looks_like_reserved_decision_syntax(envelope) {
+            return "保留的决策语法（由独占决策窗口消费，正常分发排除）";
+        }
+        if hash_entertainment_session_mismatch(envelope, active_entertainment) {
+            return "娱乐 # 命令与当前会话不匹配（没有进行中的对应玩法）";
+        }
+        "信封可解析但没有模块认领"
+    }
+
     fn route_as_permission_denied(
         &self,
         envelope: &CommandEnvelope,
@@ -456,6 +471,46 @@ fn decision_boundary(rest: &str) -> bool {
                 )
         }
     }
+}
+
+/// 决策窗口保留语法（仅用于“未执行”日志归类）。`@选择`/`@本地` 当前并未纳入
+/// `is_reserved_decision_command`（会落到“无模块认领”），这里只做日志分类，
+/// 不改变任何路由/认领行为。
+fn looks_like_reserved_decision_syntax(envelope: &CommandEnvelope) -> bool {
+    if is_reserved_decision_command(envelope) {
+        return true;
+    }
+    let command = envelope.command_text();
+    ["选择", "本地"]
+        .iter()
+        .any(|prefix| command.strip_prefix(prefix).is_some_and(decision_boundary))
+}
+
+/// 娱乐 `#` 命令存在，但与当前进行中的玩法不匹配：命令本身属于某个娱乐玩法的
+/// 进行中操作，却没有对应的 active_entertainment，因此路由层不认领。
+fn hash_entertainment_session_mismatch(
+    envelope: &CommandEnvelope,
+    active_entertainment: Option<EntertainmentKind>,
+) -> bool {
+    if envelope.prefix() != CommandPrefix::Hash
+        || envelope.authority() != CommandAuthority::HallMember
+    {
+        return false;
+    }
+    let matches_active = match active_entertainment {
+        Some(EntertainmentKind::IdiomChain) => IdiomChainCommand::claims_active_chat(envelope),
+        Some(EntertainmentKind::Landlord | EntertainmentKind::RunFast) => {
+            LandlordCommand::claims_active_chat(envelope)
+        }
+        Some(EntertainmentKind::TurtleSoup) => TurtleSoupCommand::claims_active_chat(envelope),
+        Some(EntertainmentKind::Undercover) => UndercoverCommand::claims_active_chat(envelope),
+        _ => false,
+    };
+    !matches_active
+        && (IdiomChainCommand::claims_active_chat(envelope)
+            || LandlordCommand::claims_active_chat(envelope)
+            || TurtleSoupCommand::claims_active_chat(envelope)
+            || UndercoverCommand::claims_active_chat(envelope))
 }
 
 fn role_for(identity: Option<&IdentityAccess>, username: &str) -> Option<IdentityRole> {
@@ -887,6 +942,39 @@ mod tests {
             ChatCommandRouter::new(&service)
                 .route(&envelope, None)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn unclaimed_command_reason_separates_decisions_sessions_and_unknown() {
+        assert_eq!(
+            ChatCommandRouter::unclaimed_command_reason(&envelope("blue", "@确认"), None),
+            "保留的决策语法（由独占决策窗口消费，正常分发排除）"
+        );
+        for text in ["@选择", "@本地"] {
+            assert_eq!(
+                ChatCommandRouter::unclaimed_command_reason(&envelope("blue", text), None),
+                "保留的决策语法（由独占决策窗口消费，正常分发排除）",
+                "{text}"
+            );
+        }
+        // #提示 是成语接龙的进行中操作；没有进行中的接龙 → 会话不匹配。
+        assert_eq!(
+            ChatCommandRouter::unclaimed_command_reason(&envelope("blue", "#提示"), None),
+            "娱乐 # 命令与当前会话不匹配（没有进行中的对应玩法）"
+        );
+        assert_eq!(
+            ChatCommandRouter::unclaimed_command_reason(
+                &envelope("blue", "#提示"),
+                Some(EntertainmentKind::IdiomChain)
+            ),
+            "信封可解析但没有模块认领"
+        );
+        // 大厅 # 命令在没有进行中玩法时都会落到“会话不匹配”；
+        // 真正的“没有模块认领”用 @ 命令举例。
+        assert_eq!(
+            ChatCommandRouter::unclaimed_command_reason(&envelope("blue", "@不存在xyz"), None),
+            "信封可解析但没有模块认领"
         );
     }
 }

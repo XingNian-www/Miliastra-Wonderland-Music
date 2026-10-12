@@ -661,21 +661,37 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         }
         // 播放成功消息里的音量显示引擎当前实际音量（音量命令是异步渐变，
         // 请求元数据里没有音量，之前硬编码 0 导致「播放: … 音量0」）。
-        if let Ok(current) = self.backend.status() {
-            status.volume = current.volume;
-            // 引擎已报告新请求曲目时，采用其真实 session/generation，让
-            // expected_session_id 不再恒为空：失败残留能按会话归属过滤，避免连跳。
-            let matches_request = current
-                .current_track
-                .as_ref()
-                .zip(request.track.as_ref())
-                .is_some_and(|(current_track, requested)| {
-                    current_track.track_ref.key == requested.track_ref.key
-                });
-            if matches_request {
-                status.session_id = current.session_id.clone();
-                status.generation = current.generation;
+        // 有界等待真实开播信号：play 回包只代表 Start 被受理，源站拒绝/解码失败
+        // 要稍后才到。窗口内出现本请求的 playing 或失败信号就返回；超时按原行为
+        // 确认（避免慢源被误判失败）。
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        loop {
+            if let Ok(current) = self.backend.status() {
+                status.volume = current.volume;
+                let matches_request = current
+                    .current_track
+                    .as_ref()
+                    .zip(request.track.as_ref())
+                    .is_some_and(|(current_track, requested)| {
+                        current_track.track_ref.key == requested.track_ref.key
+                    });
+                if matches_request && !current.failure_code.trim().is_empty() {
+                    anyhow::bail!(
+                        "播放器报告失败: {}: {}",
+                        current.failure_code,
+                        current.failure_message
+                    );
+                }
+                if matches_request && current.status == "playing" {
+                    status.session_id = current.session_id.clone();
+                    status.generation = current.generation;
+                    break;
+                }
             }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
         self.record_observation(&status, classify_observation(&status))?;
         let message = format_play_message(&status);
@@ -1543,9 +1559,17 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             },
             request.queue_item_id,
         )?;
-        self.record_song_dedup_playback(request, status)?;
-        self.playback_state
-            .record_playback_pool_track(confirmed_track.clone())?;
+        // 起播已确认且队首已出队：去重/播放池记账失败不能把成功改判成播放失败，
+        // 只记 warning（下一次播放会重新登记）。
+        if let Err(error) = self.record_song_dedup_playback(request, status) {
+            log::warn!("记录同歌去重历史失败（不影响本次播放）: {error:#}");
+        }
+        if let Err(error) = self
+            .playback_state
+            .record_playback_pool_track(confirmed_track.clone())
+        {
+            log::warn!("登记播放池失败（不影响本次播放）: {error:#}");
+        }
         log::info!("播放器状态转移: Starting -> RequestedSongPlaying reason={reason}");
         Ok(())
     }

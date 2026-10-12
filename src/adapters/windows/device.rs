@@ -128,6 +128,10 @@ impl UiDevice for WindowsUiDevice {
         window::capture_game(&self.window)
     }
 
+    fn benchmark_capture(&mut self, rounds: u32) -> Result<String> {
+        window::benchmark_capture_game(&self.window, rounds)
+    }
+
     /// 只读剪贴板：不要求窗口在前台，也没有输入副作用。
     fn clipboard_text(&mut self) -> Result<Option<String>> {
         super::clipboard::get_text()

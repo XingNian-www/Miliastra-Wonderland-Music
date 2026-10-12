@@ -14,6 +14,9 @@ use crate::runtime::ui::{
 
 pub(crate) trait GameUiBackend: Send + Sync + 'static {
     fn capture(&self) -> Result<DynamicImage>;
+    fn benchmark_capture(&self, _rounds: u32) -> Result<String> {
+        anyhow::bail!("capture benchmark is unavailable")
+    }
     fn press_key(&self, key: Key) -> Result<()>;
     fn click_point(&self, point: PointConfig) -> Result<()>;
     fn ensure_ready(&self, after_activate_ms: u64) -> Result<()>;
@@ -34,6 +37,10 @@ impl GameUi {
 
     pub(crate) fn capture(&self) -> Result<DynamicImage> {
         self.backend.capture()
+    }
+
+    pub(crate) fn benchmark_capture(&self, rounds: u32) -> Result<String> {
+        self.backend.benchmark_capture(rounds)
     }
 
     pub(crate) fn press_key(&self, key: Key) -> Result<()> {
@@ -173,6 +180,10 @@ impl UiRoutine for CloseWindowRoutine {
 impl GameUiBackend for RuntimeGameUiBackend {
     fn capture(&self) -> Result<DynamicImage> {
         Ok(self.execute(CaptureFrame)??.into_image())
+    }
+
+    fn benchmark_capture(&self, rounds: u32) -> Result<String> {
+        self.execute(crate::runtime::ui::BenchmarkCapture { rounds })?
     }
 
     fn press_key(&self, key: Key) -> Result<()> {

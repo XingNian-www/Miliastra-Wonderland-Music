@@ -26,6 +26,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, SW_RESTORE, SetForegroundWindow, ShowWindow, WM_CLOSE, WindowFromPoint,
 };
 use windows::core::BOOL;
+use windows_capture::capture::{
+    Context as WgcContext, GraphicsCaptureApiError, GraphicsCaptureApiHandler,
+};
+use windows_capture::frame::Frame as WgcFrame;
+use windows_capture::graphics_capture_api::InternalCaptureControl;
+use windows_capture::settings::{
+    ColorFormat as WgcColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+    MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+};
+use windows_capture::window::Window as WgcWindow;
 
 use crate::config::{PointConfig, WindowCaptureMethod, WindowConfig};
 
@@ -412,6 +422,61 @@ impl GameWindow {
         Ok(())
     }
 
+    pub fn benchmark_capture(&self, rounds: u32) -> Result<String> {
+        let mut report = Vec::new();
+        for method in [
+            WindowCaptureMethod::Gdi,
+            WindowCaptureMethod::PrintWindow,
+            WindowCaptureMethod::Desktop,
+            WindowCaptureMethod::Wgc,
+        ] {
+            let mut samples = Vec::with_capacity(rounds as usize);
+            let mut failures = Vec::new();
+            let mut dimensions = None;
+            for _ in 0..rounds {
+                let started = Instant::now();
+                match self.capture(method) {
+                    Ok(image) => {
+                        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                        dimensions = Some((image.width(), image.height()));
+                    }
+                    Err(error) => failures.push(format!("{error:#}")),
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            if samples.is_empty() {
+                report.push(format!(
+                    "{}: 全部失败（{}）",
+                    method.label(),
+                    failures.join("; ")
+                ));
+            } else {
+                let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+                let p50 = percentile_ms(&samples, 0.50);
+                let p95 = percentile_ms(&samples, 0.95);
+                let failure_note = failures
+                    .first()
+                    .map(|error| format!("；错误示例: {error}"))
+                    .unwrap_or_default();
+                report.push(format!(
+                    "{}: 成功 {}/{}，尺寸 {:?}，平均 {:.2} ms，P50 {:.2} ms，P95 {:.2} ms{}",
+                    method.label(),
+                    samples.len(),
+                    rounds,
+                    dimensions,
+                    mean,
+                    p50,
+                    p95,
+                    failure_note
+                ));
+            }
+        }
+        Ok(format!(
+            "采集后端串行测试；耗时包括像素缓冲区读取/转换。WGC 每轮冷启动并等待首帧，不代表持久会话吞吐。\n{}",
+            report.join("\n")
+        ))
+    }
+
     pub fn capture(&self, method: WindowCaptureMethod) -> Result<DynamicImage> {
         match method {
             WindowCaptureMethod::Gdi => {
@@ -437,12 +502,28 @@ impl GameWindow {
                 self.client_width,
                 self.client_height,
             ),
+            WindowCaptureMethod::Wgc => capture_with_wgc(
+                self.hwnd,
+                self.client_left,
+                self.client_top,
+                self.client_width,
+                self.client_height,
+            ),
         }
     }
 }
 
+fn percentile_ms(sorted: &[f64], percentile: f64) -> f64 {
+    let index = ((sorted.len().saturating_sub(1) as f64) * percentile).ceil() as usize;
+    sorted[index]
+}
+
 pub fn capture_game(config: &WindowConfig) -> Result<DynamicImage> {
     GameWindow::find(config)?.capture(config.capture_method)
+}
+
+pub fn benchmark_capture_game(config: &WindowConfig, rounds: u32) -> Result<String> {
+    GameWindow::find(config)?.benchmark_capture(rounds)
 }
 
 pub fn ensure_foreground(config: &WindowConfig) -> Result<()> {
@@ -566,6 +647,100 @@ fn capture_with_print_window(hwnd: HWND, width: i32, height: i32) -> Result<Dyna
         let _ = DeleteDC(memory_dc);
         ReleaseDC(Some(hwnd), reference_dc);
         image
+    }
+}
+
+fn capture_with_wgc(
+    hwnd: HWND,
+    client_left: i32,
+    client_top: i32,
+    client_width: i32,
+    client_height: i32,
+) -> Result<DynamicImage> {
+    use std::sync::mpsc;
+
+    let window_rect = WgcWindow::from_raw_hwnd(hwnd.0 as *mut std::ffi::c_void)
+        .rect()
+        .map_err(|error| anyhow!("read WGC target bounds: {error}"))?;
+    let crop_left = (client_left - window_rect.left).max(0) as u32;
+    let crop_top = (client_top - window_rect.top).max(0) as u32;
+    let crop_width = client_width.max(1) as u32;
+    let crop_height = client_height.max(1) as u32;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let item = WgcWindow::from_raw_hwnd(hwnd.0 as *mut std::ffi::c_void);
+    let settings = Settings::new(
+        item,
+        CursorCaptureSettings::WithoutCursor,
+        DrawBorderSettings::WithoutBorder,
+        SecondaryWindowSettings::Exclude,
+        MinimumUpdateIntervalSettings::Default,
+        DirtyRegionSettings::Default,
+        WgcColorFormat::Rgba8,
+        WgcFlags {
+            sender,
+            crop: (crop_left, crop_top, crop_width, crop_height),
+        },
+    );
+    let control = OneFrameWgc::start_free_threaded(settings).map_err(
+        |error: GraphicsCaptureApiError<anyhow::Error>| {
+            anyhow!("WGC initialization failed: {error}")
+        },
+    )?;
+    let image = receiver.recv_timeout(Duration::from_secs(3));
+    control
+        .stop()
+        .map_err(|error| anyhow!("WGC stop failed: {error}"))?;
+    Ok(image.map_err(|error| anyhow!("WGC did not produce a frame: {error}"))??)
+}
+
+struct WgcFlags {
+    sender: std::sync::mpsc::SyncSender<Result<DynamicImage>>,
+    crop: (u32, u32, u32, u32),
+}
+
+struct OneFrameWgc {
+    flags: WgcFlags,
+}
+
+impl GraphicsCaptureApiHandler for OneFrameWgc {
+    type Flags = WgcFlags;
+    type Error = anyhow::Error;
+
+    fn new(context: WgcContext<Self::Flags>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            flags: context.flags,
+        })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut WgcFrame<'_>,
+        capture_control: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        let image = (|| -> Result<DynamicImage> {
+            let (left, top, width, height) = self.flags.crop;
+            let right = left.saturating_add(width).min(frame.width());
+            let bottom = top.saturating_add(height).min(frame.height());
+            if left >= right || top >= bottom {
+                bail!("WGC client crop is outside the captured window bounds");
+            }
+            let buffer = frame
+                .buffer_crop(left, top, right, bottom)
+                .map_err(|error| anyhow!("read WGC frame: {error}"))?;
+            if (right - left, bottom - top) != (width, height) {
+                bail!("WGC frame bounds do not cover the requested client area");
+            }
+            let bytes = buffer.as_nopadding_buffer(&mut Vec::new()).to_vec();
+            image::RgbaImage::from_raw(right - left, bottom - top, bytes)
+                .map(DynamicImage::ImageRgba8)
+                .ok_or_else(|| anyhow!("WGC returned an invalid frame buffer"))
+        })();
+        self.flags
+            .sender
+            .send(image)
+            .map_err(|error| anyhow!("send WGC frame: {error}"))?;
+        capture_control.stop();
+        Ok(())
     }
 }
 

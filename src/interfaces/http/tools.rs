@@ -33,6 +33,9 @@ pub(crate) enum WebToolRequest {
     PanelResponseBenchmark {
         rounds: u32,
     },
+    CaptureApiBenchmark {
+        rounds: u32,
+    },
     OcrBackendProbe,
     AiSearchPreview {
         keyword: String,
@@ -146,6 +149,7 @@ impl WebToolRequest {
             Self::PanelResponseBenchmark { rounds } => {
                 format!("面板响应基准: {rounds}轮")
             }
+            Self::CaptureApiBenchmark { rounds } => format!("截图 API 基准: {rounds}轮"),
             Self::OcrBackendProbe => "OCR 后端探测".to_string(),
             Self::AiSearchPreview { keyword, .. } => format!("AI 候选诊断: {keyword}"),
         }

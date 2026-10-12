@@ -601,6 +601,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         <div class="panel-head"><h2>诊断</h2></div>
         <div class="panel-body">
           <button class="btn tools-stretch" onclick="runTool('/tools/ocr-backends')">OCR 后端探测</button>
+          <div class="row"><input id="captureRounds" value="3" inputmode="numeric" placeholder="截图 API 轮数" aria-label="截图 API 基准轮数"><button class="btn warn" onclick="captureBenchmark()">截图性能</button></div>
           <div class="row"><input id="changeSamples" value="10" inputmode="numeric" placeholder="变化采样次数" aria-label="变化采样次数"><button class="btn" onclick="sampleChatChanges()">聊天变化</button></div>
           <div class="row"><input id="benchmarkRounds" value="3" inputmode="numeric" placeholder="面板基准轮数" aria-label="面板基准轮数"><button class="btn warn" onclick="panelBenchmark()">面板基准</button></div>
           <div class="row"><input id="aiKeyword" placeholder="AI 候选诊断关键词" aria-label="AI 候选诊断关键词"><button class="btn" onclick="aiPreview()">诊断</button></div>
@@ -2237,6 +2238,7 @@ function sendKey(){runTool('/tools/key',{key:val('key')})}
 function aiPreview(){runTool('/tools/ai-preview',{keyword:val('aiKeyword'),preferAccompaniment:$('aiAccompaniment').checked?'1':''})}
 function sampleChatChanges(){runTool('/tools/chat-change-samples',{samples:val('changeSamples')})}
 function panelBenchmark(){runTool('/tools/panel-benchmark',{rounds:val('benchmarkRounds')})}
+function captureBenchmark(){runTool('/tools/capture-benchmark',{rounds:val('captureRounds')})}
 function renderToolTasks(items){
   const el=$('toolTasks')
   if(!el)return
@@ -2282,7 +2284,7 @@ function initToolsPage(){
 }
 document.addEventListener('keydown',event=>{
   if(event.key==='Enter'&&!event.isComposing&&event.target.tagName==='INPUT'){
-    const map={ocrRect:()=>runTool('/tools/ocr',{rect:val('ocrRect')}),x:clickPoint,y:clickPoint,key:sendKey,aiKeyword:aiPreview,threshold:()=>matchTemplate(false),templateRect:()=>matchTemplate(false),changeSamples:sampleChatChanges,benchmarkRounds:panelBenchmark}
+    const map={ocrRect:()=>runTool('/tools/ocr',{rect:val('ocrRect')}),x:clickPoint,y:clickPoint,key:sendKey,aiKeyword:aiPreview,threshold:()=>matchTemplate(false),templateRect:()=>matchTemplate(false),changeSamples:sampleChatChanges,benchmarkRounds:panelBenchmark,captureRounds:captureBenchmark}
     const action=map[event.target.id]
     if(action){event.preventDefault();action()}
   }

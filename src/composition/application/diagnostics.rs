@@ -202,6 +202,10 @@ impl ApplicationRuntime {
             WebToolRequest::PanelResponseBenchmark { rounds } => {
                 self.run_web_tool_panel_benchmark(rounds)
             }
+            WebToolRequest::CaptureApiBenchmark { rounds } => {
+                self.ensure_web_tool_input_still_idle()?;
+                self.ui.game_ui.benchmark_capture(rounds)
+            }
             WebToolRequest::OcrBackendProbe => {
                 let result = probe_ocr_backend_support(&self.ui.ocr_args)
                     .into_iter()

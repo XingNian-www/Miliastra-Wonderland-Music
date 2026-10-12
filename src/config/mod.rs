@@ -397,6 +397,18 @@ pub(crate) fn resolve_stability_count(local: u32, global: u32) -> u32 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowCaptureMethod {
+    /// 从目标窗口客户区 DC 读取，适合通常的窗口化/无边框运行。
+    #[default]
+    Gdi,
+    /// 请求目标窗口自行绘制客户区；窗口被遮挡时可能有效，但部分游戏不支持。
+    PrintWindow,
+    /// 从桌面 DC 裁剪目标窗口客户区；要求窗口实际可见且未被遮挡。
+    Desktop,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowConfig {
@@ -406,6 +418,9 @@ pub struct WindowConfig {
     pub content_height: u32,
     pub auto_activate_window: bool,
     pub focus_point: PointConfig,
+    /// Windows 截图来源；缺失时维持旧版 GDI 行为。
+    #[serde(default)]
+    pub capture_method: WindowCaptureMethod,
 }
 
 impl Default for WindowConfig {
@@ -416,6 +431,7 @@ impl Default for WindowConfig {
             content_height: 1080,
             auto_activate_window: false,
             focus_point: PointConfig::new(1919, 1000),
+            capture_method: WindowCaptureMethod::default(),
         }
     }
 }
@@ -2079,6 +2095,19 @@ stale_timeout_ms: 7500
         AppConfig::default()
             .validate()
             .expect("默认配置必须能通过完整校验");
+    }
+
+    #[test]
+    fn old_window_config_defaults_to_gdi_capture() {
+        let config: WindowConfig = serde_json::from_value(serde_json::json!({
+            "target_process": "game.exe",
+            "content_width": 1920,
+            "content_height": 1080,
+            "auto_activate_window": false,
+            "focus_point": { "x": 1919, "y": 1000 }
+        }))
+        .expect("old window config remains readable");
+        assert_eq!(config.capture_method, WindowCaptureMethod::Gdi);
     }
 
     #[test]

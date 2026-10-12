@@ -646,15 +646,20 @@ impl ChatTimeline {
                     .is_some_and(|end| captured_at <= end));
         // 空 OCR 帧不消费基线：否则会在真正有内容的第一帧丢失基线语义。
         let frame_empty = messages.is_empty();
+        // 冷基线消费：聊天区不存在（publish_no_chat）或首屏为空，都等价于“首屏没有命令”。
+        // 首屏抑制的目的只是不让 BOT 刚启动就读到旧命令；无命令可抑制时，
+        // 之后出现的命令按新命令处理（蓝色不再被 AppStart 吞、粉色不再走首屏历史提升）。
+        let cold_consumed = state.cold_baseline_consumed || frame_empty;
+        if state.cold_baseline_consumed && !frame_empty {
+            // 之前出现过“首屏无聊天/空屏”，现在内容才出现：过期基线事件不得落到这一帧上，
+            // 否则首屏无聊天时，内容再出现会被旧基线判成历史（粉色与蓝色同一规则）。
+            state.pending_baseline = None;
+        }
         let baseline = if frame_empty {
             None
         } else {
             state.pending_baseline.take()
         };
-        // 冷基线消费：聊天区不存在（publish_no_chat）或首屏为空，都等价于“首屏没有命令”。
-        // 首屏抑制的目的只是不让 BOT 刚启动就读到旧命令；无命令可抑制时，
-        // 之后出现的命令按新命令处理（蓝色不再被 AppStart 吞、粉色不再走首屏历史提升）。
-        let cold_consumed = state.cold_baseline_consumed || frame_empty;
         let mut freshness = state.chat_freshness.remove(&chat).unwrap_or_default();
         if cold_consumed {
             freshness.mark_view_absent();

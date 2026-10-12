@@ -222,7 +222,7 @@ impl ApplicationRuntime {
     }
 }
 
-/// 待处理的子进程重载优先于监听器安排的所有队列推进。
+/// 待处理的子进程重载优先于值守器安排的所有队列推进。
 /// 当前请求进入终态后，队列仍会持久化并由替代进程继续消费。
 fn automatic_advance_allowed(live_configs: &crate::config::LiveConfigs) -> bool {
     !live_configs.has_pending_reload()

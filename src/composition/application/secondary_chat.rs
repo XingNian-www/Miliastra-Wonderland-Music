@@ -390,7 +390,7 @@ impl ApplicationRuntime {
             self.business
                 .business
                 .finish_chat_listener_initial_unread_clear()?;
-            log::info!("二级监听初始未读清场完成，当前大厅已建立消息基线");
+            log::info!("二级值守初始未读清场完成，当前大厅已建立消息基线");
             return Ok(SecondaryListenerRoundOutcome {
                 scanned: false,
                 verified: true,
@@ -448,7 +448,7 @@ impl ApplicationRuntime {
             return Err(error);
         }
         log::info!(
-            "二级监听检测到好友未读红点: y={} discard_only={}",
+            "二级值守检测到好友未读红点: y={} discard_only={}",
             queued_y,
             discard_only
         );
@@ -463,7 +463,7 @@ impl ApplicationRuntime {
             self.business.business.release_chat_listener_unread_task()?;
             return Err(error);
         }
-        log::info!("二级监听检测到不可执行会话，已加入恢复当前大厅任务");
+        log::info!("二级值守检测到不可执行会话，已加入恢复当前大厅任务");
         Ok(true)
     }
 
@@ -519,7 +519,7 @@ impl ApplicationRuntime {
         self.business
             .business
             .finish_chat_listener_unread_task(false)?;
-        result.context("二级监听暂时无法恢复当前大厅，已保留二级模式并等待重试")
+        result.context("二级值守暂时无法恢复当前大厅，已保留二级模式并等待重试")
     }
 
     pub(super) fn begin_chat_decision_reader<A, P>(
@@ -579,7 +579,7 @@ impl ApplicationRuntime {
             }
             let mode = self.business.business.chat_listener_snapshot()?;
             if mode.mode != listener_mode || mode.pending_mode.is_some() {
-                return Err(anyhow!("监听模式正在切换，已结束确认窗口"));
+                return Err(anyhow!("值守模式正在切换，已结束确认窗口"));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -714,7 +714,7 @@ impl ApplicationRuntime {
         }
         let snapshot = self.business.business.chat_listener_snapshot()?;
         if snapshot.mode != reader.listener_mode || snapshot.pending_mode.is_some() {
-            return Err(anyhow!("监听模式正在切换，已结束确认窗口"));
+            return Err(anyhow!("值守模式正在切换，已结束确认窗口"));
         }
         reader.read_messages()
     }
@@ -773,7 +773,7 @@ impl ApplicationRuntime {
         }
         let snapshot = self.business.business.chat_listener_snapshot()?;
         if snapshot.mode != reader.listener_mode || snapshot.pending_mode.is_some() {
-            return Err(anyhow!("监听模式正在切换，已结束确认窗口"));
+            return Err(anyhow!("值守模式正在切换，已结束确认窗口"));
         }
         reader.read_messages_with_ids()
     }
@@ -915,7 +915,7 @@ impl ApplicationRuntime {
                 }
             }
             let Some(index) = text.find(['@', '＠']) else {
-                log::debug!("二级监听气泡不是命令: {}", redacted_chat_text(&text));
+                log::debug!("二级值守气泡不是命令: {}", redacted_chat_text(&text));
                 outcome.unrecognized = true;
                 continue;
             };
@@ -948,7 +948,7 @@ impl ApplicationRuntime {
                         redacted_chat_text(&text)
                     );
                 } else {
-                    log::debug!("二级监听气泡未解析为命令");
+                    log::debug!("二级值守气泡未解析为命令");
                 }
                 outcome.unrecognized = true;
                 continue;
@@ -993,7 +993,7 @@ mod tests {
             },
         );
         let router = ChatCommandRouter::with_identity(&service, &identity);
-        for text in ["@禁用", "@闲置退出 15", "@删除", "@监听模式 一级"] {
+        for text in ["@禁用", "@闲置退出 15", "@删除", "@值守模式 一级"] {
             let envelope = |sender: &str| {
                 CommandEnvelope::new(text, sender, "blue", text, CommandObservation::default())
                     .unwrap()

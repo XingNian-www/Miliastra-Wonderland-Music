@@ -105,7 +105,7 @@ impl AdministrationApplication {
             AdministrationCommand::ChatListenerMode(command) => {
                 port.log_executed(context, &format!("chat listener {}", command.label()))?;
                 log::warn!(
-                    "监听模式命令未经过专用队列分发，已只记录: {}",
+                    "值守模式命令未经过专用队列分发，已只记录: {}",
                     command.label()
                 );
                 Ok(())
@@ -196,7 +196,7 @@ impl ChatListenerModeCommand {
     }
 
     fn parse(text: &str) -> Option<CommandSyntax<'_, Self>> {
-        let argument = parse_prefixed_command(text, "监听模式", true)?;
+        let argument = parse_prefixed_command(text, "值守模式", true)?;
         let command = match argument {
             "一级" => Self::Primary,
             "二级" => Self::Secondary,
@@ -204,7 +204,7 @@ impl ChatListenerModeCommand {
             _ => return None,
         };
         Some(CommandSyntax {
-            matched: "监听模式",
+            matched: "值守模式",
             argument,
             command,
         })
@@ -241,7 +241,7 @@ impl AdministrationCommand {
                 .iter()
                 .any(|prefix| envelope.command_text().starts_with(prefix)),
             (CommandPrefix::At, CommandAuthority::Friend) => {
-                ["监听模式", "禁用", "启用", "闲置退出"]
+                ["值守模式", "禁用", "启用", "闲置退出"]
                     .iter()
                     .any(|prefix| {
                         strip_ascii_case_prefix(envelope.command_text(), prefix).is_some()
@@ -336,7 +336,7 @@ impl AdministrationCommand {
         if let Some(parsed) = ChatListenerModeCommand::parse(text) {
             return Some(FriendAdministrationMatch {
                 matched: parsed.matched,
-                raw: format!("监听模式 {}", parsed.command.label()),
+                raw: format!("值守模式 {}", parsed.command.label()),
                 command: Self::ChatListenerMode(parsed.command),
             });
         }

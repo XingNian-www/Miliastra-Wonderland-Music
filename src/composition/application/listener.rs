@@ -125,7 +125,7 @@ fn listener_ready_after_recheck(
     }
 }
 
-/// 大厅归属闸门：一级监听只消费主大厅，二级监听只消费二级大厅。
+/// 大厅归属闸门：一级值守只消费主大厅，二级值守只消费二级大厅。
 ///
 /// 二级大厅与主观察可能是同一个大厅。共享观察里所有跨帧去重结构
 /// （`command_locks`、气泡键 `visual_session|chat|bubble_sequence`、业务认领
@@ -166,7 +166,7 @@ fn unresolved_ui_recovery_due(
 
 fn secondary_hall_recovery_allowed(now: Instant, retry_after: Instant) -> bool {
     // 待处理重载可能因外部播放或不确定状态长期阻塞。恢复本身作为正式任务执行，
-    // 可安全延迟停机，不会让好友监听器停在当前大厅之外。
+    // 可安全延迟停机，不会让好友值守器停在当前大厅之外。
     now >= retry_after
 }
 
@@ -385,11 +385,11 @@ pub(super) fn load_persisted_chat_listener_mode(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("读取聊天监听模式状态失败: {}", path.display()));
+                .with_context(|| format!("读取聊天值守模式状态失败: {}", path.display()));
         }
     };
     serde_json::from_slice(&bytes)
-        .with_context(|| format!("解析聊天监听模式状态失败: {}", path.display()))
+        .with_context(|| format!("解析聊天值守模式状态失败: {}", path.display()))
         .map(Some)
 }
 
@@ -398,8 +398,8 @@ pub(super) fn persist_chat_listener_mode(
     mode: ChatListenerMode,
 ) -> Result<()> {
     let path = chat_listener_mode_path(playback_state_path);
-    let bytes = serde_json::to_vec(&mode).context("序列化聊天监听模式状态失败")?;
-    crate::adapters::file_store::write_atomic(&path, &bytes, "聊天监听模式状态")
+    let bytes = serde_json::to_vec(&mode).context("序列化聊天值守模式状态失败")?;
+    crate::adapters::file_store::write_atomic(&path, &bytes, "聊天值守模式状态")
 }
 
 use crate::features::administration::{
@@ -525,14 +525,14 @@ impl ApplicationRuntime {
         if let Err(error) =
             persist_chat_listener_mode(&self.lifecycle.config.state.playback_state_path, mode)
         {
-            log::error!("持久化聊天监听模式失败: {error:#}");
+            log::error!("持久化聊天值守模式失败: {error:#}");
         }
     }
 
     pub(super) fn persist_current_chat_listener_mode(&self) {
         match self.business.business.chat_listener_snapshot() {
             Ok(snapshot) => self.persist_listener_mode_best_effort(snapshot.mode),
-            Err(error) => log::error!("读取聊天监听模式用于持久化失败: {error}"),
+            Err(error) => log::error!("读取聊天值守模式用于持久化失败: {error}"),
         }
     }
 
@@ -996,7 +996,7 @@ impl ApplicationRuntime {
                 if let Some(subscription) = frame_subscription.take()
                     && let Err(error) = subscription.cancel()
                 {
-                    log::warn!("暂停监听时撤销观察帧需求失败: {error}");
+                    log::warn!("暂停值守时撤销观察帧需求失败: {error}");
                 }
                 unresolved_ui_since = None;
                 self.maybe_idle_exit()?;
@@ -1136,19 +1136,19 @@ impl ApplicationRuntime {
                                     listener_snapshot.temporary_primary,
                                 );
                                 log::warn!(
-                                    "聊天监听逻辑模式与当前界面不一致，尝试恢复驻留: mode={} ui={} target={target:?}",
+                                    "聊天值守逻辑模式与当前界面不一致，尝试恢复驻留: mode={} ui={} target={target:?}",
                                     listener_snapshot.mode.label(),
                                     ui_state
                                 );
                                 match self.establish_ui_residency(
                                     target,
-                                    ResidencyPurpose::IndependentRecovery("恢复持久化聊天监听驻留"),
+                                    ResidencyPurpose::IndependentRecovery("恢复持久化聊天值守驻留"),
                                 ) {
                                     Ok(()) => {
-                                        log::info!("聊天监听驻留恢复完成: target={target:?}")
+                                        log::info!("聊天值守驻留恢复完成: target={target:?}")
                                     }
                                     Err(error) => log::warn!(
-                                        "聊天监听驻留恢复失败，保留逻辑模式并稍后重试: {error:#}"
+                                        "聊天值守驻留恢复失败，保留逻辑模式并稍后重试: {error:#}"
                                     ),
                                 }
                                 listener_residency_retry_after =
@@ -1176,21 +1176,21 @@ impl ApplicationRuntime {
                                     listener_snapshot.temporary_primary,
                                 );
                                 log::warn!(
-                                    "界面持续无法验证，尝试恢复聊天监听驻留: mode={} ui={} target={target:?}",
+                                    "界面持续无法验证，尝试恢复聊天值守驻留: mode={} ui={} target={target:?}",
                                     listener_snapshot.mode.label(),
                                     ui_state
                                 );
                                 match self.establish_ui_residency(
                                     target,
                                     ResidencyPurpose::IndependentRecovery(
-                                        "恢复持续未知界面的聊天监听驻留",
+                                        "恢复持续未知界面的聊天值守驻留",
                                     ),
                                 ) {
                                     Ok(()) => log::info!(
-                                        "持续未知界面的聊天监听驻留恢复完成: target={target:?}"
+                                        "持续未知界面的聊天值守驻留恢复完成: target={target:?}"
                                     ),
                                     Err(error) => log::warn!(
-                                        "持续未知界面的聊天监听驻留恢复失败，稍后重试: {error:#}"
+                                        "持续未知界面的聊天值守驻留恢复失败，稍后重试: {error:#}"
                                     ),
                                 }
                                 listener_residency_retry_after =
@@ -1271,13 +1271,13 @@ impl ApplicationRuntime {
                                     )?)
                                 } else if command_executing {
                                     log::debug!(
-                                        "二级监听任务临时离开二级界面，等待任务状态机恢复: {}",
+                                        "二级值守任务临时离开二级界面，等待任务状态机恢复: {}",
                                         ui_state
                                     );
                                     None
                                 } else {
                                     log::warn!(
-                                        "二级监听当前不在二级聊天界面: {}，保留逻辑模式并等待驻留恢复",
+                                        "二级值守当前不在二级聊天界面: {}，保留逻辑模式并等待驻留恢复",
                                         ui_state
                                     );
                                     secondary_friend_bubble_fingerprint = None;
@@ -1517,7 +1517,7 @@ impl ApplicationRuntime {
         let snapshots = subscriber.read()?;
         if backlog.len().saturating_add(snapshots.len()) > 4096 {
             return Err(anyhow!(
-                "共享聊天业务积压超过 4096 帧，停止监听以避免静默丢失"
+                "共享聊天业务积压超过 4096 帧，停止值守以避免静默丢失"
             ));
         }
         backlog.extend(snapshots);
@@ -1527,7 +1527,7 @@ impl ApplicationRuntime {
         if backlog.is_empty() {
             return Ok(());
         }
-        // 大厅归属闸门按逻辑监听模式判定。本批次取一次模式：批次中途发生模式切换时，
+        // 大厅归属闸门按逻辑值守模式判定。本批次取一次模式：批次中途发生模式切换时，
         // 沿用既有顺序语义，不在这里新增一致性机制。
         let listener_mode = self.business.business.chat_listener_snapshot()?.mode;
         while !backlog.is_empty() {
@@ -1559,7 +1559,7 @@ impl ApplicationRuntime {
             .begin_frame(snapshot.captured_at)?;
         let result = (|| {
             // 二级大厅与主观察可能是同一个大厅，跨身份去重互不相识，因此按模式互斥消费：
-            // 一级监听不消费二级大厅观察，二级监听不消费主大厅观察。
+            // 一级值守不消费二级大厅观察，二级值守不消费主大厅观察。
             // 这里只拦命令消费（不认领、不派发）；共享观察的发布、帧缓存与只读事件保持原样。
             if !hall_consumes_identity(listener_mode, &snapshot.chat) {
                 if snapshot
@@ -1568,7 +1568,7 @@ impl ApplicationRuntime {
                     .any(|message| command::looks_like_command(&message.text))
                 {
                     log::info!(
-                        "命令未执行：监听模式={} 不消费 {:?} 观察（含命令样式消息）",
+                        "命令未执行：值守模式={} 不消费 {:?} 观察（含命令样式消息）",
                         listener_mode.label(),
                         snapshot.chat
                     );
@@ -2039,7 +2039,7 @@ impl ApplicationRuntime {
                     .pending_mode
                     .map(|mode| format!("，等待切换{}", mode.label()))
                     .unwrap_or_default();
-                let message = format!("监听模式状态: {}{}", snapshot.mode.label(), pending);
+                let message = format!("值守模式状态: {}{}", snapshot.mode.label(), pending);
                 log::info!("{}", message);
                 self.lifecycle
                     .monitor
@@ -2063,7 +2063,7 @@ impl ApplicationRuntime {
                     self.business.business.request_chat_listener_mode(target)?;
                 if !queued {
                     log::info!(
-                        "监听模式切换已处于当前或等待状态，跳过: current={} pending={:?}",
+                        "值守模式切换已处于当前或等待状态，跳过: current={} pending={:?}",
                         snapshot.mode.label(),
                         snapshot.pending_mode
                     );
@@ -2079,7 +2079,7 @@ impl ApplicationRuntime {
                         .cancel_chat_listener_mode_request(target)?;
                     return Err(error);
                 }
-                log::info!("监听模式切换已加入待处理队列: {}", target.label());
+                log::info!("值守模式切换已加入待处理队列: {}", target.label());
             }
         }
         Ok(true)
@@ -2267,7 +2267,7 @@ impl ApplicationRuntime {
         &mut self,
         target: ChatListenerMode,
     ) -> Result<()> {
-        self.abort_entertainment_for_context_loss("聊天监听模式即将切换");
+        self.abort_entertainment_for_context_loss("聊天值守模式即将切换");
         let residency = match target {
             ChatListenerMode::Primary => UiResidency::Primary,
             ChatListenerMode::Secondary => UiResidency::SecondaryCurrentHall,
@@ -2277,16 +2277,16 @@ impl ApplicationRuntime {
             .is_ok()
         {
             self.complete_chat_listener_mode(target)?;
-            log::info!("聊天监听模式已切换为{}", target.label());
+            log::info!("聊天值守模式已切换为{}", target.label());
             return Ok(());
         }
 
         self.fail_chat_listener_mode_to_primary()?;
         let _ = self.establish_ui_residency(
             UiResidency::Primary,
-            ResidencyPurpose::IndependentRecovery("监听切换失败回退一级"),
+            ResidencyPurpose::IndependentRecovery("值守切换失败回退一级"),
         );
-        Err(anyhow!("切换{}失败，已回退一级监听", target.label()))
+        Err(anyhow!("切换{}失败，已回退一级值守", target.label()))
     }
 }
 
@@ -2513,9 +2513,9 @@ mod tests {
             ("访客", "pink", true),
         ] {
             for (text, expected) in [
-                ("@监听模式 一级", super::ChatListenerModeCommand::Primary),
-                ("@监听模式 二级", super::ChatListenerModeCommand::Secondary),
-                ("@监听模式 状态", super::ChatListenerModeCommand::Status),
+                ("@值守模式 一级", super::ChatListenerModeCommand::Primary),
+                ("@值守模式 二级", super::ChatListenerModeCommand::Secondary),
+                ("@值守模式 状态", super::ChatListenerModeCommand::Status),
             ] {
                 let envelope = CommandEnvelope::new(
                     format!("{username}：{text}"),
@@ -2751,7 +2751,7 @@ mod tests {
 
     #[test]
     fn primary_listening_does_not_consume_secondary_hall_observations() {
-        // 一级监听只看主大厅。二级大厅与主观察可能是同一个大厅，同屏可见的二级几何
+        // 一级值守只看主大厅。二级大厅与主观察可能是同一个大厅，同屏可见的二级几何
         // 是同一个大厅的另一个身份；消费它就会用 SecondaryHall 再派发一次同一条命令。
         assert!(hall_consumes_identity(
             ChatListenerMode::Primary,
@@ -2765,8 +2765,8 @@ mod tests {
 
     #[test]
     fn secondary_listening_does_not_consume_primary_hall_commands() {
-        // 二级监听只看二级大厅。主大厅快照（含审核巡检临时一级驻留期间的帧）
-        // 不在它的消费范围内，命令派发留给一级监听。
+        // 二级值守只看二级大厅。主大厅快照（含审核巡检临时一级驻留期间的帧）
+        // 不在它的消费范围内，命令派发留给一级值守。
         assert!(hall_consumes_identity(
             ChatListenerMode::Secondary,
             &ChatIdentity::SecondaryHall
@@ -2779,7 +2779,7 @@ mod tests {
 
     #[test]
     fn hall_gate_leaves_friend_and_unknown_identities_untouched() {
-        // 好友未读、未知、公共频道与陌生人聊天都不是大厅，两种监听模式下语义都不变。
+        // 好友未读、未知、公共频道与陌生人聊天都不是大厅，两种值守模式下语义都不变。
         for mode in [ChatListenerMode::Primary, ChatListenerMode::Secondary] {
             for chat in [
                 ChatIdentity::Friend("最好的京子".into()),

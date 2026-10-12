@@ -28,6 +28,8 @@ pub(crate) enum CommandAuthority {
 pub(crate) enum CommandPrefix {
     At,
     Hash,
+    /// 测试专用前缀（& / ＆）：只用于在观察/新鲜度层造样本，**永不路由到任何业务模块**。
+    Amp,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -90,10 +92,14 @@ impl CommandEnvelope {
         let (prefix, command_text) = if let Some(text) = user_command
             .strip_prefix('@')
             .or_else(|| user_command.strip_prefix('＠'))
-            .or_else(|| user_command.strip_prefix('&'))
-            .or_else(|| user_command.strip_prefix('＆'))
         {
             (CommandPrefix::At, text)
+        } else if let Some(text) = user_command
+            .strip_prefix('&')
+            .or_else(|| user_command.strip_prefix('＆'))
+        {
+            // 测试专用前缀：保留信封以便观察层记录，但路由层不会认领。
+            (CommandPrefix::Amp, text)
         } else {
             (
                 CommandPrefix::Hash,
@@ -135,6 +141,7 @@ impl CommandEnvelope {
         let user_command = match self.prefix {
             CommandPrefix::At => format!("@{command_text}"),
             CommandPrefix::Hash => format!("#{command_text}"),
+            CommandPrefix::Amp => format!("&{command_text}"),
         };
         Self {
             original_text: self.original_text.clone(),

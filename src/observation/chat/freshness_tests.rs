@@ -489,6 +489,23 @@ fn first_bubble_is_never_new_on_a_regular_frame() {
 }
 
 #[test]
+fn absent_view_consumes_cold_baseline_so_first_blue_is_new() {
+    // 聊天区一直不存在 => 首屏没有命令，冷基线消费；首个 HallWorldSwitch 基线按 blue New 处理。
+    let mut state = SequenceFreshness::default();
+    state.mark_view_absent();
+    let decision = observe_texts(&mut state, Some(BaselineKind::HallWorldSwitch), &["@新"]);
+    assert_eq!(decision.freshness[0], Freshness::New);
+}
+
+#[test]
+fn cold_baseline_without_absent_view_still_suppresses_first_blue() {
+    // 对照：没有“聊天区不存在”，第一个基线仍是 AppStart 全旧。
+    let mut state = SequenceFreshness::default();
+    let decision = observe_texts(&mut state, Some(BaselineKind::HallWorldSwitch), &["@旧"]);
+    assert_eq!(decision.freshness[0], Freshness::Unknown);
+}
+
+#[test]
 fn hall_switch_baseline_can_mark_the_top_blue_bubble_new() {
     // 记录 G1 的例外：HallWorldSwitch 基线的蓝色首屏按业务规则交付。
     // 先让该 chat 有过观测，否则“第一个基线”按 AppStart 一律全 Unknown。

@@ -232,6 +232,18 @@ impl PersistentQueue {
         Ok(count)
     }
 
+    /// 启动恢复：个人歌单模式不持久化，队列里的 `playlist_auto` 项都是孤儿，清理掉。
+    pub fn remove_playlist_auto_items(&mut self) -> Result<usize> {
+        let before = self.items.len();
+        self.items.retain(|item| !item.playlist_auto);
+        let removed = before - self.items.len();
+        if removed > 0 {
+            let items = self.items.clone();
+            self.save_state(&items, self.next_id)?;
+        }
+        Ok(removed)
+    }
+
     fn save_state(&self, items: &[QueueItem], next_id: u64) -> Result<()> {
         self.request_store
             .lock()
@@ -259,6 +271,28 @@ fn normalize_source(source: &str) -> String {
 mod tests {
     use super::*;
     use crate::features::playback::{test_candidate, test_track};
+
+    #[test]
+    fn remove_playlist_auto_items_drops_only_auto_entries() {
+        let mut queue = PersistentQueue::new_for_test(10).unwrap();
+        queue
+            .push(QueueItem {
+                keyword: "manual".to_string(),
+                ..QueueItem::default()
+            })
+            .unwrap();
+        queue
+            .push(QueueItem {
+                keyword: "auto".to_string(),
+                playlist_auto: true,
+                ..QueueItem::default()
+            })
+            .unwrap();
+        assert_eq!(queue.remove_playlist_auto_items().unwrap(), 1);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.items()[0].keyword, "manual");
+        assert_eq!(queue.remove_playlist_auto_items().unwrap(), 0);
+    }
 
     #[test]
     fn push_assigns_stable_ids_and_normalizes_source() {

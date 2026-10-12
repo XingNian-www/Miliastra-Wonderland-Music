@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -455,6 +455,8 @@ pub(crate) struct PlaybackApplication {
     last_played: Arc<Mutex<Option<PlaybackRequest>>>,
     /// 个人歌单自动填充队列；激活时不从默认播放池续播。
     personal_playlist: Arc<Mutex<Option<PersonalPlaylistQueue>>>,
+    /// 当前正在播放的曲目是否来自个人歌单自动队列；@状态 据此决定是否标注归属。
+    current_playlist_auto: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -533,6 +535,7 @@ impl PlaybackApplication {
             play_mode: Arc::new(AtomicU8::new(PLAY_MODE_SHUFFLE)),
             last_played: Arc::new(Mutex::new(None)),
             personal_playlist: Arc::new(Mutex::new(None)),
+            current_playlist_auto: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -600,6 +603,63 @@ impl PlaybackApplication {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|queue| queue.owner.clone())
+    }
+
+    /// 场景切换（换大厅/进千星/进入游戏）结束个人歌单模式；返回被结束的归属昵称。
+    /// 只清内存模式，残留自动项由调用方清理。
+    pub(crate) fn take_personal_playlist_mode(&self) -> Option<String> {
+        self.personal_playlist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .map(|queue| queue.owner)
+    }
+
+    /// 当前歌单模式的归属；未激活为 None（端口用）。
+    pub(crate) fn playlist_mode_owner(&self) -> Option<String> {
+        self.personal_playlist_owner()
+    }
+
+    /// owner 与当前模式匹配时，把新曲目并入运行中的随机池（导入用）；返回是否有新增。
+    pub(crate) fn extend_personal_playlist_tracks(
+        &self,
+        owner: &str,
+        tracks: &[PlayableTrack],
+    ) -> bool {
+        let mut guard = self
+            .personal_playlist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mode) = guard.as_mut() else {
+            return false;
+        };
+        if mode.owner != owner {
+            return false;
+        }
+        let mut added = false;
+        for track in tracks {
+            if !mode
+                .tracks
+                .iter()
+                .any(|existing| existing.track_ref.key == track.track_ref.key)
+            {
+                mode.tracks.push(track.clone());
+                added = true;
+            }
+        }
+        added
+    }
+
+    fn current_is_playlist_auto(&self) -> bool {
+        self.current_playlist_auto.load(Ordering::Relaxed)
+    }
+
+    /// 记录本次起播来源，供 @状态 判断是否标注歌单归属。
+    fn note_playback_purpose(&self, purpose: PlaybackPurpose) {
+        self.current_playlist_auto.store(
+            matches!(purpose, PlaybackPurpose::Playlist { .. }),
+            Ordering::Relaxed,
+        );
     }
 
     fn refill_personal_playlist_queue<P: PlaybackExecutionPort + ?Sized>(
@@ -743,8 +803,13 @@ impl PlaybackApplication {
             PlaybackCommand::Status => {
                 let status = port.player_status()?;
                 port.log_executed(context, "status")?;
-                let text =
-                    format_status_with_mode(&status, self.personal_playlist_owner().as_deref());
+                // 只对确实来自个人歌单自动队列的当前曲目标注归属；大厅点歌/窗口选曲保留点歌人。
+                let playlist_owner = if self.current_is_playlist_auto() {
+                    self.personal_playlist_owner()
+                } else {
+                    None
+                };
+                let text = format_status_with_mode(&status, playlist_owner.as_deref());
                 port.reply(&text)?;
             }
             PlaybackCommand::Lyrics => {
@@ -1211,6 +1276,7 @@ impl PlaybackApplication {
         purpose: PlaybackPurpose,
         port: &mut P,
     ) -> Result<PlaybackCompletion> {
+        self.note_playback_purpose(purpose);
         let requested = selection.request();
         if purpose.stop_when_user_paused() && port.user_pause_active()? {
             log::info!("自动出队已跳过: 用户暂停状态在播放前生效");
@@ -1302,6 +1368,7 @@ impl PlaybackApplication {
         purpose: PlaybackPurpose,
         port: &mut P,
     ) -> Result<PlaybackCompletion> {
+        self.note_playback_purpose(purpose);
         if purpose.stop_when_user_paused() && port.user_pause_active()? {
             log::info!("自动出队已跳过: 用户暂停状态在播放请求发送前生效");
             return Ok(PlaybackCompletion::new(
@@ -2215,6 +2282,31 @@ mod tests {
             .tracks
             .clone();
         assert_eq!(tracks.len(), 1, "the original queue must be preserved");
+    }
+
+    #[test]
+    fn status_owner_only_follows_playlist_auto_source() {
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(100)),
+            monitor_status_ms: Arc::new(RwLock::new(100)),
+            help_batch_ms: 0,
+        });
+        *application.personal_playlist.lock().unwrap() = Some(PersonalPlaylistQueue {
+            owner: "甲".to_string(),
+            tracks: vec![test_track("miliastra://track/qqmusic/a", "A - 歌手")],
+            cursor: 0,
+            shuffle_state: 1,
+            last_played_key: None,
+        });
+        application.note_playback_purpose(PlaybackPurpose::Playlist {
+            stop_when_user_paused: true,
+        });
+        assert!(application.current_is_playlist_auto());
+        assert_eq!(application.personal_playlist_owner().as_deref(), Some("甲"));
+        application.note_playback_purpose(PlaybackPurpose::Requested);
+        assert!(!application.current_is_playlist_auto());
     }
 
     #[test]

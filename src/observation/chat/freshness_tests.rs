@@ -498,6 +498,21 @@ fn absent_view_consumes_cold_baseline_so_first_blue_is_new() {
 }
 
 #[test]
+fn absent_view_then_first_content_marks_pink_and_blue_new() {
+    // 首屏没有聊天界面 => 冷基线消费；之后第一帧内容里的命令按新命令处理，
+    // 粉色与蓝色遵循同一规则（不因颜色被判成历史）。
+    let mut state = SequenceFreshness::default();
+    state.mark_view_absent();
+    let bubbles = vec![
+        bubble_at(0, 0, 400, 28, "@蓝", "blue", SENDER),
+        bubble_at(0, 30, 400, 28, "@粉", "pink", SENDER),
+    ];
+    let decision = observe(&mut state, Some(BaselineKind::PanelReturn), &bubbles);
+    assert_eq!(decision.freshness[0], Freshness::New, "blue after absent first screen must be new");
+    assert_eq!(decision.freshness[1], Freshness::New, "pink after absent first screen must be new");
+}
+
+#[test]
 fn cold_baseline_without_absent_view_still_suppresses_first_blue() {
     // 对照：没有“聊天区不存在”，第一个基线仍是 AppStart 全旧。
     let mut state = SequenceFreshness::default();

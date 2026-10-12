@@ -110,6 +110,8 @@ pub(crate) struct SequenceFreshness {
     initialized: bool,
     /// 上一次观测到聊天不可见；下一帧作不连续处理（保守）。
     pending_discontinuity: bool,
+    /// 冷基线因“首屏没有聊天界面”被消费：之后第一帧内容按新命令处理。
+    cold_absent: bool,
     prev: Vec<Snapshot>,
 }
 
@@ -127,6 +129,9 @@ impl SequenceFreshness {
     pub(crate) fn mark_view_absent(&mut self) {
         if !self.initialized {
             self.initialized = true;
+            // 首屏没有聊天界面：冷基线就此消费，之后第一帧内容按新命令处理。
+            self.cold_absent = true;
+            self.prev.clear();
         }
     }
 
@@ -138,6 +143,22 @@ impl SequenceFreshness {
             phase,
             scroll_delta: None,
         };
+
+        // 0) 首屏没有聊天界面（冷基线已被消费）：之后第一帧内容一律按新命令处理，
+        //    粉色与蓝色同一规则；过期的基线事件不得作用于这一帧。
+        if self.cold_absent && len > 0 {
+            self.cold_absent = false;
+            self.phase = ViewPhase::Streaming;
+            self.prev = frame.bubbles.iter().map(Snapshot::of).collect();
+            let mut decision = FrameDecision {
+                freshness: vec![Freshness::Seen; len],
+                matched: vec![None; len],
+                phase: ViewPhase::Streaming,
+                scroll_delta: None,
+            };
+            mark_bottom_most_command_new(frame.bubbles, &mut decision.freshness);
+            return decision;
+        }
 
         // 1) 基线事件：本帧按种类处理，并重建对齐基准。
         if let Some(kind) = frame.baseline {
@@ -212,27 +233,33 @@ impl SequenceFreshness {
             decision.matched[i] = Some(n - k + i);
         }
         // 尾部 = 底部追加区，默认全部为新；C1'：同键只认最靠下那条。
-        let mut last_by_key: HashMap<String, usize> = HashMap::new();
-        for i in k..m {
-            let snapshot = Snapshot::of(&frame.bubbles[i]);
-            if is_command_candidate(&snapshot.text) {
-                last_by_key.insert(snapshot.key(), i);
-            }
-        }
-        for i in k..m {
-            let snapshot = Snapshot::of(&frame.bubbles[i]);
-            let candidate = is_command_candidate(&snapshot.text);
-            let bottom_most = last_by_key.get(&snapshot.key()) == Some(&i);
-            decision.freshness[i] = if !candidate || bottom_most {
-                Freshness::New
-            } else {
-                Freshness::Seen
-            };
-        }
+        mark_bottom_most_command_new(&frame.bubbles[k..], &mut decision.freshness[k..]);
 
         self.phase = ViewPhase::Streaming;
         self.prev = frame.bubbles.iter().map(Snapshot::of).collect();
         decision
+    }
+}
+
+/// 把“底部追加区”的判定应用到一段气泡：命令候选只有同键最靠下的那条算新。
+/// C1'：OCR 常把同一条命令读成多行/多块，只认最靠下的。
+fn mark_bottom_most_command_new(bubbles: &[RecognizedChatMessage], freshness: &mut [Freshness]) {
+    let mut last_by_key: HashMap<String, usize> = HashMap::new();
+    for (i, bubble) in bubbles.iter().enumerate() {
+        let snapshot = Snapshot::of(bubble);
+        if is_command_candidate(&snapshot.text) {
+            last_by_key.insert(snapshot.key(), i);
+        }
+    }
+    for (i, bubble) in bubbles.iter().enumerate() {
+        let snapshot = Snapshot::of(bubble);
+        let candidate = is_command_candidate(&snapshot.text);
+        let bottom_most = last_by_key.get(&snapshot.key()) == Some(&i);
+        freshness[i] = if !candidate || bottom_most {
+            Freshness::New
+        } else {
+            Freshness::Seen
+        };
     }
 }
 

@@ -27,7 +27,7 @@ impl std::fmt::Display for UnsupportedRequestStateSchema {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "不支持的请求状态 schemaVersion {:?}，请删除状态文件 {} 后重启",
+            "不支持的请求状态 schemaVersion {:?}（文件 {}）",
             self.actual,
             self.path.display()
         )
@@ -193,37 +193,85 @@ impl RequestStateStore {
             )
         })?;
         Self::ensure_schema(&connection, &path)?;
-        let snapshot = match Self::read_snapshot_row(&connection)? {
-            Some((stored_version, text)) => {
-                let value: serde_json::Value = serde_json::from_str(&text)
-                    .with_context(|| format!("解析请求状态快照失败: {}", path.display()))?;
-                let schema_version = value
-                    .get("schemaVersion")
-                    .and_then(serde_json::Value::as_u64);
-                if schema_version != Some(u64::from(REQUEST_STATE_SCHEMA_VERSION)) {
-                    return Err(UnsupportedRequestStateSchema {
-                        actual: schema_version,
-                        path: path.clone(),
-                    }
-                    .into());
-                }
-                if Some(stored_version) != schema_version {
-                    bail!(
-                        "请求状态数据库 schema_version 列与快照内容不一致，请删除 {} 后重启",
-                        path.display()
-                    );
-                }
-                let snapshot: RequestStateSnapshot = serde_json::from_value(value)
-                    .with_context(|| format!("解析请求状态快照失败: {}", path.display()))?;
-                validate_snapshot(&snapshot)?;
-                snapshot
+        let snapshot = match Self::read_snapshot(&connection, &path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // 统一库里还有配置/歌单/排行榜/缓存元数据：不删库、不迁移，
+                // 备份当前库后只重建 request_state 表，保留其它数据。
+                log::warn!(
+                    "请求状态快照不可用，已备份并仅重建 request_state 表: path={} error={error}",
+                    path.display()
+                );
+                Self::backup_corrupt_request_state(&path);
+                Self::reset_request_state_table(&connection)?;
+                RequestStateSnapshot::default()
             }
-            None => RequestStateSnapshot::default(),
         };
         Ok(Arc::new(Mutex::new(Self {
             snapshot,
             connection,
         })))
+    }
+
+    /// 读取并校验单行快照。任何不一致（JSON 损坏、schemaVersion 不符、结构校验失败）
+    /// 都以 Err 返回，由调用方备份并只重建该表，而不是让整个应用起不来。
+    fn read_snapshot(connection: &rusqlite::Connection, path: &Path) -> Result<RequestStateSnapshot> {
+        let Some((stored_version, text)) = Self::read_snapshot_row(connection)? else {
+            return Ok(RequestStateSnapshot::default());
+        };
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("解析请求状态快照失败: {}", path.display()))?;
+        let schema_version = value
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64);
+        if schema_version != Some(u64::from(REQUEST_STATE_SCHEMA_VERSION)) {
+            return Err(UnsupportedRequestStateSchema {
+                actual: schema_version,
+                path: path.to_path_buf(),
+            }
+            .into());
+        }
+        if Some(stored_version) != schema_version {
+            bail!(
+                "请求状态数据库 schema_version 列与快照内容不一致: {}",
+                path.display()
+            );
+        }
+        let snapshot: RequestStateSnapshot = serde_json::from_value(value)
+            .with_context(|| format!("解析请求状态快照失败: {}", path.display()))?;
+        validate_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// 只重建 request_state 表，保留同库的配置/歌单/排行榜/缓存元数据。
+    fn reset_request_state_table(connection: &rusqlite::Connection) -> Result<()> {
+        connection.execute_batch(
+            "DROP TABLE IF EXISTS request_state;
+             CREATE TABLE request_state (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 schema_version INTEGER NOT NULL,
+                 snapshot TEXT NOT NULL
+             )",
+        )?;
+        Ok(())
+    }
+
+    /// 备份当前统一库到 `.corrupt-<unix-ms>`（best-effort，仅用于事后排查），不删除、不移动原库。
+    fn backup_corrupt_request_state(path: &Path) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let mut raw = path.as_os_str().to_owned();
+        raw.push(format!(".corrupt-{stamp}"));
+        let backup = PathBuf::from(raw);
+        match std::fs::copy(path, &backup) {
+            Ok(_) => log::warn!("已备份损坏的请求状态库: path={}", backup.display()),
+            Err(error) => log::warn!(
+                "备份损坏的请求状态库失败: path={} error={error}",
+                path.display()
+            ),
+        }
     }
 
     /// 设置连接参数：WAL、synchronous=NORMAL、foreign_keys=ON、busy_timeout=5000。
@@ -255,20 +303,18 @@ impl RequestStateStore {
                     .iter()
                     .any(|column| !EXPECTED_COLUMNS.contains(&column.as_str()))
             {
-                bail!(
-                    "请求状态数据库表结构不匹配，请删除 {} 后重启",
-                    path.display()
-                );
+                // 结构不匹配：只重建这一张表，保留同库其它数据。
+                log::warn!("request_state 表结构不匹配，仅重建该表: path={}", path.display());
+                connection.execute_batch("DROP TABLE request_state")?;
             }
-        } else {
-            connection.execute_batch(
-                "CREATE TABLE request_state (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    schema_version INTEGER NOT NULL,
-                    snapshot TEXT NOT NULL
-                )",
-            )?;
         }
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS request_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                snapshot TEXT NOT NULL
+            )",
+        )?;
         // 点歌事件表（排行榜数据源）：与快照同库；已有数据库在这里补建。
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS song_request_events (
@@ -1433,40 +1479,34 @@ mod tests {
     }
 
     #[test]
-    fn unified_request_state_rejects_unversioned_state_with_delete_hint() {
+    fn unified_request_state_recovers_from_unversioned_state() {
+        // 快照不可用时保留统一库（配置/歌单/榜单/缓存元数据），只重建 request_state。
         let state_path = temp_request_state_path("legacy-migration");
         let mut value = serde_json::to_value(RequestStateSnapshot::default()).unwrap();
         value.as_object_mut().unwrap().remove("schemaVersion");
         write_snapshot_blob(&state_path, &value);
 
-        let error =
-            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
-                .expect_err("unversioned state must not be migrated");
-
-        assert!(error.to_string().contains("schemaVersion"));
-        assert!(error.to_string().contains("请删除状态文件"));
-
+        let store = load_recovers_with_default(&state_path);
+        drop(store);
+        assert_corrupt_backup_exists(&state_path);
         remove_request_state_path(state_path);
     }
 
     #[test]
-    fn unified_request_state_rejects_v1_with_delete_hint() {
+    fn unified_request_state_recovers_from_v1() {
         let state_path = temp_request_state_path("v1-rejected");
         let mut value = serde_json::to_value(RequestStateSnapshot::default()).unwrap();
         value["schemaVersion"] = serde_json::json!(1);
         write_snapshot_blob(&state_path, &value);
 
-        let error =
-            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
-                .expect_err("v1 state must not be migrated");
-
-        assert!(error.to_string().contains("schemaVersion Some(1)"));
-        assert!(error.to_string().contains("请删除状态文件"));
+        let store = load_recovers_with_default(&state_path);
+        drop(store);
+        assert_corrupt_backup_exists(&state_path);
         remove_request_state_path(state_path);
     }
 
     #[test]
-    fn unified_request_state_rejects_a_stale_queue_id_allocator() {
+    fn unified_request_state_recovers_from_a_stale_queue_id_allocator() {
         let state_path = temp_request_state_path("stale-queue-id");
         let mut snapshot = RequestStateSnapshot::default();
         snapshot.queue.push(QueueItem {
@@ -1477,12 +1517,42 @@ mod tests {
         snapshot.next_queue_item_id = 1;
         write_snapshot_blob(&state_path, &serde_json::to_value(&snapshot).unwrap());
 
-        let error =
-            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
-                .expect_err("queue ids must be valid in schema v2");
-
-        assert!(error.to_string().contains("nextQueueItemId"));
+        let store = load_recovers_with_default(&state_path);
+        {
+            // 重置后队列为空，避免重复 id 继续被消费。
+            assert!(store.lock().unwrap().queue_snapshot().1.is_empty());
+        }
+        drop(store);
         remove_request_state_path(state_path);
+    }
+
+    /// 快照损坏/版本不符时必须恢复启动（默认状态）而不是返回 Err。
+    fn load_recovers_with_default(state_path: &Path) -> SharedRequestStateStore {
+        let store =
+            RequestStateStore::load(state_path.to_path_buf(), crate::test_support::test_state_store())
+                .expect("不可用的请求状态必须自动恢复，而不是让整个应用起不来");
+        assert_eq!(
+            store.lock().unwrap().playback_snapshot().state,
+            ConfirmedPlaybackState::Idle
+        );
+        store
+    }
+
+    /// 恢复时必须留下 `.corrupt-*` 备份（人工可查），且不移动原库。
+    fn assert_corrupt_backup_exists(state_path: &Path) {
+        let file_name = state_path
+            .file_name()
+            .expect("state path has file name")
+            .to_string_lossy()
+            .to_string();
+        let prefix = format!("{file_name}.corrupt-");
+        let parent = state_path.parent().expect("state path has parent");
+        let found = std::fs::read_dir(parent).unwrap().any(|entry| {
+            entry
+                .ok()
+                .is_some_and(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        });
+        assert!(found, "必须生成 {prefix}* 备份文件");
     }
 
     #[test]
@@ -1777,17 +1847,16 @@ mod tests {
     }
 
     #[test]
-    fn database_schema_mismatch_fails_loudly() {
-        // 表列结构不匹配：明确失败，不迁移。
+    fn database_schema_mismatch_rebuilds_request_state() {
+        // 表列结构不匹配：只重建 request_state 表，不删库、不迁库。
         let state_path = temp_request_state_path("schema-column-mismatch");
         let connection = rusqlite::Connection::open(&state_path).unwrap();
         connection
             .execute_batch("CREATE TABLE request_state (id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
-        let error =
-            RequestStateStore::load(state_path.clone(), crate::test_support::test_state_store())
-                .expect_err("表结构不匹配必须明确失败");
-        assert!(error.to_string().contains("表结构"));
+        drop(connection);
+        let store = load_recovers_with_default(&state_path);
+        drop(store);
         remove_request_state_path(state_path);
 
         // 统一数据库已存在缓存表时，应在同一文件中补建 request_state。
@@ -2275,6 +2344,21 @@ mod tests {
         let mut shm = state_path.as_os_str().to_os_string();
         shm.push("-shm");
         let _ = fs::remove_file(shm);
+        // 清理恢复流程留下的 `.corrupt-*` 备份。
+        let file_name = state_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let prefix = format!("{file_name}.corrupt-");
+        if let Some(parent) = state_path.parent()
+            && let Ok(entries) = fs::read_dir(parent)
+        {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     #[test]

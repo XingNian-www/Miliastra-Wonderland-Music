@@ -56,22 +56,11 @@ impl ApplicationRuntime {
             return Ok(());
         };
         log::info!("{reason}: 已结束个人歌单模式 (owner={owner})");
-        let items = self
+        // 原子清理自动项，避免与并发点歌入队产生索引错位而误删用户点歌。
+        self.business
             .business
-            .business
-            .playback_queue_snapshot()
+            .remove_playlist_auto_items()
             .map_err(anyhow::Error::from)?;
-        let indexes = items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| item.playlist_auto.then_some(index))
-            .collect::<Vec<_>>();
-        if !indexes.is_empty() {
-            self.business
-                .business
-                .remove_playback_queue_indexes(indexes)
-                .map_err(anyhow::Error::from)?;
-        }
         Ok(())
     }
 }

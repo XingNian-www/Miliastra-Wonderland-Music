@@ -441,9 +441,10 @@ impl PlaybackCore {
             return Ok(());
         }
         // 磁盘缓存优先：完整文件已落盘时直接注册本地代理音源。
-        if let Some(stream) = self.disk_complete_stream(&song_key, metadata).await {
+        if self.disk_complete_stream(&song_key, metadata).await.is_some() {
+            // 不把本地代理地址写入解析缓存：播放时它会经 route_stream 写回 entry.source，
+            // 形成「向自己请求」的死等。磁盘文件仍在，播放时会再次命中。
             tracing::debug!(key = %song_key, "磁盘缓存命中，跳过预加载解析");
-            self.cache_stream(song_key.clone(), stream);
             return Ok(());
         }
         let stream = self

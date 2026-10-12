@@ -717,6 +717,13 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             runtime.state,
             ConfirmedPlaybackState::RequestedSongPlaying | ConfirmedPlaybackState::PausedByUser
         ) {
+            // 崩溃/断电落在起播确认前会留下 Starting：既不能恢复，也不应阻塞
+            // monitor 的自动出队。视为过期并清除活动请求（保留队列项与 id 分配器）。
+            if matches!(runtime.state, ConfirmedPlaybackState::Starting) {
+                log::warn!("清理崩溃残留的播放 Starting 状态，保留队列等待重播");
+                self.playback_state
+                    .update(PlaybackStateUpdate::ClearActiveRequest)?;
+            }
             return Ok(false);
         }
         let Some(active_track) = active.track.as_ref() else {
@@ -798,6 +805,26 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .playback_operation_lease
             .lock()
             .map_err(|_| anyhow!("播放操作 lease 锁已损坏"))?;
+        self.maybe_advance_queue_with_observation_policy(snapshot_status, context, false)
+    }
+
+    /// 监控循环专用的非阻塞版本：拿不到 lease 就跳过本轮，下一 tick 再试，
+    /// 避免源解析（可能跨网络）把观察循环卡住。直接调用方仍用阻塞版。
+    pub(crate) fn try_maybe_advance_queue(
+        &self,
+        snapshot_status: PlayerStatus,
+        context: QueueAdvanceContext,
+    ) -> Result<QueueAdvanceDecision> {
+        let _lease = match self.playback_operation_lease.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                log::debug!("播放操作进行中，跳过本轮自动出队检查");
+                return Ok(QueueAdvanceDecision::None);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                anyhow::bail!("播放操作 lease 锁已损坏");
+            }
+        };
         self.maybe_advance_queue_with_observation_policy(snapshot_status, context, false)
     }
 

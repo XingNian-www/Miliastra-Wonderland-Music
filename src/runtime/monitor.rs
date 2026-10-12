@@ -75,6 +75,7 @@ pub(crate) struct MonitorOperationalState {
     pub(crate) commands_enabled: bool,
     pub(crate) idle_exit_remaining_seconds: Option<u64>,
     pub(crate) hall_remaining_minutes: Option<u32>,
+    pub(crate) hall_remaining_updated_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -167,7 +168,10 @@ pub(crate) enum MonitorEvent {
     Command(String),
     Status(String),
     PlaybackController(MonitorPlaybackController),
-    ChatListener { mode: String, pending_mode: String },
+    ChatListener {
+        mode: String,
+        pending_mode: String,
+    },
     ScannerPaused(bool),
     BusinessOperational(BusinessOperationalSnapshot),
     UiState(String),
@@ -176,7 +180,10 @@ pub(crate) enum MonitorEvent {
     Decision(Option<DecisionSnapshot>),
     TurtleSoup(TurtleSoupSnapshot),
     Undercover(UndercoverSnapshot),
-    HallRemainingMinutes(Option<u32>),
+    HallRemainingMinutes {
+        minutes: Option<u32>,
+        updated_at: Option<u64>,
+    },
 }
 
 enum MonitorMessage {
@@ -281,8 +288,12 @@ impl MonitorProjection {
             MonitorEvent::Decision(decision) => state.decision = decision,
             MonitorEvent::TurtleSoup(snapshot) => state.turtle_soup = snapshot,
             MonitorEvent::Undercover(snapshot) => state.undercover = snapshot,
-            MonitorEvent::HallRemainingMinutes(minutes) => {
+            MonitorEvent::HallRemainingMinutes {
+                minutes,
+                updated_at,
+            } => {
                 state.operational.hall_remaining_minutes = minutes;
+                state.operational.hall_remaining_updated_at = updated_at;
             }
         }
     }
@@ -478,12 +489,17 @@ impl BusinessStateSink for MonitorShared {
         ));
     }
 
-    fn publish_hall_remaining_minutes(&self, minutes: Option<u32>) {
+    fn publish_hall_remaining_minutes(&self, minutes: Option<u32>, updated_at: Option<u64>) {
         // monitor 是所有可观测状态的唯一汇聚点：在这里发布事件，就不必在应用各处撒钩子。
         // 依赖是"数据"级的——只发 JSON 载荷，不把应用类型塞进事件通道。
-        crate::debug_events::bus()
-            .publish("hall.remaining", serde_json::json!({"minutes": minutes}));
-        self.publish_async(MonitorEvent::HallRemainingMinutes(minutes));
+        crate::debug_events::bus().publish(
+            "hall.remaining",
+            serde_json::json!({"minutes": minutes, "updatedAt": updated_at}),
+        );
+        self.publish_async(MonitorEvent::HallRemainingMinutes {
+            minutes,
+            updated_at,
+        });
     }
 
     fn publish_chat_listener(&self, snapshot: crate::runtime::chat_listener::ChatListenerSnapshot) {
@@ -675,7 +691,7 @@ mod tests {
             &monitor,
             BusinessOperationalSnapshot::new(false, Some(12)),
         );
-        BusinessStateSink::publish_hall_remaining_minutes(&monitor, Some(8));
+        BusinessStateSink::publish_hall_remaining_minutes(&monitor, Some(8), Some(1_700_000_000));
         monitor.publish(MonitorEvent::UiState("secondary:chat".to_string()));
         monitor.publish(MonitorEvent::TurtleSoup(TurtleSoupSnapshot {
             enabled: true,
@@ -696,6 +712,10 @@ mod tests {
         assert!(!snapshot.operational.commands_enabled);
         assert_eq!(snapshot.operational.idle_exit_remaining_seconds, Some(12));
         assert_eq!(snapshot.operational.hall_remaining_minutes, Some(8));
+        assert_eq!(
+            snapshot.operational.hall_remaining_updated_at,
+            Some(1_700_000_000)
+        );
         assert_eq!(snapshot.operational.ui_state, "secondary:chat");
         assert!(snapshot.turtle_soup.enabled);
         assert!(snapshot.undercover.enabled);
@@ -711,10 +731,14 @@ mod tests {
             BusinessOperationalSnapshot::new(false, Some(12)),
         );
 
-        BusinessStateSink::publish_hall_remaining_minutes(&monitor, Some(9));
+        BusinessStateSink::publish_hall_remaining_minutes(&monitor, Some(9), Some(1_700_000_001));
         let snapshot = monitor.snapshot();
 
         assert_eq!(snapshot.operational.hall_remaining_minutes, Some(9));
+        assert_eq!(
+            snapshot.operational.hall_remaining_updated_at,
+            Some(1_700_000_001)
+        );
         assert!(snapshot.operational.scanner_paused);
         assert!(!snapshot.operational.commands_enabled);
         assert_eq!(snapshot.operational.idle_exit_remaining_seconds, Some(12));

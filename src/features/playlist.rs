@@ -5,6 +5,7 @@
 //! 采集阶段不在歌单内部去重；数据库层用 \`(owner, track_key)\` 主键去重，重复导入/收藏不会产生重复行。
 use super::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
 use crate::features::chat_text::compact_command;
+use crate::features::playback::PersonalPlaylistStart;
 use crate::text::char_width;
 use anyhow::{Result, anyhow};
 use miliastra_playback::{PlayableTrack, PlaylistImportOperation};
@@ -165,7 +166,11 @@ pub(crate) trait PlaylistPlaybackPort {
     fn enqueue_next(&mut self, _track: &PlayableTrack) -> Result<bool> {
         anyhow::bail!("播放队列不可用")
     }
-    fn start_playlist(&mut self, _tracks: Vec<PlayableTrack>) -> Result<usize> {
+    fn start_playlist(
+        &mut self,
+        _owner: &str,
+        _tracks: Vec<PlayableTrack>,
+    ) -> Result<PersonalPlaylistStart> {
         anyhow::bail!("个人歌单播放模式不可用")
     }
     fn stop_playlist(&mut self) -> Result<bool> {
@@ -813,11 +818,15 @@ impl PlaylistApplication {
                     return Ok(vec!["收藏夹为空,先收藏或导入一些歌曲.".into()]);
                 }
                 let tracks = self.pick_many(owner, &[], total, seed_from(now_epoch, owner))?;
-                let queued = playback.start_playlist(tracks)?;
-                Ok(vec![format!(
-                    "已进入歌单模式,{}首收藏已按随机顺序加入自动队列.",
-                    queued
-                )])
+                match playback.start_playlist(owner, tracks)? {
+                    PersonalPlaylistStart::Started(queued) => Ok(vec![format!(
+                        "已进入歌单模式,{}首收藏已按随机顺序加入自动队列.",
+                        queued
+                    )]),
+                    PersonalPlaylistStart::AlreadyActive { owner: current } => Ok(vec![format!(
+                        "当前为{current}的歌单;如需切换请先发@大厅模式再发@歌单模式"
+                    )]),
+                }
             }
             PlaylistCommand::HallMode | PlaylistCommand::StopPlaylist => {
                 if playback.stop_playlist()? {
@@ -1047,7 +1056,11 @@ mod tests {
             self.played.push(format!("queued:{}", track.track_ref.key));
             Ok(true)
         }
-        fn start_playlist(&mut self, tracks: Vec<PlayableTrack>) -> Result<usize> {
+        fn start_playlist(
+            &mut self,
+            _owner: &str,
+            tracks: Vec<PlayableTrack>,
+        ) -> Result<PersonalPlaylistStart> {
             let order = tracks
                 .iter()
                 .map(|track| track.track_ref.key.id.as_str())
@@ -1055,7 +1068,7 @@ mod tests {
                 .join(",");
             self.played
                 .push(format!("playlist:{}:{order}", tracks.len()));
-            Ok(tracks.len())
+            Ok(PersonalPlaylistStart::Started(tracks.len()))
         }
         fn stop_playlist(&mut self) -> Result<bool> {
             self.played.push("playlist:stopped".to_owned());
@@ -1445,6 +1458,53 @@ mod tests {
         assert_ne!(queued, expected);
         play(&app, "甲", &PlaylistCommand::StopPlaylist, &mut port);
         assert_eq!(port.played[1], "playlist:stopped");
+    }
+
+    /// 仅验证「已在歌单模式」分支的文案映射；真实幂等由 PlaybackApplication 保证。
+    struct AlreadyActivePlayback;
+
+    impl PlaylistPlaybackPort for AlreadyActivePlayback {
+        fn current_track(&self) -> Option<PlayableTrack> {
+            None
+        }
+        fn play(&mut self, _: &PlayableTrack) -> Result<()> {
+            anyhow::bail!("unused")
+        }
+        fn import_playlist(&mut self, _: &str, _: &str) -> Result<PlaylistImportOperation> {
+            anyhow::bail!("unused")
+        }
+        fn start_playlist(
+            &mut self,
+            _owner: &str,
+            _tracks: Vec<PlayableTrack>,
+        ) -> Result<PersonalPlaylistStart> {
+            Ok(PersonalPlaylistStart::AlreadyActive {
+                owner: "甲".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn playlist_mode_command_reports_the_current_owner_when_already_active() {
+        let app = app();
+        let tracks = (0..4)
+            .map(|index| track(&format!("t{index}")))
+            .collect::<Vec<_>>();
+        app.add_many("乙", &tracks, 1).unwrap();
+        let mut port = AlreadyActivePlayback;
+        let replies = app
+            .execute(
+                "乙",
+                &PlaylistCommand::PlayPlaylist,
+                &mut port,
+                Instant::now(),
+                1_700_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            replies,
+            vec!["当前为甲的歌单;如需切换请先发@大厅模式再发@歌单模式".to_string()]
+        );
     }
 
     #[test]

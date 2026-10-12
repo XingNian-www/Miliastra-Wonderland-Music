@@ -66,7 +66,8 @@ pub(crate) use controller::{
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
-    PlaybackSnapshot, estimated_player_status, format_lyrics, format_status, is_playing,
+    PlaybackSnapshot, estimated_player_status, format_lyrics, format_status, format_status_with_mode,
+    is_playing,
 };
 use miliastra_kernel::clock::WallClock;
 pub(crate) use queue::{PersistentQueue, QueueItem};
@@ -294,6 +295,15 @@ pub(crate) enum PlaybackCommand {
 pub(crate) enum BackgroundLyricsScope {
     AllSongs,
     CurrentSong,
+}
+
+/// 进入个人歌单模式的结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PersonalPlaylistStart {
+    /// 已进入；附带实际加入自动队列的曲目数。
+    Started(usize),
+    /// 已经在歌单模式中；附带当前歌单归属的昵称。
+    AlreadyActive { owner: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

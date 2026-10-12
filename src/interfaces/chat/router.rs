@@ -9,6 +9,9 @@ use crate::features::entertainment::EntertainmentKind;
 use crate::features::hall::HallCommand;
 use crate::features::identity::{IdentityAccess, IdentityRole};
 use crate::features::idiom_chain::IdiomChainCommand;
+// 仅测试引用；release 构建若直接导入会成为未使用导入。
+#[cfg(test)]
+use crate::features::idiom_chain::IdiomChainMode;
 use crate::features::invite::InviteCommand;
 use crate::features::moderation::ModerationCommand;
 use crate::features::playback::PlaybackCommand;

@@ -523,6 +523,8 @@ fn parse_lyrics_duration(argument: &str) -> Option<u16> {
 pub(crate) struct QueuePushOutcome {
     pub(crate) accepted: bool,
     pub(crate) size: usize,
+    /// 因队列中已有同一首歌而拒绝（区别于容量已满）。
+    pub(crate) duplicate: bool,
 }
 
 pub(crate) enum PlaybackMutationIntent {
@@ -775,18 +777,23 @@ impl PlaybackService {
     }
 
     pub(crate) fn push_queue(&mut self, item: QueueItem) -> Result<QueuePushOutcome> {
-        let accepted = self.queue.push(item)?;
+        // 判重与入队在同一 actor 消息内完成，闭合「先查后写」的并发窗口。
+        let duplicate = !item.playlist_auto && self.queue.contains_duplicate(&item);
+        let accepted = if duplicate { false } else { self.queue.push(item)? };
         Ok(QueuePushOutcome {
             accepted,
             size: self.queue.len(),
+            duplicate,
         })
     }
 
     pub(crate) fn push_queue_next(&mut self, item: QueueItem) -> Result<QueuePushOutcome> {
-        let accepted = self.queue.push_next(item)?;
+        let duplicate = !item.playlist_auto && self.queue.contains_duplicate(&item);
+        let accepted = if duplicate { false } else { self.queue.push_next(item)? };
         Ok(QueuePushOutcome {
             accepted,
             size: self.queue.len(),
+            duplicate,
         })
     }
 
@@ -835,6 +842,11 @@ impl PlaybackService {
 
     pub(crate) fn clear_queue(&mut self) -> Result<usize> {
         self.queue.clear()
+    }
+
+    /// 原子移除全部 `playlist_auto` 项（同一队列锁内 retain + 落盘）。
+    pub(crate) fn remove_playlist_auto_items(&mut self) -> Result<usize> {
+        self.queue.remove_playlist_auto_items()
     }
 
     pub(crate) fn playback_pool_snapshot(&self) -> Result<Vec<PlayableTrack>> {

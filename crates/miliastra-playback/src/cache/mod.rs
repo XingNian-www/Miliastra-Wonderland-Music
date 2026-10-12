@@ -24,6 +24,24 @@ use crate::model::TrackMetadata;
 /// 代理 URL 的路径前缀。
 pub(crate) const PROXY_PATH_PREFIX: &str = "/audio/";
 
+/// 本地代理地址（`http://127.0.0.1:<port>/audio/<hash>`）。把它写回 `entry.source`
+/// 会让缓存条目指向代理自己：磁盘文件缺失时向自身发 GET，互等到超时。
+fn is_local_proxy_url(url: &str) -> bool {
+    url.contains(PROXY_PATH_PREFIX)
+        && (url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]"))
+}
+
+/// 条目没有真实上游源时的不可达占位地址，保证不会被当作可下载源。
+fn unreachable_placeholder_source() -> StreamSource {
+    StreamSource {
+        url: "http://127.0.0.1:1/unreachable.mp3"
+            .parse()
+            .expect("placeholder url is well-formed"),
+        headers: Default::default(),
+        expires_at_epoch_ms: None,
+    }
+}
+
 /// 默认磁盘缓存上限（20 GiB）。
 pub const DEFAULT_MAX_CACHE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
@@ -396,11 +414,18 @@ impl AudioCache {
             entries
                 .entry(hash.clone())
                 .and_modify(|entry| {
-                    entry.source = stream.clone();
+                    // 不把本地代理地址写回 source：否则条目自指，磁盘文件缺失时死等。
+                    if !is_local_proxy_url(stream.url.as_str()) {
+                        entry.source = stream.clone();
+                    }
                     entry.last_used = Instant::now();
                 })
                 .or_insert_with(|| Entry {
-                    source: stream.clone(),
+                    source: if is_local_proxy_url(stream.url.as_str()) {
+                        unreachable_placeholder_source()
+                    } else {
+                        stream.clone()
+                    },
                     file,
                     state: EntryState::Idle,
                     last_used: Instant::now(),
@@ -450,13 +475,7 @@ impl AudioCache {
                 })
                 .or_insert_with(|| Entry {
                     // 占位源地址：完整文件存在时代理直接服务磁盘，不会发起下载。
-                    source: StreamSource {
-                        url: "http://127.0.0.1:1/unreachable.mp3"
-                            .parse()
-                            .expect("placeholder url is well-formed"),
-                        headers: Default::default(),
-                        expires_at_epoch_ms: None,
-                    },
+                    source: unreachable_placeholder_source(),
                     file: inner.config.directory.join(cache_file_name(&hash, false)),
                     state: EntryState::Complete { bytes },
                     last_used: Instant::now(),
@@ -823,6 +842,8 @@ async fn trim_cache(inner: Arc<CacheInner>, max_bytes: u64) {
     for (hash, entry) in entries.iter_mut() {
         if removed.contains(hash) && matches!(entry.state, EntryState::Complete { .. }) {
             entry.state = EntryState::Idle;
+            // 完整文件已被淘汰：恢复不可达占位源，避免条目仍指向本地代理而形成自指。
+            entry.source = unreachable_placeholder_source();
             entry.file = inner.config.directory.join(cache_file_name(hash, false));
         }
     }

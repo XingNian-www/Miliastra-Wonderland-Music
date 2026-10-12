@@ -1371,6 +1371,7 @@ impl HttpTaskPort for RecordingHttpPort {
                     crate::features::playback::QueuePushOutcome {
                         accepted: true,
                         size: state.queue.len(),
+                        duplicate: false,
                     },
                 ))
             }

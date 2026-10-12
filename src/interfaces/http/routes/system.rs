@@ -267,6 +267,14 @@ pub(super) fn tool_panel_benchmark_route(
     enqueue_web_tool(state, WebToolRequest::PanelResponseBenchmark { rounds })
 }
 
+pub(super) fn tool_capture_api_benchmark_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let rounds = parse_bounded_u32(query_value(query, "rounds"), "rounds", 1, 5, 3)?;
+    enqueue_web_tool(state, WebToolRequest::CaptureApiBenchmark { rounds })
+}
+
 pub(super) fn tool_ocr_backends_route(
     _query: &[(String, String)],
     state: &HttpSharedState,

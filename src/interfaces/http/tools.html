@@ -246,6 +246,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
       <div class="head"><h2>诊断</h2></div>
       <div class="body">
         <button class="btn stretch" onclick="run('/tools/ocr-backends')">OCR 后端探测</button>
+        <div class="row"><input id="captureRounds" value="3" inputmode="numeric" placeholder="截图 API 轮数"><button class="btn warn" onclick="captureBenchmark()">截图性能</button></div>
         <div class="row"><input id="changeSamples" value="10" inputmode="numeric" placeholder="变化采样次数"><button class="btn" onclick="sampleChatChanges()">聊天变化</button></div>
         <div class="row"><input id="benchmarkRounds" value="3" inputmode="numeric" placeholder="面板基准轮数"><button class="btn warn" onclick="panelBenchmark()">面板基准</button></div>
         <div class="row"><input id="aiKeyword" placeholder="AI 候选诊断关键词"><button class="btn" onclick="aiPreview()">诊断</button></div>
@@ -359,6 +360,7 @@ function sendKey(){const key=val('key');if(!key){setResult('错误: 请输入要
 function aiPreview(){const keyword=val('aiKeyword');if(!keyword){setResult('错误: 请输入 AI 候选诊断关键词');return}run('/tools/ai-preview',{keyword,preferAccompaniment:$('aiAccompaniment').checked?'1':''})}
 function sampleChatChanges(){run('/tools/chat-change-samples',{samples:val('changeSamples')})}
 function panelBenchmark(){run('/tools/panel-benchmark',{rounds:val('benchmarkRounds')})}
+function captureBenchmark(){run('/tools/capture-benchmark',{rounds:val('captureRounds')})}
 async function openScreenshot(){
   if(busy)return
   const preview=window.open('about:blank','_blank')

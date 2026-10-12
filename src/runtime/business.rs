@@ -706,6 +706,7 @@ enum UndercoverRuntimeMessage {
     Abort(SyncSender<Result<bool, BusinessRuntimeError>>),
 }
 
+#[allow(dead_code)]
 enum TurtleSoupRuntimeMessage {
     HallCommand {
         player: String,
@@ -1882,6 +1883,7 @@ impl BusinessRuntimeHandle {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn stabilize_turtle_soup_secondary(
         &self,
         observations: Vec<SecondaryOcrObservation>,
@@ -1894,6 +1896,7 @@ impl BusinessRuntimeHandle {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn clear_turtle_soup_secondary_stability(&self) -> Result<(), BusinessRuntimeError> {
         self.send_request(RuntimeMessage::TurtleSoup(
             TurtleSoupRuntimeMessage::ClearSecondary,

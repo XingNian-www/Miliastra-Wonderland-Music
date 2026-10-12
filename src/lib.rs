@@ -2,16 +2,26 @@ mod adapters;
 #[cfg(target_os = "windows")]
 mod composition;
 mod config;
+#[allow(dead_code)]
 mod debug_events;
+#[allow(dead_code)]
 mod debug_http_service;
+#[allow(dead_code)]
 mod debug_mode;
+#[allow(dead_code)]
 mod debug_plugin_dispatch;
+#[allow(dead_code)]
 mod debug_plugin_process;
+#[allow(dead_code)]
 mod debug_plugin_session;
+#[allow(dead_code)]
 mod debug_plugin_stdio;
+#[allow(dead_code)]
 mod debug_read_only;
+#[allow(dead_code)]
 mod debug_sandbox;
 mod debug_sandbox_journal;
+#[allow(dead_code)]
 mod debug_sandbox_runner;
 mod debug_sandbox_store;
 mod features;

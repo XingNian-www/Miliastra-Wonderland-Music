@@ -41,6 +41,7 @@ pub(crate) struct ResolvedUiTemplateArgs {
     pub(crate) main_menu_template: PathBuf,
     /// 千星大厅底栏 👥 O 图标组模板。
     /// 聊天标记判据必须同时命中它——提瓦特的世界聊天也有蓝/黄/粉气泡（第 46 节缺陷）。
+    #[allow(dead_code)]
     pub(crate) hall_bar_template: PathBuf,
     pub(crate) world_wish_template: PathBuf,
     pub(crate) chat_templates: ResolvedTemplateArgs,

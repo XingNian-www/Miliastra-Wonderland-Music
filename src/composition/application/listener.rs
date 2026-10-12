@@ -200,6 +200,29 @@ fn take_ui_state_transition(kind: Option<UiStateKind>) -> bool {
     true
 }
 
+/// 监控页"界面"状态的中文显示名。
+///
+/// 只按"当前是什么界面"给结论，不在界面状态里复述命中了什么颜色/哪个模板
+/// （这些判据保留在 /debug/ui-state 与 ui.state 事件的证据字段里，供排障核对）。
+/// 入参是分类标签（如 `primary:marker blue=1 yellow=0 pink=0`、`panel:friend_list`、
+/// `transition:overworld 1/2`），只取冒号前的状态族做映射。
+fn ui_state_display_label(label: &str) -> String {
+    let family = label.split(':').next().unwrap_or(label);
+    let name = match family {
+        "primary" => "一级大厅",
+        "secondary" => "二级界面",
+        "main_menu" => "千星主菜单",
+        "game_gate" => "大门界面",
+        "overworld" => "主世界",
+        "loading" => "加载界面",
+        "panel" => "模态面板",
+        "unknown" => "未知界面",
+        "transition" => "界面切换中",
+        _ => return label.to_string(),
+    };
+    name.to_string()
+}
+
 /// 事件载荷的文本上限：事件是给控制器看的通知，不是完整日志，
 /// 超长文本会把 256 条的重放缓冲挤满，让真正重要的事件被淘汰。
 const MAX_EVENT_TEXT_CHARS: usize = 512;
@@ -1076,11 +1099,7 @@ impl ApplicationRuntime {
                                 );
                             }
                             self.lifecycle.monitor.publish(MonitorEvent::UiState(
-                                match ui_state.as_str() {
-                                    "game_gate" => "大门界面".to_string(),
-                                    "overworld" => "主世界".to_string(),
-                                    _ => ui_state.clone(),
-                                },
+                                ui_state_display_label(ui_state.as_str()),
                             ))
                         }
                         Err(_) => self
@@ -2292,6 +2311,56 @@ impl ApplicationRuntime {
 
 #[cfg(test)]
 mod tests {
+    /// 监控页"界面"只显示中文界面名，不复述命中的颜色/模板判据；
+    /// 判据细节仍保留在 /debug/ui-state 与 ui.state 事件证据里。
+    #[test]
+    fn ui_state_display_label_maps_state_families_without_probe_details() {
+        assert_eq!(
+            super::ui_state_display_label("primary:marker blue=1 yellow=0 pink=0"),
+            "一级大厅"
+        );
+        assert_eq!(super::ui_state_display_label("primary:friend"), "一级大厅");
+        assert_eq!(super::ui_state_display_label("secondary:chat"), "二级界面");
+        assert_eq!(
+            super::ui_state_display_label("secondary:qianxing_map"),
+            "二级界面"
+        );
+        assert_eq!(
+            super::ui_state_display_label("secondary:qianxing_panel"),
+            "二级界面"
+        );
+        assert_eq!(super::ui_state_display_label("main_menu"), "千星主菜单");
+        assert_eq!(super::ui_state_display_label("game_gate"), "大门界面");
+        assert_eq!(super::ui_state_display_label("overworld"), "主世界");
+        assert_eq!(
+            super::ui_state_display_label("overworld:world_criterion"),
+            "主世界"
+        );
+        assert_eq!(super::ui_state_display_label("loading"), "加载界面");
+        assert_eq!(
+            super::ui_state_display_label("panel:friend_list"),
+            "模态面板"
+        );
+        assert_eq!(super::ui_state_display_label("unknown"), "未知界面");
+        assert_eq!(
+            super::ui_state_display_label("unknown:game_probe"),
+            "未知界面"
+        );
+        assert_eq!(
+            super::ui_state_display_label("transition:overworld 1/2"),
+            "界面切换中"
+        );
+        assert_eq!(
+            super::ui_state_display_label("transition:unknown"),
+            "界面切换中"
+        );
+        // 未识别的新标签原样透出，不静默吞掉。
+        assert_eq!(
+            super::ui_state_display_label("something_new"),
+            "something_new"
+        );
+    }
+
     /// 界面状态迁移只在**稳定类型**变化时推送。
     /// 标签里还带着聊天标记计数，而计数每帧都在变——跟着它推等于自造轮询。
     #[test]

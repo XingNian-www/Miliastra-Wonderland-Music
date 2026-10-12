@@ -56,6 +56,7 @@ fn scan_frame_is_fresh(captured_at: Instant, not_before: Option<Instant>) -> boo
     not_before.is_none_or(|boundary| captured_at >= boundary)
 }
 
+#[allow(dead_code)]
 fn primary_rescan_can_publish(stable_kind: Option<UiStateKind>) -> bool {
     stable_kind == Some(UiStateKind::Primary)
 }
@@ -883,6 +884,8 @@ impl ApplicationRuntime {
         }
     }
 
+    // 共享 OCR 重构后，这些扫描状态只写不读；保留 `allow` 以消除噪音，待确认无后续用途再删。
+    #[allow(unused_variables, unused_mut, unused_assignments)]
     fn run_scan_loop_inner(
         &mut self,
         completion_subscriber: &mut CompletionAdvanceSubscriber,

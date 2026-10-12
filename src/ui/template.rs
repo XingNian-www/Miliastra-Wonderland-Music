@@ -50,6 +50,7 @@ struct GrayTemplate {
     /// 预计算的最大全不透明矩形，用于 SEA 下界剪枝。
     opaque: Option<OpaqueRect>,
     /// 灰度标准差，用于识别缺乏区分度的纯色模板。
+    #[allow(dead_code)]
     gray_stddev: f32,
 }
 

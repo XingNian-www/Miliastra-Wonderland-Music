@@ -15,7 +15,7 @@ use super::{
     BackgroundLyricsScope, PlaybackCommand, PlaybackNavigation, PlaybackOutcome, PlaybackRequest,
     PlaybackSnapshot, PlaybackVerification, PlayerStatus, QueueAdvanceContext,
     PersonalPlaylistStart, QueueAdvanceDecision, QueueItem, QueueRemoval,
-    estimated_player_status, format_lyrics, format_status, format_status_with_mode,
+    estimated_player_status, format_lyrics, format_status_with_mode,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

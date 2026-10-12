@@ -248,7 +248,7 @@ impl ApplicationRuntime {
         if messages_complete {
             if !outcome.is_complete() {
                 log::error!(
-                    "好友消息已全部发送，但监听驻留恢复失败: {:?}",
+                    "好友消息已全部发送，但值守驻留恢复失败: {:?}",
                     outcome.residency()
                 );
                 return Ok(FriendBatchOutcome::Failed {
@@ -256,7 +256,7 @@ impl ApplicationRuntime {
                     failure: FriendBatchFailure::new(
                         FriendBatchFailureKind::ResultUnknown,
                         format!(
-                            "好友消息已发送，但监听驻留恢复失败: {:?}",
+                            "好友消息已发送，但值守驻留恢复失败: {:?}",
                             outcome.residency()
                         ),
                     ),
@@ -482,7 +482,7 @@ impl InviteExecutionPort for ApplicationRuntime {
                         });
                     }
                 } else {
-                    log::error!("邀请已经进入目标大厅，但未能确认最终监听驻留界面");
+                    log::error!("邀请已经进入目标大厅，但未能确认最终值守驻留界面");
                 }
                 Ok(BusinessInviteUiOutcome::new(
                     true,

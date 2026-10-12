@@ -1001,7 +1001,7 @@ impl PendingTask {
         match self {
             PendingTask::SetChatListenerMode { target } => {
                 if let Err(error) = business.cancel_chat_listener_mode_request(*target) {
-                    log::error!("取消监听模式切换失败: {error}");
+                    log::error!("取消值守模式切换失败: {error}");
                 }
             }
             PendingTask::SecondaryUnread { .. } | PendingTask::RestoreSecondaryHall => {
@@ -1044,12 +1044,12 @@ impl PendingTask {
             }
             Self::SecondaryUnread { discard_only, .. } => {
                 if *discard_only {
-                    "二级监听初始未读清场".to_string()
+                    "二级值守初始未读清场".to_string()
                 } else {
-                    "二级监听好友未读".to_string()
+                    "二级值守好友未读".to_string()
                 }
             }
-            Self::RestoreSecondaryHall => "二级监听恢复当前大厅".to_string(),
+            Self::RestoreSecondaryHall => "二级值守恢复当前大厅".to_string(),
             Self::TurtleSoupQuestion { .. } => "海龟汤提问".to_string(),
             Self::CardGameEffect(effect) => effect.label(),
             Self::UndercoverEffect(effect) => effect.label(),
@@ -1119,7 +1119,7 @@ enum ResidencyPurpose {
 impl ResidencyPurpose {
     const fn label(self) -> &'static str {
         match self {
-            Self::ListenerModeSwitch => "切换聊天监听模式",
+            Self::ListenerModeSwitch => "切换聊天值守模式",
             Self::IndependentRecovery(context) => context,
         }
     }
@@ -1241,7 +1241,7 @@ impl TemporaryPrimaryHold {
     fn release(&mut self) {
         if self.active {
             if let Err(error) = self.business.end_chat_listener_temporary_primary() {
-                log::error!("释放临时一级监听保留失败: {error}");
+                log::error!("释放临时一级值守保留失败: {error}");
             }
             self.active = false;
         }
@@ -1530,8 +1530,8 @@ impl ApplicationRuntime {
                 business.complete_chat_listener_mode(mode)?;
                 log::info!("已恢复持久化的{}", mode.label());
             }
-            Ok(None) => log::info!("无持久化聊天监听模式，使用默认一级监听"),
-            Err(error) => log::warn!("加载聊天监听模式失败，使用默认一级监听: {error:#}"),
+            Ok(None) => log::info!("无持久化聊天值守模式，使用默认一级值守"),
+            Err(error) => log::warn!("加载聊天值守模式失败，使用默认一级值守: {error:#}"),
         }
         let card_games = CardGameApplication::new(Arc::new(business.clone()));
         let undercover_game = UndercoverApplication::new(Arc::new(business.clone()));

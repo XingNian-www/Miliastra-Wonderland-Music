@@ -1395,7 +1395,7 @@ where
     }
 }
 
-/// 主动读取/触发只读流程共用的执行边界，不改变全局调试模式或业务监听。
+/// 主动读取/触发只读流程共用的执行边界，不改变全局调试模式或业务值守。
 /// 刻意只持有读队列接口：无法接入业务 canceller/controller 或任何写 adapter。
 pub(crate) struct ReadOnlyExecutor {
     handle: UiRuntimeHandle,

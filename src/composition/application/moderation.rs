@@ -285,7 +285,7 @@ impl ModerationCommandPort for ApplicationRuntime {
             self.establish_ui_residency(UiResidency::Primary, ResidencyPurpose::ListenerModeSwitch)
         {
             hold.release();
-            return Err(error).context("管理投票无法建立临时一级监听驻留");
+            return Err(error).context("管理投票无法建立临时一级值守驻留");
         }
         Ok(Box::new(hold))
     }
@@ -355,7 +355,7 @@ fn moderation_action_result(
     }
 }
 
-// requester 是展示字段（监听器会替换为备注），不能作为授权主体；
+// requester 是展示字段（值守器会替换为备注），不能作为授权主体；
 // 也不信任排队时的 role 快照，执行时重新查询精确的发送者身份。
 fn moderation_requester_role(
     identity: &IdentityAccess,

@@ -185,6 +185,8 @@ impl ApplicationRuntime {
                 // 消费成功即确认 business：独占窗口回放时主链路不再把它当成新增追加，
                 // 避免对已被决策读者正常消费的命令误报“未执行”。
                 self.ui.chat_timeline.acknowledge_business(&message_id)?;
+                // 聊天侧已作出决定：立即关闭 Web 决策，后续 submit 直接失败而不是假成功。
+                web_decision.close();
                 match decision {
                     SongRequestDecision::Confirm => return Ok(SongRequestDecision::Confirm),
                     SongRequestDecision::Skip => return Ok(SongRequestDecision::Skip),
@@ -291,18 +293,11 @@ impl PlaybackExecutionPort for ApplicationRuntime {
     }
 
     fn remove_playlist_auto_items(&mut self) -> Result<()> {
-        let indexes = self
-            .playback_queue()?
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| item.playlist_auto.then_some(index))
-            .collect::<Vec<_>>();
-        if !indexes.is_empty() {
-            self.business
-                .business
-                .remove_playback_queue_indexes(indexes)
-                .map_err(anyhow::Error::from)?;
-        }
+        // 走队列内原子 retain + 落盘，避免「取快照索引 -> 按索引删」之间的并发插入错位。
+        self.business
+            .business
+            .remove_playlist_auto_items()
+            .map_err(anyhow::Error::from)?;
         Ok(())
     }
 

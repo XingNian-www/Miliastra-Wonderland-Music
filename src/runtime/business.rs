@@ -501,6 +501,7 @@ enum PlaybackRuntimeMessage {
         response: SyncSender<Result<Vec<(usize, QueueItem)>, BusinessRuntimeError>>,
     },
     ClearQueue(SyncSender<Result<usize, BusinessRuntimeError>>),
+    RemovePlaylistAutoItems(SyncSender<Result<usize, BusinessRuntimeError>>),
     QueueContains {
         item: QueueItem,
         response: SyncSender<Result<bool, BusinessRuntimeError>>,
@@ -800,6 +801,14 @@ impl DecisionSession {
         match self.receiver.recv_timeout(timeout) {
             Ok(action) => Ok(Some(action)),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Ok(None),
+        }
+    }
+
+    /// 主动关闭 Web 决策：聊天侧已经做出决定时立即失效，
+    /// 避免并发 submit 在窗口退出前抢到「假成功」。
+    pub(crate) fn close(&self) {
+        if let Err(error) = self.handle.finish_decision(self.id) {
+            log::debug!("关闭 Web 决策失败: {error}");
         }
     }
 }
@@ -1241,6 +1250,12 @@ impl BusinessRuntimeHandle {
     pub(crate) fn clear_playback_queue(&self) -> Result<usize, BusinessRuntimeError> {
         self.request(|response| {
             RuntimeMessage::Playback(PlaybackRuntimeMessage::ClearQueue(response))
+        })
+    }
+
+    pub(crate) fn remove_playlist_auto_items(&self) -> Result<usize, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::Playback(PlaybackRuntimeMessage::RemovePlaylistAutoItems(response))
         })
     }
 
@@ -3215,7 +3230,13 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
     chat_listener.publish();
     decision.publish();
     task_state.publish(clock.now());
-    while let Ok(message) = receiver.recv() {
+    let mut should_stop = false;
+    while !should_stop {
+        let Ok(message) = receiver.recv() else {
+            break;
+        };
+        // 单条消息的 panic 不能让整个业务运行时永久停摆（点歌/决策/队列/值守都依赖它）。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match message {
             RuntimeMessage::OperationalSnapshot { now, response } => {
                 task_state.handle_snapshot(now, response);
@@ -3378,8 +3399,17 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             RuntimeMessage::Shutdown(response) => {
                 entertainment.abort_all(timer.as_ref(), clock.as_ref());
                 let _ = response.send(snapshot);
-                break;
+                should_stop = true;
             }
+        }
+        }));
+        if let Err(payload) = result {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            log::error!("business runtime 处理消息时 panic，已跳过该条并继续: {detail}");
         }
         entertainment.publish(clock.as_ref());
     }

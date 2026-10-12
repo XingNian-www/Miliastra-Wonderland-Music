@@ -265,7 +265,7 @@ impl PlayerSearchPort for NativePlaybackAdapter {
                 providers,
                 limit: 10,
             })
-            .map_err(|error| PlayerSearchError::new(error.to_string()))
+            .map_err(|error| PlayerSearchError::with_code(error.code(), error.to_string()))
     }
 
     fn search_and_pick(

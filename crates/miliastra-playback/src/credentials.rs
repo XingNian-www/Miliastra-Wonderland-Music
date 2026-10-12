@@ -1931,7 +1931,7 @@ mod tests {
     }
 
     #[test]
-    fn unversioned_credential_files_are_rejected_without_migration() {
+    fn unversioned_credential_files_are_quarantined_not_fatal() {
         let directory =
             std::env::temp_dir().join(format!("miliastra-credentials-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
@@ -1941,14 +1941,10 @@ mod tests {
         )
         .unwrap();
 
-        let error = match CredentialStore::open(directory.clone()) {
-            Ok(_) => panic!("unversioned credential file must be rejected"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            CredentialError::UnsupportedSchema { actual: None, .. }
-        ));
+        // 单个平台凭据损坏不能让整个应用起不来：隔离为 .bad 并按未配置继续。
+        CredentialStore::open(directory.clone()).expect("坏凭据文件不应阻塞启动");
+        assert!(!directory.join("netease.json").exists());
+        assert!(directory.join("netease.bad").exists());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2020,15 +2016,10 @@ mod tests {
         )
         .unwrap();
 
-        let error = match CredentialStore::open(directory.clone()) {
-            Ok(_) => panic!("legacy Bilibili credential must be rejected"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported credential cookie field ac_time_value")
-        );
+        // 旧格式 Bilibili 凭据同样只隔离该平台，不阻塞启动。
+        CredentialStore::open(directory.clone()).expect("旧格式 Bilibili 凭据不应阻塞启动");
+        assert!(!directory.join("bilibili.json").exists());
+        assert!(directory.join("bilibili.bad").exists());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2043,18 +2034,10 @@ mod tests {
         )
         .unwrap();
 
-        let error = match CredentialStore::open(directory.clone()) {
-            Ok(_) => panic!("schema version one must be rejected"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            CredentialError::UnsupportedSchema {
-                expected: 2,
-                actual: Some(1),
-                ..
-            }
-        ));
+        // schema 版本不符：隔离该平台凭据，其余照常启动。
+        CredentialStore::open(directory.clone()).expect("v1 凭据不应阻塞启动");
+        assert!(!directory.join("bilibili.json").exists());
+        assert!(directory.join("bilibili.bad").exists());
         fs::remove_dir_all(directory).unwrap();
     }
 

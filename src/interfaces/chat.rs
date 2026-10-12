@@ -394,6 +394,47 @@ mod tests {
 
     #[test]
     fn parses_hash_idiom_chain_commands_by_active_game() {
+        let random_started = parse_entertainment_shortcut("用户：#接龙", "blue", None)
+            .expect("parse random idiom chain start");
+        assert_eq!(
+            random_started.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: String::new(),
+                mode: IdiomChainMode::Exact,
+            })
+        );
+
+        let random_homophone = parse_entertainment_shortcut("用户：#同音接龙", "blue", None)
+            .expect("parse random homophone idiom chain start");
+        assert_eq!(
+            random_homophone.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: String::new(),
+                mode: IdiomChainMode::Homophone,
+            })
+        );
+
+        let compact_started = parse_entertainment_shortcut("用户：#接龙画蛇添足", "blue", None)
+            .expect("parse compact idiom chain start");
+        assert_eq!(
+            compact_started.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: "画蛇添足".to_string(),
+                mode: IdiomChainMode::Exact,
+            })
+        );
+
+        let compact_homophone =
+            parse_entertainment_shortcut("用户：#同音接龙画蛇添足", "blue", None)
+                .expect("parse compact homophone idiom chain start");
+        assert_eq!(
+            compact_homophone.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: "画蛇添足".to_string(),
+                mode: IdiomChainMode::Homophone,
+            })
+        );
+
         let started = parse_entertainment_shortcut("用户：#接龙 画蛇添足", "blue", None)
             .expect("parse idiom chain start");
         assert_eq!(

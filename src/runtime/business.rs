@@ -109,7 +109,7 @@ pub(crate) trait BusinessStateSink: Send + Sync {
     fn publish_turtle_soup(&self, snapshot: TurtleSoupSnapshot);
     fn publish_undercover(&self, snapshot: UndercoverSnapshot);
     fn publish_playback_queue(&self, _queue: Vec<QueueItem>) {}
-    fn publish_hall_remaining_minutes(&self, _minutes: Option<u32>) {}
+    fn publish_hall_remaining_minutes(&self, _minutes: Option<u32>, _updated_at: Option<u64>) {}
     fn publish_chat_listener(&self, _snapshot: ChatListenerSnapshot) {}
     fn publish_decision(&self, _snapshot: Option<DecisionSnapshot>) {}
     fn publish_operational(&self, _snapshot: BusinessOperationalSnapshot) {}

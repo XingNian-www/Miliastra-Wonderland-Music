@@ -51,6 +51,16 @@ struct Inner {
     changed: Condvar,
 }
 
+/// 已见消息的交付状态，用于细分“未判为新增”的排查原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BusinessDeliveryState {
+    Pending,
+    Claimed,
+    IgnoredRevision,
+    Fenced,
+    NotTracked,
+}
+
 struct State {
     latest: Option<ChatTimelineSnapshot>,
     trackers: HashMap<ChatIdentity, Tracker>,
@@ -371,6 +381,25 @@ impl Drop for FriendBusinessSuppression {
 }
 
 impl ChatTimeline {
+    /// 某条已见消息在当前账本里的交付状态；用于把“未判为新增”细分为可排查的原因。
+    pub(crate) fn business_delivery_state(
+        &self,
+        id: &ObservedChatMessageId,
+    ) -> Result<BusinessDeliveryState> {
+        let state = self.lock()?;
+        Ok(if state.business_pending.contains(id) {
+            BusinessDeliveryState::Pending
+        } else if state.business_claimed.contains(id) {
+            BusinessDeliveryState::Claimed
+        } else if state.ignored_revisions.contains_key(id) {
+            BusinessDeliveryState::IgnoredRevision
+        } else if state.revision_delivery_fences.contains_key(id) {
+            BusinessDeliveryState::Fenced
+        } else {
+            BusinessDeliveryState::NotTracked
+        })
+    }
+
     /// 这条消息是否首次被记为“命令未执行”；true 表示应当打日志（同一实例只打一次）。
     pub(crate) fn note_not_executed_log(&self, id: &ObservedChatMessageId) -> Result<bool> {
         let mut state = self.lock()?;

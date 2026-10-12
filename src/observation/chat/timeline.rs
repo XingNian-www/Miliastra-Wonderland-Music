@@ -836,10 +836,9 @@ impl ChatTimeline {
         state.latest = None;
         // A disappeared view starts new visual sessions on its next appearance.
         state.trackers.clear();
-        // 聊天不可见：新鲜度状态保留，但下一帧按不连续处理（保守，满足场景 3）。
-        for freshness in state.chat_freshness.values_mut() {
-            freshness.mark_view_disappeared();
-        }
+        // 聊天不可见：保留新鲜度状态，但**不再强制下一帧不连续**。
+        // 真实案例：聊天框消失后回来的第一条新命令曾被“全旧”吞掉。交叠时交给对齐按
+        // “底部追加”判新；无交叠（画面大改/命令被顶到顶部）时对齐自然失败并全旧，场景 3 仍成立。
         state.ignored_revisions.clear();
         let State {
             revision_delivery_fences,
@@ -1509,6 +1508,18 @@ mod tests {
         shared
             .publish(Instant::now(), ChatIdentity::PrimaryHall, messages)
             .unwrap()
+    }
+
+    #[test]
+    fn command_after_chat_reappears_is_still_new() {
+        // 聊天框消失再回来：第一条新命令不能被“全旧”吞掉。
+        let shared = ChatTimeline::new();
+        publish(&shared, vec![input("A", 10)]);
+        shared
+            .publish_no_chat(Instant::now(), "chat hidden for a while")
+            .unwrap();
+        let again = publish(&shared, vec![input("A", 10), primary("甲", "@命令", 40)]);
+        assert!(again.messages[1].is_new, "聊天恢复后的追加命令必须判新");
     }
 
     fn friend(

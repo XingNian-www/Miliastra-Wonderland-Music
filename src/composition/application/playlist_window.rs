@@ -192,7 +192,16 @@ impl ApplicationRuntime {
             PlaylistCommand::parse_window_chat(envelope).expect("parsed playlist decision");
         let interaction =
             RoutedCommand::from_envelope(envelope, matched.map(ModuleCommand::Playlist));
-        self.log_executed_command(&interaction, "playlist")?;
+        if changed {
+            self.log_executed_command(&interaction, "playlist")?;
+        } else if let PlaylistCommand::Select(index) = command {
+            log::info!(
+                "命令未执行：歌单序号越界 index={} window_len={} text={}",
+                index,
+                application.window_len(owner, Instant::now())?,
+                crate::privacy::redacted_chat_text(envelope.user_command())
+            );
+        }
         if changed {
             crate::debug_read_only::record_command_immediate(
                 &interaction,
@@ -270,15 +279,41 @@ impl ApplicationRuntime {
                     break;
                 }
                 let Some(envelope) = playlist_decision_envelope(&message, captured_at) else {
+                    if crate::interfaces::chat::looks_like_command(&message.text) {
+                        log::info!(
+                            "命令未执行：歌单窗口决策信封不成立 text={}",
+                            crate::privacy::redacted_chat_text(&message.text)
+                        );
+                    } else {
+                        log::debug!(
+                            "歌单窗口忽略非命令消息 text={}",
+                            crate::privacy::redacted_chat_text(&message.text)
+                        );
+                    }
                     continue;
                 };
                 if !owner_matches(&owner, &self.canonical_actor_name(envelope.username())) {
+                    log::info!(
+                        "命令未执行：歌单窗口决策发送者不是当前窗口属主 sender={} owner={} text={}",
+                        envelope.username(),
+                        owner,
+                        crate::privacy::redacted_chat_text(&message.text)
+                    );
                     continue;
                 }
                 let Some(command) = playlist_decision(&envelope) else {
+                    log::info!(
+                        "命令未执行：歌单窗口收到非窗口决策命令 text={}",
+                        crate::privacy::redacted_chat_text(&message.text)
+                    );
                     continue;
                 };
                 if !reader.accept_playlist_message(&self.ui.chat_timeline, &message)? {
+                    log::info!(
+                        "命令未执行：歌单决策已被基线或已消费否决 text={} y={}",
+                        crate::privacy::redacted_chat_text(&message.text),
+                        message.block.y
+                    );
                     continue;
                 }
                 let changed = match command {

@@ -150,7 +150,7 @@ impl ApplicationRuntime {
         )?;
         let deadline = Instant::now() + timeout;
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
-            let messages = self.wait_for_chat_decision_messages(
+            let messages = self.wait_for_chat_decision_messages_with_ids(
                 &mut reader,
                 self.lifecycle.config.timing.decision.poll_ms,
                 deadline.saturating_duration_since(Instant::now()),
@@ -161,7 +161,7 @@ impl ApplicationRuntime {
             if let Some(decision) = web_decision.wait(Duration::ZERO)? {
                 return Ok(map_web_decision(decision));
             }
-            for message in messages {
+            for (message, message_id) in messages {
                 if message.message_type != "blue"
                     || message.text.is_empty()
                     || SongRequestDecision::is_feedback_text(&message.text)
@@ -169,11 +169,22 @@ impl ApplicationRuntime {
                     continue;
                 }
                 let Some(decision) = SongRequestDecision::parse(&message.text) else {
+                    log::info!(
+                        "命令未执行：点歌确认窗口未识别为决策 text={}",
+                        redacted_chat_text(&message.text)
+                    );
                     continue;
                 };
                 if !reader.accept_once(&message) {
+                    log::info!(
+                        "命令未执行：点歌决策被基线或已消费否决 text={}",
+                        redacted_chat_text(&message.text)
+                    );
                     continue;
                 }
+                // 消费成功即确认 business：独占窗口回放时主链路不再把它当成新增追加，
+                // 避免对已被决策读者正常消费的命令误报“未执行”。
+                self.ui.chat_timeline.acknowledge_business(&message_id)?;
                 match decision {
                     SongRequestDecision::Confirm => return Ok(SongRequestDecision::Confirm),
                     SongRequestDecision::Skip => return Ok(SongRequestDecision::Skip),
@@ -185,7 +196,16 @@ impl ApplicationRuntime {
                     SongRequestDecision::Select | SongRequestDecision::SelectIndex(_) => {
                         return Ok(decision);
                     }
-                    _ => {}
+                    _ => {
+                        log::info!(
+                            "命令未执行：点歌决策动作未开放 decision={:?} allow_switch_source={} allow_ai={} allow_local={} text={}",
+                            decision,
+                            allow_switch_source,
+                            allow_ai,
+                            allow_local,
+                            redacted_chat_text(&message.text)
+                        );
+                    }
                 }
             }
         }

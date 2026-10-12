@@ -12,6 +12,18 @@ const CHAT_LISTENER_UNRESOLVED_UI_GRACE: Duration = Duration::from_secs(5);
 const CONFIG_RELOAD_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CONFIG_RELOAD_UI_FALLBACK_GRACE: Duration = Duration::from_secs(15);
 
+/// 排查日志用：折叠空白并截断，避免日志里塞入超长文本。
+fn compact_for_log(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > 120 {
+        let mut truncated: String = compact.chars().take(120).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        compact
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ListenerReadyEvidence {
     PrimaryScan,
@@ -1790,7 +1802,15 @@ impl ApplicationRuntime {
             let sample_as_question = accepts_turtle_questions
                 && message.message_type == "blue"
                 && !message.text.is_empty();
+            let command_like = command::looks_like_command(&message.text);
             if !observed.is_new && !sample_as_question {
+                if command_like {
+                    log::info!(
+                        "命令未执行：未判为新增追加（freshness 判旧/基线/未见追加）type={} text={}",
+                        message.message_type,
+                        compact_for_log(&message.text)
+                    );
+                }
                 continue;
             }
             log::debug!("处理一级观察消息: id={:?}", observed.id);
@@ -1814,9 +1834,11 @@ impl ApplicationRuntime {
                 message_text: Some(message.text.clone()),
                 message_y: Some(message.block.y),
             };
-            let routed =
-                command::parse_command_envelope(&message.text, &message.message_type, observation)
-                    .and_then(|envelope| command_router.route(&envelope, active_entertainment));
+            let envelope =
+                command::parse_command_envelope(&message.text, &message.message_type, observation);
+            let routed = envelope
+                .as_ref()
+                .and_then(|envelope| command_router.route(envelope, active_entertainment));
 
             if sample_as_question && routed.is_none() {
                 if let Some(question) = turtle_soup::parse_question_message(&message.text, None) {
@@ -1827,6 +1849,19 @@ impl ApplicationRuntime {
                 continue;
             }
             let Some(parsed_command) = routed else {
+                if command_like {
+                    let reason = if envelope.is_none() {
+                        "无法解析为命令信封（发送者/前缀或结构化点歌不成立）"
+                    } else {
+                        "信封可解析但无模块认领（或保留的决策语法被正常分发排除）"
+                    };
+                    log::info!(
+                        "命令未执行：{} type={} text={}",
+                        reason,
+                        message.message_type,
+                        compact_for_log(&message.text)
+                    );
+                }
                 acknowledge_unrecognized_primary_message(
                     &self.ui.chat_timeline,
                     observed,
@@ -1840,6 +1875,10 @@ impl ApplicationRuntime {
                 let owner = self.canonical_actor_name(&parsed_command.username);
                 let application = &self.business.playlist_application;
                 if !application.has_command_context(&owner, command, Instant::now())? {
+                    log::info!(
+                        "命令未执行：歌单命令缺少当前窗口上下文 text={}",
+                        compact_for_log(&message.text)
+                    );
                     acknowledge_unrecognized_primary_message(
                         &self.ui.chat_timeline,
                         observed,

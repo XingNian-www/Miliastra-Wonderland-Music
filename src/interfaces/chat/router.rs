@@ -78,6 +78,8 @@ impl<'a> ChatCommandRouter<'a> {
         match envelope.prefix() {
             CommandPrefix::At => self.select_at_module(envelope),
             CommandPrefix::Hash => self.select_hash_module(envelope, active_entertainment),
+            // 测试专用前缀：不认领任何模块，永不执行。
+            CommandPrefix::Amp => None,
         }
     }
 
@@ -337,6 +339,24 @@ mod tarot_routing_tests {
             assert!(is_reserved_decision_command(&envelope));
             assert!(router.route(&envelope, None).is_none());
         }
+    }
+
+    #[test]
+    fn ampersand_prefix_is_test_only_and_never_routed() {
+        let router = ChatCommandRouter::without_custom_workflow();
+        let envelope = CommandEnvelope::new(
+            "&状态",
+            "用户",
+            "blue",
+            "&状态",
+            CommandObservation::default(),
+        )
+        .unwrap();
+        assert_eq!(envelope.prefix(), CommandPrefix::Amp);
+        assert!(
+            router.route(&envelope, None).is_none(),
+            "& 前缀是测试专用，永不路由/执行"
+        );
     }
 
     #[test]

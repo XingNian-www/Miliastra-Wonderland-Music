@@ -9,9 +9,10 @@ use image::DynamicImage;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleBitmap,
-    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HGDIOBJ,
+    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HDC, HGDIOBJ,
     ReleaseDC, SRCCOPY, SelectObject,
 };
+use windows::Win32::Storage::Xps::{PW_CLIENTONLY, PrintWindow};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -26,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::BOOL;
 
-use crate::config::{PointConfig, WindowConfig};
+use crate::config::{PointConfig, WindowCaptureMethod, WindowConfig};
 
 // BGI 会在拖动起点和每个插值点停留足够时间，使游戏 UI 事件循环能观察到按下状态。
 /// 移动光标与按下左键之间要留的时间。
@@ -411,13 +412,37 @@ impl GameWindow {
         Ok(())
     }
 
-    pub fn capture(&self) -> Result<DynamicImage> {
-        capture_client_area(self.hwnd, self.client_width, self.client_height)
+    pub fn capture(&self, method: WindowCaptureMethod) -> Result<DynamicImage> {
+        match method {
+            WindowCaptureMethod::Gdi => {
+                let source_dc = unsafe { GetDC(Some(self.hwnd)) };
+                if source_dc.is_invalid() {
+                    return Err(target_window_unavailable("GetDC failed for game window"));
+                }
+                capture_from_dc(
+                    source_dc,
+                    Some(self.hwnd),
+                    0,
+                    0,
+                    self.client_width,
+                    self.client_height,
+                )
+            }
+            WindowCaptureMethod::PrintWindow => {
+                capture_with_print_window(self.hwnd, self.client_width, self.client_height)
+            }
+            WindowCaptureMethod::Desktop => capture_from_desktop(
+                self.client_left,
+                self.client_top,
+                self.client_width,
+                self.client_height,
+            ),
+        }
     }
 }
 
 pub fn capture_game(config: &WindowConfig) -> Result<DynamicImage> {
-    GameWindow::find(config)?.capture()
+    GameWindow::find(config)?.capture(config.capture_method)
 }
 
 pub fn ensure_foreground(config: &WindowConfig) -> Result<()> {
@@ -445,54 +470,127 @@ fn wait_for_window_close(timeout: Duration, mut exists: impl FnMut() -> bool) ->
     Ok(())
 }
 
-fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicImage> {
+fn capture_from_dc(
+    source_dc: HDC,
+    release_owner: Option<HWND>,
+    source_x: i32,
+    source_y: i32,
+    width: i32,
+    height: i32,
+) -> Result<DynamicImage> {
     unsafe {
-        let source_dc = GetDC(Some(hwnd));
-        if source_dc.is_invalid() {
-            return Err(target_window_unavailable("GetDC failed for game window"));
-        }
-
         let memory_dc = CreateCompatibleDC(Some(source_dc));
         if memory_dc.is_invalid() {
-            ReleaseDC(Some(hwnd), source_dc);
+            ReleaseDC(release_owner, source_dc);
             return Err(target_window_unavailable("CreateCompatibleDC failed"));
         }
-
         let bitmap = CreateCompatibleBitmap(source_dc, width, height);
         if bitmap.is_invalid() {
             let _ = DeleteDC(memory_dc);
-            ReleaseDC(Some(hwnd), source_dc);
+            ReleaseDC(release_owner, source_dc);
             return Err(target_window_unavailable("CreateCompatibleBitmap failed"));
         }
-
         let old_object = SelectObject(memory_dc, HGDIOBJ::from(bitmap));
         if old_object.is_invalid() {
             let _ = DeleteObject(HGDIOBJ::from(bitmap));
             let _ = DeleteDC(memory_dc);
-            ReleaseDC(Some(hwnd), source_dc);
+            ReleaseDC(release_owner, source_dc);
             return Err(target_window_unavailable("SelectObject failed"));
         }
 
-        if let Err(error) = BitBlt(
+        let copy_result = BitBlt(
             memory_dc,
             0,
             0,
             width,
             height,
             Some(source_dc),
-            0,
-            0,
+            source_x,
+            source_y,
             SRCCOPY,
-        ) {
-            SelectObject(memory_dc, old_object);
+        );
+        SelectObject(memory_dc, old_object);
+        if let Err(error) = copy_result {
             let _ = DeleteObject(HGDIOBJ::from(bitmap));
             let _ = DeleteDC(memory_dc);
-            ReleaseDC(Some(hwnd), source_dc);
-            return Err(target_window_unavailable(format!(
-                "BitBlt game window failed: {error}"
-            )));
+            ReleaseDC(release_owner, source_dc);
+            return Err(target_window_unavailable(format!("BitBlt failed: {error}")));
         }
 
+        let image = read_bitmap(memory_dc, bitmap, width, height);
+        let _ = DeleteObject(HGDIOBJ::from(bitmap));
+        let _ = DeleteDC(memory_dc);
+        ReleaseDC(release_owner, source_dc);
+        image
+    }
+}
+
+fn capture_with_print_window(hwnd: HWND, width: i32, height: i32) -> Result<DynamicImage> {
+    unsafe {
+        let reference_dc = GetDC(Some(hwnd));
+        if reference_dc.is_invalid() {
+            return Err(target_window_unavailable("GetDC failed for PrintWindow"));
+        }
+        let memory_dc = CreateCompatibleDC(Some(reference_dc));
+        if memory_dc.is_invalid() {
+            ReleaseDC(Some(hwnd), reference_dc);
+            return Err(target_window_unavailable(
+                "CreateCompatibleDC failed for PrintWindow",
+            ));
+        }
+        let bitmap = CreateCompatibleBitmap(reference_dc, width, height);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(memory_dc);
+            ReleaseDC(Some(hwnd), reference_dc);
+            return Err(target_window_unavailable(
+                "CreateCompatibleBitmap failed for PrintWindow",
+            ));
+        }
+        let old_object = SelectObject(memory_dc, HGDIOBJ::from(bitmap));
+        if old_object.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ::from(bitmap));
+            let _ = DeleteDC(memory_dc);
+            ReleaseDC(Some(hwnd), reference_dc);
+            return Err(target_window_unavailable(
+                "SelectObject failed for PrintWindow",
+            ));
+        }
+        let printed = PrintWindow(hwnd, memory_dc, PW_CLIENTONLY).as_bool();
+        SelectObject(memory_dc, old_object);
+        let image = if printed {
+            read_bitmap(memory_dc, bitmap, width, height)
+        } else {
+            Err(target_window_unavailable("PrintWindow returned false"))
+        };
+        let _ = DeleteObject(HGDIOBJ::from(bitmap));
+        let _ = DeleteDC(memory_dc);
+        ReleaseDC(Some(hwnd), reference_dc);
+        image
+    }
+}
+
+fn capture_from_desktop(
+    client_left: i32,
+    client_top: i32,
+    width: i32,
+    height: i32,
+) -> Result<DynamicImage> {
+    unsafe {
+        let desktop_dc = GetDC(None);
+        if desktop_dc.is_invalid() {
+            return Err(target_window_unavailable("GetDC failed for desktop"));
+        }
+        capture_from_dc(desktop_dc, None, client_left, client_top, width, height)
+    }
+}
+
+unsafe fn read_bitmap(
+    memory_dc: HDC,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    width: i32,
+    height: i32,
+) -> Result<DynamicImage> {
+    unsafe {
         let mut bitmap_info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -509,10 +607,7 @@ fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicIma
             },
             ..Default::default()
         };
-
         let mut bgra = vec![0_u8; (width as usize) * (height as usize) * 4];
-        SelectObject(memory_dc, old_object);
-
         let lines = GetDIBits(
             memory_dc,
             bitmap,
@@ -522,22 +617,13 @@ fn capture_client_area(hwnd: HWND, width: i32, height: i32) -> Result<DynamicIma
             &mut bitmap_info,
             DIB_RGB_COLORS,
         );
-
-        let _ = DeleteObject(HGDIOBJ::from(bitmap));
-        let _ = DeleteDC(memory_dc);
-        ReleaseDC(Some(hwnd), source_dc);
-
         if lines == 0 {
-            return Err(target_window_unavailable(
-                "GetDIBits failed for game window",
-            ));
+            return Err(target_window_unavailable("GetDIBits failed"));
         }
-
         for pixel in bgra.chunks_exact_mut(4) {
             pixel.swap(0, 2);
             pixel[3] = 255;
         }
-
         let image = image::RgbaImage::from_raw(width as u32, height as u32, bgra)
             .ok_or_else(|| anyhow!("failed to construct captured game image"))?;
         Ok(DynamicImage::ImageRgba8(image))
@@ -752,7 +838,7 @@ mod tests {
         let window = GameWindow::find(&WindowConfig::default()).expect("find live target window");
         let foreground = window.is_foreground();
         let image = window
-            .capture()
+            .capture(WindowCaptureMethod::Gdi)
             .expect("capture live target window")
             .to_rgba8();
         assert!(image.width() > 0 && image.height() > 0);

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use pinyin::ToPinyin;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use super::chat_text::{
@@ -296,7 +297,6 @@ pub struct IdiomChainGame {
     lexicon: IdiomLexicon,
     history_limit: usize,
     idle_timeout: Option<Duration>,
-    allow_consecutive_player: bool,
     allow_anyone_stop: bool,
     session: Option<IdiomChainSession>,
 }
@@ -407,7 +407,6 @@ impl IdiomChainService {
                 .expect("valid test lexicon"),
             history_limit: 200,
             idle_timeout,
-            allow_consecutive_player: false,
             allow_anyone_stop: false,
             session: None,
         })
@@ -427,7 +426,6 @@ impl IdiomChainGame {
             history_limit: config.history_limit.max(1),
             idle_timeout: (config.idle_timeout_seconds > 0)
                 .then(|| Duration::from_secs(config.idle_timeout_seconds)),
-            allow_consecutive_player: config.allow_consecutive_player,
             allow_anyone_stop: config.allow_anyone_stop,
             session: None,
         })
@@ -467,7 +465,10 @@ impl IdiomChainGame {
         }
 
         if !matches!(command, IdiomChainCommand::Start { .. }) && self.expire_if_idle(now) {
-            return outcome("expired", "本局成语接龙已超时，请用 #接龙 成语 重新开局");
+            return outcome(
+                "expired",
+                "本局成语接龙已超时，请用 #接龙 或 #同音接龙 重新开局",
+            );
         }
 
         match command {
@@ -491,9 +492,29 @@ impl IdiomChainGame {
         if self.session.is_some() {
             return outcome("already-active", "已有成语接龙正在进行，请先 #状态");
         }
-        let idiom = match self.lookup_idiom(raw_idiom) {
-            Ok(idiom) => idiom,
-            Err(reply) => return outcome("invalid-start", reply),
+        let idiom = if raw_idiom.trim().is_empty() {
+            let eligible = self
+                .lexicon
+                .entries
+                .iter()
+                .filter(|idiom| {
+                    self.lexicon
+                        .successors(last_char(idiom), mode)
+                        .is_some_and(|successors| {
+                            successors.iter().any(|successor| *successor != **idiom)
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let Some(idiom) = eligible.choose(&mut rand::thread_rng()) else {
+                return outcome("no-start-candidate", "词库中没有可用于随机开局的成语");
+            };
+            idiom.clone()
+        } else {
+            match self.lookup_idiom(raw_idiom) {
+                Ok(idiom) => idiom,
+                Err(reply) => return outcome("invalid-start", reply),
+            }
         };
         let expected_first = last_char(&idiom);
         let mut session = IdiomChainSession::new(player, idiom.clone(), expected_first, mode, now);
@@ -518,11 +539,8 @@ impl IdiomChainGame {
             Err(reply) => return outcome("invalid-submission", reply),
         };
         let Some(session) = self.session.as_ref() else {
-            return outcome("no-session", "还没有开局，请用 #接龙 成语");
+            return outcome("no-session", "还没有开局，请用 #接龙 或 #同音接龙 随机开局");
         };
-        if !self.allow_consecutive_player && same_player(player, &session.last_player) {
-            return outcome("same-player", "请让其他玩家接下一个成语");
-        }
         let first = first_char(&idiom);
         if !session.mode.accepts(session.expected_first, first) {
             return outcome(
@@ -540,7 +558,6 @@ impl IdiomChainGame {
         let next_first = last_char(&idiom);
         let previous = session.last_idiom.clone();
         let session = self.session.as_mut().expect("session checked above");
-        session.last_player = player.trim().to_string();
         session.last_idiom = idiom.clone();
         session.expected_first = next_first;
         session.last_activity = now;
@@ -663,7 +680,6 @@ impl IdiomChainGame {
 
 struct IdiomChainSession {
     starter: String,
-    last_player: String,
     last_idiom: String,
     expected_first: char,
     mode: IdiomChainMode,
@@ -683,7 +699,6 @@ impl IdiomChainSession {
     ) -> Self {
         Self {
             starter: player.trim().to_string(),
-            last_player: player.trim().to_string(),
             last_idiom: idiom,
             expected_first,
             mode,
@@ -957,7 +972,6 @@ mod tests {
                 .expect("valid test lexicon"),
             history_limit: 200,
             idle_timeout: Some(Duration::from_secs(300)),
-            allow_consecutive_player: false,
             allow_anyone_stop: false,
             session: None,
         }
@@ -1097,6 +1111,41 @@ mod tests {
     }
 
     #[test]
+    fn start_commands_allow_random_openers_in_both_modes() {
+        assert_eq!(
+            IdiomChainCommand::parse_start("接龙"),
+            Some(start_exact(""))
+        );
+        assert_eq!(
+            IdiomChainCommand::parse_start("同音接龙"),
+            Some(IdiomChainCommand::Start {
+                idiom: String::new(),
+                mode: IdiomChainMode::Homophone,
+            })
+        );
+        assert_eq!(
+            IdiomChainCommand::parse_start("接龙后续"),
+            Some(start_exact("后续"))
+        );
+
+        let mut exact = game(&["画蛇添足", "足智多谋", "天马行空"]);
+        let started = exact.handle("Alice", &start_exact(""));
+        assert_eq!(started.action, "started");
+        assert!(started.reply.contains("画蛇添足"));
+
+        let mut homophone = game(&["画蛇添足", "组词造句", "天马行空"]);
+        let started = homophone.handle(
+            "Alice",
+            &IdiomChainCommand::Start {
+                idiom: String::new(),
+                mode: IdiomChainMode::Homophone,
+            },
+        );
+        assert_eq!(started.action, "started");
+        assert!(started.reply.contains("画蛇添足"));
+    }
+
+    #[test]
     fn accepts_only_lexicon_entries_with_matching_characters() {
         let mut game = game(&["画蛇添足", "足智多谋", "谋事在人", "人山人海"]);
 
@@ -1104,10 +1153,7 @@ mod tests {
         assert_eq!(started.action, "started");
         assert!(started.reply.contains('足'));
 
-        let wrong_player = game.handle("Alice", &IdiomChainCommand::Submit("足智多谋".to_string()));
-        assert_eq!(wrong_player.action, "same-player");
-
-        let accepted = game.handle("Bob", &IdiomChainCommand::Submit("足智多谋".to_string()));
+        let accepted = game.handle("Alice", &IdiomChainCommand::Submit("足智多谋".to_string()));
         assert_eq!(accepted.action, "accepted");
         assert!(accepted.reply.contains('谋'));
 

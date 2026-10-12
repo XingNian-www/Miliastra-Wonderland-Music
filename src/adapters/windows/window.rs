@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse};
 use image::DynamicImage;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HDC, HGDIOBJ,
@@ -659,9 +660,16 @@ fn capture_with_wgc(
 ) -> Result<DynamicImage> {
     use std::sync::mpsc;
 
-    let window_rect = WgcWindow::from_raw_hwnd(hwnd.0 as *mut std::ffi::c_void)
-        .rect()
-        .map_err(|error| anyhow!("read WGC target bounds: {error}"))?;
+    let mut window_rect = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut window_rect as *mut RECT as *mut std::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+    }
+    .map_err(|error| anyhow!("read WGC target bounds: {error}"))?;
     let crop_left = (client_left - window_rect.left).max(0) as u32;
     let crop_top = (client_top - window_rect.top).max(0) as u32;
     let crop_width = client_width.max(1) as u32;
@@ -693,6 +701,22 @@ fn capture_with_wgc(
     Ok(image.map_err(|error| anyhow!("WGC did not produce a frame: {error}"))??)
 }
 
+fn resolve_wgc_crop(
+    crop: (u32, u32, u32, u32),
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<(u32, u32, u32, u32)> {
+    let (left, top, width, height) = crop;
+    let right = left.saturating_add(width);
+    let bottom = top.saturating_add(height);
+    if right <= frame_width && bottom <= frame_height {
+        return Ok((left, top, right, bottom));
+    }
+    bail!(
+        "WGC client crop ({left},{top},{width},{height}) exceeds frame bounds ({frame_width}x{frame_height})"
+    )
+}
+
 struct WgcFlags {
     sender: std::sync::mpsc::SyncSender<Result<DynamicImage>>,
     crop: (u32, u32, u32, u32),
@@ -718,18 +742,11 @@ impl GraphicsCaptureApiHandler for OneFrameWgc {
         capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
         let image = (|| -> Result<DynamicImage> {
-            let (left, top, width, height) = self.flags.crop;
-            let right = left.saturating_add(width).min(frame.width());
-            let bottom = top.saturating_add(height).min(frame.height());
-            if left >= right || top >= bottom {
-                bail!("WGC client crop is outside the captured window bounds");
-            }
+            let (left, top, right, bottom) =
+                resolve_wgc_crop(self.flags.crop, frame.width(), frame.height())?;
             let buffer = frame
                 .buffer_crop(left, top, right, bottom)
                 .map_err(|error| anyhow!("read WGC frame: {error}"))?;
-            if (right - left, bottom - top) != (width, height) {
-                bail!("WGC frame bounds do not cover the requested client area");
-            }
             let bytes = buffer.as_nopadding_buffer(&mut Vec::new()).to_vec();
             image::RgbaImage::from_raw(right - left, bottom - top, bytes)
                 .map(DynamicImage::ImageRgba8)
@@ -1005,6 +1022,20 @@ fn send_alt_keypress() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wgc_crop_uses_window_offset_when_frame_covers_window_bounds() {
+        assert_eq!(
+            resolve_wgc_crop((8, 30, 980, 650), 1000, 700).unwrap(),
+            (8, 30, 988, 680)
+        );
+    }
+
+    #[test]
+    fn wgc_crop_rejects_unexpectedly_small_frame() {
+        let error = resolve_wgc_crop((8, 30, 980, 650), 979, 650).unwrap_err();
+        assert!(error.to_string().contains("exceeds frame bounds"));
+    }
 
     #[test]
     #[ignore = "requires a visible running game window on the desktop"]

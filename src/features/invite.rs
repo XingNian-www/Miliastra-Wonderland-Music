@@ -336,7 +336,7 @@ fn execute_approved_invite(
 ) -> Result<bool> {
     let outcome = port.execute_invite_ui(username, password, notification)?;
     if let Some(failure) = outcome.residency_failure() {
-        bail!("邀请 UI 事务未能恢复监听驻留: {failure}");
+        bail!("邀请 UI 事务未能恢复值守驻留: {failure}");
     }
     if outcome.entered()
         && let Some(warning) = outcome.notification_warning()
@@ -518,7 +518,7 @@ mod tests {
             .run(&port)
             .unwrap_err();
 
-        assert!(error.to_string().contains("未能恢复监听驻留"));
+        assert!(error.to_string().contains("未能恢复值守驻留"));
     }
 
     #[test]

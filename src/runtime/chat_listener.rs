@@ -10,8 +10,8 @@ pub(crate) enum ChatListenerMode {
 impl ChatListenerMode {
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Self::Primary => "一级监听",
-            Self::Secondary => "二级监听",
+            Self::Primary => "一级值守",
+            Self::Secondary => "二级值守",
         }
     }
 }

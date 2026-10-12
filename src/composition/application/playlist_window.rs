@@ -169,7 +169,7 @@ impl ApplicationRuntime {
         }
         let mode = self.business.business.chat_listener_snapshot()?;
         if mode.mode != reader.listener_mode || mode.pending_mode.is_some() {
-            return Err(anyhow!("监听模式正在切换，已结束歌单窗口"));
+            return Err(anyhow!("值守模式正在切换，已结束歌单窗口"));
         }
         Ok(true)
     }

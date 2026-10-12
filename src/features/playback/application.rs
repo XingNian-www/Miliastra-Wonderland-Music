@@ -351,7 +351,7 @@ pub(crate) trait PlaybackExecutionPort {
     fn user_pause_active(&mut self) -> Result<bool> {
         Ok(false)
     }
-    /// 监听器安排的队列推进是否可以开始下一首。手动播放命令使用不检查此闸门的用途。
+    /// 值守器安排的队列推进是否可以开始下一首。手动播放命令使用不检查此闸门的用途。
     fn automatic_queue_advance_allowed(&mut self) -> Result<bool> {
         Ok(true)
     }

@@ -247,7 +247,7 @@ fn process_unread(
             unreachable!("wait_shared_friend_snapshot only returns confirmed friend chats");
         };
         if request.discard_only {
-            // 初始红点清场（进入二级监听时那一次）：只建立基线、清红点，历史一律不执行。
+            // 初始红点清场（进入二级值守时那一次）：只建立基线、清红点，历史一律不执行。
             // 必须在"提升最后一条命令"之前返回；清场全程还持有好友业务抑制
             // （execute 里的 suppress_friend_business），两层都不允许它派发任何命令。
             for message in &snapshot.messages {
@@ -352,7 +352,7 @@ fn latest_unread_message(
 /// 等待业务订阅者取走这次未读提升。
 ///
 /// 提升写入的是一份共享观察资格修订（`deliver_unread_baseline`），真正的消费发生在
-/// 监听循环的业务订阅者里。UI 事务若在提升后立刻恢复大厅，这条唯一候选就没有后续帧，
+/// 值守循环的业务订阅者里。UI 事务若在提升后立刻恢复大厅，这条唯一候选就没有后续帧，
 /// 可能一直没人消费——用户规则是"进入有未读的会话读取最后发送的那条命令"，
 /// 而不是"提升了却不用"。超时不当作失败：消费方可能已按常规路径处理过同一气泡。
 fn wait_promoted_unread_consumed(
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn initial_unread_clear_never_promotes_a_command() {
-        // 初始红点清场（进入二级监听那一次）只建立基线、清红点；即使屏幕上就有命令气泡，
+        // 初始红点清场（进入二级值守那一次）只建立基线、清红点；即使屏幕上就有命令气泡，
         // 也不能被提升成一次派发。清场期间 UI 事务持有好友业务抑制，共享观察会把看到的
         // 气泡直接永久 ACK，因此这里既进不了未读基线，也不会变成待派发。
         use crate::observation::chat::RecognizedChatMessage;

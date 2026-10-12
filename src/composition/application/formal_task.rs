@@ -813,8 +813,8 @@ mod tests {
             BubbleSequence, ChatIdentity, ObservedChatMessageId, VisualSessionId,
         };
         let mut source = RoutedCommand::console(
-            "监听模式",
-            "监听模式二级",
+            "值守模式",
+            "值守模式二级",
             ModuleCommand::Administration(AdministrationCommand::ChatListenerMode(
                 ChatListenerModeCommand::Secondary,
             )),
@@ -822,7 +822,7 @@ mod tests {
         source.message_type = "pink".into();
         source.username = "香菜".into();
         source.authority = CommandAuthority::Friend;
-        source.observation.message_text = Some("香菜：@监听模式二级".into());
+        source.observation.message_text = Some("香菜：@值守模式二级".into());
         source.observation.message_y = Some(420);
         source.observation.message_id = Some(ObservedChatMessageId::new(
             VisualSessionId::new(7),
@@ -855,10 +855,10 @@ mod tests {
         assert_eq!(at, source.observation.captured_at);
         assert_eq!(payload["kind"], "setChatListenerMode");
         assert_eq!(payload["target"], ChatListenerMode::Secondary.label());
-        assert_eq!(payload["sourceCommand"]["raw"], "监听模式二级");
+        assert_eq!(payload["sourceCommand"]["raw"], "值守模式二级");
         assert_eq!(
             payload["sourceCommand"]["originalText"],
-            "香菜：@监听模式二级"
+            "香菜：@值守模式二级"
         );
         assert_eq!(payload["sourceCommand"]["nickname"], "香菜");
         assert_eq!(payload["sourceCommand"]["messageType"], "pink");
@@ -1022,7 +1022,7 @@ mod tests {
         };
         let evidence = observer.read_entry("readonly-1").unwrap();
         assert_eq!(evidence["taskId"], receipt.task_id);
-        assert_eq!(evidence["task"]["sourceCommand"]["raw"], "监听模式二级");
+        assert_eq!(evidence["task"]["sourceCommand"]["raw"], "值守模式二级");
         assert_eq!(evidence["task"]["sourceCommand"]["nickname"], "香菜");
         assert_eq!(evidence["source"]["frameId"], first.id());
         assert_eq!(evidence["source"]["canvas"], "rawGame");

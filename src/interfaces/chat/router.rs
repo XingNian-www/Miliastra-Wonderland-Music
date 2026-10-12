@@ -8,7 +8,7 @@ use crate::features::custom_workflow::CustomWorkflowService;
 use crate::features::entertainment::EntertainmentKind;
 use crate::features::hall::HallCommand;
 use crate::features::identity::{IdentityAccess, IdentityRole};
-use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainMode};
+use crate::features::idiom_chain::IdiomChainCommand;
 use crate::features::invite::InviteCommand;
 use crate::features::moderation::ModerationCommand;
 use crate::features::playback::PlaybackCommand;

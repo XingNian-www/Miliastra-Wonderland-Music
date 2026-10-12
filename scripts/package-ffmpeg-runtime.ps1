@@ -80,7 +80,8 @@ function Test-SystemImport {
     param([string]$Import)
 
     return $Import -match "^(api-ms-win|ext-ms-win)-.*\.dll$" -or
-        $Import -match "^(advapi32|bcrypt|bcryptprimitives|cfgmgr32|combase|crypt32|dbghelp|d3dcompiler_47|dwmapi|gdi32|imm32|kernel32|kernelbase|iphlpapi|mmdevapi|msvcp[0-9_]*|msvcrt|ncrypt|ntdll|ole32|oleaut32|psapi|propsys|rpcrt4|secur32|setupapi|shell32|shlwapi|ucrtbase|user32|userenv|version|vcruntime[0-9_]*|winhttp|wininet|winmm|wintrust|ws2_32)\.dll$"
+        # coremessaging/d3d11/dxgi：Windows Graphics Capture（windows-capture）依赖的系统 DLL。
+        $Import -match "^(advapi32|bcrypt|bcryptprimitives|cfgmgr32|combase|coremessaging|crypt32|d3d11|d3dcompiler_47|dbghelp|dwmapi|dxgi|gdi32|imm32|kernel32|kernelbase|iphlpapi|mmdevapi|msvcp[0-9_]*|msvcrt|ncrypt|ntdll|ole32|oleaut32|psapi|propsys|rpcrt4|secur32|setupapi|shell32|shlwapi|ucrtbase|user32|userenv|version|vcruntime[0-9_]*|winhttp|wininet|winmm|wintrust|ws2_32)\.dll$"
 }
 
 function Assert-NoForbiddenImport {

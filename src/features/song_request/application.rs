@@ -621,6 +621,11 @@ impl SongRequestExecution<'_> {
     ) -> Result<Option<ResolvedSongRequest>> {
         let label = song_label(song);
         if !self.ai.enabled() {
+            log::info!(
+                "命令未执行：AI点歌未启用 keyword={} label={}",
+                song.keyword,
+                label
+            );
             self.reply(&format!(
                 "{}{}",
                 label,
@@ -713,6 +718,7 @@ impl SongRequestExecution<'_> {
             )
         });
         if candidates.merged.is_empty() {
+            log::info!("命令未执行：无可用候选 keyword={}", song.keyword);
             self.reply(&format!("{}平台无对应歌曲音源", label))?;
             return Ok(None);
         }
@@ -797,7 +803,15 @@ impl SongRequestExecution<'_> {
             SongRequestDecision::Confirm | SongRequestDecision::Timeout => candidate,
             SongRequestDecision::SelectIndex(index) => match selection.get(index - 1).cloned() {
                 Some(candidate) => candidate,
-                None => return Ok(None),
+                None => {
+                    log::info!(
+                        "命令未执行：AI点歌候选序号越界 index={} 候选数={} keyword={}",
+                        index,
+                        selection.len(),
+                        song.keyword
+                    );
+                    return Ok(None);
+                }
             },
             SongRequestDecision::LocalLibrary => {
                 let Some(offer) = local_offer else {
@@ -823,7 +837,10 @@ impl SongRequestExecution<'_> {
             | SongRequestDecision::Select
             | SongRequestDecision::Cancelled
             | SongRequestDecision::SwitchSource
-            | SongRequestDecision::Ai => return Ok(None),
+            | SongRequestDecision::Ai => {
+                log::info!("点歌未执行：决策={:?} keyword={}", decision, song.keyword);
+                return Ok(None);
+            }
         };
         Ok(Some(ResolvedSongRequest {
             keyword: candidate.text.clone(),
@@ -894,7 +911,13 @@ impl SongRequestExecution<'_> {
                         return self.resolve_and_confirm_song_with_source(song, next_source);
                     }
                     NoCandidateOutcome::Ai => return self.resolve_and_confirm_song_ai(song),
-                    NoCandidateOutcome::Skip => return Ok(None),
+                    NoCandidateOutcome::Skip => {
+                        log::info!(
+                            "命令未执行：无在线候选且未选择本地/AI/换源 keyword={}",
+                            request.keyword
+                        );
+                        return Ok(None);
+                    }
                 }
             };
             // 本地匹配度严格高于在线结果时才展示本地搜索结果。
@@ -926,6 +949,12 @@ impl SongRequestExecution<'_> {
             let selected = match decision {
                 SongRequestDecision::SelectIndex(index) => {
                     let Some(candidate) = picked.candidate_snapshot.get(index - 1).cloned() else {
+                        log::info!(
+                            "命令未执行：点歌候选序号越界 index={} 候选数={} keyword={}",
+                            index,
+                            picked.candidate_snapshot.len(),
+                            request.keyword
+                        );
                         return Ok(None);
                     };
                     candidate
@@ -956,7 +985,14 @@ impl SongRequestExecution<'_> {
                         | SongRequestDecision::Stopped
                         | SongRequestDecision::Select
                         | SongRequestDecision::Cancelled
-                        | SongRequestDecision::LocalLibrary => Ok(None),
+                        | SongRequestDecision::LocalLibrary => {
+                            log::info!(
+                                "点歌未执行：决策={:?} keyword={}",
+                                decision,
+                                request.keyword
+                            );
+                            Ok(None)
+                        }
                         SongRequestDecision::SwitchSource => {
                             let next_source = alternate_music_source(source);
                             self.resolve_and_confirm_song_with_source(song, next_source)
@@ -964,7 +1000,10 @@ impl SongRequestExecution<'_> {
                         SongRequestDecision::Ai if self.ai.enabled() => {
                             self.resolve_and_confirm_song_ai(song)
                         }
-                        SongRequestDecision::Ai => Ok(None),
+                        SongRequestDecision::Ai => {
+                            log::info!("命令未执行：AI点歌未启用 keyword={}", request.keyword);
+                            Ok(None)
+                        }
                         SongRequestDecision::Confirm
                         | SongRequestDecision::Timeout
                         | SongRequestDecision::SelectIndex(_) => unreachable!(),
@@ -1034,7 +1073,13 @@ impl SongRequestExecution<'_> {
                     return self.resolve_and_confirm_song_with_source(song, next_source);
                 }
                 NoCandidateOutcome::Ai => return self.resolve_and_confirm_song_ai(song),
-                NoCandidateOutcome::Skip => return Ok(None),
+                NoCandidateOutcome::Skip => {
+                    log::info!(
+                        "命令未执行：换源后仍无候选且未继续换源/本地/AI keyword={}",
+                        song.keyword
+                    );
+                    return Ok(None);
+                }
             }
         };
         let actions = if self.ai.enabled() {
@@ -1087,7 +1132,10 @@ impl SongRequestExecution<'_> {
                     candidate_snapshot: picked.candidate_snapshot,
                 }))
             }
-            SongRequestDecision::Skip => Ok(None),
+            SongRequestDecision::Skip => {
+                log::info!("点歌未执行：决策={:?} keyword={}", decision, song.keyword);
+                Ok(None)
+            }
             SongRequestDecision::SwitchSource => {
                 let next_source = alternate_music_source(source);
                 self.resolve_and_confirm_song_with_source(song, next_source)
@@ -1097,7 +1145,10 @@ impl SongRequestExecution<'_> {
             | SongRequestDecision::Ai
             | SongRequestDecision::Select
             | SongRequestDecision::Cancelled
-            | SongRequestDecision::LocalLibrary => Ok(None),
+            | SongRequestDecision::LocalLibrary => {
+                log::info!("点歌未执行：决策={:?} keyword={}", decision, song.keyword);
+                Ok(None)
+            }
         }
     }
 
@@ -1509,7 +1560,10 @@ impl SongRequestExecution<'_> {
                 }
                 // @选择 或越界序号：重发列表继续等待；其余（跳过、超时、停止）一律放弃。
                 SongRequestDecision::Select | SongRequestDecision::SelectIndex(_) => continue,
-                _ => return Ok(None),
+                other => {
+                    log::info!("命令未执行：本地曲库选择放弃 decision={other:?} 候选数={count}");
+                    return Ok(None);
+                }
             }
         }
     }
@@ -1556,7 +1610,10 @@ impl SongRequestExecution<'_> {
                 Ok(NoCandidateOutcome::SwitchSource)
             }
             SongRequestDecision::Ai if self.ai.enabled() => Ok(NoCandidateOutcome::Ai),
-            _ => Ok(NoCandidateOutcome::Skip),
+            other => {
+                log::info!("命令未执行：无在线候选，决策={other:?} 按跳过处理 keyword={keyword}");
+                Ok(NoCandidateOutcome::Skip)
+            }
         }
     }
 

@@ -37,9 +37,8 @@ pub(crate) use visual::{
     secondary_hall_bubbles,
 };
 pub(crate) use passive::{
-    PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity, hash_region,
-    parse_secondary_sender_identity, passive_layout, passive_secondary_identity, passive_sender,
-    recognize_passive_hall, recognize_passive_secondary,
+    PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity,
+    parse_secondary_sender_identity, passive_layout, recognize_passive_secondary,
 };
 
 #[cfg(test)]

@@ -48,6 +48,34 @@ struct PlaylistRuntimePlaybackPort<'a> {
     runtime: &'a mut ApplicationRuntime,
 }
 
+impl ApplicationRuntime {
+    /// 上下文丢失（换大厅/进千星/进入游戏）：结束个人歌单模式并清理残留自动项。
+    pub(super) fn end_personal_playlist_for_context_loss(&self, reason: &str) -> Result<()> {
+        let application = self.playback.playback_application.clone();
+        let Some(owner) = application.take_personal_playlist_mode() else {
+            return Ok(());
+        };
+        log::info!("{reason}: 已结束个人歌单模式 (owner={owner})");
+        let items = self
+            .business
+            .business
+            .playback_queue_snapshot()
+            .map_err(anyhow::Error::from)?;
+        let indexes = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.playlist_auto.then_some(index))
+            .collect::<Vec<_>>();
+        if !indexes.is_empty() {
+            self.business
+                .business
+                .remove_playback_queue_indexes(indexes)
+                .map_err(anyhow::Error::from)?;
+        }
+        Ok(())
+    }
+}
+
 impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlaybackPort<'_> {
     fn current_track(&self) -> Option<miliastra_playback::PlayableTrack> {
         self.runtime
@@ -90,6 +118,22 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
     fn stop_playlist(&mut self) -> Result<bool> {
         let application = self.runtime.playback.playback_application.clone();
         application.stop_personal_playlist(self.runtime)
+    }
+
+    fn playlist_mode_owner(&self) -> Option<String> {
+        self.runtime.playback.playback_application.playlist_mode_owner()
+    }
+
+    fn extend_playlist_tracks(
+        &mut self,
+        owner: &str,
+        tracks: &[miliastra_playback::PlayableTrack],
+    ) -> Result<bool> {
+        Ok(self
+            .runtime
+            .playback
+            .playback_application
+            .extend_personal_playlist_tracks(owner, tracks))
     }
 
     fn import_playlist(

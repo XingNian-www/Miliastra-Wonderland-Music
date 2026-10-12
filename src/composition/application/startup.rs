@@ -30,7 +30,10 @@ impl StartupExecutionPort for ApplicationRuntime {
             .wait()
             .context("等待进入游戏 UI 事务")?;
         match outcome.effect() {
-            EnterGameEffect::Entered => self.reset_chat_observation_baseline("已进入游戏")?,
+            EnterGameEffect::Entered => {
+                self.reset_chat_observation_baseline("已进入游戏")?;
+                self.end_personal_playlist_for_context_loss("已进入游戏")?;
+            }
             EnterGameEffect::WindowReady | EnterGameEffect::Skipped => {}
             EnterGameEffect::Failed(failure) => return Err(anyhow!(failure.to_string())),
         }
@@ -51,6 +54,7 @@ impl StartupExecutionPort for ApplicationRuntime {
         match outcome.effect() {
             EnterWonderlandEffect::Entered => {
                 self.reset_chat_observation_baseline("已进入千星")?;
+                self.end_personal_playlist_for_context_loss("已进入千星")?;
             }
             EnterWonderlandEffect::Skipped => {}
             EnterWonderlandEffect::Failed(failure) => return Err(anyhow!(failure.to_string())),

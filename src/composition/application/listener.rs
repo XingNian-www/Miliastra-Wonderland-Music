@@ -1606,8 +1606,8 @@ impl ApplicationRuntime {
                         messages,
                     }])?;
                 }
-                chat @ (ChatIdentity::SecondaryHall | ChatIdentity::Friend(_)) => {
-                    let is_hall = chat == ChatIdentity::SecondaryHall;
+                ref chat @ (ChatIdentity::SecondaryHall | ChatIdentity::Friend(_)) => {
+                    let is_hall = *chat == ChatIdentity::SecondaryHall;
                     let accepts_turtle_questions = is_hall
                         && self.commands_enabled()?
                         && self.business.business.turtle_soup_accepts_questions()?;
@@ -1660,7 +1660,7 @@ impl ApplicationRuntime {
                                 continue;
                             }
                         }
-                        let id = message.id;
+                        let id = message.id.clone();
                         // Claim atomically against discard suppression and other
                         // queued revisions before dispatching business effects.
                         let Some(claim) = self.ui.chat_timeline.claim_business(
@@ -1773,7 +1773,7 @@ impl ApplicationRuntime {
                 .flat_map(|dispatch| match dispatch {
                     ChatObservationDispatch::Primary { messages, .. } => messages
                         .iter()
-                        .map(|message| message.text.clone())
+                        .map(|message| message.message.text.clone())
                         .collect::<Vec<_>>(),
                     _ => Vec::new(),
                 })

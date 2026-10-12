@@ -452,7 +452,7 @@ idiom_chain:
   history_limit: 200
   # 多久无人接词就自动结束本局；0 表示不超时，单位秒
   idle_timeout_seconds: 300
-  # false 时开局玩家不能连续接词
+  # 兼容旧配置保留；现在始终允许同一玩家连续接词
   allow_consecutive_player: false
   # false 时仅开局玩家可使用 #结束
   allow_anyone_stop: false

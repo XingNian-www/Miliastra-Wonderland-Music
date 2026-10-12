@@ -27,7 +27,7 @@ use super::cache_key_hash;
 pub(super) const DATABASE_FILE_NAME: &str = "playback.sqlite3";
 
 /// 当前 schema 版本（写入 PRAGMA user_version）。
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// SQLite busy_timeout（毫秒）：并发访问数据库时等待锁的最长时间。
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS cached_tracks (
     hash        TEXT PRIMARY KEY,
     source      TEXT,
     id          TEXT,
+    resolver_locator TEXT,
     title       TEXT,
     artists     TEXT NOT NULL DEFAULT '[]',
     album       TEXT,
@@ -75,7 +76,7 @@ CREATE TABLE IF NOT EXISTS cached_lyrics (
 ";
 
 /// 曲目记录查询统一使用的列清单。
-const TRACK_COLUMNS: &str = "hash, source, id, title, artists, album, duration_ms, complete, bytes, created_at, updated_at, play_count, requested_play_count, pool_play_count, cache_hit_count, failure_count, last_played_at_ms, last_failure_code, downloaded_at_ms";
+const TRACK_COLUMNS: &str = "hash, source, id, title, artists, album, duration_ms, complete, bytes, created_at, updated_at, play_count, requested_play_count, pool_play_count, cache_hit_count, failure_count, last_played_at_ms, last_failure_code, downloaded_at_ms, resolver_locator";
 
 /// 缓存曲目记录（对账与分页列表的返回载体）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +85,8 @@ pub(super) struct TrackRecord {
     /// 来源与 ID；对账登记的无身份孤儿完整文件为 None。
     pub source: Option<String>,
     pub id: Option<String>,
+    /// 解析定位符（QQ/酷狗等区分 media_mid/album 版本）；旧记录为 None。
+    pub resolver_locator: Option<String>,
     /// 未记录元数据时为 None。
     pub metadata: Option<TrackMetadata>,
     /// 音频完整文件是否已落盘。
@@ -164,8 +167,10 @@ impl MetadataStore {
         &self,
         key: &SongKey,
         metadata: Option<&TrackMetadata>,
+        locator: Option<&crate::ResolverLocator>,
     ) -> Result<(), MetadataStoreError> {
         let now = now_epoch_secs();
+        let locator = locator.map(|value| String::from(value.clone()));
         // metadata 为 None 时各字段传 NULL/空串，靠 SQL 的 COALESCE 与
         // CASE 分支保留旧值；title 是否为 NULL 兼任「本次是否带元数据」标记。
         let (title, artists_json, album, duration_ms) = match metadata {
@@ -179,8 +184,8 @@ impl MetadataStore {
         };
         self.conn.execute(
             "INSERT INTO cached_tracks
-                (hash, source, id, title, artists, album, duration_ms, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                (hash, source, id, title, artists, album, duration_ms, created_at, updated_at, resolver_locator)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
              ON CONFLICT(hash) DO UPDATE SET
                 source = excluded.source,
                 id = excluded.id,
@@ -190,7 +195,8 @@ impl MetadataStore {
                                ELSE excluded.artists END,
                 album = COALESCE(excluded.album, cached_tracks.album),
                 duration_ms = COALESCE(excluded.duration_ms, cached_tracks.duration_ms),
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                resolver_locator = COALESCE(excluded.resolver_locator, cached_tracks.resolver_locator)",
             params![
                 cache_key_hash(key),
                 key.source,
@@ -200,6 +206,7 @@ impl MetadataStore {
                 album,
                 duration_ms,
                 now,
+                locator,
             ],
         )?;
         Ok(())
@@ -637,6 +644,10 @@ impl MetadataStore {
                         return None;
                     }
                 };
+                let locator = record
+                    .resolver_locator
+                    .as_deref()
+                    .and_then(|value| crate::ResolverLocator::new(value).ok());
                 let (Some(source), Some(id), Some(metadata)) =
                     (record.source, record.id, record.metadata)
                 else {
@@ -651,7 +662,7 @@ impl MetadataStore {
                 return Some(crate::PlayableTrack {
                     track_ref: crate::TrackRef {
                         key,
-                        resolver_locator: None,
+                        resolver_locator: locator,
                     },
                     metadata,
                 });
@@ -681,6 +692,22 @@ impl MetadataStore {
             // 全新数据库：一次性创建当前完整 schema。
             0 => {
                 self.conn.execute_batch(SCHEMA_SQL)?;
+                self.conn
+                    .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            // v1 -> v2：补 resolver_locator 列。缓存可重建，旧记录该列为 NULL，
+            // 播放时会重新解析并回填。
+            1 => {
+                let has_column: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('cached_tracks') WHERE name = 'resolver_locator'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_column == 0 {
+                    self.conn.execute_batch(
+                        "ALTER TABLE cached_tracks ADD COLUMN resolver_locator TEXT",
+                    )?;
+                }
                 self.conn
                     .pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
@@ -734,6 +761,7 @@ fn track_from_row(row: &rusqlite::Row<'_>) -> Result<TrackRecord, MetadataStoreE
         downloaded_at_ms: row
             .get::<_, Option<i64>>(18)?
             .map(|value| value.max(0) as u64),
+        resolver_locator: row.get(19)?,
     })
 }
 
@@ -779,7 +807,7 @@ pub(super) enum MetadataStoreError {
         parameter: &'static str,
         value: usize,
     },
-    #[error("不支持的数据库 schema 版本: {version}（当前版本 v1，不提供迁移）")]
+    #[error("不支持的数据库 schema 版本: {version}（当前版本 v2，仅支持 v1->v2 迁移）")]
     UnsupportedSchema { version: i64 },
 }
 
@@ -821,7 +849,7 @@ mod tests {
         ] {
             let k = key(source, id);
             store
-                .upsert_track(&k, with_metadata.then_some(&metadata))
+                .upsert_track(&k, with_metadata.then_some(&metadata),None)
                 .unwrap();
             if complete {
                 store
@@ -862,7 +890,7 @@ mod tests {
             let k = key("qqmusic", &i.to_string());
             let mut metadata = sample_metadata();
             metadata.title = format!("歌曲{i}");
-            store.upsert_track(&k, Some(&metadata)).unwrap();
+            store.upsert_track(&k, Some(&metadata),None).unwrap();
             store
                 .mark_complete(&cache_key_hash(&k), 100, false)
                 .unwrap();
@@ -1009,7 +1037,7 @@ mod tests {
         let hash = cache_key_hash(&track_key);
 
         store
-            .upsert_track(&track_key, Some(&sample_metadata()))
+            .upsert_track(&track_key, Some(&sample_metadata()),None)
             .unwrap();
         let first = store.track(&hash).unwrap().unwrap();
         assert_eq!(first.source.as_deref(), Some("kugou"));
@@ -1022,7 +1050,7 @@ mod tests {
             ..sample_metadata()
         };
         store
-            .upsert_track(&track_key, Some(&updated_metadata))
+            .upsert_track(&track_key, Some(&updated_metadata),None)
             .unwrap();
         let second = store.track(&hash).unwrap().unwrap();
         assert_eq!(second.metadata.unwrap().title, "新标题");
@@ -1046,9 +1074,9 @@ mod tests {
         let hash = cache_key_hash(&track_key);
 
         store
-            .upsert_track(&track_key, Some(&sample_metadata()))
+            .upsert_track(&track_key, Some(&sample_metadata()),None)
             .unwrap();
-        store.upsert_track(&track_key, None).unwrap();
+        store.upsert_track(&track_key, None,None).unwrap();
 
         let record = store.track(&hash).unwrap().unwrap();
         assert_eq!(record.metadata, Some(sample_metadata()));
@@ -1070,7 +1098,7 @@ mod tests {
         assert!(!store.touch(&hash).unwrap());
         assert!(!store.remove(&hash).unwrap());
 
-        store.upsert_track(&track_key, None).unwrap();
+        store.upsert_track(&track_key, None,None).unwrap();
         assert!(store.mark_complete(&hash, 4096, true).unwrap());
         let record = store.track(&hash).unwrap().unwrap();
         assert!(record.complete);
@@ -1101,7 +1129,7 @@ mod tests {
         // 曲目记录不存在时，歌词正文写入违反外键约束。
         assert!(store.upsert_lyrics(&hash, b"{\"lines\":[]}").is_err());
 
-        store.upsert_track(&track_key, None).unwrap();
+        store.upsert_track(&track_key, None,None).unwrap();
         store.upsert_lyrics(&hash, b"{\"lines\":[]}").unwrap();
         assert_eq!(
             store.get_lyrics_json(&hash).unwrap().as_deref(),
@@ -1165,7 +1193,7 @@ mod tests {
 
         // 后续解析到真实身份：upsert 补齐 source/id，完整状态保留。
         store
-            .upsert_track(&track_key, Some(&sample_metadata()))
+            .upsert_track(&track_key, Some(&sample_metadata()),None)
             .unwrap();
         let record = store.track(&hash).unwrap().unwrap();
         assert_eq!(record.source.as_deref(), Some("kugou"));
@@ -1187,12 +1215,12 @@ mod tests {
         let unknown_key = key("kugou", "missing");
 
         store
-            .upsert_track(&complete_key, Some(&sample_metadata()))
+            .upsert_track(&complete_key, Some(&sample_metadata()),None)
             .unwrap();
         store
             .mark_complete(&cache_key_hash(&complete_key), 8192, true)
             .unwrap();
-        store.upsert_track(&partial_key, None).unwrap();
+        store.upsert_track(&partial_key, None,None).unwrap();
         let lyrics_json = b"512-bytes-lyrics";
         store
             .upsert_lyrics(&cache_key_hash(&complete_key), lyrics_json)
@@ -1224,13 +1252,13 @@ mod tests {
         let store = MetadataStore::open(&directory).unwrap();
         for id in ["a", "b", "c"] {
             let track_key = key("kugou", id);
-            store.upsert_track(&track_key, None).unwrap();
+            store.upsert_track(&track_key, None,None).unwrap();
             store
                 .mark_complete(&cache_key_hash(&track_key), 1024, true)
                 .unwrap();
         }
         // 未完整历史元数据不得出现在磁盘缓存列表或 total 中。
-        store.upsert_track(&key("kugou", "idle"), None).unwrap();
+        store.upsert_track(&key("kugou", "idle"), None,None).unwrap();
         // 手动铺时间：c 最新、a 最旧，验证按最近使用倒序。
         store
             .conn
@@ -1297,7 +1325,7 @@ mod tests {
         let store = MetadataStore::open(&directory).unwrap();
         for (id, count) in [("low", 1u64), ("high", 9), ("mid", 5)] {
             let track_key = key("kugou", id);
-            store.upsert_track(&track_key, None).unwrap();
+            store.upsert_track(&track_key, None,None).unwrap();
             store
                 .mark_complete(&cache_key_hash(&track_key), 1024, true)
                 .unwrap();
@@ -1349,7 +1377,7 @@ mod tests {
         let track_key = key("kugou", "statistics");
         let hash = cache_key_hash(&track_key);
         store
-            .upsert_track(&track_key, Some(&sample_metadata()))
+            .upsert_track(&track_key, Some(&sample_metadata()),None)
             .unwrap();
 
         assert!(store.record_play(&hash, "session-a", 7, true).unwrap());
@@ -1394,7 +1422,7 @@ mod tests {
         let store = MetadataStore::open(&directory).unwrap();
         let track_key = key("kugou", "concurrent");
         let hash = cache_key_hash(&track_key);
-        store.upsert_track(&track_key, None).unwrap();
+        store.upsert_track(&track_key, None,None).unwrap();
         drop(store);
 
         let mut workers = Vec::new();
@@ -1425,7 +1453,7 @@ mod tests {
         let track_key = key("kugou", "reset");
         let hash = cache_key_hash(&track_key);
         store
-            .upsert_track(&track_key, Some(&sample_metadata()))
+            .upsert_track(&track_key, Some(&sample_metadata()),None)
             .unwrap();
         store.mark_complete(&hash, 4096, true).unwrap();
         store.upsert_lyrics(&hash, b"lyrics-body").unwrap();

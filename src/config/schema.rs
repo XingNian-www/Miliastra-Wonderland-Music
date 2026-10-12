@@ -250,6 +250,19 @@ fn window_section() -> Vec<ConfigFieldSchema> {
             "/active-window 接口是否尝试自动切回目标窗口",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "capture_method",
+            "截图采集方式",
+            FieldKind::Enum(vec![
+                ("gdi".to_string(), "GDI 窗口采集".to_string()),
+                (
+                    "print_window".to_string(),
+                    "PrintWindow 窗口绘制".to_string(),
+                ),
+                ("desktop".to_string(), "桌面可见区域".to_string()),
+            ]),
+            "选择 Windows 截图来源；GDI 通常最兼容，PrintWindow 可尝试采集被遮挡窗口，桌面方式只采集屏幕上实际可见内容",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "focus_point",
             "安全聚焦点",
             FieldKind::Point,

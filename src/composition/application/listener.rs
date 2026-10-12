@@ -1741,7 +1741,25 @@ impl ApplicationRuntime {
             // 观测有没有漏。所以这里把原本要丢弃的观测**原样推送**出去：
             // 本进程当观察者，AI 当执行者。行为边界不变，仍然不执行任何自动化。
             publish_debug_chat_observations(&dispatches);
-            log::debug!("调试模式已启用，丢弃游戏内聊天命令与问题，不执行自动化");
+            let command_like: Vec<String> = dispatches
+                .iter()
+                .flat_map(|dispatch| match dispatch {
+                    ChatObservationDispatch::Primary { messages, .. } => messages
+                        .iter()
+                        .map(|message| message.text.clone())
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .filter(|text| command::looks_like_command(text))
+                .collect();
+            if command_like.is_empty() {
+                log::debug!("调试模式已启用，丢弃游戏内聊天命令与问题，不执行自动化");
+            } else {
+                log::info!(
+                    "命令未执行：调试/完全控制模式启用，本进程不执行游戏内命令 text={}",
+                    compact_for_log(&command_like.join(" | "))
+                );
+            }
             return Ok(SecondaryObservationOutcome::default());
         }
         let mut secondary = SecondaryObservationOutcome::default();

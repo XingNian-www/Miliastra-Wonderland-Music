@@ -555,7 +555,12 @@ impl SongRequestExecution<'_> {
 
     fn queue_is_full(&self, context: &SongRequestContext) -> Result<bool> {
         let queue = self.port.playback_queue()?;
-        if queue.len() < self.queue_max_size {
+        if queue.len() < self.queue_max_size
+            || (queue.len() == self.queue_max_size
+                && queue.iter().any(|item| item.playlist_auto))
+        {
+            // A manual request can replace an auto-filled playlist item; let the queue
+            // perform that atomic eviction after resolving the requested track.
             return Ok(false);
         }
         self.log_executed_command(context, "queue-full-early")?;
@@ -2172,6 +2177,7 @@ mod tests {
         online_error: Cell<bool>,
         fail_search_call: Cell<usize>,
         queue: RefCell<Vec<QueueItem>>,
+        queue_limit: Option<usize>,
         status: FakeStatus,
         should_queue: bool,
         status_matches: bool,
@@ -2199,6 +2205,7 @@ mod tests {
                 online_error: Cell::new(false),
                 fail_search_call: Cell::new(0),
                 queue: RefCell::new(Vec::new()),
+                queue_limit: None,
                 status: FakeStatus::Available(Box::new(stopped_status())),
                 should_queue: false,
                 status_matches: false,
@@ -2324,6 +2331,23 @@ mod tests {
 
         fn push_queue(&self, mut item: QueueItem) -> Result<QueuePushOutcome> {
             let mut queue = self.queue.borrow_mut();
+            if let Some(limit) = self.queue_limit
+                && queue.len() >= limit
+            {
+                if item.playlist_auto {
+                    return Ok(QueuePushOutcome {
+                        accepted: false,
+                        size: queue.len(),
+                    });
+                }
+                let Some(index) = queue.iter().rposition(|queued| queued.playlist_auto) else {
+                    return Ok(QueuePushOutcome {
+                        accepted: false,
+                        size: queue.len(),
+                    });
+                };
+                queue.remove(index);
+            }
             item.id = queue.len() as u64 + 1;
             queue.push(item);
             Ok(QueuePushOutcome {
@@ -2472,6 +2496,59 @@ mod tests {
         assert!(port.search_sources.borrow().is_empty());
         assert!(port.played.borrow().is_empty());
         assert_eq!(port.logs.borrow().as_slice(), ["queue-full-early"]);
+    }
+
+    #[test]
+    fn full_playlist_auto_queue_accepts_manual_song_request_and_evicts_auto_item() {
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
+        port.queue_limit = Some(1);
+        port.queue.borrow_mut().push(QueueItem {
+            keyword: "歌单自动项".to_string(),
+            playlist_auto: true,
+            ..QueueItem::default()
+        });
+        let application = SongRequestApplication::with_gateways(
+            Arc::new(DisabledAiGateway),
+            Arc::new(DisabledReviewGateway),
+            1,
+            true,
+        );
+
+        application
+            .execute(&context(), &command(), &mut port)
+            .expect("manual request can replace an auto playlist item");
+
+        assert_eq!(port.search_sources.borrow().as_slice(), ["qqmusic"]);
+        assert_eq!(port.queue.borrow().len(), 1);
+        assert_eq!(port.queue.borrow()[0].keyword, "晴天 - 周杰伦");
+        assert!(!port.queue.borrow()[0].playlist_auto);
+        assert!(port.replies.borrow().iter().any(|reply| reply.contains("队列已加入")));
+        assert!(!port.replies.borrow().iter().any(|reply| reply == "队列已满，请稍后再试"));
+    }
+
+    #[test]
+    fn full_manual_queue_still_rejects_song_request_before_searching() {
+        let mut port = FakePort::idle(std::iter::empty());
+        port.queue_limit = Some(1);
+        port.queue.borrow_mut().push(QueueItem {
+            keyword: "已有手动歌曲".to_string(),
+            ..QueueItem::default()
+        });
+        let application = SongRequestApplication::with_gateways(
+            Arc::new(DisabledAiGateway),
+            Arc::new(DisabledReviewGateway),
+            1,
+            true,
+        );
+
+        application
+            .execute(&context(), &command(), &mut port)
+            .expect("full manual queue should be handled");
+
+        assert_eq!(port.replies.borrow().as_slice(), ["队列已满，请稍后再试"]);
+        assert!(port.search_sources.borrow().is_empty());
+        assert_eq!(port.queue.borrow()[0].keyword, "已有手动歌曲");
     }
 
     #[test]

@@ -293,14 +293,14 @@ pub(crate) struct SharedBusinessClaim {
 
 impl SharedBusinessClaim {
     /// 作为命令派发成功的提交点：确认已处理，并把该消息自身的文本与 y 写进命令锁。
-    pub(crate) fn complete_as_command(mut self) -> Result<()> {
+    pub(crate) fn complete_as_command(self) -> Result<()> {
         self.commit(true)
     }
 
     /// 主动丢弃、被禁用或已处理的非命令永久消费，**绝不写命令锁**。
     /// 缺陷 1：二级/好友路径若在这里也写锁，普通闲聊会把真命令条目 FIFO 挤出，
     /// 重建后仍在屏上的已执行命令会重跑。
-    pub(crate) fn complete_ignored(mut self) -> Result<()> {
+    pub(crate) fn complete_ignored(self) -> Result<()> {
         self.commit(false)
     }
 

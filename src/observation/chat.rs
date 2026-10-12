@@ -1,11 +1,15 @@
 pub(crate) mod scan;
+#[allow(dead_code)]
 pub(crate) mod freshness;
 mod passive;
 mod secondary_hall_vision;
 mod secondary_unread_vision;
+#[allow(dead_code)]
 mod stream;
+#[allow(dead_code)]
 mod timeline;
 pub(crate) use timeline::*;
+#[allow(dead_code)]
 mod visual;
 
 use std::collections::BTreeMap;
@@ -32,13 +36,10 @@ pub(crate) use visual::{
     hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
     secondary_hall_bubbles,
 };
-pub(crate) use freshness::{
-    BaselineKind, FrameDecision, FreshFrame, Freshness, SequenceFreshness, ViewPhase,
-};
 pub(crate) use passive::{
     PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity, hash_region,
     parse_secondary_sender_identity, passive_layout, passive_secondary_identity, passive_sender,
-    passive_text, recognize_passive_hall, recognize_passive_secondary,
+    recognize_passive_hall, recognize_passive_secondary,
 };
 
 #[cfg(test)]

@@ -127,6 +127,7 @@ impl PersistentQueue {
         self.items.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn is_full(&self) -> bool {
         self.items.len() >= self.max_size
     }

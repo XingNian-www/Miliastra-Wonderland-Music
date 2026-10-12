@@ -15,12 +15,10 @@ use super::{
 };
 use crate::config::AppConfig;
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
-use crate::runtime::ui::{UiStateKind, UiStateObservation};
+use crate::runtime::ui::UiStateKind;
 use crate::ui::frame::Frame;
 use crate::ui::geometry::{Rect, crop_canvas};
-use crate::ui::locator::secondary_hall_search_rect;
-use crate::ui::routines::highlighted_conversation_row;
-use crate::ui::template::{TemplateHit, best_template_hit};
+use crate::ui::template::best_template_hit;
 
 pub(crate) const SECONDARY_HALL_FALLBACK_SENDER: &str = "二级大厅";
 #[derive(Clone, Debug, PartialEq, Eq)]

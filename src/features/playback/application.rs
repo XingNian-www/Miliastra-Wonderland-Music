@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -457,6 +457,9 @@ pub(crate) struct PlaybackApplication {
     personal_playlist: Arc<Mutex<Option<PersonalPlaylistQueue>>>,
     /// 当前正在播放的曲目是否来自个人歌单自动队列；@状态 据此决定是否标注归属。
     current_playlist_auto: Arc<AtomicBool>,
+    /// 队首 QueueBlockingFailure 的连续失败计数（item id -> (次数, 首次失败时刻)）。
+    /// 超限后按项目级失败丢弃，避免队首永久毒化整条队列。
+    queue_block_failures: Arc<Mutex<HashMap<u64, (u32, Instant)>>>,
 }
 
 #[derive(Default)]
@@ -536,6 +539,30 @@ impl PlaybackApplication {
             last_played: Arc::new(Mutex::new(None)),
             personal_playlist: Arc::new(Mutex::new(None)),
             current_playlist_auto: Arc::new(AtomicBool::new(false)),
+            queue_block_failures: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// 记录一次队首 QueueBlockingFailure；返回是否已达重试上限。
+    fn record_queue_block_failure(&self, item_id: u64) -> bool {
+        const MAX_CONSECUTIVE: u32 = 3;
+        const WINDOW: Duration = Duration::from_secs(300);
+        let now = Instant::now();
+        let mut failures = self
+            .queue_block_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = failures.entry(item_id).or_insert((0, now));
+        if now.duration_since(entry.1) > WINDOW {
+            *entry = (0, now);
+        }
+        entry.0 = entry.0.saturating_add(1);
+        entry.0 >= MAX_CONSECUTIVE
+    }
+
+    fn clear_queue_block_failure(&self, item_id: u64) {
+        if let Ok(mut failures) = self.queue_block_failures.lock() {
+            failures.remove(&item_id);
         }
     }
 
@@ -1076,6 +1103,8 @@ impl PlaybackApplication {
     ) -> Result<Option<ConsumedSelection>> {
         // 播放池随机播放时排除本轮所有已尝试歌曲，保证候选有限耗尽。
         let mut pool_excluded = HashSet::new();
+        // 本轮个人歌单已尝试且失败的曲目（按曲目身份），防止 refill 无限回灌。
+        let mut playlist_attempted: HashSet<String> = HashSet::new();
         loop {
             if purpose.stop_when_user_paused() && port.user_pause_active()? {
                 log::info!("自动出队已跳过: 播放器处于用户暂停状态");
@@ -1086,6 +1115,16 @@ impl PlaybackApplication {
                 return Ok(None);
             }
             self.refill_personal_playlist_queue(port)?;
+            // 歌单项项目级失败后会被 refill 回灌；剔除本轮已尝试的曲目，保证循环收敛。
+            if self.personal_playlist_active() && !playlist_attempted.is_empty() {
+                for item in port.playback_queue()? {
+                    if item.playlist_auto
+                        && playlist_attempted.contains(&playlist_attempt_key(&item))
+                    {
+                        port.remove_playback_queue(QueueRemoval::Id(item.id))?;
+                    }
+                }
+            }
             let queue = port.playback_queue()?;
             // 点歌队列独立于播放模式，始终优先按入队顺序消费。
             // 只有队列为空时，单曲循环才作用于自动续播。
@@ -1187,6 +1226,7 @@ impl PlaybackApplication {
             let result = self.finish_playback(completion, port)?;
             match result.outcome() {
                 PlaybackOutcome::Success => {
+                    self.clear_queue_block_failure(item.id);
                     if self.personal_playlist_active()
                         && let Some(track) = &item.track
                         && let Some(mode) = self
@@ -1206,13 +1246,28 @@ impl PlaybackApplication {
                 }
                 PlaybackOutcome::ItemScopedFailure => {
                     log::error!("队列项不可播放，已丢弃: {}", item.keyword);
+                    self.clear_queue_block_failure(item.id);
+                    if item.playlist_auto {
+                        playlist_attempted.insert(playlist_attempt_key(&item));
+                    }
                 }
                 PlaybackOutcome::QueueBlockingFailure => {
                     log::error!("队列项播放被阻断，保留在队首: {}", item.keyword);
+                    // 连续失败超限的队首不再无限重试：丢弃并继续，避免毒化整条队列。
+                    if self.record_queue_block_failure(item.id) {
+                        log::error!("队列项连续失败超限，已跳过: {}", item.keyword);
+                        port.remove_playback_queue(QueueRemoval::Id(item.id))?;
+                        self.clear_queue_block_failure(item.id);
+                        continue;
+                    }
                     return Ok(None);
                 }
                 PlaybackOutcome::DedupLimited => {
                     log::info!("队列项近期已播放过，已跳过: {}", item.keyword);
+                    self.clear_queue_block_failure(item.id);
+                    if item.playlist_auto {
+                        playlist_attempted.insert(playlist_attempt_key(&item));
+                    }
                 }
             }
         }
@@ -1594,6 +1649,14 @@ fn select_snapshot_candidate(
     comparable
         .into_iter()
         .max_by_key(|candidate| candidate.eligibility.preference_rank())
+}
+
+/// 个人歌单「本轮已尝试」的稳定键：优先曲目身份，退化为关键词。
+fn playlist_attempt_key(item: &QueueItem) -> String {
+    item.track
+        .as_ref()
+        .map(|track| format!("{:?}", track.track_ref.key))
+        .unwrap_or_else(|| item.keyword.clone())
 }
 
 fn alternate_snapshot_candidates(request: &PlaybackRequest) -> Vec<SearchCandidate> {

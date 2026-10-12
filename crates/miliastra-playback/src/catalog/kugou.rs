@@ -196,6 +196,26 @@ struct KugouPrivUrlTracker {
 /// 让 Lite/Android 请求始终使用设备绑定的令牌。
 pub(crate) const KUGOU_LITE_TOKEN_COOKIE: &str = "KUGOU_API_TOKEN";
 
+/// 允许持久化的酷狗凭据 Cookie 名（与 credentials.rs 的校验白名单保持一致）。
+/// 刷新接口的 `secu_params` 可能含 token/userid 等仅用于本次请求的键，
+/// 它们不进入持久化，避免保存校验失败导致续期结果丢失。
+const KUGOU_CREDENTIAL_COOKIE_NAMES: &[&str] = &[
+    "KuGoo",
+    "dfid",
+    "KugouGUID",
+    "KUGOU_API_GUID",
+    "KUGOU_API_DFID",
+    "KUGOU_API_MID",
+    "KUGOU_API_MAC",
+    "KUGOU_API_DEV",
+    KUGOU_LITE_TOKEN_COOKIE,
+    "kg_mid",
+    "mid",
+    "t1",
+    "vip_type",
+    "vip_token",
+];
+
 /// /v5/login_by_token 的 p3 明文；字段顺序与官方客户端一致。
 #[derive(Serialize)]
 struct KugouLoginP3 {
@@ -1581,7 +1601,9 @@ impl KugouAdapter {
                         if name == "userid" {
                             userid = Some(value.clone());
                         }
-                        cookies.insert(name, value);
+                        if KUGOU_CREDENTIAL_COOKIE_NAMES.contains(&name.as_str()) {
+                            cookies.insert(name, value);
+                        }
                     }
                 }
                 _ => token = Some(text),
@@ -1600,9 +1622,10 @@ impl KugouAdapter {
                 cookies.insert(name.to_owned(), value);
             }
         }
-        if let Some(userid) = userid.filter(|value| !value.trim().is_empty()) {
-            cookies.insert("userid".to_owned(), userid);
-        }
+        // userid 由 KuGoo/token 字段与请求侧合成，不作为凭据 Cookie 持久化；
+        // 同时清理历史保存中可能残留的非白名单键，保证保存校验通过。
+        cookies.retain(|name, _| KUGOU_CREDENTIAL_COOKIE_NAMES.contains(&name.as_str()));
+        let _ = userid;
         Ok(ProviderCredential::Kugou {
             token: web_token.clone(),
             userid: web_userid.clone(),

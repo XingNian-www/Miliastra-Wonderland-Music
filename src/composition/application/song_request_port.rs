@@ -171,7 +171,12 @@ fn song_search_failure(error: PlayerSearchClientError) -> SongSearchFailure {
             SongSearchFailure::Unavailable("operation id exhausted".to_string())
         }
         PlayerSearchClientError::NotRun { reason } => SongSearchFailure::Unavailable(reason),
-        PlayerSearchClientError::Failed(error) => SongSearchFailure::Backend(error.to_string()),
+        PlayerSearchClientError::Failed(error) => match error.code() {
+            Some("provider_auth_required") => SongSearchFailure::AuthRequired,
+            Some("relogin_required") => SongSearchFailure::ReloginRequired,
+            Some("provider_rate_limited") => SongSearchFailure::RateLimited,
+            _ => SongSearchFailure::Backend(error.to_string()),
+        },
         PlayerSearchClientError::UnexpectedOutcome(outcome) => {
             SongSearchFailure::Unexpected(outcome.to_string())
         }

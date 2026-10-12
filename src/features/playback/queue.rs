@@ -166,6 +166,13 @@ impl PersistentQueue {
         };
         if !item.playlist_auto {
             items.retain(|queued| !(queued.playlist_auto && queued.duplicates_with(&item)));
+            // 原子判重：即使调用方漏了 check-then-act，也不让同一首歌入队两份。
+            if items
+                .iter()
+                .any(|queued| !queued.playlist_auto && queued.duplicates_with(&item))
+            {
+                return Ok(false);
+            }
         }
         if items.len() >= self.max_size {
             if item.playlist_auto {

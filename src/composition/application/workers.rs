@@ -769,7 +769,7 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
         status: PlayerStatus,
         context: QueueAdvanceContext,
     ) -> Result<QueueAdvanceDecision> {
-        let decision = self.player.maybe_advance_queue(status, context)?;
+        let decision = self.player.try_maybe_advance_queue(status, context)?;
         let pending_reload = self.live_configs.has_pending_reload();
         Ok(suppress_automatic_advance_for_reload(
             decision,

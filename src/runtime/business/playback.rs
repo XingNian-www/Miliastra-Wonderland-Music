@@ -67,6 +67,17 @@ impl PlaybackRuntimeState {
                 }
                 let _ = response.send(result);
             }
+            PlaybackRuntimeMessage::RemovePlaylistAutoItems(response) => {
+                let result = self.service_mut().and_then(|service| {
+                    service
+                        .remove_playlist_auto_items()
+                        .map_err(playback_operation_failed)
+                });
+                if result.as_ref().is_ok_and(|removed| *removed > 0) {
+                    self.publish_queue();
+                }
+                let _ = response.send(result);
+            }
             PlaybackRuntimeMessage::ClearQueue(response) => {
                 let result = self
                     .service_mut()

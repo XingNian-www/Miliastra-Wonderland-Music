@@ -1236,6 +1236,7 @@ impl PlaybackApplication {
     /// 直接播放一首已收藏的结构化曲目（个人歌单 @歌单随机 使用）。
     ///
     /// 与点歌确认走同一条 play_confirmed 路径，因此同样计入播放池与后续预加载。
+    #[allow(dead_code)]
     pub(crate) fn play_structured_track<P: PlaybackExecutionPort + ?Sized>(
         &self,
         track: &PlayableTrack,

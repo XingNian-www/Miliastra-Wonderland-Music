@@ -46,6 +46,18 @@ pub(crate) fn looks_like_command(text: &str) -> bool {
     if matches!(trimmed.chars().next(), Some('@' | '＠' | '#' | '＃')) {
         return true;
     }
+    // OCR 有时把发送者与命令粘连（如「昵称@点歌晴天」），前缀不在行首；
+    // 前缀后紧跟非空白字符才算（避免把「@ 某人」这种提及也计入）。
+    if let Some(index) = trimmed
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '@' | '＠' | '#' | '＃'))
+        .map(|(index, _)| index)
+    {
+        let after = trimmed[index..].chars().nth(1);
+        if after.is_some_and(|ch| !ch.is_whitespace()) {
+            return true;
+        }
+    }
     parse_structured_song_text(text).is_some()
 }
 

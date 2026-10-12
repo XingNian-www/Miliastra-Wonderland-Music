@@ -62,6 +62,18 @@ pub(crate) fn format_status(status: &PlayerStatus) -> String {
     }
 }
 
+/// @状态 文本。歌单模式下用 `[归属的歌单]` 前缀，并省略尾部的点歌人。
+pub(crate) fn format_status_with_mode(status: &PlayerStatus, playlist_owner: Option<&str>) -> String {
+    match playlist_owner {
+        Some(owner) => {
+            let mut bare = status.clone();
+            bare.requester.clear();
+            format!("[{}的歌单] {}", owner, format_status(&bare))
+        }
+        None => format_status(status),
+    }
+}
+
 pub(crate) fn format_lyrics(status: &PlayerStatus) -> String {
     let text = status.lyric_line_text.trim();
     if text.is_empty() {
@@ -114,7 +126,26 @@ pub(super) fn format_time(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlayerStatus, format_status};
+    use super::{PlayerStatus, format_status, format_status_with_mode};
+
+    #[test]
+    fn status_uses_owner_playlist_marker_and_drops_requester() {
+        let status = PlayerStatus {
+            status: "playing".into(),
+            name: "歌".into(),
+            singer: "手".into(),
+            duration: 100.0,
+            progress: 10.0,
+            volume: 80,
+            requester: "乙".into(),
+            ..Default::default()
+        };
+        let plain = format_status_with_mode(&status, None);
+        assert!(plain.ends_with('乙'), "大厅模式保留点歌人: {plain}");
+        let playlist = format_status_with_mode(&status, Some("甲"));
+        assert!(playlist.starts_with("[甲的歌单] "), "{playlist}");
+        assert!(!playlist.contains('乙'), "歌单模式用归属替代点歌人: {playlist}");
+    }
 
     #[test]
     fn status_uses_chinese_state_and_includes_requester() {

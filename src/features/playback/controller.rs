@@ -1138,6 +1138,15 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 );
                 return Ok(QueueAdvanceDecision::None);
             }
+            // 音频输出设备不可用/丢失：换歌也没用。停止自动出队，等设备恢复后
+            // 引擎重建输出流并清空失败信号，再自动续播；期间不再逐首跳歌。
+            if status.failure_code == "engine_unavailable" {
+                log::error!(
+                    "音频输出设备不可用，暂停自动出队直到设备恢复: message={}",
+                    status.failure_message
+                );
+                return Ok(QueueAdvanceDecision::None);
+            }
             if status.failure_retryable {
                 log::error!(
                     "引擎播放失败: code={} message={}",

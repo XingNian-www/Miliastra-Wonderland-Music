@@ -391,6 +391,17 @@ mod tarot_routing_tests {
     }
 
     #[test]
+    fn hash_entertainment_help_accepts_the_full_name_too() {
+        let router = ChatCommandRouter::without_custom_workflow();
+        for text in ["#娱乐", "#帮助", "#娱乐帮助"] {
+            let envelope =
+                CommandEnvelope::new(text, "用户", "blue", text, CommandObservation::default())
+                    .unwrap();
+            assert!(router.route(&envelope, None).is_some(), "{text} 应被认领");
+        }
+    }
+
+    #[test]
     fn ampersand_prefix_is_test_only_and_never_routed() {
         let router = ChatCommandRouter::without_custom_workflow();
         let envelope = CommandEnvelope::new(
@@ -471,6 +482,11 @@ fn is_reserved_decision_command(envelope: &CommandEnvelope) -> bool {
     // Window inputs are consumed by their active readers, never by ordinary/custom routing.
     if crate::features::playlist::PlaylistCommand::is_window_decision(envelope) {
         return true;
+    }
+    // 决策语法只属于 `@`：`#` 的娱乐“进行中命令”（如 #确认/#状态）由各玩法的
+    // claims_active_chat 判定，不能被当成保留的决策回复而排除。
+    if envelope.prefix() != CommandPrefix::At {
+        return false;
     }
     let command = envelope.command_text();
     [

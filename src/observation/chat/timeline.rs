@@ -69,6 +69,8 @@ struct State {
     business_claimed: HashSet<ObservedChatMessageId>,
     /// 已经打过“命令未执行原因”日志的消息 id：同一实例只打一次，避免每帧刷屏。
     not_executed_logged: HashSet<ObservedChatMessageId>,
+    /// 聊天区曾不存在（或首屏为空）：说明“首屏没有命令”，冷基线应被消费。
+    cold_baseline_consumed: bool,
     active_business_claims: HashSet<ObservedChatMessageId>,
     ignored_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
     latest_business_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
@@ -423,6 +425,7 @@ impl ChatTimeline {
                     unread_baseline: HashSet::new(),
                     business_claimed: HashSet::new(),
                     not_executed_logged: HashSet::new(),
+                    cold_baseline_consumed: false,
                     active_business_claims: HashSet::new(),
                     ignored_revisions: HashMap::new(),
                     latest_business_revisions: HashMap::new(),
@@ -642,14 +645,22 @@ impl ChatTimeline {
                     .friend_suppression_ended
                     .is_some_and(|end| captured_at <= end));
         // 空 OCR 帧不消费基线：否则会在真正有内容的第一帧丢失基线语义。
-        let baseline = if messages.is_empty() {
+        let frame_empty = messages.is_empty();
+        let baseline = if frame_empty {
             None
         } else {
             state.pending_baseline.take()
         };
+        // 冷基线消费：聊天区不存在（publish_no_chat）或首屏为空，都等价于“首屏没有命令”。
+        // 首屏抑制的目的只是不让 BOT 刚启动就读到旧命令；无命令可抑制时，
+        // 之后出现的命令按新命令处理（蓝色不再被 AppStart 吞、粉色不再走首屏历史提升）。
+        let cold_consumed = state.cold_baseline_consumed || frame_empty;
         let mut freshness = state.chat_freshness.remove(&chat).unwrap_or_default();
+        if cold_consumed {
+            freshness.mark_view_absent();
+        }
         let tracker = state.trackers.get_mut(&chat).expect("tracker inserted");
-        let initial = !tracker.initialized;
+        let initial = !tracker.initialized && !cold_consumed;
         let mut observed = tracker.observe(&chat, messages, &mut freshness, baseline);
         let visual_session = tracker.session;
         if suppress {
@@ -657,6 +668,8 @@ impl ChatTimeline {
                 message.is_new = false;
             }
         }
+        // 只有“可信的非空首帧”才真正消费掉冷基线；空帧或被抑制帧继续保留该标志。
+        state.cold_baseline_consumed = frame_empty || suppress;
         state.chat_freshness.insert(chat.clone(), freshness);
         // 命令锁已降级为**冷启动兜底账本**：新老判定由 freshness 的序列对齐负责；
         // 这里只在“携带基线事件的帧”或“tracker 刚建立的首帧”用锁否决已经成功执行过的
@@ -879,6 +892,8 @@ impl ChatTimeline {
         state.latest = None;
         // A disappeared view starts new visual sessions on its next appearance.
         state.trackers.clear();
+        // 聊天区不存在：首屏没有命令可抑制，冷基线就此消费（见 mark_view_absent 说明）。
+        state.cold_baseline_consumed = true;
         // 聊天不可见：保留新鲜度状态，但**不再强制下一帧不连续**。
         // 真实案例：聊天框消失后回来的第一条新命令曾被“全旧”吞掉。交叠时交给对齐按
         // “底部追加”判新；无交叠（画面大改/命令被顶到顶部）时对齐自然失败并全旧，场景 3 仍成立。
@@ -1567,6 +1582,23 @@ mod tests {
             .unwrap();
         let again = publish(&shared, vec![input("A", 10), primary("甲", "@命令", 40)]);
         assert!(again.messages[1].is_new, "聊天恢复后的追加命令必须判新");
+    }
+
+    #[test]
+    fn pink_command_after_chat_reappears_is_not_first_screen_suppressed() {
+        // 聊天区不存在 => 首屏没有命令；恢复后首条粉色命令不应走“粉色首屏历史提升”而被吞。
+        let shared = ChatTimeline::new();
+        publish(&shared, vec![input("A", 10)]);
+        shared
+            .publish_no_chat(Instant::now(), "chat hidden for a while")
+            .unwrap();
+        let mut pink = primary("甲", "@点歌 晴", 40);
+        pink.message_type = "pink".into();
+        let again = publish(&shared, vec![input("A", 10), pink]);
+        assert!(
+            again.messages[1].is_new,
+            "聊天恢复后首条粉色命令不应被首屏抑制"
+        );
     }
 
     fn friend(

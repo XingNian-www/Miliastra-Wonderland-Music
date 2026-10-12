@@ -119,6 +119,17 @@ impl SequenceFreshness {
         self.pending_discontinuity = true;
     }
 
+    /// 聊天区不存在或首屏为空：等价于“首屏没有命令”。
+    ///
+    /// 首屏抑制的唯一目的是不让 BOT 刚启动就读到**旧命令**；既然这一屏根本没有命令，
+    /// 冷基线就此消费，之后出现的命令都按新命令处理（不再强制 AppStart 全旧）。
+    /// 已有 `prev`（此前见过聊天）时不改动，保留交叠对齐能力。
+    pub(crate) fn mark_view_absent(&mut self) {
+        if !self.initialized {
+            self.initialized = true;
+        }
+    }
+
     pub(crate) fn observe(&mut self, frame: &FreshFrame<'_>) -> FrameDecision {
         let len = frame.bubbles.len();
         let all = |phase: ViewPhase, freshness: Freshness| FrameDecision {

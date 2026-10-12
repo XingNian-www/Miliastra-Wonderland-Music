@@ -130,6 +130,27 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::core::PCWSTR;
 
+    // 发布打包用主程序自身初始化/校验配置库，避免为同一操作再链接一个 example 可执行文件。
+    let mut arguments = std::env::args_os();
+    let _program = arguments.next();
+    if let Some(flag) = arguments.next()
+        && flag.to_str() == Some("--ensure-config-db")
+    {
+        let config_path = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "用法: miliastra-wonderland-music --ensure-config-db <config.yaml 路径>"
+            )
+        })?;
+        let config_path = std::path::PathBuf::from(config_path);
+        let _restart_ms = miliastra_wonderland_music::watchdog_restart_ms(&config_path)
+            .map_err(|error| anyhow::anyhow!("配置库初始化或完整加载失败: {error:#}"))?;
+        println!(
+            "OK: 配置库已初始化并通过完整校验: {}",
+            config_path.display()
+        );
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+
     let current_exe = std::env::current_exe().context("定位主程序 EXE 失败")?;
     let default_config_path = miliastra_wonderland_music::default_config_path(&current_exe)?;
     let is_watchdog_child = std::env::var_os("MILIASTRA_WATCHDOG_CHILD").is_some();

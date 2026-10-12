@@ -78,9 +78,13 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
         Ok(outcome.accepted)
     }
 
-    fn start_playlist(&mut self, tracks: Vec<miliastra_playback::PlayableTrack>) -> Result<usize> {
+    fn start_playlist(
+        &mut self,
+        owner: &str,
+        tracks: Vec<miliastra_playback::PlayableTrack>,
+    ) -> Result<crate::features::playback::PersonalPlaylistStart> {
         let application = self.runtime.playback.playback_application.clone();
-        application.start_personal_playlist(tracks, self.runtime)
+        application.start_personal_playlist(owner, tracks, self.runtime)
     }
 
     fn stop_playlist(&mut self) -> Result<bool> {

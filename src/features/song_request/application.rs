@@ -132,6 +132,9 @@ fn decision_boundary(ch: Option<char>) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SongSearchFailure {
     Busy,
+    AuthRequired,
+    ReloginRequired,
+    RateLimited,
     Unavailable(String),
     Backend(String),
     Unexpected(String),
@@ -141,6 +144,9 @@ impl SongSearchFailure {
     fn user_message(&self) -> &'static str {
         match self {
             Self::Busy => "歌曲搜索繁忙，请稍后再试",
+            Self::AuthRequired => "该音乐平台尚未登录，请先登录后再点歌",
+            Self::ReloginRequired => "该音乐平台登录已失效，请重新登录",
+            Self::RateLimited => "该音乐平台请求过于频繁，请稍后再试",
             Self::Unavailable(_) => "歌曲搜索服务暂不可用，请稍后再试",
             Self::Backend(_) => "歌曲搜索后端失败，请稍后再试",
             Self::Unexpected(_) => "歌曲搜索后端返回异常，请稍后再试",
@@ -152,6 +158,9 @@ impl Display for SongSearchFailure {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Busy => formatter.write_str("player search queue full"),
+            Self::AuthRequired => formatter.write_str("player provider authentication required"),
+            Self::ReloginRequired => formatter.write_str("player provider relogin required"),
+            Self::RateLimited => formatter.write_str("player provider rate limited"),
             Self::Unavailable(reason) => write!(formatter, "player search unavailable: {reason}"),
             Self::Backend(reason) => write!(formatter, "player search backend failed: {reason}"),
             Self::Unexpected(reason) => {
@@ -365,6 +374,7 @@ impl ResolvedSongRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SongQueuePushOutcome {
     Added(usize),
+    Duplicate,
     Full,
     DedupLimited,
 }
@@ -1210,6 +1220,8 @@ impl SongRequestExecution<'_> {
                 log::debug!("点歌入队后预加载音源失败，播放时将重试: {error:#}");
             }
             Ok(SongQueuePushOutcome::Added(pushed.size))
+        } else if pushed.duplicate {
+            Ok(SongQueuePushOutcome::Duplicate)
         } else {
             Ok(SongQueuePushOutcome::Full)
         }
@@ -1229,6 +1241,10 @@ impl SongRequestExecution<'_> {
                     "{}({}/{}): {}",
                     feedback.queued_prefix, len, self.queue_max_size, request.keyword
                 ))?;
+            }
+            SongQueuePushOutcome::Duplicate => {
+                self.log_executed_command(context, &request.final_command("duplicate"))?;
+                self.reply(&format!("队列已有: {}", request.keyword))?;
             }
             SongQueuePushOutcome::Full => {
                 self.log_executed_command(context, &request.final_command(feedback.full_action))?;
@@ -2338,12 +2354,14 @@ mod tests {
                     return Ok(QueuePushOutcome {
                         accepted: false,
                         size: queue.len(),
+                        duplicate: false,
                     });
                 }
                 let Some(index) = queue.iter().rposition(|queued| queued.playlist_auto) else {
                     return Ok(QueuePushOutcome {
                         accepted: false,
                         size: queue.len(),
+                        duplicate: false,
                     });
                 };
                 queue.remove(index);
@@ -2353,6 +2371,7 @@ mod tests {
             Ok(QueuePushOutcome {
                 accepted: true,
                 size: queue.len(),
+                duplicate: false,
             })
         }
 

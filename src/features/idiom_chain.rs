@@ -109,8 +109,8 @@ impl IdiomChainCommand {
     pub(crate) fn claims_start_chat(envelope: &CommandEnvelope) -> bool {
         envelope.prefix() == CommandPrefix::Hash
             && envelope.authority() == CommandAuthority::HallMember
-            && (shortcut_argument(envelope.command_text(), "同音接龙").is_some()
-                || shortcut_argument(envelope.command_text(), "接龙").is_some())
+            && (start_argument(envelope.command_text(), "同音接龙").is_some()
+                || start_argument(envelope.command_text(), "接龙").is_some())
     }
 
     pub(crate) fn claims_active_chat(envelope: &CommandEnvelope) -> bool {
@@ -142,13 +142,13 @@ impl IdiomChainCommand {
     }
 
     pub(crate) fn parse_start(payload: &str) -> Option<Self> {
-        if let Some(idiom) = shortcut_argument(payload, "同音接龙") {
+        if let Some(idiom) = start_argument(payload, "同音接龙") {
             return Some(Self::Start {
                 idiom: idiom.to_string(),
                 mode: IdiomChainMode::Homophone,
             });
         }
-        shortcut_argument(payload, "接龙").map(|idiom| Self::Start {
+        start_argument(payload, "接龙").map(|idiom| Self::Start {
             idiom: idiom.to_string(),
             mode: IdiomChainMode::Exact,
         })
@@ -851,6 +851,11 @@ impl IdiomLexicon {
     fn len(&self) -> usize {
         self.entries.len()
     }
+}
+
+fn start_argument<'a>(payload: &'a str, prefix: &str) -> Option<&'a str> {
+    let value = payload.strip_prefix(prefix)?;
+    Some(value.trim_start_matches(['：', ':', ' ', '\t']).trim())
 }
 
 fn normalize_idiom(value: &str) -> Option<String> {

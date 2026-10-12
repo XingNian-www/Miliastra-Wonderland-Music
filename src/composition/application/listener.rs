@@ -1839,8 +1839,10 @@ impl ApplicationRuntime {
             let command_like = command::looks_like_command(&message.text);
             if !observed.is_new && !sample_as_question {
                 if command_like && self.ui.chat_timeline.note_not_executed_log(&observed.id)? {
+                    let state = self.ui.chat_timeline.business_delivery_state(&observed.id)?;
                     log::info!(
-                        "命令未执行：未判为新增追加（非新增/基线/已见锚点/被锁/已认领/等待修订等）type={} text={}",
+                        "命令未执行：未判为新增追加 state={:?}（Pending=仅排队未派发/Claimed=已认领/IgnoredRevision=等待有效修订/Fenced=交付栅栏/NotTracked=未入账，通常为基线或视图不连续）type={} text={}",
+                        state,
                         message.message_type,
                         compact_for_log(&message.text)
                     );

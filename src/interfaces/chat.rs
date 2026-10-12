@@ -38,6 +38,19 @@ pub struct PendingCommand {
 /// 聊天消息转为排队命令后保留的观察上下文。
 ///
 /// 这是仅供运行时使用的元数据，用于将执行与产生它的画面和消息关联，但不属于外部命令协议。
+/// 文本看起来像一条命令（显式 @/#/& 前缀，或结构化点歌元数据）。
+/// 仅用于“读到但没执行”的排查日志，不参与路由。
+pub(crate) fn looks_like_command(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if matches!(
+        trimmed.chars().next(),
+        Some('@' | '＠' | '#' | '＃' | '&' | '＆')
+    ) {
+        return true;
+    }
+    parse_structured_song_text(text).is_some()
+}
+
 pub(crate) fn parse_command_envelope(
     text: &str,
     message_type: &str,

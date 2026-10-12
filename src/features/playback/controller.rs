@@ -663,6 +663,19 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         // 请求元数据里没有音量，之前硬编码 0 导致「播放: … 音量0」）。
         if let Ok(current) = self.backend.status() {
             status.volume = current.volume;
+            // 引擎已报告新请求曲目时，采用其真实 session/generation，让
+            // expected_session_id 不再恒为空：失败残留能按会话归属过滤，避免连跳。
+            let matches_request = current
+                .current_track
+                .as_ref()
+                .zip(request.track.as_ref())
+                .is_some_and(|(current_track, requested)| {
+                    current_track.track_ref.key == requested.track_ref.key
+                });
+            if matches_request {
+                status.session_id = current.session_id.clone();
+                status.generation = current.generation;
+            }
         }
         self.record_observation(&status, classify_observation(&status))?;
         let message = format_play_message(&status);
@@ -796,6 +809,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         Ok(true)
     }
 
+    /// 阻塞版本：直接调用方（含测试与恢复路径）使用。监控循环改用非阻塞的
+    /// `try_maybe_advance_queue`，因此 release 构建里本方法仅测试使用。
+    #[allow(dead_code)]
     pub(crate) fn maybe_advance_queue(
         &self,
         snapshot_status: PlayerStatus,

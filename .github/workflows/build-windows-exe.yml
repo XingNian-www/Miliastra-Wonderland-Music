@@ -116,12 +116,57 @@ jobs:
             }
           }
 
+      - name: 解析快速链接器 lld-link
+        id: linker
+        shell: pwsh
+        run: |
+          $candidates = @()
+          $command = Get-Command lld-link.exe -ErrorAction SilentlyContinue
+          if ($command) { $candidates += $command.Source }
+          if ($env:LIBCLANG_PATH) {
+            $candidates += (Join-Path $env:LIBCLANG_PATH 'lld-link.exe')
+          }
+          $candidates += (Join-Path ${env:ProgramFiles} 'LLVM\bin\lld-link.exe')
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path -LiteralPath $vswhere) {
+            $vsInstall = & $vswhere -latest -products * -property installationPath
+            if ($vsInstall) {
+              $candidates += (Join-Path $vsInstall 'VC\Tools\Llvm\x64\bin\lld-link.exe')
+            }
+          }
+          $lldLink = $candidates |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
+            Select-Object -First 1
+          if ($lldLink) {
+            Write-Host "使用 lld-link: $lldLink"
+            "lld_link=$lldLink" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Warning '未找到 lld-link，回退默认 MSVC 链接器'
+            "lld_link=" >> $env:GITHUB_OUTPUT
+          }
+
       - name: 编译 Release EXE
         run: |
+          $lldLink = '${{ steps.linker.outputs.lld_link }}'
+          if ($lldLink) {
+            $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $lldLink
+          }
+          # 依赖缓存完整命中时用 --offline 自检，跳过 crates.io 索引更新（每次约 20–90s）。
+          $offlineReady = $false
+          try {
+            & cargo fetch --locked --offline *> $null
+            $offlineReady = $LASTEXITCODE -eq 0
+          } catch {
+            $offlineReady = $false
+          }
+          if ($offlineReady) {
+            $env:CARGO_NET_OFFLINE = 'true'
+            Write-Host 'cargo 离线自检通过，本次构建跳过 crates.io 索引更新'
+          } else {
+            Write-Warning 'cargo 离线自检未通过（缓存不完整），本次构建仍走网络更新索引'
+          }
           cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
           if ($LASTEXITCODE -ne 0) { throw 'Workspace release build failed' }
-          cargo build --release --target x86_64-pc-windows-msvc --example ensure-config-db --locked
-          if ($LASTEXITCODE -ne 0) { throw 'Configuration helper build failed' }
 
       - name: 解析发布版本
         id: version
@@ -192,8 +237,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/docs') | Out-Null
           Copy-Item 'turtle_soup.example.yaml', 'undercover.example.yaml', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md' (Join-Path $dist 'deps/docs')
           Copy-Item 'docs' (Join-Path $dist 'deps/docs') -Recurse
-          # 预置配置库：以当前默认配置初始化 deps/data/playback.sqlite3
-          & 'target/x86_64-pc-windows-msvc/release/examples/ensure-config-db.exe' (Join-Path $dist 'config.yaml')
+          # 预置配置库：用主程序自身初始化 deps/data/playback.sqlite3，避免为同一操作再链接一个 example 可执行文件。
+          & 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' --ensure-config-db (Join-Path $dist 'config.yaml')
           if ($LASTEXITCODE -ne 0) { throw '发布配置库初始化失败' }
           # 初始化会生成构建机令牌；恢复模板，让每份安装在首次启动时生成独立令牌。
           Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml') -Force

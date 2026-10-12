@@ -357,6 +357,8 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .playback-layout>.playback-cache-stats-panel{grid-column:span 5}
 .playback-layout>.playback-cache-tracks-panel{grid-column:span 7}
 .playback-layout>.playback-history-panel{grid-column:1/-1}
+.playback-layout>.playback-leaderboard-panel{grid-column:span 7}
+.playback-layout>.playback-queue-ops-panel{grid-column:span 5}
 .playback-player-panel,.playback-request-panel{border:1px solid var(--sep-1);border-radius:var(--radius-l);background:var(--bg-card);padding:0 var(--sp-3) var(--sp-4);box-shadow:var(--shadow)}
 .playback-player-panel .current-song{min-height:42px;font-size:16px;line-height:23px}
 .playback-player-panel .controls{grid-template-columns:repeat(3,minmax(0,1fr));margin-top:var(--sp-4)}
@@ -1007,12 +1009,15 @@ function setupPages(){
     monitorQueue:'playback-queue-panel',
     cacheStats:'playback-cache-stats-panel',
     cacheTracks:'playback-cache-tracks-panel',
-    playbackHistory:'playback-history-panel'
+    playbackHistory:'playback-history-panel',
+    leaderboard:'playback-leaderboard-panel',
+    queueOpsPanel:'playback-queue-ops-panel'
   }
   const moves={
     // 总览：实时聊天 OCR（含快捷控制台发言，高频操作放首屏）
     overview:['monitorOcr'],
-    playback:['songState','keyword','monitorQueue','queueMeta','cacheStats','cacheTracks','playbackHistory','leaderboard','queueOpsPanel'],
+    // queueMeta 与 monitorQueue 同在一个面板，不重复搬移；leaderboard/queueOpsPanel 需要显式列宽。
+    playback:['songState','keyword','monitorQueue','cacheStats','cacheTracks','playbackHistory','leaderboard','queueOpsPanel'],
     tasks:['monitorPending','monitorLogs','history'],
     login:['loginProviders'],
     // 游戏与聊天：值守切换、游戏流程、机器人操作、手动截图

@@ -11,7 +11,7 @@ resolver = "3"
 
 [package]
 name = "miliastra-wonderland-music"
-version = "6.1.6"
+version = "6.1.7"
 edition = "2024"
 license = "MIT"
 
@@ -52,6 +52,7 @@ miliastra-login-protocol = { workspace = true }
 miliastra-playback = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json", "query", "rustls"] }
 pinyin = { version = "0.11", default-features = false, features = ["plain"] }
+rand = "0.8"
 rand_chacha = "=0.3.1"
 sha2 = "=0.10.9"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
@@ -81,6 +82,7 @@ template-matching = { version = "0.2", default-features = false }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
   "Win32_Security",
   "Win32_Security_Authentication_Identity",

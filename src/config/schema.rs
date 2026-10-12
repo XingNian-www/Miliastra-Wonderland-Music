@@ -1318,9 +1318,9 @@ fn idiom_chain_section() -> Vec<ConfigFieldSchema> {
         ),
         ConfigFieldSchema::db_idle_reload(
             "allow_consecutive_player",
-            "允许连续接词",
+            "允许连续接词（兼容字段）",
             FieldKind::Bool,
-            "false 时开局玩家不能连续接词",
+            "为兼容旧配置保留；现在始终允许同一玩家连续接词",
         ),
         ConfigFieldSchema::db_idle_reload(
             "allow_anyone_stop",

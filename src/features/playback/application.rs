@@ -14,8 +14,8 @@ use super::matcher::same_song_query;
 use super::{
     BackgroundLyricsScope, PlaybackCommand, PlaybackNavigation, PlaybackOutcome, PlaybackRequest,
     PlaybackSnapshot, PlaybackVerification, PlayerStatus, QueueAdvanceContext,
-    QueueAdvanceDecision, QueueItem, QueueRemoval, estimated_player_status, format_lyrics,
-    format_status,
+    PersonalPlaylistStart, QueueAdvanceDecision, QueueItem, QueueRemoval,
+    estimated_player_status, format_lyrics, format_status, format_status_with_mode,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -438,6 +438,8 @@ pub(crate) const PLAY_MODE_SHUFFLE: u8 = 2;
 
 #[derive(Clone, Debug)]
 struct PersonalPlaylistQueue {
+    /// 激活该模式的昵称；用于「当前为谁的歌单」提示与状态注明。
+    owner: String,
     tracks: Vec<PlayableTrack>,
     cursor: usize,
     shuffle_state: u64,
@@ -536,11 +538,16 @@ impl PlaybackApplication {
 
     pub(crate) fn start_personal_playlist<P: PlaybackExecutionPort + ?Sized>(
         &self,
+        owner: &str,
         tracks: Vec<PlayableTrack>,
         port: &mut P,
-    ) -> Result<usize> {
+    ) -> Result<PersonalPlaylistStart> {
+        // 幂等：已在歌单模式时不重建队列、不重排随机顺序、不重复入队。
+        if let Some(current) = self.personal_playlist_owner() {
+            return Ok(PersonalPlaylistStart::AlreadyActive { owner: current });
+        }
         if tracks.is_empty() {
-            return Ok(0);
+            return Ok(PersonalPlaylistStart::Started(0));
         }
         port.remove_playlist_auto_items()?;
         let shuffle_state = tracks
@@ -557,12 +564,14 @@ impl PlaybackApplication {
             .personal_playlist
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PersonalPlaylistQueue {
+            owner: owner.to_owned(),
             tracks,
             cursor: 0,
             shuffle_state,
             last_played_key: None,
         });
-        self.refill_personal_playlist_queue(port)
+        let queued = self.refill_personal_playlist_queue(port)?;
+        Ok(PersonalPlaylistStart::Started(queued))
     }
 
     pub(crate) fn stop_personal_playlist<P: PlaybackExecutionPort + ?Sized>(
@@ -581,10 +590,16 @@ impl PlaybackApplication {
     }
 
     fn personal_playlist_active(&self) -> bool {
+        self.personal_playlist_owner().is_some()
+    }
+
+    /// 当前歌单模式的归属昵称；未激活时为 None。
+    fn personal_playlist_owner(&self) -> Option<String> {
         self.personal_playlist
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
+            .as_ref()
+            .map(|queue| queue.owner.clone())
     }
 
     fn refill_personal_playlist_queue<P: PlaybackExecutionPort + ?Sized>(
@@ -728,7 +743,9 @@ impl PlaybackApplication {
             PlaybackCommand::Status => {
                 let status = port.player_status()?;
                 port.log_executed(context, "status")?;
-                port.reply(&format_status(&status))?;
+                let text =
+                    format_status_with_mode(&status, self.personal_playlist_owner().as_deref());
+                port.reply(&text)?;
             }
             PlaybackCommand::Lyrics => {
                 let status = port.player_status()?;
@@ -2087,6 +2104,7 @@ mod tests {
             help_batch_ms: 0,
         });
         *application.personal_playlist.lock().unwrap() = Some(PersonalPlaylistQueue {
+            owner: "甲".to_string(),
             tracks: vec![test_track(
                 "miliastra://track/qqmusic/playlist",
                 "歌单歌曲 - 歌手",
@@ -2125,6 +2143,7 @@ mod tests {
             test_track("miliastra://track/qqmusic/b", "B - 歌手"),
         ];
         let mut mode = PersonalPlaylistQueue {
+            owner: "甲".to_string(),
             tracks,
             cursor: 0,
             shuffle_state: 1,
@@ -2141,6 +2160,61 @@ mod tests {
                 .iter()
                 .any(|track| track.track_ref.key == repeated.track_ref.key)
         );
+    }
+
+    #[test]
+    fn start_personal_playlist_is_idempotent_and_keeps_the_first_owner() {
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(100)),
+            monitor_status_ms: Arc::new(RwLock::new(100)),
+            help_batch_ms: 0,
+        });
+        *application.personal_playlist.lock().unwrap() = Some(PersonalPlaylistQueue {
+            owner: "甲".to_string(),
+            tracks: vec![test_track("miliastra://track/qqmusic/a", "A - 歌手")],
+            cursor: 0,
+            shuffle_state: 1,
+            last_played_key: None,
+        });
+        let mut port = FailingPlaybackPort {
+            queue: Vec::new(),
+            removed: Vec::new(),
+            replies: Vec::new(),
+            track_unavailable: false,
+            always_unavailable: false,
+            item_scoped_error: false,
+            play_attempts: 0,
+            pool: Vec::new(),
+        };
+        let outcome = application
+            .start_personal_playlist(
+                "乙",
+                vec![test_track("miliastra://track/qqmusic/b", "B - 歌手")],
+                &mut port,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PersonalPlaylistStart::AlreadyActive {
+                owner: "甲".to_string()
+            }
+        );
+        assert_eq!(application.personal_playlist_owner().as_deref(), Some("甲"));
+        assert!(
+            port.removed.is_empty(),
+            "already active must not touch the queue"
+        );
+        let tracks = application
+            .personal_playlist
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .tracks
+            .clone();
+        assert_eq!(tracks.len(), 1, "the original queue must be preserved");
     }
 
     #[test]

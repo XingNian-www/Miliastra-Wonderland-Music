@@ -86,7 +86,8 @@ impl HallRuntimeState {
 
     fn publish(&self) {
         if let (Some(state_sink), Some(service)) = (&self.state_sink, &self.service) {
-            state_sink.publish_hall_remaining_minutes(service.snapshot().remaining_minutes_now());
+            let (minutes, updated_at) = service.countdown_anchor();
+            state_sink.publish_hall_remaining_minutes(minutes, updated_at);
         }
     }
 }

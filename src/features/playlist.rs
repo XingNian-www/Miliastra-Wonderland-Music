@@ -183,6 +183,7 @@ pub(crate) trait PlaylistPlaybackPort {
     /// 当前正在播放的曲目；未播放时为 None。
     fn current_track(&self) -> Option<PlayableTrack>;
     /// 播放一首曲目。
+    #[allow(dead_code)]
     fn play(&mut self, track: &PlayableTrack) -> Result<()>;
     fn import_playlist(&mut self, provider: &str, input: &str) -> Result<PlaylistImportOperation>;
     fn enqueue_next(&mut self, _track: &PlayableTrack) -> Result<bool> {
@@ -640,6 +641,7 @@ impl PlaylistApplication {
         }
     }
 
+    #[allow(dead_code)]
     fn drop_pending_clear(&self, owner: &str) -> Result<()> {
         let mut pending = self
             .state

@@ -262,7 +262,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSna
         Paragraph::new(Line::from(vec![
             Span::styled(" 状态 ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(state.status.as_str()),
-            Span::styled("  监听 ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("  值守 ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(state.chat_listener.mode.as_str()),
             Span::raw(if state.chat_listener.pending_mode.is_empty() {
                 String::new()

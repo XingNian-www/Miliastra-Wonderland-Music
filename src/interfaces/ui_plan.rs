@@ -57,7 +57,7 @@ pub enum WorkflowOperation {
     EnsureResidency {
         target: WorkflowResidency,
     },
-    /// 恢复当前聊天监听器驻留状态，由应用层解析。
+    /// 恢复当前聊天值守器驻留状态，由应用层解析。
     ReturnListenerResidency,
     ClickPoint {
         point: WorkflowPoint,

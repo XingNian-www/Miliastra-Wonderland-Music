@@ -520,7 +520,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
       <span class="chip"><i class="dot"></i><span>服务</span><em id="serviceState">未知</em></span>
       <span class="chip"><i class="dot"></i><span>播放</span><em id="playerState">未知</em></span>
       <span class="chip"><i class="dot"></i><span>队列</span><em id="queueState">0 / 0</em></span>
-      <span class="chip"><i class="dot"></i><span>监听</span><em id="listenerState">一级监听</em></span>
+      <span class="chip"><i class="dot"></i><span>监听</span><em id="listenerState">一级值守</em></span>
       <span class="chip"><i class="dot"></i><span>界面</span><em id="uiState">未知</em></span>
     </div>
     <div class="top-actions">
@@ -564,7 +564,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
     </div></section>
     <section class="page-section" id="page-playback" data-page="playback"><h1 class="page-title">播放与点歌</h1><p class="page-subtitle">播放控制、点歌搜索、队列与缓存管理</p><div class="page-grid playback-layout" id="playbackGrid"></div></section>
     <section class="page-section" id="page-login" data-page="login"><h1 class="page-title">账号登录</h1><p class="page-subtitle">音乐平台账号登录与凭据状态</p><div class="page-grid" id="loginGrid"></div></section>
-    <section class="page-section" id="page-game" data-page="game"><h1 class="page-title">游戏与聊天</h1><p class="page-subtitle">聊天监听、游戏流程与机器人操作</p><div class="page-grid" id="gameGrid"></div></section>
+    <section class="page-section" id="page-game" data-page="game"><h1 class="page-title">游戏与聊天</h1><p class="page-subtitle">聊天值守、游戏流程与机器人操作</p><div class="page-grid" id="gameGrid"></div></section>
     <section class="page-section" id="page-entertainment" data-page="entertainment"><h1 class="page-title">娱乐玩法</h1><p class="page-subtitle">海龟汤与谁是卧底对局管理</p><div class="page-grid" id="entertainmentGrid"></div></section>
     <section class="page-section" id="page-tasks" data-page="tasks"><h1 class="page-title">任务与日志</h1><p class="page-subtitle">任务队列、事件日志与接口调用记录</p><div class="page-grid" id="tasksGrid"></div></section>
     <section class="page-section" id="page-tools" data-page="tools"><h1 class="page-title">高级控制</h1><p class="page-subtitle">OCR、模板匹配与手动输入诊断工具</p><div class="tools-grid">
@@ -906,7 +906,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>聊天监听</h2><small id="listenerMeta">一级监听</small></div>
+        <div class="panel-head"><h2>聊天值守</h2><small id="listenerMeta">一级值守</small></div>
         <div class="panel-body">
           <div class="tabs">
             <button class="tab" id="listenerPrimary" onclick="setChatListener('primary')">一级</button>
@@ -1015,7 +1015,7 @@ function setupPages(){
     playback:['songState','keyword','monitorQueue','queueMeta','cacheStats','cacheTracks','playbackHistory','leaderboard','queueOpsPanel'],
     tasks:['monitorPending','monitorLogs','history'],
     login:['loginProviders'],
-    // 游戏与聊天：监听切换、游戏流程、机器人操作、手动截图
+    // 游戏与聊天：值守切换、游戏流程、机器人操作、手动截图
     game:['listenerPrimary','idleExitMinutes','gameFlowPanel','screenshotPanel'],
     entertainment:['turtlePanel'],
     settings:['accessToken']
@@ -1082,7 +1082,7 @@ setupPages()
 window.addEventListener('hashchange',()=>navigateTo(location.hash.slice(1),false))
 navigateTo(initialRoute())
 const esc=(s)=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
-const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/search/candidates':'候选搜索','/player/providers':'平台状态','/player/login/status':'登录状态','/player/play-track':'播放曲目','/player/login/start':'开始登录','/player/login/cancel':'取消登录','/player/logout':'退出登录','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天监听','/tasks/cancel':'撤销任务','/operator/lyrics':'发送歌词','/operator/hall-detect':'大厅检测','/operator/hall-time':'大厅时间','/operator/microphone':'麦克风','/operator/commands':'命令开关','/operator/idle-exit':'闲置退出','/operator/workflows':'工作流','/operator/workflows/run':'执行工作流','/turtle-soup':'海龟汤状态','/turtle-soup/start':'海龟汤开局','/turtle-soup/end':'海龟汤结束','/undercover':'谁是卧底状态','/undercover/start':'谁是卧底开局','/undercover/end':'谁是卧底结束'}
+const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/search/candidates':'候选搜索','/player/providers':'平台状态','/player/login/status':'登录状态','/player/play-track':'播放曲目','/player/login/start':'开始登录','/player/login/cancel':'取消登录','/player/logout':'退出登录','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天值守','/tasks/cancel':'撤销任务','/operator/lyrics':'发送歌词','/operator/hall-detect':'大厅检测','/operator/hall-time':'大厅时间','/operator/microphone':'麦克风','/operator/commands':'命令开关','/operator/idle-exit':'闲置退出','/operator/workflows':'工作流','/operator/workflows/run':'执行工作流','/turtle-soup':'海龟汤状态','/turtle-soup/start':'海龟汤开局','/turtle-soup/end':'海龟汤结束','/undercover':'谁是卧底状态','/undercover/start':'谁是卧底开局','/undercover/end':'谁是卧底结束'}
 const stMap={playing:'播放中',paused:'已暂停',stopped:'已停止'}
 const controllerStateMap={idle:'空闲',starting:'启动播放',requested_song_playing:'点歌播放中',paused_by_user:'用户暂停',external_playback:'外部播放',unknown:'状态未知'}
 const pauseReasonMap={none:'无',user:'用户暂停',unknown:'未知'}
@@ -1935,7 +1935,7 @@ function showTask(id){
   ].filter(Boolean)
   setResult(rows.join('\n'))
 }
-function listenerLabel(mode){return mode==='secondary'?'二级监听':mode==='primary'?'一级监听':mode||'一级监听'}
+function listenerLabel(mode){return mode==='secondary'?'二级值守':mode==='primary'?'一级值守':mode||'一级值守'}
 function ageText(timestamp){const age=Math.max(0,Date.now()-Number(timestamp||0));return timestamp?(age<1000?'刚刚':Math.round(age/1000)+'s前'):'未知时间'}
 function renderLiveLog(lines){
   latestMonitorLogs=Array.isArray(lines)?lines.slice():[]

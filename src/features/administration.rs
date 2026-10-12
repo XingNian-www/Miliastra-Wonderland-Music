@@ -250,7 +250,7 @@ impl AdministrationCommand {
             (CommandPrefix::Hash, CommandAuthority::HallMember) => {
                 matches!(
                     crate::features::chat_text::compact_command(envelope.command_text()).as_str(),
-                    "娱乐" | "帮助"
+                    "娱乐" | "帮助" | "娱乐帮助"
                 )
             }
             _ => false,
@@ -326,7 +326,8 @@ impl AdministrationCommand {
     pub(crate) fn parse_entertainment_start(payload: &str) -> Option<Self> {
         matches!(
             crate::features::chat_text::compact_command(payload).as_str(),
-            "娱乐" | "帮助"
+            // `#` 与 `@` 两种前缀都接受完整写法“娱乐帮助”，方便玩家记住同一句。
+            "娱乐" | "帮助" | "娱乐帮助"
         )
         .then_some(Self::EntertainmentHelp)
     }

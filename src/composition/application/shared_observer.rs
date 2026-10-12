@@ -1,10 +1,7 @@
 use super::*;
 use crate::observation::chat::{
-    ChatIdentity, PassiveLayout, RecognizedChatMessage, hash_region, latest_incoming_bubble_rect,
-    passive_layout, passive_secondary_identity, passive_sender, recognize_passive_hall,
-    recognize_passive_secondary, scan_chat_markers,
+    ChatIdentity, PassiveLayout, passive_layout, recognize_passive_secondary,
 };
-use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{self, RecvTimeoutError};
 
 const OBSERVER_WAIT: Duration = Duration::from_millis(100);

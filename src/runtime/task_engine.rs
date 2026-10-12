@@ -350,6 +350,7 @@ impl TaskEngineHandle {
         Ok(Self::scheduler_snapshot(&state))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn formal_task_snapshot(
         &self,
         id: u64,

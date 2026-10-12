@@ -66,7 +66,7 @@ pub(crate) use controller::{
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
-    PlaybackSnapshot, estimated_player_status, format_lyrics, format_status, format_status_with_mode,
+    PlaybackSnapshot, estimated_player_status, format_lyrics, format_status_with_mode,
     is_playing,
 };
 use miliastra_kernel::clock::WallClock;

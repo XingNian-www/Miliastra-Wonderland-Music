@@ -12,6 +12,7 @@ mod lifecycle;
 mod listener;
 mod moderation;
 mod playback;
+#[allow(dead_code)]
 mod secondary_chat;
 mod shared_observer;
 mod song_request_port;
@@ -84,7 +85,7 @@ use crate::observation::chat::{
     SecondaryHallBubble, SecondaryObservedMessage, TemplateArgs, UnreadFriendHit,
     count_chat_markers, find_unread_friend_hits, hall_bubble_sequence_is_retained_prefix,
     hall_bubble_sequence_overlap, latest_incoming_fingerprint, prepare_chat_scan,
-    prepare_chat_scan_with_markers, recognize_prepared_chat, secondary_hall_bubbles,
+    prepare_chat_scan_with_markers, recognize_prepared_chat,
 };
 use crate::observation::decision::DecisionScreenLock;
 use crate::observation::shared::ObservationRead;
@@ -1723,6 +1724,7 @@ fn elapsed_ms(started: Instant) -> u128 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 enum SecondaryHallSequenceDelta {
     EstablishBaseline,
     RetainedPrefix,
@@ -1731,6 +1733,7 @@ enum SecondaryHallSequenceDelta {
     NewFrom(usize),
 }
 
+#[allow(dead_code)]
 fn secondary_hall_sequence_delta(
     previous: Option<&[SecondaryHallBubble]>,
     current: &[SecondaryHallBubble],

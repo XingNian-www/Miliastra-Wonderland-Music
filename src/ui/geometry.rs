@@ -107,6 +107,7 @@ pub(crate) fn parse_rect(value: &str) -> Result<Rect> {
     ))
 }
 
+#[allow(dead_code)]
 pub(crate) fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
     value.max(min).min(max)
 }

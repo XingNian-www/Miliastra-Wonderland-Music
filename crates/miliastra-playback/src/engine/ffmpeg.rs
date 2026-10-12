@@ -451,7 +451,7 @@ async fn run_actor(
     worker_events_tx: mpsc::UnboundedSender<WorkerEvent>,
     mut shutdown: watch::Receiver<bool>,
     snapshots: watch::Sender<PlaybackSnapshot>,
-    _stream: Stream,
+    mut stream: Stream,
     output: OutputRuntime,
 ) {
     let mut state = ActorState::new();
@@ -468,6 +468,7 @@ async fn run_actor(
                 }
             }
             Some(event) = worker_events.recv() => {
+                let output_failed = matches!(event, WorkerEvent::OutputFailed);
                 handle_worker_event(
                     event,
                     &mut state,
@@ -475,6 +476,28 @@ async fn run_actor(
                     &output,
                     &worker_events_tx,
                 ).await;
+                if output_failed {
+                    // 设备被拔/禁用：先按失败停止，再尝试重建输出流，避免逐首跳歌。
+                    match rebuild_output_stream(&output, &worker_events_tx) {
+                        Ok(rebuilt) => match rebuilt.play() {
+                            Ok(()) => {
+                                stream = rebuilt;
+                                state.snapshot.state = EngineState::Idle;
+                                state.snapshot.failure = None;
+                                state.snapshot.error = None;
+                                state.snapshot.last_end_cause = None;
+                                state.publish(&snapshots);
+                                tracing::warn!("音频输出设备已重建，播放器恢复可用");
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "重建音频输出流后启动失败，播放器保持不可用");
+                            }
+                        },
+                        Err(error) => {
+                            tracing::warn!(%error, "重建音频输出流失败，播放器保持不可用");
+                        }
+                    }
+                }
             }
             Some(envelope) = commands.recv() => {
                 let result = handle_command(
@@ -495,6 +518,8 @@ async fn run_actor(
             }
         }
     }
+    // 保持 cpal 输出流存活到 actor 退出；重建时这里读到的是最新一条流。
+    drop(stream);
 }
 
 struct OutputRuntime {
@@ -549,6 +574,38 @@ fn open_output_stream(
             io_timeout,
         },
     ))
+}
+
+/// 音频设备丢失后重建 cpal 输出流：复用现有 PCM 缓冲与音量，仅重新打开默认设备。
+/// 设备格式与丢失前不一致时保持不可用，避免用错误的采样率/声道播放。
+fn rebuild_output_stream(
+    output: &OutputRuntime,
+    worker_events_tx: &mpsc::UnboundedSender<WorkerEvent>,
+) -> Result<Stream, EngineError> {
+    let host = cpal::default_host();
+    let device = host.default_output_device().ok_or_else(|| {
+        EngineError::Unavailable("no default audio output device is available".to_owned())
+    })?;
+    let supported = device.default_output_config().map_err(|error| {
+        EngineError::Unavailable(format!("query default audio output device: {error}"))
+    })?;
+    let sample_format = supported.sample_format();
+    let stream_config: StreamConfig = supported.into();
+    if stream_config.sample_rate != output.format.sample_rate
+        || stream_config.channels != output.format.channels
+    {
+        return Err(EngineError::Unavailable(
+            "default audio output format changed after device loss".to_owned(),
+        ));
+    }
+    build_output_stream(
+        &device,
+        stream_config,
+        sample_format,
+        output.audio.clone(),
+        output.volume.clone(),
+        worker_events_tx.clone(),
+    )
 }
 
 fn build_output_stream(

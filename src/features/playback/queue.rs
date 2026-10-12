@@ -343,6 +343,41 @@ mod tests {
     }
 
     #[test]
+    fn manual_items_stay_ahead_of_playlist_auto_entries_with_spare_capacity() {
+        let mut queue = PersistentQueue::new_for_test(5).unwrap();
+        for (keyword, playlist_auto) in [("auto-a", true), ("manual-a", false), ("auto-b", true)] {
+            queue
+                .push(QueueItem {
+                    keyword: keyword.to_owned(),
+                    playlist_auto,
+                    ..QueueItem::default()
+                })
+                .unwrap();
+        }
+
+        queue
+            .push(QueueItem {
+                keyword: "manual-b".to_owned(),
+                ..QueueItem::default()
+            })
+            .unwrap();
+
+        assert_eq!(
+            queue
+                .items()
+                .iter()
+                .map(|item| (item.keyword.as_str(), item.playlist_auto))
+                .collect::<Vec<_>>(),
+            vec![
+                ("manual-a", false),
+                ("manual-b", false),
+                ("auto-a", true),
+                ("auto-b", true),
+            ]
+        );
+    }
+
+    #[test]
     fn push_next_places_selected_track_before_existing_manual_and_auto_items() {
         let mut queue = PersistentQueue::new_for_test(4).unwrap();
         queue

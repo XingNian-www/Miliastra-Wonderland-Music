@@ -111,12 +111,17 @@ impl TurtleSoupCommand {
     }
 
     pub(crate) fn claims_active_chat(envelope: &CommandEnvelope) -> bool {
-        envelope.prefix() == CommandPrefix::Hash
-            && envelope.authority() == CommandAuthority::HallMember
-            && matches!(
-                crate::features::chat_text::compact_command(envelope.command_text()).as_str(),
-                "状态" | "结束"
-            )
+        if envelope.prefix() != CommandPrefix::Hash {
+            return false;
+        }
+        match (
+            envelope.authority(),
+            crate::features::chat_text::compact_command(envelope.command_text()).as_str(),
+        ) {
+            (CommandAuthority::HallMember, "状态" | "结束")
+            | (CommandAuthority::Friend, "结束") => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn parse_start_chat(

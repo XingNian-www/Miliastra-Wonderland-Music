@@ -232,7 +232,7 @@ impl<'a> ChatCommandRouter<'a> {
     }
 
     fn select_at_module(&self, envelope: &CommandEnvelope) -> Option<ChatCommandModule> {
-        // 决策回复只属于当前独占读取器。同一画面正常分发时，也要将其保留语法排除在可配置流程之外。
+        // Decision replies belong to active readers, not ordinary/custom routing.
         if is_reserved_decision_command(envelope) {
             return None;
         }
@@ -343,6 +343,17 @@ mod tarot_routing_tests {
     use super::*;
     use crate::features::command::CommandObservation;
 
+    fn envelope(message_type: &str, command: &str) -> CommandEnvelope {
+        CommandEnvelope::new(
+            format!("用户：{command}"),
+            "用户",
+            message_type,
+            command,
+            CommandObservation::default(),
+        )
+        .expect("test command envelope")
+    }
+
     #[test]
     fn playlist_numbers_are_reserved_for_the_exclusive_window() {
         let router = ChatCommandRouter::without_custom_workflow();
@@ -354,6 +365,29 @@ mod tarot_routing_tests {
             assert!(is_reserved_decision_command(&envelope));
             assert!(router.route(&envelope, None).is_none());
         }
+    }
+
+    #[test]
+    fn turtle_soup_friend_can_end_but_not_query_status() {
+        let router = ChatCommandRouter::without_custom_workflow();
+        let active = Some(EntertainmentKind::TurtleSoup);
+
+        let friend_end = router
+            .route(&envelope("pink", "#结束"), active)
+            .expect("好友应可结束海龟汤");
+        assert!(matches!(
+            friend_end.command,
+            ModuleCommand::TurtleSoup(TurtleSoupCommand::End)
+        ));
+        assert!(router.route(&envelope("pink", "#状态"), active).is_none());
+
+        let hall_end = router
+            .route(&envelope("blue", "#结束"), active)
+            .expect("大厅结束语法仍路由到服务层拒绝");
+        assert!(matches!(
+            hall_end.command,
+            ModuleCommand::TurtleSoup(TurtleSoupCommand::End)
+        ));
     }
 
     #[test]
@@ -434,30 +468,28 @@ mod tarot_routing_tests {
 }
 
 fn is_reserved_decision_command(envelope: &CommandEnvelope) -> bool {
-    // Playlist window decisions are parsed only by its active exclusive reader.
+    // Window inputs are consumed by their active readers, never by ordinary/custom routing.
     if crate::features::playlist::PlaylistCommand::is_window_decision(envelope) {
         return true;
     }
     let command = envelope.command_text();
-    if ["确认", "跳过", "换源", "AI"]
-        .iter()
-        .any(|prefix| command.strip_prefix(prefix).is_some_and(decision_boundary))
-    {
-        return true;
-    }
-
-    envelope.authority() == CommandAuthority::Friend
-        && [
-            "邀请确认",
-            "邀请拒绝",
-            "确认邀请",
-            "拒绝邀请",
-            "同意邀请",
-            "同意",
-            "不同意",
-        ]
-        .iter()
-        .any(|prefix| command.strip_prefix(prefix).is_some_and(decision_boundary))
+    [
+        "确认",
+        "跳过",
+        "换源",
+        "AI",
+        "选择",
+        "本地",
+        "邀请确认",
+        "邀请拒绝",
+        "确认邀请",
+        "拒绝邀请",
+        "同意邀请",
+        "同意",
+        "不同意",
+    ]
+    .iter()
+    .any(|prefix| command.strip_prefix(prefix).is_some_and(decision_boundary))
 }
 
 fn decision_boundary(rest: &str) -> bool {
@@ -585,6 +617,16 @@ mod tests {
             ("blue", "@跳过！"),
             ("blue", "@换源"),
             ("blue", "@AI"),
+            ("blue", "@选择"),
+            ("blue", "@本地"),
+            ("pink", "@选择"),
+            ("pink", "@本地"),
+            ("blue", "@邀请确认"),
+            ("blue", "@邀请拒绝"),
+            ("blue", "@同意邀请"),
+            ("blue", "@拒绝邀请"),
+            ("blue", "@同意"),
+            ("blue", "@不同意"),
             ("pink", "@邀请确认"),
             ("pink", "@邀请拒绝"),
             ("pink", "@同意邀请"),
@@ -598,7 +640,11 @@ mod tests {
             );
         }
 
-        for (message_type, command) in [("blue", "@确认其他"), ("blue", "@AI点歌 晴天")] {
+        for (message_type, command) in [
+            ("blue", "@确认其他"),
+            ("blue", "@AI点歌晴天"),
+            ("blue", "#确认"),
+        ] {
             assert!(
                 !is_reserved_decision_command(&envelope(message_type, command)),
                 "ordinary command was reserved: {message_type} {command}"
@@ -895,7 +941,18 @@ mod tests {
                 workflows: vec![CustomWorkflowDefinition {
                     enabled: true,
                     name: "确认工作流".to_string(),
-                    commands: vec!["确认".to_string()],
+                    commands: vec![
+                        "确认".to_string(),
+                        "选择".to_string(),
+                        "本地".to_string(),
+                        "邀请确认".to_string(),
+                        "邀请拒绝".to_string(),
+                        "确认邀请".to_string(),
+                        "拒绝邀请".to_string(),
+                        "同意邀请".to_string(),
+                        "同意".to_string(),
+                        "不同意".to_string(),
+                    ],
                     allow_args: false,
                     message_types: Vec::new(),
                     confirm_before_run: false,
@@ -936,13 +993,28 @@ mod tests {
                 stability_changed_ratio_threshold: 0.1,
             },
         );
-        let envelope = envelope("blue", "@确认");
-        assert!(service.claims_chat(&envelope));
-        assert!(
-            ChatCommandRouter::new(&service)
-                .route(&envelope, None)
-                .is_none()
-        );
+        let router = ChatCommandRouter::new(&service);
+        for message_type in ["blue", "pink"] {
+            for command in [
+                "@确认",
+                "@选择",
+                "@本地",
+                "@邀请确认",
+                "@邀请拒绝",
+                "@确认邀请",
+                "@拒绝邀请",
+                "@同意邀请",
+                "@同意",
+                "@不同意",
+            ] {
+                let envelope = envelope(message_type, command);
+                assert!(service.claims_chat(&envelope));
+                assert!(
+                    router.route(&envelope, None).is_none(),
+                    "reserved decision reached custom workflow: {message_type} {command}"
+                );
+            }
+        }
     }
 
     #[test]

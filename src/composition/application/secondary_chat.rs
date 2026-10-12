@@ -1,5 +1,38 @@
 use super::*;
 
+impl ChatDecisionReader {
+    /// 与 `read_messages` 同一套基线/新鲜度去重规则，但保留观察 id：
+    /// 点歌决策消费成功后可 `acknowledge_business`，避免独占窗口回放时主链路误报“未执行”。
+    fn read_messages_with_ids(
+        &mut self,
+    ) -> Result<Vec<(ChatMessage, crate::observation::chat::ObservedChatMessageId)>> {
+        let mut messages = Vec::new();
+        for snapshot in self.subscriber.read()? {
+            if snapshot.chat != self.chat || snapshot.captured_at <= self.baseline_at {
+                continue;
+            }
+            for message in snapshot.messages {
+                if self.baseline_cursor.is_some_and(|(session, sequence)| {
+                    message.id.visual_session == session
+                        && message.id.bubble_sequence.get() <= sequence
+                }) || !self.seen.insert((message.id.clone(), message.text.clone()))
+                {
+                    continue;
+                }
+                messages.push((
+                    ChatMessage {
+                        message_type: message.message_type,
+                        block: message.block,
+                        text: message.text,
+                    },
+                    message.id,
+                ));
+            }
+        }
+        Ok(messages)
+    }
+}
+
 struct SecondaryUnreadTaskCompletionGuard {
     business: BusinessRuntimeHandle,
     active: bool,
@@ -686,6 +719,65 @@ impl ApplicationRuntime {
         reader.read_messages()
     }
 
+    /// 同 `wait_for_chat_decision_messages`，但把观察 id 一并带出，
+    /// 供点歌决策读者消费成功后 `acknowledge_business`，避免独占窗口回放误报。
+    pub(super) fn wait_for_chat_decision_messages_with_ids(
+        &self,
+        reader: &mut ChatDecisionReader,
+        configured_ms: u64,
+        remaining: Duration,
+    ) -> Result<Vec<(ChatMessage, crate::observation::chat::ObservedChatMessageId)>> {
+        let wait_until = Instant::now() + remaining;
+        let result = (|| {
+            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                return Ok(Vec::new());
+            }
+            let messages = self.poll_chat_decision_reader_with_ids(reader)?;
+            if !messages.is_empty() {
+                return Ok(messages);
+            }
+            reader.wait_for_input(
+                configured_ms,
+                wait_until.saturating_duration_since(Instant::now()),
+            )?;
+            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                return Ok(Vec::new());
+            }
+            self.poll_chat_decision_reader_with_ids(reader)
+        })();
+        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            return Ok(Vec::new());
+        }
+        if let Err(error) = &result {
+            log::error!("确认窗口读取失败: {error:#}");
+            if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                if let Err(reply_error) =
+                    self.reply("确认窗口已结束：无法继续读取聊天，请稍后重试。")
+                {
+                    log::warn!("确认窗口失败反馈发送失败: {reply_error:#}");
+                }
+            }
+        }
+        result
+    }
+
+    pub(super) fn poll_chat_decision_reader_with_ids(
+        &self,
+        reader: &mut ChatDecisionReader,
+    ) -> Result<Vec<(ChatMessage, crate::observation::chat::ObservedChatMessageId)>> {
+        if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+            return Err(anyhow!("运行已暂停，已结束确认窗口"));
+        }
+        if self.lifecycle.live_configs.has_pending_reload() {
+            return Err(anyhow!("配置重载待处理，已结束确认窗口"));
+        }
+        let snapshot = self.business.business.chat_listener_snapshot()?;
+        if snapshot.mode != reader.listener_mode || snapshot.pending_mode.is_some() {
+            return Err(anyhow!("监听模式正在切换，已结束确认窗口"));
+        }
+        reader.read_messages_with_ids()
+    }
+
     pub(super) fn classify_secondary_business_message(
         &self,
         text: &str,
@@ -772,7 +864,14 @@ impl ApplicationRuntime {
                             .as_deref()
                             .is_none_or(|sender| sender.trim().is_empty()))
                 {
-                    log::debug!("二级身份相关输入尚未取得发送者，保留共享消息等待身份修订");
+                    if command::looks_like_command(&text) {
+                        log::info!(
+                            "命令暂缓：二级命令缺少发送者，等待身份修订 text={}",
+                            redacted_chat_text(&text)
+                        );
+                    } else {
+                        log::debug!("二级身份相关输入尚未取得发送者，保留共享消息等待身份修订");
+                    }
                     outcome.unrecognized = true;
                     continue;
                 }
@@ -828,13 +927,29 @@ impl ApplicationRuntime {
                 command_text,
                 command_observation,
             ) else {
+                if command::looks_like_command(&text) {
+                    log::info!(
+                        "命令未执行：二级消息无法解析为命令信封 text={}",
+                        redacted_chat_text(&text)
+                    );
+                }
                 outcome.unrecognized = true;
                 continue;
             };
-            let Some(parsed) =
-                router.route(&envelope, self.business.business.active_entertainment()?)
-            else {
-                log::debug!("二级监听气泡未解析为命令");
+            let active_entertainment = self.business.business.active_entertainment()?;
+            let Some(parsed) = router.route(&envelope, active_entertainment) else {
+                if command::looks_like_command(&text) {
+                    log::info!(
+                        "命令未执行：{} text={}",
+                        ChatCommandRouter::unclaimed_command_reason(
+                            &envelope,
+                            active_entertainment
+                        ),
+                        redacted_chat_text(&text)
+                    );
+                } else {
+                    log::debug!("二级监听气泡未解析为命令");
+                }
                 outcome.unrecognized = true;
                 continue;
             };

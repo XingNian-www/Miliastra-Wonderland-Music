@@ -387,6 +387,7 @@ impl AudioCache {
         &self,
         key: &SongKey,
         metadata: Option<&TrackMetadata>,
+        locator: Option<&crate::ResolverLocator>,
         stream: StreamSource,
     ) -> StreamSource {
         let inner = &self.inner;
@@ -400,9 +401,12 @@ impl AudioCache {
             let store = inner.metadata_store.clone();
             let key = key.clone();
             let metadata = metadata.cloned();
+            let locator = locator.map(|value| value.clone());
             let _ = tokio::task::spawn_blocking(move || {
                 let store = lock_metadata_store(&store);
-                if let Err(error) = store.upsert_track(&key, metadata.as_ref()) {
+                if let Err(error) =
+                    store.upsert_track(&key, metadata.as_ref(), locator.as_ref())
+                {
                     log::warn!("音频缓存元数据登记失败: {error}");
                 }
             })
@@ -458,7 +462,7 @@ impl AudioCache {
             let metadata = metadata.cloned();
             let _ = tokio::task::spawn_blocking(move || {
                 let store = lock_metadata_store(&store);
-                if let Err(error) = store.upsert_track(&key, metadata.as_ref()) {
+                if let Err(error) = store.upsert_track(&key, metadata.as_ref(), None) {
                     log::warn!("音频缓存元数据登记失败: {error}");
                 }
             })
@@ -755,7 +759,7 @@ impl AudioCache {
         // SQLite 在阻塞线程池执行，不阻塞异步 runtime；失败返回 false。
         tokio::task::spawn_blocking(move || {
             let store = lock_metadata_store(&store);
-            if let Err(error) = store.upsert_track(&key, None) {
+            if let Err(error) = store.upsert_track(&key, None, None) {
                 log::warn!("音频缓存歌词曲目登记失败: {error}");
                 return false;
             }
@@ -1025,6 +1029,7 @@ mod tests {
             .rewrite(
                 &key,
                 None,
+                None,
                 crate::domain::StreamSource {
                     url: "http://127.0.0.1:1/unreachable.mp3".parse().unwrap(),
                     headers: std::collections::BTreeMap::new(),
@@ -1128,6 +1133,7 @@ mod tests {
             .rewrite(
                 &key,
                 None,
+                None,
                 StreamSource {
                     url: "http://127.0.0.1:1/unreachable.mp3".parse().unwrap(),
                     headers: Default::default(),
@@ -1191,7 +1197,7 @@ mod tests {
             headers: Default::default(),
             expires_at_epoch_ms: None,
         };
-        cache.rewrite(&first, None, source.clone()).await;
+        cache.rewrite(&first, None,None, source.clone()).await;
         {
             let mut entries = cache.inner.entries.write().await;
             entries.get_mut(&first_hash).unwrap().state = EntryState::Downloading(DownloadHandle {
@@ -1204,7 +1210,7 @@ mod tests {
         }
 
         let second = SongKey::new("kugou", "idle").unwrap();
-        cache.rewrite(&second, None, source).await;
+        cache.rewrite(&second, None,None, source).await;
         let entries = cache.inner.entries.read().await;
         assert!(entries.contains_key(&first_hash));
         assert_eq!(entries.len(), 1, "应优先淘汰非下载条目");

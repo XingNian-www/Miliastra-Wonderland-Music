@@ -1299,6 +1299,14 @@ pub(super) fn friend_list_drag_points(region: Rect) -> (Point, Point) {
     )
 }
 
+/// 定位“当前大厅”行时使用的拖拽方向：从列表最高头像往下拖（`to -> from`）。
+/// 按住列表内容往下拖会让列表向顶部翻，把固定在列表上方的“当前大厅”行带回可视区；
+/// 与逐页向下找好友的 `friend_list_drag_points` 方向相反，不要合并成一个。
+pub(super) fn current_hall_restore_drag_points(region: Rect) -> (Point, Point) {
+    let (bottom, top) = friend_list_drag_points(region);
+    (top, bottom)
+}
+
 fn search_current_friend_page(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
@@ -1610,8 +1618,8 @@ fn restore_secondary_hall(
     config: &FriendDeliveryRoutineConfig,
 ) -> std::result::Result<(), UiRoutineFailure> {
     ensure_secondary_chat(context, config)?;
-    // “当前大厅”位置固定。模板命中后只点击一次，不用好友高亮和 OCR 做二次确认。
-    // 未命中时向上滚动列表，避免当前选中的好友私聊目标被误当成大厅。
+    // “当前大厅”固定在会话列表上方。模板命中后只点击一次，不用好友高亮和 OCR 做二次确认。
+    // 未命中时向列表顶部拖动（从最高头像往下拖），避免当前选中的好友私聊目标被误当成大厅。
     let mut pages = Vec::<ChangeFingerprint>::new();
     for drag_index in 0..=MAX_FRIEND_LIST_DRAGS {
         let image = capture_normalized(
@@ -1662,7 +1670,7 @@ fn restore_secondary_hall(
         if drag_index == MAX_FRIEND_LIST_DRAGS {
             break;
         }
-        let (from, to) = friend_list_drag_points(config.friend_list_region);
+        let (from, to) = current_hall_restore_drag_points(config.friend_list_region);
         context
             .device()
             .drag_point(from.x, from.y, to.x, to.y)
@@ -1672,7 +1680,7 @@ fn restore_secondary_hall(
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
         "restore_secondary_hall",
-        "current-hall template was not found after two downward avatar drags",
+        "current-hall template was not found after two drags toward the list top",
     ))
 }
 
@@ -2106,6 +2114,15 @@ mod tests {
         assert_eq!((from.x, from.y), (40, 830));
         assert_eq!((to.x, to.y), (40, 330));
         assert!(from.y > to.y);
+    }
+
+    #[test]
+    fn current_hall_restore_drags_from_the_highest_avatar_downward() {
+        let (from, to) = current_hall_restore_drag_points(Rect::new(80, 280, 170, 600));
+
+        assert_eq!((from.x, from.y), (40, 330));
+        assert_eq!((to.x, to.y), (40, 830));
+        assert!(from.y < to.y);
     }
 
     use crate::config::AppConfig;

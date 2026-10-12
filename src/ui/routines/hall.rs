@@ -346,15 +346,17 @@ fn read_hall_info_transaction(
                     .device()
                     .drag_point(from.x, from.y, to.x, to.y)
                     .map_err(|error| after_input_failure("drag_hall_member_list", error))?;
-                let top_image = wait_for_hall_page_ready(context, ocr, config);
+                // 从最低头像往上拖 = 列表往下方翻，这一帧是列表更靠下的部分。
+                let scrolled = wait_for_hall_page_ready(context, ocr, config);
                 context
                     .device()
                     .drag_point(to.x, to.y, from.x, from.y)
                     .map_err(|error| after_input_failure("restore_hall_member_list", error))?;
-                let (top_image, top_sample) = top_image?;
-                let (bottom_image, bottom_sample) = wait_for_hall_page_ready(context, ocr, config)?;
-                samples.extend([top_sample, bottom_sample]);
-                screenshot = merge_hall_screenshots(&top_image, &bottom_image);
+                // 反向等距拖回起点，这一帧是列表更靠上的部分；拼图按“上、下”还原。
+                let (upper_image, upper_sample) = wait_for_hall_page_ready(context, ocr, config)?;
+                let (lower_image, lower_sample) = scrolled?;
+                samples.extend([upper_sample, lower_sample]);
+                screenshot = merge_hall_screenshots(&upper_image, &lower_image);
             }
         }
         Ok(None) => log::debug!("大厅成员人数 OCR 未识别，跳过成员列表滚动"),
@@ -479,17 +481,18 @@ fn read_hall_member_count(
     Ok(parse_hall_member_count(&count_text))
 }
 
+/// 把成员列表两帧按“上、下”拼成一张长图：`upper` 贴在上半，`lower` 贴在下半。
 fn merge_hall_screenshots(
-    first: &image::DynamicImage,
-    scrolled: &image::DynamicImage,
+    upper: &image::DynamicImage,
+    lower: &image::DynamicImage,
 ) -> image::DynamicImage {
-    let first = first.to_rgba8();
-    let scrolled = scrolled.to_rgba8();
-    let width = first.width().max(scrolled.width());
-    let height = first.height().saturating_add(scrolled.height());
+    let upper = upper.to_rgba8();
+    let lower = lower.to_rgba8();
+    let width = upper.width().max(lower.width());
+    let height = upper.height().saturating_add(lower.height());
     let mut merged = image::RgbaImage::new(width, height);
-    image::imageops::overlay(&mut merged, &first, 0, 0);
-    image::imageops::overlay(&mut merged, &scrolled, 0, i64::from(first.height()));
+    image::imageops::overlay(&mut merged, &upper, 0, 0);
+    image::imageops::overlay(&mut merged, &lower, 0, i64::from(upper.height()));
     image::DynamicImage::ImageRgba8(merged)
 }
 
@@ -742,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn hall_screenshot_captures_top_then_bottom_after_scroll() {
+    fn hall_screenshot_stacks_the_list_top_above_the_scrolled_bottom() {
         let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.click_ms = 0;
@@ -783,10 +786,12 @@ mod tests {
                 config.screen.expected_height * 2
             )
         );
-        assert_eq!(*screenshot.get_pixel(0, 0), Rgba([255, 0, 0, 255]));
+        // HallDevice 把“上拖那帧”（列表更靠下）标红、“拖回那帧”（列表更靠上）标绿；
+        // 拼接后上半必须是靠上的帧，下半才是滚动后的帧。
+        assert_eq!(*screenshot.get_pixel(0, 0), Rgba([0, 255, 0, 255]));
         assert_eq!(
             *screenshot.get_pixel(0, config.screen.expected_height),
-            Rgba([0, 255, 0, 255])
+            Rgba([255, 0, 0, 255])
         );
         assert_eq!(
             *drags.lock().unwrap(),

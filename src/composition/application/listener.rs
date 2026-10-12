@@ -1535,6 +1535,11 @@ impl ApplicationRuntime {
             let Some(_business_dispatch) =
                 self.ui.chat_observations.try_begin_business_dispatch()?
             else {
+                // 临时暂缓（backlog 保留，窗口结束后继续），走 debug 防刷屏。
+                log::debug!(
+                    "命令暂缓：独占聊天观察进行中，积压 {} 帧，窗口结束后继续",
+                    backlog.len()
+                );
                 break;
             };
             let snapshot = backlog.pop_front().expect("nonempty business backlog");
@@ -1557,6 +1562,17 @@ impl ApplicationRuntime {
             // 一级监听不消费二级大厅观察，二级监听不消费主大厅观察。
             // 这里只拦命令消费（不认领、不派发）；共享观察的发布、帧缓存与只读事件保持原样。
             if !hall_consumes_identity(listener_mode, &snapshot.chat) {
+                if snapshot
+                    .messages
+                    .iter()
+                    .any(|message| command::looks_like_command(&message.text))
+                {
+                    log::info!(
+                        "命令未执行：监听模式={} 不消费 {:?} 观察（含命令样式消息）",
+                        listener_mode.label(),
+                        snapshot.chat
+                    );
+                }
                 log::debug!(
                     "{}不消费{:?}观察，仅保留只读发布",
                     listener_mode.label(),
@@ -1804,9 +1820,9 @@ impl ApplicationRuntime {
                 && !message.text.is_empty();
             let command_like = command::looks_like_command(&message.text);
             if !observed.is_new && !sample_as_question {
-                if command_like {
+                if command_like && self.ui.chat_timeline.note_not_executed_log(&observed.id)? {
                     log::info!(
-                        "命令未执行：未判为新增追加（freshness 判旧/基线/未见追加）type={} text={}",
+                        "命令未执行：未判为新增追加（非新增/基线/已见锚点/被锁/已认领/等待修订等）type={} text={}",
                         message.message_type,
                         compact_for_log(&message.text)
                     );
@@ -1846,10 +1862,19 @@ impl ApplicationRuntime {
                 }
             }
             if !observed.is_new {
+                // 海龟汤提问采样开启时 sample_as_question 对所有非空蓝消息为真，会走到此处；
+                // 若并非新增追加，则命令不会执行，需留痕。
+                if command_like && self.ui.chat_timeline.note_not_executed_log(&observed.id)? {
+                    log::info!(
+                        "命令未执行：海龟汤提问采样中且本轮未判为新增追加 type={} text={}",
+                        message.message_type,
+                        compact_for_log(&message.text)
+                    );
+                }
                 continue;
             }
             let Some(parsed_command) = routed else {
-                if command_like {
+                if command_like && self.ui.chat_timeline.note_not_executed_log(&observed.id)? {
                     let reason = if envelope.is_none() {
                         "无法解析为命令信封（发送者/前缀或结构化点歌不成立）"
                     } else {

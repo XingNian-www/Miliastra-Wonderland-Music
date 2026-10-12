@@ -407,6 +407,19 @@ pub enum WindowCaptureMethod {
     PrintWindow,
     /// 从桌面 DC 裁剪目标窗口客户区；要求窗口实际可见且未被遮挡。
     Desktop,
+    /// 使用 Windows Graphics Capture 捕获指定 HWND（Windows 10 1903+）。
+    Wgc,
+}
+
+impl WindowCaptureMethod {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Gdi => "GDI 窗口 DC",
+            Self::PrintWindow => "PrintWindow",
+            Self::Desktop => "桌面 DC 裁剪",
+            Self::Wgc => "Windows Graphics Capture",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

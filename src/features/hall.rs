@@ -88,6 +88,11 @@ impl HallStateService {
         snapshot
     }
 
+    pub(crate) fn countdown_anchor(&self) -> (Option<u32>, Option<u64>) {
+        let state = self.state.state();
+        (state.remaining_minutes, state.remaining_updated_at)
+    }
+
     pub(crate) fn patch(&mut self, patch: HallStatePatch) -> Result<()> {
         let countdown_changed =
             patch.remaining_minutes.is_some() || patch.remaining_updated_at.is_some();
@@ -484,6 +489,7 @@ mod tests {
 
         assert_eq!(snapshot.remaining_minutes_now(), Some(4));
         assert_eq!(snapshot.remaining_updated_at, Some(1_234));
+        assert_eq!(service.countdown_anchor(), (Some(5), Some(1_234)));
         let _ = std::fs::remove_file(path);
     }
 

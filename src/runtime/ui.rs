@@ -16,6 +16,10 @@ use image::DynamicImage;
 pub trait UiDevice: Send + 'static {
     fn capture(&mut self) -> Result<DynamicImage>;
 
+    fn benchmark_capture(&mut self, _rounds: u32) -> Result<String> {
+        bail!("UI device does not support capture benchmarking")
+    }
+
     fn press_key(&mut self, _key: Key) -> Result<()> {
         bail!("UI device does not support keyboard input")
     }
@@ -128,6 +132,9 @@ struct IsolatedDevice<D: UiDevice>(D);
 impl<D: UiDevice> UiDevice for IsolatedDevice<D> {
     fn capture(&mut self) -> Result<DynamicImage> {
         self.0.capture()
+    }
+    fn benchmark_capture(&mut self, rounds: u32) -> Result<String> {
+        self.0.benchmark_capture(rounds)
     }
     fn ensure_foreground(&mut self) -> Result<()> {
         self.0.ensure_foreground()
@@ -1320,6 +1327,11 @@ impl Drop for UiScanLease {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaptureFrame;
 
+#[derive(Clone, Copy, Debug)]
+pub struct BenchmarkCapture {
+    pub rounds: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiRoutineProgressStage {
     NormalizingStart,
@@ -1519,6 +1531,16 @@ impl UiRoutine for CaptureFrame {
         context
             .capture_frame()
             .map_err(|error| UiRoutineFailure::before_input("capture_frame", format!("{error:#}")))
+    }
+}
+
+impl sealed::UiRoutineSealed for BenchmarkCapture {}
+
+impl UiRoutine for BenchmarkCapture {
+    type Output = Result<String>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        context.device().benchmark_capture(self.rounds)
     }
 }
 
@@ -2522,6 +2544,10 @@ mod tests {
             Ok(DynamicImage::new_rgba8(2, 2))
         }
 
+        fn benchmark_capture(&mut self, rounds: u32) -> Result<String> {
+            Ok(format!("benchmark:{rounds}"))
+        }
+
         fn press_key(&mut self, _key: Key) -> Result<()> {
             *self.presses.lock().unwrap() += 1;
             Ok(())
@@ -2548,6 +2574,7 @@ mod tests {
                 isolated.clipboard_text().unwrap(),
                 Some("probe-clipboard".to_owned())
             );
+            assert_eq!(isolated.benchmark_capture(3).unwrap(), "benchmark:3");
         });
     }
 

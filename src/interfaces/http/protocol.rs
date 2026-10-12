@@ -710,6 +710,12 @@ const ROUTES: &[RouteSpec] = &[
         handler: tool_panel_benchmark_route,
     },
     RouteSpec {
+        path: "/tools/capture-benchmark",
+        json: true,
+        mutating: true,
+        handler: tool_capture_api_benchmark_route,
+    },
+    RouteSpec {
         path: "/tools/ocr-backends",
         json: true,
         mutating: true,

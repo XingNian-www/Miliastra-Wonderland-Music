@@ -9,7 +9,6 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::interfaces::http::facade::ApplicationHttpCommandFacade;
 use crate::features::hall::HallRuntimeState;
 use crate::features::playback::{
     PlaybackRuntimeState, PlayerStatus, SongRequestLeaderboardEntry, test_candidate, test_track,
@@ -17,6 +16,7 @@ use crate::features::playback::{
 use crate::features::startup::{StartupSource, StartupTaskKind};
 use crate::features::turtle_soup::{TurtleSoupAppendReceipt, TurtleSoupSnapshot};
 use crate::features::undercover::UndercoverSnapshot;
+use crate::interfaces::http::facade::ApplicationHttpCommandFacade;
 use crate::interfaces::http::{
     HttpAiPort, HttpDebugPort, HttpHallPort, HttpLoginPort, HttpLoginQrCodeView, HttpLoginStatus,
     HttpPlayerPort, HttpProviderView, HttpQueryPort, HttpTaskPort,
@@ -2869,6 +2869,7 @@ fn web_tool_routes_are_queued_json_post_routes() {
         "/tools/key",
         "/tools/chat-change-samples",
         "/tools/panel-benchmark",
+        "/tools/capture-benchmark",
         "/tools/ocr-backends",
         "/tools/ai-preview",
     ] {
@@ -2878,6 +2879,25 @@ fn web_tool_routes_are_queued_json_post_routes() {
     assert!(!is_mutating_route("/tools/task"));
     assert!(is_json_route("/tools/task"));
     assert!(TOOLS_PAGE.contains("Miliastra 高级控制"));
+}
+
+#[test]
+fn capture_benchmark_route_bounds_rounds_and_queues_read_only_request() {
+    let state = test_state();
+    let body = tool_capture_api_benchmark_route(&[("rounds".into(), "5".into())], &state)
+        .expect("benchmark route succeeds");
+    let ticket: Value = serde_json::from_str(&body).expect("tool ticket");
+    assert_eq!(ticket["status"], "queued");
+    let requests = state.recording.diagnostic_requests();
+    assert!(matches!(
+        requests[0].1,
+        WebToolRequest::CaptureApiBenchmark { rounds: 5 }
+    ));
+
+    let error = tool_capture_api_benchmark_route(&[("rounds".into(), "6".into())], &state)
+        .expect_err("too many rounds rejected");
+    assert_eq!(error.status, 400);
+    assert_eq!(state.recording.diagnostic_requests().len(), 1);
 }
 
 #[test]

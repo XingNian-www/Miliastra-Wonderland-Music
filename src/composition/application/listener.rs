@@ -845,17 +845,25 @@ impl ApplicationRuntime {
         Ok(())
     }
 
-    fn poll_hall_expiry(&self, pause_applied: &mut bool, check_after: &mut Instant) {
+    fn poll_hall_expiry(
+        &self,
+        pause_applied: &mut bool,
+        notice_sent: &mut bool,
+        check_after: &mut Instant,
+    ) {
         if Instant::now() < *check_after {
             return;
         }
-        let retry_delay = match self.maybe_pause_expired_hall(*pause_applied) {
+        let retry_delay = match self.maybe_pause_expired_hall(pause_applied, notice_sent) {
             Ok(applied) => {
                 *pause_applied = applied;
+                if !applied {
+                    *notice_sent = false;
+                }
                 Duration::from_secs(1)
             }
             Err(error) => {
-                log::error!("大厅到期暂停失败，将重试: {error:#}");
+                log::error!("大厅到期暂停或提示失败，将重试: {error:#}");
                 Duration::from_secs(5)
             }
         };
@@ -933,11 +941,16 @@ impl ApplicationRuntime {
         let mut target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
         let mut target_missing = false;
         let mut hall_expiry_pause_applied = false;
+        let mut hall_expiry_notice_sent = false;
         let mut hall_expiry_check_after = Instant::now();
         let mut shared_backlog = std::collections::VecDeque::new();
         log::info!("自动化扫描已启动");
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) {
-            self.poll_hall_expiry(&mut hall_expiry_pause_applied, &mut hall_expiry_check_after);
+            self.poll_hall_expiry(
+                &mut hall_expiry_pause_applied,
+                &mut hall_expiry_notice_sent,
+                &mut hall_expiry_check_after,
+            );
             let live_config = self.lifecycle.live_configs.snapshot();
             if automatic_startup_pending
                 && self.ui.coordinator.scan_may_run()
@@ -1443,6 +1456,7 @@ impl ApplicationRuntime {
                     let window_reset = loop {
                         self.poll_hall_expiry(
                             &mut hall_expiry_pause_applied,
+                            &mut hall_expiry_notice_sent,
                             &mut hall_expiry_check_after,
                         );
                         let now = Instant::now();

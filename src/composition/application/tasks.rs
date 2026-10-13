@@ -145,6 +145,23 @@ fn reload_poll_wait(requested: Duration, pending_reload: bool) -> Duration {
     }
 }
 
+fn apply_hall_expiry_pause(
+    pause_applied: &mut bool,
+    notice_sent: &mut bool,
+    mut pause: impl FnMut() -> Result<()>,
+    mut enqueue_notice: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    if !*pause_applied {
+        pause()?;
+        *pause_applied = true;
+    }
+    if !*notice_sent {
+        enqueue_notice()?;
+        *notice_sent = true;
+    }
+    Ok(())
+}
+
 impl ApplicationRuntime {
     pub(super) fn reload_aware_wait(&self, requested: Duration) -> Duration {
         reload_poll_wait(requested, self.lifecycle.live_configs.has_pending_reload())
@@ -157,7 +174,11 @@ impl ApplicationRuntime {
             .map_err(anyhow::Error::from)
     }
 
-    pub(super) fn maybe_pause_expired_hall(&self, pause_applied: bool) -> Result<bool> {
+    pub(super) fn maybe_pause_expired_hall(
+        &self,
+        pause_applied: &mut bool,
+        notice_sent: &mut bool,
+    ) -> Result<bool> {
         if self
             .business
             .business
@@ -167,15 +188,23 @@ impl ApplicationRuntime {
         {
             return Ok(false);
         }
-        if pause_applied {
-            return Ok(true);
-        }
-        let lyrics_result = self.stop_background_lyrics_output();
-        let pause_result = self.playback.player.pause_for_hall_expiry();
-        self.update_monitor_playback_controller();
-        lyrics_result?;
-        pause_result?;
-        log::info!("大厅倒计时已结束，未确认进入新大厅，已暂停播放并停止歌词");
+        apply_hall_expiry_pause(
+            pause_applied,
+            notice_sent,
+            || {
+                self.playback.player.pause_for_hall_expiry()?;
+                self.update_monitor_playback_controller();
+                log::info!("大厅倒计时已结束，未确认进入新大厅，已暂停播放");
+                Ok(())
+            },
+            || {
+                super::enqueue_current_hall_reply(
+                    &self.business.task_engine,
+                    "大厅即将到期,已自动暂停音乐",
+                )
+            },
+        )?;
+        self.stop_background_lyrics_output()?;
         Ok(true)
     }
 
@@ -712,13 +741,114 @@ mod reload_tests {
 
     use super::{
         CONFIG_RELOAD_IDLE_CHECK_INTERVAL, PlaybackReloadReadiness, ReloadDrainReadiness,
-        ReloadIdleState, playback_reload_readiness, playback_reload_readiness_after_refresh,
-        reload_fields_require_startup, reload_poll_wait,
+        ReloadIdleState, apply_hall_expiry_pause, playback_reload_readiness,
+        playback_reload_readiness_after_refresh, reload_fields_require_startup, reload_poll_wait,
     };
     use crate::features::playback::{
         ActivePlaybackRequest, ConfirmedPlaybackState, ObservationReliability, PlaybackObservation,
         PlaybackRuntimeState, PlayerStatus, test_track,
     };
+
+    #[test]
+    fn hall_expiry_pause_failure_does_not_send_notice() {
+        let mut pause_applied = false;
+        let mut notice_sent = false;
+        let mut notice_calls = 0;
+
+        let result = apply_hall_expiry_pause(
+            &mut pause_applied,
+            &mut notice_sent,
+            || anyhow::bail!("pause failed"),
+            || {
+                notice_calls += 1;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!pause_applied);
+        assert!(!notice_sent);
+        assert_eq!(notice_calls, 0);
+    }
+
+    #[test]
+    fn hall_expiry_notice_follows_successful_pause_and_is_not_repeated() {
+        let mut pause_applied = false;
+        let mut notice_sent = false;
+        let mut pause_calls = 0;
+        let mut notice_calls = 0;
+
+        apply_hall_expiry_pause(
+            &mut pause_applied,
+            &mut notice_sent,
+            || {
+                pause_calls += 1;
+                Ok(())
+            },
+            || {
+                notice_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        apply_hall_expiry_pause(
+            &mut pause_applied,
+            &mut notice_sent,
+            || {
+                pause_calls += 1;
+                Ok(())
+            },
+            || {
+                notice_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(pause_calls, 1);
+        assert_eq!(notice_calls, 1);
+    }
+
+    #[test]
+    fn hall_expiry_notice_retries_without_repeating_successful_pause() {
+        let mut pause_applied = false;
+        let mut notice_sent = false;
+        let mut pause_calls = 0;
+        let mut notice_calls = 0;
+
+        let result = apply_hall_expiry_pause(
+            &mut pause_applied,
+            &mut notice_sent,
+            || {
+                pause_calls += 1;
+                Ok(())
+            },
+            || {
+                notice_calls += 1;
+                anyhow::bail!("queue unavailable")
+            },
+        );
+        assert!(result.is_err());
+        assert!(pause_applied);
+        assert!(!notice_sent);
+
+        apply_hall_expiry_pause(
+            &mut pause_applied,
+            &mut notice_sent,
+            || {
+                pause_calls += 1;
+                Ok(())
+            },
+            || {
+                notice_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(pause_calls, 1);
+        assert_eq!(notice_calls, 2);
+    }
 
     fn idle_state() -> ReloadIdleState {
         ReloadIdleState {

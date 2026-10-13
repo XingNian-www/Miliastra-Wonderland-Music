@@ -306,8 +306,10 @@ async fn serve_complete_chunked(
     start: u64,
 ) -> std::io::Result<()> {
     let Some(total) = crate::cache::complete_file_size(&inner.config.directory, hash) else {
-        write_chunk_end(stream).await?;
-        return Ok(());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "缓存下载未完成，不能结束代理响应",
+        ));
     };
     let mut complete = match tokio::fs::File::open(
         inner
@@ -318,10 +320,7 @@ async fn serve_complete_chunked(
     .await
     {
         Ok(file) => file,
-        Err(_) => {
-            write_chunk_end(stream).await?;
-            return Ok(());
-        }
+        Err(error) => return Err(error),
     };
     complete.seek(std::io::SeekFrom::Start(start)).await?;
     let mut remaining = total.saturating_sub(start);
@@ -330,7 +329,10 @@ async fn serve_complete_chunked(
         let to_read = remaining.min(IO_CHUNK_SIZE as u64) as usize;
         let read = complete.read(&mut buffer[..to_read]).await?;
         if read == 0 {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "完整缓存文件意外结束，代理响应不完整",
+            ));
         }
         write_all_with_timeout(stream, format!("{:x}\r\n", read).as_bytes()).await?;
         write_all_with_timeout(stream, &buffer[..read]).await?;
@@ -386,8 +388,10 @@ async fn serve_streaming(
                     wait_for_bytes(handle, start as usize + 1, inner.config.seek_wait_timeout)
                         .await;
                 if !progressed {
-                    write_chunk_end(stream).await?;
-                    return Ok(());
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "缓存下载未产生数据，代理响应不完整",
+                    ));
                 }
             }
         }
@@ -401,7 +405,10 @@ async fn serve_streaming(
             let to_read = (available - next_read_offset).min(IO_CHUNK_SIZE);
             let read = file.read(&mut buffer[..to_read]).await?;
             if read == 0 {
-                break;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "缓存临时文件意外结束，代理响应不完整",
+                ));
             }
             write_all_with_timeout(stream, format!("{:x}\r\n", read).as_bytes()).await?;
             write_all_with_timeout(stream, &buffer[..read]).await?;
@@ -412,11 +419,17 @@ async fn serve_streaming(
         // 等待下载推进或完成。
         let progressed = wait_for_bytes(handle, next_read_offset + 1, STALL_TIMEOUT).await;
         if !progressed {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "缓存下载停滞或失败，代理响应不完整",
+            ));
         }
         // 检查是否已变完整：改读完整文件。
         if handle.failed.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "缓存下载失败，代理响应不完整",
+            ));
         }
         if !matches!(
             inner
@@ -431,8 +444,6 @@ async fn serve_streaming(
             return serve_complete_chunked(inner, stream, hash, next_read_offset as u64).await;
         }
     }
-    write_chunk_end(stream).await?;
-    Ok(())
 }
 
 async fn write_chunk_end(stream: &mut TcpStream) -> std::io::Result<()> {

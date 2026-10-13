@@ -1116,6 +1116,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_does_not_finish_chunked_response_after_truncated_source() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let source_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_address = source_listener.local_addr().unwrap();
+        let source_body = b"truncated-audio-prefix";
+        let source = tokio::spawn(async move {
+            let (mut stream, _) = source_listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                source_body.len() + 4096
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(source_body).await.unwrap();
+        });
+
+        let directory = std::env::temp_dir()
+            .join(format!("miliastra-cache-truncated-{}", uuid::Uuid::new_v4()));
+        let cache = AudioCache::spawn(AudioCacheConfig {
+            directory: directory.clone(),
+            metadata_directory: directory.join("index"),
+            request_timeout: Duration::from_secs(2),
+            seek_wait_timeout: Duration::from_secs(2),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let key = SongKey::new("kugou", "truncated-source").unwrap();
+        let proxy_stream = cache
+            .rewrite(
+                &key,
+                None,
+                None,
+                StreamSource {
+                    url: format!("http://{source_address}/audio").parse().unwrap(),
+                    headers: Default::default(),
+                    expires_at_epoch_ms: None,
+                },
+            )
+            .await;
+
+        let response = reqwest::get(proxy_stream.url).await.unwrap();
+        let body = response.bytes().await;
+        assert!(
+            body.is_err(),
+            "proxy must not mark a truncated source as a clean chunked EOF"
+        );
+        source.await.unwrap();
+
+        cache.shutdown().await;
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
     async fn trim_resets_complete_entry_and_preserves_identity_and_lyrics() {
         let directory =
             std::env::temp_dir().join(format!("miliastra-cache-trim-{}", uuid::Uuid::new_v4()));

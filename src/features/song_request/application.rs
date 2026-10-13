@@ -566,8 +566,7 @@ impl SongRequestExecution<'_> {
     fn queue_is_full(&self, context: &SongRequestContext) -> Result<bool> {
         let queue = self.port.playback_queue()?;
         if queue.len() < self.queue_max_size
-            || (queue.len() == self.queue_max_size
-                && queue.iter().any(|item| item.playlist_auto))
+            || (queue.len() == self.queue_max_size && queue.iter().any(|item| item.playlist_auto))
         {
             // A manual request can replace an auto-filled playlist item; let the queue
             // perform that atomic eviction after resolving the requested track.
@@ -1211,9 +1210,16 @@ impl SongRequestExecution<'_> {
             playlist_auto: false,
         })?;
         if pushed.accepted {
-            // 只有队首（入队后队列里唯一曲目）才立即解析音源：排在后面的曲目
-            // 交给播放侧的下一首预加载，避免为长时间等待的曲目提前取流。
-            if pushed.size == 1
+            // 仅预加载当前队首；歌单自动项虽占队列容量，手动项会排在它们之前。
+            let is_queue_head = self
+                .port
+                .playback_queue()
+                .ok()
+                .and_then(|queue| queue.into_iter().next())
+                .and_then(|item| item.track)
+                .zip(request.track.as_ref())
+                .is_some_and(|(head, requested)| head.track_ref.key == requested.track_ref.key);
+            if is_queue_head
                 && let Some(track) = &request.track
                 && let Err(error) = self.port.preload_track(track)
             {
@@ -2367,7 +2373,15 @@ mod tests {
                 queue.remove(index);
             }
             item.id = queue.len() as u64 + 1;
-            queue.push(item);
+            if item.playlist_auto {
+                queue.push(item);
+            } else {
+                let index = queue
+                    .iter()
+                    .position(|queued| queued.playlist_auto)
+                    .unwrap_or(queue.len());
+                queue.insert(index, item);
+            }
             Ok(QueuePushOutcome {
                 accepted: true,
                 size: queue.len(),
@@ -2518,15 +2532,22 @@ mod tests {
     }
 
     #[test]
-    fn full_playlist_auto_queue_accepts_manual_song_request_and_evicts_auto_item() {
+    fn manual_song_ahead_of_playlist_items_is_preloaded() {
         let mut port =
             FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
-        port.queue_limit = Some(1);
-        port.queue.borrow_mut().push(QueueItem {
-            keyword: "歌单自动项".to_string(),
-            playlist_auto: true,
-            ..QueueItem::default()
-        });
+        port.queue_limit = Some(2);
+        port.queue.borrow_mut().extend([
+            QueueItem {
+                keyword: "歌单自动项A".to_string(),
+                playlist_auto: true,
+                ..QueueItem::default()
+            },
+            QueueItem {
+                keyword: "歌单自动项B".to_string(),
+                playlist_auto: true,
+                ..QueueItem::default()
+            },
+        ]);
         let application = SongRequestApplication::with_gateways(
             Arc::new(DisabledAiGateway),
             Arc::new(DisabledReviewGateway),
@@ -2539,11 +2560,30 @@ mod tests {
             .expect("manual request can replace an auto playlist item");
 
         assert_eq!(port.search_sources.borrow().as_slice(), ["qqmusic"]);
-        assert_eq!(port.queue.borrow().len(), 1);
+        assert_eq!(port.queue.borrow().len(), 2);
         assert_eq!(port.queue.borrow()[0].keyword, "晴天 - 周杰伦");
         assert!(!port.queue.borrow()[0].playlist_auto);
-        assert!(port.replies.borrow().iter().any(|reply| reply.contains("队列已加入")));
-        assert!(!port.replies.borrow().iter().any(|reply| reply == "队列已满，请稍后再试"));
+        assert!(port.queue.borrow()[1].playlist_auto);
+        assert_eq!(port.preloaded.borrow().len(), 1);
+        assert_eq!(
+            port.preloaded.borrow()[0].track_ref.key,
+            test_track("miliastra://track/qqmusic/1", "晴天 - 周杰伦")
+                .track_ref
+                .key
+        );
+        assert!(
+            port.replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.contains("队列已加入"))
+        );
+        assert!(
+            !port
+                .replies
+                .borrow()
+                .iter()
+                .any(|reply| reply == "队列已满，请稍后再试")
+        );
     }
 
     #[test]

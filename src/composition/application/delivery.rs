@@ -1,0 +1,162 @@
+use super::*;
+
+impl ApplicationRuntime {
+    pub(super) fn reply(&self, message: &str) -> Result<()> {
+        self.reply_with_ready_gate(message, false)
+    }
+
+    pub(super) fn reply_invite_ready(&self, message: &str) -> Result<()> {
+        self.reply_with_ready_gate(message, true)
+    }
+
+    fn reply_with_ready_gate(&self, message: &str, invite_ready: bool) -> Result<()> {
+        let mapped = self
+            .lifecycle
+            .live_configs
+            .identity
+            .replace_display_names(message);
+        let prefixed;
+        let message = if self
+            .lifecycle
+            .console_reply_context
+            .load(AtomicOrdering::SeqCst)
+            && !mapped.starts_with("[控制台]:")
+        {
+            prefixed = format!("[控制台]: {}", mapped);
+            prefixed.as_str()
+        } else {
+            mapped.as_str()
+        };
+        let residency = self.active_ui_residency()?;
+        if invite_ready {
+            let target = match residency {
+                UiResidency::Primary => crate::ui::routines::UiResidencyTarget::Primary,
+                UiResidency::SecondaryCurrentHall => {
+                    crate::ui::routines::UiResidencyTarget::SecondaryCurrentHall
+                }
+            };
+            return self.ui.chat_output.send_invite_ready(
+                message,
+                target,
+                self.lifecycle.running.clone(),
+            );
+        }
+        match residency {
+            UiResidency::Primary => self.ui.chat_output.send_for_command(message),
+            UiResidency::SecondaryCurrentHall => self.ui.chat_output.send_current_chat(message),
+        }
+    }
+
+    pub(super) fn reply_batch(&self, messages: &[&str], _delay_ms: u64) -> Result<()> {
+        let delay_ms = self
+            .lifecycle
+            .live_configs
+            .snapshot()
+            .timing
+            .command
+            .help_batch_ms;
+        let mapped = messages
+            .iter()
+            .map(|message| {
+                self.lifecycle
+                    .live_configs
+                    .identity
+                    .replace_display_names(message)
+            })
+            .collect::<Vec<_>>();
+        let messages = mapped.iter().map(String::as_str).collect::<Vec<_>>();
+        match self.active_ui_residency()? {
+            UiResidency::Primary => self
+                .ui
+                .chat_output
+                .send_batch_for_command(&messages, delay_ms),
+            UiResidency::SecondaryCurrentHall => self
+                .ui
+                .chat_output
+                .send_current_chat_batch(&messages, delay_ms),
+        }
+    }
+
+    pub(super) fn update_monitor_playback_controller(&self) {
+        self.lifecycle
+            .monitor
+            .publish(MonitorEvent::PlaybackController(
+                self.playback.player.snapshot(),
+            ));
+    }
+
+    pub(super) fn update_monitor_operational_state(&self) {
+        self.lifecycle.monitor.publish(MonitorEvent::ScannerPaused(
+            self.lifecycle.paused.load(AtomicOrdering::SeqCst),
+        ));
+    }
+}
+
+impl CardGameDeliveryPort for ApplicationRuntime {
+    fn verify_friend(&self, player: &str, message: &str) -> Result<bool> {
+        self.send_unique_friend_message(player, message)
+    }
+
+    fn send_friend(&self, player: &str, message: &str) -> Result<bool> {
+        self.send_friend_message(player, message)
+    }
+
+    fn send_friend_batch(
+        &self,
+        deliveries: &[LandlordPrivateDelivery],
+    ) -> Result<FriendBatchOutcome> {
+        let messages = deliveries
+            .iter()
+            .map(|delivery| FriendMessage::new(&delivery.player, &delivery.message))
+            .collect::<Vec<_>>();
+        self.send_friend_delivery_batch(&messages)
+    }
+
+    fn send_hall(&self, message: &str) -> Result<()> {
+        self.reply(message)
+    }
+}
+
+impl UndercoverDeliveryPort for ApplicationRuntime {
+    fn verify_friend(&self, player: &str, message: &str) -> Result<bool> {
+        self.send_stable_unique_friend_message(player, message)
+    }
+
+    fn send_friend_batch(&self, deliveries: &[FriendMessage]) -> Result<FriendBatchOutcome> {
+        self.send_friend_delivery_batch(deliveries)
+    }
+
+    fn send_hall(&self, message: &str) -> Result<()> {
+        self.reply(message)
+    }
+
+    fn send_hall_batch(&self, messages: &[String]) -> Result<()> {
+        let mapped = messages
+            .iter()
+            .map(|message| {
+                self.lifecycle
+                    .live_configs
+                    .identity
+                    .replace_display_names(message)
+            })
+            .collect::<Vec<_>>();
+        let refs = mapped.iter().map(String::as_str).collect::<Vec<_>>();
+        let help_batch_ms = self
+            .lifecycle
+            .live_configs
+            .snapshot()
+            .timing
+            .command
+            .help_batch_ms;
+        match self.active_ui_residency()? {
+            UiResidency::Primary => self
+                .ui
+                .chat_output
+                .send_batch_for_command_redacted(&refs, help_batch_ms),
+            UiResidency::SecondaryCurrentHall => self
+                .ui
+                .chat_output
+                .send_current_chat_batch_redacted(&refs, help_batch_ms),
+        }
+    }
+}

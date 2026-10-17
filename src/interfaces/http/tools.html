@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Miliastra 高级控制</title>
+<script>try{if(!localStorage.getItem('miliastraTheme'))localStorage.setItem('miliastraTheme','dark');document.documentElement.dataset.theme=localStorage.getItem('miliastraTheme')}catch(e){document.documentElement.dataset.theme='dark'}</script>
+<style>
+*{box-sizing:border-box}
+:root{
+  color-scheme:dark;
+  --bg-ground:#181817;
+  --bg-card:#1f1f1f;
+  --bg-input:#101010;
+  --bg-raised:#262626;
+  --fill-1:rgba(255,255,255,.06);
+  --fill-2:rgba(255,255,255,.11);
+  --sep-1:rgba(255,255,255,.1);
+  --sep-2:rgba(255,255,255,.055);
+  --text-1:rgba(255,255,255,.87);
+  --text-2:rgba(255,255,255,.56);
+  --text-3:rgba(255,255,255,.38);
+  --accent:#3d8bff;
+  --accent-soft:rgba(61,139,255,.14);
+  --ok:#3ad97a;
+  --ok-soft:rgba(58,217,122,.12);
+  --warn:#ffb02e;
+  --warn-soft:rgba(255,176,46,.12);
+  --danger:#ff5c66;
+  --danger-soft:rgba(255,92,102,.12);
+  --info:#52c7e0;
+  --info-soft:rgba(82,199,224,.12);
+  --inverse:#101010;
+  --primary-hover:rgba(255,255,255,.28);
+  --shadow:0 1px 2px rgba(0,0,0,.28);
+
+  /* 字体 */
+  --font-sans:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Consolas,monospace;
+  /* 字号 / 行高 */
+  --fs-h1:17px;--lh-h1:24px;
+  --fs-title:14px;--lh-title:20px;
+  --fs-body:14px;--lh-body:21px;
+  --fs-item:13px;--lh-item:19px;
+  --fs-meta:12px;--lh-meta:17px;
+  --fs-tiny:11px;--lh-tiny:16px;
+  /* 间距 (4px 基准) */
+  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;
+  /* 圆角 */
+  --radius-s:8px;--radius-m:10px;--radius-l:12px;
+  /* 控件尺寸 */
+  --btn-h:32px;--btn-h-sm:26px;--ctl-h:28px;
+  --ic:16px;--ic-sm:14px;
+}
+html[data-theme=light]{
+  color-scheme:light;
+  --bg-ground:#f5f5f3;
+  --bg-card:#ffffff;
+  --bg-input:#fafaf8;
+  --bg-raised:#eeeeea;
+  --fill-1:rgba(0,0,0,.045);
+  --fill-2:rgba(0,0,0,.09);
+  --sep-1:rgba(0,0,0,.1);
+  --sep-2:rgba(0,0,0,.05);
+  --text-1:rgba(0,0,0,.86);
+  --text-2:rgba(0,0,0,.56);
+  --text-3:rgba(0,0,0,.4);
+  --accent:#2f6df0;
+  --accent-soft:rgba(47,109,240,.1);
+  --ok:#149a4b;
+  --ok-soft:rgba(20,154,75,.1);
+  --warn:#c9760a;
+  --warn-soft:rgba(201,118,10,.1);
+  --danger:#d93038;
+  --danger-soft:rgba(217,48,56,.1);
+  --info:#0e8fae;
+  --info-soft:rgba(14,143,174,.1);
+  --inverse:#ffffff;
+  --primary-hover:rgba(0,0,0,.16);
+  --shadow:0 1px 3px rgba(0,0,0,.06);
+
+  /* 字体 */
+  --font-sans:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Consolas,monospace;
+  /* 字号 / 行高 */
+  --fs-h1:17px;--lh-h1:24px;
+  --fs-title:14px;--lh-title:20px;
+  --fs-body:14px;--lh-body:21px;
+  --fs-item:13px;--lh-item:19px;
+  --fs-meta:12px;--lh-meta:17px;
+  --fs-tiny:11px;--lh-tiny:16px;
+  /* 间距 (4px 基准) */
+  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;
+  /* 圆角 */
+  --radius-s:8px;--radius-m:10px;--radius-l:12px;
+  /* 控件尺寸 */
+  --btn-h:32px;--btn-h-sm:26px;--ctl-h:28px;
+  --ic:16px;--ic-sm:14px;
+}
+
+/* ===== 基础 ===== */
+body{margin:0;background:var(--bg-ground);color:var(--text-1);font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body)}
+button,input,select,textarea{font:inherit}
+.shell{max-width:1320px;margin:0 auto;padding:0 var(--sp-5) var(--sp-5)}
+.topbar{display:grid;grid-template-columns:minmax(180px,220px) minmax(0,1fr) auto;align-items:stretch;position:sticky;top:0;z-index:5;background:var(--bg-ground);border-bottom:1px solid var(--sep-2);padding:var(--sp-3) 0 var(--sp-4);margin:0 0 var(--sp-5)}
+.brand{display:flex;align-items:center;padding:0 var(--sp-4);min-width:0}
+.brand h1{font-size:var(--fs-title);line-height:1;margin:0;font-weight:700;letter-spacing:.2px}
+.brand h1 span{font-weight:500;color:var(--text-2)}
+.status-chips{display:flex;flex-wrap:nowrap;align-items:center;gap:var(--sp-3);padding:0 var(--sp-4);border-left:1px solid var(--sep-2);min-width:0;overflow:hidden}
+.chip{display:inline-flex;align-items:center;gap:var(--sp-1);font-size:var(--fs-body);line-height:1;color:var(--text-2);white-space:nowrap;min-width:0;flex:0 1 auto}
+.chip .dot{width:6px;height:6px;border-radius:50%;background:var(--text-3);flex:none}
+.chip em{font-style:normal;font-weight:600;color:var(--text-1);overflow:hidden;text-overflow:ellipsis;max-width:120px;font-variant-numeric:tabular-nums}
+.chip[data-state=ok] .dot{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.chip[data-state=warn] .dot{background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
+.chip[data-state=err] .dot{background:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
+.chip[data-state=warn] em{color:var(--warn)}
+.chip[data-state=err] em{color:var(--danger)}
+.top-actions{display:flex;flex-wrap:nowrap;align-items:center;gap:var(--sp-2);padding:0 var(--sp-4);border-left:1px solid var(--sep-2);white-space:nowrap}
+.top-actions .last-refresh{font-size:var(--fs-meta);color:var(--text-2);white-space:nowrap}
+.top-actions .sep{width:1px;height:20px;background:var(--sep-2)}
+.top-actions .btn{height:var(--ctl-h);border-color:transparent}
+.top-actions .access-token{height:var(--ctl-h);width:148px;flex:0 1 148px}
+.top-actions .theme-toggle{width:var(--ctl-h)}
+.top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:var(--sp-4);position:sticky;top:0;z-index:5;background:var(--bg-ground);border-bottom:1px solid var(--sep-2);padding:var(--sp-3) 0 var(--sp-4);margin:0 0 var(--sp-5)}
+.title{font-size:var(--fs-title);line-height:var(--lh-title);margin:0;font-weight:700;letter-spacing:.2px}
+.hint{margin:var(--sp-1) 0 0;color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta)}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-5)}
+.panel{min-width:0}
+.wide{grid-column:1/-1}
+.head{position:relative;height:40px;display:flex;align-items:center;justify-content:space-between;padding:0 var(--sp-1);gap:var(--sp-2)}
+.head::after{content:"";position:absolute;left:0;right:0;bottom:0;height:1px;background:var(--sep-2)}
+.head h2{margin:0;font-size:var(--fs-title);line-height:var(--lh-title);font-weight:600}
+.head small{color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.body{padding:var(--sp-4) var(--sp-1) 0;min-width:0}
+.body>*+*{margin-top:var(--sp-3)}
+.row{display:flex;gap:var(--sp-2);align-items:center;min-width:0}
+.row+.row{margin-top:var(--sp-3)}
+.row>*{min-width:0}
+.row>input,.row>select{flex:1 1 auto}
+.row>.btn{flex:0 0 auto}
+.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2);min-width:0}
+.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--sp-2);min-width:0}
+.stretch{width:100%}
+
+/* ===== 表单控件 ===== */
+input,select{width:100%;height:var(--btn-h);min-width:0;border:1px solid var(--sep-1);background:var(--bg-input);color:var(--text-1);border-radius:var(--radius-s);padding:0 var(--sp-2);outline:none;transition:border-color .2s ease,box-shadow .2s ease,background-color .2s ease}
+input::placeholder{color:var(--text-3)}
+input:hover,select:hover{border-color:var(--text-3)}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+select{appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238d8d8d' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right var(--sp-2) center;padding-right:30px;cursor:pointer}
+
+/* ===== 按钮 ===== */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--sp-1);height:var(--btn-h);min-width:0;padding:0 var(--sp-3);border:1px solid var(--sep-1);background:transparent;color:var(--text-1);border-radius:var(--radius-m);font-size:var(--fs-body);line-height:1;cursor:pointer;position:relative;overflow:hidden;transition:color .25s ease,border-color .25s ease,transform .12s ease}
+.btn::before{content:"";position:absolute;inset:0;background:var(--fill-1);opacity:0;transition:opacity .25s ease;pointer-events:none}
+.btn:hover::before{opacity:1}
+.btn:active::before{opacity:1;background:var(--fill-2)}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn:disabled::before{display:none}
+.btn:focus-visible,a.btn:focus-visible,.task:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+a.btn{text-decoration:none}
+.primary{background:var(--text-1);color:var(--inverse);border-color:transparent;font-weight:600}
+.primary::before{background:var(--primary-hover)}
+.warn{background:var(--danger-soft);border-color:transparent;color:var(--danger)}
+.warn::before{background:var(--danger-soft)}
+.ghost{border-color:transparent;color:var(--text-2)}
+.btn svg{width:var(--ic);height:var(--ic);flex:none}
+
+/* ===== 输出与任务 ===== */
+.output{margin:0;min-height:280px;max-height:560px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--bg-input);color:var(--text-1);padding:var(--sp-3);font-family:var(--font-mono);font-size:var(--fs-meta);line-height:1.5;border:1px solid var(--sep-2);border-radius:var(--radius-m)}
+.task-list{display:flex;flex-direction:column;gap:var(--sp-1);max-height:180px;overflow:auto}
+.task{width:100%;background:var(--bg-input);border:1px solid var(--sep-2);color:var(--text-1);border-radius:var(--radius-s);padding:var(--sp-1) var(--sp-2);font-size:var(--fs-meta);line-height:var(--lh-meta);text-align:left;cursor:pointer;transition:background-color .2s ease}
+.task:hover{background:var(--bg-raised)}
+.state{color:var(--text-3);margin-right:var(--sp-1);font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
+.state.ok{color:var(--ok)}
+.state.err{color:var(--danger)}
+.checkbox{display:inline-flex;align-items:center;gap:var(--sp-2);color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);cursor:pointer;user-select:none}
+input[type=checkbox]{-webkit-appearance:none;appearance:none;width:34px;height:20px;box-sizing:border-box;flex:none;border:1px solid var(--sep-1);border-radius:999px;background:var(--fill-2);cursor:pointer;position:relative;transition:border-color .2s ease,background-color .2s ease,box-shadow .2s ease}
+input[type=checkbox]::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--text-2);box-shadow:var(--shadow);transition:transform .2s ease,background-color .2s ease}
+input[type=checkbox]:hover{border-color:var(--text-2)}
+input[type=checkbox]:checked{background:var(--accent);border-color:var(--accent)}
+input[type=checkbox]:checked::after{background:var(--inverse);transform:translateX(14px)}
+input[type=checkbox]:focus-visible{box-shadow:0 0 0 3px var(--accent-soft)}
+input[type=checkbox]:disabled{opacity:.45;cursor:not-allowed}
+
+.readonly-status{color:var(--text-2);white-space:pre-wrap;overflow-wrap:anywhere}
+.readonly-errors{min-height:0;max-height:160px;color:var(--danger)}
+.readonly-cards{display:grid;gap:var(--sp-3)}
+.readonly-card{border:1px solid var(--sep-1);border-radius:var(--radius-m);background:var(--bg-card);padding:var(--sp-3);min-width:0}
+.readonly-card>*+*{margin-top:var(--sp-2)}
+.readonly-card h3{margin:0;font-size:var(--fs-title);overflow-wrap:anywhere}
+.readonly-card .output{min-height:0;max-height:320px}
+.readonly-card img{display:block;max-width:100%;height:auto}
+.readonly-meta{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-2);font-size:var(--fs-meta)}
+
+/* ===== 主题切换 ===== */
+.theme-toggle{width:var(--ctl-h);padding:0;color:var(--text-2);flex:none}
+.theme-toggle svg{width:var(--ic);height:var(--ic)}
+.theme-toggle .sun{display:none}
+html[data-theme=light] .theme-toggle .sun{display:block}
+html[data-theme=light] .theme-toggle .moon{display:none}
+
+@media(max-width:1200px){.status-chips{gap:var(--sp-2)}.chip{font-size:var(--fs-meta)}.chip em{max-width:96px}}
+@media(max-width:1050px){.topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:720px){body{overflow-x:hidden}.shell{padding:0 var(--sp-3) var(--sp-4)}.topbar{padding:var(--sp-3) var(--sp-1) var(--sp-4);margin-bottom:var(--sp-4)}.top-actions{gap:var(--sp-1)}.top-actions .access-token{width:160px;flex:1 1 160px}.grid{grid-template-columns:1fr;gap:var(--sp-4)}.wide{grid-column:auto}.row{flex-wrap:wrap}.row>.btn{flex:1 1 auto}.three{grid-template-columns:1fr}.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand"><h1>Miliastra <span>高级控制</span></h1></div>
+    <div class="status-chips">
+      <span class="chip"><i class="dot"></i><span>状态</span><em id="state" aria-live="polite">等待任务</em></span>
+      <span class="chip"><i class="dot"></i><span>任务</span><em id="taskId" aria-live="polite">未开始</em></span>
+      <span class="chip"><i class="dot"></i><span>工具</span><em>OCR / 模板 / 输入</em></span>
+    </div>
+    <div class="top-actions"><button class="btn theme-toggle" onclick="toggleTheme()" title="切换日间 / 夜间模式"><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg></button><input class="access-token" id="accessToken" type="password" placeholder="访问令牌（自动记住）" oninput="storeAccessToken()" onchange="applyAccessToken()"><a class="btn" href="/">监控面板</a><button class="btn" onclick="loadTools()">刷新任务</button></div>
+  </header>
+  <main class="grid">
+    <section class="panel">
+      <div class="head"><h2>画面与识别</h2></div>
+      <div class="body">
+        <div class="two"><button class="btn primary" onclick="run('/tools/ocr')">全屏 OCR</button><button class="btn" onclick="run('/tools/scan-chat')">扫描聊天</button></div>
+        <div class="row"><input id="ocrRect" placeholder="OCR 区域 x,y,width,height"><button class="btn" onclick="run('/tools/ocr',{rect:val('ocrRect')})">区域 OCR</button></div>
+        <div class="two"><button class="btn" onclick="run('/tools/ui-state')">检测 UI</button><button class="btn" onclick="run('/tools/hall-name')">大厅名称</button></div>
+        <div class="row"><button class="btn stretch" onclick="openScreenshot()">获取截图</button></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>模板</h2></div>
+      <div class="body">
+        <div class="row"><select id="template"><option value="blue-marker">蓝色聊天标志</option><option value="yellow-marker">黄色聊天标志</option><option value="pink-marker">粉色聊天标志</option><option value="friend">好友按钮</option><option value="secondary-back">二级聊天返回按钮</option><option value="secondary-hall">二级当前大厅</option></select></div>
+        <div class="row"><input id="templateRect" placeholder="匹配区域 x,y,width,height，留空全屏"><button class="btn" onclick="useConfiguredTemplateRegion()">读取配置区域</button></div>
+        <div class="row"><input id="threshold" placeholder="阈值，留空使用配置" inputmode="decimal"></div>
+        <div class="two"><button class="btn" onclick="matchTemplate(false)">匹配</button><button class="btn warn" onclick="matchTemplate(true)">匹配并点击</button></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>手动输入</h2></div>
+      <div class="body">
+        <div class="row"><input id="x" placeholder="x" inputmode="numeric"><input id="y" placeholder="y" inputmode="numeric"><button class="btn warn" onclick="clickPoint()">点击</button></div>
+        <div class="row"><input id="key" placeholder="按键，如 Escape / Return / F2"><button class="btn warn" onclick="sendKey()">发送</button></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>诊断</h2></div>
+      <div class="body">
+        <button class="btn stretch" onclick="run('/tools/ocr-backends')">OCR 后端探测</button>
+        <div class="row"><input id="captureRounds" value="3" inputmode="numeric" placeholder="截图 API 轮数"><button class="btn warn" onclick="captureBenchmark()">截图性能</button></div>
+        <div class="row"><input id="changeSamples" value="10" inputmode="numeric" placeholder="变化采样次数"><button class="btn" onclick="sampleChatChanges()">聊天变化</button></div>
+        <div class="row"><input id="benchmarkRounds" value="3" inputmode="numeric" placeholder="面板基准轮数"><button class="btn warn" onclick="panelBenchmark()">面板基准</button></div>
+        <div class="row"><input id="aiKeyword" placeholder="AI 候选诊断关键词"><button class="btn" onclick="aiPreview()">诊断</button></div>
+        <label class="checkbox"><input id="aiAccompaniment" type="checkbox">优先伴奏</label>
+      </div>
+    </section>
+    <section class="panel wide" id="readOnlyPanel" data-read-only>
+      <div class="head"><h2>用户沙盒 · 游戏状态观测</h2><small>主动读取 / 触发推送</small></div>
+      <div class="body">
+        <div class="row">
+          <label class="checkbox"><input id="readOnlyEnabled" type="checkbox" disabled onchange="setReadOnlyMode()">启用只读观测</label>
+          <select id="readOnlyState" aria-label="只读状态" disabled onchange="setReadOnlyMode()"><option value="active">主动读取</option><option value="push">推送</option></select>
+          <button class="btn" id="readOnlyRefresh" onclick="loadReadOnlyMode()">刷新状态</button>
+        </div>
+        <p class="hint">程序继续正常监听、点歌和播放。主动读取仅在点击时观察一次游戏状态；推送仅记录正常运行中触发的命令或流程。观测本身不点击、不输入、不派发命令。</p>
+        <div class="row"><input id="readOnlyLabel" aria-label="证据标签" maxlength="120" placeholder="证据标签（可选）"><button class="btn primary" id="readOnlyRead" disabled onclick="readOnlyReadOnce()">读取一次</button></div>
+        <div class="readonly-status" id="readOnlyStatus" role="status">正在读取只读状态…</div>
+        <div class="readonly-status" id="readOnlyGap" role="status" hidden></div>
+        <pre class="output readonly-errors" id="readOnlyErrors" role="log" aria-label="保留的只读错误" hidden></pre>
+        <div class="readonly-cards" id="readOnlyCards" aria-live="polite"></div>
+      </div>
+    </section>
+    <section class="panel wide">
+      <div class="head"><h2>任务结果</h2><small>最新输出</small></div>
+      <pre class="output" id="result">等待任务</pre>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>最近任务</h2></div>
+      <div class="body"><div class="task-list" id="tasks">暂无任务</div></div>
+    </section>
+  </main>
+</div>
+<script>
+const $=id=>document.getElementById(id)
+const val=id=>$(id).value.trim()
+const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
+let activeId=0
+let busy=false
+let taskPollGeneration=0
+let toolsLoadGeneration=0
+let templatesLoadGeneration=0
+let templateItems=[]
+const taskStatusLabel={queued:'等待业务空闲',running:'执行中',completed:'已完成',failed:'失败'}
+function readTokenCookie(){const match=document.cookie.match(/(?:^|;\s*)miliastraAccessToken=([^;]*)/);if(!match)return '';try{return decodeURIComponent(match[1])}catch{return ''}}
+function writeTokenCookie(value){
+  if(value){document.cookie='miliastraAccessToken='+encodeURIComponent(value)+';path=/;max-age=31536000;SameSite=Strict'}
+  else{document.cookie='miliastraAccessToken=;path=/;max-age=0;SameSite=Strict'}
+}
+function accessToken(){
+  const fromCookie=readTokenCookie();if(fromCookie)return fromCookie
+  const legacy=sessionStorage.getItem('miliastraAccessToken')||''
+  if(legacy){writeTokenCookie(legacy);sessionStorage.removeItem('miliastraAccessToken')}
+  return legacy
+}
+function storeAccessToken(){const token=$('accessToken').value.trim();if(token!==readTokenCookie()){writeTokenCookie(token);readOnlyGeneration++;readOnlyCloseEvents();readOnlyLoaded=false;readOnlyModeBusy=false;$('readOnlyStatus').textContent='令牌已更改，应用后重新读取只读状态。';readOnlyControls()}else writeTokenCookie(token)}
+function applyAccessToken(){storeAccessToken();loadTemplates();loadTools();loadReadOnlyMode()}
+function requestHeaders(){const token=accessToken();return token?{'X-Miliastra-Token':token}:{}}
+async function request(url,method='GET'){
+  const r=await fetch(url,{method,cache:'no-store',headers:requestHeaders()})
+  const text=await r.text()
+  if(!r.ok){
+    let detail=''
+    try{const value=JSON.parse(text);if(value&&typeof value==='object')detail=value.message||value.error||''}catch{}
+    if(!detail&&text.trim()&&!/^<!doctype html/i.test(text.trim())&&!/^<html[\s>]/i.test(text.trim()))detail=text.trim()
+    throw new Error(detail||('HTTP '+r.status))
+  }
+  const trimmed=text.trim()
+  if(trimmed.startsWith('<'))return 'HTTP '+r.status
+  try{
+    const value=JSON.parse(text)
+    if(value&&typeof value==='object'&&value.ok===false)throw new Error(value.message||value.error||value.code||('HTTP '+r.status))
+    return value
+  }catch(error){
+    if(error instanceof Error&&error.message&&error.message!=='Unexpected end of JSON input'&&!/Unexpected token/.test(error.message))throw error
+    return text
+  }
+}
+function setResult(text){$('result').textContent=typeof text==='string'?text:JSON.stringify(text,null,2)}
+function setHeaderState(text,state){const el=$('state');el.textContent=text;const chip=el.closest('.chip');if(chip)chip.dataset.state=state}
+function setBusy(value){busy=value;document.querySelectorAll('button').forEach(button=>{if(!button.closest('[data-read-only]'))button.disabled=value})}
+function params(values){const p=new URLSearchParams();for(const [k,v] of Object.entries(values||{})){if(v!==undefined&&v!==null&&String(v)!=='')p.set(k,v)}const s=p.toString();return s?'?'+s:''}
+async function run(path,values){
+  if(busy)return
+  const generation=++taskPollGeneration
+  setBusy(true);setResult('任务已提交...')
+  try{
+    const task=await request(path+params(values),'POST')
+    if(generation!==taskPollGeneration)return
+    const taskId=Number(task&&task.id)
+    if(!Number.isSafeInteger(taskId)||taskId<1)throw new Error('任务响应无效')
+    activeId=taskId;$('taskId').textContent='任务 #'+taskId;await pollTask(generation)
+  }catch(error){if(generation===taskPollGeneration){setResult('错误: '+error.message);setBusy(false)}}
+  if(generation===taskPollGeneration)await loadTools()
+}
+async function pollTask(generation=taskPollGeneration){
+  if(generation!==taskPollGeneration)return
+  try{
+    const task=await request('/tools/task?id='+encodeURIComponent(activeId))
+    if(generation!==taskPollGeneration)return
+     const label=taskStatusLabel[task.status]||task.status
+     setHeaderState('任务 #'+task.id+' '+label,task.status==='failed'?'err':task.status==='completed'?'ok':task.status==='running'?'ok':'neutral')
+     setResult(task.result||'等待执行...')
+     if(task.status==='queued'||task.status==='running'){setTimeout(()=>pollTask(generation),500);return}
+  }catch(error){if(generation!==taskPollGeneration)return;setResult('读取任务失败: '+error.message)}
+  if(generation!==taskPollGeneration)return
+  setBusy(false);loadTools()
+}
+function matchTemplate(click){const template=val('template');if(!template){setResult('错误: 请选择模板');return}run('/tools/template',{template,rect:val('templateRect'),threshold:val('threshold'),click:click?'1':''})}
+function clickPoint(){const x=val('x'),y=val('y');if(!x||!y){setResult('错误: 请输入 x 和 y 坐标');return}run('/tools/click',{x,y})}
+function sendKey(){const key=val('key');if(!key){setResult('错误: 请输入要发送的按键');return}run('/tools/key',{key})}
+function aiPreview(){const keyword=val('aiKeyword');if(!keyword){setResult('错误: 请输入 AI 候选诊断关键词');return}run('/tools/ai-preview',{keyword,preferAccompaniment:$('aiAccompaniment').checked?'1':''})}
+function sampleChatChanges(){run('/tools/chat-change-samples',{samples:val('changeSamples')})}
+function panelBenchmark(){run('/tools/panel-benchmark',{rounds:val('benchmarkRounds')})}
+function captureBenchmark(){run('/tools/capture-benchmark',{rounds:val('captureRounds')})}
+async function openScreenshot(){
+  if(busy)return
+  const preview=window.open('about:blank','_blank')
+  if(!preview){setResult('浏览器阻止了截图预览窗口');return}
+  setBusy(true);setResult('截图中...')
+  try{const r=await fetch('/screenshot?quality=88',{cache:'no-store',headers:requestHeaders()});if(!r.ok)throw new Error(await r.text()||('HTTP '+r.status));const url=URL.createObjectURL(await r.blob());preview.location.replace(url);setResult('截图已获取');setTimeout(()=>URL.revokeObjectURL(url),60000)}
+  catch(error){preview.close();setResult('错误: '+error.message)}
+  setBusy(false)
+}
+function renderTasks(items){const el=$('tasks');if(!Array.isArray(items)||!items.length){el.textContent='暂无任务';return}el.innerHTML=items.map(item=>'<button class="task" onclick="inspectTask('+Number(item.id)+')"><span class="state '+(item.status==='failed'?'err':item.status==='completed'?'ok':'')+'">'+esc(taskStatusLabel[item.status]||item.status)+'</span>#'+item.id+' '+esc(item.label)+'</button>').join('')}
+function inspectTask(id){if(busy)return;const taskId=Number(id);if(!Number.isSafeInteger(taskId)||taskId<1){setResult('错误: 任务编号无效');return}taskPollGeneration++;activeId=taskId;$('taskId').textContent='任务 #'+taskId;setBusy(true);pollTask(taskPollGeneration)}
+async function loadTemplates(){
+  const generation=++templatesLoadGeneration
+  try{
+    const items=await request('/tools/templates')
+    if(generation!==templatesLoadGeneration)return templateItems
+    templateItems=Array.isArray(items)?items:[]
+    const selected=val('template')
+    $('template').innerHTML=templateItems.map(item=>'<option value="'+esc(item.name)+'">'+esc(item.label)+'</option>').join('')
+    if([...$('template').options].some(option=>option.value===selected))$('template').value=selected
+    return templateItems
+  }catch(error){if(generation===templatesLoadGeneration)setHeaderState('模板读取失败','err');return []}
+}
+async function useConfiguredTemplateRegion(){
+  try{
+    const items=await loadTemplates()
+    const item=items.find(item=>item.name===val('template'))
+    const region=item&&item.region
+    if(!region||!Number.isInteger(region.x)||!Number.isInteger(region.y)||!Number.isInteger(region.width)||!Number.isInteger(region.height)){throw new Error('所选模板没有配置固定匹配区域，请手动填写')}
+    $('templateRect').value=[region.x,region.y,region.width,region.height].join(',')
+    if(Number.isFinite(Number(item.threshold)))$('threshold').value=String(item.threshold)
+    setResult('已读取 '+item.label+' 的配置区域')
+  }catch(error){setResult('错误: '+error.message)}
+}
+async function loadTools(){
+  const generation=++toolsLoadGeneration
+  try{
+    const monitor=await request('/monitor')
+    if(generation!==toolsLoadGeneration)return
+    renderTasks(monitor&&monitor.webTools)
+  }catch(error){if(generation===toolsLoadGeneration)setHeaderState('任务读取失败','err')}
+}
+// Read-only sandbox: separate from mutating tools and their polling lifecycle.
+let readOnlyMode={enabled:false,state:'active'}
+let readOnlyLoaded=false,readOnlyModeBusy=false,readOnlyReadBusy=false
+let readOnlyGeneration=0,readOnlyEventSource=null,readOnlyLastEventId=0,readOnlyInstance=null
+const readOnlyCards=new Map()
+function readOnlyObject(value){return value!==null&&typeof value==='object'&&!Array.isArray(value)}
+function readOnlySummary(value){return JSON.stringify(value,(key,item)=>key==='imagePngBase64'?'[完整 PNG 已保留，可单独下载]':item,2)}
+function readOnlyError(context,error){
+  const el=$('readOnlyErrors');el.hidden=false
+  el.textContent+=(el.textContent?'\n':'')+new Date().toLocaleTimeString()+' '+context+': '+String(error&&error.message||error)
+}
+async function readOnlyRequest(url,body){
+  const options={method:body===undefined?'GET':'POST',cache:'no-store',credentials:'same-origin',headers:requestHeaders()}
+  if(body!==undefined){options.headers={...options.headers,'Content-Type':'application/json'};options.body=JSON.stringify(body)}
+  const response=await fetch(url,options),text=await response.text()
+  let value
+  try{value=JSON.parse(text)}catch{throw new Error('HTTP '+response.status+'：返回内容不是有效 JSON')}
+  if(!readOnlyObject(value))throw new Error('HTTP '+response.status+'：JSON 响应必须为对象')
+  if(!response.ok||value.ok!==true){const error=new Error(String(value.message||value.error||value.code||('HTTP '+response.status+'：缺少 ok:true')));error.status=response.status;error.code=value.error||value.code;error.response=value;throw error}
+  return value
+}
+function readOnlyAcceptInstance(instance){
+  if(typeof instance!=='string'||!instance)throw new Error('缺少服务端 instance')
+  if(readOnlyInstance!==null&&readOnlyInstance!==instance){
+    readOnlyClearCards()
+    $('readOnlyGap').hidden=false;$('readOnlyGap').textContent='服务端实例已变化，旧实例证据已清除；序号从新实例继续。'
+  }
+  readOnlyInstance=instance
+}
+async function readOnlySection(id,section,snapshot={}){
+  let cursor=0,maxBytes=8192,text=''
+  const encoder=new TextEncoder()
+  while(true){
+    let value
+    try{value=await readOnlyRequest('/debug/read-only/evidence'+params({id,section,cursor,limit:10,maxBytes,revision:snapshot.revision}))}
+    catch(error){
+      const budget=error.response
+      if(error.code==='page_budget_too_small'&&budget.cursor===cursor&&budget.nextCursor===cursor&&maxBytes<65536){maxBytes=Math.min(65536,maxBytes*2);continue}
+      throw error
+    }
+    const evidence=value.evidence,page=evidence&&evidence.page
+    if(!readOnlyObject(evidence)||evidence.id!==id||evidence.section!==section||typeof evidence.instance!=='string'||!evidence.instance||!Number.isSafeInteger(evidence.revision)||!readOnlyObject(page)||page.encoding!=='json-utf8'||page.revision!==evidence.revision||page.cursor!==cursor||!Number.isSafeInteger(page.nextCursor)||typeof page.done!=='boolean'||!Array.isArray(page.items))throw new Error('分区分页信封无效')
+    if(snapshot.instance!==undefined&&snapshot.instance!==evidence.instance)throw new Error('分区 instance 冲突；请重新下载')
+    if(snapshot.revision!==undefined&&snapshot.revision!==evidence.revision)throw new Error('分区 revision 冲突；请重新下载')
+    snapshot.instance=evidence.instance;snapshot.revision=evidence.revision
+    let offset=cursor
+    for(const item of page.items){
+      if(!readOnlyObject(item)||item.section!==section||item.offset!==offset||typeof item.text!=='string')throw new Error('分区 UTF-8 片段不连续')
+      text+=item.text;offset+=encoder.encode(item.text).length
+    }
+    if(page.nextCursor!==offset||(!page.done&&offset<=cursor))throw new Error('分区 UTF-8 游标未正确推进')
+    if(page.done)return JSON.parse(text)
+    cursor=page.nextCursor
+  }
+}
+async function readOnlyFullEvidence(id,instance){
+  const snapshot=instance?{instance}:{}
+  const metadata=await readOnlySection(id,'metadata',snapshot)
+  const ocr=await readOnlySection(id,'ocr',snapshot)
+  const parameters=await readOnlySection(id,'parameters',snapshot)
+  const history=await readOnlySection(id,'history',snapshot)
+  if(!readOnlyObject(metadata)||metadata.id!==id||!readOnlyObject(parameters)||!readOnlyObject(parameters.task)||!readOnlyObject(history)||!Array.isArray(history.history))throw new Error('完整证据分区格式无效')
+  const task={...parameters.task};if(ocr!==null)task.ocr=ocr
+  return {evidence:{...metadata,task,...history},snapshot}
+}
+async function readOnlyImage(id,snapshot={}){
+  const response=await fetch('/debug/read-only/image'+params({id,instance:snapshot.instance,revision:snapshot.revision}),{cache:'no-store',credentials:'same-origin',headers:requestHeaders()})
+  if(!response.ok){
+    let value;try{value=JSON.parse(await response.text())}catch{throw new Error('原图 HTTP '+response.status)}
+    if(typeof value.error==='string'&&value.error.startsWith('image_unavailable'))return {blob:null,missingReason:value.message||value.error}
+    throw new Error(value.message||value.error||('原图 HTTP '+response.status))
+  }
+  const instance=response.headers.get('X-ReadOnly-Instance'),revision=response.headers.get('X-ReadOnly-Revision')
+  if(snapshot.instance!==undefined&&instance!==snapshot.instance)throw new Error('原图 instance 冲突；请重新下载')
+  if(snapshot.revision!==undefined&&revision!==String(snapshot.revision))throw new Error('原图 revision 冲突；请重新下载')
+  const blob=await response.blob(),bytes=new Uint8Array(await blob.arrayBuffer()),signature=[137,80,78,71,13,10,26,10]
+  if(bytes.length<8||signature.some((byte,index)=>bytes[index]!==byte))throw new Error('原图路由未返回 PNG')
+  const pixelSha256=response.headers.get('X-Pixel-Sha256'),fileSha256=response.headers.get('X-File-Sha256')
+  if(!/^[a-f0-9]{64}$/i.test(pixelSha256||'')||!/^[a-f0-9]{64}$/i.test(fileSha256||''))throw new Error('原图 SHA-256 响应头缺失或无效')
+  if(globalThis.crypto&&crypto.subtle){const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),byte=>byte.toString(16).padStart(2,'0')).join('');if(digest!==fileSha256.toLowerCase())throw new Error('原图文件 SHA-256 不一致')}
+  return {blob,pixelSha256,fileSha256}
+}
+function readOnlyClearCards(){
+  for(const card of readOnlyCards.values()){if(card.imageUrl)URL.revokeObjectURL(card.imageUrl);card.root.remove()}
+  readOnlyCards.clear();readOnlyLastEventId=0
+}
+async function readOnlyImageBase64(blob){
+  const bytes=new Uint8Array(await blob.arrayBuffer());let binary=''
+  for(let offset=0;offset<bytes.length;offset+=32768)binary+=String.fromCharCode(...bytes.subarray(offset,offset+32768))
+  return btoa(binary)
+}
+function readOnlyCloseEvents(){
+  if(readOnlyEventSource){readOnlyEventSource.close();readOnlyEventSource=null}
+}
+function readOnlyControls(){
+  $('readOnlyEnabled').checked=readOnlyMode.enabled
+  $('readOnlyState').value=readOnlyMode.state
+  $('readOnlyEnabled').disabled=!readOnlyLoaded||readOnlyModeBusy
+  $('readOnlyState').disabled=!readOnlyLoaded||readOnlyModeBusy
+  $('readOnlyRefresh').disabled=readOnlyModeBusy
+  $('readOnlyRead').disabled=!readOnlyLoaded||readOnlyModeBusy||readOnlyReadBusy||!readOnlyMode.enabled||readOnlyMode.state!=='active'
+  $('readOnlyLabel').disabled=$('readOnlyRead').disabled
+}
+function readOnlyAcceptMode(value){
+  const mode=value.mode
+  if(!readOnlyObject(mode)||typeof mode.enabled!=='boolean'||!['active','push'].includes(mode.state))throw new Error('只读 mode JSON 格式无效')
+  if(mode.instance||value.instance)readOnlyAcceptInstance(mode.instance||value.instance)
+  readOnlyMode={enabled:mode.enabled,state:mode.state};readOnlyLoaded=true
+  $('readOnlyStatus').textContent=!mode.enabled?'只读已禁用，未连接推送。':mode.state==='active'?'主动读取已启用，等待点击读取一次。':'推送已启用，正在连接专用事件流…'
+  if(mode.enabled&&mode.state==='push')readOnlyConnectEvents()
+}
+async function loadReadOnlyMode(){
+  if(readOnlyModeBusy)return
+  const generation=++readOnlyGeneration
+  readOnlyCloseEvents();readOnlyModeBusy=true;readOnlyLoaded=false;readOnlyControls()
+  try{const value=await readOnlyRequest('/debug/read-only/mode');if(generation===readOnlyGeneration)readOnlyAcceptMode(value)}
+  catch(error){if(generation===readOnlyGeneration){$('readOnlyStatus').textContent='状态读取失败，推送连接已关闭。';readOnlyError('读取只读状态失败',error)}}
+  finally{if(generation===readOnlyGeneration){readOnlyModeBusy=false;readOnlyControls()}}
+}
+async function setReadOnlyMode(){
+  if(readOnlyModeBusy||!readOnlyLoaded)return
+  const desired={enabled:$('readOnlyEnabled').checked,state:$('readOnlyState').value}
+  const generation=++readOnlyGeneration
+  readOnlyCloseEvents();readOnlyModeBusy=true;readOnlyControls()
+  try{const value=await readOnlyRequest('/debug/read-only/mode',desired);if(generation===readOnlyGeneration)readOnlyAcceptMode(value)}
+  catch(error){if(generation===readOnlyGeneration){readOnlyLoaded=false;$('readOnlyStatus').textContent='切换失败，连接已关闭；请刷新状态确认服务端模式。';readOnlyError('切换只读状态失败',error)}}
+  finally{if(generation===readOnlyGeneration){readOnlyModeBusy=false;readOnlyControls()}}
+}
+async function readOnlyReadOnce(){
+  if(!readOnlyLoaded||readOnlyModeBusy||readOnlyReadBusy||!readOnlyMode.enabled||readOnlyMode.state!=='active')return
+  const generation=readOnlyGeneration
+  readOnlyReadBusy=true;readOnlyControls();$('readOnlyStatus').textContent='正在采集一次只读证据…'
+  try{
+    const value=await readOnlyRequest('/debug/read-only/read',{label:val('readOnlyLabel'),ocr:true,rect:null})
+    if(generation!==readOnlyGeneration)return
+    if(value.evidence.instance)readOnlyAcceptInstance(value.evidence.instance)
+    readOnlyRenderEvidence(value.evidence)
+    $('readOnlyStatus').textContent='本次读取已完成；不会定时读取。'
+  }catch(error){if(generation===readOnlyGeneration){$('readOnlyStatus').textContent='本次读取失败，已有证据保留。';readOnlyError('主动读取失败',error)}}
+  finally{readOnlyReadBusy=false;readOnlyControls()}
+}
+function readOnlyNode(tag,className,text){const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=text;return node}
+function readOnlyCard(id){
+  let card=readOnlyCards.get(id)
+  if(card)return card
+  const root=readOnlyNode('article','readonly-card'),title=readOnlyNode('h3'),meta=readOnlyNode('div','readonly-meta'),note=readOnlyNode('div','readonly-meta'),actions=readOnlyNode('div','row'),preview=readOnlyNode('div'),details=readOnlyNode('details'),summary=readOnlyNode('summary','','证据 JSON（页面省略 PNG base64）'),output=readOnlyNode('pre','output')
+  const json=readOnlyNode('button','btn','下载完整 JSON'),png=readOnlyNode('button','btn','下载完整 PNG')
+  json.type='button';png.type='button';json.disabled=true;png.disabled=true
+  actions.append(json,png);details.append(summary,output);root.append(title,meta,note,actions,preview,details)
+  card={id,root,title,meta,note,json,png,preview,output,evidence:null,pngBlob:null,imageUrl:null,revision:0}
+  json.onclick=()=>readOnlyDownload(card,'json');png.onclick=()=>readOnlyDownload(card,'png')
+  readOnlyCards.set(id,card);$('readOnlyCards').prepend(root)
+  // Bound browser memory just as the server bounds evidence retention.
+  while(readOnlyCards.size>12){const oldest=readOnlyCards.keys().next().value,removed=readOnlyCards.get(oldest);if(removed.imageUrl)URL.revokeObjectURL(removed.imageUrl);removed.root.remove();readOnlyCards.delete(oldest)}
+  return card
+}
+function readOnlyTime(value){return typeof value==='number'&&Number.isFinite(value)?new Date(value).toLocaleString()+' ('+value+')':'未提供'}
+function readOnlyMetadata(evidence){
+  const source=evidence.source
+  let text='证据 '+evidence.id+' · taskId: '+(evidence.taskId??'无')+' · 记录时间: '+readOnlyTime(evidence.recordedAtMs)
+  if(readOnlyObject(source))text+='\n原始帧 #'+source.frameId+' · 来源: '+(source.canvas||'未提供')+' · '+source.width+' × '+source.height+'\n采集时间: '+readOnlyTime(source.capturedAtWallMillis)+(source.capturedAtWallMillisEstimated?'（估算）':'')+' · 帧龄: '+(source.ageMillis??'未提供')+' ms\n像素 SHA-256: '+(source.pixelSha256||'未提供')
+  else text+='\n来源帧: '+(evidence.sourceFrameId??'无')+' · 缺图原因: '+(evidence.missingReason||'服务端未提供来源图像')
+  return text
+}
+function readOnlyPngBlob(base64){
+  if(typeof base64!=='string'||!base64||base64.length%4!==0||!/^[A-Za-z0-9+/]*={0,2}$/.test(base64))throw new Error('source.imagePngBase64 格式无效')
+  const binary=atob(base64),signature=[137,80,78,71,13,10,26,10]
+  if(binary.length<8||signature.some((byte,index)=>binary.charCodeAt(index)!==byte))throw new Error('来源图像不是 PNG')
+  const bytes=new Uint8Array(binary.length);for(let index=0;index<binary.length;index++)bytes[index]=binary.charCodeAt(index)
+  return new Blob([bytes],{type:'image/png'})
+}
+function readOnlyRenderEvidence(evidence){
+  if(!readOnlyObject(evidence)||typeof evidence.id!=='string'||!evidence.id||!Object.prototype.hasOwnProperty.call(evidence,'source')||(evidence.source!==null&&!readOnlyObject(evidence.source)))throw new Error('evidence JSON 格式无效（需要 id 和 source）')
+  const card=readOnlyCard(evidence.id)
+  card.evidence=evidence;card.json.disabled=false;card.title.textContent=(evidence.kind==='active'?'主动读取':'触发证据')+' · '+evidence.id
+  card.meta.textContent=readOnlyMetadata(evidence);card.output.textContent=readOnlySummary(evidence)
+  // Download and preview use the exact decoded PNG bytes; no canvas, resize or re-encoding.
+  let pngBlob=null
+  card.note.textContent=''
+  try{if(evidence.source&&evidence.source.imagePngBase64)pngBlob=readOnlyPngBlob(evidence.source.imagePngBase64)}
+  catch(error){readOnlyError('证据 '+evidence.id+' 图像无效',error);card.note.textContent='图像无效；完整 JSON 仍可下载。'}
+  if(card.imageUrl){URL.revokeObjectURL(card.imageUrl);card.imageUrl=null}
+  card.preview.textContent='';card.pngBlob=pngBlob;card.png.disabled=!pngBlob&&(!evidence.source||evidence.imageRetained===false||evidence.source.imageRetained===false)
+  if(pngBlob){
+    card.imageUrl=URL.createObjectURL(pngBlob)
+    const image=readOnlyNode('img');image.alt='证据原始游戏帧 '+evidence.source.frameId;image.src=card.imageUrl
+    image.onerror=()=>readOnlyError('证据 '+evidence.id+' 图像显示失败','浏览器无法解码原始 PNG，仍可下载核对')
+    card.preview.append(image);card.note.textContent='原始 PNG，页面仅按可用宽度显示；下载保留完整像素。'
+  }else if(!card.note.textContent.startsWith('图像无效'))card.note.textContent=card.png.disabled?'无可下载图像：'+(evidence.missingReason||'原始帧未保留'):'原始 PNG 可按需下载；页面当前显示元数据。'
+  return card
+}
+async function readOnlyDownload(card,kind){
+  if(card.downloadBusy)return
+  card.downloadBusy=true
+  const generation=readOnlyGeneration
+  try{
+    if(!card.evidence)throw new Error('当前证据没有可下载的内容')
+    let blob
+    if(kind==='png'){
+      const image=await readOnlyImage(card.id,{instance:card.evidence.instance,revision:card.evidence.revision})
+      if(!image.blob)throw new Error('无可下载图像：'+image.missingReason)
+      blob=image.blob
+    }else{
+      const {evidence,snapshot}=await readOnlyFullEvidence(card.id,card.evidence.instance)
+      if(evidence.source&&evidence.imageRetained!==false&&evidence.source.imageRetained!==false){
+        const image=await readOnlyImage(card.id,snapshot)
+        if(image.blob)evidence.source={...evidence.source,pixelSha256:image.pixelSha256,fileSha256:image.fileSha256,imagePngBase64:await readOnlyImageBase64(image.blob)}
+        else{evidence.imageRetained=false;evidence.source={...evidence.source,imageRetained:false};evidence.missingReason=image.missingReason}
+      }
+      blob=new Blob([JSON.stringify(evidence,null,2)],{type:'application/json;charset=utf-8'})
+    }
+    if(generation!==readOnlyGeneration||readOnlyCards.get(card.id)!==card)return
+    const url=URL.createObjectURL(blob),link=readOnlyNode('a')
+    link.href=url;link.download='read-only-'+String(card.id).replace(/[^a-zA-Z0-9_-]/g,'_')+'.'+kind
+    document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000)
+  }catch(error){readOnlyError('下载失败',error)}
+  finally{card.downloadBusy=false}
+}
+function readOnlyEvidenceUrl(raw){
+  if(typeof raw!=='string'||!raw.startsWith('/debug/read-only/evidence?'))throw new Error('推送 evidenceUrl 无效')
+  const url=new URL(raw,window.location.origin)
+  if(url.origin!==window.location.origin||url.pathname!=='/debug/read-only/evidence'||url.hash||[...url.searchParams.keys()].some(key=>key!=='id')||url.searchParams.getAll('id').length!==1||!url.searchParams.get('id'))throw new Error('推送 evidenceUrl 必须为同源只读证据 URL')
+  return url.pathname+url.search
+}
+async function readOnlyHandleEvent(event,generation){
+  if(generation!==readOnlyGeneration||!readOnlyMode.enabled||readOnlyMode.state!=='push')return
+  let card=null,revision=0
+  try{
+    let payload
+    try{payload=JSON.parse(event.data)}catch{throw new Error('推送 data 不是有效 JSON')}
+    if(!readOnlyObject(payload)||typeof payload.id!=='string'||!payload.id)throw new Error('推送 JSON 缺少证据 id')
+    readOnlyAcceptInstance(payload.instance)
+    const sequence=Number(event.lastEventId)
+    if(Number.isSafeInteger(sequence)&&sequence>0){
+      if(sequence>readOnlyLastEventId+1){$('readOnlyGap').hidden=false;$('readOnlyGap').textContent='推送序号存在缺口（'+readOnlyLastEventId+' → '+sequence+'），有界历史可能已过期。现有证据保留。'}
+      if(sequence<=readOnlyLastEventId)return
+      readOnlyLastEventId=sequence
+    }
+    readOnlyEvidenceUrl(payload.evidenceUrl)
+    card=readOnlyCard(payload.id);revision=++card.revision
+    card.title.textContent='命令 / 流程触发 · '+payload.id;card.meta.textContent=readOnlyMetadata(payload);card.output.textContent=readOnlySummary(payload);card.note.textContent='正在读取证据元数据…'
+    const snapshot={instance:payload.instance},evidence=await readOnlySection(payload.id,'metadata',snapshot)
+    if(generation!==readOnlyGeneration||revision!==card.revision||readOnlyCards.get(payload.id)!==card)return
+    if(!readOnlyObject(evidence)||evidence.id!==payload.id)throw new Error('证据响应 id 与推送不一致')
+    readOnlyRenderEvidence(evidence)
+    if(evidence.source&&evidence.imageRetained!==false&&evidence.source.imageRetained!==false){
+      const image=await readOnlyImage(payload.id,snapshot)
+      if(generation!==readOnlyGeneration||revision!==card.revision||readOnlyCards.get(payload.id)!==card)return
+      if(image.blob){
+        evidence.source={...evidence.source,pixelSha256:image.pixelSha256,fileSha256:image.fileSha256}
+        card.meta.textContent=readOnlyMetadata(evidence);card.output.textContent=readOnlySummary(evidence)
+        card.pngBlob=image.blob;card.imageUrl=URL.createObjectURL(image.blob)
+        const preview=readOnlyNode('img');preview.alt='证据原始游戏帧 '+evidence.source.frameId;preview.src=card.imageUrl;card.preview.append(preview)
+        card.note.textContent='原始 PNG，页面仅按可用宽度显示；下载保留完整像素。'
+      }else{card.png.disabled=true;card.note.textContent='无可下载图像：'+image.missingReason}
+    }
+  }catch(error){if(generation===readOnlyGeneration){if(card&&revision===card.revision)card.note.textContent='证据读取失败：'+String(error&&error.message||error)+'；已有完整证据保留。';readOnlyError('读取触发证据失败（已有证据保留）',error)}}
+}
+async function readOnlyConnectEvents(){
+  readOnlyCloseEvents()
+  if(!readOnlyMode.enabled||readOnlyMode.state!=='push')return
+  if(typeof EventSource==='undefined'){readOnlyError('推送不可用','浏览器不支持 EventSource');return}
+  const generation=readOnlyGeneration
+  if(!readOnlyInstance){
+    try{const value=await readOnlyRequest('/debug/read-only/summary');if(generation!==readOnlyGeneration||!readOnlyMode.enabled||readOnlyMode.state!=='push')return;readOnlyAcceptInstance(value.summary&&value.summary.instance)}
+    catch(error){readOnlyError('读取推送实例失败',error);return}
+  }
+  // Cookie authentication only. Pin server identity even on native reconnect.
+  // Last-Event-ID remains the producer cursor; instance change triggers a reset gap.
+  const source=new EventSource('/debug/read-only/events'+params({instance:readOnlyInstance}),{withCredentials:true})
+  readOnlyEventSource=source;readOnlyLastEventId=0
+  for(const type of ['readonly.triggered','readonly.task.updated'])source.addEventListener(type,event=>{if(readOnlyEventSource===source)readOnlyHandleEvent(event,generation)})
+  source.addEventListener('readonly.gap',event=>{
+    if(readOnlyEventSource!==source||generation!==readOnlyGeneration)return
+    try{
+      const gap=JSON.parse(event.data),reset=gap.reset===true||(gap.instance&&readOnlyInstance!==gap.instance)
+      if(gap.instance)readOnlyAcceptInstance(gap.instance)
+      $('readOnlyGap').hidden=false;$('readOnlyGap').textContent='推送缺口：'+readOnlySummary(gap)
+      if(reset){readOnlyClearCards();readOnlyCloseEvents();readOnlyConnectEvents()}
+    }catch(error){readOnlyError('推送缺口格式无效',error)}
+  })
+  source.onopen=()=>{if(readOnlyEventSource===source)$('readOnlyStatus').textContent='专用推送已连接，等待命令 / 流程触发。'}
+  source.onerror=()=>{if(readOnlyEventSource===source){$('readOnlyStatus').textContent='推送连接中断，浏览器自动重连；有界证据可能过期。';readOnlyError('推送连接中断','将使用 Last-Event-ID 自动续传，已有证据保留')}}
+}
+window.addEventListener('pagehide',()=>{readOnlyGeneration++;readOnlyCloseEvents();readOnlyModeBusy=false})
+window.addEventListener('pageshow',event=>{if(event.persisted)loadReadOnlyMode()})
+document.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.isComposing&&event.target.tagName==='INPUT'){const map={ocrRect:()=>run('/tools/ocr',{rect:val('ocrRect')}),x:clickPoint,y:clickPoint,key:sendKey,aiKeyword:aiPreview,threshold:()=>matchTemplate(false),templateRect:()=>matchTemplate(false),changeSamples:sampleChatChanges,benchmarkRounds:panelBenchmark};const action=map[event.target.id];if(action){event.preventDefault();action()}}})
+$('accessToken').value=accessToken()
+function toggleTheme(){const t=document.documentElement.dataset.theme==='light'?'dark':'light';document.documentElement.dataset.theme=t;try{localStorage.setItem('miliastraTheme',t)}catch(e){}}
+loadTemplates()
+loadTools()
+loadReadOnlyMode()
+</script>
+</body>
+</html>

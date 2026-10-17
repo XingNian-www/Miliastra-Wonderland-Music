@@ -1,0 +1,985 @@
+use super::*;
+
+#[path = "playlist_window.rs"]
+mod playlist_window;
+
+use crate::features::administration::{
+    AdministrationApplicationPort, AdministrationCommandContext, AdministrationImmediatePort,
+};
+use crate::features::hall::{
+    HallApplicationPort, HallCommandContext, HallDetectionPort, HallMaintenancePort,
+    HallObservation, HallStatePatch,
+};
+use crate::features::idiom_chain::{
+    IdiomChainDeferredPort, IdiomChainExplanationPort, IdiomChainOutcome, IdiomDeliveryOutcome,
+};
+use crate::features::turtle_soup::{
+    QuestionSubmitOutcome, TurtleSoupApplicationPort, TurtleSoupCommandOutcome,
+};
+
+/// 歌单与收藏仅对好友及以上开放；好友私聊或大厅身份映射均可授权。
+fn playlist_command_allows_friend(authority: CommandAuthority, role: Option<IdentityRole>) -> bool {
+    authority == CommandAuthority::Friend || role.is_some()
+}
+
+/// B站 音源与本地曲库兜底要求好友及以上权限：好友私聊、靠映射获得权限的大厅成员
+/// （好友/管理员/主人），以及控制面板发起的点歌都算。
+fn song_request_allows_bilibili(parsed: &RoutedCommand, command: &SongCommand) -> bool {
+    parsed.authority == CommandAuthority::Friend
+        || parsed.role.is_some()
+        || !command.friend_username.trim().is_empty()
+        || parsed.message_type == "控制台"
+}
+
+pub(super) struct ImmediateAdministrationPort {
+    business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
+    monitor: MonitorShared,
+    executed_commands_log_path: std::path::PathBuf,
+}
+
+pub(super) struct DeferredIdiomChainPort {
+    business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
+}
+
+/// 个人歌单的播放侧适配：读取当前播放曲目、直接播放收藏曲目。
+struct PlaylistRuntimePlaybackPort<'a> {
+    runtime: &'a mut ApplicationRuntime,
+}
+
+impl ApplicationRuntime {
+    /// 上下文丢失（换大厅/进千星/进入游戏）：结束个人歌单模式并清理残留自动项。
+    pub(super) fn end_personal_playlist_for_context_loss(&self, reason: &str) -> Result<()> {
+        let application = self.playback.playback_application.clone();
+        let Some(owner) = application.take_personal_playlist_mode() else {
+            return Ok(());
+        };
+        log::info!("{reason}: 已结束个人歌单模式 (owner={owner})");
+        // 原子清理自动项，避免与并发点歌入队产生索引错位而误删用户点歌。
+        self.business
+            .business
+            .remove_playlist_auto_items()
+            .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+}
+
+impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlaybackPort<'_> {
+    fn current_track(&self) -> Option<miliastra_playback::PlayableTrack> {
+        self.runtime
+            .business
+            .business
+            .playback_state_snapshot()
+            .ok()
+            .and_then(|snapshot| snapshot.last_observation)
+            .and_then(|observation| observation.track)
+    }
+
+    fn play(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<()> {
+        let application = self.runtime.playback.playback_application.clone();
+        application.play_structured_track(track, self.runtime)
+    }
+
+    fn enqueue_next(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<bool> {
+        let outcome = self
+            .runtime
+            .business
+            .business
+            .push_playback_queue_next(QueueItem {
+                keyword: track.metadata.title.clone(),
+                source: track.track_ref.key.provider.as_str().to_owned(),
+                track: Some(track.clone()),
+                ..QueueItem::default()
+            })?;
+        Ok(outcome.accepted)
+    }
+
+    fn start_playlist(
+        &mut self,
+        owner: &str,
+        tracks: Vec<miliastra_playback::PlayableTrack>,
+    ) -> Result<crate::features::playback::PersonalPlaylistStart> {
+        let application = self.runtime.playback.playback_application.clone();
+        application.start_personal_playlist(owner, tracks, self.runtime)
+    }
+
+    fn stop_playlist(&mut self) -> Result<bool> {
+        let application = self.runtime.playback.playback_application.clone();
+        application.stop_personal_playlist(self.runtime)
+    }
+
+    fn playlist_mode_owner(&self) -> Option<String> {
+        self.runtime.playback.playback_application.playlist_mode_owner()
+    }
+
+    fn extend_playlist_tracks(
+        &mut self,
+        owner: &str,
+        tracks: &[miliastra_playback::PlayableTrack],
+    ) -> Result<bool> {
+        Ok(self
+            .runtime
+            .playback
+            .playback_application
+            .extend_personal_playlist_tracks(owner, tracks))
+    }
+
+    fn import_playlist(
+        &mut self,
+        provider: &str,
+        input: &str,
+    ) -> Result<miliastra_playback::PlaylistImportOperation> {
+        self.runtime
+            .playback
+            .native_playback
+            .import_playlist(provider, input)
+            .map_err(anyhow::Error::from)
+    }
+}
+
+struct DeferredCardGamePort {
+    task_engine: TaskEngineHandle,
+}
+
+struct TurtleSoupCommandPort {
+    business: BusinessRuntimeHandle,
+    task_engine: TaskEngineHandle,
+}
+
+struct PublicHallDetectionPort {
+    hall_ui: HallUi,
+    business: BusinessRuntimeHandle,
+}
+
+impl HallDetectionPort for PublicHallDetectionPort {
+    fn detect_public_hall(&mut self) -> Result<Option<HallObservation>> {
+        detect_public_hall(&self.hall_ui)
+    }
+
+    fn update_hall_remaining_minutes(&mut self, minutes: u32) -> Result<()> {
+        self.business
+            .update_hall_remaining_minutes(minutes)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn clear_hall_remaining_minutes(&mut self) -> Result<()> {
+        self.business
+            .clear_hall_remaining_minutes()
+            .map_err(anyhow::Error::from)
+    }
+}
+
+impl IdiomChainDeferredPort for DeferredIdiomChainPort {
+    fn handle_command(
+        &mut self,
+        player: &str,
+        command: &idiom_chain::IdiomChainCommand,
+        observed_at: Instant,
+    ) -> Result<IdiomChainOutcome> {
+        self.business
+            .handle_idiom_chain_at(player, command, observed_at)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn send_deferred(&mut self, message: String) -> Result<IdiomDeliveryOutcome> {
+        let snapshot = self.business.chat_listener_snapshot()?;
+        let target = match listener_residency(snapshot.mode, snapshot.temporary_primary) {
+            UiResidency::Primary => DeferredChatTarget::Primary,
+            UiResidency::SecondaryCurrentHall => DeferredChatTarget::SecondaryCurrentHall,
+        };
+        Ok(
+            match self.task_engine.enqueue_deferred(DeferredChatMessage {
+                text: message,
+                target,
+                background_key: None,
+                formal_epoch: None,
+            })? {
+                EnqueueOutcome::Added => IdiomDeliveryOutcome::Added,
+                EnqueueOutcome::DroppedMessage => IdiomDeliveryOutcome::DroppedEarlierMessage,
+                EnqueueOutcome::Rejected => IdiomDeliveryOutcome::Rejected,
+            },
+        )
+    }
+}
+
+impl CardGameDeliveryPort for DeferredCardGamePort {
+    fn verify_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+        Err(anyhow!("延迟牌类端口不能执行好友验证"))
+    }
+
+    fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+        Err(anyhow!("延迟牌类端口不能发送好友消息"))
+    }
+
+    fn send_friend_batch(
+        &self,
+        _deliveries: &[LandlordPrivateDelivery],
+    ) -> Result<FriendBatchOutcome> {
+        Err(anyhow!("延迟牌类端口不能发送好友批次"))
+    }
+
+    fn send_hall(&self, message: &str) -> Result<()> {
+        enqueue_current_hall_reply(&self.task_engine, message)
+    }
+}
+
+impl TurtleSoupApplicationPort for TurtleSoupCommandPort {
+    fn handle_hall_command(
+        &mut self,
+        player: &str,
+        command: &turtle_soup::TurtleSoupCommand,
+    ) -> Result<TurtleSoupCommandOutcome> {
+        self.business
+            .handle_turtle_soup_hall_command(player, command)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn handle_friend_command(
+        &mut self,
+        player: &str,
+        command: &turtle_soup::TurtleSoupCommand,
+    ) -> Result<TurtleSoupCommandOutcome> {
+        self.business
+            .handle_turtle_soup_friend_command(player, command)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn submit_question(
+        &mut self,
+        question: turtle_soup::TurtleSoupQuestion,
+        observed_at: Instant,
+    ) -> Result<QuestionSubmitOutcome> {
+        self.business
+            .submit_turtle_soup_question_at(question, observed_at)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn send_current_hall(&mut self, message: &str) -> Result<()> {
+        enqueue_current_hall_reply(&self.task_engine, message)
+    }
+}
+
+impl AdministrationImmediatePort for ImmediateAdministrationPort {
+    fn set_commands_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.business
+            .set_commands_enabled(enabled)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn enqueue_hall_reply(&mut self, message: &str) -> Result<()> {
+        enqueue_current_hall_reply(&self.task_engine, message)
+    }
+
+    fn configure_idle_exit(&mut self, minutes: u32) -> Result<()> {
+        configure_idle_exit(&self.business, minutes)
+    }
+
+    fn record_command_activity(&mut self) -> Result<()> {
+        self.business
+            .record_command_activity(Instant::now())
+            .map_err(anyhow::Error::from)
+    }
+
+    fn log_executed(
+        &mut self,
+        context: &AdministrationCommandContext,
+        final_command: &str,
+    ) -> Result<()> {
+        super::tasks::write_executed_command_fields(
+            &self.monitor,
+            &self.executed_commands_log_path,
+            &context.message_type,
+            &context.username,
+            &context.user_command,
+            final_command,
+        )
+    }
+}
+
+impl ApplicationRuntime {
+    pub(super) fn deferred_idiom_chain_port(&self) -> DeferredIdiomChainPort {
+        DeferredIdiomChainPort {
+            business: self.business.business.clone(),
+            task_engine: self.business.task_engine.clone(),
+        }
+    }
+
+    fn turtle_soup_command_port(&self) -> TurtleSoupCommandPort {
+        TurtleSoupCommandPort {
+            business: self.business.business.clone(),
+            task_engine: self.business.task_engine.clone(),
+        }
+    }
+
+    pub(super) fn immediate_administration_port(&self) -> ImmediateAdministrationPort {
+        let live_config = self.lifecycle.live_configs.snapshot();
+        ImmediateAdministrationPort {
+            business: self.business.business.clone(),
+            task_engine: self.business.task_engine.clone(),
+            monitor: self.lifecycle.monitor.clone(),
+            executed_commands_log_path: live_config.state.executed_commands_log_path.clone(),
+        }
+    }
+
+    pub(super) fn maybe_warn_hall_expiring(&mut self) -> Result<bool> {
+        let application = self.business.hall_application;
+        application.maybe_warn_expiring(self)
+    }
+
+    pub(super) fn execute_command(&mut self, parsed: &RoutedCommand) -> Result<()> {
+        if let Some(required) = parsed.permission_required {
+            log::info!(
+                "命令未执行：权限不足（需要 {:?}，authority={:?} role={:?}）text={}",
+                required,
+                parsed.authority,
+                parsed.role,
+                parsed.raw
+            );
+            let message = match required {
+                IdentityRole::Admin | IdentityRole::Owner => "权限不足：该命令仅限管理员使用",
+                IdentityRole::Friend => "权限不足：该命令仅限好友使用",
+            };
+            return ApplicationRuntime::reply(self, message);
+        }
+        match &parsed.command {
+            ModuleCommand::SongRequest(command) => {
+                let context = SongRequestContext {
+                    message_type: parsed.message_type.clone(),
+                    raw: parsed.raw.clone(),
+                    username: command_username(parsed).to_string(),
+                    user_command: parsed.user_command.clone(),
+                    friend_or_above: song_request_allows_bilibili(parsed, command),
+                };
+                self.business
+                    .song_requests
+                    .clone()
+                    .execute(&context, command, self)
+            }
+            ModuleCommand::Playback(command) => self.execute_playback_intent(parsed, command),
+            ModuleCommand::Hall(command) => self.execute_hall_intent(parsed, command),
+            ModuleCommand::Administration(command) => {
+                self.execute_administration_intent(parsed, command)
+            }
+            ModuleCommand::IdiomChain(command) => self.execute_idiom_chain_intent(parsed, command),
+            ModuleCommand::CardGame(command) => self.execute_card_game_intent(parsed, command),
+            ModuleCommand::TurtleSoup(command) => self.execute_turtle_soup_intent(parsed, command),
+            ModuleCommand::Tarot(command) => self.execute_tarot_intent(parsed, command),
+            ModuleCommand::Playlist(command) => self.execute_playlist_intent(parsed, command),
+            ModuleCommand::Undercover(command) => self.execute_undercover_intent(parsed, command),
+            ModuleCommand::Invite(command) => self.execute_invite_intent(parsed, command),
+            ModuleCommand::Moderation(command) => self.execute_moderation_intent(parsed, command),
+            ModuleCommand::CustomWorkflow(command) => {
+                self.execute_custom_workflow_intent(parsed, command)
+            }
+        }
+    }
+
+    fn execute_tarot_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        command: &crate::features::tarot::TarotCommand,
+    ) -> Result<()> {
+        let actor = self.canonical_actor_name(&parsed.username);
+        let messages = self.business.tarot_application.execute(
+            &actor,
+            command,
+            Instant::now(),
+            &self.business.ai,
+        )?;
+        self.log_executed_command(parsed, "tarot")?;
+        let messages: Vec<_> = messages.iter().map(String::as_str).collect();
+        self.reply_batch(&messages, 0)
+    }
+
+    fn execute_playlist_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        command: &crate::features::playlist::PlaylistCommand,
+    ) -> Result<()> {
+        if !playlist_command_allows_friend(parsed.authority, parsed.role) {
+            log::info!(
+                "命令未执行：个人歌单仅对好友及以上开放（authority={:?} role={:?}）text={}",
+                parsed.authority,
+                parsed.role,
+                parsed.raw
+            );
+            return ApplicationRuntime::reply(self, "个人歌单功能仅对好友及以上开放.");
+        }
+        if matches!(command, crate::features::playlist::PlaylistCommand::Open) {
+            return self.execute_playlist_window(parsed);
+        }
+        let actor = self.canonical_actor_name(&parsed.username);
+        let now = Instant::now();
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or_default();
+        // 先克隆 Arc 应用，避免与播放端口同时借用 self。
+        let application = self.business.playlist_application.clone();
+        let mut port = PlaylistRuntimePlaybackPort { runtime: self };
+        let messages = application.execute(&actor, command, &mut port, now, now_epoch)?;
+        if matches!(
+            command,
+            crate::features::playlist::PlaylistCommand::Import { .. }
+        ) {
+            self.log_executed_command_fields(
+                &parsed.message_type,
+                command_username(parsed),
+                "@导入歌单<链接已隐藏>",
+                "playlist",
+            )?;
+        } else {
+            self.log_executed_command(parsed, "playlist")?;
+        }
+        let messages: Vec<_> = messages.iter().map(String::as_str).collect();
+        self.reply_batch(&messages, 0)
+    }
+
+    fn execute_hall_intent(&mut self, parsed: &RoutedCommand, command: &HallCommand) -> Result<()> {
+        let context = HallCommandContext {
+            message_type: parsed.message_type.clone(),
+            username: command_username(parsed).to_string(),
+            user_command: parsed.user_command.clone(),
+        };
+        let application = self.business.hall_application;
+        application.execute(&context, command, self)
+    }
+
+    fn execute_administration_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        command: &AdministrationCommand,
+    ) -> Result<()> {
+        let context = AdministrationCommandContext {
+            message_type: parsed.message_type.clone(),
+            username: command_username(parsed).to_string(),
+            user_command: parsed.user_command.clone(),
+        };
+        let application = self.business.administration_application;
+        application.execute(&context, command, self)
+    }
+
+    fn execute_idiom_chain_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        command: &idiom_chain::IdiomChainCommand,
+    ) -> Result<()> {
+        let observed_at = command_observed_at(parsed);
+        let player = self.canonical_actor_name(&parsed.username);
+        if command.requires_executor() {
+            let application = self.business.idiom_chain_application;
+            application.execute_explanation(&player, command, observed_at, self)
+        } else {
+            log::debug!("成语接龙命令已按正式队列顺序处理，回复进入延迟聊天队列");
+            let mut port = self.deferred_idiom_chain_port();
+            self.business.idiom_chain_application.execute_deferred(
+                &parsed.raw,
+                &player,
+                command,
+                observed_at,
+                &mut port,
+            )
+        }
+    }
+
+    fn execute_card_game_intent(
+        &self,
+        parsed: &RoutedCommand,
+        command: &LandlordCommand,
+    ) -> Result<()> {
+        let observed_at = command_observed_at(parsed);
+        let player = self.canonical_actor_name(&parsed.username);
+        match card_game_effect_lane(command) {
+            CardGameEffectLane::Formal => self.business.card_games.execute_command(
+                &player,
+                command,
+                observed_at,
+                CardGameEffectLane::Formal,
+                self,
+            ),
+            CardGameEffectLane::Deferred => {
+                let port = DeferredCardGamePort {
+                    task_engine: self.business.task_engine.clone(),
+                };
+                self.business.card_games.execute_command(
+                    &player,
+                    command,
+                    observed_at,
+                    CardGameEffectLane::Deferred,
+                    &port,
+                )
+            }
+        }
+    }
+
+    fn execute_turtle_soup_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        command: &turtle_soup::TurtleSoupCommand,
+    ) -> Result<()> {
+        log::debug!("海龟汤控制命令已按正式队列顺序处理，回复进入延迟聊天队列");
+        let mut port = self.turtle_soup_command_port();
+        let player = self.canonical_actor_name(&parsed.username);
+        self.business.turtle_soup_application.execute_command(
+            &parsed.raw,
+            &player,
+            parsed.authority == CommandAuthority::Friend,
+            command,
+            &mut port,
+        )
+    }
+
+    fn execute_undercover_intent(
+        &self,
+        parsed: &RoutedCommand,
+        command: &UndercoverCommand,
+    ) -> Result<()> {
+        self.execute_undercover_command(parsed, command)
+    }
+
+    fn execute_invite_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        invite: &crate::features::invite::InviteCommand,
+    ) -> Result<()> {
+        let request = InviteRequest::new(
+            invite.username.clone(),
+            invite.display_name.clone(),
+            invite.seq,
+            invite.password.clone(),
+        );
+        let execution = match self.business.business.begin_invite(request)? {
+            InviteStart::Duplicate { sequence } => {
+                log::info!("邀请参数 {} 已执行过，跳过", sequence);
+                return Ok(());
+            }
+            InviteStart::Ready(execution) => execution,
+        };
+        self.log_executed_command(parsed, &format!("invite {}", invite.username))?;
+        execution.run(self).map(|_| ())
+    }
+
+    fn execute_moderation_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        command: &crate::features::moderation::ModerationCommand,
+    ) -> Result<()> {
+        self.log_executed_command(
+            parsed,
+            &format!("{} uid {}", command.action.label(), command.uid),
+        )?;
+        self.execute_moderation_with_vote(parsed, command)
+            .map(|_| ())
+    }
+
+    fn execute_custom_workflow_intent(
+        &mut self,
+        parsed: &RoutedCommand,
+        command: &crate::features::custom_workflow::CustomWorkflowCommand,
+    ) -> Result<()> {
+        self.log_executed_command(parsed, &format!("custom workflow {}", command.workflow))?;
+        self.execute_custom_workflow(command, parsed)
+    }
+
+    pub(super) fn configure_idle_exit(&self, minutes: u32) -> Result<()> {
+        configure_idle_exit(&self.business.business, minutes)
+    }
+
+    pub(super) fn commands_enabled(&self) -> Result<bool> {
+        Ok(self
+            .business
+            .business
+            .operational_snapshot(Instant::now())?
+            .commands_enabled())
+    }
+
+    pub(super) fn check_public_hall(&self) -> Result<bool> {
+        let mut port = PublicHallDetectionPort {
+            hall_ui: self.ui.hall_ui.clone(),
+            business: self.business.business.clone(),
+        };
+        self.business.hall_application.check_public_hall(&mut port)
+    }
+
+    fn execute_undercover_command(
+        &self,
+        parsed: &RoutedCommand,
+        command: &UndercoverCommand,
+    ) -> Result<()> {
+        let source = match parsed.authority {
+            CommandAuthority::Friend => UndercoverCommandSource::Friend,
+            CommandAuthority::HallMember => UndercoverCommandSource::Hall,
+        };
+        let player = self.canonical_actor_name(&parsed.username);
+        self.business.undercover_game.execute_command(
+            &player,
+            source,
+            command,
+            command_observed_at(parsed),
+            self,
+        )
+    }
+
+    pub(super) fn execute_turtle_soup_question(
+        &self,
+        question: turtle_soup::TurtleSoupQuestion,
+        observed_at: Instant,
+    ) -> Result<bool> {
+        let mut port = self.turtle_soup_command_port();
+        self.business
+            .turtle_soup_application
+            .submit_question(question, observed_at, &mut port)
+    }
+}
+
+fn card_game_effect_lane(command: &LandlordCommand) -> CardGameEffectLane {
+    if command.requires_executor() {
+        CardGameEffectLane::Formal
+    } else {
+        CardGameEffectLane::Deferred
+    }
+}
+
+fn configure_idle_exit(business: &BusinessRuntimeHandle, minutes: u32) -> Result<()> {
+    business.configure_idle_exit(Duration::from_secs(u64::from(minutes) * 60), Instant::now())?;
+    log::info!(
+        "已设置闲置退出: {}分钟无新命令后暂停播放器、关闭目标游戏进程，软件主进程和播放器运行时继续运行",
+        minutes
+    );
+    Ok(())
+}
+
+impl IdiomChainExplanationPort for ApplicationRuntime {
+    fn explain(
+        &mut self,
+        player: &str,
+        command: &idiom_chain::IdiomChainCommand,
+        observed_at: Instant,
+    ) -> Result<IdiomChainOutcome> {
+        self.business
+            .business
+            .explain_idiom_chain_at(player, command, observed_at)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn send_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()> {
+        let message_refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+        self.reply_batch(&message_refs, delay_ms)
+    }
+}
+
+impl AdministrationImmediatePort for ApplicationRuntime {
+    fn set_commands_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.business
+            .business
+            .set_commands_enabled(enabled)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn enqueue_hall_reply(&mut self, message: &str) -> Result<()> {
+        enqueue_current_hall_reply(&self.business.task_engine, message)
+    }
+
+    fn configure_idle_exit(&mut self, minutes: u32) -> Result<()> {
+        ApplicationRuntime::configure_idle_exit(self, minutes)
+    }
+
+    fn record_command_activity(&mut self) -> Result<()> {
+        ApplicationRuntime::record_command_activity(self, Instant::now())
+    }
+
+    fn log_executed(
+        &mut self,
+        context: &AdministrationCommandContext,
+        final_command: &str,
+    ) -> Result<()> {
+        self.log_executed_command_fields(
+            &context.message_type,
+            &context.username,
+            &context.user_command,
+            final_command,
+        )
+    }
+}
+
+impl AdministrationApplicationPort for ApplicationRuntime {
+    fn send_hall(&mut self, message: &str) -> Result<()> {
+        ApplicationRuntime::reply(self, message)
+    }
+
+    fn send_hall_batch(&mut self, messages: &[&str], delay_ms: u64) -> Result<()> {
+        self.reply_batch(messages, delay_ms)
+    }
+}
+
+impl HallDetectionPort for ApplicationRuntime {
+    fn detect_public_hall(&mut self) -> Result<Option<HallObservation>> {
+        detect_public_hall(&self.ui.hall_ui)
+    }
+
+    fn update_hall_remaining_minutes(&mut self, minutes: u32) -> Result<()> {
+        self.business
+            .business
+            .update_hall_remaining_minutes(minutes)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn clear_hall_remaining_minutes(&mut self) -> Result<()> {
+        self.business
+            .business
+            .clear_hall_remaining_minutes()
+            .map_err(anyhow::Error::from)
+    }
+}
+
+impl HallApplicationPort for ApplicationRuntime {
+    fn reply(&mut self, message: &str) -> Result<()> {
+        ApplicationRuntime::reply(self, message)
+    }
+
+    fn log_executed(&mut self, context: &HallCommandContext, final_command: &str) -> Result<()> {
+        self.log_executed_command_fields(
+            &context.message_type,
+            &context.username,
+            &context.user_command,
+            final_command,
+        )
+    }
+
+    fn read_hall_info(&mut self) -> Result<HallObservation> {
+        let outcome = self
+            .ui
+            .hall_ui
+            .submit_read(ReadHallInfo)
+            .context("提交大厅信息读取 UI 事务")?
+            .wait()
+            .context("等待大厅信息读取 UI 事务")?;
+        let info = match outcome.effect() {
+            ReadHallInfoEffect::Read(info) => info.clone(),
+            ReadHallInfoEffect::Failed(failure) => {
+                return Err(anyhow!("大厅信息读取失败：{failure}"));
+            }
+        };
+        if let UiResidencyOutcome::Failed(failure) = outcome.residency() {
+            return Err(anyhow!("大厅信息已读取，但一级驻留恢复失败：{failure}"));
+        }
+        Ok(HallObservation {
+            name: info.name,
+            remaining_minutes: info.remaining_minutes,
+        })
+    }
+
+    fn toggle_microphone(&mut self) -> Result<()> {
+        let outcome = self
+            .ui
+            .hall_ui
+            .submit_microphone(ToggleMicrophone)
+            .context("提交麦克风切换 UI 事务")?
+            .wait()
+            .context("等待麦克风切换 UI 事务")?;
+        if let ToggleMicrophoneEffect::Failed(failure) = outcome.effect() {
+            return Err(anyhow!("麦克风切换失败：{failure}"));
+        }
+        if let UiResidencyOutcome::Failed(failure) = outcome.residency() {
+            return Err(anyhow!("麦克风已切换，但一级驻留恢复失败：{failure}"));
+        }
+        Ok(())
+    }
+
+    fn hall_remaining_minutes(&mut self) -> Result<Option<u32>> {
+        Ok(self
+            .business
+            .business
+            .hall_state_snapshot()?
+            .remaining_minutes_now())
+    }
+}
+
+fn detect_public_hall(hall_ui: &HallUi) -> Result<Option<HallObservation>> {
+    let outcome = hall_ui
+        .submit_detect(DetectPublicHall)
+        .context("提交公共大厅检测 UI 事务")?
+        .wait()
+        .context("等待公共大厅检测 UI 事务")?;
+    let info = match outcome.effect() {
+        DetectPublicHallEffect::Detected { is_public, info } => {
+            log::debug!("公共大厅 UI 判断: {}", is_public);
+            info.clone()
+        }
+        DetectPublicHallEffect::Failed(failure) => {
+            log::error!("大厅检测 OCR 失败，按非公共大厅处理: {failure}");
+            return Ok(None);
+        }
+    };
+    if let UiResidencyOutcome::Failed(failure) = outcome.residency() {
+        return Err(anyhow!("大厅检测已完成，但一级驻留恢复失败：{failure}"));
+    }
+    Ok(Some(HallObservation {
+        name: info.name,
+        remaining_minutes: info.remaining_minutes,
+    }))
+}
+
+impl HallMaintenancePort for ApplicationRuntime {
+    fn executor_is_idle(&mut self) -> Result<bool> {
+        ApplicationRuntime::executor_is_idle(self)
+    }
+
+    fn hall_expiring_warning_sent(&mut self) -> Result<bool> {
+        Ok(self
+            .business
+            .business
+            .hall_state_snapshot()?
+            .expiring_warning_sent)
+    }
+
+    fn hall_remaining_minutes(&mut self) -> Result<Option<u32>> {
+        Ok(self
+            .business
+            .business
+            .hall_state_snapshot()?
+            .remaining_minutes_now())
+    }
+
+    fn reply(&mut self, message: &str) -> Result<()> {
+        ApplicationRuntime::reply(self, message)
+    }
+
+    fn mark_hall_expiring_warning_sent(&mut self) -> Result<()> {
+        self.business
+            .business
+            .patch_hall_state(HallStatePatch {
+                expiring_warning_sent: Some(true),
+                ..HallStatePatch::default()
+            })
+            .map_err(anyhow::Error::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::command::CommandAuthority;
+
+    #[test]
+    fn playlist_commands_require_friend_or_above() {
+        assert!(!playlist_command_allows_friend(
+            CommandAuthority::HallMember,
+            None
+        ));
+        assert!(playlist_command_allows_friend(
+            CommandAuthority::Friend,
+            None
+        ));
+        for role in [
+            IdentityRole::Friend,
+            IdentityRole::Admin,
+            IdentityRole::Owner,
+        ] {
+            assert!(playlist_command_allows_friend(
+                CommandAuthority::HallMember,
+                Some(role)
+            ));
+        }
+    }
+
+    #[test]
+    fn song_request_bilibili_permission_follows_hall_identity_mapping() {
+        let command = SongCommand {
+            keyword: "降生 纯享版".to_string(),
+            source: crate::features::song_request::SongSource::QqMusic,
+            prefix: "点歌".to_string(),
+            prefer_accompaniment: false,
+            ai_assisted: false,
+            friend_username: String::new(),
+        };
+        let mut routed = RoutedCommand::console(
+            "点歌",
+            "点歌 降生 纯享版",
+            ModuleCommand::SongRequest(command.clone()),
+        );
+        // 大厅里未映射的成员：没有 B站 权限。
+        routed.message_type = "blue".to_string();
+        routed.authority = CommandAuthority::HallMember;
+        routed.role = None;
+        assert!(!song_request_allows_bilibili(&routed, &command));
+
+        // 大厅里靠映射获得好友、管理员或主人权限的成员：算好友及以上。
+        for role in [
+            IdentityRole::Friend,
+            IdentityRole::Admin,
+            IdentityRole::Owner,
+        ] {
+            routed.role = Some(role);
+            assert!(
+                song_request_allows_bilibili(&routed, &command),
+                "mapped role"
+            );
+        }
+
+        // 未映射的好友私聊：命令带 friend_username，同样保留 B站。
+        routed.role = None;
+        routed.authority = CommandAuthority::Friend;
+        assert!(song_request_allows_bilibili(&routed, &command));
+
+        // 控制面板发起的点歌：按好友及以上处理。
+        routed.authority = CommandAuthority::HallMember;
+        routed.message_type = "控制台".to_string();
+        assert!(song_request_allows_bilibili(&routed, &command));
+    }
+
+    #[test]
+    fn card_game_lane_matches_the_effects_required_by_each_command() {
+        for command in [
+            LandlordCommand::Start,
+            LandlordCommand::RunFastStart,
+            LandlordCommand::Join,
+            LandlordCommand::Rob,
+            LandlordCommand::Decline,
+            LandlordCommand::Hand,
+            LandlordCommand::Retry,
+        ] {
+            assert_eq!(
+                card_game_effect_lane(&command),
+                CardGameEffectLane::Formal,
+                "command={command:?}"
+            );
+        }
+
+        for command in [
+            LandlordCommand::Status,
+            LandlordCommand::Play("3".to_string()),
+            LandlordCommand::Pass,
+            LandlordCommand::Exit,
+        ] {
+            assert_eq!(
+                card_game_effect_lane(&command),
+                CardGameEffectLane::Deferred,
+                "command={command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_command_uses_its_frame_capture_time() {
+        let captured_at = Instant::now() - Duration::from_secs(30);
+        let parsed = RoutedCommand {
+            matched: "#".to_string(),
+            raw: "状态".to_string(),
+            user_command: "#状态".to_string(),
+            message_type: "blue".to_string(),
+            username: "测试玩家".to_string(),
+            authority: CommandAuthority::HallMember,
+            role: None,
+            permission_required: None,
+            command: ModuleCommand::CardGame(LandlordCommand::Status),
+            observation: CommandObservation {
+                captured_at: Some(captured_at),
+                ..CommandObservation::default()
+            },
+        };
+
+        assert_eq!(command_observed_at(&parsed), captured_at);
+    }
+}

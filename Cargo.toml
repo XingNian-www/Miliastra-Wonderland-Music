@@ -1,0 +1,126 @@
+[workspace]
+members = [
+  ".",
+  "crates/miliastra-login-helper",
+  "crates/miliastra-login-protocol",
+  "crates/miliastra-playback",
+  "crates/miliastra-contracts",
+  "crates/miliastra-kernel",
+]
+resolver = "3"
+
+[package]
+name = "miliastra-wonderland-music"
+version = "6.1.9"
+edition = "2024"
+license = "MIT"
+
+[features]
+# 构建包含两种可运行时选择的 OCR 适配器的单个 EXE；仅在选择对应后端时加载 DLL。
+default = ["ocr-mnn", "ocr-openvino"]
+# PaddleOCR/MNN 后端；仅使用 OpenVINO 时可以禁用。
+ocr-mnn = ["dep:ocr-rs"]
+# OpenVINO OCR 适配器；仅当 `backend_priority` 选择 `openvino` 时动态加载运行时。
+ocr-openvino = ["dep:imageproc", "dep:openvino", "dep:openvino-sys"]
+
+[workspace.dependencies]
+anyhow = "1"
+async-openai = { version = "0.41.1", default-features = false }
+miliastra-contracts = { path = "crates/miliastra-contracts" }
+miliastra-kernel = { path = "crates/miliastra-kernel" }
+miliastra-login-protocol = { path = "crates/miliastra-login-protocol" }
+miliastra-playback = { path = "crates/miliastra-playback" }
+reqwest = { version = "0.13", default-features = false }
+serde = "1"
+serde_json = "1"
+thiserror = "2"
+tokio = "1"
+url = "2.5"
+uuid = "1"
+
+[dependencies]
+anyhow = { workspace = true }
+miliastra-contracts = { workspace = true }
+miliastra-kernel = { workspace = true }
+async-openai = { workspace = true, features = ["byot", "chat-completion", "middleware", "responses", "rustls"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+enigo = "0.6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+imageproc = { version = "0.25", optional = true }
+log = { version = "0.4", features = ["std"] }
+miliastra-login-protocol = { workspace = true }
+miliastra-playback = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json", "query", "rustls"] }
+pinyin = { version = "0.11", default-features = false, features = ["plain"] }
+rand = "0.8"
+rand_chacha = "=0.3.1"
+sha2 = "=0.10.9"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+ocr-rs = { git = "https://github.com/zibo-chen/rust-paddle-ocr.git", tag = "v2.3.1", optional = true, features = ["mnn-dynamic"] }
+openvino = { version = "0.11.0", optional = true, default-features = false, features = ["runtime-linking"] }
+# 底层运行时加载器：优先使用随包提供的 OpenVINO DLL，再搜索环境路径。
+openvino-sys = { version = "0.11.0", optional = true, default-features = false, features = ["runtime-linking"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# serde_yaml 已废弃，改用其维护中的兼容分支 serde_norway（API 与 0.9 一致）。
+serde_norway = "0.9"
+thiserror = { workspace = true }
+# 模板匹配主路径：自带的 wgpu 实现（设备/管线进程内复用），失败时由 CPU 兜底。
+wgpu = "0.16"
+pollster = "0.3"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"] }
+# SSE 事件推送：把 tokio broadcast 接成 axum 能消费的 Stream。
+tokio-stream = { version = "0.1", features = ["sync"] }
+url = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
+
+[dev-dependencies]
+# 仅用于对拍测试与 GPU 微基准；生产路径已改为自带实现。
+template-matching = { version = "0.2", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  "Win32_Security_Authentication_Identity",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+  "Win32_Storage_FileSystem",
+  "Win32_Storage_Xps",
+  "Win32_System_DataExchange",
+  "Win32_System_Console",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_System_JobObjects",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+windows-capture = "2.0.1"
+
+[profile.dev]
+# 功能验证用：只要能跑通，不追求运行速度。
+# 全量调试信息在 Windows 上要额外生成并写入 PDB，是编译/链接耗时的主要来源；
+# 保留行号（line-tables-only）仍能让断言失败时定位到源码行，代价小得多。
+debug = "line-tables-only"
+incremental = true
+
+[profile.test]
+# 与 dev 一致：跑用例用快档。
+debug = "line-tables-only"
+incremental = true
+
+[profile.release]
+# 优先运行性能，不以缩小二进制体积为目标。
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# 保持默认的 unwind：进程内有 8 处 catch_unwind 做任务级故障隔离，
+# abort 会让它们在发布版静默失效（任务 panic 直接带走整个进程）。
+strip = "symbols"

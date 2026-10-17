@@ -1,0 +1,1213 @@
+#[cfg(test)]
+use crate::features::administration::AdministrationCommand;
+#[cfg(test)]
+use crate::features::administration::ChatListenerModeCommand;
+#[cfg(test)]
+use crate::features::card_games::LandlordCommand;
+use crate::features::chat_text::command_identity;
+use crate::features::command::{CommandEnvelope, CommandObservation, ModuleCommand, RoutedCommand};
+#[cfg(test)]
+use crate::features::entertainment::EntertainmentKind;
+#[cfg(test)]
+use crate::features::hall::HallCommand;
+#[cfg(test)]
+use crate::features::idiom_chain::IdiomChainCommand;
+#[cfg(test)]
+use crate::features::idiom_chain::IdiomChainMode;
+#[cfg(test)]
+use crate::features::invite::InviteCommand;
+pub use crate::features::moderation::{ModerationAction, ModerationCommand};
+use crate::features::song_request::parse_structured_song_text;
+#[cfg(test)]
+use crate::features::song_request::{SongCommand, SongSource};
+#[cfg(test)]
+use crate::features::turtle_soup::TurtleSoupCommand;
+#[cfg(test)]
+use crate::features::undercover::UndercoverCommand;
+
+mod router;
+
+pub(crate) use router::ChatCommandRouter;
+
+#[derive(Clone, Debug)]
+pub struct PendingCommand {
+    pub lock_key: String,
+    pub routed: RoutedCommand,
+}
+
+/// 聊天消息转为排队命令后保留的观察上下文。
+///
+/// 这是仅供运行时使用的元数据，用于将执行与产生它的画面和消息关联，但不属于外部命令协议。
+/// 文本看起来像一条命令（显式 @/#/& 前缀，或结构化点歌元数据）。
+/// 仅用于“读到但没执行”的排查日志，不参与路由。
+pub(crate) fn looks_like_command(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    // & / ＆ 是测试专用前缀，永不执行，不纳入“读到命令却没执行”的排查日志。
+    if matches!(trimmed.chars().next(), Some('@' | '＠' | '#' | '＃')) {
+        return true;
+    }
+    // OCR 有时把发送者与命令粘连（如「昵称@点歌晴天」），前缀不在行首；
+    // 前缀后紧跟非空白字符才算（避免把「@ 某人」这种提及也计入）。
+    if let Some(index) = trimmed
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '@' | '＠' | '#' | '＃'))
+        .map(|(index, _)| index)
+    {
+        let after = trimmed[index..].chars().nth(1);
+        if after.is_some_and(|ch| !ch.is_whitespace()) {
+            return true;
+        }
+    }
+    parse_structured_song_text(text).is_some()
+}
+
+pub(crate) fn parse_command_envelope(
+    text: &str,
+    message_type: &str,
+    observation: CommandObservation,
+) -> Option<CommandEnvelope> {
+    if !matches!(message_type, "blue" | "pink") {
+        return None;
+    }
+    // 回显过滤已不需要：非 @/# 且非结构化点歌的文本本就会被下面的解析丢弃。
+    if text.trim_start().starts_with("歌曲名") {
+        // 反馈过滤只作用于隐式点歌请求，不能作用于 @/# 参数。
+        if is_feedback_text(text) {
+            return None;
+        }
+        return parse_structured_song_envelope(
+            text,
+            if message_type == "pink" {
+                "二级好友"
+            } else {
+                "一级大厅"
+            },
+            message_type,
+            observation,
+        );
+    }
+
+    let (username, body) = if message_type == "pink" || text.trim_start().starts_with(['[', '【'])
+    {
+        extract_bracket_sender(text)?
+    } else {
+        let separator_index = text.find(['：', ':', ']', '】'])?;
+        let separator_len = text[separator_index..].chars().next()?.len_utf8();
+        (
+            text[..separator_index].trim().to_string(),
+            &text[separator_index + separator_len..],
+        )
+    };
+    if username.is_empty() {
+        return None;
+    }
+    let raw_command_text = body.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
+    CommandEnvelope::new(
+        text,
+        username.clone(),
+        message_type,
+        raw_command_text,
+        observation.clone(),
+    )
+    .or_else(|| {
+        parse_structured_song_envelope(raw_command_text, &username, message_type, observation)
+            .filter(|_| !is_feedback_text(raw_command_text))
+    })
+}
+
+/// 为 OCR 识别到的元数据行创建标准点歌信封。
+///
+/// 将逻辑放在聊天边界后，主值守器和好友值守器都能提供结构化
+/// 文本会经过与显式 `@点歌` 相同的路由、锁状态和点歌应用处理。
+/// 命令。原始 OCR 文本仍附在信封上，用于观察关联。
+pub(crate) fn parse_structured_song_envelope(
+    text: &str,
+    username: &str,
+    message_type: &str,
+    observation: CommandObservation,
+) -> Option<CommandEnvelope> {
+    let input = parse_structured_song_text(text)?;
+    CommandEnvelope::new(
+        text,
+        username,
+        message_type,
+        format!("@点歌 {}", input.keyword()),
+        observation,
+    )
+}
+
+/// 由本地控制界面提交、而非从聊天读取的命令。
+///
+/// 控制界面应提供业务命令和展示文本；在命令边界统一创建聊天形状的
+/// 信封，避免 HTTP 等适配器各自伪造 `RoutedCommand`。
+#[derive(Clone, Debug)]
+pub(crate) struct ConsoleCommandIntent {
+    matched: String,
+    raw: String,
+    command: ModuleCommand,
+}
+
+impl ConsoleCommandIntent {
+    pub(crate) fn new(
+        raw: impl Into<String>,
+        matched: impl Into<String>,
+        command: ModuleCommand,
+    ) -> Self {
+        Self {
+            matched: matched.into(),
+            raw: raw.into(),
+            command,
+        }
+    }
+
+    pub(crate) fn into_pending(self) -> PendingCommand {
+        let routed = RoutedCommand::console(self.matched, self.raw, self.command);
+        PendingCommand {
+            lock_key: lock_key(&routed),
+            routed,
+        }
+    }
+}
+
+fn extract_bracket_sender(text: &str) -> Option<(String, &str)> {
+    let (start, open) = text
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '[' | '【'))?;
+    let close = if open == '[' { ']' } else { '】' };
+    let name_start = start + open.len_utf8();
+    let end = name_start + text[name_start..].find(close)?;
+    let username = text[name_start..end].trim();
+    if username.is_empty() {
+        None
+    } else {
+        // Split after the closing bracket so punctuation inside a nickname is preserved.
+        Some((username.to_string(), &text[end + close.len_utf8()..]))
+    }
+}
+
+pub fn lock_key(command: &RoutedCommand) -> String {
+    let key = command.command.lock_key();
+    if command.command.scopes_lock_to_actor() {
+        format!("{}:{}", key, command_identity(&command.username))
+    } else {
+        key
+    }
+}
+
+fn is_feedback_text(text: &str) -> bool {
+    FEEDBACK_TEXT_PATTERNS
+        .iter()
+        .any(|pattern| text.contains(pattern))
+}
+
+const FEEDBACK_TEXT_PATTERNS: &[&str] = &[
+    "可用命令",
+    "正在搜索",
+    "平台无",
+    "已暂停",
+    "已恢复",
+    "音量已设置",
+    "队列已加入",
+    "队列已满",
+    "状态未知",
+    "当前正在播放",
+    "队列已有",
+    "匹配失败",
+    "换源",
+    "AI自动匹配",
+    "AI点歌未启用",
+    "AI点歌识别失败",
+    "AI匹配中",
+    "搜索到:",
+    "默认通过",
+    "麦克风状态切换",
+    "麦克风状态设为",
+    "管理员已禁用",
+    "管理员已启用",
+    "大厅到期时间",
+    "大厅时间未知",
+    "公共大厅无时间限制",
+    "大厅即将到期",
+];
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::features::command::{CommandAuthority, CommandPrefix};
+    use crate::observation::chat::ObservedChatMessageId;
+
+    fn parse_text(text: &str, message_type: &str) -> Option<RoutedCommand> {
+        let envelope = parse_command_envelope(text, message_type, CommandObservation::default())?;
+        (envelope.prefix() == CommandPrefix::At).then_some(())?;
+        ChatCommandRouter::without_custom_workflow().route(&envelope, None)
+    }
+
+    fn parse_entertainment_shortcut(
+        text: &str,
+        message_type: &str,
+        active: Option<EntertainmentKind>,
+    ) -> Option<RoutedCommand> {
+        let envelope = parse_command_envelope(text, message_type, CommandObservation::default())?;
+        (envelope.prefix() == CommandPrefix::Hash).then_some(())?;
+        ChatCommandRouter::without_custom_workflow().route(&envelope, active)
+    }
+
+    #[test]
+    fn chat_ingress_produces_an_unparsed_command_envelope() {
+        let envelope = parse_command_envelope(
+            "用户：@点歌 晴天 周杰伦",
+            "blue",
+            CommandObservation::default(),
+        )
+        .expect("command envelope");
+
+        assert_eq!(envelope.username(), "用户");
+        assert_eq!(envelope.user_command(), "@点歌 晴天 周杰伦");
+        assert_eq!(envelope.command_text(), "点歌 晴天 周杰伦");
+        assert_eq!(envelope.prefix(), CommandPrefix::At);
+        assert_eq!(envelope.authority(), CommandAuthority::HallMember);
+    }
+
+    #[test]
+    fn bracket_sender_preserves_unicode_and_nickname_punctuation() {
+        for (text, message_type) in [
+            ("【阿：明】：@点歌 晴天 周杰伦", "pink"),
+            ("前置噪声【阿：明】：@点歌 晴天 周杰伦", "pink"),
+            ("【阿：明】：@点歌 晴天 周杰伦", "blue"),
+            ("[阿：明]：@点歌 晴天 周杰伦", "blue"),
+            ("[阿：明]：@点歌 晴天 周杰伦", "pink"),
+        ] {
+            let parsed = parse_text(text, message_type).expect("valid bracket sender");
+            assert_eq!(parsed.username, "阿：明");
+            assert_eq!(parsed.user_command, "@点歌 晴天 周杰伦");
+        }
+        for text in [
+            "【】：@暂停",
+            "【昵称：@暂停",
+            "[ ]：@暂停",
+            "【昵称]：@暂停",
+        ] {
+            assert!(parse_text(text, "pink").is_none(), "text={text}");
+        }
+    }
+
+    #[test]
+    fn fullwidth_at_prefix_routes_without_changing_song_parameters() {
+        for (text, message_type) in [
+            ("用户：＠点歌 晴天 周杰伦", "blue"),
+            ("【用户】：＠点歌 晴天 周杰伦", "pink"),
+        ] {
+            let parsed = parse_text(text, message_type).expect("fullwidth at command");
+            let ModuleCommand::SongRequest(song) = parsed.command else {
+                panic!("expected song request");
+            };
+            assert_eq!(song.keyword, "晴天 周杰伦");
+        }
+    }
+
+    #[test]
+    fn structured_song_ocr_routes_through_normal_song_request_module() {
+        let routed = parse_text(
+            "用户：歌曲名：醉，歌手名：三无Marblue，专辑名：三无Marblue（170509更新）",
+            "blue",
+        )
+        .expect("structured song OCR should route");
+
+        assert_eq!(routed.username, "用户");
+        assert_eq!(routed.user_command, "@点歌 醉 三无Marblue");
+        assert_eq!(
+            routed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "醉 三无Marblue".to_string(),
+                source: SongSource::QqMusic,
+                prefix: "点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn feedback_words_in_free_form_command_arguments_are_preserved() {
+        let envelope =
+            parse_command_envelope("[好友]：@通告 换源", "pink", CommandObservation::default())
+                .expect("free-form command should not be filtered by feedback words");
+
+        assert_eq!(envelope.command_text(), "通告 换源");
+        assert!(
+            parse_command_envelope(
+                "用户：搜索到:晴天,@确认@跳过@换源",
+                "blue",
+                CommandObservation::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn structured_song_ocr_without_sender_uses_hall_fallback_identity() {
+        let routed = parse_text("歌曲名:流月人间,歌手名:泠鸢yousa", "blue")
+            .expect("structured song OCR should route without sender prefix");
+
+        assert_eq!(routed.username, "一级大厅");
+        assert_eq!(routed.user_command, "@点歌 流月人间 泠鸢yousa");
+    }
+
+    #[test]
+    fn structured_secondary_friend_input_routes_without_fabricating_chat_text() {
+        let message_id = ObservedChatMessageId::new(
+            crate::observation::chat::VisualSessionId::new(9),
+            crate::observation::chat::ChatIdentity::Friend(std::sync::Arc::from("芦荟")),
+            crate::observation::chat::BubbleSequence::new(4),
+        );
+        let observation = CommandObservation {
+            frame_id: None,
+            captured_at: Some(Instant::now()),
+            message_id: Some(message_id.clone()),
+            message_text: Some("@邀请2".into()),
+            message_y: None,
+        };
+        let envelope =
+            CommandEnvelope::new("@邀请2", "芦荟", "pink", "@邀请2", observation.clone())
+                .expect("structured secondary envelope");
+
+        let routed = ChatCommandRouter::without_custom_workflow()
+            .route(&envelope, None)
+            .expect("route secondary friend command");
+
+        assert_eq!(routed.username, "芦荟");
+        assert_eq!(routed.message_type, "pink");
+        assert_eq!(routed.observation, observation);
+        assert_eq!(
+            routed.command,
+            ModuleCommand::Invite(InviteCommand {
+                username: "芦荟".to_string(),
+                display_name: "芦荟".to_string(),
+                seq: Some(2),
+                password: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_hash_idiom_chain_commands_by_active_game() {
+        let random_started = parse_entertainment_shortcut("用户：#接龙", "blue", None)
+            .expect("parse random idiom chain start");
+        assert_eq!(
+            random_started.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: String::new(),
+                mode: IdiomChainMode::Exact,
+            })
+        );
+
+        let random_homophone = parse_entertainment_shortcut("用户：#同音接龙", "blue", None)
+            .expect("parse random homophone idiom chain start");
+        assert_eq!(
+            random_homophone.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: String::new(),
+                mode: IdiomChainMode::Homophone,
+            })
+        );
+
+        let compact_started = parse_entertainment_shortcut("用户：#接龙画蛇添足", "blue", None)
+            .expect("parse compact idiom chain start");
+        assert_eq!(
+            compact_started.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: "画蛇添足".to_string(),
+                mode: IdiomChainMode::Exact,
+            })
+        );
+
+        let compact_homophone =
+            parse_entertainment_shortcut("用户：#同音接龙画蛇添足", "blue", None)
+                .expect("parse compact homophone idiom chain start");
+        assert_eq!(
+            compact_homophone.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: "画蛇添足".to_string(),
+                mode: IdiomChainMode::Homophone,
+            })
+        );
+
+        let started = parse_entertainment_shortcut("用户：#接龙 画蛇添足", "blue", None)
+            .expect("parse idiom chain start");
+        assert_eq!(
+            started.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: "画蛇添足".to_string(),
+                mode: IdiomChainMode::Exact,
+            })
+        );
+
+        let homophone = parse_entertainment_shortcut("用户：＃同音接龙 画蛇添足", "blue", None)
+            .expect("parse homophone idiom chain start");
+        assert_eq!(
+            homophone.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Start {
+                idiom: "画蛇添足".to_string(),
+                mode: IdiomChainMode::Homophone,
+            })
+        );
+
+        let submitted = parse_entertainment_shortcut(
+            "用户：#足智多谋",
+            "blue",
+            Some(EntertainmentKind::IdiomChain),
+        )
+        .expect("parse idiom chain submit");
+        assert_eq!(
+            submitted.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Submit("足智多谋".to_string()))
+        );
+
+        let explained = parse_entertainment_shortcut(
+            "用户：#解释 画蛇添足",
+            "blue",
+            Some(EntertainmentKind::IdiomChain),
+        )
+        .expect("parse idiom explanation command");
+        assert_eq!(
+            explained.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Explain(Some("画蛇添足".to_string())))
+        );
+        let hint = parse_entertainment_shortcut(
+            "用户：#提示",
+            "blue",
+            Some(EntertainmentKind::IdiomChain),
+        )
+        .expect("parse idiom hint command");
+        assert_eq!(
+            hint.command,
+            ModuleCommand::IdiomChain(IdiomChainCommand::Hint)
+        );
+    }
+
+    #[test]
+    fn explicit_hash_starts_are_available_without_an_active_game() {
+        for (text, expected) in [
+            (
+                "用户：#斗地主",
+                ModuleCommand::CardGame(LandlordCommand::Start),
+            ),
+            (
+                "用户：#跑得快",
+                ModuleCommand::CardGame(LandlordCommand::RunFastStart),
+            ),
+            (
+                "用户：#海龟汤",
+                ModuleCommand::TurtleSoup(TurtleSoupCommand::Start),
+            ),
+            (
+                "用户：#卧底",
+                ModuleCommand::Undercover(UndercoverCommand::CreateSingle),
+            ),
+            (
+                "用户：# 卧 底 双",
+                ModuleCommand::Undercover(UndercoverCommand::CreateDouble),
+            ),
+            (
+                "用户：#娱乐",
+                ModuleCommand::Administration(AdministrationCommand::EntertainmentHelp),
+            ),
+            (
+                "用户：＃帮助",
+                ModuleCommand::Administration(AdministrationCommand::EntertainmentHelp),
+            ),
+        ] {
+            assert_eq!(
+                parse_entertainment_shortcut(text, "blue", None)
+                    .unwrap_or_else(|| panic!("parse {text}"))
+                    .command,
+                expected,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_text("用户：@娱乐帮助", "blue").unwrap().command,
+            ModuleCommand::Administration(AdministrationCommand::EntertainmentHelp)
+        );
+        assert!(parse_text("用户：@娱乐", "blue").is_none());
+    }
+
+    #[test]
+    fn parses_hash_card_commands_by_active_game_and_message_source() {
+        for (text, expected) in [
+            ("用户：#加入", LandlordCommand::Join),
+            ("用户：#抢", LandlordCommand::Rob),
+            ("用户：#不抢", LandlordCommand::Decline),
+            ("用户：#出 3334", LandlordCommand::Play("3334".to_string())),
+            ("用户：#10 10", LandlordCommand::Play("10 10".to_string())),
+            ("用户：＃小王", LandlordCommand::Play("小王".to_string())),
+            ("用户：#过", LandlordCommand::Pass),
+            ("用户：#状态", LandlordCommand::Status),
+            ("用户：#重试", LandlordCommand::Retry),
+            ("用户：#结束", LandlordCommand::Exit),
+        ] {
+            let parsed =
+                parse_entertainment_shortcut(text, "blue", Some(EntertainmentKind::Landlord))
+                    .expect("parse landlord hall command");
+            assert_eq!(parsed.command, ModuleCommand::CardGame(expected), "{text}");
+        }
+
+        let hand =
+            parse_entertainment_shortcut("[用户]：#手牌", "pink", Some(EntertainmentKind::RunFast))
+                .expect("parse private hand command");
+        assert_eq!(hand.command, ModuleCommand::CardGame(LandlordCommand::Hand));
+        assert!(
+            parse_entertainment_shortcut("用户：#手牌", "blue", Some(EntertainmentKind::Landlord))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_hash_undercover_commands_by_active_game_and_message_source() {
+        let cases = [
+            ("用户：#开局", UndercoverCommand::Start),
+            ("用户：#状 态", UndercoverCommand::Status),
+            ("用户：#退出", UndercoverCommand::Exit),
+            ("用户：#结束", UndercoverCommand::End),
+            (
+                "用户：#一种常见事物",
+                UndercoverCommand::Describe("一种常见事物".to_string()),
+            ),
+        ];
+        for (text, expected) in cases {
+            let parsed =
+                parse_entertainment_shortcut(text, "blue", Some(EntertainmentKind::Undercover))
+                    .unwrap_or_else(|| panic!("parse {text}"));
+            assert_eq!(parsed.command, ModuleCommand::Undercover(expected));
+        }
+        assert!(
+            parse_entertainment_shortcut(
+                "用户：#加入",
+                "blue",
+                Some(EntertainmentKind::Undercover)
+            )
+            .is_none()
+        );
+
+        let join = parse_entertainment_shortcut(
+            "[用户]：#加入",
+            "pink",
+            Some(EntertainmentKind::Undercover),
+        )
+        .unwrap();
+        assert_eq!(
+            join.command,
+            ModuleCommand::Undercover(UndercoverCommand::Join)
+        );
+
+        let reveal = parse_entertainment_shortcut(
+            "[用户]：#谜底",
+            "pink",
+            Some(EntertainmentKind::Undercover),
+        )
+        .expect("parse private reveal command");
+        assert_eq!(
+            reveal.command,
+            ModuleCommand::Undercover(UndercoverCommand::Reveal)
+        );
+        assert_eq!(reveal.raw, "谜底");
+
+        let public_reveal = parse_entertainment_shortcut(
+            "用户：#谜底",
+            "blue",
+            Some(EntertainmentKind::Undercover),
+        )
+        .expect("public answer word remains a description payload");
+        assert_eq!(
+            public_reveal.command,
+            ModuleCommand::Undercover(UndercoverCommand::Describe("谜底".to_string()))
+        );
+
+        for text in ["[用户]：#c", "[用户]：＃投 C"] {
+            let vote =
+                parse_entertainment_shortcut(text, "pink", Some(EntertainmentKind::Undercover))
+                    .unwrap();
+            assert_eq!(
+                vote.command,
+                ModuleCommand::Undercover(UndercoverCommand::Vote('C'))
+            );
+            assert_eq!(vote.raw, "投票");
+        }
+    }
+
+    #[test]
+    fn landlord_command_locks_are_scoped_to_the_player() {
+        let left =
+            parse_entertainment_shortcut("甲：#加入", "blue", Some(EntertainmentKind::Landlord))
+                .unwrap();
+        let right =
+            parse_entertainment_shortcut("乙：#加入", "blue", Some(EntertainmentKind::Landlord))
+                .unwrap();
+
+        assert_ne!(lock_key(&left), lock_key(&right));
+    }
+
+    #[test]
+    fn turtle_soup_hash_controls_do_not_consume_questions() {
+        let status = parse_entertainment_shortcut(
+            "用户：#状态",
+            "blue",
+            Some(EntertainmentKind::TurtleSoup),
+        )
+        .expect("parse turtle soup status");
+        assert_eq!(
+            status.command,
+            ModuleCommand::TurtleSoup(TurtleSoupCommand::Status)
+        );
+        let stop = parse_entertainment_shortcut(
+            "用户：#结束",
+            "blue",
+            Some(EntertainmentKind::TurtleSoup),
+        )
+        .expect("parse turtle soup stop");
+        assert_eq!(
+            stop.command,
+            ModuleCommand::TurtleSoup(TurtleSoupCommand::End)
+        );
+        assert!(
+            parse_entertainment_shortcut(
+                "用户：#他认识死者吗？",
+                "blue",
+                Some(EntertainmentKind::TurtleSoup)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_entertainment_syntax_and_hash_in_the_middle() {
+        for text in [
+            "用户：@接龙 画蛇添足",
+            "用户：!画蛇添足",
+            "用户：！画蛇添足",
+            "用户：@斗地主",
+            "用户：@加入",
+            "用户：@出 345",
+            "用户：$345",
+            "用户：＄345",
+            "用户：@手牌",
+            "用户：@海龟汤",
+            "用户：@卧底开始",
+            "用户：@投A",
+        ] {
+            assert!(parse_text(text, "blue").is_none(), "{text}");
+            assert!(
+                parse_entertainment_shortcut(text, "blue", Some(EntertainmentKind::Landlord))
+                    .is_none(),
+                "{text}"
+            );
+        }
+        assert!(
+            parse_entertainment_shortcut(
+                "用户：普通聊天 #加入",
+                "blue",
+                Some(EntertainmentKind::Landlord)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_microphone() {
+        let parsed = parse_text("[Alice]：@麦克风", "pink").expect("parse microphone");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Hall(HallCommand::ToggleMicrophone {
+                username: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_microphone_with_param() {
+        assert!(parse_text("[Alice]：@麦克风关", "pink").is_none());
+        assert!(parse_text("[Alice]：@麦克风开", "pink").is_none());
+    }
+
+    #[test]
+    fn parses_disable_commands() {
+        let parsed = parse_text("[Alice]：@禁用", "pink").expect("parse disable");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Administration(AdministrationCommand::SetCommandsEnabled {
+                enabled: false,
+                username: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_enable_commands() {
+        let parsed = parse_text("[Alice]：@启用", "pink").expect("parse enable");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Administration(AdministrationCommand::SetCommandsEnabled {
+                enabled: true,
+                username: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_disable_with_param() {
+        assert!(parse_text("[Alice]：@禁用命令", "pink").is_none());
+    }
+
+    #[test]
+    fn parses_invite_command_without_password() {
+        let parsed = parse_text("[Alice]：@邀请2", "pink").expect("parse invite");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Invite(InviteCommand {
+                username: "Alice".to_string(),
+                display_name: "Alice".to_string(),
+                seq: Some(2),
+                password: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_invite_command_with_password_as_only_argument() {
+        let parsed = parse_text("[Alice]：@邀请654321", "pink").expect("parse invite password");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Invite(InviteCommand {
+                username: "Alice".to_string(),
+                display_name: "Alice".to_string(),
+                seq: None,
+                password: Some("654321".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invite_command_with_invalid_password() {
+        assert!(parse_text("[Alice]：@邀请2 12345", "pink").is_none());
+        assert!(parse_text("[Alice]：@邀请2 654321", "pink").is_none());
+        assert!(parse_text("[Alice]：@邀请2 1234567", "pink").is_none());
+        assert!(parse_text("[Alice]：@邀请2 abcdef", "pink").is_none());
+        assert!(parse_text("[Alice]：@邀请1000", "pink").is_none());
+    }
+
+    #[test]
+    fn parses_idle_exit_default() {
+        let parsed = parse_text("[Alice]：@闲置退出", "pink").expect("parse idle exit");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Administration(AdministrationCommand::IdleExit { minutes: 30 })
+        );
+    }
+
+    #[test]
+    fn parses_idle_exit_with_minimum() {
+        let parsed = parse_text("[Alice]：@闲置退出 5", "pink").expect("parse idle exit");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Administration(AdministrationCommand::IdleExit { minutes: 15 })
+        );
+    }
+
+    #[test]
+    fn parses_idle_exit_with_minutes_suffix() {
+        let parsed = parse_text("[Alice]：@闲置退出 20分钟", "pink").expect("parse idle exit");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Administration(AdministrationCommand::IdleExit { minutes: 20 })
+        );
+    }
+
+    #[test]
+    fn parses_pink_blacklist_uid_command() {
+        let parsed = parse_text("[Alice]：@拉黑UID123456789", "pink").expect("parse blacklist uid");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Moderation(ModerationCommand {
+                action: ModerationAction::Blacklist,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pink_blacklist_uid_command_case_insensitive() {
+        let parsed = parse_text("[Alice]：@拉黑uid123456789", "pink")
+            .expect("parse blacklist uid case insensitive");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Moderation(ModerationCommand {
+                action: ModerationAction::Blacklist,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pink_block_chat_uid_command() {
+        let parsed = parse_text("[Alice]：@屏蔽UID123456789", "pink").expect("parse block uid");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Moderation(ModerationCommand {
+                action: ModerationAction::BlockChat,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_uid_length() {
+        assert!(parse_text("[Alice]：@拉黑UID12345678", "pink").is_none());
+        assert!(parse_text("[Alice]：@屏蔽UID1234567890", "pink").is_none());
+        assert!(parse_text("[Alice]：@拉黑12345678", "pink").is_none());
+        assert!(parse_text("[Alice]：@屏蔽1234567890", "pink").is_none());
+    }
+
+    #[test]
+    fn parses_pink_blacklist_uid_alias() {
+        let parsed = parse_text("[Alice]：@拉黑123456789", "pink").expect("parse blacklist alias");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Moderation(ModerationCommand {
+                action: ModerationAction::Blacklist,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pink_block_chat_uid_alias() {
+        let parsed = parse_text("[Alice]：@屏蔽123456789", "pink").expect("parse block alias");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::Moderation(ModerationCommand {
+                action: ModerationAction::BlockChat,
+                uid: "123456789".to_string(),
+                requester: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_ai_song_command() {
+        let parsed = parse_text("用户：@AI点歌 晴天 周杰伦", "blue").expect("parse ai song");
+        assert_eq!(parsed.user_command, "@AI点歌 晴天 周杰伦");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::QqMusic,
+                prefix: "AI点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: true,
+                friend_username: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_ai_song_command_case_insensitive() {
+        let parsed = parse_text("用户：@ai点歌 晴天 周杰伦", "blue")
+            .expect("parse ai song case insensitive");
+        assert_eq!(parsed.user_command, "@ai点歌 晴天 周杰伦");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::QqMusic,
+                prefix: "AI点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: true,
+                friend_username: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_yellow_hall_command() {
+        assert!(parse_text("用户：@帮助", "yellow").is_none());
+    }
+
+    #[test]
+    fn parses_default_song_command() {
+        let parsed = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse default song");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::QqMusic,
+                prefix: "点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn friend_default_song_command_routes_bvid_to_bilibili() {
+        let parsed =
+            parse_text("[Alice]：@点歌 BV1GJ4I1x7h7", "pink").expect("friend BV song command");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "BV1GJ4J1x7h7".to_string(),
+                source: SongSource::Bilibili,
+                prefix: "点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn friend_bvid_keeps_a_real_one_and_repairs_terminal_bracket_to_j() {
+        let unchanged =
+            parse_text("[Alice]：@点歌 BV1GJ411x7h7", "pink").expect("friend BV song command");
+        let repaired = parse_text("[Alice]：@点歌 BV1GJ411x7h]", "pink")
+            .expect("friend BV song command with OCR bracket");
+
+        let ModuleCommand::SongRequest(unchanged) = unchanged.command else {
+            panic!("expected song command");
+        };
+        let ModuleCommand::SongRequest(repaired) = repaired.command else {
+            panic!("expected song command");
+        };
+        assert_eq!(unchanged.source, SongSource::Bilibili);
+        assert_eq!(unchanged.keyword, "BV1GJ411x7h7");
+        assert_eq!(repaired.source, SongSource::Bilibili);
+        assert_eq!(repaired.keyword, "BV1GJ411x7hJ");
+    }
+
+    #[test]
+    fn bvid_shortcut_and_bare_bvid_are_not_commands() {
+        assert!(parse_text("[Alice]：@BV1GJ411x7h7", "pink").is_none());
+        assert!(parse_text("[Alice]：BV1GJ411x7h7", "pink").is_none());
+    }
+
+    #[test]
+    fn song_lock_treats_ai_and_plain_hall_song_as_same_request() {
+        let plain = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse plain song");
+        let ai = parse_text("用户：@AI点歌 晴天 周杰伦", "blue").expect("parse ai song");
+
+        assert_eq!(lock_key(&plain), lock_key(&ai));
+    }
+
+    #[test]
+    fn command_lock_treats_disable_and_enable_as_global_commands() {
+        let alice_disable = parse_text("[Alice]：@禁用", "pink").expect("parse disable");
+        let bob_disable = parse_text("[Bob]：@禁用", "pink").expect("parse disable");
+        let alice_enable = parse_text("[Alice]：@启用", "pink").expect("parse enable");
+        let bob_enable = parse_text("[Bob]：@启用", "pink").expect("parse enable");
+        assert_eq!(lock_key(&alice_disable), lock_key(&bob_disable));
+        assert_eq!(lock_key(&alice_enable), lock_key(&bob_enable));
+        assert_ne!(lock_key(&alice_disable), lock_key(&alice_enable));
+    }
+
+    #[test]
+    fn pending_command_keeps_observation_context_with_the_command() {
+        let parsed = parse_text("用户：@状态", "blue").expect("parse status");
+        let mut ledger = crate::observation::chat::ChatObservationLedger::new();
+        let frame = ledger.begin_frame(Instant::now());
+        let message_id = ObservedChatMessageId::new(
+            crate::observation::chat::VisualSessionId::new(7),
+            crate::observation::chat::ChatIdentity::PrimaryHall,
+            crate::observation::chat::BubbleSequence::new(3),
+        );
+        let observation = CommandObservation {
+            frame_id: Some(frame.id()),
+            captured_at: Some(frame.captured_at()),
+            message_id: Some(message_id),
+            message_text: None,
+            message_y: None,
+        };
+        let pending = PendingCommand {
+            lock_key: lock_key(&parsed),
+            routed: RoutedCommand {
+                observation: observation.clone(),
+                ..parsed
+            },
+        };
+
+        assert_eq!(pending.routed.observation.frame_id, observation.frame_id);
+        assert_eq!(
+            pending.routed.observation.captured_at,
+            observation.captured_at
+        );
+        assert_eq!(
+            pending.routed.observation.message_id,
+            observation.message_id
+        );
+    }
+
+    #[test]
+    fn song_lock_keeps_different_sources_separate() {
+        let qq = parse_text("用户：@点歌 晴天 周杰伦", "blue").expect("parse qq song");
+        let netease =
+            parse_text("用户：@网易点歌 晴天 周杰伦", "blue").expect("parse netease song");
+
+        assert_ne!(lock_key(&qq), lock_key(&netease));
+    }
+
+    #[test]
+    fn parses_netease_cloud_song_alias_in_hall_and_friend_chat() {
+        let hall = parse_text("用户：@网易云点歌 晴天 周杰伦", "blue")
+            .expect("parse hall netease cloud alias");
+        let friend = parse_text("[Alice]：@网易云点歌 晴天 周杰伦", "pink")
+            .expect("parse friend netease cloud alias");
+
+        for parsed in [hall, friend] {
+            assert_eq!(
+                parsed.command,
+                ModuleCommand::SongRequest(SongCommand {
+                    keyword: "晴天 周杰伦".to_string(),
+                    source: SongSource::Netease,
+                    prefix: "网易云点歌".to_string(),
+                    prefer_accompaniment: false,
+                    ai_assisted: false,
+                    friend_username: if parsed.message_type == "pink" {
+                        "Alice".to_string()
+                    } else {
+                        String::new()
+                    },
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_blue_bilibili_song_command() {
+        assert!(parse_text("用户：@B站点歌 晴天 周杰伦", "blue").is_none());
+    }
+
+    #[test]
+    fn parses_blue_kugou_song_command_as_hidden_hall_command() {
+        let parsed =
+            parse_text("用户：@酷狗点歌 晴天 周杰伦", "blue").expect("parse hall kugou song");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::Kugou,
+                prefix: "酷狗点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: String::new(),
+            })
+        );
+        assert_eq!(parsed.username, "用户");
+        assert_eq!(parsed.message_type, "blue");
+        assert_eq!(parsed.user_command, "@酷狗点歌 晴天 周杰伦");
+    }
+
+    #[test]
+    fn parses_pink_kugou_song_command() {
+        let parsed =
+            parse_text("[Alice]：@酷狗点歌 晴天 周杰伦", "pink").expect("parse friend kugou song");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::Kugou,
+                prefix: "酷狗点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: "Alice".to_string(),
+            })
+        );
+        assert_eq!(parsed.message_type, "pink");
+    }
+
+    #[test]
+    fn parses_pink_bilibili_song_command() {
+        let parsed = parse_text("[Alice]：@B站点歌 晴天 周杰伦", "pink")
+            .expect("parse friend bilibili song");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::Bilibili,
+                prefix: "B站点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: "Alice".to_string(),
+            })
+        );
+        assert_eq!(parsed.username, "Alice");
+        assert_eq!(parsed.message_type, "pink");
+        assert_eq!(parsed.user_command, "@B站点歌 晴天 周杰伦");
+    }
+
+    #[test]
+    fn parses_pink_bilibili_song_command_case_insensitive() {
+        let parsed = parse_text("[Alice]：@b站点歌 晴天 周杰伦", "pink")
+            .expect("parse friend bilibili song case insensitive");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::Bilibili,
+                prefix: "B站点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: "Alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pink_chat_listener_mode_commands_only() {
+        let primary = parse_text("[Alice]：@值守模式 一级", "pink").expect("primary mode");
+        let secondary = parse_text("[Alice]：@值守模式：二级", "pink").expect("secondary mode");
+        let status = parse_text("[Alice]：@值守模式 状态", "pink").expect("mode status");
+
+        assert_eq!(
+            primary.command,
+            ModuleCommand::Administration(AdministrationCommand::ChatListenerMode(
+                ChatListenerModeCommand::Primary,
+            ))
+        );
+        assert_eq!(
+            secondary.command,
+            ModuleCommand::Administration(AdministrationCommand::ChatListenerMode(
+                ChatListenerModeCommand::Secondary,
+            ))
+        );
+        assert_eq!(
+            status.command,
+            ModuleCommand::Administration(AdministrationCommand::ChatListenerMode(
+                ChatListenerModeCommand::Status,
+            ))
+        );
+        assert!(parse_text("大厅：@值守模式 二级", "blue").is_none());
+    }
+
+    #[test]
+    fn parses_pink_ai_song_command_as_all_sources() {
+        let parsed =
+            parse_text("[Alice]：@AI点歌 晴天 周杰伦", "pink").expect("parse friend ai song");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "晴天 周杰伦".to_string(),
+                source: SongSource::All,
+                prefix: "AI点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: true,
+                friend_username: "Alice".to_string(),
+            })
+        );
+    }
+}

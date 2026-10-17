@@ -1,0 +1,166 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::{self, JoinHandle};
+
+use anyhow::Result;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VIRTUAL_KEY,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+    TranslateMessage, WM_HOTKEY, WM_QUIT,
+};
+
+use crate::config::{HotkeyConfig, parse_hotkey_virtual_code};
+
+const PAUSE_ID: i32 = 1;
+const EXIT_ID: i32 = 2;
+
+pub(crate) struct HotkeyRuntime {
+    thread_id: u32,
+    running: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl HotkeyRuntime {
+    pub(crate) fn shutdown(mut self) -> Result<()> {
+        self.running.store(false, Ordering::SeqCst);
+        if self.worker.is_some() {
+            unsafe {
+                if let Err(error) =
+                    PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
+                {
+                    log::warn!("发送热键线程退出消息失败: {error}");
+                }
+            }
+        }
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("热键线程 panic"))?;
+        }
+        Ok(())
+    }
+}
+
+pub fn start(
+    config: &HotkeyConfig,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    request_exit: Arc<dyn Fn() + Send + Sync>,
+    wake_tasks: Arc<dyn Fn() + Send + Sync>,
+) -> Result<HotkeyRuntime> {
+    if !config.enabled {
+        return Ok(HotkeyRuntime {
+            thread_id: 0,
+            running,
+            worker: None,
+        });
+    }
+    let pause_key = parse_virtual_key(&config.pause_key)?;
+    let exit_key = parse_virtual_key(&config.exit_key)?;
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    let worker_running = Arc::clone(&running);
+    let worker = thread::spawn(move || {
+        hotkey_loop(
+            pause_key,
+            exit_key,
+            worker_running,
+            paused,
+            request_exit,
+            wake_tasks,
+            ready_sender,
+        )
+    });
+    // 注册结果回传:热键被占用时启动方必须感知,而不是静默当作已启用。
+    let thread_id = match ready_receiver
+        .recv()
+        .map_err(|_| anyhow::anyhow!("热键线程未能初始化消息队列"))?
+    {
+        Ok(thread_id) => thread_id,
+        Err(error) => return Err(anyhow::anyhow!("热键注册失败: {error}")),
+    };
+    log::info!(
+        "全局热键已启用: 暂停={} 退出={}",
+        config.pause_key,
+        config.exit_key
+    );
+    Ok(HotkeyRuntime {
+        thread_id,
+        running,
+        worker: Some(worker),
+    })
+}
+
+fn hotkey_loop(
+    pause_key: VIRTUAL_KEY,
+    exit_key: VIRTUAL_KEY,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    request_exit: Arc<dyn Fn() + Send + Sync>,
+    wake_tasks: Arc<dyn Fn() + Send + Sync>,
+    ready: SyncSender<std::result::Result<u32, String>>,
+) {
+    unsafe {
+        let thread_id = GetCurrentThreadId();
+        let mut queue_probe = MSG::default();
+        let _ = PeekMessageW(&mut queue_probe, None, 0, 0, PM_NOREMOVE);
+        let registration = (|| -> std::result::Result<(), String> {
+            RegisterHotKey(None, PAUSE_ID, MOD_NOREPEAT, pause_key.0 as u32)
+                .map_err(|error| format!("注册暂停热键失败: {error:#}"))?;
+            RegisterHotKey(None, EXIT_ID, MOD_NOREPEAT, exit_key.0 as u32).map_err(|error| {
+                let _ = UnregisterHotKey(None, PAUSE_ID);
+                format!("注册退出热键失败: {error:#}")
+            })?;
+            Ok(())
+        })();
+        match registration {
+            Ok(()) => {
+                let _ = ready.send(Ok(thread_id));
+            }
+            Err(error) => {
+                log::error!("{error}");
+                let _ = ready.send(Err(error));
+                return;
+            }
+        }
+
+        let mut message = MSG::default();
+        // WM_QUIT 是生命周期停止边界。不能因 running 为假而提前返回：重载修改标志时 EXIT 热键可能已经入队，仍须在停机发布 WM_QUIT 前覆盖重载。
+        while GetMessageW(&mut message, Some(HWND(std::ptr::null_mut())), 0, 0).as_bool() {
+            if message.message == WM_HOTKEY {
+                match message.wParam.0 as i32 {
+                    PAUSE_ID => {
+                        if crate::debug_mode::enabled() {
+                            log::info!("调试模式中忽略暂停/恢复热键");
+                            continue;
+                        }
+                        let now_paused = !paused.load(Ordering::SeqCst);
+                        paused.store(now_paused, Ordering::SeqCst);
+                        wake_tasks();
+                        log::info!("脚本{}", if now_paused { "已暂停" } else { "已恢复" });
+                    }
+                    EXIT_ID => {
+                        log::info!("收到退出热键");
+                        request_exit();
+                        running.store(false, Ordering::SeqCst);
+                        wake_tasks();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        let _ = UnregisterHotKey(None, PAUSE_ID);
+        let _ = UnregisterHotKey(None, EXIT_ID);
+    }
+}
+
+fn parse_virtual_key(value: &str) -> Result<VIRTUAL_KEY> {
+    Ok(VIRTUAL_KEY(parse_hotkey_virtual_code(value)?))
+}

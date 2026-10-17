@@ -1,0 +1,12 @@
+database_path: deps/data/playback.sqlite3
+http:
+  host: 127.0.0.1
+  port: 18888
+  enabled: true
+  # 首次启动时自动生成并持久化。
+  access_token: ""
+logging:
+  dir: deps/logs
+  level: info
+  rotate_daily: true
+  retain_days: 7

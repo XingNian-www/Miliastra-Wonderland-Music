@@ -1,0 +1,37 @@
+mod cache;
+mod catalog;
+mod core;
+mod credentials;
+mod domain;
+mod engine;
+mod library_search;
+mod login;
+mod lyrics;
+mod model;
+mod runtime;
+
+pub use cache::{
+    AudioCache, AudioCacheConfig, AudioCacheStats, AudioCacheTrackStatus, CacheTrackSortKey,
+    CachedTrackInfo, CachedTrackPage, DEFAULT_MAX_REGISTRY_ENTRIES,
+};
+pub use catalog::{
+    BilibiliAdapter, ImportedPlaylist, KugouAccountStatus, KugouAdapter, KugouListenReport,
+    PlaybackEligibility, ProviderAccountStatus, ProviderId, SourceAdapter, bilibili_is_bvid,
+    bilibili_normalize_bvid, kugou_calculate_mid, kugou_normalize_guid, kugou_register_device,
+};
+pub use credentials::{CredentialError, CredentialStatus, CredentialStore, ProviderCredential};
+pub use domain::{
+    EndBehavior, EndCause, EngineState, Failure, ResolverLocator, ResolverLocatorError, SongKey,
+    StreamSource,
+};
+pub use library_search::{MAX_LIBRARY_SEARCH_RESULTS, keyword_match_score, search_library_tracks};
+pub use lyrics::{
+    LyricsParseError, MAX_LYRICS_LEAD_SECONDS, TimedLyricLine, TimedLyrics, parse_lrc_pair,
+};
+pub use model::{
+    PlayableTrack, SearchCandidate, SearchQuery, TrackKey, TrackKeyError, TrackMetadata, TrackRef,
+};
+pub use runtime::{
+    LoginOperation, LoginOperationWaitError, LoginSession, LoginStatus, PlaybackError,
+    PlaybackHandle, PlaybackOperation, PlaybackRuntime, PlaybackSnapshot, PlaylistImportOperation,
+};

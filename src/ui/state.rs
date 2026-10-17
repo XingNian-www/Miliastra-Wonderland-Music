@@ -743,24 +743,27 @@ fn detect_ui_state_with_evidence(
     }
 
     // ── 2) 没有蓝/黄（无标记，或只有粉色）：底栏结构 → 大厅 ─────────────
-    // 底栏是**唯一**的大厅判据（蓝/黄标记之外），只看三个几何条件：
+    // 底栏是**唯一**的大厅判据（蓝/黄标记之外），按实际像素几何看三件事：
     //   ① 块数 7–14（一排键；拼图 17 块被上限挡掉）
-    //   ② 白键高度统一：所有块高度极差 ≤2 采样格
-    //   ③ 键高落在 8–20 采样格（小圆角键；主菜单整块白底是 30–32）
+    //   ② 每块高度落在 22–36 px（实测 26–28；菜单整块白底是 60–64）
+    //   ③ 所有块在**同一条水平线**上：顶部 y 极差 ≤4 px
     // 白色判据用严格的 225（不是纯 255：JPEG/缩放帧的白色只有 240–254）。
     let hall_region: Rect = screen.hall_bar_rect.into();
-    let (hall_tiles, hall_height_spread, hall_median_height) = hall_bar_signature(image, hall_region);
+    let (hall_tiles, hall_min_height_px, hall_max_height_px, hall_top_spread_px) =
+        hall_bar_signature(image, hall_region);
     let hall_structure = (HALL_BAR_MIN_TILES..=HALL_BAR_MAX_TILES).contains(&hall_tiles)
-        && hall_height_spread <= HALL_BAR_MAX_TILE_HEIGHT_SPREAD
-        && (HALL_BAR_MIN_TILE_HEIGHT..=HALL_BAR_MAX_TILE_HEIGHT).contains(&hall_median_height);
+        && hall_min_height_px >= HALL_BAR_MIN_TILE_HEIGHT_PX
+        && hall_max_height_px <= HALL_BAR_MAX_TILE_HEIGHT_PX
+        && hall_top_spread_px <= HALL_BAR_MAX_TILE_TOP_SPREAD_PX;
     if hall_structure {
         log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms marker={}ms state=primary rule=primary_hall_bar tiles={} h_spread={} h_median={}",
+            "UI 状态检测耗时: total={}ms marker={}ms state=primary rule=primary_hall_bar tiles={} h_min={} h_max={} top_spread={}",
             elapsed_ms(started),
             marker_ms,
             hall_tiles,
-            hall_height_spread,
-            hall_median_height
+            hall_min_height_px,
+            hall_max_height_px,
+            hall_top_spread_px
         );
         return Ok((
             UiState::primary_hall(),
@@ -892,16 +895,17 @@ const HALL_BAR_MAX_TILES: usize = 14;
 /// 225 能让 **224/225** 大厅帧命中，同时比旧的 200 严格得多（200 会把背景亮块也算进来）。
 const HALL_BAR_WHITE_MIN: u8 = 225;
 
-/// 单块白键的**高度**允许区间（2px 采样格，1 格 = 2 真实像素）。
+/// 单块白键的**真实像素高度**允许区间。
 ///
-/// 大厅的键是 ~26–30 真实像素高的小圆角键 ⇒ 实测 13–15 采样格；
-/// 主菜单/设置宫格是整块白底 ⇒ 30–32 采样格；面板更高。
-/// **高度统一**是「一排键」与「一整块白底/拼图」的关键区别。
-const HALL_BAR_MIN_TILE_HEIGHT: usize = 8;
-const HALL_BAR_MAX_TILE_HEIGHT: usize = 20;
+/// 大厅底栏键实测 **26–28 px**（1080p 语料；用户实机另有 25 / 32 px 两档），
+/// 取 **[22, 36]** 覆盖这两档、两侧留 2–4 px 余量。
+/// 主菜单 / 设置宫格是整块白底 ⇒ 60–64 px，直接排除。
+const HALL_BAR_MIN_TILE_HEIGHT_PX: usize = 22;
+const HALL_BAR_MAX_TILE_HEIGHT_PX: usize = 36;
 
-/// 同一帧里所有键的高度必须一致：极差 ≤2 采样格（=4 真实像素）。
-const HALL_BAR_MAX_TILE_HEIGHT_SPREAD: usize = 2;
+/// 所有键必须落在**同一条水平线**上：顶部 y 极差 ≤4 真实像素（"误差留一点点"）。
+/// 实测大厅帧里 7–8 个键的顶部完全一致（极差 0）；设置宫格则是 985 与 1045 两行（极差 60）。
+const HALL_BAR_MAX_TILE_TOP_SPREAD_PX: usize = 4;
 
 /// 计入「一块按键」的最小面积（单位：2px 采样格）。低于它的白点按噪点丢弃。
 const HALL_BAR_TILE_MIN_AREA: usize = 40;
@@ -1283,14 +1287,14 @@ fn loading_rule(image: &DynamicImage) -> Option<&'static str> {
 /// 底栏结构：`(白色按键块数, 单块中位面积)`。
 ///
 /// 千星大厅的底栏是一排**小圆角白键**（聊天 / Enter / 👥 / O / 麦克风 / Alt+N / 喇叭 / N）：
-/// 块数多（7–12）且每块是**高度一致的小圆角键**（高 13–15 采样格）；提瓦特只有一个 Enter（2–4 块）；
-/// 主菜单 / 设置宫格是整块白底（块高 30–32 采样格）。
-/// 返回 `(块数, 块高极差, 块高中位)`，三个量一起才分得干净。
+/// 块数多（7–12），每块是**同高、同一条水平线的小圆角键**（实测高 26–28 px、顶部 y 极差 0）；
+/// 提瓦特只有一个 Enter（2–4 块）；主菜单 / 设置宫格是整块白底（高 60–64 px，或分成两行）。
+/// 返回 `(块数, 最小高度 px, 最大高度 px, 顶部 y 极差 px)`。
 /// 用几何量而不是模板分数，是为了绕开 1:1 SAD 对缩放不鲁棒的问题（第 47 节教训）；
 /// 也不用「近白占比」——那是亮度量，亮背景大厅会把它顶高。
-fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (usize, usize, usize) {
+fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (usize, usize, usize, usize) {
     let Ok(region) = crop_canvas(image, rect) else {
-        return (0, 0, 0);
+        return (0, 0, 0, 0);
     };
     let rgb = region.to_rgb8();
     let (width, height) = rgb.dimensions();
@@ -1308,8 +1312,8 @@ fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (usize, usize, usize)
     let total = grid_w * grid_h;
     let mut seen = vec![false; total];
     let mut stack: Vec<usize> = Vec::new();
-    let mut areas: Vec<usize> = Vec::new();
-    let mut heights: Vec<usize> = Vec::new();
+    let mut heights_px: Vec<usize> = Vec::new();
+    let mut tops_px: Vec<usize> = Vec::new();
     for start in 0..total {
         if !grid[start] || seen[start] {
             continue;
@@ -1356,18 +1360,18 @@ fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (usize, usize, usize)
             }
         }
         if area >= HALL_BAR_TILE_MIN_AREA {
-            areas.push(area);
-            heights.push(y_max - y_min + 1);
+            // 采样格 → 真实像素：高度 ×2、顶部 y ×2（区域内的相对 y 即可，极差不受影响）。
+            heights_px.push((y_max - y_min + 1) * 2);
+            tops_px.push(y_min * 2);
         }
     }
-    if heights.is_empty() {
-        return (0, 0, 0);
+    if heights_px.is_empty() {
+        return (0, 0, 0, 0);
     }
-    heights.sort_unstable();
-    let spread = heights[heights.len() - 1] - heights[0];
-    // 取上中位：奇数块时就是正中间那块；偶数块时偏大的一侧，判据更保守。
-    let median = heights[heights.len() / 2];
-    (areas.len(), spread, median)
+    let min_height = *heights_px.iter().min().unwrap_or(&0);
+    let max_height = *heights_px.iter().max().unwrap_or(&0);
+    let top_spread = tops_px.iter().max().unwrap_or(&0) - tops_px.iter().min().unwrap_or(&0);
+    (heights_px.len(), min_height, max_height, top_spread)
 }
 
 /// 世界判据的结果。
@@ -3168,13 +3172,13 @@ mod tests {
         );
     }
 
-    /// 底栏结构判据：大厅 = 7–14 块**高度一致的小圆角白键**
-    /// （白 ≥225、块高 13–15 采样格、极差 ≤2）；主菜单 / 设置宫格是整块白底（块高 30–32），
-    /// 提瓦特只有一个 Enter，都不满足。
+    /// 底栏结构判据：大厅 = 7–14 块**同高、同一条水平线的小圆角白键**
+    /// （白 ≥225、块高 26–28 px、顶部 y 极差 0）；主菜单 / 设置宫格是整块白底（60–64 px）
+    /// 或跨两行，提瓦特只有一个 Enter，都不满足。
     ///
-    /// 2026-10-17 第三轮：白色判据收紧到 **225**——纯 255 只覆盖 **89/182** 大厅帧
-    /// （JPEG/回放/DPI 缩放帧的白色只有 240–254）；再补**高度统一**约束：主菜单的整块白卡
-    /// 会被拆成 7 块 30–32 高的白条，只靠块数/面积会误判，键高一票否决。
+    /// 2026-10-17 第三轮：白色判据收紧到 **225**（纯 255 只覆盖 89/182 大厅帧：
+    /// JPEG/回放/DPI 缩放帧的白色只有 240–254）；再按**实际像素高度 + 同一水平线**判形状：
+    /// 主菜单白卡高 60–64 px、设置宫格还跨两行（顶部 985/1045），都不满足。
     #[test]
     fn hall_bar_structure_separates_hall_from_menu_and_teyvat() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -3185,10 +3189,11 @@ mod tests {
             hall_bar_signature(&image, rect)
         };
         let is_hall = |name: &str| {
-            let (tiles, spread, median) = signature(name);
+            let (tiles, min_height, max_height, top_spread) = signature(name);
             (HALL_BAR_MIN_TILES..=HALL_BAR_MAX_TILES).contains(&tiles)
-                && spread <= HALL_BAR_MAX_TILE_HEIGHT_SPREAD
-                && (HALL_BAR_MIN_TILE_HEIGHT..=HALL_BAR_MAX_TILE_HEIGHT).contains(&median)
+                && min_height >= HALL_BAR_MIN_TILE_HEIGHT_PX
+                && max_height <= HALL_BAR_MAX_TILE_HEIGHT_PX
+                && top_spread <= HALL_BAR_MAX_TILE_TOP_SPREAD_PX
         };
         for name in [
             "hall-chat-open.jpg",
@@ -3196,17 +3201,22 @@ mod tests {
             "full-hall.jpg",
             "hall-chat-closed.jpg",
         ] {
-            assert!(is_hall(name), "{name} 是千星大厅，底栏应是多块同高小圆角白键");
+            assert!(is_hall(name), "{name} 是千星大厅，底栏应是多块同高、同一水平线的小白键");
         }
         for name in ["wonderland-menu.png", "qianxing-ui-59/r16-settings-grid.png"] {
-            assert!(!is_hall(name), "{name} 是整块白底，不得判成大厅");
+            assert!(!is_hall(name), "{name} 是整块白底/跨行，不得判成大厅");
         }
-        let (_, _, menu_median) = signature("wonderland-menu.png");
+        let (_, menu_min_height, _, _) = signature("wonderland-menu.png");
         assert!(
-            menu_median > HALL_BAR_MAX_TILE_HEIGHT,
-            "主菜单白卡的块高应超过键高上限（实测 30–32）"
+            menu_min_height > HALL_BAR_MAX_TILE_HEIGHT_PX,
+            "主菜单白卡的块高应超过键高上限（实测 60–64 px）"
         );
-        let (teyvat_tiles, _, _) =
+        let (_, _, _, settings_top_spread) = signature("qianxing-ui-59/r16-settings-grid.png");
+        assert!(
+            settings_top_spread > HALL_BAR_MAX_TILE_TOP_SPREAD_PX,
+            "设置宫格应跨两行（顶部极差应大于 4 px）"
+        );
+        let (teyvat_tiles, _, _, _) =
             signature("transition-to-overworld/05-overworld-teyvat.jpg");
         assert!(teyvat_tiles < HALL_BAR_MIN_TILES, "提瓦特底栏只有一个 Enter");
     }

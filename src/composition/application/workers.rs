@@ -785,7 +785,13 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
             } else {
                 format!("{code}: {}", compact_failure_detail(&message))
             };
-            if let Err(error) = self.reply(&format!("播放失败，已跳过当前歌曲（{detail}）")) {
+            // 监控线程没有聊天发送能力：走延迟聊天队列，由 DeferredChatSender 统一发。
+            if let Err(error) = self.task_engine.enqueue_deferred(DeferredChatMessage {
+                text: format!("播放失败，已跳过当前歌曲（{detail}）"),
+                target: DeferredChatTarget::CurrentHall,
+                background_key: None,
+                formal_epoch: None,
+            }) {
                 log::warn!("发送播放失败回报失败: {error:#}");
             }
         }

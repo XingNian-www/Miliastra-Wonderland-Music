@@ -743,20 +743,24 @@ fn detect_ui_state_with_evidence(
     }
 
     // ── 2) 没有蓝/黄（无标记，或只有粉色）：底栏结构 → 大厅 ─────────────
-    // 底栏结构是粉色/无标记时的二次判据（区域标量 + 连通块），对位移/缩放不敏感（第 47 节教训）。
-    // 只看"按键块数 + 占比下界"：**不要加上界**——实测亮背景的大厅界帧占比能到 0.2866，
-    // 上限会把它们误杀（2026-10-17 踩过）。主菜单那一帧占比 0.4152 是这个判据已知的唯一误报。
+    // 底栏是**唯一**的大厅判据（蓝/黄标记之外），只看三个几何条件：
+    //   ① 块数 7–14（一排键；拼图 17 块被上限挡掉）
+    //   ② 白键高度统一：所有块高度极差 ≤2 采样格
+    //   ③ 键高落在 8–20 采样格（小圆角键；主菜单整块白底是 30–32）
+    // 白色判据用严格的 225（不是纯 255：JPEG/缩放帧的白色只有 240–254）。
     let hall_region: Rect = screen.hall_bar_rect.into();
-    let (hall_white_ratio, hall_tiles) = hall_bar_signature(image, hall_region);
-    let hall_structure = hall_tiles >= HALL_BAR_MIN_TILES
-        && hall_white_ratio >= HALL_BAR_STRUCTURE_RATIO_MIN;
+    let (hall_tiles, hall_height_spread, hall_median_height) = hall_bar_signature(image, hall_region);
+    let hall_structure = (HALL_BAR_MIN_TILES..=HALL_BAR_MAX_TILES).contains(&hall_tiles)
+        && hall_height_spread <= HALL_BAR_MAX_TILE_HEIGHT_SPREAD
+        && (HALL_BAR_MIN_TILE_HEIGHT..=HALL_BAR_MAX_TILE_HEIGHT).contains(&hall_median_height);
     if hall_structure {
         log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms marker={}ms state=primary rule=primary_hall_bar white_ratio={:.4} tiles={}",
+            "UI 状态检测耗时: total={}ms marker={}ms state=primary rule=primary_hall_bar tiles={} h_spread={} h_median={}",
             elapsed_ms(started),
             marker_ms,
-            hall_white_ratio,
-            hall_tiles
+            hall_tiles,
+            hall_height_spread,
+            hall_median_height
         );
         return Ok((
             UiState::primary_hall(),
@@ -872,28 +876,32 @@ fn detect_ui_state_with_evidence(
     ))
 }
 
-/// 底栏近白像素占比的**下限**：低于它就认为当前不是千星大厅。
+/// 底栏「白色按键块数」的范围（2px 采样下的 4 连通块，单块至少 [`HALL_BAR_TILE_MIN_AREA`] 个采样格）。
 ///
-/// 来源（不是凑出来的）：在 76 帧语料上实测——**非大厅帧最高 5.257%**
-/// （secondary-full.png），**大厅帧最低 11.181%**（hall-chat-open.jpg），
-/// 两者之间没有任何帧。取区间中点 (5.257 + 11.181) / 2 = **8.219%**。
-/// 统计区域是 `screen.hall_bar_rect`，改区域必须重新量阈值。
-const HALL_BAR_WHITE_RATIO_MIN: f32 = 0.08219;
-
-/// 底栏「白色按键块数」的下限（2px 采样下的 4 连通块，单块至少 [`HALL_BAR_TILE_MIN_AREA`] 个采样格）。
-///
-/// 来源（1553 帧语料实测，2026-10-17）：千星大厅帧 **7–11 块**（最低 7），千星主菜单 3–5 块，
-/// 提瓦特 2–4 块，登录/加载 0 块 ⇒ 取 **7**（按实测下限，不放开余量）。
+/// 来源（1133 帧整屏实测，2026-10-17）：大厅 **7–12 块**；提瓦特 2–4 块；主菜单 3–10 块；登录/加载 0 块。
 /// 这是**结构**量而不是模板分数，对位移/缩放不敏感；改采样步长或 `screen.hall_bar_rect` 必须重测。
 const HALL_BAR_MIN_TILES: usize = 7;
 
-/// 结构判定用的近白占比下限：取实测大厅带的下沿 **0.10**。
-///
-/// 与 [`HALL_BAR_WHITE_RATIO_MIN`]（0.08219，用于"有气泡时否决"）分开：
-/// 那个是**否决**阈值，宁松勿紧；这个是**主动判大厅**的门槛，必须落在实测大厅带内
-/// （大厅 0.1098–0.1435），否则白色面板/裁剪图会被当成大厅（2026-10-17 实测过一次）。
-const HALL_BAR_STRUCTURE_RATIO_MIN: f32 = 0.10;
+/// 块数上限：只为挡住「接触表 / 拼图」这类非整屏诊断图（实测 17 块）；真实大厅最多 12 块。
+const HALL_BAR_MAX_TILES: usize = 14;
 
+/// 底栏白键的**白色下限**（每通道 min(R,G,B)）。
+///
+/// **不用纯 255**：实测整屏语料里纯白只覆盖 **89/182** 大厅帧——很多帧是 JPEG/回放、
+/// 或经过 DPI 缩放重采样，白色被压到 240–254（255→89、250→116、245→131、240→141）。
+/// 225 能让 **224/225** 大厅帧命中，同时比旧的 200 严格得多（200 会把背景亮块也算进来）。
+const HALL_BAR_WHITE_MIN: u8 = 225;
+
+/// 单块白键的**高度**允许区间（2px 采样格，1 格 = 2 真实像素）。
+///
+/// 大厅的键是 ~26–30 真实像素高的小圆角键 ⇒ 实测 13–15 采样格；
+/// 主菜单/设置宫格是整块白底 ⇒ 30–32 采样格；面板更高。
+/// **高度统一**是「一排键」与「一整块白底/拼图」的关键区别。
+const HALL_BAR_MIN_TILE_HEIGHT: usize = 8;
+const HALL_BAR_MAX_TILE_HEIGHT: usize = 20;
+
+/// 同一帧里所有键的高度必须一致：极差 ≤2 采样格（=4 真实像素）。
+const HALL_BAR_MAX_TILE_HEIGHT_SPREAD: usize = 2;
 
 /// 计入「一块按键」的最小面积（单位：2px 采样格）。低于它的白点按噪点丢弃。
 const HALL_BAR_TILE_MIN_AREA: usize = 40;
@@ -1272,40 +1280,36 @@ fn loading_rule(image: &DynamicImage) -> Option<&'static str> {
     None
 }
 
-/// 底栏结构：`(近白占比, 白色按键块数)`，与 [`HALL_BAR_WHITE_RATIO_MIN`] / [`HALL_BAR_MIN_TILES`] 同一采样口径。
+/// 底栏结构：`(白色按键块数, 单块中位面积)`。
 ///
-/// 千星大厅的底栏是一排白色圆角按键（聊天 / Enter / 👥 / O / 麦克风 / Alt+N / 喇叭 / N），
-/// 所以既有足够的近白占比，也有**多块**互不相连的白色按键；提瓦特只有一个 Enter，
-/// 主菜单是一整片白底（块数少），登录/加载整屏纯色。
-/// 用结构而不是模板分数，是为了绕开 1:1 SAD 对缩放不鲁棒的问题（第 47 节教训）。
-fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (f32, usize) {
+/// 千星大厅的底栏是一排**小圆角白键**（聊天 / Enter / 👥 / O / 麦克风 / Alt+N / 喇叭 / N）：
+/// 块数多（7–12）且每块是**高度一致的小圆角键**（高 13–15 采样格）；提瓦特只有一个 Enter（2–4 块）；
+/// 主菜单 / 设置宫格是整块白底（块高 30–32 采样格）。
+/// 返回 `(块数, 块高极差, 块高中位)`，三个量一起才分得干净。
+/// 用几何量而不是模板分数，是为了绕开 1:1 SAD 对缩放不鲁棒的问题（第 47 节教训）；
+/// 也不用「近白占比」——那是亮度量，亮背景大厅会把它顶高。
+fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (usize, usize, usize) {
     let Ok(region) = crop_canvas(image, rect) else {
-        return (0.0, 0);
+        return (0, 0, 0);
     };
     let rgb = region.to_rgb8();
     let (width, height) = rgb.dimensions();
     let grid_w = (width as usize).div_ceil(2);
     let grid_h = (height as usize).div_ceil(2);
     let mut grid = vec![false; grid_w * grid_h];
-    let mut white = 0_usize;
     for gy in 0..grid_h {
         for gx in 0..grid_w {
             let pixel = rgb.get_pixel((gx * 2) as u32, (gy * 2) as u32);
-            if pixel[0].min(pixel[1]).min(pixel[2]) >= 200 {
+            if pixel[0].min(pixel[1]).min(pixel[2]) >= HALL_BAR_WHITE_MIN {
                 grid[gy * grid_w + gx] = true;
-                white += 1;
             }
         }
     }
     let total = grid_w * grid_h;
-    let ratio = if total == 0 {
-        0.0
-    } else {
-        white as f32 / total as f32
-    };
     let mut seen = vec![false; total];
     let mut stack: Vec<usize> = Vec::new();
-    let mut tiles = 0_usize;
+    let mut areas: Vec<usize> = Vec::new();
+    let mut heights: Vec<usize> = Vec::new();
     for start in 0..total {
         if !grid[start] || seen[start] {
             continue;
@@ -1314,10 +1318,14 @@ fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (f32, usize) {
         stack.push(start);
         seen[start] = true;
         let mut area = 0_usize;
+        let mut y_min = usize::MAX;
+        let mut y_max = 0_usize;
         while let Some(index) = stack.pop() {
             area += 1;
             let x = index % grid_w;
             let y = index / grid_w;
+            y_min = y_min.min(y);
+            y_max = y_max.max(y);
             if x > 0 {
                 let n = index - 1;
                 if grid[n] && !seen[n] {
@@ -1348,10 +1356,18 @@ fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (f32, usize) {
             }
         }
         if area >= HALL_BAR_TILE_MIN_AREA {
-            tiles += 1;
+            areas.push(area);
+            heights.push(y_max - y_min + 1);
         }
     }
-    (ratio, tiles)
+    if heights.is_empty() {
+        return (0, 0, 0);
+    }
+    heights.sort_unstable();
+    let spread = heights[heights.len() - 1] - heights[0];
+    // 取上中位：奇数块时就是正中间那块；偶数块时偏大的一侧，判据更保守。
+    let median = heights[heights.len() / 2];
+    (areas.len(), spread, median)
 }
 
 /// 世界判据的结果。
@@ -3152,10 +3168,13 @@ mod tests {
         );
     }
 
-    /// 底栏结构判据：大厅有 7 块以上白色按键；主菜单/提瓦特/加载都不满足。
+    /// 底栏结构判据：大厅 = 7–14 块**高度一致的小圆角白键**
+    /// （白 ≥225、块高 13–15 采样格、极差 ≤2）；主菜单 / 设置宫格是整块白底（块高 30–32），
+    /// 提瓦特只有一个 Enter，都不满足。
     ///
-    /// 钉住 2026-10-17 的「大厅优先」改动：大厅判定不再依赖聊天标记，
-    /// 靠底栏结构（白色按键块数 + 近白占比）。改采样步长或 `hall_bar_rect` 要重测阈值。
+    /// 2026-10-17 第三轮：白色判据收紧到 **225**——纯 255 只覆盖 **89/182** 大厅帧
+    /// （JPEG/回放/DPI 缩放帧的白色只有 240–254）；再补**高度统一**约束：主菜单的整块白卡
+    /// 会被拆成 7 块 30–32 高的白条，只靠块数/面积会误判，键高一票否决。
     #[test]
     fn hall_bar_structure_separates_hall_from_menu_and_teyvat() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -3165,31 +3184,31 @@ mod tests {
             let image = image::open(&path).unwrap();
             hall_bar_signature(&image, rect)
         };
+        let is_hall = |name: &str| {
+            let (tiles, spread, median) = signature(name);
+            (HALL_BAR_MIN_TILES..=HALL_BAR_MAX_TILES).contains(&tiles)
+                && spread <= HALL_BAR_MAX_TILE_HEIGHT_SPREAD
+                && (HALL_BAR_MIN_TILE_HEIGHT..=HALL_BAR_MAX_TILE_HEIGHT).contains(&median)
+        };
         for name in [
             "hall-chat-open.jpg",
             "qianxing-halls-58/hall3-01.jpg",
             "full-hall.jpg",
+            "hall-chat-closed.jpg",
         ] {
-            let (ratio, tiles) = signature(name);
-            assert!(
-                tiles >= HALL_BAR_MIN_TILES,
-                "{name} 是大厅，底栏应有多块白色按键，实测 {tiles} 块"
-            );
-            assert!(
-                ratio >= HALL_BAR_STRUCTURE_RATIO_MIN,
-                "{name} 近白占比 {ratio:.4} 应不低于结构门槛"
-            );
+            assert!(is_hall(name), "{name} 是千星大厅，底栏应是多块同高小圆角白键");
         }
-        let (_ratio, tiles) = signature("wonderland-menu.png");
+        for name in ["wonderland-menu.png", "qianxing-ui-59/r16-settings-grid.png"] {
+            assert!(!is_hall(name), "{name} 是整块白底，不得判成大厅");
+        }
+        let (_, _, menu_median) = signature("wonderland-menu.png");
         assert!(
-            tiles < HALL_BAR_MIN_TILES,
-            "千星主菜单是一整片白底，不该凑出 {tiles} 块按键"
+            menu_median > HALL_BAR_MAX_TILE_HEIGHT,
+            "主菜单白卡的块高应超过键高上限（实测 30–32）"
         );
-        let (ratio, _) = signature("transition-to-overworld/05-overworld-teyvat.jpg");
-        assert!(
-            ratio < HALL_BAR_STRUCTURE_RATIO_MIN,
-            "提瓦特底栏只有一个 Enter，近白占比 {ratio:.4} 不该过结构门槛"
-        );
+        let (teyvat_tiles, _, _) =
+            signature("transition-to-overworld/05-overworld-teyvat.jpg");
+        assert!(teyvat_tiles < HALL_BAR_MIN_TILES, "提瓦特底栏只有一个 Enter");
     }
 
     fn panel_regions_from(config: &AppConfig) -> PanelRegions {

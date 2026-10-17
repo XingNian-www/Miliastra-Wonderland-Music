@@ -1,0 +1,318 @@
+//! 酷狗接口使用的加密与歌词解码辅助函数。
+
+use aes::{Aes128, Aes192, Aes256};
+use base64::Engine;
+use cbc::{Decryptor, Encryptor};
+use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+use flate2::read::ZlibDecoder;
+use rand::thread_rng;
+use rsa::Pkcs1v15Encrypt;
+use rsa::pkcs8::DecodePublicKey;
+use rsa::traits::PublicKeyParts;
+use std::io::Read;
+
+/// 酷狗测试版/lite 登录端点使用的公钥。
+pub const KUGOU_LITE_RSA_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDECi0Np2UR87scwrvTr72L6oO01rBbbBPriSDFPxr3Z5syug0O24QyQO8bg27+0+4kBzTBTBOZ/WWU0WryL1JSXRTXLgFVxtzIY41Pe7lPOgsfTCn5kZcvKhYKJesKnnJDNr5/abvTGf+rHG3YRwsCHcQ08/q6ifSioBszvb3QiwIDAQAB\n-----END PUBLIC KEY-----";
+
+const KRC_XOR_KEY: &[u8; 16] = &[
+    64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105,
+];
+
+/// 纯加密辅助函数返回的错误。
+#[derive(Debug, thiserror::Error)]
+pub enum KugouCryptoError {
+    #[error("invalid AES key or IV length (key={key}, iv={iv})")]
+    InvalidAesLength { key: usize, iv: usize },
+    #[error("invalid hexadecimal ciphertext: {0}")]
+    InvalidHex(String),
+    #[error("AES operation failed: {0}")]
+    Aes(String),
+    #[error("RSA public key parsing failed: {0}")]
+    RsaKey(String),
+    #[error("KRC payload is too short")]
+    KrcHeader,
+    #[error("KRC zlib decompression failed: {0}")]
+    KrcInflate(String),
+    #[error("KRC text is not valid UTF-8: {0}")]
+    KrcUtf8(String),
+}
+
+fn aes_cbc_encrypt(plaintext: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, KugouCryptoError> {
+    validate_aes_lengths(key, iv)?;
+    let mut buffer = vec![0u8; plaintext.len() + 16];
+    buffer[..plaintext.len()].copy_from_slice(plaintext);
+    let encrypted = match key.len() {
+        16 => Encryptor::<Aes128>::new_from_slices(key, iv)
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?
+            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?,
+        24 => Encryptor::<Aes192>::new_from_slices(key, iv)
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?
+            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?,
+        32 => Encryptor::<Aes256>::new_from_slices(key, iv)
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?
+            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?,
+        _ => unreachable!(),
+    };
+    Ok(encrypted.to_vec())
+}
+
+fn decrypt_in_place(
+    ciphertext: &mut [u8],
+    key: &[u8],
+    iv: &[u8],
+) -> Result<Vec<u8>, KugouCryptoError> {
+    validate_aes_lengths(key, iv)?;
+    let decrypted = match key.len() {
+        16 => Decryptor::<Aes128>::new_from_slices(key, iv)
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?
+            .decrypt_padded_mut::<Pkcs7>(ciphertext)
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?,
+        24 => Decryptor::<Aes192>::new_from_slices(key, iv)
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?
+            .decrypt_padded_mut::<Pkcs7>(ciphertext)
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?,
+        32 => Decryptor::<Aes256>::new_from_slices(key, iv)
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?
+            .decrypt_padded_mut::<Pkcs7>(ciphertext)
+            .map_err(|error| KugouCryptoError::Aes(error.to_string()))?,
+        _ => unreachable!(),
+    };
+    Ok(decrypted.to_vec())
+}
+
+fn validate_aes_lengths(key: &[u8], iv: &[u8]) -> Result<(), KugouCryptoError> {
+    if !matches!(key.len(), 16 | 24 | 32) || iv.len() != 16 {
+        return Err(KugouCryptoError::InvalidAesLength {
+            key: key.len(),
+            iv: iv.len(),
+        });
+    }
+    Ok(())
+}
+
+/// 加密 `/risk/v2/r_register_dev` 使用的歌单/设备注册载荷。
+/// 临时六字符密钥通过 MD5 派生 AES-128 密钥和 IV，与上游 JS 辅助函数一致。
+pub fn playlist_aes_encrypt_base64(
+    plaintext: &[u8],
+    temporary_key: &str,
+) -> Result<String, KugouCryptoError> {
+    let digest = md5_key(temporary_key);
+    let encrypted = aes_cbc_encrypt(
+        plaintext,
+        &digest.as_bytes()[..16],
+        &digest.as_bytes()[16..],
+    )?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
+}
+
+/// 解密 `/risk/v2/r_register_dev` 返回的歌单 AES 响应。
+pub fn playlist_aes_decrypt_base64(
+    ciphertext: &[u8],
+    temporary_key: &str,
+) -> Result<Vec<u8>, KugouCryptoError> {
+    let mut decoded = std::str::from_utf8(ciphertext)
+        .ok()
+        .and_then(|text| {
+            base64::engine::general_purpose::STANDARD
+                .decode(text.trim())
+                .ok()
+        })
+        .filter(|bytes| !bytes.is_empty() && bytes.len().is_multiple_of(16))
+        .unwrap_or_else(|| ciphertext.to_vec());
+    if decoded.is_empty() || !decoded.len().is_multiple_of(16) {
+        return Err(KugouCryptoError::Aes(
+            "playlist AES response is not a complete ciphertext".to_owned(),
+        ));
+    }
+    let digest = md5_key(temporary_key);
+    decrypt_in_place(
+        &mut decoded,
+        &digest.as_bytes()[..16],
+        &digest.as_bytes()[16..],
+    )
+}
+
+fn parse_public_key(public_key_pem: &str) -> Result<rsa::RsaPublicKey, KugouCryptoError> {
+    let normalized_pem = public_key_pem.replace("\\n", "\n");
+    // RSA crate 在 PEM 的 Base64 正文未换行时可能拒绝部分有效值。
+    // 直接解码 DER 载荷，消除换行差异影响。
+    let der = normalized_pem
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("-----"))
+        .flat_map(str::chars)
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(der.as_bytes())
+        .map_err(|error| KugouCryptoError::RsaKey(error.to_string()))?;
+    rsa::RsaPublicKey::from_public_key_der(&der)
+        .map_err(|error| KugouCryptoError::RsaKey(error.to_string()))
+}
+
+/// MD5 十六进制摘要；用于按上游规则从临时密钥派生 AES 密钥与 IV。
+pub fn md5_hex(value: &str) -> String {
+    md5_key(value)
+}
+
+/// 上游 cryptoAesEncrypt 的显式 key/iv 分支：AES-CBC-Pkcs7，密文输出十六进制。
+pub fn aes_cbc_encrypt_hex(
+    plaintext: &[u8],
+    key: &str,
+    iv: &str,
+) -> Result<String, KugouCryptoError> {
+    let encrypted = aes_cbc_encrypt(plaintext, key.as_bytes(), iv.as_bytes())?;
+    Ok(to_hex(&encrypted))
+}
+
+/// 上游 cryptoAesDecrypt 的十六进制密文分支。
+pub fn aes_cbc_decrypt_hex(
+    ciphertext_hex: &str,
+    key: &str,
+    iv: &str,
+) -> Result<Vec<u8>, KugouCryptoError> {
+    let mut decoded = decode_hex(ciphertext_hex)?;
+    if decoded.is_empty() || !decoded.len().is_multiple_of(16) {
+        return Err(KugouCryptoError::Aes(
+            "hex ciphertext is not a complete AES block sequence".to_owned(),
+        ));
+    }
+    decrypt_in_place(&mut decoded, key.as_bytes(), iv.as_bytes())
+}
+
+/// 上游 cryptoRSAEncrypt：把 UTF-8 字节放到模长缓冲区的开头（尾部补零）后做裸 RSA。
+///
+/// 与 PKCS#1 v1.5 不同，这里没有随机填充，因此结果可复现；酷狗登录接口依赖该形式。
+pub fn rsa_raw_encrypt_hex(
+    plaintext: &[u8],
+    public_key_pem: &str,
+) -> Result<String, KugouCryptoError> {
+    let key = parse_public_key(public_key_pem)?;
+    let key_length = key.n().bits().div_ceil(8);
+    if plaintext.len() > key_length {
+        return Err(KugouCryptoError::RsaKey(
+            "RSA plaintext exceeds the modulus size".to_owned(),
+        ));
+    }
+    let mut padded = vec![0u8; key_length];
+    padded[..plaintext.len()].copy_from_slice(plaintext);
+    let message = rsa::BigUint::from_bytes_be(&padded);
+    let encrypted = message.modpow(key.e(), key.n()).to_bytes_be();
+    let mut bytes = vec![0u8; key_length.saturating_sub(encrypted.len())];
+    bytes.extend_from_slice(&encrypted);
+    Ok(to_hex(&bytes))
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, KugouCryptoError> {
+    let trimmed = value.trim();
+    if !trimmed.len().is_multiple_of(2) {
+        return Err(KugouCryptoError::InvalidHex(value.to_owned()));
+    }
+    (0..trimmed.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&trimmed[index..index + 2], 16)
+                .map_err(|_| KugouCryptoError::InvalidHex(value.to_owned()))
+        })
+        .collect()
+}
+
+/// 注册 p 查询字段使用的 RSAES-PKCS1-v1_5 加密。
+pub fn rsa_pkcs1_encrypt_hex(
+    plaintext: &[u8],
+    public_key_pem: &str,
+) -> Result<String, KugouCryptoError> {
+    let key = parse_public_key(public_key_pem)?;
+    let encrypted = key
+        .encrypt(&mut thread_rng(), Pkcs1v15Encrypt, plaintext)
+        .map_err(|error| KugouCryptoError::Aes(format!("RSA encryption failed: {error}")))?;
+    Ok(to_hex(&encrypted))
+}
+
+/// 解码 Base64 编码的 KRC 文件（`krc1` 头和 XOR/zlib 正文）。
+pub fn decode_krc_base64(encoded: &str) -> Result<String, KugouCryptoError> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| KugouCryptoError::InvalidHex(error.to_string()))?;
+    decode_krc(&bytes)
+}
+
+/// 解码原始 KRC 字节。
+pub fn decode_krc(bytes: &[u8]) -> Result<String, KugouCryptoError> {
+    if bytes.len() < 4 {
+        return Err(KugouCryptoError::KrcHeader);
+    }
+    let decrypted = bytes[4..]
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| byte ^ KRC_XOR_KEY[index % KRC_XOR_KEY.len()]);
+    let decrypted = decrypted.collect::<Vec<_>>();
+    let mut decoder = ZlibDecoder::new(decrypted.as_slice());
+    let mut text = Vec::new();
+    decoder
+        .read_to_end(&mut text)
+        .map_err(|error| KugouCryptoError::KrcInflate(error.to_string()))?;
+    String::from_utf8(text).map_err(|error| KugouCryptoError::KrcUtf8(error.to_string()))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn md5_key(value: &str) -> String {
+    format!("{:x}", md5::compute(value.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rsa_pkcs1_accepts_unwrapped_lite_public_key() {
+        let encrypted =
+            rsa_pkcs1_encrypt_hex(b"{\"uid\":\"42\"}", KUGOU_LITE_RSA_PUBLIC_KEY).unwrap();
+        assert_eq!(encrypted.len(), 256);
+        assert!(encrypted.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn krc_round_trip_decodes_xor_and_zlib() {
+        let mut compressed = Vec::new();
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(&mut compressed, flate2::Compression::default());
+        use std::io::Write;
+        encoder.write_all("[00:00.00]hello".as_bytes()).unwrap();
+        encoder.finish().unwrap();
+        let mut bytes = b"krc1".to_vec();
+        bytes.extend(
+            compressed
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ KRC_XOR_KEY[index % KRC_XOR_KEY.len()]),
+        );
+        assert_eq!(decode_krc(&bytes).unwrap(), "[00:00.00]hello");
+    }
+
+    #[test]
+    fn playlist_aes_decrypts_base64_and_raw_registration_responses() {
+        let plaintext = br#"{"status":1,"data":{"dfid":"device"}}"#;
+        let encoded = playlist_aes_encrypt_base64(plaintext, "abc123").unwrap();
+        assert_eq!(
+            encoded,
+            "xGop/4PjsJcKjl7ieszfoThw4X8vl/BeE/ZUKX2kANi+TkytsGTnu8a8toM7DoD+"
+        );
+        assert_eq!(
+            playlist_aes_decrypt_base64(encoded.as_bytes(), "abc123").unwrap(),
+            plaintext
+        );
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(
+            playlist_aes_decrypt_base64(&raw, "abc123").unwrap(),
+            plaintext
+        );
+    }
+}

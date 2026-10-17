@@ -1,0 +1,902 @@
+use enigo::Key;
+use std::sync::Arc;
+
+use super::friend_delivery::{
+    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
+    before_input_failure, capture_normalized, confirm_primary_residency, friend_list_drag_points,
+    restore_residency, wait_ms,
+};
+#[cfg(test)]
+use crate::config::AppConfig;
+use crate::config::{HallTimingConfig, OcrConfig, ScreenConfig};
+use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
+use crate::runtime::ui::{
+    InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
+    UiSubmitError, sealed,
+};
+use crate::text::normalize_comparison_text as normalize_lock_text;
+use crate::ui::geometry::{Rect, crop_canvas};
+use crate::ui::locator::{
+    HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty, merge_hall_info_samples,
+    parse_hall_member_count, parse_hall_remaining_minutes,
+};
+
+const HALL_MEMBER_SCROLL_THRESHOLD: u32 = 7;
+const HALL_PAGE_READY_TIMEOUT_MS: u64 = 15_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReadHallInfo;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DetectPublicHall;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToggleMicrophone;
+
+#[derive(Clone, Debug)]
+pub(crate) enum ReadHallInfoEffect {
+    Read(HallInfo),
+    Failed(UiRoutineFailure),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReadHallInfoOutcome {
+    effect: ReadHallInfoEffect,
+    residency: UiResidencyOutcome,
+    screenshot: Option<Arc<image::DynamicImage>>,
+}
+
+impl ReadHallInfoOutcome {
+    pub(crate) fn effect(&self) -> &ReadHallInfoEffect {
+        &self.effect
+    }
+
+    pub(crate) fn residency(&self) -> &UiResidencyOutcome {
+        &self.residency
+    }
+
+    pub(crate) fn screenshot(&self) -> Option<Arc<image::DynamicImage>> {
+        self.screenshot.clone()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum DetectPublicHallEffect {
+    Detected { is_public: bool, info: HallInfo },
+    Failed(UiRoutineFailure),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DetectPublicHallOutcome {
+    effect: DetectPublicHallEffect,
+    residency: UiResidencyOutcome,
+}
+
+impl DetectPublicHallOutcome {
+    pub(crate) fn effect(&self) -> &DetectPublicHallEffect {
+        &self.effect
+    }
+
+    pub(crate) fn residency(&self) -> &UiResidencyOutcome {
+        &self.residency
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ToggleMicrophoneEffect {
+    Toggled,
+    Failed(UiRoutineFailure),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToggleMicrophoneOutcome {
+    effect: ToggleMicrophoneEffect,
+    residency: UiResidencyOutcome,
+}
+
+impl ToggleMicrophoneOutcome {
+    pub(crate) fn effect(&self) -> &ToggleMicrophoneEffect {
+        &self.effect
+    }
+
+    pub(crate) fn residency(&self) -> &UiResidencyOutcome {
+        &self.residency
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct HallUi {
+    runtime: UiRuntimeHandle,
+    ocr: OcrRuntimeHandle,
+    config: HallRoutineConfig,
+}
+
+impl HallUi {
+    pub(crate) fn new(
+        runtime: UiRuntimeHandle,
+        ocr: OcrRuntimeHandle,
+        config: HallRoutineConfig,
+    ) -> Self {
+        Self {
+            runtime,
+            ocr,
+            config,
+        }
+    }
+
+    pub(crate) fn submit_read(
+        &self,
+        request: ReadHallInfo,
+    ) -> Result<UiOperation<ReadHallInfoOutcome>, UiSubmitError> {
+        self.runtime.submit(ReadHallInfoRoutine {
+            request,
+            ocr: self.ocr.clone(),
+            config: self.config.clone(),
+        })
+    }
+
+    pub(crate) fn submit_detect(
+        &self,
+        request: DetectPublicHall,
+    ) -> Result<UiOperation<DetectPublicHallOutcome>, UiSubmitError> {
+        self.runtime.submit(DetectPublicHallRoutine {
+            request,
+            ocr: self.ocr.clone(),
+            config: self.config.clone(),
+        })
+    }
+
+    pub(crate) fn submit_microphone(
+        &self,
+        request: ToggleMicrophone,
+    ) -> Result<UiOperation<ToggleMicrophoneOutcome>, UiSubmitError> {
+        self.runtime.submit(ToggleMicrophoneRoutine {
+            request,
+            ocr: self.ocr.clone(),
+            config: self.config.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct HallRoutineConfig {
+    residency: FriendDeliveryRoutineConfig,
+    hall_name_region: Rect,
+    hall_member_count_region: Rect,
+    hall_time_region: Rect,
+    hall_member_list_region: Rect,
+    page_settle_ms: u64,
+    sample_interval_ms: u64,
+    same_line_y_tolerance: i32,
+}
+
+impl HallRoutineConfig {
+    pub(crate) fn resolve(
+        residency: FriendDeliveryRoutineConfig,
+        screen: &ScreenConfig,
+        timing: &HallTimingConfig,
+        ocr: &OcrConfig,
+    ) -> Self {
+        Self {
+            residency,
+            hall_name_region: screen.hall_name_rect.into(),
+            hall_member_count_region: screen.hall_member_count_rect.into(),
+            hall_time_region: screen.hall_time_rect.into(),
+            hall_member_list_region: screen.hall_member_list_rect.into(),
+            page_settle_ms: timing.page_settle_ms,
+            sample_interval_ms: timing.ocr_sample_interval_ms,
+            same_line_y_tolerance: ocr.same_line_y_tolerance,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_app(config: &AppConfig) -> Self {
+        Self::resolve(
+            FriendDeliveryRoutineConfig::from_app(config),
+            &config.screen,
+            &config.timing.hall,
+            &config.ocr,
+        )
+    }
+}
+
+struct ReadHallInfoRoutine {
+    request: ReadHallInfo,
+    ocr: OcrRuntimeHandle,
+    config: HallRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for ReadHallInfoRoutine {}
+
+impl UiRoutine for ReadHallInfoRoutine {
+    type Output = ReadHallInfoOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let _ = self.request;
+        let mut opened = false;
+        let (effect, screenshot) =
+            match read_hall_info_transaction(context, &self.ocr, &self.config, &mut opened) {
+                Ok((info, screenshot)) => (ReadHallInfoEffect::Read(info), Some(screenshot)),
+                Err(failure) => (ReadHallInfoEffect::Failed(failure), None),
+            };
+        let residency = finish_hall_page(context, &self.ocr, &self.config, opened);
+        ReadHallInfoOutcome {
+            effect,
+            residency,
+            screenshot,
+        }
+    }
+}
+
+struct DetectPublicHallRoutine {
+    request: DetectPublicHall,
+    ocr: OcrRuntimeHandle,
+    config: HallRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for DetectPublicHallRoutine {}
+
+impl UiRoutine for DetectPublicHallRoutine {
+    type Output = DetectPublicHallOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let _ = self.request;
+        let mut opened = false;
+        let effect = match read_hall_info_transaction(context, &self.ocr, &self.config, &mut opened)
+        {
+            Ok((info, _screenshot)) => {
+                let is_public = normalize_lock_text(&info.name) == normalize_lock_text("公共大厅");
+                DetectPublicHallEffect::Detected { is_public, info }
+            }
+            Err(failure) => DetectPublicHallEffect::Failed(failure),
+        };
+        let residency = finish_hall_page(context, &self.ocr, &self.config, opened);
+        DetectPublicHallOutcome { effect, residency }
+    }
+}
+
+struct ToggleMicrophoneRoutine {
+    request: ToggleMicrophone,
+    ocr: OcrRuntimeHandle,
+    config: HallRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for ToggleMicrophoneRoutine {}
+
+impl UiRoutine for ToggleMicrophoneRoutine {
+    type Output = ToggleMicrophoneOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let _ = self.request;
+        let effect = match prepare_primary(context, &self.ocr, &self.config) {
+            Ok(()) => match context.device().press_key(Key::Unicode('n')) {
+                Ok(()) => {
+                    match wait_ms(
+                        context,
+                        100,
+                        "toggle_microphone",
+                        InputCertainty::AfterInputUnknown,
+                    ) {
+                        Ok(()) => ToggleMicrophoneEffect::Toggled,
+                        Err(failure) => ToggleMicrophoneEffect::Failed(failure),
+                    }
+                }
+                Err(error) => ToggleMicrophoneEffect::Failed(UiRoutineFailure::new(
+                    InputCertainty::AfterInputUnknown,
+                    "toggle_microphone",
+                    format!("{error:#}"),
+                )),
+            },
+            Err(failure) => ToggleMicrophoneEffect::Failed(failure),
+        };
+        let residency = match restore_residency(
+            context,
+            &self.ocr,
+            &self.config.residency,
+            UiResidencyTarget::Primary,
+        ) {
+            Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+            Err(failure) => UiResidencyOutcome::Failed(failure),
+        };
+        ToggleMicrophoneOutcome { effect, residency }
+    }
+}
+
+fn prepare_primary(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &HallRoutineConfig,
+) -> Result<(), UiRoutineFailure> {
+    context
+        .device()
+        .ensure_ready(config.residency.after_activate_ms)
+        .map_err(|error| before_input_failure("prepare_hall_operation", error))?;
+    restore_residency(context, ocr, &config.residency, UiResidencyTarget::Primary)
+}
+
+fn read_hall_info_transaction(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &HallRoutineConfig,
+    opened: &mut bool,
+) -> Result<(HallInfo, Arc<image::DynamicImage>), UiRoutineFailure> {
+    prepare_primary(context, ocr, config)?;
+    context.device().press_key(Key::F2).map_err(|error| {
+        UiRoutineFailure::new(
+            InputCertainty::AfterInputUnknown,
+            "open_hall_page",
+            format!("{error:#}"),
+        )
+    })?;
+    *opened = true;
+    let (initial_image, initial_sample) = wait_for_hall_page_ready(context, ocr, config)?;
+    let mut samples = Vec::with_capacity(HALL_INFO_OCR_SAMPLES);
+    samples.push(initial_sample);
+    let mut screenshot = initial_image.clone();
+    match read_hall_member_count(ocr, &initial_image, config) {
+        Ok(Some(member_count)) => {
+            log::info!(
+                "大厅成员人数 OCR 结果: {}，滚动阈值={}",
+                member_count,
+                HALL_MEMBER_SCROLL_THRESHOLD
+            );
+            if member_count > HALL_MEMBER_SCROLL_THRESHOLD {
+                let (from, to) = friend_list_drag_points(config.hall_member_list_region);
+                context
+                    .device()
+                    .drag_point(from.x, from.y, to.x, to.y)
+                    .map_err(|error| after_input_failure("drag_hall_member_list", error))?;
+                // 从最低头像往上拖 = 列表往下方翻，这一帧是列表更靠下的部分。
+                let scrolled = wait_for_hall_page_ready(context, ocr, config);
+                context
+                    .device()
+                    .drag_point(to.x, to.y, from.x, from.y)
+                    .map_err(|error| after_input_failure("restore_hall_member_list", error))?;
+                // 反向等距拖回起点，这一帧是列表更靠上的部分；拼图按“上、下”还原。
+                let (upper_image, upper_sample) = wait_for_hall_page_ready(context, ocr, config)?;
+                let (lower_image, lower_sample) = scrolled?;
+                samples.extend([upper_sample, lower_sample]);
+                screenshot = merge_hall_screenshots(&upper_image, &lower_image);
+            }
+        }
+        Ok(None) => log::debug!("大厅成员人数 OCR 未识别，跳过成员列表滚动"),
+        Err(failure) => log::warn!("大厅成员人数 OCR 失败，跳过成员列表滚动: {failure}"),
+    }
+    let screenshot = Arc::new(screenshot);
+    while samples.len() < HALL_INFO_OCR_SAMPLES {
+        wait_ms(
+            context,
+            config.sample_interval_ms,
+            "capture_hall_info",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "capture_hall_info",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        samples.push(read_hall_sample(ocr, &image, config)?);
+    }
+    for (index, sample) in samples.iter().enumerate() {
+        log::info!(
+            "大厅检测 OCR 采样: {}/{} name={} time={} minutes={}",
+            index + 1,
+            HALL_INFO_OCR_SAMPLES,
+            display_or_empty(&sample.name),
+            display_or_empty(&sample.time_text),
+            sample
+                .remaining_minutes
+                .map(|minutes| minutes.to_string())
+                .unwrap_or_else(|| "未知".to_string())
+        );
+    }
+    Ok((merge_hall_info_samples(&samples), screenshot))
+}
+
+fn wait_for_hall_page_ready(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &HallRoutineConfig,
+) -> Result<(image::DynamicImage, HallInfoSample), UiRoutineFailure> {
+    // F2 可能让黑色过渡画面持续超过常规稳定等待。不要把该画面作为截图返回，
+    // 应等待大厅内容可见，并在正常大厅信息样本中复用 OCR 结果。
+    wait_ms(
+        context,
+        config.page_settle_ms,
+        "wait_hall_page_ready",
+        InputCertainty::AfterInputUnknown,
+    )?;
+    let timeout_ms = HALL_PAGE_READY_TIMEOUT_MS.max(config.page_settle_ms);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let poll_ms = config.sample_interval_ms.max(50);
+    loop {
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "wait_hall_page_ready",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        if hall_page_has_content(&image, config)? {
+            let sample = read_hall_sample(ocr, &image, config)?;
+            if !sample.name.trim().is_empty()
+                || sample.remaining_minutes.is_some()
+                || !sample.time_text.trim().is_empty()
+            {
+                return Ok((image, sample));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
+                "wait_hall_page_ready",
+                "hall page did not produce visible OCR content before timeout",
+            ));
+        }
+        wait_ms(
+            context,
+            poll_ms,
+            "wait_hall_page_ready",
+            InputCertainty::AfterInputUnknown,
+        )?;
+    }
+}
+
+fn hall_page_has_content(
+    image: &image::DynamicImage,
+    config: &HallRoutineConfig,
+) -> Result<bool, UiRoutineFailure> {
+    // 亮像素阈值取 64：真实过场/加载帧的暗色底是 (29,28,34)，亮度约 29，
+    // 原阈值 24 连背景都会判成"有内容"（证据：technical-docs/ui-state-evidence/loading-screens/）；
+    // 真实大厅标题区是亮底白字，区域内像素几乎全部 ≥ 128。64 夹在两者之间。
+    for region in [config.hall_name_region, config.hall_time_region] {
+        let crop = crop_canvas(image, region)
+            .map_err(|error| after_input_failure("check_hall_page_visibility", error))?;
+        let lit_pixels = crop
+            .to_luma8()
+            .pixels()
+            .filter(|pixel| pixel[0] >= 64)
+            .count();
+        if lit_pixels >= 8 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_hall_member_count(
+    ocr: &OcrRuntimeHandle,
+    image: &image::DynamicImage,
+    config: &HallRoutineConfig,
+) -> Result<Option<u32>, UiRoutineFailure> {
+    let count_crop = crop_canvas(image, config.hall_member_count_region)
+        .map_err(|error| after_input_failure("crop_hall_member_count", error))?;
+    let count_text = ocr
+        .merged_text(
+            count_crop,
+            config.same_line_y_tolerance,
+            OcrPriority::UiConfirmation,
+        )
+        .map_err(|error| after_input_failure("ocr_hall_member_count", error.into()))?;
+    Ok(parse_hall_member_count(&count_text))
+}
+
+/// 把成员列表两帧按“上、下”拼成一张长图：`upper` 贴在上半，`lower` 贴在下半。
+fn merge_hall_screenshots(
+    upper: &image::DynamicImage,
+    lower: &image::DynamicImage,
+) -> image::DynamicImage {
+    let upper = upper.to_rgba8();
+    let lower = lower.to_rgba8();
+    let width = upper.width().max(lower.width());
+    let height = upper.height().saturating_add(lower.height());
+    let mut merged = image::RgbaImage::new(width, height);
+    image::imageops::overlay(&mut merged, &upper, 0, 0);
+    image::imageops::overlay(&mut merged, &lower, 0, i64::from(upper.height()));
+    image::DynamicImage::ImageRgba8(merged)
+}
+
+fn read_hall_sample(
+    ocr: &OcrRuntimeHandle,
+    image: &image::DynamicImage,
+    config: &HallRoutineConfig,
+) -> Result<HallInfoSample, UiRoutineFailure> {
+    let name_crop = crop_canvas(image, config.hall_name_region)
+        .map_err(|error| after_input_failure("crop_hall_name", error))?;
+    let name = ocr
+        .merged_text(
+            name_crop,
+            config.same_line_y_tolerance,
+            OcrPriority::UiConfirmation,
+        )
+        .map_err(|error| after_input_failure("ocr_hall_name", error.into()))?;
+    let time_crop = crop_canvas(image, config.hall_time_region)
+        .map_err(|error| after_input_failure("crop_hall_time", error))?;
+    let time_text = ocr
+        .merged_text(
+            time_crop,
+            config.same_line_y_tolerance,
+            OcrPriority::UiConfirmation,
+        )
+        .map_err(|error| after_input_failure("ocr_hall_time", error.into()))?;
+    Ok(HallInfoSample {
+        name,
+        remaining_minutes: parse_hall_remaining_minutes(&time_text),
+        time_text,
+    })
+}
+
+fn finish_hall_page(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &HallRoutineConfig,
+    opened: bool,
+) -> UiResidencyOutcome {
+    if opened {
+        if let Err(error) = context.device().press_key(Key::Escape) {
+            return UiResidencyOutcome::Failed(UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
+                "close_hall_page",
+                format!("{error:#}"),
+            ));
+        }
+        return match confirm_primary_residency(context, &config.residency) {
+            Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+            Err(failure) => UiResidencyOutcome::Failed(failure),
+        };
+    }
+    match restore_residency(context, ocr, &config.residency, UiResidencyTarget::Primary) {
+        Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+        Err(failure) => UiResidencyOutcome::Failed(failure),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use image::{DynamicImage, GenericImage, Rgba};
+
+    use super::*;
+    use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
+    use crate::runtime::ui::{UiDevice, UiRuntime};
+    use crate::ui::geometry::Rect;
+    use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
+
+    type DragRecord = (i32, i32, i32, i32);
+
+    struct HallDevice {
+        frame: DynamicImage,
+        keys: Arc<Mutex<Vec<Key>>>,
+        drags: Arc<Mutex<Vec<DragRecord>>>,
+    }
+
+    impl UiDevice for HallDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            Ok(self.frame.clone())
+        }
+
+        fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.keys.lock().unwrap().push(key);
+            Ok(())
+        }
+
+        fn drag_point(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<()> {
+            self.drags
+                .lock()
+                .unwrap()
+                .push((from_x, from_y, to_x, to_y));
+            let color = if from_y > to_y {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 255, 0, 255])
+            };
+            self.frame.put_pixel(0, 0, color);
+            Ok(())
+        }
+    }
+
+    struct TransitionHallDevice {
+        primary: DynamicImage,
+        loading: DynamicImage,
+        keys: Arc<Mutex<Vec<Key>>>,
+        fail_entry_capture: bool,
+        captures_after_f2: usize,
+        captures_after_escape: usize,
+    }
+
+    impl UiDevice for TransitionHallDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            let last_key = self.keys.lock().unwrap().last().cloned();
+            match last_key {
+                None => Ok(self.primary.clone()),
+                Some(Key::F2) => {
+                    self.captures_after_f2 += 1;
+                    if self.fail_entry_capture && self.captures_after_f2 > 2 {
+                        anyhow::bail!("hall capture failed");
+                    }
+                    if self.captures_after_f2 <= 2 {
+                        Ok(self.loading.clone())
+                    } else {
+                        Ok(self.primary.clone())
+                    }
+                }
+                Some(Key::Escape) => {
+                    self.captures_after_escape += 1;
+                    if self.captures_after_escape <= 2 {
+                        Ok(self.loading.clone())
+                    } else {
+                        Ok(self.primary.clone())
+                    }
+                }
+                Some(_) => Ok(self.loading.clone()),
+            }
+        }
+
+        fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.keys.lock().unwrap().push(key);
+            Ok(())
+        }
+    }
+
+    struct HallOcrDevice {
+        member_count: &'static str,
+    }
+
+    fn start_test_ui_runtime(device: impl UiDevice, config: &AppConfig) -> UiRuntime {
+        UiRuntime::start_with_state_classifier(
+            device,
+            2,
+            TemplateUiStateClassifier::new(
+                UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+                config.screen.clone(),
+            ),
+            config.resolve_stability_count(0),
+        )
+        .unwrap()
+    }
+
+    impl OcrDevice for HallOcrDevice {
+        fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            let text = match (image.width(), image.height()) {
+                (450, 50) => self.member_count,
+                (325, 40) => "公共大厅",
+                _ => "",
+            };
+            Ok(vec![OcrLine {
+                text: text.to_string(),
+                confidence: 1.0,
+                bbox: Rect::new(0, 0, image.width(), image.height()),
+            }])
+        }
+    }
+
+    #[test]
+    fn public_hall_detection_owns_f2_ocr_and_primary_recovery_in_one_operation() {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.hall.page_settle_ms = 0;
+        config.timing.hall.ocr_sample_interval_ms = 0;
+        config.timing.workflow.default_timeout_ms = 200;
+        config.timing.workflow.default_poll_ms = 1;
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let drags = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            HallDevice {
+                frame: primary_frame(&config),
+                keys: keys.clone(),
+                drags: drags.clone(),
+            },
+            &config,
+        );
+        let ocr_runtime = OcrRuntime::start(
+            HallOcrDevice {
+                member_count: "大厅人数 8/12",
+            },
+            4,
+        )
+        .unwrap();
+        let hall_ui = HallUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            HallRoutineConfig::from_app(&config),
+        );
+
+        let outcome = hall_ui
+            .submit_detect(DetectPublicHall)
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(matches!(
+            outcome.effect(),
+            DetectPublicHallEffect::Detected {
+                is_public: true,
+                ..
+            }
+        ));
+        assert!(
+            matches!(
+                outcome.residency(),
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+            ),
+            "{:?}",
+            outcome.residency()
+        );
+        assert_eq!(*keys.lock().unwrap(), [Key::F2, Key::Escape]);
+        assert_eq!(
+            *drags.lock().unwrap(),
+            [(1240, 910, 1240, 160), (1240, 160, 1240, 910)]
+        );
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hall_screenshot_stacks_the_list_top_above_the_scrolled_bottom() {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.hall.page_settle_ms = 0;
+        config.timing.hall.ocr_sample_interval_ms = 0;
+        config.timing.workflow.default_timeout_ms = 200;
+        config.timing.workflow.default_poll_ms = 1;
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let drags = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            HallDevice {
+                frame: primary_frame(&config),
+                keys,
+                drags: drags.clone(),
+            },
+            &config,
+        );
+        let ocr_runtime = OcrRuntime::start(
+            HallOcrDevice {
+                member_count: "大厅人数 8/12",
+            },
+            4,
+        )
+        .unwrap();
+        let hall_ui = HallUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            HallRoutineConfig::from_app(&config),
+        );
+
+        let outcome = hall_ui.submit_read(ReadHallInfo).unwrap().wait().unwrap();
+        let screenshot = outcome.screenshot().expect("hall screenshot").to_rgba8();
+
+        assert_eq!(
+            (screenshot.width(), screenshot.height()),
+            (
+                config.screen.expected_width,
+                config.screen.expected_height * 2
+            )
+        );
+        // HallDevice 把“上拖那帧”（列表更靠下）标红、“拖回那帧”（列表更靠上）标绿；
+        // 拼接后上半必须是靠上的帧，下半才是滚动后的帧。
+        assert_eq!(*screenshot.get_pixel(0, 0), Rgba([0, 255, 0, 255]));
+        assert_eq!(
+            *screenshot.get_pixel(0, config.screen.expected_height),
+            Rgba([255, 0, 0, 255])
+        );
+        assert_eq!(
+            *drags.lock().unwrap(),
+            [(1240, 910, 1240, 160), (1240, 160, 1240, 910)]
+        );
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hall_screenshot_skips_black_entry_frames_and_waits_for_primary_after_exit() {
+        assert_hall_transition_outcome(false);
+    }
+
+    #[test]
+    fn hall_screenshot_failure_after_black_frames_still_recovers_primary() {
+        assert_hall_transition_outcome(true);
+    }
+
+    fn assert_hall_transition_outcome(fail_entry_capture: bool) {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.hall.page_settle_ms = 0;
+        config.timing.hall.ocr_sample_interval_ms = 0;
+        config.timing.workflow.default_timeout_ms = 5_000;
+        config.timing.workflow.default_poll_ms = 1;
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            TransitionHallDevice {
+                primary: primary_frame(&config),
+                loading: loading_frame(&config),
+                keys: keys.clone(),
+                fail_entry_capture,
+                captures_after_f2: 0,
+                captures_after_escape: 0,
+            },
+            &config,
+        );
+        let ocr_runtime = OcrRuntime::start(
+            HallOcrDevice {
+                member_count: "大厅人数 3/12",
+            },
+            4,
+        )
+        .unwrap();
+        let hall_ui = HallUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            HallRoutineConfig::from_app(&config),
+        );
+
+        let outcome = hall_ui.submit_read(ReadHallInfo).unwrap().wait().unwrap();
+
+        if fail_entry_capture {
+            assert!(matches!(outcome.effect(), ReadHallInfoEffect::Failed(_)));
+            assert!(outcome.screenshot().is_none());
+        } else {
+            assert!(matches!(outcome.effect(), ReadHallInfoEffect::Read(_)));
+            assert_eq!(
+                outcome
+                    .screenshot()
+                    .expect("visible hall screenshot")
+                    .to_rgba8(),
+                primary_frame(&config).to_rgba8()
+            );
+        }
+        assert!(
+            matches!(
+                outcome.residency(),
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+            ),
+            "{:?}",
+            outcome.residency()
+        );
+        assert_eq!(*keys.lock().unwrap(), [Key::F2, Key::Escape]);
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    /// 真实一级（千星大厅）截图。合成黑底帧会被状态机的 loading 判据吞掉
+    /// （`src/ui/state.rs` 第 55 节），改用实际执行路径上的真帧。
+    fn primary_frame(config: &AppConfig) -> DynamicImage {
+        let frame = image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg")
+            .expect("打开真实大厅帧失败");
+        assert_eq!(
+            (frame.width(), frame.height()),
+            (config.screen.expected_width, config.screen.expected_height),
+            "真实大厅帧尺寸必须与配置画布一致"
+        );
+        frame
+    }
+
+    /// 真实过场（暗色加载屏）截图：F2/ESC 之后画面进入加载的过渡态，
+    /// 状态机的 loading 判据会命中它——这正是例程必须跳过并等待的帧。
+    fn loading_frame(config: &AppConfig) -> DynamicImage {
+        let frame = image::open("tests/fixtures/ui/loading-dark-1920x1080.jpg")
+            .expect("打开真实过场帧失败");
+        assert_eq!(
+            (frame.width(), frame.height()),
+            (config.screen.expected_width, config.screen.expected_height),
+            "真实过场帧尺寸必须与配置画布一致"
+        );
+        frame
+    }
+}

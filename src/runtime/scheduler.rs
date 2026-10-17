@@ -1,0 +1,1092 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+
+const MAX_TASK_RECORDS: usize = 60;
+const MAX_FORMAL_TERMINAL_STATUSES: usize = 1000;
+const MAX_TASK_RESULT_CHARS: usize = 4 * 1024;
+const MAX_DIAGNOSTIC_RECORDS: usize = 30;
+const MAX_QUEUED_DIAGNOSTICS: usize = 10;
+const MAX_DIAGNOSTIC_RESULT_CHARS: usize = 48 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FormalTaskDedupKey(String);
+
+impl FormalTaskDedupKey {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+pub(crate) trait FormalTaskWork: Send {
+    fn execute(
+        self: Box<Self>,
+        cancellation: FormalTaskCancellationToken,
+    ) -> FormalTaskExecutionOutcome;
+
+    fn cancel(self: Box<Self>);
+}
+
+pub(crate) enum FormalTaskExecutionOutcome {
+    Completed(anyhow::Result<String>),
+    Canceled(String),
+}
+
+pub(crate) trait DiagnosticTaskWork: Send {
+    fn execute(self: Box<Self>) -> anyhow::Result<String>;
+}
+
+pub(crate) struct DiagnosticTaskSubmission {
+    label: String,
+    work: Box<dyn DiagnosticTaskWork>,
+}
+
+impl DiagnosticTaskSubmission {
+    pub(crate) fn new(label: impl Into<String>, work: Box<dyn DiagnosticTaskWork>) -> Self {
+        Self {
+            label: label.into(),
+            work,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DiagnosticTaskSnapshot {
+    pub(crate) id: u64,
+    pub(crate) label: String,
+    pub(crate) status: String,
+    pub(crate) result: Option<String>,
+}
+
+struct DiagnosticTaskRecord {
+    id: u64,
+    label: String,
+    status: &'static str,
+    result: Option<String>,
+}
+
+struct QueuedDiagnosticTask {
+    id: u64,
+    label: String,
+    work: Box<dyn DiagnosticTaskWork>,
+}
+
+pub(crate) struct DiagnosticTaskLease {
+    id: u64,
+    label: String,
+    work: Box<dyn DiagnosticTaskWork>,
+}
+
+impl DiagnosticTaskLease {
+    pub(crate) const fn task_id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn execute(self) -> anyhow::Result<String> {
+        self.work.execute()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DiagnosticTaskCompletion {
+    Succeeded(String),
+    Failed(String),
+}
+
+pub(crate) struct FormalTaskSubmission {
+    label: String,
+    dedup_key: Option<FormalTaskDedupKey>,
+    playback_related: bool,
+    work: Box<dyn FormalTaskWork>,
+}
+
+impl FormalTaskSubmission {
+    pub(crate) fn new(
+        label: impl Into<String>,
+        dedup_key: Option<FormalTaskDedupKey>,
+        playback_related: bool,
+        work: Box<dyn FormalTaskWork>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            dedup_key,
+            playback_related,
+            work,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FormalTaskReceipt {
+    pub(crate) task_id: u64,
+    pub(crate) position: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FormalTaskEnqueueOutcome {
+    Queued(FormalTaskReceipt),
+    Duplicate,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FormalSchedulerSnapshot {
+    pending_labels: Vec<String>,
+    tasks: Vec<FormalTaskSnapshot>,
+    active_lane: Option<SchedulerLane>,
+    formal_epoch: u64,
+    pending_playback_related: bool,
+    pending_diagnostic: bool,
+    pending_deferred: bool,
+}
+
+impl FormalSchedulerSnapshot {
+    pub(crate) fn pending_labels(&self) -> &[String] {
+        &self.pending_labels
+    }
+
+    pub(crate) fn tasks(&self) -> &[FormalTaskSnapshot] {
+        &self.tasks
+    }
+
+    pub(crate) const fn is_busy(&self) -> bool {
+        self.active_lane.is_some()
+    }
+
+    pub(crate) const fn formal_epoch(&self) -> u64 {
+        self.formal_epoch
+    }
+
+    pub(crate) const fn formal_busy(&self) -> bool {
+        matches!(self.active_lane, Some(SchedulerLane::Formal)) || !self.pending_labels.is_empty()
+    }
+
+    pub(crate) const fn is_idle(&self) -> bool {
+        self.active_lane.is_none()
+            && self.pending_labels.is_empty()
+            && !self.pending_diagnostic
+            && !self.pending_deferred
+    }
+
+    pub(crate) const fn pending_playback_related(&self) -> bool {
+        self.pending_playback_related
+    }
+
+    pub(crate) const fn with_pending_deferred(mut self, pending: bool) -> Self {
+        self.pending_deferred = pending;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FormalTaskSnapshot {
+    pub(crate) id: u64,
+    pub(crate) label: String,
+    pub(crate) status: String,
+    pub(crate) queued_at_ms: u64,
+    pub(crate) started_at_ms: Option<u64>,
+    pub(crate) finished_at_ms: Option<u64>,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) cancellation_requested: bool,
+    pub(crate) result: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FormalTaskRecord {
+    id: u64,
+    label: String,
+    status: &'static str,
+    queued_at_ms: u64,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+    cancellation_requested: bool,
+    result: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FormalTaskCancellationToken {
+    requested: Arc<AtomicBool>,
+}
+
+impl FormalTaskCancellationToken {
+    pub(crate) fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
+struct QueuedFormalTask {
+    id: u64,
+    label: String,
+    dedup_key: Option<FormalTaskDedupKey>,
+    playback_related: bool,
+    cancellation: FormalTaskCancellationToken,
+    work: Box<dyn FormalTaskWork>,
+}
+
+pub(crate) struct FormalTaskLease {
+    id: u64,
+    label: String,
+    dedup_key: Option<FormalTaskDedupKey>,
+    playback_related: bool,
+    cancellation: FormalTaskCancellationToken,
+    work: Box<dyn FormalTaskWork>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SchedulerLane {
+    Formal,
+    Deferred,
+    Diagnostic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SchedulerLaneLease {
+    id: u64,
+    lane: SchedulerLane,
+}
+
+enum ActiveSchedulerWork {
+    Formal {
+        id: u64,
+        label: String,
+        cancellation: FormalTaskCancellationToken,
+    },
+    External(SchedulerLaneLease),
+    Diagnostic {
+        id: u64,
+    },
+}
+
+impl FormalTaskLease {
+    pub(crate) const fn task_id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn execute(self) -> FormalTaskExecutionOutcome {
+        if self.cancellation.is_requested() {
+            self.work.cancel();
+            return FormalTaskExecutionOutcome::Canceled(
+                "任务在开始执行前收到取消请求".to_string(),
+            );
+        }
+        self.work.execute(self.cancellation)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FormalTaskCompletion {
+    Succeeded(String),
+    Failed(String),
+    Canceled(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FormalTaskCancelOutcome {
+    CanceledBeforeStart,
+    CancellationRequested,
+    AlreadyFinished,
+    NotFound,
+}
+
+pub(crate) enum FormalTaskCancelAction {
+    CanceledBeforeStart(Box<dyn FormalTaskWork>),
+    CancellationRequested,
+    AlreadyFinished,
+    NotFound,
+}
+
+pub(crate) struct FormalTaskShutdownPlan {
+    queued: Vec<Box<dyn FormalTaskWork>>,
+    active_task_id: Option<u64>,
+}
+
+impl FormalTaskShutdownPlan {
+    pub(crate) fn cancel_queued(self) {
+        for work in self.queued {
+            work.cancel();
+        }
+    }
+
+    pub(crate) const fn active_task_id(&self) -> Option<u64> {
+        self.active_task_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FormalSchedulerError(String);
+
+impl std::fmt::Display for FormalSchedulerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+pub(crate) struct FormalScheduler {
+    next_id: u64,
+    next_lane_lease_id: u64,
+    formal_epoch: u64,
+    queued: VecDeque<QueuedFormalTask>,
+    active: Option<ActiveSchedulerWork>,
+    records: VecDeque<FormalTaskRecord>,
+    // 正式状态源独立于人的展示窗口；未完成任务不参与终态容量淘汰。
+    formal_records: BTreeMap<u64, FormalTaskRecord>,
+    formal_terminal_ids: VecDeque<u64>,
+    dropped_formal_statuses: u64,
+    diagnostic_queued: VecDeque<QueuedDiagnosticTask>,
+    diagnostic_records: VecDeque<DiagnosticTaskRecord>,
+    accepting: bool,
+}
+
+impl FormalScheduler {
+    pub(crate) fn new() -> Self {
+        Self {
+            next_id: 1,
+            next_lane_lease_id: 1,
+            formal_epoch: 0,
+            queued: VecDeque::new(),
+            active: None,
+            records: VecDeque::new(),
+            formal_records: BTreeMap::new(),
+            formal_terminal_ids: VecDeque::new(),
+            dropped_formal_statuses: 0,
+            diagnostic_queued: VecDeque::new(),
+            diagnostic_records: VecDeque::new(),
+            accepting: true,
+        }
+    }
+
+    pub(crate) fn enqueue_diagnostic(
+        &mut self,
+        submission: DiagnosticTaskSubmission,
+    ) -> Result<DiagnosticTaskSnapshot, FormalSchedulerError> {
+        if !self.accepting {
+            return Err(FormalSchedulerError(
+                "正式任务运行时正在关闭，不能再接收 Web 工具任务".to_string(),
+            ));
+        }
+        if self.diagnostic_queued.len() >= MAX_QUEUED_DIAGNOSTICS {
+            return Err(FormalSchedulerError(
+                "Web 工具任务过多，请等待现有任务完成".to_string(),
+            ));
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let label = submission.label;
+        self.diagnostic_queued.push_back(QueuedDiagnosticTask {
+            id,
+            label: label.clone(),
+            work: submission.work,
+        });
+        self.diagnostic_records.push_front(DiagnosticTaskRecord {
+            id,
+            label: label.clone(),
+            status: "queued",
+            result: None,
+        });
+        trim_diagnostic_records(&mut self.diagnostic_records);
+        Ok(DiagnosticTaskSnapshot {
+            id,
+            label,
+            status: "queued".to_string(),
+            result: None,
+        })
+    }
+
+    pub(crate) fn take_next_diagnostic(&mut self) -> Option<DiagnosticTaskLease> {
+        if self.active.is_some() || !self.queued.is_empty() {
+            return None;
+        }
+        let task = self.diagnostic_queued.pop_front()?;
+        self.active = Some(ActiveSchedulerWork::Diagnostic { id: task.id });
+        if let Some(record) = self
+            .diagnostic_records
+            .iter_mut()
+            .find(|record| record.id == task.id)
+        {
+            record.status = "running";
+        }
+        Some(DiagnosticTaskLease {
+            id: task.id,
+            label: task.label,
+            work: task.work,
+        })
+    }
+
+    pub(crate) fn complete_diagnostic(
+        &mut self,
+        task_id: u64,
+        completion: DiagnosticTaskCompletion,
+    ) -> Result<(), FormalSchedulerError> {
+        match self.active.as_ref() {
+            Some(ActiveSchedulerWork::Diagnostic { id, .. }) if *id == task_id => {}
+            Some(ActiveSchedulerWork::Diagnostic { id, .. }) => {
+                return Err(FormalSchedulerError(format!(
+                    "诊断任务完成顺序不一致: active={id} actual={task_id}"
+                )));
+            }
+            Some(_) => {
+                return Err(FormalSchedulerError(format!(
+                    "其他调度通道仍在执行，不能完成诊断任务: task_id={task_id}"
+                )));
+            }
+            None => {
+                return Err(FormalSchedulerError(format!(
+                    "诊断任务没有活动租约: task_id={task_id}"
+                )));
+            }
+        }
+        self.active = None;
+        if let Some(record) = self
+            .diagnostic_records
+            .iter_mut()
+            .find(|record| record.id == task_id)
+        {
+            match completion {
+                DiagnosticTaskCompletion::Succeeded(result) => {
+                    record.status = "completed";
+                    record.result = Some(limit_diagnostic_result(result));
+                }
+                DiagnosticTaskCompletion::Failed(error) => {
+                    record.status = "failed";
+                    record.result = Some(limit_diagnostic_result(format!("错误: {error}")));
+                }
+            }
+        }
+        trim_diagnostic_records(&mut self.diagnostic_records);
+        Ok(())
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> Vec<DiagnosticTaskSnapshot> {
+        self.diagnostic_records
+            .iter()
+            .take(8)
+            .map(|record| DiagnosticTaskSnapshot {
+                id: record.id,
+                label: record.label.clone(),
+                status: record.status.to_string(),
+                result: record.result.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn diagnostic_task_snapshot(&self, id: u64) -> Option<DiagnosticTaskSnapshot> {
+        self.diagnostic_records
+            .iter()
+            .find(|record| record.id == id)
+            .map(|record| DiagnosticTaskSnapshot {
+                id: record.id,
+                label: record.label.clone(),
+                status: record.status.to_string(),
+                result: record.result.clone(),
+            })
+    }
+
+    pub(crate) fn enqueue(
+        &mut self,
+        submission: FormalTaskSubmission,
+    ) -> Result<FormalTaskEnqueueOutcome, FormalSchedulerError> {
+        if !self.accepting {
+            return Err(FormalSchedulerError(
+                "正式任务运行时正在关闭，不能再接收任务".to_string(),
+            ));
+        }
+        if submission.dedup_key.as_ref().is_some_and(|key| {
+            self.queued
+                .iter()
+                .any(|task| task.dedup_key.as_ref() == Some(key))
+        }) {
+            return Ok(FormalTaskEnqueueOutcome::Duplicate);
+        }
+
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.formal_epoch = self.formal_epoch.wrapping_add(1).max(1);
+        let label = submission.label;
+        self.queued.push_back(QueuedFormalTask {
+            id,
+            label: label.clone(),
+            dedup_key: submission.dedup_key,
+            playback_related: submission.playback_related,
+            cancellation: FormalTaskCancellationToken::default(),
+            work: submission.work,
+        });
+        let record = FormalTaskRecord {
+            id,
+            label,
+            status: "queued",
+            queued_at_ms: current_unix_millis(),
+            started_at_ms: None,
+            finished_at_ms: None,
+            cancellation_requested: false,
+            result: None,
+        };
+        self.formal_records.insert(id, record.clone());
+        self.records.push_front(record);
+        trim_records(&mut self.records);
+        Ok(FormalTaskEnqueueOutcome::Queued(FormalTaskReceipt {
+            task_id: id,
+            position: self.queued.len(),
+        }))
+    }
+
+    pub(crate) fn snapshot(&self) -> FormalSchedulerSnapshot {
+        let now = current_unix_millis();
+        FormalSchedulerSnapshot {
+            pending_labels: self.queued.iter().map(|task| task.label.clone()).collect(),
+            tasks: self
+                .records
+                .iter()
+                .take(30)
+                .map(|record| record_snapshot(record, now))
+                .collect(),
+            active_lane: self.active.as_ref().map(|active| match active {
+                ActiveSchedulerWork::Formal { .. } => SchedulerLane::Formal,
+                ActiveSchedulerWork::External(lease) => lease.lane,
+                ActiveSchedulerWork::Diagnostic { .. } => SchedulerLane::Diagnostic,
+            }),
+            formal_epoch: self.formal_epoch,
+            pending_playback_related: self.queued.iter().any(|task| task.playback_related),
+            pending_diagnostic: !self.diagnostic_queued.is_empty(),
+            pending_deferred: false,
+        }
+    }
+
+    /// 全部未完成正式任务及最近完成的有界终态，不受展示窗口限制。
+    pub(crate) fn formal_statuses(&self) -> Vec<FormalTaskSnapshot> {
+        let now = current_unix_millis();
+        self.formal_records
+            .values()
+            .rev()
+            .map(|record| record_snapshot(record, now))
+            .collect()
+    }
+
+    pub(crate) fn formal_task_snapshot(&self, id: u64) -> Option<FormalTaskSnapshot> {
+        self.formal_records
+            .get(&id)
+            .map(|record| record_snapshot(record, current_unix_millis()))
+    }
+
+    pub(crate) const fn dropped_formal_statuses(&self) -> u64 {
+        self.dropped_formal_statuses
+    }
+
+    pub(crate) fn contains_dedup_key(&self, key: &FormalTaskDedupKey) -> bool {
+        self.queued
+            .iter()
+            .any(|task| task.dedup_key.as_ref() == Some(key))
+    }
+
+    pub(crate) fn take_next(&mut self) -> Option<FormalTaskLease> {
+        if self.active.is_some() {
+            return None;
+        }
+        let queued = self.queued.pop_front()?;
+        self.active = Some(ActiveSchedulerWork::Formal {
+            id: queued.id,
+            label: queued.label.clone(),
+            cancellation: queued.cancellation.clone(),
+        });
+        self.update_record(queued.id, |record| {
+            record.status = "running";
+            record.started_at_ms = Some(current_unix_millis());
+            record.finished_at_ms = None;
+            record.result = None;
+        });
+        Some(FormalTaskLease {
+            id: queued.id,
+            label: queued.label,
+            dedup_key: queued.dedup_key,
+            playback_related: queued.playback_related,
+            cancellation: queued.cancellation,
+            work: queued.work,
+        })
+    }
+
+    pub(crate) fn restore(&mut self, lease: FormalTaskLease) -> Result<(), FormalSchedulerError> {
+        self.require_active(lease.id)?;
+        self.active = None;
+        self.update_record(lease.id, |record| {
+            record.status = "queued";
+            record.started_at_ms = None;
+            record.finished_at_ms = None;
+            record.result = None;
+        });
+        self.queued.push_front(QueuedFormalTask {
+            id: lease.id,
+            label: lease.label,
+            dedup_key: lease.dedup_key,
+            playback_related: lease.playback_related,
+            cancellation: lease.cancellation,
+            work: lease.work,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn complete(
+        &mut self,
+        task_id: u64,
+        completion: FormalTaskCompletion,
+    ) -> Result<(), FormalSchedulerError> {
+        self.require_active(task_id)?;
+        self.active = None;
+        self.update_record(task_id, |record| {
+            record.finished_at_ms = Some(current_unix_millis());
+            match completion {
+                FormalTaskCompletion::Succeeded(result) => {
+                    record.status = "completed";
+                    record.result = Some(limit_result(result));
+                }
+                FormalTaskCompletion::Failed(error) => {
+                    record.status = "failed";
+                    record.result = Some(limit_result(error));
+                }
+                FormalTaskCompletion::Canceled(reason) => {
+                    record.status = "canceled";
+                    record.result = Some(limit_result(reason));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    pub(crate) fn cancel(&mut self, task_id: u64) -> FormalTaskCancelAction {
+        if let Some(index) = self.queued.iter().position(|task| task.id == task_id) {
+            let task = self
+                .queued
+                .remove(index)
+                .expect("queued task index was found");
+            self.update_record(task_id, |record| {
+                record.status = "canceled";
+                record.finished_at_ms = Some(current_unix_millis());
+                record.result = Some("任务已在执行前取消".to_string());
+            });
+            return FormalTaskCancelAction::CanceledBeforeStart(task.work);
+        }
+        if let Some(ActiveSchedulerWork::Formal {
+            id, cancellation, ..
+        }) = self.active.as_ref()
+            && *id == task_id
+        {
+            cancellation.request();
+            self.update_record(task_id, |record| {
+                record.cancellation_requested = true;
+            });
+            return FormalTaskCancelAction::CancellationRequested;
+        }
+        if self.records.iter().any(|record| record.id == task_id) {
+            FormalTaskCancelAction::AlreadyFinished
+        } else {
+            FormalTaskCancelAction::NotFound
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&mut self) -> FormalTaskShutdownPlan {
+        self.accepting = false;
+        let mut queued = Vec::with_capacity(self.queued.len());
+        while let Some(task) = self.queued.pop_front() {
+            self.update_record(task.id, |record| {
+                record.status = "canceled";
+                record.finished_at_ms = Some(current_unix_millis());
+                record.result = Some("应用关闭，任务已在执行前取消".to_string());
+            });
+            queued.push(task.work);
+        }
+        let active_task_id = match self.active.as_ref() {
+            Some(ActiveSchedulerWork::Formal {
+                id, cancellation, ..
+            }) => {
+                let id = *id;
+                cancellation.request();
+                self.update_record(id, |record| {
+                    record.cancellation_requested = true;
+                });
+                Some(id)
+            }
+            _ => None,
+        };
+        while let Some(task) = self.diagnostic_queued.pop_front() {
+            if let Some(record) = self
+                .diagnostic_records
+                .iter_mut()
+                .find(|record| record.id == task.id)
+            {
+                record.status = "canceled";
+                record.result = Some("应用关闭，任务未执行".to_string());
+            }
+        }
+        FormalTaskShutdownPlan {
+            queued,
+            active_task_id,
+        }
+    }
+
+    pub(crate) fn try_acquire_lane(
+        &mut self,
+        lane: SchedulerLane,
+    ) -> Result<Option<SchedulerLaneLease>, FormalSchedulerError> {
+        if lane == SchedulerLane::Formal {
+            return Err(FormalSchedulerError(
+                "正式通道只能通过正式任务租约取得".to_string(),
+            ));
+        }
+        if self.active.is_some() || !self.queued.is_empty() {
+            return Ok(None);
+        }
+        let lease = SchedulerLaneLease {
+            id: self.next_lane_lease_id,
+            lane,
+        };
+        self.next_lane_lease_id = self.next_lane_lease_id.wrapping_add(1).max(1);
+        self.active = Some(ActiveSchedulerWork::External(lease));
+        Ok(Some(lease))
+    }
+
+    pub(crate) fn release_lane(
+        &mut self,
+        lease: SchedulerLaneLease,
+    ) -> Result<(), FormalSchedulerError> {
+        match self.active.as_ref() {
+            Some(ActiveSchedulerWork::External(active)) if *active == lease => {
+                self.active = None;
+                Ok(())
+            }
+            Some(ActiveSchedulerWork::External(active)) => Err(FormalSchedulerError(format!(
+                "调度通道租约不一致: active={active:?} actual={lease:?}"
+            ))),
+            Some(ActiveSchedulerWork::Formal { id, label, .. }) => Err(FormalSchedulerError(
+                format!("正式任务仍在执行，不能释放外部通道: active={id}:{label}"),
+            )),
+            Some(ActiveSchedulerWork::Diagnostic { id, .. }) => Err(FormalSchedulerError(format!(
+                "诊断任务仍在执行，不能释放外部通道: active={id}"
+            ))),
+            None => Err(FormalSchedulerError(format!(
+                "调度通道没有活动租约: actual={lease:?}"
+            ))),
+        }
+    }
+
+    fn require_active(&self, task_id: u64) -> Result<(), FormalSchedulerError> {
+        match self.active.as_ref() {
+            Some(ActiveSchedulerWork::Formal { id, .. }) if *id == task_id => Ok(()),
+            Some(ActiveSchedulerWork::Formal {
+                id: active_id,
+                label,
+                ..
+            }) => Err(FormalSchedulerError(format!(
+                "正式任务完成顺序不一致: active={active_id}:{label} actual={task_id}"
+            ))),
+            Some(ActiveSchedulerWork::External(lease)) => Err(FormalSchedulerError(format!(
+                "外部调度通道仍在执行，不能完成正式任务: active={lease:?} actual={task_id}"
+            ))),
+            Some(ActiveSchedulerWork::Diagnostic { id, .. }) => Err(FormalSchedulerError(format!(
+                "诊断任务仍在执行，不能完成正式任务: active={id} actual={task_id}"
+            ))),
+            None => Err(FormalSchedulerError(format!(
+                "正式任务没有活动租约: task_id={task_id}"
+            ))),
+        }
+    }
+
+    fn update_record(&mut self, id: u64, update: impl FnOnce(&mut FormalTaskRecord)) {
+        let Some(record) = self.formal_records.get_mut(&id) else {
+            log::warn!("正式任务追踪记录不存在: id={id}");
+            return;
+        };
+        let was_terminal = record.finished_at_ms.is_some();
+        update(record);
+        let became_terminal = !was_terminal && record.finished_at_ms.is_some();
+        if let Some(display_record) = self.records.iter_mut().find(|record| record.id == id) {
+            *display_record = record.clone();
+        }
+        trim_records(&mut self.records);
+        if became_terminal {
+            self.formal_terminal_ids.push_back(id);
+            // 按完成顺序保留终态：很早入队但刚完成的任务仍可查询。
+            while self.formal_terminal_ids.len() > MAX_FORMAL_TERMINAL_STATUSES {
+                let expired = self
+                    .formal_terminal_ids
+                    .pop_front()
+                    .expect("terminal exists");
+                self.formal_records.remove(&expired);
+                self.dropped_formal_statuses = self.dropped_formal_statuses.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn record_snapshot(record: &FormalTaskRecord, now: u64) -> FormalTaskSnapshot {
+    let elapsed_ms = record.started_at_ms.map_or(0, |started_at| {
+        record
+            .finished_at_ms
+            .unwrap_or(now)
+            .saturating_sub(started_at)
+    });
+    FormalTaskSnapshot {
+        id: record.id,
+        label: record.label.clone(),
+        status: record.status.to_string(),
+        queued_at_ms: record.queued_at_ms,
+        started_at_ms: record.started_at_ms,
+        finished_at_ms: record.finished_at_ms,
+        elapsed_ms,
+        cancellation_requested: record.cancellation_requested,
+        result: record.result.clone(),
+    }
+}
+
+fn trim_records(records: &mut VecDeque<FormalTaskRecord>) {
+    while records.len() > MAX_TASK_RECORDS {
+        let can_drop = records
+            .back()
+            .is_some_and(|record| record.status != "queued" && record.status != "running");
+        if !can_drop {
+            break;
+        }
+        records.pop_back();
+    }
+}
+
+fn limit_result(value: String) -> String {
+    if value.chars().count() <= MAX_TASK_RESULT_CHARS {
+        return value;
+    }
+    format!(
+        "{}\n[任务结果过长，已截断]",
+        value
+            .chars()
+            .take(MAX_TASK_RESULT_CHARS)
+            .collect::<String>()
+    )
+}
+
+fn trim_diagnostic_records(records: &mut VecDeque<DiagnosticTaskRecord>) {
+    while records.len() > MAX_DIAGNOSTIC_RECORDS {
+        let can_drop = records
+            .back()
+            .is_some_and(|record| record.status != "queued" && record.status != "running");
+        if !can_drop {
+            break;
+        }
+        records.pop_back();
+    }
+}
+
+fn limit_diagnostic_result(value: String) -> String {
+    let char_count = value.chars().count();
+    if char_count <= MAX_DIAGNOSTIC_RESULT_CHARS {
+        return value;
+    }
+    format!(
+        "{}\n\n[结果过长，已截断：原始字符数={char_count}]",
+        value
+            .chars()
+            .take(MAX_DIAGNOSTIC_RESULT_CHARS)
+            .collect::<String>()
+    )
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopWork;
+
+    impl FormalTaskWork for NoopWork {
+        fn execute(
+            self: Box<Self>,
+            _cancellation: FormalTaskCancellationToken,
+        ) -> FormalTaskExecutionOutcome {
+            FormalTaskExecutionOutcome::Completed(Ok("done".to_string()))
+        }
+
+        fn cancel(self: Box<Self>) {}
+    }
+
+    fn submission(label: &str, dedup_key: Option<&str>) -> FormalTaskSubmission {
+        FormalTaskSubmission::new(
+            label,
+            dedup_key.map(FormalTaskDedupKey::new),
+            false,
+            Box::new(NoopWork),
+        )
+    }
+
+    #[test]
+    fn enqueue_deduplicates_queued_tasks_sharing_a_dedup_key() {
+        let mut scheduler = FormalScheduler::new();
+
+        let first = scheduler
+            .enqueue(submission("自动出队(a)", Some("playback_advance_queue")))
+            .expect("first advance queue enqueues");
+        assert!(matches!(first, FormalTaskEnqueueOutcome::Queued(_)));
+
+        // 相同去重键再次入队被拒绝，待执行范围内只保留一个推进任务。
+        let duplicate = scheduler
+            .enqueue(submission("自动出队(b)", Some("playback_advance_queue")))
+            .expect("duplicate key reports outcome");
+        assert_eq!(duplicate, FormalTaskEnqueueOutcome::Duplicate);
+        assert_eq!(scheduler.snapshot().pending_labels().len(), 1);
+
+        // 无去重键或不同键的任务不受影响。
+        let other = scheduler
+            .enqueue(submission("普通任务", None))
+            .expect("no-key task enqueues");
+        assert!(matches!(other, FormalTaskEnqueueOutcome::Queued(_)));
+        let different = scheduler
+            .enqueue(submission("自动出队", Some("other_key")))
+            .expect("different key enqueues");
+        assert!(matches!(different, FormalTaskEnqueueOutcome::Queued(_)));
+        assert_eq!(scheduler.snapshot().pending_labels().len(), 3);
+    }
+
+    #[test]
+    fn completed_task_releases_its_dedup_key() {
+        let mut scheduler = FormalScheduler::new();
+        let receipt = match scheduler
+            .enqueue(submission("自动出队", Some("playback_advance_queue")))
+            .expect("first enqueue")
+        {
+            FormalTaskEnqueueOutcome::Queued(receipt) => receipt,
+            FormalTaskEnqueueOutcome::Duplicate => panic!("first enqueue must queue"),
+        };
+
+        let lease = scheduler.take_next().expect("queued task lease");
+        scheduler
+            .complete(
+                receipt.task_id,
+                FormalTaskCompletion::Succeeded("ok".to_string()),
+            )
+            .expect("complete active task");
+        drop(lease);
+
+        // 执行完成后相同键可以再次入队。
+        let again = scheduler
+            .enqueue(submission("自动出队", Some("playback_advance_queue")))
+            .expect("re-enqueue after completion");
+        assert!(matches!(again, FormalTaskEnqueueOutcome::Queued(_)));
+    }
+
+    #[test]
+    fn formal_statuses_keep_all_unfinished_tasks_and_bound_terminals_by_completion() {
+        let mut scheduler = FormalScheduler::new();
+        scheduler.enqueue(submission("old running", None)).unwrap();
+        let old = scheduler.take_next().unwrap();
+        let mut queued_ids = Vec::new();
+        for _ in 0..1200 {
+            let FormalTaskEnqueueOutcome::Queued(receipt) =
+                scheduler.enqueue(submission("new queued", None)).unwrap()
+            else {
+                panic!("task should queue");
+            };
+            queued_ids.push(receipt.task_id);
+        }
+        assert_eq!(scheduler.snapshot().pending_labels().len(), 1200);
+        assert_eq!(scheduler.snapshot().tasks().len(), 30);
+        assert_eq!(scheduler.formal_statuses().len(), 1201);
+
+        for id in queued_ids.iter().take(1001) {
+            assert!(matches!(
+                scheduler.cancel(*id),
+                FormalTaskCancelAction::CanceledBeforeStart(_)
+            ));
+        }
+        assert_eq!(scheduler.dropped_formal_statuses(), 1);
+        assert!(scheduler.formal_task_snapshot(queued_ids[0]).is_none());
+        // Existing cancellation semantics still use the separate display history.
+        assert!(matches!(
+            scheduler.cancel(queued_ids[0]),
+            FormalTaskCancelAction::AlreadyFinished
+        ));
+        assert_eq!(scheduler.formal_statuses().len(), 1200);
+        assert_eq!(
+            scheduler
+                .formal_task_snapshot(old.task_id())
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(
+            scheduler
+                .formal_task_snapshot(queued_ids[1199])
+                .unwrap()
+                .status,
+            "queued"
+        );
+        assert_eq!(
+            scheduler
+                .formal_task_snapshot(queued_ids[1000])
+                .unwrap()
+                .status,
+            "canceled"
+        );
+
+        scheduler
+            .complete(
+                old.task_id(),
+                FormalTaskCompletion::Succeeded("old done".into()),
+            )
+            .unwrap();
+        assert_eq!(scheduler.dropped_formal_statuses(), 2);
+        assert!(scheduler.formal_task_snapshot(queued_ids[1]).is_none());
+        // Earliest enqueue is the newest terminal, so it stays queryable.
+        let terminal = scheduler.formal_task_snapshot(old.task_id()).unwrap();
+        assert_eq!(terminal.status, "completed");
+        assert_eq!(terminal.result.as_deref(), Some("old done"));
+        assert_eq!(
+            scheduler
+                .formal_statuses()
+                .iter()
+                .filter(|task| task.finished_at_ms.is_some())
+                .count(),
+            1000
+        );
+        assert_eq!(
+            scheduler
+                .formal_statuses()
+                .iter()
+                .filter(|task| task.status == "queued")
+                .count(),
+            199
+        );
+    }
+
+    #[test]
+    fn contains_dedup_key_reports_only_queued_tasks() {
+        let mut scheduler = FormalScheduler::new();
+        let key = FormalTaskDedupKey::new("playback_advance_queue");
+        assert!(!scheduler.contains_dedup_key(&key));
+
+        scheduler
+            .enqueue(submission("自动出队", Some("playback_advance_queue")))
+            .expect("enqueue");
+        assert!(scheduler.contains_dedup_key(&key));
+
+        // 任务进入执行后不再占用去重键，新推进任务仍可入队。
+        let _lease = scheduler.take_next().expect("task lease");
+        assert!(!scheduler.contains_dedup_key(&key));
+    }
+}

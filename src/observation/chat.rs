@@ -1,4 +1,6 @@
 pub(crate) mod scan;
+mod scan_gate;
+pub(crate) use scan_gate::PassiveScanGate;
 #[allow(dead_code)]
 pub(crate) mod freshness;
 mod passive;
@@ -38,7 +40,7 @@ pub(crate) use visual::{
 };
 pub(crate) use passive::{
     PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity,
-    parse_secondary_sender_identity, passive_layout, recognize_passive_secondary,
+    parse_secondary_sender_identity, passive_layout, passive_text, recognize_passive_secondary,
 };
 
 #[cfg(test)]

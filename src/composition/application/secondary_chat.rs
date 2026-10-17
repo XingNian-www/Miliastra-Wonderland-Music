@@ -180,10 +180,6 @@ impl SecondaryHallCommandTracker {
         })
     }
 
-    fn begin_scan(&mut self, now: Instant) {
-        self.last_scan_at = Some(now);
-    }
-
     fn snapshot(messages: &[SecondaryOcrMessage]) -> Vec<SecondaryHallCommandObservation> {
         messages
             .iter()
@@ -192,16 +188,6 @@ impl SecondaryHallCommandTracker {
                 secondary_hall_command_observation(message, messages.len() - 1 - index)
             })
             .collect()
-    }
-
-    fn snapshots_match(previous: &[SecondaryOcrMessage], current: &[SecondaryOcrMessage]) -> bool {
-        let previous = Self::snapshot(previous);
-        let current = Self::snapshot(current);
-        previous.len() == current.len()
-            && previous
-                .iter()
-                .zip(current.iter())
-                .all(|(left, right)| left.stable_with(right))
     }
 
     fn preview_new_indexes(&self, messages: &[SecondaryOcrMessage]) -> Vec<usize> {
@@ -241,13 +227,6 @@ impl SecondaryHallCommandTracker {
         self.visible = Self::snapshot(messages);
         self.initialized = true;
         self.visible_bubble_count = messages.len();
-    }
-
-    fn should_hold_incomplete(&self, messages: &[SecondaryOcrMessage], same_layout: bool) -> bool {
-        self.initialized
-            && same_layout
-            && messages.len() == self.visible_bubble_count
-            && Self::snapshot(messages).len() < self.visible.len()
     }
 }
 

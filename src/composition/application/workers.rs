@@ -769,12 +769,27 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
         status: PlayerStatus,
         context: QueueAdvanceContext,
     ) -> Result<QueueAdvanceDecision> {
+        // 开播回执已经立即发过了；这里只在**失败确认、要放弃当前曲目**时补一条错误回报。
+        // 失败信息要在把 status 交给控制器前先取出（状态会被消费）。
+        let failure = (!status.failure_code.trim().is_empty())
+            .then(|| (status.failure_code.clone(), status.failure_message.clone()));
         let decision = self.player.try_maybe_advance_queue(status, context)?;
         let pending_reload = self.live_configs.has_pending_reload();
-        Ok(suppress_automatic_advance_for_reload(
-            decision,
-            pending_reload,
-        ))
+        let decision = suppress_automatic_advance_for_reload(decision, pending_reload);
+        if let QueueAdvanceDecision::AdvanceQueue { reason } = &decision
+            && *reason == "播放失败"
+            && let Some((code, message)) = failure
+        {
+            let detail = if message.trim().is_empty() {
+                code
+            } else {
+                format!("{code}: {}", compact_failure_detail(&message))
+            };
+            if let Err(error) = self.reply(&format!("播放失败，已跳过当前歌曲（{detail}）")) {
+                log::warn!("发送播放失败回报失败: {error:#}");
+            }
+        }
+        Ok(decision)
     }
 
     fn enqueue_advance_queue(&mut self, reason: &'static str) -> Result<()> {
@@ -795,6 +810,16 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
         self.monitor
             .publish(MonitorEvent::PlaybackController(self.player.snapshot()));
     }
+}
+
+/// 失败回报里的引擎详情：折叠空白并截断，避免把整段错误/URI 塞进聊天。
+fn compact_failure_detail(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut truncated: String = compact.chars().take(120).collect();
+    if compact.chars().count() > 120 {
+        truncated.push('…');
+    }
+    truncated
 }
 
 /// 让播放控制器完成终态记录，但子进程等待重载期间不要将该状态转换为新的自动播放请求。

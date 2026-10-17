@@ -889,13 +889,14 @@ fn default_hall_bar_rect() -> RectConfig {
 }
 
 fn default_main_menu_rect() -> RectConfig {
-    // 收紧到按钮本身外扩约 20px：按钮在这批帧里位置固定，收紧既省掉
-    // 每个二级帧多付的模板匹配开销，也顺手降低了误报面。
+    // 按「返回提瓦特」整串文字外扩约 8px：模板本身只有这串字（137x25，不含定位图标），
+    // 搜索区必须能容纳整块模板，否则匹配器直接返回空、主菜单又会漏判。
+    // 上边界避开左侧图标，下边界停在 UID 行之前。
     RectConfig {
-        x: 1740,
-        y: 1005,
-        width: 100,
-        height: 40,
+        x: 1668,
+        y: 998,
+        width: 153,
+        height: 44,
     }
 }
 
@@ -1111,6 +1112,7 @@ pub struct ChatScanTimingConfig {
 impl Default for ChatScanTimingConfig {
     fn default() -> Self {
         Self {
+            // 门控阈值（6.0/0.03）吸收抖动后，低于阈值的真实变化只能靠这里兜底：2s 即其最大发现延迟。
             fallback_ms: 2000,
             change_debounce_ms: 120,
             change_cooldown_ms: 250,

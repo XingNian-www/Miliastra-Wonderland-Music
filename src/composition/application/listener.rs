@@ -11,6 +11,8 @@ const CHAT_LISTENER_RESIDENCY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CHAT_LISTENER_UNRESOLVED_UI_GRACE: Duration = Duration::from_secs(5);
 const CONFIG_RELOAD_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CONFIG_RELOAD_UI_FALLBACK_GRACE: Duration = Duration::from_secs(15);
+/// 等观察帧的切片长度：让主循环能在大约 25ms 内感知共享聊天发布并提前回顶部派发。
+const FRAME_WAIT_SLICE: Duration = Duration::from_millis(25);
 
 /// 排查日志用：折叠空白并截断，避免日志里塞入超长文本。
 fn compact_for_log(text: &str) -> String {
@@ -1059,12 +1061,43 @@ impl ApplicationRuntime {
 
             let mut listener_ready_evidence = None;
             let frame_started = Instant::now();
-            match receive_observation_frame(
-                frame_subscription
-                    .as_ref()
-                    .expect("frame subscription initialized above"),
-                &canvas,
-            ) {
+            // 等观察帧的同时，每 FRAME_WAIT_SLICE 检查共享聊天是否已发布新快照：
+            // 有就提前结束等待、回循环顶部派发，避免把 OCR→派发拖满一整轮。
+            let frame_deadline = frame_started + CONFIG_RELOAD_IDLE_CHECK_INTERVAL;
+            let mut woken_by_snapshot = false;
+            let mut frame_outcome: Result<Option<Frame>> = Ok(None);
+            loop {
+                match shared_subscriber.has_pending() {
+                    Ok(true) => {
+                        woken_by_snapshot = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        frame_outcome = Err(error);
+                        break;
+                    }
+                }
+                let now = Instant::now();
+                if now >= frame_deadline {
+                    break;
+                }
+                let slice = (frame_deadline - now).min(FRAME_WAIT_SLICE);
+                match receive_observation_frame(
+                    frame_subscription
+                        .as_ref()
+                        .expect("frame subscription initialized above"),
+                    &canvas,
+                    slice,
+                ) {
+                    Ok(None) => {}
+                    other => {
+                        frame_outcome = other;
+                        break;
+                    }
+                }
+            }
+            match frame_outcome {
                 Ok(Some(frame)) => {
                     if !scan_frame_is_fresh(frame.captured_at, scan_boundary) {
                         log::debug!("丢弃扫描新鲜度边界之前捕获的旧观察帧");
@@ -1394,7 +1427,7 @@ impl ApplicationRuntime {
                     // A receive timeout is a normal polling tick, not a capture failure.
                     drop(scan_lease.take());
                     self.maybe_reload_config_when_idle();
-                    if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                    if !woken_by_snapshot && self.lifecycle.running.load(AtomicOrdering::SeqCst) {
                         self.maybe_activate_reload_startup_after_ui_grace(
                             config_reload_child,
                             self.business.task_engine.is_idle()?,

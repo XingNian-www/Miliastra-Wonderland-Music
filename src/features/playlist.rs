@@ -641,17 +641,6 @@ impl PlaylistApplication {
         }
     }
 
-    #[allow(dead_code)]
-    fn drop_pending_clear(&self, owner: &str) -> Result<()> {
-        let mut pending = self
-            .state
-            .pending_clear
-            .lock()
-            .map_err(|_| anyhow!("歌单确认状态不可用"))?;
-        pending.remove(owner);
-        Ok(())
-    }
-
     pub(crate) fn poll_import_completions(&self, now: Instant) -> Result<Vec<Vec<String>>> {
         let mut imports = self
             .state

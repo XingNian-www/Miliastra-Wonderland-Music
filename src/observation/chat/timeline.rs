@@ -1403,6 +1403,23 @@ impl ChatTimelineSubscriber {
         Ok(subscriber.queue.drain(..).collect())
     }
 
+    /// 本订阅者是否还有未被消费的快照。
+    ///
+    /// `publish` 已经在 `changed` 条件变量上 `notify_all`；标准库通道没有 `select`，
+    /// 所以主循环用「短切片等帧 + 这里检查」把等待变成可中断的：一有发布就提前
+    /// 回循环顶部派发，而不是等满一整轮（等帧 + 处理 + sleep）。
+    pub(crate) fn has_pending(&self) -> Result<bool> {
+        let state = self.shared.lock()?;
+        let subscriber = state
+            .subscribers
+            .get(&self.id)
+            .ok_or_else(|| anyhow!("chat timeline subscription closed"))?;
+        if let Some(reason) = &subscriber.failure {
+            bail!("{reason}");
+        }
+        Ok(!subscriber.queue.is_empty())
+    }
+
     pub(crate) fn wait(&self, timeout: Duration) -> Result<bool> {
         let started = Instant::now();
         let mut state = self.shared.lock()?;

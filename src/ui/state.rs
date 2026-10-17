@@ -148,6 +148,23 @@ impl UiState {
         }
     }
 
+    /// 千星大厅：靠**底栏结构**判出来且当场没有聊天标记。
+    ///
+    /// 大厅是最常见的状态，气泡只是它的可选内容：聊天框关着、或气泡模板没命中时，
+    /// 旧逻辑会落到 unknown。这个构造器只服务那条新路径，标签用 `primary:hall`
+    /// 与「靠气泡判出来」的 `primary:marker …` 区分开。
+    fn primary_hall() -> Self {
+        Self {
+            state: UiStateKind::Primary,
+            blue_count: 0,
+            yellow_count: 0,
+            pink_count: 0,
+            secondary_visible: false,
+            friend_visible: false,
+            source: "hall",
+        }
+    }
+
     fn secondary_chat() -> Self {
         Self {
             state: UiStateKind::Secondary,
@@ -229,6 +246,9 @@ impl std::fmt::Display for UiState {
         match self.state {
             UiStateKind::Primary if self.source == "friend" => {
                 write!(formatter, "primary:friend")
+            }
+            UiStateKind::Primary if self.source == "hall" => {
+                write!(formatter, "primary:hall")
             }
             UiStateKind::Primary => write!(
                 formatter,
@@ -689,7 +709,62 @@ fn detect_ui_state_with_evidence(
     let threshold = templates.chat_templates.marker_threshold;
     let mut template_probes = Vec::with_capacity(2);
 
-    // 加载界面是**真实界面**，不是 unknown，所以最先判它。
+    // ── 1) 聊天标记：最高优先级的模板匹配 ────────────────────────────────
+    // 三个标记模板形状**完全不同**：蓝色建筑图标 / 黄色四角星 / 粉色人形剪影。
+    // 实测 328 帧：蓝/黄只出现在千星侧（大厅 93 蓝、22 黄、1 蓝+黄，面板 3+7），
+    // 提瓦特 0 帧带蓝/黄 ⇒ 蓝/黄命中就是大厅，不需要其它信息（也不需要算底栏）。
+    // 粉色**不能作判据**：提瓦特世界聊天 6/6 帧都是 pink-only（第 46 节缺陷②），
+    // 所以 pink-only 不在这里返回，落到下面的二次判断流程（底栏结构 → 世界判据）。
+    let marker_started = Instant::now();
+    let marker_hits = scan_chat_markers(image, &templates.chat_templates, screen.chat_rect)?;
+    let (blue, yellow, pink) = count_scanned_chat_markers(&marker_hits);
+    let marker_ms = elapsed_ms(marker_started);
+    let marker_probe = UiMarkerProbeEvidence::new(
+        evidence_rect(screen.chat_rect.into()),
+        (image.width(), image.height()),
+        blue,
+        yellow,
+        pink,
+        marker_hits,
+    );
+    if blue > 0 || yellow > 0 {
+        log::info!(target: "timing",
+            "UI 状态检测耗时: total={}ms marker={}ms state=primary rule=primary_chat_markers blue={} yellow={} pink={}",
+            elapsed_ms(started),
+            marker_ms,
+            blue,
+            yellow,
+            pink
+        );
+        return Ok((
+            UiState::primary_marker(blue, yellow, pink),
+            UiStateEvidence::new(template_probes, Some(marker_probe), "primary_chat_markers"),
+        ));
+    }
+
+    // ── 2) 没有蓝/黄（无标记，或只有粉色）：底栏结构 → 大厅 ─────────────
+    // 底栏结构是粉色/无标记时的二次判据（区域标量 + 连通块），对位移/缩放不敏感（第 47 节教训）。
+    // 只看"按键块数 + 占比下界"：**不要加上界**——实测亮背景的大厅界帧占比能到 0.2866，
+    // 上限会把它们误杀（2026-10-17 踩过）。主菜单那一帧占比 0.4152 是这个判据已知的唯一误报。
+    let hall_region: Rect = screen.hall_bar_rect.into();
+    let (hall_white_ratio, hall_tiles) = hall_bar_signature(image, hall_region);
+    let hall_structure = hall_tiles >= HALL_BAR_MIN_TILES
+        && hall_white_ratio >= HALL_BAR_STRUCTURE_RATIO_MIN;
+    if hall_structure {
+        log::info!(target: "timing",
+            "UI 状态检测耗时: total={}ms marker={}ms state=primary rule=primary_hall_bar white_ratio={:.4} tiles={}",
+            elapsed_ms(started),
+            marker_ms,
+            hall_white_ratio,
+            hall_tiles
+        );
+        return Ok((
+            UiState::primary_hall(),
+            UiStateEvidence::new(template_probes, Some(marker_probe), "primary_hall_bar"),
+        ));
+    }
+
+    // ── 3) 加载界面是**真实界面**，不是 unknown，所以在剩下的分支里最先判它。
     // 它整屏只有极端色调，任何游戏界面的暗/白占比都远达不到（见上面两条阈值的实测来源），
     // 因此放在最前面既便宜又不会抢掉其它状态。具体外观由证据里的规则名区分。
     if let Some(rule) = loading_rule(image) {
@@ -703,31 +778,6 @@ fn detect_ui_state_with_evidence(
             UiStateEvidence::new(template_probes, None, rule),
         ));
     }
-
-    let friend_started = Instant::now();
-    let friend_region: Rect = screen.friend_rect.into();
-    let friend_candidate =
-        best_template_candidate(image, Some(friend_region), &templates.friend_template)?;
-    let friend_visible = candidate_matches(&friend_candidate, threshold);
-    template_probes.push(template_probe(
-        &templates.friend_template,
-        friend_region,
-        threshold,
-        friend_candidate.as_ref(),
-    ));
-    if friend_visible {
-        let friend_ms = elapsed_ms(friend_started);
-        log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms friend={}ms menu=0ms back=0ms marker=0ms state=primary_friend",
-            elapsed_ms(started),
-            friend_ms
-        );
-        return Ok((
-            UiState::primary_friend(),
-            UiStateEvidence::new(template_probes, None, "primary_friend_template"),
-        ));
-    }
-    let friend_ms = elapsed_ms(friend_started);
 
     let back_started = Instant::now();
     let back_region: Rect = screen.secondary_back_rect.into();
@@ -758,10 +808,10 @@ fn detect_ui_state_with_evidence(
         let back_ms = elapsed_ms(back_started);
         if menu_visible {
             log::info!(target: "timing",
-                "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker=0ms state=main_menu",
+                "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=main_menu",
                 elapsed_ms(started),
-                friend_ms,
-                back_ms
+                back_ms,
+                marker_ms
             );
             return Ok((
                 UiState::main_menu(),
@@ -787,10 +837,10 @@ fn detect_ui_state_with_evidence(
         if paimon_visible {
             let back_ms = elapsed_ms(back_started);
             log::info!(target: "timing",
-                "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker=0ms state=paimon_menu",
+                "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=paimon_menu",
                 elapsed_ms(started),
-                friend_ms,
-                back_ms
+                back_ms,
+                marker_ms
             );
             return Ok((
                 UiState::paimon_menu(),
@@ -798,10 +848,10 @@ fn detect_ui_state_with_evidence(
             ));
         }
         log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker=0ms state=secondary_chat",
+            "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=secondary_chat",
             elapsed_ms(started),
-            friend_ms,
-            back_ms
+            back_ms,
+            marker_ms
         );
         return Ok((
             UiState::secondary_chat(),
@@ -810,64 +860,9 @@ fn detect_ui_state_with_evidence(
     }
     let back_ms = elapsed_ms(back_started);
 
-    let marker_started = Instant::now();
-    let marker_hits = scan_chat_markers(image, &templates.chat_templates, screen.chat_rect)?;
-    let (blue, yellow, pink) = count_scanned_chat_markers(&marker_hits);
-    let marker_ms = elapsed_ms(marker_started);
-    let marker_probe = UiMarkerProbeEvidence::new(
-        evidence_rect(screen.chat_rect.into()),
-        (image.width(), image.height()),
-        blue,
-        yellow,
-        pink,
-        marker_hits,
-    );
-    if blue + yellow + pink > 0 {
-        // 聊天标记**不是千星奇域独有的**：提瓦特大世界的世界聊天同样带蓝/黄/粉气泡，
-        // 第 46 节实机因此把提瓦特判成了千星大厅。所以这里再看一眼底栏的白色按键占比。
-        // 第 47 节试过用底栏模板匹配来否决，栽在 1:1 SAD 对缩放不鲁棒上；
-        // 第 48 节改成像素占比，这个量对位移和缩放都不敏感。
-        let bar_region: Rect = screen.hall_bar_rect.into();
-        let white_ratio = near_white_ratio(image, bar_region);
-        if white_ratio < HALL_BAR_WHITE_RATIO_MIN {
-            log::info!(target: "timing",
-                "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker={}ms state=unknown reason=markers_without_hall_bar white_ratio={:.4} min={}",
-                elapsed_ms(started),
-                friend_ms,
-                back_ms,
-                marker_ms,
-                white_ratio,
-                HALL_BAR_WHITE_RATIO_MIN
-            );
-            return Ok((
-                UiState::unknown(),
-                UiStateEvidence::new(
-                    template_probes,
-                    Some(marker_probe),
-                    "markers_without_hall_bar",
-                ),
-            ));
-        }
-        log::info!(target: "timing",
-            "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker={}ms state=primary_marker blue={} yellow={} pink={}",
-            elapsed_ms(started),
-            friend_ms,
-            back_ms,
-            marker_ms,
-            blue,
-            yellow,
-            pink
-        );
-        return Ok((
-            UiState::primary_marker(blue, yellow, pink),
-            UiStateEvidence::new(template_probes, Some(marker_probe), "primary_chat_markers"),
-        ));
-    }
-
     log::info!(target: "timing",
-        "UI 状态检测耗时: total={}ms friend={}ms back={}ms marker={}ms state=unknown",
+        "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=unknown",
         elapsed_ms(started),
-        friend_ms,
         back_ms,
         marker_ms
     );
@@ -884,6 +879,24 @@ fn detect_ui_state_with_evidence(
 /// 两者之间没有任何帧。取区间中点 (5.257 + 11.181) / 2 = **8.219%**。
 /// 统计区域是 `screen.hall_bar_rect`，改区域必须重新量阈值。
 const HALL_BAR_WHITE_RATIO_MIN: f32 = 0.08219;
+
+/// 底栏「白色按键块数」的下限（2px 采样下的 4 连通块，单块至少 [`HALL_BAR_TILE_MIN_AREA`] 个采样格）。
+///
+/// 来源（1553 帧语料实测，2026-10-17）：千星大厅帧 **7–11 块**（最低 7），千星主菜单 3–5 块，
+/// 提瓦特 2–4 块，登录/加载 0 块 ⇒ 取 **7**（按实测下限，不放开余量）。
+/// 这是**结构**量而不是模板分数，对位移/缩放不敏感；改采样步长或 `screen.hall_bar_rect` 必须重测。
+const HALL_BAR_MIN_TILES: usize = 7;
+
+/// 结构判定用的近白占比下限：取实测大厅带的下沿 **0.10**。
+///
+/// 与 [`HALL_BAR_WHITE_RATIO_MIN`]（0.08219，用于"有气泡时否决"）分开：
+/// 那个是**否决**阈值，宁松勿紧；这个是**主动判大厅**的门槛，必须落在实测大厅带内
+/// （大厅 0.1098–0.1435），否则白色面板/裁剪图会被当成大厅（2026-10-17 实测过一次）。
+const HALL_BAR_STRUCTURE_RATIO_MIN: f32 = 0.10;
+
+
+/// 计入「一块按键」的最小面积（单位：2px 采样格）。低于它的白点按噪点丢弃。
+const HALL_BAR_TILE_MIN_AREA: usize = 40;
 
 /// 统计指定区域里"近白"像素的占比（每 2 像素取样一次，与定阈值时的量法一致）。
 ///
@@ -1259,32 +1272,86 @@ fn loading_rule(image: &DynamicImage) -> Option<&'static str> {
     None
 }
 
-fn near_white_ratio(image: &DynamicImage, rect: Rect) -> f32 {
+/// 底栏结构：`(近白占比, 白色按键块数)`，与 [`HALL_BAR_WHITE_RATIO_MIN`] / [`HALL_BAR_MIN_TILES`] 同一采样口径。
+///
+/// 千星大厅的底栏是一排白色圆角按键（聊天 / Enter / 👥 / O / 麦克风 / Alt+N / 喇叭 / N），
+/// 所以既有足够的近白占比，也有**多块**互不相连的白色按键；提瓦特只有一个 Enter，
+/// 主菜单是一整片白底（块数少），登录/加载整屏纯色。
+/// 用结构而不是模板分数，是为了绕开 1:1 SAD 对缩放不鲁棒的问题（第 47 节教训）。
+fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (f32, usize) {
     let Ok(region) = crop_canvas(image, rect) else {
-        return 0.0;
+        return (0.0, 0);
     };
     let rgb = region.to_rgb8();
     let (width, height) = rgb.dimensions();
-    let mut total = 0_usize;
+    let grid_w = (width as usize).div_ceil(2);
+    let grid_h = (height as usize).div_ceil(2);
+    let mut grid = vec![false; grid_w * grid_h];
     let mut white = 0_usize;
-    let mut y = 0;
-    while y < height {
-        let mut x = 0;
-        while x < width {
-            let pixel = rgb.get_pixel(x, y);
+    for gy in 0..grid_h {
+        for gx in 0..grid_w {
+            let pixel = rgb.get_pixel((gx * 2) as u32, (gy * 2) as u32);
             if pixel[0].min(pixel[1]).min(pixel[2]) >= 200 {
+                grid[gy * grid_w + gx] = true;
                 white += 1;
             }
-            total += 1;
-            x += 2;
         }
-        y += 2;
     }
-    if total == 0 {
+    let total = grid_w * grid_h;
+    let ratio = if total == 0 {
         0.0
     } else {
         white as f32 / total as f32
+    };
+    let mut seen = vec![false; total];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut tiles = 0_usize;
+    for start in 0..total {
+        if !grid[start] || seen[start] {
+            continue;
+        }
+        stack.clear();
+        stack.push(start);
+        seen[start] = true;
+        let mut area = 0_usize;
+        while let Some(index) = stack.pop() {
+            area += 1;
+            let x = index % grid_w;
+            let y = index / grid_w;
+            if x > 0 {
+                let n = index - 1;
+                if grid[n] && !seen[n] {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            }
+            if x + 1 < grid_w {
+                let n = index + 1;
+                if grid[n] && !seen[n] {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            }
+            if y > 0 {
+                let n = index - grid_w;
+                if grid[n] && !seen[n] {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            }
+            if y + 1 < grid_h {
+                let n = index + grid_w;
+                if grid[n] && !seen[n] {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            }
+        }
+        if area >= HALL_BAR_TILE_MIN_AREA {
+            tiles += 1;
+        }
     }
+    (ratio, tiles)
 }
 
 /// 世界判据的结果。
@@ -2963,7 +3030,8 @@ mod tests {
         );
         // 仍然是 3：第 34 秒还在同一次冷却期内，第 33 秒那帧是 secondary 直接返回。
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        classifier.screen.friend_rect.width = 3000;
+        // 好友判据已并入大厅；现在链首扫的是聊天标记，所以用聊天区的非法矩形验证"坏区域必须报错"。
+        classifier.screen.chat_rect.width = 3000;
         assert!(
             classifier
                 .classify_at(&world, now + Duration::from_secs(40))
@@ -3062,25 +3130,65 @@ mod tests {
             .expect("classify fixed secondary-chat screenshot");
         let evidence = classification.evidence();
         assert_eq!(evidence.final_rule(), "secondary_back_template");
-        // 探针顺序：friend、secondary_back，然后是返回按钮命中后才跑的两个否决探针
+        // 探针顺序：secondary_back，然后是返回按钮命中后才跑的两个否决探针
         // （main_menu 奇域主菜单、paimon_menu 提瓦特派蒙菜单）。后两者都用来挡住
         // 和二级聊天共用的那个圆形返回按钮。
-        assert_eq!(evidence.template_probes().len(), 4);
+        // 2026-10-17：好友按钮判据并入大厅（与大厅重复，65/66 帧同判），探针从 4 个减到 3 个。
+        assert_eq!(evidence.template_probes().len(), 3);
         assert!(
             evidence
                 .template_probes()
                 .iter()
                 .all(|probe| probe.best_score().is_some())
         );
-        assert!(evidence.template_probes()[0].hit_rect().is_none());
-        assert!(evidence.template_probes()[1].hit_rect().is_some());
+        assert!(evidence.template_probes()[0].hit_rect().is_some());
         assert!(
-            evidence.template_probes()[2].hit_rect().is_none(),
+            evidence.template_probes()[1].hit_rect().is_none(),
             "二级界面上不该出现主菜单的返回提瓦特按钮"
         );
         assert!(
-            evidence.template_probes()[3].hit_rect().is_none(),
+            evidence.template_probes()[2].hit_rect().is_none(),
             "二级界面上不该出现派蒙菜单的功能宫格锚点"
+        );
+    }
+
+    /// 底栏结构判据：大厅有 7 块以上白色按键；主菜单/提瓦特/加载都不满足。
+    ///
+    /// 钉住 2026-10-17 的「大厅优先」改动：大厅判定不再依赖聊天标记，
+    /// 靠底栏结构（白色按键块数 + 近白占比）。改采样步长或 `hall_bar_rect` 要重测阈值。
+    #[test]
+    fn hall_bar_structure_separates_hall_from_menu_and_teyvat() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let rect: Rect = config.screen.hall_bar_rect.into();
+        let signature = |name: &str| {
+            let path = format!("technical-docs/ui-state-evidence/{name}");
+            let image = image::open(&path).unwrap();
+            hall_bar_signature(&image, rect)
+        };
+        for name in [
+            "hall-chat-open.jpg",
+            "qianxing-halls-58/hall3-01.jpg",
+            "full-hall.jpg",
+        ] {
+            let (ratio, tiles) = signature(name);
+            assert!(
+                tiles >= HALL_BAR_MIN_TILES,
+                "{name} 是大厅，底栏应有多块白色按键，实测 {tiles} 块"
+            );
+            assert!(
+                ratio >= HALL_BAR_STRUCTURE_RATIO_MIN,
+                "{name} 近白占比 {ratio:.4} 应不低于结构门槛"
+            );
+        }
+        let (_ratio, tiles) = signature("wonderland-menu.png");
+        assert!(
+            tiles < HALL_BAR_MIN_TILES,
+            "千星主菜单是一整片白底，不该凑出 {tiles} 块按键"
+        );
+        let (ratio, _) = signature("transition-to-overworld/05-overworld-teyvat.jpg");
+        assert!(
+            ratio < HALL_BAR_STRUCTURE_RATIO_MIN,
+            "提瓦特底栏只有一个 Enter，近白占比 {ratio:.4} 不该过结构门槛"
         );
     }
 

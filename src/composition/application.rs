@@ -345,8 +345,9 @@ impl ResolvedApplicationConfig {
 fn receive_observation_frame(
     subscription: &FrameDemandSubscription,
     canvas: &Canvas,
+    timeout: Duration,
 ) -> Result<Option<Frame>> {
-    match subscription.recv_timeout(CONFIG_RELOAD_IDLE_CHECK_INTERVAL) {
+    match subscription.recv_timeout(timeout) {
         Ok(FramePublication::Captured(published)) => {
             Ok(Some(from_captured_frame(&published, canvas)))
         }

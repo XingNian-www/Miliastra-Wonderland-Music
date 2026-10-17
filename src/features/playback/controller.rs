@@ -661,37 +661,31 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         }
         // 播放成功消息里的音量显示引擎当前实际音量（音量命令是异步渐变，
         // 请求元数据里没有音量，之前硬编码 0 导致「播放: … 音量0」）。
-        // 有界等待真实开播信号：play 回包只代表 Start 被受理，源站拒绝/解码失败
-        // 要稍后才到。窗口内出现本请求的 playing 或失败信号就返回；超时按原行为
-        // 确认（避免慢源被误判失败）。
-        let deadline = Instant::now() + Duration::from_millis(1500);
-        loop {
-            if let Ok(current) = self.backend.status() {
-                status.volume = current.volume;
-                let matches_request = current
-                    .current_track
-                    .as_ref()
-                    .zip(request.track.as_ref())
-                    .is_some_and(|(current_track, requested)| {
-                        current_track.track_ref.key == requested.track_ref.key
-                    });
-                if matches_request && !current.failure_code.trim().is_empty() {
-                    anyhow::bail!(
-                        "播放器报告失败: {}: {}",
-                        current.failure_code,
-                        current.failure_message
-                    );
-                }
-                if matches_request && current.status == "playing" {
-                    status.session_id = current.session_id.clone();
-                    status.generation = current.generation;
-                    break;
-                }
+        // **立即回报**：play 回包返回后不再等真实开播信号（6.1.8 加的 1.5s 有界等待
+        // 会让 @点歌 的回执明显变慢，6.1.7 是直接回报的）。这里只做一次**非阻塞**的
+        // 状态读取，用于补齐音量与引擎会话号；返回瞬间就已可见的失败仍然按失败处理
+        // （交给上层换源），但不会 sleep、不会拖慢回执。
+        // 之后才到的失败由监听循环的失败处理路径额外报错（见 workers 的播放失败回报）。
+        if let Ok(current) = self.backend.status() {
+            status.volume = current.volume;
+            let matches_request = current
+                .current_track
+                .as_ref()
+                .zip(request.track.as_ref())
+                .is_some_and(|(current_track, requested)| {
+                    current_track.track_ref.key == requested.track_ref.key
+                });
+            if matches_request && !current.failure_code.trim().is_empty() {
+                anyhow::bail!(
+                    "播放器报告失败: {}: {}",
+                    current.failure_code,
+                    current.failure_message
+                );
             }
-            if Instant::now() >= deadline {
-                break;
+            if matches_request {
+                status.session_id = current.session_id.clone();
+                status.generation = current.generation;
             }
-            std::thread::sleep(Duration::from_millis(50));
         }
         self.record_observation(&status, classify_observation(&status))?;
         let message = format_play_message(&status);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::observation::chat::PassiveScanGate;
 use crate::observation::chat::{
     ChatIdentity, PassiveLayout, passive_layout, recognize_passive_secondary,
 };
@@ -137,16 +138,23 @@ impl ApplicationRuntime {
                             PassiveLayout::Secondary { .. } => "secondary",
                             PassiveLayout::NoChat => "no_chat",
                         };
-                        let signature =
-                            layout.signature(&frame.image, config.screen.chat_rect.into())?;
+                        // 变化判据用 v5.9.4 的「均值差 / 变化比例」而不是精确像素哈希：
+                        // 聊天区透出 3D 场景、粒子、半透明底纹的轻微抖动会被阈值吸收；
+                        // 真实消息（文字出现）差异远大于阈值，仍能及时触发。
+                        let fingerprint = crate::ui::change_detection::rect_chat_change_fingerprint(
+                            &frame.image,
+                            config.screen.chat_rect.into(),
+                        )?;
                         hash_time = finish_observer_stage(&mut stage_started);
                         let now = Instant::now();
                         let scan_due = gate.scan_due(
-                            signature,
+                            &fingerprint,
                             now,
                             refresh.is_some(),
                             Duration::from_millis(live.timing.chat_scan.fallback_ms.max(1)),
                             Duration::from_millis(live.timing.chat_scan.change_debounce_ms),
+                            config.ocr.change_mean_threshold,
+                            config.ocr.change_pixel_threshold,
                         );
                         gate_time = finish_observer_stage(&mut stage_started);
                         if !scan_due {
@@ -265,50 +273,6 @@ fn finish_observer_stage(started: &mut Option<Instant>) -> Duration {
 
 fn capture_satisfies_refresh(captured_at: Instant, refresh: Option<Instant>) -> bool {
     refresh.is_none_or(|requested_at| captured_at >= requested_at)
-}
-
-#[derive(Default)]
-struct PassiveScanGate {
-    published: Option<u64>,
-    candidate: Option<(u64, Instant)>,
-    pending: Option<u64>,
-    last_scan: Option<Instant>,
-}
-
-impl PassiveScanGate {
-    fn scan_due(
-        &mut self,
-        signature: u64,
-        now: Instant,
-        forced: bool,
-        fallback: Duration,
-        debounce: Duration,
-    ) -> bool {
-        let fallback_due = self
-            .last_scan
-            .is_none_or(|last| now.saturating_duration_since(last) >= fallback);
-        let changed = self.published != Some(signature);
-        if !changed {
-            self.candidate = None;
-        } else if self
-            .candidate
-            .is_none_or(|(previous, _)| previous != signature)
-        {
-            self.candidate = Some((signature, now));
-        }
-        let settled = self
-            .candidate
-            .is_some_and(|(_, first)| now.saturating_duration_since(first) >= debounce);
-        let due = forced || fallback_due || (changed && settled);
-        self.pending = due.then_some(signature);
-        due
-    }
-
-    fn complete(&mut self, now: Instant) {
-        self.published = self.pending.take();
-        self.last_scan = Some(now);
-        self.candidate = None;
-    }
 }
 
 #[cfg(test)]
@@ -479,18 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_frames_skip_ocr_until_fallback() {
-        let now = Instant::now();
-        let mut gate = PassiveScanGate::default();
-        let fallback = Duration::from_secs(5);
-        let debounce = Duration::from_millis(100);
-        assert!(gate.scan_due(1, now, false, fallback, debounce));
-        gate.complete(now);
-        assert!(!gate.scan_due(1, now + Duration::from_secs(1), false, fallback, debounce));
-        assert!(gate.scan_due(1, now + fallback, false, fallback, debounce));
-    }
-
-    #[test]
     fn refresh_rejects_old_capture_and_bypasses_unchanged_cache() {
         let requested = Instant::now();
         assert!(!capture_satisfies_refresh(
@@ -498,29 +450,6 @@ mod tests {
             Some(requested)
         ));
         assert!(capture_satisfies_refresh(requested, Some(requested)));
-        let mut gate = PassiveScanGate::default();
-        assert!(gate.scan_due(7, requested, false, Duration::from_secs(5), Duration::ZERO));
-        gate.complete(requested);
-        assert!(gate.scan_due(
-            7,
-            requested,
-            true,
-            Duration::from_secs(5),
-            Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn changed_frames_debounce_and_failed_scan_stays_due() {
-        let now = Instant::now();
-        let mut gate = PassiveScanGate::default();
-        let fallback = Duration::from_secs(5);
-        let debounce = Duration::from_millis(100);
-        assert!(gate.scan_due(1, now, false, fallback, debounce));
-        gate.complete(now);
-        assert!(!gate.scan_due(2, now + debounce, false, fallback, debounce));
-        assert!(gate.scan_due(2, now + debounce * 2, false, fallback, debounce));
-        assert!(gate.scan_due(2, now + debounce * 3, false, fallback, debounce));
     }
 
     #[test]

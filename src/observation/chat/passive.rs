@@ -142,6 +142,9 @@ pub(crate) fn passive_layout(
 }
 
 impl PassiveLayout {
+    /// 旧的变化签名（整段聊天区 + marker 几何的 u64 哈希）。
+    /// 2026-10-17 起门控改用 `PassiveScanGate` 的阈值判据，这里只剩测试在用，保留作对照。
+    #[allow(dead_code)]
     pub(crate) fn signature(&self, image: &DynamicImage, primary_rect: Rect) -> Result<u64> {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         match self {

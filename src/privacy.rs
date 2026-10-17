@@ -1,3 +1,5 @@
+//! 聊天文本脱敏：只影响日志/诊断/HTTP 展示，不改变业务参数与比较键。
+
 pub(crate) const REDACTED_TURTLE_SOUP_BOTTOM: &str = "[海龟汤汤底已隐藏]";
 pub(crate) const REDACTED_UNDERCOVER_SECRET: &str = "[谁是卧底秘密内容已隐藏]";
 pub(crate) const REDACTED_UNDERCOVER_INPUT: &str = "[谁是卧底私聊内容已隐藏]";

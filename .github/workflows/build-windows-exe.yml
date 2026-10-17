@@ -1,0 +1,306 @@
+name: 构建 Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 发布版本，例如 v0.1.0。留空时使用 Cargo.toml 版本。
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - .cargo/**
+      - .github/workflows/build-windows-exe.yml
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - rust-toolchain.toml
+      - README.md
+      - THIRD_PARTY_NOTICES.md
+      - assets/**
+      - config.example.yaml
+      - crates/**
+      - docs/**
+      - examples/**
+      - scripts/**
+      - turtle_soup.example.yaml
+      - undercover.example.yaml
+      - src/**
+      - vendor/ffmpeg/8.1/windows-x64/**
+      - vendor/mnn/3.6.0/windows-x64/**
+      - vendor/webview2/1.0.4129.50/x64/**
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+  # OCR 源码与模型固定到 Cargo.lock 锁定的提交。
+  # 下载步骤另外校验 SHA-256，确保模型内容符合预期。
+  OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/7368dfa292ab988e8431de4ec952f015bec40635/models
+
+jobs:
+  build-windows-exe:
+    name: 构建 Windows x64 EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-release
+
+      - name: 安装 PE 导入表检查工具
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-binutils
+
+      - name: 解析 PE 导入表检查工具路径
+        shell: msys2 {0}
+        run: |
+          objdump_path="$(command -v objdump)"
+          test -x "$objdump_path"
+          echo "OBJDUMP=$(cygpath -w "$objdump_path")" >> "$GITHUB_ENV"
+
+      - name: 缓存 OCR 模型
+        uses: actions/cache@v5
+        with:
+          path: models
+          key: pp-ocrv6-small-models-v2.3.1-sha256-2c6277ab-ed59cc29-b5f2bfe2
+
+      - name: 下载 PP-OCRv6 small 模型
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+          $files = @(
+            'PP-OCRv6_small_det.mnn',
+            'PP-OCRv6_small_rec.mnn',
+            'ppocr_keys_v6_small.txt'
+          )
+          $expectedHashes = @{
+            'PP-OCRv6_small_det.mnn' = '2c6277abbbddb4c77a790f4650cdd7f8ab33512db38fac372ed5471538070619'
+            'PP-OCRv6_small_rec.mnn' = 'ed59cc294fe2d564bd64f929b5356b70abd0977f99e7e60e3b08cfeef4ef72be'
+            'ppocr_keys_v6_small.txt' = 'b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d'
+          }
+          foreach ($file in $files) {
+            $path = "models/$file"
+            if (Test-Path -LiteralPath $path -PathType Container) {
+              Remove-Item -LiteralPath $path -Recurse -Force
+            }
+            $needsDownload = $true
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+              $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              $needsDownload = $actualHash -ne $expectedHashes[$file]
+            }
+            if ($needsDownload) {
+              Invoke-WebRequest -Uri "$env:OCR_MODEL_BASE_URL/$file" -OutFile $path
+            }
+            $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHashes[$file]) {
+              throw "OCR 模型 SHA-256 校验失败: file=$file expected=$($expectedHashes[$file]) actual=$actualHash"
+            }
+          }
+
+      - name: 解析快速链接器 lld-link
+        id: linker
+        shell: pwsh
+        run: |
+          $candidates = @()
+          $command = Get-Command lld-link.exe -ErrorAction SilentlyContinue
+          if ($command) { $candidates += $command.Source }
+          if ($env:LIBCLANG_PATH) {
+            $candidates += (Join-Path $env:LIBCLANG_PATH 'lld-link.exe')
+          }
+          $candidates += (Join-Path ${env:ProgramFiles} 'LLVM\bin\lld-link.exe')
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path -LiteralPath $vswhere) {
+            $vsInstall = & $vswhere -latest -products * -property installationPath
+            if ($vsInstall) {
+              $candidates += (Join-Path $vsInstall 'VC\Tools\Llvm\x64\bin\lld-link.exe')
+            }
+          }
+          $lldLink = $candidates |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
+            Select-Object -First 1
+          if ($lldLink) {
+            Write-Host "使用 lld-link: $lldLink"
+            "lld_link=$lldLink" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Warning '未找到 lld-link，回退默认 MSVC 链接器'
+            "lld_link=" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: 编译 Release EXE
+        run: |
+          $lldLink = '${{ steps.linker.outputs.lld_link }}'
+          if ($lldLink) {
+            $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $lldLink
+          }
+          # 依赖缓存完整命中时用 --offline 自检，跳过 crates.io 索引更新（每次约 20–90s）。
+          $offlineReady = $false
+          try {
+            & cargo fetch --locked --offline *> $null
+            $offlineReady = $LASTEXITCODE -eq 0
+          } catch {
+            $offlineReady = $false
+          }
+          if ($offlineReady) {
+            $env:CARGO_NET_OFFLINE = 'true'
+            Write-Host 'cargo 离线自检通过，本次构建跳过 crates.io 索引更新'
+          } else {
+            Write-Warning 'cargo 离线自检未通过（缓存不完整），本次构建仍走网络更新索引'
+          }
+          cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Workspace release build failed' }
+
+      - name: 解析发布版本
+        id: version
+        shell: pwsh
+        run: |
+          function Read-PackageVersion($text) {
+            $content = if ($text -is [array]) { $text -join "`n" } else { [string]$text }
+            if ($content -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
+              throw '无法从 Cargo.toml 读取包版本'
+            }
+            return $Matches[1]
+          }
+
+          $inputVersion = '${{ github.event.inputs.version }}'.Trim()
+          $cargoToml = Get-Content Cargo.toml -Raw
+          $packageVersion = Read-PackageVersion $cargoToml
+          if ($inputVersion) {
+            $version = $inputVersion
+          } else {
+            $version = "v$packageVersion"
+          }
+          if (-not $version.StartsWith('v')) {
+            $version = "v$version"
+          }
+          $createRelease = '${{ github.event_name }}' -eq 'workflow_dispatch'
+          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_name }}' -eq 'main') {
+            $createRelease = 'false'
+            $before = '${{ github.event.before }}'
+            if (-not $before -or $before -match '^0+$') {
+              $createRelease = 'true'
+            } else {
+              git fetch --no-tags --depth=1 origin $before
+              $oldCargo = git show "$($before):Cargo.toml"
+              $oldVersion = Read-PackageVersion $oldCargo
+              if ($oldVersion -ne $packageVersion) {
+                $createRelease = 'true'
+              }
+            }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "zip=miliastra-wonderland-music-windows-x64-$version.zip" >> $env:GITHUB_OUTPUT
+          "create_release=$($createRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: 准备产物
+        shell: pwsh
+        run: |
+          $dist = 'dist/miliastra-wonderland-music-windows-x64'
+          if (Test-Path -LiteralPath $dist) {
+            Remove-Item -LiteralPath $dist -Recurse -Force
+          }
+          & ./scripts/package-ffmpeg-runtime.ps1 `
+            -FfmpegRoot 'vendor/ffmpeg/8.1/windows-x64' `
+            -MinGwRuntime 'vendor/ffmpeg/8.1/windows-x64/bin/libwinpthread-1.dll' `
+            -Executable 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' `
+            -LoginHelper 'target/x86_64-pc-windows-msvc/release/miliastra-login-helper.exe' `
+            -Mnn 'vendor/mnn/3.6.0/windows-x64/bin/MNN.dll' `
+            -Destination $dist `
+            -Objdump $env:OBJDUMP
+          # 发布布局：EXE 根目录只保留主程序与 config.yaml，其余依赖统一放入 deps/。
+          New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/bin'), (Join-Path $dist 'deps/dll') | Out-Null
+          Move-Item -LiteralPath (Join-Path $dist 'miliastra-login-helper.exe') -Destination (Join-Path $dist 'deps/bin')
+          foreach ($dll in @('MNN.dll', 'avformat-62.dll', 'avcodec-62.dll', 'avutil-60.dll', 'swresample-6.dll', 'libwinpthread-1.dll')) {
+            Move-Item -LiteralPath (Join-Path $dist $dll) -Destination (Join-Path $dist 'deps/dll')
+          }
+          Copy-Item 'assets' (Join-Path $dist 'deps') -Recurse
+          Copy-Item 'models' (Join-Path $dist 'deps') -Recurse
+          Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml')
+          New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/docs') | Out-Null
+          Copy-Item 'turtle_soup.example.yaml', 'undercover.example.yaml', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md' (Join-Path $dist 'deps/docs')
+          Copy-Item 'docs' (Join-Path $dist 'deps/docs') -Recurse
+          # 预置配置库：用主程序自身初始化 deps/data/playback.sqlite3，避免为同一操作再链接一个 example 可执行文件。
+          & 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' --ensure-config-db (Join-Path $dist 'config.yaml')
+          if ($LASTEXITCODE -ne 0) { throw '发布配置库初始化失败' }
+          # 初始化会生成构建机令牌；恢复模板，让每份安装在首次启动时生成独立令牌。
+          Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml') -Force
+
+          $requiredDirectories = @(
+            'deps\assets',
+            'deps\models',
+            'deps\dll',
+            'deps\bin',
+            'deps\docs'
+          )
+          foreach ($directory in $requiredDirectories) {
+            if (-not (Test-Path -LiteralPath (Join-Path $dist $directory) -PathType Container)) {
+              throw "发布包缺少必需目录: $directory"
+            }
+          }
+
+          $requiredFiles = @(
+            'miliastra-wonderland-music.exe',
+            'config.yaml',
+            'deps\bin\miliastra-login-helper.exe',
+            'deps\dll\MNN.dll',
+            'deps\dll\avformat-62.dll',
+            'deps\dll\avcodec-62.dll',
+            'deps\dll\avutil-60.dll',
+            'deps\dll\swresample-6.dll',
+            'deps\dll\libwinpthread-1.dll',
+            'deps\assets\idioms.txt',
+            'deps\models\PP-OCRv6_small_det.mnn',
+            'deps\models\PP-OCRv6_small_rec.mnn',
+            'deps\models\ppocr_keys_v6_small.txt',
+            'deps\data\playback.sqlite3',
+            'deps\docs\turtle_soup.example.yaml',
+            'deps\docs\undercover.example.yaml',
+            'deps\docs\README.md',
+            'deps\docs\THIRD_PARTY_NOTICES.md'
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath (Join-Path $dist $file) -PathType Leaf)) {
+              throw "发布包缺少必需文件: $file"
+            }
+          }
+
+      - name: 打包 Release zip
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path 'dist/miliastra-wonderland-music-windows-x64' `
+            -DestinationPath "dist/${{ steps.version.outputs.zip }}" `
+            -Force
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: miliastra-wonderland-music-windows-x64
+          path: dist/miliastra-wonderland-music-windows-x64
+
+      - name: 创建 GitHub Release
+        if: github.ref_name != 'dev' && steps.version.outputs.create_release == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Miliastra Wonderland Music ${{ steps.version.outputs.version }}
+          files: dist/${{ steps.version.outputs.zip }}
+          generate_release_notes: true

@@ -1,0 +1,251 @@
+use std::fmt;
+use std::sync::Arc;
+
+use anyhow::Result;
+use enigo::Key;
+use image::DynamicImage;
+
+use crate::config::PointConfig;
+use crate::debug_mode;
+use crate::runtime::ui::{
+    CaptureFrame, InputCertainty, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
+    sealed,
+};
+
+pub(crate) trait GameUiBackend: Send + Sync + 'static {
+    fn capture(&self) -> Result<DynamicImage>;
+    fn benchmark_capture(&self, _rounds: u32) -> Result<String> {
+        anyhow::bail!("capture benchmark is unavailable")
+    }
+    fn press_key(&self, key: Key) -> Result<()>;
+    fn click_point(&self, point: PointConfig) -> Result<()>;
+    fn ensure_ready(&self, after_activate_ms: u64) -> Result<()>;
+    fn close_window(&self) -> Result<()>;
+}
+
+#[derive(Clone)]
+pub(crate) struct GameUi {
+    backend: Arc<dyn GameUiBackend>,
+}
+
+impl GameUi {
+    pub(crate) fn new(backend: impl GameUiBackend) -> Self {
+        Self {
+            backend: Arc::new(backend),
+        }
+    }
+
+    pub(crate) fn capture(&self) -> Result<DynamicImage> {
+        self.backend.capture()
+    }
+
+    pub(crate) fn benchmark_capture(&self, rounds: u32) -> Result<String> {
+        self.backend.benchmark_capture(rounds)
+    }
+
+    pub(crate) fn press_key(&self, key: Key) -> Result<()> {
+        if !debug_mode::input_allowed() {
+            anyhow::bail!("调试模式已禁用游戏内输入，请通过外部 API 操作");
+        }
+        self.backend.press_key(key)
+    }
+
+    pub(crate) fn click_point(&self, point: PointConfig) -> Result<()> {
+        if !debug_mode::input_allowed() {
+            anyhow::bail!("调试模式已禁用游戏内输入，请通过外部 API 操作");
+        }
+        self.backend.click_point(point)
+    }
+
+    pub(crate) fn ensure_ready(&self, after_activate_ms: u64) -> Result<()> {
+        if !debug_mode::input_allowed() {
+            anyhow::bail!("调试模式已禁用游戏内输入，请通过外部 API 操作");
+        }
+        self.backend.ensure_ready(after_activate_ms)
+    }
+
+    pub(crate) fn close_window(&self) -> Result<()> {
+        if !debug_mode::input_allowed() {
+            anyhow::bail!("调试模式已禁用游戏内输入，请通过外部 API 操作");
+        }
+        self.backend.close_window()
+    }
+
+    pub(crate) fn runtime(handle: UiRuntimeHandle) -> Self {
+        Self::new(RuntimeGameUiBackend { handle })
+    }
+}
+
+impl fmt::Debug for GameUi {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("GameUi").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeGameUiBackend {
+    handle: UiRuntimeHandle,
+}
+
+impl RuntimeGameUiBackend {
+    fn execute<R: UiRoutine>(&self, routine: R) -> Result<R::Output> {
+        Ok(self.handle.submit(routine)?.wait()?)
+    }
+}
+
+struct PressKeyRoutine {
+    key: Key,
+}
+
+impl sealed::UiRoutineSealed for PressKeyRoutine {}
+
+impl UiRoutine for PressKeyRoutine {
+    type Output = Result<(), UiRoutineFailure>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        context.device().press_key(self.key).map_err(|error| {
+            UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
+                "press_key",
+                format!("{error:#}"),
+            )
+        })
+    }
+}
+
+fn device_failure(
+    certainty: InputCertainty,
+    stage: &'static str,
+    error: anyhow::Error,
+) -> UiRoutineFailure {
+    UiRoutineFailure::new(certainty, stage, format!("{error:#}"))
+}
+
+struct ClickPointRoutine {
+    point: PointConfig,
+}
+
+impl sealed::UiRoutineSealed for ClickPointRoutine {}
+
+impl UiRoutine for ClickPointRoutine {
+    type Output = Result<(), UiRoutineFailure>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        context
+            .device()
+            .click_point(self.point.x, self.point.y)
+            .map_err(|error| {
+                device_failure(InputCertainty::AfterInputUnknown, "click_point", error)
+            })
+    }
+}
+
+struct EnsureReadyRoutine {
+    after_activate_ms: u64,
+}
+
+impl sealed::UiRoutineSealed for EnsureReadyRoutine {}
+
+impl UiRoutine for EnsureReadyRoutine {
+    type Output = Result<(), UiRoutineFailure>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        context
+            .device()
+            .ensure_ready(self.after_activate_ms)
+            .map_err(|error| {
+                device_failure(
+                    InputCertainty::AfterInputUnknown,
+                    "ensure_game_ready_for_input",
+                    error,
+                )
+            })
+    }
+}
+
+struct CloseWindowRoutine;
+
+impl sealed::UiRoutineSealed for CloseWindowRoutine {}
+
+impl UiRoutine for CloseWindowRoutine {
+    type Output = Result<(), UiRoutineFailure>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        context.device().close_window().map_err(|error| {
+            device_failure(InputCertainty::AfterInputUnknown, "close_window", error)
+        })
+    }
+}
+
+impl GameUiBackend for RuntimeGameUiBackend {
+    fn capture(&self) -> Result<DynamicImage> {
+        Ok(self.execute(CaptureFrame)??.into_image())
+    }
+
+    fn benchmark_capture(&self, rounds: u32) -> Result<String> {
+        self.execute(crate::runtime::ui::BenchmarkCapture { rounds })?
+    }
+
+    fn press_key(&self, key: Key) -> Result<()> {
+        self.execute(PressKeyRoutine { key })??;
+        Ok(())
+    }
+
+    fn click_point(&self, point: PointConfig) -> Result<()> {
+        self.execute(ClickPointRoutine { point })??;
+        Ok(())
+    }
+
+    fn ensure_ready(&self, after_activate_ms: u64) -> Result<()> {
+        self.execute(EnsureReadyRoutine { after_activate_ms })??;
+        Ok(())
+    }
+
+    fn close_window(&self) -> Result<()> {
+        self.execute(CloseWindowRoutine)??;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use anyhow::Result;
+    use enigo::Key;
+    use image::DynamicImage;
+
+    use super::*;
+    use crate::runtime::ui::{UiDevice, UiRuntime};
+
+    struct RecordingUiDevice {
+        keys: Arc<Mutex<Vec<Key>>>,
+    }
+
+    impl UiDevice for RecordingUiDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            Ok(DynamicImage::new_rgba8(1, 1))
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.keys.lock().unwrap().push(key);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn runtime_game_ui_handles_execute_on_one_owned_device() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let runtime = UiRuntime::start(RecordingUiDevice { keys: keys.clone() }, 2).unwrap();
+        let ui = GameUi::runtime(runtime.handle());
+        let clone = ui.clone();
+
+        let image = ui.capture().unwrap();
+        assert_eq!((image.width(), image.height()), (1, 1));
+        ui.press_key(Key::Return).unwrap();
+        clone.press_key(Key::Escape).unwrap();
+
+        assert_eq!(*keys.lock().unwrap(), vec![Key::Return, Key::Escape]);
+        runtime.shutdown().unwrap();
+    }
+}

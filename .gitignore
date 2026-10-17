@@ -1,0 +1,55 @@
+# 默认忽略根目录中的新内容，只开放下列项目目录。
+/*
+
+# 源码、构建、资源和公开使用文档。
+# 注意:测试内容(含 tests/ 全部夹具)与技术分析文档仅保留在本地,
+# 不进 GitHub——GitHub 只保留编译所需代码及使用文档。
+!/.cargo/
+!/.github/
+!/assets/
+!/crates/
+!/docs/
+!/examples/
+!/scripts/
+!/src/
+!/vendor/
+
+# GitHub 只保留安装/使用类用户文档(docs/ 内,跟随发布)。
+# 技术性/过程性文档统一放在 technical-docs/,整个目录不入库。
+/technical-docs/
+
+# 根目录中随项目发布的必要文件。
+!/.gitattributes
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/build.rs
+!/rust-toolchain.toml
+!/LICENSE
+!/README.md
+!/THIRD_PARTY_NOTICES.md
+!/config.example.yaml
+!/turtle_soup.example.yaml
+!/undercover.example.yaml
+
+# 本地维护资料和各目录中的生成物。
+/.local/
+**/target/
+**/node_modules/
+**/__pycache__/
+**/.venv/
+**/.cache/
+**/.bitfun/
+**/.build/
+**/logs/
+**/diagnostics/
+**/dist/
+/crates/miliastra-playback/examples/
+.bitfun/
+
+# 实机证据帧(1099 个文件 / 约 626 MB)属于可重采的过程产物,随 technical-docs/ 一起不入库;
+# 判据与复现方法见 technical-docs/ui-state-criteria.md 与 technical-docs/ui-state-machine.md。
+/.bitfun/search/flashgrep-index/
+
+# Linux 版 MNN 仅为本地测试运行时，不入库；Windows 版仍随 vendor/mnn/3.6.0/windows-x64 保留。
+/vendor/mnn/3.6.0/linux-x64/

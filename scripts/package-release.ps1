@@ -53,6 +53,22 @@ foreach ($name in $modelNames) {
     Copy-Item -LiteralPath (Join-Path $root "models/$name") -Destination "$stage/deps/models"
 }
 
+# OpenVINO FP32 IR 模型(存在时随包分发;缺失不阻断,运行期自动回退 MNN CPU)
+$openvinoIrModels = @(
+    "PP-OCRv6_small_det.xml",
+    "PP-OCRv6_small_det.bin",
+    "PP-OCRv6_small_rec.xml",
+    "PP-OCRv6_small_rec.bin"
+)
+foreach ($name in $openvinoIrModels) {
+    $source = Join-Path $root "models/$name"
+    if (Test-Path -LiteralPath $source -PathType Leaf) {
+        Copy-Item -LiteralPath $source -Destination "$stage/deps/models"
+    } else {
+        Write-Warning "缺少 OpenVINO IR 模型,跳过: models/$name(运行期将回退 MNN CPU)"
+    }
+}
+
 # openvino 运行时(如存在于 deps/openvino)
 if (Test-Path -LiteralPath "$root/deps/openvino" -PathType Container) {
     Copy-Item -LiteralPath "$root/deps/openvino" -Destination "$stage/deps" -Recurse

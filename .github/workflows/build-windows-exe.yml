@@ -42,6 +42,14 @@ env:
   # OCR 源码与模型固定到 Cargo.lock 锁定的提交。
   # 下载步骤另外校验 SHA-256，确保模型内容符合预期。
   OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/7368dfa292ab988e8431de4ec952f015bec40635/models
+  # OpenVINO 运行时随主发布包分发，版本与附加组件流水线保持一致。
+  # 运行时压缩包校验官方 SHA-256；PP-OCRv6 ONNX 按 HuggingFace 提交固定 URL，
+  # 本机无法访问 HuggingFace 计算内容哈希，下载后仅做体积下限校验。
+  OPENVINO_VERSION: 2026.2.1
+  OPENVINO_ARCHIVE_URL: https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.2.1/windows_vc_mt/openvino_toolkit_windows_vc_mt_2026.2.1.21919.ede283a88e3_x86_64.zip
+  OPENVINO_ARCHIVE_SHA256_URL: https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.2.1/windows_vc_mt/openvino_toolkit_windows_vc_mt_2026.2.1.21919.ede283a88e3_x86_64.zip.sha256
+  PP_OCR_DET_ONNX_URL: https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det_onnx/resolve/5994b4f1a827310b6d38f6b13716af6381847be0/inference.onnx?download=true
+  PP_OCR_REC_ONNX_URL: https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/3d2d345e6a299891174f1397a72cdd81331359c7/inference.onnx?download=true
 
 jobs:
   build-windows-exe:
@@ -76,11 +84,81 @@ jobs:
           test -x "$objdump_path"
           echo "OBJDUMP=$(cygpath -w "$objdump_path")" >> "$GITHUB_ENV"
 
+      - name: 安装 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 缓存 OpenVINO runtime 压缩包
+        uses: actions/cache@v5
+        with:
+          path: .build/openvino-${{ env.OPENVINO_VERSION }}.zip
+          key: openvino-runtime-windows-vc-mt-${{ env.OPENVINO_VERSION }}-x86_64-v1
+
+      - name: 下载 OpenVINO runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:GITHUB_WORKSPACE ".build\openvino-$env:OPENVINO_VERSION.zip"
+          $extract = Join-Path $env:GITHUB_WORKSPACE '.build\openvino'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $archive) | Out-Null
+
+          # 命中 actions/cache 时跳过下载，但每次仍校验 SHA-256，防止缓存损坏。
+          if (-not (Test-Path -LiteralPath $archive)) {
+            Invoke-WebRequest `
+              -Uri $env:OPENVINO_ARCHIVE_URL `
+              -OutFile $archive `
+              -MaximumRedirection 10
+          }
+          if ((Get-Item -LiteralPath $archive).Length -lt 1000000) {
+            throw "OpenVINO 压缩包体积异常: $archive"
+          }
+
+          $checksumPath = "$archive.sha256"
+          Invoke-WebRequest `
+            -Uri $env:OPENVINO_ARCHIVE_SHA256_URL `
+            -OutFile $checksumPath `
+            -MaximumRedirection 10
+          $expectedHash = (Get-Content -LiteralPath $checksumPath -Raw).Trim().Split()[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expectedHash -ne $actualHash) {
+            throw "OpenVINO 压缩包 SHA-256 校验失败: expected=$expectedHash actual=$actualHash"
+          }
+
+          if (Test-Path -LiteralPath $extract) {
+            Remove-Item -LiteralPath $extract -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+
+          $candidates = @($extract)
+          $candidates += Get-ChildItem -LiteralPath $extract -Directory -Recurse |
+            ForEach-Object { $_.FullName }
+          $openvinoRoot = $candidates |
+            Where-Object {
+              Test-Path -LiteralPath (Join-Path $_ 'runtime\bin\intel64\Release\openvino_c.dll')
+            } |
+            Select-Object -First 1
+          if (-not $openvinoRoot) {
+            throw "未在 $extract 中找到 OpenVINO Windows x64 runtime"
+          }
+
+          $runtimeBin = Join-Path $openvinoRoot 'runtime\bin\intel64\Release'
+          $tbbBin = Join-Path $openvinoRoot 'runtime\3rdparty\tbb\bin'
+          if (-not (Test-Path -LiteralPath $tbbBin)) {
+            throw "未找到随附的 oneTBB runtime: $tbbBin"
+          }
+          $envPath = "$runtimeBin;$tbbBin;$env:PATH"
+          "OPENVINO_ROOT=$openvinoRoot" >> $env:GITHUB_ENV
+          "OPENVINO_INSTALL_DIR=$openvinoRoot" >> $env:GITHUB_ENV
+          "INTEL_OPENVINO_DIR=$openvinoRoot" >> $env:GITHUB_ENV
+          "OPENVINO_LIB_PATHS=$runtimeBin;$tbbBin" >> $env:GITHUB_ENV
+          "PATH=$envPath" >> $env:GITHUB_ENV
+
       - name: 缓存 OCR 模型
         uses: actions/cache@v5
         with:
           path: models
-          key: pp-ocrv6-small-models-v2.3.1-sha256-2c6277ab-ed59cc29-b5f2bfe2
+          key: pp-ocrv6-small-models-v3-openvino-2c6277ab-ed59cc29-b5f2bfe2
 
       - name: 下载 PP-OCRv6 small 模型
         shell: pwsh
@@ -115,6 +193,85 @@ jobs:
               throw "OCR 模型 SHA-256 校验失败: file=$file expected=$($expectedHashes[$file]) actual=$actualHash"
             }
           }
+
+      - name: 下载 PP-OCRv6 small ONNX 模型（转换 OpenVINO IR 用）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+          # ONNX 只用于转换 IR，转换完成后删除，不进入发布包。
+          $downloads = [ordered]@{
+            'models\PP-OCRv6_small_det.onnx' = $env:PP_OCR_DET_ONNX_URL
+            'models\PP-OCRv6_small_rec.onnx' = $env:PP_OCR_REC_ONNX_URL
+          }
+          foreach ($entry in $downloads.GetEnumerator()) {
+            # HuggingFace 偶发限流/连接中断：最多尝试 3 次（首次 + 2 次重试），避免主发布 job 因单次抖动失败。
+            $attempt = 0
+            while ($true) {
+              $attempt++
+              try {
+                Invoke-WebRequest `
+                  -Uri $entry.Value `
+                  -OutFile $entry.Key `
+                  -MaximumRedirection 10
+                break
+              } catch {
+                if ($attempt -ge 3) { throw }
+                Write-Warning "ONNX 下载失败，第 $attempt 次重试: $($entry.Key): $($_.Exception.Message)"
+                Start-Sleep -Seconds 5
+              }
+            }
+            $size = (Get-Item -LiteralPath $entry.Key).Length
+            if ($size -lt 1024) {
+              throw "ONNX 模型体积异常: $($entry.Key) ($size 字节)"
+            }
+          }
+
+      - name: 安装 OpenVINO Python 转换依赖
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONPATH = "$env:OPENVINO_ROOT\python"
+          python -m pip install --disable-pip-version-check --no-input `
+            -r "$env:OPENVINO_ROOT\python\requirements.txt"
+          python -c "import openvino as ov; print('OpenVINO Python', ov.__version__)"
+
+      - name: 将 PP-OCRv6 ONNX 转换为 FP32 OpenVINO IR
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONPATH = "$env:OPENVINO_ROOT\python"
+          $script = @'
+          from pathlib import Path
+
+          import openvino as ov
+
+          models = Path("models")
+          conversions = (
+              (models / "PP-OCRv6_small_det.onnx", models / "PP-OCRv6_small_det.xml"),
+              (models / "PP-OCRv6_small_rec.onnx", models / "PP-OCRv6_small_rec.xml"),
+          )
+          for source, destination in conversions:
+              if not source.is_file():
+                  raise FileNotFoundError(source)
+              model = ov.convert_model(str(source))
+              ov.save_model(model, str(destination), compress_to_fp16=False)
+              weights = destination.with_suffix(".bin")
+              if not destination.is_file() or destination.stat().st_size == 0:
+                  raise RuntimeError(f"missing IR model: {destination}")
+              if not weights.is_file() or weights.stat().st_size == 0:
+                  raise RuntimeError(f"missing IR weights: {weights}")
+              print(f"converted {source.name} -> {destination.name} ({weights.stat().st_size} bytes)")
+          '@
+          $script | python -
+          Remove-Item -LiteralPath 'models\PP-OCRv6_small_det.onnx', 'models\PP-OCRv6_small_rec.onnx' -Force
+
+      - name: OpenVINO IR 真实截图 smoke test
+        shell: pwsh
+        env:
+          OPENVINO_OCR_IR_ROOT: ${{ github.workspace }}\models
+          OPENVINO_OCR_CHARSET: ${{ github.workspace }}\models\ppocr_keys_v6_small.txt
+        run: cargo test --locked --no-default-features --features ocr-openvino configured_ir_models_recognize_fixture -- --ignored --nocapture
 
       - name: 解析快速链接器 lld-link
         id: linker
@@ -233,8 +390,47 @@ jobs:
           }
           Copy-Item 'assets' (Join-Path $dist 'deps') -Recurse
           Copy-Item 'models' (Join-Path $dist 'deps') -Recurse
+          # OpenVINO 运行时随主发布包分发到 deps/openvino，程序启动时自动探测并前置 DLL 搜索路径。
+          $openvinoRoot = $env:OPENVINO_ROOT
+          if (-not $openvinoRoot) {
+            throw 'OPENVINO_ROOT 未设置，无法打包 OpenVINO runtime'
+          }
+          $runtimeSource = Join-Path $openvinoRoot 'runtime\bin\intel64\Release'
+          $runtimeTarget = Join-Path $dist 'deps\openvino\runtime\bin\intel64\Release'
+          New-Item -ItemType Directory -Force -Path $runtimeTarget | Out-Null
+          $runtimeDlls = Get-ChildItem -LiteralPath $runtimeSource -Filter '*.dll' -File |
+            Where-Object { $_.Name -notmatch '_debug\.dll$' }
+          if (-not $runtimeDlls) {
+            throw "OpenVINO runtime 目录中没有可发布的 DLL: $runtimeSource"
+          }
+          $runtimeDlls | Copy-Item -Destination $runtimeTarget -Force
+
+          $tbbSource = Join-Path $openvinoRoot 'runtime\3rdparty\tbb\bin'
+          $tbbTarget = Join-Path $dist 'deps\openvino\runtime\3rdparty\tbb\bin'
+          New-Item -ItemType Directory -Force -Path $tbbTarget | Out-Null
+          $tbbDlls = Get-ChildItem -LiteralPath $tbbSource -Filter '*.dll' -File |
+            Where-Object { $_.Name -notmatch '_debug\.dll$' }
+          if (-not $tbbDlls) {
+            throw "oneTBB runtime 目录中没有可发布的 DLL: $tbbSource"
+          }
+          $tbbDlls | Copy-Item -Destination $tbbTarget -Force
+
           Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml')
           New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/docs') | Out-Null
+          # 随包分发 OpenVINO 与 oneTBB 许可证，满足再分发要求。
+          $licenseFiles = @{
+            'OPENVINO-LICENSE.txt' = Join-Path $openvinoRoot 'docs\licensing\LICENSE'
+            'OPENVINO-THIRD-PARTY-NOTICES.txt' = Join-Path $openvinoRoot 'docs\licensing\runtime-third-party-programs.txt'
+            'TBB-LICENSE.txt' = Join-Path $openvinoRoot 'runtime\3rdparty\tbb\TBB-LICENSE'
+            'TBB-THIRD-PARTY-NOTICES.txt' = Join-Path $openvinoRoot 'docs\licensing\onetbb_third-party-programs.txt'
+          }
+          foreach ($entry in $licenseFiles.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) {
+              throw "缺少 OpenVINO runtime 许可证文件: $($entry.Value)"
+            }
+            $licenseTarget = Join-Path (Join-Path $dist 'deps/docs') $entry.Key
+            Copy-Item -LiteralPath $entry.Value -Destination $licenseTarget
+          }
           Copy-Item 'turtle_soup.example.yaml', 'undercover.example.yaml', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md' (Join-Path $dist 'deps/docs')
           Copy-Item 'docs' (Join-Path $dist 'deps/docs') -Recurse
           # 预置配置库：用主程序自身初始化 deps/data/playback.sqlite3，避免为同一操作再链接一个 example 可执行文件。
@@ -246,6 +442,7 @@ jobs:
           $requiredDirectories = @(
             'deps\assets',
             'deps\models',
+            'deps\openvino',
             'deps\dll',
             'deps\bin',
             'deps\docs'
@@ -270,11 +467,22 @@ jobs:
             'deps\models\PP-OCRv6_small_det.mnn',
             'deps\models\PP-OCRv6_small_rec.mnn',
             'deps\models\ppocr_keys_v6_small.txt',
+            'deps\models\PP-OCRv6_small_det.xml',
+            'deps\models\PP-OCRv6_small_det.bin',
+            'deps\models\PP-OCRv6_small_rec.xml',
+            'deps\models\PP-OCRv6_small_rec.bin',
+            'deps\openvino\runtime\bin\intel64\Release\openvino_c.dll',
+            'deps\openvino\runtime\bin\intel64\Release\openvino_intel_cpu_plugin.dll',
+            'deps\openvino\runtime\3rdparty\tbb\bin\tbb12.dll',
             'deps\data\playback.sqlite3',
             'deps\docs\turtle_soup.example.yaml',
             'deps\docs\undercover.example.yaml',
             'deps\docs\README.md',
-            'deps\docs\THIRD_PARTY_NOTICES.md'
+            'deps\docs\THIRD_PARTY_NOTICES.md',
+            'deps\docs\OPENVINO-LICENSE.txt',
+            'deps\docs\OPENVINO-THIRD-PARTY-NOTICES.txt',
+            'deps\docs\TBB-LICENSE.txt',
+            'deps\docs\TBB-THIRD-PARTY-NOTICES.txt'
           )
           foreach ($file in $requiredFiles) {
             if (-not (Test-Path -LiteralPath (Join-Path $dist $file) -PathType Leaf)) {

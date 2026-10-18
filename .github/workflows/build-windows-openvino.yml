@@ -251,8 +251,9 @@ jobs:
 
           $licenseFiles = @{
             'OPENVINO-LICENSE.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\LICENSE'
-            'OPENVINO-THIRD-PARTY-NOTICES.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\onetbb_third-party-programs.txt'
+            'OPENVINO-THIRD-PARTY-NOTICES.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\runtime-third-party-programs.txt'
             'TBB-LICENSE.txt' = Join-Path $env:OPENVINO_ROOT 'runtime\3rdparty\tbb\TBB-LICENSE'
+            'TBB-THIRD-PARTY-NOTICES.txt' = Join-Path $env:OPENVINO_ROOT 'docs\licensing\onetbb_third-party-programs.txt'
           }
           foreach ($entry in $licenseFiles.GetEnumerator()) {
             if (-not (Test-Path -LiteralPath $entry.Value)) {
@@ -264,8 +265,11 @@ jobs:
           $readme = @'
           OpenVINO OCR 运行时附加组件
 
+          主程序发布包已内置 OpenVINO 运行时与 IR 模型，本附加包仅用于旧版主程序或单独替换运行时。
+
           此包不含主程序。将包内 deps 文件夹合并到主程序目录下的 deps 文件夹，
-          不要删除或替换主程序及 config.yaml。
+          不要删除或替换主程序及 config.yaml。包根目录的许可证文件
+          （OPENVINO-LICENSE.txt 等）也请一并保留。
 
           安装：
           1. 先解压普通 Windows x64 主程序包。
@@ -273,7 +277,8 @@ jobs:
              deps\openvino\runtime\bin\intel64\Release\openvino_c.dll
              deps\openvino\runtime\3rdparty\tbb\bin\tbb12.dll
              deps\models\PP-OCRv6_small_det.xml
-          3. 在 Web“配置中心”的 ocr 区域选择 OpenVINO 后端。
+          3. 新版主程序默认即 openvino、cpu，无需额外选择；旧版主程序请在
+             Web“配置中心”的 ocr 区域选择 OpenVINO 后端。
              功能配置保存在 deps\data\playback.sqlite3，不要写入 config.yaml。
              模型路径使用 deps/models/ 下对应的 XML、BIN 文件。
           4. 需要 MNN CPU 兜底时，保持后端优先级为 openvino、cpu。
@@ -295,7 +300,8 @@ jobs:
             'README-OPENVINO.txt',
             'OPENVINO-LICENSE.txt',
             'OPENVINO-THIRD-PARTY-NOTICES.txt',
-            'TBB-LICENSE.txt'
+            'TBB-LICENSE.txt',
+            'TBB-THIRD-PARTY-NOTICES.txt'
           )
           foreach ($relativePath in $required) {
             if (-not (Test-Path -LiteralPath (Join-Path $dist $relativePath))) {

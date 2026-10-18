@@ -12,7 +12,7 @@ Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌�
 
 运行与配置方法见 [用户使用指南](docs/user-guide.md)。
 
-发布包包含主程序、登录辅助器和运行所需的媒体、OCR 资源；Windows WebView2 Evergreen Runtime 是登录功能的系统前置条件。
+发布包包含主程序、登录辅助器和运行所需的媒体、OCR 资源；OCR 默认使用 OpenVINO（随包内置 Windows x64 运行时与 PP-OCRv6 IR 模型，CPU 推理），初始化失败时自动回退 MNN CPU。Windows WebView2 Evergreen Runtime 是登录功能的系统前置条件。系统需为 64 位 Windows 10/11；若启动时提示缺少 MSVC 运行库（例如 `vcruntime140.dll`），请安装 x64 Microsoft Visual C++ Redistributable。
 登录信息保存在本机的 `deps/data/credentials/`。
 
 ## 简易配置流程

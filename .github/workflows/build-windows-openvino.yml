@@ -1,5 +1,9 @@
 name: 打包 Windows OpenVINO OCR 运行时依赖
 
+# 生成 OpenVINO 成品运行时包（运行时、IR 与许可证）。主发布工作流
+# build-windows-exe.yml 通过 OPENVINO_RUNTIME_URL / OPENVINO_RUNTIME_SHA256
+# 直接复用这里发布的资产，不再重复下载官方 runtime 或转换 ONNX。
+
 on:
   workflow_dispatch:
     inputs:

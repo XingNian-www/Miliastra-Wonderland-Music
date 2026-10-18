@@ -21,13 +21,13 @@ License 2.0.
 ## OpenVINO
 
 The release package bundles the Intel OpenVINO 2026.2.1 runtime (Windows x64,
-`windows_vc_mt` build) under the Apache License 2.0. The bundled PP-OCRv6 IR
-models are converted from the PaddlePaddle PP-OCRv6 small ONNX models. The
-licenses and notices shipped with the runtime are
-`deps/docs/OPENVINO-LICENSE.txt` (Apache License 2.0),
-`deps/docs/OPENVINO-THIRD-PARTY-NOTICES.txt` (OpenVINO Runtime Third Party
-Programs) and, for the bundled oneTBB runtime, `deps/docs/TBB-LICENSE.txt` and
-`deps/docs/TBB-THIRD-PARTY-NOTICES.txt`.
+`windows_vc_mt` build) under the Apache License 2.0. The runtime and the
+PP-OCRv6 FP32 IR models are taken from the project's prebuilt OpenVINO runtime
+package (`v4.1.0-openvino` release asset). The licenses and notices shipped
+with that package are `deps/docs/OPENVINO-LICENSE.txt` (Apache License 2.0),
+`deps/docs/OPENVINO-THIRD-PARTY-NOTICES.txt` (third-party programs included in
+the runtime package) and `deps/docs/TBB-LICENSE.txt` (Intel Simplified Software
+License, October 2022).
 
 - Source: <https://github.com/openvinotoolkit/openvino/tree/2026.2.1>
 - License: <https://github.com/openvinotoolkit/openvino/blob/2026.2.1/LICENSE>
@@ -35,9 +35,9 @@ Programs) and, for the bundled oneTBB runtime, `deps/docs/TBB-LICENSE.txt` and
 ## oneTBB
 
 The OpenVINO runtime redistributes oneTBB (Intel Threading Building Blocks).
-Upstream oneTBB is Apache-2.0; the bundled Windows runtime includes Intel's
-redistribution license file (Intel Simplified Software License, October 2022)
-and the oneTBB third-party programs file.
+Upstream oneTBB is Apache-2.0; the bundled Windows runtime ships Intel's
+redistribution license file and the oneTBB third-party programs notices as part
+of `OPENVINO-THIRD-PARTY-NOTICES.txt`.
 
 - Source: <https://github.com/oneapi-src/oneTBB>
 - License: <https://github.com/oneapi-src/oneTBB/blob/master/LICENSE.txt>

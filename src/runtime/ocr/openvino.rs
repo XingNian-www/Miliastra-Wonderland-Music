@@ -90,10 +90,10 @@ impl OpenVinoEngine {
         prepare_local_runtime_loading();
         let mut core = Core::new().map_err(|error| {
             anyhow!(
-                "OpenVINO 运行时依赖不可用，初始化 Core 失败: {error:#}; 请安装 OpenVINO >= 2025.1，\
-                 程序会先尝试 EXE 目录下的 runtime；使用外部安装时请把 runtime/bin/intel64/Release \
-                 与 runtime/3rdparty/tbb/bin 加入 PATH，或设置 OPENVINO_INSTALL_DIR；\
-                 当前后端会按配置继续尝试下一个 fallback"
+                "OpenVINO 运行时依赖不可用，初始化 Core 失败: {error:#}; 发布包应已内置 \
+                 deps/openvino，请确认该目录未被删除；使用外部安装时请把 \
+                 runtime/bin/intel64/Release 与 runtime/3rdparty/tbb/bin 加入 PATH，\
+                 或设置 OPENVINO_INSTALL_DIR；当前后端会按配置继续尝试下一个 fallback"
             )
         })?;
         let device = device_type(&config.device);

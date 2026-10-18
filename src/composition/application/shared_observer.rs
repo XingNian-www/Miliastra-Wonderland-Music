@@ -277,7 +277,12 @@ fn capture_satisfies_refresh(captured_at: Instant, refresh: Option<Instant>) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::hash::{Hash, Hasher};
+
     use super::*;
+    use crate::observation::chat::{
+        hash_region, passive_secondary_identity, passive_sender, recognize_passive_hall,
+    };
 
     fn reference_hash_region(
         image: &DynamicImage,

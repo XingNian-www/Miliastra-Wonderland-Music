@@ -211,17 +211,18 @@ ocr:
   request_timeout_ms: 10000
   # 关闭时等待底层 OCR 推理退出的最长时间，单位毫秒
   shutdown_timeout_ms: 5000
-  # OCR 后端优先级；可用值: cuda, vulkan, opencl, openvino, cpu。默认只使用 CPU OCR；
-  # 选择 openvino 时必须配置下方模型路径。引擎逐个尝试、失败自动回退到下一个。
+  # OCR 后端优先级；可用值: cuda, vulkan, opencl, openvino, cpu。
+  # 默认 openvino、cpu：OpenVINO 优先，初始化失败自动回退 MNN CPU；引擎逐个尝试。
   backend_priority:
+    - openvino
     - cpu
-  # OpenVINO IR 模型配置。默认 EXE 已包含 OpenVINO 适配器，但只在
-  # backend_priority 选择 openvino 时检查运行时 DLL 和这些模型文件。
+  # OpenVINO IR 模型配置。发布包已内置运行时与这些模型；只有
+  # backend_priority 包含 openvino 时才使用它们。
   openvino:
-    det_model: null
-    det_weights: null
-    rec_model: null
-    rec_weights: null
+    det_model: models/PP-OCRv6_small_det.xml
+    det_weights: models/PP-OCRv6_small_det.bin
+    rec_model: models/PP-OCRv6_small_rec.xml
+    rec_weights: models/PP-OCRv6_small_rec.bin
     device: CPU
     # OpenVINO GPU/CPU 编译缓存；首次启动会预热聊天 OCR 的固定形状，后续启动可避免重复编译。
     # 设置为 null 可关闭缓存。

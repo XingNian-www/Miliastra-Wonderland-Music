@@ -810,7 +810,7 @@ fn ocr_section() -> Vec<ConfigFieldSchema> {
             "backend_priority",
             "后端优先级",
             FieldKind::StringArray,
-            "OCR 后端优先级；可用值: cuda, vulkan, opencl, openvino, cpu。引擎逐个尝试、失败自动回退到下一个",
+            "OCR 后端优先级；可用值: cuda, vulkan, opencl, openvino, cpu。默认 openvino、cpu：OpenVINO 优先，初始化失败自动回退 MNN CPU",
         ),
         ConfigFieldSchema::db_idle_reload(
             "openvino.det_model",

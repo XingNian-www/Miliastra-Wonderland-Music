@@ -1226,6 +1226,7 @@ pub struct OcrConfig {
     pub threads: i32,
     pub request_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
+    /// OCR 后端优先级。默认 `openvino`、`cpu`：OpenVINO 优先，初始化失败时自动回退 MNN CPU。
     pub backend_priority: Vec<String>,
     /// 可选的 OpenVINO IR 模型配置。除非 `backend_priority` 包含 `openvino`，否则忽略。
     #[serde(default)]
@@ -1287,7 +1288,8 @@ impl Default for OpenVinoConfig {
 
 impl Default for OcrConfig {
     fn default() -> Self {
-        // CPU/MNN 后端要求 det_model/rec_model/charset 非空；
+        // 默认优先使用 OpenVINO（发布包内置运行时与 IR 模型），初始化失败时回退 MNN CPU；
+        // CPU/MNN 后端要求 det_model/rec_model/charset 非空，因此两套模型都给出默认路径。
         // 默认路径使用发布布局 deps/models/，与 config.full.yaml 的文件名一致。
         Self {
             det_model: Some(PathBuf::from("deps/models/PP-OCRv6_small_det.mnn")),
@@ -1297,7 +1299,7 @@ impl Default for OcrConfig {
             threads: 4,
             request_timeout_ms: 10_000,
             shutdown_timeout_ms: 5_000,
-            backend_priority: vec!["cpu".to_string()],
+            backend_priority: vec!["openvino".to_string(), "cpu".to_string()],
             openvino: OpenVinoConfig::default(),
             det_max_side_len: 960,
             det_score_threshold: 0.3,
@@ -2113,6 +2115,27 @@ stale_timeout_ms: 7500
     }
 
     #[test]
+    fn default_ocr_backend_prefers_openvino_with_cpu_fallback() {
+        // 发布包内置 OpenVINO 运行时与 IR 模型，默认后端顺序应为 openvino、cpu；
+        // 两套模型路径都非空，默认配置才能通过校验并在 OpenVINO 不可用时回退 MNN。
+        let config = AppConfig::default();
+
+        assert_eq!(
+            config.ocr.backend_priority,
+            vec!["openvino".to_string(), "cpu".to_string()]
+        );
+        assert!(config.ocr.det_model.is_some());
+        assert!(config.ocr.rec_model.is_some());
+        assert!(config.ocr.openvino.det_model.is_some());
+        assert!(config.ocr.openvino.det_weights.is_some());
+        assert!(config.ocr.openvino.rec_model.is_some());
+        assert!(config.ocr.openvino.rec_weights.is_some());
+        config
+            .validate()
+            .expect("默认 OpenVINO/MNN 双后端配置必须能通过完整校验");
+    }
+
+    #[test]
     fn old_window_config_defaults_to_gdi_capture() {
         let config: WindowConfig = serde_json::from_value(serde_json::json!({
             "target_process": "game.exe",
@@ -2651,7 +2674,12 @@ stale_timeout_ms: 7500
     fn startup_validation_requires_openvino_ir_paths_when_selected() {
         let mut config: AppConfig =
             serde_norway::from_str(bundled_config_yaml()).expect("default config");
+        // 夹具默认已配置 OpenVINO IR；这里显式清空，验证选中 openvino 后缺少 IR 路径会被拒绝。
         config.ocr.backend_priority = vec!["openvino".to_string()];
+        config.ocr.openvino.det_model = None;
+        config.ocr.openvino.det_weights = None;
+        config.ocr.openvino.rec_model = None;
+        config.ocr.openvino.rec_weights = None;
         config.ocr.det_model = None;
         config.ocr.rec_model = None;
 

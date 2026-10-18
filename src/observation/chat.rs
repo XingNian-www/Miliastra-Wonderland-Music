@@ -43,6 +43,13 @@ pub(crate) use passive::{
     parse_secondary_sender_identity, passive_layout, passive_text, recognize_passive_secondary,
 };
 
+// 单元测试（composition::application::shared_observer 等）需要这些纯函数；
+// release 构建不使用它们，若放在普通导入里会被 warning 清理逻辑删除。
+#[cfg(test)]
+pub(crate) use passive::{
+    hash_region, passive_secondary_identity, passive_sender, recognize_passive_hall,
+};
+
 #[cfg(test)]
 pub(crate) use visual::SECONDARY_TITLE_RECT;
 

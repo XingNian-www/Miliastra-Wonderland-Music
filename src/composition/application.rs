@@ -1868,6 +1868,7 @@ fn web_tool_panel_response_rect(config: &AppConfig) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observation::chat::secondary_hall_bubbles;
 
     #[test]
     fn advance_queue_uses_a_stable_dedup_key() {

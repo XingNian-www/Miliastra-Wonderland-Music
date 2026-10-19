@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
@@ -8,10 +10,16 @@ use image::{DynamicImage, GenericImageView, GrayImage};
 use imageproc::contours::{Contour, find_contours};
 use imageproc::point::Point;
 use imageproc::rect::Rect as ImageRect;
-use openvino::{CompiledModel, Core, DeviceType, ElementType, RwPropertyKey, Shape, Tensor};
+use openvino::{
+    CompiledModel, Core, DeviceType, ElementType, InferRequest, RwPropertyKey, Shape, Tensor,
+};
 
 use super::{OcrLine, ResolvedOcrArgs, compare_rect_top_left, normalize_ocr_text};
 use crate::ui::geometry::Rect;
+
+#[cfg(test)]
+#[path = "openvino_perf_tests.rs"]
+mod perf_tests;
 
 const RECOGNITION_HEIGHT: u32 = 48;
 const RECOGNITION_CHARACTER_THRESHOLD: f32 = 0.3;
@@ -29,6 +37,7 @@ const RECOGNITION_CHANNEL_STD: [f32; 3] = [0.5, 0.5, 0.5];
 pub(crate) struct OpenVinoEngine {
     detector: OpenVinoModel,
     recognizer: OpenVinoModel,
+    rec_fixed_width: Option<u32>,
     charset: Vec<char>,
     min_confidence: f32,
     det_max_side_len: u32,
@@ -38,10 +47,23 @@ pub(crate) struct OpenVinoEngine {
     det_box_border: u32,
 }
 
+// A single OCR worker uses each model synchronously. Keep the request alive and
+// reuse common input shapes; output views never escape run's postprocess callback.
 struct OpenVinoModel {
+    request: Option<InferRequest>,
+    inputs: VecDeque<CachedInputTensor>,
     compiled: CompiledModel,
     label: &'static str,
 }
+
+struct CachedInputTensor {
+    shape: Vec<usize>,
+    tensor: Tensor,
+    bytes: usize,
+}
+
+const INPUT_TENSOR_CACHE_ENTRIES: usize = 8;
+const INPUT_TENSOR_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct DetectedTextBox {
@@ -111,6 +133,7 @@ impl OpenVinoEngine {
         let mut engine = Self {
             detector,
             recognizer,
+            rec_fixed_width: config.rec_fixed_width,
             charset,
             min_confidence: args.min_confidence,
             det_max_side_len: args.det_max_side_len,
@@ -177,7 +200,11 @@ impl OpenVinoEngine {
                     )
                 })?;
         }
-        for &width in RECOGNITION_WIDTH_BUCKETS {
+        let recognition_widths = match self.rec_fixed_width {
+            Some(width) => vec![width],
+            None => RECOGNITION_WIDTH_BUCKETS.to_vec(),
+        };
+        for width in recognition_widths {
             self.probe_recognize(&DynamicImage::new_rgb8(width, RECOGNITION_HEIGHT))
                 .with_context(|| {
                     format!(
@@ -193,71 +220,82 @@ impl OpenVinoEngine {
         let scaled = resize_to_max_side(image, self.det_max_side_len)
             .context("OpenVINO 检测图像缩放失败")?;
         let input = preprocess_for_det(&scaled).context("OpenVINO 检测图像预处理失败")?;
-        let (output_data, output_shape) = self.detector.run(&input.data, &input.shape)?;
-        let (batch, channels, out_h, out_w) = match output_shape.as_slice() {
-            [batch, channels, height, width] => (*batch, *channels, *height, *width),
-            [batch, height, width] => (*batch, 1, *height, *width),
-            [height, width] => (1, 1, *height, *width),
-            _ => {
-                bail!("OpenVINO 检测输出形状无效: {output_shape:?}");
-            }
-        };
-        if batch != 1 || channels != 1 {
-            bail!("OpenVINO 检测输出必须是单 batch/单 channel 概率图: shape={output_shape:?}");
-        }
-        if out_w == 0 || out_h == 0 {
-            bail!("OpenVINO 检测输出形状无效: {output_shape:?}");
-        }
-        let mask_len = out_w
-            .checked_mul(out_h)
-            .ok_or_else(|| anyhow!("OpenVINO 检测输出尺寸溢出: {output_shape:?}"))?;
-        if out_w != input.shape[3] || out_h != input.shape[2] {
-            bail!(
-                "OpenVINO 检测输出空间尺寸必须与输入一致: input={}x{} output={}x{}",
-                input.shape[3],
-                input.shape[2],
-                out_w,
-                out_h
-            );
-        }
-        if output_data.len() < mask_len {
-            bail!(
-                "OpenVINO 检测输出尺寸无效: shape={output_shape:?} values={}",
-                output_data.len()
-            );
-        }
-        let mask = output_data[..mask_len]
-            .iter()
-            .map(|value| u8::from(*value > self.det_score_threshold) * 255)
-            .collect::<Vec<_>>();
-        Ok(extract_boxes_with_unclip(
-            &mask,
-            DetectionGeometry {
-                mask_width: out_w as u32,
-                mask_height: out_h as u32,
-                valid_width: input.valid_width,
-                valid_height: input.valid_height,
-                original_width: image.width(),
-                original_height: image.height(),
-                min_area: self.det_min_area,
-                unclip_ratio: self.det_unclip_ratio,
-            },
-        ))
+        let threshold = self.det_score_threshold;
+        let min_area = self.det_min_area;
+        let unclip_ratio = self.det_unclip_ratio;
+        self.detector
+            .run(&input.data, &input.shape, |output_data, output_shape| {
+                let (batch, channels, out_h, out_w) = match output_shape {
+                    [batch, channels, height, width] => (*batch, *channels, *height, *width),
+                    [batch, height, width] => (*batch, 1, *height, *width),
+                    [height, width] => (1, 1, *height, *width),
+                    _ => {
+                        bail!("OpenVINO 检测输出形状无效: {output_shape:?}");
+                    }
+                };
+                if batch != 1 || channels != 1 {
+                    bail!(
+                        "OpenVINO 检测输出必须是单 batch/单 channel 概率图: shape={output_shape:?}"
+                    );
+                }
+                if out_w == 0 || out_h == 0 {
+                    bail!("OpenVINO 检测输出形状无效: {output_shape:?}");
+                }
+                let mask_len = out_w
+                    .checked_mul(out_h)
+                    .ok_or_else(|| anyhow!("OpenVINO 检测输出尺寸溢出: {output_shape:?}"))?;
+                if out_w != input.shape[3] || out_h != input.shape[2] {
+                    bail!(
+                        "OpenVINO 检测输出空间尺寸必须与输入一致: input={}x{} output={}x{}",
+                        input.shape[3],
+                        input.shape[2],
+                        out_w,
+                        out_h
+                    );
+                }
+                if output_data.len() < mask_len {
+                    bail!(
+                        "OpenVINO 检测输出尺寸无效: shape={output_shape:?} values={}",
+                        output_data.len()
+                    );
+                }
+                let mask = output_data[..mask_len]
+                    .iter()
+                    .map(|value| u8::from(*value > threshold) * 255)
+                    .collect::<Vec<_>>();
+                Ok(extract_boxes_with_unclip(
+                    &mask,
+                    DetectionGeometry {
+                        mask_width: out_w as u32,
+                        mask_height: out_h as u32,
+                        valid_width: input.valid_width,
+                        valid_height: input.valid_height,
+                        original_width: image.width(),
+                        original_height: image.height(),
+                        min_area,
+                        unclip_ratio,
+                    },
+                ))
+            })
     }
 
     fn recognize_text(&mut self, image: &DynamicImage) -> Result<(String, f32)> {
-        let input =
-            preprocess_for_rec(image, RECOGNITION_HEIGHT).context("OpenVINO 识别图像预处理失败")?;
-        let (output_data, output_shape) = self.recognizer.run(&input.data, &input.shape)?;
-        let (sequence_length, _) = ctc_output_dimensions(&output_shape)?;
-        let valid_sequence_length = (sequence_length as u64 * input.valid_width as u64)
-            .div_ceil(input.shape[3] as u64) as usize;
-        decode_ctc(
-            &output_data,
-            &output_shape,
-            &self.charset,
-            Some(valid_sequence_length),
-        )
+        let input = preprocess_for_rec(image, RECOGNITION_HEIGHT, self.rec_fixed_width)
+            .context("OpenVINO 识别图像预处理失败")?;
+        let fixed_width = self.rec_fixed_width;
+        let charset = &self.charset;
+        self.recognizer
+            .run(&input.data, &input.shape, |output_data, output_shape| {
+                let (sequence_length, _) = ctc_output_dimensions(output_shape)?;
+                let valid_sequence_length =
+                    recognition_valid_sequence_length(&input, sequence_length, fixed_width)?;
+                decode_ctc(
+                    output_data,
+                    output_shape,
+                    charset,
+                    Some(valid_sequence_length),
+                )
+            })
     }
 }
 
@@ -268,67 +306,135 @@ impl OpenVinoModel {
         device: DeviceType<'static>,
         label: &'static str,
     ) -> Result<Self> {
-        let compiled = core
+        let mut compiled = core
             .compile_model(model, device)
             .with_context(|| format!("编译 OpenVINO {label} 模型失败"))?;
-        Ok(Self { compiled, label })
+        let request = compiled
+            .create_infer_request()
+            .with_context(|| format!("创建 OpenVINO {label} 推理请求失败"))?;
+        Ok(Self {
+            request: Some(request),
+            inputs: VecDeque::new(),
+            compiled,
+            label,
+        })
     }
 
-    fn run(&mut self, input_data: &[f32], input_shape: &[usize]) -> Result<(Vec<f32>, Vec<usize>)> {
+    fn take_input(&mut self, input_shape: &[usize]) -> Result<CachedInputTensor> {
+        if let Some(index) = self
+            .inputs
+            .iter()
+            .position(|input| input.shape == input_shape)
+        {
+            return Ok(self.inputs.remove(index).expect("located cached tensor"));
+        }
         let dimensions = input_shape
             .iter()
-            .map(|dimension| i64::try_from(*dimension))
+            .map(|&dimension| i64::try_from(dimension))
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("OpenVINO 输入维度超出范围")?;
         let shape = Shape::new(&dimensions).context("创建 OpenVINO 输入形状失败")?;
-        let mut tensor = Tensor::new(ElementType::F32, &shape)
+        let tensor = Tensor::new(ElementType::F32, &shape)
             .with_context(|| format!("创建 OpenVINO {} 输入张量失败", self.label))?;
-        let tensor_data = tensor
-            .get_data_mut::<f32>()
-            .with_context(|| format!("访问 OpenVINO {} 输入张量失败", self.label))?;
-        if tensor_data.len() != input_data.len() {
-            bail!(
-                "OpenVINO {} 输入张量元素数不匹配: tensor={} input={}",
-                self.label,
-                tensor_data.len(),
-                input_data.len()
-            );
-        }
-        tensor_data.copy_from_slice(input_data);
-
-        let mut request = self
-            .compiled
-            .create_infer_request()
-            .with_context(|| format!("创建 OpenVINO {} 推理请求失败", self.label))?;
-        request
-            .set_input_tensor(&tensor)
-            .with_context(|| format!("设置 OpenVINO {} 输入失败", self.label))?;
-        request
-            .infer()
-            .with_context(|| format!("执行 OpenVINO {} 推理失败", self.label))?;
-        let output = request
-            .get_output_tensor_by_index(0)
-            .with_context(|| format!("读取 OpenVINO {} 输出失败", self.label))?;
-        if output
-            .get_element_type()
-            .context("读取 OpenVINO 输出元素类型失败")?
-            != ElementType::F32
-        {
-            bail!("OpenVINO {} 输出必须是 F32，当前类型不受支持", self.label);
-        }
-        let output_shape = output
-            .get_shape()
-            .context("读取 OpenVINO 输出形状失败")?
-            .get_dimensions()
+        let bytes = input_shape
             .iter()
-            .map(|dimension| usize::try_from(*dimension))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("OpenVINO 输出维度无效")?;
-        let output_data = output
-            .get_data::<f32>()
-            .context("读取 OpenVINO 输出数据失败")?
-            .to_vec();
-        Ok((output_data, output_shape))
+            .try_fold(std::mem::size_of::<f32>(), |bytes, &size| {
+                bytes.checked_mul(size)
+            })
+            .ok_or_else(|| anyhow!("OpenVINO 输入张量尺寸溢出"))?;
+        Ok(CachedInputTensor {
+            shape: input_shape.to_vec(),
+            tensor,
+            bytes,
+        })
+    }
+
+    fn return_input(&mut self, input: CachedInputTensor) {
+        // Bound both shape count and retained bytes, including unusual diagnostic images.
+        if input.bytes > INPUT_TENSOR_CACHE_BYTES {
+            return;
+        }
+        let mut bytes = self.inputs.iter().map(|entry| entry.bytes).sum::<usize>();
+        while self.inputs.len() >= INPUT_TENSOR_CACHE_ENTRIES
+            || bytes + input.bytes > INPUT_TENSOR_CACHE_BYTES
+        {
+            if let Some(oldest) = self.inputs.pop_front() {
+                bytes -= oldest.bytes;
+            } else {
+                break;
+            }
+        }
+        self.inputs.push_back(input);
+    }
+
+    fn run<R>(
+        &mut self,
+        input_data: &[f32],
+        input_shape: &[usize],
+        postprocess: impl FnOnce(&[f32], &[usize]) -> Result<R>,
+    ) -> Result<R> {
+        let mut input = self.take_input(input_shape)?;
+        let result = (|| {
+            let tensor_data = input
+                .tensor
+                .get_data_mut::<f32>()
+                .with_context(|| format!("访问 OpenVINO {} 输入张量失败", self.label))?;
+            if tensor_data.len() != input_data.len() {
+                bail!(
+                    "OpenVINO {} 输入张量元素数不匹配: tensor={} input={}",
+                    self.label,
+                    tensor_data.len(),
+                    input_data.len()
+                );
+            }
+            // Overwrite the full tensor, including padding, before every inference.
+            tensor_data.copy_from_slice(input_data);
+            if self.request.is_none() {
+                self.request = Some(
+                    self.compiled
+                        .create_infer_request()
+                        .with_context(|| format!("创建 OpenVINO {} 推理请求失败", self.label))?,
+                );
+            }
+            let request = self.request.as_mut().expect("request initialized");
+            request
+                .set_input_tensor(&input.tensor)
+                .with_context(|| format!("设置 OpenVINO {} 输入失败", self.label))?;
+            request
+                .infer()
+                .with_context(|| format!("执行 OpenVINO {} 推理失败", self.label))?;
+            let output = request
+                .get_output_tensor_by_index(0)
+                .with_context(|| format!("读取 OpenVINO {} 输出失败", self.label))?;
+            if output
+                .get_element_type()
+                .context("读取 OpenVINO 输出元素类型失败")?
+                != ElementType::F32
+            {
+                bail!("OpenVINO {} 输出必须是 F32，当前类型不受支持", self.label);
+            }
+            let output_shape = output
+                .get_shape()
+                .context("读取 OpenVINO 输出形状失败")?
+                .get_dimensions()
+                .iter()
+                .map(|&dimension| usize::try_from(dimension))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("OpenVINO 输出维度无效")?;
+            let output_data = output
+                .get_data::<f32>()
+                .context("读取 OpenVINO 输出数据失败")?;
+            // No T*C output copy: finish consuming the borrowed view before this
+            // output handle drops and before the persistent request can infer again.
+            postprocess(output_data, &output_shape)
+        })();
+        if result.is_err() || input.bytes > INPUT_TENSOR_CACHE_BYTES {
+            // Rebuild after failures. Also release the request's native reference
+            // to oversized one-off inputs instead of retaining them between calls.
+            self.request = None;
+        }
+        self.return_input(input);
+        result
     }
 }
 
@@ -403,23 +509,49 @@ fn preprocess_for_det(image: &DynamicImage) -> Result<PreprocessedTensor> {
     })
 }
 
-fn preprocess_for_rec(image: &DynamicImage, target_height: u32) -> Result<PreprocessedTensor> {
+fn preprocess_for_rec(
+    image: &DynamicImage,
+    target_height: u32,
+    fixed_width: Option<u32>,
+) -> Result<PreprocessedTensor> {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 || target_height == 0 {
         bail!("OpenVINO 识别输入图像尺寸不能为空");
     }
     let scale = target_height as f64 / height as f64;
-    let valid_width = ((width as f64 * scale).round() as u32).max(1);
+    let scaled_width = width as f64 * scale;
+    let (valid_width, target_width, source) = match fixed_width {
+        Some(768) if target_height == RECOGNITION_HEIGHT => {
+            // 对齐 train.py preprocess_for_model：Python round（ties-to-even），
+            // 先封顶再 resize（不是裁掉后缀），输入在缩放前转 RGB。
+            let valid_width = (scaled_width.round_ties_even() as u32).clamp(1, 768);
+            (
+                valid_width,
+                768,
+                Cow::Owned(DynamicImage::ImageRgb8(image.to_rgb8())),
+            )
+        }
+        Some(_) => bail!("OpenVINO 固定识别 profile 仅支持 48x768、输出 stride 8"),
+        None => {
+            // 官方 bucket 的舍入、色彩转换顺序与宽度分档保持不变。
+            let valid_width = (scaled_width.round() as u32).max(1);
+            (
+                valid_width,
+                recognition_width_bucket(valid_width),
+                Cow::Borrowed(image),
+            )
+        }
+    };
     let resized = if width == valid_width && height == target_height {
-        image.clone()
+        source.into_owned()
     } else {
-        image.resize_exact(
+        source.resize_exact(
             valid_width,
             target_height,
             image::imageops::FilterType::Lanczos3,
         )
     };
-    let target_width = recognition_width_bucket(valid_width) as usize;
+    let target_width = target_width as usize;
     let target_height = target_height as usize;
     let plane = target_width
         .checked_mul(target_height)
@@ -441,6 +573,26 @@ fn preprocess_for_rec(image: &DynamicImage, target_height: u32) -> Result<Prepro
         valid_width,
         valid_height: target_height as u32,
     })
+}
+
+fn recognition_valid_sequence_length(
+    input: &PreprocessedTensor,
+    sequence_length: usize,
+    fixed_width: Option<u32>,
+) -> Result<usize> {
+    if let Some(width) = fixed_width {
+        let expected_sequence_length = (width / 8) as usize;
+        if width != 768 || sequence_length != expected_sequence_length {
+            bail!(
+                "OpenVINO 固定识别 profile 要求 48x768、输出 stride 8: timesteps={sequence_length} expected={expected_sequence_length}"
+            );
+        }
+        return Ok(input.valid_width.div_ceil(8) as usize);
+    }
+    Ok(
+        (sequence_length as u64 * input.valid_width as u64).div_ceil(input.shape[3] as u64)
+            as usize,
+    )
 }
 
 fn extract_boxes_with_unclip(mask: &[u8], geometry: DetectionGeometry) -> Vec<DetectedTextBox> {
@@ -785,21 +937,26 @@ fn decode_ctc(
             .enumerate()
             .max_by(|(_, left), (_, right)| left.total_cmp(right))
             .ok_or_else(|| anyhow!("OpenVINO 识别输出行为空"))?;
+        let repeated = max_index == previous;
+        previous = max_index; // Low-confidence tokens still participate in CTC collapse.
+        if max_index == 0 || repeated {
+            continue;
+        }
         let score = if row.iter().all(|value| *value >= 0.0 && *value <= 1.0)
             && (row.iter().sum::<f32>() - 1.0).abs() <= 0.05
         {
             *max_value
+        } else if max_value.is_finite() {
+            // For a finite total_cmp winner, this is also the numeric maximum.
+            // Keep summation order and the original exp(value - maximum) expression.
+            softmax_probability_with_maximum(*max_value, row, *max_value)
         } else {
+            // total_cmp and f32::max differ for NaN; retain the original fallback.
             softmax_probability(*max_value, row)
         };
-        if max_index != 0
-            && max_index != previous
-            && max_index < charset.len()
-            && score >= RECOGNITION_CHARACTER_THRESHOLD
-        {
+        if max_index < charset.len() && score >= RECOGNITION_CHARACTER_THRESHOLD {
             characters.push((charset[max_index], score));
         }
-        previous = max_index;
     }
     let confidence = if characters.is_empty() {
         0.0
@@ -814,6 +971,10 @@ fn decode_ctc(
 
 fn softmax_probability(value: f32, row: &[f32]) -> f32 {
     let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    softmax_probability_with_maximum(value, row, maximum)
+}
+
+fn softmax_probability_with_maximum(value: f32, row: &[f32], maximum: f32) -> f32 {
     let denominator = row
         .iter()
         .map(|candidate| (*candidate - maximum).exp())
@@ -1082,6 +1243,7 @@ mod tests {
                 det_weights: Some(model_root.join("PP-OCRv6_small_det.bin")),
                 rec_model: Some(model_root.join("PP-OCRv6_small_rec.xml")),
                 rec_weights: Some(model_root.join("PP-OCRv6_small_rec.bin")),
+                rec_fixed_width: None,
                 device: "CPU".to_string(),
                 cache_dir: None,
             },
@@ -1128,7 +1290,7 @@ mod tests {
     fn recognition_preprocessing_scales_height_and_uses_minus_one_to_one_range() {
         let image =
             DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 1, image::Rgb([255, 0, 128])));
-        let tensor = preprocess_for_rec(&image, 48).unwrap();
+        let tensor = preprocess_for_rec(&image, 48, None).unwrap();
         assert_eq!(tensor.shape, vec![1, 3, 48, 96]);
         assert_eq!(tensor.valid_width, 96);
         assert!((tensor.data[0] - 1.0).abs() < 1e-6);
@@ -1142,12 +1304,138 @@ mod tests {
             1,
             image::Rgb([255, 255, 255]),
         ));
-        let tensor = preprocess_for_rec(&image, 48).unwrap();
+        let tensor = preprocess_for_rec(&image, 48, None).unwrap();
         assert_eq!(tensor.shape, vec![1, 3, 48, 192]);
         assert_eq!(tensor.valid_width, 144);
         let plane = 48 * 192;
         assert_eq!(tensor.data[plane - 1], 0.0);
         assert_eq!(tensor.data[plane + 192 - 1], 0.0);
+    }
+
+    #[test]
+    fn recognition_default_bucket_keeps_uncapped_width_and_rounding() {
+        let wide = preprocess_for_rec(&DynamicImage::new_rgb8(1600, 48), 48, None).unwrap();
+        assert_eq!(wide.shape, [1, 3, 48, 1600]);
+        assert_eq!(wide.valid_width, 1600);
+        let tie = preprocess_for_rec(&DynamicImage::new_rgb8(5, 96), 48, None).unwrap();
+        assert_eq!(tie.valid_width, 3); // 保留原 bucket 的 half-away-from-zero。
+        assert_eq!(tie.shape, [1, 3, 48, 96]);
+        assert_eq!(
+            recognition_valid_sequence_length(&tie, 12, None).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn recognition_fixed768_short_line_keeps_rgb_pixels_and_zero_padding() {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(5, 96, |x, y| {
+            image::Rgba([(x * 51) as u8, (y * 2) as u8, 128, (x * 40) as u8])
+        }));
+        let tensor = preprocess_for_rec(&image, 48, Some(768)).unwrap();
+        // 5 * (48 / 96) = 2.5；Python round 得 2，bucket 的原规则得 3。
+        assert_eq!(tensor.shape, [1, 3, 48, 768]);
+        assert_eq!(tensor.valid_width, 2);
+        assert_eq!(tensor.valid_height, 48);
+        let expected = image::imageops::resize(
+            &image.to_rgb8(),
+            2,
+            48,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let plane = 48 * 768;
+        for channel in 0..3 {
+            for y in 0..48 {
+                for x in 0..768 {
+                    let actual = tensor.data[channel * plane + y * 768 + x];
+                    let expected = if x < 2 {
+                        (expected.get_pixel(x as u32, y as u32)[channel] as f32 / 255.0 - 0.5) / 0.5
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(actual, expected, "channel={channel} x={x} y={y}");
+                }
+            }
+        }
+        assert_eq!(
+            recognition_valid_sequence_length(&tensor, 96, Some(768)).unwrap(),
+            1
+        );
+        assert!(recognition_valid_sequence_length(&tensor, 95, Some(768)).is_err());
+        // 2.5 的另一侧 ties-to-even 与至少一像素保护。
+        for (width, expected) in [(7, 4), (1, 1)] {
+            let tensor =
+                preprocess_for_rec(&DynamicImage::new_rgb8(width, 96), 48, Some(768)).unwrap();
+            assert_eq!(tensor.valid_width, expected);
+        }
+    }
+
+    #[test]
+    fn recognition_fixed768_long_line_resizes_complete_pixels_instead_of_cropping() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(1600, 48, |x, _| {
+            if x < 800 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        }));
+        let tensor = preprocess_for_rec(&image, 48, Some(768)).unwrap();
+        assert_eq!(tensor.shape, [1, 3, 48, 768]);
+        assert_eq!(tensor.valid_width, 768);
+        let expected = image::imageops::resize(
+            &image.to_rgb8(),
+            768,
+            48,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let plane = 48 * 768;
+        for (x, y, pixel) in expected.enumerate_pixels() {
+            for channel in 0..3 {
+                assert_eq!(
+                    tensor.data[channel * plane + y as usize * 768 + x as usize],
+                    (pixel[channel] as f32 / 255.0 - 0.5) / 0.5
+                );
+            }
+        }
+        // 右半蓝色仍存在；直接裁 768 像素会只留下红色。
+        assert_eq!(tensor.data[767], -1.0);
+        assert_eq!(tensor.data[2 * plane + 767], 1.0);
+        assert_eq!(
+            recognition_valid_sequence_length(&tensor, 96, Some(768)).unwrap(),
+            96
+        );
+    }
+
+    #[test]
+    fn recognition_profiles_reject_empty_images_and_invalid_fixed_geometry() {
+        for fixed_width in [None, Some(768)] {
+            for (width, height) in [(0, 0), (0, 48), (48, 0)] {
+                assert!(
+                    preprocess_for_rec(&DynamicImage::new_rgb8(width, height), 48, fixed_width)
+                        .is_err()
+                );
+            }
+        }
+        let image = DynamicImage::new_rgb8(5, 10);
+        assert!(preprocess_for_rec(&image, 0, None).is_err());
+        assert!(preprocess_for_rec(&image, 32, Some(768)).is_err());
+        assert!(preprocess_for_rec(&image, 48, Some(760)).is_err());
+    }
+
+    #[test]
+    fn recognition_fixed768_decodes_only_ceil_valid_width_over_stride() {
+        let input = preprocess_for_rec(&DynamicImage::new_rgb8(9, 48), 48, Some(768)).unwrap();
+        let valid = recognition_valid_sequence_length(&input, 96, Some(768)).unwrap();
+        assert_eq!(valid, 2);
+        let mut data = vec![0.0; 96 * 3];
+        for row in data.chunks_exact_mut(3) {
+            row[0] = 1.0;
+        }
+        data[0..3].copy_from_slice(&[0.05, 0.9, 0.05]);
+        data[6..9].copy_from_slice(&[0.05, 0.05, 0.9]); // padding 内的“乙”必须丢弃。
+        let (text, confidence) =
+            decode_ctc(&data, &[1, 96, 3], &[' ', '甲', '乙'], Some(valid)).unwrap();
+        assert_eq!(text, "甲");
+        assert_eq!(confidence, 0.9);
     }
 
     #[test]

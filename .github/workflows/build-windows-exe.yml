@@ -4,34 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 发布版本，例如 v0.1.0。留空时使用 Cargo.toml 版本。
+        description: 发布版本，例如 v6.2.0；带 -dev 时只构建不发布（如 v6.2.0-dev）。留空时使用 Cargo.toml 版本。
         required: false
         type: string
   push:
     branches:
       - main
-      - dev
+    # 只有版本号提交（Cargo.toml）或本工作流改动才会触发，普通代码/文档提交不产生 CI。
+    # 版本号是否带 -dev、是否为纯数字，由 version-gate 任务判定构建与发布策略。
     paths:
-      - .cargo/**
-      - .github/workflows/build-windows-exe.yml
       - Cargo.toml
-      - Cargo.lock
-      - build.rs
-      - rust-toolchain.toml
-      - README.md
-      - THIRD_PARTY_NOTICES.md
-      - assets/**
-      - config.example.yaml
-      - crates/**
-      - docs/**
-      - examples/**
-      - scripts/**
-      - turtle_soup.example.yaml
-      - undercover.example.yaml
-      - src/**
-      - vendor/ffmpeg/8.1/windows-x64/**
-      - vendor/mnn/3.6.0/windows-x64/**
-      - vendor/webview2/1.0.4129.50/x64/**
+      - .github/workflows/build-windows-exe.yml
 
 permissions:
   contents: write
@@ -51,8 +34,148 @@ env:
   OPENVINO_RUNTIME_SHA256: b829a123f24fb44143a7be912e0dfba5f739f8d924b2f01543083ff6f49db500
 
 jobs:
+  version-gate:
+    name: 判定版本与发布策略
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.gate.outputs.should_build }}
+      create_release: ${{ steps.gate.outputs.create_release }}
+      version: ${{ steps.gate.outputs.version }}
+      zip: ${{ steps.gate.outputs.zip }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: 读取版本并判定构建/发布
+        id: gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # 从 Cargo.toml 的 [package] 段读取 version。
+          read_package_version() {
+            local text="$1"
+            local version
+            version=$(printf '%s\n' "$text" | awk '
+              /^\[package\][[:space:]]*$/ { in_package = 1; next }
+              /^\[/ { in_package = 0 }
+              in_package && /^[[:space:]]*version[[:space:]]*=/ {
+                if (match($0, /"[^"]+"/)) {
+                  print substr($0, RSTART + 1, RLENGTH - 2)
+                  exit
+                }
+              }
+            ')
+            if [ -z "$version" ]; then
+              echo "::error::无法从 Cargo.toml 读取 [package].version"
+              exit 1
+            fi
+            printf '%s' "$version"
+          }
+
+          normalize_version() {
+            local value="$1"
+            value="${value#v}"
+            value="${value#V}"
+            printf '%s' "$value"
+          }
+
+          is_dev_version() {
+            case "$1" in
+              *-dev*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          is_numeric_version() {
+            [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          }
+
+          emit() {
+            local should_build="$1"
+            local create_release="$2"
+            local version="$3"
+            {
+              echo "should_build=$should_build"
+              echo "create_release=$create_release"
+              echo "version=v$version"
+              echo "zip=miliastra-wonderland-music-windows-x64-v$version.zip"
+            } >> "$GITHUB_OUTPUT"
+            echo "判定结果: 版本=v$version 构建=$should_build 发布=$create_release"
+          }
+
+          validate_version() {
+            local version="$1"
+            case "$version" in
+              ""|*[[:space:]]*)
+                echo "::error::版本号不能为空且不能包含空白字符: '$version'"
+                exit 1
+                ;;
+            esac
+          }
+
+          cargo_version="$(read_package_version "$(cat Cargo.toml)")"
+          validate_version "$cargo_version"
+
+          # 手动触发与 push 使用同一套版本规则，避免意外发布。
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$(normalize_version "${INPUT_VERSION:-}")"
+            if [ -z "$version" ]; then
+              version="$cargo_version"
+            fi
+            validate_version "$version"
+            if is_dev_version "$version"; then
+              emit true false "$version"
+            elif is_numeric_version "$version"; then
+              emit true true "$version"
+            else
+              echo "::error::手动触发版本必须是纯数字 X.Y.Z 或带 -dev 的版本，当前为: $version"
+              exit 1
+            fi
+            exit 0
+          fi
+
+          # push：只有版本号实际变化才构建；版本格式决定是否发布。
+          version_changed=true
+          if [ -z "${BEFORE_SHA:-}" ] || ! printf '%s' "$BEFORE_SHA" | grep -q '[^0]'; then
+            echo "推送前提交未知或为首次推送，按版本变化处理"
+          elif git fetch --no-tags --depth=1 origin "$BEFORE_SHA" >/dev/null 2>&1 \
+            && old_cargo="$(git show "$BEFORE_SHA:Cargo.toml" 2>/dev/null)" \
+            && old_version="$(read_package_version "$old_cargo")"; then
+            if [ "$old_version" = "$cargo_version" ]; then
+              version_changed=false
+            fi
+          else
+            echo "::warning::无法读取推送前版本，按版本变化处理"
+          fi
+
+          if [ "$version_changed" = "false" ]; then
+            echo "版本号未变化（$cargo_version），本次提交不构建"
+            emit false false "$cargo_version"
+            exit 0
+          fi
+
+          if is_numeric_version "$cargo_version"; then
+            emit true true "$cargo_version"
+          elif is_dev_version "$cargo_version"; then
+            emit true false "$cargo_version"
+          else
+            echo "版本 $cargo_version 既不是纯数字版本也不是 -dev 版本，跳过自动构建"
+            emit false false "$cargo_version"
+          fi
+
   build-windows-exe:
     name: 构建 Windows x64 EXE
+    needs: version-gate
+    if: needs.version-gate.outputs.should_build == 'true'
     runs-on: windows-latest
 
     steps:
@@ -249,48 +372,6 @@ jobs:
           cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
           if ($LASTEXITCODE -ne 0) { throw 'Workspace release build failed' }
 
-      - name: 解析发布版本
-        id: version
-        shell: pwsh
-        run: |
-          function Read-PackageVersion($text) {
-            $content = if ($text -is [array]) { $text -join "`n" } else { [string]$text }
-            if ($content -notmatch '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
-              throw '无法从 Cargo.toml 读取包版本'
-            }
-            return $Matches[1]
-          }
-
-          $inputVersion = '${{ github.event.inputs.version }}'.Trim()
-          $cargoToml = Get-Content Cargo.toml -Raw
-          $packageVersion = Read-PackageVersion $cargoToml
-          if ($inputVersion) {
-            $version = $inputVersion
-          } else {
-            $version = "v$packageVersion"
-          }
-          if (-not $version.StartsWith('v')) {
-            $version = "v$version"
-          }
-          $createRelease = '${{ github.event_name }}' -eq 'workflow_dispatch'
-          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_name }}' -eq 'main') {
-            $createRelease = 'false'
-            $before = '${{ github.event.before }}'
-            if (-not $before -or $before -match '^0+$') {
-              $createRelease = 'true'
-            } else {
-              git fetch --no-tags --depth=1 origin $before
-              $oldCargo = git show "$($before):Cargo.toml"
-              $oldVersion = Read-PackageVersion $oldCargo
-              if ($oldVersion -ne $packageVersion) {
-                $createRelease = 'true'
-              }
-            }
-          }
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "zip=miliastra-wonderland-music-windows-x64-$version.zip" >> $env:GITHUB_OUTPUT
-          "create_release=$($createRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-
       - name: 准备产物
         shell: pwsh
         run: |
@@ -404,7 +485,7 @@ jobs:
         run: |
           Compress-Archive `
             -Path 'dist/miliastra-wonderland-music-windows-x64' `
-            -DestinationPath "dist/${{ steps.version.outputs.zip }}" `
+            -DestinationPath "dist/${{ needs.version-gate.outputs.zip }}" `
             -Force
 
       - name: 上传产物
@@ -413,11 +494,31 @@ jobs:
           name: miliastra-wonderland-music-windows-x64
           path: dist/miliastra-wonderland-music-windows-x64
 
-      - name: 创建 GitHub Release
-        if: github.ref_name != 'dev' && steps.version.outputs.create_release == 'true'
+      - name: 解析发布说明文件
+        id: release_notes
+        shell: pwsh
+        run: |
+          $path = ".github/release-notes/${{ needs.version-gate.outputs.version }}.md"
+          if (Test-Path -LiteralPath $path -PathType Leaf) {
+            "body_path=$path" >> $env:GITHUB_OUTPUT
+          } else {
+            "body_path=" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: 创建 GitHub Release（使用发布说明）
+        if: needs.version-gate.outputs.create_release == 'true' && steps.release_notes.outputs.body_path != ''
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: Miliastra Wonderland Music ${{ steps.version.outputs.version }}
-          files: dist/${{ steps.version.outputs.zip }}
+          tag_name: ${{ needs.version-gate.outputs.version }}
+          name: Miliastra Wonderland Music ${{ needs.version-gate.outputs.version }}
+          body_path: ${{ steps.release_notes.outputs.body_path }}
+          files: dist/${{ needs.version-gate.outputs.zip }}
+
+      - name: 创建 GitHub Release（自动生成说明）
+        if: needs.version-gate.outputs.create_release == 'true' && steps.release_notes.outputs.body_path == ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version-gate.outputs.version }}
+          name: Miliastra Wonderland Music ${{ needs.version-gate.outputs.version }}
+          files: dist/${{ needs.version-gate.outputs.zip }}
           generate_release_notes: true

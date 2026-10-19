@@ -163,7 +163,8 @@ fn decoder_matches_legacy_for_mixed_probability_and_logit_sequences() {
 #[ignore = "requires native OpenVINO runtime"]
 fn oversized_successful_input_releases_the_request_binding() -> Result<()> {
     // A tiny reduction model exercises a >16 MiB input without the recognizer's
-    // enormous class output. Keep these local fixture files for failure diagnosis.
+    // enormous class output. Keep dimensions because OpenVINO's C shape getter
+    // rejects rank-0 scalar outputs. Keep fixture files for failure diagnosis.
     let root = std::env::temp_dir().join(format!("ocr-input-budget-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root)?;
     let xml = root.join("reduce.xml");
@@ -173,8 +174,8 @@ fn oversized_successful_input_releases_the_request_binding() -> Result<()> {
         r#"<net name="input_budget" version="11"><layers>
 <layer id="0" name="input" type="Parameter" version="opset1"><data shape="1,3,48,-1" element_type="f32"/><output><port id="0" precision="FP32"><dim>1</dim><dim>3</dim><dim>48</dim><dim>-1</dim></port></output></layer>
 <layer id="1" name="axes" type="Const" version="opset1"><data element_type="i64" shape="4" offset="0" size="32"/><output><port id="0" precision="I64"><dim>4</dim></port></output></layer>
-<layer id="2" name="sum" type="ReduceSum" version="opset1"><data keep_dims="false"/><input><port id="0" precision="FP32"><dim>1</dim><dim>3</dim><dim>48</dim><dim>-1</dim></port><port id="1" precision="I64"><dim>4</dim></port></input><output><port id="2" precision="FP32"/></output></layer>
-<layer id="3" name="result" type="Result" version="opset1"><input><port id="0" precision="FP32"/></input></layer>
+<layer id="2" name="sum" type="ReduceSum" version="opset1"><data keep_dims="true"/><input><port id="0" precision="FP32"><dim>1</dim><dim>3</dim><dim>48</dim><dim>-1</dim></port><port id="1" precision="I64"><dim>4</dim></port></input><output><port id="2" precision="FP32"><dim>1</dim><dim>1</dim><dim>1</dim><dim>1</dim></port></output></layer>
+<layer id="3" name="result" type="Result" version="opset1"><input><port id="0" precision="FP32"><dim>1</dim><dim>1</dim><dim>1</dim><dim>1</dim></port></input></layer>
 </layers><edges><edge from-layer="0" from-port="0" to-layer="2" to-port="0"/><edge from-layer="1" from-port="0" to-layer="2" to-port="1"/><edge from-layer="2" from-port="2" to-layer="3" to-port="0"/></edges></net>"#,
     )?;
     std::fs::write(
@@ -190,7 +191,8 @@ fn oversized_successful_input_releases_the_request_binding() -> Result<()> {
     let mut model = OpenVinoModel::compile(&mut core, &ir, DeviceType::CPU, "input_budget")?;
     for width in [96, INPUT_TENSOR_CACHE_BYTES / (3 * 48 * 4) + 1, 96] {
         let data = vec![0.0; 3 * 48 * width];
-        model.run(&data, &[1, 3, 48, width], |values, _| {
+        model.run(&data, &[1, 3, 48, width], |values, shape| {
+            assert_eq!(shape, &[1, 1, 1, 1]);
             assert_eq!(values, &[0.0]);
             Ok(())
         })?;

@@ -36,6 +36,12 @@ Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌�
 - [Web 面板使用](docs/web-tools.md)：状态面板、远程控制和高级工具。
 - [平台登录](docs/login-qr-feasibility.md)：登录步骤、凭据和环境要求。
 
+## 交流群
+
+欢迎加入 QQ 交流群【千星点歌BOT交流群】（群号 1109165607）：
+
+[点击链接加入群聊【千星点歌BOT交流群】](https://qun.qq.com/universal-share/share?ac=1&authKey=hLANDgO68y1bFiLD45vcptHNY0ajh4D2LyyIJiyC0QO6uuH5gsBgekBnUTeIYunS&busi_data=eyJncm91cENvZGUiOiIxMTA5MTY1NjA3IiwidG9rZW4iOiJMRWgwak9PYlJYRC9BZFh5T3VTR0ZpdGRILy9uaGJFQkF1MHR0MmhEYW1VejVkejFxTW0za25uUkcyZ3hYQTlYIiwidWluIjoiMTM5MjkxMDY0NSJ9&data=G2C076I3acUsqhUNcCE8KcqM3YSSBJh1DYqhBMSa6vlH40VgK_SflDzGZ5YhVWJDHDr08LjWHAP5oVQuNQ68tQ&svctype=4&tempid=h5_group_info)
+
 ## 许可证
 
 本项目使用 MIT 许可证，详见 [LICENSE](LICENSE)。第三方组件的许可信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

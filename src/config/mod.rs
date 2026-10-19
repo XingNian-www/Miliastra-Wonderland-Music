@@ -1265,6 +1265,10 @@ pub struct OpenVinoConfig {
     /// 与 `rec_model` 配套的识别模型权重文件。
     #[serde(default)]
     pub rec_weights: Option<PathBuf>,
+    /// 显式选择自训识别模型的固定输入 profile；目前仅支持 48x768、输出 stride 8。
+    /// 省略或 null 保持官方模型的等比缩放 + bucket，不根据模型文件名猜测。
+    #[serde(default)]
+    pub rec_fixed_width: Option<u32>,
     /// OpenVINO 设备名称，通常为 `CPU`（安装相应插件后也可用 `GPU`/`NPU`）。
     #[serde(default = "default_openvino_device")]
     pub device: String,
@@ -1280,6 +1284,7 @@ impl Default for OpenVinoConfig {
             det_weights: Some(PathBuf::from("deps/models/PP-OCRv6_small_det.bin")),
             rec_model: Some(PathBuf::from("deps/models/PP-OCRv6_small_rec.xml")),
             rec_weights: Some(PathBuf::from("deps/models/PP-OCRv6_small_rec.bin")),
+            rec_fixed_width: None,
             device: default_openvino_device(),
             cache_dir: default_openvino_cache_dir(),
         }
@@ -1342,6 +1347,11 @@ impl OpenVinoConfig {
                 bail!("{field} 在启用 OpenVINO 后端时不能为空");
             };
             validate_nonempty_path(path, field)?;
+        }
+        if self.rec_fixed_width.is_some_and(|width| width != 768) {
+            bail!(
+                "ocr.openvino.rec_fixed_width 仅支持 768（自训 48x768、输出 stride 8）；官方 bucket 请省略或设为 null"
+            );
         }
         if self.device.trim().is_empty() {
             bail!("ocr.openvino.device 不能为空");
@@ -2133,6 +2143,36 @@ stale_timeout_ms: 7500
         config
             .validate()
             .expect("默认 OpenVINO/MNN 双后端配置必须能通过完整校验");
+    }
+
+    #[test]
+    fn openvino_rec_fixed_width_defaults_and_round_trips_explicit_profile() {
+        assert_eq!(OpenVinoConfig::default().rec_fixed_width, None);
+        let mut legacy = serde_json::to_value(OpenVinoConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("rec_fixed_width");
+        let legacy: OpenVinoConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.rec_fixed_width, None);
+        legacy.validate().unwrap();
+        for width in [None, Some(768)] {
+            let config = OpenVinoConfig {
+                rec_fixed_width: width,
+                ..legacy.clone()
+            };
+            let restored: OpenVinoConfig =
+                serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+            assert_eq!(restored.rec_fixed_width, width);
+            restored.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_validation_rejects_unsupported_openvino_rec_fixed_width() {
+        for width in [0, 1, 760, 769, 1024, u32::MAX] {
+            let mut config = AppConfig::default();
+            config.ocr.openvino.rec_fixed_width = Some(width);
+            let error = config.validate().expect_err("only fixed768 is supported");
+            assert!(error.to_string().contains("ocr.openvino.rec_fixed_width"));
+        }
     }
 
     #[test]

@@ -841,6 +841,13 @@ fn ocr_section() -> Vec<ConfigFieldSchema> {
         )
         .nullable(),
         ConfigFieldSchema::db_idle_reload(
+            "openvino.rec_fixed_width",
+            "OpenVINO 识别固定宽度",
+            int(768, 768),
+            "仅自训 48x768、输出 stride 8 模型设为 768：超宽压缩、短行右侧归一化补零；官方模型保留 null，按等比宽度分桶",
+        )
+        .nullable(),
+        ConfigFieldSchema::db_idle_reload(
             "openvino.device",
             "OpenVINO 设备",
             FieldKind::String,
@@ -2529,6 +2536,18 @@ mod tests {
             serde_json::to_value(Effect::Restart).unwrap(),
             json!("restart")
         );
+    }
+
+    #[test]
+    fn openvino_fixed_rec_profile_schema_is_nullable_and_idle_reload() {
+        let field = config_sections()
+            .into_iter()
+            .flat_map(|section| section.fields)
+            .find(|field| field.path == "ocr.openvino.rec_fixed_width")
+            .expect("explicit recognition profile schema");
+        assert_eq!(field.kind, FieldKind::Int { min: 768, max: 768 });
+        assert!(field.nullable);
+        assert_eq!(field.effect, Effect::IdleReload);
     }
 
     #[test]

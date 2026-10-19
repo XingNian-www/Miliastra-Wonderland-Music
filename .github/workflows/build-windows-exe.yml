@@ -320,6 +320,10 @@ jobs:
         shell: pwsh
         run: cargo test --locked --no-default-features --features ocr-openvino configured_ir_models_recognize_fixture -- --ignored --nocapture
 
+      - name: OpenVINO 请求复用与 CTC 回归
+        shell: pwsh
+        run: cargo test --locked --no-default-features --features ocr-openvino runtime::ocr::engine::openvino::perf_tests -- --include-ignored --nocapture
+
       - name: 解析快速链接器 lld-link
         id: linker
         shell: pwsh

@@ -8,6 +8,10 @@
 
 use std::collections::BTreeMap;
 
+// 按消费模块拆分的模板文件：每个模块只写自己的文件，避免并行开发时互相覆盖。
+pub(crate) mod hall;
+pub(crate) mod playback;
+
 /// 一条可调整回复的元数据。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReplyTemplate {
@@ -215,6 +219,9 @@ pub(crate) fn catalog() -> impl Iterator<Item = &'static ReplyTemplate> {
         .iter()
         .chain(HELP_ENTERTAINMENT.iter())
         .chain(REPLY_SONG.iter())
+        // 按模块拆分的模板：新增模块时只在这里加一行。
+        .chain(playback::PLAYBACK.iter())
+        .chain(hall::HALL.iter())
 }
 
 #[cfg(test)]

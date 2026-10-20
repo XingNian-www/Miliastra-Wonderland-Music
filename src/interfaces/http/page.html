@@ -2438,7 +2438,9 @@ function onAiProviderChange(select){
     return
   }
   // 先保留当前表单全部值，再仅为留空字段填入新服务商默认值。
+  // 官方服务商的 Responses 地址可由 endpoint 推导，切换时清掉旧网关的显式地址。
   ai.provider=provider
+  if(provider!=='custom')ai.responses_endpoint=''
   if(String(ai.endpoint||'').trim()==='')ai.endpoint=defaults.endpoint
   if(String(ai.model||'').trim()==='')ai.model=defaults.model
   markConfigDirty('ai')

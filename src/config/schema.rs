@@ -74,12 +74,7 @@ pub enum FieldKind {
 /// （`get_path` 找不到即跳过）天然兼容，无需特殊处理。
 ///
 /// `store.rs` 的 `SECRET_PATHS` 引用本常量，禁止在别处重复定义。
-pub const SECRET_PATHS: &[&str] = &[
-    "http.access_token",
-    "ai.api_key",
-    "song_review.provider.api_key",
-    "turtle_soup.ai.api_key",
-];
+pub const SECRET_PATHS: &[&str] = &["http.access_token", "ai.api_key"];
 
 /// 配置字段 schema：路径、中文名、类型、生效级别、来源与提示。
 #[derive(Clone, Debug)]
@@ -1564,45 +1559,21 @@ fn turtle_soup_section() -> Vec<ConfigFieldSchema> {
             "海龟汤 AI 的裁决模板；可使用 {{verification_instruction}}、{{context}}、{{custom_prompt}}",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "ai.endpoint",
-            "AI 接口地址",
+            "model",
+            "专用模型",
             FieldKind::String,
-            "OpenAI 官方完整 Chat Completions 地址",
+            "海龟汤专用模型；留空沿用 ai.model。裁决偏重复杂逻辑，可用更强模型",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "ai.api_key",
-            "AI API Key",
-            FieldKind::Secret,
-            "填写 OpenAI API Key；不要提交到 Git",
-        ),
-        ConfigFieldSchema::db_idle_reload(
-            "ai.model",
-            "AI 模型",
-            FieldKind::String,
-            "高能力模型；请求只发送 OpenAI 标准 Chat Completions 字段",
-        ),
-        ConfigFieldSchema::db_idle_reload(
-            "ai.http_proxy",
-            "AI 代理",
-            FieldKind::String,
-            "可选的独立 HTTP(S) 代理；留空时沿用环境代理设置",
-        ),
-        ConfigFieldSchema::db_idle_reload(
-            "ai.max_tokens",
+            "max_tokens",
             "最大 Token",
             int(1, 1_000_000),
-            "单次裁决允许生成的最大 Token；程序按 OpenAI Chat Completions 的 max_tokens 字段发送",
-        ),
-        ConfigFieldSchema::db_idle_reload(
-            "ai.extra_body",
-            "第三方兼容字段",
-            FieldKind::Object,
-            "第三方兼容字段；默认空。Web 可载入主流网关模板或手动填写 JSON。只能补充字段，和程序固定字段同名时程序值优先",
+            "单次裁决允许生成的最大 Token",
         ),
     ]
 }
 
-/// ai 段：点歌 AI。
+/// ai 段：统一 AI 连接配置（点歌、歌曲审核、海龟汤共用）。
 fn ai_section() -> Vec<ConfigFieldSchema> {
     vec![
         ConfigFieldSchema::db_idle_reload(
@@ -1614,31 +1585,64 @@ fn ai_section() -> Vec<ConfigFieldSchema> {
                 ("deepseek".to_string(), "DeepSeek".to_string()),
                 ("custom".to_string(), "自定义网关".to_string()),
             ]),
-            "点歌 AI Provider。二段式配置：先选服务商，再按服务商填写参数；custom 必须填写 endpoint 与 model",
+            "所有 AI 功能共用的服务商。二段式配置：先选服务商，再按服务商填写参数；custom 必须填写 endpoint 与 model",
         ),
         ConfigFieldSchema::db_idle_reload(
             "api_key",
             "API Key",
             FieldKind::Secret,
-            "API Key。留空表示点歌 AI 未启用；不要提交到 Git，也不要放进 URL 查询参数",
+            "所有 AI 功能共用的 API Key。留空表示全部 AI 功能关闭；不要提交到 Git，也不要放进 URL 查询参数",
         ),
         ConfigFieldSchema::db_idle_reload(
             "endpoint",
             "接口地址",
             FieldKind::String,
-            "完整的 Chat Completions 请求地址，必须以 /chat/completions 结尾；非 custom Provider 留空时使用默认 endpoint",
+            "Chat Completions 地址，通常以 /chat/completions 结尾；Responses 地址默认由它推导。非 custom 留空时使用默认地址",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "responses_endpoint",
+            "Responses 地址",
+            FieldKind::String,
+            "可选的 Responses 地址；留空时把接口地址的 /chat/completions 换成 /responses",
         ),
         ConfigFieldSchema::db_idle_reload(
             "model",
-            "模型名",
+            "默认模型",
             FieldKind::String,
-            "模型名；点歌默认使用低延迟模型，custom 必须填写",
+            "所有 AI 功能的默认模型；各功能可单独覆盖，custom 必须填写",
         ),
         ConfigFieldSchema::db_idle_reload(
             "http_proxy",
             "代理",
             FieldKind::String,
-            "可选的独立 HTTP(S) 代理；只作用于点歌 AI，留空时沿用环境代理设置",
+            "可选的独立 HTTP(S) 代理；作用于全部 AI 功能，留空时沿用环境代理设置",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "wire_api",
+            "线上协议",
+            FieldKind::Enum(vec![
+                ("responses".to_string(), "Responses（推荐）".to_string()),
+                ("chat_completions".to_string(), "Chat Completions".to_string()),
+            ]),
+            "默认走 Responses。仅当网关（Kimi、GLM、部分自建网关）只支持 Chat Completions 时切换",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "extra_body",
+            "第三方兼容字段",
+            FieldKind::Object,
+            "服务商专属请求参数。Web 对 MiMo/OpenAI/DeepSeek 提供官方字段结构化表单；只有 custom 使用自由 JSON。与程序固定字段同名时程序值优先",
+        ),
+    ]
+}
+
+/// song_ai 段：点歌 AI 的提示词与本地推荐策略。
+fn song_ai_section() -> Vec<ConfigFieldSchema> {
+    vec![
+        ConfigFieldSchema::db_idle_reload(
+            "model",
+            "专用模型",
+            FieldKind::String,
+            "点歌专用模型；留空沿用 ai.model。点歌偏重低延迟",
         ),
         ConfigFieldSchema::db_idle_reload(
             "local_recommend",
@@ -1675,12 +1679,6 @@ fn ai_section() -> Vec<ConfigFieldSchema> {
             "选歌提示词",
             FieldKind::Text,
             "从候选中选歌的模板；可使用 {{request}}、{{preferAccompaniment}}、{{preferAccompanimentInstruction}}、{{candidates}}",
-        ),
-        ConfigFieldSchema::db_idle_reload(
-            "extra_body",
-            "第三方兼容字段",
-            FieldKind::Object,
-            "服务商专属请求参数。Web 对 MiMo/OpenAI/DeepSeek 提供官方字段结构化表单；只有 custom 使用自由 JSON。与程序固定字段同名时程序值优先",
         ),
     ]
 }
@@ -1749,34 +1747,22 @@ fn song_review_section() -> Vec<ConfigFieldSchema> {
             "追加审核规则；会附加在 policy_prompt 后面，用于临时补充口径",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "provider.endpoint",
-            "审核接口地址",
-            FieldKind::String,
-            "OpenAI 官方完整 Responses 地址；程序会固定要求 web_search",
-        ),
-        ConfigFieldSchema::db_idle_reload(
-            "provider.api_key",
-            "审核 API Key",
-            FieldKind::Secret,
-            "Responses API 使用 Authorization: Bearer <key>；不要提交到 Git",
-        ),
-        ConfigFieldSchema::db_idle_reload(
-            "provider.model",
+            "model",
             "审核模型",
             FieldKind::String,
-            "高能力审核模型；启用审核时必须同时填写 api_key",
+            "审核专用模型；留空沿用 ai.model。审核偏重判断质量，建议用更强模型",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "provider.http_proxy",
-            "审核代理",
-            FieldKind::String,
-            "可选的独立 HTTP(S) 代理；只作用于歌曲审核，留空时沿用环境代理设置",
+            "web_search",
+            "联网审核",
+            FieldKind::Bool,
+            "是否要求模型联网搜索后再判断；需要 ai.wire_api=responses，网关不支持时关闭",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "provider.extra_body",
-            "第三方兼容字段",
-            FieldKind::Object,
-            "第三方兼容字段；必须是 JSON object，与官方字段同名时官方值覆盖",
+            "max_tokens",
+            "最大 Token",
+            int(1, 1_000_000),
+            "单次审核允许生成的最大 Token",
         ),
     ]
 }
@@ -2179,7 +2165,7 @@ fn kugou_section() -> Vec<ConfigFieldSchema> {
     ]
 }
 
-/// 全部配置段 schema（29 段：与 AppConfig 顶层段一一对应，含 bootstrap 的 http/logging）。
+/// 全部配置段 schema（与 AppConfig 顶层段一一对应，含 bootstrap 的 http/logging）。
 pub fn config_sections() -> Vec<ConfigSectionSchema> {
     vec![
         ConfigSectionSchema {
@@ -2298,62 +2284,68 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
         },
         ConfigSectionSchema {
             name: "ai".to_string(),
-            label: "点歌 AI".to_string(),
+            label: "AI 连接".to_string(),
             order: 20,
             fields: with_section_prefix("ai", ai_section()),
         },
         ConfigSectionSchema {
+            name: "song_ai".to_string(),
+            label: "点歌 AI".to_string(),
+            order: 21,
+            fields: with_section_prefix("song_ai", song_ai_section()),
+        },
+        ConfigSectionSchema {
             name: "song_review".to_string(),
             label: "歌曲审核".to_string(),
-            order: 21,
+            order: 22,
             fields: with_section_prefix("song_review", song_review_section()),
         },
         ConfigSectionSchema {
             name: "matching".to_string(),
             label: "歌名匹配".to_string(),
-            order: 22,
+            order: 23,
             fields: with_section_prefix("matching", matching_section()),
         },
         ConfigSectionSchema {
             name: "hotkeys".to_string(),
             label: "全局热键".to_string(),
-            order: 23,
+            order: 24,
             fields: with_section_prefix("hotkeys", hotkeys_section()),
         },
         ConfigSectionSchema {
             name: "startup".to_string(),
             label: "启动流程".to_string(),
-            order: 24,
+            order: 25,
             fields: with_section_prefix("startup", startup_section()),
         },
         ConfigSectionSchema {
             name: "invite".to_string(),
             label: "邀请流程".to_string(),
-            order: 25,
+            order: 26,
             fields: with_section_prefix("invite", invite_section()),
         },
         ConfigSectionSchema {
             name: "friend_delivery".to_string(),
             label: "好友投递".to_string(),
-            order: 26,
+            order: 27,
             fields: with_section_prefix("friend_delivery", friend_delivery_section()),
         },
         ConfigSectionSchema {
             name: "custom_workflows".to_string(),
             label: "自定义流程".to_string(),
-            order: 27,
+            order: 28,
             fields: with_section_prefix("custom_workflows", custom_workflows_section()),
         },
         ConfigSectionSchema {
             name: "identity".to_string(),
             label: "身份映射".to_string(),
-            order: 28,
+            order: 29,
             fields: with_section_prefix("identity", identity_section()),
         },
         ConfigSectionSchema {
             name: "kugou".to_string(),
             label: "酷狗设备".to_string(),
-            order: 29,
+            order: 30,
             fields: with_section_prefix("kugou", kugou_section()),
         },
     ]

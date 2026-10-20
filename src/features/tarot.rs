@@ -1,5 +1,6 @@
 //! 本地稳定抽牌与可选AI解读。只产生聊天回复，不依赖播放器或娱乐会话。
 use super::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
+use super::reply_template::{tarot as templates, ReplyVars};
 use crate::text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
 use anyhow::{Result, anyhow, bail};
 use rand_chacha::{
@@ -179,12 +180,12 @@ impl TarotApplication {
         let (reroll, ai, question) = match command {
             TarotCommand::Help => {
                 return Ok([
-                    "#塔罗牌 [问题] 抽当天三张：现状、提醒、建议；带问题自动AI解读。",
-                    "#塔罗牌重抽 [问题] 提前换一组当天牌。",
-                    "#塔罗牌AI [问题] 解读当前三张，不重新抽牌。",
+                    reply(&templates::HELP_DRAW, ReplyVars::new()),
+                    reply(&templates::HELP_REROLL, ReplyVars::new()),
+                    reply(&templates::HELP_INTERPRET, ReplyVars::new()),
                 ]
                 .into_iter()
-                .flat_map(|text| fit_messages("塔罗", text))
+                .flat_map(|text| fit_messages("塔罗", &text))
                 .collect());
             }
             TarotCommand::Draw {
@@ -194,11 +195,11 @@ impl TarotApplication {
             } => (*reroll, *ai || !question.trim().is_empty(), question),
         };
         if question.chars().count() > MAX_QUESTION_CHARS || question.chars().any(char::is_control) {
-            return Ok(vec!["塔罗问题请使用不超过80字的单行文字。".into()]);
+            return Ok(vec![reply(&templates::QUESTION_TOO_LONG, ReplyVars::new())]);
         }
         let actor = actor.trim();
         if actor.is_empty() {
-            return Ok(vec!["塔罗需要先识别发言者，请稍后重试。".into()]);
+            return Ok(vec![reply(&templates::ACTOR_MISSING, ReplyVars::new())]);
         }
         let throttled = reroll || (ai && gateway.enabled());
         if throttled {
@@ -209,16 +210,18 @@ impl TarotApplication {
                 .map_err(|_| anyhow!("塔罗状态不可用"))?;
             recent.retain(|_, at| now.saturating_duration_since(*at) < COOLDOWN);
             if let Some(at) = recent.get(actor) {
-                return Ok(vec![format!(
-                    "塔罗冷却中，请{}秒后重抽或AI解读。",
-                    COOLDOWN
-                        .saturating_sub(now.saturating_duration_since(*at))
-                        .as_millis()
-                        .div_ceil(1000)
+                let seconds = COOLDOWN
+                    .saturating_sub(now.saturating_duration_since(*at))
+                    .as_millis()
+                    .div_ceil(1000)
+                    .to_string();
+                return Ok(vec![reply(
+                    &templates::COOLDOWN,
+                    ReplyVars::new().with("秒数", seconds),
                 )]);
             }
             if recent.len() >= MAX_ACTORS {
-                return Ok(vec!["塔罗暂忙，请稍后再试。".into()]);
+                return Ok(vec![reply(&templates::BUSY, ReplyVars::new())]);
             }
             recent.insert(actor.into(), now);
         }
@@ -229,7 +232,11 @@ impl TarotApplication {
             .take(12)
             .filter(|ch| !matches!(ch, '@' | '#' | '＃') && !ch.is_control())
             .collect();
-        let mut messages = fit_messages("塔罗", &format!("{nickname}的今日塔罗牌"));
+        let title = reply(
+            &templates::SPREAD_TITLE,
+            ReplyVars::new().with("昵称", nickname.clone()),
+        );
+        let mut messages = fit_messages("塔罗", &title);
         for card in &cards {
             messages.extend(fit_messages(
                 "牌义",
@@ -244,7 +251,7 @@ impl TarotApplication {
         }
         if ai {
             if !gateway.enabled() {
-                messages.push("塔罗AI未启用，请先配置AI；已保留基础牌义。".into());
+                messages.push(reply(&templates::AI_DISABLED, ReplyVars::new()));
             } else {
                 let interpretation = gateway
                     .interpret(question, &cards)
@@ -253,13 +260,22 @@ impl TarotApplication {
                     Ok(result) => messages.extend(result),
                     Err(error) => {
                         log::warn!("塔罗AI解读失败: {error:#}");
-                        messages.push("塔罗AI解读暂不可用，牌面不变，请参考基础牌义。".into());
+                        messages.push(reply(&templates::AI_UNAVAILABLE, ReplyVars::new()));
                     }
                 }
             }
         }
         Ok(messages)
     }
+}
+
+/// 渲染一条叙述性文案。
+///
+/// 塔罗的回复是 `Vec<String>`，在业务层就已拼成成品文本，组装层拿不到模板键，
+/// 因此这里只渲染内置默认文案；用户覆盖文案要生效，需要在组装层增加模板直通通道
+/// （见任务汇报）。牌面数据行（位置/牌名/正逆位/牌义）不走模板，保留原样。
+fn reply(spec: &super::reply_template::ReplyTemplate, vars: ReplyVars) -> String {
+    super::reply_template::render(spec, None, &vars).text
 }
 
 /// 固定UTC+8日序号，不依赖操作系统时区，也没有夏令时偏移。

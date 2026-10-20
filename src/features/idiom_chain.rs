@@ -13,6 +13,7 @@ use super::chat_text::{
 };
 use super::command::{CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch};
 use super::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
+use super::reply_template::{idiom_chain as templates, ReplyVars};
 use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 fn default_lexicon_path() -> std::path::PathBuf {
@@ -338,7 +339,7 @@ impl IdiomChainService {
         if entertainment.active() == Some(EntertainmentKind::TurtleSoup) {
             return Ok(outcome(
                 "occupied",
-                "海龟汤正在进行，请结束后再开始成语接龙",
+                reply(&templates::OCCUPIED_TURTLE_SOUP, ReplyVars::new()),
             ));
         }
         let acquired_for_start = if matches!(command, IdiomChainCommand::Start { .. }) {
@@ -348,7 +349,10 @@ impl IdiomChainService {
                 AcquireOutcome::Occupied(kind) => {
                     return Ok(outcome(
                         "occupied",
-                        format!("{}正在进行，请结束后再开始成语接龙", kind.label()),
+                        reply(
+                            &templates::OCCUPIED_OTHER,
+                            ReplyVars::new().with("其他玩法", kind.label()),
+                        ),
                     ));
                 }
             }
@@ -461,14 +465,11 @@ impl IdiomChainGame {
         now: Instant,
     ) -> IdiomChainOutcome {
         if !self.enabled {
-            return outcome("disabled", "成语接龙未启用");
+            return outcome("disabled", reply(&templates::DISABLED, ReplyVars::new()));
         }
 
         if !matches!(command, IdiomChainCommand::Start { .. }) && self.expire_if_idle(now) {
-            return outcome(
-                "expired",
-                "本局成语接龙已超时，请用 #接龙 或 #同音接龙 重新开局",
-            );
+            return outcome("expired", reply(&templates::EXPIRED, ReplyVars::new()));
         }
 
         match command {
@@ -490,7 +491,10 @@ impl IdiomChainGame {
     ) -> IdiomChainOutcome {
         self.expire_if_idle(now);
         if self.session.is_some() {
-            return outcome("already-active", "已有成语接龙正在进行，请先 #状态");
+            return outcome(
+                "already-active",
+                reply(&templates::ALREADY_ACTIVE, ReplyVars::new()),
+            );
         }
         let idiom = if raw_idiom.trim().is_empty() {
             let eligible = self
@@ -507,7 +511,10 @@ impl IdiomChainGame {
                 .cloned()
                 .collect::<Vec<_>>();
             let Some(idiom) = eligible.choose(&mut rand::thread_rng()) else {
-                return outcome("no-start-candidate", "词库中没有可用于随机开局的成语");
+                return outcome(
+                    "no-start-candidate",
+                    reply(&templates::NO_START_CANDIDATE, ReplyVars::new()),
+                );
             };
             idiom.clone()
         } else {
@@ -523,13 +530,22 @@ impl IdiomChainGame {
             .lexicon
             .has_unused_successor(expected_first, mode, &session.used)
         {
-            return outcome("dead-end-start", "这个成语没有可接词，请换一个开局成语");
+            return outcome(
+                "dead-end-start",
+                reply(&templates::DEAD_END_START, ReplyVars::new()),
+            );
         }
         self.session = Some(session);
         let expected = expected_start_description(expected_first, mode);
         outcome(
             "started",
-            format!("{}开始：{}。请接{}的成语。", mode.label(), idiom, expected),
+            reply(
+                &templates::STARTED,
+                ReplyVars::new()
+                    .with("模式", mode.label())
+                    .with("成语", idiom)
+                    .with("开头描述", expected),
+            ),
         )
     }
 
@@ -539,20 +555,26 @@ impl IdiomChainGame {
             Err(reply) => return outcome("invalid-submission", reply),
         };
         let Some(session) = self.session.as_ref() else {
-            return outcome("no-session", "还没有开局，请用 #接龙 或 #同音接龙 随机开局");
+            return outcome(
+                "no-session",
+                reply(&templates::NO_SESSION_START, ReplyVars::new()),
+            );
         };
         let first = first_char(&idiom);
         if !session.mode.accepts(session.expected_first, first) {
             return outcome(
                 "wrong-first-char",
-                format!(
-                    "接龙失败：请用{}。",
-                    expected_start_description(session.expected_first, session.mode)
+                reply(
+                    &templates::WRONG_FIRST_CHAR,
+                    ReplyVars::new().with(
+                        "开头描述",
+                        expected_start_description(session.expected_first, session.mode),
+                    ),
                 ),
             );
         }
         if session.used.contains(&idiom) {
-            return outcome("duplicate", "这个成语已经出现过了");
+            return outcome("duplicate", reply(&templates::DUPLICATE, ReplyVars::new()));
         }
 
         let next_first = last_char(&idiom);
@@ -571,28 +593,43 @@ impl IdiomChainGame {
             self.session = None;
             return outcome(
                 "completed",
-                format!("接龙封龙：{}。共接出 {} 个成语。", idiom, count),
+                reply(
+                    &templates::COMPLETED,
+                    ReplyVars::new()
+                        .with("成语", idiom)
+                        .with("数量", count.to_string()),
+                ),
             );
         }
         let expected = expected_start_description(next_first, session.mode);
         outcome(
             "accepted",
-            format!("接龙成功：{} -> {}。请接{}。", previous, idiom, expected),
+            reply(
+                &templates::ACCEPTED,
+                ReplyVars::new()
+                    .with("上一个", previous)
+                    .with("成语", idiom)
+                    .with("开头描述", expected),
+            ),
         )
     }
 
     fn status(&mut self) -> IdiomChainOutcome {
         let Some(session) = self.session.as_ref() else {
-            return outcome("no-session", "当前没有进行中的成语接龙");
+            return outcome("no-session", reply(&templates::NO_SESSION, ReplyVars::new()));
         };
         outcome(
             "status",
-            format!(
-                "{}当前第 {} 个：{}。请接{}。",
-                session.mode.label(),
-                session.total_count,
-                session.last_idiom,
-                expected_start_description(session.expected_first, session.mode)
+            reply(
+                &templates::STATUS,
+                ReplyVars::new()
+                    .with("模式", session.mode.label())
+                    .with("数量", session.total_count.to_string())
+                    .with("成语", session.last_idiom.clone())
+                    .with(
+                        "开头描述",
+                        expected_start_description(session.expected_first, session.mode),
+                    ),
             ),
         )
     }
@@ -608,14 +645,20 @@ impl IdiomChainGame {
         } else {
             return outcome(
                 "no-explanation-target",
-                "请使用 #解释 成语，或先开始一局接龙",
+                reply(&templates::NO_EXPLANATION_TARGET, ReplyVars::new()),
             );
         };
         let Some(details) = self.lexicon.explanation(&idiom) else {
-            return outcome("missing-explanation", "这个成语暂无来源和解释");
+            return outcome(
+                "missing-explanation",
+                reply(&templates::MISSING_EXPLANATION, ReplyVars::new()),
+            );
         };
         IdiomChainOutcome {
-            reply: format!("成语：{}", idiom),
+            reply: reply(
+                &templates::EXPLANATION_TITLE,
+                ReplyVars::new().with("成语", idiom.clone()),
+            ),
             action: "explained",
             explanation: Some(IdiomExplanation {
                 idiom,
@@ -627,38 +670,47 @@ impl IdiomChainGame {
 
     fn hint(&self) -> IdiomChainOutcome {
         let Some(session) = self.session.as_ref() else {
-            return outcome("no-session", "当前没有进行中的成语接龙");
+            return outcome("no-session", reply(&templates::NO_SESSION, ReplyVars::new()));
         };
         let Some(idiom) =
             self.lexicon
                 .first_safe_hint(session.expected_first, session.mode, &session.used)
         else {
-            return outcome("no-hint", "当前没有不会立即封龙的安全提示");
+            return outcome("no-hint", reply(&templates::NO_HINT, ReplyVars::new()));
         };
-        outcome("hint", format!("提示：{}", idiom))
+        outcome(
+            "hint",
+            reply(&templates::HINT, ReplyVars::new().with("成语", idiom)),
+        )
     }
 
     fn stop(&mut self, player: &str) -> IdiomChainOutcome {
         let Some(session) = self.session.as_ref() else {
-            return outcome("no-session", "当前没有进行中的成语接龙");
+            return outcome("no-session", reply(&templates::NO_SESSION, ReplyVars::new()));
         };
         if !self.allow_anyone_stop && !same_player(player, &session.starter) {
-            return outcome("stop-denied", "只有开局玩家可以结束本局接龙");
+            return outcome(
+                "stop-denied",
+                reply(&templates::STOP_DENIED, ReplyVars::new()),
+            );
         }
         let count = session.total_count;
         self.session = None;
         outcome(
             "stopped",
-            format!("成语接龙已结束，共接出 {} 个成语。", count),
+            reply(
+                &templates::STOPPED,
+                ReplyVars::new().with("数量", count.to_string()),
+            ),
         )
     }
 
-    fn lookup_idiom(&self, raw_idiom: &str) -> std::result::Result<String, &'static str> {
+    fn lookup_idiom(&self, raw_idiom: &str) -> std::result::Result<String, String> {
         let Some(idiom) = normalize_idiom(raw_idiom) else {
-            return Err("请输入只包含汉字的成语");
+            return Err(reply(&templates::INVALID_IDIOM, ReplyVars::new()));
         };
         if !self.lexicon.contains(&idiom) {
-            return Err("这个词不在当前成语词库中");
+            return Err(reply(&templates::IDIOM_NOT_IN_LEXICON, ReplyVars::new()));
         }
         Ok(idiom)
     }
@@ -932,10 +984,16 @@ fn pinyin_key(ch: char) -> Option<String> {
 
 fn expected_start_description(expected: char, mode: IdiomChainMode) -> String {
     match (mode, pinyin_key(expected)) {
-        (IdiomChainMode::Homophone, Some(pinyin)) => {
-            format!("与“{}”（{}）同音的字开头", expected, pinyin)
-        }
-        _ => format!("“{}”字开头", expected),
+        (IdiomChainMode::Homophone, Some(pinyin)) => reply(
+            &templates::EXPECTED_HOMOPHONE,
+            ReplyVars::new()
+                .with("字", expected.to_string())
+                .with("拼音", pinyin),
+        ),
+        _ => reply(
+            &templates::EXPECTED_EXACT,
+            ReplyVars::new().with("字", expected.to_string()),
+        ),
     }
 }
 
@@ -949,6 +1007,15 @@ fn with_default_label(value: String) -> String {
     } else {
         value
     }
+}
+
+/// 渲染一条回复文案。
+///
+/// 成语接龙的回复在业务层就拼成成品字符串（`IdiomChainOutcome.reply`），
+/// 组装层拿不到模板键，因此这里只渲染内置默认文案；用户覆盖文案要生效，
+/// 需要在组装层增加模板直通通道（见任务汇报）。
+fn reply(spec: &super::reply_template::ReplyTemplate, vars: ReplyVars) -> String {
+    super::reply_template::render(spec, None, &vars).text
 }
 
 fn outcome(action: &'static str, reply: impl Into<String>) -> IdiomChainOutcome {

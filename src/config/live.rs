@@ -62,6 +62,7 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "custom_workflows.templates",
     "custom_workflows.workflows",
     "identity.mappings",
+    "replies.overrides",
 ];
 
 /// 当前进程真正采用的配置快照。
@@ -137,6 +138,8 @@ pub struct LiveConfigs {
     pub custom_workflows: Arc<RwLock<CustomWorkflowConfig>>,
     /// identity.mappings（整段共享，身份查询直接挂在该句柄上）
     pub identity: IdentityAccess,
+    /// replies.overrides（整段共享，回复渲染直接读）
+    pub replies: Arc<RwLock<crate::config::RepliesConfig>>,
 }
 
 impl Default for LiveConfigs {
@@ -170,6 +173,7 @@ impl LiveConfigs {
             matching: Arc::new(RwLock::new(config.matching.clone())),
             custom_workflows: Arc::new(RwLock::new(config.custom_workflows.clone())),
             identity: IdentityAccess::new(config.identity.clone()),
+            replies: Arc::new(RwLock::new(config.replies.clone())),
         }
     }
 

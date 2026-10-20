@@ -63,14 +63,15 @@ impl SongRequestPort for ApplicationRuntime {
     }
 
     fn local_recommend(&self) -> bool {
-        self.lifecycle.live_configs.snapshot().ai.local_recommend
+        // 本地推荐策略在 b8605a5 从 ai 段迁到了 song_ai 段（点歌专属）。
+        self.lifecycle.live_configs.snapshot().song_ai.local_recommend
     }
 
     fn local_recommend_min_score(&self) -> f64 {
         self.lifecycle
             .live_configs
             .snapshot()
-            .ai
+            .song_ai
             .local_recommend_min_score
     }
 

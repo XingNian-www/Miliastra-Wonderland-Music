@@ -9,11 +9,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use async_openai::types::chat::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-    FinishReason, ResponseFormat,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -25,11 +20,12 @@ use super::{
     TurtleSoupDeliveryOutcome, TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose, TurtleSoupPuzzle,
     TurtleSoupSubmission,
 };
+use crate::config::ai::AiConfig;
 use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
 use crate::text::normalize_comparison_text;
 use miliastra_contracts::StateStore;
-use miliastra_kernel::ai::{Authentication, OpenAiRuntimeHandle, Target, validate_http_proxy};
+use miliastra_kernel::ai::OpenAiRuntimeHandle;
 use miliastra_kernel::clock::{Clock, Delay};
 use miliastra_kernel::identity::SessionGeneration;
 
@@ -65,7 +61,12 @@ pub struct TurtleSoupConfig {
     #[serde(default = "default_turtle_review_prompt")]
     pub review_prompt: String,
     pub custom_prompt: String,
-    pub ai: TurtleSoupAiConfig,
+    /// 可选的海龟汤专用模型；留空沿用 ai.model。
+    #[serde(default)]
+    pub model: String,
+    /// 单次裁决允许生成的最大 Token。
+    #[serde(default = "default_ai_max_tokens")]
+    pub max_tokens: u32,
 }
 
 impl Default for TurtleSoupConfig {
@@ -87,7 +88,8 @@ impl Default for TurtleSoupConfig {
             system_prompt: default_turtle_system_prompt(),
             review_prompt: default_turtle_review_prompt(),
             custom_prompt: String::new(),
-            ai: TurtleSoupAiConfig::default(),
+            model: String::new(),
+            max_tokens: default_ai_max_tokens(),
         }
     }
 }
@@ -109,38 +111,16 @@ impl TurtleSoupConfig {
             {
                 bail!("海龟汤题库和使用记录路径不能为空");
             }
-            validate_provider_config(&self.ai)?;
-        } else {
-            validate_http_proxy(&self.ai.http_proxy)
-                .context("turtle_soup.ai.http_proxy 配置无效")?;
+            if self.max_tokens == 0 {
+                bail!("turtle_soup.max_tokens 必须大于 0");
+            }
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TurtleSoupAiConfig {
-    pub endpoint: String,
-    pub api_key: String,
-    pub model: String,
-    #[serde(default)]
-    pub http_proxy: String,
-    pub max_tokens: u32,
-    pub extra_body: HashMap<String, Value>,
-}
-
-impl Default for TurtleSoupAiConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: OPENAI_DEFAULT_ENDPOINT.to_string(),
-            api_key: String::new(),
-            model: OPENAI_DEFAULT_MODEL.to_string(),
-            http_proxy: String::new(),
-            max_tokens: DEFAULT_AI_MAX_TOKENS,
-            extra_body: HashMap::new(),
-        }
-    }
+fn default_ai_max_tokens() -> u32 {
+    DEFAULT_AI_MAX_TOKENS
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -374,6 +354,7 @@ pub(crate) struct TurtleSoupService {
     config: TurtleSoupConfig,
     bank: TurtleSoupBankStore,
     openai: OpenAiRuntimeHandle,
+    ai: AiConfig,
     state: TurtleSoupState,
     worker_sender: SyncSender<TurtleSoupJob>,
     worker_receiver: Option<Arc<Mutex<Receiver<TurtleSoupJob>>>>,
@@ -391,6 +372,7 @@ pub(crate) struct TurtleSoupWorkerRuntime {
 struct TurtleSoupWorker {
     config: TurtleSoupConfig,
     openai: OpenAiRuntimeHandle,
+    ai: AiConfig,
     receiver: Arc<Mutex<Receiver<TurtleSoupJob>>>,
     shutting_down: Arc<AtomicBool>,
     cancelled_through: Arc<AtomicU64>,
@@ -399,8 +381,10 @@ struct TurtleSoupWorker {
 }
 
 impl TurtleSoupWorkerRuntime {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         config: TurtleSoupConfig,
+        ai: AiConfig,
         openai: OpenAiRuntimeHandle,
         receiver: Arc<Mutex<Receiver<TurtleSoupJob>>>,
         cancelled_through: Arc<AtomicU64>,
@@ -415,6 +399,7 @@ impl TurtleSoupWorkerRuntime {
             let worker = TurtleSoupWorker {
                 config: config.clone(),
                 openai: openai.clone(),
+                ai: ai.clone(),
                 receiver: receiver.clone(),
                 shutting_down: shutting_down.clone(),
                 cancelled_through: cancelled_through.clone(),
@@ -869,6 +854,7 @@ impl TurtleSoupAiCompletionPort for DiscardedAiCompletionPort {
 impl TurtleSoupService {
     pub(crate) fn new(
         mut config: TurtleSoupConfig,
+        ai: AiConfig,
         openai: OpenAiRuntimeHandle,
         clock: Arc<dyn Clock>,
         retry_delay: Arc<dyn Delay>,
@@ -884,6 +870,7 @@ impl TurtleSoupService {
             config,
             bank,
             openai,
+            ai,
             state: TurtleSoupState::default(),
             worker_sender,
             worker_receiver: Some(Arc::new(Mutex::new(worker_receiver))),
@@ -916,6 +903,7 @@ impl TurtleSoupService {
         let receiver = self.worker_receiver.take()?;
         Some(TurtleSoupWorkerRuntime::start(
             self.config.clone(),
+            self.ai.clone(),
             self.openai.clone(),
             receiver,
             self.cancelled_through.clone(),
@@ -1481,7 +1469,13 @@ impl TurtleSoupService {
         if !self.config.enabled {
             bail!("海龟汤功能未启用");
         }
-        validate_provider_config(&self.config.ai)?;
+        if self.config.max_tokens == 0 {
+            bail!("turtle_soup.max_tokens 必须大于 0");
+        }
+        // 共享连接未配置密钥时全部 AI 功能关闭；开局前就失败，避免读走题目后才报错。
+        if self.ai.api_key.trim().is_empty() {
+            bail!("海龟汤需要 AI 裁决，请先在配置中心填写 ai.api_key");
+        }
         if self.state.phase != TurtleSoupPhase::Idle {
             bail!("已有海龟汤正在进行");
         }
@@ -1882,34 +1876,23 @@ impl TurtleSoupWorker {
         context: &ReviewContext,
         verification: bool,
     ) -> Result<Judgment> {
-        validate_provider_config(&self.config.ai)?;
-        let request = build_ai_request(
-            &self.config.ai,
-            &render_turtle_system_prompt(&self.config.system_prompt, verification),
-            render_turtle_review_prompt(
-                &self.config.review_prompt,
-                &job.question,
-                context,
-                &self.config.custom_prompt,
-                verification,
-            ),
+        let system_prompt = render_turtle_system_prompt(&self.config.system_prompt, verification);
+        let user_prompt = render_turtle_review_prompt(
+            &self.config.review_prompt,
+            &job.question,
+            context,
+            &self.config.custom_prompt,
+            verification,
+        );
+        let content = crate::config::ai::request_json(
+            &self.openai,
+            &self.ai,
+            &self.config.model,
+            &system_prompt,
+            &user_prompt,
+            self.config.max_tokens,
+            Duration::from_secs(self.config.request_timeout_seconds.max(1)),
         )?;
-        let target = Target::chat(
-            &self.config.ai.endpoint,
-            &self.config.ai.api_key,
-            Authentication::Bearer,
-        )?;
-        let response = self
-            .openai
-            .chat_completion(
-                target,
-                request,
-                &self.config.ai.extra_body,
-                Duration::from_secs(self.config.request_timeout_seconds.max(1)),
-            )?
-            .wait()
-            .context("海龟汤 AI 请求失败")?;
-        let content = model_reply_content(&response)?;
         parse_judgment(&content)
     }
 }
@@ -2271,67 +2254,6 @@ fn settlement_messages(session: &TurtleSoupSession, reason: &SettlementReason) -
     messages
 }
 
-fn build_ai_request(
-    config: &TurtleSoupAiConfig,
-    system_prompt: &str,
-    user_prompt: String,
-) -> Result<CreateChatCompletionRequest> {
-    Ok(CreateChatCompletionRequestArgs::default()
-        .model(config.model.clone())
-        .messages(vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content(system_prompt)
-                .build()?
-                .into(),
-            ChatCompletionRequestUserMessageArgs::default()
-                .content(user_prompt)
-                .build()?
-                .into(),
-        ])
-        .response_format(ResponseFormat::JsonObject)
-        .stream(false)
-        .store(false)
-        .max_tokens(config.max_tokens)
-        .temperature(0.0_f32)
-        .build()?)
-}
-
-fn model_reply_content(value: &CreateChatCompletionResponse) -> Result<String> {
-    let Some(choice) = value.choices.first() else {
-        bail!("海龟汤 AI 响应缺少 choices[0]");
-    };
-    if choice.finish_reason == Some(FinishReason::Length) {
-        bail!("海龟汤 AI 响应达到 max_tokens 上限，JSON 可能不完整");
-    }
-    choice
-        .message
-        .content
-        .as_deref()
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("海龟汤 AI 响应缺少 choices[0].message.content"))
-}
-
-fn validate_provider_config(config: &TurtleSoupAiConfig) -> Result<()> {
-    if config.endpoint.trim().is_empty() {
-        bail!("turtle_soup.ai.endpoint 未配置");
-    }
-    if config.api_key.trim().is_empty() {
-        bail!("turtle_soup.ai.api_key 未配置");
-    }
-    validate_http_proxy(&config.http_proxy).context("turtle_soup.ai.http_proxy 配置无效")?;
-    Target::chat(&config.endpoint, &config.api_key, Authentication::Bearer)
-        .context("turtle_soup.ai Provider 配置无效")?;
-    if config.model.trim().is_empty() {
-        bail!("turtle_soup.ai.model 未配置");
-    }
-    if config.max_tokens == 0 {
-        bail!("turtle_soup.ai.max_tokens 必须大于 0");
-    }
-    Ok(())
-}
-
 fn default_turtle_system_prompt() -> String {
     "{{role}}{{verification_rules}}只返回合法 json 对象。".to_string()
 }
@@ -2545,10 +2467,25 @@ mod tests {
             .handle()
     }
 
+    fn test_ai_config() -> AiConfig {
+        AiConfig {
+            provider: "openai".to_string(),
+            api_key: "test-key".to_string(),
+            endpoint: "https://example.com/v1/chat/completions".to_string(),
+            model: "gpt-5.6".to_string(),
+            ..AiConfig::default()
+        }
+    }
+
     fn test_service(config: TurtleSoupConfig) -> TurtleSoupService {
+        test_service_with_ai(config, crate::config::ai::AiConfig::default())
+    }
+
+    fn test_service_with_ai(config: TurtleSoupConfig, ai: AiConfig) -> TurtleSoupService {
         let clock = Arc::new(ManualClock::new(Instant::now()));
         TurtleSoupService::new(
             config,
+            ai,
             test_openai(),
             clock.clone(),
             clock,
@@ -2578,13 +2515,12 @@ mod tests {
         assert_eq!(config.batch_max_parts, DEFAULT_BATCH_MAX_PARTS);
         assert_eq!(config.request_timeout_seconds, 20);
         assert_eq!(config.retry_count, 2);
-        assert_eq!(config.ai.endpoint, OPENAI_DEFAULT_ENDPOINT);
-        assert_eq!(config.ai.model, OPENAI_DEFAULT_MODEL);
-        assert_eq!(config.ai.max_tokens, DEFAULT_AI_MAX_TOKENS);
+        assert_eq!(config.model, "");
+        assert_eq!(config.max_tokens, DEFAULT_AI_MAX_TOKENS);
     }
 
     #[test]
-    fn module_configuration_validates_its_own_provider_before_startup() {
+    fn enabled_configuration_validates_its_own_limits() {
         let disabled = TurtleSoupConfig::default();
         disabled.validate().expect("disabled configuration");
 
@@ -2592,14 +2528,10 @@ mod tests {
             enabled: true,
             ..TurtleSoupConfig::default()
         };
-        assert!(enabled.validate().is_err());
-
-        enabled.ai.api_key = "key".to_string();
-        enabled.ai.endpoint = "not-a-url".to_string();
-        assert!(enabled.validate().is_err());
-
-        enabled.ai.endpoint = "https://example.com/v1/chat/completions".to_string();
         enabled.validate().expect("valid enabled configuration");
+
+        enabled.max_tokens = 0;
+        assert!(enabled.validate().is_err());
     }
 
     #[test]
@@ -2617,96 +2549,22 @@ mod tests {
     }
 
     #[test]
-    fn ai_request_uses_only_standard_chat_completion_parameters() {
-        let config = TurtleSoupAiConfig::default();
-        let request = build_ai_request(&config, core_system_prompt(false), "输出 json".into())
-            .expect("chat request");
-        let body = serde_json::to_value(request).expect("request json");
+    fn turtle_ai_defaults_fall_back_to_the_shared_connection() {
+        let config = TurtleSoupConfig::default();
 
-        assert_eq!(body["model"], OPENAI_DEFAULT_MODEL);
-        assert_eq!(body["response_format"]["type"], "json_object");
-        assert_eq!(body["temperature"].as_f64(), Some(0.0));
-        assert_eq!(
-            body["max_tokens"].as_u64(),
-            Some(DEFAULT_AI_MAX_TOKENS as u64)
-        );
-        assert_eq!(body["stream"], false);
-        assert_eq!(body["store"], false);
-        assert!(body.get("max_completion_tokens").is_none());
-        assert!(body.get("thinking").is_none());
-        assert!(body.get("top_p").is_none());
-        assert!(
-            body["messages"][0]["content"]
-                .as_str()
-                .is_some_and(|prompt| prompt.contains("json"))
-        );
+        assert_eq!(config.model, "");
+        assert_eq!(config.max_tokens, DEFAULT_AI_MAX_TOKENS);
     }
 
     #[test]
-    fn ai_request_uses_configured_standard_token_limit_for_custom_models() {
-        let config = TurtleSoupAiConfig {
-            endpoint: "https://example.com/v1/chat/completions".to_string(),
-            api_key: "test-key".to_string(),
-            model: "custom-model".to_string(),
-            http_proxy: String::new(),
-            max_tokens: 2_048,
-            extra_body: HashMap::new(),
+    fn turtle_ai_rejects_a_zero_token_limit() {
+        let mut config = TurtleSoupConfig {
+            enabled: true,
+            ..TurtleSoupConfig::default()
         };
-        let request =
-            build_ai_request(&config, "返回 json", "输出 json".into()).expect("chat request");
-        let body = serde_json::to_value(request).expect("request json");
+        config.max_tokens = 0;
 
-        assert!(body.get("thinking").is_none());
-        assert_eq!(body["max_tokens"].as_u64(), Some(2_048));
-        assert_eq!(body["temperature"].as_f64(), Some(0.0));
-    }
-
-    #[test]
-    fn model_reply_content_rejects_empty_or_truncated_json_output() {
-        let valid: CreateChatCompletionResponse = serde_json::from_value(json!({
-            "id": "chat-test",
-            "created": 0,
-            "model": "test-model",
-            "object": "chat.completion",
-            "choices": [{
-                "finish_reason": "stop",
-                "index": 0,
-                "message": { "role": "assistant", "content": "{\"decision\":\"yes\"}" }
-            }]
-        }))
-        .expect("typed valid response");
-        assert_eq!(
-            model_reply_content(&valid).unwrap(),
-            r#"{"decision":"yes"}"#
-        );
-
-        let truncated: CreateChatCompletionResponse = serde_json::from_value(json!({
-            "id": "chat-test",
-            "created": 0,
-            "model": "test-model",
-            "object": "chat.completion",
-            "choices": [{
-                "finish_reason": "length",
-                "index": 0,
-                "message": { "role": "assistant", "content": "{}" }
-            }]
-        }))
-        .expect("typed truncated response");
-        assert!(model_reply_content(&truncated).is_err());
-
-        let empty: CreateChatCompletionResponse = serde_json::from_value(json!({
-            "id": "chat-test",
-            "created": 0,
-            "model": "test-model",
-            "object": "chat.completion",
-            "choices": [{
-                "finish_reason": "stop",
-                "index": 0,
-                "message": { "role": "assistant", "content": "" }
-            }]
-        }))
-        .expect("typed empty response");
-        assert!(model_reply_content(&empty).is_err());
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -3381,7 +3239,7 @@ mod tests {
             .start_random_from_web(&mut EntertainmentState::new(), &mut TestDeliveryPort)
             .unwrap_err();
 
-        assert!(error.to_string().contains("turtle_soup.ai.api_key"));
+        assert!(error.to_string().contains("ai.api_key"), "{error}");
         assert_eq!(service.snapshot().phase, TurtleSoupPhase::Idle);
     }
 
@@ -3409,14 +3267,13 @@ mod tests {
         )
         .unwrap();
         fs::write(&used_path, "{}").unwrap();
-        let mut config = TurtleSoupConfig {
+        let config = TurtleSoupConfig {
             enabled: true,
             question_bank_path: bank_path,
             used_state_path: used_path.clone(),
             ..TurtleSoupConfig::default()
         };
-        config.ai.api_key = "test-key".to_string();
-        let mut service = test_service(config);
+        let mut service = test_service_with_ai(config, test_ai_config());
 
         let error = service
             .start_random_from_web(&mut EntertainmentState::new(), &mut TestDeliveryPort)
@@ -3428,43 +3285,11 @@ mod tests {
     }
 
     #[test]
-    fn provider_validation_rejects_invalid_urls_and_header_values() {
-        let mut config = TurtleSoupAiConfig {
-            endpoint: "not-a-url".to_string(),
-            api_key: "key".to_string(),
-            model: "model".to_string(),
-            ..TurtleSoupAiConfig::default()
-        };
-        assert!(validate_provider_config(&config).is_err());
+    fn turtle_model_override_is_optional() {
+        let config = TurtleSoupConfig::default();
 
-        config.endpoint = "https://example.com/v1/chat/completions".to_string();
-        config.api_key = "bad\nkey".to_string();
-        assert!(validate_provider_config(&config).is_err());
-
-        config.api_key = "key".to_string();
-        config.max_tokens = 0;
-        assert!(validate_provider_config(&config).is_err());
-    }
-
-    #[test]
-    fn provider_validation_rejects_an_unsupported_http_proxy() {
-        let config = TurtleSoupAiConfig {
-            endpoint: "https://example.com/v1/chat/completions".to_string(),
-            api_key: "key".to_string(),
-            model: "model".to_string(),
-            http_proxy: "socks5://127.0.0.1:1080".to_string(),
-            ..TurtleSoupAiConfig::default()
-        };
-
-        assert!(validate_provider_config(&config).is_err());
-    }
-
-    #[test]
-    fn disabled_configuration_still_rejects_an_unsupported_http_proxy() {
-        let mut config = TurtleSoupConfig::default();
-        config.ai.http_proxy = "socks5://127.0.0.1:1080".to_string();
-
-        assert!(config.validate().is_err());
+        assert!(config.model.is_empty());
+        assert_eq!(config.max_tokens, DEFAULT_AI_MAX_TOKENS);
     }
 
     #[test]
@@ -3505,6 +3330,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new(started_at));
         let mut service = TurtleSoupService::new(
             TurtleSoupConfig::default(),
+            crate::config::ai::AiConfig::default(),
             test_openai(),
             clock.clone(),
             clock.clone(),

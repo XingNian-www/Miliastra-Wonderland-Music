@@ -695,6 +695,7 @@ impl AppConfig {
 /// 只用于**库中已有数据**：启动加载、保存时未提交段（current）与回滚快照。
 /// 客户端提交段不经过此处，未知字段照旧被 save 拒绝（防篡改语义不变）。
 fn prune_unknown_schema_fields(sections: &mut Map<String, Value>) {
+    migrate_legacy_ai_sections(sections);
     let schema = config_schema_tree();
     sections.retain(|name, value| {
         let Some(node) = schema.get(name) else {
@@ -703,6 +704,80 @@ fn prune_unknown_schema_fields(sections: &mut Map<String, Value>) {
         prune_schema_value(value, node);
         true
     });
+}
+
+/// 把旧版分散的 AI Provider 迁到统一 `ai` 段。
+///
+/// 旧库有 `song_review.provider` 和/或 `turtle_soup.ai`（各自 endpoint/api_key/
+/// 代理）。清理未知字段前先迁移，否则密钥会随字段一起被静默丢弃。
+/// 只在统一段仍为空时填补，用户已在新结构填过的值绝不被覆盖。
+fn migrate_legacy_ai_sections(sections: &mut Map<String, Value>) {
+    let mut legacy: Map<String, Value> = Map::new();
+    for (section, path) in [("song_review", "provider"), ("turtle_soup", "ai")] {
+        let Some(source) = sections
+            .get(section)
+            .and_then(Value::as_object)
+            .and_then(|object| object.get(path))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for key in ["endpoint", "api_key", "model", "http_proxy", "extra_body"] {
+            let Some(value) = source.get(key) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            legacy.entry(key.to_string()).or_insert_with(|| value.clone());
+        }
+    }
+    if legacy.is_empty() {
+        return;
+    }
+    let ai = sections
+        .entry("ai".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(ai) = ai.as_object_mut() else {
+        return;
+    };
+    let responses_endpoint = legacy
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .filter(|endpoint| endpoint.ends_with("/responses"))
+        .map(str::to_string);
+    for (key, value) in legacy {
+        let is_empty = |current: Option<&Value>| {
+            current.is_none_or(|current| current.is_null() || current.as_str() == Some(""))
+        };
+        match key.as_str() {
+            // Responses 地址迁移到单独字段；统一 segment 的 endpoint 保留 Chat 地址。
+            "endpoint" => {
+                if let Some(responses_endpoint) = &responses_endpoint {
+                    if is_empty(ai.get("responses_endpoint")) {
+                        ai.insert(
+                            "responses_endpoint".to_string(),
+                            Value::String(responses_endpoint.clone()),
+                        );
+                    }
+                    if is_empty(ai.get("endpoint")) {
+                        ai.insert(
+                            "endpoint".to_string(),
+                            Value::String(
+                                responses_endpoint.replace("/responses", "/chat/completions"),
+                            ),
+                        );
+                    }
+                } else if is_empty(ai.get("endpoint")) {
+                    ai.insert("endpoint".to_string(), value);
+                }
+            }
+            "model" | "api_key" | "http_proxy" | "extra_body" if is_empty(ai.get(&key)) => {
+                ai.insert(key, value);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1466,6 +1541,70 @@ mod tests {
     use super::*;
     use crate::config::{HttpConfig, LoggingConfig};
     use serde_json::json;
+
+    #[test]
+    fn legacy_per_feature_ai_providers_migrate_into_the_shared_section() {
+        let mut sections = Map::from_iter([
+            (
+                "ai".to_string(),
+                json!({"provider": "openai", "api_key": "", "endpoint": "", "model": ""}),
+            ),
+            (
+                "song_review".to_string(),
+                json!({
+                    "provider": {
+                        "endpoint": "https://example.com/v1/responses",
+                        "api_key": "legacy-review-key",
+                        "model": "gpt-5.6",
+                        "http_proxy": "",
+                        "extra_body": {}
+                    }
+                }),
+            ),
+            (
+                "turtle_soup".to_string(),
+                json!({
+                    "ai": {
+                        "endpoint": "https://example.com/v1/chat/completions",
+                        "api_key": "legacy-soup-key",
+                        "model": "deepseek-v4-pro",
+                        "max_tokens": 2048
+                    }
+                }),
+            ),
+        ]);
+
+        prune_unknown_schema_fields(&mut sections);
+
+        let ai = sections["ai"].as_object().expect("shared ai section");
+        // 密钥只在统一段为空时填补，且首个迁移来源优先。
+        assert_eq!(ai["api_key"], json!("legacy-review-key"));
+        assert_eq!(ai["responses_endpoint"], json!("https://example.com/v1/responses"));
+        assert_eq!(ai["endpoint"], json!("https://example.com/v1/chat/completions"));
+        // 遗留段本身不再保留 provider / ai 子对象。
+        assert!(sections["song_review"].get("provider").is_none());
+        assert!(sections["turtle_soup"].get("ai").is_none());
+    }
+
+    #[test]
+    fn migration_never_overwrites_values_already_set_in_the_shared_section() {
+        let mut sections = Map::from_iter([
+            (
+                "ai".to_string(),
+                json!({"provider": "deepseek", "api_key": "current-key", "endpoint": "", "model": "m"}),
+            ),
+            (
+                "turtle_soup".to_string(),
+                json!({"ai": {"endpoint": "https://old.example/v1/chat/completions", "api_key": "old-key"}}),
+            ),
+        ]);
+
+        prune_unknown_schema_fields(&mut sections);
+
+        let ai = sections["ai"].as_object().expect("shared ai section");
+        assert_eq!(ai["api_key"], json!("current-key"));
+        assert_eq!(ai["endpoint"], json!("https://old.example/v1/chat/completions"));
+    }
 
     /// 构造测试用最小启动配置；统一数据库路径指向临时目录下的 playback.sqlite3
     /// （StateConfig::validate 要求 playback_state_path 文件名必须是 playback.sqlite3）。

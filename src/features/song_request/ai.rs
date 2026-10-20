@@ -2,32 +2,19 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use async_openai::types::chat::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ResponseFormat,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::SearchCandidate;
-use miliastra_kernel::ai::{Authentication, OpenAiRuntimeHandle, Target, validate_http_proxy};
-
-const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
-const MIMO_MODEL: &str = "mimo-v2.5";
-const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const OPENAI_MODEL: &str = "gpt-5.6-mini";
-const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
-const DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
+use crate::config::ai::AiConfig;
+use miliastra_kernel::ai::OpenAiRuntimeHandle;
 const CANDIDATE_PICK_LIMIT: usize = 30;
 const CANDIDATES_PER_SOURCE: usize = 5;
 
+/// 点歌 AI 的提示词与模型覆盖；连接参数统一来自 \`ai\` 段。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AiConfig {
-    pub provider: String,
-    pub api_key: String,
-    pub endpoint: String,
-    pub model: String,
+pub struct SongAiConfig {
     /// Chat Completions 的系统提示词；留空时使用内置默认值。
     #[serde(default = "default_ai_system_prompt")]
     pub system_prompt: String,
@@ -40,15 +27,15 @@ pub struct AiConfig {
     /// 从候选中选歌的提示词模板，可使用 {{request}}、{{preferAccompaniment}}、{{candidates}}。
     #[serde(default = "default_candidate_pick_prompt")]
     pub candidate_pick_prompt: String,
+    /// 可选的专用模型；留空沿用 ai.model。
     #[serde(default)]
-    pub http_proxy: String,
+    pub model: String,
     /// 在线匹配偏低时是否额外给出本地曲库推荐；默认开启。
     #[serde(default = "default_local_recommend")]
     pub local_recommend: bool,
     /// 在线候选分数低于该值才去比较本地曲库；本地分数必须严格更高才会推荐。
     #[serde(default = "default_local_recommend_min_score")]
     pub local_recommend_min_score: f64,
-    pub extra_body: HashMap<String, Value>,
 }
 
 fn default_local_recommend() -> bool {
@@ -59,98 +46,35 @@ fn default_local_recommend_min_score() -> f64 {
     0.6
 }
 
-impl Default for AiConfig {
+impl Default for SongAiConfig {
     fn default() -> Self {
         Self {
-            provider: "openai".to_string(),
-            api_key: String::new(),
-            endpoint: String::new(),
-            model: "gpt-5.6-mini".to_string(),
             system_prompt: default_ai_system_prompt(),
             recognize_prompt: default_recognize_prompt(),
             match_prompt: default_match_prompt(),
             candidate_pick_prompt: default_candidate_pick_prompt(),
-            http_proxy: String::new(),
+            model: String::new(),
             local_recommend: default_local_recommend(),
             local_recommend_min_score: default_local_recommend_min_score(),
-            extra_body: HashMap::new(),
         }
     }
 }
 
-impl AiConfig {
+impl SongAiConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.local_recommend_min_score.is_finite()
             || !(0.0..=1.0).contains(&self.local_recommend_min_score)
         {
-            bail!("ai.local_recommend_min_score 必须是 0 到 1 之间的有限小数");
-        }
-        validate_http_proxy(&self.http_proxy).context("ai.http_proxy 配置无效")?;
-        if self.api_key.trim().is_empty() {
-            return Ok(());
-        }
-        let provider = resolve_provider_config(self, None)?;
-        validate_provider_extra_body(provider.provider, &provider.extra_body)
-    }
-}
-
-fn validate_provider_extra_body(
-    provider: AiProvider,
-    extra_body: &HashMap<String, Value>,
-) -> Result<()> {
-    let optional_string = |key: &str, max_len: usize| -> Result<()> {
-        let Some(value) = extra_body.get(key).filter(|value| !value.is_null()) else {
-            return Ok(());
-        };
-        let text = value
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("ai.extra_body.{key} 必须是字符串"))?;
-        if text.chars().count() > max_len {
-            bail!("ai.extra_body.{key} 不能超过 {max_len} 个字符");
+            bail!("song_ai.local_recommend_min_score 必须是 0 到 1 之间的有限小数");
         }
         Ok(())
-    };
-    match provider {
-        AiProvider::OpenAi => {
-            optional_string("safety_identifier", 64)?;
-            if let Some(metadata) = extra_body.get("metadata").filter(|value| !value.is_null()) {
-                let object = metadata
-                    .as_object()
-                    .ok_or_else(|| anyhow::anyhow!("ai.extra_body.metadata 必须是 JSON object"))?;
-                if object.len() > 16 {
-                    bail!("ai.extra_body.metadata 不能超过 16 项");
-                }
-                for (key, value) in object {
-                    if key.chars().count() > 64 {
-                        bail!("ai.extra_body.metadata 的键不能超过 64 个字符");
-                    }
-                    let text = value.as_str().ok_or_else(|| {
-                        anyhow::anyhow!("ai.extra_body.metadata 的值必须是字符串")
-                    })?;
-                    if text.chars().count() > 512 {
-                        bail!("ai.extra_body.metadata 的值不能超过 512 个字符");
-                    }
-                }
-            }
-        }
-        AiProvider::DeepSeek => {
-            optional_string("user_id", 512)?;
-            if let Some(user_id) = extra_body.get("user_id").and_then(Value::as_str)
-                && !user_id
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-            {
-                bail!("ai.extra_body.user_id 只允许 a-zA-Z0-9-_");
-            }
-        }
-        AiProvider::Mimo | AiProvider::Custom => {}
     }
-    Ok(())
 }
 
 #[derive(Clone)]
 pub struct AiClient {
-    config: AiConfig,
+    config: SongAiConfig,
+    connection: AiConfig,
     request_timeout: Duration,
     openai: OpenAiRuntimeHandle,
 }
@@ -163,48 +87,42 @@ pub struct AiCandidatePickResult {
     pub score: f64,
 }
 
-#[derive(Clone, Debug)]
-struct AiProviderConfig {
-    provider: AiProvider,
-    endpoint: String,
-    api_key: String,
-    model: String,
-    system_prompt: String,
-    extra_body: HashMap<String, Value>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AiProvider {
-    Mimo,
-    OpenAi,
-    DeepSeek,
-    Custom,
-}
-
 impl AiClient {
-    pub fn new(config: &AiConfig, request_timeout: Duration, openai: OpenAiRuntimeHandle) -> Self {
+    pub fn new(
+        config: &SongAiConfig,
+        connection: &AiConfig,
+        request_timeout: Duration,
+        openai: OpenAiRuntimeHandle,
+    ) -> Self {
         Self {
             config: config.clone(),
+            connection: connection.clone(),
             request_timeout,
             openai,
         }
     }
 
     pub fn enabled(&self) -> bool {
-        !self.config.api_key.trim().is_empty()
+        !self.connection.api_key.trim().is_empty()
     }
 
     /// 共用连接配置和超时，但由独立业务提供系统提示词，避免混用点歌提示词。
     pub(crate) fn request_feature_json(&self, system: &str, prompt: &str) -> Result<Value> {
-        let mut provider = resolve_provider_config(&self.config, None)?;
-        provider.system_prompt = system.to_owned();
-        let reply = call_ai(&self.openai, &provider, prompt, 1024, self.request_timeout)?;
+        let reply = crate::config::ai::request_json(
+            &self.openai,
+            &self.connection,
+            &self.config.model,
+            system,
+            prompt,
+            1024,
+            self.request_timeout,
+        )?;
         Ok(serde_json::from_str(&model_reply_json_object(&reply)?)?)
     }
 
     fn match_song_identity_json(
         &self,
-        provider: &AiProviderConfig,
+        connection: &AiConfig,
         request: &str,
         song_name: &str,
         song_singer: &str,
@@ -214,9 +132,11 @@ impl AiClient {
         let song_singer = assert_no_control_chars(song_singer, "songSinger")?
             .trim()
             .to_string();
-        let reply = call_ai(
+        let reply = crate::config::ai::request_json(
             &self.openai,
-            provider,
+            connection,
+            &self.config.model,
+            &self.system_prompt(),
             &build_match_prompt(
                 &self.config.match_prompt,
                 &request,
@@ -231,6 +151,14 @@ impl AiClient {
         Ok(json)
     }
 
+    fn system_prompt(&self) -> String {
+        if self.config.system_prompt.trim().is_empty() {
+            default_ai_system_prompt()
+        } else {
+            self.config.system_prompt.clone()
+        }
+    }
+
     /// 二次搜索只改写检索关键词，不改写 OCR 原文或生成播放地址。
     pub fn rewrite_song_search(
         &self,
@@ -238,13 +166,20 @@ impl AiClient {
         prefer_accompaniment: bool,
         candidates: &[SearchCandidate],
     ) -> Result<Option<String>> {
-        let provider = resolve_provider_config(&self.config, None)?;
         let request = normalize_required(request, "request")?;
         if request.chars().count() > 256 {
             return Ok(None);
         }
         let prompt = build_search_rewrite_prompt(&request, prefer_accompaniment, candidates);
-        let reply = call_ai(&self.openai, &provider, &prompt, 1024, self.request_timeout)?;
+        let reply = crate::config::ai::request_json(
+            &self.openai,
+            &self.connection,
+            &self.config.model,
+            &self.system_prompt(),
+            &prompt,
+            1024,
+            self.request_timeout,
+        )?;
         parse_search_rewrite(&model_reply_json_object(&reply)?, &request)
     }
 
@@ -254,15 +189,16 @@ impl AiClient {
         prefer_accompaniment: bool,
         candidates: &[SearchCandidate],
     ) -> Result<AiCandidatePickResult> {
-        let provider = resolve_provider_config(&self.config, None)?;
         let request = normalize_required(request, "request")?;
         let candidates = truncate_candidates_per_source(candidates, CANDIDATES_PER_SOURCE);
         if candidates.is_empty() {
             bail!("缺少搜索候选");
         }
-        let reply = call_ai(
+        let reply = crate::config::ai::request_json(
             &self.openai,
-            &provider,
+            &self.connection,
+            &self.config.model,
+            &self.system_prompt(),
             &build_candidate_pick_prompt(
                 &self.config.candidate_pick_prompt,
                 &request,
@@ -370,11 +306,12 @@ fn truncate_candidates_per_source(
 
 impl AiClient {
     pub fn recognize_with_query(&self, query: &[(String, String)]) -> Result<String> {
-        let provider = resolve_provider_config(&self.config, Some(query))?;
         let text = normalize_required(query_value(query, "text").unwrap_or(""), "text")?;
-        let reply = call_ai(
+        let reply = crate::config::ai::request_json(
             &self.openai,
-            &provider,
+            &self.query_connection(query)?,
+            &self.config.model,
+            &self.system_prompt(),
             &build_recognize_prompt(&self.config.recognize_prompt, &text),
             1024,
             self.request_timeout,
@@ -385,17 +322,21 @@ impl AiClient {
     }
 
     pub fn match_with_query(&self, query: &[(String, String)]) -> Result<String> {
-        let provider = resolve_provider_config(&self.config, Some(query))?;
+        let connection = self.query_connection(query)?;
         self.match_song_identity_json(
-            &provider,
+            &connection,
             query_value(query, "request").unwrap_or(""),
             query_value(query, "songName").unwrap_or(""),
             query_value(query, "songSinger").unwrap_or(""),
         )
     }
 
+    /// 查询参数只能影响 provider/model：endpoint 与 apiKey 永远来自配置。
+    fn query_connection(&self, query: &[(String, String)]) -> Result<AiConfig> {
+        resolve_connection(&self.connection, query)
+    }
+
     pub fn pick_with_query(&self, query: &[(String, String)]) -> Result<String> {
-        let provider = resolve_provider_config(&self.config, Some(query))?;
         let request = normalize_required(query_value(query, "request").unwrap_or(""), "request")?;
         let prefer_accompaniment = parse_bool(query_value(query, "preferAccompaniment"));
         let candidates = parse_query_candidates(query_value(query, "candidates").unwrap_or(""))?;
@@ -403,9 +344,12 @@ impl AiClient {
         if indexed_candidates.is_empty() {
             bail!("缺少搜索候选");
         }
-        let reply = call_ai(
+        let connection = self.query_connection(query)?;
+        let reply = crate::config::ai::request_json(
             &self.openai,
-            &provider,
+            &connection,
+            &self.config.model,
+            &self.system_prompt(),
             &build_candidate_pick_prompt(
                 &self.config.candidate_pick_prompt,
                 &request,
@@ -444,100 +388,29 @@ fn parse_query_candidates(text: &str) -> Result<Vec<SearchCandidate>> {
     Ok(candidates)
 }
 
-fn resolve_provider_config(
-    config: &AiConfig,
-    query: Option<&[(String, String)]>,
-) -> Result<AiProviderConfig> {
-    let query_value = |key| query.and_then(|items| query_value(items, key));
-    // 安全加固:endpoint/apiKey 不允许通过查询参数覆盖(防止把配置中的
-    // 真实密钥作为 Bearer 头发往攻击者指定的端点,或用作 SSRF)。
-    if query_value("endpoint").is_some() {
+/// 解析一次点歌 AI 调用的目标；连接参数来自共享 `ai` 段。
+///
+/// Web 调试接口仍允许用查询参数临时覆盖 provider/model，但 endpoint 与
+/// apiKey 永不接受覆盖（防止把真实密钥发往攻击者端点或造成 SSRF）。
+fn resolve_connection(connection: &AiConfig, query: &[(String, String)]) -> Result<AiConfig> {
+    if query_value(query, "endpoint").is_some() {
         bail!("endpoint不允许通过查询参数覆盖,请在配置中心设置ai.endpoint");
     }
-    if query_value("apiKey").is_some() || query_value("api_key").is_some() {
+    if query_value(query, "apiKey").is_some() || query_value(query, "api_key").is_some() {
         bail!("apiKey不允许通过查询参数覆盖,请在配置中心设置ai.api_key");
     }
-    let provider_override = query_value("provider");
-    let provider = parse_provider(provider_override.unwrap_or(&config.provider))?;
-    let api_key = normalize_api_key(config.api_key.as_str())?;
-    let endpoint = resolve_endpoint(provider, config.endpoint.as_str())?;
-    let model = resolve_model(
-        provider,
-        query_value("model").unwrap_or(config.model.as_str()),
-    )?;
-    Ok(AiProviderConfig {
-        provider,
-        endpoint,
-        api_key,
-        model,
-        system_prompt: if config.system_prompt.trim().is_empty() {
-            default_ai_system_prompt()
-        } else {
-            config.system_prompt.clone()
-        },
-        extra_body: if provider_override.is_none()
-            || parse_provider(&config.provider).is_ok_and(|configured| configured == provider)
-        {
-            config.extra_body.clone()
-        } else {
-            HashMap::new()
-        },
-    })
-}
-
-fn parse_provider(value: &str) -> Result<AiProvider> {
-    match normalize_optional_text(value, "provider")?
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "mimo" => Ok(AiProvider::Mimo),
-        "openai" => Ok(AiProvider::OpenAi),
-        "deepseek" => Ok(AiProvider::DeepSeek),
-        "custom" => Ok(AiProvider::Custom),
-        _ => bail!("provider只允许mimo/openai/deepseek/custom"),
-    }
-}
-
-fn resolve_endpoint(provider: AiProvider, value: &str) -> Result<String> {
-    let text = normalize_optional_text(value, "endpoint")?;
-    let endpoint = if text.is_empty() {
-        match provider {
-            AiProvider::Mimo => MIMO_ENDPOINT,
-            AiProvider::OpenAi => OPENAI_ENDPOINT,
-            AiProvider::DeepSeek => DEEPSEEK_ENDPOINT,
-            AiProvider::Custom => bail!("custom provider缺少endpoint"),
+    let mut resolved = connection.clone();
+    if let Some(provider) = query_value(query, "provider") {
+        // 换服务商时丢弃原服务商的专属字段，避免私有参数跨供应商泄漏。
+        if provider != resolved.provider {
+            resolved.extra_body.clear();
         }
-        .to_string()
-    } else {
-        text
-    };
-    if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
-        bail!("endpoint必须以http://或https://开头")
+        resolved.provider = provider.to_string();
     }
-    Ok(endpoint)
-}
-
-fn resolve_model(provider: AiProvider, value: &str) -> Result<String> {
-    let text = normalize_optional_text(value, "model")?;
-    if !text.is_empty() {
-        return Ok(text);
+    if let Some(model) = query_value(query, "model") {
+        resolved.model = model.to_string();
     }
-    Ok(match provider {
-        AiProvider::Mimo => MIMO_MODEL,
-        AiProvider::OpenAi => OPENAI_MODEL,
-        AiProvider::DeepSeek => DEEPSEEK_MODEL,
-        AiProvider::Custom => bail!("custom provider缺少model"),
-    }
-    .to_string())
-}
-
-fn normalize_api_key(value: &str) -> Result<String> {
-    let text = normalize_required(value, "apiKey")?;
-    Ok(text)
-}
-
-fn normalize_optional_text(value: &str, name: &str) -> Result<String> {
-    Ok(assert_no_control_chars(value, name)?.trim().to_string())
+    Ok(resolved)
 }
 
 fn normalize_required(value: &str, name: &str) -> Result<String> {
@@ -786,69 +659,6 @@ fn json_string(value: &Value, key: &str) -> String {
         .to_string()
 }
 
-fn call_ai(
-    openai: &OpenAiRuntimeHandle,
-    config: &AiProviderConfig,
-    prompt: &str,
-    max_tokens: usize,
-    request_timeout: Duration,
-) -> Result<String> {
-    let request = build_ai_request(config, prompt, max_tokens)?;
-    call_ai_http(openai, config, request, request_timeout)
-}
-
-fn build_ai_request(
-    config: &AiProviderConfig,
-    prompt: &str,
-    max_tokens: usize,
-) -> Result<CreateChatCompletionRequest> {
-    Ok(CreateChatCompletionRequestArgs::default()
-        .model(config.model.clone())
-        .messages(vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content(config.system_prompt.as_str())
-                .build()?
-                .into(),
-            ChatCompletionRequestUserMessageArgs::default()
-                .content(prompt)
-                .build()?
-                .into(),
-        ])
-        .response_format(ResponseFormat::JsonObject)
-        .temperature(0.1_f32)
-        .stream(false)
-        .store(false)
-        .max_completion_tokens(u32::try_from(max_tokens).context("AI max_tokens 超出范围")?)
-        .top_p(0.95_f32)
-        .build()?)
-}
-
-fn call_ai_http(
-    openai: &OpenAiRuntimeHandle,
-    config: &AiProviderConfig,
-    request: CreateChatCompletionRequest,
-    request_timeout: Duration,
-) -> Result<String> {
-    let auth = if config.provider == AiProvider::Mimo {
-        Authentication::ApiKey
-    } else {
-        Authentication::Bearer
-    };
-    let target = Target::chat(&config.endpoint, &config.api_key, auth)?;
-    let response = openai
-        .chat_completion(target, request, &config.extra_body, request_timeout)?
-        .wait()
-        .with_context(|| format!("AI请求失败({:?})", config.provider))?;
-    response
-        .choices
-        .first()
-        .and_then(|choice| choice.message.content.as_deref())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("AI响应缺少choices[0].message.content"))
-}
-
 fn model_reply_json_object(reply: &str) -> Result<String> {
     let trimmed = reply.trim();
     if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
@@ -1084,139 +894,5 @@ mod tests {
         assert_eq!(value["score"], 0.8);
         assert_eq!(value["reason"], "best match");
         assert!(value.get("index").is_none());
-    }
-
-    #[test]
-    fn current_provider_names_require_an_explicit_supported_value() {
-        for provider in ["", "openai-compatible", "openai_compatible"] {
-            let config = AiConfig {
-                provider: provider.to_string(),
-                api_key: "secret".to_string(),
-                endpoint: "https://gateway.example/v1/chat/completions".to_string(),
-                model: "test-model".to_string(),
-                http_proxy: String::new(),
-                extra_body: HashMap::new(),
-                ..AiConfig::default()
-            };
-
-            let error = config.validate().expect_err("removed provider alias");
-
-            assert!(error.to_string().contains("provider只允许"));
-        }
-    }
-
-    #[test]
-    fn official_providers_resolve_current_default_models() {
-        for (provider, expected) in [
-            ("mimo", MIMO_MODEL),
-            ("openai", OPENAI_MODEL),
-            ("deepseek", DEEPSEEK_MODEL),
-        ] {
-            let config = AiConfig {
-                provider: provider.to_string(),
-                api_key: "secret".to_string(),
-                endpoint: String::new(),
-                model: String::new(),
-                http_proxy: String::new(),
-                extra_body: HashMap::new(),
-                ..AiConfig::default()
-            };
-
-            let resolved = resolve_provider_config(&config, None).expect("official provider");
-            assert_eq!(resolved.model, expected);
-        }
-    }
-
-    #[test]
-    fn official_provider_extra_body_rejects_invalid_typed_fields() {
-        let mut config = AiConfig {
-            provider: "deepseek".to_string(),
-            api_key: "secret".to_string(),
-            endpoint: String::new(),
-            model: String::new(),
-            http_proxy: String::new(),
-            extra_body: HashMap::from([("user_id".to_string(), json!("含中文"))]),
-            ..AiConfig::default()
-        };
-        assert!(config.validate().is_err());
-
-        config.provider = "openai".to_string();
-        config.extra_body = HashMap::from([("metadata".to_string(), json!(["not-object"]))]);
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn provider_rejects_an_unsupported_http_proxy() {
-        let config = AiConfig {
-            provider: "openai".to_string(),
-            api_key: "secret".to_string(),
-            endpoint: "https://gateway.example/v1/chat/completions".to_string(),
-            model: "test-model".to_string(),
-            http_proxy: "socks5://127.0.0.1:1080".to_string(),
-            extra_body: HashMap::new(),
-            ..AiConfig::default()
-        };
-
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn disabled_provider_still_rejects_an_unsupported_http_proxy() {
-        let config = AiConfig {
-            provider: "openai".to_string(),
-            api_key: String::new(),
-            endpoint: String::new(),
-            model: String::new(),
-            http_proxy: "socks5://127.0.0.1:1080".to_string(),
-            extra_body: HashMap::new(),
-            ..AiConfig::default()
-        };
-
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn ai_request_contains_only_standard_chat_completion_fields() {
-        let config = AiProviderConfig {
-            provider: AiProvider::Mimo,
-            endpoint: MIMO_ENDPOINT.to_string(),
-            api_key: "secret".to_string(),
-            model: MIMO_MODEL.to_string(),
-            system_prompt: default_ai_system_prompt(),
-            extra_body: HashMap::new(),
-        };
-        let request = build_ai_request(&config, "返回 JSON", 1_024).expect("chat request");
-        let body = serde_json::to_value(request).expect("request json");
-
-        assert_eq!(body["model"], MIMO_MODEL);
-        assert_eq!(body["response_format"]["type"], "json_object");
-        assert_eq!(body["max_completion_tokens"], 1_024);
-        assert_eq!(body["store"], false);
-        assert_eq!(body["stream"], false);
-        assert!(body.get("thinking").is_none());
-        assert!(body.get("enable_thinking").is_none());
-    }
-
-    #[test]
-    fn provider_override_only_keeps_compatibility_fields_for_the_configured_provider() {
-        let compatibility_fields =
-            HashMap::from([("thinking".to_string(), json!({ "type": "disabled" }))]);
-        let config = AiConfig {
-            provider: "mimo".to_string(),
-            api_key: "secret".to_string(),
-            endpoint: MIMO_ENDPOINT.to_string(),
-            model: MIMO_MODEL.to_string(),
-            http_proxy: String::new(),
-            extra_body: compatibility_fields.clone(),
-            ..AiConfig::default()
-        };
-
-        let configured = resolve_provider_config(&config, None).expect("configured provider");
-        assert_eq!(configured.extra_body, compatibility_fields);
-
-        let query = vec![("provider".to_string(), "openai".to_string())];
-        let overridden =
-            resolve_provider_config(&config, Some(&query)).expect("overridden provider");
-        assert!(overridden.extra_body.is_empty());
     }
 }

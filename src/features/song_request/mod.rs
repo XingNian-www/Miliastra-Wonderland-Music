@@ -12,7 +12,7 @@ use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
 
-pub(crate) use ai::{AiCandidatePickResult, AiClient, AiConfig};
+pub(crate) use ai::{AiCandidatePickResult, AiClient, SongAiConfig};
 pub(crate) use application::{
     ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
     SongRequestPort, SongSearchFailure,

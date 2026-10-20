@@ -80,6 +80,7 @@ fn field_json(
     field: &crate::config::ConfigFieldSchema,
     defaults: &Value,
     audio_cache_defaults: &Value,
+    visual_paths: &std::collections::BTreeSet<String>,
 ) -> Value {
     let source_defaults = if field.path.contains(".audio_cache.") {
         audio_cache_defaults
@@ -89,6 +90,8 @@ fn field_json(
     json!({
         "path": field.path,
         "label": field.label,
+        // 由视觉档案接管的字段：默认表单隐藏，避免与档案面板重复编辑。
+        "managedBy": if visual_paths.contains(&field.path) { json!("visual") } else { Value::Null },
         "kind": kind_json(&field.kind),
         "effect": field.effect,
         "source": source_str(field.source),
@@ -106,6 +109,7 @@ fn section_json(
     section: &ConfigSectionSchema,
     defaults: &Value,
     audio_cache_defaults: &Value,
+    visual_paths: &std::collections::BTreeSet<String>,
 ) -> Value {
     json!({
         "name": section.name,
@@ -114,8 +118,13 @@ fn section_json(
         "fields": section
             .fields
             .iter()
-            .map(|field| field_json(field, defaults, audio_cache_defaults))
+            .map(|field| field_json(field, defaults, audio_cache_defaults, visual_paths))
             .collect::<Vec<_>>(),
+        "visualFields": section
+            .fields
+            .iter()
+            .filter(|field| visual_paths.contains(&field.path))
+            .count(),
     })
 }
 
@@ -273,9 +282,10 @@ pub(super) fn config_schema_route(
 ) -> std::result::Result<String, AppError> {
     let defaults = default_config_json();
     let audio_cache_defaults = default_config_json_with_audio_cache();
+    let visual_paths = crate::config::visual::managed_paths();
     let sections = config_sections()
         .iter()
-        .map(|section| section_json(section, &defaults, &audio_cache_defaults))
+        .map(|section| section_json(section, &defaults, &audio_cache_defaults, &visual_paths))
         .collect::<Vec<_>>();
     serde_json::to_string(&json!({ "ok": true, "sections": sections })).map_err(internal_error)
 }
@@ -299,6 +309,7 @@ pub(super) fn config_section_route(
     let values = sections.get(name).cloned().unwrap_or(Value::Null);
     let defaults = default_config_json();
     let audio_cache_defaults = default_config_json_with_audio_cache();
+    let visual_paths = crate::config::visual::managed_paths();
     serde_json::to_string(&json!({
         "ok": true,
         "name": section.name,
@@ -307,8 +318,13 @@ pub(super) fn config_section_route(
         "fields": section
             .fields
             .iter()
-            .map(|field| field_json(field, &defaults, &audio_cache_defaults))
+            .map(|field| field_json(field, &defaults, &audio_cache_defaults, &visual_paths))
             .collect::<Vec<_>>(),
+        "visualFields": section
+            .fields
+            .iter()
+            .filter(|field| visual_paths.contains(&field.path))
+            .count(),
         "values": values,
         "revision": revision,
     }))
@@ -420,4 +436,87 @@ pub(super) fn config_rollback_route(
         .map_err(internal_error),
         Err(error) => Err(internal_error(error)),
     }
+}
+
+/// GET /config/visual: raw saved paths plus effective values, without unrelated secrets.
+pub(super) fn config_visual_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    use crate::config::visual::{VisualProfile, differences, match_catalog};
+    let store = lock_store(state)?;
+    let current = store.current_value().map_err(internal_error)?;
+    let profile = VisualProfile::export(&current).map_err(internal_error)?;
+    let snapshot = state.live_configs.snapshot();
+    let effective =
+        VisualProfile::export(&serde_json::to_value(&*snapshot).map_err(internal_error)?)
+            .map_err(internal_error)?;
+    // Runtime paths are resolved, stored paths intentionally are not. Report pending
+    // schema fields instead of claiming every path spelling difference is unapplied.
+    let pending = state.live_configs.pending_reload_fields();
+    serde_json::to_string(&json!({
+        "ok":true, "revision":store.current_revision().map_err(internal_error)?,
+        "profile":profile, "effectiveProfile":effective,
+        "pendingReloadFields":pending, "catalog":match_catalog(),
+        "statusNote":"保存值路径保持原样；生效值路径可能已解析。待重载字段以列表为准。",
+        "profileDifferences":differences(&profile,&effective).map_err(internal_error)?,
+    }))
+    .map_err(internal_error)
+}
+
+/// Preview is read-only. Import repeats validation and uses the preview revision CAS.
+fn visual_request(
+    body: &[u8],
+    state: &HttpSharedState,
+    commit: bool,
+) -> std::result::Result<String, AppError> {
+    use crate::config::visual::{VisualProfile, differences};
+    let body: Value = parse_json_body(body, "视觉档案请求")?;
+    let profile: VisualProfile = serde_json::from_value(
+        body.get("profile")
+            .cloned()
+            .ok_or_else(|| bad_request("请求必须包含 profile"))?,
+    )
+    .map_err(|e| bad_request(&format!("视觉档案格式错误: {e}")))?;
+    let mut store = lock_store(state)?;
+    let current = store.current_value().map_err(internal_error)?;
+    let candidate = profile
+        .candidate(&current)
+        .map_err(|e| bad_request(&e.to_string()))?;
+    let errors = store
+        .validate_candidate(&candidate)
+        .map_err(internal_error)?;
+    if !errors.is_empty() {
+        return serde_json::to_string(&validation_failed_json(&errors)).map_err(internal_error);
+    }
+    let revision = store.current_revision().map_err(internal_error)?;
+    if !commit {
+        let before = VisualProfile::export(&current).map_err(internal_error)?;
+        return serde_json::to_string(&json!({"ok":true,"revision":revision,"differences":differences(&before,&profile).map_err(internal_error)?,"errors":[]})).map_err(internal_error);
+    }
+    let base = body
+        .get("baseRevision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| bad_request("请求必须包含 baseRevision 整数"))?;
+    match store.save(base, candidate) {
+        Ok(outcome) => save_outcome_response_after_apply(state, &store, outcome, "视觉档案已导入"),
+        Err(ConfigSaveError::Conflict) => serde_json::to_string(
+            &json!({"ok":false,"code":"config_conflict","message":"配置已变化，请重新预览后导入"}),
+        )
+        .map_err(internal_error),
+        Err(e) => Err(internal_error(e)),
+    }
+}
+
+pub(super) fn config_visual_preview_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    visual_request(body, state, false)
+}
+pub(super) fn config_visual_import_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    visual_request(body, state, true)
 }

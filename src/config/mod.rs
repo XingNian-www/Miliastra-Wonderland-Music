@@ -14,7 +14,8 @@ use crate::features::idiom_chain::IdiomChainConfig;
 use crate::features::invite::{InviteConfig, InviteTimingConfig};
 use crate::features::moderation::{ModerationConfig, ModerationTimingConfig};
 use crate::features::playback::{MatchConfig, PlaybackTimingConfig, QueueConfig, SongDedupConfig};
-use crate::features::song_request::{AiConfig, SongReviewConfig};
+use crate::config::ai::AiConfig;
+use crate::features::song_request::{SongAiConfig, SongReviewConfig};
 use crate::features::startup::{StartupConfig, StartupTemplateConfig};
 use crate::features::turtle_soup::TurtleSoupConfig;
 use crate::features::undercover::UndercoverConfig;
@@ -71,9 +72,12 @@ pub struct AppConfig {
     /// 海龟汤；内嵌段可省略。
     #[serde(default)]
     pub turtle_soup: TurtleSoupConfig,
-    /// 点歌 AI；内嵌段可省略。
+    /// 统一 AI 连接配置（点歌、歌曲审核、海龟汤共用）；内嵌段可省略。
     #[serde(default)]
     pub ai: AiConfig,
+    /// 点歌 AI 的提示词与模型覆盖；内嵌段可省略。
+    #[serde(default)]
+    pub song_ai: SongAiConfig,
     /// 歌曲审核；内嵌段可省略。
     #[serde(default)]
     pub song_review: SongReviewConfig,
@@ -214,6 +218,7 @@ impl Default for AppConfig {
             undercover: UndercoverConfig::default(),
             turtle_soup: TurtleSoupConfig::default(),
             ai: AiConfig::default(),
+            song_ai: SongAiConfig::default(),
             song_review: SongReviewConfig::default(),
             matching: MatchConfig::default(),
             hotkeys: HotkeyConfig::default(),
@@ -490,6 +495,7 @@ impl AppConfig {
         self.custom_workflows.validate()?;
         self.startup.validate()?;
         self.ai.validate()?;
+        self.song_ai.validate()?;
         self.song_review.validate()?;
         self.turtle_soup.validate()?;
         self.identity.validate()?;
@@ -804,6 +810,7 @@ fn validate_nonempty_path(path: &Path, field: &str) -> Result<()> {
 }
 
 /// 配置 schema 声明（阶段 4a）：Web 配置页按此生成表单。
+pub(crate) mod ai;
 mod schema;
 pub(crate) use schema::*;
 
@@ -2964,10 +2971,8 @@ stale_timeout_ms: 7500
             "landlord.enabled",
             "undercover.enabled",
             "song_review.policy_prompt",
-            "song_review.provider.extra_body",
             "ai.extra_body",
             "turtle_soup.batch_max_parts",
-            "turtle_soup.ai.extra_body",
             "startup.wonderland_map_star_retries",
             "startup.wonderland_map_star_retry_ms",
             "startup.wonderland_hall_retries",
@@ -3012,11 +3017,7 @@ stale_timeout_ms: 7500
     fn http_proxy_fields_default_when_omitted_from_existing_config() {
         let mut value: serde_norway::Value =
             serde_norway::from_str(bundled_config_yaml()).expect("default config value");
-        for path in [
-            "song_review.provider.http_proxy",
-            "ai.http_proxy",
-            "turtle_soup.ai.http_proxy",
-        ] {
+        for path in ["ai.http_proxy"] {
             let segments = path.split('.').collect::<Vec<_>>();
             let mut parent = &mut value;
             for segment in &segments[..segments.len() - 1] {
@@ -3037,8 +3038,6 @@ stale_timeout_ms: 7500
             .expect("proxy fields are optional for existing configurations");
 
         assert!(config.ai.http_proxy.is_empty());
-        assert!(config.song_review.provider.http_proxy.is_empty());
-        assert!(config.turtle_soup.ai.http_proxy.is_empty());
     }
 
     #[test]

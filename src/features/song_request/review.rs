@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use async_openai::types::responses::{
     CreateResponse, CreateResponseArgs, OutputItem, OutputMessageContent, Response,
     ResponseFormatJsonSchema, Status, Tool, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
@@ -11,7 +10,8 @@ use miliastra_playback::TrackKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use miliastra_kernel::ai::{OpenAiRuntimeHandle, Target, validate_http_proxy};
+use crate::config::ai::{AiConfig, ResolvedAiTarget, WireApi};
+use miliastra_kernel::ai::OpenAiRuntimeHandle;
 use miliastra_kernel::clock::Delay;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,7 +31,15 @@ pub(crate) struct SongReviewConfig {
     pub review_prompt: String,
     pub policy_prompt: String,
     pub custom_prompt: String,
-    pub provider: SongReviewProviderConfig,
+    /// 可选的审核专用模型；留空沿用 ai.model。
+    #[serde(default)]
+    pub model: String,
+    /// 是否要求模型联网搜索后再判断；网关不支持 web_search 时应关闭。
+    #[serde(default = "default_web_search")]
+    pub web_search: bool,
+    /// 单次审核允许生成的最大 Token。
+    #[serde(default = "default_review_max_tokens")]
+    pub max_tokens: u32,
 }
 
 impl Default for SongReviewConfig {
@@ -47,15 +55,18 @@ impl Default for SongReviewConfig {
             review_prompt: default_song_review_prompt(),
             policy_prompt: default_song_review_policy_prompt(),
             custom_prompt: String::new(),
-            provider: SongReviewProviderConfig::default(),
+            model: String::new(),
+            web_search: default_web_search(),
+            max_tokens: default_review_max_tokens(),
         }
     }
 }
 
 impl SongReviewConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        validate_http_proxy(&self.provider.http_proxy)
-            .context("song_review.provider.http_proxy 配置无效")?;
+        if self.max_tokens == 0 {
+            bail!("song_review.max_tokens 必须大于 0");
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -65,19 +76,16 @@ impl SongReviewConfig {
         if self.reply_reason_max_chars == 0 {
             bail!("song_review.reply_reason_max_chars 必须大于 0");
         }
-        if self.provider.endpoint.trim().is_empty() {
-            bail!("song_review.provider.endpoint 未配置");
-        }
-        if self.provider.api_key.trim().is_empty() {
-            bail!("song_review.provider.api_key 未配置");
-        }
-        if self.provider.model.trim().is_empty() {
-            bail!("song_review.provider.model 未配置");
-        }
-        Target::responses(&self.provider.endpoint, &self.provider.api_key)
-            .context("song_review.provider 配置无效")?;
         Ok(())
     }
+}
+
+fn default_web_search() -> bool {
+    true
+}
+
+fn default_review_max_tokens() -> u32 {
+    512
 }
 
 fn default_song_review_policy_prompt() -> String {
@@ -97,20 +105,10 @@ pub(crate) enum SongReviewFailurePolicy {
     Allow,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SongReviewProviderConfig {
-    pub endpoint: String,
-    pub api_key: String,
-    pub model: String,
-    #[serde(default)]
-    pub http_proxy: String,
-    pub extra_body: HashMap<String, Value>,
-}
-
 #[derive(Clone)]
 pub(crate) struct SongReviewClient {
     config: SongReviewConfig,
+    ai: AiConfig,
     request_timeout: Duration,
     openai: OpenAiRuntimeHandle,
     retry_delay: Arc<dyn Delay>,
@@ -148,12 +146,14 @@ struct SongReviewResult {
 impl SongReviewClient {
     pub(crate) fn new(
         config: &SongReviewConfig,
+        ai: &AiConfig,
         request_timeout: Duration,
         openai: OpenAiRuntimeHandle,
         retry_delay: Arc<dyn Delay>,
     ) -> Self {
         Self {
             config: config.clone(),
+            ai: ai.clone(),
             request_timeout,
             openai,
             retry_delay,
@@ -233,23 +233,15 @@ impl SongReviewClient {
     }
 
     fn review_once(&self, candidate: &SongReviewCandidate) -> Result<SongReviewResult> {
-        if self.config.provider.endpoint.trim().is_empty() {
-            bail!("song_review.provider.endpoint 未配置");
+        if self.config.web_search && self.ai.wire_api != WireApi::Responses {
+            bail!("歌曲审核需要 web_search，必须使用 ai.wire_api=responses");
         }
-        if self.config.provider.api_key.trim().is_empty() {
-            bail!("song_review.provider.api_key 未配置");
-        }
-        if self.config.provider.model.trim().is_empty() {
-            bail!("song_review.provider.model 未配置");
-        }
-
-        let request = build_review_request(&self.config, candidate)?;
+        let target = self.ai.resolve(&self.config.model)?;
+        let request = build_review_request(&self.config, &target, candidate)?;
         let reply = call_review_http(
             &self.openai,
-            &self.config.provider.endpoint,
-            &self.config.provider.api_key,
+            &target,
             request,
-            &self.config.provider.extra_body,
             self.request_timeout,
         )?;
         let json_text = model_reply_json_object(&reply)?;
@@ -259,10 +251,12 @@ impl SongReviewClient {
 
 fn build_review_request(
     config: &SongReviewConfig,
+    target: &ResolvedAiTarget,
     candidate: &SongReviewCandidate,
 ) -> Result<CreateResponse> {
-    Ok(CreateResponseArgs::default()
-        .model(config.provider.model.clone())
+    let mut request = CreateResponseArgs::default();
+    request
+        .model(target.model.clone())
         .instructions(if config.system_prompt.trim().is_empty() {
             default_song_review_system_prompt()
         } else {
@@ -280,14 +274,17 @@ fn build_review_request(
             schema: review_schema(),
             strict: Some(true),
         })
-        .tools(vec![Tool::WebSearch(WebSearchTool::default())])
-        .tool_choice(ToolChoiceParam::Mode(ToolChoiceOptions::Required))
         .temperature(0.1_f32)
         .top_p(0.95_f32)
-        .max_output_tokens(512_u32)
+        .max_output_tokens(config.max_tokens)
         .store(false)
-        .stream(false)
-        .build()?)
+        .stream(false);
+    if config.web_search {
+        request
+            .tools(vec![Tool::WebSearch(WebSearchTool::default())])
+            .tool_choice(ToolChoiceParam::Mode(ToolChoiceOptions::Required));
+    }
+    Ok(request.build()?)
 }
 
 fn default_song_review_system_prompt() -> String {
@@ -372,15 +369,17 @@ fn review_schema() -> Value {
 
 fn call_review_http(
     openai: &OpenAiRuntimeHandle,
-    endpoint: &str,
-    api_key: &str,
+    target: &ResolvedAiTarget,
     request: CreateResponse,
-    extra_body: &HashMap<String, Value>,
     request_timeout: Duration,
 ) -> Result<String> {
-    let target = Target::responses(endpoint, api_key)?;
     let value = openai
-        .create_response(target, request, extra_body, request_timeout)?
+        .create_response(
+            target.build_target()?,
+            request,
+            &target.extra_body,
+            request_timeout,
+        )?
         .wait()?;
     response_output_text(&value)
 }
@@ -524,17 +523,11 @@ mod tests {
             enabled: true,
             retry_count: 2,
             retry_delay_ms: 500,
-            provider: SongReviewProviderConfig {
-                endpoint: String::new(),
-                api_key: "key".to_string(),
-                model: "gpt-5.6".to_string(),
-                http_proxy: String::new(),
-                extra_body: HashMap::new(),
-            },
             ..SongReviewConfig::default()
         };
         let client = SongReviewClient::new(
             &config,
+            &test_ai_config(),
             Duration::from_secs(1),
             test_openai(),
             clock.clone(),
@@ -557,40 +550,56 @@ mod tests {
         assert_eq!(clock.now(), started_at + Duration::from_secs(1));
     }
 
+    fn test_ai_config() -> AiConfig {
+        AiConfig {
+            provider: "openai".to_string(),
+            api_key: "key".to_string(),
+            endpoint: "https://example.com/v1/chat/completions".to_string(),
+            model: "gpt-5.6".to_string(),
+            ..AiConfig::default()
+        }
+    }
+
     #[test]
-    fn enabled_review_configuration_requires_a_valid_responses_endpoint() {
+    fn web_search_review_requires_the_responses_wire_api() {
+        let config = SongReviewConfig {
+            enabled: true,
+            web_search: true,
+            ..SongReviewConfig::default()
+        };
+        let mut ai = test_ai_config();
+        ai.wire_api = WireApi::ChatCompletions;
+        let client = SongReviewClient::new(
+            &config,
+            &ai,
+            Duration::from_secs(1),
+            test_openai(),
+            Arc::new(ManualClock::new(Instant::now())),
+        );
+        let candidate = SongReviewCandidate {
+            source: "qqmusic".to_string(),
+            title: "测试".to_string(),
+            artist: "歌手".to_string(),
+            duration_ms: None,
+            track_key: test_track("miliastra://track/qqmusic/wire", "测试 - 歌手")
+                .track_ref
+                .key,
+            message_type: "大厅".to_string(),
+            username: "测试者".to_string(),
+        };
+
+        let decision = client.review(&candidate);
+
+        assert!(decision.reason.contains("wire_api"), "{}", decision.reason);
+    }
+
+    #[test]
+    fn review_max_tokens_must_be_positive() {
         let mut config = SongReviewConfig {
             enabled: true,
             ..SongReviewConfig::default()
         };
-        config.provider.api_key = "key".to_string();
-        config.provider.model = "gpt-5.6".to_string();
-        config.provider.endpoint = "https://example.com/v1/chat/completions".to_string();
-
-        assert!(config.validate().is_err());
-
-        config.provider.endpoint = "https://example.com/v1/responses".to_string();
-        config.validate().expect("valid Responses provider");
-    }
-
-    #[test]
-    fn enabled_review_configuration_rejects_an_unsupported_http_proxy() {
-        let mut config = SongReviewConfig {
-            enabled: true,
-            ..SongReviewConfig::default()
-        };
-        config.provider.api_key = "key".to_string();
-        config.provider.model = "gpt-5.6".to_string();
-        config.provider.endpoint = "https://example.com/v1/responses".to_string();
-        config.provider.http_proxy = "socks5://127.0.0.1:1080".to_string();
-
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn disabled_review_configuration_still_rejects_an_unsupported_http_proxy() {
-        let mut config = SongReviewConfig::default();
-        config.provider.http_proxy = "socks5://127.0.0.1:1080".to_string();
+        config.max_tokens = 0;
 
         assert!(config.validate().is_err());
     }
@@ -715,7 +724,7 @@ mod tests {
     #[test]
     fn review_request_uses_standard_responses_web_search() {
         let mut config = SongReviewConfig::default();
-        config.provider.model = "gpt-5-mini".to_string();
+        config.model = "gpt-5-mini".to_string();
         let candidate = SongReviewCandidate {
             source: "qqmusic".to_string(),
             title: "晴天".to_string(),
@@ -727,7 +736,9 @@ mod tests {
             message_type: "大厅".to_string(),
             username: "测试".to_string(),
         };
-        let request = build_review_request(&config, &candidate).expect("responses request");
+        let target = test_ai_config().resolve(&config.model).expect("resolved target");
+        let request =
+            build_review_request(&config, &target, &candidate).expect("responses request");
         let body = serde_json::to_value(request).expect("request json");
 
         assert_eq!(body["tools"][0]["type"], "web_search");
@@ -744,7 +755,7 @@ mod tests {
     #[test]
     fn configured_review_prompt_replaces_policy_and_candidate_variables() {
         let mut config = SongReviewConfig::default();
-        config.provider.model = "gpt-5-mini".to_string();
+        config.model = "gpt-5-mini".to_string();
         config.system_prompt = "自定义审核角色".to_string();
         config.review_prompt =
             "规则={{policy_prompt}}\n歌曲={{candidate}}\n附加={{custom_prompt}}".to_string();
@@ -761,7 +772,9 @@ mod tests {
             message_type: "大厅".to_string(),
             username: "测试者".to_string(),
         };
-        let request = build_review_request(&config, &candidate).expect("responses request");
+        let target = test_ai_config().resolve(&config.model).expect("resolved target");
+        let request =
+            build_review_request(&config, &target, &candidate).expect("responses request");
         let body = serde_json::to_value(request).expect("request json");
         assert_eq!(body["instructions"], "自定义审核角色");
         let input = body["input"].as_str().expect("input text");

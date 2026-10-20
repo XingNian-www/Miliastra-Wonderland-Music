@@ -4395,13 +4395,33 @@ fn config_schema_route_lists_all_sections_with_defaults() {
         .find(|field| field["path"] == "ai.api_key")
         .expect("ai.api_key field");
     assert_eq!(api_key["kind"]["type"], "secret");
-    let system_prompt = ai["fields"]
+    // 统一后 ai 段只保留连接字段；提示词下放到各功能段。
+    let wire_api = ai["fields"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|field| field["path"] == "ai.system_prompt")
-        .expect("ai.system_prompt field");
-    assert_eq!(system_prompt["kind"]["type"], "text");
+        .find(|field| field["path"] == "ai.wire_api")
+        .expect("ai.wire_api field");
+    assert_eq!(wire_api["kind"]["type"], "enum");
+    assert!(
+        ai["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|field| field["path"] != "ai.system_prompt"),
+        "ai 段不应再声明提示词字段"
+    );
+    let song_ai = sections
+        .iter()
+        .find(|section| section["name"] == "song_ai")
+        .expect("song_ai section");
+    let song_prompt = song_ai["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["path"] == "song_ai.system_prompt")
+        .expect("song_ai.system_prompt field");
+    assert_eq!(song_prompt["kind"]["type"], "text");
     // audio_cache 默认 null，但其子字段 default 用"启用后默认对象"提供
     // （Web「启用」开关预填来源，避免用户手填 JSON）。
     let playback = sections
@@ -4461,23 +4481,14 @@ fn config_section_route_unknown_section_fails() {
 #[test]
 fn config_section_route_masks_secret_fields() {
     let state = test_state();
-    // 保存 ai.api_key 与 song_review.provider.api_key 真实值 → revision 2。
+    // 统一后只有 ai 段持有密钥：保存真实值 → revision 2。
     let mut sections = full_config_sections(&state);
     sections["ai"]["api_key"] = json!("sk-ai-real-1");
-    sections["song_review"]["provider"]["api_key"] = json!("sk-song-real-1");
     let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
     let saved: Value =
         serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
     assert_eq!(saved["ok"], true);
     assert_eq!(saved["revision"], 2);
-    // 再保存 turtle_soup.ai.api_key 真实值 → revision 3。
-    let mut sections = full_config_sections(&state);
-    sections["turtle_soup"]["ai"]["api_key"] = json!("sk-soup-real-1");
-    let body = serde_json::to_string(&json!({ "baseRevision": 2, "sections": sections })).unwrap();
-    let saved: Value =
-        serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
-    assert_eq!(saved["ok"], true);
-    assert_eq!(saved["revision"], 3);
 
     // ai 段：api_key 必须掩码且响应不含真实值。
     let ai: Value = serde_json::from_str(
@@ -4492,34 +4503,22 @@ fn config_section_route_masks_secret_fields() {
         "ai 段不得泄漏真实 api_key"
     );
 
-    // song_review 段：provider.api_key 必须掩码。
-    let song: Value = serde_json::from_str(
-        &config_section_route(&[("name".to_string(), "song_review".to_string())], &state).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        song["values"]["provider"]["api_key"],
-        crate::config::SECRET_MASK
-    );
-    assert!(
-        !serde_json::to_string(&song["values"])
-            .unwrap()
-            .contains("sk-song-real-1"),
-        "song_review 段不得泄漏真实 api_key"
-    );
-
-    // turtle_soup 段：ai.api_key 必须掩码。
-    let soup: Value = serde_json::from_str(
-        &config_section_route(&[("name".to_string(), "turtle_soup".to_string())], &state).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(soup["values"]["ai"]["api_key"], crate::config::SECRET_MASK);
-    assert!(
-        !serde_json::to_string(&soup["values"])
-            .unwrap()
-            .contains("sk-soup-real-1"),
-        "turtle_soup 段不得泄漏真实 api_key"
-    );
+    // 统一后其它段不再持有密钥：既没有 api_key 字段，也不会出现任何明文。
+    for section in ["song_ai", "song_review", "turtle_soup"] {
+        let value: Value = serde_json::from_str(
+            &config_section_route(&[("name".to_string(), section.to_string())], &state).unwrap(),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&value["values"]).unwrap();
+        assert!(
+            !serialized.contains("api_key"),
+            "{section} 段不应再持有 api_key"
+        );
+        assert!(
+            !serialized.contains("sk-ai-real-1"),
+            "{section} 段不得泄漏 ai.api_key"
+        );
+    }
 
     // http 段：bootstrap 注入的 access_token 即使未保存也必须掩码。
     let http_token = state
@@ -4548,8 +4547,6 @@ fn config_section_route_masks_secret_fields() {
     let store = state.config_store.lock().unwrap();
     let full = store.load_full().unwrap();
     assert_eq!(full.ai.api_key, "sk-ai-real-1");
-    assert_eq!(full.song_review.provider.api_key, "sk-song-real-1");
-    assert_eq!(full.turtle_soup.ai.api_key, "sk-soup-real-1");
 }
 
 #[test]

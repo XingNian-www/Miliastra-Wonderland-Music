@@ -744,6 +744,27 @@ impl HallApplicationPort for ApplicationRuntime {
         ApplicationRuntime::reply(self, message)
     }
 
+    fn reply_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        // features 层只声明模板；覆盖文案在组装层查，业务模块不依赖配置中心。
+        let override_text = self
+            .lifecycle
+            .live_configs
+            .replies
+            .read()
+            .ok()
+            .and_then(|config| config.get(spec.key).map(str::to_string));
+        let rendered =
+            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
+        if !rendered.missing.is_empty() {
+            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
+        }
+        ApplicationRuntime::reply(self, &rendered.text)
+    }
+
     fn log_executed(&mut self, context: &HallCommandContext, final_command: &str) -> Result<()> {
         self.log_executed_command_fields(
             &context.message_type,
@@ -850,6 +871,27 @@ impl HallMaintenancePort for ApplicationRuntime {
 
     fn reply(&mut self, message: &str) -> Result<()> {
         ApplicationRuntime::reply(self, message)
+    }
+
+    fn reply_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        // features 层只声明模板；覆盖文案在组装层查，业务模块不依赖配置中心。
+        let override_text = self
+            .lifecycle
+            .live_configs
+            .replies
+            .read()
+            .ok()
+            .and_then(|config| config.get(spec.key).map(str::to_string));
+        let rendered =
+            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
+        if !rendered.missing.is_empty() {
+            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
+        }
+        ApplicationRuntime::reply(self, &rendered.text)
     }
 
     fn mark_hall_expiring_warning_sent(&mut self) -> Result<()> {

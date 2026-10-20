@@ -173,6 +173,22 @@ impl Display for SongSearchFailure {
 pub(crate) trait SongRequestPort {
     fn reply(&self, message: &str) -> Result<()>;
 
+    /// 按模板键回复。
+    ///
+    /// 业务层只声明"用哪条模板、带哪些变量"，**不知道配置存在**；
+    /// 覆盖文案的查找由实现方（composition 层）负责，这样 features 层
+    /// 不会反向依赖配置中心。
+    ///
+    /// 默认实现按内置文案渲染，保证不接配置的调用方（测试替身）也能工作。
+    fn reply_template(
+        &self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        let rendered = crate::features::reply_template::render(spec, None, vars);
+        self.reply(&rendered.text)
+    }
+
     /// allow_local 为 false 时 @本地 会被忽略（继续等待其他确认命令）。
     fn prompt_and_wait_for_decision_batch(
         &mut self,
@@ -487,7 +503,11 @@ impl SongRequestExecution<'_> {
         if self.queue_contains_request(&request)? {
             log::info!("队列已有: {}", request.keyword);
             self.log_executed_command(context, &request.final_command("duplicate"))?;
-            self.reply(&format!("队列已有: {}", request.keyword))?;
+            self.reply_template(
+                &crate::features::reply_template::song::SONG[0],
+                &crate::features::reply_template::ReplyVars::new()
+                    .with("歌名", request.keyword.clone()),
+            )?;
             return Ok(());
         }
         if !self.playback_queue()?.is_empty() {
@@ -506,7 +526,11 @@ impl SongRequestExecution<'_> {
                         .is_some_and(|current| current.track_ref.key == requested.track_ref.key)
                 }) {
                     self.log_executed_command(context, &request.final_command("already-playing"))?;
-                    self.reply(&format!("当前正在播放: {}", request.keyword))?;
+                    self.reply_template(
+                    &crate::features::reply_template::song::SONG[1],
+                    &crate::features::reply_template::ReplyVars::new()
+                        .with("歌名", request.keyword.clone()),
+                )?;
                     return Ok(());
                 }
                 if self
@@ -573,7 +597,10 @@ impl SongRequestExecution<'_> {
             return Ok(false);
         }
         self.log_executed_command(context, "queue-full-early")?;
-        self.reply(QUEUE_PUSH_FEEDBACK.full_reply)?;
+        self.reply_template(
+            &crate::features::reply_template::song::SONG[11],
+            &crate::features::reply_template::ReplyVars::new(),
+        )?;
         Ok(true)
     }
 
@@ -584,7 +611,12 @@ impl SongRequestExecution<'_> {
         error: &SongSearchFailure,
     ) -> Result<()> {
         log::error!("{context}: {error}");
-        self.reply(&format!("{}{}", label, error.user_message()))
+        self.reply_template(
+            &crate::features::reply_template::song::SONG[9],
+            &crate::features::reply_template::ReplyVars::new()
+                .with("标签", label.to_string())
+                .with("原因", error.user_message()),
+        )
     }
 
     fn resolve_song_request(&mut self, song: &SongCommand) -> Result<Option<ResolvedSongRequest>> {
@@ -640,19 +672,22 @@ impl SongRequestExecution<'_> {
                 song.keyword,
                 label
             );
-            self.reply(&format!(
-                "{}{}",
-                label,
-                if include_configuration_hint {
-                    "AI点歌未启用，请先配置 ai.api_key"
-                } else {
-                    "AI点歌未启用"
-                }
-            ))?;
+            let spec = if include_configuration_hint {
+                &crate::features::reply_template::song::SONG[3]
+            } else {
+                &crate::features::reply_template::song::SONG[2]
+            };
+            self.reply_template(
+                spec,
+                &crate::features::reply_template::ReplyVars::new().with("标签", label.clone()),
+            )?;
             return Ok(None);
         }
 
-        self.reply(&format!("{}AI匹配中", label))?;
+        self.reply_template(
+            &crate::features::reply_template::song::SONG[4],
+            &crate::features::reply_template::ReplyVars::new().with("标签", label.clone()),
+        )?;
 
         let search_source = ai_candidate_source(song, self.friend_or_above);
         let allow_bilibili = self.friend_or_above;
@@ -704,7 +739,12 @@ impl SongRequestExecution<'_> {
                         if let Some(query) =
                             super::ai::validated_search_rewrite(&song.keyword, &query)
                         {
-                            self.reply(&format!("{}AI理解搜索词:{}，再次搜索", label, query))?;
+                            self.reply_template(
+                                &crate::features::reply_template::song::SONG[5],
+                                &crate::features::reply_template::ReplyVars::new()
+                                    .with("标签", label.clone())
+                                    .with("搜索词", query.clone()),
+                            )?;
                             match self.search_ai_candidates(&query, search_source, allow_bilibili) {
                                 Ok(second) => {
                                     candidates =
@@ -712,10 +752,11 @@ impl SongRequestExecution<'_> {
                                 }
                                 Err(error) => {
                                     log::warn!("AI二次搜索失败，保留首次候选: {error}");
-                                    self.reply(&format!(
-                                        "{}二次搜索失败，保留首次搜索结果",
-                                        label
-                                    ))?;
+                                    self.reply_template(
+                                        &crate::features::reply_template::song::SONG[6],
+                                        &crate::features::reply_template::ReplyVars::new()
+                                            .with("标签", label.clone()),
+                                    )?;
                                 }
                             }
                         }
@@ -733,7 +774,10 @@ impl SongRequestExecution<'_> {
         });
         if candidates.merged.is_empty() {
             log::info!("命令未执行：无可用候选 keyword={}", song.keyword);
-            self.reply(&format!("{}平台无对应歌曲音源", label))?;
+            self.reply_template(
+                &crate::features::reply_template::song::SONG[7],
+                &crate::features::reply_template::ReplyVars::new().with("标签", label.clone()),
+            )?;
             return Ok(None);
         }
 
@@ -746,7 +790,11 @@ impl SongRequestExecution<'_> {
             Ok(result) => result,
             Err(error) => {
                 log::error!("AI点歌选择候选失败: {error:#}");
-                self.reply(&format!("{}AI点歌识别失败", label))?;
+                self.reply_template(
+                    &crate::features::reply_template::song::SONG[8],
+                    &crate::features::reply_template::ReplyVars::new()
+                        .with("标签", label.clone()),
+                )?;
                 return Ok(None);
             }
         };
@@ -1243,22 +1291,41 @@ impl SongRequestExecution<'_> {
         match outcome {
             SongQueuePushOutcome::Added(len) => {
                 self.log_executed_command(context, &request.final_command(feedback.queued_action))?;
-                self.reply(&format!(
-                    "{}({}/{}): {}",
-                    feedback.queued_prefix, len, self.queue_max_size, request.keyword
-                ))?;
+                self.reply_template(
+                    &crate::features::reply_template::song::SONG[10],
+                    &crate::features::reply_template::ReplyVars::new()
+                        .with("前缀", feedback.queued_prefix)
+                        .with("当前", len.to_string())
+                        .with("上限", self.queue_max_size.to_string())
+                        .with("歌名", request.keyword.clone()),
+                )?;
             }
             SongQueuePushOutcome::Duplicate => {
                 self.log_executed_command(context, &request.final_command("duplicate"))?;
-                self.reply(&format!("队列已有: {}", request.keyword))?;
+                self.reply_template(
+                &crate::features::reply_template::song::SONG[0],
+                &crate::features::reply_template::ReplyVars::new()
+                    .with("歌名", request.keyword.clone()),
+            )?;
             }
             SongQueuePushOutcome::Full => {
                 self.log_executed_command(context, &request.final_command(feedback.full_action))?;
-                self.reply(feedback.full_reply)?;
+                self.reply_template(
+                    if feedback.full_reply == QUEUE_PUSH_FEEDBACK.full_reply {
+                        &crate::features::reply_template::song::SONG[11]
+                    } else {
+                        &crate::features::reply_template::song::SONG[12]
+                    },
+                    &crate::features::reply_template::ReplyVars::new(),
+                )?;
             }
             SongQueuePushOutcome::DedupLimited => {
                 self.log_executed_command(context, &request.final_command("dedup-limited-queue"))?;
-                self.reply(&request.dedup_reject_message())?;
+                self.reply_template(
+                    &crate::features::reply_template::song::SONG[13],
+                    &crate::features::reply_template::ReplyVars::new()
+                        .with("歌名", request.keyword.clone()),
+                )?;
             }
         }
         Ok(())
@@ -1381,15 +1448,27 @@ impl SongRequestExecution<'_> {
             |level| format!("review-reject-level-{level}"),
         );
         self.log_executed_command(context, &request.final_command(&action))?;
-        self.reply(&review_reject_reply(
-            &reason,
-            self.song_review.reply_reason_max_chars(),
-        ))?;
+        self.reply_template(
+            &crate::features::reply_template::song::SONG[14],
+            &crate::features::reply_template::ReplyVars::new().with(
+                "原因",
+                shortened_review_reason(&reason, self.song_review.reply_reason_max_chars()),
+            ),
+        )?;
         Ok(false)
     }
 
     fn reply(&self, message: &str) -> Result<()> {
         self.port.reply(message)
+    }
+
+    /// 按模板键回复；覆盖文案由 port 实现方查找。
+    fn reply_template(
+        &self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        self.port.reply_template(spec, vars)
     }
 
     /// 展示候选并等待选择。messages 是首批消息（在线提示，必要时附带本地推荐行）；
@@ -1899,15 +1978,18 @@ fn normalized_review_reason(reason: &str) -> String {
     }
 }
 
-fn review_reject_reply(reason: &str, max_chars: usize) -> String {
+/// 只做"规范化 + 按上限截断"，不拼前缀。
+///
+/// 前缀文案由模板 `song.review.rejected` 提供，因此这里不再返回完整句子，
+/// 避免出现"模板里已有前缀、函数里又拼一次"的双重前缀。
+fn shortened_review_reason(reason: &str, max_chars: usize) -> String {
     let reason = normalized_review_reason(reason);
     let max_chars = max_chars.max(1);
-    let shortened = if reason.chars().count() > max_chars {
+    if reason.chars().count() > max_chars {
         format!("{}...", reason.chars().take(max_chars).collect::<String>())
     } else {
         reason
-    };
-    format!("点歌未通过审核: {shortened}")
+    }
 }
 
 #[cfg(test)]
@@ -2505,6 +2587,65 @@ mod tests {
             )]
         );
         assert!(port.logs.borrow()[0].starts_with("play keyword=晴天 - 周杰伦"));
+    }
+
+    #[test]
+
+    #[test]
+    fn template_replies_keep_the_exact_wording_they_had_before_templating() {
+        // 模板化的核心风险是"顺手改了文案"。这里直接渲染每条模板，
+        // 断言输出与改造前的字面量逐字一致（含全角标点与空格）。
+        use crate::features::reply_template::{ReplyVars, render, song::SONG};
+
+        // 无变量模板：渲染结果必须等于默认文案本身。
+        for spec in [
+            &SONG[11], // song.queue.full
+            &SONG[12], // song.queue.full_unknown_state
+        ] {
+            let rendered = render(spec, None, &ReplyVars::new());
+            assert_eq!(rendered.text, spec.default, "{} 无变量模板不该被改变", spec.key);
+            assert!(rendered.missing.is_empty());
+        }
+
+        // 带变量模板：填满变量后必须还原成改造前的完整句子。
+        let rendered = render(
+            &SONG[0], // "队列已有: {歌名}"
+            None,
+            &ReplyVars::new().with("歌名", "晴天"),
+        );
+        assert_eq!(rendered.text, "队列已有: 晴天");
+        assert!(rendered.missing.is_empty(), "变量应全部被消费");
+
+        // 入队回执：前缀/当前/上限/歌名 四个变量，格式 "{前缀}({当前}/{上限}): {歌名}"
+        let rendered = render(
+            &SONG[10],
+            None,
+            &ReplyVars::new()
+                .with("前缀", "队列已加入")
+                .with("当前", "3")
+                .with("上限", "10")
+                .with("歌名", "晴天"),
+        );
+        assert_eq!(rendered.text, "队列已加入(3/10): 晴天");
+
+        // 搜索失败："{标签}{原因}" 是两个变量直接相接，不能插入空格。
+        let rendered = render(
+            &SONG[9],
+            None,
+            &ReplyVars::new()
+                .with("标签", "@点歌")
+                .with("原因", "网络错误"),
+        );
+        assert_eq!(rendered.text, "@点歌网络错误");
+    }
+
+    #[test]
+    fn a_missing_template_variable_is_reported_instead_of_silently_dropped() {
+        // 变量名拼错时必须能被发现，否则玩家会收到缺字的文案。
+        use crate::features::reply_template::{ReplyVars, render, song::SONG};
+        let rendered = render(&SONG[0], None, &ReplyVars::new().with("歌名错", "晴天"));
+        assert_eq!(rendered.missing, vec!["歌名".to_string()]);
+        assert_eq!(rendered.text, "队列已有: ");
     }
 
     #[test]

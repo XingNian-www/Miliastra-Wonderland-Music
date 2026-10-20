@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
+use crate::features::reply_template::{ReplyTemplate, ReplyVars};
 use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 pub(crate) mod repository;
@@ -20,6 +21,35 @@ pub(crate) use service::{
     TurtleSoupQuestion, TurtleSoupService, TurtleSoupSnapshot, TurtleSoupWorkerRuntime,
     parse_question_message,
 };
+
+/// 按模板渲染一条玩家可见文案——本模块所有玩家可见文案的唯一出口。
+///
+/// 业务层只声明"用哪条模板、带哪些变量"，**不知道配置存在**。
+///
+/// # 现状（重要）
+///
+/// 当前实现只渲染**内置文案**，`replies.overrides` 的覆盖对海龟汤**不生效**：
+/// 文案在这里就被渲染成 String 进 deferred 聊天队列，等到 composition 层的
+/// `impl TurtleSoupApplicationPort` / `TurtleSoupDeliveryPort` 时只剩成品字符串，
+/// 无从查配置。全部 41 条 key 已登记在 `reply_template::turtle_soup`，
+/// 但覆盖目前不会被应用。
+///
+/// # 升级路径
+///
+/// 把 `TurtleSoupCommandOutcome::immediate_reply` 与
+/// `TurtleSoupDeliveryIntent::messages` 里的 `String` 换成二元组
+/// （参照 `playback::application` 的 `ReplyMessage { spec, vars }`）：
+///
+/// ```text
+/// enum ReplyText { Raw(String), Keyed(ReplyMessage) }
+/// ```
+///
+/// `Raw` 留给汤面/汤底等题库原文与错误原因，`Keyed` 携带 (spec, vars) 一路传到
+/// composition，由那边查 `live_configs.replies` 后再渲染。届时只需把本函数换成
+/// "接收 `Option<&str>` 覆盖文案"的形态，调用点无需再动。
+pub(crate) fn render_reply(spec: &ReplyTemplate, vars: &ReplyVars) -> String {
+    crate::features::reply_template::render(spec, None, vars).text
+}
 
 pub(crate) trait TurtleSoupApplicationPort {
     fn handle_hall_command(

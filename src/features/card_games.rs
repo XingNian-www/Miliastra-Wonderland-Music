@@ -8,6 +8,7 @@ use crate::features::chat_text::{command_identity, compact_command};
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
+use crate::features::reply_template::{card_games as templates, ReplyVars};
 #[cfg(test)]
 use crate::features::friend_delivery::{
     FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
@@ -539,10 +540,19 @@ impl LandlordGame {
         now: Instant,
     ) -> LandlordOutcome {
         if !self.config.enabled {
-            return LandlordOutcome::public("disabled", format!("{}未启用", variant.label()));
+            return LandlordOutcome::public(
+                "disabled",
+                reply(
+                    &templates::DISABLED,
+                    ReplyVars::new().with("玩法", variant.label()),
+                ),
+            );
         }
         if self.is_active() {
-            return LandlordOutcome::public("already-active", "已有牌局或房间进行中");
+            return LandlordOutcome::public(
+                "already-active",
+                reply(&templates::ALREADY_ACTIVE, ReplyVars::new()),
+            );
         }
         self.state = GameState::Lobby(Lobby {
             players: vec![Player::new(player)],
@@ -551,23 +561,30 @@ impl LandlordGame {
         });
         LandlordOutcome::public(
             "created",
-            format!(
-                "{}创建了{}房间，还需2人，发送 #加入 参加",
-                player.trim(),
-                variant.label()
+            reply(
+                &templates::LOBBY_CREATED,
+                ReplyVars::new()
+                    .with("玩家", player.trim())
+                    .with("玩法", variant.label()),
             ),
         )
     }
 
     pub fn join(&mut self, player: &str, now: Instant) -> LandlordOutcome {
         let GameState::Lobby(lobby) = &mut self.state else {
-            return LandlordOutcome::public("no-lobby", "当前没有等待加入的牌局房间");
+            return LandlordOutcome::public(
+                "no-lobby",
+                reply(&templates::LOBBY_NONE, ReplyVars::new()),
+            );
         };
         let key = player_key(player);
         if lobby.players.iter().any(|item| item.key == key) {
             return LandlordOutcome::public(
                 "duplicate-player",
-                format!("你已经加入本局{}", lobby.variant.label()),
+                reply(
+                    &templates::LOBBY_ALREADY_JOINED,
+                    ReplyVars::new().with("玩法", lobby.variant.label()),
+                ),
             );
         }
         lobby.players.push(Player::new(player));
@@ -575,7 +592,12 @@ impl LandlordGame {
         if lobby.players.len() < 3 {
             return LandlordOutcome::public(
                 "joined",
-                format!("{}加入{}，还需1人", player.trim(), lobby.variant.label()),
+                reply(
+                    &templates::LOBBY_JOINED,
+                    ReplyVars::new()
+                        .with("玩家", player.trim())
+                        .with("玩法", lobby.variant.label()),
+                ),
             );
         }
 
@@ -603,9 +625,9 @@ impl LandlordGame {
             });
             return LandlordOutcome::public(
                 "run-fast-started",
-                format!(
-                    "跑得快已发手牌，{}持有黑桃3并先出；第一手必须包含黑桃3",
-                    first_name
+                reply(
+                    &templates::RUN_FAST_STARTED,
+                    ReplyVars::new().with("玩家", first_name),
                 ),
             )
             .with_private_deliveries(deliveries);
@@ -629,9 +651,9 @@ impl LandlordGame {
         });
         LandlordOutcome::public(
             "bidding-started",
-            format!(
-                "斗地主已发手牌，随机由{}开始抢地主；发送 #抢 或 #不抢",
-                first_name
+            reply(
+                &templates::BIDDING_STARTED,
+                ReplyVars::new().with("玩家", first_name),
             ),
         )
         .with_private_deliveries(deliveries)
@@ -653,24 +675,34 @@ impl LandlordGame {
             LandlordCommand::Play(cards) => self.play(player, cards, now),
             LandlordCommand::Pass => self.pass(player, now),
             LandlordCommand::Hand => self.hand(player, now),
-            LandlordCommand::Retry => {
-                LandlordOutcome::public("retry-unavailable", "当前没有待重试的私聊投递")
-            }
+            LandlordCommand::Retry => LandlordOutcome::public(
+                "retry-unavailable",
+                reply(&templates::RETRY_NONE, ReplyVars::new()),
+            ),
             LandlordCommand::Exit => self.exit(player),
         }
     }
 
     fn bid(&mut self, player: &str, rob: bool, now: Instant) -> LandlordOutcome {
         let GameState::Bidding(bidding) = &mut self.state else {
-            return LandlordOutcome::public("not-bidding", "当前不在抢地主阶段");
+            return LandlordOutcome::public(
+                "not-bidding",
+                reply(&templates::BIDDING_NOT_BIDDING, ReplyVars::new()),
+            );
         };
         let Some(index) = find_player(&bidding.players, player) else {
-            return LandlordOutcome::public("not-player", "你不在本局斗地主中");
+            return LandlordOutcome::public(
+                "not-player",
+                reply(&templates::NOT_IN_LANDLORD_GAME, ReplyVars::new()),
+            );
         };
         if index != bidding.current {
             return LandlordOutcome::public(
                 "wrong-bidder",
-                format!("现在轮到{}抢地主", bidding.players[bidding.current].name),
+                reply(
+                    &templates::BIDDING_TURN,
+                    ReplyVars::new().with("玩家", bidding.players[bidding.current].name.clone()),
+                ),
             );
         }
 
@@ -686,11 +718,12 @@ impl LandlordGame {
             let next = bidding.players[bidding.current].name.clone();
             return LandlordOutcome::public(
                 if rob { "robbed" } else { "declined" },
-                format!(
-                    "{}{}；轮到{}抢地主",
-                    name,
-                    if rob { "抢地主" } else { "不抢" },
-                    next
+                reply(
+                    &templates::BIDDING_DECIDED,
+                    ReplyVars::new()
+                        .with("玩家", name)
+                        .with("决定", if rob { "抢地主" } else { "不抢" })
+                        .with("下一位", next),
                 ),
             );
         }
@@ -721,7 +754,10 @@ impl LandlordGame {
             });
             return LandlordOutcome::public(
                 "redealt",
-                format!("三人均未抢地主，已重新发牌；随机由{}开始", first_name),
+                reply(
+                    &templates::BIDDING_REDEALT,
+                    ReplyVars::new().with("玩家", first_name),
+                ),
             )
             .with_private_deliveries(deliveries);
         };
@@ -732,10 +768,11 @@ impl LandlordGame {
         let landlord_name = bidding.players[landlord].name.clone();
         let landlord_delivery = LandlordPrivateDelivery {
             player: landlord_name.clone(),
-            message: format!(
-                "地主手牌({}张): {}",
-                bidding.players[landlord].hand.len(),
-                format_hand(&bidding.players[landlord].hand)
+            message: reply(
+                &templates::HAND_LANDLORD_INITIAL,
+                ReplyVars::new()
+                    .with("张数", bidding.players[landlord].hand.len().to_string())
+                    .with("手牌", format_hand(&bidding.players[landlord].hand)),
             ),
         };
         self.state = GameState::Playing(Playing {
@@ -753,7 +790,12 @@ impl LandlordGame {
         });
         LandlordOutcome::public(
             "landlord-selected",
-            format!("{}成为地主并先出牌；底牌: {}", landlord_name, bottom_text),
+            reply(
+                &templates::LANDLORD_SELECTED,
+                ReplyVars::new()
+                    .with("玩家", landlord_name)
+                    .with("底牌", bottom_text),
+            ),
         )
         .with_private_deliveries(vec![landlord_delivery])
     }
@@ -772,7 +814,7 @@ impl LandlordGame {
                 self.state = GameState::Idle;
                 Some(LandlordOutcome::ended(
                     "lobby-timeout",
-                    format!("{}组局等待超时，房间已取消", label),
+                    reply(&templates::LOBBY_TIMEOUT, ReplyVars::new().with("玩法", label)),
                 ))
             }
             GameState::Bidding(game) => {
@@ -789,7 +831,10 @@ impl LandlordGame {
                     game.warning_sent = true;
                     return Some(LandlordOutcome::public(
                         "bid-warning",
-                        format!("{}抢地主剩余30秒", game.players[game.current].name),
+                        reply(
+                            &templates::BIDDING_WARNING,
+                            ReplyVars::new().with("玩家", game.players[game.current].name.clone()),
+                        ),
                     ));
                 }
                 if game.timer.elapsed < timeout {
@@ -797,9 +842,13 @@ impl LandlordGame {
                 }
                 let player = game.players[game.current].name.clone();
                 let mut outcome = self.bid(&player, false, now);
-                if let Some(reply) = outcome.public_reply.take() {
-                    outcome.public_reply =
-                        Some(format!("{}抢地主超时，按不抢处理；{}", player, reply));
+                if let Some(continuation) = outcome.public_reply.take() {
+                    outcome.public_reply = Some(reply(
+                        &templates::BIDDING_TIMEOUT,
+                        ReplyVars::new()
+                            .with("玩家", player)
+                            .with("后续", continuation),
+                    ));
                 }
                 Some(outcome)
             }
@@ -844,7 +893,10 @@ impl LandlordGame {
                     game.warning_sent = true;
                     return Some(LandlordOutcome::public(
                         "turn-warning",
-                        format!("{}出牌剩余30秒", game.players[current].name),
+                        reply(
+                            &templates::TURN_WARNING,
+                            ReplyVars::new().with("玩家", game.players[current].name.clone()),
+                        ),
                     ));
                 }
                 if game.timer.elapsed >= timeout {
@@ -902,7 +954,10 @@ impl LandlordGame {
                 let next = game.players[game.current].name.clone();
                 return LandlordOutcome::public(
                     "auto-pass",
-                    format!("{}超时且无牌可压，自动过牌；轮到{}", name, next),
+                    reply(
+                        &templates::PASS_TIMEOUT_NO_BEATING,
+                        ReplyVars::new().with("玩家", name).with("下一位", next),
+                    ),
                 );
             }
             if !game.players[current].trustee {
@@ -910,7 +965,10 @@ impl LandlordGame {
                 let next = game.players[game.current].name.clone();
                 return LandlordOutcome::public(
                     "auto-pass",
-                    format!("{}超时，自动过牌；轮到{}", name, next),
+                    reply(
+                        &templates::PASS_TIMEOUT,
+                        ReplyVars::new().with("玩家", name).with("下一位", next),
+                    ),
                 );
             }
             let previous = &game
@@ -931,11 +989,12 @@ impl LandlordGame {
                 let next = game.players[game.current].name.clone();
                 LandlordOutcome::public(
                     "auto-pass",
-                    format!(
-                        "{}超时{}，自动过牌；轮到{}",
-                        name,
-                        trustee_suffix(game, current),
-                        next
+                    reply(
+                        &templates::PASS_TIMEOUT_WITH_SUFFIX,
+                        ReplyVars::new()
+                            .with("玩家", name)
+                            .with("托管后缀", trustee_suffix(game, current))
+                            .with("下一位", next),
                     ),
                 )
             }
@@ -973,23 +1032,37 @@ impl LandlordGame {
 
     fn play(&mut self, player: &str, text: &str, now: Instant) -> LandlordOutcome {
         let GameState::Playing(game) = &mut self.state else {
-            return LandlordOutcome::public("no-game", "当前没有进行中的牌局");
+            return LandlordOutcome::public(
+                "no-game",
+                reply(&templates::NO_ACTIVE_GAME, ReplyVars::new()),
+            );
         };
         let Some(player_index) = find_player(&game.players, player) else {
             return LandlordOutcome::public(
                 "not-player",
-                format!("你不在本局{}中", game.variant.label()),
+                reply(
+                    &templates::NOT_IN_GAME,
+                    ReplyVars::new().with("玩法", game.variant.label()),
+                ),
             );
         };
         if player_index != game.current {
             return LandlordOutcome::public(
                 "wrong-turn",
-                format!("现在轮到{}出牌", game.players[game.current].name),
+                reply(
+                    &templates::WRONG_TURN,
+                    ReplyVars::new().with("玩家", game.players[game.current].name.clone()),
+                ),
             );
         }
         let ranks = match parse_cards(text) {
             Ok(ranks) if !ranks.is_empty() => ranks,
-            Ok(_) => return LandlordOutcome::public("empty-play", "请输入要出的牌"),
+            Ok(_) => {
+                return LandlordOutcome::public(
+                    "empty-play",
+                    reply(&templates::PLAY_EMPTY, ReplyVars::new()),
+                );
+            }
             Err(error) => return LandlordOutcome::public("invalid-cards", error),
         };
         let cards = match take_cards_for_play(
@@ -1004,12 +1077,18 @@ impl LandlordGame {
             && game.opening_spade_three_required
             && !cards.iter().any(|card| card.spade_three)
         {
-            return LandlordOutcome::public("spade-three-required", "首手必须包含黑桃3");
+            return LandlordOutcome::public(
+                "spade-three-required",
+                reply(&templates::SPADE_THREE_REQUIRED, ReplyVars::new()),
+            );
         }
         let pattern = match classify_for_variant(&ranks, game.variant) {
             Some(pattern) => pattern,
             None => {
-                return LandlordOutcome::public("invalid-pattern", "这组牌不是当前玩法的有效牌型");
+                return LandlordOutcome::public(
+                    "invalid-pattern",
+                    reply(&templates::INVALID_PATTERN, ReplyVars::new()),
+                );
             }
         };
         if game.variant == CardGameVariant::HunanRunFast
@@ -1019,7 +1098,7 @@ impl LandlordGame {
         {
             return LandlordOutcome::public(
                 "must-play-largest-single",
-                "下家已报单，出单张时必须出手中最大牌",
+                reply(&templates::MUST_PLAY_LARGEST_SINGLE, ReplyVars::new()),
             );
         }
         if let Some(last) = &game.last_play
@@ -1028,7 +1107,12 @@ impl LandlordGame {
         {
             return LandlordOutcome::public(
                 "cannot-beat",
-                format!("{}压不过上一手{}", pattern.label(), last.pattern.label()),
+                reply(
+                    &templates::CANNOT_BEAT,
+                    ReplyVars::new()
+                        .with("牌型", pattern.label())
+                        .with("上一手牌型", last.pattern.label()),
+                ),
             );
         }
         let outcome = play_cards(
@@ -1047,18 +1131,27 @@ impl LandlordGame {
 
     fn pass(&mut self, player: &str, now: Instant) -> LandlordOutcome {
         let GameState::Playing(game) = &mut self.state else {
-            return LandlordOutcome::public("no-game", "当前没有进行中的牌局");
+            return LandlordOutcome::public(
+                "no-game",
+                reply(&templates::NO_ACTIVE_GAME, ReplyVars::new()),
+            );
         };
         let Some(player_index) = find_player(&game.players, player) else {
             return LandlordOutcome::public(
                 "not-player",
-                format!("你不在本局{}中", game.variant.label()),
+                reply(
+                    &templates::NOT_IN_GAME,
+                    ReplyVars::new().with("玩法", game.variant.label()),
+                ),
             );
         };
         if player_index != game.current {
             return LandlordOutcome::public(
                 "wrong-turn",
-                format!("现在轮到{}出牌", game.players[game.current].name),
+                reply(
+                    &templates::WRONG_TURN,
+                    ReplyVars::new().with("玩家", game.players[game.current].name.clone()),
+                ),
             );
         }
         if game
@@ -1066,7 +1159,10 @@ impl LandlordGame {
             .as_ref()
             .is_none_or(|last| last.player == player_index)
         {
-            return LandlordOutcome::public("cannot-pass", "你是本轮领出者，不能过牌");
+            return LandlordOutcome::public(
+                "cannot-pass",
+                reply(&templates::LEADER_CANNOT_PASS, ReplyVars::new()),
+            );
         }
         if game.variant == CardGameVariant::HunanRunFast {
             let previous = &game
@@ -1081,7 +1177,10 @@ impl LandlordGame {
             )
             .is_some()
             {
-                return LandlordOutcome::public("must-play", "跑得快有牌能压时不能过牌");
+                return LandlordOutcome::public(
+                    "must-play",
+                    reply(&templates::MUST_PLAY_RUN_FAST, ReplyVars::new()),
+                );
             }
         }
         pass_playing(game, player_index, now, ActionOrigin::Manual)
@@ -1092,11 +1191,17 @@ impl LandlordGame {
             GameState::Bidding(game) => (&mut game.players, CardGameVariant::Landlord.label()),
             GameState::Playing(game) => (&mut game.players, game.variant.label()),
             GameState::Idle | GameState::Lobby(_) => {
-                return LandlordOutcome::private("no-game", "当前没有已发牌的牌局");
+                return LandlordOutcome::private(
+                    "no-game",
+                    reply(&templates::HAND_NO_DEALT_GAME, ReplyVars::new()),
+                );
             }
         };
         let Some(index) = find_player(players, player) else {
-            return LandlordOutcome::private("not-player", format!("你不在本局{}中", label));
+            return LandlordOutcome::private(
+                "not-player",
+                reply(&templates::NOT_IN_GAME, ReplyVars::new().with("玩法", label)),
+            );
         };
         let cooldown = Duration::from_secs(self.config.hand_cooldown_seconds);
         if players[index]
@@ -1114,39 +1219,54 @@ impl LandlordGame {
         players[index].last_hand_reply = Some(now);
         LandlordOutcome::private(
             "hand",
-            format!(
-                "当前手牌({}张): {}",
-                players[index].hand.len(),
-                format_hand(&players[index].hand)
+            reply(
+                &templates::HAND_CURRENT,
+                ReplyVars::new()
+                    .with("张数", players[index].hand.len().to_string())
+                    .with("手牌", format_hand(&players[index].hand)),
             ),
         )
     }
 
     fn status(&self) -> LandlordOutcome {
         match &self.state {
-            GameState::Idle => LandlordOutcome::public("idle", "当前没有牌局房间或进行中的牌局"),
+            GameState::Idle => LandlordOutcome::public(
+                "idle",
+                reply(&templates::STATUS_IDLE, ReplyVars::new()),
+            ),
             GameState::Lobby(lobby) => LandlordOutcome::public(
                 "lobby-status",
-                format!(
-                    "{}等待加入: {}，还需{}人",
-                    lobby.variant.label(),
-                    lobby
-                        .players
-                        .iter()
-                        .map(|player| player.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join("、"),
-                    3usize.saturating_sub(lobby.players.len())
+                reply(
+                    &templates::STATUS_LOBBY,
+                    ReplyVars::new()
+                        .with("玩法", lobby.variant.label())
+                        .with(
+                            "名单",
+                            lobby
+                                .players
+                                .iter()
+                                .map(|player| player.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("、"),
+                        )
+                        .with(
+                            "人数",
+                            (3usize.saturating_sub(lobby.players.len())).to_string(),
+                        ),
                 ),
             ),
             GameState::Bidding(game) => LandlordOutcome::public(
                 "bidding-status",
-                format!(
-                    "斗地主抢地主中；轮到:{}；当前抢地主:{}",
-                    game.players[game.current].name,
-                    game.candidate
-                        .map(|index| game.players[index].name.as_str())
-                        .unwrap_or("暂无")
+                reply(
+                    &templates::STATUS_BIDDING,
+                    ReplyVars::new()
+                        .with("玩家", game.players[game.current].name.clone())
+                        .with(
+                            "当前抢地主",
+                            game.candidate
+                                .map(|index| game.players[index].name.as_str())
+                                .unwrap_or("暂无"),
+                        ),
                 ),
             ),
             GameState::Playing(game) => {
@@ -1164,36 +1284,53 @@ impl LandlordGame {
                 let remaining = game
                     .players
                     .iter()
-                    .map(|player| format!("{} {}张", player.name, player.hand.len()))
+                    .map(|player| {
+                        reply(
+                            &templates::PLAYER_CARD_COUNT,
+                            ReplyVars::new()
+                                .with("玩家", player.name.as_str())
+                                .with("张数", player.hand.len().to_string()),
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("、");
-                let reply = if game.variant == CardGameVariant::HunanRunFast {
-                    format!(
-                        "跑得快；轮到:{}；剩余:{}；上一手:{}",
-                        game.players[game.current].name, remaining, last
+                let message = if game.variant == CardGameVariant::HunanRunFast {
+                    reply(
+                        &templates::STATUS_PLAYING_RUN_FAST,
+                        ReplyVars::new()
+                            .with("玩家", game.players[game.current].name.clone())
+                            .with("剩余", remaining)
+                            .with("上一手", last),
                     )
                 } else {
-                    format!(
-                        "地主:{}；轮到:{}；剩余:{}；上一手:{}",
-                        game.players[game.landlord].name,
-                        game.players[game.current].name,
-                        remaining,
-                        last
+                    reply(
+                        &templates::STATUS_PLAYING_LANDLORD,
+                        ReplyVars::new()
+                            .with("地主", game.players[game.landlord].name.clone())
+                            .with("玩家", game.players[game.current].name.clone())
+                            .with("剩余", remaining)
+                            .with("上一手", last),
                     )
                 };
-                LandlordOutcome::public("playing-status", reply)
+                LandlordOutcome::public("playing-status", message)
             }
         }
     }
 
     fn exit(&mut self, player: &str) -> LandlordOutcome {
         match &mut self.state {
-            GameState::Idle => LandlordOutcome::public("idle", "当前没有牌局房间或进行中的牌局"),
+            GameState::Idle => LandlordOutcome::public(
+                "idle",
+                reply(&templates::STATUS_IDLE, ReplyVars::new()),
+            ),
             GameState::Lobby(lobby) => {
                 let Some(index) = find_player(&lobby.players, player) else {
                     return LandlordOutcome::public(
                         "not-player",
-                        format!("你不在当前{}房间中", lobby.variant.label()),
+                        reply(
+                            &templates::NOT_IN_LOBBY,
+                            ReplyVars::new().with("玩法", lobby.variant.label()),
+                        ),
                     );
                 };
                 let name = lobby.players[index].name.clone();
@@ -1202,38 +1339,77 @@ impl LandlordGame {
                     self.state = GameState::Idle;
                     LandlordOutcome::ended(
                         "lobby-canceled",
-                        format!("{}取消了{}房间", name, variant.label()),
+                        reply(
+                            &templates::LOBBY_CANCELED,
+                            ReplyVars::new()
+                                .with("玩家", name)
+                                .with("玩法", variant.label()),
+                        ),
                     )
                 } else {
                     lobby.players.remove(index);
                     LandlordOutcome::public(
                         "left-lobby",
-                        format!("{}退出了{}房间", name, variant.label()),
+                        reply(
+                            &templates::LOBBY_LEFT,
+                            ReplyVars::new()
+                                .with("玩家", name)
+                                .with("玩法", variant.label()),
+                        ),
                     )
                 }
             }
             GameState::Bidding(game) => {
                 let Some(index) = find_player(&game.players, player) else {
-                    return LandlordOutcome::public("not-player", "你不在本局斗地主中");
+                    return LandlordOutcome::public(
+                        "not-player",
+                        reply(&templates::NOT_IN_LANDLORD_GAME, ReplyVars::new()),
+                    );
                 };
                 let name = game.players[index].name.clone();
                 self.state = GameState::Idle;
-                LandlordOutcome::ended("game-aborted", format!("{}退出，斗地主牌局已结束", name))
+                LandlordOutcome::ended(
+                    "game-aborted",
+                    reply(
+                        &templates::EXIT_LANDLORD_ENDED,
+                        ReplyVars::new().with("玩家", name),
+                    ),
+                )
             }
             GameState::Playing(game) => {
                 let Some(index) = find_player(&game.players, player) else {
                     return LandlordOutcome::public(
                         "not-player",
-                        format!("你不在本局{}中", game.variant.label()),
+                        reply(
+                            &templates::NOT_IN_GAME,
+                            ReplyVars::new().with("玩法", game.variant.label()),
+                        ),
                     );
                 };
                 let name = game.players[index].name.clone();
                 let label = game.variant.label();
                 self.state = GameState::Idle;
-                LandlordOutcome::ended("game-aborted", format!("{}退出，{}牌局已结束", name, label))
+                LandlordOutcome::ended(
+                    "game-aborted",
+                    reply(
+                        &templates::EXIT_GAME_ENDED,
+                        ReplyVars::new()
+                            .with("玩家", name)
+                            .with("玩法", label),
+                    ),
+                )
             }
         }
     }
+}
+
+/// 渲染一条牌类回复。
+///
+/// 牌类回复在 effect 入队前就渲染成 String（`CardGameEffect::HallDelivery` 携带成品文案），
+/// 组装层拿不到模板键，因此这里只渲染内置默认文案；用户覆盖文案要生效，
+/// 需要在组装层增加模板直通通道（见任务汇报）。
+fn reply(spec: &crate::features::reply_template::ReplyTemplate, vars: ReplyVars) -> String {
+    crate::features::reply_template::render(spec, None, &vars).text
 }
 
 fn deadline_after(now: Instant, elapsed: Duration, target: Duration) -> Instant {
@@ -1330,14 +1506,14 @@ fn play_cards(
             };
             return LandlordOutcome::ended(
                 "won",
-                format!(
-                    "{}{}:{}[{}]，获胜；其余:{}张/{}张",
-                    name,
-                    action_text,
-                    format_play_compact(&cards),
-                    pattern_name,
-                    remaining[0],
-                    remaining[1]
+                reply(
+                    &templates::WON_RUN_FAST,
+                    ReplyVars::new()
+                        .with("玩家", name)
+                        .with("动作", action_text)
+                        .with("牌面", format_play_compact(&cards))
+                        .with("牌型", pattern_name)
+                        .with("剩余", format!("{}张/{}张", remaining[0], remaining[1])),
                 ),
             );
         }
@@ -1349,14 +1525,29 @@ fn play_cards(
         let summary = game
             .players
             .iter()
-            .map(|item| format!("{} {}张", item.name, item.hand.len()))
+            .map(|item| {
+                reply(
+                    &templates::PLAYER_CARD_COUNT,
+                    ReplyVars::new()
+                        .with("玩家", item.name.as_str())
+                        .with("张数", item.hand.len().to_string()),
+                )
+            })
             .collect::<Vec<_>>()
             .join("、");
         return LandlordOutcome::ended(
             "won",
-            format!(
-                "{}({})出完{}[{}]，{}获胜。剩余:{}；炸弹{}次；共{}手",
-                name, role, played, pattern_name, winner, summary, game.bombs, game.turns
+            reply(
+                &templates::WON_LANDLORD,
+                ReplyVars::new()
+                    .with("玩家", name)
+                    .with("角色", role)
+                    .with("牌面", played)
+                    .with("牌型", pattern_name)
+                    .with("阵营", winner)
+                    .with("剩余", summary)
+                    .with("炸弹", game.bombs.to_string())
+                    .with("手数", game.turns.to_string()),
             ),
         );
     }
@@ -1374,30 +1565,38 @@ fn play_cards(
             ActionOrigin::Timeout => "超时出",
             ActionOrigin::Forced => "自动出",
         };
-        format!(
-            "{}{}:{}[{}] 余{}，轮到{}",
-            name,
-            action_text,
-            format_play_compact(&game.last_play.as_ref().expect("play was recorded").cards),
-            pattern_name,
-            game.players[player].hand.len(),
-            game.players[game.current].name
+        reply(
+            &templates::PLAY_RUN_FAST,
+            ReplyVars::new()
+                .with("玩家", name)
+                .with("动作", action_text)
+                .with(
+                    "牌面",
+                    format_play_compact(&game.last_play.as_ref().expect("play was recorded").cards),
+                )
+                .with("牌型", pattern_name)
+                .with("剩余", game.players[player].hand.len().to_string())
+                .with("下一位", game.players[game.current].name.clone()),
         )
     } else {
         let action_text = match origin {
-            ActionOrigin::Manual => "出牌".to_string(),
-            ActionOrigin::Timeout => format!("超时{}，自动出", trustee_suffix(game, player)),
+            ActionOrigin::Manual => reply(&templates::LANDLORD_ACTION_PLAY, ReplyVars::new()),
+            ActionOrigin::Timeout => reply(
+                &templates::LANDLORD_ACTION_TIMEOUT,
+                ReplyVars::new().with("托管后缀", trustee_suffix(game, player)),
+            ),
             ActionOrigin::Forced => unreachable!("forced play only applies to run fast"),
         };
-        format!(
-            "{}({}){} {}[{}]，剩余{}张；轮到{}",
-            name,
-            role,
-            action_text,
-            played,
-            pattern_name,
-            game.players[player].hand.len(),
-            game.players[game.current].name
+        reply(
+            &templates::PLAY_LANDLORD,
+            ReplyVars::new()
+                .with("玩家", name)
+                .with("角色", role)
+                .with("动作", action_text)
+                .with("牌面", played)
+                .with("牌型", pattern_name)
+                .with("剩余", game.players[player].hand.len().to_string())
+                .with("下一位", game.players[game.current].name.clone()),
         )
     };
     LandlordOutcome::public(
@@ -1439,18 +1638,31 @@ fn pass_playing(
     }
     let next = &game.players[game.current].name;
     let message = if game.variant == CardGameVariant::HunanRunFast {
-        match (origin, new_trick) {
-            (ActionOrigin::Manual, false) => format!("{}过，轮到{}", name, next),
-            (ActionOrigin::Manual, true) => format!("{}过，{}领出", name, next),
-            (ActionOrigin::Timeout, false) => format!("{}超时过，轮到{}", name, next),
-            (ActionOrigin::Timeout, true) => format!("{}超时过，{}领出", name, next),
-            (ActionOrigin::Forced, false) => format!("{}无牌可压，轮到{}", name, next),
-            (ActionOrigin::Forced, true) => format!("双方无牌可压，{}领出", next),
-        }
+        // "双方无牌可压，{下一位}领出" 不出现玩家名，其余分支都带玩家名。
+        let spec = match (origin, new_trick) {
+            (ActionOrigin::Manual, false) => &templates::PASS_MANUAL_NEXT,
+            (ActionOrigin::Manual, true) => &templates::PASS_MANUAL_LEAD,
+            (ActionOrigin::Timeout, false) => &templates::PASS_TIMEOUT_NEXT,
+            (ActionOrigin::Timeout, true) => &templates::PASS_TIMEOUT_LEAD,
+            (ActionOrigin::Forced, false) => &templates::PASS_FORCED_NEXT,
+            (ActionOrigin::Forced, true) => &templates::PASS_FORCED_LEAD,
+        };
+        let vars = if origin == ActionOrigin::Forced && new_trick {
+            ReplyVars::new().with("下一位", next.clone())
+        } else {
+            ReplyVars::new().with("玩家", name).with("下一位", next.clone())
+        };
+        reply(spec, vars)
     } else if new_trick {
-        format!("{}过牌，重新由{}领出", name, next)
+        reply(
+            &templates::PASS_NEW_TRICK,
+            ReplyVars::new().with("玩家", name).with("下一位", next),
+        )
     } else {
-        format!("{}过牌，轮到{}", name, next)
+        reply(
+            &templates::PASS_NEXT,
+            ReplyVars::new().with("玩家", name).with("下一位", next),
+        )
     };
     LandlordOutcome::public(
         match origin {
@@ -1611,11 +1823,12 @@ fn initial_hand_deliveries(
         .iter()
         .map(|player| LandlordPrivateDelivery {
             player: player.name.clone(),
-            message: format!(
-                "{}初始手牌({}张): {}",
-                variant.label(),
-                player.hand.len(),
-                format_hand(&player.hand)
+            message: reply(
+                &templates::HAND_INITIAL,
+                ReplyVars::new()
+                    .with("玩法", variant.label())
+                    .with("张数", player.hand.len().to_string())
+                    .with("手牌", format_hand(&player.hand)),
             ),
         })
         .collect()
@@ -1712,7 +1925,12 @@ fn parse_cards(text: &str) -> Result<Vec<Rank>, String> {
                 'K' => Rank::King,
                 'A' => Rank::Ace,
                 '2' => Rank::Two,
-                _ => return Err(format!("无法识别牌面: {}", ch)),
+                _ => {
+                    return Err(reply(
+                        &templates::PARSE_UNKNOWN_CARD,
+                        ReplyVars::new().with("牌面", ch.to_string()),
+                    ));
+                }
             };
             (rank, ch.len_utf8())
         };
@@ -1731,7 +1949,12 @@ fn take_cards(hand: &[Card], ranks: &[Rank]) -> Result<Vec<Card>, String> {
             .iter()
             .position(|card| card.rank == *rank && !card.spade_three)
             .or_else(|| available.iter().position(|card| card.rank == *rank))
-            .ok_or_else(|| format!("手牌中缺少 {}", rank.label()))?;
+            .ok_or_else(|| {
+                reply(
+                    &templates::PARSE_MISSING_CARD,
+                    ReplyVars::new().with("牌面", rank.label()),
+                )
+            })?;
         cards.push(available.remove(index));
     }
     Ok(cards)

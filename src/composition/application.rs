@@ -1472,23 +1472,21 @@ impl ApplicationRuntime {
         );
         let openai_runtime = OpenAiRuntime::start().context("启动 OpenAI runtime")?;
         let openai = openai_runtime.handle();
-        let song_ai_proxy = config.ai.http_proxy.as_str();
-        let song_review_proxy = config.song_review.provider.http_proxy.as_str();
-        let turtle_soup_proxy = turtle_soup_config.ai.http_proxy.as_str();
-        let song_ai_openai = openai
-            .with_http_proxy(song_ai_proxy)
-            .context("创建点歌 AI HTTP 客户端失败")?;
-        let song_review_openai = openai
-            .with_http_proxy(song_review_proxy)
-            .context("创建歌曲审核 AI HTTP 客户端失败")?;
-        let turtle_soup_openai = openai
-            .with_http_proxy(turtle_soup_proxy)
-            .context("创建海龟汤 AI HTTP 客户端失败")?;
-        let ai = AiClient::new(&config.ai, ai_request_timeout, song_ai_openai);
+        // 三个 AI 功能共用同一份连接配置与 HTTP 客户端。
+        let ai_openai = openai
+            .with_http_proxy(config.ai.http_proxy.as_str())
+            .context("创建 AI HTTP 客户端失败")?;
+        let ai = AiClient::new(
+            &config.song_ai,
+            &config.ai,
+            ai_request_timeout,
+            ai_openai.clone(),
+        );
         let song_review = SongReviewClient::new(
             &config.song_review,
+            &config.ai,
             ai_request_timeout,
-            song_review_openai,
+            ai_openai.clone(),
             system_clock.clone(),
         );
         let song_requests = SongRequestApplication::new(
@@ -1501,7 +1499,8 @@ impl ApplicationRuntime {
             ChatOutput::with_live_enabled(live_configs.output_send_enabled.clone(), hall_batch_ui);
         let turtle_soup = TurtleSoupService::new(
             turtle_soup_config,
-            turtle_soup_openai,
+            config.ai.clone(),
+            ai_openai,
             system_clock.clone(),
             system_clock.clone(),
             state_store,

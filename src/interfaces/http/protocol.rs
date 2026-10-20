@@ -167,6 +167,14 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
         handler: turtle_soup_questions_route,
     },
     BodyRouteSpec {
+        path: "/config/visual/preview",
+        handler: config_visual_preview_route,
+    },
+    BodyRouteSpec {
+        path: "/config/visual/import",
+        handler: config_visual_import_route,
+    },
+    BodyRouteSpec {
         path: "/config/validate",
         handler: config_validate_route,
     },
@@ -732,6 +740,12 @@ const ROUTES: &[RouteSpec] = &[
         json: true,
         mutating: false,
         handler: config_route,
+    },
+    RouteSpec {
+        path: "/config/visual",
+        json: true,
+        mutating: false,
+        handler: config_visual_route,
     },
     RouteSpec {
         path: "/config/schema",

@@ -8,8 +8,10 @@ use anyhow::{Result, anyhow, bail};
 use super::repository::UndercoverBankStore;
 use super::{
     UndercoverCommand, UndercoverConfig, UndercoverDelivery, UndercoverGame, UndercoverMode,
-    UndercoverSnapshot, random_seed,
+    UndercoverSnapshot, random_seed, render_reply,
 };
+use crate::features::reply_template::ReplyVars;
+use crate::features::reply_template::undercover as templates;
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
 use crate::features::friend_delivery::{
     FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
@@ -405,9 +407,10 @@ impl UndercoverRuntimeService {
                 return Ok(self.begin_deliveries(
                     key,
                     UndercoverEffectLane::Formal,
-                    vec![UndercoverDelivery::Hall(
-                        "谁是卧底私聊投递尚未完成，请使用#重试或#结束".to_string(),
-                    )],
+                    vec![UndercoverDelivery::Hall(render_reply(
+                        &templates::DELIVERY_WAITING,
+                        &ReplyVars::new(),
+                    ))],
                     "delivery-waiting",
                     false,
                 ));
@@ -652,7 +655,7 @@ impl UndercoverRuntimeService {
                 UndercoverEffectKey::new(operation_id, self.generation),
                 source,
                 player,
-                "谁是卧底未启用".to_string(),
+                render_reply(&templates::ERROR_DISABLED, &ReplyVars::new()),
             );
         }
         let mode = if matches!(command, UndercoverCommand::CreateDouble) {
@@ -667,7 +670,7 @@ impl UndercoverRuntimeService {
                     UndercoverEffectKey::new(operation_id, self.generation),
                     source,
                     player,
-                    "已有谁是卧底房间或牌局进行中".to_string(),
+                    render_reply(&templates::ERROR_ALREADY_ACTIVE, &ReplyVars::new()),
                 );
             }
             AcquireOutcome::Occupied(kind) => {
@@ -675,7 +678,10 @@ impl UndercoverRuntimeService {
                     UndercoverEffectKey::new(operation_id, self.generation),
                     source,
                     player,
-                    format!("{}正在进行，请结束后再开始谁是卧底", kind.label()),
+                    render_reply(
+                        &templates::ERROR_OCCUPIED,
+                        &ReplyVars::new().with("玩法", kind.label()),
+                    ),
                 );
             }
         }
@@ -690,7 +696,7 @@ impl UndercoverRuntimeService {
             UndercoverEffectLane::Formal,
             UndercoverEffect::FriendVerify {
                 player: player.trim().to_string(),
-                message: "谁是卧底报名成功，请回到大厅等待组局".to_string(),
+                message: render_reply(&templates::VERIFY_CREATE_OK, &ReplyVars::new()),
             },
             UndercoverContinuation::VerifyCreate {
                 player: player.trim().to_string(),
@@ -712,20 +718,35 @@ impl UndercoverRuntimeService {
     ) -> Result<UndercoverCommandStart> {
         let key = UndercoverEffectKey::new(operation_id, self.generation);
         if entertainment.active() != Some(EntertainmentKind::Undercover) {
-            return self.begin_error(key, source, player, "当前没有谁是卧底报名房间".to_string());
+            return self.begin_error(
+                key,
+                source,
+                player,
+                render_reply(&templates::ERROR_NO_LOBBY, &ReplyVars::new()),
+            );
         }
         if !self.game.is_lobby() {
-            return self.begin_error(key, source, player, "谁是卧底已经开局".to_string());
+            return self.begin_error(
+                key,
+                source,
+                player,
+                render_reply(&templates::ERROR_ALREADY_STARTED, &ReplyVars::new()),
+            );
         }
         if self.game.lobby_contains(player) {
-            return self.begin_error(key, source, player, "你已经加入本局谁是卧底".to_string());
+            return self.begin_error(
+                key,
+                source,
+                player,
+                render_reply(&templates::ERROR_ALREADY_JOINED, &ReplyVars::new()),
+            );
         }
         let request = self.insert_effect(
             key,
             UndercoverEffectLane::Formal,
             UndercoverEffect::FriendVerify {
                 player: player.trim().to_string(),
-                message: "谁是卧底报名成功，请回到大厅等待开局".to_string(),
+                message: render_reply(&templates::VERIFY_JOIN_OK, &ReplyVars::new()),
             },
             UndercoverContinuation::VerifyJoin {
                 player: player.trim().to_string(),
@@ -785,7 +806,12 @@ impl UndercoverRuntimeService {
         source: UndercoverCommandSource,
     ) -> Result<UndercoverCommandStart> {
         if source != UndercoverCommandSource::Friend {
-            return self.begin_error(key, source, player, "#谜底只能通过好友私聊使用".to_string());
+            return self.begin_error(
+                key,
+                source,
+                player,
+                render_reply(&templates::REVEAL_FRIEND_ONLY, &ReplyVars::new()),
+            );
         }
         match self.game.reveal(player) {
             Ok(lines) => Ok(self.begin_friend_batch(key, player, lines, "revealed")),
@@ -830,9 +856,10 @@ impl UndercoverRuntimeService {
                 }
                 UndercoverEffectResult::FriendVerify(Ok(false)) => Ok(self.resume_with_deliveries(
                     key,
-                    vec![UndercoverDelivery::Hall(
-                        "谁是卧底报名失败：好友列表未找到唯一昵称".to_string(),
-                    )],
+                    vec![UndercoverDelivery::Hall(render_reply(
+                        &templates::VERIFY_FAILED,
+                        &ReplyVars::new(),
+                    ))],
                     UndercoverEffectLane::Formal,
                     "verification-rejected",
                     false,
@@ -882,9 +909,10 @@ impl UndercoverRuntimeService {
                 }
                 UndercoverEffectResult::FriendVerify(Ok(false)) => Ok(self.resume_with_deliveries(
                     key,
-                    vec![UndercoverDelivery::Hall(
-                        "谁是卧底报名失败：好友列表未找到唯一昵称".to_string(),
-                    )],
+                    vec![UndercoverDelivery::Hall(render_reply(
+                        &templates::VERIFY_FAILED,
+                        &ReplyVars::new(),
+                    ))],
                     UndercoverEffectLane::Formal,
                     "verification-rejected",
                     false,
@@ -1134,9 +1162,10 @@ impl UndercoverRuntimeService {
             return self.begin_deliveries(
                 key,
                 UndercoverEffectLane::Formal,
-                vec![UndercoverDelivery::Hall(
-                    "当前没有待重试的谁是卧底私聊投递".to_string(),
-                )],
+                vec![UndercoverDelivery::Hall(render_reply(
+                    &templates::RETRY_NONE,
+                    &ReplyVars::new(),
+                ))],
                 "retry-unavailable",
                 false,
             );
@@ -1145,7 +1174,10 @@ impl UndercoverRuntimeService {
             return self.begin_deliveries(
                 key,
                 UndercoverEffectLane::Formal,
-                vec![UndercoverDelivery::Hall("待重试投递已失效".to_string())],
+                vec![UndercoverDelivery::Hall(render_reply(
+                    &templates::RETRY_EXPIRED,
+                    &ReplyVars::new(),
+                ))],
                 "retry-expired",
                 false,
             );
@@ -1156,8 +1188,9 @@ impl UndercoverRuntimeService {
             return self.begin_deliveries(
                 key,
                 UndercoverEffectLane::Formal,
-                vec![UndercoverDelivery::Hall(format!(
-                    "谁是卧底私聊投递结果未知，不能重试，请#结束：{reason}"
+                vec![UndercoverDelivery::Hall(render_reply(
+                    &templates::RETRY_UNSAFE,
+                    &ReplyVars::new().with("原因", reason),
                 ))],
                 "retry-unsafe",
                 false,
@@ -1190,14 +1223,14 @@ impl UndercoverRuntimeService {
         let message = if retryable.is_empty() {
             match failure.kind() {
                 FriendBatchFailureKind::ResultUnknown => {
-                    "谁是卧底私聊投递结果未知，不能重试，请#结束"
+                    render_reply(&templates::DELIVERY_RESULT_UNKNOWN, &ReplyVars::new())
                 }
                 FriendBatchFailureKind::ConfirmedUnsent => {
-                    "谁是卧底私聊投递失败且没有安全剩余项，请#结束"
+                    render_reply(&templates::DELIVERY_NO_SAFE, &ReplyVars::new())
                 }
             }
         } else {
-            "谁是卧底私聊投递未完成，请#重试或#结束"
+            render_reply(&templates::DELIVERY_INCOMPLETE, &ReplyVars::new())
         };
         self.pending_retry = Some(PendingUndercoverRetry {
             session_generation: key.session_generation,
@@ -1207,7 +1240,7 @@ impl UndercoverRuntimeService {
         });
         self.resume_with_deliveries(
             key,
-            vec![UndercoverDelivery::Hall(message.to_string())],
+            vec![UndercoverDelivery::Hall(message)],
             UndercoverEffectLane::Formal,
             "secret-delivery-paused",
             false,

@@ -9,8 +9,15 @@
 use std::collections::BTreeMap;
 
 // 按消费模块拆分的模板文件：每个模块只写自己的文件，避免并行开发时互相覆盖。
+pub(crate) mod card_games;
 pub(crate) mod hall;
+pub(crate) mod idiom_chain;
+pub(crate) mod moderation;
 pub(crate) mod playback;
+pub(crate) mod song;
+pub(crate) mod tarot;
+pub(crate) mod turtle_soup;
+pub(crate) mod undercover;
 
 /// 一条可调整回复的元数据。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,7 +33,10 @@ pub(crate) struct ReplyTemplate {
 }
 
 /// 渲染时的变量集合。AI 回答等动态文本以普通值形式放入。
-#[derive(Clone, Debug, Default)]
+///
+/// 实现 `PartialEq`/`Eq` 是为了让"待渲染消息"能放进 `#[derive(PartialEq, Eq)]`
+/// 的 effect 队列里（如 `UndercoverEffect`），测试才能整体断言 effect 相等。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReplyVars {
     values: BTreeMap<&'static str, String>,
 }
@@ -222,6 +232,13 @@ pub(crate) fn catalog() -> impl Iterator<Item = &'static ReplyTemplate> {
         // 按模块拆分的模板：新增模块时只在这里加一行。
         .chain(playback::PLAYBACK.iter())
         .chain(hall::HALL.iter())
+        .chain(song::SONG.iter())
+        .chain(undercover::UNDERCOVER.iter())
+        .chain(turtle_soup::TURTLE_SOUP.iter())
+        .chain(card_games::CARD_GAMES.iter())
+        .chain(idiom_chain::IDIOM_CHAIN.iter())
+        .chain(tarot::TAROT.iter())
+        .chain(moderation::MODERATION.iter())
 }
 
 #[cfg(test)]

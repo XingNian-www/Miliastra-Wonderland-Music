@@ -290,20 +290,22 @@ impl InviteExecution {
                 port,
                 &username,
                 password.as_deref(),
-                "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
+                crate::features::reply_template::moderation::MODERATION[2].default,
             );
         }
-        let announce = format!(
-            "{}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
-            display_name
-        );
+        let announce = crate::features::reply_template::render(
+            &crate::features::reply_template::moderation::MODERATION[4],
+            None,
+            &crate::features::reply_template::ReplyVars::new().with("用户名", display_name.clone()),
+        )
+        .text;
         if let Err(error) = port.send_hall(&announce) {
             log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
             return execute_approved_invite(
                 port,
                 &username,
                 password.as_deref(),
-                "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
+                crate::features::reply_template::moderation::MODERATION[2].default,
             );
         }
         match port.wait_for_decision()? {
@@ -311,7 +313,7 @@ impl InviteExecution {
                 port,
                 &username,
                 password.as_deref(),
-                "已同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
+                crate::features::reply_template::moderation::MODERATION[2].default,
             ),
             InviteDecision::Timeout => execute_approved_invite(
                 port,

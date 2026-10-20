@@ -520,25 +520,16 @@ turtle_soup:
   custom_prompt: |
     裁决备注若以“主持裁决：问题=结果”的形式明确列出标准问法，语义等价的玩家问题优先遵循该结果。
     对裁决备注没有列出的问法，严格使用内置的互斥裁决协议，只判断本次问题，不自行放宽“相容近似”或“完全正确”的范围。
-  # 海龟汤默认使用 OpenAI Chat Completions；优先选择高能力模型，保证复杂逻辑整理质量
-  ai:
-    # OpenAI 官方完整 Chat Completions 地址
-    endpoint: "https://api.openai.com/v1/chat/completions"
-    # 填写 OpenAI API Key；不要提交到 Git
-    api_key: ""
-    # 高能力模型；请求只发送 OpenAI 标准 Chat Completions 字段
-    model: "gpt-5.6"
-    # 可选的独立 HTTP(S) 代理；留空时沿用环境代理设置
-    http_proxy: ""
-    # 单次裁决允许生成的最大 Token；复杂裁决使用更充足的 JSON 输出空间
-    # 程序按 OpenAI Chat Completions 的 max_tokens 字段发送
-    max_tokens: 1024
-    # 第三方兼容字段；默认空。只能补充字段，和官方字段同名时官方值优先
-    # 例如某 Provider 必须显式关闭私有思考模式时，可填：{ thinking: { type: disabled } }
-    extra_body: {}
+  # 海龟汤专用模型；留空沿用 ai.model。裁决偏重复杂逻辑，可用更强模型。
+  model: ""
+  # 单次裁决允许生成的最大 Token；复杂裁决使用更充足的 JSON 输出空间
+  max_tokens: 1024
 
 ai:
-  # 点歌 AI Provider。可选：mimo、openai、deepseek、custom；默认选择响应更快的 OpenAI 小模型。
+  # 统一 AI 连接配置：点歌、歌曲审核、海龟汤共用 provider / api_key / endpoint / 代理。
+  # 各功能的提示词与模型覆盖在各自配置段（song_ai、song_review、turtle_soup）。
+  #
+  # 可选：mimo、openai、deepseek、custom。
   #
   # mimo：默认使用小米 Mimo，鉴权头为 api-key。
   #   默认 endpoint: https://api.xiaomimimo.com/v1/chat/completions
@@ -546,22 +537,54 @@ ai:
   # openai：默认使用 OpenAI，鉴权头为 Authorization: Bearer。
   #   默认 endpoint: https://api.openai.com/v1/chat/completions
   #   默认 model: gpt-5.6-mini
-  # deepseek：默认使用 DeepSeek OpenAI Chat Completions 接口。
+  # deepseek：默认使用 DeepSeek。
   #   默认 endpoint: https://api.deepseek.com/chat/completions
   #   默认 model: deepseek-v4-flash（V4 系列：deepseek-v4-flash / deepseek-v4-pro）
   # custom：自定义 OpenAI-compatible 网关，必须同时填写 endpoint 和 model。
   provider: openai
-  # API Key。留空表示点歌 AI 未启用；不要提交到 Git，也不要放进 URL 查询参数。
+  # API Key。留空表示全部 AI 功能关闭；不要提交到 Git，也不要放进 URL 查询参数。
   # mimo 使用 api-key 请求头，其他 Provider 使用 Authorization Bearer 请求头。
   api_key: ""
-  # 完整的 Chat Completions 请求地址，必须以 /chat/completions 结尾。
+  # Chat Completions 地址，通常以 /chat/completions 结尾。
   # 非 custom Provider 留空时使用上面列出的默认 endpoint；custom 必填。
   # 可包含网关要求的查询参数，例如：
   #   https://gateway.example/v1/chat/completions?api-version=2026-07-15
   endpoint: ""
-  # 模型名；点歌默认使用低延迟模型，custom 必须填写。
-  # 网关可用模型以其 /v1/models 返回结果为准。
+  # 可选的 Responses 地址；留空时把 endpoint 的 /chat/completions 换成 /responses。
+  # 各官方服务商都已支持 Responses（DeepSeek 为 https://api.deepseek.com/v1/responses，
+  # 小米 MiMo 为 https://api.xiaomimimo.com/v1/responses）。
+  responses_endpoint: ""
+  # 默认模型；各功能可用自己的 model 字段覆盖。
   model: "gpt-5.6-mini"
+  # 可选的独立 HTTP(S) 代理；作用于全部 AI 功能，留空时沿用环境代理设置
+  http_proxy: ""
+  # 线上协议：responses（默认）或 chat_completions。
+  # 仅当网关（Kimi、GLM、部分自建网关）只支持 Chat Completions 时切换。
+  # 注意：歌曲审核依赖 web_search，该工具只在 Responses 下可用。
+  wire_api: responses
+  # 第三方兼容字段。必须是 JSON object；默认空对象。
+  # Responses 下程序自动生成：model、instructions、input、text、temperature、
+  # max_output_tokens、store、stream；Chat Completions 下自动生成 model、messages、
+  # response_format、temperature、stream、store、max_completion_tokens。
+  # 与这些字段同名时，程序值覆盖 extra_body；其他字段原样传给网关。
+  # 例如 DeepSeek 私有思考开关（仅在网关明确支持时配置）：
+  #   extra_body:
+  #     thinking:
+  #       type: disabled
+  extra_body: {}
+
+  # AI 请求超时不在本段配置，由 timing.external.ai_request_timeout_ms 控制。
+  # Web 调试接口 /ai/recognize、/ai/match、/ai/pick 仍允许用 query 临时覆盖
+  # provider 与 model；endpoint 与 API Key 永不接受覆盖。
+  # 切换到不同 Provider 时，配置中的 extra_body 不会带过去，避免跨供应商泄漏私有字段。
+
+song_ai:
+  # 点歌专用模型；留空沿用 ai.model（点歌偏重低延迟）。
+  model: ""
+  # 在线匹配偏低时额外给出本地曲库推荐；默认开启。
+  local_recommend: true
+  # 在线候选分数低于该值才比较本地曲库；只有本地分数更高才会推荐。
+  local_recommend_min_score: 0.6
   # 留空使用内置系统提示词。
   system_prompt: ""
   # 留空使用内置提示词；可使用 {{text}}。
@@ -570,23 +593,6 @@ ai:
   match_prompt: ""
   # 留空使用内置提示词；可使用 {{request}}、{{preferAccompaniment}}、{{preferAccompanimentInstruction}}、{{candidates}}。
   candidate_pick_prompt: ""
-  # 可选的独立 HTTP(S) 代理；只作用于点歌 AI，留空时沿用环境代理设置
-  http_proxy: ""
-  # 第三方兼容字段。必须是 JSON object；默认空对象。
-  # 程序会自动生成官方 Chat Completions 字段：model、messages、response_format、
-  # temperature、stream=false、store=false、max_completion_tokens、top_p。
-  # extra_body 与这些字段同名时，官方值覆盖 extra_body；其他字段原样传给网关。
-  # 例如 DeepSeek 私有思考开关（仅在网关明确支持时配置）：
-  #   extra_body:
-  #     thinking:
-  #       type: disabled
-  # 也可以放置网关自定义的租户、路由或思考参数；程序不会自动猜测这些字段。
-  extra_body: {}
-
-  # 点歌 AI 请求超时不在本段配置，由 timing.external.ai_request_timeout_ms 控制。
-  # Web 调试接口 /ai/recognize、/ai/match、/ai/pick 还允许用 query 临时覆盖：
-  # provider、apiKey（或 api_key）、endpoint、model。
-  # 切换到不同 Provider 时，配置中的 extra_body 不会带过去，避免跨供应商泄漏私有字段。
 
 song_review:
   # 候选歌曲 AI 审核；只审核最终候选歌曲/URI，控制台来源最高权限免审。
@@ -615,22 +621,13 @@ song_review:
   # 追加审核规则；会附加在 policy_prompt 后面，用于临时补充口径
   custom_prompt: |
     本房间偏好舒缓、轻松、不吵闹的音乐。
-  # 独立审核 Provider；必须支持 OpenAI Responses API、web_search 和严格 JSON Schema
-  provider:
-    # OpenAI 官方完整 Responses 地址；程序会固定要求 web_search。
-    endpoint: "https://api.openai.com/v1/responses"
-    # Responses API 使用 Authorization: Bearer <key>；不要提交到 Git。
-    api_key: ""
-    # 高能力审核模型；启用审核时必须同时填写 api_key。
-    model: "gpt-5.6"
-    # 可选的独立 HTTP(S) 代理；只作用于歌曲审核，留空时沿用环境代理设置
-    http_proxy: ""
-    # 第三方兼容字段；必须是 JSON object，默认空对象。
-    # 程序会自动生成官方 Responses 字段：model、instructions、input、text、tools、
-    # tool_choice、temperature、top_p、max_output_tokens、store、stream。
-    # extra_body 与这些字段同名时，官方值覆盖 extra_body；其他字段原样传给网关。
-    # web_search 和严格 JSON Schema 由程序固定启用，不能通过 extra_body 关闭。
-    extra_body: {}
+  # 审核专用模型；留空沿用 ai.model。审核偏重判断质量，建议用更强模型。
+  model: ""
+  # 是否要求模型联网搜索后再判断；网关不支持 web_search 时应关闭。
+  # 需要 ai.wire_api=responses。
+  web_search: true
+  # 单次审核允许生成的最大 Token。
+  max_tokens: 512
 
 matching:
   # 歌名最低匹配分数

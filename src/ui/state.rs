@@ -34,6 +34,7 @@ pub(crate) struct UiTemplateArgs {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedUiTemplateArgs {
+    pub(crate) panel_downsample_factors: std::collections::BTreeMap<String, u32>,
     pub(crate) friend_template: PathBuf,
     pub(crate) secondary_back_template: PathBuf,
     /// 主菜单「返回提瓦特」按钮模板。它比 secondary_back 优先判定：
@@ -70,6 +71,7 @@ impl UiTemplateArgs {
         ocr: &OcrConfig,
     ) -> ResolvedUiTemplateArgs {
         ResolvedUiTemplateArgs {
+            panel_downsample_factors: templates.panel_downsample_factors.clone(),
             friend_template: self
                 .friend_template
                 .clone()
@@ -472,6 +474,22 @@ impl TemplateUiStateClassifier {
             ),
         ];
         for (label, path, region, scale) in cases {
+            let key = match label {
+                "panel:friend_list" => "friend_panel",
+                "panel:more_settings" => "friend_block_chat",
+                "panel:add_friend" => "friend_search_panel",
+                "panel:confirm_dialog" => "friend_confirm",
+                "panel:hall_card" => "invite_enter_hall",
+                "panel:archive_card" => "invite_goto_hall",
+                "panel:avatar_popup" => "invite_view_star",
+                _ => unreachable!("fixed panel table"),
+            };
+            let scale = self
+                .templates
+                .panel_downsample_factors
+                .get(key)
+                .copied()
+                .unwrap_or(scale);
             let candidate =
                 match best_template_candidate_downscaled(image, Some(region), path, scale) {
                     Ok(candidate) => candidate,
@@ -3201,9 +3219,15 @@ mod tests {
             "full-hall.jpg",
             "hall-chat-closed.jpg",
         ] {
-            assert!(is_hall(name), "{name} 是千星大厅，底栏应是多块同高、同一水平线的小白键");
+            assert!(
+                is_hall(name),
+                "{name} 是千星大厅，底栏应是多块同高、同一水平线的小白键"
+            );
         }
-        for name in ["wonderland-menu.png", "qianxing-ui-59/r16-settings-grid.png"] {
+        for name in [
+            "wonderland-menu.png",
+            "qianxing-ui-59/r16-settings-grid.png",
+        ] {
             assert!(!is_hall(name), "{name} 是整块白底/跨行，不得判成大厅");
         }
         let (_, menu_min_height, _, _) = signature("wonderland-menu.png");
@@ -3216,9 +3240,11 @@ mod tests {
             settings_top_spread > HALL_BAR_MAX_TILE_TOP_SPREAD_PX,
             "设置宫格应跨两行（顶部极差应大于 4 px）"
         );
-        let (teyvat_tiles, _, _, _) =
-            signature("transition-to-overworld/05-overworld-teyvat.jpg");
-        assert!(teyvat_tiles < HALL_BAR_MIN_TILES, "提瓦特底栏只有一个 Enter");
+        let (teyvat_tiles, _, _, _) = signature("transition-to-overworld/05-overworld-teyvat.jpg");
+        assert!(
+            teyvat_tiles < HALL_BAR_MIN_TILES,
+            "提瓦特底栏只有一个 Enter"
+        );
     }
 
     fn panel_regions_from(config: &AppConfig) -> PanelRegions {

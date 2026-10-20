@@ -4352,6 +4352,25 @@ fn config_schema_route_lists_all_sections_with_defaults() {
     assert_eq!(max_size["effect"], "idleReload");
     assert_eq!(max_size["source"], "db");
     assert_eq!(max_size["nullable"], false);
+    assert_eq!(max_size["managedBy"], Value::Null);
+    // 视觉档案接管的字段必须在 schema 中标注，页面据此默认收起。
+    let templates = sections
+        .iter()
+        .find(|section| section["name"] == "templates")
+        .expect("templates section");
+    let blue = templates["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["path"] == "templates.blue_marker")
+        .expect("templates.blue_marker field");
+    assert_eq!(blue["managedBy"], "visual");
+    assert_eq!(templates["visualFields"], 21);
+    let ocr = sections
+        .iter()
+        .find(|section| section["name"] == "ocr")
+        .expect("ocr section");
+    assert_eq!(ocr["visualFields"], 14);
     let http = sections
         .iter()
         .find(|section| section["name"] == "http")
@@ -5143,4 +5162,91 @@ fn config_endpoints_require_access_token() {
     let value: Value = serde_json::from_str(&response.body).expect("config JSON");
     assert_eq!(value["ok"], true);
     server.shutdown().expect("shutdown HTTP server");
+}
+
+#[test]
+fn visual_profile_preview_is_read_only_and_import_preserves_other_settings() {
+    let state = test_state();
+    let exported: Value = serde_json::from_str(&config_visual_route(&[], &state).unwrap()).unwrap();
+    let mut profile = exported["profile"].clone();
+    assert!(
+        profile["templates"]["blue_marker"]
+            .as_str()
+            .unwrap()
+            .ends_with("chat-marker-blue.png")
+    );
+    assert!(profile.get("custom_workflows").is_none());
+    profile["thresholds"]["builtin"] = json!(0.81);
+    profile["chat_geometry"]["marker_search_width"] = json!(72);
+    profile["matching"]["panel_downsample_factors"] = json!({"friend_confirm":2});
+    let before = state.config_store.lock().unwrap().current_value().unwrap();
+    let preview_body = serde_json::to_vec(&json!({"profile":profile})).unwrap();
+    let preview: Value =
+        serde_json::from_str(&config_visual_preview_route(&preview_body, &state).unwrap()).unwrap();
+    assert_eq!(preview["ok"], true);
+    assert_eq!(preview["differences"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .current_revision()
+            .unwrap(),
+        1
+    );
+    let body =
+        serde_json::to_vec(&json!({"baseRevision":preview["revision"],"profile":profile})).unwrap();
+    let result: Value =
+        serde_json::from_str(&config_visual_import_route(&body, &state).unwrap()).unwrap();
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["reloadScheduled"], true);
+    let saved = state.config_store.lock().unwrap().current_value().unwrap();
+    assert_eq!(saved["templates"]["marker_threshold"], 0.81);
+    assert_eq!(saved["ocr"]["marker_search_width"], 72);
+    assert_eq!(
+        saved["templates"]["panel_downsample_factors"]["friend_confirm"],
+        2
+    );
+    for key in ["custom_workflows", "ai", "timing", "playback"] {
+        assert_eq!(saved[key], before[key]);
+    }
+    let stale: Value =
+        serde_json::from_str(&config_visual_import_route(&body, &state).unwrap()).unwrap();
+    assert_eq!(stale["code"], "config_conflict");
+}
+
+#[test]
+fn visual_profile_rejects_incomplete_or_invalid_geometry_without_writing() {
+    let state = test_state();
+    let exported: Value = serde_json::from_str(&config_visual_route(&[], &state).unwrap()).unwrap();
+    let mut profile = exported["profile"].clone();
+    profile["regions"]["chat"]["width"] = json!(u64::MAX);
+    let body = serde_json::to_vec(&json!({"profile":profile,"baseRevision":1})).unwrap();
+    assert!(config_visual_import_route(&body, &state).is_err());
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .current_revision()
+            .unwrap(),
+        1
+    );
+    let mut bad = exported["profile"].clone();
+    bad["matching"]["panel_downsample_factors"] = json!({"unknown":2});
+    let body = serde_json::to_vec(&json!({"profile":bad})).unwrap();
+    let rejected: Value =
+        serde_json::from_str(&config_visual_preview_route(&body, &state).unwrap()).unwrap();
+    assert_eq!(rejected["ok"], false);
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .current_revision()
+            .unwrap(),
+        1
+    );
+    assert!(is_mutating_route("/config/visual/import"));
+    assert!(!is_mutating_route("/config/visual"));
 }

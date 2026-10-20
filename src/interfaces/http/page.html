@@ -404,6 +404,55 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .global-result.result-ok{border-left:3px solid var(--ok)}
 .global-result.result-err{border-left:3px solid var(--danger)}
 
+/* ===== 命令面板 ===== */
+.command-status{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-2);margin:0 0 var(--sp-4);padding:var(--sp-3) var(--sp-4);background:var(--bg-input);border:1px solid var(--sep-2);border-radius:var(--radius-m);font-size:var(--fs-meta);line-height:var(--lh-meta);color:var(--text-2)}
+.command-status .chip{padding:6px var(--sp-3)}
+.command-status .btn{margin-left:auto}
+.command-status .btn+.btn{margin-left:0}
+.command-toolbar{display:flex;flex-wrap:wrap;gap:var(--sp-2);align-items:center;margin:0 0 var(--sp-3)}
+.command-toolbar input[type=text]{flex:1;min-width:180px;height:var(--btn-h)}
+.command-toolbar .tabs{flex:none}
+.command-toolbar-meta{color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);white-space:nowrap}
+.command-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-4);align-items:start}
+.command-group{background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-l);box-shadow:var(--shadow);min-width:0;overflow:hidden}
+.command-group-head{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2);width:100%;height:44px;padding:0 var(--sp-3);border:0;background:transparent;color:var(--text-1);cursor:pointer;font:inherit;text-align:left}
+.command-group-head:hover{background:var(--fill-1)}
+.command-group-name{display:flex;align-items:center;gap:var(--sp-2);font-size:var(--fs-title);line-height:var(--lh-title);font-weight:600}
+.command-group-name::before{content:"";width:3px;height:14px;border-radius:2px;background:var(--accent);flex:none}
+.command-group-name::after{content:"▾";color:var(--text-3);font-size:var(--fs-tiny)}
+.command-group.collapsed .command-group-name::after{content:"▸"}
+.command-group-count{color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);white-space:nowrap}
+.command-group-body{display:flex;flex-direction:column;gap:var(--sp-2);padding:var(--sp-3);border-top:1px solid var(--sep-2)}
+.command-group.collapsed .command-group-body{display:none}
+.command-item{background:var(--bg-input);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-2) var(--sp-3);min-width:0}
+.command-item.hidden-command{border-style:dashed}
+.command-item.disabled{opacity:.55}
+.command-item.disabled:hover{opacity:.85}
+.command-head{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-2)}
+.command-title{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-1);min-width:0}
+.command-name{font-size:var(--fs-item);line-height:var(--lh-item);font-weight:600;color:var(--text-1);word-break:break-word}
+.command-alias{color:var(--text-2);font-size:var(--fs-tiny);line-height:var(--lh-tiny);background:var(--fill-1);border:1px solid var(--sep-2);border-radius:999px;padding:1px var(--sp-2)}
+.command-badges{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-1);margin-left:auto}
+.command-badge{font-size:var(--fs-tiny);line-height:var(--lh-tiny);padding:1px var(--sp-2);border-radius:999px;white-space:nowrap}
+.command-badge.prefix{font-family:var(--font-mono);font-weight:600;background:var(--accent-soft);color:var(--accent)}
+.command-badge.source{background:var(--fill-2);color:var(--text-2)}
+.command-badge.open{background:var(--ok-soft);color:var(--ok);font-weight:600}
+.command-badge.hidden-mark{background:var(--fill-2);color:var(--text-3)}
+.command-badge.disabled-mark{background:var(--danger-soft);color:var(--danger)}
+.command-summary{margin:var(--sp-1) 0 0;color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);word-break:break-word}
+.command-toggle{margin-top:var(--sp-1)}
+.command-detail{margin-top:var(--sp-2);padding-top:var(--sp-2);border-top:1px dashed var(--sep-1);display:flex;flex-direction:column;gap:var(--sp-1)}
+.command-detail-row{color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);word-break:break-word}
+.command-detail-label{display:inline-block;min-width:64px;color:var(--text-3);font-size:var(--fs-tiny)}
+.command-detail-lines{display:flex;flex-direction:column;gap:2px;margin-top:2px}
+.command-detail-lines code{display:block;font-family:var(--font-mono);font-size:var(--fs-meta);color:var(--text-1);background:var(--bg-raised);border-radius:var(--radius-s);padding:2px var(--sp-2);word-break:break-word}
+.command-detail-open{color:var(--ok)}
+.command-detail-empty{color:var(--text-3)}
+.command-empty{grid-column:1/-1;color:var(--text-3);font-size:var(--fs-item);line-height:var(--lh-item);text-align:center;padding:var(--sp-5) var(--sp-3);background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-l)}
+.command-foot{margin:var(--sp-3) 0 0;color:var(--text-3);font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
+@media(max-width:1050px){.command-groups{grid-template-columns:1fr}}
+@media(max-width:720px){.command-status .btn{margin-left:0}}
+
 /* ===== 高级控制 ===== */
 .tools-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-5)}
 .tools-grid>.wide{grid-column:1/-1}
@@ -508,6 +557,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
     <button class="nav-link" data-route="login" onclick="navigateTo('login')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/></svg>账号登录</button>
     <button class="nav-link" data-route="game" onclick="navigateTo('game')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>游戏与聊天</button>
     <button class="nav-link" data-route="entertainment" onclick="navigateTo('entertainment')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>娱乐玩法</button>
+    <button class="nav-link" data-route="commands" onclick="navigateTo('commands')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="3.5" width="19" height="17" rx="2.5"/><path d="m6.5 8.5 3 3-3 3"/><path d="M12.5 15h4.5"/></svg>命令面板</button>
     <button class="nav-link" data-route="tasks" onclick="navigateTo('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15l2 2 4-4"/></svg>任务与日志</button>
     <button class="nav-link" data-route="tools" onclick="navigateTo('tools')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>高级控制</button>
     <button class="nav-link" data-route="config" onclick="navigateTo('config')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/></svg>配置中心</button>
@@ -570,6 +620,29 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
     <section class="page-section" id="page-login" data-page="login"><h1 class="page-title">账号登录</h1><p class="page-subtitle">音乐平台账号登录与凭据状态</p><div class="page-grid" id="loginGrid"></div></section>
     <section class="page-section" id="page-game" data-page="game"><h1 class="page-title">游戏与聊天</h1><p class="page-subtitle">聊天值守、游戏流程与机器人操作</p><div class="page-grid" id="gameGrid"></div></section>
     <section class="page-section" id="page-entertainment" data-page="entertainment"><h1 class="page-title">娱乐玩法</h1><p class="page-subtitle">海龟汤与谁是卧底对局管理</p><div class="page-grid" id="entertainmentGrid"></div></section>
+    <section class="page-section" id="page-commands" data-page="commands">
+      <h1 class="page-title">命令面板</h1>
+      <p class="page-subtitle">大厅与好友私聊可用的聊天命令目录，按功能模块分组；只读视图，不提供开关写操作</p>
+      <div class="command-status" id="commandStatusBar">
+        <span class="chip"><i class="dot"></i><span>全局命令</span><em id="commandStatusText">读取中…</em></span>
+        <span id="commandStatusHint">来源：GET /commands/catalog</span>
+        <button class="btn small" onclick="navigateTo('game')">前往游戏页开关</button>
+        <button class="btn small ghost" onclick="loadCommandCatalog(true)">刷新目录</button>
+      </div>
+      <div class="command-toolbar">
+        <input id="commandSearch" type="text" placeholder="搜索命令名称 / 别名 / 摘要" aria-label="搜索命令" oninput="renderCommandCatalog()">
+        <div class="tabs" role="group" aria-label="按来源过滤">
+          <button class="tab active" id="commandSourceAll" onclick="setCommandSourceFilter('all')">全部来源</button>
+          <button class="tab" id="commandSourceHall" onclick="setCommandSourceFilter('hall')">仅大厅</button>
+          <button class="tab" id="commandSourceFriend" onclick="setCommandSourceFilter('friend')">仅好友</button>
+        </div>
+        <label class="tools-checkbox"><input id="commandShowHidden" type="checkbox" onchange="renderCommandCatalog()">显示隐藏命令</label>
+        <span class="command-toolbar-meta" id="commandCatalogMeta">加载中…</span>
+      </div>
+      <div class="config-message err hidden" id="commandError" role="status" aria-live="polite"></div>
+      <div class="command-groups" id="commandGroups"><div class="command-empty">正在读取命令目录…</div></div>
+      <p class="command-foot">命令开关请在「游戏与聊天 → 机器人操作」中切换；本页仅展示目录，不发送任何游戏输入。</p>
+    </section>
     <section class="page-section" id="page-tasks" data-page="tasks"><h1 class="page-title">任务与日志</h1><p class="page-subtitle">任务队列、事件日志与接口调用记录</p><div class="page-grid" id="tasksGrid"></div></section>
     <section class="page-section" id="page-tools" data-page="tools"><h1 class="page-title">高级控制</h1><p class="page-subtitle">OCR、模板匹配与手动输入诊断工具</p><div class="tools-grid">
       <div class="panel">
@@ -1021,7 +1094,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
 
 <script>
 function $(id){return document.getElementById(id)}
-const pageRoutes=['overview','playback','login','game','entertainment','tasks','tools','config','settings']
+const pageRoutes=['overview','playback','login','game','entertainment','commands','tasks','tools','config','settings']
 function setupPages(){
   const playbackPanelClasses={
     songState:'playback-player-panel',
@@ -1076,6 +1149,18 @@ let configLatestRevisionAtMs=null // 服务端最新历史版本时间（首次�
 let configSearchText=''
 let configRevisionsOpen=false
 let configSecretDraft={}
+// 命令面板状态：navigateTo 在脚本中段即被调用，声明必须位于其之前，避免 TDZ。
+let commandCatalog=null              // GET /commands/catalog 响应 {commandsEnabled, groups}
+let commandCatalogLoading=false
+let commandCatalogError=''
+let commandCatalogFetchedAt=0        // 最近一次成功读取时间，用于刷新节流
+let commandSourceFilter='all'        // all | hall | friend
+let commandCollapsedGroups=new Set()
+let commandExpandedItems=new Set()
+// 命令目录是静态数据：命令面板内刷新节流 5s，避免每次过滤/全量刷新都打后端。
+const commandRefreshMinInterval=5000
+const commandAuthorityLabels={hall:'大厅成员',friend:'好友私聊'}
+const commandGroupOrder=['点歌','播放','大厅','娱乐','管理']
 async function navigateTo(route,updateHash=true){
   if(!pageRoutes.includes(route))route='overview'
   const currentRoute=document.querySelector('.page-section.active')?.dataset.page
@@ -1097,6 +1182,7 @@ async function navigateTo(route,updateHash=true){
   try{localStorage.setItem('miliastraRoute',route)}catch(e){}
   if(updateHash&&location.hash!=='#'+route)history.replaceState(null,'','#'+route)
   if(route==='config'&&(!configData||!configUnsaved))loadConfigPage()
+  if(route==='commands'&&!commandCatalog&&!commandCatalogLoading)loadCommandCatalog()
 }
 function initialRoute(){
   const hash=location.hash.slice(1)
@@ -2155,6 +2241,8 @@ function toggleRefresh(){
   if(!refreshPaused)refreshAll()
 }
 async function refreshAll(){
+  // 命令目录是静态数据，只在停留在命令面板时随全量刷新重读（内部有加载中/时间节流）。
+  if(document.querySelector('.page-section.active')?.dataset.page==='commands')loadCommandCatalog()
   const results=await Promise.allSettled([loadMonitor(),loadHistory(),refreshPlayer(),loadPlaybackInsights(),loadPlayMode()])
   const failed=results.find((item)=>item.status==='rejected')
   if(failed)setResult('刷新失败: '+failed.reason.message)
@@ -2221,6 +2309,230 @@ document.addEventListener('keydown',event=>{
     event.preventDefault()
   }
 })
+/* ===== 命令面板（GET /commands/catalog，只读） ===== */
+function commandText(value){return typeof value==='string'?value.trim():''}
+function commandList(value){
+  if(Array.isArray(value))return value.map(commandText).filter(text=>text.length>0)
+  const single=commandText(value)
+  return single?[single]:[]
+}
+function commandEscape(value){return esc(String(value??''))}
+function commandSourceState(item){
+  const values=Array.isArray(item.authorities)?item.authorities.map(value=>String(value).toLowerCase()).filter(Boolean):[]
+  const hall=values.includes('hall')
+  const friend=values.includes('friend')
+  if(!hall&&!friend)return {hall:true,friend:true,labels:[],unknown:true}
+  return {hall,friend,labels:values.map(value=>commandAuthorityLabels[value]||value),unknown:false}
+}
+function commandIsHidden(item){
+  if(typeof item.hidden==='boolean')return item.hidden
+  return String(item.visibility||'').toLowerCase()==='hidden'
+}
+function commandIsEnabled(item){return !(typeof item.enabled==='boolean'&&item.enabled===false)}
+// 稳定 key：只依赖组名与命令名，过滤/搜索不改变展开状态；name 缺失时才用下标兜底。
+function commandItemKey(groupName,item,index){
+  const name=commandText(item&&item.name)
+  return groupName+'\u00b7'+(name||('#'+commandText(item&&item.prefix)+index))
+}
+function commandMatchesSearch(item,query){
+  if(!query)return true
+  const haystack=[commandText(item.name),commandText(item.summary),...(Array.isArray(item.aliases)?item.aliases:[])].join('\n').toLowerCase()
+  return haystack.includes(query)
+}
+function commandToLine(command,prefix,addPrefix){
+  const text=commandText(command)||''
+  if(!text)return ''
+  const hasPrefix=text.startsWith('@')||text.startsWith('#')
+  return addPrefix&&!hasPrefix?prefix+text:text
+}
+function commandPrefix(value){return value==='#'||value==='@'?value:'@'}
+function commandDetailLines(values,prefix,placeholders){
+  const lines=commandList(values).map(value=>commandToLine(value,prefix,placeholders)).filter(Boolean)
+  return lines.length?lines.map(line=>'<code>'+commandEscape(line)+'</code>').join(''):''
+}
+function commandBadge(text,kind){return '<span class="command-badge '+(kind||'')+'">'+commandEscape(text)+'</span>'}
+function commandItemHtml(item,index,groupName,showHidden){
+  const key=commandItemKey(groupName,item,index)
+  const name=commandText(item.name)||'（未命名命令）'
+  const prefix=commandPrefix(item.prefix)
+  const source=commandSourceState(item)
+  const hidden=commandIsHidden(item)
+  const enabled=commandIsEnabled(item)
+  const openEnded=item.openEnded===true
+  const aliases=commandList(item.aliases)
+  const expanded=commandExpandedItems.has(key)
+  const usage=commandDetailLines(item.usage,prefix,true)
+  const examples=commandDetailLines(item.examples,prefix,false)
+  const classes=['command-item']
+  if(hidden&&showHidden)classes.push('hidden-command')
+  if(!enabled)classes.push('disabled')
+  // 来源徽章：缺省按“大厅 + 好友”处理，未知取值原样展示，避免静默丢信息。
+  const sourceBadge=source.unknown?(source.labels.length?source.labels.join(' / '):'来源未标注'):(source.hall&&source.friend?'大厅成员 / 好友私聊':(source.hall?'大厅成员':'好友私聊'))
+  return '<div class="'+classes.join(' ')+'" data-command-key="'+commandEscape(key)+'">'+
+    '<div class="command-head"><div class="command-title"><span class="command-name">'+commandEscape(name)+'</span>'+
+    aliases.map(alias=>'<span class="command-alias">'+commandEscape(alias)+'</span>').join('')+'</div>'+
+    '<div class="command-badges">'+commandBadge(prefix,'prefix')+
+      (source.hall&&!source.unknown?commandBadge('大厅','source'):'')+
+      (source.friend&&!source.unknown?commandBadge('好友','source'):'')+
+      (source.unknown?commandBadge(sourceBadge,'source'):'')+
+      (openEnded?commandBadge('会话中可自由输入','open'):'')+
+      (hidden?commandBadge('隐藏','hidden-mark'):'')+
+      (enabled?'':commandBadge('已禁用','disabled-mark'))+'</div></div>'+
+    '<p class="command-summary">'+commandEscape(commandText(item.summary)||'（暂无摘要）')+'</p>'+
+    '<div class="command-toggle"><button class="btn small ghost toggle-command-detail" type="button">'+(expanded?'收起用法':'查看用法与示例')+'</button></div>'+
+    (expanded?commandDetailHtml(item,usage,examples):'')+
+    '</div>'
+}
+function commandDetailHtml(item,usage,examples){
+  const openEnded=item.openEnded===true
+  const usageRow=usage
+    ?'<div class="command-detail-row"><span class="command-detail-label">用法</span><div class="command-detail-lines">'+usage+'</div></div>'
+    :''
+  const exampleRow=examples
+    ?'<div class="command-detail-row"><span class="command-detail-label">示例</span><div class="command-detail-lines">'+examples+'</div></div>'
+    :''
+  const empty=!usage&&!examples?'<div class="command-detail-row command-detail-empty">后端未提供用法与示例</div>':''
+  // openEnded：玩法进行中接受任意输入，不能只列保留关键词。
+  const openRow=openEnded?'<div class="command-detail-row command-detail-open">会话中可自由输入：玩法进行中接受任意输入，上列关键词只是入口或保留词，不是完整输入集合。</div>':''
+  return '<div class="command-detail">'+usageRow+exampleRow+empty+openRow+'</div>'
+}
+function commandVisibleItems(group,showHidden){
+  const items=Array.isArray(group&&group.commands)?group.commands:[]
+  const query=commandText($('commandSearch')?$('commandSearch').value:'').toLowerCase()
+  return items.filter(item=>{
+    if(!item||typeof item!=='object')return false
+    if(commandIsHidden(item)&&!showHidden)return false
+    if(commandSourceFilter!=='all'){
+      const source=commandSourceState(item)
+      if(commandSourceFilter==='hall'&&!source.hall)return false
+      if(commandSourceFilter==='friend'&&!source.friend)return false
+    }
+    return commandMatchesSearch(item,query)
+  })
+}
+function commandGroupHtml(group,showHidden){
+  const groupName=commandText(group.name)||'未分组'
+  const items=commandVisibleItems(group,showHidden)
+  if(!items.length)return ''
+  const collapsed=commandCollapsedGroups.has(groupName)
+  const body=items.map((item,index)=>commandItemHtml(item,index,groupName,showHidden)).join('')
+  return '<div class="command-group'+(collapsed?' collapsed':'')+'" data-command-group="'+commandEscape(groupName)+'">'+
+    '<button class="command-group-head" type="button" aria-expanded="'+(collapsed?'false':'true')+'" onclick="toggleCommandGroup(this)">'+
+    '<span class="command-group-name">'+commandEscape(groupName)+'</span><span class="command-group-count">'+items.length+' 条</span></button>'+
+    '<div class="command-group-body">'+body+'</div></div>'
+}
+function renderCommandCatalog(){
+  const host=$('commandGroups')
+  if(!host)return
+  if(!commandCatalog){
+    host.innerHTML='<div class="command-empty">'+commandEscape(commandCatalogError||'正在读取命令目录…')+'</div>'
+    updateCommandToolbarMeta([])
+    return
+  }
+  const showHidden=Boolean($('commandShowHidden')&&$('commandShowHidden').checked)
+  const groups=Array.isArray(commandCatalog.groups)?commandCatalog.groups.filter(group=>group&&Array.isArray(group.commands)):[]
+  const ordered=[...groups].sort((a,b)=>{
+    const ai=commandGroupOrder.indexOf(commandText(a.name))
+    const bi=commandGroupOrder.indexOf(commandText(b.name))
+    return (ai<0?commandGroupOrder.length:ai)-(bi<0?commandGroupOrder.length:bi)
+  })
+  const html=ordered.map(group=>commandGroupHtml(group,showHidden)).join('')
+  host.innerHTML=html||'<div class="command-empty">没有匹配的命令；可清空搜索、放宽来源过滤，或勾选「显示隐藏命令」。</div>'
+  updateCommandToolbarMeta(groups)
+}
+function updateCommandToolbarMeta(groups){
+  const meta=$('commandCatalogMeta')
+  if(!meta)return
+  if(!commandCatalog){meta.textContent=commandCatalogError?'读取失败':'加载中…';return}
+  const showHidden=Boolean($('commandShowHidden')&&$('commandShowHidden').checked)
+  const visible=groups.reduce((total,group)=>total+commandVisibleItems(group,showHidden).length,0)
+  const total=groups.reduce((sum,group)=>sum+(Array.isArray(group.commands)?group.commands.length:0),0)
+  const fetched=commandCatalogFetchedAt?' · '+new Date(commandCatalogFetchedAt).toLocaleTimeString('zh-CN',{hour12:false}):''
+  meta.textContent='显示 '+visible+' / '+total+' 条'+fetched
+}
+function renderCommandError(){
+  const notice=$('commandError')
+  if(!notice)return
+  // 失败提示独立于数据区：即使保留着上一次成功的目录，也要明确告知本次读取失败。
+  notice.textContent=commandCatalogError||''
+  notice.classList.toggle('hidden',!commandCatalogError)
+}
+function renderCommandStatus(){
+  renderCommandError()
+  const status=$('commandStatusText')
+  const hint=$('commandStatusHint')
+  if(!status)return
+  const chip=status.closest('.chip')
+  if(!commandCatalog){
+    status.textContent=commandCatalogError?'目录读取失败':'读取中…'
+    if(chip)chip.dataset.state=commandCatalogError?'err':''
+  }else if(commandCatalog.commandsEnabled===false){
+    status.textContent='已禁用'
+    if(chip)chip.dataset.state='warn'
+  }else if(commandCatalog.commandsEnabled===true){
+    status.textContent='已启用'
+    if(chip)chip.dataset.state='ok'
+  }else{
+    status.textContent='状态未知'
+    if(chip)chip.dataset.state=''
+  }
+  if(hint){
+    // 失败时优先显示原因；已有上一次成功数据时继续展示，只提示读取失败（不抛未捕获异常）。
+    if(commandCatalogError)hint.textContent=commandCatalogError
+    else if(commandCatalogFetchedAt)hint.textContent='最近读取 '+new Date(commandCatalogFetchedAt).toLocaleTimeString('zh-CN',{hour12:false})
+    else hint.textContent='来源：GET /commands/catalog'
+  }
+}
+async function loadCommandCatalog(force){
+  if(commandCatalogLoading)return
+  // 目录是静态数据：非强制时按时间节流，避免全量刷新/切页反复打后端。
+  if(!force&&commandCatalog&&Date.now()-commandCatalogFetchedAt<commandRefreshMinInterval)return
+  commandCatalogLoading=true
+  try{
+    const data=await request('/commands/catalog')
+    if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('命令目录响应格式不正确')
+    if(!Array.isArray(data.groups))throw new Error('命令目录缺少 groups 字段')
+    commandCatalog={commandsEnabled:data.commandsEnabled,groups:data.groups}
+    commandCatalogError=''
+    commandCatalogFetchedAt=Date.now()
+  }catch(e){
+    // 后端未就绪时只提示，不抛未捕获异常；保留上一次成功数据。
+    commandCatalogError='读取命令目录失败：'+(e&&e.message?e.message:'未知错误')
+  }finally{
+    commandCatalogLoading=false
+    renderCommandStatus()
+    renderCommandCatalog()
+  }
+}
+function setCommandSourceFilter(filter){
+  commandSourceFilter=['hall','friend'].includes(filter)?filter:'all'
+  ;[['commandSourceAll','all'],['commandSourceHall','hall'],['commandSourceFriend','friend']].forEach(([id,value])=>{
+    const el=$(id)
+    if(el)el.classList.toggle('active',value===commandSourceFilter)
+  })
+  renderCommandCatalog()
+}
+function toggleCommandGroup(button){
+  const group=button&&button.closest?button.closest('.command-group'):null
+  if(!group)return
+  const name=group.dataset.commandGroup||''
+  const collapsed=group.classList.toggle('collapsed')
+  if(collapsed)commandCollapsedGroups.add(name)
+  else commandCollapsedGroups.delete(name)
+  button.setAttribute('aria-expanded',collapsed?'false':'true')
+}
+// 事件委托：目录内容整体重渲染，避免逐条绑定监听器。
+document.addEventListener('click',event=>{
+  const toggle=event.target&&event.target.closest?event.target.closest('.toggle-command-detail'):null
+  if(!toggle)return
+  const item=toggle.closest('.command-item')
+  if(!item)return
+  const key=item.dataset.commandKey||''
+  if(commandExpandedItems.has(key))commandExpandedItems.delete(key)
+  else commandExpandedItems.add(key)
+  renderCommandCatalog()
+})
+
 /* ===== 高级控制（原 /tools 独立页面，已并入左侧导航） ===== */
 const val=(id)=>{const el=$(id);return el?el.value.trim():''}
 let toolsBusy=false

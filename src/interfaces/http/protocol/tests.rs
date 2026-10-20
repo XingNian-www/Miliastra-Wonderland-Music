@@ -5247,3 +5247,103 @@ fn visual_profile_rejects_incomplete_or_invalid_geometry_without_writing() {
     assert!(is_mutating_route("/config/visual/import"));
     assert!(!is_mutating_route("/config/visual"));
 }
+
+#[test]
+fn commands_catalog_route_serves_the_panel_contract_over_real_http() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+
+    let response = http_get(server.local_addr(), "/commands/catalog", None);
+
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+    let value: Value = serde_json::from_str(&response.body).expect("catalog JSON");
+    // 面板契约：顶层两个字段，groups 非空。
+    assert!(value["commandsEnabled"].is_boolean());
+    let groups = value["groups"].as_array().expect("groups 数组");
+    assert!(!groups.is_empty(), "命令目录不应为空");
+    // 首组必须是点歌（面板按此顺序渲染）。
+    assert_eq!(groups[0]["name"], "点歌");
+    // 抽查一条命令的字段齐全，且别名已归并。
+    let all_commands: Vec<&Value> = groups
+        .iter()
+        .flat_map(|group| group["commands"].as_array().expect("commands 数组"))
+        .collect();
+    let song = all_commands
+        .iter()
+        .find(|command| command["name"] == "点歌")
+        .expect("点歌 已登记");
+    let aliases = song["aliases"].as_array().expect("aliases 数组");
+    assert!(
+        aliases.iter().any(|alias| alias == "AI点歌"),
+        "别名应归并到点歌条目下"
+    );
+    assert_eq!(song["prefix"], "@");
+    // 面板逐字段读取这些键；后端少给一个就会渲染成空白。
+    assert!(song["openEnded"].is_boolean());
+    assert!(song["enabled"].is_boolean());
+    assert!(song["usage"].is_array());
+    assert!(song["examples"].is_array());
+    assert!(song["summary"].is_string());
+    assert!(song["authorities"].is_array());
+
+    // 会话态玩法必须如实标注 openEnded=true，而不是伪装成普通命令。
+    let open_ended: Vec<&str> = all_commands
+        .iter()
+        .filter(|command| command["openEnded"] == true)
+        .filter_map(|command| command["name"].as_str())
+        .collect();
+    assert!(
+        open_ended.contains(&"成语接龙") && open_ended.contains(&"斗地主"),
+        "会话中可自由输入的玩法要标注 openEnded，实际：{open_ended:?}"
+    );
+    assert!(
+        !open_ended.contains(&"海龟汤"),
+        "海龟汤只认固定关键词，不应标注为可自由输入"
+    );
+
+    server.shutdown().expect("shutdown HTTP server");
+}
+
+#[test]
+fn commands_catalog_route_never_mutates_config_even_when_posted_to() {
+    // 本程序的方法网关只强制"写接口必须用 POST"，并不禁止对只读接口发 POST
+    // （见 protocol.rs 的 method guard）。因此这里断言的重点不是"拒绝 POST"，
+    // 而是"无论用哪种方法都不会产生副作用、返回的都是同一份目录"。
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+
+    let revision_before = state
+        .config_store
+        .lock()
+        .unwrap()
+        .current_revision()
+        .unwrap();
+
+    let get_response = http_get(server.local_addr(), "/commands/catalog", None);
+    assert_eq!(get_response.status_line, "HTTP/1.1 200 OK");
+
+    let post_response = http_post(server.local_addr(), "/commands/catalog", None);
+    assert_eq!(
+        post_response.status_line, "HTTP/1.1 200 OK",
+        "只读路由对 POST 也返回目录，但绝不写库"
+    );
+
+    // 关键不变量：读目录不能改动配置修订号。
+    let revision_after = state
+        .config_store
+        .lock()
+        .unwrap()
+        .current_revision()
+        .unwrap();
+    assert_eq!(
+        revision_before, revision_after,
+        "读取命令目录不得改动配置修订号"
+    );
+    assert_eq!(
+        get_response.body, post_response.body,
+        "两种方法应返回同一份目录"
+    );
+
+    server.shutdown().expect("shutdown HTTP server");
+}
+

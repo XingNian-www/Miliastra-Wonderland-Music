@@ -2165,6 +2165,15 @@ fn kugou_section() -> Vec<ConfigFieldSchema> {
     ]
 }
 
+fn replies_section() -> Vec<ConfigFieldSchema> {
+    vec![ConfigFieldSchema::db_live(
+        "overrides",
+        "回复文案覆盖",
+        FieldKind::Object,
+        "键为模板键（如 help.song_request.1），值为替换文案，可用 {占位符} 插入变量（如 {用户名}{歌名}{剩余分钟}{AI回答}）。缺失的键回落内置默认文案；留空或全空白的值等同于未覆盖。改完立即生效。命令面板可查看全部可用键与占位符。",
+    )]
+}
+
 /// 全部配置段 schema（与 AppConfig 顶层段一一对应，含 bootstrap 的 http/logging）。
 pub fn config_sections() -> Vec<ConfigSectionSchema> {
     vec![
@@ -2347,6 +2356,12 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             label: "酷狗设备".to_string(),
             order: 30,
             fields: with_section_prefix("kugou", kugou_section()),
+        },
+        ConfigSectionSchema {
+            name: "replies".to_string(),
+            label: "回复文案".to_string(),
+            order: 31,
+            fields: with_section_prefix("replies", replies_section()),
         },
     ]
 }

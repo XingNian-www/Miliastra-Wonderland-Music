@@ -404,7 +404,13 @@ impl ApplicationRuntime {
                 parsed.role,
                 parsed.raw
             );
-            return ApplicationRuntime::reply(self, "个人歌单功能仅对好友及以上开放.");
+            // 文案可被配置中心覆盖；变量留空，渲染时按内置默认文案输出。
+            let text = self.render_reply(
+                crate::features::reply_template::REPLY_SONG[0].key,
+                crate::features::reply_template::REPLY_SONG[0].default,
+                &crate::features::reply_template::ReplyVars::new(),
+            );
+            return ApplicationRuntime::reply(self, &text);
         }
         if matches!(command, crate::features::playlist::PlaylistCommand::Open) {
             return self.execute_playlist_window(parsed);

@@ -811,6 +811,9 @@ pub(crate) use schema::*;
 mod store;
 pub(crate) use store::*;
 
+/// Unified visual profile import/export over the existing SQLite fields.
+pub(crate) mod visual;
+
 /// 运行时可热更新配置的共享句柄集合（阶段 7）：保存成功后由 HTTP 层 apply，
 /// 消费方在运行态读取共享值，使 schema 中标 Live 的字段真正生效。
 mod live;
@@ -1243,6 +1246,12 @@ pub struct OcrConfig {
     pub block_bottom_padding: i32,
     pub max_block_height: i32,
     pub same_line_y_tolerance: i32,
+    #[serde(default = "default_marker_search_width")]
+    pub marker_search_width: u32,
+    #[serde(default = "default_marker_dedupe_min_x")]
+    pub marker_dedupe_min_x: i32,
+    #[serde(default = "default_marker_dedupe_min_y")]
+    pub marker_dedupe_min_y: i32,
     pub marker_dedupe_x: i32,
     pub marker_dedupe_y: i32,
     pub next_marker_min_gap: i32,
@@ -1291,6 +1300,16 @@ impl Default for OpenVinoConfig {
     }
 }
 
+fn default_marker_search_width() -> u32 {
+    60
+}
+fn default_marker_dedupe_min_x() -> i32 {
+    22
+}
+fn default_marker_dedupe_min_y() -> i32 {
+    14
+}
+
 impl Default for OcrConfig {
     fn default() -> Self {
         // 默认优先使用 OpenVINO（发布包内置运行时与 IR 模型），初始化失败时回退 MNN CPU；
@@ -1318,6 +1337,9 @@ impl Default for OcrConfig {
             block_bottom_padding: 2,
             max_block_height: 120,
             same_line_y_tolerance: 10,
+            marker_search_width: default_marker_search_width(),
+            marker_dedupe_min_x: default_marker_dedupe_min_x(),
+            marker_dedupe_min_y: default_marker_dedupe_min_y(),
             marker_dedupe_x: 8,
             marker_dedupe_y: 8,
             next_marker_min_gap: 12,
@@ -1365,6 +1387,14 @@ impl OpenVinoConfig {
 
 impl OcrConfig {
     fn validate(&self) -> Result<()> {
+        if self.marker_search_width == 0 || self.marker_search_width > 10_000 {
+            bail!("ocr.marker_search_width 必须在 1 到 10000 之间");
+        }
+        if !(0..=1000).contains(&self.marker_dedupe_min_x)
+            || !(0..=1000).contains(&self.marker_dedupe_min_y)
+        {
+            bail!("ocr.marker_dedupe_min_x/y 必须在 0 到 1000 之间");
+        }
         for (value, field) in [
             (self.request_timeout_ms, "ocr.request_timeout_ms"),
             (self.shutdown_timeout_ms, "ocr.shutdown_timeout_ms"),
@@ -1551,6 +1581,8 @@ mod ocr_geometry_validation_tests {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemplateConfig {
+    #[serde(default)]
+    pub panel_downsample_factors: std::collections::BTreeMap<String, u32>,
     pub blue_marker: PathBuf,
     pub yellow_marker: PathBuf,
     pub pink_marker: PathBuf,
@@ -1605,6 +1637,7 @@ impl Default for TemplateConfig {
         // tests/fixtures/config.full.yaml 及 assets/ 目录一致；
         // 全部非空才能通过 validate() 的路径校验。
         Self {
+            panel_downsample_factors: std::collections::BTreeMap::new(),
             blue_marker: PathBuf::from("deps/assets/chat-marker-blue.png"),
             yellow_marker: PathBuf::from("deps/assets/chat-marker-yellow.png"),
             pink_marker: PathBuf::from("deps/assets/chat-marker-pink.png"),
@@ -1632,6 +1665,22 @@ impl Default for TemplateConfig {
 impl TemplateConfig {
     fn validate(&self) -> Result<()> {
         validate_unit_interval(self.marker_threshold, "templates.marker_threshold")?;
+        for (key, factor) in &self.panel_downsample_factors {
+            if ![
+                "friend_panel",
+                "friend_search_panel",
+                "friend_block_chat",
+                "friend_confirm",
+                "invite_enter_hall",
+                "invite_goto_hall",
+                "invite_view_star",
+            ]
+            .contains(&key.as_str())
+                || !(1..=4).contains(factor)
+            {
+                bail!("templates.panel_downsample_factors: 未知用途或倍数不在 1 到 4 之间: {key}");
+            }
+        }
         for (path, field) in [
             (&self.blue_marker, "templates.blue_marker"),
             (&self.yellow_marker, "templates.yellow_marker"),

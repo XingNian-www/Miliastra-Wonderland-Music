@@ -392,7 +392,7 @@ pub(super) fn debug_ui_catalogue_route(
     let marker_region = crate::ui::geometry::Rect::new(
         chat.x,
         chat.y,
-        crate::observation::chat::scan::CHAT_MARKER_SEARCH_WIDTH.min(chat.width),
+        config.ocr.marker_search_width.min(chat.width),
         chat.height,
     );
 
@@ -545,8 +545,14 @@ pub(super) fn debug_ui_catalogue_route(
         marker_region,
         &marker_paths,
         marker,
-        config.ocr.marker_dedupe_x,
-        config.ocr.marker_dedupe_y,
+        config
+            .ocr
+            .marker_dedupe_x
+            .max(config.ocr.marker_dedupe_min_x),
+        config
+            .ocr
+            .marker_dedupe_y
+            .max(config.ocr.marker_dedupe_min_y),
     );
 
     let mut probes = Vec::with_capacity(entries.len());

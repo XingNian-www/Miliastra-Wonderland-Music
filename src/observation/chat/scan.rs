@@ -13,8 +13,25 @@ use crate::runtime::ocr::{OcrImageBlock, OcrPriority, OcrRuntimeHandle, batch_re
 use crate::ui::geometry::{Rect, crop_canvas};
 use crate::ui::template::{TemplateHit, dedupe_hits, find_color_template_hit_groups};
 
-pub(crate) const CHAT_MARKER_SEARCH_WIDTH: u32 = 60;
 const CHAT_SCAN_RESULT_LOG_TARGET: &str = "chat_scan_result";
+
+/// 上一次写入 info 的扫描结果，用于抑制内容未变化时的重复记录。
+static LAST_LOGGED_SCAN_RESULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 记录本次扫描结果并返回是否需要以 info 级别输出。
+///
+/// 聊天扫描是每秒一次级别的循环，逐次打印整段气泡文本会让文件日志按扫描次数膨胀；
+/// 只有内容真的变化时才值得留一条可追溯记录。
+fn remember_scan_result_for_log(scan_result: &str) -> bool {
+    let mut last = LAST_LOGGED_SCAN_RESULT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.as_deref() == Some(scan_result) {
+        return false;
+    }
+    *last = Some(scan_result.to_owned());
+    true
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TemplateArgs {
@@ -30,6 +47,7 @@ pub(crate) struct ResolvedTemplateArgs {
     pub(crate) yellow_template: PathBuf,
     pub(crate) pink_template: PathBuf,
     pub(crate) marker_threshold: f32,
+    pub(crate) marker_search_width: u32,
     pub(crate) marker_dedupe_x: i32,
     pub(crate) marker_dedupe_y: i32,
     pub(crate) text_left_gap: i32,
@@ -62,8 +80,9 @@ impl TemplateArgs {
                 .clone()
                 .unwrap_or_else(|| templates.pink_marker.clone()),
             marker_threshold: self.marker_threshold.unwrap_or(templates.marker_threshold),
-            marker_dedupe_x: ocr.marker_dedupe_x,
-            marker_dedupe_y: ocr.marker_dedupe_y,
+            marker_search_width: ocr.marker_search_width,
+            marker_dedupe_x: ocr.marker_dedupe_x.max(ocr.marker_dedupe_min_x),
+            marker_dedupe_y: ocr.marker_dedupe_y.max(ocr.marker_dedupe_min_y),
             text_left_gap: ocr.text_left_gap,
             block_top_padding: ocr.block_top_padding,
             block_bottom_padding: ocr.block_bottom_padding,
@@ -237,12 +256,22 @@ pub(crate) fn recognize_prepared_chat(
             scope: "一级聊天",
         });
     }
-    log::info!(target: CHAT_SCAN_RESULT_LOG_TARGET,
-        "聊天扫描结果: markers={} messages={} {}",
-        prepared.markers.len(),
-        messages.len(),
-        format_scan_result(&messages)
-    );
+    // 扫描频率是每秒一次级别，逐次打印整段气泡文本会让日志按扫描次数膨胀。
+    // 只在识别到的内容真正变化时留一条 info 记录；同样的内容降到 debug。
+    let scan_result = format_scan_result(&messages);
+    if remember_scan_result_for_log(&scan_result) {
+        log::info!(target: CHAT_SCAN_RESULT_LOG_TARGET,
+            "聊天扫描结果: markers={} messages={} {scan_result}",
+            prepared.markers.len(),
+            messages.len()
+        );
+    } else {
+        log::debug!(target: CHAT_SCAN_RESULT_LOG_TARGET,
+            "聊天扫描结果未变化: markers={} messages={}",
+            prepared.markers.len(),
+            messages.len()
+        );
+    }
     log::info!(target: "timing",
         "聊天扫描耗时: total={}ms prepare={}ms crop={}ms marker={}ms block={}ms ocr={}ms markers={} messages={}",
         total_ms,
@@ -291,7 +320,7 @@ fn find_chat_markers(
     let search_rect = Some(Rect::new(
         0,
         0,
-        CHAT_MARKER_SEARCH_WIDTH.min(chat.width()),
+        templates.marker_search_width.min(chat.width()),
         chat.height(),
     ));
     let template_paths = [
@@ -343,8 +372,8 @@ pub(crate) fn dedupe_chat_marker_hits(
     tolerance_x: i32,
     tolerance_y: i32,
 ) -> Vec<TemplateHit> {
-    let tolerance_x = tolerance_x.max(22);
-    let tolerance_y = tolerance_y.max(14);
+    let tolerance_x = tolerance_x.max(0);
+    let tolerance_y = tolerance_y.max(0);
     let mut by_score = hits;
     by_score.sort_by(|left, right| {
         right
@@ -457,6 +486,17 @@ mod tests {
     }
 
     #[test]
+    fn scan_result_log_recorded_only_when_content_changes() {
+        // 内容未变时不重复写 info，变化后重新记录一次。
+        assert!(remember_scan_result_for_log("scan-dedup-a"));
+        assert!(!remember_scan_result_for_log("scan-dedup-a"));
+        assert!(remember_scan_result_for_log("scan-dedup-b"));
+        assert!(!remember_scan_result_for_log("scan-dedup-b"));
+        assert!(remember_scan_result_for_log(""));
+        assert!(!remember_scan_result_for_log(""));
+    }
+
+    #[test]
     fn message_block_preserves_default_geometry() {
         let markers = [marker(8, 10, 20, 19), marker(8, 45, 20, 19)];
         let block = make_message_block(
@@ -549,5 +589,25 @@ mod tests {
                 make_message_block(&hit, std::slice::from_ref(&hit), rect, &templates()).is_err()
             );
         }
+    }
+    #[test]
+    fn marker_geometry_defaults_and_configured_overrides_resolve_once() {
+        let default = templates();
+        assert_eq!(default.marker_search_width, 60);
+        assert_eq!((default.marker_dedupe_x, default.marker_dedupe_y), (22, 14));
+        let ocr = OcrConfig {
+            marker_search_width: 72,
+            marker_dedupe_min_x: 3,
+            marker_dedupe_min_y: 4,
+            marker_dedupe_x: 5,
+            marker_dedupe_y: 6,
+            ..OcrConfig::default()
+        };
+        let custom = TemplateArgs::default().resolve(&TemplateConfig::default(), &ocr);
+        assert_eq!(custom.marker_search_width, 72);
+        assert_eq!((custom.marker_dedupe_x, custom.marker_dedupe_y), (5, 6));
+        let hits = vec![marker(0, 0, 10, 10), marker(10, 0, 10, 10)];
+        assert_eq!(dedupe_chat_marker_hits(hits.clone(), 22, 14).len(), 1);
+        assert_eq!(dedupe_chat_marker_hits(hits, 5, 6).len(), 2);
     }
 }

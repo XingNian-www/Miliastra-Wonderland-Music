@@ -933,6 +933,24 @@ fn ocr_section() -> Vec<ConfigFieldSchema> {
             "OCR 结果合并为同一行的 Y 轴容差",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "marker_search_width",
+            "标志搜索条带宽度",
+            int(1, 10_000),
+            "基准画布像素；聊天区左侧标志搜索范围",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "marker_dedupe_min_x",
+            "标志去重 X 下限",
+            int(0, 1000),
+            "与标志去重 X 容差取较大值",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "marker_dedupe_min_y",
+            "标志去重 Y 下限",
+            int(0, 1000),
+            "与标志去重 Y 容差取较大值",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "marker_dedupe_x",
             "标志去重 X 容差",
             int(0, 1000),
@@ -968,6 +986,12 @@ fn ocr_section() -> Vec<ConfigFieldSchema> {
 /// templates 段：模板图片路径与匹配阈值。
 fn templates_section() -> Vec<ConfigFieldSchema> {
     vec![
+        ConfigFieldSchema::db_idle_reload(
+            "panel_downsample_factors",
+            "面板用途降采样倍数",
+            FieldKind::Object,
+            "用途名到 1–4 倍的覆盖；空对象保留现有 1/4 倍默认值，不影响流程点击精度",
+        ),
         ConfigFieldSchema::db_idle_reload(
             "blue_marker",
             "蓝色聊天标志",
@@ -2887,5 +2911,43 @@ mod tests {
                 }
             }
         }
+    }
+    /// 视觉档案接管的字段必须都存在于 schema；否则字段会既不在档案面板可编辑，
+    /// 又无法被 schema 标记，用户将失去修改入口。
+    #[test]
+    fn every_visual_managed_path_exists_in_the_schema() {
+        let schema_paths: std::collections::BTreeSet<_> = config_sections()
+            .into_iter()
+            .flat_map(|section| section.fields)
+            .map(|field| field.path)
+            .collect();
+        for path in crate::config::visual::managed_paths() {
+            assert!(
+                schema_paths.contains(&path),
+                "视觉档案路径不在 schema 中: {path}"
+            );
+        }
+    }
+
+    /// 页面规则：整段字段都被档案接管时保留原表单（否则该段会变成空白页）。
+    /// 目前 screen 和 templates 两段属于这种情况；新增整段接管必须同步确认页面行为。
+    #[test]
+    fn only_the_screen_section_is_fully_owned_by_the_visual_profile() {
+        let fully_owned: Vec<_> = config_sections()
+            .into_iter()
+            .filter(|section| {
+                !section.fields.is_empty()
+                    && section
+                        .fields
+                        .iter()
+                        .all(|field| crate::config::visual::managed_paths().contains(&field.path))
+            })
+            .map(|section| section.name)
+            .collect();
+        assert_eq!(
+            fully_owned,
+            vec!["screen", "templates"],
+            "整段被档案接管的段列表变化了"
+        );
     }
 }

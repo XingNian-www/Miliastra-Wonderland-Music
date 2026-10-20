@@ -3087,4 +3087,53 @@ window:
 
         let _ = fs::remove_dir_all(&root);
     }
+    #[test]
+    fn legacy_visual_geometry_defaults_preserve_saved_values_on_import() {
+        let (root, database_path) = temp_database("legacy-visual-profile");
+        let bootstrap = test_bootstrap(&database_path);
+        drop(ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap());
+        let mut ocr = stored_section(&database_path, "ocr");
+        for key in [
+            "marker_search_width",
+            "marker_dedupe_min_x",
+            "marker_dedupe_min_y",
+        ] {
+            ocr.as_object_mut().unwrap().remove(key);
+        }
+        ocr["text_left_gap"] = serde_json::json!(17);
+        let mut templates = stored_section(&database_path, "templates");
+        templates
+            .as_object_mut()
+            .unwrap()
+            .remove("panel_downsample_factors");
+        templates["marker_threshold"] = serde_json::json!(0.83);
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        for (key, value) in [("ocr", ocr), ("templates", templates)] {
+            connection
+                .execute(
+                    "UPDATE config_sections SET value_json=?1 WHERE section=?2",
+                    rusqlite::params![serde_json::to_string(&value).unwrap(), key],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        let config = store.load_full().unwrap();
+        assert_eq!(config.ocr.marker_search_width, 60);
+        assert_eq!(config.ocr.text_left_gap, 17);
+        assert!(config.templates.panel_downsample_factors.is_empty());
+        let raw = store.current_value().unwrap();
+        let mut profile = crate::config::visual::VisualProfile::export(&raw).unwrap();
+        assert_eq!(profile.thresholds["builtin"], serde_json::json!(0.83));
+        profile
+            .chat_geometry
+            .insert("marker_search_width".into(), serde_json::json!(72));
+        let sections = profile.candidate(&raw).unwrap();
+        let revision = store.current_revision().unwrap();
+        store.save(revision, sections).unwrap();
+        assert_eq!(store.load_full().unwrap().ocr.marker_search_width, 72);
+        assert_eq!(store.load_full().unwrap().ocr.text_left_gap, 17);
+        drop(store);
+        cleanup(&root);
+    }
 }

@@ -34,6 +34,8 @@ mod ai_routes;
 mod config_routes;
 #[path = "routes/debug.rs"]
 mod debug_routes;
+#[path = "routes/commands.rs"]
+mod commands_routes;
 #[path = "routes/entertainment.rs"]
 mod entertainment_routes;
 #[path = "routes/operator.rs"]
@@ -48,6 +50,7 @@ mod tasks_chat_routes;
 use ai_routes::*;
 use config_routes::*;
 use debug_routes::*;
+use commands_routes::*;
 use entertainment_routes::*;
 use operator_routes::*;
 use playback_routes::*;
@@ -290,6 +293,12 @@ const ROUTES: &[RouteSpec] = &[
         json: true,
         mutating: true,
         handler: debug_mode_route,
+    },
+    RouteSpec {
+        path: "/commands/catalog",
+        json: true,
+        mutating: false,
+        handler: commands_catalog_route,
     },
     RouteSpec {
         path: "/status",

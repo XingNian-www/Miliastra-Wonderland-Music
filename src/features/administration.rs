@@ -7,27 +7,11 @@ use crate::features::chat_text::{
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
+use crate::features::reply_template::{self, ReplyVars};
 use crate::runtime::chat_listener::{ChatListenerMode, ChatListenerSnapshot};
 
 const IDLE_EXIT_MIN_MINUTES: u32 = 15;
 
-const SONG_REQUEST_HELP: [&str; 3] = [
-    "点歌示例: @点歌/@AI点歌 歌名 歌手 伴奏,输入伴奏时优先匹配伴奏",
-    "切换网易平台: @网易点歌/@网易云点歌 歌名 歌手 伴奏,默认为QQ平台",
-    "可用 @QQ点歌/@网易点歌/@网易云点歌 指定来源,@AI点歌用于智能识别歌名歌手",
-];
-
-const ENTERTAINMENT_HELP: [&str; 9] = [
-    "塔罗: #塔罗牌抽当天三张;#塔罗牌重抽提前换组;带问题自动AI",
-    "塔罗: UTC+8每日更新;#塔罗牌AI解读当前三张;#塔罗牌帮助",
-    "成语接龙: #接龙随机开局;同音模式用 #同音接龙随机开局;进行中直接发送成语/#提示/#解释",
-    "斗地主: #斗地主/#加入/#抢/#不抢/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌",
-    "跑得快: #跑得快/#加入/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌",
-    "海龟汤: #海龟汤;进行中 #状态/#结束;提问直接以#开头,如#他认识死者吗",
-    "海龟汤长答案: ##1第一段,##2第二段,最后发送##提交;取消用##取消",
-    "谁是卧底: #卧底/#卧底双;公屏 #开局/#状态/#退出/#结束/#重试/#内容",
-    "谁是卧底: 好友私聊 #加入/#退出/#弃权/#A/#投A;局外好友私聊 #谜底",
-];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AdministrationCommandContext {
@@ -79,11 +63,15 @@ impl AdministrationApplication {
         match command {
             AdministrationCommand::Help => {
                 port.log_executed(context, "help")?;
-                port.send_hall_batch(&SONG_REQUEST_HELP, self.help_batch_ms)
+                let lines = help_lines(&reply_template::HELP_SONG_REQUEST, &ReplyVars::new());
+                let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
+                port.send_hall_batch(&borrowed, self.help_batch_ms)
             }
             AdministrationCommand::EntertainmentHelp => {
                 port.log_executed(context, "entertainment help")?;
-                port.send_hall_batch(&ENTERTAINMENT_HELP, self.help_batch_ms)
+                let lines = help_lines(&reply_template::HELP_ENTERTAINMENT, &ReplyVars::new());
+                let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
+                port.send_hall_batch(&borrowed, self.help_batch_ms)
             }
             AdministrationCommand::SetCommandsEnabled { enabled, .. } => {
                 log::info!("收到{}命令", if *enabled { "启用" } else { "禁用" });
@@ -156,6 +144,17 @@ impl AdministrationApplication {
             }
         }
     }
+}
+
+/// 按模板目录渲染一组帮助行。
+///
+/// 目前帮助行没有业务变量，占位符解析仍走同一条路径，
+/// 这样后续给帮助加变量（如版本号、当前音源）时不需要再改这里。
+fn help_lines(specs: &[reply_template::ReplyTemplate], vars: &ReplyVars) -> Vec<String> {
+    specs
+        .iter()
+        .map(|spec| reply_template::render(spec, None, vars).text)
+        .collect()
 }
 
 fn command_availability_feedback(enabled: bool) -> &'static str {

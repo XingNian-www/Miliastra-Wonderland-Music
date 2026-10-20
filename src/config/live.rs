@@ -193,7 +193,8 @@ impl LiveConfigs {
     }
 
     /// 返回当前进程累计等待重载的字段；结果按路径排序并与内部状态解耦。
-    #[cfg(test)]
+    /// 只读快照，Web 状态接口也使用它报告保存值与生效值之间的差异，
+    /// 不认领、不清空重载请求。
     pub(crate) fn pending_reload_fields(&self) -> BTreeSet<String> {
         self.pending_reload
             .lock()

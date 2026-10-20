@@ -624,11 +624,28 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         <span id="configSavedAt">尚未保存</span>
         <span id="configDirtyHint" class="config-dirty hidden">有未保存的修改</span>
       </div>
+      <details class="panel" id="visualProfilePanel">
+        <summary class="panel-head">视觉档案：模板与分辨率</summary>
+        <div class="panel-body">
+          <p>坐标统一使用基准画布。导出已保存配置；导入前先校验并预览差异，自定义流程保持原配置。</p>
+          <div class="row">
+            <button class="btn" onclick="loadVisualProfile()">刷新状态</button>
+            <button class="btn" onclick="exportVisualProfile()">导出 JSON</button>
+            <label class="btn">选择 JSON<input type="file" id="visualProfileFile" accept="application/json,.json" onchange="readVisualProfile(this)" hidden></label>
+            <button class="btn" onclick="previewVisualProfile()">校验与预览</button>
+            <button class="btn primary" id="visualImportButton" onclick="importVisualProfile()" disabled>导入已预览档案</button>
+          </div>
+          <p id="visualProfileStatus" role="status">点击刷新状态查看保存值与生效值</p>
+          <textarea id="visualProfileText" rows="12" style="width:100%" aria-label="视觉档案 JSON" oninput="invalidateVisualPreview()" placeholder="选择 JSON 文件，或粘贴通过导出得到的档案"></textarea>
+          <pre id="visualProfilePreview" style="white-space:pre-wrap;overflow-wrap:anywhere" aria-live="polite"></pre>
+        </div>
+      </details>
       <div class="config-layout">
         <div class="config-sidebar" id="configSectionList"></div>
         <div class="config-main">
           <div class="config-toolbar">
             <input id="configSearch" type="text" placeholder="搜索字段（名称 / 路径 / 说明）" aria-label="搜索配置字段">
+            <button class="btn" id="configVisualToggle" onclick="toggleVisualFields()">显示档案字段</button>
             <button class="btn" onclick="restoreDefaults()">恢复默认</button>
             <button class="btn" onclick="toggleConfigRevisions()">历史版本</button>
             <button class="btn primary" id="configSaveBtn" onclick="saveConfig()">保存全部</button>
@@ -1051,6 +1068,7 @@ let configSchema=null
 let configData=null            // GET /config 响应 {revision, sections}
 let configDirty=new Set()      // 有未保存修改的段名集合
 let configActiveSection=null   // 当前选中分组
+let configShowVisualFields=false // 默认隐藏已并入视觉档案的模板/分辨率字段
 let configLoading=false
 let configSaving=false
 let configSavedAtMs=null       // 本次会话最近一次成功保存/回滚的时间
@@ -2641,6 +2659,23 @@ function syncConfigFormToData(){
   configData.sections[configActiveSection]=Object.assign(base&&typeof base==='object'?JSON.parse(JSON.stringify(base)):{},out)
   return true
 }
+function toggleVisualFields(){
+  configShowVisualFields=!configShowVisualFields
+  const btn=$('configVisualToggle')
+  if(btn){
+    btn.textContent=configShowVisualFields?'隐藏档案字段':'显示档案字段'
+    btn.classList.toggle('primary',configShowVisualFields)
+  }
+  const visible=(configSchema||[]).filter(configSectionHasMatch)
+  if(!visible.some(section=>section.name===configActiveSection))configActiveSection=visible.length?visible[0].name:null
+  renderConfigSectionList()
+  renderConfigForm()
+}
+// 档案接管的字段默认收起；整段都由档案接管时（如 screen）仍显示原字段，
+// 否则该段会变成空白页。搜索与“显示档案字段”都会覆盖收起。
+function configSectionHidesVisual(section){
+  return !configShowVisualFields&&!configSearchText&&section.fields.some(f=>f.managedBy!=='visual')
+}
 function selectConfigSection(name){
   if(name===configActiveSection)return
   if(!syncConfigFormToData()){
@@ -2742,16 +2777,20 @@ function renderConfigForm(){
   if(!section){form.innerHTML='<div class="config-message">没有匹配的配置字段</div>';return}
   const parts=['<div class="config-form">']
   const isAi=section.name==='ai'
+  const hidesVisual=configSectionHidesVisual(section)
+  const hiddenVisual=hidesVisual?section.fields.filter(f=>f.source!=='bootstrap'&&f.managedBy==='visual').length:0
+  if(hiddenVisual)parts.push('<div class="config-message">本段有 '+hiddenVisual+' 个模板/区域/分辨率字段已并入上方“视觉档案”；点工具栏“显示档案字段”可临时展开原表单，保存仍会保留这些值。</div>')
   for(const field of section.fields){
     const id=configControlId(field.path)
     const value=configValueAt(section.name,field.path)
     const bootstrap=field.source==='bootstrap'
-    const hiddenBySearch=!configFieldMatches(field)
+    const hiddenBySearch=!configFieldMatches(field)||(hidesVisual&&field.managedBy==='visual')
     // 点歌 AI 二段式：第一步选服务商，第二步按服务商填参数。
     if(isAi&&field.path==='ai.provider')parts.push('<div class="config-step-title">第一步：选择服务商</div>')
     if(isAi&&field.path==='ai.api_key')parts.push('<div class="config-step-title">第二步：服务商参数</div><div class="config-field-hint ai-provider-info" id="aiProviderInfo"></div>')
     parts.push('<div class="config-field'+(bootstrap?' bootstrap':'')+(hiddenBySearch?' hidden':'')+'" data-cfg-field="'+field.path+'" id="cfg-field-'+id+'">')
     parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code>'+configEffectTag(field)+'</div>')
+    if(field.managedBy==='visual')parts.push('<div class="config-field-hint">该字段已并入上方“视觉档案”，建议从档案统一修改。</div>')
     if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
     parts.push(configControlHtml(field,value))
     parts.push('<div class="config-field-meta">')
@@ -3055,6 +3094,8 @@ function setConfigSavingUI(saving){
   })
   const btn=$('configSaveBtn')
   if(btn)btn.textContent=saving?'保存中...':'保存全部'
+  const visualImport=$('visualImportButton')
+  if(visualImport)visualImport.disabled=saving||!visualPreview
 }
 async function applyConfigSaveResult(resp,action){
   configSavedAtMs=Date.now()
@@ -3079,6 +3120,73 @@ async function applyConfigSaveResult(resp,action){
   if(resp.playbackReloadFields&&resp.playbackReloadFields.length)message+='\n已安排播放结束或可安全恢复的暂停状态后自动重载：'+formatConfigFields(resp.playbackReloadFields)
   if(resp.restartRequired)message+='\n以下配置需重启生效：'+formatConfigFields(resp.restartFields)
   showConfigMessage(message,'ok')
+}
+let visualPreview=null
+let visualPreviewGeneration=0
+let visualImportBusy=false
+function invalidateVisualPreview(){
+  visualPreviewGeneration++
+  visualPreview=null
+  $('visualImportButton').disabled=true
+}
+async function loadVisualProfile(){
+  try{
+    const data=await request('/config/visual')
+    if(!data||data.ok!==true)throw new Error(data&&data.message||'获取失败')
+    const pending=data.pendingReloadFields||[]
+    $('visualProfileStatus').textContent='保存版本 '+data.revision+'；基准画布 '+data.profile.canvas.width+'×'+data.profile.canvas.height+'；'+(pending.length?'待重载字段：'+pending.join('、'):'当前没有待重载字段')+'。'+data.statusNote
+    $('visualProfilePreview').textContent=JSON.stringify({effectiveProfile:data.effectiveProfile,catalog:data.catalog},null,2)
+  }catch(e){$('visualProfileStatus').textContent='加载失败：'+e.message}
+}
+async function exportVisualProfile(){
+  try{
+    const data=await request('/config/visual')
+    if(!data||data.ok!==true)throw new Error(data&&data.message||'获取失败')
+    const text=JSON.stringify(data.profile,null,2)
+    const url=URL.createObjectURL(new Blob([text],{type:'application/json'}))
+    const link=document.createElement('a')
+    link.href=url;link.download='visual-profile-r'+data.revision+'.json';link.click()
+    setTimeout(()=>URL.revokeObjectURL(url),1000)
+    $('visualProfileStatus').textContent='已导出保存版本 '+data.revision+'，不包含自定义流程和无关配置。'
+  }catch(e){$('visualProfileStatus').textContent='导出失败：'+e.message}
+}
+async function readVisualProfile(input){
+  invalidateVisualPreview()
+  const file=input.files&&input.files[0]
+  if(!file)return
+  if(file.size>60000){$('visualProfileStatus').textContent='档案超过 60KB，请检查文件内容。';return}
+  try{$('visualProfileText').value=await file.text();$('visualProfileStatus').textContent='文件已读取，请校验与预览。'}
+  catch(e){$('visualProfileStatus').textContent='读取失败：'+e.message}
+}
+async function previewVisualProfile(){
+  invalidateVisualPreview()
+  const text=$('visualProfileText').value
+  const generation=visualPreviewGeneration
+  try{
+    const profile=JSON.parse(text)
+    const result=await requestJson('/config/visual/preview',{profile})
+    if(!result||result.ok!==true)throw new Error(result&&result.errors?JSON.stringify(result.errors):result&&result.message||'校验失败')
+    if(generation!==visualPreviewGeneration||$('visualProfileText').value!==text)return
+    visualPreview={text,profile,revision:result.revision}
+    $('visualImportButton').disabled=false
+    $('visualProfileStatus').textContent='校验通过，基于版本 '+result.revision+'；'+result.differences.length+' 项差异。尚未保存。'
+    $('visualProfilePreview').textContent=JSON.stringify(result.differences,null,2)
+  }catch(e){$('visualProfileStatus').textContent='预览失败：'+e.message}
+}
+async function importVisualProfile(){
+  const preview=visualPreview
+  if(visualImportBusy||!preview||preview.text!==$('visualProfileText').value)return
+  if(configUnsaved){$('visualProfileStatus').textContent='配置表单有未保存修改，请先保存或重新加载后再导入档案。';return}
+  invalidateVisualPreview()
+  visualImportBusy=true
+  setConfigSavingUI(true)
+  try{
+    const result=await requestJson('/config/visual/import',{baseRevision:preview.revision,profile:preview.profile})
+    if(!result||result.ok!==true)throw new Error(result&&result.message||JSON.stringify(result&&result.errors)||'导入失败')
+    await applyConfigSaveResult(result,'视觉档案已导入')
+    await loadVisualProfile()
+  }catch(e){$('visualProfileStatus').textContent='导入失败：'+e.message+'；请重新预览。'}
+  finally{visualImportBusy=false;setConfigSavingUI(false);invalidateVisualPreview()}
 }
 async function loadConfigPage(){
   if(configLoading)return

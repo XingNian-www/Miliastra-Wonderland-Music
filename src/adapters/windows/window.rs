@@ -56,6 +56,12 @@ const DRAG_STEP_MS: u64 = 30;
 const DRAG_BEFORE_RELEASE_MS: u64 = 400;
 const DRAG_RELEASE_SETTLE_MS: u64 = 500;
 
+/// 进程级记录上一次提示过的客户区尺寸。
+///
+/// 游戏窗口在每次点击前都会被重新查找，实例字段记不住跨调用状态；
+/// 而按键与点击路径每秒会刷新十几次客户区，逐次提示同一句缩放说明只会刷屏。
+static NOTED_CLIENT_SIZE: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
 #[derive(Clone, Debug)]
 pub struct TargetWindowUnavailable {
     message: String,
@@ -307,17 +313,22 @@ impl GameWindow {
 
     fn refresh_client_area(&mut self, config: &WindowConfig) -> Result<()> {
         self.refresh_client_area_values()?;
-        if self.client_width != config.content_width as i32
-            || self.client_height != config.content_height as i32
-        {
-            log::warn!(
-                "目标窗口客户区为 {}x{}，配置有效内容为 {}x{}，点击会按比例换算",
-                self.client_width,
-                self.client_height,
-                config.content_width,
-                config.content_height
-            );
+        // 按比例点击是支持的行为（例如 2560x1440 客户区配 1920x1080 画布），
+        // 不是每个点击周期都要报的异常。同一尺寸只在进程内提示一次，避免刷屏。
+        if !should_notice_client_size(
+            (self.client_width, self.client_height),
+            config.content_width,
+            config.content_height,
+        ) {
+            return Ok(());
         }
+        log::info!(
+            "目标窗口客户区为 {}x{}，配置有效内容为 {}x{}，点击按比例换算",
+            self.client_width,
+            self.client_height,
+            config.content_width,
+            config.content_height
+        );
         Ok(())
     }
 
@@ -986,6 +997,21 @@ fn normalize_process_names(value: &str) -> Result<Vec<String>> {
     Ok(targets)
 }
 
+/// 客户区尺寸是否需要提示：与配置一致时不提示，同一尺寸只提示一次。
+fn should_notice_client_size(size: (i32, i32), content_width: u32, content_height: u32) -> bool {
+    if size == (content_width as i32, content_height as i32) {
+        return false;
+    }
+    let mut noted = NOTED_CLIENT_SIZE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *noted == Some(size) {
+        return false;
+    }
+    *noted = Some(size);
+    true
+}
+
 fn scale_i32(value: i32, from: i32, to: i32) -> i32 {
     ((value as f32 / from as f32) * to as f32).round() as i32
 }
@@ -1022,6 +1048,16 @@ fn send_alt_keypress() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_size_notice_is_emitted_once_per_size() {
+        // 同一尺寸反复刷新只提示一次；尺寸真的变了才重新提示。
+        assert!(should_notice_client_size((2560, 1440), 1920, 1080));
+        assert!(!should_notice_client_size((2560, 1440), 1920, 1080));
+        assert!(should_notice_client_size((1280, 720), 1920, 1080));
+        // 与配置一致时完全不需要提示。
+        assert!(!should_notice_client_size((1920, 1080), 1920, 1080));
+    }
 
     #[test]
     fn wgc_crop_uses_window_offset_when_frame_covers_window_bounds() {

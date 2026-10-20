@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 #[cfg(test)]
 use super::parse_question_bank;
+use super::render_reply;
 use super::repository::TurtleSoupBankStore;
 use super::{
     TurtleSoupAppendReceipt, TurtleSoupDeadlineKind, TurtleSoupDelivery, TurtleSoupDeliveryIntent,
@@ -23,6 +24,7 @@ use super::{
 use crate::config::ai::AiConfig;
 use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
+use crate::features::reply_template::{ReplyVars, turtle_soup as templates};
 use crate::text::normalize_comparison_text;
 use miliastra_contracts::StateStore;
 use miliastra_kernel::ai::OpenAiRuntimeHandle;
@@ -219,24 +221,32 @@ impl Judgment {
 
     fn player_reply(self, player: &str, question: &str) -> String {
         let result = match self {
-            Self::Yes => "是",
-            Self::No => "否",
-            Self::Irrelevant => "无关",
-            Self::Partial => "部分正确",
-            Self::Complete => "完全正确",
-            Self::Refused => "该问题无法裁决",
-            Self::ReviewFailed => "AI裁决失败，请稍后再问",
+            Self::Yes => render_reply(&templates::RESULT_YES, &ReplyVars::new()),
+            Self::No => render_reply(&templates::RESULT_NO, &ReplyVars::new()),
+            Self::Irrelevant => render_reply(&templates::RESULT_IRRELEVANT, &ReplyVars::new()),
+            Self::Partial => render_reply(&templates::RESULT_PARTIAL, &ReplyVars::new()),
+            Self::Complete => render_reply(&templates::RESULT_COMPLETE, &ReplyVars::new()),
+            Self::Refused => render_reply(&templates::RESULT_REFUSED, &ReplyVars::new()),
+            Self::ReviewFailed => {
+                render_reply(&templates::RESULT_REVIEW_FAILED, &ReplyVars::new())
+            }
         };
-        format_judgment_reply(player, question, result)
+        format_judgment_reply(player, question, &result)
     }
 }
 
 fn format_judgment_reply(player: &str, question: &str, result: &str) -> String {
     let question = question_reply_excerpt(question);
-    let suffix = format!("]的{}回复：{}", question, result);
+    let suffix = render_reply(
+        &templates::JUDGMENT_SUFFIX,
+        &ReplyVars::new().with("问题", question).with("结果", result),
+    );
     let player_width = MAX_CHAT_WIDTH.saturating_sub(display_width("[") + display_width(&suffix));
     let player = truncate_reply_player(player, player_width);
-    format!("[{}{}", player, suffix)
+    render_reply(
+        &templates::JUDGMENT_REPLY,
+        &ReplyVars::new().with("玩家", player).with("后缀", suffix),
+    )
 }
 
 fn question_reply_excerpt(question: &str) -> String {
@@ -257,7 +267,13 @@ fn format_batch_notice(prefix: &str, player: &str, suffix: &str) -> String {
         .saturating_add(display_width("[]:"))
         .saturating_add(display_width(suffix));
     let player = truncate_reply_player(player, MAX_CHAT_WIDTH.saturating_sub(fixed_width));
-    format!("{}[{}]:{}", prefix, player, suffix)
+    render_reply(
+        &templates::BATCH_NOTICE,
+        &ReplyVars::new()
+            .with("前缀", prefix)
+            .with("玩家", player)
+            .with("后缀", suffix),
+    )
 }
 
 fn truncate_reply_player(player: &str, max_width: usize) -> String {
@@ -969,7 +985,10 @@ impl TurtleSoupService {
             },
             TurtleSoupCommand::End => TurtleSoupCommandOutcome {
                 action: "hall-stop-denied",
-                immediate_reply: Some("只有好友私聊或Web控制台可以主动结束海龟汤".to_string()),
+                immediate_reply: Some(render_reply(
+                    &templates::END_HALL_DENIED,
+                    &ReplyVars::new(),
+                )),
             },
         }
     }
@@ -997,11 +1016,14 @@ impl TurtleSoupService {
             },
             Ok(false) => TurtleSoupCommandOutcome {
                 action: "no-session",
-                immediate_reply: Some("当前没有进行中的海龟汤".to_string()),
+                immediate_reply: Some(render_reply(&templates::NO_SESSION, &ReplyVars::new())),
             },
             Err(error) => TurtleSoupCommandOutcome {
                 action: "friend-stop-failed",
-                immediate_reply: Some(format!("海龟汤结束失败：{}", concise_error(&error))),
+                immediate_reply: Some(render_reply(
+                    &templates::END_FAILED,
+                    &ReplyVars::new().with("原因", concise_error(&error)),
+                )),
             },
         };
         self.reconcile_entertainment(entertainment);
@@ -1104,14 +1126,14 @@ impl TurtleSoupService {
                 let max_parts = self.config.batch_max_parts.max(1);
                 if index == 0 || index > max_parts {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        "上限",
+                        &render_reply(&templates::BATCH_LIMIT, &ReplyVars::new()),
                         &question.player,
                         &format!("##{}", max_parts),
                     )));
                 }
                 if question.question.trim().is_empty() {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        "空段",
+                        &render_reply(&templates::BATCH_EMPTY_PART, &ReplyVars::new()),
                         &question.player,
                         &format!("##{}", index),
                     )));
@@ -1140,7 +1162,7 @@ impl TurtleSoupService {
                     stored
                 );
                 return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                    "暂存",
+                    &render_reply(&templates::BATCH_SAVED, &ReplyVars::new()),
                     &question.player,
                     &format!("##{}", index),
                 )));
@@ -1148,23 +1170,23 @@ impl TurtleSoupService {
             TurtleSoupQuestionKind::BatchSubmit => {
                 let Some(draft) = state.batch_drafts.get(&question.player_key) else {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        "无暂存",
+                        &render_reply(&templates::BATCH_NO_DRAFT, &ReplyVars::new()),
                         &question.player,
-                        "##提交",
+                        &render_reply(&templates::BATCH_SUBMIT, &ReplyVars::new()),
                     )));
                 };
                 let Some(max_index) = draft.parts.keys().next_back().copied() else {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        "无暂存",
+                        &render_reply(&templates::BATCH_NO_DRAFT, &ReplyVars::new()),
                         &question.player,
-                        "##提交",
+                        &render_reply(&templates::BATCH_SUBMIT, &ReplyVars::new()),
                     )));
                 };
                 if let Some(missing) =
                     (1..=max_index).find(|index| !draft.parts.contains_key(index))
                 {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        "缺少",
+                        &render_reply(&templates::BATCH_MISSING, &ReplyVars::new()),
                         &question.player,
                         &format!("##{}", missing),
                     )));
@@ -1174,31 +1196,31 @@ impl TurtleSoupService {
             TurtleSoupQuestionKind::BatchCancel => {
                 state.batch_drafts.remove(&question.player_key);
                 return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                    "清空",
+                    &render_reply(&templates::BATCH_CLEARED, &ReplyVars::new()),
                     &question.player,
-                    "完成",
+                    &render_reply(&templates::BATCH_DONE, &ReplyVars::new()),
                 )));
             }
             TurtleSoupQuestionKind::BatchInvalid => {
                 return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                    "格式",
+                    &render_reply(&templates::BATCH_FORMAT, &ReplyVars::new()),
                     &question.player,
-                    "##编号内容",
+                    &render_reply(&templates::BATCH_FORMAT_HINT, &ReplyVars::new()),
                 )));
             }
             TurtleSoupQuestionKind::Single => {}
         }
 
         if state.pending_players.contains(&question.player_key) {
-            return Ok(QuestionSubmitOutcome::Reply(format!(
-                "{}，你上一条问题还在裁决中",
-                question.player
+            return Ok(QuestionSubmitOutcome::Reply(render_reply(
+                &templates::QUESTION_PENDING,
+                &ReplyVars::new().with("玩家", question.player),
             )));
         }
         if state.pending_players.len() >= self.config.max_pending.max(1) {
-            return Ok(QuestionSubmitOutcome::Reply(format!(
-                "{}，当前提问过多，请稍后再试",
-                question.player
+            return Ok(QuestionSubmitOutcome::Reply(render_reply(
+                &templates::QUESTION_TOO_MANY,
+                &ReplyVars::new().with("玩家", question.player),
             )));
         }
 
@@ -1220,8 +1242,13 @@ impl TurtleSoupService {
         };
         if let Err(error) = self.worker_sender.try_send(job.clone()) {
             return Ok(QuestionSubmitOutcome::Reply(match error {
-                TrySendError::Full(_) => format!("{}，当前提问过多，请稍后再试", player_for_log),
-                TrySendError::Disconnected(_) => "海龟汤 AI Worker 不可用，请稍后再试".to_string(),
+                TrySendError::Full(_) => render_reply(
+                    &templates::QUESTION_TOO_MANY,
+                    &ReplyVars::new().with("玩家", player_for_log),
+                ),
+                TrySendError::Disconnected(_) => {
+                    render_reply(&templates::QUESTION_WORKER_UNAVAILABLE, &ReplyVars::new())
+                }
             }));
         }
         state.next_request_id = state.next_request_id.wrapping_add(1).max(1);
@@ -1435,16 +1462,19 @@ impl TurtleSoupService {
                 },
                 Err(error) => TurtleSoupCommandOutcome {
                     action: "start-failed",
-                    immediate_reply: Some(format!("海龟汤开局失败：{}", concise_error(&error))),
+                    immediate_reply: Some(render_reply(
+                    &templates::START_FAILED,
+                    &ReplyVars::new().with("原因", concise_error(&error)),
+                )),
                 },
             },
             TurtleSoupPhase::Announcing => TurtleSoupCommandOutcome {
                 action: "announcing",
-                immediate_reply: Some("海龟汤正在公布汤面，请稍候".to_string()),
+                immediate_reply: Some(render_reply(&templates::ANNOUNCING, &ReplyVars::new())),
             },
             TurtleSoupPhase::Settling => TurtleSoupCommandOutcome {
                 action: "settling",
-                immediate_reply: Some("海龟汤正在结算，请稍候".to_string()),
+                immediate_reply: Some(render_reply(&templates::SETTLING, &ReplyVars::new())),
             },
             TurtleSoupPhase::Active => match self.repeat_surface(delivery) {
                 Ok(()) => TurtleSoupCommandOutcome {
@@ -1453,7 +1483,10 @@ impl TurtleSoupService {
                 },
                 Err(error) => TurtleSoupCommandOutcome {
                     action: "surface-repeat-failed",
-                    immediate_reply: Some(format!("汤面重发失败：{}", concise_error(&error))),
+                    immediate_reply: Some(render_reply(
+                        &templates::SURFACE_REPEAT_FAILED,
+                        &ReplyVars::new().with("原因", concise_error(&error)),
+                    )),
                 },
             },
         }
@@ -1541,7 +1574,7 @@ impl TurtleSoupService {
                 state.last_error = None;
                 state.generation
             };
-            let messages = split_numbered_chat_message("汤面", &puzzle.surface);
+            let messages = split_numbered_chat_message(&label_surface(), &puzzle.surface);
             match Self::enqueue_batch(
                 delivery,
                 messages,
@@ -1590,7 +1623,7 @@ impl TurtleSoupService {
         };
         let outcome = Self::enqueue_batch(
             delivery,
-            split_numbered_chat_message("汤面", &surface),
+            split_numbered_chat_message(&label_surface(), &surface),
             generation,
             TurtleSoupDeliveryPurpose::SurfaceRepeat,
         )?;
@@ -1605,22 +1638,27 @@ impl TurtleSoupService {
 
     fn status_message(&self) -> String {
         if !self.config.enabled {
-            return "海龟汤功能未启用".to_string();
+            return render_reply(&templates::DISABLED, &ReplyVars::new());
         }
         let state = &self.state;
         let Some(session) = state.session.as_ref() else {
-            return "当前没有进行中的海龟汤".to_string();
+            return render_reply(&templates::NO_SESSION, &ReplyVars::new());
         };
         let started = session.active_at.unwrap_or(session.selected_at);
-        format!(
-            "海龟汤{}，已进行{}秒，{}人参与，{}个有效提问",
-            state.phase.label(),
-            self.clock
-                .now()
-                .saturating_duration_since(started)
-                .as_secs(),
-            session.participants.len(),
-            session.question_count
+        render_reply(
+            &templates::STATUS,
+            &ReplyVars::new()
+                .with("阶段", state.phase.label())
+                .with(
+                    "秒数",
+                    self.clock
+                        .now()
+                        .saturating_duration_since(started)
+                        .as_secs()
+                        .to_string(),
+                )
+                .with("人数", session.participants.len().to_string())
+                .with("提问数", session.question_count.to_string()),
         )
     }
 
@@ -2056,19 +2094,31 @@ pub(crate) fn parse_question_message(
     })
 }
 
+/// 判断一条文本是不是本模块自己发出的长答案分段提示。
+///
+/// 关键：这些 marker 必须与实际发出的文案**同源**，否则用户一旦在
+/// `replies.overrides` 里改了分段提示的前缀，机器人就会把自己的提示
+/// 当成玩家提问去解析（把 "#暂存[xxx]" 当成真问题）。
+/// 所以这里从模板取，而不是写死字面量。
 fn is_generated_batch_notice(text: &str) -> bool {
-    [
-        "暂存[",
-        "缺少[",
-        "上限[",
-        "空段[",
-        "无暂存[",
-        "格式[",
-        "海龟汤长答案:",
-        "海龟汤长答案：",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
+    let prefixes = [
+        &templates::BATCH_SAVED,
+        &templates::BATCH_MISSING,
+        &templates::BATCH_LIMIT,
+        &templates::BATCH_EMPTY_PART,
+        &templates::BATCH_NO_DRAFT,
+        &templates::BATCH_FORMAT,
+    ];
+    if prefixes.iter().any(|spec| {
+        let prefix = render_reply(spec, &ReplyVars::new());
+        // 模板负责"前缀[玩家]:后缀"里的前缀部分，实际消息里紧跟一个 '['。
+        text.contains(&format!("{prefix}["))
+    }) {
+        return true;
+    }
+    // 历史消息里还有一种带"海龟汤长答案:"前缀的分段提示，现在已不再发出，
+    // 但旧消息可能仍在会话里，保留识别以免被当成提问。两种冒号都接受。
+    text.contains("海龟汤长答案:") || text.contains("海龟汤长答案：")
 }
 
 fn parse_question_payload(payload: &str) -> (TurtleSoupQuestionKind, String) {
@@ -2235,23 +2285,48 @@ fn pseudo_random_index(len: usize) -> usize {
 
 fn settlement_messages(session: &TurtleSoupSession, reason: &SettlementReason) -> Vec<String> {
     let reason_text = match reason {
-        SettlementReason::Winner(player) => format!("玩家[{}]已还原真相", player),
-        SettlementReason::Friend(player) => {
-            format!("好友[{}]已主动结束当前海龟汤", player)
+        SettlementReason::Winner(player) => render_reply(
+            &templates::REASON_WINNER,
+            &ReplyVars::new().with("玩家", player),
+        ),
+        SettlementReason::Friend(player) => render_reply(
+            &templates::REASON_FRIEND,
+            &ReplyVars::new().with("玩家", player),
+        ),
+        SettlementReason::Web => render_reply(&templates::REASON_WEB, &ReplyVars::new()),
+        SettlementReason::IdleTimeout => render_reply(&templates::REASON_IDLE, &ReplyVars::new()),
+        SettlementReason::MaxDuration => {
+            render_reply(&templates::REASON_MAX_DURATION, &ReplyVars::new())
         }
-        SettlementReason::Web => "Web控制台已主动结束当前海龟汤".to_string(),
-        SettlementReason::IdleTimeout => "海龟汤因长时间无人提问自动结束".to_string(),
-        SettlementReason::MaxDuration => "海龟汤达到最长时长，已自动结束".to_string(),
     };
-    let summary = format!(
-        "{}。本局共有{}名参与者，收到{}个有效提问",
-        reason_text,
-        session.participants.len(),
-        session.question_count
+    let summary = render_reply(
+        &templates::SETTLEMENT_SUMMARY,
+        &ReplyVars::new()
+            .with("原因", reason_text)
+            .with("人数", session.participants.len().to_string())
+            .with("提问数", session.question_count.to_string()),
     );
-    let mut messages = split_numbered_chat_message("结算", &summary);
-    messages.extend(split_numbered_chat_message("汤底", &session.puzzle.bottom));
+    let mut messages = split_numbered_chat_message(&label_settlement(), &summary);
+    messages.extend(split_numbered_chat_message(
+        &label_bottom(),
+        &session.puzzle.bottom,
+    ));
     messages
+}
+
+/// 结算消息的分段标签（"结算1/2：…"里的"结算"）。
+fn label_settlement() -> String {
+    render_reply(&templates::LABEL_SETTLEMENT, &ReplyVars::new())
+}
+
+/// 汤底消息的分段标签（"汤底1/1：…"里的"汤底"）。
+fn label_bottom() -> String {
+    render_reply(&templates::LABEL_BOTTOM, &ReplyVars::new())
+}
+
+/// 汤面消息的分段标签（"汤面1/1：…"里的"汤面"）。
+fn label_surface() -> String {
+    render_reply(&templates::LABEL_SURFACE, &ReplyVars::new())
 }
 
 fn default_turtle_system_prompt() -> String {
@@ -2789,6 +2864,31 @@ mod tests {
             parse_question_message("机器人：海龟汤长答案: ##1第一段,最后##提交", None).is_none()
         );
     }
+
+    #[test]
+    fn batch_notice_markers_track_the_templates_so_overrides_stay_recognized() {
+        // 分段提示的识别 marker 必须与模板同源：用户把 "暂存" 改成别的词以后，
+        // 机器人仍要能认出自己发的那条，不能把它当成玩家的真提问。
+        // 这里直接验证 marker 判定使用的就是模板 default。
+        use crate::features::reply_template::turtle_soup as templates;
+        for spec in [
+            &templates::BATCH_SAVED,
+            &templates::BATCH_MISSING,
+            &templates::BATCH_LIMIT,
+            &templates::BATCH_EMPTY_PART,
+            &templates::BATCH_NO_DRAFT,
+            &templates::BATCH_FORMAT,
+        ] {
+            // 构造一条与 format_batch_notice 同形的消息，确认会被识别出来。
+            let notice = format_batch_notice(spec.default, "Alice", "##1");
+            assert!(
+                is_generated_batch_notice(&notice),
+                "模板 {} 发出的分段提示应被识别: {notice}",
+                spec.key
+            );
+        }
+    }
+
 
     #[test]
     fn numbered_batch_replaces_parts_and_queues_one_merged_question() {
@@ -3494,3 +3594,4 @@ mod tests {
         service
     }
 }
+

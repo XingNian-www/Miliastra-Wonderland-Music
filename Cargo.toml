@@ -11,7 +11,7 @@ resolver = "3"
 
 [package]
 name = "miliastra-wonderland-music"
-version = "6.2.2-dev"
+version = "6.2.3-dev"
 edition = "2024"
 license = "MIT"
 

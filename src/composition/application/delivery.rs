@@ -88,7 +88,9 @@ impl ApplicationRuntime {
     pub(super) fn render_reply(
         &self,
         key: &'static str,
-        default_text: &str,
+        // 必须是 'static：ReplyTemplate::default 要求它活到程序结束，
+        // 因为它会被登记进目录、供面板展示，不能指向调用栈上的临时 String。
+        default_text: &'static str,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> String {
         let overrides = self

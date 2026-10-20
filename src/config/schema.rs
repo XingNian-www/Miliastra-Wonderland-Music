@@ -261,7 +261,7 @@ fn window_section() -> Vec<ConfigFieldSchema> {
                 ("desktop".to_string(), "桌面可见区域".to_string()),
                 ("wgc".to_string(), "Windows Graphics Capture".to_string()),
             ]),
-            "选择 Windows 截图来源；GDI 通常最兼容，PrintWindow 可尝试采集被遮挡窗口，桌面方式读取屏幕可见内容，WGC 使用系统图形捕获 API（Windows 10 1903+）",
+            "选择 Windows 截图来源；GDI 通常最兼容，PrintWindow 可尝试采集被遮挡窗口，桌面方式读取屏幕可见内容，WGC 使用系统图形捕获 API（Windows 10 1903+，建会话失败时自动回落到 GDI）",
         ),
         ConfigFieldSchema::db_idle_reload(
             "focus_point",

@@ -1,5 +1,7 @@
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -28,10 +30,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::BOOL;
 use windows_capture::capture::{
-    Context as WgcContext, GraphicsCaptureApiError, GraphicsCaptureApiHandler,
+    CaptureControl, Context as WgcContext, GraphicsCaptureApiError, GraphicsCaptureApiHandler,
 };
 use windows_capture::frame::Frame as WgcFrame;
-use windows_capture::graphics_capture_api::InternalCaptureControl;
+use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
 use windows_capture::settings::{
     ColorFormat as WgcColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
@@ -669,8 +671,118 @@ fn capture_with_wgc(
     client_width: i32,
     client_height: i32,
 ) -> Result<DynamicImage> {
-    use std::sync::mpsc;
+    match capture_with_wgc_session(hwnd, client_left, client_top, client_width, client_height) {
+        Ok(image) => Ok(image),
+        Err(error) => {
+            // 完全回落：WGC 初始化失败（例如系统低于 Win10 1903）或本帧不可用时
+            // 退回 GDI 窗口采集，而不是让整条观察链路失败。
+            let source_dc = unsafe { GetDC(Some(hwnd)) };
+            if source_dc.is_invalid() {
+                return Err(error);
+            }
+            capture_from_dc(source_dc, Some(hwnd), 0, 0, client_width, client_height)
+        }
+    }
+}
 
+/// 一个常驻的 WGC 捕获会话。
+///
+/// 与旧实现的关键差别：旧代码每次截图都 `start_free_threaded` 一次并立刻 `stop()`，
+/// 于是每帧都要付一遍线程创建、WinRT 初始化、dispatcher queue、`D3D11CreateDevice`
+/// 以及帧池和消息循环的销毁成本。参考 OBS `libobs-winrt/winrt-capture.cpp`：
+/// 设备、帧池与会话只初始化一次，`FrameArrived` 回调常驻，
+/// 只在窗口几何变化或会话失效时重建。
+struct WgcSession {
+    key: WgcSessionKey,
+    shared: Arc<WgcShared>,
+    control: Option<CaptureControl<StreamWgc, anyhow::Error>>,
+}
+
+impl WgcSession {
+    fn start(hwnd: HWND, key: WgcSessionKey) -> Result<Self> {
+        let shared = Arc::new(WgcShared::new());
+        let item = WgcWindow::from_raw_hwnd(hwnd.0 as *mut std::ffi::c_void);
+        let settings = Settings::new(
+            item,
+            wgc_cursor_settings(),
+            wgc_border_settings(),
+            wgc_secondary_window_settings(),
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            WgcColorFormat::Rgba8,
+            WgcFlags {
+                shared: Arc::clone(&shared),
+                crop: key.crop.as_tuple(),
+            },
+        );
+        let control = StreamWgc::start_free_threaded(settings).map_err(
+            |error: GraphicsCaptureApiError<anyhow::Error>| anyhow!("WGC 初始化失败: {error}"),
+        )?;
+        Ok(Self {
+            key,
+            shared,
+            control: Some(control),
+        })
+    }
+
+    fn is_dead(&self) -> bool {
+        self.shared.closed.load(Ordering::SeqCst)
+            || self.control.as_ref().is_none_or(CaptureControl::is_finished)
+    }
+}
+
+impl Drop for WgcSession {
+    fn drop(&mut self) {
+        if let Some(control) = self.control.take()
+            && let Err(error) = control.stop()
+        {
+            log::debug!("停止 WGC 会话失败: {error}");
+        }
+    }
+}
+
+/// 每个可选能力单独探测并降级，照 OBS 的做法：探测不到就不设置，而不是整体失败。
+///
+/// `WithoutCursor` / `WithoutBorder` 要求 Win10 2004+ 的属性存在，`Exclude` 要求
+/// Win11 22H2+ 的 `IncludeSecondaryWindows`。旧系统上直接传这些值会让初始化
+/// 返回 `CursorConfigUnsupported` 一类的错误，整条采集链路就此失效。
+fn wgc_cursor_settings() -> CursorCaptureSettings {
+    match GraphicsCaptureApi::is_cursor_settings_supported() {
+        Ok(true) => CursorCaptureSettings::WithoutCursor,
+        _ => CursorCaptureSettings::Default,
+    }
+}
+
+fn wgc_border_settings() -> DrawBorderSettings {
+    match GraphicsCaptureApi::is_border_settings_supported() {
+        Ok(true) => DrawBorderSettings::WithoutBorder,
+        _ => DrawBorderSettings::Default,
+    }
+}
+
+fn wgc_secondary_window_settings() -> SecondaryWindowSettings {
+    match GraphicsCaptureApi::is_secondary_windows_supported() {
+        Ok(true) => SecondaryWindowSettings::Exclude,
+        _ => SecondaryWindowSettings::Default,
+    }
+}
+
+/// 进程内常驻的 WGC 会话槽位。
+static WGC_SESSION: Mutex<Option<WgcSession>> = Mutex::new(None);
+
+/// 已经确认不可用 WGC 的目标窗口及原因。
+///
+/// 没有这个记录，初始化失败后每一帧都会重试一次注定失败的会话建立，
+/// 反而比直接走 GDI 更慢；换了目标窗口会自动重新尝试。
+static WGC_UNAVAILABLE: Mutex<Option<(isize, String)>> = Mutex::new(None);
+
+fn wgc_session_key(
+    hwnd: HWND,
+    client_left: i32,
+    client_top: i32,
+    client_width: i32,
+    client_height: i32,
+) -> Result<WgcSessionKey> {
     let mut window_rect = RECT::default();
     unsafe {
         DwmGetWindowAttribute(
@@ -680,64 +792,218 @@ fn capture_with_wgc(
             std::mem::size_of::<RECT>() as u32,
         )
     }
-    .map_err(|error| anyhow!("read WGC target bounds: {error}"))?;
-    let crop_left = (client_left - window_rect.left).max(0) as u32;
-    let crop_top = (client_top - window_rect.top).max(0) as u32;
-    let crop_width = client_width.max(1) as u32;
-    let crop_height = client_height.max(1) as u32;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let item = WgcWindow::from_raw_hwnd(hwnd.0 as *mut std::ffi::c_void);
-    let settings = Settings::new(
-        item,
-        CursorCaptureSettings::WithoutCursor,
-        DrawBorderSettings::WithoutBorder,
-        SecondaryWindowSettings::Exclude,
-        MinimumUpdateIntervalSettings::Default,
-        DirtyRegionSettings::Default,
-        WgcColorFormat::Rgba8,
-        WgcFlags {
-            sender,
-            crop: (crop_left, crop_top, crop_width, crop_height),
+    .map_err(|error| anyhow!("读取 WGC 目标窗口边界失败: {error}"))?;
+    Ok(WgcSessionKey {
+        window: hwnd.0 as isize,
+        crop: WgcCrop {
+            left: (client_left - window_rect.left).max(0) as u32,
+            top: (client_top - window_rect.top).max(0) as u32,
+            width: client_width.max(1) as u32,
+            height: client_height.max(1) as u32,
         },
-    );
-    let control = OneFrameWgc::start_free_threaded(settings).map_err(
-        |error: GraphicsCaptureApiError<anyhow::Error>| {
-            anyhow!("WGC initialization failed: {error}")
-        },
-    )?;
-    let image = receiver.recv_timeout(Duration::from_secs(3));
-    control
-        .stop()
-        .map_err(|error| anyhow!("WGC stop failed: {error}"))?;
-    Ok(image.map_err(|error| anyhow!("WGC did not produce a frame: {error}"))??)
+    })
 }
 
+fn note_wgc_unavailable(hwnd: HWND, error: &anyhow::Error) {
+    let window = hwnd.0 as isize;
+    let message = format!("{error:#}");
+    let mut noted = WGC_UNAVAILABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let already_noted = noted
+        .as_ref()
+        .is_some_and(|(noted_window, noted)| *noted_window == window && *noted == message);
+    if already_noted {
+        return;
+    }
+    log::info!("WGC 采集不可用，已回落到 GDI 窗口采集: {message}");
+    *noted = Some((window, message));
+}
+
+fn wgc_unavailable_reason(hwnd: HWND) -> Option<String> {
+    let noted = WGC_UNAVAILABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match noted.as_ref() {
+        Some((window, message)) if *window == hwnd.0 as isize => Some(message.clone()),
+        _ => None,
+    }
+}
+
+/// 复用或建立常驻会话，然后返回当前帧。
+fn capture_with_wgc_session(
+    hwnd: HWND,
+    client_left: i32,
+    client_top: i32,
+    client_width: i32,
+    client_height: i32,
+) -> Result<DynamicImage> {
+    if let Some(reason) = wgc_unavailable_reason(hwnd) {
+        bail!("WGC 已标记为不可用: {reason}");
+    }
+    // 读取窗口边界失败是瞬时故障（窗口正在重建等），不记为永久不可用。
+    let key = wgc_session_key(hwnd, client_left, client_top, client_width, client_height)?;
+    let shared = {
+        let mut slot = WGC_SESSION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reusable = slot
+            .as_ref()
+            .is_some_and(|session| session.key == key && !session.is_dead());
+        if reusable {
+            Arc::clone(&slot.as_ref().expect("reusable checked above").shared)
+        } else {
+            // 先丢掉旧会话（Drop 里 stop 并 join 捕获线程），再建立新会话。
+            *slot = None;
+            match WgcSession::start(hwnd, key) {
+                Ok(session) => {
+                    let shared = Arc::clone(&session.shared);
+                    *slot = Some(session);
+                    shared
+                }
+                Err(error) => {
+                    // 只有“建不起来”才值得记住：这类失败每帧重试都必然失败，
+                    // 会让 WGC 比直接用 GDI 更慢。取帧超时属于瞬时故障，不在此列。
+                    note_wgc_unavailable(hwnd, &error);
+                    return Err(error);
+                }
+            }
+        }
+    };
+    let frame = shared.latest_frame();
+    if frame.is_err() {
+        // 会话已经不可用（关闭或设备丢失）：丢弃它，下一帧重新建立，
+        // 但不把 WGC 永久标记为不可用。
+        let mut slot = WGC_SESSION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = None;
+    }
+    frame
+}
+
+/// 把客户区裁剪框钳制到帧边界内。
+///
+/// 参考 OBS 的 `get_client_box`：窗口边框/DWM 边界与帧尺寸可能差一个边框或缩放，
+/// 越界时钳制而不是报错，否则一次尺寸抖动就会让整帧采集失败。
 fn resolve_wgc_crop(
     crop: (u32, u32, u32, u32),
     frame_width: u32,
     frame_height: u32,
 ) -> Result<(u32, u32, u32, u32)> {
     let (left, top, width, height) = crop;
-    let right = left.saturating_add(width);
-    let bottom = top.saturating_add(height);
-    if right <= frame_width && bottom <= frame_height {
-        return Ok((left, top, right, bottom));
+    if frame_width == 0 || frame_height == 0 {
+        bail!("WGC 帧尺寸无效: {frame_width}x{frame_height}");
     }
-    bail!(
-        "WGC client crop ({left},{top},{width},{height}) exceeds frame bounds ({frame_width}x{frame_height})"
-    )
+    let left = left.min(frame_width - 1);
+    let top = top.min(frame_height - 1);
+    let right = left.saturating_add(width.max(1)).min(frame_width);
+    let bottom = top.saturating_add(height.max(1)).min(frame_height);
+    if right <= left || bottom <= top {
+        bail!("WGC 客户区裁剪框为空: ({left},{top},{right},{bottom})");
+    }
+    Ok((left, top, right, bottom))
 }
 
 struct WgcFlags {
-    sender: std::sync::mpsc::SyncSender<Result<DynamicImage>>,
+    shared: Arc<WgcShared>,
     crop: (u32, u32, u32, u32),
 }
 
-struct OneFrameWgc {
+struct StreamWgc {
     flags: WgcFlags,
 }
 
-impl GraphicsCaptureApiHandler for OneFrameWgc {
+/// 客户区在目标窗口内的裁剪矩形。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct WgcCrop {
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+}
+
+impl WgcCrop {
+    fn as_tuple(self) -> (u32, u32, u32, u32) {
+        (self.left, self.top, self.width, self.height)
+    }
+}
+
+/// 会话的失效条件：换了窗口或客户区几何变了就得重建。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct WgcSessionKey {
+    window: isize,
+    crop: WgcCrop,
+}
+
+/// 常驻会话推给调用方的最新一帧。
+struct WgcShared {
+    latest: Mutex<Option<DynamicImage>>,
+    ready: Condvar,
+    closed: AtomicBool,
+}
+
+impl WgcShared {
+    fn new() -> Self {
+        Self {
+            latest: Mutex::new(None),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// 取最近一帧，只在还没收到首帧时等待。
+    ///
+    /// 常驻会话按“画面有更新”推帧，静止画面本来就不会产生新帧。
+    /// 这里返回缓存帧而不是每次都干等下一帧，否则静止画面会把调用方卡满超时；
+    /// 这与 OBS 每帧渲染手头最新纹理是同一语义。
+    fn latest_frame(&self) -> Result<DynamicImage> {
+        let mut guard = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            // 先判关闭：目标窗口关掉后，缓存帧不能继续冒充当前画面。
+            if self.closed.load(Ordering::SeqCst) {
+                bail!("WGC 捕获会话已关闭");
+            }
+            if let Some(image) = guard.as_ref() {
+                return Ok(image.clone());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("WGC 未在超时内产生首帧");
+            }
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = next;
+            if timeout.timed_out() && guard.is_none() {
+                bail!("WGC 未在超时内产生首帧");
+            }
+        }
+    }
+
+    fn publish(&self, image: DynamicImage) {
+        {
+            let mut guard = self
+                .latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(image);
+        }
+        self.ready.notify_all();
+    }
+
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.ready.notify_all();
+    }
+}
+
+impl GraphicsCaptureApiHandler for StreamWgc {
     type Flags = WgcFlags;
     type Error = anyhow::Error;
 
@@ -747,27 +1013,34 @@ impl GraphicsCaptureApiHandler for OneFrameWgc {
         })
     }
 
+    /// 常驻回调：只读帧并发布，不再 `stop()`。
+    ///
+    /// 旧实现在这里停止会话，于是每帧都要重建一整套设备与会话；
+    /// OBS 的 `on_frame_arrived` 也只在窗口尺寸变化时 `Recreate` 帧池，从不停止会话。
     fn on_frame_arrived(
         &mut self,
         frame: &mut WgcFrame<'_>,
-        capture_control: InternalCaptureControl,
+        _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let image = (|| -> Result<DynamicImage> {
-            let (left, top, right, bottom) =
-                resolve_wgc_crop(self.flags.crop, frame.width(), frame.height())?;
-            let buffer = frame
-                .buffer_crop(left, top, right, bottom)
-                .map_err(|error| anyhow!("read WGC frame: {error}"))?;
-            let bytes = buffer.as_nopadding_buffer(&mut Vec::new()).to_vec();
-            image::RgbaImage::from_raw(right - left, bottom - top, bytes)
-                .map(DynamicImage::ImageRgba8)
-                .ok_or_else(|| anyhow!("WGC returned an invalid frame buffer"))
-        })();
-        self.flags
-            .sender
-            .send(image)
-            .map_err(|error| anyhow!("send WGC frame: {error}"))?;
-        capture_control.stop();
+        let Ok((left, top, right, bottom)) =
+            resolve_wgc_crop(self.flags.crop, frame.width(), frame.height())
+        else {
+            // 单帧几何异常不应终止常驻会话；下一帧继续尝试。
+            return Ok(());
+        };
+        let buffer = frame
+            .buffer_crop(left, top, right, bottom)
+            .map_err(|error| anyhow!("read WGC frame: {error}"))?;
+        let bytes = buffer.as_nopadding_buffer(&mut Vec::new()).to_vec();
+        let image = image::RgbaImage::from_raw(right - left, bottom - top, bytes)
+            .map(DynamicImage::ImageRgba8)
+            .ok_or_else(|| anyhow!("WGC returned an invalid frame buffer"))?;
+        self.flags.shared.publish(image);
+        Ok(())
+    }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        self.flags.shared.mark_closed();
         Ok(())
     }
 }
@@ -1068,9 +1341,41 @@ mod tests {
     }
 
     #[test]
-    fn wgc_crop_rejects_unexpectedly_small_frame() {
-        let error = resolve_wgc_crop((8, 30, 980, 650), 979, 650).unwrap_err();
-        assert!(error.to_string().contains("exceeds frame bounds"));
+    fn wgc_crop_clamps_to_frame_instead_of_failing() {
+        // 参考 OBS：帧尺寸比客户区少几像素时钳制，而不是让整帧采集失败。
+        assert_eq!(
+            resolve_wgc_crop((8, 30, 980, 650), 979, 650).unwrap(),
+            (8, 30, 979, 650)
+        );
+        // 偏移超出帧边界时收到帧内，并保证非空。
+        assert_eq!(
+            resolve_wgc_crop((2000, 2000, 980, 650), 1000, 700).unwrap(),
+            (999, 699, 1000, 700)
+        );
+        assert!(resolve_wgc_crop((0, 0, 1, 1), 0, 700).is_err());
+    }
+
+    #[test]
+    fn wgc_session_key_changes_with_window_or_crop() {
+        let crop = WgcCrop {
+            left: 8,
+            top: 30,
+            width: 980,
+            height: 650,
+        };
+        let base = WgcSessionKey { window: 1, crop };
+        assert_eq!(base, WgcSessionKey { window: 1, crop });
+        assert_ne!(base, WgcSessionKey { window: 2, crop });
+        assert_ne!(
+            base,
+            WgcSessionKey {
+                window: 1,
+                crop: WgcCrop {
+                    width: 981,
+                    ..crop
+                },
+            }
+        );
     }
 
     #[test]

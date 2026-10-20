@@ -466,7 +466,14 @@ impl CustomWorkflowService {
                 match port.wait_for_fresh_message(confirmation, is_confirmation_message)? {
                     FreshMessageOutcome::Message(message) => parse_confirmation(&message),
                     FreshMessageOutcome::Timeout => {
-                        port.send_hall("自定义流程确认超时,已取消")?;
+                        port.send_hall(
+                            &crate::features::reply_template::render(
+                                &crate::features::reply_template::moderation::MODERATION[3],
+                                None,
+                                &crate::features::reply_template::ReplyVars::new(),
+                            )
+                            .text,
+                        )?;
                         None
                     }
                     FreshMessageOutcome::Stopped => None,

@@ -14,6 +14,7 @@ use crate::features::chat_text::{
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
+use crate::features::reply_template::{hall as templates, ReplyVars};
 use crate::text::normalize_comparison_text;
 use miliastra_contracts::StateStore;
 use miliastra_kernel::clock::{Clock, WallClock};
@@ -172,6 +173,21 @@ pub(crate) trait HallDetectionPort {
 
 pub(crate) trait HallApplicationPort: HallDetectionPort {
     fn reply(&mut self, message: &str) -> Result<()>;
+
+    /// 按模板键回复。
+    ///
+    /// 业务层只声明"用哪条模板、带哪些变量"，**不知道配置存在**；
+    /// 覆盖文案的查找由实现方（composition 层）负责，features 层不反向依赖配置中心。
+    /// 默认实现只渲染内置文案，保证不接配置的调用方（测试替身）也能工作。
+    fn reply_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &ReplyVars,
+    ) -> Result<()> {
+        let rendered = crate::features::reply_template::render(spec, None, vars);
+        self.reply(&rendered.text)
+    }
+
     fn log_executed(&mut self, context: &HallCommandContext, final_command: &str) -> Result<()>;
     fn read_hall_info(&mut self) -> Result<HallObservation>;
     fn toggle_microphone(&mut self) -> Result<()>;
@@ -183,6 +199,17 @@ pub(crate) trait HallMaintenancePort {
     fn hall_expiring_warning_sent(&mut self) -> Result<bool>;
     fn hall_remaining_minutes(&mut self) -> Result<Option<u32>>;
     fn reply(&mut self, message: &str) -> Result<()>;
+
+    /// 按模板键回复；语义同 HallApplicationPort::reply_template。
+    fn reply_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &ReplyVars,
+    ) -> Result<()> {
+        let rendered = crate::features::reply_template::render(spec, None, vars);
+        self.reply(&rendered.text)
+    }
+
     fn mark_hall_expiring_warning_sent(&mut self) -> Result<()>;
 }
 
@@ -203,12 +230,15 @@ impl HallApplication {
         if minutes > HALL_EXPIRING_WARNING_MINUTES {
             return Ok(false);
         }
-        let message = if minutes == 0 {
-            "大厅即将到期".to_string()
+        // minutes == 0 与 minutes > 0 是两条不同语义的文案：合成一条带可选后缀的
+        // 模板会让用户在覆盖时留出空槽位，所以保持两个独立 key。
+        let spec = if minutes == 0 {
+            &templates::EXPIRING_WARNING
         } else {
-            format!("大厅即将到期，剩余{}分钟", minutes)
+            &templates::EXPIRING_WARNING_MINUTES
         };
-        port.reply(&message)?;
+        let vars = ReplyVars::new().with("剩余分钟", minutes.to_string());
+        port.reply_template(spec, &vars)?;
         port.mark_hall_expiring_warning_sent()?;
         Ok(true)
     }
@@ -241,7 +271,10 @@ impl HallApplication {
                     port.log_executed(context, &format!("microphone toggle {}", username))?;
                     port.toggle_microphone()?;
                     log::info!("麦克风: 已按 N 切换状态");
-                    port.reply(&format!("{} 执行了切换麦克风状态！", username))
+                    port.reply_template(
+                        &templates::MICROPHONE_TOGGLED,
+                        &ReplyVars::new().with("用户名", username.as_str()),
+                    )
                 }
             }
         }
@@ -252,13 +285,13 @@ impl HallApplication {
             Ok(info) => info,
             Err(error) => {
                 log::error!("大厅检测 OCR 失败: {error:#}");
-                return port.reply("大厅检测失败");
+                return port.reply_template(&templates::DETECT_FAILED, &ReplyVars::new());
             }
         };
         log::info!("大厅检测 OCR 结果: {}", info.name);
         if is_public_hall(&info.name) {
             port.clear_hall_remaining_minutes()?;
-            port.reply("当前为公共大厅")
+            port.reply_template(&templates::PUBLIC_HALL_CURRENT, &ReplyVars::new())
         } else {
             if let Some(minutes) = info.remaining_minutes {
                 port.update_hall_remaining_minutes(minutes)?;
@@ -269,11 +302,16 @@ impl HallApplication {
             } else {
                 info.name.as_str()
             };
+            // 后缀（含前导全角逗号）由调用方组织：没有倒计时时是空串，
+            // 这样回复不会多出一个孤零零的逗号。
             let suffix = info
                 .remaining_minutes
                 .map(|minutes| format!("，剩余{}分钟", minutes))
                 .unwrap_or_default();
-            port.reply(&format!("当前为{}{}", name, suffix))
+            port.reply_template(
+                &templates::CURRENT,
+                &ReplyVars::new().with("大厅名", name).with("后缀", suffix),
+            )
         }
     }
 
@@ -282,7 +320,10 @@ impl HallApplication {
             .hall_remaining_minutes()?
             .filter(|minutes| *minutes > 0)
         {
-            return port.reply(&format!("大厅到期时间，剩余{}分钟", minutes));
+            return port.reply_template(
+                &templates::TIME_REMAINING,
+                &ReplyVars::new().with("剩余分钟", minutes.to_string()),
+            );
         }
 
         log::info!("大厅时间未知，执行一次大厅识别");
@@ -290,18 +331,22 @@ impl HallApplication {
             Ok(info) => info,
             Err(error) => {
                 log::error!("大厅时间 OCR 失败: {error:#}");
-                return port.reply("大厅时间未知");
+                return port.reply_template(&templates::TIME_UNKNOWN, &ReplyVars::new());
             }
         };
         if is_public_hall(&info.name) {
             port.clear_hall_remaining_minutes()?;
-            return port.reply("公共大厅无时间限制");
+            return port.reply_template(&templates::PUBLIC_HALL_NO_LIMIT, &ReplyVars::new());
         }
         if let Some(minutes) = info.remaining_minutes {
             port.update_hall_remaining_minutes(minutes)?;
-            return port.reply(&format!("大厅到期时间，剩余{}分钟", minutes));
+            return port.reply_template(
+                &templates::TIME_REMAINING,
+                &ReplyVars::new().with("剩余分钟", minutes.to_string()),
+            );
         }
-        port.reply("大厅时间未知")
+        // 两处"大厅时间未知"共用同一条模板：语义相同，不该让用户维护两份覆盖。
+        port.reply_template(&templates::TIME_UNKNOWN, &ReplyVars::new())
     }
 
     pub(crate) fn check_public_hall<P: HallDetectionPort + ?Sized>(
@@ -708,5 +753,345 @@ mod tests {
         assert!(warned);
         assert_eq!(port.replies, ["大厅即将到期"]);
         assert!(port.marked);
+    }
+
+    /// 只接受模板回复的替身。
+    ///
+    /// 走 reply(&format!(..)) 的老写法会把文案塞进 raw_replies，
+    /// 于是"这条路径忘了模板化"能被测试抓出来，而不是悄悄回退成硬编码。
+    #[derive(Default)]
+    struct TemplateRecordingPort {
+        read_hall_info: Option<HallObservation>,
+        detected_hall: Option<HallObservation>,
+        remaining_minutes: Option<u32>,
+        idle: bool,
+        warning_sent: bool,
+        rendered: Vec<(&'static str, String)>,
+        raw_replies: Vec<String>,
+        toggled: bool,
+        marked: bool,
+    }
+
+    impl TemplateRecordingPort {
+        fn with_hall(info: HallObservation) -> Self {
+            Self {
+                read_hall_info: Some(info),
+                idle: true,
+                ..Self::default()
+            }
+        }
+
+        fn rendered_keys(&self) -> Vec<&'static str> {
+            self.rendered.iter().map(|(key, _)| *key).collect()
+        }
+
+        fn assert_only_templates_were_used(&self) {
+            assert!(
+                self.raw_replies.is_empty(),
+                "这些文案绕过了 reply_template：{:?}",
+                self.raw_replies
+            );
+        }
+    }
+
+    impl HallDetectionPort for TemplateRecordingPort {
+        fn detect_public_hall(&mut self) -> Result<Option<HallObservation>> {
+            Ok(self.detected_hall.clone())
+        }
+
+        fn update_hall_remaining_minutes(&mut self, minutes: u32) -> Result<()> {
+            self.remaining_minutes = Some(minutes);
+            Ok(())
+        }
+
+        fn clear_hall_remaining_minutes(&mut self) -> Result<()> {
+            self.remaining_minutes = None;
+            Ok(())
+        }
+    }
+
+    impl HallApplicationPort for TemplateRecordingPort {
+        fn reply(&mut self, message: &str) -> Result<()> {
+            self.raw_replies.push(message.to_string());
+            Ok(())
+        }
+
+        fn reply_template(
+            &mut self,
+            spec: &crate::features::reply_template::ReplyTemplate,
+            vars: &ReplyVars,
+        ) -> Result<()> {
+            let rendered = crate::features::reply_template::render(spec, None, vars);
+            assert!(
+                rendered.missing.is_empty(),
+                "{} 渲染时缺少变量 {:?}",
+                spec.key,
+                rendered.missing
+            );
+            self.rendered.push((spec.key, rendered.text));
+            Ok(())
+        }
+
+        fn log_executed(
+            &mut self,
+            _context: &HallCommandContext,
+            _final_command: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn read_hall_info(&mut self) -> Result<HallObservation> {
+            self.read_hall_info
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("大厅信息读取失败：测试注入"))
+        }
+
+        fn toggle_microphone(&mut self) -> Result<()> {
+            self.toggled = true;
+            Ok(())
+        }
+
+        fn hall_remaining_minutes(&mut self) -> Result<Option<u32>> {
+            Ok(self.remaining_minutes)
+        }
+    }
+
+    impl HallMaintenancePort for TemplateRecordingPort {
+        fn executor_is_idle(&mut self) -> Result<bool> {
+            Ok(self.idle)
+        }
+
+        fn hall_expiring_warning_sent(&mut self) -> Result<bool> {
+            Ok(self.warning_sent)
+        }
+
+        fn hall_remaining_minutes(&mut self) -> Result<Option<u32>> {
+            Ok(self.remaining_minutes)
+        }
+
+        fn reply(&mut self, message: &str) -> Result<()> {
+            self.raw_replies.push(message.to_string());
+            Ok(())
+        }
+
+        fn reply_template(
+            &mut self,
+            spec: &crate::features::reply_template::ReplyTemplate,
+            vars: &ReplyVars,
+        ) -> Result<()> {
+            let rendered = crate::features::reply_template::render(spec, None, vars);
+            self.rendered.push((spec.key, rendered.text));
+            Ok(())
+        }
+
+        fn mark_hall_expiring_warning_sent(&mut self) -> Result<()> {
+            self.marked = true;
+            Ok(())
+        }
+    }
+
+    fn hall_context() -> HallCommandContext {
+        HallCommandContext {
+            message_type: "blue".to_string(),
+            username: "测试".to_string(),
+            user_command: "@大厅检测".to_string(),
+        }
+    }
+
+    #[test]
+    fn hall_detection_replies_through_the_current_template_keys() {
+        // 读取失败 → hall.detect.failed
+        let mut failing = TemplateRecordingPort::default();
+        HallApplication
+            .execute(&hall_context(), &HallCommand::Detect, &mut failing)
+            .expect("hall detect failure path");
+        assert_eq!(failing.rendered_keys(), ["hall.detect.failed"]);
+        assert_eq!(failing.rendered[0].1, "大厅检测失败");
+        failing.assert_only_templates_were_used();
+
+        // 公共大厅 → hall.public.current
+        let mut public = TemplateRecordingPort::with_hall(HallObservation {
+            name: "公共大厅".to_string(),
+            remaining_minutes: None,
+        });
+        HallApplication
+            .execute(&hall_context(), &HallCommand::Detect, &mut public)
+            .expect("public hall detect");
+        assert_eq!(public.rendered_keys(), ["hall.public.current"]);
+        assert_eq!(public.rendered[0].1, "当前为公共大厅");
+        public.assert_only_templates_were_used();
+
+        // 具名大厅 + 剩余时间 → hall.current，后缀仍是"，剩余N分钟"
+        let mut named = TemplateRecordingPort::with_hall(HallObservation {
+            name: "一级大厅".to_string(),
+            remaining_minutes: Some(7),
+        });
+        HallApplication
+            .execute(&hall_context(), &HallCommand::Detect, &mut named)
+            .expect("named hall detect");
+        assert_eq!(named.rendered_keys(), ["hall.current"]);
+        assert_eq!(named.rendered[0].1, "当前为一级大厅，剩余7分钟");
+        assert_eq!(named.remaining_minutes, Some(7));
+        named.assert_only_templates_were_used();
+
+        // 无倒计时 → 不得留下孤立的逗号
+        let mut no_timer = TemplateRecordingPort::with_hall(HallObservation {
+            name: "未识别到大厅名称".to_string(),
+            remaining_minutes: None,
+        });
+        HallApplication
+            .execute(&hall_context(), &HallCommand::Detect, &mut no_timer)
+            .expect("hall detect without countdown");
+        assert_eq!(no_timer.rendered[0].1, "当前为未识别到大厅名称");
+        no_timer.assert_only_templates_were_used();
+    }
+
+    #[test]
+    fn hall_time_replies_through_the_current_template_keys() {
+        // 已有倒计时 → hall.time.remaining
+        let mut cached = TemplateRecordingPort {
+            remaining_minutes: Some(3),
+            idle: true,
+            ..TemplateRecordingPort::default()
+        };
+        HallApplication
+            .execute(&hall_context(), &HallCommand::Time, &mut cached)
+            .expect("cached hall time");
+        assert_eq!(cached.rendered_keys(), ["hall.time.remaining"]);
+        assert_eq!(cached.rendered[0].1, "大厅到期时间，剩余3分钟");
+        cached.assert_only_templates_were_used();
+
+        // OCR 失败 → hall.time.unknown
+        let mut failing = TemplateRecordingPort {
+            idle: true,
+            ..TemplateRecordingPort::default()
+        };
+        HallApplication
+            .execute(&hall_context(), &HallCommand::Time, &mut failing)
+            .expect("hall time read failure");
+        assert_eq!(failing.rendered_keys(), ["hall.time.unknown"]);
+        assert_eq!(failing.rendered[0].1, "大厅时间未知");
+        failing.assert_only_templates_were_used();
+
+        // 公共大厅 → hall.public.no_limit
+        let mut public = TemplateRecordingPort {
+            read_hall_info: Some(HallObservation {
+                name: "公共大厅".to_string(),
+                remaining_minutes: None,
+            }),
+            idle: true,
+            ..TemplateRecordingPort::default()
+        };
+        HallApplication
+            .execute(&hall_context(), &HallCommand::Time, &mut public)
+            .expect("public hall time");
+        assert_eq!(public.rendered_keys(), ["hall.public.no_limit"]);
+        assert_eq!(public.rendered[0].1, "公共大厅无时间限制");
+        public.assert_only_templates_were_used();
+
+        // 识别出倒计时 → hall.time.remaining 并写回状态
+        let mut detected = TemplateRecordingPort {
+            read_hall_info: Some(HallObservation {
+                name: "一级大厅".to_string(),
+                remaining_minutes: Some(12),
+            }),
+            ..TemplateRecordingPort::default()
+        };
+        HallApplication
+            .execute(&hall_context(), &HallCommand::Time, &mut detected)
+            .expect("detected hall time");
+        assert_eq!(detected.rendered_keys(), ["hall.time.remaining"]);
+        assert_eq!(detected.rendered[0].1, "大厅到期时间，剩余12分钟");
+        assert_eq!(detected.remaining_minutes, Some(12));
+        detected.assert_only_templates_were_used();
+
+        // 识别成功但没读到倒计时 → 仍回落到 hall.time.unknown
+        let mut unknown = TemplateRecordingPort {
+            read_hall_info: Some(HallObservation {
+                name: "一级大厅".to_string(),
+                remaining_minutes: None,
+            }),
+            ..TemplateRecordingPort::default()
+        };
+        HallApplication
+            .execute(&hall_context(), &HallCommand::Time, &mut unknown)
+            .expect("unknown hall time");
+        assert_eq!(unknown.rendered_keys(), ["hall.time.unknown"]);
+        unknown.assert_only_templates_were_used();
+    }
+
+    #[test]
+    fn microphone_and_expiry_warnings_use_templates_too() {
+        // 非公共大厅 → 切换麦克风并通告
+        let mut toggle = TemplateRecordingPort {
+            detected_hall: Some(HallObservation {
+                name: "一级大厅".to_string(),
+                remaining_minutes: None,
+            }),
+            ..TemplateRecordingPort::default()
+        };
+        HallApplication
+            .execute(
+                &hall_context(),
+                &HallCommand::ToggleMicrophone {
+                    username: "小明".to_string(),
+                },
+                &mut toggle,
+            )
+            .expect("microphone toggle");
+        assert!(toggle.toggled);
+        assert_eq!(toggle.rendered_keys(), ["hall.microphone.toggled"]);
+        assert_eq!(toggle.rendered[0].1, "小明 执行了切换麦克风状态！");
+        toggle.assert_only_templates_were_used();
+
+        // 到期警告：>0 用带分钟的那条，==0 用不带分钟的
+        let mut warn_minutes = TemplateRecordingPort {
+            remaining_minutes: Some(4),
+            idle: true,
+            ..TemplateRecordingPort::default()
+        };
+        assert!(HallApplication
+            .maybe_warn_expiring(&mut warn_minutes)
+            .expect("expiry warning with minutes"));
+        assert_eq!(
+            warn_minutes.rendered_keys(),
+            ["hall.expiring.warning_minutes"]
+        );
+        assert_eq!(warn_minutes.rendered[0].1, "大厅即将到期，剩余4分钟");
+        warn_minutes.assert_only_templates_were_used();
+
+        let mut warn_expired = TemplateRecordingPort {
+            remaining_minutes: Some(0),
+            idle: true,
+            ..TemplateRecordingPort::default()
+        };
+        assert!(HallApplication
+            .maybe_warn_expiring(&mut warn_expired)
+            .expect("expiry warning without minutes"));
+        assert_eq!(warn_expired.rendered_keys(), ["hall.expiring.warning"]);
+        assert_eq!(warn_expired.rendered[0].1, "大厅即将到期");
+        warn_expired.assert_only_templates_were_used();
+    }
+
+    #[test]
+    fn every_key_used_by_hall_is_registered_in_the_catalog() {
+        // 调用点用的字面量 key 必须与模板目录登记的一致，否则覆盖永远命中不到。
+        let registered: std::collections::BTreeSet<&str> =
+            crate::features::reply_template::catalog()
+                .map(|spec| spec.key)
+                .collect();
+        for key in [
+            "hall.detect.failed",
+            "hall.public.current",
+            "hall.current",
+            "hall.time.remaining",
+            "hall.time.unknown",
+            "hall.public.no_limit",
+            "hall.microphone.toggled",
+            "hall.expiring.warning",
+            "hall.expiring.warning_minutes",
+        ] {
+            assert!(registered.contains(key), "{key} 未登记进模板目录");
+        }
     }
 }

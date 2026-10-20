@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use miliastra_playback::{PlayableTrack, ProviderId, TrackKey};
 
+use crate::features::reply_template::playback as playback_templates;
+use crate::features::reply_template::{self, ReplyTemplate, ReplyVars};
 use crate::features::song_request::SearchCandidate;
 use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
 
@@ -103,12 +105,9 @@ impl PlaybackSelection {
         }
     }
 
-    fn dedup_reject_message(&self) -> String {
-        format!("{}近期已播放过,请稍后再点", self.keyword)
-    }
-
-    fn dedup_skip_message(&self) -> String {
-        format!("{}近期已播放过,已跳过", self.keyword)
+    /// 去重文案的变量：两条模板（点播拦截 / 队列跳过）都只插入歌名。
+    fn dedup_vars(&self) -> ReplyVars {
+        ReplyVars::new().with("歌名", self.keyword.clone())
     }
 }
 
@@ -286,10 +285,20 @@ impl PlaybackPurpose {
         )
     }
 
-    fn dedup_reply(self, selection: &PlaybackSelection) -> Option<String> {
+    /// 去重时展示给玩家的文案。
+    ///
+    /// 存模板键而不是成品字符串：真正渲染发生在回复出口（`finish_playback`），
+    /// 那里才有 port 可以查询用户覆盖；在这里拼成字符串会把覆盖绕过去。
+    fn dedup_reply(self, selection: &PlaybackSelection) -> Option<ReplyMessage> {
         match self {
-            Self::Requested => Some(selection.dedup_reject_message()),
-            Self::Queue { .. } => Some(selection.dedup_skip_message()),
+            Self::Requested => Some(ReplyMessage {
+                spec: &playback_templates::DEDUP_RECENTLY_PLAYED,
+                vars: selection.dedup_vars(),
+            }),
+            Self::Queue { .. } => Some(ReplyMessage {
+                spec: &playback_templates::DEDUP_SKIPPED,
+                vars: selection.dedup_vars(),
+            }),
             Self::Previous
             | Self::SourceRetry { .. }
             | Self::Playlist { .. }
@@ -299,9 +308,27 @@ impl PlaybackPurpose {
     }
 }
 
+/// 一条待发送的回复：模板 + 变量。
+///
+/// 播放链路的回复要到出口（`finish_playback`）才发送，因此这里携带模板本身，
+/// 由出口用 port 渲染——这样配置覆盖对所有分支一致生效。
+struct ReplyMessage {
+    spec: &'static ReplyTemplate,
+    vars: ReplyVars,
+}
+
+impl ReplyMessage {
+    fn new(spec: &'static ReplyTemplate, vars: ReplyVars) -> Self {
+        Self { spec, vars }
+    }
+}
+
 struct PlaybackCompletion {
     result: PlaybackResult,
+    /// 原样透传的文案（播放回执、错误原因等，文案源头不在本模块）。
     reply: Option<String>,
+    /// 走模板渲染的文案；与 `reply` 互斥，两者最多一个为 Some。
+    reply_template: Option<ReplyMessage>,
     update_monitor: bool,
 }
 
@@ -310,13 +337,40 @@ impl PlaybackCompletion {
         Self {
             result,
             reply,
+            reply_template: None,
             update_monitor,
         }
+    }
+
+    fn templated(mut self, spec: &'static ReplyTemplate, vars: ReplyVars) -> Self {
+        self.reply = None;
+        self.reply_template = Some(ReplyMessage::new(spec, vars));
+        self
     }
 }
 
 pub(crate) trait PlaybackExecutionPort {
     fn reply(&mut self, message: &str) -> Result<()>;
+
+    /// 渲染一条模板，返回成品文案（不发送）。
+    ///
+    /// 业务层只声明"用哪条模板、带哪些变量"，**不知道配置存在**；
+    /// 覆盖文案的查找由实现方（composition 层）负责，这样 features 层
+    /// 不会反向依赖配置中心。
+    ///
+    /// 单独拆出"只渲染不发送"，是给需要在一条消息里拼多段模板的调用点用的
+    /// （如完整队列的分批消息）；默认实现按内置文案渲染，保证不接配置的
+    /// 调用方（测试替身）也能工作。
+    fn render_reply(&mut self, spec: &ReplyTemplate, vars: &ReplyVars) -> String {
+        reply_template::render(spec, None, vars).text
+    }
+
+    /// 按模板键回复。
+    fn reply_template(&mut self, spec: &ReplyTemplate, vars: &ReplyVars) -> Result<()> {
+        let text = self.render_reply(spec, vars);
+        self.reply(&text)
+    }
+
     fn update_monitor(&mut self);
     fn search_and_pick(
         &mut self,
@@ -753,13 +807,13 @@ impl PlaybackApplication {
                 port.pause_by_user()?;
                 port.log_executed(context, "pause")?;
                 port.update_monitor();
-                port.reply("已暂停")?;
+                port.reply_template(&playback_templates::PAUSE_OK, &ReplyVars::new())?;
             }
             PlaybackCommand::Resume | PlaybackCommand::Play => {
                 port.resume_by_user()?;
                 port.log_executed(context, "resume")?;
                 port.update_monitor();
-                port.reply("已恢复播放")?;
+                port.reply_template(&playback_templates::RESUME_OK, &ReplyVars::new())?;
             }
             PlaybackCommand::Next => {
                 // 严格按播放列表：队列有歌播队列第一首（播放确认消息已回复）；
@@ -767,9 +821,14 @@ impl PlaybackApplication {
                 match self.consume_queue("手动下一首", port)? {
                     Some(ConsumedSelection::Queue { .. }) => {}
                     Some(ConsumedSelection::Pool { keyword }) => {
-                        port.reply(&format!("播放列表为空，随机续播: {keyword}"))?;
+                        port.reply_template(
+                            &playback_templates::NEXT_POOL_FALLBACK,
+                            &ReplyVars::new().with("关键词", keyword),
+                        )?;
                     }
-                    None => port.reply("队列和播放池都为空，无可播放歌曲")?,
+                    None => {
+                        port.reply_template(&playback_templates::NEXT_EMPTY, &ReplyVars::new())?;
+                    }
                 }
                 port.log_executed(context, "next queue")?;
             }
@@ -777,7 +836,10 @@ impl PlaybackApplication {
                 let status = port.player_status()?;
                 let Some(track) = status.current_track else {
                     port.log_executed(context, "delete current pool track unavailable")?;
-                    port.reply("当前歌曲信息不可用，未删除播放池歌曲")?;
+                    port.reply_template(
+                        &playback_templates::DELETE_TRACK_UNAVAILABLE,
+                        &ReplyVars::new(),
+                    )?;
                     return Ok(());
                 };
                 let removed = port.remove_playback_pool_track(&track.track_ref.key)?;
@@ -792,20 +854,20 @@ impl PlaybackApplication {
                 match self.consume_queue("删除当前歌曲并下一曲", port)? {
                     Some(ConsumedSelection::Queue { .. }) => {}
                     Some(ConsumedSelection::Pool { keyword }) => {
-                        let action = if removed {
-                            "已从播放池删除当前歌曲"
+                        let spec = if removed {
+                            &playback_templates::DELETE_REMOVED_POOL_FALLBACK
                         } else {
-                            "当前歌曲不在播放池中"
+                            &playback_templates::DELETE_NOT_IN_POOL_POOL_FALLBACK
                         };
-                        port.reply(&format!("{action}，随机续播: {keyword}"))?;
+                        port.reply_template(spec, &ReplyVars::new().with("关键词", keyword))?;
                     }
                     None => {
-                        let action = if removed {
-                            "已从播放池删除当前歌曲"
+                        let spec = if removed {
+                            &playback_templates::DELETE_REMOVED_QUEUE_EMPTY
                         } else {
-                            "当前歌曲不在播放池中"
+                            &playback_templates::DELETE_NOT_IN_POOL_QUEUE_EMPTY
                         };
-                        port.reply(&format!("{action}；队列和播放池都为空"))?;
+                        port.reply_template(spec, &ReplyVars::new())?;
                     }
                 }
             }
@@ -819,13 +881,16 @@ impl PlaybackApplication {
                     // 无历史请求：没有可回退的上一曲，明确告知，不转发给引擎。
                     port.update_monitor();
                     port.log_executed(context, "previous")?;
-                    port.reply("没有上一曲记录")?;
+                    port.reply_template(&playback_templates::PREVIOUS_MISSING, &ReplyVars::new())?;
                 }
             }
             PlaybackCommand::Volume(volume) => {
                 port.set_volume(volume)?;
                 port.log_executed(context, &format!("volume {}", volume))?;
-                port.reply(&format!("音量已设置为 {}", volume))?;
+                port.reply_template(
+                    &playback_templates::VOLUME_SET,
+                    &ReplyVars::new().with("音量", volume.to_string()),
+                )?;
             }
             PlaybackCommand::Status => {
                 let status = port.player_status()?;
@@ -847,11 +912,12 @@ impl PlaybackApplication {
             PlaybackCommand::ToggleLyrics => {
                 let mode = port.toggle_lyrics()?;
                 port.log_executed(context, "lyrics toggle")?;
-                port.reply(if mode == "translation" {
-                    "歌词已切换为翻译"
+                let spec = if mode == "translation" {
+                    &playback_templates::LYRICS_TOGGLE_TRANSLATION
                 } else {
-                    "歌词已切换为原文"
-                })?;
+                    &playback_templates::LYRICS_TOGGLE_ORIGINAL
+                };
+                port.reply_template(spec, &ReplyVars::new())?;
             }
             PlaybackCommand::LyricsFor(seconds) => {
                 let started = port.start_background_lyrics(
@@ -859,15 +925,12 @@ impl PlaybackApplication {
                     BackgroundLyricsScope::AllSongs,
                 )?;
                 port.log_executed(context, &format!("lyrics {}s", seconds))?;
-                let message = if started {
-                    format!(
-                        "限时歌词已开启，将持续{}秒；默认显示翻译，发送@切换可切换原文/翻译",
-                        seconds
-                    )
+                let spec = if started {
+                    &playback_templates::LYRICS_TIMED_STARTED
                 } else {
-                    "后台歌词已经在运行".to_string()
+                    &playback_templates::LYRICS_ALREADY_RUNNING
                 };
-                port.reply(&message)?;
+                port.reply_template(spec, &ReplyVars::new().with("秒数", seconds.to_string()))?;
             }
             PlaybackCommand::ContinuousLyrics => {
                 port.stop_background_lyrics()?;
@@ -878,30 +941,33 @@ impl PlaybackApplication {
                 let started =
                     port.start_background_lyrics(None, BackgroundLyricsScope::AllSongs)?;
                 port.log_executed(context, "lyrics background")?;
-                port.reply(if started {
-                    "后台歌词已开启；默认显示翻译，发送@切换 可切换原文/翻译；"
+                let spec = if started {
+                    &playback_templates::LYRICS_BACKGROUND_STARTED
                 } else {
-                    "后台歌词已经在运行"
-                })?;
+                    &playback_templates::LYRICS_ALREADY_RUNNING
+                };
+                port.reply_template(spec, &ReplyVars::new())?;
             }
             PlaybackCommand::SingleSongLyrics => {
                 let started =
                     port.start_background_lyrics(None, BackgroundLyricsScope::CurrentSong)?;
                 port.log_executed(context, "lyrics single song")?;
-                port.reply(if started {
-                    "单曲后台歌词已开启；默认显示翻译，发送@切换可切换原文/翻译；切歌后自动停止"
+                let spec = if started {
+                    &playback_templates::LYRICS_SINGLE_SONG_STARTED
                 } else {
-                    "后台歌词已经在运行"
-                })?;
+                    &playback_templates::LYRICS_ALREADY_RUNNING
+                };
+                port.reply_template(spec, &ReplyVars::new())?;
             }
             PlaybackCommand::StopBackgroundLyrics => {
                 let stopped = port.stop_background_lyrics()?;
                 port.log_executed(context, "lyrics background stop")?;
-                port.reply(if stopped {
-                    "后台歌词已停止"
+                let spec = if stopped {
+                    &playback_templates::LYRICS_BACKGROUND_STOPPED
                 } else {
-                    "后台歌词当前未运行"
-                })?;
+                    &playback_templates::LYRICS_BACKGROUND_NOT_RUNNING
+                };
+                port.reply_template(spec, &ReplyVars::new())?;
             }
             PlaybackCommand::Queue => {
                 port.log_executed(context, "queue list")?;
@@ -910,13 +976,19 @@ impl PlaybackApplication {
             PlaybackCommand::QueueDelete(indexes) => {
                 if indexes.is_empty() {
                     port.log_executed(context, "queue delete invalid")?;
-                    port.reply("没有匹配到有效队列序号")?;
+                    port.reply_template(
+                        &playback_templates::QUEUE_DELETE_INVALID,
+                        &ReplyVars::new(),
+                    )?;
                     return Ok(());
                 }
                 let removed = port.remove_playback_queue_indexes(indexes.clone())?;
                 if removed.is_empty() {
                     port.log_executed(context, "queue delete none")?;
-                    port.reply("队列删除失败或序号不存在")?;
+                    port.reply_template(
+                        &playback_templates::QUEUE_DELETE_MISSING,
+                        &ReplyVars::new(),
+                    )?;
                 } else {
                     let removed_text = removed
                         .iter()
@@ -924,16 +996,22 @@ impl PlaybackApplication {
                         .collect::<Vec<_>>()
                         .join(", ");
                     port.log_executed(context, &format!("queue delete {}", removed_text))?;
-                    port.reply(&format!("队列已删除: {}", removed_text))?;
+                    port.reply_template(
+                        &playback_templates::QUEUE_DELETE_DONE,
+                        &ReplyVars::new().with("条目", removed_text),
+                    )?;
                 }
             }
             PlaybackCommand::QueueClear => {
                 let count = port.clear_playback_queue()?;
                 port.log_executed(context, &format!("queue clear {}", count))?;
                 if count == 0 {
-                    port.reply("队列为空")?;
+                    port.reply_template(&playback_templates::QUEUE_EMPTY, &ReplyVars::new())?;
                 } else {
-                    port.reply(&format!("队列已清空: {} 首", count))?;
+                    port.reply_template(
+                        &playback_templates::QUEUE_CLEARED,
+                        &ReplyVars::new().with("数量", count.to_string()),
+                    )?;
                 }
             }
         }
@@ -943,10 +1021,19 @@ impl PlaybackApplication {
     fn reply_full_queue<P: PlaybackCommandPort + ?Sized>(&self, port: &mut P) -> Result<()> {
         let queue = port.playback_queue()?;
         if queue.is_empty() {
-            return port.reply("队列为空");
+            return port.reply_template(&playback_templates::QUEUE_EMPTY, &ReplyVars::new());
         }
 
-        let messages = split_full_queue_messages(&queue, self.config.queue_max_size);
+        let header_spec = &playback_templates::QUEUE_HEADER;
+        let entry_spec = &playback_templates::QUEUE_ENTRY;
+        let mut render = |spec: &ReplyTemplate, vars: &ReplyVars| port.render_reply(spec, vars);
+        let messages = split_full_queue_messages(
+            &queue,
+            self.config.queue_max_size,
+            header_spec,
+            entry_spec,
+            &mut render,
+        );
         port.reply_batch(&messages, self.config.help_batch_ms)
     }
 
@@ -1352,11 +1439,10 @@ impl PlaybackApplication {
                     .map(|track| track.track_ref.key.to_string())
                     .unwrap_or_default()
             );
-            return Ok(PlaybackCompletion::new(
-                PlaybackResult::dedup_limited(&requested),
-                purpose.dedup_reply(selection),
-                false,
-            ));
+            let mut completion =
+                PlaybackCompletion::new(PlaybackResult::dedup_limited(&requested), None, false);
+            completion.reply_template = purpose.dedup_reply(selection);
+            return Ok(completion);
         }
         if selection.track.is_none() {
             let source = if selection.source.trim().is_empty() {
@@ -1378,17 +1464,26 @@ impl PlaybackApplication {
                             None,
                             "平台无对应歌曲音源",
                         ),
-                        Some("平台无对应歌曲音源".to_string()),
+                        None,
                         false,
-                    ));
+                    )
+                    .templated(&playback_templates::NO_SOURCE, ReplyVars::new()));
                 }
                 Err(error) => {
                     log::error!("点歌搜索失败: {error}");
-                    return Ok(PlaybackCompletion::new(
+                    let message = ReplyMessage::new(
+                        &playback_templates::SEARCH_FAILED,
+                        ReplyVars::new()
+                            .with("前缀", selection.label())
+                            .with("原因", error.user_message()),
+                    );
+                    let mut completion = PlaybackCompletion::new(
                         PlaybackResult::error(&requested, &requested, None, error.to_string()),
-                        Some(format!("{}{}", selection.label(), error.user_message())),
+                        None,
                         false,
-                    ));
+                    );
+                    completion.reply_template = Some(message);
+                    return Ok(completion);
                 }
             };
             log::info!(
@@ -1455,11 +1550,25 @@ impl PlaybackApplication {
                         return self
                             .switch_source_and_play(requested, request, purpose, &reason, port);
                     }
-                    return Ok(PlaybackCompletion::new(
-                        PlaybackResult::no_source(requested, request, None, reason.clone()),
-                        purpose.replies_with_play_message().then_some(reason),
+                    let mut completion = PlaybackCompletion::new(
+                        PlaybackResult::no_source(requested, request, None, reason),
+                        None,
                         false,
-                    ));
+                    );
+                    if purpose.replies_with_play_message() {
+                        completion.reply_template = Some(match item_message {
+                            Some(message) => ReplyMessage::new(
+                                &playback_templates::ITEM_FAILURE,
+                                ReplyVars::new()
+                                    .with("来源", request_source(request))
+                                    .with("原因", message),
+                            ),
+                            None => {
+                                ReplyMessage::new(&playback_templates::NO_SOURCE, ReplyVars::new())
+                            }
+                        });
+                    }
+                    return Ok(completion);
                 }
                 let message = error.to_string();
                 let reply = if message.trim().is_empty() {
@@ -1468,13 +1577,25 @@ impl PlaybackApplication {
                     message.trim().to_string()
                 };
                 log::error!("播放候选失败: {reply}");
-                return Ok(PlaybackCompletion::new(
+                let mut completion = PlaybackCompletion::new(
                     PlaybackResult::error(requested, request, None, reply.clone()),
-                    (purpose.replies_with_play_message()
-                        || matches!(purpose, PlaybackPurpose::SourceRetry { .. }))
-                    .then_some(reply),
+                    None,
                     false,
-                ));
+                );
+                if purpose.replies_with_play_message()
+                    || matches!(purpose, PlaybackPurpose::SourceRetry { .. })
+                {
+                    if message.trim().is_empty() {
+                        completion.reply_template = Some(ReplyMessage::new(
+                            &playback_templates::NO_SOURCE,
+                            ReplyVars::new(),
+                        ));
+                    } else {
+                        // 播放器返回的原始错误文本：文案源头不在本模块，原样透传。
+                        completion.reply = Some(reply);
+                    }
+                }
+                return Ok(completion);
             }
         };
         self.complete_verification(requested, request, verification, purpose, port)
@@ -1538,9 +1659,14 @@ impl PlaybackApplication {
             )?;
             match completion.result.outcome() {
                 PlaybackOutcome::Success => {
-                    completion.reply = purpose.replies_with_play_message().then(|| {
-                        format!("已自动换源:{}", compact_candidate_title(&resolved.keyword))
-                    });
+                    if purpose.replies_with_play_message() {
+                        completion.reply = None;
+                        completion.reply_template = Some(ReplyMessage::new(
+                            &playback_templates::SOURCE_SWITCHED,
+                            ReplyVars::new()
+                                .with("歌名", compact_candidate_title(&resolved.keyword)),
+                        ));
+                    }
                     return Ok(completion);
                 }
                 PlaybackOutcome::ItemScopedFailure => {
@@ -1560,13 +1686,21 @@ impl PlaybackApplication {
         }
         let reason = reasons.join("; ");
         completion.result.failure_reason = Some(reason.clone());
-        completion.reply = purpose.replies_with_play_message().then(|| {
-            if matches!(purpose, PlaybackPurpose::Queue { .. }) {
-                format!("{reason}，已跳过当前歌曲")
+        if purpose.replies_with_play_message() {
+            completion.reply = None;
+            completion.reply_template = Some(if matches!(purpose, PlaybackPurpose::Queue { .. }) {
+                ReplyMessage::new(
+                    &playback_templates::QUEUE_SKIPPED,
+                    ReplyVars::new().with("原因", reason),
+                )
             } else {
-                reason
-            }
-        });
+                // 多个平台失败原因拼接：动态文本本身作为变量注入。
+                ReplyMessage::new(
+                    &playback_templates::FAILURE_REASON,
+                    ReplyVars::new().with("原因", reason),
+                )
+            });
+        }
         Ok(completion)
     }
 
@@ -1590,6 +1724,8 @@ impl PlaybackApplication {
         }
         if let Some(reply) = completion.reply {
             port.reply(&reply)?;
+        } else if let Some(message) = completion.reply_template {
+            port.reply_template(message.spec, &message.vars)?;
         }
         Ok(completion.result)
     }
@@ -1735,14 +1871,34 @@ fn compact_candidate_title(candidate: &str) -> String {
     candidate.replace(" - ", "-")
 }
 
-fn split_full_queue_messages(queue: &[QueueItem], queue_max_size: usize) -> Vec<String> {
-    let header = format!("完整队列({}/{}): ", queue.len(), queue_max_size);
+/// 把完整队列切成不超过聊天宽度的多条消息。
+///
+/// 表头与单条条目的文案由模板提供；渲染走调用方给的 `render`，这样用户对
+/// `playback.queue.header` / `playback.queue.entry` 的覆盖与其它回复一致生效。
+fn split_full_queue_messages(
+    queue: &[QueueItem],
+    queue_max_size: usize,
+    header_spec: &ReplyTemplate,
+    entry_spec: &ReplyTemplate,
+    render: &mut dyn FnMut(&ReplyTemplate, &ReplyVars) -> String,
+) -> Vec<String> {
+    let header = render(
+        header_spec,
+        &ReplyVars::new()
+            .with("当前", queue.len().to_string())
+            .with("上限", queue_max_size.to_string()),
+    );
     let mut messages = Vec::new();
     let mut current = header;
     let mut has_entry = false;
 
     for (index, item) in queue.iter().enumerate() {
-        let entry = format!("{}.{}", index + 1, item.keyword);
+        let entry = render(
+            entry_spec,
+            &ReplyVars::new()
+                .with("序号", (index + 1).to_string())
+                .with("歌名", item.keyword.clone()),
+        );
         let entry_width = display_width(&entry);
 
         if entry_width > MAX_CHAT_WIDTH {
@@ -3451,6 +3607,95 @@ mod tests {
         );
     }
 
+    /// 只为"覆盖文案真的会到达玩家"这一件事存在的端口：它对指定模板键返回覆盖文案，
+    /// 其余行为全部走 trait 默认实现（即内置默认文案）。
+    ///
+    /// 这样测试不依赖 composition 层就能验证：`reply_template` 确实经由
+    /// `render_reply` 取文案，而不是绕过它直接拼内置字符串。
+    struct OverridingPort {
+        replies: Vec<String>,
+        overrides: Vec<(&'static str, &'static str)>,
+    }
+
+    impl PlaybackExecutionPort for OverridingPort {
+        fn reply(&mut self, message: &str) -> Result<()> {
+            self.replies.push(message.to_string());
+            Ok(())
+        }
+
+        fn render_reply(&mut self, spec: &ReplyTemplate, vars: &ReplyVars) -> String {
+            match self
+                .overrides
+                .iter()
+                .find(|(key, _)| *key == spec.key)
+                .map(|(_, text)| *text)
+            {
+                // 覆盖文案同样支持占位符，走同一套渲染。
+                Some(text) => {
+                    reply_template::render(
+                        &ReplyTemplate {
+                            key: spec.key,
+                            default: text,
+                            summary: spec.summary,
+                            group: spec.group,
+                        },
+                        None,
+                        vars,
+                    )
+                    .text
+                }
+                None => reply_template::render(spec, None, vars).text,
+            }
+        }
+
+        fn update_monitor(&mut self) {}
+        fn search_and_pick(
+            &mut self,
+            _keyword: &str,
+            _source: &str,
+            _prefer_accompaniment: bool,
+        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+            unreachable!("this port is only used for reply assertions")
+        }
+        fn song_dedup_limited(&mut self, _request: &PlaybackRequest) -> Result<bool> {
+            Ok(false)
+        }
+        fn play_and_verify(&mut self, _request: &PlaybackRequest) -> Result<PlaybackVerification> {
+            unreachable!("this port is only used for reply assertions")
+        }
+        fn player_status(&mut self) -> Result<PlayerStatus> {
+            Ok(PlayerStatus::default())
+        }
+        fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
+            Ok(Vec::new())
+        }
+        fn remove_playback_queue(&mut self, _removal: QueueRemoval) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reply_template_goes_through_the_render_seam_so_overrides_reach_the_player() {
+        let mut port = OverridingPort {
+            replies: Vec::new(),
+            overrides: vec![
+                ("playback.volume.set", "音量调到 {音量} 啦"),
+                ("playback.queue.empty", "队列空空的"),
+            ],
+        };
+
+        // 默认实现（无覆盖）与覆盖后的实现都必须经由 render_reply。
+        port.reply_template(
+            &playback_templates::VOLUME_SET,
+            &ReplyVars::new().with("音量", "80"),
+        )
+        .expect("templated reply");
+        port.reply_template(&playback_templates::QUEUE_EMPTY, &ReplyVars::new())
+            .expect("templated reply");
+
+        assert_eq!(port.replies, ["音量调到 80 啦", "队列空空的"]);
+    }
+
     #[test]
     fn full_queue_command_uses_batch_delivery_without_compressing_entries() {
         let mut port = NavigationCommandPort {
@@ -3661,7 +3906,13 @@ mod tests {
             },
         ];
 
-        let messages = split_full_queue_messages(&queue, 20);
+        let messages = split_full_queue_messages(
+            &queue,
+            20,
+            &playback_templates::QUEUE_HEADER,
+            &playback_templates::QUEUE_ENTRY,
+            &mut |spec, vars| reply_template::render(spec, None, vars).text,
+        );
         let combined = messages.join(" ");
 
         assert!(messages.len() > 1);

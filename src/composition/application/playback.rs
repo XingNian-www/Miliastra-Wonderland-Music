@@ -235,6 +235,38 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         ApplicationRuntime::reply(self, message)
     }
 
+    fn render_reply(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> String {
+        // features 层只声明模板；覆盖文案在组装层查，业务模块不依赖配置中心。
+        // 这里必须与 reply_template 共用同一条路径：队列分批消息只调 render_reply，
+        // 若覆盖只写在 reply_template 里，这些消息就会绕过用户配置。
+        let override_text = self
+            .lifecycle
+            .live_configs
+            .replies
+            .read()
+            .ok()
+            .and_then(|config| config.get(spec.key).map(str::to_string));
+        let rendered =
+            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
+        if !rendered.missing.is_empty() {
+            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
+        }
+        rendered.text
+    }
+
+    fn reply_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        let text = self.render_reply(spec, vars);
+        ApplicationRuntime::reply(self, &text)
+    }
+
     fn update_monitor(&mut self) {
         self.update_monitor_playback_controller();
     }

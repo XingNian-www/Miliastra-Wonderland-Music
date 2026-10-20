@@ -77,6 +77,48 @@ impl ApplicationRuntime {
         }
     }
 
+
+    /// 把一条已渲染的业务文案按模板键换成用户配置的版本。
+    ///
+    /// 调用点在回复收口处：默认配置为空表，此时直接返回原样文案，
+    /// **不改变任何现有行为**；只有用户在配置中心为某个键写了覆盖才替换。
+    ///
+    /// 变量按"已知键"逐个注入：调用方给出的变量在渲染时才生效，
+    /// 因此同一条默认文案在不同调用点可以有不同取值。
+    pub(super) fn render_reply(
+        &self,
+        key: &'static str,
+        default_text: &str,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> String {
+        let overrides = self
+            .lifecycle
+            .live_configs
+            .replies
+            .read()
+            .map(|config| config.get(key).map(str::to_string))
+            .unwrap_or(None);
+        let Some(override_text) = overrides else {
+            // 未配置覆盖：原样返回调用方已经组织好的文案。
+            return default_text.to_string();
+        };
+        let spec = crate::features::reply_template::ReplyTemplate {
+            key,
+            default: default_text,
+            summary: "",
+            group: "",
+        };
+        let rendered =
+            crate::features::reply_template::render(&spec, Some(&override_text), vars);
+        if !rendered.missing.is_empty() {
+            log::warn!(
+                "回复模板 {key} 缺少变量 {:?}，已按空串渲染",
+                rendered.missing
+            );
+        }
+        rendered.text
+    }
+
     pub(super) fn update_monitor_playback_controller(&self) {
         self.lifecycle
             .monitor

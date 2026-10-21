@@ -101,7 +101,7 @@ use crate::runtime::decision::DecisionAction;
 use crate::runtime::monitor::MonitorShared;
 use crate::runtime::scheduler::{FormalTaskCancelOutcome, FormalTaskEnqueueOutcome};
 use crate::ui::frame::LatestFrameCache;
-use crate::ui::geometry::parse_rect;
+use crate::geometry::parse_rect;
 use miliastra_playback::{ProviderId, TrackKey};
 pub(crate) use tools::{WebToolRequest, WebToolTemplate};
 use uuid::Uuid;

@@ -239,7 +239,7 @@ fn pearson_luma(a: &image::GrayImage, b: &image::GrayImage) -> Option<f64> {
 fn structural_evidence(
     image: &image::DynamicImage,
     template_path: &std::path::Path,
-    hit: crate::ui::geometry::Rect,
+    hit: crate::geometry::Rect,
 ) -> (f64, Option<f64>, Option<f64>) {
     let hit_region = image
         .crop_imm(hit.x as u32, hit.y as u32, hit.width, hit.height)
@@ -263,7 +263,7 @@ fn structural_evidence(
 /// 保证"探针报的"就是"分类器算的"。
 fn classifier_marker_evidence(
     image: &image::DynamicImage,
-    region: crate::ui::geometry::Rect,
+    region: crate::geometry::Rect,
     paths: &[&std::path::Path],
     threshold: f32,
     dedupe_x: i32,
@@ -311,7 +311,7 @@ fn classifier_marker_evidence(
 }
 
 /// 搜索区域的 JSON 形式，与 `/debug/ui-state` 的证据保持一致。
-fn rect_json(rect: crate::ui::geometry::Rect) -> serde_json::Value {
+fn rect_json(rect: crate::geometry::Rect) -> serde_json::Value {
     json!({ "x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height })
 }
 
@@ -388,8 +388,8 @@ pub(super) fn debug_ui_catalogue_route(
     // （`scan.rs` 的 `find_chat_markers`）。早先这个探针在整块 chat_rect 上搜索，
     // 于是"过阈值的平坦误配"会被当成标记，**与分类器的实际判定不等价**。
     // 这里改成同一窗口，使探针数值能真正代表分类器行为。
-    let chat: crate::ui::geometry::Rect = screen.chat_rect.into();
-    let marker_region = crate::ui::geometry::Rect::new(
+    let chat: crate::geometry::Rect = screen.chat_rect.into();
+    let marker_region = crate::geometry::Rect::new(
         chat.x,
         chat.y,
         config.ocr.marker_search_width.min(chat.width),
@@ -397,7 +397,7 @@ pub(super) fn debug_ui_catalogue_route(
     );
 
     // 顺序与 GET /tools/templates 一致，便于互相对照。
-    let entries: [(&str, &str, crate::ui::geometry::Rect, &std::path::Path, f32); 19] = [
+    let entries: [(&str, &str, crate::geometry::Rect, &std::path::Path, f32); 19] = [
         (
             "blue-marker",
             "蓝色聊天标志",

@@ -10,11 +10,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect as TuiRect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::Console::{
-    CONSOLE_MODE, ENABLE_EXTENDED_FLAGS, ENABLE_INSERT_MODE, ENABLE_QUICK_EDIT_MODE,
-    GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
-};
 
 use crate::config::TuiConfig;
 use crate::runtime::monitor::{MonitorQueueItem, MonitorShared, MonitorSnapshot};
@@ -35,10 +30,7 @@ pub(crate) struct TuiHandle {
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-struct ConsoleInputModeGuard {
-    handle: HANDLE,
-    original_mode: CONSOLE_MODE,
-}
+use console_input_mode::ConsoleInputModeGuard;
 
 impl TuiHandle {
     pub(crate) fn start(config: &TuiConfig, shared: MonitorShared) -> io::Result<Self> {
@@ -57,30 +49,6 @@ impl TuiHandle {
             thread: Some(thread),
             console_mode_guard,
         })
-    }
-}
-
-impl ConsoleInputModeGuard {
-    fn disable_quick_edit_and_insert() -> Option<Self> {
-        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) }.ok()?;
-        let mut original_mode = CONSOLE_MODE(0);
-        unsafe { GetConsoleMode(handle, &mut original_mode) }.ok()?;
-        let new_mode = CONSOLE_MODE(
-            (original_mode.0 | ENABLE_EXTENDED_FLAGS.0)
-                & !ENABLE_QUICK_EDIT_MODE.0
-                & !ENABLE_INSERT_MODE.0,
-        );
-        unsafe { SetConsoleMode(handle, new_mode) }.ok()?;
-        Some(Self {
-            handle,
-            original_mode,
-        })
-    }
-}
-
-impl Drop for ConsoleInputModeGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { SetConsoleMode(self.handle, self.original_mode) };
     }
 }
 
@@ -352,5 +320,56 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(visible, vec!["消息3", "消息4", "消息5", "消息6", "消息7"]);
+    }
+}
+
+/// 控制台输入模式：Windows 关闭快速编辑/插入模式，避免鼠标点击暂停输出。
+/// 其它平台没有等价机制，返回 `None`（不改变任何行为）。
+#[cfg(target_os = "windows")]
+mod console_input_mode {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_EXTENDED_FLAGS, ENABLE_INSERT_MODE, ENABLE_QUICK_EDIT_MODE,
+        GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+
+    pub(super) struct ConsoleInputModeGuard {
+        handle: HANDLE,
+        original_mode: CONSOLE_MODE,
+    }
+
+    impl ConsoleInputModeGuard {
+        pub(super) fn disable_quick_edit_and_insert() -> Option<Self> {
+            let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) }.ok()?;
+            let mut original_mode = CONSOLE_MODE(0);
+            unsafe { GetConsoleMode(handle, &mut original_mode) }.ok()?;
+            let new_mode = CONSOLE_MODE(
+                (original_mode.0 | ENABLE_EXTENDED_FLAGS.0)
+                    & !ENABLE_QUICK_EDIT_MODE.0
+                    & !ENABLE_INSERT_MODE.0,
+            );
+            unsafe { SetConsoleMode(handle, new_mode) }.ok()?;
+            Some(Self {
+                handle,
+                original_mode,
+            })
+        }
+    }
+
+    impl Drop for ConsoleInputModeGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { SetConsoleMode(self.handle, self.original_mode) };
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod console_input_mode {
+    pub(super) struct ConsoleInputModeGuard;
+
+    impl ConsoleInputModeGuard {
+        pub(super) fn disable_quick_edit_and_insert() -> Option<Self> {
+            None
+        }
     }
 }

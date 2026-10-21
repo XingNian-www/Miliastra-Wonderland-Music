@@ -1,6 +1,6 @@
 use image::{DynamicImage, GenericImageView};
 
-use crate::ui::geometry::{Point, Rect};
+use crate::geometry::{Point, Rect};
 
 const MIN_RED_PIXELS_PER_ROW: usize = 2;
 const REFERENCE_WIDTH: u32 = 1920;

@@ -240,22 +240,9 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> String {
-        // features 层只声明模板；覆盖文案在组装层查，业务模块不依赖配置中心。
-        // 这里必须与 reply_template 共用同一条路径：队列分批消息只调 render_reply，
-        // 若覆盖只写在 reply_template 里，这些消息就会绕过用户配置。
-        let override_text = self
-            .lifecycle
-            .live_configs
-            .replies
-            .read()
-            .ok()
-            .and_then(|config| config.get(spec.key).map(str::to_string));
-        let rendered =
-            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
-        if !rendered.missing.is_empty() {
-            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
-        }
-        rendered.text
+        // 队列分批消息只调 render_reply，必须与 reply_template 共用同一条渲染路径，
+        // 否则这些消息会绕过用户配置的覆盖文案。
+        self.render_template_text(spec, vars)
     }
 
     fn reply_template(

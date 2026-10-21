@@ -15,7 +15,7 @@ use super::freshness::{
 };
 use super::RecognizedChatMessage;
 use crate::text::normalize_chat_text;
-use crate::ui::geometry::Rect;
+use crate::geometry::Rect;
 
 /// 合成行距：与真帧约 5 行窗口的量级一致。
 const ROW: i32 = 30;

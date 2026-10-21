@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapters::file_store::write_atomic;
 
+use crate::config::ai::AiConfig;
+use crate::features::ai_chat::AiChatConfig;
 use crate::features::card_games::LandlordConfig;
 use crate::features::custom_workflow::{CustomWorkflowConfig, WorkflowTimingConfig};
 use crate::features::identity::IdentityConfig;
@@ -14,7 +16,6 @@ use crate::features::idiom_chain::IdiomChainConfig;
 use crate::features::invite::{InviteConfig, InviteTimingConfig};
 use crate::features::moderation::{ModerationConfig, ModerationTimingConfig};
 use crate::features::playback::{MatchConfig, PlaybackTimingConfig, QueueConfig, SongDedupConfig};
-use crate::config::ai::AiConfig;
 use crate::features::song_request::{SongAiConfig, SongReviewConfig};
 use crate::features::startup::{StartupConfig, StartupTemplateConfig};
 use crate::features::turtle_soup::TurtleSoupConfig;
@@ -78,6 +79,9 @@ pub struct AppConfig {
     /// 点歌 AI 的提示词与模型覆盖；内嵌段可省略。
     #[serde(default)]
     pub song_ai: SongAiConfig,
+    /// AI 聊天与轻量记忆；内嵌段可省略。
+    #[serde(default)]
+    pub ai_chat: AiChatConfig,
     /// 歌曲审核；内嵌段可省略。
     #[serde(default)]
     pub song_review: SongReviewConfig,
@@ -263,6 +267,7 @@ impl Default for AppConfig {
             turtle_soup: TurtleSoupConfig::default(),
             ai: AiConfig::default(),
             song_ai: SongAiConfig::default(),
+            ai_chat: AiChatConfig::default(),
             song_review: SongReviewConfig::default(),
             matching: MatchConfig::default(),
             hotkeys: HotkeyConfig::default(),
@@ -540,6 +545,7 @@ impl AppConfig {
         self.startup.validate()?;
         self.ai.validate()?;
         self.song_ai.validate()?;
+        self.ai_chat.validate()?;
         self.song_review.validate()?;
         self.turtle_soup.validate()?;
         self.identity.validate()?;
@@ -2149,7 +2155,6 @@ overrides:
         assert_eq!(config.replies.get("help.song_request.1"), None);
     }
 
-
     fn playback_timing(yaml: &str) -> PlaybackTimingConfig {
         serde_norway::from_str(yaml).expect("valid playback timing config")
     }
@@ -2411,6 +2416,8 @@ stale_timeout_ms: 7500
         fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(windows)]
+    #[cfg(windows)]
     #[test]
     fn runtime_paths_resolve_against_the_executable_root_and_preserve_absolute_paths() {
         let root = Path::new(r"C:\发布目录");

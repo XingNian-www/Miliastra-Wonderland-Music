@@ -141,7 +141,7 @@ impl ApplicationRuntime {
                         // 变化判据用 v5.9.4 的「均值差 / 变化比例」而不是精确像素哈希：
                         // 聊天区透出 3D 场景、粒子、半透明底纹的轻微抖动会被阈值吸收；
                         // 真实消息（文字出现）差异远大于阈值，仍能及时触发。
-                        let fingerprint = crate::ui::change_detection::rect_chat_change_fingerprint(
+                        let fingerprint = crate::change_detection::rect_chat_change_fingerprint(
                             &frame.image,
                             config.screen.chat_rect.into(),
                         )?;
@@ -269,7 +269,6 @@ fn finish_observer_stage(started: &mut Option<Instant>) -> Duration {
     *previous = now;
     elapsed
 }
-
 
 fn capture_satisfies_refresh(captured_at: Instant, refresh: Option<Instant>) -> bool {
     refresh.is_none_or(|requested_at| captured_at >= requested_at)

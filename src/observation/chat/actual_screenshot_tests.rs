@@ -11,7 +11,7 @@ use crate::runtime::ocr::{
 };
 use crate::runtime::ui::{CaptureFrame, UiDevice, UiRuntime, UiStateKind, UiStateObservation};
 use crate::ui::frame::{Canvas, Frame, from_captured_frame};
-use crate::ui::geometry::{Rect, crop_canvas};
+use crate::geometry::{Rect, crop_canvas};
 use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 use anyhow::{Context, Result, anyhow, ensure};
 use image::DynamicImage;

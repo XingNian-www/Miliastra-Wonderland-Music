@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 
-use crate::ui::geometry::Rect;
+use crate::geometry::Rect;
 
 #[derive(Clone, Debug)]
 pub(crate) enum WebToolRequest {

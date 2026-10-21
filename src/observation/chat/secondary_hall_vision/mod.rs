@@ -5,7 +5,7 @@ use image::DynamicImage;
 
 use self::detection::{DetectionConfig, Rect as VisionRect, detect_bubbles};
 use self::sender_label::{SenderLabelConfig, segment_sender_labels};
-use crate::ui::geometry::Rect;
+use crate::geometry::Rect;
 
 pub(super) struct ConfirmedSecondaryHallBubble {
     pub(super) rect: Rect,

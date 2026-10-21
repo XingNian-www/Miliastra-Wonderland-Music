@@ -538,7 +538,7 @@ mod tests {
             sender: None,
             raw_sender: None,
             message_type: color.into(),
-            block: crate::ui::geometry::Rect::new(0, y, 100, 10),
+            block: crate::geometry::Rect::new(0, y, 100, 10),
         }
     }
 

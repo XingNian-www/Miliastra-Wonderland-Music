@@ -87,7 +87,7 @@ fn message_key(message: &ChatMessage) -> DecisionMessageKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::geometry::Rect;
+    use crate::geometry::Rect;
 
     fn message(message_type: &str, y: i32, text: &str) -> ChatMessage {
         ChatMessage {

@@ -1,8 +1,8 @@
 use crate::features::administration::AdministrationCommand;
 use crate::features::card_games::LandlordCommand;
 use crate::features::command::{
-    CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch, ModuleCommand,
-    RoutedCommand,
+    ChatCommandModule, CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
+    ModuleCommand, RoutedCommand,
 };
 use crate::features::custom_workflow::CustomWorkflowService;
 use crate::features::entertainment::EntertainmentKind;
@@ -19,24 +19,137 @@ use crate::features::song_request::SongCommand;
 use crate::features::turtle_soup::TurtleSoupCommand;
 use crate::features::undercover::UndercoverCommand;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChatCommandModule {
-    SongRequest,
-    Playback,
-    Hall,
-    Administration,
-    IdiomChain,
-    CardGame,
-    TurtleSoup,
-    Tarot,
-    Playlist,
-    Undercover,
-    Invite,
-    Moderation,
-    CustomWorkflow,
+/// 一条聊天命令 handler。
+///
+/// 这是路由的唯一事实来源：认领谓词与参数解析器绑在同一条目上，
+/// 因此不会出现"这张表认领了、那张表没登记"或"认领用的是 A、解析用的是 B"的漂移。
+///
+/// 各模块的 claims_* 谓词内部已自带前缀与来源门控（大厅/好友），
+/// 所以大厅与好友共用同一张 @ 表，不需要按来源各写一份。
+#[derive(Clone, Copy)]
+pub(crate) struct ChatHandler {
+    pub(crate) module: ChatCommandModule,
+    pub(crate) claims: fn(&CommandEnvelope) -> bool,
+    pub(crate) parse: fn(&CommandEnvelope) -> Option<FeatureCommandMatch<ModuleCommand>>,
 }
 
-type ModuleClaim = (ChatCommandModule, fn(&CommandEnvelope) -> bool);
+const fn handler(
+    module: ChatCommandModule,
+    claims: fn(&CommandEnvelope) -> bool,
+    parse: fn(&CommandEnvelope) -> Option<FeatureCommandMatch<ModuleCommand>>,
+) -> ChatHandler {
+    ChatHandler {
+        module,
+        claims,
+        parse,
+    }
+}
+
+/// 静态 `@` 命令表（顺序即优先级）。
+pub(crate) const AT_HANDLERS: &[ChatHandler] = &[
+    handler(
+        ChatCommandModule::Administration,
+        AdministrationCommand::claims_chat,
+        |envelope| {
+            AdministrationCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Administration))
+        },
+    ),
+    handler(
+        ChatCommandModule::SongRequest,
+        SongCommand::claims_chat,
+        |envelope| {
+            SongCommand::parse_chat(envelope).map(|matched| matched.map(ModuleCommand::SongRequest))
+        },
+    ),
+    handler(
+        ChatCommandModule::Playback,
+        PlaybackCommand::claims_chat,
+        |envelope| {
+            PlaybackCommand::parse_chat(envelope).map(|matched| matched.map(ModuleCommand::Playback))
+        },
+    ),
+    handler(
+        ChatCommandModule::Hall,
+        HallCommand::claims_chat,
+        |envelope| HallCommand::parse_chat(envelope).map(|matched| matched.map(ModuleCommand::Hall)),
+    ),
+    handler(
+        ChatCommandModule::Invite,
+        InviteCommand::claims_chat,
+        |envelope| {
+            InviteCommand::parse_chat(envelope).map(|matched| matched.map(ModuleCommand::Invite))
+        },
+    ),
+    handler(
+        ChatCommandModule::Moderation,
+        ModerationCommand::claims_chat,
+        |envelope| {
+            ModerationCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Moderation))
+        },
+    ),
+    handler(
+        ChatCommandModule::Playlist,
+        crate::features::playlist::PlaylistCommand::claims_chat,
+        |envelope| {
+            crate::features::playlist::PlaylistCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Playlist))
+        },
+    ),
+    handler(
+        ChatCommandModule::AiChat,
+        crate::features::ai_chat::AiChatCommand::claims_chat,
+        |envelope| {
+            crate::features::ai_chat::AiChatCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::AiChat))
+        },
+    ),
+];
+
+/// `#` 开局命令表：与当前玩法无关，任何时刻都能发起。
+pub(crate) const HASH_START_HANDLERS: &[ChatHandler] = &[
+    handler(
+        ChatCommandModule::Tarot,
+        crate::features::tarot::TarotCommand::claims_chat,
+        |envelope| {
+            crate::features::tarot::TarotCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Tarot))
+        },
+    ),
+    handler(
+        ChatCommandModule::IdiomChain,
+        IdiomChainCommand::claims_start_chat,
+        |envelope| route_idiom(envelope).map(|matched| matched.map(ModuleCommand::IdiomChain)),
+    ),
+    handler(
+        ChatCommandModule::CardGame,
+        LandlordCommand::claims_start_chat,
+        |envelope| route_card_game(envelope).map(|matched| matched.map(ModuleCommand::CardGame)),
+    ),
+    handler(
+        ChatCommandModule::TurtleSoup,
+        TurtleSoupCommand::claims_start_chat,
+        |envelope| {
+            route_turtle_soup(envelope).map(|matched| matched.map(ModuleCommand::TurtleSoup))
+        },
+    ),
+    handler(
+        ChatCommandModule::Undercover,
+        UndercoverCommand::claims_start_chat,
+        |envelope| {
+            route_undercover(envelope).map(|matched| matched.map(ModuleCommand::Undercover))
+        },
+    ),
+    handler(
+        ChatCommandModule::Administration,
+        AdministrationCommand::claims_chat,
+        |envelope| {
+            AdministrationCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Administration))
+        },
+    ),
+];
 
 /// 聊天命令信封的静态模块路由器。
 ///
@@ -70,19 +183,6 @@ impl<'a> ChatCommandRouter<'a> {
         Self {
             custom_workflow: None,
             identity: None,
-        }
-    }
-
-    pub(crate) fn select_module(
-        &self,
-        envelope: &CommandEnvelope,
-        active_entertainment: Option<EntertainmentKind>,
-    ) -> Option<ChatCommandModule> {
-        match envelope.prefix() {
-            CommandPrefix::At => self.select_at_module(envelope),
-            CommandPrefix::Hash => self.select_hash_module(envelope, active_entertainment),
-            // 测试专用前缀：不认领任何模块，永不执行。
-            CommandPrefix::Amp => None,
         }
     }
 
@@ -189,155 +289,80 @@ impl<'a> ChatCommandRouter<'a> {
         None
     }
 
+    /// 静态表与自定义流程共用的一次派发。
+    ///
+    /// 保留的决策语法（@确认/@1…）由独占窗口消费，**必须在整个派发之前**排除；
+    /// 只把它挡在静态表外面会让自定义流程认领它——那是曾经修过的缺陷。
     fn route_match(
         &self,
         envelope: &CommandEnvelope,
         active_entertainment: Option<EntertainmentKind>,
     ) -> Option<FeatureCommandMatch<ModuleCommand>> {
-        let module = self.select_module(envelope, active_entertainment)?;
-        match module {
-            ChatCommandModule::SongRequest => SongCommand::parse_chat(envelope)
-                .map(|matched| matched.map(ModuleCommand::SongRequest)),
-            ChatCommandModule::Playback => PlaybackCommand::parse_chat(envelope)
-                .map(|matched| matched.map(ModuleCommand::Playback)),
-            ChatCommandModule::Hall => {
-                HallCommand::parse_chat(envelope).map(|matched| matched.map(ModuleCommand::Hall))
-            }
-            ChatCommandModule::Administration => AdministrationCommand::parse_chat(envelope)
-                .map(|matched| matched.map(ModuleCommand::Administration)),
-            ChatCommandModule::IdiomChain => {
-                route_idiom(envelope).map(|matched| matched.map(ModuleCommand::IdiomChain))
-            }
-            ChatCommandModule::CardGame => {
-                route_card_game(envelope).map(|matched| matched.map(ModuleCommand::CardGame))
-            }
-            ChatCommandModule::TurtleSoup => {
-                route_turtle_soup(envelope).map(|matched| matched.map(ModuleCommand::TurtleSoup))
-            }
-            ChatCommandModule::Tarot => crate::features::tarot::TarotCommand::parse_chat(envelope)
-                .map(|matched| matched.map(ModuleCommand::Tarot)),
-            ChatCommandModule::Playlist => {
-                crate::features::playlist::PlaylistCommand::parse_chat(envelope)
-                    .map(|matched| matched.map(ModuleCommand::Playlist))
-            }
-            ChatCommandModule::Undercover => {
-                route_undercover(envelope).map(|matched| matched.map(ModuleCommand::Undercover))
-            }
-            ChatCommandModule::Invite => InviteCommand::parse_chat(envelope)
-                .map(|matched| matched.map(ModuleCommand::Invite)),
-            ChatCommandModule::Moderation => ModerationCommand::parse_chat(envelope)
-                .map(|matched| matched.map(ModuleCommand::Moderation)),
-            ChatCommandModule::CustomWorkflow => self
-                .custom_workflow?
-                .parse_chat(envelope)
-                .map(|matched| matched.map(ModuleCommand::CustomWorkflow)),
-        }
-    }
-
-    fn select_at_module(&self, envelope: &CommandEnvelope) -> Option<ChatCommandModule> {
-        // Decision replies belong to active readers, not ordinary/custom routing.
         if is_reserved_decision_command(envelope) {
             return None;
         }
-        let candidates: &[ModuleClaim] = match envelope.authority() {
-            CommandAuthority::HallMember => &[
-                (ChatCommandModule::SongRequest, SongCommand::claims_chat),
-                (ChatCommandModule::Playback, PlaybackCommand::claims_chat),
-                (ChatCommandModule::Hall, HallCommand::claims_chat),
-                (
-                    ChatCommandModule::Administration,
-                    AdministrationCommand::claims_chat,
-                ),
-            ],
-            CommandAuthority::Friend => &[
-                (
-                    ChatCommandModule::Administration,
-                    AdministrationCommand::claims_chat,
-                ),
-                (ChatCommandModule::SongRequest, SongCommand::claims_chat),
-                (ChatCommandModule::Playback, PlaybackCommand::claims_chat),
-                (ChatCommandModule::Invite, InviteCommand::claims_chat),
-                (
-                    ChatCommandModule::Moderation,
-                    ModerationCommand::claims_chat,
-                ),
-                (ChatCommandModule::Hall, HallCommand::claims_chat),
-                (
-                    ChatCommandModule::Playlist,
-                    crate::features::playlist::PlaylistCommand::claims_chat,
-                ),
-            ],
-        };
-        candidates
-            .iter()
-            .find_map(|(module, claims)| claims(envelope).then_some(*module))
-            .or_else(|| {
-                self.custom_workflow
-                    .is_some_and(|service| service.claims_chat(envelope))
-                    .then_some(ChatCommandModule::CustomWorkflow)
-            })
+        if let Some(handler) = self.static_handler(envelope, active_entertainment) {
+            return (handler.parse)(envelope);
+        }
+        // 自定义流程由配置定义，运行期才知道，因此不在静态表里。
+        self.custom_workflow
+            .and_then(|service| service.parse_chat(envelope))
+            .map(|matched| matched.map(ModuleCommand::CustomWorkflow))
     }
 
-    fn select_hash_module(
+    /// 该信封会被哪个模块认领。仅用于诊断与测试。
+    pub(crate) fn select_module(
         &self,
         envelope: &CommandEnvelope,
         active_entertainment: Option<EntertainmentKind>,
     ) -> Option<ChatCommandModule> {
-        // 塔罗是一次性回复，不占用或切换其他娱乐会话。
-        if crate::features::tarot::TarotCommand::claims_chat(envelope) {
-            return Some(ChatCommandModule::Tarot);
+        if is_reserved_decision_command(envelope) {
+            return None;
         }
-        if envelope.authority() == CommandAuthority::HallMember {
-            for (module, claims) in [
-                (
-                    ChatCommandModule::IdiomChain,
-                    IdiomChainCommand::claims_start_chat as fn(&CommandEnvelope) -> bool,
-                ),
-                (
-                    ChatCommandModule::CardGame,
-                    LandlordCommand::claims_start_chat,
-                ),
-                (
-                    ChatCommandModule::TurtleSoup,
-                    TurtleSoupCommand::claims_start_chat,
-                ),
-                (
-                    ChatCommandModule::Undercover,
-                    UndercoverCommand::claims_start_chat,
-                ),
-                (
-                    ChatCommandModule::Administration,
-                    AdministrationCommand::claims_chat,
-                ),
-            ] {
-                if claims(envelope) {
-                    return Some(module);
-                }
-            }
+        if let Some(handler) = self.static_handler(envelope, active_entertainment) {
+            return Some(handler.module);
         }
-        match active_entertainment {
-            Some(EntertainmentKind::IdiomChain)
-                if IdiomChainCommand::claims_active_chat(envelope) =>
-            {
-                Some(ChatCommandModule::IdiomChain)
-            }
-            Some(EntertainmentKind::Landlord | EntertainmentKind::RunFast)
-                if LandlordCommand::claims_active_chat(envelope) =>
-            {
-                Some(ChatCommandModule::CardGame)
-            }
-            Some(EntertainmentKind::TurtleSoup)
-                if TurtleSoupCommand::claims_active_chat(envelope) =>
-            {
-                Some(ChatCommandModule::TurtleSoup)
-            }
-            Some(EntertainmentKind::Undercover)
-                if UndercoverCommand::claims_active_chat(envelope) =>
-            {
-                Some(ChatCommandModule::Undercover)
-            }
-            _ => None,
+        self.custom_workflow
+            .is_some_and(|service| service.claims_chat(envelope))
+            .then_some(ChatCommandModule::CustomWorkflow)
+    }
+
+    /// 按优先级走查静态 handler 表。
+    ///
+    /// 决策语法的排除在 route_match 里统一完成，这里不再重复判断。
+    fn static_handler(
+        &self,
+        envelope: &CommandEnvelope,
+        active_entertainment: Option<EntertainmentKind>,
+    ) -> Option<ChatHandler> {
+        match envelope.prefix() {
+            CommandPrefix::At => AT_HANDLERS
+                .iter()
+                .find(|entry| (entry.claims)(envelope))
+                .copied(),
+            CommandPrefix::Hash => HASH_START_HANDLERS
+                .iter()
+                .find(|entry| (entry.claims)(envelope))
+                .copied()
+                .or_else(|| self.session_handler(envelope, active_entertainment)),
+            // 测试专用前缀：永不认领。
+            CommandPrefix::Amp => None,
         }
+    }
+
+    /// hash 进行中命令：按当前玩法查 command_catalog::SESSION_DISPATCH。
+    ///
+    /// 这张表本来只为面板而存在；现在路由也读它，因此"玩法状态 → 模块"的映射
+    /// 只有一份，不会出现表里登记了、路由里却走另一条分支。
+    fn session_handler(
+        &self,
+        envelope: &CommandEnvelope,
+        active_entertainment: Option<EntertainmentKind>,
+    ) -> Option<ChatHandler> {
+        crate::features::command_catalog::session_rules(active_entertainment)
+            .iter()
+            .find(|rule| (rule.claims)(envelope))
+            .map(|rule| handler(rule.module, rule.claims, rule.parse))
     }
 }
 
@@ -568,24 +593,26 @@ fn role_for(identity: Option<&IdentityAccess>, username: &str) -> Option<Identit
     identity.and_then(|identity| identity.role_of(username))
 }
 
+// 开局表的解析器只解析开局语法。
+//
+// 这些函数原先写成 `parse_start_chat(..).or_else(|| parse_active_chat(..))`，
+// 但它们的认领谓词是 `claims_start_chat`，与 `parse_start` 共用同一份字面量判定，
+// 所以 `parse_start_chat` 认领成功后必然返回 Some——`or_else` 是不可达的死分支。
+// 会话态（进行中）命令走 `command_catalog::SESSION_DISPATCH`，不经过这里。
 fn route_idiom(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<IdiomChainCommand>> {
     IdiomChainCommand::parse_start_chat(envelope)
-        .or_else(|| IdiomChainCommand::parse_active_chat(envelope))
 }
 
 fn route_card_game(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<LandlordCommand>> {
     LandlordCommand::parse_start_chat(envelope)
-        .or_else(|| LandlordCommand::parse_active_chat(envelope))
 }
 
 fn route_turtle_soup(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<TurtleSoupCommand>> {
     TurtleSoupCommand::parse_start_chat(envelope)
-        .or_else(|| TurtleSoupCommand::parse_active_chat(envelope))
 }
 
 fn route_undercover(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<UndercoverCommand>> {
     UndercoverCommand::parse_start_chat(envelope)
-        .or_else(|| UndercoverCommand::parse_active_chat(envelope))
 }
 
 /// OCR 容错：去掉命令文本首尾的噪声标点后重试路由。
@@ -1076,5 +1103,62 @@ mod tests {
             ChatCommandRouter::unclaimed_command_reason(&envelope("blue", "@不存在xyz"), None),
             "信封可解析但没有模块认领"
         );
+    }
+
+    /// @忘记我 的 claims_chat 只接受大厅来源，因此必须登记在 @ 表里。
+    /// 曾经只登记在好友分支，导致该命令在任何来源下都不可达。
+    #[test]
+    fn forget_me_reaches_the_ai_chat_module_from_a_hall_message() {
+        let router = ChatCommandRouter::without_custom_workflow();
+        let routed = router
+            .route(&envelope("blue", "@忘记我"), None)
+            .expect("@忘记我 应被认领");
+        assert!(matches!(
+            routed.command,
+            ModuleCommand::AiChat(crate::features::ai_chat::AiChatCommand::Forget)
+        ));
+        // 好友来源仍不认领：claims_chat 明确只支持大厅。
+        assert!(router.route(&envelope("pink", "@忘记我"), None).is_none());
+    }
+
+    /// 每条登记的命令都必须能被 @ 表认领到——表是唯一事实来源后，
+    /// 漏登记不会再表现成"游戏里静默不认"，而是在这里直接失败。
+    #[test]
+    fn every_at_handler_is_reachable_and_distinct() {
+        let mut modules = std::collections::BTreeSet::new();
+        for entry in AT_HANDLERS {
+            assert!(
+                modules.insert(format!("{:?}", entry.module)),
+                "同一个模块在 @ 表里重复登记：{:?}",
+                entry.module
+            );
+        }
+    }
+
+    /// 开局表的解析器不再挂 `or_else(parse_active_chat)` 兜底。
+    ///
+    /// 该准则建立在「claims_start_chat 通过 ⇒ parse_start_chat 必返回 Some」之上
+    /// （两者共用同一份字面量判定）。这个测试就是那个前提的守卫：
+    /// 一旦某个模块的 claims 与 parse 不再同源，这里会先失败，
+    /// 而不是让开局命令在游戏里静默解析不出来。
+    #[test]
+    fn hash_start_claims_always_parse_successfully() {
+        let router = ChatCommandRouter::without_custom_workflow();
+        let starts = [
+            ("#接龙画蛇添足", "成语接龙"),
+            ("#同音接龙画蛇添足", "同音接龙"),
+            ("#斗地主", "斗地主"),
+            ("#跑得快", "跑得快"),
+            ("#海龟汤", "海龟汤"),
+            ("#卧底", "卧底"),
+            ("#卧底双", "卧底"),
+        ];
+        for (text, label) in starts {
+            let envelope = envelope("blue", text);
+            assert!(
+                router.route(&envelope, None).is_some(),
+                "{label} 的开局命令 {text} 应被认领并解析成功"
+            );
+        }
     }
 }

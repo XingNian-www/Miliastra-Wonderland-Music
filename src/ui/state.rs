@@ -16,7 +16,7 @@ use crate::runtime::ui::{
     UiStateEvidence, UiStateKind as RuntimeUiStateKind, UiTemplateProbeEvidence,
     UiWorldProbeEvidence,
 };
-use crate::ui::geometry::{Point, Rect, crop_canvas};
+use crate::geometry::{Point, Rect, crop_canvas};
 #[cfg(test)]
 use crate::ui::template::best_template_hit;
 use crate::ui::template::{
@@ -2175,6 +2175,7 @@ mod tests {
     /// 一个不落——第 47 节就是栽在正样本集不全上（漏了 overworld-hub.png）。
     /// 同时把提瓦特/登录/地图这些低占比帧作为负样本钉住。
     #[test]
+    #[ignore = "requires the local real screenshot corpus under technical-docs/ui-state-evidence or dist/sandbox-run"]
     fn teyvat_world_chat_is_not_the_hall() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         // 语料跨两个目录：证据目录与运行目录，两边都要找。

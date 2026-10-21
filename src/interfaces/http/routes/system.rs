@@ -131,7 +131,7 @@ pub(super) fn tool_ocr_route(
         .map_err(|error| bad_request(&format!("rect参数无效: {error}")))?;
     // 安全加固:把 rect 裁剪到期望屏幕尺寸内,防止溢出/越界输入。
     let rect = rect.map(|rect| {
-        crate::ui::geometry::clamp_rect(
+        crate::geometry::clamp_rect(
             rect,
             state.config.screen.expected_width,
             state.config.screen.expected_height,
@@ -179,7 +179,7 @@ pub(super) fn tool_template_route(
         .map_err(|error| bad_request(&format!("rect参数无效: {error}")))?;
     // 安全加固:把 rect 裁剪到期望屏幕尺寸内。
     let rect = rect.map(|rect| {
-        crate::ui::geometry::clamp_rect(
+        crate::geometry::clamp_rect(
             rect,
             config.screen.expected_width,
             config.screen.expected_height,

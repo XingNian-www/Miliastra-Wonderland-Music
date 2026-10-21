@@ -350,7 +350,7 @@ fn is_command_candidate(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::geometry::Rect;
+    use crate::geometry::Rect;
 
     fn bubble(y: i32, text: &str) -> RecognizedChatMessage {
         RecognizedChatMessage {

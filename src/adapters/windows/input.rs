@@ -227,28 +227,3 @@ impl Drop for KeyReleaseGuard<'_> {
 fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
 }
-
-pub(crate) fn parse_key(value: &str) -> Result<Key> {
-    let normalized = value.trim().to_ascii_lowercase();
-    let key = match normalized.as_str() {
-        "return" | "enter" => Key::Return,
-        "escape" | "esc" => Key::Escape,
-        "control" | "ctrl" => Key::Control,
-        "f1" => Key::F1,
-        "f2" => Key::F2,
-        "f3" => Key::F3,
-        "f4" => Key::F4,
-        "f5" => Key::F5,
-        "f6" => Key::F6,
-        "f7" => Key::F7,
-        "f8" => Key::F8,
-        "f9" => Key::F9,
-        "f10" => Key::F10,
-        "f11" => Key::F11,
-        "f12" => Key::F12,
-        "n" => Key::Unicode('n'),
-        single if single.chars().count() == 1 => Key::Unicode(single.chars().next().unwrap()),
-        _ => bail!("unsupported key: {}", value),
-    };
-    Ok(key)
-}

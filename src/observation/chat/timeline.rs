@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use super::freshness::{BaselineKind, FreshFrame, Freshness, SequenceFreshness};
 pub(crate) use super::scan::RecognizedChatMessage;
 use super::{BubbleSequence, ChatIdentity, ObservedChatMessageId, VisualSessionId};
-use crate::ui::geometry::Rect;
+use crate::geometry::Rect;
 
 const RETAINED_CAPACITY: usize = 4096;
 /// 每个聊天最多记住多少条"已认领并派发成功"的命令文本。

@@ -8,7 +8,10 @@ use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
 use serde::Serialize;
 
-use super::geometry::{Point, Rect, crop_canvas};
+use crate::geometry::{Point, Rect, crop_canvas};
+// 命中结果只含几何与分数，已移到几何叶子（runtime 也要用）。
+// 这里重导出，既有 `ui::template::TemplateHit` 调用点不必改动。
+pub(crate) use crate::geometry::TemplateHit;
 
 static RGB_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<RgbImage>>>> = OnceLock::new();
 static GRAY_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<GrayTemplate>>>> = OnceLock::new();
@@ -54,25 +57,6 @@ struct GrayTemplate {
     gray_stddev: f32,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct TemplateHit {
-    pub(crate) kind: String,
-    pub(crate) x: i32,
-    pub(crate) y: i32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) score: f32,
-}
-
-impl TemplateHit {
-    pub(crate) fn rect(&self) -> Rect {
-        Rect::new(self.x, self.y, self.width, self.height)
-    }
-
-    pub(crate) fn center(&self) -> Point {
-        self.rect().center()
-    }
-}
 
 pub(crate) fn find_template_hits(
     image: &DynamicImage,
@@ -2676,9 +2660,9 @@ fn main_sad(@builtin(global_invocation_id) gid: vec3<u32>) {
             raw.push((seed >> 24) as u8);
         }
         let haystack = RgbImage::from_raw(width, height, raw).expect("haystack");
-        let template = crate::ui::geometry::crop_canvas(
+        let template = crate::geometry::crop_canvas(
             &DynamicImage::ImageRgb8(haystack.clone()),
-            crate::ui::geometry::Rect::new(5, 4, template_width, template_height),
+            crate::geometry::Rect::new(5, 4, template_width, template_height),
         )
         .expect("crop")
         .to_rgb8();
@@ -2738,7 +2722,7 @@ fn main_sad(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let refs: Vec<&std::path::Path> = paths.iter().map(|path| path.as_path()).collect();
         // 生产调用点只在这条 60 像素宽的条带里搜索（CHAT_MARKER_SEARCH_WIDTH）。
-        let rect = crate::ui::geometry::Rect::new(0, 0, 60, frame.height());
+        let rect = crate::geometry::Rect::new(0, 0, 60, frame.height());
         const ROUNDS: usize = 20;
         let mut samples = Vec::with_capacity(ROUNDS);
         let mut hits = 0usize;

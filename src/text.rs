@@ -60,15 +60,26 @@ pub(crate) fn split_numbered_chat_message(label: &str, message: &str) -> Vec<Str
 
 fn split_numbered_with_total(label: &str, source: &str, total: usize) -> Vec<String> {
     let chars = source.chars().collect::<Vec<_>>();
+    // 空 label 表示「只按显示宽度切分、不要编号」：AI 聊天这类纯文本回复
+    // 若带上 "1/1：" 前缀，玩家会看到与内容无关的编号噪声。
+    let numbered = !label.is_empty();
     if chars.is_empty() {
-        return vec![format!("{}1/1：", label)];
+        return vec![if numbered {
+            format!("{}1/1：", label)
+        } else {
+            String::new()
+        }];
     }
 
     let mut messages = Vec::new();
     let mut offset = 0usize;
     while offset < chars.len() {
         let index = messages.len() + 1;
-        let prefix = format!("{}{}/{}：", label, index, total.max(1));
+        let prefix = if numbered {
+            format!("{}{}/{}：", label, index, total.max(1))
+        } else {
+            String::new()
+        };
         let available = MAX_CHAT_WIDTH.saturating_sub(display_width(&prefix));
         let mut chunk = String::new();
         let mut width = 0usize;
@@ -172,5 +183,30 @@ mod tests {
                 .iter()
                 .all(|message| display_width(message) <= MAX_CHAT_WIDTH)
         );
+    }
+
+    /// 空 label 表示"只按宽度切、不编号"。
+    /// AI 聊天把模型回答交给这里分片，若带上 "1/1：" 前缀，玩家会看到与内容无关的编号。
+    #[test]
+    fn empty_label_splits_without_numbering_noise() {
+        assert_eq!(
+            split_numbered_chat_message("", "今天天气不错"),
+            vec!["今天天气不错".to_string()]
+        );
+
+        let long = "很长".repeat(80);
+        let messages = split_numbered_chat_message("", &long);
+        assert!(messages.len() > 1, "超宽文本仍要分片");
+        assert!(
+            messages.iter().all(|message| !message.contains("1/")),
+            "空 label 不应出现编号前缀: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| display_width(message) <= MAX_CHAT_WIDTH)
+        );
+        // 分片后拼回原文，确认没有内容丢失。
+        assert_eq!(messages.concat(), long);
     }
 }

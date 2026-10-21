@@ -495,7 +495,10 @@ mod tests {
 
         let target = connection.resolve("").expect("chat target");
 
-        assert_eq!(target.endpoint, "https://gateway.example/v1/chat/completions");
+        assert_eq!(
+            target.endpoint,
+            "https://gateway.example/v1/chat/completions"
+        );
         assert_eq!(target.wire_api, WireApi::ChatCompletions);
     }
 
@@ -509,7 +512,10 @@ mod tests {
             "shared-model"
         );
         assert_eq!(
-            connection.resolve("review-model").expect("feature model").model,
+            connection
+                .resolve("review-model")
+                .expect("feature model")
+                .model,
             "review-model"
         );
         // 空白覆盖值等于未覆盖。
@@ -532,9 +538,11 @@ mod tests {
 
             let target = connection.resolve("").expect("official provider");
 
-            assert_eq!(target.endpoint.replace("/chat/completions", "/responses"),
+            assert_eq!(
+                target.endpoint.replace("/chat/completions", "/responses"),
                 endpoint.replace("/chat/completions", "/responses"),
-                "provider={provider}");
+                "provider={provider}"
+            );
             assert_eq!(target.model, model, "provider={provider}");
         }
     }

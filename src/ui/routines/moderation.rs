@@ -12,7 +12,7 @@ use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiStateKind, UiStateObservation, UiSubmitError, sealed,
 };
-use crate::ui::geometry::{Point, Rect};
+use crate::geometry::{Point, Rect};
 use crate::ui::template::{best_template_hit, template_exists};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

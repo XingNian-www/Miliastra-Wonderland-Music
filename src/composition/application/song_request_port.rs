@@ -16,20 +16,7 @@ impl SongRequestPort for ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> Result<()> {
-        // features 层只声明模板，覆盖文案在组装层查，因此业务模块不依赖配置中心。
-        let override_text = self
-            .lifecycle
-            .live_configs
-            .replies
-            .read()
-            .ok()
-            .and_then(|config| config.get(spec.key).map(str::to_string));
-        let rendered =
-            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
-        if !rendered.missing.is_empty() {
-            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
-        }
-        ApplicationRuntime::reply(self, &rendered.text)
+        self.reply_with_template(spec, vars)
     }
 
     fn prompt_and_wait_for_decision_batch(
@@ -64,7 +51,11 @@ impl SongRequestPort for ApplicationRuntime {
 
     fn local_recommend(&self) -> bool {
         // 本地推荐策略在 b8605a5 从 ai 段迁到了 song_ai 段（点歌专属）。
-        self.lifecycle.live_configs.snapshot().song_ai.local_recommend
+        self.lifecycle
+            .live_configs
+            .snapshot()
+            .song_ai
+            .local_recommend
     }
 
     fn local_recommend_min_score(&self) -> f64 {

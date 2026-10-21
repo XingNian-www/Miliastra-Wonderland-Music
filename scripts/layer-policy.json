@@ -1,0 +1,42 @@
+{
+  "comment": "分层方向策略：forbid 是当前应为 0 的反向边；allow_files 是既有设计边的文件白名单（新增文件不自动豁免）。",
+  "forbid": [
+    [
+      "features",
+      "interfaces"
+    ],
+    [
+      "features",
+      "debug"
+    ],
+    [
+      "observation",
+      "features"
+    ],
+    [
+      "ui",
+      "features"
+    ],
+    [
+      "runtime",
+      "interfaces"
+    ],
+    [
+      "observation",
+      "interfaces"
+    ],
+    [
+      "ui",
+      "interfaces"
+    ],
+    [
+      "adapters",
+      "interfaces"
+    ],
+    [
+      "config",
+      "interfaces"
+    ]
+  ],
+  "allow_files": []
+}

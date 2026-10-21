@@ -155,6 +155,10 @@ impl CommandEnvelope {
         }
     }
 
+    pub(crate) fn original_text(&self) -> &str {
+        &self.original_text
+    }
+
     pub(crate) fn username(&self) -> &str {
         &self.username
     }
@@ -209,6 +213,28 @@ impl<T> FeatureCommandMatch<T> {
     }
 }
 
+/// 认领该命令的业务模块。
+///
+/// 住在命令模型里（而不是路由层），是因为它描述的是"这条命令属于谁"这一领域事实；
+/// 面板也要用它做分组，而 features 层不该反向依赖 interfaces。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChatCommandModule {
+    SongRequest,
+    Playback,
+    Hall,
+    Administration,
+    IdiomChain,
+    CardGame,
+    TurtleSoup,
+    Tarot,
+    Playlist,
+    Undercover,
+    Invite,
+    Moderation,
+    CustomWorkflow,
+    AiChat,
+}
+
 /// ADR 0059 定义的顶层小型路由枚举。
 ///
 /// 每种载荷类型由对应业务模块拥有。聊天路由完成后，此枚举标识选中的模块，也允许非聊天适配器直接提交类型化模块命令。
@@ -227,6 +253,7 @@ pub(crate) enum ModuleCommand {
     Invite(InviteCommand),
     Moderation(ModerationCommand),
     CustomWorkflow(CustomWorkflowCommand),
+    AiChat(super::ai_chat::AiChatCommand),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,13 +330,20 @@ impl ModuleCommand {
             Self::Invite(command) => command.lock_key(),
             Self::Moderation(command) => command.lock_key(),
             Self::CustomWorkflow(command) => command.lock_key(),
+            // AI 聊天按人加锁：同一人重复触发被拦，不同人互不影响，
+            // 由 scopes_lock_to_actor 追加发送者身份。
+            Self::AiChat(command) => command.lock_key(),
         }
     }
 
     pub(crate) fn scopes_lock_to_actor(&self) -> bool {
         matches!(
             self,
-            Self::CardGame(_) | Self::Undercover(_) | Self::Tarot(_) | Self::Playlist(_)
+            Self::CardGame(_)
+                | Self::Undercover(_)
+                | Self::Tarot(_)
+                | Self::Playlist(_)
+                | Self::AiChat(_)
         )
     }
 
@@ -336,6 +370,7 @@ impl ModuleCommand {
             Self::Undercover(command) => !matches!(command, UndercoverCommand::Retry),
             // 这些模块目前仅对好友开放，或将触发用户作为执行契约的一部分。后续增加大厅路由时仍保持保守处理。
             Self::Invite(_) | Self::Moderation(_) | Self::CustomWorkflow(_) => true,
+            Self::AiChat(_) => true,
         }
     }
 }

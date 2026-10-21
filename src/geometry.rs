@@ -107,3 +107,27 @@ pub(crate) fn parse_rect(value: &str) -> Result<Rect> {
     ))
 }
 
+/// 一次模板匹配命中的结果。
+///
+/// 只含几何与分数，没有任何匹配算法或图像资源，因此放在几何叶子里：
+/// `runtime` 的证据 DTO 用它作字段类型，arg 若留在 `ui::template`（那里有 wgpu），
+/// 会造成 runtime 反向依赖整个模板匹配器。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct TemplateHit {
+    pub(crate) kind: String,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) score: f32,
+}
+
+impl TemplateHit {
+    pub(crate) fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, self.width, self.height)
+    }
+
+    pub(crate) fn center(&self) -> Point {
+        self.rect().center()
+    }
+}

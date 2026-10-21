@@ -1,4 +1,6 @@
 pub(crate) mod file_store;
+pub(crate) mod game_path;
+pub(crate) mod input;
 pub(crate) mod logging;
 pub(crate) mod login_helper;
 pub(crate) mod native_playback;

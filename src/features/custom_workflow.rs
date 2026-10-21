@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{PointConfig, RectConfig};
 use crate::features::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
-pub use crate::interfaces::ui_plan::{
+pub use crate::ui::plan::{
     WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
     WorkflowResidency,
 };

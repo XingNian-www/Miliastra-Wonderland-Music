@@ -1622,7 +1622,10 @@ fn ai_section() -> Vec<ConfigFieldSchema> {
             "线上协议",
             FieldKind::Enum(vec![
                 ("responses".to_string(), "Responses（推荐）".to_string()),
-                ("chat_completions".to_string(), "Chat Completions".to_string()),
+                (
+                    "chat_completions".to_string(),
+                    "Chat Completions".to_string(),
+                ),
             ]),
             "默认走 Responses。仅当网关（Kimi、GLM、部分自建网关）只支持 Chat Completions 时切换",
         ),
@@ -2363,6 +2366,93 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             order: 31,
             fields: with_section_prefix("replies", replies_section()),
         },
+        ConfigSectionSchema {
+            name: "ai_chat".to_string(),
+            label: "AI 聊天".to_string(),
+            order: 32,
+            fields: with_section_prefix("ai_chat", ai_chat_section()),
+        },
+    ]
+}
+
+/// ai_chat 段：AI 聊天与轻量记忆。
+fn ai_chat_section() -> Vec<ConfigFieldSchema> {
+    vec![
+        ConfigFieldSchema::db_idle_reload(
+            "enabled",
+            "启用 AI 聊天",
+            FieldKind::Bool,
+            "关键词触发的大厅聊天机器人；未配置 ai.api_key 时不会回复",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "keyword",
+            "触发关键词",
+            FieldKind::String,
+            "消息包含该关键词时触发；默认 橘子",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "trigger_mode",
+            "触发方式",
+            FieldKind::Enum(vec![
+                ("prefix".to_string(), "以关键词开头".to_string()),
+                ("contains".to_string(), "包含关键词".to_string()),
+            ]),
+            "默认只在消息以关键词开头时触发",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "actor_token_budget",
+            "单人记忆预算",
+            int(1_000, 200_000),
+            "每个玩家的事实与对话合计 token 上限；超出淘汰最旧内容",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "bot_token_budget",
+            "机器人记忆预算",
+            int(1_000, 400_000),
+            "机器人自身发言的全局 token 上限",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "cooldown_seconds",
+            "冷却秒数",
+            int(0, 86_400),
+            "同一玩家两次触发之间的最小间隔",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "allow_commands",
+            "允许执行命令",
+            FieldKind::Bool,
+            "允许 AI 在回答中带命令；程序按提问者本人权限复核后执行",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "model",
+            "专用模型",
+            FieldKind::String,
+            "留空沿用 ai.model",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "max_tokens",
+            "最大 Token",
+            int(1, 100_000),
+            "单次回答允许生成的最大 token",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "system_prompt",
+            "系统提示词",
+            FieldKind::Text,
+            "留空使用内置默认值",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "answer_prompt",
+            "回答模板",
+            FieldKind::Text,
+            "可使用 {{keyword}}、{{question}}、{{facts}}、{{history}}、{{bot_history}}、{{commands}}",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "extract_prompt",
+            "事实抽取提示词",
+            FieldKind::Text,
+            "留空使用内置默认值；从每轮对话中抽取值得长期记住的信息",
+        ),
     ]
 }
 

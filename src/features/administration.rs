@@ -35,6 +35,23 @@ pub(crate) trait AdministrationImmediatePort {
 pub(crate) trait AdministrationApplicationPort: AdministrationImmediatePort {
     fn send_hall(&mut self, message: &str) -> Result<()>;
     fn send_hall_batch(&mut self, messages: &[&str], delay_ms: u64) -> Result<()>;
+
+    /// 按模板渲染（不发送）。
+    ///
+    /// 帮助文案必须走这里而不是直接 render，否则 replies.overrides 不生效：
+    /// 覆盖文案只有组装层能查到，features 层不知道配置存在。
+    /// 默认实现只渲染内置文案，保证不接配置的测试替身也能工作。
+    ///
+    /// 命名说明：叫 render_template 而不是 render_reply，是为了避开
+    /// ApplicationRuntime 上已有的固有方法 render_reply(key, default, vars)
+    /// ——同名不同签名在两个 trait 同时可见时会产生方法解析歧义。
+    fn render_template(
+        &mut self,
+        spec: &reply_template::ReplyTemplate,
+        vars: &ReplyVars,
+    ) -> String {
+        reply_template::render(spec, None, vars).text
+    }
 }
 
 /// 管理命令：帮助、开关命令识别、闲置退出、通告和运行状态控制。
@@ -63,13 +80,15 @@ impl AdministrationApplication {
         match command {
             AdministrationCommand::Help => {
                 port.log_executed(context, "help")?;
-                let lines = help_lines(&reply_template::HELP_SONG_REQUEST, &ReplyVars::new());
+                let lines =
+                    help_lines(port, &reply_template::HELP_SONG_REQUEST, &ReplyVars::new());
                 let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
                 port.send_hall_batch(&borrowed, self.help_batch_ms)
             }
             AdministrationCommand::EntertainmentHelp => {
                 port.log_executed(context, "entertainment help")?;
-                let lines = help_lines(&reply_template::HELP_ENTERTAINMENT, &ReplyVars::new());
+                let lines =
+                    help_lines(port, &reply_template::HELP_ENTERTAINMENT, &ReplyVars::new());
                 let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
                 port.send_hall_batch(&borrowed, self.help_batch_ms)
             }
@@ -150,10 +169,14 @@ impl AdministrationApplication {
 ///
 /// 目前帮助行没有业务变量，占位符解析仍走同一条路径，
 /// 这样后续给帮助加变量（如版本号、当前音源）时不需要再改这里。
-fn help_lines(specs: &[reply_template::ReplyTemplate], vars: &ReplyVars) -> Vec<String> {
+fn help_lines<P: AdministrationApplicationPort + ?Sized>(
+    port: &mut P,
+    specs: &[reply_template::ReplyTemplate],
+    vars: &ReplyVars,
+) -> Vec<String> {
     specs
         .iter()
-        .map(|spec| reply_template::render(spec, None, vars).text)
+        .map(|spec| port.render_template(spec, vars))
         .collect()
 }
 
@@ -514,5 +537,82 @@ mod tests {
         assert_eq!(port.batches[0].len(), 3);
         assert!(port.batches[0].iter().all(|line| line.contains("点歌")));
         assert!(port.batches[0].iter().all(|line| !line.contains("斗地主")));
+    }
+
+    /// 帮助文案必须经过 port.render_template，否则 replies.overrides 不生效。
+    ///
+    /// 这是回归测试：修复前 help_lines 直接调 render(spec, None, ..)，
+    /// 导致 12 个 help.* key 登记在册、面板可见，但改了完全不生效。
+    #[test]
+    fn help_lines_go_through_the_port_so_overrides_can_reach_the_player() {
+        #[derive(Default)]
+        struct OverridingPort {
+            batches: Vec<Vec<String>>,
+            rendered_keys: Vec<String>,
+        }
+
+        impl AdministrationImmediatePort for OverridingPort {
+            fn set_commands_enabled(&mut self, _enabled: bool) -> Result<()> {
+                Ok(())
+            }
+            fn enqueue_hall_reply(&mut self, _message: &str) -> Result<()> {
+                Ok(())
+            }
+            fn configure_idle_exit(&mut self, _minutes: u32) -> Result<()> {
+                Ok(())
+            }
+            fn record_command_activity(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn log_executed(&mut self, _c: &AdministrationCommandContext, _f: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        impl AdministrationApplicationPort for OverridingPort {
+            fn send_hall(&mut self, _message: &str) -> Result<()> {
+                Ok(())
+            }
+            fn send_hall_batch(&mut self, messages: &[&str], _delay_ms: u64) -> Result<()> {
+                self.batches
+                    .push(messages.iter().map(|m| (*m).to_string()).collect());
+                Ok(())
+            }
+            /// 模拟组装层：为每条模板返回一条"覆盖文案"，
+            /// 并记录被请求的 key，用来证明 features 层确实按 key 走了 port。
+            fn render_template(
+                &mut self,
+                spec: &reply_template::ReplyTemplate,
+                _vars: &ReplyVars,
+            ) -> String {
+                self.rendered_keys.push(spec.key.to_string());
+                format!("覆盖:{}", spec.key)
+            }
+        }
+
+        let mut port = OverridingPort::default();
+        let context = AdministrationCommandContext {
+            message_type: "blue".to_string(),
+            username: "测试".to_string(),
+            user_command: "@帮助".to_string(),
+        };
+        AdministrationApplication::new(150)
+            .execute(&context, &AdministrationCommand::Help, &mut port)
+            .expect("help command");
+
+        // 每条帮助行都必须来自 port 渲染，而不是内置字面量。
+        assert_eq!(port.rendered_keys.len(), 3, "3 条帮助都应经 port 渲染");
+        assert!(
+            port.rendered_keys
+                .iter()
+                .all(|key| key.starts_with("help.song_request.")),
+            "应逐条按 help.* 键渲染，实际: {:?}",
+            port.rendered_keys
+        );
+        assert!(
+            port.batches[0].iter().all(|line| line.starts_with("覆盖:")),
+            "玩家应收到覆盖文案，而不是内置默认: {:?}",
+            port.batches[0]
+        );
     }
 }

@@ -717,6 +717,28 @@ impl AdministrationApplicationPort for ApplicationRuntime {
     fn send_hall_batch(&mut self, messages: &[&str], delay_ms: u64) -> Result<()> {
         self.reply_batch(messages, delay_ms)
     }
+
+    fn render_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> String {
+        // 帮助文案此前直接 render(spec, None, ..)，导致这 12 个 help.* key
+        // 登记了却改不动：覆盖文案只有组装层查得到，渲染也必须走组装层。
+        let override_text = self
+            .lifecycle
+            .live_configs
+            .replies
+            .read()
+            .ok()
+            .and_then(|config| config.get(spec.key).map(str::to_string));
+        let rendered =
+            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
+        if !rendered.missing.is_empty() {
+            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
+        }
+        rendered.text
+    }
 }
 
 impl HallDetectionPort for ApplicationRuntime {

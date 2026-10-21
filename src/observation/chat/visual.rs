@@ -5,8 +5,8 @@ use anyhow::Result;
 use image::{DynamicImage, GenericImageView};
 
 use super::secondary_hall_vision::confirmed_secondary_hall_bubbles;
-use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
-use crate::ui::geometry::Rect;
+use crate::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
+use crate::geometry::Rect;
 
 // 仅供旧 OCR 测试和通用标题裁剪工具使用，不参与二级身份判断。
 #[cfg(test)]

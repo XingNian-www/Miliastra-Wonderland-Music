@@ -15,7 +15,7 @@ use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
 };
-use crate::ui::geometry::Rect;
+use crate::geometry::Rect;
 use crate::ui::template::best_template_hit;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -542,7 +542,7 @@ mod tests {
     use crate::observation::chat::SECONDARY_TITLE_RECT;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
-    use crate::ui::geometry::Rect;
+    use crate::geometry::Rect;
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

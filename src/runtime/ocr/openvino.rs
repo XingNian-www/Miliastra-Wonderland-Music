@@ -15,7 +15,7 @@ use openvino::{
 };
 
 use super::{OcrLine, ResolvedOcrArgs, compare_rect_top_left, normalize_ocr_text};
-use crate::ui::geometry::Rect;
+use crate::geometry::Rect;
 
 #[cfg(test)]
 #[path = "openvino_perf_tests.rs"]

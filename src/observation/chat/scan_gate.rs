@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::ui::change_detection::{ChangeFingerprint, change_stats};
+use crate::change_detection::{ChangeFingerprint, change_stats};
 
 /// 均值差或变化比例任一超阈值 ⇒ 聊天区变了（v5.9.4 口径）。
 pub(crate) fn fingerprint_changed(

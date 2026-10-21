@@ -1975,6 +1975,12 @@ impl ApplicationRuntime {
                 .as_ref()
                 .and_then(|envelope| command_router.route(envelope, active_entertainment));
 
+            // 关键词 AI 聊天：不是 @ 命令，因此在路由失败后单独判定。
+            // 与命令互斥：一条消息要么是命令，要么是闲聊触发，不会被处理两次。
+            if routed.is_none() && observed.is_new {
+                self.enqueue_ai_chat_keyword(&observed.id, &message, captured_at)?;
+            }
+
             if sample_as_question && routed.is_none() {
                 if let Some(question) = turtle_soup::parse_question_message(&message.text, None) {
                     visible_turtle_questions.push(question);
@@ -2091,7 +2097,73 @@ impl ApplicationRuntime {
         Ok(())
     }
 
-    fn command_is_disabled(&self, command: &RoutedCommand) -> Result<bool> {
+    /// 关键词触发的 AI 聊天：把命中的闲聊转成一次 `AiChatCommand::Ask`。
+    ///
+    /// 不是命令：不写成功命令锁、不参与命令路由；只受冷却与开关约束。
+    fn enqueue_ai_chat_keyword(
+        &self,
+        message_id: &crate::observation::chat::ObservedChatMessageId,
+        message: &crate::observation::chat::scan::ChatMessage,
+        captured_at: Instant,
+    ) -> Result<()> {
+        let config = self.lifecycle.live_configs.snapshot().ai_chat.clone();
+        if !config.enabled || !self.business.ai.enabled() {
+            return Ok(());
+        }
+        // 只处理大厅普通成员发言；好友私聊另有既有链路。
+        if message.message_type != "blue" {
+            return Ok(());
+        }
+        // 大厅消息没有独立 sender 字段，昵称在文本行首，与命令信封共用同一套切分。
+        let Some((sender, body)) =
+            crate::interfaces::chat::split_sender_line(&message.text, &message.message_type)
+        else {
+            // 拆不出发送者就不触发：MUST_READ §2 要求 Unknown 不授权、不建记忆。
+            return Ok(());
+        };
+        let sender = sender.trim();
+        if sender.is_empty() {
+            return Ok(());
+        }
+        // 触发关键词与提问都只看正文：昵称里出现关键词不算触发。
+        let Some(question) = config.match_trigger(body) else {
+            return Ok(());
+        };
+        let question = question.trim().to_string();
+        if question.is_empty()
+            || question.chars().count() > crate::features::ai_chat::MAX_QUESTION_CHARS
+        {
+            return Ok(());
+        }
+        let mut routed = RoutedCommand::console(
+            &config.keyword,
+            &message.text,
+            ModuleCommand::AiChat(crate::features::ai_chat::AiChatCommand::Ask { question }),
+        );
+        routed.username = sender.to_string();
+        routed.message_type = message.message_type.clone();
+        routed.authority = CommandAuthority::HallMember;
+        routed.role = self.lifecycle.live_configs.identity.role_of(sender);
+        routed.observation = crate::features::command::CommandObservation {
+            frame_id: None,
+            captured_at: Some(captured_at),
+            message_id: Some(message_id.clone()),
+            message_text: Some(message.text.clone()),
+            message_y: Some(message.block.y),
+        };
+        let pending = PendingCommand {
+            lock_key: crate::interfaces::chat::lock_key(&routed),
+            routed,
+        };
+        self.enqueue_pending_command(pending)?;
+        Ok(())
+    }
+
+    /// 全局命令开关只约束「大厅普通成员」；好友与已映射角色不受影响。
+    ///
+    /// AI 转述的命令也必须过这一关，否则管理员关掉命令后，
+    /// 真人 `@点歌` 不执行、AI 转述的同一条却照跑。
+    pub(super) fn command_is_disabled(&self, command: &RoutedCommand) -> Result<bool> {
         Ok(!self.commands_enabled()?
             && command.authority == CommandAuthority::HallMember
             && command.role.is_none())
@@ -2509,7 +2581,7 @@ mod tests {
         BubbleSequence, ChatIdentity, ChatMessage, ChatTimeline, ObservedChatMessageId,
         PrimaryObservedMessage, RecognizedChatMessage, VisualSessionId,
     };
-    use crate::ui::geometry::Rect;
+    use crate::geometry::Rect;
     use std::time::{Duration, Instant};
 
     fn listener_snapshot(

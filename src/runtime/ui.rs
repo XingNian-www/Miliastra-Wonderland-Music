@@ -460,7 +460,7 @@ pub struct UiMarkerProbeEvidence {
     blue_count: usize,
     yellow_count: usize,
     pink_count: usize,
-    marker_hits: Vec<crate::ui::template::TemplateHit>,
+    marker_hits: Vec<crate::geometry::TemplateHit>,
 }
 
 impl UiMarkerProbeEvidence {
@@ -470,7 +470,7 @@ impl UiMarkerProbeEvidence {
         blue_count: usize,
         yellow_count: usize,
         pink_count: usize,
-        marker_hits: Vec<crate::ui::template::TemplateHit>,
+        marker_hits: Vec<crate::geometry::TemplateHit>,
     ) -> Self {
         Self {
             source_frame_id: None,
@@ -514,7 +514,7 @@ impl UiMarkerProbeEvidence {
         self.pink_count
     }
 
-    pub(crate) fn marker_hits(&self) -> &[crate::ui::template::TemplateHit] {
+    pub(crate) fn marker_hits(&self) -> &[crate::geometry::TemplateHit] {
         &self.marker_hits
     }
 }
@@ -2432,7 +2432,7 @@ mod tests {
                         1,
                         0,
                         0,
-                        vec![crate::ui::template::TemplateHit {
+                        vec![crate::geometry::TemplateHit {
                             kind: "blue".into(),
                             x: i32::from(image.get_pixel(1, 1).0[0]),
                             y: 1,

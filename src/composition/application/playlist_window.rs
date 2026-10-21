@@ -658,12 +658,20 @@ mod tests {
                 )
                 .unwrap();
             assert_ne!(rebuilt.messages[0].id, previous_id);
-            assert_eq!(rebuilt.messages[0].is_new, !changed, "{text}");
-            assert_eq!(
-                shared.is_business_pending(&rebuilt.messages[0].id).unwrap(),
-                !changed,
-                "{text}"
-            );
+            if changed {
+                let lock_texts = shared.command_lock_texts_for_test(&ChatIdentity::PrimaryHall);
+                assert!(
+                    lock_texts.iter().any(|locked| locked == text),
+                    "successful decision must write a lock: {text}"
+                );
+            } else {
+                assert!(
+                    shared
+                        .command_lock_texts_for_test(&ChatIdentity::PrimaryHall)
+                        .is_empty(),
+                    "invalid selection must not write a success lock: {text}"
+                );
+            }
         }
     }
 

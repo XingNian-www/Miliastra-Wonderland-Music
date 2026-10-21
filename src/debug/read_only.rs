@@ -980,6 +980,7 @@ pub(crate) fn command_parameters(parsed: &RoutedCommand) -> Value {
         ModuleCommand::Invite(_) => "invite",
         ModuleCommand::Moderation(_) => "moderation",
         ModuleCommand::CustomWorkflow(_) => "customWorkflow",
+        ModuleCommand::AiChat(_) => "aiChat",
     });
     let private_reason =
         match &parsed.command {

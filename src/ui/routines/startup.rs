@@ -6,15 +6,15 @@ use super::friend_delivery::{
     before_input_failure, capture_normalized, wait_ms,
 };
 use super::state_observation::wait_for_stable_ui_kind;
-use crate::adapters::windows::resolve_game_executable;
+use crate::adapters::game_path::resolve_game_executable;
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiStateKind, UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::ui::change_detection::{change_stats, rect_chat_change_fingerprint};
-use crate::ui::geometry::{Point, Rect, crop_canvas};
+use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
+use crate::geometry::{Point, Rect, crop_canvas};
 use crate::ui::state::find_enter_game_text as locate_enter_game_text;
 use crate::ui::state::world_is_teyvat;
 use crate::ui::template::best_template_hit;
@@ -486,7 +486,7 @@ fn execute_enter_wonderland(
 
     context
         .device()
-        .press_key(Key::M)
+        .press_key(Key::Unicode('m'))
         .map_err(|error| after_input_failure("open_wonderland_map", error))?;
 
     // **先确认地图真的开了，再去找星标。**
@@ -1071,7 +1071,7 @@ mod tests {
     impl UiDevice for PaimonOnlyDevice {
         fn capture(&mut self) -> Result<DynamicImage> {
             if let Some(after_m) = &self.after_m {
-                if self.keys.lock().unwrap().contains(&Key::M) {
+                if self.keys.lock().unwrap().contains(&Key::Unicode('m')) {
                     return Ok(after_m.clone());
                 }
             }
@@ -1179,7 +1179,7 @@ mod tests {
         };
         assert_eq!(failure.stage(), "locate_wonderland_map_star");
         assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
-        assert_eq!(keys.lock().unwrap().as_slice(), &[Key::M]);
+        assert_eq!(keys.lock().unwrap().as_slice(), &[Key::Unicode('m')]);
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }

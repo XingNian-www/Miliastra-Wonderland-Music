@@ -521,7 +521,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::ocr::OcrLine;
-    use crate::ui::geometry::Rect;
+    use crate::geometry::Rect;
 
     struct FixedOcrDevice;
 

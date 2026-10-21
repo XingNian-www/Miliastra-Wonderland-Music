@@ -125,6 +125,16 @@ impl CommandSpec {
     }
 }
 
+
+/// 全部已登记命令（按分组顺序拼接）。
+///
+/// AI 聊天用它构造"提问者可用命令"提示，避免模型给出越权或不存在命令。
+pub(crate) fn all_specs() -> Vec<&'static CommandSpec> {
+    // 与 static_commands() 保持同一组表。此前遗漏 FRIEND_MISC，
+    // 导致 @邀请/@拉黑/@屏蔽 不进 AI 提示词的可用命令列表。
+    static_commands().collect()
+}
+
 /// 会话态命令：某个玩法进行中才生效的派发规则。
 ///
 /// 对应 python-telegram-bot `ConversationHandler` 的 `states`：
@@ -134,6 +144,11 @@ impl CommandSpec {
 pub(crate) struct SessionDispatch {
     /// 该规则适用的玩法状态。
     pub(crate) kind: crate::features::entertainment::EntertainmentKind,
+    /// 认领后归属的路由模块。
+    ///
+    /// 有了这一列，路由才能直接从这张表派发，而不必在 `router.rs` 里再写一份
+    /// "玩法状态 → 模块" 的 match（那是一份会漂移的重复数据）。
+    pub(crate) module: crate::features::command::ChatCommandModule,
     /// 认领谓词：由所属模块提供（各模块现成的 `claims_active_chat`）。
     pub(crate) claims: fn(&crate::features::command::CommandEnvelope) -> bool,
     /// 解析谓词：由所属模块提供（各模块现成的 `parse_active_chat`）。
@@ -142,6 +157,7 @@ pub(crate) struct SessionDispatch {
     pub(crate) parse: fn(
         &crate::features::command::CommandEnvelope,
     ) -> Option<crate::features::command::FeatureCommandMatch<crate::features::command::ModuleCommand>>,
+
     /// 会话内是否接受**任意**文本（由玩法自己兜底解释）。
     ///
     /// `true`：成语接龙（任意文本当成语提交）、斗地主（任意文本当出牌）。
@@ -477,6 +493,19 @@ pub(crate) const HALL: &[CommandSpec] = &[
         usage: &["@麦克风"],
         hidden: false,
     },
+    CommandSpec {
+        name: "忘记我",
+        aliases: &[],
+        prefix: At,
+        match_rule: CommandMatch::Prefix {
+            allows_argument: false,
+        },
+        group: CommandGroup::Hall,
+        authorities: HALL_ONLY,
+        summary: "清空 AI 对你说过的记忆",
+        usage: &["@忘记我"],
+        hidden: false,
+    },
 ];
 
 /// 管理类命令（@ 与 # 两种前缀）。
@@ -774,6 +803,85 @@ pub(crate) const PLAYLIST: &[CommandSpec] = &[
         usage: &["@关闭"],
         hidden: false,
     },
+    // 以下 7 条此前只在 playlist.rs 的 parse_chat 里存在，catalog 未登记，
+    // 导致游戏里能用、面板与帮助里看不到（漂移）。
+    CommandSpec {
+        name: "停止播放歌单",
+        aliases: &[],
+        prefix: At,
+        match_rule: CommandMatch::Compact,
+        group: CommandGroup::Song,
+        authorities: FRIEND_ONLY,
+        summary: "停止个人歌单播放",
+        usage: &["@停止播放歌单"],
+        hidden: false,
+    },
+    CommandSpec {
+        name: "歌单清空",
+        aliases: &[],
+        prefix: At,
+        match_rule: CommandMatch::Compact,
+        group: CommandGroup::Song,
+        authorities: FRIEND_ONLY,
+        summary: "清空自己的歌单（需二次确认）",
+        usage: &["@歌单清空"],
+        hidden: false,
+    },
+    CommandSpec {
+        name: "确认清空",
+        aliases: &[],
+        prefix: At,
+        match_rule: CommandMatch::Compact,
+        group: CommandGroup::Song,
+        authorities: FRIEND_ONLY,
+        summary: "确认清空歌单",
+        usage: &["@确认清空"],
+        hidden: false,
+    },
+    CommandSpec {
+        name: "放弃清空",
+        aliases: &[],
+        prefix: At,
+        match_rule: CommandMatch::Compact,
+        group: CommandGroup::Song,
+        authorities: FRIEND_ONLY,
+        summary: "放弃清空歌单",
+        usage: &["@放弃清空"],
+        hidden: false,
+    },
+    CommandSpec {
+        name: "确认导入",
+        aliases: &[],
+        prefix: At,
+        match_rule: CommandMatch::Compact,
+        group: CommandGroup::Song,
+        authorities: FRIEND_ONLY,
+        summary: "确认导入歌单",
+        usage: &["@确认导入"],
+        hidden: false,
+    },
+    CommandSpec {
+        name: "取消导入",
+        aliases: &[],
+        prefix: At,
+        match_rule: CommandMatch::Compact,
+        group: CommandGroup::Song,
+        authorities: FRIEND_ONLY,
+        summary: "取消导入歌单",
+        usage: &["@取消导入"],
+        hidden: false,
+    },
+    CommandSpec {
+        name: "导入QQ歌单",
+        aliases: &["导入网易歌单", "导入网易云歌单"],
+        prefix: At,
+        match_rule: CommandMatch::Prefix { allows_argument: true },
+        group: CommandGroup::Song,
+        authorities: FRIEND_ONLY,
+        summary: "按分享链接导入歌单",
+        usage: &["@导入QQ歌单<链接>"],
+        hidden: false,
+    },
 ];
 
 /// 好友专属命令（邀请、管理）。
@@ -838,6 +946,7 @@ pub(crate) fn static_commands() -> impl Iterator<Item = &'static CommandSpec> {
 pub(crate) const SESSION_DISPATCH: &[SessionDispatch] = &[
     SessionDispatch {
         kind: crate::features::entertainment::EntertainmentKind::IdiomChain,
+        module: crate::features::command::ChatCommandModule::IdiomChain,
         claims: crate::features::idiom_chain::IdiomChainCommand::claims_active_chat,
         parse: |envelope| {
             crate::features::idiom_chain::IdiomChainCommand::parse_active_chat(envelope)
@@ -850,6 +959,7 @@ pub(crate) const SESSION_DISPATCH: &[SessionDispatch] = &[
     },
     SessionDispatch {
         kind: crate::features::entertainment::EntertainmentKind::Landlord,
+        module: crate::features::command::ChatCommandModule::CardGame,
         claims: crate::features::card_games::LandlordCommand::claims_active_chat,
         parse: |envelope| {
             crate::features::card_games::LandlordCommand::parse_active_chat(envelope)
@@ -862,6 +972,7 @@ pub(crate) const SESSION_DISPATCH: &[SessionDispatch] = &[
     },
     SessionDispatch {
         kind: crate::features::entertainment::EntertainmentKind::RunFast,
+        module: crate::features::command::ChatCommandModule::CardGame,
         claims: crate::features::card_games::LandlordCommand::claims_active_chat,
         parse: |envelope| {
             crate::features::card_games::LandlordCommand::parse_active_chat(envelope)
@@ -873,6 +984,7 @@ pub(crate) const SESSION_DISPATCH: &[SessionDispatch] = &[
     },
     SessionDispatch {
         kind: crate::features::entertainment::EntertainmentKind::TurtleSoup,
+        module: crate::features::command::ChatCommandModule::TurtleSoup,
         claims: crate::features::turtle_soup::TurtleSoupCommand::claims_active_chat,
         parse: |envelope| {
             crate::features::turtle_soup::TurtleSoupCommand::parse_active_chat(envelope)
@@ -885,6 +997,7 @@ pub(crate) const SESSION_DISPATCH: &[SessionDispatch] = &[
     },
     SessionDispatch {
         kind: crate::features::entertainment::EntertainmentKind::Undercover,
+        module: crate::features::command::ChatCommandModule::Undercover,
         claims: crate::features::undercover::UndercoverCommand::claims_active_chat,
         parse: |envelope| {
             crate::features::undercover::UndercoverCommand::parse_active_chat(envelope)
@@ -1303,8 +1416,17 @@ mod tests {
     /// 这是"面板显示得出来、游戏里却不认"这类漂移的探针。
     #[test]
     fn every_registered_alias_is_claimed_by_a_real_module() {
+        // 带参数的命令（如 @导入QQ歌单<链接>）用裸命令名认领不到，
+        // 因此优先用 spec.usage 里的第一个示例构造信封；示例本身也是登记的一部分。
         let claimed = |spec: &CommandSpec, name: &str, authority: CommandAuthority| -> bool {
-            let envelope = envelope_for(name, spec.prefix, authority);
+            let sample = spec
+                .usage
+                .first()
+                .map(|usage| usage.trim_start_matches(['@', '#']))
+                .filter(|usage| !usage.is_empty())
+                .unwrap_or(name);
+            let envelope = envelope_for(sample, spec.prefix, authority);
+            let _ = name;
             match spec.prefix {
                 CommandPrefix::At => {
                     crate::features::song_request::SongCommand::claims_chat(&envelope)
@@ -1316,6 +1438,7 @@ mod tests {
                         || crate::features::playlist::PlaylistCommand::claims_chat(&envelope)
                         || crate::features::invite::InviteCommand::claims_chat(&envelope)
                         || crate::features::moderation::ModerationCommand::claims_chat(&envelope)
+                        || crate::features::ai_chat::AiChatCommand::claims_chat(&envelope)
                 }
                 CommandPrefix::Hash => {
                     // # 开局命令的认领入口是 claims_start_chat（不是 claims_chat），

@@ -466,6 +466,8 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .tools-checkbox{display:inline-flex;align-items:center;gap:var(--sp-2);color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);cursor:pointer;user-select:none}
 .tools-stretch{width:100%}
 
+
+
 /* ===== 配置中心 ===== */
 .config-status{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-3);margin:0 0 var(--sp-4);padding:var(--sp-3) var(--sp-4);background:var(--bg-input);border:1px solid var(--sep-2);border-radius:var(--radius-m);font-size:var(--fs-meta);line-height:var(--lh-meta);color:var(--text-2)}
 .config-status .chip{padding-right:var(--sp-3);border-right:1px solid var(--sep-2)}
@@ -558,6 +560,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
     <button class="nav-link" data-route="game" onclick="navigateTo('game')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>游戏与聊天</button>
     <button class="nav-link" data-route="entertainment" onclick="navigateTo('entertainment')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>娱乐玩法</button>
     <button class="nav-link" data-route="commands" onclick="navigateTo('commands')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="3.5" width="19" height="17" rx="2.5"/><path d="m6.5 8.5 3 3-3 3"/><path d="M12.5 15h4.5"/></svg>命令面板</button>
+    <button class="nav-link" data-route="aichat" onclick="navigateTo('aichat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3 8.9 8.9 0 0 1-3.2-.6L4 21l1.8-4.6a8.2 8.2 0 0 1-1.3-4.6A8.4 8.4 0 0 1 13 3.5a8.4 8.4 0 0 1 8 8z"/><circle cx="9" cy="11" r=".8" fill="currentColor"/><circle cx="13" cy="11" r=".8" fill="currentColor"/><circle cx="17" cy="11" r=".8" fill="currentColor"/></svg>AI 聊天</button>
     <button class="nav-link" data-route="tasks" onclick="navigateTo('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15l2 2 4-4"/></svg>任务与日志</button>
     <button class="nav-link" data-route="tools" onclick="navigateTo('tools')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>高级控制</button>
     <button class="nav-link" data-route="config" onclick="navigateTo('config')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/></svg>配置中心</button>
@@ -642,6 +645,32 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
       <div class="config-message err hidden" id="commandError" role="status" aria-live="polite"></div>
       <div class="command-groups" id="commandGroups"><div class="command-empty">正在读取命令目录…</div></div>
       <p class="command-foot">命令开关请在「游戏与聊天 → 机器人操作」中切换；本页仅展示目录，不发送任何游戏输入。</p>
+    </section>
+    <section class="page-section" id="page-aichat" data-page="aichat">
+      <h1 class="page-title">AI 聊天</h1>
+      <p class="page-subtitle">关键词触发的大厅聊天机器人；记忆按玩家个人隔离，仅保存轻量事实与最近对话</p>
+      <div class="config-status" id="aiChatStatusBar">
+        <span class="chip"><i class="dot"></i><span>状态</span><em id="aiChatStatusText">读取中…</em></span>
+        <span id="aiChatStatusHint">来源：GET /config/section?name=ai_chat</span>
+        <button class="btn small" onclick="loadAiChatSettings()">重新读取</button>
+        <button class="btn small" onclick="navigateTo('config')">打开完整配置</button>
+      </div>
+      <div class="config-message err hidden" id="aiChatMessage" role="status" aria-live="polite"></div>
+      <div class="page-grid" id="aiChatGrid">
+        <details class="panel" open>
+          <summary class="panel-head">触发与开关</summary>
+          <div class="panel-body" id="aiChatTriggerPanel"><p class="config-field-hint">正在读取配置…</p></div>
+        </details>
+        <details class="panel">
+          <summary class="panel-head">记忆容量</summary>
+          <div class="panel-body" id="aiChatMemoryPanel"><p class="config-field-hint">正在读取配置…</p></div>
+        </details>
+        <details class="panel">
+          <summary class="panel-head">模型与提示词</summary>
+          <div class="panel-body" id="aiChatPromptPanel"><p class="config-field-hint">正在读取配置…</p></div>
+        </details>
+      </div>
+      <p class="command-foot">记忆只保存在本地统一数据库；「@忘记我」可让玩家清空自己的记忆。AI 给出的命令会按提问者本人权限复核后执行。</p>
     </section>
     <section class="page-section" id="page-tasks" data-page="tasks"><h1 class="page-title">任务与日志</h1><p class="page-subtitle">任务队列、事件日志与接口调用记录</p><div class="page-grid" id="tasksGrid"></div></section>
     <section class="page-section" id="page-tools" data-page="tools"><h1 class="page-title">高级控制</h1><p class="page-subtitle">OCR、模板匹配与手动输入诊断工具</p><div class="tools-grid">
@@ -1094,7 +1123,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
 
 <script>
 function $(id){return document.getElementById(id)}
-const pageRoutes=['overview','playback','login','game','entertainment','commands','tasks','tools','config','settings']
+const pageRoutes=['overview','playback','login','game','entertainment','commands','aichat','tasks','tools','config','settings']
 function setupPages(){
   const playbackPanelClasses={
     songState:'playback-player-panel',
@@ -1183,16 +1212,101 @@ async function navigateTo(route,updateHash=true){
   if(updateHash&&location.hash!=='#'+route)history.replaceState(null,'','#'+route)
   if(route==='config'&&(!configData||!configUnsaved))loadConfigPage()
   if(route==='commands'&&!commandCatalog&&!commandCatalogLoading)loadCommandCatalog()
+  if(route==='aichat'&&!aiChatData)loadAiChatSettings()
 }
+/* ===== AI 聊天功能页 =====
+ * 复用配置中心 schema 渲染与保存接口，仅编辑 ai_chat 段。
+ */
+let aiChatData=null
+let aiChatFields=[]
+let aiChatDirty=false
+const AI_CHAT_GROUPS=[
+  {id:'aiChatTriggerPanel',keys:['enabled','keyword','trigger_mode','cooldown_seconds','allow_commands']},
+  {id:'aiChatMemoryPanel',keys:['actor_token_budget','bot_token_budget']},
+  {id:'aiChatPromptPanel',keys:['model','max_tokens','system_prompt','answer_prompt','extract_prompt']}
+]
+async function loadAiChatSettings(){
+  const status=$('aiChatStatusText')
+  try{
+    const schema=await request('/config/schema')
+    const section=(schema.sections||[]).find(item=>item.name==='ai_chat')
+    if(!section)throw new Error('配置 schema 中没有 ai_chat 段')
+    aiChatFields=section.fields||[]
+    const current=await request('/config/section?name=ai_chat')
+    aiChatData={revision:current.revision,values:current.values||{}}
+    aiChatDirty=false
+    renderAiChatPage()
+    if(status)status.textContent=aiChatData.values.enabled===true||aiChatData.values.enabled==='true'?'已启用':'未启用'
+    showAiChatMessage('',null)
+  }catch(error){
+    showAiChatMessage('读取失败：'+error.message,'err')
+    if(status)status.textContent='读取失败'
+  }
+}
+function showAiChatMessage(text,kind){
+  const el=$('aiChatMessage')
+  if(!el)return
+  el.textContent=text||''
+  el.className='config-message'+(kind?' '+kind:'')+(text?'':' hidden')
+}
+function aiChatKey(path){return String(path||'').replace(/^ai_chat\./,'')}
+function aiChatFieldValue(path){
+  const key=aiChatKey(path)
+  return aiChatData&&aiChatData.values?aiChatData.values[key]:undefined
+}
+function renderAiChatPage(){
+  for(const group of AI_CHAT_GROUPS){
+    const host=$(group.id)
+    if(!host)continue
+    const parts=[]
+    for(const key of group.keys){
+      const field=aiChatFields.find(item=>item.path==='ai_chat.'+key)
+      if(!field)continue
+      parts.push('<div class="config-field">')
+      parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code></div>')
+      if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
+      parts.push(configControlHtml(field,aiChatFieldValue(field.path)))
+      parts.push('</div>')
+    }
+    parts.push('<div class="config-string-row"><button class="btn" onclick="saveAiChatSettings()">保存本页</button>')
+    parts.push('<button class="btn ghost" onclick="loadAiChatSettings()">放弃修改</button></div>')
+    host.innerHTML=parts.join('')
+  }
+  document.querySelectorAll('#page-aichat [data-cfg]').forEach(input=>{
+    input.addEventListener('change',()=>{aiChatDirty=true})
+    input.addEventListener('input',()=>{aiChatDirty=true})
+  })
+}
+function collectAiChatSection(){
+  const values={}
+  for(const field of aiChatFields){
+    const key=aiChatKey(field.path)
+    const el=document.getElementById(configControlId(field.path))
+    if(!el){values[key]=aiChatData.values[key];continue}
+    const kind=field.kind&&field.kind.type
+    if(kind==='bool')values[key]=el.checked
+    else if(kind==='int'){const n=Number(el.value);values[key]=Number.isFinite(n)?Math.trunc(n):aiChatData.values[key]}
+    else if(kind==='float'){const n=Number(el.value);values[key]=Number.isFinite(n)?n:aiChatData.values[key]}
+    else values[key]=el.value
+  }
+  return values
+}
+async function saveAiChatSettings(){
+  try{
+    const section=collectAiChatSection()
+    const resp=await requestJson('/config/save',{baseRevision:aiChatData.revision!=null?aiChatData.revision:0,sections:{ai_chat:section}})
+    if(resp&&resp.ok===false){showAiChatMessage('保存失败：'+(resp.message||'校验未通过'),'err');return}
+    showAiChatMessage('已保存','ok')
+    await loadAiChatSettings()
+  }catch(error){showAiChatMessage('保存失败：'+error.message,'err')}
+}
+
 function initialRoute(){
   const hash=location.hash.slice(1)
   if(pageRoutes.includes(hash))return hash
   try{const saved=localStorage.getItem('miliastraRoute');if(pageRoutes.includes(saved))return saved}catch(e){}
   return 'overview'
 }
-setupPages()
-window.addEventListener('hashchange',()=>navigateTo(location.hash.slice(1),false))
-navigateTo(initialRoute())
 const esc=(s)=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
 const commandLabels={'/status':'状态','/play':'继续','/pause':'暂停','/skip-next':'下一首','/skip-prev':'上一首','/volume':'音量','/startup/game':'启动游戏','/startup/wonderland':'启动并进入千星','/startup/enter-wonderland':'进入千星','/searchPlay':'点歌','/searchSource':'指定音源点歌','/search':'搜索','/search/candidates':'候选搜索','/player/providers':'平台状态','/player/login/status':'登录状态','/player/play-track':'播放曲目','/player/login/start':'开始登录','/player/login/cancel':'取消登录','/player/logout':'退出登录','/queue':'队列','/queue/add':'加入队列','/queue/remove':'删除队列','/queue/clear':'清空队列','/ai/search':'AI点歌','/chat/send':'控制台发言','/chat-listener/mode':'聊天值守','/tasks/cancel':'撤销任务','/operator/lyrics':'发送歌词','/operator/hall-detect':'大厅检测','/operator/hall-time':'大厅时间','/operator/microphone':'麦克风','/operator/commands':'命令开关','/operator/idle-exit':'闲置退出','/operator/workflows':'工作流','/operator/workflows/run':'执行工作流','/turtle-soup':'海龟汤状态','/turtle-soup/start':'海龟汤开局','/turtle-soup/end':'海龟汤结束','/undercover':'谁是卧底状态','/undercover/start':'谁是卧底开局','/undercover/end':'谁是卧底结束'}
 const stMap={playing:'播放中',paused:'已暂停',stopped:'已停止'}
@@ -3775,6 +3889,9 @@ document.addEventListener('keydown',(e)=>{
   if(e.key==='?'){showShortcutHelp();e.preventDefault();return}
 })
 /* ===== 初始化执行块（必须位于全部 const/let 声明之后，避免 TDZ） ===== */
+setupPages()
+window.addEventListener('hashchange',()=>navigateTo(location.hash.slice(1),false))
+navigateTo(initialRoute())
 $('accessToken').value=accessToken()
 initNotifyUI()
 loadOperatorWorkflows()

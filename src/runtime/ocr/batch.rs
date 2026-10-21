@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use image::{DynamicImage, GenericImage, ImageBuffer, Rgba};
 
 use super::{OcrLine, OcrPriority, OcrRuntimeHandle, merge_ocr_lines};
-use crate::ui::geometry::Rect;
+use crate::geometry::Rect;
 
 const BLOCK_GAP: u32 = 12;
 const GAP_COLOR: Rgba<u8> = Rgba([180, 180, 180, 255]);

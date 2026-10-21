@@ -1,3 +1,11 @@
+//! 全局热键。
+//!
+//! Windows 用 `RegisterHotKey` 起独立消息线程；其它平台没有等价机制，
+//! 提供一个签名一致的空实现，让组合层在 Linux 上可编译、可测试，
+//! 同时保证 Windows 生产路径原样不变。
+
+#[cfg(target_os = "windows")]
+mod imp {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -164,3 +172,38 @@ fn hotkey_loop(
 fn parse_virtual_key(value: &str) -> Result<VIRTUAL_KEY> {
     Ok(VIRTUAL_KEY(parse_hotkey_virtual_code(value)?))
 }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod imp {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use anyhow::Result;
+
+    use crate::config::HotkeyConfig;
+
+    /// 非 Windows：没有全局热键，保持空实现。
+    pub(crate) struct HotkeyRuntime {
+        _running: Arc<AtomicBool>,
+    }
+
+    impl HotkeyRuntime {
+        pub(crate) fn shutdown(self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn start(
+        _config: &HotkeyConfig,
+        running: Arc<AtomicBool>,
+        _paused: Arc<AtomicBool>,
+        _request_exit: Arc<dyn Fn() + Send + Sync>,
+        _wake_tasks: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<HotkeyRuntime> {
+        log::debug!("当前平台没有全局热键支持，已跳过");
+        Ok(HotkeyRuntime { _running: running })
+    }
+}
+
+pub(crate) use imp::{HotkeyRuntime, start};

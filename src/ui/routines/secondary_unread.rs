@@ -536,8 +536,8 @@ fn unread_message_failure(detail: impl Into<String>) -> UiRoutineFailure {
 }
 
 fn stable_bubble_sample(
-    previous: Option<&crate::ui::change_detection::ChangeFingerprint>,
-    current: Option<&crate::ui::change_detection::ChangeFingerprint>,
+    previous: Option<&crate::change_detection::ChangeFingerprint>,
+    current: Option<&crate::change_detection::ChangeFingerprint>,
 ) -> bool {
     previous.is_some() && current.is_some() && !optional_fingerprint_changed(previous, current)
 }
@@ -556,12 +556,12 @@ fn unread_text_is_usable(text: &str) -> bool {
 }
 
 fn optional_fingerprint_changed(
-    previous: Option<&crate::ui::change_detection::ChangeFingerprint>,
-    current: Option<&crate::ui::change_detection::ChangeFingerprint>,
+    previous: Option<&crate::change_detection::ChangeFingerprint>,
+    current: Option<&crate::change_detection::ChangeFingerprint>,
 ) -> bool {
     match (previous, current) {
         (Some(previous), Some(current)) => {
-            let stats = crate::ui::change_detection::change_stats(previous, current);
+            let stats = crate::change_detection::change_stats(previous, current);
             stats.mean_abs_diff >= 0.8 || stats.changed_ratio >= 0.01
         }
         (None, None) => true,
@@ -572,7 +572,7 @@ fn optional_fingerprint_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::geometry::Rect;
+    use crate::geometry::Rect;
 
     #[test]
     fn unread_selection_promotes_latest_incoming_without_replaying_history() {
@@ -682,8 +682,8 @@ mod tests {
             assert!(!fresh_friend_snapshot(&snapshot, opened_at));
         }
     }
-    use crate::ui::change_detection::ChangeFingerprint;
-    use crate::ui::geometry::Point;
+    use crate::change_detection::ChangeFingerprint;
+    use crate::geometry::Point;
 
     fn fingerprint(value: u8) -> ChangeFingerprint {
         ChangeFingerprint {

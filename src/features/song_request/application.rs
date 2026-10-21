@@ -2692,7 +2692,7 @@ mod tests {
         let application = SongRequestApplication::with_gateways(
             Arc::new(DisabledAiGateway),
             Arc::new(DisabledReviewGateway),
-            1,
+            2,
             true,
         );
 

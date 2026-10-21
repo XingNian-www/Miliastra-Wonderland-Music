@@ -21,7 +21,7 @@ use self::openvino::OpenVinoEngine;
 use crate::config::OcrConfig;
 #[cfg(feature = "ocr-openvino")]
 use crate::config::OpenVinoConfig;
-use crate::ui::geometry::Rect;
+use crate::geometry::Rect;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OcrArgs {

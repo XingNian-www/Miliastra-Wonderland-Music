@@ -21,8 +21,8 @@ use crate::runtime::ui::{
     sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
-use crate::ui::geometry::{Point, Rect, crop_canvas};
+use crate::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
+use crate::geometry::{Point, Rect, crop_canvas};
 use crate::ui::locator::secondary_hall_search_rect;
 use crate::ui::template::best_template_hit;
 
@@ -2130,7 +2130,7 @@ mod tests {
     use crate::runtime::ocr::{OcrArgs, ProductionOcrDevice};
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{FrameDemand, FramePublication, UiDevice, UiRuntime};
-    use crate::ui::geometry::Rect;
+    use crate::geometry::Rect;
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
     fn start_test_ui_runtime(
@@ -3338,6 +3338,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local screenshot timing probe; requires dist/ui-flow/frames fixtures"]
     fn tmp_panel_probe_cost() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let threshold = config.templates.marker_threshold;

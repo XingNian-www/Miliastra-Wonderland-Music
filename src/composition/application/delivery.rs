@@ -77,7 +77,6 @@ impl ApplicationRuntime {
         }
     }
 
-
     /// 把一条已渲染的业务文案按模板键换成用户配置的版本。
     ///
     /// 调用点在回复收口处：默认配置为空表，此时直接返回原样文案，
@@ -110,8 +109,7 @@ impl ApplicationRuntime {
             summary: "",
             group: "",
         };
-        let rendered =
-            crate::features::reply_template::render(&spec, Some(&override_text), vars);
+        let rendered = crate::features::reply_template::render(&spec, Some(&override_text), vars);
         if !rendered.missing.is_empty() {
             log::warn!(
                 "回复模板 {key} 缺少变量 {:?}，已按空串渲染",
@@ -119,6 +117,43 @@ impl ApplicationRuntime {
             );
         }
         rendered.text
+    }
+
+    /// 按模板键渲染一条回复，并查配置中心的覆盖文案。
+    ///
+    /// 这是组装层唯一的模板渲染入口：`render_reply`（键+默认值）与各业务端口的
+    /// `reply_template`/`render_template`（模板结构）都汇到这里，避免每个端口各抄一遍
+    /// "查覆盖 → 渲染 → 记录缺变量" 的流程，也就不会再出现某条路径漏查覆盖。
+    pub(super) fn render_template_text(
+        &self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> String {
+        let override_text = self
+            .lifecycle
+            .live_configs
+            .replies
+            .read()
+            .ok()
+            .and_then(|config| config.get(spec.key).map(str::to_string));
+        let rendered =
+            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
+        if !rendered.missing.is_empty() {
+            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
+        }
+        rendered.text
+    }
+
+    /// 渲染并直接发送一条模板回复。
+    ///
+    /// 名字与各端口 trait 的 `reply_template` 不同，避免同类型上固有方法与 trait 方法同名。
+    pub(super) fn reply_with_template(
+        &self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        let text = self.render_template_text(spec, vars);
+        self.reply(&text)
     }
 
     pub(super) fn update_monitor_playback_controller(&self) {

@@ -110,7 +110,10 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
     }
 
     fn playlist_mode_owner(&self) -> Option<String> {
-        self.runtime.playback.playback_application.playlist_mode_owner()
+        self.runtime
+            .playback
+            .playback_application
+            .playlist_mode_owner()
     }
 
     fn extend_playlist_tracks(
@@ -372,6 +375,7 @@ impl ApplicationRuntime {
             ModuleCommand::CustomWorkflow(command) => {
                 self.execute_custom_workflow_intent(parsed, command)
             }
+            ModuleCommand::AiChat(command) => self.execute_ai_chat_intent(parsed, command),
         }
     }
 
@@ -723,21 +727,7 @@ impl AdministrationApplicationPort for ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> String {
-        // 帮助文案此前直接 render(spec, None, ..)，导致这 12 个 help.* key
-        // 登记了却改不动：覆盖文案只有组装层查得到，渲染也必须走组装层。
-        let override_text = self
-            .lifecycle
-            .live_configs
-            .replies
-            .read()
-            .ok()
-            .and_then(|config| config.get(spec.key).map(str::to_string));
-        let rendered =
-            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
-        if !rendered.missing.is_empty() {
-            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
-        }
-        rendered.text
+        self.render_template_text(spec, vars)
     }
 }
 
@@ -771,20 +761,7 @@ impl HallApplicationPort for ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> Result<()> {
-        // features 层只声明模板；覆盖文案在组装层查，业务模块不依赖配置中心。
-        let override_text = self
-            .lifecycle
-            .live_configs
-            .replies
-            .read()
-            .ok()
-            .and_then(|config| config.get(spec.key).map(str::to_string));
-        let rendered =
-            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
-        if !rendered.missing.is_empty() {
-            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
-        }
-        ApplicationRuntime::reply(self, &rendered.text)
+        self.reply_with_template(spec, vars)
     }
 
     fn log_executed(&mut self, context: &HallCommandContext, final_command: &str) -> Result<()> {
@@ -900,20 +877,7 @@ impl HallMaintenancePort for ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> Result<()> {
-        // features 层只声明模板；覆盖文案在组装层查，业务模块不依赖配置中心。
-        let override_text = self
-            .lifecycle
-            .live_configs
-            .replies
-            .read()
-            .ok()
-            .and_then(|config| config.get(spec.key).map(str::to_string));
-        let rendered =
-            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
-        if !rendered.missing.is_empty() {
-            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
-        }
-        ApplicationRuntime::reply(self, &rendered.text)
+        self.reply_with_template(spec, vars)
     }
 
     fn mark_hall_expiring_warning_sent(&mut self) -> Result<()> {

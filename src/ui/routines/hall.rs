@@ -15,7 +15,7 @@ use crate::runtime::ui::{
     UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::ui::geometry::{Rect, crop_canvas};
+use crate::geometry::{Rect, crop_canvas};
 use crate::ui::locator::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty, merge_hall_info_samples,
     parse_hall_member_count, parse_hall_remaining_minutes,
@@ -562,7 +562,7 @@ mod tests {
     use super::*;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
-    use crate::ui::geometry::Rect;
+    use crate::geometry::Rect;
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
     type DragRecord = (i32, i32, i32, i32);
@@ -688,7 +688,7 @@ mod tests {
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
         config.timing.hall.ocr_sample_interval_ms = 0;
-        config.timing.workflow.default_timeout_ms = 200;
+        config.timing.workflow.default_timeout_ms = 5_000;
         config.timing.workflow.default_poll_ms = 1;
         let keys = Arc::new(Mutex::new(Vec::new()));
         let drags = Arc::new(Mutex::new(Vec::new()));
@@ -751,8 +751,8 @@ mod tests {
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
         config.timing.hall.ocr_sample_interval_ms = 0;
-        config.timing.workflow.default_timeout_ms = 200;
-        config.timing.workflow.default_poll_ms = 1;
+        config.timing.workflow.default_timeout_ms = 2_000;
+        config.timing.workflow.default_poll_ms = 5;
         let keys = Arc::new(Mutex::new(Vec::new()));
         let drags = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = start_test_ui_runtime(

@@ -1,3 +1,4 @@
+mod ai_chat_commands;
 mod commands;
 mod custom_workflow;
 #[cfg(test)]
@@ -31,7 +32,7 @@ use self::formal_task::{FormalTaskClient, FormalTaskRuntime};
 use crate::adapters::login_helper::LoginHelperManager;
 use crate::adapters::native_playback::NativePlaybackAdapter;
 use crate::adapters::player::PlayerRuntimeBackend;
-use crate::adapters::windows::{WindowsUiDevice, parse_key};
+use crate::adapters::input::parse_key;
 use crate::config::{AppConfig, LiveConfigs, PointConfig};
 use crate::features::administration::{
     AdministrationApplication, AdministrationCommand, ChatListenerModeCommand,
@@ -77,7 +78,7 @@ use crate::features::undercover::{
 use crate::interfaces::chat::{self as command, ChatCommandRouter, PendingCommand};
 use crate::interfaces::hotkeys;
 use crate::interfaces::http::{self, WebToolRequest, WebToolTemplate};
-use crate::interfaces::ui_plan::{WorkflowOperation, WorkflowResidency};
+use crate::ui::plan::{WorkflowOperation, WorkflowResidency};
 use crate::observation::chat::{
     ChatMessage, ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
     ChatScanTelemetry, ChatScanTelemetrySink, CompletionAdvanceSubscriber, ObservedFrame,
@@ -115,10 +116,10 @@ use crate::runtime::ui::{
     UiStateObservation,
 };
 use crate::ui::atoms::GameUi;
-use crate::ui::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
+use crate::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 use crate::ui::chat_output::{ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput};
 use crate::ui::frame::{Canvas, Frame, LatestFrameCache, from_captured_frame};
-use crate::ui::geometry::{Rect, crop_canvas};
+use crate::geometry::{Rect, crop_canvas};
 #[cfg(test)]
 use crate::ui::locator::secondary_hall_search_rect;
 use crate::ui::routines::{
@@ -233,11 +234,11 @@ impl ResolvedApplicationConfig {
             blacklist_region: app.moderation.blacklist_region.into(),
             block_chat_region: app.moderation.block_chat_region.into(),
             confirm_region: app.moderation.confirm_region.into(),
-            search_input: crate::ui::geometry::Point::new(
+            search_input: crate::geometry::Point::new(
                 app.moderation.search_input_point.x,
                 app.moderation.search_input_point.y,
             ),
-            search_button: crate::ui::geometry::Point::new(
+            search_button: crate::geometry::Point::new(
                 app.moderation.search_button_point.x,
                 app.moderation.search_button_point.y,
             ),
@@ -407,6 +408,13 @@ struct BusinessBundle {
     formal_tasks: Option<FormalTaskClient>,
     background_commands: workers::BackgroundCommandManager,
     ai: AiClient,
+    // 记忆与冷却门是「全局唯一一份」的进程内状态：facade 与正式执行上下文必须共享同一实例，
+    // 因此用 Arc 而不是 Clone（它们本身也不该被复制出第二份冷却账本）。
+    ai_chat_memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
+    ai_chat_gate: std::sync::Arc<crate::features::ai_chat::TriggerGate>,
+    ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
+    ai_connection: crate::config::ai::AiConfig,
+    ai_request_timeout: std::time::Duration,
     song_requests: SongRequestApplication,
     card_games: CardGameApplication,
     administration_application: AdministrationApplication,
@@ -659,6 +667,11 @@ struct FormalTaskBusinessContext {
     formal_tasks: FormalTaskClient,
     background_commands: workers::BackgroundCommandManager,
     ai: AiClient,
+    ai_chat_memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
+    ai_chat_gate: std::sync::Arc<crate::features::ai_chat::TriggerGate>,
+    ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
+    ai_connection: crate::config::ai::AiConfig,
+    ai_request_timeout: std::time::Duration,
     song_requests: SongRequestApplication,
     card_games: CardGameApplication,
     administration_application: AdministrationApplication,
@@ -735,6 +748,11 @@ impl FormalTaskExecutionContext {
                     formal_tasks: Some(self.business.formal_tasks.clone()),
                     background_commands: self.business.background_commands.clone(),
                     ai: self.business.ai.clone(),
+                    ai_chat_memory: self.business.ai_chat_memory.clone(),
+                    ai_chat_gate: self.business.ai_chat_gate.clone(),
+                    ai_chat_openai: self.business.ai_chat_openai.clone(),
+                    ai_connection: self.business.ai_connection.clone(),
+                    ai_request_timeout: self.business.ai_request_timeout,
                     song_requests: self.business.song_requests.clone(),
                     card_games: self.business.card_games.clone(),
                     administration_application: self.business.administration_application,
@@ -1429,7 +1447,7 @@ impl ApplicationRuntime {
                     invite_enter_hall: config.invite.enter_hall_region.into(),
                 });
         let ui_runtime = UiRuntime::start_with_progress_and_state_classifier(
-            WindowsUiDevice::new(config.window.clone()),
+            platform_ui_device(config.window.clone()),
             UI_RUNTIME_QUEUE_CAPACITY,
             Arc::new(monitor.clone()),
             ui_state_classifier,
@@ -1482,6 +1500,13 @@ impl ApplicationRuntime {
             ai_request_timeout,
             ai_openai.clone(),
         );
+        let ai_chat_memory = std::sync::Arc::new(
+            crate::features::ai_chat::AiChatMemory::open(&config.state.playback_state_path)
+                .context("打开 AI 聊天记忆库")?,
+        );
+        let ai_chat_gate = std::sync::Arc::new(crate::features::ai_chat::TriggerGate::new(
+            std::time::Duration::from_secs(config.ai_chat.cooldown_seconds),
+        ));
         let song_review = SongReviewClient::new(
             &config.song_review,
             &config.ai,
@@ -1497,6 +1522,7 @@ impl ApplicationRuntime {
         );
         let chat_output =
             ChatOutput::with_live_enabled(live_configs.output_send_enabled.clone(), hall_batch_ui);
+        let ai_openai_for_chat = ai_openai.clone();
         let turtle_soup = TurtleSoupService::new(
             turtle_soup_config,
             config.ai.clone(),
@@ -1609,6 +1635,11 @@ impl ApplicationRuntime {
                 formal_tasks: None,
                 background_commands: workers::BackgroundCommandManager::new(),
                 ai,
+                ai_chat_memory,
+                ai_chat_gate,
+                ai_chat_openai: ai_openai_for_chat,
+                ai_connection: config.ai.clone(),
+                ai_request_timeout,
                 song_requests,
                 card_games,
                 administration_application,
@@ -1762,6 +1793,31 @@ fn secondary_hall_sequence_delta(
 }
 
 
+/// 构造平台 UI 设备。
+///
+/// 这是 `composition` 对 `adapters::windows` 的**唯一**依赖点。
+/// 把它收成工厂函数后，其余 17k 行组合层代码不再需要 Windows 才能编译，
+/// 于是 Linux 侧可以真正运行组合层的测试（此前整块被 `#[cfg(windows)]` 挡住）。
+#[cfg(target_os = "windows")]
+fn platform_ui_device(window: crate::config::WindowConfig) -> impl crate::runtime::ui::UiDevice {
+    crate::adapters::windows::WindowsUiDevice::new(window)
+}
+
+/// 非 Windows 构建（仅测试）没有真实设备。
+///
+/// 返回一个所有操作都失败的设备：组合层的测试用的是 `UiRuntime` + 测试替身，
+/// 走不到这里；万一真走到，也要显式失败而不是假装成功。
+#[cfg(not(target_os = "windows"))]
+fn platform_ui_device(_window: crate::config::WindowConfig) -> impl crate::runtime::ui::UiDevice {
+    struct UnsupportedDevice;
+    impl crate::runtime::ui::UiDevice for UnsupportedDevice {
+        fn capture(&mut self) -> anyhow::Result<image::DynamicImage> {
+            anyhow::bail!("非 Windows 构建没有真实 UI 设备")
+        }
+    }
+    UnsupportedDevice
+}
+
 pub(crate) use crate::observation::chat::{
     SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity, parse_secondary_sender_identity,
 };
@@ -1772,7 +1828,6 @@ enum SecondaryHallMessageKind {
     Command,
     TurtleQuestion,
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SecondaryHallMessageClassification {
@@ -1827,7 +1882,6 @@ fn normalize_secondary_sender_name(value: &str) -> String {
         .effective_name()
         .to_string()
 }
-
 
 fn next_target_missing_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(TARGET_MISSING_BACKOFF_MAX)

@@ -1,29 +1,37 @@
 mod adapters;
-#[cfg(target_os = "windows")]
 mod composition;
+mod change_detection;
 mod config;
+mod geometry;
+mod input_gate;
 #[allow(dead_code)]
-mod debug_events;
+mod debug;
+// 调试沙盒的既有扁平路径（`crate::debug_mode` 等）在 crate 内被大量引用。
+// 迁移到 `debug/` 目录后保留别名，避免一次性改数百个调用点。
 #[allow(dead_code)]
-mod debug_http_service;
+pub(crate) use debug::debug_events;
 #[allow(dead_code)]
-mod debug_mode;
+pub(crate) use debug::debug_http_service;
+// 进程级输入闸门：原住在 debug/ 下叫 debug_mode，但它服务所有输入路径
+// （runtime 17 次、adapters 17 次、ui、interfaces），不是调试专属。
+// 提到根级后，runtime→debug 的最大一条反边消失；保留别名供既有调用点。
+pub(crate) use input_gate as debug_mode;
 #[allow(dead_code)]
-mod debug_plugin_dispatch;
+pub(crate) use debug::debug_plugin_dispatch;
 #[allow(dead_code)]
-mod debug_plugin_process;
+pub(crate) use debug::debug_plugin_process;
 #[allow(dead_code)]
-mod debug_plugin_session;
+pub(crate) use debug::debug_plugin_session;
 #[allow(dead_code)]
-mod debug_plugin_stdio;
+pub(crate) use debug::debug_plugin_stdio;
 #[allow(dead_code)]
-mod debug_read_only;
+pub(crate) use debug::debug_read_only;
 #[allow(dead_code)]
-mod debug_sandbox;
-mod debug_sandbox_journal;
+pub(crate) use debug::debug_sandbox;
+pub(crate) use debug::debug_sandbox_journal;
 #[allow(dead_code)]
-mod debug_sandbox_runner;
-mod debug_sandbox_store;
+pub(crate) use debug::debug_sandbox_runner;
+pub(crate) use debug::debug_sandbox_store;
 mod features;
 mod interfaces;
 mod privacy;
@@ -175,6 +183,8 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    #[cfg(windows)]
+    #[cfg(windows)]
     #[test]
     fn default_configuration_is_next_to_the_supplied_executable() {
         let path = default_config_path(Path::new(r"C:\发布目录\主程序.exe"))

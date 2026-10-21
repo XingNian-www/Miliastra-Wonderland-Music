@@ -32,6 +32,29 @@ pub(crate) struct ReplyTemplate {
     pub(crate) group: &'static str,
 }
 
+/// AI 聊天回复。
+pub(crate) const AI_CHAT_FORGET: ReplyTemplate = ReplyTemplate {
+    key: "ai_chat.forget.done",
+    default: "已忘记关于你的记忆",
+    summary: "清空自己的 AI 记忆",
+    group: "AI 聊天",
+};
+
+/// 提问过长。
+pub(crate) const AI_CHAT_TOO_LONG: ReplyTemplate = ReplyTemplate {
+    key: "ai_chat.question.too_long",
+    default: "问题太长，请精简后再问",
+    summary: "提问超过长度上限",
+    group: "AI 聊天",
+};
+
+/// AI 暂不可用。
+pub(crate) const AI_CHAT_UNAVAILABLE: ReplyTemplate = ReplyTemplate {
+    key: "ai_chat.unavailable",
+    default: "我现在答不上来，稍后再问",
+    summary: "AI 调用失败",
+    group: "AI 聊天",
+};
 /// 渲染时的变量集合。AI 回答等动态文本以普通值形式放入。
 ///
 /// 实现 `PartialEq`/`Eq` 是为了让"待渲染消息"能放进 `#[derive(PartialEq, Eq)]`

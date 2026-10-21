@@ -27,6 +27,7 @@ use crate::features::undercover::UndercoverCommand;
 
 mod router;
 
+pub(crate) use crate::features::command::ChatCommandModule;
 pub(crate) use router::ChatCommandRouter;
 
 #[derive(Clone, Debug)]
@@ -87,17 +88,7 @@ pub(crate) fn parse_command_envelope(
         );
     }
 
-    let (username, body) = if message_type == "pink" || text.trim_start().starts_with(['[', '【'])
-    {
-        extract_bracket_sender(text)?
-    } else {
-        let separator_index = text.find(['：', ':', ']', '】'])?;
-        let separator_len = text[separator_index..].chars().next()?.len_utf8();
-        (
-            text[..separator_index].trim().to_string(),
-            &text[separator_index + separator_len..],
-        )
-    };
+    let (username, body) = split_sender_line(text, message_type)?;
     if username.is_empty() {
         return None;
     }
@@ -167,6 +158,29 @@ impl ConsoleCommandIntent {
             routed,
         }
     }
+}
+
+/// 把一行聊天拆成「发送者昵称」与「正文」。
+///
+/// 一级/二级大厅的 OCR 文本本身带昵称前缀（`[昵称]:内容`、`昵称：内容`），
+/// 消息结构里**没有**独立的 sender 字段，因此任何需要昵称的消费者都要走这里，
+/// 不要各自再写一套切分规则（全角冒号、方括号、昵称里的标点都要一致）。
+///
+/// 拆不开就返回 `None`：调用方必须把「拿不到发送者」当作 Unknown 处理，
+/// 不能编造身份去授权或记账。
+pub(crate) fn split_sender_line<'a>(
+    text: &'a str,
+    message_type: &str,
+) -> Option<(String, &'a str)> {
+    if message_type == "pink" || text.trim_start().starts_with(['[', '【']) {
+        return extract_bracket_sender(text);
+    }
+    let separator_index = text.find(['：', ':', ']', '】'])?;
+    let separator_len = text[separator_index..].chars().next()?.len_utf8();
+    Some((
+        text[..separator_index].trim().to_string(),
+        &text[separator_index + separator_len..],
+    ))
 }
 
 fn extract_bracket_sender(text: &str) -> Option<(String, &str)> {

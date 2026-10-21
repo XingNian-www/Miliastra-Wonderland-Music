@@ -729,7 +729,9 @@ fn migrate_legacy_ai_sections(sections: &mut Map<String, Value>) {
             if value.is_null() {
                 continue;
             }
-            legacy.entry(key.to_string()).or_insert_with(|| value.clone());
+            legacy
+                .entry(key.to_string())
+                .or_insert_with(|| value.clone());
         }
     }
     if legacy.is_empty() {
@@ -1579,8 +1581,14 @@ mod tests {
         let ai = sections["ai"].as_object().expect("shared ai section");
         // 密钥只在统一段为空时填补，且首个迁移来源优先。
         assert_eq!(ai["api_key"], json!("legacy-review-key"));
-        assert_eq!(ai["responses_endpoint"], json!("https://example.com/v1/responses"));
-        assert_eq!(ai["endpoint"], json!("https://example.com/v1/chat/completions"));
+        assert_eq!(
+            ai["responses_endpoint"],
+            json!("https://example.com/v1/responses")
+        );
+        assert_eq!(
+            ai["endpoint"],
+            json!("https://example.com/v1/chat/completions")
+        );
         // 遗留段本身不再保留 provider / ai 子对象。
         assert!(sections["song_review"].get("provider").is_none());
         assert!(sections["turtle_soup"].get("ai").is_none());
@@ -1603,7 +1611,10 @@ mod tests {
 
         let ai = sections["ai"].as_object().expect("shared ai section");
         assert_eq!(ai["api_key"], json!("current-key"));
-        assert_eq!(ai["endpoint"], json!("https://old.example/v1/chat/completions"));
+        assert_eq!(
+            ai["endpoint"],
+            json!("https://old.example/v1/chat/completions")
+        );
     }
 
     /// 构造测试用最小启动配置；统一数据库路径指向临时目录下的 playback.sqlite3

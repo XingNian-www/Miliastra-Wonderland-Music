@@ -17,7 +17,7 @@ use crate::config::AppConfig;
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::UiStateKind;
 use crate::ui::frame::Frame;
-use crate::ui::geometry::{Rect, crop_canvas};
+use crate::geometry::{Rect, crop_canvas};
 use crate::ui::template::best_template_hit;
 
 pub(crate) const SECONDARY_HALL_FALLBACK_SENDER: &str = "二级大厅";

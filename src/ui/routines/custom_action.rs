@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use image::imageops::FilterType;
 
 use super::friend_delivery::{FriendDeliveryRoutineConfig, UiResidencyTarget, restore_residency};
-use crate::adapters::windows::parse_key;
-use crate::interfaces::ui_plan::{
+use crate::adapters::input::parse_key;
+use crate::ui::plan::{
     WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
     WorkflowResidency,
 };
@@ -17,8 +17,8 @@ use crate::runtime::ui::{
     UiRoutineProgressStage, UiRuntimeHandle, UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::ui::change_detection::{change_stats, rect_chat_change_fingerprint};
-use crate::ui::geometry::{Point, Rect, crop_canvas};
+use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
+use crate::geometry::{Point, Rect, crop_canvas};
 use crate::ui::template::{TemplateHit, best_template_hit, template_exists};
 
 #[derive(Clone, Debug, PartialEq)]

@@ -7,6 +7,38 @@ use crate::features::song_request::{
 };
 
 impl SongRequestPort for ApplicationRuntime {
+    fn song_ai_command_allowed(&self, username: &str, console: bool) -> bool {
+        if console {
+            return true;
+        }
+        let snapshot = self.lifecycle.live_configs.snapshot();
+        let actor = crate::features::command_access::actor_permission(
+            self.lifecycle.live_configs.identity.role_of(username),
+            !username.trim().is_empty(),
+        );
+        crate::features::command_access::catalog_policy(&snapshot.command_access, "@AI点歌")
+            .is_some_and(|policy| policy.allows(actor))
+    }
+
+    fn song_source_allowed(&self, username: &str, source: &str, console: bool) -> bool {
+        if console {
+            return true;
+        }
+        let Some(source) = crate::features::song_request::SongSource::from_str(source) else {
+            return false;
+        };
+        let Some(id) = source.permission_id() else {
+            return false;
+        };
+        let snapshot = self.lifecycle.live_configs.snapshot();
+        let actor = crate::features::command_access::actor_permission(
+            self.lifecycle.live_configs.identity.role_of(username),
+            !username.trim().is_empty(),
+        );
+        crate::features::command_access::catalog_policy(&snapshot.command_access, id)
+            .is_some_and(|policy| policy.allows(actor))
+    }
+
     fn reply(&self, message: &str) -> Result<()> {
         ApplicationRuntime::reply(self, message)
     }

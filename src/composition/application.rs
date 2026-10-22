@@ -689,6 +689,7 @@ struct FormalTaskBusinessContext {
 
 struct FormalTaskLifecycleContext {
     config: AppConfig,
+    config_store: crate::config::SharedConfigStore,
     /// 热更新共享句柄集合：正式任务上下文（facade 重建）与 HTTP 服务共享同一份。
     live_configs: LiveConfigs,
     running: Arc<AtomicBool>,
@@ -781,7 +782,7 @@ impl FormalTaskExecutionContext {
                     paused: self.lifecycle.paused.clone(),
                     console_reply_context: self.lifecycle.console_reply_context.clone(),
                     monitor: self.lifecycle.monitor.clone(),
-                    config_store: None,
+                    config_store: Some(self.lifecycle.config_store.clone()),
                 },
             },
         }

@@ -84,7 +84,7 @@ pub(crate) struct CommandSpec {
     pub(crate) name: &'static str,
     /// 其它可触发写法（同义别名），全部等价。
     ///
-    /// 本项目有大量同义命令（`点歌`/`QQ点歌`/`AI点歌`…），这里是它们唯一的归口。
+    /// 同义命令（如 `点歌`/`QQ点歌`、`网易点歌`/`网易云点歌`）在所属功能注册表统一登记。
     pub(crate) aliases: &'static [&'static str],
     pub(crate) prefix: CommandPrefix,
     pub(crate) match_rule: CommandMatch,
@@ -180,72 +180,6 @@ use crate::features::command::CommandPrefix::{At, Hash};
 const BOTH: &[CommandAuthority] = &[HallMember, Friend];
 const HALL_ONLY: &[CommandAuthority] = &[HallMember];
 const FRIEND_ONLY: &[CommandAuthority] = &[Friend];
-
-/// 点歌类命令（@ 前缀）。
-///
-/// 大厅与好友的命令集不同：好友多出 B 站音源，大厅的 `点歌` 默认走 QQ。
-/// 这里按"同一语义归并别名"登记，具体音源差异由 `SongCommand::parse_chat` 决定。
-pub(crate) const SONG: &[CommandSpec] = &[
-    CommandSpec {
-        name: "点歌",
-        aliases: &["AI点歌", "QQ点歌", "网易点歌", "网易云点歌", "酷狗点歌"],
-        prefix: At,
-        match_rule: CommandMatch::Prefix {
-            allows_argument: true,
-        },
-        group: CommandGroup::Song,
-        authorities: HALL_ONLY,
-        summary: "按歌名点歌，可用前缀指定音源",
-        usage: &["@点歌晴天", "@网易点歌晴天", "@AI点歌晴天 周杰伦"],
-        hidden: false,
-    },
-    CommandSpec {
-        name: "搜索",
-        aliases: &["AI搜索", "QQ搜索", "网易搜索"],
-        prefix: At,
-        match_rule: CommandMatch::Prefix {
-            allows_argument: true,
-        },
-        group: CommandGroup::Song,
-        authorities: HALL_ONLY,
-        summary: "只搜索不点播，返回候选",
-        usage: &["@搜索晴天"],
-        hidden: false,
-    },
-    CommandSpec {
-        name: "点歌",
-        aliases: &[
-            "AI点歌",
-            "QQ点歌",
-            "网易点歌",
-            "网易云点歌",
-            "酷狗点歌",
-            "B站点歌",
-        ],
-        prefix: At,
-        match_rule: CommandMatch::Prefix {
-            allows_argument: true,
-        },
-        group: CommandGroup::Song,
-        authorities: FRIEND_ONLY,
-        summary: "好友点歌，额外支持 B 站音源",
-        usage: &["@点歌晴天", "@B站点歌BV1xx411c7mD"],
-        hidden: false,
-    },
-    CommandSpec {
-        name: "搜索",
-        aliases: &["AI搜索", "QQ搜索", "网易搜索", "B站搜索"],
-        prefix: At,
-        match_rule: CommandMatch::Prefix {
-            allows_argument: true,
-        },
-        group: CommandGroup::Song,
-        authorities: FRIEND_ONLY,
-        summary: "好友搜索，额外支持 B 站音源",
-        usage: &["@搜索晴天"],
-        hidden: false,
-    },
-];
 
 /// 播放控制命令（@ 前缀，大厅为主）。
 pub(crate) const PLAYBACK: &[CommandSpec] = &[
@@ -966,7 +900,8 @@ pub(crate) const FRIEND_MISC: &[CommandSpec] = &[
 
 /// 全部静态命令（不含会话态命令）。
 pub(crate) fn static_commands() -> impl Iterator<Item = &'static CommandSpec> {
-    SONG.iter()
+    crate::features::song_request::command_specs()
+        .iter()
         .chain(PLAYBACK.iter())
         .chain(HALL.iter())
         .chain(ADMINISTRATION.iter())
@@ -1216,6 +1151,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn song_catalog_reuses_platform_registry_without_duplicate_policy_ids() {
+        let registered = crate::features::song_request::command_specs();
+        assert_eq!(registered.len(), 5);
+        let catalog = all_specs();
+        for spec in registered {
+            assert_eq!(
+                catalog
+                    .iter()
+                    .filter(|entry| entry.name == spec.name && entry.prefix == spec.prefix)
+                    .count(),
+                1
+            );
+            assert!(catalog.iter().any(|entry| std::ptr::eq(*entry, spec)));
+        }
+        let names: std::collections::BTreeSet<_> =
+            registered.iter().map(|spec| spec.name).collect();
+        assert_eq!(
+            names,
+            ["QQ点歌", "网易点歌", "酷狗点歌", "B站点歌", "AI点歌"]
+                .into_iter()
+                .collect()
+        );
+        for spec in catalog {
+            assert!(
+                spec.all_names().all(|name| !name.contains("搜索")),
+                "removed search entry: {}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
     fn catalog_entries_have_unique_prefix_name_and_authority_combinations() {
         // 同一命令在不同来源下可以分别登记（大厅与好友的点歌集不同），
         // 但"前缀 + 写法 + 来源"三者完全相同就是重复登记。
@@ -1280,13 +1247,14 @@ mod tests {
         // 无参数命令后面多出内容就不该命中。
         assert!(!pause.matches_text("暂停现在"));
 
-        let song = SONG
+        let song = crate::features::song_request::command_specs()
             .iter()
-            .find(|spec| spec.name == "点歌" && spec.authorities == HALL_ONLY)
-            .expect("大厅点歌 已登记");
+            .find(|spec| spec.name == "QQ点歌")
+            .expect("QQ点歌 已登记");
         assert!(song.matches_text("点歌晴天"));
         assert!(song.matches_text("点歌 晴天"));
-        assert!(song.matches_text("AI点歌晴天"), "别名必须等价");
+        assert!(song.matches_text("QQ点歌晴天"), "默认点歌别名必须可匹配");
+        assert!(!song.matches_text("AI点歌晴天"), "AI 点歌是独立权限入口");
     }
 
     #[test]

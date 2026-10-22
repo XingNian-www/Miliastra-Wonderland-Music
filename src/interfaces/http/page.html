@@ -172,6 +172,12 @@ button,input,select,textarea{font:inherit}
 .sparkline{flex:none;background:var(--fill-1);border-radius:var(--radius-s)}
 #monitorLogs{min-height:240px;max-height:420px}
 #monitorCommands{max-height:150px}
+#visualProfileForm fieldset{border:1px solid var(--sep-1);border-radius:var(--radius-m);margin:var(--sp-3) 0;padding:var(--sp-3);min-width:0}
+#visualProfileForm fieldset fieldset{display:inline-block;vertical-align:top;max-width:100%}
+#visualProfileForm label{display:inline-flex;flex-direction:column;gap:var(--sp-1);margin:var(--sp-1);max-width:100%}
+#visualProfileForm input{max-width:100%}
+#visualProfileForm input[type=text]{width:320px;min-width:0}
+#visualProfileForm input[type=number]{width:120px}
 .queue-list{display:flex;flex-direction:column;gap:var(--sp-1);min-height:94px;max-height:180px;overflow:auto}
 .empty-hint{color:var(--text-3);font-size:var(--fs-meta);text-align:center;padding:var(--sp-4) var(--sp-2)}
 .queue-item,.pending-item,.task-item,.candidate-item,.undercover-player{background:var(--bg-input);border:1px solid var(--sep-2);border-radius:var(--radius-s);transition:background-color .2s ease}
@@ -659,7 +665,8 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
       </div>
       <div class="config-message err hidden" id="commandError" role="status" aria-live="polite"></div>
       <div class="command-groups" id="commandGroups"><div class="command-empty">正在读取命令目录…</div></div>
-      <p class="command-foot">命令开关请在「游戏与聊天 → 机器人操作」中切换；本页仅展示目录，不发送任何游戏输入。</p>
+      <div class="row"><button class="btn primary" id="commandPolicySave" onclick="saveCommandPolicies()" disabled>保存命令设置（0）</button><button class="btn" onclick="discardCommandPolicies()">放弃草稿并重载</button><span id="commandPolicyStatus" role="status"></span></div>
+      <p class="command-foot">最低权限按普通用户 → 好友 → 管理员 → 主人逐级包含。来源与权限分开；修改后统一保存，锁定命令按提示处理。</p>
     </section>
     <section class="page-section" id="page-aichat" data-page="aichat">
       <h1 class="page-title">AI 聊天</h1>
@@ -741,19 +748,21 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         <span id="configSavedAt">尚未保存</span>
         <span id="configDirtyHint" class="config-dirty hidden">有未保存的修改</span>
       </div>
-      <details class="panel" id="visualProfilePanel">
+      <details class="panel" id="visualProfilePanel" open>
         <summary class="panel-head">视觉档案：模板与分辨率</summary>
         <div class="panel-body">
-          <p>坐标统一使用基准画布。导出已保存配置；导入前先校验并预览差异，自定义流程保持原配置。</p>
+          <p>默认档案为 1080P（1920 × 1080）。下方按分组编辑名称、模板、区域和坐标，校验差异后保存；坐标使用基准画布，不会自动缩放。</p>
           <div class="row">
-            <button class="btn" onclick="loadVisualProfile()">刷新状态</button>
+            <button class="btn" onclick="loadVisualProfile(true)">重新加载保存值</button>
             <button class="btn" onclick="exportVisualProfile()">导出 JSON</button>
+            <button class="btn" onclick="restoreVisualDefaults()">恢复默认1080P</button>
             <label class="btn">选择 JSON<input type="file" id="visualProfileFile" accept="application/json,.json" onchange="readVisualProfile(this)" hidden></label>
             <button class="btn" onclick="previewVisualProfile()">校验与预览</button>
-            <button class="btn primary" id="visualImportButton" onclick="importVisualProfile()" disabled>导入已预览档案</button>
+            <button class="btn primary" id="visualImportButton" onclick="importVisualProfile()" disabled>保存已预览档案</button>
           </div>
           <p id="visualProfileStatus" role="status">点击刷新状态查看保存值与生效值</p>
-          <textarea id="visualProfileText" rows="12" style="width:100%" aria-label="视觉档案 JSON" oninput="invalidateVisualPreview()" placeholder="选择 JSON 文件，或粘贴通过导出得到的档案"></textarea>
+          <div id="visualProfileForm" class="config-form">正在加载视觉档案…</div>
+          <details><summary>高级：JSON 导入与编辑</summary><p>JSON 修改后点击“应用到表单”，再校验保存。</p><textarea id="visualProfileText" rows="12" style="width:100%" aria-label="视觉档案 JSON" oninput="visualJsonChanged()"></textarea><button class="btn" onclick="applyVisualProfileJson()">应用到表单</button></details>
           <pre id="visualProfilePreview" style="white-space:pre-wrap;overflow-wrap:anywhere" aria-live="polite"></pre>
         </div>
       </details>
@@ -1195,6 +1204,11 @@ let configRevisionsOpen=false
 let configSecretDraft={}
 // 命令面板状态：navigateTo 在脚本中段即被调用，声明必须位于其之前，避免 TDZ。
 let commandCatalog=null              // GET /commands/catalog 响应 {commandsEnabled, groups}
+let commandPolicyDraft=new Map()
+let commandPolicyBaseRevision=null
+let commandPolicySaving=false
+const commandRoleLabels={user:'普通用户',friend:'好友',admin:'管理员',owner:'主人'}
+let commandCatalogGeneration=0
 let commandCatalogLoading=false
 let commandCatalogError=''
 let commandCatalogFetchedAt=0        // 最近一次成功读取时间，用于刷新节流
@@ -2438,7 +2452,55 @@ document.addEventListener('keydown',event=>{
     event.preventDefault()
   }
 })
-/* ===== 命令面板（GET /commands/catalog，只读） ===== */
+/* ===== 命令目录与权限编辑 ===== */
+function commandPolicyHtml(item){
+  if(!item.id)return '<p class="config-field-hint">此命令未提供可编辑策略。</p>'
+  const policy=commandPolicyDraft.get(String(item.id))||item
+  const roles=Object.keys(commandRoleLabels)
+  const floor=roles.indexOf(item.minimumFloor||'user')
+  const disabled=commandPolicySaving||item.editable!==true||floor<0||!(policy.minimumRole in commandRoleLabels)?' disabled':''
+  return '<div class="row" data-policy-id="'+commandEscape(item.id)+'"><label class="switch-line"><input type="checkbox" data-policy-enabled'+(policy.enabled!==false?' checked':'')+disabled+'>启用</label><label>最低权限 <select data-policy-role'+disabled+'>'+Object.entries(commandRoleLabels).map(([value,label])=>'<option value="'+value+'"'+(policy.minimumRole===value?' selected':'')+(roles.indexOf(value)<floor?' disabled':'')+'>'+label+'</option>').join('')+'</select></label>'+(commandPolicyDraft.has(String(item.id))?'<span class="config-dirty">未保存</span>':'')+'</div>'+(floor>0?'<p class="config-field-hint">此命令的权限下限为'+commandEscape(commandRoleLabels[item.minimumFloor])+'，不能降低；仍可单独禁用。</p>':'')+(item.lockedReason?'<p class="config-field-hint">'+commandEscape(item.lockedReason)+'</p>':'')
+}
+function updateCommandPolicyUI(){
+  const save=$('commandPolicySave')
+  if(save){save.disabled=commandPolicySaving||!commandPolicyDraft.size;save.textContent=commandPolicySaving?'保存中…':'保存命令设置（'+commandPolicyDraft.size+'）'}
+}
+document.addEventListener('change',event=>{
+  const control=event.target
+  if(!control.matches('[data-policy-enabled],[data-policy-role]'))return
+  const row=control.closest('[data-policy-id]')
+  const id=row.dataset.policyId
+  const item=(commandCatalog?.groups||[]).flatMap(group=>group.commands||[]).find(item=>String(item.id)===id)
+  if(!item||item.editable!==true||commandPolicySaving)return
+  if(!commandPolicyDraft.size)commandPolicyBaseRevision=commandCatalog.revision
+  const draft={id,enabled:row.querySelector('[data-policy-enabled]').checked,minimumRole:row.querySelector('[data-policy-role]').value}
+  if(draft.enabled===item.enabled&&draft.minimumRole===item.minimumRole)commandPolicyDraft.delete(id)
+  else commandPolicyDraft.set(id,draft)
+  renderCommandCatalog();updateCommandPolicyUI()
+})
+function discardCommandPolicies(){
+  if(commandPolicySaving)return
+  if(commandPolicyDraft.size&&!confirm('放弃未保存的命令设置并重新读取？'))return
+  commandPolicyDraft.clear();commandPolicyBaseRevision=null;loadCommandCatalog(true)
+}
+async function saveCommandPolicies(){
+  if(commandPolicySaving||!commandPolicyDraft.size)return
+  commandPolicySaving=true;renderCommandCatalog();updateCommandPolicyUI()
+  try{
+    const result=await requestJson('/commands/policy',{baseRevision:commandPolicyBaseRevision,items:[...commandPolicyDraft.values()]})
+    if(!result||result.ok!==true)throw new Error(result?.code==='config_conflict'?'配置版本已变化，草稿已保留。请记录修改后点“放弃草稿并重载”，再重新编辑保存。':result?.message||JSON.stringify(result?.errors)||'保存失败')
+    // 发布已落库的本地状态，再刷新；刷新失败也不能恢复成旧策略或旧版本。
+    commandCatalogGeneration++
+    for(const group of commandCatalog.groups||[])for(const item of group.commands||[]){
+      const saved=commandPolicyDraft.get(String(item.id));if(saved)Object.assign(item,saved)
+    }
+    commandCatalog.revision=result.revision
+    commandPolicyDraft.clear();commandPolicyBaseRevision=null
+    await loadCommandCatalog(true)
+    $('commandPolicyStatus').textContent='命令设置已保存，版本 '+result.revision+(commandCatalogError?'；目录刷新失败，当前显示已保存策略。':'')
+  }catch(e){commandCatalogError='保存失败：'+e.message;renderCommandError()}
+  finally{commandPolicySaving=false;renderCommandCatalog();updateCommandPolicyUI()}
+}
 function commandText(value){return typeof value==='string'?value.trim():''}
 function commandList(value){
   if(Array.isArray(value))return value.map(commandText).filter(text=>text.length>0)
@@ -2501,13 +2563,14 @@ function commandItemHtml(item,index,groupName,showHidden){
     '<div class="command-head"><div class="command-title"><span class="command-name">'+commandEscape(name)+'</span>'+
     aliases.map(alias=>'<span class="command-alias">'+commandEscape(alias)+'</span>').join('')+'</div>'+
     '<div class="command-badges">'+commandBadge(prefix,'prefix')+
-      (source.hall&&!source.unknown?commandBadge('大厅','source'):'')+
-      (source.friend&&!source.unknown?commandBadge('好友','source'):'')+
-      (source.unknown?commandBadge(sourceBadge,'source'):'')+
+      (source.hall&&!source.unknown?commandBadge('语法来源：大厅','source'):'')+
+      (source.friend&&!source.unknown?commandBadge('语法来源：好友','source'):'')+
+      (source.unknown?commandBadge('语法来源：'+sourceBadge,'source'):'')+
       (openEnded?commandBadge('会话中可自由输入','open'):'')+
       (hidden?commandBadge('隐藏','hidden-mark'):'')+
       (enabled?'':commandBadge('已禁用','disabled-mark'))+'</div></div>'+
     '<p class="command-summary">'+commandEscape(commandText(item.summary)||'（暂无摘要）')+'</p>'+
+    commandPolicyHtml(item)+
     '<div class="command-toggle"><button class="btn small ghost toggle-command-detail" type="button">'+(expanded?'收起用法':'查看用法与示例')+'</button></div>'+
     (expanded?commandDetailHtml(item,usage,examples):'')+
     '</div>'
@@ -2568,6 +2631,7 @@ function renderCommandCatalog(){
   const html=ordered.map(group=>commandGroupHtml(group,showHidden)).join('')
   host.innerHTML=html||'<div class="command-empty">没有匹配的命令；可清空搜索、放宽来源过滤，或勾选「显示隐藏命令」。</div>'
   updateCommandToolbarMeta(groups)
+  updateCommandPolicyUI()
 }
 function updateCommandToolbarMeta(groups){
   const meta=$('commandCatalogMeta')
@@ -2613,24 +2677,35 @@ function renderCommandStatus(){
   }
 }
 async function loadCommandCatalog(force){
-  if(commandCatalogLoading)return
+  if(commandCatalogLoading&&!force)return
   // 目录是静态数据：非强制时按时间节流，避免全量刷新/切页反复打后端。
   if(!force&&commandCatalog&&Date.now()-commandCatalogFetchedAt<commandRefreshMinInterval)return
+  const generation=++commandCatalogGeneration
   commandCatalogLoading=true
   try{
     const data=await request('/commands/catalog')
+    if(generation!==commandCatalogGeneration)return
+    if(commandCatalog?.revision!=null&&data.revision<commandCatalog.revision)throw new Error('目录版本早于已保存版本，请重新刷新')
     if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('命令目录响应格式不正确')
     if(!Array.isArray(data.groups))throw new Error('命令目录缺少 groups 字段')
-    commandCatalog={commandsEnabled:data.commandsEnabled,groups:data.groups}
+    // 编辑时固定基线与目录，周期刷新不能覆盖草稿或悄悄提升保存版本。
+    if(!commandPolicyDraft.size)commandCatalog={commandsEnabled:data.commandsEnabled,groups:data.groups,revision:data.revision}
+    else if(data.revision!==commandPolicyBaseRevision){
+      commandCatalogError='配置已有新版本；本地草稿已保留，保存时将检查冲突。'
+      return
+    }
     commandCatalogError=''
     commandCatalogFetchedAt=Date.now()
   }catch(e){
     // 后端未就绪时只提示，不抛未捕获异常；保留上一次成功数据。
+    if(generation!==commandCatalogGeneration)return
     commandCatalogError='读取命令目录失败：'+(e&&e.message?e.message:'未知错误')
   }finally{
-    commandCatalogLoading=false
-    renderCommandStatus()
-    renderCommandCatalog()
+    if(generation===commandCatalogGeneration){
+      commandCatalogLoading=false
+      renderCommandStatus()
+      renderCommandCatalog()
+    }
   }
 }
 function setCommandSourceFilter(filter){
@@ -3114,10 +3189,9 @@ function toggleVisualFields(){
   renderConfigSectionList()
   renderConfigForm()
 }
-// 档案接管的字段默认收起；整段都由档案接管时（如 screen）仍显示原字段，
-// 否则该段会变成空白页。搜索与“显示档案字段”都会覆盖收起。
+// 档案字段在所有配置段和搜索结果中默认隐藏，仅显式展开时显示。
 function configSectionHidesVisual(section){
-  return !configShowVisualFields&&!configSearchText&&section.fields.some(f=>f.managedBy!=='visual')
+  return !configShowVisualFields
 }
 function selectConfigSection(name){
   if(name===configActiveSection)return
@@ -3577,7 +3651,7 @@ function setConfigSavingUI(saving){
   document.querySelectorAll('#page-config .btn').forEach(btn=>{btn.disabled=saving})
   const search=$('configSearch')
   if(search)search.disabled=saving
-  document.querySelectorAll('#configForm input, #configForm textarea, #configForm select').forEach(control=>{
+  document.querySelectorAll('#configForm input, #configForm textarea, #configForm select, #visualProfileForm input, #visualProfileText, #visualProfileFile').forEach(control=>{
     if(saving){control.dataset.savingDisabled=control.disabled?'1':'0';control.disabled=true}
     else if(control.dataset.savingDisabled!==undefined){control.disabled=control.dataset.savingDisabled==='1';delete control.dataset.savingDisabled}
   })
@@ -3610,6 +3684,61 @@ async function applyConfigSaveResult(resp,action){
   if(resp.restartRequired)message+='\n以下配置需重启生效：'+formatConfigFields(resp.restartFields)
   showConfigMessage(message,'ok')
 }
+let visualDraft=null
+let visualDraftDirty=false
+let visualJsonDirty=false
+let visualDefaultProfile=null
+const visualLabels={name:'档案名称',canvas:'基准画布',width:'宽度',height:'高度',templates:'模板路径',thresholds:'匹配阈值',regions:'识别区域',points:'点击坐标',chat_geometry:'聊天几何',capture:'截图设置',matching:'匹配设置',x:'横坐标 X',y:'纵坐标 Y'}
+function visualValueHtml(value,path){
+  const key=path[path.length-1]
+  const schemaField=configFieldByPath(key)||configFieldByPath('window.'+key)||configFieldByPath('ocr.'+key)
+  const label=visualLabels[key]||(schemaField&&schemaField.label)||key
+  if(value&&typeof value==='object'&&!Array.isArray(value))return '<fieldset><legend>'+esc(label)+'</legend>'+Object.entries(value).map(([key,item])=>visualValueHtml(item,[...path,key])).join('')+'</fieldset>'
+  const attr=' data-visual-path="'+esc(JSON.stringify(path))+'" data-visual-type="'+(Array.isArray(value)?'array':typeof value)+'"'
+  let control
+  if(schemaField?.kind?.type==='enum')control='<select'+attr+'>'+schemaField.kind.values.map(item=>'<option value="'+esc(item.value)+'"'+(value===item.value?' selected':'')+'>'+esc(item.label)+'</option>').join('')+'</select>'
+  else if(typeof value==='boolean')control='<input type="checkbox"'+attr+(value?' checked':'')+'>'
+  else control='<input type="'+(typeof value==='number'?'number':'text')+'"'+attr+(typeof value==='number'?' step="any"':'')+' value="'+esc(Array.isArray(value)?value.join(', '):String(value??''))+'">'
+  return '<label class="config-field"><span>'+esc(label)+'</span>'+control+(Array.isArray(value)?'<small>数值列表，以逗号分隔</small>':'')+'</label>'
+}
+function renderVisualProfileForm(){
+  $('visualProfileForm').innerHTML=visualDraft?Object.entries(visualDraft).filter(([key])=>key!=='schema_version').map(([key,value])=>visualValueHtml(value,[key])).join(''):'请重新加载视觉档案。'
+}
+function visualJsonChanged(){visualJsonDirty=true;visualDraftDirty=true;invalidateVisualPreview()}
+function applyVisualProfileJson(){
+  try{
+    const profile=JSON.parse($('visualProfileText').value)
+    if(!profile||typeof profile!=='object'||Array.isArray(profile)||!profile.canvas)throw new Error('档案必须包含基准画布')
+    visualDraft=profile;visualJsonDirty=false;visualDraftDirty=true;invalidateVisualPreview();renderVisualProfileForm()
+    $('visualProfileStatus').textContent='JSON 已应用到表单，尚未保存。'
+  }catch(e){$('visualProfileStatus').textContent='JSON 无效：'+e.message}
+}
+function restoreVisualDefaults(){
+  if(!visualDefaultProfile)return
+  if(visualDraftDirty&&!confirm('用默认1080P档案替换当前未保存修改？'))return
+  visualDraft=JSON.parse(JSON.stringify(visualDefaultProfile));visualDraftDirty=true;visualJsonDirty=false
+  $('visualProfileText').value=JSON.stringify(visualDraft,null,2);invalidateVisualPreview();renderVisualProfileForm()
+  $('visualProfileStatus').textContent='已载入默认1080P档案，请校验差异后保存。'
+}
+function onVisualProfileInput(event){
+  const control=event.target.closest('[data-visual-path]')
+  if(!control||!visualDraft)return
+  invalidateVisualPreview();visualDraftDirty=true
+  let value=control.value
+  if(control.dataset.visualType==='boolean')value=control.checked
+  if(control.dataset.visualType==='number')value=control.value.trim()===''?NaN:Number(control.value)
+  if(control.dataset.visualType==='array')value=control.value.split(/[,，]/).map(item=>item.trim()).filter(Boolean).map(Number)
+  const valid=typeof value==='number'?Number.isFinite(value):Array.isArray(value)?value.length>0&&value.every(Number.isFinite):true
+  control.setCustomValidity(valid?'':'请输入有效数值')
+  if(!valid)return
+  setNestedValue(visualDraft,JSON.parse(control.dataset.visualPath),value)
+  visualJsonDirty=false;$('visualProfileText').value=JSON.stringify(visualDraft,null,2)
+  $('visualProfileStatus').textContent='视觉档案有未保存修改，请校验与预览。'
+}
+document.addEventListener('input',onVisualProfileInput)
+document.addEventListener('change',event=>{if(event.target.matches('#visualProfileForm select'))onVisualProfileInput(event)})
+let visualLoadGeneration=0
+let visualSavedRevision=null
 let visualPreview=null
 let visualPreviewGeneration=0
 let visualImportBusy=false
@@ -3618,14 +3747,30 @@ function invalidateVisualPreview(){
   visualPreview=null
   $('visualImportButton').disabled=true
 }
-async function loadVisualProfile(){
+async function loadVisualProfile(replaceDraft=false){
+  if(replaceDraft&&visualDraftDirty&&!confirm('重新加载会丢弃未保存的视觉修改，继续？'))return
+  const generation=++visualLoadGeneration
+  const draftGeneration=visualPreviewGeneration
   try{
     const data=await request('/config/visual')
+    if(generation!==visualLoadGeneration)return
     if(!data||data.ok!==true)throw new Error(data&&data.message||'获取失败')
+    if(visualSavedRevision!=null&&data.revision<visualSavedRevision)throw new Error('档案版本早于已保存版本，请重新加载')
+    visualSavedRevision=data.revision
+    visualDefaultProfile=data.defaultProfile||null
+    if(draftGeneration===visualPreviewGeneration&&(!visualDraft||replaceDraft||!visualDraftDirty)){
+      invalidateVisualPreview();visualDraft=JSON.parse(JSON.stringify(data.profile));visualDraftDirty=false;visualJsonDirty=false
+      $('visualProfileText').value=JSON.stringify(visualDraft,null,2);renderVisualProfileForm()
+    }
     const pending=data.pendingReloadFields||[]
     $('visualProfileStatus').textContent='保存版本 '+data.revision+'；基准画布 '+data.profile.canvas.width+'×'+data.profile.canvas.height+'；'+(pending.length?'待重载字段：'+pending.join('、'):'当前没有待重载字段')+'。'+data.statusNote
-    $('visualProfilePreview').textContent=JSON.stringify({effectiveProfile:data.effectiveProfile,catalog:data.catalog},null,2)
-  }catch(e){$('visualProfileStatus').textContent='加载失败：'+e.message}
+    if(!visualPreview)$('visualProfilePreview').textContent='档案：'+(data.profile.name||'1080P')+'。'+(visualDraftDirty?'保留本地未保存修改。':'可编辑表单后预览保存。')
+    return true
+  }catch(e){
+    if(generation!==visualLoadGeneration)return
+    $('visualProfileStatus').textContent=(visualImportBusy?'视觉档案已保存，版本 '+visualSavedRevision+'；刷新失败：':'加载失败：')+e.message
+    return false
+  }
 }
 async function exportVisualProfile(){
   try{
@@ -3644,7 +3789,7 @@ async function readVisualProfile(input){
   const file=input.files&&input.files[0]
   if(!file)return
   if(file.size>60000){$('visualProfileStatus').textContent='档案超过 60KB，请检查文件内容。';return}
-  try{$('visualProfileText').value=await file.text();$('visualProfileStatus').textContent='文件已读取，请校验与预览。'}
+  try{$('visualProfileText').value=await file.text();applyVisualProfileJson()}
   catch(e){$('visualProfileStatus').textContent='读取失败：'+e.message}
 }
 async function previewVisualProfile(){
@@ -3652,6 +3797,10 @@ async function previewVisualProfile(){
   const text=$('visualProfileText').value
   const generation=visualPreviewGeneration
   try{
+    if(visualJsonDirty)throw new Error('请先将 JSON 应用到表单')
+    if(!visualDraft)throw new Error('请先加载档案')
+    const invalid=$('visualProfileForm').querySelector(':invalid')
+    if(invalid){invalid.reportValidity();throw new Error('请修正表单中的数值')}
     const profile=JSON.parse(text)
     const result=await requestJson('/config/visual/preview',{profile})
     if(!result||result.ok!==true)throw new Error(result&&result.errors?JSON.stringify(result.errors):result&&result.message||'校验失败')
@@ -3672,7 +3821,13 @@ async function importVisualProfile(){
   try{
     const result=await requestJson('/config/visual/import',{baseRevision:preview.revision,profile:preview.profile})
     if(!result||result.ok!==true)throw new Error(result&&result.message||JSON.stringify(result&&result.errors)||'导入失败')
-    await applyConfigSaveResult(result,'视觉档案已导入')
+    visualLoadGeneration++
+    visualSavedRevision=result.revision
+    visualDraft=JSON.parse(JSON.stringify(preview.profile));visualDraftDirty=false;visualJsonDirty=false
+    $('visualProfileText').value=JSON.stringify(visualDraft,null,2);renderVisualProfileForm()
+    $('visualProfileStatus').textContent='视觉档案已保存，版本 '+result.revision
+    try{await applyConfigSaveResult(result,'视觉档案已保存')}
+    catch(e){showConfigMessage('视觉档案已保存，版本 '+result.revision+'；配置刷新失败：'+e.message,'err')}
     await loadVisualProfile()
   }catch(e){$('visualProfileStatus').textContent='导入失败：'+e.message+'；请重新预览。'}
   finally{visualImportBusy=false;setConfigSavingUI(false);invalidateVisualPreview()}
@@ -3692,6 +3847,7 @@ async function loadConfigPage(){
     renderConfigStatus()
     renderConfigSectionList()
     renderConfigForm()
+    if(!visualDraft)await loadVisualProfile()
     clearConfigMessage()
     if(configRevisionsOpen)loadConfigRevisions()
   }catch(e){
@@ -3843,7 +3999,7 @@ $('configSearch').addEventListener('input',()=>{
   },200)
 })
 window.addEventListener('beforeunload',(e)=>{
-  if(configUnsaved){e.preventDefault();e.returnValue='有未保存的配置修改，确定离开？'}
+  if(configUnsaved||visualDraftDirty||commandPolicyDraft.size){e.preventDefault();e.returnValue='有未保存的修改，确定离开？'}
 })
 // 配置中心 Ctrl+S / Cmd+S 快捷保存
 document.addEventListener('keydown',(e)=>{

@@ -4293,7 +4293,10 @@ fn config_route_masks_secrets_and_reports_revision() {
     let response: Value = serde_json::from_str(&config_route(&[], &state).unwrap()).unwrap();
     assert_eq!(response["ok"], true);
     assert_eq!(response["revision"], 2);
-    assert_eq!(response["schemaVersion"], 1);
+    assert_eq!(
+        response["schemaVersion"],
+        crate::config::CONFIG_SCHEMA_VERSION
+    );
     assert_eq!(response["sections"]["ai"]["api_key"], "••••••");
     // 数据库中的真实密钥必须保留（脱敏只影响展示）。
     let store = state.config_store.lock().unwrap();
@@ -4365,12 +4368,18 @@ fn config_schema_route_lists_all_sections_with_defaults() {
         .find(|field| field["path"] == "templates.blue_marker")
         .expect("templates.blue_marker field");
     assert_eq!(blue["managedBy"], "visual");
-    assert_eq!(templates["visualFields"], 21);
+    assert_eq!(templates["visualFields"], 20);
     let ocr = sections
         .iter()
         .find(|section| section["name"] == "ocr")
         .expect("ocr section");
-    assert_eq!(ocr["visualFields"], 14);
+    assert_eq!(
+        ocr["visualFields"].as_u64().unwrap() as usize,
+        crate::config::visual::managed_paths()
+            .iter()
+            .filter(|path| path.starts_with("ocr."))
+            .count()
+    );
     let http = sections
         .iter()
         .find(|section| section["name"] == "http")
@@ -5302,6 +5311,46 @@ fn commands_catalog_route_serves_the_panel_contract_over_real_http() {
     );
 
     server.shutdown().expect("shutdown HTTP server");
+}
+
+#[test]
+fn command_policy_panel_save_is_live_and_revision_safe() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+    let catalog: Value =
+        serde_json::from_str(&http_get(server.local_addr(), "/commands/catalog", None).body)
+            .unwrap();
+    let revision = catalog["revision"].as_u64().unwrap();
+    let body = json!({"baseRevision":revision,"items":[{"id":"@点歌","enabled":false,"minimumRole":"admin"}]}).to_string();
+    let response = http_post_json(server.local_addr(), "/commands/policy", &body, None);
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+    let saved: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(saved["ok"], true, "{}", response.body);
+    let policy = &state.live_configs.snapshot().command_access.overrides["@点歌"];
+    assert!(!policy.enabled);
+    assert_eq!(serde_json::to_value(policy.minimum_role).unwrap(), "admin");
+    let stale = http_post_json(server.local_addr(), "/commands/policy", &body, None);
+    let stale: Value = serde_json::from_str(&stale.body).unwrap();
+    assert_eq!(stale["code"], "config_conflict");
+    let revision = state
+        .config_store
+        .lock()
+        .unwrap()
+        .current_revision()
+        .unwrap();
+    let invalid = json!({"baseRevision":revision,"items":[{"id":"@不存在的命令","enabled":true,"minimumRole":"user"}]}).to_string();
+    let response = http_post_json(server.local_addr(), "/commands/policy", &invalid, None);
+    assert_ne!(response.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .current_revision()
+            .unwrap(),
+        revision
+    );
+    server.shutdown().unwrap();
 }
 
 #[test]

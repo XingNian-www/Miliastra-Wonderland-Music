@@ -28,7 +28,6 @@ pub(crate) struct UiTemplateArgs {
     friend_template: Option<PathBuf>,
     secondary_back_template: Option<PathBuf>,
     main_menu_template: Option<PathBuf>,
-    hall_bar_template: Option<PathBuf>,
     chat_templates: TemplateArgs,
 }
 
@@ -40,10 +39,6 @@ pub(crate) struct ResolvedUiTemplateArgs {
     /// 主菜单「返回提瓦特」按钮模板。它比 secondary_back 优先判定：
     /// 奇域主菜单上也有那个圆形返回按钮，若不先挡住，菜单会被误判成二级聊天。
     pub(crate) main_menu_template: PathBuf,
-    /// 千星大厅底栏 👥 O 图标组模板。
-    /// 聊天标记判据必须同时命中它——提瓦特的世界聊天也有蓝/黄/粉气泡（第 46 节缺陷）。
-    #[allow(dead_code)]
-    pub(crate) hall_bar_template: PathBuf,
     pub(crate) world_wish_template: PathBuf,
     pub(crate) chat_templates: ResolvedTemplateArgs,
     /// 面板判据模板（好友面板 / 更多设置菜单 / 添加好友页 / 确认弹窗 /
@@ -84,10 +79,6 @@ impl UiTemplateArgs {
                 .main_menu_template
                 .clone()
                 .unwrap_or_else(|| templates.main_menu.clone()),
-            hall_bar_template: self
-                .hall_bar_template
-                .clone()
-                .unwrap_or_else(|| templates.hall_bar.clone()),
             world_wish_template: templates.world_wish.clone(),
             chat_templates: self.chat_templates.resolve(templates, ocr),
             friend_panel_template: templates.friend_panel.clone(),

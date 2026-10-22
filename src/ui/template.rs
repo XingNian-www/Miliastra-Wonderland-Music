@@ -57,7 +57,6 @@ struct GrayTemplate {
     gray_stddev: f32,
 }
 
-
 pub(crate) fn find_template_hits(
     image: &DynamicImage,
     search_rect: Option<Rect>,

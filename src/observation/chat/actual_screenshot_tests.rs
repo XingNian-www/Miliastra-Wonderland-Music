@@ -2,6 +2,7 @@
 use super::*;
 use crate::config::AppConfig;
 use crate::features::command::{CommandEnvelope, CommandObservation, CommandPrefix};
+use crate::geometry::{Rect, crop_canvas};
 use crate::interfaces::chat::{
     ChatCommandRouter, parse_command_envelope, parse_structured_song_envelope,
 };
@@ -11,7 +12,6 @@ use crate::runtime::ocr::{
 };
 use crate::runtime::ui::{CaptureFrame, UiDevice, UiRuntime, UiStateKind, UiStateObservation};
 use crate::ui::frame::{Canvas, Frame, from_captured_frame};
-use crate::geometry::{Rect, crop_canvas};
 use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 use anyhow::{Context, Result, anyhow, ensure};
 use image::DynamicImage;

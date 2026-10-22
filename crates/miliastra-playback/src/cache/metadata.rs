@@ -849,7 +849,7 @@ mod tests {
         ] {
             let k = key(source, id);
             store
-                .upsert_track(&k, with_metadata.then_some(&metadata),None)
+                .upsert_track(&k, with_metadata.then_some(&metadata), None)
                 .unwrap();
             if complete {
                 store
@@ -890,7 +890,7 @@ mod tests {
             let k = key("qqmusic", &i.to_string());
             let mut metadata = sample_metadata();
             metadata.title = format!("歌曲{i}");
-            store.upsert_track(&k, Some(&metadata),None).unwrap();
+            store.upsert_track(&k, Some(&metadata), None).unwrap();
             store
                 .mark_complete(&cache_key_hash(&k), 100, false)
                 .unwrap();
@@ -1037,7 +1037,7 @@ mod tests {
         let hash = cache_key_hash(&track_key);
 
         store
-            .upsert_track(&track_key, Some(&sample_metadata()),None)
+            .upsert_track(&track_key, Some(&sample_metadata()), None)
             .unwrap();
         let first = store.track(&hash).unwrap().unwrap();
         assert_eq!(first.source.as_deref(), Some("kugou"));
@@ -1050,7 +1050,7 @@ mod tests {
             ..sample_metadata()
         };
         store
-            .upsert_track(&track_key, Some(&updated_metadata),None)
+            .upsert_track(&track_key, Some(&updated_metadata), None)
             .unwrap();
         let second = store.track(&hash).unwrap().unwrap();
         assert_eq!(second.metadata.unwrap().title, "新标题");
@@ -1074,9 +1074,9 @@ mod tests {
         let hash = cache_key_hash(&track_key);
 
         store
-            .upsert_track(&track_key, Some(&sample_metadata()),None)
+            .upsert_track(&track_key, Some(&sample_metadata()), None)
             .unwrap();
-        store.upsert_track(&track_key, None,None).unwrap();
+        store.upsert_track(&track_key, None, None).unwrap();
 
         let record = store.track(&hash).unwrap().unwrap();
         assert_eq!(record.metadata, Some(sample_metadata()));
@@ -1098,7 +1098,7 @@ mod tests {
         assert!(!store.touch(&hash).unwrap());
         assert!(!store.remove(&hash).unwrap());
 
-        store.upsert_track(&track_key, None,None).unwrap();
+        store.upsert_track(&track_key, None, None).unwrap();
         assert!(store.mark_complete(&hash, 4096, true).unwrap());
         let record = store.track(&hash).unwrap().unwrap();
         assert!(record.complete);
@@ -1129,7 +1129,7 @@ mod tests {
         // 曲目记录不存在时，歌词正文写入违反外键约束。
         assert!(store.upsert_lyrics(&hash, b"{\"lines\":[]}").is_err());
 
-        store.upsert_track(&track_key, None,None).unwrap();
+        store.upsert_track(&track_key, None, None).unwrap();
         store.upsert_lyrics(&hash, b"{\"lines\":[]}").unwrap();
         assert_eq!(
             store.get_lyrics_json(&hash).unwrap().as_deref(),
@@ -1193,7 +1193,7 @@ mod tests {
 
         // 后续解析到真实身份：upsert 补齐 source/id，完整状态保留。
         store
-            .upsert_track(&track_key, Some(&sample_metadata()),None)
+            .upsert_track(&track_key, Some(&sample_metadata()), None)
             .unwrap();
         let record = store.track(&hash).unwrap().unwrap();
         assert_eq!(record.source.as_deref(), Some("kugou"));
@@ -1215,12 +1215,12 @@ mod tests {
         let unknown_key = key("kugou", "missing");
 
         store
-            .upsert_track(&complete_key, Some(&sample_metadata()),None)
+            .upsert_track(&complete_key, Some(&sample_metadata()), None)
             .unwrap();
         store
             .mark_complete(&cache_key_hash(&complete_key), 8192, true)
             .unwrap();
-        store.upsert_track(&partial_key, None,None).unwrap();
+        store.upsert_track(&partial_key, None, None).unwrap();
         let lyrics_json = b"512-bytes-lyrics";
         store
             .upsert_lyrics(&cache_key_hash(&complete_key), lyrics_json)
@@ -1252,13 +1252,15 @@ mod tests {
         let store = MetadataStore::open(&directory).unwrap();
         for id in ["a", "b", "c"] {
             let track_key = key("kugou", id);
-            store.upsert_track(&track_key, None,None).unwrap();
+            store.upsert_track(&track_key, None, None).unwrap();
             store
                 .mark_complete(&cache_key_hash(&track_key), 1024, true)
                 .unwrap();
         }
         // 未完整历史元数据不得出现在磁盘缓存列表或 total 中。
-        store.upsert_track(&key("kugou", "idle"), None,None).unwrap();
+        store
+            .upsert_track(&key("kugou", "idle"), None, None)
+            .unwrap();
         // 手动铺时间：c 最新、a 最旧，验证按最近使用倒序。
         store
             .conn
@@ -1325,7 +1327,7 @@ mod tests {
         let store = MetadataStore::open(&directory).unwrap();
         for (id, count) in [("low", 1u64), ("high", 9), ("mid", 5)] {
             let track_key = key("kugou", id);
-            store.upsert_track(&track_key, None,None).unwrap();
+            store.upsert_track(&track_key, None, None).unwrap();
             store
                 .mark_complete(&cache_key_hash(&track_key), 1024, true)
                 .unwrap();
@@ -1377,7 +1379,7 @@ mod tests {
         let track_key = key("kugou", "statistics");
         let hash = cache_key_hash(&track_key);
         store
-            .upsert_track(&track_key, Some(&sample_metadata()),None)
+            .upsert_track(&track_key, Some(&sample_metadata()), None)
             .unwrap();
 
         assert!(store.record_play(&hash, "session-a", 7, true).unwrap());
@@ -1422,7 +1424,7 @@ mod tests {
         let store = MetadataStore::open(&directory).unwrap();
         let track_key = key("kugou", "concurrent");
         let hash = cache_key_hash(&track_key);
-        store.upsert_track(&track_key, None,None).unwrap();
+        store.upsert_track(&track_key, None, None).unwrap();
         drop(store);
 
         let mut workers = Vec::new();
@@ -1453,7 +1455,7 @@ mod tests {
         let track_key = key("kugou", "reset");
         let hash = cache_key_hash(&track_key);
         store
-            .upsert_track(&track_key, Some(&sample_metadata()),None)
+            .upsert_track(&track_key, Some(&sample_metadata()), None)
             .unwrap();
         store.mark_complete(&hash, 4096, true).unwrap();
         store.upsert_lyrics(&hash, b"lyrics-body").unwrap();

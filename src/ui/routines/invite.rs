@@ -9,13 +9,13 @@ use super::friend_delivery::{
 };
 #[cfg(test)]
 use crate::config::AppConfig;
+use crate::geometry::Rect;
 use crate::observation::chat::secondary_hall_bubbles;
 use crate::runtime::ocr::OcrRuntimeHandle;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
 };
-use crate::geometry::Rect;
 use crate::ui::template::best_template_hit;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -539,10 +539,10 @@ mod tests {
 
     use super::*;
     use crate::config::{AppConfig, RectConfig};
+    use crate::geometry::Rect;
     use crate::observation::chat::SECONDARY_TITLE_RECT;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
-    use crate::geometry::Rect;
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

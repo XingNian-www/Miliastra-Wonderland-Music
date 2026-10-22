@@ -341,6 +341,75 @@ struct DeferredChatSender {
 }
 
 impl DeferredChatSender {
+    fn render_reply_text(
+        &self,
+        reply: &crate::features::turtle_soup::TurtleSoupReplyText,
+    ) -> String {
+        use crate::features::turtle_soup::TurtleSoupReplyText;
+        match reply {
+            TurtleSoupReplyText::Raw(text) => text.clone(),
+            TurtleSoupReplyText::NumberedComposed {
+                label,
+                index,
+                total,
+                content,
+            } => {
+                let overrides = self.live_configs.replies.read().ok();
+                let override_text = overrides
+                    .as_ref()
+                    .and_then(|config| config.overrides.get(label.key));
+                let label = crate::features::reply_template::render(
+                    label,
+                    override_text.map(String::as_str),
+                    &crate::features::reply_template::ReplyVars::new(),
+                )
+                .text;
+                let content = self.render_reply_text(content);
+                format!("{label}{index}/{total}：{content}")
+            }
+            TurtleSoupReplyText::Numbered {
+                label,
+                index,
+                total,
+                content,
+            } => {
+                let overrides = self.live_configs.replies.read().ok();
+                let override_text = overrides
+                    .as_ref()
+                    .and_then(|config| config.overrides.get(label.key));
+                let rendered = crate::features::reply_template::render(
+                    label,
+                    override_text.map(String::as_str),
+                    &crate::features::reply_template::ReplyVars::new(),
+                );
+                format!("{}{index}/{total}：{content}", rendered.text)
+            }
+            TurtleSoupReplyText::Keyed { spec, vars } => {
+                let overrides = self.live_configs.replies.read().ok();
+                let override_text = overrides
+                    .as_ref()
+                    .and_then(|config| config.overrides.get(spec.key));
+                let rendered = crate::features::reply_template::render(
+                    spec,
+                    override_text.map(String::as_str),
+                    vars,
+                );
+                if !rendered.missing.is_empty() {
+                    log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
+                }
+                rendered.text
+            }
+            TurtleSoupReplyText::Composed { spec, vars, nested } => {
+                let nested = nested
+                    .iter()
+                    .map(|(name, reply)| (*name, self.render_reply_text(reply)))
+                    .collect();
+                let vars = vars.clone().with_nested(nested);
+                self.render_reply_text(&TurtleSoupReplyText::Keyed { spec: *spec, vars })
+            }
+        }
+    }
+
     fn run(self) -> Result<()> {
         let mut generation = self.task_engine.generation()?;
         while self.running.load(AtomicOrdering::SeqCst) {
@@ -461,11 +530,43 @@ impl DeferredChatSender {
                         }
                         DeferredChatTarget::CurrentHall => self.active_ui_residency()?,
                     };
-                    let mapped_messages = batch
-                        .remaining_texts()
-                        .iter()
-                        .map(|message| self.live_configs.identity.replace_display_names(message))
-                        .collect::<Vec<_>>();
+                    let mapped_messages = if batch.is_rendered() {
+                        batch
+                            .remaining_replies()
+                            .map(|reply| match reply {
+                                crate::features::turtle_soup::TurtleSoupReplyText::Raw(text) => {
+                                    text.clone()
+                                }
+                                other => self.render_reply_text(other),
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        let mut rows = Vec::new();
+                        for reply in batch.remaining_replies() {
+                            if let crate::features::turtle_soup::TurtleSoupReplyText::NumberedComposed {
+                                label, content, ..
+                            } = reply {
+                                let overrides = self.live_configs.replies.read().ok();
+                                let override_text = overrides.as_ref().and_then(|config| config.overrides.get(label.key));
+                                let label_text = crate::features::reply_template::render(
+                                    label, override_text.map(String::as_str),
+                                    &crate::features::reply_template::ReplyVars::new(),
+                                ).text;
+                                let content_text = self.render_reply_text(content);
+                                let rendered = crate::features::chat_text::split_numbered_chat_message(
+                                    &label_text, &content_text,
+                                );
+                                rows.extend(rendered.into_iter().map(|row| {
+                                    self.live_configs.identity.replace_display_names(&row)
+                                }));
+                            } else {
+                                let rendered = self.render_reply_text(reply);
+                                rows.push(self.live_configs.identity.replace_display_names(&rendered));
+                            }
+                        }
+                        batch.replace_remaining(rows.clone());
+                        rows
+                    };
                     let messages = mapped_messages
                         .iter()
                         .map(String::as_str)
@@ -511,7 +612,7 @@ impl DeferredChatSender {
                             let error = anyhow!(
                                 "海龟汤批量发送提前完成: sent={} remaining={}",
                                 sent,
-                                batch.remaining_texts().len()
+                                batch.remaining_replies().count()
                             );
                             log::error!("{error:#}");
                             self.business.turtle_soup_delivery_failure(delivery, &error);

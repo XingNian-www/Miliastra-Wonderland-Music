@@ -1,6 +1,6 @@
 //! 本地稳定抽牌与可选AI解读。只产生聊天回复，不依赖播放器或娱乐会话。
 use super::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
-use super::reply_template::{tarot as templates, ReplyVars};
+use super::reply_template::{ReplyVars, tarot as templates};
 use crate::text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
 use anyhow::{Result, anyhow, bail};
 use rand_chacha::{

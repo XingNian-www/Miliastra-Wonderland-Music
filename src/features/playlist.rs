@@ -204,11 +204,7 @@ pub(crate) trait PlaylistPlaybackPort {
         None
     }
     /// owner 与当前模式匹配时，把新曲目并入运行中的随机池（导入用）。
-    fn extend_playlist_tracks(
-        &mut self,
-        _owner: &str,
-        _tracks: &[PlayableTrack],
-    ) -> Result<bool> {
+    fn extend_playlist_tracks(&mut self, _owner: &str, _tracks: &[PlayableTrack]) -> Result<bool> {
         Ok(false)
     }
 }
@@ -1477,7 +1473,10 @@ mod tests {
             .execute("甲", &PlaylistCommand::ConfirmClear, &mut port, now, 1)
             .unwrap();
         assert!(cleared[0].contains("已清空"));
-        assert!(cleared[0].contains("已退出"), "清空应立即结束运行中的歌单模式");
+        assert!(
+            cleared[0].contains("已退出"),
+            "清空应立即结束运行中的歌单模式"
+        );
         assert!(port.stopped);
     }
 
@@ -1526,7 +1525,9 @@ mod tests {
                 deadline: now + IMPORT_TTL,
             },
         );
-        let mut port = RecordingExtendPlayback { extended: Vec::new() };
+        let mut port = RecordingExtendPlayback {
+            extended: Vec::new(),
+        };
         let replies = app
             .execute("甲", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
             .unwrap();

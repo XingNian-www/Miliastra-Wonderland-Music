@@ -8,9 +8,9 @@ use image::DynamicImage;
 use serde::Serialize;
 
 use crate::config::{OcrConfig, RectConfig, TemplateConfig};
+use crate::geometry::{Rect, crop_canvas};
 use crate::privacy::redacted_chat_text;
 use crate::runtime::ocr::{OcrImageBlock, OcrPriority, OcrRuntimeHandle, batch_recognize_blocks};
-use crate::geometry::{Rect, crop_canvas};
 use crate::ui::template::{TemplateHit, dedupe_hits, find_color_template_hit_groups};
 
 const CHAT_SCAN_RESULT_LOG_TARGET: &str = "chat_scan_result";

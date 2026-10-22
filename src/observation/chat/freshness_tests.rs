@@ -10,12 +10,12 @@
 
 use std::collections::HashMap;
 
+use super::RecognizedChatMessage;
 use super::freshness::{
     BaselineKind, FrameDecision, FreshFrame, Freshness, SequenceFreshness, ViewPhase,
 };
-use super::RecognizedChatMessage;
-use crate::text::normalize_chat_text;
 use crate::geometry::Rect;
+use crate::text::normalize_chat_text;
 
 /// 合成行距：与真帧约 5 行窗口的量级一致。
 const ROW: i32 = 30;
@@ -193,9 +193,7 @@ fn frame_from(
     logical[start..]
         .iter()
         .enumerate()
-        .map(|(i, (text, kind))| {
-            bubble(i as i32 * ROW + offset, text.as_str(), kind.as_str())
-        })
+        .map(|(i, (text, kind))| bubble(i as i32 * ROW + offset, text.as_str(), kind.as_str()))
         .collect()
 }
 
@@ -455,11 +453,17 @@ fn first_baseline_of_every_kind_is_all_unknown() {
 fn panel_return_is_all_unknown_even_with_appended_command() {
     let mut state = SequenceFreshness::default();
     let _ = observe_texts(&mut state, Some(BaselineKind::AppStart), &["A", "B"]);
-    let decision = observe_texts(&mut state, Some(BaselineKind::PanelReturn), &["A", "B", "@新"]);
-    assert!(decision
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    let decision = observe_texts(
+        &mut state,
+        Some(BaselineKind::PanelReturn),
+        &["A", "B", "@新"],
+    );
+    assert!(
+        decision
+            .freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 }
 
 #[test]
@@ -468,10 +472,12 @@ fn mark_view_disappeared_forces_next_frame_unknown_then_recovers() {
     let _ = observe_texts(&mut state, Some(BaselineKind::AppStart), &["A", "B", "C"]);
     state.mark_view_disappeared();
     let decision = observe_texts(&mut state, None, &["B", "C", "@新"]);
-    assert!(decision
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        decision
+            .freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
     assert_eq!(decision.phase, ViewPhase::Discontinuity);
 
     // 基准已重建为上一帧；再追加一条应恢复判新。
@@ -482,7 +488,11 @@ fn mark_view_disappeared_forces_next_frame_unknown_then_recovers() {
 #[test]
 fn first_bubble_is_never_new_on_a_regular_frame() {
     let mut state = SequenceFreshness::default();
-    let _ = observe_texts(&mut state, Some(BaselineKind::HallWorldSwitch), &["A", "B", "C"]);
+    let _ = observe_texts(
+        &mut state,
+        Some(BaselineKind::HallWorldSwitch),
+        &["A", "B", "C"],
+    );
     let decision = observe_texts(&mut state, None, &["B", "C", "@新"]);
     assert_ne!(decision.freshness[0], Freshness::New);
     assert_new_at(&decision, &[2]);
@@ -508,8 +518,16 @@ fn absent_view_then_first_content_marks_pink_and_blue_new() {
         bubble_at(0, 30, 400, 28, "@粉", "pink", SENDER),
     ];
     let decision = observe(&mut state, Some(BaselineKind::PanelReturn), &bubbles);
-    assert_eq!(decision.freshness[0], Freshness::New, "blue after absent first screen must be new");
-    assert_eq!(decision.freshness[1], Freshness::New, "pink after absent first screen must be new");
+    assert_eq!(
+        decision.freshness[0],
+        Freshness::New,
+        "blue after absent first screen must be new"
+    );
+    assert_eq!(
+        decision.freshness[1],
+        Freshness::New,
+        "pink after absent first screen must be new"
+    );
 }
 
 #[test]
@@ -531,10 +549,7 @@ fn hall_switch_baseline_can_mark_the_top_blue_bubble_new() {
         bubble_at(0, 30, 400, 28, "@粉", "pink", SENDER),
     ];
     let decision = observe(&mut state, Some(BaselineKind::HallWorldSwitch), &bubbles);
-    assert_eq!(
-        decision.freshness,
-        vec![Freshness::New, Freshness::Unknown]
-    );
+    assert_eq!(decision.freshness, vec![Freshness::New, Freshness::Unknown]);
 }
 
 #[test]
@@ -589,17 +604,20 @@ fn untrusted_frame_is_all_unknown_and_rebuilds_the_baseline() {
         baseline: None,
         bubbles: &bubbles,
     });
-    assert!(decision
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        decision
+            .freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
     assert_eq!(decision.phase, ViewPhase::Discontinuity);
 
     let same = observe_texts(&mut state, None, &["A", "B", "@新"]);
-    assert!(same
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Seen));
+    assert!(
+        same.freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Seen)
+    );
     let more = observe_texts(&mut state, None, &["B", "@新", "@再"]);
     assert_new_at(&more, &[2]);
 }
@@ -709,7 +727,11 @@ fn mid_list_small_ocr_revision_keeps_the_anchor() {
 #[test]
 fn mid_list_large_ocr_revision_breaks_the_anchor() {
     let mut state = SequenceFreshness::default();
-    let _ = observe_texts(&mut state, Some(BaselineKind::AppStart), &["AAAA", "B", "C"]);
+    let _ = observe_texts(
+        &mut state,
+        Some(BaselineKind::AppStart),
+        &["AAAA", "B", "C"],
+    );
     let decision = observe_texts(&mut state, None, &["ZZZZ", "Bx", "Cx"]);
     assert!(
         decision
@@ -728,10 +750,12 @@ fn sender_change_breaks_the_anchor() {
     let _ = observe(&mut state, Some(BaselineKind::AppStart), &seeded);
     let current = vec![bubble_at(0, 100, 400, 28, "同一句", "blue", "乙")];
     let decision = observe(&mut state, None, &current);
-    assert!(decision
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        decision
+            .freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 }
 
 #[test]
@@ -741,10 +765,12 @@ fn color_change_breaks_the_anchor() {
     let _ = observe(&mut state, Some(BaselineKind::AppStart), &seeded);
     let current = vec![bubble_at(0, 100, 400, 28, "同一句", "blue", SENDER)];
     let decision = observe(&mut state, None, &current);
-    assert!(decision
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        decision
+            .freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 }
 
 #[test]
@@ -829,10 +855,11 @@ fn replay_case1_4fillers_scrolled() {
         Some(BaselineKind::AppStart),
         &["甲", "乙", "丙", "丁", "@状态"],
     );
-    assert!(seed
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        seed.freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 
     // 01-first-AA：乙 丙 丁 @状态 @AA → 仅底部 @AA 新。
     let first = frame(&["乙", "丙", "丁", "@状态", "@AA"]);
@@ -859,10 +886,11 @@ fn replay_case1_same_frame_identical() {
         Some(BaselineKind::AppStart),
         &["@CC", "戊", "己", "庚"],
     );
-    assert!(seed
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        seed.freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 
     // 04-both-CC：同帧两条同文本 @CC，仅最底部一条为 New。
     let both = frame(&["@CC", "戊", "己", "庚", "@CC"]);
@@ -880,10 +908,11 @@ fn replay_case2_reply_between() {
         Some(BaselineKind::AppStart),
         &["三", "四", "@AA", "@BB"],
     );
-    assert!(seed
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        seed.freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 
     // 02-reply：三 四 @AA @BB 已处理 → 只有“已处理”新。
     let reply = frame(&["三", "四", "@AA", "@BB", "已处理"]);
@@ -903,25 +932,30 @@ fn replay_case3_view_return_is_all_old() {
     // 路径一：PanelReturn 基线（目标窗口恢复）→ 全部无视。
     let mut state = SequenceFreshness::default();
     let seed = observe_texts(&mut state, Some(BaselineKind::AppStart), &texts);
-    assert!(seed
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        seed.freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
     let decision = observe_texts(&mut state, Some(BaselineKind::PanelReturn), &texts);
-    assert!(decision
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        decision
+            .freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 
     // 路径二：视图消失标记 → 下一帧保守全 Unknown。
     let mut state = SequenceFreshness::default();
     let _ = observe_texts(&mut state, Some(BaselineKind::AppStart), &texts);
     state.mark_view_disappeared();
     let decision = observe_texts(&mut state, None, &texts);
-    assert!(decision
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        decision
+            .freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 }
 
 /// replay.json 中 s016 的长英文行（step-02 里的占位即指这一条）。
@@ -937,10 +971,11 @@ fn replay_s016_scroll() {
         Some(BaselineKind::AppStart),
         &["前后有空格", LONG_EN],
     );
-    assert!(seed
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        seed.freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 
     // step-02：长英文行 + 滚1 + 滚2 → 两条滚动为新。
     let step02 = frame(&[LONG_EN, "滚1", "滚2"]);
@@ -961,10 +996,11 @@ fn replay_s017_duplicate_adjacent() {
         Some(BaselineKind::AppStart),
         &["滚2", "滚3", "滚4", "滚5", "滚6"],
     );
-    assert!(seed
-        .freshness
-        .iter()
-        .all(|freshness| *freshness == Freshness::Unknown));
+    assert!(
+        seed.freshness
+            .iter()
+            .all(|freshness| *freshness == Freshness::Unknown)
+    );
 
     // dup-1：标点行首次出现 → 仅它新。
     let dup1 = frame(&["滚3", "滚4", "滚5", "滚6", "标点测试，。！？；："]);

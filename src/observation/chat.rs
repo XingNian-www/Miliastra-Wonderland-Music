@@ -20,6 +20,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub(crate) use passive::{
+    PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity,
+    parse_secondary_sender_identity, passive_layout, passive_text, recognize_passive_secondary,
+};
 pub(crate) use scan::{
     ChatMessage, ChatScanTelemetry, ChatScanTelemetrySink, RecognizedChatMessage,
     ResolvedTemplateArgs, TemplateArgs, count_chat_markers, count_scanned_chat_markers,
@@ -37,10 +41,6 @@ pub(crate) use visual::{
     SecondaryChatIdentity, SecondaryHallBubble, hall_bubble_sequence_is_retained_prefix,
     hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
     secondary_hall_bubbles,
-};
-pub(crate) use passive::{
-    PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity,
-    parse_secondary_sender_identity, passive_layout, passive_text, recognize_passive_secondary,
 };
 
 // 单元测试（composition::application::shared_observer 等）需要这些纯函数；

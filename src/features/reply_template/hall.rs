@@ -99,7 +99,7 @@ pub(crate) const HALL: &[ReplyTemplate] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::reply_template::{catalog, render, ReplyVars};
+    use crate::features::reply_template::{ReplyVars, catalog, render};
     use std::collections::BTreeSet;
 
     #[test]

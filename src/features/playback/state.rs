@@ -215,7 +215,10 @@ impl RequestStateStore {
 
     /// 读取并校验单行快照。任何不一致（JSON 损坏、schemaVersion 不符、结构校验失败）
     /// 都以 Err 返回，由调用方备份并只重建该表，而不是让整个应用起不来。
-    fn read_snapshot(connection: &rusqlite::Connection, path: &Path) -> Result<RequestStateSnapshot> {
+    fn read_snapshot(
+        connection: &rusqlite::Connection,
+        path: &Path,
+    ) -> Result<RequestStateSnapshot> {
         let Some((stored_version, text)) = Self::read_snapshot_row(connection)? else {
             return Ok(RequestStateSnapshot::default());
         };
@@ -304,7 +307,10 @@ impl RequestStateStore {
                     .any(|column| !EXPECTED_COLUMNS.contains(&column.as_str()))
             {
                 // 结构不匹配：只重建这一张表，保留同库其它数据。
-                log::warn!("request_state 表结构不匹配，仅重建该表: path={}", path.display());
+                log::warn!(
+                    "request_state 表结构不匹配，仅重建该表: path={}",
+                    path.display()
+                );
                 connection.execute_batch("DROP TABLE request_state")?;
             }
         }
@@ -1528,9 +1534,11 @@ mod tests {
 
     /// 快照损坏/版本不符时必须恢复启动（默认状态）而不是返回 Err。
     fn load_recovers_with_default(state_path: &Path) -> SharedRequestStateStore {
-        let store =
-            RequestStateStore::load(state_path.to_path_buf(), crate::test_support::test_state_store())
-                .expect("不可用的请求状态必须自动恢复，而不是让整个应用起不来");
+        let store = RequestStateStore::load(
+            state_path.to_path_buf(),
+            crate::test_support::test_state_store(),
+        )
+        .expect("不可用的请求状态必须自动恢复，而不是让整个应用起不来");
         assert_eq!(
             store.lock().unwrap().playback_snapshot().state,
             ConfirmedPlaybackState::Idle

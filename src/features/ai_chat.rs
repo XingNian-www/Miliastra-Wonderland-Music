@@ -625,9 +625,7 @@ pub(crate) fn split_commands(answer: &str) -> (String, Vec<String>) {
     let mut commands = Vec::new();
     for line in answer.lines() {
         let trimmed = line.trim();
-        if (trimmed.starts_with('@') || trimmed.starts_with('#'))
-            && trimmed.chars().count() <= 40
-        {
+        if (trimmed.starts_with('@') || trimmed.starts_with('#')) && trimmed.chars().count() <= 40 {
             commands.push(trimmed.to_string());
             continue;
         }

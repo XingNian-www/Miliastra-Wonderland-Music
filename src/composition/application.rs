@@ -29,10 +29,11 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use self::formal_task::{FormalTaskClient, FormalTaskRuntime};
+use crate::adapters::input::parse_key;
 use crate::adapters::login_helper::LoginHelperManager;
 use crate::adapters::native_playback::NativePlaybackAdapter;
 use crate::adapters::player::PlayerRuntimeBackend;
-use crate::adapters::input::parse_key;
+use crate::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 use crate::config::{AppConfig, LiveConfigs, PointConfig};
 use crate::features::administration::{
     AdministrationApplication, AdministrationCommand, ChatListenerModeCommand,
@@ -75,10 +76,10 @@ use crate::features::undercover::{
     UndercoverApplication, UndercoverCommand, UndercoverCommandSource, UndercoverDeliveryPort,
     UndercoverEffectTask, UndercoverRuntimeService,
 };
+use crate::geometry::{Rect, crop_canvas};
 use crate::interfaces::chat::{self as command, ChatCommandRouter, PendingCommand};
 use crate::interfaces::hotkeys;
 use crate::interfaces::http::{self, WebToolRequest, WebToolTemplate};
-use crate::ui::plan::{WorkflowOperation, WorkflowResidency};
 use crate::observation::chat::{
     ChatMessage, ChatObservationDispatch, ChatObservationExclusiveGuard, ChatObservationShared,
     ChatScanTelemetry, ChatScanTelemetrySink, CompletionAdvanceSubscriber, ObservedFrame,
@@ -116,12 +117,11 @@ use crate::runtime::ui::{
     UiStateObservation,
 };
 use crate::ui::atoms::GameUi;
-use crate::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 use crate::ui::chat_output::{ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput};
 use crate::ui::frame::{Canvas, Frame, LatestFrameCache, from_captured_frame};
-use crate::geometry::{Rect, crop_canvas};
 #[cfg(test)]
 use crate::ui::locator::secondary_hall_search_rect;
+use crate::ui::plan::{WorkflowOperation, WorkflowResidency};
 use crate::ui::routines::{
     CustomActionUi, DetectPublicHall, DetectPublicHallEffect, EstablishResidency,
     FriendDeliveryRoutineConfig, FriendDeliveryRoutineConfigSource, FriendDeliveryUi, HallBatchUi,
@@ -1791,7 +1791,6 @@ fn secondary_hall_sequence_delta(
         SecondaryHallSequenceDelta::NewFrom(overlap)
     }
 }
-
 
 /// 构造平台 UI 设备。
 ///

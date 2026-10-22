@@ -302,6 +302,7 @@ impl LiveConfigs {
             .write()
             .unwrap_or_else(PoisonError::into_inner) = config.custom_workflows.clone();
         self.identity.replace(config.identity.clone());
+        *self.replies.write().unwrap_or_else(PoisonError::into_inner) = config.replies.clone();
 
         let mut effective = Arc::unwrap_or_clone(self.effective.snapshot());
         effective.stability.secondary_hall_count = config.stability.secondary_hall_count;
@@ -373,6 +374,10 @@ mod tests {
         config.matching.enable_fuzzy_singer = false;
         config.custom_workflows.enabled = true;
         config.custom_workflows.default_threshold = 0.73;
+        config
+            .replies
+            .overrides
+            .insert("test.reply".to_string(), "changed".to_string());
         config.identity = IdentityConfig {
             mappings: vec![crate::features::identity::IdentityMapping {
                 nickname: "派蒙本蒙".to_string(),
@@ -504,6 +509,10 @@ mod tests {
         );
         assert!(live.identity.is_owner("派蒙本蒙"));
         assert!(!live.identity.is_friend_or_above("陌生人"));
+        assert_eq!(
+            live.replies.read().unwrap().get("test.reply"),
+            Some("changed")
+        );
         let snapshot = live.snapshot();
         assert_eq!(snapshot.timing.watchdog_restart_ms, 4321);
         assert_eq!(snapshot.timing.chat_scan.fallback_ms, 4444);
@@ -520,6 +529,7 @@ mod tests {
         assert!(*live.queue_protect_current_song.read().unwrap());
         assert_eq!(live.song_dedup.read().unwrap().max_count, 1);
         assert_eq!(*live.lyrics_lead_seconds.read().unwrap(), 0.0);
+        assert_eq!(live.replies.read().unwrap().get("test.reply"), None);
     }
 
     #[test]

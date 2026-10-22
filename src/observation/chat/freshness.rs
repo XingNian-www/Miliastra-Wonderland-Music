@@ -164,7 +164,11 @@ impl SequenceFreshness {
         if let Some(kind) = frame.baseline {
             // 该 chat 的第一个基线（进程启动/重启后首见）一律全旧；
             // 之后的基线才按原因区分为“进入大厅/世界”与“切界面返回”。
-            let kind = if self.initialized { kind } else { BaselineKind::AppStart };
+            let kind = if self.initialized {
+                kind
+            } else {
+                BaselineKind::AppStart
+            };
             let phase = if kind == BaselineKind::AppStart {
                 ViewPhase::Baseline
             } else {
@@ -268,10 +272,7 @@ fn bubble_matches(prev: &Snapshot, cur: &RecognizedChatMessage, delta: i32) -> b
         return false;
     }
     if let (Some(a), Some(b)) = (prev.sender.as_deref(), cur.sender.as_deref()) {
-        if !a.is_empty()
-            && !b.is_empty()
-            && normalize_chat_text(a) != normalize_chat_text(b)
-        {
+        if !a.is_empty() && !b.is_empty() && normalize_chat_text(a) != normalize_chat_text(b) {
             return false;
         }
     }
@@ -482,11 +483,7 @@ mod tests {
             &[("A", 100), ("B", 130), ("C", 160)],
         );
         // 两次观测之间追加超过窗口行数：无共同锚，保守判旧。
-        let d = observe(
-            &mut state,
-            None,
-            &[("X", 100), ("Y", 130), ("Z", 160)],
-        );
+        let d = observe(&mut state, None, &[("X", 100), ("Y", 130), ("Z", 160)]);
         assert!(d.freshness.iter().all(|f| *f == Freshness::Unknown));
     }
 
@@ -501,7 +498,12 @@ mod tests {
         let d = observe(
             &mut state,
             None,
-            &[("标点测试，。！？；：", 100), ("B", 130), ("C", 160), ("D", 190)],
+            &[
+                ("标点测试，。！？；：", 100),
+                ("B", 130),
+                ("C", 160),
+                ("D", 190),
+            ],
         );
         assert_eq!(new_of(&d, 3), Freshness::New);
         assert_eq!(new_of(&d, 0), Freshness::Seen);

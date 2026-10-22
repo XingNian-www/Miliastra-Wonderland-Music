@@ -249,6 +249,64 @@ pub(crate) const QUEUE_SKIPPED: ReplyTemplate = ReplyTemplate {
     group: "播放",
 };
 
+// ---------------------------------------------------------------------------
+// @状态 / @歌词：运行时拼装的动态行
+// ---------------------------------------------------------------------------
+//
+// 这两条命令的回复不是固定文案，而是把播放器快照拼成一行。为了让它们也能被
+// 用户改写，把整行拆成"主模板 + 可选片段"：
+// - 主模板负责排版；曲名、进度、音量等作为变量注入。
+// - 有歌 / 无歌、是否带点歌人，用各自的可选片段模板控制，片段留空即整段消失。
+// 这样用户改一处排版就能同时影响两种播放器状态，不必分别维护两份文案。
+
+/// @状态 主模板（当前有歌曲信息时）。
+pub(crate) const STATUS_WITH_SONG: ReplyTemplate = ReplyTemplate {
+    key: "playback.status.with_song",
+    default: "{状态}:{曲名} ({进度}/{总长}) 音量{音量}{点歌人}",
+    summary: "@状态 有歌曲时的一行排版",
+    group: "播放",
+};
+
+/// @状态 主模板（播放器没有曲目信息时）。
+pub(crate) const STATUS_WITHOUT_SONG: ReplyTemplate = ReplyTemplate {
+    key: "playback.status.without_song",
+    default: "{状态}:({进度}/{总长}) 音量{音量}{点歌人}",
+    summary: "@状态 无歌曲时的一行排版",
+    group: "播放",
+};
+
+/// @状态 尾部的点歌人片段；留空即不显示点歌人。
+pub(crate) const STATUS_REQUESTER: ReplyTemplate = ReplyTemplate {
+    key: "playback.status.requester",
+    default: "  {点歌人}",
+    summary: "@状态 尾部的点歌人片段",
+    group: "播放",
+};
+
+/// 歌单模式下的归属前缀；留空即不加前缀。
+pub(crate) const STATUS_PLAYLIST_PREFIX: ReplyTemplate = ReplyTemplate {
+    key: "playback.status.playlist_prefix",
+    default: "[{歌单归属}的歌单] {内容}",
+    summary: "歌单模式下 @状态 的前缀",
+    group: "播放",
+};
+
+/// @歌词 有歌词时。
+pub(crate) const LYRICS_LINE: ReplyTemplate = ReplyTemplate {
+    key: "playback.lyrics.line",
+    default: "歌词: {歌词}",
+    summary: "@歌词 有歌词时",
+    group: "播放",
+};
+
+/// @歌词 当前无歌词。
+pub(crate) const LYRICS_EMPTY: ReplyTemplate = ReplyTemplate {
+    key: "playback.lyrics.empty",
+    default: "当前无歌词",
+    summary: "@歌词 无歌词时",
+    group: "播放",
+};
+
 /// 播放控制回复。键一旦发布不要改名，否则用户已保存的覆盖会失效。
 ///
 /// 这里必须收齐上面每一个常量；漏登记等于该条文案在面板里消失、也无法被覆盖。
@@ -287,6 +345,12 @@ pub(crate) const PLAYBACK: &[ReplyTemplate] = &[
     FAILURE_REASON,
     SOURCE_SWITCHED,
     QUEUE_SKIPPED,
+    STATUS_WITH_SONG,
+    STATUS_WITHOUT_SONG,
+    STATUS_REQUESTER,
+    STATUS_PLAYLIST_PREFIX,
+    LYRICS_LINE,
+    LYRICS_EMPTY,
 ];
 
 #[cfg(test)]
@@ -296,7 +360,7 @@ mod tests {
     use crate::features::reply_template::catalog;
 
     /// 本模块负责的全部模板常量。新增模板时先加常量、再加进 PLAYBACK、最后补到这里。
-    const EVERY_PLAYBACK_SPEC: [ReplyTemplate; 34] = [
+    const EVERY_PLAYBACK_SPEC: [ReplyTemplate; 40] = [
         PAUSE_OK,
         RESUME_OK,
         NEXT_POOL_FALLBACK,
@@ -331,6 +395,12 @@ mod tests {
         FAILURE_REASON,
         SOURCE_SWITCHED,
         QUEUE_SKIPPED,
+        STATUS_WITH_SONG,
+        STATUS_WITHOUT_SONG,
+        STATUS_REQUESTER,
+        STATUS_PLAYLIST_PREFIX,
+        LYRICS_LINE,
+        LYRICS_EMPTY,
     ];
 
     #[test]
@@ -447,6 +517,16 @@ mod tests {
             "playback.queue.skipped",
             "平台无对应歌曲音源，已跳过当前歌曲",
         ),
+        // 以下是 7.0.0 新增的动态行模板：金标值 = 拆分前后的等价输出。
+        ("playback.status.with_song", "播放:晴天 - 周杰伦 (1:05/3:05) 音量80"),
+        ("playback.status.without_song", "播放:(0:00/0:00) 音量0"),
+        ("playback.status.requester", "  点歌人"),
+        (
+            "playback.status.playlist_prefix",
+            "[甲的歌单] 播放:(0:00/0:00) 音量0",
+        ),
+        ("playback.lyrics.line", "歌词: 晴天"),
+        ("playback.lyrics.empty", "当前无歌词"),
     ];
 
     /// 每条模板配一份代表性变量，用于复现迁移前的成品文案。
@@ -475,6 +555,24 @@ mod tests {
             "playback.failure.reason" => ReplyVars::new().with("原因", "平台无对应歌曲音源"),
             "playback.source_switched" => ReplyVars::new().with("歌名", "Song-Artist"),
             "playback.queue.skipped" => ReplyVars::new().with("原因", "平台无对应歌曲音源"),
+            "playback.status.with_song" => ReplyVars::new()
+                .with("状态", "播放")
+                .with("曲名", "晴天 - 周杰伦")
+                .with("进度", "1:05")
+                .with("总长", "3:05")
+                .with("音量", "80")
+                .with("点歌人", ""),
+            "playback.status.without_song" => ReplyVars::new()
+                .with("状态", "播放")
+                .with("进度", "0:00")
+                .with("总长", "0:00")
+                .with("音量", "0")
+                .with("点歌人", ""),
+            "playback.status.requester" => ReplyVars::new().with("点歌人", "点歌人"),
+            "playback.status.playlist_prefix" => ReplyVars::new()
+                .with("歌单归属", "甲")
+                .with("内容", "播放:(0:00/0:00) 音量0"),
+            "playback.lyrics.line" => ReplyVars::new().with("歌词", "晴天"),
             _ => ReplyVars::new(),
         }
     }

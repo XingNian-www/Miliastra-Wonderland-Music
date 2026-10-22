@@ -4,6 +4,7 @@
 //! 存储与 tarot 一样复用统一数据库 \`playback.sqlite3\`，只新增自己的表，不改全局 schema 版本。
 //! 采集阶段不在歌单内部去重；数据库层用 \`(owner, track_key)\` 主键去重，重复导入/收藏不会产生重复行。
 use super::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
+use super::reply_template::{ReplyTemplate, ReplyVars, playlist as templates};
 use crate::features::chat_text::compact_command;
 use crate::features::playback::PersonalPlaylistStart;
 use crate::text::char_width;
@@ -23,6 +24,49 @@ const CLEAR_CONFIRM_TTL: Duration = Duration::from_secs(60);
 pub(crate) const WINDOW_TTL: Duration = Duration::from_secs(20);
 const IMPORT_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_IMPORT_TRACKS: usize = 3000;
+
+/// 一条待发送的歌单回复。
+///
+/// 为什么不是裸 String：歌单在业务层拼好整段文本，如果直接返回 String，
+/// 组装层拿不到模板 key，用户在命令面板改的文案永远读不到。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PlaylistReply {
+    /// 已定型的文本（运行时数据、外部导入的歌单名等）。
+    Raw(String),
+    /// 带模板 key 的文案，发送时才查覆盖。
+    Keyed {
+        spec: &'static ReplyTemplate,
+        vars: ReplyVars,
+    },
+}
+
+impl PlaylistReply {
+    fn keyed(spec: &'static ReplyTemplate, vars: ReplyVars) -> Self {
+        Self::Keyed { spec, vars }
+    }
+
+    /// 按内置默认文案渲染，供测试与"只需成品文本"的场景使用。
+    pub(crate) fn render_default(&self) -> String {
+        match self {
+            Self::Raw(text) => text.clone(),
+            Self::Keyed { spec, vars } => {
+                crate::features::reply_template::render(spec, None, vars).text
+            }
+        }
+    }
+}
+
+impl From<String> for PlaylistReply {
+    fn from(text: String) -> Self {
+        Self::Raw(text)
+    }
+}
+
+impl From<&str> for PlaylistReply {
+    fn from(text: &str) -> Self {
+        Self::Raw(text.to_string())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -637,7 +681,7 @@ impl PlaylistApplication {
         }
     }
 
-    pub(crate) fn poll_import_completions(&self, now: Instant) -> Result<Vec<Vec<String>>> {
+    pub(crate) fn poll_import_completions(&self, now: Instant) -> Result<Vec<Vec<PlaylistReply>>> {
         let mut imports = self
             .state
             .pending_imports
@@ -668,18 +712,23 @@ impl PlaylistApplication {
             match result {
                 None => {
                     imports.remove(&owner);
-                    replies.push(vec!["歌单导入已超时,请重新发起.".to_owned()]);
+                    replies.push(vec![PlaylistReply::keyed(
+                        &templates::IMPORT_TIMEOUT,
+                        ReplyVars::new(),
+                    )]);
                 }
                 Some(Err(_)) => {
                     imports.remove(&owner);
-                    replies.push(vec![
-                        "读取歌单失败或平台暂不可用,请检查分享链接后重试.".to_owned(),
-                    ]);
+                    replies.push(vec![PlaylistReply::keyed(
+                        &templates::IMPORT_FAILED,
+                        ReplyVars::new(),
+                    )]);
                 }
                 Some(Ok(playlist)) if playlist.tracks.len() > MAX_IMPORT_TRACKS => {
                     imports.remove(&owner);
-                    replies.push(vec![format!(
-                        "歌单超过单次导入上限{MAX_IMPORT_TRACKS}首,未导入内容."
+                    replies.push(vec![PlaylistReply::keyed(
+                        &templates::IMPORT_TOO_LARGE,
+                        ReplyVars::new().with("上限", MAX_IMPORT_TRACKS.to_string()),
                     )]);
                 }
                 Some(Ok(playlist)) => {
@@ -692,23 +741,24 @@ impl PlaylistApplication {
                     } else {
                         "网易云音乐"
                     };
-                    let mut preview = vec![
-                        "歌单导入预览".to_owned(),
-                        format!("{provider}: {}", chat_safe_text(&playlist.title, 34)),
-                        format!("创建者: {}", chat_safe_text(creator, 32)),
-                        format!("曲目: {total}首,新增{new_count}首,已收藏{duplicate_count}首"),
+                    let mut preview: Vec<PlaylistReply> = vec![
+                        "歌单导入预览".to_owned().into(),
+                        format!("{provider}: {}", chat_safe_text(&playlist.title, 34)).into(),
+                        format!("创建者: {}", chat_safe_text(creator, 32)).into(),
+                        format!("曲目: {total}首,新增{new_count}首,已收藏{duplicate_count}首")
+                            .into(),
                     ];
                     preview.extend(playlist.tracks.iter().take(3).enumerate().map(
                         |(index, track)| {
-                            format!(
+                            PlaylistReply::from(format!(
                                 "示例{}: {} - {}",
                                 index + 1,
                                 chat_safe_text(&track.metadata.title, 22),
                                 chat_safe_text(&track_artists(track), 18)
-                            )
+                            ))
                         },
                     ));
-                    preview.push("回复@确认导入或@取消导入.".to_owned());
+                    preview.push("回复@确认导入或@取消导入.".to_owned().into());
                     imports.insert(
                         owner,
                         PendingPlaylistImport::Ready {
@@ -730,28 +780,28 @@ impl PlaylistApplication {
         playback: &mut dyn PlaylistPlaybackPort,
         now: Instant,
         now_epoch: i64,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<PlaylistReply>> {
         let owner = owner.trim();
         if owner.is_empty() {
-            return Ok(vec!["歌单需要先识别发言者,请稍后重试.".into()]);
+            return Ok(vec![PlaylistReply::keyed(
+                &templates::ACTOR_MISSING,
+                ReplyVars::new(),
+            )]);
         }
         match command {
+            // 帮助四行由组装层按 @歌单帮助 的覆盖逐行渲染。
             PlaylistCommand::Help => Ok(crate::features::reply_template::HELP_PLAYLIST
                 .iter()
-                .map(|spec| {
-                    crate::features::reply_template::render(
-                        spec,
-                        None,
-                        &crate::features::reply_template::ReplyVars::new(),
-                    )
-                    .text
-                })
+                .map(|spec| PlaylistReply::keyed(spec, ReplyVars::new()))
                 .collect()),
             PlaylistCommand::Open => {
                 self.discard_window(owner)?;
                 let total = self.count(owner)?;
                 if total == 0 {
-                    return Ok(vec!["你的歌单还是空的,先播一首再发@收藏.".into()]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::EMPTY_NO_TRACK_HINT,
+                        ReplyVars::new(),
+                    )]);
                 }
                 let seed = seed_from(now_epoch, owner);
                 let tracks = self.pick_many(owner, &[], WINDOW_CANDIDATES, seed)?;
@@ -767,12 +817,16 @@ impl PlaylistApplication {
                 match self.take_window_selection(owner, index, now)? {
                     Some(track) => {
                         if !playback.enqueue_next(&track)? {
-                            return Ok(vec!["播放队列已满,歌曲未加入.".into()]);
+                            return Ok(vec![PlaylistReply::keyed(
+                                &templates::SELECT_QUEUE_FULL,
+                                ReplyVars::new(),
+                            )]);
                         }
-                        Ok(vec![format!(
-                            "下一曲: {} - {}",
-                            track_title(&track),
-                            track_artists(&track)
+                        Ok(vec![PlaylistReply::keyed(
+                            &templates::SELECT_QUEUED,
+                            ReplyVars::new()
+                                .with("歌名", track_title(&track))
+                                .with("歌手", track_artists(&track)),
                         )])
                     }
                     None => {
@@ -780,7 +834,10 @@ impl PlaylistApplication {
                         if len == 0 {
                             Ok(Vec::new())
                         } else {
-                            Ok(vec![format!("请回复@1~@{len}选择,@关闭退出.")])
+                            Ok(vec![PlaylistReply::keyed(
+                                &templates::SELECT_OUT_OF_RANGE,
+                                ReplyVars::new().with("上限", len.to_string()),
+                            )])
                         }
                     }
                 }
@@ -792,7 +849,10 @@ impl PlaylistApplication {
                 let seed = seed_from(now_epoch ^ 0x5DEE_CE66, owner);
                 let tracks = self.pick_many(owner, &shown, WINDOW_CANDIDATES, seed)?;
                 if tracks.is_empty() {
-                    return Ok(vec!["没有更多可以换的歌了,回复@关闭退出.".into()]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::REROLL_EXHAUSTED,
+                        ReplyVars::new(),
+                    )]);
                 }
                 // pick_many 只有未展示池耗尽才回到全部曲目，此时重置周期。
                 let restarted = tracks
@@ -805,79 +865,116 @@ impl PlaylistApplication {
             }
             PlaylistCommand::Close => {
                 if self.close_active_window(owner, now)? {
-                    Ok(vec!["已关闭歌单窗口.".into()])
+                    Ok(vec![PlaylistReply::keyed(
+                        &templates::WINDOW_CLOSED,
+                        ReplyVars::new(),
+                    )])
                 } else {
                     Ok(Vec::new())
                 }
             }
             PlaylistCommand::Favorite => {
                 let Some(track) = playback.current_track() else {
-                    return Ok(vec!["当前没有正在播放的歌曲,无法收藏.".into()]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::FAVORITE_NO_TRACK,
+                        ReplyVars::new(),
+                    )]);
                 };
                 let title = track_title(&track);
                 let added = self.add(owner, &track, now_epoch)?;
                 if added {
-                    Ok(vec![format!(
-                        "已收藏: {title} (共{}首)",
-                        self.count(owner)?
+                    Ok(vec![PlaylistReply::keyed(
+                        &templates::FAVORITE_ADDED,
+                        ReplyVars::new()
+                            .with("歌名", title)
+                            .with("数量", self.count(owner)?.to_string()),
                     )])
                 } else {
                     // 歌单模式下当前曲通常已在收藏里；明确提示，不让人误以为又收藏了一首。
-                    Ok(vec![format!("这首歌已在你的歌单中: {title}")])
+                    Ok(vec![PlaylistReply::keyed(
+                        &templates::FAVORITE_EXISTS,
+                        ReplyVars::new().with("歌名", title),
+                    )])
                 }
             }
             PlaylistCommand::Unfavorite => {
                 let Some(track) = playback.current_track() else {
-                    return Ok(vec!["当前没有正在播放的歌曲,无法取消收藏.".into()]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::UNFAVORITE_NO_TRACK,
+                        ReplyVars::new(),
+                    )]);
                 };
                 let title = track_title(&track);
                 let removed = self.remove(owner, &track)?;
                 if removed {
-                    Ok(vec![format!(
-                        "已取消收藏: {title} (剩余{}首)",
-                        self.count(owner)?
+                    Ok(vec![PlaylistReply::keyed(
+                        &templates::UNFAVORITE_REMOVED,
+                        ReplyVars::new()
+                            .with("歌名", title)
+                            .with("数量", self.count(owner)?.to_string()),
                     )])
                 } else {
-                    Ok(vec![format!("收藏夹中没有: {title}")])
+                    Ok(vec![PlaylistReply::keyed(
+                        &templates::UNFAVORITE_MISSING,
+                        ReplyVars::new().with("歌名", title),
+                    )])
                 }
             }
             PlaylistCommand::PlayPlaylist => {
                 let total = self.count(owner)?;
                 if total == 0 {
-                    return Ok(vec!["收藏夹为空,先收藏或导入一些歌曲.".into()]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::PLAY_EMPTY,
+                        ReplyVars::new(),
+                    )]);
                 }
                 let tracks = self.pick_many(owner, &[], total, seed_from(now_epoch, owner))?;
                 match playback.start_playlist(owner, tracks)? {
-                    PersonalPlaylistStart::Started(queued) => Ok(vec![format!(
-                        "已进入歌单模式,{}首收藏已按随机顺序加入自动队列.",
-                        queued
+                    PersonalPlaylistStart::Started(queued) => Ok(vec![PlaylistReply::keyed(
+                        &templates::PLAY_STARTED,
+                        ReplyVars::new().with("数量", queued.to_string()),
                     )]),
-                    PersonalPlaylistStart::AlreadyActive { owner: current } => Ok(vec![format!(
-                        "当前为{current}的歌单;如需切换请先发@大厅模式再发@歌单模式"
-                    )]),
+                    PersonalPlaylistStart::AlreadyActive { owner: current } => {
+                        Ok(vec![PlaylistReply::keyed(
+                            &templates::PLAY_OCCUPIED,
+                            ReplyVars::new().with("歌手", current),
+                        )])
+                    }
                 }
             }
             PlaylistCommand::HallMode | PlaylistCommand::StopPlaylist => {
                 if playback.stop_playlist()? {
-                    Ok(vec!["已退出歌单模式,大厅点歌与默认播放池已恢复.".into()])
+                    Ok(vec![PlaylistReply::keyed(
+                        &templates::MODE_EXITED,
+                        ReplyVars::new(),
+                    )])
                 } else {
-                    Ok(vec![
-                        "当前已是大厅模式,大厅点歌与默认播放池正常工作.".into(),
-                    ])
+                    Ok(vec![PlaylistReply::keyed(
+                        &templates::MODE_ALREADY_HALL,
+                        ReplyVars::new(),
+                    )])
                 }
             }
             PlaylistCommand::Random => {
                 let total = self.count(owner)?;
                 if total == 0 {
-                    return Ok(vec!["你的歌单还是空的,先播一首再发@收藏.".into()]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::EMPTY_NO_TRACK_HINT,
+                        ReplyVars::new(),
+                    )]);
                 }
                 let seed = seed_from(now_epoch, owner);
                 let Some(track) = self.pick_random(owner, &[], seed)? else {
-                    return Ok(vec!["你的歌单还是空的.".into()]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::EMPTY_PLAIN,
+                        ReplyVars::new(),
+                    )]);
                 };
-                Ok(vec![format!(
-                    "为你随机推荐: {} (收藏夹共{total}首)",
-                    track_title(&track)
+                Ok(vec![PlaylistReply::keyed(
+                    &templates::RANDOM_PICKED,
+                    ReplyVars::new()
+                        .with("歌名", track_title(&track))
+                        .with("数量", total.to_string()),
                 )])
             }
             PlaylistCommand::Import { provider, input } => {
@@ -891,12 +988,16 @@ impl PlaylistApplication {
                     | PendingPlaylistImport::Ready { deadline, .. } => *deadline > now,
                 });
                 if imports.contains_key(owner) {
-                    return Ok(vec![
-                        "你已有一个待处理的歌单导入,请先确认或取消.".to_owned(),
-                    ]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::IMPORT_PENDING,
+                        ReplyVars::new(),
+                    )]);
                 }
                 if imports.len() >= 4 {
-                    return Ok(vec!["当前歌单导入任务较多,请稍后再试.".to_owned()]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::IMPORT_BUSY,
+                        ReplyVars::new(),
+                    )]);
                 }
                 let operation = playback.import_playlist(provider, input)?;
                 imports.insert(
@@ -906,7 +1007,10 @@ impl PlaylistApplication {
                         deadline: now + IMPORT_TTL,
                     },
                 );
-                Ok(vec!["正在读取歌单,完成后会发送导入预览.".to_owned()])
+                Ok(vec![PlaylistReply::keyed(
+                    &templates::IMPORT_LOADING,
+                    ReplyVars::new(),
+                )])
             }
             PlaylistCommand::ConfirmImport => {
                 let mut imports = self
@@ -929,7 +1033,10 @@ impl PlaylistApplication {
                                 deadline,
                             },
                         );
-                        Ok(vec!["歌单仍在读取,请等候预览后再确认.".to_owned()])
+                        Ok(vec![PlaylistReply::keyed(
+                            &templates::IMPORT_STILL_LOADING,
+                            ReplyVars::new(),
+                        )])
                     }
                     PendingPlaylistImport::Ready { playlist, deadline } if deadline > now => {
                         drop(imports);
@@ -937,11 +1044,12 @@ impl PlaylistApplication {
                             self.add_many(owner, &playlist.tracks, now_epoch)?;
                         // 导入是往歌单里加歌：新歌并入运行中的随机池（owner 匹配时）。
                         playback.extend_playlist_tracks(owner, &playlist.tracks)?;
-                        Ok(vec![format!(
-                            "已导入 \"{}\",新增{}首,重复{}首.",
-                            safe_external_text(&playlist.title),
-                            added,
-                            duplicates
+                        Ok(vec![PlaylistReply::keyed(
+                            &templates::IMPORT_DONE,
+                            ReplyVars::new()
+                                .with("歌名", safe_external_text(&playlist.title))
+                                .with("新增", added.to_string())
+                                .with("重复", duplicates.to_string()),
                         )])
                     }
                     _ => Ok(Vec::new()),
@@ -959,7 +1067,10 @@ impl PlaylistApplication {
                         | PendingPlaylistImport::Ready { deadline, .. } => deadline > now,
                     });
                 if removed {
-                    Ok(vec!["已取消歌单导入,收藏未修改.".to_owned()])
+                    Ok(vec![PlaylistReply::keyed(
+                        &templates::IMPORT_CANCELLED,
+                        ReplyVars::new(),
+                    )])
                 } else {
                     Ok(Vec::new())
                 }
@@ -967,11 +1078,15 @@ impl PlaylistApplication {
             PlaylistCommand::Clear => {
                 let total = self.count(owner)?;
                 if total == 0 {
-                    return Ok(vec!["你的歌单本来就是空的.".into()]);
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::CLEAR_ALREADY_EMPTY,
+                        ReplyVars::new(),
+                    )]);
                 }
                 self.mark_pending_clear(owner, now)?;
-                Ok(vec![format!(
-                    "将清空你收藏的{total}首歌曲;回复@确认清空执行,回复@放弃清空取消."
+                Ok(vec![PlaylistReply::keyed(
+                    &templates::CLEAR_CONFIRM,
+                    ReplyVars::new().with("数量", total.to_string()),
                 )])
             }
             PlaylistCommand::ConfirmClear => {
@@ -982,37 +1097,51 @@ impl PlaylistApplication {
                 if playback.playlist_mode_owner().as_deref() == Some(owner) {
                     // 运行中的模式没有可播内容，直接退出，避免“已清空还在放”。
                     playback.stop_playlist()?;
-                    return Ok(vec![format!(
-                        "已清空歌单,共移除{removed}首歌曲;当前歌单模式已退出."
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::CLEAR_DONE_WITH_EXIT,
+                        ReplyVars::new().with("数量", removed.to_string()),
                     )]);
                 }
-                Ok(vec![format!("已清空歌单,共移除{removed}首歌曲.")])
+                Ok(vec![PlaylistReply::keyed(
+                    &templates::CLEAR_DONE,
+                    ReplyVars::new().with("数量", removed.to_string()),
+                )])
             }
             PlaylistCommand::AbortClear => {
                 if !self.take_pending_clear(owner, now)? {
                     return Ok(Vec::new());
                 }
-                Ok(vec!["已取消清空.".into()])
+                Ok(vec![PlaylistReply::keyed(
+                    &templates::CLEAR_ABORTED,
+                    ReplyVars::new(),
+                )])
             }
         }
     }
 }
 
 /// 每首歌单独发一条；五首推荐时首尾说明加五首正好七条。
-fn window_messages(tracks: &[PlayableTrack]) -> Vec<String> {
-    let mut messages = vec![format!("为你推荐{}首", tracks.len())];
+fn window_messages(tracks: &[PlayableTrack]) -> Vec<PlaylistReply> {
+    let mut messages = vec![PlaylistReply::keyed(
+        &templates::WINDOW_HEADER,
+        ReplyVars::new().with("数量", tracks.len().to_string()),
+    )];
     messages.extend(tracks.iter().enumerate().map(|(index, track)| {
-        format!(
-            "{}. {} - {}",
-            index + 1,
-            chat_safe_text(&track.metadata.title, 24),
-            chat_safe_text(&track_artists(track), 20)
+        PlaylistReply::keyed(
+            &templates::WINDOW_ITEM,
+            ReplyVars::new()
+                .with("序号", (index + 1).to_string())
+                .with("歌名", chat_safe_text(&track.metadata.title, 24))
+                .with("歌手", chat_safe_text(&track_artists(track), 20)),
         )
     }));
     if !tracks.is_empty() {
-        messages.push(format!(
-            "20秒内回复@1-@{}加入下一曲；@换一批重抽；@关闭退出",
-            tracks.len().min(WINDOW_CANDIDATES)
+        messages.push(PlaylistReply::keyed(
+            &templates::WINDOW_FOOTER,
+            ReplyVars::new().with(
+                "上限",
+                tracks.len().min(WINDOW_CANDIDATES).to_string(),
+            ),
         ));
     }
     messages
@@ -1133,6 +1262,13 @@ mod tests {
         }
     }
 
+    /// 把带 key 的回复按内置默认文案展开，供断言成品文本使用。
+    ///
+    /// 生产路径由组装层查用户覆盖后渲染；测试不接配置，所以这里等价于内置文案。
+    fn texts(replies: Vec<PlaylistReply>) -> Vec<String> {
+        replies.iter().map(PlaylistReply::render_default).collect()
+    }
+
     fn app() -> PlaylistApplication {
         PlaylistApplication::from_connection(Connection::open_in_memory().unwrap()).unwrap()
     }
@@ -1162,8 +1298,10 @@ mod tests {
         command: &PlaylistCommand,
         port: &mut FakePlayback,
     ) -> Vec<String> {
-        app.execute(owner, command, port, Instant::now(), 1_700_000_000)
-            .unwrap()
+        texts(
+            app.execute(owner, command, port, Instant::now(), 1_700_000_000)
+                .unwrap(),
+        )
     }
 
     #[test]
@@ -1418,9 +1556,9 @@ mod tests {
             current: None,
             played: Vec::new(),
         };
-        let other_owner = app
+        let other_owner = texts(app
             .execute("乙", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
-            .unwrap();
+            .unwrap());
         assert!(other_owner.is_empty());
         assert_eq!(app.count("甲").unwrap(), 0);
         assert!(
@@ -1431,9 +1569,9 @@ mod tests {
             !app.has_command_context("乙", &PlaylistCommand::ConfirmImport, now)
                 .unwrap()
         );
-        let owner = app
+        let owner = texts(app
             .execute("甲", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
-            .unwrap();
+            .unwrap());
         assert!(owner[0].contains("新增2首"));
         assert_eq!(app.count("甲").unwrap(), 2);
         assert_eq!(app.count("乙").unwrap(), 0);
@@ -1469,13 +1607,13 @@ mod tests {
         let now = Instant::now();
         app.add("甲", &track("a"), 1).unwrap();
         let mut port = ActiveModePlayback { stopped: false };
-        let prompt = app
+        let prompt = texts(app
             .execute("甲", &PlaylistCommand::Clear, &mut port, now, 1)
-            .unwrap();
+            .unwrap());
         assert!(prompt[0].contains("确认清空"));
-        let cleared = app
+        let cleared = texts(app
             .execute("甲", &PlaylistCommand::ConfirmClear, &mut port, now, 1)
-            .unwrap();
+            .unwrap());
         assert!(cleared[0].contains("已清空"));
         assert!(
             cleared[0].contains("已退出"),
@@ -1532,9 +1670,9 @@ mod tests {
         let mut port = RecordingExtendPlayback {
             extended: Vec::new(),
         };
-        let replies = app
+        let replies = texts(app
             .execute("甲", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
-            .unwrap();
+            .unwrap());
         assert!(replies[0].contains("新增2首"));
         assert_eq!(port.extended.len(), 2, "确认导入应把新歌并入运行中的随机池");
     }
@@ -1571,7 +1709,7 @@ mod tests {
         let tracks = (0..5)
             .map(|index| track(&index.to_string()))
             .collect::<Vec<_>>();
-        let messages = window_messages(&tracks);
+        let messages = texts(window_messages(&tracks));
         assert_eq!(messages.len(), 7);
         assert_eq!(messages[0], "为你推荐5首");
         for index in 1..=5 {
@@ -1666,7 +1804,7 @@ mod tests {
             .collect::<Vec<_>>();
         app.add_many("乙", &tracks, 1).unwrap();
         let mut port = AlreadyActivePlayback;
-        let replies = app
+        let replies = texts(app
             .execute(
                 "乙",
                 &PlaylistCommand::PlayPlaylist,
@@ -1674,7 +1812,7 @@ mod tests {
                 Instant::now(),
                 1_700_000_000,
             )
-            .unwrap();
+            .unwrap());
         assert_eq!(
             replies,
             vec!["当前为甲的歌单;如需切换请先发@大厅模式再发@歌单模式".to_string()]
@@ -1732,9 +1870,9 @@ mod tests {
         app.execute("甲", &PlaylistCommand::Clear, &mut port, started, 0)
             .unwrap();
         let later = started + CLEAR_CONFIRM_TTL + Duration::from_secs(1);
-        let reply = app
+        let reply = texts(app
             .execute("甲", &PlaylistCommand::ConfirmClear, &mut port, later, 0)
-            .unwrap();
+            .unwrap());
         assert!(reply.is_empty());
         assert_eq!(app.count("甲").unwrap(), 1);
     }
@@ -1750,23 +1888,23 @@ mod tests {
             app.add("甲", &track(id), 0).unwrap();
         }
         let now = Instant::now();
-        let opened = app
+        let opened = texts(app
             .execute("甲", &PlaylistCommand::Open, &mut port, now, 7)
-            .unwrap();
+            .unwrap());
         assert_eq!(opened.len(), 5);
         assert!(opened[0].starts_with("为你推荐3首"));
         assert!(opened[1].starts_with("1. "));
         assert!(opened[4].contains("20秒内回复@1-@3加入下一曲"));
-        let reply = app
+        let reply = texts(app
             .execute("甲", &PlaylistCommand::Select(1), &mut port, now, 7)
-            .unwrap();
+            .unwrap());
         assert!(reply[0].contains("下一曲"), "{reply:?}");
         assert_eq!(port.played.len(), 1);
         assert!(port.played[0].starts_with("queued:"));
         // 选过之后窗口关闭。
-        let again = app
+        let again = texts(app
             .execute("甲", &PlaylistCommand::Select(1), &mut port, now, 7)
-            .unwrap();
+            .unwrap());
         assert!(again.is_empty());
     }
 
@@ -1807,9 +1945,9 @@ mod tests {
         app.execute("甲", &PlaylistCommand::Open, &mut port, started, 7)
             .unwrap();
         let later = started + WINDOW_TTL + Duration::from_secs(1);
-        let reply = app
+        let reply = texts(app
             .execute("甲", &PlaylistCommand::Select(1), &mut port, later, 7)
-            .unwrap();
+            .unwrap());
         assert!(reply.is_empty());
         assert!(port.played.is_empty(), "过期窗口不应触发播放");
     }

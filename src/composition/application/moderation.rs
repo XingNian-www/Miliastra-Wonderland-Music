@@ -279,6 +279,14 @@ impl ModerationCommandPort for ApplicationRuntime {
         self.reply(message)
     }
 
+    fn send_hall_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        self.reply_with_template(spec, vars)
+    }
+
     fn prepare_vote_hold(&mut self) -> Result<Box<dyn ModerationPrimaryHold>> {
         let mut hold = TemporaryPrimaryHold::new(self.business.business.clone())?;
         if let Err(error) =

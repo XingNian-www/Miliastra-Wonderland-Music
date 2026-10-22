@@ -14,7 +14,7 @@ use crate::features::chat_text::{
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
-use crate::features::reply_template::{hall as templates, ReplyVars};
+use crate::features::reply_template::{ReplyVars, hall as templates};
 use crate::text::normalize_comparison_text;
 use miliastra_contracts::StateStore;
 use miliastra_kernel::clock::{Clock, WallClock};
@@ -1050,9 +1050,11 @@ mod tests {
             idle: true,
             ..TemplateRecordingPort::default()
         };
-        assert!(HallApplication
-            .maybe_warn_expiring(&mut warn_minutes)
-            .expect("expiry warning with minutes"));
+        assert!(
+            HallApplication
+                .maybe_warn_expiring(&mut warn_minutes)
+                .expect("expiry warning with minutes")
+        );
         assert_eq!(
             warn_minutes.rendered_keys(),
             ["hall.expiring.warning_minutes"]
@@ -1065,9 +1067,11 @@ mod tests {
             idle: true,
             ..TemplateRecordingPort::default()
         };
-        assert!(HallApplication
-            .maybe_warn_expiring(&mut warn_expired)
-            .expect("expiry warning without minutes"));
+        assert!(
+            HallApplication
+                .maybe_warn_expiring(&mut warn_expired)
+                .expect("expiry warning without minutes")
+        );
         assert_eq!(warn_expired.rendered_keys(), ["hall.expiring.warning"]);
         assert_eq!(warn_expired.rendered[0].1, "大厅即将到期");
         warn_expired.assert_only_templates_were_used();

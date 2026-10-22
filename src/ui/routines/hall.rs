@@ -9,13 +9,13 @@ use super::friend_delivery::{
 #[cfg(test)]
 use crate::config::AppConfig;
 use crate::config::{HallTimingConfig, OcrConfig, ScreenConfig};
+use crate::geometry::{Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::geometry::{Rect, crop_canvas};
 use crate::ui::locator::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty, merge_hall_info_samples,
     parse_hall_member_count, parse_hall_remaining_minutes,
@@ -560,9 +560,9 @@ mod tests {
     use image::{DynamicImage, GenericImage, Rgba};
 
     use super::*;
+    use crate::geometry::Rect;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
-    use crate::geometry::Rect;
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
     type DragRecord = (i32, i32, i32, i32);

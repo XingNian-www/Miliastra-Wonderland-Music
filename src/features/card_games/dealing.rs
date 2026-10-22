@@ -59,6 +59,13 @@ pub(super) fn initial_hand_deliveries(
                     .with("张数", player.hand.len().to_string())
                     .with("手牌", format_hand(&player.hand)),
             ),
+            template: Some(keyed_reply(
+                &templates::HAND_INITIAL,
+                ReplyVars::new()
+                    .with("玩法", variant.label())
+                    .with("张数", player.hand.len().to_string())
+                    .with("手牌", format_hand(&player.hand)),
+            )),
         })
         .collect()
 }

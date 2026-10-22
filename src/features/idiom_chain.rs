@@ -13,7 +13,7 @@ use super::chat_text::{
 };
 use super::command::{CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch};
 use super::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
-use super::reply_template::{idiom_chain as templates, ReplyVars};
+use super::reply_template::{ReplyTemplate, ReplyVars, idiom_chain as templates};
 use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 fn default_lexicon_path() -> std::path::PathBuf {
@@ -199,6 +199,13 @@ pub struct IdiomChainOutcome {
     pub reply: String,
     pub action: &'static str,
     pub explanation: Option<IdiomExplanation>,
+    pub reply_template: Option<IdiomReplyTemplate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdiomReplyTemplate {
+    pub spec: &'static ReplyTemplate,
+    pub vars: ReplyVars,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,6 +230,13 @@ pub(crate) trait IdiomChainDeferredPort {
         observed_at: Instant,
     ) -> Result<IdiomChainOutcome>;
     fn send_deferred(&mut self, message: String) -> Result<IdiomDeliveryOutcome>;
+    fn send_deferred_template(
+        &mut self,
+        message: &str,
+        _template: &IdiomReplyTemplate,
+    ) -> Result<IdiomDeliveryOutcome> {
+        self.send_deferred(message.to_string())
+    }
 }
 
 pub(crate) trait IdiomChainExplanationPort {
@@ -256,7 +270,11 @@ impl IdiomChainApplication {
         let outcome = port.handle_command(player, command, observed_at)?;
         let action = outcome.action;
         debug_assert!(outcome.explanation.is_none());
-        match port.send_deferred(outcome.reply)? {
+        let delivery = match outcome.reply_template.as_ref() {
+            Some(template) => port.send_deferred_template(&outcome.reply, template),
+            None => port.send_deferred(outcome.reply.clone()),
+        };
+        match delivery? {
             IdiomDeliveryOutcome::Added => {}
             IdiomDeliveryOutcome::DroppedEarlierMessage => {
                 log::warn!("延迟聊天发送队列已满，已丢弃一条较早的回复");
@@ -337,9 +355,9 @@ impl IdiomChainService {
         now: Instant,
     ) -> Result<IdiomChainOutcome> {
         if entertainment.active() == Some(EntertainmentKind::TurtleSoup) {
-            return Ok(outcome(
+            return Ok(templated_outcome(
                 "occupied",
-                reply(&templates::OCCUPIED_TURTLE_SOUP, ReplyVars::new()),
+                keyed_reply(&templates::OCCUPIED_TURTLE_SOUP, ReplyVars::new()),
             ));
         }
         let acquired_for_start = if matches!(command, IdiomChainCommand::Start { .. }) {
@@ -347,9 +365,9 @@ impl IdiomChainService {
                 AcquireOutcome::Acquired => true,
                 AcquireOutcome::AlreadyOwned => false,
                 AcquireOutcome::Occupied(kind) => {
-                    return Ok(outcome(
+                    return Ok(templated_outcome(
                         "occupied",
-                        reply(
+                        keyed_reply(
                             &templates::OCCUPIED_OTHER,
                             ReplyVars::new().with("其他玩法", kind.label()),
                         ),
@@ -465,11 +483,17 @@ impl IdiomChainGame {
         now: Instant,
     ) -> IdiomChainOutcome {
         if !self.enabled {
-            return outcome("disabled", reply(&templates::DISABLED, ReplyVars::new()));
+            return templated_outcome(
+                "disabled",
+                keyed_reply(&templates::DISABLED, ReplyVars::new()),
+            );
         }
 
         if !matches!(command, IdiomChainCommand::Start { .. }) && self.expire_if_idle(now) {
-            return outcome("expired", reply(&templates::EXPIRED, ReplyVars::new()));
+            return templated_outcome(
+                "expired",
+                keyed_reply(&templates::EXPIRED, ReplyVars::new()),
+            );
         }
 
         match command {
@@ -491,9 +515,9 @@ impl IdiomChainGame {
     ) -> IdiomChainOutcome {
         self.expire_if_idle(now);
         if self.session.is_some() {
-            return outcome(
+            return templated_outcome(
                 "already-active",
-                reply(&templates::ALREADY_ACTIVE, ReplyVars::new()),
+                keyed_reply(&templates::ALREADY_ACTIVE, ReplyVars::new()),
             );
         }
         let idiom = if raw_idiom.trim().is_empty() {
@@ -511,9 +535,9 @@ impl IdiomChainGame {
                 .cloned()
                 .collect::<Vec<_>>();
             let Some(idiom) = eligible.choose(&mut rand::thread_rng()) else {
-                return outcome(
+                return templated_outcome(
                     "no-start-candidate",
-                    reply(&templates::NO_START_CANDIDATE, ReplyVars::new()),
+                    keyed_reply(&templates::NO_START_CANDIDATE, ReplyVars::new()),
                 );
             };
             idiom.clone()
@@ -530,16 +554,16 @@ impl IdiomChainGame {
             .lexicon
             .has_unused_successor(expected_first, mode, &session.used)
         {
-            return outcome(
+            return templated_outcome(
                 "dead-end-start",
-                reply(&templates::DEAD_END_START, ReplyVars::new()),
+                keyed_reply(&templates::DEAD_END_START, ReplyVars::new()),
             );
         }
         self.session = Some(session);
         let expected = expected_start_description(expected_first, mode);
-        outcome(
+        templated_outcome(
             "started",
-            reply(
+            keyed_reply(
                 &templates::STARTED,
                 ReplyVars::new()
                     .with("模式", mode.label())
@@ -555,16 +579,16 @@ impl IdiomChainGame {
             Err(reply) => return outcome("invalid-submission", reply),
         };
         let Some(session) = self.session.as_ref() else {
-            return outcome(
+            return templated_outcome(
                 "no-session",
-                reply(&templates::NO_SESSION_START, ReplyVars::new()),
+                keyed_reply(&templates::NO_SESSION_START, ReplyVars::new()),
             );
         };
         let first = first_char(&idiom);
         if !session.mode.accepts(session.expected_first, first) {
-            return outcome(
+            return templated_outcome(
                 "wrong-first-char",
-                reply(
+                keyed_reply(
                     &templates::WRONG_FIRST_CHAR,
                     ReplyVars::new().with(
                         "开头描述",
@@ -574,7 +598,10 @@ impl IdiomChainGame {
             );
         }
         if session.used.contains(&idiom) {
-            return outcome("duplicate", reply(&templates::DUPLICATE, ReplyVars::new()));
+            return templated_outcome(
+                "duplicate",
+                keyed_reply(&templates::DUPLICATE, ReplyVars::new()),
+            );
         }
 
         let next_first = last_char(&idiom);
@@ -591,9 +618,9 @@ impl IdiomChainGame {
                 .has_unused_successor(next_first, session.mode, &session.used);
         if no_successor {
             self.session = None;
-            return outcome(
+            return templated_outcome(
                 "completed",
-                reply(
+                keyed_reply(
                     &templates::COMPLETED,
                     ReplyVars::new()
                         .with("成语", idiom)
@@ -602,9 +629,9 @@ impl IdiomChainGame {
             );
         }
         let expected = expected_start_description(next_first, session.mode);
-        outcome(
+        templated_outcome(
             "accepted",
-            reply(
+            keyed_reply(
                 &templates::ACCEPTED,
                 ReplyVars::new()
                     .with("上一个", previous)
@@ -616,11 +643,14 @@ impl IdiomChainGame {
 
     fn status(&mut self) -> IdiomChainOutcome {
         let Some(session) = self.session.as_ref() else {
-            return outcome("no-session", reply(&templates::NO_SESSION, ReplyVars::new()));
+            return templated_outcome(
+                "no-session",
+                keyed_reply(&templates::NO_SESSION, ReplyVars::new()),
+            );
         };
-        outcome(
+        templated_outcome(
             "status",
-            reply(
+            keyed_reply(
                 &templates::STATUS,
                 ReplyVars::new()
                     .with("模式", session.mode.label())
@@ -643,15 +673,15 @@ impl IdiomChainGame {
         } else if let Some(session) = self.session.as_ref() {
             session.last_idiom.clone()
         } else {
-            return outcome(
+            return templated_outcome(
                 "no-explanation-target",
-                reply(&templates::NO_EXPLANATION_TARGET, ReplyVars::new()),
+                keyed_reply(&templates::NO_EXPLANATION_TARGET, ReplyVars::new()),
             );
         };
         let Some(details) = self.lexicon.explanation(&idiom) else {
-            return outcome(
+            return templated_outcome(
                 "missing-explanation",
-                reply(&templates::MISSING_EXPLANATION, ReplyVars::new()),
+                keyed_reply(&templates::MISSING_EXPLANATION, ReplyVars::new()),
             );
         };
         IdiomChainOutcome {
@@ -659,6 +689,10 @@ impl IdiomChainGame {
                 &templates::EXPLANATION_TITLE,
                 ReplyVars::new().with("成语", idiom.clone()),
             ),
+            reply_template: Some(IdiomReplyTemplate {
+                spec: &templates::EXPLANATION_TITLE,
+                vars: ReplyVars::new().with("成语", idiom.clone()),
+            }),
             action: "explained",
             explanation: Some(IdiomExplanation {
                 idiom,
@@ -670,35 +704,44 @@ impl IdiomChainGame {
 
     fn hint(&self) -> IdiomChainOutcome {
         let Some(session) = self.session.as_ref() else {
-            return outcome("no-session", reply(&templates::NO_SESSION, ReplyVars::new()));
+            return templated_outcome(
+                "no-session",
+                keyed_reply(&templates::NO_SESSION, ReplyVars::new()),
+            );
         };
         let Some(idiom) =
             self.lexicon
                 .first_safe_hint(session.expected_first, session.mode, &session.used)
         else {
-            return outcome("no-hint", reply(&templates::NO_HINT, ReplyVars::new()));
+            return templated_outcome(
+                "no-hint",
+                keyed_reply(&templates::NO_HINT, ReplyVars::new()),
+            );
         };
-        outcome(
+        templated_outcome(
             "hint",
-            reply(&templates::HINT, ReplyVars::new().with("成语", idiom)),
+            keyed_reply(&templates::HINT, ReplyVars::new().with("成语", idiom)),
         )
     }
 
     fn stop(&mut self, player: &str) -> IdiomChainOutcome {
         let Some(session) = self.session.as_ref() else {
-            return outcome("no-session", reply(&templates::NO_SESSION, ReplyVars::new()));
+            return templated_outcome(
+                "no-session",
+                keyed_reply(&templates::NO_SESSION, ReplyVars::new()),
+            );
         };
         if !self.allow_anyone_stop && !same_player(player, &session.starter) {
-            return outcome(
+            return templated_outcome(
                 "stop-denied",
-                reply(&templates::STOP_DENIED, ReplyVars::new()),
+                keyed_reply(&templates::STOP_DENIED, ReplyVars::new()),
             );
         }
         let count = session.total_count;
         self.session = None;
-        outcome(
+        templated_outcome(
             "stopped",
-            reply(
+            keyed_reply(
                 &templates::STOPPED,
                 ReplyVars::new().with("数量", count.to_string()),
             ),
@@ -1018,11 +1061,26 @@ fn reply(spec: &super::reply_template::ReplyTemplate, vars: ReplyVars) -> String
     super::reply_template::render(spec, None, &vars).text
 }
 
+fn keyed_reply(spec: &'static ReplyTemplate, vars: ReplyVars) -> IdiomReplyTemplate {
+    IdiomReplyTemplate { spec, vars }
+}
+
 fn outcome(action: &'static str, reply: impl Into<String>) -> IdiomChainOutcome {
     IdiomChainOutcome {
         reply: reply.into(),
         action,
         explanation: None,
+        reply_template: None,
+    }
+}
+
+fn templated_outcome(action: &'static str, template: IdiomReplyTemplate) -> IdiomChainOutcome {
+    let rendered = super::reply_template::render(template.spec, None, &template.vars).text;
+    IdiomChainOutcome {
+        reply: rendered,
+        action,
+        explanation: None,
+        reply_template: Some(template),
     }
 }
 
@@ -1070,6 +1128,7 @@ mod tests {
                     source: "故事来源".to_string(),
                     explanation: "比喻多此一举".to_string(),
                 }),
+                reply_template: None,
             })
         }
 

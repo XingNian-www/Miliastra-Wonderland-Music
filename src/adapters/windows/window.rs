@@ -727,7 +727,10 @@ impl WgcSession {
 
     fn is_dead(&self) -> bool {
         self.shared.closed.load(Ordering::SeqCst)
-            || self.control.as_ref().is_none_or(CaptureControl::is_finished)
+            || self
+                .control
+                .as_ref()
+                .is_none_or(CaptureControl::is_finished)
     }
 }
 
@@ -1370,10 +1373,7 @@ mod tests {
             base,
             WgcSessionKey {
                 window: 1,
-                crop: WgcCrop {
-                    width: 981,
-                    ..crop
-                },
+                crop: WgcCrop { width: 981, ..crop },
             }
         );
     }

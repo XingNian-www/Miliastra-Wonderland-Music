@@ -1,16 +1,16 @@
 mod ai;
 mod application;
+mod commands;
 mod review;
 mod search;
 
 use serde::{Deserialize, Serialize};
 
-use crate::features::chat_text::{
-    CommandSyntax, command_identity, parse_prefixed_command, strip_ascii_case_prefix,
-};
+use crate::features::chat_text::{CommandSyntax, command_identity};
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
+pub(crate) use commands::{command_specs, permission_id_for_command_name, platform_sources};
 
 pub(crate) use ai::{AiCandidatePickResult, AiClient, SongAiConfig};
 pub(crate) use application::{
@@ -105,6 +105,16 @@ pub(crate) enum SongSource {
 }
 
 impl SongSource {
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        platform_sources()
+            .map(|(source, _)| source)
+            .find(|source| source.as_str() == value)
+    }
+
+    pub(crate) fn permission_id(self) -> Option<&'static str> {
+        commands::permission_id(self)
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::All => "",
@@ -117,17 +127,21 @@ impl SongSource {
 }
 
 impl SongCommand {
+    pub(crate) fn permission_id(&self) -> &'static str {
+        if self.ai_assisted {
+            commands::ai_permission_id()
+        } else {
+            self.source
+                .permission_id()
+                .unwrap_or_else(commands::ai_permission_id)
+        }
+    }
+
     pub(crate) fn claims_chat(envelope: &CommandEnvelope) -> bool {
         if envelope.prefix() != CommandPrefix::At {
             return false;
         }
-        let commands = match envelope.authority() {
-            CommandAuthority::HallMember => HALL_COMMANDS,
-            CommandAuthority::Friend => FRIEND_COMMANDS,
-        };
-        commands.iter().any(|(prefix, _, _)| {
-            strip_ascii_case_prefix(envelope.command_text(), prefix).is_some()
-        })
+        commands::match_entry(envelope.command_text(), envelope.authority()).is_some()
     }
 
     pub(crate) fn parse_chat(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<Self>> {
@@ -181,45 +195,28 @@ fn joined_command(matched: &str, argument: &str) -> String {
 }
 
 pub(crate) fn parse_hall_syntax(command: &str) -> Option<CommandSyntax<'_, SongCommand>> {
-    for (prefix, source, ai_assisted) in HALL_COMMANDS {
-        let Some(argument) = parse_prefixed_command(command, prefix, true) else {
-            continue;
-        };
-        let song = parse_with_source(command, prefix, *source, *ai_assisted)?;
-        return Some(CommandSyntax {
-            matched: prefix,
-            argument,
-            command: song,
-        });
-    }
-    None
+    let entry = commands::match_entry(command, CommandAuthority::HallMember)?;
+    let song = parse_with_source(command, entry.matched, entry.source, entry.ai_assisted)?;
+    Some(CommandSyntax {
+        matched: entry.matched,
+        argument: entry.argument,
+        command: song,
+    })
 }
 
 pub(crate) fn parse_friend_command(command: &str, username: &str) -> Option<SongCommand> {
-    parse_with_commands(command, username, FRIEND_COMMANDS)
-}
-
-fn parse_with_commands(
-    command: &str,
-    username: &str,
-    commands: &[(&str, SongSource, bool)],
-) -> Option<SongCommand> {
-    for (prefix, source, ai_assisted) in commands {
-        if strip_ascii_case_prefix(command, prefix).is_some() {
-            let mut song = parse_with_source(command, prefix, *source, *ai_assisted)?;
-            // 好友默认点歌支持直接发送 B 站 BV 号；仅对明确的“点歌”命令切换音源，
-            // 保持 QQ点歌、搜索及大厅命令的原有语义。
-            if prefix.eq_ignore_ascii_case("点歌") && *source == SongSource::QqMusic {
-                if let Some(bvid) = miliastra_playback::bilibili_normalize_bvid(&song.keyword) {
-                    song.source = SongSource::Bilibili;
-                    song.keyword = bvid;
-                }
-            }
-            song.friend_username = username.to_string();
-            return Some(song);
+    let entry = commands::match_entry(command, CommandAuthority::Friend)?;
+    let mut song = parse_with_source(command, entry.matched, entry.source, entry.ai_assisted)?;
+    // Only the default friend alias recognizes a direct BV number; explicit QQ
+    // and hall requests retain their selected source.
+    if entry.matched == "点歌" && entry.source == SongSource::QqMusic {
+        if let Some(bvid) = miliastra_playback::bilibili_normalize_bvid(&song.keyword) {
+            song.source = SongSource::Bilibili;
+            song.keyword = bvid;
         }
     }
-    None
+    song.friend_username = username.to_string();
+    Some(song)
 }
 
 fn parse_with_source(
@@ -249,38 +246,113 @@ fn parse_with_source(
     })
 }
 
-const HALL_COMMANDS: &[(&str, SongSource, bool)] = &[
-    ("AI点歌", SongSource::QqMusic, true),
-    ("AI搜索", SongSource::QqMusic, true),
-    ("QQ点歌", SongSource::QqMusic, false),
-    ("QQ搜索", SongSource::QqMusic, false),
-    ("网易点歌", SongSource::Netease, false),
-    ("网易云点歌", SongSource::Netease, false),
-    ("网易搜索", SongSource::Netease, false),
-    ("酷狗点歌", SongSource::Kugou, false),
-    ("点歌", SongSource::QqMusic, false),
-    ("搜索", SongSource::QqMusic, false),
-];
-
-// 好友点歌默认开放全部音源；AI 点歌和 AI 搜索使用 All，由后端在全部音源中选择结果。
-const FRIEND_COMMANDS: &[(&str, SongSource, bool)] = &[
-    ("AI点歌", SongSource::All, true),
-    ("AI搜索", SongSource::All, true),
-    ("QQ点歌", SongSource::QqMusic, false),
-    ("QQ搜索", SongSource::QqMusic, false),
-    ("网易点歌", SongSource::Netease, false),
-    ("网易云点歌", SongSource::Netease, false),
-    ("网易搜索", SongSource::Netease, false),
-    ("酷狗点歌", SongSource::Kugou, false),
-    ("B站点歌", SongSource::Bilibili, false),
-    ("B站搜索", SongSource::Bilibili, false),
-    ("点歌", SongSource::QqMusic, false),
-    ("搜索", SongSource::QqMusic, false),
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_options_round_trip_through_the_same_registry() {
+        let platforms: Vec<_> = platform_sources().collect();
+        assert_eq!(platforms.len(), 4);
+        for (source, label) in platforms {
+            assert_ne!(source, SongSource::All);
+            assert_eq!(SongSource::from_str(source.as_str()), Some(source));
+            assert_eq!(source.permission_id().unwrap(), format!("@{label}"));
+        }
+        for invalid in ["", "all", "unknown", "AI点歌"] {
+            assert_eq!(SongSource::from_str(invalid), None);
+        }
+    }
+
+    #[test]
+    fn registry_aliases_parse_with_independent_platform_permissions() {
+        for spec in command_specs() {
+            for name in spec.all_names() {
+                for authority in spec.authorities {
+                    let text = format!("{name}晴天");
+                    let command = match authority {
+                        CommandAuthority::HallMember => parse_hall_syntax(&text).unwrap().command,
+                        CommandAuthority::Friend => parse_friend_command(&text, "friend").unwrap(),
+                    };
+                    assert_eq!(command.keyword, "晴天");
+                    assert_eq!(command.prefix, name);
+                    assert_eq!(command.permission_id(), format!("@{}", spec.name));
+                    assert_eq!(
+                        command.friend_username,
+                        if *authority == CommandAuthority::Friend {
+                            "friend"
+                        } else {
+                            ""
+                        }
+                    );
+                    assert!(spec.matches_text(&text));
+                }
+            }
+        }
+        assert_eq!(SongSource::All.permission_id(), None);
+    }
+
+    #[test]
+    fn registry_preserves_friend_bv_and_ai_source_semantics() {
+        let bv = "BV1xx411c7mD";
+        let friend = parse_friend_command(&format!("点歌{bv}"), "friend").unwrap();
+        assert_eq!(friend.source, SongSource::Bilibili);
+        assert_eq!(friend.permission_id(), "@B站点歌");
+        assert_eq!(
+            parse_friend_command(&format!("QQ点歌{bv}"), "friend")
+                .unwrap()
+                .source,
+            SongSource::QqMusic
+        );
+        assert_eq!(
+            parse_hall_syntax(&format!("点歌{bv}"))
+                .unwrap()
+                .command
+                .source,
+            SongSource::QqMusic
+        );
+        assert!(parse_hall_syntax(&format!("B站点歌{bv}")).is_none());
+        assert_eq!(
+            parse_friend_command("AI点歌晴天", "friend").unwrap().source,
+            SongSource::All
+        );
+        assert_eq!(
+            parse_hall_syntax("AI点歌晴天").unwrap().command.source,
+            SongSource::QqMusic
+        );
+        assert_eq!(
+            parse_friend_command("ai点歌晴天伴奏", "friend")
+                .unwrap()
+                .permission_id(),
+            "@AI点歌"
+        );
+        assert!(
+            parse_friend_command("ai点歌晴天伴奏", "friend")
+                .unwrap()
+                .prefer_accompaniment
+        );
+    }
+
+    #[test]
+    fn removed_search_aliases_are_neither_parsed_nor_enumerated() {
+        for prefix in [
+            "搜索",
+            "AI搜索",
+            "QQ搜索",
+            "网易搜索",
+            "网易云搜索",
+            "酷狗搜索",
+            "B站搜索",
+        ] {
+            let text = format!("{prefix}晴天");
+            assert!(parse_hall_syntax(&text).is_none(), "hall {prefix}");
+            assert!(
+                parse_friend_command(&text, "friend").is_none(),
+                "friend {prefix}"
+            );
+            assert!(command_specs().iter().all(|spec| !spec.matches_text(&text)));
+        }
+    }
 
     #[test]
     fn parses_structured_song_metadata_and_ignores_album_in_keyword() {

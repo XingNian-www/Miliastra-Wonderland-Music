@@ -29,6 +29,8 @@ impl CommandPolicy {
 #[serde(deny_unknown_fields)]
 pub struct CommandAccessConfig {
     pub overrides: BTreeMap<String, CommandPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_song_source: Option<String>,
 }
 pub(crate) fn actor_permission(
     role: Option<IdentityRole>,
@@ -59,6 +61,17 @@ pub(crate) fn minimum_floor(id: &str) -> CommandPermission {
     }
 }
 fn default_policy(id: &str) -> Option<CommandPolicy> {
+    if id == "@点歌"
+        || id == "@搜索"
+        || super::song_request::command_specs()
+            .iter()
+            .any(|spec| super::song_request::permission_id_for_command_name(spec.name) == Some(id))
+    {
+        return Some(CommandPolicy {
+            enabled: true,
+            minimum_role: CommandPermission::User,
+        });
+    }
     if id == "custom_workflow" {
         return Some(CommandPolicy {
             enabled: true,
@@ -107,12 +120,41 @@ fn default_policy(id: &str) -> Option<CommandPolicy> {
 }
 pub(crate) fn catalog_policy(config: &CommandAccessConfig, id: &str) -> Option<CommandPolicy> {
     let default = default_policy(id)?;
-    let mut policy = config.overrides.get(id).cloned().unwrap_or(default);
+    let mut policy = config
+        .overrides
+        .get(id)
+        .cloned()
+        .or_else(|| {
+            super::song_request::command_specs()
+                .iter()
+                .any(|spec| {
+                    super::song_request::permission_id_for_command_name(spec.name) == Some(id)
+                })
+                .then(|| config.overrides.get("@点歌").cloned())
+                .flatten()
+        })
+        .unwrap_or(default);
     policy.minimum_role = policy.minimum_role.max(minimum_floor(id));
     Some(policy)
 }
 impl CommandAccessConfig {
+    pub(crate) fn apply_default_song_source(&self, song: &mut super::song_request::SongCommand) {
+        use super::song_request::SongSource;
+        if song.prefix != "点歌" || song.source == SongSource::Bilibili {
+            return;
+        }
+        song.source =
+            SongSource::from_str(self.default_song_source.as_deref().unwrap_or("qqmusic"))
+                .unwrap_or(SongSource::QqMusic);
+    }
     pub fn validate(&self) -> Result<()> {
+        if self
+            .default_song_source
+            .as_deref()
+            .is_some_and(|source| super::song_request::SongSource::from_str(source).is_none())
+        {
+            bail!("默认点歌平台无效");
+        }
         for (id, policy) in &self.overrides {
             if default_policy(id).is_none() {
                 bail!("command_access.overrides 未知命令ID: {id}");
@@ -130,6 +172,7 @@ pub(crate) fn resolve_for_routed(
 ) -> (String, CommandPolicy) {
     use super::administration::AdministrationCommand;
     let forced = match &command.command {
+        ModuleCommand::SongRequest(song) => Some(song.permission_id()),
         ModuleCommand::Administration(AdministrationCommand::SetCommandsEnabled {
             enabled,
             ..

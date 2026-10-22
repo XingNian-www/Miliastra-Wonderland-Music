@@ -22,7 +22,7 @@ pub(crate) mod undercover;
 /// 一条可调整回复的元数据。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReplyTemplate {
-    /// 稳定键，如 song.request.accepted。配置覆盖按此键索引。
+    /// 稳定键，如 song.request.accepted。回复面板覆盖按此键索引。
     pub(crate) key: &'static str,
     /// 内置默认文案，可含花括号占位符。
     pub(crate) default: &'static str,
@@ -30,6 +30,429 @@ pub(crate) struct ReplyTemplate {
     pub(crate) summary: &'static str,
     /// 面板分组：点歌 / 播放 / 大厅 / 娱乐 / 管理。
     pub(crate) group: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplyVariable {
+    pub name: &'static str,
+    pub label: &'static str,
+}
+
+/// Global template tokens; includes builder-supported reserved values.
+pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
+    ReplyVariable {
+        name: "AI回答",
+        label: "AI回答",
+    },
+    ReplyVariable {
+        name: "UID",
+        label: "UID",
+    },
+    ReplyVariable {
+        name: "上一个",
+        label: "上一个",
+    },
+    ReplyVariable {
+        name: "上一手",
+        label: "上一手",
+    },
+    ReplyVariable {
+        name: "上一手牌型",
+        label: "上一手牌型",
+    },
+    ReplyVariable {
+        name: "上限",
+        label: "上限",
+    },
+    ReplyVariable {
+        name: "下一位",
+        label: "下一位",
+    },
+    ReplyVariable {
+        name: "人数",
+        label: "人数",
+    },
+    ReplyVariable {
+        name: "位置",
+        label: "位置",
+    },
+    ReplyVariable {
+        name: "位置列表",
+        label: "位置列表",
+    },
+    ReplyVariable {
+        name: "关键词",
+        label: "关键词",
+    },
+    ReplyVariable {
+        name: "其他玩法",
+        label: "其他玩法",
+    },
+    ReplyVariable {
+        name: "决定",
+        label: "决定",
+    },
+    ReplyVariable {
+        name: "前缀",
+        label: "前缀",
+    },
+    ReplyVariable {
+        name: "剩余",
+        label: "剩余",
+    },
+    ReplyVariable {
+        name: "剩余分钟",
+        label: "剩余分钟",
+    },
+    ReplyVariable {
+        name: "动作",
+        label: "动作",
+    },
+    ReplyVariable {
+        name: "卧底位置",
+        label: "卧底位置",
+    },
+    ReplyVariable {
+        name: "卧底词",
+        label: "卧底词",
+    },
+    ReplyVariable {
+        name: "原因",
+        label: "原因",
+    },
+    ReplyVariable {
+        name: "名单",
+        label: "名单",
+    },
+    ReplyVariable {
+        name: "后续",
+        label: "后续",
+    },
+    ReplyVariable {
+        name: "后缀",
+        label: "后缀",
+    },
+    ReplyVariable {
+        name: "地主",
+        label: "地主",
+    },
+    ReplyVariable {
+        name: "大厅名",
+        label: "大厅名",
+    },
+    ReplyVariable {
+        name: "字",
+        label: "字",
+    },
+    ReplyVariable {
+        name: "平民词",
+        label: "平民词",
+    },
+    ReplyVariable {
+        name: "序号",
+        label: "序号",
+    },
+    ReplyVariable {
+        name: "底牌",
+        label: "底牌",
+    },
+    ReplyVariable {
+        name: "开头描述",
+        label: "开头描述",
+    },
+    ReplyVariable {
+        name: "张数",
+        label: "张数",
+    },
+    ReplyVariable {
+        name: "当前",
+        label: "当前",
+    },
+    ReplyVariable {
+        name: "当前抢地主",
+        label: "当前抢地主",
+    },
+    ReplyVariable {
+        name: "成语",
+        label: "成语",
+    },
+    ReplyVariable {
+        name: "手数",
+        label: "手数",
+    },
+    ReplyVariable {
+        name: "手牌",
+        label: "手牌",
+    },
+    ReplyVariable {
+        name: "托管后缀",
+        label: "托管后缀",
+    },
+    ReplyVariable {
+        name: "投票说明",
+        label: "投票说明",
+    },
+    ReplyVariable {
+        name: "拼音",
+        label: "拼音",
+    },
+    ReplyVariable {
+        name: "提问数",
+        label: "提问数",
+    },
+    ReplyVariable {
+        name: "搜索词",
+        label: "搜索词",
+    },
+    ReplyVariable {
+        name: "数量",
+        label: "数量",
+    },
+    ReplyVariable {
+        name: "昵称",
+        label: "昵称",
+    },
+    ReplyVariable {
+        name: "条目",
+        label: "条目",
+    },
+    ReplyVariable {
+        name: "来源",
+        label: "来源",
+    },
+    ReplyVariable {
+        name: "标签",
+        label: "标签",
+    },
+    ReplyVariable {
+        name: "模式",
+        label: "模式",
+    },
+    ReplyVariable {
+        name: "歌名",
+        label: "歌名",
+    },
+    ReplyVariable {
+        name: "炸弹",
+        label: "炸弹",
+    },
+    ReplyVariable {
+        name: "牌型",
+        label: "牌型",
+    },
+    ReplyVariable {
+        name: "牌面",
+        label: "牌面",
+    },
+    ReplyVariable {
+        name: "玩家",
+        label: "玩家",
+    },
+    ReplyVariable {
+        name: "玩家列表",
+        label: "玩家列表",
+    },
+    ReplyVariable {
+        name: "玩法",
+        label: "玩法",
+    },
+    ReplyVariable {
+        name: "用户名",
+        label: "用户名",
+    },
+    ReplyVariable {
+        name: "秒数",
+        label: "秒数",
+    },
+    ReplyVariable {
+        name: "结果",
+        label: "结果",
+    },
+    ReplyVariable {
+        name: "胜方",
+        label: "胜方",
+    },
+    ReplyVariable {
+        name: "角色",
+        label: "角色",
+    },
+    ReplyVariable {
+        name: "词语",
+        label: "词语",
+    },
+    ReplyVariable {
+        name: "超时秒数",
+        label: "超时秒数",
+    },
+    ReplyVariable {
+        name: "身份",
+        label: "身份",
+    },
+    ReplyVariable {
+        name: "轮次",
+        label: "轮次",
+    },
+    ReplyVariable {
+        name: "问题",
+        label: "问题",
+    },
+    ReplyVariable {
+        name: "阵营",
+        label: "阵营",
+    },
+    ReplyVariable {
+        name: "阶段",
+        label: "阶段",
+    },
+    ReplyVariable {
+        name: "音量",
+        label: "音量",
+    },
+];
+
+pub(crate) struct CommandReplyCatalogEntry {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub category: &'static str,
+    pub replies: &'static [ReplyTemplate],
+    pub ordered_batch: bool,
+}
+
+static COMMAND_REPLY_CATALOG: &[CommandReplyCatalogEntry] = &[
+    CommandReplyCatalogEntry {
+        id: "@帮助",
+        name: "帮助",
+        category: "帮助",
+        replies: &HELP_SONG_REQUEST,
+        ordered_batch: true,
+    },
+    CommandReplyCatalogEntry {
+        id: "@娱乐帮助",
+        name: "娱乐帮助",
+        category: "帮助",
+        replies: &HELP_ENTERTAINMENT,
+        ordered_batch: true,
+    },
+    CommandReplyCatalogEntry {
+        id: "@歌单帮助",
+        name: "歌单帮助",
+        category: "歌单",
+        replies: &HELP_PLAYLIST,
+        ordered_batch: true,
+    },
+    CommandReplyCatalogEntry {
+        id: "#塔罗牌帮助",
+        name: "塔罗牌帮助",
+        category: "娱乐",
+        replies: &[tarot::HELP_DRAW, tarot::HELP_REROLL, tarot::HELP_INTERPRET],
+        ordered_batch: true,
+    },
+    CommandReplyCatalogEntry {
+        id: "#海龟汤",
+        name: "海龟汤开局",
+        category: "娱乐",
+        replies: &[
+            turtle_soup::START_FAILED,
+            turtle_soup::ANNOUNCING,
+            turtle_soup::SETTLING,
+        ],
+        ordered_batch: false,
+    },
+    CommandReplyCatalogEntry {
+        id: "#状态（海龟汤）",
+        name: "海龟汤状态",
+        category: "娱乐",
+        replies: &[
+            turtle_soup::DISABLED,
+            turtle_soup::STATUS,
+            turtle_soup::STATUS_NO_SESSION,
+        ],
+        ordered_batch: false,
+    },
+    CommandReplyCatalogEntry {
+        id: "#结束（海龟汤）",
+        name: "结束海龟汤",
+        category: "娱乐",
+        replies: &[turtle_soup::END_FAILED, turtle_soup::END_NO_SESSION],
+        ordered_batch: false,
+    },
+    CommandReplyCatalogEntry {
+        id: "@大厅检测",
+        name: "大厅检测",
+        category: "大厅",
+        replies: &[
+            hall::DETECT_FAILED,
+            hall::PUBLIC_HALL_CURRENT,
+            hall::CURRENT,
+        ],
+        ordered_batch: false,
+    },
+    CommandReplyCatalogEntry {
+        id: "@大厅时间",
+        name: "大厅时间",
+        category: "大厅",
+        replies: &[
+            hall::TIME_REMAINING,
+            hall::TIME_UNKNOWN,
+            hall::PUBLIC_HALL_NO_LIMIT,
+        ],
+        ordered_batch: false,
+    },
+    CommandReplyCatalogEntry {
+        id: "@下一首",
+        name: "下一首",
+        category: "播放",
+        replies: &[playback::NEXT_POOL_FALLBACK, playback::NEXT_EMPTY],
+        ordered_batch: false,
+    },
+    CommandReplyCatalogEntry {
+        id: "@删除",
+        name: "删除当前曲目",
+        category: "播放",
+        replies: &[
+            playback::DELETE_TRACK_UNAVAILABLE,
+            playback::DELETE_REMOVED_POOL_FALLBACK,
+            playback::DELETE_NOT_IN_POOL_POOL_FALLBACK,
+            playback::DELETE_REMOVED_QUEUE_EMPTY,
+            playback::DELETE_NOT_IN_POOL_QUEUE_EMPTY,
+        ],
+        ordered_batch: false,
+    },
+    CommandReplyCatalogEntry {
+        id: "@暂停",
+        name: "暂停",
+        category: "播放",
+        replies: &[playback::PAUSE_OK],
+        ordered_batch: false,
+    },
+    CommandReplyCatalogEntry {
+        id: "@继续",
+        name: "继续 / 播放",
+        category: "播放",
+        replies: &[playback::RESUME_OK],
+        ordered_batch: false,
+    },
+    CommandReplyCatalogEntry {
+        id: "@音量",
+        name: "音量",
+        category: "播放",
+        replies: &[playback::VOLUME_SET],
+        ordered_batch: false,
+    },
+];
+pub(crate) fn command_reply_catalog() -> &'static [CommandReplyCatalogEntry] {
+    COMMAND_REPLY_CATALOG
+}
+pub(crate) fn command_reply_entry_for_key(key: &str) -> Option<&'static CommandReplyCatalogEntry> {
+    COMMAND_REPLY_CATALOG
+        .iter()
+        .find(|entry| entry.replies.iter().any(|spec| spec.key == key))
+}
+pub(crate) fn reply_variables() -> &'static [ReplyVariable] {
+    REPLY_VARIABLES
+}
+pub(crate) fn reply_variable_allowed(name: &str) -> bool {
+    REPLY_VARIABLES.iter().any(|v| v.name == name)
 }
 
 /// AI 聊天回复。
@@ -181,7 +604,34 @@ pub(crate) const HELP_SONG_REQUEST: [ReplyTemplate; 3] = [
     },
 ];
 
-/// 大厅帮助（娱乐类）逐行文案。
+/// 大厅帮助（歌单类）逐行文案。
+pub(crate) const HELP_PLAYLIST: [ReplyTemplate; 4] = [
+    ReplyTemplate {
+        key: "help.playlist.1",
+        default: "歌单: @歌单 推荐5首歌; @随机歌单/@歌单随机 随机推荐",
+        summary: "歌单帮助-浏览",
+        group: "歌单",
+    },
+    ReplyTemplate {
+        key: "help.playlist.2",
+        default: "收藏: @收藏 收藏当前歌曲; @取消收藏",
+        summary: "歌单帮助-收藏",
+        group: "歌单",
+    },
+    ReplyTemplate {
+        key: "help.playlist.3",
+        default: "模式: @歌单模式/@播放歌单 进入歌单模式; @退出歌单模式/@大厅模式 退出歌单模式",
+        summary: "歌单帮助-播放模式",
+        group: "歌单",
+    },
+    ReplyTemplate {
+        key: "help.playlist.4",
+        default: "导入: @导入QQ歌单<数字ID>; @导入网易歌单<数字ID>; @歌单清空",
+        summary: "歌单帮助-导入",
+        group: "歌单",
+    },
+];
+
 pub(crate) const HELP_ENTERTAINMENT: [ReplyTemplate; 9] = [
     ReplyTemplate {
         key: "help.entertainment.tarot.1",
@@ -247,14 +697,12 @@ pub(crate) const REPLY_SONG: [ReplyTemplate; 1] = [ReplyTemplate {
     group: "点歌",
 }];
 
-/// 全部模板的可枚举清单。
+/// 配置中心管理的通用回复模板清单。
 ///
-/// 新增模板时必须在此登记，否则面板看不到、配置也无法覆盖。
+/// 命令级帮助文本由 `command_reply_catalog` 独立提供。
 pub(crate) fn catalog() -> impl Iterator<Item = &'static ReplyTemplate> {
-    HELP_SONG_REQUEST
+    REPLY_SONG
         .iter()
-        .chain(HELP_ENTERTAINMENT.iter())
-        .chain(REPLY_SONG.iter())
         // 按模块拆分的模板：新增模块时只在这里加一行。
         .chain(playback::PLAYBACK.iter())
         .chain(hall::HALL.iter())
@@ -364,6 +812,62 @@ mod tests {
             assert!(!spec.group.trim().is_empty(), "{} 缺少分组", spec.key);
         }
         assert!(!keys.is_empty(), "模板目录不应为空");
+
+        let mut command_ids = std::collections::BTreeSet::new();
+        let mut owned_keys = std::collections::BTreeSet::new();
+        for entry in command_reply_catalog() {
+            assert!(
+                command_ids.insert(entry.id),
+                "命令回复目录ID重复：{}",
+                entry.id
+            );
+            assert!(!entry.replies.is_empty(), "{} 未登记回复", entry.id);
+            for spec in entry.replies {
+                assert!(
+                    owned_keys.insert(spec.key),
+                    "模板键被多个命令目录项拥有：{}",
+                    spec.key
+                );
+                assert_eq!(
+                    command_reply_entry_for_key(spec.key).map(|owner| owner.id),
+                    Some(entry.id),
+                    "模板 key 必须解析回它唯一的命令 owner: {}",
+                    spec.key
+                );
+            }
+        }
+        for id in [
+            "#塔罗牌帮助",
+            "#海龟汤",
+            "#状态（海龟汤）",
+            "#结束（海龟汤）",
+            "@大厅检测",
+            "@大厅时间",
+            "@下一首",
+            "@删除",
+            "@暂停",
+            "@继续",
+            "@音量",
+        ] {
+            assert!(command_ids.contains(id), "缺少可编辑静态命令 {id}");
+        }
+    }
+
+    #[test]
+    fn command_catalog_resolves_playback_keys_and_renders_shared_global_variables() {
+        let entry = command_reply_entry_for_key("playback.volume.set").unwrap();
+        assert_eq!(entry.id, "@音量");
+        assert_eq!(entry.replies[0].key, "playback.volume.set");
+        let rendered = render(
+            entry.replies.first().unwrap(),
+            Some("音量调整完成：{音量}"),
+            &ReplyVars::new().with("音量", "65"),
+        );
+        assert_eq!(rendered.text, "音量调整完成：65");
+        assert!(
+            command_reply_entry_for_key("playback.resume.ok")
+                .is_some_and(|entry| entry.id == "@继续")
+        );
     }
 
     #[test]

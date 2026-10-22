@@ -250,6 +250,9 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> Result<()> {
+        if self.command_reply_is_muted(spec.key) {
+            return Ok(());
+        }
         let text = self.render_reply(spec, vars);
         ApplicationRuntime::reply(self, &text)
     }

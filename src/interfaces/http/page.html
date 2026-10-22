@@ -434,7 +434,22 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .command-toolbar input[type=text]{flex:1;min-width:180px;height:var(--btn-h)}
 .command-toolbar .tabs{flex:none}
 .command-toolbar-meta{color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);white-space:nowrap}
-.command-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-4);align-items:start}
+.command-workspace{display:grid;grid-template-columns:minmax(150px,190px) minmax(0,1fr) minmax(280px,390px);gap:var(--sp-3);align-items:start}
+.command-reply-nav{position:sticky;top:12px;display:grid;gap:var(--sp-1);max-height:calc(100vh - 24px);overflow:auto}
+.command-reply-nav button{text-align:left;justify-content:flex-start}
+.command-reply-nav button.active{border-color:var(--accent);color:var(--accent)}
+.command-groups{display:grid;grid-template-columns:1fr;gap:var(--sp-3);align-items:start;min-width:0}
+.command-reply-editor{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto;background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-3);min-width:0}
+.command-reply-editor h3{margin:0 0 var(--sp-2);font-size:var(--fs-title)}
+.command-reply-list{display:grid;gap:var(--sp-2)}
+.command-reply-row{display:grid;gap:var(--sp-1);border-bottom:1px solid var(--sep-2);padding:var(--sp-2) 0}
+.command-reply-row textarea{min-height:58px}
+.command-reply-row.inactive{opacity:.65}
+.command-reply-tools{display:flex;flex-wrap:wrap;gap:2px}
+.command-reply-vars{display:flex;gap:var(--sp-1);flex-wrap:wrap}
+.command-reply-key{font-family:var(--font-mono);font-size:var(--fs-tiny);color:var(--text-3);overflow-wrap:anywhere}
+@media(max-width:1100px){.command-workspace{grid-template-columns:150px minmax(0,1fr)}.command-reply-editor{position:static;grid-column:1/-1;max-height:none}}
+@media(max-width:720px){.command-workspace{grid-template-columns:1fr}.command-reply-nav{position:static;display:flex;flex-wrap:wrap;max-height:none}.command-reply-editor{grid-column:auto}}
 .command-group{background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-l);box-shadow:var(--shadow);min-width:0;overflow:hidden}
 .command-group-head{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2);width:100%;height:44px;padding:0 var(--sp-3);border:0;background:transparent;color:var(--text-1);cursor:pointer;font:inherit;text-align:left}
 .command-group-head:hover{background:var(--fill-1)}
@@ -452,6 +467,8 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .command-head{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-2)}
 .command-title{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-1);min-width:0}
 .command-name{font-size:var(--fs-item);line-height:var(--lh-item);font-weight:600;color:var(--text-1);word-break:break-word}
+.command-select{border:0;background:transparent;padding:0;text-align:left;cursor:pointer}
+.command-select.active{color:var(--accent)}
 .command-alias{color:var(--text-2);font-size:var(--fs-tiny);line-height:var(--lh-tiny);background:var(--fill-1);border:1px solid var(--sep-2);border-radius:999px;padding:1px var(--sp-2)}
 .command-badges{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-1);margin-left:auto}
 .command-badge{font-size:var(--fs-tiny);line-height:var(--lh-tiny);padding:1px var(--sp-2);border-radius:999px;white-space:nowrap}
@@ -471,7 +488,8 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .command-detail-empty{color:var(--text-3)}
 .command-empty{grid-column:1/-1;color:var(--text-3);font-size:var(--fs-item);line-height:var(--lh-item);text-align:center;padding:var(--sp-5) var(--sp-3);background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-l)}
 .command-foot{margin:var(--sp-3) 0 0;color:var(--text-3);font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
-@media(max-width:1050px){.command-groups{grid-template-columns:1fr}}
+@media(max-width:1050px){.command-groups{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:720px){.command-groups{grid-template-columns:1fr}}
 @media(max-width:720px){.command-status .btn{margin-left:0}}
 
 /* ===== 高级控制 ===== */
@@ -646,13 +664,14 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
     <section class="page-section" id="page-entertainment" data-page="entertainment"><h1 class="page-title">娱乐玩法</h1><p class="page-subtitle">海龟汤与谁是卧底对局管理</p><div class="page-grid" id="entertainmentGrid"></div></section>
     <section class="page-section" id="page-commands" data-page="commands">
       <h1 class="page-title">命令面板</h1>
-      <p class="page-subtitle">大厅与好友私聊可用的聊天命令目录，按功能模块分组；只读视图，不提供开关写操作</p>
+      <p class="page-subtitle">大厅与好友私聊可用的聊天命令目录，按功能模块分组，可编辑启用、最低权限与默认点歌平台</p>
       <div class="command-status" id="commandStatusBar">
         <span class="chip"><i class="dot"></i><span>全局命令</span><em id="commandStatusText">读取中…</em></span>
         <span id="commandStatusHint">来源：GET /commands/catalog</span>
         <button class="btn small" onclick="navigateTo('game')">前往游戏页开关</button>
         <button class="btn small ghost" onclick="loadCommandCatalog(true)">刷新目录</button>
       </div>
+      <div class="row"><label for="commandDefaultSongSource">@点歌默认平台</label><select id="commandDefaultSongSource" onchange="changeCommandDefaultSongSource(this.value)" disabled><option value="">读取中…</option></select><span id="commandDefaultSongSourceHint" role="status"></span></div>
       <div class="command-toolbar">
         <input id="commandSearch" type="text" placeholder="搜索命令名称 / 别名 / 摘要" aria-label="搜索命令" oninput="renderCommandCatalog()">
         <div class="tabs" role="group" aria-label="按来源过滤">
@@ -664,8 +683,9 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         <span class="command-toolbar-meta" id="commandCatalogMeta">加载中…</span>
       </div>
       <div class="config-message err hidden" id="commandError" role="status" aria-live="polite"></div>
-      <div class="command-groups" id="commandGroups"><div class="command-empty">正在读取命令目录…</div></div>
-      <div class="row"><button class="btn primary" id="commandPolicySave" onclick="saveCommandPolicies()" disabled>保存命令设置（0）</button><button class="btn" onclick="discardCommandPolicies()">放弃草稿并重载</button><span id="commandPolicyStatus" role="status"></span></div>
+      <div class="config-message" id="commandReplyStatus" role="status" aria-live="polite">正在读取命令回复…</div>
+      <div class="command-workspace"><nav id="commandReplyNav" class="command-reply-nav" aria-label="回复分类"></nav><div class="command-groups" id="commandGroups"><div class="command-empty">正在读取命令目录…</div></div><section id="commandReplyEditor" class="command-reply-editor"><div class="command-empty">选择一个命令编辑回复</div></section></div>
+      <div class="row wrap"><button class="btn primary" id="commandPolicySave" onclick="saveCommandPolicies()" disabled>保存权限与平台（0）</button><button class="btn" onclick="discardCommandPolicies()">放弃权限草稿</button><button class="btn primary" id="commandReplySave" onclick="saveCommandReplies()" disabled>保存回复（0）</button><button class="btn" onclick="discardCommandReplies()">放弃回复草稿</button><span id="commandPolicyStatus" role="status"></span></div>
       <p class="command-foot">最低权限按普通用户 → 好友 → 管理员 → 主人逐级包含。来源与权限分开；修改后统一保存，锁定命令按提示处理。</p>
     </section>
     <section class="page-section" id="page-aichat" data-page="aichat">
@@ -1205,8 +1225,23 @@ let configSecretDraft={}
 // 命令面板状态：navigateTo 在脚本中段即被调用，声明必须位于其之前，避免 TDZ。
 let commandCatalog=null              // GET /commands/catalog 响应 {commandsEnabled, groups}
 let commandPolicyDraft=new Map()
+let commandDefaultSongSourceDraft=null
 let commandPolicyBaseRevision=null
 let commandPolicySaving=false
+let commandReplyCatalog=null
+let commandReplyRevision=null
+let commandReplyBaseRevision=null
+let commandReplyDraft=new Map()
+let commandReplyLoading=false
+let commandReplySaving=false
+let commandReplyGeneration=0
+let commandReplyError=''
+let commandReplyActiveCategory='all'
+let commandReplyActiveId=null
+let commandReplyActiveFilter=''
+let commandReplyFocusedIndex=null
+let commandReplyFocusStart=0
+let commandReplyFocusEnd=0
 const commandRoleLabels={user:'普通用户',friend:'好友',admin:'管理员',owner:'主人'}
 let commandCatalogGeneration=0
 let commandCatalogLoading=false
@@ -1240,7 +1275,10 @@ async function navigateTo(route,updateHash=true){
   try{localStorage.setItem('miliastraRoute',route)}catch(e){}
   if(updateHash&&location.hash!=='#'+route)history.replaceState(null,'','#'+route)
   if(route==='config'&&(!configData||!configUnsaved))loadConfigPage()
-  if(route==='commands'&&!commandCatalog&&!commandCatalogLoading)loadCommandCatalog()
+  if(route==='commands'){
+    if(!commandCatalog&&!commandCatalogLoading)loadCommandCatalog()
+    if(!commandReplyCatalog&&!commandReplyLoading)loadCommandReplies()
+  }
   if(route==='aichat'&&!aiChatData)loadAiChatSettings()
 }
 /* ===== AI 聊天功能页 =====
@@ -2461,9 +2499,177 @@ function commandPolicyHtml(item){
   const disabled=commandPolicySaving||item.editable!==true||floor<0||!(policy.minimumRole in commandRoleLabels)?' disabled':''
   return '<div class="row" data-policy-id="'+commandEscape(item.id)+'"><label class="switch-line"><input type="checkbox" data-policy-enabled'+(policy.enabled!==false?' checked':'')+disabled+'>启用</label><label>最低权限 <select data-policy-role'+disabled+'>'+Object.entries(commandRoleLabels).map(([value,label])=>'<option value="'+value+'"'+(policy.minimumRole===value?' selected':'')+(roles.indexOf(value)<floor?' disabled':'')+'>'+label+'</option>').join('')+'</select></label>'+(commandPolicyDraft.has(String(item.id))?'<span class="config-dirty">未保存</span>':'')+'</div>'+(floor>0?'<p class="config-field-hint">此命令的权限下限为'+commandEscape(commandRoleLabels[item.minimumFloor])+'，不能降低；仍可单独禁用。</p>':'')+(item.lockedReason?'<p class="config-field-hint">'+commandEscape(item.lockedReason)+'</p>':'')
 }
+function commandPolicyHasChanges(){return commandPolicyDraft.size>0||commandDefaultSongSourceDraft!==null}
+function commandReplyHasChanges(){return commandReplyDraft.size>0}
+function commandReplyCanonicalId(id){return String(id)}
+function commandReplyEntry(id){const key=commandReplyCanonicalId(id);return commandReplyCatalog?.commands?.find(item=>String(item.id)===key)||null}
+function commandReplyList(id){return commandReplyDraft.get(commandReplyCanonicalId(id))||commandReplyEntry(id)?.replies||[]}
+function commandReplyActiveList(id){return commandReplyList(id).filter(row=>row.active!==false)}
+function commandReplyVars(id){
+  const entry=commandReplyEntry(id)
+  const allowed=Array.isArray(entry?.allowedVariables)?new Set(entry.allowedVariables.map(v=>typeof v==='string'?v:v.name)):null
+  return (commandReplyCatalog?.variables||[]).map(v=>typeof v==='string'?v:v.name).filter(name=>name&&(!allowed||allowed.has(name)))
+}
+function renderCommandReplyNav(){
+  const nav=$('commandReplyNav');if(!nav)return
+  if(!commandReplyCatalog){nav.innerHTML='<div class="command-empty">回复目录加载中</div>';return}
+  const groups=(commandCatalog?.groups||[]).map(group=>group.name).filter(Boolean)
+  const categories=[...new Set(groups.length?groups:commandReplyCatalog.commands.map(item=>item.category||'其他'))]
+  const buttons=[['all','全部'],...categories.map(category=>[category,category])]
+  nav.innerHTML=buttons.map(([value,label])=>'<button type="button" class="btn small'+(commandReplyActiveCategory===value?' active':'')+'" onclick="selectCommandReplyCategory('+commandEscape(JSON.stringify(value))+')">'+commandEscape(label)+'</button>').join('')
+}
+function selectCommandReplyCategory(category){commandReplyActiveCategory=category;renderCommandReplyNav();renderCommandCatalog()}
+function selectCommandReply(id){commandReplyActiveId=commandReplyCanonicalId(id);renderCommandCatalog();renderCommandReplyEditor()}
+function renderCommandReplyStatus(){
+  const status=$('commandReplyStatus');if(!status)return
+  status.textContent=commandReplyError||(commandReplySaving?'保存回复中…':commandReplyLoading?'读取回复目录…':commandReplyRevision==null?'回复目录未加载':commandReplyHasChanges()?'回复修改未保存（基线版本 '+commandReplyRevision+'）':'回复版本 '+commandReplyRevision)
+  status.classList.toggle('err',Boolean(commandReplyError))
+}
+function renderCommandReplyEditor(){
+  const host=$('commandReplyEditor');if(!host)return
+  const entry=commandReplyEntry(commandReplyActiveId)
+  const policyItem=(commandCatalog?.groups||[]).flatMap(group=>group.commands||[]).find(item=>String(item.id)===String(commandReplyActiveId))
+  if(!entry&&!policyItem){host.innerHTML='<div class="command-empty">选择一个命令</div>';renderCommandReplyStatus();return}
+  const rows=entry?commandReplyList(entry.id):[],vars=entry?commandReplyVars(entry.id):[],dirty=entry&&commandReplyDraft.has(String(entry.id)),batch=entry?.orderedBatch===true,locked=entry?.editable===false||commandReplySaving||commandPolicySaving
+  const html=rows.map((row,index)=>{
+    const disabled=locked||row.editable===false||row.active===false?' disabled':''
+    const variableButtons=vars.map(name=>'<button type="button" class="btn small ghost" data-reply-var="'+commandEscape(name)+'" title="插入 {'+commandEscape(name)+'}">{'+commandEscape(name)+'}</button>').join('')
+    const tools=(batch?(row.active===false?'<button type="button" class="btn small" data-reply-activate data-index="'+index+'"'+(locked?' disabled':'')+'>启用</button>':(row.defaultText===null?'<button type="button" class="btn small ghost" data-reply-delete data-index="'+index+'"'+(locked?' disabled':'')+'>删除</button>':'<button type="button" class="btn small ghost" data-reply-deactivate data-index="'+index+'"'+(locked?' disabled':'')+'>停用</button>')):(row.active===false?'<button type="button" class="btn small" data-reply-activate data-index="'+index+'"'+(locked?' disabled':'')+'>启用</button>':'<button type="button" class="btn small ghost" data-reply-deactivate data-index="'+index+'"'+(locked?' disabled':'')+'>停用</button>'))
+    const order=batch?'<button type="button" class="btn small ghost" data-reply-up data-index="'+index+'"'+(locked||index===0?' disabled':'')+'>上移</button><button type="button" class="btn small ghost" data-reply-down data-index="'+index+'"'+(locked||index===rows.length-1?' disabled':'')+'>下移</button>':''
+    return '<article class="command-reply-row'+(row.active===false?' inactive':'')+'" data-reply-row-index="'+index+'"><div class="row wrap"><strong>'+commandEscape(row.label||row.key||'自定义回复')+'</strong><code class="command-reply-key">'+commandEscape(row.key||'自定义')+'</code>'+(row.active===false?'<span class="field-state warn">已静音</span>':'')+'</div>'+(row.defaultText!=null?'<div class="config-field-hint">内置默认：'+commandEscape(row.defaultText)+'</div>':'')+'<textarea data-reply-text data-reply-index="'+index+'" maxlength="1000" aria-label="回复文案 '+commandEscape(row.key||index+1)+'"'+disabled+'>'+commandEscape(row.text||'')+'</textarea>'+'<div class="command-reply-tools">'+order+tools+'</div>'+((row.editable!==false&&vars.length)?'<div class="command-reply-vars" aria-label="插入变量">'+variableButtons+'</div>':'')+'</article>'
+  }).join('')
+  const policyHtml=policyItem?'<h3>'+commandEscape(policyItem.name||policyItem.id)+' 设置</h3>'+commandPolicyHtml(policyItem):''
+  const replyHtml=entry?'<h3>'+commandEscape(entry.name||entry.id)+' 回复</h3><p class="config-field-hint">'+(entry.orderedBatch===true?'按序批量发送':'业务仅发送实际触发的结果分支')+'</p>'+(entry.editable===false?'<p class="config-field-hint">此命令的回复不可编辑。</p>':'')+'<div class="command-reply-list">'+(html||'<div class="command-reply-empty">当前无回复；保存空列表会静音此命令。</div>')+'</div>'+(entry.editable===false?'':'<div class="row wrap">'+(entry.orderedBatch===true?'<button type="button" class="btn small" onclick="addCommandReply()">添加回复</button>':'')+'<button type="button" class="btn small" onclick="restoreCommandReplyDefaults()">恢复内置回复</button><button type="button" class="btn small warn" onclick="muteCommandReplies()">静音此命令</button></div>'):'<h3>'+commandEscape(policyItem.name||policyItem.id)+'</h3><p class="config-field-hint">此命令暂无可编辑回复。</p>'
+  host.innerHTML=policyHtml+replyHtml
+  host.querySelectorAll('[data-reply-var]').forEach(button=>button.addEventListener('click',()=>insertCommandReplyVariable(button.dataset.replyVar)))
+
+  renderCommandReplyStatus();updateCommandPolicyUI()
+}
+function setCommandReplyDraft(id,rows){
+  const key=commandReplyCanonicalId(id),entry=commandReplyEntry(id),next=rows.map(row=>({...row,key:row.key,text:String(row.text||''),active:row.active!==false}))
+  const submitted=list=>list.filter(row=>row.active!==false).map(({key,text})=>({key,text}))
+  if(JSON.stringify(submitted(next))===JSON.stringify(submitted(entry?.replies||[])))commandReplyDraft.delete(key)
+  else{if(!commandReplyHasChanges())commandReplyBaseRevision=commandReplyRevision;commandReplyDraft.set(key,next)}
+  if(!commandReplyHasChanges())commandReplyBaseRevision=null
+  renderCommandReplyStatus();updateCommandPolicyUI()
+}
+function addCommandReply(){
+  const entry=commandReplyEntry(commandReplyActiveId);if(!entry||entry.editable===false||commandReplySaving||commandPolicySaving)return
+  const rows=commandReplyList(entry.id).map(row=>({...row}));rows.push({key:'custom:'+Date.now().toString(36),text:'',defaultText:null,editable:true,active:true});setCommandReplyDraft(entry.id,rows);renderCommandReplyEditor()
+}
+function restoreCommandReplyDefaults(){
+  const entry=commandReplyEntry(commandReplyActiveId);if(!entry||entry.editable===false||commandReplySaving||commandPolicySaving)return
+  const rows=(entry.defaultReplies||[]).map(row=>({...row,text:row.defaultText,active:true}))
+  if(!confirm('将此命令恢复为全部内置回复？当前自定义回复和顺序会被替换。'))return
+  setCommandReplyDraft(entry.id,rows);renderCommandReplyEditor()
+}
+function muteCommandReplies(){
+  const entry=commandReplyEntry(commandReplyActiveId);if(!entry||entry.editable===false||commandReplySaving||commandPolicySaving)return
+  if(!confirm('确定静音此命令？它将不再发送任何回复。'))return
+  setCommandReplyDraft(entry.id,[]);renderCommandReplyEditor()
+}
+function moveCommandReply(index,delta){
+  const entry=commandReplyEntry(commandReplyActiveId);if(!entry||commandReplySaving||commandPolicySaving)return
+  if(entry.editable===false)return
+  const rows=commandReplyList(entry.id).map(row=>({...row})),target=index+delta
+  if(target<0||target>=rows.length)return
+  ;[rows[index],rows[target]]=[rows[target],rows[index]];setCommandReplyDraft(entry.id,rows);renderCommandReplyEditor()
+}
+function removeCommandReply(index){
+  const entry=commandReplyEntry(commandReplyActiveId);if(!entry||commandReplySaving||commandPolicySaving)return
+  if(entry.editable===false)return
+  const rows=commandReplyList(entry.id).map(row=>({...row}));if(rows[index]?.defaultText!==null)return
+  rows.splice(index,1);setCommandReplyDraft(entry.id,rows);renderCommandReplyEditor()
+}
+function setCommandReplyActive(index,active){
+  const entry=commandReplyEntry(commandReplyActiveId);if(!entry||commandReplySaving||commandPolicySaving)return
+  if(entry.editable===false)return
+  const rows=commandReplyList(entry.id).map(row=>({...row}));if(!rows[index])return
+  rows[index].active=active;setCommandReplyDraft(entry.id,rows);renderCommandReplyEditor()
+}
+function insertCommandReplyVariable(name){
+  const editor=$('commandReplyEditor'),input=editor?.querySelector('[data-reply-text][data-reply-index="'+commandReplyFocusedIndex+'"]');if(!input||!commandReplyVars(commandReplyActiveId).includes(name))return
+  const token='{'+name+'}',start=commandReplyFocusStart,end=commandReplyFocusEnd
+  input.focus();input.setRangeText(token,start,end,'end');input.dispatchEvent(new Event('input',{bubbles:true}));input.focus()
+}
+function loadCommandReplies(force=false){
+  if(commandReplyLoading&&!force)return
+  if(commandReplyHasChanges())return
+  const generation=++commandReplyGeneration;commandReplyLoading=true;commandReplyError='';renderCommandReplyStatus()
+  return request('/commands/replies').then(data=>{
+    if(generation!==commandReplyGeneration)return
+    if(commandReplyHasChanges())return
+    if(!data||!Array.isArray(data.commands)||!Array.isArray(data.variables))throw new Error('回复目录响应缺少commands或variables')
+    if(commandReplyRevision!=null&&data.revision<commandReplyRevision)throw new Error('回复目录版本早于已保存版本')
+    commandReplyCatalog=data;commandReplyRevision=data.revision
+    if(!commandReplyActiveId||!commandReplyEntry(commandReplyActiveId))commandReplyActiveId=data.commands.length?String(data.commands[0].id):null
+    renderCommandReplyNav();renderCommandReplyStatus();renderCommandCatalog();renderCommandReplyEditor()
+  }).catch(error=>{
+    if(generation===commandReplyGeneration){commandReplyError='读取回复目录失败：'+error.message;renderCommandReplyStatus()}
+  }).finally(()=>{if(generation===commandReplyGeneration){commandReplyLoading=false;renderCommandReplyStatus()}})
+}
+function discardCommandReplies(){
+  if(commandReplySaving||commandPolicySaving)return
+  if(commandReplyHasChanges()&&!confirm('放弃所有未保存回复并重新加载？'))return
+  commandReplyDraft.clear();commandReplyBaseRevision=null;loadCommandReplies(true);renderCommandReplyEditor()
+}
+async function saveCommandReplies(){
+  if(commandReplySaving||commandPolicySaving||!commandReplyHasChanges())return
+  commandReplySaving=true;commandReplyError='';renderCommandReplyEditor()
+  try{
+    const commands=[...commandReplyDraft].map(([id,replies])=>({id,replies:replies.filter(reply=>reply.active!==false).map(({key,text})=>({key,text}))}))
+    const result=await requestJson('/commands/replies',{baseRevision:commandReplyBaseRevision,commands})
+    if(!result||result.ok!==true)throw new Error(result?.code==='reply_conflict'?'回复配置已变化；草稿已保留，请放弃草稿并重新加载后再编辑。':result?.message||'回复保存失败')
+    commandReplyGeneration++
+    for(const [id,replies]of commandReplyDraft){const entry=commandReplyEntry(id);if(entry){const active=new Set(replies.filter(reply=>reply.active!==false).map(reply=>reply.key));entry.replies=entry.replies.filter(reply=>reply.defaultText!==null||active.has(reply.key)).map(reply=>({...reply,...(replies.find(item=>item.key===reply.key)||{}),active:active.has(reply.key)}))}}
+    commandReplyRevision=result.revision;commandReplyDraft.clear();commandReplyBaseRevision=null
+    const refresh=await loadCommandReplies(true)
+    $('commandReplyStatus').textContent='回复已保存，版本 '+result.revision+(refresh===false?'；回复目录刷新失败，已保存内容仍保留。':'')
+  }catch(error){commandReplyError='回复保存失败：'+error.message;renderCommandReplyStatus()}
+  finally{commandReplySaving=false;renderCommandReplyEditor();updateCommandPolicyUI()}
+}
+document.addEventListener('focusin',event=>{
+  const input=event.target.closest('#commandReplyEditor [data-reply-text]');if(!input)return
+  commandReplyFocusedIndex=Number(input.dataset.replyIndex);commandReplyFocusStart=input.selectionStart;commandReplyFocusEnd=input.selectionEnd
+})
+document.addEventListener('select',event=>{
+  const input=event.target.closest('#commandReplyEditor [data-reply-text]');if(!input)return
+  commandReplyFocusStart=input.selectionStart;commandReplyFocusEnd=input.selectionEnd
+})
+document.addEventListener('input',event=>{
+  const input=event.target.closest('#commandReplyEditor [data-reply-text]');if(!input||commandReplySaving||commandPolicySaving)return
+  commandReplyFocusedIndex=Number(input.dataset.replyIndex);commandReplyFocusStart=input.selectionStart;commandReplyFocusEnd=input.selectionEnd
+  const entry=commandReplyEntry(commandReplyActiveId);if(!entry)return
+  const rows=commandReplyList(entry.id).map(row=>({...row}));rows[Number(input.dataset.replyIndex)].text=input.value;setCommandReplyDraft(entry.id,rows)
+})
+document.addEventListener('click',event=>{
+  const button=event.target.closest('#commandReplyEditor [data-reply-up],#commandReplyEditor [data-reply-down],#commandReplyEditor [data-reply-delete],#commandReplyEditor [data-reply-activate],#commandReplyEditor [data-reply-deactivate]');if(!button)return
+  const index=Number(button.dataset.index)
+  if(button.hasAttribute('data-reply-up'))moveCommandReply(index,-1)
+  else if(button.hasAttribute('data-reply-down'))moveCommandReply(index,1)
+  else if(button.hasAttribute('data-reply-delete'))removeCommandReply(index)
+  else setCommandReplyActive(index,button.hasAttribute('data-reply-activate'))
+})
+function changeCommandDefaultSongSource(value){
+  if(commandPolicySaving||commandReplySaving||!commandCatalog||(commandCatalog.songPlatforms||[]).every(item=>item.value!==value))return
+  if(!commandPolicyHasChanges())commandPolicyBaseRevision=commandCatalog.revision
+  commandDefaultSongSourceDraft=value===commandCatalog.defaultSongSource?null:value
+  updateCommandPolicyUI()
+}
 function updateCommandPolicyUI(){
+  const source=$('commandDefaultSongSource')
+  if(source){
+    const options=commandCatalog?.songPlatforms||[]
+    const selected=commandDefaultSongSourceDraft??commandCatalog?.defaultSongSource
+    source.innerHTML=options.length?options.map(item=>'<option value="'+commandEscape(item.value)+'"'+(selected===item.value?' selected':'')+'>'+commandEscape(item.label)+'</option>').join(''):'<option value="">暂无可用平台</option>'
+    source.disabled=commandPolicySaving||commandReplySaving||!options.length
+  }
+  const hint=$('commandDefaultSongSourceHint')
+  if(hint)hint.textContent=commandDefaultSongSourceDraft!==null?'默认平台未保存':''
   const save=$('commandPolicySave')
-  if(save){save.disabled=commandPolicySaving||!commandPolicyDraft.size;save.textContent=commandPolicySaving?'保存中…':'保存命令设置（'+commandPolicyDraft.size+'）'}
+  if(save){save.disabled=commandPolicySaving||commandReplySaving||!commandPolicyHasChanges();save.textContent=commandPolicySaving?'保存中…':'保存权限与平台（'+(commandPolicyDraft.size+(commandDefaultSongSourceDraft!==null?1:0))+'）'}
+  const replySave=$('commandReplySave')
+  if(replySave){replySave.disabled=commandPolicySaving||commandReplySaving||!commandReplyHasChanges();replySave.textContent=commandReplySaving?'保存中…':'保存回复（'+commandReplyDraft.size+'）'}
 }
 document.addEventListener('change',event=>{
   const control=event.target
@@ -2471,23 +2677,25 @@ document.addEventListener('change',event=>{
   const row=control.closest('[data-policy-id]')
   const id=row.dataset.policyId
   const item=(commandCatalog?.groups||[]).flatMap(group=>group.commands||[]).find(item=>String(item.id)===id)
-  if(!item||item.editable!==true||commandPolicySaving)return
-  if(!commandPolicyDraft.size)commandPolicyBaseRevision=commandCatalog.revision
+  if(!item||item.editable!==true||commandPolicySaving||commandReplySaving)return
+  if(!commandPolicyHasChanges())commandPolicyBaseRevision=commandCatalog.revision
   const draft={id,enabled:row.querySelector('[data-policy-enabled]').checked,minimumRole:row.querySelector('[data-policy-role]').value}
   if(draft.enabled===item.enabled&&draft.minimumRole===item.minimumRole)commandPolicyDraft.delete(id)
   else commandPolicyDraft.set(id,draft)
-  renderCommandCatalog();updateCommandPolicyUI()
+  renderCommandCatalog();renderCommandReplyEditor();updateCommandPolicyUI()
 })
 function discardCommandPolicies(){
-  if(commandPolicySaving)return
-  if(commandPolicyDraft.size&&!confirm('放弃未保存的命令设置并重新读取？'))return
-  commandPolicyDraft.clear();commandPolicyBaseRevision=null;loadCommandCatalog(true)
+  if(commandPolicySaving||commandReplySaving)return
+  if(commandPolicyHasChanges()&&!confirm('放弃未保存的命令设置并重新读取？'))return
+  commandPolicyDraft.clear();commandDefaultSongSourceDraft=null;commandPolicyBaseRevision=null;loadCommandCatalog(true)
 }
 async function saveCommandPolicies(){
-  if(commandPolicySaving||!commandPolicyDraft.size)return
+  if(commandPolicySaving||commandReplySaving||!commandPolicyHasChanges())return
   commandPolicySaving=true;renderCommandCatalog();updateCommandPolicyUI()
   try{
-    const result=await requestJson('/commands/policy',{baseRevision:commandPolicyBaseRevision,items:[...commandPolicyDraft.values()]})
+    const payload={baseRevision:commandPolicyBaseRevision,items:[...commandPolicyDraft.values()]}
+    if(commandDefaultSongSourceDraft!==null)payload.defaultSongSource=commandDefaultSongSourceDraft
+    const result=await requestJson('/commands/policy',payload)
     if(!result||result.ok!==true)throw new Error(result?.code==='config_conflict'?'配置版本已变化，草稿已保留。请记录修改后点“放弃草稿并重载”，再重新编辑保存。':result?.message||JSON.stringify(result?.errors)||'保存失败')
     // 发布已落库的本地状态，再刷新；刷新失败也不能恢复成旧策略或旧版本。
     commandCatalogGeneration++
@@ -2495,7 +2703,8 @@ async function saveCommandPolicies(){
       const saved=commandPolicyDraft.get(String(item.id));if(saved)Object.assign(item,saved)
     }
     commandCatalog.revision=result.revision
-    commandPolicyDraft.clear();commandPolicyBaseRevision=null
+    if(commandDefaultSongSourceDraft!==null)commandCatalog.defaultSongSource=commandDefaultSongSourceDraft
+    commandPolicyDraft.clear();commandDefaultSongSourceDraft=null;commandPolicyBaseRevision=null
     await loadCommandCatalog(true)
     $('commandPolicyStatus').textContent='命令设置已保存，版本 '+result.revision+(commandCatalogError?'；目录刷新失败，当前显示已保存策略。':'')
   }catch(e){commandCatalogError='保存失败：'+e.message;renderCommandError()}
@@ -2560,7 +2769,7 @@ function commandItemHtml(item,index,groupName,showHidden){
   // 来源徽章：缺省按“大厅 + 好友”处理，未知取值原样展示，避免静默丢信息。
   const sourceBadge=source.unknown?(source.labels.length?source.labels.join(' / '):'来源未标注'):(source.hall&&source.friend?'大厅成员 / 好友私聊':(source.hall?'大厅成员':'好友私聊'))
   return '<div class="'+classes.join(' ')+'" data-command-key="'+commandEscape(key)+'">'+
-    '<div class="command-head"><div class="command-title"><span class="command-name">'+commandEscape(name)+'</span>'+
+    '<div class="command-head"><div class="command-title"><button type="button" class="command-name command-select'+(String(commandReplyActiveId)===String(item.id)?' active':'')+'" onclick="selectCommandReply('+commandEscape(JSON.stringify(item.id))+')">'+commandEscape(name)+'</button>'+
     aliases.map(alias=>'<span class="command-alias">'+commandEscape(alias)+'</span>').join('')+'</div>'+
     '<div class="command-badges">'+commandBadge(prefix,'prefix')+
       (source.hall&&!source.unknown?commandBadge('语法来源：大厅','source'):'')+
@@ -2570,7 +2779,7 @@ function commandItemHtml(item,index,groupName,showHidden){
       (hidden?commandBadge('隐藏','hidden-mark'):'')+
       (enabled?'':commandBadge('已禁用','disabled-mark'))+'</div></div>'+
     '<p class="command-summary">'+commandEscape(commandText(item.summary)||'（暂无摘要）')+'</p>'+
-    commandPolicyHtml(item)+
+
     '<div class="command-toggle"><button class="btn small ghost toggle-command-detail" type="button">'+(expanded?'收起用法':'查看用法与示例')+'</button></div>'+
     (expanded?commandDetailHtml(item,usage,examples):'')+
     '</div>'
@@ -2623,7 +2832,7 @@ function renderCommandCatalog(){
   }
   const showHidden=Boolean($('commandShowHidden')&&$('commandShowHidden').checked)
   const groups=Array.isArray(commandCatalog.groups)?commandCatalog.groups.filter(group=>group&&Array.isArray(group.commands)):[]
-  const ordered=[...groups].sort((a,b)=>{
+  const ordered=[...groups].filter(group=>commandReplyActiveCategory==='all'||commandText(group.name)===commandReplyActiveCategory).sort((a,b)=>{
     const ai=commandGroupOrder.indexOf(commandText(a.name))
     const bi=commandGroupOrder.indexOf(commandText(b.name))
     return (ai<0?commandGroupOrder.length:ai)-(bi<0?commandGroupOrder.length:bi)
@@ -2689,7 +2898,7 @@ async function loadCommandCatalog(force){
     if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('命令目录响应格式不正确')
     if(!Array.isArray(data.groups))throw new Error('命令目录缺少 groups 字段')
     // 编辑时固定基线与目录，周期刷新不能覆盖草稿或悄悄提升保存版本。
-    if(!commandPolicyDraft.size)commandCatalog={commandsEnabled:data.commandsEnabled,groups:data.groups,revision:data.revision}
+    if(!commandPolicyHasChanges())commandCatalog={commandsEnabled:data.commandsEnabled,groups:data.groups,revision:data.revision,defaultSongSource:data.defaultSongSource,songPlatforms:data.songPlatforms}
     else if(data.revision!==commandPolicyBaseRevision){
       commandCatalogError='配置已有新版本；本地草稿已保留，保存时将检查冲突。'
       return
@@ -2704,7 +2913,7 @@ async function loadCommandCatalog(force){
     if(generation===commandCatalogGeneration){
       commandCatalogLoading=false
       renderCommandStatus()
-      renderCommandCatalog()
+      renderCommandCatalog();renderCommandReplyEditor()
     }
   }
 }
@@ -3999,7 +4208,7 @@ $('configSearch').addEventListener('input',()=>{
   },200)
 })
 window.addEventListener('beforeunload',(e)=>{
-  if(configUnsaved||visualDraftDirty||commandPolicyDraft.size){e.preventDefault();e.returnValue='有未保存的修改，确定离开？'}
+  if(configUnsaved||visualDraftDirty||commandPolicyHasChanges()||commandReplyHasChanges()){e.preventDefault();e.returnValue='有未保存的修改，确定离开？'}
 })
 // 配置中心 Ctrl+S / Cmd+S 快捷保存
 document.addEventListener('keydown',(e)=>{

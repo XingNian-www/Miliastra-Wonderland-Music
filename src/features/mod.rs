@@ -3,6 +3,7 @@ pub(crate) mod ai_chat;
 pub(crate) mod card_games;
 pub(crate) mod chat_text;
 pub(crate) mod command;
+pub(crate) mod command_access;
 pub(crate) mod command_catalog;
 pub(crate) mod custom_workflow;
 pub(crate) mod entertainment;

@@ -1032,12 +1032,6 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
             "千星奇域主菜单右下角「返回提瓦特」按钮模板，命中即判为奇域主菜单而不是二级聊天",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "hall_bar",
-            "大厅底栏模板",
-            FieldKind::Path,
-            "千星大厅底栏 👥 O 图标组模板；聊天标记判据必须同时命中它，避免把提瓦特的世界聊天误判成大厅",
-        ),
-        ConfigFieldSchema::db_idle_reload(
             "world_wish",
             "主世界祈愿模板",
             FieldKind::Path,
@@ -2183,6 +2177,34 @@ fn replies_section() -> Vec<ConfigFieldSchema> {
 pub fn config_sections() -> Vec<ConfigSectionSchema> {
     vec![
         ConfigSectionSchema {
+            name: "visual".to_string(),
+            label: "视觉档案".to_string(),
+            order: 0,
+            fields: with_section_prefix(
+                "visual",
+                vec![ConfigFieldSchema::db_live(
+                    "name",
+                    "档案名称",
+                    FieldKind::String,
+                    "默认 1080P；可在视觉档案中编辑保存",
+                )],
+            ),
+        },
+        ConfigSectionSchema {
+            name: "command_access".to_string(),
+            label: "命令权限".to_string(),
+            order: 33,
+            fields: with_section_prefix(
+                "command_access",
+                vec![ConfigFieldSchema::db_live(
+                    "overrides",
+                    "命令权限策略",
+                    FieldKind::Object,
+                    "命令键到启用状态与最低身份的覆盖：user、friend、admin、owner；保存后立即生效",
+                )],
+            ),
+        },
+        ConfigSectionSchema {
             name: "window".to_string(),
             label: "窗口".to_string(),
             order: 1,
@@ -2423,7 +2445,7 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "allow_commands",
             "允许执行命令",
             FieldKind::Bool,
-            "允许 AI 在回答中带命令；程序按提问者本人权限复核后执行",
+            "允许 AI 通过原生工具调用执行命令；程序按提问者身份与命令权限策略复核后执行",
         ),
         ConfigFieldSchema::db_idle_reload(
             "model",
@@ -2447,7 +2469,7 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "answer_prompt",
             "回答模板",
             FieldKind::Text,
-            "可使用 {{keyword}}、{{question}}、{{facts}}、{{history}}、{{bot_history}}、{{commands}}",
+            "可使用 {{keyword}}、{{question}}、{{facts}}、{{bot_history}}、{{commands}}；玩家历史按独立角色消息传输，{{history}} 仅作兼容占位",
         ),
         ConfigFieldSchema::db_idle_reload(
             "extract_prompt",
@@ -3043,10 +3065,9 @@ mod tests {
         }
     }
 
-    /// 页面规则：整段字段都被档案接管时保留原表单（否则该段会变成空白页）。
-    /// 目前 screen 和 templates 两段属于这种情况；新增整段接管必须同步确认页面行为。
+    /// 全视觉段由视觉面板编辑，普通表单和搜索不重复展示。
     #[test]
-    fn only_the_screen_section_is_fully_owned_by_the_visual_profile() {
+    fn fully_visual_sections_are_owned_by_the_visual_profile() {
         let fully_owned: Vec<_> = config_sections()
             .into_iter()
             .filter(|section| {
@@ -3060,7 +3081,7 @@ mod tests {
             .collect();
         assert_eq!(
             fully_owned,
-            vec!["screen", "templates"],
+            vec!["visual", "screen", "stability", "templates", "moderation"],
             "整段被档案接管的段列表变化了"
         );
     }

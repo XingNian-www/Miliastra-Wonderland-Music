@@ -358,6 +358,11 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn execute_command(&mut self, parsed: &RoutedCommand) -> Result<()> {
+        // 队列等待期间权限/开关可能变化，执行时再次读取当前策略。
+        if self.command_is_disabled(parsed)? {
+            log::info!("命令未执行：当前权限或启用策略拒绝: {}", parsed.raw);
+            return Ok(());
+        }
         if let Some(required) = parsed.permission_required {
             log::info!(
                 "命令未执行：权限不足（需要 {:?}，authority={:?} role={:?}）text={}",

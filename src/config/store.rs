@@ -3,11 +3,11 @@
 //! 配置三表（config_meta / config_sections / config_revisions）与既有表
 //! （request_state、cached_* 等）共存于统一数据库；配置 schema 版本
 //! （[`CONFIG_SCHEMA_VERSION`]）与请求状态快照版本、缓存 user_version 完全独立。
-//! schema 不兼容时明确失败，不做迁移。
+//! v1 配置断代重置为新默认值；只操作配置三表，不删除歌曲缓存表或文件。
 //!
 //! 启动流程读取完整配置，Web 配置中心负责保存、历史版本和回滚。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,11 +16,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Map, Value};
 
-use super::schema::{SECRET_PATHS, config_sections};
+use super::schema::SECRET_PATHS;
 use super::{AppConfig, BootstrapConfig};
 
-/// 配置数据库 schema 版本；与请求状态快照版本 2、缓存 user_version 1 完全独立。
-pub const CONFIG_SCHEMA_VERSION: i64 = 1;
+/// 配置数据库 schema 版本；与请求状态快照版本及缓存 user_version 完全独立。
+pub const CONFIG_SCHEMA_VERSION: i64 = 2;
 
 /// 打开连接（含头初始化）的重试次数：两个进程并发首次创建同一新库文件时，
 /// SQLite 头初始化阶段的锁竞争发生在 busy_timeout 生效之前，需要有限重试吸收。
@@ -123,7 +123,7 @@ impl ConfigStore {
     ///
     /// 库不存在时创建三表并以 [`AppConfig::default()`] 初始化完整配置
     /// （分 section 写入 config_sections、meta 记 revision=1、写入 revision 1 快照）；
-    /// 库已存在但 schema 版本不兼容时明确失败，不做迁移。
+    /// v1 配置自动重置为新默认值；未来版本或损坏的表结构明确失败。
     /// 库中已有 request_state / cached_* 等其他表不视为冲突。
     pub fn open(
         database_path: &Path,
@@ -241,7 +241,7 @@ impl ConfigStore {
             // 部分表存在：半初始化或结构损坏，绝不初始化（否则会把已有数据当新库覆盖）。
             count if count != CONFIG_TABLES.len() => {
                 bail!(
-                    "配置数据库表结构不匹配（配置表缺失），请删除 {} 后重启",
+                    "配置数据库表结构不匹配（配置表缺失），请修复配置三表（不要删除含歌曲缓存的数据库）: {}",
                     path.display()
                 );
             }
@@ -256,7 +256,10 @@ impl ConfigStore {
             || !table_structure_matches(connection, "config_sections", &SECTIONS_COLUMNS)?
             || !table_structure_matches(connection, "config_revisions", &REVISIONS_COLUMNS)?
         {
-            bail!("配置数据库表结构不匹配，请删除 {} 后重启", path.display());
+            bail!(
+                "配置数据库表结构不匹配，请修复配置三表（不要删除含歌曲缓存的数据库）: {}",
+                path.display()
+            );
         }
         // 三表全部通过检查后再读 schema 版本。
         let schema_version: Option<i64> = connection
@@ -268,16 +271,47 @@ impl ConfigStore {
             .optional()?;
         let Some(schema_version) = schema_version else {
             bail!(
-                "配置数据库 config_meta 缺少初始化数据，请删除 {} 后重启",
+                "配置数据库 config_meta 缺少初始化数据，请修复配置三表（不要删除含歌曲缓存的数据库）: {}",
                 path.display()
             );
         };
+        if schema_version == 1 {
+            return Self::reset_previous_schema(connection, path);
+        }
         if schema_version != CONFIG_SCHEMA_VERSION {
             bail!(
-                "配置数据库 schema 版本不兼容（当前 {schema_version}，需要 {CONFIG_SCHEMA_VERSION}），请删除 {} 后重启",
+                "配置数据库 schema 版本不兼容（当前 {schema_version}，需要 {CONFIG_SCHEMA_VERSION}），请修复配置三表（不要删除含歌曲缓存的数据库）: {}",
                 path.display()
             );
         }
+        Ok(())
+    }
+
+    /// 已知旧配置断代：取写锁后重查版本，只重建配置三表。缓存及其他表不受影响。
+    fn reset_previous_schema(connection: &mut rusqlite::Connection, path: &Path) -> Result<()> {
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = transaction.query_row(
+            "SELECT schema_version FROM config_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version != 1 {
+            // 另一进程可能已完成断代；重新校验，绝不覆盖同版本保存的配置。
+            drop(transaction);
+            return Self::ensure_schema(connection, path);
+        }
+        transaction.execute_batch(
+            "DROP TABLE config_revisions;
+             DROP TABLE config_sections;
+             DROP TABLE config_meta;",
+        )?;
+        Self::initialize_database_transaction(&transaction, now_ms() as i64)?;
+        transaction.commit()?;
+        log::warn!(
+            "旧配置 schema v1 已重置为 v{CONFIG_SCHEMA_VERSION} 默认值；歌曲缓存保留: {}",
+            path.display()
+        );
         Ok(())
     }
 
@@ -362,10 +396,7 @@ impl ConfigStore {
     /// 加载完整业务配置：读全部 config_sections 组装 JSON，注入启动引导
     /// （http/logging/state.playback_state_path），解析相对路径并通过完整校验。
     pub fn load_full(&self) -> Result<AppConfig> {
-        let mut sections = self.read_all_sections()?;
-        // 旧版本库可能残留已删除字段（如 playback.kugou_api_*），先剔除
-        // 再严格反序列化，避免 deny_unknown_fields 导致启动失败。
-        prune_unknown_schema_fields(&mut sections);
+        let sections = self.read_all_sections()?;
         let config = AppConfig::from_db_value(
             Value::Object(sections),
             &self.bootstrap,
@@ -384,11 +415,9 @@ impl ConfigStore {
     /// 保存把绝对路径写回配置库。http/logging 段不落库，这里按启动引导
     /// （config.yaml）原始值注入；state.playback_state_path 注入统一数据库路径。
     pub fn current_value(&self) -> Result<Value> {
-        let mut sections = self.read_all_sections()?;
-        // Web 展示也沿用启动/保存的 schema 清理规则，避免已删除字段继续出现在页面。
-        prune_unknown_schema_fields(&mut sections);
+        let sections = self.read_all_sections()?;
+        self.build_config(&sections)?;
         let mut value = Value::Object(sections);
-        fill_missing_defaults(&mut value, &AppConfig::default().to_db_value());
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "http".to_string(),
@@ -419,9 +448,8 @@ impl ConfigStore {
         &self,
         sections: &Map<String, Value>,
     ) -> Result<Vec<ConfigFieldError>> {
-        // 未提交段（current）同样先剔除旧版残留字段，保证保存路径与加载一致。
-        let mut current_sections = self.read_all_sections()?;
-        prune_unknown_schema_fields(&mut current_sections);
+        let current_sections = self.read_all_sections()?;
+        self.build_config(&current_sections)?;
         let mut merged = merge_sections(&current_sections, sections);
         let immutable_errors = immutable_bootstrap_field_conflicts(&current_sections, &merged);
         if !immutable_errors.is_empty() {
@@ -458,9 +486,8 @@ impl ConfigStore {
     ) -> std::result::Result<ConfigSaveOutcome, ConfigSaveError> {
         // 应用候选：并集合并、剔除注入段、secret 空值/掩码保留、
         // `{"__clear__": true}` 标记强制清除（写入空串，绕过保留规则）。
-        // current 先剔除旧版残留字段：加载时容忍、提交时清理，保存一次即迁移干净。
-        let mut current_sections = self.read_all_sections()?;
-        prune_unknown_schema_fields(&mut current_sections);
+        let current_sections = self.read_all_sections()?;
+        self.build_config(&current_sections)?;
         let normalized_current = merge_sections(&current_sections, &Map::new());
         let mut merged = merge_sections(&current_sections, &sections);
         let immutable_errors = immutable_bootstrap_field_conflicts(&current_sections, &merged);
@@ -592,8 +619,8 @@ impl ConfigStore {
             .as_object()
             .cloned()
             .ok_or_else(|| anyhow!("目标版本快照必须是对象"))?;
-        // 旧版本历史快照同样可能携带已删除字段，先剔除再走 save 校验。
-        prune_unknown_schema_fields(&mut sections);
+        // 历史快照必须完整符合当前结构，不用当前段或默认值补齐。
+        self.build_config(&sections)?;
         let current_sections = self.read_all_sections()?;
         force_retain_secret_fields(&mut sections, &current_sections);
         self.save(base_revision, sections)
@@ -670,7 +697,7 @@ impl AppConfig {
         value
     }
 
-    /// 从数据库存储值组装完整配置：http/logging/state 段缺失时走 serde 默认值，
+    /// 从当前 schema 的完整持久化值组装配置；缺失或未知字段明确拒绝。
     /// 随后注入启动引导提供的 http/logging 与统一数据库路径，并解析相对路径
     /// （state.playback_state_path 已是绝对路径，再次解析保持不变）。
     pub(crate) fn from_db_value(
@@ -678,7 +705,8 @@ impl AppConfig {
         bootstrap: &BootstrapConfig,
         executable_root: &Path,
     ) -> Result<AppConfig> {
-        let mut config: AppConfig = serde_json::from_value(value)?;
+        let mut config: AppConfig = serde_json::from_value(value.clone())?;
+        validate_persisted_shape(&value, &config.to_db_value(), "")?;
         config.state.playback_state_path = bootstrap.database_path.clone();
         config.http = bootstrap.http.clone();
         config.logging = bootstrap.logging.clone();
@@ -688,153 +716,35 @@ impl AppConfig {
     }
 }
 
-/// 剔除 config_sections 中当前 schema 未声明的字段（如旧版本库遗留的
-/// `playback.kugou_api_executable` / `playback.kugou_api_base_url`），
-/// 保证严格反序列化（deny_unknown_fields）不被历史数据破坏。
-///
-/// 只用于**库中已有数据**：启动加载、保存时未提交段（current）与回滚快照。
-/// 客户端提交段不经过此处，未知字段照旧被 save 拒绝（防篡改语义不变）。
-fn prune_unknown_schema_fields(sections: &mut Map<String, Value>) {
-    migrate_legacy_ai_sections(sections);
-    let schema = config_schema_tree();
-    sections.retain(|name, value| {
-        let Some(node) = schema.get(name) else {
-            return false;
-        };
-        prune_schema_value(value, node);
-        true
-    });
-}
-
-/// 把旧版分散的 AI Provider 迁到统一 `ai` 段。
-///
-/// 旧库有 `song_review.provider` 和/或 `turtle_soup.ai`（各自 endpoint/api_key/
-/// 代理）。清理未知字段前先迁移，否则密钥会随字段一起被静默丢弃。
-/// 只在统一段仍为空时填补，用户已在新结构填过的值绝不被覆盖。
-fn migrate_legacy_ai_sections(sections: &mut Map<String, Value>) {
-    let mut legacy: Map<String, Value> = Map::new();
-    for (section, path) in [("song_review", "provider"), ("turtle_soup", "ai")] {
-        let Some(source) = sections
-            .get(section)
-            .and_then(Value::as_object)
-            .and_then(|object| object.get(path))
-            .and_then(Value::as_object)
-        else {
-            continue;
-        };
-        for key in ["endpoint", "api_key", "model", "http_proxy", "extra_body"] {
-            let Some(value) = source.get(key) else {
-                continue;
-            };
-            if value.is_null() {
-                continue;
-            }
-            legacy
-                .entry(key.to_string())
-                .or_insert_with(|| value.clone());
-        }
-    }
-    if legacy.is_empty() {
-        return;
-    }
-    let ai = sections
-        .entry("ai".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(ai) = ai.as_object_mut() else {
-        return;
-    };
-    let responses_endpoint = legacy
-        .get("endpoint")
-        .and_then(Value::as_str)
-        .filter(|endpoint| endpoint.ends_with("/responses"))
-        .map(str::to_string);
-    for (key, value) in legacy {
-        let is_empty = |current: Option<&Value>| {
-            current.is_none_or(|current| current.is_null() || current.as_str() == Some(""))
-        };
-        match key.as_str() {
-            // Responses 地址迁移到单独字段；统一 segment 的 endpoint 保留 Chat 地址。
-            "endpoint" => {
-                if let Some(responses_endpoint) = &responses_endpoint {
-                    if is_empty(ai.get("responses_endpoint")) {
-                        ai.insert(
-                            "responses_endpoint".to_string(),
-                            Value::String(responses_endpoint.clone()),
-                        );
-                    }
-                    if is_empty(ai.get("endpoint")) {
-                        ai.insert(
-                            "endpoint".to_string(),
-                            Value::String(
-                                responses_endpoint.replace("/responses", "/chat/completions"),
-                            ),
-                        );
-                    }
-                } else if is_empty(ai.get("endpoint")) {
-                    ai.insert("endpoint".to_string(), value);
-                }
-            }
-            "model" | "api_key" | "http_proxy" | "extra_body" if is_empty(ai.get(&key)) => {
-                ai.insert(key, value);
-            }
-            _ => {}
-        }
-    }
-}
-
-#[derive(Default)]
-struct ConfigSchemaNode {
-    children: BTreeMap<String, ConfigSchemaNode>,
-}
-
-fn config_schema_tree() -> BTreeMap<String, ConfigSchemaNode> {
-    let mut roots: BTreeMap<String, ConfigSchemaNode> = BTreeMap::new();
-    for section in config_sections() {
-        let root = roots.entry(section.name.clone()).or_default();
-        for field in section.fields {
-            let Some(path) = field.path.strip_prefix(&format!("{}.", section.name)) else {
-                continue;
-            };
-            let mut node = &mut *root;
-            for segment in path.split('.') {
-                node = node.children.entry(segment.to_owned()).or_default();
+/// 比较反序列化前后的键结构，拒绝默认值静默补齐或忽略旧字段。
+/// 实际配置值重新序列化后保留自由 map、可空对象和数组条目的真实结构。
+fn validate_persisted_shape(stored: &Value, canonical: &Value, path: &str) -> Result<()> {
+    match (stored, canonical) {
+        (Value::Object(stored), Value::Object(canonical)) => {
+            for key in stored
+                .keys()
+                .filter(|key| !canonical.contains_key(*key))
+                .chain(canonical.keys())
+            {
+                let field = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                let (Some(stored), Some(canonical)) = (stored.get(key), canonical.get(key)) else {
+                    bail!("配置字段 {field} 与当前 schema 不匹配（缺失或未知字段）");
+                };
+                validate_persisted_shape(stored, canonical, &field)?;
             }
         }
-    }
-    roots
-}
-
-fn prune_schema_value(value: &mut Value, node: &ConfigSchemaNode) {
-    // 矩形、点和自由格式 Object 等叶子对象在 schema 中没有子路径，必须原样保留。
-    // 仅对声明过的容器（例如 playback.audio_cache）递归清理。
-    if node.children.is_empty() {
-        return;
-    }
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    object.retain(|key, value| {
-        let Some(child) = node.children.get(key) else {
-            return false;
-        };
-        prune_schema_value(value, child);
-        true
-    });
-}
-
-/// 旧数据库可以缺少带 serde 默认值的新字段。向配置客户端展示这些字段时，不改变显式值（包括 null），也不解析路径。
-fn fill_missing_defaults(current: &mut Value, defaults: &Value) {
-    let (Some(current), Some(defaults)) = (current.as_object_mut(), defaults.as_object()) else {
-        return;
-    };
-    for (key, default) in defaults {
-        match current.get_mut(key) {
-            Some(value) => fill_missing_defaults(value, default),
-            None => {
-                current.insert(key.clone(), default.clone());
+        (Value::Array(stored), Value::Array(canonical)) => {
+            for (index, (stored, canonical)) in stored.iter().zip(canonical).enumerate() {
+                validate_persisted_shape(stored, canonical, &format!("{path}[{index}]"))?;
             }
         }
+        _ => {}
     }
+    Ok(())
 }
 
 /// 当前毫秒时间戳（系统时钟不可用时回退 0）。
@@ -1544,79 +1454,6 @@ mod tests {
     use crate::config::{HttpConfig, LoggingConfig};
     use serde_json::json;
 
-    #[test]
-    fn legacy_per_feature_ai_providers_migrate_into_the_shared_section() {
-        let mut sections = Map::from_iter([
-            (
-                "ai".to_string(),
-                json!({"provider": "openai", "api_key": "", "endpoint": "", "model": ""}),
-            ),
-            (
-                "song_review".to_string(),
-                json!({
-                    "provider": {
-                        "endpoint": "https://example.com/v1/responses",
-                        "api_key": "legacy-review-key",
-                        "model": "gpt-5.6",
-                        "http_proxy": "",
-                        "extra_body": {}
-                    }
-                }),
-            ),
-            (
-                "turtle_soup".to_string(),
-                json!({
-                    "ai": {
-                        "endpoint": "https://example.com/v1/chat/completions",
-                        "api_key": "legacy-soup-key",
-                        "model": "deepseek-v4-pro",
-                        "max_tokens": 2048
-                    }
-                }),
-            ),
-        ]);
-
-        prune_unknown_schema_fields(&mut sections);
-
-        let ai = sections["ai"].as_object().expect("shared ai section");
-        // 密钥只在统一段为空时填补，且首个迁移来源优先。
-        assert_eq!(ai["api_key"], json!("legacy-review-key"));
-        assert_eq!(
-            ai["responses_endpoint"],
-            json!("https://example.com/v1/responses")
-        );
-        assert_eq!(
-            ai["endpoint"],
-            json!("https://example.com/v1/chat/completions")
-        );
-        // 遗留段本身不再保留 provider / ai 子对象。
-        assert!(sections["song_review"].get("provider").is_none());
-        assert!(sections["turtle_soup"].get("ai").is_none());
-    }
-
-    #[test]
-    fn migration_never_overwrites_values_already_set_in_the_shared_section() {
-        let mut sections = Map::from_iter([
-            (
-                "ai".to_string(),
-                json!({"provider": "deepseek", "api_key": "current-key", "endpoint": "", "model": "m"}),
-            ),
-            (
-                "turtle_soup".to_string(),
-                json!({"ai": {"endpoint": "https://old.example/v1/chat/completions", "api_key": "old-key"}}),
-            ),
-        ]);
-
-        prune_unknown_schema_fields(&mut sections);
-
-        let ai = sections["ai"].as_object().expect("shared ai section");
-        assert_eq!(ai["api_key"], json!("current-key"));
-        assert_eq!(
-            ai["endpoint"],
-            json!("https://old.example/v1/chat/completions")
-        );
-    }
-
     /// 构造测试用最小启动配置；统一数据库路径指向临时目录下的 playback.sqlite3
     /// （StateConfig::validate 要求 playback_state_path 文件名必须是 playback.sqlite3）。
     fn test_bootstrap(database_path: &Path) -> BootstrapConfig {
@@ -1724,8 +1561,8 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO config_meta (id, schema_version, revision, updated_at_ms)
-                 VALUES (1, 1, 1, 0)",
-                [],
+                 VALUES (1, ?1, 1, 0)",
+                rusqlite::params![CONFIG_SCHEMA_VERSION],
             )
             .unwrap();
     }
@@ -1742,303 +1579,153 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unknown_section_fields_are_pruned_before_strict_deserialization() {
-        let (root, database_path) = temp_database("legacy-prune");
+    fn previous_schema_resets_only_configuration_and_preserves_cache() {
+        let (root, database_path) = temp_database("schema-reset-cache");
         let bootstrap = test_bootstrap(&database_path);
-        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let mut sections = full_sections(&store);
+        sections["queue"]["max_size"] = json!(20);
+        sections["ai"]["api_key"] = json!("old-secret");
+        store.save(1, sections).unwrap();
+        let audio_path = root.join("cached-song.audio");
+        fs::write(&audio_path, b"cached audio bytes").unwrap();
+        store.connection.execute_batch(
+            "CREATE TABLE cached_tracks (hash TEXT PRIMARY KEY, title TEXT);
+             CREATE TABLE cached_lyrics (hash TEXT PRIMARY KEY REFERENCES cached_tracks(hash) ON DELETE CASCADE, lyrics_json BLOB);
+             CREATE TABLE request_state (id INTEGER PRIMARY KEY, snapshot_json TEXT);
+             INSERT INTO cached_tracks VALUES ('song', 'cached title');
+             INSERT INTO cached_lyrics VALUES ('song', X'010203');
+             INSERT INTO request_state VALUES (1, 'request snapshot');
+             PRAGMA user_version = 2;
+             UPDATE config_meta SET schema_version = 1;
+             UPDATE config_sections SET value_json = 'invalid old JSON';
+             UPDATE config_revisions SET snapshot_json = 'invalid old snapshot';"
+        ).unwrap();
+        drop(store);
 
-        // 把 playback 段改写为旧版本库形态：携带已删除的 kugou_api_* 字段。
-        let playback = store.load_full().unwrap().playback.clone();
-        let mut playback_value = serde_json::to_value(playback.clone()).unwrap();
-        playback_value["kugou_api_executable"] = json!("kugou-api.exe");
-        playback_value["kugou_api_base_url"] = json!("http://127.0.0.1:3000");
-        let connection = rusqlite::Connection::open(&database_path).unwrap();
-        connection
-            .execute(
-                "INSERT OR REPLACE INTO config_sections (section, value_json, revision, updated_at_ms)
-                 VALUES ('playback', ?1, 1, 0)",
-                rusqlite::params![serde_json::to_string(&playback_value).unwrap()],
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        // 按真实持久化 JSON 往返比较；f32 转 JSON 数字再解析可能有末位舍入差异。
+        let expected: Value = serde_json::from_str(
+            &serde_json::to_string(&AppConfig::default().to_db_value()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(Value::Object(store.read_all_sections().unwrap()), expected);
+        assert_eq!(store.current_revision().unwrap(), 1);
+        assert_eq!(store.revisions().unwrap().len(), 1);
+        assert_eq!(latest_snapshot(&database_path), expected);
+        store.load_full().unwrap();
+        let cache: (String, Vec<u8>, String, i64) = store.connection.query_row(
+            "SELECT title, lyrics_json, snapshot_json, (SELECT user_version FROM pragma_user_version)
+             FROM cached_tracks JOIN cached_lyrics USING(hash) CROSS JOIN request_state", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            cache,
+            (
+                "cached title".into(),
+                vec![1, 2, 3],
+                "request snapshot".into(),
+                2
             )
-            .unwrap();
-        drop(connection);
+        );
+        assert_eq!(fs::read(&audio_path).unwrap(), b"cached audio bytes");
+        assert!(matches!(
+            store.rollback(2, 1),
+            Err(ConfigSaveError::RevisionNotFound(2))
+        ));
 
-        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
-        let loaded = store.load_full().unwrap();
-        assert_eq!(
-            loaded.playback.credential_directory, playback.credential_directory,
-            "旧字段剔除不得影响已知字段"
-        );
-        assert_eq!(
-            loaded.playback.login_timeout_ms, playback.login_timeout_ms,
-            "旧字段剔除不得影响已知字段"
-        );
-        // 保存任意段：current 旧字段先剔除 → save 成功，库中被清理。
-        let mut save_sections = Map::new();
-        let current = store.current_value().unwrap();
-        save_sections.insert("window".to_string(), current["window"].clone());
-        store.save(1, save_sections).unwrap();
-        let stored = stored_section(&database_path, "playback");
-        assert!(
-            stored.get("kugou_api_executable").is_none()
-                && stored.get("kugou_api_base_url").is_none(),
-            "保存后库中旧字段必须被清理: {stored}"
-        );
+        // 断代之后同版本保存、重开不能再次重置。
+        let mut sections = full_sections(&store);
+        sections["queue"]["max_size"] = json!(23);
+        store.save(1, sections).unwrap();
+        drop(store);
+        let store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        assert_eq!(store.load_full().unwrap().queue.max_size, 23);
+        assert_eq!(store.current_revision().unwrap(), 2);
+        drop(store);
         cleanup(&root);
     }
 
     #[test]
-    fn legacy_timing_without_lyrics_lead_uses_and_exposes_the_default() {
-        let (root, database_path) = temp_database("legacy-lyrics-lead");
+    fn previous_schema_reset_failure_rolls_back_all_configuration_tables() {
+        let (root, database_path) = temp_database("schema-reset-failure");
         let bootstrap = test_bootstrap(&database_path);
-        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        let before = store.read_all_sections().unwrap();
+        // 引用旧 revision 的外部表阻止 DROP；失败必须回滚已执行的 DDL。
+        store.connection.execute_batch(
+            "UPDATE config_meta SET schema_version = 1;
+             CREATE TABLE retained_reference (revision INTEGER REFERENCES config_revisions(revision));
+             INSERT INTO retained_reference VALUES (1);"
+        ).unwrap();
+        assert!(ConfigStore::ensure_schema(&mut store.connection, &database_path).is_err());
+        assert_eq!(store.read_all_sections().unwrap(), before);
+        assert_eq!(store.revisions().unwrap().len(), 1);
+        let version: i64 = store
+            .connection
+            .query_row("SELECT schema_version FROM config_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 1);
         drop(store);
+        cleanup(&root);
+    }
 
-        let mut timing = stored_section(&database_path, "timing");
-        timing["playback"]
+    #[test]
+    fn current_schema_never_fills_missing_fields_or_prunes_old_fields() {
+        let (root, database_path) = temp_database("strict-current");
+        let bootstrap = test_bootstrap(&database_path);
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        let original = store.read_all_sections().unwrap();
+        let mut missing_section = original.clone();
+        missing_section.remove("state");
+        assert!(store.build_config(&missing_section).is_err());
+        let mut legacy = original.clone();
+        legacy["song_review"]["provider"] = json!({"api_key":"old"});
+        assert!(store.build_config(&legacy).is_err());
+        let mut incomplete = original.clone();
+        incomplete["timing"]["playback"]
             .as_object_mut()
-            .expect("playback timing object")
+            .unwrap()
             .remove("lyrics_lead_seconds");
-        let connection = rusqlite::Connection::open(&database_path).unwrap();
-        connection
+        store
+            .connection
             .execute(
                 "UPDATE config_sections SET value_json = ?1 WHERE section = 'timing'",
-                rusqlite::params![serde_json::to_string(&timing).unwrap()],
+                rusqlite::params![serde_json::to_string(&incomplete["timing"]).unwrap()],
             )
             .unwrap();
-        drop(connection);
-
-        let reopened = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
-        assert_eq!(
-            reopened
-                .load_full()
-                .unwrap()
-                .timing
-                .playback
-                .lyrics_lead_seconds,
-            0.0
-        );
-        assert_eq!(
-            reopened.current_value().unwrap()["timing"]["playback"]["lyrics_lead_seconds"].as_f64(),
-            Some(0.0)
-        );
-        drop(reopened);
+        assert!(store.load_full().is_err());
+        assert!(store.current_value().is_err());
+        assert!(store.validate_candidate(&Map::new()).is_err());
+        assert!(store.save(1, Map::new()).is_err());
+        assert_eq!(store.current_revision().unwrap(), 1);
+        assert_eq!(store.read_all_sections().unwrap(), incomplete);
+        drop(store);
         cleanup(&root);
     }
 
     #[test]
-    fn legacy_database_without_world_wish_fields_survives_load_web_save_and_rollback() {
-        let (root, database_path) = temp_database("legacy-world-wish-fields");
+    fn rollback_rejects_incomplete_snapshot_without_merging_current_fields() {
+        let (root, database_path) = temp_database("strict-rollback");
         let bootstrap = test_bootstrap(&database_path);
-        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
-        let original_created_at = store.revisions().unwrap()[0].created_at_ms;
-
-        // 模拟三个祈愿字段加入前写入的版本，并在每次往返中保留自定义值和相对路径。
-        let mut legacy_snapshot = Value::Object(store.read_all_sections().unwrap());
-        legacy_snapshot["screen"]
-            .as_object_mut()
-            .unwrap()
-            .remove("world_wish_rect");
-        legacy_snapshot["templates"]
-            .as_object_mut()
-            .unwrap()
-            .remove("world_wish");
-        legacy_snapshot["templates"]["world_wish_threshold"] = json!(0.95);
-        legacy_snapshot["templates"]["friend"] = json!("legacy-assets/friend.png");
-        legacy_snapshot["window"]["target_process"] = json!("legacy-game.exe");
-        let mut legacy_snapshot_without_unknown = legacy_snapshot.clone();
-        legacy_snapshot_without_unknown["templates"]
-            .as_object_mut()
-            .unwrap()
-            .remove("world_wish_threshold");
-        let legacy_snapshot_text = serde_json::to_string(&legacy_snapshot).unwrap();
-        let connection = rusqlite::Connection::open(&database_path).unwrap();
-        for section in ["screen", "templates", "window"] {
-            connection
-                .execute(
-                    "UPDATE config_sections SET value_json = ?1 WHERE section = ?2",
-                    rusqlite::params![
-                        serde_json::to_string(&legacy_snapshot[section]).unwrap(),
-                        section
-                    ],
-                )
-                .unwrap();
-        }
-        connection
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        let before = store.read_all_sections().unwrap();
+        let mut snapshot = before.clone();
+        snapshot.remove("timing");
+        store
+            .connection
             .execute(
                 "UPDATE config_revisions SET snapshot_json = ?1 WHERE revision = 1",
-                rusqlite::params![legacy_snapshot_text],
+                rusqlite::params![serde_json::to_string(&snapshot).unwrap()],
             )
             .unwrap();
-        drop(connection);
+        assert!(store.rollback(1, 1).is_err());
+        assert_eq!(store.current_revision().unwrap(), 1);
+        assert_eq!(store.read_all_sections().unwrap(), before);
         drop(store);
-
-        let mut reopened = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
-        let loaded = reopened.load_full().unwrap();
-        let mut expected = expected_loaded_config(&bootstrap, &root);
-        expected.templates.friend = root.join("legacy-assets/friend.png");
-        expected.window.target_process = "legacy-game.exe".to_string();
-        assert_eq!(
-            serde_json::to_value(&loaded).unwrap(),
-            serde_json::to_value(&expected).unwrap()
-        );
-        assert_eq!(loaded.state.playback_state_path, database_path);
-
-        let current = reopened.current_value().unwrap();
-        assert_eq!(
-            current["screen"]["world_wish_rect"],
-            json!({"x": 1300, "y": 0, "width": 620, "height": 110})
-        );
-        assert_eq!(
-            current["templates"]["world_wish"],
-            json!("deps/assets/world-wish.png")
-        );
-        assert_eq!(current["templates"]["marker_threshold"], json!(0.9_f32));
-        assert!(current["templates"].get("world_wish_threshold").is_none());
-        assert_eq!(
-            current["templates"]["friend"],
-            json!("legacy-assets/friend.png")
-        );
-        assert_eq!(
-            Value::Object(reopened.read_all_sections().unwrap()),
-            legacy_snapshot
-        );
-        assert_eq!(latest_snapshot(&database_path), legacy_snapshot);
-        assert_eq!(stored_revision(&database_path), 1);
-        assert_eq!(
-            reopened
-                .revisions()
-                .unwrap()
-                .iter()
-                .map(|revision| (revision.revision, revision.created_at_ms))
-                .collect::<Vec<_>>(),
-            vec![(1, original_created_at)]
-        );
-
-        // 保存 Web 可见的屏幕/模板值会补齐默认字段，不改变无关旧字段或引导配置拥有的数据库路径。
-        let mut sections = Map::new();
-        sections.insert("screen".to_string(), current["screen"].clone());
-        sections.insert("templates".to_string(), current["templates"].clone());
-        assert!(reopened.validate_candidate(&sections).unwrap().is_empty());
-        let saved = reopened.save(1, sections).unwrap();
-        assert_eq!(saved.revision, 2);
-        let mut expected_saved_snapshot = legacy_snapshot.clone();
-        expected_saved_snapshot["screen"] = current["screen"].clone();
-        expected_saved_snapshot["templates"] = current["templates"].clone();
-        assert_eq!(
-            Value::Object(reopened.read_all_sections().unwrap()),
-            expected_saved_snapshot
-        );
-        assert_eq!(latest_snapshot(&database_path), expected_saved_snapshot);
-        assert_eq!(
-            serde_json::to_value(reopened.load_full().unwrap()).unwrap(),
-            serde_json::to_value(&expected).unwrap()
-        );
-
-        // 回滚仍缺少这些字段的旧快照后必须继续可读；再次应用默认值，同时在版本链中记录新版本。
-        let rolled_back = reopened.rollback(1, 2).unwrap();
-        assert_eq!(rolled_back.revision, 3);
-        assert_eq!(
-            serde_json::to_value(reopened.load_full().unwrap()).unwrap(),
-            serde_json::to_value(&expected).unwrap()
-        );
-        assert_eq!(reopened.current_value().unwrap(), current);
-        assert_eq!(
-            Value::Object(reopened.read_all_sections().unwrap()),
-            legacy_snapshot_without_unknown
-        );
-        assert_eq!(
-            latest_snapshot(&database_path),
-            legacy_snapshot_without_unknown
-        );
-        assert_eq!(reopened.current_revision().unwrap(), 3);
-        assert_eq!(
-            reopened
-                .revisions()
-                .unwrap()
-                .iter()
-                .map(|revision| revision.revision)
-                .collect::<Vec<_>>(),
-            vec![3, 2, 1]
-        );
-        let original_history: (String, u64) = reopened
-            .connection
-            .query_row(
-                "SELECT snapshot_json, created_at_ms FROM config_revisions WHERE revision = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            original_history,
-            (legacy_snapshot_text, original_created_at)
-        );
-        drop(reopened);
         cleanup(&root);
-    }
-
-    #[test]
-    fn prune_keeps_nested_object_fields_declared_in_schema() {
-        let mut sections = Map::new();
-        sections.insert(
-            "playback".to_string(),
-            json!({
-                "credential_directory": "deps/data/credentials",
-                "audio_cache": {
-                    "enabled": true,
-                    "directory": "",
-                    "stale_nested_field": "remove-me"
-                },
-                "stale_legacy_field": "remove-me"
-            }),
-        );
-        prune_unknown_schema_fields(&mut sections);
-        let playback = sections["playback"].as_object().unwrap();
-        assert!(playback.contains_key("credential_directory"));
-        assert!(playback.contains_key("audio_cache"));
-        assert!(!playback.contains_key("stale_legacy_field"));
-        assert!(
-            !playback["audio_cache"]
-                .as_object()
-                .unwrap()
-                .contains_key("stale_nested_field")
-        );
-    }
-
-    #[test]
-    fn prune_removes_unknown_sections_but_keeps_free_form_objects() {
-        let mut sections = Map::new();
-        sections.insert("removed_section".to_string(), json!({"old_value": true}));
-        sections.insert(
-            "custom_workflows".to_string(),
-            json!({
-                "enabled": true,
-                "templates": {"legacy_template": "legacy.png"},
-                "workflows": {"legacy_workflow": {"steps": []}}
-            }),
-        );
-        sections.insert(
-            "identity".to_string(),
-            json!({
-                "mappings": {"游戏昵称": {"display_name": "显示昵称", "role": "friend"}}
-            }),
-        );
-
-        prune_unknown_schema_fields(&mut sections);
-
-        assert!(!sections.contains_key("removed_section"));
-        assert_eq!(
-            sections["custom_workflows"]["templates"]["legacy_template"],
-            json!("legacy.png")
-        );
-        assert!(
-            sections["custom_workflows"]["workflows"]
-                .get("legacy_workflow")
-                .is_some()
-        );
-        assert_eq!(
-            sections["identity"]["mappings"]["游戏昵称"]["display_name"],
-            json!("显示昵称")
-        );
     }
 
     #[test]
@@ -2099,6 +1786,7 @@ mod tests {
         let mut sections = full_sections(&store);
         sections["queue"]["max_size"] = json!(20);
         sections["timing"]["loop_idle_ms"] = json!(100);
+        sections["ai"]["extra_body"] = json!({"custom": {"nested": [1, {"flag": true}]}});
         let outcome = store.save(1, sections.clone()).unwrap();
         assert_eq!(outcome.revision, 2, "首次保存后版本必须为 2");
         assert!(
@@ -2120,6 +1808,10 @@ mod tests {
         let reopened = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
         let loaded = reopened.load_full().unwrap();
         assert_eq!(loaded.queue.max_size, 20, "重开后 queue.max_size 必须保留");
+        assert_eq!(
+            reopened.current_value().unwrap()["ai"]["extra_body"],
+            sections["ai"]["extra_body"]
+        );
         assert_eq!(
             loaded.timing.loop_idle_ms, 100,
             "重开后 timing.loop_idle_ms 必须保留"
@@ -2331,8 +2023,8 @@ mod tests {
             "错误消息必须提示 schema 版本不兼容: {error}"
         );
         assert!(
-            error.to_string().contains("请删除"),
-            "错误消息必须提示删除数据库: {error}"
+            error.to_string().contains("不要删除"),
+            "错误消息必须提示保留缓存数据库: {error}"
         );
         cleanup(&root);
     }
@@ -2496,8 +2188,8 @@ mod tests {
             "错误消息必须提示表结构不匹配: {error}"
         );
         assert!(
-            error.to_string().contains("请删除"),
-            "错误消息必须提示删除数据库: {error}"
+            error.to_string().contains("不要删除"),
+            "错误消息必须提示保留缓存数据库: {error}"
         );
         cleanup(&root);
     }
@@ -2513,8 +2205,8 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO config_meta (id, schema_version, revision, updated_at_ms)
-                 VALUES (1, 1, 1, 0)",
-                [],
+                 VALUES (1, ?1, 1, 0)",
+                rusqlite::params![CONFIG_SCHEMA_VERSION],
             )
             .unwrap();
         drop(connection);
@@ -2526,8 +2218,8 @@ mod tests {
             "错误消息必须提示表结构不匹配: {error}"
         );
         assert!(
-            error.to_string().contains("请删除"),
-            "错误消息必须提示删除数据库: {error}"
+            error.to_string().contains("不要删除"),
+            "错误消息必须提示保留缓存数据库: {error}"
         );
 
         // 绝不初始化：失败后其余配置表不得被创建。
@@ -2572,8 +2264,8 @@ mod tests {
             "错误消息必须提示表结构不匹配: {error}"
         );
         assert!(
-            error.to_string().contains("请删除"),
-            "错误消息必须提示删除数据库: {error}"
+            error.to_string().contains("不要删除"),
+            "错误消息必须提示保留缓存数据库: {error}"
         );
         cleanup(&root);
     }
@@ -2604,8 +2296,8 @@ mod tests {
             "错误消息必须提示表结构不匹配: {error}"
         );
         assert!(
-            error.to_string().contains("请删除"),
-            "错误消息必须提示删除数据库: {error}"
+            error.to_string().contains("不要删除"),
+            "错误消息必须提示保留缓存数据库: {error}"
         );
         cleanup(&root);
     }
@@ -2636,8 +2328,8 @@ mod tests {
             "错误消息必须提示表结构不匹配: {error}"
         );
         assert!(
-            error.to_string().contains("请删除"),
-            "错误消息必须提示删除数据库: {error}"
+            error.to_string().contains("不要删除"),
+            "错误消息必须提示保留缓存数据库: {error}"
         );
         cleanup(&root);
     }
@@ -2670,8 +2362,8 @@ mod tests {
             "错误消息必须提示表结构不匹配: {error}"
         );
         assert!(
-            error.to_string().contains("请删除"),
-            "错误消息必须提示删除数据库: {error}"
+            error.to_string().contains("不要删除"),
+            "错误消息必须提示保留缓存数据库: {error}"
         );
         cleanup(&root);
     }
@@ -2712,8 +2404,8 @@ mod tests {
                 "错误消息必须提示表结构不匹配: {error}"
             );
             assert!(
-                error.to_string().contains("请删除"),
-                "错误消息必须提示删除数据库: {error}"
+                error.to_string().contains("不要删除"),
+                "错误消息必须提示保留缓存数据库: {error}"
             );
             cleanup(&root);
         }
@@ -2747,8 +2439,8 @@ mod tests {
             "错误消息必须提示表结构不匹配: {error}"
         );
         assert!(
-            error.to_string().contains("请删除"),
-            "错误消息必须提示删除数据库: {error}"
+            error.to_string().contains("不要删除"),
+            "错误消息必须提示保留缓存数据库: {error}"
         );
         cleanup(&root);
     }
@@ -3238,24 +2930,15 @@ window:
         let _ = fs::remove_dir_all(&root);
     }
     #[test]
-    fn legacy_visual_geometry_defaults_preserve_saved_values_on_import() {
+    fn current_schema_visual_profile_round_trip_preserves_saved_geometry() {
         let (root, database_path) = temp_database("legacy-visual-profile");
         let bootstrap = test_bootstrap(&database_path);
         drop(ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap());
         let mut ocr = stored_section(&database_path, "ocr");
-        for key in [
-            "marker_search_width",
-            "marker_dedupe_min_x",
-            "marker_dedupe_min_y",
-        ] {
-            ocr.as_object_mut().unwrap().remove(key);
-        }
+        ocr["marker_search_width"] = json!(60);
         ocr["text_left_gap"] = serde_json::json!(17);
         let mut templates = stored_section(&database_path, "templates");
-        templates
-            .as_object_mut()
-            .unwrap()
-            .remove("panel_downsample_factors");
+        templates["panel_downsample_factors"] = json!({});
         templates["marker_threshold"] = serde_json::json!(0.83);
         let connection = rusqlite::Connection::open(&database_path).unwrap();
         for (key, value) in [("ocr", ocr), ("templates", templates)] {

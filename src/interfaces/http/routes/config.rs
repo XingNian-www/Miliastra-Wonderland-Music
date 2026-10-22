@@ -483,6 +483,7 @@ pub(super) fn config_visual_route(
     serde_json::to_string(&json!({
         "ok":true, "revision":store.current_revision().map_err(internal_error)?,
         "profile":profile, "effectiveProfile":effective,
+        "defaultProfile": VisualProfile::export(&serde_json::to_value(crate::config::AppConfig::default()).map_err(internal_error)?).map_err(internal_error)?,
         "pendingReloadFields":pending, "catalog":match_catalog(),
         "statusNote":"保存值路径保持原样；生效值路径可能已解析。待重载字段以列表为准。",
         "profileDifferences":differences(&profile,&effective).map_err(internal_error)?,

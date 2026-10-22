@@ -26,6 +26,10 @@ use crate::runtime::player_io::{PlayerRuntimeConfig, PlayerRuntimeConfigError};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub visual: visual::VisualConfig,
+    #[serde(default)]
+    pub command_access: crate::features::command_access::CommandAccessConfig,
     pub window: WindowConfig,
     /// 游戏区域坐标；内嵌段可省略。
     #[serde(default)]
@@ -202,6 +206,8 @@ impl Default for AppConfig {
     /// 路径类默认使用发布布局（deps/models、deps/templates、deps/data）。
     fn default() -> Self {
         Self {
+            visual: visual::VisualConfig::default(),
+            command_access: crate::features::command_access::CommandAccessConfig::default(),
             window: WindowConfig::default(),
             screen: ScreenConfig::default(),
             stability: StabilityConfig::default(),
@@ -524,6 +530,8 @@ impl AppConfig {
                 "window.content_width/content_height 必须与 screen.expected_width/expected_height 一致"
             );
         }
+        self.visual.validate()?;
+        self.command_access.validate()?;
         self.screen.validate()?;
         self.ocr.validate()?;
         self.templates.validate()?;
@@ -1651,10 +1659,6 @@ pub struct TemplateConfig {
     /// 用来挡住 secondary_back 在 ESC 菜单上的误判（见 technical-docs/ui-state-machine.md §44）。
     #[serde(default = "default_main_menu_template")]
     pub main_menu: PathBuf,
-    /// 千星大厅底栏的 👥 O 图标组。提瓦特底栏只有一个 Enter，没有这一组，
-    /// 所以它能把"提瓦特的世界聊天气泡"和"千星聊天标记"区分开（§47）。
-    #[serde(default = "default_hall_bar_template")]
-    pub hall_bar: PathBuf,
     #[serde(default = "default_world_wish_template")]
     pub world_wish: PathBuf,
     pub invite_view_star: PathBuf,
@@ -1685,10 +1689,6 @@ fn default_main_menu_template() -> PathBuf {
     PathBuf::from("deps/assets/ui-main-menu-return.png")
 }
 
-fn default_hall_bar_template() -> PathBuf {
-    PathBuf::from("deps/assets/ui-hall-bar.png")
-}
-
 impl Default for TemplateConfig {
     fn default() -> Self {
         // 模板路径默认使用发布布局 deps/assets/，文件名与
@@ -1703,7 +1703,6 @@ impl Default for TemplateConfig {
             secondary_back: PathBuf::from("deps/assets/ui-secondary-back.png"),
             secondary_hall: PathBuf::from("deps/assets/ui-secondary-hall.png"),
             main_menu: default_main_menu_template(),
-            hall_bar: default_hall_bar_template(),
             world_wish: default_world_wish_template(),
             invite_view_star: PathBuf::from("deps/assets/invite-view-star.png"),
             invite_goto_hall: PathBuf::from("deps/assets/invite-goto-hall.png"),

@@ -130,6 +130,10 @@ struct BodyRouteSpec {
 
 const BODY_ROUTES: &[BodyRouteSpec] = &[
     BodyRouteSpec {
+        path: "/commands/policy",
+        handler: commands_policy_save_route,
+    },
+    BodyRouteSpec {
         path: "/debug/read-only/mode",
         handler: debug_read_only_mode_set_route,
     },

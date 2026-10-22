@@ -1915,9 +1915,11 @@ impl ApplicationRuntime {
     ) -> Result<()> {
         let active_entertainment = self.business.business.active_entertainment()?;
         let accepts_turtle_questions = self.business.business.turtle_soup_accepts_questions()?;
-        let command_router = ChatCommandRouter::with_identity(
+        let access_config = self.lifecycle.live_configs.snapshot();
+        let command_router = ChatCommandRouter::with_access(
             &self.business.custom_workflow,
             &self.lifecycle.live_configs.identity,
+            &access_config.command_access,
         );
         if observed_messages.is_empty() {
             log::debug!("没有找到聊天标志，本轮不更新命令锁");
@@ -2164,9 +2166,29 @@ impl ApplicationRuntime {
     /// AI 转述的命令也必须过这一关，否则管理员关掉命令后，
     /// 真人 `@点歌` 不执行、AI 转述的同一条却照跑。
     pub(super) fn command_is_disabled(&self, command: &RoutedCommand) -> Result<bool> {
-        Ok(!self.commands_enabled()?
-            && command.authority == CommandAuthority::HallMember
-            && command.role.is_none())
+        // 控制台来源仅由已鉴权HTTP/内部任务构造，游戏颜色解析不能创建此来源。
+        if command.message_type == "控制台" {
+            return Ok(false);
+        }
+        let snapshot = self.lifecycle.live_configs.snapshot();
+        let (_, policy) = crate::features::command_access::resolve_with_active(
+            &snapshot.command_access,
+            command,
+            self.business.business.active_entertainment()?,
+        );
+        let role = self
+            .lifecycle
+            .live_configs
+            .identity
+            .role_of(&command.username);
+        let actor = crate::features::command_access::actor_permission(
+            role,
+            !command.username.trim().is_empty(),
+        );
+        Ok(!policy.allows(actor)
+            || (!self.commands_enabled()?
+                && command.authority == CommandAuthority::HallMember
+                && role.is_none()))
     }
 
     fn enqueue_chat_listener_command(&self, parsed: &RoutedCommand) -> Result<bool> {

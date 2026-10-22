@@ -5,9 +5,34 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Saved metadata for the single editable visual profile.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VisualConfig {
+    pub name: String,
+}
+
+impl Default for VisualConfig {
+    fn default() -> Self {
+        Self {
+            name: "1080P".into(),
+        }
+    }
+}
+
+impl VisualConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            bail!("视觉档案名称不能为空");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VisualProfile {
+    pub name: String,
     pub schema_version: u32,
     pub canvas: Canvas,
     pub templates: BTreeMap<String, String>,
@@ -37,7 +62,6 @@ fn fields() -> Vec<(String, String, String)> {
         "secondary_back",
         "secondary_hall",
         "main_menu",
-        "hall_bar",
         "world_wish",
         "invite_view_star",
         "invite_goto_hall",
@@ -152,6 +176,28 @@ fn fields() -> Vec<(String, String, String)> {
     }
     add(
         "capture",
+        "capture_method".into(),
+        "window.capture_method".into(),
+    );
+    for path in [
+        "ocr.min_confidence",
+        "ocr.det_max_side_len",
+        "ocr.det_score_threshold",
+        "ocr.det_unclip_ratio",
+        "ocr.det_min_area",
+        "ocr.det_box_border",
+        "stability.default_count",
+        "stability.ui_state_count",
+        "stability.secondary_hall_count",
+        "startup.stable_mean_threshold",
+        "startup.stable_changed_ratio_threshold",
+        "moderation.stable_vote_samples",
+        "moderation.required_vote_margin",
+    ] {
+        add("matching", path.into(), path.into());
+    }
+    add(
+        "capture",
         "warn_on_size_mismatch".into(),
         "screen.warn_on_size_mismatch".into(),
     );
@@ -167,6 +213,7 @@ fn fields() -> Vec<(String, String, String)> {
 /// default form can hide them and edit them only through the profile panel.
 pub fn managed_paths() -> BTreeSet<String> {
     let mut paths: BTreeSet<String> = [
+        "visual.name",
         "window.content_width",
         "window.content_height",
         "screen.expected_width",
@@ -213,6 +260,7 @@ impl VisualProfile {
             bail!("窗口参考尺寸与识别画布不一致，请先修正现有配置");
         }
         let mut groups = Map::new();
+        groups.insert("name".into(), get(sections, "visual.name")?.clone());
         groups.insert("schema_version".into(), json!(1));
         groups.insert("canvas".into(), json!({"width": get(sections,"screen.expected_width")?, "height": get(sections,"screen.expected_height")?}));
         for (group, key, path) in fields() {
@@ -226,6 +274,10 @@ impl VisualProfile {
 
     /// Return whole affected sections, preserving every non-visual leaf.
     pub fn candidate(&self, current: &Value) -> Result<Map<String, Value>> {
+        VisualConfig {
+            name: self.name.clone(),
+        }
+        .validate()?;
         if self.schema_version != 1 {
             bail!("不支持的视觉档案版本 {}", self.schema_version);
         }
@@ -295,7 +347,8 @@ impl VisualProfile {
             }
         }
         let mut merged = current.clone();
-        let mut affected = std::collections::BTreeSet::new();
+        set(&mut merged, "visual.name", json!(self.name))?;
+        let mut affected = std::collections::BTreeSet::from(["visual".to_owned()]);
         for (group, key, path) in fields() {
             set(&mut merged, &path, value[&group][&key].clone())?;
             affected.insert(path.split('.').next().unwrap().to_owned());
@@ -325,7 +378,8 @@ pub fn match_catalog() -> Value {
     json!({
         "algorithms": {"chat_markers":"rgb_sad", "other_templates":"gray_sad"},
         "panelDownsampleFactors": {"friend_panel":1,"friend_search_panel":1,"friend_block_chat":4,"friend_confirm":4,"invite_enter_hall":4,"invite_goto_hall":4,"invite_view_star":4},
-        "retainedClassificationAssets":["friend","hall_bar"],
+        "diagnosticOnlyAssets":["friend"],
+        "structuralClassification":{"hall_bar":"screen.hall_bar_rect"},
         "derivedRegions":{"friend_delivery.secondary_hall_search":{"operation":"bounding_union","sources":["secondary_hall","invite.friend_list"]}},
         "notes":["更多设置模板仍供管理点击和恢复使用", "面板用途降采样可覆盖；流程点击继续使用原精度", "自定义流程保留独立 Live 配置与步骤覆盖", "更换同路径资源需重载进程清除模板缓存", "实际窗口尺寸不等于基准画布尺寸"]
     })
@@ -388,6 +442,69 @@ mod tests {
         );
         assert_eq!(sections["templates"]["friend_confirm"], "custom/确认.png");
     }
+    #[test]
+    fn editable_profile_name_and_recognition_fields_survive_serialized_reload() {
+        let current = serde_json::to_value(AppConfig::default()).unwrap();
+        let mut profile = VisualProfile::export(&current).unwrap();
+        assert_eq!(profile.name, "1080P");
+        assert!(!profile.templates.contains_key("hall_bar"));
+        assert!(profile.regions.contains_key("hall_bar"));
+        profile.name = "我的1080P".into();
+        profile
+            .capture
+            .insert("capture_method".into(), json!("wgc"));
+        profile
+            .matching
+            .insert("ocr.det_score_threshold".into(), json!(0.5));
+        profile
+            .matching
+            .insert("startup.stable_mean_threshold".into(), json!(3.0));
+        let mut saved = current.clone();
+        for (section, value) in profile.candidate(&current).unwrap() {
+            saved[section] = value;
+        }
+        let reloaded: AppConfig = serde_json::from_value(saved).unwrap();
+        reloaded.validate().unwrap();
+        let exported = VisualProfile::export(&serde_json::to_value(reloaded).unwrap()).unwrap();
+        assert_eq!(exported, profile);
+        assert_eq!(current["visual"]["name"], "1080P");
+        profile.name = "  ".into();
+        assert!(profile.candidate(&current).is_err());
+    }
+
+    #[test]
+    fn profile_mapping_covers_visual_schema_fields_without_duplicate_targets() {
+        let mappings = fields();
+        let paths: BTreeSet<_> = mappings.iter().map(|(_, _, path)| path).collect();
+        assert_eq!(paths.len(), mappings.len());
+        let keys: BTreeSet<_> = mappings
+            .iter()
+            .map(|(group, key, _)| (group, key))
+            .collect();
+        assert_eq!(keys.len(), mappings.len());
+        let managed = managed_paths();
+        for section in crate::config::schema::config_sections() {
+            for field in section.fields {
+                if matches!(
+                    field.kind,
+                    crate::config::schema::FieldKind::Rect
+                        | crate::config::schema::FieldKind::Point
+                ) || field.path.starts_with("templates.")
+                    || field.path.starts_with("startup.templates.")
+                {
+                    assert!(
+                        managed.contains(&field.path),
+                        "missing visual field: {}",
+                        field.path
+                    );
+                }
+            }
+        }
+        assert!(!managed.contains("custom_workflows.templates"));
+        assert!(!managed.contains("custom_workflows.default_threshold"));
+        assert!(!managed.contains("templates.hall_bar"));
+    }
+
     #[test]
     fn visual_profile_rejects_unknown_missing_invalid_and_outside_values() {
         let current = serde_json::to_value(AppConfig::default()).unwrap();

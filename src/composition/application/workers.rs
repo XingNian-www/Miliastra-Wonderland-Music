@@ -315,6 +315,7 @@ impl ApplicationRuntime {
 
     pub(super) fn start_deferred_chat_sender(&self) -> thread::JoinHandle<()> {
         let sender = DeferredChatSender {
+            config_store: self.lifecycle.config_store.clone(),
             live_configs: self.lifecycle.live_configs.clone(),
             running: Arc::clone(&self.lifecycle.running),
             paused: Arc::clone(&self.lifecycle.paused),
@@ -332,6 +333,7 @@ impl ApplicationRuntime {
 }
 
 struct DeferredChatSender {
+    config_store: Option<crate::config::SharedConfigStore>,
     live_configs: LiveConfigs,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -340,7 +342,67 @@ struct DeferredChatSender {
     chat_output: ChatOutput,
 }
 
+fn command_reply_override(
+    config_store: Option<&crate::config::SharedConfigStore>,
+    key: &str,
+) -> Option<String> {
+    let entry = crate::features::reply_template::command_reply_entry_for_key(key)?;
+    if entry.ordered_batch {
+        return None;
+    }
+    let store = config_store?.lock().ok()?;
+    store
+        .reply_templates()
+        .ok()?
+        .get(entry.id)?
+        .iter()
+        .find(|reply| reply.key == key)
+        .map(|reply| reply.text.clone())
+}
+
+fn command_reply_is_muted(
+    config_store: Option<&crate::config::SharedConfigStore>,
+    key: &str,
+) -> bool {
+    let Some(entry) = crate::features::reply_template::command_reply_entry_for_key(key) else {
+        return false;
+    };
+    let Some(store) = config_store else {
+        return false;
+    };
+    let Ok(store) = store.lock() else {
+        return false;
+    };
+    let Ok(replies) = store.reply_templates() else {
+        return false;
+    };
+    replies.get(entry.id).is_some_and(|rows| {
+        rows.is_empty() || (!entry.ordered_batch && !rows.iter().any(|reply| reply.key == key))
+    })
+}
+
 impl DeferredChatSender {
+    fn render_template_text(
+        &self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> String {
+        let legacy_override = self
+            .live_configs
+            .replies
+            .read()
+            .ok()
+            .and_then(|config| config.get(spec.key).map(str::to_string));
+        let override_text =
+            command_reply_override(self.config_store.as_ref(), spec.key).or(legacy_override);
+        let rendered =
+            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
+        if !rendered.missing.is_empty() {
+            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
+        }
+        rendered.text
+    }
+
     fn render_reply_text(
         &self,
         reply: &crate::features::turtle_soup::TurtleSoupReplyText,
@@ -348,22 +410,23 @@ impl DeferredChatSender {
         use crate::features::turtle_soup::TurtleSoupReplyText;
         match reply {
             TurtleSoupReplyText::Raw(text) => text.clone(),
+            TurtleSoupReplyText::Keyed { spec, vars } => {
+                if command_reply_is_muted(self.config_store.as_ref(), spec.key) {
+                    String::new()
+                } else {
+                    self.render_template_text(spec, vars)
+                }
+            }
             TurtleSoupReplyText::NumberedComposed {
                 label,
                 index,
                 total,
                 content,
             } => {
-                let overrides = self.live_configs.replies.read().ok();
-                let override_text = overrides
-                    .as_ref()
-                    .and_then(|config| config.overrides.get(label.key));
-                let label = crate::features::reply_template::render(
+                let label = self.render_template_text(
                     label,
-                    override_text.map(String::as_str),
                     &crate::features::reply_template::ReplyVars::new(),
-                )
-                .text;
+                );
                 let content = self.render_reply_text(content);
                 format!("{label}{index}/{total}：{content}")
             }
@@ -373,31 +436,11 @@ impl DeferredChatSender {
                 total,
                 content,
             } => {
-                let overrides = self.live_configs.replies.read().ok();
-                let override_text = overrides
-                    .as_ref()
-                    .and_then(|config| config.overrides.get(label.key));
-                let rendered = crate::features::reply_template::render(
+                let rendered = self.render_template_text(
                     label,
-                    override_text.map(String::as_str),
                     &crate::features::reply_template::ReplyVars::new(),
                 );
-                format!("{}{index}/{total}：{content}", rendered.text)
-            }
-            TurtleSoupReplyText::Keyed { spec, vars } => {
-                let overrides = self.live_configs.replies.read().ok();
-                let override_text = overrides
-                    .as_ref()
-                    .and_then(|config| config.overrides.get(spec.key));
-                let rendered = crate::features::reply_template::render(
-                    spec,
-                    override_text.map(String::as_str),
-                    vars,
-                );
-                if !rendered.missing.is_empty() {
-                    log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
-                }
-                rendered.text
+                format!("{rendered}{index}/{total}：{content}")
             }
             TurtleSoupReplyText::Composed { spec, vars, nested } => {
                 let nested = nested
@@ -546,12 +589,10 @@ impl DeferredChatSender {
                             if let crate::features::turtle_soup::TurtleSoupReplyText::NumberedComposed {
                                 label, content, ..
                             } = reply {
-                                let overrides = self.live_configs.replies.read().ok();
-                                let override_text = overrides.as_ref().and_then(|config| config.overrides.get(label.key));
-                                let label_text = crate::features::reply_template::render(
-                                    label, override_text.map(String::as_str),
+                                let label_text = self.render_template_text(
+                                    label,
                                     &crate::features::reply_template::ReplyVars::new(),
-                                ).text;
+                                );
                                 let content_text = self.render_reply_text(content);
                                 let rendered = crate::features::chat_text::split_numbered_chat_message(
                                     &label_text, &content_text,
@@ -781,6 +822,12 @@ impl ApplicationRuntime {
             },
             lifecycle: FormalTaskLifecycleContext {
                 config: self.lifecycle.config.clone(),
+                config_store: self
+                    .lifecycle
+                    .config_store
+                    .as_ref()
+                    .expect("formal tasks require config store")
+                    .clone(),
                 live_configs: self.lifecycle.live_configs.clone(),
                 running: self.lifecycle.running.clone(),
                 reload_startup: self.lifecycle.reload_startup.clone(),
@@ -951,6 +998,45 @@ fn suppress_automatic_advance_for_reload(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn deferred_turtle_reply_uses_independent_command_store_override() {
+        use crate::config::{BootstrapConfig, HttpConfig, LoggingConfig};
+        use crate::config::{ConfigStore, StoredReply};
+        use std::collections::BTreeMap;
+
+        let root = std::env::temp_dir().join(format!("deferred-reply-{}", uuid::Uuid::new_v4()));
+        let database_path = root.join("deps/data/playback.sqlite3");
+        std::fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+        let bootstrap = BootstrapConfig {
+            database_path: database_path.clone(),
+            http: HttpConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        let updates = BTreeMap::from([(
+            "#状态（海龟汤）".to_string(),
+            vec![StoredReply {
+                key: "turtle_soup.status".to_string(),
+                text: "状态={阶段}/{秒数}/{人数}/{提问数}".to_string(),
+            }],
+        )]);
+        store.save_reply_templates(0, &updates).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let spec = crate::features::reply_template::turtle_soup::STATUS;
+        let vars = crate::features::reply_template::ReplyVars::new()
+            .with("阶段", "进行中")
+            .with("秒数", "12")
+            .with("人数", "3")
+            .with("提问数", "2");
+        let override_text = command_reply_override(Some(&store), spec.key).unwrap();
+        assert_eq!(
+            crate::features::reply_template::render(&spec, Some(&override_text), &vars).text,
+            "状态=进行中/12/3/2"
+        );
+        assert!(!command_reply_is_muted(Some(&store), spec.key));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn long_worker_wait_stops_promptly_after_shutdown_signal() {

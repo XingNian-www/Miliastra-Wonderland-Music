@@ -736,13 +736,17 @@ impl PlaylistApplication {
             return Ok(vec!["歌单需要先识别发言者,请稍后重试.".into()]);
         }
         match command {
-            PlaylistCommand::Help => Ok(vec![
-                "歌单: @歌单 推荐5首歌; @随机歌单/@歌单随机 随机推荐".into(),
-                "收藏: @收藏 收藏当前歌曲; @取消收藏".into(),
-                "模式: @歌单模式/@播放歌单 进入歌单模式; @退出歌单模式/@大厅模式 退出歌单模式"
-                    .into(),
-                "导入: @导入QQ歌单<数字ID>; @导入网易歌单<数字ID>; @歌单清空".into(),
-            ]),
+            PlaylistCommand::Help => Ok(crate::features::reply_template::HELP_PLAYLIST
+                .iter()
+                .map(|spec| {
+                    crate::features::reply_template::render(
+                        spec,
+                        None,
+                        &crate::features::reply_template::ReplyVars::new(),
+                    )
+                    .text
+                })
+                .collect()),
             PlaylistCommand::Open => {
                 self.discard_window(owner)?;
                 let total = self.count(owner)?;

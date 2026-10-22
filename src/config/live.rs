@@ -63,6 +63,7 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "custom_workflows.workflows",
     "identity.mappings",
     "command_access.overrides",
+    "command_access.default_song_source",
     "visual.name",
     "replies.overrides",
 ];

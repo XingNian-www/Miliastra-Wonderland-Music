@@ -33,6 +33,17 @@ pub(crate) trait AdministrationImmediatePort {
 
 pub(crate) trait AdministrationApplicationPort: AdministrationImmediatePort {
     fn send_hall(&mut self, message: &str) -> Result<()>;
+    fn send_command_reply_batch(
+        &mut self,
+        _command_id: &str,
+        templates: &[reply_template::ReplyTemplate],
+        vars: &ReplyVars,
+        delay_ms: u64,
+    ) -> Result<()> {
+        let lines = help_lines(self, templates, vars);
+        let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
+        self.send_hall_batch(&borrowed, delay_ms)
+    }
     fn send_hall_batch(&mut self, messages: &[&str], delay_ms: u64) -> Result<()>;
 
     /// 按模板渲染（不发送）。
@@ -79,16 +90,21 @@ impl AdministrationApplication {
         match command {
             AdministrationCommand::Help => {
                 port.log_executed(context, "help")?;
-                let lines = help_lines(port, &reply_template::HELP_SONG_REQUEST, &ReplyVars::new());
-                let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
-                port.send_hall_batch(&borrowed, self.help_batch_ms)
+                port.send_command_reply_batch(
+                    "@帮助",
+                    &reply_template::HELP_SONG_REQUEST,
+                    &ReplyVars::new(),
+                    self.help_batch_ms,
+                )
             }
             AdministrationCommand::EntertainmentHelp => {
                 port.log_executed(context, "entertainment help")?;
-                let lines =
-                    help_lines(port, &reply_template::HELP_ENTERTAINMENT, &ReplyVars::new());
-                let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
-                port.send_hall_batch(&borrowed, self.help_batch_ms)
+                port.send_command_reply_batch(
+                    "@娱乐帮助",
+                    &reply_template::HELP_ENTERTAINMENT,
+                    &ReplyVars::new(),
+                    self.help_batch_ms,
+                )
             }
             AdministrationCommand::SetCommandsEnabled { enabled, .. } => {
                 log::info!("收到{}命令", if *enabled { "启用" } else { "禁用" });

@@ -185,7 +185,13 @@ impl ApplicationRuntime {
             !parsed.username.trim().is_empty(),
         );
         for spec in catalog {
-            let id = format!("{}{}", command_prefix_char(spec.prefix), spec.name);
+            let id = if spec.prefix == crate::features::command::CommandPrefix::At {
+                crate::features::song_request::permission_id_for_command_name(spec.name)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("@{}", spec.name))
+            } else {
+                format!("{}{}", command_prefix_char(spec.prefix), spec.name)
+            };
             let allowed =
                 crate::features::command_access::catalog_policy(&snapshot.command_access, &id)
                     .is_some_and(|policy| policy.allows(actor));

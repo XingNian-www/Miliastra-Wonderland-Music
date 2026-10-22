@@ -2022,6 +2022,7 @@ mod tests {
         verified: bool,
         friend_sent: bool,
         hall_messages: StdMutex<Vec<String>>,
+        private_templates: StdMutex<Vec<(String, String, String)>>,
     }
 
     impl FakeCardGamePort {
@@ -2030,6 +2031,7 @@ mod tests {
                 verified,
                 friend_sent,
                 hall_messages: StdMutex::new(Vec::new()),
+                private_templates: StdMutex::new(Vec::new()),
             }
         }
 
@@ -2044,6 +2046,23 @@ mod tests {
         }
 
         fn send_friend(&self, _player: &str, _message: &str) -> Result<bool> {
+            Ok(self.friend_sent)
+        }
+
+        fn send_friend_template(
+            &self,
+            player: &str,
+            message: &str,
+            template: &CardGameReplyTemplate,
+        ) -> Result<bool> {
+            let CardGameReplyTemplate::Template { spec, .. } = template else {
+                panic!("hand delivery should carry template metadata");
+            };
+            self.private_templates.lock().unwrap().push((
+                player.to_string(),
+                message.to_string(),
+                spec.key.to_string(),
+            ));
             Ok(self.friend_sent)
         }
 
@@ -2199,9 +2218,18 @@ mod tests {
                 CardGameEffect::FriendVerify { player, message } => {
                     CardGameEffectResult::FriendVerify(port.verify_friend(&player, &message))
                 }
-                CardGameEffect::PrivateDelivery { player, message } => {
-                    CardGameEffectResult::PrivateDelivery(port.send_friend(&player, &message))
-                }
+                CardGameEffect::PrivateDelivery {
+                    player,
+                    message,
+                    template,
+                } => match template {
+                    Some(template) => CardGameEffectResult::PrivateDeliveryTemplate(
+                        port.send_friend_template(&player, &message, &template),
+                    ),
+                    None => {
+                        CardGameEffectResult::PrivateDelivery(port.send_friend(&player, &message))
+                    }
+                },
                 CardGameEffect::PrivateBatch { deliveries } => {
                     CardGameEffectResult::PrivateBatchTemplates(
                         port.send_friend_batch_templates(&deliveries),
@@ -2596,7 +2624,7 @@ mod tests {
         let error = service
             .resume_claimed_for_test(
                 first_hand.key,
-                CardGameEffectResult::PrivateDelivery(Ok(false)),
+                CardGameEffectResult::PrivateDeliveryTemplate(Ok(false)),
             )
             .unwrap_err();
         assert!(error.to_string().contains("牌局手牌发送失败"));
@@ -2615,7 +2643,8 @@ mod tests {
         assert_ne!(first_hand.key.operation_id, retry.key.operation_id);
         assert!(matches!(
             retry.effect,
-            CardGameEffect::PrivateDelivery { ref player, .. } if player == "甲"
+            CardGameEffect::PrivateDelivery { ref player, ref template, .. }
+                if player == "甲" && matches!(template, Some(CardGameReplyTemplate::Template { spec, .. }) if spec.key == "card_games.hand.current")
         ));
     }
 
@@ -2642,7 +2671,7 @@ mod tests {
         let error = service
             .resume_claimed_for_test(
                 failed.key,
-                CardGameEffectResult::PrivateDelivery(Err(anyhow::anyhow!("send failed"))),
+                CardGameEffectResult::PrivateDeliveryTemplate(Err(anyhow::anyhow!("send failed"))),
             )
             .unwrap_err();
         assert!(error.to_string().contains("send failed"));
@@ -2664,7 +2693,8 @@ mod tests {
         );
         assert!(matches!(
             retry.effect,
-            CardGameEffect::PrivateDelivery { ref player, .. } if player == "甲"
+            CardGameEffect::PrivateDelivery { ref player, ref template, .. }
+                if player == "甲" && matches!(template, Some(CardGameReplyTemplate::Template { spec, .. }) if spec.key == "card_games.hand.current")
         ));
     }
 
@@ -2689,14 +2719,14 @@ mod tests {
                 .unwrap(),
         );
         assert!(matches!(
-                service
-                    .resume_claimed_for_test(
-                        first.key,
-                        CardGameEffectResult::PrivateDelivery(Ok(true)),
-                    )
-                    .unwrap(),
-                CardGameResume::Completed(_)
-            ));
+            service
+                .resume_claimed_for_test(
+                    first.key,
+                    CardGameEffectResult::PrivateDeliveryTemplate(Ok(true)),
+                )
+                .unwrap(),
+            CardGameResume::Completed(_)
+        ));
 
         assert!(matches!(
             service

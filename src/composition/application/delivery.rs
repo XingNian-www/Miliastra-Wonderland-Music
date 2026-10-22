@@ -173,19 +173,53 @@ impl ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> String {
-        let override_text = self
+        let command_override = self.command_reply_text(spec.key);
+        let legacy_override = self
             .lifecycle
             .live_configs
             .replies
             .read()
             .ok()
             .and_then(|config| config.get(spec.key).map(str::to_string));
+        let override_text = command_override.or(legacy_override);
         let rendered =
             crate::features::reply_template::render(spec, override_text.as_deref(), vars);
         if !rendered.missing.is_empty() {
             log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
         }
         rendered.text
+    }
+
+    fn command_reply_text(&self, key: &str) -> Option<String> {
+        let entry = crate::features::reply_template::command_reply_entry_for_key(key)?;
+        if entry.ordered_batch {
+            return None;
+        }
+        let store = self.lifecycle.config_store.as_ref()?.lock().ok()?;
+        let replies = store.reply_templates().ok()?;
+        replies
+            .get(entry.id)?
+            .iter()
+            .find(|reply| reply.key == key)
+            .map(|reply| reply.text.clone())
+    }
+
+    pub(super) fn command_reply_is_muted(&self, key: &str) -> bool {
+        let Some(entry) = crate::features::reply_template::command_reply_entry_for_key(key) else {
+            return false;
+        };
+        let Some(store) = self.lifecycle.config_store.as_ref() else {
+            return false;
+        };
+        let Ok(store) = store.lock() else {
+            return false;
+        };
+        let Ok(replies) = store.reply_templates() else {
+            return false;
+        };
+        replies.get(entry.id).is_some_and(|rows| {
+            rows.is_empty() || (!entry.ordered_batch && !rows.iter().any(|reply| reply.key == key))
+        })
     }
 
     /// 渲染并直接发送一条模板回复。
@@ -196,6 +230,9 @@ impl ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> Result<()> {
+        if self.command_reply_is_muted(spec.key) {
+            return Ok(());
+        }
         let text = self.render_template_text(spec, vars);
         self.reply(&text)
     }

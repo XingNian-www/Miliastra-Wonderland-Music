@@ -146,7 +146,8 @@ struct DeferredCardGamePort {
     task_engine: TaskEngineHandle,
 }
 
-struct TurtleSoupCommandPort {
+struct TurtleSoupCommandPort<'a> {
+    runtime: &'a ApplicationRuntime,
     business: BusinessRuntimeHandle,
     task_engine: TaskEngineHandle,
 }
@@ -241,6 +242,15 @@ impl CardGameDeliveryPort for DeferredCardGamePort {
         Err(anyhow!("延迟牌类端口不能发送好友消息"))
     }
 
+    fn send_friend_template(
+        &self,
+        _player: &str,
+        _message: &str,
+        _template: &crate::features::card_games::CardGameReplyTemplate,
+    ) -> Result<bool> {
+        Err(anyhow!("延迟牌类端口不能发送好友模板消息"))
+    }
+
     fn send_friend_batch(
         &self,
         _deliveries: &[LandlordPrivateDelivery],
@@ -253,7 +263,7 @@ impl CardGameDeliveryPort for DeferredCardGamePort {
     }
 }
 
-impl TurtleSoupApplicationPort for TurtleSoupCommandPort {
+impl TurtleSoupApplicationPort for TurtleSoupCommandPort<'_> {
     fn handle_hall_command(
         &mut self,
         player: &str,
@@ -286,6 +296,16 @@ impl TurtleSoupApplicationPort for TurtleSoupCommandPort {
 
     fn send_current_hall(&mut self, message: &str) -> Result<()> {
         enqueue_current_hall_reply(&self.task_engine, message)
+    }
+
+    fn send_turtle_soup_reply(&mut self, reply: turtle_soup::TurtleSoupReplyText) -> Result<()> {
+        if let turtle_soup::TurtleSoupReplyText::Keyed { spec, .. } = &reply
+            && self.runtime.command_reply_is_muted(spec.key)
+        {
+            return Ok(());
+        }
+        let text = self.runtime.render_reply_text(&reply);
+        enqueue_current_hall_reply(&self.task_engine, &text)
     }
 }
 
@@ -335,8 +355,9 @@ impl ApplicationRuntime {
         }
     }
 
-    fn turtle_soup_command_port(&self) -> TurtleSoupCommandPort {
+    fn turtle_soup_command_port(&self) -> TurtleSoupCommandPort<'_> {
         TurtleSoupCommandPort {
+            runtime: self,
             business: self.business.business.clone(),
             task_engine: self.business.task_engine.clone(),
         }
@@ -416,6 +437,19 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         command: &crate::features::tarot::TarotCommand,
     ) -> Result<()> {
+        if matches!(command, crate::features::tarot::TarotCommand::Help) {
+            self.log_executed_command(parsed, "tarot")?;
+            return self.send_command_reply_batch(
+                "#塔罗牌帮助",
+                &[
+                    crate::features::reply_template::tarot::HELP_DRAW,
+                    crate::features::reply_template::tarot::HELP_REROLL,
+                    crate::features::reply_template::tarot::HELP_INTERPRET,
+                ],
+                &crate::features::reply_template::ReplyVars::new(),
+                0,
+            );
+        }
         let actor = self.canonical_actor_name(&parsed.username);
         let messages = self.business.tarot_application.execute(
             &actor,
@@ -450,6 +484,15 @@ impl ApplicationRuntime {
         }
         if matches!(command, crate::features::playlist::PlaylistCommand::Open) {
             return self.execute_playlist_window(parsed);
+        }
+        if matches!(command, crate::features::playlist::PlaylistCommand::Help) {
+            self.log_executed_command(parsed, "playlist help")?;
+            return self.send_command_reply_batch(
+                "@歌单帮助",
+                &crate::features::reply_template::HELP_PLAYLIST,
+                &crate::features::reply_template::ReplyVars::new(),
+                0,
+            );
         }
         let actor = self.canonical_actor_name(&parsed.username);
         let now = Instant::now();
@@ -709,6 +752,24 @@ impl IdiomChainExplanationPort for ApplicationRuntime {
         let message_refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
         self.reply_batch(&message_refs, delay_ms)
     }
+
+    fn send_explanation_batch(
+        &mut self,
+        messages: &[idiom_chain::IdiomExplanationMessage],
+        delay_ms: u64,
+    ) -> Result<()> {
+        let rendered = messages
+            .iter()
+            .map(|message| match message {
+                idiom_chain::IdiomExplanationMessage::Template { spec, vars } => {
+                    self.render_template_text(spec, vars)
+                }
+                idiom_chain::IdiomExplanationMessage::Raw(text) => text.clone(),
+            })
+            .collect::<Vec<_>>();
+        let refs = rendered.iter().map(String::as_str).collect::<Vec<_>>();
+        self.reply_batch(&refs, delay_ms)
+    }
 }
 
 impl AdministrationImmediatePort for ApplicationRuntime {
@@ -746,6 +807,55 @@ impl AdministrationImmediatePort for ApplicationRuntime {
 }
 
 impl AdministrationApplicationPort for ApplicationRuntime {
+    fn send_command_reply_batch(
+        &mut self,
+        command_id: &str,
+        templates: &[crate::features::reply_template::ReplyTemplate],
+        vars: &crate::features::reply_template::ReplyVars,
+        delay_ms: u64,
+    ) -> Result<()> {
+        let stored = if let Some(store) = self.lifecycle.config_store.as_ref() {
+            let store = store.lock().map_err(|_| anyhow!("命令回复存储锁已损坏"))?;
+            store.reply_templates()?.get(command_id).cloned()
+        } else {
+            None
+        };
+        let mut rendered = Vec::new();
+        match stored {
+            Some(rows) => {
+                for row in rows {
+                    let result = if let Some(spec) =
+                        templates.iter().find(|spec| spec.key == row.key)
+                    {
+                        crate::features::reply_template::render(spec, Some(&row.text), vars)
+                    } else if row.key.starts_with("custom:") {
+                        let rendered = crate::features::reply_template::ReplyTemplate {
+                            key: "custom.reply",
+                            default: "",
+                            summary: "自定义回复",
+                            group: "命令回复",
+                        };
+                        crate::features::reply_template::render(&rendered, Some(&row.text), vars)
+                    } else {
+                        log::warn!("命令回复 {} 不在模板目录中，跳过", row.key);
+                        continue;
+                    };
+                    if !result.missing.is_empty() {
+                        log::warn!("命令回复 {} 缺少变量 {:?}", row.key, result.missing);
+                    }
+                    rendered.push(result.text);
+                }
+            }
+            None => rendered.extend(
+                templates
+                    .iter()
+                    .map(|spec| self.render_template_text(spec, vars)),
+            ),
+        }
+        let refs = rendered.iter().map(String::as_str).collect::<Vec<_>>();
+        self.reply_batch(&refs, delay_ms)
+    }
+
     fn send_hall(&mut self, message: &str) -> Result<()> {
         ApplicationRuntime::reply(self, message)
     }

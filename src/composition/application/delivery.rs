@@ -124,6 +124,50 @@ impl ApplicationRuntime {
     /// 这是组装层唯一的模板渲染入口：`render_reply`（键+默认值）与各业务端口的
     /// `reply_template`/`render_template`（模板结构）都汇到这里，避免每个端口各抄一遍
     /// "查覆盖 → 渲染 → 记录缺变量" 的流程，也就不会再出现某条路径漏查覆盖。
+    pub(super) fn render_reply_text(
+        &self,
+        reply: &crate::features::turtle_soup::TurtleSoupReplyText,
+    ) -> String {
+        use crate::features::turtle_soup::TurtleSoupReplyText;
+        match reply {
+            TurtleSoupReplyText::Raw(text) => text.clone(),
+            TurtleSoupReplyText::Keyed { spec, vars } => self.render_template_text(spec, vars),
+            TurtleSoupReplyText::Numbered {
+                label,
+                index,
+                total,
+                content,
+            } => {
+                let label = self.render_template_text(
+                    label,
+                    &crate::features::reply_template::ReplyVars::new(),
+                );
+                format!("{label}{index}/{total}：{content}")
+            }
+            TurtleSoupReplyText::NumberedComposed {
+                label,
+                index,
+                total,
+                content,
+            } => {
+                let label = self.render_template_text(
+                    label,
+                    &crate::features::reply_template::ReplyVars::new(),
+                );
+                let content = self.render_reply_text(content);
+                format!("{label}{index}/{total}：{content}")
+            }
+            TurtleSoupReplyText::Composed { spec, vars, nested } => {
+                let nested = nested
+                    .iter()
+                    .map(|(name, reply)| (*name, self.render_reply_text(reply)))
+                    .collect();
+                let vars = vars.clone().with_nested(nested);
+                self.render_template_text(spec, &vars)
+            }
+        }
+    }
+
     pub(super) fn render_template_text(
         &self,
         spec: &crate::features::reply_template::ReplyTemplate,
@@ -169,6 +213,65 @@ impl ApplicationRuntime {
             self.lifecycle.paused.load(AtomicOrdering::SeqCst),
         ));
     }
+
+    fn send_redacted_hall_batch(&self, messages: &[String]) -> Result<()> {
+        let mapped = messages
+            .iter()
+            .map(|message| {
+                self.lifecycle
+                    .live_configs
+                    .identity
+                    .replace_display_names(message)
+            })
+            .collect::<Vec<_>>();
+        let refs = mapped.iter().map(String::as_str).collect::<Vec<_>>();
+        let delay = self
+            .lifecycle
+            .live_configs
+            .snapshot()
+            .timing
+            .command
+            .help_batch_ms;
+        match self.active_ui_residency()? {
+            UiResidency::Primary => self
+                .ui
+                .chat_output
+                .send_batch_for_command_redacted(&refs, delay),
+            UiResidency::SecondaryCurrentHall => self
+                .ui
+                .chat_output
+                .send_current_chat_batch_redacted(&refs, delay),
+        }
+    }
+
+    fn render_undercover_reply(
+        &self,
+        reply: &crate::features::undercover::UndercoverReply,
+    ) -> String {
+        match reply {
+            crate::features::undercover::UndercoverReply::Raw(text) => text.clone(),
+            crate::features::undercover::UndercoverReply::Keyed { spec, vars } => {
+                self.render_template_text(spec, vars)
+            }
+            crate::features::undercover::UndercoverReply::Composed {
+                spec,
+                vars,
+                fragments,
+            } => {
+                let nested = fragments
+                    .iter()
+                    .map(|(name, reply)| (*name, self.render_undercover_reply(reply)))
+                    .collect();
+                let vars = vars.clone().with_nested(nested);
+                self.render_template_text(spec, &vars)
+            }
+            crate::features::undercover::UndercoverReply::Joined { fragments } => fragments
+                .iter()
+                .map(|reply| self.render_undercover_reply(reply))
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
 }
 
 impl CardGameDeliveryPort for ApplicationRuntime {
@@ -178,6 +281,74 @@ impl CardGameDeliveryPort for ApplicationRuntime {
 
     fn send_friend(&self, player: &str, message: &str) -> Result<bool> {
         self.send_friend_message(player, message)
+    }
+
+    fn send_friend_template(
+        &self,
+        player: &str,
+        message: &str,
+        template: &crate::features::card_games::CardGameReplyTemplate,
+    ) -> Result<bool> {
+        let rendered = match template {
+            crate::features::card_games::CardGameReplyTemplate::Template { spec, vars } => {
+                self.render_template_text(spec, vars)
+            }
+            crate::features::card_games::CardGameReplyTemplate::Raw(text) => text.clone(),
+        };
+        let _ = message;
+        self.send_friend_message(player, &rendered)
+    }
+
+    fn send_friend_batch_templates(
+        &self,
+        deliveries: &[LandlordPrivateDelivery],
+    ) -> Result<crate::features::card_games::CardGameFriendBatchOutcome> {
+        let rendered = deliveries
+            .iter()
+            .map(|delivery| {
+                let message = match delivery.template.as_ref() {
+                    Some(crate::features::card_games::CardGameReplyTemplate::Template {
+                        spec,
+                        vars,
+                    }) => self.render_template_text(spec, vars),
+                    Some(crate::features::card_games::CardGameReplyTemplate::Raw(text)) => {
+                        text.clone()
+                    }
+                    None => delivery.message.clone(),
+                };
+                (delivery.player.clone(), message)
+            })
+            .collect::<Vec<_>>();
+        let messages = rendered
+            .iter()
+            .map(|(player, message)| FriendMessage::new(player, message))
+            .collect::<Vec<_>>();
+        match self.send_friend_delivery_batch(&messages)? {
+            FriendBatchOutcome::Complete => {
+                Ok(crate::features::card_games::CardGameFriendBatchOutcome::Complete)
+            }
+            FriendBatchOutcome::Failed { retryable, failure } => {
+                let mut remaining = deliveries.iter().cloned().zip(rendered).collect::<Vec<_>>();
+                let mut retryable_templates = Vec::with_capacity(retryable.len());
+                for failed in retryable {
+                    let position = remaining
+                        .iter()
+                        .position(|(delivery, message)| {
+                            delivery.player == failed.recipient() && message.1 == failed.message()
+                        })
+                        .ok_or_else(|| {
+                            anyhow!("card-game retry payload did not match its original delivery")
+                        })?;
+                    retryable_templates.push(remaining.remove(position).0);
+                }
+                Ok(
+                    crate::features::card_games::CardGameFriendBatchOutcome::Failed {
+                        retryable: retryable_templates,
+                        failure,
+                    },
+                )
+            }
+        }
     }
 
     fn send_friend_batch(
@@ -194,11 +365,35 @@ impl CardGameDeliveryPort for ApplicationRuntime {
     fn send_hall(&self, message: &str) -> Result<()> {
         self.reply(message)
     }
+
+    fn send_hall_template(
+        &self,
+        message: &str,
+        template: &crate::features::card_games::CardGameReplyTemplate,
+    ) -> Result<()> {
+        let rendered = match template {
+            crate::features::card_games::CardGameReplyTemplate::Template { spec, vars } => {
+                self.render_template_text(spec, vars)
+            }
+            crate::features::card_games::CardGameReplyTemplate::Raw(text) => text.clone(),
+        };
+        let _ = message;
+        self.reply(&rendered)
+    }
 }
 
 impl UndercoverDeliveryPort for ApplicationRuntime {
     fn verify_friend(&self, player: &str, message: &str) -> Result<bool> {
         self.send_stable_unique_friend_message(player, message)
+    }
+
+    fn verify_keyed_friend(
+        &self,
+        player: &str,
+        reply: &crate::features::undercover::UndercoverReply,
+    ) -> Result<bool> {
+        let message = self.render_undercover_reply(reply);
+        self.send_stable_unique_friend_message(player, &message)
     }
 
     fn send_friend_batch(&self, deliveries: &[FriendMessage]) -> Result<FriendBatchOutcome> {
@@ -210,32 +405,64 @@ impl UndercoverDeliveryPort for ApplicationRuntime {
     }
 
     fn send_hall_batch(&self, messages: &[String]) -> Result<()> {
-        let mapped = messages
+        self.send_redacted_hall_batch(messages)
+    }
+
+    fn send_keyed_hall(&self, reply: &crate::features::undercover::UndercoverReply) -> Result<()> {
+        let message = self.render_undercover_reply(reply);
+        self.reply(&message)
+    }
+
+    fn send_keyed_hall_batch(
+        &self,
+        replies: &[crate::features::undercover::UndercoverReply],
+    ) -> Result<()> {
+        let messages = replies
             .iter()
-            .map(|message| {
-                self.lifecycle
-                    .live_configs
-                    .identity
-                    .replace_display_names(message)
+            .map(|reply| self.render_undercover_reply(reply))
+            .collect::<Vec<_>>();
+        self.send_redacted_hall_batch(&messages)
+    }
+
+    fn send_keyed_friend_batch(
+        &self,
+        deliveries: &[crate::features::undercover::UndercoverFriendDelivery],
+    ) -> Result<crate::features::undercover::UndercoverFriendBatchOutcome> {
+        use crate::features::undercover::UndercoverFriendBatchOutcome;
+        let rendered = deliveries
+            .iter()
+            .map(|delivery| {
+                (
+                    delivery.recipient.clone(),
+                    self.render_undercover_reply(&delivery.reply),
+                )
             })
             .collect::<Vec<_>>();
-        let refs = mapped.iter().map(String::as_str).collect::<Vec<_>>();
-        let help_batch_ms = self
-            .lifecycle
-            .live_configs
-            .snapshot()
-            .timing
-            .command
-            .help_batch_ms;
-        match self.active_ui_residency()? {
-            UiResidency::Primary => self
-                .ui
-                .chat_output
-                .send_batch_for_command_redacted(&refs, help_batch_ms),
-            UiResidency::SecondaryCurrentHall => self
-                .ui
-                .chat_output
-                .send_current_chat_batch_redacted(&refs, help_batch_ms),
+        let messages = rendered
+            .iter()
+            .map(|(recipient, message)| FriendMessage::new(recipient, message))
+            .collect::<Vec<_>>();
+        match self.send_friend_delivery_batch(&messages)? {
+            FriendBatchOutcome::Complete => Ok(UndercoverFriendBatchOutcome::Complete),
+            FriendBatchOutcome::Failed { retryable, failure } => {
+                let mut remaining = deliveries.iter().cloned().zip(rendered).collect::<Vec<_>>();
+                let mut keyed_retryable = Vec::with_capacity(retryable.len());
+                for failed in retryable {
+                    let position = remaining
+                        .iter()
+                        .position(|(delivery, (_, message))| {
+                            delivery.recipient == failed.recipient() && message == failed.message()
+                        })
+                        .ok_or_else(|| {
+                            anyhow!("keyed friend retry payload did not match its original message")
+                        })?;
+                    keyed_retryable.push(remaining.remove(position).0);
+                }
+                Ok(UndercoverFriendBatchOutcome::Failed {
+                    retryable: keyed_retryable,
+                    failure,
+                })
+            }
         }
     }
 }

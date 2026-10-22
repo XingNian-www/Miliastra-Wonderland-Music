@@ -41,6 +41,7 @@ pub(super) struct ImmediateAdministrationPort {
 pub(super) struct DeferredIdiomChainPort {
     business: BusinessRuntimeHandle,
     task_engine: TaskEngineHandle,
+    live_configs: LiveConfigs,
 }
 
 /// 个人歌单的播放侧适配：读取当前播放曲目、直接播放收藏曲目。
@@ -173,19 +174,8 @@ impl HallDetectionPort for PublicHallDetectionPort {
     }
 }
 
-impl IdiomChainDeferredPort for DeferredIdiomChainPort {
-    fn handle_command(
-        &mut self,
-        player: &str,
-        command: &idiom_chain::IdiomChainCommand,
-        observed_at: Instant,
-    ) -> Result<IdiomChainOutcome> {
-        self.business
-            .handle_idiom_chain_at(player, command, observed_at)
-            .map_err(anyhow::Error::from)
-    }
-
-    fn send_deferred(&mut self, message: String) -> Result<IdiomDeliveryOutcome> {
+impl DeferredIdiomChainPort {
+    fn enqueue_message(&self, message: String) -> Result<IdiomDeliveryOutcome> {
         let snapshot = self.business.chat_listener_snapshot()?;
         let target = match listener_residency(snapshot.mode, snapshot.temporary_primary) {
             UiResidency::Primary => DeferredChatTarget::Primary,
@@ -203,6 +193,42 @@ impl IdiomChainDeferredPort for DeferredIdiomChainPort {
                 EnqueueOutcome::Rejected => IdiomDeliveryOutcome::Rejected,
             },
         )
+    }
+}
+
+impl IdiomChainDeferredPort for DeferredIdiomChainPort {
+    fn handle_command(
+        &mut self,
+        player: &str,
+        command: &idiom_chain::IdiomChainCommand,
+        observed_at: Instant,
+    ) -> Result<IdiomChainOutcome> {
+        self.business
+            .handle_idiom_chain_at(player, command, observed_at)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn send_deferred(&mut self, message: String) -> Result<IdiomDeliveryOutcome> {
+        self.enqueue_message(message)
+    }
+
+    fn send_deferred_template(
+        &mut self,
+        _message: &str,
+        template: &idiom_chain::IdiomReplyTemplate,
+    ) -> Result<IdiomDeliveryOutcome> {
+        let override_text = self
+            .live_configs
+            .replies
+            .read()
+            .ok()
+            .and_then(|config| config.overrides.get(template.spec.key).cloned());
+        let rendered = crate::features::reply_template::render(
+            template.spec,
+            override_text.as_deref(),
+            &template.vars,
+        );
+        self.enqueue_message(rendered.text)
     }
 }
 
@@ -305,6 +331,7 @@ impl ApplicationRuntime {
         DeferredIdiomChainPort {
             business: self.business.business.clone(),
             task_engine: self.business.task_engine.clone(),
+            live_configs: self.lifecycle.live_configs.clone(),
         }
     }
 

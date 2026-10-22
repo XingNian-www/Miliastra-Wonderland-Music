@@ -14,10 +14,10 @@ use super::{
     latest_incoming_bubble_rect, scan_chat_markers, secondary_hall_bubbles,
 };
 use crate::config::AppConfig;
+use crate::geometry::{Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::UiStateKind;
 use crate::ui::frame::Frame;
-use crate::geometry::{Rect, crop_canvas};
 use crate::ui::template::best_template_hit;
 
 pub(crate) const SECONDARY_HALL_FALLBACK_SENDER: &str = "二级大厅";
@@ -218,7 +218,9 @@ pub(crate) fn hash_region(image: &DynamicImage, rect: Rect, hash: &mut impl Hash
     Ok(())
 }
 
-pub(crate) fn passive_ui_excludes_chat(observation: Option<&crate::runtime::ui::UiStateObservation>) -> bool {
+pub(crate) fn passive_ui_excludes_chat(
+    observation: Option<&crate::runtime::ui::UiStateObservation>,
+) -> bool {
     let Some(crate::runtime::ui::UiStateObservation::Classified(state)) = observation else {
         return false;
     };

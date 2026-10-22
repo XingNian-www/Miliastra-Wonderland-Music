@@ -247,7 +247,7 @@ pub(crate) const IDIOM_CHAIN: &[ReplyTemplate] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::reply_template::{catalog, render, ReplyVars};
+    use crate::features::reply_template::{ReplyVars, catalog, render};
     use std::collections::BTreeSet;
 
     fn text(spec: &ReplyTemplate, vars: ReplyVars) -> String {
@@ -278,7 +278,10 @@ mod tests {
             "海龟汤正在进行，请结束后再开始成语接龙"
         );
         assert_eq!(
-            text(&OCCUPIED_OTHER, ReplyVars::new().with("其他玩法", "谁是卧底")),
+            text(
+                &OCCUPIED_OTHER,
+                ReplyVars::new().with("其他玩法", "谁是卧底")
+            ),
             "谁是卧底正在进行，请结束后再开始成语接龙"
         );
         assert_eq!(text(&DISABLED, ReplyVars::new()), "成语接龙未启用");
@@ -380,7 +383,10 @@ mod tests {
             "成语接龙当前第 3 个：人山人海。请接“海”字开头。"
         );
         assert_eq!(
-            text(&EXPLANATION_TITLE, ReplyVars::new().with("成语", "画蛇添足")),
+            text(
+                &EXPLANATION_TITLE,
+                ReplyVars::new().with("成语", "画蛇添足")
+            ),
             "成语：画蛇添足"
         );
         assert_eq!(

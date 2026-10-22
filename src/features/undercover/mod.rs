@@ -14,48 +14,105 @@ pub(crate) mod repository;
 mod service;
 
 use super::chat_text::{command_identity, compact_command, display_width};
-use super::reply_template::{undercover as templates, ReplyTemplate, ReplyVars};
+use super::reply_template::{ReplyTemplate, ReplyVars, undercover as templates};
 
 pub use service::{
     UndercoverApplication, UndercoverCommandSource, UndercoverCommandStart, UndercoverDeliveryPort,
     UndercoverEffectClaim, UndercoverEffectKey, UndercoverEffectResult, UndercoverEffectTask,
-    UndercoverResume, UndercoverRuntimePort, UndercoverRuntimeService, UndercoverTimedOutcome,
+    UndercoverFriendBatchOutcome, UndercoverResume, UndercoverRuntimePort,
+    UndercoverRuntimeService, UndercoverTimedOutcome,
 };
 
-/// 按模板渲染一条玩家可见文案——本模块所有文案的唯一出口。
-///
-/// 业务层只声明"用哪条模板、带哪些变量"，**不知道配置存在**。
-///
-/// # 现状（重要）
-///
-/// 当前实现只渲染**内置文案**，`replies.overrides` 的覆盖对谁是卧底**不生效**：
-/// 文案在这里就被渲染成 String 塞进 `UndercoverDelivery`，等到 composition 层的
-/// `impl UndercoverDeliveryPort for ApplicationRuntime` 时，原始 (key, vars) 已经丢了，
-/// 那里无从查配置。全部 57 条 key 已登记在 `reply_template::undercover`，
-/// 但覆盖目前不会被应用。
-///
-/// # 升级路径
-///
-/// 把 `UndercoverDelivery` / `UndercoverEffect` 里的 `String` 换成二元组
-/// （参照 `playback::application` 的 `ReplyMessage { spec, vars }`）：
-///
-/// ```text
-/// enum ReplyText { Raw(String), Keyed(ReplyMessage) }
-/// ```
-///
-/// `Raw` 留给错误原因等不可控文案，`Keyed` 携带 (spec, vars) 一路传到 composition，
-/// 由那边查 `live_configs.replies` 后再渲染。届时只需把本函数换成"接收
-/// `Option<&str>` 覆盖文案"的形态，调用点无需再动。
-///
-/// 之所以没在这次改造里做：构造点 66 处 + 测试断言整个 effect 相等 30+ 处，
-/// 收益（娱乐玩法文案可改）与回归风险不成比例。
-pub(crate) fn render_reply(spec: &ReplyTemplate, vars: &ReplyVars) -> String {
-    crate::features::reply_template::render(spec, None, vars).text
+/// A reply that stays raw or keyed until the composition delivery boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UndercoverReply {
+    Raw(String),
+    Keyed {
+        spec: &'static ReplyTemplate,
+        vars: ReplyVars,
+    },
+    Composed {
+        spec: &'static ReplyTemplate,
+        vars: ReplyVars,
+        fragments: Vec<(&'static str, UndercoverReply)>,
+    },
+    Joined {
+        fragments: Vec<UndercoverReply>,
+    },
+}
+
+impl UndercoverReply {
+    pub(crate) fn keyed(spec: &'static ReplyTemplate, vars: &ReplyVars) -> Self {
+        Self::Keyed {
+            spec,
+            vars: vars.clone(),
+        }
+    }
+
+    pub(crate) fn render_default(&self) -> String {
+        match self {
+            Self::Raw(text) => text.clone(),
+            Self::Keyed { spec, vars } => {
+                crate::features::reply_template::render(spec, None, vars).text
+            }
+            Self::Composed {
+                spec,
+                vars,
+                fragments,
+            } => {
+                let nested = fragments
+                    .iter()
+                    .map(|(name, reply)| (*name, reply.render_default()))
+                    .collect();
+                crate::features::reply_template::render(
+                    spec,
+                    None,
+                    &vars.clone().with_nested(nested),
+                )
+                .text
+            }
+            Self::Joined { fragments } => fragments
+                .iter()
+                .map(Self::render_default)
+                .collect::<String>(),
+        }
+    }
+
+    pub(crate) fn into_raw(self) -> Option<String> {
+        match self {
+            Self::Raw(message) => Some(message),
+            Self::Keyed { .. } | Self::Composed { .. } | Self::Joined { .. } => None,
+        }
+    }
+}
+
+/// One private message, retaining the recipient beside its unresolved reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndercoverFriendDelivery {
+    pub recipient: String,
+    pub reply: UndercoverReply,
+}
+
+impl UndercoverFriendDelivery {
+    pub(crate) fn new(recipient: impl Into<String>, reply: UndercoverReply) -> Self {
+        Self {
+            recipient: recipient.into(),
+            reply,
+        }
+    }
 }
 
 /// 投票说明。它是多条投票提示里的公共片段，单独成键以便用户只改一处。
-pub(crate) fn vote_instruction() -> String {
-    render_reply(&templates::VOTE_INSTRUCTION, &ReplyVars::new())
+pub(crate) fn vote_instruction() -> UndercoverReply {
+    UndercoverReply::keyed(&templates::VOTE_INSTRUCTION, &ReplyVars::new())
+}
+
+fn with_vote_instruction(spec: &'static ReplyTemplate) -> UndercoverReply {
+    UndercoverReply::Composed {
+        spec,
+        vars: ReplyVars::new(),
+        fragments: vec![("投票说明", vote_instruction())],
+    }
 }
 
 #[derive(Debug)]
@@ -309,6 +366,9 @@ pub enum UndercoverDelivery {
     Hall(String),
     HallBatch(Vec<String>),
     Friend { player: String, message: String },
+    KeyedHall(UndercoverReply),
+    KeyedHallBatch(Vec<UndercoverReply>),
+    KeyedFriend(UndercoverFriendDelivery),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -354,11 +414,12 @@ enum Role {
 }
 
 impl Role {
-    fn label(self) -> String {
-        match self {
-            Self::Civilian => render_reply(&templates::ROLE_CIVILIAN, &ReplyVars::new()),
-            Self::Undercover => render_reply(&templates::ROLE_UNDERCOVER, &ReplyVars::new()),
-        }
+    fn reply(self) -> UndercoverReply {
+        let spec = match self {
+            Self::Civilian => &templates::ROLE_CIVILIAN,
+            Self::Undercover => &templates::ROLE_UNDERCOVER,
+        };
+        UndercoverReply::keyed(spec, &ReplyVars::new())
     }
 }
 
@@ -534,21 +595,23 @@ impl UndercoverGame {
 
         let deliveries = players
             .iter()
-            .map(|player| UndercoverDelivery::Friend {
-                player: player.name.clone(),
-                message: render_reply(
-                    &templates::SECRET,
-                    &ReplyVars::new()
-                        .with("位置", player.position.to_string())
-                        .with(
-                            "词语",
-                            if player.role == Role::Civilian {
-                                words.civilian.as_str()
-                            } else {
-                                words.undercover.as_str()
-                            },
-                        ),
-                ),
+            .map(|player| {
+                UndercoverDelivery::KeyedFriend(UndercoverFriendDelivery::new(
+                    player.name.clone(),
+                    UndercoverReply::keyed(
+                        &templates::SECRET,
+                        &&ReplyVars::new()
+                            .with("位置", player.position.to_string())
+                            .with(
+                                "词语",
+                                if player.role == Role::Civilian {
+                                    words.civilian.as_str()
+                                } else {
+                                    words.undercover.as_str()
+                                },
+                            ),
+                    ),
+                ))
             })
             .collect();
         self.state = GameState::Playing(Playing {
@@ -574,21 +637,24 @@ impl UndercoverGame {
             descriptions: BTreeMap::new(),
         };
         game.last_activity = now;
-        let mut lines = vec![render_reply(
+        let mut lines = vec![UndercoverReply::keyed(
             &templates::OPENING,
             &ReplyVars::new()
                 .with("模式", game.mode.label())
                 .with("人数", game.players.len().to_string()),
         )];
         lines.extend(position_mapping_lines(&game.players));
-        lines.push(render_reply(&templates::DESCRIBE_PROMPT, &ReplyVars::new()));
-        Ok(vec![UndercoverDelivery::HallBatch(lines)])
+        lines.push(UndercoverReply::keyed(
+            &templates::DESCRIBE_PROMPT,
+            &ReplyVars::new(),
+        ));
+        Ok(vec![UndercoverDelivery::KeyedHallBatch(lines)])
     }
 
     pub fn cancel_delivery(&mut self) -> Vec<UndercoverDelivery> {
         if matches!(self.state, GameState::Playing(_)) {
             self.state = GameState::Idle;
-            vec![UndercoverDelivery::Hall(render_reply(
+            vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                 &templates::DELIVERY_CANCELED,
                 &ReplyVars::new(),
             ))]
@@ -658,7 +724,7 @@ impl UndercoverGame {
                 let voter_count = alive_count(&game.players).saturating_sub(candidates.len());
                 if voter_count == 0 {
                     start_next_round(game);
-                    deliveries.push(UndercoverDelivery::Hall(render_reply(
+                    deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                         &templates::RUNOFF_NO_VOTERS,
                         &ReplyVars::new().with("轮次", game.round.to_string()),
                     )));
@@ -668,9 +734,8 @@ impl UndercoverGame {
                         votes: BTreeMap::new(),
                         reminder: VoteReminder::new(now),
                     };
-                    deliveries.push(UndercoverDelivery::Hall(render_reply(
+                    deliveries.push(UndercoverDelivery::KeyedHall(with_vote_instruction(
                         &templates::RUNOFF_DESCRIBED,
-                        &ReplyVars::new().with("投票说明", vote_instruction()),
                     )));
                 }
             } else {
@@ -678,9 +743,8 @@ impl UndercoverGame {
                     votes: BTreeMap::new(),
                     reminder: VoteReminder::new(now),
                 };
-                deliveries.push(UndercoverDelivery::Hall(render_reply(
+                deliveries.push(UndercoverDelivery::KeyedHall(with_vote_instruction(
                     &templates::DESCRIBE_COMPLETED,
-                    &ReplyVars::new().with("投票说明", vote_instruction()),
                 )));
             }
         }
@@ -797,15 +861,15 @@ impl UndercoverGame {
         Ok(())
     }
 
-    pub fn status(&mut self, requester: &str, now: Instant) -> String {
+    pub fn status(&mut self, requester: &str, now: Instant) -> UndercoverReply {
         let requester = player_key(requester);
         match &mut self.state {
-            GameState::Idle => render_reply(&templates::STATUS_IDLE, &ReplyVars::new()),
+            GameState::Idle => UndercoverReply::keyed(&templates::STATUS_IDLE, &ReplyVars::new()),
             GameState::Lobby(lobby) => {
                 if lobby.players.iter().any(|player| player.key == requester) {
                     lobby.last_activity = now;
                 }
-                render_reply(
+                UndercoverReply::keyed(
                     &templates::STATUS_LOBBY,
                     &ReplyVars::new()
                         .with("模式", lobby.mode.label())
@@ -827,7 +891,7 @@ impl UndercoverGame {
     }
 
     /// 返回当前游戏的私有答案，不改变游戏状态。
-    pub fn reveal(&self, requester: &str) -> Result<Vec<String>> {
+    pub fn reveal(&self, requester: &str) -> Result<Vec<UndercoverReply>> {
         let GameState::Playing(game) = &self.state else {
             bail!("当前没有正在进行的谁是卧底牌局");
         };
@@ -847,7 +911,7 @@ impl UndercoverGame {
         } else {
             undercover_positions.join("")
         };
-        Ok(vec![render_reply(
+        Ok(vec![UndercoverReply::keyed(
             &templates::REVEAL,
             &ReplyVars::new()
                 .with("平民词", game.words.civilian.as_str())
@@ -869,14 +933,14 @@ impl UndercoverGame {
                 let name = lobby.players[index].name.clone();
                 if lobby.creator_key == key {
                     self.state = GameState::Idle;
-                    Ok(vec![UndercoverDelivery::Hall(render_reply(
+                    Ok(vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                         &templates::EXIT_CREATOR,
                         &ReplyVars::new().with("玩家", name),
                     ))])
                 } else {
                     lobby.players.remove(index);
                     lobby.last_activity = now;
-                    Ok(vec![UndercoverDelivery::Hall(render_reply(
+                    Ok(vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                         &templates::EXIT_LOBBY,
                         &ReplyVars::new()
                             .with("玩家", name)
@@ -888,20 +952,21 @@ impl UndercoverGame {
                 let index = active_player_index(&game.players, player)?;
                 game.players[index].alive = false;
                 game.last_activity = now;
-                let mut deliveries = vec![UndercoverDelivery::Hall(render_reply(
-                    &templates::EXIT_PLAYING,
-                    &ReplyVars::new()
-                        .with("位置", game.players[index].position.to_string())
-                        .with("身份", game.players[index].role.label()),
-                ))];
+                let mut deliveries =
+                    vec![UndercoverDelivery::KeyedHall(UndercoverReply::Composed {
+                        spec: &templates::EXIT_PLAYING,
+                        vars: ReplyVars::new()
+                            .with("位置", game.players[index].position.to_string()),
+                        fragments: vec![("身份", game.players[index].role.reply())],
+                    })];
                 if let Some(result) = winner(game) {
-                    deliveries.push(UndercoverDelivery::HallBatch(settlement_lines(
+                    deliveries.push(UndercoverDelivery::KeyedHallBatch(settlement_lines(
                         game, result,
                     )));
                     self.state = GameState::Idle;
                 } else {
                     start_next_round(game);
-                    deliveries.push(UndercoverDelivery::Hall(render_reply(
+                    deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                         &templates::ROUND_RESTART,
                         &ReplyVars::new().with("轮次", game.round.to_string()),
                     )));
@@ -921,7 +986,7 @@ impl UndercoverGame {
                     bail!("只有房间创建者可以结束");
                 }
                 self.state = GameState::Idle;
-                Ok(vec![UndercoverDelivery::Hall(render_reply(
+                Ok(vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                     &templates::LOBBY_CANCELED,
                     &ReplyVars::new(),
                 ))])
@@ -932,7 +997,7 @@ impl UndercoverGame {
                 {
                     bail!("只有房间创建者可以结束");
                 }
-                let deliveries = vec![UndercoverDelivery::HallBatch(settlement_lines(
+                let deliveries = vec![UndercoverDelivery::KeyedHallBatch(settlement_lines(
                     game,
                     Winner::None,
                 ))];
@@ -1069,7 +1134,7 @@ impl UndercoverGame {
                     >= std::time::Duration::from_secs(self.config.lobby_timeout_seconds.max(1))
                 {
                     self.state = GameState::Idle;
-                    deliveries.push(UndercoverDelivery::Hall(render_reply(
+                    deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                         &templates::LOBBY_TIMEOUT,
                         &ReplyVars::new(),
                     )));
@@ -1098,7 +1163,7 @@ impl UndercoverGame {
                     _ => None,
                 };
                 if let Some(message) = message {
-                    deliveries.push(UndercoverDelivery::Hall(message));
+                    deliveries.push(UndercoverDelivery::KeyedHall(message));
                 }
                 if now.saturating_duration_since(game.last_activity)
                     < std::time::Duration::from_secs(self.config.phase_timeout_seconds.max(1))
@@ -1115,7 +1180,7 @@ impl UndercoverGame {
         let phase = std::mem::replace(&mut game.phase, Phase::AwaitingDelivery);
         let ended = match phase {
             Phase::AwaitingDelivery => {
-                deliveries.push(UndercoverDelivery::Hall(render_reply(
+                deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                     &templates::DELIVERY_TIMEOUT,
                     &ReplyVars::new(),
                 )));
@@ -1137,7 +1202,7 @@ impl UndercoverGame {
             ),
             Phase::Voting { votes, .. } => {
                 if votes.is_empty() {
-                    deliveries.push(UndercoverDelivery::HallBatch(settlement_lines(
+                    deliveries.push(UndercoverDelivery::KeyedHallBatch(settlement_lines(
                         &game,
                         Winner::None,
                     )));
@@ -1150,7 +1215,7 @@ impl UndercoverGame {
                 candidates, votes, ..
             } => {
                 if votes.is_empty() {
-                    deliveries.push(UndercoverDelivery::HallBatch(settlement_lines(
+                    deliveries.push(UndercoverDelivery::KeyedHallBatch(settlement_lines(
                         &game,
                         Winner::None,
                     )));
@@ -1187,28 +1252,32 @@ fn playing_progress(game: &Playing) -> (&'static str, usize, usize) {
     }
 }
 
-fn compact_status(game: &Playing) -> String {
+fn compact_status(game: &Playing) -> UndercoverReply {
     let (phase, eligible, completed) = match &game.phase {
         Phase::AwaitingDelivery => (
-            describing_phase_label(),
+            UndercoverReply::keyed(&templates::PHASE_DESCRIBING, &ReplyVars::new()),
             alive_indices(&game.players),
             BTreeSet::new(),
         ),
         Phase::Describing { descriptions } => (
-            describing_phase_label(),
+            UndercoverReply::keyed(&templates::PHASE_DESCRIBING, &ReplyVars::new()),
             alive_indices(&game.players),
             descriptions.keys().copied().collect(),
         ),
         Phase::Voting { .. } => {
             let eligible = alive_indices(&game.players);
             let completed = eligible.iter().copied().collect();
-            (voting_phase_label(), eligible, completed)
+            (
+                UndercoverReply::keyed(&templates::PHASE_VOTING, &ReplyVars::new()),
+                eligible,
+                completed,
+            )
         }
         Phase::RunoffDescribing {
             candidates,
             descriptions,
         } => (
-            describing_phase_label(),
+            UndercoverReply::keyed(&templates::PHASE_DESCRIBING, &ReplyVars::new()),
             candidates
                 .iter()
                 .copied()
@@ -1222,7 +1291,11 @@ fn compact_status(game: &Playing) -> String {
                 .filter(|index| !candidates.contains(index))
                 .collect::<Vec<_>>();
             let completed = eligible.iter().copied().collect();
-            (voting_phase_label(), eligible, completed)
+            (
+                UndercoverReply::keyed(&templates::PHASE_VOTING, &ReplyVars::new()),
+                eligible,
+                completed,
+            )
         }
     };
     let positions = eligible
@@ -1236,24 +1309,21 @@ fn compact_status(game: &Playing) -> String {
             }
         })
         .collect::<String>();
-    render_reply(
-        &templates::STATUS_PLAYING,
-        &ReplyVars::new()
+    let mut fragments = vec![("阶段", phase)];
+    if matches!(
+        game.phase,
+        Phase::Voting { .. } | Phase::RunoffVoting { .. }
+    ) {
+        fragments.push(("投票说明", vote_instruction()));
+    }
+    UndercoverReply::Composed {
+        spec: &templates::STATUS_PLAYING,
+        vars: ReplyVars::new()
             .with("模式", game.mode.label())
             .with("轮次", game.round.to_string())
-            .with("阶段", phase)
             .with("位置", positions),
-    )
-}
-
-/// #状态里的描述阶段词。抽成函数是为了让 Phase 匹配臂与最终拼接共用同一模板。
-fn describing_phase_label() -> String {
-    render_reply(&templates::PHASE_DESCRIBING, &ReplyVars::new())
-}
-
-/// #状态里的投票阶段词。
-fn voting_phase_label() -> String {
-    render_reply(&templates::PHASE_VOTING, &ReplyVars::new())
+        fragments,
+    }
 }
 
 fn alive_indices(players: &[Player]) -> Vec<usize> {
@@ -1274,7 +1344,7 @@ fn missing_vote_message(
     players: &[Player],
     votes: &Votes,
     excluded_voters: Option<&[usize]>,
-) -> Option<String> {
+) -> Option<UndercoverReply> {
     let positions = players
         .iter()
         .enumerate()
@@ -1286,7 +1356,7 @@ fn missing_vote_message(
         .map(|(_, player)| player.position.to_string())
         .collect::<Vec<_>>();
     (!positions.is_empty()).then(|| {
-        render_reply(
+        UndercoverReply::keyed(
             &templates::VOTE_MISSING,
             &ReplyVars::new().with("位置列表", positions.join("、")),
         )
@@ -1301,7 +1371,7 @@ fn resolve_description_timeout(
     deliveries: &mut Vec<UndercoverDelivery>,
 ) -> bool {
     if descriptions.is_empty() {
-        deliveries.push(UndercoverDelivery::HallBatch(settlement_lines(
+        deliveries.push(UndercoverDelivery::KeyedHallBatch(settlement_lines(
             game,
             Winner::None,
         )));
@@ -1317,16 +1387,15 @@ fn resolve_description_timeout(
     for index in required {
         if !descriptions.contains_key(&index) && game.players[index].alive {
             game.players[index].alive = false;
-            deliveries.push(UndercoverDelivery::Hall(render_reply(
-                &templates::DESCRIBE_TIMEOUT,
-                &ReplyVars::new()
-                    .with("位置", game.players[index].position.to_string())
-                    .with("身份", game.players[index].role.label()),
-            )));
+            deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::Composed {
+                spec: &templates::DESCRIBE_TIMEOUT,
+                vars: ReplyVars::new().with("位置", game.players[index].position.to_string()),
+                fragments: vec![("身份", game.players[index].role.reply())],
+            }));
         }
     }
     if let Some(result) = winner(game) {
-        deliveries.push(UndercoverDelivery::HallBatch(settlement_lines(
+        deliveries.push(UndercoverDelivery::KeyedHallBatch(settlement_lines(
             game, result,
         )));
         return true;
@@ -1339,7 +1408,7 @@ fn resolve_description_timeout(
             .collect::<Vec<_>>();
         if candidates.len() < 2 {
             start_next_round(game);
-            deliveries.push(UndercoverDelivery::Hall(render_reply(
+            deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                 &templates::RUNOFF_DESCRIBE_TIMEOUT,
                 &ReplyVars::new().with("轮次", game.round.to_string()),
             )));
@@ -1349,9 +1418,8 @@ fn resolve_description_timeout(
                 votes: BTreeMap::new(),
                 reminder: VoteReminder::new(now),
             };
-            deliveries.push(UndercoverDelivery::Hall(render_reply(
+            deliveries.push(UndercoverDelivery::KeyedHall(with_vote_instruction(
                 &templates::RUNOFF_DESCRIBE_CUTOFF,
-                &ReplyVars::new().with("投票说明", vote_instruction()),
             )));
         }
     } else {
@@ -1359,9 +1427,8 @@ fn resolve_description_timeout(
             votes: BTreeMap::new(),
             reminder: VoteReminder::new(now),
         };
-        deliveries.push(UndercoverDelivery::Hall(render_reply(
+        deliveries.push(UndercoverDelivery::KeyedHall(with_vote_instruction(
             &templates::DESCRIBE_CUTOFF,
-            &ReplyVars::new().with("投票说明", vote_instruction()),
         )));
     }
     false
@@ -1377,7 +1444,7 @@ fn resolve_votes(
     if leaders.len() > 1 {
         if runoff_candidates.is_some() {
             start_next_round(game);
-            deliveries.push(UndercoverDelivery::Hall(render_reply(
+            deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                 &templates::RUNOFF_TIED,
                 &ReplyVars::new().with("轮次", game.round.to_string()),
             )));
@@ -1391,7 +1458,7 @@ fn resolve_votes(
                 candidates: leaders,
                 descriptions: BTreeMap::new(),
             };
-            deliveries.push(UndercoverDelivery::Hall(render_reply(
+            deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                 &templates::RUNOFF_ENTER,
                 &ReplyVars::new().with("位置列表", positions),
             )));
@@ -1400,27 +1467,26 @@ fn resolve_votes(
     }
     let Some(target) = leaders.first().copied() else {
         start_next_round(game);
-        deliveries.push(UndercoverDelivery::Hall(render_reply(
+        deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
             &templates::VOTE_NONE,
             &ReplyVars::new().with("轮次", game.round.to_string()),
         )));
         return false;
     };
     game.players[target].alive = false;
-    deliveries.push(UndercoverDelivery::Hall(render_reply(
-        &templates::ELIMINATED,
-        &ReplyVars::new()
-            .with("位置", game.players[target].position.to_string())
-            .with("身份", game.players[target].role.label()),
-    )));
+    deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::Composed {
+        spec: &templates::ELIMINATED,
+        vars: ReplyVars::new().with("位置", game.players[target].position.to_string()),
+        fragments: vec![("身份", game.players[target].role.reply())],
+    }));
     if let Some(result) = winner(game) {
-        deliveries.push(UndercoverDelivery::HallBatch(settlement_lines(
+        deliveries.push(UndercoverDelivery::KeyedHallBatch(settlement_lines(
             game, result,
         )));
         true
     } else {
         start_next_round(game);
-        deliveries.push(UndercoverDelivery::Hall(render_reply(
+        deliveries.push(UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
             &templates::ROUND_START,
             &ReplyVars::new().with("轮次", game.round.to_string()),
         )));
@@ -1443,12 +1509,13 @@ enum Winner {
 }
 
 impl Winner {
-    fn label(self) -> String {
-        match self {
-            Self::Civilian => render_reply(&templates::WINNER_CIVILIAN, &ReplyVars::new()),
-            Self::Undercover => render_reply(&templates::WINNER_UNDERCOVER, &ReplyVars::new()),
-            Self::None => render_reply(&templates::WINNER_NONE, &ReplyVars::new()),
-        }
+    fn reply(self) -> UndercoverReply {
+        let spec = match self {
+            Self::Civilian => &templates::WINNER_CIVILIAN,
+            Self::Undercover => &templates::WINNER_UNDERCOVER,
+            Self::None => &templates::WINNER_NONE,
+        };
+        UndercoverReply::keyed(spec, &ReplyVars::new())
     }
 }
 
@@ -1502,50 +1569,52 @@ fn winner(game: &Playing) -> Option<Winner> {
     }
 }
 
-fn position_mapping_lines(players: &[Player]) -> Vec<String> {
+fn position_mapping_lines(players: &[Player]) -> Vec<UndercoverReply> {
     players
         .chunks(3)
         .map(|chunk| {
-            chunk
-                .iter()
-                .map(|player| {
-                    render_reply(
-                        &templates::POSITION_MAPPING,
-                        &ReplyVars::new()
-                            .with("位置", player.position.to_string())
-                            .with("昵称", player.name.as_str()),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("|")
+            let mut fragments = Vec::with_capacity(chunk.len() * 2 - 1);
+            for (index, player) in chunk.iter().enumerate() {
+                if index > 0 {
+                    fragments.push(UndercoverReply::Raw("|".to_string()));
+                }
+                fragments.push(UndercoverReply::keyed(
+                    &templates::POSITION_MAPPING,
+                    &ReplyVars::new()
+                        .with("位置", player.position.to_string())
+                        .with("昵称", player.name.as_str()),
+                ));
+            }
+            UndercoverReply::Joined { fragments }
         })
         .collect()
 }
 
-fn settlement_lines(game: &Playing, winner: Winner) -> Vec<String> {
-    let mut lines = vec![render_reply(
-        &templates::SETTLEMENT_HEADER,
-        &ReplyVars::new()
-            .with("胜方", winner.label())
+fn settlement_lines(game: &Playing, winner: Winner) -> Vec<UndercoverReply> {
+    let mut lines = vec![UndercoverReply::Composed {
+        spec: &templates::SETTLEMENT_HEADER,
+        vars: ReplyVars::new()
             .with("平民词", game.words.civilian.as_str())
             .with("卧底词", game.words.undercover.as_str()),
-    )];
+        fragments: vec![("胜方", winner.reply())],
+    }];
     lines.extend(game.players.chunks(3).map(|chunk| {
-        chunk
-            .iter()
-            .map(|player| {
-                render_reply(
-                    &templates::SETTLEMENT_PLAYER,
-                    &ReplyVars::new()
-                        .with("位置", player.position.to_string())
-                        .with("昵称", player.name.as_str())
-                        .with("身份", player.role.label()),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("|")
+        let mut fragments = Vec::with_capacity(chunk.len() * 2 - 1);
+        for (index, player) in chunk.iter().enumerate() {
+            if index > 0 {
+                fragments.push(UndercoverReply::Raw("|".to_string()));
+            }
+            fragments.push(UndercoverReply::Composed {
+                spec: &templates::SETTLEMENT_PLAYER,
+                vars: ReplyVars::new()
+                    .with("位置", player.position.to_string())
+                    .with("昵称", player.name.as_str()),
+                fragments: vec![("身份", player.role.reply())],
+            });
+        }
+        UndercoverReply::Joined { fragments }
     }));
-    lines.push(render_reply(
+    lines.push(UndercoverReply::keyed(
         &templates::SETTLEMENT_ROUNDS,
         &ReplyVars::new().with("轮次", game.round.to_string()),
     ));
@@ -1628,6 +1697,67 @@ mod tests {
 
     use super::*;
 
+    fn delivery_default_text(deliveries: &[UndercoverDelivery]) -> Vec<String> {
+        deliveries
+            .iter()
+            .flat_map(|delivery| match delivery {
+                UndercoverDelivery::Hall(message) => vec![message.clone()],
+                UndercoverDelivery::HallBatch(messages) => messages.clone(),
+                UndercoverDelivery::Friend { .. } | UndercoverDelivery::KeyedFriend(_) => {
+                    Vec::new()
+                }
+                UndercoverDelivery::KeyedHall(reply) => vec![reply.render_default()],
+                UndercoverDelivery::KeyedHallBatch(replies) => replies
+                    .iter()
+                    .map(UndercoverReply::render_default)
+                    .collect(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn position_mapping_preserves_order_pipe_separators_and_keyed_entries() {
+        let players = ['A', 'B', 'C', 'D']
+            .into_iter()
+            .zip(["甲", "乙", "丙", "丁"])
+            .map(|(position, name)| {
+                let mut player = Player::lobby(name);
+                player.position = position;
+                player
+            })
+            .collect::<Vec<_>>();
+
+        let lines = position_mapping_lines(&players);
+        assert_eq!(
+            lines
+                .iter()
+                .map(UndercoverReply::render_default)
+                .collect::<Vec<_>>(),
+            ["A=甲|B=乙|C=丙", "D=丁"]
+        );
+        for (line, chunk) in lines.iter().zip(players.chunks(3)) {
+            let UndercoverReply::Joined { fragments } = line else {
+                panic!("position mappings must retain joined keyed entries");
+            };
+            assert_eq!(fragments.len(), chunk.len() * 2 - 1);
+            for (index, player) in chunk.iter().enumerate() {
+                assert!(
+                    matches!(&fragments[index * 2], UndercoverReply::Keyed { spec, vars }
+                    if spec.key == templates::POSITION_MAPPING.key
+                        && vars == &ReplyVars::new()
+                            .with("位置", player.position.to_string())
+                            .with("昵称", player.name.as_str()))
+                );
+                if index > 0 {
+                    assert_eq!(
+                        fragments[index * 2 - 1],
+                        UndercoverReply::Raw("|".to_string())
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn abstain_is_a_private_vote_command_and_never_a_public_description() {
         assert_eq!(
@@ -1661,14 +1791,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(deliveries.len(), 4);
-        assert!(deliveries.iter().all(|delivery| matches!(
-            delivery,
-            UndercoverDelivery::Friend { message, .. }
-                if message.contains("你的位置：")
-                    && message.contains("你的词语：")
-                    && !message.contains("平民")
-                    && !message.contains("卧底")
-        )));
+        assert!(deliveries.iter().all(|delivery| {
+            let UndercoverDelivery::KeyedFriend(delivery) = delivery else {
+                return false;
+            };
+            let message = delivery.reply.render_default();
+            matches!(&delivery.reply, UndercoverReply::Keyed { spec, .. }
+                if spec.key == templates::SECRET.key)
+                && message.contains("你的位置：")
+                && message.contains("你的词语：")
+                && !message.contains("平民")
+                && !message.contains("卧底")
+        }));
     }
 
     #[test]
@@ -1684,14 +1818,18 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } => {
-                    Some((player, message_position(&message)))
-                }
+                UndercoverDelivery::KeyedFriend(delivery) => Some((
+                    delivery.recipient,
+                    message_position(&delivery.reply.render_default()),
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(game.status("旁观者", now), "单卧底,第1轮,发言,abcd");
+        assert_eq!(
+            game.status("旁观者", now).render_default(),
+            "单卧底,第1轮,发言,abcd"
+        );
         game.complete_delivery(now).unwrap();
 
         let player_a = players
@@ -1700,7 +1838,10 @@ mod tests {
             .map(|(player, _)| player.clone())
             .expect("position A");
         game.describe(&player_a, "第一条描述", now).unwrap();
-        assert_eq!(game.status("旁观者", now), "单卧底,第1轮,发言,Abcd");
+        assert_eq!(
+            game.status("旁观者", now).render_default(),
+            "单卧底,第1轮,发言,Abcd"
+        );
 
         for (index, (player, _)) in players.iter().enumerate() {
             if player != &player_a {
@@ -1708,10 +1849,16 @@ mod tests {
                     .unwrap();
             }
         }
-        assert_eq!(game.status("旁观者", now), "单卧底,第1轮,投票,ABCD");
+        assert_eq!(
+            game.status("旁观者", now).render_default(),
+            "单卧底,第1轮,投票,ABCD"
+        );
 
         game.vote(&player_a, 'B', now).unwrap();
-        assert_eq!(game.status("旁观者", now), "单卧底,第1轮,投票,ABCD");
+        assert_eq!(
+            game.status("旁观者", now).render_default(),
+            "单卧底,第1轮,投票,ABCD"
+        );
     }
 
     #[test]
@@ -1728,8 +1875,13 @@ mod tests {
         let undercover = words
             .iter()
             .find_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } if message.contains("梨") => {
-                    Some((player.clone(), message_position(message)))
+                UndercoverDelivery::KeyedFriend(delivery)
+                    if delivery.reply.render_default().contains("梨") =>
+                {
+                    Some((
+                        delivery.recipient.clone(),
+                        message_position(&delivery.reply.render_default()),
+                    ))
                 }
                 _ => None,
             })
@@ -1737,16 +1889,22 @@ mod tests {
         let participants = words
             .iter()
             .filter_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } => {
-                    Some((player.clone(), message_position(message)))
-                }
+                UndercoverDelivery::KeyedFriend(delivery) => Some((
+                    delivery.recipient.clone(),
+                    message_position(&delivery.reply.render_default()),
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
 
         let opening = game.complete_delivery(now).unwrap();
-        assert!(matches!(&opening[0], UndercoverDelivery::HallBatch(lines)
-            if lines.iter().any(|line| line.contains("A="))));
+        assert!(
+            matches!(&opening[0], UndercoverDelivery::KeyedHallBatch(lines)
+            if matches!(lines.first(), Some(UndercoverReply::Keyed { spec, .. }) if spec.key == templates::OPENING.key)
+                && lines.len() == 4
+                && lines[1..3].iter().all(|reply| matches!(reply, UndercoverReply::Joined { .. }))
+                && matches!(lines.last(), Some(UndercoverReply::Keyed { spec, .. }) if spec.key == templates::DESCRIBE_PROMPT.key))
+        );
 
         for (index, (player, _)) in participants.iter().enumerate() {
             let deliveries = game
@@ -1756,11 +1914,8 @@ mod tests {
                 assert!(deliveries.is_empty());
             } else {
                 assert_eq!(
-                    deliveries,
-                    vec![UndercoverDelivery::Hall(
-                        "所有存活玩家已描述，请好友私聊#怀疑对象编号，例如#A，或发送#弃权"
-                            .to_string()
-                    )]
+                    delivery_default_text(&deliveries),
+                    vec!["所有存活玩家已描述，请好友私聊#怀疑对象编号，例如#A，或发送#弃权"]
                 );
             }
         }
@@ -1780,9 +1935,9 @@ mod tests {
             final_deliveries = game.vote(player, target, now).unwrap();
         }
         assert!(final_deliveries.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::HallBatch(lines)
-                if lines.first().is_some_and(|line| line.contains("平民胜利"))
-                    && lines.last().is_some_and(|line| line == "共进行1轮"))));
+            UndercoverDelivery::KeyedHallBatch(lines)
+                if lines.first().is_some_and(|line| line.render_default().contains("平民胜利"))
+                    && lines.last().is_some_and(|line| line.render_default() == "共进行1轮"))));
     }
 
     #[test]
@@ -1799,9 +1954,10 @@ mod tests {
         let players = deliveries
             .iter()
             .filter_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } => {
-                    Some((player.clone(), message_position(message)))
-                }
+                UndercoverDelivery::KeyedFriend(delivery) => Some((
+                    delivery.recipient.clone(),
+                    message_position(&delivery.reply.render_default()),
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1818,24 +1974,24 @@ mod tests {
             runoff_started = game.vote(player, target, now).unwrap();
         }
         assert!(runoff_started.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::Hall(message) if message.contains("进入并列加赛"))));
+            UndercoverDelivery::KeyedHall(UndercoverReply::Keyed { spec, .. })
+                if spec.key == templates::RUNOFF_ENTER.key)));
 
         game.describe(&players[0].0, "补充描述一", now).unwrap();
         let completed = game.describe(&players[1].0, "补充描述二", now).unwrap();
         assert_eq!(
-            completed,
-            vec![UndercoverDelivery::Hall(
+            delivery_default_text(&completed),
+            vec![
                 "并列玩家已完成公屏描述，其他存活玩家请好友私聊#怀疑对象编号，例如#A，或发送#弃权"
-                    .to_string()
-            )]
+            ]
         );
 
         let voters = [&players[2], &players[3]];
         game.vote(&voters[0].0, first, now).unwrap();
         let tied = game.vote(&voters[1].0, second, now).unwrap();
         assert!(tied.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::Hall(message)
-                if message.contains("加赛仍并列") && message.contains("第2轮"))));
+            UndercoverDelivery::KeyedHall(UndercoverReply::Keyed { spec, vars })
+                if spec.key == templates::RUNOFF_TIED.key && vars.get("轮次") == Some("2"))));
     }
 
     #[test]
@@ -1852,9 +2008,10 @@ mod tests {
         let players = deliveries
             .iter()
             .filter_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } => {
-                    Some((player.clone(), message_position(message)))
-                }
+                UndercoverDelivery::KeyedFriend(delivery) => Some((
+                    delivery.recipient.clone(),
+                    message_position(&delivery.reply.render_default()),
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1890,8 +2047,8 @@ mod tests {
         let result = game.describe(&second_name, "补充描述二", now).unwrap();
 
         assert!(result.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::Hall(message)
-                if message.contains("无人可投票") && message.contains("第2轮"))));
+            UndercoverDelivery::KeyedHall(UndercoverReply::Keyed { spec, vars })
+                if spec.key == templates::RUNOFF_NO_VOTERS.key && vars.get("轮次") == Some("2"))));
         assert!(matches!(
             game.state,
             GameState::Playing(Playing {
@@ -1916,9 +2073,10 @@ mod tests {
         let players = deliveries
             .iter()
             .filter_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } => {
-                    Some((player.clone(), message_position(message)))
-                }
+                UndercoverDelivery::KeyedFriend(delivery) => Some((
+                    delivery.recipient.clone(),
+                    message_position(&delivery.reply.render_default()),
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1934,9 +2092,10 @@ mod tests {
 
         let first_reminder = game.tick(now + std::time::Duration::from_secs(20));
         assert_eq!(first_reminder.len(), 1);
-        let UndercoverDelivery::Hall(message) = &first_reminder[0] else {
+        let UndercoverDelivery::KeyedHall(reply) = &first_reminder[0] else {
             panic!("expected hall reminder");
         };
+        let message = reply.render_default();
         assert!(message.starts_with("未投票："));
         assert!(!message.contains(players[0].1));
         for (_, position) in players.iter().skip(1) {
@@ -1964,9 +2123,10 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } => {
-                    Some((player, message_position(&message)))
-                }
+                UndercoverDelivery::KeyedFriend(delivery) => Some((
+                    delivery.recipient,
+                    message_position(&delivery.reply.render_default()),
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1983,8 +2143,9 @@ mod tests {
         let result = game.abstain(&players.last().unwrap().0, now).unwrap();
 
         assert!(result.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::Hall(message)
-                if message.contains("本轮无人获得票数") && message.contains("第2轮"))));
+            UndercoverDelivery::KeyedHall(reply)
+                if reply.render_default().contains("本轮无人获得票数")
+                    && reply.render_default().contains("第2轮"))));
         let GameState::Playing(playing) = &game.state else {
             panic!("all abstentions must keep the game active");
         };
@@ -2005,7 +2166,7 @@ mod tests {
             .start(UndercoverWordPair::new("苹果", "梨"), now)
             .unwrap();
         let first = match &deliveries[0] {
-            UndercoverDelivery::Friend { player, .. } => player.clone(),
+            UndercoverDelivery::KeyedFriend(delivery) => delivery.recipient.clone(),
             _ => unreachable!(),
         };
         game.complete_delivery(now).unwrap();
@@ -2019,16 +2180,16 @@ mod tests {
         let early = game.tick(now + std::time::Duration::from_secs(180));
         assert!(game.is_active());
         assert!(!early.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::HallBatch(lines)
-                if lines.first().is_some_and(|line| line.contains("谁是卧底结束")))));
+            UndercoverDelivery::KeyedHallBatch(lines)
+                if lines.first().is_some_and(|line| line.render_default().contains("谁是卧底结束")))));
 
         let _ = game.status("甲", now + std::time::Duration::from_secs(290));
 
         let settled = game.tick(now + std::time::Duration::from_secs(300));
         assert!(!game.is_active());
         assert!(settled.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::HallBatch(lines)
-                if lines.first().is_some_and(|line| line.contains("谁是卧底结束")))));
+            UndercoverDelivery::KeyedHallBatch(lines)
+                if lines.first().is_some_and(|line| line.render_default().contains("谁是卧底结束")))));
     }
 
     #[test]
@@ -2045,10 +2206,10 @@ mod tests {
         let players = deliveries
             .iter()
             .filter_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } => Some((
-                    player.clone(),
-                    message_position(message),
-                    message.contains("梨"),
+                UndercoverDelivery::KeyedFriend(delivery) => Some((
+                    delivery.recipient.clone(),
+                    message_position(&delivery.reply.render_default()),
+                    delivery.reply.render_default().contains("梨"),
                 )),
                 _ => None,
             })
@@ -2094,8 +2255,8 @@ mod tests {
             }
             if round == 1 {
                 assert!(result.iter().any(|delivery| matches!(delivery,
-                    UndercoverDelivery::HallBatch(lines)
-                        if lines.first().is_some_and(|line| line.contains("卧底胜利")))));
+                    UndercoverDelivery::KeyedHallBatch(lines)
+                        if lines.first().is_some_and(|line| line.render_default().contains("卧底胜利")))));
             }
         }
         assert!(!game.is_active());
@@ -2115,10 +2276,10 @@ mod tests {
         let players = deliveries
             .iter()
             .filter_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } => Some((
-                    player.clone(),
-                    message_position(message),
-                    message.contains("梨"),
+                UndercoverDelivery::KeyedFriend(delivery) => Some((
+                    delivery.recipient.clone(),
+                    message_position(&delivery.reply.render_default()),
+                    delivery.reply.render_default().contains("梨"),
                 )),
                 _ => None,
             })
@@ -2137,8 +2298,8 @@ mod tests {
 
         let result = game.tick(now + std::time::Duration::from_secs(180));
         assert!(result.iter().any(|delivery| matches!(delivery,
-            UndercoverDelivery::HallBatch(lines)
-                if lines.first().is_some_and(|line| line.contains("平民胜利")))));
+            UndercoverDelivery::KeyedHallBatch(lines)
+                if lines.first().is_some_and(|line| line.render_default().contains("平民胜利")))));
     }
 
     #[test]
@@ -2175,7 +2336,11 @@ mod tests {
         let before = serde_json::to_string(&game.snapshot(now)).unwrap();
         let deadline = game.next_deadline(now, true);
         let lines = game.reveal("旁观者").unwrap();
-        let answer = lines.join("\n");
+        let answer = lines
+            .iter()
+            .map(UndercoverReply::render_default)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(lines.len(), 1);
         assert!(answer.starts_with("平民词:绝密平民词,卧底词:绝密卧底词,卧底:"));
         assert!(!answer.contains("内鬼位置"));

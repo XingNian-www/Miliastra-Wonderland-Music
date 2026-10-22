@@ -5346,4 +5346,3 @@ fn commands_catalog_route_never_mutates_config_even_when_posted_to() {
 
     server.shutdown().expect("shutdown HTTP server");
 }
-

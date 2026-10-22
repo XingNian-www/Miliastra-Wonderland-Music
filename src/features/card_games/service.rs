@@ -6,8 +6,8 @@ use std::time::Instant;
 use anyhow::{Result, anyhow, bail};
 
 use super::{
-    CardGameDeadlineKind, LandlordCommand, LandlordConfig, LandlordGame, LandlordOutcome,
-    LandlordPrivateDelivery,
+    CardGameDeadlineKind, CardGameFriendBatchOutcome, CardGameReplyTemplate, LandlordCommand,
+    LandlordConfig, LandlordGame, LandlordOutcome, LandlordPrivateDelivery,
 };
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
 use crate::features::friend_delivery::{
@@ -54,6 +54,7 @@ pub enum CardGameEffect {
     },
     HallDelivery {
         message: String,
+        template: Option<CardGameReplyTemplate>,
     },
 }
 
@@ -69,6 +70,7 @@ pub enum CardGameEffectResult {
     FriendVerify(Result<bool>),
     PrivateDelivery(Result<bool>),
     PrivateBatch(Result<FriendBatchOutcome>),
+    PrivateBatchTemplates(Result<CardGameFriendBatchOutcome>),
     HallDelivery(Result<()>),
 }
 
@@ -146,11 +148,46 @@ pub struct CardGameStartReservation {
 pub trait CardGameDeliveryPort {
     fn verify_friend(&self, player: &str, message: &str) -> Result<bool>;
     fn send_friend(&self, player: &str, message: &str) -> Result<bool>;
+    fn send_friend_template(
+        &self,
+        player: &str,
+        message: &str,
+        _template: &CardGameReplyTemplate,
+    ) -> Result<bool> {
+        self.send_friend(player, message)
+    }
+    fn send_friend_batch_templates(
+        &self,
+        deliveries: &[LandlordPrivateDelivery],
+    ) -> Result<CardGameFriendBatchOutcome> {
+        self.send_friend_batch(deliveries)
+            .map(|outcome| match outcome {
+                FriendBatchOutcome::Complete => CardGameFriendBatchOutcome::Complete,
+                FriendBatchOutcome::Failed { retryable, failure } => {
+                    let retryable = retryable
+                        .into_iter()
+                        .filter_map(|failed| {
+                            deliveries
+                                .iter()
+                                .find(|delivery| {
+                                    delivery.player == failed.recipient()
+                                        && delivery.message == failed.message()
+                                })
+                                .cloned()
+                        })
+                        .collect();
+                    CardGameFriendBatchOutcome::Failed { retryable, failure }
+                }
+            })
+    }
     fn send_friend_batch(
         &self,
         deliveries: &[LandlordPrivateDelivery],
     ) -> Result<FriendBatchOutcome>;
     fn send_hall(&self, message: &str) -> Result<()>;
+    fn send_hall_template(&self, message: &str, _template: &CardGameReplyTemplate) -> Result<()> {
+        self.send_hall(message)
+    }
 }
 
 pub trait CardGameRuntimePort: Send + Sync {
@@ -281,14 +318,21 @@ impl CardGameApplication {
                         || delivery.send_friend(&player, &message),
                     ))
                 }
-                CardGameEffect::PrivateBatch { deliveries } => CardGameEffectResult::PrivateBatch(
-                    run_card_game_delivery("好友批量消息发送", || {
-                        delivery.send_friend_batch(&deliveries)
-                    }),
-                ),
-                CardGameEffect::HallDelivery { message } => CardGameEffectResult::HallDelivery(
-                    run_card_game_delivery("大厅消息发送", || delivery.send_hall(&message)),
-                ),
+                CardGameEffect::PrivateBatch { deliveries } => {
+                    CardGameEffectResult::PrivateBatchTemplates(run_card_game_delivery(
+                        "好友批量消息发送",
+                        || delivery.send_friend_batch_templates(&deliveries),
+                    ))
+                }
+                CardGameEffect::HallDelivery { message, template } => {
+                    CardGameEffectResult::HallDelivery(run_card_game_delivery(
+                        "大厅消息发送",
+                        || match template {
+                            Some(template) => delivery.send_hall_template(&message, &template),
+                            None => delivery.send_hall(&message),
+                        },
+                    ))
+                }
             };
             match self.runtime.resume(key, result)? {
                 CardGameResume::Completed(_) => return Ok(()),
@@ -363,6 +407,7 @@ struct CardGameState {
 #[derive(Clone)]
 struct PrivateDeliveryContinuation {
     public_reply: Option<String>,
+    public_reply_template: Option<CardGameReplyTemplate>,
     action: &'static str,
     lane: CardGameEffectLane,
     release_on_completion: bool,
@@ -420,6 +465,7 @@ impl PendingCardGameEffect {
             ) | (
                 Self::DeliverOutcomePrivate { .. },
                 CardGameEffectResult::PrivateBatch(_)
+                    | CardGameEffectResult::PrivateBatchTemplates(_)
             ) | (
                 Self::DeliverHand { .. },
                 CardGameEffectResult::PrivateDelivery(_)
@@ -436,6 +482,7 @@ impl PendingCardGameEffect {
             ) | (
                 Self::DeliverOutcomePrivate { .. },
                 CardGameEffectResult::PrivateBatch(_)
+                    | CardGameEffectResult::PrivateBatchTemplates(_)
             )
         )
     }
@@ -626,6 +673,7 @@ impl CardGameService {
             CardGameEffectLane::Formal,
             CardGameEffect::HallDelivery {
                 message: message.into(),
+                template: None,
             },
             PendingCardGameEffect::Hall {
                 action,
@@ -695,6 +743,7 @@ impl CardGameService {
             CardGameEffectLane::Formal,
             CardGameEffect::HallDelivery {
                 message: reply.expect("non-started card game has a reply"),
+                template: None,
             },
             PendingCardGameEffect::Hall {
                 action: "start-rejected",
@@ -817,6 +866,7 @@ impl CardGameService {
                                 "{}报名失败：好友列表未找到唯一昵称",
                                 reservation.kind().label()
                             ),
+                            template: None,
                         },
                         PendingCardGameEffect::Hall {
                             action: "verification-rejected",
@@ -871,6 +921,7 @@ impl CardGameService {
                     CardGameEffectLane::Formal,
                     CardGameEffect::HallDelivery {
                         message: format!("{}报名失败：好友列表未找到唯一昵称", kind.label()),
+                        template: None,
                     },
                     PendingCardGameEffect::Hall {
                         action: "verification-rejected",
@@ -882,9 +933,9 @@ impl CardGameService {
             },
             (
                 PendingCardGameEffect::DeliverOutcomePrivate { continuation },
-                CardGameEffectResult::PrivateBatch(result),
+                CardGameEffectResult::PrivateBatchTemplates(result),
             ) => match result {
-                Ok(FriendBatchOutcome::Complete) => {
+                Ok(CardGameFriendBatchOutcome::Complete) => {
                     self.state.pending_retry = None;
                     let resumed = Self::continue_outcome_delivery_in_state(
                         &mut self.state,
@@ -898,7 +949,7 @@ impl CardGameService {
                     }
                     Ok(resumed)
                 }
-                Ok(FriendBatchOutcome::Failed { retryable, failure }) => self
+                Ok(CardGameFriendBatchOutcome::Failed { retryable, failure }) => self
                     .pause_private_delivery(
                         key.session_generation,
                         retryable,
@@ -935,17 +986,11 @@ impl CardGameService {
     fn pause_private_delivery(
         &mut self,
         session_generation: SessionGeneration,
-        retryable: Vec<FriendMessage>,
+        retryable: Vec<LandlordPrivateDelivery>,
         continuation: PrivateDeliveryContinuation,
         failure: FriendBatchFailure,
     ) -> Result<CardGameResume> {
-        let deliveries = retryable
-            .into_iter()
-            .map(|message| LandlordPrivateDelivery {
-                player: message.recipient().to_string(),
-                message: message.message().to_string(),
-            })
-            .collect::<Vec<_>>();
+        let deliveries = retryable;
         log::error!(
             "牌局私聊投递暂停: retryable={} kind={:?} reason={}",
             deliveries.len(),
@@ -974,6 +1019,7 @@ impl CardGameService {
             CardGameEffectLane::Formal,
             CardGameEffect::HallDelivery {
                 message: message.to_string(),
+                template: None,
             },
             PendingCardGameEffect::Hall {
                 action: "private-delivery-paused",
@@ -1096,6 +1142,7 @@ impl CardGameService {
         if !deliveries.is_empty() {
             let continuation = PrivateDeliveryContinuation {
                 public_reply: outcome.public_reply,
+                public_reply_template: outcome.public_reply_template,
                 action,
                 lane,
                 release_on_completion,
@@ -1111,11 +1158,12 @@ impl CardGameService {
             )
             .map(CardGameResume::Suspended)
         } else if let Some(message) = outcome.public_reply {
+            let template = outcome.public_reply_template;
             suspend_effect(
                 state,
                 generation,
                 lane,
-                CardGameEffect::HallDelivery { message },
+                CardGameEffect::HallDelivery { message, template },
                 PendingCardGameEffect::Hall {
                     action,
                     release_on_completion,
@@ -1133,11 +1181,12 @@ impl CardGameService {
         continuation: PrivateDeliveryContinuation,
     ) -> Result<CardGameResume> {
         if let Some(message) = continuation.public_reply {
+            let template = continuation.public_reply_template;
             return suspend_effect(
                 state,
                 generation,
                 continuation.lane,
-                CardGameEffect::HallDelivery { message },
+                CardGameEffect::HallDelivery { message, template },
                 PendingCardGameEffect::Hall {
                     action: continuation.action,
                     release_on_completion: continuation.release_on_completion,

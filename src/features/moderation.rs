@@ -386,27 +386,31 @@ impl ModerationService {
                 command.action.label(),
                 command.uid
             );
-            port.send_hall(&crate::features::reply_template::render(
-                &crate::features::reply_template::moderation::MODERATION[0],
-                None,
-                &crate::features::reply_template::ReplyVars::new()
-                    .with("UID", command.uid.clone())
-                    .with("动作", command.action.label()),
-            )
-            .text)?;
+            port.send_hall(
+                &crate::features::reply_template::render(
+                    &crate::features::reply_template::moderation::MODERATION[0],
+                    None,
+                    &crate::features::reply_template::ReplyVars::new()
+                        .with("UID", command.uid.clone())
+                        .with("动作", command.action.label()),
+                )
+                .text,
+            )?;
             return Ok(ModerationStart::Duplicate);
         };
 
         let vote_timeout_seconds = self.policy.vote_timeout.as_millis().saturating_add(999) / 1000;
-        port.send_hall(&crate::features::reply_template::render(
-            &crate::features::reply_template::moderation::MODERATION[1],
-            None,
-            &crate::features::reply_template::ReplyVars::new()
-                .with("UID", command.uid.clone())
-                .with("动作", command.action.label())
-                .with("超时秒数", vote_timeout_seconds.to_string()),
-        )
-        .text)?;
+        port.send_hall(
+            &crate::features::reply_template::render(
+                &crate::features::reply_template::moderation::MODERATION[1],
+                None,
+                &crate::features::reply_template::ReplyVars::new()
+                    .with("UID", command.uid.clone())
+                    .with("动作", command.action.label())
+                    .with("超时秒数", vote_timeout_seconds.to_string()),
+            )
+            .text,
+        )?;
         let hold = port.prepare_vote_hold()?;
         Ok(ModerationStart::Started(ModerationVoteWork {
             command: command.clone(),

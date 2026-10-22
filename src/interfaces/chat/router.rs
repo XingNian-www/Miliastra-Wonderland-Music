@@ -66,13 +66,16 @@ pub(crate) const AT_HANDLERS: &[ChatHandler] = &[
         ChatCommandModule::Playback,
         PlaybackCommand::claims_chat,
         |envelope| {
-            PlaybackCommand::parse_chat(envelope).map(|matched| matched.map(ModuleCommand::Playback))
+            PlaybackCommand::parse_chat(envelope)
+                .map(|matched| matched.map(ModuleCommand::Playback))
         },
     ),
     handler(
         ChatCommandModule::Hall,
         HallCommand::claims_chat,
-        |envelope| HallCommand::parse_chat(envelope).map(|matched| matched.map(ModuleCommand::Hall)),
+        |envelope| {
+            HallCommand::parse_chat(envelope).map(|matched| matched.map(ModuleCommand::Hall))
+        },
     ),
     handler(
         ChatCommandModule::Invite,
@@ -137,9 +140,7 @@ pub(crate) const HASH_START_HANDLERS: &[ChatHandler] = &[
     handler(
         ChatCommandModule::Undercover,
         UndercoverCommand::claims_start_chat,
-        |envelope| {
-            route_undercover(envelope).map(|matched| matched.map(ModuleCommand::Undercover))
-        },
+        |envelope| route_undercover(envelope).map(|matched| matched.map(ModuleCommand::Undercover)),
     ),
     handler(
         ChatCommandModule::Administration,

@@ -7,15 +7,15 @@ use anyhow::{Result, anyhow, bail};
 
 use super::repository::UndercoverBankStore;
 use super::{
-    UndercoverCommand, UndercoverConfig, UndercoverDelivery, UndercoverGame, UndercoverMode,
-    UndercoverSnapshot, random_seed, render_reply,
+    UndercoverCommand, UndercoverConfig, UndercoverDelivery, UndercoverFriendDelivery,
+    UndercoverGame, UndercoverMode, UndercoverReply, UndercoverSnapshot, random_seed,
 };
-use crate::features::reply_template::ReplyVars;
-use crate::features::reply_template::undercover as templates;
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
 use crate::features::friend_delivery::{
     FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
 };
+use crate::features::reply_template::ReplyVars;
+use crate::features::reply_template::undercover as templates;
 use miliastra_kernel::identity::{BusinessOperationId, SessionGeneration};
 
 /// 标识业务运行时拥有的一条 UI 效果链。
@@ -45,10 +45,41 @@ pub enum UndercoverEffectLane {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UndercoverEffect {
-    FriendVerify { player: String, message: String },
-    FriendBatch { deliveries: Vec<FriendMessage> },
-    Hall { message: String },
-    HallBatch { messages: Vec<String> },
+    FriendVerify {
+        player: String,
+        message: String,
+    },
+    KeyedFriendVerify {
+        player: String,
+        reply: UndercoverReply,
+    },
+    FriendBatch {
+        deliveries: Vec<FriendMessage>,
+    },
+    Hall {
+        message: String,
+    },
+    HallBatch {
+        messages: Vec<String>,
+    },
+    KeyedFriendBatch {
+        deliveries: Vec<UndercoverFriendDelivery>,
+    },
+    KeyedHall {
+        reply: UndercoverReply,
+    },
+    KeyedHallBatch {
+        replies: Vec<UndercoverReply>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UndercoverFriendBatchOutcome {
+    Complete,
+    Failed {
+        retryable: Vec<UndercoverFriendDelivery>,
+        failure: FriendBatchFailure,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,9 +92,13 @@ pub struct UndercoverEffectRequest {
 #[derive(Debug)]
 pub enum UndercoverEffectResult {
     FriendVerify(Result<bool>),
+    KeyedFriendVerify(Result<bool>),
     FriendBatch(Result<FriendBatchOutcome>),
+    KeyedFriendBatch(Result<UndercoverFriendBatchOutcome>),
     Hall(Result<()>),
     HallBatch(Result<()>),
+    KeyedHall(Result<()>),
+    KeyedHallBatch(Result<()>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,9 +160,16 @@ pub enum UndercoverCommandSource {
 
 pub trait UndercoverDeliveryPort {
     fn verify_friend(&self, player: &str, message: &str) -> Result<bool>;
+    fn verify_keyed_friend(&self, player: &str, reply: &UndercoverReply) -> Result<bool>;
     fn send_friend_batch(&self, deliveries: &[FriendMessage]) -> Result<FriendBatchOutcome>;
     fn send_hall(&self, message: &str) -> Result<()>;
     fn send_hall_batch(&self, messages: &[String]) -> Result<()>;
+    fn send_keyed_friend_batch(
+        &self,
+        deliveries: &[UndercoverFriendDelivery],
+    ) -> Result<UndercoverFriendBatchOutcome>;
+    fn send_keyed_hall(&self, reply: &UndercoverReply) -> Result<()>;
+    fn send_keyed_hall_batch(&self, replies: &[UndercoverReply]) -> Result<()>;
 }
 
 pub trait UndercoverRuntimePort: Send + Sync {
@@ -249,6 +291,12 @@ impl UndercoverApplication {
                         || delivery.verify_friend(&player, &message),
                     ))
                 }
+                UndercoverEffect::KeyedFriendVerify { player, reply } => {
+                    UndercoverEffectResult::KeyedFriendVerify(run_undercover_delivery(
+                        "好友模板验证",
+                        || delivery.verify_keyed_friend(&player, &reply),
+                    ))
+                }
                 UndercoverEffect::FriendBatch { deliveries } => {
                     UndercoverEffectResult::FriendBatch(run_undercover_delivery(
                         "好友私密批次发送",
@@ -263,6 +311,23 @@ impl UndercoverApplication {
                         delivery.send_hall_batch(&messages)
                     }),
                 ),
+                UndercoverEffect::KeyedFriendBatch { deliveries } => {
+                    UndercoverEffectResult::KeyedFriendBatch(run_undercover_delivery(
+                        "好友私密模板批次发送",
+                        || delivery.send_keyed_friend_batch(&deliveries),
+                    ))
+                }
+                UndercoverEffect::KeyedHall { reply } => UndercoverEffectResult::KeyedHall(
+                    run_undercover_delivery("大厅模板消息发送", || {
+                        delivery.send_keyed_hall(&reply)
+                    }),
+                ),
+                UndercoverEffect::KeyedHallBatch { replies } => {
+                    UndercoverEffectResult::KeyedHallBatch(run_undercover_delivery(
+                        "大厅模板批次发送",
+                        || delivery.send_keyed_hall_batch(&replies),
+                    ))
+                }
             };
             match self.runtime.resume(key, result)? {
                 UndercoverResume::Completed(_) => return Ok(()),
@@ -330,7 +395,7 @@ pub struct UndercoverRuntimeService {
 
 struct PendingUndercoverRetry {
     session_generation: SessionGeneration,
-    deliveries: Vec<FriendMessage>,
+    deliveries: Vec<UndercoverFriendDelivery>,
     now: Instant,
     failure: FriendBatchFailure,
 }
@@ -407,7 +472,7 @@ impl UndercoverRuntimeService {
                 return Ok(self.begin_deliveries(
                     key,
                     UndercoverEffectLane::Formal,
-                    vec![UndercoverDelivery::Hall(render_reply(
+                    vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                         &templates::DELIVERY_WAITING,
                         &ReplyVars::new(),
                     ))],
@@ -429,7 +494,7 @@ impl UndercoverRuntimeService {
                 Ok(self.begin_deliveries(
                     key,
                     UndercoverEffectLane::Formal,
-                    vec![UndercoverDelivery::Hall(status)],
+                    vec![UndercoverDelivery::KeyedHall(status)],
                     "status",
                     false,
                 ))
@@ -447,7 +512,12 @@ impl UndercoverRuntimeService {
                             ended,
                         ))
                     }
-                    Err(error) => self.begin_error(key, source, player, error.to_string()),
+                    Err(error) => self.begin_error(
+                        key,
+                        source,
+                        player,
+                        UndercoverReply::Raw(error.to_string()),
+                    ),
                 }
             }
             UndercoverCommand::End => {
@@ -460,7 +530,12 @@ impl UndercoverRuntimeService {
                         "ended",
                         true,
                     )),
-                    Err(error) => self.begin_error(key, source, player, error.to_string()),
+                    Err(error) => self.begin_error(
+                        key,
+                        source,
+                        player,
+                        UndercoverReply::Raw(error.to_string()),
+                    ),
                 }
             }
             UndercoverCommand::Retry => unreachable!("retry handled before command dispatch"),
@@ -474,7 +549,12 @@ impl UndercoverRuntimeService {
                         "described",
                         false,
                     )),
-                    Err(error) => self.begin_error(key, source, player, error.to_string()),
+                    Err(error) => self.begin_error(
+                        key,
+                        source,
+                        player,
+                        UndercoverReply::Raw(error.to_string()),
+                    ),
                 }
             }
             UndercoverCommand::Vote(position) => match self.game.vote(player, *position, now) {
@@ -488,7 +568,9 @@ impl UndercoverRuntimeService {
                         ended,
                     ))
                 }
-                Err(error) => self.begin_error(key, source, player, error.to_string()),
+                Err(error) => {
+                    self.begin_error(key, source, player, UndercoverReply::Raw(error.to_string()))
+                }
             },
             UndercoverCommand::Abstain => match self.game.abstain(player, now) {
                 Ok(deliveries) => {
@@ -501,7 +583,9 @@ impl UndercoverRuntimeService {
                         ended,
                     ))
                 }
-                Err(error) => self.begin_error(key, source, player, error.to_string()),
+                Err(error) => {
+                    self.begin_error(key, source, player, UndercoverReply::Raw(error.to_string()))
+                }
             },
         };
         self.reconcile_entertainment(entertainment);
@@ -655,7 +739,7 @@ impl UndercoverRuntimeService {
                 UndercoverEffectKey::new(operation_id, self.generation),
                 source,
                 player,
-                render_reply(&templates::ERROR_DISABLED, &ReplyVars::new()),
+                UndercoverReply::keyed(&templates::ERROR_DISABLED, &ReplyVars::new()),
             );
         }
         let mode = if matches!(command, UndercoverCommand::CreateDouble) {
@@ -670,7 +754,7 @@ impl UndercoverRuntimeService {
                     UndercoverEffectKey::new(operation_id, self.generation),
                     source,
                     player,
-                    render_reply(&templates::ERROR_ALREADY_ACTIVE, &ReplyVars::new()),
+                    UndercoverReply::keyed(&templates::ERROR_ALREADY_ACTIVE, &ReplyVars::new()),
                 );
             }
             AcquireOutcome::Occupied(kind) => {
@@ -678,7 +762,7 @@ impl UndercoverRuntimeService {
                     UndercoverEffectKey::new(operation_id, self.generation),
                     source,
                     player,
-                    render_reply(
+                    UndercoverReply::keyed(
                         &templates::ERROR_OCCUPIED,
                         &ReplyVars::new().with("玩法", kind.label()),
                     ),
@@ -691,12 +775,13 @@ impl UndercoverRuntimeService {
         };
         self.generation = next_generation;
         let key = UndercoverEffectKey::new(operation_id, self.generation);
+        let verify_vars = ReplyVars::new();
         let request = self.insert_effect(
             key,
             UndercoverEffectLane::Formal,
-            UndercoverEffect::FriendVerify {
+            UndercoverEffect::KeyedFriendVerify {
                 player: player.trim().to_string(),
-                message: render_reply(&templates::VERIFY_CREATE_OK, &ReplyVars::new()),
+                reply: UndercoverReply::keyed(&templates::VERIFY_CREATE_OK, &verify_vars),
             },
             UndercoverContinuation::VerifyCreate {
                 player: player.trim().to_string(),
@@ -722,7 +807,7 @@ impl UndercoverRuntimeService {
                 key,
                 source,
                 player,
-                render_reply(&templates::ERROR_NO_LOBBY, &ReplyVars::new()),
+                UndercoverReply::keyed(&templates::ERROR_NO_LOBBY, &ReplyVars::new()),
             );
         }
         if !self.game.is_lobby() {
@@ -730,7 +815,7 @@ impl UndercoverRuntimeService {
                 key,
                 source,
                 player,
-                render_reply(&templates::ERROR_ALREADY_STARTED, &ReplyVars::new()),
+                UndercoverReply::keyed(&templates::ERROR_ALREADY_STARTED, &ReplyVars::new()),
             );
         }
         if self.game.lobby_contains(player) {
@@ -738,15 +823,16 @@ impl UndercoverRuntimeService {
                 key,
                 source,
                 player,
-                render_reply(&templates::ERROR_ALREADY_JOINED, &ReplyVars::new()),
+                UndercoverReply::keyed(&templates::ERROR_ALREADY_JOINED, &ReplyVars::new()),
             );
         }
+        let verify_vars = ReplyVars::new();
         let request = self.insert_effect(
             key,
             UndercoverEffectLane::Formal,
-            UndercoverEffect::FriendVerify {
+            UndercoverEffect::KeyedFriendVerify {
                 player: player.trim().to_string(),
-                message: render_reply(&templates::VERIFY_JOIN_OK, &ReplyVars::new()),
+                reply: UndercoverReply::keyed(&templates::VERIFY_JOIN_OK, &verify_vars),
             },
             UndercoverContinuation::VerifyJoin {
                 player: player.trim().to_string(),
@@ -769,29 +855,41 @@ impl UndercoverRuntimeService {
             .game
             .authorize_start((source != UndercoverCommandSource::Console).then_some(player))
         {
-            return self.begin_error(key, source, player, error.to_string());
+            return self.begin_error(key, source, player, UndercoverReply::Raw(error.to_string()));
         }
         let words = match self.bank.consume_random(random_seed()) {
             Ok(words) => words,
-            Err(error) => return self.begin_error(key, source, player, error.to_string()),
+            Err(error) => {
+                return self.begin_error(
+                    key,
+                    source,
+                    player,
+                    UndercoverReply::Raw(error.to_string()),
+                );
+            }
         };
         let deliveries = match self.game.start(words, now) {
             Ok(deliveries) => deliveries,
-            Err(error) => return self.begin_error(key, source, player, error.to_string()),
+            Err(error) => {
+                return self.begin_error(
+                    key,
+                    source,
+                    player,
+                    UndercoverReply::Raw(error.to_string()),
+                );
+            }
         };
         let secrets = deliveries
             .into_iter()
             .filter_map(|delivery| match delivery {
-                UndercoverDelivery::Friend { player, message } => {
-                    Some(FriendMessage::new(player, message))
-                }
+                UndercoverDelivery::KeyedFriend(delivery) => Some(delivery),
                 _ => None,
             })
             .collect::<Vec<_>>();
         let request = self.insert_effect(
             key,
             UndercoverEffectLane::Formal,
-            UndercoverEffect::FriendBatch {
+            UndercoverEffect::KeyedFriendBatch {
                 deliveries: secrets,
             },
             UndercoverContinuation::DeliverSecrets { now },
@@ -810,12 +908,31 @@ impl UndercoverRuntimeService {
                 key,
                 source,
                 player,
-                render_reply(&templates::REVEAL_FRIEND_ONLY, &ReplyVars::new()),
+                UndercoverReply::keyed(&templates::REVEAL_FRIEND_ONLY, &ReplyVars::new()),
             );
         }
         match self.game.reveal(player) {
-            Ok(lines) => Ok(self.begin_friend_batch(key, player, lines, "revealed")),
-            Err(error) => self.begin_error(key, source, player, error.to_string()),
+            Ok(lines) => {
+                let deliveries = lines
+                    .into_iter()
+                    .map(|reply| UndercoverFriendDelivery::new(player.trim(), reply))
+                    .collect::<Vec<_>>();
+                let request = self.insert_effect(
+                    key,
+                    UndercoverEffectLane::Formal,
+                    UndercoverEffect::KeyedFriendBatch { deliveries },
+                    UndercoverContinuation::Deliveries {
+                        remaining: VecDeque::new(),
+                        lane: UndercoverEffectLane::Formal,
+                        action: "revealed",
+                        ended: false,
+                    },
+                );
+                Ok(UndercoverCommandStart::Suspended(request))
+            }
+            Err(error) => {
+                self.begin_error(key, source, player, UndercoverReply::Raw(error.to_string()))
+            }
         }
     }
 
@@ -832,10 +949,15 @@ impl UndercoverRuntimeService {
                 source,
                 now,
             } => match result {
-                UndercoverEffectResult::FriendVerify(Ok(true)) => {
+                UndercoverEffectResult::KeyedFriendVerify(Ok(true)) => {
                     if let Err(error) = self.game.create(&player, mode, now) {
                         return self
-                            .begin_error(key, source, &player, error.to_string())
+                            .begin_error(
+                                key,
+                                source,
+                                &player,
+                                UndercoverReply::Raw(error.to_string()),
+                            )
                             .map(|start| match start {
                                 UndercoverCommandStart::Completed(completion) => {
                                     UndercoverResume::Completed(completion)
@@ -848,23 +970,24 @@ impl UndercoverRuntimeService {
                     let status = self.game.status(&player, now);
                     Ok(self.resume_with_deliveries(
                         key,
-                        vec![UndercoverDelivery::Hall(status)],
+                        vec![UndercoverDelivery::KeyedHall(status)],
                         UndercoverEffectLane::Formal,
                         "created",
                         false,
                     ))
                 }
-                UndercoverEffectResult::FriendVerify(Ok(false)) => Ok(self.resume_with_deliveries(
-                    key,
-                    vec![UndercoverDelivery::Hall(render_reply(
-                        &templates::VERIFY_FAILED,
-                        &ReplyVars::new(),
-                    ))],
-                    UndercoverEffectLane::Formal,
-                    "verification-rejected",
-                    false,
-                )),
-                UndercoverEffectResult::FriendVerify(Err(error)) => Err(error),
+                UndercoverEffectResult::KeyedFriendVerify(Ok(false)) => Ok(self
+                    .resume_with_deliveries(
+                        key,
+                        vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
+                            &templates::VERIFY_FAILED,
+                            &ReplyVars::new(),
+                        ))],
+                        UndercoverEffectLane::Formal,
+                        "verification-rejected",
+                        false,
+                    )),
+                UndercoverEffectResult::KeyedFriendVerify(Err(error)) => Err(error),
                 _ => unreachable!("effect result checked before resume"),
             },
             UndercoverContinuation::VerifyJoin {
@@ -872,7 +995,7 @@ impl UndercoverRuntimeService {
                 source,
                 now,
             } => match result {
-                UndercoverEffectResult::FriendVerify(Ok(true)) => {
+                UndercoverEffectResult::KeyedFriendVerify(Ok(true)) => {
                     let outcome = self.game.join(&player, now);
                     match outcome {
                         Ok(()) if self.game.lobby_is_full() => self
@@ -889,14 +1012,19 @@ impl UndercoverRuntimeService {
                             let status = self.game.status(&player, now);
                             Ok(self.resume_with_deliveries(
                                 key,
-                                vec![UndercoverDelivery::Hall(status)],
+                                vec![UndercoverDelivery::KeyedHall(status)],
                                 UndercoverEffectLane::Formal,
                                 "joined",
                                 false,
                             ))
                         }
                         Err(error) => self
-                            .begin_error(key, source, &player, error.to_string())
+                            .begin_error(
+                                key,
+                                source,
+                                &player,
+                                UndercoverReply::Raw(error.to_string()),
+                            )
                             .map(|start| match start {
                                 UndercoverCommandStart::Completed(completion) => {
                                     UndercoverResume::Completed(completion)
@@ -907,21 +1035,24 @@ impl UndercoverRuntimeService {
                             }),
                     }
                 }
-                UndercoverEffectResult::FriendVerify(Ok(false)) => Ok(self.resume_with_deliveries(
-                    key,
-                    vec![UndercoverDelivery::Hall(render_reply(
-                        &templates::VERIFY_FAILED,
-                        &ReplyVars::new(),
-                    ))],
-                    UndercoverEffectLane::Formal,
-                    "verification-rejected",
-                    false,
-                )),
-                UndercoverEffectResult::FriendVerify(Err(error)) => Err(error),
+                UndercoverEffectResult::KeyedFriendVerify(Ok(false)) => Ok(self
+                    .resume_with_deliveries(
+                        key,
+                        vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
+                            &templates::VERIFY_FAILED,
+                            &ReplyVars::new(),
+                        ))],
+                        UndercoverEffectLane::Formal,
+                        "verification-rejected",
+                        false,
+                    )),
+                UndercoverEffectResult::KeyedFriendVerify(Err(error)) => Err(error),
                 _ => unreachable!("effect result checked before resume"),
             },
             UndercoverContinuation::DeliverSecrets { now } => match result {
-                UndercoverEffectResult::FriendBatch(Ok(FriendBatchOutcome::Complete)) => {
+                UndercoverEffectResult::KeyedFriendBatch(Ok(
+                    UndercoverFriendBatchOutcome::Complete,
+                )) => {
                     self.pending_retry = None;
                     let opening = self.game.complete_delivery(now)?;
                     Ok(self.resume_with_deliveries(
@@ -932,19 +1063,19 @@ impl UndercoverRuntimeService {
                         false,
                     ))
                 }
-                UndercoverEffectResult::FriendBatch(Ok(FriendBatchOutcome::Failed {
-                    retryable,
-                    failure,
-                })) => Ok(self.pause_secret_delivery(key, retryable, now, failure)),
-                UndercoverEffectResult::FriendBatch(Err(error)) => Ok(self.pause_secret_delivery(
-                    key,
-                    Vec::new(),
-                    now,
-                    FriendBatchFailure::new(
-                        FriendBatchFailureKind::ResultUnknown,
-                        format!("谁是卧底私聊投递执行异常: {error:#}"),
-                    ),
-                )),
+                UndercoverEffectResult::KeyedFriendBatch(Ok(
+                    UndercoverFriendBatchOutcome::Failed { retryable, failure },
+                )) => Ok(self.pause_secret_delivery(key, retryable, now, failure)),
+                UndercoverEffectResult::KeyedFriendBatch(Err(error)) => Ok(self
+                    .pause_secret_delivery(
+                        key,
+                        Vec::new(),
+                        now,
+                        FriendBatchFailure::new(
+                            FriendBatchFailureKind::ResultUnknown,
+                            format!("谁是卧底私聊投递执行异常: {error:#}"),
+                        ),
+                    )),
                 _ => unreachable!("effect result checked before resume"),
             },
             UndercoverContinuation::Deliveries {
@@ -955,7 +1086,12 @@ impl UndercoverRuntimeService {
             } => match result {
                 UndercoverEffectResult::FriendBatch(Ok(FriendBatchOutcome::Complete))
                 | UndercoverEffectResult::Hall(Ok(()))
-                | UndercoverEffectResult::HallBatch(Ok(())) => {
+                | UndercoverEffectResult::HallBatch(Ok(()))
+                | UndercoverEffectResult::KeyedFriendBatch(Ok(
+                    UndercoverFriendBatchOutcome::Complete,
+                ))
+                | UndercoverEffectResult::KeyedHall(Ok(()))
+                | UndercoverEffectResult::KeyedHallBatch(Ok(())) => {
                     if let Some(next) = remaining.pop_front() {
                         let request = self.begin_effect(
                             key,
@@ -982,21 +1118,28 @@ impl UndercoverRuntimeService {
                 UndercoverEffectResult::FriendBatch(Ok(FriendBatchOutcome::Failed {
                     failure,
                     ..
-                })) => {
+                }))
+                | UndercoverEffectResult::KeyedFriendBatch(Ok(
+                    UndercoverFriendBatchOutcome::Failed { failure, .. },
+                )) => {
                     if ended {
                         self.finish_session();
                     }
                     bail!("谁是卧底好友消息发送失败：{}", failure.reason())
                 }
                 UndercoverEffectResult::FriendBatch(Err(error))
+                | UndercoverEffectResult::KeyedFriendBatch(Err(error))
                 | UndercoverEffectResult::Hall(Err(error))
-                | UndercoverEffectResult::HallBatch(Err(error)) => {
+                | UndercoverEffectResult::HallBatch(Err(error))
+                | UndercoverEffectResult::KeyedHall(Err(error))
+                | UndercoverEffectResult::KeyedHallBatch(Err(error)) => {
                     if ended {
                         self.finish_session();
                     }
                     Err(error)
                 }
-                UndercoverEffectResult::FriendVerify(_) => {
+                UndercoverEffectResult::FriendVerify(_)
+                | UndercoverEffectResult::KeyedFriendVerify(_) => {
                     unreachable!("effect result checked before resume")
                 }
             },
@@ -1071,7 +1214,9 @@ impl UndercoverRuntimeService {
     ) -> UndercoverCommandStart {
         let deliveries = messages
             .into_iter()
-            .map(|message| FriendMessage::new(player.trim(), message))
+            .map(|message| {
+                UndercoverFriendDelivery::new(player.trim(), UndercoverReply::Raw(message))
+            })
             .collect::<Vec<_>>();
         if deliveries.is_empty() {
             return UndercoverCommandStart::Completed(UndercoverCompletion {
@@ -1082,7 +1227,7 @@ impl UndercoverRuntimeService {
         let request = self.insert_effect(
             key,
             UndercoverEffectLane::Formal,
-            UndercoverEffect::FriendBatch { deliveries },
+            UndercoverEffect::KeyedFriendBatch { deliveries },
             UndercoverContinuation::Deliveries {
                 remaining: VecDeque::new(),
                 lane: UndercoverEffectLane::Formal,
@@ -1135,14 +1280,14 @@ impl UndercoverRuntimeService {
         key: UndercoverEffectKey,
         source: UndercoverCommandSource,
         player: &str,
-        message: String,
+        reply: UndercoverReply,
     ) -> Result<UndercoverCommandStart> {
         let effect = if source == UndercoverCommandSource::Friend {
-            UndercoverEffect::FriendBatch {
-                deliveries: vec![FriendMessage::new(player.trim(), message)],
+            UndercoverEffect::KeyedFriendBatch {
+                deliveries: vec![UndercoverFriendDelivery::new(player.trim(), reply)],
             }
         } else {
-            UndercoverEffect::Hall { message }
+            UndercoverEffect::KeyedHall { reply }
         };
         Ok(UndercoverCommandStart::Suspended(self.insert_effect(
             key,
@@ -1162,7 +1307,7 @@ impl UndercoverRuntimeService {
             return self.begin_deliveries(
                 key,
                 UndercoverEffectLane::Formal,
-                vec![UndercoverDelivery::Hall(render_reply(
+                vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                     &templates::RETRY_NONE,
                     &ReplyVars::new(),
                 ))],
@@ -1174,7 +1319,7 @@ impl UndercoverRuntimeService {
             return self.begin_deliveries(
                 key,
                 UndercoverEffectLane::Formal,
-                vec![UndercoverDelivery::Hall(render_reply(
+                vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                     &templates::RETRY_EXPIRED,
                     &ReplyVars::new(),
                 ))],
@@ -1188,7 +1333,7 @@ impl UndercoverRuntimeService {
             return self.begin_deliveries(
                 key,
                 UndercoverEffectLane::Formal,
-                vec![UndercoverDelivery::Hall(render_reply(
+                vec![UndercoverDelivery::KeyedHall(UndercoverReply::keyed(
                     &templates::RETRY_UNSAFE,
                     &ReplyVars::new().with("原因", reason),
                 ))],
@@ -1196,7 +1341,7 @@ impl UndercoverRuntimeService {
                 false,
             );
         }
-        let effect = UndercoverEffect::FriendBatch {
+        let effect = UndercoverEffect::KeyedFriendBatch {
             deliveries: retry.deliveries.clone(),
         };
         UndercoverCommandStart::Suspended(self.insert_effect(
@@ -1210,7 +1355,7 @@ impl UndercoverRuntimeService {
     fn pause_secret_delivery(
         &mut self,
         key: UndercoverEffectKey,
-        retryable: Vec<FriendMessage>,
+        retryable: Vec<UndercoverFriendDelivery>,
         now: Instant,
         failure: FriendBatchFailure,
     ) -> UndercoverResume {
@@ -1220,17 +1365,17 @@ impl UndercoverRuntimeService {
             failure.kind(),
             failure.reason()
         );
-        let message = if retryable.is_empty() {
+        let reply = if retryable.is_empty() {
             match failure.kind() {
                 FriendBatchFailureKind::ResultUnknown => {
-                    render_reply(&templates::DELIVERY_RESULT_UNKNOWN, &ReplyVars::new())
+                    UndercoverReply::keyed(&templates::DELIVERY_RESULT_UNKNOWN, &ReplyVars::new())
                 }
                 FriendBatchFailureKind::ConfirmedUnsent => {
-                    render_reply(&templates::DELIVERY_NO_SAFE, &ReplyVars::new())
+                    UndercoverReply::keyed(&templates::DELIVERY_NO_SAFE, &ReplyVars::new())
                 }
             }
         } else {
-            render_reply(&templates::DELIVERY_INCOMPLETE, &ReplyVars::new())
+            UndercoverReply::keyed(&templates::DELIVERY_INCOMPLETE, &ReplyVars::new())
         };
         self.pending_retry = Some(PendingUndercoverRetry {
             session_generation: key.session_generation,
@@ -1240,7 +1385,7 @@ impl UndercoverRuntimeService {
         });
         self.resume_with_deliveries(
             key,
-            vec![UndercoverDelivery::Hall(message)],
+            vec![UndercoverDelivery::KeyedHall(reply)],
             UndercoverEffectLane::Formal,
             "secret-delivery-paused",
             false,
@@ -1281,6 +1426,15 @@ fn delivery_effect(delivery: &UndercoverDelivery) -> UndercoverEffect {
         UndercoverDelivery::Friend { player, message } => UndercoverEffect::FriendBatch {
             deliveries: vec![FriendMessage::new(player, message)],
         },
+        UndercoverDelivery::KeyedHall(reply) => UndercoverEffect::KeyedHall {
+            reply: reply.clone(),
+        },
+        UndercoverDelivery::KeyedHallBatch(replies) => UndercoverEffect::KeyedHallBatch {
+            replies: replies.clone(),
+        },
+        UndercoverDelivery::KeyedFriend(delivery) => UndercoverEffect::KeyedFriendBatch {
+            deliveries: vec![delivery.clone()],
+        },
     }
 }
 
@@ -1291,6 +1445,9 @@ fn effect_accepts(effect: &UndercoverEffect, result: &UndercoverEffectResult) ->
             UndercoverEffect::FriendVerify { .. },
             UndercoverEffectResult::FriendVerify(_)
         ) | (
+            UndercoverEffect::KeyedFriendVerify { .. },
+            UndercoverEffectResult::KeyedFriendVerify(_)
+        ) | (
             UndercoverEffect::FriendBatch { .. },
             UndercoverEffectResult::FriendBatch(_)
         ) | (
@@ -1299,6 +1456,15 @@ fn effect_accepts(effect: &UndercoverEffect, result: &UndercoverEffectResult) ->
         ) | (
             UndercoverEffect::HallBatch { .. },
             UndercoverEffectResult::HallBatch(_)
+        ) | (
+            UndercoverEffect::KeyedFriendBatch { .. },
+            UndercoverEffectResult::KeyedFriendBatch(_)
+        ) | (
+            UndercoverEffect::KeyedHall { .. },
+            UndercoverEffectResult::KeyedHall(_)
+        ) | (
+            UndercoverEffect::KeyedHallBatch { .. },
+            UndercoverEffectResult::KeyedHallBatch(_)
         )
     )
 }
@@ -1366,7 +1532,7 @@ mod runtime_tests {
             .resume(
                 entertainment,
                 verification.key,
-                UndercoverEffectResult::FriendVerify(Ok(true)),
+                UndercoverEffectResult::KeyedFriendVerify(Ok(true)),
             )
             .expect("resume verification")
         {
@@ -1379,7 +1545,7 @@ mod runtime_tests {
                 .resume(
                     entertainment,
                     hall.key,
-                    UndercoverEffectResult::Hall(Ok(())),
+                    UndercoverEffectResult::KeyedHall(Ok(())),
                 )
                 .expect("resume lobby status"),
             UndercoverResume::Completed(_)
@@ -1422,13 +1588,13 @@ mod runtime_tests {
         let UndercoverCommandStart::Suspended(request) = start else {
             panic!("start should wait for secret delivery");
         };
-        let UndercoverEffect::FriendBatch { deliveries } = request.effect else {
+        let UndercoverEffect::KeyedFriendBatch { deliveries } = request.effect else {
             panic!("all secrets should share one friend batch");
         };
 
         let mut recipients = deliveries
             .iter()
-            .map(|delivery| delivery.recipient())
+            .map(|delivery| delivery.recipient.as_str())
             .collect::<Vec<_>>();
         recipients.sort_unstable();
         assert_eq!(recipients, ["丁", "丙", "乙", "甲"]);
@@ -1436,7 +1602,8 @@ mod runtime_tests {
             let position = (b'A' + index as u8) as char;
             assert!(
                 delivery
-                    .message()
+                    .reply
+                    .render_default()
                     .contains(&format!("你的位置：{position}"))
             );
         }
@@ -1479,7 +1646,7 @@ mod runtime_tests {
         let UndercoverCommandStart::Suspended(batch) = start else {
             panic!("start should wait for secret delivery");
         };
-        let UndercoverEffect::FriendBatch { deliveries } = &batch.effect else {
+        let UndercoverEffect::KeyedFriendBatch { deliveries } = &batch.effect else {
             panic!("secrets should use one friend batch");
         };
         let safe_remainder = deliveries.last().expect("four deliveries").clone();
@@ -1488,13 +1655,15 @@ mod runtime_tests {
             .resume(
                 &mut entertainment,
                 batch.key,
-                UndercoverEffectResult::FriendBatch(Ok(FriendBatchOutcome::Failed {
-                    retryable: vec![safe_remainder.clone()],
-                    failure: FriendBatchFailure::new(
-                        FriendBatchFailureKind::ConfirmedUnsent,
-                        "friend row was not found",
-                    ),
-                })),
+                UndercoverEffectResult::KeyedFriendBatch(Ok(
+                    UndercoverFriendBatchOutcome::Failed {
+                        retryable: vec![safe_remainder.clone()],
+                        failure: FriendBatchFailure::new(
+                            FriendBatchFailureKind::ConfirmedUnsent,
+                            "friend row was not found",
+                        ),
+                    },
+                )),
             )
             .expect("pause failed batch")
         {
@@ -1503,8 +1672,8 @@ mod runtime_tests {
         };
         assert!(matches!(
             &notice.effect,
-            UndercoverEffect::Hall { message }
-                if message.contains("#重试") && message.contains("#结束")
+            UndercoverEffect::KeyedHall { reply: message }
+                if message.render_default().contains("#重试") && message.render_default().contains("#结束")
         ));
         service.claim(notice.key).expect("claim retry notice");
         assert!(matches!(
@@ -1512,7 +1681,7 @@ mod runtime_tests {
                 .resume(
                     &mut entertainment,
                     notice.key,
-                    UndercoverEffectResult::Hall(Ok(())),
+                    UndercoverEffectResult::KeyedHall(Ok(())),
                 )
                 .expect("resume retry notice"),
             UndercoverResume::Completed(_)
@@ -1533,7 +1702,7 @@ mod runtime_tests {
         };
         assert_eq!(
             retry.effect,
-            UndercoverEffect::FriendBatch {
+            UndercoverEffect::KeyedFriendBatch {
                 deliveries: vec![safe_remainder]
             }
         );
@@ -1558,10 +1727,10 @@ mod runtime_tests {
 
         assert!(matches!(
         request.effect,
-        UndercoverEffect::FriendBatch { ref deliveries }
+        UndercoverEffect::KeyedFriendBatch { ref deliveries }
             if deliveries.len() == 1
-                && deliveries[0].recipient() == "甲"
-                && deliveries[0].message().contains("当前没有谁是卧底报名房间")
+                && deliveries[0].recipient.as_str() == "甲"
+                && deliveries[0].reply.render_default().contains("当前没有谁是卧底报名房间")
         ));
     }
 
@@ -1606,7 +1775,9 @@ mod runtime_tests {
             .resume(
                 &mut entertainment,
                 secret_batch.key,
-                UndercoverEffectResult::FriendBatch(Ok(FriendBatchOutcome::Complete)),
+                UndercoverEffectResult::KeyedFriendBatch(Ok(
+                    UndercoverFriendBatchOutcome::Complete,
+                )),
             )
             .expect("resume secret batch")
         {
@@ -1621,7 +1792,7 @@ mod runtime_tests {
                 .resume(
                     &mut entertainment,
                     opening.key,
-                    UndercoverEffectResult::HallBatch(Ok(())),
+                    UndercoverEffectResult::KeyedHallBatch(Ok(())),
                 )
                 .expect("resume opening announcement"),
             UndercoverResume::Completed(_)
@@ -1642,18 +1813,18 @@ mod runtime_tests {
         let UndercoverCommandStart::Suspended(reveal_request) = reveal else {
             panic!("reveal should wait for friend delivery");
         };
-        let UndercoverEffect::FriendBatch { deliveries } = &reveal_request.effect else {
+        let UndercoverEffect::KeyedFriendBatch { deliveries } = &reveal_request.effect else {
             panic!("reveal must use a friend batch");
         };
         assert_eq!(deliveries.len(), 1);
         assert!(
             deliveries
                 .iter()
-                .all(|delivery| delivery.recipient() == "旁观者")
+                .all(|delivery| delivery.recipient.as_str() == "旁观者")
         );
         let reveal_text = deliveries
             .iter()
-            .map(|delivery| delivery.message())
+            .map(|delivery| delivery.reply.render_default())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(reveal_text.contains("平民词:苹果"));
@@ -1675,7 +1846,9 @@ mod runtime_tests {
                 .resume(
                     &mut entertainment,
                     reveal_request.key,
-                    UndercoverEffectResult::FriendBatch(Ok(FriendBatchOutcome::Complete)),
+                    UndercoverEffectResult::KeyedFriendBatch(Ok(
+                        UndercoverFriendBatchOutcome::Complete
+                    )),
                 )
                 .expect("resume reveal delivery"),
             UndercoverResume::Completed(UndercoverCompletion {
@@ -1699,10 +1872,10 @@ mod runtime_tests {
         };
         assert!(matches!(
             member_error.effect,
-            UndercoverEffect::FriendBatch { ref deliveries }
+            UndercoverEffect::KeyedFriendBatch { ref deliveries }
                 if deliveries.len() == 1
-                    && deliveries[0].recipient() == "甲"
-                    && deliveries[0].message().contains("对局玩家不能使用#谜底")
+                    && deliveries[0].recipient.as_str() == "甲"
+                    && deliveries[0].reply.render_default().contains("对局玩家不能使用#谜底")
         ));
 
         let hall_reveal = service
@@ -1720,8 +1893,8 @@ mod runtime_tests {
         };
         assert!(matches!(
             hall_error.effect,
-            UndercoverEffect::Hall { ref message }
-                if message.contains("只能通过好友私聊使用")
+            UndercoverEffect::KeyedHall { reply: ref message }
+                if message.render_default().contains("只能通过好友私聊使用")
         ));
     }
 
@@ -1744,7 +1917,7 @@ mod runtime_tests {
         };
         assert!(matches!(
             verification.effect,
-            UndercoverEffect::FriendVerify { .. }
+            UndercoverEffect::KeyedFriendVerify { .. }
         ));
         assert_eq!(
             service.claim(verification.key).expect("claim verification"),
@@ -1754,20 +1927,20 @@ mod runtime_tests {
             .resume(
                 &mut entertainment,
                 verification.key,
-                UndercoverEffectResult::FriendVerify(Ok(true)),
+                UndercoverEffectResult::KeyedFriendVerify(Ok(true)),
             )
             .expect("resume verification")
         {
             UndercoverResume::Suspended(request) => request,
             other => panic!("expected status delivery, got {other:?}"),
         };
-        assert!(matches!(hall.effect, UndercoverEffect::Hall { .. }));
+        assert!(matches!(hall.effect, UndercoverEffect::KeyedHall { .. }));
         service.claim(hall.key).expect("claim status");
         let completed = service
             .resume(
                 &mut entertainment,
                 hall.key,
-                UndercoverEffectResult::Hall(Ok(())),
+                UndercoverEffectResult::KeyedHall(Ok(())),
             )
             .expect("resume status");
         assert!(matches!(completed, UndercoverResume::Completed(_)));
@@ -1802,7 +1975,7 @@ mod runtime_tests {
             .resume(
                 &mut entertainment,
                 verification.key,
-                UndercoverEffectResult::FriendVerify(Ok(true)),
+                UndercoverEffectResult::KeyedFriendVerify(Ok(true)),
             )
             .expect("resume verification")
         {
@@ -1814,7 +1987,7 @@ mod runtime_tests {
             .resume(
                 &mut entertainment,
                 hall.key,
-                UndercoverEffectResult::Hall(Ok(())),
+                UndercoverEffectResult::KeyedHall(Ok(())),
             )
             .expect("resume status");
 
@@ -1834,7 +2007,7 @@ mod runtime_tests {
         assert_eq!(outcome.action(), "timed-settlement");
         assert!(matches!(
             outcome.into_request().effect,
-            UndercoverEffect::Hall { .. }
+            UndercoverEffect::KeyedHall { .. }
         ));
     }
 
@@ -1860,7 +2033,7 @@ mod runtime_tests {
             .resume(
                 &mut entertainment,
                 verification.key,
-                UndercoverEffectResult::FriendVerify(Ok(true)),
+                UndercoverEffectResult::KeyedFriendVerify(Ok(true)),
             )
             .expect("resume verification")
         {
@@ -1872,7 +2045,7 @@ mod runtime_tests {
             .resume(
                 &mut entertainment,
                 hall.key,
-                UndercoverEffectResult::Hall(Ok(())),
+                UndercoverEffectResult::KeyedHall(Ok(())),
             )
             .expect("resume status");
 

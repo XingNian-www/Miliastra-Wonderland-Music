@@ -118,13 +118,10 @@ impl CommandSpec {
                 crate::features::chat_text::parse_prefixed_command(text, name, allows_argument)
                     .is_some()
             }
-            CommandMatch::Compact => {
-                crate::features::chat_text::compact_command(text) == name
-            }
+            CommandMatch::Compact => crate::features::chat_text::compact_command(text) == name,
         }
     }
 }
-
 
 /// 全部已登记命令（按分组顺序拼接）。
 ///
@@ -156,7 +153,9 @@ pub(crate) struct SessionDispatch {
     /// 返回完整的匹配结果而非裸命令：路由需要 `matched`/`raw` 参与命令锁与日志。
     pub(crate) parse: fn(
         &crate::features::command::CommandEnvelope,
-    ) -> Option<crate::features::command::FeatureCommandMatch<crate::features::command::ModuleCommand>>,
+    ) -> Option<
+        crate::features::command::FeatureCommandMatch<crate::features::command::ModuleCommand>,
+    >,
 
     /// 会话内是否接受**任意**文本（由玩法自己兜底解释）。
     ///
@@ -175,8 +174,8 @@ pub(crate) struct SessionDispatch {
 // 命令登记数据
 // ---------------------------------------------------------------------------
 
-use crate::features::command::CommandPrefix::{At, Hash};
 use crate::features::command::CommandAuthority::{Friend, HallMember};
+use crate::features::command::CommandPrefix::{At, Hash};
 
 const BOTH: &[CommandAuthority] = &[HallMember, Friend];
 const HALL_ONLY: &[CommandAuthority] = &[HallMember];
@@ -191,7 +190,9 @@ pub(crate) const SONG: &[CommandSpec] = &[
         name: "点歌",
         aliases: &["AI点歌", "QQ点歌", "网易点歌", "网易云点歌", "酷狗点歌"],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Song,
         authorities: HALL_ONLY,
         summary: "按歌名点歌，可用前缀指定音源",
@@ -202,7 +203,9 @@ pub(crate) const SONG: &[CommandSpec] = &[
         name: "搜索",
         aliases: &["AI搜索", "QQ搜索", "网易搜索"],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Song,
         authorities: HALL_ONLY,
         summary: "只搜索不点播，返回候选",
@@ -211,9 +214,18 @@ pub(crate) const SONG: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "点歌",
-        aliases: &["AI点歌", "QQ点歌", "网易点歌", "网易云点歌", "酷狗点歌", "B站点歌"],
+        aliases: &[
+            "AI点歌",
+            "QQ点歌",
+            "网易点歌",
+            "网易云点歌",
+            "酷狗点歌",
+            "B站点歌",
+        ],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Song,
         authorities: FRIEND_ONLY,
         summary: "好友点歌，额外支持 B 站音源",
@@ -224,7 +236,9 @@ pub(crate) const SONG: &[CommandSpec] = &[
         name: "搜索",
         aliases: &["AI搜索", "QQ搜索", "网易搜索", "B站搜索"],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Song,
         authorities: FRIEND_ONLY,
         summary: "好友搜索，额外支持 B 站音源",
@@ -317,7 +331,9 @@ pub(crate) const PLAYBACK: &[CommandSpec] = &[
         name: "音量",
         aliases: &[],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Playback,
         authorities: HALL_ONLY,
         summary: "设置音量",
@@ -354,7 +370,9 @@ pub(crate) const PLAYBACK: &[CommandSpec] = &[
         name: "队列删除",
         aliases: &[],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Playback,
         authorities: HALL_ONLY,
         summary: "从队列删除指定序号",
@@ -378,7 +396,9 @@ pub(crate) const PLAYBACK: &[CommandSpec] = &[
         name: "歌词",
         aliases: &[],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Playback,
         authorities: HALL_ONLY,
         summary: "发送歌词",
@@ -551,7 +571,9 @@ pub(crate) const ADMINISTRATION: &[CommandSpec] = &[
         name: "值守模式",
         aliases: &[],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Administration,
         authorities: FRIEND_ONLY,
         summary: "切换聊天值守模式",
@@ -588,7 +610,9 @@ pub(crate) const ADMINISTRATION: &[CommandSpec] = &[
         name: "闲置退出",
         aliases: &[],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Administration,
         authorities: FRIEND_ONLY,
         summary: "设置闲置退出分钟数",
@@ -603,7 +627,9 @@ pub(crate) const ENTERTAINMENT_START: &[CommandSpec] = &[
         name: "塔罗牌",
         aliases: &["塔罗牌AI", "塔罗牌ai"],
         prefix: Hash,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Entertainment,
         authorities: HALL_ONLY,
         summary: "抽当天塔罗三张，带问题自动 AI 解读",
@@ -614,7 +640,9 @@ pub(crate) const ENTERTAINMENT_START: &[CommandSpec] = &[
         name: "塔罗牌重抽",
         aliases: &[],
         prefix: Hash,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Entertainment,
         authorities: HALL_ONLY,
         summary: "提前换一组塔罗牌",
@@ -638,7 +666,9 @@ pub(crate) const ENTERTAINMENT_START: &[CommandSpec] = &[
         name: "接龙",
         aliases: &[],
         prefix: Hash,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Entertainment,
         authorities: HALL_ONLY,
         summary: "随机开局成语接龙",
@@ -649,7 +679,9 @@ pub(crate) const ENTERTAINMENT_START: &[CommandSpec] = &[
         name: "同音接龙",
         aliases: &[],
         prefix: Hash,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Entertainment,
         authorities: HALL_ONLY,
         summary: "同音模式开局成语接龙",
@@ -875,7 +907,9 @@ pub(crate) const PLAYLIST: &[CommandSpec] = &[
         name: "导入QQ歌单",
         aliases: &["导入网易歌单", "导入网易云歌单"],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Song,
         authorities: FRIEND_ONLY,
         summary: "按分享链接导入歌单",
@@ -893,7 +927,9 @@ pub(crate) const FRIEND_MISC: &[CommandSpec] = &[
         name: "邀请",
         aliases: &[],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Administration,
         authorities: FRIEND_ONLY,
         summary: "邀请好友进入大厅",
@@ -904,7 +940,9 @@ pub(crate) const FRIEND_MISC: &[CommandSpec] = &[
         name: "拉黑",
         aliases: &["拉黑UID"],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Administration,
         authorities: FRIEND_ONLY,
         summary: "拉黑指定 UID",
@@ -915,7 +953,9 @@ pub(crate) const FRIEND_MISC: &[CommandSpec] = &[
         name: "屏蔽",
         aliases: &["屏蔽UID"],
         prefix: At,
-        match_rule: CommandMatch::Prefix { allows_argument: true },
+        match_rule: CommandMatch::Prefix {
+            allows_argument: true,
+        },
         group: CommandGroup::Administration,
         authorities: FRIEND_ONLY,
         summary: "屏蔽指定 UID",
@@ -926,8 +966,7 @@ pub(crate) const FRIEND_MISC: &[CommandSpec] = &[
 
 /// 全部静态命令（不含会话态命令）。
 pub(crate) fn static_commands() -> impl Iterator<Item = &'static CommandSpec> {
-    SONG
-        .iter()
+    SONG.iter()
         .chain(PLAYBACK.iter())
         .chain(HALL.iter())
         .chain(ADMINISTRATION.iter())
@@ -1006,7 +1045,9 @@ pub(crate) const SESSION_DISPATCH: &[SessionDispatch] = &[
         // 大厅成员发任何 # 文本都会进入卧底的 parse_active 分支，但解析器只接受固定动作，
         // 因此这里如实标为 false（不兜底）。
         open_ended: false,
-        keywords: &["开局", "状态", "退出", "结束", "重试", "内容", "加入", "弃权", "谜底"],
+        keywords: &[
+            "开局", "状态", "退出", "结束", "重试", "内容", "加入", "弃权", "谜底",
+        ],
         label: "谁是卧底",
     },
 ];
@@ -1031,7 +1072,6 @@ pub(crate) fn session_rules(
         .count();
     &SESSION_DISPATCH[start..start + len]
 }
-
 
 // ---------------------------------------------------------------------------
 // 面板数据：把注册表序列化成 /commands/catalog 的响应
@@ -1119,7 +1159,10 @@ pub(crate) fn catalog_view(commands_enabled: bool) -> CommandCatalogView {
             hidden: spec.hidden,
             enabled,
         };
-        match groups.iter_mut().find(|group| group.name == spec.group.label()) {
+        match groups
+            .iter_mut()
+            .find(|group| group.name == spec.group.label())
+        {
             Some(group) => group.commands.push(view),
             None => groups.push(CommandGroupView {
                 name: spec.group.label(),
@@ -1211,9 +1254,7 @@ mod tests {
         // MUST_READ §1：命令不依赖空格分隔。用法示例里出现 "命令 参数" 会误导用户。
         for spec in static_commands() {
             for usage in spec.usage {
-                let body = usage
-                    .trim_start_matches('@')
-                    .trim_start_matches('#');
+                let body = usage.trim_start_matches('@').trim_start_matches('#');
                 let name = spec
                     .all_names()
                     .find(|name| body.starts_with(*name))
@@ -1374,10 +1415,7 @@ mod tests {
         assert!(first["commands"].is_array());
         let command = &first["commands"][0];
         for field in ["name", "aliases", "prefix", "authorities", "summary"] {
-            assert!(
-                !command[field].is_null(),
-                "面板契约要求字段 {field} 存在"
-            );
+            assert!(!command[field].is_null(), "面板契约要求字段 {field} 存在");
         }
         assert!(command["usage"].is_array());
         assert!(command["openEnded"].is_boolean());

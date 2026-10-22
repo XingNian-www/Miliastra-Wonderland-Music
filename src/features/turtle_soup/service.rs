@@ -19,11 +19,12 @@ use super::repository::TurtleSoupBankStore;
 use super::{
     TurtleSoupAppendReceipt, TurtleSoupDeadlineKind, TurtleSoupDelivery, TurtleSoupDeliveryIntent,
     TurtleSoupDeliveryOutcome, TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose, TurtleSoupPuzzle,
-    TurtleSoupSubmission,
+    TurtleSoupReplyText, TurtleSoupSubmission,
 };
 use crate::config::ai::AiConfig;
-use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
+use crate::features::chat_text::{MAX_CHAT_WIDTH, display_width};
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
+use crate::features::reply_template::ReplyTemplate;
 use crate::features::reply_template::{ReplyVars, turtle_soup as templates};
 use crate::text::normalize_comparison_text;
 use miliastra_contracts::StateStore;
@@ -135,7 +136,7 @@ pub enum TurtleSoupCommand {
 #[derive(Clone, Debug)]
 pub(crate) struct TurtleSoupCommandOutcome {
     pub action: &'static str,
-    pub immediate_reply: Option<String>,
+    pub immediate_reply: Option<TurtleSoupReplyText>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,7 +172,7 @@ enum TurtleSoupQuestionKind {
 pub(crate) enum QuestionSubmitOutcome {
     Ignored,
     Queued { request_id: u64 },
-    Reply(String),
+    Reply(TurtleSoupReplyText),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -219,34 +220,70 @@ impl Judgment {
         }
     }
 
-    fn player_reply(self, player: &str, question: &str) -> String {
+    fn player_reply(self, player: &str, question: &str) -> TurtleSoupReplyText {
         let result = match self {
-            Self::Yes => render_reply(&templates::RESULT_YES, &ReplyVars::new()),
-            Self::No => render_reply(&templates::RESULT_NO, &ReplyVars::new()),
-            Self::Irrelevant => render_reply(&templates::RESULT_IRRELEVANT, &ReplyVars::new()),
-            Self::Partial => render_reply(&templates::RESULT_PARTIAL, &ReplyVars::new()),
-            Self::Complete => render_reply(&templates::RESULT_COMPLETE, &ReplyVars::new()),
-            Self::Refused => render_reply(&templates::RESULT_REFUSED, &ReplyVars::new()),
+            Self::Yes => TurtleSoupReplyText::keyed(&templates::RESULT_YES, ReplyVars::new()),
+            Self::No => TurtleSoupReplyText::keyed(&templates::RESULT_NO, ReplyVars::new()),
+            Self::Irrelevant => {
+                TurtleSoupReplyText::keyed(&templates::RESULT_IRRELEVANT, ReplyVars::new())
+            }
+            Self::Partial => {
+                TurtleSoupReplyText::keyed(&templates::RESULT_PARTIAL, ReplyVars::new())
+            }
+            Self::Complete => {
+                TurtleSoupReplyText::keyed(&templates::RESULT_COMPLETE, ReplyVars::new())
+            }
+            Self::Refused => {
+                TurtleSoupReplyText::keyed(&templates::RESULT_REFUSED, ReplyVars::new())
+            }
             Self::ReviewFailed => {
-                render_reply(&templates::RESULT_REVIEW_FAILED, &ReplyVars::new())
+                TurtleSoupReplyText::keyed(&templates::RESULT_REVIEW_FAILED, ReplyVars::new())
             }
         };
-        format_judgment_reply(player, question, &result)
+        format_judgment_reply(player, question, result)
     }
 }
 
-fn format_judgment_reply(player: &str, question: &str, result: &str) -> String {
+fn format_judgment_reply(
+    player: &str,
+    question: &str,
+    result: TurtleSoupReplyText,
+) -> TurtleSoupReplyText {
     let question = question_reply_excerpt(question);
-    let suffix = render_reply(
+    let result_default = match &result {
+        TurtleSoupReplyText::Keyed { spec, .. } => spec.default,
+        _ => "",
+    };
+    let suffix_default = render_reply(
         &templates::JUDGMENT_SUFFIX,
-        &ReplyVars::new().with("问题", question).with("结果", result),
+        &ReplyVars::new()
+            .with("问题", &question)
+            .with("结果", result_default),
     );
-    let player_width = MAX_CHAT_WIDTH.saturating_sub(display_width("[") + display_width(&suffix));
+    let player_width =
+        MAX_CHAT_WIDTH.saturating_sub(display_width("[") + display_width(&suffix_default));
     let player = truncate_reply_player(player, player_width);
-    render_reply(
+    TurtleSoupReplyText::composed(
         &templates::JUDGMENT_REPLY,
-        &ReplyVars::new().with("玩家", player).with("后缀", suffix),
+        ReplyVars::new().with("玩家", player),
+        vec![(
+            "后缀",
+            TurtleSoupReplyText::composed(
+                &templates::JUDGMENT_SUFFIX,
+                ReplyVars::new().with("问题", question),
+                vec![("结果", result)],
+            ),
+        )],
     )
+}
+
+fn numbered_messages(label: &ReplyTemplate, content: &str) -> Vec<TurtleSoupReplyText> {
+    vec![TurtleSoupReplyText::NumberedComposed {
+        label: *label,
+        index: 0,
+        total: 0,
+        content: Box::new(TurtleSoupReplyText::raw(content)),
+    }]
 }
 
 fn question_reply_excerpt(question: &str) -> String {
@@ -262,17 +299,29 @@ fn question_reply_excerpt(question: &str) -> String {
     format!("{}....{}", start, end)
 }
 
-fn format_batch_notice(prefix: &str, player: &str, suffix: &str) -> String {
-    let fixed_width = display_width(prefix)
+fn format_batch_notice(
+    prefix: TurtleSoupReplyText,
+    player: &str,
+    suffix: TurtleSoupReplyText,
+) -> TurtleSoupReplyText {
+    let prefix_default = match &prefix {
+        TurtleSoupReplyText::Keyed { spec, .. } => spec.default,
+        TurtleSoupReplyText::Raw(text) => text.as_str(),
+        _ => "",
+    };
+    let suffix_default = match &suffix {
+        TurtleSoupReplyText::Keyed { spec, .. } => spec.default,
+        TurtleSoupReplyText::Raw(text) => text.as_str(),
+        _ => "",
+    };
+    let fixed_width = display_width(prefix_default)
         .saturating_add(display_width("[]:"))
-        .saturating_add(display_width(suffix));
+        .saturating_add(display_width(suffix_default));
     let player = truncate_reply_player(player, MAX_CHAT_WIDTH.saturating_sub(fixed_width));
-    render_reply(
+    TurtleSoupReplyText::composed(
         &templates::BATCH_NOTICE,
-        &ReplyVars::new()
-            .with("前缀", prefix)
-            .with("玩家", player)
-            .with("后缀", suffix),
+        ReplyVars::new().with("玩家", player),
+        vec![("前缀", prefix), ("后缀", suffix)],
     )
 }
 
@@ -985,9 +1034,9 @@ impl TurtleSoupService {
             },
             TurtleSoupCommand::End => TurtleSoupCommandOutcome {
                 action: "hall-stop-denied",
-                immediate_reply: Some(render_reply(
+                immediate_reply: Some(TurtleSoupReplyText::keyed(
                     &templates::END_HALL_DENIED,
-                    &ReplyVars::new(),
+                    ReplyVars::new(),
                 )),
             },
         }
@@ -1016,13 +1065,16 @@ impl TurtleSoupService {
             },
             Ok(false) => TurtleSoupCommandOutcome {
                 action: "no-session",
-                immediate_reply: Some(render_reply(&templates::NO_SESSION, &ReplyVars::new())),
+                immediate_reply: Some(TurtleSoupReplyText::keyed(
+                    &templates::NO_SESSION,
+                    ReplyVars::new(),
+                )),
             },
             Err(error) => TurtleSoupCommandOutcome {
                 action: "friend-stop-failed",
-                immediate_reply: Some(render_reply(
+                immediate_reply: Some(TurtleSoupReplyText::keyed(
                     &templates::END_FAILED,
-                    &ReplyVars::new().with("原因", concise_error(&error)),
+                    ReplyVars::new().with("原因", concise_error(&error)),
                 )),
             },
         };
@@ -1126,16 +1178,16 @@ impl TurtleSoupService {
                 let max_parts = self.config.batch_max_parts.max(1);
                 if index == 0 || index > max_parts {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        &render_reply(&templates::BATCH_LIMIT, &ReplyVars::new()),
+                        TurtleSoupReplyText::keyed(&templates::BATCH_LIMIT, ReplyVars::new()),
                         &question.player,
-                        &format!("##{}", max_parts),
+                        TurtleSoupReplyText::raw(format!("##{}", max_parts)),
                     )));
                 }
                 if question.question.trim().is_empty() {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        &render_reply(&templates::BATCH_EMPTY_PART, &ReplyVars::new()),
+                        TurtleSoupReplyText::keyed(&templates::BATCH_EMPTY_PART, ReplyVars::new()),
                         &question.player,
-                        &format!("##{}", index),
+                        TurtleSoupReplyText::raw(format!("##{}", index)),
                     )));
                 }
                 let stored = {
@@ -1162,33 +1214,33 @@ impl TurtleSoupService {
                     stored
                 );
                 return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                    &render_reply(&templates::BATCH_SAVED, &ReplyVars::new()),
+                    TurtleSoupReplyText::keyed(&templates::BATCH_SAVED, ReplyVars::new()),
                     &question.player,
-                    &format!("##{}", index),
+                    TurtleSoupReplyText::raw(format!("##{}", index)),
                 )));
             }
             TurtleSoupQuestionKind::BatchSubmit => {
                 let Some(draft) = state.batch_drafts.get(&question.player_key) else {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        &render_reply(&templates::BATCH_NO_DRAFT, &ReplyVars::new()),
+                        TurtleSoupReplyText::keyed(&templates::BATCH_NO_DRAFT, ReplyVars::new()),
                         &question.player,
-                        &render_reply(&templates::BATCH_SUBMIT, &ReplyVars::new()),
+                        TurtleSoupReplyText::keyed(&templates::BATCH_SUBMIT, ReplyVars::new()),
                     )));
                 };
                 let Some(max_index) = draft.parts.keys().next_back().copied() else {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        &render_reply(&templates::BATCH_NO_DRAFT, &ReplyVars::new()),
+                        TurtleSoupReplyText::keyed(&templates::BATCH_NO_DRAFT, ReplyVars::new()),
                         &question.player,
-                        &render_reply(&templates::BATCH_SUBMIT, &ReplyVars::new()),
+                        TurtleSoupReplyText::keyed(&templates::BATCH_SUBMIT, ReplyVars::new()),
                     )));
                 };
                 if let Some(missing) =
                     (1..=max_index).find(|index| !draft.parts.contains_key(index))
                 {
                     return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                        &render_reply(&templates::BATCH_MISSING, &ReplyVars::new()),
+                        TurtleSoupReplyText::keyed(&templates::BATCH_MISSING, ReplyVars::new()),
                         &question.player,
-                        &format!("##{}", missing),
+                        TurtleSoupReplyText::raw(format!("##{}", missing)),
                     )));
                 }
                 question.question = draft.parts.values().cloned().collect::<Vec<_>>().join("\n");
@@ -1196,31 +1248,31 @@ impl TurtleSoupService {
             TurtleSoupQuestionKind::BatchCancel => {
                 state.batch_drafts.remove(&question.player_key);
                 return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                    &render_reply(&templates::BATCH_CLEARED, &ReplyVars::new()),
+                    TurtleSoupReplyText::keyed(&templates::BATCH_CLEARED, ReplyVars::new()),
                     &question.player,
-                    &render_reply(&templates::BATCH_DONE, &ReplyVars::new()),
+                    TurtleSoupReplyText::keyed(&templates::BATCH_DONE, ReplyVars::new()),
                 )));
             }
             TurtleSoupQuestionKind::BatchInvalid => {
                 return Ok(QuestionSubmitOutcome::Reply(format_batch_notice(
-                    &render_reply(&templates::BATCH_FORMAT, &ReplyVars::new()),
+                    TurtleSoupReplyText::keyed(&templates::BATCH_FORMAT, ReplyVars::new()),
                     &question.player,
-                    &render_reply(&templates::BATCH_FORMAT_HINT, &ReplyVars::new()),
+                    TurtleSoupReplyText::keyed(&templates::BATCH_FORMAT_HINT, ReplyVars::new()),
                 )));
             }
             TurtleSoupQuestionKind::Single => {}
         }
 
         if state.pending_players.contains(&question.player_key) {
-            return Ok(QuestionSubmitOutcome::Reply(render_reply(
+            return Ok(QuestionSubmitOutcome::Reply(TurtleSoupReplyText::keyed(
                 &templates::QUESTION_PENDING,
-                &ReplyVars::new().with("玩家", question.player),
+                ReplyVars::new().with("玩家", question.player),
             )));
         }
         if state.pending_players.len() >= self.config.max_pending.max(1) {
-            return Ok(QuestionSubmitOutcome::Reply(render_reply(
+            return Ok(QuestionSubmitOutcome::Reply(TurtleSoupReplyText::keyed(
                 &templates::QUESTION_TOO_MANY,
-                &ReplyVars::new().with("玩家", question.player),
+                ReplyVars::new().with("玩家", question.player),
             )));
         }
 
@@ -1242,13 +1294,14 @@ impl TurtleSoupService {
         };
         if let Err(error) = self.worker_sender.try_send(job.clone()) {
             return Ok(QuestionSubmitOutcome::Reply(match error {
-                TrySendError::Full(_) => render_reply(
+                TrySendError::Full(_) => TurtleSoupReplyText::keyed(
                     &templates::QUESTION_TOO_MANY,
-                    &ReplyVars::new().with("玩家", player_for_log),
+                    ReplyVars::new().with("玩家", player_for_log),
                 ),
-                TrySendError::Disconnected(_) => {
-                    render_reply(&templates::QUESTION_WORKER_UNAVAILABLE, &ReplyVars::new())
-                }
+                TrySendError::Disconnected(_) => TurtleSoupReplyText::keyed(
+                    &templates::QUESTION_WORKER_UNAVAILABLE,
+                    ReplyVars::new(),
+                ),
             }));
         }
         state.next_request_id = state.next_request_id.wrapping_add(1).max(1);
@@ -1462,19 +1515,25 @@ impl TurtleSoupService {
                 },
                 Err(error) => TurtleSoupCommandOutcome {
                     action: "start-failed",
-                    immediate_reply: Some(render_reply(
-                    &templates::START_FAILED,
-                    &ReplyVars::new().with("原因", concise_error(&error)),
-                )),
+                    immediate_reply: Some(TurtleSoupReplyText::keyed(
+                        &templates::START_FAILED,
+                        ReplyVars::new().with("原因", concise_error(&error)),
+                    )),
                 },
             },
             TurtleSoupPhase::Announcing => TurtleSoupCommandOutcome {
                 action: "announcing",
-                immediate_reply: Some(render_reply(&templates::ANNOUNCING, &ReplyVars::new())),
+                immediate_reply: Some(TurtleSoupReplyText::keyed(
+                    &templates::ANNOUNCING,
+                    ReplyVars::new(),
+                )),
             },
             TurtleSoupPhase::Settling => TurtleSoupCommandOutcome {
                 action: "settling",
-                immediate_reply: Some(render_reply(&templates::SETTLING, &ReplyVars::new())),
+                immediate_reply: Some(TurtleSoupReplyText::keyed(
+                    &templates::SETTLING,
+                    ReplyVars::new(),
+                )),
             },
             TurtleSoupPhase::Active => match self.repeat_surface(delivery) {
                 Ok(()) => TurtleSoupCommandOutcome {
@@ -1483,9 +1542,9 @@ impl TurtleSoupService {
                 },
                 Err(error) => TurtleSoupCommandOutcome {
                     action: "surface-repeat-failed",
-                    immediate_reply: Some(render_reply(
+                    immediate_reply: Some(TurtleSoupReplyText::keyed(
                         &templates::SURFACE_REPEAT_FAILED,
-                        &ReplyVars::new().with("原因", concise_error(&error)),
+                        ReplyVars::new().with("原因", concise_error(&error)),
                     )),
                 },
             },
@@ -1574,7 +1633,7 @@ impl TurtleSoupService {
                 state.last_error = None;
                 state.generation
             };
-            let messages = split_numbered_chat_message(&label_surface(), &puzzle.surface);
+            let messages = numbered_messages(&templates::LABEL_SURFACE, &puzzle.surface);
             match Self::enqueue_batch(
                 delivery,
                 messages,
@@ -1623,7 +1682,7 @@ impl TurtleSoupService {
         };
         let outcome = Self::enqueue_batch(
             delivery,
-            split_numbered_chat_message(&label_surface(), &surface),
+            numbered_messages(&templates::LABEL_SURFACE, &surface),
             generation,
             TurtleSoupDeliveryPurpose::SurfaceRepeat,
         )?;
@@ -1636,18 +1695,18 @@ impl TurtleSoupService {
         Ok(())
     }
 
-    fn status_message(&self) -> String {
+    fn status_message(&self) -> TurtleSoupReplyText {
         if !self.config.enabled {
-            return render_reply(&templates::DISABLED, &ReplyVars::new());
+            return TurtleSoupReplyText::keyed(&templates::DISABLED, ReplyVars::new());
         }
         let state = &self.state;
         let Some(session) = state.session.as_ref() else {
-            return render_reply(&templates::NO_SESSION, &ReplyVars::new());
+            return TurtleSoupReplyText::keyed(&templates::NO_SESSION, ReplyVars::new());
         };
         let started = session.active_at.unwrap_or(session.selected_at);
-        render_reply(
+        TurtleSoupReplyText::keyed(
             &templates::STATUS,
-            &ReplyVars::new()
+            ReplyVars::new()
                 .with("阶段", state.phase.label())
                 .with(
                     "秒数",
@@ -1743,7 +1802,7 @@ impl TurtleSoupService {
 
     fn enqueue_batch(
         delivery: &mut dyn TurtleSoupDeliveryPort,
-        messages: Vec<String>,
+        messages: Vec<TurtleSoupReplyText>,
         generation: u64,
         purpose: TurtleSoupDeliveryPurpose,
     ) -> Result<TurtleSoupDeliveryOutcome> {
@@ -2283,50 +2342,47 @@ fn pseudo_random_index(len: usize) -> usize {
         .unwrap_or(0)
 }
 
-fn settlement_messages(session: &TurtleSoupSession, reason: &SettlementReason) -> Vec<String> {
+fn settlement_messages(
+    session: &TurtleSoupSession,
+    reason: &SettlementReason,
+) -> Vec<TurtleSoupReplyText> {
     let reason_text = match reason {
-        SettlementReason::Winner(player) => render_reply(
+        SettlementReason::Winner(player) => TurtleSoupReplyText::keyed(
             &templates::REASON_WINNER,
-            &ReplyVars::new().with("玩家", player),
+            ReplyVars::new().with("玩家", player),
         ),
-        SettlementReason::Friend(player) => render_reply(
+        SettlementReason::Friend(player) => TurtleSoupReplyText::keyed(
             &templates::REASON_FRIEND,
-            &ReplyVars::new().with("玩家", player),
+            ReplyVars::new().with("玩家", player),
         ),
-        SettlementReason::Web => render_reply(&templates::REASON_WEB, &ReplyVars::new()),
-        SettlementReason::IdleTimeout => render_reply(&templates::REASON_IDLE, &ReplyVars::new()),
+        SettlementReason::Web => {
+            TurtleSoupReplyText::keyed(&templates::REASON_WEB, ReplyVars::new())
+        }
+        SettlementReason::IdleTimeout => {
+            TurtleSoupReplyText::keyed(&templates::REASON_IDLE, ReplyVars::new())
+        }
         SettlementReason::MaxDuration => {
-            render_reply(&templates::REASON_MAX_DURATION, &ReplyVars::new())
+            TurtleSoupReplyText::keyed(&templates::REASON_MAX_DURATION, ReplyVars::new())
         }
     };
-    let summary = render_reply(
+    let summary = TurtleSoupReplyText::composed(
         &templates::SETTLEMENT_SUMMARY,
-        &ReplyVars::new()
-            .with("原因", reason_text)
+        ReplyVars::new()
             .with("人数", session.participants.len().to_string())
             .with("提问数", session.question_count.to_string()),
+        vec![("原因", reason_text)],
     );
-    let mut messages = split_numbered_chat_message(&label_settlement(), &summary);
-    messages.extend(split_numbered_chat_message(
-        &label_bottom(),
+    let mut messages = vec![TurtleSoupReplyText::NumberedComposed {
+        label: templates::LABEL_SETTLEMENT,
+        index: 0,
+        total: 0,
+        content: Box::new(summary),
+    }];
+    messages.extend(numbered_messages(
+        &templates::LABEL_BOTTOM,
         &session.puzzle.bottom,
     ));
     messages
-}
-
-/// 结算消息的分段标签（"结算1/2：…"里的"结算"）。
-fn label_settlement() -> String {
-    render_reply(&templates::LABEL_SETTLEMENT, &ReplyVars::new())
-}
-
-/// 汤底消息的分段标签（"汤底1/1：…"里的"汤底"）。
-fn label_bottom() -> String {
-    render_reply(&templates::LABEL_BOTTOM, &ReplyVars::new())
-}
-
-/// 汤面消息的分段标签（"汤面1/1：…"里的"汤面"）。
-fn label_surface() -> String {
-    render_reply(&templates::LABEL_SURFACE, &ReplyVars::new())
 }
 
 fn default_turtle_system_prompt() -> String {
@@ -2531,6 +2587,49 @@ fn unix_millis() -> u64 {
 mod tests {
     use super::*;
     use miliastra_kernel::clock::{Clock, ManualClock};
+
+    #[test]
+    fn numbered_recipe_defers_splitting_until_after_long_label_override() {
+        let label_override = "结算摘要标签扩展内容".repeat(2);
+        let content = "完整内容".repeat(45);
+        let recipe = numbered_messages(&templates::LABEL_SETTLEMENT, &content);
+        assert_eq!(recipe.len(), 1);
+        let TurtleSoupReplyText::NumberedComposed {
+            content: recipe_content,
+            ..
+        } = &recipe[0]
+        else {
+            panic!("numbered message must retain a full-content recipe");
+        };
+        assert_eq!(
+            recipe_content.as_ref(),
+            &TurtleSoupReplyText::raw(content.clone())
+        );
+
+        let rendered = crate::features::reply_template::render(
+            &templates::LABEL_SETTLEMENT,
+            Some(&label_override),
+            &ReplyVars::new(),
+        )
+        .text;
+        let rows = crate::text::split_numbered_chat_message(&rendered, &content);
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|row| row.starts_with(&rendered)));
+        assert!(rows.iter().all(|row| display_width(row) <= MAX_CHAT_WIDTH));
+        let bodies = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                row.strip_prefix(&format!(
+                    "{rendered}{}/{total}：",
+                    index + 1,
+                    total = rows.len()
+                ))
+                .expect("each row retains the numbered override prefix")
+            })
+            .collect::<String>();
+        assert_eq!(bodies, content);
+    }
 
     fn test_openai() -> OpenAiRuntimeHandle {
         static RUNTIME: std::sync::OnceLock<miliastra_kernel::ai::OpenAiRuntime> =
@@ -2880,7 +2979,12 @@ mod tests {
             &templates::BATCH_FORMAT,
         ] {
             // 构造一条与 format_batch_notice 同形的消息，确认会被识别出来。
-            let notice = format_batch_notice(spec.default, "Alice", "##1");
+            let notice = format_batch_notice(
+                TurtleSoupReplyText::raw(spec.default),
+                "Alice",
+                TurtleSoupReplyText::raw("##1"),
+            )
+            .render_default();
             assert!(
                 is_generated_batch_notice(&notice),
                 "模板 {} 发出的分段提示应被识别: {notice}",
@@ -2888,7 +2992,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn numbered_batch_replaces_parts_and_queues_one_merged_question() {
@@ -2899,7 +3002,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             reply,
-            QuestionSubmitOutcome::Reply("暂存[Alice]:##2".to_string())
+            QuestionSubmitOutcome::Reply(TurtleSoupReplyText::composed(
+                &templates::BATCH_NOTICE,
+                ReplyVars::new().with("玩家", "Alice"),
+                vec![
+                    (
+                        "前缀",
+                        TurtleSoupReplyText::keyed(&templates::BATCH_SAVED, ReplyVars::new())
+                    ),
+                    ("后缀", TurtleSoupReplyText::raw("##2")),
+                ],
+            ))
         );
         service
             .submit_question(parse_question_message("Alice：##1 第一段内容", None).unwrap())
@@ -2933,7 +3046,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome,
-            QuestionSubmitOutcome::Reply("缺少[Alice]:##2".to_string())
+            QuestionSubmitOutcome::Reply(TurtleSoupReplyText::composed(
+                &templates::BATCH_NOTICE,
+                ReplyVars::new().with("玩家", "Alice"),
+                vec![
+                    (
+                        "前缀",
+                        TurtleSoupReplyText::keyed(&templates::BATCH_MISSING, ReplyVars::new())
+                    ),
+                    ("后缀", TurtleSoupReplyText::raw("##2")),
+                ],
+            ))
         );
         assert_eq!(
             service.state.batch_drafts.get("alice").unwrap().parts.len(),
@@ -2985,7 +3108,12 @@ mod tests {
     #[test]
     fn batch_acknowledgment_is_short_and_never_echoes_the_content() {
         let player = "超长昵称".repeat(20);
-        let reply = format_batch_notice("暂存", &player, "##32");
+        let reply = format_batch_notice(
+            TurtleSoupReplyText::raw("暂存"),
+            &player,
+            TurtleSoupReplyText::raw("##32"),
+        )
+        .render_default();
 
         assert!(display_width(&reply) <= MAX_CHAT_WIDTH);
         assert!(reply.starts_with("暂存["));
@@ -3293,24 +3421,32 @@ mod tests {
     fn judgment_reply_uses_bracketed_question_style() {
         let question = "男人是灯塔管理员吗？";
         assert_eq!(
-            Judgment::Yes.player_reply("星念", question),
+            Judgment::Yes
+                .player_reply("星念", question)
+                .render_default(),
             "[星念]的男人是灯....理员吗？回复：是"
         );
         assert_eq!(
-            Judgment::No.player_reply("星念", question),
+            Judgment::No.player_reply("星念", question).render_default(),
             "[星念]的男人是灯....理员吗？回复：否"
         );
         assert_eq!(
-            Judgment::Irrelevant.player_reply("星念", question),
+            Judgment::Irrelevant
+                .player_reply("星念", question)
+                .render_default(),
             "[星念]的男人是灯....理员吗？回复：无关"
         );
         assert_eq!(
-            Judgment::Partial.player_reply("星念", question),
+            Judgment::Partial
+                .player_reply("星念", question)
+                .render_default(),
             "[星念]的男人是灯....理员吗？回复：部分正确"
         );
 
         assert_eq!(
-            Judgment::No.player_reply("星念", "他在说谎吗？"),
+            Judgment::No
+                .player_reply("星念", "他在说谎吗？")
+                .render_default(),
             "[星念]的他在说谎吗？回复：否"
         );
         assert_eq!(
@@ -3318,7 +3454,9 @@ mod tests {
             "第一段内....二段内容"
         );
 
-        let long_reply = Judgment::ReviewFailed.player_reply("七字昵称测试者", question);
+        let long_reply = Judgment::ReviewFailed
+            .player_reply("七字昵称测试者", question)
+            .render_default();
         assert!(display_width(&long_reply) <= MAX_CHAT_WIDTH);
         assert_eq!(
             long_reply,
@@ -3594,4 +3732,3 @@ mod tests {
         service
     }
 }
-

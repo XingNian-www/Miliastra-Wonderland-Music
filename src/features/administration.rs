@@ -22,6 +22,17 @@ pub(crate) struct AdministrationCommandContext {
 pub(crate) trait AdministrationImmediatePort {
     fn set_commands_enabled(&mut self, enabled: bool) -> Result<()>;
     fn enqueue_hall_reply(&mut self, message: &str) -> Result<()>;
+    /// 按模板排队一条大厅回复。
+    ///
+    /// 默认实现只渲染内置文案，保证不接配置的测试替身也能工作；
+    /// 组装层会覆盖它以便查用户设置的覆盖文案。
+    fn enqueue_hall_template(
+        &mut self,
+        spec: &reply_template::ReplyTemplate,
+        vars: &ReplyVars,
+    ) -> Result<()> {
+        self.enqueue_hall_reply(&reply_template::render(spec, None, vars).text)
+    }
     fn configure_idle_exit(&mut self, minutes: u32) -> Result<()>;
     fn record_command_activity(&mut self) -> Result<()>;
     fn log_executed(
@@ -33,6 +44,15 @@ pub(crate) trait AdministrationImmediatePort {
 
 pub(crate) trait AdministrationApplicationPort: AdministrationImmediatePort {
     fn send_hall(&mut self, message: &str) -> Result<()>;
+
+    /// 按模板发送一条大厅回复；默认实现只渲染内置文案。
+    fn send_hall_template(
+        &mut self,
+        spec: &reply_template::ReplyTemplate,
+        vars: &ReplyVars,
+    ) -> Result<()> {
+        self.send_hall(&reply_template::render(spec, None, vars).text)
+    }
     fn send_command_reply_batch(
         &mut self,
         _command_id: &str,
@@ -117,7 +137,10 @@ impl AdministrationApplication {
                         "disable commands"
                     },
                 )?;
-                port.send_hall(command_availability_feedback(*enabled))
+                port.send_hall_template(
+                    command_availability_feedback(*enabled),
+                    &ReplyVars::new(),
+                )
             }
             AdministrationCommand::IdleExit { minutes } => {
                 port.configure_idle_exit((*minutes).max(IDLE_EXIT_MIN_MINUTES))?;
@@ -158,7 +181,10 @@ impl AdministrationApplication {
                 } else if let Err(error) = log_result {
                     log::error!("写入执行命令日志失败: {error:#}");
                 }
-                port.enqueue_hall_reply(command_availability_feedback(enabled))?;
+                port.enqueue_hall_template(
+                    command_availability_feedback(enabled),
+                    &ReplyVars::new(),
+                )?;
                 Ok(ImmediateAdministrationOutcome::Handled)
             }
             AdministrationDispatch::ConfigureIdleExit { minutes } => {
@@ -194,11 +220,14 @@ fn help_lines<P: AdministrationApplicationPort + ?Sized>(
         .collect()
 }
 
-fn command_availability_feedback(enabled: bool) -> &'static str {
+/// 大厅命令开关的回执模板。
+///
+/// 返回模板而不是成品文案：文案要能在命令面板里改，渲染留给组装层。
+fn command_availability_feedback(enabled: bool) -> &'static reply_template::ReplyTemplate {
     if enabled {
-        "管理员已启用大厅命令识别功能"
+        &reply_template::ADMIN_COMMANDS_ENABLED
     } else {
-        "管理员已禁用大厅命令识别功能"
+        &reply_template::ADMIN_COMMANDS_DISABLED
     }
 }
 

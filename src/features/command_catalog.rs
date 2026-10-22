@@ -1392,6 +1392,24 @@ mod tests {
         assert!(command["enabled"].is_boolean());
     }
 
+    #[test]
+    fn usage_and_examples_are_identical_so_the_panel_shows_one_row() {
+        // 面板在两者渲染结果相同时只展示“示例”一行。这条测试钉住前提：
+        // 现状 examples 就是 usage 的副本；若将来真给命令单独写示例，
+        // 面板会自动恢复成“用法 + 示例”两行，这里也需要同步更新。
+        for command in catalog_view(true)
+            .groups
+            .iter()
+            .flat_map(|group| group.commands.iter())
+        {
+            assert_eq!(
+                command.usage, command.examples,
+                "命令 {} 的 usage 与 examples 应同源",
+                command.name
+            );
+        }
+    }
+
     /// 构造与真实链路一致的信封：走 CommandEnvelope::new 的同一套解析。
     fn envelope_for(
         raw: &str,

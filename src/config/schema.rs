@@ -58,8 +58,6 @@ pub enum FieldKind {
     StringArray,
     /// 嵌套对象（未知结构，高级 JSON 编辑）
     Object,
-    /// 回复模板目录：由配置页按模块分组逐条编辑，不显示 JSON。
-    ReplyTemplates,
     /// 矩形区域 {x, y, width, height}
     Rect,
     /// 点 {x, y}
@@ -2164,15 +2162,6 @@ fn kugou_section() -> Vec<ConfigFieldSchema> {
     ]
 }
 
-fn replies_section() -> Vec<ConfigFieldSchema> {
-    vec![ConfigFieldSchema::db_live(
-        "overrides",
-        "回复文案",
-        FieldKind::ReplyTemplates,
-        "按用途逐条编辑回复。留空使用内置默认文案；花括号中的变量由程序自动填入。保存后立即生效。",
-    )]
-}
-
 /// 全部配置段 schema（与 AppConfig 顶层段一一对应，含 bootstrap 的 http/logging）。
 pub fn config_sections() -> Vec<ConfigSectionSchema> {
     vec![
@@ -2394,12 +2383,6 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             fields: with_section_prefix("kugou", kugou_section()),
         },
         ConfigSectionSchema {
-            name: "replies".to_string(),
-            label: "回复文案".to_string(),
-            order: 31,
-            fields: with_section_prefix("replies", replies_section()),
-        },
-        ConfigSectionSchema {
             name: "ai_chat".to_string(),
             label: "AI 聊天".to_string(),
             order: 32,
@@ -2496,7 +2479,7 @@ pub fn section_schema(name: &str) -> Option<ConfigSectionSchema> {
         .find(|section| section.name == name)
 }
 
-/// 查询点路径对应的生效级别。Object/ReplyTemplates/Rect/Point 的路径继承最深的
+/// 查询点路径对应的生效级别。Object/Rect/Point 的路径继承最深的
 /// schema 父字段；未声明路径返回 None。
 pub(crate) fn config_effect_for_path(path: &str) -> Option<Effect> {
     config_sections()
@@ -2506,10 +2489,7 @@ pub(crate) fn config_effect_for_path(path: &str) -> Option<Effect> {
             field.path == path
                 || (matches!(
                     field.kind,
-                    FieldKind::Object
-                        | FieldKind::ReplyTemplates
-                        | FieldKind::Rect
-                        | FieldKind::Point
+                    FieldKind::Object | FieldKind::Rect | FieldKind::Point
                 ) && path
                     .strip_prefix(&field.path)
                     .is_some_and(|suffix| suffix.starts_with('.')))
@@ -2650,10 +2630,7 @@ mod tests {
                     && matches!(
                         kinds.get(prefix),
                         Some(
-                            FieldKind::Object
-                                | FieldKind::ReplyTemplates
-                                | FieldKind::Rect
-                                | FieldKind::Point
+                            FieldKind::Object | FieldKind::Rect | FieldKind::Point
                         )
                     )
                 {
@@ -2920,13 +2897,6 @@ mod tests {
                     }
                     FieldKind::StringArray => {
                         assert!(field_value.is_array(), "字段 {} 必须是数组", field.path);
-                    }
-                    FieldKind::ReplyTemplates => {
-                        assert!(
-                            field_value.is_object(),
-                            "字段 {} 必须是回复覆盖对象",
-                            field.path
-                        );
                     }
                     // custom_workflows.workflows 默认值是数组，故对象或数组都接受。
                     FieldKind::Object => {

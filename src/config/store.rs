@@ -3,7 +3,7 @@
 //! 配置三表（config_meta / config_sections / config_revisions）与既有表
 //! （request_state、cached_* 等）共存于统一数据库；配置 schema 版本
 //! （[`CONFIG_SCHEMA_VERSION`]）与请求状态快照版本、缓存 user_version 完全独立。
-//! v1 配置断代重置为新默认值；只操作配置三表，不删除歌曲缓存表或文件。
+//! 版本不匹配时配置断代重置为新默认值；只操作配置三表，不删除歌曲缓存表或文件。
 //!
 //! 启动流程读取完整配置，Web 配置中心负责保存、历史版本和回滚。
 
@@ -20,7 +20,12 @@ use super::schema::SECRET_PATHS;
 use super::{AppConfig, BootstrapConfig};
 
 /// 配置数据库 schema 版本；与请求状态快照版本及缓存 user_version 完全独立。
-pub const CONFIG_SCHEMA_VERSION: i64 = 2;
+///
+/// 7.0.0 起回复文案统一由命令面板持有（[<code>command_replies</code>] 表），
+/// 配置表里的 `replies` 段被移除；同时命令回复目录重组为
+/// key→命令 的归属表。这些变化让旧配置失去意义，因此提升版本号触发断代重置。
+/// 重置只重建配置三表，歌曲缓存与音频文件不受影响。
+pub const CONFIG_SCHEMA_VERSION: i64 = 3;
 
 /// 打开连接（含头初始化）的重试次数：两个进程并发首次创建同一新库文件时，
 /// SQLite 头初始化阶段的锁竞争发生在 busy_timeout 生效之前，需要有限重试吸收。
@@ -421,20 +426,26 @@ impl ConfigStore {
                 path.display()
             );
         };
-        if schema_version == 1 {
-            return Self::reset_previous_schema(connection, path);
+        // 低于当前版本的配置一律断代重置：本项目只保证同一版本内的配置兼容，
+        // 跨版本仅保留歌曲缓存（见 MUST_READ「配置断代」）。
+        if schema_version < CONFIG_SCHEMA_VERSION {
+            return Self::reset_previous_schema(connection, path, schema_version);
         }
-        if schema_version != CONFIG_SCHEMA_VERSION {
+        if schema_version > CONFIG_SCHEMA_VERSION {
             bail!(
-                "配置数据库 schema 版本不兼容（当前 {schema_version}，需要 {CONFIG_SCHEMA_VERSION}），请修复配置三表（不要删除含歌曲缓存的数据库）: {}",
+                "配置数据库 schema 版本高于当前程序（{schema_version} > {CONFIG_SCHEMA_VERSION}），请升级程序或修复配置三表（不要删除含歌曲缓存的数据库）: {}",
                 path.display()
             );
         }
         Ok(())
     }
 
-    /// 已知旧配置断代：取写锁后重查版本，只重建配置三表。缓存及其他表不受影响。
-    fn reset_previous_schema(connection: &mut rusqlite::Connection, path: &Path) -> Result<()> {
+    /// 旧配置断代：取写锁后重查版本，只重建配置三表。缓存及其他表不受影响。
+    fn reset_previous_schema(
+        connection: &mut rusqlite::Connection,
+        path: &Path,
+        stale_version: i64,
+    ) -> Result<()> {
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 = transaction.query_row(
@@ -442,7 +453,7 @@ impl ConfigStore {
             [],
             |row| row.get(0),
         )?;
-        if version != 1 {
+        if version >= CONFIG_SCHEMA_VERSION {
             // 另一进程可能已完成断代；重新校验，绝不覆盖同版本保存的配置。
             drop(transaction);
             return Self::ensure_schema(connection, path);
@@ -455,7 +466,7 @@ impl ConfigStore {
         Self::initialize_database_transaction(&transaction, now_ms() as i64)?;
         transaction.commit()?;
         log::warn!(
-            "旧配置 schema v1 已重置为 v{CONFIG_SCHEMA_VERSION} 默认值；歌曲缓存保留: {}",
+            "旧配置 schema v{stale_version} 已重置为 v{CONFIG_SCHEMA_VERSION} 默认值；歌曲缓存保留: {}",
             path.display()
         );
         Ok(())
@@ -2315,7 +2326,9 @@ mod tests {
         let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
         drop(store);
 
-        // 手工把 schema 版本改成 99，模拟未来版本写入的数据库。
+        // 手工把 schema 版本改成高于当前程序的值，模拟"降级运行"：
+        // 低于当前版本的配置会被断代重置，高于当前版本必须明确失败，
+        // 否则旧程序会把新版本配置静默覆盖成默认值。
         let connection = rusqlite::Connection::open(&database_path).unwrap();
         connection
             .execute(
@@ -2326,10 +2339,10 @@ mod tests {
         drop(connection);
 
         let error = ConfigStore::open(&database_path, &root, bootstrap)
-            .expect_err("不兼容的 schema 版本必须明确失败");
+            .expect_err("高于当前程序的 schema 版本必须明确失败");
         assert!(
-            error.to_string().contains("不兼容"),
-            "错误消息必须提示 schema 版本不兼容: {error}"
+            error.to_string().contains("高于当前程序"),
+            "错误消息必须说明版本高于当前程序: {error}"
         );
         assert!(
             error.to_string().contains("不要删除"),

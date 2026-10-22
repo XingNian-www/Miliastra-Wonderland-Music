@@ -2501,9 +2501,18 @@ function commandPolicyHtml(item){
 }
 function commandPolicyHasChanges(){return commandPolicyDraft.size>0||commandDefaultSongSourceDraft!==null}
 function commandReplyHasChanges(){return commandReplyDraft.size>0}
-function commandReplyCanonicalId(id){return String(id)}
+function commandReplyCanonicalId(id){
+  const key=String(id)
+  // 共享回复的命令（@播放 与 @继续、各平台点歌等）没有独立文案：
+  // 归一到真正持有回复的分组，避免面板显示"暂无可编辑回复"。
+  const alias=commandReplyCatalog&&Array.isArray(commandReplyCatalog.aliases)
+    ?commandReplyCatalog.aliases.find(item=>String(item.id)===key)
+    :null
+  return alias?String(alias.owner):key
+}
 function commandReplyEntry(id){const key=commandReplyCanonicalId(id);return commandReplyCatalog?.commands?.find(item=>String(item.id)===key)||null}
 function commandReplyList(id){return commandReplyDraft.get(commandReplyCanonicalId(id))||commandReplyEntry(id)?.replies||[]}
+function commandReplyMaxChars(){const limit=Number(commandReplyCatalog?.limits?.maxReplyChars);return Number.isFinite(limit)&&limit>0?limit:300}
 function commandReplyActiveList(id){return commandReplyList(id).filter(row=>row.active!==false)}
 function commandReplyVars(id){
   const entry=commandReplyEntry(id)
@@ -2536,10 +2545,10 @@ function renderCommandReplyEditor(){
     const variableButtons=vars.map(name=>'<button type="button" class="btn small ghost" data-reply-var="'+commandEscape(name)+'" title="插入 {'+commandEscape(name)+'}">{'+commandEscape(name)+'}</button>').join('')
     const tools=(batch?(row.active===false?'<button type="button" class="btn small" data-reply-activate data-index="'+index+'"'+(locked?' disabled':'')+'>启用</button>':(row.defaultText===null?'<button type="button" class="btn small ghost" data-reply-delete data-index="'+index+'"'+(locked?' disabled':'')+'>删除</button>':'<button type="button" class="btn small ghost" data-reply-deactivate data-index="'+index+'"'+(locked?' disabled':'')+'>停用</button>')):(row.active===false?'<button type="button" class="btn small" data-reply-activate data-index="'+index+'"'+(locked?' disabled':'')+'>启用</button>':'<button type="button" class="btn small ghost" data-reply-deactivate data-index="'+index+'"'+(locked?' disabled':'')+'>停用</button>'))
     const order=batch?'<button type="button" class="btn small ghost" data-reply-up data-index="'+index+'"'+(locked||index===0?' disabled':'')+'>上移</button><button type="button" class="btn small ghost" data-reply-down data-index="'+index+'"'+(locked||index===rows.length-1?' disabled':'')+'>下移</button>':''
-    return '<article class="command-reply-row'+(row.active===false?' inactive':'')+'" data-reply-row-index="'+index+'"><div class="row wrap"><strong>'+commandEscape(row.label||row.key||'自定义回复')+'</strong><code class="command-reply-key">'+commandEscape(row.key||'自定义')+'</code>'+(row.active===false?'<span class="field-state warn">已静音</span>':'')+'</div>'+(row.defaultText!=null?'<div class="config-field-hint">内置默认：'+commandEscape(row.defaultText)+'</div>':'')+'<textarea data-reply-text data-reply-index="'+index+'" maxlength="1000" aria-label="回复文案 '+commandEscape(row.key||index+1)+'"'+disabled+'>'+commandEscape(row.text||'')+'</textarea>'+'<div class="command-reply-tools">'+order+tools+'</div>'+((row.editable!==false&&vars.length)?'<div class="command-reply-vars" aria-label="插入变量">'+variableButtons+'</div>':'')+'</article>'
+    return '<article class="command-reply-row'+(row.active===false?' inactive':'')+'" data-reply-row-index="'+index+'"><div class="row wrap"><strong>'+commandEscape(row.label||row.key||'自定义回复')+'</strong><code class="command-reply-key">'+commandEscape(row.key||'自定义')+'</code>'+(row.active===false?'<span class="field-state warn">已静音</span>':'')+'</div>'+(row.defaultText!=null?'<div class="config-field-hint">内置默认：'+commandEscape(row.defaultText)+'</div>':'')+'<textarea data-reply-text data-reply-index="'+index+'" maxlength="'+commandReplyMaxChars()+'" placeholder="留空则使用内置默认文案" aria-label="回复文案 '+commandEscape(row.key||index+1)+'"'+disabled+'>'+commandEscape(row.text||'')+'</textarea>'+'<div class="command-reply-tools">'+order+tools+'</div>'+((row.editable!==false&&vars.length)?'<div class="command-reply-vars" aria-label="插入变量">'+variableButtons+'</div>':'')+'</article>'
   }).join('')
   const policyHtml=policyItem?'<h3>'+commandEscape(policyItem.name||policyItem.id)+' 设置</h3>'+commandPolicyHtml(policyItem):''
-  const replyHtml=entry?'<h3>'+commandEscape(entry.name||entry.id)+' 回复</h3><p class="config-field-hint">'+(entry.orderedBatch===true?'按序批量发送':'业务仅发送实际触发的结果分支')+'</p>'+(entry.editable===false?'<p class="config-field-hint">此命令的回复不可编辑。</p>':'')+'<div class="command-reply-list">'+(html||'<div class="command-reply-empty">当前无回复；保存空列表会静音此命令。</div>')+'</div>'+(entry.editable===false?'':'<div class="row wrap">'+(entry.orderedBatch===true?'<button type="button" class="btn small" onclick="addCommandReply()">添加回复</button>':'')+'<button type="button" class="btn small" onclick="restoreCommandReplyDefaults()">恢复内置回复</button><button type="button" class="btn small warn" onclick="muteCommandReplies()">静音此命令</button></div>'):'<h3>'+commandEscape(policyItem.name||policyItem.id)+'</h3><p class="config-field-hint">此命令暂无可编辑回复。</p>'
+  const replyHtml=entry?'<h3>'+commandEscape(entry.name||entry.id)+' 回复</h3><p class="config-field-hint">'+(entry.orderedBatch===true?'按序批量发送':'业务仅发送实际触发的结果分支')+'</p>'+(entry.editable===false?'<p class="config-field-hint">此命令的回复不可编辑。</p>':'')+'<div class="command-reply-list">'+(html||'<div class="command-reply-empty">当前无回复；把文案留空表示使用内置默认，点“静音此命令”才会停止回复。</div>')+'</div>'+(entry.editable===false?'':'<div class="row wrap">'+(entry.orderedBatch===true?'<button type="button" class="btn small" onclick="addCommandReply()">添加回复</button>':'')+'<button type="button" class="btn small" onclick="restoreCommandReplyDefaults()">恢复内置回复</button><button type="button" class="btn small warn" onclick="muteCommandReplies()">静音此命令</button></div>'):'<h3>'+commandEscape(policyItem.name||policyItem.id)+'</h3><p class="config-field-hint">此命令暂无可编辑回复。</p>'
   host.innerHTML=policyHtml+replyHtml
   host.querySelectorAll('[data-reply-var]').forEach(button=>button.addEventListener('click',()=>insertCommandReplyVariable(button.dataset.replyVar)))
 
@@ -2761,8 +2770,20 @@ function commandItemHtml(item,index,groupName,showHidden){
   const openEnded=item.openEnded===true
   const aliases=commandList(item.aliases)
   const expanded=commandExpandedItems.has(key)
-  const usage=commandDetailLines(item.usage,prefix,true)
-  const examples=commandDetailLines(item.examples,prefix,false)
+  // 后端的 usage 与 examples 目前同源（都来自 CommandSpec.usage）。
+  // 内容相同时只保留示例，避免同一条命令在展开区里显示两遍。
+  // 比较的是去掉前缀后的正文：静态命令本来带 @/#，会话态关键词（如“提示”）
+  // 两边渲染会补出不同前缀，但它们是同一批词，仍应视为重复。
+  const commandBody=values=>commandList(values).map(value=>value.replace(/^[@#]/,''))
+  const usageBody=commandBody(item.usage)
+  const exampleBody=commandBody(item.examples)
+  const sameUsageAndExamples=usageBody.length>0
+    &&usageBody.length===exampleBody.length
+    &&usageBody.every((value,index)=>value===exampleBody[index])
+  const usageRendered=commandDetailLines(item.usage,prefix,true)
+  const examplesRendered=commandDetailLines(item.examples,prefix,false)
+  const usage=sameUsageAndExamples?'':usageRendered
+  const examples=examplesRendered
   const classes=['command-item']
   if(hidden&&showHidden)classes.push('hidden-command')
   if(!enabled)classes.push('disabled')
@@ -2780,7 +2801,7 @@ function commandItemHtml(item,index,groupName,showHidden){
       (enabled?'':commandBadge('已禁用','disabled-mark'))+'</div></div>'+
     '<p class="command-summary">'+commandEscape(commandText(item.summary)||'（暂无摘要）')+'</p>'+
 
-    '<div class="command-toggle"><button class="btn small ghost toggle-command-detail" type="button">'+(expanded?'收起用法':'查看用法与示例')+'</button></div>'+
+    '<div class="command-toggle"><button class="btn small ghost toggle-command-detail" type="button">'+(expanded?'收起'+(sameUsageAndExamples?'示例':'用法与示例'):'查看'+(sameUsageAndExamples?'示例':'用法与示例'))+'</button></div>'+
     (expanded?commandDetailHtml(item,usage,examples):'')+
     '</div>'
 }
@@ -3460,33 +3481,6 @@ function configControlHtml(field,value){
     const rows=items.map(item=>'<div class="config-string-row" data-cfg-row><input type="text" data-cfg="'+path+'" data-cfg-array="1" value="'+esc(String(item))+'"><button type="button" class="btn small ghost" onclick="configArrayRemove(this)">删除</button></div>').join('')
     return '<div class="config-array" id="'+id+'">'+rows+'<div class="config-string-row"><button type="button" class="btn small" onclick="configArrayAdd('+esc(JSON.stringify(path))+')">添加一行</button></div></div>'
   }
-  if(kind==='replyTemplates'){
-    const items=Array.isArray(field.kind.items)?field.kind.items:[]
-    const overrides=value&&typeof value==='object'?value:{}
-    const groups=new Map()
-    for(const item of items){const group=String(item.group||'其他');if(!groups.has(group))groups.set(group,[]);groups.get(group).push(item)}
-    let html='<div class="reply-template-editor" id="'+id+'" data-cfg="'+path+'" data-cfg-reply-templates="1">'
-    html+='<label class="reply-template-search">筛选文案<input type="search" data-reply-search placeholder="按用途、默认文案或变量筛选"></label>'
-    html+='<div class="reply-template-groups">'
-    for(const [group,entries] of groups){
-      html+='<section class="reply-template-group"><h3>'+esc(group)+'</h3>'
-      for(const item of entries){
-        const key=String(item.key||'')
-        const current=Object.prototype.hasOwnProperty.call(overrides,key)?String(overrides[key]??''):''
-        const variables=Array.isArray(item.variables)?item.variables:[]
-        const search=[item.summary,item.default,variables.join(' '),key].join(' ').toLowerCase()
-        html+='<article class="reply-template-row" data-reply-row data-reply-search-text="'+esc(search)+'">'
-        html+='<div class="reply-template-meta"><strong>'+esc(item.summary||key)+'</strong><code>'+esc(key)+'</code></div>'
-        html+='<div class="reply-template-default"><span>内置默认</span><div>'+esc(item.default||'')+'</div></div>'
-        if(variables.length)html+='<div class="reply-template-vars">变量：'+variables.map(v=>'<code>{'+esc(v)+'}</code>').join(' ' )+'</div>'
-        html+='<label class="reply-template-edit">自定义文案<textarea data-reply-override="'+esc(key)+'" rows="2" maxlength="300" placeholder="留空则使用内置默认文案">'+esc(current)+'</textarea></label>'
-        html+='</article>'
-      }
-      html+='</section>'
-    }
-    html+='</div></div>'
-    return html
-  }
   if(kind==='object'){
     // 有子字段 schema 声明的可空对象（如 audio_cache）→ 结构化开关，禁止手填 JSON；
     // 无子字段声明的自由对象（ai.extra_body、custom_workflows 等）→ 高级 JSON 编辑。
@@ -3636,12 +3630,6 @@ function onConfigObjectToggle(el,field){
 }
 function onConfigFormInput(e){
   const el=e.target
-  if(el&&el.dataset&&el.dataset.replyOverride!==undefined){markConfigDirty('replies');return}
-  if(el&&el.dataset&&el.dataset.replySearch!==undefined){
-    const query=String(el.value||'').trim().toLowerCase()
-    document.querySelectorAll('[data-reply-row]').forEach(row=>row.classList.toggle('hidden',!!query&&!String(row.dataset.replySearchText||'').includes(query)))
-    return
-  }
   const path=el&&el.dataset&&el.dataset.cfg
   if(!path)return
   const field=configFieldByPath(path)
@@ -3695,19 +3683,6 @@ function collectConfigFieldValue(field,sectionName){
   const kind=field.kind&&field.kind.type
   const el=document.getElementById(configControlId(field.path))
   if(!el)return {skip:true}
-  if(kind==='replyTemplates'){
-    const overrides=el.querySelectorAll('[data-reply-override]')
-    const result={}
-    const existing=configValueAt(sectionName,field.path)
-    if(existing&&typeof existing==='object'&&!Array.isArray(existing))Object.assign(result,existing)
-    for(const input of overrides){
-      const key=input.dataset.replyOverride
-      const text=String(input.value||'')
-      if(text.trim())result[key]=text
-      else delete result[key]
-    }
-    return {value:result}
-  }
   // 父级 nullable object 未启用（开关关闭 / textarea 为 null / 库中为 null）
   // → 跳过子字段，避免把旧子字段写回提交段导致父级重新变成对象。
   const parent=configNullableObjectParent(sectionName,field.path)

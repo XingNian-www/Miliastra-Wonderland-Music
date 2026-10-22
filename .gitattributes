@@ -1,2 +1,19 @@
+# 统一行尾：源码与文档一律 LF，避免不同平台检出后产生整文件差异。
+# 仓库索引本来存的就是 LF；这条规则防止 Windows 的 core.autocrlf 再次把它转成 CRLF。
+* text=auto eol=lf
+
+# 二进制资源不做行尾转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.pdf binary
+*.mnn binary
+*.dll binary
+*.exe binary
+*.so binary
+*.rlib binary
+
 vendor/mnn/** -whitespace
 assets/idioms.txt text eol=lf

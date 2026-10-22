@@ -1,6 +1,42 @@
 use super::*;
 
 impl ApplicationRuntime {
+    /// 渲染一条歌单回复；带 key 的条目在此处才查用户覆盖与静音。
+    ///
+    /// 返回 Vec 是因为静音会让整条回复消失（零条消息）。
+    pub(super) fn render_playlist_reply(
+        &self,
+        reply: &crate::features::playlist::PlaylistReply,
+    ) -> Vec<String> {
+        use crate::features::playlist::PlaylistReply;
+        match reply {
+            PlaylistReply::Raw(text) => vec![text.clone()],
+            PlaylistReply::Keyed { spec, vars } => {
+                self.render_template_text(spec, vars).into_iter().collect()
+            }
+        }
+    }
+
+    /// 渲染一条塔罗回复；带 key 的条目在此处才查用户覆盖与静音。
+    pub(super) fn render_tarot_reply(
+        &self,
+        reply: &crate::features::tarot::TarotReply,
+    ) -> Vec<String> {
+        use crate::features::tarot::TarotReply;
+        match reply {
+            TarotReply::Raw(text) => vec![text.clone()],
+            TarotReply::Keyed { spec, vars } => {
+                self.render_template_text(spec, vars).into_iter().collect()
+            }
+            TarotReply::KeyedFitted { label, spec, vars } => {
+                match self.render_template_text(spec, vars) {
+                    Some(text) => crate::text::fit_chat_message(label, &text),
+                    None => Vec::new(),
+                }
+            }
+        }
+    }
+
     pub(super) fn reply(&self, message: &str) -> Result<()> {
         self.reply_with_ready_gate(message, false)
     }
@@ -92,14 +128,7 @@ impl ApplicationRuntime {
         default_text: &'static str,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> String {
-        let overrides = self
-            .lifecycle
-            .live_configs
-            .replies
-            .read()
-            .map(|config| config.get(key).map(str::to_string))
-            .unwrap_or(None);
-        let Some(override_text) = overrides else {
+        let Some(override_text) = self.command_reply_text(key) else {
             // 未配置覆盖：原样返回调用方已经组织好的文案。
             return default_text.to_string();
         };
@@ -127,11 +156,13 @@ impl ApplicationRuntime {
     pub(super) fn render_reply_text(
         &self,
         reply: &crate::features::turtle_soup::TurtleSoupReplyText,
-    ) -> String {
+    ) -> Option<String> {
         use crate::features::turtle_soup::TurtleSoupReplyText;
         match reply {
-            TurtleSoupReplyText::Raw(text) => text.clone(),
-            TurtleSoupReplyText::Keyed { spec, vars } => self.render_template_text(spec, vars),
+            TurtleSoupReplyText::Raw(text) => Some(text.clone()),
+            TurtleSoupReplyText::Keyed { spec, vars } => {
+                self.render_template_text(spec, vars)
+            }
             TurtleSoupReplyText::Numbered {
                 label,
                 index,
@@ -141,8 +172,8 @@ impl ApplicationRuntime {
                 let label = self.render_template_text(
                     label,
                     &crate::features::reply_template::ReplyVars::new(),
-                );
-                format!("{label}{index}/{total}：{content}")
+                )?;
+                Some(format!("{label}{index}/{total}：{content}"))
             }
             TurtleSoupReplyText::NumberedComposed {
                 label,
@@ -153,41 +184,44 @@ impl ApplicationRuntime {
                 let label = self.render_template_text(
                     label,
                     &crate::features::reply_template::ReplyVars::new(),
-                );
-                let content = self.render_reply_text(content);
-                format!("{label}{index}/{total}：{content}")
+                )?;
+                let content = self.render_reply_text(content)?;
+                Some(format!("{label}{index}/{total}：{content}"))
             }
             TurtleSoupReplyText::Composed { spec, vars, nested } => {
-                let nested = nested
-                    .iter()
-                    .map(|(name, reply)| (*name, self.render_reply_text(reply)))
-                    .collect();
-                let vars = vars.clone().with_nested(nested);
+                // 任一嵌套片段被静音，整条复合回复就不发：半个句子没有意义。
+                let mut resolved = Vec::with_capacity(nested.len());
+                for (name, reply) in nested {
+                    resolved.push((*name, self.render_reply_text(reply)?));
+                }
+                let vars = vars.clone().with_nested(resolved);
                 self.render_template_text(spec, &vars)
             }
         }
     }
 
+    /// 按模板渲染一条文案；被静音时返回 None。
+    ///
+    /// 静音判定放在这里而不是各调用点：此前 21 个发送点里只有 5 个自己查了静音，
+    /// 其余路径（牌类、卧底、海龟汤片段、塔罗、歌单）的静音根本不生效。
+    /// 现在返回类型强制每个调用方处理"这条不该发"的情况，
+    /// 新增发送路径时也不可能漏掉静音。
     pub(super) fn render_template_text(
         &self,
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
-    ) -> String {
-        let command_override = self.command_reply_text(spec.key);
-        let legacy_override = self
-            .lifecycle
-            .live_configs
-            .replies
-            .read()
-            .ok()
-            .and_then(|config| config.get(spec.key).map(str::to_string));
-        let override_text = command_override.or(legacy_override);
+    ) -> Option<String> {
+        if self.command_reply_is_muted(spec.key) {
+            return None;
+        }
+        // 覆盖只来自命令面板保存的行；配置中心不再提供回复文案入口。
+        let override_text = self.command_reply_text(spec.key);
         let rendered =
             crate::features::reply_template::render(spec, override_text.as_deref(), vars);
         if !rendered.missing.is_empty() {
             log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
         }
-        rendered.text
+        Some(rendered.text)
     }
 
     fn command_reply_text(&self, key: &str) -> Option<String> {
@@ -230,10 +264,10 @@ impl ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> Result<()> {
-        if self.command_reply_is_muted(spec.key) {
+        // 静音由 render_template_text 统一处理：None 表示这条不该发。
+        let Some(text) = self.render_template_text(spec, vars) else {
             return Ok(());
-        }
-        let text = self.render_template_text(spec, vars);
+        };
         self.reply(&text)
     }
 
@@ -281,12 +315,34 @@ impl ApplicationRuntime {
         }
     }
 
+    /// 渲染卧底回复；静音时返回 None。
+    /// 渲染牌类回复模板；内层模板同样解析覆盖与静音。
+    fn render_card_game_template(
+        &self,
+        template: &crate::features::card_games::CardGameReplyTemplate,
+    ) -> Option<String> {
+        use crate::features::card_games::CardGameReplyTemplate;
+        match template {
+            CardGameReplyTemplate::Template { spec, vars } => {
+                self.render_template_text(spec, vars)
+            }
+            CardGameReplyTemplate::Composed { spec, vars, nested } => {
+                let mut resolved = Vec::with_capacity(nested.len());
+                for (name, reply) in nested {
+                    resolved.push((*name, self.render_card_game_template(reply)?));
+                }
+                self.render_template_text(spec, &vars.clone().with_nested(resolved))
+            }
+            CardGameReplyTemplate::Raw(text) => Some(text.clone()),
+        }
+    }
+
     fn render_undercover_reply(
         &self,
         reply: &crate::features::undercover::UndercoverReply,
-    ) -> String {
+    ) -> Option<String> {
         match reply {
-            crate::features::undercover::UndercoverReply::Raw(text) => text.clone(),
+            crate::features::undercover::UndercoverReply::Raw(text) => Some(text.clone()),
             crate::features::undercover::UndercoverReply::Keyed { spec, vars } => {
                 self.render_template_text(spec, vars)
             }
@@ -295,18 +351,20 @@ impl ApplicationRuntime {
                 vars,
                 fragments,
             } => {
-                let nested = fragments
-                    .iter()
-                    .map(|(name, reply)| (*name, self.render_undercover_reply(reply)))
-                    .collect();
-                let vars = vars.clone().with_nested(nested);
-                self.render_template_text(spec, &vars)
+                let mut resolved = Vec::with_capacity(fragments.len());
+                for (name, reply) in fragments {
+                    resolved.push((*name, self.render_undercover_reply(reply)?));
+                }
+                self.render_template_text(spec, &vars.clone().with_nested(resolved))
             }
-            crate::features::undercover::UndercoverReply::Joined { fragments } => fragments
-                .iter()
-                .map(|reply| self.render_undercover_reply(reply))
-                .collect::<Vec<_>>()
-                .join(""),
+            crate::features::undercover::UndercoverReply::Joined { fragments } => {
+                // 任一细分片被静音，整条拼接就不发。
+                let mut joined = String::new();
+                for reply in fragments {
+                    joined.push_str(&self.render_undercover_reply(reply)?);
+                }
+                Some(joined)
+            }
         }
     }
 }
@@ -326,13 +384,12 @@ impl CardGameDeliveryPort for ApplicationRuntime {
         message: &str,
         template: &crate::features::card_games::CardGameReplyTemplate,
     ) -> Result<bool> {
-        let rendered = match template {
-            crate::features::card_games::CardGameReplyTemplate::Template { spec, vars } => {
-                self.render_template_text(spec, vars)
-            }
-            crate::features::card_games::CardGameReplyTemplate::Raw(text) => text.clone(),
-        };
+        let rendered = self.render_card_game_template(template);
         let _ = message;
+        // 静音：这条私聊不发送，但对调用方仍算"已处理"。
+        let Some(rendered) = rendered else {
+            return Ok(true);
+        };
         self.send_friend_message(player, &rendered)
     }
 
@@ -344,18 +401,15 @@ impl CardGameDeliveryPort for ApplicationRuntime {
             .iter()
             .map(|delivery| {
                 let message = match delivery.template.as_ref() {
-                    Some(crate::features::card_games::CardGameReplyTemplate::Template {
-                        spec,
-                        vars,
-                    }) => self.render_template_text(spec, vars),
-                    Some(crate::features::card_games::CardGameReplyTemplate::Raw(text)) => {
-                        text.clone()
-                    }
-                    None => delivery.message.clone(),
+                    Some(template) => self.render_card_game_template(template),
+                    None => Some(delivery.message.clone()),
                 };
-                (delivery.player.clone(), message)
+                // 静音的条目整条剔除：不该出现在好友批次里。
+                message.map(|message| (delivery.player.clone(), message))
             })
             .collect::<Vec<_>>();
+        // 静音条目已被剔除；后续投递与重试只针对实际要发的那些。
+        let rendered: Vec<_> = rendered.into_iter().flatten().collect();
         let messages = rendered
             .iter()
             .map(|(player, message)| FriendMessage::new(player, message))
@@ -408,13 +462,11 @@ impl CardGameDeliveryPort for ApplicationRuntime {
         message: &str,
         template: &crate::features::card_games::CardGameReplyTemplate,
     ) -> Result<()> {
-        let rendered = match template {
-            crate::features::card_games::CardGameReplyTemplate::Template { spec, vars } => {
-                self.render_template_text(spec, vars)
-            }
-            crate::features::card_games::CardGameReplyTemplate::Raw(text) => text.clone(),
-        };
+        let rendered = self.render_card_game_template(template);
         let _ = message;
+        let Some(rendered) = rendered else {
+            return Ok(());
+        };
         self.reply(&rendered)
     }
 }
@@ -429,7 +481,10 @@ impl UndercoverDeliveryPort for ApplicationRuntime {
         player: &str,
         reply: &crate::features::undercover::UndercoverReply,
     ) -> Result<bool> {
-        let message = self.render_undercover_reply(reply);
+        // 静音：不发送，但对调用方仍算"已处理"。
+        let Some(message) = self.render_undercover_reply(reply) else {
+            return Ok(true);
+        };
         self.send_stable_unique_friend_message(player, &message)
     }
 
@@ -446,7 +501,9 @@ impl UndercoverDeliveryPort for ApplicationRuntime {
     }
 
     fn send_keyed_hall(&self, reply: &crate::features::undercover::UndercoverReply) -> Result<()> {
-        let message = self.render_undercover_reply(reply);
+        let Some(message) = self.render_undercover_reply(reply) else {
+            return Ok(());
+        };
         self.reply(&message)
     }
 
@@ -454,10 +511,14 @@ impl UndercoverDeliveryPort for ApplicationRuntime {
         &self,
         replies: &[crate::features::undercover::UndercoverReply],
     ) -> Result<()> {
+        // 静音条目在批量里直接跳过。
         let messages = replies
             .iter()
-            .map(|reply| self.render_undercover_reply(reply))
+            .filter_map(|reply| self.render_undercover_reply(reply))
             .collect::<Vec<_>>();
+        if messages.is_empty() {
+            return Ok(());
+        }
         self.send_redacted_hall_batch(&messages)
     }
 
@@ -468,11 +529,9 @@ impl UndercoverDeliveryPort for ApplicationRuntime {
         use crate::features::undercover::UndercoverFriendBatchOutcome;
         let rendered = deliveries
             .iter()
-            .map(|delivery| {
-                (
-                    delivery.recipient.clone(),
-                    self.render_undercover_reply(&delivery.reply),
-                )
+            .filter_map(|delivery| {
+                self.render_undercover_reply(&delivery.reply)
+                    .map(|message| (delivery.recipient.clone(), message))
             })
             .collect::<Vec<_>>();
         let messages = rendered

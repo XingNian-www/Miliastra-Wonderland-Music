@@ -48,6 +48,7 @@ pub enum CardGameEffect {
     PrivateDelivery {
         player: String,
         message: String,
+        template: Option<CardGameReplyTemplate>,
     },
     PrivateBatch {
         deliveries: Vec<LandlordPrivateDelivery>,
@@ -69,6 +70,7 @@ pub struct CardGameEffectRequest {
 pub enum CardGameEffectResult {
     FriendVerify(Result<bool>),
     PrivateDelivery(Result<bool>),
+    PrivateDeliveryTemplate(Result<bool>),
     PrivateBatch(Result<FriendBatchOutcome>),
     PrivateBatchTemplates(Result<CardGameFriendBatchOutcome>),
     HallDelivery(Result<()>),
@@ -312,12 +314,21 @@ impl CardGameApplication {
                         || delivery.verify_friend(&player, &message),
                     ))
                 }
-                CardGameEffect::PrivateDelivery { player, message } => {
-                    CardGameEffectResult::PrivateDelivery(run_card_game_delivery(
+                CardGameEffect::PrivateDelivery {
+                    player,
+                    message,
+                    template,
+                } => match template {
+                    Some(template) => CardGameEffectResult::PrivateDeliveryTemplate(
+                        run_card_game_delivery("好友消息发送", || {
+                            delivery.send_friend_template(&player, &message, &template)
+                        }),
+                    ),
+                    None => CardGameEffectResult::PrivateDelivery(run_card_game_delivery(
                         "好友消息发送",
                         || delivery.send_friend(&player, &message),
-                    ))
-                }
+                    )),
+                },
                 CardGameEffect::PrivateBatch { deliveries } => {
                     CardGameEffectResult::PrivateBatchTemplates(run_card_game_delivery(
                         "好友批量消息发送",
@@ -469,6 +480,7 @@ impl PendingCardGameEffect {
             ) | (
                 Self::DeliverHand { .. },
                 CardGameEffectResult::PrivateDelivery(_)
+                    | CardGameEffectResult::PrivateDeliveryTemplate(_)
             ) | (Self::Hall { .. }, CardGameEffectResult::HallDelivery(_))
         )
     }
@@ -583,6 +595,7 @@ impl CardGameService {
                             action,
                         }));
                     };
+                    let template = outcome.private_reply_template;
                     let generation = self.state.session_generation;
                     let request = suspend_effect(
                         &mut self.state,
@@ -591,6 +604,7 @@ impl CardGameService {
                         CardGameEffect::PrivateDelivery {
                             player: player.to_string(),
                             message,
+                            template,
                         },
                         PendingCardGameEffect::DeliverHand {
                             player: player.to_string(),
@@ -885,7 +899,8 @@ impl CardGameService {
             },
             (
                 PendingCardGameEffect::DeliverHand { player, action },
-                CardGameEffectResult::PrivateDelivery(result),
+                CardGameEffectResult::PrivateDelivery(result)
+                | CardGameEffectResult::PrivateDeliveryTemplate(result),
             ) => match result {
                 Ok(true) => Ok(CardGameResume::Completed(CardGameCompletion { action })),
                 Ok(false) => {

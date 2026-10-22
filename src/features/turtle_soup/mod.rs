@@ -122,31 +122,9 @@ pub(crate) use service::{
     parse_question_message,
 };
 
-/// 按模板渲染一条玩家可见文案——本模块所有玩家可见文案的唯一出口。
-///
-/// 业务层只声明"用哪条模板、带哪些变量"，**不知道配置存在**。
-///
-/// # 现状（重要）
-///
-/// 当前实现只渲染**内置文案**，`replies.overrides` 的覆盖对海龟汤**不生效**：
-/// 文案在这里就被渲染成 String 进 deferred 聊天队列，等到 composition 层的
-/// `impl TurtleSoupApplicationPort` / `TurtleSoupDeliveryPort` 时只剩成品字符串，
-/// 无从查配置。全部 41 条 key 已登记在 `reply_template::turtle_soup`，
-/// 但覆盖目前不会被应用。
-///
-/// # 升级路径
-///
-/// 把 `TurtleSoupCommandOutcome::immediate_reply` 与
-/// `TurtleSoupDeliveryIntent::messages` 里的 `String` 换成二元组
-/// （参照 `playback::application` 的 `ReplyMessage { spec, vars }`）：
-///
-/// ```text
-/// enum ReplyText { Raw(String), Keyed(ReplyMessage) }
-/// ```
-///
-/// `Raw` 留给汤面/汤底等题库原文与错误原因，`Keyed` 携带 (spec, vars) 一路传到
-/// composition，由那边查 `live_configs.replies` 后再渲染。届时只需把本函数换成
-/// "接收 `Option<&str>` 覆盖文案"的形态，调用点无需再动。
+/// Reply producers retain raw text or keyed template metadata until composition.
+/// The composition sender resolves configured overrides at the actual send boundary;
+/// puzzle content and dynamic text remain raw values or variable values.
 pub(crate) fn render_reply(spec: &ReplyTemplate, vars: &ReplyVars) -> String {
     crate::features::reply_template::render(spec, None, vars).text
 }
@@ -482,6 +460,7 @@ mod tests {
 
     struct CommandPort {
         replies: Vec<String>,
+        typed_replies: Vec<TurtleSoupReplyText>,
     }
 
     impl TurtleSoupApplicationPort for CommandPort {
@@ -492,7 +471,10 @@ mod tests {
         ) -> Result<TurtleSoupCommandOutcome> {
             Ok(TurtleSoupCommandOutcome {
                 action: "status",
-                immediate_reply: Some(TurtleSoupReplyText::raw("海龟汤正在进行")),
+                immediate_reply: Some(TurtleSoupReplyText::keyed(
+                    &crate::features::reply_template::turtle_soup::STATUS,
+                    ReplyVars::new().with("阶段", "进行中"),
+                )),
             })
         }
 
@@ -516,12 +498,18 @@ mod tests {
             self.replies.push(message.to_string());
             Ok(())
         }
+
+        fn send_turtle_soup_reply(&mut self, reply: TurtleSoupReplyText) -> Result<()> {
+            self.typed_replies.push(reply);
+            Ok(())
+        }
     }
 
     #[test]
-    fn command_application_delivers_the_immediate_reply() {
+    fn command_application_forwards_keyed_reply_without_rendering_it() {
         let mut port = CommandPort {
             replies: Vec::new(),
+            typed_replies: Vec::new(),
         };
 
         TurtleSoupApplication
@@ -534,7 +522,12 @@ mod tests {
             )
             .expect("turtle soup command");
 
-        assert_eq!(port.replies, ["海龟汤正在进行"]);
+        assert!(port.replies.is_empty());
+        assert!(matches!(
+            port.typed_replies.as_slice(),
+            [TurtleSoupReplyText::Keyed { spec, vars }]
+                if spec.key == "turtle_soup.status" && vars.get("阶段") == Some("进行中")
+        ));
     }
 
     #[test]

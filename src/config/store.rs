@@ -7,7 +7,7 @@
 //!
 //! 启动流程读取完整配置，Web 配置中心负责保存、历史版本和回滚。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,6 +44,13 @@ pub struct ConfigStore {
     connection: rusqlite::Connection,
     executable_root: PathBuf,
     bootstrap: BootstrapConfig,
+}
+
+/// 持久化的命令回复模板。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredReply {
+    pub key: String,
+    pub text: String,
 }
 
 /// 一次配置保存的结果。
@@ -164,11 +171,150 @@ impl ConfigStore {
             })
         })?;
         Self::ensure_schema(&mut connection, database_path)?;
+        Self::ensure_reply_schema(&connection)?;
         Ok(Self {
             connection,
             executable_root: executable_root.to_path_buf(),
             bootstrap,
         })
+    }
+
+    /// 当前命令回复存储的独立 revision。
+    pub fn reply_revision(&self) -> Result<u64> {
+        let revision: i64 = self.connection.query_row(
+            "SELECT revision FROM command_reply_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        u64::try_from(revision).context("命令回复 revision 为负数")
+    }
+
+    /// 读取命令回复；每个向量按持久化 ordinal 排序。
+    pub fn reply_templates(&self) -> Result<BTreeMap<String, Vec<StoredReply>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT command_id, ordinal, key, text FROM command_replies
+             ORDER BY command_id, ordinal",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut commands = BTreeMap::<String, Vec<StoredReply>>::new();
+        let mut empty_overrides = BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            let command_id: String = row.get(0)?;
+            let ordinal: i64 = row.get(1)?;
+            let key: String = row.get(2)?;
+            let text: String = row.get(3)?;
+            if ordinal == -1 {
+                if key.is_empty()
+                    && text.is_empty()
+                    && commands.get(&command_id).is_none_or(Vec::is_empty)
+                    && empty_overrides.insert(command_id.clone())
+                {
+                    continue;
+                }
+                bail!("命令回复存储包含无效的空列表标记");
+            }
+            if empty_overrides.contains(&command_id) {
+                bail!("空列表标记不能与普通命令回复并存");
+            }
+            let replies = commands.entry(command_id).or_default();
+            if ordinal < 0 || ordinal as usize != replies.len() {
+                bail!("命令回复存储的 ordinal 不连续");
+            }
+            replies.push(StoredReply { key, text });
+        }
+        for command_id in empty_overrides {
+            commands.insert(command_id, Vec::new());
+        }
+        Ok(commands)
+    }
+
+    /// CAS 替换已提交命令的回复列表；未提交命令不变，空向量保存为空覆盖。
+    pub fn save_reply_templates(
+        &mut self,
+        base_revision: u64,
+        commands: &BTreeMap<String, Vec<StoredReply>>,
+    ) -> Result<u64> {
+        if commands.is_empty() {
+            bail!("命令回复保存至少需要一个命令");
+        }
+        for (command_id, replies) in commands {
+            if command_id.trim().is_empty() {
+                bail!("命令回复 command_id 不能为空");
+            }
+            let mut keys = BTreeSet::new();
+            for reply in replies {
+                if reply.key.trim().is_empty() {
+                    bail!("命令回复 key 不能为空");
+                }
+                if !keys.insert(reply.key.as_str()) {
+                    bail!("命令 {command_id} 包含重复的回复 key: {}", reply.key);
+                }
+            }
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stored_revision: i64 = transaction.query_row(
+            "SELECT revision FROM command_reply_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if u64::try_from(stored_revision).context("命令回复 revision 为负数")? != base_revision
+        {
+            bail!("命令回复 revision 冲突，请刷新后重试");
+        }
+        for (command_id, replies) in commands {
+            transaction.execute(
+                "DELETE FROM command_replies WHERE command_id = ?1",
+                rusqlite::params![command_id],
+            )?;
+            if replies.is_empty() {
+                transaction.execute(
+                    "INSERT INTO command_replies (command_id, ordinal, key, text)
+                     VALUES (?1, -1, '', '')",
+                    rusqlite::params![command_id],
+                )?;
+            } else {
+                for (ordinal, reply) in replies.iter().enumerate() {
+                    let ordinal = i64::try_from(ordinal).context("回复列表过长")?;
+                    transaction.execute(
+                        "INSERT INTO command_replies (command_id, ordinal, key, text)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![command_id, ordinal, reply.key, reply.text],
+                    )?;
+                }
+            }
+        }
+        let next_revision = stored_revision
+            .checked_add(1)
+            .context("命令回复 revision 溢出")?;
+        transaction.execute(
+            "UPDATE command_reply_meta SET revision = ?1 WHERE id = 1",
+            rusqlite::params![next_revision],
+        )?;
+        transaction.commit()?;
+        u64::try_from(next_revision).context("命令回复 revision 为负数")
+    }
+
+    fn ensure_reply_schema(connection: &rusqlite::Connection) -> Result<()> {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS command_reply_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                revision INTEGER NOT NULL CHECK (revision >= 0)
+             );
+             INSERT OR IGNORE INTO command_reply_meta (id, revision) VALUES (1, 0);
+             CREATE TABLE IF NOT EXISTS command_replies (
+                command_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                text TEXT NOT NULL,
+                PRIMARY KEY (command_id, ordinal),
+                UNIQUE (command_id, key),
+                CHECK ((ordinal = -1 AND key = '' AND text = '') OR
+                       (ordinal >= 0 AND key <> ''))
+             );",
+        )?;
+        Ok(())
     }
 
     /// 打开连接并设置连接参数（WAL 等）；独立成函数供 open 的并发重试使用。
@@ -1579,10 +1725,88 @@ mod tests {
     }
 
     #[test]
+    fn reply_templates_preserve_order_partial_replacement_empty_override_and_cas() {
+        let (root, database_path) = temp_database("reply-store");
+        let bootstrap = test_bootstrap(&database_path);
+        let mut first = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let mut second = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        assert_eq!(first.reply_revision().unwrap(), 0);
+        assert!(first.reply_templates().unwrap().is_empty());
+        assert!(first.save_reply_templates(0, &BTreeMap::new()).is_err());
+
+        let initial = BTreeMap::from([
+            (
+                "@游戏A".to_string(),
+                vec![
+                    StoredReply {
+                        key: "first".into(),
+                        text: "line one".into(),
+                    },
+                    StoredReply {
+                        key: "second".into(),
+                        text: "line two".into(),
+                    },
+                ],
+            ),
+            (
+                "@游戏B".to_string(),
+                vec![StoredReply {
+                    key: "keep".into(),
+                    text: "retained".into(),
+                }],
+            ),
+        ]);
+        assert_eq!(first.save_reply_templates(0, &initial).unwrap(), 1);
+        let loaded = first.reply_templates().unwrap();
+        assert_eq!(loaded["@游戏A"], initial["@游戏A"]);
+        assert_eq!(loaded["@游戏B"], initial["@游戏B"]);
+
+        let updates = BTreeMap::from([
+            (
+                "@游戏A".to_string(),
+                vec![StoredReply {
+                    key: "third".into(),
+                    text: "replacement".into(),
+                }],
+            ),
+            ("@游戏B".to_string(), Vec::new()),
+        ]);
+        assert_eq!(first.save_reply_templates(1, &updates).unwrap(), 2);
+        let saved = first.reply_templates().unwrap();
+        assert_eq!(saved["@游戏A"], updates["@游戏A"]);
+        assert!(saved["@游戏B"].is_empty());
+        assert_eq!(first.reply_revision().unwrap(), 2);
+
+        let stale = BTreeMap::from([("@游戏A".to_string(), Vec::new())]);
+        assert!(second.save_reply_templates(1, &stale).is_err());
+        assert_eq!(second.reply_revision().unwrap(), 2);
+        assert_eq!(
+            second.reply_templates().unwrap(),
+            first.reply_templates().unwrap()
+        );
+        drop(second);
+        drop(first);
+        let reopened = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        assert_eq!(reopened.reply_revision().unwrap(), 2);
+        let reopened_rows = reopened.reply_templates().unwrap();
+        assert_eq!(reopened_rows["@游戏A"], updates["@游戏A"]);
+        assert!(reopened_rows["@游戏B"].is_empty());
+        cleanup(&root);
+    }
+
+    #[test]
     fn previous_schema_resets_only_configuration_and_preserves_cache() {
         let (root, database_path) = temp_database("schema-reset-cache");
         let bootstrap = test_bootstrap(&database_path);
         let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let reply_data = BTreeMap::from([(
+            "@preserved".to_string(),
+            vec![StoredReply {
+                key: "answer".into(),
+                text: "survives reset".into(),
+            }],
+        )]);
+        assert_eq!(store.save_reply_templates(0, &reply_data).unwrap(), 1);
         let mut sections = full_sections(&store);
         sections["queue"]["max_size"] = json!(20);
         sections["ai"]["api_key"] = json!("old-secret");
@@ -1604,6 +1828,8 @@ mod tests {
         drop(store);
 
         let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        assert_eq!(store.reply_revision().unwrap(), 1);
+        assert_eq!(store.reply_templates().unwrap(), reply_data);
         // 按真实持久化 JSON 往返比较；f32 转 JSON 数字再解析可能有末位舍入差异。
         let expected: Value = serde_json::from_str(
             &serde_json::to_string(&AppConfig::default().to_db_value()).unwrap(),
@@ -1668,6 +1894,89 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, 1);
+        drop(store);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn omitted_optional_song_source_survives_strict_load_save_and_reopen() {
+        let (root, database_path) = temp_database("optional-song-source");
+        let bootstrap = test_bootstrap(&database_path);
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        // 当前 schema 已有的权限段只有 overrides；新可选字段没有落库。
+        let access = json!({"overrides": {"@点歌": {"enabled": false, "minimum_role": "admin"}}});
+        store
+            .connection
+            .execute(
+                "UPDATE config_sections SET value_json = ?1 WHERE section = 'command_access'",
+                rusqlite::params![serde_json::to_string(&access).unwrap()],
+            )
+            .unwrap();
+        drop(store);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let loaded = store.load_full().unwrap();
+        assert_eq!(loaded.command_access.default_song_source, None);
+        assert!(!loaded.command_access.overrides["@点歌"].enabled);
+        assert_eq!(store.current_revision().unwrap(), 1, "打开旧段不能触发迁移");
+        assert_eq!(stored_section(&database_path, "command_access"), access);
+        let sections = Map::from_iter([("command_access".into(), access.clone())]);
+        assert!(store.validate_candidate(&sections).unwrap().is_empty());
+        assert_eq!(store.save(1, sections).unwrap().revision, 2);
+        assert_eq!(stored_section(&database_path, "command_access"), access);
+        assert_eq!(latest_snapshot(&database_path)["command_access"], access);
+        drop(store);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        assert_eq!(
+            store
+                .load_full()
+                .unwrap()
+                .command_access
+                .default_song_source,
+            None
+        );
+        assert_eq!(store.current_value().unwrap()["command_access"], access);
+        let mut with_source = access.clone();
+        with_source["default_song_source"] = json!("netease");
+        let sections = Map::from_iter([("command_access".into(), with_source.clone())]);
+        assert_eq!(store.save(2, sections).unwrap().revision, 3);
+        drop(store);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        assert_eq!(
+            store
+                .load_full()
+                .unwrap()
+                .command_access
+                .default_song_source
+                .as_deref(),
+            Some("netease")
+        );
+        assert_eq!(
+            stored_section(&database_path, "command_access"),
+            with_source
+        );
+        assert_eq!(
+            latest_snapshot(&database_path)["command_access"],
+            with_source
+        );
+        for invalid in [Value::Null, json!("unknown-platform")] {
+            let mut candidate = access.clone();
+            candidate["default_song_source"] = invalid;
+            let sections = Map::from_iter([("command_access".into(), candidate)]);
+            assert!(!store.validate_candidate(&sections).unwrap().is_empty());
+            assert!(store.save(3, sections).is_err());
+            assert_eq!(store.current_revision().unwrap(), 3);
+            assert_eq!(
+                stored_section(&database_path, "command_access"),
+                with_source
+            );
+            assert_eq!(
+                latest_snapshot(&database_path)["command_access"],
+                with_source
+            );
+        }
         drop(store);
         cleanup(&root);
     }

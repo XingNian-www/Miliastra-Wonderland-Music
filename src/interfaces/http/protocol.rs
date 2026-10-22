@@ -130,6 +130,10 @@ struct BodyRouteSpec {
 
 const BODY_ROUTES: &[BodyRouteSpec] = &[
     BodyRouteSpec {
+        path: "/commands/replies",
+        handler: commands_replies_save_route,
+    },
+    BodyRouteSpec {
         path: "/commands/policy",
         handler: commands_policy_save_route,
     },
@@ -297,6 +301,12 @@ const ROUTES: &[RouteSpec] = &[
         json: true,
         mutating: true,
         handler: debug_mode_route,
+    },
+    RouteSpec {
+        path: "/commands/replies",
+        json: true,
+        mutating: false,
+        handler: commands_replies_route,
     },
     RouteSpec {
         path: "/commands/catalog",

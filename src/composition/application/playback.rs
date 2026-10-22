@@ -241,8 +241,8 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         vars: &crate::features::reply_template::ReplyVars,
     ) -> String {
         // 队列分批消息只调 render_reply，必须与 reply_template 共用同一条渲染路径，
-        // 否则这些消息会绕过用户配置的覆盖文案。
-        self.render_template_text(spec, vars)
+        // 否则这些消息会绕过用户配置的覆盖文案。静音时给空串，调用方会跳过空行。
+        self.render_template_text(spec, vars).unwrap_or_default()
     }
 
     fn reply_template(
@@ -250,10 +250,11 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> Result<()> {
-        if self.command_reply_is_muted(spec.key) {
+        // 静音由渲染入口统一处理，这里不再重复判断。
+        let text = self.render_reply(spec, vars);
+        if text.is_empty() {
             return Ok(());
         }
-        let text = self.render_reply(spec, vars);
         ApplicationRuntime::reply(self, &text)
     }
 

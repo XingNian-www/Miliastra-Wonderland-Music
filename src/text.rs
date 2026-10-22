@@ -45,6 +45,18 @@ pub(crate) fn char_width(ch: char) -> usize {
     if ch.is_ascii() { 1 } else { 2 }
 }
 
+/// 按聊天宽度适配一条消息：放得下就原样返回，放不下才分段编号。
+///
+/// 这个判断必须收在一处：渲染方（组装层）和测试助手中任何一处忘记"短文本不编号"，
+/// 都会让玩家看到与内容无关的 "1/1：" 前缀。
+pub(crate) fn fit_chat_message(label: &str, message: &str) -> Vec<String> {
+    if display_width(message) <= MAX_CHAT_WIDTH {
+        vec![message.to_string()]
+    } else {
+        split_numbered_chat_message(label, message)
+    }
+}
+
 pub(crate) fn split_numbered_chat_message(label: &str, message: &str) -> Vec<String> {
     let source = normalize_segment_source(message);
     let mut expected_total = 1usize;
@@ -171,6 +183,27 @@ mod tests {
     fn comparison_text_ignores_width_case_whitespace_and_punctuation() {
         assert_eq!(normalize_comparison_text(" ＡbＣ，萌！ "), "abc萌");
         assert_eq!(normalize_comparison_text("当前 大厅"), "当前大厅");
+    }
+
+    #[test]
+    fn short_messages_are_not_numbered() {
+        // 放得下就原样发送：给短文案加 "1/1：" 是纯噪声。
+        // 这条同时守住生产路径（组装层渲染）与测试助手共用的同一个判断，
+        // 两边曾经分叉过一次，导致生产给塔罗短文案加了编号。
+        let messages = fit_chat_message("塔罗", "今日塔罗牌");
+        assert_eq!(messages, ["今日塔罗牌"]);
+    }
+
+    #[test]
+    fn overlong_messages_are_split_and_numbered() {
+        let messages = fit_chat_message("塔罗", &"很长".repeat(80));
+        assert!(messages.len() > 1);
+        assert!(messages[0].starts_with("塔罗1/"));
+        assert!(
+            messages
+                .iter()
+                .all(|message| display_width(message) <= MAX_CHAT_WIDTH)
+        );
     }
 
     #[test]

@@ -5519,8 +5519,15 @@ fn command_replies_http_roundtrip_preserves_order_mute_partial_updates_and_confl
 
     let initial: Value =
         serde_json::from_str(&http_get(address, "/commands/replies", None).body).unwrap();
-    assert_eq!(initial["commands"][0]["id"], "@帮助");
-    assert_eq!(initial["commands"][0]["orderedBatch"], true);
+    // 目录顺序跟随回复归属表（点歌 → 播放 → 大厅 → 娱乐 → 管理），
+    // 不再按旧的手写清单从帮助开始。
+    let help = initial["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@帮助")
+        .expect("帮助命令仍在回复目录中");
+    assert_eq!(help["orderedBatch"], true);
     let initial_volume = initial["commands"]
         .as_array()
         .unwrap()
@@ -5548,9 +5555,11 @@ fn command_replies_http_roundtrip_preserves_order_mute_partial_updates_and_confl
             {"key":"tarot.help.draw","text":"1 抽牌"},
             {"key":"tarot.help.reroll","text":"2 重抽"}
         ]},
-        {"id":"#海龟汤","replies":[{"key":"turtle_soup.start.failed","text":"开局错误：{原因}"}]},
-        {"id":"#状态（海龟汤）","replies":[{"key":"turtle_soup.status","text":"{阶段} / {秒数}s {人数} {提问数}"}]},
-        {"id":"#结束（海龟汤）","replies":[{"key":"turtle_soup.end.failed","text":"结束错误：{原因}"}]},
+        {"id":"#海龟汤","replies":[
+            {"key":"turtle_soup.start.failed","text":"开局错误：{原因}"},
+            {"key":"turtle_soup.status","text":"{阶段} / {秒数}s {人数} {提问数}"},
+            {"key":"turtle_soup.end.failed","text":"结束错误：{原因}"}
+        ]},
         {"id":"@音量","replies":[{"key":"playback.volume.set","text":"音量调整完成：{音量}"}]}
     ]})
     .to_string();
@@ -5636,41 +5645,31 @@ fn command_replies_http_roundtrip_preserves_order_mute_partial_updates_and_confl
     assert_eq!(tarot_help["replies"][1]["key"], "tarot.help.draw");
     assert_eq!(tarot_help["replies"][2]["key"], "tarot.help.reroll");
 
-    let turtle_status = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "#状态（海龟汤）")
-        .unwrap();
-    assert_eq!(turtle_status["orderedBatch"], false);
-    assert_eq!(
-        turtle_status["allowedVariables"],
-        json!(["人数", "提问数", "秒数", "阶段"])
-    );
-    assert_eq!(
-        turtle_status["replies"][0]["text"],
-        "{阶段} / {秒数}s {人数} {提问数}"
-    );
-
-    let turtle_start = after["commands"]
+    // 海龟汤的状态/结束回复已并入单一命令 #海龟汤：
+    // 旧库里的 "#状态（海龟汤）"/"#结束（海龟汤）" 仍可读写（别名归一），
+    // 但面板只保留一个入口，避免同一条文案分散在三处编辑。
+    let turtle = after["commands"]
         .as_array()
         .unwrap()
         .iter()
         .find(|row| row["id"] == "#海龟汤")
         .unwrap();
-    assert_eq!(turtle_start["allowedVariables"], json!(["原因"]));
-    assert_eq!(
-        turtle_start["replies"][0]["key"],
-        "turtle_soup.start.failed"
-    );
-
-    let turtle_end = after["commands"]
+    assert_eq!(turtle["orderedBatch"], false);
+    let turtle_keys: Vec<_> = turtle["replies"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|row| row["id"] == "#结束（海龟汤）")
-        .unwrap();
-    assert_eq!(turtle_end["replies"][0]["key"], "turtle_soup.end.failed");
+        .filter(|row| row["active"] == true)
+        .map(|row| row["key"].as_str().unwrap())
+        .collect();
+    assert!(turtle_keys.contains(&"turtle_soup.status"));
+    assert!(turtle_keys.contains(&"turtle_soup.start.failed"));
+    assert!(turtle_keys.contains(&"turtle_soup.end.failed"));
+    assert!(turtle["allowedVariables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|name| name == "阶段"));
 
     let playlist_help = after["commands"]
         .as_array()
@@ -5737,7 +5736,9 @@ fn command_replies_http_roundtrip_preserves_order_mute_partial_updates_and_confl
         serde_json::from_str::<Value>(&stale.body).unwrap()["code"],
         "reply_conflict"
     );
-    let invalid = json!({"baseRevision":revision+1,"commands":[{"id":"@帮助","replies":[{"key":"help.song_request.1","text":"   "}]}]}).to_string();
+    // 留空现在是合法语义（恢复内置默认），所以这里改用真正的非法输入：
+    // 未知变量占位符必须被拒绝。
+    let invalid = json!({"baseRevision":revision+1,"commands":[{"id":"@帮助","replies":[{"key":"help.song_request.1","text":"未知变量 {不存在的变量}"}]}]}).to_string();
     assert_ne!(
         http_post_json(address, "/commands/replies", &invalid, None).status_line,
         "HTTP/1.1 200 OK"

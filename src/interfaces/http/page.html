@@ -238,6 +238,21 @@ button,input,select,textarea{font:inherit}
 input,select,textarea{width:100%;height:var(--btn-h);min-width:0;border:1px solid var(--sep-1);background:var(--bg-input);color:var(--text-1);border-radius:var(--radius-s);padding:0 var(--sp-2);outline:none;transition:border-color .2s ease,box-shadow .2s ease,background-color .2s ease}
 textarea{height:auto;min-height:74px;padding:var(--sp-1) var(--sp-2);resize:vertical}
 .config-prompt-text{min-height:220px;line-height:1.5;white-space:pre-wrap}
+.reply-template-editor{display:grid;gap:var(--sp-3)}
+.reply-template-search{display:grid;grid-template-columns:110px minmax(0,1fr);gap:var(--sp-2);align-items:center;color:var(--text-2);font-size:var(--fs-meta)}
+.reply-template-groups{display:grid;gap:var(--sp-4);max-height:68vh;overflow:auto;padding-right:var(--sp-1)}
+.reply-template-group{min-width:0}
+.reply-template-group h3{position:sticky;top:0;z-index:1;margin:0;padding:var(--sp-2) 0;background:var(--bg-ground);border-bottom:1px solid var(--sep-1);font-size:var(--fs-item)}
+.reply-template-row{display:grid;gap:var(--sp-1);padding:var(--sp-3) var(--sp-1);border-bottom:1px solid var(--sep-2);min-width:0}
+.reply-template-meta{display:flex;justify-content:space-between;align-items:baseline;gap:var(--sp-2)}
+.reply-template-meta strong{font-size:var(--fs-item);font-weight:600}
+.reply-template-meta code,.reply-template-vars code{font-family:var(--font-mono);font-size:var(--fs-tiny);color:var(--text-2);overflow-wrap:anywhere}
+.reply-template-default{display:grid;grid-template-columns:76px minmax(0,1fr);gap:var(--sp-2);font-size:var(--fs-meta);color:var(--text-2)}
+.reply-template-default div{white-space:pre-wrap;overflow-wrap:anywhere}
+.reply-template-vars{font-size:var(--fs-tiny);color:var(--text-3)}
+.reply-template-edit{display:grid;grid-template-columns:76px minmax(0,1fr);gap:var(--sp-2);align-items:start;font-size:var(--fs-meta);color:var(--text-2)}
+.reply-template-edit textarea{min-height:46px;line-height:1.45}
+@media(max-width:720px){.reply-template-search,.reply-template-default,.reply-template-edit{grid-template-columns:1fr;gap:var(--sp-1)}.reply-template-meta{align-items:flex-start;flex-direction:column}.reply-template-groups{max-height:none}}
 input::placeholder,textarea::placeholder{color:var(--text-3)}
 input:hover,select:hover,textarea:hover{border-color:var(--text-3)}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
@@ -3162,6 +3177,33 @@ function configControlHtml(field,value){
     const rows=items.map(item=>'<div class="config-string-row" data-cfg-row><input type="text" data-cfg="'+path+'" data-cfg-array="1" value="'+esc(String(item))+'"><button type="button" class="btn small ghost" onclick="configArrayRemove(this)">删除</button></div>').join('')
     return '<div class="config-array" id="'+id+'">'+rows+'<div class="config-string-row"><button type="button" class="btn small" onclick="configArrayAdd('+esc(JSON.stringify(path))+')">添加一行</button></div></div>'
   }
+  if(kind==='replyTemplates'){
+    const items=Array.isArray(field.kind.items)?field.kind.items:[]
+    const overrides=value&&typeof value==='object'?value:{}
+    const groups=new Map()
+    for(const item of items){const group=String(item.group||'其他');if(!groups.has(group))groups.set(group,[]);groups.get(group).push(item)}
+    let html='<div class="reply-template-editor" id="'+id+'" data-cfg="'+path+'" data-cfg-reply-templates="1">'
+    html+='<label class="reply-template-search">筛选文案<input type="search" data-reply-search placeholder="按用途、默认文案或变量筛选"></label>'
+    html+='<div class="reply-template-groups">'
+    for(const [group,entries] of groups){
+      html+='<section class="reply-template-group"><h3>'+esc(group)+'</h3>'
+      for(const item of entries){
+        const key=String(item.key||'')
+        const current=Object.prototype.hasOwnProperty.call(overrides,key)?String(overrides[key]??''):''
+        const variables=Array.isArray(item.variables)?item.variables:[]
+        const search=[item.summary,item.default,variables.join(' '),key].join(' ').toLowerCase()
+        html+='<article class="reply-template-row" data-reply-row data-reply-search-text="'+esc(search)+'">'
+        html+='<div class="reply-template-meta"><strong>'+esc(item.summary||key)+'</strong><code>'+esc(key)+'</code></div>'
+        html+='<div class="reply-template-default"><span>内置默认</span><div>'+esc(item.default||'')+'</div></div>'
+        if(variables.length)html+='<div class="reply-template-vars">变量：'+variables.map(v=>'<code>{'+esc(v)+'}</code>').join(' ' )+'</div>'
+        html+='<label class="reply-template-edit">自定义文案<textarea data-reply-override="'+esc(key)+'" rows="2" maxlength="300" placeholder="留空则使用内置默认文案">'+esc(current)+'</textarea></label>'
+        html+='</article>'
+      }
+      html+='</section>'
+    }
+    html+='</div></div>'
+    return html
+  }
   if(kind==='object'){
     // 有子字段 schema 声明的可空对象（如 audio_cache）→ 结构化开关，禁止手填 JSON；
     // 无子字段声明的自由对象（ai.extra_body、custom_workflows 等）→ 高级 JSON 编辑。
@@ -3311,6 +3353,12 @@ function onConfigObjectToggle(el,field){
 }
 function onConfigFormInput(e){
   const el=e.target
+  if(el&&el.dataset&&el.dataset.replyOverride!==undefined){markConfigDirty('replies');return}
+  if(el&&el.dataset&&el.dataset.replySearch!==undefined){
+    const query=String(el.value||'').trim().toLowerCase()
+    document.querySelectorAll('[data-reply-row]').forEach(row=>row.classList.toggle('hidden',!!query&&!String(row.dataset.replySearchText||'').includes(query)))
+    return
+  }
   const path=el&&el.dataset&&el.dataset.cfg
   if(!path)return
   const field=configFieldByPath(path)
@@ -3364,6 +3412,19 @@ function collectConfigFieldValue(field,sectionName){
   const kind=field.kind&&field.kind.type
   const el=document.getElementById(configControlId(field.path))
   if(!el)return {skip:true}
+  if(kind==='replyTemplates'){
+    const overrides=el.querySelectorAll('[data-reply-override]')
+    const result={}
+    const existing=configValueAt(sectionName,field.path)
+    if(existing&&typeof existing==='object'&&!Array.isArray(existing))Object.assign(result,existing)
+    for(const input of overrides){
+      const key=input.dataset.replyOverride
+      const text=String(input.value||'')
+      if(text.trim())result[key]=text
+      else delete result[key]
+    }
+    return {value:result}
+  }
   // 父级 nullable object 未启用（开关关闭 / textarea 为 null / 库中为 null）
   // → 跳过子字段，避免把旧子字段写回提交段导致父级重新变成对象。
   const parent=configNullableObjectParent(sectionName,field.path)

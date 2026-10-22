@@ -7,14 +7,14 @@ use super::friend_delivery::{
 };
 use super::state_observation::wait_for_stable_ui_kind;
 use crate::adapters::game_path::resolve_game_executable;
+use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
+use crate::geometry::{Point, Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiStateKind, UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
-use crate::geometry::{Point, Rect, crop_canvas};
 use crate::ui::state::find_enter_game_text as locate_enter_game_text;
 use crate::ui::state::world_is_teyvat;
 use crate::ui::template::best_template_hit;

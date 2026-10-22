@@ -12,7 +12,6 @@ use crate::runtime::chat_listener::{ChatListenerMode, ChatListenerSnapshot};
 
 const IDLE_EXIT_MIN_MINUTES: u32 = 15;
 
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AdministrationCommandContext {
     pub(crate) message_type: String,
@@ -80,8 +79,7 @@ impl AdministrationApplication {
         match command {
             AdministrationCommand::Help => {
                 port.log_executed(context, "help")?;
-                let lines =
-                    help_lines(port, &reply_template::HELP_SONG_REQUEST, &ReplyVars::new());
+                let lines = help_lines(port, &reply_template::HELP_SONG_REQUEST, &ReplyVars::new());
                 let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
                 port.send_hall_batch(&borrowed, self.help_batch_ms)
             }

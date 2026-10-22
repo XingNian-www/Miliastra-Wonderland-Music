@@ -30,12 +30,12 @@ mod tools;
 
 #[path = "routes/ai.rs"]
 mod ai_routes;
+#[path = "routes/commands.rs"]
+mod commands_routes;
 #[path = "routes/config.rs"]
 mod config_routes;
 #[path = "routes/debug.rs"]
 mod debug_routes;
-#[path = "routes/commands.rs"]
-mod commands_routes;
 #[path = "routes/entertainment.rs"]
 mod entertainment_routes;
 #[path = "routes/operator.rs"]
@@ -48,9 +48,9 @@ mod system_routes;
 mod tasks_chat_routes;
 
 use ai_routes::*;
+use commands_routes::*;
 use config_routes::*;
 use debug_routes::*;
-use commands_routes::*;
 use entertainment_routes::*;
 use operator_routes::*;
 use playback_routes::*;
@@ -93,6 +93,7 @@ use crate::features::startup::{StartupConfig, StartupSource, StartupTask};
 use crate::features::turtle_soup::{
     TurtleSoupMutationIntent, TurtleSoupMutationOutcome, TurtleSoupSubmission,
 };
+use crate::geometry::parse_rect;
 #[cfg(test)]
 use crate::interfaces::chat::PendingCommand;
 use crate::runtime::business::{BusinessMutationIntent, BusinessMutationOutcome};
@@ -101,7 +102,6 @@ use crate::runtime::decision::DecisionAction;
 use crate::runtime::monitor::MonitorShared;
 use crate::runtime::scheduler::{FormalTaskCancelOutcome, FormalTaskEnqueueOutcome};
 use crate::ui::frame::LatestFrameCache;
-use crate::geometry::parse_rect;
 use miliastra_playback::{ProviderId, TrackKey};
 pub(crate) use tools::{WebToolRequest, WebToolTemplate};
 use uuid::Uuid;

@@ -66,8 +66,7 @@ pub(crate) use controller::{
 };
 pub(crate) use dedup::{PersistentSongDedupHistory, SongDedupCandidate};
 pub(crate) use format::{
-    PlaybackSnapshot, estimated_player_status, format_lyrics, format_status_with_mode,
-    is_playing,
+    PlaybackSnapshot, estimated_player_status, format_lyrics, format_status_with_mode, is_playing,
 };
 use miliastra_kernel::clock::WallClock;
 pub(crate) use queue::{PersistentQueue, QueueItem};
@@ -779,7 +778,11 @@ impl PlaybackService {
     pub(crate) fn push_queue(&mut self, item: QueueItem) -> Result<QueuePushOutcome> {
         // 判重与入队在同一 actor 消息内完成，闭合「先查后写」的并发窗口。
         let duplicate = !item.playlist_auto && self.queue.contains_duplicate(&item);
-        let accepted = if duplicate { false } else { self.queue.push(item)? };
+        let accepted = if duplicate {
+            false
+        } else {
+            self.queue.push(item)?
+        };
         Ok(QueuePushOutcome {
             accepted,
             size: self.queue.len(),
@@ -789,7 +792,11 @@ impl PlaybackService {
 
     pub(crate) fn push_queue_next(&mut self, item: QueueItem) -> Result<QueuePushOutcome> {
         let duplicate = !item.playlist_auto && self.queue.contains_duplicate(&item);
-        let accepted = if duplicate { false } else { self.queue.push_next(item)? };
+        let accepted = if duplicate {
+            false
+        } else {
+            self.queue.push_next(item)?
+        };
         Ok(QueuePushOutcome {
             accepted,
             size: self.queue.len(),

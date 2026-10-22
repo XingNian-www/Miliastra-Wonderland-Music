@@ -62,6 +62,8 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "custom_workflows.templates",
     "custom_workflows.workflows",
     "identity.mappings",
+    "command_access.overrides",
+    "visual.name",
     "replies.overrides",
 ];
 
@@ -333,6 +335,8 @@ impl LiveConfigs {
         effective.matching = config.matching.clone();
         effective.custom_workflows = config.custom_workflows.clone();
         effective.identity = config.identity.clone();
+        effective.command_access = config.command_access.clone();
+        effective.visual = config.visual.clone();
         self.effective.replace(effective);
     }
 }
@@ -387,6 +391,26 @@ mod tests {
             }],
         };
         config
+    }
+
+    #[test]
+    fn panel_command_policy_and_visual_name_apply_without_restart() {
+        let live = LiveConfigs::default();
+        let mut changed = AppConfig::default();
+        changed.visual.name = "我的档案".into();
+        changed.command_access.overrides.insert(
+            "@点歌".into(),
+            crate::features::command_access::CommandPolicy {
+                enabled: false,
+                minimum_role: crate::features::command_access::CommandPermission::Admin,
+            },
+        );
+        live.apply(&changed);
+        assert_eq!(live.snapshot().visual.name, "我的档案");
+        assert!(!live.snapshot().command_access.overrides["@点歌"].enabled);
+        live.apply(&AppConfig::default());
+        assert!(live.snapshot().command_access.overrides.is_empty());
+        assert_eq!(live.snapshot().visual.name, "1080P");
     }
 
     #[test]

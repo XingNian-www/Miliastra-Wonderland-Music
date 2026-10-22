@@ -445,10 +445,648 @@ fn responses_output_text(response: &Response) -> anyhow::Result<String> {
     bail!("AI 响应缺少 output_text")
 }
 
+/// One native tool conversation. History is replayed in full, including Responses
+/// reasoning items, so this does not depend on server-side response storage.
+pub(crate) struct ToolSession {
+    target: ResolvedAiTarget,
+    http_proxy: String,
+    system: String,
+    tools: Vec<Value>,
+    names: std::collections::HashSet<String>,
+    history: Vec<Value>,
+    seen: std::collections::HashSet<String>,
+    pending: std::collections::HashSet<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentReply {
+    pub(crate) text: String,
+    pub(crate) calls: Vec<AgentToolCall>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
+}
+
+impl ToolSession {
+    pub(crate) fn new(
+        config: &AiConfig,
+        feature_model: &str,
+        system: &str,
+        user: &str,
+        tools: Vec<Value>,
+    ) -> Result<Self> {
+        Self::with_history(config, feature_model, system, Vec::new(), user, tools)
+    }
+
+    /// Replay completed text turns before the current user message. Historical
+    /// messages cannot supply system instructions or native tool-call metadata.
+    pub(crate) fn with_history(
+        config: &AiConfig,
+        feature_model: &str,
+        system: &str,
+        mut history: Vec<Value>,
+        user: &str,
+        tools: Vec<Value>,
+    ) -> Result<Self> {
+        if history.len() % 2 != 0 {
+            bail!("AI 历史消息必须包含完整的 user/assistant 对话轮次");
+        }
+        for (index, message) in history.iter().enumerate() {
+            let object = message
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("AI 历史消息必须是 JSON object"))?;
+            if object.len() != 2 || !object.contains_key("role") || !object.contains_key("content")
+            {
+                bail!("AI 历史消息只允许 role 和 content 字段");
+            }
+            let expected_role = if index % 2 == 0 { "user" } else { "assistant" };
+            if message["role"].as_str() != Some(expected_role) {
+                bail!("AI 历史消息必须按 user/assistant 交替排列");
+            }
+            if !message["content"].is_string() {
+                bail!("AI 历史消息 content 必须是字符串");
+            }
+        }
+        history.push(serde_json::json!({"role":"user", "content":user}));
+        let target = config.resolve(feature_model)?;
+        target.build_target()?;
+        validate_http_proxy(&config.http_proxy)?;
+        validate_extra_body(target.provider, &target.extra_body)?;
+        let mut names = std::collections::HashSet::new();
+        for tool in &tools {
+            if tool["type"] != "function" || !tool["function"].is_object() {
+                bail!("AI 工具定义必须是 Chat Completions function 格式");
+            }
+            let function = &tool["function"];
+            let name = tool_string(function, "name")?;
+            validate_tool_name(name)?;
+            if !names.insert(name.to_string()) {
+                bail!("AI 工具名重复: {name}");
+            }
+            if !function["parameters"].is_object() {
+                bail!("AI 工具 parameters 必须是 JSON object");
+            }
+        }
+        Ok(Self {
+            target,
+            http_proxy: config.http_proxy.clone(),
+            system: system.to_string(),
+            tools,
+            names,
+            history,
+            seen: Default::default(),
+            pending: Default::default(),
+        })
+    }
+
+    fn request_body(&self, max_tokens: u32, allow_tools: bool) -> Result<Value> {
+        if !self.pending.is_empty() {
+            bail!("AI 工具调用尚未全部追加结果");
+        }
+        let enabled = allow_tools && !self.tools.is_empty();
+        let tools: Vec<Value> = match self.target.wire_api {
+            WireApi::ChatCompletions => self.tools.clone(),
+            WireApi::Responses => self
+                .tools
+                .iter()
+                .map(|tool| {
+                    let mut function = tool["function"].clone();
+                    function["type"] = Value::String("function".into());
+                    function
+                })
+                .collect(),
+        };
+        let mut body = serde_json::json!({
+            "model": self.target.model,
+            "stream": false,
+            "store": false,
+            "tools": tools,
+            "tool_choice": if enabled { "auto" } else { "none" },
+        });
+        match self.target.wire_api {
+            WireApi::Responses => {
+                body["instructions"] = self.system.clone().into();
+                body["max_output_tokens"] = max_tokens.into();
+                body["input"] = self.history.clone().into();
+                // With store:false, retain the encrypted reasoning content when provided.
+                body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+            }
+            WireApi::ChatCompletions => {
+                let mut messages =
+                    vec![serde_json::json!({"role":"system", "content":self.system})];
+                messages.extend(self.history.clone());
+                body["messages"] = messages.into();
+                body["max_completion_tokens"] = max_tokens.into();
+            }
+        }
+        Ok(body)
+    }
+
+    fn responses_request(&self, max_tokens: u32, allow_tools: bool) -> Result<CreateResponse> {
+        use async_openai::types::responses::{InputItem, InputParam, Item};
+        let mut body = self.request_body(max_tokens, allow_tools)?;
+        // Explicitly deserialize structured items, avoiding the SDK's untagged
+        // item-reference alternative swallowing IDs and dropping item contents.
+        body["input"] = serde_json::json!([]);
+        let mut request: CreateResponse =
+            serde_json::from_value(body).context("AI Responses 工具请求无效")?;
+        let items = self
+            .history
+            .iter()
+            .map(|item| {
+                if item.get("type").is_some() {
+                    serde_json::from_value::<Item>(item.clone()).map(InputItem::Item)
+                } else {
+                    serde_json::from_value(item.clone())
+                }
+            })
+            .collect::<std::result::Result<Vec<InputItem>, _>>()
+            .context("AI Responses 会话历史无效")?;
+        request.input = InputParam::Items(items);
+        Ok(request)
+    }
+
+    pub(crate) fn request(
+        &mut self,
+        runtime: &miliastra_kernel::ai::OpenAiRuntimeHandle,
+        max_tokens: u32,
+        timeout: std::time::Duration,
+        allow_tools: bool,
+    ) -> Result<AgentReply> {
+        let runtime = runtime.with_http_proxy(&self.http_proxy)?;
+        match self.target.wire_api {
+            WireApi::Responses => {
+                let request = self.responses_request(max_tokens, allow_tools)?;
+                let response = runtime
+                    .create_response(
+                        self.target.build_target()?,
+                        request,
+                        &self.target.extra_body,
+                        timeout,
+                    )?
+                    .wait()
+                    .context("AI 工具请求失败")?;
+                if serde_json::to_value(&response)?["status"] != "completed" {
+                    bail!("AI Responses 响应未完成");
+                }
+                let output = response
+                    .output
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                self.accept_output(output, allow_tools)
+            }
+            WireApi::ChatCompletions => {
+                let request: CreateChatCompletionRequest =
+                    serde_json::from_value(self.request_body(max_tokens, allow_tools)?)
+                        .context("AI Chat Completions 工具请求无效")?;
+                let response = runtime
+                    .chat_completion(
+                        self.target.build_target()?,
+                        request,
+                        &self.target.extra_body,
+                        timeout,
+                    )?
+                    .wait()
+                    .context("AI 工具请求失败")?;
+                let choice = response
+                    .choices
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("AI 响应缺少 choices[0]"))?;
+                if choice.finish_reason == Some(async_openai::types::chat::FinishReason::Length) {
+                    bail!("AI 工具响应超出输出上限");
+                }
+                self.accept_output(vec![serde_json::to_value(&choice.message)?], allow_tools)
+            }
+        }
+    }
+
+    fn accept_output(&mut self, output: Vec<Value>, allow_tools: bool) -> Result<AgentReply> {
+        let mut reply = AgentReply {
+            text: String::new(),
+            calls: Vec::new(),
+        };
+        for item in &output {
+            match self.target.wire_api {
+                WireApi::Responses => match item["type"].as_str() {
+                    Some("function_call") => {
+                        if item["status"].as_str().is_some_and(|s| s != "completed") {
+                            bail!("AI 工具调用未完成");
+                        }
+                        reply.calls.push(AgentToolCall {
+                            id: tool_string(item, "call_id")?.to_string(),
+                            name: tool_string(item, "name")?.to_string(),
+                            arguments: tool_string(item, "arguments")?.to_string(),
+                        });
+                    }
+                    Some("message") => {
+                        if let Some(content) = item["content"].as_array() {
+                            for part in content {
+                                if part["type"] == "refusal" {
+                                    bail!("AI 拒绝回答: {}", part["refusal"]);
+                                }
+                                if part["type"] == "output_text" {
+                                    reply.text.push_str(tool_string(part, "text")?);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                WireApi::ChatCompletions => {
+                    if let Some(refusal) = item["refusal"].as_str().filter(|s| !s.is_empty()) {
+                        bail!("AI 拒绝回答: {refusal}");
+                    }
+                    if let Some(text) = item["content"].as_str() {
+                        reply.text.push_str(text);
+                    }
+                    if let Some(calls) = item["tool_calls"].as_array() {
+                        for call in calls {
+                            if call["type"] != "function" {
+                                bail!("AI 返回了不支持的工具类型");
+                            }
+                            reply.calls.push(AgentToolCall {
+                                id: tool_string(call, "id")?.to_string(),
+                                name: tool_string(&call["function"], "name")?.to_string(),
+                                arguments: tool_string(&call["function"], "arguments")?.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if reply.calls.len() > 8 {
+            bail!("AI 单轮工具调用不能超过 8 个");
+        }
+        let mut ids = std::collections::HashSet::new();
+        for call in &reply.calls {
+            if !allow_tools {
+                bail!("AI 在禁用工具时返回工具调用");
+            }
+            validate_tool_name(&call.name)?;
+            if !self.names.contains(&call.name) {
+                bail!("AI 返回未声明的工具: {}", call.name);
+            }
+            if call.id.is_empty()
+                || call.id.len() > 512
+                || call.id.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                bail!("AI 工具调用 ID 无效");
+            }
+            if self.seen.contains(&call.id) || !ids.insert(call.id.clone()) {
+                bail!("AI 工具调用 ID 重复");
+            }
+            let arguments: Value =
+                serde_json::from_str(&call.arguments).context("AI 工具参数不是有效 JSON")?;
+            if !arguments.is_object() {
+                bail!("AI 工具参数必须是 JSON object");
+            }
+        }
+        if reply.text.trim().is_empty() && reply.calls.is_empty() {
+            bail!("AI 响应缺少文本与工具调用");
+        }
+        self.seen.extend(ids.iter().cloned());
+        self.pending.extend(ids);
+        self.history.extend(output);
+        Ok(reply)
+    }
+
+    pub(crate) fn append_result(&mut self, id: &str, result: &str) -> Result<()> {
+        if !self.pending.remove(id) {
+            bail!("AI 工具结果没有对应的待处理调用 ID");
+        }
+        self.history.push(match self.target.wire_api {
+            WireApi::Responses => serde_json::json!({
+                "type":"function_call_output", "call_id":id, "output":result,
+            }),
+            WireApi::ChatCompletions => serde_json::json!({
+                "role":"tool", "tool_call_id":id, "content":result,
+            }),
+        });
+        Ok(())
+    }
+}
+
+fn tool_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("AI 工具响应缺少字符串 {field}"))
+}
+
+fn validate_tool_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    {
+        bail!("AI 工具名无效");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn tool_definitions() -> Vec<Value> {
+        vec![json!({"type":"function", "function":{
+            "name":"lookup", "description":"Find a song", "strict":true,
+            "parameters":{"type":"object", "properties":{}, "additionalProperties":false}
+        }})]
+    }
+
+    fn session_body(session: &ToolSession, allow_tools: bool) -> Value {
+        match session.target.wire_api {
+            WireApi::Responses => {
+                serde_json::to_value(session.responses_request(123, allow_tools).unwrap()).unwrap()
+            }
+            WireApi::ChatCompletions => {
+                let request: CreateChatCompletionRequest =
+                    serde_json::from_value(session.request_body(123, allow_tools).unwrap())
+                        .unwrap();
+                serde_json::to_value(request).unwrap()
+            }
+        }
+    }
+
+    #[test]
+    fn tool_session_replays_text_history_before_current_user_on_both_wires() {
+        let history = vec![
+            json!({"role":"user", "content":"First question"}),
+            json!({"role":"assistant", "content":"First answer"}),
+            json!({"role":"user", "content":"Second question"}),
+            json!({"role":"assistant", "content":"Second answer"}),
+        ];
+        for wire in [WireApi::Responses, WireApi::ChatCompletions] {
+            let mut config = config("openai");
+            config.wire_api = wire;
+            let session = ToolSession::with_history(
+                &config,
+                "",
+                "Persona",
+                history.clone(),
+                "Current question",
+                tool_definitions(),
+            )
+            .unwrap();
+            let body = session_body(&session, true);
+            let messages = match wire {
+                WireApi::Responses => {
+                    assert_eq!(body["instructions"], "Persona");
+                    body["input"].as_array().unwrap().clone()
+                }
+                WireApi::ChatCompletions => {
+                    assert_eq!(
+                        body["messages"][0],
+                        json!({"role":"system","content":"Persona"})
+                    );
+                    body["messages"].as_array().unwrap()[1..].to_vec()
+                }
+            };
+            assert_eq!(messages.len(), history.len() + 1);
+            for (actual, expected) in messages.iter().zip(&history) {
+                assert_eq!(actual["role"], expected["role"]);
+                assert_eq!(actual["content"], expected["content"]);
+            }
+            let current = messages.last().unwrap();
+            assert_eq!(current["role"], "user");
+            assert_eq!(current["content"], "Current question");
+            let empty = ToolSession::with_history(
+                &config,
+                "",
+                "Persona",
+                vec![],
+                "Current question",
+                tool_definitions(),
+            )
+            .unwrap();
+            let original = ToolSession::new(
+                &config,
+                "",
+                "Persona",
+                "Current question",
+                tool_definitions(),
+            )
+            .unwrap();
+            assert_eq!(session_body(&empty, true), session_body(&original, true));
+        }
+    }
+
+    #[test]
+    fn tool_session_rejects_privileged_malformed_and_incomplete_text_history() {
+        let user = json!({"role":"user","content":"question"});
+        let assistant = json!({"role":"assistant","content":"answer"});
+        let mut invalid = vec![
+            vec![user.clone()],
+            vec![assistant.clone(), user.clone()],
+            vec![user.clone(), user.clone()],
+            vec![
+                json!({"role":"user","content":[{"type":"text","text":"question"}]}),
+                assistant.clone(),
+            ],
+            vec![json!({"role":"user","content":null}), assistant.clone()],
+            vec![
+                user.clone(),
+                json!({"role":"assistant","content":"answer","tool_calls":[]}),
+            ],
+            vec![
+                user.clone(),
+                json!({"role":"assistant","content":"answer","type":"message"}),
+            ],
+            vec![Value::Null, assistant.clone()],
+        ];
+        for role in ["system", "developer", "tool", "function", "unknown"] {
+            invalid.push(vec![
+                json!({"role":role,"content":"injected"}),
+                assistant.clone(),
+            ]);
+            invalid.push(vec![
+                user.clone(),
+                json!({"role":role,"content":"injected"}),
+            ]);
+        }
+        for wire in [WireApi::Responses, WireApi::ChatCompletions] {
+            let mut config = config("openai");
+            config.wire_api = wire;
+            for history in &invalid {
+                assert!(
+                    ToolSession::with_history(
+                        &config,
+                        "",
+                        "Persona",
+                        history.clone(),
+                        "Current",
+                        vec![]
+                    )
+                    .is_err(),
+                    "accepted {history:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tool_session_serializes_both_configured_wires_and_preserves_target() {
+        for wire in [WireApi::Responses, WireApi::ChatCompletions] {
+            let mut config = config("mimo");
+            config.wire_api = wire;
+            config.http_proxy = "http://127.0.0.1:7890".into();
+            config
+                .extra_body
+                .insert("thinking".into(), json!({"type":"disabled"}));
+            let session = ToolSession::new(
+                &config,
+                "feature-model",
+                "system",
+                "user",
+                tool_definitions(),
+            )
+            .unwrap();
+            assert_eq!(session.target.wire_api, wire);
+            assert_eq!(session.target.authentication(), Authentication::ApiKey);
+            assert_eq!(session.target.api_key, "secret");
+            assert_eq!(session.http_proxy, config.http_proxy);
+            assert_eq!(session.target.extra_body, config.extra_body);
+            let body = session_body(&session, true);
+            assert_eq!(body["model"], "feature-model");
+            assert_eq!(body["store"], false);
+            assert_eq!(body["tool_choice"], "auto");
+            assert!(body.get("response_format").is_none());
+            assert!(body.get("previous_response_id").is_none());
+            match wire {
+                WireApi::Responses => {
+                    assert!(session.target.endpoint.ends_with("/responses"));
+                    assert_eq!(body["tools"][0]["name"], "lookup");
+                    assert_eq!(body["tools"][0]["strict"], true);
+                    assert_eq!(body["instructions"], "system");
+                    assert_eq!(body["input"][0]["content"], "user");
+                    assert!(body.get("text").is_none());
+                }
+                WireApi::ChatCompletions => {
+                    assert!(session.target.endpoint.ends_with("/chat/completions"));
+                    assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+                    assert_eq!(body["messages"][0]["content"], "system");
+                }
+            }
+            assert_eq!(session_body(&session, false)["tool_choice"], "none");
+            let empty = ToolSession::new(&config, "", "system", "user", vec![]).unwrap();
+            assert_eq!(session_body(&empty, true)["tool_choice"], "none");
+        }
+    }
+
+    #[test]
+    fn tool_session_replays_full_outputs_and_results_across_repeated_rounds() {
+        for wire in [WireApi::Responses, WireApi::ChatCompletions] {
+            let mut config = config("openai");
+            config.wire_api = wire;
+            let mut session =
+                ToolSession::new(&config, "", "system", "user", tool_definitions()).unwrap();
+            for round in 0..2 {
+                let id = format!("call_{round}");
+                let outputs = match wire {
+                    WireApi::Responses => vec![
+                        json!({"type":"reasoning", "id":format!("rs_{round}"), "summary":[], "encrypted_content":"encrypted"}),
+                        json!({"type":"function_call", "id":format!("fc_{round}"), "call_id":id,
+                            "name":"lookup", "arguments":"{}", "status":"completed"}),
+                    ],
+                    WireApi::ChatCompletions => vec![json!({"role":"assistant", "content":null,
+                        "tool_calls":[{"id":id,"type":"function","function":{"name":"lookup","arguments":"{}"}}]})],
+                };
+                let reply = session.accept_output(outputs.clone(), true).unwrap();
+                assert_eq!(reply.calls[0].id, id);
+                assert_eq!(reply.calls[0].name, "lookup");
+                assert_eq!(reply.calls[0].arguments, "{}");
+                assert!(session.request_body(123, true).is_err());
+                assert!(session.append_result("unknown", "result").is_err());
+                session.append_result(&id, "result").unwrap();
+                assert!(session.append_result(&id, "duplicate").is_err());
+                let body = session_body(&session, false);
+                match wire {
+                    WireApi::Responses => {
+                        let index = 1 + round * 3;
+                        assert_eq!(body["input"][index], outputs[0]);
+                        assert_eq!(body["input"][index + 1], outputs[1]);
+                        assert_eq!(body["input"][index + 2]["call_id"], id);
+                        assert_eq!(body["input"][index + 2]["type"], "function_call_output");
+                    }
+                    WireApi::ChatCompletions => {
+                        let index = 2 + round * 2;
+                        assert_eq!(body["messages"][index]["tool_calls"][0]["id"], id);
+                        assert_eq!(body["messages"][index + 1]["tool_call_id"], id);
+                        assert_eq!(body["messages"][index + 1]["content"], "result");
+                    }
+                }
+            }
+            let final_output = match wire {
+                WireApi::Responses => {
+                    json!({"type":"message","id":"msg_final","role":"assistant", "status":"completed",
+                    "content":[{"type":"output_text","text":"Natural language answer", "annotations":[]}]})
+                }
+                WireApi::ChatCompletions => {
+                    json!({"role":"assistant", "content":"Natural language answer"})
+                }
+            };
+            assert_eq!(
+                session
+                    .accept_output(vec![final_output], false)
+                    .unwrap()
+                    .text,
+                "Natural language answer"
+            );
+            session_body(&session, false);
+        }
+    }
+
+    #[test]
+    fn tool_session_rejects_malformed_or_unexpected_calls_without_mutating_history() {
+        let mut session =
+            ToolSession::new(&config("openai"), "", "s", "u", tool_definitions()).unwrap();
+        for (id, name, arguments, allow) in [
+            ("", "lookup", "{}", true),
+            ("bad id", "lookup", "{}", true),
+            ("call", "unknown", "{}", true),
+            ("call", "lookup", "not json", true),
+            ("call", "lookup", "[]", true),
+            ("call", "lookup", "{}", false),
+        ] {
+            assert!(
+                session
+                    .accept_output(
+                        vec![json!({"type":"function_call", "call_id":id,
+                "name":name,"arguments":arguments})],
+                        allow
+                    )
+                    .is_err()
+            );
+            assert_eq!(session.history.len(), 1);
+            assert!(session.pending.is_empty());
+        }
+        let too_many = (0..9)
+            .map(|i| {
+                json!({"type":"function_call",
+            "call_id":format!("call_{i}"),"name":"lookup","arguments":"{}"})
+            })
+            .collect();
+        assert!(session.accept_output(too_many, true).is_err());
+        assert_eq!(session.history.len(), 1);
+        assert!(session.pending.is_empty());
+        let call =
+            json!({"type":"function_call","call_id":"same","name":"lookup","arguments":"{}"});
+        assert!(
+            session
+                .accept_output(vec![call.clone(), call.clone()], true)
+                .is_err()
+        );
+        session.accept_output(vec![call.clone()], true).unwrap();
+        session.append_result("same", "done").unwrap();
+        assert!(session.accept_output(vec![call], true).is_err());
+    }
 
     fn config(provider: &str) -> AiConfig {
         AiConfig {

@@ -158,6 +158,7 @@ pub(crate) const HASH_START_HANDLERS: &[ChatHandler] = &[
 pub(crate) struct ChatCommandRouter<'a> {
     custom_workflow: Option<&'a CustomWorkflowService>,
     identity: Option<&'a IdentityAccess>,
+    access: Option<&'a crate::features::command_access::CommandAccessConfig>,
 }
 
 impl<'a> ChatCommandRouter<'a> {
@@ -166,6 +167,7 @@ impl<'a> ChatCommandRouter<'a> {
         Self {
             custom_workflow: Some(custom_workflow),
             identity: None,
+            access: None,
         }
     }
 
@@ -176,6 +178,19 @@ impl<'a> ChatCommandRouter<'a> {
         Self {
             custom_workflow: Some(custom_workflow),
             identity: Some(identity),
+            access: None,
+        }
+    }
+
+    pub(crate) const fn with_access(
+        custom_workflow: &'a CustomWorkflowService,
+        identity: &'a IdentityAccess,
+        access: &'a crate::features::command_access::CommandAccessConfig,
+    ) -> Self {
+        Self {
+            custom_workflow: Some(custom_workflow),
+            identity: Some(identity),
+            access: Some(access),
         }
     }
 
@@ -184,6 +199,7 @@ impl<'a> ChatCommandRouter<'a> {
         Self {
             custom_workflow: None,
             identity: None,
+            access: None,
         }
     }
 
@@ -192,6 +208,39 @@ impl<'a> ChatCommandRouter<'a> {
         envelope: &CommandEnvelope,
         active_entertainment: Option<EntertainmentKind>,
     ) -> Option<RoutedCommand> {
+        if let Some(access) = self.access {
+            // 来源只负责语法兼容，授权始终使用当前发送者角色。
+            let other = match envelope.authority() {
+                CommandAuthority::HallMember => CommandAuthority::Friend,
+                CommandAuthority::Friend => CommandAuthority::HallMember,
+            };
+            let mut routed =
+                self.route_with_authorities(envelope, active_entertainment, None, Some(other))?;
+            let (_, policy) = crate::features::command_access::resolve_with_active(
+                access,
+                &routed,
+                active_entertainment,
+            );
+            let actor = crate::features::command_access::actor_permission(
+                routed.role,
+                !routed.username.trim().is_empty(),
+            );
+            if !policy.allows(actor) {
+                routed.permission_required = Some(match policy.minimum_role {
+                    crate::features::command_access::CommandPermission::User
+                    | crate::features::command_access::CommandPermission::Friend => {
+                        IdentityRole::Friend
+                    }
+                    crate::features::command_access::CommandPermission::Admin => {
+                        IdentityRole::Admin
+                    }
+                    crate::features::command_access::CommandPermission::Owner => {
+                        IdentityRole::Owner
+                    }
+                });
+            }
+            return Some(routed);
+        }
         let role = self
             .identity
             .and_then(|identity| identity.role_of(envelope.username()));
@@ -658,6 +707,77 @@ mod tests {
     }
 
     #[test]
+    fn editable_permissions_apply_independently_of_message_source() {
+        use crate::features::command_access::*;
+        let service = CustomWorkflowService::new(
+            CustomWorkflowConfig::default(),
+            WorkflowDefaults {
+                default_timeout_ms: 1000,
+                default_poll_ms: 10,
+                default_step_wait_ms: 0,
+                decision_timeout_ms: 1000,
+                decision_poll_ms: 10,
+                after_activate_ms: 0,
+                clipboard_hold_ms: 0,
+                stability_mean_threshold: 1.0,
+                stability_changed_ratio_threshold: 0.1,
+            },
+        );
+        let identity = IdentityAccess::default();
+        let mut access = CommandAccessConfig::default();
+        let noisy = ChatCommandRouter::with_access(&service, &identity, &access)
+            .route(&envelope("blue", "@，禁用"), None)
+            .unwrap();
+        assert_eq!(noisy.permission_required, Some(IdentityRole::Owner));
+        access.overrides.insert(
+            "#跑得快".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        let runfast = ChatCommandRouter::with_access(&service, &identity, &access)
+            .route(&envelope("blue", "#跑得快"), None)
+            .unwrap();
+        assert!(runfast.permission_required.is_some());
+        access.overrides.clear();
+        for source in ["pink", "blue"] {
+            let routed = ChatCommandRouter::with_access(&service, &identity, &access)
+                .route(&envelope(source, "@删除"), None)
+                .unwrap();
+            assert_eq!(routed.permission_required, Some(IdentityRole::Admin));
+            assert_eq!(routed.message_type, source);
+        }
+        access.overrides.insert(
+            "@删除".into(),
+            CommandPolicy {
+                enabled: true,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        for source in ["pink", "blue"] {
+            let routed = ChatCommandRouter::with_access(&service, &identity, &access)
+                .route(&envelope(source, "@删除"), None)
+                .unwrap();
+            assert!(routed.permission_required.is_none());
+        }
+        access.overrides.insert(
+            "@点歌".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        assert!(
+            ChatCommandRouter::with_access(&service, &identity, &access)
+                .route(&envelope("blue", "@点歌晴天"), None)
+                .unwrap()
+                .permission_required
+                .is_some()
+        );
+    }
+
+    #[test]
     fn reserves_decision_syntax_from_custom_workflow_routing() {
         for (message_type, command) in [
             ("blue", "@确认"),
@@ -736,6 +856,7 @@ mod tests {
             let router = ChatCommandRouter {
                 custom_workflow: None,
                 identity: Some(&identity),
+                access: None,
             };
             for source in ["pink", "blue"] {
                 for (text, action) in [
@@ -786,6 +907,7 @@ mod tests {
         let router = ChatCommandRouter {
             custom_workflow: None,
             identity: Some(&identity),
+            access: None,
         };
         for source in ["pink", "blue"] {
             for text in [

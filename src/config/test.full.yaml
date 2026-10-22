@@ -277,8 +277,6 @@ templates:
   secondary_hall: assets/ui-secondary-hall.png
   # 千星奇域主菜单右下角「返回提瓦特」按钮模板，命中即判为奇域主菜单
   main_menu: assets/ui-main-menu-return.png
-  # 千星大厅底栏 👥 O 图标组模板
-  hall_bar: assets/ui-hall-bar.png
   # 主世界右上角祈愿图标透明模板，仅持续未知时探测
   world_wish: assets/world-wish.png
   # 邀请流程里的“查看千星”按钮模板

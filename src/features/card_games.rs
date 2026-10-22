@@ -246,6 +246,15 @@ pub enum CardGameReplyTemplate {
         spec: &'static crate::features::reply_template::ReplyTemplate,
         vars: ReplyVars,
     },
+    /// 外层模板的某个变量本身来自另一条模板（例如斗地主的"动作"词）。
+    ///
+    /// 单独保留内层 key，是为了让内层文案也能被用户覆盖：如果先把内层渲染成
+    /// 字符串再当变量塞进外层，组装层只拿到成品文本，内层覆盖就永远读不到。
+    Composed {
+        spec: &'static crate::features::reply_template::ReplyTemplate,
+        vars: ReplyVars,
+        nested: Vec<(&'static str, CardGameReplyTemplate)>,
+    },
     Raw(String),
 }
 
@@ -271,10 +280,7 @@ impl LandlordOutcome {
         Self {
             action,
             public_reply: Some(reply.render_default()),
-            public_reply_template: match reply {
-                CardGameReplyTemplate::Template { .. } => Some(reply),
-                CardGameReplyTemplate::Raw(_) => None,
-            },
+            public_reply_template: reply.is_keyed().then_some(reply),
             private_reply: None,
             private_reply_template: None,
             private_deliveries: Vec::new(),
@@ -289,10 +295,7 @@ impl LandlordOutcome {
             public_reply: None,
             public_reply_template: None,
             private_reply: Some(reply.render_default()),
-            private_reply_template: match reply {
-                CardGameReplyTemplate::Template { .. } => Some(reply),
-                CardGameReplyTemplate::Raw(_) => None,
-            },
+            private_reply_template: reply.is_keyed().then_some(reply),
             private_deliveries: Vec::new(),
             ended: false,
         }
@@ -303,10 +306,7 @@ impl LandlordOutcome {
         Self {
             action,
             public_reply: Some(reply.render_default()),
-            public_reply_template: match reply {
-                CardGameReplyTemplate::Template { .. } => Some(reply),
-                CardGameReplyTemplate::Raw(_) => None,
-            },
+            public_reply_template: reply.is_keyed().then_some(reply),
             private_reply: None,
             private_reply_template: None,
             private_deliveries: Vec::new(),
@@ -1466,7 +1466,10 @@ impl LandlordGame {
     }
 }
 
-/// Preserve the key and variables while retaining the built-in rendered text.
+/// 按内置文案渲染成品文本（不含用户覆盖）。
+///
+/// 仅用于把"内层片段"直接拼进更大字符串的场景与测试断言；任何要真正发送
+/// 的回复都必须走 keyed_reply/Composed 保留模板 key，否则用户覆盖读不到。
 fn reply(spec: &crate::features::reply_template::ReplyTemplate, vars: ReplyVars) -> String {
     crate::features::reply_template::render(spec, None, &vars).text
 }
@@ -1496,8 +1499,21 @@ impl CardGameReplyTemplate {
             Self::Template { spec, vars } => {
                 crate::features::reply_template::render(spec, None, vars).text
             }
+            Self::Composed { spec, vars, nested } => {
+                let nested = nested
+                    .iter()
+                    .map(|(name, reply)| (*name, reply.render_default()))
+                    .collect();
+                let vars = vars.clone().with_nested(nested);
+                crate::features::reply_template::render(spec, None, &vars).text
+            }
             Self::Raw(text) => text.clone(),
         }
+    }
+
+    /// 这条回复是否带模板 key；只有带 key 的才能在发送时查用户覆盖。
+    pub(crate) fn is_keyed(&self) -> bool {
+        matches!(self, Self::Template { .. } | Self::Composed { .. })
     }
 }
 
@@ -1654,7 +1670,7 @@ fn play_cards(
             ActionOrigin::Timeout => "超时出",
             ActionOrigin::Forced => "自动出",
         };
-        reply(
+        keyed_reply(
             &templates::PLAY_RUN_FAST,
             ReplyVars::new()
                 .with("玩家", name)
@@ -1669,24 +1685,24 @@ fn play_cards(
         )
     } else {
         let action_text = match origin {
-            ActionOrigin::Manual => reply(&templates::LANDLORD_ACTION_PLAY, ReplyVars::new()),
-            ActionOrigin::Timeout => reply(
+            ActionOrigin::Manual => keyed_reply(&templates::LANDLORD_ACTION_PLAY, ReplyVars::new()),
+            ActionOrigin::Timeout => keyed_reply(
                 &templates::LANDLORD_ACTION_TIMEOUT,
                 ReplyVars::new().with("托管后缀", trustee_suffix(game, player)),
             ),
             ActionOrigin::Forced => unreachable!("forced play only applies to run fast"),
         };
-        reply(
-            &templates::PLAY_LANDLORD,
-            ReplyVars::new()
+        CardGameReplyTemplate::Composed {
+            spec: &templates::PLAY_LANDLORD,
+            vars: ReplyVars::new()
                 .with("玩家", name)
                 .with("角色", role)
-                .with("动作", action_text)
                 .with("牌面", played)
                 .with("牌型", pattern_name)
                 .with("剩余", game.players[player].hand.len().to_string())
                 .with("下一位", game.players[game.current].name.clone()),
-        )
+            nested: vec![("动作", action_text)],
+        }
     };
     LandlordOutcome::public(
         match origin {

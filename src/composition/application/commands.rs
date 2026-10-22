@@ -42,6 +42,9 @@ pub(super) struct DeferredIdiomChainPort {
     business: BusinessRuntimeHandle,
     task_engine: TaskEngineHandle,
     live_configs: LiveConfigs,
+    /// 延迟发送也要读命令面板的覆盖，否则同一条接龙文案在"立即发送"和
+    /// "延迟发送"两条路径上行为不同，用户会以为改了没反应。
+    config_store: Option<crate::config::SharedConfigStore>,
 }
 
 /// 个人歌单的播放侧适配：读取当前播放曲目、直接播放收藏曲目。
@@ -218,17 +221,32 @@ impl IdiomChainDeferredPort for DeferredIdiomChainPort {
         _message: &str,
         template: &idiom_chain::IdiomReplyTemplate,
     ) -> Result<IdiomDeliveryOutcome> {
-        let override_text = self
-            .live_configs
-            .replies
-            .read()
-            .ok()
-            .and_then(|config| config.overrides.get(template.spec.key).cloned());
+        let stored = self
+            .config_store
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .and_then(|store| store.reply_templates().ok());
+        if let Some(stored) = &stored {
+            if crate::features::reply_template::is_muted(stored, template.spec.key) {
+                return Ok(IdiomDeliveryOutcome::Added);
+            }
+        }
+        let command_override = stored
+            .as_ref()
+            .and_then(|stored| crate::features::reply_template::stored_override(stored, template.spec.key));
+        // 覆盖只来自命令面板保存的行；配置中心不再提供回复文案入口。
         let rendered = crate::features::reply_template::render(
             template.spec,
-            override_text.as_deref(),
+            command_override.as_deref(),
             &template.vars,
         );
+        if !rendered.missing.is_empty() {
+            log::warn!(
+                "回复模板 {} 缺少变量 {:?}",
+                template.spec.key,
+                rendered.missing
+            );
+        }
         self.enqueue_message(rendered.text)
     }
 }
@@ -299,12 +317,11 @@ impl TurtleSoupApplicationPort for TurtleSoupCommandPort<'_> {
     }
 
     fn send_turtle_soup_reply(&mut self, reply: turtle_soup::TurtleSoupReplyText) -> Result<()> {
-        if let turtle_soup::TurtleSoupReplyText::Keyed { spec, .. } = &reply
-            && self.runtime.command_reply_is_muted(spec.key)
-        {
+        // 静音由 render_reply_text 统一处理：None 表示这条不该发。
+        // 这里不再手动判断 key，复合回复的静音才能沿嵌套链传播。
+        let Some(text) = self.runtime.render_reply_text(&reply) else {
             return Ok(());
-        }
-        let text = self.runtime.render_reply_text(&reply);
+        };
         enqueue_current_hall_reply(&self.task_engine, &text)
     }
 }
@@ -352,6 +369,7 @@ impl ApplicationRuntime {
             business: self.business.business.clone(),
             task_engine: self.business.task_engine.clone(),
             live_configs: self.lifecycle.live_configs.clone(),
+            config_store: self.lifecycle.config_store.clone(),
         }
     }
 
@@ -458,7 +476,11 @@ impl ApplicationRuntime {
             &self.business.ai,
         )?;
         self.log_executed_command(parsed, "tarot")?;
-        let messages: Vec<_> = messages.iter().map(String::as_str).collect();
+        let mut rendered = Vec::new();
+        for message in &messages {
+            rendered.extend(self.render_tarot_reply(message));
+        }
+        let messages: Vec<_> = rendered.iter().map(String::as_str).collect();
         self.reply_batch(&messages, 0)
     }
 
@@ -517,7 +539,11 @@ impl ApplicationRuntime {
         } else {
             self.log_executed_command(parsed, "playlist")?;
         }
-        let messages: Vec<_> = messages.iter().map(String::as_str).collect();
+        let rendered: Vec<String> = messages
+            .iter()
+            .flat_map(|reply| self.render_playlist_reply(reply))
+            .collect();
+        let messages: Vec<_> = rendered.iter().map(String::as_str).collect();
         self.reply_batch(&messages, 0)
     }
 
@@ -760,11 +786,11 @@ impl IdiomChainExplanationPort for ApplicationRuntime {
     ) -> Result<()> {
         let rendered = messages
             .iter()
-            .map(|message| match message {
+            .filter_map(|message| match message {
                 idiom_chain::IdiomExplanationMessage::Template { spec, vars } => {
                     self.render_template_text(spec, vars)
                 }
-                idiom_chain::IdiomExplanationMessage::Raw(text) => text.clone(),
+                idiom_chain::IdiomExplanationMessage::Raw(text) => Some(text.clone()),
             })
             .collect::<Vec<_>>();
         let refs = rendered.iter().map(String::as_str).collect::<Vec<_>>();
@@ -782,6 +808,18 @@ impl AdministrationImmediatePort for ApplicationRuntime {
 
     fn enqueue_hall_reply(&mut self, message: &str) -> Result<()> {
         enqueue_current_hall_reply(&self.business.task_engine, message)
+    }
+
+    fn enqueue_hall_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        // 静音由 render_template_text 统一处理：None 表示这条不该发。
+        let Some(text) = self.render_template_text(spec, vars) else {
+            return Ok(());
+        };
+        self.enqueue_hall_reply(&text)
     }
 
     fn configure_idle_exit(&mut self, minutes: u32) -> Result<()> {
@@ -849,7 +887,7 @@ impl AdministrationApplicationPort for ApplicationRuntime {
             None => rendered.extend(
                 templates
                     .iter()
-                    .map(|spec| self.render_template_text(spec, vars)),
+                    .filter_map(|spec| self.render_template_text(spec, vars)),
             ),
         }
         let refs = rendered.iter().map(String::as_str).collect::<Vec<_>>();
@@ -858,6 +896,14 @@ impl AdministrationApplicationPort for ApplicationRuntime {
 
     fn send_hall(&mut self, message: &str) -> Result<()> {
         ApplicationRuntime::reply(self, message)
+    }
+
+    fn send_hall_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        self.reply_with_template(spec, vars)
     }
 
     fn send_hall_batch(&mut self, messages: &[&str], delay_ms: u64) -> Result<()> {
@@ -869,7 +915,8 @@ impl AdministrationApplicationPort for ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> String {
-        self.render_template_text(spec, vars)
+        // 端口契约是"只渲染不发送"，静音时给空串，由调用方决定是否成段。
+        self.render_template_text(spec, vars).unwrap_or_default()
     }
 }
 

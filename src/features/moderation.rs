@@ -194,6 +194,18 @@ pub trait ModerationPrimaryHold: Send {
 
 pub trait ModerationCommandPort {
     fn send_hall(&mut self, message: &str) -> Result<()>;
+
+    /// 按模板发送。保留 key 让组装层能查到用户覆盖；默认实现只渲染内置文案，
+    /// 保证不接配置的测试替身也能工作。
+    fn send_hall_template(
+        &mut self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        vars: &crate::features::reply_template::ReplyVars,
+    ) -> Result<()> {
+        let rendered = crate::features::reply_template::render(spec, None, vars);
+        self.send_hall(&rendered.text)
+    }
+
     fn prepare_vote_hold(&mut self) -> Result<Box<dyn ModerationPrimaryHold>>;
 }
 
@@ -386,30 +398,22 @@ impl ModerationService {
                 command.action.label(),
                 command.uid
             );
-            port.send_hall(
-                &crate::features::reply_template::render(
-                    &crate::features::reply_template::moderation::MODERATION[0],
-                    None,
-                    &crate::features::reply_template::ReplyVars::new()
-                        .with("UID", command.uid.clone())
-                        .with("动作", command.action.label()),
-                )
-                .text,
+            port.send_hall_template(
+                &crate::features::reply_template::moderation::MODERATION[0],
+                &crate::features::reply_template::ReplyVars::new()
+                    .with("UID", command.uid.clone())
+                    .with("动作", command.action.label()),
             )?;
             return Ok(ModerationStart::Duplicate);
         };
 
         let vote_timeout_seconds = self.policy.vote_timeout.as_millis().saturating_add(999) / 1000;
-        port.send_hall(
-            &crate::features::reply_template::render(
-                &crate::features::reply_template::moderation::MODERATION[1],
-                None,
-                &crate::features::reply_template::ReplyVars::new()
-                    .with("UID", command.uid.clone())
-                    .with("动作", command.action.label())
-                    .with("超时秒数", vote_timeout_seconds.to_string()),
-            )
-            .text,
+        port.send_hall_template(
+            &crate::features::reply_template::moderation::MODERATION[1],
+            &crate::features::reply_template::ReplyVars::new()
+                .with("UID", command.uid.clone())
+                .with("动作", command.action.label())
+                .with("超时秒数", vote_timeout_seconds.to_string()),
         )?;
         let hold = port.prepare_vote_hold()?;
         Ok(ModerationStart::Started(ModerationVoteWork {

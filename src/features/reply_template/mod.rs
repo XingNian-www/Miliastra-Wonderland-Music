@@ -13,11 +13,15 @@ pub(crate) mod card_games;
 pub(crate) mod hall;
 pub(crate) mod idiom_chain;
 pub(crate) mod moderation;
+pub(crate) mod ownership;
 pub(crate) mod playback;
+pub(crate) mod playlist;
 pub(crate) mod song;
 pub(crate) mod tarot;
 pub(crate) mod turtle_soup;
 pub(crate) mod undercover;
+
+/// 统一的待发送回复类型。
 
 /// 一条可调整回复的元数据。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,6 +237,50 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
         label: "歌名",
     },
     ReplyVariable {
+        name: "歌手",
+        label: "歌手",
+    },
+    ReplyVariable {
+        name: "状态",
+        label: "播放状态（播放/暂停/停止）",
+    },
+    ReplyVariable {
+        name: "曲名",
+        label: "曲名（歌名 - 歌手）",
+    },
+    ReplyVariable {
+        name: "进度",
+        label: "已播放时长",
+    },
+    ReplyVariable {
+        name: "总长",
+        label: "歌曲总时长",
+    },
+    ReplyVariable {
+        name: "点歌人",
+        label: "点歌人昵称",
+    },
+    ReplyVariable {
+        name: "歌单归属",
+        label: "歌单模式所有者",
+    },
+    ReplyVariable {
+        name: "内容",
+        label: "被包裹的正文",
+    },
+    ReplyVariable {
+        name: "歌词",
+        label: "当前歌词行",
+    },
+    ReplyVariable {
+        name: "新增",
+        label: "新增数量",
+    },
+    ReplyVariable {
+        name: "重复",
+        label: "重复数量",
+    },
+    ReplyVariable {
         name: "炸弹",
         label: "炸弹",
     },
@@ -310,144 +358,70 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
     },
 ];
 
+/// 命令回复目录项；由 `ownership::REPLY_GROUPS` 派生，不再手写维护。
+///
+/// 保留这个类型是为了让路由层与发送层只依赖"命令 → 回复"这一层语义，
+/// 不必知道归一化后的归属表结构。
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct CommandReplyCatalogEntry {
     pub id: &'static str,
     pub name: &'static str,
     pub category: &'static str,
-    pub replies: &'static [ReplyTemplate],
     pub ordered_batch: bool,
+    keys: &'static [&'static str],
 }
 
-static COMMAND_REPLY_CATALOG: &[CommandReplyCatalogEntry] = &[
-    CommandReplyCatalogEntry {
-        id: "@帮助",
-        name: "帮助",
-        category: "帮助",
-        replies: &HELP_SONG_REQUEST,
-        ordered_batch: true,
-    },
-    CommandReplyCatalogEntry {
-        id: "@娱乐帮助",
-        name: "娱乐帮助",
-        category: "帮助",
-        replies: &HELP_ENTERTAINMENT,
-        ordered_batch: true,
-    },
-    CommandReplyCatalogEntry {
-        id: "@歌单帮助",
-        name: "歌单帮助",
-        category: "歌单",
-        replies: &HELP_PLAYLIST,
-        ordered_batch: true,
-    },
-    CommandReplyCatalogEntry {
-        id: "#塔罗牌帮助",
-        name: "塔罗牌帮助",
-        category: "娱乐",
-        replies: &[tarot::HELP_DRAW, tarot::HELP_REROLL, tarot::HELP_INTERPRET],
-        ordered_batch: true,
-    },
-    CommandReplyCatalogEntry {
-        id: "#海龟汤",
-        name: "海龟汤开局",
-        category: "娱乐",
-        replies: &[
-            turtle_soup::START_FAILED,
-            turtle_soup::ANNOUNCING,
-            turtle_soup::SETTLING,
-        ],
-        ordered_batch: false,
-    },
-    CommandReplyCatalogEntry {
-        id: "#状态（海龟汤）",
-        name: "海龟汤状态",
-        category: "娱乐",
-        replies: &[
-            turtle_soup::DISABLED,
-            turtle_soup::STATUS,
-            turtle_soup::STATUS_NO_SESSION,
-        ],
-        ordered_batch: false,
-    },
-    CommandReplyCatalogEntry {
-        id: "#结束（海龟汤）",
-        name: "结束海龟汤",
-        category: "娱乐",
-        replies: &[turtle_soup::END_FAILED, turtle_soup::END_NO_SESSION],
-        ordered_batch: false,
-    },
-    CommandReplyCatalogEntry {
-        id: "@大厅检测",
-        name: "大厅检测",
-        category: "大厅",
-        replies: &[
-            hall::DETECT_FAILED,
-            hall::PUBLIC_HALL_CURRENT,
-            hall::CURRENT,
-        ],
-        ordered_batch: false,
-    },
-    CommandReplyCatalogEntry {
-        id: "@大厅时间",
-        name: "大厅时间",
-        category: "大厅",
-        replies: &[
-            hall::TIME_REMAINING,
-            hall::TIME_UNKNOWN,
-            hall::PUBLIC_HALL_NO_LIMIT,
-        ],
-        ordered_batch: false,
-    },
-    CommandReplyCatalogEntry {
-        id: "@下一首",
-        name: "下一首",
-        category: "播放",
-        replies: &[playback::NEXT_POOL_FALLBACK, playback::NEXT_EMPTY],
-        ordered_batch: false,
-    },
-    CommandReplyCatalogEntry {
-        id: "@删除",
-        name: "删除当前曲目",
-        category: "播放",
-        replies: &[
-            playback::DELETE_TRACK_UNAVAILABLE,
-            playback::DELETE_REMOVED_POOL_FALLBACK,
-            playback::DELETE_NOT_IN_POOL_POOL_FALLBACK,
-            playback::DELETE_REMOVED_QUEUE_EMPTY,
-            playback::DELETE_NOT_IN_POOL_QUEUE_EMPTY,
-        ],
-        ordered_batch: false,
-    },
-    CommandReplyCatalogEntry {
-        id: "@暂停",
-        name: "暂停",
-        category: "播放",
-        replies: &[playback::PAUSE_OK],
-        ordered_batch: false,
-    },
-    CommandReplyCatalogEntry {
-        id: "@继续",
-        name: "继续 / 播放",
-        category: "播放",
-        replies: &[playback::RESUME_OK],
-        ordered_batch: false,
-    },
-    CommandReplyCatalogEntry {
-        id: "@音量",
-        name: "音量",
-        category: "播放",
-        replies: &[playback::VOLUME_SET],
-        ordered_batch: false,
-    },
-];
-pub(crate) fn command_reply_catalog() -> &'static [CommandReplyCatalogEntry] {
-    COMMAND_REPLY_CATALOG
+impl CommandReplyCatalogEntry {
+    /// 该命令拥有的模板，顺序与归属表一致。
+    pub(crate) fn replies(&self) -> impl Iterator<Item = &'static ReplyTemplate> + '_ {
+        self.keys.iter().filter_map(|key| spec_for_key(key))
+    }
 }
-pub(crate) fn command_reply_entry_for_key(key: &str) -> Option<&'static CommandReplyCatalogEntry> {
-    COMMAND_REPLY_CATALOG
-        .iter()
-        .find(|entry| entry.replies.iter().any(|spec| spec.key == key))
+
+/// 命令回复目录。顺序即命令面板的展示顺序。
+pub(crate) fn command_reply_catalog() -> impl Iterator<Item = CommandReplyCatalogEntry> + 'static {
+    ownership::REPLY_GROUPS.iter().map(|group| CommandReplyCatalogEntry {
+        id: group.command_id,
+        name: group.name,
+        category: group.category,
+        ordered_batch: group.ordered_batch,
+        keys: group.keys,
+    })
 }
+
+/// 与已有分组共用回复的命令别名表。
+pub(crate) fn command_id_aliases() -> &'static [(&'static str, &'static str)] {
+    ownership::COMMAND_ID_ALIASES
+}
+
+/// 把命令 ID 归一化为真正持有回复的分组 ID。
+///
+/// 共享命令（@播放 与 @继续、各平台点歌等）没有独立文案，
+/// 面板据此展示所属分组的回复，而不是显示"暂无可编辑回复"。
+pub(crate) fn canonical_command_id(command_id: &str) -> &str {
+    ownership::canonical_command_id(command_id)
+}
+
+/// 一条 key 归属哪个命令。
+///
+/// 这是"覆盖能不能被找到"的唯一判定：不在任何命令下登记的 key，
+/// 发送时查不到覆盖，面板里也编辑不到。
+pub(crate) fn command_reply_entry_for_key(key: &str) -> Option<CommandReplyCatalogEntry> {
+    let group = ownership::group_for_key(key)?;
+    Some(CommandReplyCatalogEntry {
+        id: group.command_id,
+        name: group.name,
+        category: group.category,
+        ordered_batch: group.ordered_batch,
+        keys: group.keys,
+    })
+}
+
+/// 按稳定 key 查模板定义。
+pub(crate) fn spec_for_key(key: &str) -> Option<&'static ReplyTemplate> {
+    catalog().find(|spec| spec.key == key)
+}
+
 pub(crate) fn reply_variables() -> &'static [ReplyVariable] {
     REPLY_VARIABLES
 }
@@ -477,6 +451,22 @@ pub(crate) const AI_CHAT_UNAVAILABLE: ReplyTemplate = ReplyTemplate {
     default: "我现在答不上来，稍后再问",
     summary: "AI 调用失败",
     group: "AI 聊天",
+};
+
+/// 管理员启用大厅命令识别后的回执。
+pub(crate) const ADMIN_COMMANDS_ENABLED: ReplyTemplate = ReplyTemplate {
+    key: "admin.commands.enabled",
+    default: "管理员已启用大厅命令识别功能",
+    summary: "@启用 执行成功",
+    group: "管理",
+};
+
+/// 管理员禁用大厅命令识别后的回执。
+pub(crate) const ADMIN_COMMANDS_DISABLED: ReplyTemplate = ReplyTemplate {
+    key: "admin.commands.disabled",
+    default: "管理员已禁用大厅命令识别功能",
+    summary: "@禁用 执行成功",
+    group: "管理",
 };
 /// 渲染时的变量集合。AI 回答等动态文本以普通值形式放入。
 ///
@@ -571,6 +561,52 @@ pub(crate) fn render(
         overridden,
         missing,
     }
+}
+
+/// 从已持久化的命令回复里取某条 key 的用户覆盖。
+///
+/// 这是“覆盖能不能查到”的唯一实现：立即发送、延迟发送、播放器三条路径都调用它，
+/// 避免各写一份导致同一条配置在不同路径上表现不一致。
+///
+/// ordered_batch 的命令整段按序发送，单条覆盖由组装层按行渲染，
+/// 这里返回 None 表示“不参与单条覆盖查找”。
+pub(crate) fn stored_override(
+    stored: &std::collections::BTreeMap<String, Vec<crate::config::StoredReply>>,
+    key: &str,
+) -> Option<String> {
+    let entry = command_reply_entry_for_key(key)?;
+    if entry.ordered_batch {
+        return None;
+    }
+    stored
+        .get(entry.id)?
+        .iter()
+        .find(|reply| reply.key == key)
+        .map(|reply| reply.text.clone())
+        // 空文本表示"使用内置默认"，不是覆盖。
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// 某条 key 是否被命令面板静音。
+///
+/// 两种静音来源，都表示"不要发送"：
+/// - 整个命令存了空列表：命令级静音。
+/// - 该 key 不在命令的行里：单行被停用。
+///
+/// 注意行的**存在**表示启用，与文本是否为空无关：留空行表示"使用内置默认"，
+/// 仍会正常发送。若把空文本行当成静音，用户清空文案就会意外关掉回复。
+///
+/// 未登记归属的 key 永远不会被静音，避免误吞没有编辑入口的文案。
+pub(crate) fn is_muted(
+    stored: &std::collections::BTreeMap<String, Vec<crate::config::StoredReply>>,
+    key: &str,
+) -> bool {
+    let Some(entry) = command_reply_entry_for_key(key) else {
+        return false;
+    };
+    stored.get(entry.id).is_some_and(|rows| {
+        rows.is_empty() || (!entry.ordered_batch && !rows.iter().any(|reply| reply.key == key))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -697,14 +733,25 @@ pub(crate) const REPLY_SONG: [ReplyTemplate; 1] = [ReplyTemplate {
     group: "点歌",
 }];
 
-/// 配置中心管理的通用回复模板清单。
+/// 全部可配置回复模板。
 ///
-/// 命令级帮助文本由 `command_reply_catalog` 独立提供。
+/// 每个新增模板模块必须在这里加一行；`every_production_key_is_registered`
+/// 测试会拦住"定义了模板却漏登记"的情况。
 pub(crate) fn catalog() -> impl Iterator<Item = &'static ReplyTemplate> {
-    REPLY_SONG
+    // 帮助与 AI 聊天文案住在本文件里，此前漏登记，导致配置页看不到、也改不了。
+    HELP_SONG_REQUEST
         .iter()
+        .chain(HELP_PLAYLIST.iter())
+        .chain(HELP_ENTERTAINMENT.iter())
+        .chain(std::iter::once(&AI_CHAT_FORGET))
+        .chain(std::iter::once(&AI_CHAT_TOO_LONG))
+        .chain(std::iter::once(&AI_CHAT_UNAVAILABLE))
+        .chain(std::iter::once(&ADMIN_COMMANDS_ENABLED))
+        .chain(std::iter::once(&ADMIN_COMMANDS_DISABLED))
+        .chain(REPLY_SONG.iter())
         // 按模块拆分的模板：新增模块时只在这里加一行。
         .chain(playback::PLAYBACK.iter())
+        .chain(playlist::PLAYLIST.iter())
         .chain(hall::HALL.iter())
         .chain(song::SONG.iter())
         .chain(undercover::UNDERCOVER.iter())
@@ -821,8 +868,12 @@ mod tests {
                 "命令回复目录ID重复：{}",
                 entry.id
             );
-            assert!(!entry.replies.is_empty(), "{} 未登记回复", entry.id);
-            for spec in entry.replies {
+            assert!(
+                entry.replies().next().is_some(),
+                "{} 未登记回复",
+                entry.id
+            );
+            for spec in entry.replies() {
                 assert!(
                     owned_keys.insert(spec.key),
                     "模板键被多个命令目录项拥有：{}",
@@ -836,30 +887,93 @@ mod tests {
                 );
             }
         }
-        for id in [
-            "#塔罗牌帮助",
-            "#海龟汤",
-            "#状态（海龟汤）",
-            "#结束（海龟汤）",
-            "@大厅检测",
-            "@大厅时间",
-            "@下一首",
-            "@删除",
-            "@暂停",
-            "@继续",
-            "@音量",
-        ] {
-            assert!(command_ids.contains(id), "缺少可编辑静态命令 {id}");
+    }
+
+    #[test]
+    fn every_catalog_key_is_owned_by_exactly_one_command() {
+        // 这是"全部命令可编辑"的结构性保证：目录里任何一条文案都必须能在
+        // 某个命令下被编辑；否则配置页列出它、命令面板却找不到入口。
+        let mut owners = std::collections::BTreeMap::new();
+        for spec in catalog() {
+            if let Some(owner) = command_reply_entry_for_key(spec.key) {
+                assert!(
+                    owners.insert(spec.key, owner.id).is_none(),
+                    "模板 key 被重复归属：{}",
+                    spec.key
+                );
+            }
         }
+        let orphan: Vec<_> = catalog()
+            .map(|spec| spec.key)
+            .filter(|key| !owners.contains_key(key))
+            .collect();
+        assert!(
+            orphan.is_empty(),
+            "以下模板没有归属命令，面板里无法编辑：{orphan:?}"
+        );
+    }
+
+    #[test]
+    fn ownership_groups_only_reference_registered_templates() {
+        // 反向校验：归属表里写错一个 key，发送时查不到模板，覆盖会静默失效。
+        for group in ownership::REPLY_GROUPS {
+            for key in group.keys {
+                assert!(
+                    spec_for_key(key).is_some(),
+                    "归属表引用了不存在的模板 key：{key}（命令 {}）",
+                    group.command_id
+                );
+            }
+            assert_eq!(
+                ownership::group_for_command(group.command_id).map(|g| g.command_id),
+                Some(group.command_id),
+                "命令 {} 的归属不可查",
+                group.command_id
+            );
+        }
+    }
+
+    #[test]
+    fn every_command_alias_points_at_a_real_group() {
+        // 别名让共享命令在面板里复用别人的回复；指向不存在的分组会让
+        // 该命令重新变成"暂无可编辑回复"。
+        for (alias, owner) in ownership::COMMAND_ID_ALIASES {
+            assert!(
+                ownership::group_for_command(owner).is_some(),
+                "别名 {alias} 指向不存在的分组 {owner}"
+            );
+            assert_ne!(alias, owner, "别名不应指向自己：{alias}");
+            // 别名命令本身不应再持有 key，否则两处都能编辑同一批文案。
+            assert!(
+                ownership::group_for_command(alias).is_none(),
+                "{alias} 既有别名又自带分组，归属会歧义"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_batch_groups_are_the_help_batches() {
+        // 只有"整段按序发送"的帮助类命令允许增删行；业务分支回复必须按实际分支发送。
+        let ordered: Vec<_> = ownership::REPLY_GROUPS
+            .iter()
+            .filter(|group| group.ordered_batch)
+            .map(|group| group.command_id)
+            .collect();
+        assert_eq!(
+            ordered,
+            ["@歌单帮助", "#塔罗牌帮助", "@帮助", "@娱乐帮助"],
+            "按序批量发送的命令清单发生变化，请确认这是有意的"
+        );
     }
 
     #[test]
     fn command_catalog_resolves_playback_keys_and_renders_shared_global_variables() {
         let entry = command_reply_entry_for_key("playback.volume.set").unwrap();
         assert_eq!(entry.id, "@音量");
-        assert_eq!(entry.replies[0].key, "playback.volume.set");
+        let specs: Vec<_> = entry.replies().collect();
+        assert_eq!(specs[0].key, "playback.volume.set");
         let rendered = render(
-            entry.replies.first().unwrap(),
+            specs[0],
             Some("音量调整完成：{音量}"),
             &ReplyVars::new().with("音量", "65"),
         );
@@ -871,6 +985,42 @@ mod tests {
     }
 
     #[test]
+    fn muted_keys_render_to_none_on_every_path() {
+        // 这是"静音在所有路径生效"的契约测试。
+        //
+        // 修复前：21 个发送点只有 5 个自己查静音，牌类/卧底/海龟汤片段/塔罗/歌单
+        // 的静音根本不生效。现在静音判定收在 render_template_text 里，
+        // 这些组合回复的静音才能沿嵌套链传播。
+        let muted = std::collections::BTreeMap::from([("@音量".to_string(), Vec::new())]);
+        assert!(is_muted(&muted, "playback.volume.set"));
+
+        // 静音是"按命令"生效的：同一命令下的 key 一起静音，
+        // 其他命令不受影响。组合回复的嵌套片段分属不同命令时，
+        // 任一被静音都会让整条不发（见 render_reply_text 的 ? 传播）。
+        let playlist_muted =
+            std::collections::BTreeMap::from([("@歌单".to_string(), Vec::new())]);
+        assert!(is_muted(&playlist_muted, "playlist.window.header"));
+        assert!(is_muted(&playlist_muted, "playlist.select.queued"));
+        assert!(!is_muted(&playlist_muted, "playback.volume.set"));
+    }
+
+    fn a_blank_row_means_default_not_muted() {
+        // 行的存在 = 该回复启用；行内文本为空 = 用内置默认。
+        // 这两件事必须分开：曾经"清空文案"会把唯一一行丢掉，命令变空列表后被
+        // 判为整条静音——用户只是想恢复默认，却把回复关掉了。
+        let blank = stored(&[("playback.volume.set", "")]);
+        assert_eq!(stored_override(&blank, "playback.volume.set"), None);
+        assert!(
+            !is_muted(&blank, "playback.volume.set"),
+            "留空行必须仍视为启用"
+        );
+
+        // 只有真的是空列表（命令级静音）才不发送。
+        let muted = std::collections::BTreeMap::from([("@音量".to_string(), Vec::new())]);
+        assert!(is_muted(&muted, "playback.volume.set"));
+    }
+
+    #[test]
     fn every_catalog_key_can_be_overridden_and_renders_the_override() {
         // 这是"全部回复可改"的直接证据：目录里任何一条都能被覆盖并正确渲染。
         for spec in catalog() {
@@ -878,6 +1028,66 @@ mod tests {
             assert_eq!(rendered.text, "自定义文案", "{} 未能被覆盖", spec.key);
             assert!(rendered.overridden);
         }
+    }
+
+    fn stored(rows: &[(&str, &str)]) -> std::collections::BTreeMap<String, Vec<crate::config::StoredReply>> {
+        std::collections::BTreeMap::from([(
+            "@音量".to_string(),
+            rows.iter()
+                .map(|(key, text)| crate::config::StoredReply {
+                    key: (*key).to_string(),
+                    text: (*text).to_string(),
+                })
+                .collect(),
+        )])
+    }
+
+    #[test]
+    fn stored_override_reads_the_row_saved_under_its_own_command() {
+        // "改了没反应"的根因就是查不到这一行；这条测试直接钉住查询路径。
+        let stored = stored(&[("playback.volume.set", "音量已设为{音量}")]);
+        assert_eq!(
+            stored_override(&stored, "playback.volume.set").as_deref(),
+            Some("音量已设为{音量}")
+        );
+    }
+
+    #[test]
+    fn stored_override_is_none_when_the_row_was_removed() {
+        // 留空 / 停用 = 恢复内置默认，不应再返回覆盖。
+        let stored = stored(&[]);
+        assert_eq!(stored_override(&stored, "playback.volume.set"), None);
+    }
+
+    #[test]
+    fn stored_override_ignores_ordered_batch_commands() {
+        // 按序批量命令的单条文案由组装层按行渲染，不走单条覆盖查找。
+        let stored = std::collections::BTreeMap::from([(
+            "@帮助".to_string(),
+            vec![crate::config::StoredReply {
+                key: "help.song_request.1".to_string(),
+                text: "自定义".to_string(),
+            }],
+        )]);
+        assert_eq!(stored_override(&stored, "help.song_request.1"), None);
+    }
+
+    #[test]
+    fn muting_a_command_suppresses_only_its_own_keys() {
+        let stored = std::collections::BTreeMap::from([("@音量".to_string(), Vec::new())]);
+        assert!(is_muted(&stored, "playback.volume.set"));
+        // 别的命令不受影响
+        assert!(!is_muted(&stored, "playback.pause.ok"));
+        // 没有归属的 key 永远不会被静音，避免误吞没有编辑入口的文案
+        assert!(!is_muted(&stored, "test.spec"));
+    }
+
+    #[test]
+    fn partial_override_does_not_mute_the_remaining_rows() {
+        // 只改一条时，同命令其他 key 仍应正常发送。
+        let stored = stored(&[("playback.volume.set", "音量{音量}")]);
+        assert!(!is_muted(&stored, "playback.volume.set"));
+        assert!(!is_muted(&stored, "playback.pause.ok"));
     }
 
     #[test]

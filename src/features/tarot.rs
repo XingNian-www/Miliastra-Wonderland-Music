@@ -1,6 +1,6 @@
 //! 本地稳定抽牌与可选AI解读。只产生聊天回复，不依赖播放器或娱乐会话。
 use super::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
-use super::reply_template::{ReplyVars, tarot as templates};
+use super::reply_template::{ReplyTemplate, ReplyVars, tarot as templates};
 use crate::text::{MAX_CHAT_WIDTH, display_width, split_numbered_chat_message};
 use anyhow::{Result, anyhow, bail};
 use rand_chacha::{
@@ -14,6 +14,54 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// 一条待发送的塔罗回复。
+///
+/// 为什么不是裸 String：塔罗在业务层就拼好整段文本，如果直接返回 String，
+/// 组装层拿不到模板 key，用户改的覆盖文案永远读不到。带 key 的条目交给
+/// 组装层渲染，牌面数据行（位置/牌名/正逆位/牌义）保持 Raw，因为它们是牌库
+/// 内容而不是可编辑文案。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TarotReply {
+    /// 已定型的文本：牌面数据行、AI 输出、分段后的片段。
+    Raw(String),
+    /// 带模板 key 的文案，发送时才查覆盖。
+    Keyed {
+        spec: &'static ReplyTemplate,
+        vars: ReplyVars,
+    },
+    /// 需要按聊天宽度分段的模板文案。
+    ///
+    /// 分段必须在渲染之后做（宽度取决于实际文案），所以这里保留 key 与分段标签，
+    /// 由组装层先渲染、再调用同一套分段函数。
+    KeyedFitted {
+        label: &'static str,
+        spec: &'static ReplyTemplate,
+        vars: ReplyVars,
+    },
+}
+
+impl From<String> for TarotReply {
+    fn from(text: String) -> Self {
+        Self::Raw(text)
+    }
+}
+
+impl TarotReply {
+    /// 按内置默认文案渲染（不含用户覆盖），供业务层需要成品文本的场景使用。
+    pub(crate) fn render_default(&self) -> Vec<String> {
+        match self {
+            Self::Raw(text) => vec![text.clone()],
+            Self::Keyed { spec, vars } => {
+                vec![crate::features::reply_template::render(spec, None, vars).text]
+            }
+            Self::KeyedFitted { label, spec, vars } => {
+                let text = crate::features::reply_template::render(spec, None, vars).text;
+                fit_messages(label, &text)
+            }
+        }
+    }
+}
 
 const COOLDOWN: Duration = Duration::from_secs(30);
 const MAX_ACTORS: usize = 1024;
@@ -165,7 +213,7 @@ impl TarotApplication {
         command: &TarotCommand,
         now: Instant,
         gateway: &dyn TarotAiGateway,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<TarotReply>> {
         // 每次命令只读取一次墙上时间，模型等待跨午夜不会混用两天的牌。
         self.execute_for_day(actor, command, now, utc8_day_at(SystemTime::now()), gateway)
     }
@@ -176,16 +224,20 @@ impl TarotApplication {
         now: Instant,
         day: i64,
         gateway: &dyn TarotAiGateway,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<TarotReply>> {
         let (reroll, ai, question) = match command {
             TarotCommand::Help => {
                 return Ok([
-                    reply(&templates::HELP_DRAW, ReplyVars::new()),
-                    reply(&templates::HELP_REROLL, ReplyVars::new()),
-                    reply(&templates::HELP_INTERPRET, ReplyVars::new()),
+                    &templates::HELP_DRAW,
+                    &templates::HELP_REROLL,
+                    &templates::HELP_INTERPRET,
                 ]
                 .into_iter()
-                .flat_map(|text| fit_messages("塔罗", &text))
+                .map(|spec| TarotReply::KeyedFitted {
+                    label: "塔罗",
+                    spec,
+                    vars: ReplyVars::new(),
+                })
                 .collect());
             }
             TarotCommand::Draw {
@@ -195,11 +247,17 @@ impl TarotApplication {
             } => (*reroll, *ai || !question.trim().is_empty(), question),
         };
         if question.chars().count() > MAX_QUESTION_CHARS || question.chars().any(char::is_control) {
-            return Ok(vec![reply(&templates::QUESTION_TOO_LONG, ReplyVars::new())]);
+            return Ok(vec![TarotReply::Keyed {
+                spec: &templates::QUESTION_TOO_LONG,
+                vars: ReplyVars::new(),
+            }]);
         }
         let actor = actor.trim();
         if actor.is_empty() {
-            return Ok(vec![reply(&templates::ACTOR_MISSING, ReplyVars::new())]);
+            return Ok(vec![TarotReply::Keyed {
+                spec: &templates::ACTOR_MISSING,
+                vars: ReplyVars::new(),
+            }]);
         }
         let throttled = reroll || (ai && gateway.enabled());
         if throttled {
@@ -215,13 +273,16 @@ impl TarotApplication {
                     .as_millis()
                     .div_ceil(1000)
                     .to_string();
-                return Ok(vec![reply(
-                    &templates::COOLDOWN,
-                    ReplyVars::new().with("秒数", seconds),
-                )]);
+                return Ok(vec![TarotReply::Keyed {
+                    spec: &templates::COOLDOWN,
+                    vars: ReplyVars::new().with("秒数", seconds),
+                }]);
             }
             if recent.len() >= MAX_ACTORS {
-                return Ok(vec![reply(&templates::BUSY, ReplyVars::new())]);
+                return Ok(vec![TarotReply::Keyed {
+                    spec: &templates::BUSY,
+                    vars: ReplyVars::new(),
+                }]);
             }
             recent.insert(actor.into(), now);
         }
@@ -232,35 +293,46 @@ impl TarotApplication {
             .take(12)
             .filter(|ch| !matches!(ch, '@' | '#' | '＃') && !ch.is_control())
             .collect();
-        let title = reply(
-            &templates::SPREAD_TITLE,
-            ReplyVars::new().with("昵称", nickname.clone()),
-        );
-        let mut messages = fit_messages("塔罗", &title);
+        // 标题保留模板 key：在这里先渲染成 Raw 会让用户的塔罗标题覆盖失效。
+        let mut messages: Vec<TarotReply> = vec![TarotReply::KeyedFitted {
+            label: "塔罗",
+            spec: &templates::SPREAD_TITLE,
+            vars: ReplyVars::new().with("昵称", nickname.clone()),
+        }];
         for card in &cards {
-            messages.extend(fit_messages(
-                "牌义",
-                &format!(
-                    "{}：{}·{}，{}",
-                    card.position,
-                    card.name,
-                    if card.reversed { "逆位" } else { "正位" },
-                    card.meaning
-                ),
-            ));
+            messages.extend(
+                fit_messages(
+                    "牌义",
+                    &format!(
+                        "{}：{}·{}，{}",
+                        card.position,
+                        card.name,
+                        if card.reversed { "逆位" } else { "正位" },
+                        card.meaning
+                    ),
+                )
+                .into_iter()
+                .map(TarotReply::Raw),
+            );
         }
         if ai {
             if !gateway.enabled() {
-                messages.push(reply(&templates::AI_DISABLED, ReplyVars::new()));
+                messages.push(TarotReply::Keyed {
+                    spec: &templates::AI_DISABLED,
+                    vars: ReplyVars::new(),
+                });
             } else {
                 let interpretation = gateway
                     .interpret(question, &cards)
                     .and_then(|text| bounded_ai_messages(&text));
                 match interpretation {
-                    Ok(result) => messages.extend(result),
+                    Ok(result) => messages.extend(result.into_iter().map(TarotReply::Raw)),
                     Err(error) => {
                         log::warn!("塔罗AI解读失败: {error:#}");
-                        messages.push(reply(&templates::AI_UNAVAILABLE, ReplyVars::new()));
+                        messages.push(TarotReply::Keyed {
+                            spec: &templates::AI_UNAVAILABLE,
+                            vars: ReplyVars::new(),
+                        });
                     }
                 }
             }
@@ -342,11 +414,7 @@ fn card_reading(card: usize, reversed: bool) -> (String, String) {
     )
 }
 fn fit_messages(label: &str, text: &str) -> Vec<String> {
-    if display_width(text) <= MAX_CHAT_WIDTH {
-        vec![text.into()]
-    } else {
-        split_numbered_chat_message(label, text)
-    }
+    crate::text::fit_chat_message(label, text)
 }
 fn bounded_ai_messages(text: &str) -> Result<Vec<String>> {
     // 保留模型的自然段，只限制总字数；具体限宽复用现有聊天分段工具。
@@ -542,6 +610,16 @@ const RANKS: [(&str, &str, &str); 14] = [
 ];
 #[cfg(test)]
 mod tests {
+    /// 把带 key 的回复按内置默认文案展开，供断言成品文本使用。
+    ///
+    /// 生产路径由组装层查用户覆盖后渲染；测试不接配置，所以这里等价于内置文案。
+    fn flatten(replies: Vec<TarotReply>) -> Vec<String> {
+        replies
+            .into_iter()
+            .flat_map(|reply| reply.render_default())
+            .collect()
+    }
+
     use super::*;
     use crate::features::command::CommandObservation;
     const DAY: i64 = 20725;
@@ -682,12 +760,14 @@ mod tests {
         let now = Instant::now();
         let reply = app
             .execute_for_day("用户", &parsed("#塔罗牌").unwrap(), now, DAY, &ai)
+            .map(flatten)
             .unwrap();
         assert_eq!(reply.len(), 4);
         assert!(reply[0].contains("今日塔罗牌"));
         assert_eq!(
             reply,
             app.execute_for_day("用户", &parsed("#塔罗牌").unwrap(), now, DAY, &ai)
+                .map(flatten)
                 .unwrap()
         );
         assert!(ai.seen.lock().unwrap().is_empty());
@@ -706,7 +786,7 @@ mod tests {
                 Instant::now(),
                 DAY,
                 &ai,
-            )
+            ).map(flatten)
             .unwrap();
         let seen = ai.seen.lock().unwrap();
         assert_eq!(seen[0].0, "最近学习");
@@ -725,6 +805,7 @@ mod tests {
         let all = draw_cards(stable_seed("用户", DAY), 3);
         let plain = app
             .execute_for_day("用户", &parsed("#塔罗牌").unwrap(), now, DAY, &ai)
+            .map(flatten)
             .unwrap();
         assert_eq!(plain.len(), 4);
         assert_eq!(stored(&app, "用户").2, 3);
@@ -735,7 +816,7 @@ mod tests {
                 now + COOLDOWN,
                 DAY,
                 &ai,
-            )
+            ).map(flatten)
             .unwrap();
         assert!(asked.len() > plain.len());
         let seen = ai.seen.lock().unwrap();
@@ -805,21 +886,22 @@ mod tests {
             ..Default::default()
         };
         let now = Instant::now();
-        app.execute_for_day("用户", &draw(false, true, "提问"), now, DAY, &ai)
+        app.execute_for_day("用户", &draw(false, true, "提问"), now, DAY, &ai).map(flatten)
             .unwrap();
         let state = stored(&app, "用户");
         let reply = app
             .clone()
-            .execute_for_day("用户", &draw(false, true, "再问"), now, DAY, &ai)
+            .execute_for_day("用户", &draw(false, true, "再问"), now, DAY, &ai).map(flatten)
             .unwrap();
         assert!(reply[0].contains("冷却"));
         assert_eq!(stored(&app, "用户"), state);
         assert_eq!(ai.seen.lock().unwrap().len(), 1);
         // 普通抽牌不占冷却，也不改变牌组。
         app.execute_for_day("用户", &parsed("#塔罗牌").unwrap(), now, DAY, &ai)
+            .map(flatten)
             .unwrap();
         assert_eq!(stored(&app, "用户"), state);
-        app.execute_for_day("用户", &draw(false, true, "追问"), now + COOLDOWN, DAY, &ai)
+        app.execute_for_day("用户", &draw(false, true, "追问"), now + COOLDOWN, DAY, &ai).map(flatten)
             .unwrap();
         assert_eq!(ai.seen.lock().unwrap().len(), 2);
     }
@@ -833,8 +915,8 @@ mod tests {
                 ..Default::default()
             };
             let messages = app
-                .execute_for_day("用户", &draw(false, true, "问题"), Instant::now(), DAY, &ai)
-                .unwrap();
+                .execute_for_day("用户", &draw(false, true, "问题"), Instant::now(), DAY, &ai).map(flatten)
+            .unwrap();
             assert!(messages.iter().any(|m| m.contains("基础牌义")));
             let state = stored(&app, "用户");
             assert_eq!((state.2, state.3), (3, None));
@@ -851,19 +933,19 @@ mod tests {
         let ai = FakeAi::default();
         let now = Instant::now();
         assert!(
-            app.execute_for_day("用户", &TarotCommand::Help, now, DAY, &ai)
-                .unwrap()
+            app.execute_for_day("用户", &TarotCommand::Help, now, DAY, &ai).map(flatten)
+            .unwrap()
                 .iter()
                 .all(|m| display_width(m) <= 80)
         );
         assert!(
-            app.execute_for_day("用户", &draw(false, false, &"字".repeat(81)), now, DAY, &ai)
-                .unwrap()[0]
+            app.execute_for_day("用户", &draw(false, false, &"字".repeat(81)), now, DAY, &ai).map(flatten)
+            .unwrap()[0]
                 .contains("80字")
         );
         assert!(
-            app.execute_for_day("", &draw(false, false, ""), now, DAY, &ai)
-                .unwrap()[0]
+            app.execute_for_day("", &draw(false, false, ""), now, DAY, &ai).map(flatten)
+            .unwrap()[0]
                 .contains("发言者")
         );
         assert_eq!(
@@ -921,6 +1003,72 @@ mod tests {
         );
         assert!(bounded_ai_messages("   ").is_err());
     }
+    #[test]
+    fn tarot_replies_keep_template_keys_so_overrides_can_reach_the_sender() {
+        // 修复前塔罗在业务层就把模板渲染成 String，组装层拿不到 key，
+        // 用户改的塔罗文案永远不生效。这里断言返回的条目确实带着 key。
+        let app = app();
+        let ai = FakeAi::default();
+        let replies = app
+            .execute_for_day(
+                "用户",
+                &draw(false, false, &"太长的问题".repeat(20)),
+                Instant::now(),
+                DAY,
+                &ai,
+            )
+            .unwrap();
+        let TarotReply::Keyed { spec, .. } = &replies[0] else {
+            panic!("超长提问应返回带 key 的回复，实际得到 {:?}", replies[0]);
+        };
+        assert_eq!(spec.key, "tarot.question.too_long");
+    }
+
+    #[test]
+    fn tarot_help_replies_are_fitted_templates_not_raw_text() {
+        let app = app();
+        let ai = FakeAi::default();
+        let replies = app
+            .execute_for_day("用户", &TarotCommand::Help, Instant::now(), DAY, &ai)
+            .unwrap();
+        assert_eq!(replies.len(), 3);
+        for reply in &replies {
+            let TarotReply::KeyedFitted { spec, .. } = reply else {
+                panic!("帮助应返回可分段模板，实际得到 {reply:?}");
+            };
+            assert!(spec.key.starts_with("tarot.help."));
+        }
+    }
+
+    #[test]
+    fn tarot_card_lines_stay_raw_data_not_templates() {
+        // 牌面行是牌库内容，不是可编辑文案；它们必须保持 Raw，
+        // 否则用户能改出与牌库不一致的解读。
+        let app = app();
+        let ai = FakeAi::default();
+        let replies = app
+            .execute_for_day("用户", &parsed("#塔罗牌").unwrap(), Instant::now(), DAY, &ai)
+            .unwrap();
+        // 标题保留模板 key（否则标题覆盖会失效），牌面行必须是 Raw 数据。
+        assert!(
+            matches!(replies[0], TarotReply::KeyedFitted { .. }),
+            "标题应带模板 key，实际得到 {:?}",
+            replies[0]
+        );
+        assert!(
+            replies
+                .iter()
+                .skip(1)
+                .all(|reply| matches!(reply, TarotReply::Raw(_))),
+            "牌面数据行应保持 Raw"
+        );
+        // 标题现在是 KeyedFitted：文案由组装层渲染，键为 tarot.spread.title。
+        assert!(
+            matches!(&replies[0], TarotReply::KeyedFitted { spec, .. } if spec.key == "tarot.spread.title"),
+            "标题应使用 tarot.spread.title 模板"
+        );
+    }
+
     #[test]
     fn ai_prompt_carries_selected_cards_and_question_as_data() {
         let cards = draw_cards(stable_seed("用户", DAY), 3);

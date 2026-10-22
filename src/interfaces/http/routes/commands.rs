@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::config::StoredReply;
 
 const MAX_COMMAND_REPLIES: usize = 32;
-const MAX_REPLY_CHARS: usize = 300;
+/// 单条回复的字数上限；与配置页的 replies.overrides 共用同一个来源，
+/// 避免两个编辑入口对同一条文案给出不同限制。
+const MAX_REPLY_CHARS: usize = crate::config::MAX_REPLY_OVERRIDE_CHARS;
 
 /// 命令目录与可编辑策略共享稳定ID，读取本身不改变配置。
 pub(super) fn commands_replies_route(
@@ -22,12 +24,13 @@ pub(super) fn commands_replies_route(
         .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?;
     let revision = store.reply_revision().map_err(internal_error)?;
     let stored = store.reply_templates().map_err(internal_error)?;
-    let commands = crate::features::reply_template::command_reply_catalog().iter().map(|entry| {
-        let defaults = entry.replies.iter().map(|item| json!({"key":item.key,"text":item.default,"defaultText":item.default,"editable":true,"active":true})).collect::<Vec<_>>();
+    let commands = crate::features::reply_template::command_reply_catalog().map(|entry| {
+        let owned: Vec<_> = entry.replies().collect();
+        let defaults = owned.iter().map(|item| json!({"key":item.key,"text":item.default,"defaultText":item.default,"editable":true,"active":true})).collect::<Vec<_>>();
         let stored_rows = stored.get(entry.id).map(Vec::as_slice);
-        let default_by_key: BTreeMap<_, _> = entry.replies.iter().map(|item| (item.key, item.default)).collect();
+        let default_by_key: BTreeMap<_, _> = owned.iter().map(|item| (item.key, item.default)).collect();
         let replies = match stored_rows {
-            Some(rows) if rows.is_empty() => entry.replies.iter().map(|item| json!({
+            Some(rows) if rows.is_empty() => owned.iter().map(|item| json!({
                 "key": item.key, "text": item.default, "defaultText": item.default, "editable": true, "active": false
             })).collect::<Vec<_>>(),
             Some(rows) => {
@@ -39,16 +42,16 @@ pub(super) fn commands_replies_route(
                     "editable":true,
                     "active":true
                 })).collect::<Vec<_>>();
-                replies.extend(entry.replies.iter().filter(|item| !active.contains(item.key))
+                replies.extend(owned.iter().filter(|item| !active.contains(item.key))
                     .map(|item| json!({"key":item.key,"text":item.default,"defaultText":item.default,"editable":true,"active":false})));
                 replies
             },
-            None => entry.replies.iter().map(|item| json!({
+            None => owned.iter().map(|item| json!({
                 "key": item.key, "text": item.default, "defaultText": item.default, "editable": true, "active": true
             })).collect::<Vec<_>>(),
         };
         let mut referenced_variables = BTreeSet::new();
-        for item in entry.replies {
+        for item in &owned {
             let mut rest = item.default;
             while let Some(open) = rest.find('{') {
                 let after = &rest[open + 1..];
@@ -69,8 +72,18 @@ pub(super) fn commands_replies_route(
         .iter()
         .map(|variable| json!({"name":variable.name,"label":variable.label}))
         .collect::<Vec<_>>();
-    serde_json::to_string(&json!({"revision":revision,"commands":commands,"variables":variables}))
-        .map_err(internal_error)
+    serde_json::to_string(&json!({
+        "revision": revision,
+        "commands": commands,
+        "variables": variables,
+        "limits": { "maxReplyChars": MAX_REPLY_CHARS, "maxRows": MAX_COMMAND_REPLIES },
+        // 共享回复的命令别名：前端据此把 @播放 这类命令指向它真正所在的回复分组。
+        "aliases": crate::features::reply_template::command_id_aliases()
+            .iter()
+            .map(|(alias, owner)| json!({"id": alias, "owner": owner}))
+            .collect::<Vec<_>>(),
+    }))
+    .map_err(internal_error)
 }
 
 #[derive(Deserialize)]
@@ -99,15 +112,24 @@ fn validate_reply_items(
     if items.len() > MAX_COMMAND_REPLIES {
         return Err(bad_request("每个命令最多32条回复"));
     }
-    let static_keys: BTreeSet<_> = entry.replies.iter().map(|item| item.key).collect();
+    let static_keys: BTreeSet<_> = entry.replies().map(|item| item.key).collect();
     let mut seen = BTreeSet::new();
     let mut saved = Vec::with_capacity(items.len());
     for reply in items {
         if reply.key.trim().is_empty() || !seen.insert(reply.key.clone()) {
             return Err(bad_request("回复key不能为空且不能重复"));
         }
+        // 留空 = 使用内置默认，但**仍要保留这一行**。
+        //
+        // 关键区别：行的存在表示"该回复启用"，行的缺失才表示"该回复被停用"。
+        // 如果这里把空文本行丢弃，一条只含单行的命令保存后就会变成空列表，
+        // 被 is_muted 判成"整条命令静音"——用户只是想恢复默认文案，却把回复关掉了。
         if reply.text.trim().is_empty() {
-            return Err(bad_request("活动回复内容不能为空；请停用该行或静音命令"));
+            saved.push(StoredReply {
+                key: reply.key,
+                text: String::new(),
+            });
+            continue;
         }
         if reply.text.chars().count() > MAX_REPLY_CHARS
             || reply.text.contains('\n')
@@ -145,7 +167,7 @@ pub(super) fn commands_replies_save_route(
     if request.commands.is_empty() || request.commands.len() > 64 {
         return Err(bad_request("请提交1至64个命令的回复列表"));
     }
-    let catalog = crate::features::reply_template::command_reply_catalog();
+    let catalog: Vec<_> = crate::features::reply_template::command_reply_catalog().collect();
     let mut replacements = BTreeMap::<String, Vec<StoredReply>>::new();
     for command in request.commands {
         let entry = catalog
@@ -294,9 +316,8 @@ mod reply_api_tests {
         assert!(!reply_variables_valid("未知{HTTP内部字段}"));
     }
 
-    fn help_song_entry() -> &'static crate::features::reply_template::CommandReplyCatalogEntry {
+    fn help_song_entry() -> crate::features::reply_template::CommandReplyCatalogEntry {
         crate::features::reply_template::command_reply_catalog()
-            .iter()
             .find(|entry| entry.id == "@帮助")
             .expect("help reply catalog entry")
     }
@@ -308,9 +329,8 @@ mod reply_api_tests {
         }
     }
 
-    fn single_reply_entry() -> &'static crate::features::reply_template::CommandReplyCatalogEntry {
+    fn single_reply_entry() -> crate::features::reply_template::CommandReplyCatalogEntry {
         crate::features::reply_template::command_reply_catalog()
-            .iter()
             .find(|entry| entry.id == "@音量")
             .expect("single reply catalog entry")
     }
@@ -318,7 +338,7 @@ mod reply_api_tests {
     #[test]
     fn reply_item_validation_accepts_ordered_static_and_custom_rows() {
         let rows = validate_reply_items(
-            help_song_entry(),
+            &help_song_entry(),
             vec![
                 item("custom:first", "第一条{用户名}".to_owned()),
                 item("help.song_request.1", "第二条".to_owned()),
@@ -335,14 +355,14 @@ mod reply_api_tests {
     fn branch_outcome_rejects_extra_reply_keys() {
         assert!(
             validate_reply_items(
-                single_reply_entry(),
+                &single_reply_entry(),
                 vec![item("custom:extra", "不应添加第二个分支回复".to_owned())],
             )
             .is_err()
         );
         assert!(
             validate_reply_items(
-                single_reply_entry(),
+                &single_reply_entry(),
                 vec![item("playback.volume.set", "音量 {音量}".to_owned())],
             )
             .is_ok()
@@ -351,15 +371,18 @@ mod reply_api_tests {
 
     #[test]
     fn reply_item_validation_rejects_blank_oversized_multiline_and_unknown_variables() {
+        // 留空 = 使用内置默认，但行必须保留：行存在才表示该回复启用。
+        // 若把行丢掉，只含单行的命令保存后就会变成空列表而被判为“整条静音”。
         for text in [String::new(), "  ".to_owned()] {
-            assert!(
-                validate_reply_items(help_song_entry(), vec![item("help.song_request.1", text)])
-                    .is_err()
-            );
+            let rows =
+                validate_reply_items(&help_song_entry(), vec![item("help.song_request.1", text)])
+                    .expect("留空应被接受");
+            assert_eq!(rows.len(), 1, "留空的行必须保留");
+            assert!(rows[0].text.trim().is_empty(), "留空行的文本应为空");
         }
         assert!(
             validate_reply_items(
-                help_song_entry(),
+                &help_song_entry(),
                 vec![item(
                     "help.song_request.1",
                     "歌".repeat(MAX_REPLY_CHARS + 1)
@@ -369,14 +392,14 @@ mod reply_api_tests {
         );
         assert!(
             validate_reply_items(
-                help_song_entry(),
+                &help_song_entry(),
                 vec![item("help.song_request.1", "第一行\n第二行".to_owned())],
             )
             .is_err()
         );
         assert!(
             validate_reply_items(
-                help_song_entry(),
+                &help_song_entry(),
                 vec![item("help.song_request.1", "未知{HTTP内部字段}".to_owned())],
             )
             .is_err()
@@ -386,7 +409,7 @@ mod reply_api_tests {
     #[test]
     fn empty_reply_list_is_valid_for_explicit_mute() {
         assert!(
-            validate_reply_items(help_song_entry(), Vec::new())
+            validate_reply_items(&help_song_entry(), Vec::new())
                 .unwrap()
                 .is_empty()
         );

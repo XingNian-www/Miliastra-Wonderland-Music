@@ -20,8 +20,7 @@ pub(crate) struct SongRequestContext {
     pub(crate) raw: String,
     pub(crate) username: String,
     pub(crate) user_command: String,
-    /// 调用方是否具备好友及以上权限：好友私聊、已映射的好友/管理员/主人，
-    /// 以及控制面板发起的点歌都算；B站 音源与本地曲库兜底以此为门槛。
+    /// 调用方身份快照；平台权限统一通过 SongRequestPort::song_source_allowed 读取。
     pub(crate) friend_or_above: bool,
 }
 
@@ -171,6 +170,15 @@ impl Display for SongSearchFailure {
 }
 
 pub(crate) trait SongRequestPort {
+    /// Read the current platform policy for the original actor, not the delivery target.
+    fn song_source_allowed(&self, _username: &str, _source: &str, _console: bool) -> bool {
+        true
+    }
+
+    fn song_ai_command_allowed(&self, _username: &str, _console: bool) -> bool {
+        true
+    }
+
     fn reply(&self, message: &str) -> Result<()>;
 
     /// 按模板键回复。
@@ -208,7 +216,7 @@ pub(crate) trait SongRequestPort {
     /// 本地曲库候选；AI 点歌与普通点歌都会调用，供在线匹配偏低时推荐。
     ///
     /// 本地检索跨平台进行，不受在线 source 限制；`allow_bilibili` 表示本次请求
-    /// 具备好友及以上权限，只有它才允许把 B站 音源纳入本地兜底。
+    /// 当前平台策略允许 B站 时才把它纳入本地兜底。
     fn search_library_candidates(
         &self,
         keyword: &str,
@@ -393,6 +401,7 @@ enum SongQueuePushOutcome {
     Duplicate,
     Full,
     DedupLimited,
+    PermissionDenied,
 }
 
 #[derive(Clone, Copy)]
@@ -466,7 +475,8 @@ impl SongRequestApplication {
             song_review: self.song_review.as_ref(),
             queue_max_size: self.queue_max_size,
             console_bypass_dedup: self.console_bypass_dedup,
-            friend_or_above: context.friend_or_above,
+            actor_username: &context.username,
+            console: context.message_type == "控制台",
             port,
         }
         .execute_song_request_intent(context, song)
@@ -478,12 +488,71 @@ struct SongRequestExecution<'a> {
     song_review: &'a dyn SongReviewGateway,
     queue_max_size: usize,
     console_bypass_dedup: bool,
-    /// 本次请求是否具备好友及以上权限。
-    friend_or_above: bool,
+    actor_username: &'a str,
+    console: bool,
     port: &'a mut dyn SongRequestPort,
 }
 
 impl SongRequestExecution<'_> {
+    fn source_allowed(&self, source: &str) -> bool {
+        self.port
+            .song_source_allowed(self.actor_username, source, self.console)
+    }
+
+    fn ai_command_allowed(&self) -> bool {
+        self.port
+            .song_ai_command_allowed(self.actor_username, self.console)
+    }
+
+    fn require_ai_command(&self) -> Result<bool> {
+        if self.ai_command_allowed() {
+            return Ok(true);
+        }
+        self.reply_template(
+            &crate::features::reply_template::song::PLATFORM_DENIED,
+            &crate::features::reply_template::ReplyVars::new(),
+        )?;
+        Ok(false)
+    }
+
+    fn require_source(&self, source: &str) -> Result<bool> {
+        if self.source_allowed(source) {
+            return Ok(true);
+        }
+        self.reply_template(
+            &crate::features::reply_template::song::PLATFORM_DENIED,
+            &crate::features::reply_template::ReplyVars::new(),
+        )?;
+        Ok(false)
+    }
+
+    fn require_request_source(&self, request: &ResolvedSongRequest) -> Result<bool> {
+        let source = request
+            .track
+            .as_ref()
+            .map(|track| track.track_ref.key.provider.as_str())
+            .unwrap_or(&request.source);
+        self.require_source(source)
+    }
+
+    fn allowed_candidates(&self, candidates: Vec<SearchCandidate>) -> Vec<SearchCandidate> {
+        candidates
+            .into_iter()
+            .filter(|candidate| self.source_allowed(candidate.track_ref.key.provider.as_str()))
+            .collect()
+    }
+
+    fn allowed_pick(&self, picked: Option<PickedCandidate>) -> Result<Option<PickedCandidate>> {
+        let Some(mut picked) = picked else {
+            return Ok(None);
+        };
+        picked.candidate_snapshot = self.allowed_candidates(picked.candidate_snapshot);
+        if !self.require_source(picked.candidate.track_ref.key.provider.as_str())? {
+            return Ok(None);
+        }
+        Ok(Some(picked))
+    }
+
     fn execute_song_request_intent(
         &mut self,
         context: &SongRequestContext,
@@ -497,6 +566,9 @@ impl SongRequestExecution<'_> {
         };
         request.requester = context.username.clone();
         request.console_bypass_dedup = context.message_type == "控制台";
+        if !self.require_request_source(&request)? {
+            return Ok(());
+        }
         if !self.review_song_candidate(context, &request)? {
             return Ok(());
         }
@@ -547,7 +619,9 @@ impl SongRequestExecution<'_> {
                     return Ok(());
                 }
                 if !self.port.current_status_matches_request(&status)? {
-                    let result = self.play_request_confirmed(&request)?;
+                    let Some(result) = self.play_request_confirmed(&request)? else {
+                        return Ok(());
+                    };
                     self.log_play_request_outcome(context, &request, &result)?;
                     return Ok(());
                 }
@@ -583,7 +657,9 @@ impl SongRequestExecution<'_> {
             }
         }
 
-        let result = self.play_request_confirmed(&request)?;
+        let Some(result) = self.play_request_confirmed(&request)? else {
+            return Ok(());
+        };
         self.log_play_request_outcome(context, &request, &result)
     }
 
@@ -649,7 +725,33 @@ impl SongRequestExecution<'_> {
                 Vec::new()
             }
         };
-        let online = match self.port.search_candidates(keyword, source) {
+        let local = self.allowed_candidates(local);
+        let original_source = source;
+        let all_sources = super::platform_sources()
+            .map(|(source, _)| source.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = if source.is_empty() {
+            &all_sources
+        } else {
+            source
+        };
+        let sources = source
+            .split(',')
+            .filter(|source| self.source_allowed(source))
+            .collect::<Vec<_>>()
+            .join(",");
+        if sources.is_empty() {
+            return Ok(SongSearchCandidates::from_sources(local, Vec::new()));
+        }
+        let online = match self.port.search_candidates(
+            keyword,
+            if sources == source {
+                original_source
+            } else {
+                &sources
+            },
+        ) {
             Ok(candidates) => candidates.unwrap_or_default(),
             Err(error) if local.is_empty() => return Err(error),
             Err(error) => {
@@ -657,7 +759,10 @@ impl SongRequestExecution<'_> {
                 Vec::new()
             }
         };
-        Ok(SongSearchCandidates::from_sources(local, online))
+        Ok(SongSearchCandidates::from_sources(
+            local,
+            self.allowed_candidates(online),
+        ))
     }
 
     fn resolve_ai_song_request(
@@ -666,6 +771,9 @@ impl SongRequestExecution<'_> {
         include_configuration_hint: bool,
     ) -> Result<Option<ResolvedSongRequest>> {
         let label = song_label(song);
+        if !self.require_ai_command()? {
+            return Ok(None);
+        }
         if !self.ai.enabled() {
             log::info!(
                 "命令未执行：AI点歌未启用 keyword={} label={}",
@@ -689,8 +797,8 @@ impl SongRequestExecution<'_> {
             &crate::features::reply_template::ReplyVars::new().with("标签", label.clone()),
         )?;
 
-        let search_source = ai_candidate_source(song, self.friend_or_above);
-        let allow_bilibili = self.friend_or_above;
+        let search_source = ai_candidate_source(song, self.source_allowed("bilibili"));
+        let allow_bilibili = self.source_allowed("bilibili");
         let mut candidates =
             match self.search_ai_candidates(&song.keyword, search_source, allow_bilibili) {
                 Ok(candidates) => candidates,
@@ -772,6 +880,9 @@ impl SongRequestExecution<'_> {
                 CandidateEligibility::Eligible | CandidateEligibility::Unknown
             )
         });
+        candidates.merged = self.allowed_candidates(candidates.merged);
+        candidates.local = self.allowed_candidates(candidates.local);
+        candidates.online = self.allowed_candidates(candidates.online);
         if candidates.merged.is_empty() {
             log::info!("命令未执行：无可用候选 keyword={}", song.keyword);
             self.reply_template(
@@ -929,6 +1040,9 @@ impl SongRequestExecution<'_> {
             } else {
                 &request.source
             };
+            if !self.require_source(source)? {
+                return Ok(None);
+            }
             let picked = match self.port.search_and_pick(
                 &request.keyword,
                 source,
@@ -944,6 +1058,11 @@ impl SongRequestExecution<'_> {
                     return Ok(None);
                 }
             };
+            let had_pick = picked.is_some();
+            let picked = self.allowed_pick(picked)?;
+            if had_pick && picked.is_none() {
+                return Ok(None);
+            }
             let Some(picked) = picked else {
                 // 平台没有可播候选时给出本地曲库推荐。这是与在线选歌分开的独立流程，
                 // 超时语义为「跳过」，绝不替用户自动播放本地候选。
@@ -951,7 +1070,7 @@ impl SongRequestExecution<'_> {
                     &request.label(),
                     &format!("{}平台无对应歌曲音源", request.label()),
                     &request.keyword,
-                    self.friend_or_above,
+                    self.source_allowed("bilibili"),
                     true,
                 )? {
                     NoCandidateOutcome::Local(candidate) => {
@@ -985,7 +1104,7 @@ impl SongRequestExecution<'_> {
             let local_offer = self.plain_local_offer_after_online_pick(&request.keyword, &picked);
             let allow_local = local_offer.is_some();
             let song_title = picked.candidate.text.clone();
-            let actions = if self.ai.enabled() {
+            let actions = if self.ai.enabled() && self.ai_command_allowed() {
                 "@确认@跳过@换源@AI@选择"
             } else {
                 "@确认@跳过@换源@选择"
@@ -1003,7 +1122,7 @@ impl SongRequestExecution<'_> {
                 &messages,
                 &picked.candidate_snapshot,
                 true,
-                self.ai.enabled(),
+                self.ai.enabled() && self.ai_command_allowed(),
                 allow_local,
                 !allow_local,
             )?;
@@ -1058,11 +1177,16 @@ impl SongRequestExecution<'_> {
                             let next_source = alternate_music_source(source);
                             self.resolve_and_confirm_song_with_source(song, next_source)
                         }
-                        SongRequestDecision::Ai if self.ai.enabled() => {
+                        SongRequestDecision::Ai
+                            if self.ai.enabled() && self.ai_command_allowed() =>
+                        {
                             self.resolve_and_confirm_song_ai(song)
                         }
                         SongRequestDecision::Ai => {
-                            log::info!("命令未执行：AI点歌未启用 keyword={}", request.keyword);
+                            if !self.ai_command_allowed() {
+                                self.require_ai_command()?;
+                            }
+                            log::info!("命令未执行：AI点歌不可用 keyword={}", request.keyword);
                             Ok(None)
                         }
                         SongRequestDecision::Confirm
@@ -1091,6 +1215,9 @@ impl SongRequestExecution<'_> {
         song: &SongCommand,
         source: &str,
     ) -> Result<Option<ResolvedSongRequest>> {
+        if !self.require_source(source)? {
+            return Ok(None);
+        }
         let picked =
             match self
                 .port
@@ -1106,6 +1233,11 @@ impl SongRequestExecution<'_> {
                     return Ok(None);
                 }
             };
+        let had_pick = picked.is_some();
+        let picked = self.allowed_pick(picked)?;
+        if had_pick && picked.is_none() {
+            return Ok(None);
+        }
         let Some(picked) = picked else {
             // 换源后仍无音源时同样给出本地曲库推荐；本地推荐是独立流程，
             // 超时按「跳过」处理，不会自动播放。
@@ -1113,7 +1245,7 @@ impl SongRequestExecution<'_> {
                 &song_label(song),
                 &format!("{}换源后仍无音源", song_label(song)),
                 &song.keyword,
-                self.friend_or_above,
+                self.source_allowed("bilibili"),
                 true,
             )? {
                 NoCandidateOutcome::Local(candidate) => {
@@ -1201,7 +1333,9 @@ impl SongRequestExecution<'_> {
                 let next_source = alternate_music_source(source);
                 self.resolve_and_confirm_song_with_source(song, next_source)
             }
-            SongRequestDecision::Ai if self.ai.enabled() => self.resolve_and_confirm_song_ai(song),
+            SongRequestDecision::Ai if self.ai.enabled() && self.ai_command_allowed() => {
+                self.resolve_and_confirm_song_ai(song)
+            }
             SongRequestDecision::Stopped
             | SongRequestDecision::Ai
             | SongRequestDecision::Select
@@ -1242,6 +1376,9 @@ impl SongRequestExecution<'_> {
                     .unwrap_or_default()
             );
             return Ok(SongQueuePushOutcome::DedupLimited);
+        }
+        if !self.require_request_source(request)? {
+            return Ok(SongQueuePushOutcome::PermissionDenied);
         }
         let pushed = self.port.push_queue(QueueItem {
             id: 0,
@@ -1288,6 +1425,7 @@ impl SongRequestExecution<'_> {
         feedback: QueuePushFeedback,
     ) -> Result<()> {
         match outcome {
+            SongQueuePushOutcome::PermissionDenied => {}
             SongQueuePushOutcome::Added(len) => {
                 self.log_executed_command(context, &request.final_command(feedback.queued_action))?;
                 self.reply_template(
@@ -1541,7 +1679,7 @@ impl SongRequestExecution<'_> {
             .fold(0.0_f64, f64::max);
         let local = match self
             .port
-            .search_library_candidates(keyword, self.friend_or_above)
+            .search_library_candidates(keyword, self.source_allowed("bilibili"))
         {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -1549,6 +1687,7 @@ impl SongRequestExecution<'_> {
                 return None;
             }
         };
+        let local = self.allowed_candidates(local);
         if local.is_empty() {
             return None;
         }
@@ -1573,7 +1712,7 @@ impl SongRequestExecution<'_> {
             return Vec::new();
         }
         match self.port.search_library_candidates(keyword, allow_bilibili) {
-            Ok(candidates) => local_library_choices(&candidates, 0),
+            Ok(candidates) => local_library_choices(&self.allowed_candidates(candidates), 0),
             Err(error) => {
                 log::warn!("本地曲库检索失败，无法给出本地推荐: {error:#}");
                 Vec::new()
@@ -1688,7 +1827,8 @@ impl SongRequestExecution<'_> {
         if allow_switch_source {
             actions.push_str("@换源");
         }
-        if self.ai.enabled() {
+        let allow_ai = self.ai.enabled() && self.ai_command_allowed();
+        if allow_ai {
             actions.push_str("@AI");
         }
         // @本地 只出现在下面那条本地推荐里，不在这里重复列出。
@@ -1700,11 +1840,15 @@ impl SongRequestExecution<'_> {
         let decision = self.port.prompt_and_wait_for_decision_batch(
             &messages,
             allow_switch_source,
-            self.ai.enabled(),
+            allow_ai,
             allow_local,
             true,
         )?;
         match decision {
+            SongRequestDecision::Ai if !allow_ai => {
+                self.require_ai_command()?;
+                Ok(NoCandidateOutcome::Skip)
+            }
             SongRequestDecision::LocalLibrary => {
                 match self.choose_local_library_candidate(&offer)? {
                     Some(candidate) => Ok(NoCandidateOutcome::Local(candidate)),
@@ -1714,7 +1858,11 @@ impl SongRequestExecution<'_> {
             SongRequestDecision::SwitchSource if allow_switch_source => {
                 Ok(NoCandidateOutcome::SwitchSource)
             }
-            SongRequestDecision::Ai if self.ai.enabled() => Ok(NoCandidateOutcome::Ai),
+            SongRequestDecision::Ai if self.ai.enabled() && allow_ai => Ok(NoCandidateOutcome::Ai),
+            SongRequestDecision::Ai => {
+                self.require_ai_command()?;
+                Ok(NoCandidateOutcome::Skip)
+            }
             other => {
                 log::info!("命令未执行：无在线候选，决策={other:?} 按跳过处理 keyword={keyword}");
                 Ok(NoCandidateOutcome::Skip)
@@ -1726,8 +1874,14 @@ impl SongRequestExecution<'_> {
         self.port.playback_queue()
     }
 
-    fn play_request_confirmed(&mut self, request: &ResolvedSongRequest) -> Result<PlaybackResult> {
-        self.port.play_confirmed(request)
+    fn play_request_confirmed(
+        &mut self,
+        request: &ResolvedSongRequest,
+    ) -> Result<Option<PlaybackResult>> {
+        if !self.require_request_source(request)? {
+            return Ok(None);
+        }
+        self.port.play_confirmed(request).map(Some)
     }
 
     fn log_executed_command(
@@ -1927,15 +2081,14 @@ fn merge_ai_search_rounds(
 
 /// AI 点歌的在线检索范围。
 ///
-/// 未获得好友及以上权限的大厅成员只用 QQ、网易、酷狗三源；好友私聊与大厅里
-/// 靠身份映射获得好友/管理员/主人权限的成员，按好友私聊的语义处理：
-/// `@AI点歌`/`@AI搜索` 搜索全部音源（含 B站），显式指定音源时仍只用该音源。
-fn ai_candidate_source(song: &SongCommand, friend_or_above: bool) -> &'static str {
-    if !friend_or_above && song.friend_username.trim().is_empty() {
+/// 默认 AI 点歌扩展到所有获授权的平台；显式音源仍保持业务范围。
+/// 是否允许 B站 来自平台策略，不由好友投递目标或聊天颜色决定。
+fn ai_candidate_source(song: &SongCommand, allow_bilibili: bool) -> &'static str {
+    if !allow_bilibili && matches!(song.source, SongSource::QqMusic | SongSource::All) {
         return "qqmusic,netease,kugou";
     }
     if song.ai_assisted && song.source == SongSource::QqMusic {
-        // 大厅命令表的 AI 点歌默认写的是 QQ，获得好友及以上权限后按好友表放开全部音源。
+        // 默认 AI 点歌的 QQ 占位扩展到全部平台，再按实际平台权限过滤。
         return "";
     }
     song.source.as_str()
@@ -2265,6 +2418,12 @@ mod tests {
     }
 
     struct FakePort {
+        denied_sources: RefCell<Vec<String>>,
+        ai_denied: RefCell<Option<(String, bool)>>,
+        ai_permission_checks: RefCell<Vec<(String, bool)>>,
+        permission_checks: RefCell<Vec<(String, String, bool)>>,
+        revoke_on_status: Cell<bool>,
+        revoke_on_dedup: Cell<bool>,
         replies: RefCell<Vec<String>>,
         decision_prompts: RefCell<Vec<String>>,
         /// 每次等待记录 (允许换源, 允许AI, 允许本地推荐, 超时确认)。
@@ -2295,6 +2454,12 @@ mod tests {
     impl FakePort {
         fn idle(searches: impl IntoIterator<Item = Option<PickedCandidate>>) -> Self {
             Self {
+                denied_sources: RefCell::new(vec!["bilibili".into()]),
+                ai_denied: RefCell::new(None),
+                ai_permission_checks: RefCell::new(Vec::new()),
+                permission_checks: RefCell::new(Vec::new()),
+                revoke_on_status: Cell::new(false),
+                revoke_on_dedup: Cell::new(false),
                 replies: RefCell::new(Vec::new()),
                 decision_prompts: RefCell::new(Vec::new()),
                 decision_options: RefCell::new(Vec::new()),
@@ -2323,6 +2488,29 @@ mod tests {
     }
 
     impl SongRequestPort for FakePort {
+        fn song_ai_command_allowed(&self, username: &str, console: bool) -> bool {
+            self.ai_permission_checks
+                .borrow_mut()
+                .push((username.into(), console));
+            self.ai_denied
+                .borrow()
+                .as_ref()
+                .map_or(true, |(user, allowed)| {
+                    user != username || *allowed || console
+                })
+        }
+
+        fn song_source_allowed(&self, username: &str, source: &str, console: bool) -> bool {
+            self.permission_checks
+                .borrow_mut()
+                .push((username.into(), source.into(), console));
+            !self
+                .denied_sources
+                .borrow()
+                .iter()
+                .any(|denied| denied == source)
+        }
+
         fn reply(&self, message: &str) -> Result<()> {
             self.replies.borrow_mut().push(message.to_string());
             Ok(())
@@ -2396,7 +2584,7 @@ mod tests {
             if self.library_error.get() {
                 return Err(anyhow!("test library unavailable"));
             }
-            // 与生产实现一致：缺少好友及以上权限时本地兜底排除 B站 音源。
+            // 模拟后端按调用方传入的平台授权参数过滤 B站。
             Ok(self
                 .library_candidates
                 .borrow()
@@ -2476,6 +2664,9 @@ mod tests {
         }
 
         fn player_status(&self) -> Result<PlayerStatus> {
+            if self.revoke_on_status.get() {
+                self.denied_sources.borrow_mut().push("qqmusic".into());
+            }
             match &self.status {
                 FakeStatus::Available(status) => Ok(status.as_ref().clone()),
                 FakeStatus::Unavailable => Err(anyhow!("status unavailable")),
@@ -2502,6 +2693,9 @@ mod tests {
         }
 
         fn song_dedup_limited(&self, _request: &PlaybackRequest) -> Result<bool> {
+            if self.revoke_on_dedup.get() {
+                self.denied_sources.borrow_mut().push("qqmusic".into());
+            }
             Ok(self.dedup_limited.get())
         }
 
@@ -2518,6 +2712,207 @@ mod tests {
             candidate,
             formatted_candidates: text.to_string(),
         }
+    }
+
+    #[test]
+    fn ai_command_policy_blocks_ai_routes_without_blocking_plain_qq() {
+        let mut direct = FakePort::idle([None]);
+        *direct.ai_denied.borrow_mut() = Some(("Alice".into(), false));
+        let ai_song = SongCommand {
+            ai_assisted: true,
+            ..command()
+        };
+        application()
+            .execute(&context(), &ai_song, &mut direct)
+            .unwrap();
+        assert!(direct.search_sources.borrow().is_empty());
+        assert!(direct.library_searches.borrow().is_empty());
+        assert!(direct.played.borrow().is_empty());
+        assert!(
+            direct
+                .replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.contains("权限不足"))
+        );
+
+        let mut pick_ai = FakePort::idle([Some(picked("晴天", "miliastra://track/qqmusic/1"))]);
+        *pick_ai.ai_denied.borrow_mut() = Some(("Alice".into(), false));
+        pick_ai.decisions = VecDeque::from([SongRequestDecision::Ai]);
+        application()
+            .execute(&context(), &command(), &mut pick_ai)
+            .unwrap();
+        assert_eq!(pick_ai.search_sources.borrow().as_slice(), ["qqmusic"]);
+        assert!(!pick_ai.decision_options.borrow()[0].1);
+        assert!(pick_ai.played.borrow().is_empty());
+        assert!(
+            pick_ai
+                .replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.contains("权限不足"))
+        );
+
+        let mut confirm = FakePort::idle([Some(picked("晴天", "miliastra://track/qqmusic/2"))]);
+        *confirm.ai_denied.borrow_mut() = Some(("Alice".into(), false));
+        confirm.decisions = VecDeque::from([SongRequestDecision::Confirm]);
+        application()
+            .execute(&context(), &command(), &mut confirm)
+            .unwrap();
+        assert_eq!(confirm.played.borrow().len(), 1);
+        assert!(
+            !confirm
+                .replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.contains("权限不足"))
+        );
+    }
+
+    #[test]
+    fn denied_explicit_and_switched_sources_never_reach_search_or_playback() {
+        let mut denied = FakePort::idle([None]);
+        denied.denied_sources.borrow_mut().push("qqmusic".into());
+        application()
+            .execute(&context(), &command(), &mut denied)
+            .unwrap();
+        assert!(denied.search_sources.borrow().is_empty());
+        assert!(denied.played.borrow().is_empty());
+        assert!(
+            denied
+                .replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.contains("权限不足"))
+        );
+
+        let mut switched =
+            FakePort::idle([Some(picked("晴天", "miliastra://track/qqmusic/first"))]);
+        switched.denied_sources.borrow_mut().push("netease".into());
+        switched.decisions = VecDeque::from([SongRequestDecision::SwitchSource]);
+        application()
+            .execute(&context(), &command(), &mut switched)
+            .unwrap();
+        assert_eq!(*switched.search_sources.borrow(), ["qqmusic"]);
+        assert!(switched.played.borrow().is_empty());
+    }
+
+    #[test]
+    fn actual_provider_is_checked_even_when_requested_source_is_allowed() {
+        let mut port = FakePort::idle([Some(picked(
+            "forbidden",
+            "miliastra://track/bilibili/blocked",
+        ))]);
+        application()
+            .execute(&context(), &command(), &mut port)
+            .unwrap();
+        assert!(port.played.borrow().is_empty());
+        assert!(port.queue.borrow().is_empty());
+        assert!(
+            port.replies
+                .borrow()
+                .iter()
+                .any(|reply| reply.contains("权限不足"))
+        );
+    }
+
+    #[test]
+    fn ai_and_library_candidates_are_filtered_before_model_selection() {
+        let ai = Arc::new(RecordingAiGateway::default());
+        let app = SongRequestApplication::with_gateways(
+            ai.clone(),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        let allowed = test_candidate("晴天", "miliastra://track/qqmusic/allowed");
+        let blocked = bilibili_candidate();
+        let mut port = FakePort::idle([Some(PickedCandidate::with_snapshot(
+            blocked.clone(),
+            vec![blocked.clone(), allowed.clone()],
+            "",
+        ))]);
+        *port.library_candidates.borrow_mut() = vec![blocked];
+        app.execute(
+            &context(),
+            &SongCommand {
+                ai_assisted: true,
+                ..command()
+            },
+            &mut port,
+        )
+        .unwrap();
+        let calls = ai.candidates.lock().unwrap();
+        assert!(!calls.is_empty());
+        assert!(
+            calls
+                .iter()
+                .flatten()
+                .all(|candidate| candidate.track_ref.key.provider.as_str() != "bilibili")
+        );
+        assert_eq!(
+            port.played.borrow()[0]
+                .track
+                .as_ref()
+                .unwrap()
+                .track_ref
+                .key,
+            allowed.track_ref.key
+        );
+    }
+
+    #[test]
+    fn platform_revocation_is_rechecked_immediately_before_play_and_queue() {
+        for queued in [false, true] {
+            let mut port =
+                FakePort::idle([Some(picked("晴天", "miliastra://track/qqmusic/allowed"))]);
+            if queued {
+                port.queue.borrow_mut().push(QueueItem {
+                    keyword: "other".into(),
+                    ..QueueItem::default()
+                });
+                port.revoke_on_dedup.set(true);
+            } else {
+                port.revoke_on_status.set(true);
+            }
+            application()
+                .execute(&context(), &command(), &mut port)
+                .unwrap();
+            assert!(port.played.borrow().is_empty());
+            assert_eq!(port.queue.borrow().len(), usize::from(queued));
+            assert!(port.preloaded.borrow().is_empty());
+            assert!(
+                port.replies
+                    .borrow()
+                    .iter()
+                    .any(|reply| reply.contains("权限不足"))
+            );
+        }
+    }
+
+    #[test]
+    fn platform_checks_keep_original_actor_and_console_context() {
+        let mut port = FakePort::idle([Some(picked("晴天", "miliastra://track/qqmusic/allowed"))]);
+        let context = SongRequestContext {
+            message_type: "控制台".into(),
+            ..context()
+        };
+        application()
+            .execute(
+                &context,
+                &SongCommand {
+                    friend_username: "Bob".into(),
+                    ..command()
+                },
+                &mut port,
+            )
+            .unwrap();
+        assert!(
+            port.permission_checks
+                .borrow()
+                .iter()
+                .all(|(actor, _, console)| actor == "Alice" && *console)
+        );
     }
 
     #[test]
@@ -2588,7 +2983,6 @@ mod tests {
         assert!(port.logs.borrow()[0].starts_with("play keyword=晴天 - 周杰伦"));
     }
 
-    #[test]
     #[test]
     fn template_replies_keep_the_exact_wording_they_had_before_templating() {
         // 模板化的核心风险是"顺手改了文案"。这里直接渲染每条模板，
@@ -3187,6 +3581,7 @@ mod tests {
             vec![online.clone()],
             "",
         ))]);
+        port.denied_sources.borrow_mut().clear();
         port.library_candidates.borrow_mut().push(local.clone());
         port.decisions = VecDeque::from([SongRequestDecision::LocalLibrary]);
         application()
@@ -3833,8 +4228,8 @@ mod tests {
     }
 
     #[test]
-    fn hall_ai_song_search_excludes_bilibili_while_friend_ai_search_keeps_it() {
-        // 大厅里未映射的成员：不提供 B站 音源。
+    fn ai_song_search_range_uses_platform_permission_not_delivery_target() {
+        // 平台策略禁止 B站：不提供该音源。
         let hall = SongCommand {
             friend_username: String::new(),
             ..command()
@@ -3843,7 +4238,7 @@ mod tests {
         assert!(!source.split(',').any(|part| part == "bilibili"));
         assert_eq!(source, "qqmusic,netease,kugou");
 
-        // 大厅里靠身份映射获得好友及以上权限的成员：AI 点歌按好友语义搜索全部音源。
+        // 平台策略允许 B站：默认 AI 点歌可搜索全部音源。
         let mapped = SongCommand {
             ai_assisted: true,
             friend_username: String::new(),
@@ -3879,7 +4274,7 @@ mod tests {
 
     #[test]
     fn mapped_hall_member_ai_search_uses_every_platform() {
-        // 权限来自身份映射时，AI 点歌的在线检索范围与好友私聊一致（空串=全部音源）。
+        // 平台策略允许全部音源时使用空串表示全平台。
         let application = SongRequestApplication::with_gateways(
             Arc::new(RecordingAiGateway::default()),
             Arc::new(DisabledReviewGateway),
@@ -3891,12 +4286,13 @@ mod tests {
             ..command()
         };
         let mut mapped = FakePort::idle([None]);
+        mapped.denied_sources.borrow_mut().clear();
         application
             .execute(&mapped_context(), &song, &mut mapped)
             .expect("song request");
         assert_eq!(mapped.search_sources.borrow().as_slice(), [""]);
 
-        // 大厅里未映射的成员仍然只搜 QQ、网易、酷狗。
+        // 同一调用者的策略禁止 B站 时只搜其余音源。
         let mut plain = FakePort::idle([None]);
         application
             .execute(&context(), &song, &mut plain)
@@ -4174,8 +4570,8 @@ mod tests {
     }
 
     #[test]
-    fn local_library_fallback_needs_friend_permission_for_bilibili() {
-        // 大厅里未映射的成员没有好友及以上权限：本地兜底排除 B站，@本地 不可用，也不会播放。
+    fn local_library_fallback_uses_platform_policy_for_bilibili() {
+        // 平台策略禁止 B站：本地兜底排除该音源，@本地 不可用，也不会播放。
         let mut hall = FakePort::idle([None]);
         hall.library_candidates
             .borrow_mut()
@@ -4197,9 +4593,9 @@ mod tests {
                 .any(|line| line.contains("@本地"))
         );
 
-        // 大厅里靠身份映射获得好友及以上权限的成员：命令形状仍是大厅命令，
-        // 但本地兜底保留 B站 并可以播放。
+        // 同一调用者的平台策略允许 B站 后，本地兜底可推荐并播放。
         let mut mapped = FakePort::idle([None]);
+        mapped.denied_sources.borrow_mut().clear();
         mapped
             .library_candidates
             .borrow_mut()
@@ -4218,8 +4614,9 @@ mod tests {
             miliastra_playback::ProviderId::Bilibili
         );
 
-        // 好友私聊命令保留 B站 音源，可推荐并播放。
+        // 好友投递目标不参与授权，仍由调用者的平台策略允许 B站。
         let mut friend = FakePort::idle([None]);
+        friend.denied_sources.borrow_mut().clear();
         friend
             .library_candidates
             .borrow_mut()

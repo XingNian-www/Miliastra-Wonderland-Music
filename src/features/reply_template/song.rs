@@ -5,6 +5,13 @@
 
 use super::ReplyTemplate;
 
+pub(crate) const PLATFORM_DENIED: ReplyTemplate = ReplyTemplate {
+    key: "song.platform.denied",
+    default: "权限不足，不能使用该歌曲平台",
+    summary: "歌曲平台权限不足或已禁用",
+    group: "点歌",
+};
+
 /// 点歌回复。
 pub(crate) const SONG: &[ReplyTemplate] = &[
     ReplyTemplate {
@@ -97,4 +104,5 @@ pub(crate) const SONG: &[ReplyTemplate] = &[
         summary: "审核未通过",
         group: "点歌",
     },
+    PLATFORM_DENIED,
 ];

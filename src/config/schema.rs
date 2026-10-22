@@ -2196,12 +2196,21 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             order: 33,
             fields: with_section_prefix(
                 "command_access",
-                vec![ConfigFieldSchema::db_live(
-                    "overrides",
-                    "命令权限策略",
-                    FieldKind::Object,
-                    "命令键到启用状态与最低身份的覆盖：user、friend、admin、owner；保存后立即生效",
-                )],
+                vec![
+                    ConfigFieldSchema::db_live(
+                        "overrides",
+                        "命令权限策略",
+                        FieldKind::Object,
+                        "命令键到启用状态与最低身份的覆盖：user、friend、admin、owner；保存后立即生效",
+                    ),
+                    ConfigFieldSchema::db_live(
+                        "default_song_source",
+                        "默认点歌平台",
+                        FieldKind::String,
+                        "普通@点歌使用的平台；请在命令面板选择，实际平台权限仍会检查",
+                    )
+                    .nullable(),
+                ],
             ),
         },
         ConfigSectionSchema {
@@ -2591,7 +2600,15 @@ mod tests {
                     "字段 {path} 的中间节点 {parent_path} 为 null，但 schema 未声明 nullable/optional_parent"
                 );
             }
-            current = current.as_object()?.get(*segment)?;
+            current = match current.as_object()?.get(*segment) {
+                Some(value) => value,
+                None if index + 1 == segments.len()
+                    && nullability.get(path).is_some_and(|(nullable, _)| *nullable) =>
+                {
+                    return Some(&Value::Null);
+                }
+                None => return None,
+            };
         }
         Some(current)
     }
@@ -2999,6 +3016,16 @@ mod tests {
         );
         collect_leaf_paths(
             &sample_config_json_with_audio_cache(),
+            "",
+            &kinds,
+            &schema_paths,
+            &mut json_paths,
+        );
+        let mut with_default_platform = default_config_json();
+        with_default_platform["command_access"]["default_song_source"] =
+            Value::String("qqmusic".to_string());
+        collect_leaf_paths(
+            &with_default_platform,
             "",
             &kinds,
             &schema_paths,

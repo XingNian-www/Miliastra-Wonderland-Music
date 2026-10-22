@@ -5279,12 +5279,12 @@ fn commands_catalog_route_serves_the_panel_contract_over_real_http() {
         .collect();
     let song = all_commands
         .iter()
-        .find(|command| command["name"] == "点歌")
-        .expect("点歌 已登记");
+        .find(|command| command["id"] == "@QQ点歌")
+        .expect("QQ点歌 已登记");
     let aliases = song["aliases"].as_array().expect("aliases 数组");
     assert!(
-        aliases.iter().any(|alias| alias == "AI点歌"),
-        "别名应归并到点歌条目下"
+        aliases.iter().any(|alias| alias == "点歌"),
+        "默认点歌别名应归并到QQ点歌条目下"
     );
     assert_eq!(song["prefix"], "@");
     // 面板逐字段读取这些键；后端少给一个就会渲染成空白。
@@ -5321,12 +5321,12 @@ fn command_policy_panel_save_is_live_and_revision_safe() {
         serde_json::from_str(&http_get(server.local_addr(), "/commands/catalog", None).body)
             .unwrap();
     let revision = catalog["revision"].as_u64().unwrap();
-    let body = json!({"baseRevision":revision,"items":[{"id":"@点歌","enabled":false,"minimumRole":"admin"}]}).to_string();
+    let body = json!({"baseRevision":revision,"items":[{"id":"@QQ点歌","enabled":false,"minimumRole":"admin"}]}).to_string();
     let response = http_post_json(server.local_addr(), "/commands/policy", &body, None);
     assert_eq!(response.status_line, "HTTP/1.1 200 OK");
     let saved: Value = serde_json::from_str(&response.body).unwrap();
     assert_eq!(saved["ok"], true, "{}", response.body);
-    let policy = &state.live_configs.snapshot().command_access.overrides["@点歌"];
+    let policy = &state.live_configs.snapshot().command_access.overrides["@QQ点歌"];
     assert!(!policy.enabled);
     assert_eq!(serde_json::to_value(policy.minimum_role).unwrap(), "admin");
     let stale = http_post_json(server.local_addr(), "/commands/policy", &body, None);
@@ -5350,6 +5350,399 @@ fn command_policy_panel_save_is_live_and_revision_safe() {
             .unwrap(),
         revision
     );
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn song_platform_panel_catalog_and_policy_save_are_independent_and_live() {
+    use crate::features::command_access::{CommandPermission, catalog_policy};
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+    let address = server.local_addr();
+    let catalog: Value =
+        serde_json::from_str(&http_get(address, "/commands/catalog", None).body).unwrap();
+    let rows: Vec<&Value> = catalog["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["commands"].as_array().unwrap())
+        .collect();
+    for id in ["@QQ点歌", "@网易点歌", "@酷狗点歌", "@B站点歌", "@AI点歌"] {
+        let matches: Vec<_> = rows.iter().filter(|row| row["id"] == id).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "platform must have one independent row: {id}"
+        );
+        assert_eq!(matches[0]["minimumRole"], "user", "{id}");
+        assert_eq!(matches[0]["enabled"], true, "{id}");
+    }
+    assert!(!rows.iter().any(|row| row["id"] == "@点歌"));
+    assert!(!rows.iter().any(|row| {
+        row["name"]
+            .as_str()
+            .is_some_and(|name| name.contains("搜索"))
+    }));
+    let revision = catalog["revision"].as_u64().unwrap();
+    let body = json!({"baseRevision":revision,"defaultSongSource":"netease","items":[
+        {"id":"@QQ点歌","enabled":false,"minimumRole":"friend"},
+        {"id":"@网易点歌","enabled":true,"minimumRole":"admin"},
+        {"id":"@酷狗点歌","enabled":true,"minimumRole":"user"},
+        {"id":"@B站点歌","enabled":true,"minimumRole":"owner"},
+        {"id":"@AI点歌","enabled":false,"minimumRole":"admin"}
+    ]})
+    .to_string();
+    let response = http_post_json(address, "/commands/policy", &body, None);
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK", "{}", response.body);
+    let saved: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(saved["ok"], true, "{}", response.body);
+    let snapshot = state.live_configs.snapshot();
+    assert_eq!(
+        snapshot.command_access.default_song_source.as_deref(),
+        Some("netease")
+    );
+    for (id, enabled, role) in [
+        ("@QQ点歌", false, CommandPermission::Friend),
+        ("@网易点歌", true, CommandPermission::Admin),
+        ("@酷狗点歌", true, CommandPermission::User),
+        ("@B站点歌", true, CommandPermission::Owner),
+        ("@AI点歌", false, CommandPermission::Admin),
+    ] {
+        let policy = catalog_policy(&snapshot.command_access, id).unwrap();
+        assert_eq!(policy.enabled, enabled, "{id}");
+        assert_eq!(policy.minimum_role, role, "{id}");
+    }
+    let updated: Value =
+        serde_json::from_str(&http_get(address, "/commands/catalog", None).body).unwrap();
+    assert_eq!(updated["defaultSongSource"], "netease");
+    assert!(updated["revision"].as_u64().unwrap() > revision);
+    for (id, enabled, role) in [
+        ("@QQ点歌", false, "friend"),
+        ("@网易点歌", true, "admin"),
+        ("@酷狗点歌", true, "user"),
+        ("@B站点歌", true, "owner"),
+        ("@AI点歌", false, "admin"),
+    ] {
+        let row = updated["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["commands"].as_array().unwrap())
+            .find(|row| row["id"] == id)
+            .unwrap();
+        assert_eq!(row["enabled"], enabled, "{id}");
+        assert_eq!(row["minimumRole"], role, "{id}");
+    }
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn default_song_source_only_save_rejects_unknown_platforms_and_stale_revisions() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+    let address = server.local_addr();
+    let catalog: Value =
+        serde_json::from_str(&http_get(address, "/commands/catalog", None).body).unwrap();
+    let revision = catalog["revision"].as_u64().unwrap();
+    let body = json!({"baseRevision":revision,"items":[],"defaultSongSource":"kugou"}).to_string();
+    let saved = http_post_json(address, "/commands/policy", &body, None);
+    assert_eq!(saved.status_line, "HTTP/1.1 200 OK", "{}", saved.body);
+    assert_eq!(
+        serde_json::from_str::<Value>(&saved.body).unwrap()["ok"],
+        true
+    );
+    assert_eq!(
+        state
+            .live_configs
+            .snapshot()
+            .command_access
+            .default_song_source
+            .as_deref(),
+        Some("kugou")
+    );
+    let stale = http_post_json(address, "/commands/policy", &body, None);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stale.body).unwrap()["code"],
+        "config_conflict"
+    );
+    let revision = state
+        .config_store
+        .lock()
+        .unwrap()
+        .current_revision()
+        .unwrap();
+    for source in ["all", "unknown"] {
+        let invalid =
+            json!({"baseRevision":revision,"items":[],"defaultSongSource":source}).to_string();
+        let response = http_post_json(address, "/commands/policy", &invalid, None);
+        assert_ne!(
+            response.status_line, "HTTP/1.1 200 OK",
+            "{source}: {}",
+            response.body
+        );
+    }
+    for id in ["@未知点歌", "@点歌", "@搜索", "@QQ搜索", "@AI搜索"] {
+        let invalid = json!({"baseRevision":revision,"items":[{"id":id,"enabled":true,"minimumRole":"user"}]}).to_string();
+        let response = http_post_json(address, "/commands/policy", &invalid, None);
+        assert_ne!(
+            response.status_line, "HTTP/1.1 200 OK",
+            "{id}: {}",
+            response.body
+        );
+    }
+    assert_eq!(
+        state
+            .config_store
+            .lock()
+            .unwrap()
+            .current_revision()
+            .unwrap(),
+        revision
+    );
+    assert_eq!(
+        state
+            .live_configs
+            .snapshot()
+            .command_access
+            .default_song_source
+            .as_deref(),
+        Some("kugou")
+    );
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn command_replies_http_roundtrip_preserves_order_mute_partial_updates_and_conflicts() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+    let address = server.local_addr();
+
+    let initial: Value =
+        serde_json::from_str(&http_get(address, "/commands/replies", None).body).unwrap();
+    assert_eq!(initial["commands"][0]["id"], "@帮助");
+    assert_eq!(initial["commands"][0]["orderedBatch"], true);
+    let initial_volume = initial["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@音量")
+        .unwrap();
+    assert_eq!(initial_volume["orderedBatch"], false);
+    let revision = initial["revision"].as_u64().unwrap();
+    let save = json!({"baseRevision":revision,"commands":[
+        {"id":"@帮助","replies":[
+            {"key":"help.song_request.2","text":"第二条已修改"},
+            {"key":"custom:last","text":"最后一条 {用户名}"}
+        ]},
+        {"id":"@娱乐帮助","replies":[]},
+        {"id":"@歌单帮助","replies":[
+            {"key":"help.playlist.3","text":"模式帮助已更新"},
+            {"key":"help.playlist.1","text":"歌单帮助已更新"}
+        ]},
+        {"id":"@大厅检测","replies":[{"key":"hall.current","text":"大厅 {大厅名}{后缀}"}]},
+        {"id":"@大厅时间","replies":[{"key":"hall.time.remaining","text":"还剩{剩余分钟}分"}]},
+        {"id":"@下一首","replies":[{"key":"playback.next.pool_fallback","text":"池续播 {关键词}"}]},
+        {"id":"@删除","replies":[{"key":"playback.delete.removed.pool_fallback","text":"删除后续播 {关键词}"}]},
+        {"id":"#塔罗牌帮助","replies":[
+            {"key":"tarot.help.interpret","text":"3 AI解读"},
+            {"key":"tarot.help.draw","text":"1 抽牌"},
+            {"key":"tarot.help.reroll","text":"2 重抽"}
+        ]},
+        {"id":"#海龟汤","replies":[{"key":"turtle_soup.start.failed","text":"开局错误：{原因}"}]},
+        {"id":"#状态（海龟汤）","replies":[{"key":"turtle_soup.status","text":"{阶段} / {秒数}s {人数} {提问数}"}]},
+        {"id":"#结束（海龟汤）","replies":[{"key":"turtle_soup.end.failed","text":"结束错误：{原因}"}]},
+        {"id":"@音量","replies":[{"key":"playback.volume.set","text":"音量调整完成：{音量}"}]}
+    ]})
+    .to_string();
+    let saved = http_post_json(address, "/commands/replies", &save, None);
+    assert_eq!(saved.status_line, "HTTP/1.1 200 OK", "{}", saved.body);
+    let result: Value = serde_json::from_str(&saved.body).unwrap();
+    assert_eq!(result["revision"], revision + 1);
+    let after: Value =
+        serde_json::from_str(&http_get(address, "/commands/replies", None).body).unwrap();
+    let playback_volume = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@音量")
+        .unwrap();
+    assert_eq!(playback_volume["replies"][0]["key"], "playback.volume.set");
+    assert_eq!(
+        playback_volume["replies"][0]["text"],
+        "音量调整完成：{音量}"
+    );
+    assert_eq!(playback_volume["allowedVariables"], json!(["音量"]));
+    let playback_pause = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@暂停")
+        .unwrap();
+    assert!(
+        playback_pause["allowedVariables"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let hall_detect = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@大厅检测")
+        .unwrap();
+    assert_eq!(hall_detect["orderedBatch"], false);
+    assert_eq!(hall_detect["allowedVariables"], json!(["后缀", "大厅名"]));
+    assert_eq!(hall_detect["replies"][0]["text"], "大厅 {大厅名}{后缀}");
+    let hall_time = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@大厅时间")
+        .unwrap();
+    assert_eq!(hall_time["allowedVariables"], json!(["剩余分钟"]));
+    let next = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@下一首")
+        .unwrap();
+    assert_eq!(next["orderedBatch"], false);
+    assert_eq!(next["allowedVariables"], json!(["关键词"]));
+    let delete = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@删除")
+        .unwrap();
+    assert_eq!(delete["allowedVariables"], json!(["关键词"]));
+    assert_eq!(
+        delete["replies"][0]["key"],
+        "playback.delete.removed.pool_fallback"
+    );
+    let tarot_help = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "#塔罗牌帮助")
+        .unwrap();
+    assert_eq!(tarot_help["orderedBatch"], true);
+    assert!(
+        tarot_help["allowedVariables"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(tarot_help["replies"][0]["key"], "tarot.help.interpret");
+    assert_eq!(tarot_help["replies"][1]["key"], "tarot.help.draw");
+    assert_eq!(tarot_help["replies"][2]["key"], "tarot.help.reroll");
+
+    let turtle_status = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "#状态（海龟汤）")
+        .unwrap();
+    assert_eq!(turtle_status["orderedBatch"], false);
+    assert_eq!(
+        turtle_status["allowedVariables"],
+        json!(["人数", "提问数", "秒数", "阶段"])
+    );
+    assert_eq!(
+        turtle_status["replies"][0]["text"],
+        "{阶段} / {秒数}s {人数} {提问数}"
+    );
+
+    let turtle_start = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "#海龟汤")
+        .unwrap();
+    assert_eq!(turtle_start["allowedVariables"], json!(["原因"]));
+    assert_eq!(
+        turtle_start["replies"][0]["key"],
+        "turtle_soup.start.failed"
+    );
+
+    let turtle_end = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "#结束（海龟汤）")
+        .unwrap();
+    assert_eq!(turtle_end["replies"][0]["key"], "turtle_soup.end.failed");
+
+    let playlist_help = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@歌单帮助")
+        .unwrap();
+    assert_eq!(playlist_help["orderedBatch"], true);
+    assert_eq!(playlist_help["replies"][0]["key"], "help.playlist.3");
+    assert_eq!(playlist_help["replies"][1]["key"], "help.playlist.1");
+    let help = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@帮助")
+        .unwrap();
+    assert_eq!(help["replies"][0]["key"], "help.song_request.2");
+    assert_eq!(help["replies"][0]["text"], "第二条已修改");
+    assert_eq!(help["replies"][1]["key"], "custom:last");
+    assert_eq!(help["replies"].as_array().unwrap().len(), 4);
+    assert!(help["replies"][2]["active"] == false);
+    assert!(help["replies"][3]["active"] == false);
+    let entertainment = after["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "@娱乐帮助")
+        .unwrap();
+    assert!(
+        entertainment["replies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["active"] == false)
+    );
+    assert!(
+        entertainment["replies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| !row["text"].as_str().unwrap().is_empty())
+    );
+
+    let reactivate = json!({"baseRevision":revision+1,"commands":[{"id":"@娱乐帮助","replies":[
+        {"key":"help.entertainment.tarot.1","text":entertainment["replies"][0]["defaultText"]},
+        {"key":"help.entertainment.tarot.2","text":entertainment["replies"][1]["defaultText"]},
+        {"key":"help.entertainment.idiom","text":entertainment["replies"][2]["defaultText"]},
+        {"key":"help.entertainment.landlord","text":entertainment["replies"][3]["defaultText"]},
+        {"key":"help.entertainment.run_fast","text":entertainment["replies"][4]["defaultText"]},
+        {"key":"help.entertainment.turtle_soup","text":entertainment["replies"][5]["defaultText"]},
+        {"key":"help.entertainment.turtle_soup_long","text":entertainment["replies"][6]["defaultText"]},
+        {"key":"help.entertainment.undercover.1","text":entertainment["replies"][7]["defaultText"]},
+        {"key":"help.entertainment.undercover.2","text":entertainment["replies"][8]["defaultText"]}
+    ]}]}).to_string();
+    let reactivated = http_post_json(address, "/commands/replies", &reactivate, None);
+    assert_eq!(
+        reactivated.status_line, "HTTP/1.1 200 OK",
+        "{}",
+        reactivated.body
+    );
+
+    let stale = http_post_json(address, "/commands/replies", &save, None);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stale.body).unwrap()["code"],
+        "reply_conflict"
+    );
+    let invalid = json!({"baseRevision":revision+1,"commands":[{"id":"@帮助","replies":[{"key":"help.song_request.1","text":"   "}]}]}).to_string();
+    assert_ne!(
+        http_post_json(address, "/commands/replies", &invalid, None).status_line,
+        "HTTP/1.1 200 OK"
+    );
+
     server.shutdown().unwrap();
 }
 

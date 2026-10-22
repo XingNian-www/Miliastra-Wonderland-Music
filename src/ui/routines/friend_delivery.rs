@@ -9,11 +9,13 @@ use std::time::Duration;
 use enigo::Key;
 use image::{DynamicImage, GenericImageView};
 
+use crate::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
 #[cfg(test)]
 use crate::config::AppConfig;
 use crate::config::{
     InputTimingConfig, OcrConfig, OutputConfig, PointConfig, ScreenConfig, TemplateConfig,
 };
+use crate::geometry::{Point, Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure,
@@ -21,8 +23,6 @@ use crate::runtime::ui::{
     sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::change_detection::{ChangeFingerprint, change_stats, rect_chat_change_fingerprint};
-use crate::geometry::{Point, Rect, crop_canvas};
 use crate::ui::locator::secondary_hall_search_rect;
 use crate::ui::template::best_template_hit;
 
@@ -2126,11 +2126,11 @@ mod tests {
     }
 
     use crate::config::AppConfig;
+    use crate::geometry::Rect;
     #[cfg(feature = "ocr-mnn")]
     use crate::runtime::ocr::{OcrArgs, ProductionOcrDevice};
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{FrameDemand, FramePublication, UiDevice, UiRuntime};
-    use crate::geometry::Rect;
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
     fn start_test_ui_runtime(

@@ -58,6 +58,8 @@ pub enum FieldKind {
     StringArray,
     /// 嵌套对象（未知结构，高级 JSON 编辑）
     Object,
+    /// 回复模板目录：由配置页按模块分组逐条编辑，不显示 JSON。
+    ReplyTemplates,
     /// 矩形区域 {x, y, width, height}
     Rect,
     /// 点 {x, y}
@@ -2171,9 +2173,9 @@ fn kugou_section() -> Vec<ConfigFieldSchema> {
 fn replies_section() -> Vec<ConfigFieldSchema> {
     vec![ConfigFieldSchema::db_live(
         "overrides",
-        "回复文案覆盖",
-        FieldKind::Object,
-        "键为模板键（如 help.song_request.1），值为替换文案，可用 {占位符} 插入变量（如 {用户名}{歌名}{剩余分钟}{AI回答}）。缺失的键回落内置默认文案；留空或全空白的值等同于未覆盖。改完立即生效。命令面板可查看全部可用键与占位符。",
+        "回复文案",
+        FieldKind::ReplyTemplates,
+        "按用途逐条编辑回复。留空使用内置默认文案；花括号中的变量由程序自动填入。保存后立即生效。",
     )]
 }
 
@@ -2463,7 +2465,7 @@ pub fn section_schema(name: &str) -> Option<ConfigSectionSchema> {
         .find(|section| section.name == name)
 }
 
-/// 查询点路径对应的生效级别。Object/Rect/Point 的 JSON 叶子路径继承最深的
+/// 查询点路径对应的生效级别。Object/ReplyTemplates/Rect/Point 的路径继承最深的
 /// schema 父字段；未声明路径返回 None。
 pub(crate) fn config_effect_for_path(path: &str) -> Option<Effect> {
     config_sections()
@@ -2473,7 +2475,10 @@ pub(crate) fn config_effect_for_path(path: &str) -> Option<Effect> {
             field.path == path
                 || (matches!(
                     field.kind,
-                    FieldKind::Object | FieldKind::Rect | FieldKind::Point
+                    FieldKind::Object
+                        | FieldKind::ReplyTemplates
+                        | FieldKind::Rect
+                        | FieldKind::Point
                 ) && path
                     .strip_prefix(&field.path)
                     .is_some_and(|suffix| suffix.starts_with('.')))
@@ -2605,7 +2610,12 @@ mod tests {
                 if !has_declared_children
                     && matches!(
                         kinds.get(prefix),
-                        Some(FieldKind::Object | FieldKind::Rect | FieldKind::Point)
+                        Some(
+                            FieldKind::Object
+                                | FieldKind::ReplyTemplates
+                                | FieldKind::Rect
+                                | FieldKind::Point
+                        )
                     )
                 {
                     out.insert(prefix.to_string());
@@ -2871,6 +2881,13 @@ mod tests {
                     }
                     FieldKind::StringArray => {
                         assert!(field_value.is_array(), "字段 {} 必须是数组", field.path);
+                    }
+                    FieldKind::ReplyTemplates => {
+                        assert!(
+                            field_value.is_object(),
+                            "字段 {} 必须是回复覆盖对象",
+                            field.path
+                        );
                     }
                     // custom_workflows.workflows 默认值是数组，故对象或数组都接受。
                     FieldKind::Object => {

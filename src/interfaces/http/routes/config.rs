@@ -39,6 +39,22 @@ fn get_value_by_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
+/// 从默认文案中提取占位符名。
+fn template_variables(text: &str) -> Vec<String> {
+    let mut variables = std::collections::BTreeSet::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else { break };
+        let name = &after[..close];
+        if !name.is_empty() && !name.contains('{') {
+            variables.insert(name.to_string());
+        }
+        rest = &after[close + 1..];
+    }
+    variables.into_iter().collect()
+}
+
 /// FieldKind → 表单控件描述 JSON。
 fn kind_json(kind: &FieldKind) -> Value {
     match kind {
@@ -57,6 +73,16 @@ fn kind_json(kind: &FieldKind) -> Value {
         }),
         FieldKind::StringArray => json!({ "type": "stringArray" }),
         FieldKind::Object => json!({ "type": "object" }),
+        FieldKind::ReplyTemplates => json!({
+            "type": "replyTemplates",
+            "items": crate::features::reply_template::catalog().map(|spec| json!({
+                "key": spec.key,
+                "default": spec.default,
+                "summary": spec.summary,
+                "group": spec.group,
+                "variables": template_variables(spec.default),
+            })).collect::<Vec<_>>(),
+        }),
         FieldKind::Rect => json!({ "type": "rect" }),
         FieldKind::Point => json!({ "type": "point" }),
         FieldKind::Secret => json!({ "type": "secret" }),
@@ -519,4 +545,42 @@ pub(super) fn config_visual_import_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     visual_request(body, state, true)
+}
+
+#[cfg(test)]
+mod reply_template_schema_tests {
+    use super::*;
+
+    #[test]
+    fn reply_editor_schema_exposes_catalog_and_variables() {
+        let schema = kind_json(&FieldKind::ReplyTemplates);
+        assert_eq!(schema["type"], "replyTemplates");
+        let items = schema["items"].as_array().expect("catalog array");
+        assert!(items.len() >= 197);
+        assert!(items.iter().all(|item| {
+            item["key"].is_string()
+                && item["default"].is_string()
+                && item["summary"].is_string()
+                && item["group"].is_string()
+                && item["variables"].is_array()
+        }));
+        let judgment = items
+            .iter()
+            .find(|item| item["key"] == "turtle_soup.judgment.reply")
+            .expect("turtle-soup template");
+        assert!(
+            judgment["variables"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("玩家"))
+        );
+    }
+
+    #[test]
+    fn template_variable_extraction_deduplicates_names() {
+        assert_eq!(
+            template_variables("{玩家}{歌曲}{玩家} {} {未闭合"),
+            vec!["歌曲", "玩家"]
+        );
+    }
 }

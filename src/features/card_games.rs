@@ -8,19 +8,27 @@ use crate::features::chat_text::{command_identity, compact_command};
 use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
-use crate::features::reply_template::{card_games as templates, ReplyVars};
 #[cfg(test)]
 use crate::features::friend_delivery::{
     FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
 };
+use crate::features::reply_template::{ReplyVars, card_games as templates};
 use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
 mod dealing;
 mod rules;
 mod service;
 
-use dealing::{deal, sort_hand, format_hand, initial_hand_deliveries, deal_hunan_run_fast, format_play, format_play_compact};
-use rules::{parse_cards, take_cards, take_cards_for_play, remove_cards, PlayPattern, classify, classify_for_variant, lowest_beating_play, lowest_beating_play_for_variant, RunFastPlayFilter, collect_run_fast_legal_plays, collect_beating_plays, classify_airplane, rank_counts, single_group, group_rank, consecutive};
+use dealing::{
+    deal, deal_hunan_run_fast, format_hand, format_play, format_play_compact,
+    initial_hand_deliveries, sort_hand,
+};
+use rules::{
+    PlayPattern, RunFastPlayFilter, classify, classify_airplane, classify_for_variant,
+    collect_beating_plays, collect_run_fast_legal_plays, consecutive, group_rank,
+    lowest_beating_play, lowest_beating_play_for_variant, parse_cards, rank_counts, remove_cards,
+    single_group, take_cards, take_cards_for_play,
+};
 #[cfg(test)]
 use service::CardGameStartGate;
 pub use service::{
@@ -225,43 +233,82 @@ impl LandlordCommand {
 pub struct LandlordOutcome {
     pub action: &'static str,
     pub public_reply: Option<String>,
+    pub public_reply_template: Option<CardGameReplyTemplate>,
     pub private_reply: Option<String>,
+    pub private_reply_template: Option<CardGameReplyTemplate>,
     pub private_deliveries: Vec<LandlordPrivateDelivery>,
     pub ended: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CardGameReplyTemplate {
+    Template {
+        spec: &'static crate::features::reply_template::ReplyTemplate,
+        vars: ReplyVars,
+    },
+    Raw(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LandlordPrivateDelivery {
     pub player: String,
     pub message: String,
+    pub template: Option<CardGameReplyTemplate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CardGameFriendBatchOutcome {
+    Complete,
+    Failed {
+        retryable: Vec<LandlordPrivateDelivery>,
+        failure: crate::features::friend_delivery::FriendBatchFailure,
+    },
 }
 
 impl LandlordOutcome {
-    fn public(action: &'static str, reply: impl Into<String>) -> Self {
+    fn public(action: &'static str, reply: impl Into<CardGameReplyTemplate>) -> Self {
+        let reply = reply.into();
         Self {
             action,
-            public_reply: Some(reply.into()),
+            public_reply: Some(reply.render_default()),
+            public_reply_template: match reply {
+                CardGameReplyTemplate::Template { .. } => Some(reply),
+                CardGameReplyTemplate::Raw(_) => None,
+            },
             private_reply: None,
+            private_reply_template: None,
             private_deliveries: Vec::new(),
             ended: false,
         }
     }
 
-    fn private(action: &'static str, reply: impl Into<String>) -> Self {
+    fn private(action: &'static str, reply: impl Into<CardGameReplyTemplate>) -> Self {
+        let reply = reply.into();
         Self {
             action,
             public_reply: None,
-            private_reply: Some(reply.into()),
+            public_reply_template: None,
+            private_reply: Some(reply.render_default()),
+            private_reply_template: match reply {
+                CardGameReplyTemplate::Template { .. } => Some(reply),
+                CardGameReplyTemplate::Raw(_) => None,
+            },
             private_deliveries: Vec::new(),
             ended: false,
         }
     }
 
-    fn ended(action: &'static str, reply: impl Into<String>) -> Self {
+    fn ended(action: &'static str, reply: impl Into<CardGameReplyTemplate>) -> Self {
+        let reply = reply.into();
         Self {
             action,
-            public_reply: Some(reply.into()),
+            public_reply: Some(reply.render_default()),
+            public_reply_template: match reply {
+                CardGameReplyTemplate::Template { .. } => Some(reply),
+                CardGameReplyTemplate::Raw(_) => None,
+            },
             private_reply: None,
+            private_reply_template: None,
             private_deliveries: Vec::new(),
             ended: true,
         }
@@ -546,7 +593,7 @@ impl LandlordGame {
         if !self.config.enabled {
             return LandlordOutcome::public(
                 "disabled",
-                reply(
+                keyed_reply(
                     &templates::DISABLED,
                     ReplyVars::new().with("玩法", variant.label()),
                 ),
@@ -555,7 +602,7 @@ impl LandlordGame {
         if self.is_active() {
             return LandlordOutcome::public(
                 "already-active",
-                reply(&templates::ALREADY_ACTIVE, ReplyVars::new()),
+                keyed_reply(&templates::ALREADY_ACTIVE, ReplyVars::new()),
             );
         }
         self.state = GameState::Lobby(Lobby {
@@ -565,7 +612,7 @@ impl LandlordGame {
         });
         LandlordOutcome::public(
             "created",
-            reply(
+            keyed_reply(
                 &templates::LOBBY_CREATED,
                 ReplyVars::new()
                     .with("玩家", player.trim())
@@ -578,14 +625,14 @@ impl LandlordGame {
         let GameState::Lobby(lobby) = &mut self.state else {
             return LandlordOutcome::public(
                 "no-lobby",
-                reply(&templates::LOBBY_NONE, ReplyVars::new()),
+                keyed_reply(&templates::LOBBY_NONE, ReplyVars::new()),
             );
         };
         let key = player_key(player);
         if lobby.players.iter().any(|item| item.key == key) {
             return LandlordOutcome::public(
                 "duplicate-player",
-                reply(
+                keyed_reply(
                     &templates::LOBBY_ALREADY_JOINED,
                     ReplyVars::new().with("玩法", lobby.variant.label()),
                 ),
@@ -596,7 +643,7 @@ impl LandlordGame {
         if lobby.players.len() < 3 {
             return LandlordOutcome::public(
                 "joined",
-                reply(
+                keyed_reply(
                     &templates::LOBBY_JOINED,
                     ReplyVars::new()
                         .with("玩家", player.trim())
@@ -629,7 +676,7 @@ impl LandlordGame {
             });
             return LandlordOutcome::public(
                 "run-fast-started",
-                reply(
+                keyed_reply(
                     &templates::RUN_FAST_STARTED,
                     ReplyVars::new().with("玩家", first_name),
                 ),
@@ -655,7 +702,7 @@ impl LandlordGame {
         });
         LandlordOutcome::public(
             "bidding-started",
-            reply(
+            keyed_reply(
                 &templates::BIDDING_STARTED,
                 ReplyVars::new().with("玩家", first_name),
             ),
@@ -681,7 +728,7 @@ impl LandlordGame {
             LandlordCommand::Hand => self.hand(player, now),
             LandlordCommand::Retry => LandlordOutcome::public(
                 "retry-unavailable",
-                reply(&templates::RETRY_NONE, ReplyVars::new()),
+                keyed_reply(&templates::RETRY_NONE, ReplyVars::new()),
             ),
             LandlordCommand::Exit => self.exit(player),
         }
@@ -691,19 +738,19 @@ impl LandlordGame {
         let GameState::Bidding(bidding) = &mut self.state else {
             return LandlordOutcome::public(
                 "not-bidding",
-                reply(&templates::BIDDING_NOT_BIDDING, ReplyVars::new()),
+                keyed_reply(&templates::BIDDING_NOT_BIDDING, ReplyVars::new()),
             );
         };
         let Some(index) = find_player(&bidding.players, player) else {
             return LandlordOutcome::public(
                 "not-player",
-                reply(&templates::NOT_IN_LANDLORD_GAME, ReplyVars::new()),
+                keyed_reply(&templates::NOT_IN_LANDLORD_GAME, ReplyVars::new()),
             );
         };
         if index != bidding.current {
             return LandlordOutcome::public(
                 "wrong-bidder",
-                reply(
+                keyed_reply(
                     &templates::BIDDING_TURN,
                     ReplyVars::new().with("玩家", bidding.players[bidding.current].name.clone()),
                 ),
@@ -722,7 +769,7 @@ impl LandlordGame {
             let next = bidding.players[bidding.current].name.clone();
             return LandlordOutcome::public(
                 if rob { "robbed" } else { "declined" },
-                reply(
+                keyed_reply(
                     &templates::BIDDING_DECIDED,
                     ReplyVars::new()
                         .with("玩家", name)
@@ -758,7 +805,7 @@ impl LandlordGame {
             });
             return LandlordOutcome::public(
                 "redealt",
-                reply(
+                keyed_reply(
                     &templates::BIDDING_REDEALT,
                     ReplyVars::new().with("玩家", first_name),
                 ),
@@ -778,6 +825,12 @@ impl LandlordGame {
                     .with("张数", bidding.players[landlord].hand.len().to_string())
                     .with("手牌", format_hand(&bidding.players[landlord].hand)),
             ),
+            template: Some(keyed_reply(
+                &templates::HAND_LANDLORD_INITIAL,
+                ReplyVars::new()
+                    .with("张数", bidding.players[landlord].hand.len().to_string())
+                    .with("手牌", format_hand(&bidding.players[landlord].hand)),
+            )),
         };
         self.state = GameState::Playing(Playing {
             players: bidding.players,
@@ -794,7 +847,7 @@ impl LandlordGame {
         });
         LandlordOutcome::public(
             "landlord-selected",
-            reply(
+            keyed_reply(
                 &templates::LANDLORD_SELECTED,
                 ReplyVars::new()
                     .with("玩家", landlord_name)
@@ -818,7 +871,10 @@ impl LandlordGame {
                 self.state = GameState::Idle;
                 Some(LandlordOutcome::ended(
                     "lobby-timeout",
-                    reply(&templates::LOBBY_TIMEOUT, ReplyVars::new().with("玩法", label)),
+                    keyed_reply(
+                        &templates::LOBBY_TIMEOUT,
+                        ReplyVars::new().with("玩法", label),
+                    ),
                 ))
             }
             GameState::Bidding(game) => {
@@ -835,7 +891,7 @@ impl LandlordGame {
                     game.warning_sent = true;
                     return Some(LandlordOutcome::public(
                         "bid-warning",
-                        reply(
+                        keyed_reply(
                             &templates::BIDDING_WARNING,
                             ReplyVars::new().with("玩家", game.players[game.current].name.clone()),
                         ),
@@ -897,7 +953,7 @@ impl LandlordGame {
                     game.warning_sent = true;
                     return Some(LandlordOutcome::public(
                         "turn-warning",
-                        reply(
+                        keyed_reply(
                             &templates::TURN_WARNING,
                             ReplyVars::new().with("玩家", game.players[current].name.clone()),
                         ),
@@ -958,7 +1014,7 @@ impl LandlordGame {
                 let next = game.players[game.current].name.clone();
                 return LandlordOutcome::public(
                     "auto-pass",
-                    reply(
+                    keyed_reply(
                         &templates::PASS_TIMEOUT_NO_BEATING,
                         ReplyVars::new().with("玩家", name).with("下一位", next),
                     ),
@@ -969,7 +1025,7 @@ impl LandlordGame {
                 let next = game.players[game.current].name.clone();
                 return LandlordOutcome::public(
                     "auto-pass",
-                    reply(
+                    keyed_reply(
                         &templates::PASS_TIMEOUT,
                         ReplyVars::new().with("玩家", name).with("下一位", next),
                     ),
@@ -993,7 +1049,7 @@ impl LandlordGame {
                 let next = game.players[game.current].name.clone();
                 LandlordOutcome::public(
                     "auto-pass",
-                    reply(
+                    keyed_reply(
                         &templates::PASS_TIMEOUT_WITH_SUFFIX,
                         ReplyVars::new()
                             .with("玩家", name)
@@ -1038,13 +1094,13 @@ impl LandlordGame {
         let GameState::Playing(game) = &mut self.state else {
             return LandlordOutcome::public(
                 "no-game",
-                reply(&templates::NO_ACTIVE_GAME, ReplyVars::new()),
+                keyed_reply(&templates::NO_ACTIVE_GAME, ReplyVars::new()),
             );
         };
         let Some(player_index) = find_player(&game.players, player) else {
             return LandlordOutcome::public(
                 "not-player",
-                reply(
+                keyed_reply(
                     &templates::NOT_IN_GAME,
                     ReplyVars::new().with("玩法", game.variant.label()),
                 ),
@@ -1053,7 +1109,7 @@ impl LandlordGame {
         if player_index != game.current {
             return LandlordOutcome::public(
                 "wrong-turn",
-                reply(
+                keyed_reply(
                     &templates::WRONG_TURN,
                     ReplyVars::new().with("玩家", game.players[game.current].name.clone()),
                 ),
@@ -1064,7 +1120,7 @@ impl LandlordGame {
             Ok(_) => {
                 return LandlordOutcome::public(
                     "empty-play",
-                    reply(&templates::PLAY_EMPTY, ReplyVars::new()),
+                    keyed_reply(&templates::PLAY_EMPTY, ReplyVars::new()),
                 );
             }
             Err(error) => return LandlordOutcome::public("invalid-cards", error),
@@ -1083,7 +1139,7 @@ impl LandlordGame {
         {
             return LandlordOutcome::public(
                 "spade-three-required",
-                reply(&templates::SPADE_THREE_REQUIRED, ReplyVars::new()),
+                keyed_reply(&templates::SPADE_THREE_REQUIRED, ReplyVars::new()),
             );
         }
         let pattern = match classify_for_variant(&ranks, game.variant) {
@@ -1091,7 +1147,7 @@ impl LandlordGame {
             None => {
                 return LandlordOutcome::public(
                     "invalid-pattern",
-                    reply(&templates::INVALID_PATTERN, ReplyVars::new()),
+                    keyed_reply(&templates::INVALID_PATTERN, ReplyVars::new()),
                 );
             }
         };
@@ -1102,7 +1158,7 @@ impl LandlordGame {
         {
             return LandlordOutcome::public(
                 "must-play-largest-single",
-                reply(&templates::MUST_PLAY_LARGEST_SINGLE, ReplyVars::new()),
+                keyed_reply(&templates::MUST_PLAY_LARGEST_SINGLE, ReplyVars::new()),
             );
         }
         if let Some(last) = &game.last_play
@@ -1111,7 +1167,7 @@ impl LandlordGame {
         {
             return LandlordOutcome::public(
                 "cannot-beat",
-                reply(
+                keyed_reply(
                     &templates::CANNOT_BEAT,
                     ReplyVars::new()
                         .with("牌型", pattern.label())
@@ -1137,13 +1193,13 @@ impl LandlordGame {
         let GameState::Playing(game) = &mut self.state else {
             return LandlordOutcome::public(
                 "no-game",
-                reply(&templates::NO_ACTIVE_GAME, ReplyVars::new()),
+                keyed_reply(&templates::NO_ACTIVE_GAME, ReplyVars::new()),
             );
         };
         let Some(player_index) = find_player(&game.players, player) else {
             return LandlordOutcome::public(
                 "not-player",
-                reply(
+                keyed_reply(
                     &templates::NOT_IN_GAME,
                     ReplyVars::new().with("玩法", game.variant.label()),
                 ),
@@ -1152,7 +1208,7 @@ impl LandlordGame {
         if player_index != game.current {
             return LandlordOutcome::public(
                 "wrong-turn",
-                reply(
+                keyed_reply(
                     &templates::WRONG_TURN,
                     ReplyVars::new().with("玩家", game.players[game.current].name.clone()),
                 ),
@@ -1165,7 +1221,7 @@ impl LandlordGame {
         {
             return LandlordOutcome::public(
                 "cannot-pass",
-                reply(&templates::LEADER_CANNOT_PASS, ReplyVars::new()),
+                keyed_reply(&templates::LEADER_CANNOT_PASS, ReplyVars::new()),
             );
         }
         if game.variant == CardGameVariant::HunanRunFast {
@@ -1183,7 +1239,7 @@ impl LandlordGame {
             {
                 return LandlordOutcome::public(
                     "must-play",
-                    reply(&templates::MUST_PLAY_RUN_FAST, ReplyVars::new()),
+                    keyed_reply(&templates::MUST_PLAY_RUN_FAST, ReplyVars::new()),
                 );
             }
         }
@@ -1197,14 +1253,17 @@ impl LandlordGame {
             GameState::Idle | GameState::Lobby(_) => {
                 return LandlordOutcome::private(
                     "no-game",
-                    reply(&templates::HAND_NO_DEALT_GAME, ReplyVars::new()),
+                    keyed_reply(&templates::HAND_NO_DEALT_GAME, ReplyVars::new()),
                 );
             }
         };
         let Some(index) = find_player(players, player) else {
             return LandlordOutcome::private(
                 "not-player",
-                reply(&templates::NOT_IN_GAME, ReplyVars::new().with("玩法", label)),
+                keyed_reply(
+                    &templates::NOT_IN_GAME,
+                    ReplyVars::new().with("玩法", label),
+                ),
             );
         };
         let cooldown = Duration::from_secs(self.config.hand_cooldown_seconds);
@@ -1215,7 +1274,9 @@ impl LandlordGame {
             return LandlordOutcome {
                 action: "hand-cooldown",
                 public_reply: None,
+                public_reply_template: None,
                 private_reply: None,
+                private_reply_template: None,
                 private_deliveries: Vec::new(),
                 ended: false,
             };
@@ -1223,7 +1284,7 @@ impl LandlordGame {
         players[index].last_hand_reply = Some(now);
         LandlordOutcome::private(
             "hand",
-            reply(
+            keyed_reply(
                 &templates::HAND_CURRENT,
                 ReplyVars::new()
                     .with("张数", players[index].hand.len().to_string())
@@ -1236,11 +1297,11 @@ impl LandlordGame {
         match &self.state {
             GameState::Idle => LandlordOutcome::public(
                 "idle",
-                reply(&templates::STATUS_IDLE, ReplyVars::new()),
+                keyed_reply(&templates::STATUS_IDLE, ReplyVars::new()),
             ),
             GameState::Lobby(lobby) => LandlordOutcome::public(
                 "lobby-status",
-                reply(
+                keyed_reply(
                     &templates::STATUS_LOBBY,
                     ReplyVars::new()
                         .with("玩法", lobby.variant.label())
@@ -1261,7 +1322,7 @@ impl LandlordGame {
             ),
             GameState::Bidding(game) => LandlordOutcome::public(
                 "bidding-status",
-                reply(
+                keyed_reply(
                     &templates::STATUS_BIDDING,
                     ReplyVars::new()
                         .with("玩家", game.players[game.current].name.clone())
@@ -1325,13 +1386,13 @@ impl LandlordGame {
         match &mut self.state {
             GameState::Idle => LandlordOutcome::public(
                 "idle",
-                reply(&templates::STATUS_IDLE, ReplyVars::new()),
+                keyed_reply(&templates::STATUS_IDLE, ReplyVars::new()),
             ),
             GameState::Lobby(lobby) => {
                 let Some(index) = find_player(&lobby.players, player) else {
                     return LandlordOutcome::public(
                         "not-player",
-                        reply(
+                        keyed_reply(
                             &templates::NOT_IN_LOBBY,
                             ReplyVars::new().with("玩法", lobby.variant.label()),
                         ),
@@ -1343,7 +1404,7 @@ impl LandlordGame {
                     self.state = GameState::Idle;
                     LandlordOutcome::ended(
                         "lobby-canceled",
-                        reply(
+                        keyed_reply(
                             &templates::LOBBY_CANCELED,
                             ReplyVars::new()
                                 .with("玩家", name)
@@ -1354,7 +1415,7 @@ impl LandlordGame {
                     lobby.players.remove(index);
                     LandlordOutcome::public(
                         "left-lobby",
-                        reply(
+                        keyed_reply(
                             &templates::LOBBY_LEFT,
                             ReplyVars::new()
                                 .with("玩家", name)
@@ -1367,14 +1428,14 @@ impl LandlordGame {
                 let Some(index) = find_player(&game.players, player) else {
                     return LandlordOutcome::public(
                         "not-player",
-                        reply(&templates::NOT_IN_LANDLORD_GAME, ReplyVars::new()),
+                        keyed_reply(&templates::NOT_IN_LANDLORD_GAME, ReplyVars::new()),
                     );
                 };
                 let name = game.players[index].name.clone();
                 self.state = GameState::Idle;
                 LandlordOutcome::ended(
                     "game-aborted",
-                    reply(
+                    keyed_reply(
                         &templates::EXIT_LANDLORD_ENDED,
                         ReplyVars::new().with("玩家", name),
                     ),
@@ -1384,7 +1445,7 @@ impl LandlordGame {
                 let Some(index) = find_player(&game.players, player) else {
                     return LandlordOutcome::public(
                         "not-player",
-                        reply(
+                        keyed_reply(
                             &templates::NOT_IN_GAME,
                             ReplyVars::new().with("玩法", game.variant.label()),
                         ),
@@ -1395,11 +1456,9 @@ impl LandlordGame {
                 self.state = GameState::Idle;
                 LandlordOutcome::ended(
                     "game-aborted",
-                    reply(
+                    keyed_reply(
                         &templates::EXIT_GAME_ENDED,
-                        ReplyVars::new()
-                            .with("玩家", name)
-                            .with("玩法", label),
+                        ReplyVars::new().with("玩家", name).with("玩法", label),
                     ),
                 )
             }
@@ -1407,13 +1466,39 @@ impl LandlordGame {
     }
 }
 
-/// 渲染一条牌类回复。
-///
-/// 牌类回复在 effect 入队前就渲染成 String（`CardGameEffect::HallDelivery` 携带成品文案），
-/// 组装层拿不到模板键，因此这里只渲染内置默认文案；用户覆盖文案要生效，
-/// 需要在组装层增加模板直通通道（见任务汇报）。
+/// Preserve the key and variables while retaining the built-in rendered text.
 fn reply(spec: &crate::features::reply_template::ReplyTemplate, vars: ReplyVars) -> String {
     crate::features::reply_template::render(spec, None, &vars).text
+}
+
+fn keyed_reply(
+    spec: &'static crate::features::reply_template::ReplyTemplate,
+    vars: ReplyVars,
+) -> CardGameReplyTemplate {
+    CardGameReplyTemplate::Template { spec, vars }
+}
+
+impl From<String> for CardGameReplyTemplate {
+    fn from(text: String) -> Self {
+        Self::Raw(text)
+    }
+}
+
+impl From<&str> for CardGameReplyTemplate {
+    fn from(text: &str) -> Self {
+        Self::Raw(text.to_string())
+    }
+}
+
+impl CardGameReplyTemplate {
+    pub fn render_default(&self) -> String {
+        match self {
+            Self::Template { spec, vars } => {
+                crate::features::reply_template::render(spec, None, vars).text
+            }
+            Self::Raw(text) => text.clone(),
+        }
+    }
 }
 
 fn deadline_after(now: Instant, elapsed: Duration, target: Duration) -> Instant {
@@ -1510,7 +1595,7 @@ fn play_cards(
             };
             return LandlordOutcome::ended(
                 "won",
-                reply(
+                keyed_reply(
                     &templates::WON_RUN_FAST,
                     ReplyVars::new()
                         .with("玩家", name)
@@ -1541,7 +1626,7 @@ fn play_cards(
             .join("、");
         return LandlordOutcome::ended(
             "won",
-            reply(
+            keyed_reply(
                 &templates::WON_LANDLORD,
                 ReplyVars::new()
                     .with("玩家", name)
@@ -1654,7 +1739,9 @@ fn pass_playing(
         let vars = if origin == ActionOrigin::Forced && new_trick {
             ReplyVars::new().with("下一位", next.clone())
         } else {
-            ReplyVars::new().with("玩家", name).with("下一位", next.clone())
+            ReplyVars::new()
+                .with("玩家", name)
+                .with("下一位", next.clone())
         };
         reply(spec, vars)
     } else if new_trick {
@@ -2116,9 +2203,11 @@ mod tests {
                     CardGameEffectResult::PrivateDelivery(port.send_friend(&player, &message))
                 }
                 CardGameEffect::PrivateBatch { deliveries } => {
-                    CardGameEffectResult::PrivateBatch(port.send_friend_batch(&deliveries))
+                    CardGameEffectResult::PrivateBatchTemplates(
+                        port.send_friend_batch_templates(&deliveries),
+                    )
                 }
-                CardGameEffect::HallDelivery { message } => {
+                CardGameEffect::HallDelivery { message, .. } => {
                     CardGameEffectResult::HallDelivery(port.send_hall(&message))
                 }
             };
@@ -2173,7 +2262,7 @@ mod tests {
         );
         assert!(matches!(
             failure_reply.effect,
-            CardGameEffect::HallDelivery { ref message } if message.contains("报名失败")
+            CardGameEffect::HallDelivery { ref message, .. } if message.contains("报名失败")
         ));
 
         assert!(matches!(
@@ -2428,20 +2517,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["甲", "乙", "丙"]
         );
-        let retryable = deliveries[1..]
-            .iter()
-            .map(|delivery| FriendMessage::new(&delivery.player, &delivery.message))
-            .collect();
+        let retryable = deliveries[1..].to_vec();
+        let expected_retryable = retryable.clone();
         let CardGameResume::Suspended(failure_notice) = service
             .resume_claimed_for_test(
                 hand_batch.key,
-                CardGameEffectResult::PrivateBatch(Ok(FriendBatchOutcome::Failed {
-                    retryable,
-                    failure: FriendBatchFailure::new(
-                        FriendBatchFailureKind::ConfirmedUnsent,
-                        "second hand was not sent",
-                    ),
-                })),
+                CardGameEffectResult::PrivateBatchTemplates(Ok(
+                    CardGameFriendBatchOutcome::Failed {
+                        retryable,
+                        failure: FriendBatchFailure::new(
+                            FriendBatchFailureKind::ConfirmedUnsent,
+                            "second hand was not sent",
+                        ),
+                    },
+                )),
             )
             .unwrap()
         else {
@@ -2449,7 +2538,7 @@ mod tests {
         };
         assert!(matches!(
             failure_notice.effect,
-            CardGameEffect::HallDelivery { ref message } if message.contains("#重试")
+            CardGameEffect::HallDelivery { ref message, .. } if message.contains("#重试")
         ));
         assert!(matches!(
             service
@@ -2468,6 +2557,7 @@ mod tests {
         let CardGameEffect::PrivateBatch { deliveries } = retry.effect else {
             panic!("retry should submit one safe remaining batch")
         };
+        assert_eq!(deliveries, expected_retryable);
         assert_eq!(
             deliveries
                 .iter()
@@ -2685,7 +2775,9 @@ mod tests {
         let CardGameResume::Suspended(hall) = service
             .resume_claimed_for_test(
                 hand_batch.key,
-                CardGameEffectResult::PrivateBatch(Ok(FriendBatchOutcome::Complete)),
+                CardGameEffectResult::PrivateBatchTemplates(Ok(
+                    CardGameFriendBatchOutcome::Complete,
+                )),
             )
             .unwrap()
         else {
@@ -2696,7 +2788,9 @@ mod tests {
             service
                 .resume_claimed_for_test(
                     hand_batch.key,
-                    CardGameEffectResult::PrivateBatch(Ok(FriendBatchOutcome::Complete)),
+                    CardGameEffectResult::PrivateBatchTemplates(Ok(
+                        CardGameFriendBatchOutcome::Complete
+                    )),
                 )
                 .unwrap(),
             CardGameResume::Late(_)
@@ -2890,11 +2984,8 @@ mod tests {
                 panic!("private outcome should use a batch")
             };
             let result = if expected_action == "redealt" {
-                Ok(FriendBatchOutcome::Failed {
-                    retryable: deliveries
-                        .iter()
-                        .map(|delivery| FriendMessage::new(&delivery.player, &delivery.message))
-                        .collect(),
+                Ok(CardGameFriendBatchOutcome::Failed {
+                    retryable: deliveries.clone(),
                     failure: FriendBatchFailure::new(
                         FriendBatchFailureKind::ConfirmedUnsent,
                         "private delivery failed",
@@ -2904,7 +2995,10 @@ mod tests {
                 Err(anyhow::anyhow!("private delivery failed"))
             };
             let CardGameResume::Suspended(notice) = service
-                .resume_claimed_for_test(delivery.key, CardGameEffectResult::PrivateBatch(result))
+                .resume_claimed_for_test(
+                    delivery.key,
+                    CardGameEffectResult::PrivateBatchTemplates(result),
+                )
                 .unwrap()
             else {
                 panic!("failed private batch should publish a pause notice")
@@ -2977,7 +3071,9 @@ mod tests {
         let CardGameResume::Suspended(delivery) = service
             .resume_claimed_for_test(
                 delivery.key,
-                CardGameEffectResult::PrivateBatch(Ok(FriendBatchOutcome::Complete)),
+                CardGameEffectResult::PrivateBatchTemplates(Ok(
+                    CardGameFriendBatchOutcome::Complete,
+                )),
             )
             .unwrap()
         else {
@@ -3027,7 +3123,9 @@ mod tests {
         let CardGameResume::Suspended(delivery) = service
             .resume_claimed_for_test(
                 delivery.key,
-                CardGameEffectResult::PrivateBatch(Ok(FriendBatchOutcome::Complete)),
+                CardGameEffectResult::PrivateBatchTemplates(Ok(
+                    CardGameFriendBatchOutcome::Complete,
+                )),
             )
             .unwrap()
         else {
@@ -3387,7 +3485,7 @@ mod tests {
         let port = FakeCardGamePort::new(true, true);
 
         let aborted = service.abort();
-        let CardGameEffect::HallDelivery { message } = request.effect else {
+        let CardGameEffect::HallDelivery { message, .. } = request.effect else {
             panic!("lobby timeout should be a hall delivery")
         };
         let result = CardGameEffectResult::HallDelivery(port.send_hall(&message));

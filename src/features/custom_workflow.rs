@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{PointConfig, RectConfig};
 use crate::features::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
+use crate::text::normalize_comparison_text;
 pub use crate::ui::plan::{
     WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
     WorkflowResidency,
 };
-use crate::text::normalize_comparison_text;
 
 const MIN_POLL_MS: u64 = 50;
 

@@ -404,9 +404,7 @@ impl AudioCache {
             let locator = locator.map(|value| value.clone());
             let _ = tokio::task::spawn_blocking(move || {
                 let store = lock_metadata_store(&store);
-                if let Err(error) =
-                    store.upsert_track(&key, metadata.as_ref(), locator.as_ref())
-                {
+                if let Err(error) = store.upsert_track(&key, metadata.as_ref(), locator.as_ref()) {
                     log::warn!("音频缓存元数据登记失败: {error}");
                 }
             })
@@ -1135,8 +1133,10 @@ mod tests {
             stream.write_all(source_body).await.unwrap();
         });
 
-        let directory = std::env::temp_dir()
-            .join(format!("miliastra-cache-truncated-{}", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-cache-truncated-{}",
+            uuid::Uuid::new_v4()
+        ));
         let cache = AudioCache::spawn(AudioCacheConfig {
             directory: directory.clone(),
             metadata_directory: directory.join("index"),
@@ -1255,7 +1255,7 @@ mod tests {
             headers: Default::default(),
             expires_at_epoch_ms: None,
         };
-        cache.rewrite(&first, None,None, source.clone()).await;
+        cache.rewrite(&first, None, None, source.clone()).await;
         {
             let mut entries = cache.inner.entries.write().await;
             entries.get_mut(&first_hash).unwrap().state = EntryState::Downloading(DownloadHandle {
@@ -1268,7 +1268,7 @@ mod tests {
         }
 
         let second = SongKey::new("kugou", "idle").unwrap();
-        cache.rewrite(&second, None,None, source).await;
+        cache.rewrite(&second, None, None, source).await;
         let entries = cache.inner.entries.read().await;
         assert!(entries.contains_key(&first_hash));
         assert_eq!(entries.len(), 1, "应优先淘汰非下载条目");

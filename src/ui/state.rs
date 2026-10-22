@@ -7,6 +7,7 @@ use image::imageops::FilterType;
 use serde::Serialize;
 
 use crate::config::{self, OcrConfig, TemplateConfig};
+use crate::geometry::{Point, Rect, crop_canvas};
 use crate::observation::chat::{
     ResolvedTemplateArgs, TemplateArgs, count_scanned_chat_markers, scan_chat_markers,
 };
@@ -16,7 +17,6 @@ use crate::runtime::ui::{
     UiStateEvidence, UiStateKind as RuntimeUiStateKind, UiTemplateProbeEvidence,
     UiWorldProbeEvidence,
 };
-use crate::geometry::{Point, Rect, crop_canvas};
 #[cfg(test)]
 use crate::ui::template::best_template_hit;
 use crate::ui::template::{

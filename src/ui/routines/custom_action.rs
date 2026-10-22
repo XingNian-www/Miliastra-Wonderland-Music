@@ -7,18 +7,18 @@ use image::imageops::FilterType;
 
 use super::friend_delivery::{FriendDeliveryRoutineConfig, UiResidencyTarget, restore_residency};
 use crate::adapters::input::parse_key;
-use crate::ui::plan::{
-    WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
-    WorkflowResidency,
-};
+use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
+use crate::geometry::{Point, Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure,
     UiRoutineProgressStage, UiRuntimeHandle, UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
-use crate::geometry::{Point, Rect, crop_canvas};
+use crate::ui::plan::{
+    WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
+    WorkflowResidency,
+};
 use crate::ui::template::{TemplateHit, best_template_hit, template_exists};
 
 #[derive(Clone, Debug, PartialEq)]

@@ -14,10 +14,10 @@ use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
 
 use super::matcher::same_song_query;
 use super::{
-    BackgroundLyricsScope, PlaybackCommand, PlaybackNavigation, PlaybackOutcome, PlaybackRequest,
-    PlaybackSnapshot, PlaybackVerification, PlayerStatus, QueueAdvanceContext,
-    PersonalPlaylistStart, QueueAdvanceDecision, QueueItem, QueueRemoval,
-    estimated_player_status, format_lyrics, format_status_with_mode,
+    BackgroundLyricsScope, PersonalPlaylistStart, PlaybackCommand, PlaybackNavigation,
+    PlaybackOutcome, PlaybackRequest, PlaybackSnapshot, PlaybackVerification, PlayerStatus,
+    QueueAdvanceContext, QueueAdvanceDecision, QueueItem, QueueRemoval, estimated_player_status,
+    format_lyrics, format_status_with_mode,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

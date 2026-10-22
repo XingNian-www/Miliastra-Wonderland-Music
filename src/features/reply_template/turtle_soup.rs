@@ -430,7 +430,9 @@ mod tests {
     #[test]
     fn rendering_turtle_soup_templates_reproduces_the_pre_migration_strings() {
         // 改造前这些文案是 format! 直接拼出来的；渲染结果必须逐字一致。
-        let vars = ReplyVars::new().with("问题", "他认识死者吗").with("结果", "是");
+        let vars = ReplyVars::new()
+            .with("问题", "他认识死者吗")
+            .with("结果", "是");
         assert_eq!(
             render(&JUDGMENT_SUFFIX, None, &vars).text,
             "]的他认识死者吗回复：是"
@@ -443,11 +445,11 @@ mod tests {
             "[Alice]的他认识死者吗回复：是"
         );
 
-        let vars = ReplyVars::new().with("前缀", "暂存").with("玩家", "Alice").with("后缀", "##2");
-        assert_eq!(
-            render(&BATCH_NOTICE, None, &vars).text,
-            "暂存[Alice]:##2"
-        );
+        let vars = ReplyVars::new()
+            .with("前缀", "暂存")
+            .with("玩家", "Alice")
+            .with("后缀", "##2");
+        assert_eq!(render(&BATCH_NOTICE, None, &vars).text, "暂存[Alice]:##2");
 
         let vars = ReplyVars::new()
             .with("阶段", "进行中")
@@ -487,7 +489,10 @@ mod tests {
         );
 
         assert_eq!(render(&LABEL_SURFACE, None, &ReplyVars::new()).text, "汤面");
-        assert_eq!(render(&LABEL_SETTLEMENT, None, &ReplyVars::new()).text, "结算");
+        assert_eq!(
+            render(&LABEL_SETTLEMENT, None, &ReplyVars::new()).text,
+            "结算"
+        );
         assert_eq!(render(&LABEL_BOTTOM, None, &ReplyVars::new()).text, "汤底");
     }
 }

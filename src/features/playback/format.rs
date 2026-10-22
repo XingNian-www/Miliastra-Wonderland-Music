@@ -63,7 +63,10 @@ pub(crate) fn format_status(status: &PlayerStatus) -> String {
 }
 
 /// @状态 文本。歌单模式下用 `[归属的歌单]` 前缀，并省略尾部的点歌人。
-pub(crate) fn format_status_with_mode(status: &PlayerStatus, playlist_owner: Option<&str>) -> String {
+pub(crate) fn format_status_with_mode(
+    status: &PlayerStatus,
+    playlist_owner: Option<&str>,
+) -> String {
     match playlist_owner {
         Some(owner) => {
             let mut bare = status.clone();
@@ -144,7 +147,10 @@ mod tests {
         assert!(plain.ends_with('乙'), "大厅模式保留点歌人: {plain}");
         let playlist = format_status_with_mode(&status, Some("甲"));
         assert!(playlist.starts_with("[甲的歌单] "), "{playlist}");
-        assert!(!playlist.contains('乙'), "歌单模式用归属替代点歌人: {playlist}");
+        assert!(
+            !playlist.contains('乙'),
+            "歌单模式用归属替代点歌人: {playlist}"
+        );
     }
 
     #[test]

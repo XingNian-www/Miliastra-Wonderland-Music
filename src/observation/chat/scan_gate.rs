@@ -106,7 +106,15 @@ mod tests {
             MEAN,
             RATIO
         ));
-        assert!(gate.scan_due(&fp(10), now + fallback, false, fallback, debounce, MEAN, RATIO));
+        assert!(gate.scan_due(
+            &fp(10),
+            now + fallback,
+            false,
+            fallback,
+            debounce,
+            MEAN,
+            RATIO
+        ));
     }
 
     /// 轻微抖动（均值差 2、变化比例 0）= 被阈值吸收，不触发扫描。
@@ -180,7 +188,15 @@ mod tests {
         let requested = Instant::now();
         let mut gate = PassiveScanGate::default();
         let sample = fp(7);
-        assert!(gate.scan_due(&sample, requested, false, Duration::from_secs(5), Duration::ZERO, MEAN, RATIO));
+        assert!(gate.scan_due(
+            &sample,
+            requested,
+            false,
+            Duration::from_secs(5),
+            Duration::ZERO,
+            MEAN,
+            RATIO
+        ));
         gate.complete(requested);
         assert!(gate.scan_due(
             &sample,

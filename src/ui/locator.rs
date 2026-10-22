@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::text::normalize_comparison_text;
 use crate::geometry::Rect;
+use crate::text::normalize_comparison_text;
 
 pub(crate) const HALL_INFO_OCR_SAMPLES: usize = 3;
 const HALL_TIME_RECOGNITION_TOLERANCE_MINUTES: u32 = 1;

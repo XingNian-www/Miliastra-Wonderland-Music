@@ -3236,8 +3236,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             break;
         };
         // 单条消息的 panic 不能让整个业务运行时永久停摆（点歌/决策/队列/值守都依赖它）。
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match message {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match message {
             RuntimeMessage::OperationalSnapshot { now, response } => {
                 task_state.handle_snapshot(now, response);
             }
@@ -3401,7 +3400,6 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 let _ = response.send(snapshot);
                 should_stop = true;
             }
-        }
         }));
         if let Err(payload) = result {
             let detail = payload
@@ -3698,7 +3696,9 @@ fn handle_turtle_soup_message(
             | TurtleSoupRuntimeMessage::FriendCommand { response, .. } => {
                 let _ = response.send(TurtleSoupCommandOutcome {
                     action: "unavailable",
-                    immediate_reply: Some("海龟汤运行时不可用".to_string()),
+                    immediate_reply: Some(crate::features::turtle_soup::TurtleSoupReplyText::raw(
+                        "海龟汤运行时不可用",
+                    )),
                 });
             }
             TurtleSoupRuntimeMessage::StartRandom { response }

@@ -11,6 +11,106 @@ use crate::features::command::{
 use crate::features::reply_template::{ReplyTemplate, ReplyVars};
 use miliastra_kernel::timer::{DeadlineKind, DeadlineModule, DeadlineToken};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TurtleSoupReplyText {
+    Raw(String),
+    Keyed {
+        spec: ReplyTemplate,
+        vars: ReplyVars,
+    },
+    Composed {
+        spec: ReplyTemplate,
+        vars: ReplyVars,
+        nested: Vec<(&'static str, TurtleSoupReplyText)>,
+    },
+    Numbered {
+        label: ReplyTemplate,
+        index: usize,
+        total: usize,
+        content: String,
+    },
+    NumberedComposed {
+        label: ReplyTemplate,
+        index: usize,
+        total: usize,
+        content: Box<TurtleSoupReplyText>,
+    },
+}
+
+impl TurtleSoupReplyText {
+    pub(crate) fn keyed(spec: &ReplyTemplate, vars: ReplyVars) -> Self {
+        Self::Keyed { spec: *spec, vars }
+    }
+
+    pub(crate) fn raw(text: impl Into<String>) -> Self {
+        Self::Raw(text.into())
+    }
+
+    pub(crate) fn composed(
+        spec: &ReplyTemplate,
+        vars: ReplyVars,
+        nested: Vec<(&'static str, TurtleSoupReplyText)>,
+    ) -> Self {
+        Self::Composed {
+            spec: *spec,
+            vars,
+            nested,
+        }
+    }
+
+    pub(crate) fn render_default(&self) -> String {
+        match self {
+            Self::Raw(text) => text.clone(),
+            Self::Keyed { spec, vars } => {
+                crate::features::reply_template::render(spec, None, vars).text
+            }
+            Self::Composed { spec, vars, nested } => {
+                let nested = nested
+                    .iter()
+                    .map(|(name, reply)| (*name, reply.render_default()))
+                    .collect();
+                let vars = vars.clone().with_nested(nested);
+                crate::features::reply_template::render(spec, None, &vars).text
+            }
+            Self::Numbered {
+                label,
+                index,
+                total,
+                content,
+            } => {
+                format!(
+                    "{}{index}/{total}：{content}",
+                    crate::features::reply_template::render(label, None, &ReplyVars::new()).text
+                )
+            }
+            Self::NumberedComposed {
+                label,
+                index,
+                total,
+                content,
+            } => {
+                format!(
+                    "{}{index}/{total}：{}",
+                    crate::features::reply_template::render(label, None, &ReplyVars::new()).text,
+                    content.render_default()
+                )
+            }
+        }
+    }
+}
+
+impl From<String> for TurtleSoupReplyText {
+    fn from(text: String) -> Self {
+        Self::Raw(text)
+    }
+}
+
+impl From<&str> for TurtleSoupReplyText {
+    fn from(text: &str) -> Self {
+        Self::Raw(text.to_string())
+    }
+}
+
 pub(crate) mod repository;
 mod service;
 
@@ -68,6 +168,17 @@ pub(crate) trait TurtleSoupApplicationPort {
         observed_at: Instant,
     ) -> Result<QuestionSubmitOutcome>;
     fn send_current_hall(&mut self, message: &str) -> Result<()>;
+    fn send_turtle_soup_reply(&mut self, reply: TurtleSoupReplyText) -> Result<()> {
+        match reply {
+            TurtleSoupReplyText::Raw(message) => self.send_current_hall(&message),
+            TurtleSoupReplyText::Keyed { .. }
+            | TurtleSoupReplyText::Composed { .. }
+            | TurtleSoupReplyText::Numbered { .. }
+            | TurtleSoupReplyText::NumberedComposed { .. } => {
+                bail!("keyed turtle-soup reply requires composition rendering")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -88,7 +199,7 @@ impl TurtleSoupApplication {
             port.handle_hall_command(player, command)?
         };
         if let Some(reply) = outcome.immediate_reply {
-            port.send_current_hall(&reply)?;
+            port.send_turtle_soup_reply(reply)?;
         }
         log::info!(
             "海龟汤命令已处理: command={} action={}",
@@ -111,7 +222,7 @@ impl TurtleSoupApplication {
                 Ok(true)
             }
             QuestionSubmitOutcome::Reply(reply) => {
-                port.send_current_hall(&reply)?;
+                port.send_turtle_soup_reply(reply)?;
                 Ok(true)
             }
         }
@@ -246,14 +357,14 @@ pub(crate) trait TurtleSoupDeliveryPort {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TurtleSoupDeliveryIntent {
-    messages: Vec<String>,
+    messages: Vec<TurtleSoupReplyText>,
     generation: u64,
     purpose: TurtleSoupDeliveryPurpose,
 }
 
 impl TurtleSoupDeliveryIntent {
-    pub(crate) fn new(
-        messages: Vec<String>,
+    pub(crate) fn new<T: Into<TurtleSoupReplyText>>(
+        messages: Vec<T>,
         generation: u64,
         purpose: TurtleSoupDeliveryPurpose,
     ) -> Result<Self> {
@@ -261,7 +372,7 @@ impl TurtleSoupDeliveryIntent {
             bail!("海龟汤投递不能为空");
         }
         Ok(Self {
-            messages,
+            messages: messages.into_iter().map(Into::into).collect(),
             generation,
             purpose,
         })
@@ -282,7 +393,7 @@ impl TurtleSoupDeliveryIntent {
         DELIVERY_ATTEMPTS
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<String>, TurtleSoupDelivery) {
+    pub(crate) fn into_parts(self) -> (Vec<TurtleSoupReplyText>, TurtleSoupDelivery) {
         (
             self.messages,
             TurtleSoupDelivery {
@@ -381,7 +492,7 @@ mod tests {
         ) -> Result<TurtleSoupCommandOutcome> {
             Ok(TurtleSoupCommandOutcome {
                 action: "status",
-                immediate_reply: Some("海龟汤正在进行".to_string()),
+                immediate_reply: Some(TurtleSoupReplyText::raw("海龟汤正在进行")),
             })
         }
 
@@ -449,8 +560,12 @@ mod tests {
         assert_eq!(judgment.max_attempts(), 3);
 
         assert!(
-            TurtleSoupDeliveryIntent::new(Vec::new(), 7, TurtleSoupDeliveryPurpose::Settlement,)
-                .is_err()
+            TurtleSoupDeliveryIntent::new(
+                Vec::<String>::new(),
+                7,
+                TurtleSoupDeliveryPurpose::Settlement,
+            )
+            .is_err()
         );
     }
 }

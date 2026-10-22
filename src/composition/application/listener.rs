@@ -2577,11 +2577,11 @@ mod tests {
         replacement_startup_fallback_due, replacement_startup_retry_due, scan_frame_is_fresh,
         secondary_hall_recovery_allowed, unresolved_ui_recovery_due,
     };
+    use crate::geometry::Rect;
     use crate::observation::chat::{
         BubbleSequence, ChatIdentity, ChatMessage, ChatTimeline, ObservedChatMessageId,
         PrimaryObservedMessage, RecognizedChatMessage, VisualSessionId,
     };
-    use crate::geometry::Rect;
     use std::time::{Duration, Instant};
 
     fn listener_snapshot(

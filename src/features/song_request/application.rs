@@ -527,10 +527,10 @@ impl SongRequestExecution<'_> {
                 }) {
                     self.log_executed_command(context, &request.final_command("already-playing"))?;
                     self.reply_template(
-                    &crate::features::reply_template::song::SONG[1],
-                    &crate::features::reply_template::ReplyVars::new()
-                        .with("歌名", request.keyword.clone()),
-                )?;
+                        &crate::features::reply_template::song::SONG[1],
+                        &crate::features::reply_template::ReplyVars::new()
+                            .with("歌名", request.keyword.clone()),
+                    )?;
                     return Ok(());
                 }
                 if self
@@ -792,8 +792,7 @@ impl SongRequestExecution<'_> {
                 log::error!("AI点歌选择候选失败: {error:#}");
                 self.reply_template(
                     &crate::features::reply_template::song::SONG[8],
-                    &crate::features::reply_template::ReplyVars::new()
-                        .with("标签", label.clone()),
+                    &crate::features::reply_template::ReplyVars::new().with("标签", label.clone()),
                 )?;
                 return Ok(None);
             }
@@ -1303,10 +1302,10 @@ impl SongRequestExecution<'_> {
             SongQueuePushOutcome::Duplicate => {
                 self.log_executed_command(context, &request.final_command("duplicate"))?;
                 self.reply_template(
-                &crate::features::reply_template::song::SONG[0],
-                &crate::features::reply_template::ReplyVars::new()
-                    .with("歌名", request.keyword.clone()),
-            )?;
+                    &crate::features::reply_template::song::SONG[0],
+                    &crate::features::reply_template::ReplyVars::new()
+                        .with("歌名", request.keyword.clone()),
+                )?;
             }
             SongQueuePushOutcome::Full => {
                 self.log_executed_command(context, &request.final_command(feedback.full_action))?;
@@ -2590,7 +2589,6 @@ mod tests {
     }
 
     #[test]
-
     #[test]
     fn template_replies_keep_the_exact_wording_they_had_before_templating() {
         // 模板化的核心风险是"顺手改了文案"。这里直接渲染每条模板，
@@ -2603,7 +2601,11 @@ mod tests {
             &SONG[12], // song.queue.full_unknown_state
         ] {
             let rendered = render(spec, None, &ReplyVars::new());
-            assert_eq!(rendered.text, spec.default, "{} 无变量模板不该被改变", spec.key);
+            assert_eq!(
+                rendered.text, spec.default,
+                "{} 无变量模板不该被改变",
+                spec.key
+            );
             assert!(rendered.missing.is_empty());
         }
 

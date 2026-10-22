@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use super::PlayerStatus;
+use crate::features::reply_template::{ReplyVars, playback as templates};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlaybackSnapshot {
@@ -33,33 +34,48 @@ pub(crate) fn format_play_message(status: &PlayerStatus) -> String {
     )
 }
 
-pub(crate) fn format_status(status: &PlayerStatus) -> String {
+/// @状态 的播放器快照变量。
+///
+/// 单独拆出来，是为了让"状态行模板"和"歌单前缀模板"共用同一批值：
+/// 前缀模板拿到的 {内容} 就是这里渲染出的整行。
+fn status_vars(status: &PlayerStatus, requester: &str) -> ReplyVars {
     let title = optional_song_title(&status.name, &status.singer);
-    let progress = format_seconds(status.progress);
-    let duration = format_seconds(status.duration);
     let state = match status.status.as_str() {
         "playing" => "播放",
         "paused" => "暂停",
         "stopped" => "停止",
         _ => "未知",
     };
-    let requester = status.requester.trim();
-    let requester = if requester.is_empty() {
+    // 点歌人片段本身也是模板：留空即整段消失，用户可改成任意措辞。
+    let requester_text = if requester.is_empty() {
         String::new()
     } else {
-        format!("  {requester}")
+        crate::features::reply_template::render(
+            &templates::STATUS_REQUESTER,
+            None,
+            &ReplyVars::new().with("点歌人", requester),
+        )
+        .text
     };
-    if title.is_empty() {
-        format!(
-            "{}:({}/{}) 音量{}{}",
-            state, progress, duration, status.volume, requester
-        )
+    ReplyVars::new()
+        .with("状态", state)
+        .with("曲名", title)
+        .with("进度", format_seconds(status.progress))
+        .with("总长", format_seconds(status.duration))
+        .with("音量", status.volume.to_string())
+        .with("点歌人", requester_text)
+}
+
+pub(crate) fn format_status(status: &PlayerStatus) -> String {
+    let vars = status_vars(status, status.requester.trim());
+    // 有歌 / 无歌用两张主模板：两种排版的冒号与空格位置不同，
+    // 不能靠同一张模板加空变量凑出来。
+    let spec = if vars.get("曲名").is_some_and(|title| title.is_empty()) {
+        &templates::STATUS_WITHOUT_SONG
     } else {
-        format!(
-            "{}:{} ({}/{}) 音量{}{}",
-            state, title, progress, duration, status.volume, requester
-        )
-    }
+        &templates::STATUS_WITH_SONG
+    };
+    crate::features::reply_template::render(spec, None, &vars).text
 }
 
 /// @状态 文本。歌单模式下用 `[归属的歌单]` 前缀，并省略尾部的点歌人。
@@ -69,9 +85,19 @@ pub(crate) fn format_status_with_mode(
 ) -> String {
     match playlist_owner {
         Some(owner) => {
+            // 歌单模式用归属替代点歌人：清空 requester 渲染整行，
+            // 再由前缀模板包一层，两处都能被用户改写。
             let mut bare = status.clone();
             bare.requester.clear();
-            format!("[{}的歌单] {}", owner, format_status(&bare))
+            let inner = format_status(&bare);
+            crate::features::reply_template::render(
+                &templates::STATUS_PLAYLIST_PREFIX,
+                None,
+                &ReplyVars::new()
+                    .with("歌单归属", owner)
+                    .with("内容", inner),
+            )
+            .text
         }
         None => format_status(status),
     }
@@ -79,11 +105,12 @@ pub(crate) fn format_status_with_mode(
 
 pub(crate) fn format_lyrics(status: &PlayerStatus) -> String {
     let text = status.lyric_line_text.trim();
-    if text.is_empty() {
-        "当前无歌词".to_string()
+    let spec = if text.is_empty() {
+        &templates::LYRICS_EMPTY
     } else {
-        format!("歌词: {}", text)
-    }
+        &templates::LYRICS_LINE
+    };
+    crate::features::reply_template::render(spec, None, &ReplyVars::new().with("歌词", text)).text
 }
 
 fn format_seconds(value: f64) -> String {
@@ -130,6 +157,36 @@ pub(super) fn format_time(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{PlayerStatus, format_status, format_status_with_mode};
+
+    #[test]
+    fn status_line_templates_preserve_the_pre_split_output() {
+        // 拆分前后必须逐字一致：这是"模板化不改变现有行为"的直接证据。
+        let status = PlayerStatus {
+            status: "playing".into(),
+            name: "歌".into(),
+            singer: "手".into(),
+            duration: 185.0,
+            progress: 65.0,
+            volume: 80,
+            requester: "点歌人".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_status(&status),
+            "播放:歌 - 手 (1:05/3:05) 音量80  点歌人"
+        );
+        // 无曲目信息：冒号后直接接括号。
+        let bare = PlayerStatus {
+            status: "paused".into(),
+            ..Default::default()
+        };
+        assert_eq!(format_status(&bare), "暂停:(0:00/0:00) 音量0");
+        // 歌单模式：归属替代点歌人。
+        assert_eq!(
+            format_status_with_mode(&status, Some("甲")),
+            "[甲的歌单] 播放:歌 - 手 (1:05/3:05) 音量80"
+        );
+    }
 
     #[test]
     fn status_uses_owner_playlist_marker_and_drops_requester() {

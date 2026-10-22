@@ -541,7 +541,11 @@ impl ApplicationRuntime {
             .playlist_application
             .poll_import_completions(Instant::now())?
         {
-            let messages = messages.iter().map(String::as_str).collect::<Vec<_>>();
+            let rendered: Vec<String> = messages
+                .iter()
+                .flat_map(|reply| self.render_playlist_reply(reply))
+                .collect();
+            let messages = rendered.iter().map(String::as_str).collect::<Vec<_>>();
             self.reply_batch(&messages, 0)?;
         }
         Ok(())

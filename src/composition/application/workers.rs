@@ -342,31 +342,21 @@ struct DeferredChatSender {
     chat_output: ChatOutput,
 }
 
+/// 读取命令面板保存的覆盖文案；与立即发送路径共用同一查询语义。
 fn command_reply_override(
     config_store: Option<&crate::config::SharedConfigStore>,
     key: &str,
 ) -> Option<String> {
-    let entry = crate::features::reply_template::command_reply_entry_for_key(key)?;
-    if entry.ordered_batch {
-        return None;
-    }
     let store = config_store?.lock().ok()?;
-    store
-        .reply_templates()
-        .ok()?
-        .get(entry.id)?
-        .iter()
-        .find(|reply| reply.key == key)
-        .map(|reply| reply.text.clone())
+    let replies = store.reply_templates().ok()?;
+    crate::features::reply_template::stored_override(&replies, key)
 }
 
+/// 该 key 是否被命令面板静音；与立即发送路径共用同一判定。
 fn command_reply_is_muted(
     config_store: Option<&crate::config::SharedConfigStore>,
     key: &str,
 ) -> bool {
-    let Some(entry) = crate::features::reply_template::command_reply_entry_for_key(key) else {
-        return false;
-    };
     let Some(store) = config_store else {
         return false;
     };
@@ -376,47 +366,39 @@ fn command_reply_is_muted(
     let Ok(replies) = store.reply_templates() else {
         return false;
     };
-    replies.get(entry.id).is_some_and(|rows| {
-        rows.is_empty() || (!entry.ordered_batch && !rows.iter().any(|reply| reply.key == key))
-    })
+    crate::features::reply_template::is_muted(&replies, key)
 }
 
 impl DeferredChatSender {
+    /// 按模板渲染一条文案；被静音时返回 None。
+    ///
+    /// 与立即发送路径同一契约：静音判定在渲染入口完成，调用方必须处理 None。
     fn render_template_text(
         &self,
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
-    ) -> String {
-        let legacy_override = self
-            .live_configs
-            .replies
-            .read()
-            .ok()
-            .and_then(|config| config.get(spec.key).map(str::to_string));
-        let override_text =
-            command_reply_override(self.config_store.as_ref(), spec.key).or(legacy_override);
+    ) -> Option<String> {
+        if command_reply_is_muted(self.config_store.as_ref(), spec.key) {
+            return None;
+        }
+        // 覆盖只来自命令面板保存的行；配置中心不再提供回复文案入口。
+        let override_text = command_reply_override(self.config_store.as_ref(), spec.key);
         let rendered =
             crate::features::reply_template::render(spec, override_text.as_deref(), vars);
         if !rendered.missing.is_empty() {
             log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
         }
-        rendered.text
+        Some(rendered.text)
     }
 
     fn render_reply_text(
         &self,
         reply: &crate::features::turtle_soup::TurtleSoupReplyText,
-    ) -> String {
+    ) -> Option<String> {
         use crate::features::turtle_soup::TurtleSoupReplyText;
         match reply {
-            TurtleSoupReplyText::Raw(text) => text.clone(),
-            TurtleSoupReplyText::Keyed { spec, vars } => {
-                if command_reply_is_muted(self.config_store.as_ref(), spec.key) {
-                    String::new()
-                } else {
-                    self.render_template_text(spec, vars)
-                }
-            }
+            TurtleSoupReplyText::Raw(text) => Some(text.clone()),
+            TurtleSoupReplyText::Keyed { spec, vars } => self.render_template_text(spec, vars),
             TurtleSoupReplyText::NumberedComposed {
                 label,
                 index,
@@ -426,9 +408,9 @@ impl DeferredChatSender {
                 let label = self.render_template_text(
                     label,
                     &crate::features::reply_template::ReplyVars::new(),
-                );
-                let content = self.render_reply_text(content);
-                format!("{label}{index}/{total}：{content}")
+                )?;
+                let content = self.render_reply_text(content)?;
+                Some(format!("{label}{index}/{total}：{content}"))
             }
             TurtleSoupReplyText::Numbered {
                 label,
@@ -439,16 +421,15 @@ impl DeferredChatSender {
                 let rendered = self.render_template_text(
                     label,
                     &crate::features::reply_template::ReplyVars::new(),
-                );
-                format!("{rendered}{index}/{total}：{content}")
+                )?;
+                Some(format!("{rendered}{index}/{total}：{content}"))
             }
             TurtleSoupReplyText::Composed { spec, vars, nested } => {
-                let nested = nested
-                    .iter()
-                    .map(|(name, reply)| (*name, self.render_reply_text(reply)))
-                    .collect();
-                let vars = vars.clone().with_nested(nested);
-                self.render_reply_text(&TurtleSoupReplyText::Keyed { spec: *spec, vars })
+                let mut resolved = Vec::with_capacity(nested.len());
+                for (name, reply) in nested {
+                    resolved.push((*name, self.render_reply_text(reply)?));
+                }
+                self.render_template_text(spec, &vars.clone().with_nested(resolved))
             }
         }
     }
@@ -573,12 +554,13 @@ impl DeferredChatSender {
                         }
                         DeferredChatTarget::CurrentHall => self.active_ui_residency()?,
                     };
+                    // 静音条目在此处被剔除：它们不应进入待发送队列。
                     let mapped_messages = if batch.is_rendered() {
                         batch
                             .remaining_replies()
-                            .map(|reply| match reply {
+                            .filter_map(|reply| match reply {
                                 crate::features::turtle_soup::TurtleSoupReplyText::Raw(text) => {
-                                    text.clone()
+                                    Some(text.clone())
                                 }
                                 other => self.render_reply_text(other),
                             })
@@ -589,19 +571,23 @@ impl DeferredChatSender {
                             if let crate::features::turtle_soup::TurtleSoupReplyText::NumberedComposed {
                                 label, content, ..
                             } = reply {
-                                let label_text = self.render_template_text(
-                                    label,
-                                    &crate::features::reply_template::ReplyVars::new(),
-                                );
-                                let content_text = self.render_reply_text(content);
+                                // 任一段被静音，整条编号消息就不发。
+                                let (Some(label_text), Some(content_text)) = (
+                                    self.render_template_text(
+                                        label,
+                                        &crate::features::reply_template::ReplyVars::new(),
+                                    ),
+                                    self.render_reply_text(content),
+                                ) else {
+                                    continue;
+                                };
                                 let rendered = crate::features::chat_text::split_numbered_chat_message(
                                     &label_text, &content_text,
                                 );
                                 rows.extend(rendered.into_iter().map(|row| {
                                     self.live_configs.identity.replace_display_names(&row)
                                 }));
-                            } else {
-                                let rendered = self.render_reply_text(reply);
+                            } else if let Some(rendered) = self.render_reply_text(reply) {
                                 rows.push(self.live_configs.identity.replace_display_names(&rendered));
                             }
                         }
@@ -1015,7 +1001,7 @@ mod tests {
         };
         let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
         let updates = BTreeMap::from([(
-            "#状态（海龟汤）".to_string(),
+            "#海龟汤".to_string(),
             vec![StoredReply {
                 key: "turtle_soup.status".to_string(),
                 text: "状态={阶段}/{秒数}/{人数}/{提问数}".to_string(),

@@ -113,50 +113,15 @@ pub struct AppConfig {
     /// 酷狗设备信息（由用户填写，程序不再自动生成）；内嵌段可省略。
     #[serde(default)]
     pub kugou: KugouDeviceConfig,
-    /// 可调整回复文案；内嵌段可省略。
-    #[serde(default)]
-    pub replies: RepliesConfig,
 }
 
-/// 可调整回复文案的覆盖层。
-///
-/// 键是稳定的模板键（见 `features::reply_template` 的目录），值是替换文案。
-/// 缺失的键回落代码内置默认值；默认值始终存在，因此这里可以是空表。
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepliesConfig {
-    /// 模板键 -> 覆盖文案。全空白视为未覆盖。
-    #[serde(default)]
-    pub overrides: std::collections::BTreeMap<String, String>,
-}
-
-/// 单条回复覆盖文案的字符上限。
+/// 单条回复文案的字符上限。
 ///
 /// 游戏聊天框宽度有限，超长文案会被截断或被 OCR 切成多行，
 /// 反而比内置短文案更不可靠，因此这里主动设上限。
+///
+/// 命令面板与业务校验共用这一个来源，避免两个入口给出不同限制。
 pub const MAX_REPLY_OVERRIDE_CHARS: usize = 300;
-
-impl RepliesConfig {
-    fn validate(&self) -> Result<()> {
-        for (key, value) in &self.overrides {
-            if key.trim().is_empty() {
-                bail!("replies.overrides 存在空键");
-            }
-            if value.chars().count() > MAX_REPLY_OVERRIDE_CHARS {
-                bail!("replies.overrides[{key}] 超过 {MAX_REPLY_OVERRIDE_CHARS} 字符上限");
-            }
-        }
-        Ok(())
-    }
-
-    /// 取一条覆盖文案；全空白视为未覆盖。
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.overrides
-            .get(key)
-            .map(String::as_str)
-            .filter(|text| !text.trim().is_empty())
-    }
-}
 
 /// 酷狗设备标识：GUID、设备型号与 MAC 由用户提供，用于登录与取流请求。
 ///
@@ -267,7 +232,6 @@ impl Default for AppConfig {
             idiom_chain: IdiomChainConfig::default(),
             identity: IdentityConfig::default(),
             kugou: KugouDeviceConfig::default(),
-            replies: RepliesConfig::default(),
             landlord: LandlordConfig::default(),
             undercover: UndercoverConfig::default(),
             turtle_soup: TurtleSoupConfig::default(),
@@ -558,7 +522,6 @@ impl AppConfig {
         self.turtle_soup.validate()?;
         self.identity.validate()?;
         self.kugou.validate()?;
-        self.replies.validate()?;
         self.validate_ui_geometry()?;
         Ok(())
     }
@@ -2102,57 +2065,6 @@ mod tests {
     use super::*;
 
     type ConfigMutation = (&'static str, fn(&mut AppConfig));
-
-    #[test]
-    fn replies_config_treats_blank_overrides_as_absent() {
-        // 用户把某条清空 = 恢复默认，不该发出空消息。
-        let config: RepliesConfig = serde_norway::from_str(
-            r#"
-overrides:
-  "help.song_request.1": ""
-  "help.song_request.2": "   "
-  "help.song_request.3": "实际覆盖"
-"#,
-        )
-        .expect("解析 replies 配置");
-        assert_eq!(config.get("help.song_request.1"), None);
-        assert_eq!(config.get("help.song_request.2"), None);
-        assert_eq!(config.get("help.song_request.3"), Some("实际覆盖"));
-        // 不存在的键同样回落默认。
-        assert_eq!(config.get("不存在的键"), None);
-        config.validate().expect("空白覆盖应通过校验");
-    }
-
-    #[test]
-    fn replies_config_rejects_overlong_overrides() {
-        // 超长文案会被聊天框截断，反而更不可靠，因此在配置层就拒绝。
-        let mut config = RepliesConfig::default();
-        config.overrides.insert(
-            "help.song_request.1".to_string(),
-            "字".repeat(MAX_REPLY_OVERRIDE_CHARS + 1),
-        );
-        let error = config.validate().expect_err("超长文案必须被拒绝");
-        assert!(
-            error.to_string().contains("超过"),
-            "错误信息应说明超限：{error}"
-        );
-        // 恰好等于上限应当通过。
-        config.overrides.insert(
-            "help.song_request.1".to_string(),
-            "字".repeat(MAX_REPLY_OVERRIDE_CHARS),
-        );
-        config.validate().expect("上限内应通过");
-    }
-
-    #[test]
-    fn replies_config_is_optional_and_defaults_to_no_overrides() {
-        // 老配置文件没有 replies 段时不能报错，且默认不覆盖任何文案。
-        let config: AppConfig =
-            serde_norway::from_str(&serde_norway::to_string(&AppConfig::default()).unwrap())
-                .expect("往返序列化");
-        assert!(config.replies.overrides.is_empty());
-        assert_eq!(config.replies.get("help.song_request.1"), None);
-    }
 
     fn playback_timing(yaml: &str) -> PlaybackTimingConfig {
         serde_norway::from_str(yaml).expect("valid playback timing config")

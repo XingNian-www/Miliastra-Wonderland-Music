@@ -202,14 +202,18 @@ impl ApplicationRuntime {
                 crate::privacy::redacted_chat_text(envelope.user_command())
             );
         }
+        let rendered: Vec<String> = messages
+            .iter()
+            .flat_map(|reply| self.render_playlist_reply(reply))
+            .collect();
         if changed {
             crate::debug_read_only::record_command_immediate(
                 &interaction,
                 "playlist_window",
-                messages.join(" "),
+                rendered.join(" "),
             );
         }
-        self.reply_batch(&messages.iter().map(String::as_str).collect::<Vec<_>>(), 0)
+        self.reply_batch(&rendered.iter().map(String::as_str).collect::<Vec<_>>(), 0)
     }
 
     pub(super) fn execute_playlist_window(&mut self, parsed: &RoutedCommand) -> Result<()> {
@@ -229,7 +233,11 @@ impl ApplicationRuntime {
                 playlist_seed(),
             )?;
             self.log_executed_command(parsed, "playlist")?;
-            return self.reply_batch(&messages.iter().map(String::as_str).collect::<Vec<_>>(), 0);
+            let rendered: Vec<String> = messages
+                .iter()
+                .flat_map(|reply| self.render_playlist_reply(reply))
+                .collect();
+            return self.reply_batch(&rendered.iter().map(String::as_str).collect::<Vec<_>>(), 0);
         }
         // Bound setup separately; the full selection period starts after the recommendations send.
         let setup_deadline = Instant::now() + WINDOW_TTL;
@@ -270,7 +278,11 @@ impl ApplicationRuntime {
         if !self.playlist_window_active(reader, setup_deadline)? {
             return Ok(());
         }
-        self.reply_batch(&messages.iter().map(String::as_str).collect::<Vec<_>>(), 0)?;
+        let rendered: Vec<String> = messages
+            .iter()
+            .flat_map(|reply| self.render_playlist_reply(reply))
+            .collect();
+        self.reply_batch(&rendered.iter().map(String::as_str).collect::<Vec<_>>(), 0)?;
         let mut deadline = Instant::now() + WINDOW_TTL;
         application.set_window_deadline(&owner, deadline)?;
         while self.playlist_window_active(reader, deadline)? {

@@ -216,6 +216,9 @@ impl<'a> ChatCommandRouter<'a> {
             };
             let mut routed =
                 self.route_with_authorities(envelope, active_entertainment, None, Some(other))?;
+            if let ModuleCommand::SongRequest(song) = &mut routed.command {
+                access.apply_default_song_source(song);
+            }
             let (_, policy) = crate::features::command_access::resolve_with_active(
                 access,
                 &routed,
@@ -704,6 +707,213 @@ mod tests {
             CommandObservation::default(),
         )
         .expect("test command envelope")
+    }
+
+    fn song_policy_route(
+        access: &crate::features::command_access::CommandAccessConfig,
+        source: &str,
+        text: &str,
+    ) -> RoutedCommand {
+        let identity = IdentityAccess::default();
+        ChatCommandRouter {
+            custom_workflow: None,
+            identity: Some(&identity),
+            access: Some(access),
+        }
+        .route(&envelope(source, text), None)
+        .unwrap_or_else(|| panic!("song command should route: {source} {text}"))
+    }
+
+    #[test]
+    fn song_platform_permissions_are_independent_and_aliases_cannot_bypass() {
+        use crate::features::command_access::*;
+        let mut access = CommandAccessConfig::default();
+        for id in ["@QQ点歌", "@网易点歌", "@酷狗点歌", "@B站点歌", "@AI点歌"] {
+            let policy = catalog_policy(&access, id).unwrap();
+            assert!(policy.enabled, "{id}");
+            assert_eq!(policy.minimum_role, CommandPermission::User, "{id}");
+        }
+        access.overrides.insert(
+            "@网易点歌".into(),
+            CommandPolicy {
+                enabled: true,
+                minimum_role: CommandPermission::Admin,
+            },
+        );
+        access.overrides.insert(
+            "@AI点歌".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        for source in ["blue", "pink"] {
+            for text in ["@网易点歌晴天", "@网易云点歌晴天"] {
+                let routed = song_policy_route(&access, source, text);
+                assert_eq!(resolve_for_routed(&access, &routed).0, "@网易点歌");
+                assert_eq!(routed.permission_required, Some(IdentityRole::Admin));
+                assert_eq!(routed.message_type, source);
+            }
+            for text in ["@点歌晴天", "@QQ点歌晴天", "@酷狗点歌晴天"] {
+                assert!(
+                    song_policy_route(&access, source, text)
+                        .permission_required
+                        .is_none(),
+                    "{source} {text}"
+                );
+            }
+            for text in ["@AI点歌晴天", "@ai点歌晴天"] {
+                let routed = song_policy_route(&access, source, text);
+                assert_eq!(resolve_for_routed(&access, &routed).0, "@AI点歌");
+                assert!(routed.permission_required.is_some());
+            }
+        }
+        access.overrides.insert(
+            "@QQ点歌".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        for text in ["@点歌晴天", "@QQ点歌晴天"] {
+            assert!(
+                song_policy_route(&access, "blue", text)
+                    .permission_required
+                    .is_some()
+            );
+        }
+        assert!(
+            song_policy_route(&access, "blue", "@酷狗点歌晴天")
+                .permission_required
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn friend_bv_alias_uses_bilibili_policy_even_with_another_default_source() {
+        use crate::features::command_access::*;
+        use crate::features::song_request::SongSource;
+        let mut access = CommandAccessConfig::default();
+        access.default_song_source = Some("netease".into());
+        access.overrides.insert(
+            "@B站点歌".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        let routed = song_policy_route(&access, "pink", "@点歌BV1xx411c7mD");
+        assert_eq!(resolve_for_routed(&access, &routed).0, "@B站点歌");
+        assert!(routed.permission_required.is_some());
+        let ModuleCommand::SongRequest(song) = routed.command else {
+            panic!("expected song");
+        };
+        assert_eq!(song.source, SongSource::Bilibili);
+        let explicit = song_policy_route(&access, "pink", "@QQ点歌BV1xx411c7mD");
+        assert_eq!(resolve_for_routed(&access, &explicit).0, "@QQ点歌");
+        assert!(explicit.permission_required.is_none());
+    }
+
+    #[test]
+    fn default_song_source_selects_its_platform_policy_not_qq_policy() {
+        use crate::features::command_access::*;
+        for (source, id) in [
+            ("qqmusic", "@QQ点歌"),
+            ("netease", "@网易点歌"),
+            ("kugou", "@酷狗点歌"),
+        ] {
+            let mut access = CommandAccessConfig::default();
+            access.default_song_source = Some(source.into());
+            access.overrides.insert(
+                id.into(),
+                CommandPolicy {
+                    enabled: true,
+                    minimum_role: CommandPermission::Owner,
+                },
+            );
+            for transport in ["blue", "pink"] {
+                let routed = song_policy_route(&access, transport, "@点歌晴天");
+                assert_eq!(resolve_for_routed(&access, &routed).0, id);
+                assert_eq!(routed.permission_required, Some(IdentityRole::Owner));
+                let ModuleCommand::SongRequest(song) = routed.command else {
+                    panic!("expected song");
+                };
+                assert_eq!(song.source.as_str(), source);
+                if source != "qqmusic" {
+                    let explicit = song_policy_route(&access, transport, "@QQ点歌晴天");
+                    assert_eq!(resolve_for_routed(&access, &explicit).0, "@QQ点歌");
+                    assert!(explicit.permission_required.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_song_policy_falls_back_without_overwriting_platform_override() {
+        use crate::features::command_access::*;
+        let mut access = CommandAccessConfig::default();
+        access.overrides.insert(
+            "@点歌".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::Admin,
+            },
+        );
+        access.overrides.insert(
+            "@酷狗点歌".into(),
+            CommandPolicy {
+                enabled: true,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        access.validate().unwrap();
+        for text in [
+            "@点歌晴天",
+            "@网易云点歌晴天",
+            "@B站点歌BV1xx411c7mD",
+            "@AI点歌晴天",
+        ] {
+            assert!(
+                song_policy_route(&access, "pink", text)
+                    .permission_required
+                    .is_some(),
+                "{text}"
+            );
+        }
+        assert!(
+            song_policy_route(&access, "pink", "@酷狗点歌晴天")
+                .permission_required
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn removed_song_search_entries_do_not_route_from_any_chat_source() {
+        use crate::features::command_access::CommandAccessConfig;
+        let access = CommandAccessConfig::default();
+        let identity = IdentityAccess::default();
+        let router = ChatCommandRouter {
+            custom_workflow: None,
+            identity: Some(&identity),
+            access: Some(&access),
+        };
+        for source in ["blue", "pink"] {
+            for text in [
+                "@搜索晴天",
+                "@QQ搜索晴天",
+                "@网易搜索晴天",
+                "@网易云搜索晴天",
+                "@酷狗搜索晴天",
+                "@B站搜索晴天",
+                "@AI搜索晴天",
+                "@ai搜索晴天",
+            ] {
+                assert!(
+                    router.route(&envelope(source, text), None).is_none(),
+                    "removed search routed: {source} {text}"
+                );
+            }
+        }
     }
 
     #[test]

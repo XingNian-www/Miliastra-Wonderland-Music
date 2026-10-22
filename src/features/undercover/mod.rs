@@ -1716,6 +1716,56 @@ mod tests {
     }
 
     #[test]
+    fn reply_payload_preserves_raw_text_and_recursive_template_metadata() {
+        let vars = ReplyVars::new().with("位置列表", "A、B");
+        let reply = UndercoverReply::Composed {
+            spec: &templates::RUNOFF_ENTER,
+            vars,
+            fragments: vec![(
+                "位置列表",
+                UndercoverReply::Joined {
+                    fragments: vec![
+                        UndercoverReply::keyed(
+                            &templates::POSITION_MAPPING,
+                            &ReplyVars::new().with("位置", "A").with("昵称", "甲"),
+                        ),
+                        UndercoverReply::Raw("|{玩家内容}".to_string()),
+                    ],
+                },
+            )],
+        };
+
+        let UndercoverReply::Composed {
+            spec,
+            vars,
+            fragments,
+        } = &reply
+        else {
+            panic!("composed replies must retain their outer template");
+        };
+        assert_eq!(spec.key, templates::RUNOFF_ENTER.key);
+        assert_eq!(vars.get("位置列表"), Some("A、B"));
+        assert_eq!(fragments[0].0, "位置列表");
+        let UndercoverReply::Joined { fragments } = &fragments[0].1 else {
+            panic!("nested fragment order must remain explicit");
+        };
+        assert!(
+            matches!(&fragments[0], UndercoverReply::Keyed { spec, vars }
+            if spec.key == templates::POSITION_MAPPING.key
+                && vars.get("位置") == Some("A")
+                && vars.get("昵称") == Some("甲"))
+        );
+        assert_eq!(
+            fragments[1],
+            UndercoverReply::Raw("|{玩家内容}".to_string())
+        );
+        assert_eq!(
+            reply.render_default(),
+            "A=甲|{玩家内容}最高票并列，进入并列加赛，请并列玩家在公屏发送 #内容"
+        );
+    }
+
+    #[test]
     fn position_mapping_preserves_order_pipe_separators_and_keyed_entries() {
         let players = ['A', 'B', 'C', 'D']
             .into_iter()

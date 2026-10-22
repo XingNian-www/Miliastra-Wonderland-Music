@@ -228,6 +228,14 @@ pub(crate) const NO_SESSION: ReplyTemplate = ReplyTemplate {
     group: "娱乐",
 };
 
+/// #状态 在没有进行中的对局时回复。
+pub(crate) const STATUS_NO_SESSION: ReplyTemplate = ReplyTemplate {
+    key: "turtle_soup.status.no_session",
+    default: "当前没有进行中的海龟汤",
+    summary: "#状态：没有进行中的对局",
+    group: "娱乐",
+};
+
 /// #状态 的正常回复。
 pub(crate) const STATUS: ReplyTemplate = ReplyTemplate {
     key: "turtle_soup.status",
@@ -241,6 +249,14 @@ pub(crate) const END_HALL_DENIED: ReplyTemplate = ReplyTemplate {
     key: "turtle_soup.end.hall_denied",
     default: "只有好友私聊或Web控制台可以主动结束海龟汤",
     summary: "公屏 #结束 被拒的提示",
+    group: "娱乐",
+};
+
+/// 好友 #结束 在没有进行中的对局时回复。
+pub(crate) const END_NO_SESSION: ReplyTemplate = ReplyTemplate {
+    key: "turtle_soup.end.no_session",
+    default: "当前没有进行中的海龟汤",
+    summary: "好友 #结束：没有进行中的对局",
     group: "娱乐",
 };
 
@@ -387,6 +403,8 @@ pub(crate) const TURTLE_SOUP: &[ReplyTemplate] = &[
     QUESTION_WORKER_UNAVAILABLE,
     DISABLED,
     NO_SESSION,
+    STATUS_NO_SESSION,
+    END_NO_SESSION,
     STATUS,
     END_HALL_DENIED,
     END_FAILED,

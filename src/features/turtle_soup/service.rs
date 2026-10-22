@@ -1066,7 +1066,7 @@ impl TurtleSoupService {
             Ok(false) => TurtleSoupCommandOutcome {
                 action: "no-session",
                 immediate_reply: Some(TurtleSoupReplyText::keyed(
-                    &templates::NO_SESSION,
+                    &templates::END_NO_SESSION,
                     ReplyVars::new(),
                 )),
             },
@@ -1701,7 +1701,7 @@ impl TurtleSoupService {
         }
         let state = &self.state;
         let Some(session) = state.session.as_ref() else {
-            return TurtleSoupReplyText::keyed(&templates::NO_SESSION, ReplyVars::new());
+            return TurtleSoupReplyText::keyed(&templates::STATUS_NO_SESSION, ReplyVars::new());
         };
         let started = session.active_at.unwrap_or(session.selected_at);
         TurtleSoupReplyText::keyed(

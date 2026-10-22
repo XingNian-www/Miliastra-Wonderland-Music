@@ -239,6 +239,15 @@ pub(crate) trait IdiomChainDeferredPort {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IdiomExplanationMessage {
+    Template {
+        spec: &'static ReplyTemplate,
+        vars: ReplyVars,
+    },
+    Raw(String),
+}
+
 pub(crate) trait IdiomChainExplanationPort {
     fn explain(
         &mut self,
@@ -247,6 +256,22 @@ pub(crate) trait IdiomChainExplanationPort {
         observed_at: Instant,
     ) -> Result<IdiomChainOutcome>;
     fn send_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()>;
+    fn send_explanation_batch(
+        &mut self,
+        messages: &[IdiomExplanationMessage],
+        delay_ms: u64,
+    ) -> Result<()> {
+        let rendered = messages
+            .iter()
+            .map(|message| match message {
+                IdiomExplanationMessage::Template { spec, vars } => {
+                    super::reply_template::render(spec, None, vars).text
+                }
+                IdiomExplanationMessage::Raw(text) => text.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.send_batch(&rendered, delay_ms)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -299,15 +324,26 @@ impl IdiomChainApplication {
         port: &mut P,
     ) -> Result<()> {
         let outcome = port.explain(player, command, observed_at)?;
-        let mut messages = vec![outcome.reply];
+        let mut messages = vec![match outcome.reply_template {
+            Some(template) => IdiomExplanationMessage::Template {
+                spec: template.spec,
+                vars: template.vars,
+            },
+            None => IdiomExplanationMessage::Raw(outcome.reply),
+        }];
         if let Some(explanation) = outcome.explanation {
-            messages.extend(split_numbered_chat_message("来源", &explanation.source));
-            messages.extend(split_numbered_chat_message(
-                "解释",
-                &explanation.explanation,
-            ));
+            messages.extend(
+                split_numbered_chat_message("来源", &explanation.source)
+                    .into_iter()
+                    .map(IdiomExplanationMessage::Raw),
+            );
+            messages.extend(
+                split_numbered_chat_message("解释", &explanation.explanation)
+                    .into_iter()
+                    .map(IdiomExplanationMessage::Raw),
+            );
         }
-        port.send_batch(&messages, self.batch_delay_ms)
+        port.send_explanation_batch(&messages, self.batch_delay_ms)
     }
 }
 
@@ -1111,6 +1147,7 @@ mod tests {
 
     struct ExplanationPort {
         batches: Vec<Vec<String>>,
+        keyed_batches: Vec<Vec<IdiomExplanationMessage>>,
     }
 
     impl IdiomChainExplanationPort for ExplanationPort {
@@ -1128,12 +1165,34 @@ mod tests {
                     source: "故事来源".to_string(),
                     explanation: "比喻多此一举".to_string(),
                 }),
-                reply_template: None,
+                reply_template: Some(IdiomReplyTemplate {
+                    spec: &templates::EXPLANATION_TITLE,
+                    vars: ReplyVars::new().with("成语", "画蛇添足"),
+                }),
             })
         }
 
         fn send_batch(&mut self, messages: &[String], _delay_ms: u64) -> Result<()> {
             self.batches.push(messages.to_vec());
+            Ok(())
+        }
+
+        fn send_explanation_batch(
+            &mut self,
+            messages: &[IdiomExplanationMessage],
+            _delay_ms: u64,
+        ) -> Result<()> {
+            self.keyed_batches.push(messages.to_vec());
+            let rendered = messages
+                .iter()
+                .map(|message| match message {
+                    IdiomExplanationMessage::Template { spec, vars } => {
+                        super::super::reply_template::render(spec, None, vars).text
+                    }
+                    IdiomExplanationMessage::Raw(text) => text.clone(),
+                })
+                .collect();
+            self.batches.push(rendered);
             Ok(())
         }
     }
@@ -1142,6 +1201,7 @@ mod tests {
     fn explanation_application_sends_reply_source_and_explanation_as_one_batch() {
         let mut port = ExplanationPort {
             batches: Vec::new(),
+            keyed_batches: Vec::new(),
         };
 
         IdiomChainApplication::new(100)
@@ -1162,6 +1222,20 @@ mod tests {
                 "解释1/1：比喻多此一举"
             ]
         );
+        assert!(matches!(
+            &port.keyed_batches[0][0],
+            IdiomExplanationMessage::Template { spec, vars }
+                if spec.key == "idiom_chain.explanation.title"
+                    && vars.get("成语") == Some("画蛇添足")
+        ));
+        assert!(matches!(
+            &port.keyed_batches[0][1],
+            IdiomExplanationMessage::Raw(text) if text == "来源1/1：故事来源"
+        ));
+        assert!(matches!(
+            &port.keyed_batches[0][2],
+            IdiomExplanationMessage::Raw(text) if text == "解释1/1：比喻多此一举"
+        ));
     }
 
     #[test]

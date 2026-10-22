@@ -762,9 +762,11 @@ impl ApplicationRuntime {
         text: &str,
         accepts_turtle_questions: bool,
     ) -> Result<SecondaryHallMessageClassification> {
-        let router = ChatCommandRouter::with_identity(
+        let access_config = self.lifecycle.live_configs.snapshot();
+        let router = ChatCommandRouter::with_access(
             &self.business.custom_workflow,
             &self.lifecycle.live_configs.identity,
+            &access_config.command_access,
         );
         let active_entertainment = self.business.business.active_entertainment()?;
         let routed = secondary_hall_command_text(text)
@@ -830,9 +832,11 @@ impl ApplicationRuntime {
                     .unwrap_or(SECONDARY_HALL_FALLBACK_SENDER)
                     .to_string()
             };
-            let router = ChatCommandRouter::with_identity(
+            let access_config = self.lifecycle.live_configs.snapshot();
+            let router = ChatCommandRouter::with_access(
                 &self.business.custom_workflow,
                 &self.lifecycle.live_configs.identity,
+                &access_config.command_access,
             );
             if message_type == "blue" {
                 let classification =

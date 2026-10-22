@@ -1,6 +1,6 @@
 use super::*;
-use crate::observation::chat::{ChatIdentity, ChatTimeline, RecognizedChatMessage};
 use crate::geometry::Rect;
+use crate::observation::chat::{ChatIdentity, ChatTimeline, RecognizedChatMessage};
 
 fn message(text: &str, y: i32) -> RecognizedChatMessage {
     RecognizedChatMessage {

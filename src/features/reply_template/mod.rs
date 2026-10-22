@@ -83,6 +83,11 @@ impl ReplyVars {
     pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.values.get(name).map(String::as_str)
     }
+
+    pub(crate) fn with_nested(mut self, nested: Vec<(&'static str, String)>) -> Self {
+        self.values.extend(nested);
+        self
+    }
 }
 
 /// 渲染结果。
@@ -144,7 +149,6 @@ pub(crate) fn render(
         missing,
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // 模板目录
@@ -242,7 +246,6 @@ pub(crate) const REPLY_SONG: [ReplyTemplate; 1] = [ReplyTemplate {
     summary: "歌单权限不足时的提示",
     group: "点歌",
 }];
-
 
 /// 全部模板的可枚举清单。
 ///

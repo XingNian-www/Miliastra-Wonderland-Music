@@ -293,7 +293,10 @@ pub(super) fn classify(ranks: &[Rank]) -> Option<PlayPattern> {
     classify_airplane(&counts, len)
 }
 
-pub(super) fn classify_for_variant(ranks: &[Rank], variant: CardGameVariant) -> Option<PlayPattern> {
+pub(super) fn classify_for_variant(
+    ranks: &[Rank],
+    variant: CardGameVariant,
+) -> Option<PlayPattern> {
     if variant == CardGameVariant::HunanRunFast {
         let counts = rank_counts(ranks);
         if ranks.len() == 4 && counts.values().all(|count| *count == 2) && consecutive(&counts, 2) {
@@ -306,7 +309,10 @@ pub(super) fn classify_for_variant(ranks: &[Rank], variant: CardGameVariant) -> 
     classify(ranks)
 }
 
-pub(super) fn lowest_beating_play(hand: &[Card], previous: &PlayPattern) -> Option<(Vec<Card>, PlayPattern)> {
+pub(super) fn lowest_beating_play(
+    hand: &[Card],
+    previous: &PlayPattern,
+) -> Option<(Vec<Card>, PlayPattern)> {
     lowest_beating_play_for_variant(hand, previous, CardGameVariant::Landlord)
 }
 

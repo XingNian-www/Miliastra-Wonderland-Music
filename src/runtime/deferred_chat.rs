@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 
 use crate::features::turtle_soup::{
     TurtleSoupDelivery, TurtleSoupDeliveryIntent, TurtleSoupDeliveryOutcome,
-    TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose,
+    TurtleSoupDeliveryPort, TurtleSoupDeliveryPurpose, TurtleSoupReplyText,
 };
 
 pub(crate) const DEFAULT_CAPACITY: usize = 32;
@@ -33,7 +33,8 @@ pub(crate) struct DeferredChatMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeferredChatBatch {
-    messages: VecDeque<String>,
+    messages: Vec<TurtleSoupReplyText>,
+    rendered: bool,
     pub(crate) target: DeferredChatTarget,
     pub(crate) turtle_soup: TurtleSoupDelivery,
     max_attempts: u8,
@@ -49,7 +50,7 @@ pub(crate) enum BatchFailureOutcome {
 
 impl DeferredChatBatch {
     fn new(
-        messages: Vec<String>,
+        messages: Vec<TurtleSoupReplyText>,
         target: DeferredChatTarget,
         turtle_soup: TurtleSoupDelivery,
         max_attempts: u8,
@@ -60,6 +61,7 @@ impl DeferredChatBatch {
         }
         Ok(Self {
             messages: messages.into(),
+            rendered: false,
             target,
             turtle_soup,
             max_attempts: max_attempts.max(1),
@@ -68,8 +70,21 @@ impl DeferredChatBatch {
         })
     }
 
-    pub(crate) fn remaining_texts(&self) -> Vec<&str> {
-        self.messages.iter().map(String::as_str).collect()
+    pub(crate) fn remaining_replies(&self) -> impl Iterator<Item = &TurtleSoupReplyText> {
+        self.messages.iter()
+    }
+
+    pub(crate) fn cache_rendered_rows(&mut self, messages: Vec<String>) {
+        self.messages = messages.into_iter().map(TurtleSoupReplyText::raw).collect();
+        self.rendered = true;
+    }
+
+    pub(crate) fn replace_remaining(&mut self, messages: Vec<String>) {
+        self.cache_rendered_rows(messages);
+    }
+
+    pub(crate) fn is_rendered(&self) -> bool {
+        self.rendered
     }
 
     pub(crate) fn mark_sent(&mut self, count: usize) -> Result<bool> {
@@ -366,7 +381,7 @@ mod tests {
 
     fn batch(purpose: TurtleSoupDeliveryPurpose, text: &str) -> DeferredChatBatch {
         DeferredChatBatch::new(
-            vec![text.to_string()],
+            vec![TurtleSoupReplyText::raw(text)],
             DeferredChatTarget::CurrentHall,
             TurtleSoupDelivery {
                 generation: 1,
@@ -490,7 +505,10 @@ mod tests {
     #[test]
     fn partial_batch_progress_resets_failure_count_only_after_confirmed_sends() {
         let mut batch = DeferredChatBatch::new(
-            vec!["first".to_string(), "second".to_string()],
+            vec![
+                TurtleSoupReplyText::raw("first"),
+                TurtleSoupReplyText::raw("second"),
+            ],
             DeferredChatTarget::CurrentHall,
             TurtleSoupDelivery {
                 generation: 1,
@@ -503,12 +521,57 @@ mod tests {
 
         assert_eq!(batch.mark_current_failed(), BatchFailureOutcome::Retry);
         assert_eq!(batch.current_attempt(), 2);
+        batch.replace_remaining(vec![
+            "first rendered row".into(),
+            "second rendered row".into(),
+            "third rendered row".into(),
+        ]);
+        assert!(batch.is_rendered());
         assert!(!batch.mark_sent(0).unwrap());
         assert_eq!(batch.current_attempt(), 2);
         assert!(!batch.mark_sent(1).unwrap());
-        assert_eq!(batch.remaining_texts(), vec!["second"]);
+        assert_eq!(batch.remaining_replies().count(), 2);
+        assert!(
+            matches!(batch.remaining_replies().next(), Some(TurtleSoupReplyText::Raw(text)) if text == "second rendered row")
+        );
+        assert_eq!(
+            batch
+                .remaining_replies()
+                .map(TurtleSoupReplyText::render_default)
+                .collect::<Vec<_>>(),
+            vec!["second rendered row", "third rendered row"]
+        );
         assert_eq!(batch.current_attempt(), 1);
-        assert!(batch.mark_sent(2).is_err());
+        assert!(batch.mark_sent(3).is_err());
+        assert!(batch.is_rendered());
+        assert!(batch.mark_sent(2).unwrap());
+    }
+
+    #[test]
+    fn cached_override_rows_survive_partial_send_and_retry_without_rerendering() {
+        let mut batch = batch(TurtleSoupDeliveryPurpose::Opening, "source");
+        batch.cache_rendered_rows(vec![
+            "汤面1/3：长覆盖第一段".into(),
+            "汤面2/3：长覆盖第二段".into(),
+            "汤面3/3：长覆盖第三段".into(),
+        ]);
+        assert!(batch.is_rendered());
+        assert!(!batch.mark_sent(1).unwrap());
+        assert_eq!(
+            batch
+                .remaining_replies()
+                .map(TurtleSoupReplyText::render_default)
+                .collect::<Vec<_>>(),
+            vec!["汤面2/3：长覆盖第二段", "汤面3/3：长覆盖第三段"]
+        );
+        assert_eq!(batch.mark_current_failed(), BatchFailureOutcome::Retry);
+        assert_eq!(
+            batch
+                .remaining_replies()
+                .map(TurtleSoupReplyText::render_default)
+                .collect::<Vec<_>>(),
+            vec!["汤面2/3：长覆盖第二段", "汤面3/3：长覆盖第三段"]
+        );
     }
 
     #[test]

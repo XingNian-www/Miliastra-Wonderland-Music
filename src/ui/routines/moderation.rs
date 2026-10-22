@@ -8,11 +8,11 @@ use super::friend_delivery::{
     before_input_failure, capture_normalized, wait_ms,
 };
 use super::state_observation::wait_for_stable_ui_kind;
+use crate::geometry::{Point, Rect};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiStateKind, UiStateObservation, UiSubmitError, sealed,
 };
-use crate::geometry::{Point, Rect};
 use crate::ui::template::{best_template_hit, template_exists};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

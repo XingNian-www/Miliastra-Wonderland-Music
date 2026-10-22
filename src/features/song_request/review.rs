@@ -238,12 +238,7 @@ impl SongReviewClient {
         }
         let target = self.ai.resolve(&self.config.model)?;
         let request = build_review_request(&self.config, &target, candidate)?;
-        let reply = call_review_http(
-            &self.openai,
-            &target,
-            request,
-            self.request_timeout,
-        )?;
+        let reply = call_review_http(&self.openai, &target, request, self.request_timeout)?;
         let json_text = model_reply_json_object(&reply)?;
         parse_review_result(&json_text)
     }
@@ -736,7 +731,9 @@ mod tests {
             message_type: "大厅".to_string(),
             username: "测试".to_string(),
         };
-        let target = test_ai_config().resolve(&config.model).expect("resolved target");
+        let target = test_ai_config()
+            .resolve(&config.model)
+            .expect("resolved target");
         let request =
             build_review_request(&config, &target, &candidate).expect("responses request");
         let body = serde_json::to_value(request).expect("request json");
@@ -772,7 +769,9 @@ mod tests {
             message_type: "大厅".to_string(),
             username: "测试者".to_string(),
         };
-        let target = test_ai_config().resolve(&config.model).expect("resolved target");
+        let target = test_ai_config()
+            .resolve(&config.model)
+            .expect("resolved target");
         let request =
             build_review_request(&config, &target, &candidate).expect("responses request");
         let body = serde_json::to_value(request).expect("request json");

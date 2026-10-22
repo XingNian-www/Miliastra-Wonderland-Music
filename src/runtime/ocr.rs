@@ -520,8 +520,8 @@ mod tests {
     use image::DynamicImage;
 
     use super::*;
-    use crate::runtime::ocr::OcrLine;
     use crate::geometry::Rect;
+    use crate::runtime::ocr::OcrLine;
 
     struct FixedOcrDevice;
 

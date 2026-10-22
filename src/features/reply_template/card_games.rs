@@ -23,11 +23,8 @@ const fn spec(key: &'static str, default: &'static str, summary: &'static str) -
 }
 
 /// 牌类玩法未启用。
-pub(crate) const DISABLED: ReplyTemplate = spec(
-    "card_games.disabled",
-    "{玩法}未启用",
-    "玩法未启用",
-);
+pub(crate) const DISABLED: ReplyTemplate =
+    spec("card_games.disabled", "{玩法}未启用", "玩法未启用");
 
 /// 已有牌局或房间进行中。
 pub(crate) const ALREADY_ACTIVE: ReplyTemplate = spec(
@@ -207,11 +204,8 @@ pub(crate) const NO_ACTIVE_GAME: ReplyTemplate = spec(
 );
 
 /// 不在本局（带玩法名）。
-pub(crate) const NOT_IN_GAME: ReplyTemplate = spec(
-    "card_games.game.not_in",
-    "你不在本局{玩法}中",
-    "不在本局中",
-);
+pub(crate) const NOT_IN_GAME: ReplyTemplate =
+    spec("card_games.game.not_in", "你不在本局{玩法}中", "不在本局中");
 
 /// 还没轮到这位玩家。
 pub(crate) const WRONG_TURN: ReplyTemplate = spec(
@@ -221,11 +215,8 @@ pub(crate) const WRONG_TURN: ReplyTemplate = spec(
 );
 
 /// 没有输入要出的牌。
-pub(crate) const PLAY_EMPTY: ReplyTemplate = spec(
-    "card_games.play.empty",
-    "请输入要出的牌",
-    "未输入要出的牌",
-);
+pub(crate) const PLAY_EMPTY: ReplyTemplate =
+    spec("card_games.play.empty", "请输入要出的牌", "未输入要出的牌");
 
 /// 跑得快首手不含黑桃3。
 pub(crate) const SPADE_THREE_REQUIRED: ReplyTemplate = spec(
@@ -375,11 +366,8 @@ pub(crate) const PLAY_RUN_FAST: ReplyTemplate = spec(
 );
 
 /// 斗地主出牌动作：手动。
-pub(crate) const LANDLORD_ACTION_PLAY: ReplyTemplate = spec(
-    "card_games.action.play",
-    "出牌",
-    "斗地主手动出牌的动作词",
-);
+pub(crate) const LANDLORD_ACTION_PLAY: ReplyTemplate =
+    spec("card_games.action.play", "出牌", "斗地主手动出牌的动作词");
 
 /// 斗地主出牌动作：超时自动出。
 pub(crate) const LANDLORD_ACTION_TIMEOUT: ReplyTemplate = spec(
@@ -445,11 +433,8 @@ pub(crate) const PASS_NEW_TRICK: ReplyTemplate = spec(
 );
 
 /// 斗地主过牌，下一家继续。
-pub(crate) const PASS_NEXT: ReplyTemplate = spec(
-    "card_games.pass.next",
-    "{玩家}过牌，轮到{下一位}",
-    "过牌",
-);
+pub(crate) const PASS_NEXT: ReplyTemplate =
+    spec("card_games.pass.next", "{玩家}过牌，轮到{下一位}", "过牌");
 
 /// 出牌文本里有无法识别的牌面。
 pub(crate) const PARSE_UNKNOWN_CARD: ReplyTemplate = spec(
@@ -535,7 +520,7 @@ pub(crate) const CARD_GAMES: &[ReplyTemplate] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::reply_template::{catalog, render, ReplyVars};
+    use crate::features::reply_template::{ReplyVars, catalog, render};
     use std::collections::BTreeSet;
 
     fn text(spec: &ReplyTemplate, vars: ReplyVars) -> String {
@@ -581,7 +566,10 @@ mod tests {
             "当前没有等待加入的牌局房间"
         );
         assert_eq!(
-            text(&LOBBY_ALREADY_JOINED, ReplyVars::new().with("玩法", "跑得快")),
+            text(
+                &LOBBY_ALREADY_JOINED,
+                ReplyVars::new().with("玩法", "跑得快")
+            ),
             "你已经加入本局跑得快"
         );
         assert_eq!(
@@ -733,7 +721,9 @@ mod tests {
         assert_eq!(
             text(
                 &CANNOT_BEAT,
-                ReplyVars::new().with("牌型", "单张").with("上一手牌型", "对子")
+                ReplyVars::new()
+                    .with("牌型", "单张")
+                    .with("上一手牌型", "对子")
             ),
             "单张压不过上一手对子"
         );
@@ -773,7 +763,9 @@ mod tests {
         assert_eq!(
             text(
                 &STATUS_BIDDING,
-                ReplyVars::new().with("玩家", "甲").with("当前抢地主", "暂无")
+                ReplyVars::new()
+                    .with("玩家", "甲")
+                    .with("当前抢地主", "暂无")
             ),
             "斗地主抢地主中；轮到:甲；当前抢地主:暂无"
         );
@@ -876,7 +868,10 @@ mod tests {
             "超时并进入托管，自动出"
         );
         assert_eq!(
-            text(&LANDLORD_ACTION_TIMEOUT, ReplyVars::new().with("托管后缀", "")),
+            text(
+                &LANDLORD_ACTION_TIMEOUT,
+                ReplyVars::new().with("托管后缀", "")
+            ),
             "超时，自动出"
         );
         assert_eq!(

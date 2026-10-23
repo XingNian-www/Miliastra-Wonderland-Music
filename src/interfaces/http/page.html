@@ -439,6 +439,9 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .command-reply-nav button{text-align:left;justify-content:flex-start}
 .command-reply-nav button.active{border-color:var(--accent);color:var(--accent)}
 .command-groups{display:grid;grid-template-columns:1fr;gap:var(--sp-3);align-items:start;min-width:0}
+.model-picker{display:flex;gap:var(--sp-2);align-items:center;flex-wrap:wrap}
+.model-picker input{flex:1;min-width:180px}
+.model-picker select{min-width:150px}
 .command-reply-editor{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto;background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-3);min-width:0}
 .command-reply-editor h3{margin:0 0 var(--sp-2);font-size:var(--fs-title)}
 .command-reply-list{display:grid;gap:var(--sp-2)}
@@ -1368,6 +1371,33 @@ async function saveAiChatSettings(){
   }catch(error){showAiChatMessage('保存失败：'+error.message,'err')}
 }
 
+/* ===== AI 模型列表 ===== */
+let modelChoices=[]
+let modelLoading=false
+function loadAiModels(){
+  if(modelLoading)return
+  modelLoading=true;renderConfigPage()
+  request('/ai/models').then(data=>{
+    const models=Array.isArray(data&&data.models)?data.models:[]
+    if(!models.length)throw new Error('服务端未返回模型')
+    modelChoices=models
+    showConfigMessage('已获取 '+models.length+' 个模型','ok')
+  }).catch(error=>{
+    // 拉取失败不影响手填：清空列表并说明原因。
+    modelChoices=[]
+    showConfigMessage('获取模型列表失败：'+error.message+'（仍可手动填写模型名）','err')
+  }).finally(()=>{modelLoading=false;renderConfigPage()})
+}
+document.addEventListener('change',event=>{
+  const pick=event.target.closest('[data-model-pick]');if(!pick)return
+  const name=pick.value;if(!name)return
+  const path=pick.dataset.modelPick
+  const input=document.querySelector('[data-cfg="'+CSS.escape(path)+'"]')
+  if(!input)return
+  input.value=name
+  input.dispatchEvent(new Event('input',{bubbles:true}))
+  markConfigDirty(String(path).split('.')[0])
+})
 function initialRoute(){
   const hash=location.hash.slice(1)
   if(pageRoutes.includes(hash))return hash
@@ -3468,6 +3498,21 @@ function configControlHtml(field,value){
   }
   if(kind==='string'||kind==='path'){
     return '<input id="'+id+'" type="text" data-cfg="'+path+'" value="'+(value==null?'':esc(String(value)))+'" placeholder="'+(field.nullable?'留空表示 null':'')+'"'+disabledAttr+parentAttr+'>'
+  }
+  if(kind==='modelName'){
+    // 模型名既可手填也可从服务端列表选：网关差异大、列表也可能拉取失败，
+    // 所以列表只是辅助，输入框始终可用。
+    const text=value==null?'':String(value)
+    const models=Array.isArray(modelChoices)?modelChoices:[]
+    const options=models.map(name=>'<option value="'+esc(name)+'"'+(text===name?' selected':'')+'>'+esc(name)+'</option>').join('')
+    const listDisabled=models.length?'':' disabled'
+    return '<div class="model-picker">'+
+      '<input id="'+id+'" type="text" data-cfg="'+path+'" value="'+esc(text)+'" placeholder="留空沿用默认模型"'+disabledAttr+parentAttr+'>'+
+      '<select data-model-pick="'+esc(path)+'"'+listDisabled+disabledAttr+'>'+
+        '<option value="">'+(models.length?'从列表选择…':'（尚未获取模型列表）')+'</option>'+options+
+      '</select>'+
+      '<button type="button" class="btn small ghost" onclick="loadAiModels()"'+disabledAttr+'>'+(modelLoading?'获取中…':'获取模型列表')+'</button>'+
+      '</div>'
   }
   if(kind==='enum'){
     const values=Array.isArray(field.kind.values)?field.kind.values:[]

@@ -615,6 +615,13 @@ const ROUTES: &[RouteSpec] = &[
         handler: ai_pick_route,
     },
     RouteSpec {
+        path: "/ai/models",
+        json: true,
+        // 只读：拉取服务端模型列表，不改配置。
+        mutating: false,
+        handler: ai_models_route,
+    },
+    RouteSpec {
         path: "/ai/search",
         json: true,
         mutating: true,

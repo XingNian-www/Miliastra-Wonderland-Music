@@ -172,6 +172,13 @@ button,input,select,textarea{font:inherit}
 .sparkline{flex:none;background:var(--fill-1);border-radius:var(--radius-s)}
 #monitorLogs{min-height:240px;max-height:420px}
 #monitorCommands{max-height:150px}
+.config-subgroup-title{margin:var(--sp-3) 0 var(--sp-1);padding-bottom:var(--sp-1);border-bottom:1px dashed var(--sep-2);font-weight:600;font-size:var(--fs-small);opacity:.85}
+.config-domain{border-bottom:1px solid var(--sep-2)}
+.config-domain-head{display:flex;justify-content:space-between;align-items:center;width:100%;background:none;border:0;padding:var(--sp-2);cursor:pointer;font:inherit;color:inherit;font-weight:600;text-align:left}
+.config-domain-head:hover{background:var(--bg-hover)}
+.config-domain-count{font-weight:400;opacity:.7;font-size:var(--fs-small)}
+.config-domain-body{display:none;padding-left:var(--sp-2)}
+.config-domain.open .config-domain-body{display:block}
 #visualProfileForm fieldset{border:1px solid var(--sep-1);border-radius:var(--radius-m);margin:var(--sp-3) 0;padding:var(--sp-3);min-width:0}
 #visualProfileForm fieldset fieldset{display:inline-block;vertical-align:top;max-width:100%}
 #visualProfileForm label{display:inline-flex;flex-direction:column;gap:var(--sp-1);margin:var(--sp-1);max-width:100%}
@@ -2549,6 +2556,12 @@ function commandReplyVars(id){
   const allowed=Array.isArray(entry?.allowedVariables)?new Set(entry.allowedVariables.map(v=>typeof v==='string'?v:v.name)):null
   return (commandReplyCatalog?.variables||[]).map(v=>typeof v==='string'?v:v.name).filter(name=>name&&(!allowed||allowed.has(name)))
 }
+function commandReplyVarExample(name){
+  const list=Array.isArray(commandReplyCatalog?.variables)?commandReplyCatalog.variables:[]
+  const hit=list.find(item=>typeof item==='object'&&String(item.name)===String(name))
+  // 没有示例时退回变量名，至少不让按钮空着。
+  return hit&&hit.example?String(hit.example):String(name)
+}
 function renderCommandReplyNav(){
   const nav=$('commandReplyNav');if(!nav)return
   if(!commandReplyCatalog){nav.innerHTML='<div class="command-empty">回复目录加载中</div>';return}
@@ -2572,10 +2585,14 @@ function renderCommandReplyEditor(){
   const rows=entry?commandReplyList(entry.id):[],vars=entry?commandReplyVars(entry.id):[],dirty=entry&&commandReplyDraft.has(String(entry.id)),batch=entry?.orderedBatch===true,locked=entry?.editable===false||commandReplySaving||commandPolicySaving
   const html=rows.map((row,index)=>{
     const disabled=locked||row.editable===false||row.active===false?' disabled':''
-    const variableButtons=vars.map(name=>'<button type="button" class="btn small ghost" data-reply-var="'+commandEscape(name)+'" title="插入 {'+commandEscape(name)+'}">{'+commandEscape(name)+'}</button>').join('')
+    const variableButtons=vars.map(name=>{
+      const example=commandReplyVarExample(name)
+      // 按钮显示"这个变量长什么样"（示例值），title 才解释它会插入什么。
+      return '<button type="button" class="btn small ghost" data-reply-var="'+commandEscape(name)+'" title="插入 '+commandEscape('{'+name+'}')+'（如 '+commandEscape(example)+'）">'+commandEscape(example)+'</button>'
+    }).join('')
     const tools=(batch?(row.active===false?'<button type="button" class="btn small" data-reply-activate data-index="'+index+'"'+(locked?' disabled':'')+'>启用</button>':(row.defaultText===null?'<button type="button" class="btn small ghost" data-reply-delete data-index="'+index+'"'+(locked?' disabled':'')+'>删除</button>':'<button type="button" class="btn small ghost" data-reply-deactivate data-index="'+index+'"'+(locked?' disabled':'')+'>停用</button>')):(row.active===false?'<button type="button" class="btn small" data-reply-activate data-index="'+index+'"'+(locked?' disabled':'')+'>启用</button>':'<button type="button" class="btn small ghost" data-reply-deactivate data-index="'+index+'"'+(locked?' disabled':'')+'>停用</button>'))
     const order=batch?'<button type="button" class="btn small ghost" data-reply-up data-index="'+index+'"'+(locked||index===0?' disabled':'')+'>上移</button><button type="button" class="btn small ghost" data-reply-down data-index="'+index+'"'+(locked||index===rows.length-1?' disabled':'')+'>下移</button>':''
-    return '<article class="command-reply-row'+(row.active===false?' inactive':'')+'" data-reply-row-index="'+index+'"><div class="row wrap"><strong>'+commandEscape(row.label||row.key||'自定义回复')+'</strong><code class="command-reply-key">'+commandEscape(row.key||'自定义')+'</code>'+(row.active===false?'<span class="field-state warn">已静音</span>':'')+'</div>'+(row.defaultText!=null?'<div class="config-field-hint">内置默认：'+commandEscape(row.defaultText)+'</div>':'')+'<textarea data-reply-text data-reply-index="'+index+'" maxlength="'+commandReplyMaxChars()+'" placeholder="留空则使用内置默认文案" aria-label="回复文案 '+commandEscape(row.key||index+1)+'"'+disabled+'>'+commandEscape(row.text||'')+'</textarea>'+'<div class="command-reply-tools">'+order+tools+'</div>'+((row.editable!==false&&vars.length)?'<div class="command-reply-vars" aria-label="插入变量">'+variableButtons+'</div>':'')+'</article>'
+    return '<article class="command-reply-row'+(row.active===false?' inactive':'')+'" data-reply-row-index="'+index+'"><div class="row wrap"><strong>'+commandEscape(row.label||row.key||'自定义回复')+'</strong><code class="command-reply-key">'+commandEscape(row.key||'自定义')+'</code>'+(row.active===false?'<span class="field-state warn">已静音</span>':'')+'</div>'+(row.defaultText!=null?'<div class="config-field-hint">内置默认：'+commandEscape(row.defaultText)+'</div>':'')+'<textarea data-reply-text data-reply-index="'+index+'" maxlength="'+commandReplyMaxChars()+'" placeholder="留空则使用内置默认；换行即分条发送" aria-label="回复文案 '+commandEscape(row.key||index+1)+'"'+disabled+'>'+commandEscape(row.text||'')+'</textarea>'+'<div class="command-reply-tools">'+order+tools+'</div>'+((row.editable!==false&&vars.length)?'<div class="command-reply-vars" aria-label="插入变量">'+variableButtons+'</div>':'')+'</article>'
   }).join('')
   const policyHtml=policyItem?'<h3>'+commandEscape(policyItem.name||policyItem.id)+' 设置</h3>'+commandPolicyHtml(policyItem):''
   const replyHtml=entry?'<h3>'+commandEscape(entry.name||entry.id)+' 回复</h3><p class="config-field-hint">'+(entry.orderedBatch===true?'按序批量发送':'业务仅发送实际触发的结果分支')+'</p>'+(entry.editable===false?'<p class="config-field-hint">此命令的回复不可编辑。</p>':'')+'<div class="command-reply-list">'+(html||'<div class="command-reply-empty">当前无回复；把文案留空表示使用内置默认，点“静音此命令”才会停止回复。</div>')+'</div>'+(entry.editable===false?'':'<div class="row wrap">'+(entry.orderedBatch===true?'<button type="button" class="btn small" onclick="addCommandReply()">添加回复</button>':'')+'<button type="button" class="btn small" onclick="restoreCommandReplyDefaults()">恢复内置回复</button><button type="button" class="btn small warn" onclick="muteCommandReplies()">静音此命令</button></div>'):'<h3>'+commandEscape(policyItem.name||policyItem.id)+'</h3><p class="config-field-hint">此命令暂无可编辑回复。</p>'
@@ -3409,15 +3426,46 @@ function renderConfigStatus(){
     hint.textContent='有未保存的修改（'+configDirty.size+' 段）'
   }
 }
+// 配置域的固定顺序：与后端 Domain::ALL 一致，按"用户找东西的习惯"排。
+const configDomainOrder=['recognition','playback','entertainment','interaction','system']
+const configDomainLabels={recognition:'识别与画面',playback:'播放与点歌',entertainment:'娱乐玩法',interaction:'AI 与交互',system:'系统'}
 function renderConfigSectionList(){
   const el=$('configSectionList')
   if(!el)return
-  el.innerHTML=(configSchema||[]).map(section=>{
-    if(!configSectionHasMatch(section))return ''
-    const dirty=configDirty.has(section.name)
-    const active=section.name===configActiveSection?' active':''
-    return '<button type="button" class="config-section-item'+active+'" onclick="selectConfigSection('+esc(JSON.stringify(section.name))+')"><span>'+esc(section.label)+'</span><span class="section-name">'+esc(section.name)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
-  }).join('')||'<div class="config-field-hint" style="padding:var(--sp-2)">没有匹配的配置段</div>'
+  const visible=(configSchema||[]).filter(section=>configSectionHasMatch(section))
+  if(!visible.length){el.innerHTML='<div class="config-field-hint" style="padding:var(--sp-2)">没有匹配的配置段</div>';return}
+  // 按域分组：33 个段平铺时用户无法凭直觉定位，分组后先选域再选段。
+  const groups=new Map()
+  for(const section of visible){
+    const domain=String(section.domain||'system')
+    if(!groups.has(domain))groups.set(domain,[])
+    groups.get(domain).push(section)
+  }
+  const ordered=[...groups.keys()].sort((a,b)=>{
+    const ai=configDomainOrder.indexOf(a), bi=configDomainOrder.indexOf(b)
+    return (ai<0?99:ai)-(bi<0?99:bi)
+  })
+  el.innerHTML=ordered.map(domain=>{
+    const sections=groups.get(domain)
+    // 当前段所属的域默认展开，其余域收起，避免一次铺满 33 项。
+    const expanded=configDomainOpen.has(domain)||sections.some(s=>s.name===configActiveSection)
+    const items=sections.map(section=>{
+      const dirty=configDirty.has(section.name)
+      const active=section.name===configActiveSection?' active':''
+      return '<button type="button" class="config-section-item'+active+'" onclick="selectConfigSection('+esc(JSON.stringify(section.name))+')"><span>'+esc(section.label)+'</span><span class="section-name">'+esc(section.name)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
+    }).join('')
+    const label=esc(configDomainLabels[domain]||domain)
+    return '<div class="config-domain'+(expanded?' open':'')+'">'+
+      '<button type="button" class="config-domain-head" aria-expanded="'+(expanded?'true':'false')+'" onclick="toggleConfigDomain('+esc(JSON.stringify(domain))+')">'+
+        '<span>'+label+'</span><span class="config-domain-count">'+sections.length+'</span></button>'+
+      '<div class="config-domain-body">'+items+'</div></div>'
+  }).join('')
+}
+let configDomainOpen=new Set()
+function toggleConfigDomain(domain){
+  if(configDomainOpen.has(domain))configDomainOpen.delete(domain)
+  else configDomainOpen.add(domain)
+  renderConfigSectionList()
 }
 function syncConfigFormToData(){
   if(!configActiveSection||!configData||!configDirty.has(configActiveSection))return true
@@ -3572,11 +3620,18 @@ function renderConfigForm(){
   const hidesVisual=configSectionHidesVisual(section)
   const hiddenVisual=hidesVisual?section.fields.filter(f=>f.source!=='bootstrap'&&f.managedBy==='visual').length:0
   if(hiddenVisual)parts.push('<div class="config-message">本段有 '+hiddenVisual+' 个模板/区域/分辨率字段已并入上方“视觉档案”；点工具栏“显示档案字段”可临时展开原表单，保存仍会保留这些值。</div>')
+  // 大段（timing/ocr/startup 等）按后端给的 group 分子节，避免 30+ 字段平铺。
+  let lastGroup=null
   for(const field of section.fields){
     const id=configControlId(field.path)
     const value=configValueAt(section.name,field.path)
     const bootstrap=field.source==='bootstrap'
     const hiddenBySearch=!configFieldMatches(field)||(hidesVisual&&field.managedBy==='visual')
+    // 只在可见字段之间插入小节标题；被搜索隐藏的字段不应留下空标题。
+    if(!hiddenBySearch&&field.group&&field.group!==lastGroup){
+      lastGroup=field.group
+      parts.push('<div class="config-subgroup-title">'+esc(field.group)+'</div>')
+    }
     // 点歌 AI 二段式：第一步选服务商，第二步按服务商填参数。
     if(isAi&&field.path==='ai.provider')parts.push('<div class="config-step-title">第一步：选择服务商</div>')
     if(isAi&&field.path==='ai.api_key')parts.push('<div class="config-step-title">第二步：服务商参数</div><div class="config-field-hint ai-provider-info" id="aiProviderInfo"></div>')

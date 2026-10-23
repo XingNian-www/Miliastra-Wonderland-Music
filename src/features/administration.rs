@@ -53,14 +53,19 @@ pub(crate) trait AdministrationApplicationPort: AdministrationImmediatePort {
     ) -> Result<()> {
         self.send_hall(&reply_template::render(spec, None, vars).text)
     }
+    /// 按顺序发送一条帮助回复。
+    ///
+    /// 帮助文案是单条模板、多行内容：一行发一条消息由发送路径负责拆条，
+    /// 因此这里不再接收模板数组。
     fn send_command_reply_batch(
         &mut self,
         _command_id: &str,
-        templates: &[reply_template::ReplyTemplate],
+        template: &reply_template::ReplyTemplate,
         vars: &ReplyVars,
         delay_ms: u64,
     ) -> Result<()> {
-        let lines = help_lines(self, templates, vars);
+        let rendered = self.render_template(template, vars);
+        let lines = crate::text::split_configured_lines(&rendered);
         let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
         self.send_hall_batch(&borrowed, delay_ms)
     }
@@ -209,16 +214,6 @@ impl AdministrationApplication {
 ///
 /// 目前帮助行没有业务变量，占位符解析仍走同一条路径，
 /// 这样后续给帮助加变量（如版本号、当前音源）时不需要再改这里。
-fn help_lines<P: AdministrationApplicationPort + ?Sized>(
-    port: &mut P,
-    specs: &[reply_template::ReplyTemplate],
-    vars: &ReplyVars,
-) -> Vec<String> {
-    specs
-        .iter()
-        .map(|spec| port.render_template(spec, vars))
-        .collect()
-}
 
 /// 大厅命令开关的回执模板。
 ///
@@ -643,14 +638,11 @@ mod tests {
             .execute(&context, &AdministrationCommand::Help, &mut port)
             .expect("help command");
 
-        // 每条帮助行都必须来自 port 渲染，而不是内置字面量。
-        assert_eq!(port.rendered_keys.len(), 3, "3 条帮助都应经 port 渲染");
-        assert!(
-            port.rendered_keys
-                .iter()
-                .all(|key| key.starts_with("help.song_request.")),
-            "应逐条按 help.* 键渲染，实际: {:?}",
-            port.rendered_keys
+        // 帮助是单条模板：必须经 port 渲染过一次，才能让用户覆盖生效。
+        assert_eq!(port.rendered_keys.len(), 1, "帮助应经 port 渲染");
+        assert_eq!(
+            port.rendered_keys[0], "help.song_request",
+            "应按合并后的 help.song_request 键渲染"
         );
         assert!(
             port.batches[0].iter().all(|line| line.starts_with("覆盖:")),

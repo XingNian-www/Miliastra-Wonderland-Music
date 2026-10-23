@@ -60,6 +60,9 @@ fn kind_json(kind: &FieldKind) -> Value {
         FieldKind::Rect => json!({ "type": "rect" }),
         FieldKind::Point => json!({ "type": "point" }),
         FieldKind::Secret => json!({ "type": "secret" }),
+        // 模型名：前端渲染成"可选列表 + 手填"两用控件，
+        // 列表由 GET /ai/models 拉取，拉取失败时退回纯手填。
+        FieldKind::ModelName => json!({ "type": "modelName" }),
     }
 }
 

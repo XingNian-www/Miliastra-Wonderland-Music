@@ -74,9 +74,12 @@ impl ApplicationRuntime {
                     Vec::new()
                 };
                 let result = (|| -> Result<String> {
-                    let mut session = crate::config::ai::ToolSession::with_history(
+                    let mut session = crate::config::ai::ToolSession::with_history_options(
                         &self.business.ai_connection,
-                        &config.model,
+                        &crate::config::ai::AiCallOptions {
+                            model: config.model.clone(),
+                            reasoning: config.reasoning,
+                        },
                         &ai_chat::response_system_prompt(&config),
                         ai_chat::conversation_history(&context),
                         &prompt,
@@ -221,7 +224,10 @@ impl ApplicationRuntime {
             crate::config::ai::request_json(
                 &self.business.ai_chat_openai,
                 &self.business.ai_connection,
-                &config.model,
+                &crate::config::ai::AiCallOptions {
+                    model: config.model.clone(),
+                    reasoning: config.reasoning,
+                },
                 &config.extract_prompt,
                 &prompt,
                 256,

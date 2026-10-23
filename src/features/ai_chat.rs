@@ -86,6 +86,9 @@ pub struct AiChatConfig {
     /// 可选专用模型；留空沿用 `ai.model`。
     #[serde(default)]
     pub model: String,
+    /// 思考强度；unset 表示不显式发送。
+    #[serde(default)]
+    pub reasoning: crate::config::ai::ReasoningEffort,
     /// 单次回答允许生成的最大 token。
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
@@ -132,6 +135,7 @@ impl Default for AiChatConfig {
             cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
             allow_commands: true,
             model: String::new(),
+            reasoning: Default::default(),
             max_tokens: default_max_tokens(),
             system_prompt: default_system_prompt(),
             answer_prompt: default_answer_prompt(),

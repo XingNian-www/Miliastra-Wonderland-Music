@@ -45,6 +45,51 @@ pub(crate) fn char_width(ch: char) -> usize {
     if ch.is_ascii() { 1 } else { 2 }
 }
 
+/// 把用户配置的多行文案拆成实际要发送的消息。
+///
+/// 规则（与面板说明一致）：
+/// 1. 先按换行切分——一行就是一条消息，空行忽略。
+/// 2. 若某一行仍超过聊天宽度（MAX_CHAT_WIDTH），按显示宽度硬切，
+///    不加 "1/2：" 这类编号：用户写的就是要发的内容，编号会污染文案。
+///
+/// 不限制条数：文案由用户自己配置，条数后果也由用户自己承担。
+pub(crate) fn split_configured_lines(text: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        messages.extend(wrap_to_chat_width(line));
+    }
+    messages
+}
+
+/// 按显示宽度硬切一行，保持字符边界。
+fn wrap_to_chat_width(line: &str) -> Vec<String> {
+    if display_width(line) <= MAX_CHAT_WIDTH {
+        return vec![line.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut width = 0usize;
+    for ch in line.chars() {
+        let next = char_width(ch);
+        if width + next > MAX_CHAT_WIDTH && !chunk.is_empty() {
+            chunks.push(chunk.trim_end().to_string());
+            chunk = String::new();
+            width = 0;
+        }
+        chunk.push(ch);
+        width += next;
+    }
+    if !chunk.trim().is_empty() {
+        chunks.push(chunk.trim_end().to_string());
+    }
+    chunks.retain(|item| !item.is_empty());
+    chunks
+}
+
 /// 按聊天宽度适配一条消息：放得下就原样返回，放不下才分段编号。
 ///
 /// 这个判断必须收在一处：渲染方（组装层）和测试助手中任何一处忘记"短文本不编号"，
@@ -183,6 +228,43 @@ mod tests {
     fn comparison_text_ignores_width_case_whitespace_and_punctuation() {
         assert_eq!(normalize_comparison_text(" ＡbＣ，萌！ "), "abc萌");
         assert_eq!(normalize_comparison_text("当前 大厅"), "当前大厅");
+    }
+
+    #[test]
+    fn configured_lines_are_split_by_newline_into_separate_messages() {
+        // 用户在一条回复里写多行 = 要发多条消息。
+        let messages = split_configured_lines("已收到命令\n已暂停");
+        assert_eq!(messages, ["已收到命令", "已暂停"]);
+    }
+
+    #[test]
+    fn blank_lines_are_ignored_and_windows_newlines_are_supported() {
+        let messages = split_configured_lines("第一条\r\n\r\n\n第二条\n   \n");
+        assert_eq!(messages, ["第一条", "第二条"]);
+    }
+
+    #[test]
+    fn overlong_lines_are_wrapped_without_numbering() {
+        // 超宽行按显示宽度硬切，但不加 "1/2：" 编号：用户写的就是要发的原文。
+        let long = "字".repeat(100);
+        let messages = split_configured_lines(&long);
+        assert!(messages.len() > 1);
+        for message in &messages {
+            assert!(display_width(message) <= MAX_CHAT_WIDTH, "{message}");
+            assert!(!message.contains('/'), "拆条不应插入编号前缀");
+        }
+        assert_eq!(messages.concat(), long);
+    }
+
+    #[test]
+    fn a_single_short_line_stays_one_message() {
+        assert_eq!(split_configured_lines("已暂停"), ["已暂停"]);
+    }
+
+    #[test]
+    fn empty_text_produces_no_messages() {
+        assert!(split_configured_lines("").is_empty());
+        assert!(split_configured_lines("   \n  \n").is_empty());
     }
 
     #[test]

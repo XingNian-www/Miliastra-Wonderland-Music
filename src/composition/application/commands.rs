@@ -459,11 +459,7 @@ impl ApplicationRuntime {
             self.log_executed_command(parsed, "tarot")?;
             return self.send_command_reply_batch(
                 "#塔罗牌帮助",
-                &[
-                    crate::features::reply_template::tarot::HELP_DRAW,
-                    crate::features::reply_template::tarot::HELP_REROLL,
-                    crate::features::reply_template::tarot::HELP_INTERPRET,
-                ],
+                &crate::features::reply_template::tarot::HELP,
                 &crate::features::reply_template::ReplyVars::new(),
                 0,
             );
@@ -819,7 +815,11 @@ impl AdministrationImmediatePort for ApplicationRuntime {
         let Some(text) = self.render_template_text(spec, vars) else {
             return Ok(());
         };
-        self.enqueue_hall_reply(&text)
+        // 多行文案逐条入队，与立即发送路径保持同一拆条规则。
+        for message in crate::text::split_configured_lines(&text) {
+            self.enqueue_hall_reply(&message)?;
+        }
+        Ok(())
     }
 
     fn configure_idle_exit(&mut self, minutes: u32) -> Result<()> {
@@ -848,52 +848,32 @@ impl AdministrationApplicationPort for ApplicationRuntime {
     fn send_command_reply_batch(
         &mut self,
         command_id: &str,
-        templates: &[crate::features::reply_template::ReplyTemplate],
+        template: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
         delay_ms: u64,
     ) -> Result<()> {
+        // 帮助是单条模板、多行内容。命令面板的覆盖按该模板的 key 查，
+        // 多行由发送路径拆成多条消息——不再有"逐行模板数组"这一层。
         let stored = if let Some(store) = self.lifecycle.config_store.as_ref() {
             let store = store.lock().map_err(|_| anyhow!("命令回复存储锁已损坏"))?;
             store.reply_templates()?.get(command_id).cloned()
         } else {
             None
         };
-        let mut rendered = Vec::new();
-        match stored {
-            Some(rows) => {
-                for row in rows {
-                    let result = if let Some(spec) =
-                        templates.iter().find(|spec| spec.key == row.key)
-                    {
-                        crate::features::reply_template::render(spec, Some(&row.text), vars)
-                    } else if row.key.starts_with("custom:") {
-                        let rendered = crate::features::reply_template::ReplyTemplate {
-                            key: "custom.reply",
-                            default: "",
-                            summary: "自定义回复",
-                            group: "命令回复",
-                        };
-                        crate::features::reply_template::render(&rendered, Some(&row.text), vars)
-                    } else {
-                        log::warn!("命令回复 {} 不在模板目录中，跳过", row.key);
-                        continue;
-                    };
-                    if !result.missing.is_empty() {
-                        log::warn!("命令回复 {} 缺少变量 {:?}", row.key, result.missing);
-                    }
-                    rendered.push(result.text);
-                }
-            }
-            None => rendered.extend(
-                templates
-                    .iter()
-                    .filter_map(|spec| self.render_template_text(spec, vars)),
-            ),
+        let override_text = stored
+            .as_ref()
+            .and_then(|rows| rows.iter().find(|row| row.key == template.key))
+            .map(|row| row.text.clone())
+            .or_else(|| self.command_reply_text(template.key));
+        let rendered =
+            crate::features::reply_template::render(template, override_text.as_deref(), vars);
+        if !rendered.missing.is_empty() {
+            log::warn!("帮助模板 {} 缺少变量 {:?}", template.key, rendered.missing);
         }
-        let refs = rendered.iter().map(String::as_str).collect::<Vec<_>>();
+        let messages = crate::text::split_configured_lines(&rendered.text);
+        let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
         self.reply_batch(&refs, delay_ms)
     }
-
     fn send_hall(&mut self, message: &str) -> Result<()> {
         ApplicationRuntime::reply(self, message)
     }

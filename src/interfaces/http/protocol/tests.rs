@@ -5527,33 +5527,33 @@ fn command_replies_http_roundtrip_preserves_order_mute_partial_updates_and_confl
         .iter()
         .find(|row| row["id"] == "@帮助")
         .expect("帮助命令仍在回复目录中");
-    assert_eq!(help["orderedBatch"], true);
+    // 合并后不再有 orderedBatch：所有命令都是"一个模板、文案可含换行"。
+    assert!(help.get("orderedBatch").is_none());
+    assert_eq!(help["replies"][0]["key"], "help.song_request");
     let initial_volume = initial["commands"]
         .as_array()
         .unwrap()
         .iter()
         .find(|row| row["id"] == "@音量")
         .unwrap();
-    assert_eq!(initial_volume["orderedBatch"], false);
+    assert_eq!(initial_volume["replies"][0]["key"], "playback.volume.set");
+
     let revision = initial["revision"].as_u64().unwrap();
+    // 帮助文案改成多行：一行发一条消息，保存后仍是同一条配置。
     let save = json!({"baseRevision":revision,"commands":[
         {"id":"@帮助","replies":[
-            {"key":"help.song_request.2","text":"第二条已修改"},
-            {"key":"custom:last","text":"最后一条 {用户名}"}
+            {"key":"help.song_request","text":"第一行帮助\n第二行帮助"}
         ]},
         {"id":"@娱乐帮助","replies":[]},
         {"id":"@歌单帮助","replies":[
-            {"key":"help.playlist.3","text":"模式帮助已更新"},
-            {"key":"help.playlist.1","text":"歌单帮助已更新"}
+            {"key":"help.playlist","text":"歌单帮助已更新"}
         ]},
         {"id":"@大厅检测","replies":[{"key":"hall.current","text":"大厅 {大厅名}{后缀}"}]},
         {"id":"@大厅时间","replies":[{"key":"hall.time.remaining","text":"还剩{剩余分钟}分"}]},
         {"id":"@下一首","replies":[{"key":"playback.next.pool_fallback","text":"池续播 {关键词}"}]},
         {"id":"@删除","replies":[{"key":"playback.delete.removed.pool_fallback","text":"删除后续播 {关键词}"}]},
         {"id":"#塔罗牌帮助","replies":[
-            {"key":"tarot.help.interpret","text":"3 AI解读"},
-            {"key":"tarot.help.draw","text":"1 抽牌"},
-            {"key":"tarot.help.reroll","text":"2 重抽"}
+            {"key":"tarot.help","text":"抽牌\n重抽\n解读"}
         ]},
         {"id":"#海龟汤","replies":[
             {"key":"turtle_soup.start.failed","text":"开局错误：{原因}"},
@@ -5569,176 +5569,41 @@ fn command_replies_http_roundtrip_preserves_order_mute_partial_updates_and_confl
     assert_eq!(result["revision"], revision + 1);
     let after: Value =
         serde_json::from_str(&http_get(address, "/commands/replies", None).body).unwrap();
-    let playback_volume = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "@音量")
-        .unwrap();
-    assert_eq!(playback_volume["replies"][0]["key"], "playback.volume.set");
-    assert_eq!(
-        playback_volume["replies"][0]["text"],
-        "音量调整完成：{音量}"
-    );
-    assert_eq!(playback_volume["allowedVariables"], json!(["音量"]));
-    let playback_pause = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "@暂停")
-        .unwrap();
-    assert!(
-        playback_pause["allowedVariables"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    let hall_detect = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "@大厅检测")
-        .unwrap();
-    assert_eq!(hall_detect["orderedBatch"], false);
-    assert_eq!(hall_detect["allowedVariables"], json!(["后缀", "大厅名"]));
-    assert_eq!(hall_detect["replies"][0]["text"], "大厅 {大厅名}{后缀}");
-    let hall_time = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "@大厅时间")
-        .unwrap();
-    assert_eq!(hall_time["allowedVariables"], json!(["剩余分钟"]));
-    let next = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "@下一首")
-        .unwrap();
-    assert_eq!(next["orderedBatch"], false);
-    assert_eq!(next["allowedVariables"], json!(["关键词"]));
-    let delete = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "@删除")
-        .unwrap();
-    assert_eq!(delete["allowedVariables"], json!(["关键词"]));
-    assert_eq!(
-        delete["replies"][0]["key"],
-        "playback.delete.removed.pool_fallback"
-    );
-    let tarot_help = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "#塔罗牌帮助")
-        .unwrap();
-    assert_eq!(tarot_help["orderedBatch"], true);
-    assert!(
-        tarot_help["allowedVariables"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(tarot_help["replies"][0]["key"], "tarot.help.interpret");
-    assert_eq!(tarot_help["replies"][1]["key"], "tarot.help.draw");
-    assert_eq!(tarot_help["replies"][2]["key"], "tarot.help.reroll");
 
-    // 海龟汤的状态/结束回复已并入单一命令 #海龟汤：
-    // 旧库里的 "#状态（海龟汤）"/"#结束（海龟汤）" 仍可读写（别名归一），
-    // 但面板只保留一个入口，避免同一条文案分散在三处编辑。
-    let turtle = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "#海龟汤")
-        .unwrap();
-    assert_eq!(turtle["orderedBatch"], false);
-    let turtle_keys: Vec<_> = turtle["replies"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|row| row["active"] == true)
-        .map(|row| row["key"].as_str().unwrap())
-        .collect();
-    assert!(turtle_keys.contains(&"turtle_soup.status"));
-    assert!(turtle_keys.contains(&"turtle_soup.start.failed"));
-    assert!(turtle_keys.contains(&"turtle_soup.end.failed"));
-    assert!(turtle["allowedVariables"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|name| name == "阶段"));
-
-    let playlist_help = after["commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "@歌单帮助")
-        .unwrap();
-    assert_eq!(playlist_help["orderedBatch"], true);
-    assert_eq!(playlist_help["replies"][0]["key"], "help.playlist.3");
-    assert_eq!(playlist_help["replies"][1]["key"], "help.playlist.1");
-    let help = after["commands"]
+    let help_after = after["commands"]
         .as_array()
         .unwrap()
         .iter()
         .find(|row| row["id"] == "@帮助")
         .unwrap();
-    assert_eq!(help["replies"][0]["key"], "help.song_request.2");
-    assert_eq!(help["replies"][0]["text"], "第二条已修改");
-    assert_eq!(help["replies"][1]["key"], "custom:last");
-    assert_eq!(help["replies"].as_array().unwrap().len(), 4);
-    assert!(help["replies"][2]["active"] == false);
-    assert!(help["replies"][3]["active"] == false);
-    let entertainment = after["commands"]
+    assert_eq!(help_after["replies"][0]["key"], "help.song_request");
+    assert_eq!(help_after["replies"][0]["text"], "第一行帮助\n第二行帮助");
+    assert_eq!(help_after["replies"].as_array().unwrap().len(), 1);
+
+    let volume = after["commands"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|row| row["id"] == "@娱乐帮助")
+        .find(|row| row["id"] == "@音量")
         .unwrap();
-    assert!(
-        entertainment["replies"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["active"] == false)
-    );
-    assert!(
-        entertainment["replies"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| !row["text"].as_str().unwrap().is_empty())
-    );
+    assert_eq!(volume["replies"][0]["text"], "音量调整完成：{音量}");
 
-    let reactivate = json!({"baseRevision":revision+1,"commands":[{"id":"@娱乐帮助","replies":[
-        {"key":"help.entertainment.tarot.1","text":entertainment["replies"][0]["defaultText"]},
-        {"key":"help.entertainment.tarot.2","text":entertainment["replies"][1]["defaultText"]},
-        {"key":"help.entertainment.idiom","text":entertainment["replies"][2]["defaultText"]},
-        {"key":"help.entertainment.landlord","text":entertainment["replies"][3]["defaultText"]},
-        {"key":"help.entertainment.run_fast","text":entertainment["replies"][4]["defaultText"]},
-        {"key":"help.entertainment.turtle_soup","text":entertainment["replies"][5]["defaultText"]},
-        {"key":"help.entertainment.turtle_soup_long","text":entertainment["replies"][6]["defaultText"]},
-        {"key":"help.entertainment.undercover.1","text":entertainment["replies"][7]["defaultText"]},
-        {"key":"help.entertainment.undercover.2","text":entertainment["replies"][8]["defaultText"]}
-    ]}]}).to_string();
-    let reactivated = http_post_json(address, "/commands/replies", &reactivate, None);
+    // 整条静音仍然生效：存空列表。
+    let mute = json!({"baseRevision":revision+1,"commands":[{"id":"@娱乐帮助","replies":[]}]}).to_string();
     assert_eq!(
-        reactivated.status_line, "HTTP/1.1 200 OK",
-        "{}",
-        reactivated.body
+        http_post_json(address, "/commands/replies", &mute, None).status_line,
+        "HTTP/1.1 200 OK"
     );
 
+    // 版本冲突必须被拒绝。
     let stale = http_post_json(address, "/commands/replies", &save, None);
     assert_eq!(
         serde_json::from_str::<Value>(&stale.body).unwrap()["code"],
         "reply_conflict"
     );
-    // 留空现在是合法语义（恢复内置默认），所以这里改用真正的非法输入：
-    // 未知变量占位符必须被拒绝。
-    let invalid = json!({"baseRevision":revision+1,"commands":[{"id":"@帮助","replies":[{"key":"help.song_request.1","text":"未知变量 {不存在的变量}"}]}]}).to_string();
+
+    // 未知变量必须被拒绝。
+    let invalid = json!({"baseRevision":revision+2,"commands":[{"id":"@帮助","replies":[{"key":"help.song_request","text":"未知变量 {不存在的变量}"}]}]}).to_string();
     assert_ne!(
         http_post_json(address, "/commands/replies", &invalid, None).status_line,
         "HTTP/1.1 200 OK"

@@ -93,12 +93,55 @@ pub struct ConfigFieldSchema {
     pub source: ConfigSource,
     /// 中文说明/提示
     pub hint: String,
+    /// 段内小节名（可选）。只给字段较多的大段用，
+    /// 前端渲染成可折叠小节，避免 30+ 字段平铺。
+    pub group: Option<&'static str>,
     /// 字段值可为 null（对应 struct 的 Option 字段；如 ocr.det_model、
     /// playback.audio_cache 本身）。表单允许提交 null 表示未启用。
     pub nullable: bool,
     /// 字段的父级可能为 null（如 audio_cache=null 时其 6 个子字段在结构中
     /// 仍存在但取值路径中间节点为 null）。测试取值时允许该路径返回 null。
     pub optional_parent: bool,
+}
+
+/// 配置段所属的功能域。
+///
+/// 配置页按域分组呈现：用户先想"我要改哪类东西"，再在该域里找具体段。
+/// 域的划分依据是用户任务，不是代码模块——例如 ocr/templates/screen
+/// 在代码里是三段，但对用户都是"识别与画面"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Domain {
+    /// 识别与画面：视觉档案、窗口、截图区域、OCR、模板、稳定判定。
+    Recognition,
+    /// 播放与点歌：播放器、队列、去重、点歌 AI、歌曲审核。
+    Playback,
+    /// 娱乐玩法：成语接龙、斗地主、卧底、海龟汤、热键。
+    Entertainment,
+    /// AI 与交互：AI 连接、AI 聊天、输出、命令权限、身份、自定义流程。
+    Interaction,
+    /// 系统：面板、日志、TUI、状态、启动、管理、邀请、设备。
+    System,
+}
+
+impl Domain {
+    pub const ALL: [Self; 5] = [
+        Self::Recognition,
+        Self::Playback,
+        Self::Entertainment,
+        Self::Interaction,
+        Self::System,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recognition => "识别与画面",
+            Self::Playback => "播放与点歌",
+            Self::Entertainment => "娱乐玩法",
+            Self::Interaction => "AI 与交互",
+            Self::System => "系统",
+        }
+    }
 }
 
 /// 配置段 schema：段名（与 AppConfig 字段名一致）、中文分组名、顺序与字段列表。
@@ -108,7 +151,9 @@ pub struct ConfigSectionSchema {
     pub name: String,
     /// 中文分组名
     pub label: String,
-    /// 分组显示顺序
+    /// 所属功能域（面板按域分组呈现）
+    pub domain: Domain,
+    /// 域内显示顺序
     pub order: usize,
     pub fields: Vec<ConfigFieldSchema>,
 }
@@ -130,6 +175,7 @@ impl ConfigFieldSchema {
             hint: hint.to_string(),
             nullable: false,
             optional_parent: false,
+            group: None,
         }
     }
 
@@ -144,6 +190,7 @@ impl ConfigFieldSchema {
             hint: hint.to_string(),
             nullable: false,
             optional_parent: false,
+            group: None,
         }
     }
 
@@ -160,6 +207,7 @@ impl ConfigFieldSchema {
             hint: hint.to_string(),
             nullable: false,
             optional_parent: false,
+            group: None,
         }
     }
 
@@ -174,6 +222,7 @@ impl ConfigFieldSchema {
             hint: hint.to_string(),
             nullable: false,
             optional_parent: false,
+            group: None,
         }
     }
 
@@ -2210,11 +2259,56 @@ fn kugou_section() -> Vec<ConfigFieldSchema> {
 }
 
 /// 全部配置段 schema（与 AppConfig 顶层段一一对应，含 bootstrap 的 http/logging）。
+/// 段内小节：按字段路径前缀推导，避免在 300+ 个声明点逐个手写。
+///
+/// 只有字段数较多的段才值得分子节；小节名面向用户，所以用中文，
+/// 且按"用户改它时的意图"命名，不照搬代码里的路径前缀。
+fn field_group(section: &str, path: &str) -> Option<&'static str> {
+    // 去掉段前缀，只看段内路径。
+    let inner = path.strip_prefix(section)?.strip_prefix('.')?;
+    let head = inner.split('.').next().unwrap_or(inner);
+    match (section, head) {
+        // 时序：按子系统分节，User 找的是"聊天扫描还是命令执行"。
+        ("timing", "watchdog_restart_ms" | "loop_idle_ms") => Some("主循环"),
+        ("timing", "chat_scan") => Some("聊天扫描"),
+        ("timing", "command") => Some("命令执行"),
+        ("timing", "input") => Some("输入等待"),
+        ("timing", "invite") => Some("邀请流程"),
+        ("timing", "workflow") => Some("自定义流程"),
+        ("timing", "hall") => Some("大厅"),
+        ("timing", "moderation") => Some("管理投票"),
+        ("timing", "playback") => Some("播放器"),
+        ("timing", "decision") => Some("决策窗口"),
+        ("timing", "external") => Some("外部程序"),
+        // OCR：检测参数、识别参数、聊天几何三者改动场景不同。
+        ("ocr", "det_model" | "rec_model" | "charset" | "min_confidence" | "threads") => {
+            Some("模型与置信度")
+        }
+        ("ocr", "det_max_side_len" | "det_score_threshold" | "det_unclip_ratio" | "det_min_area"
+            | "det_box_border") => Some("检测参数"),
+        ("ocr", "request_timeout_ms" | "shutdown_timeout_ms" | "backend_priority") => {
+            Some("运行控制")
+        }
+        ("ocr", "openvino") => Some("OpenVINO"),
+        ("ocr", "marker_search_width" | "marker_dedupe_min_x" | "marker_dedupe_min_y"
+            | "marker_dedupe_x" | "marker_dedupe_y") => Some("气泡定位"),
+        ("ocr", "text_left_gap" | "block_top_padding" | "block_bottom_padding"
+            | "max_block_height" | "same_line_y_tolerance" | "next_marker_min_gap"
+            | "right_padding") => Some("文本排版"),
+        ("ocr", "change_mean_threshold" | "change_pixel_threshold") => Some("变化检测"),
+        // 启动流程：截图判定 vs 点击导航。
+        ("startup", "stable_mean_threshold" | "stable_changed_ratio_threshold"
+            | "stable_frame_count" | "settle_ms") => Some("稳定判定"),
+        _ => None,
+    }
+}
+
 pub fn config_sections() -> Vec<ConfigSectionSchema> {
-    vec![
+    let mut sections = vec![
         ConfigSectionSchema {
             name: "visual".to_string(),
             label: "视觉档案".to_string(),
+            domain: Domain::Recognition,
             order: 0,
             fields: with_section_prefix(
                 "visual",
@@ -2229,6 +2323,7 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
         ConfigSectionSchema {
             name: "command_access".to_string(),
             label: "命令权限".to_string(),
+            domain: Domain::Interaction,
             order: 33,
             fields: with_section_prefix(
                 "command_access",
@@ -2252,190 +2347,229 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
         ConfigSectionSchema {
             name: "window".to_string(),
             label: "窗口".to_string(),
+            domain: Domain::Recognition,
             order: 1,
             fields: with_section_prefix("window", window_section()),
         },
         ConfigSectionSchema {
             name: "screen".to_string(),
             label: "屏幕区域".to_string(),
+            domain: Domain::Recognition,
             order: 2,
             fields: with_section_prefix("screen", screen_section()),
         },
         ConfigSectionSchema {
             name: "stability".to_string(),
             label: "稳定性".to_string(),
+            domain: Domain::Recognition,
             order: 3,
             fields: with_section_prefix("stability", stability_section()),
         },
         ConfigSectionSchema {
             name: "timing".to_string(),
             label: "时序".to_string(),
+            domain: Domain::System,
             order: 4,
             fields: with_section_prefix("timing", timing_section()),
         },
         ConfigSectionSchema {
             name: "ocr".to_string(),
             label: "OCR".to_string(),
+            domain: Domain::Recognition,
             order: 5,
             fields: with_section_prefix("ocr", ocr_section()),
         },
         ConfigSectionSchema {
             name: "templates".to_string(),
             label: "模板图片".to_string(),
+            domain: Domain::Recognition,
             order: 6,
             fields: with_section_prefix("templates", templates_section()),
         },
         ConfigSectionSchema {
             name: "output".to_string(),
             label: "输出".to_string(),
+            domain: Domain::Interaction,
             order: 7,
             fields: with_section_prefix("output", output_section()),
         },
         ConfigSectionSchema {
             name: "moderation".to_string(),
             label: "管理（拉黑/屏蔽）".to_string(),
+            domain: Domain::System,
             order: 8,
             fields: with_section_prefix("moderation", moderation_section()),
         },
         ConfigSectionSchema {
             name: "playback".to_string(),
             label: "播放器".to_string(),
+            domain: Domain::Playback,
             order: 9,
             fields: with_section_prefix("playback", playback_section()),
         },
         ConfigSectionSchema {
             name: "http".to_string(),
             label: "Web/API 面板".to_string(),
+            domain: Domain::System,
             order: 10,
             fields: with_section_prefix("http", http_section()),
         },
         ConfigSectionSchema {
             name: "logging".to_string(),
             label: "日志".to_string(),
+            domain: Domain::System,
             order: 11,
             fields: with_section_prefix("logging", logging_section()),
         },
         ConfigSectionSchema {
             name: "tui".to_string(),
             label: "终端 TUI".to_string(),
+            domain: Domain::System,
             order: 12,
             fields: with_section_prefix("tui", tui_section()),
         },
         ConfigSectionSchema {
             name: "state".to_string(),
             label: "状态文件".to_string(),
+            domain: Domain::System,
             order: 13,
             fields: with_section_prefix("state", state_section()),
         },
         ConfigSectionSchema {
             name: "queue".to_string(),
             label: "点歌队列".to_string(),
+            domain: Domain::Playback,
             order: 14,
             fields: with_section_prefix("queue", queue_section()),
         },
         ConfigSectionSchema {
             name: "song_dedup".to_string(),
             label: "同歌去重".to_string(),
+            domain: Domain::Playback,
             order: 15,
             fields: with_section_prefix("song_dedup", song_dedup_section()),
         },
         ConfigSectionSchema {
             name: "idiom_chain".to_string(),
             label: "成语接龙".to_string(),
+            domain: Domain::Entertainment,
             order: 16,
             fields: with_section_prefix("idiom_chain", idiom_chain_section()),
         },
         ConfigSectionSchema {
             name: "landlord".to_string(),
             label: "斗地主".to_string(),
+            domain: Domain::Entertainment,
             order: 17,
             fields: with_section_prefix("landlord", landlord_section()),
         },
         ConfigSectionSchema {
             name: "undercover".to_string(),
             label: "谁是卧底".to_string(),
+            domain: Domain::Entertainment,
             order: 18,
             fields: with_section_prefix("undercover", undercover_section()),
         },
         ConfigSectionSchema {
             name: "turtle_soup".to_string(),
             label: "海龟汤".to_string(),
+            domain: Domain::Entertainment,
             order: 19,
             fields: with_section_prefix("turtle_soup", turtle_soup_section()),
         },
         ConfigSectionSchema {
             name: "ai".to_string(),
             label: "AI 连接".to_string(),
+            domain: Domain::Interaction,
             order: 20,
             fields: with_section_prefix("ai", ai_section()),
         },
         ConfigSectionSchema {
             name: "song_ai".to_string(),
             label: "点歌 AI".to_string(),
+            domain: Domain::Playback,
             order: 21,
             fields: with_section_prefix("song_ai", song_ai_section()),
         },
         ConfigSectionSchema {
             name: "song_review".to_string(),
             label: "歌曲审核".to_string(),
+            domain: Domain::Playback,
             order: 22,
             fields: with_section_prefix("song_review", song_review_section()),
         },
         ConfigSectionSchema {
             name: "matching".to_string(),
             label: "歌名匹配".to_string(),
+            domain: Domain::Recognition,
             order: 23,
             fields: with_section_prefix("matching", matching_section()),
         },
         ConfigSectionSchema {
             name: "hotkeys".to_string(),
             label: "全局热键".to_string(),
+            domain: Domain::Entertainment,
             order: 24,
             fields: with_section_prefix("hotkeys", hotkeys_section()),
         },
         ConfigSectionSchema {
             name: "startup".to_string(),
             label: "启动流程".to_string(),
+            domain: Domain::System,
             order: 25,
             fields: with_section_prefix("startup", startup_section()),
         },
         ConfigSectionSchema {
             name: "invite".to_string(),
             label: "邀请流程".to_string(),
+            domain: Domain::System,
             order: 26,
             fields: with_section_prefix("invite", invite_section()),
         },
         ConfigSectionSchema {
             name: "friend_delivery".to_string(),
             label: "好友投递".to_string(),
+            domain: Domain::System,
             order: 27,
             fields: with_section_prefix("friend_delivery", friend_delivery_section()),
         },
         ConfigSectionSchema {
             name: "custom_workflows".to_string(),
             label: "自定义流程".to_string(),
+            domain: Domain::Interaction,
             order: 28,
             fields: with_section_prefix("custom_workflows", custom_workflows_section()),
         },
         ConfigSectionSchema {
             name: "identity".to_string(),
             label: "身份映射".to_string(),
+            domain: Domain::Interaction,
             order: 29,
             fields: with_section_prefix("identity", identity_section()),
         },
         ConfigSectionSchema {
             name: "kugou".to_string(),
             label: "酷狗设备".to_string(),
+            domain: Domain::System,
             order: 30,
             fields: with_section_prefix("kugou", kugou_section()),
         },
         ConfigSectionSchema {
             name: "ai_chat".to_string(),
             label: "AI 聊天".to_string(),
+            domain: Domain::Interaction,
             order: 32,
             fields: with_section_prefix("ai_chat", ai_chat_section()),
         },
-    ]
+    ];
+    // 统一补段内小节：声明点不必逐个手写 group。
+    for section in &mut sections {
+        let name = section.name.clone();
+        for field in &mut section.fields {
+            field.group = field_group(&name, &field.path);
+        }
+    }
+    sections
 }
 
 /// ai_chat 段：AI 聊天与轻量记忆。
@@ -2840,6 +2974,64 @@ mod tests {
     /// to_db_value 剔除 http/logging 与 state.playback_state_path，schema 对
     /// bootstrap 段仍声明用于展示；state 段只含 hall/executed 两字段，
     /// playback_state_path 不在 schema 中（由统一数据库路径注入）。
+    #[test]
+    fn every_section_belongs_to_a_domain_and_domains_are_ordered() {
+        // 每个段都必须能归入一个功能域，否则面板上它会落到"系统"里，
+        // 用户找不到——这是分组呈现的前提。
+        let sections = config_sections();
+        assert!(!sections.is_empty());
+        for section in &sections {
+            assert!(
+                Domain::ALL.contains(&section.domain),
+                "段 {} 的域 {section:?} 不在 Domain::ALL 中",
+                section.name
+            );
+        }
+        // 五个域都应有段，避免出现空分组。
+        for domain in Domain::ALL {
+            assert!(
+                sections.iter().any(|s| s.domain == domain),
+                "域 {} 没有任何配置段",
+                domain.label()
+            );
+        }
+    }
+
+    #[test]
+    fn large_sections_are_split_into_named_subgroups() {
+        // 字段多的大段必须分子节，否则 30+ 字段平铺难以浏览。
+        let sections = config_sections();
+        for name in ["timing", "ocr"] {
+            let section = sections
+                .iter()
+                .find(|s| s.name == name)
+                .expect("大段应存在");
+            let grouped = section.fields.iter().filter(|f| f.group.is_some()).count();
+            assert!(
+                grouped * 2 > section.fields.len(),
+                "{name} 的多数字段应归入小节，实际 {grouped}/{}",
+                section.fields.len()
+            );
+        }
+    }
+
+    #[test]
+    fn subgroup_names_are_non_empty_and_user_facing() {
+        // 小节名会直接显示给用户：不能为空，也不能是代码里的路径前缀。
+        for section in config_sections() {
+            for field in &section.fields {
+                if let Some(group) = field.group {
+                    assert!(!group.trim().is_empty(), "{} 的小节名为空", field.path);
+                    assert!(
+                        !group.contains('.') && !group.contains('_'),
+                        "{} 的小节名像代码标识符：{group}",
+                        field.path
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn schema_covers_all_app_config_sections() {
         let declared: BTreeSet<String> = config_sections()

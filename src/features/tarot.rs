@@ -227,18 +227,11 @@ impl TarotApplication {
     ) -> Result<Vec<TarotReply>> {
         let (reroll, ai, question) = match command {
             TarotCommand::Help => {
-                return Ok([
-                    &templates::HELP_DRAW,
-                    &templates::HELP_REROLL,
-                    &templates::HELP_INTERPRET,
-                ]
-                .into_iter()
-                .map(|spec| TarotReply::KeyedFitted {
+                return Ok(vec![TarotReply::KeyedFitted {
                     label: "塔罗",
-                    spec,
+                    spec: &templates::HELP,
                     vars: ReplyVars::new(),
-                })
-                .collect());
+                }]);
             }
             TarotCommand::Draw {
                 reroll,
@@ -1031,13 +1024,21 @@ mod tests {
         let replies = app
             .execute_for_day("用户", &TarotCommand::Help, Instant::now(), DAY, &ai)
             .unwrap();
-        assert_eq!(replies.len(), 3);
-        for reply in &replies {
-            let TarotReply::KeyedFitted { spec, .. } = reply else {
-                panic!("帮助应返回可分段模板，实际得到 {reply:?}");
-            };
-            assert!(spec.key.starts_with("tarot.help."));
-        }
+        // 帮助合并成单条多行模板：业务层返回 1 条，拆条在发送路径。
+        assert_eq!(replies.len(), 1);
+        let TarotReply::KeyedFitted { spec, .. } = &replies[0] else {
+            panic!("帮助应返回可分段模板，实际得到 {:?}", replies[0]);
+        };
+        assert_eq!(spec.key, "tarot.help");
+        // 三行内容都在，且拆条后每行都不含换行。
+        let lines = crate::text::split_configured_lines(&crate::features::reply_template::render(
+            spec,
+            None,
+            &ReplyVars::new(),
+        )
+        .text);
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| !line.contains(['\n', '\r'])));
     }
 
     #[test]

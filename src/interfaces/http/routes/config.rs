@@ -99,6 +99,7 @@ fn field_json(
         "effect": field.effect,
         "source": source_str(field.source),
         "hint": field.hint,
+        "group": field.group,
         "nullable": field.nullable,
         "optionalParent": field.optional_parent,
         "default": get_value_by_path(source_defaults, &field.path)
@@ -117,6 +118,8 @@ fn section_json(
     json!({
         "name": section.name,
         "label": section.label,
+        "domain": section.domain,
+        "domainLabel": section.domain.label(),
         "order": section.order,
         "fields": section
             .fields
@@ -317,6 +320,8 @@ pub(super) fn config_section_route(
         "ok": true,
         "name": section.name,
         "label": section.label,
+        "domain": section.domain,
+        "domainLabel": section.domain.label(),
         "order": section.order,
         "fields": section
             .fields

@@ -40,6 +40,11 @@ pub(crate) struct ReplyTemplate {
 pub(crate) struct ReplyVariable {
     pub name: &'static str,
     pub label: &'static str,
+    /// 面板上展示的简短示例值。
+    ///
+    /// 按钮直接显示示例（如「晴天」）而不是占位符（如「{歌名}」）：
+    /// 用户看到的是"这条变量长什么样"，不必先理解花括号语法再想象结果。
+    pub example: &'static str,
 }
 
 /// Global template tokens; includes builder-supported reserved values.
@@ -47,314 +52,392 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
     ReplyVariable {
         name: "AI回答",
         label: "AI回答",
+        example: "今天的风很适合散步",
     },
     ReplyVariable {
         name: "UID",
         label: "UID",
+        example: "123456789",
     },
     ReplyVariable {
         name: "上一个",
         label: "上一个",
+        example: "画蛇添足",
     },
     ReplyVariable {
         name: "上一手",
         label: "上一手",
+        example: "对3",
     },
     ReplyVariable {
         name: "上一手牌型",
         label: "上一手牌型",
+        example: "对子",
     },
     ReplyVariable {
         name: "上限",
         label: "上限",
+        example: "20",
     },
     ReplyVariable {
         name: "下一位",
         label: "下一位",
+        example: "小明",
     },
     ReplyVariable {
         name: "人数",
         label: "人数",
+        example: "4",
     },
     ReplyVariable {
         name: "位置",
         label: "位置",
+        example: "A",
     },
     ReplyVariable {
         name: "位置列表",
         label: "位置列表",
+        example: "A、C",
     },
     ReplyVariable {
         name: "关键词",
         label: "关键词",
+        example: "晴天",
     },
     ReplyVariable {
         name: "其他玩法",
         label: "其他玩法",
+        example: "海龟汤",
     },
     ReplyVariable {
         name: "决定",
         label: "决定",
+        example: "抢地主",
     },
     ReplyVariable {
         name: "前缀",
         label: "前缀",
+        example: "[提示]",
     },
     ReplyVariable {
         name: "剩余",
         label: "剩余",
+        example: "3张",
     },
     ReplyVariable {
         name: "剩余分钟",
         label: "剩余分钟",
+        example: "15",
     },
     ReplyVariable {
         name: "动作",
         label: "动作",
+        example: "出牌",
     },
     ReplyVariable {
         name: "卧底位置",
         label: "卧底位置",
+        example: "B",
     },
     ReplyVariable {
         name: "卧底词",
         label: "卧底词",
+        example: "苹果",
     },
     ReplyVariable {
         name: "原因",
         label: "原因",
+        example: "平台无音源",
     },
     ReplyVariable {
         name: "名单",
         label: "名单",
+        example: "甲、乙",
     },
     ReplyVariable {
         name: "后续",
         label: "后续",
+        example: "轮到小明",
     },
     ReplyVariable {
         name: "后缀",
         label: "后缀",
+        example: "（超时）",
     },
     ReplyVariable {
         name: "地主",
         label: "地主",
+        example: "小明",
     },
     ReplyVariable {
         name: "大厅名",
         label: "大厅名",
+        example: "1号大厅",
     },
     ReplyVariable {
         name: "字",
         label: "字",
+        example: "天",
     },
     ReplyVariable {
         name: "平民词",
         label: "平民词",
+        example: "香蕉",
     },
     ReplyVariable {
         name: "序号",
         label: "序号",
+        example: "1",
     },
     ReplyVariable {
         name: "底牌",
         label: "底牌",
+        example: "红桃2",
     },
     ReplyVariable {
         name: "开头描述",
         label: "开头描述",
+        example: "以「天」字开头",
     },
     ReplyVariable {
         name: "张数",
         label: "张数",
+        example: "17",
     },
     ReplyVariable {
         name: "当前",
         label: "当前",
+        example: "晴天",
     },
     ReplyVariable {
         name: "当前抢地主",
         label: "当前抢地主",
+        example: "小明",
     },
     ReplyVariable {
         name: "成语",
         label: "成语",
+        example: "一举两得",
     },
     ReplyVariable {
         name: "手数",
         label: "手数",
+        example: "12",
     },
     ReplyVariable {
         name: "手牌",
         label: "手牌",
+        example: "♠3 ♥5 ♦K",
     },
     ReplyVariable {
         name: "托管后缀",
         label: "托管后缀",
+        example: "（托管）",
     },
     ReplyVariable {
         name: "投票说明",
         label: "投票说明",
+        example: "私聊#A投票",
     },
     ReplyVariable {
         name: "拼音",
         label: "拼音",
+        example: "tiān",
     },
     ReplyVariable {
         name: "提问数",
         label: "提问数",
+        example: "5",
     },
     ReplyVariable {
         name: "搜索词",
         label: "搜索词",
+        example: "晴天 周杰伦",
     },
     ReplyVariable {
         name: "数量",
         label: "数量",
+        example: "3",
     },
     ReplyVariable {
         name: "昵称",
         label: "昵称",
+        example: "小明",
     },
     ReplyVariable {
         name: "条目",
         label: "条目",
+        example: "1.晴天",
     },
     ReplyVariable {
         name: "来源",
         label: "来源",
+        example: "QQ音乐",
     },
     ReplyVariable {
         name: "标签",
         label: "标签",
+        example: "@点歌",
     },
     ReplyVariable {
         name: "模式",
         label: "模式",
+        example: "同音接龙",
     },
     ReplyVariable {
         name: "歌名",
         label: "歌名",
+        example: "晴天",
     },
     ReplyVariable {
         name: "歌手",
         label: "歌手",
+        example: "周杰伦",
     },
     ReplyVariable {
         name: "状态",
         label: "播放状态（播放/暂停/停止）",
+        example: "播放",
     },
     ReplyVariable {
         name: "曲名",
         label: "曲名（歌名 - 歌手）",
+        example: "晴天 - 周杰伦",
     },
     ReplyVariable {
         name: "进度",
         label: "已播放时长",
+        example: "1:05",
     },
     ReplyVariable {
         name: "总长",
         label: "歌曲总时长",
+        example: "3:05",
     },
     ReplyVariable {
         name: "点歌人",
         label: "点歌人昵称",
+        example: "小明",
     },
     ReplyVariable {
         name: "歌单归属",
         label: "歌单模式所有者",
+        example: "小明",
     },
     ReplyVariable {
         name: "内容",
         label: "被包裹的正文",
+        example: "状态行正文",
     },
     ReplyVariable {
         name: "歌词",
         label: "当前歌词行",
+        example: "故事的小黄花",
     },
     ReplyVariable {
         name: "新增",
         label: "新增数量",
+        example: "12",
     },
     ReplyVariable {
         name: "重复",
         label: "重复数量",
+        example: "3",
     },
     ReplyVariable {
         name: "炸弹",
         label: "炸弹",
+        example: "2",
     },
     ReplyVariable {
         name: "牌型",
         label: "牌型",
+        example: "顺子",
     },
     ReplyVariable {
         name: "牌面",
         label: "牌面",
+        example: "♠3♠4♠5♠6♠7",
     },
     ReplyVariable {
         name: "玩家",
         label: "玩家",
+        example: "小明",
     },
     ReplyVariable {
         name: "玩家列表",
         label: "玩家列表",
+        example: "甲、乙、丙",
     },
     ReplyVariable {
         name: "玩法",
         label: "玩法",
+        example: "斗地主",
     },
     ReplyVariable {
         name: "用户名",
         label: "用户名",
+        example: "小明",
     },
     ReplyVariable {
         name: "秒数",
         label: "秒数",
+        example: "30",
     },
     ReplyVariable {
         name: "结果",
         label: "结果",
+        example: "是",
     },
     ReplyVariable {
         name: "胜方",
         label: "胜方",
+        example: "平民胜利",
     },
     ReplyVariable {
         name: "角色",
         label: "角色",
+        example: "地主",
     },
     ReplyVariable {
         name: "词语",
         label: "词语",
+        example: "苹果",
     },
     ReplyVariable {
         name: "超时秒数",
         label: "超时秒数",
+        example: "30",
     },
     ReplyVariable {
         name: "身份",
         label: "身份",
+        example: "平民",
     },
     ReplyVariable {
         name: "轮次",
         label: "轮次",
+        example: "2",
     },
     ReplyVariable {
         name: "问题",
         label: "问题",
+        example: "他认识死者吗",
     },
     ReplyVariable {
         name: "阵营",
         label: "阵营",
+        example: "地主方",
     },
     ReplyVariable {
         name: "阶段",
         label: "阶段",
+        example: "提问",
     },
     ReplyVariable {
         name: "音量",
         label: "音量",
+        example: "80",
     },
 ];
 
@@ -367,7 +450,6 @@ pub(crate) struct CommandReplyCatalogEntry {
     pub id: &'static str,
     pub name: &'static str,
     pub category: &'static str,
-    pub ordered_batch: bool,
     keys: &'static [&'static str],
 }
 
@@ -384,7 +466,6 @@ pub(crate) fn command_reply_catalog() -> impl Iterator<Item = CommandReplyCatalo
         id: group.command_id,
         name: group.name,
         category: group.category,
-        ordered_batch: group.ordered_batch,
         keys: group.keys,
     })
 }
@@ -412,7 +493,6 @@ pub(crate) fn command_reply_entry_for_key(key: &str) -> Option<CommandReplyCatal
         id: group.command_id,
         name: group.name,
         category: group.category,
-        ordered_batch: group.ordered_batch,
         keys: group.keys,
     })
 }
@@ -568,16 +648,12 @@ pub(crate) fn render(
 /// 这是“覆盖能不能查到”的唯一实现：立即发送、延迟发送、播放器三条路径都调用它，
 /// 避免各写一份导致同一条配置在不同路径上表现不一致。
 ///
-/// ordered_batch 的命令整段按序发送，单条覆盖由组装层按行渲染，
-/// 这里返回 None 表示“不参与单条覆盖查找”。
+/// 覆盖文案含换行时由发送路径拆条，这里只负责取合并后的整段文本。
 pub(crate) fn stored_override(
     stored: &std::collections::BTreeMap<String, Vec<crate::config::StoredReply>>,
     key: &str,
 ) -> Option<String> {
     let entry = command_reply_entry_for_key(key)?;
-    if entry.ordered_batch {
-        return None;
-    }
     stored
         .get(entry.id)?
         .iter()
@@ -605,7 +681,7 @@ pub(crate) fn is_muted(
         return false;
     };
     stored.get(entry.id).is_some_and(|rows| {
-        rows.is_empty() || (!entry.ordered_batch && !rows.iter().any(|reply| reply.key == key))
+        rows.is_empty() || !rows.iter().any(|reply| reply.key == key)
     })
 }
 
@@ -618,112 +694,32 @@ pub(crate) fn is_muted(
 // - default 是内置文案，也是“用户没改过”时的唯一来源。
 // - summary 给命令面板做说明；group 用于面板分组。
 
-/// 大厅帮助（点歌类）逐行文案。
-pub(crate) const HELP_SONG_REQUEST: [ReplyTemplate; 3] = [
-    ReplyTemplate {
-        key: "help.song_request.1",
-        default: "点歌示例: @点歌/@AI点歌 歌名 歌手 伴奏,输入伴奏时优先匹配伴奏",
-        summary: "大厅帮助-点歌示例",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.song_request.2",
-        default: "切换网易平台: @网易点歌/@网易云点歌 歌名 歌手 伴奏,默认为QQ平台",
-        summary: "大厅帮助-切换平台",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.song_request.3",
-        default: "可用 @QQ点歌/@网易点歌/@网易云点歌 指定来源,@AI点歌用于智能识别歌名歌手",
-        summary: "大厅帮助-音源说明",
-        group: "管理",
-    },
-];
+/// 大厅帮助（点歌类）。
+///
+/// 单条模板、多行文案：一行发一条消息。合并成一个 key 后，
+/// 用户改一处就能看到全部帮助，不必在三个文本框之间来回找。
+pub(crate) const HELP_SONG_REQUEST: ReplyTemplate = ReplyTemplate {
+    key: "help.song_request",
+    default: "点歌示例: @点歌/@AI点歌 歌名 歌手 伴奏,输入伴奏时优先匹配伴奏\n切换网易平台: @网易点歌/@网易云点歌 歌名 歌手 伴奏,默认为QQ平台\n可用 @QQ点歌/@网易点歌/@网易云点歌 指定来源,@AI点歌用于智能识别歌名歌手",
+    summary: "大厅帮助（点歌）",
+    group: "管理",
+};
 
-/// 大厅帮助（歌单类）逐行文案。
-pub(crate) const HELP_PLAYLIST: [ReplyTemplate; 4] = [
-    ReplyTemplate {
-        key: "help.playlist.1",
-        default: "歌单: @歌单 推荐5首歌; @随机歌单/@歌单随机 随机推荐",
-        summary: "歌单帮助-浏览",
-        group: "歌单",
-    },
-    ReplyTemplate {
-        key: "help.playlist.2",
-        default: "收藏: @收藏 收藏当前歌曲; @取消收藏",
-        summary: "歌单帮助-收藏",
-        group: "歌单",
-    },
-    ReplyTemplate {
-        key: "help.playlist.3",
-        default: "模式: @歌单模式/@播放歌单 进入歌单模式; @退出歌单模式/@大厅模式 退出歌单模式",
-        summary: "歌单帮助-播放模式",
-        group: "歌单",
-    },
-    ReplyTemplate {
-        key: "help.playlist.4",
-        default: "导入: @导入QQ歌单<数字ID>; @导入网易歌单<数字ID>; @歌单清空",
-        summary: "歌单帮助-导入",
-        group: "歌单",
-    },
-];
+/// 大厅帮助（歌单类）。
+pub(crate) const HELP_PLAYLIST: ReplyTemplate = ReplyTemplate {
+    key: "help.playlist",
+    default: "歌单: @歌单 推荐5首歌; @随机歌单/@歌单随机 随机推荐\n收藏: @收藏 收藏当前歌曲; @取消收藏\n模式: @歌单模式/@播放歌单 进入歌单模式; @退出歌单模式/@大厅模式 退出歌单模式\n导入: @导入QQ歌单<数字ID>; @导入网易歌单<数字ID>; @歌单清空",
+    summary: "大厅帮助（歌单）",
+    group: "歌单",
+};
 
-pub(crate) const HELP_ENTERTAINMENT: [ReplyTemplate; 9] = [
-    ReplyTemplate {
-        key: "help.entertainment.tarot.1",
-        default: "塔罗: #塔罗牌抽当天三张;#塔罗牌重抽提前换组;带问题自动AI",
-        summary: "娱乐帮助-塔罗1",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.entertainment.tarot.2",
-        default: "塔罗: UTC+8每日更新;#塔罗牌AI解读当前三张;#塔罗牌帮助",
-        summary: "娱乐帮助-塔罗2",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.entertainment.idiom",
-        default: "成语接龙: #接龙随机开局;同音模式用 #同音接龙随机开局;进行中直接发送成语/#提示/#解释",
-        summary: "娱乐帮助-成语接龙",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.entertainment.landlord",
-        default: "斗地主: #斗地主/#加入/#抢/#不抢/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌",
-        summary: "娱乐帮助-斗地主",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.entertainment.run_fast",
-        default: "跑得快: #跑得快/#加入/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌",
-        summary: "娱乐帮助-跑得快",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.entertainment.turtle_soup",
-        default: "海龟汤: #海龟汤;进行中 #状态/#结束;提问直接以#开头,如#他认识死者吗",
-        summary: "娱乐帮助-海龟汤",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.entertainment.turtle_soup_long",
-        default: "海龟汤长答案: ##1第一段,##2第二段,最后发送##提交;取消用##取消",
-        summary: "娱乐帮助-海龟汤长答案",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.entertainment.undercover.1",
-        default: "谁是卧底: #卧底/#卧底双;公屏 #开局/#状态/#退出/#结束/#重试/#内容",
-        summary: "娱乐帮助-谁是卧底1",
-        group: "管理",
-    },
-    ReplyTemplate {
-        key: "help.entertainment.undercover.2",
-        default: "谁是卧底: 好友私聊 #加入/#退出/#弃权/#A/#投A;局外好友私聊 #谜底",
-        summary: "娱乐帮助-谁是卧底2",
-        group: "管理",
-    },
-];
+/// 大厅帮助（娱乐类）。
+pub(crate) const HELP_ENTERTAINMENT: ReplyTemplate = ReplyTemplate {
+    key: "help.entertainment",
+    default: "塔罗: #塔罗牌抽当天三张;#塔罗牌重抽提前换组;带问题自动AI\n塔罗: UTC+8每日更新;#塔罗牌AI解读当前三张;#塔罗牌帮助\n成语接龙: #接龙随机开局;同音模式用 #同音接龙随机开局;进行中直接发送成语/#提示/#解释\n斗地主: #斗地主/#加入/#抢/#不抢/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌\n跑得快: #跑得快/#加入/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌\n海龟汤: #海龟汤;进行中 #状态/#结束;提问直接以#开头,如#他认识死者吗\n海龟汤长答案: ##1第一段,##2第二段,最后发送##提交;取消用##取消\n谁是卧底: #卧底/#卧底双;公屏 #开局/#状态/#退出/#结束/#重试/#内容\n谁是卧底: 好友私聊 #加入/#退出/#弃权/#A/#投A;局外好友私聊 #谜底",
+    summary: "大厅帮助（娱乐）",
+    group: "管理",
+};
 
 /// 点歌/歌单类回复文案。
 pub(crate) const REPLY_SONG: [ReplyTemplate; 1] = [ReplyTemplate {
@@ -739,10 +735,9 @@ pub(crate) const REPLY_SONG: [ReplyTemplate; 1] = [ReplyTemplate {
 /// 测试会拦住"定义了模板却漏登记"的情况。
 pub(crate) fn catalog() -> impl Iterator<Item = &'static ReplyTemplate> {
     // 帮助与 AI 聊天文案住在本文件里，此前漏登记，导致配置页看不到、也改不了。
-    HELP_SONG_REQUEST
-        .iter()
-        .chain(HELP_PLAYLIST.iter())
-        .chain(HELP_ENTERTAINMENT.iter())
+    std::iter::once(&HELP_SONG_REQUEST)
+        .chain(std::iter::once(&HELP_PLAYLIST))
+        .chain(std::iter::once(&HELP_ENTERTAINMENT))
         .chain(std::iter::once(&AI_CHAT_FORGET))
         .chain(std::iter::once(&AI_CHAT_TOO_LONG))
         .chain(std::iter::once(&AI_CHAT_UNAVAILABLE))
@@ -890,6 +885,31 @@ mod tests {
     }
 
     #[test]
+    fn every_reply_variable_has_a_short_example() {
+        // 面板按钮展示示例值而不是占位符：用户看到「晴天」就知道这条变量长什么样。
+        // 示例必须简短，否则按钮会撑破布局；也不能为空或仍是占位符。
+        for variable in reply_variables() {
+            assert!(
+                !variable.example.trim().is_empty(),
+                "变量 {} 缺少示例",
+                variable.name
+            );
+            assert!(
+                variable.example.chars().count() <= 16,
+                "变量 {} 的示例过长：{}",
+                variable.name,
+                variable.example
+            );
+            assert!(
+                !variable.example.contains('{') && !variable.example.contains('}'),
+                "变量 {} 的示例不该是占位符：{}",
+                variable.name,
+                variable.example
+            );
+        }
+    }
+
+    #[test]
     fn every_catalog_key_is_owned_by_exactly_one_command() {
         // 这是"全部命令可编辑"的结构性保证：目录里任何一条文案都必须能在
         // 某个命令下被编辑；否则配置页列出它、命令面板却找不到入口。
@@ -949,21 +969,6 @@ mod tests {
                 "{alias} 既有别名又自带分组，归属会歧义"
             );
         }
-    }
-
-    #[test]
-    fn ordered_batch_groups_are_the_help_batches() {
-        // 只有"整段按序发送"的帮助类命令允许增删行；业务分支回复必须按实际分支发送。
-        let ordered: Vec<_> = ownership::REPLY_GROUPS
-            .iter()
-            .filter(|group| group.ordered_batch)
-            .map(|group| group.command_id)
-            .collect();
-        assert_eq!(
-            ordered,
-            ["@歌单帮助", "#塔罗牌帮助", "@帮助", "@娱乐帮助"],
-            "按序批量发送的命令清单发生变化，请确认这是有意的"
-        );
     }
 
     #[test]
@@ -1057,19 +1062,6 @@ mod tests {
         // 留空 / 停用 = 恢复内置默认，不应再返回覆盖。
         let stored = stored(&[]);
         assert_eq!(stored_override(&stored, "playback.volume.set"), None);
-    }
-
-    #[test]
-    fn stored_override_ignores_ordered_batch_commands() {
-        // 按序批量命令的单条文案由组装层按行渲染，不走单条覆盖查找。
-        let stored = std::collections::BTreeMap::from([(
-            "@帮助".to_string(),
-            vec![crate::config::StoredReply {
-                key: "help.song_request.1".to_string(),
-                text: "自定义".to_string(),
-            }],
-        )]);
-        assert_eq!(stored_override(&stored, "help.song_request.1"), None);
     }
 
     #[test]

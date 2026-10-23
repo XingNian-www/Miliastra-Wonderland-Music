@@ -67,6 +67,9 @@ pub struct TurtleSoupConfig {
     /// 可选的海龟汤专用模型；留空沿用 ai.model。
     #[serde(default)]
     pub model: String,
+    /// 思考强度；unset 表示不显式发送。
+    #[serde(default)]
+    pub reasoning: crate::config::ai::ReasoningEffort,
     /// 单次裁决允许生成的最大 Token。
     #[serde(default = "default_ai_max_tokens")]
     pub max_tokens: u32,
@@ -92,6 +95,7 @@ impl Default for TurtleSoupConfig {
             review_prompt: default_turtle_review_prompt(),
             custom_prompt: String::new(),
             model: String::new(),
+            reasoning: Default::default(),
             max_tokens: default_ai_max_tokens(),
         }
     }
@@ -1984,7 +1988,10 @@ impl TurtleSoupWorker {
         let content = crate::config::ai::request_json(
             &self.openai,
             &self.ai,
-            &self.config.model,
+            &crate::config::ai::AiCallOptions {
+                model: self.config.model.clone(),
+                reasoning: self.config.reasoning,
+            },
             &system_prompt,
             &user_prompt,
             self.config.max_tokens,

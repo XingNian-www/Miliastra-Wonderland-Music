@@ -64,6 +64,11 @@ pub enum FieldKind {
     Point,
     /// 敏感字段（API Key 等）：只显示掩码，空/掩码提交表示不修改
     Secret,
+    /// 模型名：面板提供"从服务端列表选择"按钮，同时保留手填。
+    ///
+    /// 单独一种类型而不是复用 String：模型名可以远程获取，
+    /// 但网关差异大、列表也可能拉取失败，所以必须同时允许手写。
+    ModelName,
 }
 
 /// 需要脱敏的 secret 字段（点路径），**唯一权威定义**。
@@ -1555,8 +1560,20 @@ fn turtle_soup_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "model",
             "专用模型",
-            FieldKind::String,
+            FieldKind::ModelName,
             "海龟汤专用模型；留空沿用 ai.model。裁决偏重复杂逻辑，可用更强模型",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "reasoning",
+            "思考强度",
+            FieldKind::Enum(vec![
+                ("unset".to_string(), "不指定（服务端默认）".to_string()),
+                ("minimal".to_string(), "最低".to_string()),
+                ("low".to_string(), "低".to_string()),
+                ("medium".to_string(), "中".to_string()),
+                ("high".to_string(), "高".to_string()),
+            ]),
+            "海龟汤裁决的思考强度；留空跟随服务端默认。裁决逻辑复杂，通常用中或高",
         ),
         ConfigFieldSchema::db_idle_reload(
             "max_tokens",
@@ -1602,7 +1619,7 @@ fn ai_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "model",
             "默认模型",
-            FieldKind::String,
+            FieldKind::ModelName,
             "所有 AI 功能的默认模型；各功能可单独覆盖，custom 必须填写",
         ),
         ConfigFieldSchema::db_idle_reload(
@@ -1629,6 +1646,12 @@ fn ai_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Object,
             "服务商专属请求参数。Web 对 MiMo/OpenAI/DeepSeek 提供官方字段结构化表单；只有 custom 使用自由 JSON。与程序固定字段同名时程序值优先",
         ),
+        ConfigFieldSchema::db_idle_reload(
+            "reasoning_rules",
+            "思考强度适配规则",
+            FieldKind::Object,
+            "按模型改写或拒绝某个思考强度：不同模型接受的 effort 词不同，写错会 400。规则按 from + 模型匹配（exact/prefix/suffix），to 写 deny 表示不支持。匹配不到的模型原样发送；若上游仍以 400 拒绝，程序会自动去掉该字段重试一次",
+        ),
     ]
 }
 
@@ -1638,8 +1661,20 @@ fn song_ai_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "model",
             "专用模型",
-            FieldKind::String,
+            FieldKind::ModelName,
             "点歌专用模型；留空沿用 ai.model。点歌偏重低延迟",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "reasoning",
+            "思考强度",
+            FieldKind::Enum(vec![
+                ("unset".to_string(), "不指定（服务端默认）".to_string()),
+                ("minimal".to_string(), "最低".to_string()),
+                ("low".to_string(), "低".to_string()),
+                ("medium".to_string(), "中".to_string()),
+                ("high".to_string(), "高".to_string()),
+            ]),
+            "点歌匹配的思考强度；留空跟随服务端默认。点歌偏重低延迟，通常用最低",
         ),
         ConfigFieldSchema::db_idle_reload(
             "local_recommend",
@@ -1746,8 +1781,20 @@ fn song_review_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "model",
             "审核模型",
-            FieldKind::String,
+            FieldKind::ModelName,
             "审核专用模型；留空沿用 ai.model。审核偏重判断质量，建议用更强模型",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "reasoning",
+            "思考强度",
+            FieldKind::Enum(vec![
+                ("unset".to_string(), "不指定（服务端默认）".to_string()),
+                ("minimal".to_string(), "最低".to_string()),
+                ("low".to_string(), "低".to_string()),
+                ("medium".to_string(), "中".to_string()),
+                ("high".to_string(), "高".to_string()),
+            ]),
+            "歌曲审核的思考强度；审核偏重判断质量，通常用中或高",
         ),
         ConfigFieldSchema::db_idle_reload(
             "web_search",
@@ -2442,8 +2489,20 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "model",
             "专用模型",
-            FieldKind::String,
+            FieldKind::ModelName,
             "留空沿用 ai.model",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "reasoning",
+            "思考强度",
+            FieldKind::Enum(vec![
+                ("unset".to_string(), "不指定（服务端默认）".to_string()),
+                ("minimal".to_string(), "最低".to_string()),
+                ("low".to_string(), "低".to_string()),
+                ("medium".to_string(), "中".to_string()),
+                ("high".to_string(), "高".to_string()),
+            ]),
+            "AI 聊天的思考强度；留空跟随服务端默认",
         ),
         ConfigFieldSchema::db_idle_reload(
             "max_tokens",
@@ -2892,6 +2951,7 @@ mod tests {
                     | FieldKind::Text
                     | FieldKind::Path
                     | FieldKind::Secret
+                    | FieldKind::ModelName
                     | FieldKind::Enum(_) => {
                         assert!(field_value.is_string(), "字段 {} 必须是字符串", field.path);
                     }

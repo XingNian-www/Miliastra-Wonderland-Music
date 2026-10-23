@@ -34,6 +34,9 @@ pub(crate) struct SongReviewConfig {
     /// 可选的审核专用模型；留空沿用 ai.model。
     #[serde(default)]
     pub model: String,
+    /// 思考强度；unset 表示不显式发送。
+    #[serde(default)]
+    pub reasoning: crate::config::ai::ReasoningEffort,
     /// 是否要求模型联网搜索后再判断；网关不支持 web_search 时应关闭。
     #[serde(default = "default_web_search")]
     pub web_search: bool,
@@ -56,6 +59,7 @@ impl Default for SongReviewConfig {
             policy_prompt: default_song_review_policy_prompt(),
             custom_prompt: String::new(),
             model: String::new(),
+            reasoning: Default::default(),
             web_search: default_web_search(),
             max_tokens: default_review_max_tokens(),
         }
@@ -236,7 +240,10 @@ impl SongReviewClient {
         if self.config.web_search && self.ai.wire_api != WireApi::Responses {
             bail!("歌曲审核需要 web_search，必须使用 ai.wire_api=responses");
         }
-        let target = self.ai.resolve(&self.config.model)?;
+        let target = self.ai.resolve_with(&crate::config::ai::AiCallOptions {
+            model: self.config.model.clone(),
+            reasoning: self.config.reasoning,
+        })?;
         let request = build_review_request(&self.config, &target, candidate)?;
         let reply = call_review_http(&self.openai, &target, request, self.request_timeout)?;
         let json_text = model_reply_json_object(&reply)?;
@@ -372,7 +379,7 @@ fn call_review_http(
         .create_response(
             target.build_target()?,
             request,
-            &target.extra_body,
+            &crate::config::ai::merged_extra_body(target),
             request_timeout,
         )?
         .wait()?;
@@ -732,7 +739,10 @@ mod tests {
             username: "测试".to_string(),
         };
         let target = test_ai_config()
-            .resolve(&config.model)
+            .resolve_with(&crate::config::ai::AiCallOptions {
+                model: config.model.clone(),
+                reasoning: config.reasoning,
+            })
             .expect("resolved target");
         let request =
             build_review_request(&config, &target, &candidate).expect("responses request");
@@ -770,7 +780,10 @@ mod tests {
             username: "测试者".to_string(),
         };
         let target = test_ai_config()
-            .resolve(&config.model)
+            .resolve_with(&crate::config::ai::AiCallOptions {
+                model: config.model.clone(),
+                reasoning: config.reasoning,
+            })
             .expect("resolved target");
         let request =
             build_review_request(&config, &target, &candidate).expect("responses request");

@@ -17,8 +17,6 @@ pub(crate) struct CommandReplyGroup {
     pub(crate) name: &'static str,
     /// 面板分组，取 CommandGroup::label() 的取值。
     pub(crate) category: &'static str,
-    /// 按序批量发送：用户可增删行、调整顺序。
-    pub(crate) ordered_batch: bool,
     /// 该命令拥有的模板 key，顺序即面板展示顺序。
     pub(crate) keys: &'static [&'static str],
 }
@@ -29,7 +27,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@QQ点歌",
         name: "点歌",
         category: "点歌",
-        ordered_batch: false,
         keys: &[
             "playback.dedup.recently_played",
             "playback.dedup.skipped",
@@ -61,7 +58,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@歌单",
         name: "歌单",
         category: "点歌",
-        ordered_batch: false,
         keys: &[
             "song.playlist.friend_only",
             // 窗口推荐（@歌单 打开后的一批候选）与选曲回执。
@@ -114,19 +110,14 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@歌单帮助",
         name: "歌单帮助",
         category: "点歌",
-        ordered_batch: true,
         keys: &[
-            "help.playlist.1",
-            "help.playlist.2",
-            "help.playlist.3",
-            "help.playlist.4",
+            "help.playlist",
         ],
     },
     CommandReplyGroup {
         command_id: "@暂停",
         name: "暂停",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.pause.ok",
         ],
@@ -135,7 +126,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@继续",
         name: "继续 / 播放",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.resume.ok",
         ],
@@ -144,7 +134,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@下一首",
         name: "下一首",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.next.pool_fallback",
             "playback.next.empty",
@@ -154,7 +143,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@上一首",
         name: "上一首",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.previous.missing",
         ],
@@ -163,7 +151,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@删除",
         name: "删除当前曲目",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.delete.track_unavailable",
             "playback.delete.removed.pool_fallback",
@@ -176,7 +163,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@音量",
         name: "音量",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.volume.set",
         ],
@@ -185,7 +171,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@队列",
         name: "队列",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.queue.empty",
             "playback.queue.header",
@@ -196,7 +181,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@队列删除",
         name: "队列删除",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.queue.delete.invalid",
             "playback.queue.delete.missing",
@@ -207,7 +191,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@队列清空",
         name: "队列清空",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.queue.cleared",
         ],
@@ -216,7 +199,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@歌词",
         name: "歌词",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.lyrics.toggle.translation",
             "playback.lyrics.toggle.original",
@@ -231,7 +213,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@状态",
         name: "播放状态",
         category: "播放",
-        ordered_batch: false,
         // @状态 是运行时拼装的动态行，拆成主模板 + 可选片段：
         // 有歌 / 无歌两张排版，外加点歌人与歌单前缀两个可留空的片段。
         keys: &[
@@ -245,7 +226,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@后台歌词",
         name: "后台歌词",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.lyrics.background.started",
         ],
@@ -254,7 +234,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@单曲歌词",
         name: "单曲歌词",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.lyrics.single_song.started",
         ],
@@ -263,7 +242,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@停止歌词",
         name: "停止歌词",
         category: "播放",
-        ordered_batch: false,
         keys: &[
             "playback.lyrics.background.stopped",
             "playback.lyrics.background.not_running",
@@ -273,7 +251,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@大厅检测",
         name: "大厅检测",
         category: "大厅",
-        ordered_batch: false,
         keys: &[
             "hall.detect.failed",
             "hall.public.current",
@@ -284,7 +261,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@大厅时间",
         name: "大厅时间",
         category: "大厅",
-        ordered_batch: false,
         keys: &[
             "hall.time.remaining",
             "hall.time.unknown",
@@ -297,7 +273,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@麦克风",
         name: "麦克风",
         category: "大厅",
-        ordered_batch: false,
         keys: &[
             "hall.microphone.toggled",
         ],
@@ -306,7 +281,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "#塔罗牌",
         name: "塔罗牌",
         category: "娱乐",
-        ordered_batch: false,
         keys: &[
             "tarot.question.too_long",
             "tarot.actor.missing",
@@ -321,18 +295,14 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "#塔罗牌帮助",
         name: "塔罗牌帮助",
         category: "娱乐",
-        ordered_batch: true,
         keys: &[
-            "tarot.help.draw",
-            "tarot.help.reroll",
-            "tarot.help.interpret",
+            "tarot.help",
         ],
     },
     CommandReplyGroup {
         command_id: "#接龙",
         name: "成语接龙",
         category: "娱乐",
-        ordered_batch: false,
         keys: &[
             "idiom_chain.occupied.turtle_soup",
             "idiom_chain.occupied.other",
@@ -366,7 +336,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "#斗地主",
         name: "斗地主",
         category: "娱乐",
-        ordered_batch: false,
         keys: &[
             "card_games.disabled",
             "card_games.already_active",
@@ -430,7 +399,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "#跑得快",
         name: "跑得快",
         category: "娱乐",
-        ordered_batch: false,
         keys: &[
             "card_games.run_fast.started",
             "card_games.play.spade_three_required",
@@ -445,7 +413,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "#海龟汤",
         name: "海龟汤",
         category: "娱乐",
-        ordered_batch: false,
         keys: &[
             "turtle_soup.judgment.suffix",
             "turtle_soup.judgment.reply",
@@ -496,7 +463,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "#卧底",
         name: "谁是卧底",
         category: "娱乐",
-        ordered_batch: false,
         keys: &[
             "undercover.vote.instruction",
             "undercover.start.secret",
@@ -561,49 +527,34 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@帮助",
         name: "帮助",
         category: "管理",
-        ordered_batch: true,
         keys: &[
-            "help.song_request.1",
-            "help.song_request.2",
-            "help.song_request.3",
+            "help.song_request",
         ],
     },
     CommandReplyGroup {
         command_id: "@娱乐帮助",
         name: "娱乐帮助",
         category: "管理",
-        ordered_batch: true,
         keys: &[
-            "help.entertainment.tarot.1",
-            "help.entertainment.tarot.2",
-            "help.entertainment.idiom",
-            "help.entertainment.landlord",
-            "help.entertainment.run_fast",
-            "help.entertainment.turtle_soup",
-            "help.entertainment.turtle_soup_long",
-            "help.entertainment.undercover.1",
-            "help.entertainment.undercover.2",
+            "help.entertainment",
         ],
     },
     CommandReplyGroup {
         command_id: "@启用",
         name: "启用命令识别",
         category: "管理",
-        ordered_batch: false,
         keys: &["admin.commands.enabled"],
     },
     CommandReplyGroup {
         command_id: "@禁用",
         name: "禁用命令识别",
         category: "管理",
-        ordered_batch: false,
         keys: &["admin.commands.disabled"],
     },
     CommandReplyGroup {
         command_id: "@忘记我",
         name: "AI 聊天",
         category: "管理",
-        ordered_batch: false,
         keys: &[
             "ai_chat.forget.done",
             "ai_chat.question.too_long",
@@ -614,7 +565,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@拉黑",
         name: "拉黑 / 屏蔽",
         category: "管理",
-        ordered_batch: false,
         keys: &[
             "moderation.request.pending",
             "moderation.vote.opened",
@@ -624,7 +574,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@邀请",
         name: "邀请",
         category: "管理",
-        ordered_batch: false,
         keys: &[
             "invite.accepted",
             "invite.sent",
@@ -634,7 +583,6 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "custom_workflow",
         name: "自定义流程",
         category: "管理",
-        ordered_batch: false,
         keys: &[
             "workflow.confirm.timeout",
         ],

@@ -789,11 +789,11 @@ impl PlaylistApplication {
             )]);
         }
         match command {
-            // 帮助四行由组装层按 @歌单帮助 的覆盖逐行渲染。
-            PlaylistCommand::Help => Ok(crate::features::reply_template::HELP_PLAYLIST
-                .iter()
-                .map(|spec| PlaylistReply::keyed(spec, ReplyVars::new()))
-                .collect()),
+            // 帮助是单条模板、多行内容：拆条由发送路径负责。
+            PlaylistCommand::Help => Ok(vec![PlaylistReply::keyed(
+                &crate::features::reply_template::HELP_PLAYLIST,
+                ReplyVars::new(),
+            )]),
             PlaylistCommand::Open => {
                 self.discard_window(owner)?;
                 let total = self.count(owner)?;
@@ -1311,7 +1311,10 @@ mod tests {
             current: None,
             played: Vec::new(),
         };
-        let messages = play(&app, "甲", &PlaylistCommand::Help, &mut port);
+        // 帮助是单条多行模板：业务层返回 1 条，拆条发生在发送路径。
+        let raw = play(&app, "甲", &PlaylistCommand::Help, &mut port);
+        assert_eq!(raw.len(), 1);
+        let messages = crate::text::split_configured_lines(&raw[0]);
         assert_eq!(messages.len(), 4);
         assert!(
             messages

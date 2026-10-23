@@ -8,27 +8,13 @@
 
 use super::ReplyTemplate;
 
-/// 抽牌帮助第一行。
-pub(crate) const HELP_DRAW: ReplyTemplate = ReplyTemplate {
-    key: "tarot.help.draw",
-    default: "#塔罗牌 [问题] 抽当天三张：现状、提醒、建议；带问题自动AI解读。",
-    summary: "塔罗帮助：抽当天三张",
-    group: "娱乐",
-};
-
-/// 重抽帮助。
-pub(crate) const HELP_REROLL: ReplyTemplate = ReplyTemplate {
-    key: "tarot.help.reroll",
-    default: "#塔罗牌重抽 [问题] 提前换一组当天牌。",
-    summary: "塔罗帮助：重抽",
-    group: "娱乐",
-};
-
-/// 只解读当前三张的帮助。
-pub(crate) const HELP_INTERPRET: ReplyTemplate = ReplyTemplate {
-    key: "tarot.help.interpret",
-    default: "#塔罗牌AI [问题] 解读当前三张，不重新抽牌。",
-    summary: "塔罗帮助：只解读不重抽",
+/// 塔罗帮助。
+///
+/// 单条模板、多行文案：一行发一条消息。
+pub(crate) const HELP: ReplyTemplate = ReplyTemplate {
+    key: "tarot.help",
+    default: "#塔罗牌 [问题] 抽当天三张：现状、提醒、建议；带问题自动AI解读。\n#塔罗牌重抽 [问题] 提前换一组当天牌。\n#塔罗牌AI [问题] 解读当前三张，不重新抽牌。",
+    summary: "塔罗帮助",
     group: "娱乐",
 };
 
@@ -90,9 +76,7 @@ pub(crate) const AI_UNAVAILABLE: ReplyTemplate = ReplyTemplate {
 
 /// 塔罗全部模板。键一旦发布不要改名。
 pub(crate) const TAROT: &[ReplyTemplate] = &[
-    HELP_DRAW,
-    HELP_REROLL,
-    HELP_INTERPRET,
+    HELP,
     QUESTION_TOO_LONG,
     ACTOR_MISSING,
     COOLDOWN,
@@ -132,17 +116,12 @@ mod tests {
     #[test]
     fn rendering_tarot_templates_reproduces_the_pre_migration_strings() {
         // 改造前这些文案写死在 execute_for_day 里；渲染结果必须逐字一致。
+        // 帮助合并成单条多行模板：三行内容与合并前逐字一致。
         assert_eq!(
-            text(&HELP_DRAW, ReplyVars::new()),
-            "#塔罗牌 [问题] 抽当天三张：现状、提醒、建议；带问题自动AI解读。"
-        );
-        assert_eq!(
-            text(&HELP_REROLL, ReplyVars::new()),
-            "#塔罗牌重抽 [问题] 提前换一组当天牌。"
-        );
-        assert_eq!(
-            text(&HELP_INTERPRET, ReplyVars::new()),
-            "#塔罗牌AI [问题] 解读当前三张，不重新抽牌。"
+            text(&HELP, ReplyVars::new()),
+            "#塔罗牌 [问题] 抽当天三张：现状、提醒、建议；带问题自动AI解读。\n\
+             #塔罗牌重抽 [问题] 提前换一组当天牌。\n\
+             #塔罗牌AI [问题] 解读当前三张，不重新抽牌。"
         );
         assert_eq!(
             text(&QUESTION_TOO_LONG, ReplyVars::new()),

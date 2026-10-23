@@ -224,18 +224,10 @@ impl ApplicationRuntime {
         Some(rendered.text)
     }
 
-    fn command_reply_text(&self, key: &str) -> Option<String> {
-        let entry = crate::features::reply_template::command_reply_entry_for_key(key)?;
-        if entry.ordered_batch {
-            return None;
-        }
+    pub(super) fn command_reply_text(&self, key: &str) -> Option<String> {
         let store = self.lifecycle.config_store.as_ref()?.lock().ok()?;
         let replies = store.reply_templates().ok()?;
-        replies
-            .get(entry.id)?
-            .iter()
-            .find(|reply| reply.key == key)
-            .map(|reply| reply.text.clone())
+        crate::features::reply_template::stored_override(&replies, key)
     }
 
     pub(super) fn command_reply_is_muted(&self, key: &str) -> bool {
@@ -252,7 +244,7 @@ impl ApplicationRuntime {
             return false;
         };
         replies.get(entry.id).is_some_and(|rows| {
-            rows.is_empty() || (!entry.ordered_batch && !rows.iter().any(|reply| reply.key == key))
+            rows.is_empty() || !rows.iter().any(|reply| reply.key == key)
         })
     }
 
@@ -268,7 +260,16 @@ impl ApplicationRuntime {
         let Some(text) = self.render_template_text(spec, vars) else {
             return Ok(());
         };
-        self.reply(&text)
+        // 用户可以在一条回复里写多行：一行发一条消息，超宽的行按聊天宽度硬切。
+        let messages = crate::text::split_configured_lines(&text);
+        if messages.is_empty() {
+            return Ok(());
+        }
+        if messages.len() == 1 {
+            return self.reply(&messages[0]);
+        }
+        let refs: Vec<&str> = messages.iter().map(String::as_str).collect();
+        self.reply_batch(&refs, 0)
     }
 
     pub(super) fn update_monitor_playback_controller(&self) {

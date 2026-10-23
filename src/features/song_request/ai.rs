@@ -30,6 +30,9 @@ pub struct SongAiConfig {
     /// 可选的专用模型；留空沿用 ai.model。
     #[serde(default)]
     pub model: String,
+    /// 思考强度；unset 表示不显式发送。
+    #[serde(default)]
+    pub reasoning: crate::config::ai::ReasoningEffort,
     /// 在线匹配偏低时是否额外给出本地曲库推荐；默认开启。
     #[serde(default = "default_local_recommend")]
     pub local_recommend: bool,
@@ -54,6 +57,7 @@ impl Default for SongAiConfig {
             match_prompt: default_match_prompt(),
             candidate_pick_prompt: default_candidate_pick_prompt(),
             model: String::new(),
+            reasoning: Default::default(),
             local_recommend: default_local_recommend(),
             local_recommend_min_score: default_local_recommend_min_score(),
         }
@@ -106,12 +110,20 @@ impl AiClient {
         !self.connection.api_key.trim().is_empty()
     }
 
+    /// 本功能的模型与思考强度，供所有调用点复用。
+    fn call_options(&self) -> crate::config::ai::AiCallOptions {
+        crate::config::ai::AiCallOptions {
+            model: self.config.model.clone(),
+            reasoning: self.config.reasoning,
+        }
+    }
+
     /// 共用连接配置和超时，但由独立业务提供系统提示词，避免混用点歌提示词。
     pub(crate) fn request_feature_json(&self, system: &str, prompt: &str) -> Result<Value> {
         let reply = crate::config::ai::request_json(
             &self.openai,
             &self.connection,
-            &self.config.model,
+            &self.call_options(),
             system,
             prompt,
             1024,
@@ -135,7 +147,7 @@ impl AiClient {
         let reply = crate::config::ai::request_json(
             &self.openai,
             connection,
-            &self.config.model,
+            &self.call_options(),
             &self.system_prompt(),
             &build_match_prompt(
                 &self.config.match_prompt,
@@ -174,7 +186,7 @@ impl AiClient {
         let reply = crate::config::ai::request_json(
             &self.openai,
             &self.connection,
-            &self.config.model,
+            &self.call_options(),
             &self.system_prompt(),
             &prompt,
             1024,
@@ -197,7 +209,7 @@ impl AiClient {
         let reply = crate::config::ai::request_json(
             &self.openai,
             &self.connection,
-            &self.config.model,
+            &self.call_options(),
             &self.system_prompt(),
             &build_candidate_pick_prompt(
                 &self.config.candidate_pick_prompt,
@@ -310,7 +322,7 @@ impl AiClient {
         let reply = crate::config::ai::request_json(
             &self.openai,
             &self.query_connection(query)?,
-            &self.config.model,
+            &self.call_options(),
             &self.system_prompt(),
             &build_recognize_prompt(&self.config.recognize_prompt, &text),
             1024,
@@ -348,7 +360,7 @@ impl AiClient {
         let reply = crate::config::ai::request_json(
             &self.openai,
             &connection,
-            &self.config.model,
+            &self.call_options(),
             &self.system_prompt(),
             &build_candidate_pick_prompt(
                 &self.config.candidate_pick_prompt,

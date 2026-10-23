@@ -49,6 +49,167 @@ pub(crate) enum AiProvider {
     Custom,
 }
 
+/// 思考强度。OpenAI 兼容网关把它放在 `reasoning.effort`（Responses）
+/// 或 `reasoning_effort`（Chat Completions）里。
+///
+/// 单独建模而不是让用户手写 extra_body，是为了：
+/// - 面板能直接给出下拉选项，不必知道 JSON 结构；
+/// - 两个线上协议的字段名差异由这里收敛；
+/// - 取值有校验，写错不会静默失效。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// 不显式发送，由服务端默认决定。
+    #[default]
+    Unset,
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// 调用请求体里的字段值；Unset 返回 None（不发送该字段）。
+    pub(crate) fn as_wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::Unset => None,
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+        }
+    }
+
+    /// 从线上值反查；无法识别时视为不发送。
+    fn from_wire_value(value: &str) -> Self {
+        match value {
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            _ => Self::Unset,
+        }
+    }
+}
+
+/// 一条思考强度适配规则。
+///
+/// 不同模型接受的 effort 词不同：有的只认 low/medium/high，收到 minimal 会 400。
+/// 这里按模型 ID 把源值改写成目标值，或直接拒绝（`deny`）以免发出必失败的请求。
+/// 模型匹配支持精确、前缀、后缀——与常见网关的命名习惯一致
+/// （如 `o1-preview`、`gpt-5-*`、`*-reasoning`）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningRule {
+    /// 匹配的源 effort 值（low/medium/high/minimal）。
+    pub from: String,
+    /// 改写目标值；`deny` 表示该模型不支持此强度。
+    pub to: String,
+    /// 模型匹配方式：exact / prefix / suffix；留空表示适用所有模型。
+    #[serde(default)]
+    pub match_type: String,
+    /// 与 match_type 配套的模型片段；留空表示适用所有模型。
+    #[serde(default)]
+    pub model: String,
+}
+
+impl ReasoningRule {
+    /// 该规则是否适用于这个模型。
+    fn applies_to(&self, model: &str) -> bool {
+        let needle = self.model.trim();
+        if needle.is_empty() {
+            return true;
+        }
+        let model = model.trim();
+        match self.match_type.trim().to_ascii_lowercase().as_str() {
+            "exact" => model == needle,
+            "prefix" | "" => model.starts_with(needle),
+            "suffix" => model.ends_with(needle),
+            _ => false,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.from.trim().is_empty() || self.to.trim().is_empty() {
+            bail!("ai.reasoning_rules 的 from/to 不能为空");
+        }
+        if !matches!(self.from.trim(), "minimal" | "low" | "medium" | "high") {
+            bail!(
+                "ai.reasoning_rules.from 只允许 minimal/low/medium/high，当前为：{}",
+                self.from
+            );
+        }
+        let to = self.to.trim();
+        if to != "deny" && !matches!(to, "minimal" | "low" | "medium" | "high") {
+            bail!("ai.reasoning_rules.to 只允许 minimal/low/medium/high/deny，当前为：{to}");
+        }
+        let kind = self.match_type.trim().to_ascii_lowercase();
+        if !kind.is_empty() && !matches!(kind.as_str(), "exact" | "prefix" | "suffix") {
+            bail!("ai.reasoning_rules.match_type 只允许 exact/prefix/suffix");
+        }
+        Ok(())
+    }
+}
+
+/// 按规则改写本模型的 effort。
+///
+/// 返回 `Ok(None)` 表示规则要求拒绝（不发送该字段或整体不调），
+/// `Ok(Some(effort))` 表示最终要发送的值。第一条命中的规则生效。
+fn apply_reasoning_rules(
+    model: &str,
+    effort: ReasoningEffort,
+    rules: &[ReasoningRule],
+) -> std::result::Result<Option<&'static str>, String> {
+    let Some(current) = effort.as_wire_value() else {
+        return Ok(None);
+    };
+    for rule in rules {
+        if rule.from.trim() != current || !rule.applies_to(model) {
+            continue;
+        }
+        let to = rule.to.trim();
+        if to == "deny" {
+            return Err(format!(
+                "模型 {model} 不接受思考强度 {current}，请在配置中改用其他强度"
+            ));
+        }
+        return Ok(Some(match to {
+            "minimal" => "minimal",
+            "low" => "low",
+            "medium" => "medium",
+            "high" => "high",
+            other => {
+                return Err(format!("未被识别的目标思考强度：{other}"));
+            }
+        }));
+    }
+    Ok(Some(current))
+}
+
+/// 单次调用的可变参数：模型与思考强度。/// 单次调用的可变参数：模型与思考强度。
+///
+/// 每个调用点各自构造一个，因此"点歌用高思考、审核用低思考"这种组合不需要
+/// 全局开关，也不会互相影响。空字符串模型表示沿用 `ai.model`。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AiCallOptions {
+    pub(crate) model: String,
+    pub(crate) reasoning: ReasoningEffort,
+}
+
+impl AiCallOptions {
+    pub(crate) fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            reasoning: ReasoningEffort::default(),
+        }
+    }
+
+    pub(crate) fn with_reasoning(mut self, reasoning: ReasoningEffort) -> Self {
+        self.reasoning = reasoning;
+        self
+    }
+}
+
 /// 唯一的 AI 连接配置段。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +228,12 @@ pub struct AiConfig {
     #[serde(default)]
     pub wire_api: WireApi,
     pub extra_body: HashMap<String, Value>,
+    /// 思考强度适配规则：按模型改写或拒绝某个 effort 值。
+    ///
+    /// 不同模型接受的词不同，写错会 400；这里让用户按模型前缀/后缀兜住差异，
+    /// 而不必为每个模型单独记一套可用值。
+    #[serde(default)]
+    pub reasoning_rules: Vec<ReasoningRule>,
 }
 
 impl Default for AiConfig {
@@ -80,6 +247,7 @@ impl Default for AiConfig {
             http_proxy: String::new(),
             wire_api: WireApi::default(),
             extra_body: HashMap::new(),
+            reasoning_rules: Vec::new(),
         }
     }
 }
@@ -93,6 +261,8 @@ pub(crate) struct ResolvedAiTarget {
     pub(crate) model: String,
     pub(crate) wire_api: WireApi,
     pub(crate) extra_body: HashMap<String, Value>,
+    /// 本次调用的思考强度；Unset 表示不发该字段。
+    pub(crate) reasoning: ReasoningEffort,
 }
 
 impl ResolvedAiTarget {
@@ -125,10 +295,18 @@ impl AiConfig {
         }
         let target = self.resolve("")?;
         target.build_target()?;
+        for rule in &self.reasoning_rules {
+            rule.validate()?;
+        }
         validate_extra_body(provider, &self.extra_body)
     }
 
     pub(crate) fn resolve(&self, feature_model: &str) -> Result<ResolvedAiTarget> {
+        self.resolve_with(&AiCallOptions::new(feature_model))
+    }
+
+    /// 按调用点选项解析目标：模型与思考强度都在这里生效。
+    pub(crate) fn resolve_with(&self, options: &AiCallOptions) -> Result<ResolvedAiTarget> {
         let provider = parse_provider(&self.provider)?;
         let wire_api = self.wire_api;
         let endpoint = match wire_api {
@@ -137,13 +315,22 @@ impl AiConfig {
             }
             WireApi::ChatCompletions => resolve_endpoint(provider, &self.endpoint)?,
         };
+        let model = resolve_model(provider, effective_model(self, &options.model))?;
+        // 规则按最终模型名匹配：模型可能来自功能覆盖或 ai.model，二者都要适用。
+        let reasoning = match apply_reasoning_rules(&model, options.reasoning, &self.reasoning_rules)
+        {
+            Ok(Some(wire)) => ReasoningEffort::from_wire_value(wire),
+            Ok(None) => ReasoningEffort::Unset,
+            Err(message) => bail!("{message}"),
+        };
         Ok(ResolvedAiTarget {
             provider,
             endpoint,
             api_key: normalize_api_key(&self.api_key)?,
-            model: resolve_model(provider, effective_model(self, feature_model))?,
+            model,
             wire_api,
             extra_body: self.extra_body.clone(),
+            reasoning,
         })
     }
 }
@@ -337,26 +524,85 @@ fn assert_no_control_chars<'a>(value: &'a str, name: &str) -> Result<&'a str> {
 pub(crate) fn request_json(
     openai: &miliastra_kernel::ai::OpenAiRuntimeHandle,
     config: &AiConfig,
-    feature_model: &str,
+    options: &AiCallOptions,
     system_prompt: &str,
     user_prompt: &str,
     max_tokens: u32,
     timeout: std::time::Duration,
 ) -> anyhow::Result<String> {
-    let target = config.resolve(feature_model)?;
+    let target = config.resolve_with(options)?;
+    let reasoning = target.reasoning;
+    match request_json_once(openai, &target, system_prompt, user_prompt, max_tokens, timeout) {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            // 兜底降级：某些模型不接受 reasoning 字段，会以 400 拒绝整个请求。
+            // 与其让用户去猜该配什么值，不如去掉该字段重试一次——这也是
+            // 中转服务普遍采用的兼容策略。只降级一次，避免掩盖真实错误。
+            if reasoning == ReasoningEffort::Unset || !looks_like_reasoning_rejection(&error) {
+                return Err(error);
+            }
+            log::warn!(
+                "模型 {} 拒绝了思考强度 {}，已去掉该字段重试: {error}",
+                target.model,
+                reasoning.as_wire_value().unwrap_or("unset")
+            );
+            let mut without = target.clone();
+            without.reasoning = ReasoningEffort::Unset;
+            request_json_once(openai, &without, system_prompt, user_prompt, max_tokens, timeout)
+        }
+    }
+}
+
+/// 判断错误是否指向 reasoning 字段。
+///
+/// 只认明确提到该字段的错误，避免把"模型不存在""余额不足"这类
+/// 与思考强度无关的失败也重试一遍。
+fn looks_like_reasoning_rejection(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    const REASONING_HINTS: [&str; 5] = [
+        "reasoning",
+        "reasoning_effort",
+        "thinking",
+        "unsupported parameter",
+        "invalid parameter",
+    ];
+    // "invalid parameter" 单独出现太宽泛，必须同时出现 reasoning 相关词。
+    REASONING_HINTS[..3].iter().any(|hint| text.contains(hint))
+        || (text.contains("parameter")
+            && (text.contains("reasoning") || text.contains("thinking")))
+}
+
+fn request_json_once(
+    openai: &miliastra_kernel::ai::OpenAiRuntimeHandle,
+    target: &ResolvedAiTarget,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+    timeout: std::time::Duration,
+) -> anyhow::Result<String> {
     match target.wire_api {
         WireApi::Responses => {
-            let request = build_responses_request(&target, system_prompt, user_prompt, max_tokens)?;
+            let request = build_responses_request(target, system_prompt, user_prompt, max_tokens)?;
             let response = openai
-                .create_response(target.build_target()?, request, &target.extra_body, timeout)?
+                .create_response(
+                    target.build_target()?,
+                    request,
+                    &merged_extra_body(target),
+                    timeout,
+                )?
                 .wait()
                 .context("AI 请求失败")?;
             responses_output_text(&response)
         }
         WireApi::ChatCompletions => {
-            let request = build_chat_request(&target, system_prompt, user_prompt, max_tokens)?;
+            let request = build_chat_request(target, system_prompt, user_prompt, max_tokens)?;
             let response = openai
-                .chat_completion(target.build_target()?, request, &target.extra_body, timeout)?
+                .chat_completion(
+                    target.build_target()?,
+                    request,
+                    &merged_extra_body(target),
+                    timeout,
+                )?
                 .wait()
                 .context("AI 请求失败")?;
             let choice = response
@@ -373,6 +619,35 @@ pub(crate) fn request_json(
                 .ok_or_else(|| anyhow::anyhow!("AI 响应缺少 choices[0].message.content"))
         }
     }
+}
+
+/// 把思考强度合进 extra_body。
+///
+/// 两个线上协议字段名不同：Responses 用嵌套的 reasoning.effort，
+/// Chat Completions 用扁平的 reasoning_effort。用户显式写进 extra_body 的
+/// 同名字段优先，避免被这里覆盖。
+pub(crate) fn merged_extra_body(target: &ResolvedAiTarget) -> HashMap<String, Value> {
+    let mut body = target.extra_body.clone();
+    let Some(effort) = target.reasoning.as_wire_value() else {
+        return body;
+    };
+    match target.wire_api {
+        WireApi::Responses => {
+            let entry = body
+                .entry("reasoning".to_string())
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(object) = entry.as_object_mut() {
+                object
+                    .entry("effort".to_string())
+                    .or_insert_with(|| Value::String(effort.to_string()));
+            }
+        }
+        WireApi::ChatCompletions => {
+            body.entry("reasoning_effort".to_string())
+                .or_insert_with(|| Value::String(effort.to_string()));
+        }
+    }
+    body
 }
 
 fn build_responses_request(
@@ -445,6 +720,101 @@ fn responses_output_text(response: &Response) -> anyhow::Result<String> {
     bail!("AI 响应缺少 output_text")
 }
 
+/// 从服务端拉取可用模型列表。
+///
+/// 走 `GET {base}/models`：base 由 chat/completions 地址去掉后缀得到，
+/// 因此 Responses 与 Chat Completions 两种配置都能用同一个接口。
+/// 只读，不改任何配置；失败时把服务端原文带给调用方，便于排查网关差异。
+pub(crate) fn fetch_models(config: &AiConfig) -> Result<Vec<String>> {
+    let provider = parse_provider(&config.provider)?;
+    let chat_endpoint = resolve_endpoint(provider, &config.endpoint)?;
+    let Some(base) = chat_endpoint.strip_suffix(CHAT_COMPLETIONS_SUFFIX) else {
+        bail!(
+            "拉取模型列表需要以 /chat/completions 结尾的地址，当前为：{chat_endpoint}"
+        );
+    };
+    let url = format!("{base}/models");
+    ensure_http_url(&url, "models 地址")?;
+    let api_key = normalize_api_key(&config.api_key)?;
+
+    let client = build_model_list_client(&config.http_proxy)?;
+    let mut request = client.get(&url);
+    // 与 kernel 的鉴权方式保持一致：Mimo 用 api-key，其余用 Bearer。
+    request = match authentication(provider) {
+        Authentication::ApiKey => request.header("api-key", &api_key),
+        Authentication::Bearer => request.bearer_auth(&api_key),
+    };
+    let response = request
+        .send()
+        .context("请求模型列表失败（检查 endpoint 与代理）")?;
+    let status = response.status();
+    let body = response.text().context("读取模型列表响应失败")?;
+    if !status.is_success() {
+        bail!(
+            "模型列表请求失败（HTTP {}）：{}",
+            status.as_u16(),
+            body.chars().take(300).collect::<String>()
+        );
+    }
+    parse_model_list(&body)
+}
+
+/// 兼容两种常见响应形状：
+/// - OpenAI：`{"data":[{"id":"gpt-..."},...]}`
+/// - 少数网关：`{"models":["a","b"]}` 或裸数组
+fn parse_model_list(body: &str) -> Result<Vec<String>> {
+    let value: Value = serde_json::from_str(body).context("模型列表响应不是合法 JSON")?;
+    let mut models = Vec::new();
+    let mut push = |id: &str| {
+        let id = id.trim();
+        if !id.is_empty() && !id.chars().any(char::is_control) {
+            models.push(id.to_string());
+        }
+    };
+    match &value {
+        Value::Object(object) => {
+            if let Some(items) = object.get("data").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        push(id);
+                    }
+                }
+            } else if let Some(items) = object.get("models").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(id) = item.as_str() {
+                        push(id);
+                    }
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(id) = item.as_str() {
+                    push(id);
+                }
+            }
+        }
+        _ => {}
+    }
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        bail!("模型列表为空或响应格式无法识别");
+    }
+    Ok(models)
+}
+
+/// 模型列表是一次短请求，单独建 client 以套用用户代理设置。
+fn build_model_list_client(proxy: &str) -> Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20));
+    let proxy = proxy.trim();
+    if !proxy.is_empty() {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).context("ai.http_proxy 配置无效")?);
+    }
+    builder.build().context("构建模型列表客户端失败")
+}
+
 /// One native tool conversation. History is replayed in full, including Responses
 /// reasoning items, so this does not depend on server-side response storage.
 pub(crate) struct ToolSession {
@@ -479,7 +849,14 @@ impl ToolSession {
         user: &str,
         tools: Vec<Value>,
     ) -> Result<Self> {
-        Self::with_history(config, feature_model, system, Vec::new(), user, tools)
+        Self::with_history_options(
+            config,
+            &AiCallOptions::new(feature_model),
+            system,
+            Vec::new(),
+            user,
+            tools,
+        )
     }
 
     /// Replay completed text turns before the current user message. Historical
@@ -487,6 +864,25 @@ impl ToolSession {
     pub(crate) fn with_history(
         config: &AiConfig,
         feature_model: &str,
+        system: &str,
+        history: Vec<Value>,
+        user: &str,
+        tools: Vec<Value>,
+    ) -> Result<Self> {
+        Self::with_history_options(
+            config,
+            &AiCallOptions::new(feature_model),
+            system,
+            history,
+            user,
+            tools,
+        )
+    }
+
+    /// 带调用点选项的构造：模型与思考强度都在这里落到 target 上。
+    pub(crate) fn with_history_options(
+        config: &AiConfig,
+        options: &AiCallOptions,
         system: &str,
         mut history: Vec<Value>,
         user: &str,
@@ -512,7 +908,7 @@ impl ToolSession {
             }
         }
         history.push(serde_json::json!({"role":"user", "content":user}));
-        let target = config.resolve(feature_model)?;
+        let target = config.resolve_with(options)?;
         target.build_target()?;
         validate_http_proxy(&config.http_proxy)?;
         validate_extra_body(target.provider, &target.extra_body)?;
@@ -1094,6 +1490,159 @@ mod tests {
             api_key: "secret".to_string(),
             ..AiConfig::default()
         }
+    }
+
+    fn rule(from: &str, to: &str, match_type: &str, model: &str) -> ReasoningRule {
+        ReasoningRule {
+            from: from.into(),
+            to: to.into(),
+            match_type: match_type.into(),
+            model: model.into(),
+        }
+    }
+
+    #[test]
+    fn reasoning_rules_rewrite_by_model_prefix_and_suffix() {
+        let rules = vec![
+            rule("minimal", "low", "prefix", "o1"),
+            rule("high", "medium", "suffix", "-mini"),
+        ];
+        // 前缀命中：o1 系列不接受 minimal。
+        assert_eq!(
+            apply_reasoning_rules("o1-preview", ReasoningEffort::Minimal, &rules).unwrap(),
+            Some("low")
+        );
+        // 后缀命中。
+        assert_eq!(
+            apply_reasoning_rules("gpt-5-mini", ReasoningEffort::High, &rules).unwrap(),
+            Some("medium")
+        );
+        // 没有规则命中时原样发送。
+        assert_eq!(
+            apply_reasoning_rules("gpt-5", ReasoningEffort::Minimal, &rules).unwrap(),
+            Some("minimal")
+        );
+    }
+
+    #[test]
+    fn reasoning_rules_can_deny_and_are_scoped_to_their_effort() {
+        let rules = vec![rule("minimal", "deny", "exact", "strict-model")];
+        assert!(
+            apply_reasoning_rules("strict-model", ReasoningEffort::Minimal, &rules).is_err(),
+            "deny 规则必须拒绝该组合"
+        );
+        // 同一模型的其它强度不受影响。
+        assert_eq!(
+            apply_reasoning_rules("strict-model", ReasoningEffort::High, &rules).unwrap(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn empty_model_selector_matches_every_model() {
+        let rules = vec![rule("minimal", "low", "", "")];
+        assert_eq!(
+            apply_reasoning_rules("任意模型", ReasoningEffort::Minimal, &rules).unwrap(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn unset_reasoning_never_consults_rules() {
+        let rules = vec![rule("minimal", "deny", "", "")];
+        assert_eq!(
+            apply_reasoning_rules("any", ReasoningEffort::Unset, &rules).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_rejections_are_detected_only_when_the_field_is_named() {
+        // 只对明确提到 reasoning/thinking 的错误降级重试。
+        assert!(looks_like_reasoning_rejection(&anyhow::anyhow!(
+            "400 Bad Request: Unsupported parameter: reasoning.effort"
+        )));
+        assert!(looks_like_reasoning_rejection(&anyhow::anyhow!(
+            "invalid parameter: reasoning_effort"
+        )));
+        // 与思考强度无关的失败不能重试，否则会掩盖真实问题。
+        assert!(!looks_like_reasoning_rejection(&anyhow::anyhow!(
+            "400 model_not_found: gpt-9"
+        )));
+        assert!(!looks_like_reasoning_rejection(&anyhow::anyhow!(
+            "401 invalid api key"
+        )));
+    }
+
+    #[test]
+    fn reasoning_rules_are_validated() {
+        let mut connection = config("openai");
+        connection.reasoning_rules = vec![rule("minimal", "  ", "", "")];
+        assert!(connection.validate().is_err(), "空 to 必须被拒绝");
+        connection.reasoning_rules = vec![rule("bogus", "low", "", "")];
+        assert!(connection.validate().is_err(), "非法 from 必须被拒绝");
+        connection.reasoning_rules = vec![rule("minimal", "low", "middle", "")];
+        assert!(connection.validate().is_err(), "非法 match_type 必须被拒绝");
+        connection.reasoning_rules = vec![rule("minimal", "deny", "prefix", "o1")];
+        connection.validate().expect("合法规则应通过");
+    }
+
+    #[test]
+    fn reasoning_effort_is_injected_per_wire_api() {
+        // Responses 用嵌套的 reasoning.effort，Chat Completions 用扁平字段。
+        // 两种协议的字段名差异由 merged_extra_body 收敛，调用点不必关心。
+        let responses = config("openai");
+        let target = responses
+            .resolve_with(&AiCallOptions::new("").with_reasoning(ReasoningEffort::High))
+            .expect("responses target");
+        let body = merged_extra_body(&target);
+        assert_eq!(body["reasoning"]["effort"], json!("high"));
+        assert!(!body.contains_key("reasoning_effort"));
+
+        let mut chat = config("openai");
+        chat.wire_api = WireApi::ChatCompletions;
+        let target = chat
+            .resolve_with(&AiCallOptions::new("").with_reasoning(ReasoningEffort::Low))
+            .expect("chat target");
+        let body = merged_extra_body(&target);
+        assert_eq!(body["reasoning_effort"], json!("low"));
+        assert!(!body.contains_key("reasoning"));
+    }
+
+    #[test]
+    fn unset_reasoning_does_not_emit_any_field() {
+        let target = config("openai")
+            .resolve_with(&AiCallOptions::new(""))
+            .expect("target");
+        let body = merged_extra_body(&target);
+        assert!(!body.contains_key("reasoning"));
+        assert!(!body.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn explicit_extra_body_reasoning_wins_over_the_structured_option() {
+        // 用户手写 extra_body 时以他写的为准，避免结构化选项静默覆盖。
+        let mut connection = config("openai");
+        connection.extra_body = HashMap::from([(
+            "reasoning".to_string(),
+            json!({"effort": "minimal"}),
+        )]);
+        let target = connection
+            .resolve_with(&AiCallOptions::new("").with_reasoning(ReasoningEffort::High))
+            .expect("target");
+        assert_eq!(merged_extra_body(&target)["reasoning"]["effort"], json!("minimal"));
+    }
+
+    #[test]
+    fn model_list_parser_accepts_the_common_shapes() {
+        let openai = r#"{"data":[{"id":"gpt-b"},{"id":"gpt-a"}]}"#;
+        assert_eq!(parse_model_list(openai).unwrap(), ["gpt-a", "gpt-b"]);
+        let alt = r#"{"models":["m2","m1"]}"#;
+        assert_eq!(parse_model_list(alt).unwrap(), ["m1", "m2"]);
+        let bare = r#"["z","a"]"#;
+        assert_eq!(parse_model_list(bare).unwrap(), ["a", "z"]);
+        assert!(parse_model_list(r#"{"data":[]}"#).is_err());
+        assert!(parse_model_list("not json").is_err());
     }
 
     #[test]

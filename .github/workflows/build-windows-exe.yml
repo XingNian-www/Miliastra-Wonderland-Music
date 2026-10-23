@@ -43,7 +43,8 @@ jobs:
       should_build: ${{ steps.gate.outputs.should_build }}
       create_release: ${{ steps.gate.outputs.create_release }}
       version: ${{ steps.gate.outputs.version }}
-      zip: ${{ steps.gate.outputs.zip }}
+      zip_full: ${{ steps.gate.outputs.zip_full }}
+      zip_basic: ${{ steps.gate.outputs.zip_basic }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v5
@@ -107,7 +108,8 @@ jobs:
               echo "should_build=$should_build"
               echo "create_release=$create_release"
               echo "version=v$version"
-              echo "zip=miliastra-wonderland-music-windows-x64-v$version.zip"
+              echo "zip_full=miliastra-wonderland-music-windows-x64-openvino-v$version.zip"
+              echo "zip_basic=miliastra-wonderland-music-windows-x64-mnn-v$version.zip"
             } >> "$GITHUB_OUTPUT"
             echo "判定结果: 版本=v$version 构建=$should_build 发布=$create_release"
           }
@@ -173,11 +175,13 @@ jobs:
           fi
 
   build-windows-exe:
+    # 两个变体共用同一份构建逻辑，只有 OCR 后端与打包内容不同：
+    # - openvino：默认特性，含 OpenVINO 运行时（识别更快、体积更大）
+    # - mnn    ：--no-default-features --features ocr-mnn，只保留 MNN（体积更小）
     name: 构建 Windows x64 EXE
     needs: version-gate
     if: needs.version-gate.outputs.should_build == 'true'
     runs-on: windows-latest
-
     steps:
       - name: 检出代码
         uses: actions/checkout@v5
@@ -373,6 +377,8 @@ jobs:
           } else {
             Write-Warning 'cargo 离线自检未通过（缓存不完整），本次构建仍走网络更新索引'
           }
+          # 只编译一次双后端版本：OpenVINO 走 runtime-linking（libloading 运行时加载 DLL），
+          # 不在 PE 导入表里，所以同一个 EXE 删掉 deps/openvino 后会自动回落到 MNN。
           cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
           if ($LASTEXITCODE -ne 0) { throw 'Workspace release build failed' }
 
@@ -399,7 +405,7 @@ jobs:
           }
           Copy-Item 'assets' (Join-Path $dist 'deps') -Recurse
           Copy-Item 'models' (Join-Path $dist 'deps') -Recurse
-          # OpenVINO 运行时与 IR 直接使用已发布的成品运行时包，整体复制到发布布局。
+          # OpenVINO 运行时与 IR 打进完整包；精简包在后续步骤从副本删掉这些文件。
           $openvinoPackage = $env:OPENVINO_PACKAGE_ROOT
           if (-not $openvinoPackage) {
             throw 'OPENVINO_PACKAGE_ROOT 未设置，无法打包 OpenVINO runtime'
@@ -409,7 +415,7 @@ jobs:
             throw "OpenVINO 成品包缺少运行时: $packageRuntime"
           }
           Copy-Item -LiteralPath $packageRuntime -Destination (Join-Path $dist 'deps') -Recurse
-          foreach ($ir in @('PP-OCRv6_small_det.xml', 'PP-OCRv6_small_det.bin', 'PP-OCRv6_small_rec.xml', 'PP-OCRv6_small_rec.bin')) {
+            foreach ($ir in @('PP-OCRv6_small_det.xml', 'PP-OCRv6_small_det.bin', 'PP-OCRv6_small_rec.xml', 'PP-OCRv6_small_rec.bin')) {
             $source = Join-Path (Join-Path $openvinoPackage $env:OPENVINO_PACKAGE_MODELS) $ir
             if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
               throw "OpenVINO 成品包缺少 IR 模型: $source"
@@ -418,7 +424,7 @@ jobs:
           }
           Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml')
           New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/docs') | Out-Null
-          # 成品包自带的 OpenVINO / oneTBB 许可证随主包分发。
+          # 成品包自带的 OpenVINO / oneTBB 许可证随完整包分发。
           foreach ($license in @('OPENVINO-LICENSE.txt', 'OPENVINO-THIRD-PARTY-NOTICES.txt', 'TBB-LICENSE.txt')) {
             $source = Join-Path $openvinoPackage $license
             if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
@@ -433,6 +439,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw '发布配置库初始化失败' }
           # 初始化会生成构建机令牌；恢复模板，让每份安装在首次启动时生成独立令牌。
           Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml') -Force
+
 
           $requiredDirectories = @(
             'deps\assets',
@@ -462,6 +469,13 @@ jobs:
             'deps\models\PP-OCRv6_small_det.mnn',
             'deps\models\PP-OCRv6_small_rec.mnn',
             'deps\models\ppocr_keys_v6_small.txt',
+            'deps\data\playback.sqlite3',
+            'deps\docs\turtle_soup.example.yaml',
+            'deps\docs\undercover.example.yaml',
+            'deps\docs\README.md',
+            'deps\docs\THIRD_PARTY_NOTICES.md'
+          )
+          $requiredFiles += @(
             'deps\models\PP-OCRv6_small_det.xml',
             'deps\models\PP-OCRv6_small_det.bin',
             'deps\models\PP-OCRv6_small_rec.xml',
@@ -469,11 +483,6 @@ jobs:
             'deps\openvino\runtime\bin\intel64\Release\openvino_c.dll',
             'deps\openvino\runtime\bin\intel64\Release\openvino_intel_cpu_plugin.dll',
             'deps\openvino\runtime\3rdparty\tbb\bin\tbb12.dll',
-            'deps\data\playback.sqlite3',
-            'deps\docs\turtle_soup.example.yaml',
-            'deps\docs\undercover.example.yaml',
-            'deps\docs\README.md',
-            'deps\docs\THIRD_PARTY_NOTICES.md',
             'deps\docs\OPENVINO-LICENSE.txt',
             'deps\docs\OPENVINO-THIRD-PARTY-NOTICES.txt',
             'deps\docs\TBB-LICENSE.txt'
@@ -484,19 +493,73 @@ jobs:
             }
           }
 
+      - name: 生成精简包（MNN-only）
+        shell: pwsh
+        run: |
+          # 同一个 EXE 就能当 MNN-only 用：OpenVINO 通过 libloading 在运行时加载，
+          # 不在 PE 导入表里；删掉 deps/openvino 后运行时会 warn 并回落到 cpu(MNN)。
+          # 因此不必再编译一次，只复制一份产物并移除 OpenVINO 相关文件即可。
+          $source = 'dist/miliastra-wonderland-music-windows-x64'
+          $target = 'dist/miliastra-wonderland-music-windows-x64-mnn'
+          if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force
+          }
+          Copy-Item -LiteralPath $source -Destination $target -Recurse
+
+          # OpenVINO 运行时目录与 IR 模型只属于完整包。
+          $dropDir = Join-Path $target 'deps\openvino'
+          if (Test-Path -LiteralPath $dropDir) {
+            Remove-Item -LiteralPath $dropDir -Recurse -Force
+          }
+          foreach ($ir in @('PP-OCRv6_small_det.xml', 'PP-OCRv6_small_det.bin', 'PP-OCRv6_small_rec.xml', 'PP-OCRv6_small_rec.bin')) {
+            $path = Join-Path (Join-Path $target 'deps\models') $ir
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+          }
+          foreach ($license in @('OPENVINO-LICENSE.txt', 'OPENVINO-THIRD-PARTY-NOTICES.txt', 'TBB-LICENSE.txt')) {
+            $path = Join-Path (Join-Path $target 'deps\docs') $license
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+          }
+
+          # 精简包必须仍然可用：核心运行时与 MNN 模型一个都不能少。
+          $mnnRequired = @(
+            'miliastra-wonderland-music.exe',
+            'config.yaml',
+            'deps\dll\MNN.dll',
+            'deps\models\PP-OCRv6_small_det.mnn',
+            'deps\models\PP-OCRv6_small_rec.mnn',
+            'deps\models\ppocr_keys_v6_small.txt',
+            'deps\data\playback.sqlite3'
+          )
+          foreach ($file in $mnnRequired) {
+            if (-not (Test-Path -LiteralPath (Join-Path $target $file) -PathType Leaf)) {
+              throw "精简包缺少必需文件: $file"
+            }
+          }
+          if (Test-Path -LiteralPath $dropDir) {
+            throw '精简包不应包含 deps/openvino'
+          }
+
       - name: 打包 Release zip
         shell: pwsh
         run: |
-          Compress-Archive `
-            -Path 'dist/miliastra-wonderland-music-windows-x64' `
-            -DestinationPath "dist/${{ needs.version-gate.outputs.zip }}" `
-            -Force
+          $full = '${{ needs.version-gate.outputs.zip_full }}'
+          $basic = '${{ needs.version-gate.outputs.zip_basic }}'
+          Compress-Archive -Path 'dist/miliastra-wonderland-music-windows-x64' -DestinationPath "dist/$full" -Force
+          Compress-Archive -Path 'dist/miliastra-wonderland-music-windows-x64-mnn' -DestinationPath "dist/$basic" -Force
+          "ZIP_FULL=dist/$full" >> $env:GITHUB_ENV
+          "ZIP_BASIC=dist/$basic" >> $env:GITHUB_ENV
 
-      - name: 上传产物
+      - name: 上传产物（含 OpenVINO）
         uses: actions/upload-artifact@v6
         with:
-          name: miliastra-wonderland-music-windows-x64
+          name: miliastra-wonderland-music-windows-x64-openvino
           path: dist/miliastra-wonderland-music-windows-x64
+
+      - name: 上传产物（MNN 精简版）
+        uses: actions/upload-artifact@v6
+        with:
+          name: miliastra-wonderland-music-windows-x64-mnn
+          path: dist/miliastra-wonderland-music-windows-x64-mnn
 
       - name: 解析发布说明文件
         id: release_notes
@@ -516,7 +579,9 @@ jobs:
           tag_name: ${{ needs.version-gate.outputs.version }}
           name: Miliastra Wonderland Music ${{ needs.version-gate.outputs.version }}
           body_path: ${{ steps.release_notes.outputs.body_path }}
-          files: dist/${{ needs.version-gate.outputs.zip }}
+          files: |
+            ${{ env.ZIP_FULL }}
+            ${{ env.ZIP_BASIC }}
 
       - name: 创建 GitHub Release（自动生成说明）
         if: needs.version-gate.outputs.create_release == 'true' && steps.release_notes.outputs.body_path == ''
@@ -524,5 +589,7 @@ jobs:
         with:
           tag_name: ${{ needs.version-gate.outputs.version }}
           name: Miliastra Wonderland Music ${{ needs.version-gate.outputs.version }}
-          files: dist/${{ needs.version-gate.outputs.zip }}
+          files: |
+            ${{ env.ZIP_FULL }}
+            ${{ env.ZIP_BASIC }}
           generate_release_notes: true

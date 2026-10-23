@@ -2195,8 +2195,8 @@ stale_timeout_ms: 7500
 
     #[test]
     fn default_ocr_backend_prefers_openvino_with_cpu_fallback() {
-        // 发布包内置 OpenVINO 运行时与 IR 模型，默认后端顺序应为 openvino、cpu；
-        // 两套模型路径都非空，默认配置才能通过校验并在 OpenVINO 不可用时回退 MNN。
+        // 发布包只有一个 EXE：默认先试 OpenVINO，运行时加载失败会自动回落 MNN。
+        // 精简包删掉 deps/openvino 后，同样靠这条回落链继续工作。
         let config = AppConfig::default();
 
         assert_eq!(

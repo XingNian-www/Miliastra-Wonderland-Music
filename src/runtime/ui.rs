@@ -1394,6 +1394,8 @@ pub struct UiRoutineContext<'a> {
     latest_frame: &'a Mutex<Option<Arc<CapturedFrame>>>,
     demands: &'a mut HashMap<u64, ActiveFrameDemand>,
     cancelled: &'a AtomicBool,
+    /// 单次操作内的截图失败去重；每次操作独立，不需要跨操作共享。
+    failure_log: CaptureFailureLog,
 }
 
 impl<'a> UiRoutineContext<'a> {
@@ -1414,6 +1416,7 @@ impl<'a> UiRoutineContext<'a> {
             latest_frame,
             demands,
             cancelled,
+            failure_log: CaptureFailureLog::default(),
         }
     }
 
@@ -1448,6 +1451,7 @@ impl<'a> UiRoutineContext<'a> {
                     self.observation,
                     self.demands,
                     self.latest_frame,
+                    &mut self.failure_log,
                 );
             }
             if self.is_cancelled() {
@@ -2285,6 +2289,7 @@ fn run_ui_runtime(
     let mut device = IsolatedDevice(device);
     let mut demands = HashMap::<u64, ActiveFrameDemand>::new();
     let mut observation = UiObservationRuntime::new(classifier, stable_count, latest_ui_state);
+    let mut failure_log = CaptureFailureLog::default();
     loop {
         if stop_requested.load(Ordering::Acquire) {
             break;
@@ -2309,7 +2314,13 @@ fn run_ui_runtime(
                     &mut demands,
                     &latest_frame,
                 );
-                publish_due_frame(&mut device, &mut observation, &mut demands, &latest_frame);
+                publish_due_frame(
+                    &mut device,
+                    &mut observation,
+                    &mut demands,
+                    &latest_frame,
+                    &mut failure_log,
+                );
             }
             Some(RuntimeMessage::AddFrameDemand { id, demand, slot }) => {
                 demands.insert(
@@ -2327,7 +2338,13 @@ fn run_ui_runtime(
                 }
             }
             Some(RuntimeMessage::Shutdown) => break,
-            None => publish_due_frame(&mut device, &mut observation, &mut demands, &latest_frame),
+            None => publish_due_frame(
+                &mut device,
+                &mut observation,
+                &mut demands,
+                &latest_frame,
+                &mut failure_log,
+            ),
         }
     }
     for demand in demands.values() {
@@ -2338,6 +2355,59 @@ fn run_ui_runtime(
             slot.close();
         }
     }
+}
+
+/// 按需截图失败的日志去重器。
+///
+/// 游戏没启动时每次 capture 都会失败，而 demand 到期就重试一次——若每次都记
+/// 一条 error，日志会被同一句话刷满。这里只在"失败原因发生变化"时记录：
+/// 首次失败记 warn（用户需要知道没找到窗口），同样的原因连续失败降为 debug，
+/// 恢复后再失败重新记 warn。
+#[derive(Default)]
+struct CaptureFailureLog {
+    last_reason: Option<String>,
+}
+
+impl CaptureFailureLog {
+    /// 本次失败是否需要记录（原因与上次不同）。
+    fn should_report(&self, error: &anyhow::Error) -> bool {
+        let reason = format!("{error:#}");
+        self.last_reason.as_deref() != Some(reason.as_str())
+    }
+
+    /// 记下本次原因。
+    fn mark_reported(&mut self, error: &anyhow::Error) {
+        self.last_reason = Some(format!("{error:#}"));
+    }
+
+    /// 记录一次失败；只有原因变化时才真的写日志。
+    fn record(&mut self, error: &anyhow::Error) {
+        let reason = format!("{error:#}");
+        if !self.should_report(error) {
+            // 同样的失败连续发生：细节留在 debug，不刷主日志。
+            log::debug!("UI runtime 按需截图仍失败（重复）: {reason}");
+            return;
+        }
+        // 游戏窗口不存在是预期状态：游戏没开而已，不是程序错误。
+        if is_window_unavailable(&reason) {
+            log::warn!("UI runtime 按需截图失败: {reason}");
+        } else {
+            log::error!("UI runtime 按需截图失败: {reason}");
+        }
+        self.mark_reported(error);
+    }
+
+    /// 截图成功后清除去重状态，让下次失败重新记 warn。
+    fn reset(&mut self) {
+        self.last_reason = None;
+    }
+}
+
+/// 判断错误是否只是"目标游戏窗口不存在"。
+///
+/// 这类失败可恢复：游戏启动后下一次 capture 就会成功，不该按 error 记录。
+fn is_window_unavailable(reason: &str) -> bool {
+    reason.contains("未找到目标游戏窗口进程") || reason.contains("未找到可用目标游戏窗口进程")
 }
 
 fn next_frame_timeout(demands: &HashMap<u64, ActiveFrameDemand>) -> Option<Duration> {
@@ -2353,6 +2423,7 @@ fn publish_due_frame(
     observation: &mut UiObservationRuntime,
     demands: &mut HashMap<u64, ActiveFrameDemand>,
     latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
+    failure_log: &mut CaptureFailureLog,
 ) {
     demands.retain(|_, demand| !demand.slot.is_closed());
     let now = Instant::now();
@@ -2365,9 +2436,12 @@ fn publish_due_frame(
     }
 
     let publication = match observation.capture(device) {
-        Ok(frame) => FramePublication::Captured(Arc::new(frame)),
+        Ok(frame) => {
+            failure_log.reset();
+            FramePublication::Captured(Arc::new(frame))
+        }
         Err(error) => {
-            log::error!("UI runtime 按需截图失败: {error:#}");
+            failure_log.record(&error);
             FramePublication::Failed(FrameCaptureFailure {
                 failed_at: Instant::now(),
                 reason: Arc::from(format!("{error:#}")),
@@ -2413,6 +2487,40 @@ mod tests {
         fn capture(&mut self) -> Result<DynamicImage> {
             Ok(self.0.clone())
         }
+    }
+
+    #[test]
+    fn capture_failure_log_only_reports_changes() {
+        // 同一原因连续失败只记一次：这是"日志被刷屏"的根因修复。
+        // 用"是否应当记录"观测，避免为测试引入生产代码用不到的钩子。
+        let mut log = CaptureFailureLog::default();
+        let error = anyhow::anyhow!("未找到目标游戏窗口进程: game.exe candidates=game.exe");
+        assert!(log.should_report(&error), "首次失败必须记录");
+        log.mark_reported(&error);
+        assert!(!log.should_report(&error), "同样的原因不应重复记录");
+        assert!(!log.should_report(&error));
+        // 原因变化后重新记录。
+        let other = anyhow::anyhow!("DPI 变化，重建捕获设备");
+        assert!(log.should_report(&other));
+        log.mark_reported(&other);
+        assert!(!log.should_report(&other));
+        // 恢复后再失败，重新记录。
+        log.reset();
+        assert!(log.should_report(&error));
+    }
+
+    #[test]
+    fn window_unavailable_is_a_recoverable_state_not_an_error() {
+        // 游戏没启动是预期状态：应走 warn 而不是 error。
+        assert!(is_window_unavailable(
+            "未找到目标游戏窗口进程: game.exe candidates=game.exe"
+        ));
+        assert!(is_window_unavailable(
+            "未找到可用目标游戏窗口进程: game.exe hidden_windows=1"
+        ));
+        // 其他捕获失败才是真错误。
+        assert!(!is_window_unavailable("EnumWindows failed"));
+        assert!(!is_window_unavailable("设备丢失"));
     }
 
     struct PixelClassifier(Arc<AtomicU64>);

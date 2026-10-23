@@ -66,11 +66,15 @@ pub(super) fn commands_replies_route(
         let allowed_variables = crate::features::reply_template::reply_variables().iter()
             .filter(|variable| referenced_variables.contains(variable.name))
             .map(|variable| variable.name).collect::<Vec<_>>();
-        json!({ "id": entry.id, "name": entry.name, "category": entry.category, "orderedBatch": entry.ordered_batch, "replies": replies, "defaultReplies": defaults, "allowedVariables": allowed_variables })
+        json!({ "id": entry.id, "name": entry.name, "category": entry.category, "replies": replies, "defaultReplies": defaults, "allowedVariables": allowed_variables })
     }).collect::<Vec<_>>();
     let variables = crate::features::reply_template::reply_variables()
         .iter()
-        .map(|variable| json!({"name":variable.name,"label":variable.label}))
+        .map(|variable| json!({
+            "name": variable.name,
+            "label": variable.label,
+            "example": variable.example,
+        }))
         .collect::<Vec<_>>();
     serde_json::to_string(&json!({
         "revision": revision,
@@ -131,18 +135,20 @@ fn validate_reply_items(
             });
             continue;
         }
-        if reply.text.chars().count() > MAX_REPLY_CHARS
-            || reply.text.contains('\n')
-            || reply.text.contains('\r')
-        {
-            return Err(bad_request("单条回复最多300字且必须为单行"));
+        // 允许换行：一行发一条消息，用户自己决定发几条。
+        // 仍限制总字符数，避免一次粘贴成百上千字把聊天区刷爆。
+        if reply.text.chars().count() > MAX_REPLY_CHARS {
+            return Err(bad_request("单条回复最多300字"));
         }
+        if reply.text.contains('\r') {
+            return Err(bad_request("回复文案不能包含回车符，请使用换行"));
+        }
+        // 静态 key 必须属于该命令；custom: 前缀的自定义行始终允许。
         if !static_keys.contains(reply.key.as_str())
-            && (!entry.ordered_batch
-                || !reply
-                    .key
-                    .strip_prefix("custom:")
-                    .is_some_and(|suffix| !suffix.trim().is_empty()))
+            && !reply
+                .key
+                .strip_prefix("custom:")
+                .is_some_and(|suffix| !suffix.trim().is_empty())
         {
             return Err(bad_request(
                 "静态回复key不属于该命令，自定义key必须使用custom:前缀",
@@ -336,27 +342,36 @@ mod reply_api_tests {
     }
 
     #[test]
-    fn reply_item_validation_accepts_ordered_static_and_custom_rows() {
+    fn reply_item_validation_accepts_static_and_custom_rows() {
+        // 帮助已合并成单条 help.song_request；自定义行仍以 custom: 前缀表达。
         let rows = validate_reply_items(
             &help_song_entry(),
             vec![
                 item("custom:first", "第一条{用户名}".to_owned()),
-                item("help.song_request.1", "第二条".to_owned()),
+                item("help.song_request", "第二条".to_owned()),
             ],
         )
         .unwrap();
         assert_eq!(
             rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
-            ["custom:first", "help.song_request.1"]
+            ["custom:first", "help.song_request"]
         );
     }
 
     #[test]
-    fn branch_outcome_rejects_extra_reply_keys() {
+    fn branch_outcome_rejects_unknown_static_keys_but_allows_custom_rows() {
+        // custom: 行始终允许；不属于该命令的静态 key 必须拒绝。
         assert!(
             validate_reply_items(
                 &single_reply_entry(),
-                vec![item("custom:extra", "不应添加第二个分支回复".to_owned())],
+                vec![item("custom:extra", "自定义行".to_owned())],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_reply_items(
+                &single_reply_entry(),
+                vec![item("playback.pause.ok", "别的命令的 key".to_owned())],
             )
             .is_err()
         );
@@ -375,7 +390,7 @@ mod reply_api_tests {
         // 若把行丢掉，只含单行的命令保存后就会变成空列表而被判为“整条静音”。
         for text in [String::new(), "  ".to_owned()] {
             let rows =
-                validate_reply_items(&help_song_entry(), vec![item("help.song_request.1", text)])
+                validate_reply_items(&help_song_entry(), vec![item("help.song_request", text)])
                     .expect("留空应被接受");
             assert_eq!(rows.len(), 1, "留空的行必须保留");
             assert!(rows[0].text.trim().is_empty(), "留空行的文本应为空");
@@ -384,23 +399,31 @@ mod reply_api_tests {
             validate_reply_items(
                 &help_song_entry(),
                 vec![item(
-                    "help.song_request.1",
+                    "help.song_request",
                     "歌".repeat(MAX_REPLY_CHARS + 1)
                 )],
             )
             .is_err()
         );
+        // 多行现在是合法语义：一行发一条消息，用户自己决定发几条。
+        let multiline = validate_reply_items(
+            &help_song_entry(),
+            vec![item("help.song_request", "第一行\n第二行".to_owned())],
+        )
+        .expect("多行回复应被接受");
+        assert_eq!(multiline.len(), 1, "多行仍是一条配置项");
+        // 回车符仍然拒绝：它只会在文案里留下不可见控制字符。
         assert!(
             validate_reply_items(
                 &help_song_entry(),
-                vec![item("help.song_request.1", "第一行\n第二行".to_owned())],
+                vec![item("help.song_request", "第一行\r第二行".to_owned())],
             )
             .is_err()
         );
         assert!(
             validate_reply_items(
                 &help_song_entry(),
-                vec![item("help.song_request.1", "未知{HTTP内部字段}".to_owned())],
+                vec![item("help.song_request", "未知{HTTP内部字段}".to_owned())],
             )
             .is_err()
         );

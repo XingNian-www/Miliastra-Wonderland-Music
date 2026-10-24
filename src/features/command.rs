@@ -54,9 +54,27 @@ pub(crate) struct CommandEnvelope {
     prefix: CommandPrefix,
     authority: CommandAuthority,
     observation: CommandObservation,
+    /// 消息来源的账号（仅外部聊天 API 提供）。
+    ///
+    /// OCR 路径为 None——它只有昵称；API 路径带上 UID，
+    /// 权限解析时 UID 优先于昵称。
+    account: Option<CommandAccount>,
 }
 
+/// 一条消息对应的游戏账号（定义在 kernel，观察层也要用）。
+pub(crate) use miliastra_kernel::chat_source::CommandAccount;
+
 impl CommandEnvelope {
+    /// 附加账号信息（外部聊天 API 路径用）。
+    pub(crate) fn with_account(mut self, account: Option<CommandAccount>) -> Self {
+        self.account = account;
+        self
+    }
+
+    pub(crate) fn account(&self) -> Option<&CommandAccount> {
+        self.account.as_ref()
+    }
+
     pub(crate) fn new(
         original_text: impl Into<String>,
         username: impl Into<String>,
@@ -89,6 +107,8 @@ impl CommandEnvelope {
         } else {
             trimmed_command.to_string()
         };
+        // 默认无账号：OCR 路径不提供；API 路径在构造后用 `with_account` 补上。
+        let account = None;
         let (prefix, command_text) = if let Some(text) = user_command
             .strip_prefix('@')
             .or_else(|| user_command.strip_prefix('＠'))
@@ -121,6 +141,7 @@ impl CommandEnvelope {
             prefix,
             authority,
             observation,
+            account,
         })
     }
 
@@ -152,6 +173,7 @@ impl CommandEnvelope {
             prefix: self.prefix,
             authority: self.authority,
             observation: self.observation.clone(),
+            account: self.account.clone(),
         }
     }
 
@@ -254,6 +276,74 @@ pub(crate) enum ModuleCommand {
     Moderation(ModerationCommand),
     CustomWorkflow(CustomWorkflowCommand),
     AiChat(super::ai_chat::AiChatCommand),
+}
+
+/// 命令是否携带不能进证据流的私密内容。
+///
+/// 这是**必须回答**的问题：返回 `None` 表示"参数可以公开"，会原样进入
+/// 可导出的证据流。新增玩法时若这个 match 没有穷尽覆盖，编译器会报错——
+/// 之前它在 `debug/read_only.rs` 里是个带 `_ => None` 的手写 match，
+/// 漏改不会编译失败、不会测试失败，只会静默把私密内容写进证据。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrivatePayload {
+    /// 审核/拉黑的私聊输入。
+    ModerationInput,
+    /// 塔罗的私密提问。
+    TarotQuestion,
+    /// 谁是卧底的投票/弃权/揭示。
+    UndercoverInput,
+    /// AI 聊天的提问。
+    AiChatQuestion,
+}
+
+impl PrivatePayload {
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::ModerationInput => "private moderation input",
+            Self::TarotQuestion => "private AI input",
+            Self::UndercoverInput => "private game input",
+            Self::AiChatQuestion => "private AI chat input",
+        }
+    }
+}
+
+impl ModuleCommand {
+    /// 这条命令是否携带私密内容。
+    ///
+    /// **不要加 `_ =>` 兜底**：那会让新增的 `ModuleCommand` 变体静默落进
+    /// "可公开"分支。宁可让编译器逼着写一行 `=> None`。
+    pub(crate) fn private_payload(&self, message_type: &str) -> Option<PrivatePayload> {
+        match self {
+            Self::Moderation(_) if message_type == "pink" => Some(PrivatePayload::ModerationInput),
+            Self::Tarot(super::tarot::TarotCommand::Draw { ai: true, .. })
+                if message_type == "pink" =>
+            {
+                Some(PrivatePayload::TarotQuestion)
+            }
+            Self::Undercover(
+                UndercoverCommand::Vote(_)
+                | UndercoverCommand::Abstain
+                | UndercoverCommand::Reveal,
+            ) => Some(PrivatePayload::UndercoverInput),
+            // 开局/加入等不含私密输入（玩家自己的身份由游戏内展示）。
+            Self::Undercover(_) => None,
+            Self::AiChat(_) => Some(PrivatePayload::AiChatQuestion),
+            // 公屏里的审核触发不含私密内容；只有私聊输入才需要脱敏（上面已匹配）。
+            Self::Moderation(_) => None,
+            // 以下玩法不含需要脱敏的用户输入。
+            Self::SongRequest(_)
+            | Self::Playback(_)
+            | Self::Hall(_)
+            | Self::Administration(_)
+            | Self::IdiomChain(_)
+            | Self::CardGame(_)
+            | Self::TurtleSoup(_)
+            | Self::Tarot(_)
+            | Self::Playlist(_)
+            | Self::Invite(_)
+            | Self::CustomWorkflow(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

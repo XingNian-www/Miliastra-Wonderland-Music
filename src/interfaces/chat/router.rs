@@ -244,9 +244,7 @@ impl<'a> ChatCommandRouter<'a> {
             }
             return Some(routed);
         }
-        let role = self
-            .identity
-            .and_then(|identity| identity.role_of(envelope.username()));
+        let role = role_for_envelope(self.identity, envelope);
         let alternate_authority = match role {
             Some(IdentityRole::Friend | IdentityRole::Admin | IdentityRole::Owner)
                 if envelope.authority() == CommandAuthority::HallMember =>
@@ -325,7 +323,7 @@ impl<'a> ChatCommandRouter<'a> {
                 let mut routed = RoutedCommand::from_envelope(envelope, matched);
                 routed.authority = envelope.authority();
                 routed.message_type = envelope.message_type().to_string();
-                routed.role = role_for(self.identity, envelope.username());
+                routed.role = role_for_envelope(self.identity, envelope);
                 return Some(routed);
             }
             if let Some(authority) = alternate_authority {
@@ -334,7 +332,7 @@ impl<'a> ChatCommandRouter<'a> {
                     let mut routed = RoutedCommand::from_envelope(envelope, matched);
                     routed.authority = envelope.authority();
                     routed.message_type = envelope.message_type().to_string();
-                    routed.role = role_for(self.identity, envelope.username());
+                    routed.role = role_for_envelope(self.identity, envelope);
                     return Some(routed);
                 }
             }
@@ -642,8 +640,24 @@ fn hash_entertainment_session_mismatch(
             || UndercoverCommand::claims_active_chat(envelope))
 }
 
-fn role_for(identity: Option<&IdentityAccess>, username: &str) -> Option<IdentityRole> {
-    identity.and_then(|identity| identity.role_of(username))
+/// 按消息来源解析角色：有账号走 UID，否则走昵称。
+///
+/// 两条链路共用这一个入口——OCR 只有昵称，外部聊天 API 有 UID。
+/// UID 优先是因为它改不了、不会重名；昵称可以被玩家改成任意想要的名字。
+fn role_for_envelope(
+    identity: Option<&IdentityAccess>,
+    envelope: &CommandEnvelope,
+) -> Option<IdentityRole> {
+    let identity = identity?;
+    let hint = match envelope.account() {
+        Some(account) => crate::features::identity::IdentityHint::Account {
+            game: &account.game,
+            uid: &account.uid,
+            nickname: Some(envelope.username()),
+        },
+        None => crate::features::identity::IdentityHint::Nickname(envelope.username()),
+    };
+    identity.resolve_hint(hint).map(|resolved| resolved.role)
 }
 
 // 开局表的解析器只解析开局语法。
@@ -1060,6 +1074,7 @@ mod tests {
                         id: uuid::Uuid::from_u128(1),
                         role,
                         note: "展示备注".to_string(),
+                        accounts: Vec::new(),
                     })
                     .collect(),
             });
@@ -1112,6 +1127,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Admin,
                 note: String::new(),
+                accounts: Vec::new(),
             }],
         });
         let router = ChatCommandRouter {
@@ -1196,18 +1212,21 @@ mod tests {
                     id: uuid::Uuid::from_u128(1),
                     role: IdentityRole::Owner,
                     note: String::new(),
+                    accounts: Vec::new(),
                 },
                 IdentityMapping {
                     nickname: "管理员".to_string(),
                     id: uuid::Uuid::from_u128(2),
                     role: IdentityRole::Admin,
                     note: String::new(),
+                    accounts: Vec::new(),
                 },
                 IdentityMapping {
                     nickname: "好友".to_string(),
                     id: uuid::Uuid::from_u128(3),
                     role: IdentityRole::Friend,
                     note: "好友备注".to_string(),
+                    accounts: Vec::new(),
                 },
             ],
         });

@@ -812,6 +812,7 @@ impl ApplicationRuntime {
             id: message_id,
             text,
             sender: message_sender,
+            account,
         } in messages
         {
             log::debug!("处理二级观察消息: id={message_id:?}");
@@ -864,7 +865,9 @@ impl ApplicationRuntime {
                 &shortcut_player,
                 &message_type,
                 command_observation.clone(),
-            ) && let Some(parsed) =
+            )
+            .map(|envelope| envelope.with_account(account.clone()))
+            && let Some(parsed) =
                 router.route(&envelope, self.business.business.active_entertainment()?)
             {
                 outcome.processed = true;
@@ -877,7 +880,9 @@ impl ApplicationRuntime {
                 &message_type,
                 text.trim(),
                 command_observation.clone(),
-            ) && envelope.prefix() == CommandPrefix::Hash
+            )
+            .map(|envelope| envelope.with_account(account.clone()))
+            && envelope.prefix() == CommandPrefix::Hash
                 && let Some(parsed) =
                     router.route(&envelope, self.business.business.active_entertainment()?)
             {
@@ -909,7 +914,9 @@ impl ApplicationRuntime {
                 &message_type,
                 command_text,
                 command_observation,
-            ) else {
+            )
+            .map(|envelope| envelope.with_account(account.clone()))
+            else {
                 if command::looks_like_command(&text) {
                     log::info!(
                         "命令未执行：二级消息无法解析为命令信封 text={}",
@@ -959,6 +966,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Admin,
                 note: String::new(),
+                accounts: Vec::new(),
             }],
         });
         let service = CustomWorkflowService::new(

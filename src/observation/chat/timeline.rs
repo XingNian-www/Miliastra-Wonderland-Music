@@ -31,6 +31,10 @@ pub(crate) struct ChatTimelineMessage {
     pub(crate) block: Rect,
     /// Still eligible for business delivery, not merely absent from the last frame.
     pub(crate) is_new: bool,
+    /// 消息来源的账号（仅外部聊天 API 提供；OCR 为 None）。
+    ///
+    /// 一路带到 `CommandEnvelope`，让权限解析能用 UID 而不是昵称。
+    pub(crate) account: Option<miliastra_kernel::chat_source::CommandAccount>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +82,8 @@ struct State {
     command_locks: HashMap<ChatIdentity, CommandLock>,
     /// 命令新老判定状态：按 ChatIdentity 存活，跨 Tracker 重建（视图消失）保留。
     chat_freshness: HashMap<ChatIdentity, SequenceFreshness>,
+    /// 下一次 publish 要采用的"聊天区消失性质"（由 publish_no_chat 写入）。
+    pending_absence: Option<crate::observation::chat::ViewAbsence>,
     /// 下一个可信帧要携带的基线事件（由 reset_chat_observation_baseline 写入）。
     pending_baseline: Option<BaselineKind>,
     next_command_lock_activity: u64,
@@ -409,6 +415,16 @@ impl ChatTimeline {
     }
 
     /// 标记下一次发布要携带的基线事件（由 reset_chat_observation_baseline 调用）。
+    /// 清空命令锁。
+    ///
+    /// 数据源切换时必须调用：命令锁的 y 是屏幕坐标，切到外部源后坐标语义完全不同，
+    /// 旧条目会在基线帧误否决同文本的新命令。
+    pub(crate) fn clear_command_locks(&self) -> Result<()> {
+        let mut state = self.lock()?;
+        state.command_locks.clear();
+        Ok(())
+    }
+
     pub(crate) fn note_baseline(&self, reason: &str) -> Result<()> {
         let mut state = self.lock()?;
         state.pending_baseline = Some(BaselineKind::from_reason(reason));
@@ -433,6 +449,7 @@ impl ChatTimeline {
                     command_locks: HashMap::new(),
                     chat_freshness: HashMap::new(),
                     pending_baseline: None,
+                    pending_absence: None,
                     next_command_lock_activity: 0,
                     unread_delivery_fences: HashMap::new(),
                     friend_suppression_generation: 0,
@@ -662,7 +679,12 @@ impl ChatTimeline {
         };
         let mut freshness = state.chat_freshness.remove(&chat).unwrap_or_default();
         if cold_consumed {
-            freshness.mark_view_absent();
+            // 默认按短暂过渡处理：没有显式记录时保持原有对齐行为。
+            let absence = state
+                .pending_absence
+                .take()
+                .unwrap_or(crate::observation::chat::ViewAbsence::Transient);
+            freshness.mark_view_absent(absence);
         }
         let tracker = state.trackers.get_mut(&chat).expect("tracker inserted");
         let initial = !tracker.initialized && !cold_consumed;
@@ -880,10 +902,139 @@ impl ChatTimeline {
         Ok(snapshot)
     }
 
+    /// 外部聊天源注入消息：跳过气泡对齐，只进业务账本与订阅队列。
+    ///
+    /// 为什么不能复用 [`Self::publish`]：`publish` 会把整帧交给 `Tracker::observe`，
+    /// 而它会把本帧写成下一帧的 `prev`。外部消息没有屏幕坐标，一旦进入 `prev`，
+    /// 下一帧真实 OCR 的对角对齐必然失败、整帧判旧——等于注入一次就吞掉一条真命令。
+    ///
+    /// 因此这里只复用 `publish` 的记账思路，跳过 `observe` 与 `state.latest` 写入。
+    /// 外部消息不参与屏幕对齐，也不写入命令锁条目。
+    pub(crate) fn inject_external(
+        &self,
+        captured_at: Instant,
+        epoch: VisualSessionId,
+        source: &str,
+        messages: Vec<crate::observation::chat::ExternalChatMessage>,
+    ) -> Result<Vec<ObservedChatMessageId>> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut state = self.lock()?;
+        let mut accepted: Vec<(ObservedChatMessageId, ChatIdentity)> = Vec::new();
+        // 真正推给订阅者的消息；`accepted` 只记 id 供调用方核对。
+        let mut delivered: Vec<ChatTimelineMessage> = Vec::new();
+        for message in messages {
+            let Some(identity) = external_chat_identity(&message) else {
+                log::debug!(
+                    "外部聊天消息缺少可用的会话身份，已忽略: channel={}",
+                    message.channel
+                );
+                continue;
+            };
+            // 去重键参与 id 构造：同一来源的同一序号只会入账一次。
+            let dedup = message.dedup_key(source);
+            let id = ObservedChatMessageId::new(
+                epoch,
+                identity.clone(),
+                BubbleSequence::new(external_sequence(&dedup)),
+            );
+            if state.business_claimed.contains(&id) || state.business_pending.contains(&id) {
+                log::debug!("外部聊天消息重复，已忽略: {dedup}");
+                continue;
+            }
+            let sender = message
+                .sender
+                .nickname
+                .clone()
+                .filter(|name| !name.trim().is_empty());
+            if sender.is_none() {
+                // 昵称缺失时无法解析命令主语：按"未知发送者"处理，不授权。
+                log::debug!("外部聊天消息缺少昵称，按未授权处理: {dedup}");
+            }
+            let revision = BusinessMessageRevision {
+                text: message.text.clone(),
+                sender: sender.clone(),
+                raw_sender: sender,
+            };
+            state.business_pending.insert(id.clone());
+            state.latest_business_revisions.insert(
+                id.clone(),
+                CapturedBusinessRevision {
+                    captured_at,
+                    revision: revision.clone(),
+                    // 外部消息没有屏幕位置：记录 None 表示"无法用位置校验"。
+                    y: None,
+                },
+            );
+            delivered.push(ChatTimelineMessage {
+                id: id.clone(),
+                text: revision.text,
+                sender: revision.sender,
+                raw_sender: revision.raw_sender,
+                // 必须用既有的 blue/pink 词汇：`CommandEnvelope::new` 只认这两个，
+                // 其他值会让整条消息无法成为命令。
+                message_type: match identity {
+                    ChatIdentity::Friend(_) => "pink".to_string(),
+                    _ => "blue".to_string(),
+                },
+                // 哨兵坐标：永不命中命令锁的 `y <= entry.y + 28` 容差。
+                block: crate::geometry::Rect::new(0, i32::MIN / 2, 1, 1),
+                is_new: true,
+                account: message.sender.uid.as_ref().map(|uid| {
+                    miliastra_kernel::chat_source::CommandAccount {
+                        game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
+                        uid: uid.as_str().to_string(),
+                    }
+                }),
+            });
+            accepted.push((id, identity));
+        }
+        if accepted.is_empty() {
+            return Ok(accepted.into_iter().map(|(id, _)| id).collect());
+        }
+        // 推给订阅者：命令链路靠这条队列拿消息。
+        // 与 `publish` 的投递段保持同一套过滤规则（绑定聊天、溢出保护）。
+        let snapshot = ChatTimelineSnapshot {
+            captured_at,
+            visual_session: epoch,
+            chat: accepted
+                .first()
+                .map(|(_, identity)| identity.clone())
+                .unwrap_or(ChatIdentity::Unknown),
+            messages: delivered,
+        };
+        for subscriber in state.subscribers.values_mut() {
+            if subscriber.failure.is_some() {
+                continue;
+            }
+            // 未绑定聊天的订阅者（主命令消费者就是这种）必须照常入队——
+            // 与 `publish` 的投递规则保持一致，否则 API 消息到不了命令链路。
+            if let Some(bound) = subscriber.chat.clone()
+                && snapshot.chat != ChatIdentity::Unknown
+                && bound != snapshot.chat
+            {
+                continue;
+            }
+            if subscriber.queue.len() >= RETAINED_CAPACITY {
+                subscriber.failure =
+                    Some("chat timeline subscriber overflow (4096 snapshots)".into());
+                subscriber.queue.clear();
+                continue;
+            }
+            subscriber.session = Some(epoch);
+            subscriber.queue.push_back(snapshot.clone());
+        }
+        drop(state);
+        self.inner.changed.notify_all();
+        Ok(accepted.into_iter().map(|(id, _)| id).collect())
+    }
+
     pub(crate) fn publish_no_chat(
         &self,
         captured_at: Instant,
         reason: impl Into<String>,
+        absence: crate::observation::chat::ViewAbsence,
     ) -> Result<()> {
         let reason = reason.into();
         let mut state = self.lock()?;
@@ -899,6 +1050,8 @@ impl ChatTimeline {
         state.trackers.clear();
         // 聊天区不存在：首屏没有命令可抑制，冷基线就此消费（见 mark_view_absent 说明）。
         state.cold_baseline_consumed = true;
+        // 记录消失性质：重开第一帧据此决定能否沿用旧的交叠对齐。
+        state.pending_absence = Some(absence);
         // 聊天不可见：保留新鲜度状态，但**不再强制下一帧不连续**。
         // 真实案例：聊天框消失后回来的第一条新命令曾被“全旧”吞掉。交叠时交给对齐按
         // “底部追加”判新；无交叠（画面大改/命令被顶到顶部）时对齐自然失败并全旧，场景 3 仍成立。
@@ -1165,6 +1318,51 @@ impl ChatTimeline {
         record_command_lock_locked(&mut state, &id.chat, text, y);
         Ok(found)
     }
+}
+
+/// 外部消息映射到 BOT 内部的会话身份。
+///
+/// 大厅消息归到 `SecondaryHall`（二级值守的大厅），私聊归到 `Friend`。
+/// 昵称缺失的私聊无法确定好友名，直接放弃——宁可少处理也不误授权。
+fn external_chat_identity(
+    message: &crate::observation::chat::ExternalChatMessage,
+) -> Option<ChatIdentity> {
+    if message.channel.is_current_hall() {
+        return Some(ChatIdentity::SecondaryHall);
+    }
+    if message.channel.is_private() {
+        let name = message
+            .sender
+            .nickname
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())?;
+        let peer = match (&message.to_uid, &message.sender.uid) {
+            (Some(to), _) => to.as_str().to_string(),
+            (None, Some(from)) => from.as_str().to_string(),
+            (None, None) => name.to_string(),
+        };
+        let _ = peer;
+        return Some(ChatIdentity::Friend(name.to_string().into()));
+    }
+    None
+}
+
+/// 把去重键压成一个稳定的 `u64` 序号。
+///
+/// `BubbleSequence` 是 `u64`，而去重键是字符串；这里用 FNV-1a 做稳定散列。
+/// 不用 `DefaultHasher` 是因为它不保证跨进程稳定——重启后同一消息会算出不同 id，
+/// 导致 `business_claimed` 的墓碑失效、历史消息被重放。
+fn external_sequence(dedup_key: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in dedup_key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    // 0 会让 BubbleSequence(0) 与"未初始化"混淆，避开。
+    hash.max(1)
 }
 
 fn acknowledge_business_locked(state: &mut State, id: &ObservedChatMessageId) -> bool {
@@ -1512,6 +1710,8 @@ impl Tracker {
                 raw_sender: input.raw_sender,
                 message_type: input.message_type,
                 block: input.block,
+                // OCR 路径没有账号：权限只能按昵称解析。
+                account: None,
             });
         }
         self.initialized = true;
@@ -1594,13 +1794,107 @@ mod tests {
             .unwrap()
     }
 
+    /// 对照组：重开时带回旧气泡（有交叠），命令能正常判新。
+    ///
+    /// 与上面同场景，唯一差别是新帧里保留了旧气泡 `旧消息二` 作为锚点——
+    /// 这证明故障条件是"无交叠"，而不是"聊天框重开"本身。
+    #[test]
+    fn control_friend_command_after_idle_with_overlap_is_delivered() {
+        let shared = ChatTimeline::new();
+        friend(&shared, vec![input("旧消息一", 10), input("旧消息二", 30)]);
+        shared
+            .publish_no_chat(
+            Instant::now(),
+            "chat hidden after idle timeout",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
+            .unwrap();
+        let mut command = input("#手牌", 60);
+        command.message_type = "pink".into();
+        // 带回旧消息二作锚点。
+        let reopened = friend(&shared, vec![input("旧消息二", 30), command]);
+        assert!(
+            reopened.messages[1].is_new,
+            "有交叠时命令应判新；当前状态={:?}",
+            shared
+                .business_delivery_state(&reopened.messages[1].id)
+                .unwrap()
+        );
+    }
+
+    /// 复现：好友会话闲置隐藏后重开，只剩一条新命令（无交叠）。
+    ///
+    /// 真实场景：一级大厅值守，聊天框闲置超时被收起；玩家在好友私聊发 `#手牌`，
+    /// 游戏把聊天框弹出。此时好友面板常只渲染出这一个气泡（无历史气泡），
+    /// 于是新帧只有 1 条、与旧的 prev 完全没有共同锚点。
+    #[test]
+    fn injected_command_reaches_unbound_business_subscriber() {
+        // 回归：主命令消费者用 subscribe_business()（chat=None）。
+        // 若注入路径跳过未绑定订阅者，API 消息永远到不了命令链路。
+        let shared = ChatTimeline::new();
+        let business = shared.subscribe_business().unwrap();
+        let epoch = VisualSessionId::new(u64::MAX);
+        let message = miliastra_kernel::chat_source::ExternalChatMessage {
+            sequence: 1,
+            sent_at: None,
+            channel: miliastra_kernel::chat_source::ChatChannel::current_hall(),
+            hall_id: None,
+            sender: miliastra_kernel::chat_source::ExternalSender::new(
+                Some("玩家癸".to_string()),
+                Some(miliastra_kernel::chat_source::GameUid::from_u32(900000001)),
+            ),
+            to_uid: None,
+            text: "@状态".to_string(),
+        };
+        shared
+            .inject_external(Instant::now(), epoch, "test", vec![message])
+            .unwrap();
+        let frames = business.read().unwrap();
+        assert_eq!(frames.len(), 1, "注入的消息必须进入业务订阅者队列");
+        let delivered = &frames[0].messages[0];
+        // 回归：空串 message_type 会让 CommandEnvelope::new 直接返回 None。
+        assert!(
+            matches!(delivered.message_type.as_str(), "blue" | "pink"),
+            "message_type 必须是 blue/pink，实际为 {:?}",
+            delivered.message_type
+        );
+    }
+
+    #[test]
+    fn repro_friend_command_after_long_idle_is_lost() {
+        let shared = ChatTimeline::new();
+        // 1) 好友会话曾经被读过，建立 prev（模拟此前的未读处理/读会话）。
+        friend(&shared, vec![input("旧消息一", 10), input("旧消息二", 30)]);
+        // 2) 聊天框闲置隐藏。
+        shared
+            .publish_no_chat(
+                Instant::now(),
+                "chat hidden after idle timeout",
+                crate::observation::chat::ViewAbsence::Long,
+            )
+            .unwrap();
+        // 3) 重开：只有一条新命令，没有任何旧气泡可作锚点。
+        let mut command = input("#手牌", 40);
+        command.message_type = "pink".into();
+        let reopened = friend(&shared, vec![command]);
+        assert!(
+            reopened.messages[0].is_new,
+            "无交叠重开后好友命令必须判新；当前状态={:?}",
+            shared.business_delivery_state(&reopened.messages[0].id).unwrap()
+        );
+    }
+
     #[test]
     fn command_after_chat_reappears_is_still_new() {
         // 聊天框消失再回来：第一条新命令不能被“全旧”吞掉。
         let shared = ChatTimeline::new();
         publish(&shared, vec![input("A", 10)]);
         shared
-            .publish_no_chat(Instant::now(), "chat hidden for a while")
+            .publish_no_chat(
+            Instant::now(),
+            "chat hidden for a while",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         let again = publish(&shared, vec![input("A", 10), primary("甲", "@命令", 40)]);
         assert!(again.messages[1].is_new, "聊天恢复后的追加命令必须判新");
@@ -1612,7 +1906,11 @@ mod tests {
         let shared = ChatTimeline::new();
         publish(&shared, vec![input("A", 10)]);
         shared
-            .publish_no_chat(Instant::now(), "chat hidden for a while")
+            .publish_no_chat(
+            Instant::now(),
+            "chat hidden for a while",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         let mut pink = primary("甲", "@点歌 晴", 40);
         pink.message_type = "pink".into();
@@ -1696,7 +1994,11 @@ mod tests {
             .complete_as_command()
             .unwrap();
         shared
-            .publish_no_chat(Instant::now(), "view rebuild after successful command")
+            .publish_no_chat(
+            Instant::now(),
+            "view rebuild after successful command",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         let rebuilt = friend(&shared, vec![input("@点歌晴天", 40)]);
         let repeated = &rebuilt.messages[0];
@@ -1810,7 +2112,11 @@ mod tests {
             );
         }
         shared
-            .publish_no_chat(Instant::now(), "view rebuilt")
+            .publish_no_chat(
+            Instant::now(),
+            "view rebuilt",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         assert!(
             shared
@@ -1835,7 +2141,11 @@ mod tests {
         let command = publish(&shared, vec![input("history", 10), input("@帮助", 40)]);
         let id = &command.messages[1].id;
         shared
-            .publish_no_chat(Instant::now(), "view rebuilt")
+            .publish_no_chat(
+            Instant::now(),
+            "view rebuilt",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         let rebuilt = publish(&shared, vec![input("other screen", 100)]);
         assert_ne!(command.visual_session, rebuilt.visual_session);
@@ -1872,7 +2182,11 @@ mod tests {
         let suppression = shared.suppress_friend_business().unwrap();
         drop(suppression);
         shared
-            .publish_no_chat(Instant::now(), "view rebuilt")
+            .publish_no_chat(
+            Instant::now(),
+            "view rebuilt",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         assert!(!ignore_revision(&shared, &unread, 1));
         assert!(
@@ -1900,7 +2214,11 @@ mod tests {
             .acknowledge_command(&message.id, &message.text, message.block.y)
             .unwrap();
         shared
-            .publish_no_chat(Instant::now(), "view hidden")
+            .publish_no_chat(
+            Instant::now(),
+            "view hidden",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         let restored = publish(&shared, vec![input("甲:@下一首。!", 40)]);
         assert!(
@@ -2007,7 +2325,11 @@ mod tests {
                 assert_eq!(&corrected.messages[1].id, ignored_id);
                 if rebuild_before_completion {
                     shared
-                        .publish_no_chat(Instant::now(), "view rebuilt")
+                        .publish_no_chat(
+            Instant::now(),
+            "view rebuilt",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
                         .unwrap();
                 }
                 if let Some(active) = active {
@@ -2036,7 +2358,11 @@ mod tests {
         let shared = ChatTimeline::new();
         let refresh = shared.request_refresh().unwrap();
         shared
-            .publish_no_chat(Instant::now(), "chat temporarily hidden")
+            .publish_no_chat(
+            Instant::now(),
+            "chat temporarily hidden",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         let no_chat = shared
             .wait_for_snapshot(refresh, Duration::ZERO)
@@ -2395,7 +2721,11 @@ mod tests {
             .unwrap();
         let token = shared.request_refresh().unwrap();
         shared
-            .publish_no_chat(Instant::now(), "chat disappeared")
+            .publish_no_chat(
+            Instant::now(),
+            "chat disappeared",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         assert!(shared.latest().unwrap().is_none());
         assert!(shared.wait_for_snapshot(token, Duration::ZERO).is_err());
@@ -2422,7 +2752,11 @@ mod tests {
         // 机器人自己发出候选提示会让聊天区瞬态消失（输入框获焦、面板滚动），
         // 共享 OCR 因此清空 tracker；聊天重新出现时会话号自增，但聊天身份没变。
         shared
-            .publish_no_chat(Instant::now(), "bot reply is scrolling the chat")
+            .publish_no_chat(
+            Instant::now(),
+            "bot reply is scrolling the chat",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         assert!(decision.read().unwrap().is_empty());
         let rebuilt = publish(&shared, vec![input("候选", 10), input("确认", 40)]);
@@ -2546,7 +2880,11 @@ mod tests {
         }
         assert!(decision.read().unwrap().is_empty());
         shared
-            .publish_no_chat(Instant::now(), "transient view gap")
+            .publish_no_chat(
+            Instant::now(),
+            "transient view gap",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
         assert!(decision.read().unwrap().is_empty());
         for _ in 0..32 {
@@ -2666,7 +3004,11 @@ mod tests {
     /// 窗口切换/视图重建：聊天区瞬态消失，tracker 清空，下一帧 visual_session 自增。
     fn rebuild(shared: &ChatTimeline) {
         shared
-            .publish_no_chat(Instant::now(), "view rebuilt")
+            .publish_no_chat(
+            Instant::now(),
+            "view rebuilt",
+            crate::observation::chat::ViewAbsence::Transient,
+        )
             .unwrap();
     }
 

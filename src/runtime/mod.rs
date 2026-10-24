@@ -1,5 +1,6 @@
 pub mod business;
 pub(crate) mod chat_listener;
+pub(crate) mod chat_source;
 pub use miliastra_kernel::clock;
 pub(crate) mod deadline;
 pub(crate) mod deadline_bridge;

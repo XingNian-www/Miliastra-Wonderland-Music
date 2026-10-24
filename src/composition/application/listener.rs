@@ -1765,6 +1765,7 @@ impl ApplicationRuntime {
                                         id: id.clone(),
                                         text: message.text,
                                         sender,
+                                        account: message.account,
                                     }],
                                 },
                             },
@@ -1900,6 +1901,30 @@ impl ApplicationRuntime {
             .live_configs
             .identity
             .canonical_name(ocr_name)
+    }
+
+    /// 歌单归属键的候选列表，按优先级：UID > 身份映射 UUID > 昵称。
+    ///
+    /// UID 最高是因为它能跨改名稳定定位；身份映射次之（用户显式声明同一人）；
+    /// 昵称兜底。读取时依次尝试，写入时用第一个可用的。
+    /// 歌单归属只认身份 UUID：没有登记身份映射的玩家没有歌单。
+    ///
+    /// 返回空表示"无歌单"，调用方应提示用户先配置身份映射，
+    /// 而不是退化成按昵称归属（昵称会改、会重名、OCR 会读错）。
+    pub(super) fn playlist_owner_candidates(&self, ocr_name: &str) -> Vec<String> {
+        let identity = self
+            .lifecycle
+            .live_configs
+            .identity
+            .resolve(ocr_name)
+            .map(|resolved| resolved.id.to_string());
+        crate::features::playlist::owner_key::candidates(identity.as_deref())
+    }
+
+    /// 写入用的归属键：候选中优先级最高的那个。
+    /// 写入用的归属键；没有身份映射时为 `None`（调用方应拒绝操作）。
+    pub(super) fn playlist_owner_key(&self, ocr_name: &str) -> Option<String> {
+        self.playlist_owner_candidates(ocr_name).into_iter().next()
     }
 
     fn map_command_actor(&self, mut command: RoutedCommand) -> RoutedCommand {
@@ -2707,6 +2732,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Admin,
                 note: String::new(),
+                accounts: Vec::new(),
             }],
         });
         let workflows = CustomWorkflowService::new(
@@ -3341,7 +3367,11 @@ mod tests {
         let command = primary_route(message.id.clone());
         super::acknowledge_primary_command(&shared, &command, true).unwrap();
         shared
-            .publish_no_chat(Instant::now(), "transient view rebuild")
+            .publish_no_chat(
+                Instant::now(),
+                "transient view rebuild",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         let rebuilt = shared
             .publish(Instant::now(), ChatIdentity::PrimaryHall, vec![input])
@@ -3407,7 +3437,11 @@ mod tests {
         );
 
         shared
-            .publish_no_chat(Instant::now(), "view rebuilt")
+            .publish_no_chat(
+                Instant::now(),
+                "view rebuilt",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         let rebuilt = shared
             .publish(

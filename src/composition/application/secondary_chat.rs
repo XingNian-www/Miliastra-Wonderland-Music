@@ -85,13 +85,35 @@ pub(super) struct SecondaryObservationOutcome {
     pub(super) unrecognized: bool,
 }
 
+/// 二级大厅消息的命令主语键。
+///
+/// 优先级与身份模型一致：昵称 > 账号 UID > 占位符。昵称在前是因为它是
+/// 身份映射与展示的既有匹配键（OCR 路径只有它）；外部源昵称缺失时才退回
+/// UID，保证同一账号在同一大厅内仍然稳定，不会所有人塌缩成同一个占位名。
+/// 两者都没有时返回占位符：那种消息已经在上游被 Unknown 拒绝，到不了这里。
+fn secondary_hall_actor_key(
+    nickname: Option<&str>,
+    account: Option<&crate::features::command::CommandAccount>,
+) -> String {
+    if let Some(nickname) = nickname.map(str::trim).filter(|name| !name.is_empty()) {
+        return nickname.to_string();
+    }
+    if let Some(uid) = account
+        .map(|account| account.uid.trim())
+        .filter(|uid| !uid.is_empty())
+    {
+        return format!("uid:{uid}");
+    }
+    SECONDARY_HALL_FALLBACK_SENDER.to_string()
+}
+
 #[derive(Clone, Debug)]
 struct SecondaryOcrMessage {
     text: String,
     sender: Option<String>,
     sender_identity: Option<SecondarySenderIdentity>,
     kind: SecondaryHallMessageKind,
-    requires_sender: bool,
+    requires_identity: bool,
 }
 
 fn classify_secondary_hall_routed_message(
@@ -106,7 +128,7 @@ fn classify_secondary_hall_routed_message(
         accepts_turtle_questions,
     );
     // 第一条路由使用占位发言者，因此授权判断需要真实发言者。
-    classification.requires_sender |= routed
+    classification.requires_identity |= routed
         .is_some_and(|command| command.permission_required.is_some())
         || (!commands_enabled && classification.kind == SecondaryHallMessageKind::Command);
     classification
@@ -122,16 +144,18 @@ struct SecondaryHallActorObservation {
 struct SecondaryHallCommandObservation {
     command_key: String,
     actor: Option<SecondaryHallActorObservation>,
-    requires_sender: bool,
+    requires_identity: bool,
     row_from_bottom: usize,
 }
 
 impl SecondaryHallCommandObservation {
     fn stable_with(&self, other: &Self) -> bool {
-        if self.command_key != other.command_key || self.requires_sender != other.requires_sender {
+        if self.command_key != other.command_key
+            || self.requires_identity != other.requires_identity
+        {
             return false;
         }
-        if !self.requires_sender {
+        if !self.requires_identity {
             return true;
         }
         if self.actor.is_none() || other.actor.is_none() {
@@ -141,10 +165,12 @@ impl SecondaryHallCommandObservation {
     }
 
     fn matches(&self, other: &Self) -> bool {
-        if self.command_key != other.command_key || self.requires_sender != other.requires_sender {
+        if self.command_key != other.command_key
+            || self.requires_identity != other.requires_identity
+        {
             return false;
         }
-        if !self.requires_sender {
+        if !self.requires_identity {
             return true;
         }
         let (Some(left), Some(right)) = (&self.actor, &other.actor) else {
@@ -254,7 +280,7 @@ fn secondary_hall_command_observation(
         let input = crate::features::song_request::parse_structured_song_text(&message.text)?;
         format!("@:{}", command_identity(&input.keyword()))
     };
-    let actor = if message.requires_sender {
+    let actor = if message.requires_identity {
         message
             .sender_identity
             .as_ref()
@@ -282,7 +308,7 @@ fn secondary_hall_command_observation(
     Some(SecondaryHallCommandObservation {
         command_key,
         actor,
-        requires_sender: message.requires_sender,
+        requires_identity: message.requires_identity,
         row_from_bottom,
     })
 }
@@ -322,17 +348,27 @@ impl ApplicationRuntime {
             self.lifecycle.config.screen.expected_height,
             self.lifecycle.config.invite.friend_list_region.into(),
         );
+        // 身份判定的依据按来源分开，不再用「外部源是否开着」猜：
+        //
+        // - OCR 路径：看共享快照是不是二级大厅（屏幕上有二级聊天区就是 Identity::SecondaryHall）。
+        // - 外部源路径：inject_external 有意不写 `state.latest`（外部消息没有屏幕坐标，
+        //   写进去会毒化下一帧对齐），所以 latest 恒为 None。此时身份必须由
+        //   「当前是否有外部消息在账本里」决定，而不是靠界面推断。
+        //
+        // 以前把两者混成"external_active 就认定 CurrentHall"，语义上能跑但把
+        // 「看哪块屏幕」和「消息属于哪个容器」绑死了——正是这次要拆开的耦合。
         let shared_snapshot = self.ui.chat_timeline.latest()?;
-        let observed_identity = if shared_snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot.chat == crate::observation::chat::ChatIdentity::SecondaryHall
-        }) {
-            SecondaryChatIdentity::CurrentHall
-        } else {
-            SecondaryChatIdentity::Unknown
-        };
-        let scanned = shared_snapshot.as_ref().is_some_and(|snapshot| {
+        let ocr_confirms_secondary = shared_snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.chat == crate::observation::chat::ChatIdentity::SecondaryHall
         });
+        // 外部源在线就说明它随时可能交付大厅消息；身份按"大厅"对待，
+        // 否则二级轮次既不敢派发也会反复排队恢复大厅。
+        let external_supplies_hall = self.lifecycle.external_chat.is_active();
+        let (observed_identity, scanned) = if ocr_confirms_secondary || external_supplies_hall {
+            (SecondaryChatIdentity::CurrentHall, true)
+        } else {
+            (SecondaryChatIdentity::Unknown, false)
+        };
         let verified = observed_identity == SecondaryChatIdentity::CurrentHall;
         let identity_changed = identity.as_ref() != Some(&observed_identity);
         if identity_changed {
@@ -826,12 +862,7 @@ impl ApplicationRuntime {
             let shortcut_player = if message_type == "pink" {
                 friend_name.trim().to_string()
             } else {
-                message_sender
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|sender| !sender.is_empty())
-                    .unwrap_or(SECONDARY_HALL_FALLBACK_SENDER)
-                    .to_string()
+                secondary_hall_actor_key(message_sender.as_deref(), account.as_ref())
             };
             let access_config = self.lifecycle.live_configs.snapshot();
             let router = ChatCommandRouter::with_access(
@@ -842,19 +873,23 @@ impl ApplicationRuntime {
             if message_type == "blue" {
                 let classification =
                     self.classify_secondary_business_message(&text, accepts_turtle_questions)?;
+                // 身份来源按可信度排序：账号 UID 优先，昵称次之。外部聊天源的
+                // 昵称可能为 null（API 文档 §5）而 from.uid 必填，只看昵称会把整条
+                // 命令丢掉；反过来，两者皆无（Unknown）仍然拒绝，不放宽到无身份执行。
                 if classification.kind == SecondaryHallMessageKind::Ignored
-                    || (classification.requires_sender
-                        && message_sender
-                            .as_deref()
-                            .is_none_or(|sender| sender.trim().is_empty()))
+                    || (classification.requires_identity
+                        && !crate::features::command::has_known_identity(
+                            message_sender.as_deref(),
+                            account.as_ref(),
+                        ))
                 {
                     if command::looks_like_command(&text) {
                         log::info!(
-                            "命令暂缓：二级命令缺少发送者，等待身份修订 text={}",
+                            "命令暂缓：二级命令缺少可确认身份（UID 与昵称皆无），等待身份修订 text={}",
                             redacted_chat_text(&text)
                         );
                     } else {
-                        log::debug!("二级身份相关输入尚未取得发送者，保留共享消息等待身份修订");
+                        log::debug!("二级身份相关输入尚未取得可确认身份，保留共享消息等待身份修订");
                     }
                     outcome.unrecognized = true;
                     continue;
@@ -867,13 +902,16 @@ impl ApplicationRuntime {
                 command_observation.clone(),
             )
             .map(|envelope| envelope.with_account(account.clone()))
-            && let Some(parsed) =
-                router.route(&envelope, self.business.business.active_entertainment()?)
+                && let Some(parsed) =
+                    router.route(&envelope, self.business.business.active_entertainment()?)
             {
                 outcome.processed = true;
                 outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
                 continue;
             }
+            // 行首就是命令前缀（@ 或 #）时走正规路径，不要退回下面的「找 @」兜底。
+            // 旧实现只认 Hash，把 @ 排到兜底分支；兜底位于身份检查之后，
+            // 外部源昵称缺失时整条 @ 命令就被吞掉了。Amp 是测试专用前缀，仍然排除。
             if let Some(envelope) = CommandEnvelope::new(
                 &text,
                 &shortcut_player,
@@ -882,7 +920,7 @@ impl ApplicationRuntime {
                 command_observation.clone(),
             )
             .map(|envelope| envelope.with_account(account.clone()))
-            && envelope.prefix() == CommandPrefix::Hash
+                && envelope.prefix() != CommandPrefix::Amp
                 && let Some(parsed) =
                     router.route(&envelope, self.business.business.active_entertainment()?)
             {
@@ -915,8 +953,7 @@ impl ApplicationRuntime {
                 command_text,
                 command_observation,
             )
-            .map(|envelope| envelope.with_account(account.clone()))
-            else {
+            .map(|envelope| envelope.with_account(account.clone())) else {
                 if command::looks_like_command(&text) {
                     log::info!(
                         "命令未执行：二级消息无法解析为命令信封 text={}",
@@ -996,7 +1033,7 @@ mod tests {
             let classification =
                 classify_secondary_hall_routed_message(text, Some(&provisional), false, true);
             assert_eq!(classification.kind, SecondaryHallMessageKind::Command);
-            assert!(classification.requires_sender, "command={text}");
+            assert!(classification.requires_identity, "command={text}");
 
             let authorized = router.route(&envelope("管理员"), None).unwrap();
             assert_eq!(authorized.permission_required, None, "command={text}");
@@ -1004,7 +1041,7 @@ mod tests {
         }
         let disabled = classify_secondary_hall_routed_message("@启用", None, false, false);
         assert_eq!(disabled.kind, SecondaryHallMessageKind::Command);
-        assert!(disabled.requires_sender);
+        assert!(disabled.requires_identity);
         for text in ["#状态", "#结束"] {
             let envelope = |sender: &str| {
                 CommandEnvelope::new(text, sender, "blue", text, CommandObservation::default())
@@ -1019,7 +1056,7 @@ mod tests {
             let classification =
                 classify_secondary_hall_routed_message(text, Some(&provisional), false, false);
             assert_eq!(classification.kind, SecondaryHallMessageKind::Command);
-            assert!(classification.requires_sender, "disabled command={text}");
+            assert!(classification.requires_identity, "disabled command={text}");
             let authorized = router
                 .route(&envelope("管理员"), Some(EntertainmentKind::TurtleSoup))
                 .unwrap();
@@ -1028,13 +1065,93 @@ mod tests {
         }
     }
 
+    fn external_account(uid: &str) -> crate::features::command::CommandAccount {
+        crate::features::command::CommandAccount::new(
+            miliastra_kernel::chat_source::GAME_GENSHIN,
+            uid,
+        )
+    }
+
+    #[test]
+    fn actor_key_falls_back_to_uid_when_external_nickname_is_missing() {
+        // 回归：外部聊天源昵称为 null（API 文档 §5）但 from.uid 必填。
+        // 旧实现直接落回占位符，导致大厅里所有缺昵称的玩家塌缩成同一个命令主语，
+        // 锁键、回合归属与歌单归属全部串味。
+        assert_eq!(
+            secondary_hall_actor_key(None, Some(&external_account("900000001"))),
+            "uid:900000001"
+        );
+        assert_eq!(
+            secondary_hall_actor_key(Some("  "), Some(&external_account("42"))),
+            "uid:42"
+        );
+    }
+
+    #[test]
+    fn actor_key_prefers_the_nickname_that_identity_mapping_uses() {
+        // 昵称是身份映射与 OCR 的既有匹配键，有昵称时不能被 UID 顶掉。
+        assert_eq!(
+            secondary_hall_actor_key(Some("芦荟"), Some(&external_account("42"))),
+            "芦荟"
+        );
+        assert_eq!(secondary_hall_actor_key(Some("芦荟"), None), "芦荟");
+    }
+
+    #[test]
+    fn actor_key_keeps_the_placeholder_only_for_unknown_identities() {
+        // Unknown 在上游就会被拒绝执行，占位符只是这条路径的兜底。
+        assert_eq!(
+            secondary_hall_actor_key(None, None),
+            SECONDARY_HALL_FALLBACK_SENDER
+        );
+    }
+
+    #[test]
+    fn uid_only_external_message_passes_the_identity_gate_but_unknown_does_not() {
+        use crate::features::command::has_known_identity;
+
+        // 外部源：昵称缺失、UID 存在 → 放行（这是本轮的回归点）。
+        assert!(has_known_identity(
+            None,
+            Some(&external_account("900000001"))
+        ));
+        // OCR 路径：只有昵称 → 放行。
+        assert!(has_known_identity(Some("芦荟"), None));
+        // 两者皆无 → Unknown，仍然拒绝；不得放宽到无身份也执行。
+        assert!(!has_known_identity(None, None));
+    }
+
+    #[test]
+    fn uid_only_song_request_routes_through_the_shared_at_path() {
+        // 回归：@ 曾被 `prefix == Hash` 排除在正常路径之外，只能落到「找 @」兜底；
+        // 兜底位于身份检查之后，外部源昵称缺失时整条 @点歌 就被吞掉。
+        // 这里验证 @点歌 本身就是可路由的 At 信封，不依赖兜底。
+        let envelope = CommandEnvelope::new(
+            "@点歌晴天",
+            "uid:900000001",
+            "blue",
+            "@点歌晴天",
+            CommandObservation::default(),
+        )
+        .expect("uid-only 消息仍能构造命令信封")
+        .with_account(Some(external_account("900000001")));
+
+        assert_eq!(envelope.prefix(), CommandPrefix::At);
+        assert!(envelope.account().is_some());
+
+        let routed = ChatCommandRouter::without_custom_workflow()
+            .route(&envelope, None)
+            .expect("@点歌 必须被点歌模块认领");
+        assert!(matches!(routed.command, ModuleCommand::SongRequest(_)));
+    }
+
     fn command(text: &str) -> SecondaryOcrMessage {
         SecondaryOcrMessage {
             text: text.to_string(),
             sender: None,
             sender_identity: None,
             kind: SecondaryHallMessageKind::Command,
-            requires_sender: false,
+            requires_identity: false,
         }
     }
 
@@ -1048,7 +1165,7 @@ mod tests {
             sender: Some(identity.effective_name().to_string()),
             sender_identity: Some(identity),
             kind: SecondaryHallMessageKind::Command,
-            requires_sender: true,
+            requires_identity: true,
         }
     }
 
@@ -1156,7 +1273,7 @@ mod tests {
             sender: None,
             sender_identity: None,
             kind: SecondaryHallMessageKind::Command,
-            requires_sender: true,
+            requires_identity: true,
         }];
         assert_eq!(tracker.preview_new_indexes(&pending), vec![0]);
     }

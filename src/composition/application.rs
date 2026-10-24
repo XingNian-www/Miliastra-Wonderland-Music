@@ -1888,7 +1888,12 @@ enum SecondaryHallMessageKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SecondaryHallMessageClassification {
     kind: SecondaryHallMessageKind,
-    requires_sender: bool,
+    /// 这条消息是否需要**可确认的身份**才能执行。
+    ///
+    /// 语义不是「必须有昵称」：账号 UID 或 昵称任一存在就满足。外部聊天源的
+    /// 昵称可能缺失而 UID 必填，只按昵称判断会让这类消息整条丢失。判定统一
+    /// 走 crate::features::command::has_known_identity。
+    requires_identity: bool,
 }
 
 fn secondary_hall_command_text(text: &str) -> Option<&str> {
@@ -1899,6 +1904,11 @@ fn secondary_hall_command_text(text: &str) -> Option<&str> {
     text.find(['@', '＠']).map(|index| text[index..].trim())
 }
 
+/// 判断一条二级大厅消息属于哪类，以及它是否依赖真实发送者身份。
+///
+/// requires_identity 描述的是「业务结果/授权/回合归属会随发言者变化」——
+/// 具体满足条件由 crate::features::command::has_known_identity 统一裁定：
+/// 账号 UID 或 昵称任一存在即可，两者皆无（Unknown）才拒绝执行。
 fn classify_secondary_hall_message(
     text: &str,
     command: Option<&ModuleCommand>,
@@ -1907,7 +1917,7 @@ fn classify_secondary_hall_message(
     if let Some(command) = command {
         return SecondaryHallMessageClassification {
             kind: SecondaryHallMessageKind::Command,
-            requires_sender: command.requires_hall_sender(),
+            requires_identity: command.requires_hall_sender(),
         };
     }
     if accepts_turtle_questions
@@ -1915,7 +1925,7 @@ fn classify_secondary_hall_message(
     {
         return SecondaryHallMessageClassification {
             kind: SecondaryHallMessageKind::TurtleQuestion,
-            requires_sender: true,
+            requires_identity: true,
         };
     }
     if secondary_hall_command_text(text)
@@ -1923,12 +1933,12 @@ fn classify_secondary_hall_message(
     {
         return SecondaryHallMessageClassification {
             kind: SecondaryHallMessageKind::Command,
-            requires_sender: true,
+            requires_identity: true,
         };
     }
     SecondaryHallMessageClassification {
         kind: SecondaryHallMessageKind::Ignored,
-        requires_sender: false,
+        requires_identity: false,
     }
 }
 
@@ -2059,7 +2069,7 @@ mod tests {
         ] {
             let classification = classify_secondary_hall_message("#状态", Some(&command), true);
             assert_eq!(classification.kind, SecondaryHallMessageKind::Command);
-            assert!(!classification.requires_sender, "command={command:?}");
+            assert!(!classification.requires_identity, "command={command:?}");
         }
 
         for command in [
@@ -2072,21 +2082,21 @@ mod tests {
         ] {
             let classification = classify_secondary_hall_message("#输入", Some(&command), false);
             assert_eq!(classification.kind, SecondaryHallMessageKind::Command);
-            assert!(classification.requires_sender, "command={command:?}");
+            assert!(classification.requires_identity, "command={command:?}");
         }
 
         let question = classify_secondary_hall_message("#男人是管理员吗", None, true);
         assert_eq!(question.kind, SecondaryHallMessageKind::TurtleQuestion);
-        assert!(question.requires_sender);
+        assert!(question.requires_identity);
 
         let ignored = classify_secondary_hall_message("普通聊天", None, true);
         assert_eq!(ignored.kind, SecondaryHallMessageKind::Ignored);
-        assert!(!ignored.requires_sender);
+        assert!(!ignored.requires_identity);
 
         for text in ["@删除", "@邀请1"] {
             let fallback = classify_secondary_hall_message(text, None, false);
             assert_eq!(fallback.kind, SecondaryHallMessageKind::Command);
-            assert!(fallback.requires_sender, "text={text}");
+            assert!(fallback.requires_identity, "text={text}");
         }
     }
 
@@ -2110,16 +2120,16 @@ mod tests {
             classify_secondary_hall_message(text, Some(&routed.command), false)
         };
 
-        assert!(!classify("@点歌 测试", None).requires_sender);
-        assert!(!classify("@帮助", None).requires_sender);
-        assert!(classify("#斗地主", None).requires_sender);
-        assert!(!classify("#状态", Some(EntertainmentKind::Landlord)).requires_sender);
-        assert!(classify("#出3", Some(EntertainmentKind::Landlord)).requires_sender);
-        assert!(!classify("#提示", Some(EntertainmentKind::IdiomChain)).requires_sender);
-        assert!(classify("#画蛇添足", Some(EntertainmentKind::IdiomChain)).requires_sender);
-        assert!(classify("#状态", Some(EntertainmentKind::Undercover)).requires_sender);
-        assert!(!classify("#重试", Some(EntertainmentKind::Undercover)).requires_sender);
-        assert!(!classify("#状态", Some(EntertainmentKind::TurtleSoup)).requires_sender);
+        assert!(!classify("@点歌 测试", None).requires_identity);
+        assert!(!classify("@帮助", None).requires_identity);
+        assert!(classify("#斗地主", None).requires_identity);
+        assert!(!classify("#状态", Some(EntertainmentKind::Landlord)).requires_identity);
+        assert!(classify("#出3", Some(EntertainmentKind::Landlord)).requires_identity);
+        assert!(!classify("#提示", Some(EntertainmentKind::IdiomChain)).requires_identity);
+        assert!(classify("#画蛇添足", Some(EntertainmentKind::IdiomChain)).requires_identity);
+        assert!(classify("#状态", Some(EntertainmentKind::Undercover)).requires_identity);
+        assert!(!classify("#重试", Some(EntertainmentKind::Undercover)).requires_identity);
+        assert!(!classify("#状态", Some(EntertainmentKind::TurtleSoup)).requires_identity);
     }
 
     #[test]

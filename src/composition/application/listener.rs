@@ -1726,19 +1726,37 @@ impl ApplicationRuntime {
                             .map(parse_secondary_sender_identity)
                             .filter(|identity| !identity.effective_name().trim().is_empty())
                             .map(|identity| identity.effective_name().to_string())
-                            .or(message.sender)
+                            // clone 而不是 move：下面还要从 message 取 lock_anchor()
+                            // 与 text，部分移动会让它们不可用。
+                            .or_else(|| message.sender.clone())
                             .filter(|sender| !sender.trim().is_empty());
                         if is_hall {
                             let classification = self.classify_secondary_business_message(
                                 &message.text,
                                 accepts_turtle_questions,
                             )?;
-                            if classification.requires_sender && sender.is_none() {
+                            // 身份门禁看「有没有可授权身份」，不是「有没有昵称」。
+                            //
+                            // ChatBridge 协议保证每条用户消息都带 UID；没有 UID 的
+                            // 不是用户消息（系统/观测帧），本就不该进这里。
+                            // 旧实现只判 sender.is_none()，会把「有 UID、昵称未到」的
+                            // 外部消息当作无身份拒掉——这是「接管后命令完全无效」的
+                            // 第一道硬闸。
+                            //
+                            // MUST_READ §2 的「Unknown 不授权」仍然成立：
+                            // 昵称与 UID 都没有才是 Unknown。
+                            // 身份判定只有一处实现（features::command），避免两处漂移。
+                            if classification.requires_identity
+                                && !crate::features::command::has_known_identity(
+                                    sender.as_deref(),
+                                    message.account.as_ref(),
+                                )
+                            {
                                 if command::looks_like_command(&message.text)
                                     && self.ui.chat_timeline.note_not_executed_log(&message.id)?
                                 {
                                     log::info!(
-                                        "命令未执行：二级消息缺少发送者 text={}",
+                                        "命令未执行：二级消息缺少可用身份（无 UID 也无昵称） text={}",
                                         compact_for_log(&message.text)
                                     );
                                 }
@@ -1746,13 +1764,18 @@ impl ApplicationRuntime {
                             }
                         }
                         let id = message.id.clone();
+                        // 锚点跟着来源走：OCR 用屏幕 y，外部源用服务端序号。
+                        // 外部消息的 block 是哨兵坐标，拿它当屏幕锚点会让任何
+                        // 已记录条目都命中，同文本命令被整批吞掉。
+                        // 必须在 message 被部分移动前取出来。
+                        let lock_anchor = message.lock_anchor();
                         // Claim atomically against discard suppression and other
                         // queued revisions before dispatching business effects.
-                        let Some(claim) = self.ui.chat_timeline.claim_business(
+                        let Some(claim) = self.ui.chat_timeline.claim_business_at(
                             &id,
                             snapshot.captured_at,
                             &message.text,
-                            message.block.y,
+                            lock_anchor,
                         )?
                         else {
                             if command::looks_like_command(&message.text)
@@ -2150,34 +2173,39 @@ impl ApplicationRuntime {
         captured_at: Instant,
     ) -> Result<()> {
         let config = self.lifecycle.live_configs.snapshot().ai_chat.clone();
-        if !config.enabled || !self.business.ai.enabled() {
-            return Ok(());
-        }
-        // 只处理大厅普通成员发言；好友私聊另有既有链路。
-        if message.message_type != "blue" {
-            return Ok(());
-        }
         // 大厅消息没有独立 sender 字段，昵称在文本行首，与命令信封共用同一套切分。
-        let Some((sender, body)) =
-            crate::interfaces::chat::split_sender_line(&message.text, &message.message_type)
-        else {
-            // 拆不出发送者就不触发：MUST_READ §2 要求 Unknown 不授权、不建记忆。
-            return Ok(());
+        // 拆不出发送者就不触发：MUST_READ §2 要求 Unknown 不授权、不建记忆。
+        let split =
+            crate::interfaces::chat::split_sender_line(&message.text, &message.message_type);
+        // 全部门槛收敛在 features::ai_chat::keyword_trigger：原来每个不满足的分支都
+        // 直接 return Ok(()) 且不打日志，用户只看到「完全静默」。收敛成一条不可
+        // 静默的日志，也避免以后新增门槛时又悄悄吞掉触发。
+        let (sender, question) = match crate::features::ai_chat::keyword_trigger(
+            &config,
+            self.business.ai.enabled(),
+            &message.message_type,
+            split,
+        ) {
+            crate::features::ai_chat::KeywordTrigger::Ask { sender, question } => {
+                (sender, question)
+            }
+            crate::features::ai_chat::KeywordTrigger::Skip(skip) => {
+                // 用 info 而不是 debug：logging.level 默认 info（LoggingConfig::default），
+                // debug 级日志在默认配置下根本不落盘，排查时还是「什么都看不到」。
+                // 只在真正收到聊天消息时打印，不会淹没日志。
+                log::info!(
+                    "AI 聊天未触发：{} type={} text={}",
+                    skip.reason(),
+                    message.message_type,
+                    compact_for_log(&message.text)
+                );
+                return Ok(());
+            }
         };
-        let sender = sender.trim();
-        if sender.is_empty() {
-            return Ok(());
-        }
-        // 触发关键词与提问都只看正文：昵称里出现关键词不算触发。
-        let Some(question) = config.match_trigger(body) else {
-            return Ok(());
-        };
-        let question = question.trim().to_string();
-        if question.is_empty()
-            || question.chars().count() > crate::features::ai_chat::MAX_QUESTION_CHARS
-        {
-            return Ok(());
-        }
+        log::info!(
+            "AI 聊天触发: sender={sender} question={}",
+            compact_for_log(&question)
+        );
         let mut routed = RoutedCommand::console(
             &config.keyword,
             &message.text,
@@ -2186,7 +2214,7 @@ impl ApplicationRuntime {
         routed.username = sender.to_string();
         routed.message_type = message.message_type.clone();
         routed.authority = CommandAuthority::HallMember;
-        routed.role = self.lifecycle.live_configs.identity.role_of(sender);
+        routed.role = self.lifecycle.live_configs.identity.role_of(&sender);
         routed.observation = crate::features::command::CommandObservation {
             frame_id: None,
             captured_at: Some(captured_at),
@@ -2490,7 +2518,11 @@ impl ApplicationRuntime {
         if snapshot.mode == ChatListenerMode::Secondary || snapshot.pending_mode.is_some() {
             return Ok(());
         }
-        if !self.lifecycle.external_chat.claim_initial_secondary_switch() {
+        if !self
+            .lifecycle
+            .external_chat
+            .claim_initial_secondary_switch()
+        {
             return Ok(());
         }
         log::info!("外部聊天源首次遇到一级聊天界面，自动切换二级值守: ui={ui_state}");
@@ -2568,6 +2600,86 @@ impl ApplicationRuntime {
 
 #[cfg(test)]
 mod tests {
+    /// 回归：AI 聊天的触发关键词必须作用在「去掉前导分隔符」的正文上。
+    ///
+    /// split_sender_line 只切在分隔符**之前**，body 仍带着那个分隔符：
+    ///   [2#BOT|勿加]:橘子你是什么模型？  ->  (2#BOT|勿加, :橘子你是什么模型？)
+    /// 命令路径会先 trim 掉 : / ： 再解析，AI 聊天分支原来没做，
+    /// 于是 Prefix 模式下 strip_prefix(橘子) 永远失败——表现为
+    /// 「AI 聊天完全无法触发」，而日志里只看到「命令未执行」。
+    #[test]
+    fn ai_chat_trigger_text_drops_the_sender_separator() {
+        use crate::interfaces::chat::split_sender_line;
+        let raw = "[2#BOT|勿加]:橘子你是什么模型？";
+        let (sender, body) = split_sender_line(raw, "blue").expect("bracket sender");
+        assert_eq!(sender, "2#BOT|勿加");
+        // split_sender_line 只切在分隔符**之前**，body 仍带着冒号。
+        assert_eq!(body, ":橘子你是什么模型？");
+        let mut config = crate::features::ai_chat::AiChatConfig::default();
+        config.keyword = "橘子".to_string();
+        // 归一化下沉到 match_trigger 内部：命令路径与闲聊路径看到同一段正文。
+        // 因此带冒号的原始 body 也必须命中，正文是「你是什么模型？」。
+        assert_eq!(
+            config.match_trigger(body).as_deref(),
+            Some("你是什么模型？"),
+            "带前导分隔符的 body 必须命中：归一化是 match_trigger 的职责"
+        );
+        // 已经 trim 过的正文结果一致（幂等）。
+        let trimmed = body.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
+        assert_eq!(
+            config.match_trigger(trimmed).as_deref(),
+            Some("你是什么模型？")
+        );
+    }
+
+    /// 回归（端到端）：真实 OCR 文本「[昵称]:橘子xxx」必须能一路命中触发。
+    ///
+    /// 覆盖从聊天行到判定结果的全部真实环节：split_sender_line 切昵称、
+    /// match_trigger 去分隔符并剥关键词、keyword_trigger 过全部门槛。
+    /// 这条路径以前因为 body 带 ':' 而永远返回 None，玩家看到的就是 AI 完全不回。
+    #[test]
+    fn bracketed_hall_line_with_keyword_triggers_end_to_end() {
+        use crate::features::ai_chat::{
+            AiChatConfig, KeywordTrigger, TriggerSkip, keyword_trigger,
+        };
+        use crate::interfaces::chat::split_sender_line;
+
+        let config = AiChatConfig {
+            enabled: true,
+            keyword: "橘子".to_string(),
+            ..AiChatConfig::default()
+        };
+
+        // 玩家发的那句话：昵称在方括号里，正文前有半角冒号。
+        let line = "[路人甲]:橘子你是什么模型？";
+        let split = split_sender_line(line, "blue");
+        assert_eq!(
+            keyword_trigger(&config, true, "blue", split),
+            KeywordTrigger::Ask {
+                sender: "路人甲".to_string(),
+                question: "你是什么模型？".to_string(),
+            }
+        );
+
+        // 全角昵称括号 + 冒号（OCR 两种字形都可能出现）。
+        let line = "【路人甲】:橘子在吗";
+        let split = split_sender_line(line, "blue");
+        assert_eq!(
+            keyword_trigger(&config, true, "blue", split),
+            KeywordTrigger::Ask {
+                sender: "路人甲".to_string(),
+                question: "在吗".to_string(),
+            }
+        );
+
+        // 一条命令式的行不会被关键词吞掉：它不带关键词，正常落回关键词未命中。
+        let split = split_sender_line("[路人甲]:@点歌晴天", "blue");
+        assert_eq!(
+            keyword_trigger(&config, true, "blue", split),
+            KeywordTrigger::Skip(TriggerSkip::KeywordMiss)
+        );
+    }
+
     /// 监控页"界面"只显示中文界面名，不复述命中的颜色/模板判据；
     /// 判据细节仍保留在 /debug/ui-state 与 ui.state 事件证据里。
     #[test]

@@ -8,7 +8,10 @@ use anyhow::{Result, anyhow, bail};
 
 use super::freshness::{BaselineKind, FreshFrame, Freshness, SequenceFreshness};
 pub(crate) use super::scan::RecognizedChatMessage;
-use super::{BubbleSequence, ChatIdentity, ObservedChatMessageId, VisualSessionId};
+use super::{
+    BubbleSequence, ChatIdentity, ChatScope, LockAnchor, ObservedChatMessageId, SourceId,
+    VisualSessionId,
+};
 use crate::geometry::Rect;
 
 const RETAINED_CAPACITY: usize = 4096;
@@ -35,6 +38,32 @@ pub(crate) struct ChatTimelineMessage {
     ///
     /// 一路带到 `CommandEnvelope`，让权限解析能用 UID 而不是昵称。
     pub(crate) account: Option<miliastra_kernel::chat_source::CommandAccount>,
+    /// 外部源的**原始**服务端序号；OCR 路径为 0。
+    ///
+    /// 不能复用 `id.bubble_sequence`：那是去重键的 FNV 哈希，不保证单调，
+    /// 而命令锁的序号锚点依赖「序号越大越新」。
+    pub(crate) source_sequence: u64,
+}
+
+impl ChatTimelineMessage {
+    /// 该消息在命令锁里的锚点。
+    ///
+    /// OCR 消息用屏幕 y；外部消息用**原始服务端序号**。
+    ///
+    /// 不能用 `id.bubble_sequence`：那是去重键的 FNV 哈希，不保证单调，
+    /// 而锚点比较依赖「序号越大越新」——用哈希会让新旧判断随机化。
+    ///
+    /// 外部消息的 `block` 是哨兵坐标，若拿它当屏幕锚点，`y <= recorded + 28`
+    /// 会与任何已记录条目命中，同文本命令被全部吞掉。
+    pub(crate) fn lock_anchor(&self) -> LockAnchor {
+        if self.id.is_from_screen() {
+            LockAnchor::Screen { y: self.block.y }
+        } else {
+            LockAnchor::Sequence {
+                after: self.source_sequence,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -161,15 +190,34 @@ struct CommandLock {
 #[derive(Clone, Debug)]
 struct CommandLockEntry {
     text: String,
-    y: i32,
+    /// 记录时的锚点。OCR 用屏幕位置，外部源用服务端序号；
+    /// 两者语义不同，不能互相比较——见 [`LockAnchor`]。
+    anchor: LockAnchor,
     /// 连续多少个可信帧判定该条目已不在屏上；任一次命中即清零。
+    /// 外部源没有「帧」的概念，该字段恒为 0（永不因缺席释放）。
     missing_frames: u8,
 }
 
 impl CommandLockEntry {
-    /// v3 锚点命中：归一化文本一致，且当前位置不晚于记录位置 + 一行高容差。
-    fn matches(&self, normalized: &str, y: i32) -> bool {
-        self.text == normalized && y <= self.y + COMMAND_LOCK_POSITION_TOLERANCE_PX
+    /// 锚点命中：文本一致，且锚点在容差内。
+    ///
+    /// - 屏幕锚点：当前位置不晚于记录位置 + 一行高容差（v3 语义）。
+    /// - 序号锚点：新消息序号必须大于已记录的（严格更大才算新命令）。
+    fn matches(&self, normalized: &str, anchor: LockAnchor) -> bool {
+        if self.text != normalized {
+            return false;
+        }
+        match (self.anchor, anchor) {
+            (LockAnchor::Screen { y: recorded }, LockAnchor::Screen { y }) => {
+                y <= recorded + COMMAND_LOCK_POSITION_TOLERANCE_PX
+            }
+            // 序号越大越新：只有「新序号 <= 已记录」才算同一条。
+            (LockAnchor::Sequence { after: recorded }, LockAnchor::Sequence { after }) => {
+                after <= recorded
+            }
+            // 锚点类型不同说明来源换了：绝不能把外部消息当成屏幕上的同一条。
+            _ => false,
+        }
     }
 }
 
@@ -178,21 +226,22 @@ impl CommandLock {
         self.entries.is_empty()
     }
 
-    /// anchor_matched(msg)：锁中存在条目满足 normalize(entry.text) == normalize(msg.text)
-    /// 且 msg.block.y <= entry.y + TOLERANCE（一行高）。
+    /// 锚点命中：锁中存在条目满足 normalize 文本一致且锚点容差内。
     fn matches(&self, message: &ChatTimelineMessage) -> bool {
-        self.matches_text_at(&message.text, message.block.y)
+        self.matches_text_at(&message.text, message.lock_anchor())
     }
 
-    fn matches_text_at(&self, text: &str, y: i32) -> bool {
+    fn matches_text_at(&self, text: &str, anchor: LockAnchor) -> bool {
         let text = normalize_command_lock_text(text);
-        self.entries.iter().any(|entry| entry.matches(&text, y))
+        self.entries
+            .iter()
+            .any(|entry| entry.matches(&text, anchor))
     }
 
-    /// 同一条文本再次写入时只更新位置并复位缺失计数，不重复追加；超出容量丢弃最旧。
-    fn record(&mut self, text: String, y: i32) {
+    /// 同一条文本再次写入时只更新锚点并复位缺失计数，不重复追加；超出容量丢弃最旧。
+    fn record(&mut self, text: String, anchor: LockAnchor) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.text == text) {
-            entry.y = y;
+            entry.anchor = anchor;
             entry.missing_frames = 0;
             return;
         }
@@ -201,7 +250,7 @@ impl CommandLock {
         }
         self.entries.push_back(CommandLockEntry {
             text,
-            y,
+            anchor,
             missing_frames: 0,
         });
     }
@@ -216,10 +265,24 @@ impl CommandLock {
         }
         let screen = observed
             .iter()
-            .map(|message| (normalize_command_lock_text(&message.text), message.block.y))
+            .map(|message| {
+                (
+                    normalize_command_lock_text(&message.text),
+                    message.lock_anchor(),
+                )
+            })
             .collect::<Vec<_>>();
         for entry in &mut self.entries {
-            if screen.iter().any(|(text, y)| entry.matches(text, *y)) {
+            // 序号锚点没有「是否还在屏上」的概念：外部消息只在收到新序号时推进，
+            // 不能因为这一帧没看到它就释放，否则重连补拉会重复执行。
+            if matches!(entry.anchor, LockAnchor::Sequence { .. }) {
+                entry.missing_frames = 0;
+                continue;
+            }
+            if screen
+                .iter()
+                .any(|(text, anchor)| entry.matches(text, *anchor))
+            {
                 entry.missing_frames = 0;
             } else {
                 entry.missing_frames = entry.missing_frames.saturating_add(1);
@@ -289,10 +352,11 @@ pub(crate) struct SharedBusinessClaim {
     shared: ChatTimeline,
     id: ObservedChatMessageId,
     suppression_generation: u64,
-    /// 被派发消息自身的文本与屏幕位置，认领时就捕获，绝不回头查当前 tracker
+    /// 被派发消息自身的文本与锚点，认领时就捕获，绝不回头查当前 tracker
     /// （执行完成时气泡可能已经滚出 visible/latest）。
     text: String,
-    y: i32,
+    /// OCR 消息是屏幕位置，外部消息是服务端序号——见 [`LockAnchor`]。
+    anchor: LockAnchor,
     captured_at: Instant,
     committed: bool,
 }
@@ -343,7 +407,7 @@ impl SharedBusinessClaim {
             let mut state = self.shared.lock()?;
             acknowledge_business_locked(&mut state, &self.id);
             if write_lock {
-                record_command_lock_locked(&mut state, &self.id.chat, &self.text, self.y);
+                record_command_lock_locked(&mut state, &self.id.chat, &self.text, self.anchor);
             }
         }
         self.committed = true;
@@ -934,7 +998,9 @@ impl ChatTimeline {
             };
             // 去重键参与 id 构造：同一来源的同一序号只会入账一次。
             let dedup = message.dedup_key(source);
-            let id = ObservedChatMessageId::new(
+            // 明确标记来源：外部消息不是屏幕气泡，命令锁与去重都不能用位置语义。
+            let id = ObservedChatMessageId::from_source(
+                SourceId::external(source),
                 epoch,
                 identity.clone(),
                 BubbleSequence::new(external_sequence(&dedup)),
@@ -981,6 +1047,8 @@ impl ChatTimeline {
                 // 哨兵坐标：永不命中命令锁的 `y <= entry.y + 28` 容差。
                 block: crate::geometry::Rect::new(0, i32::MIN / 2, 1, 1),
                 is_new: true,
+                // 原始序号：命令锁的序号锚点必须单调，不能用去重哈希。
+                source_sequence: message.sequence,
                 account: message.sender.uid.as_ref().map(|uid| {
                     miliastra_kernel::chat_source::CommandAccount {
                         game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
@@ -1249,15 +1317,29 @@ impl ChatTimeline {
             && !snapshot_precedes_delivery_fence(&state, id, captured_at))
     }
 
-    /// `text`/`y` 必须是被派发消息自身的数据（由调用方在认领时连同快照一起捕获），
+    /// `text`/锚点必须是被派发消息自身的数据（由调用方在认领时连同快照一起捕获），
     /// 不能回头查当前 tracker：执行完成时气泡可能已经滚出 visible/latest，
     /// 那样会静默不写命令锁。
+    ///
+    /// 兼容入口：调用方仍按 OCR 语义给 y。外部消息用
+    /// [`Self::claim_business_at`] 传 `LockAnchor::Sequence`。
     pub(crate) fn claim_business(
         &self,
         id: &ObservedChatMessageId,
         captured_at: Instant,
         text: &str,
         y: i32,
+    ) -> Result<Option<SharedBusinessClaim>> {
+        self.claim_business_at(id, captured_at, text, LockAnchor::Screen { y })
+    }
+
+    /// 带显式锚点的认领：OCR 传 `Screen { y }`，外部源传 `Sequence { after }`。
+    pub(crate) fn claim_business_at(
+        &self,
+        id: &ObservedChatMessageId,
+        captured_at: Instant,
+        text: &str,
+        anchor: LockAnchor,
     ) -> Result<Option<SharedBusinessClaim>> {
         let mut state = self.lock()?;
         if snapshot_precedes_delivery_fence(&state, id, captured_at)
@@ -1273,7 +1355,7 @@ impl ChatTimeline {
             id: id.clone(),
             suppression_generation: state.friend_suppression_generation,
             text: text.to_owned(),
-            y,
+            anchor,
             captured_at,
             committed: false,
         }))
@@ -1313,9 +1395,21 @@ impl ChatTimeline {
         text: &str,
         y: i32,
     ) -> Result<bool> {
+        // 兼容入口：调用方仍按 OCR 语义给 y。外部消息的锚点由
+        // `acknowledge_command_at` 提供，避免这里猜来源。
+        self.acknowledge_command_at(id, text, LockAnchor::Screen { y })
+    }
+
+    /// 带显式锚点的命令确认：OCR 传 `Screen { y }`，外部源传 `Sequence { after }`。
+    pub(crate) fn acknowledge_command_at(
+        &self,
+        id: &ObservedChatMessageId,
+        text: &str,
+        anchor: LockAnchor,
+    ) -> Result<bool> {
         let mut state = self.lock()?;
         let found = acknowledge_business_locked(&mut state, id);
-        record_command_lock_locked(&mut state, &id.chat, text, y);
+        record_command_lock_locked(&mut state, &id.chat, text, anchor);
         Ok(found)
     }
 }
@@ -1327,23 +1421,45 @@ impl ChatTimeline {
 fn external_chat_identity(
     message: &crate::observation::chat::ExternalChatMessage,
 ) -> Option<ChatIdentity> {
+    let scope = external_chat_scope(message)?;
+    Some(match scope {
+        // 外部源的大厅消息统一归到二级桶：它本来就是「当前所在大厅」，
+        // 与 OCR 的二级观察是同一个物理容器（见 MUST_READ 的共享观察约定）。
+        ChatScope::Hall { .. } => ChatIdentity::SecondaryHall,
+        ChatScope::Private { peer } => ChatIdentity::Friend(peer),
+    })
+}
+
+/// 外部消息属于哪个聊天容器。
+///
+/// 私聊的 peer **优先用 UID**：昵称可能迟到甚至永远不到（API 文档 §5），
+/// 而 UID 是必填的。以前用昵称当键，昵称一缺整条私聊就被丢弃。
+fn external_chat_scope(
+    message: &crate::observation::chat::ExternalChatMessage,
+) -> Option<ChatScope> {
     if message.channel.is_current_hall() {
-        return Some(ChatIdentity::SecondaryHall);
+        return Some(match message.hall_id {
+            Some(id) => ChatScope::hall_with_id(id),
+            None => ChatScope::hall(),
+        });
     }
     if message.channel.is_private() {
-        let name = message
-            .sender
-            .nickname
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())?;
+        // 对方账号：优先 to_uid（我发给别人），其次 from.uid（别人发给我）。
         let peer = match (&message.to_uid, &message.sender.uid) {
             (Some(to), _) => to.as_str().to_string(),
             (None, Some(from)) => from.as_str().to_string(),
-            (None, None) => name.to_string(),
+            (None, None) => {
+                // 两个 UID 都没有时才退回昵称；再没有就只能放弃。
+                let name = message
+                    .sender
+                    .nickname
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())?;
+                name.to_string()
+            }
         };
-        let _ = peer;
-        return Some(ChatIdentity::Friend(name.to_string().into()));
+        return Some(ChatScope::private(peer));
     }
     None
 }
@@ -1425,16 +1541,25 @@ fn acknowledge_ignored_locked(
     // 独立保留尚未消费 ID 的最新修订，旧忽略提交不能抹掉积压的正确文字。
     let current = state.latest_business_revisions.get(id).cloned();
     let ignored_y = current.as_ref().and_then(|current| current.y);
+    // 迟到的忽略提交也必须尊重锁。锚点来自实际最新修订：
+    // 外部消息没有 y 但有序号，两种来源各自用对应锚点，未知锚点不猜测。
     if current.as_ref().is_some_and(|current| {
         current.captured_at >= captured_at
-            && current.y.is_some_and(|y| {
-                state
-                    .command_locks
-                    .get(&id.chat)
-                    .is_some_and(|lock| lock.matches_text_at(&current.revision.text, y))
-            })
+            && match (id.source.is_ocr(), current.y) {
+                (true, Some(y)) => state.command_locks.get(&id.chat).is_some_and(|lock| {
+                    lock.matches_text_at(&current.revision.text, LockAnchor::Screen { y })
+                }),
+                (false, _) => state.command_locks.get(&id.chat).is_some_and(|lock| {
+                    lock.matches_text_at(
+                        &current.revision.text,
+                        LockAnchor::Sequence {
+                            after: id.bubble_sequence.get(),
+                        },
+                    )
+                }),
+                (true, None) => false,
+            }
     }) {
-        // 迟到的忽略提交也必须尊重锁；位置来自实际最新修订，未知位置不猜测。
         acknowledge_business_locked(state, id);
         return found;
     }
@@ -1480,9 +1605,16 @@ fn set_business_new_locked(state: &mut State, id: &ObservedChatMessageId, is_new
     }
 }
 
-/// 认领并派发成功后把命令文本与屏幕位置写入该聊天的命令锁。
-/// 文本与 y 来自被派发消息自身，不查询当前 tracker。
-fn record_command_lock_locked(state: &mut State, chat: &ChatIdentity, text: &str, y: i32) {
+/// 认领并派发成功后把命令文本与锚点写入该聊天的命令锁。
+///
+/// 文本与锚点来自被派发消息自身，不查询当前 tracker：
+/// 执行完成时气泡可能已滚出屏幕，回头查会静默漏写锁。
+fn record_command_lock_locked(
+    state: &mut State,
+    chat: &ChatIdentity,
+    text: &str,
+    anchor: LockAnchor,
+) {
     let normalized = normalize_command_lock_text(text);
     if normalized.is_empty() {
         return;
@@ -1514,7 +1646,7 @@ fn record_command_lock_locked(state: &mut State, chat: &ChatIdentity, text: &str
     let activity = state.next_command_lock_activity;
     let lock = state.command_locks.entry(chat.clone()).or_default();
     lock.last_activity = activity;
-    lock.record(normalized, y);
+    lock.record(normalized, anchor);
 }
 
 /// 命令锁键：折全角、小写化并去掉空白，保留 @/# 等命令前缀，避免不同命令互相命中。
@@ -1712,6 +1844,8 @@ impl Tracker {
                 block: input.block,
                 // OCR 路径没有账号：权限只能按昵称解析。
                 account: None,
+                // OCR 没有服务端序号：命令锁走屏幕锚点。
+                source_sequence: 0,
             });
         }
         self.initialized = true;
@@ -1804,10 +1938,10 @@ mod tests {
         friend(&shared, vec![input("旧消息一", 10), input("旧消息二", 30)]);
         shared
             .publish_no_chat(
-            Instant::now(),
-            "chat hidden after idle timeout",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "chat hidden after idle timeout",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         let mut command = input("#手牌", 60);
         command.message_type = "pink".into();
@@ -1880,7 +2014,9 @@ mod tests {
         assert!(
             reopened.messages[0].is_new,
             "无交叠重开后好友命令必须判新；当前状态={:?}",
-            shared.business_delivery_state(&reopened.messages[0].id).unwrap()
+            shared
+                .business_delivery_state(&reopened.messages[0].id)
+                .unwrap()
         );
     }
 
@@ -1891,10 +2027,10 @@ mod tests {
         publish(&shared, vec![input("A", 10)]);
         shared
             .publish_no_chat(
-            Instant::now(),
-            "chat hidden for a while",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "chat hidden for a while",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         let again = publish(&shared, vec![input("A", 10), primary("甲", "@命令", 40)]);
         assert!(again.messages[1].is_new, "聊天恢复后的追加命令必须判新");
@@ -1907,10 +2043,10 @@ mod tests {
         publish(&shared, vec![input("A", 10)]);
         shared
             .publish_no_chat(
-            Instant::now(),
-            "chat hidden for a while",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "chat hidden for a while",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         let mut pink = primary("甲", "@点歌 晴", 40);
         pink.message_type = "pink".into();
@@ -1995,10 +2131,10 @@ mod tests {
             .unwrap();
         shared
             .publish_no_chat(
-            Instant::now(),
-            "view rebuild after successful command",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "view rebuild after successful command",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         let rebuilt = friend(&shared, vec![input("@点歌晴天", 40)]);
         let repeated = &rebuilt.messages[0];
@@ -2113,10 +2249,10 @@ mod tests {
         }
         shared
             .publish_no_chat(
-            Instant::now(),
-            "view rebuilt",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "view rebuilt",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         assert!(
             shared
@@ -2142,10 +2278,10 @@ mod tests {
         let id = &command.messages[1].id;
         shared
             .publish_no_chat(
-            Instant::now(),
-            "view rebuilt",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "view rebuilt",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         let rebuilt = publish(&shared, vec![input("other screen", 100)]);
         assert_ne!(command.visual_session, rebuilt.visual_session);
@@ -2183,10 +2319,10 @@ mod tests {
         drop(suppression);
         shared
             .publish_no_chat(
-            Instant::now(),
-            "view rebuilt",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "view rebuilt",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         assert!(!ignore_revision(&shared, &unread, 1));
         assert!(
@@ -2215,10 +2351,10 @@ mod tests {
             .unwrap();
         shared
             .publish_no_chat(
-            Instant::now(),
-            "view hidden",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "view hidden",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         let restored = publish(&shared, vec![input("甲:@下一首。!", 40)]);
         assert!(
@@ -2326,10 +2462,10 @@ mod tests {
                 if rebuild_before_completion {
                     shared
                         .publish_no_chat(
-            Instant::now(),
-            "view rebuilt",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                            Instant::now(),
+                            "view rebuilt",
+                            crate::observation::chat::ViewAbsence::Transient,
+                        )
                         .unwrap();
                 }
                 if let Some(active) = active {
@@ -2359,10 +2495,10 @@ mod tests {
         let refresh = shared.request_refresh().unwrap();
         shared
             .publish_no_chat(
-            Instant::now(),
-            "chat temporarily hidden",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "chat temporarily hidden",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         let no_chat = shared
             .wait_for_snapshot(refresh, Duration::ZERO)
@@ -2722,10 +2858,10 @@ mod tests {
         let token = shared.request_refresh().unwrap();
         shared
             .publish_no_chat(
-            Instant::now(),
-            "chat disappeared",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "chat disappeared",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         assert!(shared.latest().unwrap().is_none());
         assert!(shared.wait_for_snapshot(token, Duration::ZERO).is_err());
@@ -2753,10 +2889,10 @@ mod tests {
         // 共享 OCR 因此清空 tracker；聊天重新出现时会话号自增，但聊天身份没变。
         shared
             .publish_no_chat(
-            Instant::now(),
-            "bot reply is scrolling the chat",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "bot reply is scrolling the chat",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         assert!(decision.read().unwrap().is_empty());
         let rebuilt = publish(&shared, vec![input("候选", 10), input("确认", 40)]);
@@ -2881,10 +3017,10 @@ mod tests {
         assert!(decision.read().unwrap().is_empty());
         shared
             .publish_no_chat(
-            Instant::now(),
-            "transient view gap",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "transient view gap",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         assert!(decision.read().unwrap().is_empty());
         for _ in 0..32 {
@@ -3005,10 +3141,10 @@ mod tests {
     fn rebuild(shared: &ChatTimeline) {
         shared
             .publish_no_chat(
-            Instant::now(),
-            "view rebuilt",
-            crate::observation::chat::ViewAbsence::Transient,
-        )
+                Instant::now(),
+                "view rebuilt",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
     }
 
@@ -3059,6 +3195,67 @@ mod tests {
     }
 
     /// 桶淘汰不能只断言 len<=32：必须证明“在用桶没被淘汰、新桶写进去了、
+    /// 外部消息用序号锚点，不能被写死的哨兵坐标当成「屏幕上的同一条」。
+    ///
+    /// 回归：外部消息的 block 是 Rect::new(0, i32::MIN/2, 1, 1)，
+    /// 若拿它当 Screen 锚点，`y <= recorded + 28` 对任何已记录条目都成立，
+    /// 同文本命令会被整批吞掉——这正是「接管后命令完全无效」的一个成因。
+    #[test]
+    fn external_messages_use_sequence_anchor_not_sentinel_y() {
+        let screen = ChatTimelineMessage {
+            id: ObservedChatMessageId::new(
+                VisualSessionId::new(1),
+                ChatIdentity::SecondaryHall,
+                BubbleSequence::new(7),
+            ),
+            text: "@状态".to_string(),
+            sender: Some("甲".to_string()),
+            raw_sender: Some("甲".to_string()),
+            message_type: "blue".to_string(),
+            block: crate::geometry::Rect::new(0, i32::MIN / 2, 1, 1),
+            is_new: true,
+            account: None,
+            source_sequence: 0,
+        };
+        assert_eq!(screen.lock_anchor(), LockAnchor::Screen { y: i32::MIN / 2 });
+
+        // id.bubble_sequence 是去重键的哈希（不单调），锚点必须用原始序号。
+        let external = ChatTimelineMessage {
+            id: ObservedChatMessageId::from_source(
+                SourceId::external("chatbridge"),
+                VisualSessionId::new(1),
+                ChatIdentity::SecondaryHall,
+                // 故意让哈希序号与原始序号不同，验证锚点取后者。
+                BubbleSequence::new(9999),
+            ),
+            account: None,
+            source_sequence: 42,
+            ..screen.clone()
+        };
+        // 同一个哨兵 block，但来源是外部：锚点必须是原始序号，不是哈希。
+        assert_eq!(external.lock_anchor(), LockAnchor::Sequence { after: 42 });
+
+        // 序号锚点：只有更大的序号才算新命令。
+        let mut lock = CommandLock::default();
+        lock.record("@状态".to_string(), LockAnchor::Sequence { after: 42 });
+        assert!(
+            lock.matches_text_at("@状态", LockAnchor::Sequence { after: 42 }),
+            "同序号必须命中（视为同一条）"
+        );
+        assert!(
+            lock.matches_text_at("@状态", LockAnchor::Sequence { after: 30 }),
+            "更小序号是更旧的消息，也必须命中"
+        );
+        assert!(
+            !lock.matches_text_at("@状态", LockAnchor::Sequence { after: 43 }),
+            "更大序号是新命令，不得被吞"
+        );
+        // 跨来源绝不互认：屏幕锚点不能命中外部记录。
+        assert!(
+            !lock.matches_text_at("@状态", LockAnchor::Screen { y: 10 }),
+            "屏幕锚点与序号锚点语义不同，不能互相命中"
+        );
+    }
     /// 被淘汰的是一次性抖动桶”。真实运行时 PrimaryHall 每帧都被 publish 触碰，
     /// 因此它的活跃度持续刷新；OCR 好友名抖动产生的桶写一次后再也没人碰。
     #[test]
@@ -3073,7 +3270,12 @@ mod tests {
             let chat = ChatIdentity::Friend(Arc::from(format!("ocr-name-{index}").as_str()));
             {
                 let mut state = shared.inner.state.lock().unwrap();
-                record_command_lock_locked(&mut state, &chat, "@命令", 10);
+                record_command_lock_locked(
+                    &mut state,
+                    &chat,
+                    "@命令",
+                    LockAnchor::Screen { y: 10 },
+                );
             }
             // 等价于真实运行时 PrimaryHall 每帧被 publish 触碰。
             publish(&shared, vec![primary("甲", "@命令", 40)]);
@@ -3095,7 +3297,12 @@ mod tests {
         drop(state);
         {
             let mut state = shared.inner.state.lock().unwrap();
-            record_command_lock_locked(&mut state, &newest, "@新命令", 10);
+            record_command_lock_locked(
+                &mut state,
+                &newest,
+                "@新命令",
+                LockAnchor::Screen { y: 10 },
+            );
             assert!(state.command_locks.contains_key(&newest), "新桶必须写入");
             assert!(
                 state.command_locks.contains_key(&primary_hall),

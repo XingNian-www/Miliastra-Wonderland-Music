@@ -1161,6 +1161,12 @@ impl ApplicationRuntime {
                             .publish(MonitorEvent::UiState("界面检测失败".to_string())),
                     }
                     let ui_ms = elapsed_ms(ui_started);
+                    // 值守切换自愈：pending_mode 置位后必须有人在正式队列里执行
+                    // SetChatListenerMode，否则它会永久悬挂——既切不到目标模式，
+                    // 又因为 pending_mode.is_some() 挡住后续一切驻留恢复与再次切换。
+                    // 外部聊天源、HTTP 面板都会先 request 再入队；这里兜住任何
+                    // "只置位未入队"的路径（包括入队失败后没撤销的情况）。
+                    self.reconcile_pending_listener_mode()?;
                     let listener_snapshot = self.business.business.chat_listener_snapshot()?;
                     let command_executing = !self.business.task_engine.is_idle()?;
                     let mut residency_recovery_attempted = false;
@@ -2453,6 +2459,50 @@ impl ApplicationRuntime {
     pub(super) fn execute_console_chat_task(&mut self, text: String, prefix: String) -> Result<()> {
         let message = format!("{}{}", prefix, text);
         self.reply(&message)
+    }
+
+    /// 值守切换自愈：pending_mode 有值但正式队列里没有对应任务时补入队。
+    ///
+    /// 正常情况下 request + enqueue 由同一个生产者完成；但只要中途入队失败、
+    /// 队列被撤销，或某个调用点只 request 不入队，pending_mode 就会永久悬挂：
+    /// 目标模式切不过去，且 `pending_mode.is_some()` 会挡住后续所有驻留恢复，
+    /// 表现为「卡在一级值守，怎么都进不了二级」。
+    ///
+    /// 去重键保证这里重复调用是安全的：队列里已有同模式任务时直接返回。
+    fn reconcile_pending_listener_mode(&self) -> Result<()> {
+        let snapshot = self.business.business.chat_listener_snapshot()?;
+        let Some(target) = snapshot.pending_mode else {
+            return Ok(());
+        };
+        if snapshot.mode == target {
+            // 已经切到了目标模式，pending 只是残留：直接收尾。
+            self.business.business.complete_chat_listener_mode(target)?;
+            log::info!("值守模式已是{}，清理残留的切换请求", target.label());
+            return Ok(());
+        }
+        let key = crate::runtime::scheduler::FormalTaskDedupKey::new(format!(
+            "chat_listener_mode_{}",
+            target.label()
+        ));
+        if self.business.task_engine.contains_formal_dedup_key(&key)? {
+            return Ok(());
+        }
+        log::warn!(
+            "值守切换请求没有对应任务（pending={}），补入队",
+            target.label()
+        );
+        if let Err(error) = self.push_pending_task(PendingTask::SetChatListenerMode { target }) {
+            // 入队失败就撤销请求，避免下个周期继续空转。
+            if let Err(cancel_error) = self
+                .business
+                .business
+                .cancel_chat_listener_mode_request(target)
+            {
+                log::error!("撤销值守切换请求失败: {cancel_error}");
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(super) fn execute_set_chat_listener_mode(

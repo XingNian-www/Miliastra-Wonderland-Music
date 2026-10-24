@@ -1092,10 +1092,13 @@ impl PendingTask {
             // 播放队列自动推进使用稳定去重键：同一时刻只保留一个待执行推进任务，
             // 推进决策在任务执行时重新评估，多个推进原因可以安全合并为一次执行。
             Self::AdvanceQueue { .. } => Some("playback_advance_queue".to_string()),
+            // 值守切换用稳定去重键：同一时刻只需要一个"切到某模式"的任务。
+            // 没有它时，自愈逻辑无法判断 pending_mode 是否已有任务在排队，
+            // 重复入队会堆积多个切换任务，彼此撤销对方的 pending 状态。
+            Self::SetChatListenerMode { target } => Some(format!("chat_listener_mode_{}", target.label())),
             Self::ConsoleChat { .. }
             | Self::Startup(_)
             | Self::ClearIdleExit
-            | Self::SetChatListenerMode { .. }
             | Self::SecondaryUnread { .. }
             | Self::RestoreSecondaryHall
             | Self::TurtleSoupQuestion { .. }
@@ -1622,6 +1625,8 @@ impl ApplicationRuntime {
         let external_identity_access = IdentityAccess::new(config.identity.clone());
         // API 模式默认走二级值守：socket 给消息，二级界面停留延迟最低。
         // 切不进去只是保持原模式，不影响消息接收。
+        // 这里只置位 pending_mode；真正的界面切换由 "值守请求自愈" 在
+        // 主导航循环里入队执行（见 reconcile_pending_listener_mode）。
         let external_listener_control: Option<
             std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
         > = {

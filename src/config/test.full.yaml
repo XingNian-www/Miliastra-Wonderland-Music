@@ -669,28 +669,27 @@ startup:
   # 启动游戏时附加的命令行参数
   game_args: ""
   # 启动游戏后每次等待窗口出现的时间，单位毫秒
-  launch_wait_ms: 5000
+  launch_wait_ms: 3000
   # 启动游戏后最多检查窗口次数
-  launch_retries: 12
+  launch_retries: 20
   # OCR 等待并点击“点击进入”的最长时间，单位毫秒
-  enter_game_timeout_ms: 60000
+  enter_game_timeout_ms: 45000
   # 等待千星奇域界面/大厅确认的最长时间，单位毫秒
-  enter_wonderland_timeout_ms: 300000
+  enter_wonderland_timeout_ms: 60000
   # 地图星型入口阶段最多匹配次数
-  wonderland_map_star_retries: 120
+  wonderland_map_star_retries: 6
   # 地图星型入口匹配轮询间隔，单位毫秒
   wonderland_map_star_retry_ms: 2500
   # 千星大厅 OCR 阶段最多重试次数
-  wonderland_hall_retries: 90
+  wonderland_hall_retries: 6
   # 千星大厅 OCR 轮询间隔，单位毫秒
-  wonderland_hall_retry_ms: 2000
+  wonderland_hall_retry_ms: 2500
   # 千星入口和确认弹窗各阶段过渡等待的最长时间，单位毫秒
-  wonderland_transition_timeout_ms: 60000
+  wonderland_transition_timeout_ms: 4000
   # 确认按钮消失后等待该区域像素稳定的最长时间，单位毫秒
-  wonderland_confirm_stable_timeout_ms: 60000
+  wonderland_confirm_stable_timeout_ms: 3000
   # 启动游戏结束时等待派蒙菜单模板的最长时间，单位毫秒
-  final_primary_timeout_ms: 120000
-  # 启动流程 OCR/截图轮询间隔，单位毫秒
+  final_primary_timeout_ms: 10000
   poll_ms: 1000
   # 像素稳定平均差阈值
   stable_mean_threshold: 2.0

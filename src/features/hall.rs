@@ -273,7 +273,7 @@ impl HallApplication {
                     log::info!("麦克风: 已按 N 切换状态");
                     port.reply_template(
                         &templates::MICROPHONE_TOGGLED,
-                        &ReplyVars::new().with("用户名", username.as_str()),
+                        &ReplyVars::new().with("玩家", username.as_str()),
                     )
                 }
             }

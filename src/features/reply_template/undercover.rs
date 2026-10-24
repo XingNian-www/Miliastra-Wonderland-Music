@@ -270,7 +270,7 @@ pub(crate) const SETTLEMENT_HEADER: ReplyTemplate = ReplyTemplate {
 /// 结算逐人一行。
 pub(crate) const SETTLEMENT_PLAYER: ReplyTemplate = ReplyTemplate {
     key: "undercover.settlement.player",
-    default: "{位置}：{昵称}（{身份}）",
+    default: "{位置}：{玩家}（{身份}）",
     summary: "结算中的单个玩家",
     group: "娱乐",
 };
@@ -286,7 +286,7 @@ pub(crate) const SETTLEMENT_ROUNDS: ReplyTemplate = ReplyTemplate {
 /// 位置映射片段（每行由 | 连接多个片段）。
 pub(crate) const POSITION_MAPPING: ReplyTemplate = ReplyTemplate {
     key: "undercover.start.position_mapping",
-    default: "{位置}={昵称}",
+    default: "{位置}={玩家}",
     summary: "开局位置与昵称映射",
     group: "娱乐",
 };
@@ -645,13 +645,13 @@ mod tests {
         );
         let vars = ReplyVars::new()
             .with("位置", "A")
-            .with("昵称", "甲")
+            .with("玩家", "甲")
             .with("身份", "平民");
         assert_eq!(
             render(&SETTLEMENT_PLAYER, None, &vars).text,
             "A：甲（平民）"
         );
-        let vars = ReplyVars::new().with("位置", "A").with("昵称", "甲");
+        let vars = ReplyVars::new().with("位置", "A").with("玩家", "甲");
         assert_eq!(render(&POSITION_MAPPING, None, &vars).text, "A=甲");
 
         let vars = ReplyVars::new().with("玩法", "斗地主");

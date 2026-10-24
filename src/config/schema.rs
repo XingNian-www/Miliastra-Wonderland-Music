@@ -194,7 +194,7 @@ fn chat_source_section() -> Vec<ConfigFieldSchema> {
             "self_uid",
             "本机账号 UID",
             FieldKind::Int { min: 0, max: 4_294_967_295 },
-            "本机游戏账号的 UID。Miliastra-Wonderland-Chat 用它区分自己和玩家的消息，填错会把自己的发言当成命令；auto_start 开启时必填",
+            "本机游戏账号的 UID。Miliastra-Wonderland-Chat 用它区分自己和玩家的消息，填错会把 BOT 自己的发言当成命令再执行一次。仅「自动启动」时由 BOT 传给对方；自行部署时请在你的启动命令里填 --self-uid，此处可留 0",
         ),
     ]
 }

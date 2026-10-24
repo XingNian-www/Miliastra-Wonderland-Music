@@ -383,13 +383,34 @@ fn deliver(
 ///
 /// `ws://127.0.0.1:18889/stream` → `http://127.0.0.1:18889`
 fn ws_url_to_http(ws_url: &str) -> String {
-    let rest = ws_url
-        .strip_prefix("ws://")
-        .or_else(|| ws_url.strip_prefix("wss://"))
-        .unwrap_or(ws_url);
-    let scheme = if ws_url.starts_with("wss://") { "https" } else { "http" };
-    let authority = rest.split('/').next().unwrap_or(rest);
-    format!("{scheme}://{authority}")
+    let (scheme, rest) = if let Some(rest) = ws_url.strip_prefix("wss://") {
+        ("https", rest)
+    } else if let Some(rest) = ws_url.strip_prefix("ws://") {
+        ("http", rest)
+    } else {
+        ("http", ws_url)
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+    // 保留子路径：自建服务常挂在 /api/ 下，丢掉它会让 /names 与 /messages
+    // 打到根路径而 404。同时去掉最后的 /stream 之类端点后缀——
+    // 同一服务的 HTTP 接口与 WS 端点共享前缀。
+    let prefix = path
+        .map(|path| {
+            let trimmed = path.trim_end_matches('/');
+            trimmed
+                .rsplit_once('/')
+                .map(|(head, _)| head)
+                .unwrap_or("")
+                .to_string()
+        })
+        .filter(|prefix| !prefix.is_empty());
+    match prefix {
+        Some(prefix) => format!("{scheme}://{authority}/{prefix}"),
+        None => format!("{scheme}://{authority}"),
+    }
 }
 
 /// 数据源切换后的状态重置。
@@ -422,15 +443,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ws_url_to_http_maps_scheme_and_strips_path() {
-        // /names 补查与 WS 同源同端口，只换 scheme、去掉 /stream。
+    fn ws_url_to_http_maps_scheme_and_strips_endpoint() {
+        // /names 与 /messages 与 WS 同源，只换 scheme、去掉端点后缀。
         assert_eq!(
             ws_url_to_http("ws://127.0.0.1:18889/stream"),
             "http://127.0.0.1:18889"
         );
         assert_eq!(
-            ws_url_to_http("wss://example.com:9443/stream?x=1"),
+            ws_url_to_http("wss://example.com:9443/stream"),
             "https://example.com:9443"
+        );
+        // 无路径时保持原样。
+        assert_eq!(
+            ws_url_to_http("ws://127.0.0.1:18889"),
+            "http://127.0.0.1:18889"
+        );
+    }
+
+    #[test]
+    fn ws_url_to_http_preserves_subpath_for_self_hosted_apis() {
+        // 自建服务常挂在子路径下：丢掉前缀会让 /names 与 /messages 打到根路径而 404。
+        assert_eq!(
+            ws_url_to_http("ws://host:8080/api/stream"),
+            "http://host:8080/api"
+        );
+        assert_eq!(
+            ws_url_to_http("ws://host:8080/chat/v1/stream"),
+            "http://host:8080/chat/v1"
         );
     }
 

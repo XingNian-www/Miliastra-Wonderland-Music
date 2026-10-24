@@ -196,9 +196,20 @@ pub trait ChatSource: Send {
     /// 来源名称，用于日志与去重键前缀。
     fn name(&self) -> &str;
 
-    /// 阻塞等待下一个事件。返回 `None` 表示不会再有事件（应停止消费）。
+    /// 阻塞等待下一个事件。返回 `None` 表示当前没有事件（读超时或心跳），
+    /// 调用方应继续调用；错误表示需要重连。
     ///
     /// 用阻塞而不是 async，是为了与仓库既有的"每类线程各自阻塞"模型一致；
     /// 实现内部可以自由使用 tokio 或其他异步运行时。
     fn next_event(&mut self) -> anyhow::Result<Option<ChatSourceEvent>>;
+
+    /// 连接此刻是否仍然可用（未关闭）。
+    ///
+    /// `next_event` 返回 `None` 时调用方需要区分两种情形：连接还活着
+    /// （读超时 / Ping / Pong），此时应刷新租约；连接已关，此时应等租约
+    /// 超时后回落 OCR 并重连。实现方默认返回 `true`，避免新增来源时
+    /// 被迫重写——但凡是会把连接置空的实现都必须覆盖它。
+    fn is_connected(&self) -> bool {
+        true
+    }
 }

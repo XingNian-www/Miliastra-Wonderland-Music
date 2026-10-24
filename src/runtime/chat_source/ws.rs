@@ -4,17 +4,20 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use miliastra_kernel::chat_source::{ChatSource, ChatSourceEvent};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
 
 /// 鉴权头名称，与 BOT 自身的 HTTP 服务保持一致。
 const TOKEN_HEADER: &str = "x-miliastra-token";
 
-/// 单次读取的超时：服务端 30 秒一次 Ping，这里留足余量。
+/// 单次读取的超时：只是让调用方能周期性回到上层检查租约与停止信号。
 ///
-/// 超时不是错误——它只是让调用方能周期性检查"是否该换成 OCR 了"。
-const READ_TIMEOUT: Duration = Duration::from_secs(45);
+/// 必须明显短于 `chat_source.lease_timeout_ms`（默认 10s）：读超时返回
+/// `Ok(None)` 而连接仍在，上层据此刷新租约；若这里设得比租约还长，
+/// 上层在两次返回之间根本得不到机会，租约也只能靠消息到达来维持。
+/// 服务端 30 秒一次 Ping，3 秒的轮询不会打断它。
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) struct WebSocketChatSource {
     name: String,
@@ -51,9 +54,7 @@ impl WebSocketChatSource {
             .into_client_request()
             .with_context(|| format!("无效的外部聊天 WS 地址: {}", self.url))?;
         let value = HeaderValue::from_str(&self.token).context("访问令牌含非法字符")?;
-        request
-            .headers_mut()
-            .insert(TOKEN_HEADER, value);
+        request.headers_mut().insert(TOKEN_HEADER, value);
         let (stream, _response) = self
             .runtime
             .block_on(async { tokio_tungstenite::connect_async(request).await })
@@ -65,7 +66,9 @@ impl WebSocketChatSource {
 }
 
 /// 读取一条完整的 WS 消息。连接正常关闭返回 `None`，异常转为错误。
-async fn read_message<S>(stream: &mut tokio_tungstenite::WebSocketStream<S>) -> Result<Option<Message>>
+async fn read_message<S>(
+    stream: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> Result<Option<Message>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -82,6 +85,10 @@ where
 impl ChatSource for WebSocketChatSource {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connection.is_some()
     }
 
     fn next_event(&mut self) -> Result<Option<ChatSourceEvent>> {
@@ -104,6 +111,7 @@ impl ChatSource for WebSocketChatSource {
                 self.connection = None;
                 Ok(None)
             }
+            // 心跳只说明连接活着，不产生业务事件；调用方按"连接仍在"刷新租约。
             Ok(Some(Message::Ping(_))) | Ok(Some(Message::Pong(_))) => Ok(None),
             Ok(Some(_)) => Ok(None),
             Ok(None) => {

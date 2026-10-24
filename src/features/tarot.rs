@@ -290,7 +290,7 @@ impl TarotApplication {
         let mut messages: Vec<TarotReply> = vec![TarotReply::KeyedFitted {
             label: "塔罗",
             spec: &templates::SPREAD_TITLE,
-            vars: ReplyVars::new().with("昵称", nickname.clone()),
+            vars: ReplyVars::new().with("玩家", nickname.clone()),
         }];
         for card in &cards {
             messages.extend(

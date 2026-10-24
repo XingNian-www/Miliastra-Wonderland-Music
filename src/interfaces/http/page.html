@@ -781,24 +781,6 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         <span id="configSavedAt">尚未保存</span>
         <span id="configDirtyHint" class="config-dirty hidden">有未保存的修改</span>
       </div>
-      <details class="panel" id="visualProfilePanel" open>
-        <summary class="panel-head">视觉档案：模板与分辨率</summary>
-        <div class="panel-body">
-          <p>默认档案为 1080P（1920 × 1080）。下方按分组编辑名称、模板、区域和坐标，校验差异后保存；坐标使用基准画布，不会自动缩放。</p>
-          <div class="row">
-            <button class="btn" onclick="loadVisualProfile(true)">重新加载保存值</button>
-            <button class="btn" onclick="exportVisualProfile()">导出 JSON</button>
-            <button class="btn" onclick="restoreVisualDefaults()">恢复默认1080P</button>
-            <label class="btn">选择 JSON<input type="file" id="visualProfileFile" accept="application/json,.json" onchange="readVisualProfile(this)" hidden></label>
-            <button class="btn" onclick="previewVisualProfile()">校验与预览</button>
-            <button class="btn primary" id="visualImportButton" onclick="importVisualProfile()" disabled>保存已预览档案</button>
-          </div>
-          <p id="visualProfileStatus" role="status">点击刷新状态查看保存值与生效值</p>
-          <div id="visualProfileForm" class="config-form">正在加载视觉档案…</div>
-          <details><summary>高级：JSON 导入与编辑</summary><p>JSON 修改后点击“应用到表单”，再校验保存。</p><textarea id="visualProfileText" rows="12" style="width:100%" aria-label="视觉档案 JSON" oninput="visualJsonChanged()"></textarea><button class="btn" onclick="applyVisualProfileJson()">应用到表单</button></details>
-          <pre id="visualProfilePreview" style="white-space:pre-wrap;overflow-wrap:anywhere" aria-live="polite"></pre>
-        </div>
-      </details>
       <div class="config-layout">
         <div class="config-sidebar" id="configSectionList"></div>
         <div class="config-main">
@@ -1384,10 +1366,52 @@ async function saveAiChatSettings(){
 /* ===== AI 模型列表 ===== */
 let modelChoices=[]
 let modelLoading=false
+// 只取会影响"连到哪台服务"的字段，用表单当前值（未保存也算）。
+// 字段不提交表示"沿用已保存配置"，提交空串表示"面板上确实是空的"，两者语义不同。
+// 密钥框永远渲染为空（占位符是"留空表示不修改"），所以只有它需要特判：
+// 没输入就不提交，让后端用已保存的 key；点了"清除"才提交空串。
+function aiModelOverrides(){
+  const out={}
+  for(const key of ['provider','endpoint','responses_endpoint','api_key','http_proxy','wire_api']){
+    const path='ai.'+key
+    const el=document.getElementById(configControlId(path))
+    // 字段没渲染（例如被档案字段折叠隐藏）就不碰它，避免误清空真实配置。
+    if(!el)continue
+    const value=String(el.value||'').trim()
+    if(key==='api_key'){
+      if(el.dataset.cfgClear==='1')out[key]=''
+      else if(value)out[key]=value
+      continue
+    }
+    if(key==='wire_api'&&!value)continue
+    out[key]=value
+  }
+  return out
+}
+// 只就地更新模型选择控件，不重建表单：重建会冲掉用户未保存的输入，
+// 还会把密钥提示从"已设置"变成"未设置"（密钥框渲染时永远是空值）。
+function refreshAiModelPicker(){
+  const models=Array.isArray(modelChoices)?modelChoices:[]
+  document.querySelectorAll('[data-model-pick]').forEach(select=>{
+    const path=select.dataset.modelPick
+    const input=document.querySelector('[data-cfg="'+CSS.escape(path)+'"]')
+    const text=input?String(input.value||''):''
+    const options=models.map(name=>'<option value="'+esc(name)+'"'+(text===name?' selected':'')+'>'+esc(name)+'</option>').join('')
+    select.innerHTML='<option value="">'+(models.length?'从列表选择…':'（尚未获取模型列表）')+'</option>'+options
+    // 只收回"因为我没列表所以禁用"这一种；bootstrap 字段等本来就该禁用，
+    // 无脑赋值会把它们的禁用状态抹掉。
+    if(select.dataset.modelNoList==='1')select.disabled=!models.length
+    select.dataset.modelNoList=models.length?'':'1'
+  })
+  document.querySelectorAll('[data-model-fetch]').forEach(btn=>{
+    btn.textContent=modelLoading?'获取中…':'获取模型列表'
+  })
+}
 function loadAiModels(){
   if(modelLoading)return
-  modelLoading=true;renderConfigPage()
-  request('/ai/models').then(data=>{
+  modelLoading=true
+  refreshAiModelPicker()
+  requestJson('/ai/models',aiModelOverrides()).then(data=>{
     const models=Array.isArray(data&&data.models)?data.models:[]
     if(!models.length)throw new Error('服务端未返回模型')
     modelChoices=models
@@ -1396,7 +1420,7 @@ function loadAiModels(){
     // 拉取失败不影响手填：清空列表并说明原因。
     modelChoices=[]
     showConfigMessage('获取模型列表失败：'+error.message+'（仍可手动填写模型名）','err')
-  }).finally(()=>{modelLoading=false;renderConfigPage()})
+  }).finally(()=>{modelLoading=false;refreshAiModelPicker()})
 }
 document.addEventListener('change',event=>{
   const pick=event.target.closest('[data-model-pick]');if(!pick)return
@@ -2559,6 +2583,17 @@ function commandReplyVars(id){
   const allowed=Array.isArray(entry?.allowedVariables)?new Set(entry.allowedVariables.map(v=>typeof v==='string'?v:v.name)):null
   return (commandReplyCatalog?.variables||[]).map(v=>typeof v==='string'?v:v.name).filter(name=>name&&(!allowed||allowed.has(name)))
 }
+function commandReplyVarMeta(name,field){
+  const list=Array.isArray(commandReplyCatalog?.variables)?commandReplyCatalog.variables:[]
+  const hit=list.find(item=>typeof item==='object'&&String(item.name)===String(name))
+  return hit&&hit[field]?String(hit[field]):''
+}
+function commandReplyVarLabel(name){
+  // 后端给的说明（如「曲名（歌名 - 歌手）」）一直没被显示过，
+  // 导致玩家只能靠名字和示例猜用途。
+  const label=commandReplyVarMeta(name,'label')
+  return label&&label!==String(name)?label:String(name)
+}
 function commandReplyVarExample(name){
   const list=Array.isArray(commandReplyCatalog?.variables)?commandReplyCatalog.variables:[]
   const hit=list.find(item=>typeof item==='object'&&String(item.name)===String(name))
@@ -2590,8 +2625,10 @@ function renderCommandReplyEditor(){
     const disabled=locked||row.editable===false||row.active===false?' disabled':''
     const variableButtons=vars.map(name=>{
       const example=commandReplyVarExample(name)
-      // 按钮显示"这个变量长什么样"（示例值），title 才解释它会插入什么。
-      return '<button type="button" class="btn small ghost" data-reply-var="'+commandEscape(name)+'" title="插入 '+commandEscape('{'+name+'}')+'（如 '+commandEscape(example)+'）">'+commandEscape(example)+'</button>'
+      // 按钮显示变量名（与点击后插入的内容一致），title 给出示例值。
+      // 只显示示例会让用户分不清是哪个变量——多个变量的示例可能相同。
+      const label=commandReplyVarLabel(name)
+      return '<button type="button" class="btn small ghost" data-reply-var="'+commandEscape(name)+'" title="'+commandEscape(label)+'｜插入 '+commandEscape('{'+name+'}')+'（如 '+commandEscape(example)+'）">'+commandEscape('{'+name+'}')+'</button>'
     }).join('')
     const tools=(batch?(row.active===false?'<button type="button" class="btn small" data-reply-activate data-index="'+index+'"'+(locked?' disabled':'')+'>启用</button>':(row.defaultText===null?'<button type="button" class="btn small ghost" data-reply-delete data-index="'+index+'"'+(locked?' disabled':'')+'>删除</button>':'<button type="button" class="btn small ghost" data-reply-deactivate data-index="'+index+'"'+(locked?' disabled':'')+'>停用</button>')):(row.active===false?'<button type="button" class="btn small" data-reply-activate data-index="'+index+'"'+(locked?' disabled':'')+'>启用</button>':'<button type="button" class="btn small ghost" data-reply-deactivate data-index="'+index+'"'+(locked?' disabled':'')+'>停用</button>'))
     const order=batch?'<button type="button" class="btn small ghost" data-reply-up data-index="'+index+'"'+(locked||index===0?' disabled':'')+'>上移</button><button type="button" class="btn small ghost" data-reply-down data-index="'+index+'"'+(locked||index===rows.length-1?' disabled':'')+'>下移</button>':''
@@ -3588,7 +3625,7 @@ function configControlHtml(field,value){
       '<select data-model-pick="'+esc(path)+'"'+listDisabled+disabledAttr+'>'+
         '<option value="">'+(models.length?'从列表选择…':'（尚未获取模型列表）')+'</option>'+options+
       '</select>'+
-      '<button type="button" class="btn small ghost" onclick="loadAiModels()"'+disabledAttr+'>'+(modelLoading?'获取中…':'获取模型列表')+'</button>'+
+      '<button type="button" class="btn small ghost" data-model-fetch onclick="loadAiModels()"'+disabledAttr+'>'+(modelLoading?'获取中…':'获取模型列表')+'</button>'+
       '</div>'
   }
   if(kind==='enum'){
@@ -3639,11 +3676,45 @@ function configControlHtml(field,value){
   }
   return ''
 }
+// 视觉档案编辑器：作为「视觉档案」段的内容渲染，不再是独立折叠面板。
+function visualProfilePanelHtml(){
+  return '<div class="config-form">'
+    +'<p class="config-field-hint">默认档案为 1080P（1920 × 1080）。下方按分组编辑名称、模板、区域和坐标，校验差异后保存；坐标使用基准画布，不会自动缩放。</p>'
+    +'<div class="row">'
+    +'<button class="btn" onclick="loadVisualProfile(true)">重新加载保存值</button>'
+    +'<button class="btn" onclick="exportVisualProfile()">导出 JSON</button>'
+    +'<button class="btn" onclick="restoreVisualDefaults()">恢复默认1080P</button>'
+    +'<label class="btn">选择 JSON<input type="file" id="visualProfileFile" accept="application/json,.json" onchange="readVisualProfile(this)" hidden></label>'
+    +'<button class="btn" onclick="previewVisualProfile()">校验与预览</button>'
+    +'<button class="btn primary" id="visualImportButton" onclick="importVisualProfile()" disabled>保存已预览档案</button>'
+    +'</div>'
+    +'<p id="visualProfileStatus" role="status">点击刷新状态查看保存值与生效值</p>'
+    +'<div id="visualProfileForm" class="config-form">正在加载视觉档案…</div>'
+    +'<details><summary>高级：JSON 导入与编辑</summary><p>JSON 修改后点击"应用到表单"，再校验保存。</p>'
+    +'<textarea id="visualProfileText" rows="12" style="width:100%" aria-label="视觉档案 JSON" oninput="visualJsonChanged()"></textarea>'
+    +'<button class="btn" onclick="applyVisualProfileJson()">应用到表单</button></details>'
+    +'<pre id="visualProfilePreview" style="white-space:pre-wrap;overflow-wrap:anywhere" aria-live="polite"></pre>'
+    +'</div>'
+}
+function visualProfileBind(){
+  // 档案编辑器不参与 `syncConfigFormToData` 的字段收集（它自己走 import 接口），
+  // 因此切走时不该被视为"有未保存修改"。
+  configDirty.delete('visual')
+}
+
 function renderConfigForm(){
   const form=$('configForm')
   if(!form)return
   const section=configSectionByName(configActiveSection)
   if(!section){form.innerHTML='<div class="config-message">没有匹配的配置字段</div>';return}
+  // 视觉档案不是普通字段表：它有画布、分组、JSON 导入与预览。
+  // 这里直接挂载档案编辑器，避免"同一个东西两个入口"。
+  if(section.name==='visual'){
+    form.innerHTML=visualProfilePanelHtml()
+    visualProfileBind()
+    loadVisualProfile(false)
+    return
+  }
   const parts=['<div class="config-form">']
   const isAi=section.name==='ai'
   const hidesVisual=configSectionHidesVisual(section)

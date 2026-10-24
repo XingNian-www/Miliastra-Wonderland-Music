@@ -63,12 +63,19 @@ pub(super) fn commands_replies_route(
                 rest = &after[close + 1..];
             }
         }
-        let allowed_variables = crate::features::reply_template::reply_variables().iter()
+        let mut allowed_variables = crate::features::reply_template::reply_variables().iter()
             .filter(|variable| referenced_variables.contains(variable.name))
             .map(|variable| variable.name).collect::<Vec<_>>();
+        // 全局标签与命令无关：任何回复都能用，因此总是放行。
+        allowed_variables.extend(
+            crate::features::global_tags::GLOBAL_TAGS
+                .iter()
+                .map(|tag| tag.name),
+        );
+        allowed_variables.push(crate::features::global_tags::AI_TAG);
         json!({ "id": entry.id, "name": entry.name, "category": entry.category, "replies": replies, "defaultReplies": defaults, "allowedVariables": allowed_variables })
     }).collect::<Vec<_>>();
-    let variables = crate::features::reply_template::reply_variables()
+    let mut variables = crate::features::reply_template::reply_variables()
         .iter()
         .map(|variable| json!({
             "name": variable.name,
@@ -76,6 +83,22 @@ pub(super) fn commands_replies_route(
             "example": variable.example,
         }))
         .collect::<Vec<_>>();
+    // 全局标签排在最后：它们不依赖命令上下文，示例取候选里第一条。
+    variables.extend(crate::features::global_tags::GLOBAL_TAGS.iter().map(|tag| {
+        json!({
+            "name": tag.name,
+            "label": tag.label,
+            "example": tag.choices.first().copied().unwrap_or(""),
+            "global": true,
+        })
+    }));
+    // AI 标签走另一条求值路径（渲染前预生成），但同样要能让用户插入。
+    variables.push(json!({
+        "name": crate::features::global_tags::AI_TAG,
+        "label": crate::features::global_tags::AI_TAG_LABEL,
+        "example": crate::features::global_tags::AI_TAG_EXAMPLE,
+        "global": true,
+    }));
     serde_json::to_string(&json!({
         "revision": revision,
         "commands": commands,
@@ -316,7 +339,7 @@ mod reply_api_tests {
 
     #[test]
     fn reply_variables_accept_only_registered_runtime_names() {
-        assert!(reply_variables_valid("正在播放{歌名}，请求者{用户名}"));
+        assert!(reply_variables_valid("正在播放{歌名}，请求者{玩家}"));
         assert!(reply_variables_valid("花括号{}保留"));
         assert!(reply_variables_valid("前缀{未闭合"));
         assert!(!reply_variables_valid("未知{HTTP内部字段}"));
@@ -347,7 +370,7 @@ mod reply_api_tests {
         let rows = validate_reply_items(
             &help_song_entry(),
             vec![
-                item("custom:first", "第一条{用户名}".to_owned()),
+                item("custom:first", "第一条{玩家}".to_owned()),
                 item("help.song_request", "第二条".to_owned()),
             ],
         )

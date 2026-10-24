@@ -53,7 +53,7 @@ pub(crate) const BUSY: ReplyTemplate = ReplyTemplate {
 /// 当日牌阵标题（"昵称的今日塔罗牌"）。
 pub(crate) const SPREAD_TITLE: ReplyTemplate = ReplyTemplate {
     key: "tarot.spread.title",
-    default: "{昵称}的今日塔罗牌",
+    default: "{玩家}的今日塔罗牌",
     summary: "塔罗牌阵标题",
     group: "娱乐",
 };
@@ -145,7 +145,7 @@ mod tests {
             "塔罗冷却中，请12秒后重抽或AI解读。"
         );
         assert_eq!(
-            text(&SPREAD_TITLE, ReplyVars::new().with("昵称", "小明")),
+            text(&SPREAD_TITLE, ReplyVars::new().with("玩家", "小明")),
             "小明的今日塔罗牌"
         );
     }

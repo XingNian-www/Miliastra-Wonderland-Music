@@ -380,6 +380,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(1),
                 role: crate::features::identity::IdentityRole::Owner,
                 note: String::new(),
+                accounts: Vec::new(),
             }],
         };
         config

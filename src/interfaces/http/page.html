@@ -578,6 +578,9 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
 .identity-table th,.identity-table td{padding:var(--sp-2);text-align:left;border-bottom:1px solid var(--sep-2);vertical-align:middle}
 .identity-table th{color:var(--text-2);font-size:var(--fs-meta);font-weight:600;white-space:nowrap}
 .identity-table tbody tr:last-child td{border-bottom:0}
+.identity-table .identity-th-hint{display:block;font-weight:400;font-size:var(--fs-meta);opacity:.65}
+.identity-table .identity-uid code{font-family:var(--font-mono,monospace);font-size:var(--fs-meta);word-break:break-all}
+.identity-table .identity-uid .btn{margin-left:var(--sp-1)}
 .identity-table input,.identity-table select{width:100%;box-sizing:border-box;background:var(--bg-input);color:var(--text-1);border:1px solid var(--sep-1);border-radius:var(--radius-s);padding:5px 8px;min-height:var(--ctl-h)}
 .identity-table input:focus,.identity-table select:focus{border-color:var(--accent);outline:0;box-shadow:0 0 0 3px var(--accent-soft)}
 .identity-empty{color:var(--text-3);text-align:center;padding:var(--sp-4) 0!important}
@@ -3292,12 +3295,21 @@ function identityRenderTable(){
     const mapping=m&&typeof m==='object'&&!Array.isArray(m)?m:{}
     const role=IDENTITY_ROLE_LABELS[mapping.role]?mapping.role:'friend'
     const select=['friend','admin','owner'].map(r=>'<option value="'+r+'"'+(role===r?' selected':'')+'>'+IDENTITY_ROLE_LABELS[r]+'</option>').join('')
-    return '<tr><td><input value="'+esc(mapping.nickname||'')+'" placeholder="游戏内昵称" oninput="identityTableSet('+i+',\'nickname\',this.value)"></td>'
-      +'<td><input value="'+esc(mapping.note||'')+'" placeholder="显示昵称（可选）" oninput="identityTableSet('+i+',\'note\',this.value)"></td>'
+    const accounts=Array.isArray(mapping.accounts)?mapping.accounts:[]
+    // UUID 是内部标记，只读：它由程序生成，用户改它只会让歌单归属错乱。
+    const uidCell='<td class="identity-uid" title="内部身份标识（只读）"><code>'+esc(mapping.id||'—')+'</code>'
+      +'<button type="button" class="btn small ghost" onclick="identityCopyUid('+i+')" title="复制 UUID">复制</button></td>'
+    // 游戏 UID 可编辑、支持多个（逗号分隔）：一个身份可绑大小号，匹配时任一命中即算同一人。
+    const gameUidCell='<td><input value="'+esc(accounts.map(a=>a&&a.uid?a.uid:'').filter(Boolean).join(','))+'" placeholder="可填多个，用 , 分隔" oninput="identityTableSetUids('+i+',this.value)"></td>'
+    // 昵称与显示昵称属于 OCR 路径，聊天 API 接管时不需要它们。
+    return '<tr>'+uidCell
+      +gameUidCell
+      +'<td><input value="'+esc(mapping.nickname||'')+'" placeholder="OCR 模式匹配键（API 模式自动生成）" oninput="identityTableSet('+i+',\'nickname\',this.value)"></td>'
+      +'<td><input value="'+esc(mapping.note||'')+'" placeholder="仅 OCR 模式使用" oninput="identityTableSet('+i+',\'note\',this.value)"></td>'
       +'<td><select onchange="identityTableSet('+i+',\'role\',this.value)">'+select+'</select></td>'
       +'<td><button type="button" class="btn small warn" onclick="identityTableRemove('+i+')">删除</button></td></tr>'
   }).join('')
-  wrap.innerHTML='<div class="identity-table-wrap"><table class="identity-table"><thead><tr><th>游戏内昵称</th><th>显示昵称</th><th>角色</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="4" class="identity-empty">暂无映射</td></tr>')+'</tbody></table></div>'
+  wrap.innerHTML='<div class="identity-table-wrap"><table class="identity-table"><thead><tr><th>UUID<span class="identity-th-hint">只读标识</span></th><th>游戏 UID<span class="identity-th-hint">API 模式主键，可多个</span></th><th>游戏内昵称<span class="identity-th-hint">OCR 模式匹配用；API 模式自动随机生成</span></th><th>显示昵称<span class="identity-th-hint">仅 OCR 模式使用；API 模式可留空</span></th><th>角色</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="6" class="identity-empty">暂无映射</td></tr>')+'</tbody></table></div>'
 }
 function identityRepairJsonApply(){
   const repair=$('identityRepairJson');if(!repair)return
@@ -3317,6 +3329,23 @@ function identityTableSet(index,field,value){
     showConfigMessage('昵称 '+next.trim()+' 已存在','err');identityRenderTable();return
   }
   items[index][field]=field==='nickname'?next.trim():next
+  identityMappingsWrite(items)
+}
+function identityCopyUid(index){
+  const items=identityMappingsList();if(!items||!items[index])return
+  const uid=String(items[index].id||'')
+  if(!uid)return
+  // 复制失败时不弹错误：多数浏览器在非安全上下文禁用 clipboard，
+  // 此时用户仍可从只读列手动选中。
+  navigator.clipboard?.writeText(uid).then(
+    ()=>showConfigMessage('UID 已复制','ok'),
+    ()=>showConfigMessage('复制失败，请手动选中','err')
+  )
+}
+function identityTableSetUids(index,value){
+  const items=identityMappingsList();if(!items||!items[index]||typeof items[index]!=='object'||Array.isArray(items[index]))return
+  const uids=String(value||'').split(',').map(v=>v.trim()).filter(Boolean)
+  items[index].accounts=uids.map(uid=>({game:'genshin',uid:uid}))
   identityMappingsWrite(items)
 }
 function identityTableRemove(index){

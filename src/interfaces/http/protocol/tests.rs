@@ -4065,6 +4065,61 @@ fn test_state_with_bootstrap_access_token(access_token: &str) -> HttpTestState {
 }
 
 #[test]
+fn ai_models_route_requires_post_and_rejects_unknown_fields() {
+    // POST 用面板当前值覆盖连接参数，因此登记为 body 路由；
+    // 旧的只读 GET 保留给外部脚本，仍按只读放行。
+    assert!(is_mutating_route("/ai/models"));
+    assert!(body_route_spec("/ai/models").is_some());
+    assert!(route_spec("/ai/models").is_some_and(|route| !route.mutating));
+
+    let state = test_state();
+    let unknown = br#"{"proxy":"http://127.0.0.1:1"}"#;
+    let error = ai_models_body_route(unknown, &state).expect_err("unknown field");
+    assert_eq!(error.status, 400, "{}", error.message);
+
+    let not_json = b"not json";
+    let error = ai_models_body_route(not_json, &state).expect_err("invalid JSON");
+    assert_eq!(error.status, 400, "{}", error.message);
+}
+
+#[test]
+fn ai_models_overrides_distinguish_missing_from_empty() {
+    // 字段缺失 -> 沿用已保存配置；空串 -> 面板上确实是空的。
+    // 二者混用会让用户清空 endpoint 时悄悄回落到旧网关。
+    let mut config = crate::config::ai::AiConfig::default();
+    config.endpoint = "https://saved.example/v1/chat/completions".to_string();
+    config.responses_endpoint = "https://saved.example/v1/responses".to_string();
+
+    let sparse: AiModelsOverrides =
+        serde_json::from_str(r#"{"provider":"deepseek"}"#).expect("missing fields");
+    apply_ai_model_overrides(&mut config, sparse);
+    assert_eq!(config.provider, "deepseek");
+    assert_eq!(config.endpoint, "https://saved.example/v1/chat/completions");
+    assert_eq!(
+        config.responses_endpoint,
+        "https://saved.example/v1/responses"
+    );
+
+    let cleared: AiModelsOverrides =
+        serde_json::from_str(r#"{"endpoint":"","responses_endpoint":""}"#).expect("empty values");
+    apply_ai_model_overrides(&mut config, cleared);
+    assert_eq!(config.endpoint, "");
+    assert_eq!(config.responses_endpoint, "");
+}
+
+#[test]
+fn model_list_config_errors_are_client_errors() {
+    let error = model_list_error(ModelListError::Config("缺少 ai.endpoint".to_string()));
+    assert_eq!(error.status, 400);
+    assert!(error.message.contains("ai.endpoint"));
+
+    // 上游/网络失败不能把内部细节回给浏览器。
+    let error = model_list_error(ModelListError::Request("connect timeout".to_string()));
+    assert_eq!(error.status, 500);
+    assert_eq!(error.message, "内部错误");
+}
+
+#[test]
 fn internal_errors_use_a_generic_message_instead_of_leaking_details() {
     let error = internal_error(anyhow!("读取配置失败: C:\\secret\\path\\config.yaml"));
     assert_eq!(error.status, 500);

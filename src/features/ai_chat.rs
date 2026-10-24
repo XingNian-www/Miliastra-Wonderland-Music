@@ -101,6 +101,103 @@ pub struct AiChatConfig {
     /// 事实抽取提示词；留空使用内置默认值。
     #[serde(default = "default_extract_prompt")]
     pub extract_prompt: String,
+    /// `{AI回复}` 标签的生成参数。
+    #[serde(default)]
+    pub ai_reply: AiReplyConfig,
+}
+
+/// `{AI回复}` 标签的生成方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiReplyMode {
+    /// 模板是主体，AI 只补一句。
+    #[default]
+    Append,
+    /// AI 重写整条回复，模板作参考。
+    Rewrite,
+}
+
+impl AiReplyMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Append => "补充一句",
+            Self::Rewrite => "改写整条",
+        }
+    }
+}
+
+/// `{AI回复}` 的生成参数。
+///
+/// 放在 `ai_chat` 段下：它复用同一套模型配置，但提示词与上下文范围独立可调。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiReplyConfig {
+    pub mode: AiReplyMode,
+    /// 把渲染后的回复（已填充变量）给模型看。
+    ///
+    /// 关掉的话模型只能看到模板骨架，等于瞎编——除特殊调试外不要关。
+    #[serde(default = "default_true")]
+    pub include_template: bool,
+    /// 把命令名给模型看，让它知道当前在响应什么。
+    #[serde(default = "default_true")]
+    pub include_command: bool,
+    /// 系统提示词；留空使用内置默认值。
+    #[serde(default = "default_ai_reply_system_prompt")]
+    pub system_prompt: String,
+    /// 用户提示词；支持 `{{command}}`、`{{template}}`，留空使用内置默认值。
+    #[serde(default = "default_ai_reply_user_prompt")]
+    pub user_prompt: String,
+    /// 单次生成上限。
+    #[serde(default = "default_ai_reply_max_tokens")]
+    pub max_tokens: u32,
+    /// 超时秒数；超时按失败处理，回复留空继续发。
+    #[serde(default = "default_ai_reply_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_ai_reply_system_prompt() -> String {
+    "你在为一款原神游戏机器人生成简短的聊天回复。只输出一句话，不要引号、不要解释。".to_string()
+}
+
+fn default_ai_reply_user_prompt() -> String {
+    "命令：{{command}}\n已知回复：{{template}}\n请补一句自然、符合情境的话。".to_string()
+}
+
+fn default_ai_reply_max_tokens() -> u32 {
+    120
+}
+
+fn default_ai_reply_timeout() -> u64 {
+    8
+}
+
+impl Default for AiReplyConfig {
+    fn default() -> Self {
+        Self {
+            mode: AiReplyMode::default(),
+            include_template: true,
+            include_command: true,
+            system_prompt: default_ai_reply_system_prompt(),
+            user_prompt: default_ai_reply_user_prompt(),
+            max_tokens: default_ai_reply_max_tokens(),
+            timeout_seconds: default_ai_reply_timeout(),
+        }
+    }
+}
+
+impl AiReplyConfig {
+    /// 按当前配置展开用户提示词。
+    ///
+    /// 改写模式下即使 `include_template` 关掉也强制带入模板：没有原始信息，
+    /// 模型只能自由发挥，而这条回复会直接发到游戏大厅。
+    pub fn render_user_prompt(&self, command: &str, template: &str) -> String {
+        let command = if self.include_command { command } else { "" };
+        let keep_template = self.include_template || self.mode == AiReplyMode::Rewrite;
+        let template = if keep_template { template } else { "" };
+        self.user_prompt
+            .replace("{{command}}", command)
+            .replace("{{template}}", template)
+    }
 }
 
 fn default_actor_budget() -> usize {
@@ -140,6 +237,7 @@ impl Default for AiChatConfig {
             system_prompt: default_system_prompt(),
             answer_prompt: default_answer_prompt(),
             extract_prompt: default_extract_prompt(),
+            ai_reply: AiReplyConfig::default(),
         }
     }
 }
@@ -201,6 +299,53 @@ fn default_answer_prompt() -> String {
         "请用中文简短回答。",
     ]
     .join("")
+}
+
+#[cfg(test)]
+mod ai_reply_tests {
+    use super::*;
+
+    #[test]
+    fn append_mode_expands_both_placeholders() {
+        let config = AiReplyConfig::default();
+        let prompt = config.render_user_prompt("@QQ点歌", "小明点播的《晴天》已排上");
+        assert!(prompt.contains("@QQ点歌"));
+        assert!(prompt.contains("小明点播的《晴天》已排上"));
+        assert!(!prompt.contains("{{"), "占位符必须全部展开: {prompt}");
+    }
+
+    #[test]
+    fn disabled_context_leaves_the_placeholder_empty() {
+        let config = AiReplyConfig {
+            include_command: false,
+            ..AiReplyConfig::default()
+        };
+        let prompt = config.render_user_prompt("@QQ点歌", "回复正文");
+        assert!(!prompt.contains("@QQ点歌"));
+        assert!(prompt.contains("回复正文"));
+    }
+
+    #[test]
+    fn rewrite_mode_keeps_template_even_when_disabled() {
+        // 改写模式没有原始信息就只能编，而这条回复会直接发到大厅。
+        let config = AiReplyConfig {
+            mode: AiReplyMode::Rewrite,
+            include_template: false,
+            ..AiReplyConfig::default()
+        };
+        let prompt = config.render_user_prompt("@状态", "小明点播的《晴天》");
+        assert!(prompt.contains("小明点播的《晴天》"));
+    }
+
+    #[test]
+    fn defaults_are_append_with_both_contexts_on() {
+        let config = AiReplyConfig::default();
+        assert_eq!(config.mode, AiReplyMode::Append);
+        assert!(config.include_template);
+        assert!(config.include_command);
+        assert!(config.timeout_seconds >= 1);
+        assert!(config.max_tokens > 0);
+    }
 }
 
 fn default_extract_prompt() -> String {

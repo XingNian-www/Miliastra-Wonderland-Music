@@ -216,12 +216,86 @@ impl ApplicationRuntime {
         }
         // 覆盖只来自命令面板保存的行；配置中心不再提供回复文案入口。
         let override_text = self.command_reply_text(spec.key);
-        let rendered =
-            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
+        let rendered = crate::features::reply_template::render(
+            spec,
+            override_text.as_deref(),
+            vars,
+        );
+        // 先渲染出真实内容，再让 AI 看这段"已经发生的事实"——
+        // 直接把未渲染的模板交给模型，它只能看到占位符，等于瞎编。
+        let rendered = self.fill_ai_reply(spec, rendered);
         if !rendered.missing.is_empty() {
             log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
         }
         Some(rendered.text)
+    }
+
+    /// 把渲染结果里的 `{AI回复}` 换成 AI 生成的内容。
+    ///
+    /// 顺序很关键：**先渲染再生成**。模板里 `{AI回复}` 之外的变量已经填好，
+    /// 模型看到的是「小明点播的《晴天》已排上」而不是「{玩家}点播的{歌名}」。
+    fn fill_ai_reply(
+        &self,
+        spec: &crate::features::reply_template::ReplyTemplate,
+        rendered: crate::features::reply_template::RenderedReply,
+    ) -> crate::features::reply_template::RenderedReply {
+        let tag = format!("{{{}}}", crate::features::global_tags::AI_TAG);
+        if !rendered.text.contains(&tag) {
+            return rendered;
+        }
+        let mut out = rendered;
+        match self.generate_ai_reply(spec.key, &out.text) {
+            Ok(text) => {
+                let text = text.trim();
+                match self.lifecycle.live_configs.snapshot().ai_chat.ai_reply.mode {
+                    // 补充：保留模板，只把标签换成那句话。
+                    crate::features::ai_chat::AiReplyMode::Append => {
+                        out.text = out.text.replace(&tag, text);
+                    }
+                    // 改写：整条换成 AI 的版本。模板只作为参考输入。
+                    crate::features::ai_chat::AiReplyMode::Rewrite => {
+                        out.text = text.to_string();
+                    }
+                }
+            }
+            Err(error) => {
+                // 生成失败就删掉占位符，别让花括号发到游戏里。
+                log::debug!("{} 的 AI 回复生成失败，留空继续: {error:#}", spec.key);
+                out.text = out.text.replace(&tag, "");
+            }
+        }
+        out
+    }
+
+    /// 让 AI 为一条回复生成内容。
+    ///
+    /// 失败只记 debug：回复本身不该因为 AI 挂掉而不发。
+    fn generate_ai_reply(&self, spec_key: &str, template: &str) -> Result<String> {
+        let snapshot = self.lifecycle.live_configs.snapshot();
+        let config = snapshot.ai_chat.clone();
+        if !config.enabled {
+            anyhow::bail!("AI 聊天未启用");
+        }
+        let reply = &config.ai_reply;
+        let command = crate::features::reply_template::command_reply_entry_for_key(spec_key)
+            .map(|entry| entry.name)
+            .unwrap_or_default();
+        let user = reply.render_user_prompt(&command, template);
+        let timeout = std::time::Duration::from_secs(reply.timeout_seconds.max(1));
+        // 不能在持有 UI 租约时干等网络。
+        let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
+        crate::config::ai::request_json(
+            &self.business.ai_chat_openai,
+            &self.business.ai_connection,
+            &crate::config::ai::AiCallOptions {
+                model: config.model.clone(),
+                reasoning: config.reasoning,
+            },
+            &reply.system_prompt,
+            &user,
+            reply.max_tokens,
+            timeout,
+        )
     }
 
     pub(super) fn command_reply_text(&self, key: &str) -> Option<String> {

@@ -1582,7 +1582,7 @@ fn position_mapping_lines(players: &[Player]) -> Vec<UndercoverReply> {
                     &templates::POSITION_MAPPING,
                     &ReplyVars::new()
                         .with("位置", player.position.to_string())
-                        .with("昵称", player.name.as_str()),
+                        .with("玩家", player.name.as_str()),
                 ));
             }
             UndercoverReply::Joined { fragments }
@@ -1608,7 +1608,7 @@ fn settlement_lines(game: &Playing, winner: Winner) -> Vec<UndercoverReply> {
                 spec: &templates::SETTLEMENT_PLAYER,
                 vars: ReplyVars::new()
                     .with("位置", player.position.to_string())
-                    .with("昵称", player.name.as_str()),
+                    .with("玩家", player.name.as_str()),
                 fragments: vec![("身份", player.role.reply())],
             });
         }
@@ -1727,7 +1727,7 @@ mod tests {
                     fragments: vec![
                         UndercoverReply::keyed(
                             &templates::POSITION_MAPPING,
-                            &ReplyVars::new().with("位置", "A").with("昵称", "甲"),
+                            &ReplyVars::new().with("位置", "A").with("玩家", "甲"),
                         ),
                         UndercoverReply::Raw("|{玩家内容}".to_string()),
                     ],
@@ -1753,7 +1753,7 @@ mod tests {
             matches!(&fragments[0], UndercoverReply::Keyed { spec, vars }
             if spec.key == templates::POSITION_MAPPING.key
                 && vars.get("位置") == Some("A")
-                && vars.get("昵称") == Some("甲"))
+                && vars.get("玩家") == Some("甲"))
         );
         assert_eq!(
             fragments[1],
@@ -1796,7 +1796,7 @@ mod tests {
                     if spec.key == templates::POSITION_MAPPING.key
                         && vars == &ReplyVars::new()
                             .with("位置", player.position.to_string())
-                            .with("昵称", player.name.as_str()))
+                            .with("玩家", player.name.as_str()))
                 );
                 if index > 0 {
                     assert_eq!(

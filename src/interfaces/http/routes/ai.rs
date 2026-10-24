@@ -51,8 +51,90 @@ pub(super) fn ai_models_route(
         .load_full()
         .map_err(internal_error)?
         .ai;
-    let models = crate::config::ai::fetch_models(&config).map_err(ai_route_error)?;
+    let models = crate::config::ai::fetch_models(&config).map_err(model_list_error)?;
     serde_json::to_string(&json!({ "models": models })).map_err(internal_error)
+}
+
+/// POST /ai/models 的可选连接参数覆盖。
+///
+/// 面板上"获取模型列表"就在参数输入框旁边，用户不会先保存再点。
+/// 只读已保存配置会让刚填的 endpoint/key 被忽略、请求打到旧网关，
+/// 所以这里接受表单当前值。
+///
+/// 字段缺失（None）表示沿用已保存配置，空字符串表示"面板上就是空的"；
+/// 两者必须区分，否则用户清空 endpoint 想用服务商默认地址时会悄悄回落到旧网关。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AiModelsOverrides {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    responses_endpoint: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    http_proxy: Option<String>,
+    #[serde(default)]
+    wire_api: Option<crate::config::ai::WireApi>,
+}
+
+/// 把面板当前值合并到已保存配置上；字段缺失表示沿用已保存值。
+pub(super) fn apply_ai_model_overrides(
+    config: &mut crate::config::ai::AiConfig,
+    overrides: AiModelsOverrides,
+) {
+    if let Some(value) = overrides.provider {
+        config.provider = value;
+    }
+    if let Some(value) = overrides.endpoint {
+        config.endpoint = value;
+    }
+    if let Some(value) = overrides.responses_endpoint {
+        config.responses_endpoint = value;
+    }
+    if let Some(value) = overrides.api_key {
+        config.api_key = value;
+    }
+    if let Some(value) = overrides.http_proxy {
+        config.http_proxy = value;
+    }
+    if let Some(value) = overrides.wire_api {
+        config.wire_api = value;
+    }
+}
+
+/// POST /ai/models：用面板当前值（未保存也算）拉取模型列表。
+pub(super) fn ai_models_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let overrides: AiModelsOverrides = parse_json_body(body, "模型列表参数")?;
+    let mut config = state
+        .config_store
+        .lock()
+        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
+        .load_full()
+        .map_err(internal_error)?
+        .ai;
+    apply_ai_model_overrides(&mut config, overrides);
+    let models = crate::config::ai::fetch_models(&config).map_err(model_list_error)?;
+    serde_json::to_string(&json!({ "models": models })).map_err(internal_error)
+}
+
+/// 配置形状问题按 400 回原文（用户能照着改），上游/网络问题按 500 只记日志。
+///
+/// 不用 `is_client_error` 的关键字匹配：这类报错是"地址后缀不对""缺少 apiKey"
+/// 之类的新文案，关键字表追不上就会把可操作的提示降级成"内部错误"。
+pub(super) fn model_list_error(error: ModelListError) -> AppError {
+    match error {
+        ModelListError::Config(message) => AppError {
+            status: 400,
+            message,
+        },
+        ModelListError::Request(message) => internal_error(anyhow!(message)),
+    }
 }
 
 pub(super) fn ai_route_error(error: anyhow::Error) -> AppError {

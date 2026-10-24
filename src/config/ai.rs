@@ -720,43 +720,91 @@ fn responses_output_text(response: &Response) -> anyhow::Result<String> {
     bail!("AI 响应缺少 output_text")
 }
 
+/// 拉取模型列表的失败分类。
+///
+/// 配置形状问题用户按原文能自己改，上游或网络问题不能；混在一起会让路由
+/// 只能二选一——之前两者都落到"内部错误"，把可操作的提示吞掉了。
+#[derive(Debug)]
+pub(crate) enum ModelListError {
+    /// provider、endpoint 后缀、apiKey、代理等配置形状不对。
+    Config(String),
+    /// 请求已发出但失败：网络、上游状态码、响应形状。
+    Request(String),
+}
+
+impl std::fmt::Display for ModelListError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(message) | Self::Request(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ModelListError {}
+
 /// 从服务端拉取可用模型列表。
 ///
-/// 走 `GET {base}/models`：base 由 chat/completions 地址去掉后缀得到，
+/// 走 `GET {base}/models`：base 由当前线上协议的调用地址去掉后缀得到，
 /// 因此 Responses 与 Chat Completions 两种配置都能用同一个接口。
 /// 只读，不改任何配置；失败时把服务端原文带给调用方，便于排查网关差异。
-pub(crate) fn fetch_models(config: &AiConfig) -> Result<Vec<String>> {
-    let provider = parse_provider(&config.provider)?;
-    let chat_endpoint = resolve_endpoint(provider, &config.endpoint)?;
-    let Some(base) = chat_endpoint.strip_suffix(CHAT_COMPLETIONS_SUFFIX) else {
-        bail!(
-            "拉取模型列表需要以 /chat/completions 结尾的地址，当前为：{chat_endpoint}"
-        );
-    };
+pub(crate) fn fetch_models(config: &AiConfig) -> std::result::Result<Vec<String>, ModelListError> {
+    let provider = parse_provider(&config.provider).map_err(config_error)?;
+    let base = models_base_url(provider, config).map_err(config_error)?;
     let url = format!("{base}/models");
-    ensure_http_url(&url, "models 地址")?;
-    let api_key = normalize_api_key(&config.api_key)?;
+    ensure_http_url(&url, "models 地址").map_err(config_error)?;
+    let api_key = normalize_api_key(&config.api_key).map_err(config_error)?;
 
-    let client = build_model_list_client(&config.http_proxy)?;
+    let client = build_model_list_client(&config.http_proxy).map_err(config_error)?;
     let mut request = client.get(&url);
     // 与 kernel 的鉴权方式保持一致：Mimo 用 api-key，其余用 Bearer。
     request = match authentication(provider) {
         Authentication::ApiKey => request.header("api-key", &api_key),
         Authentication::Bearer => request.bearer_auth(&api_key),
     };
-    let response = request
-        .send()
-        .context("请求模型列表失败（检查 endpoint 与代理）")?;
+    let response = request.send().map_err(|error| {
+        ModelListError::Request(format!("请求模型列表失败（检查 endpoint 与代理）：{error}"))
+    })?;
     let status = response.status();
-    let body = response.text().context("读取模型列表响应失败")?;
+    let body = response
+        .text()
+        .map_err(|error| ModelListError::Request(format!("读取模型列表响应失败：{error}")))?;
     if !status.is_success() {
-        bail!(
+        return Err(ModelListError::Request(format!(
             "模型列表请求失败（HTTP {}）：{}",
             status.as_u16(),
             body.chars().take(300).collect::<String>()
-        );
+        )));
     }
-    parse_model_list(&body)
+    parse_model_list(&body).map_err(|error| ModelListError::Request(error.to_string()))
+}
+
+fn config_error(error: anyhow::Error) -> ModelListError {
+    ModelListError::Config(error.to_string())
+}
+
+/// 推导 `GET /models` 的 base，必须与真正发请求的端点保持一致。
+///
+/// Responses 配置允许只填 `ai.responses_endpoint`（此时 `ai.endpoint` 留空也能
+/// 正常调用 AI），只按 chat 地址推导会让这类配置在拉列表时报"缺少 ai.endpoint"。
+fn models_base_url(provider: AiProvider, config: &AiConfig) -> Result<String> {
+    let endpoint = match config.wire_api {
+        WireApi::Responses => {
+            resolve_responses_endpoint(provider, &config.endpoint, &config.responses_endpoint)?
+        }
+        WireApi::ChatCompletions => resolve_endpoint(provider, &config.endpoint)?,
+    };
+    // kernel 的 normalize_endpoint 会先去掉结尾的 /，所以带尾斜杠的配置能正常调用；
+    // 这里必须同样处理，否则"AI 能用、拉列表报错"。
+    let trimmed = endpoint.trim_end_matches('/');
+    let base = trimmed
+        .strip_suffix(CHAT_COMPLETIONS_SUFFIX)
+        .or_else(|| trimmed.strip_suffix(RESPONSES_SUFFIX))
+        .with_context(|| {
+            format!(
+                "拉取模型列表需要以 /chat/completions 或 /responses 结尾的地址，当前为：{endpoint}"
+            )
+        })?;
+    Ok(base.to_string())
 }
 
 /// 兼容两种常见响应形状：
@@ -804,10 +852,16 @@ fn parse_model_list(body: &str) -> Result<Vec<String>> {
     Ok(models)
 }
 
-/// 模型列表是一次短请求，单独建 client 以套用用户代理设置。
+/// 模型列表是一次短请求，单独建 client 以套用代理与 User-Agent。
+///
+/// reqwest 默认不发 User-Agent，部分网关会因此直接 403。
 fn build_model_list_client(proxy: &str) -> Result<reqwest::blocking::Client> {
     let mut builder = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20));
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent(concat!(
+            "miliastra-wonderland-music/",
+            env!("CARGO_PKG_VERSION")
+        ));
     let proxy = proxy.trim();
     if !proxy.is_empty() {
         builder = builder.proxy(reqwest::Proxy::all(proxy).context("ai.http_proxy 配置无效")?);
@@ -1643,6 +1697,62 @@ mod tests {
         assert_eq!(parse_model_list(bare).unwrap(), ["a", "z"]);
         assert!(parse_model_list(r#"{"data":[]}"#).is_err());
         assert!(parse_model_list("not json").is_err());
+    }
+
+    #[test]
+    fn models_base_follows_the_wire_api_endpoint() {
+        // Responses 默认：从推导出的 /responses 地址去掉后缀。
+        assert_eq!(
+            models_base_url(AiProvider::OpenAi, &config("openai")).unwrap(),
+            "https://api.openai.com/v1"
+        );
+
+        // 只填 responses_endpoint 也必须能拉列表：这是合法配置，
+        // 此时 endpoint 为空，按 chat 地址推导会直接报"缺少 endpoint"。
+        let mut responses_only = config("custom");
+        responses_only.endpoint = String::new();
+        responses_only.responses_endpoint = "https://gateway.example/v1/responses".to_string();
+        assert_eq!(
+            models_base_url(AiProvider::Custom, &responses_only).unwrap(),
+            "https://gateway.example/v1"
+        );
+
+        // Chat Completions 配置仍按 chat 地址推导。
+        let mut chat = config("custom");
+        chat.endpoint = "https://gateway.example/v1/chat/completions".to_string();
+        chat.wire_api = WireApi::ChatCompletions;
+        assert_eq!(
+            models_base_url(AiProvider::Custom, &chat).unwrap(),
+            "https://gateway.example/v1"
+        );
+    }
+
+    #[test]
+    fn models_base_rejects_endpoints_without_a_known_suffix() {
+        let mut connection = config("custom");
+        connection.endpoint = "https://gateway.example/v1/other".to_string();
+        connection.responses_endpoint = "https://gateway.example/v1/also-other".to_string();
+
+        let error = models_base_url(AiProvider::Custom, &connection)
+            .expect_err("unknown suffix must be rejected");
+
+        assert!(
+            error.to_string().contains("/models") || error.to_string().contains("结尾"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn models_base_trims_a_trailing_slash() {
+        let mut connection = config("custom");
+        connection.endpoint = "https://gateway.example/v1/chat/completions/".to_string();
+        connection.wire_api = WireApi::ChatCompletions;
+
+        // 结尾多一个 / 不该拼出 //models，也不该把后缀匹配搞失败。
+        assert_eq!(
+            models_base_url(AiProvider::Custom, &connection).unwrap(),
+            "https://gateway.example/v1"
+        );
     }
 
     #[test]

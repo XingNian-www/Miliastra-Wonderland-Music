@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use miliastra_kernel::chat_source::{ChatSource, ChatSourceEvent};
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -65,22 +67,6 @@ impl WebSocketChatSource {
     }
 }
 
-/// 读取一条完整的 WS 消息。连接正常关闭返回 `None`，异常转为错误。
-async fn read_message<S>(
-    stream: &mut tokio_tungstenite::WebSocketStream<S>,
-) -> Result<Option<Message>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use futures_util::StreamExt;
-    use tokio_tungstenite::tungstenite::Error as WsError;
-    match stream.next().await {
-        None => Ok(None),
-        Some(Ok(message)) => Ok(Some(message)),
-        Some(Err(WsError::ConnectionClosed | WsError::AlreadyClosed)) => Ok(None),
-        Some(Err(error)) => Err(anyhow::anyhow!(error.to_string())),
-    }
-}
 
 impl ChatSource for WebSocketChatSource {
     fn name(&self) -> &str {
@@ -96,25 +82,40 @@ impl ChatSource for WebSocketChatSource {
             self.connect()?;
         }
         let stream = self.connection.as_mut().expect("刚刚连接");
-        let read: Result<Option<Message>> = self.runtime.block_on(async {
-            match tokio::time::timeout(READ_TIMEOUT, read_message(stream)).await {
-                Ok(Ok(message)) => Ok(message),
-                Ok(Err(error)) => Err(error),
-                // 超时不是错误：返回 None，让上层有机会检查是否该回落 OCR。
-                Err(_) => Ok(None),
+        // 三态：读到消息 / 读超时（连接仍活）/ 连接已结束。
+        // 超时必须与关闭分开——把超时当成关闭会导致每 3 秒重连一次，
+        // 每次重连都发 Connected，上层的"连上就切二级"就会反复把手动
+        // 切换的一级顶回去，表现为"切了一级又自己变回二级"。
+        enum Read {
+            Message(Message),
+            TimedOut,
+            Closed,
+        }
+        let read: Result<Read> = self.runtime.block_on(async {
+            match tokio::time::timeout(READ_TIMEOUT, stream.next()).await {
+                // 流结束：对端真的关了。
+                Err(_) => Ok(Read::TimedOut),
+                Ok(None) => Ok(Read::Closed),
+                Ok(Some(Ok(message))) => Ok(Read::Message(message)),
+                Ok(Some(Err(WsError::ConnectionClosed | WsError::AlreadyClosed))) => {
+                    Ok(Read::Closed)
+                }
+                Ok(Some(Err(error))) => Err(anyhow::anyhow!(error.to_string())),
             }
         });
         match read {
-            Ok(Some(Message::Text(text))) => super::parse_frame(text.as_str()),
-            Ok(Some(Message::Close(_))) => {
+            Ok(Read::Message(Message::Text(text))) => super::parse_frame(text.as_str()),
+            Ok(Read::Message(Message::Close(_))) => {
                 log::info!("外部聊天 WS 被对端关闭");
                 self.connection = None;
                 Ok(None)
             }
             // 心跳只说明连接活着，不产生业务事件；调用方按"连接仍在"刷新租约。
-            Ok(Some(Message::Ping(_))) | Ok(Some(Message::Pong(_))) => Ok(None),
-            Ok(Some(_)) => Ok(None),
-            Ok(None) => {
+            Ok(Read::Message(Message::Ping(_))) | Ok(Read::Message(Message::Pong(_))) => Ok(None),
+            Ok(Read::Message(_)) => Ok(None),
+            // 读超时：连接保持不动，让上层周期性检查租约与停止信号。
+            Ok(Read::TimedOut) => Ok(None),
+            Ok(Read::Closed) => {
                 self.connection = None;
                 Ok(None)
             }

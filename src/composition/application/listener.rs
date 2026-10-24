@@ -1167,6 +1167,12 @@ impl ApplicationRuntime {
                     // 外部聊天源、HTTP 面板都会先 request 再入队；这里兜住任何
                     // "只置位未入队"的路径（包括入队失败后没撤销的情况）。
                     self.reconcile_pending_listener_mode()?;
+                    // 外部聊天源的默认值守：等**第一次真正停在一级聊天界面**时
+                    // 切一次二级。放在这里而不是握手时，是因为握手发生在游戏还没
+                    // 进界面的时候，那时按界面门控必然被跳过。
+                    if let Ok((state, Some(UiStateKind::Primary))) = &ui_state_result {
+                        self.maybe_switch_to_secondary(state.as_str())?;
+                    }
                     let listener_snapshot = self.business.business.chat_listener_snapshot()?;
                     let command_executing = !self.business.task_engine.is_idle()?;
                     let mut residency_recovery_attempted = false;
@@ -2469,6 +2475,34 @@ impl ApplicationRuntime {
     /// 表现为「卡在一级值守，怎么都进不了二级」。
     ///
     /// 去重键保证这里重复调用是安全的：队列里已有同模式任务时直接返回。
+    /// 外部聊天源启用时，第一次真正停在一级聊天界面就切到二级。
+    ///
+    /// 只做一次：用 `claim_initial_secondary_switch` 原子认领，之后用户手动
+    /// 切回一级不会再被顶回二级。
+    ///
+    /// 准入条件除了「一级界面」，还要求外部源已接管、当前不是二级、没有正在
+    /// 进行的切换，避免与启动自动化抢 UI 事务。
+    fn maybe_switch_to_secondary(&self, ui_state: &str) -> Result<()> {
+        if !self.lifecycle.external_chat.is_active() {
+            return Ok(());
+        }
+        let snapshot = self.business.business.chat_listener_snapshot()?;
+        if snapshot.mode == ChatListenerMode::Secondary || snapshot.pending_mode.is_some() {
+            return Ok(());
+        }
+        if !self.lifecycle.external_chat.claim_initial_secondary_switch() {
+            return Ok(());
+        }
+        log::info!("外部聊天源首次遇到一级聊天界面，自动切换二级值守: ui={ui_state}");
+        if let Err(error) = self
+            .business
+            .business
+            .request_chat_listener_mode(ChatListenerMode::Secondary)
+        {
+            log::warn!("外部聊天源默认切换二级失败（保持一级）: {error}");
+        }
+        Ok(())
+    }
     fn reconcile_pending_listener_mode(&self) -> Result<()> {
         let snapshot = self.business.business.chat_listener_snapshot()?;
         let Some(target) = snapshot.pending_mode else {

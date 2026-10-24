@@ -254,7 +254,7 @@ impl ResolvedApplicationConfig {
         let startup = StartupRoutineConfig::resolve(
             StartupUiConfig {
                 launch_game: app.startup.launch_game,
-                // 启用外部聊天源时，游戏由 Miliastra-Wonderland-Chat 拉起（只有它能注入）。
+                // 启用外部聊天源时，游戏由 Miliastra-Wonderland-ChatBridge 拉起（只有它能注入）。
                 external_launcher: (app.chat_source.enabled && app.chat_source.auto_start)
                     .then(|| app.chat_source.clone()),
                 enter_game: app.startup.enter_game,

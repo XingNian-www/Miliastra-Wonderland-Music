@@ -259,12 +259,19 @@ impl AiChatConfig {
     }
 
     /// 文本是否触发本次对话；命中时返回去掉关键词后的正文。
+    ///
+    /// 入口先去掉「发送者与正文之间」的前导分隔符：split_sender_line 只切在
+    /// 分隔符**之前**，正文仍带着那个分隔符（真实 OCR 文本
+    /// `[2#BOT|勿加]:橘子你是什么模型？` → 正文 `:橘子你是什么模型？`）。
+    /// 命令路径由 parse_command_envelope 统一 trim，关键词触发原来没有这一步，
+    /// Prefix 模式下 strip_prefix(关键词) 永远失败，表现为「AI 聊天完全静默」。
+    /// 放进这里而不是调用点，是为了让所有调用方都吃到同一份修正。
     pub(crate) fn match_trigger(&self, text: &str) -> Option<String> {
         let keyword = self.keyword.trim();
         if keyword.is_empty() {
             return None;
         }
-        let text = text.trim();
+        let text = strip_sender_separators(text).trim();
         match self.trigger_mode {
             TriggerMode::Prefix => text
                 .strip_prefix(keyword)
@@ -276,6 +283,109 @@ impl AiChatConfig {
             }),
         }
     }
+}
+
+/// 关键词触发的一次判定结果。
+///
+/// 静默退路以前直接散落在调用点的 `return Ok(())` 里：既不打日志，也测不到。
+/// 收敛成一个纯函数后，调用点只负责把 `reason()` 写进日志，测试可以直接断言
+/// 「为什么没触发」，不需要给单元测试装全局 logger。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeywordTrigger {
+    /// 命中：发送者与去掉关键词后的问句。
+    Ask { sender: String, question: String },
+    /// 未触发，`reason` 给日志用。
+    Skip(TriggerSkip),
+}
+
+/// 关键词触发被跳过的具体原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TriggerSkip {
+    /// `ai_chat.enabled=false`。
+    Disabled,
+    /// `ai.api_key` 为空，所有 AI 功能关闭。
+    AiNotConfigured,
+    /// 非大厅蓝字发言（好友私聊走既有链路）。
+    NotHallMessage,
+    /// 拆不出发送者昵称。
+    SenderUnparsed,
+    /// 昵称拆出来是空串。
+    EmptySender,
+    /// 正文没有命中触发关键词。
+    KeywordMiss,
+    /// 命中关键词但问句为空。
+    EmptyQuestion,
+    /// 问句超过 MAX_QUESTION_CHARS。
+    QuestionTooLong,
+}
+
+impl TriggerSkip {
+    /// 日志里给人看的原因。
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Disabled => "ai_chat.enabled=false",
+            Self::AiNotConfigured => "ai.api_key 为空（所有 AI 功能关闭）",
+            Self::NotHallMessage => "非大厅蓝字发言（只处理 blue）",
+            Self::SenderUnparsed => "拆不出发送者（缺少昵称分隔符）",
+            Self::EmptySender => "发送者昵称为空",
+            Self::KeywordMiss => "未命中触发关键词",
+            Self::EmptyQuestion => "命中关键词但问句为空",
+            Self::QuestionTooLong => "问句超过长度上限",
+        }
+    }
+}
+
+/// 关键词触发的全部门槛，按调用点原来的顺序判定并返回原因。
+///
+/// `ai_configured` 由调用点传 `business.ai.enabled()`（即 api_key 非空），
+/// 这里不碰任何全局状态，保证判定可测。`split` 是 `split_sender_line` 的结果，
+/// 由调用点提供以保持「聊天文本如何切分」只有一份实现。
+pub(crate) fn keyword_trigger(
+    config: &AiChatConfig,
+    ai_configured: bool,
+    message_type: &str,
+    split: Option<(String, &str)>,
+) -> KeywordTrigger {
+    if !config.enabled {
+        return KeywordTrigger::Skip(TriggerSkip::Disabled);
+    }
+    if !ai_configured {
+        return KeywordTrigger::Skip(TriggerSkip::AiNotConfigured);
+    }
+    if message_type != "blue" {
+        return KeywordTrigger::Skip(TriggerSkip::NotHallMessage);
+    }
+    let Some((sender, body)) = split else {
+        return KeywordTrigger::Skip(TriggerSkip::SenderUnparsed);
+    };
+    let sender = sender.trim();
+    if sender.is_empty() {
+        return KeywordTrigger::Skip(TriggerSkip::EmptySender);
+    }
+    // 触发关键词与提问都只看正文：昵称里出现关键词不算触发。
+    let Some(question) = config.match_trigger(body) else {
+        return KeywordTrigger::Skip(TriggerSkip::KeywordMiss);
+    };
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        return KeywordTrigger::Skip(TriggerSkip::EmptyQuestion);
+    }
+    if question.chars().count() > MAX_QUESTION_CHARS {
+        return KeywordTrigger::Skip(TriggerSkip::QuestionTooLong);
+    }
+    KeywordTrigger::Ask {
+        sender: sender.to_string(),
+        question,
+    }
+}
+
+/// 去掉发送者与正文之间的前导分隔符。
+///
+/// 与 crate::interfaces::chat::parse_command_envelope 的 trim 保持一致：同一行 OCR
+/// 文本，命令路径和闲聊路径必须看到同一段正文，否则同一条消息会时而能当命令、
+/// 时而不能当提问。纯函数，便于直接做回归测试。
+pub(crate) fn strip_sender_separators(text: &str) -> &str {
+    text.trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
 }
 
 fn default_system_prompt() -> String {
@@ -905,6 +1015,144 @@ mod tests {
 
         config.keyword = "   ".to_string();
         assert!(config.match_trigger("橘子在吗").is_none());
+    }
+
+    /// 回归：真实 OCR 文本来的一行正文带着发送者分隔符时也必须命中。
+    ///
+    /// split_sender_line 只切在分隔符**之前**，所以 `[2#BOT|勿加]:橘子你是什么模型？`
+    /// 拆出来的 body 是 `:橘子你是什么模型？`。没有这一步归一化，Prefix 模式下
+    /// strip_prefix(橘子) 永远失败，表现就是玩家发「橘子…」AI 完全没反应。
+    #[test]
+    fn separator_prefixed_body_still_triggers() {
+        let config = config();
+        assert_eq!(
+            config.match_trigger(":橘子你是什么模型？").as_deref(),
+            Some("你是什么模型？")
+        );
+        assert_eq!(
+            config.match_trigger("：橘子你是什么模型？").as_deref(),
+            Some("你是什么模型？"),
+            "全角冒号同样要处理"
+        );
+        // 幂等：已经去过分隔符的正文结果不变。
+        assert_eq!(
+            config.match_trigger("橘子你是什么模型？").as_deref(),
+            Some("你是什么模型？")
+        );
+    }
+
+    /// AiChatConfig::default() 必须是关闭的：配置段缺省时不静默替用户开启 AI。
+    ///
+    /// 这也是「网页配置中心没开就完全没反应」的第一道门槛，必须显式可测。
+    #[test]
+    fn default_config_is_disabled_and_reports_that_reason() {
+        let config = AiChatConfig::default();
+        assert!(!config.enabled, "默认必须关闭，不能替用户开启外部调用");
+        assert_eq!("橘子", config.keyword, "默认关键词保持在代码里");
+        assert_eq!(
+            keyword_trigger(&config, true, "blue", Some(("甲".to_string(), "橘子在吗"))),
+            KeywordTrigger::Skip(TriggerSkip::Disabled)
+        );
+        assert!(TriggerSkip::Disabled.reason().contains("enabled"));
+    }
+
+    /// 配置段整体缺省时，serde 的 `#[serde(default)]` 会补上 AiChatConfig::default()。
+    ///
+    /// 复现 AppConfig 的取法（`#[serde(default)] pub ai_chat`）：配置文件里根本没有
+    /// `ai_chat:` 段时，拿到的就是默认值——`enabled: false`。发布模板
+    /// src/config/test.full.yaml 正是这种情况，因此「没在配置中心勾启用就完全静默」
+    /// 是代码事实，不是猜测。
+    #[test]
+    fn missing_section_falls_back_to_disabled_defaults() {
+        #[derive(Deserialize)]
+        struct Holder {
+            #[serde(default)]
+            ai_chat: AiChatConfig,
+        }
+
+        let holder: Holder = serde_json::from_str("{}").expect("缺段时用默认值");
+        assert!(
+            !holder.ai_chat.enabled,
+            "段缺失必须落到 enabled=false，不能默认开启"
+        );
+        assert_eq!(holder.ai_chat.keyword, "橘子");
+
+        // 只写一部分字段不行：enabled / keyword 没有 serde 默认值，
+        // 配置中心保存时必须提交整段（它确实是整段保存的）。
+        assert!(
+            serde_json::from_str::<Holder>(r#"{"ai_chat":{"keyword":"小助手"}}"#).is_err(),
+            "缺 enabled 的部分段必须被拒绝，而不是猜一个开关值"
+        );
+    }
+
+    /// 每条静默退路都要能被区分出来：以前它们都是同一个 `return Ok(())`。
+    #[test]
+    fn keyword_trigger_names_every_silent_skip_reason() {
+        let config = config();
+        let ok_split = || Some(("甲".to_string(), "橘子在吗"));
+
+        assert_eq!(
+            keyword_trigger(&config, false, "blue", ok_split()),
+            KeywordTrigger::Skip(TriggerSkip::AiNotConfigured)
+        );
+        assert_eq!(
+            keyword_trigger(&config, true, "pink", ok_split()),
+            KeywordTrigger::Skip(TriggerSkip::NotHallMessage)
+        );
+        assert_eq!(
+            keyword_trigger(&config, true, "blue", None),
+            KeywordTrigger::Skip(TriggerSkip::SenderUnparsed)
+        );
+        assert_eq!(
+            keyword_trigger(&config, true, "blue", Some(("  ".to_string(), "橘子在吗"))),
+            KeywordTrigger::Skip(TriggerSkip::EmptySender)
+        );
+        assert_eq!(
+            keyword_trigger(
+                &config,
+                true,
+                "blue",
+                Some(("甲".to_string(), "今天天气不错"))
+            ),
+            KeywordTrigger::Skip(TriggerSkip::KeywordMiss)
+        );
+        assert_eq!(
+            keyword_trigger(&config, true, "blue", Some(("甲".to_string(), "橘子"))),
+            KeywordTrigger::Skip(TriggerSkip::EmptyQuestion)
+        );
+        let long = format!("橘子{}", "字".repeat(MAX_QUESTION_CHARS + 1));
+        assert_eq!(
+            keyword_trigger(&config, true, "blue", Some(("甲".to_string(), &long))),
+            KeywordTrigger::Skip(TriggerSkip::QuestionTooLong)
+        );
+    }
+
+    /// 命中路径：昵称不带关键词，问句是去掉关键词后的正文。
+    #[test]
+    fn keyword_trigger_returns_sender_and_stripped_question() {
+        let config = config();
+        assert_eq!(
+            keyword_trigger(
+                &config,
+                true,
+                "blue",
+                Some(("2#BOT|勿加".to_string(), ":橘子你是什么模型？")),
+            ),
+            KeywordTrigger::Ask {
+                sender: "2#BOT|勿加".to_string(),
+                question: "你是什么模型？".to_string(),
+            }
+        );
+        // 昵称里出现关键词不算触发：只看正文。
+        assert_eq!(
+            keyword_trigger(
+                &config,
+                true,
+                "blue",
+                Some(("橘子粉丝".to_string(), "今天天气不错")),
+            ),
+            KeywordTrigger::Skip(TriggerSkip::KeywordMiss)
+        );
     }
 
     #[test]

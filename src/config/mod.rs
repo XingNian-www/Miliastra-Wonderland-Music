@@ -103,6 +103,14 @@ impl ChatSourceConfig {
             // 那种失败很难从日志里看出来，所以在保存时就挡住。
             bail!("chat_source.token 在启用时不能为空（应与 http.access_token 相同）");
         }
+        if self.auto_start && self.self_uid == 0 {
+            // UID 0 会让 chat 侧的"是否自己发的"判定永久为假：BOT 会把自己的
+            // 发言当成玩家命令再执行一次，造成指令回环。
+            bail!(
+                "chat_source.self_uid 在自动启动时必须填写本机账号 UID（不能为 0），\
+                 否则 Miliastra-Wonderland-Chat 会把 BOT 自己发的消息当成命令"
+            );
+        }
         if self.reconnect_ms == 0 {
             bail!("chat_source.reconnect_ms 不能为 0");
         }
@@ -2292,6 +2300,28 @@ stale_timeout_ms: 7500
         AppConfig::default()
             .validate()
             .expect("默认配置必须能通过完整校验");
+    }
+
+    #[test]
+    fn auto_start_requires_nonzero_self_uid() {
+        // UID 0 会让 chat 侧的"是否自己发的"判定永久为假 → BOT 把自己的
+        // 发言当命令再执行一次，形成指令回环。
+        let mut config = AppConfig::default();
+        config.chat_source.enabled = true;
+        config.chat_source.token = "token".to_string();
+        config.chat_source.auto_start = true;
+        config.chat_source.self_uid = 0;
+        let error = config.validate().expect_err("self_uid=0 必须被拒绝");
+        assert!(error.to_string().contains("self_uid"), "实际: {error}");
+
+        // 填上 UID 后通过。
+        config.chat_source.self_uid = 127138439;
+        config.validate().expect("合法配置应通过");
+
+        // 不自动启动时 self_uid 可以为 0（自行部署由用户在自己命令行填）。
+        config.chat_source.auto_start = false;
+        config.chat_source.self_uid = 0;
+        config.validate().expect("不自动启动时 self_uid 可为 0");
     }
 
     #[test]

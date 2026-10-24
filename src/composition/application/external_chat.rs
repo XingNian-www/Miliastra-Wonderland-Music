@@ -52,6 +52,8 @@ struct ExternalChatInner {
     last_seen_ms: AtomicU64,
     /// 注入用的保留会话号；重连且需要丢弃旧墓碑时递增。
     epoch: AtomicU64,
+    /// 是否已经用掉"首次遇到一级聊天界面时自动切二级"的机会。
+    initial_secondary_switch_done: AtomicBool,
 }
 
 impl ExternalChatState {
@@ -121,6 +123,32 @@ impl ExternalChatState {
             self.inner.watermark.store(sequence, Ordering::Release);
             log::info!("外部聊天源建立启动水位: 序号 ≤ {sequence} 的历史消息将被忽略");
         }
+    }
+
+    /// 首次握手时调用：原子地标记水位并返回本次是否为首次。
+    ///
+    /// 与 先 watermark_established() 再 establish_watermark() 相比，
+    /// 这个组合没有"先查后设"的竞态，调用点也不必自己拼两段逻辑。
+    pub(crate) fn take_first_handshake(&self, sequence: u64) -> bool {
+        if self.inner.watermark_set.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.inner.watermark.store(sequence, Ordering::Release);
+        log::info!("外部聊天源建立启动水位: 序号 ≤ {sequence} 的历史消息将被忽略");
+        true
+    }
+
+    /// 认领"首次遇到一级聊天界面时自动切二级"这一次机会。
+    ///
+    /// 为什么不在握手时切：首次握手发生在 BOT 刚启动、游戏还没进界面的时候，
+    /// 那一刻几乎不可能停在一级聊天页，按界面门控必然被跳过，默认行为等于失效。
+    /// 所以改成"等第一次真正停在一级聊天界面时再切一次"，只认领一次；
+    /// 之后用户手动切一级不会被再顶回二级。
+    pub(crate) fn claim_initial_secondary_switch(&self) -> bool {
+        !self
+            .inner
+            .initial_secondary_switch_done
+            .swap(true, Ordering::AcqRel)
     }
 
     /// 强制把水位提高到指定序号（跳过补拉时用）。
@@ -218,12 +246,11 @@ fn run(
                             log::info!("外部聊天源握手完成: lastSequence={last_sequence}");
                             // 首次连接：把启动前的历史挡在水位之外。
                             // 重连时水位已存在，不动它——断线期间的消息要补拉。
-                            state.establish_watermark(last_sequence);
-                            // API 模式默认走二级值守：消息来自 socket 而非 OCR，
-                            // 二级界面停留时延迟最低。切不进去也不影响消息接收。
-                            if let Some(control) = listener_control.as_ref() {
-                                control(crate::runtime::chat_listener::ChatListenerMode::Secondary);
-                            }
+                            state.take_first_handshake(last_sequence);
+                            // 这里**不再**直接切二级：首次握手发生在 BOT 刚启动、
+                            // 游戏还没进界面的时候，那一刻不可能停在一级聊天页。
+                            // 默认切换改由主导航循环在「首次真正停在一级」时完成
+                            // （见 ApplicationRuntime::maybe_switch_to_secondary）。
                             // 断线补拉：本地最后处理到哪，就从那里往后要。
                             // 但断线太久就不补了——一次性涌入几百条命令比丢几条更糟：
                             // 玩家看到的是 BOT 突然把一分钟前的命令全部重放一遍。
@@ -497,6 +524,31 @@ mod tests {
         );
     }
 
+    /// 回归：首次握手只建水位，不改值守模式。
+    ///
+    /// 切换改由主导航循环在「首次真正停在一级聊天界面」时完成——握手发生在
+    /// BOT 刚启动、游戏还没进界面的时候，那时按界面门控必然被跳过。
+    #[test]
+    fn first_handshake_only_establishes_watermark() {
+        let state = ExternalChatState::default();
+        assert!(state.take_first_handshake(4));
+        // 重连不重复建立水位，也不重复触发任何一次性动作。
+        assert!(!state.take_first_handshake(10));
+        assert!(!state.take_first_handshake(10));
+        // 水位仍停在首次握手那一刻：断线期间的消息要能补拉。
+        assert_eq!(state.watermark(), 4);
+    }
+
+    /// 默认二级切换只认领一次。
+    ///
+    /// 认领后即使用户手动切回一级，也不会被再次顶回二级。
+    #[test]
+    fn initial_secondary_switch_is_claimed_exactly_once() {
+        let state = ExternalChatState::default();
+        assert!(state.claim_initial_secondary_switch());
+        assert!(!state.claim_initial_secondary_switch());
+        assert!(!state.claim_initial_secondary_switch());
+    }
     /// 回归：心跳/读超时不能被当成「外部源失联」。
     ///
     /// ChatBridge 每 30s 才发一次 Ping，而租约默认 10s。旧实现里

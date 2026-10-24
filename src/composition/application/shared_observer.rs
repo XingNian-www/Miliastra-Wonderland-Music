@@ -40,6 +40,7 @@ impl ApplicationRuntime {
         let templates = self.ui.chat_templates.clone();
         let monitor = self.lifecycle.monitor.clone();
         let timeline = self.ui.chat_timeline.clone();
+        let external_chat = self.lifecycle.external_chat.clone();
         let running = Arc::clone(&self.lifecycle.running);
         let draining = Arc::clone(&self.lifecycle.http_reload_draining);
         let stop = Arc::new(AtomicBool::new(false));
@@ -163,6 +164,21 @@ impl ApplicationRuntime {
                         }
                         match layout {
                             PassiveLayout::Primary(markers) => {
+                                // 外部源接管：内容由 WS 提供，这里不再 OCR。
+                                // 不发布任何帧——空帧会把 cold_baseline_consumed 置 true，
+                                // 影响 API 断开后回落 OCR 的首帧语义；而注入本身不依赖界面帧。
+                                if external_chat.is_active() {
+                                    outcome = "external";
+                                    monitor.publish_chat_scan(ChatScanTelemetry {
+                                        marker_count: 0,
+                                        lines: Vec::new(),
+                                        marker_ms: 0,
+                                        ocr_ms: 0,
+                                        total_ms: 0,
+                                        scope: "external-skip",
+                                    });
+                                    return Ok(());
+                                }
                                 let prepared = prepare_chat_scan_with_markers(
                                     &frame.image,
                                     &templates,
@@ -190,6 +206,25 @@ impl ApplicationRuntime {
                                 bubbles,
                                 latest,
                             } => {
+                                if external_chat.is_active() {
+                                    // 外部源接管：这个聊天桶由 `inject_external` 独占。
+                                    // 这里**什么都不发布**——连空帧也不发：
+                                    //   · 空帧会把 `cold_baseline_consumed` 置 true，
+                                    //     污染 API 断开后回落 OCR 的首帧语义；
+                                    //   · API 注入不依赖 `prev`/`state.latest`，不需要界面帧喂数据；
+                                    //   · 界面识别（hall/selected/bubbles）已经算完，结果只用于日志。
+                                    // 唯一保留的是界面判定的副作用：让值守逻辑知道当前不在大厅。
+                                    outcome = "external";
+                                    monitor.publish_chat_scan(ChatScanTelemetry {
+                                        marker_count: 0,
+                                        lines: Vec::new(),
+                                        marker_ms: 0,
+                                        ocr_ms: 0,
+                                        total_ms: 0,
+                                        scope: "external-skip",
+                                    });
+                                    return Ok(());
+                                }
                                 let started = Instant::now();
                                 let (identity, messages) = recognize_passive_secondary(
                                     &ocr, &frame.image, &config, hall, selected, &bubbles, latest,
@@ -210,9 +245,12 @@ impl ApplicationRuntime {
                                 timeline.publish(frame.captured_at, identity, messages)?;
                             }
                             PassiveLayout::NoChat => {
+                                // 这里的 NoChat 表示聊天区真的不在画面上（含闲置超时收起），
+                                // 重开时旧气泡早已滚走，必须整体重建基准。
                                 timeline.publish_no_chat(
                                     frame.captured_at,
                                     "no reliable primary markers or secondary chat geometry",
+                                    crate::observation::chat::ViewAbsence::Long,
                                 )?;
                             }
                         }

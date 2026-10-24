@@ -25,7 +25,7 @@ use super::{AppConfig, BootstrapConfig};
 /// 配置表里的 `replies` 段被移除；同时命令回复目录重组为
 /// key→命令 的归属表。这些变化让旧配置失去意义，因此提升版本号触发断代重置。
 /// 重置只重建配置三表，歌曲缓存与音频文件不受影响。
-pub const CONFIG_SCHEMA_VERSION: i64 = 3;
+pub const CONFIG_SCHEMA_VERSION: i64 = 4;
 
 /// 打开连接（含头初始化）的重试次数：两个进程并发首次创建同一新库文件时，
 /// SQLite 头初始化阶段的锁竞争发生在 busy_timeout 生效之前，需要有限重试吸收。

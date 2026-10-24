@@ -34,6 +34,8 @@ pub(crate) struct SecondaryObservedMessage {
     pub(crate) id: ObservedChatMessageId,
     pub(crate) text: String,
     pub(crate) sender: Option<String>,
+    /// 消息来源的账号（仅外部聊天 API 提供）；权限解析优先用它。
+    pub(crate) account: Option<miliastra_kernel::chat_source::CommandAccount>,
 }
 
 #[derive(Clone)]
@@ -141,6 +143,8 @@ impl ChatObservationShared {
                 id,
                 text: message.text,
                 sender: message.sender,
+                // OCR 路径没有账号。
+                account: None,
             });
         }
         let dispatches = Self::publish_locked(

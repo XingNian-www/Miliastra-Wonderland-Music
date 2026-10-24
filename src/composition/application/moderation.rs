@@ -597,7 +597,11 @@ mod tests {
                 thread::sleep(Duration::from_millis(2));
             }
             publisher
-                .publish_no_chat(Instant::now(), "transient view gap")
+                .publish_no_chat(
+                Instant::now(),
+                "transient view gap",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
             while publisher.pending_refresh().unwrap().is_none() {
@@ -715,7 +719,11 @@ mod tests {
         );
         let previous_session = port.baseline.visual_session;
         shared
-            .publish_no_chat(Instant::now(), "temporary panel transition")
+            .publish_no_chat(
+                Instant::now(),
+                "temporary panel transition",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         shared
             .publish(Instant::now(), ChatIdentity::PrimaryHall, vec![])
@@ -772,7 +780,11 @@ mod tests {
         let shared = ChatTimeline::new();
         let mut port = shared_vote_port(&shared);
         shared
-            .publish_no_chat(Instant::now(), "temporary panel transition")
+            .publish_no_chat(
+                Instant::now(),
+                "temporary panel transition",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         for _ in 0..32 {
             shared
@@ -882,7 +894,11 @@ mod tests {
         });
         wait_for_vote_refresh(&shared);
         shared
-            .publish_no_chat(Instant::now(), "temporary chat gap")
+            .publish_no_chat(
+                Instant::now(),
+                "temporary chat gap",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         wait_for_vote_refresh(&shared);
         shared
@@ -924,7 +940,11 @@ mod tests {
             });
             wait_for_vote_refresh(&shared);
             shared
-                .publish_no_chat(Instant::now(), "same failure text")
+                .publish_no_chat(
+                Instant::now(),
+                "same failure text",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
                 .unwrap();
             wait_for_vote_refresh(&shared);
             if transition {
@@ -969,7 +989,11 @@ mod tests {
         });
         wait_for_vote_refresh(&shared);
         shared
-            .publish_no_chat(Instant::now(), "temporary chat gap")
+            .publish_no_chat(
+                Instant::now(),
+                "temporary chat gap",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
             .unwrap();
         wait_for_vote_refresh(&shared);
         let stopped_at = Instant::now();
@@ -995,7 +1019,11 @@ mod tests {
         while !worker.is_finished() && Instant::now() < test_deadline {
             if shared.pending_refresh().unwrap().is_some() {
                 shared
-                    .publish_no_chat(Instant::now(), "chat remains hidden")
+                    .publish_no_chat(
+                Instant::now(),
+                "chat remains hidden",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
                     .unwrap();
                 gaps += 1;
             } else {
@@ -1151,6 +1179,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(index as u128 + 1),
                 role,
                 note: format!("{nickname}展示备注"),
+                accounts: Vec::new(),
             })
             .collect(),
         })
@@ -1375,6 +1404,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Owner,
                 note: String::new(),
+                accounts: Vec::new(),
             }];
             if downgrade {
                 mappings.push(IdentityMapping {
@@ -1382,6 +1412,7 @@ mod tests {
                     id: uuid::Uuid::from_u128(2),
                     role: IdentityRole::Friend,
                     note: String::new(),
+                    accounts: Vec::new(),
                 });
             }
             identity.replace(IdentityConfig { mappings });

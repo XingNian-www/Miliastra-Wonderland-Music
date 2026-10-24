@@ -115,6 +115,19 @@ pub(crate) struct SequenceFreshness {
     prev: Vec<Snapshot>,
 }
 
+/// 聊天区不可见的性质。
+///
+/// 两者对"下一帧怎么判新"的要求相反，不能合并处理：
+/// 短暂过渡时旧气泡仍在屏上，靠对齐判追加最准；
+/// 长时间消失后旧气泡早已不在，只能把重开第一帧整体当新基线。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewAbsence {
+    /// 短暂过渡（面板切换、搜索展开）：`prev` 仍可能有效，保留交叠对齐。
+    Transient,
+    /// 聊天区真的消失过（闲置超时收起）：`prev` 已失效，重开首帧按新基线处理。
+    Long,
+}
+
 impl SequenceFreshness {
     /// 聊天不可见（publish_no_chat）：不推进对齐，下一帧按不连续处理。
     pub(crate) fn mark_view_disappeared(&mut self) {
@@ -125,13 +138,27 @@ impl SequenceFreshness {
     ///
     /// 首屏抑制的唯一目的是不让 BOT 刚启动就读到**旧命令**；既然这一屏根本没有命令，
     /// 冷基线就此消费，之后出现的命令都按新命令处理（不再强制 AppStart 全旧）。
-    /// 已有 `prev`（此前见过聊天）时不改动，保留交叠对齐能力。
-    pub(crate) fn mark_view_absent(&mut self) {
-        if !self.initialized {
-            self.initialized = true;
-            // 首屏没有聊天界面：冷基线就此消费，之后第一帧内容按新命令处理。
-            self.cold_absent = true;
-            self.prev.clear();
+    ///
+    /// 已有 `prev`（此前见过聊天）时默认不改动，保留交叠对齐能力——这适用于
+    /// 面板过渡、搜索框展开等短暂过渡：旧气泡仍在屏幕上，对齐能正确判出追加区。
+    ///
+    /// 但"聊天区真的消失过一段时间"（闲置超时收起）必须清空基准：旧 `prev`
+    /// 与重开后的画面毫无共同气泡，对齐必然全部失败、整帧判旧，好友私聊的
+    /// 第一条命令就是这样被吞掉的。这类调用方传 `ViewAbsence::Long`。
+    pub(crate) fn mark_view_absent(&mut self, absence: ViewAbsence) {
+        match absence {
+            ViewAbsence::Long => {
+                self.initialized = true;
+                self.cold_absent = true;
+                self.prev.clear();
+            }
+            ViewAbsence::Transient => {
+                if !self.initialized {
+                    self.initialized = true;
+                    self.cold_absent = true;
+                    self.prev.clear();
+                }
+            }
         }
     }
 

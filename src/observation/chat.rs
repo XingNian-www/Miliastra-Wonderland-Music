@@ -3,6 +3,10 @@ mod scan_gate;
 pub(crate) use scan_gate::PassiveScanGate;
 #[allow(dead_code)]
 pub(crate) mod freshness;
+pub(crate) use freshness::ViewAbsence;
+
+/// 外部聊天源的消息类型（来自 kernel 的通用定义，避免重复建模）。
+pub(crate) use miliastra_kernel::chat_source::ExternalChatMessage;
 mod passive;
 mod secondary_hall_vision;
 mod secondary_unread_vision;

@@ -10,6 +10,7 @@ pub(crate) mod formal_task;
 /// the same `http_facade::` path while Linux test builds can use them without `composition`.
 pub(crate) use crate::interfaces::http::facade as http_facade;
 mod lifecycle;
+pub(super) mod external_chat;
 mod listener;
 mod moderation;
 mod playback;
@@ -52,7 +53,7 @@ use crate::features::command::{
 use crate::features::custom_workflow::{CustomWorkflowService, WorkflowDefaults};
 use crate::features::friend_delivery::{FriendBatchOutcome, FriendMessage};
 use crate::features::hall::{HallApplication, HallCommand, HallStateService};
-use crate::features::identity::IdentityRole;
+use crate::features::identity::{IdentityAccess, IdentityRole};
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::{IdiomChainApplication, IdiomChainService};
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
@@ -253,6 +254,9 @@ impl ResolvedApplicationConfig {
         let startup = StartupRoutineConfig::resolve(
             StartupUiConfig {
                 launch_game: app.startup.launch_game,
+                // 启用外部聊天源时，游戏由 Miliastra-Wonderland-Chat 拉起（只有它能注入）。
+                external_launcher: (app.chat_source.enabled && app.chat_source.auto_start)
+                    .then(|| app.chat_source.clone()),
                 enter_game: app.startup.enter_game,
                 exe_path: app.startup.exe_path.clone(),
                 game_args: app.startup.game_args.clone(),
@@ -610,6 +614,8 @@ struct LifecycleBundle {
     /// 配置中心共享句柄；正式运行时由 ApplicationRuntime::new 注入，
     /// 正式任务执行上下文（facade 重建）中不持有（HTTP 服务不在其中）。
     config_store: Option<crate::config::SharedConfigStore>,
+    /// 外部聊天源共享状态：观察线程据此决定是否跳过 OCR 聊天识别。
+    external_chat: crate::composition::application::external_chat::ExternalChatState,
 }
 
 pub(crate) struct ApplicationRuntime {
@@ -783,6 +789,8 @@ impl FormalTaskExecutionContext {
                     console_reply_context: self.lifecycle.console_reply_context.clone(),
                     monitor: self.lifecycle.monitor.clone(),
                     config_store: Some(self.lifecycle.config_store.clone()),
+                    // facade 只用于任务执行，不启动观察线程；接管判定发生在真身上。
+                    external_chat: external_chat::ExternalChatState::default(),
                 },
             },
         }
@@ -1382,6 +1390,19 @@ impl ApplicationRuntime {
         let playlist_application = crate::features::playlist::PlaylistApplication::open(
             &config.state.playback_state_path,
         )?;
+        // 旧版本的歌单按昵称归属；现在只认身份 UUID。
+        // 这里把能在映射里找到同名昵称的行改写过去，找不到的留着等用户补配。
+        {
+            let mappings = config
+                .identity
+                .mappings
+                .iter()
+                .map(|mapping| (mapping.nickname.clone(), mapping.id.to_string()))
+                .collect::<std::collections::HashMap<_, _>>();
+            if let Err(error) = playlist_application.migrate_to_identity_keys(&mappings) {
+                log::warn!("歌单归属键迁移失败（不影响启动）: {error:#}");
+            }
+        }
         let moderation_policy = ModerationPolicy::new(
             Duration::from_millis(config.timing.moderation.vote_timeout_ms),
             Duration::from_millis(config.timing.moderation.vote_poll_ms),
@@ -1593,6 +1614,24 @@ impl ApplicationRuntime {
         let idiom_chain_application =
             IdiomChainApplication::new(config.timing.command.help_batch_ms);
         let moderation = ModerationService::new(moderation_policy, Arc::new(business.clone()));
+        // 外部聊天源与观察线程共用同一份时间线；UiBundle 会接管所有权，先克隆。
+        let chat_timeline_for_external = chat_timeline.clone();
+        // config 稍后会被移入生命周期，先把外部聊天源配置取出来。
+        let chat_source_config = config.chat_source.clone();
+        // 外部聊天源在好友私聊里遇到未登记的 UID 时要自动建身份，需要一个共享句柄。
+        let external_identity_access = IdentityAccess::new(config.identity.clone());
+        // API 模式默认走二级值守：socket 给消息，二级界面停留延迟最低。
+        // 切不进去只是保持原模式，不影响消息接收。
+        let external_listener_control: Option<
+            std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
+        > = {
+            let business = business.clone();
+            Some(std::sync::Arc::new(move |mode| {
+                if let Err(error) = business.request_chat_listener_mode(mode) {
+                    log::debug!("外部聊天源切换值守模式失败（保持当前模式）: {error}");
+                }
+            }))
+        };
         Ok(Self {
             ui: UiBundle {
                 coordinator: UiCoordinator::new(),
@@ -1670,6 +1709,16 @@ impl ApplicationRuntime {
                 console_reply_context: Arc::new(AtomicBool::new(false)),
                 monitor,
                 config_store: Some(config_store),
+                external_chat: external_chat::spawn(
+                    chat_timeline_for_external,
+                    chat_source_config,
+                    Some(external_identity_access),
+                    external_listener_control,
+                )
+                .unwrap_or_else(|error| {
+                    log::error!("外部聊天源启动失败，继续走 OCR: {error:#}");
+                    external_chat::ExternalChatState::default()
+                }),
             },
         })
     }

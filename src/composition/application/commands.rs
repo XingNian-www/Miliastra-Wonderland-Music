@@ -512,7 +512,19 @@ impl ApplicationRuntime {
                 0,
             );
         }
-        let actor = self.canonical_actor_name(&parsed.username);
+        // 歌单只属于已登记身份的玩家：没有 UUID 就没有歌单。
+        let Some(actor) = self.playlist_owner_key(&parsed.username) else {
+            log::info!(
+                "命令未执行：该玩家未在身份映射登记，无个人歌单 text={}",
+                parsed.raw
+            );
+            let text = self.render_reply(
+                crate::features::reply_template::REPLY_SONG[0].key,
+                crate::features::reply_template::REPLY_SONG[0].default,
+                &crate::features::reply_template::ReplyVars::new(),
+            );
+            return ApplicationRuntime::reply(self, &text);
+        };
         let now = Instant::now();
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

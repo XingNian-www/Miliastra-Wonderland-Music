@@ -10,7 +10,7 @@ use miliastra_kernel::chat_source::{ChatChannel, ChatSourceEvent, ExternalChatMe
 
 /// 一条 WS 推送的原始 JSON。
 ///
-/// 字段名与 `Miliastra-Wonderland-Chat/docs/API.md` 的 `ChatMessage` 一致。
+/// 字段名与 `Miliastra-Wonderland-ChatBridge/docs/API.md` 的 `ChatMessage` 一致。
 #[derive(serde::Deserialize)]
 struct WireMessage {
     id: u64,

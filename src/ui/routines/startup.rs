@@ -145,7 +145,7 @@ pub(crate) struct StartupRoutineConfig {
 #[derive(Clone)]
 pub(crate) struct StartupUiConfig {
     pub(crate) launch_game: bool,
-    /// 外部聊天源配置。启用时游戏改由 Miliastra-Wonderland-Chat 拉起，
+    /// 外部聊天源配置。启用时游戏改由 Miliastra-Wonderland-ChatBridge 拉起，
     /// 因为反作弊只允许"创建游戏进程的一方"注入 DLL。
     pub(crate) external_launcher: Option<crate::config::ChatSourceConfig>,
     pub(crate) enter_game: bool,
@@ -419,9 +419,9 @@ fn execute_enter_game(
 }
 
 
-/// 让 Miliastra-Wonderland-Chat 拉起游戏，并等待窗口出现。
+/// 让 Miliastra-Wonderland-ChatBridge 拉起游戏，并等待窗口出现。
 ///
-/// Miliastra-Wonderland-Chat 会用 CREATE_SUSPENDED 启动游戏、注入 DLL、再恢复主线程，
+/// Miliastra-Wonderland-ChatBridge 会用 CREATE_SUSPENDED 启动游戏、注入 DLL、再恢复主线程，
 /// 之后游戏窗口才出现。BOT 这里只负责等。
 fn ensure_game_window_via_chat_api(
     context: &mut UiRoutineContext<'_>,
@@ -449,7 +449,7 @@ fn ensure_game_window_via_chat_api(
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
         "wait_game_window",
-        "Miliastra-Wonderland-Chat 启动了游戏但窗口一直没出现",
+        "Miliastra-Wonderland-ChatBridge 启动了游戏但窗口一直没出现",
     ))
 }
 
@@ -460,7 +460,7 @@ fn ensure_game_window(
     if context.device().ensure_window().is_ok() {
         return Ok(());
     }
-    // 外部聊天源接管游戏启动：只有 Miliastra-Wonderland-Chat 能创建可注入的游戏进程。
+    // 外部聊天源接管游戏启动：只有 Miliastra-Wonderland-ChatBridge 能创建可注入的游戏进程。
     if let Some(chat_source) = config.startup.external_launcher.as_ref() {
         return ensure_game_window_via_chat_api(context, config, chat_source);
     }

@@ -1,4 +1,4 @@
-//! 外部聊天源线程：把 Miliastra-Wonderland-Chat 的推送注入时间线，并接管 OCR 的聊天内容识别。
+//! 外部聊天源线程：把 Miliastra-Wonderland-ChatBridge 的推送注入时间线，并接管 OCR 的聊天内容识别。
 //!
 //! 与 `shared_observer` 平行：那边用模板匹配判界面、用 OCR 读文字；这边用 WS 读文字。
 //! 界面识别仍由 `shared_observer` 负责，本模块只提供"当前是否接管"这一信号。
@@ -176,12 +176,12 @@ fn run(
     let lease = Duration::from_millis(config.lease_timeout_ms);
     let reconnect = Duration::from_millis(config.reconnect_ms);
     loop {
-        // 登录器角色：Miliastra-Wonderland-Chat 没在监听时替用户拉起来。
+        // 登录器角色：Miliastra-Wonderland-ChatBridge 没在监听时替用户拉起来。
         // 探测很便宜（300ms 超时），每次重连都试一次，这样用户中途关掉也能被重新拉起。
         if config.auto_start
             && let Err(error) = crate::runtime::chat_source::launcher::ensure_running(&config)
         {
-            log::warn!("无法自动启动 Miliastra-Wonderland-Chat，等待人工处理: {error:#}");
+            log::warn!("无法自动启动 Miliastra-Wonderland-ChatBridge，等待人工处理: {error:#}");
         }
         let mut source = match WebSocketChatSource::new(config.url.clone(), config.token.clone()) {
             Ok(source) => source,

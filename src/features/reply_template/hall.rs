@@ -62,7 +62,7 @@ pub(crate) const PUBLIC_HALL_NO_LIMIT: ReplyTemplate = ReplyTemplate {
 /// 好友执行麦克风切换后的通告。
 pub(crate) const MICROPHONE_TOGGLED: ReplyTemplate = ReplyTemplate {
     key: "hall.microphone.toggled",
-    default: "{用户名} 执行了切换麦克风状态！",
+    default: "{玩家} 执行了切换麦克风状态！",
     summary: "麦克风切换成功通告",
     group: "大厅",
 };
@@ -166,7 +166,7 @@ mod tests {
             "大厅即将到期"
         );
         // 注意默认文案里"执行了"前是一个半角空格。
-        let vars = ReplyVars::new().with("用户名", "小明");
+        let vars = ReplyVars::new().with("玩家", "小明");
         assert_eq!(
             render(&MICROPHONE_TOGGLED, None, &vars).text,
             "小明 执行了切换麦克风状态！"

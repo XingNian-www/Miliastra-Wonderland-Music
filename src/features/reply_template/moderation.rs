@@ -30,7 +30,7 @@ pub(crate) const MODERATION: &[ReplyTemplate] = &[
     },
     ReplyTemplate {
         key: "invite.sent",
-        default: "{用户名}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
+        default: "{玩家}邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过",
         summary: "邀请 BOT 进入大厅",
         group: "管理",
     },

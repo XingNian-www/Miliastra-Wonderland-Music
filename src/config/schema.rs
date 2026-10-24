@@ -2365,13 +2365,17 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             label: "视觉档案".to_string(),
             domain: Domain::Recognition,
             order: 0,
+            // 字段表里只保留 `visual.name`：它仍是 Live 字段（档案改名要热更新），
+            // 且 LiveConfigs 的一致性测试要求 schema 与热更新路径一一对应。
+            // 面板不会把它渲染成普通输入框——该段整体由档案编辑器接管，
+            // 名称在档案里改。
             fields: with_section_prefix(
                 "visual",
                 vec![ConfigFieldSchema::db_live(
                     "name",
                     "档案名称",
                     FieldKind::String,
-                    "默认 1080P；可在视觉档案中编辑保存",
+                    "默认 1080P；在下方视觉档案编辑器里修改",
                 )],
             ),
         },
@@ -2724,6 +2728,51 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Text,
             "留空使用内置默认值；从每轮对话中抽取值得长期记住的信息",
         ),
+        ConfigFieldSchema::db_idle_reload(
+            "ai_reply.mode",
+            "AI回复 生成方式",
+            FieldKind::Enum(vec![
+                ("append".to_string(), "补充一句（模板为主）".to_string()),
+                ("rewrite".to_string(), "改写整条（AI 为主）".to_string()),
+            ]),
+            "回复文案里写入 {AI回复} 时的生成方式；改写模式会让 AI 重写整条，事实可能被改动，默认补充一句",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "ai_reply.include_template",
+            "把回复内容给 AI 看",
+            FieldKind::Bool,
+            "开启后 AI 能看到已填充变量的真实回复（如「小明点播的《晴天》已排上」）；关闭只能看到占位符骨架，不建议关闭",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "ai_reply.include_command",
+            "把命令名给 AI 看",
+            FieldKind::Bool,
+            "开启后 AI 知道自己在响应哪条命令，如 @QQ点歌",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "ai_reply.system_prompt",
+            "系统提示词",
+            FieldKind::Text,
+            "留空使用内置默认值；用于约束 AI 的语气与输出格式",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "ai_reply.user_prompt",
+            "用户提示词",
+            FieldKind::Text,
+            "可使用 {{command}}、{{template}}；留空使用内置默认值",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "ai_reply.max_tokens",
+            "生成上限",
+            FieldKind::Int { min: 16, max: 4096 },
+            "单次生成的最大 token 数；回复本来就很短，默认 120 足够",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "ai_reply.timeout_seconds",
+            "超时秒数",
+            FieldKind::Int { min: 1, max: 120 },
+            "超过该时长按失败处理，AI回复 留空继续发送",
+        ),
     ]
 }
 
@@ -2921,6 +2970,7 @@ mod tests {
     /// JSON 中存在但 schema 不声明的注入字段（由启动引导提供，不进配置库）：
     /// state.playback_state_path 由统一数据库路径注入；http/logging 段 schema
     /// 已声明（bootstrap 仅展示），无需豁免。
+    /// 由启动引导注入、不出现在 schema 字段里的路径。
     const INJECTED_JSON_PATHS: &[&str] = &["state.playback_state_path"];
 
     #[test]

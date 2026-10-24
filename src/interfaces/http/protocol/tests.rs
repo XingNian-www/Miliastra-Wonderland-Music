@@ -1052,6 +1052,7 @@ fn api_identity_mapping_changes_display_fields_without_changing_track_metadata()
             id: Uuid::from_u128(1),
             role: IdentityRole::Friend,
             note: "显示昵称".to_string(),
+            accounts: Vec::new(),
         }],
     });
     let mut value = json!({
@@ -3303,12 +3304,14 @@ fn playback_leaderboard_maps_display_names_without_merging_people() {
                 id: Uuid::from_u128(11),
                 role: IdentityRole::Friend,
                 note: "同一备注".into(),
+                accounts: Vec::new(),
             },
             IdentityMapping {
                 nickname: "Bob".into(),
                 id: Uuid::from_u128(12),
                 role: IdentityRole::Friend,
                 note: "同一备注".into(),
+                accounts: Vec::new(),
             },
         ],
     });

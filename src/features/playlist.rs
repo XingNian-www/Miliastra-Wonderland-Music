@@ -285,6 +285,61 @@ pub(crate) struct PlaylistApplication {
     state: Arc<PlaylistState>,
 }
 
+/// 歌单归属键：**只用身份 UUID**。
+///
+/// 早期版本按昵称归属（`name:`），但昵称会改、会重名、OCR 会读错。
+/// 现在歌单只属于已在「身份映射」登记过的玩家——没有 UUID 就没有歌单，
+/// 这与"歌单仅对好友及以上开放"的权限设计一致。
+pub(crate) mod owner_key {
+    pub(crate) const IDENTITY: &str = "id:";
+
+    /// 按身份 UUID 构造键。
+    pub(crate) fn for_identity(uuid: &str) -> String {
+        format!("{IDENTITY}{}", uuid.trim())
+    }
+
+    /// 读取候选键：没有身份映射时返回空——调用方据此判定"无歌单权限"。
+    pub(crate) fn candidates(identity: Option<&str>) -> Vec<String> {
+        identity
+            .filter(|value| !value.trim().is_empty())
+            .map(|uuid| vec![for_identity(uuid)])
+            .unwrap_or_default()
+    }
+
+    /// 迁移旧键：把 `name:<昵称>` 记录改写成 `id:<uuid>`。
+    ///
+    /// 只迁移能在身份映射里找到同名昵称的行；找不到的保留原样（读不到，
+    /// 但数据不丢），等用户补配映射后下次启动再迁。
+    pub(crate) fn migrate_named_rows(
+        connection: &rusqlite::Connection,
+        nickname_to_uuid: &std::collections::HashMap<String, String>,
+    ) -> rusqlite::Result<usize> {
+        if nickname_to_uuid.is_empty() {
+            return Ok(0);
+        }
+        let mut migrated = 0usize;
+        for (nickname, uuid) in nickname_to_uuid {
+            migrated += connection.execute(
+                "UPDATE OR REPLACE playlist_items
+                 SET owner = ?1
+                 WHERE owner = ?2",
+                rusqlite::params![
+                    for_identity(uuid),
+                    format!("name:{}", crate::text::normalize_comparison_text(nickname.trim())),
+                ],
+            )?;
+            // 兼容极早期未加前缀的裸昵称。
+            migrated += connection.execute(
+                "UPDATE OR REPLACE playlist_items
+                 SET owner = ?1
+                 WHERE owner = ?2",
+                rusqlite::params![for_identity(uuid), nickname.trim()],
+            )?;
+        }
+        Ok(migrated)
+    }
+}
+
 impl PlaylistApplication {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         Self::from_connection(Connection::open(path)?)
@@ -303,6 +358,8 @@ impl PlaylistApplication {
              );
              CREATE INDEX IF NOT EXISTS idx_playlist_items_owner ON playlist_items(owner);",
         )?;
+        // 旧键迁移到 UUID 由 `migrate_to_identity_keys` 在配置加载后执行：
+        // 这里拿不到身份映射，不能在此处迁移。
         Ok(Self {
             state: Arc::new(PlaylistState {
                 connection: Mutex::new(connection),
@@ -311,6 +368,22 @@ impl PlaylistApplication {
                 pending_imports: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    /// 把旧的昵称键迁移到身份 UUID 键。
+    ///
+    /// 必须在身份映射加载后调用（`PlaylistApplication::open` 时还不知道映射）。
+    /// 幂等：没有可迁移的行时什么都不做；找不到映射的行原样保留。
+    pub(crate) fn migrate_to_identity_keys(
+        &self,
+        nickname_to_uuid: &std::collections::HashMap<String, String>,
+    ) -> Result<usize> {
+        let connection = self.connection()?;
+        let migrated = owner_key::migrate_named_rows(&connection, nickname_to_uuid)?;
+        if migrated > 0 {
+            log::info!("歌单归属键迁移：{migrated} 条记录已改为身份 UUID");
+        }
+        Ok(migrated)
     }
 
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
@@ -423,6 +496,35 @@ impl PlaylistApplication {
     }
 
     /// 按入库顺序读取全部收藏。
+    /// 合并所有候选键下的曲目。
+    ///
+    /// 不能"第一个非空就返回"：迁移后老数据在 `name:` 键，新增的收藏会写到
+    /// `id:` 键，只取第一个会让用户看到"歌单变空了"。合并 + 去重才是对的。
+    pub(crate) fn items_for(&self, candidates: &[String]) -> Result<Vec<PlayableTrack>> {
+        let mut merged: Vec<PlayableTrack> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for key in candidates {
+            for item in self.items(key)? {
+                // 同一首歌可能同时存在于迁移前的 name: 键与迁移后的 id: 键下。
+                if seen.insert(item.track_ref.key.to_string()) {
+                    merged.push(item);
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    /// 按候选键查总数：与 [`Self::items_for`] 用同一个"第一个命中"规则。
+    pub(crate) fn count_for(&self, candidates: &[String]) -> Result<usize> {
+        for key in candidates {
+            let count = self.count(key)?;
+            if count > 0 {
+                return Ok(count);
+            }
+        }
+        Ok(0)
+    }
+
     pub(crate) fn items(&self, owner: &str) -> Result<Vec<PlayableTrack>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -1195,6 +1297,91 @@ fn seed_from(now_epoch: i64, owner: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    mod owner_key_tests {
+        use super::super::{owner_key, PlaylistApplication};
+
+        #[test]
+        fn owner_key_is_identity_only() {
+            // 歌单只认身份 UUID：昵称/UUID 都不再是兜底键。
+            assert_eq!(
+                owner_key::candidates(Some("uuid-1")),
+                vec!["id:uuid-1".to_string()]
+            );
+            // 没有身份映射 → 空候选，调用方据此拒绝操作。
+            assert!(owner_key::candidates(None).is_empty());
+            assert!(owner_key::candidates(Some("   ")).is_empty());
+        }
+
+        #[test]
+        fn identity_anchor_is_required_for_playlist() {
+            // 路人（没有身份映射）不能拥有歌单：候选为空，调用方据此拒绝操作。
+            assert!(owner_key::candidates(None).is_empty());
+            assert!(owner_key::candidates(Some("")).is_empty());
+            // 有身份时只有一个键，且就是 UUID。
+            assert_eq!(
+                owner_key::candidates(Some("uuid-1")),
+                vec!["id:uuid-1".to_string()]
+            );
+        }
+
+        #[test]
+        fn migration_rewrites_legacy_name_keys_to_uuid() {
+            let dir = std::env::temp_dir().join(format!(
+                "playlist-uuid-migrate-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("playlist.sqlite3");
+            {
+                let app = PlaylistApplication::open(&path).unwrap();
+                let guard = app.connection().unwrap();
+                // 三种历史形态：裸昵称、name: 前缀、已迁移的 id:。
+                guard
+                    .execute(
+                        "INSERT INTO playlist_items(owner, track_key, track_json, added_at)
+                         VALUES('洛','k1','{}',1),
+                               ('name:小明','k2','{}',2),
+                               ('id:uuid-existing','k3','{}',3)",
+                        [],
+                    )
+                    .unwrap();
+                drop(guard);
+                drop(app);
+            }
+            let app = PlaylistApplication::open(&path).unwrap();
+            let mappings = std::collections::HashMap::from([
+                ("洛".to_string(), "uuid-luo".to_string()),
+                ("小明".to_string(), "uuid-ming".to_string()),
+            ]);
+            app.migrate_to_identity_keys(&mappings).unwrap();
+            let owners: Vec<String> = {
+                let guard = app.connection().unwrap();
+                let rows = guard
+                    .prepare("SELECT owner FROM playlist_items ORDER BY owner")
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(|row| row.unwrap())
+                    .collect();
+                rows
+            };
+            drop(app);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(
+                owners,
+                vec![
+                    "id:uuid-existing".to_string(),
+                    "id:uuid-luo".to_string(),
+                    "id:uuid-ming".to_string(),
+                ],
+                "历史键改写为 UUID，已迁移的不受影响"
+            );
+        }
+
+
+    }
+
     use super::*;
     use crate::features::command::CommandObservation;
     use miliastra_playback::{ProviderId, TrackKey, TrackMetadata, TrackRef};

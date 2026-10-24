@@ -79,7 +79,7 @@ pub enum FieldKind {
 /// （`get_path` 找不到即跳过）天然兼容，无需特殊处理。
 ///
 /// `store.rs` 的 `SECRET_PATHS` 引用本常量，禁止在别处重复定义。
-pub const SECRET_PATHS: &[&str] = &["http.access_token", "ai.api_key"];
+pub const SECRET_PATHS: &[&str] = &["http.access_token", "ai.api_key", "chat_source.token"];
 
 /// 配置字段 schema：路径、中文名、类型、生效级别、来源与提示。
 #[derive(Clone, Debug)]
@@ -142,6 +142,61 @@ impl Domain {
             Self::System => "系统",
         }
     }
+}
+
+
+/// chat_source 段：外部聊天源（Miliastra-Wonderland-Chat WS）。
+fn chat_source_section() -> Vec<ConfigFieldSchema> {
+    vec![
+        ConfigFieldSchema::db_idle_reload(
+            "enabled",
+            "启用外部聊天源",
+            FieldKind::Bool,
+            "启用后停止 OCR 的聊天内容识别，改由 Miliastra-Wonderland-Chat 的 WS 推送提供消息；界面识别（一级/二级/未聊天）仍由模板匹配完成。关闭则完全走 OCR",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "url",
+            "WebSocket 地址",
+            FieldKind::Text,
+            "Miliastra-Wonderland-Chat 的推送地址，默认 ws://127.0.0.1:18889/stream（端口 = http.port + 1）",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "token",
+            "访问令牌",
+            FieldKind::Secret,
+            "Miliastra-Wonderland-Chat 的鉴权令牌，通常与 http.access_token 相同；留空则连接会被拒绝",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "reconnect_ms",
+            "重连间隔",
+            FieldKind::Int { min: 100, max: 600_000 },
+            "WS 断开后等待多久重连，单位毫秒",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "lease_timeout_ms",
+            "失联回落阈值",
+            FieldKind::Int { min: 1_000, max: 600_000 },
+            "外部源多久没有消息就回落到 OCR，单位毫秒；防止 Miliastra-Wonderland-Chat 挂掉后聊天完全失聪",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "auto_start",
+            "自动启动 Miliastra-Wonderland-Chat",
+            FieldKind::Bool,
+            "开启后 BOT 发现 Miliastra-Wonderland-Chat 没在监听时替你拉起它；要求游戏未运行，因为 Miliastra-Wonderland-Chat 会自己拉起游戏并注入",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "executable",
+            "Miliastra-Wonderland-Chat 路径",
+            FieldKind::Text,
+            "Miliastra-Wonderland-Chat.exe 的完整路径；留空则查找 BOT 目录及其上一级下的 Miliastra-Wonderland-Chat 子目录",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "self_uid",
+            "本机账号 UID",
+            FieldKind::Int { min: 0, max: 4_294_967_295 },
+            "本机游戏账号的 UID。Miliastra-Wonderland-Chat 用它区分自己和玩家的消息，填错会把自己的发言当成命令；auto_start 开启时必填",
+        ),
+    ]
 }
 
 /// 配置段 schema：段名（与 AppConfig 字段名一致）、中文分组名、顺序与字段列表。
@@ -2343,6 +2398,13 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
                     .nullable(),
                 ],
             ),
+        },
+        ConfigSectionSchema {
+            name: "chat_source".to_string(),
+            label: "外部聊天源".to_string(),
+            domain: Domain::Interaction,
+            order: 34,
+            fields: with_section_prefix("chat_source", chat_source_section()),
         },
         ConfigSectionSchema {
             name: "window".to_string(),

@@ -145,6 +145,9 @@ pub(crate) struct StartupRoutineConfig {
 #[derive(Clone)]
 pub(crate) struct StartupUiConfig {
     pub(crate) launch_game: bool,
+    /// 外部聊天源配置。启用时游戏改由 Miliastra-Wonderland-Chat 拉起，
+    /// 因为反作弊只允许"创建游戏进程的一方"注入 DLL。
+    pub(crate) external_launcher: Option<crate::config::ChatSourceConfig>,
     pub(crate) enter_game: bool,
     pub(crate) exe_path: PathBuf,
     pub(crate) game_args: String,
@@ -415,12 +418,51 @@ fn execute_enter_game(
     ))
 }
 
+
+/// 让 Miliastra-Wonderland-Chat 拉起游戏，并等待窗口出现。
+///
+/// Miliastra-Wonderland-Chat 会用 CREATE_SUSPENDED 启动游戏、注入 DLL、再恢复主线程，
+/// 之后游戏窗口才出现。BOT 这里只负责等。
+fn ensure_game_window_via_chat_api(
+    context: &mut UiRoutineContext<'_>,
+    config: &StartupRoutineConfig,
+    chat_source: &crate::config::ChatSourceConfig,
+) -> Result<(), UiRoutineFailure> {
+    crate::runtime::chat_source::launcher::ensure_running(chat_source).map_err(|error| {
+        UiRoutineFailure::new(
+            InputCertainty::BeforeInput,
+            "launch_chat_api",
+            format!("{error:#}"),
+        )
+    })?;
+    for _ in 0..config.startup.launch_retries.max(1) {
+        wait_ms(
+            context,
+            config.startup.launch_wait_ms,
+            "wait_game_window",
+            InputCertainty::AfterInputUnknown,
+        )?;
+        if context.device().ensure_window().is_ok() {
+            return Ok(());
+        }
+    }
+    Err(UiRoutineFailure::new(
+        InputCertainty::AfterInputUnknown,
+        "wait_game_window",
+        "Miliastra-Wonderland-Chat 启动了游戏但窗口一直没出现",
+    ))
+}
+
 fn ensure_game_window(
     context: &mut UiRoutineContext<'_>,
     config: &StartupRoutineConfig,
 ) -> Result<(), UiRoutineFailure> {
     if context.device().ensure_window().is_ok() {
         return Ok(());
+    }
+    // 外部聊天源接管游戏启动：只有 Miliastra-Wonderland-Chat 能创建可注入的游戏进程。
+    if let Some(chat_source) = config.startup.external_launcher.as_ref() {
+        return ensure_game_window_via_chat_api(context, config, chat_source);
     }
     if !config.startup.launch_game {
         return Err(UiRoutineFailure::new(
@@ -1096,6 +1138,7 @@ mod tests {
         let startup = &app.startup;
         StartupRoutineConfig::resolve(
             StartupUiConfig {
+                external_launcher: None,
                 launch_game: startup.launch_game,
                 enter_game: startup.enter_game,
                 exe_path: startup.exe_path.clone(),

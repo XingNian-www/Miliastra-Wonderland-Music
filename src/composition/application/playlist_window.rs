@@ -217,13 +217,26 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn execute_playlist_window(&mut self, parsed: &RoutedCommand) -> Result<()> {
-        let owner = self.canonical_actor_name(&parsed.username);
+        // 歌单只属于已登记身份的玩家：没有 UUID 就没有歌单窗口。
+        let Some(owner) = self.playlist_owner_key(&parsed.username) else {
+            log::info!(
+                "命令未执行：该玩家未在身份映射登记，无个人歌单 text={}",
+                parsed.raw
+            );
+            let text = self.render_reply(
+                crate::features::reply_template::REPLY_SONG[0].key,
+                crate::features::reply_template::REPLY_SONG[0].default,
+                &crate::features::reply_template::ReplyVars::new(),
+            );
+            return ApplicationRuntime::reply(self, &text);
+        };
+        let candidates = vec![owner.clone()];
         let application = self.business.playlist_application.clone();
         let _cleanup = PlaylistWindowCleanup {
             application: application.clone(),
             owner: owner.clone(),
         };
-        if application.items(&owner)?.is_empty() {
+        if application.items_for(&candidates)?.is_empty() {
             let mut port = PlaylistRuntimePlaybackPort { runtime: self };
             let messages = application.execute(
                 &owner,
@@ -660,7 +673,11 @@ mod tests {
             acknowledge_playlist_decision(&shared, &envelope, changed).unwrap();
             let previous_id = fresh[0].0.id.clone();
             shared
-                .publish_no_chat(Instant::now(), "真实会话切换的状态事件")
+                .publish_no_chat(
+                Instant::now(),
+                "真实会话切换的状态事件",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
                 .unwrap();
             let rebuilt = shared
                 .publish(

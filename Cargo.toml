@@ -74,6 +74,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"
 tokio-stream = { version = "0.1", features = ["sync"] }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # 仅用于对拍测试与 GPU 微基准；生产路径已改为自带实现。

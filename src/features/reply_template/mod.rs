@@ -50,248 +50,233 @@ pub(crate) struct ReplyVariable {
 /// Global template tokens; includes builder-supported reserved values.
 pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
     ReplyVariable {
-        name: "AI回答",
-        label: "AI回答",
-        example: "今天的风很适合散步",
-    },
-    ReplyVariable {
         name: "UID",
-        label: "UID",
+        label: "目标玩家的游戏 UID",
         example: "123456789",
     },
     ReplyVariable {
         name: "上一个",
-        label: "上一个",
+        label: "上一个成语（接龙）",
         example: "画蛇添足",
     },
     ReplyVariable {
         name: "上一手",
-        label: "上一手",
+        label: "上一手出牌（含出牌人与牌型）",
         example: "对3",
     },
     ReplyVariable {
         name: "上一手牌型",
-        label: "上一手牌型",
+        label: "上一手的牌型名",
         example: "对子",
     },
     ReplyVariable {
         name: "上限",
-        label: "上限",
+        label: "队列数量上限",
         example: "20",
     },
     ReplyVariable {
         name: "下一位",
-        label: "下一位",
+        label: "下一位该行动的玩家",
         example: "小明",
     },
     ReplyVariable {
         name: "人数",
-        label: "人数",
+        label: "当前人数",
         example: "4",
     },
     ReplyVariable {
         name: "位置",
-        label: "位置",
+        label: "座位号",
         example: "A",
     },
     ReplyVariable {
         name: "位置列表",
-        label: "位置列表",
+        label: "座位号列表",
         example: "A、C",
     },
     ReplyVariable {
         name: "关键词",
-        label: "关键词",
+        label: "从播放池续播的歌曲",
         example: "晴天",
     },
     ReplyVariable {
         name: "其他玩法",
-        label: "其他玩法",
+        label: "正在占用娱乐会话的其他玩法",
         example: "海龟汤",
     },
     ReplyVariable {
         name: "决定",
-        label: "决定",
+        label: "抢地主的选择（抢/不抢）",
         example: "抢地主",
     },
     ReplyVariable {
         name: "前缀",
-        label: "前缀",
+        label: "队列入队提示前缀",
         example: "[提示]",
     },
     ReplyVariable {
         name: "剩余",
-        label: "剩余",
+        label: "剩余手牌",
         example: "3张",
     },
     ReplyVariable {
         name: "剩余分钟",
-        label: "剩余分钟",
+        label: "大厅剩余分钟数",
         example: "15",
     },
     ReplyVariable {
         name: "动作",
-        label: "动作",
+        label: "当前动作",
         example: "出牌",
     },
     ReplyVariable {
         name: "卧底位置",
-        label: "卧底位置",
+        label: "卧底所在的座位号",
         example: "B",
     },
     ReplyVariable {
         name: "卧底词",
-        label: "卧底词",
+        label: "卧底阵营拿到的词",
         example: "苹果",
     },
     ReplyVariable {
         name: "原因",
-        label: "原因",
+        label: "失败原因",
         example: "平台无音源",
     },
     ReplyVariable {
-        name: "名单",
-        label: "名单",
-        example: "甲、乙",
-    },
-    ReplyVariable {
         name: "后续",
-        label: "后续",
+        label: "超时后的后续提示",
         example: "轮到小明",
     },
     ReplyVariable {
         name: "后缀",
-        label: "后缀",
+        label: "追加在后方的文本",
         example: "（超时）",
     },
     ReplyVariable {
         name: "地主",
-        label: "地主",
+        label: "地主玩家名",
         example: "小明",
     },
     ReplyVariable {
         name: "大厅名",
-        label: "大厅名",
+        label: "当前大厅名称",
         example: "1号大厅",
     },
     ReplyVariable {
         name: "字",
-        label: "字",
+        label: "接龙要求的目标首字",
         example: "天",
     },
     ReplyVariable {
         name: "平民词",
-        label: "平民词",
+        label: "平民阵营拿到的词",
         example: "香蕉",
     },
     ReplyVariable {
         name: "序号",
-        label: "序号",
+        label: "列表条目序号",
         example: "1",
     },
     ReplyVariable {
         name: "底牌",
-        label: "底牌",
+        label: "地主的三张底牌",
         example: "红桃2",
     },
     ReplyVariable {
         name: "开头描述",
-        label: "开头描述",
+        label: "接龙开头要求的整句描述",
         example: "以「天」字开头",
     },
     ReplyVariable {
         name: "张数",
-        label: "张数",
+        label: "手牌张数",
         example: "17",
     },
     ReplyVariable {
         name: "当前",
-        label: "当前",
+        label: "队列当前数量",
         example: "晴天",
     },
     ReplyVariable {
         name: "当前抢地主",
-        label: "当前抢地主",
+        label: "当前正在抢地主的玩家",
         example: "小明",
     },
     ReplyVariable {
         name: "成语",
-        label: "成语",
+        label: "当前接到的成语",
         example: "一举两得",
     },
     ReplyVariable {
         name: "手数",
-        label: "手数",
+        label: "本局累计出牌次数",
         example: "12",
     },
     ReplyVariable {
         name: "手牌",
-        label: "手牌",
+        label: "自己的手牌（含花色）",
         example: "♠3 ♥5 ♦K",
     },
     ReplyVariable {
         name: "托管后缀",
-        label: "托管后缀",
+        label: "托管状态标记",
         example: "（托管）",
     },
     ReplyVariable {
         name: "投票说明",
-        label: "投票说明",
+        label: "投票操作提示整句",
         example: "私聊#A投票",
     },
     ReplyVariable {
         name: "拼音",
-        label: "拼音",
+        label: "目标首字的拼音",
         example: "tiān",
     },
     ReplyVariable {
         name: "提问数",
-        label: "提问数",
+        label: "已提出的有效问题数",
         example: "5",
     },
     ReplyVariable {
         name: "搜索词",
-        label: "搜索词",
+        label: "AI 改写后的搜索词",
         example: "晴天 周杰伦",
     },
     ReplyVariable {
         name: "数量",
-        label: "数量",
+        label: "条目数量",
         example: "3",
     },
     ReplyVariable {
-        name: "昵称",
-        label: "昵称",
-        example: "小明",
-    },
-    ReplyVariable {
         name: "条目",
-        label: "条目",
+        label: "队列条目（序号 + 歌名）",
         example: "1.晴天",
     },
     ReplyVariable {
         name: "来源",
-        label: "来源",
+        label: "音乐平台",
         example: "QQ音乐",
     },
     ReplyVariable {
         name: "标签",
-        label: "标签",
+        label: "命令回显前缀",
         example: "@点歌",
     },
     ReplyVariable {
         name: "模式",
-        label: "模式",
+        label: "玩法模式",
         example: "同音接龙",
     },
     ReplyVariable {
         name: "歌名",
-        label: "歌名",
+        label: "曲目标题",
         example: "晴天",
     },
     ReplyVariable {
         name: "歌手",
-        label: "歌手",
+        label: "歌手名",
         example: "周杰伦",
     },
     ReplyVariable {
@@ -326,7 +311,7 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
     },
     ReplyVariable {
         name: "内容",
-        label: "被包裹的正文",
+        label: "被外层模板包裹的状态行正文",
         example: "状态行正文",
     },
     ReplyVariable {
@@ -336,48 +321,43 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
     },
     ReplyVariable {
         name: "新增",
-        label: "新增数量",
+        label: "新增歌曲数",
         example: "12",
     },
     ReplyVariable {
         name: "重复",
-        label: "重复数量",
+        label: "重复歌曲数",
         example: "3",
     },
     ReplyVariable {
         name: "炸弹",
-        label: "炸弹",
+        label: "本局炸弹次数",
         example: "2",
     },
     ReplyVariable {
         name: "牌型",
-        label: "牌型",
+        label: "牌型名",
         example: "顺子",
     },
     ReplyVariable {
         name: "牌面",
-        label: "牌面",
+        label: "牌面字符串",
         example: "♠3♠4♠5♠6♠7",
     },
     ReplyVariable {
         name: "玩家",
-        label: "玩家",
+        label: "玩家名",
         example: "小明",
     },
     ReplyVariable {
         name: "玩家列表",
-        label: "玩家列表",
+        label: "玩家名列表",
         example: "甲、乙、丙",
     },
     ReplyVariable {
         name: "玩法",
-        label: "玩法",
+        label: "玩法名称",
         example: "斗地主",
-    },
-    ReplyVariable {
-        name: "用户名",
-        label: "用户名",
-        example: "小明",
     },
     ReplyVariable {
         name: "秒数",
@@ -386,57 +366,52 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
     },
     ReplyVariable {
         name: "结果",
-        label: "结果",
+        label: "判定结果",
         example: "是",
     },
     ReplyVariable {
         name: "胜方",
-        label: "胜方",
+        label: "胜利阵营",
         example: "平民胜利",
     },
     ReplyVariable {
-        name: "角色",
-        label: "角色",
-        example: "地主",
-    },
-    ReplyVariable {
         name: "词语",
-        label: "词语",
+        label: "自己拿到的词",
         example: "苹果",
     },
     ReplyVariable {
         name: "超时秒数",
-        label: "超时秒数",
+        label: "投票超时秒数",
         example: "30",
     },
     ReplyVariable {
         name: "身份",
-        label: "身份",
+        label: "玩家身份（平民/卧底）",
         example: "平民",
     },
     ReplyVariable {
         name: "轮次",
-        label: "轮次",
+        label: "当前轮次",
         example: "2",
     },
     ReplyVariable {
         name: "问题",
-        label: "问题",
+        label: "玩家提出的问题",
         example: "他认识死者吗",
     },
     ReplyVariable {
         name: "阵营",
-        label: "阵营",
+        label: "对局阵营（地主方/农民方）",
         example: "地主方",
     },
     ReplyVariable {
         name: "阶段",
-        label: "阶段",
+        label: "对局阶段",
         example: "提问",
     },
     ReplyVariable {
         name: "音量",
-        label: "音量",
+        label: "播放器音量",
         example: "80",
     },
 ];
@@ -569,8 +544,12 @@ impl ReplyVars {
 
     /// 注入 AI 生成的文本。单独开一个方法，是为了在调用点显式表达
     /// “这是外部模型输出”，提醒读者它不参与模板解析。
+    /// 注入 AI 生成的文本。
+    ///
+    /// 占位符名与全局标签 `{AI回复}` 一致：模板里写 `{AI回复}`，
+    /// 由调用方预生成后注入，渲染时与普通变量同路径取得。
     pub(crate) fn with_ai(self, value: impl Into<String>) -> Self {
-        self.with("AI回答", value)
+        self.with(crate::features::global_tags::AI_TAG, value)
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&str> {
@@ -627,11 +606,16 @@ pub(crate) fn render(
         }
         match vars.get(name) {
             Some(value) => out.push_str(value),
-            None => {
-                if !missing.iter().any(|seen| seen == name) {
-                    missing.push(name.to_string());
+            // 全局标签在渲染时动态生成（随机池），不占用调用点的注入槽。
+            // 顺序在 vars 之后：调用点显式注入的值优先于随机候选。
+            None => match crate::features::global_tags::resolve(name) {
+                Some(value) => out.push_str(value),
+                None => {
+                    if !missing.iter().any(|seen| seen == name) {
+                        missing.push(name.to_string());
+                    }
                 }
-            }
+            },
         }
         rest = &after[close + 1..];
     }
@@ -763,14 +747,14 @@ mod tests {
 
     const SPEC: ReplyTemplate = ReplyTemplate {
         key: "test.spec",
-        default: "已为{用户名}点播{歌名}",
+        default: "已为{玩家}点播{歌名}",
         summary: "测试",
         group: "点歌",
     };
 
     #[test]
     fn falls_back_to_the_builtin_default_when_no_override_exists() {
-        let vars = ReplyVars::new().with("用户名", "甲").with("歌名", "晴天");
+        let vars = ReplyVars::new().with("玩家", "甲").with("歌名", "晴天");
         let rendered = render(&SPEC, None, &vars);
         assert_eq!(rendered.text, "已为甲点播晴天");
         assert!(!rendered.overridden);
@@ -779,7 +763,7 @@ mod tests {
 
     #[test]
     fn an_empty_override_still_falls_back_instead_of_sending_blank_text() {
-        let vars = ReplyVars::new().with("用户名", "甲").with("歌名", "晴天");
+        let vars = ReplyVars::new().with("玩家", "甲").with("歌名", "晴天");
         let rendered = render(&SPEC, Some("   "), &vars);
         assert!(!rendered.overridden);
         assert_eq!(rendered.text, "已为甲点播晴天");
@@ -787,8 +771,8 @@ mod tests {
 
     #[test]
     fn override_text_is_used_verbatim_apart_from_placeholders() {
-        let vars = ReplyVars::new().with("用户名", "乙").with("歌名", "夜曲");
-        let rendered = render(&SPEC, Some("收到，{用户名} 的 {歌名} 已排上"), &vars);
+        let vars = ReplyVars::new().with("玩家", "乙").with("歌名", "夜曲");
+        let rendered = render(&SPEC, Some("收到，{玩家} 的 {歌名} 已排上"), &vars);
         assert_eq!(rendered.text, "收到，乙 的 夜曲 已排上");
         assert!(rendered.overridden);
     }
@@ -799,7 +783,7 @@ mod tests {
         let vars = ReplyVars::new().with_ai("牌面显示 {歌名} 与 {未知}");
         let spec = ReplyTemplate {
             key: "test.ai",
-            default: "解读：{AI回答}",
+            default: "解读：{AI回复}",
             summary: "测试",
             group: "娱乐",
         };
@@ -817,7 +801,7 @@ mod tests {
         assert_eq!(rendered.text, "已为点播");
         assert_eq!(
             rendered.missing,
-            vec!["用户名".to_string(), "歌名".to_string()]
+            vec!["玩家".to_string(), "歌名".to_string()]
         );
     }
 

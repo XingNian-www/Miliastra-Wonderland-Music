@@ -48,6 +48,7 @@ mod system_routes;
 mod tasks_chat_routes;
 
 use ai_routes::*;
+use crate::config::ai::ModelListError;
 use commands_routes::*;
 use config_routes::*;
 use debug_routes::*;
@@ -144,6 +145,10 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
     BodyRouteSpec {
         path: "/debug/read-only/read",
         handler: debug_read_only_read_route,
+    },
+    BodyRouteSpec {
+        path: "/ai/models",
+        handler: ai_models_body_route,
     },
     BodyRouteSpec {
         path: "/debug/tasks",

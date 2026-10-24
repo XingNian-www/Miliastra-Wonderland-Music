@@ -15,6 +15,7 @@ pub(crate) mod invite;
 pub(crate) mod moderation;
 pub(crate) mod playback;
 pub(crate) mod playlist;
+pub(crate) mod global_tags;
 pub(crate) mod reply_template;
 pub(crate) mod song_request;
 pub(crate) mod startup;

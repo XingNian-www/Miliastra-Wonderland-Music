@@ -296,7 +296,7 @@ impl InviteExecution {
         let announce = crate::features::reply_template::render(
             &crate::features::reply_template::moderation::MODERATION[4],
             None,
-            &crate::features::reply_template::ReplyVars::new().with("用户名", display_name.clone()),
+            &crate::features::reply_template::ReplyVars::new().with("玩家", display_name.clone()),
         )
         .text;
         if let Err(error) = port.send_hall(&announce) {

@@ -284,7 +284,7 @@ pub(crate) const STATUS_IDLE: ReplyTemplate = spec(
 /// 房间等待加入状态。
 pub(crate) const STATUS_LOBBY: ReplyTemplate = spec(
     "card_games.status.lobby",
-    "{玩法}等待加入: {名单}，还需{人数}人",
+    "{玩法}等待加入: {玩家列表}，还需{人数}人",
     "房间状态",
 );
 
@@ -755,7 +755,7 @@ mod tests {
                 &STATUS_LOBBY,
                 ReplyVars::new()
                     .with("玩法", "斗地主")
-                    .with("名单", "甲、乙")
+                    .with("玩家列表", "甲、乙")
                     .with("人数", "1")
             ),
             "斗地主等待加入: 甲、乙，还需1人"

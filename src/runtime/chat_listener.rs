@@ -150,4 +150,30 @@ mod tests {
         state.end_temporary_primary();
         assert!(!state.snapshot().temporary_primary);
     }
+
+    /// 回归：只 request 不入队时 pending_mode 会永久悬挂。
+    ///
+    /// 这是「接入外部聊天后卡在一级、怎么都进不了二级」的直接原因：
+    /// 外部聊天线程只调 request_chat_listener_mode，没人把 SetChatListenerMode
+    /// 放进正式队列，pending_mode 一直是 Some(Secondary)。
+    #[test]
+    fn pending_mode_is_cleared_only_by_completion_not_by_request_alone() {
+        let mut state = ChatListenerState::new();
+        assert!(state.request_mode(ChatListenerMode::Secondary));
+        assert_eq!(
+            state.snapshot().pending_mode,
+            Some(ChatListenerMode::Secondary)
+        );
+        assert_eq!(state.snapshot().mode, ChatListenerMode::Primary);
+        // 重复请求不会被重新接受，也不会自行清空。
+        assert!(!state.request_mode(ChatListenerMode::Secondary));
+        assert_eq!(
+            state.snapshot().pending_mode,
+            Some(ChatListenerMode::Secondary)
+        );
+        // 只有完成或撤销才清空。
+        state.complete_mode_switch(ChatListenerMode::Secondary);
+        assert_eq!(state.snapshot().pending_mode, None);
+        assert_eq!(state.snapshot().mode, ChatListenerMode::Secondary);
+    }
 }

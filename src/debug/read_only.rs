@@ -982,21 +982,12 @@ pub(crate) fn command_parameters(parsed: &RoutedCommand) -> Value {
         ModuleCommand::CustomWorkflow(_) => "customWorkflow",
         ModuleCommand::AiChat(_) => "aiChat",
     });
-    let private_reason =
-        match &parsed.command {
-            ModuleCommand::Moderation(_) if parsed.message_type == "pink" => {
-                Some("private moderation input")
-            }
-            ModuleCommand::Tarot(crate::features::tarot::TarotCommand::Draw {
-                ai: true, ..
-            }) if parsed.message_type == "pink" => Some("private AI input"),
-            ModuleCommand::Undercover(
-                crate::features::undercover::UndercoverCommand::Vote(_)
-                | crate::features::undercover::UndercoverCommand::Abstain
-                | crate::features::undercover::UndercoverCommand::Reveal,
-            ) => Some("private game input"),
-            _ => None,
-        };
+    // 由 `ModuleCommand::private_payload` 统一回答：新增玩法时编译器会强制
+    // 它给出答案，而不是靠这里的手写 match（漏改曾导致私密内容静默进证据流）。
+    let private_reason = parsed
+        .command
+        .private_payload(&parsed.message_type)
+        .map(|payload| payload.reason());
     if let Some(reason) = private_reason {
         payload["parametersOmitted"] = json!(reason);
         payload["sourceTextOmitted"] = json!(reason);

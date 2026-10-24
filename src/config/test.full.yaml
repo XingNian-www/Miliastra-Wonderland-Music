@@ -1038,3 +1038,13 @@ custom_workflows:
       steps:
         - type: send_chat
           message: "{{args}}"
+
+chat_source:
+  enabled: false
+  url: ws://127.0.0.1:18889/stream
+  token: ""
+  reconnect_ms: 3000
+  lease_timeout_ms: 10000
+  auto_start: false
+  executable: ""
+  self_uid: 0

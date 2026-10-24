@@ -502,7 +502,7 @@ fn first_bubble_is_never_new_on_a_regular_frame() {
 fn absent_view_consumes_cold_baseline_so_first_blue_is_new() {
     // 聊天区一直不存在 => 首屏没有命令，冷基线消费；首个 HallWorldSwitch 基线按 blue New 处理。
     let mut state = SequenceFreshness::default();
-    state.mark_view_absent();
+    state.mark_view_absent(super::ViewAbsence::Transient);
     let decision = observe_texts(&mut state, Some(BaselineKind::HallWorldSwitch), &["@新"]);
     assert_eq!(decision.freshness[0], Freshness::New);
 }
@@ -512,7 +512,7 @@ fn absent_view_then_first_content_marks_pink_and_blue_new() {
     // 首屏没有聊天界面 => 冷基线消费；之后第一帧内容里的命令按新命令处理，
     // 粉色与蓝色遵循同一规则（不因颜色被判成历史）。
     let mut state = SequenceFreshness::default();
-    state.mark_view_absent();
+    state.mark_view_absent(super::ViewAbsence::Transient);
     let bubbles = vec![
         bubble_at(0, 0, 400, 28, "@蓝", "blue", SENDER),
         bubble_at(0, 30, 400, 28, "@粉", "pink", SENDER),

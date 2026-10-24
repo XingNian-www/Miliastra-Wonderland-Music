@@ -358,17 +358,24 @@ impl Default for AppConfig {
                 enter_wonderland: false,
                 exe_path: PathBuf::new(),
                 game_args: String::new(),
-                launch_wait_ms: 5000,
-                launch_retries: 12,
-                enter_game_timeout_ms: 60000,
-                enter_wonderland_timeout_ms: 300000,
-                wonderland_map_star_retries: 120,
+                // 默认预算按"每个阶段都不超过一分钟"分配（用户明确要求）：
+                //   启动游戏 ≤ 60s、进入游戏 ≤ 45s、进入千星 ≤ 51s。
+                // 原来的默认值最坏要 15 分钟（星标 120×2.5s + 大厅 90×2s +
+                // 三处 60s 过渡 + 120s 主界面），卡在某个阶段时用户完全不知道
+                // 还要等多久，因此把每个阶段的**上限**都收到一分钟以内。
+                // 超时只是放弃等待并如实报错，不会误点错位置；
+                // 真机慢到超过一分钟的用户可以在配置中心自行调大。
+                launch_wait_ms: 3000,
+                launch_retries: 20,
+                enter_game_timeout_ms: 45000,
+                enter_wonderland_timeout_ms: 60000,
+                wonderland_map_star_retries: 6,
                 wonderland_map_star_retry_ms: 2500,
-                wonderland_hall_retries: 90,
-                wonderland_hall_retry_ms: 2000,
-                wonderland_transition_timeout_ms: 60000,
-                wonderland_confirm_stable_timeout_ms: 60000,
-                final_primary_timeout_ms: 120000,
+                wonderland_hall_retries: 6,
+                wonderland_hall_retry_ms: 2500,
+                wonderland_transition_timeout_ms: 4000,
+                wonderland_confirm_stable_timeout_ms: 3000,
+                final_primary_timeout_ms: 10000,
                 poll_ms: 1000,
                 stable_mean_threshold: 2.0,
                 stable_changed_ratio_threshold: 0.01,
@@ -2565,6 +2572,50 @@ stale_timeout_ms: 7500
         assert_eq!(workflow.steps[1].template.as_deref(), Some("按钮"));
     }
 
+    /// 启动流程每个阶段的**上限**都不超过一分钟（用户明确要求）。
+    ///
+    /// 改动前最坏要 15 分钟：星标 120×2.5s + 星标消失 60s + 大厅 90×2s
+    /// + 确认弹窗 60s + 确认稳定 60s + 主界面 120s。卡住时用户完全不知道
+    /// 还要等多久，所以这里把各阶段预算钉死，避免以后调参时悄悄回涨。
+    #[test]
+    fn startup_stage_budgets_stay_under_one_minute() {
+        const ONE_MINUTE_MS: u64 = 60_000;
+        // 用内置默认配置（与发布包 config.yaml 同源），而不是 AppConfig::default()：
+        // 后者是运行时内部默认，前者才是用户实际拿到的值。
+        let config: AppConfig =
+            serde_norway::from_str(bundled_config_yaml()).expect("默认配置应可解析");
+        let startup = &config.startup;
+
+        // 启动游戏：等窗口的总上限。
+        let launch_total = startup.launch_wait_ms * u64::from(startup.launch_retries.max(1));
+        assert!(
+            launch_total <= ONE_MINUTE_MS,
+            "启动游戏阶段上限 {launch_total}ms 超过一分钟"
+        );
+
+        // 进入游戏：点击进入的等待上限。
+        assert!(
+            startup.enter_game_timeout_ms <= ONE_MINUTE_MS,
+            "进入游戏阶段上限 {}ms 超过一分钟",
+            startup.enter_game_timeout_ms
+        );
+
+        // 进入千星：各子阶段之和。派蒙菜单等待走 timing.workflow.default_timeout_ms。
+        let star = u64::from(startup.wonderland_map_star_retries.max(1))
+            * startup.wonderland_map_star_retry_ms.max(1);
+        let hall = u64::from(startup.wonderland_hall_retries.max(1))
+            * startup.wonderland_hall_retry_ms.max(1);
+        let wonderland_total = config.timing.workflow.default_timeout_ms
+            + star
+            + startup.wonderland_transition_timeout_ms * 2
+            + hall
+            + startup.wonderland_confirm_stable_timeout_ms
+            + startup.final_primary_timeout_ms;
+        assert!(
+            wonderland_total <= ONE_MINUTE_MS,
+            "进入千星阶段上限 {wonderland_total}ms 超过一分钟"
+        );
+    }
     #[test]
     fn empty_optional_runtime_path_stays_empty() {
         let mut config: AppConfig =

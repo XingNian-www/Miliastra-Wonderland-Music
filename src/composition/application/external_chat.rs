@@ -152,7 +152,9 @@ pub(crate) fn spawn(
     timeline: ChatTimeline,
     config: ChatSourceConfig,
     identity_access: Option<crate::features::identity::IdentityAccess>,
-    listener_control: Option<std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>>,
+    listener_control: Option<
+        std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
+    >,
 ) -> Result<ExternalChatState> {
     let state = ExternalChatState::default();
     if !config.enabled {
@@ -161,7 +163,15 @@ pub(crate) fn spawn(
     let worker_state = state.clone();
     thread::Builder::new()
         .name("external-chat".into())
-        .spawn(move || run(timeline, config, identity_access, listener_control, worker_state))
+        .spawn(move || {
+            run(
+                timeline,
+                config,
+                identity_access,
+                listener_control,
+                worker_state,
+            )
+        })
         .map_err(|error| anyhow::anyhow!("启动外部聊天线程失败: {error}"))?;
     Ok(state)
 }
@@ -170,7 +180,9 @@ fn run(
     timeline: ChatTimeline,
     config: ChatSourceConfig,
     identity_access: Option<crate::features::identity::IdentityAccess>,
-    listener_control: Option<std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>>,
+    listener_control: Option<
+        std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
+    >,
     state: ExternalChatState,
 ) {
     let lease = Duration::from_millis(config.lease_timeout_ms);
@@ -283,14 +295,24 @@ fn run(
                     }
                 }
                 Ok(None) => {
-                    // 连接正常关闭（或读超时）：继续下一轮，不退出线程。
-                    if last_event_at.elapsed() > lease {
+                    // 这里既可能是「读超时」，也可能是收到了 Ping/Pong/Close。
+                    // 必须区分：ChatBridge 每 30s 发一次 Ping，若把心跳当成
+                    // 无活动，租约(默认 10s)永远先超时，外部源会周期性地
+                    // 「已退出 → 已接管」抖动，聊天源等于一直在断。
+                    // conn: Some(_) 表示连接还在读，心跳/超时都算存活；
+                    // None 表示连接已关闭，交给上层重连。
+                    if source.is_connected() {
+                        last_event_at = Instant::now();
+                    } else if last_event_at.elapsed() > lease {
                         state.set_active(false);
                     }
                     continue;
                 }
                 Err(error) => {
-                    log::warn!("外部聊天源读取失败，{}ms 后重连: {error:#}", config.reconnect_ms);
+                    log::warn!(
+                        "外部聊天源读取失败，{}ms 后重连: {error:#}",
+                        config.reconnect_ms
+                    );
                     state.set_active(false);
                     // 重连前重置：旧墓碑与会话号都不再适用于新连接。
                     state.bump_epoch();
@@ -327,7 +349,9 @@ fn deliver(
                         log::debug!("昵称补查命中: uid={} name={name}", uid.as_str());
                         message.sender.nickname = Some(name);
                     }
-                    Ok(None) => log::debug!("昵称补查无结果，按未知发送者处理: uid={}", uid.as_str()),
+                    Ok(None) => {
+                        log::debug!("昵称补查无结果，按未知发送者处理: uid={}", uid.as_str())
+                    }
                     Err(error) => log::debug!("昵称补查失败: {error:#}"),
                 }
             }
@@ -470,6 +494,32 @@ mod tests {
         assert_eq!(
             ws_url_to_http("ws://host:8080/chat/v1/stream"),
             "http://host:8080/chat/v1"
+        );
+    }
+
+    /// 回归：心跳/读超时不能被当成「外部源失联」。
+    ///
+    /// ChatBridge 每 30s 才发一次 Ping，而租约默认 10s。旧实现里
+    /// next_event() 对 Ping/Pong 返回 Ok(None)，上层既没有事件可刷新
+    /// last_event_at，也没有任何存活信号，于是必然「已退出 → 已接管」
+    /// 周期性抖动，外部聊天等于一直在断。
+    #[test]
+    fn heartbeat_keeps_source_connected_so_lease_is_not_lost() {
+        // is_connected 是新增的存活判据：连接还在就必须算活跃。
+        // 默认实现为 true，保证新增来源不会被误判为断线。
+        struct AlwaysConnected;
+        impl ChatSource for AlwaysConnected {
+            fn name(&self) -> &str {
+                "test"
+            }
+            fn next_event(&mut self) -> anyhow::Result<Option<ChatSourceEvent>> {
+                Ok(None)
+            }
+        }
+        let source = AlwaysConnected;
+        assert!(
+            source.is_connected(),
+            "读超时/心跳期间连接仍在，上层据此刷新租约"
         );
     }
 

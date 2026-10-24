@@ -51,16 +51,52 @@ def normalize_module(name):
 USE_RE = re.compile(r'(?<!\w)crate::([A-Za-z_]\w*)')
 
 
-def strip_test_code(text):
-    """截断顶层 #[cfg(test)] mod，避免把测试里的跨层引用算成生产依赖。
+TEST_MOD_DECL = re.compile(r'(?m)^[ \t]*#\[cfg\(test\)\]\s*\n\s*mod\s+\w+\s*;')
+TEST_MOD_BLOCK = re.compile(r'(?m)^[ \t]*#\[cfg\(test\)\]\s*\n\s*mod\s+\w+\s*\{')
 
-    不截断的话现状就会 FAIL：例如 observation/chat/actual_screenshot_tests.rs
-    会 use crate::features/...，但那是 cfg(all(test, feature = "ocr-mnn")) 内的代码。
+
+def strip_test_code(text):
+    """删除顶层 #[cfg(test)] mod 声明，保留其后的生产代码。
+
+    旧实现从第一个匹配截断到文件末尾：只要文件里有一行
+    `#[cfg(test)] mod xxx_tests;`，它后面的**全部生产代码**都不再参与检查。
+    `composition/application.rs` 因此整份文件被跳过（95 处 crate:: 引用不可见）。
+
+    现在只删 `mod x;` 这一行声明；内联的 `mod x { ... }` 用花括号配对删除。
     """
-    marker = re.search(r'(?m)^#\[cfg\(test\)\]\s*\n\s*mod\s+\w+', text)
-    if marker:
-        return text[:marker.start()]
-    return text
+    out = []
+    i = 0
+    while i < len(text):
+        decl = TEST_MOD_DECL.search(text, i)
+        block = TEST_MOD_BLOCK.search(text, i)
+        candidates = [m for m in (decl, block) if m]
+        if not candidates:
+            out.append(text[i:])
+            break
+        marker = min(candidates, key=lambda m: m.start())
+        out.append(text[i:marker.start()])
+        if marker is decl:
+            i = marker.end()
+            continue
+        # 内联块：从 '{' 起做花括号配对，跳过字符串与字符字面量里的括号。
+        depth = 0
+        j = marker.end() - 1
+        while j < len(text):
+            ch = text[j]
+            if ch == '"':
+                j += 1
+                while j < len(text) and text[j] != '"':
+                    j += 2 if text[j] == '\\' else 1
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        i = j
+    return "".join(out)
 
 
 def walk():

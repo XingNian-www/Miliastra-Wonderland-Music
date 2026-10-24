@@ -24,8 +24,12 @@ use super::{AppConfig, BootstrapConfig};
 /// 7.0.0 起回复文案统一由命令面板持有（[<code>command_replies</code>] 表），
 /// 配置表里的 `replies` 段被移除；同时命令回复目录重组为
 /// key→命令 的归属表。这些变化让旧配置失去意义，因此提升版本号触发断代重置。
-/// 重置只重建配置三表，歌曲缓存与音频文件不受影响。
-pub const CONFIG_SCHEMA_VERSION: i64 = 4;
+/// 正式版从 v6.2.0 的 1 只升一级到 2；开发期中间版本号（3/4）不再沿用，
+/// 避免正式版与开发版共用同一版本号造成语义混淆。
+///
+/// 重置只重建配置三表，歌曲缓存与音频文件不受影响；重置前会先把整库
+/// 备份到同目录的 `.bak` 文件，便于用户找回旧配置。
+pub const CONFIG_SCHEMA_VERSION: i64 = 2;
 
 /// 打开连接（含头初始化）的重试次数：两个进程并发首次创建同一新库文件时，
 /// SQLite 头初始化阶段的锁竞争发生在 busy_timeout 生效之前，需要有限重试吸收。
@@ -440,12 +444,24 @@ impl ConfigStore {
         Ok(())
     }
 
-    /// 旧配置断代：取写锁后重查版本，只重建配置三表。缓存及其他表不受影响。
+    /// 旧配置断代：先备份整库，再取写锁重查版本，只重建配置三表。
+    /// 缓存及其他表不受影响。
     fn reset_previous_schema(
         connection: &mut rusqlite::Connection,
         path: &Path,
         stale_version: i64,
     ) -> Result<()> {
+        // 备份必须在改库之前完成：断代会删掉旧配置，事后无法还原。
+        // 备份失败只告警不阻断——否则用户会被卡在"升级不了也回不去"的死局里，
+        // 而缓存与旧配置都还在原库里。
+        match backup_before_reset(connection, path, stale_version) {
+            Ok(Some(backup)) => log::warn!(
+                "配置 schema v{stale_version} → v{CONFIG_SCHEMA_VERSION} 断代前已备份旧库: {}",
+                backup.display()
+            ),
+            Ok(None) => {}
+            Err(error) => log::warn!("断代前备份旧库失败（继续升级）: {error:#}"),
+        }
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 = transaction.query_row(
@@ -909,6 +925,63 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// 断代前把整库备份到同目录的 `.bak` 文件，返回备份路径。
+///
+/// 用 `VACUUM INTO` 而不是复制文件：库开着 WAL，直接复制主库文件会漏掉
+/// 还在 `-wal` 里没 checkpoint 的已提交数据；`VACUUM INTO` 由 SQLite 在
+/// 同一连接上生成一致快照。
+///
+/// 返回 `Ok(None)` 表示库文件还不存在（全新库，没有可备份的内容）。
+/// 备份名带旧 schema 版本与时间戳，重复升级不会覆盖上一次的备份。
+fn backup_before_reset(
+    connection: &rusqlite::Connection,
+    path: &Path,
+    stale_version: i64,
+) -> Result<Option<PathBuf>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let backup = backup_path(path, stale_version);
+    // 同名文件已存在时换个名字，绝不覆盖用户已有的备份。
+    let backup = unique_backup_path(backup);
+    // VACUUM INTO 的目标必须是尚不存在的文件；参数化避免路径里的引号破坏 SQL。
+    connection.execute(
+        "VACUUM INTO ?1",
+        rusqlite::params![backup.display().to_string()],
+    )?;
+    Ok(Some(backup))
+}
+
+/// 备份文件名：`<库名>.v<旧版本>.YYYYmmdd-HHMMSS.bak`。
+fn backup_path(path: &Path, stale_version: i64) -> PathBuf {
+    let stamp = backup_timestamp();
+    let stem = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".to_string());
+    path.with_file_name(format!("{stem}.v{stale_version}.{stamp}.bak"))
+}
+
+/// 若目标已存在则追加 `-1`、`-2`…，保证不覆盖既有备份。
+fn unique_backup_path(candidate: PathBuf) -> PathBuf {
+    if !candidate.exists() {
+        return candidate;
+    }
+    let base = candidate.with_extension("");
+    for index in 1..1000 {
+        let next = PathBuf::from(format!("{}-{index}.bak", base.display()));
+        if !next.exists() {
+            return next;
+        }
+    }
+    candidate
+}
+
+/// 文件名安全的时间戳（`YYYYmmdd-HHMMSS`，本地 +08:00）。
+fn backup_timestamp() -> String {
+    crate::adapters::logging::format_timestamp_compact(SystemTime::now())
 }
 
 /// 检查表是否存在且列结构匹配期望列（列集合必须完全一致，顺序不限）；
@@ -1881,6 +1954,113 @@ mod tests {
         assert_eq!(store.current_revision().unwrap(), 2);
         drop(store);
         cleanup(&root);
+    }
+
+    #[test]
+    fn v6_2_0_database_upgrades_by_resetting_config_and_keeping_cache() {
+        // v6.2.0 的 CONFIG_SCHEMA_VERSION 是 1，7.0.0 是 2：跨版本按既定策略断代重置
+        // 配置三表，但歌曲缓存、命令回复与请求快照必须完好，且升级前要留下备份。
+        // 这条测试直接模拟"从最新正式发布版升级"，避免以后改版本号时误伤缓存。
+        let (root, database_path) = temp_database("v620-upgrade");
+        let bootstrap = test_bootstrap(&database_path);
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+
+        let reply_data = BTreeMap::from([(
+            "@升级保留".to_string(),
+            vec![StoredReply {
+                key: "answer".into(),
+                text: "keep me".into(),
+            }],
+        )]);
+        assert_eq!(store.save_reply_templates(0, &reply_data).unwrap(), 1);
+        let audio_path = root.join("v620-cached.audio");
+        fs::write(&audio_path, b"audio bytes").unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TABLE cached_tracks (hash TEXT PRIMARY KEY, title TEXT);
+             INSERT INTO cached_tracks VALUES ('v620', 'cached v620');
+             PRAGMA user_version = 1;
+             UPDATE config_meta SET schema_version = 1;",
+            )
+            .unwrap();
+        drop(store);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+
+        // 配置回到默认值（断代），版本号进到当前值。
+        let expected: Value = serde_json::from_str(
+            &serde_json::to_string(&AppConfig::default().to_db_value()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(Value::Object(store.read_all_sections().unwrap()), expected);
+        assert_eq!(store.current_revision().unwrap(), 1);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT schema_version FROM config_meta WHERE id = 1",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            CONFIG_SCHEMA_VERSION
+        );
+
+        // 缓存与回复模板不属于配置三表，必须跨版本保留。
+        let cached: String = store
+            .connection
+            .query_row(
+                "SELECT title FROM cached_tracks WHERE hash = 'v620'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cached, "cached v620");
+        assert_eq!(store.reply_templates().unwrap(), reply_data);
+        assert_eq!(fs::read(&audio_path).unwrap(), b"audio bytes");
+
+        // 升级后能正常加载并再次保存。
+        store.load_full().unwrap().validate().unwrap();
+        drop(store);
+
+        // 断代前必须留下整库备份，且备份里还能读到升级前的配置与缓存。
+        // 备份写在库文件同目录（deps/data），不是可执行根目录。
+        let backups = backup_files(database_path.parent().unwrap());
+        assert_eq!(backups.len(), 1, "升级应恰好产生一个备份: {backups:?}");
+        let backup = rusqlite::Connection::open(&backups[0]).unwrap();
+        let backed_up_version: i64 = backup
+            .query_row(
+                "SELECT schema_version FROM config_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backed_up_version, 1, "备份应保留升级前的 schema 版本");
+        let backed_up_cache: String = backup
+            .query_row(
+                "SELECT title FROM cached_tracks WHERE hash = 'v620'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backed_up_cache, "cached v620");
+
+        cleanup(&root);
+    }
+
+    /// 临时目录里的 .bak 文件列表（按名字排序）。
+    fn backup_files(root: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut found: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "bak"))
+            .collect();
+        found.sort();
+        found
     }
 
     #[test]

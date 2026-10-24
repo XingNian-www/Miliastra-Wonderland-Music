@@ -379,6 +379,11 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .overview-quick-controls .btn svg{width:var(--ic-sm);height:var(--ic-sm)}
 .overview-now-playing .playback-progress{margin-top:var(--sp-3)}
 .page-grid>.wide{grid-column:1/-1}
+/* 折叠面板在 grid 里按行对齐：一行中某个面板收起后，该行高度仍由最高的
+   面板决定，下方就空出一截，后面的面板也不会补上来。
+   改用 masonry 式单列流：所有面板排进一列，只按各自内容占高，
+   收起任何一个都不会在别处留白。仅 AI 聊天页用 details 面板，因此只作用于它。 */
+#aiChatGrid{grid-template-columns:minmax(0,1fr);gap:var(--sp-4)}
 .playback-layout{grid-template-columns:repeat(12,minmax(0,1fr));gap:var(--sp-4)}
 .playback-layout>.playback-player-panel{grid-column:span 7}
 .playback-layout>.playback-request-panel{grid-column:span 5}
@@ -716,13 +721,17 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
           <summary class="panel-head">触发与开关</summary>
           <div class="panel-body" id="aiChatTriggerPanel"><p class="config-field-hint">正在读取配置…</p></div>
         </details>
-        <details class="panel">
+        <details class="panel" open>
           <summary class="panel-head">记忆容量</summary>
           <div class="panel-body" id="aiChatMemoryPanel"><p class="config-field-hint">正在读取配置…</p></div>
         </details>
-        <details class="panel">
+        <details class="panel" open>
           <summary class="panel-head">模型与提示词</summary>
           <div class="panel-body" id="aiChatPromptPanel"><p class="config-field-hint">正在读取配置…</p></div>
+        </details>
+        <details class="panel" open>
+          <summary class="panel-head">AI回复 标签</summary>
+          <div class="panel-body" id="aiChatReplyPanel"><p class="config-field-hint">正在读取配置…</p></div>
         </details>
       </div>
       <p class="command-foot">记忆只保存在本地统一数据库；「@忘记我」可让玩家清空自己的记忆。AI 给出的命令会按提问者本人权限复核后执行。</p>
@@ -1285,7 +1294,14 @@ let aiChatDirty=false
 const AI_CHAT_GROUPS=[
   {id:'aiChatTriggerPanel',keys:['enabled','keyword','trigger_mode','cooldown_seconds','allow_commands']},
   {id:'aiChatMemoryPanel',keys:['actor_token_budget','bot_token_budget']},
-  {id:'aiChatPromptPanel',keys:['model','max_tokens','system_prompt','answer_prompt','extract_prompt']}
+  {id:'aiChatPromptPanel',keys:['model','reasoning','max_tokens','system_prompt','answer_prompt','extract_prompt']},
+  // {AI回复} 是回复模板里的独立标签，生成参数在 ai_reply.* 下；
+  // 不在这里列出的话，用户根本看不到它、也没法调。
+  {id:'aiChatReplyPanel',keys:[
+    'ai_reply.mode','ai_reply.include_template','ai_reply.include_command',
+    'ai_reply.system_prompt','ai_reply.user_prompt',
+    'ai_reply.max_tokens','ai_reply.timeout_seconds'
+  ]}
 ]
 async function loadAiChatSettings(){
   const status=$('aiChatStatusText')
@@ -1311,10 +1327,30 @@ function showAiChatMessage(text,kind){
   el.textContent=text||''
   el.className='config-message'+(kind?' '+kind:'')+(text?'':' hidden')
 }
+// ai_chat 段里既有扁平字段（enabled），也有嵌套字段（ai_reply.mode）。
+// 早期按扁平 key 读写，导致 ai_reply.* 永远读不到、存回去还会多出
+// 一个叫 "ai_reply.mode" 的顶层键，AI回复 的配置因此一直是默认值。
 function aiChatKey(path){return String(path||'').replace(/^ai_chat\./,'')}
+function aiChatValueAt(values,key){
+  if(!values)return undefined
+  let node=values
+  for(const seg of String(key).split('.')){
+    if(node==null||typeof node!=='object')return undefined
+    node=node[seg]
+  }
+  return node
+}
+function aiChatSetValue(target,key,value){
+  const seg=String(key).split('.')
+  let node=target
+  for(let i=0;i<seg.length-1;i++){
+    if(node[seg[i]]==null||typeof node[seg[i]]!=='object')node[seg[i]]={}
+    node=node[seg[i]]
+  }
+  node[seg[seg.length-1]]=value
+}
 function aiChatFieldValue(path){
-  const key=aiChatKey(path)
-  return aiChatData&&aiChatData.values?aiChatData.values[key]:undefined
+  return aiChatValueAt(aiChatData&&aiChatData.values,aiChatKey(path))
 }
 function renderAiChatPage(){
   for(const group of AI_CHAT_GROUPS){
@@ -1327,7 +1363,7 @@ function renderAiChatPage(){
       parts.push('<div class="config-field">')
       parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code></div>')
       if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
-      parts.push(configControlHtml(field,aiChatFieldValue(field.path)))
+      parts.push(configControlHtml(field,aiChatFieldValue(field.path),'ai_chat'))
       parts.push('</div>')
     }
     parts.push('<div class="config-string-row"><button class="btn" onclick="saveAiChatSettings()">保存本页</button>')
@@ -1340,16 +1376,21 @@ function renderAiChatPage(){
   })
 }
 function collectAiChatSection(){
-  const values={}
+  // 以已保存值为基线：页面上没渲染的字段（其他分组里的）不能被写丢。
+  const values=JSON.parse(JSON.stringify(aiChatData&&aiChatData.values?aiChatData.values:{}))
   for(const field of aiChatFields){
     const key=aiChatKey(field.path)
     const el=document.getElementById(configControlId(field.path))
-    if(!el){values[key]=aiChatData.values[key];continue}
+    if(!el)continue
+    const previous=aiChatValueAt(aiChatData&&aiChatData.values,key)
     const kind=field.kind&&field.kind.type
-    if(kind==='bool')values[key]=el.checked
-    else if(kind==='int'){const n=Number(el.value);values[key]=Number.isFinite(n)?Math.trunc(n):aiChatData.values[key]}
-    else if(kind==='float'){const n=Number(el.value);values[key]=Number.isFinite(n)?n:aiChatData.values[key]}
-    else values[key]=el.value
+    let value
+    if(kind==='bool')value=el.checked
+    else if(kind==='int'){const n=Number(el.value);value=Number.isFinite(n)?Math.trunc(n):previous}
+    else if(kind==='float'){const n=Number(el.value);value=Number.isFinite(n)?n:previous}
+    else if(kind==='enum'||kind==='string'||kind==='text')value=el.value
+    else value=previous
+    aiChatSetValue(values,key,value)
   }
   return values
 }
@@ -3590,13 +3631,16 @@ function configDefaultText(value){
   const text=JSON.stringify(value)
   return text.length>48?esc(text.slice(0,48))+'…':esc(text)
 }
-function configControlHtml(field,value){
+// sectionName 用于解析可空对象父字段；AI 聊天页不是配置中心的当前段，
+// 不显式传入会拿错段（inheritdoc 到别的 section 的字段）。
+function configControlHtml(field,value,sectionName){
+  const section=sectionName||configActiveSection
   const kind=field.kind&&field.kind.type
   const id=configControlId(field.path)
   const path=field.path
   const disabledAttr=field.source==='bootstrap'?' disabled':''
-  const parent=configNullableObjectParent(configActiveSection,path)
-  const parentNull=parent&&configValueAt(configActiveSection,parent.path)==null
+  const parent=configNullableObjectParent(section,path)
+  const parentNull=parent&&configValueAt(section,parent.path)==null
   const parentAttr=parent?(' data-cfg-parent="'+parent.path+'"'+(parentNull?' disabled':'')):''
   if(kind==='bool'){
     return '<label class="switch-line"><input id="'+id+'" type="checkbox" data-cfg="'+path+'"'+(value===true?' checked':'')+disabledAttr+parentAttr+'><span data-switch-state>'+(value===true?'已启用':'未启用')+'</span></label>'
@@ -3643,7 +3687,7 @@ function configControlHtml(field,value){
   if(kind==='object'){
     // 有子字段 schema 声明的可空对象（如 audio_cache）→ 结构化开关，禁止手填 JSON；
     // 无子字段声明的自由对象（ai.extra_body、custom_workflows 等）→ 高级 JSON 编辑。
-    const hasChildren=configSchema&&configSchema.some(s=>s.name===configActiveSection&&s.fields.some(f=>String(f.path).startsWith(path+'.')))
+    const hasChildren=configSchema&&configSchema.some(s=>s.name===section&&s.fields.some(f=>String(f.path).startsWith(path+'.')))
     if(field.nullable&&hasChildren){
       const on=value!=null&&value.enabled!==false
       return '<label class="switch-line config-object-toggle"><input id="'+id+'" type="checkbox" data-cfg="'+path+'" data-cfg-object-toggle="1"'+(on?' checked':'')+disabledAttr+'><span data-switch-state>'+(on?'已启用':'未启用')+'</span></label>'+

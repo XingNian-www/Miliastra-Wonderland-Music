@@ -36,7 +36,7 @@ impl WebSocketChatSource {
             .build()
             .context("创建外部聊天 WS runtime 失败")?;
         Ok(Self {
-            name: "Miliastra-Wonderland-Chat".to_string(),
+            name: "Miliastra-Wonderland-ChatBridge".to_string(),
             url,
             token,
             runtime,

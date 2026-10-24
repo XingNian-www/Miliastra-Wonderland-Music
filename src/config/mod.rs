@@ -23,7 +23,7 @@ use crate::features::undercover::UndercoverConfig;
 use crate::runtime::player::PlayerObservationConfig;
 use crate::runtime::player_io::{PlayerRuntimeConfig, PlayerRuntimeConfigError};
 
-/// 外部聊天源：用 Miliastra-Wonderland-Chat 的 WS 推送替代 OCR 的聊天内容识别。
+/// 外部聊天源：用 Miliastra-Wonderland-ChatBridge 的 WS 推送替代 OCR 的聊天内容识别。
 ///
 /// 界面识别（Primary/Secondary/NoChat）仍由模板匹配完成，不受本段影响。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -44,17 +44,19 @@ pub struct ChatSourceConfig {
     /// 外部源失联多久后回落到 OCR。
     #[serde(default = "default_chat_source_lease_ms")]
     pub lease_timeout_ms: u64,
-    /// 是否由 BOT 负责拉起 Miliastra-Wonderland-Chat（登录器角色）。
+    /// 是否由 BOT 负责拉起 Miliastra-Wonderland-ChatBridge（登录器角色）。
     ///
-    /// 开启后，BOT 在连接失败时会尝试启动 Miliastra-Wonderland-Chat；关闭则要求用户自己先运行它。
+    /// 开启后，BOT 在连接失败时会尝试启动 Miliastra-Wonderland-ChatBridge；关闭则要求用户自己先运行它。
     #[serde(default)]
     pub auto_start: bool,
-    /// Miliastra-Wonderland-Chat 可执行文件路径。留空则在 BOT 目录及其上一级查找 Miliastra-Wonderland-Chat.exe。
+    /// Miliastra-Wonderland-ChatBridge 可执行文件路径。
+    /// 留空则在 BOT 目录及其上一级的 deps/bin、Miliastra-Wonderland-ChatBridge 目录，
+    /// 以及带版本号的解压目录里查找 miliastra-wonderland-chatbridge.exe。
     #[serde(default)]
     pub executable: String,
     /// 本机游戏账号的 UID。
     ///
-    /// Miliastra-Wonderland-Chat 用它过滤自己发出的消息，必须与游戏里登录的账号一致；
+    /// Miliastra-Wonderland-ChatBridge 用它过滤自己发出的消息，必须与游戏里登录的账号一致；
     /// 填错会导致自己的发言被当成玩家命令。
     #[serde(default)]
     pub self_uid: u32,
@@ -99,7 +101,7 @@ impl ChatSourceConfig {
             bail!("chat_source.url 必须是 ws:// 或 wss:// 地址");
         }
         if self.token.trim().is_empty() {
-            // Miliastra-Wonderland-Chat 会用这个令牌校验请求头；留空的结果是"一直连不上 + 401"，
+            // Miliastra-Wonderland-ChatBridge 会用这个令牌校验请求头；留空的结果是"一直连不上 + 401"，
             // 那种失败很难从日志里看出来，所以在保存时就挡住。
             bail!("chat_source.token 在启用时不能为空（应与 http.access_token 相同）");
         }
@@ -108,7 +110,7 @@ impl ChatSourceConfig {
             // 发言当成玩家命令再执行一次，造成指令回环。
             bail!(
                 "chat_source.self_uid 在自动启动时必须填写本机账号 UID（不能为 0），\
-                 否则 Miliastra-Wonderland-Chat 会把 BOT 自己发的消息当成命令"
+                 否则 Miliastra-Wonderland-ChatBridge 会把 BOT 自己发的消息当成命令"
             );
         }
         if self.reconnect_ms == 0 {
@@ -119,7 +121,7 @@ impl ChatSourceConfig {
         }
         if self.auto_start && self.self_uid == 0 {
             bail!(
-                "chat_source.auto_start 开启时必须填写 self_uid（本机游戏账号 UID），否则 Miliastra-Wonderland-Chat 无法区分自己和玩家的消息"
+                "chat_source.auto_start 开启时必须填写 self_uid（本机游戏账号 UID），否则 Miliastra-Wonderland-ChatBridge 无法区分自己和玩家的消息"
             );
         }
         Ok(())
@@ -134,7 +136,7 @@ pub struct AppConfig {
     pub visual: visual::VisualConfig,
     #[serde(default)]
     pub command_access: crate::features::command_access::CommandAccessConfig,
-    /// 外部聊天源（Miliastra-Wonderland-Chat WS）；段可省略。
+    /// 外部聊天源（Miliastra-Wonderland-ChatBridge WS）；段可省略。
     #[serde(default)]
     pub chat_source: ChatSourceConfig,
     pub window: WindowConfig,

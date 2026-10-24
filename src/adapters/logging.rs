@@ -152,6 +152,22 @@ pub(crate) fn format_time(now: SystemTime) -> String {
     format_timestamp(now)
 }
 
+/// 文件名安全的紧凑时间戳：`YYYYmmdd-HHMMSS`（本地 +08:00）。
+///
+/// 日志用的 `MM-DD HH:MM:SS` 含空格与冒号，Windows 文件名不接受；
+/// 备份文件名还要年份才能区分不同年份的升级。
+pub(crate) fn format_timestamp_compact(now: SystemTime) -> String {
+    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = duration.as_secs() as i64 + 8 * 3600;
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = second_of_day / 3600;
+    let minute = second_of_day % 3600 / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
 fn format_timestamp(time: SystemTime) -> String {
     let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = duration.as_secs() as i64 + 8 * 3600;

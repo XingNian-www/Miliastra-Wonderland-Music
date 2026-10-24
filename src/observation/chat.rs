@@ -98,24 +98,134 @@ impl BubbleSequence {
     }
 }
 
+// ==== 来源抽象（阶段一） ====
+
+/// 消息来源。屏幕 OCR 与外部聊天源产生的消息走同一条业务账本，
+/// 但去重、锁锚点与身份可信度完全不同，因此必须能被区分。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SourceId {
+    /// 屏幕 OCR：靠气泡位置与视觉会话去重。
+    Ocr,
+    /// 外部聊天源（如 Miliastra-Wonderland-ChatBridge）：靠服务端序号去重。
+    External(Arc<str>),
+}
+
+impl SourceId {
+    pub const fn ocr() -> Self {
+        Self::Ocr
+    }
+
+    pub fn external(name: impl Into<Arc<str>>) -> Self {
+        Self::External(name.into())
+    }
+
+    pub const fn is_ocr(&self) -> bool {
+        matches!(self, Self::Ocr)
+    }
+
+    /// 日志与诊断用的短名。
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Ocr => "ocr",
+            Self::External(name) => name.as_ref(),
+        }
+    }
+}
+
+/// 一条消息属于哪个聊天容器（与「BOT 正看着哪块屏幕」无关）。
+///
+/// 外部聊天源直接给出 `channel`，OCR 只能从画面布局推断；
+/// 两者都归一到这个类型，业务侧不再关心来源。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ChatScope {
+    /// 大厅。外部源带 hallId；OCR 路径为 None（画面没有稳定 id）。
+    Hall { id: Option<u64> },
+    /// 私聊。`peer` 是对话对方的稳定标识（有 UID 用 UID，否则用昵称）。
+    Private { peer: Arc<str> },
+}
+
+impl ChatScope {
+    pub fn hall() -> Self {
+        Self::Hall { id: None }
+    }
+
+    pub fn hall_with_id(id: u64) -> Self {
+        Self::Hall { id: Some(id) }
+    }
+
+    pub fn private(peer: impl Into<Arc<str>>) -> Self {
+        Self::Private { peer: peer.into() }
+    }
+
+    pub const fn is_hall(&self) -> bool {
+        matches!(self, Self::Hall { .. })
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Hall { id: Some(id) } => format!("hall:{id}"),
+            Self::Hall { id: None } => "hall".to_string(),
+            Self::Private { peer } => format!("private:{peer}"),
+        }
+    }
+}
+
+/// 命令去重的锚点：OCR 靠屏幕位置，外部源靠单调序号。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockAnchor {
+    /// OCR：与已记录条目同一文本且 `y` 相差不多即视为同一条。
+    Screen { y: i32 },
+    /// 外部源：序号单调递增，小于等于已记录的即视为旧消息。
+    Sequence { after: u64 },
+}
+/// 一条被观察消息的稳定身份。
+///
+/// 三个字段都是"去重需要的最小信息"，但它们的含义随来源不同：
+///
+/// | 来源 | visual_session | bubble_sequence |
+/// | --- | --- | --- |
+/// | OCR | 视觉会话号（换屏/重进会递增） | 本帧内气泡的稳定序号 |
+/// | 外部源 | 来源 epoch（重连递增） | 服务端消息序号 |
+///
+/// 业务账本只把它当不透明键比较，不解释这些字段的物理含义；
+/// 需要来源语义的地方读 [`Self::source`]。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ObservedChatMessageId {
+    /// 消息来源。OCR 是屏幕，外部源是某个具体接入端。
+    pub source: SourceId,
     pub visual_session: VisualSessionId,
     pub chat: ChatIdentity,
     pub bubble_sequence: BubbleSequence,
 }
 
 impl ObservedChatMessageId {
+    /// OCR 路径：来源恒为屏幕。
     pub fn new(
         visual_session: VisualSessionId,
         chat: ChatIdentity,
         bubble_sequence: BubbleSequence,
     ) -> Self {
+        Self::from_source(SourceId::ocr(), visual_session, chat, bubble_sequence)
+    }
+
+    /// 显式指定来源。外部聊天源用这个，避免被误当成屏幕气泡。
+    pub fn from_source(
+        source: SourceId,
+        visual_session: VisualSessionId,
+        chat: ChatIdentity,
+        bubble_sequence: BubbleSequence,
+    ) -> Self {
         Self {
+            source,
             visual_session,
             chat,
             bubble_sequence,
         }
+    }
+
+    /// 是否来自屏幕 OCR。命令锁的位置语义只对这类消息成立。
+    pub fn is_from_screen(&self) -> bool {
+        self.source.is_ocr()
     }
 }
 

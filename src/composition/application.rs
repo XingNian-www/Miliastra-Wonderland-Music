@@ -1631,6 +1631,8 @@ impl ApplicationRuntime {
             std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
         > = {
             let business = business.clone();
+            // 外部源的默认二级切换已移到主导航循环，只在首次遇到一级界面时触发；
+            // 这个回调保留给需要直接请求切换的调用点。
             Some(std::sync::Arc::new(move |mode| {
                 if let Err(error) = business.request_chat_listener_mode(mode) {
                     log::debug!("外部聊天源切换值守模式失败（保持当前模式）: {error}");

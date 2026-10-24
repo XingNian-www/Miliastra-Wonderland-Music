@@ -145,26 +145,26 @@ impl Domain {
 }
 
 
-/// chat_source 段：外部聊天源（Miliastra-Wonderland-Chat WS）。
+/// chat_source 段：外部聊天源（Miliastra-Wonderland-ChatBridge WS）。
 fn chat_source_section() -> Vec<ConfigFieldSchema> {
     vec![
         ConfigFieldSchema::db_idle_reload(
             "enabled",
             "启用外部聊天源",
             FieldKind::Bool,
-            "启用后停止 OCR 的聊天内容识别，改由 Miliastra-Wonderland-Chat 的 WS 推送提供消息；界面识别（一级/二级/未聊天）仍由模板匹配完成。关闭则完全走 OCR",
+            "启用后停止 OCR 的聊天内容识别，改由 Miliastra-Wonderland-ChatBridge 的 WS 推送提供消息；界面识别（一级/二级/未聊天）仍由模板匹配完成。关闭则完全走 OCR",
         ),
         ConfigFieldSchema::db_idle_reload(
             "url",
             "WebSocket 地址",
             FieldKind::Text,
-            "Miliastra-Wonderland-Chat 的推送地址，默认 ws://127.0.0.1:18889/stream（端口 = http.port + 1）",
+            "Miliastra-Wonderland-ChatBridge 的推送地址，默认 ws://127.0.0.1:18889/stream（端口 = http.port + 1）",
         ),
         ConfigFieldSchema::db_idle_reload(
             "token",
             "访问令牌",
             FieldKind::Secret,
-            "Miliastra-Wonderland-Chat 的鉴权令牌，通常与 http.access_token 相同；留空则连接会被拒绝",
+            "Miliastra-Wonderland-ChatBridge 的鉴权令牌，通常与 http.access_token 相同；留空则连接会被拒绝",
         ),
         ConfigFieldSchema::db_idle_reload(
             "reconnect_ms",
@@ -176,25 +176,25 @@ fn chat_source_section() -> Vec<ConfigFieldSchema> {
             "lease_timeout_ms",
             "失联回落阈值",
             FieldKind::Int { min: 1_000, max: 600_000 },
-            "外部源多久没有消息就回落到 OCR，单位毫秒；防止 Miliastra-Wonderland-Chat 挂掉后聊天完全失聪",
+            "外部源多久没有消息就回落到 OCR，单位毫秒；防止 Miliastra-Wonderland-ChatBridge 挂掉后聊天完全失聪",
         ),
         ConfigFieldSchema::db_idle_reload(
             "auto_start",
-            "自动启动 Miliastra-Wonderland-Chat",
+            "自动启动 Miliastra-Wonderland-ChatBridge",
             FieldKind::Bool,
-            "开启后 BOT 发现 Miliastra-Wonderland-Chat 没在监听时替你拉起它；要求游戏未运行，因为 Miliastra-Wonderland-Chat 会自己拉起游戏并注入",
+            "开启后 BOT 发现 Miliastra-Wonderland-ChatBridge 没在监听时替你拉起它；要求游戏未运行，因为 Miliastra-Wonderland-ChatBridge 会自己拉起游戏并注入",
         ),
         ConfigFieldSchema::db_idle_reload(
             "executable",
-            "Miliastra-Wonderland-Chat 路径",
+            "Miliastra-Wonderland-ChatBridge 路径",
             FieldKind::Text,
-            "Miliastra-Wonderland-Chat.exe 的完整路径；留空则查找 BOT 目录及其上一级下的 Miliastra-Wonderland-Chat 子目录",
+            "miliastra-wonderland-chatbridge.exe 的完整路径；留空则依次查找 BOT 目录及其上一级的 deps/bin、Miliastra-Wonderland-ChatBridge 目录，以及解压出的带版本号发布目录",
         ),
         ConfigFieldSchema::db_idle_reload(
             "self_uid",
             "本机账号 UID",
             FieldKind::Int { min: 0, max: 4_294_967_295 },
-            "本机游戏账号的 UID。Miliastra-Wonderland-Chat 用它区分自己和玩家的消息，填错会把 BOT 自己的发言当成命令再执行一次。仅「自动启动」时由 BOT 传给对方；自行部署时请在你的启动命令里填 --self-uid，此处可留 0",
+            "本机游戏账号的 UID。Miliastra-Wonderland-ChatBridge 用它区分自己和玩家的消息，填错会把 BOT 自己的发言当成命令再执行一次。仅「自动启动」时由 BOT 传给对方；自行部署时请在你的启动命令里填 --self-uid，此处可留 0",
         ),
     ]
 }

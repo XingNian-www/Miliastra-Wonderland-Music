@@ -64,6 +64,21 @@ pub(crate) struct CommandEnvelope {
 /// 一条消息对应的游戏账号（定义在 kernel，观察层也要用）。
 pub(crate) use miliastra_kernel::chat_source::CommandAccount;
 
+/// 是否有足以承担命令身份的标识。
+///
+/// 身份来源按可信度排序：账号 UID 优先，昵称次之。有 UID 或 有非空昵称都算
+/// 满足；两者都没有就是 Unknown。Unknown 不授权任何命令——MUST_READ §2 的
+/// 「未确认发送者不能用于授权命令」是硬约束，不能为了「能跑」放宽。
+///
+/// 主动作用：外部聊天源的昵称可能为 null（API 文档 §5：异步到达、服务端不
+/// 补发），但 `from.uid` 必填。只按昵称判断会让这类消息整条丢失。
+pub(crate) fn has_known_identity(nickname: Option<&str>, account: Option<&CommandAccount>) -> bool {
+    if account.is_some_and(|account| !account.uid.trim().is_empty()) {
+        return true;
+    }
+    nickname.is_some_and(|nickname| !nickname.trim().is_empty())
+}
+
 impl CommandEnvelope {
     /// 附加账号信息（外部聊天 API 路径用）。
     pub(crate) fn with_account(mut self, account: Option<CommandAccount>) -> Self {
@@ -321,9 +336,7 @@ impl ModuleCommand {
                 Some(PrivatePayload::TarotQuestion)
             }
             Self::Undercover(
-                UndercoverCommand::Vote(_)
-                | UndercoverCommand::Abstain
-                | UndercoverCommand::Reveal,
+                UndercoverCommand::Vote(_) | UndercoverCommand::Abstain | UndercoverCommand::Reveal,
             ) => Some(PrivatePayload::UndercoverInput),
             // 开局/加入等不含私密输入（玩家自己的身份由游戏内展示）。
             Self::Undercover(_) => None,
@@ -462,5 +475,42 @@ impl ModuleCommand {
             Self::Invite(_) | Self::Moderation(_) | Self::CustomWorkflow(_) => true,
             Self::AiChat(_) => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(uid: &str) -> CommandAccount {
+        CommandAccount::new(miliastra_kernel::chat_source::GAME_GENSHIN, uid)
+    }
+
+    #[test]
+    fn account_uid_alone_counts_as_a_known_identity() {
+        // 外部聊天源的昵称是异步到达的（API 文档 §5），缺失时只剩 UID。
+        // 这时必须仍算「已知身份」，否则 @ 命令会被整条丢弃。
+        assert!(has_known_identity(None, Some(&account("127138439"))));
+    }
+
+    #[test]
+    fn nickname_alone_still_counts_as_a_known_identity() {
+        // OCR 路径没有账号，昵称就是唯一身份来源。
+        assert!(has_known_identity(Some("芦荟"), None));
+    }
+
+    #[test]
+    fn unknown_identity_is_not_authorized() {
+        // MUST_READ §2：未确认发送者不能用于授权命令。这里守住「不放宽」。
+        assert!(!has_known_identity(None, None));
+        assert!(!has_known_identity(Some("   "), None));
+        assert!(!has_known_identity(Some(""), Some(&account("  "))));
+    }
+
+    #[test]
+    fn account_takes_precedence_but_nickname_is_accepted_as_fallback() {
+        // 两者都缺失的账号结构不应被当成身份；有昵称时仍成立。
+        assert!(!has_known_identity(None, Some(&account(""))));
+        assert!(has_known_identity(Some("香菜"), Some(&account(""))));
     }
 }

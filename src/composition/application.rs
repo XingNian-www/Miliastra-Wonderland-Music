@@ -1259,7 +1259,7 @@ impl ChatDecisionReader {
             return true;
         }
         if self.from_screen {
-            snapshot.chat == self.chat
+            snapshot.chat.as_ref() == Some(&self.chat)
         } else {
             // 用 same_container 而非 ==：外部源带 hallId，窗口绑的是不带 id 的
             // 大厅容器，严格相等会让整窗收不到消息。

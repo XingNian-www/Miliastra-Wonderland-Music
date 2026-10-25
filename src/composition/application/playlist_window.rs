@@ -487,6 +487,7 @@ mod tests {
                 scope: snapshot.scope.clone(),
                 from_screen: true,
                 any_conversation: false,
+                settled_conversations: std::collections::HashSet::new(),
                 sequence_floor: None,
                 screen_lock: DecisionScreenLock::default(),
                 _observation_session: guard,

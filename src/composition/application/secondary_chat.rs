@@ -630,6 +630,7 @@ impl ApplicationRuntime {
                 scope: hall_scope,
                 from_screen: false,
                 any_conversation,
+                settled_conversations: std::collections::HashSet::new(),
                 baseline_at: Instant::now(),
                 sequence_floor: Some(floor),
                 baseline_cursor: None,
@@ -760,6 +761,7 @@ impl ApplicationRuntime {
             // 若这时还按 from_screen=false 读，屏幕上的旧决策气泡会被当成新决策。
             from_screen: baseline.source.is_ocr(),
             any_conversation: scope == ChatDecisionScope::MultipleConversations,
+            settled_conversations: std::collections::HashSet::new(),
             baseline_at: baseline.captured_at,
             // 外部源按单调序号判新旧：让基线成立的那条消息的 captured_at 就等于
             // baseline_at，用 `<=' 会把它自己排除，用户第一次 @1 永远进不来。

@@ -8,10 +8,14 @@ impl ChatDecisionReader {
     ) -> Result<Vec<(ChatMessage, crate::observation::chat::ObservedChatMessageId)>> {
         let mut messages = Vec::new();
         for snapshot in self.subscriber.read()? {
-            if snapshot.chat != self.chat || snapshot.captured_at <= self.baseline_at {
+            if !self.same_conversation(&snapshot) {
                 continue;
             }
+            let snapshot_at = snapshot.captured_at;
             for message in snapshot.messages {
+                if !self.is_after_baseline_at(snapshot_at, &message) {
+                    continue;
+                }
                 if self.baseline_cursor.is_some_and(|(session, sequence)| {
                     message.id.visual_session == session
                         && message.id.bubble_sequence.get() <= sequence
@@ -579,14 +583,61 @@ impl ApplicationRuntime {
                         || self.lifecycle.live_configs.has_pending_reload()
                 })?;
         let listener_mode = self.business.business.chat_listener_snapshot()?.mode;
-        let chat = if scope == ChatDecisionScope::CurrentHall
+        // 基线匹配按**来源**分流：
+        //
+        // - OCR 路径：窗口期的基线是「某块屏幕的快照」，只能按屏幕桶（chat）匹配。
+        //   一级区与二级区是同一大厅的两块面板，必须区分开。
+        // - 外部源路径：消息没有屏幕，外部大厅恒被映射成 SecondaryHall。
+        //   若仍按 chat 匹配，一级值守下窗口会一直等 PrimaryHall 而永远等不到，
+        //   表现就是「等待共享聊天确认基线超时」。改按业务范围（scope）匹配。
+        let external_active = self.lifecycle.external_chat.supplies_hall_messages();
+        let expected_chat = if scope == ChatDecisionScope::CurrentHall
             && self.active_ui_residency()? == UiResidency::SecondaryCurrentHall
         {
             crate::observation::chat::ChatIdentity::SecondaryHall
         } else {
             crate::observation::chat::ChatIdentity::PrimaryHall
         };
+        let chat = expected_chat;
+        // 先取水位再订阅：反过来的话，两步之间到达的消息会落在水位之内被当成历史。
+        let external_floor = external_active.then(|| self.lifecycle.external_chat.last_sequence());
         let subscriber = self.ui.chat_timeline.subscribe()?;
+        // 外部源在线时**不等快照**，直接用服务端序号水位建基线。
+        //
+        // 为什么：外部接管期间观察线程不发布任何帧（shared_observer 的两个布局分支
+        // 都直接 return），等待中的 refresh 只能靠「刚好有人说话」来完成。安静大厅里
+        // 打开决策窗口 → 20s 后必然报「等待共享聊天确认基线超时」。
+        // OCR 有 2000ms 兜底帧，所以它从不暴露这个问题——这正是两模式不一致的根源。
+        //
+        // 外部源是有序队列，「窗口前的历史」由序号就能确定，不需要也不该等屏幕帧。
+        if external_active {
+            let floor = external_floor.unwrap_or(0);
+            let hall_scope = crate::observation::chat::ChatScope::hall();
+            // 多会话窗口（邀请/自定义流程确认）既要收大厅也要收好友私聊，
+            // 这时不能绑单一容器——绑了会在投递层把私聊整批挡掉。
+            let any_conversation = scope == ChatDecisionScope::MultipleConversations;
+            if !any_conversation {
+                // 会话号对账本水位基线无意义：不按 session 过滤，只按序号。
+                subscriber.bind_scope(
+                    hall_scope.clone(),
+                    crate::observation::chat::VisualSessionId::new(0),
+                )?;
+            }
+            return Ok(ChatDecisionReader {
+                listener_mode,
+                subscriber,
+                chat,
+                scope: hall_scope,
+                from_screen: false,
+                any_conversation,
+                baseline_at: Instant::now(),
+                sequence_floor: Some(floor),
+                baseline_cursor: None,
+                seen: std::collections::HashSet::new(),
+                screen_lock: DecisionScreenLock::default(),
+                _observation_session: observation_session,
+            });
+        }
         let mut refresh = self.ui.chat_timeline.request_refresh()?;
         let baseline = loop {
             if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
@@ -623,37 +674,56 @@ impl ApplicationRuntime {
                 }
                 Err(error) => return Err(error),
             };
-            // 一级大厅下发消息必然经过一次二级面板：那是同一大厅的另一块面板，
-            // 属于预期内的瞬时状态，不得用它做基线游标，也不得重用已经完成的刷新 token。
-            if let Some(next) = self
-                .ui
-                .chat_timeline
-                .refresh_after_other_hall_panel(&chat, &snapshot)?
-            {
-                refresh = next;
-                continue;
-            }
-            if snapshot.chat != chat {
-                // A task may temporarily expose another chat for several seconds.
-                // Keep capturing until its bound chat returns or the outer deadline expires.
+            // 每轮重新判断来源：窗口打开期间外部源可能才刚连上（或刚好断线），
+            // 用入口处的一次快照会让后面这半段永远走错分支，一路空转到超时。
+            let external_now = self.lifecycle.external_chat.supplies_hall_messages();
+            let matched = if external_now {
+                // 外部源：只看业务范围。它的大厅消息恒被映射成 SecondaryHall，
+                // 按屏幕桶匹配会让一级值守下的窗口永远等不到基线。
+                snapshot.scope.is_hall()
+            } else {
+                // OCR：一级大厅下发消息必然经过一次二级面板，那是同一大厅的另一块
+                // 面板，属预期内的瞬时状态，不得用它做基线游标，也不得重用已完成的 token。
+                let other_panel = crate::observation::chat::other_hall_panel(&chat, &snapshot.chat);
+                !other_panel && snapshot.chat == chat
+            };
+            if !matched {
+                // 这块快照不是窗口要的：换一个新 token 继续等，不要消耗掉当前这份。
                 refresh = self.ui.chat_timeline.request_refresh()?;
                 continue;
             }
             break snapshot;
         };
-        if baseline.chat != chat {
+        if baseline.source.is_ocr() && baseline.chat != chat {
             return Err(anyhow!("共享聊天确认基线会话不匹配"));
         }
-        subscriber.bind_chat(chat.clone(), baseline.visual_session)?;
-        let baseline_cursor = Some((
-            baseline.visual_session,
-            baseline
-                .messages
-                .iter()
-                .map(|message| message.id.bubble_sequence.get())
-                .max()
-                .unwrap_or(0),
-        ));
+        if scope == ChatDecisionScope::MultipleConversations {
+            // 多会话窗口：不绑任何容器，投递层才会把大厅与私聊都送进来；
+            // 由调用方按消息类型（blue/pink）自行筛选。
+        } else if baseline.source.is_ocr() {
+            // 按**基线快照的来源**决定绑法，与 from_screen 保持同一判据。
+            // 用入口期的活标志会在「窗口打开后外部源才接管」时绑错：
+            // baseline 是外部快照、却绑了屏幕桶，投递层随后整批丢弃。
+            subscriber.bind_chat(chat.clone(), baseline.visual_session)?;
+        } else {
+            // 外部源按业务容器绑定：它的消息没有屏幕桶，绑 chat 会被投递层整批挡住。
+            subscriber.bind_scope(baseline.scope.clone(), baseline.visual_session)?;
+        }
+        // 外部源不用屏幕游标：它的 `bubble_sequence` 是去重哈希、不单调，
+        // 拿最大值当水位会把约一半新消息误判成旧消息。序号单调性由账本负责。
+        let baseline_cursor = if !baseline.source.is_ocr() {
+            None
+        } else {
+            Some((
+                baseline.visual_session,
+                baseline
+                    .messages
+                    .iter()
+                    .map(|message| message.id.bubble_sequence.get())
+                    .max()
+                    .unwrap_or(0),
+            ))
+        };
         let messages = baseline
             .messages
             .iter()
@@ -667,18 +737,42 @@ impl ApplicationRuntime {
             listener_mode,
             subscriber,
             chat,
+            // 业务容器直接取基线快照自带的值——它对两种来源都是权威的。
+            // 不要按 external_active 硬写成 hall：外部私聊窗口会因此匹配错容器。
+            scope: baseline.scope.clone(),
+            // 按**基线快照的来源**固化，不用调用瞬间的活标志：
+            // 窗口期间外部源可能掉线（租约超时）让 OCR 恢复发布，
+            // 若这时还按 from_screen=false 读，屏幕上的旧决策气泡会被当成新决策。
+            from_screen: baseline.source.is_ocr(),
+            any_conversation: scope == ChatDecisionScope::MultipleConversations,
             baseline_at: baseline.captured_at,
+            // 外部源按单调序号判新旧：让基线成立的那条消息的 captured_at 就等于
+            // baseline_at，用 `<=' 会把它自己排除，用户第一次 @1 永远进不来。
+            sequence_floor: if baseline.source.is_ocr() {
+                None
+            } else {
+                Some(
+                    baseline
+                        .messages
+                        .iter()
+                        .map(|message| message.source_sequence)
+                        .max()
+                        .unwrap_or(0),
+                )
+            },
             baseline_cursor,
             seen: baseline
                 .messages
                 .into_iter()
                 .map(|message| (message.id, message.text))
                 .collect(),
-            screen_lock: DecisionScreenLock::from_messages(
-                &messages,
-                accepts_message_type,
-                is_decision,
-            ),
+            // 外部源的 block 是哨兵坐标（全部相同），位置锁会把同文本决策
+            // 永久判成「已存在」，所以它对外部源恒为空实现。
+            screen_lock: if !baseline.source.is_ocr() {
+                DecisionScreenLock::default()
+            } else {
+                DecisionScreenLock::from_messages(&messages, accepts_message_type, is_decision)
+            },
             _observation_session: observation_session,
         })
     }

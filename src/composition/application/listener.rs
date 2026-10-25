@@ -182,7 +182,7 @@ fn hall_consumes_scope(
     mode: ChatListenerMode,
     scope: &ChatScope,
     source: &SourceId,
-    chat: &ChatIdentity,
+    chat: Option<&ChatIdentity>,
 ) -> bool {
     if !scope.is_hall() {
         // 私聊与大厅无关，不受值守模式约束。
@@ -199,12 +199,16 @@ fn hall_consumes_scope(
     }
     match chat {
         // OCR 的屏幕桶：按模式互斥，维持原有的同屏去重语义。
-        ChatIdentity::PrimaryHall => mode == ChatListenerMode::Primary,
-        ChatIdentity::SecondaryHall => mode == ChatListenerMode::Secondary,
-        ChatIdentity::Friend(_)
-        | ChatIdentity::PublicChannel
-        | ChatIdentity::StrangerMessages
-        | ChatIdentity::Unknown => true,
+        Some(ChatIdentity::PrimaryHall) => mode == ChatListenerMode::Primary,
+        Some(ChatIdentity::SecondaryHall) => mode == ChatListenerMode::Secondary,
+        // 外部消息没有屏幕桶（None），不受屏幕互斥约束。
+        Some(
+            ChatIdentity::Friend(_)
+            | ChatIdentity::PublicChannel
+            | ChatIdentity::StrangerMessages
+            | ChatIdentity::Unknown,
+        )
+        | None => true,
     }
 }
 
@@ -1460,7 +1464,7 @@ impl ApplicationRuntime {
                                 }
                                 // Recognition is supplied independently, even while this navigation loop is blocked.
                                 if self.ui.chat_timeline.latest()?.is_some_and(|snapshot| {
-                                    snapshot.chat == ChatIdentity::PrimaryHall
+                                    snapshot.chat.as_ref() == Some(&ChatIdentity::PrimaryHall)
                                 }) {
                                     listener_ready_evidence =
                                         Some(ListenerReadyEvidence::PrimaryScan);
@@ -1725,7 +1729,7 @@ impl ApplicationRuntime {
                 listener_mode,
                 &snapshot.scope,
                 &snapshot.source,
-                &snapshot.chat,
+                snapshot.chat.as_ref(),
             ) {
                 if snapshot
                     .messages
@@ -1752,12 +1756,11 @@ impl ApplicationRuntime {
             // Friend(peer)），所以这一步是**显式化**而非改变行为。写出来的价值在于
             // 让「外部源没有屏幕」这条约束不依赖上游实现细节；一旦哪天
             // identity_for_scope 改了映射，这里仍然按 scope 走对分支。
-            let screen_bucket = if snapshot.source.is_ocr() {
-                snapshot.chat.clone()
-            } else if snapshot.scope.is_hall() {
-                ChatIdentity::SecondaryHall
-            } else {
-                snapshot.chat.clone()
+            // 外部源的消息没有屏幕桶（chat=None）：按业务容器归到二级分派，
+            // 因为那套分支内部一律用 scope 判 is_hall 与 friend_name。
+            let screen_bucket = match snapshot.chat.clone() {
+                Some(bucket) => bucket,
+                None => ChatIdentity::SecondaryHall,
             };
             match screen_bucket {
                 ChatIdentity::PrimaryHall => {
@@ -3328,13 +3331,13 @@ mod tests {
             ChatListenerMode::Primary,
             &ChatScope::hall(),
             &ocr,
-            &ChatIdentity::PrimaryHall
+            Some(&ChatIdentity::PrimaryHall)
         ));
         assert!(!hall_consumes_scope(
             ChatListenerMode::Primary,
             &ChatScope::hall(),
             &ocr,
-            &ChatIdentity::SecondaryHall
+            Some(&ChatIdentity::SecondaryHall)
         ));
         // 外部源借用的 SecondaryHall 桶没有屏幕语义：一级值守也必须消费，
         // 否则用户切到一级后外部大厅命令会被整批丢弃。
@@ -3342,14 +3345,14 @@ mod tests {
             ChatListenerMode::Primary,
             &ChatScope::hall_with_id(7),
             &SourceId::external("chatbridge"),
-            &ChatIdentity::SecondaryHall
+            Some(&ChatIdentity::SecondaryHall)
         ));
         // 私聊与值守模式无关。
         assert!(hall_consumes_scope(
             ChatListenerMode::Primary,
             &ChatScope::private("Alice"),
             &ocr,
-            &ChatIdentity::Friend("Alice".into())
+            Some(&ChatIdentity::Friend("Alice".into()))
         ));
     }
 
@@ -3362,13 +3365,13 @@ mod tests {
             ChatListenerMode::Secondary,
             &ChatScope::hall(),
             &ocr,
-            &ChatIdentity::SecondaryHall
+            Some(&ChatIdentity::SecondaryHall)
         ));
         assert!(!hall_consumes_scope(
             ChatListenerMode::Secondary,
             &ChatScope::hall(),
             &ocr,
-            &ChatIdentity::PrimaryHall
+            Some(&ChatIdentity::PrimaryHall)
         ));
     }
 
@@ -3387,7 +3390,7 @@ mod tests {
                         mode,
                         &ChatScope::from_identity(&chat),
                         &SourceId::ocr(),
-                        &chat,
+                        Some(&chat),
                     ),
                     "{} 不应改变 {chat:?} 的消费语义",
                     mode.label()

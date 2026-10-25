@@ -244,7 +244,7 @@ fn process_unread(
                 "fresh shared friend chat OCR did not arrive before timeout",
             ));
         };
-        let ChatIdentity::Friend(friend_name) = &snapshot.chat else {
+        let Some(ChatIdentity::Friend(friend_name)) = snapshot.chat.as_ref() else {
             unreachable!("wait_shared_friend_snapshot only returns confirmed friend chats");
         };
         if request.discard_only {
@@ -403,7 +403,7 @@ fn wait_promoted_unread_consumed(
 
 fn fresh_friend_snapshot(snapshot: &ChatTimelineSnapshot, opened_at: Instant) -> bool {
     snapshot.captured_at >= opened_at
-        && matches!(&snapshot.chat, ChatIdentity::Friend(name) if !name.trim().is_empty())
+        && matches!(snapshot.chat.as_ref(), Some(ChatIdentity::Friend(name)) if !name.trim().is_empty())
 }
 
 fn reacquire_unread_hit(
@@ -669,7 +669,7 @@ mod tests {
             captured_at: opened_at - Duration::from_millis(1),
             scope: crate::observation::chat::ChatScope::private(Arc::from("Alice")),
             source: crate::observation::chat::SourceId::ocr(),
-            chat: ChatIdentity::Friend(Arc::from("Alice")),
+            chat: Some(ChatIdentity::Friend(Arc::from("Alice"))),
             messages: Vec::new(),
         };
         assert!(!fresh_friend_snapshot(&snapshot, opened_at));
@@ -680,7 +680,7 @@ mod tests {
             ChatIdentity::SecondaryHall,
             ChatIdentity::Friend(Arc::from("  ")),
         ] {
-            snapshot.chat = chat;
+            snapshot.chat = Some(chat);
             assert!(!fresh_friend_snapshot(&snapshot, opened_at));
         }
     }

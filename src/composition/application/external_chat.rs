@@ -85,6 +85,20 @@ impl ExternalChatState {
         self.inner.last_sequence.load(Ordering::Acquire)
     }
 
+    /// 一次性取「是否在线 + 当前水位」。
+    ///
+    /// 分开调 `supplies_hall_messages()` 和 `last_sequence()` 是两次独立原子读，
+    /// 中间可能恰好发生接管/退出，于是得到「在线」配「旧水位」这种不存在的组合。
+    /// 投票窗口用它建基线，需要一致的快照。
+    ///
+    /// 返回 None 表示当前不由外部源供数，调用方应走 OCR 基线。
+    pub(crate) fn hall_watermark(&self) -> Option<u64> {
+        // 先读水位再读 active：若期间刚好退出，我们会读到 active=false 而返回 None，
+        // 宁可退回 OCR 基线，也不要拿一个可能已经过期的水位去挡票。
+        let sequence = self.inner.last_sequence.load(Ordering::Acquire);
+        self.is_active().then_some(sequence)
+    }
+
     fn set_active(&self, active: bool) {
         if self.inner.active.swap(active, Ordering::AcqRel) != active {
             log::info!(

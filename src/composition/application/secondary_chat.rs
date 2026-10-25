@@ -369,7 +369,7 @@ impl ApplicationRuntime {
         // 混用会让外部源的大厅消息被当成"屏幕确认二级"，从而跳过 UI 恢复。
         let shared_snapshot = self.ui.chat_timeline.latest()?;
         let ocr_confirms_secondary = shared_snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot.chat == crate::observation::chat::ChatIdentity::SecondaryHall
+            snapshot.chat.as_ref() == Some(&crate::observation::chat::ChatIdentity::SecondaryHall)
         });
         // 外部源在线就说明它随时可能交付大厅消息；身份按"大厅"对待，
         // 否则二级轮次既不敢派发也会反复排队恢复大厅。
@@ -697,10 +697,10 @@ impl ApplicationRuntime {
                 // 按屏幕桶匹配会让一级值守下的窗口永远等不到基线。
                 snapshot.scope.is_hall()
             } else {
-                // OCR：一级大厅下发消息必然经过一次二级面板，那是同一大厅的另一块
-                // 面板，属预期内的瞬时状态，不得用它做基线游标，也不得重用已完成的 token。
-                let other_panel = crate::observation::chat::other_hall_panel(&chat, &snapshot.chat);
-                !other_panel && snapshot.chat == chat
+                // OCR：只认绑定的那一块聊天。另一块大厅面板的快照会被这里拒绝，
+                // 换新 token 继续等——那是同一大厅的另一块面板，属预期内的瞬时状态，
+                // 不得用它做基线游标，也不得重用已完成的 token。
+                snapshot.chat.as_ref() == Some(&chat)
             };
             if !matched {
                 // 这块快照不是窗口要的：换一个新 token 继续等，不要消耗掉当前这份。
@@ -709,7 +709,7 @@ impl ApplicationRuntime {
             }
             break snapshot;
         };
-        if baseline.source.is_ocr() && baseline.chat != chat {
+        if baseline.source.is_ocr() && baseline.chat.as_ref() != Some(&chat) {
             return Err(anyhow!("共享聊天确认基线会话不匹配"));
         }
         if scope == ChatDecisionScope::MultipleConversations {

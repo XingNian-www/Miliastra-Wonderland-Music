@@ -372,7 +372,8 @@ fn moderation_requester_role(
     if parsed.permission_required.is_some() {
         return None;
     }
-    identity.role_of(&parsed.username)
+    // 有账号时按 UID 解析：外部源的昵称是随机 OCR 匹配键，只按昵称查不到绑定。
+    identity.role_of_sender(&parsed.username, parsed.account.as_ref())
 }
 
 fn prepare_direct_blacklist(
@@ -598,10 +599,10 @@ mod tests {
             }
             publisher
                 .publish_no_chat(
-                Instant::now(),
-                "transient view gap",
-                crate::observation::chat::ViewAbsence::Transient,
-            )
+                    Instant::now(),
+                    "transient view gap",
+                    crate::observation::chat::ViewAbsence::Transient,
+                )
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
             while publisher.pending_refresh().unwrap().is_none() {
@@ -941,10 +942,10 @@ mod tests {
             wait_for_vote_refresh(&shared);
             shared
                 .publish_no_chat(
-                Instant::now(),
-                "same failure text",
-                crate::observation::chat::ViewAbsence::Transient,
-            )
+                    Instant::now(),
+                    "same failure text",
+                    crate::observation::chat::ViewAbsence::Transient,
+                )
                 .unwrap();
             wait_for_vote_refresh(&shared);
             if transition {
@@ -1020,10 +1021,10 @@ mod tests {
             if shared.pending_refresh().unwrap().is_some() {
                 shared
                     .publish_no_chat(
-                Instant::now(),
-                "chat remains hidden",
-                crate::observation::chat::ViewAbsence::Transient,
-            )
+                        Instant::now(),
+                        "chat remains hidden",
+                        crate::observation::chat::ViewAbsence::Transient,
+                    )
                     .unwrap();
                 gaps += 1;
             } else {

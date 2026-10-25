@@ -231,9 +231,9 @@ impl IdiomChainDeferredPort for DeferredIdiomChainPort {
                 return Ok(IdiomDeliveryOutcome::Added);
             }
         }
-        let command_override = stored
-            .as_ref()
-            .and_then(|stored| crate::features::reply_template::stored_override(stored, template.spec.key));
+        let command_override = stored.as_ref().and_then(|stored| {
+            crate::features::reply_template::stored_override(stored, template.spec.key)
+        });
         // 覆盖只来自命令面板保存的行；配置中心不再提供回复文案入口。
         let rendered = crate::features::reply_template::render(
             template.spec,
@@ -1185,6 +1185,7 @@ mod tests {
             user_command: "#状态".to_string(),
             message_type: "blue".to_string(),
             username: "测试玩家".to_string(),
+            account: None,
             authority: CommandAuthority::HallMember,
             role: None,
             permission_required: None,

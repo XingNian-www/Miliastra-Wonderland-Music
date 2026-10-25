@@ -357,13 +357,19 @@ impl ApplicationRuntime {
         //
         // 以前把两者混成"external_active 就认定 CurrentHall"，语义上能跑但把
         // 「看哪块屏幕」和「消息属于哪个容器」绑死了——正是这次要拆开的耦合。
+        // 判「屏幕确认二级界面」只看 chat：这是纯粹的**屏幕分桶**问题
+        // （二级面板几何判定出来的桶），与消息属于哪个容器无关。
+        //
+        // 这里刻意保留 chat 而非 scope：scope 是业务范围（大厅/私聊），
+        // 它回答不了「BOT 现在看的是不是二级界面」。两者职责不同，
+        // 混用会让外部源的大厅消息被当成"屏幕确认二级"，从而跳过 UI 恢复。
         let shared_snapshot = self.ui.chat_timeline.latest()?;
         let ocr_confirms_secondary = shared_snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.chat == crate::observation::chat::ChatIdentity::SecondaryHall
         });
         // 外部源在线就说明它随时可能交付大厅消息；身份按"大厅"对待，
         // 否则二级轮次既不敢派发也会反复排队恢复大厅。
-        let external_supplies_hall = self.lifecycle.external_chat.is_active();
+        let external_supplies_hall = self.lifecycle.external_chat.supplies_hall_messages();
         let (observed_identity, scanned) = if ocr_confirms_secondary || external_supplies_hall {
             (SecondaryChatIdentity::CurrentHall, true)
         } else {
@@ -857,7 +863,9 @@ impl ApplicationRuntime {
                 captured_at: Some(frame.captured_at()),
                 message_id: Some(message_id.clone()),
                 message_text: Some(text.clone()),
-                message_y: None,
+                // 二级观察当前不写命令锁（锁由调用方在认领时用 claim_business_at
+                // 携带锚点完成），这里不需要位置信息。
+                lock_anchor: None,
             };
             let shortcut_player = if message_type == "pink" {
                 friend_name.trim().to_string()
@@ -895,23 +903,16 @@ impl ApplicationRuntime {
                     continue;
                 }
             }
-            if let Some(envelope) = command::parse_structured_song_envelope(
-                &text,
-                &shortcut_player,
-                &message_type,
-                command_observation.clone(),
-            )
-            .map(|envelope| envelope.with_account(account.clone()))
-                && let Some(parsed) =
-                    router.route(&envelope, self.business.business.active_entertainment()?)
-            {
-                outcome.processed = true;
-                outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
-                continue;
-            }
-            // 行首就是命令前缀（@ 或 #）时走正规路径，不要退回下面的「找 @」兜底。
-            // 旧实现只认 Hash，把 @ 排到兜底分支；兜底位于身份检查之后，
-            // 外部源昵称缺失时整条 @ 命令就被吞掉了。Amp 是测试专用前缀，仍然排除。
+            // 顺序必须与一级一致：**显式 @/# 前缀优先，失败才回落结构化点歌**。
+            //
+            // 反过来（先结构化）会让 `@通告 歌曲名：X，歌手名：Y` 这类消息在二级被
+            // 劫持成 `@点歌 X Y`，而一级仍按「通告」执行——同一文本两条路径派发不同模块。
+            // 根因是 parse_structured_song_text 用 find 找标签、不要求标签在行首，
+            // 所以任何以 @/# 开头、正文里又带歌曲名的消息都会命中。
+            //
+            // 行首就是命令前缀时走正规路径，不要退回下面的「找 @」兜底：
+            // 兜底位于身份检查之后，外部源昵称缺失时整条 @ 命令会被吞掉。
+            // Amp 是测试专用前缀，仍然排除。
             if let Some(envelope) = CommandEnvelope::new(
                 &text,
                 &shortcut_player,
@@ -921,6 +922,20 @@ impl ApplicationRuntime {
             )
             .map(|envelope| envelope.with_account(account.clone()))
                 && envelope.prefix() != CommandPrefix::Amp
+                && let Some(parsed) =
+                    router.route(&envelope, self.business.business.active_entertainment()?)
+            {
+                outcome.processed = true;
+                outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
+                continue;
+            }
+            if let Some(envelope) = command::parse_structured_song_envelope(
+                &text,
+                &shortcut_player,
+                &message_type,
+                command_observation.clone(),
+            )
+            .map(|envelope| envelope.with_account(account.clone()))
                 && let Some(parsed) =
                     router.route(&envelope, self.business.business.active_entertainment()?)
             {

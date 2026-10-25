@@ -529,4 +529,3 @@ pub(super) fn config_visual_import_route(
 ) -> std::result::Result<String, AppError> {
     visual_request(body, state, true)
 }
-

@@ -624,10 +624,7 @@ impl ConfigStore {
         let current_sections = self.read_all_sections()?;
         self.build_config(&current_sections)?;
         let mut merged = merge_sections(&current_sections, sections);
-        let immutable_errors = immutable_bootstrap_field_conflicts(&current_sections, &merged);
-        if !immutable_errors.is_empty() {
-            return Ok(immutable_errors);
-        }
+
         // 与 save 同一路径：先应用清除标记，再保留其余 secret（保证预检结果
         // 与最终保存一致，清除标记不会被误判为非法类型）。
         let mut forced_cleared = BTreeSet::new();
@@ -663,15 +660,6 @@ impl ConfigStore {
         self.build_config(&current_sections)?;
         let normalized_current = merge_sections(&current_sections, &Map::new());
         let mut merged = merge_sections(&current_sections, &sections);
-        let immutable_errors = immutable_bootstrap_field_conflicts(&current_sections, &merged);
-        if !immutable_errors.is_empty() {
-            return Err(ConfigSaveError::Other(
-                ConfigFieldErrors {
-                    errors: immutable_errors,
-                }
-                .into(),
-            ));
-        }
         let mut forced_cleared = BTreeSet::new();
         apply_secret_clear_markers(&mut merged, &mut forced_cleared);
         retain_secret_fields(&mut merged, &current_sections, &forced_cleared);
@@ -1637,43 +1625,23 @@ fn field_errors_from_anyhow(error: &anyhow::Error) -> ConfigFieldErrors {
     }
 }
 
-/// 引导段字段：由 config.yaml 启动引导固化，Web 配置中心不能修改。
-/// 防止经 HTTP 篡改 login_helper_exe 等路径后自动拉起任意可执行文件。
-const IMMUTABLE_BOOTSTRAP_FIELDS: &[(&str, &str)] = &[
-    ("playback", "loginHelperExecutable"),
-    ("startup", "exePath"),
-    ("startup", "gameArgs"),
-];
-
-/// 对比当前已存储的值：候选合并结果中受保护字段与当前一致（Web 表单整段
-/// 回传原值）时放行，被改动时拒绝并给出字段错误。
-fn immutable_bootstrap_field_conflicts(
-    current: &Map<String, Value>,
-    merged: &Map<String, Value>,
-) -> Vec<ConfigFieldError> {
-    let mut errors = Vec::new();
-    for (section, field) in IMMUTABLE_BOOTSTRAP_FIELDS {
-        let merged_value = merged
-            .get(*section)
-            .and_then(Value::as_object)
-            .and_then(|object| object.get(*field));
-        let current_value = current
-            .get(*section)
-            .and_then(Value::as_object)
-            .and_then(|object| object.get(*field));
-        if current_value != merged_value {
-            errors.push(ConfigFieldError {
-                section: (*section).to_string(),
-                field: format!("{section}.{field}"),
-                message: format!(
-                    "{}.{} 由 config.yaml 启动固化，Web 面板不可修改；请直接编辑 config.yaml 后重启",
-                    section, field
-                ),
-            });
-        }
-    }
-    errors
-}
+/// 历史遗留：曾试图把 `login_helper_executable` / `exe_path` / `game_args`
+/// 当作「由 config.yaml 固化的引导段字段」锁死在面板之外。这段守卫有两层问题，
+/// 已整体移除：
+///
+/// 1. **它从未生效。** 键名写成驼峰（`loginHelperExecutable`），而落库形态是
+///    蛇形（`login_helper_executable`），两侧 `get` 都返回 `None`、恒等成立，
+///    永远不报错。
+/// 2. **即使改对键名，前提也不成立。** 这三个字段不在 `BootstrapConfig` 里——
+///    config.yaml 只允许 `database_path` / `http` / `logging` 三个引导段
+///    （见 `BootstrapConfig::load` 的 deny_unknown_fields），它们本就是
+///    面板可编辑的 `db_idle_reload` 配置项。修好键名只会让正常的 Web 保存
+///    被拒，并不能提供任何真实保护。
+///
+/// 真正的风险点是：`login_helper_executable` 会被 `LoginHelperManager` 直接
+/// `Command::new` 拉起，`exe_path` 决定启动哪个程序。既然面板允许编辑它们，
+/// 防护就不该放在「禁止修改」上——如果以后要收紧，应该走可执行文件签名/
+/// 白名单校验，而不是复活这段无效守卫。
 
 #[cfg(test)]
 mod tests {

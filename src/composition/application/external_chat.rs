@@ -58,8 +58,27 @@ struct ExternalChatInner {
 
 impl ExternalChatState {
     /// 观察线程用它决定是否跳过 OCR 聊天识别。
+    /// 外部源此刻是否在接管。**这是唯一的来源仲裁查询**。
+    ///
+    /// 用途分三类，调用点不要各自发明判断：
+    ///
+    /// 1. **跳过 OCR**（`shared_observer`）：接管期间内容由 socket 提供，
+    ///    再 OCR 会重复派发同一条消息 → 用 [`Self::should_skip_ocr`]。
+    /// 2. **消息范围**（消费门控）：由 `ChatTimelineSnapshot::scope` 决定，
+    ///    不看这里——来源已随消息一起传递。
+    /// 3. **UI 驻留决策**（`maybe_switch_to_secondary`）：接管时才有"默认切二级"
+    ///    这件事 → 用 [`Self::supplies_hall_messages`]。
     pub(crate) fn is_active(&self) -> bool {
         self.inner.active.load(Ordering::Acquire)
+    }
+
+    /// 外部源是否正在为大厅提供消息。
+    ///
+    /// 与 [`Self::is_active`] 同义，但语义更窄、更贴近调用点意图：
+    /// 它回答"大厅内容是否来自 socket"，而不是"外部线程是否活着"。
+    /// UI 驻留决策应该问这个，而不是直接读 `is_active`。
+    pub(crate) fn supplies_hall_messages(&self) -> bool {
+        self.is_active()
     }
 
     pub(crate) fn last_sequence(&self) -> u64 {

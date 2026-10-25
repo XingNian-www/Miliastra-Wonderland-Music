@@ -381,7 +381,7 @@ pub(crate) fn keyword_trigger(
 
 /// 去掉发送者与正文之间的前导分隔符。
 ///
-/// 与 crate::interfaces::chat::parse_command_envelope 的 trim 保持一致：同一行 OCR
+/// 与命令信封解析的 trim 保持一致：同一行 OCR
 /// 文本，命令路径和闲聊路径必须看到同一段正文，否则同一条消息会时而能当命令、
 /// 时而不能当提问。纯函数，便于直接做回归测试。
 pub(crate) fn strip_sender_separators(text: &str) -> &str {

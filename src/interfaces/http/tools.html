@@ -670,9 +670,10 @@ async function readOnlyConnectEvents(){
     try{const value=await readOnlyRequest('/debug/read-only/summary');if(generation!==readOnlyGeneration||!readOnlyMode.enabled||readOnlyMode.state!=='push')return;readOnlyAcceptInstance(value.summary&&value.summary.instance)}
     catch(error){readOnlyError('读取推送实例失败',error);return}
   }
-  // Cookie authentication only. Pin server identity even on native reconnect.
-  // Last-Event-ID remains the producer cursor; instance change triggers a reset gap.
-  const source=new EventSource('/debug/read-only/events'+params({instance:readOnlyInstance}),{withCredentials:true})
+  // EventSource 不能设自定义请求头，服务端也没有 Cookie 鉴权，令牌只能走查询参数。
+  // 缺了它这条推送必然 401，而 EventSource 会无限自动重连。
+  // Last-Event-ID 仍是 producer 游标；instance 变化触发 reset gap。
+  const source=new EventSource('/debug/read-only/events'+params({instance:readOnlyInstance,token:readTokenCookie()}));
   readOnlyEventSource=source;readOnlyLastEventId=0
   for(const type of ['readonly.triggered','readonly.task.updated'])source.addEventListener(type,event=>{if(readOnlyEventSource===source)readOnlyHandleEvent(event,generation)})
   source.addEventListener('readonly.gap',event=>{

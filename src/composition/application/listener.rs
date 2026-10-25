@@ -2,7 +2,7 @@ use super::secondary_chat::{
     SecondaryHallCommandTracker, SecondaryListenerRoundState, SecondaryObservationOutcome,
 };
 use super::*;
-use crate::observation::chat::ChatIdentity;
+use crate::observation::chat::{ChatIdentity, ChatScope, SourceId};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -15,8 +15,40 @@ const CONFIG_RELOAD_UI_FALLBACK_GRACE: Duration = Duration::from_secs(15);
 const FRAME_WAIT_SLICE: Duration = Duration::from_millis(25);
 
 /// 排查日志用：折叠空白并截断，避免日志里塞入超长文本。
+/// 命令锁锚点：OCR 消息用屏幕 y，外部消息用服务端序号。
+///
+/// 外部消息的 `block` 是哨兵坐标，拿它当屏幕锚点会让「同文本即同一条」
+/// 对所有已记录命令成立，从而整批吞掉真实命令。
+///
+/// **只接受屏幕来源的 id。** 外部消息的原始服务端序号不存在于 id 里
+/// （`id.bubble_sequence` 是去重键的 FNV 哈希，不单调，不能当锚点），
+/// 所以外部消息必须自己带着 `source_sequence` 走到
+/// `ChatTimelineMessage::lock_anchor()`，不能经这里推算。
+fn lock_anchor_for(
+    id: &crate::observation::chat::ObservedChatMessageId,
+    screen_y: i32,
+) -> crate::observation::chat::LockAnchor {
+    use crate::observation::chat::LockAnchor;
+    debug_assert!(
+        id.is_from_screen(),
+        "lock_anchor_for 只适用于屏幕消息；外部消息请用 ChatTimelineMessage::lock_anchor()"
+    );
+    LockAnchor::Screen { y: screen_y }
+}
+
+/// 日志里的聊天正文：先脱敏，再折叠空白与截断。
+///
+/// 脱敏必须在截断**之前**：歌单导入命令的分享链接可能很长，先截断会把
+/// `@导入网易歌单` 前缀留住、把链接截掉一半，但脱敏判定是按整串匹配的，
+/// 截断后可能不再命中，反而泄漏了链接片段。
+///
+/// 二级/歌单窗口路径一直用 `privacy::redacted_chat_text`；一级路径原先只折叠
+/// 不脱敏，导致同一句 `@导入QQ歌单<链接>` 在一级会把完整链接写进日志文件。
 fn compact_for_log(text: &str) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = crate::privacy::redacted_chat_text(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if compact.chars().count() > 120 {
         let mut truncated: String = compact.chars().take(120).collect();
         truncated.push('…');
@@ -130,15 +162,43 @@ fn listener_ready_after_recheck(
 
 /// 大厅归属闸门：一级值守只消费主大厅，二级值守只消费二级大厅。
 ///
-/// 二级大厅与主观察可能是同一个大厅。共享观察里所有跨帧去重结构
-/// （`command_locks`、气泡键 `visual_session|chat|bubble_sequence`、业务认领
-/// `ObservedChatMessageId`）都按 `ChatIdentity` 分桶，两个身份互不相识，
-/// 所以同一条大厅消息会被两个身份各派发一次。互斥只能成立在消费处：
-/// 这里不合并身份，也不改动任何去重结构。
+/// 消费门控：这条消息该不该由当前值守模式处理。
 ///
-/// 好友会话与未知/公共/陌生人聊天不是大厅，不参与这道闸门。
-fn hall_consumes_identity(mode: ChatListenerMode, chat: &ChatIdentity) -> bool {
+/// **只看消息范围（`ChatScope`），不看屏幕分桶键（`ChatIdentity`）。**
+///
+/// 这道闸门存在的理由：一级区与二级区可能是同一个大厅，共享观察里的跨帧去重
+/// 结构（`command_locks`、气泡键、业务认领）都按 `ChatIdentity` 分桶，
+/// 两个桶互不相识，同一条大厅消息会被各派发一次。互斥成立在消费处。
+///
+/// 但「同屏去重」与「消息属于哪个容器」是两件事：
+///
+/// - OCR 的一级区/二级区确实是**两个屏幕桶**，需要按模式互斥；
+/// - 外部聊天源没有屏幕，它的大厅消息借 `SecondaryHall` 桶只是为了共用去重结构，
+///   并不代表「BOT 正看着二级界面」。
+///
+/// 旧实现按 `chat` 判断，导致用户把值守切到一级后，外部源的大厅命令被整批丢弃
+/// （日志：`值守模式=一级值守 不消费 SecondaryHall 观察`）。
+fn hall_consumes_scope(
+    mode: ChatListenerMode,
+    scope: &ChatScope,
+    source: &SourceId,
+    chat: &ChatIdentity,
+) -> bool {
+    if !scope.is_hall() {
+        // 私聊与大厅无关，不受值守模式约束。
+        return true;
+    }
+    // 屏幕互斥只对屏幕来源成立。
+    //
+    // 外部源没有屏幕，它的大厅消息借 SecondaryHall 桶只是为了共用去重结构，
+    // 不代表「BOT 正看着二级界面」。把它也纳入按模式互斥，会让用户切到一级后
+    // 外部命令被整批丢弃。同一条外部消息只会经由一个来源到达，不存在
+    // 「一级区与二级区各派发一次」的问题，所以放行是安全的。
+    if !source.is_ocr() {
+        return true;
+    }
     match chat {
+        // OCR 的屏幕桶：按模式互斥，维持原有的同屏去重语义。
         ChatIdentity::PrimaryHall => mode == ChatListenerMode::Primary,
         ChatIdentity::SecondaryHall => mode == ChatListenerMode::Secondary,
         ChatIdentity::Friend(_)
@@ -492,22 +552,23 @@ fn acknowledge_primary_command(
         return Ok(());
     };
     let acknowledged = if write_lock {
-        // 用被派发消息自身捕获的文本与 y，绝不回头查当前 tracker。
+        // 用被派发消息自身捕获的文本与锚点，绝不回头查当前 tracker。
         match (
             command
                 .observation
                 .message_text
                 .as_deref()
                 .filter(|text| !text.trim().is_empty()),
-            command.observation.message_y,
+            command.observation.lock_anchor,
         ) {
-            (Some(text), Some(y)) => chat_timeline.acknowledge_command(message_id, text, y)?,
-            (text, y) => {
+            (Some(text), Some(anchor)) => {
+                chat_timeline.acknowledge_command_at(message_id, text, anchor)?
+            }
+            (text, anchor) => {
                 log::warn!(
-                    "命令锁未写入：观察缺少可信文本或屏幕 y（chat={:?}, text={:?}, y={:?}, id={message_id:?}），本轮只确认不写锁",
+                    "命令锁未写入：观察缺少可信文本或锚点（chat={:?}, text={:?}, anchor={anchor:?}, id={message_id:?}），本轮只确认不写锁",
                     message_id.chat,
                     text.map(redacted_chat_text),
-                    y,
                 );
                 chat_timeline.acknowledge_business(message_id)?
             }
@@ -1599,6 +1660,23 @@ impl ApplicationRuntime {
         subscriber: &crate::observation::chat::ChatTimelineSubscriber,
         backlog: &mut std::collections::VecDeque<crate::observation::chat::ChatTimelineSnapshot>,
     ) -> Result<()> {
+        // 暂停值守：**必须照常取走快照并丢弃**，不能直接跳过读取。
+        //
+        // 发布侧不看暂停标志（观察线程仍在按 loop_idle_ms 推帧），所以只要不取，
+        // 订阅者队列就会一路涨到 4096 上限。撞上限时发布侧会把订阅者标成失败并清空
+        // 队列，下一次 read 直接报错——错误沿消费循环→扫描循环→主循环冒到 main，
+        // 看门狗于是重启整个进程。表现就是「暂停两三个小时后程序自己退出」。
+        //
+        // 取走并丢弃等于「暂停期间的消息确实不处理」，符合暂停语义；恢复后
+        // 靠 OCR 冷基线重建观察状态。积压一并清掉，避免恢复瞬间暴发式补跑历史命令。
+        if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+            let discarded = subscriber.read()?.len().saturating_add(backlog.len());
+            backlog.clear();
+            if discarded > 0 {
+                log::debug!("值守已暂停，丢弃 {discarded} 帧共享聊天观察，恢复后按冷基线重建");
+            }
+            return Ok(());
+        }
         let snapshots = subscriber.read()?;
         if backlog.len().saturating_add(snapshots.len()) > 4096 {
             return Err(anyhow!(
@@ -1606,9 +1684,6 @@ impl ApplicationRuntime {
             ));
         }
         backlog.extend(snapshots);
-        if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
-            return Ok(());
-        }
         if backlog.is_empty() {
             return Ok(());
         }
@@ -1646,7 +1721,12 @@ impl ApplicationRuntime {
             // 二级大厅与主观察可能是同一个大厅，跨身份去重互不相识，因此按模式互斥消费：
             // 一级值守不消费二级大厅观察，二级值守不消费主大厅观察。
             // 这里只拦命令消费（不认领、不派发）；共享观察的发布、帧缓存与只读事件保持原样。
-            if !hall_consumes_identity(listener_mode, &snapshot.chat) {
+            if !hall_consumes_scope(
+                listener_mode,
+                &snapshot.scope,
+                &snapshot.source,
+                &snapshot.chat,
+            ) {
                 if snapshot
                     .messages
                     .iter()
@@ -1820,9 +1900,23 @@ impl ApplicationRuntime {
                 ChatIdentity::Unknown
                 | ChatIdentity::PublicChannel
                 | ChatIdentity::StrangerMessages => {
-                    // These identities never dispatch business. Sender-pending hall messages
-                    // remain unacknowledged in the hall branch until an OCR revision arrives.
+                    // 这些身份从不派发业务：Unknown 是身份没认出来，PublicChannel/
+                    // StrangerMessages 不是玩家大厅。大厅里「等待身份修订」的消息
+                    // 保持未确认，等 OCR 修订到达后再走大厅分支。
+                    //
+                    // 但必须留痕：这里是**永久 ACK**，一旦确认同一 id 不再交付。
+                    // 二级面板昵称 OCR 失败时（高亮行读不出名字 → Unknown），屏上的
+                    // `@点歌晴天` 会被这样静默吞掉，用户和日志都看不到任何证据。
                     for message in snapshot.messages {
+                        if command::looks_like_command(&message.text)
+                            && self.ui.chat_timeline.note_not_executed_log(&message.id)?
+                        {
+                            log::info!(
+                                "命令未执行：{:?} 身份不派发业务，永久丢弃 text={}",
+                                snapshot.chat,
+                                compact_for_log(&message.text)
+                            );
+                        }
                         self.ui.chat_timeline.acknowledge_business(&message.id)?;
                     }
                 }
@@ -2031,9 +2125,10 @@ impl ApplicationRuntime {
                 frame_id: None,
                 captured_at: Some(captured_at),
                 message_id: Some(observed.id.clone()),
-                // 命令锁只认被派发消息自身的数据：这里连同快照一起捕获文本与 y。
+                // 命令锁只认被派发消息自身的数据：这里连同快照一起捕获文本与锚点。
+                // 锚点跟着来源走，外部消息用序号而不是哨兵坐标。
                 message_text: Some(message.text.clone()),
-                message_y: Some(message.block.y),
+                lock_anchor: Some(lock_anchor_for(&observed.id, message.block.y)),
             };
             let envelope =
                 command::parse_command_envelope(&message.text, &message.message_type, observation);
@@ -2134,7 +2229,13 @@ impl ApplicationRuntime {
 
         for routed in parsed {
             if self.command_is_disabled(&routed)? {
-                log::info!("命令识别已禁用，跳过: {}", routed.raw);
+                // 文案必须反映真实原因：这里既可能是全局命令开关关闭，
+                // 也可能是该命令的最低角色/单条启用策略拒绝。写成「识别已禁用」
+                // 会把人引去查全局开关，而实际原因是权限。
+                log::info!(
+                    "命令未执行：权限或启用策略拒绝（全局开关或该命令的最低角色） text={}",
+                    routed.raw
+                );
                 // 被禁用不是“执行成功”，只确认不写锁。
                 acknowledge_primary_command(&self.ui.chat_timeline, &routed, false)?;
                 continue;
@@ -2220,7 +2321,7 @@ impl ApplicationRuntime {
             captured_at: Some(captured_at),
             message_id: Some(message_id.clone()),
             message_text: Some(message.text.clone()),
-            message_y: Some(message.block.y),
+            lock_anchor: Some(lock_anchor_for(message_id, message.block.y)),
         };
         let pending = PendingCommand {
             lock_key: crate::interfaces::chat::lock_key(&routed),
@@ -2245,11 +2346,13 @@ impl ApplicationRuntime {
             command,
             self.business.business.active_entertainment()?,
         );
+        // 与路由期同一判定：有账号按 UID，否则按昵称。只按昵称会让外部源的
+        // 管理员命令「路由放行、执行拒绝」——昵称是随机 OCR 匹配键，查不到 UID 绑定。
         let role = self
             .lifecycle
             .live_configs
             .identity
-            .role_of(&command.username);
+            .role_of_sender(&command.username, command.account.as_ref());
         let actor = crate::features::command_access::actor_permission(
             role,
             !command.username.trim().is_empty(),
@@ -2419,7 +2522,11 @@ impl ApplicationRuntime {
             return Ok(true);
         }
         if self.command_is_disabled(&parsed)? {
-            log::info!("命令识别已禁用，跳过二级大厅命令: {}", parsed.raw);
+            // 同上一级：区分「全局开关」与「该命令权限不够」，否则会误导排查方向。
+            log::info!(
+                "命令未执行：二级命令被权限或启用策略拒绝 text={}",
+                parsed.raw
+            );
             return Ok(false);
         }
         if let ModuleCommand::Invite(invite) = &parsed.command
@@ -2511,7 +2618,7 @@ impl ApplicationRuntime {
     /// 准入条件除了「一级界面」，还要求外部源已接管、当前不是二级、没有正在
     /// 进行的切换，避免与启动自动化抢 UI 事务。
     fn maybe_switch_to_secondary(&self, ui_state: &str) -> Result<()> {
-        if !self.lifecycle.external_chat.is_active() {
+        if !self.lifecycle.external_chat.supplies_hall_messages() {
             return Ok(());
         }
         let snapshot = self.business.business.chat_listener_snapshot()?;
@@ -2818,16 +2925,16 @@ mod tests {
 
     use super::{
         CHAT_LISTENER_UNRESOLVED_UI_GRACE, CONFIG_RELOAD_UI_FALLBACK_GRACE, ChatListenerMode,
-        ListenerReadyEvidence, hall_consumes_identity, listener_mode_matches_ui,
-        listener_ready_after_recheck, load_persisted_chat_listener_mode,
+        ListenerReadyEvidence, hall_consumes_scope, listener_mode_matches_ui,
+        listener_ready_after_recheck, load_persisted_chat_listener_mode, lock_anchor_for,
         persist_chat_listener_mode, primary_rescan_can_publish, replacement_ready_allowed,
         replacement_startup_fallback_due, replacement_startup_retry_due, scan_frame_is_fresh,
         secondary_hall_recovery_allowed, unresolved_ui_recovery_due,
     };
     use crate::geometry::Rect;
     use crate::observation::chat::{
-        BubbleSequence, ChatIdentity, ChatMessage, ChatTimeline, ObservedChatMessageId,
-        PrimaryObservedMessage, RecognizedChatMessage, VisualSessionId,
+        BubbleSequence, ChatIdentity, ChatMessage, ChatScope, ChatTimeline, ObservedChatMessageId,
+        PrimaryObservedMessage, RecognizedChatMessage, SourceId, VisualSessionId,
     };
     use std::time::{Duration, Instant};
 
@@ -3190,28 +3297,53 @@ mod tests {
 
     #[test]
     fn primary_listening_does_not_consume_secondary_hall_observations() {
-        // 一级值守只看主大厅。二级大厅与主观察可能是同一个大厅，同屏可见的二级几何
-        // 是同一个大厅的另一个身份；消费它就会用 SecondaryHall 再派发一次同一条命令。
-        assert!(hall_consumes_identity(
+        // 一级值守只看主大厅的**屏幕桶**。二级大厅与主观察可能是同一个大厅，
+        // 同屏可见的二级几何是同一个大厅的另一个身份；消费它就会重复派发同一条命令。
+        let ocr = SourceId::ocr();
+        assert!(hall_consumes_scope(
             ChatListenerMode::Primary,
+            &ChatScope::hall(),
+            &ocr,
             &ChatIdentity::PrimaryHall
         ));
-        assert!(!hall_consumes_identity(
+        assert!(!hall_consumes_scope(
             ChatListenerMode::Primary,
+            &ChatScope::hall(),
+            &ocr,
             &ChatIdentity::SecondaryHall
+        ));
+        // 外部源借用的 SecondaryHall 桶没有屏幕语义：一级值守也必须消费，
+        // 否则用户切到一级后外部大厅命令会被整批丢弃。
+        assert!(hall_consumes_scope(
+            ChatListenerMode::Primary,
+            &ChatScope::hall_with_id(7),
+            &SourceId::external("chatbridge"),
+            &ChatIdentity::SecondaryHall
+        ));
+        // 私聊与值守模式无关。
+        assert!(hall_consumes_scope(
+            ChatListenerMode::Primary,
+            &ChatScope::private("Alice"),
+            &ocr,
+            &ChatIdentity::Friend("Alice".into())
         ));
     }
 
     #[test]
     fn secondary_listening_does_not_consume_primary_hall_commands() {
-        // 二级值守只看二级大厅。主大厅快照（含审核巡检临时一级驻留期间的帧）
+        // 二级值守只看二级大厅的屏幕桶。主大厅快照（含审核巡检临时一级驻留期间的帧）
         // 不在它的消费范围内，命令派发留给一级值守。
-        assert!(hall_consumes_identity(
+        let ocr = SourceId::ocr();
+        assert!(hall_consumes_scope(
             ChatListenerMode::Secondary,
+            &ChatScope::hall(),
+            &ocr,
             &ChatIdentity::SecondaryHall
         ));
-        assert!(!hall_consumes_identity(
+        assert!(!hall_consumes_scope(
             ChatListenerMode::Secondary,
+            &ChatScope::hall(),
+            &ocr,
             &ChatIdentity::PrimaryHall
         ));
     }
@@ -3227,7 +3359,12 @@ mod tests {
                 ChatIdentity::StrangerMessages,
             ] {
                 assert!(
-                    hall_consumes_identity(mode, &chat),
+                    hall_consumes_scope(
+                        mode,
+                        &ChatScope::from_identity(&chat),
+                        &SourceId::ocr(),
+                        &chat,
+                    ),
                     "{} 不应改变 {chat:?} 的消费语义",
                     mode.label()
                 );
@@ -3356,12 +3493,14 @@ mod tests {
     }
 
     fn primary_route(message_id: ObservedChatMessageId) -> RoutedCommand {
+        let anchor = lock_anchor_for(&message_id, 40);
         RoutedCommand {
             matched: "状态".into(),
             raw: "状态".into(),
             user_command: "@状态".into(),
             message_type: "blue".into(),
             username: "甲".into(),
+            account: None,
             authority: CommandAuthority::HallMember,
             role: None,
             permission_required: None,
@@ -3371,7 +3510,7 @@ mod tests {
                 captured_at: Some(Instant::now()),
                 message_id: Some(message_id),
                 message_text: Some("[甲]:@状态".to_string()),
-                message_y: Some(40),
+                lock_anchor: Some(anchor),
             },
         }
     }
@@ -3437,7 +3576,7 @@ mod tests {
                     CommandObservation {
                         message_id: Some(message.id.clone()),
                         message_text: Some(message.text.clone()),
-                        message_y: Some(message.block.y),
+                        lock_anchor: Some(lock_anchor_for(&message.id, message.block.y)),
                         ..CommandObservation::default()
                     },
                 )
@@ -3517,7 +3656,7 @@ mod tests {
             let message = frame.messages[0].clone();
             let mut command = primary_route(message.id.clone());
             command.observation.message_text = text.map(str::to_string);
-            command.observation.message_y = y;
+            command.observation.lock_anchor = y.map(|y| lock_anchor_for(&message.id, y));
             super::acknowledge_primary_command(&shared, &command, true).unwrap();
             assert!(
                 !shared.command_lock_bucket_exists_for_test(&ChatIdentity::PrimaryHall),
@@ -3590,11 +3729,11 @@ mod tests {
             .unwrap();
         let command = first.messages[0].clone();
         let claim = shared
-            .claim_business(
+            .claim_business_at(
                 &command.id,
                 first.captured_at,
                 &command.text,
-                command.block.y,
+                command.lock_anchor(),
             )
             .unwrap()
             .expect("secondary command should be claimable");
@@ -3616,11 +3755,11 @@ mod tests {
             let chatter = frame.messages.last().unwrap().clone();
             assert!(shared.is_business_pending(&chatter.id).unwrap());
             let claim = shared
-                .claim_business(
+                .claim_business_at(
                     &chatter.id,
                     frame.captured_at,
                     &chatter.text,
-                    chatter.block.y,
+                    chatter.lock_anchor(),
                 )
                 .unwrap()
                 .expect("chatter should be claimable");

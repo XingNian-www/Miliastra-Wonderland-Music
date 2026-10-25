@@ -70,7 +70,16 @@ impl ChatTimelineMessage {
 pub(crate) struct ChatTimelineSnapshot {
     pub(crate) visual_session: VisualSessionId,
     pub(crate) captured_at: Instant,
+    /// OCR 的屏幕分桶键（一级区/二级区/好友名）。外部源也借它复用去重结构。
     pub(crate) chat: ChatIdentity,
+    /// 消息属于哪个聊天容器。**业务消费只看它**。
+    ///
+    /// `chat` 回答「这条消息出现在哪块屏幕」，`scope` 回答「它属于大厅还是私聊」。
+    /// 以前两者混用，导致外部大厅消息被映射成 `SecondaryHall` 后，
+    /// 用户一旦把值守切到一级，命令就被 `hall_consumes_identity` 静默丢弃。
+    pub(crate) scope: ChatScope,
+    /// 这批消息的来源。OCR 的屏幕互斥规则只对屏幕来源成立。
+    pub(crate) source: SourceId,
     pub(crate) messages: Vec<ChatTimelineMessage>,
 }
 
@@ -95,19 +104,11 @@ pub(crate) enum BusinessDeliveryState {
 }
 
 struct State {
-    latest: Option<ChatTimelineSnapshot>,
-    trackers: HashMap<ChatIdentity, Tracker>,
-    business_pending: HashSet<ObservedChatMessageId>,
-    unread_baseline: HashSet<ObservedChatMessageId>,
-    business_claimed: HashSet<ObservedChatMessageId>,
-    /// 已经打过“命令未执行原因”日志的消息 id：同一实例只打一次，避免每帧刷屏。
-    not_executed_logged: HashSet<ObservedChatMessageId>,
-    /// 聊天区曾不存在（或首屏为空）：说明“首屏没有命令”，冷基线应被消费。
-    cold_baseline_consumed: bool,
-    active_business_claims: HashSet<ObservedChatMessageId>,
-    ignored_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
-    latest_business_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
-    revision_delivery_fences: HashMap<ObservedChatMessageId, Instant>,
+    /// 屏幕追踪与去重：只有 OCR 路径写它。
+    screen: ScreenState,
+    /// 业务账本：两条来源共用，只按消息 id 记账。
+    ledger: BusinessLedger,
+    /// 命令锁：按 ChatIdentity 分桶，锚点由来源决定。
     command_locks: HashMap<ChatIdentity, CommandLock>,
     /// 命令新老判定状态：按 ChatIdentity 存活，跨 Tracker 重建（视图消失）保留。
     chat_freshness: HashMap<ChatIdentity, SequenceFreshness>,
@@ -116,15 +117,39 @@ struct State {
     /// 下一个可信帧要携带的基线事件（由 reset_chat_observation_baseline 写入）。
     pending_baseline: Option<BaselineKind>,
     next_command_lock_activity: u64,
+    next_session: u64,
+    requests: BTreeMap<u64, Refresh>,
+    next_request: u64,
+}
+
+/// 屏幕追踪状态：**只有 OCR 路径**读写。
+///
+/// 外部聊天源没有屏幕坐标，永远不碰这里——这正是拆开的目的：
+/// inject_external 不再需要显式跳过 latest/tracker，因为它在结构上够不到。
+struct ScreenState {
+    latest: Option<ChatTimelineSnapshot>,
+    trackers: HashMap<ChatIdentity, Tracker>,
+}
+
+/// 业务账本：两条来源共用的消息记账。
+///
+/// 只关心"这条消息处理了没有"，不关心它来自屏幕还是 socket。
+struct BusinessLedger {
+    pending: HashSet<ObservedChatMessageId>,
+    unread_baseline: HashSet<ObservedChatMessageId>,
+    claimed: HashSet<ObservedChatMessageId>,
+    not_executed_logged: HashSet<ObservedChatMessageId>,
+    cold_baseline_consumed: bool,
+    active_claims: HashSet<ObservedChatMessageId>,
+    ignored_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
+    latest_business_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
+    revision_delivery_fences: HashMap<ObservedChatMessageId, Instant>,
     unread_delivery_fences: HashMap<ObservedChatMessageId, Instant>,
     friend_suppression_generation: u64,
     friend_suppressions: usize,
     friend_suppression_ended: Option<Instant>,
     subscribers: HashMap<u64, Subscription>,
     next_subscriber: u64,
-    next_session: u64,
-    requests: BTreeMap<u64, Refresh>,
-    next_request: u64,
 }
 
 struct Tracker {
@@ -173,7 +198,12 @@ impl BusinessMessageRevision {
 struct CapturedBusinessRevision {
     captured_at: Instant,
     revision: BusinessMessageRevision,
-    y: Option<i32>,
+    /// 该修订对应的命令锁锚点。
+    ///
+    /// 不能只存屏幕 y：外部消息没有位置，而「迟到忽略提交必须尊重锁」这条
+    /// 护栏需要区分来源。用去重哈希（`id.bubble_sequence`）代替原始序号会让
+    /// `hash <= recorded` 恒假，护栏形同不存在。
+    anchor: Option<LockAnchor>,
 }
 
 /// 每个聊天一份的命令锁：记录最近"已认领并派发成功"的命令文本与屏幕位置。
@@ -238,9 +268,19 @@ impl CommandLock {
             .any(|entry| entry.matches(&text, anchor))
     }
 
-    /// 同一条文本再次写入时只更新锚点并复位缺失计数，不重复追加；超出容量丢弃最旧。
+    /// 同一条文本再次写入时只更新**同来源**的锚点并复位缺失计数，不重复追加；
+    /// 超出容量丢弃最旧。
+    ///
+    /// 必须按 (文本, 锚点类型) 匹配：外部消息与 OCR 消息共用同一个 `SecondaryHall`
+    /// 桶，若只按文本合并，后写的来源会把先写来源的锚点改写成自己的类型。而
+    /// [`CommandLockEntry::matches`] 严格区分锚点变体，于是被改写的那一方从此
+    /// 命不中自己的记录 —— 等价于它的锁凭空消失，视图重建后可能重跑。
     fn record(&mut self, text: String, anchor: LockAnchor) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.text == text) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.text == text && std::mem::discriminant(&entry.anchor) == std::mem::discriminant(&anchor))
+        {
             entry.anchor = anchor;
             entry.missing_frames = 0;
             return;
@@ -384,7 +424,7 @@ impl SharedBusinessClaim {
         {
             let mut state = self.shared.lock()?;
             if matches!(self.id.chat, ChatIdentity::Friend(_))
-                && state.friend_suppression_generation != self.suppression_generation
+                && state.ledger.friend_suppression_generation != self.suppression_generation
             {
                 acknowledge_business_locked(&mut state, &self.id);
             } else {
@@ -423,14 +463,14 @@ impl Drop for SharedBusinessClaim {
             return;
         }
         if let Ok(mut state) = self.shared.inner.state.lock() {
-            if !state.active_business_claims.remove(&self.id) {
+            if !state.ledger.active_claims.remove(&self.id) {
                 return;
             }
-            state.business_claimed.remove(&self.id);
+            state.ledger.claimed.remove(&self.id);
             if !matches!(self.id.chat, ChatIdentity::Friend(_))
-                || state.friend_suppression_generation == self.suppression_generation
+                || state.ledger.friend_suppression_generation == self.suppression_generation
             {
-                state.business_pending.insert(self.id.clone());
+                state.ledger.pending.insert(self.id.clone());
             }
         }
     }
@@ -443,10 +483,10 @@ pub(crate) struct FriendBusinessSuppression {
 impl Drop for FriendBusinessSuppression {
     fn drop(&mut self) {
         if let Ok(mut state) = self.shared.inner.state.lock() {
-            state.friend_suppressions -= 1;
-            if state.friend_suppressions == 0 {
+            state.ledger.friend_suppressions -= 1;
+            if state.ledger.friend_suppressions == 0 {
                 // OCR captured before release can finish publishing afterwards.
-                state.friend_suppression_ended = Some(Instant::now());
+                state.ledger.friend_suppression_ended = Some(Instant::now());
             }
         }
     }
@@ -459,13 +499,13 @@ impl ChatTimeline {
         id: &ObservedChatMessageId,
     ) -> Result<BusinessDeliveryState> {
         let state = self.lock()?;
-        Ok(if state.business_pending.contains(id) {
+        Ok(if state.ledger.pending.contains(id) {
             BusinessDeliveryState::Pending
-        } else if state.business_claimed.contains(id) {
+        } else if state.ledger.claimed.contains(id) {
             BusinessDeliveryState::Claimed
-        } else if state.ignored_revisions.contains_key(id) {
+        } else if state.ledger.ignored_revisions.contains_key(id) {
             BusinessDeliveryState::IgnoredRevision
-        } else if state.revision_delivery_fences.contains_key(id) {
+        } else if state.ledger.revision_delivery_fences.contains_key(id) {
             BusinessDeliveryState::Fenced
         } else {
             BusinessDeliveryState::NotTracked
@@ -475,7 +515,7 @@ impl ChatTimeline {
     /// 这条消息是否首次被记为“命令未执行”；true 表示应当打日志（同一实例只打一次）。
     pub(crate) fn note_not_executed_log(&self, id: &ObservedChatMessageId) -> Result<bool> {
         let mut state = self.lock()?;
-        Ok(state.not_executed_logged.insert(id.clone()))
+        Ok(state.ledger.not_executed_logged.insert(id.clone()))
     }
 
     /// 标记下一次发布要携带的基线事件（由 reset_chat_observation_baseline 调用）。
@@ -499,28 +539,32 @@ impl ChatTimeline {
         let this = Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
-                    latest: None,
-                    trackers: HashMap::new(),
-                    business_pending: HashSet::new(),
-                    unread_baseline: HashSet::new(),
-                    business_claimed: HashSet::new(),
-                    not_executed_logged: HashSet::new(),
-                    cold_baseline_consumed: false,
-                    active_business_claims: HashSet::new(),
-                    ignored_revisions: HashMap::new(),
-                    latest_business_revisions: HashMap::new(),
-                    revision_delivery_fences: HashMap::new(),
+                    screen: ScreenState {
+                        latest: None,
+                        trackers: HashMap::new(),
+                    },
+                    ledger: BusinessLedger {
+                        pending: HashSet::new(),
+                        unread_baseline: HashSet::new(),
+                        claimed: HashSet::new(),
+                        not_executed_logged: HashSet::new(),
+                        cold_baseline_consumed: false,
+                        active_claims: HashSet::new(),
+                        ignored_revisions: HashMap::new(),
+                        latest_business_revisions: HashMap::new(),
+                        revision_delivery_fences: HashMap::new(),
+                        unread_delivery_fences: HashMap::new(),
+                        friend_suppression_generation: 0,
+                        friend_suppressions: 0,
+                        friend_suppression_ended: None,
+                        subscribers: HashMap::new(),
+                        next_subscriber: 1,
+                    },
                     command_locks: HashMap::new(),
                     chat_freshness: HashMap::new(),
                     pending_baseline: None,
                     pending_absence: None,
                     next_command_lock_activity: 0,
-                    unread_delivery_fences: HashMap::new(),
-                    friend_suppression_generation: 0,
-                    friend_suppressions: 0,
-                    friend_suppression_ended: None,
-                    subscribers: HashMap::new(),
-                    next_subscriber: 1,
                     next_session: 1,
                     requests: BTreeMap::new(),
                     next_request: 1,
@@ -560,7 +604,7 @@ impl ChatTimeline {
     }
 
     pub(crate) fn latest(&self) -> Result<Option<ChatTimelineSnapshot>> {
-        Ok(self.lock()?.latest.clone())
+        Ok(self.lock()?.screen.latest.clone())
     }
 
     pub(crate) fn subscribe(&self) -> Result<ChatTimelineSubscriber> {
@@ -579,7 +623,7 @@ impl ChatTimeline {
         &self,
     ) -> Result<(Option<ChatTimelineSnapshot>, ChatTimelineSubscriber)> {
         let mut state = self.lock()?;
-        let latest = state.latest.clone();
+        let latest = state.screen.latest.clone();
         let subscriber = self.subscribe_locked(&mut state, None, false);
         Ok((latest, subscriber))
     }
@@ -595,9 +639,9 @@ impl ChatTimeline {
         chat: Option<ChatIdentity>,
         durable_business: bool,
     ) -> ChatTimelineSubscriber {
-        let id = state.next_subscriber;
-        state.next_subscriber += 1;
-        state.subscribers.insert(
+        let id = state.ledger.next_subscriber;
+        state.ledger.next_subscriber += 1;
+        state.ledger.subscribers.insert(
             id,
             Subscription {
                 chat,
@@ -701,16 +745,17 @@ impl ChatTimeline {
         let mut state = self.lock()?;
         // A delayed frame must not roll the passive baseline or trackers backwards.
         if state
+            .screen
             .latest
             .as_ref()
             .is_some_and(|latest| latest.captured_at > captured_at)
         {
             bail!("chat timeline received an out-of-order frame");
         }
-        if !state.trackers.contains_key(&chat) {
+        if !state.screen.trackers.contains_key(&chat) {
             let session = VisualSessionId::new(state.next_session);
             state.next_session += 1;
-            state.trackers.insert(
+            state.screen.trackers.insert(
                 chat.clone(),
                 Tracker {
                     session,
@@ -721,8 +766,9 @@ impl ChatTimeline {
             );
         }
         let suppress = matches!(chat, ChatIdentity::Friend(_))
-            && (state.friend_suppressions > 0
+            && (state.ledger.friend_suppressions > 0
                 || state
+                    .ledger
                     .friend_suppression_ended
                     .is_some_and(|end| captured_at <= end));
         // 空 OCR 帧不消费基线：否则会在真正有内容的第一帧丢失基线语义。
@@ -730,8 +776,8 @@ impl ChatTimeline {
         // 冷基线消费：聊天区不存在（publish_no_chat）或首屏为空，都等价于“首屏没有命令”。
         // 首屏抑制的目的只是不让 BOT 刚启动就读到旧命令；无命令可抑制时，
         // 之后出现的命令按新命令处理（蓝色不再被 AppStart 吞、粉色不再走首屏历史提升）。
-        let cold_consumed = state.cold_baseline_consumed || frame_empty;
-        if state.cold_baseline_consumed && !frame_empty {
+        let cold_consumed = state.ledger.cold_baseline_consumed || frame_empty;
+        if state.ledger.cold_baseline_consumed && !frame_empty {
             // 之前出现过“首屏无聊天/空屏”，现在内容才出现：过期基线事件不得落到这一帧上，
             // 否则首屏无聊天时，内容再出现会被旧基线判成历史（粉色与蓝色同一规则）。
             state.pending_baseline = None;
@@ -750,7 +796,11 @@ impl ChatTimeline {
                 .unwrap_or(crate::observation::chat::ViewAbsence::Transient);
             freshness.mark_view_absent(absence);
         }
-        let tracker = state.trackers.get_mut(&chat).expect("tracker inserted");
+        let tracker = state
+            .screen
+            .trackers
+            .get_mut(&chat)
+            .expect("tracker inserted");
         let initial = !tracker.initialized && !cold_consumed;
         let mut observed = tracker.observe(&chat, messages, &mut freshness, baseline);
         let visual_session = tracker.session;
@@ -760,7 +810,7 @@ impl ChatTimeline {
             }
         }
         // 只有“可信的非空首帧”才真正消费掉冷基线；空帧或被抑制帧继续保留该标志。
-        state.cold_baseline_consumed = frame_empty || suppress;
+        state.ledger.cold_baseline_consumed = frame_empty || suppress;
         state.chat_freshness.insert(chat.clone(), freshness);
         // 命令锁已降级为**冷启动兜底账本**：新老判定由 freshness 的序列对齐负责；
         // 这里只在“携带基线事件的帧”或“tracker 刚建立的首帧”用锁否决已经成功执行过的
@@ -794,16 +844,16 @@ impl ChatTimeline {
             state.command_locks.remove(&chat);
         }
         if !observed.is_empty() {
-            state.ignored_revisions.retain(|id, _| {
+            state.ledger.ignored_revisions.retain(|id, _| {
                 id.chat != chat || observed.iter().any(|message| message.id == *id)
             });
         }
-        state.unread_baseline.retain(|id| {
+        state.ledger.unread_baseline.retain(|id| {
             id.chat != chat
                 || observed.is_empty()
                 || observed.iter().any(|message| message.id == *id)
         });
-        state.not_executed_logged.retain(|id| {
+        state.ledger.not_executed_logged.retain(|id| {
             id.chat != chat
                 || observed.is_empty()
                 || observed.iter().any(|message| message.id == *id)
@@ -811,32 +861,32 @@ impl ChatTimeline {
         for message in &mut observed {
             if suppress {
                 message.is_new = false;
-                state.business_pending.remove(&message.id);
-                state.unread_baseline.remove(&message.id);
-                state.ignored_revisions.remove(&message.id);
-                state.latest_business_revisions.remove(&message.id);
-                state.revision_delivery_fences.remove(&message.id);
-                state.business_claimed.insert(message.id.clone());
+                state.ledger.pending.remove(&message.id);
+                state.ledger.unread_baseline.remove(&message.id);
+                state.ledger.ignored_revisions.remove(&message.id);
+                state.ledger.latest_business_revisions.remove(&message.id);
+                state.ledger.revision_delivery_fences.remove(&message.id);
+                state.ledger.claimed.insert(message.id.clone());
             } else if initial && message.message_type == "pink" {
                 // 首屏历史仅按粉色消息判定，不按会话权限或昵称角色判定。
                 // 蓝色大厅命令照常交付；粉色首屏只允许未读流程提升所选气泡。
                 message.is_new = false;
-                state.business_pending.remove(&message.id);
+                state.ledger.pending.remove(&message.id);
                 if state
                     .command_locks
                     .get(&chat)
                     .is_some_and(|lock| lock.matches(message))
                 {
                     // 未读提升不能把视图重建前已成功的命令重新派发。
-                    state.unread_baseline.remove(&message.id);
-                    state.business_claimed.insert(message.id.clone());
+                    state.ledger.unread_baseline.remove(&message.id);
+                    state.ledger.claimed.insert(message.id.clone());
                 } else {
-                    state.unread_baseline.insert(message.id.clone());
+                    state.ledger.unread_baseline.insert(message.id.clone());
                 }
-            } else if state.business_claimed.contains(&message.id) {
+            } else if state.ledger.claimed.contains(&message.id) {
                 message.is_new = false;
             } else {
-                if let Some(ignored) = state.ignored_revisions.get(&message.id) {
+                if let Some(ignored) = state.ledger.ignored_revisions.get(&message.id) {
                     let corrected = captured_at >= ignored.captured_at
                         && BusinessMessageRevision::from_message(message)
                             .corrects(&ignored.revision);
@@ -850,8 +900,9 @@ impl ChatTimeline {
                             acknowledge_business_locked(&mut state, &message.id);
                             message.is_new = false;
                         } else {
-                            state.ignored_revisions.remove(&message.id);
+                            state.ledger.ignored_revisions.remove(&message.id);
                             state
+                                .ledger
                                 .revision_delivery_fences
                                 .insert(message.id.clone(), captured_at);
                             message.is_new = true;
@@ -862,42 +913,43 @@ impl ChatTimeline {
                     }
                 }
                 if message.is_new {
-                    state.business_pending.insert(message.id.clone());
+                    state.ledger.pending.insert(message.id.clone());
                 }
             }
         }
         for message in &observed {
             if !suppress
-                && (state.business_pending.contains(&message.id)
-                    || state.active_business_claims.contains(&message.id)
-                    || state.ignored_revisions.contains_key(&message.id))
+                && (state.ledger.pending.contains(&message.id)
+                    || state.ledger.active_claims.contains(&message.id)
+                    || state.ledger.ignored_revisions.contains_key(&message.id))
             {
                 let revision = BusinessMessageRevision::from_message(message);
                 let retains_nonempty = revision.text.is_empty()
                     && state
+                        .ledger
                         .latest_business_revisions
                         .get(&message.id)
                         .is_some_and(|current| !current.revision.text.is_empty());
                 if !retains_nonempty {
                     // 空 OCR 是退化观测，不能盖掉尚未消费的有效非空正文及其捕获边界。
-                    state.latest_business_revisions.insert(
+                    state.ledger.latest_business_revisions.insert(
                         message.id.clone(),
                         CapturedBusinessRevision {
                             captured_at,
                             revision,
-                            y: Some(message.block.y),
+                            anchor: Some(LockAnchor::Screen { y: message.block.y }),
                         },
                     );
                 }
             }
         }
-        let State {
+        let BusinessLedger {
             latest_business_revisions,
-            business_pending,
-            active_business_claims,
+            pending: business_pending,
+            active_claims: active_business_claims,
             ignored_revisions,
             ..
-        } = &mut *state;
+        } = &mut state.ledger;
         latest_business_revisions.retain(|id, _| {
             business_pending.contains(id)
                 || active_business_claims.contains(id)
@@ -906,10 +958,12 @@ impl ChatTimeline {
         let snapshot = ChatTimelineSnapshot {
             captured_at,
             visual_session,
+            scope: ChatScope::from_identity(&chat),
+            source: SourceId::ocr(),
             chat,
             messages: observed,
         };
-        for subscriber in state.subscribers.values_mut() {
+        for subscriber in state.ledger.subscribers.values_mut() {
             if subscriber.failure.is_some() {
                 continue;
             }
@@ -961,7 +1015,7 @@ impl ChatTimeline {
             }
         }
         complete_refreshes(&mut state, captured_at, Ok(Some(snapshot.clone())));
-        state.latest = Some(snapshot.clone());
+        state.screen.latest = Some(snapshot.clone());
         self.inner.changed.notify_all();
         Ok(snapshot)
     }
@@ -972,7 +1026,7 @@ impl ChatTimeline {
     /// 而它会把本帧写成下一帧的 `prev`。外部消息没有屏幕坐标，一旦进入 `prev`，
     /// 下一帧真实 OCR 的对角对齐必然失败、整帧判旧——等于注入一次就吞掉一条真命令。
     ///
-    /// 因此这里只复用 `publish` 的记账思路，跳过 `observe` 与 `state.latest` 写入。
+    /// 因此这里只复用 `publish` 的记账思路，跳过 `observe` 与 `state.screen.latest` 写入。
     /// 外部消息不参与屏幕对齐，也不写入命令锁条目。
     pub(crate) fn inject_external(
         &self,
@@ -985,17 +1039,22 @@ impl ChatTimeline {
             return Ok(Vec::new());
         }
         let mut state = self.lock()?;
-        let mut accepted: Vec<(ObservedChatMessageId, ChatIdentity)> = Vec::new();
+        // 第三个元素是该消息自己的业务范围，与 identity 一一对应。
+        // 不能只记一个「批次共同范围」：断线补拉走 /messages?since=，
+        // 服务端返回的是跨频道的环形缓冲，同一批里可能既有大厅又有私聊。
+        let mut accepted: Vec<(ObservedChatMessageId, ChatIdentity, ChatScope)> = Vec::new();
         // 真正推给订阅者的消息；`accepted` 只记 id 供调用方核对。
         let mut delivered: Vec<ChatTimelineMessage> = Vec::new();
         for message in messages {
-            let Some(identity) = external_chat_identity(&message) else {
+            let Some(scope) = external_chat_scope(&message) else {
                 log::debug!(
                     "外部聊天消息缺少可用的会话身份，已忽略: channel={}",
                     message.channel
                 );
                 continue;
             };
+            // 业务范围以消息自带的 channel/hallId 为准。
+            let identity = identity_for_scope(&scope);
             // 去重键参与 id 构造：同一来源的同一序号只会入账一次。
             let dedup = message.dedup_key(source);
             // 明确标记来源：外部消息不是屏幕气泡，命令锁与去重都不能用位置语义。
@@ -1005,7 +1064,7 @@ impl ChatTimeline {
                 identity.clone(),
                 BubbleSequence::new(external_sequence(&dedup)),
             );
-            if state.business_claimed.contains(&id) || state.business_pending.contains(&id) {
+            if state.ledger.claimed.contains(&id) || state.ledger.pending.contains(&id) {
                 log::debug!("外部聊天消息重复，已忽略: {dedup}");
                 continue;
             }
@@ -1023,14 +1082,16 @@ impl ChatTimeline {
                 sender: sender.clone(),
                 raw_sender: sender,
             };
-            state.business_pending.insert(id.clone());
-            state.latest_business_revisions.insert(
+            state.ledger.pending.insert(id.clone());
+            state.ledger.latest_business_revisions.insert(
                 id.clone(),
                 CapturedBusinessRevision {
                     captured_at,
                     revision: revision.clone(),
-                    // 外部消息没有屏幕位置：记录 None 表示"无法用位置校验"。
-                    y: None,
+                    // 外部消息用原始服务端序号锚定，不是屏幕位置。
+                    anchor: Some(LockAnchor::Sequence {
+                        after: message.sequence,
+                    }),
                 },
             );
             delivered.push(ChatTimelineMessage {
@@ -1056,23 +1117,32 @@ impl ChatTimeline {
                     }
                 }),
             });
-            accepted.push((id, identity));
+            accepted.push((id, identity, scope));
         }
         if accepted.is_empty() {
-            return Ok(accepted.into_iter().map(|(id, _)| id).collect());
+            return Ok(accepted.into_iter().map(|(id, _, _)| id).collect());
         }
         // 推给订阅者：命令链路靠这条队列拿消息。
         // 与 `publish` 的投递段保持同一套过滤规则（绑定聊天、溢出保护）。
         let snapshot = ChatTimelineSnapshot {
             captured_at,
             visual_session: epoch,
+            // chat 与 scope 必须来自**同一条**消息，否则两个字段指向不同会话：
+            // 批内既有大厅又有私聊时，消费侧会按 scope 放行、却按 chat 进错分支，
+            // 把私聊消息当大厅命令派发（friend_name 为空 → 主语为空 → 丢命令），
+            // 或把大厅消息记到某个好友名下（归属与身份解析错误）。
             chat: accepted
                 .first()
-                .map(|(_, identity)| identity.clone())
+                .map(|(_, identity, _)| identity.clone())
                 .unwrap_or(ChatIdentity::Unknown),
+            scope: accepted
+                .first()
+                .map(|(_, _, scope)| scope.clone())
+                .unwrap_or(ChatScope::hall()),
+            source: SourceId::external(source),
             messages: delivered,
         };
-        for subscriber in state.subscribers.values_mut() {
+        for subscriber in state.ledger.subscribers.values_mut() {
             if subscriber.failure.is_some() {
                 continue;
             }
@@ -1095,7 +1165,7 @@ impl ChatTimeline {
         }
         drop(state);
         self.inner.changed.notify_all();
-        Ok(accepted.into_iter().map(|(id, _)| id).collect())
+        Ok(accepted.into_iter().map(|(id, _, _)| id).collect())
     }
 
     pub(crate) fn publish_no_chat(
@@ -1107,31 +1177,32 @@ impl ChatTimeline {
         let reason = reason.into();
         let mut state = self.lock()?;
         if state
+            .screen
             .latest
             .as_ref()
             .is_some_and(|latest| latest.captured_at > captured_at)
         {
             bail!("chat timeline received an out-of-order no-chat frame");
         }
-        state.latest = None;
+        state.screen.latest = None;
         // A disappeared view starts new visual sessions on its next appearance.
-        state.trackers.clear();
+        state.screen.trackers.clear();
         // 聊天区不存在：首屏没有命令可抑制，冷基线就此消费（见 mark_view_absent 说明）。
-        state.cold_baseline_consumed = true;
+        state.ledger.cold_baseline_consumed = true;
         // 记录消失性质：重开第一帧据此决定能否沿用旧的交叠对齐。
         state.pending_absence = Some(absence);
         // 聊天不可见：保留新鲜度状态，但**不再强制下一帧不连续**。
         // 真实案例：聊天框消失后回来的第一条新命令曾被“全旧”吞掉。交叠时交给对齐按
         // “底部追加”判新；无交叠（画面大改/命令被顶到顶部）时对齐自然失败并全旧，场景 3 仍成立。
-        state.ignored_revisions.clear();
-        let State {
+        state.ledger.ignored_revisions.clear();
+        let BusinessLedger {
             revision_delivery_fences,
-            business_pending,
-            business_claimed,
-            active_business_claims,
+            pending: business_pending,
+            claimed: business_claimed,
+            active_claims: active_business_claims,
             latest_business_revisions,
             ..
-        } = &mut *state;
+        } = &mut state.ledger;
         revision_delivery_fences
             .retain(|id, _| business_pending.contains(id) || business_claimed.contains(id));
         latest_business_revisions
@@ -1144,8 +1215,9 @@ impl ChatTimeline {
                 entry.missing_frames = 0;
             }
         }
-        state.unread_baseline.clear();
+        state.ledger.unread_baseline.clear();
         for subscriber in state
+            .ledger
             .subscribers
             .values_mut()
             .filter(|subscriber| subscriber.chat.is_some())
@@ -1167,7 +1239,7 @@ impl ChatTimeline {
     pub(crate) fn report_failure(&self, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
         let mut state = self.lock()?;
-        for subscriber in state.subscribers.values_mut() {
+        for subscriber in state.ledger.subscribers.values_mut() {
             if !subscriber.durable_business {
                 fail_subscription(subscriber, &reason);
             }
@@ -1187,23 +1259,27 @@ impl ChatTimeline {
     /// decision queues keep flowing; IDs observed here are consumed, not deferred.
     pub(crate) fn suppress_friend_business(&self) -> Result<FriendBusinessSuppression> {
         let mut state = self.lock()?;
-        state.friend_suppressions += 1;
-        state.friend_suppression_generation += 1;
-        state.unread_delivery_fences.clear();
+        state.ledger.friend_suppressions += 1;
+        state.ledger.friend_suppression_generation += 1;
+        state.ledger.unread_delivery_fences.clear();
         state
-            .business_pending
+            .ledger
+            .pending
             .retain(|id| !matches!(id.chat, ChatIdentity::Friend(_)));
-        state.unread_baseline.clear();
+        state.ledger.unread_baseline.clear();
         state
+            .ledger
             .ignored_revisions
             .retain(|id, _| !matches!(id.chat, ChatIdentity::Friend(_)));
         state
+            .ledger
             .latest_business_revisions
             .retain(|id, _| !matches!(id.chat, ChatIdentity::Friend(_)));
         state
+            .ledger
             .revision_delivery_fences
             .retain(|id, _| !matches!(id.chat, ChatIdentity::Friend(_)));
-        for (chat, tracker) in &mut state.trackers {
+        for (chat, tracker) in &mut state.screen.trackers {
             if matches!(chat, ChatIdentity::Friend(_)) {
                 for message in &mut tracker.visible {
                     message.is_new = false;
@@ -1224,16 +1300,17 @@ impl ChatTimeline {
         id: &ObservedChatMessageId,
     ) -> Result<bool> {
         let mut state = self.lock()?;
-        if state.friend_suppressions > 0
+        if state.ledger.friend_suppressions > 0
             || !matches!(snapshot.chat, ChatIdentity::Friend(_))
             || !snapshot.messages.iter().any(|message| message.id == *id)
-            || !state.unread_baseline.contains(id)
+            || !state.ledger.unread_baseline.contains(id)
         {
             return Ok(false);
         }
         // Use the most recent actual OCR revision so eligibility cannot append
         // an older capture behind newer queued frames or dispatch stale OCR text.
         let mut revision = state
+            .screen
             .latest
             .as_ref()
             .filter(|latest| {
@@ -1256,25 +1333,28 @@ impl ChatTimeline {
             acknowledge_business_locked(&mut state, id);
             return Ok(false);
         }
-        state.unread_baseline.remove(id);
+        state.ledger.unread_baseline.remove(id);
         state
+            .ledger
             .unread_delivery_fences
             .insert(id.clone(), revision.captured_at);
-        state.business_pending.insert(id.clone());
+        state.ledger.pending.insert(id.clone());
         let selected_message = revision
             .messages
             .iter()
             .find(|message| message.id == *id)
             .expect("latest unread revision contains selected message");
-        state.latest_business_revisions.insert(
+        state.ledger.latest_business_revisions.insert(
             id.clone(),
             CapturedBusinessRevision {
                 captured_at: revision.captured_at,
                 revision: BusinessMessageRevision::from_message(selected_message),
-                y: Some(selected_message.block.y),
+                anchor: Some(LockAnchor::Screen {
+                    y: selected_message.block.y,
+                }),
             },
         );
-        if let Some(tracker) = state.trackers.get_mut(&id.chat) {
+        if let Some(tracker) = state.screen.trackers.get_mut(&id.chat) {
             for message in &mut tracker.visible {
                 if message.id == *id {
                     message.is_new = true;
@@ -1285,7 +1365,12 @@ impl ChatTimeline {
         revision.messages[0].is_new = true;
         // An eligibility revision is needed even if the listener already drained
         // the passive baseline. Bound decision readers need no duplicate frame.
-        for subscriber in state.subscribers.values_mut().filter(|s| s.chat.is_none()) {
+        for subscriber in state
+            .ledger
+            .subscribers
+            .values_mut()
+            .filter(|s| s.chat.is_none())
+        {
             if subscriber.failure.is_some() {
                 continue;
             }
@@ -1303,7 +1388,7 @@ impl ChatTimeline {
     }
 
     pub(crate) fn is_business_pending(&self, id: &ObservedChatMessageId) -> Result<bool> {
-        Ok(self.lock()?.business_pending.contains(id))
+        Ok(self.lock()?.ledger.pending.contains(id))
     }
 
     /// 快照消费同时核对修订时间，旧排队 OCR 不能抢先消费较新的有效修订。
@@ -1313,7 +1398,7 @@ impl ChatTimeline {
         captured_at: Instant,
     ) -> Result<bool> {
         let state = self.lock()?;
-        Ok(state.business_pending.contains(id)
+        Ok(state.ledger.pending.contains(id)
             && !snapshot_precedes_delivery_fence(&state, id, captured_at))
     }
 
@@ -1321,19 +1406,7 @@ impl ChatTimeline {
     /// 不能回头查当前 tracker：执行完成时气泡可能已经滚出 visible/latest，
     /// 那样会静默不写命令锁。
     ///
-    /// 兼容入口：调用方仍按 OCR 语义给 y。外部消息用
-    /// [`Self::claim_business_at`] 传 `LockAnchor::Sequence`。
-    pub(crate) fn claim_business(
-        &self,
-        id: &ObservedChatMessageId,
-        captured_at: Instant,
-        text: &str,
-        y: i32,
-    ) -> Result<Option<SharedBusinessClaim>> {
-        self.claim_business_at(id, captured_at, text, LockAnchor::Screen { y })
-    }
-
-    /// 带显式锚点的认领：OCR 传 `Screen { y }`，外部源传 `Sequence { after }`。
+    /// 锚点由来源决定：OCR 传 `Screen { y }`，外部源传 `Sequence { after }`。
     pub(crate) fn claim_business_at(
         &self,
         id: &ObservedChatMessageId,
@@ -1343,17 +1416,17 @@ impl ChatTimeline {
     ) -> Result<Option<SharedBusinessClaim>> {
         let mut state = self.lock()?;
         if snapshot_precedes_delivery_fence(&state, id, captured_at)
-            || state.business_claimed.contains(id)
-            || !state.business_pending.remove(id)
+            || state.ledger.claimed.contains(id)
+            || !state.ledger.pending.remove(id)
         {
             return Ok(None);
         }
-        state.business_claimed.insert(id.clone());
-        state.active_business_claims.insert(id.clone());
+        state.ledger.claimed.insert(id.clone());
+        state.ledger.active_claims.insert(id.clone());
         Ok(Some(SharedBusinessClaim {
             shared: self.clone(),
             id: id.clone(),
-            suppression_generation: state.friend_suppression_generation,
+            suppression_generation: state.ledger.friend_suppression_generation,
             text: text.to_owned(),
             anchor,
             captured_at,
@@ -1387,20 +1460,10 @@ impl ChatTimeline {
     }
 
     /// 一级大厅命令路径的"真正派发成功"完成点：确认已处理，并用被派发消息自身的
-    /// 文本与 y 写入命令锁。调用方必须只在成功派发点调用它；被禁用/被跳过的
+    /// 文本与锚点写入命令锁。调用方必须只在成功派发点调用它；被禁用/被跳过的
     /// 路径只调 `acknowledge_business`，未路由修订使用 `acknowledge_ignored`。
-    pub(crate) fn acknowledge_command(
-        &self,
-        id: &ObservedChatMessageId,
-        text: &str,
-        y: i32,
-    ) -> Result<bool> {
-        // 兼容入口：调用方仍按 OCR 语义给 y。外部消息的锚点由
-        // `acknowledge_command_at` 提供，避免这里猜来源。
-        self.acknowledge_command_at(id, text, LockAnchor::Screen { y })
-    }
-
-    /// 带显式锚点的命令确认：OCR 传 `Screen { y }`，外部源传 `Sequence { after }`。
+    ///
+    /// 锚点由来源决定：OCR 传 `Screen { y }`，外部源传 `Sequence { after }`。
     pub(crate) fn acknowledge_command_at(
         &self,
         id: &ObservedChatMessageId,
@@ -1418,16 +1481,18 @@ impl ChatTimeline {
 ///
 /// 大厅消息归到 `SecondaryHall`（二级值守的大厅），私聊归到 `Friend`。
 /// 昵称缺失的私聊无法确定好友名，直接放弃——宁可少处理也不误授权。
-fn external_chat_identity(
-    message: &crate::observation::chat::ExternalChatMessage,
-) -> Option<ChatIdentity> {
-    let scope = external_chat_scope(message)?;
-    Some(match scope {
-        // 外部源的大厅消息统一归到二级桶：它本来就是「当前所在大厅」，
+/// 从业务范围推导 OCR 分桶键。
+///
+/// 这里只是**借用** `ChatIdentity` 作为去重/锁的桶键：外部源没有屏幕，
+/// 但它的消息仍需要与 OCR 消息共用同一条业务账本。真正的业务语义在
+/// `ChatScope`，消费侧不应再读 `chat`。
+fn identity_for_scope(scope: &ChatScope) -> ChatIdentity {
+    match scope {
+        // 外部源的大厅消息归到二级桶：它本来就是「当前所在大厅」，
         // 与 OCR 的二级观察是同一个物理容器（见 MUST_READ 的共享观察约定）。
         ChatScope::Hall { .. } => ChatIdentity::SecondaryHall,
-        ChatScope::Private { peer } => ChatIdentity::Friend(peer),
-    })
+        ChatScope::Private { peer } => ChatIdentity::Friend(peer.clone()),
+    }
 }
 
 /// 外部消息属于哪个聊天容器。
@@ -1482,14 +1547,14 @@ fn external_sequence(dedup_key: &str) -> u64 {
 }
 
 fn acknowledge_business_locked(state: &mut State, id: &ObservedChatMessageId) -> bool {
-    state.unread_baseline.remove(id);
-    state.unread_delivery_fences.remove(id);
-    state.ignored_revisions.remove(id);
-    state.latest_business_revisions.remove(id);
-    state.revision_delivery_fences.remove(id);
-    state.business_claimed.insert(id.clone());
-    state.active_business_claims.remove(id);
-    let found = state.business_pending.remove(id);
+    state.ledger.unread_baseline.remove(id);
+    state.ledger.unread_delivery_fences.remove(id);
+    state.ledger.ignored_revisions.remove(id);
+    state.ledger.latest_business_revisions.remove(id);
+    state.ledger.revision_delivery_fences.remove(id);
+    state.ledger.claimed.insert(id.clone());
+    state.ledger.active_claims.remove(id);
+    let found = state.ledger.pending.remove(id);
     set_business_new_locked(state, id, false);
     found
 }
@@ -1500,10 +1565,11 @@ fn snapshot_precedes_delivery_fence(
     captured_at: Instant,
 ) -> bool {
     state
+        .ledger
         .unread_delivery_fences
         .get(id)
         .into_iter()
-        .chain(state.revision_delivery_fences.get(id))
+        .chain(state.ledger.revision_delivery_fences.get(id))
         .any(|fence| captured_at < *fence)
 }
 
@@ -1515,50 +1581,45 @@ fn acknowledge_ignored_locked(
     claimed: bool,
 ) -> bool {
     if !claimed
-        && (state.business_claimed.contains(id)
+        && (state.ledger.claimed.contains(id)
             || snapshot_precedes_delivery_fence(state, id, captured_at)
-            || (!state.business_pending.contains(id) && !state.ignored_revisions.contains_key(id)))
+            || (!state.ledger.pending.contains(id)
+                && !state.ledger.ignored_revisions.contains_key(id)))
     {
         return false;
     }
     if matches!(id.chat, ChatIdentity::Friend(_))
-        && (state.friend_suppressions > 0
+        && (state.ledger.friend_suppressions > 0
             || state
+                .ledger
                 .friend_suppression_ended
                 .is_some_and(|end| captured_at <= end))
     {
         return acknowledge_business_locked(state, id);
     }
     if claimed {
-        if !state.active_business_claims.remove(id) {
+        if !state.ledger.active_claims.remove(id) {
             // 永久 ACK 已覆盖此认领，迟到的忽略提交不能撤销成功墓碑。
             return false;
         }
-        state.business_claimed.remove(id);
+        state.ledger.claimed.remove(id);
     }
-    let found = state.business_pending.remove(id) || claimed;
+    let found = state.ledger.pending.remove(id) || claimed;
     // 业务快照可能已整批读取，且其 tracker 已在 no_chat 中清空。
     // 独立保留尚未消费 ID 的最新修订，旧忽略提交不能抹掉积压的正确文字。
-    let current = state.latest_business_revisions.get(id).cloned();
-    let ignored_y = current.as_ref().and_then(|current| current.y);
-    // 迟到的忽略提交也必须尊重锁。锚点来自实际最新修订：
-    // 外部消息没有 y 但有序号，两种来源各自用对应锚点，未知锚点不猜测。
+    let current = state.ledger.latest_business_revisions.get(id).cloned();
+    let ignored_anchor = current.as_ref().and_then(|current| current.anchor);
+    // 迟到的忽略提交也必须尊重锁。锚点取自该修订**捕获时**记下的值，
+    // 不在这里按来源重新推算：外部消息的原始序号不在 id 里，
+    // 用 id.bubble_sequence（去重哈希）代替会让比较恒假，护栏失效。
     if current.as_ref().is_some_and(|current| {
         current.captured_at >= captured_at
-            && match (id.source.is_ocr(), current.y) {
-                (true, Some(y)) => state.command_locks.get(&id.chat).is_some_and(|lock| {
-                    lock.matches_text_at(&current.revision.text, LockAnchor::Screen { y })
-                }),
-                (false, _) => state.command_locks.get(&id.chat).is_some_and(|lock| {
-                    lock.matches_text_at(
-                        &current.revision.text,
-                        LockAnchor::Sequence {
-                            after: id.bubble_sequence.get(),
-                        },
-                    )
-                }),
-                (true, None) => false,
-            }
+            && ignored_anchor.is_some_and(|anchor| {
+                state
+                    .command_locks
+                    .get(&id.chat)
+                    .is_some_and(|lock| lock.matches_text_at(&current.revision.text, anchor))
+            })
     }) {
         acknowledge_business_locked(state, id);
         return found;
@@ -1568,19 +1629,20 @@ fn acknowledge_ignored_locked(
         && current.revision.corrects(&revision)
     {
         // 忽略提交落后于当前有效修订：保留更新并拦住所有更早的排队快照。
-        state.ignored_revisions.remove(id);
+        state.ledger.ignored_revisions.remove(id);
         state
+            .ledger
             .revision_delivery_fences
             .insert(id.clone(), current.captured_at);
-        state.business_pending.insert(id.clone());
+        state.ledger.pending.insert(id.clone());
         set_business_new_locked(state, id, true);
     } else {
-        state.ignored_revisions.insert(
+        state.ledger.ignored_revisions.insert(
             id.clone(),
             CapturedBusinessRevision {
                 captured_at,
                 revision,
-                y: ignored_y,
+                anchor: ignored_anchor,
             },
         );
         set_business_new_locked(state, id, false);
@@ -1589,14 +1651,14 @@ fn acknowledge_ignored_locked(
 }
 
 fn set_business_new_locked(state: &mut State, id: &ObservedChatMessageId, is_new: bool) {
-    if let Some(tracker) = state.trackers.get_mut(&id.chat) {
+    if let Some(tracker) = state.screen.trackers.get_mut(&id.chat) {
         for message in &mut tracker.visible {
             if message.id == *id {
                 message.is_new = is_new;
             }
         }
     }
-    if let Some(latest) = &mut state.latest {
+    if let Some(latest) = &mut state.screen.latest {
         for message in &mut latest.messages {
             if message.id == *id {
                 message.is_new = is_new;
@@ -1708,6 +1770,7 @@ impl ChatTimelineSubscriber {
     pub(crate) fn bind_chat(&self, chat: ChatIdentity, session: VisualSessionId) -> Result<()> {
         let mut state = self.shared.lock()?;
         let subscriber = state
+            .ledger
             .subscribers
             .get_mut(&self.id)
             .ok_or_else(|| anyhow!("chat timeline subscription closed"))?;
@@ -1724,6 +1787,7 @@ impl ChatTimelineSubscriber {
     pub(crate) fn read(&self) -> Result<Vec<ChatTimelineSnapshot>> {
         let mut state = self.shared.lock()?;
         let subscriber = state
+            .ledger
             .subscribers
             .get_mut(&self.id)
             .ok_or_else(|| anyhow!("chat timeline subscription closed"))?;
@@ -1741,6 +1805,7 @@ impl ChatTimelineSubscriber {
     pub(crate) fn has_pending(&self) -> Result<bool> {
         let state = self.shared.lock()?;
         let subscriber = state
+            .ledger
             .subscribers
             .get(&self.id)
             .ok_or_else(|| anyhow!("chat timeline subscription closed"))?;
@@ -1755,6 +1820,7 @@ impl ChatTimelineSubscriber {
         let mut state = self.shared.lock()?;
         loop {
             let subscriber = state
+                .ledger
                 .subscribers
                 .get(&self.id)
                 .ok_or_else(|| anyhow!("chat timeline subscription closed"))?;
@@ -1784,7 +1850,7 @@ impl ChatTimelineSubscriber {
 impl Drop for ChatTimelineSubscriber {
     fn drop(&mut self) {
         if let Ok(mut state) = self.shared.inner.state.lock() {
-            state.subscribers.remove(&self.id);
+            state.ledger.subscribers.remove(&self.id);
         }
     }
 }
@@ -1908,7 +1974,7 @@ mod tests {
         // （蓝色 New、粉色 Old），以便聚焦后续行为；AppStart 全旧语义由 freshness 单元测试覆盖。
         let first_ever = {
             let state = shared.inner.state.lock().unwrap();
-            state.trackers.is_empty() && state.chat_freshness.is_empty()
+            state.screen.trackers.is_empty() && state.chat_freshness.is_empty()
         };
         if first_ever {
             // 1) 先消费 AppStart 基线（进程首帧全旧），让状态 initialized。
@@ -2162,7 +2228,12 @@ mod tests {
         captured_at: Instant,
     ) -> Option<SharedBusinessClaim> {
         shared
-            .claim_business(&message.id, captured_at, &message.text, message.block.y)
+            .claim_business_at(
+                &message.id,
+                captured_at,
+                &message.text,
+                message.lock_anchor(),
+            )
             .unwrap()
     }
 
@@ -2243,7 +2314,14 @@ mod tests {
             );
             assert!(ignore_revision(&shared, &snapshot, 0));
             assert_eq!(
-                shared.inner.state.lock().unwrap().ignored_revisions.len(),
+                shared
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .ignored_revisions
+                    .len(),
                 1
             );
         }
@@ -2260,6 +2338,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
+                .ledger
                 .ignored_revisions
                 .is_empty()
         );
@@ -2312,6 +2391,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
+                .ledger
                 .latest_business_revisions
                 .contains_key(id)
         );
@@ -2336,6 +2416,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
+                .ledger
                 .latest_business_revisions
                 .contains_key(id)
         );
@@ -2347,7 +2428,7 @@ mod tests {
         let first = publish(&shared, vec![input("甲:@下一首", 40)]);
         let message = &first.messages[0];
         shared
-            .acknowledge_command(&message.id, &message.text, message.block.y)
+            .acknowledge_command_at(&message.id, &message.text, message.lock_anchor())
             .unwrap();
         shared
             .publish_no_chat(
@@ -2426,8 +2507,13 @@ mod tests {
             1
         );
         let state = shared.inner.state.lock().unwrap();
-        assert!(!state.ignored_revisions.contains_key(ignored_id));
-        assert!(!state.latest_business_revisions.contains_key(ignored_id));
+        assert!(!state.ledger.ignored_revisions.contains_key(ignored_id));
+        assert!(
+            !state
+                .ledger
+                .latest_business_revisions
+                .contains_key(ignored_id)
+        );
     }
 
     #[test]
@@ -2483,8 +2569,13 @@ mod tests {
                     1
                 );
                 let state = shared.inner.state.lock().unwrap();
-                assert!(!state.ignored_revisions.contains_key(ignored_id));
-                assert!(!state.latest_business_revisions.contains_key(ignored_id));
+                assert!(!state.ledger.ignored_revisions.contains_key(ignored_id));
+                assert!(
+                    !state
+                        .ledger
+                        .latest_business_revisions
+                        .contains_key(ignored_id)
+                );
             }
         }
     }
@@ -3125,11 +3216,11 @@ mod tests {
         let message = &snapshot.messages[index];
         assert!(shared.is_business_pending(&message.id).unwrap());
         shared
-            .claim_business(
+            .claim_business_at(
                 &message.id,
                 snapshot.captured_at,
                 &message.text,
-                message.block.y,
+                message.lock_anchor(),
             )
             .unwrap()
             .expect("pending message should be claimable")
@@ -3196,7 +3287,40 @@ mod tests {
 
     /// 桶淘汰不能只断言 len<=32：必须证明“在用桶没被淘汰、新桶写进去了、
     /// 外部消息用序号锚点，不能被写死的哨兵坐标当成「屏幕上的同一条」。
+    /// 回归：两个来源的锁条目必须共存，不能互相覆盖锚点。
     ///
+    /// 外部消息与 OCR 消息共用同一个 `SecondaryHall` 桶。若 `record` 只按文本
+    /// 合并，后写来源会把先写来源的锚点改写成另一种变体；而 `matches` 严格区分
+    /// 锚点变体，被改写的那一方从此命不中自己的记录——等价于它的锁凭空消失，
+    /// 视图重建后可能重跑（外部源租约到期回落 OCR 时正是这个窗口）。
+    #[test]
+    fn command_lock_record_keeps_anchors_of_both_sources() {
+        let mut lock = CommandLock::default();
+        let text = normalize_command_lock_text("[甲]:@状态");
+
+        // 屏幕路径先记录。
+        lock.record(text.clone(), LockAnchor::Screen { y: 40 });
+        // 外部源写入同文本、不同来源：必须各占一条，不能改写屏幕那条。
+        lock.record(text.clone(), LockAnchor::Sequence { after: 100 });
+
+        assert!(
+            lock.matches_text_at(&text, LockAnchor::Screen { y: 40 }),
+            "屏幕锚点在外部来源写入后仍必须命中"
+        );
+        assert!(
+            lock.matches_text_at(&text, LockAnchor::Sequence { after: 100 }),
+            "外部锚点应命中"
+        );
+        assert_eq!(lock.entries.len(), 2, "两个来源各占一条，不得合并");
+
+        // 同来源重复写入仍然只更新，不追加。
+        lock.record(text.clone(), LockAnchor::Sequence { after: 120 });
+        assert_eq!(lock.entries.len(), 2, "同来源重复写入不得追加新条目");
+        assert!(
+            lock.matches_text_at(&text, LockAnchor::Sequence { after: 120 }),
+            "同来源应更新到新锚点"
+        );
+    }
     /// 回归：外部消息的 block 是 Rect::new(0, i32::MIN/2, 1, 1)，
     /// 若拿它当 Screen 锚点，`y <= recorded + 28` 对任何已记录条目都成立，
     /// 同文本命令会被整批吞掉——这正是「接管后命令完全无效」的一个成因。
@@ -3337,10 +3461,10 @@ mod tests {
         {
             let state = shared.inner.state.lock().unwrap();
             assert!(
-                state.business_claimed.contains(&id),
+                state.ledger.claimed.contains(&id),
                 "complete() 之后认领墓碑必须保留，否则同一 id 可以再次入队"
             );
-            assert!(!state.business_pending.contains(&id));
+            assert!(!state.ledger.pending.contains(&id));
         }
         assert!(claim(&shared, message, built.captured_at).is_none());
         let repeat = publish(&shared, vec![primary("甲", "@命令1", 40)]);

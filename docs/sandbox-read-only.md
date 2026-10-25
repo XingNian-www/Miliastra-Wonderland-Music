@@ -54,7 +54,9 @@ Since 大于 0 时必须使用对应的 Instance。实例变化后，脚本会�
 
 ## HTTP 调用
 
-请求使用 X-Miliastra-Token 请求头或访问 cookie。
+请求使用 `X-Miliastra-Token` 请求头；订阅事件流（SSE）时改用查询参数 `?token=`——浏览器不允许 EventSource 设置自定义请求头。
+
+> 服务端没有 Cookie 鉴权。面板把令牌存进 Cookie 只是为了本地保存，它从不参与鉴权。
 
 - POST /debug/read-only/mode：启用或关闭 active、push。
 - POST /debug/read-only/read：主动读取；新客户端可使用 response=metadata。

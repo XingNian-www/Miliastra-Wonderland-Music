@@ -382,7 +382,7 @@ mod tests {
             captured_at: Some(Instant::now()),
             message_id: Some(message_id.clone()),
             message_text: Some("@邀请2".into()),
-            message_y: None,
+            lock_anchor: None,
         };
         let envelope =
             CommandEnvelope::new("@邀请2", "芦荟", "pink", "@邀请2", observation.clone())
@@ -1045,7 +1045,7 @@ mod tests {
             captured_at: Some(frame.captured_at()),
             message_id: Some(message_id),
             message_text: None,
-            message_y: None,
+            lock_anchor: None,
         };
         let pending = PendingCommand {
             lock_key: lock_key(&parsed),

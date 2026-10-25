@@ -369,6 +369,19 @@ pub(super) fn debug_ui_catalogue_route(
             if path.extension().and_then(|ext| ext.to_str()) != Some("png") {
                 path.set_extension("png");
             }
+            // 只允许写到**已存在的目录**：这个 GET 会真实落盘，不该成为
+            // 「随便指一个路径就替调用方创建目录树」的写入口。
+            // 仍然需要有效令牌，且路径由调用方明确给出（离线复现工作流依赖这一点）。
+            let parent_exists = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .is_none_or(|parent| parent.is_dir());
+            if !parent_exists {
+                return Err(AppError {
+                    status: 400,
+                    message: "保存路径的父目录不存在".to_string(),
+                });
+            }
             image.save(&path).map_err(|error| AppError {
                 status: 500,
                 message: format!("保存测量帧失败: {error}"),

@@ -823,7 +823,9 @@ mod tests {
         source.username = "香菜".into();
         source.authority = CommandAuthority::Friend;
         source.observation.message_text = Some("香菜：@值守模式二级".into());
-        source.observation.message_y = Some(420);
+        source.observation.lock_anchor = Some(crate::observation::chat::LockAnchor::Screen {
+            y: 420,
+        });
         source.observation.message_id = Some(ObservedChatMessageId::new(
             VisualSessionId::new(7),
             ChatIdentity::Friend(Arc::from("最好的京子")),

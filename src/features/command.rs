@@ -39,8 +39,11 @@ pub(crate) struct CommandObservation {
     pub(crate) message_id: Option<ObservedChatMessageId>,
     /// 被观察消息自身的原始文本；命令锁只认这份数据，不回头查 tracker。
     pub(crate) message_text: Option<String>,
-    /// 被观察消息自身的屏幕 y（矩形顶部）；命令锁用它做锚点位置判定。
-    pub(crate) message_y: Option<i32>,
+    /// 命令锁锚点：OCR 是屏幕 y，外部源是服务端序号。
+    ///
+    /// 不再单存 `message_y`：那个类型只对屏幕消息成立。外部消息没有位置，
+    /// 塞哨兵坐标会让「同文本即同一条」对所有命令成立，整批吞掉真实命令。
+    pub(crate) lock_anchor: Option<crate::observation::chat::LockAnchor>,
 }
 
 /// 尚未选择或解析业务模块前的聊天输入。
@@ -366,6 +369,12 @@ pub(crate) struct RoutedCommand {
     pub(crate) user_command: String,
     pub(crate) message_type: String,
     pub(crate) username: String,
+    /// 发送者的游戏账号（仅外部聊天源提供；OCR 为 None）。
+    ///
+    /// 必须一路带到执行阶段：执行前的权限复查原来只按昵称解析，
+    /// 而外部源的昵称是 OCR 匹配键（自动生成、随机 8 位），与账号 UID 无关。
+    /// 于是「路由按 UID 判有权限、执行按昵称判没权限」——管理员命令被静默丢弃。
+    pub(crate) account: Option<CommandAccount>,
     pub(crate) authority: CommandAuthority,
     pub(crate) role: Option<IdentityRole>,
     pub(crate) permission_required: Option<IdentityRole>,
@@ -385,6 +394,7 @@ impl RoutedCommand {
             user_command: envelope.user_command().to_string(),
             message_type: envelope.message_type.clone(),
             username: envelope.username.clone(),
+            account: envelope.account().cloned(),
             authority: envelope.authority,
             role: None,
             permission_required: None,
@@ -405,6 +415,8 @@ impl RoutedCommand {
             raw,
             message_type: "控制台".to_string(),
             username: "控制台".to_string(),
+            // 控制台来源由已鉴权内部路径构造，没有游戏账号。
+            account: None,
             authority: CommandAuthority::HallMember,
             role: None,
             permission_required: None,

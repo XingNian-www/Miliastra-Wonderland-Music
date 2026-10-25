@@ -667,6 +667,8 @@ mod tests {
         let mut snapshot = ChatTimelineSnapshot {
             visual_session: crate::observation::chat::VisualSessionId::new(1),
             captured_at: opened_at - Duration::from_millis(1),
+            scope: crate::observation::chat::ChatScope::private(Arc::from("Alice")),
+            source: crate::observation::chat::SourceId::ocr(),
             chat: ChatIdentity::Friend(Arc::from("Alice")),
             messages: Vec::new(),
         };

@@ -144,6 +144,39 @@ pub enum ChatScope {
     Private { peer: Arc<str> },
 }
 
+#[cfg(test)]
+mod same_container_tests {
+    use super::ChatScope;
+
+    #[test]
+    fn hall_with_both_ids_requires_equality() {
+        // 双方都知道 hallId 时不能放宽：那是「换了大厅」的唯一证据。
+        // 外部源 HallChanged 不会关闭已开的窗口，放宽会让换厅后的新消息
+        // 被计入旧窗口的投票/决策。
+        assert!(ChatScope::hall_with_id(1).same_container(&ChatScope::hall_with_id(1)));
+        assert!(!ChatScope::hall_with_id(1).same_container(&ChatScope::hall_with_id(2)));
+    }
+
+    #[test]
+    fn hall_with_a_missing_id_is_treated_as_the_same_container() {
+        // OCR 拿不到 hallId，要求相等等于让它与外部源永不匹配。
+        assert!(ChatScope::hall().same_container(&ChatScope::hall_with_id(7)));
+        assert!(ChatScope::hall_with_id(7).same_container(&ChatScope::hall()));
+        assert!(ChatScope::hall().same_container(&ChatScope::hall()));
+    }
+
+    #[test]
+    fn private_scopes_match_by_category_not_by_peer() {
+        // OCR 用昵称、外部源优先 UID：同一个好友会有两个标识。
+        assert!(ChatScope::private("甲").same_container(&ChatScope::private("900000001")));
+    }
+
+    #[test]
+    fn hall_and_private_are_never_the_same_container() {
+        assert!(!ChatScope::hall().same_container(&ChatScope::private("甲")));
+        assert!(!ChatScope::private("甲").same_container(&ChatScope::hall()));
+    }
+}
 impl ChatScope {
     pub fn hall() -> Self {
         Self::Hall { id: None }
@@ -163,23 +196,27 @@ impl ChatScope {
 
     /// 两个范围是否指向同一个业务容器。
     ///
-    /// **只区分「大厅 / 私聊」，不区分「哪个大厅 / 哪个好友」。**
+    /// 分两层判断：
+    /// - 大厅：**双方都有 hallId 时必须相等**；任一方缺 id 才放宽。
+    ///   OCR 永远拿不到 hallId（画面没有稳定 id），要求相等等于让 OCR 与外部源
+    ///   永不匹配；但双方都知道 id 时没有理由再放宽——那正是「换了大厅」的证据。
+    ///   外部源 `HallChanged` 不会关闭已开的窗口，若这里也放宽，换厅后到达的
+    ///   新消息会被计入旧窗口的投票/决策。
+    /// - 私聊：只比类别，不比 peer。OCR 用昵称、外部源优先 UID，同一个好友会有
+    ///   两个标识；要求相等会让同一好友变成两个容器。当前没有订阅者绑定私聊
+    ///   容器，这条是前瞻性的。
     ///
-    /// 这是刻意放宽的：
-    /// - 大厅 id 侧，OCR 永远拿不到（恒 None），只有外部源有。要求 id 相等等于
-    ///   让 OCR 与外部源永远不匹配；而「任一方缺 id 就算同一」看似折中，实际
-    ///   等价于「大厅永远同容器」——因为 OCR 侧恒缺 id，边界从未生效。
-    ///   与其留一段不可达的比较，不如把语义写实：大厅就是一个容器。
-    /// - 私聊 peer 侧，OCR 用昵称、外部源优先 UID，同一个好友会有两个标识。
-    ///   要求 peer 相等会让外部源断线回落 OCR 时整批收不到该好友的消息。
-    ///   投票/决策窗口本来就按「当前大厅」工作，不需要区分到人。
-    ///
-    /// 需要精确定位某个大厅或某个好友时，用 `==`，不要用这个。
+    /// 需要精确定位某个大厅或某个好友时，用 `==`。
     pub fn same_container(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::Hall { .. }, Self::Hall { .. }) | (Self::Private { .. }, Self::Private { .. })
-        )
+        match (self, other) {
+            (Self::Hall { id: left }, Self::Hall { id: right }) => match (left, right) {
+                (Some(left), Some(right)) => left == right,
+                // 任一方缺 id：无法证明不是同一个大厅，按同一容器处理。
+                _ => true,
+            },
+            (Self::Private { .. }, Self::Private { .. }) => true,
+            _ => false,
+        }
     }
 
     pub fn label(&self) -> String {

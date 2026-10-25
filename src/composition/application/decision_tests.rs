@@ -401,6 +401,63 @@ fn screen_opened_window_still_receives_frames_after_external_takeover() {
     let got = reader.read_messages().unwrap();
     assert_eq!(got.len(), 1, "接管后外部帧必须送达，实际 {} 条", got.len());
 }
+/// 回归：多会话窗口首次见到某会话时只登记、不交付。
+///
+/// 该会话的整屏气泡都是「窗口打开后才渲染出来的历史」，时间戳晚于基线，
+/// 照单全收会把首屏历史当成新决策（MUST_READ 第 2 节被绕过）。
+/// 这条判据曾写反（`!insert()`），导致首帧泄漏、第二帧起永久丢弃，
+/// 而任何测试都没覆盖到——所以这里同时固定两个方向。
+#[test]
+fn multiple_conversations_skips_first_frame_then_accepts_later_ones() {
+    let shared = ChatTimeline::new();
+    let observations = ChatObservationShared::new();
+    let observation_session = observations.begin_exclusive().unwrap();
+    let subscriber = shared.subscribe().unwrap();
+    let baseline = shared
+        .publish(
+            Instant::now(),
+            ChatIdentity::PrimaryHall,
+            vec![message("基线", 10)],
+        )
+        .unwrap();
+    let mut reader = ChatDecisionReader {
+        listener_mode: ChatListenerMode::Primary,
+        subscriber,
+        scope: baseline.scope.clone(),
+        from_screen: true,
+        any_conversation: true,
+        chat: ChatIdentity::PrimaryHall,
+        settled_conversations: std::collections::HashSet::new(),
+        baseline_at: baseline.captured_at,
+        sequence_floor: None,
+        baseline_cursor: None,
+        seen: baseline
+            .messages
+            .into_iter()
+            .map(|m| (m.id, m.text))
+            .collect(),
+        screen_lock: DecisionScreenLock::default(),
+        _observation_session: observation_session,
+    };
+    // 首次见到这个会话：整屏历史，必须跳过。
+    publish(
+        &shared,
+        ChatIdentity::Friend("甲".into()),
+        vec![message("@确认", 20)],
+    );
+    assert!(
+        reader.read_messages().unwrap().is_empty(),
+        "首次见到某会话时，它的整屏历史不得作为决策输入"
+    );
+    // 第二次见到：这才是真正的回复。
+    publish(
+        &shared,
+        ChatIdentity::Friend("甲".into()),
+        vec![message("@确认", 40)],
+    );
+    let got = reader.read_messages().unwrap();
+    assert_eq!(got.len(), 1, "第二帧起必须正常交付，实际 {} 条", got.len());
+}
 /// 回归：外部源的决策读者必须按业务范围收消息，不能按屏幕桶。
 ///
 /// 外部大厅消息恒被映射成 `SecondaryHall`，而一级值守下的窗口期望 `PrimaryHall`。

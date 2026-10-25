@@ -161,6 +161,26 @@ impl ChatScope {
         matches!(self, Self::Hall { .. })
     }
 
+    /// 两个范围是否指向同一个业务容器。
+    ///
+    /// 与 `==` 的区别在 `Hall` 的 id：OCR 拿不到大厅 id（恒为 None），外部聊天源
+    /// 带 hallId（Some）。若严格要求 id 相等，外部源的决策窗口绑 `hall()` 就永远
+    /// 收不到带 id 的大厅消息——这正是「外部源下点歌/投票全超时」的根因。
+    ///
+    /// 判断规则：大厅之间只要有一方不知道 id，就按同一容器处理（宁宽勿严）；
+    /// 双方都知道 id 时必须相等；私聊必须 peer 相同。
+    pub fn same_container(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Hall { id: left }, Self::Hall { id: right }) => match (left, right) {
+                (Some(left), Some(right)) => left == right,
+                // 任一方缺 id：无法证明不是同一个大厅，按同一容器处理。
+                _ => true,
+            },
+            (Self::Private { peer: left }, Self::Private { peer: right }) => left == right,
+            _ => false,
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::Hall { id: Some(id) } => format!("hall:{id}"),

@@ -313,6 +313,94 @@ fn external_window_is_ready_then_receives_the_decision() {
     assert_eq!(got.len(), 1, "窗口必须收到 @1，实际 {} 条", got.len());
     assert!(got[0].text.ends_with("@1"), "实际: {:?}", got[0].text);
 }
+/// 回归：外部消息补了「昵称：」前缀后，`#` 命令仍能被提取。
+///
+/// `secondary_hall_command_text` 原本要求 `#` 在行首；外部源统一补前缀后
+/// `#` 就跑到行中间了，若坚持行首判断，`#状态`/`#塔罗牌`/`#手牌` 会整批失效。
+#[test]
+fn external_message_with_sender_prefix_still_yields_hash_commands() {
+    let shared = ChatTimeline::new();
+    let business = shared.subscribe_business().unwrap();
+    shared
+        .inject_external(
+            Instant::now(),
+            crate::observation::chat::VisualSessionId::new(u64::MAX),
+            "test",
+            vec![external_hall_message(1, "#状态")],
+        )
+        .unwrap();
+    let frames = business.read().unwrap();
+    let text = &frames[0].messages[0].text;
+    assert!(
+        text.contains("#状态"),
+        "正文里必须保留完整命令，实际: {text:?}"
+    );
+    assert_eq!(
+        super::secondary_hall_command_text(text),
+        Some("#状态"),
+        "# 命令必须能被提取，实际正文: {text:?}"
+    );
+}
+/// 回归：窗口在 OCR 下打开、随后外部源接管，仍要收到外部帧。
+///
+/// `from_screen` 按基线来源固化，若匹配也按 `chat` 比，外部帧（chat=None）
+/// 会被整批拒绝，窗口一条收不到直到超时。归属必须一律按 scope 判。
+#[test]
+fn screen_opened_window_still_receives_frames_after_external_takeover() {
+    let shared = ChatTimeline::new();
+    let observations = ChatObservationShared::new();
+    let observation_session = observations.begin_exclusive().unwrap();
+    let subscriber = shared.subscribe().unwrap();
+    // 用 OCR 的基线开窗：from_screen=true、绑二级大厅桶。
+    let baseline = shared
+        .publish(
+            Instant::now(),
+            ChatIdentity::SecondaryHall,
+            vec![message("候选", 10)],
+        )
+        .unwrap();
+    subscriber
+        .bind_chat(ChatIdentity::SecondaryHall, baseline.visual_session)
+        .unwrap();
+    let mut reader = ChatDecisionReader {
+        listener_mode: ChatListenerMode::Primary,
+        subscriber,
+        scope: baseline.scope.clone(),
+        from_screen: true,
+        any_conversation: false,
+        chat: ChatIdentity::SecondaryHall,
+        settled_conversations: std::collections::HashSet::new(),
+        baseline_at: baseline.captured_at,
+        sequence_floor: None,
+        baseline_cursor: Some((
+            baseline.visual_session,
+            baseline
+                .messages
+                .iter()
+                .map(|m| m.id.bubble_sequence.get())
+                .max()
+                .unwrap_or(0),
+        )),
+        seen: baseline
+            .messages
+            .into_iter()
+            .map(|m| (m.id, m.text))
+            .collect(),
+        screen_lock: DecisionScreenLock::default(),
+        _observation_session: observation_session,
+    };
+    // 外部源接管，注入一条大厅消息。
+    shared
+        .inject_external(
+            Instant::now(),
+            crate::observation::chat::VisualSessionId::new(u64::MAX),
+            "test",
+            vec![external_hall_message(5, "@1")],
+        )
+        .unwrap();
+    let got = reader.read_messages().unwrap();
+    assert_eq!(got.len(), 1, "接管后外部帧必须送达，实际 {} 条", got.len());
+}
 /// 回归：外部源的决策读者必须按业务范围收消息，不能按屏幕桶。
 ///
 /// 外部大厅消息恒被映射成 `SecondaryHall`，而一级值守下的窗口期望 `PrimaryHall`。

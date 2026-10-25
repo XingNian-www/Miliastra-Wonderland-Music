@@ -1890,22 +1890,12 @@ impl ApplicationRuntime {
                             }
                             continue;
                         };
-                        // 关键词 AI 聊天：与一级路径同一条规则——不是命令时才判定。
-                        // 以前只在 `handle_scan_messages`（一级 OCR）里触发，外部源
-                        // 的消息按二级分派，于是关键词闲聊在外部模式下永不响应。
-                        // 必须在 dispatch 之前调用：那里会移动 message。
-                        if is_hall && !command::looks_like_command(&message.text) {
-                            self.enqueue_ai_chat_keyword(
-                                &id,
-                                &crate::observation::chat::scan::ChatMessage {
-                                    message_type: message.message_type.clone(),
-                                    block: message.block,
-                                    text: message.text.clone(),
-                                },
-                                snapshot.captured_at,
-                                lock_anchor,
-                            )?;
-                        }
+                        // AI 触发需要正文与类型：dispatch 会移动 message，先留存。
+                        let ai_candidate = crate::observation::chat::scan::ChatMessage {
+                            message_type: message.message_type.clone(),
+                            block: message.block,
+                            text: message.text.clone(),
+                        };
                         let outcome = self.dispatch_chat_observations(vec![
                             ChatObservationDispatch::Secondary {
                                 frame,
@@ -1922,6 +1912,18 @@ impl ApplicationRuntime {
                                 },
                             },
                         ])?;
+                        // 关键词 AI 聊天：判据与一级路径完全一致——**路由失败之后**才
+                        // 判定，而不是提前看「像不像命令」。`looks_like_command` 只是
+                        // 样式启发，一条形似命令但没被任何模块认领的消息，在一级会去
+                        // 尝试 AI 触发，在二级不该被判死。
+                        if is_hall && outcome.unrecognized {
+                            self.enqueue_ai_chat_keyword(
+                                &id,
+                                &ai_candidate,
+                                snapshot.captured_at,
+                                lock_anchor,
+                            )?;
+                        }
                         // 缺陷 1：只有真正作为命令派发成功才写锁；
                         // 普通闲聊/被禁用/未路由只 ack，绝不能挤掉真命令条目。
                         if outcome.unrecognized {
@@ -2038,7 +2040,6 @@ impl ApplicationRuntime {
                 }
                 ChatObservationDispatch::Secondary { frame, observation } => {
                     let outcome = self.process_secondary_chat_observation(frame, observation)?;
-                    secondary.processed |= outcome.processed;
                     secondary.command_dispatched |= outcome.command_dispatched;
                     secondary.unrecognized |= outcome.unrecognized;
                 }

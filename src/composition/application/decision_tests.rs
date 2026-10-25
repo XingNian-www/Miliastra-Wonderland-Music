@@ -76,7 +76,7 @@ fn external_hall_message_with_hall(
 /// 构造一个「外部聊天源」语义的决策读者。
 ///
 /// 与 `shared_reader` 的区别就是解耦后的两条判据：
-/// - `from_screen = false` → 按 `scope` 匹配，不看屏幕桶；
+/// - `sequence_floor = Some(_)` → 按 `scope` 匹配，不看屏幕桶；
 /// - `baseline_cursor = None` → 不用非单调的哈希序当水位；
 /// - `screen_lock` 为空实现 → 哨兵坐标不参与去重。
 fn external_reader(
@@ -94,14 +94,11 @@ fn external_reader(
         .unwrap()
         .unwrap();
     // 外部源按业务容器绑定，不按屏幕桶。
-    subscriber
-        .bind_scope(baseline.scope.clone(), baseline.visual_session)
-        .unwrap();
+    subscriber.bind_scope(baseline.scope.clone()).unwrap();
     ChatDecisionReader {
         listener_mode: ChatListenerMode::Primary,
         subscriber,
         scope: baseline.scope.clone(),
-        from_screen: false,
         any_conversation: false,
         settled_conversations: std::collections::HashSet::new(),
         sequence_floor: Some(
@@ -138,18 +135,12 @@ fn external_reader_uses_sequence_watermark_without_waiting_for_a_frame() {
     let observation_session = observations.begin_exclusive().unwrap();
     let subscriber = shared.subscribe().unwrap();
     let scope = crate::observation::chat::ChatScope::hall();
-    subscriber
-        .bind_scope(
-            scope.clone(),
-            crate::observation::chat::VisualSessionId::new(0),
-        )
-        .unwrap();
+    subscriber.bind_scope(scope.clone()).unwrap();
     // 窗口打开时的水位是 5：之前的历史都不该进决策。
     let mut reader = ChatDecisionReader {
         listener_mode: ChatListenerMode::Primary,
         subscriber,
         scope,
-        from_screen: false,
         any_conversation: false,
         settled_conversations: std::collections::HashSet::new(),
         chat: ChatIdentity::SecondaryHall,
@@ -197,7 +188,6 @@ fn external_decision_window_is_ready_without_any_incoming_message() {
         listener_mode: ChatListenerMode::Primary,
         subscriber,
         scope: crate::observation::chat::ChatScope::hall(),
-        from_screen: false,
         any_conversation: false,
         settled_conversations: std::collections::HashSet::new(),
         chat: ChatIdentity::PrimaryHall,
@@ -241,7 +231,6 @@ fn external_decision_window_receives_messages_carrying_a_hall_id() {
         listener_mode: ChatListenerMode::Primary,
         subscriber,
         scope: crate::observation::chat::ChatScope::hall(),
-        from_screen: false,
         any_conversation: false,
         settled_conversations: std::collections::HashSet::new(),
         chat: ChatIdentity::PrimaryHall,
@@ -287,7 +276,6 @@ fn external_window_is_ready_then_receives_the_decision() {
         listener_mode: ChatListenerMode::Primary,
         subscriber,
         scope: crate::observation::chat::ChatScope::hall(),
-        from_screen: false,
         any_conversation: false,
         settled_conversations: std::collections::HashSet::new(),
         chat: ChatIdentity::SecondaryHall,
@@ -343,7 +331,7 @@ fn external_message_with_sender_prefix_still_yields_hash_commands() {
 }
 /// 回归：窗口在 OCR 下打开、随后外部源接管，仍要收到外部帧。
 ///
-/// `from_screen` 按基线来源固化，若匹配也按 `chat` 比，外部帧（chat=None）
+/// 若匹配也按 `chat` 比，外部帧（chat=None）
 /// 会被整批拒绝，窗口一条收不到直到超时。归属必须一律按 scope 判。
 #[test]
 fn screen_opened_window_still_receives_frames_after_external_takeover() {
@@ -351,7 +339,7 @@ fn screen_opened_window_still_receives_frames_after_external_takeover() {
     let observations = ChatObservationShared::new();
     let observation_session = observations.begin_exclusive().unwrap();
     let subscriber = shared.subscribe().unwrap();
-    // 用 OCR 的基线开窗：from_screen=true、绑二级大厅桶。
+    // 用 OCR 的基线开窗：sequence_floor=None、绑二级大厅桶。
     let baseline = shared
         .publish(
             Instant::now(),
@@ -366,7 +354,6 @@ fn screen_opened_window_still_receives_frames_after_external_takeover() {
         listener_mode: ChatListenerMode::Primary,
         subscriber,
         scope: baseline.scope.clone(),
-        from_screen: true,
         any_conversation: false,
         chat: ChatIdentity::SecondaryHall,
         settled_conversations: std::collections::HashSet::new(),
@@ -424,7 +411,6 @@ fn multiple_conversations_skips_first_frame_then_accepts_later_ones() {
         listener_mode: ChatListenerMode::Primary,
         subscriber,
         scope: baseline.scope.clone(),
-        from_screen: true,
         any_conversation: true,
         chat: ChatIdentity::PrimaryHall,
         settled_conversations: std::collections::HashSet::new(),
@@ -457,6 +443,96 @@ fn multiple_conversations_skips_first_frame_then_accepts_later_ones() {
     );
     let got = reader.read_messages().unwrap();
     assert_eq!(got.len(), 1, "第二帧起必须正常交付，实际 {} 条", got.len());
+}
+/// 回归：多会话窗口下，**外部帧**（chat=None）的首帧也必须跳过。
+///
+/// 这条分支此前两次写反（`!insert` 与 `insert` 极性相反），而所有测试都走
+/// OCR 的 Some 分支，零覆盖。外部帧 + 多会话窗口的组合因此一直漏报。
+#[test]
+fn multiple_conversations_skips_first_external_frame_of_new_container() {
+    let shared = ChatTimeline::new();
+    let observations = ChatObservationShared::new();
+    let observation_session = observations.begin_exclusive().unwrap();
+    let subscriber = shared
+        .subscribe_scoped(crate::observation::chat::ChatScope::hall())
+        .unwrap();
+    let mut reader = ChatDecisionReader {
+        listener_mode: ChatListenerMode::Primary,
+        subscriber,
+        scope: crate::observation::chat::ChatScope::hall(),
+        any_conversation: true,
+        chat: ChatIdentity::SecondaryHall,
+        settled_conversations: std::collections::HashSet::new(),
+        baseline_at: Instant::now(),
+        sequence_floor: Some(0),
+        baseline_cursor: None,
+        seen: std::collections::HashSet::new(),
+        screen_lock: DecisionScreenLock::default(),
+        _observation_session: observation_session,
+    };
+    // 第一次见到这个容器：整屏历史，必须跳过。
+    shared
+        .inject_external(
+            Instant::now(),
+            crate::observation::chat::VisualSessionId::new(u64::MAX),
+            "test",
+            vec![external_hall_message(1, "@确认")],
+        )
+        .unwrap();
+    assert!(
+        reader.read_messages().unwrap().is_empty(),
+        "外部帧首次见到某容器时，历史不得作为决策输入"
+    );
+    // 第二次：真正的回复。
+    shared
+        .inject_external(
+            Instant::now(),
+            crate::observation::chat::VisualSessionId::new(u64::MAX),
+            "test",
+            vec![external_hall_message(2, "@确认")],
+        )
+        .unwrap();
+    let got = reader.read_messages().unwrap();
+    assert_eq!(got.len(), 1, "第二帧起必须正常交付，实际 {} 条", got.len());
+}
+/// 回归：外部源开窗后掉线、OCR 回落，窗口不能在回落瞬间开始漏帧。
+///
+/// 基线来自外部源时，游标是服务端序号水位，与是哪块面板无关。
+/// 若仍按开窗时猜的 `chat` 过滤，实际驻留面板与开窗时不同就会整窗漏帧到超时。
+#[test]
+fn external_opened_window_keeps_receiving_after_ocr_fallback() {
+    let shared = ChatTimeline::new();
+    let observations = ChatObservationShared::new();
+    let observation_session = observations.begin_exclusive().unwrap();
+    let subscriber = shared
+        .subscribe_scoped(crate::observation::chat::ChatScope::hall())
+        .unwrap();
+    // 外部开窗：sequence_floor=Some(_)，chat 只是开窗时猜的面板。
+    let mut reader = ChatDecisionReader {
+        listener_mode: ChatListenerMode::Primary,
+        subscriber,
+        scope: crate::observation::chat::ChatScope::hall(),
+        any_conversation: false,
+        chat: ChatIdentity::SecondaryHall,
+        settled_conversations: std::collections::HashSet::new(),
+        baseline_at: Instant::now(),
+        sequence_floor: Some(0),
+        baseline_cursor: None,
+        seen: std::collections::HashSet::new(),
+        screen_lock: DecisionScreenLock::default(),
+        _observation_session: observation_session,
+    };
+    // 外部源掉线，OCR 接管，且拍到的是一级面板（与开窗时猜的二级不同）。
+    publish(
+        &shared,
+        ChatIdentity::PrimaryHall,
+        vec![message("甲：@1", 20)],
+    );
+    let got = reader.read_messages().unwrap();
+    assert!(
+        !got.is_empty(),
+        "回落 OCR 后窗口仍须收到消息，不能因面板号不同而漏帧"
+    );
 }
 /// 回归：外部源的决策读者必须按业务范围收消息，不能按屏幕桶。
 ///
@@ -520,7 +596,6 @@ fn shared_reader(
         listener_mode: ChatListenerMode::Primary,
         subscriber,
         scope: baseline.scope.clone(),
-        from_screen: true,
         any_conversation: false,
         settled_conversations: std::collections::HashSet::new(),
         sequence_floor: None,

@@ -1229,9 +1229,7 @@ struct ChatDecisionReader {
     ///
     /// 做法：第一次见到某个会话时，只把当时已有的气泡记为已见、不交给调用方；
     /// 从第二帧起才是真正的决策输入。
-    settled_conversations: std::collections::HashSet<crate::observation::chat::ChatIdentity>,
-    /// 窗口期基线来源。外部源没有屏幕，下面两项屏幕语义对它一律跳过。
-    from_screen: bool,
+    settled_conversations: std::collections::HashSet<crate::observation::chat::ChatScope>,
     baseline_at: Instant,
     /// 外部源的服务端序号水位（窗口打开时的最大已处理序号）。
     ///
@@ -1269,15 +1267,25 @@ impl ChatDecisionReader {
         //
         // 不能因为窗口是「屏幕来源」就改按 `chat` 比：窗口打开后外部源才接管时，
         // 外部帧的 `chat` 恒为 None，按桶比会让整窗一条都收不到，直到超时。
-        // `from_screen` 只用来决定**游标与位置锁**（见 [`Self::is_after_baseline_at`]），
-        // 不该参与「这条消息是不是本窗口的」。
+        // 「窗口的游标是序号还是时间」由 `sequence_floor` 决定，与这条判断无关。
         if !snapshot.scope.same_container(&self.scope) {
             return false;
         }
-        // 窗口绑了具体屏幕桶时，另一块大厅面板的快照仍要排除——那是同一大厅的
-        // 另一块面板，属于预期内的瞬时状态，不能拿它当基线游标。
-        // 外部帧（chat=None）没有面板概念，不受这条约束。
+        // 屏幕桶判据只在**屏幕基线**的窗口上生效。
+        //
+        // 目的：窗口绑在二级面板上时，一级面板的快照是同一大厅的另一视图，
+        // 不能拿它当基线游标（会把别的面板的历史当成决策输入）。
+        //
+        // 但基线来自外部源的窗口例外——它的游标是服务端序号水位，与面板无关。
+        // 若仍按开窗时猜的 `chat` 过滤，一旦外部源掉线、OCR 接管且实际驻留面板
+        // 与开窗时不同，整窗会在回落瞬间开始漏帧直到超时。
+        // `sequence_floor` 为 None 即「基线来自屏幕」——两个字段表达同一件事，
+        // 不再单独存一个「是否屏幕来源」开关（存了就会与它分叉）。
+        if self.sequence_floor.is_some() {
+            return true;
+        }
         match snapshot.chat.as_ref() {
+            // 外部帧没有面板概念：它靠 scope 已经判过归属。
             None => true,
             Some(incoming) => incoming == &self.chat,
         }
@@ -1297,17 +1305,10 @@ impl ChatDecisionReader {
         if !self.any_conversation {
             return false;
         }
-        match snapshot.chat.clone() {
-            Some(bucket) => self.settled_conversations.insert(bucket),
-            // 外部帧没有屏幕桶：按容器登记，避免同一好友的后续消息被当成首帧。
-            None => {
-                !self
-                    .settled_conversations
-                    .insert(crate::observation::chat::ChatIdentity::Friend(
-                        snapshot.scope.label().into(),
-                    ))
-            }
-        }
+        // 键一律用业务容器：外部帧没有屏幕桶，而屏幕桶本来也只是面板的别名，
+        // 两者混在一个集合里会让同一会话因来源不同而各记一次。
+        // `insert` 返回 true 表示「这次才第一次见到」——那正是要跳过的一帧。
+        self.settled_conversations.insert(snapshot.scope.clone())
     }
 
     /// 这条消息是否晚于窗口打开时的水位。
@@ -1319,12 +1320,12 @@ impl ChatDecisionReader {
         snapshot_at: Instant,
         message: &crate::observation::chat::ChatTimelineMessage,
     ) -> bool {
-        // 判据跟着**这一帧的来源**走，与 `from_screen` 保持一致：
-        // 外部源用单调序号，屏幕用时间。用 `message.id.is_from_screen()` 也一样
-        // （id 的来源由投递层写入），但显式用 `from_screen` 能表达「窗口基线的
-        // 来源」这层语义，避免两者将来分叉时静默错判。
+        // 判据跟着**这条消息自己的来源**走：外部源开窗后若掉线、OCR 接管，
+        // 窗口会先后收到两种消息。外部消息有服务端序号，OCR 消息没有
+        // （`source_sequence` 恒 0）。若按窗口来源判，OCR 消息会拿 0 去比
+        // 序号水位，`0 > floor` 恒假，整窗漏帧直到超时。
         match self.sequence_floor {
-            Some(floor) if !self.from_screen => message.source_sequence > floor,
+            Some(floor) if !message.id.is_from_screen() => message.source_sequence > floor,
             _ => snapshot_at > self.baseline_at,
         }
     }
@@ -1744,18 +1745,6 @@ impl ApplicationRuntime {
         // 切不进去只是保持原模式，不影响消息接收。
         // 这里只置位 pending_mode；真正的界面切换由 "值守请求自愈" 在
         // 主导航循环里入队执行（见 reconcile_pending_listener_mode）。
-        let external_listener_control: Option<
-            std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
-        > = {
-            let business = business.clone();
-            // 外部源的默认二级切换已移到主导航循环，只在首次遇到一级界面时触发；
-            // 这个回调保留给需要直接请求切换的调用点。
-            Some(std::sync::Arc::new(move |mode| {
-                if let Err(error) = business.request_chat_listener_mode(mode) {
-                    log::debug!("外部聊天源切换值守模式失败（保持当前模式）: {error}");
-                }
-            }))
-        };
         Ok(Self {
             ui: UiBundle {
                 coordinator: UiCoordinator::new(),
@@ -1838,7 +1827,6 @@ impl ApplicationRuntime {
                     chat_source_config,
                     Some(external_identity_access),
                     Some(config_store),
-                    external_listener_control,
                 )
                 .unwrap_or_else(|error| {
                     log::error!("外部聊天源启动失败，继续走 OCR: {error:#}");
@@ -2015,15 +2003,17 @@ struct SecondaryHallMessageClassification {
 }
 
 fn secondary_hall_command_text(text: &str) -> Option<&str> {
-    // `#` 命令从它所在位置起截断，不要求行首。
+    // 顺序与 OCR 既有语义一致：`@` 优先。
     //
-    // 屏幕上的一行可能是「昵称：#状态」（二级面板的好友消息排版），也可能
-    // 只是「#状态」。外部聊天源统一补了「昵称：」前缀后**全部**变成前者——
-    // 若坚持 `trimmed.starts_with('#')`，外部源的 `#` 命令会整批失效。
-    if let Some(index) = text.find(['#', '＃']) {
+    // 一级路径历史上就是「先找 @，找不到再找 #」（`CommandEnvelope` 的 At 分支
+    // 先判）。这里保持同一顺序，否则同时含 `@` 与 `#` 的文本（如歌名带 `#`）
+    // 会被截成后半段，两条路径派发不同结果——违反「OCR 行为不变」。
+    if let Some(index) = text.find(['@', '＠']) {
         return Some(text[index..].trim());
     }
-    text.find(['@', '＠']).map(|index| text[index..].trim())
+    // `#` 不要求行首：外部聊天源统一补了「昵称：」前缀，`#` 会落在行中间。
+    // 屏幕上的一行本来也可能是「昵称：#状态」（二级面板的好友消息排版）。
+    text.find(['#', '＃']).map(|index| text[index..].trim())
 }
 
 /// 判断一条二级大厅消息属于哪类，以及它是否依赖真实发送者身份。

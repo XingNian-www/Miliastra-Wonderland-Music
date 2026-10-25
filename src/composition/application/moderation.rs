@@ -98,13 +98,21 @@ impl ModerationVoteContext {
                         refresh = self.chat_timeline.request_refresh()?;
                         continue;
                     }
-                    // 空快照不能当基线：它的气泡序号上限是 0，之后整屏历史消息都会
-                    // 满足「> 0」而被当成新票重放。
+                    // 空帧能否作基线，取决于它是不是「真正的大厅帧」。
                     //
-                    // 代价：聊天区空无一物的大厅建不起基线，投票会等到超时并如实报
-                    // 「等待共享聊天管理投票基线超时」。这是有意的取舍——误收整屏旧票
-                    // 比超时更糟。外部源不受影响：注入从不产生空快照。
-                    if snapshot.messages.is_empty() {
+                    // 旧实现按 `chat == PrimaryHall` 判：空的 PrimaryHall 帧可以，
+                    // 其它桶（PublicChannel/Stranger/Unknown，scope 也算大厅）不行。
+                    // 现在按 scope 判会让这些桶都通过——那是本轮引入的行为改变。
+                    //
+                    // 所以这里补回原判据：只有一级/二级大厅面板的空帧才算基线。
+                    // 它们之后出现的整屏历史由序号水位挡住（空帧水位 0、历史序号 > 0，
+                    // 这是既有语义）；跨面板时由消息级时间比较挡住。
+                    if snapshot.messages.is_empty()
+                        && !matches!(
+                            snapshot.chat.as_ref(),
+                            Some(ChatIdentity::PrimaryHall | ChatIdentity::SecondaryHall)
+                        )
+                    {
                         refresh = self.chat_timeline.request_refresh()?;
                         continue;
                     }
@@ -134,6 +142,12 @@ struct AppModerationVotePort {
     baseline: Option<ChatTimelineSnapshot>,
     /// 窗口前的水位。OCR 是屏幕气泡序号上限，外部源是服务端序号。
     baseline_sequence: u64,
+    /// 最近一次读到消息的来源。
+    ///
+    /// 采样要求随它变：外部源是结构化传输、每条只投递一次，重复采样会让票
+    /// 永远凑不满稳态；OCR 会误读，必须连续多次读到才可信。
+    /// 用最近一帧而不是开窗时的 baseline：投票中途外部源连上/断开时两者不同。
+    last_source_was_external: bool,
     failed: bool,
 }
 
@@ -163,11 +177,13 @@ impl AppModerationVotePort {
                 .max()
                 .unwrap_or(0)
         };
+        let last_source_was_external = !baseline.source.is_ocr();
         Ok(Self {
             context,
             subscriber,
             baseline: Some(baseline),
             baseline_sequence,
+            last_source_was_external,
             failed: false,
         })
     }
@@ -187,6 +203,7 @@ impl AppModerationVotePort {
             subscriber,
             baseline: None,
             baseline_sequence: floor,
+            last_source_was_external: true,
             failed: false,
         }
     }
@@ -204,6 +221,13 @@ impl AppModerationVotePort {
             if !snapshot.scope.same_container(&self.context.vote_scope) {
                 continue;
             }
+            // 采样要求跟着这一帧的来源走：外部票每条只投递一次，要求三次会让它
+            // 永远凑不满稳态；OCR 票会误读，必须连续多次读到。
+            //
+            // 空帧也算「这一帧由该来源提供」：接管后回落 OCR 时，第一帧可能是
+            // 空的，若跳过它，采样要求会继续保持外部源的 1 次，OCR 误读票一次
+            // 就会被计入稳态。
+            self.last_source_was_external = !snapshot.source.is_ocr();
             // 时间过滤只对 OCR 基线有意义：外部源没有屏幕帧，captured_at 是
             // 投递时刻，同一毫秒的连续注入会被误判成「基线时刻」而丢弃。
             if let Some(baseline) = self.baseline.as_ref()
@@ -251,6 +275,15 @@ impl AppModerationVotePort {
             //
             // 只承认这两块面板互通：PublicChannel / StrangerMessages / Friend 是
             // 真正不同的容器，它们的消息不该计入大厅投票。
+            // 跨屏幕桶（一级区 ↔ 二级区）时整帧跳过，不做任何计票。
+            //
+            // 两边的 `bubble_sequence` 是各自从 0 开始的独立序列，无法互相比较；
+            // 而这一帧里**整屏气泡都是切换后才渲染出来的**，时间戳必然晚于基线。
+            // 若按时间放行，切换瞬间的整屏历史票（通常没人反对）会被当成新票，
+            // 方向恰好推向「无反对即通过」。
+            //
+            // 代价：切换后那一帧的新票也一起丢。这是既有语义（旧实现同样整帧
+            // continue），且丢一帧不至于让投票开不起来。
             let cross_bucket = self.baseline.as_ref().is_some_and(|baseline| {
                 let is_hall_panel = |chat: &ChatIdentity| {
                     matches!(
@@ -289,11 +322,11 @@ impl AppModerationVotePort {
                         // 拿它去比外部大水位会恒假，整窗 OCR 票静默丢光。
                         // 反过来（OCR→外部）也同理。所以按帧判单位，与
                         // `secondary_chat.rs` 每轮重判来源的做法保持一致。
-                        // 跨屏幕桶时水位不可比（两边序号各自从 0 开始），直接放行；
-                        // 同桶内仍按水位过滤，避免重放视图重建前的历史票。
-                        let newer = if cross_bucket {
-                            true
-                        } else if snapshot.source.is_ocr() {
+                        // 跨屏幕桶时序号不可比（两边各自从 0 开始），退回按时间判：
+                        if cross_bucket {
+                            return false;
+                        }
+                        let newer = if snapshot.source.is_ocr() {
                             message.id.bubble_sequence.get() > self.baseline_sequence
                         } else {
                             message.source_sequence > self.baseline_sequence
@@ -335,7 +368,10 @@ impl ModerationVotePort for AppModerationVotePort {
         // 外部聊天源是结构化传输：同一条消息只投递一次（按 dedup key 去重），
         // 要求连续三次采样会让外部票永远凑不满稳态，投票退化成只能超时通过。
         // OCR 仍需重复采样——同一句话在不同帧里可能被误读。
-        self.baseline.is_some()
+        //
+        // 判据是**最近一帧**的来源，不是开窗时的 baseline：投票中途外部源连上或
+        // 断开时两者不同，用后者会让回落期间的 OCR 票一次就被计入稳态。
+        !self.last_source_was_external
     }
 
     fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>> {
@@ -728,12 +764,6 @@ mod tests {
             .unwrap()
     }
 
-    /// 二级面板与一级大厅是同一个业务容器，可以直接作为投票基线。
-    ///
-    /// 这条以前验证「二级面板不算基线、必须重新挂 refresh」——那是按屏幕桶判
-    /// 身份时的行为。改为按 scope 判后两块面板同属 `Hall{None}`，二级快照就是
-    /// 合法基线；外部聊天源更是**只会**产生 SecondaryHall，不接受就永远开不了投票。
-
     /// 外部聊天源：同一票只需一次即可计入稳态。
     ///
     /// 外部消息按 dedup key 只投递一次，若仍要求连续三次采样，外部票永远凑不满
@@ -781,6 +811,12 @@ mod tests {
         );
     }
 
+    /// 二级面板与一级大厅是同一个业务容器，可以直接作为投票基线。
+    ///
+    /// 这条以前验证「二级面板不算基线、必须重新挂 refresh」——那是按屏幕桶判
+    /// 身份时的行为。改为按 scope 判后两块面板同属 `Hall{None}`，二级快照就是
+    /// 合法基线；外部聊天源更是只会产生 SecondaryHall（`chat` 恒为 None），
+    /// 不接受就永远开不了投票。
     #[test]
     fn moderation_vote_accepts_secondary_panel_baseline() {
         let shared = ChatTimeline::new();

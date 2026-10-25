@@ -26,7 +26,7 @@ use std::time::Instant;
 
 pub(crate) use passive::{
     PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity,
-    parse_secondary_sender_identity, passive_layout, passive_text, recognize_passive_secondary,
+    parse_secondary_sender_identity, passive_layout, recognize_passive_secondary,
 };
 pub(crate) use scan::{
     ChatMessage, ChatScanTelemetry, ChatScanTelemetrySink, RecognizedChatMessage,

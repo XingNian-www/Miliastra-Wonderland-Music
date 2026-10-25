@@ -1220,11 +1220,16 @@ struct ChatDecisionReader {
     ///
     /// 邀请确认、自定义流程确认这类窗口既可能从大厅来，也可能从好友私聊来，
     /// 因此不绑定单一容器，由调用方再按消息类型（blue/pink）筛选。
-    ///
-    /// 代价：窗口打开后新出现的会话，其整屏历史气泡都晚于 `baseline_at`，
-    /// 可能被当成新决策。这类窗口的确认文本都带唯一 token，业务层会按 token
-    /// 去重；且位置锁（`screen_lock`）在 OCR 路径仍生效，重复文本会被否决。
     any_conversation: bool,
+    /// 已见过首帧的会话。
+    ///
+    /// 只对 `any_conversation` 生效。窗口打开后**新出现**的会话，它的整屏
+    /// 历史气泡都晚于 `baseline_at`，若照单全收就会把首屏历史当成新决策
+    /// （MUST_READ 第 2 节的「首屏历史不执行」被绕过）。
+    ///
+    /// 做法：第一次见到某个会话时，只把当时已有的气泡记为已见、不交给调用方；
+    /// 从第二帧起才是真正的决策输入。
+    settled_conversations: std::collections::HashSet<crate::observation::chat::ChatIdentity>,
     /// 窗口期基线来源。外部源没有屏幕，下面两项屏幕语义对它一律跳过。
     from_screen: bool,
     baseline_at: Instant,
@@ -1286,6 +1291,19 @@ impl ChatDecisionReader {
         let mut messages = Vec::new();
         for snapshot in self.subscriber.read()? {
             if !self.same_conversation(&snapshot) {
+                continue;
+            }
+            // 多会话窗口里首次出现的会话：只登记、不交付。
+            //
+            // 它的整屏气泡都是「窗口打开后才被渲染出来的历史」，时间戳自然晚于
+            // `baseline_at`，照单全收会把首屏历史当成新决策。从第二帧起才是输入。
+            if self.any_conversation
+                && let Some(bucket) = snapshot.chat.clone()
+                && !self.settled_conversations.insert(bucket)
+            {
+                continue;
+            }
+            if self.any_conversation && snapshot.chat.is_none() && snapshot.source.is_ocr() {
                 continue;
             }
             let snapshot_at = snapshot.captured_at;

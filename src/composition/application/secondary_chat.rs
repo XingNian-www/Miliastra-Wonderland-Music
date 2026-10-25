@@ -88,7 +88,6 @@ impl Drop for SecondaryUnreadTaskCompletionGuard {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct SecondaryObservationOutcome {
-    pub(super) processed: bool,
     pub(super) command_dispatched: bool,
     pub(super) unrecognized: bool,
 }
@@ -622,17 +621,13 @@ impl ApplicationRuntime {
             let any_conversation = scope == ChatDecisionScope::MultipleConversations;
             if !any_conversation {
                 // 会话号对账本水位基线无意义：不按 session 过滤，只按序号。
-                subscriber.bind_scope(
-                    hall_scope.clone(),
-                    crate::observation::chat::VisualSessionId::new(0),
-                )?;
+                subscriber.bind_scope(hall_scope.clone())?;
             }
             return Ok(ChatDecisionReader {
                 listener_mode,
                 subscriber,
                 chat,
                 scope: hall_scope,
-                from_screen: false,
                 any_conversation,
                 settled_conversations: std::collections::HashSet::new(),
                 baseline_at: Instant::now(),
@@ -721,13 +716,13 @@ impl ApplicationRuntime {
             // 多会话窗口：不绑任何容器，投递层才会把大厅与私聊都送进来；
             // 由调用方按消息类型（blue/pink）自行筛选。
         } else if baseline.source.is_ocr() {
-            // 按**基线快照的来源**决定绑法，与 from_screen 保持同一判据。
+            // 按**基线快照的来源**决定绑法。
             // 用入口期的活标志会在「窗口打开后外部源才接管」时绑错：
             // baseline 是外部快照、却绑了屏幕桶，投递层随后整批丢弃。
             subscriber.bind_chat(chat.clone(), baseline.visual_session)?;
         } else {
             // 外部源按业务容器绑定：它的消息没有屏幕桶，绑 chat 会被投递层整批挡住。
-            subscriber.bind_scope(baseline.scope.clone(), baseline.visual_session)?;
+            subscriber.bind_scope(baseline.scope.clone())?;
         }
         // 外部源不用屏幕游标：它的 `bubble_sequence` 是去重哈希、不单调，
         // 拿最大值当水位会把约一半新消息误判成旧消息。序号单调性由账本负责。
@@ -762,8 +757,7 @@ impl ApplicationRuntime {
             scope: baseline.scope.clone(),
             // 按**基线快照的来源**固化，不用调用瞬间的活标志：
             // 窗口期间外部源可能掉线（租约超时）让 OCR 恢复发布，
-            // 若这时还按 from_screen=false 读，屏幕上的旧决策气泡会被当成新决策。
-            from_screen: baseline.source.is_ocr(),
+            // 若这时还按外部源的判据读，屏幕上的旧决策气泡会被当成新决策。
             any_conversation: scope == ChatDecisionScope::MultipleConversations,
             settled_conversations: std::collections::HashSet::new(),
             baseline_at: baseline.captured_at,
@@ -1028,19 +1022,23 @@ impl ApplicationRuntime {
             // 行首就是命令前缀时走正规路径，不要退回下面的「找 @」兜底：
             // 兜底位于身份检查之后，外部源昵称缺失时整条 @ 命令会被吞掉。
             // Amp 是测试专用前缀，仍然排除。
-            if let Some(envelope) = CommandEnvelope::new(
-                &text,
-                &shortcut_player,
-                &message_type,
-                text.trim(),
-                command_observation.clone(),
-            )
-            .map(|envelope| envelope.with_account(account.clone()))
+            // 用提取结果而不是 `text.trim()`：正文可能带「昵称：」前缀（外部源
+            // 统一补成 OCR 排版），`CommandEnvelope` 的前缀判定要求 `@`/`#` 在开头。
+            // 直接传原始 text 会让外部源的 `#` 命令恒失败——Hash 分支 strip_prefix 失败，
+            // 返回 None，整条落入 Ignored。
+            if let Some(command_text) = secondary_hall_command_text(&text)
+                && let Some(envelope) = CommandEnvelope::new(
+                    &text,
+                    &shortcut_player,
+                    &message_type,
+                    command_text,
+                    command_observation.clone(),
+                )
+                .map(|envelope| envelope.with_account(account.clone()))
                 && envelope.prefix() != CommandPrefix::Amp
                 && let Some(parsed) =
                     router.route(&envelope, self.business.business.active_entertainment()?)
             {
-                outcome.processed = true;
                 outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
                 continue;
             }
@@ -1054,7 +1052,6 @@ impl ApplicationRuntime {
                 && let Some(parsed) =
                     router.route(&envelope, self.business.business.active_entertainment()?)
             {
-                outcome.processed = true;
                 outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
                 continue;
             }
@@ -1066,7 +1063,6 @@ impl ApplicationRuntime {
                     .and_then(|player| turtle_soup::parse_question_message(&text, Some(player)));
                 if let Some(question) = question {
                     self.enqueue_turtle_soup_question(question, frame.captured_at())?;
-                    outcome.processed = true;
                     continue;
                 }
             }
@@ -1110,7 +1106,6 @@ impl ApplicationRuntime {
                 outcome.unrecognized = true;
                 continue;
             };
-            outcome.processed = true;
             outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
         }
         Ok(outcome)
@@ -1119,6 +1114,38 @@ impl ApplicationRuntime {
 
 #[cfg(test)]
 mod tests {
+    /// 端到端回归：外部源的 `#` 命令必须能真的派发。
+    ///
+    /// 这条覆盖的是**整条链路**：投递层补「昵称：」前缀 → 提取命令 → 构造信封 →
+    /// 路由命中。此前只测了提取函数返回 `Some`，而派发路径用的是 `text.trim()`，
+    /// 于是测试全绿但功能不通。
+    #[test]
+    fn external_hash_command_survives_sender_prefix_through_dispatch() {
+        use crate::features::command::CommandEnvelope;
+        // 外部源投递层补前缀后的正文。
+        let text = "玩家癸：#状态";
+        let command_text =
+            super::secondary_hall_command_text(text).expect("带昵称前缀的 # 命令必须能被提取");
+        let envelope = CommandEnvelope::new(text, "玩家癸", "blue", command_text, Default::default())
+            .expect("提取出的 #状态 必须能构造命令信封");
+        assert_eq!(
+            format!("{:?}", envelope.prefix()),
+            "Hash",
+            "前缀必须是 Hash，实际正文: {text:?}"
+        );
+    }
+
+    /// 同样覆盖 `@` 命令，确认两条前缀都通。
+    #[test]
+    fn external_at_command_survives_sender_prefix_through_dispatch() {
+        use crate::features::command::CommandEnvelope;
+        let text = "玩家癸：@状态";
+        let command_text =
+            super::secondary_hall_command_text(text).expect("带昵称前缀的 @ 命令必须能被提取");
+        let envelope = CommandEnvelope::new(text, "玩家癸", "blue", command_text, Default::default())
+            .expect("提取出的 @状态 必须能构造命令信封");
+        assert_eq!(format!("{:?}", envelope.prefix()), "At");
+    }
     use crate::features::entertainment::EntertainmentKind;
 
     use super::*;

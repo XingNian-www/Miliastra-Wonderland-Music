@@ -214,9 +214,6 @@ pub(crate) fn spawn(
     config: ChatSourceConfig,
     identity_access: Option<crate::features::identity::IdentityAccess>,
     config_store: Option<crate::config::SharedConfigStore>,
-    listener_control: Option<
-        std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
-    >,
 ) -> Result<ExternalChatState> {
     let state = ExternalChatState::default();
     if !config.enabled {
@@ -231,7 +228,6 @@ pub(crate) fn spawn(
                 config,
                 identity_access,
                 config_store,
-                listener_control,
                 worker_state,
             )
         })
@@ -244,9 +240,6 @@ fn run(
     config: ChatSourceConfig,
     identity_access: Option<crate::features::identity::IdentityAccess>,
     config_store: Option<crate::config::SharedConfigStore>,
-    listener_control: Option<
-        std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
-    >,
     state: ExternalChatState,
 ) {
     let lease = Duration::from_millis(config.lease_timeout_ms);

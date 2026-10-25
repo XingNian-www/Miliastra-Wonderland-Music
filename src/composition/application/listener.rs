@@ -1890,6 +1890,22 @@ impl ApplicationRuntime {
                             }
                             continue;
                         };
+                        // 关键词 AI 聊天：与一级路径同一条规则——不是命令时才判定。
+                        // 以前只在 `handle_scan_messages`（一级 OCR）里触发，外部源
+                        // 的消息按二级分派，于是关键词闲聊在外部模式下永不响应。
+                        // 必须在 dispatch 之前调用：那里会移动 message。
+                        if is_hall && !command::looks_like_command(&message.text) {
+                            self.enqueue_ai_chat_keyword(
+                                &id,
+                                &crate::observation::chat::scan::ChatMessage {
+                                    message_type: message.message_type.clone(),
+                                    block: message.block,
+                                    text: message.text.clone(),
+                                },
+                                snapshot.captured_at,
+                                lock_anchor,
+                            )?;
+                        }
                         let outcome = self.dispatch_chat_observations(vec![
                             ChatObservationDispatch::Secondary {
                                 frame,
@@ -2160,7 +2176,12 @@ impl ApplicationRuntime {
             // 关键词 AI 聊天：不是 @ 命令，因此在路由失败后单独判定。
             // 与命令互斥：一条消息要么是命令，要么是闲聊触发，不会被处理两次。
             if routed.is_none() && observed.is_new {
-                self.enqueue_ai_chat_keyword(&observed.id, &message, captured_at)?;
+                self.enqueue_ai_chat_keyword(
+                    &observed.id,
+                    &message,
+                    captured_at,
+                    lock_anchor_for(&observed.id, message.block.y),
+                )?;
             }
 
             if sample_as_question && routed.is_none() {
@@ -2293,6 +2314,7 @@ impl ApplicationRuntime {
         message_id: &crate::observation::chat::ObservedChatMessageId,
         message: &crate::observation::chat::scan::ChatMessage,
         captured_at: Instant,
+        lock_anchor: crate::observation::chat::LockAnchor,
     ) -> Result<()> {
         let config = self.lifecycle.live_configs.snapshot().ai_chat.clone();
         // 大厅消息没有独立 sender 字段，昵称在文本行首，与命令信封共用同一套切分。
@@ -2342,7 +2364,7 @@ impl ApplicationRuntime {
             captured_at: Some(captured_at),
             message_id: Some(message_id.clone()),
             message_text: Some(message.text.clone()),
-            lock_anchor: Some(lock_anchor_for(message_id, message.block.y)),
+            lock_anchor: Some(lock_anchor),
         };
         let pending = PendingCommand {
             lock_key: crate::interfaces::chat::lock_key(&routed),

@@ -672,7 +672,8 @@ impl ChatTimeline {
             id,
             Subscription {
                 chat,
-                // 订阅时只绑 chat；需要按业务容器收消息的读者随后调 bind_scope。
+                // 订阅入口决定绑定方式：subscribe() 不绑；subscribe_scoped() 直接写
+                // scope；subscribe_chat 已删除。bind_chat / bind_scope 供后续改绑。
                 scope: None,
                 session: None,
                 queue: VecDeque::new(),
@@ -1114,7 +1115,21 @@ impl ChatTimeline {
             accepted.push((id, identity, scope));
         }
         if accepted.is_empty() {
-            return Ok(accepted.into_iter().map(|(id, _, _)| id).collect());
+            // 整批都无法映射业务容器（缺 channel / 未知频道）：没有快照可投，
+            // 但**仍要回应**等待中的 refresh 围栏。
+            //
+            // 否则这成了「围栏无条件完成」的唯一例外：外部源独占期间观察线程
+            // 不发布帧，等待中的决策窗口只能干等到超时。围栏完成不等于投递成立，
+            // 等待者拿到空结果会自己决定重试还是采用。
+            complete_refreshes(
+                &mut state,
+                captured_at,
+                Err(RefreshFailure::NoChat(
+                    "外部批次没有可用的业务容器".to_string(),
+                )),
+            );
+            self.inner.changed.notify_all();
+            return Ok(Vec::new());
         }
         // 推给订阅者：命令链路靠这条队列拿消息。
         // 与 `publish` 的投递段保持同一套过滤规则（绑定聊天、溢出保护）。
@@ -1805,12 +1820,19 @@ fn deliver_snapshot(
             );
             continue;
         }
+        // 会话号变化是否构成「换了会话」。
+        //
+        // 三种情况不算：
+        // - 外部注入：重连换 epoch 不代表历史失效，清掉会丢窗口里已入队未读的决策。
+        // - 绑了业务容器的读者：它按 scope 收，一级区与二级区是同一大厅的两块面板、
+        //   各自有独立 tracker 和会话号。若按会话号变化清队列，每次面板切换都会把
+        //   投票/决策攒到一半的样本清空，永远凑不够稳态票数。
+        // - 绑了屏幕桶的读者：保持原有「视图重建即重置」语义。
         let session_changed = subscriber
             .session
             .is_some_and(|session| session != snapshot.visual_session)
-            // 外部注入**不清队列**：纯重连换 epoch 不代表历史失效，
-            // 清掉会把窗口里已入队未读的决策消息丢掉。原 inject_external 就是这样。
-            && snapshot.source.is_ocr();
+            && snapshot.source.is_ocr()
+            && subscriber.scope.is_none();
         if session_changed {
             // 同一个聊天里的视图重建（机器人自己发言、面板滚动、重新申请帧）会让视觉会话号自增。
             // 确认读者重置基线继续等待；业务读者保留尚未消费的旧会话快照。
@@ -1879,6 +1901,10 @@ impl ChatTimelineSubscriber {
         if let Some(reason) = &subscriber.failure {
             bail!("{reason}");
         }
+        // 清掉 chat：否则投递层会把「绑定的 chat」和「绑定的 scope」叠加成 AND，
+        // 先 bind_chat 再 bind_scope 的读者会被双重筛掉。
+        // 一个读者要么按屏幕桶收，要么按业务容器收，不该同时受两者约束。
+        subscriber.chat = None;
         subscriber.scope = Some(scope);
         subscriber.session = Some(session);
         Ok(())

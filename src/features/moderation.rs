@@ -643,12 +643,26 @@ impl ModerationService {
         }
         let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
         let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
+        // 超时且无反对 → 通过。这是既有的产品策略（测试
+        // `timeout_passes_only_when_no_stable_disagreement_exists` 明确固定它）。
+        //
+        // 但要注意：agree=0 时这条同样成立，而「一票没收到」既可能是真的没人
+        // 说话，也可能是观测出了问题（共享观察读不到、外部源掉线、基线建不起来）。
+        // 两种情况在这里无法区分，所以额外记一条 warn，让运维能从日志看出
+        // 「这次通过是在零观测下产生的」。
         if disagree == 0 {
-            log::info!(
-                "{}投票超时: 同意={} 不同意=0，无反对，按通过处理",
-                command.action.label(),
-                agree,
-            );
+            if agree == 0 {
+                log::warn!(
+                    "{}投票超时: 同意=0 不同意=0，无任何观测，按既有策略通过；若这不是预期，请检查共享观察与外部聊天源是否正常工作",
+                    command.action.label(),
+                );
+            } else {
+                log::info!(
+                    "{}投票超时: 同意={} 不同意=0，无反对，按通过处理",
+                    command.action.label(),
+                    agree,
+                );
+            }
             Ok(true)
         } else {
             log::info!(

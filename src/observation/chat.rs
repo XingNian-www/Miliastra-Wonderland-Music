@@ -163,22 +163,23 @@ impl ChatScope {
 
     /// 两个范围是否指向同一个业务容器。
     ///
-    /// 与 `==` 的区别在 `Hall` 的 id：OCR 拿不到大厅 id（恒为 None），外部聊天源
-    /// 带 hallId（Some）。若严格要求 id 相等，外部源的决策窗口绑 `hall()` 就永远
-    /// 收不到带 id 的大厅消息——这正是「外部源下点歌/投票全超时」的根因。
+    /// **只区分「大厅 / 私聊」，不区分「哪个大厅 / 哪个好友」。**
     ///
-    /// 判断规则：大厅之间只要有一方不知道 id，就按同一容器处理（宁宽勿严）；
-    /// 双方都知道 id 时必须相等；私聊必须 peer 相同。
+    /// 这是刻意放宽的：
+    /// - 大厅 id 侧，OCR 永远拿不到（恒 None），只有外部源有。要求 id 相等等于
+    ///   让 OCR 与外部源永远不匹配；而「任一方缺 id 就算同一」看似折中，实际
+    ///   等价于「大厅永远同容器」——因为 OCR 侧恒缺 id，边界从未生效。
+    ///   与其留一段不可达的比较，不如把语义写实：大厅就是一个容器。
+    /// - 私聊 peer 侧，OCR 用昵称、外部源优先 UID，同一个好友会有两个标识。
+    ///   要求 peer 相等会让外部源断线回落 OCR 时整批收不到该好友的消息。
+    ///   投票/决策窗口本来就按「当前大厅」工作，不需要区分到人。
+    ///
+    /// 需要精确定位某个大厅或某个好友时，用 `==`，不要用这个。
     pub fn same_container(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Hall { id: left }, Self::Hall { id: right }) => match (left, right) {
-                (Some(left), Some(right)) => left == right,
-                // 任一方缺 id：无法证明不是同一个大厅，按同一容器处理。
-                _ => true,
-            },
-            (Self::Private { peer: left }, Self::Private { peer: right }) => left == right,
-            _ => false,
-        }
+        matches!(
+            (self, other),
+            (Self::Hall { .. }, Self::Hall { .. }) | (Self::Private { .. }, Self::Private { .. })
+        )
     }
 
     pub fn label(&self) -> String {

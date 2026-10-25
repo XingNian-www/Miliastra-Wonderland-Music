@@ -1078,6 +1078,14 @@ impl ChatTimeline {
             // 命令解析不受影响：`secondary_hall_command_text` 从 `@` 处截断，
             // 昵称前缀本来就被丢弃；`CommandEnvelope::new` 的 original_text 与
             // user_command 也是分开传的。
+            // 正文对齐 OCR 的屏幕排版：二级气泡把「昵称：」直接渲染在正文里。
+            //
+            // 外部源把这部分拆成 sender + text 两个字段，下游却只认正文格式
+            // （投票解析、命令提取都按「昵称：命令」写的）。所以在这里补齐一次，
+            // 而不是让每个消费者各拼一遍。
+            //
+            // `#` 命令的提取不要求行首（`secondary_hall_command_text` 按字符查找），
+            // 所以补前缀不会让它失效。
             let display_text = match revision.sender.as_deref().map(str::trim) {
                 Some(name) if !name.is_empty() && !revision.text.contains('：') => {
                     format!("{name}：{}", revision.text.trim())

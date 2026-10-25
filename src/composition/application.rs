@@ -1263,12 +1263,21 @@ impl ChatDecisionReader {
         if self.any_conversation {
             return true;
         }
-        if self.from_screen {
-            snapshot.chat.as_ref() == Some(&self.chat)
-        } else {
-            // 用 same_container 而非 ==：外部源带 hallId，窗口绑的是不带 id 的
-            // 大厅容器，严格相等会让整窗收不到消息。
-            snapshot.scope.same_container(&self.scope)
+        // 归属一律按业务容器判，与来源无关。
+        //
+        // 不能因为窗口是「屏幕来源」就改按 `chat` 比：窗口打开后外部源才接管时，
+        // 外部帧的 `chat` 恒为 None，按桶比会让整窗一条都收不到，直到超时。
+        // `from_screen` 只用来决定**游标与位置锁**（见 [`Self::is_after_baseline_at`]），
+        // 不该参与「这条消息是不是本窗口的」。
+        if !snapshot.scope.same_container(&self.scope) {
+            return false;
+        }
+        // 窗口绑了具体屏幕桶时，另一块大厅面板的快照仍要排除——那是同一大厅的
+        // 另一块面板，属于预期内的瞬时状态，不能拿它当基线游标。
+        // 外部帧（chat=None）没有面板概念，不受这条约束。
+        match snapshot.chat.as_ref() {
+            None => true,
+            Some(incoming) => incoming == &self.chat,
         }
     }
 
@@ -1983,9 +1992,13 @@ struct SecondaryHallMessageClassification {
 }
 
 fn secondary_hall_command_text(text: &str) -> Option<&str> {
-    let trimmed = text.trim();
-    if trimmed.starts_with('#') || trimmed.starts_with('＃') {
-        return Some(trimmed);
+    // `#` 命令从它所在位置起截断，不要求行首。
+    //
+    // 屏幕上的一行可能是「昵称：#状态」（二级面板的好友消息排版），也可能
+    // 只是「#状态」。外部聊天源统一补了「昵称：」前缀后**全部**变成前者——
+    // 若坚持 `trimmed.starts_with('#')`，外部源的 `#` 命令会整批失效。
+    if let Some(index) = text.find(['#', '＃']) {
+        return Some(text[index..].trim());
     }
     text.find(['@', '＠']).map(|index| text[index..].trim())
 }

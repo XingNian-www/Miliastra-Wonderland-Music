@@ -693,8 +693,8 @@ impl ApplicationRuntime {
             // 用入口处的一次快照会让后面这半段永远走错分支，一路空转到超时。
             let external_now = self.lifecycle.external_chat.supplies_hall_messages();
             let matched = if external_now {
-                // 外部源：只看业务范围。它的大厅消息恒被映射成 SecondaryHall，
-                // 按屏幕桶匹配会让一级值守下的窗口永远等不到基线。
+                // 外部源：只看业务范围。外部帧没有屏幕桶（chat 恒为 None），
+                // 按屏幕桶匹配会让窗口永远等不到基线。
                 snapshot.scope.is_hall()
             } else {
                 // OCR：只认绑定的那一块聊天。另一块大厅面板的快照会被这里拒绝，

@@ -1256,9 +1256,11 @@ struct ChatDecisionReader {
 impl ChatDecisionReader {
     /// 这份快照是否属于本窗口的会话。
     ///
-    /// 屏幕读者按屏幕桶判（一级区与二级区是同一大厅的两块面板，必须区分）；
-    /// 外部源读者按业务范围判（外部消息没有屏幕，大厅恒映射 SecondaryHall，
-    /// 按屏幕桶判会永远匹配不上）。三条读者路径共用这一个判定，避免漂移。
+    /// 归属一律按业务容器（`scope`）判，与来源无关。窗口绑了具体屏幕桶时，
+    /// 额外排除「同一大厅的另一块面板」——那是同一物理会话的另一个视图，
+    /// 不能拿它当基线游标。外部帧没有屏幕桶（`chat` 为 None），不受这条约束。
+    ///
+    /// 三条读者路径共用这一个判定，避免漂移。
     fn same_conversation(&self, snapshot: &crate::observation::chat::ChatTimelineSnapshot) -> bool {
         if self.any_conversation {
             return true;
@@ -1281,6 +1283,33 @@ impl ChatDecisionReader {
         }
     }
 
+    /// 多会话窗口的首帧防护：首次见到某会话时只登记、不交付。
+    ///
+    /// 该会话的整屏气泡都是「窗口打开后才渲染出来的历史」，时间戳晚于基线，
+    /// 照单全收会把首屏历史当成新决策（MUST_READ 第 2 节被绕过）。
+    ///
+    /// 抽成方法是为了让三条读取路径共用同一条判据——它们各有自己的循环，
+    /// 若某一处漏掉，那条路径就会静默绕开首屏历史抑制。
+    fn skips_first_frame_of_new_conversation(
+        &mut self,
+        snapshot: &crate::observation::chat::ChatTimelineSnapshot,
+    ) -> bool {
+        if !self.any_conversation {
+            return false;
+        }
+        match snapshot.chat.clone() {
+            Some(bucket) => self.settled_conversations.insert(bucket),
+            // 外部帧没有屏幕桶：按容器登记，避免同一好友的后续消息被当成首帧。
+            None => {
+                !self
+                    .settled_conversations
+                    .insert(crate::observation::chat::ChatIdentity::Friend(
+                        snapshot.scope.label().into(),
+                    ))
+            }
+        }
+    }
+
     /// 这条消息是否晚于窗口打开时的水位。
     ///
     /// 屏幕消息没有服务端序号，退回按时间比较（与解耦前一致）；
@@ -1290,8 +1319,12 @@ impl ChatDecisionReader {
         snapshot_at: Instant,
         message: &crate::observation::chat::ChatTimelineMessage,
     ) -> bool {
+        // 判据跟着**这一帧的来源**走，与 `from_screen` 保持一致：
+        // 外部源用单调序号，屏幕用时间。用 `message.id.is_from_screen()` 也一样
+        // （id 的来源由投递层写入），但显式用 `from_screen` 能表达「窗口基线的
+        // 来源」这层语义，避免两者将来分叉时静默错判。
         match self.sequence_floor {
-            Some(floor) if !message.id.is_from_screen() => message.source_sequence > floor,
+            Some(floor) if !self.from_screen => message.source_sequence > floor,
             _ => snapshot_at > self.baseline_at,
         }
     }
@@ -1302,17 +1335,7 @@ impl ChatDecisionReader {
             if !self.same_conversation(&snapshot) {
                 continue;
             }
-            // 多会话窗口里首次出现的会话：只登记、不交付。
-            //
-            // 它的整屏气泡都是「窗口打开后才被渲染出来的历史」，时间戳自然晚于
-            // `baseline_at`，照单全收会把首屏历史当成新决策。从第二帧起才是输入。
-            if self.any_conversation
-                && let Some(bucket) = snapshot.chat.clone()
-                && !self.settled_conversations.insert(bucket)
-            {
-                continue;
-            }
-            if self.any_conversation && snapshot.chat.is_none() && snapshot.source.is_ocr() {
+            if self.skips_first_frame_of_new_conversation(&snapshot) {
                 continue;
             }
             let snapshot_at = snapshot.captured_at;
@@ -2157,14 +2180,8 @@ mod tests {
         // 正文里出现 `#` 也会被截断出来，但**能不能执行取决于 router**：
         // `#话题` 不是注册命令，`route` 返回 None，不会被当成命令派发。
         // 这里只固定提取行为，执行与否由下游命令表决定。
-        assert_eq!(
-            secondary_hall_command_text("聊天内容 #话题"),
-            Some("#话题")
-        );
-        assert_eq!(
-            secondary_hall_command_text("昵称：#状态"),
-            Some("#状态")
-        );
+        assert_eq!(secondary_hall_command_text("聊天内容 #话题"), Some("#话题"));
+        assert_eq!(secondary_hall_command_text("昵称：#状态"), Some("#状态"));
     }
 
     #[test]

@@ -24,9 +24,13 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+// `passive_text` 只在实机截图回归（`--features ocr-mnn` + ignored 用例）里用到，
+// 默认构建看不到消费方，所以显式放开 unused_imports——删掉它会让那条回归路径
+// 编译不过，而它正是唯一验证真实帧 OCR 的入口。
+#[allow(unused_imports)]
 pub(crate) use passive::{
     PassiveLayout, SECONDARY_HALL_FALLBACK_SENDER, SecondarySenderIdentity,
-    parse_secondary_sender_identity, passive_layout, recognize_passive_secondary,
+    parse_secondary_sender_identity, passive_layout, passive_text, recognize_passive_secondary,
 };
 pub(crate) use scan::{
     ChatMessage, ChatScanTelemetry, ChatScanTelemetrySink, RecognizedChatMessage,

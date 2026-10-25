@@ -103,6 +103,7 @@ fn external_reader(
         scope: baseline.scope.clone(),
         from_screen: false,
         any_conversation: false,
+        settled_conversations: std::collections::HashSet::new(),
         sequence_floor: Some(
             baseline
                 .messages
@@ -150,6 +151,7 @@ fn external_reader_uses_sequence_watermark_without_waiting_for_a_frame() {
         scope,
         from_screen: false,
         any_conversation: false,
+        settled_conversations: std::collections::HashSet::new(),
         chat: ChatIdentity::SecondaryHall,
         baseline_at: Instant::now(),
         sequence_floor: Some(5),
@@ -197,6 +199,7 @@ fn external_decision_window_is_ready_without_any_incoming_message() {
         scope: crate::observation::chat::ChatScope::hall(),
         from_screen: false,
         any_conversation: false,
+        settled_conversations: std::collections::HashSet::new(),
         chat: ChatIdentity::PrimaryHall,
         baseline_at: Instant::now(),
         sequence_floor: Some(4),
@@ -240,6 +243,7 @@ fn external_decision_window_receives_messages_carrying_a_hall_id() {
         scope: crate::observation::chat::ChatScope::hall(),
         from_screen: false,
         any_conversation: false,
+        settled_conversations: std::collections::HashSet::new(),
         chat: ChatIdentity::PrimaryHall,
         baseline_at: Instant::now(),
         sequence_floor: Some(10),
@@ -285,6 +289,7 @@ fn external_window_is_ready_then_receives_the_decision() {
         scope: crate::observation::chat::ChatScope::hall(),
         from_screen: false,
         any_conversation: false,
+        settled_conversations: std::collections::HashSet::new(),
         chat: ChatIdentity::SecondaryHall,
         baseline_at: Instant::now(),
         sequence_floor: Some(10),
@@ -372,6 +377,7 @@ fn shared_reader(
         scope: baseline.scope.clone(),
         from_screen: true,
         any_conversation: false,
+        settled_conversations: std::collections::HashSet::new(),
         sequence_floor: None,
         chat,
         baseline_at: baseline.captured_at,

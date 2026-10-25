@@ -190,25 +190,19 @@ fn hall_consumes_scope(
     }
     // 屏幕互斥只对屏幕来源成立。
     //
-    // 外部源没有屏幕，它的大厅消息借 SecondaryHall 桶只是为了共用去重结构，
-    // 不代表「BOT 正看着二级界面」。把它也纳入按模式互斥，会让用户切到一级后
-    // 外部命令被整批丢弃。同一条外部消息只会经由一个来源到达，不存在
-    // 「一级区与二级区各派发一次」的问题，所以放行是安全的。
+    // 外部源没有屏幕：同一条消息只会经由一个来源到达，不存在「一级区与二级区
+    // 各派发一次」的问题。把它纳入按模式互斥，会让用户切到一级后外部命令被整批丢弃。
     if !source.is_ocr() {
         return true;
     }
+    // 走到这里一定是 OCR 帧，屏幕桶必然存在（`publish` 恒填 Some）。
+    // `None` 会在下面落进 `_ => true`，那只是给「外部帧误走这里」留的兜底，
+    // 不是一条正常路径。
     match chat {
         // OCR 的屏幕桶：按模式互斥，维持原有的同屏去重语义。
         Some(ChatIdentity::PrimaryHall) => mode == ChatListenerMode::Primary,
         Some(ChatIdentity::SecondaryHall) => mode == ChatListenerMode::Secondary,
-        // 外部消息没有屏幕桶（None），不受屏幕互斥约束。
-        Some(
-            ChatIdentity::Friend(_)
-            | ChatIdentity::PublicChannel
-            | ChatIdentity::StrangerMessages
-            | ChatIdentity::Unknown,
-        )
-        | None => true,
+        _ => true,
     }
 }
 

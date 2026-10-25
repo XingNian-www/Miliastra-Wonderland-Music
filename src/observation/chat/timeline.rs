@@ -352,13 +352,6 @@ struct Subscription {
     durable_business: bool,
 }
 
-/// 同一个大厅可能以两个身份出现：`PrimaryHall`（主聊天区 marker 规则判定）与
-/// `SecondaryHall`（二级面板几何判定）。一级大厅下发消息必然经过一次二级面板，
-/// 因此对绑定在大厅上的读者，另一块面板的快照不是“换了会话”，而是同一物理会话的
-/// 另一视角：跳过即可——不入队、不清队列、不失败，让读者继续等它自己身份的消息。
-///
-/// 任务绑定期间出现的其他身份同样只被忽略：它们不能提供本任务输入，也不应仅因
-/// 一个任务内状态停留较久就终止窗口；调用方的整体期限负责结束等待。
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct NoChatRefreshError(String);
@@ -1154,7 +1147,7 @@ impl ChatTimeline {
             }
         }
         let mut accepted_ids = Vec::with_capacity(accepted.len());
-        for ((identity, scope), messages) in groups {
+        for ((_identity, scope), messages) in groups {
             let snapshot = ChatTimelineSnapshot {
                 captured_at,
                 visual_session: epoch,
@@ -1245,7 +1238,10 @@ impl ChatTimeline {
             .ledger
             .subscribers
             .values_mut()
-            .filter(|subscriber| subscriber.chat.is_some())
+            // 绑了屏幕桶或业务容器的读者都要处理：聊天区消失对两者都是
+            // 「这一帧没有可信的屏幕证据」。漏掉 scope 读者会让它在视图重建期间
+            // 继续用队列里未读的旧帧计票。
+            .filter(|subscriber| subscriber.chat.is_some() || subscriber.scope.is_some())
         {
             // 聊天视图瞬态消失（机器人自己发言、面板滚动、重新申请帧）不应立刻杀死确认读者。
             // 这里只清空队列并作废已绑定的视觉会话，等同一聊天重新出现后在 publish 里改绑；
@@ -1515,20 +1511,13 @@ impl ChatTimeline {
     }
 }
 
-/// 外部消息映射到 BOT 内部的会话身份。
-///
-/// 大厅消息归到 `SecondaryHall`（二级值守的大厅），私聊归到 `Friend`。
-/// 昵称缺失的私聊无法确定好友名，直接放弃——宁可少处理也不误授权。
-/// 从业务范围推导 OCR 分桶键。
-///
-/// 这里只是**借用** `ChatIdentity` 作为去重/锁的桶键：外部源没有屏幕，
-/// 但它的消息仍需要与 OCR 消息共用同一条业务账本。真正的业务语义在
-/// `ChatScope`，消费侧不应再读 `chat`。
 /// 外部消息的**去重身份**（不是屏幕桶）。
 ///
 /// 消息 id 需要一个稳定的键来判重，`ChatScope` 变体多、带 id，直接当键不稳定，
-/// 所以归一到 `ChatIdentity` 的两个变体。注意这个值**不进快照的 `chat` 字段**
-/// —— 外部快照的 `chat` 恒为 `None`，业务归属一律看 `scope`。
+/// 所以归一到 `ChatIdentity` 的两个变体：大厅 → `SecondaryHall`，私聊 → `Friend`。
+///
+/// 注意这个值**不进快照的 `chat` 字段**：外部快照的 `chat` 恒为 `None`，
+/// 业务归属一律看 `scope`。消费侧不应再读 `chat`。
 fn dedup_identity_for_scope(scope: &ChatScope) -> ChatIdentity {
     match scope {
         // 外部源的大厅消息归到二级桶：它本来就是「当前所在大厅」，
@@ -2173,11 +2162,6 @@ mod tests {
         );
     }
 
-    /// 回归：外部注入必须满足等待中的 refresh 围栏。
-    ///
-    /// 决策窗口（点歌选候选、审核投票等）靠 `request_refresh` 等一份新鲜快照。
-    /// 外部聊天源接管时观察线程不发布任何帧，如果注入路径也不完成围栏，
-    /// 窗口只能等到起超时——用户看到「等待共享聊天确认基线超时」。
     /// 回归：窗口打开后外部源才接管，绑屏幕桶的读者仍要收到外部大厅帧。
     ///
     /// 这是把 `chat` 改成 `Option` 时引入的真实回归：外部帧的 `chat` 变成 None，
@@ -2266,6 +2250,11 @@ mod tests {
         // 业务归属仍然完整：scope 才是消费依据。
         assert!(frames[0].scope.is_hall());
     }
+    /// 回归：外部注入必须满足等待中的 refresh 围栏。
+    ///
+    /// 决策窗口（点歌选候选、审核投票等）靠 `request_refresh` 等一份新鲜快照。
+    /// 外部聊天源接管时观察线程不发布任何帧，如果注入路径也不完成围栏，
+    /// 窗口只能等到超时——用户看到「等待共享聊天确认基线超时」。
     #[test]
     fn external_injection_satisfies_pending_refresh() {
         let shared = ChatTimeline::new();

@@ -70,8 +70,12 @@ impl ChatTimelineMessage {
 pub(crate) struct ChatTimelineSnapshot {
     pub(crate) visual_session: VisualSessionId,
     pub(crate) captured_at: Instant,
-    /// OCR 的屏幕分桶键（一级区/二级区/好友名）。外部源也借它复用去重结构。
-    pub(crate) chat: ChatIdentity,
+    /// OCR 的屏幕分桶键（一级区/二级区/好友名）。
+    ///
+    /// **外部源恒为 None**：socket 消息没有屏幕位置，不该硬塞一个桶名。
+    /// 以前借 `SecondaryHall` 复用去重结构，代价是「业务层看到 chat 就以为
+    /// 那是一条屏幕观察」，两个模式的行由此分岔。业务归属一律看 `scope`。
+    pub(crate) chat: Option<ChatIdentity>,
     /// 消息属于哪个聊天容器。**业务消费只看它**。
     ///
     /// `chat` 回答「这条消息出现在哪块屏幕」，`scope` 回答「它属于大厅还是私聊」。
@@ -363,13 +367,6 @@ struct Subscription {
 /// 只用于屏幕读者判断「这块快照不是我要的、但也不算换会话」。
 /// 业务侧（决策窗口、审核投票、好友未读）一律按 [`ChatScope`] 判，不要用它——
 /// 外部聊天源没有屏幕桶，把它套到外部消息上没有意义。
-pub(crate) fn other_hall_panel(bound: &ChatIdentity, incoming: &ChatIdentity) -> bool {
-    matches!(
-        (bound, incoming),
-        (ChatIdentity::PrimaryHall, ChatIdentity::SecondaryHall)
-            | (ChatIdentity::SecondaryHall, ChatIdentity::PrimaryHall)
-    )
-}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -993,22 +990,22 @@ impl ChatTimeline {
             visual_session,
             scope: ChatScope::from_identity(&chat),
             source: SourceId::ocr(),
-            chat,
+            chat: Some(chat),
             messages: observed,
         };
-        // 屏幕来源的过滤规则：另一块大厅面板跳过；其余必须是绑定的同一聊天。
-        // 不同身份可能是长期的界面过渡，等目标聊天回来，而不是按帧数/时长结束任务。
+        // 屏幕来源的过滤规则：只收绑定的那一块聊天。
         //
-        // 这是**屏幕侧**过滤：另一块大厅面板跳过，其余必须是绑定的同一聊天。
+        // 「另一块大厅面板也算同一会话」原本由 `other_hall_panel` 单独判断，
+        // 但它成立时 `bound == snapshot.chat` 必然为假，两个分支动作完全相同
+        // （都是跳过）。那层判断是多余的，等值比较已经覆盖它的语义。
         // 外部来源的过滤由调用方另给（外部消息没有屏幕桶）。
         deliver_snapshot(&mut state, &snapshot, |subscriber, snapshot| {
-            let Some(bound) = subscriber.chat.as_ref() else {
-                return true;
-            };
-            if other_hall_panel(bound, &snapshot.chat) {
-                return false;
+            match (subscriber.chat.as_ref(), snapshot.chat.as_ref()) {
+                (None, _) => true,
+                // 屏幕读者不收没有屏幕桶的帧（外部来源的帧）。
+                (Some(_), None) => false,
+                (Some(bound), Some(incoming)) => bound == incoming,
             }
-            *bound == snapshot.chat
         });
         state.screen.latest = Some(snapshot.clone());
         self.inner.changed.notify_all();
@@ -1049,7 +1046,7 @@ impl ChatTimeline {
                 continue;
             };
             // 业务范围以消息自带的 channel/hallId 为准。
-            let identity = identity_for_scope(&scope);
+            let identity = dedup_identity_for_scope(&scope);
             // 去重键参与 id 构造：同一来源的同一序号只会入账一次。
             let dedup = message.dedup_key(source);
             // 明确标记来源：外部消息不是屏幕气泡，命令锁与去重都不能用位置语义。
@@ -1170,7 +1167,8 @@ impl ChatTimeline {
             let snapshot = ChatTimelineSnapshot {
                 captured_at,
                 visual_session: epoch,
-                chat: identity,
+                // 外部消息没有屏幕桶：这就是本轮解耦的核心。
+                chat: None,
                 scope,
                 source: SourceId::external(source),
                 messages,
@@ -1182,12 +1180,8 @@ impl ChatTimeline {
                 if let Some(bound_scope) = subscriber.scope.as_ref() {
                     return bound_scope.same_container(&snapshot.scope);
                 }
-                match subscriber.chat.as_ref() {
-                    None => true,
-                    Some(bound) => {
-                        snapshot.chat == ChatIdentity::Unknown || *bound == snapshot.chat
-                    }
-                }
+                // 外部消息没有屏幕桶：只有未绑定屏幕桶的读者才收（命令链路）。
+                subscriber.chat.is_none()
             });
         }
         accepted_ids.extend(accepted.into_iter().map(|(id, _, _)| id));
@@ -1329,7 +1323,7 @@ impl ChatTimeline {
     ) -> Result<bool> {
         let mut state = self.lock()?;
         if state.ledger.friend_suppressions > 0
-            || !matches!(snapshot.chat, ChatIdentity::Friend(_))
+            || !matches!(snapshot.chat.as_ref(), Some(ChatIdentity::Friend(_)))
             || !snapshot.messages.iter().any(|message| message.id == *id)
         {
             return Ok(false);
@@ -1362,7 +1356,12 @@ impl ChatTimeline {
             .expect("latest unread revision contains selected message");
         if state
             .command_locks
-            .get(&snapshot.chat)
+            .get(
+                snapshot
+                    .chat
+                    .as_ref()
+                    .expect("screen snapshot always has a bucket"),
+            )
             .is_some_and(|lock| lock.matches(selected))
         {
             // 最新 OCR 可从误读修订为已成功文本；提升前再次校验实际修订。
@@ -1522,7 +1521,12 @@ impl ChatTimeline {
 /// 这里只是**借用** `ChatIdentity` 作为去重/锁的桶键：外部源没有屏幕，
 /// 但它的消息仍需要与 OCR 消息共用同一条业务账本。真正的业务语义在
 /// `ChatScope`，消费侧不应再读 `chat`。
-fn identity_for_scope(scope: &ChatScope) -> ChatIdentity {
+/// 外部消息的**去重身份**（不是屏幕桶）。
+///
+/// 消息 id 需要一个稳定的键来判重，`ChatScope` 变体多、带 id，直接当键不稳定，
+/// 所以归一到 `ChatIdentity` 的两个变体。注意这个值**不进快照的 `chat` 字段**
+/// —— 外部快照的 `chat` 恒为 `None`，业务归属一律看 `scope`。
+fn dedup_identity_for_scope(scope: &ChatScope) -> ChatIdentity {
     match scope {
         // 外部源的大厅消息归到二级桶：它本来就是「当前所在大厅」，
         // 与 OCR 的二级观察是同一个物理容器（见 MUST_READ 的共享观察约定）。
@@ -2171,6 +2175,44 @@ mod tests {
     /// 决策窗口（点歌选候选、审核投票等）靠 `request_refresh` 等一份新鲜快照。
     /// 外部聊天源接管时观察线程不发布任何帧，如果注入路径也不完成围栏，
     /// 窗口只能等到起超时——用户看到「等待共享聊天确认基线超时」。
+    /// 回归：外部消息的快照**没有屏幕桶**。
+    ///
+    /// 这是解耦的核心保证：socket 消息没有屏幕位置，`chat` 恒为 None。
+    /// 以前借 `SecondaryHall` 复用去重结构，代价是业务层看到 chat 就以为那是
+    /// 一条屏幕观察，两个模式的行为由此分岔。
+    #[test]
+    fn external_snapshots_carry_no_screen_bucket() {
+        let shared = ChatTimeline::new();
+        let business = shared.subscribe_business().unwrap();
+        shared
+            .inject_external(
+                Instant::now(),
+                VisualSessionId::new(u64::MAX),
+                "test",
+                vec![miliastra_kernel::chat_source::ExternalChatMessage {
+                    sequence: 1,
+                    sent_at: None,
+                    channel: miliastra_kernel::chat_source::ChatChannel::current_hall(),
+                    hall_id: None,
+                    sender: miliastra_kernel::chat_source::ExternalSender::new(
+                        Some("玩家癸".to_string()),
+                        Some(miliastra_kernel::chat_source::GameUid::from_u32(900000001)),
+                    ),
+                    to_uid: None,
+                    text: "@状态".to_string(),
+                }],
+            )
+            .unwrap();
+        let frames = business.read().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frames[0].chat.is_none(),
+            "外部消息不该有屏幕桶，实际: {:?}",
+            frames[0].chat
+        );
+        // 业务归属仍然完整：scope 才是消费依据。
+        assert!(frames[0].scope.is_hall());
+    }
     #[test]
     fn external_injection_satisfies_pending_refresh() {
         let shared = ChatTimeline::new();
@@ -2847,7 +2889,7 @@ mod tests {
         let delayed = shared
             .publish(
                 pending_capture,
-                queued.chat,
+                queued.chat.expect("publish frame has a bucket"),
                 vec![
                     RecognizedChatMessage {
                         message_type: "pink".into(),
@@ -3122,7 +3164,10 @@ mod tests {
         let business = shared.subscribe().unwrap();
         let decision = shared.subscribe().unwrap();
         decision
-            .bind_chat(baseline.chat.clone(), baseline.visual_session)
+            .bind_chat(
+                baseline.chat.clone().expect("baseline has a bucket"),
+                baseline.visual_session,
+            )
             .unwrap();
         let token = shared.request_refresh().unwrap();
         shared
@@ -3152,7 +3197,10 @@ mod tests {
         let baseline = publish(&shared, vec![input("候选", 10)]);
         let decision = shared.subscribe().unwrap();
         decision
-            .bind_chat(baseline.chat.clone(), baseline.visual_session)
+            .bind_chat(
+                baseline.chat.clone().expect("baseline has a bucket"),
+                baseline.visual_session,
+            )
             .unwrap();
         // 机器人自己发出候选提示会让聊天区瞬态消失（输入框获焦、面板滚动），
         // 共享 OCR 因此清空 tracker；聊天重新出现时会话号自增，但聊天身份没变。
@@ -3192,13 +3240,13 @@ mod tests {
             .unwrap();
         let queued = decision.read().unwrap();
         assert_eq!(queued.len(), 1, "另一块大厅面板不得清空已排队的本身份消息");
-        assert_eq!(queued[0].chat, ChatIdentity::PrimaryHall);
+        assert_eq!(queued[0].chat.as_ref(), Some(&ChatIdentity::PrimaryHall));
         assert_eq!(queued[0].messages[1].text, "确认");
         // 原绑定仍然活着：主大厅后续消息照常到达。
         publish(&shared, vec![input("后续", 60)]);
         let snapshots = decision.read().unwrap();
         assert_eq!(snapshots.len(), 1, "窗口必须继续接收它自己身份的消息");
-        assert_eq!(snapshots[0].chat, ChatIdentity::PrimaryHall);
+        assert_eq!(snapshots[0].chat.as_ref(), Some(&ChatIdentity::PrimaryHall));
         assert_eq!(snapshots[0].messages[0].text, "后续");
     }
 
@@ -3309,7 +3357,7 @@ mod tests {
         publish(&shared, vec![input("确认", 40)]);
         let snapshots = decision.read().unwrap();
         assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].chat, ChatIdentity::PrimaryHall);
+        assert_eq!(snapshots[0].chat.as_ref(), Some(&ChatIdentity::PrimaryHall));
     }
 
     #[test]

@@ -320,7 +320,15 @@ impl AppModerationVotePort {
                         if cross_bucket {
                             return false;
                         }
-                        let newer = if snapshot.source.is_ocr() {
+                        // 比较字段跟着**这一帧**的来源走，各自与自己同类的历史比。
+                        //
+                        // 但外部源开窗（baseline 为 None、水位是服务端序号）时，没有
+                        // 任何 OCR 基线可参照：OCR 消息的 source_sequence 恒为 0，拿它
+                        // 去比服务端大序号会恒假，整窗 OCR 票静默丢弃。来源中途切换的
+                        // 情形退回放行，由调用方的采样门槛兜住误读。
+                        let newer = if self.baseline.is_none() && snapshot.source.is_ocr() {
+                            true
+                        } else if snapshot.source.is_ocr() {
                             message.id.bubble_sequence.get() > self.baseline_sequence
                         } else {
                             message.source_sequence > self.baseline_sequence
@@ -762,6 +770,38 @@ mod tests {
     ///
     /// 外部消息按 dedup key 只投递一次，若仍要求连续三次采样，外部票永远凑不满
     /// 稳态，投票会退化成「只能超时通过」。
+    /// 回归：外部源开窗后回落 OCR，OCR 票仍要能计入。
+    ///
+    /// 外部开窗时 `baseline` 为 None、水位是服务端序号；OCR 消息的
+    /// `source_sequence` 恒为 0，拿它去比大序号会恒假，整窗 OCR 票静默丢弃。
+    /// 投票于是退化成「无反对即通过」——故障自动提权。
+    #[test]
+    fn ocr_votes_still_count_after_external_window_falls_back() {
+        let shared = ChatTimeline::new();
+        let subscriber = shared.subscribe_scoped(ChatScope::hall()).unwrap();
+        let context = ModerationVoteContext {
+            running: Arc::new(AtomicBool::new(true)),
+            chat_timeline: shared.clone(),
+            baseline_timeout: Duration::from_secs(1),
+            vote_scope: ChatScope::hall(),
+            external_floor: Some(100),
+        };
+        // 外部源开窗：水位是服务端序号 100。
+        let mut port = AppModerationVotePort::from_external_watermark(context, subscriber, 100);
+        // 外部源掉线，OCR 接管并带来一张票。
+        shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![shared_vote_input("[甲]：@同意", "pink", 10)],
+            )
+            .unwrap();
+        let votes = port.read_votes().unwrap();
+        assert!(
+            !votes.is_empty(),
+            "回落 OCR 后票仍须计入；水位单位错配会让整窗票静默丢弃"
+        );
+    }
     #[test]
     fn external_vote_counts_after_a_single_sample() {
         let shared = ChatTimeline::new();

@@ -7,20 +7,35 @@ use crate::features::song_request::{
 };
 
 impl SongRequestPort for ApplicationRuntime {
-    fn song_ai_command_allowed(&self, username: &str, console: bool) -> bool {
+    fn song_ai_command_allowed(
+        &self,
+        username: &str,
+        account: Option<&crate::features::command::CommandAccount>,
+        console: bool,
+    ) -> bool {
         if console {
             return true;
         }
         let snapshot = self.lifecycle.live_configs.snapshot();
+        // 与路由期同一判定：有账号按 UID，否则按昵称。
+        // 只按昵称会让外部源（username 是 uid:/随机匹配键）在这里被降级成 User。
         let actor = crate::features::command_access::actor_permission(
-            self.lifecycle.live_configs.identity.role_of(username),
-            !username.trim().is_empty(),
+            self.lifecycle
+                .live_configs
+                .identity
+                .role_of_sender(username, account),
         );
         crate::features::command_access::catalog_policy(&snapshot.command_access, "@AI点歌")
             .is_some_and(|policy| policy.allows(actor))
     }
 
-    fn song_source_allowed(&self, username: &str, source: &str, console: bool) -> bool {
+    fn song_source_allowed(
+        &self,
+        username: &str,
+        account: Option<&crate::features::command::CommandAccount>,
+        source: &str,
+        console: bool,
+    ) -> bool {
         if console {
             return true;
         }
@@ -32,8 +47,10 @@ impl SongRequestPort for ApplicationRuntime {
         };
         let snapshot = self.lifecycle.live_configs.snapshot();
         let actor = crate::features::command_access::actor_permission(
-            self.lifecycle.live_configs.identity.role_of(username),
-            !username.trim().is_empty(),
+            self.lifecycle
+                .live_configs
+                .identity
+                .role_of_sender(username, account),
         );
         crate::features::command_access::catalog_policy(&snapshot.command_access, id)
             .is_some_and(|policy| policy.allows(actor))

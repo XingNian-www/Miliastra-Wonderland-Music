@@ -288,8 +288,6 @@ pub(super) fn commands_catalog_route(
                     if let Some(policy) = catalog_policy(&config.command_access, &id) {
                         command["enabled"] = json!(policy.enabled);
                         command["minimumRole"] = json!(policy.minimum_role);
-                        command["defaultMinimumRole"] =
-                            json!(catalog_policy(&defaults, &id).map(|p| p.minimum_role));
                         command["editable"] = json!(true);
                         let floor = crate::features::command_access::minimum_floor(&id);
                         command["minimumFloor"] = json!(floor);
@@ -313,7 +311,7 @@ pub(super) fn commands_catalog_route(
         groups.push(json!({"name":"自定义流程","commands":[{
             "id":"custom_workflow","name":"全部自定义流程","prefix":"","aliases":[],"usage":[],"examples":[],"authorities":[],"openEnded":false,
             "summary":"适用于所有已配置自定义流程，仍保留各流程自身来源及确认规则",
-            "enabled":workflow.enabled,"minimumRole":workflow.minimum_role,"defaultMinimumRole":"admin","minimumFloor":"user","editable":true,"lockedReason":null
+            "enabled":workflow.enabled,"minimumRole":workflow.minimum_role,"minimumFloor":"user","editable":true,"lockedReason":null
         }]}));
     }
     serde_json::to_string(&view).map_err(internal_error)

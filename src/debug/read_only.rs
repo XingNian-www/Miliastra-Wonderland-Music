@@ -954,7 +954,12 @@ pub(crate) fn command_parameters(parsed: &RoutedCommand) -> Value {
             .then_some("routed_input_has_no_original_message_text"),
         "nickname": parsed.username, "messageType": parsed.message_type,
         "authority": format!("{:?}", parsed.authority),
-        "messageY": parsed.observation.message_y,
+        "lockAnchor": parsed.observation.lock_anchor.map(|anchor| match anchor {
+            crate::observation::chat::LockAnchor::Screen { y } => json!({"kind": "screen", "y": y}),
+            crate::observation::chat::LockAnchor::Sequence { after } => {
+                json!({"kind": "sequence", "after": after})
+            }
+        }),
         "observationFrameId": parsed.observation.frame_id.map(|id| id.get()),
         "messageId": parsed.observation.message_id.as_ref().map(|id| json!({
             "visualSession": id.visual_session.get(),

@@ -36,6 +36,21 @@ impl Isolation {
     }
 }
 static ISOLATION: Isolation = Isolation::new();
+
+/// 串行化会改全局 `ISOLATION` 的测试。
+///
+/// `ISOLATION` 是进程级 RwLock，`generation` 是全局计数：任何测试调用
+/// `set_enabled` 都会递增它，让**其他测试**排队中的 operation 被判 stale 后
+/// 直接丢响应（表现为 `UiWaitTimeoutError { disconnected: true }`，
+/// 或断言里拿到空结果）。这不是产品缺陷，是测试之间共享进程状态互相干扰。
+///
+/// 凡是用 `UiRuntime` 或调试模式开关的测试都必须先拿这把锁。
+#[cfg(test)]
+pub(crate) fn isolation_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // 前一个测试 panic 会毒化锁；这里只做互斥，不读被保护数据，可安全恢复。
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 thread_local! {
     static EXTERNAL: Cell<bool> = const { Cell::new(false) };
     static EXECUTION_INPUT: Cell<Option<bool>> = const { Cell::new(None) };

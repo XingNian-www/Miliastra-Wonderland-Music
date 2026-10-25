@@ -436,6 +436,10 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .global-result .result{min-height:0;max-height:100px}
 .global-result.result-ok{border-left:3px solid var(--ok)}
 .global-result.result-err{border-left:3px solid var(--danger)}
+/* setResult 把 result-ok/result-err 加在 #result 的父节点（.panel-body）上，
+   不是 #responsePanel 自身；两处都要有规则，否则成败外观完全一致。 */
+.global-result .panel-body.result-ok{border-left:3px solid var(--ok)}
+.global-result .panel-body.result-err{border-left:3px solid var(--danger)}
 
 /* ===== 命令面板 ===== */
 .command-status{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-2);margin:0 0 var(--sp-4);padding:var(--sp-3) var(--sp-4);background:var(--bg-input);border:1px solid var(--sep-2);border-radius:var(--radius-m);font-size:var(--fs-meta);line-height:var(--lh-meta);color:var(--text-2)}
@@ -1274,6 +1278,18 @@ async function navigateTo(route,updateHash=true){
     configData=null
     configActiveSection=null
   }
+  // AI 聊天页的未保存修改也要拦一次：aiChatDirty 原先只写不读，
+  // 改完直接切走或刷新就静默丢掉了。
+  if(aiChatDirty&&currentRoute==='aichat'&&route!==currentRoute){
+    if(!await confirmDialog('有未保存的 AI 聊天修改，确定离开？',{title:'离开 AI 聊天'})){
+      if(!updateHash&&currentRoute&&location.hash!=='#'+currentRoute)history.replaceState(null,'','#'+currentRoute)
+      return
+    }
+    aiChatDirty=false
+  }
+  // 离开高级控制页时停掉工具任务轮询：那条 500ms 自续链不看当前路由，
+  // 切走后仍会一直打 /tools/task 与 /monitor。
+  if(currentRoute==='tools'&&route!=='tools')cancelToolTaskPolling()
   document.querySelectorAll('.page-section').forEach(page=>page.classList.toggle('active',page.dataset.page===route))
   document.querySelectorAll('.nav-link[data-route]').forEach(link=>link.classList.toggle('active',link.dataset.route===route))
   try{localStorage.setItem('miliastraRoute',route)}catch(e){}
@@ -1349,6 +1365,12 @@ function aiChatSetValue(target,key,value){
   }
   node[seg[seg.length-1]]=value
 }
+// 放弃 AI 聊天页的未保存修改：有改动时先确认，避免误点丢配置。
+async function discardAiChatSettings(){
+  if(aiChatDirty&&!await confirmDialog('放弃未保存的 AI 聊天修改？',{title:'放弃修改'}))return
+  aiChatDirty=false
+  await loadAiChatSettings()
+}
 function aiChatFieldValue(path){
   return aiChatValueAt(aiChatData&&aiChatData.values,aiChatKey(path))
 }
@@ -1363,11 +1385,11 @@ function renderAiChatPage(){
       parts.push('<div class="config-field">')
       parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code></div>')
       if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
-      parts.push(configControlHtml(field,aiChatFieldValue(field.path),'ai_chat'))
+      parts.push(configControlHtml(field,aiChatFieldValue(field.path),'ai_chat','aichat-'))
       parts.push('</div>')
     }
     parts.push('<div class="config-string-row"><button class="btn" onclick="saveAiChatSettings()">保存本页</button>')
-    parts.push('<button class="btn ghost" onclick="loadAiChatSettings()">放弃修改</button></div>')
+    parts.push('<button class="btn ghost" onclick="discardAiChatSettings()">放弃修改</button></div>')
     host.innerHTML=parts.join('')
   }
   document.querySelectorAll('#page-aichat [data-cfg]').forEach(input=>{
@@ -1380,7 +1402,8 @@ function collectAiChatSection(){
   const values=JSON.parse(JSON.stringify(aiChatData&&aiChatData.values?aiChatData.values:{}))
   for(const field of aiChatFields){
     const key=aiChatKey(field.path)
-    const el=document.getElementById(configControlId(field.path))
+    // AI 聊天页控件用 aichat- 前缀，与配置中心的同 path 控件区分开。
+    const el=document.getElementById('aichat-'+configControlId(field.path))
     if(!el)continue
     const previous=aiChatValueAt(aiChatData&&aiChatData.values,key)
     const kind=field.kind&&field.kind.type
@@ -1435,7 +1458,11 @@ function refreshAiModelPicker(){
   const models=Array.isArray(modelChoices)?modelChoices:[]
   document.querySelectorAll('[data-model-pick]').forEach(select=>{
     const path=select.dataset.modelPick
-    const input=document.querySelector('[data-cfg="'+CSS.escape(path)+'"]')
+    // 就近查找同一个字段容器内的输入框：AI 聊天页与配置中心各有一份同 path 控件，
+    // 用 document.querySelector 会拿到文档序第一个（可能是另一个页面的），
+    // 于是选择器把名字填进了看不见的那份。
+    const scope=select.closest('.config-field')||document
+    const input=scope.querySelector('[data-cfg="'+CSS.escape(path)+'"]')
     const text=input?String(input.value||''):''
     const options=models.map(name=>'<option value="'+esc(name)+'"'+(text===name?' selected':'')+'>'+esc(name)+'</option>').join('')
     select.innerHTML='<option value="">'+(models.length?'从列表选择…':'（尚未获取模型列表）')+'</option>'+options
@@ -1448,6 +1475,14 @@ function refreshAiModelPicker(){
     btn.textContent=modelLoading?'获取中…':'获取模型列表'
   })
 }
+// 模型列表的获取反馈要送到**当前所在页面**：
+// 配置中心在 #configMessage，AI 聊天页在 #aiChatMessage。
+// 以前固定写 #configMessage，于是在 AI 聊天页点「获取模型列表」什么也看不到。
+function reportModelFetch(text,kind){
+  const onAiPage=document.getElementById('page-aichat')?.classList.contains('active')
+  if(onAiPage)showAiChatMessage(text,kind)
+  else showConfigMessage(text,kind)
+}
 function loadAiModels(){
   if(modelLoading)return
   modelLoading=true
@@ -1456,11 +1491,11 @@ function loadAiModels(){
     const models=Array.isArray(data&&data.models)?data.models:[]
     if(!models.length)throw new Error('服务端未返回模型')
     modelChoices=models
-    showConfigMessage('已获取 '+models.length+' 个模型','ok')
+    reportModelFetch('已获取 '+models.length+' 个模型','ok')
   }).catch(error=>{
     // 拉取失败不影响手填：清空列表并说明原因。
     modelChoices=[]
-    showConfigMessage('获取模型列表失败：'+error.message+'（仍可手动填写模型名）','err')
+    reportModelFetch('获取模型列表失败：'+error.message+'（仍可手动填写模型名）','err')
   }).finally(()=>{modelLoading=false;refreshAiModelPicker()})
 }
 document.addEventListener('change',event=>{
@@ -1567,11 +1602,24 @@ function bindEnter(id,handler){
     handler()
   })
 }
+// 解析响应体。
+//
+// 配置/回复家族把「版本冲突、校验失败」设计成 HTTP 200 + {ok:false, code, errors}。
+// 仍然抛错（很多调用点靠它判失败），但把 code 与 errors **挂到错误对象上**：
+// 否则调用方只拿到一句 message，读不到 code，那些「冲突→自动重载 /
+// 校验失败→字段回填」的分支就永远进不去。
+function configResponseError(value,status){
+  const error=new Error(value.message||value.error||value.code||('HTTP '+status))
+  error.code=value.code
+  error.errors=value.errors
+  error.payload=value
+  return error
+}
 function parseResponse(text,status){
   if(text.trim().startsWith('<'))return 'HTTP '+status
   try{
     const value=JSON.parse(text)
-    if(value&&typeof value==='object'&&value.ok===false)throw new Error(value.message||value.error||value.code||('HTTP '+status))
+    if(value&&typeof value==='object'&&value.ok===false)throw configResponseError(value,status)
     return value
   }catch(error){
     if(error instanceof Error&&error.message&&error.message!=='Unexpected end of JSON input'&&!/Unexpected token/.test(error.message))throw error
@@ -1581,23 +1629,67 @@ function parseResponse(text,status){
 // 令牌失效（401/403）时置全局标记：暂停轮询、显示引导横幅，避免每秒静默打满失败请求。
 // 重新填入并应用令牌后（applyAccessToken）清除标记恢复轮询。
 let tokenInvalid=false
+// 只有 401 才代表令牌失效。
+//
+// 403 有多个互不相干的来源：平台登录要求人机验证（provider_verification_required）、
+// 来源校验失败、以及真正的鉴权拒绝。把它也当令牌失效会让面板谎称令牌有问题，
+// 并停掉全部轮询——用户点一次「登录」触发人机验证，整个监控就停摆。
+// 403 按普通错误处理，由调用方展示具体原因。
 function handleAuthFailure(status){
-  if(status!==401&&status!==403)return
+  if(status!==401)return
   if(tokenInvalid)return
   tokenInvalid=true
   const banner=$('tokenBanner')
   if(banner)banner.classList.remove('hidden')
 }
+// 后端对非 2xx 的响应体已经带了「错误: 」前缀（protocol.rs 的 plain_response），
+// 所以这里必须先剥掉，否则每个调用点的 catch 再加一次前缀就成了「错误: 错误: xxx」。
+function stripErrorPrefix(text){
+  const t=String(text||'').trim()
+  return t.startsWith('错误:')?t.slice(3).trim():t
+}
+// 请求超时。没有它，任一请求若永不 settle（后端卡死、半开连接、休眠唤醒），
+// jsonAction 的 actionInFlight 会永久保持 true —— 此后所有写操作都被
+// 「上一项操作仍在请求中」拦下且无法取消，只能刷新页面。
+// 60s 覆盖登录、扫描等长操作，又不至于让卡死的请求拖死整个面板。
+const REQUEST_TIMEOUT_MS=60000
+function requestSignal(external){
+  const controller=new AbortController()
+  const timer=setTimeout(()=>controller.abort(),REQUEST_TIMEOUT_MS)
+  return {signal:controller.signal,cleanup:()=>clearTimeout(timer)}
+}
+function timeoutMessage(error){
+  return error&&error.name==='AbortError'?('请求超时（'+Math.round(REQUEST_TIMEOUT_MS/1000)+'秒），请稍后重试'):null
+}
 async function request(url,method,signal){
-  const r=await fetch(url,{method:method||'GET',cache:'no-store',headers:requestHeaders(),signal})
+  const guard=requestSignal()
+  const abortSignal=signal||guard.signal
+  let r
+  try{
+    r=await fetch(url,{method:method||'GET',cache:'no-store',headers:requestHeaders(),signal:abortSignal})
+  }catch(error){
+    guard.cleanup()
+    const timeout=timeoutMessage(error)
+    throw new Error(timeout||('请求失败: '+(error&&error.message||error)))
+  }
+  guard.cleanup()
   const text=await r.text()
-  if(!r.ok){handleAuthFailure(r.status);let detail=text.trim()&&!text.trim().startsWith('<')?text.trim():'HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
+  if(!r.ok){handleAuthFailure(r.status);let detail=text.trim()&&!text.trim().startsWith('<')?stripErrorPrefix(text):'HTTP '+r.status;try{const value=JSON.parse(text);detail=stripErrorPrefix(value.message||value.error||detail)}catch{}throw new Error(detail)}
   return parseResponse(text,r.status)
 }
 async function requestJson(url,body){
-  const r=await fetch(url,{method:'POST',cache:'no-store',headers:{...requestHeaders(),'Content-Type':'application/json'},body:JSON.stringify(body)})
+  const guard=requestSignal()
+  let r
+  try{
+    r=await fetch(url,{method:'POST',cache:'no-store',headers:{...requestHeaders(),'Content-Type':'application/json'},body:JSON.stringify(body),signal:guard.signal})
+  }catch(error){
+    guard.cleanup()
+    const timeout=timeoutMessage(error)
+    throw new Error(timeout||('请求失败: '+(error&&error.message||error)))
+  }
+  guard.cleanup()
   const text=await r.text()
-  if(!r.ok){handleAuthFailure(r.status);let detail=text.trim()&&!text.trim().startsWith('<')?text.trim():'HTTP '+r.status;try{const value=JSON.parse(text);detail=value.message||value.error||detail}catch{}throw new Error(detail)}
+  if(!r.ok){handleAuthFailure(r.status);let detail=text.trim()&&!text.trim().startsWith('<')?stripErrorPrefix(text):'HTTP '+r.status;try{const value=JSON.parse(text);detail=stripErrorPrefix(value.message||value.error||detail)}catch{}throw new Error(detail)}
   return parseResponse(text,r.status)
 }
 async function call(url,method){
@@ -2434,8 +2526,12 @@ function renderMonitor(d){
   const pendingMode=listener.pendingMode?listenerLabel(listener.pendingMode):''
   $('listenerState').textContent=pendingMode?listenerMode+' -> '+pendingMode:listenerMode
   $('listenerMeta').textContent=pendingMode?'等待切换 '+pendingMode:listenerMode
-  $('listenerPrimary').classList.toggle('primary',listener.mode==='primary'&&!pendingMode)
-  $('listenerSecondary').classList.toggle('primary',listener.mode==='secondary'&&!pendingMode)
+  // listener.mode 是**中文展示标签**（后端 display_mode：「一级值守」/「二级值守」，
+  // 临时阶段还带「（临时一级阶段）」后缀），不是 primary/secondary 枚举。
+  // 直接和英文枚举比较会让两个 tab 永远都不高亮。
+  const activeMode=listenerLabel(listener.mode)
+  $('listenerPrimary').classList.toggle('primary',activeMode.startsWith('一级值守')&&!pendingMode)
+  $('listenerSecondary').classList.toggle('primary',activeMode.startsWith('二级值守')&&!pendingMode)
   const hallMinutes=operational.hallRemainingMinutes
   const hallUpdatedAt=Number(operational.hallRemainingUpdatedAt||0)
   const hallRemaining=hallMinutes==null
@@ -2661,7 +2757,7 @@ function renderCommandReplyEditor(){
   const entry=commandReplyEntry(commandReplyActiveId)
   const policyItem=(commandCatalog?.groups||[]).flatMap(group=>group.commands||[]).find(item=>String(item.id)===String(commandReplyActiveId))
   if(!entry&&!policyItem){host.innerHTML='<div class="command-empty">选择一个命令</div>';renderCommandReplyStatus();return}
-  const rows=entry?commandReplyList(entry.id):[],vars=entry?commandReplyVars(entry.id):[],dirty=entry&&commandReplyDraft.has(String(entry.id)),batch=entry?.orderedBatch===true,locked=entry?.editable===false||commandReplySaving||commandPolicySaving
+  const rows=entry?commandReplyList(entry.id):[],vars=entry?commandReplyVars(entry.id):[],dirty=entry&&commandReplyDraft.has(String(entry.id)),batch=!!entry&&entry.editable!==false,locked=entry?.editable===false||commandReplySaving||commandPolicySaving
   const html=rows.map((row,index)=>{
     const disabled=locked||row.editable===false||row.active===false?' disabled':''
     const variableButtons=vars.map(name=>{
@@ -2676,7 +2772,7 @@ function renderCommandReplyEditor(){
     return '<article class="command-reply-row'+(row.active===false?' inactive':'')+'" data-reply-row-index="'+index+'"><div class="row wrap"><strong>'+commandEscape(row.label||row.key||'自定义回复')+'</strong><code class="command-reply-key">'+commandEscape(row.key||'自定义')+'</code>'+(row.active===false?'<span class="field-state warn">已静音</span>':'')+'</div>'+(row.defaultText!=null?'<div class="config-field-hint">内置默认：'+commandEscape(row.defaultText)+'</div>':'')+'<textarea data-reply-text data-reply-index="'+index+'" maxlength="'+commandReplyMaxChars()+'" placeholder="留空则使用内置默认；换行即分条发送" aria-label="回复文案 '+commandEscape(row.key||index+1)+'"'+disabled+'>'+commandEscape(row.text||'')+'</textarea>'+'<div class="command-reply-tools">'+order+tools+'</div>'+((row.editable!==false&&vars.length)?'<div class="command-reply-vars" aria-label="插入变量">'+variableButtons+'</div>':'')+'</article>'
   }).join('')
   const policyHtml=policyItem?'<h3>'+commandEscape(policyItem.name||policyItem.id)+' 设置</h3>'+commandPolicyHtml(policyItem):''
-  const replyHtml=entry?'<h3>'+commandEscape(entry.name||entry.id)+' 回复</h3><p class="config-field-hint">'+(entry.orderedBatch===true?'按序批量发送':'业务仅发送实际触发的结果分支')+'</p>'+(entry.editable===false?'<p class="config-field-hint">此命令的回复不可编辑。</p>':'')+'<div class="command-reply-list">'+(html||'<div class="command-reply-empty">当前无回复；把文案留空表示使用内置默认，点“静音此命令”才会停止回复。</div>')+'</div>'+(entry.editable===false?'':'<div class="row wrap">'+(entry.orderedBatch===true?'<button type="button" class="btn small" onclick="addCommandReply()">添加回复</button>':'')+'<button type="button" class="btn small" onclick="restoreCommandReplyDefaults()">恢复内置回复</button><button type="button" class="btn small warn" onclick="muteCommandReplies()">静音此命令</button></div>'):'<h3>'+commandEscape(policyItem.name||policyItem.id)+'</h3><p class="config-field-hint">此命令暂无可编辑回复。</p>'
+  const replyHtml=entry?'<h3>'+commandEscape(entry.name||entry.id)+' 回复</h3><p class="config-field-hint">'+(entry.editable===false?'业务仅发送实际触发的结果分支':'多行文案会按顺序逐条发送；留空表示使用内置默认。')+'</p>'+(entry.editable===false?'<p class="config-field-hint">此命令的回复不可编辑。</p>':'')+'<div class="command-reply-list">'+(html||'<div class="command-reply-empty">当前无回复；把文案留空表示使用内置默认，点“静音此命令”才会停止回复。</div>')+'</div>'+(entry.editable===false?'':'<div class="row wrap">'+(entry.editable===false?'':'<button type="button" class="btn small" onclick="addCommandReply()">添加回复</button>')+'<button type="button" class="btn small" onclick="restoreCommandReplyDefaults()">恢复内置回复</button><button type="button" class="btn small warn" onclick="muteCommandReplies()">静音此命令</button></div>'):'<h3>'+commandEscape(policyItem.name||policyItem.id)+'</h3><p class="config-field-hint">此命令暂无可编辑回复。</p>'
   host.innerHTML=policyHtml+replyHtml
   host.querySelectorAll('[data-reply-var]').forEach(button=>button.addEventListener('click',()=>insertCommandReplyVariable(button.dataset.replyVar)))
 
@@ -3108,20 +3204,37 @@ async function runTool(path,values){
   setToolsBusy(true);setToolsResult('任务已提交...')
   try{
     const task=await request(path+toolsParams(values),'POST')
+    cancelToolTaskPolling()
     toolsActiveId=task.id
     $('toolsResultMeta').textContent='任务 #'+task.id
     await pollToolTask()
   }catch(error){setToolsResult('错误: '+error.message);setToolsBusy(false)}
   await loadToolTasks()
 }
+// 轮询代次：切页、切换任务、重新发起工具调用时递增，旧链自行退出。
+// 没有这个守卫，一个 queued/running 的长任务会让 500ms 自续链一直跑下去——
+// 即使切到别的页面、标签页被隐藏、甚至任务卡死永不结束。
+// 每轮还会连带打一次 /monitor（loadToolTasks），后台负担翻倍。
+let toolTaskGeneration=0
+function cancelToolTaskPolling(){
+  toolTaskGeneration++
+}
 async function pollToolTask(){
+  const generation=toolTaskGeneration
   try{
     const task=await request('/tools/task?id='+encodeURIComponent(toolsActiveId),'GET')
+    if(generation!==toolTaskGeneration)return
     const label=taskStatusLabel[task.status]||task.status
     $('toolsResultMeta').textContent='任务 #'+task.id+' '+label
     setToolsResult(task.result||'等待执行...')
-    if(task.status==='queued'||task.status==='running'){setTimeout(pollToolTask,500);return}
-  }catch(error){setToolsResult('读取任务失败: '+error.message)}
+    if(task.status==='queued'||task.status==='running'){
+      setTimeout(()=>{if(generation===toolTaskGeneration)pollToolTask()},500)
+      return
+    }
+  }catch(error){
+    if(generation!==toolTaskGeneration)return
+    setToolsResult('读取任务失败: '+error.message)
+  }
   setToolsBusy(false);loadToolTasks()
 }
 function matchTemplate(click){runTool('/tools/template',{template:val('template'),rect:val('templateRect'),threshold:val('threshold'),click:click?'1':''})}
@@ -3139,6 +3252,7 @@ function renderToolTasks(items){
 }
 function inspectToolTask(id){
   if(toolsBusy)return
+  cancelToolTaskPolling()
   toolsActiveId=id
   $('toolsResultMeta').textContent='任务 #'+id
   setToolsBusy(true);pollToolTask()
@@ -3593,6 +3707,13 @@ function syncConfigFormToData(){
   return true
 }
 function toggleVisualFields(){
+  // 重建表单前必须先回收当前段的值：renderConfigForm 是从 configData 重新渲染的，
+  // 不先 sync 就会把用户在本段未保存的编辑静默覆盖掉（configDirty 标记还留着，
+  // 用户会以为改动还在）。与 selectConfigSection 的既有做法保持一致。
+  if(!syncConfigFormToData()){
+    showConfigMessage('当前配置存在格式错误，请修正后再切换','err')
+    return
+  }
   configShowVisualFields=!configShowVisualFields
   const btn=$('configVisualToggle')
   if(btn){
@@ -3633,10 +3754,14 @@ function configDefaultText(value){
 }
 // sectionName 用于解析可空对象父字段；AI 聊天页不是配置中心的当前段，
 // 不显式传入会拿错段（inheritdoc 到别的 section 的字段）。
-function configControlHtml(field,value,sectionName){
+// idPrefix 用于区分「同一个配置字段在不同页面各有一份控件」的情况。
+// AI 聊天页与配置中心的 AI 聊天段渲染的是同一批 path；若共用同一个 DOM id，
+// getElementById 只会拿到文档序第一个（AI 聊天页在配置页之前），
+// 于是在配置中心改完保存，读到的却是 AI 聊天页的旧控件值——编辑被静默丢弃。
+function configControlHtml(field,value,sectionName,idPrefix){
   const section=sectionName||configActiveSection
   const kind=field.kind&&field.kind.type
-  const id=configControlId(field.path)
+  const id=(idPrefix||'')+configControlId(field.path)
   const path=field.path
   const disabledAttr=field.source==='bootstrap'?' disabled':''
   const parent=configNullableObjectParent(section,path)
@@ -3925,7 +4050,9 @@ function clearConfigSecret(path){
 }
 function collectConfigFieldValue(field,sectionName){
   const kind=field.kind&&field.kind.type
-  const el=document.getElementById(configControlId(field.path))
+  // ai_chat 段在 AI 聊天页有独立一份控件（前缀 aichat-），避免与配置中心撞 id。
+  const el=document.getElementById((sectionName==='ai_chat'?'aichat-':'')+configControlId(field.path))
+    ||document.getElementById(configControlId(field.path))
   if(!el)return {skip:true}
   // 父级 nullable object 未启用（开关关闭 / textarea 为 null / 库中为 null）
   // → 跳过子字段，避免把旧子字段写回提交段导致父级重新变成对象。
@@ -4003,6 +4130,14 @@ function collectConfigFieldValue(field,sectionName){
   if(kind==='secret'){
     if(el.dataset.cfgClear==='1')return {clear:true}
     return {value:String(el.value||'')}
+  }
+  // modelName 与 text/string 同形：就是一个可编辑的字符串控件。
+  // 漏掉这个分支会让「在配置中心改模型名」被静默跳过——保存提示成功，
+  // 实际提交的是旧值，重拉后旧值又渲染回表单。
+  if(kind==='modelName'){
+    const v=String(el.value||'')
+    if(field.nullable&&v.trim()==='')return {value:null}
+    return {value:v}
   }
   return {skip:true}
 }
@@ -4299,19 +4434,18 @@ async function saveConfig(){
       return
     }
     const resp=await requestJson('/config/save',{baseRevision:configData&&configData.revision!=null?configData.revision:0,sections})
-    if(!resp||resp.ok!==true){
-      if(resp&&resp.code==='config_conflict'){
-        showConfigMessage('保存失败：配置已被其他修改，请刷新后重试','err')
-        await loadConfigPage()
-      }else if(resp&&Array.isArray(resp.errors)&&resp.errors.length){
-        applyConfigErrors(resp.errors)
-      }else{
-        showConfigMessage('保存失败：'+(resp&&resp.message||'未知错误'),'err')
-      }
-      return
-    }
     await applyConfigSaveResult(resp,'已保存')
-  }catch(e){showConfigMessage('保存失败: '+e.message,'err')}
+  }catch(e){
+    // 冲突/校验失败由 parseResponse 以带 code 的错误抛出，见 configResponseError。
+    if(e&&e.code==='config_conflict'){
+      showConfigMessage('保存失败：配置已被其他修改，请刷新后重试','err')
+      await loadConfigPage()
+    }else if(e&&Array.isArray(e.errors)&&e.errors.length){
+      applyConfigErrors(e.errors)
+    }else{
+      showConfigMessage('保存失败: '+(e&&e.message||'未知错误'),'err')
+    }
+  }
   finally{
     configSaving=false
     setConfigSavingUI(false)
@@ -4346,19 +4480,18 @@ async function restoreDefaults(){
   setConfigSavingUI(true)
   try{
     const resp=await requestJson('/config/save',{baseRevision:configData&&configData.revision!=null?configData.revision:0,sections})
-    if(!resp||resp.ok!==true){
-      if(resp&&resp.code==='config_conflict'){
-        showConfigMessage('恢复失败：配置已被其他修改，请刷新后重试','err')
-        await loadConfigPage()
-      }else if(resp&&Array.isArray(resp.errors)&&resp.errors.length){
-        applyConfigErrors(resp.errors)
-      }else{
-        showConfigMessage('恢复默认失败：'+(resp&&resp.message||'未知错误'),'err')
-      }
-      return
-    }
     await applyConfigSaveResult(resp,'已恢复默认配置')
-  }catch(e){showConfigMessage('恢复默认失败: '+e.message,'err')}
+  }catch(e){
+    // 冲突/校验失败由 parseResponse 以带 code 的错误抛出，见 configResponseError。
+    if(e&&e.code==='config_conflict'){
+      showConfigMessage('恢复失败：配置已被其他修改，请刷新后重试','err')
+      await loadConfigPage()
+    }else if(e&&Array.isArray(e.errors)&&e.errors.length){
+      applyConfigErrors(e.errors)
+    }else{
+      showConfigMessage('恢复默认失败：'+(e&&e.message||'未知错误'),'err')
+    }
+  }
   finally{
     configSaving=false
     setConfigSavingUI(false)
@@ -4394,17 +4527,15 @@ async function rollbackTo(rev){
   setConfigSavingUI(true)
   try{
     const resp=await requestJson('/config/rollback',{revision:Number(rev),baseRevision:configData&&configData.revision!=null?configData.revision:0})
-    if(!resp||resp.ok!==true){
-      if(resp&&resp.code==='config_conflict'){
-        showConfigMessage('回滚失败：配置已被其他修改，请刷新后重试','err')
-        await loadConfigPage()
-      }else{
-        showConfigMessage('回滚失败：'+(resp&&resp.message||'未知错误'),'err')
-      }
-      return
-    }
     await applyConfigSaveResult(resp,'已回滚到版本 #'+rev)
-  }catch(e){showConfigMessage('回滚失败: '+e.message,'err')}
+  }catch(e){
+    if(e&&e.code==='config_conflict'){
+      showConfigMessage('回滚失败：配置已被其他修改，请刷新后重试','err')
+      await loadConfigPage()
+    }else{
+      showConfigMessage('回滚失败：'+(e&&e.message||'未知错误'),'err')
+    }
+  }
   finally{
     configSaving=false
     setConfigSavingUI(false)
@@ -4427,7 +4558,7 @@ $('configSearch').addEventListener('input',()=>{
   },200)
 })
 window.addEventListener('beforeunload',(e)=>{
-  if(configUnsaved||visualDraftDirty||commandPolicyHasChanges()||commandReplyHasChanges()){e.preventDefault();e.returnValue='有未保存的修改，确定离开？'}
+  if(configUnsaved||visualDraftDirty||aiChatDirty||commandPolicyHasChanges()||commandReplyHasChanges()){e.preventDefault();e.returnValue='有未保存的修改，确定离开？'}
 })
 // 配置中心 Ctrl+S / Cmd+S 快捷保存
 document.addEventListener('keydown',(e)=>{
@@ -4504,6 +4635,9 @@ function shortcutAllowed(e){
   if(!$('screenshotModal').classList.contains('hidden')||!$('confirmModal').classList.contains('hidden'))return false
   const tag=e.target&&e.target.tagName
   if(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||(e.target&&e.target.isContentEditable))return false
+  // 按钮/链接上的空格是原生激活键：Tab 聚焦「保存全部」后按空格必须触发保存，
+  // 不能被播放快捷键抢走（否则键盘用户永远按不动按钮）。
+  if(tag==='BUTTON'||tag==='A')return false
   return true
 }
 function showShortcutHelp(){

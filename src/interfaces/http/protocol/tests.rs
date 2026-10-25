@@ -5647,7 +5647,8 @@ fn command_replies_http_roundtrip_preserves_order_mute_partial_updates_and_confl
     assert_eq!(volume["replies"][0]["text"], "音量调整完成：{音量}");
 
     // 整条静音仍然生效：存空列表。
-    let mute = json!({"baseRevision":revision+1,"commands":[{"id":"@娱乐帮助","replies":[]}]}).to_string();
+    let mute =
+        json!({"baseRevision":revision+1,"commands":[{"id":"@娱乐帮助","replies":[]}]}).to_string();
     assert_eq!(
         http_post_json(address, "/commands/replies", &mute, None).status_line,
         "HTTP/1.1 200 OK"

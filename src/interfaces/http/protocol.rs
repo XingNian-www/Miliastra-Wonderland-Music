@@ -47,8 +47,8 @@ mod system_routes;
 #[path = "routes/tasks_chat.rs"]
 mod tasks_chat_routes;
 
-use ai_routes::*;
 use crate::config::ai::ModelListError;
+use ai_routes::*;
 use commands_routes::*;
 use config_routes::*;
 use debug_routes::*;
@@ -286,12 +286,18 @@ const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         path: "/debug/ui-state",
         json: true,
+        // 保持 false：前端与测试都按 GET 调用（改 true 会被 enforce_method 拦成 405）。
+        // 它的 image= 分支确实读任意路径，但只读文件、不写状态；风险由
+        // 令牌门槛与「仅 loopback 默认可达」承担，见 debug_ui_state_route 的注释。
         mutating: false,
         handler: debug_ui_state_route,
     },
     RouteSpec {
         path: "/debug/ui-catalogue",
         json: true,
+        // 同样保持 false：GET 是既定契约。它的 save= 分支会写 PNG 到任意路径，
+        // 这一条已由 handler 内的显式拒绝处理（见 debug_ui_catalogue_route），
+        // 不靠 mutating 标志兜底。
         mutating: false,
         handler: debug_ui_catalogue_route,
     },
@@ -1582,7 +1588,12 @@ fn requires_access_token(config: &crate::config::HttpConfig, path: &str) -> bool
 }
 
 fn has_valid_access_token(request: &Request, expected: &str) -> bool {
-    header_value(request, "x-miliastra-token").is_some_and(|value| {
+    // 请求头是主通道。查询参数 `token` 只服务 EventSource：浏览器不允许
+    // EventSource 设置自定义请求头，而本服务端没有 Cookie 鉴权，
+    // 否则推送通道永远 401，EventSource 又会无限自动重连形成风暴。
+    let candidate =
+        header_value(request, "x-miliastra-token").or_else(|| query_value(&request.query, "token"));
+    candidate.is_some_and(|value| {
         // 常数时间比较，避免长度/逐字节时序侧信道泄露 token 信息。
         value.len() == expected.len()
             && value

@@ -150,6 +150,10 @@ impl ChatDecisionReader {
             if !self.same_conversation(&snapshot) {
                 continue;
             }
+            // 与 read_messages 共用同一条首屏防护，避免某条路径静默绕开。
+            if self.skips_first_frame_of_new_conversation(&snapshot) {
+                continue;
+            }
             let snapshot_at = snapshot.captured_at;
             for message in snapshot.messages {
                 if !self.is_after_baseline_at(snapshot_at, &message) {

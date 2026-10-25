@@ -269,12 +269,6 @@ impl AppModerationVotePort {
                 self.baseline = Some(snapshot);
                 continue;
             }
-            // 跨**大厅面板**（一级区 ↔ 二级区）：两边的 bubble_sequence 是独立序列，
-            // 不能拿一边的水位去卡另一边，所以这一帧照常收票，不 rebase。
-            // 消息 id 里的 chat 会把同一条消息在两个桶里区分开，不会重复计票。
-            //
-            // 只承认这两块面板互通：PublicChannel / StrangerMessages / Friend 是
-            // 真正不同的容器，它们的消息不该计入大厅投票。
             // 跨屏幕桶（一级区 ↔ 二级区）时整帧跳过，不做任何计票。
             //
             // 两边的 `bubble_sequence` 是各自从 0 开始的独立序列，无法互相比较；

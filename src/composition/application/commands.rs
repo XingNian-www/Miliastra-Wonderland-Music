@@ -423,7 +423,7 @@ impl ApplicationRuntime {
                     raw: parsed.raw.clone(),
                     username: command_username(parsed).to_string(),
                     user_command: parsed.user_command.clone(),
-                    friend_or_above: song_request_allows_bilibili(parsed, command),
+                    account: parsed.account.clone(),
                 };
                 self.business
                     .song_requests

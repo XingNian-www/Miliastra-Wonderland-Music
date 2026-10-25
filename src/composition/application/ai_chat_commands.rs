@@ -180,12 +180,12 @@ impl ApplicationRuntime {
         let catalog = crate::features::command_catalog::all_specs();
         let mut names = Vec::new();
         let snapshot = self.lifecycle.live_configs.snapshot();
+        // 与路由期同一判定：有账号按 UID，否则按昵称。
         let actor = crate::features::command_access::actor_permission(
             self.lifecycle
                 .live_configs
                 .identity
-                .role_of(&parsed.username),
-            !parsed.username.trim().is_empty(),
+                .role_of_sender(&parsed.username, parsed.account.as_ref()),
         );
         for spec in catalog {
             let id = if spec.prefix == crate::features::command::CommandPrefix::At {

@@ -20,8 +20,15 @@ pub(crate) struct SongRequestContext {
     pub(crate) raw: String,
     pub(crate) username: String,
     pub(crate) user_command: String,
-    /// 调用方身份快照；平台权限统一通过 SongRequestPort::song_source_allowed 读取。
-    pub(crate) friend_or_above: bool,
+    /// 发送者的游戏账号（仅外部聊天源提供；OCR 为 None）。
+    ///
+    /// 平台权限统一通过 [`SongRequestPort::song_source_allowed`] 读取，那里需要
+    /// 账号才能按 UID 解析角色。
+    ///
+    /// 这里原本还有一个 `friend_or_above: bool`，由 `song_request_allows_bilibili`
+    /// 计算后写入，但**生产代码从未读过它**——真正的判定在 port 里。已删除，
+    /// 避免两份判断并存且互相矛盾。
+    pub(crate) account: Option<crate::features::command::CommandAccount>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,11 +178,26 @@ impl Display for SongSearchFailure {
 
 pub(crate) trait SongRequestPort {
     /// Read the current platform policy for the original actor, not the delivery target.
-    fn song_source_allowed(&self, _username: &str, _source: &str, _console: bool) -> bool {
+    ///
+    /// 必须同时传 `account`：OCR 链路只有昵称，外部聊天源有 UID。只按昵称判定会让
+    /// API 链路（username 是 uid 前缀或随机匹配键）被降级成 User，形成
+    /// 「同一个人走 OCR 能点 B 站、走 API 不能」的跨模式不一致。
+    fn song_source_allowed(
+        &self,
+        _username: &str,
+        _account: Option<&crate::features::command::CommandAccount>,
+        _source: &str,
+        _console: bool,
+    ) -> bool {
         true
     }
 
-    fn song_ai_command_allowed(&self, _username: &str, _console: bool) -> bool {
+    fn song_ai_command_allowed(
+        &self,
+        _username: &str,
+        _account: Option<&crate::features::command::CommandAccount>,
+        _console: bool,
+    ) -> bool {
         true
     }
 
@@ -476,6 +498,7 @@ impl SongRequestApplication {
             queue_max_size: self.queue_max_size,
             console_bypass_dedup: self.console_bypass_dedup,
             actor_username: &context.username,
+            actor_account: context.account.as_ref(),
             console: context.message_type == "控制台",
             port,
         }
@@ -489,19 +512,28 @@ struct SongRequestExecution<'a> {
     queue_max_size: usize,
     console_bypass_dedup: bool,
     actor_username: &'a str,
+    /// 发送者的游戏账号（仅外部聊天源提供；OCR 为 None）。
+    ///
+    /// 平台权限必须按它与 `actor_username` 一起判定，否则 API 链路只能按
+    /// 不可解析的 uid 主语查角色，被静默降级成 User。
+    actor_account: Option<&'a crate::features::command::CommandAccount>,
     console: bool,
     port: &'a mut dyn SongRequestPort,
 }
 
 impl SongRequestExecution<'_> {
     fn source_allowed(&self, source: &str) -> bool {
-        self.port
-            .song_source_allowed(self.actor_username, source, self.console)
+        self.port.song_source_allowed(
+            self.actor_username,
+            self.actor_account,
+            source,
+            self.console,
+        )
     }
 
     fn ai_command_allowed(&self) -> bool {
         self.port
-            .song_ai_command_allowed(self.actor_username, self.console)
+            .song_ai_command_allowed(self.actor_username, self.actor_account, self.console)
     }
 
     fn require_ai_command(&self) -> Result<bool> {
@@ -2372,14 +2404,17 @@ mod tests {
             raw: "@点歌 晴天".to_string(),
             username: "Alice".to_string(),
             user_command: "@点歌 晴天".to_string(),
-            friend_or_above: false,
+            account: None,
         }
     }
 
     /// 大厅里靠身份映射获得好友及以上权限的成员：命令仍是大厅形状，权限来自映射。
     fn mapped_context() -> SongRequestContext {
         SongRequestContext {
-            friend_or_above: true,
+            account: Some(crate::features::command::CommandAccount {
+                game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
+                uid: "900000001".to_string(),
+            }),
             ..context()
         }
     }
@@ -2488,7 +2523,12 @@ mod tests {
     }
 
     impl SongRequestPort for FakePort {
-        fn song_ai_command_allowed(&self, username: &str, console: bool) -> bool {
+        fn song_ai_command_allowed(
+            &self,
+            username: &str,
+            _account: Option<&crate::features::command::CommandAccount>,
+            console: bool,
+        ) -> bool {
             self.ai_permission_checks
                 .borrow_mut()
                 .push((username.into(), console));
@@ -2500,7 +2540,13 @@ mod tests {
                 })
         }
 
-        fn song_source_allowed(&self, username: &str, source: &str, console: bool) -> bool {
+        fn song_source_allowed(
+            &self,
+            username: &str,
+            _account: Option<&crate::features::command::CommandAccount>,
+            source: &str,
+            console: bool,
+        ) -> bool {
             self.permission_checks
                 .borrow_mut()
                 .push((username.into(), source.into(), console));
@@ -3322,10 +3368,7 @@ mod tests {
         );
         assert_eq!(
             port.library_searches.borrow().as_slice(),
-            [
-                (song.keyword.clone(), context().friend_or_above),
-                ("晴天 周杰伦".into(), context().friend_or_above)
-            ]
+            [(song.keyword.clone(), false), ("晴天 周杰伦".into(), false)]
         );
         assert_eq!(port.search_sources.borrow().len(), 2);
         assert_eq!(
@@ -3543,7 +3586,7 @@ mod tests {
         application.execute(&context(), &song, &mut port).unwrap();
         assert_eq!(
             port.library_searches.borrow().as_slice(),
-            [("晴天".into(), context().friend_or_above)]
+            [("晴天".into(), false)]
         );
         assert_eq!(ai.candidates.lock().unwrap()[0].len(), 1);
         assert_eq!(

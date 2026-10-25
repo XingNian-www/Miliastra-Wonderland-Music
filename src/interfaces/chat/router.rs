@@ -224,10 +224,7 @@ impl<'a> ChatCommandRouter<'a> {
                 &routed,
                 active_entertainment,
             );
-            let actor = crate::features::command_access::actor_permission(
-                routed.role,
-                !routed.username.trim().is_empty(),
-            );
+            let actor = crate::features::command_access::actor_permission(routed.role);
             if !policy.allows(actor) {
                 routed.permission_required = Some(match policy.minimum_role {
                     crate::features::command_access::CommandPermission::User
@@ -952,7 +949,9 @@ mod tests {
         let noisy = ChatCommandRouter::with_access(&service, &identity, &access)
             .route(&envelope("blue", "@，禁用"), None)
             .unwrap();
-        assert_eq!(noisy.permission_required, Some(IdentityRole::Owner));
+        // @禁用 现在是 Admin 档（不再要求 Owner）；这条断言同时验证
+        // OCR 容错（「@，禁用」这条带噪声的写法）能正确认领到同一个策略。
+        assert_eq!(noisy.permission_required, Some(IdentityRole::Admin));
         access.overrides.insert(
             "#跑得快".into(),
             CommandPolicy {
@@ -969,7 +968,11 @@ mod tests {
             let routed = ChatCommandRouter::with_access(&service, &identity, &access)
                 .route(&envelope(source, "@删除"), None)
                 .unwrap();
-            assert_eq!(routed.permission_required, Some(IdentityRole::Admin));
+            // @删除 声明 FRIEND_ONLY（catalog 摘要「好友删除当前曲目」），
+            // 且 playback::claims_chat 的大厅分支明确排除「删除」。
+            // 所以默认门槛是 Friend，不是 Admin——旧断言把「仅好友」
+            // 误解成了「好友且管理员」。
+            assert_eq!(routed.permission_required, Some(IdentityRole::Friend));
             assert_eq!(routed.message_type, source);
         }
         access.overrides.insert(

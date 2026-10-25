@@ -1745,7 +1745,19 @@ impl ApplicationRuntime {
                 );
                 return Ok(());
             }
-            match snapshot.chat {
+            // 分支路由按「来源 + 业务容器」决定，屏幕桶只作为 OCR 的补充判据。
+            //
+            // 外部聊天源没有屏幕：它的大厅消息借 SecondaryHall 桶只为复用去重结构，
+            // 不该因为借了这个桶就被当成「二级屏幕观察」。业务上它就是大厅或私聊，
+            // 走 Secondary 那套分派（按 scope 判 is_hall / friend_name）。
+            let screen_bucket = if snapshot.source.is_ocr() {
+                snapshot.chat.clone()
+            } else if snapshot.scope.is_hall() {
+                ChatIdentity::SecondaryHall
+            } else {
+                snapshot.chat.clone()
+            };
+            match screen_bucket {
                 ChatIdentity::PrimaryHall => {
                     let messages = snapshot
                         .messages
@@ -1772,12 +1784,20 @@ impl ApplicationRuntime {
                     }])?;
                 }
                 ref chat @ (ChatIdentity::SecondaryHall | ChatIdentity::Friend(_)) => {
-                    let is_hall = *chat == ChatIdentity::SecondaryHall;
+                    // 业务容器看 scope，屏幕桶只看 chat。
+                    //
+                    // 外部聊天源的大厅消息被映射成 SecondaryHall 只是为了复用它去重结构，
+                    // 真正的「是不是大厅 / 是哪个好友」由 scope 回答。这里以前用 chat
+                    // 推导，等于让业务判定依赖屏幕位置——正是本轮要拆掉的耦合。
+                    let is_hall = snapshot.scope.is_hall();
                     let accepts_turtle_questions = is_hall
                         && self.commands_enabled()?
                         && self.business.business.turtle_soup_accepts_questions()?;
-                    let friend_name = match chat {
-                        ChatIdentity::Friend(name) => name.to_string(),
+                    // 好友名优先取业务容器的 peer（外部源用它，昵称可能迟到）；
+                    // 屏幕来源退回屏幕桶里的好友名。
+                    let friend_name = match (&snapshot.scope, chat) {
+                        (ChatScope::Private { peer }, _) => peer.to_string(),
+                        (_, ChatIdentity::Friend(name)) => name.to_string(),
                         _ => String::new(),
                     };
                     for message in snapshot.messages {

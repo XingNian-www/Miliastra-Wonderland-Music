@@ -638,6 +638,12 @@ impl ApplicationRuntime {
                 _observation_session: observation_session,
             });
         }
+        // OCR 路径仍然要等一帧快照：屏幕只显示当前内容，必须拍一帧才知道
+        // 「哪些气泡是窗口打开前就已经在屏上的」。账本水位替代不了它——
+        // 屏幕可能正显示着历史气泡，账本不会告诉你这些已经看过了。
+        // MUST_READ §2 的「首屏历史不执行」就建立在这个基线上。
+        //
+        // 外部源不需要这条路：它是有序队列，新旧由服务端序号直接回答。
         let mut refresh = self.ui.chat_timeline.request_refresh()?;
         let baseline = loop {
             if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {

@@ -605,13 +605,13 @@ impl ChatTimeline {
 
     pub(crate) fn subscribe(&self) -> Result<ChatTimelineSubscriber> {
         let mut state = self.lock()?;
-        Ok(self.subscribe_locked(&mut state, None, false))
+        Ok(self.subscribe_locked(&mut state, false))
     }
 
     /// A business reader survives transient capture/OCR failures and retains its queue.
     pub(crate) fn subscribe_business(&self) -> Result<ChatTimelineSubscriber> {
         let mut state = self.lock()?;
-        Ok(self.subscribe_locked(&mut state, None, true))
+        Ok(self.subscribe_locked(&mut state, true))
     }
 
     /// 订阅并限定只收某个业务容器的消息。
@@ -623,7 +623,7 @@ impl ChatTimeline {
     /// 两步之间到达的其他容器快照会先入队（读侧虽会二次过滤，但队列白占）。
     pub(crate) fn subscribe_scoped(&self, scope: ChatScope) -> Result<ChatTimelineSubscriber> {
         let mut state = self.lock()?;
-        let subscriber = self.subscribe_locked(&mut state, None, false);
+        let subscriber = self.subscribe_locked(&mut state, false);
         let id = subscriber.id;
         if let Some(sub) = state.ledger.subscribers.get_mut(&id) {
             sub.scope = Some(scope);
@@ -637,14 +637,15 @@ impl ChatTimeline {
     ) -> Result<(Option<ChatTimelineSnapshot>, ChatTimelineSubscriber)> {
         let mut state = self.lock()?;
         let latest = state.screen.latest.clone();
-        let subscriber = self.subscribe_locked(&mut state, None, false);
+        let subscriber = self.subscribe_locked(&mut state, false);
         Ok((latest, subscriber))
     }
 
+    /// 新建订阅者。绑定（屏幕桶或业务容器）由 `bind_chat` / `bind_scope` 稍后设置，
+    /// 所以这里不接收 chat——历史上它恒为 None。
     fn subscribe_locked(
         &self,
         state: &mut State,
-        chat: Option<ChatIdentity>,
         durable_business: bool,
     ) -> ChatTimelineSubscriber {
         let id = state.ledger.next_subscriber;
@@ -652,9 +653,9 @@ impl ChatTimeline {
         state.ledger.subscribers.insert(
             id,
             Subscription {
-                chat,
+                chat: None,
                 // 订阅入口决定绑定方式：subscribe() 不绑；subscribe_scoped() 直接写
-                // scope；subscribe_chat 已删除。bind_chat / bind_scope 供后续改绑。
+                // scope。bind_chat / bind_scope 供后续改绑。
                 scope: None,
                 session: None,
                 queue: VecDeque::new(),
@@ -984,11 +985,11 @@ impl ChatTimeline {
         // （都是跳过）。那层判断是多余的，等值比较已经覆盖它的语义。
         // 外部来源的过滤由调用方另给（外部消息没有屏幕桶）。
         deliver_snapshot(&mut state, &snapshot, |subscriber, snapshot| {
-            match (subscriber.chat.as_ref(), snapshot.chat.as_ref()) {
-                (None, _) => true,
-                // 屏幕读者不收没有屏幕桶的帧（外部来源的帧）。
-                (Some(_), None) => false,
-                (Some(bound), Some(incoming)) => bound == incoming,
+            // `publish` 构造的快照恒有屏幕桶，所以只需判「未绑定的读者照收」
+            // 与「绑定的读者要匹配」两种。
+            match subscriber.chat.as_ref() {
+                None => true,
+                Some(bound) => snapshot.chat.as_ref() == Some(bound),
             }
         });
         state.screen.latest = Some(snapshot.clone());
@@ -1165,13 +1166,9 @@ impl ChatTimeline {
                 source: SourceId::external(source),
                 messages,
             };
-            // 外部来源的过滤规则：未绑定聊天的订阅者（主命令消费者）照常入队；
-            // 绑定了的就只收同一个身份。这里**不**做 other_hall_panel 判定——
-            // 那是屏幕分桶概念，外部消息没有屏幕。
+            // 外部来源的过滤规则：绑了屏幕桶的读者按「这条消息属不属于它的大厅/私聊」
+            // 判断。scope 读者已在 `deliver_snapshot` 里按容器过筛，不必在这里重判。
             deliver_snapshot(&mut state, &snapshot, |subscriber, snapshot| {
-                if let Some(bound_scope) = subscriber.scope.as_ref() {
-                    return bound_scope.same_container(&snapshot.scope);
-                }
                 // 绑了屏幕桶的读者：外部帧没有桶，但它可能正是这个读者在等的消息。
                 //
                 // 判据换成 scope——外部大厅帧的 scope 就是大厅，绑在大厅桶上的
@@ -1913,7 +1910,9 @@ impl ChatTimelineSubscriber {
     ///
     /// 外部聊天源专用。它的消息没有屏幕坐标，大厅恒被映射成 `SecondaryHall`；
     /// 若仍按 `chat` 过滤，一级驻留的读者会被整批挡住。
-    pub(crate) fn bind_scope(&self, scope: ChatScope, session: VisualSessionId) -> Result<()> {
+    /// 不接收 session：`deliver_snapshot` 的会话变更只对屏幕读者生效
+    /// （`session_changed` 要求 `scope.is_none()`），scope 读者的会话号从不被读。
+    pub(crate) fn bind_scope(&self, scope: ChatScope) -> Result<()> {
         let mut state = self.shared.lock()?;
         let subscriber = state
             .ledger
@@ -1928,7 +1927,6 @@ impl ChatTimelineSubscriber {
         // 一个读者要么按屏幕桶收，要么按业务容器收，不该同时受两者约束。
         subscriber.chat = None;
         subscriber.scope = Some(scope);
-        subscriber.session = Some(session);
         Ok(())
     }
 

@@ -359,15 +359,6 @@ struct Subscription {
 ///
 /// 任务绑定期间出现的其他身份同样只被忽略：它们不能提供本任务输入，也不应仅因
 /// 一个任务内状态停留较久就终止窗口；调用方的整体期限负责结束等待。
-/// 两块快照是否「同一大厅的另一块面板」。
-///
-/// **屏幕侧语义**：一级区（主聊天 marker 判定）与二级区（二级面板几何判定）
-/// 是同一物理大厅的两块面板，一级下发消息必然途经一次二级面板。
-///
-/// 只用于屏幕读者判断「这块快照不是我要的、但也不算换会话」。
-/// 业务侧（决策窗口、审核投票、好友未读）一律按 [`ChatScope`] 判，不要用它——
-/// 外部聊天源没有屏幕桶，把它套到外部消息上没有意义。
-
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct NoChatRefreshError(String);
@@ -1180,8 +1171,20 @@ impl ChatTimeline {
                 if let Some(bound_scope) = subscriber.scope.as_ref() {
                     return bound_scope.same_container(&snapshot.scope);
                 }
-                // 外部消息没有屏幕桶：只有未绑定屏幕桶的读者才收（命令链路）。
-                subscriber.chat.is_none()
+                // 绑了屏幕桶的读者：外部帧没有桶，但它可能正是这个读者在等的消息。
+                //
+                // 判据换成 scope——外部大厅帧的 scope 就是大厅，绑在大厅桶上的
+                // 决策窗口理应收到。以前这里比 chat（外部恒为 SecondaryHall），
+                // 二级驻留的窗口能碰巧命中、一级驻留的命中不了，两边行为分岔。
+                match subscriber.chat.as_ref() {
+                    None => true,
+                    Some(ChatIdentity::PrimaryHall | ChatIdentity::SecondaryHall) => {
+                        snapshot.scope.is_hall()
+                    }
+                    Some(ChatIdentity::Friend(_)) => !snapshot.scope.is_hall(),
+                    // 公共频道/陌生人/未知这些屏幕桶本就不参与业务判定。
+                    Some(_) => false,
+                }
             });
         }
         accepted_ids.extend(accepted.into_iter().map(|(id, _, _)| id));
@@ -2175,6 +2178,56 @@ mod tests {
     /// 决策窗口（点歌选候选、审核投票等）靠 `request_refresh` 等一份新鲜快照。
     /// 外部聊天源接管时观察线程不发布任何帧，如果注入路径也不完成围栏，
     /// 窗口只能等到起超时——用户看到「等待共享聊天确认基线超时」。
+    /// 回归：窗口打开后外部源才接管，绑屏幕桶的读者仍要收到外部大厅帧。
+    ///
+    /// 这是把 `chat` 改成 `Option` 时引入的真实回归：外部帧的 `chat` 变成 None，
+    /// 若投递层只放行「未绑定屏幕桶」的读者，二级驻留的决策窗口就会「有基线无输入」，
+    /// 一路空转到超时。判据必须是 scope——外部大厅帧本来就属于大厅。
+    #[test]
+    fn bound_decision_reader_still_receives_external_frames_after_takeover() {
+        let shared = ChatTimeline::new();
+        // 窗口先在 OCR 的二级面板上建基线并绑定桶。
+        let baseline = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::SecondaryHall,
+                vec![input("候选", 10)],
+            )
+            .unwrap();
+        let decision = shared.subscribe().unwrap();
+        decision
+            .bind_chat(ChatIdentity::SecondaryHall, baseline.visual_session)
+            .unwrap();
+        // 之后外部源接管，注入一条大厅消息。
+        shared
+            .inject_external(
+                Instant::now(),
+                VisualSessionId::new(u64::MAX),
+                "test",
+                vec![miliastra_kernel::chat_source::ExternalChatMessage {
+                    sequence: 1,
+                    sent_at: None,
+                    channel: miliastra_kernel::chat_source::ChatChannel::current_hall(),
+                    hall_id: None,
+                    sender: miliastra_kernel::chat_source::ExternalSender::new(
+                        Some("甲".to_string()),
+                        Some(miliastra_kernel::chat_source::GameUid::from_u32(1001)),
+                    ),
+                    to_uid: None,
+                    text: "@1".to_string(),
+                }],
+            )
+            .unwrap();
+        let frames = decision.read().unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "接管后外部大厅帧必须送达绑在大厅桶上的决策读者，实际收到 {} 帧",
+            frames.len()
+        );
+        assert!(frames[0].scope.is_hall());
+        assert!(frames[0].chat.is_none(), "外部帧本身没有屏幕桶");
+    }
     /// 回归：外部消息的快照**没有屏幕桶**。
     ///
     /// 这是解耦的核心保证：socket 消息没有屏幕位置，`chat` 恒为 None。
@@ -3221,7 +3274,7 @@ mod tests {
     }
 
     #[test]
-    fn other_hall_panel_does_not_end_bound_decision_reader() {
+    fn other_panel_snapshot_does_not_end_bound_decision_reader() {
         let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("候选", 10)]);
         let decision = shared.subscribe().unwrap();
@@ -3251,7 +3304,7 @@ mod tests {
     }
 
     #[test]
-    fn other_hall_panel_never_returns_as_decision_input() {
+    fn other_panel_snapshot_never_returns_as_decision_input() {
         let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("候选", 10)]);
         let decision = shared.subscribe().unwrap();
@@ -3340,7 +3393,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_accepts_other_hall_panel_baseline() {
+    fn bind_accepts_a_baseline_from_the_other_panel() {
         let shared = ChatTimeline::new();
         // 基线落在二级面板上：这是同一大厅的同一物理会话，不应判为“基线后换会话”。
         let baseline = shared

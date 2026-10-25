@@ -20,7 +20,8 @@ use crate::features::moderation::{
 };
 use crate::interfaces::chat as command;
 use crate::observation::chat::{
-    ChatScope, ChatTimeline, ChatTimelineSnapshot, ChatTimelineSubscriber, NoChatRefreshError,
+    ChatIdentity, ChatScope, ChatTimeline, ChatTimelineSnapshot, ChatTimelineSubscriber,
+    NoChatRefreshError,
 };
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::ui::InputCertainty;
@@ -212,30 +213,58 @@ impl AppModerationVotePort {
             }
             // 屏幕语汇只对 OCR 成立。外部源没有视觉会话号，bubble_sequence 还是
             // 去重哈希（不单调），拿它当水位会随机丢票。
-            if let Some(baseline) = self.baseline.as_ref() {
-                if snapshot.visual_session != baseline.visual_session {
-                    if snapshot.messages.is_empty() {
-                        // Wait for a reliable restored baseline before accepting votes.
-                        continue;
-                    }
-                    // A rebuilt view of the same chat gets new bubble IDs. Rebase
-                    // before counting so restored historical votes are not replayed.
-                    log::info!(
-                        "管理投票共享 OCR 视图重建，更新基线: session={:?} -> {:?}",
-                        baseline.visual_session,
-                        snapshot.visual_session
-                    );
-                    let rebased = snapshot
-                        .messages
-                        .iter()
-                        .map(|message| message.id.bubble_sequence.get())
-                        .max()
-                        .unwrap_or(0);
-                    self.baseline_sequence = rebased;
-                    self.baseline = Some(snapshot);
+            // 会话重建只在**同一块屏幕**内判断。
+            //
+            // `visual_session` 是按 chat 分桶各自递增的（tracker 每桶一个），
+            // 一级区与二级区各有独立序列。若不分桶就比较，投票窗口会把每次面板
+            // 切换都当成「视图重建」：rebase 到另一块面板的序号空间、并整帧丢弃。
+            // 一级下发必经二级是常态，结果就是每次切面板丢一帧新票，且水位变成
+            // 与另一块面板不可比的序列，票可能永远凑不满稳态。
+            if let Some(baseline) = self.baseline.as_ref()
+                && baseline.chat == snapshot.chat
+                && snapshot.visual_session != baseline.visual_session
+            {
+                if snapshot.messages.is_empty() {
+                    // Wait for a reliable restored baseline before accepting votes.
                     continue;
                 }
+                // A rebuilt view of the same chat gets new bubble IDs. Rebase
+                // before counting so restored historical votes are not replayed.
+                log::info!(
+                    "管理投票共享 OCR 视图重建，更新基线: session={:?} -> {:?}",
+                    baseline.visual_session,
+                    snapshot.visual_session
+                );
+                let rebased = snapshot
+                    .messages
+                    .iter()
+                    .map(|message| message.id.bubble_sequence.get())
+                    .max()
+                    .unwrap_or(0);
+                self.baseline_sequence = rebased;
+                self.baseline = Some(snapshot);
+                continue;
             }
+            // 跨**大厅面板**（一级区 ↔ 二级区）：两边的 bubble_sequence 是独立序列，
+            // 不能拿一边的水位去卡另一边，所以这一帧照常收票，不 rebase。
+            // 消息 id 里的 chat 会把同一条消息在两个桶里区分开，不会重复计票。
+            //
+            // 只承认这两块面板互通：PublicChannel / StrangerMessages / Friend 是
+            // 真正不同的容器，它们的消息不该计入大厅投票。
+            let cross_bucket = self.baseline.as_ref().is_some_and(|baseline| {
+                let is_hall_panel = |chat: &ChatIdentity| {
+                    matches!(
+                        chat,
+                        ChatIdentity::PrimaryHall | ChatIdentity::SecondaryHall
+                    )
+                };
+                baseline
+                    .chat
+                    .as_ref()
+                    .zip(snapshot.chat.as_ref())
+                    .is_some_and(|(left, right)| is_hall_panel(left) && is_hall_panel(right))
+                    && baseline.chat != snapshot.chat
+            });
             // 水位单位在窗口打开时就固定，不随每帧来源漂移：投票中途外部源
             // 连上/断开时，同一订阅者会先后收到两种来源，逐帧换单位会让
             // OCR 消息（source_sequence 恒 0）与外部大序号互相误判，
@@ -260,7 +289,11 @@ impl AppModerationVotePort {
                         // 拿它去比外部大水位会恒假，整窗 OCR 票静默丢光。
                         // 反过来（OCR→外部）也同理。所以按帧判单位，与
                         // `secondary_chat.rs` 每轮重判来源的做法保持一致。
-                        let newer = if snapshot.source.is_ocr() {
+                        // 跨屏幕桶时水位不可比（两边序号各自从 0 开始），直接放行；
+                        // 同桶内仍按水位过滤，避免重放视图重建前的历史票。
+                        let newer = if cross_bucket {
+                            true
+                        } else if snapshot.source.is_ocr() {
                             message.id.bubble_sequence.get() > self.baseline_sequence
                         } else {
                             message.source_sequence > self.baseline_sequence

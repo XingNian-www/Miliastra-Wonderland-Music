@@ -249,6 +249,15 @@ impl AppModerationVotePort {
             // 连上/断开时，同一订阅者会先后收到两种来源，逐帧换单位会让
             // OCR 消息（source_sequence 恒 0）与外部大序号互相误判，
             // 两个方向都会静默丢票。
+            //
+            // 但 message_type 必须按**这一帧的来源**判，不能跟着 base_line 走：
+            // 投票中途外部源接管时 baseline 仍是 OCR 的 Some，而这一帧是外部的
+            // blue 票，用 pink 过滤会静默丢光。
+            let vote_type = if snapshot.source.is_ocr() {
+                "pink"
+            } else {
+                "blue"
+            };
             votes.extend(
                 snapshot
                     .messages
@@ -260,29 +269,13 @@ impl AppModerationVotePort {
                             message.id.bubble_sequence.get() > self.baseline_sequence
                         };
                         newer
-                            && message.message_type == self.vote_message_type()
+                            && message.message_type == vote_type
                             && is_moderation_vote_message(&message.text)
                     })
                     .map(|message| message.text),
             );
         }
         Ok(votes)
-    }
-
-    /// 投票认可的 message_type。
-    ///
-    /// OCR：大厅面板里的好友消息是 pink，天然限定在好友范围内。
-    /// 外部源：大厅消息恒为 blue，好友私聊是 pink，而投票范围就是当前大厅，
-    /// 所以收 blue。
-    ///
-    /// 已知取舍：外部源的 blue 不区分好友与路人，授权面比 OCR 宽。
-    /// 这由 `required_vote_margin` 与投票发起者的身份门槛共同约束。
-    fn vote_message_type(&self) -> &'static str {
-        if self.baseline.is_some() {
-            "pink"
-        } else {
-            "blue"
-        }
     }
 }
 

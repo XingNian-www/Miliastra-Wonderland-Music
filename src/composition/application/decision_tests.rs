@@ -265,6 +265,49 @@ fn external_decision_window_receives_messages_carrying_a_hall_id() {
     );
     assert!(got[0].text.contains("@1"));
 }
+/// 回归：外部源窗口在**没有新消息**时也能就绪，且之后能收到决策输入。
+///
+/// 这是用户报告的「点歌报错：等待共享聊天确认基线超时」的直接覆盖。
+/// 外部接管期间观察线程不发布帧，若窗口只能靠「刚好有人说话」推动，
+/// 安静大厅里必然超时。
+#[test]
+fn external_window_is_ready_then_receives_the_decision() {
+    let shared = ChatTimeline::new();
+    let observations = ChatObservationShared::new();
+    let observation_session = observations.begin_exclusive().unwrap();
+    let subscriber = shared
+        .subscribe_scoped(crate::observation::chat::ChatScope::hall())
+        .unwrap();
+    // 窗口打开：水位 10，不需要任何帧。
+    let mut reader = ChatDecisionReader {
+        listener_mode: ChatListenerMode::Primary,
+        subscriber,
+        scope: crate::observation::chat::ChatScope::hall(),
+        from_screen: false,
+        any_conversation: false,
+        chat: ChatIdentity::SecondaryHall,
+        baseline_at: Instant::now(),
+        sequence_floor: Some(10),
+        baseline_cursor: None,
+        seen: std::collections::HashSet::new(),
+        screen_lock: DecisionScreenLock::default(),
+        _observation_session: observation_session,
+    };
+    // 就绪即可读，不该阻塞。
+    assert!(reader.read_messages().unwrap().is_empty());
+    // 用户在窗口内回 @1。
+    shared
+        .inject_external(
+            Instant::now(),
+            crate::observation::chat::VisualSessionId::new(u64::MAX),
+            "test",
+            vec![external_hall_message(11, "@1")],
+        )
+        .unwrap();
+    let got = reader.read_messages().unwrap();
+    assert_eq!(got.len(), 1, "窗口必须收到 @1，实际 {} 条", got.len());
+    assert!(got[0].text.ends_with("@1"), "实际: {:?}", got[0].text);
+}
 /// 回归：外部源的决策读者必须按业务范围收消息，不能按屏幕桶。
 ///
 /// 外部大厅消息恒被映射成 `SecondaryHall`，而一级值守下的窗口期望 `PrimaryHall`。

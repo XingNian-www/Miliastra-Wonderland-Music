@@ -2154,6 +2154,17 @@ mod tests {
             Some("＠点歌 测试")
         );
         assert_eq!(secondary_hall_command_text("普通聊天"), None);
+        // 正文里出现 `#` 也会被截断出来，但**能不能执行取决于 router**：
+        // `#话题` 不是注册命令，`route` 返回 None，不会被当成命令派发。
+        // 这里只固定提取行为，执行与否由下游命令表决定。
+        assert_eq!(
+            secondary_hall_command_text("聊天内容 #话题"),
+            Some("#话题")
+        );
+        assert_eq!(
+            secondary_hall_command_text("昵称：#状态"),
+            Some("#状态")
+        );
     }
 
     #[test]

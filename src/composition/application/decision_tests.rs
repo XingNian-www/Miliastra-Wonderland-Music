@@ -16,6 +16,37 @@ fn publish(shared: &ChatTimeline, chat: ChatIdentity, messages: Vec<RecognizedCh
     shared.publish(Instant::now(), chat, messages).unwrap();
 }
 
+/// 回归：外部消息补上「昵称：」前缀后，命令仍能被正确提取。
+///
+/// 投递层把正文对齐成 OCR 的屏幕排版（`[甲]：@状态`），命令解析必须仍能
+/// 从 `@` 处截断拿到 `@状态`，否则补前缀就变成了把命令弄坏。
+#[test]
+fn external_message_with_sender_prefix_still_yields_the_command() {
+    let shared = ChatTimeline::new();
+    let business = shared.subscribe_business().unwrap();
+    shared
+        .inject_external(
+            Instant::now(),
+            crate::observation::chat::VisualSessionId::new(u64::MAX),
+            "test",
+            vec![external_hall_message(1, "@状态")],
+        )
+        .unwrap();
+    let frames = business.read().unwrap();
+    let text = &frames[0].messages[0].text;
+    assert!(
+        text.ends_with("@状态"),
+        "正文应保留完整命令，实际: {text:?}"
+    );
+    // 与 OCR 同一条提取路径：从 @ 处截断。
+    let command = super::secondary_hall_command_text(text);
+    assert_eq!(
+        command,
+        Some("@状态"),
+        "命令必须能被正确提取，实际: {command:?}"
+    );
+}
+
 fn external_hall_message(
     sequence: u64,
     text: &str,
@@ -140,9 +171,10 @@ fn external_reader_uses_sequence_watermark_without_waiting_for_a_frame() {
         )
         .unwrap();
     let received = reader.read_messages().unwrap();
+    // 正文带「昵称：」前缀：投递层已把外部消息对齐成 OCR 的屏幕排版语义。
     assert_eq!(
         received.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
-        vec!["@2"],
+        vec!["甲：@2"],
         "只收水位之后的消息：@1(序号3) 是历史，@2(序号7) 才是新决策"
     );
 }

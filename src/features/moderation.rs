@@ -221,6 +221,17 @@ pub trait ModerationVotePort {
         self.poll_visible_friend_messages()
     }
     fn finish(&mut self);
+
+    /// 票是否需要重复采样到 `stable_vote_samples` 次才算稳态。
+    ///
+    /// OCR 需要：同一句话在不同帧里可能被误读成不同内容，必须连续多次读到
+    /// 一致的结果才能确认。
+    ///
+    /// 外部聊天源不需要：它是结构化传输，同一条消息只会投递一次（按 dedup key
+    /// 去重）。要求三次采样会让外部票永远凑不满，投票退化成「只能超时通过」。
+    fn requires_repeated_samples(&self) -> bool {
+        true
+    }
 }
 
 pub trait ModerationTaskPort {
@@ -614,7 +625,12 @@ impl ModerationService {
                             .entry(key)
                             .and_modify(|value| *value += 1)
                             .or_insert(1);
-                        if *count >= self.policy.stable_vote_samples {
+                        let needed = if port.requires_repeated_samples() {
+                            self.policy.stable_vote_samples.max(1)
+                        } else {
+                            1
+                        };
+                        if *count >= needed {
                             stable_votes.insert(username, agreed);
                         }
                     }

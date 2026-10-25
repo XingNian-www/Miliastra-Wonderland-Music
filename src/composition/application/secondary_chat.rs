@@ -675,6 +675,15 @@ impl ApplicationRuntime {
                         .downcast_ref::<crate::observation::chat::NoChatRefreshError>()
                         .is_some() =>
                 {
+                    // 退避一小段再重挂：投递层在「整批无可用容器」时也会用 NoChat
+                    // 完成围栏，若不可映射的频道持续连发，这里会高频空转抢占锁。
+                    // 与 moderation.rs 的 NoChat 分支保持一致。
+                    let backoff = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50));
+                    if !backoff.is_zero() {
+                        std::thread::sleep(backoff);
+                    }
                     refresh = self.ui.chat_timeline.request_refresh()?;
                     continue;
                 }

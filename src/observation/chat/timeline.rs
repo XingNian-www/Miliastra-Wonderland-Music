@@ -1089,9 +1089,23 @@ impl ChatTimeline {
                     }),
                 },
             );
+            // 正文对齐 OCR 语义：屏幕上的二级气泡把「昵称：」直接渲染在正文里，
+            // OCR 读到的就是「[甲]：@同意」。外部源把这部分拆成了两个字段
+            // （sender + text），下游消费者却只认正文格式——所以在这里补齐，
+            // 而不是让每个消费者各自拼一遍。
+            //
+            // 命令解析不受影响：`secondary_hall_command_text` 从 `@` 处截断，
+            // 昵称前缀本来就被丢弃；`CommandEnvelope::new` 的 original_text 与
+            // user_command 也是分开传的。
+            let display_text = match revision.sender.as_deref().map(str::trim) {
+                Some(name) if !name.is_empty() && !revision.text.contains('：') => {
+                    format!("{name}：{}", revision.text.trim())
+                }
+                _ => revision.text.clone(),
+            };
             delivered.push(ChatTimelineMessage {
                 id: id.clone(),
-                text: revision.text,
+                text: display_text,
                 sender: revision.sender,
                 raw_sender: revision.raw_sender,
                 // 必须用既有的 blue/pink 词汇：`CommandEnvelope::new` 只认这两个，
@@ -1882,6 +1896,10 @@ impl ChatTimelineSubscriber {
         }
         // The supplied fresh baseline owns this binding. The live view may already
         // have moved to a temporary identity; publish/read will filter until it returns.
+        //
+        // 清掉 scope，与 bind_scope 对称：一个读者要么按屏幕桶收、要么按业务容器收。
+        // 否则两个条件会叠加成 AND，先 bind_scope 再 bind_chat 的读者被双重筛掉。
+        subscriber.scope = None;
         subscriber.chat = Some(chat);
         subscriber.session = Some(session);
         Ok(())

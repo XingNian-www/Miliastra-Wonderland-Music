@@ -199,6 +199,7 @@ pub(crate) fn spawn(
     timeline: ChatTimeline,
     config: ChatSourceConfig,
     identity_access: Option<crate::features::identity::IdentityAccess>,
+    config_store: Option<crate::config::SharedConfigStore>,
     listener_control: Option<
         std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
     >,
@@ -215,6 +216,7 @@ pub(crate) fn spawn(
                 timeline,
                 config,
                 identity_access,
+                config_store,
                 listener_control,
                 worker_state,
             )
@@ -227,6 +229,7 @@ fn run(
     timeline: ChatTimeline,
     config: ChatSourceConfig,
     identity_access: Option<crate::features::identity::IdentityAccess>,
+    config_store: Option<crate::config::SharedConfigStore>,
     listener_control: Option<
         std::sync::Arc<dyn Fn(crate::runtime::chat_listener::ChatListenerMode) + Send + Sync>,
     >,
@@ -309,6 +312,7 @@ fn run(
                                                 &state,
                                                 &config,
                                                 identity_access.as_ref(),
+                                                config_store.as_ref(),
                                                 &config.url,
                                                 batch.messages,
                                             );
@@ -334,6 +338,7 @@ fn run(
                                 &state,
                                 &config,
                                 identity_access.as_ref(),
+                                config_store.as_ref(),
                                 &config.url,
                                 messages,
                             );
@@ -371,11 +376,43 @@ fn run(
     }
 }
 
+/// 把内存里的身份映射整体写回配置库的 `identity` 段。
+///
+/// 自动为好友 UID 建身份时调用。不写库的话，这条映射只活在当前进程：
+/// 面板看不到、用户无法调权限，而且任何一次配置重载都会用库里的旧值
+/// 把它冲掉（`LiveConfigs::apply` 里 `identity.replace(config.identity)`）。
+///
+/// 只更新 `identity` 段，其余段保持原值——避免与正在编辑的其他配置打架。
+fn persist_identity(
+    store: &crate::config::SharedConfigStore,
+    identity: &crate::features::identity::IdentityAccess,
+) -> anyhow::Result<()> {
+    let snapshot = identity.snapshot();
+    let mut guard = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("配置库锁被毒化"))?;
+    let mut sections = guard
+        .load_full()
+        .map_err(|error| anyhow::anyhow!("读取配置失败: {error}"))?
+        .to_db_value()
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("配置根不是对象"))?;
+    sections.insert("identity".to_string(), serde_json::to_value(snapshot)?);
+    let revision = guard
+        .current_revision()
+        .map_err(|error| anyhow::anyhow!("读取配置版本失败: {error}"))?;
+    guard
+        .save(revision, sections)
+        .map_err(|error| anyhow::anyhow!("保存身份映射失败: {error}"))?;
+    Ok(())
+}
 fn deliver(
     timeline: &ChatTimeline,
     state: &ExternalChatState,
     config: &ChatSourceConfig,
     identity_access: Option<&crate::features::identity::IdentityAccess>,
+    config_store: Option<&crate::config::SharedConfigStore>,
     source: &str,
     messages: Vec<ExternalChatMessage>,
 ) {
@@ -411,11 +448,22 @@ fn deliver(
         if message.channel.is_private() {
             if let Some(uid) = message.sender.uid.as_ref() {
                 if let Some(identity) = identity_access {
-                    identity.ensure_identity_for_account(
+                    let created = identity.ensure_identity_for_account(
                         miliastra_kernel::chat_source::GAME_GENSHIN,
                         uid.as_str(),
                         message.sender.nickname.as_deref(),
                     );
+                    // 自动建出来的身份必须落库。
+                    //
+                    // 只改内存的话有两个后果：面板看不到这条映射（用户无法
+                    // 调权限），而且每次配置重载 live_configs 都会用库里的值
+                    // `identity.replace(...)` 把内存覆盖回去，身份直接消失。
+                    if created.is_some()
+                        && let Some(store) = config_store
+                        && let Err(error) = persist_identity(store, identity)
+                    {
+                        log::warn!("自动创建的身份未能写入数据库: {error:#}");
+                    }
                 }
             }
         }

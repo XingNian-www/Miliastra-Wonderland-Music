@@ -276,11 +276,10 @@ impl CommandLock {
     /// [`CommandLockEntry::matches`] 严格区分锚点变体，于是被改写的那一方从此
     /// 命不中自己的记录 —— 等价于它的锁凭空消失，视图重建后可能重跑。
     fn record(&mut self, text: String, anchor: LockAnchor) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.text == text && std::mem::discriminant(&entry.anchor) == std::mem::discriminant(&anchor))
-        {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.text == text
+                && std::mem::discriminant(&entry.anchor) == std::mem::discriminant(&anchor)
+        }) {
             entry.anchor = anchor;
             entry.missing_frames = 0;
             return;
@@ -335,6 +334,14 @@ impl CommandLock {
 
 struct Subscription {
     chat: Option<ChatIdentity>,
+    /// 绑定的业务容器。设置后按 `scope` 收消息，**优先于 `chat`**。
+    ///
+    /// 为什么需要它：外部聊天源的消息没有屏幕，外部大厅恒被映射成
+    /// `SecondaryHall`。读者若只绑 `chat`，一级驻留时绑的是 `PrimaryHall`，
+    /// 外部消息会被过滤整批丢掉——决策窗口只能空转到超时。
+    ///
+    /// 屏幕读者保持只绑 `chat`（`scope` 为 None），行为与解耦前一致。
+    scope: Option<ChatScope>,
     session: Option<VisualSessionId>,
     queue: VecDeque<ChatTimelineSnapshot>,
     failure: Option<String>,
@@ -348,6 +355,14 @@ struct Subscription {
 ///
 /// 任务绑定期间出现的其他身份同样只被忽略：它们不能提供本任务输入，也不应仅因
 /// 一个任务内状态停留较久就终止窗口；调用方的整体期限负责结束等待。
+/// 两块快照是否「同一大厅的另一块面板」。
+///
+/// **屏幕侧语义**：一级区（主聊天 marker 判定）与二级区（二级面板几何判定）
+/// 是同一物理大厅的两块面板，一级下发消息必然途经一次二级面板。
+///
+/// 只用于屏幕读者判断「这块快照不是我要的、但也不算换会话」。
+/// 业务侧（决策窗口、审核投票、好友未读）一律按 [`ChatScope`] 判，不要用它——
+/// 外部聊天源没有屏幕桶，把它套到外部消息上没有意义。
 pub(crate) fn other_hall_panel(bound: &ChatIdentity, incoming: &ChatIdentity) -> bool {
     matches!(
         (bound, incoming),
@@ -618,6 +633,23 @@ impl ChatTimeline {
         Ok(self.subscribe_locked(&mut state, None, true))
     }
 
+    /// 订阅并限定只收某个业务容器的消息。
+    ///
+    /// 这是「按业务容器订阅」的正规入口：审批投票、决策窗口这类读者
+    /// 只关心当前大厅，不该收到好友私聊。
+    ///
+    /// 订阅与绑定是一次原子操作——先 `subscribe()` 再 `bind_scope()` 的话，
+    /// 两步之间到达的其他容器快照会先入队（读侧虽会二次过滤，但队列白占）。
+    pub(crate) fn subscribe_scoped(&self, scope: ChatScope) -> Result<ChatTimelineSubscriber> {
+        let mut state = self.lock()?;
+        let subscriber = self.subscribe_locked(&mut state, None, false);
+        let id = subscriber.id;
+        if let Some(sub) = state.ledger.subscribers.get_mut(&id) {
+            sub.scope = Some(scope);
+        }
+        Ok(subscriber)
+    }
+
     /// Reading the passive baseline and starting the queue is one atomic operation.
     pub(crate) fn subscribe_with_snapshot(
         &self,
@@ -626,11 +658,6 @@ impl ChatTimeline {
         let latest = state.screen.latest.clone();
         let subscriber = self.subscribe_locked(&mut state, None, false);
         Ok((latest, subscriber))
-    }
-
-    pub(crate) fn subscribe_chat(&self, chat: ChatIdentity) -> Result<ChatTimelineSubscriber> {
-        let mut state = self.lock()?;
-        Ok(self.subscribe_locked(&mut state, Some(chat), false))
     }
 
     fn subscribe_locked(
@@ -645,6 +672,8 @@ impl ChatTimeline {
             id,
             Subscription {
                 chat,
+                // 订阅时只绑 chat；需要按业务容器收消息的读者随后调 bind_scope。
+                scope: None,
                 session: None,
                 queue: VecDeque::new(),
                 failure: None,
@@ -657,16 +686,19 @@ impl ChatTimeline {
         }
     }
 
-    pub(crate) fn refresh_after_other_hall_panel(
-        &self,
-        expected: &ChatIdentity,
-        snapshot: &ChatTimelineSnapshot,
-    ) -> Result<Option<u64>> {
-        if other_hall_panel(expected, &snapshot.chat) {
-            self.request_refresh().map(Some)
-        } else {
-            Ok(None)
-        }
+    /// 当前大厅的业务容器。
+    ///
+    /// 决策/投票窗口用它订阅：一级区与二级区是同一大厅的两块面板，
+    /// 用同一个 scope 就天然不必区分；外部聊天源的大厅消息也是同一个容器。
+    pub(crate) fn current_hall_scope(&self) -> Result<ChatScope> {
+        let state = self.lock()?;
+        // 只取**大厅**容器的 id。最近一帧可能是好友会话（二级面板选了谁、刚处理完
+        // 未读），直接拿它的 scope 会把投票/决策绑到私聊容器上，大厅消息反而全被丢。
+        Ok(match state.screen.latest.as_ref().map(|s| &s.scope) {
+            Some(ChatScope::Hall { id }) => ChatScope::Hall { id: *id },
+            // 私聊帧、或还没有任何帧：退回不带 id 的大厅容器。
+            _ => ChatScope::hall(),
+        })
     }
 
     pub(crate) fn request_refresh(&self) -> Result<u64> {
@@ -963,58 +995,20 @@ impl ChatTimeline {
             chat,
             messages: observed,
         };
-        for subscriber in state.ledger.subscribers.values_mut() {
-            if subscriber.failure.is_some() {
-                continue;
+        // 屏幕来源的过滤规则：另一块大厅面板跳过；其余必须是绑定的同一聊天。
+        // 不同身份可能是长期的界面过渡，等目标聊天回来，而不是按帧数/时长结束任务。
+        //
+        // 这是**屏幕侧**过滤：另一块大厅面板跳过，其余必须是绑定的同一聊天。
+        // 外部来源的过滤由调用方另给（外部消息没有屏幕桶）。
+        deliver_snapshot(&mut state, &snapshot, |subscriber, snapshot| {
+            let Some(bound) = subscriber.chat.as_ref() else {
+                return true;
+            };
+            if other_hall_panel(bound, &snapshot.chat) {
+                return false;
             }
-            if subscriber
-                .chat
-                .as_ref()
-                .is_some_and(|bound| other_hall_panel(bound, &snapshot.chat))
-            {
-                continue;
-            }
-            // Only snapshots from the bound chat can feed this task. A different
-            // identity may be a long-lived UI transition, so wait for the target
-            // instead of ending the task based on frame count or elapsed time here.
-            if subscriber
-                .chat
-                .as_ref()
-                .is_some_and(|bound| *bound != snapshot.chat)
-            {
-                continue;
-            }
-            if subscriber.queue.len() >= RETAINED_CAPACITY {
-                subscriber.failure =
-                    Some("chat timeline subscriber overflow (4096 snapshots)".into());
-                subscriber.queue.clear();
-            } else {
-                let session_changed = subscriber
-                    .session
-                    .is_some_and(|session| session != snapshot.visual_session);
-                if session_changed {
-                    // 同一个聊天里的视图重建（机器人自己发言、面板滚动、重新申请帧）会让视觉会话号自增。
-                    // 确认读者重置基线继续等待；业务读者保留尚未消费的旧会话快照。
-                    log::info!(
-                        "共享聊天读者改绑新视觉会话: session={:?} -> {:?}",
-                        subscriber.session,
-                        snapshot.visual_session
-                    );
-                    if !subscriber.durable_business {
-                        subscriber.queue.clear();
-                    }
-                } else if subscriber.session.is_none() && subscriber.chat.is_some() {
-                    // 聊天视图曾瞬态消失；同一聊天恢复后重新绑定，不丢后续消息。
-                    log::info!("共享聊天读者在聊天恢复后重新绑定: chat={:?}", snapshot.chat);
-                    if !subscriber.durable_business {
-                        subscriber.queue.clear();
-                    }
-                }
-                subscriber.session = Some(snapshot.visual_session);
-                subscriber.queue.push_back(snapshot.clone());
-            }
-        }
-        complete_refreshes(&mut state, captured_at, Ok(Some(snapshot.clone())));
+            *bound == snapshot.chat
+        });
         state.screen.latest = Some(snapshot.clone());
         self.inner.changed.notify_all();
         Ok(snapshot)
@@ -1124,48 +1118,53 @@ impl ChatTimeline {
         }
         // 推给订阅者：命令链路靠这条队列拿消息。
         // 与 `publish` 的投递段保持同一套过滤规则（绑定聊天、溢出保护）。
-        let snapshot = ChatTimelineSnapshot {
-            captured_at,
-            visual_session: epoch,
-            // chat 与 scope 必须来自**同一条**消息，否则两个字段指向不同会话：
-            // 批内既有大厅又有私聊时，消费侧会按 scope 放行、却按 chat 进错分支，
-            // 把私聊消息当大厅命令派发（friend_name 为空 → 主语为空 → 丢命令），
-            // 或把大厅消息记到某个好友名下（归属与身份解析错误）。
-            chat: accepted
-                .first()
-                .map(|(_, identity, _)| identity.clone())
-                .unwrap_or(ChatIdentity::Unknown),
-            scope: accepted
-                .first()
-                .map(|(_, _, scope)| scope.clone())
-                .unwrap_or(ChatScope::hall()),
-            source: SourceId::external(source),
-            messages: delivered,
-        };
-        for subscriber in state.ledger.subscribers.values_mut() {
-            if subscriber.failure.is_some() {
-                continue;
-            }
-            // 未绑定聊天的订阅者（主命令消费者就是这种）必须照常入队——
-            // 与 `publish` 的投递规则保持一致，否则 API 消息到不了命令链路。
-            if let Some(bound) = subscriber.chat.clone()
-                && snapshot.chat != ChatIdentity::Unknown
-                && bound != snapshot.chat
+        // 按 (chat, scope) 分组：断线补拉走 `/messages?since=`，服务端返回的是跨频道
+        // 环形缓冲，同一批里可能既有大厅又有私聊。整批打上第一条消息的身份会让
+        // 消费侧按 scope 放行、却把私聊消息当大厅命令派发（friend_name 为空 → 丢命令），
+        // 或把大厅消息记到某个好友名下（归属与身份解析错误）。
+        let mut groups: Vec<((ChatIdentity, ChatScope), Vec<ChatTimelineMessage>)> = Vec::new();
+        for ((identity, scope), message) in accepted
+            .iter()
+            .map(|(_, identity, scope)| (identity.clone(), scope.clone()))
+            .zip(delivered)
+        {
+            match groups
+                .iter_mut()
+                .find(|(key, _)| *key == (identity.clone(), scope.clone()))
             {
-                continue;
+                Some((_, bucket)) => bucket.push(message),
+                None => groups.push(((identity, scope), vec![message])),
             }
-            if subscriber.queue.len() >= RETAINED_CAPACITY {
-                subscriber.failure =
-                    Some("chat timeline subscriber overflow (4096 snapshots)".into());
-                subscriber.queue.clear();
-                continue;
-            }
-            subscriber.session = Some(epoch);
-            subscriber.queue.push_back(snapshot.clone());
         }
+        let mut accepted_ids = Vec::with_capacity(accepted.len());
+        for ((identity, scope), messages) in groups {
+            let snapshot = ChatTimelineSnapshot {
+                captured_at,
+                visual_session: epoch,
+                chat: identity,
+                scope,
+                source: SourceId::external(source),
+                messages,
+            };
+            // 外部来源的过滤规则：未绑定聊天的订阅者（主命令消费者）照常入队；
+            // 绑定了的就只收同一个身份。这里**不**做 other_hall_panel 判定——
+            // 那是屏幕分桶概念，外部消息没有屏幕。
+            deliver_snapshot(&mut state, &snapshot, |subscriber, snapshot| {
+                if let Some(bound_scope) = subscriber.scope.as_ref() {
+                    return bound_scope.same_container(&snapshot.scope);
+                }
+                match subscriber.chat.as_ref() {
+                    None => true,
+                    Some(bound) => {
+                        snapshot.chat == ChatIdentity::Unknown || *bound == snapshot.chat
+                    }
+                }
+            });
+        }
+        accepted_ids.extend(accepted.into_iter().map(|(id, _, _)| id));
         drop(state);
         self.inner.changed.notify_all();
-        Ok(accepted.into_iter().map(|(id, _, _)| id).collect())
+        Ok(accepted_ids)
     }
 
     pub(crate) fn publish_no_chat(
@@ -1303,8 +1302,16 @@ impl ChatTimeline {
         if state.ledger.friend_suppressions > 0
             || !matches!(snapshot.chat, ChatIdentity::Friend(_))
             || !snapshot.messages.iter().any(|message| message.id == *id)
-            || !state.ledger.unread_baseline.contains(id)
         {
+            return Ok(false);
+        }
+        // 外部聊天源的消息一进账本就是 pending，业务链路会直接消费，不需要「提升」
+        // ——提升是给 OCR 首屏历史消息用的（它们被基线压住，要单独放行一条）。
+        // 这里如实返回 false，调用方按「无需提升」处理，而不是等到超时报假成功。
+        if !snapshot.source.is_ocr() {
+            return Ok(false);
+        }
+        if !state.ledger.unread_baseline.contains(id) {
             return Ok(false);
         }
         // Use the most recent actual OCR revision so eligibility cannot append
@@ -1756,6 +1763,80 @@ fn complete_refreshes(
     }
 }
 
+/// 统一的订阅者投递：**两个来源共用这一份**。
+///
+/// 解耦要点：OCR 与外部聊天源在上游各写各的账本（前者要走跨帧对齐与新鲜度判定，
+/// 后者直接构造），但「把快照推给订阅者 + 完成 refresh 围栏」这一段的规则必须只有一份。
+///
+/// 以前两份实现各自演化，已经出现真实分歧：
+/// - `inject_external` 漏了 `complete_refreshes`，导致决策窗口永远等不到基线；
+/// - 外部来源与屏幕来源的过滤条件各自加分支，长期漂移；
+/// - 溢出时一个 `clear()` 后 `continue`，另一个靠分支结构，行为不一致。
+///
+/// `bound_filter` 决定「绑定在这个订阅者上的消息要不要收」——调用方按来源给出，
+/// 因为 OCR 需要区分「另一个屏幕桶」与「换了会话」，而外部消息没有屏幕桶概念。
+fn deliver_snapshot(
+    state: &mut State,
+    snapshot: &ChatTimelineSnapshot,
+    accepts: impl Fn(&Subscription, &ChatTimelineSnapshot) -> bool,
+) {
+    for subscriber in state.ledger.subscribers.values_mut() {
+        if subscriber.failure.is_some() {
+            continue;
+        }
+        // 绑定业务容器的读者只收本容器的消息。
+        //
+        // 这里过滤的是**订阅队列**，不影响 `refresh` 围栏——围栏在循环之后
+        // 无条件完成，等待者仍会被唤醒并自行决定继续等还是采用。
+        // 若把围栏也一起挡掉，`wait_for_snapshot` 永远拿不到任何东西，
+        // 窗口只能干等到超时，这正是外部源/面板切换超时的经典成因。
+        if let Some(bound_scope) = subscriber.scope.as_ref()
+            && !bound_scope.same_container(&snapshot.scope)
+        {
+            continue;
+        }
+        if !accepts(subscriber, snapshot) {
+            continue;
+        }
+        if subscriber.queue.len() >= RETAINED_CAPACITY {
+            fail_subscription(
+                subscriber,
+                "chat timeline subscriber overflow (4096 snapshots)",
+            );
+            continue;
+        }
+        let session_changed = subscriber
+            .session
+            .is_some_and(|session| session != snapshot.visual_session)
+            // 外部注入**不清队列**：纯重连换 epoch 不代表历史失效，
+            // 清掉会把窗口里已入队未读的决策消息丢掉。原 inject_external 就是这样。
+            && snapshot.source.is_ocr();
+        if session_changed {
+            // 同一个聊天里的视图重建（机器人自己发言、面板滚动、重新申请帧）会让视觉会话号自增。
+            // 确认读者重置基线继续等待；业务读者保留尚未消费的旧会话快照。
+            log::info!(
+                "共享聊天读者改绑新视觉会话: session={:?} -> {:?}",
+                subscriber.session,
+                snapshot.visual_session
+            );
+            if !subscriber.durable_business {
+                subscriber.queue.clear();
+            }
+        }
+        // 聊天视图曾瞬态消失、同一会话恢复：留一条日志，便于排查「读者为什么停了」。
+        // 队列清理已由上面的 session_changed 分支覆盖，这里只补可观测性。
+        if !session_changed && subscriber.session.is_none() && subscriber.chat.is_some() {
+            log::info!("共享聊天读者在聊天恢复后重新绑定: chat={:?}", snapshot.chat);
+        }
+        subscriber.session = Some(snapshot.visual_session);
+        subscriber.queue.push_back(snapshot.clone());
+    }
+    // refresh 围栏对所有未完成请求无条件应答。
+    //
+    // 这是决策窗口能成立的前提：它等的是一份「当前会话的新鲜快照」，
+    // 而不管这份快照来自屏幕 OCR 还是聊天 socket。
+    complete_refreshes(state, snapshot.captured_at, Ok(Some(snapshot.clone())));
+}
 fn fail_subscription(subscriber: &mut Subscription, reason: &str) {
     if subscriber.failure.is_none() {
         subscriber.failure = Some(reason.to_owned());
@@ -1780,6 +1861,25 @@ impl ChatTimelineSubscriber {
         // The supplied fresh baseline owns this binding. The live view may already
         // have moved to a temporary identity; publish/read will filter until it returns.
         subscriber.chat = Some(chat);
+        subscriber.session = Some(session);
+        Ok(())
+    }
+
+    /// 绑定业务容器：之后只收这个容器的消息，不再看屏幕桶。
+    ///
+    /// 外部聊天源专用。它的消息没有屏幕坐标，大厅恒被映射成 `SecondaryHall`；
+    /// 若仍按 `chat` 过滤，一级驻留的读者会被整批挡住。
+    pub(crate) fn bind_scope(&self, scope: ChatScope, session: VisualSessionId) -> Result<()> {
+        let mut state = self.shared.lock()?;
+        let subscriber = state
+            .ledger
+            .subscribers
+            .get_mut(&self.id)
+            .ok_or_else(|| anyhow!("chat timeline subscription closed"))?;
+        if let Some(reason) = &subscriber.failure {
+            bail!("{reason}");
+        }
+        subscriber.scope = Some(scope);
         subscriber.session = Some(session);
         Ok(())
     }
@@ -2022,11 +2122,40 @@ mod tests {
         );
     }
 
-    /// 复现：好友会话闲置隐藏后重开，只剩一条新命令（无交叠）。
+    /// 回归：外部注入必须满足等待中的 refresh 围栏。
     ///
-    /// 真实场景：一级大厅值守，聊天框闲置超时被收起；玩家在好友私聊发 `#手牌`，
-    /// 游戏把聊天框弹出。此时好友面板常只渲染出这一个气泡（无历史气泡），
-    /// 于是新帧只有 1 条、与旧的 prev 完全没有共同锚点。
+    /// 决策窗口（点歌选候选、审核投票等）靠 `request_refresh` 等一份新鲜快照。
+    /// 外部聊天源接管时观察线程不发布任何帧，如果注入路径也不完成围栏，
+    /// 窗口只能等到起超时——用户看到「等待共享聊天确认基线超时」。
+    #[test]
+    fn external_injection_satisfies_pending_refresh() {
+        let shared = ChatTimeline::new();
+        let refresh = shared.request_refresh().unwrap();
+        let epoch = VisualSessionId::new(u64::MAX);
+        let message = miliastra_kernel::chat_source::ExternalChatMessage {
+            sequence: 1,
+            sent_at: None,
+            channel: miliastra_kernel::chat_source::ChatChannel::current_hall(),
+            hall_id: None,
+            sender: miliastra_kernel::chat_source::ExternalSender::new(
+                Some("玩家癸".to_string()),
+                Some(miliastra_kernel::chat_source::GameUid::from_u32(900000001)),
+            ),
+            to_uid: None,
+            text: "@状态".to_string(),
+        };
+        shared
+            .inject_external(Instant::now(), epoch, "test", vec![message])
+            .unwrap();
+        let outcome = shared
+            .wait_for_snapshot(refresh, Duration::from_millis(50))
+            .unwrap();
+        assert!(
+            outcome.is_some(),
+            "外部注入必须完成等待中的 refresh 围栏，否则决策窗口必然超时"
+        );
+    }
+
     #[test]
     fn injected_command_reaches_unbound_business_subscriber() {
         // 回归：主命令消费者用 subscribe_business()（chat=None）。
@@ -2060,6 +2189,11 @@ mod tests {
         );
     }
 
+    /// 复现：好友会话闲置隐藏后重开，只剩一条新命令（无交叠）。
+    ///
+    /// 真实场景：一级大厅值守，聊天框闲置超时被收起；玩家在好友私聊发 `#手牌`，
+    /// 游戏把聊天框弹出。此时好友面板常只渲染出这一个气泡（无历史气泡），
+    /// 于是新帧只有 1 条、与旧的 prev 完全没有共同锚点。
     #[test]
     fn repro_friend_command_after_long_idle_is_lost() {
         let shared = ChatTimeline::new();
@@ -2349,7 +2483,7 @@ mod tests {
         let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("history", 10)]);
         let business = shared.subscribe_business().unwrap();
-        let decisions = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
+        let decisions = shared.subscribe().unwrap();
         decisions
             .bind_chat(ChatIdentity::PrimaryHall, baseline.visual_session)
             .unwrap();
@@ -2610,7 +2744,7 @@ mod tests {
         let shared = ChatTimeline::new();
         let baseline = friend(&shared, vec![input("history", 10)]);
         let business = shared.subscribe().unwrap();
-        let decision = shared.subscribe_chat(baseline.chat.clone()).unwrap();
+        let decision = shared.subscribe().unwrap();
         let guard = shared.suppress_friend_business().unwrap();
         let token = shared.request_refresh().unwrap();
         let producer = shared.clone();
@@ -2995,48 +3129,6 @@ mod tests {
     }
 
     #[test]
-    fn refresh_after_other_hall_panel_requests_a_new_frame() {
-        let shared = ChatTimeline::new();
-        let first_refresh = shared.request_refresh().unwrap();
-        let secondary = shared
-            .publish(
-                Instant::now(),
-                ChatIdentity::SecondaryHall,
-                vec![input("panel transition", 10)],
-            )
-            .unwrap();
-        assert_eq!(
-            shared
-                .wait_for_snapshot(first_refresh, Duration::ZERO)
-                .unwrap()
-                .unwrap()
-                .chat,
-            ChatIdentity::SecondaryHall
-        );
-        let next_refresh = shared
-            .refresh_after_other_hall_panel(&ChatIdentity::PrimaryHall, &secondary)
-            .unwrap()
-            .expect("opposite panel must rearm the baseline request");
-        assert_ne!(first_refresh, next_refresh);
-
-        let primary = shared
-            .publish(
-                Instant::now(),
-                ChatIdentity::PrimaryHall,
-                vec![input("target baseline", 10)],
-            )
-            .unwrap();
-        assert_eq!(
-            shared
-                .wait_for_snapshot(next_refresh, Duration::ZERO)
-                .unwrap()
-                .unwrap()
-                .chat,
-            primary.chat
-        );
-    }
-
-    #[test]
     fn other_hall_panel_does_not_end_bound_decision_reader() {
         let shared = ChatTimeline::new();
         let baseline = publish(&shared, vec![input("候选", 10)]);
@@ -3180,7 +3272,8 @@ mod tests {
     fn long_foreign_state_is_filtered_for_decision_not_business_reader() {
         let shared = ChatTimeline::new();
         let business = shared.subscribe().unwrap();
-        let decision = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
+        // 决策读者只收大厅：绑定业务容器后，好友会话的快照不进它的队列。
+        let decision = shared.subscribe_scoped(ChatScope::hall()).unwrap();
         for y in [10, 20, 30, 40, 50] {
             shared
                 .publish(

@@ -9,8 +9,8 @@ pub(crate) mod formal_task;
 /// Cross-platform command/login/player/AI facades, re-exported here so Windows call sites keep
 /// the same `http_facade::` path while Linux test builds can use them without `composition`.
 pub(crate) use crate::interfaces::http::facade as http_facade;
-mod lifecycle;
 pub(super) mod external_chat;
+mod lifecycle;
 mod listener;
 mod moderation;
 mod playback;
@@ -1095,7 +1095,9 @@ impl PendingTask {
             // 值守切换用稳定去重键：同一时刻只需要一个"切到某模式"的任务。
             // 没有它时，自愈逻辑无法判断 pending_mode 是否已有任务在排队，
             // 重复入队会堆积多个切换任务，彼此撤销对方的 pending 状态。
-            Self::SetChatListenerMode { target } => Some(format!("chat_listener_mode_{}", target.label())),
+            Self::SetChatListenerMode { target } => {
+                Some(format!("chat_listener_mode_{}", target.label()))
+            }
             Self::ConsoleChat { .. }
             | Self::Startup(_)
             | Self::ClearIdleExit
@@ -1212,21 +1214,86 @@ struct ChatDecisionReader {
     listener_mode: ChatListenerMode,
     subscriber: crate::observation::chat::ChatTimelineSubscriber,
     chat: crate::observation::chat::ChatIdentity,
+    /// 窗口期的业务容器。外部源只按它匹配消息，不看屏幕桶。
+    scope: crate::observation::chat::ChatScope,
+    /// 是否接收所有会话（`MultipleConversations`）。
+    ///
+    /// 邀请确认、自定义流程确认这类窗口既可能从大厅来，也可能从好友私聊来，
+    /// 因此不绑定单一容器，由调用方再按消息类型（blue/pink）筛选。
+    ///
+    /// 代价：窗口打开后新出现的会话，其整屏历史气泡都晚于 `baseline_at`，
+    /// 可能被当成新决策。这类窗口的确认文本都带唯一 token，业务层会按 token
+    /// 去重；且位置锁（`screen_lock`）在 OCR 路径仍生效，重复文本会被否决。
+    any_conversation: bool,
+    /// 窗口期基线来源。外部源没有屏幕，下面两项屏幕语义对它一律跳过。
+    from_screen: bool,
     baseline_at: Instant,
+    /// 外部源的服务端序号水位（窗口打开时的最大已处理序号）。
+    ///
+    /// 为什么不能只靠 `baseline_at`：外部源的消息由 socket 推送，`captured_at`
+    /// 是投递时刻。窗口打开后到达的第一条消息，其时间戳可能与窗口开启时刻同值，
+    /// 用 `<=` 过滤会把它自己排除掉——用户发的第一条 `@1` 永远进不了窗口。
+    /// OCR 有周期兜底帧，这个问题在那边从不暴露。
+    ///
+    /// 用序号水位则语义确定：小于等于水位的都发生在窗口打开之前。
+    /// 水位在 `subscribe` **之前**采样，避免两步之间到达的消息被误判为历史。
+    sequence_floor: Option<u64>,
+    /// 屏幕气泡序号上限。外部消息的 `bubble_sequence` 是去重哈希、不单调，
+    /// 拿它当游标会把约一半新消息误判成旧消息，所以外部源恒为 None。
     baseline_cursor: Option<(crate::observation::chat::VisualSessionId, u64)>,
     seen: std::collections::HashSet<(crate::observation::chat::ObservedChatMessageId, String)>,
+    /// 屏幕位置去重锁。外部消息的 `block` 是哨兵坐标，全部相同，
+    /// 用它判定会把同文本决策永久否决，所以外部源恒为空实现。
     screen_lock: DecisionScreenLock,
     _observation_session: ChatObservationExclusiveGuard,
 }
 
 impl ChatDecisionReader {
+    /// 这份快照是否属于本窗口的会话。
+    ///
+    /// 屏幕读者按屏幕桶判（一级区与二级区是同一大厅的两块面板，必须区分）；
+    /// 外部源读者按业务范围判（外部消息没有屏幕，大厅恒映射 SecondaryHall，
+    /// 按屏幕桶判会永远匹配不上）。三条读者路径共用这一个判定，避免漂移。
+    fn same_conversation(&self, snapshot: &crate::observation::chat::ChatTimelineSnapshot) -> bool {
+        if self.any_conversation {
+            return true;
+        }
+        if self.from_screen {
+            snapshot.chat == self.chat
+        } else {
+            // 用 same_container 而非 ==：外部源带 hallId，窗口绑的是不带 id 的
+            // 大厅容器，严格相等会让整窗收不到消息。
+            snapshot.scope.same_container(&self.scope)
+        }
+    }
+
+    /// 这条消息是否晚于窗口打开时的水位。
+    ///
+    /// 屏幕消息没有服务端序号，退回按时间比较（与解耦前一致）；
+    /// 外部消息按单调序号比较，避免把「让基线成立的那条」误判成历史。
+    fn is_after_baseline_at(
+        &self,
+        snapshot_at: Instant,
+        message: &crate::observation::chat::ChatTimelineMessage,
+    ) -> bool {
+        match self.sequence_floor {
+            Some(floor) if !message.id.is_from_screen() => message.source_sequence > floor,
+            _ => snapshot_at > self.baseline_at,
+        }
+    }
+
     fn read_messages(&mut self) -> Result<Vec<ChatMessage>> {
         let mut messages = Vec::new();
         for snapshot in self.subscriber.read()? {
-            if snapshot.chat != self.chat || snapshot.captured_at <= self.baseline_at {
+            if !self.same_conversation(&snapshot) {
                 continue;
             }
+            let snapshot_at = snapshot.captured_at;
             for message in snapshot.messages {
+                // 消息级时间/序号判定：外部源按单调序号，避免把让基线成立的那条排除掉。
+                if !self.is_after_baseline_at(snapshot_at, &message) {
+                    continue;
+                }
                 if self.baseline_cursor.is_some_and(|(session, sequence)| {
                     message.id.visual_session == session
                         && message.id.bubble_sequence.get() <= sequence
@@ -1715,11 +1782,12 @@ impl ApplicationRuntime {
                 paused: Arc::new(AtomicBool::new(false)),
                 console_reply_context: Arc::new(AtomicBool::new(false)),
                 monitor,
-                config_store: Some(config_store),
+                config_store: Some(config_store.clone()),
                 external_chat: external_chat::spawn(
                     chat_timeline_for_external,
                     chat_source_config,
                     Some(external_identity_access),
+                    Some(config_store),
                     external_listener_control,
                 )
                 .unwrap_or_else(|error| {

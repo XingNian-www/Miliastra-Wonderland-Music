@@ -114,7 +114,8 @@ fn observation(message: &RecognizedChatMessage, frame: &Frame) -> CommandObserva
     CommandObservation {
         captured_at: Some(frame.captured_at),
         message_text: Some(message.text.clone()),
-        message_y: Some(message.block.y),
+        // 命令锁锚点：屏幕消息用 y。`message_y` 字段已并入 `lock_anchor`。
+        lock_anchor: Some(crate::observation::chat::LockAnchor::Screen { y: message.block.y }),
         ..Default::default()
     }
 }

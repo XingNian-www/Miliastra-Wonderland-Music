@@ -160,9 +160,7 @@ impl ApplicationRuntime {
         use crate::features::turtle_soup::TurtleSoupReplyText;
         match reply {
             TurtleSoupReplyText::Raw(text) => Some(text.clone()),
-            TurtleSoupReplyText::Keyed { spec, vars } => {
-                self.render_template_text(spec, vars)
-            }
+            TurtleSoupReplyText::Keyed { spec, vars } => self.render_template_text(spec, vars),
             TurtleSoupReplyText::Numbered {
                 label,
                 index,
@@ -216,11 +214,8 @@ impl ApplicationRuntime {
         }
         // 覆盖只来自命令面板保存的行；配置中心不再提供回复文案入口。
         let override_text = self.command_reply_text(spec.key);
-        let rendered = crate::features::reply_template::render(
-            spec,
-            override_text.as_deref(),
-            vars,
-        );
+        let rendered =
+            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
         // 先渲染出真实内容，再让 AI 看这段"已经发生的事实"——
         // 直接把未渲染的模板交给模型，它只能看到占位符，等于瞎编。
         let rendered = self.fill_ai_reply(spec, rendered);
@@ -317,9 +312,9 @@ impl ApplicationRuntime {
         let Ok(replies) = store.reply_templates() else {
             return false;
         };
-        replies.get(entry.id).is_some_and(|rows| {
-            rows.is_empty() || !rows.iter().any(|reply| reply.key == key)
-        })
+        replies
+            .get(entry.id)
+            .is_some_and(|rows| rows.is_empty() || !rows.iter().any(|reply| reply.key == key))
     }
 
     /// 渲染并直接发送一条模板回复。
@@ -398,9 +393,7 @@ impl ApplicationRuntime {
     ) -> Option<String> {
         use crate::features::card_games::CardGameReplyTemplate;
         match template {
-            CardGameReplyTemplate::Template { spec, vars } => {
-                self.render_template_text(spec, vars)
-            }
+            CardGameReplyTemplate::Template { spec, vars } => self.render_template_text(spec, vars),
             CardGameReplyTemplate::Composed { spec, vars, nested } => {
                 let mut resolved = Vec::with_capacity(nested.len());
                 for (name, reply) in nested {

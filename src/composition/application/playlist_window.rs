@@ -147,10 +147,14 @@ impl ChatDecisionReader {
     fn read_playlist_messages(&mut self) -> Result<Vec<(ChatTimelineMessage, Instant)>> {
         let mut messages = Vec::new();
         for snapshot in self.subscriber.read()? {
-            if snapshot.chat != self.chat || snapshot.captured_at <= self.baseline_at {
+            if !self.same_conversation(&snapshot) {
                 continue;
             }
+            let snapshot_at = snapshot.captured_at;
             for message in snapshot.messages {
+                if !self.is_after_baseline_at(snapshot_at, &message) {
+                    continue;
+                }
                 if self.baseline_cursor.is_some_and(|(session, sequence)| {
                     message.id.visual_session == session
                         && message.id.bubble_sequence.get() <= sequence
@@ -480,6 +484,10 @@ mod tests {
                     .into_iter()
                     .map(|message| (message.id, message.text))
                     .collect(),
+                scope: snapshot.scope.clone(),
+                from_screen: true,
+                any_conversation: false,
+                sequence_floor: None,
                 screen_lock: DecisionScreenLock::default(),
                 _observation_session: guard,
             },

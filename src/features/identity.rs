@@ -206,6 +206,17 @@ impl IdentityAccess {
         *self.inner.write().unwrap_or_else(PoisonError::into_inner) = config;
     }
 
+    /// 当前映射表的快照。
+    ///
+    /// 自动为好友 UID 建身份后需要把它写回配置库；不取快照就没法持久化，
+    /// 那条映射只能活到下一次配置重载。
+    pub fn snapshot(&self) -> IdentityConfig {
+        self.inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// 精确解析昵称；未映射返回 None。
     pub fn resolve(&self, nickname: &str) -> Option<ResolvedIdentity> {
         // 空昵称永不匹配：OCR 失败时发送者是空串，若不挡住会命中

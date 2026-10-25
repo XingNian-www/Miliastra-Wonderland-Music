@@ -20,7 +20,7 @@ use crate::features::moderation::{
 };
 use crate::interfaces::chat as command;
 use crate::observation::chat::{
-    ChatIdentity, ChatTimeline, ChatTimelineSnapshot, ChatTimelineSubscriber, NoChatRefreshError,
+    ChatScope, ChatTimeline, ChatTimelineSnapshot, ChatTimelineSubscriber, NoChatRefreshError,
 };
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::ui::InputCertainty;
@@ -32,26 +32,34 @@ struct ModerationVoteContext {
     running: Arc<AtomicBool>,
     chat_timeline: ChatTimeline,
     baseline_timeout: Duration,
+    /// 投票所属大厅的业务容器。整个投票期固定，避免中途被别的 hall 带走。
+    vote_scope: ChatScope,
 }
 
 impl ModerationVoteContext {
     fn open(self) -> Result<AppModerationVotePort> {
         // Subscribe before requesting a fresh frame so nothing after the baseline is lost.
         // This queue is independent of ordinary command delivery and other votes.
+        // 按业务容器订阅，不按屏幕桶：外部聊天源接管时大厅消息恒被映射成
+        // SecondaryHall，绑 PrimaryHall 会让投票永远等不到基线，投票直接失败。
         let subscriber = self
             .chat_timeline
-            .subscribe_chat(ChatIdentity::PrimaryHall)?;
-        let baseline = self.fresh_snapshot()?;
+            .subscribe_scoped(self.vote_scope.clone())?;
+        let baseline = self.fresh_snapshot(&self.vote_scope)?;
         AppModerationVotePort::from_baseline(self, subscriber, baseline)
     }
 
-    fn fresh_snapshot(&self) -> Result<ChatTimelineSnapshot> {
+    fn fresh_snapshot(&self, scope: &ChatScope) -> Result<ChatTimelineSnapshot> {
         let deadline = Instant::now() + self.baseline_timeout;
-        self.fresh_snapshot_until(deadline)?
+        self.fresh_snapshot_until(scope, deadline)?
             .ok_or_else(|| anyhow::anyhow!("等待共享聊天管理投票基线超时"))
     }
 
-    fn fresh_snapshot_until(&self, deadline: Instant) -> Result<Option<ChatTimelineSnapshot>> {
+    fn fresh_snapshot_until(
+        &self,
+        scope: &ChatScope,
+        deadline: Instant,
+    ) -> Result<Option<ChatTimelineSnapshot>> {
         if !self.running.load(AtomicOrdering::SeqCst) {
             anyhow::bail!("运行已停止，已结束管理投票");
         }
@@ -72,14 +80,19 @@ impl ModerationVoteContext {
                 .wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50)))
             {
                 Ok(Some(snapshot)) => {
-                    if let Some(next) = self
-                        .chat_timeline
-                        .refresh_after_other_hall_panel(&ChatIdentity::PrimaryHall, &snapshot)?
-                    {
-                        refresh = next;
+                    // 只认当前大厅这个业务容器：一级区/二级区是同一大厅的两块
+                    // 面板，按 scope 判就不必再区分；外部源没有屏幕也同样成立。
+                    if !snapshot.scope.same_container(scope) {
+                        refresh = self.chat_timeline.request_refresh()?;
                         continue;
                     }
-                    if snapshot.chat != ChatIdentity::PrimaryHall {
+                    // 空快照不能当基线：它的气泡序号上限是 0，之后整屏历史消息都会
+                    // 满足「> 0」而被当成新票重放。
+                    //
+                    // 代价：聊天区空无一物的大厅建不起基线，投票会等到超时并如实报
+                    // 「等待共享聊天管理投票基线超时」。这是有意的取舍——误收整屏旧票
+                    // 比超时更糟。外部源不受影响：注入从不产生空快照。
+                    if snapshot.messages.is_empty() {
                         refresh = self.chat_timeline.request_refresh()?;
                         continue;
                     }
@@ -115,16 +128,26 @@ impl AppModerationVotePort {
         subscriber: ChatTimelineSubscriber,
         baseline: ChatTimelineSnapshot,
     ) -> Result<Self> {
-        if baseline.chat != ChatIdentity::PrimaryHall {
-            anyhow::bail!("管理投票共享 OCR 基线不在一级大厅");
-        }
-        subscriber.bind_chat(baseline.chat.clone(), baseline.visual_session)?;
-        let baseline_sequence = baseline
-            .messages
-            .iter()
-            .map(|message| message.id.bubble_sequence.get())
-            .max()
-            .unwrap_or(0);
+        // 订阅时已按业务容器绑定；这里只需推进会话号。
+        // 水位单位必须与后面比较的单位一致：
+        // - OCR：屏幕气泡序号（bubble_sequence，单调递增）
+        // - 外部源：服务端原始序号（source_sequence，单调）
+        // 混用会导致「哈希 vs 小整数」恒不成立，外部票全被判成旧票。
+        let baseline_sequence = if baseline.source.is_ocr() {
+            baseline
+                .messages
+                .iter()
+                .map(|message| message.id.bubble_sequence.get())
+                .max()
+                .unwrap_or(0)
+        } else {
+            baseline
+                .messages
+                .iter()
+                .map(|message| message.source_sequence)
+                .max()
+                .unwrap_or(0)
+        };
         Ok(Self {
             context,
             subscriber,
@@ -141,49 +164,67 @@ impl AppModerationVotePort {
             .read()
             .context("管理投票共享 OCR 读取失败")?
         {
-            if crate::observation::chat::other_hall_panel(&self.baseline.chat, &snapshot.chat) {
-                continue;
-            }
-            if snapshot.chat != self.baseline.chat {
+            // 按业务容器过滤：外部源的消息没有屏幕桶，按 chat 判会整批丢弃。
+            if !snapshot.scope.same_container(&self.baseline.scope) {
                 continue;
             }
             if snapshot.captured_at <= self.baseline.captured_at {
                 continue;
             }
-            if snapshot.visual_session != self.baseline.visual_session {
-                if snapshot.messages.is_empty() {
-                    // Wait for a reliable restored baseline before accepting votes.
+            // 屏幕语汇只对 OCR 来源成立。外部聊天源没有视觉会话号，`bubble_sequence`
+            // 还是去重哈希（不单调），拿它当投票水位会随机丢票。
+            if self.baseline.source.is_ocr() && snapshot.source.is_ocr() {
+                if snapshot.visual_session != self.baseline.visual_session {
+                    if snapshot.messages.is_empty() {
+                        // Wait for a reliable restored baseline before accepting votes.
+                        continue;
+                    }
+                    // A rebuilt view of the same chat gets new bubble IDs. Rebase
+                    // before counting so restored historical votes are not replayed.
+                    log::info!(
+                        "管理投票共享 OCR 视图重建，更新基线: session={:?} -> {:?}",
+                        self.baseline.visual_session,
+                        snapshot.visual_session
+                    );
+                    self.baseline_sequence = snapshot
+                        .messages
+                        .iter()
+                        .map(|message| message.id.bubble_sequence.get())
+                        .max()
+                        .unwrap_or(0);
+                    self.baseline = snapshot;
                     continue;
                 }
-                // A rebuilt view of the same chat gets new bubble IDs. Rebase
-                // before counting so restored historical votes are not replayed.
-                log::info!(
-                    "管理投票共享 OCR 视图重建，更新基线: session={:?} -> {:?}",
-                    self.baseline.visual_session,
-                    snapshot.visual_session
+                votes.extend(
+                    snapshot
+                        .messages
+                        .into_iter()
+                        .filter(|message| {
+                            message.id.bubble_sequence.get() > self.baseline_sequence
+                                // OCR 路径保持原语义：大厅面板里显示的好友消息是 pink。
+                                && message.message_type == "pink"
+                                && is_moderation_vote_message(&message.text)
+                        })
+                        .map(|message| message.text),
                 );
-                self.baseline_sequence = snapshot
-                    .messages
-                    .iter()
-                    .map(|message| message.id.bubble_sequence.get())
-                    .max()
-                    .unwrap_or(0);
-                self.baseline = snapshot;
-                continue;
+            } else {
+                // 外部源按原始服务端序号判新旧：单调、可靠。
+                votes.extend(
+                    snapshot
+                        .messages
+                        .into_iter()
+                        .filter(|message| {
+                            message.source_sequence > self.baseline_sequence
+                                // 外部源没有「大厅面板里的好友消息」这层区分：
+                                // 大厅消息恒为 blue，好友私聊才是 pink。
+                                // 投票发生在当前大厅，因此这里要收 blue；
+                                // 收 pink 会让外部模式下结构性无票。
+                                && message.message_type == "blue"
+                                && is_moderation_vote_message(&message.text)
+                        })
+                        .map(|message| message.text),
+                );
             }
-            // Keep repeated observations and OCR revisions: the vote service requires
-            // stable samples. Business acknowledgement must not consume these votes.
-            votes.extend(
-                snapshot
-                    .messages
-                    .into_iter()
-                    .filter(|message| {
-                        message.id.bubble_sequence.get() > self.baseline_sequence
-                            && message.message_type == "pink"
-                            && is_moderation_vote_message(&message.text)
-                    })
-                    .map(|message| message.text),
-            );
         }
         Ok(votes)
     }
@@ -222,7 +263,12 @@ impl ModerationVotePort for AppModerationVotePort {
             if !votes.is_empty() || Instant::now() >= deadline {
                 return Ok(votes);
             }
-            if self.context.fresh_snapshot_until(deadline)?.is_none() {
+            let scope = self.context.vote_scope.clone();
+            if self
+                .context
+                .fresh_snapshot_until(&scope, deadline)?
+                .is_none()
+            {
                 return Ok(Vec::new());
             }
             self.read_votes()
@@ -476,6 +522,8 @@ impl ApplicationRuntime {
             baseline_timeout: Duration::from_millis(
                 self.lifecycle.config.timing.decision.timeout_ms,
             ),
+            // 投票永远属于「当前所在大厅」这个业务容器，与屏幕桶、消息来源无关。
+            vote_scope: self.ui.chat_timeline.current_hall_scope()?,
         };
         let task_context = ModerationTaskContext {
             running: Arc::clone(&self.lifecycle.running),
@@ -535,6 +583,7 @@ impl ApplicationRuntime {
 mod tests {
     use super::*;
     use crate::interfaces::chat::{ModerationAction, ModerationCommand};
+    use crate::observation::chat::ChatIdentity;
     use crate::runtime::ui::UiRoutineFailure;
 
     fn shared_vote_input(
@@ -556,11 +605,12 @@ mod tests {
             running: Arc::new(AtomicBool::new(true)),
             chat_timeline: shared.clone(),
             baseline_timeout: Duration::ZERO,
+            vote_scope: ChatScope::hall(),
         }
     }
 
     fn shared_vote_port(shared: &ChatTimeline) -> AppModerationVotePort {
-        let subscriber = shared.subscribe_chat(ChatIdentity::PrimaryHall).unwrap();
+        let subscriber = shared.subscribe().unwrap();
         let baseline = shared
             .publish(
                 Instant::now(),
@@ -572,8 +622,13 @@ mod tests {
             .unwrap()
     }
 
+    /// 二级面板与一级大厅是同一个业务容器，可以直接作为投票基线。
+    ///
+    /// 这条以前验证「二级面板不算基线、必须重新挂 refresh」——那是按屏幕桶判
+    /// 身份时的行为。改为按 scope 判后两块面板同属 `Hall{None}`，二级快照就是
+    /// 合法基线；外部聊天源更是**只会**产生 SecondaryHall，不接受就永远开不了投票。
     #[test]
-    fn moderation_vote_open_rearms_after_secondary_panel_baseline() {
+    fn moderation_vote_accepts_secondary_panel_baseline() {
         let shared = ChatTimeline::new();
         let publisher = shared.clone();
         let publish_frames = std::thread::spawn(move || {
@@ -585,37 +640,11 @@ mod tests {
                 );
                 thread::sleep(Duration::from_millis(2));
             }
+            // 只给二级面板：它就是同一个大厅容器。
             publisher
                 .publish(
                     Instant::now(),
                     ChatIdentity::SecondaryHall,
-                    vec![shared_vote_input("panel transition", "blue", 10)],
-                )
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while publisher.pending_refresh().unwrap().is_none() {
-                assert!(Instant::now() < deadline, "vote refresh was not rearmed");
-                thread::sleep(Duration::from_millis(2));
-            }
-            publisher
-                .publish_no_chat(
-                    Instant::now(),
-                    "transient view gap",
-                    crate::observation::chat::ViewAbsence::Transient,
-                )
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while publisher.pending_refresh().unwrap().is_none() {
-                assert!(
-                    Instant::now() < deadline,
-                    "vote refresh was not rearmed after no-chat"
-                );
-                thread::sleep(Duration::from_millis(2));
-            }
-            publisher
-                .publish(
-                    Instant::now(),
-                    ChatIdentity::PrimaryHall,
                     vec![shared_vote_input("baseline", "blue", 10)],
                 )
                 .unwrap();
@@ -624,11 +653,15 @@ mod tests {
             running: Arc::new(AtomicBool::new(true)),
             chat_timeline: shared.clone(),
             baseline_timeout: Duration::from_secs(2),
+            vote_scope: ChatScope::hall(),
         };
         let mut port = context.open().unwrap();
         publish_frames.join().unwrap();
-        assert_eq!(port.baseline.chat, ChatIdentity::PrimaryHall);
+        // 一级/二级是同一大厅的两块面板，都归到同一个 scope；
+        // 投票不再因为落到二级面板而失败（外部源下更是只有 SecondaryHall）。
+        assert_eq!(port.baseline.scope, ChatScope::hall());
 
+        // 投票在同一块面板内继续：这是最普通的情形。
         shared
             .publish(
                 Instant::now(),
@@ -641,7 +674,7 @@ mod tests {
             shared
                 .publish(
                     Instant::now(),
-                    ChatIdentity::PrimaryHall,
+                    ChatIdentity::SecondaryHall,
                     vec![
                         shared_vote_input("baseline", "blue", 10),
                         shared_vote_input("[甲]：@同意", "pink", 30),
@@ -835,8 +868,14 @@ mod tests {
         let publish_frames = thread::spawn(move || {
             for _ in 0..32 {
                 wait_for_vote_refresh(&publisher);
+                // 用真正的另一个业务容器（好友私聊）证明窗口会继续等，
+                // 而不是用 PublicChannel——它与大厅同 scope，现在本就该被接受。
                 publisher
-                    .publish(Instant::now(), ChatIdentity::PublicChannel, vec![])
+                    .publish(
+                        Instant::now(),
+                        ChatIdentity::Friend("他人".into()),
+                        vec![shared_vote_input("other chat", "pink", 10)],
+                    )
                     .unwrap();
             }
             wait_for_vote_refresh(&publisher);

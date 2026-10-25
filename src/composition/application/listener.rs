@@ -1749,15 +1749,12 @@ impl ApplicationRuntime {
                 );
                 return Ok(());
             }
-            // 分派桶：外部源按业务容器归一，OCR 直接用屏幕桶。
+            // 分派桶：OCR 直接用屏幕桶，外部源按业务容器归到二级分派。
             //
-            // 诚实地说，当前两个来源产出的 chat 已经天然符合这个规则
-            // （`identity_for_scope` 把外部大厅映射成 SecondaryHall，私聊映射成
-            // Friend(peer)），所以这一步是**显式化**而非改变行为。写出来的价值在于
-            // 让「外部源没有屏幕」这条约束不依赖上游实现细节；一旦哪天
-            // identity_for_scope 改了映射，这里仍然按 scope 走对分支。
-            // 外部源的消息没有屏幕桶（chat=None）：按业务容器归到二级分派，
-            // 因为那套分支内部一律用 scope 判 is_hall 与 friend_name。
+            // 外部消息的 `chat` 恒为 None——它没有屏幕位置。二级分派分支内部
+            // 一律用 `scope` 判 is_hall 与 friend_name，所以把外部帧交给它是对的。
+            // 若哪天有人在那条分支里新增按 `chat` 判断的逻辑，外部私聊会被误伤；
+            // 新增逻辑时请继续用 scope。
             let screen_bucket = match snapshot.chat.clone() {
                 Some(bucket) => bucket,
                 None => ChatIdentity::SecondaryHall,

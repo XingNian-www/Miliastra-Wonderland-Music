@@ -1745,11 +1745,13 @@ impl ApplicationRuntime {
                 );
                 return Ok(());
             }
-            // 分支路由按「来源 + 业务容器」决定，屏幕桶只作为 OCR 的补充判据。
+            // 分派桶：外部源按业务容器归一，OCR 直接用屏幕桶。
             //
-            // 外部聊天源没有屏幕：它的大厅消息借 SecondaryHall 桶只为复用去重结构，
-            // 不该因为借了这个桶就被当成「二级屏幕观察」。业务上它就是大厅或私聊，
-            // 走 Secondary 那套分派（按 scope 判 is_hall / friend_name）。
+            // 诚实地说，当前两个来源产出的 chat 已经天然符合这个规则
+            // （`identity_for_scope` 把外部大厅映射成 SecondaryHall，私聊映射成
+            // Friend(peer)），所以这一步是**显式化**而非改变行为。写出来的价值在于
+            // 让「外部源没有屏幕」这条约束不依赖上游实现细节；一旦哪天
+            // identity_for_scope 改了映射，这里仍然按 scope 走对分支。
             let screen_bucket = if snapshot.source.is_ocr() {
                 snapshot.chat.clone()
             } else if snapshot.scope.is_hall() {
@@ -1793,8 +1795,13 @@ impl ApplicationRuntime {
                     let accepts_turtle_questions = is_hall
                         && self.commands_enabled()?
                         && self.business.business.turtle_soup_accepts_questions()?;
-                    // 好友名优先取业务容器的 peer（外部源用它，昵称可能迟到）；
-                    // 屏幕来源退回屏幕桶里的好友名。
+                    // 好友名以业务容器为准：`Private.peer` 是身份判定的权威来源
+                    // （外部源用 UID，OCR 用昵称，都由 `ChatScope::from_identity`
+                    // 与 `external_chat_scope` 各自保证）。
+                    //
+                    // 第二个分支理论上不可达（`Friend` 的 scope 恒为 `Private`），
+                    // 保留它作为映射漂移时的兜底：宁可退回屏幕桶里的名字，
+                    // 也不要静默变成空串让下游以为「没有好友」。
                     let friend_name = match (&snapshot.scope, chat) {
                         (ChatScope::Private { peer }, _) => peer.to_string(),
                         (_, ChatIdentity::Friend(name)) => name.to_string(),

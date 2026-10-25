@@ -65,6 +65,15 @@ pub(crate) struct MonitorQueueItem {
 pub(crate) struct MonitorChatListener {
     pub(crate) mode: String,
     pub(crate) pending_mode: String,
+    /// 以下是值守卡在哪一步的排障信息。
+    ///
+    /// 后端 ChatListenerSnapshot 本来就有这些状态，但 MonitorEvent 这一跳
+    /// 只带了 mode/pending_mode，于是面板上四条诊断提示永远为空——
+    /// 二级值守卡住时看不到「在清未读」还是「在等返回大厅」。
+    pub(crate) temporary_primary: bool,
+    pub(crate) initial_unread_clear: bool,
+    pub(crate) unread_task_pending: bool,
+    pub(crate) hall_round_required: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -171,6 +180,10 @@ pub(crate) enum MonitorEvent {
     ChatListener {
         mode: String,
         pending_mode: String,
+        temporary_primary: bool,
+        initial_unread_clear: bool,
+        unread_task_pending: bool,
+        hall_round_required: bool,
     },
     ScannerPaused(bool),
     BusinessOperational(BusinessOperationalSnapshot),
@@ -262,8 +275,22 @@ impl MonitorProjection {
             }
             MonitorEvent::Status(status) => state.status = status,
             MonitorEvent::PlaybackController(snapshot) => state.playback_controller = snapshot,
-            MonitorEvent::ChatListener { mode, pending_mode } => {
-                state.chat_listener = MonitorChatListener { mode, pending_mode };
+            MonitorEvent::ChatListener {
+                mode,
+                pending_mode,
+                temporary_primary,
+                initial_unread_clear,
+                unread_task_pending,
+                hall_round_required,
+            } => {
+                state.chat_listener = MonitorChatListener {
+                    mode,
+                    pending_mode,
+                    temporary_primary,
+                    initial_unread_clear,
+                    unread_task_pending,
+                    hall_round_required,
+                };
             }
             MonitorEvent::ScannerPaused(paused) => state.operational.scanner_paused = paused,
             MonitorEvent::BusinessOperational(snapshot) => {
@@ -516,6 +543,10 @@ impl BusinessStateSink for MonitorShared {
                 .pending_mode
                 .map(|mode| mode.label().to_string())
                 .unwrap_or_default(),
+            temporary_primary: snapshot.temporary_primary,
+            initial_unread_clear: snapshot.initial_unread_clear,
+            unread_task_pending: snapshot.unread_task_pending,
+            hall_round_required: snapshot.hall_round_required,
         });
     }
 
@@ -685,6 +716,10 @@ mod tests {
         monitor.publish(MonitorEvent::ChatListener {
             mode: "二级".to_string(),
             pending_mode: "一级".to_string(),
+            temporary_primary: false,
+            initial_unread_clear: false,
+            unread_task_pending: false,
+            hall_round_required: false,
         });
         monitor.publish(MonitorEvent::ScannerPaused(true));
         BusinessStateSink::publish_operational(

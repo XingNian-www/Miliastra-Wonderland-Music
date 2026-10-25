@@ -43,7 +43,7 @@ fn playlist_decision_envelope(
         captured_at: Some(captured_at),
         message_id: Some(message.id.clone()),
         message_text: Some(message.text.clone()),
-        message_y: Some(message.block.y),
+        lock_anchor: Some(message.lock_anchor()),
         ..CommandObservation::default()
     };
     if let Some(sender) = message
@@ -83,6 +83,21 @@ fn owner_matches(owner: &str, sender: &str) -> bool {
             == crate::text::normalize_comparison_text(sender)
 }
 
+/// 决策发送者是不是窗口属主（带身份解析）。
+///
+/// `owner` 是归属键（`id:<uuid>` 形态），`sender` 是 OCR 出来的展示名。
+/// 用 [`owner_matches`] 直接比较这两者**永远不相等**，会让属主本人在窗口期
+/// 发的 `@1`/`@换一批`/`@关闭` 全部被判"不是属主"，窗口只能超时。
+///
+/// 所以先把发送者解析成同一套候选归属键，再比对。`sender` 直比只作为
+/// 身份未登记时的兜底，保留原有行为。
+fn owner_matches_identity(owner: &str, sender: &str, candidates: &[String]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| owner_matches(owner, candidate))
+        || owner_matches(owner, sender)
+}
+
 fn acknowledge_playlist_decision(
     shared: &crate::observation::chat::ChatTimeline,
     envelope: &CommandEnvelope,
@@ -93,10 +108,10 @@ fn acknowledge_playlist_decision(
         match (
             changed,
             observation.message_text.as_deref(),
-            observation.message_y,
+            observation.lock_anchor,
         ) {
-            (true, Some(text), Some(y)) if !text.trim().is_empty() => {
-                shared.acknowledge_command(id, text, y)?;
+            (true, Some(text), Some(anchor)) if !text.trim().is_empty() => {
+                shared.acknowledge_command_at(id, text, anchor)?;
             }
             _ => {
                 shared.acknowledge_business(id)?;
@@ -317,7 +332,11 @@ impl ApplicationRuntime {
                     }
                     continue;
                 };
-                if !owner_matches(&owner, &self.canonical_actor_name(envelope.username())) {
+                // 属主是 id:<uuid> 归属键、发送者是展示名：必须经身份解析比较，
+                // 否则属主本人也永远对不上，整个决策窗口不可用。
+                let sender_name = self.canonical_actor_name(envelope.username());
+                let sender_candidates = self.playlist_owner_candidates(&sender_name);
+                if !owner_matches_identity(&owner, &sender_name, &sender_candidates) {
                     log::info!(
                         "命令未执行：歌单窗口决策发送者不是当前窗口属主 sender={} owner={} text={}",
                         envelope.username(),
@@ -674,10 +693,10 @@ mod tests {
             let previous_id = fresh[0].0.id.clone();
             shared
                 .publish_no_chat(
-                Instant::now(),
-                "真实会话切换的状态事件",
-                crate::observation::chat::ViewAbsence::Transient,
-            )
+                    Instant::now(),
+                    "真实会话切换的状态事件",
+                    crate::observation::chat::ViewAbsence::Transient,
+                )
                 .unwrap();
             let rebuilt = shared
                 .publish(

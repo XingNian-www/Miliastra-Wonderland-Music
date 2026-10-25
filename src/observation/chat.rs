@@ -170,6 +170,25 @@ impl ChatScope {
     }
 }
 
+impl ChatScope {
+    /// 从 OCR 的屏幕分桶键推导消息范围。
+    ///
+    /// 只用于 OCR 路径：屏幕上一级/二级聊天区都属于当前大厅，粉色气泡是好友私聊。
+    /// 外部路径由消息自带的 channel/hallId 直接给出，不要走这个推断。
+    pub(crate) fn from_identity(chat: &ChatIdentity) -> Self {
+        match chat {
+            ChatIdentity::PrimaryHall | ChatIdentity::SecondaryHall => Self::hall(),
+            // OCR 拿不到 UID，好友名就是 peer 标识。
+            ChatIdentity::Friend(name) => Self::private(name.clone()),
+            // 公共频道/陌生人/未知按大厅语义归类：它们不参与值守门控，
+            // 是否能执行仍由 Unknown 不授权的既有约束决定。
+            ChatIdentity::PublicChannel
+            | ChatIdentity::StrangerMessages
+            | ChatIdentity::Unknown => Self::hall(),
+        }
+    }
+}
+
 /// 命令去重的锚点：OCR 靠屏幕位置，外部源靠单调序号。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockAnchor {

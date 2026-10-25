@@ -85,9 +85,7 @@ impl IdentityConfig {
         for mapping in &self.mappings {
             // 空昵称允许存在（自建身份还没绑定昵称），但只能有一条：
             // 多条空昵称会让"按昵称查找"永远落空，也失去可读性。
-            if !mapping.nickname.trim().is_empty()
-                && !nicknames.insert(mapping.nickname.as_str())
-            {
+            if !mapping.nickname.trim().is_empty() && !nicknames.insert(mapping.nickname.as_str()) {
                 bail!("identity.mappings 昵称重复: {}", mapping.nickname);
             }
             if !ids.insert(mapping.id) {
@@ -95,9 +93,15 @@ impl IdentityConfig {
             }
             for account in &mapping.accounts {
                 if account.uid.trim().is_empty() {
-                    bail!("identity.mappings 账号 UID 不能为空（昵称: {}）", mapping.nickname);
+                    bail!(
+                        "identity.mappings 账号 UID 不能为空（昵称: {}）",
+                        mapping.nickname
+                    );
                 }
-                if !accounts.insert((account.game.trim().to_ascii_lowercase(), account.uid.trim().to_string())) {
+                if !accounts.insert((
+                    account.game.trim().to_ascii_lowercase(),
+                    account.uid.trim().to_string(),
+                )) {
                     bail!(
                         "identity.mappings 账号重复: {}:{}",
                         account.game,
@@ -227,18 +231,21 @@ impl IdentityAccess {
 
     /// 按线索解析身份：两条链路共用的唯一入口。
     ///
-    /// UID 命中优先于昵称：账号 ID 改不了、不会重名，而昵称可能被玩家改成
-    /// 任意想要的名字。昵称只在没有 UID 时才作为兜底。
+    /// **有 UID 时只认 UID，绝不回退到昵称。**
+    ///
+    /// 账号 ID 改不了、不会重名；昵称可以被玩家改成任意名字。若 UID 未登记就
+    /// 退回按昵称解析，攻击者只要把昵称改成与某个已登记 Owner/Admin 相同、
+    /// 而自己的 UID 从未登记，就能在带 UID 的消息路径（外部聊天源）拿到那个角色。
+    /// 这违反 MUST_READ §2「未确认发送者不能用于授权」。
+    ///
+    /// 昵称只在**完全没有 UID** 时使用：OCR 路径拿不到 UID，只能靠昵称。
+    ///
+    /// 代价：外部源里「UID 换了、昵称没变」的已登记玩家会被判为未登记。
+    /// 这是刻意的方向选择——宁可让旧配置失效，也不让改昵称就能提权。
     pub fn resolve_hint(&self, hint: IdentityHint<'_>) -> Option<ResolvedIdentity> {
         match hint {
             IdentityHint::Nickname(name) => self.resolve(name),
-            IdentityHint::Account {
-                game,
-                uid,
-                nickname,
-            } => self
-                .resolve_account(game, uid)
-                .or_else(|| nickname.and_then(|name| self.resolve(name))),
+            IdentityHint::Account { game, uid, .. } => self.resolve_account(game, uid),
         }
     }
 
@@ -258,8 +265,7 @@ impl IdentityAccess {
                 .accounts
                 .iter()
                 .any(|account| {
-                    account.game.trim().to_ascii_lowercase() == game
-                        && account.uid.trim() == uid
+                    account.game.trim().to_ascii_lowercase() == game && account.uid.trim() == uid
                 })
                 .then(|| ResolvedIdentity {
                     id: mapping.id,
@@ -323,15 +329,13 @@ impl IdentityAccess {
         if let Some(existing) = self.resolve_account(game, uid) {
             return Some(existing.id);
         }
-        let mut config = self
-            .inner
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         // 双检：拿到写锁后可能已被别的线程插入同一 UID。
         if let Some(existing) = config.mappings.iter().find(|mapping| {
-            mapping.accounts.iter().any(|account| {
-                account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid
-            })
+            mapping
+                .accounts
+                .iter()
+                .any(|account| account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid)
         }) {
             return Some(existing.id);
         }
@@ -431,6 +435,27 @@ impl IdentityAccess {
 
     pub fn role_of(&self, nickname: &str) -> Option<IdentityRole> {
         self.resolve(nickname).map(|identity| identity.role)
+    }
+
+    /// 发送者的角色：有账号时按 UID 解析，否则按昵称。
+    ///
+    /// **必须与路由期用同一个判定**。路由期按 UID 认出了 Owner/Admin，
+    /// 执行期若退回只按昵称（外部源的昵称是随机 OCR 匹配键），就会
+    /// 「路由说有权限、执行说没有」，命令被静默丢弃。
+    pub fn role_of_sender(
+        &self,
+        nickname: &str,
+        account: Option<&miliastra_kernel::chat_source::CommandAccount>,
+    ) -> Option<IdentityRole> {
+        let hint = match account {
+            Some(account) => IdentityHint::Account {
+                game: &account.game,
+                uid: &account.uid,
+                nickname: Some(nickname),
+            },
+            None => IdentityHint::Nickname(nickname),
+        };
+        self.resolve_hint(hint).map(|resolved| resolved.role)
     }
 
     #[cfg(test)]
@@ -591,6 +616,89 @@ mod tests {
         assert!(IdentityConfig::default().validate().is_ok());
     }
 
+    /// 安全边界：有 UID 时绝不因 UID 未登记而回退到昵称授权。
+    ///
+    /// 否则攻击者把游戏昵称改成与已登记 Owner 相同、自己 UID 不登记，
+    /// 就能在带 UID 的消息路径（外部聊天源）拿到 Owner 角色。
+
+    /// 执行期权限复查必须与路由期同一判定：有账号按 UID，否则按昵称。
+    ///
+    /// 外部源的昵称是随机 OCR 匹配键，与 UID 绑定无关。旧实现只按昵称查，
+    /// 于是「路由按 UID 判有权限、执行按昵称判没权限」，管理员命令被静默丢弃。
+    #[test]
+    fn role_of_sender_prefers_account_over_nickname() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            nickname: "随机匹配键".to_string(),
+            id: Uuid::from_u128(11),
+            role: IdentityRole::Admin,
+            note: String::new(),
+            accounts: vec![GameAccount {
+                game: "genshin".to_string(),
+                uid: "100000001".to_string(),
+            }],
+        });
+        let access = IdentityAccess::new(config);
+
+        // 有账号：即使昵称对不上，也应凭 UID 拿到 Admin。
+        let account = miliastra_kernel::chat_source::CommandAccount {
+            game: "genshin".to_string(),
+            uid: "100000001".to_string(),
+        };
+        assert_eq!(
+            access.role_of_sender("API昵称不一致", Some(&account)),
+            Some(IdentityRole::Admin),
+            "有账号时必须按 UID 解析，不能被昵称不一致挡住"
+        );
+
+        // 无账号：退回昵称解析（OCR 路径）。
+        assert_eq!(
+            access.role_of_sender("随机匹配键", None),
+            Some(IdentityRole::Admin),
+            "无账号时按昵称解析"
+        );
+
+        // 有账号但 UID 未登记：不回退昵称，判为未登记。
+        let unknown = miliastra_kernel::chat_source::CommandAccount {
+            game: "genshin".to_string(),
+            uid: "999999999".to_string(),
+        };
+        assert_eq!(
+            access.role_of_sender("随机匹配键", Some(&unknown)),
+            None,
+            "UID 未登记时不得回退昵称，否则改昵称即可提权"
+        );
+    }
+    #[test]
+    fn uid_miss_never_falls_back_to_nickname_authority() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            nickname: "可信昵称".to_string(),
+            id: Uuid::from_u128(7),
+            role: IdentityRole::Owner,
+            note: String::new(),
+            accounts: Vec::new(),
+        });
+        let access = IdentityAccess::new(config);
+
+        // 昵称路径照常命中（OCR 没有 UID，只能靠昵称）。
+        let by_name = access.resolve_hint(IdentityHint::Nickname("可信昵称"));
+        assert_eq!(
+            by_name.map(|resolved| resolved.role),
+            Some(IdentityRole::Owner)
+        );
+
+        // 带 UID 但 UID 未登记：即使昵称撞上已登记 Owner，也必须解析失败。
+        let spoofed = access.resolve_hint(IdentityHint::Account {
+            game: "genshin",
+            uid: "999999999",
+            nickname: Some("可信昵称"),
+        });
+        assert!(
+            spoofed.is_none(),
+            "UID 未登记时不得回退昵称，否则改昵称即可提权"
+        );
+    }
     #[test]
     fn role_serialization_is_lowercase() {
         let json = serde_json::to_string(&IdentityRole::Owner).unwrap();
@@ -612,7 +720,10 @@ mod tests {
         // OCR 匹配键必须随机且不等于 API 昵称：否则 OCR 读到同名玩家会误命中。
         assert_ne!(resolved.nickname, "荧");
         assert_eq!(resolved.nickname.chars().count(), 8);
-        assert!(resolved.nickname.is_ascii(), "随机昵称用英数，不带非 ASCII 字符");
+        assert!(
+            resolved.nickname.is_ascii(),
+            "随机昵称用英数，不带非 ASCII 字符"
+        );
     }
 
     #[test]

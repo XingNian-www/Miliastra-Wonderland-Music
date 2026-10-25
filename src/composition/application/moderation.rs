@@ -133,12 +133,6 @@ struct AppModerationVotePort {
     baseline: Option<ChatTimelineSnapshot>,
     /// 窗口前的水位。OCR 是屏幕气泡序号上限，外部源是服务端序号。
     baseline_sequence: u64,
-    /// 水位单位是否是服务端序号。
-    ///
-    /// 按**水位本身的来源**固定，不随快照来源漂移：投票中途外部源连上/断开时，
-    /// 同一订阅者会先后收到两种来源，若逐帧换单位，OCR 消息的 source_sequence
-    /// 恒为 0、外部序号是大整数，两个方向都会静默丢票。
-    watermark_is_sequence: bool,
     failed: bool,
 }
 
@@ -168,13 +162,11 @@ impl AppModerationVotePort {
                 .max()
                 .unwrap_or(0)
         };
-        let watermark_is_sequence = !baseline.source.is_ocr();
         Ok(Self {
             context,
             subscriber,
             baseline: Some(baseline),
             baseline_sequence,
-            watermark_is_sequence,
             failed: false,
         })
     }
@@ -194,7 +186,6 @@ impl AppModerationVotePort {
             subscriber,
             baseline: None,
             baseline_sequence: floor,
-            watermark_is_sequence: true,
             failed: false,
         }
     }
@@ -263,11 +254,19 @@ impl AppModerationVotePort {
                     .messages
                     .into_iter()
                     .filter(|message| {
-                        let newer = if self.watermark_is_sequence {
-                            message.source_sequence > self.baseline_sequence
-                        } else {
+                        // 水位单位必须跟着**这一帧**走，不能跟着开窗时固定。
+                        //
+                        // 外部源→OCR 回落时，OCR 消息的 source_sequence 恒为 0，
+                        // 拿它去比外部大水位会恒假，整窗 OCR 票静默丢光。
+                        // 反过来（OCR→外部）也同理。所以按帧判单位，与
+                        // `secondary_chat.rs` 每轮重判来源的做法保持一致。
+                        let newer = if snapshot.source.is_ocr() {
                             message.id.bubble_sequence.get() > self.baseline_sequence
+                        } else {
+                            message.source_sequence > self.baseline_sequence
                         };
+                        // 正文已由投递层统一成 OCR 语义（含「昵称：」前缀），
+                        // 两个来源在这里不再有格式差异。
                         newer
                             && message.message_type == vote_type
                             && is_moderation_vote_message(&message.text)
@@ -299,6 +298,13 @@ impl ModerationVotePort for AppModerationVotePort {
         !self.failed && self.context.running.load(AtomicOrdering::SeqCst)
     }
 
+    fn requires_repeated_samples(&self) -> bool {
+        // 外部聊天源是结构化传输：同一条消息只投递一次（按 dedup key 去重），
+        // 要求连续三次采样会让外部票永远凑不满稳态，投票退化成只能超时通过。
+        // OCR 仍需重复采样——同一句话在不同帧里可能被误读。
+        self.baseline.is_some()
+    }
+
     fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>> {
         let deadline = Instant::now() + self.context.baseline_timeout;
         self.poll_visible_friend_messages_until(deadline)
@@ -311,6 +317,19 @@ impl ModerationVotePort for AppModerationVotePort {
             let votes = self.read_votes()?;
             if !votes.is_empty() || Instant::now() >= deadline {
                 return Ok(votes);
+            }
+            // 外部源模式不需要主动刷新：消息由 socket 推入订阅队列，
+            // 这里只要等一小段让队列有数据即可。走 fresh_snapshot_until 会阻塞到
+            // 「下一条消息到达」或整个投票 deadline——接管期间观察线程从不发布帧，
+            // 只有注入能完成围栏，2s 的采样节奏会彻底失效。
+            if self.baseline.is_none() {
+                let wait = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50));
+                if !wait.is_zero() {
+                    thread::sleep(wait);
+                }
+                return Ok(self.read_votes()?);
             }
             let scope = self.context.vote_scope.clone();
             if self
@@ -574,11 +593,9 @@ impl ApplicationRuntime {
             // 投票永远属于「当前所在大厅」这个业务容器，与屏幕桶、消息来源无关。
             vote_scope: self.ui.chat_timeline.current_hall_scope()?,
             // 外部源在线时先用序号水位建基线，避免安静大厅等不到帧而开不了投票。
-            external_floor: self
-                .lifecycle
-                .external_chat
-                .supplies_hall_messages()
-                .then(|| self.lifecycle.external_chat.last_sequence()),
+            // 用一次性快照而非两次原子读：分开读会得到「在线 + 旧水位」这种
+            // 不存在的组合，那会让整场投票用错的水位单位。
+            external_floor: self.lifecycle.external_chat.hall_watermark(),
         };
         let task_context = ModerationTaskContext {
             running: Arc::clone(&self.lifecycle.running),
@@ -683,6 +700,54 @@ mod tests {
     /// 这条以前验证「二级面板不算基线、必须重新挂 refresh」——那是按屏幕桶判
     /// 身份时的行为。改为按 scope 判后两块面板同属 `Hall{None}`，二级快照就是
     /// 合法基线；外部聊天源更是**只会**产生 SecondaryHall，不接受就永远开不了投票。
+
+    /// 外部聊天源：同一票只需一次即可计入稳态。
+    ///
+    /// 外部消息按 dedup key 只投递一次，若仍要求连续三次采样，外部票永远凑不满
+    /// 稳态，投票会退化成「只能超时通过」。
+    #[test]
+    fn external_vote_counts_after_a_single_sample() {
+        let shared = ChatTimeline::new();
+        let subscriber = shared.subscribe_scoped(ChatScope::hall()).unwrap();
+        let context = ModerationVoteContext {
+            running: Arc::new(AtomicBool::new(true)),
+            chat_timeline: shared.clone(),
+            baseline_timeout: Duration::from_secs(1),
+            vote_scope: ChatScope::hall(),
+            external_floor: Some(0),
+        };
+        let mut port = AppModerationVotePort::from_external_watermark(context, subscriber, 0);
+        shared
+            .inject_external(
+                Instant::now(),
+                crate::observation::chat::VisualSessionId::new(u64::MAX),
+                "test",
+                vec![miliastra_kernel::chat_source::ExternalChatMessage {
+                    sequence: 1,
+                    sent_at: None,
+                    channel: miliastra_kernel::chat_source::ChatChannel::current_hall(),
+                    hall_id: None,
+                    sender: miliastra_kernel::chat_source::ExternalSender::new(
+                        Some("甲".to_string()),
+                        Some(miliastra_kernel::chat_source::GameUid::from_u32(1001)),
+                    ),
+                    to_uid: None,
+                    text: "@同意".to_string(),
+                }],
+            )
+            .unwrap();
+        assert!(
+            !port.requires_repeated_samples(),
+            "外部源不该要求重复采样，否则票永远凑不满稳态"
+        );
+        let votes =
+            port.poll_visible_friend_messages_until(Instant::now() + Duration::from_secs(1));
+        assert!(
+            votes.map(|v| !v.is_empty()).unwrap_or(false),
+            "外部源的 @同意 必须能进投票统计"
+        );
+    }
+
     #[test]
     fn moderation_vote_accepts_secondary_panel_baseline() {
         let shared = ChatTimeline::new();

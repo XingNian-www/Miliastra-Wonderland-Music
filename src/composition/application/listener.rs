@@ -2353,10 +2353,7 @@ impl ApplicationRuntime {
             .live_configs
             .identity
             .role_of_sender(&command.username, command.account.as_ref());
-        let actor = crate::features::command_access::actor_permission(
-            role,
-            !command.username.trim().is_empty(),
-        );
+        let actor = crate::features::command_access::actor_permission(role);
         Ok(!policy.allows(actor)
             || (!self.commands_enabled()?
                 && command.authority == CommandAuthority::HallMember

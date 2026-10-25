@@ -2082,6 +2082,8 @@ mod read_only_tests {
 
     #[test]
     fn read_only_rejects_every_write_before_run_and_at_executor_and_worker_boundaries() {
+        // 串行化：这些用例会改全局 ISOLATION，与并行用例互相干扰。
+        let _isolation = crate::input_gate::isolation_test_lock();
         let calls = Arc::new(Calls::default());
         let runtime = UiRuntime::start(
             Device {
@@ -2287,6 +2289,8 @@ mod read_only_tests {
 
     #[test]
     fn read_only_timeout_cancels_wait_and_never_queues_recovery() {
+        // 串行化：这些用例会改全局 ISOLATION，与并行用例互相干扰。
+        let _isolation = crate::input_gate::isolation_test_lock();
         let calls = Arc::new(Calls::default());
         let runtime = UiRuntime::start(
             Device {
@@ -2385,6 +2389,8 @@ mod read_only_tests {
 
     #[test]
     fn read_only_full_real_frame_and_state_window_queue_assertions_work_without_mode_change() {
+        // 串行化：这些用例会改全局 ISOLATION，与并行用例互相干扰。
+        let _isolation = crate::input_gate::isolation_test_lock();
         use crate::config::AppConfig;
         use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
         // 来源沿用 friend_delivery.rs secondary_hall_row_frame 的现有真实私聊截图。
@@ -2795,6 +2801,8 @@ mod tests {
 
     #[test]
     fn ui_state_assertion_rejected_without_adapter_and_honest_when_live_unclassified() {
+        // 串行化：这些用例会改全局 ISOLATION，与并行用例互相干扰。
+        let _isolation = crate::input_gate::isolation_test_lock();
         use crate::runtime::ui::UiDevice;
         struct NoCapture;
         impl UiDevice for NoCapture {
@@ -3914,6 +3922,8 @@ mod tests {
 
     #[test]
     fn live_command_captures_one_frame_within_its_ui_operation() {
+        // 串行化：这些用例会改全局 ISOLATION，与并行用例互相干扰。
+        let _isolation = crate::input_gate::isolation_test_lock();
         use std::sync::atomic::AtomicUsize;
         struct Device(Arc<AtomicUsize>);
         impl crate::runtime::ui::UiDevice for Device {
@@ -4047,6 +4057,8 @@ mod tests {
 
     #[test]
     fn live_close_window_succeeds_without_attempting_post_close_capture() {
+        // 串行化：这些用例会改全局 ISOLATION，与并行用例互相干扰。
+        let _isolation = crate::input_gate::isolation_test_lock();
         use std::sync::atomic::AtomicUsize;
         struct ClosingDevice {
             captures: Arc<AtomicUsize>,

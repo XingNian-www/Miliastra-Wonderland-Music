@@ -77,11 +77,13 @@ pub(super) fn commands_replies_route(
     }).collect::<Vec<_>>();
     let mut variables = crate::features::reply_template::reply_variables()
         .iter()
-        .map(|variable| json!({
-            "name": variable.name,
-            "label": variable.label,
-            "example": variable.example,
-        }))
+        .map(|variable| {
+            json!({
+                "name": variable.name,
+                "label": variable.label,
+                "example": variable.example,
+            })
+        })
         .collect::<Vec<_>>();
     // 全局标签排在最后：它们不依赖命令上下文，示例取候选里第一条。
     variables.extend(crate::features::global_tags::GLOBAL_TAGS.iter().map(|tag| {
@@ -421,10 +423,7 @@ mod reply_api_tests {
         assert!(
             validate_reply_items(
                 &help_song_entry(),
-                vec![item(
-                    "help.song_request",
-                    "歌".repeat(MAX_REPLY_CHARS + 1)
-                )],
+                vec![item("help.song_request", "歌".repeat(MAX_REPLY_CHARS + 1))],
             )
             .is_err()
         );

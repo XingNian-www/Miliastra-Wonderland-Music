@@ -258,22 +258,20 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         command: &str,
     ) -> Result<serde_json::Value> {
-        let envelope = crate::interfaces::chat::parse_command_envelope(
-            command,
-            &parsed.message_type,
-            crate::features::command::CommandObservation::default(),
-        );
-        let Some(envelope) = envelope else {
-            return Ok(serde_json::json!({"status":"rejected","reason":"命令无法解析"}));
-        };
+        // 工具给的是一条**裸命令**（形如 `@点歌晴天`、`#提示`），不含发送者前缀。
+        //
+        // 不能走 `parse_command_envelope`：它第一步要把整行切成「发送者 + 正文」，
+        // 而裸命令里没有 `：`/`:`/`]`/`】` 分隔符，会直接返回 None，
+        // 于是工具命令 100% 被拒——表现为模型每次只拿到「命令无法解析」。
+        // 身份不是从文本推出来的，而是提问者本人：直接用 `parsed` 里的发送者构造信封。
         let Some(request) = crate::features::command::CommandEnvelope::new(
-            envelope.original_text().to_string(),
+            command.to_string(),
             parsed.username.clone(),
             parsed.message_type.clone(),
-            envelope.user_command().to_string(),
-            envelope.observation().clone(),
+            command.trim().to_string(),
+            crate::features::command::CommandObservation::default(),
         ) else {
-            return Ok(serde_json::json!({"status":"rejected","reason":"无法确认请求身份"}));
+            return Ok(serde_json::json!({"status":"rejected","reason":"命令无法解析"}));
         };
         let active = self.business.business.active_entertainment()?;
         let access_config = self.lifecycle.live_configs.snapshot();

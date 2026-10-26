@@ -251,7 +251,23 @@ impl ApplicationRuntime {
         if answer.trim().is_empty() {
             return Ok(());
         }
-        let prompt = format!("玩家说：{question}\n你回答：{answer}");
+        // 把已有事实交给模型：它才能判断这条是新增还是推翻旧的。
+        // 放在用户消息里而不是 extract_prompt 模板里——模板存在配置库，
+        // 用户沿用的旧值不会有这个占位符，改代码默认值对已部署实例无效。
+        let existing = self.business.ai_chat_memory.facts(actor)?;
+        let existing_text = if existing.is_empty() {
+            "（暂无）".to_string()
+        } else {
+            existing.join("；")
+        };
+        let prompt = format!(
+            "已有事实（按时间从旧到新）：{existing_text}\n\
+             玩家说：{question}\n你回答：{answer}\n\
+             只返回 JSON：{{\"facts\":[\"…\"],\"remove\":[\"…\"]}}。\
+             facts 写这一轮新增或需要改写的信息；\
+             remove 原样列出已有事实中已被本轮明确推翻的句子（改名、改称呼、改偏好），\
+             没有就留空数组。不要重复已有事实。"
+        );
         // 同一次问答的第二次模型调用，同样不能在持有 UI 租约时干等。
         let reply = match {
             let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
@@ -274,7 +290,15 @@ impl ApplicationRuntime {
                 return Ok(());
             }
         };
-        for fact in crate::features::ai_chat::parse_facts(&reply) {
+        let (facts, remove) = crate::features::ai_chat::parse_fact_update(&reply);
+        // 先删被推翻的旧事实，再写新的：顺序反了会在中间态里同时存在新旧两条，
+        // 而模型下一轮读取正是看这个列表。
+        for fact in &remove {
+            if let Err(error) = self.business.ai_chat_memory.delete_fact(actor, fact) {
+                log::debug!("淘汰旧事实失败（跳过）: {error:#}");
+            }
+        }
+        for fact in facts {
             self.business.ai_chat_memory.add_fact(
                 actor,
                 &fact,

@@ -32,10 +32,10 @@ use super::{AppConfig, BootstrapConfig};
 ///
 /// v2 → v3：AI 聊天记忆改成三层结构，新增单人中期摘要预算、大厅原文预算、
 /// 大厅中期摘要预算三个字段。
-/// v3 → v4：AI 聊天新增触发权限 min_access。
-/// 配置库要求键集与 schema 完全一致，旧库缺字段会在加载时报
-/// 「与当前 schema 不匹配」，因此每次加字段都必须升版本走断代重置。
-pub const CONFIG_SCHEMA_VERSION: i64 = 4;
+///
+/// 只有**删除或改名**字段才需要升版本：新增字段由 serde 默认值补齐，加载器
+/// 明确允许「存储里缺字段」，因此加配置项不再触发断代重置。
+pub const CONFIG_SCHEMA_VERSION: i64 = 3;
 
 /// 打开连接（含头初始化）的重试次数：两个进程并发首次创建同一新库文件时，
 /// SQLite 头初始化阶段的锁竞争发生在 busy_timeout 生效之前，需要有限重试吸收。
@@ -883,25 +883,36 @@ impl AppConfig {
     }
 }
 
-/// 比较反序列化前后的键结构，拒绝默认值静默补齐或忽略旧字段。
+/// 比较反序列化前后的键结构。
+///
+/// 允许**存储里缺字段**：那是「程序新增了配置项」，serde 已经用默认值补齐，
+/// 属于向后兼容的升级。以前这里把缺字段也当错误，导致每加一个字段就要升
+/// schema 版本、把用户整份配置断代重置——代价过大。
+///
+/// 仍然拒绝**存储里多出字段**：那是字段被删除或改名，旧值会被静默丢弃，
+/// 必须让用户看见错误而不是悄悄丢失设置。
+///
 /// 实际配置值重新序列化后保留自由 map、可空对象和数组条目的真实结构。
 fn validate_persisted_shape(stored: &Value, canonical: &Value, path: &str) -> Result<()> {
     match (stored, canonical) {
         (Value::Object(stored), Value::Object(canonical)) => {
-            for key in stored
-                .keys()
-                .filter(|key| !canonical.contains_key(*key))
-                .chain(canonical.keys())
-            {
-                let field = if path.is_empty() {
+            let field_name = |key: &String| {
+                if path.is_empty() {
                     key.clone()
                 } else {
                     format!("{path}.{key}")
+                }
+            };
+            // 存储里有、结构体里没有 = 字段被移除或改名。
+            for key in stored.keys().filter(|key| !canonical.contains_key(*key)) {
+                bail!("配置字段 {} 已不存在（字段被删除或改名）", field_name(key));
+            }
+            // 结构体里有、存储里没有 = 新增字段，默认值已生效，递归交给下层校验。
+            for (key, canonical_value) in canonical {
+                let Some(stored_value) = stored.get(key) else {
+                    continue;
                 };
-                let (Some(stored), Some(canonical)) = (stored.get(key), canonical.get(key)) else {
-                    bail!("配置字段 {field} 与当前 schema 不匹配（缺失或未知字段）");
-                };
-                validate_persisted_shape(stored, canonical, &field)?;
+                validate_persisted_shape(stored_value, canonical_value, &field_name(key))?;
             }
         }
         (Value::Array(stored), Value::Array(canonical)) => {
@@ -2147,22 +2158,28 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_never_fills_missing_fields_or_prunes_old_fields() {
+    fn schema_tolerates_added_fields_but_rejects_removed_ones() {
         let (root, database_path) = temp_database("strict-current");
         let bootstrap = test_bootstrap(&database_path);
         let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
         let original = store.read_all_sections().unwrap();
         let mut missing_section = original.clone();
         missing_section.remove("state");
-        assert!(store.build_config(&missing_section).is_err());
+        // 缺整个段同样按「新增」处理：默认值补齐，不报错。
+        assert!(
+            store.build_config(&missing_section).is_ok(),
+            "缺段属于新增，应补默认值而不是报错"
+        );
         let mut legacy = original.clone();
         legacy["song_review"]["provider"] = json!({"api_key":"old"});
         assert!(store.build_config(&legacy).is_err());
+        // 缺字段不再报错：那是「程序新增了配置项」，默认值补齐即可。
         let mut incomplete = original.clone();
-        incomplete["timing"]["playback"]
+        let removed = incomplete["timing"]["playback"]
             .as_object_mut()
             .unwrap()
-            .remove("lyrics_lead_seconds");
+            .remove("lyrics_lead_seconds")
+            .expect("测试字段必须存在");
         store
             .connection
             .execute(
@@ -2170,11 +2187,15 @@ mod tests {
                 rusqlite::params![serde_json::to_string(&incomplete["timing"]).unwrap()],
             )
             .unwrap();
-        assert!(store.load_full().is_err());
-        assert!(store.current_value().is_err());
-        assert!(store.validate_candidate(&Map::new()).is_err());
-        assert!(store.save(1, Map::new()).is_err());
-        assert_eq!(store.current_revision().unwrap(), 1);
+        let loaded = store.load_full().expect("缺字段必须按默认值补齐而不是报错");
+        let _ = removed;
+        assert_eq!(
+            loaded.timing.playback.lyrics_lead_seconds,
+            AppConfig::default().timing.playback.lyrics_lead_seconds,
+            "补齐的应当是默认值"
+        );
+        // 空候选现在等于「全部用默认值」，不再是错误；这里只校验读路径。
+        // 读回原始存储值仍然是缺字段的形态，不做隐式回写。
         assert_eq!(store.read_all_sections().unwrap(), incomplete);
         drop(store);
         cleanup(&root);

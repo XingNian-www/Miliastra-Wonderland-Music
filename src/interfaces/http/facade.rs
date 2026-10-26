@@ -1279,11 +1279,33 @@ impl crate::interfaces::http::HttpDebugPort for ApplicationHttpDebugFacade {
 #[derive(Clone)]
 pub(crate) struct ApplicationHttpAiFacade {
     client: AiClient,
+    /// 记忆库句柄。为 None 时（测试装配）记忆接口返回明确的未装配错误。
+    memory: Option<std::sync::Arc<crate::features::ai_chat::AiChatMemory>>,
 }
 
 impl ApplicationHttpAiFacade {
     pub(crate) fn new(client: AiClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            memory: None,
+        }
+    }
+
+    /// 生产装配：额外带上记忆库，供面板查询与删改。
+    pub(crate) fn with_memory(
+        client: AiClient,
+        memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
+    ) -> Self {
+        Self {
+            client,
+            memory: Some(memory),
+        }
+    }
+
+    fn memory(&self) -> anyhow::Result<&crate::features::ai_chat::AiChatMemory> {
+        self.memory
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("记忆库未装配"))
     }
 }
 
@@ -1298,5 +1320,66 @@ impl HttpAiPort for ApplicationHttpAiFacade {
 
     fn pick(&self, query: &[(String, String)]) -> Result<String> {
         self.client.pick_with_query(query)
+    }
+
+    fn memory_actors(&self) -> Result<String> {
+        let actors = self.memory()?.list_actors()?;
+        Ok(serde_json::to_string(&json!({ "actors": actors }))?)
+    }
+
+    fn memory_actor(&self, actor: &str) -> Result<String> {
+        let memory = self.memory()?;
+        let context = memory.context(actor, usize::MAX / 4)?;
+        let facts = context.facts;
+        let summary = context.summary;
+        let turns = context
+            .turns
+            .into_iter()
+            .map(|turn| json!({ "asker": turn.asker, "question": turn.question, "answer": turn.answer }))
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_string(&json!({
+            "actor": actor,
+            "facts": facts,
+            "summary": summary,
+            "turns": turns,
+        }))?)
+    }
+
+    fn memory_hall(&self) -> Result<String> {
+        let memory = self.memory()?;
+        let hall = memory.hall_context()?;
+        let (count, tokens) = memory.hall_stats()?;
+        let lines = hall
+            .lines
+            .into_iter()
+            .map(|(speaker, text)| json!({ "speaker": speaker, "text": text }))
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_string(&json!({
+            "summary": hall.summary,
+            "lines": lines,
+            "count": count,
+            "tokens": tokens,
+        }))?)
+    }
+
+    fn forget_actor(&self, actor: &str) -> Result<String> {
+        let removed = self.memory()?.forget(actor)?;
+        Ok(serde_json::to_string(
+            &json!({ "ok": true, "removed": removed }),
+        )?)
+    }
+
+    fn delete_fact(&self, actor: &str, fact: &str) -> Result<String> {
+        let removed = self.memory()?.delete_fact(actor, fact)?;
+        Ok(serde_json::to_string(
+            &json!({ "ok": true, "removed": removed }),
+        )?)
+    }
+
+    fn forget_hall(&self) -> Result<String> {
+        let removed = self.memory()?.forget_hall()?;
+        Ok(serde_json::to_string(
+            &json!({ "ok": true, "removed": removed }),
+        )?)
     }
 }

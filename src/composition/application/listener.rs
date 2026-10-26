@@ -1896,6 +1896,8 @@ impl ApplicationRuntime {
                             block: message.block,
                             text: message.text.clone(),
                         };
+                        // 外部源昵称可能缺失但 UID 必有：AI 触发要用它兜底。
+                        let ai_account = message.account.clone();
                         let outcome = self.dispatch_chat_observations(vec![
                             ChatObservationDispatch::Secondary {
                                 frame,
@@ -1920,6 +1922,7 @@ impl ApplicationRuntime {
                             self.enqueue_ai_chat_keyword(
                                 &id,
                                 &ai_candidate,
+                                ai_account.as_ref(),
                                 snapshot.captured_at,
                                 lock_anchor,
                             )?;
@@ -2180,6 +2183,7 @@ impl ApplicationRuntime {
                 self.enqueue_ai_chat_keyword(
                     &observed.id,
                     &message,
+                    None,
                     captured_at,
                     lock_anchor_for(&observed.id, message.block.y),
                 )?;
@@ -2314,14 +2318,19 @@ impl ApplicationRuntime {
         &self,
         message_id: &crate::observation::chat::ObservedChatMessageId,
         message: &crate::observation::chat::scan::ChatMessage,
+        account: Option<&miliastra_kernel::chat_source::CommandAccount>,
         captured_at: Instant,
         lock_anchor: crate::observation::chat::LockAnchor,
     ) -> Result<()> {
         let config = self.lifecycle.live_configs.snapshot().ai_chat.clone();
         // 大厅消息没有独立 sender 字段，昵称在文本行首，与命令信封共用同一套切分。
-        // 拆不出发送者就不触发：MUST_READ §2 要求 Unknown 不授权、不建记忆。
+        //
+        // 拆不出昵称时退回账号 UID：外部聊天源的昵称可能为 null（API 文档 §5），
+        // 但 UID 必填。只按昵称判断会让这类消息整条静默失效——它不是 Unknown，
+        // 只是缺一个展示名。正文此时本来就是纯正文（投递层没补前缀）。
         let split =
-            crate::interfaces::chat::split_sender_line(&message.text, &message.message_type);
+            crate::interfaces::chat::split_sender_line(&message.text, &message.message_type)
+                .or_else(|| account.map(|account| (account.uid.clone(), message.text.as_str())));
         // 全部门槛收敛在 features::ai_chat::keyword_trigger：原来每个不满足的分支都
         // 直接 return Ok(()) 且不打日志，用户只看到「完全静默」。收敛成一条不可
         // 静默的日志，也避免以后新增门槛时又悄悄吞掉触发。

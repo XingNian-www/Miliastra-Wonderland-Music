@@ -444,57 +444,6 @@ fn multiple_conversations_skips_first_frame_then_accepts_later_ones() {
     let got = reader.read_messages().unwrap();
     assert_eq!(got.len(), 1, "第二帧起必须正常交付，实际 {} 条", got.len());
 }
-/// 回归：多会话窗口下，**外部帧**（chat=None）的首帧也必须跳过。
-///
-/// 这条分支此前两次写反（`!insert` 与 `insert` 极性相反），而所有测试都走
-/// OCR 的 Some 分支，零覆盖。外部帧 + 多会话窗口的组合因此一直漏报。
-#[test]
-fn multiple_conversations_skips_first_external_frame_of_new_container() {
-    let shared = ChatTimeline::new();
-    let observations = ChatObservationShared::new();
-    let observation_session = observations.begin_exclusive().unwrap();
-    let subscriber = shared
-        .subscribe_scoped(crate::observation::chat::ChatScope::hall())
-        .unwrap();
-    let mut reader = ChatDecisionReader {
-        listener_mode: ChatListenerMode::Primary,
-        subscriber,
-        scope: crate::observation::chat::ChatScope::hall(),
-        any_conversation: true,
-        chat: ChatIdentity::SecondaryHall,
-        settled_conversations: std::collections::HashSet::new(),
-        baseline_at: Instant::now(),
-        sequence_floor: Some(0),
-        baseline_cursor: None,
-        seen: std::collections::HashSet::new(),
-        screen_lock: DecisionScreenLock::default(),
-        _observation_session: observation_session,
-    };
-    // 第一次见到这个容器：整屏历史，必须跳过。
-    shared
-        .inject_external(
-            Instant::now(),
-            crate::observation::chat::VisualSessionId::new(u64::MAX),
-            "test",
-            vec![external_hall_message(1, "@确认")],
-        )
-        .unwrap();
-    assert!(
-        reader.read_messages().unwrap().is_empty(),
-        "外部帧首次见到某容器时，历史不得作为决策输入"
-    );
-    // 第二次：真正的回复。
-    shared
-        .inject_external(
-            Instant::now(),
-            crate::observation::chat::VisualSessionId::new(u64::MAX),
-            "test",
-            vec![external_hall_message(2, "@确认")],
-        )
-        .unwrap();
-    let got = reader.read_messages().unwrap();
-    assert_eq!(got.len(), 1, "第二帧起必须正常交付，实际 {} 条", got.len());
-}
 /// 回归：外部源开窗后掉线、OCR 回落，窗口不能在回落瞬间开始漏帧。
 ///
 /// 基线来自外部源时，游标是服务端序号水位，与是哪块面板无关。
@@ -533,6 +482,69 @@ fn external_opened_window_keeps_receiving_after_ocr_fallback() {
         !got.is_empty(),
         "回落 OCR 后窗口仍须收到消息，不能因面板号不同而漏帧"
     );
+}
+/// 回归：多会话窗口下，**外部帧**（chat=None）的首帧必须直接交付。
+///
+/// 首帧防护是为 OCR 的「整屏历史」写的——那是窗口打开后重绘出来的旧气泡。
+/// 外部聊天源每条消息只投递一次且是真实事件，首帧就是决策输入本身；
+/// 若也跳过，这一次确认被永久吞掉，窗口只能等到超时。
+#[test]
+fn multiple_conversations_delivers_first_external_frame() {
+    let shared = ChatTimeline::new();
+    let observations = ChatObservationShared::new();
+    let observation_session = observations.begin_exclusive().unwrap();
+    let subscriber = shared
+        .subscribe_scoped(crate::observation::chat::ChatScope::hall())
+        .unwrap();
+    let mut reader = ChatDecisionReader {
+        listener_mode: ChatListenerMode::Primary,
+        subscriber,
+        scope: crate::observation::chat::ChatScope::hall(),
+        any_conversation: true,
+        chat: ChatIdentity::SecondaryHall,
+        settled_conversations: std::collections::HashSet::new(),
+        baseline_at: Instant::now(),
+        sequence_floor: Some(0),
+        baseline_cursor: None,
+        seen: std::collections::HashSet::new(),
+        screen_lock: DecisionScreenLock::default(),
+        _observation_session: observation_session,
+    };
+    shared
+        .inject_external(
+            Instant::now(),
+            crate::observation::chat::VisualSessionId::new(u64::MAX),
+            "test",
+            vec![external_hall_message(1, "@确认")],
+        )
+        .unwrap();
+    let got = reader.read_messages().unwrap();
+    assert_eq!(
+        got.len(),
+        1,
+        "外部帧每条只投递一次，首帧跳过等于永久吞掉真实确认；实际 {} 条",
+        got.len()
+    );
+}
+
+/// 回归：外部源同一决策文本连发两次，第二次必须仍然生效。
+///
+/// 外部消息的 block 是统一哨兵坐标，`DecisionScreenLock::default()` 会按
+/// (文本, bottom) 把第二次判成「已消费」——但外部每条消息只投递一次，
+/// 重复文本就是用户真的又发了一次（如连续两次 `@换一批`）。
+#[test]
+fn external_repeated_decision_text_is_accepted_twice() {
+    use crate::observation::chat::ChatMessage as Observed;
+    use crate::observation::decision::DecisionScreenLock;
+    let sentinel = crate::geometry::Rect::new(0, i32::MIN / 2, 1, 1);
+    let msg = Observed {
+        message_type: "blue".to_string(),
+        block: sentinel,
+        text: "@换一批".to_string(),
+    };
+    let mut lock = DecisionScreenLock::inert();
+    assert!(lock.accept_once(&msg), "外部源第一次决策必须生效");
+    assert!(lock.accept_once(&msg), "外部源第二次同文本决策也必须生效");
 }
 /// 回归：外部源的决策读者必须按业务范围收消息，不能按屏幕桶。
 ///

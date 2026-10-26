@@ -2873,7 +2873,8 @@ mod tests {
             keyword_trigger(&config, true, "blue", split),
             KeywordTrigger::Ask {
                 sender: "路人甲".to_string(),
-                question: "你是什么模型？".to_string(),
+                // 正文原样交给模型，关键词保留在句首。
+                question: "橘子你是什么模型？".to_string(),
             }
         );
 
@@ -2884,7 +2885,7 @@ mod tests {
             keyword_trigger(&config, true, "blue", split),
             KeywordTrigger::Ask {
                 sender: "路人甲".to_string(),
-                question: "在吗".to_string(),
+                question: "橘子在吗".to_string(),
             }
         );
 

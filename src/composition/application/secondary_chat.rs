@@ -1009,19 +1009,32 @@ impl ApplicationRuntime {
                 // 身份来源按可信度排序：账号 UID 优先，昵称次之。外部聊天源的
                 // 昵称可能为 null（API 文档 §5）而 from.uid 必填，只看昵称会把整条
                 // 命令丢掉；反过来，两者皆无（Unknown）仍然拒绝，不放宽到无身份执行。
-                if classification.kind == SecondaryHallMessageKind::Ignored
-                    || (classification.requires_identity
-                        && !crate::features::command::has_known_identity(
-                            message_sender.as_deref(),
-                            account.as_ref(),
-                        ))
-                {
+                // 两种原因都会走到这里，但语义完全不同——日志必须分开，
+                // 否则排查时会把「没有玩法认领这条命令」误读成「身份丢失」。
+                //
+                // 1. Ignored：没有任何模块认领（如没有对局时的 `#状态`）。
+                // 2. 需要身份但拿不到：真正的 Unknown，MUST_READ §2 要求不授权。
+                let unclaimed = classification.kind == SecondaryHallMessageKind::Ignored;
+                let unknown_identity = !unclaimed
+                    && classification.requires_identity
+                    && !crate::features::command::has_known_identity(
+                        message_sender.as_deref(),
+                        account.as_ref(),
+                    );
+                if unclaimed || unknown_identity {
                     if command::looks_like_command(&text) {
-                        log::info!(
-                            "命令暂缓：二级命令缺少可确认身份（UID 与昵称皆无），等待身份修订 text={}",
-                            redacted_chat_text(&text)
-                        );
-                    } else {
+                        if unclaimed {
+                            log::info!(
+                                "命令未执行：二级消息无模块认领（当前无对应玩法/开关） text={}",
+                                redacted_chat_text(&text)
+                            );
+                        } else {
+                            log::info!(
+                                "命令暂缓：二级命令缺少可确认身份（UID 与昵称皆无），等待身份修订 text={}",
+                                redacted_chat_text(&text)
+                            );
+                        }
+                    } else if unknown_identity {
                         log::debug!("二级身份相关输入尚未取得可确认身份，保留共享消息等待身份修订");
                     }
                     outcome.unrecognized = true;

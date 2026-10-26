@@ -1145,18 +1145,15 @@ impl ApplicationRuntime {
 
 #[cfg(test)]
 mod tests {
-    /// 端到端回归：外部源的 `#` 命令必须能真的派发。
+    /// 回归：外部源的 `#` / `@` 命令必须能从纯正文里提取并构造信封。
     ///
-    /// 这条覆盖的是**整条链路**：投递层补「昵称：」前缀 → 提取命令 → 构造信封 →
-    /// 路由命中。此前只测了提取函数返回 `Some`，而派发路径用的是 `text.trim()`，
-    /// 于是测试全绿但功能不通。
+    /// 正文曾经是「昵称：正文」，提取器于是在任意位置找命令符号；现在投递层
+    /// 不再拼前缀，正文就是纯正文，昵称单独走 sender 字段。
     #[test]
-    fn external_hash_command_survives_sender_prefix_through_dispatch() {
+    fn external_hash_command_is_extracted_from_a_plain_body() {
         use crate::features::command::CommandEnvelope;
-        // 外部源投递层补前缀后的正文。
-        let text = "玩家癸：#状态";
-        let command_text =
-            super::secondary_hall_command_text(text).expect("带昵称前缀的 # 命令必须能被提取");
+        let text = "#状态";
+        let command_text = super::secondary_hall_command_text(text).expect("# 命令必须能被提取");
         let envelope = CommandEnvelope::new(text, "玩家癸", "blue", command_text, Default::default())
             .expect("提取出的 #状态 必须能构造命令信封");
         assert_eq!(
@@ -1168,15 +1165,15 @@ mod tests {
 
     /// 同样覆盖 `@` 命令，确认两条前缀都通。
     #[test]
-    fn external_at_command_survives_sender_prefix_through_dispatch() {
+    fn external_at_command_is_extracted_from_a_plain_body() {
         use crate::features::command::CommandEnvelope;
-        let text = "玩家癸：@状态";
-        let command_text =
-            super::secondary_hall_command_text(text).expect("带昵称前缀的 @ 命令必须能被提取");
+        let text = "@状态";
+        let command_text = super::secondary_hall_command_text(text).expect("@ 命令必须能被提取");
         let envelope = CommandEnvelope::new(text, "玩家癸", "blue", command_text, Default::default())
             .expect("提取出的 @状态 必须能构造命令信封");
         assert_eq!(format!("{:?}", envelope.prefix()), "At");
     }
+
     use crate::features::entertainment::EntertainmentKind;
 
     use super::*;

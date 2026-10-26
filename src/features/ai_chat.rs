@@ -903,29 +903,6 @@ impl AiChatMemory {
         Ok(())
     }
 
-    /// 大厅原文总 token。
-    fn hall_tokens(&self) -> Result<usize> {
-        let connection = self.connection()?;
-        let total: i64 = connection.query_row(
-            "SELECT COALESCE(SUM(tokens), 0) FROM ai_chat_hall_turns",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(total as usize)
-    }
-
-    /// 个人原文总 token。
-    fn actor_tokens(&self, actor: &str) -> Result<usize> {
-        let connection = self.connection()?;
-        let total: i64 = connection.query_row(
-            "SELECT COALESCE((SELECT SUM(tokens) FROM ai_chat_turns WHERE actor = ?1), 0)
-                  + COALESCE((SELECT SUM(tokens) FROM ai_chat_facts WHERE actor = ?1), 0)",
-            [actor],
-            |row| row.get(0),
-        )?;
-        Ok(total as usize)
-    }
-
     /// 取出某个 scope 需要压缩的原文条数估算：按最旧的顺序，直到降到预算内。
     ///
     /// 返回需要移出的条目数；0 表示不用压缩。

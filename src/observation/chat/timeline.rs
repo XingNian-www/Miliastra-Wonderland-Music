@@ -1076,18 +1076,15 @@ impl ChatTimeline {
             // （sender + text），下游消费者却只认正文格式——所以在这里补齐，
             // 而不是让每个消费者各自拼一遍。
             //
-            // 命令解析不受影响：`secondary_hall_command_text` 会先剥掉这一段
-            // 「昵称：」前缀，再要求正文以 `@`/`#` 起头；`CommandEnvelope::new`
-            // 的 original_text 与 user_command 也是分开传的。
+            // **不在这里补「昵称：」前缀**。
             //
-            // **前缀只允许一段**：正文里出现的 `@`/`#` 不算命令。以前提取器
-            // 在任意位置找符号，导致「今天天气不错@某人」被当成命令截断。
-            let display_text = match revision.sender.as_deref().map(str::trim) {
-                Some(name) if !name.is_empty() && !revision.text.contains('：') => {
-                    format!("{name}：{}", revision.text.trim())
-                }
-                _ => revision.text.clone(),
-            };
+            // 以前为了让下游少拼一次，投递层把 sender 合成进 text。代价是
+            // `text` 不再是正文：命令提取要在任意位置找 `@`（于是任何含 @ 的
+            // 闲聊都被当成命令），投票解析也要从文本里切昵称。
+            //
+            // 现在 `text` 保持纯正文，`sender` 单独传递；需要昵称的消费者
+            // （投票、AI 触发、命令信封）各自读 `sender` 字段。
+            let display_text = revision.text.clone();
             delivered.push(ChatTimelineMessage {
                 id: id.clone(),
                 text: display_text,

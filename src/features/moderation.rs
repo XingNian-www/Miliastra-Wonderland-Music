@@ -209,12 +209,25 @@ pub trait ModerationCommandPort {
     fn prepare_vote_hold(&mut self) -> Result<Box<dyn ModerationPrimaryHold>>;
 }
 
+/// 一条可见的大厅/好友消息：发送者与正文分开给。
+///
+/// 以前端口只回正文，调用方得从「昵称：正文」里切昵称——于是投递层不得不在
+/// 正文里拼昵称，命令提取也因此误判「任何含 @ 的闲聊」。现在两者分开。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleVoteMessage {
+    pub sender: Option<String>,
+    pub text: String,
+}
+
 pub trait ModerationVotePort {
     fn now(&self) -> Instant;
     fn wait(&mut self, duration: Duration);
     fn is_running(&self) -> bool;
-    fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>>;
-    fn poll_visible_friend_messages_until(&mut self, deadline: Instant) -> Result<Vec<String>> {
+    fn poll_visible_friend_messages(&mut self) -> Result<Vec<VisibleVoteMessage>>;
+    fn poll_visible_friend_messages_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Vec<VisibleVoteMessage>> {
         if self.now() >= deadline {
             return Ok(Vec::new());
         }
@@ -616,7 +629,8 @@ impl ModerationService {
             match polled {
                 Ok(messages) => {
                     for message in messages {
-                        let Some((username, agreed)) = parse_friend_moderation_vote(&message)
+                        let Some((username, agreed)) =
+                            parse_friend_moderation_vote(message.sender.as_deref(), &message.text)
                         else {
                             continue;
                         };
@@ -871,19 +885,33 @@ fn workflow_key(command: &ModerationCommand) -> ModerationWorkflowKey {
     }
 }
 
-pub(crate) fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)> {
-    let sep_index = text.find(['：', ':', ']', '】'])?;
-    let username = text[..sep_index]
-        .trim_matches(['[', '【', ']', '】', ' ', '\t'])
-        .to_string();
-    if username.trim().is_empty() {
-        return None;
-    }
-    let sep_len = text[sep_index..].chars().next()?.len_utf8();
-    let command_text = text[sep_index + sep_len..]
-        .trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
-        .strip_prefix('@')?
-        .trim_start();
+/// 解析一条投票：谁投的 + 同意与否。
+///
+/// `sender` 已知时（外部聊天源、二级面板气泡）正文是纯正文，直接用 sender；
+/// 未知时（一级大厅扫描拿不到独立发送者列）昵称仍在正文行首，只能从文本里切。
+pub(crate) fn parse_friend_moderation_vote(
+    sender: Option<&str>,
+    text: &str,
+) -> Option<(String, bool)> {
+    let text = text.trim();
+    let (username, command_text) = match sender.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(sender) => (sender.to_string(), text.strip_prefix('@')?.trim_start()),
+        None => {
+            let sep_index = text.find(['：', ':', ']', '】'])?;
+            let username = text[..sep_index]
+                .trim_matches(['[', '【', ']', '】', ' ', '\t'])
+                .to_string();
+            if username.trim().is_empty() {
+                return None;
+            }
+            let sep_len = text[sep_index..].chars().next()?.len_utf8();
+            let command_text = text[sep_index + sep_len..]
+                .trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
+                .strip_prefix('@')?
+                .trim_start();
+            (username, command_text)
+        }
+    };
     if command_text
         .strip_prefix("不同意")
         .is_some_and(|rest| decision_boundary(rest.chars().next()))
@@ -899,8 +927,8 @@ pub(crate) fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)>
     }
 }
 
-pub(crate) fn is_moderation_vote_message(text: &str) -> bool {
-    parse_friend_moderation_vote(text).is_some()
+pub(crate) fn is_moderation_vote_message(sender: Option<&str>, text: &str) -> bool {
+    parse_friend_moderation_vote(sender, text).is_some()
 }
 
 fn decision_boundary(ch: Option<char>) -> bool {
@@ -1005,17 +1033,27 @@ mod tests {
         running: bool,
         finished: bool,
         poll_advance: Duration,
-        polls: VecDeque<Result<Vec<String>>>,
+        polls: VecDeque<Result<Vec<VisibleVoteMessage>>>,
     }
 
     impl FakeVotePort {
         fn new(polls: impl IntoIterator<Item = Vec<String>>) -> Self {
+            // 测试用「昵称：@同意」文本形态：sender 留空，解析器走文本切分分支。
+            let polls = polls
+                .into_iter()
+                .map(|batch| {
+                    Ok(batch
+                        .into_iter()
+                        .map(|text| VisibleVoteMessage { sender: None, text })
+                        .collect())
+                })
+                .collect();
             Self {
                 now: Instant::now(),
                 running: true,
                 finished: false,
                 poll_advance: Duration::ZERO,
-                polls: polls.into_iter().map(Ok).collect(),
+                polls,
             }
         }
     }
@@ -1033,14 +1071,14 @@ mod tests {
             self.running
         }
 
-        fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>> {
+        fn poll_visible_friend_messages(&mut self) -> Result<Vec<VisibleVoteMessage>> {
             self.polls.pop_front().unwrap_or_else(|| Ok(Vec::new()))
         }
 
         fn poll_visible_friend_messages_until(
             &mut self,
             _deadline: Instant,
-        ) -> Result<Vec<String>> {
+        ) -> Result<Vec<VisibleVoteMessage>> {
             self.now += self.poll_advance;
             self.poll_visible_friend_messages()
         }
@@ -1740,14 +1778,34 @@ mod tests {
 
     #[test]
     fn vote_parser_requires_a_complete_command_boundary() {
+        // 发送者未知（一级大厅扫描）：昵称在正文行首，从文本里切。
         assert_eq!(
-            parse_friend_moderation_vote("[甲]：@同意"),
+            parse_friend_moderation_vote(None, "[甲]：@同意"),
             Some(("甲".to_string(), true))
         );
         assert_eq!(
-            parse_friend_moderation_vote("乙:@不同意！"),
+            parse_friend_moderation_vote(None, "乙:@不同意！"),
             Some(("乙".to_string(), false))
         );
-        assert_eq!(parse_friend_moderation_vote("[甲]：@同意执行"), None);
+        assert_eq!(parse_friend_moderation_vote(None, "[甲]：@同意执行"), None);
+    }
+
+    /// 发送者已知时（外部源、二级面板）正文是纯正文，直接用 sender。
+    #[test]
+    fn vote_parser_uses_explicit_sender_without_a_prefix_in_the_body() {
+        assert_eq!(
+            parse_friend_moderation_vote(Some("甲"), "@同意"),
+            Some(("甲".to_string(), true))
+        );
+        assert_eq!(
+            parse_friend_moderation_vote(Some("乙"), "  @不同意  "),
+            Some(("乙".to_string(), false))
+        );
+        assert_eq!(
+            parse_friend_moderation_vote(Some("甲"), "@同意执行"),
+            None,
+            "边界不完整时必须拒绝"
+        );
+        assert_eq!(parse_friend_moderation_vote(Some("甲"), "同意"), None);
     }
 }

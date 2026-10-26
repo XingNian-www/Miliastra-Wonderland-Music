@@ -311,9 +311,17 @@ const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         path: "/debug/ui-catalogue",
         json: true,
-        // 同样保持 false：GET 是既定契约。它的 save= 分支会写 PNG 到任意路径，
-        // 这一条已由 handler 内的显式拒绝处理（见 debug_ui_catalogue_route），
-        // 不靠 mutating 标志兜底。
+        // 保持 false：GET 是既定契约（前端与离线复现脚本都按 GET 调用），
+        // 改 true 会被 enforce_method 拦成 405。
+        //
+        // 但必须如实记录：**它的 save= 分支会真实落盘写 PNG**，所以
+        // `request_blocks_idle_reload` 的写保护对它不生效，可以在 reload_draining
+        // 期间执行。这是刻意的取舍——离线复现要求「量到哪一帧就存哪一帧」，
+        // 只在 POST 下可用会让复现流程断掉。
+        //
+        // 风险边界完全由别处承担，不能误以为 handler 会拒绝写盘：
+        // 1. 有效令牌（http.access_token 为空时鉴权整体关闭，此时需保证仅 loopback 可达）
+        // 2. handler 只校验「父目录已存在」，不会替你创建目录树，也不限制路径范围
         mutating: false,
         handler: debug_ui_catalogue_route,
     },

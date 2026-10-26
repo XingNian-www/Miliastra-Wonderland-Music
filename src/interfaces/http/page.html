@@ -1426,7 +1426,7 @@ async function viewAiChatActor(name){
 async function forgetAiChatActor(name){
   if(!await confirmDialog('删除「'+name+'」的全部记忆？此操作不可撤销。',{title:'删除记忆'}))return
   try{
-    await request('/ai/memory/forget-actor?name='+encodeURIComponent(name),'POST')
+    await requestJson('/ai/memory/forget-actor',{name})
     await loadAiChatMemory()
   }catch(error){alert('删除失败：'+error.message)}
 }
@@ -1434,7 +1434,7 @@ async function forgetAiChatActor(name){
 async function forgetAiChatHall(){
   if(!await confirmDialog('清空大厅共享记忆？所有玩家共享的上下文都会被删除。',{title:'清空大厅记忆'}))return
   try{
-    await request('/ai/memory/forget-hall','POST')
+    await requestJson('/ai/memory/forget-hall',{})
     await loadAiChatMemory()
   }catch(error){alert('清空失败：'+error.message)}
 }
@@ -1442,7 +1442,7 @@ async function forgetAiChatHall(){
 async function deleteAiChatFact(name,fact){
   if(!await confirmDialog('删除这条事实？\n\n'+fact,{title:'删除事实'}))return
   try{
-    await request('/ai/memory/delete-fact?name='+encodeURIComponent(name)+'&fact='+encodeURIComponent(fact),'POST')
+    await requestJson('/ai/memory/delete-fact',{name,fact})
     await viewAiChatActor(name)
   }catch(error){alert('删除失败：'+error.message)}
 }

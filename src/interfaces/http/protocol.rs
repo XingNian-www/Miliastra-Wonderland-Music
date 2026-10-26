@@ -151,6 +151,18 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
         handler: ai_models_body_route,
     },
     BodyRouteSpec {
+        path: "/ai/memory/forget-actor",
+        handler: ai_memory_forget_actor_route,
+    },
+    BodyRouteSpec {
+        path: "/ai/memory/delete-fact",
+        handler: ai_memory_delete_fact_route,
+    },
+    BodyRouteSpec {
+        path: "/ai/memory/forget-hall",
+        handler: ai_memory_forget_hall_route,
+    },
+    BodyRouteSpec {
         path: "/debug/tasks",
         handler: debug_task_save_route,
     },
@@ -635,6 +647,24 @@ const ROUTES: &[RouteSpec] = &[
         // 只读：拉取服务端模型列表，不改配置。
         mutating: false,
         handler: ai_models_route,
+    },
+    RouteSpec {
+        path: "/ai/memory/actors",
+        json: true,
+        mutating: false,
+        handler: ai_memory_actors_route,
+    },
+    RouteSpec {
+        path: "/ai/memory/actor",
+        json: true,
+        mutating: false,
+        handler: ai_memory_actor_route,
+    },
+    RouteSpec {
+        path: "/ai/memory/hall",
+        json: true,
+        mutating: false,
+        handler: ai_memory_hall_route,
     },
     RouteSpec {
         path: "/ai/search",

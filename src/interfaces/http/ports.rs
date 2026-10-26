@@ -427,6 +427,19 @@ pub(crate) trait HttpAiPort: Send + Sync {
     fn recognize(&self, query: &[(String, String)]) -> Result<String>;
     fn match_song(&self, query: &[(String, String)]) -> Result<String>;
     fn pick(&self, query: &[(String, String)]) -> Result<String>;
+
+    /// 列出所有有记忆的玩家及其规模。
+    fn memory_actors(&self) -> Result<String>;
+    /// 读取某个玩家的完整记忆（事实 + 摘要 + 原文）。
+    fn memory_actor(&self, actor: &str) -> Result<String>;
+    /// 读取大厅共享记忆。
+    fn memory_hall(&self) -> Result<String>;
+    /// 删除某个玩家的记忆。
+    fn forget_actor(&self, actor: &str) -> Result<String>;
+    /// 删除某条事实。
+    fn delete_fact(&self, actor: &str, fact: &str) -> Result<String>;
+    /// 清空大厅共享记忆。
+    fn forget_hall(&self) -> Result<String>;
 }
 
 #[derive(Clone)]

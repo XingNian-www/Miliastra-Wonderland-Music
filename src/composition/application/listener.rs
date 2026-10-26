@@ -770,8 +770,9 @@ impl ApplicationRuntime {
                 Arc::new(http_facade::ApplicationHttpLoginFacade::new(
                     self.playback.login_helper.clone(),
                 )),
-                Arc::new(http_facade::ApplicationHttpAiFacade::new(
+                Arc::new(http_facade::ApplicationHttpAiFacade::with_memory(
                     self.business.ai.clone(),
+                    self.business.ai_chat_memory.clone(),
                 )),
             ),
         );

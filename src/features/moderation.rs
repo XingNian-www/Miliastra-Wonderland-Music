@@ -871,7 +871,7 @@ fn workflow_key(command: &ModerationCommand) -> ModerationWorkflowKey {
     }
 }
 
-fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)> {
+pub(crate) fn parse_friend_moderation_vote(text: &str) -> Option<(String, bool)> {
     let sep_index = text.find(['：', ':', ']', '】'])?;
     let username = text[..sep_index]
         .trim_matches(['[', '【', ']', '】', ' ', '\t'])

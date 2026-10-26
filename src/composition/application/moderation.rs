@@ -32,6 +32,12 @@ use crate::ui::routines::{
 struct ModerationVoteContext {
     running: Arc<AtomicBool>,
     chat_timeline: ChatTimeline,
+    /// 身份映射：投票资格的**唯一**判据。
+    ///
+    /// 以前靠消息颜色隐式表达「谁的票算数」——OCR 只收粉色（二级面板里好友
+    /// 消息的渲染色）。那是屏幕副产物，外部聊天源没有颜色，映射不上，于是
+    /// 路人也能投票。现在两个来源统一按身份映射判「是否好友」。
+    identity: crate::features::identity::IdentityAccess,
     baseline_timeout: Duration,
     /// 投票所属大厅的业务容器。整个投票期固定，避免中途被别的 hall 带走。
     vote_scope: ChatScope,
@@ -292,19 +298,16 @@ impl AppModerationVotePort {
                     .is_some_and(|(left, right)| is_hall_panel(left) && is_hall_panel(right))
                     && baseline.chat != snapshot.chat
             });
-            // 水位单位在窗口打开时就固定，不随每帧来源漂移：投票中途外部源
-            // 连上/断开时，同一订阅者会先后收到两种来源，逐帧换单位会让
-            // OCR 消息（source_sequence 恒 0）与外部大序号互相误判，
-            // 两个方向都会静默丢票。
+            // 颜色判据：身份映射里查不到该玩家时的退路。
             //
-            // 但 message_type 必须按**这一帧的来源**判，不能跟着 base_line 走：
-            // 投票中途外部源接管时 baseline 仍是 OCR 的 Some，而这一帧是外部的
-            // blue 票，用 pink 过滤会静默丢光。
+            // OCR 的 pink 是「二级面板里好友消息的渲染色」，天然限定好友；
+            // 外部源的 blue 是大厅广播，不限。真正的资格判定见下面的身份查表。
             let vote_type = if snapshot.source.is_ocr() {
                 "pink"
             } else {
                 "blue"
             };
+            let identity = self.context.identity.clone();
             votes.extend(
                 snapshot
                     .messages
@@ -335,9 +338,45 @@ impl AppModerationVotePort {
                         };
                         // 正文已由投递层统一成 OCR 语义（含「昵称：」前缀），
                         // 两个来源在这里不再有格式差异。
-                        newer
-                            && message.message_type == vote_type
-                            && is_moderation_vote_message(&message.text)
+                        if !newer || !is_moderation_vote_message(&message.text) {
+                            return false;
+                        }
+                        // 正文已由投递层统一成 OCR 语义（含「昵称：」前缀），
+                        // 两个来源在这里不再有格式差异。
+                        if !is_moderation_vote_message(&message.text) {
+                            return false;
+                        }
+                        // 投票资格：**身份映射里有记录时按角色判**，没有记录则退回
+                        // 原有的颜色判据。
+                        //
+                        // 为什么不能一律按映射判：映射表是用户手工维护的，空表是
+                        // 合法初始状态。若一律要求「映射里必须是好友」，全新安装
+                        // 时所有人都不能投票，比原来的隐式规则更糟。
+                        //
+                        // 颜色判据在这里的含义：OCR 的 pink 表示「二级面板里好友
+                        // 消息的渲染色」；外部源的 blue 表示大厅广播。前者天然限定
+                        // 好友，后者不限——所以外部源在映射缺失时仍然偏宽，这是
+                        // 已知取舍，需要严格时请配置身份映射。
+                        let Some((username, _)) =
+                            crate::features::moderation::parse_friend_moderation_vote(
+                                &message.text,
+                            )
+                        else {
+                            return false;
+                        };
+                        // 判据分三种情形：
+                        // 1. 映射里查得到 → 按角色（唯一成文规则）
+                        // 2. 查不到，但消息**带账号**（UID）→ 说明这是可精确识别的
+                        //    玩家，只是没登记。视为非好友，不计票——否则任何人改个
+                        //    昵称就能投票。
+                        // 3. 查不到，且没有账号（OCR 路径只能靠昵称）→ 退回颜色判据。
+                        //    映射表是用户手工维护的、空表是合法初始状态，一律拒绝会
+                        //    让全新安装时没有任何人能投票。
+                        match identity.role_of_sender(&username, message.account.as_ref()) {
+                            Some(role) => role >= crate::features::identity::IdentityRole::Friend,
+                            None if message.account.is_some() => false,
+                            None => message.message_type == vote_type,
+                        }
                     })
                     .map(|message| message.text),
             );
@@ -663,6 +702,7 @@ impl ApplicationRuntime {
             ),
             // 投票永远属于「当前所在大厅」这个业务容器，与屏幕桶、消息来源无关。
             vote_scope: self.ui.chat_timeline.current_hall_scope()?,
+            identity: self.lifecycle.live_configs.identity.clone(),
             // 外部源在线时先用序号水位建基线，避免安静大厅等不到帧而开不了投票。
             // 用一次性快照而非两次原子读：分开读会得到「在线 + 旧水位」这种
             // 不存在的组合，那会让整场投票用错的水位单位。
@@ -743,12 +783,34 @@ mod tests {
         }
     }
 
+    fn external_vote_message(
+        sequence: u64,
+        sender: &str,
+        text: &str,
+    ) -> miliastra_kernel::chat_source::ExternalChatMessage {
+        miliastra_kernel::chat_source::ExternalChatMessage {
+            sequence,
+            sent_at: None,
+            channel: miliastra_kernel::chat_source::ChatChannel::current_hall(),
+            hall_id: None,
+            sender: miliastra_kernel::chat_source::ExternalSender::new(
+                Some(sender.to_string()),
+                Some(miliastra_kernel::chat_source::GameUid::from_u32(
+                    9000 + sequence as u32,
+                )),
+            ),
+            to_uid: None,
+            text: text.to_string(),
+        }
+    }
+
     fn shared_vote_context(shared: &ChatTimeline) -> ModerationVoteContext {
         ModerationVoteContext {
             running: Arc::new(AtomicBool::new(true)),
             chat_timeline: shared.clone(),
             baseline_timeout: Duration::ZERO,
             vote_scope: ChatScope::hall(),
+            identity: crate::features::identity::IdentityAccess::new(Default::default()),
             external_floor: None,
         }
     }
@@ -775,6 +837,56 @@ mod tests {
     /// 外部开窗时 `baseline` 为 None、水位是服务端序号；OCR 消息的
     /// `source_sequence` 恒为 0，拿它去比大序号会恒假，整窗 OCR 票静默丢弃。
     /// 投票于是退化成「无反对即通过」——故障自动提权。
+    /// 回归：身份映射里查得到时，投票资格按**角色**判，不按消息颜色。
+    ///
+    /// 这修的是「外部模式下路人也能投票」：OCR 靠 pink 隐式限定好友，
+    /// 外部源的 blue 是大厅广播、不限，三个陌生人就能凑够 margin 批准拉黑。
+    /// 现在映射里有的玩家一律按角色裁——非好友即使发 blue 也不计票。
+    #[test]
+    fn mapped_non_friend_cannot_vote_even_on_blue_hall_message() {
+        let shared = ChatTimeline::new();
+        let subscriber = shared.subscribe_scoped(ChatScope::hall()).unwrap();
+        // 身份映射里只有「甲」，且角色是 Friend（最低档）。
+        let identity = crate::features::identity::IdentityAccess::new(
+            crate::features::identity::IdentityConfig {
+                mappings: vec![crate::features::identity::IdentityMapping {
+                    nickname: "甲".to_string(),
+                    id: uuid::Uuid::new_v4(),
+                    role: crate::features::identity::IdentityRole::Friend,
+                    note: String::new(),
+                    // 有 UID 的消息只按 UID 认身份（防改昵称冒充），所以映射必须绑账号。
+                    accounts: vec![crate::features::identity::GameAccount {
+                        game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
+                        uid: "9001".to_string(),
+                    }],
+                }],
+            },
+        );
+        let context = ModerationVoteContext {
+            running: Arc::new(AtomicBool::new(true)),
+            chat_timeline: shared.clone(),
+            baseline_timeout: Duration::from_secs(1),
+            vote_scope: ChatScope::hall(),
+            identity,
+            external_floor: Some(0),
+        };
+        let mut port = AppModerationVotePort::from_external_watermark(context, subscriber, 0);
+        // 甲乙都发 @同意（外部 → blue）。
+        shared
+            .inject_external(
+                Instant::now(),
+                crate::observation::chat::VisualSessionId::new(u64::MAX),
+                "test",
+                vec![
+                    external_vote_message(1, "甲", "@同意"),
+                    external_vote_message(2, "路人乙", "@同意"),
+                ],
+            )
+            .unwrap();
+        let votes = port.read_votes().unwrap();
+        assert_eq!(votes.len(), 1, "只有映射里的好友能投票，实际 {:?}", votes);
+        assert!(votes[0].contains("甲"), "实际: {:?}", votes);
+    }
     #[test]
     fn ocr_votes_still_count_after_external_window_falls_back() {
         let shared = ChatTimeline::new();
@@ -784,6 +896,7 @@ mod tests {
             chat_timeline: shared.clone(),
             baseline_timeout: Duration::from_secs(1),
             vote_scope: ChatScope::hall(),
+            identity: crate::features::identity::IdentityAccess::new(Default::default()),
             external_floor: Some(100),
         };
         // 外部源开窗：水位是服务端序号 100。
@@ -806,11 +919,27 @@ mod tests {
     fn external_vote_counts_after_a_single_sample() {
         let shared = ChatTimeline::new();
         let subscriber = shared.subscribe_scoped(ChatScope::hall()).unwrap();
+        // 投票资格按身份映射判：这里绑一个好友，专注验证「外部源单次采样即计入」。
+        let identity = crate::features::identity::IdentityAccess::new(
+            crate::features::identity::IdentityConfig {
+                mappings: vec![crate::features::identity::IdentityMapping {
+                    nickname: "甲".to_string(),
+                    id: uuid::Uuid::new_v4(),
+                    role: crate::features::identity::IdentityRole::Friend,
+                    note: String::new(),
+                    accounts: vec![crate::features::identity::GameAccount {
+                        game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
+                        uid: "1001".to_string(),
+                    }],
+                }],
+            },
+        );
         let context = ModerationVoteContext {
             running: Arc::new(AtomicBool::new(true)),
             chat_timeline: shared.clone(),
             baseline_timeout: Duration::from_secs(1),
             vote_scope: ChatScope::hall(),
+            identity,
             external_floor: Some(0),
         };
         let mut port = AppModerationVotePort::from_external_watermark(context, subscriber, 0);
@@ -878,6 +1007,7 @@ mod tests {
             chat_timeline: shared.clone(),
             baseline_timeout: Duration::from_secs(2),
             vote_scope: ChatScope::hall(),
+            identity: crate::features::identity::IdentityAccess::new(Default::default()),
             external_floor: None,
         };
         let mut port = context.open().unwrap();

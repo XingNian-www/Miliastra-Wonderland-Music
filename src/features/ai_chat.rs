@@ -568,8 +568,9 @@ fn render_records(lines: &[String]) -> String {
 fn default_extract_prompt() -> String {
     [
         "从下面这轮对话里抽取关于该玩家、值得长期记住的稳定信息（偏好、称呼、习惯、约定）。",
-        "只返回 JSON：{\"facts\":[\"…\"]}。没有值得记住的内容就返回空数组。",
-        "每条尽量简短（不超过 120 个字），不要记录一次性的问题或你自己的回答。",
+        "只返回 JSON：{\"facts\":[\"…\"],\"remove\":[\"…\"]}。",
+        "facts 写这一轮新增或需要改写的信息；remove 原样列出已有事实中已被本轮明确推翻的句子（改名、改称呼、改偏好）。",
+        "没有值得记住的内容就返回空数组。每条尽量简短（不超过 120 个字），不要记录一次性的问题或你自己的回答。",
     ]
     .join("")
 }
@@ -820,6 +821,20 @@ impl AiChatMemory {
     }
 
     /// 写入事实；重复只刷新时间。整条内容超过上限时丢弃而不截断。
+    /// 读取某个玩家的全部事实（旧→新）。
+    ///
+    /// 抽取时要把它交给模型，模型才知道哪些信息已经存在、哪些需要推翻；
+    /// 不传的话它只能盲目追加，改名之后新旧称呼并存。
+    pub(crate) fn facts(&self, actor: &str) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let facts = connection
+            .prepare(
+                "SELECT fact FROM ai_chat_facts WHERE actor = ?1 ORDER BY added_at ASC, rowid ASC",
+            )?
+            .query_map([actor], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(facts)
+    }
     pub(crate) fn add_fact(
         &self,
         actor: &str,
@@ -1301,10 +1316,15 @@ pub(crate) struct PromptInput<'a> {
 
 /// 当前消息模板。历史由独立 user/assistant 消息承载，保留旧占位符兼容。
 pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
+    // 事实按写入时间从旧到新排列。必须显式告诉模型这个顺序与优先级，
+    // 否则改名、改称呼之后它会在新旧两条之间随机挑一条，表现为「没使用最新信息」。
     let facts = if input.context.facts.is_empty() {
         "（暂无）".to_string()
     } else {
-        input.context.facts.join("；")
+        format!(
+            "{}（按时间从旧到新，冲突时以后面一条为准）",
+            input.context.facts.join("；")
+        )
     };
     let history = "（历史已作为独立对话消息提供）";
     let bot_history = if input.context.bot_history.is_empty() {
@@ -1464,21 +1484,34 @@ pub(crate) fn sanitize_answer(text: &str) -> String {
         .to_string()
 }
 
-/// 解析事实抽取结果；非法 JSON 或非数组一律视为「没有新事实」。
-pub(crate) fn parse_facts(reply: &str) -> Vec<String> {
+/// 抽取结果的完整解析：新增事实 + 需要删除的旧事实原句。
+///
+/// 只看 facts 会让改名、改称呼这类更新变成「再追加一条」，新旧两条并存，
+/// 模型随后在新旧之间随机挑一条——表现为「没有使用最新信息」。
+pub(crate) fn parse_fact_update(reply: &str) -> (Vec<String>, Vec<String>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(reply.trim()) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    let Some(items) = value.get("facts").and_then(|v| v.as_array()) else {
-        return Vec::new();
+    let collect = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
     };
-    items
-        .iter()
-        .filter_map(|item| item.as_str())
-        .map(str::trim)
-        .filter(|fact| !fact.is_empty() && fact.chars().count() <= MAX_FACT_CHARS)
-        .map(str::to_string)
-        .collect()
+    let facts = collect("facts")
+        .into_iter()
+        .filter(|fact| fact.chars().count() <= MAX_FACT_CHARS)
+        .collect();
+    (facts, collect("remove"))
 }
 
 /// 回答长度上限（显示宽度），用于提示词约束与发送前检查。
@@ -1863,17 +1896,39 @@ mod tests {
     }
 
     #[test]
-    fn facts_are_parsed_and_invalid_payloads_yield_nothing() {
-        assert_eq!(
-            parse_facts(r#"{"facts":["喜欢晴天","常在晚上上线"]}"#),
-            vec!["喜欢晴天".to_string(), "常在晚上上线".to_string()]
-        );
-        assert!(parse_facts("not json").is_empty());
-        assert!(parse_facts(r#"{"facts":"single"}"#).is_empty());
-        assert!(parse_facts(r#"{"other":[]}"#).is_empty());
+    fn fact_update_parses_additions_and_removals() {
+        let (facts, remove) =
+            parse_fact_update(r#"{"facts":["喜欢晴天"],"remove":["玩家的名字是安娜"]}"#);
+        assert_eq!(facts, vec!["喜欢晴天".to_string()]);
+        assert_eq!(remove, vec!["玩家的名字是安娜".to_string()]);
+
+        // 旧格式（只有 facts）仍然可用，remove 为空。
+        let (facts, remove) = parse_fact_update(r#"{"facts":["常在晚上上线"]}"#);
+        assert_eq!(facts, vec!["常在晚上上线".to_string()]);
+        assert!(remove.is_empty());
+
+        // 非法负载一律视为没有变化。
+        let (facts, remove) = parse_fact_update("not json");
+        assert!(facts.is_empty() && remove.is_empty());
+        let (facts, _) = parse_fact_update(r#"{"facts":"single"}"#);
+        assert!(facts.is_empty());
+
         // 超长事实被丢弃而不是截断。
         let long = "字".repeat(MAX_FACT_CHARS + 1);
-        assert!(parse_facts(&format!(r#"{{"facts":["{long}"]}}"#)).is_empty());
+        let (facts, _) = parse_fact_update(&format!(r#"{{"facts":["{long}"]}}"#));
+        assert!(facts.is_empty());
+    }
+
+    /// 回归：改名后旧称呼必须能被淘汰。
+    ///
+    /// 线上出现过同一个玩家 10 条事实里既有「叫玩家乙」又有「叫安娜」
+    /// 「叫别名乙」，模型随机挑一条，表现为「没使用最新信息」。
+    #[test]
+    fn fact_update_can_retire_a_superseded_nickname() {
+        let reply = r#"{"facts":["玩家现在的称呼是别名甲喵"],"remove":["玩家叫别名甲"]}"#;
+        let (facts, remove) = parse_fact_update(reply);
+        assert_eq!(facts.len(), 1, "必须写入新称呼");
+        assert_eq!(remove.len(), 1, "必须淘汰旧称呼");
     }
 
     #[test]

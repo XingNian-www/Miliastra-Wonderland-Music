@@ -440,6 +440,21 @@ impl ApplicationRuntime {
                     .into_iter()
                     .next()
                 {
+                    // 外部聊天源接管时不排队未读任务。
+                    //
+                    // 未读提升是屏幕操作：要等一帧 OCR 好友会话、再从 screen.latest
+                    // 取修订。接管期间观察线程不发布任何帧、外部帧也没有屏幕桶，
+                    // 任务必然等到超时并报「fresh shared friend chat OCR did not arrive」，
+                    // 红点清不掉还会反复重排队——纯空转。
+                    // 外部私聊本身走 scope=Private 直投业务链路，不受影响。
+                    if external_supplies_hall {
+                        log::debug!("外部聊天源接管中，跳过未读提升（该流程依赖屏幕帧）");
+                        return Ok(SecondaryListenerRoundOutcome {
+                            scanned,
+                            verified,
+                            ..Default::default()
+                        });
+                    }
                     self.queue_secondary_unread_task(hit, false)?;
                     return Ok(SecondaryListenerRoundOutcome::default());
                 }
@@ -782,9 +797,10 @@ impl ApplicationRuntime {
                 .map(|message| (message.id, message.text))
                 .collect(),
             // 外部源的 block 是哨兵坐标（全部相同），位置锁会把同文本决策
-            // 永久判成「已存在」，所以它对外部源恒为空实现。
+            // 永久判成「已存在」。而它每条消息只投递一次——重复文本就是用户
+            // 真的又发了一次（连续两次 @换一批），不该被否决。用真正的 inert。
             screen_lock: if !baseline.source.is_ocr() {
-                DecisionScreenLock::default()
+                DecisionScreenLock::inert()
             } else {
                 DecisionScreenLock::from_messages(&messages, accepts_message_type, is_decision)
             },

@@ -737,6 +737,18 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
           <summary class="panel-head">AI回复 标签</summary>
           <div class="panel-body" id="aiChatReplyPanel"><p class="config-field-hint">正在读取配置…</p></div>
         </details>
+
+        <details class="panel" open id="aiChatMemoryPanelWrap">
+          <summary class="panel-head">记忆库</summary>
+          <div class="panel-body">
+            <p class="config-field-hint">直接查询与删改已保存的记忆。个人记忆按玩家隔离，大厅记忆所有人共享。</p>
+            <div class="row" style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+              <button class="btn small" onclick="loadAiChatMemory()">刷新</button>
+              <span class="config-field-hint" id="aiChatMemoryHint">未读取</span>
+            </div>
+            <div id="aiChatMemoryBody"></div>
+          </div>
+        </details>
       </div>
       <p class="command-foot">记忆只保存在本地统一数据库；「@忘记我」可让玩家清空自己的记忆。AI 给出的命令会按提问者本人权限复核后执行。</p>
     </section>
@@ -1299,7 +1311,7 @@ async function navigateTo(route,updateHash=true){
     if(!commandCatalog&&!commandCatalogLoading)loadCommandCatalog()
     if(!commandReplyCatalog&&!commandReplyLoading)loadCommandReplies()
   }
-  if(route==='aichat'&&!aiChatData)loadAiChatSettings()
+  if(route==='aichat'){if(!aiChatData)loadAiChatSettings();if(!$('aiChatMemoryBody')||!$('aiChatMemoryBody').childElementCount)loadAiChatMemory()}
 }
 /* ===== AI 聊天功能页 =====
  * 复用配置中心 schema 渲染与保存接口，仅编辑 ai_chat 段。
@@ -1319,6 +1331,121 @@ const AI_CHAT_GROUPS=[
     'ai_reply.max_tokens','ai_reply.timeout_seconds'
   ]}
 ]
+
+/* ===== AI 记忆库面板 =====
+ * 只读查询 + 精确删除。不做「编辑事实」：
+ * 记忆内容是模型抽取的自然语言，手改容易与后续抽取冲突；
+ * 删掉重新积累更可控。
+ */
+async function loadAiChatMemory(){
+  const body=$('aiChatMemoryBody'),hint=$('aiChatMemoryHint')
+  if(!body)return
+  body.innerHTML='<p class="config-field-hint">读取中…</p>'
+  try{
+    const data=await request('/ai/memory/actors')
+    const actors=data.actors||[]
+    const hall=await request('/ai/memory/hall')
+    const parts=[]
+    parts.push('<h4 style="margin:12px 0 6px">大厅共享记忆</h4>')
+    parts.push(`<p class="config-field-hint">原文 ${hall.count||0} 条，约 ${hall.tokens||0} token</p>`)
+    if(hall.summary){
+      parts.push('<div class="panel" style="padding:8px;margin-bottom:6px"><strong>摘要</strong><pre style="white-space:pre-wrap;margin:4px 0 0">'+esc(hall.summary)+'</pre></div>')
+    }
+    if((hall.lines||[]).length){
+      parts.push('<div style="max-height:240px;overflow:auto">')
+      for(const line of hall.lines){
+        parts.push('<div style="padding:3px 0;border-bottom:1px solid var(--border,#eee)">'
+          +'<strong>'+esc(line.speaker)+'</strong>：'+esc(line.text)+'</div>')
+      }
+      parts.push('</div>')
+    }else{
+      parts.push('<p class="config-field-hint">（暂无大厅记忆）</p>')
+    }
+    parts.push('<button class="btn small danger" onclick="forgetAiChatHall()">清空大厅记忆</button>')
+
+    parts.push('<h4 style="margin:16px 0 6px">个人记忆</h4>')
+    if(!actors.length){
+      parts.push('<p class="config-field-hint">（还没有任何玩家记忆）</p>')
+    }else{
+      parts.push('<div style="max-height:320px;overflow:auto">')
+      for(const actor of actors){
+        parts.push('<div style="padding:6px 0;border-bottom:1px solid var(--border,#eee)">'
+          +'<div style="display:flex;gap:8px;align-items:center">'
+          +'<strong>'+esc(actor.actor)+'</strong>'
+          +'<span class="config-field-hint">事实 '+actor.facts+' 条 / 对话 '+actor.turns+' 轮 / 约 '+actor.tokens+' token</span>'
+          +'<button class="btn small" onclick="viewAiChatActor(\''+esc(actor.actor).replace(/'/g,"\\'")+'\')">查看</button>'
+          +'<button class="btn small danger" onclick="forgetAiChatActor(\''+esc(actor.actor).replace(/'/g,"\\'")+'\')">删除</button>'
+          +'</div><div id="aiChatActor-'+esc(actor.actor)+'"></div></div>')
+      }
+      parts.push('</div>')
+    }
+    body.innerHTML=parts.join('')
+    if(hint)hint.textContent='已读取 '+actors.length+' 位玩家'
+  }catch(error){
+    body.innerHTML='<p class="config-message err">读取失败：'+esc(error.message)+'</p>'
+    if(hint)hint.textContent='读取失败'
+  }
+}
+
+async function viewAiChatActor(name){
+  const el=$('aiChatActor-'+name)
+  if(!el)return
+  el.innerHTML='<p class="config-field-hint">读取中…</p>'
+  try{
+    const data=await request('/ai/memory/actor?name='+encodeURIComponent(name))
+    const parts=[]
+    if(data.summary){
+      parts.push('<div class="panel" style="padding:8px;margin:6px 0"><strong>中期摘要</strong><pre style="white-space:pre-wrap;margin:4px 0 0">'+esc(data.summary)+'</pre></div>')
+    }
+    const facts=data.facts||[]
+    if(facts.length){
+      parts.push('<div style="margin:6px 0"><strong>事实</strong></div>')
+      for(const fact of facts){
+        parts.push('<div style="display:flex;gap:8px;align-items:center;padding:2px 0">'
+          +'<span style="flex:1">'+esc(fact)+'</span>'
+          +'<button class="btn small danger" onclick="deleteAiChatFact(\''+esc(name).replace(/'/g,"\\'")+'\',\''+esc(fact).replace(/'/g,"\\'").replace(/\\/g,'\\\\')+'\')">删除</button></div>')
+      }
+    }else{
+      parts.push('<p class="config-field-hint">（暂无事实）</p>')
+    }
+    const turns=data.turns||[]
+    if(turns.length){
+      parts.push('<div style="margin:6px 0"><strong>近期对话</strong></div><div style="max-height:200px;overflow:auto">')
+      for(const turn of turns){
+        parts.push('<div style="padding:2px 0"><span class="config-field-hint">['+esc(turn.asker)+']</span> '+esc(turn.question)
+          +'<br><span style="opacity:.75">↳ '+esc(turn.answer)+'</span></div>')
+      }
+      parts.push('</div>')
+    }
+    el.innerHTML=parts.join('')
+  }catch(error){
+    el.innerHTML='<p class="config-message err">读取失败：'+esc(error.message)+'</p>'
+  }
+}
+
+async function forgetAiChatActor(name){
+  if(!await confirmDialog('删除「'+name+'」的全部记忆？此操作不可撤销。',{title:'删除记忆'}))return
+  try{
+    await request('/ai/memory/forget-actor?name='+encodeURIComponent(name),'POST')
+    await loadAiChatMemory()
+  }catch(error){alert('删除失败：'+error.message)}
+}
+
+async function forgetAiChatHall(){
+  if(!await confirmDialog('清空大厅共享记忆？所有玩家共享的上下文都会被删除。',{title:'清空大厅记忆'}))return
+  try{
+    await request('/ai/memory/forget-hall','POST')
+    await loadAiChatMemory()
+  }catch(error){alert('清空失败：'+error.message)}
+}
+
+async function deleteAiChatFact(name,fact){
+  if(!await confirmDialog('删除这条事实？\n\n'+fact,{title:'删除事实'}))return
+  try{
+    await request('/ai/memory/delete-fact?name='+encodeURIComponent(name)+'&fact='+encodeURIComponent(fact),'POST')
+    await viewAiChatActor(name)
+  }catch(error){alert('删除失败：'+error.message)}
+}
 async function loadAiChatSettings(){
   const status=$('aiChatStatusText')
   try{

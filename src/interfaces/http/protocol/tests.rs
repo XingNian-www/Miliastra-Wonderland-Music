@@ -2031,6 +2031,30 @@ impl HttpLoginPort for HttpTestLoginPort {
 struct HttpTestAiPort;
 
 impl HttpAiPort for HttpTestAiPort {
+    fn memory_actors(&self) -> Result<String> {
+        Ok(r#"{"actors":[]}"#.to_string())
+    }
+
+    fn memory_actor(&self, _actor: &str) -> Result<String> {
+        Ok(r#"{"facts":[],"summary":null,"turns":[]}"#.to_string())
+    }
+
+    fn memory_hall(&self) -> Result<String> {
+        Ok(r#"{"summary":null,"lines":[],"count":0,"tokens":0}"#.to_string())
+    }
+
+    fn forget_actor(&self, _actor: &str) -> Result<String> {
+        Ok(r#"{"ok":true,"removed":false}"#.to_string())
+    }
+
+    fn delete_fact(&self, _actor: &str, _fact: &str) -> Result<String> {
+        Ok(r#"{"ok":true,"removed":false}"#.to_string())
+    }
+
+    fn forget_hall(&self) -> Result<String> {
+        Ok(r#"{"ok":true,"removed":0}"#.to_string())
+    }
+
     fn recognize(&self, _query: &[(String, String)]) -> Result<String> {
         Ok("test recognition".to_string())
     }

@@ -68,8 +68,15 @@ impl InviteConfig {
 /// 邀请命令：读取邀请序号或六位密码，并发起入厅确认流程。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InviteCommand {
-    /// 游戏好友列表中的实际昵称，用于 UI 搜索。
+    /// 命令发起人（信封主语）。外部聊天源下这是**纯 UID**，不能拿去搜好友列表；
+    /// 它仍参与权限判定与锁键，所以保持原样、不在这里替换。
     pub(crate) username: String,
+    /// 好友列表里真正可以匹配的名字（备注 + 游戏内昵称），由 composition 层用 UID 反查填入。
+    ///
+    /// 为空时调用方回退到 `username`：OCR 路径的信封主语本来就是列表上看得见的昵称，
+    /// 那时反查不到账号也不该让邀请失效。
+    #[serde(default)]
+    pub(crate) search_names: Vec<String>,
     /// 身份映射后的备注昵称，用于大厅通告和好友通知。
     pub(crate) display_name: String,
     pub(crate) seq: Option<u32>,
@@ -114,6 +121,9 @@ impl InviteCommand {
             raw_parameter,
             command: Self {
                 username: username.to_string(),
+                // 解析阶段只认识信封主语；能用 UID 反查出哪些名字，
+                // 依赖 IdentityAccess，只有 composition 层拿得到。
+                search_names: Vec::new(),
                 display_name: username.to_string(),
                 seq,
                 password,
@@ -163,6 +173,8 @@ pub enum InviteDecision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InviteRequest {
     pub username: String,
+    /// 好友列表可匹配名；空则回退到 `username`。
+    pub search_names: Vec<String>,
     pub display_name: String,
     pub sequence: Option<u32>,
     pub password: Option<String>,
@@ -177,9 +189,19 @@ impl InviteRequest {
     ) -> Self {
         Self {
             username: username.into(),
+            search_names: Vec::new(),
             display_name: display_name.into(),
             sequence,
             password,
+        }
+    }
+
+    /// 实际拿去搜好友列表的名字：优先用 UID 反查出来的候选，没有再退回主语。
+    pub fn recipients(&self) -> Vec<String> {
+        if self.search_names.is_empty() {
+            vec![self.username.clone()]
+        } else {
+            self.search_names.clone()
         }
     }
 }
@@ -191,6 +213,8 @@ pub enum InviteStart {
 
 pub struct InviteExecution {
     username: String,
+    /// 好友列表可匹配名（UID 反查得到），空则回退到 `username`。
+    recipients: Vec<String>,
     display_name: String,
     password: Option<String>,
 }
@@ -235,7 +259,7 @@ pub trait InviteExecutionPort {
     fn wait_for_decision(&self) -> Result<InviteDecision>;
     fn execute_invite_ui(
         &self,
-        username: &str,
+        recipients: &[String],
         password: Option<&str>,
         notification: &str,
     ) -> Result<InviteUiOutcome>;
@@ -270,8 +294,10 @@ impl InviteService {
                 self.executed_sequences.pop_front();
             }
         }
+        let recipients = request.recipients();
         InviteStart::Ready(InviteExecution {
             username: request.username,
+            recipients,
             display_name: request.display_name,
             password: request.password,
         })
@@ -281,6 +307,7 @@ impl InviteService {
 impl InviteExecution {
     pub fn run(self, port: &dyn InviteExecutionPort) -> Result<bool> {
         let username = self.username;
+        let recipients = self.recipients;
         let display_name = self.display_name;
         let password = self.password;
         log::info!("邀请: 先检测是否公共大厅");
@@ -288,7 +315,7 @@ impl InviteExecution {
             log::info!("邀请: 当前在公共大厅，直接执行");
             return execute_approved_invite(
                 port,
-                &username,
+                &recipients,
                 password.as_deref(),
                 crate::features::reply_template::moderation::MODERATION[2].default,
             );
@@ -303,7 +330,7 @@ impl InviteExecution {
             log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
             return execute_approved_invite(
                 port,
-                &username,
+                &recipients,
                 password.as_deref(),
                 crate::features::reply_template::moderation::MODERATION[2].default,
             );
@@ -311,13 +338,13 @@ impl InviteExecution {
         match port.wait_for_decision()? {
             InviteDecision::Approve => execute_approved_invite(
                 port,
-                &username,
+                &recipients,
                 password.as_deref(),
                 crate::features::reply_template::moderation::MODERATION[2].default,
             ),
             InviteDecision::Timeout => execute_approved_invite(
                 port,
-                &username,
+                &recipients,
                 password.as_deref(),
                 "已默认同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
             ),
@@ -332,11 +359,11 @@ impl InviteExecution {
 
 fn execute_approved_invite(
     port: &dyn InviteExecutionPort,
-    username: &str,
+    recipients: &[String],
     password: Option<&str>,
     notification: &str,
 ) -> Result<bool> {
-    let outcome = port.execute_invite_ui(username, password, notification)?;
+    let outcome = port.execute_invite_ui(recipients, password, notification)?;
     if let Some(failure) = outcome.residency_failure() {
         bail!("邀请 UI 事务未能恢复值守驻留: {failure}");
     }
@@ -397,7 +424,7 @@ mod tests {
 
         fn execute_invite_ui(
             &self,
-            _username: &str,
+            _recipients: &[String],
             _password: Option<&str>,
             notification: &str,
         ) -> Result<InviteUiOutcome> {

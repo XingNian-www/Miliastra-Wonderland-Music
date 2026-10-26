@@ -662,12 +662,36 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         invite: &crate::features::invite::InviteCommand,
     ) -> Result<()> {
-        let request = InviteRequest::new(
+        let mut request = InviteRequest::new(
             invite.username.clone(),
             invite.display_name.clone(),
             invite.seq,
             invite.password.clone(),
         );
+        // 邀请要去好友列表里找**发起人**。外部聊天源的信封主语是纯 UID，
+        // 而好友列表上显示的是昵称/备注，直接拿 UID 搜必然落空
+        // （实机表现：locate_friend / no unique stable friend row）。
+        //
+        // 这里用 UID 反查出可以匹配的名字。之所以是多个：
+        // 自动建的身份把 API 昵称放在 note、随机串放在 nickname，
+        // 手工映射则真名在 nickname——两种来源都得试。
+        if let Some(account) = parsed.account.as_ref() {
+            let names = self
+                .lifecycle
+                .live_configs
+                .identity
+                .friend_row_names_for_account(&account.game, &account.uid);
+            if !names.is_empty() {
+                log::info!("邀请: UID {} 反查到候选名 {:?}", account.uid, names);
+                request.search_names = names;
+            } else {
+                log::warn!(
+                    "邀请: UID {} 未登记任何昵称，只能尝试用信封主语 {:?} 搜索",
+                    account.uid,
+                    invite.username
+                );
+            }
+        }
         let execution = match self.business.business.begin_invite(request)? {
             InviteStart::Duplicate { sequence } => {
                 log::info!("邀请参数 {} 已执行过，跳过", sequence);

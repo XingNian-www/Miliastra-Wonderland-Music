@@ -254,7 +254,11 @@ impl InviteUiOutcome {
 
 pub trait InviteExecutionPort {
     fn is_public_hall(&self) -> Result<bool>;
-    fn notify_friend(&self, username: &str, message: &str) -> bool;
+    /// 拒绝邀请后给发起人发一条说明。
+    ///
+    /// 参数是**候选名**而不是 username：外部源下 username 是纯 UID，
+    /// 拿去搜好友列表必然落空，拒绝通知会永远发不出去。
+    fn notify_friend(&self, recipients: &[String], message: &str) -> bool;
     fn send_hall(&self, message: &str) -> Result<()>;
     fn wait_for_decision(&self) -> Result<InviteDecision>;
     fn execute_invite_ui(
@@ -350,7 +354,7 @@ impl InviteExecution {
             ),
             InviteDecision::Reject => {
                 log::info!("收到邀请拒绝，取消邀请");
-                port.notify_friend(&username, "大厅成员已拒绝邀请");
+                port.notify_friend(&recipients, "大厅成员已拒绝邀请");
                 Ok(false)
             }
         }
@@ -409,7 +413,7 @@ mod tests {
             Ok(self.public_hall)
         }
 
-        fn notify_friend(&self, _username: &str, message: &str) -> bool {
+        fn notify_friend(&self, _recipients: &[String], message: &str) -> bool {
             self.notifications.lock().unwrap().push(message.to_string());
             true
         }

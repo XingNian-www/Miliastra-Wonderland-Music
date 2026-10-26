@@ -2115,7 +2115,27 @@ impl ApplicationRuntime {
     }
 
     fn map_command_actor(&self, mut command: RoutedCommand) -> RoutedCommand {
-        let actor = self.mapped_actor_name(&command.username);
+        // 有账号时按 UID 反查真实名字。
+        //
+        // `username` 在外部聊天源下可能是 UID（私聊容器的 peer 取的是 to_uid，
+        // 也就是收件人＝BOT 自己），拿去当昵称查必然落空、原样返回一串数字，
+        // 于是大厅通告会念出「900000001邀请BOT前往大厅」。
+        // 帐号里的 uid 才是真正的发送者。
+        let actor = match command.account.as_ref() {
+            Some(account) => {
+                let names = self
+                    .lifecycle
+                    .live_configs
+                    .identity
+                    .friend_row_names_for_account(&account.game, &account.uid);
+                // 反查不到时退回原本的昵称路径（OCR 场景 account 为 None，走 else 分支）。
+                names
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| self.mapped_actor_name(&command.username))
+            }
+            None => self.mapped_actor_name(&command.username),
+        };
         match &mut command.command {
             ModuleCommand::Invite(invite) => invite.display_name = actor,
             ModuleCommand::Moderation(moderation) => moderation.requester = actor,

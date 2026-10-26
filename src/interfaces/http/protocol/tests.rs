@@ -5737,3 +5737,35 @@ fn commands_catalog_route_never_mutates_config_even_when_posted_to() {
 
     server.shutdown().expect("shutdown HTTP server");
 }
+
+mod memory_route_tests {
+    use super::{body_route_spec, route_spec};
+
+    /// 回归：记忆接口必须真的挂在路由表上。
+    ///
+    /// 曾经处理器写好了、面板也接好了，但两张路由表都漏了注册，
+    /// 结果线上访问一律 404「未知接口」——单测全绿也发现不了。
+    #[test]
+    fn memory_endpoints_are_registered() {
+        for path in ["/ai/memory/actors", "/ai/memory/actor", "/ai/memory/hall"] {
+            assert!(route_spec(path).is_some(), "GET {path} 未注册");
+        }
+        for path in [
+            "/ai/memory/forget-actor",
+            "/ai/memory/delete-fact",
+            "/ai/memory/forget-hall",
+        ] {
+            assert!(body_route_spec(path).is_some(), "POST {path} 未注册");
+        }
+    }
+
+    /// 只读接口不能声明成 mutating，否则会被写保护拦掉。
+    #[test]
+    fn memory_read_endpoints_are_not_mutating() {
+        for path in ["/ai/memory/actors", "/ai/memory/actor", "/ai/memory/hall"] {
+            let spec = route_spec(path).expect("已注册");
+            assert!(!spec.mutating, "{path} 应为只读");
+            assert!(spec.json, "{path} 应返回 JSON");
+        }
+    }
+}

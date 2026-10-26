@@ -12,8 +12,24 @@ struct DecisionMessageKey {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionScreenLock {
+    /// 真正的空实现：不判「已存在」也不记录「已消费」。
+    ///
+    /// 外部聊天源专用。它的消息没有屏幕坐标（block 是统一哨兵），位置语义
+    /// 完全不成立；而它每条消息只投递一次，重复文本就是用户真的又发了一次
+    /// （例如连续两次 @换一批），不该被当成同一条气泡否决。
+    inert: bool,
     existing_y_positions: HashMap<DecisionMessageKey, i32>,
     consumed_bottoms: HashMap<DecisionMessageKey, i32>,
+}
+
+impl DecisionScreenLock {
+    /// 不做任何位置判定的锁：`accept_once` 恒真。
+    pub(crate) fn inert() -> Self {
+        Self {
+            inert: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl DecisionScreenLock {
@@ -42,6 +58,9 @@ impl DecisionScreenLock {
     }
 
     pub(crate) fn accept_once(&mut self, message: &ChatMessage) -> bool {
+        if self.inert {
+            return true;
+        }
         if self.is_existing(message) || self.has_consumed_record(message) {
             return false;
         }

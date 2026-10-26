@@ -724,6 +724,9 @@ pub(crate) struct CompressionPlan {
     pub(crate) scope: String,
     pub(crate) previous_summary: String,
     pub(crate) records: Vec<String>,
+    /// 这些原文对应的行 id 与所在表：压缩成功后才按它们删除。
+    pub(crate) source_table: &'static str,
+    pub(crate) source_ids: Vec<i64>,
 }
 
 impl AiChatMemory {
@@ -945,10 +948,17 @@ impl AiChatMemory {
 
     /// 清空某人的记忆；返回是否确实删掉了内容。
     pub(crate) fn forget(&self, actor: &str) -> Result<bool> {
+        // 必须连中期摘要一起删：`context()` 会把摘要照常注入提示词，
+        // 只删 facts/turns 时用户要求遗忘之后模型仍然知道他的信息。
+        // `forget_hall` 一直是对的，这里漏了。
         let connection = self.connection()?;
         let facts = connection.execute("DELETE FROM ai_chat_facts WHERE actor = ?1", [actor])?;
         let turns = connection.execute("DELETE FROM ai_chat_turns WHERE actor = ?1", [actor])?;
-        Ok(facts + turns > 0)
+        let summary = connection.execute(
+            "DELETE FROM ai_chat_summaries WHERE scope = ?1",
+            [Self::actor_scope(actor)],
+        )?;
+        Ok(facts + turns + summary > 0)
     }
 
     /// 记录大厅里的一句话（所有人在大厅说的，全局共享）。
@@ -1036,7 +1046,12 @@ impl AiChatMemory {
         Ok(())
     }
 
-    /// 取出并删除最旧的一批原文，供压缩使用。
+    /// 只读取最旧的一批原文下标与内容，**不删除**。
+    ///
+    /// 删除必须等到摘要成功写回之后（见 `consume_compressed`）。
+    /// 原来这里是「取出即删」：模型调用失败或返回空摘要时，原文已经没了、
+    /// 摘要也没写，那段记忆永久消失——与调用点注释「原文仍在库里，下一轮再试」
+    /// 完全矛盾。
     ///
     /// `table` / `column` 只接受内部常量（不来自外部输入），拼接安全。
     fn take_oldest(
@@ -1045,7 +1060,7 @@ impl AiChatMemory {
         column: &str,
         actor: Option<&str>,
         count: usize,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<(i64, String)>> {
         let connection = self.connection()?;
         let mut out = Vec::new();
         let mut ids = Vec::new();
@@ -1066,10 +1081,23 @@ impl AiChatMemory {
                 out.push(row.get::<_, String>(1)?);
             }
         }
-        for id in ids {
-            connection.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [id])?;
+        Ok(ids.into_iter().zip(out).collect())
+    }
+
+    /// 压缩成功后删除已消费的原文。
+    ///
+    /// 只有摘要确实写回之后才调用：先删后写会在模型失败时永久丢记忆。
+    pub(crate) fn consume_compressed(&self, table: &str, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
         }
-        Ok(out)
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction()?;
+        for id in ids {
+            transaction.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [id])?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
     /// 个人记忆：超预算时算出要压缩哪些原文。
     ///
@@ -1088,16 +1116,20 @@ impl AiChatMemory {
         let previous_summary = self.read_summary(&scope)?.unwrap_or_default();
         // 取「问 + 答」整段：只压问题会把机器人的回答丢掉，
         // 而回答里往往含结论（点歌结果、约定内容），丢了等于记忆缺一半。
-        let records = self.take_oldest(
+        let rows = self.take_oldest(
             "ai_chat_turns",
             "question || ' → ' || answer",
             Some(actor),
             overflow,
         )?;
+        let source_ids = rows.iter().map(|(id, _)| *id).collect();
+        let records = rows.into_iter().map(|(_, text)| text).collect();
         Ok(Some(CompressionPlan {
             scope,
             previous_summary,
             records,
+            source_table: "ai_chat_turns",
+            source_ids,
         }))
     }
 
@@ -1111,16 +1143,20 @@ impl AiChatMemory {
         let scope = Self::hall_scope().to_string();
         let previous_summary = self.read_summary(&scope)?.unwrap_or_default();
         // 带说话人：大厅是多人共享的记忆，压掉名字后「谁说了什么」就没了。
-        let records = self.take_oldest(
+        let rows = self.take_oldest(
             "ai_chat_hall_turns",
             "speaker || '：' || text",
             None,
             overflow,
         )?;
+        let source_ids = rows.iter().map(|(id, _)| *id).collect();
+        let records = rows.into_iter().map(|(_, text)| text).collect();
         Ok(Some(CompressionPlan {
             scope,
             previous_summary,
             records,
+            source_table: "ai_chat_hall_turns",
+            source_ids,
         }))
     }
 
@@ -1129,6 +1165,9 @@ impl AiChatMemory {
     /// **绝不截断摘要正文**：摘要本身就是信息，砍掉尾巴等于丢记忆。
     /// 容量靠下一轮压缩控制——摘要变长意味着下一轮会更早触发重新压缩。
     /// 若模型返回空摘要，保留旧摘要，不能把已有记忆清空。
+    /// 摘要写回成功后才删除已消费的原文。
+    ///
+    /// 顺序是硬要求：先删后写会在模型失败时把那段记忆永久抹掉。
     pub(crate) fn apply_compression(
         &self,
         plan: &CompressionPlan,
@@ -1137,10 +1176,12 @@ impl AiChatMemory {
     ) -> Result<()> {
         let summary = summary.trim();
         if summary.is_empty() {
-            log::warn!("压缩返回空摘要，保留旧摘要 scope={}", plan.scope);
+            // 原文一条都没删，下轮会重新规划。
+            log::warn!("压缩返回空摘要，保留旧摘要与原文 scope={}", plan.scope);
             return Ok(());
         }
-        self.write_summary(&plan.scope, summary, now_ms)
+        self.write_summary(&plan.scope, summary, now_ms)?;
+        self.consume_compressed(plan.source_table, &plan.source_ids)
     }
 
     /// 列出所有有记忆的玩家及其规模（面板用）。
@@ -1435,18 +1476,56 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
     // 把标识做进 {{question}} 本身，任何模板下都成立。
     // 昵称缺失时 asker_prefix 给 [未知]，不会出现空方括号。
     let question = format!("{}:{}", asker_prefix(input.asker), input.question.trim());
-    input
-        .config
-        .answer_prompt
-        .replace("{{keyword}}", &input.config.keyword)
-        .replace("{{question}}", &question)
-        .replace("{{facts}}", &facts)
-        .replace("{{history}}", history)
-        .replace("{{bot_history}}", &bot_history)
-        .replace("{{commands}}", &commands)
-        .replace("{{asker}}", &asker)
-        .replace("{{hall}}", &hall)
-        .replace("{{summary}}", &summary)
+    // 单遍替换：模板里的占位符各自只展开一次。
+    //
+    // 链式 `replace` 会把**已插入的内容**再扫一遍：玩家在提问里写
+    // `{{commands}}` 就会被当成模板展开，把命令清单、自己的事实记忆、
+    // 甚至大厅共享记忆回显进本轮提示词——提示词注入 / 跨玩家内容泄露。
+    let vars = [
+        ("keyword", input.config.keyword.as_str()),
+        ("question", question.as_str()),
+        ("facts", facts.as_str()),
+        ("history", history),
+        ("bot_history", bot_history.as_str()),
+        ("commands", commands.as_str()),
+        ("asker", asker.as_str()),
+        ("hall", hall.as_str()),
+        ("summary", summary.as_str()),
+    ];
+    render_template(&input.config.answer_prompt, &vars, default_answer_prompt())
+}
+
+/// 单遍展开 `{{name}}` 占位符。
+///
+/// 未定义的占位符原样保留（便于用户发现拼错），模板为空时回退到内置默认值——
+/// 与 `response_system_prompt` 对 system_prompt 的处理保持一致。
+fn render_template(template: &str, vars: &[(&str, &str)], fallback: String) -> String {
+    let template = if template.trim().is_empty() {
+        fallback
+    } else {
+        template.to_string()
+    };
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template.as_str();
+    while let Some(start) = rest.find("{{") {
+        let (before, tail) = rest.split_at(start);
+        output.push_str(before);
+        let Some(end) = tail[2..].find("}}").map(|index| index + 2) else {
+            output.push_str(tail);
+            return output;
+        };
+        let name = &tail[2..end];
+        match vars.iter().find(|(key, _)| *key == name) {
+            Some((_, value)) => output.push_str(value),
+            // 未知占位符原样保留，且**不**把它当作模板继续扫描。
+            None => {
+                output.push_str(&tail[..end + 2]);
+            }
+        }
+        rest = &tail[end + 2..];
+    }
+    output.push_str(rest);
+    output
 }
 
 /// 按时间顺序恢复角色化的个人会话，绝不把全局发言冒充该玩家的历史。
@@ -2184,6 +2263,47 @@ mod tests {
         }))
         .expect("旧配置必须仍可解析");
         assert_eq!(config.min_access, AiChatAccess::Everyone);
+    }
+    /// 回归：玩家输入里写占位符不能被二次展开。
+    ///
+    /// 链式 replace 会把已插入的内容再扫一遍，于是提问里的 `{{commands}}`
+    /// 会回显命令清单、`{{summary}}` 会回显个人摘要，属于提示词注入。
+    #[test]
+    fn user_supplied_placeholders_are_not_expanded_again() {
+        let mut config = config();
+        config.answer_prompt = "命令={{commands}} 问题={{question}}".into();
+        let prompt = build_prompt(&PromptInput {
+            config: &config,
+            question: "我想知道 {{commands}} 和 {{summary}}",
+            context: &ChatContext::default(),
+            allowed_commands: &["@点歌".to_string()],
+            asker: "甲",
+            hall: &HallContext::default(),
+        });
+        // 模板里的 {{commands}} 展开一次。
+        assert!(prompt.starts_with("命令=@点歌"), "实际: {prompt}");
+        // 玩家写的那两个原样保留，不再展开成清单/摘要。
+        assert!(
+            prompt.contains("我想知道 {{commands}} 和 {{summary}}"),
+            "玩家输入里的占位符必须原样保留，实际: {prompt}"
+        );
+    }
+
+    /// 模板为空时回退到内置默认值，不能发出空用户消息。
+    #[test]
+    fn empty_answer_prompt_falls_back_to_the_builtin_default() {
+        let mut config = config();
+        config.answer_prompt = "   ".into();
+        let prompt = build_prompt(&PromptInput {
+            config: &config,
+            question: "你好",
+            context: &ChatContext::default(),
+            allowed_commands: &[],
+            asker: "甲",
+            hall: &HallContext::default(),
+        });
+        assert!(prompt.contains("[甲]:你好"), "实际: {prompt}");
+        assert!(prompt.contains("请用中文简短回答"), "应当回退到默认模板");
     }
 }
 

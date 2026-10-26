@@ -16,10 +16,10 @@ fn publish(shared: &ChatTimeline, chat: ChatIdentity, messages: Vec<RecognizedCh
     shared.publish(Instant::now(), chat, messages).unwrap();
 }
 
-/// 回归：外部消息补上「昵称：」前缀后，命令仍能被正确提取。
+/// 回归：外部消息的正文是纯正文，命令必须能直接提取。
 ///
-/// 投递层把正文对齐成 OCR 的屏幕排版（`[甲]：@状态`），命令解析必须仍能
-/// 从 `@` 处截断拿到 `@状态`，否则补前缀就变成了把命令弄坏。
+/// 投递层**不再**把昵称拼进正文（昵称在 sender 字段里），所以命令提取
+/// 只需看正文首字符，不用在任意位置找 `@`/`#`。
 #[test]
 fn external_message_with_sender_prefix_still_yields_the_command() {
     let shared = ChatTimeline::new();
@@ -164,10 +164,10 @@ fn external_reader_uses_sequence_watermark_without_waiting_for_a_frame() {
         )
         .unwrap();
     let received = reader.read_messages().unwrap();
-    // 正文带「昵称：」前缀：投递层已把外部消息对齐成 OCR 的屏幕排版语义。
+    // 正文是纯正文：投递层不再把昵称拼进来，昵称在 sender 字段。
     assert_eq!(
         received.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
-        vec!["甲：@2"],
+        vec!["@2"],
         "只收水位之后的消息：@1(序号3) 是历史，@2(序号7) 才是新决策"
     );
 }
@@ -816,4 +816,46 @@ fn shared_reader_does_not_replay_pending_messages_from_its_fresh_baseline() {
     let messages = reader.read_messages().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].text, "new input");
+}
+
+/// 回归：外部消息正文里的 `@` 不能把闲聊变成命令。
+///
+/// 曾经的实现让投递层把「昵称：」拼进正文，命令提取只好在任意位置找 `@`，
+/// 于是「今天天气不错@某人」被从 `@` 处截断成命令 `@某人` 进入派发。
+/// 现在正文是纯正文，提取只认首字符。
+#[test]
+fn external_chatter_mentioning_at_is_not_truncated_into_a_command() {
+    let shared = ChatTimeline::new();
+    let observations = ChatObservationShared::new();
+    let observation_session = observations.begin_exclusive().unwrap();
+    let scope = crate::observation::chat::ChatScope::hall();
+    let subscriber = shared.subscribe_scoped(scope.clone()).unwrap();
+    let mut reader = ChatDecisionReader {
+        listener_mode: ChatListenerMode::Primary,
+        subscriber,
+        scope,
+        any_conversation: false,
+        settled_conversations: std::collections::HashSet::new(),
+        chat: ChatIdentity::PrimaryHall,
+        baseline_at: Instant::now(),
+        sequence_floor: Some(1),
+        baseline_cursor: None,
+        seen: std::collections::HashSet::new(),
+        screen_lock: DecisionScreenLock::default(),
+        _observation_session: observation_session,
+    };
+    shared
+        .inject_external(
+            Instant::now(),
+            crate::observation::chat::VisualSessionId::new(u64::MAX),
+            "test",
+            vec![external_hall_message(2, "今天天气不错@某人")],
+        )
+        .unwrap();
+    let received = reader.read_messages().unwrap();
+    assert_eq!(
+        received.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+        vec!["今天天气不错@某人"],
+        "正文必须原样交付：不补前缀，也不从 @ 处截断"
+    );
 }

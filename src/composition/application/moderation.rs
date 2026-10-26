@@ -16,7 +16,8 @@ use crate::features::identity::{IdentityAccess, IdentityRole};
 use crate::features::moderation::{
     ModerationCommandPort, ModerationExecutionPort, ModerationPrimaryHold,
     ModerationResultExecution, ModerationResultTask, ModerationService, ModerationStart,
-    ModerationTaskPort, ModerationVotePort, ModerationVoteWork, is_moderation_vote_message,
+    ModerationTaskPort, ModerationVotePort, ModerationVoteWork, VisibleVoteMessage,
+    is_moderation_vote_message,
 };
 use crate::interfaces::chat as command;
 use crate::observation::chat::{
@@ -214,7 +215,7 @@ impl AppModerationVotePort {
         }
     }
 
-    fn read_votes(&mut self) -> Result<Vec<String>> {
+    fn read_votes(&mut self) -> Result<Vec<VisibleVoteMessage>> {
         let mut votes = Vec::new();
         for snapshot in self
             .subscriber
@@ -336,14 +337,10 @@ impl AppModerationVotePort {
                         } else {
                             message.source_sequence > self.baseline_sequence
                         };
-                        // 正文已由投递层统一成 OCR 语义（含「昵称：」前缀），
-                        // 两个来源在这里不再有格式差异。
-                        if !newer || !is_moderation_vote_message(&message.text) {
-                            return false;
-                        }
-                        // 正文已由投递层统一成 OCR 语义（含「昵称：」前缀），
-                        // 两个来源在这里不再有格式差异。
-                        if !is_moderation_vote_message(&message.text) {
+                        // 发送者与正文分开判：正文是纯正文，昵称在 sender 里。
+                        if !newer
+                            || !is_moderation_vote_message(message.sender.as_deref(), &message.text)
+                        {
                             return false;
                         }
                         // 投票资格：**身份映射里有记录时按角色判**，没有记录则退回
@@ -359,6 +356,7 @@ impl AppModerationVotePort {
                         // 已知取舍，需要严格时请配置身份映射。
                         let Some((username, _)) =
                             crate::features::moderation::parse_friend_moderation_vote(
+                                message.sender.as_deref(),
                                 &message.text,
                             )
                         else {
@@ -378,7 +376,10 @@ impl AppModerationVotePort {
                             None => message.message_type == vote_type,
                         }
                     })
-                    .map(|message| message.text),
+                    .map(|message| VisibleVoteMessage {
+                        sender: message.sender,
+                        text: message.text,
+                    }),
             );
         }
         Ok(votes)
@@ -415,12 +416,15 @@ impl ModerationVotePort for AppModerationVotePort {
         !self.last_source_was_external
     }
 
-    fn poll_visible_friend_messages(&mut self) -> Result<Vec<String>> {
+    fn poll_visible_friend_messages(&mut self) -> Result<Vec<VisibleVoteMessage>> {
         let deadline = Instant::now() + self.context.baseline_timeout;
         self.poll_visible_friend_messages_until(deadline)
     }
 
-    fn poll_visible_friend_messages_until(&mut self, deadline: Instant) -> Result<Vec<String>> {
+    fn poll_visible_friend_messages_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Vec<VisibleVoteMessage>> {
         let result = (|| {
             // An unchanged view may be fingerprint-cached by the observer. Request
             // genuine fresh OCR samples for the service's stable-vote threshold.
@@ -769,6 +773,18 @@ mod tests {
     use crate::observation::chat::ChatIdentity;
     use crate::runtime::ui::UiRoutineFailure;
 
+    /// 把投票渲染回「昵称：正文」便于断言。
+    ///
+    /// 正文现在是**纯正文**、昵称在 sender 里；这个渲染同时验证两个字段。
+    fn vote_pairs(votes: &[VisibleVoteMessage]) -> Vec<String> {
+        votes
+            .iter()
+            .map(|vote| match vote.sender.as_deref() {
+                Some(sender) if !sender.is_empty() => format!("{sender}：{}", vote.text),
+                _ => vote.text.clone(),
+            })
+            .collect()
+    }
     fn shared_vote_input(
         text: &str,
         color: &str,
@@ -885,7 +901,12 @@ mod tests {
             .unwrap();
         let votes = port.read_votes().unwrap();
         assert_eq!(votes.len(), 1, "只有映射里的好友能投票，实际 {:?}", votes);
-        assert!(votes[0].contains("甲"), "实际: {:?}", votes);
+        assert_eq!(
+            votes[0].sender.as_deref(),
+            Some("甲"),
+            "应收录甲的票，实际: {:?}",
+            votes
+        );
     }
     #[test]
     fn ocr_votes_still_count_after_external_window_falls_back() {
@@ -1038,7 +1059,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            port.read_votes().unwrap(),
+            vote_pairs(&port.read_votes().unwrap()),
             vec!["[甲]：@同意", "[甲]：@同意"]
         );
     }
@@ -1078,7 +1099,7 @@ mod tests {
             .publish(Instant::now(), ChatIdentity::PrimaryHall, vec![])
             .unwrap();
         assert_eq!(
-            port.poll_visible_friend_messages().unwrap(),
+            vote_pairs(&port.poll_visible_friend_messages().unwrap()),
             vec!["[甲]：@同意", "[甲]：@同意"]
         );
         assert!(port.read_votes().unwrap().is_empty());
@@ -1103,7 +1124,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            port.poll_visible_friend_messages().unwrap(),
+            vote_pairs(&port.poll_visible_friend_messages().unwrap()),
             vec!["[甲]：@同意", "[甲]：@同意"]
         );
         let previous_session = port.baseline.as_ref().unwrap().visual_session;
@@ -1164,7 +1185,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            port.poll_visible_friend_messages().unwrap(),
+            vote_pairs(&port.poll_visible_friend_messages().unwrap()),
             vec!["[乙]：@不同意", "[乙]：@不同意"]
         );
         assert!(port.is_running());
@@ -1214,7 +1235,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            port.read_votes().unwrap(),
+            vote_pairs(&port.read_votes().unwrap()),
             vec!["[甲]：@同意", "[甲]：@同意"]
         );
         assert!(port.is_running());
@@ -1323,7 +1344,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            port.poll_visible_friend_messages().unwrap(),
+            vote_pairs(&port.poll_visible_friend_messages().unwrap()),
             vec!["[甲]：@不同意"]
         );
         assert!(port.is_running());
@@ -1488,7 +1509,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            port.poll_visible_friend_messages().unwrap(),
+            vote_pairs(&port.poll_visible_friend_messages().unwrap()),
             vec!["[甲]：@不同意"]
         );
     }

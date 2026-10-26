@@ -1130,6 +1130,9 @@ struct UiCoordinatorState {
     next_lease_id: u64,
     formal_leases: HashMap<u64, UiFormalOwner>,
     in_flight_scans: usize,
+    /// 每个在途扫描租约的持有线程，用于检测「本线程自己卡住自己」。
+    scan_owners: HashMap<u64, thread::ThreadId>,
+    next_scan_lease_id: u64,
     scan_drainers: usize,
     scan_not_before: Option<Instant>,
 }
@@ -1156,12 +1159,24 @@ impl UiCoordinator {
 
     /// Retain formal ownership and wait for already admitted scans to finish.
     /// Acquire and use this lease on the thread executing the formal task.
-    /// Never acquire it while holding a scan lease on this thread.
+    ///
+    /// **不能在本线程持有扫描租约时调用**：等待条件是「在途扫描归零」，
+    /// 而那份扫描正被本线程自己持有、且本线程已阻塞在这里，条件永远不成立，
+    /// 形成自等待死锁。以前只有一句注释劝告，靠调用方自律；现在显式检测，
+    /// 把「静默卡死」变成「立刻报错并指出原因」。
     pub fn acquire_formal(&self) -> UiFormalLease {
+        let current_thread = thread::current().id();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !state
+                .scan_owners
+                .values()
+                .any(|owner| *owner == current_thread),
+            "acquire_formal 不能在本线程持有扫描租约时调用：等待「在途扫描归零」会自等待死锁，请先 drop 扫描租约"
+        );
         state.scan_not_before = Some(Instant::now());
         let id = state.next_lease_id;
         state.next_lease_id = id.checked_add(1).expect("UI lease IDs exhausted");
@@ -1233,8 +1248,12 @@ impl UiCoordinator {
             return None;
         }
         state.in_flight_scans += 1;
+        let id = state.next_scan_lease_id;
+        state.next_scan_lease_id = id.wrapping_add(1);
+        state.scan_owners.insert(id, thread::current().id());
         Some(UiScanLease {
             coordinator: self.clone(),
+            id,
             not_before: state.scan_not_before,
         })
     }
@@ -1299,6 +1318,7 @@ impl Drop for UiScanPermit {
 #[must_use = "keep the scan lease alive through all scan UI work"]
 pub struct UiScanLease {
     coordinator: UiCoordinator,
+    id: u64,
     not_before: Option<Instant>,
 }
 
@@ -1317,6 +1337,7 @@ impl Drop for UiScanLease {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.scan_owners.remove(&self.id);
         state.in_flight_scans -= 1;
         if state.in_flight_scans == 0 {
             self.coordinator.scans_drained.notify_all();
@@ -3519,5 +3540,18 @@ mod tests {
         assert!(report.timed_out());
         assert!(report.detached());
         let _ = release_sender.send(());
+    }
+    /// 回归：本线程持扫描租约时取正式租约必须立刻报错，而不是自等待死锁。
+    ///
+    /// 等待条件是「在途扫描归零」，而那份扫描正被本线程持有、本线程又阻塞在这里，
+    /// 条件永远不成立。以前只有注释劝告，误用会表现为整个 UI 静默卡死。
+    #[test]
+    #[should_panic(expected = "自等待死锁")]
+    fn acquiring_a_formal_lease_while_holding_a_scan_lease_fails_fast() {
+        let coordinator = UiCoordinator::new();
+        let _scan = coordinator
+            .try_acquire_scan()
+            .expect("空闲时应能取到扫描租约");
+        let _formal = coordinator.acquire_formal();
     }
 }

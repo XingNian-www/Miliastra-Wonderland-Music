@@ -1785,6 +1785,7 @@ impl ApplicationRuntime {
                                 id: message.id,
                                 is_new,
                                 message: ChatMessage {
+                                    sender: message.sender,
                                     text: message.text,
                                     block: message.block,
                                     message_type: message.message_type,
@@ -1913,6 +1914,7 @@ impl ApplicationRuntime {
                             message_type: message.message_type.clone(),
                             block: message.block,
                             text: message.text.clone(),
+                            sender: message.sender.clone(),
                         };
                         // 外部源昵称可能缺失但 UID 必有：AI 触发要用它兜底。
                         let ai_account = message.account.clone();
@@ -2213,8 +2215,13 @@ impl ApplicationRuntime {
                 message_text: Some(message.text.clone()),
                 lock_anchor: Some(lock_anchor_for(&observed.id, message.block.y)),
             };
-            let envelope =
-                command::parse_command_envelope(&message.text, &message.message_type, observation);
+            // 正文已由扫描层切成纯正文，昵称在 message.sender 里。
+            let envelope = command::parse_command_envelope(
+                &message.text,
+                &message.message_type,
+                message.sender.as_deref(),
+                observation,
+            );
             let routed = envelope
                 .as_ref()
                 .and_then(|envelope| command_router.route(envelope, active_entertainment));
@@ -2225,8 +2232,8 @@ impl ApplicationRuntime {
                 self.enqueue_ai_chat_keyword(
                     &observed.id,
                     &message,
-                    // 一级大厅 OCR 没有独立发送者列，昵称仍在正文行首。
-                    None,
+                    // 昵称已由扫描层从正文剥出。
+                    message.sender.as_deref(),
                     None,
                     captured_at,
                     lock_anchor_for(&observed.id, message.block.y),
@@ -3577,6 +3584,7 @@ mod tests {
                 message_type: "blue".to_string(),
                 block: Rect::new(0, sequence as i32 * 20, 10, 10),
                 text: text.to_string(),
+                sender: None,
             },
             is_new,
         }
@@ -3634,6 +3642,7 @@ mod tests {
                 is_new: true,
                 message: ChatMessage {
                     text: message.text.clone(),
+                    sender: message.sender.clone(),
                     message_type: "blue".into(),
                     block: message.block,
                 },
@@ -3641,6 +3650,7 @@ mod tests {
             let envelope = crate::interfaces::chat::parse_command_envelope(
                 &message.text,
                 "blue",
+                None,
                 CommandObservation::default(),
             )
             .unwrap();
@@ -3675,6 +3685,7 @@ mod tests {
                 let envelope = crate::interfaces::chat::parse_command_envelope(
                     &message.text,
                     "blue",
+                    message.sender.as_deref(),
                     CommandObservation {
                         message_id: Some(message.id.clone()),
                         message_text: Some(message.text.clone()),
@@ -3789,6 +3800,7 @@ mod tests {
             is_new: message.is_new,
             message: ChatMessage {
                 text: message.text.clone(),
+                sender: message.sender.clone(),
                 message_type: "blue".into(),
                 block: message.block,
             },

@@ -325,3 +325,45 @@ mod tests {
         assert_eq!(messages.concat(), long);
     }
 }
+
+/// 把一行聊天文本切成「发送者 + 正文」。
+///
+/// 一级/二级大厅的 OCR 文本本身带昵称前缀（`[昵称]:内容`、`昵称：内容`），
+/// 消息结构里**没有**独立的 sender 字段，因此任何需要昵称的消费者都要走这里，
+/// 不要各自再写一套切分规则（全角冒号、方括号、昵称里的标点都要一致）。
+///
+/// 拆不开就返回 `None`：调用方必须把「拿不到发送者」当作 Unknown 处理，
+/// 不能编造身份去授权或记账。
+///
+/// 放在 `text` 而不是 `interfaces`：OCR 扫描层（`observation`）也要用它把
+/// 昵称从正文里剥出来，而 `observation` 不允许依赖 `interfaces`。
+pub(crate) fn split_sender_line<'a>(
+    text: &'a str,
+    message_type: &str,
+) -> Option<(String, &'a str)> {
+    if message_type == "pink" || text.trim_start().starts_with(['[', '【']) {
+        return extract_bracket_sender(text);
+    }
+    let separator_index = text.find(['：', ':', ']', '】'])?;
+    let separator_len = text[separator_index..].chars().next()?.len_utf8();
+    Some((
+        text[..separator_index].trim().to_string(),
+        &text[separator_index + separator_len..],
+    ))
+}
+
+fn extract_bracket_sender(text: &str) -> Option<(String, &str)> {
+    let (start, open) = text
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '[' | '【'))?;
+    let close = if open == '[' { ']' } else { '】' };
+    let name_start = start + open.len_utf8();
+    let end = name_start + text[name_start..].find(close)?;
+    let username = text[name_start..end].trim();
+    if username.is_empty() {
+        None
+    } else {
+        // Split after the closing bracket so punctuation inside a nickname is preserved.
+        Some((username.to_string(), &text[end + close.len_utf8()..]))
+    }
+}

@@ -59,10 +59,11 @@ fn playlist_decision_envelope(
             observation,
         )
     } else {
-        // Primary OCR includes the sender in the same text, as in the ordinary listener.
+        // 一级 OCR 的正文已由扫描层切成纯正文，昵称在 sender 字段。
         crate::interfaces::chat::parse_command_envelope(
             &message.text,
             &message.message_type,
+            message.sender.as_deref(),
             observation,
         )
     }
@@ -131,6 +132,7 @@ impl ChatDecisionReader {
             message_type: message.message_type.clone(),
             block: message.block,
             text: message.text.clone(),
+            sender: message.sender.clone(),
         };
         if !self.accept_once(&chat_message) {
             return Ok(false);

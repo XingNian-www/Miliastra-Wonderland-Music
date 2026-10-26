@@ -1370,6 +1370,7 @@ impl ChatDecisionReader {
                 messages.push(ChatMessage {
                     message_type: message.message_type,
                     block: message.block,
+                    sender: message.sender,
                     text: message.text,
                 });
             }

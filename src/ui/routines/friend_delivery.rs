@@ -792,8 +792,9 @@ fn deliver_remaining_messages(
     recipient_index: usize,
     recipient_count: usize,
 ) -> std::result::Result<(), DeliveryAttemptFailure> {
-    open_friend_conversation(context, ocr, config, &delivery.recipient)
-        .map_err(safe_attempt_failure)?;
+    // 好友投递的收件人来自配置/流程，本就是可用于匹配的名字（单候选）。
+    let recipients = [delivery.recipient.clone()];
+    open_friend_conversation(context, ocr, config, &recipients).map_err(safe_attempt_failure)?;
 
     for (message_index, (message, status)) in delivery
         .messages
@@ -834,10 +835,10 @@ pub(super) fn open_friend_conversation(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
-    recipient: &str,
+    recipients: &[String],
 ) -> std::result::Result<(), UiRoutineFailure> {
     ensure_secondary_chat(context, config)?;
-    let point = locate_stable_friend_row(context, ocr, config, recipient)?;
+    let point = locate_stable_friend_row(context, ocr, config, recipients)?;
     context
         .device()
         .click_point(point.x, point.y)
@@ -848,7 +849,7 @@ pub(super) fn open_friend_conversation(
         "select_friend",
         InputCertainty::AfterInputUnknown,
     )?;
-    confirm_friend_conversation(context, ocr, config, recipient, point)
+    confirm_friend_conversation(context, ocr, config, recipients, point)
 }
 
 pub(super) fn send_current_chat_message(
@@ -1150,11 +1151,11 @@ fn locate_stable_friend_row(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
-    recipient: &str,
+    recipients: &[String],
 ) -> std::result::Result<Point, UiRoutineFailure> {
     let mut pages = Vec::<ChangeFingerprint>::new();
     for drag_index in 0..=MAX_FRIEND_LIST_DRAGS {
-        match search_current_friend_page(context, ocr, config, recipient)? {
+        match search_current_friend_page(context, ocr, config, recipients)? {
             PageSearch::Found(point) => return Ok(point),
             PageSearch::Missing => {}
         }
@@ -1184,7 +1185,7 @@ fn locate_stable_friend_row(
         wait_friend_list_stable(context, config)?;
     }
     if config.fuzzy_friend_match {
-        return search_top_friend_candidate(context, ocr, config, recipient);
+        return search_top_friend_candidate(context, ocr, config, recipients);
     }
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
@@ -1197,7 +1198,7 @@ fn search_top_friend_candidate(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
-    recipient: &str,
+    recipients: &[String],
 ) -> std::result::Result<Point, UiRoutineFailure> {
     let (from, to) = friend_list_drag_points(config.friend_list_region);
     context
@@ -1212,9 +1213,17 @@ fn search_top_friend_candidate(
         InputCertainty::AfterInputUnknown,
     )?;
     let rows = ocr_friend_rows(ocr, &image, config.friend_list_region)?;
+    // 多候选：每个候选名各自打分，取所有候选里的最高分。
+    let targets = normalize_friend_targets(recipients);
     let mut candidates = rows
         .into_iter()
-        .map(|row| (score_friend_candidate(recipient, &row.text), row))
+        .map(|row| {
+            let score = targets
+                .iter()
+                .map(|target| score_friend_candidate(target, &row.text))
+                .fold(0.0_f32, f32::max);
+            (score, row)
+        })
         .filter(|(score, _)| *score >= FUZZY_FRIEND_MIN_SCORE)
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -1307,18 +1316,33 @@ pub(super) fn current_hall_restore_drag_points(region: Rect) -> (Point, Point) {
     (top, bottom)
 }
 
+/// 归一化一组候选名：去空、去重，顺序保留。
+///
+/// 归一化必须与 `matching_text_rows` 里对 OCR 行做的处理一致，
+/// 否则候选与识别结果永远不相等。
+fn normalize_friend_targets(targets: &[String]) -> Vec<String> {
+    let mut normalized: Vec<String> = Vec::with_capacity(targets.len());
+    for target in targets {
+        let value = normalize_lock_text(target);
+        if value.is_empty() || normalized.iter().any(|existing| existing == &value) {
+            continue;
+        }
+        normalized.push(value);
+    }
+    normalized
+}
 fn search_current_friend_page(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
-    recipient: &str,
+    targets: &[String],
 ) -> std::result::Result<PageSearch, UiRoutineFailure> {
-    let target = normalize_lock_text(recipient);
-    if target.is_empty() {
+    let targets = normalize_friend_targets(targets);
+    if targets.is_empty() {
         return Err(UiRoutineFailure::new(
             InputCertainty::ConfirmedFailure,
             "validate_friend_name",
-            "normalized friend name is empty",
+            "no usable friend name to search",
         ));
     }
     let mut stable_y = None;
@@ -1330,7 +1354,7 @@ fn search_current_friend_page(
             "capture_friend_list",
             InputCertainty::AfterInputUnknown,
         )?;
-        let hits = matching_text_rows(ocr, &image, config.friend_list_region, &target)?;
+        let hits = matching_text_rows(ocr, &image, config.friend_list_region, &targets)?;
         match hits.as_slice() {
             [point] => {
                 if stable_y
@@ -1373,11 +1397,11 @@ fn confirm_friend_conversation(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
-    recipient: &str,
+    targets: &[String],
     selected_point: Point,
 ) -> std::result::Result<(), UiRoutineFailure> {
     context.publish_progress(UiRoutineProgressStage::ConfirmingUi);
-    let target = normalize_lock_text(recipient);
+    let targets = normalize_friend_targets(targets);
     let image = capture_normalized(
         context,
         config,
@@ -1385,7 +1409,7 @@ fn confirm_friend_conversation(
         InputCertainty::AfterInputUnknown,
     )?;
     let highlighted = highlighted_row(&image, selected_row_region(config));
-    let matches = matching_text_rows(ocr, &image, config.friend_list_region, &target)?;
+    let matches = matching_text_rows(ocr, &image, config.friend_list_region, &targets)?;
     let fuzzy_selected = config.fuzzy_friend_match
         && matches.is_empty()
         && ocr_friend_rows(ocr, &image, config.friend_list_region)?
@@ -1684,11 +1708,19 @@ fn restore_secondary_hall(
     ))
 }
 
+/// 在一屏好友列表里找**任意一个**候选名，返回所有命中行。
+///
+/// 为什么要多候选：外部聊天源的发起人只有 UID。UID 反查出来可能是「备注」
+/// 也可能是「游戏内昵称」（自动建身份把 API 昵称放 note、随机串放 nickname；
+/// 手工映射反过来），没法预先知道好友列表上显示的是哪一个。两个都试。
+///
+/// 同一屏命中多个**不同**候选时仍返回全部命中，由调用方判歧义——
+/// 悄悄挑一个等于赌运气点错人。
 fn matching_text_rows(
     ocr: &OcrRuntimeHandle,
     image: &DynamicImage,
     region: Rect,
-    normalized_target: &str,
+    normalized_targets: &[String],
 ) -> std::result::Result<Vec<Point>, UiRoutineFailure> {
     let crop = crop_canvas(image, region)
         .map_err(|error| after_input_failure("crop_ocr_confirmation", error))?;
@@ -1699,7 +1731,9 @@ fn matching_text_rows(
         .into_iter()
         .filter_map(|line| {
             let recognized = normalize_lock_text(&line.text);
-            let matched = recognized == normalized_target;
+            let matched = normalized_targets
+                .iter()
+                .any(|target| recognized == *target);
             matched.then(|| {
                 Point::new(
                     region.x + line.bbox.center().x,

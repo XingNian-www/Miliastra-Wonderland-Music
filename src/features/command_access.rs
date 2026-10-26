@@ -85,6 +85,27 @@ pub(crate) fn minimum_floor(id: &str) -> CommandPermission {
         CommandPermission::User
     }
 }
+
+/// 点歌类命令的权限下限。
+///
+/// 不能一律给 User：`@B站点歌` 在命令目录里声明 `authorities: &[Friend]`，
+/// 文案也写着「好友 B站音源点歌」。之前这里短路成 User，声明与实际判据矛盾，
+/// 大厅普通成员可以直接用它点 B 站音源。
+///
+/// 以命令目录的声明为准：只有 Friend 才抬高下限，BOTH 保持 User。
+fn song_minimum_role(id: &str) -> CommandPermission {
+    let restricted_to_friend = super::song_request::command_specs()
+        .iter()
+        .find(|spec| super::song_request::permission_id_for_command_name(spec.name) == Some(id))
+        .is_some_and(|spec| {
+            spec.authorities == &[crate::features::command::CommandAuthority::Friend]
+        });
+    if restricted_to_friend {
+        CommandPermission::Friend
+    } else {
+        CommandPermission::User
+    }
+}
 fn default_policy(id: &str) -> Option<CommandPolicy> {
     // 注意不要再加回 @搜索：该命令已移除，command_access 之外也无人认识它，
     // 留着只会让 validate 接受一份指向不存在命令的配置。
@@ -95,7 +116,7 @@ fn default_policy(id: &str) -> Option<CommandPolicy> {
     {
         return Some(CommandPolicy {
             enabled: true,
-            minimum_role: CommandPermission::User,
+            minimum_role: song_minimum_role(id),
         });
     }
     if id == "custom_workflow" {

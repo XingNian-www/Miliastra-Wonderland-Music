@@ -9,7 +9,7 @@ pub(crate) mod formal_task;
 /// Cross-platform command/login/player/AI facades, re-exported here so Windows call sites keep
 /// the same `http_facade::` path while Linux test builds can use them without `composition`.
 pub(crate) use crate::interfaces::http::facade as http_facade;
-pub(super) mod external_chat;
+pub(crate) mod external_chat;
 mod lifecycle;
 mod listener;
 mod moderation;
@@ -696,6 +696,13 @@ struct FormalTaskBusinessContext {
 struct FormalTaskLifecycleContext {
     config: AppConfig,
     config_store: crate::config::SharedConfigStore,
+    /// 外部聊天源的共享状态。
+    ///
+    /// **必须来自真身**，不能用 ExternalChatState::default()：那是全新的空状态，
+    /// active 恒为 false。决策窗口在 facade 里读不到接管状态就会走 OCR 慢路径，
+    /// 而外部源接管期间观察线程不发布帧——点歌/歌单窗口必然等满 20s 后报
+    /// 「等待共享聊天确认基线超时」。
+    external_chat: crate::composition::application::external_chat::ExternalChatState,
     /// 热更新共享句柄集合：正式任务上下文（facade 重建）与 HTTP 服务共享同一份。
     live_configs: LiveConfigs,
     running: Arc<AtomicBool>,
@@ -789,8 +796,9 @@ impl FormalTaskExecutionContext {
                     console_reply_context: self.lifecycle.console_reply_context.clone(),
                     monitor: self.lifecycle.monitor.clone(),
                     config_store: Some(self.lifecycle.config_store.clone()),
-                    // facade 只用于任务执行，不启动观察线程；接管判定发生在真身上。
-                    external_chat: external_chat::ExternalChatState::default(),
+                    // facade 不启动观察线程，但**命令执行发生在这里**，决策窗口要读
+                    // 接管状态。必须是真身那份（Arc 共享），否则恒为 false。
+                    external_chat: self.lifecycle.external_chat.clone(),
                 },
             },
         }

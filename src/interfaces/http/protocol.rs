@@ -163,6 +163,10 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
         handler: debug_command_route,
     },
     BodyRouteSpec {
+        path: "/debug/simulate-chat",
+        handler: simulate_chat_body_route,
+    },
+    BodyRouteSpec {
         path: "/player/play-track",
         handler: player_play_track_body_route,
     },

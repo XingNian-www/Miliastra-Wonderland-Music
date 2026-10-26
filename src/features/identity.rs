@@ -206,6 +206,35 @@ impl IdentityAccess {
         *self.inner.write().unwrap_or_else(PoisonError::into_inner) = config;
     }
 
+    /// 调试用：幂等登记一个模拟身份。
+    ///
+    /// 只操作 `__sim_` 保留昵称与 990_xxx 段 UID：真实映射不受影响，
+    /// 用户也不会在面板里看到这些条目（面板读的是配置库，这里只改内存）。
+    ///
+    /// 每次调用都要重登是因为配置重载会用库里的值整体覆盖 `IdentityAccess`。
+    pub fn ensure_simulation_mapping(&self, nickname: &str, uid: u32, role: IdentityRole) {
+        let uid = uid.to_string();
+        let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let existing = config.mappings.iter_mut().find(|mapping| {
+            mapping
+                .accounts
+                .iter()
+                .any(|account| account.uid.trim() == uid)
+        });
+        match existing {
+            Some(mapping) => mapping.role = role,
+            None => config.mappings.push(IdentityMapping {
+                nickname: nickname.to_string(),
+                id: Uuid::new_v4(),
+                role,
+                note: "模拟命令（调试）".to_string(),
+                accounts: vec![GameAccount {
+                    game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
+                    uid,
+                }],
+            }),
+        }
+    }
     /// 当前映射表的快照。
     ///
     /// 自动为好友 UID 建身份后需要把它写回配置库；不取快照就没法持久化，

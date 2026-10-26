@@ -708,10 +708,19 @@ impl ApplicationRuntime {
         );
         // 调试沙盒复用与公开 HTTP 完全相同的播放控制入队路径，不另造旁路：
         // 这样"沙盒里能做的"和"API 能做的"永远一致，不会各自漂移。
+        // 模拟聊天注入需要真身的链路句柄：timeline 决定消息进哪条队列，
+        // identity 决定按什么角色授权，external 决定决策窗口走快路径还是 OCR。
+        let simulation_external = self.lifecycle.external_chat.clone();
+        let simulation = http_facade::ChatSimulation {
+            timeline: self.ui.chat_timeline.clone(),
+            identity: self.lifecycle.live_configs.identity.clone(),
+            external_active: Arc::new(move || simulation_external.supplies_hall_messages()),
+        };
         let debug_command_port: Arc<dyn http::HttpCommandPort> =
-            Arc::new(http_facade::ApplicationHttpCommandFacade::new(
+            Arc::new(http_facade::ApplicationHttpCommandFacade::with_simulation(
                 formal_tasks.clone(),
                 self.business.custom_workflow.clone(),
+                simulation,
             ));
         let config_store = self
             .lifecycle
@@ -735,9 +744,17 @@ impl ApplicationRuntime {
             config_store,
             self.lifecycle.live_configs.clone(),
             http::HttpApplicationPorts::new(
-                Arc::new(http_facade::ApplicationHttpCommandFacade::new(
+                Arc::new(http_facade::ApplicationHttpCommandFacade::with_simulation(
                     formal_tasks.clone(),
                     self.business.custom_workflow.clone(),
+                    http_facade::ChatSimulation {
+                        timeline: self.ui.chat_timeline.clone(),
+                        identity: self.lifecycle.live_configs.identity.clone(),
+                        external_active: {
+                            let external = self.lifecycle.external_chat.clone();
+                            Arc::new(move || external.supplies_hall_messages())
+                        },
+                    },
                 )),
                 formal_tasks.clone(),
                 formal_tasks,

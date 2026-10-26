@@ -39,6 +39,22 @@ use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 pub(crate) struct ApplicationHttpCommandFacade {
     tasks: Arc<dyn HttpTaskPort>,
     custom_workflow: CustomWorkflowService,
+    /// 调试用模拟聊天注入所需的链路句柄。
+    ///
+    /// 只有生产装配点会填；测试里为 None，simulate_chat 会明确报错而不是静默无效。
+    simulation: Option<ChatSimulation>,
+}
+
+/// 模拟聊天注入所需的共享句柄。
+///
+/// 只持有下层句柄（observation / features）。「外部源是否在接管」用闭包传入，
+/// 避免 interfaces 反向依赖 composition —— 那个方向由分层策略禁止。
+#[derive(Clone)]
+pub(crate) struct ChatSimulation {
+    pub(crate) timeline: crate::observation::chat::ChatTimeline,
+    pub(crate) identity: crate::features::identity::IdentityAccess,
+    /// 外部源此刻是否在接管。决策窗口要靠它选快路径，模拟时也要如实反映。
+    pub(crate) external_active: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl ApplicationHttpCommandFacade {
@@ -49,6 +65,20 @@ impl ApplicationHttpCommandFacade {
         Self {
             tasks,
             custom_workflow,
+            simulation: None,
+        }
+    }
+
+    /// 生产装配：额外带上模拟聊天所需的链路句柄。
+    pub(crate) fn with_simulation(
+        tasks: Arc<dyn HttpTaskPort>,
+        custom_workflow: CustomWorkflowService,
+        simulation: ChatSimulation,
+    ) -> Self {
+        Self {
+            tasks,
+            custom_workflow,
+            simulation: Some(simulation),
         }
     }
 
@@ -99,6 +129,126 @@ impl ApplicationHttpCommandFacade {
 }
 
 impl HttpCommandPort for ApplicationHttpCommandFacade {
+    /// 调试用：把一条模拟聊天消息注入观察链路，**只入队不等待**。
+    ///
+    /// 不阻塞是刻意的：点歌/歌单这类命令会在后台正式任务里打开决策窗口并等 20s，
+    /// HTTP 请求若跟着等，接口会长时间挂住且无法观察中间状态。这里只负责注入，
+    /// 命令执行与窗口等待都发生在原有线程里，符合真实链路。
+    fn simulate_chat(&self, role: String, text: String) -> Result<String, HttpCommandError> {
+        use miliastra_kernel::chat_source::{
+            ChatChannel, ExternalChatMessage, ExternalSender, GameUid,
+        };
+
+        let Some(simulation) = self.simulation.as_ref() else {
+            return Err(HttpCommandError::internal(
+                "模拟聊天未装配（仅生产运行时可用）",
+            ));
+        };
+
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Err(HttpCommandError {
+                status: 400,
+                message: "text 不能为空".to_string(),
+            });
+        }
+
+        // 每种角色一个固定假身份。用 __sim_ 前缀避免与真实玩家昵称/UID 撞车。
+        let (nickname, uid, identity_role, private) = match role.as_str() {
+            // 大厅普通成员：没有身份映射，权限落到 User。
+            "user" => ("__sim_user__", 990_001u32, None, false),
+            "friend" => (
+                "__sim_friend__",
+                990_002,
+                Some(crate::features::identity::IdentityRole::Friend),
+                false,
+            ),
+            "admin" => (
+                "__sim_admin__",
+                990_003,
+                Some(crate::features::identity::IdentityRole::Admin),
+                false,
+            ),
+            "owner" => (
+                "__sim_owner__",
+                990_004,
+                Some(crate::features::identity::IdentityRole::Owner),
+                false,
+            ),
+            // 私聊走的也是同一套身份判定，只是容器不同。
+            "friend_private" => (
+                "__sim_friend__",
+                990_002,
+                Some(crate::features::identity::IdentityRole::Friend),
+                true,
+            ),
+            "admin_private" => (
+                "__sim_admin__",
+                990_003,
+                Some(crate::features::identity::IdentityRole::Admin),
+                true,
+            ),
+            other => {
+                return Err(HttpCommandError {
+                    status: 400,
+                    message: format!(
+                        "未知角色 {other:?}；可用：user / friend / admin / owner / friend_private / admin_private"
+                    ),
+                });
+            }
+        };
+
+        // 幂等登记假身份。配置重载会用库里的值覆盖 IdentityAccess，
+        // 所以每次调用都要补一次——只碰 __sim_ 保留名，不影响真实映射。
+        if let Some(role) = identity_role {
+            simulation
+                .identity
+                .ensure_simulation_mapping(nickname, uid, role);
+        }
+
+        let channel = if private {
+            ChatChannel::new(ChatChannel::PRIVATE)
+        } else {
+            ChatChannel::current_hall()
+        };
+
+        // 序号只需在同一来源内单调，用于去重与命令锁锚点。
+        static SIM_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let sequence = SIM_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let message = ExternalChatMessage {
+            sequence,
+            sent_at: None,
+            channel,
+            hall_id: None,
+            sender: ExternalSender::new(Some(nickname.to_string()), Some(GameUid::from_u32(uid))),
+            // 私聊必须有接收者，否则 scope 推导失败、消息会被整条丢弃。
+            to_uid: private.then(|| GameUid::from_u32(990_999)),
+            text: text.clone(),
+        };
+
+        let accepted = simulation
+            .timeline
+            .inject_external(
+                std::time::Instant::now(),
+                crate::observation::chat::VisualSessionId::new(u64::MAX),
+                "simulate",
+                vec![message],
+            )
+            .map_err(internal_command_error)?;
+
+        Ok(json!({
+            "ok": true,
+            "injected": accepted.len(),
+            "role": role,
+            "nickname": nickname,
+            "uid": uid,
+            "channel": if private { "private" } else { "current_hall" },
+            "text": text,
+            "note": "已注入观察链路；命令在后台任务里执行，本请求不等待决策窗口",
+        })
+        .to_string())
+    }
     fn playback_control(&self, command: PlaybackCommand) -> Result<String, HttpCommandError> {
         let (raw, matched) = match &command {
             PlaybackCommand::Resume => ("继续".to_string(), "继续"),

@@ -97,11 +97,25 @@ impl ApplicationRuntime {
         }
     }
 
-    fn notify_friend_invite_decision(&self, username: &str, message: &str) -> bool {
-        match self.send_friend_message(username, message) {
-            Ok(true) => true,
-            Ok(false) => {
-                log::error!("好友邀请确认回复失败: 未能打开好友聊天 {}", username);
+    fn notify_friend_invite_decision(&self, recipients: &[String], message: &str) -> bool {
+        if recipients.is_empty() {
+            log::error!("好友邀请确认回复失败: 没有可用的收件人名字");
+            return false;
+        }
+        // 收件人主键沿用第一个候选，其余候选随投递一起下发用于搜列表。
+        let outcome =
+            self.send_friend_delivery_batch(&[FriendMessage::new(recipients[0].as_str(), message)
+                .with_search_names(recipients.iter().cloned())]);
+        match outcome {
+            Ok(FriendBatchOutcome::Complete) => true,
+            Ok(FriendBatchOutcome::Failed { failure, .. })
+                if failure.kind() == FriendBatchFailureKind::ConfirmedUnsent =>
+            {
+                log::error!("好友邀请确认回复失败: 未能打开好友聊天 {recipients:?}");
+                false
+            }
+            Ok(FriendBatchOutcome::Failed { failure, .. }) => {
+                log::error!("好友邀请确认回复失败: {}", failure.reason());
                 false
             }
             Err(error) => {
@@ -176,6 +190,8 @@ impl ApplicationRuntime {
             super::UiResidency::SecondaryCurrentHall => UiResidencyTarget::SecondaryCurrentHall,
         };
         let mut grouped = Vec::<(String, Vec<String>)>::new();
+        // 与 grouped 一一对应的候选名（搜好友列表用）。
+        let mut grouped_search_names = Vec::<Vec<String>>::new();
         let mut raw_grouped = Vec::<(String, Vec<String>)>::new();
         for message in messages {
             let display_message = self
@@ -184,12 +200,14 @@ impl ApplicationRuntime {
                 .identity
                 .replace_display_names(message.message());
             let display_message = fit_chat_message(&display_message);
+            let search_names = message.search_names().to_vec();
             if let Some((recipient, items)) = grouped.last_mut()
                 && recipient == message.recipient()
             {
                 items.push(display_message);
             } else {
                 grouped.push((message.recipient().to_string(), vec![display_message]));
+                grouped_search_names.push(search_names);
             }
             if let Some((recipient, items)) = raw_grouped.last_mut()
                 && recipient == message.recipient()
@@ -205,7 +223,10 @@ impl ApplicationRuntime {
         let request = SendFriendDeliveries::new(
             grouped
                 .into_iter()
-                .map(|(recipient, messages)| FriendDelivery::new(recipient, messages))
+                .zip(grouped_search_names)
+                .map(|((recipient, messages), names)| {
+                    FriendDelivery::new(recipient, messages).with_search_names(names)
+                })
                 .collect(),
             residency,
         );
@@ -415,8 +436,8 @@ impl InviteExecutionPort for ApplicationRuntime {
         self.check_public_hall()
     }
 
-    fn notify_friend(&self, username: &str, message: &str) -> bool {
-        self.notify_friend_invite_decision(username, message)
+    fn notify_friend(&self, recipients: &[String], message: &str) -> bool {
+        self.notify_friend_invite_decision(recipients, message)
     }
 
     fn send_hall(&self, message: &str) -> Result<()> {

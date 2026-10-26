@@ -262,6 +262,8 @@ enum ActiveSchedulerWork {
         id: u64,
         label: String,
         cancellation: FormalTaskCancellationToken,
+        /// 与 enqueue 去重共用：执行中的任务也必须能被同键提交挡住。
+        dedup_key: Option<FormalTaskDedupKey>,
     },
     External(SchedulerLaneLease),
     Diagnostic {
@@ -506,10 +508,20 @@ impl FormalScheduler {
                 "正式任务运行时正在关闭，不能再接收任务".to_string(),
             ));
         }
+        // 去重必须同时覆盖**排队中**与**正在执行**的任务。
+        //
+        // 原来只扫 `queued`：任务被 take_next 取走进入 running 后，
+        // 同一 dedup_key 的再次提交既不算 Duplicate 也过得了
+        // `contains_dedup_key`，会重新入队并在前一个任务结束后**再执行一遍**
+        // ——点歌/切歌/审核结果这类有副作用的操作会重复生效。
         if submission.dedup_key.as_ref().is_some_and(|key| {
             self.queued
                 .iter()
                 .any(|task| task.dedup_key.as_ref() == Some(key))
+                || self.active.as_ref().is_some_and(|active| {
+                    matches!(active, ActiveSchedulerWork::Formal { dedup_key, .. }
+                        if dedup_key.as_ref() == Some(key))
+                })
         }) {
             return Ok(FormalTaskEnqueueOutcome::Duplicate);
         }
@@ -587,6 +599,13 @@ impl FormalScheduler {
         self.dropped_formal_statuses
     }
 
+    /// 是否已有**排队中**的同键任务。
+    ///
+    /// 刻意不看执行中的任务：自动出队这类周期性推进任务在执行期间仍需允许
+    /// 后续推进入队，否则长任务会把整条队列饿死（见
+    /// `contains_dedup_key_reports_only_queued_tasks`）。
+    ///
+    /// 防重复执行由 `enqueue` 的 Duplicate 分支负责——那里会把 `active` 也算上。
     pub(crate) fn contains_dedup_key(&self, key: &FormalTaskDedupKey) -> bool {
         self.queued
             .iter()
@@ -602,6 +621,7 @@ impl FormalScheduler {
             id: queued.id,
             label: queued.label.clone(),
             cancellation: queued.cancellation.clone(),
+            dedup_key: queued.dedup_key.clone(),
         });
         self.update_record(queued.id, |record| {
             record.status = "running";

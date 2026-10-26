@@ -662,15 +662,22 @@ impl PlaybackApplication {
         &self,
         port: &mut P,
     ) -> Result<bool> {
-        let active = self.personal_playlist_active();
+        // 一次加锁完成「判定 + 清状态」，再去清队列。
+        //
+        // 原来是 check-then-act：先读 active（锁已释放）、再清队列、最后才 take。
+        // 窗口里 start 可能刚写入新模式并 `refill_personal_playlist_queue` 入队，
+        // 随后的 remove_playlist_auto_items 会把对方刚入队的自动项清掉，
+        // 而模式仍然激活 —— 歌单看起来在跑但没有下一首。
+        //
+        // 顺序也反过来了：先摘掉模式，再清队列，避免中间态「模式还在、队列已空」。
+        let was_active = self
+            .personal_playlist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some();
         port.remove_playlist_auto_items()?;
-        if active {
-            self.personal_playlist
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-        }
-        Ok(active)
+        Ok(was_active)
     }
 
     fn personal_playlist_active(&self) -> bool {
@@ -748,35 +755,50 @@ impl PlaybackApplication {
         port: &mut P,
     ) -> Result<usize> {
         let mut queue = port.playback_queue()?;
-        let mut mode = self
-            .personal_playlist
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(mode) = mode.as_mut() else {
-            return Ok(0);
-        };
-        let max_auto = mode.tracks.len().min(self.config.queue_max_size);
-        let mut added = 0;
-        while queue.len() < self.config.queue_max_size
-            && queue.iter().filter(|item| item.playlist_auto).count() < max_auto
-        {
-            let mut queued_keys = queue
-                .iter()
-                .filter_map(|item| item.track.as_ref().map(|track| track.track_ref.key.clone()))
-                .collect::<HashSet<_>>();
-            if mode.tracks.len() > 1
-                && let Some(last_played) = &mode.last_played_key
-            {
-                queued_keys.insert(last_played.clone());
-            }
-            let Some(track) = mode.next_track_excluding(&queued_keys) else {
-                break;
+        // 先在锁内算出**要补哪些歌**，再出锁逐条入队。
+        //
+        // 原实现在锁内直接调 `port.enqueue_playlist_item` 落盘：
+        // 一把进程级互斥锁跨越磁盘写入，落盘一慢，
+        // playlist_mode_owner / take_personal_playlist_mode /
+        // extend_personal_playlist_tracks 全部被拖住，命令线程跟着停摆。
+        let pending = {
+            let mut mode = self
+                .personal_playlist
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(mode) = mode.as_mut() else {
+                return Ok(0);
             };
-            let item = playlist_queue_item(track);
-            if !port.enqueue_playlist_item(item.clone())? {
+            let max_auto = mode.tracks.len().min(self.config.queue_max_size);
+            let mut pending = Vec::new();
+            while queue.len() + pending.len() < self.config.queue_max_size
+                && queue.iter().filter(|item| item.playlist_auto).count() + pending.len() < max_auto
+            {
+                let mut queued_keys = queue
+                    .iter()
+                    .filter_map(|item| item.track.as_ref().map(|track| track.track_ref.key.clone()))
+                    .collect::<HashSet<_>>();
+                queued_keys.extend(pending.iter().filter_map(|item: &QueueItem| {
+                    item.track.as_ref().map(|track| track.track_ref.key.clone())
+                }));
+                if mode.tracks.len() > 1
+                    && let Some(last_played) = &mode.last_played_key
+                {
+                    queued_keys.insert(last_played.clone());
+                }
+                let Some(track) = mode.next_track_excluding(&queued_keys) else {
+                    break;
+                };
+                pending.push(playlist_queue_item(track));
+            }
+            pending
+        };
+        // 锁外落盘。任一条失败就停手：与原来的 break 语义一致。
+        let mut added = 0;
+        for item in pending {
+            if !port.enqueue_playlist_item(item)? {
                 break;
             }
-            queue.push(item);
             added += 1;
         }
         Ok(added)
@@ -1345,6 +1367,12 @@ impl PlaybackApplication {
                         log::error!("队列项连续失败超限，已跳过: {}", item.keyword);
                         port.remove_playback_queue(QueueRemoval::Id(item.id))?;
                         self.clear_queue_block_failure(item.id);
+                        // 必须记进 playlist_attempted：否则循环顶部 refill 会拿**新 id**
+                        // 把同一首回灌进队列，而失败计数以 id 为键，计数随之归零。
+                        // 整张歌单都被阻断时，consume_queue_inner 会无退避、无终止地热循环。
+                        if item.playlist_auto {
+                            playlist_attempted.insert(playlist_attempt_key(&item));
+                        }
                         continue;
                     }
                     return Ok(None);

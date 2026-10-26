@@ -414,14 +414,20 @@ pub(crate) fn keyword_trigger(
     if sender.is_empty() {
         return KeywordTrigger::Skip(TriggerSkip::EmptySender);
     }
-    // 触发关键词与提问都只看正文：昵称里出现关键词不算触发。
-    let Some(question) = config.match_trigger(body) else {
+    // 触发判定只看正文：昵称里出现关键词不算触发。
+    let Some(rest) = config.match_trigger(body) else {
         return KeywordTrigger::Skip(TriggerSkip::KeywordMiss);
     };
-    let question = question.trim().to_string();
-    if question.is_empty() {
+    // 只剩关键词说明玩家只是在叫名字，没有实际内容。
+    if rest.trim().is_empty() {
         return KeywordTrigger::Skip(TriggerSkip::EmptyQuestion);
     }
+    // **送给模型的是原话，不是剥掉关键词的残句**。
+    //
+    // 剥离会造成语义断层：Contains 模式把「我觉得橘子很好吃」变成
+    // 「我觉得很好吃」，「你叫橘子吗」变成「你叫吗」；前缀模式则让
+    // 「橘子是笨蛋吗」丢掉主语。触发只需要关键词存在，模型需要完整句子。
+    let question = strip_sender_separators(body).trim().to_string();
     if question.chars().count() > MAX_QUESTION_CHARS {
         return KeywordTrigger::Skip(TriggerSkip::QuestionTooLong);
     }
@@ -1714,9 +1720,12 @@ mod tests {
         );
     }
 
-    /// 命中路径：昵称不带关键词，问句是去掉关键词后的正文。
+    /// 命中路径：昵称不带关键词；**正文原样传给模型，不剥关键词**。
+    ///
+    /// 剥掉会造成语义断层：「橘子是笨蛋吗」丢主语、「你叫橘子吗」变成
+    /// 「你叫吗」。触发只需要关键词存在，模型需要完整句子。
     #[test]
-    fn keyword_trigger_returns_sender_and_stripped_question() {
+    fn keyword_trigger_returns_sender_and_the_verbatim_body() {
         let config = config();
         assert_eq!(
             keyword_trigger(
@@ -1727,7 +1736,8 @@ mod tests {
             ),
             KeywordTrigger::Ask {
                 sender: "2#BOT|勿加".to_string(),
-                question: "你是什么模型？".to_string(),
+                // 原话原样：关键词在开头也保留。
+                question: "橘子你是什么模型？".to_string(),
             }
         );
         // 昵称里出现关键词不算触发：只看正文。

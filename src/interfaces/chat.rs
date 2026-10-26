@@ -62,9 +62,14 @@ pub(crate) fn looks_like_command(text: &str) -> bool {
     parse_structured_song_text(text).is_some()
 }
 
+/// 解析成命令信封。
+///
+/// `sender` 由 OCR 扫描层在切分正文时给出；为 `None` 时退回从正文行首切
+/// （合成文本、或只拿到整行文本的旧调用点）。
 pub(crate) fn parse_command_envelope(
     text: &str,
     message_type: &str,
+    sender: Option<&str>,
     observation: CommandObservation,
 ) -> Option<CommandEnvelope> {
     if !matches!(message_type, "blue" | "pink") {
@@ -88,7 +93,10 @@ pub(crate) fn parse_command_envelope(
         );
     }
 
-    let (username, body) = split_sender_line(text, message_type)?;
+    let (username, body) = match sender.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(sender) => (sender.to_string(), text),
+        None => split_sender_line(text, message_type)?,
+    };
     if username.is_empty() {
         return None;
     }
@@ -162,42 +170,8 @@ impl ConsoleCommandIntent {
 
 /// 把一行聊天拆成「发送者昵称」与「正文」。
 ///
-/// 一级/二级大厅的 OCR 文本本身带昵称前缀（`[昵称]:内容`、`昵称：内容`），
-/// 消息结构里**没有**独立的 sender 字段，因此任何需要昵称的消费者都要走这里，
-/// 不要各自再写一套切分规则（全角冒号、方括号、昵称里的标点都要一致）。
-///
-/// 拆不开就返回 `None`：调用方必须把「拿不到发送者」当作 Unknown 处理，
-/// 不能编造身份去授权或记账。
-pub(crate) fn split_sender_line<'a>(
-    text: &'a str,
-    message_type: &str,
-) -> Option<(String, &'a str)> {
-    if message_type == "pink" || text.trim_start().starts_with(['[', '【']) {
-        return extract_bracket_sender(text);
-    }
-    let separator_index = text.find(['：', ':', ']', '】'])?;
-    let separator_len = text[separator_index..].chars().next()?.len_utf8();
-    Some((
-        text[..separator_index].trim().to_string(),
-        &text[separator_index + separator_len..],
-    ))
-}
-
-fn extract_bracket_sender(text: &str) -> Option<(String, &str)> {
-    let (start, open) = text
-        .char_indices()
-        .find(|(_, ch)| matches!(ch, '[' | '【'))?;
-    let close = if open == '[' { ']' } else { '】' };
-    let name_start = start + open.len_utf8();
-    let end = name_start + text[name_start..].find(close)?;
-    let username = text[name_start..end].trim();
-    if username.is_empty() {
-        None
-    } else {
-        // Split after the closing bracket so punctuation inside a nickname is preserved.
-        Some((username.to_string(), &text[end + close.len_utf8()..]))
-    }
-}
+/// 切分「发送者 + 正文」，实现已下沉到 `text`（OCR 扫描层也要用）。
+pub(crate) use crate::text::split_sender_line;
 
 pub fn lock_key(command: &RoutedCommand) -> String {
     let key = command.command.lock_key();
@@ -253,7 +227,8 @@ mod tests {
     use crate::observation::chat::ObservedChatMessageId;
 
     fn parse_text(text: &str, message_type: &str) -> Option<RoutedCommand> {
-        let envelope = parse_command_envelope(text, message_type, CommandObservation::default())?;
+        let envelope =
+            parse_command_envelope(text, message_type, None, CommandObservation::default())?;
         (envelope.prefix() == CommandPrefix::At).then_some(())?;
         ChatCommandRouter::without_custom_workflow().route(&envelope, None)
     }
@@ -263,7 +238,8 @@ mod tests {
         message_type: &str,
         active: Option<EntertainmentKind>,
     ) -> Option<RoutedCommand> {
-        let envelope = parse_command_envelope(text, message_type, CommandObservation::default())?;
+        let envelope =
+            parse_command_envelope(text, message_type, None, CommandObservation::default())?;
         (envelope.prefix() == CommandPrefix::Hash).then_some(())?;
         ChatCommandRouter::without_custom_workflow().route(&envelope, active)
     }
@@ -273,6 +249,7 @@ mod tests {
         let envelope = parse_command_envelope(
             "用户：@点歌 晴天 周杰伦",
             "blue",
+            None,
             CommandObservation::default(),
         )
         .expect("command envelope");
@@ -346,15 +323,20 @@ mod tests {
 
     #[test]
     fn feedback_words_in_free_form_command_arguments_are_preserved() {
-        let envelope =
-            parse_command_envelope("[好友]：@通告 换源", "pink", CommandObservation::default())
-                .expect("free-form command should not be filtered by feedback words");
+        let envelope = parse_command_envelope(
+            "[好友]：@通告 换源",
+            "pink",
+            None,
+            CommandObservation::default(),
+        )
+        .expect("free-form command should not be filtered by feedback words");
 
         assert_eq!(envelope.command_text(), "通告 换源");
         assert!(
             parse_command_envelope(
                 "用户：搜索到:晴天,@确认@跳过@换源",
                 "blue",
+                None,
                 CommandObservation::default(),
             )
             .is_none()

@@ -590,6 +590,13 @@ impl SongRequestExecution<'_> {
         context: &SongRequestContext,
         song: &SongCommand,
     ) -> Result<()> {
+        // 队列已满先于搜索拒绝：满队列不必浪费一次搜索。这是刻意的性能取舍，
+        // 有测试锁定（full_queue_replies_before_searching_for_a_song）。
+        //
+        // 代价：无平台权限且队列已满时，玩家收到「队列已满」而非权限拒绝。
+        // 这不算泄漏（队列状态本就通过 @队列 公开），但确实答非所问；
+        // 真正的权限判定在下面 require_request_source，顺序上无法再前移——
+        // 权限判据依赖已解析出的音源。
         if self.queue_is_full(context)? {
             return Ok(());
         }

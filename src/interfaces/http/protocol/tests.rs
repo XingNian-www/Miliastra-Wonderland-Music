@@ -5449,7 +5449,7 @@ fn song_platform_panel_catalog_and_policy_save_are_independent_and_live() {
         .iter()
         .flat_map(|group| group["commands"].as_array().unwrap())
         .collect();
-    for id in ["@QQ点歌", "@网易点歌", "@酷狗点歌", "@B站点歌", "@AI点歌"] {
+    for id in ["@QQ点歌", "@网易点歌", "@酷狗点歌", "@AI点歌"] {
         let matches: Vec<_> = rows.iter().filter(|row| row["id"] == id).collect();
         assert_eq!(
             matches.len(),
@@ -5459,6 +5459,11 @@ fn song_platform_panel_catalog_and_policy_save_are_independent_and_live() {
         assert_eq!(matches[0]["minimumRole"], "user", "{id}");
         assert_eq!(matches[0]["enabled"], true, "{id}");
     }
+    // `@B站点歌` 在命令目录里声明 authorities: &[Friend]，面板必须如实反映。
+    let bilibili: Vec<_> = rows.iter().filter(|row| row["id"] == "@B站点歌").collect();
+    assert_eq!(bilibili.len(), 1);
+    assert_eq!(bilibili[0]["minimumRole"], "friend");
+    assert_eq!(bilibili[0]["enabled"], true);
     assert!(!rows.iter().any(|row| row["id"] == "@点歌"));
     assert!(!rows.iter().any(|row| {
         row["name"]

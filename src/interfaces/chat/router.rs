@@ -739,11 +739,20 @@ mod tests {
     fn song_platform_permissions_are_independent_and_aliases_cannot_bypass() {
         use crate::features::command_access::*;
         let mut access = CommandAccessConfig::default();
-        for id in ["@QQ点歌", "@网易点歌", "@酷狗点歌", "@B站点歌", "@AI点歌"] {
+        // 其余平台命令对所有人开放；`@B站点歌` 在命令目录里声明 authorities:
+        // &[Friend]，文案也是「好友 B站音源点歌」，下限必须跟随声明。
+        for id in ["@QQ点歌", "@网易点歌", "@酷狗点歌", "@AI点歌"] {
             let policy = catalog_policy(&access, id).unwrap();
             assert!(policy.enabled, "{id}");
             assert_eq!(policy.minimum_role, CommandPermission::User, "{id}");
         }
+        let bilibili = catalog_policy(&access, "@B站点歌").unwrap();
+        assert!(bilibili.enabled);
+        assert_eq!(
+            bilibili.minimum_role,
+            CommandPermission::Friend,
+            "声明仅好友的命令不能被放宽成 User",
+        );
         access.overrides.insert(
             "@网易点歌".into(),
             CommandPolicy {

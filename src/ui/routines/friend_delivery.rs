@@ -47,6 +47,13 @@ pub(crate) enum UiResidencyTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FriendDelivery {
     recipient: String,
+    /// 搜好友列表时可尝试的其他名字（可选）。
+    ///
+    /// 用于只有 UID 的场景：外部聊天源给的身份证是 UID，好友列表上显示的是
+    /// 昵称或备注，拿 UID 搜必然落空。`recipient` 仍是主键（去重/日志/分组都用它），
+    /// 这里只补充「还能拿哪些名字去找」。
+    #[allow(dead_code)]
+    search_names: Vec<String>,
     messages: Vec<String>,
 }
 
@@ -59,12 +66,32 @@ impl FriendDelivery {
     {
         Self {
             recipient: recipient.into(),
+            search_names: Vec::new(),
             messages: messages.into_iter().map(Into::into).collect(),
         }
     }
 
+    /// 追加可搜索的候选名（UID 反查得到）。
+    pub(crate) fn with_search_names<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.search_names = names.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub(crate) fn recipient(&self) -> &str {
         &self.recipient
+    }
+
+    /// 实际拿去搜好友列表的名字：有候选就用候选，否则退回 `recipient`。
+    pub(crate) fn search_recipients(&self) -> Vec<String> {
+        if self.search_names.is_empty() {
+            vec![self.recipient.clone()]
+        } else {
+            self.search_names.clone()
+        }
     }
 
     pub(crate) fn messages(&self) -> &[String] {
@@ -174,6 +201,7 @@ impl SendFriendDeliveriesOutcome {
                     .collect::<Vec<_>>();
                 (!messages.is_empty()).then_some(FriendDelivery {
                     recipient: requested.recipient.clone(),
+                    search_names: requested.search_names.clone(),
                     messages,
                 })
             })
@@ -792,8 +820,8 @@ fn deliver_remaining_messages(
     recipient_index: usize,
     recipient_count: usize,
 ) -> std::result::Result<(), DeliveryAttemptFailure> {
-    // 好友投递的收件人来自配置/流程，本就是可用于匹配的名字（单候选）。
-    let recipients = [delivery.recipient.clone()];
+    // 收件人可能只是 UID（外部源），真正能搜列表的名字在 search_names 里。
+    let recipients = delivery.search_recipients();
     open_friend_conversation(context, ocr, config, &recipients).map_err(safe_attempt_failure)?;
 
     for (message_index, (message, status)) in delivery

@@ -2695,6 +2695,17 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "默认只在消息以关键词开头时触发",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "min_access",
+            "触发权限",
+            FieldKind::Enum(vec![
+                ("everyone".to_string(), "所有人".to_string()),
+                ("friend".to_string(), "好友及以上".to_string()),
+                ("admin".to_string(), "管理员及以上".to_string()),
+                ("owner".to_string(), "仅所有者".to_string()),
+            ]),
+            "谁能让 AI 回应；身份映射里查不到的人，除「所有人」外一律拒绝",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "actor_token_budget",
             "单人近期原文预算",
             int(1_000, 200_000),

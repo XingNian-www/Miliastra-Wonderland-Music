@@ -65,29 +65,64 @@ pub(crate) fn split_configured_lines(text: &str) -> Vec<String> {
     messages
 }
 
-/// 按显示宽度硬切一行，保持字符边界。
+/// 句末标点：优先在这些字符后面断开。
+const STRONG_BREAKS: [char; 9] = ['。', '！', '？', '；', '…', '.', '!', '?', ';'];
+/// 句中停顿：找不到句末标点时退而求其次，至少不切断词。
+const WEAK_BREAKS: [char; 7] = ['，', '、', '：', '—', ',', ':', ' '];
+
+/// 按显示宽度切一行，**优先在标点处断开**。
+///
+/// 原来是无条件按宽度硬切，会把句子从词中间劈开，读起来像断线。
+/// 现在先尽量塞满（贪婪），再回退到最近的标点；实在没有标点才硬切。
 fn wrap_to_chat_width(line: &str) -> Vec<String> {
     if display_width(line) <= MAX_CHAT_WIDTH {
         return vec![line.to_string()];
     }
+    let chars = line.chars().collect::<Vec<_>>();
     let mut chunks = Vec::new();
-    let mut chunk = String::new();
-    let mut width = 0usize;
-    for ch in line.chars() {
-        let next = char_width(ch);
-        if width + next > MAX_CHAT_WIDTH && !chunk.is_empty() {
-            chunks.push(chunk.trim_end().to_string());
-            chunk = String::new();
-            width = 0;
+    let mut start = 0usize;
+    while start < chars.len() {
+        let end = next_break(&chars, start, MAX_CHAT_WIDTH);
+        let chunk = chars[start..end].iter().collect::<String>();
+        let chunk = chunk.trim_end().to_string();
+        if !chunk.is_empty() {
+            chunks.push(chunk);
         }
-        chunk.push(ch);
-        width += next;
-    }
-    if !chunk.trim().is_empty() {
-        chunks.push(chunk.trim_end().to_string());
+        start = end;
     }
     chunks.retain(|item| !item.is_empty());
     chunks
+}
+
+/// 从 `start` 起在 `budget` 显示宽度内尽量多塞，然后回退到最近的标点。
+///
+/// 返回该段的结束下标（不含）。回退下限是半个预算：再往前就切出碎片了。
+fn next_break(chars: &[char], start: usize, budget: usize) -> usize {
+    let mut width = 0usize;
+    let mut end = start;
+    while end < chars.len() {
+        let next = char_width(chars[end]);
+        // 至少要吃下一个字符，否则预算为 0 时会原地打转。
+        if end > start && width + next > budget {
+            break;
+        }
+        width += next;
+        end += 1;
+    }
+    if end >= chars.len() {
+        return chars.len();
+    }
+    let floor = start + ((end - start) / 2).max(1);
+    for set in [&STRONG_BREAKS[..], &WEAK_BREAKS[..]] {
+        let mut index = end;
+        while index > floor {
+            index -= 1;
+            if set.contains(&chars[index]) {
+                return index + 1;
+            }
+        }
+    }
+    end
 }
 
 /// 按聊天宽度适配一条消息：放得下就原样返回，放不下才分段编号。
@@ -138,24 +173,10 @@ fn split_numbered_with_total(label: &str, source: &str, total: usize) -> Vec<Str
             String::new()
         };
         let available = MAX_CHAT_WIDTH.saturating_sub(display_width(&prefix));
-        let mut chunk = String::new();
-        let mut width = 0usize;
-        while offset < chars.len() {
-            let next_width = char_width(chars[offset]);
-            if !chunk.is_empty() && width + next_width > available {
-                break;
-            }
-            if chunk.is_empty() && next_width > available {
-                break;
-            }
-            chunk.push(chars[offset]);
-            width += next_width;
-            offset += 1;
-        }
-        if chunk.is_empty() {
-            chunk.push(chars[offset]);
-            offset += 1;
-        }
+        // 与固定宽度换行同一套规则：先塞满，再回退到最近的标点。
+        let end = next_break(&chars, offset, available);
+        let chunk = chars[offset..end].iter().collect::<String>();
+        offset = end;
         messages.push(format!("{}{}", prefix, chunk));
     }
     messages
@@ -365,5 +386,56 @@ fn extract_bracket_sender(text: &str) -> Option<(String, &str)> {
     } else {
         // Split after the closing bracket so punctuation inside a nickname is preserved.
         Some((username.to_string(), &text[end + close.len_utf8()..]))
+    }
+}
+
+#[cfg(test)]
+mod punctuation_split_tests {
+    use super::*;
+
+    /// 超长文本必须优先在标点处断开，而不是从词中间硬切。
+    #[test]
+    fn long_text_breaks_at_punctuation_instead_of_mid_word() {
+        let line = "这是一个测试句子。".repeat(10);
+        let parts = split_configured_lines(&line);
+        assert!(parts.len() > 1, "必须被切成多段");
+        for part in &parts {
+            assert!(
+                display_width(part) <= MAX_CHAT_WIDTH,
+                "每段都不能超过上限: {part:?}"
+            );
+        }
+        // 除最后一段外都应停在句号后面。
+        let ended = parts.iter().filter(|part| part.ends_with('。')).count();
+        assert!(
+            ended >= parts.len().saturating_sub(1),
+            "应当优先在句号处断开，实际: {parts:?}"
+        );
+    }
+
+    /// 没有任何标点时退回硬切，但必须保持字符边界且不超上限。
+    #[test]
+    fn long_text_without_punctuation_falls_back_to_a_hard_cut() {
+        let line = "字".repeat(120);
+        let parts = split_configured_lines(&line);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(display_width(part) <= MAX_CHAT_WIDTH);
+            assert!(part.chars().all(|ch| ch == '字'), "不能切坏字符");
+        }
+    }
+
+    /// 编号分段同样要按标点断，编号宽度也算进预算。
+    #[test]
+    fn numbered_segments_also_break_at_punctuation() {
+        let message = "第一句内容。第二句内容。第三句内容。第四句内容。第五句内容。第六句内容。第七句内容。第八句内容。";
+        let parts = fit_chat_message("标签", message);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(
+                display_width(part) <= MAX_CHAT_WIDTH,
+                "带编号也不能超上限: {part:?}"
+            );
+        }
     }
 }

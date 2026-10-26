@@ -108,7 +108,10 @@ pub(crate) struct RecognizedChatMessage {
 pub(crate) struct ChatMessage {
     pub(crate) message_type: String,
     pub(crate) block: Rect,
+    /// 纯正文：昵称已由扫描层剥到 `sender`。
     pub(crate) text: String,
+    /// 扫描层切出来的昵称；一级大厅 OCR 与外部源之外可能为 None。
+    pub(crate) sender: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,24 +217,28 @@ pub(crate) fn recognize_prepared_chat(
         )?;
         for text in texts {
             let (marker, block) = &prepared.blocks[text.id];
+            let message_type = marker_type(marker).to_string();
+            let (sender, raw_sender, body) = split_ocr_sender(text.text, &message_type);
             messages.push(RecognizedChatMessage {
-                sender: None,
-                raw_sender: None,
-                message_type: marker_type(marker).to_string(),
+                sender,
+                raw_sender,
+                message_type,
                 block: *block,
-                text: text.text,
+                text: body,
             });
         }
     } else {
         for (marker, block) in &prepared.blocks {
             let crop = crop_canvas(&prepared.chat, *block)?;
             let text = ocr.merged_text(crop, templates.same_line_y_tolerance, priority)?;
+            let message_type = marker_type(marker).to_string();
+            let (sender, raw_sender, body) = split_ocr_sender(text, &message_type);
             messages.push(RecognizedChatMessage {
-                sender: None,
-                raw_sender: None,
-                message_type: marker_type(marker).to_string(),
+                sender,
+                raw_sender,
+                message_type,
                 block: *block,
-                text,
+                text: body,
             });
         }
     }
@@ -609,5 +616,78 @@ mod tests {
         let hits = vec![marker(0, 0, 10, 10), marker(10, 0, 10, 10)];
         assert_eq!(dedupe_chat_marker_hits(hits.clone(), 22, 14).len(), 1);
         assert_eq!(dedupe_chat_marker_hits(hits, 5, 6).len(), 2);
+    }
+}
+
+/// 把 OCR 出的一行切成「发送者 + 纯正文」。
+///
+/// 一级大厅的气泡把「昵称：正文」渲染成一整块，OCR 拿到的是混合文本。
+/// 在这里切一次，下游（命令、投票、AI 触发、锁文本）都能用统一的纯正文语义，
+/// 不必各自再按分隔符猜。
+///
+/// 两类文本**不切**：
+/// - 结构化点歌元数据（`歌曲名…`）没有发送者，切了会把「歌曲名」当成昵称；
+/// - 切不出昵称时原样保留，交给下游按 Unknown 处理。
+fn split_ocr_sender(text: String, message_type: &str) -> (Option<String>, Option<String>, String) {
+    if text.trim_start().starts_with("歌曲名") {
+        return (None, None, text);
+    }
+    let Some((sender, body)) = crate::text::split_sender_line(&text, message_type) else {
+        return (None, None, text);
+    };
+    if sender.trim().is_empty() || sender.starts_with(['@', '＠', '#', '＃']) {
+        return (None, None, text);
+    }
+    // 分隔符本身属于昵称与正文之间，正文从分隔符之后开始。
+    let body = body
+        .trim_start()
+        .trim_start_matches(['：', ':', ' ', '\t', ']', '】'])
+        .trim()
+        .to_string();
+    (Some(sender.clone()), Some(sender), body)
+}
+
+#[cfg(test)]
+mod split_ocr_sender_tests {
+    use super::split_ocr_sender;
+
+    /// 一级大厅 OCR 的「昵称：正文」必须在扫描层就切开。
+    #[test]
+    fn splits_the_sender_out_of_the_primary_hall_line() {
+        let (sender, raw, body) = split_ocr_sender("甲：@状态".to_string(), "blue");
+        assert_eq!(sender.as_deref(), Some("甲"));
+        assert_eq!(raw.as_deref(), Some("甲"));
+        assert_eq!(body, "@状态");
+    }
+
+    #[test]
+    fn splits_bracketed_sender_for_pink_lines() {
+        let (sender, _, body) = split_ocr_sender("[好友]：@同意".to_string(), "pink");
+        assert_eq!(sender.as_deref(), Some("好友"));
+        assert_eq!(body, "@同意");
+    }
+
+    /// 结构化点歌元数据没有发送者：把「歌曲名」当昵称会把整条请求弄坏。
+    #[test]
+    fn never_treats_the_song_metadata_label_as_a_sender() {
+        let (sender, _, body) = split_ocr_sender("歌曲名：晴天".to_string(), "blue");
+        assert_eq!(sender, None);
+        assert_eq!(body, "歌曲名：晴天");
+    }
+
+    /// 切不出昵称时原样保留，交给下游按 Unknown 处理。
+    #[test]
+    fn keeps_lines_without_a_separator_intact() {
+        let (sender, _, body) = split_ocr_sender("普通聊天".to_string(), "blue");
+        assert_eq!(sender, None);
+        assert_eq!(body, "普通聊天");
+    }
+
+    /// 正文本身以命令前缀开头时，不能把命令当成昵称切掉。
+    #[test]
+    fn keeps_a_leading_command_prefix_in_the_body() {
+        let (sender, _, body) = split_ocr_sender("@状态".to_string(), "blue");
+        assert_eq!(sender, None);
+        assert_eq!(body, "@状态");
     }
 }

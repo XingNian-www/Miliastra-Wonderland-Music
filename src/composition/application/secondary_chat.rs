@@ -31,6 +31,7 @@ impl ChatDecisionReader {
                     ChatMessage {
                         message_type: message.message_type,
                         block: message.block,
+                        sender: message.sender,
                         text: message.text,
                     },
                     message.id,
@@ -761,6 +762,7 @@ impl ApplicationRuntime {
                 message_type: message.message_type.clone(),
                 block: message.block,
                 text: message.text.clone(),
+                sender: message.sender.clone(),
             })
             .collect::<Vec<_>>();
         Ok(ChatDecisionReader {

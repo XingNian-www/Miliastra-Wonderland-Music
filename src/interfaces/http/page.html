@@ -1320,7 +1320,7 @@ let aiChatData=null
 let aiChatFields=[]
 let aiChatDirty=false
 const AI_CHAT_GROUPS=[
-  {id:'aiChatTriggerPanel',keys:['enabled','keyword','trigger_mode','cooldown_seconds','allow_commands']},
+  {id:'aiChatTriggerPanel',keys:['enabled','keyword','trigger_mode','min_access','cooldown_seconds','allow_commands']},
   {id:'aiChatMemoryPanel',keys:['actor_token_budget','bot_token_budget']},
   {id:'aiChatPromptPanel',keys:['model','reasoning','max_tokens','system_prompt','answer_prompt','extract_prompt']},
   // {AI回复} 是回复模板里的独立标签，生成参数在 ai_reply.* 下；

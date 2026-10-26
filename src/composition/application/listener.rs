@@ -2400,6 +2400,22 @@ impl ApplicationRuntime {
             split,
         ) {
             crate::features::ai_chat::KeywordTrigger::Ask { sender, question } => {
+                // 权限判定放在触发之后：先确认这句话确实是在叫机器人，
+                // 再判断叫的人有没有资格，避免把普通闲聊记成「越权」。
+                let role = self
+                    .lifecycle
+                    .live_configs
+                    .identity
+                    .role_of_sender(&sender, account);
+                if !config.min_access.allows(role) {
+                    log::info!(
+                        "AI 聊天未触发：需要{}才能触发 sender={} role={:?}",
+                        config.min_access.label(),
+                        sender,
+                        role
+                    );
+                    return Ok(());
+                }
                 (sender, question)
             }
             crate::features::ai_chat::KeywordTrigger::Skip(skip) => {

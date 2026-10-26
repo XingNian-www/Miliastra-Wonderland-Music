@@ -87,6 +87,47 @@ impl TriggerMode {
     }
 }
 
+/// AI 聊天的触发权限档位。
+///
+/// 大厅是公开场合，谁都能看见关键词。默认不限制（保持既有行为），
+/// 需要时可由管理员在配置里收紧到好友/管理员/所有者。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiChatAccess {
+    /// 任何人（默认）。
+    #[default]
+    Everyone,
+    /// 身份映射里登记为好友及以上。
+    Friend,
+    Admin,
+    Owner,
+}
+
+impl AiChatAccess {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Everyone => "所有人",
+            Self::Friend => "好友及以上",
+            Self::Admin => "管理员及以上",
+            Self::Owner => "仅所有者",
+        }
+    }
+
+    /// 该角色能否触发。
+    ///
+    /// `None` 表示身份映射里查不到这个人；除「所有人」外一律拒绝，
+    /// 否则任何人改个昵称就能绕过限制。
+    pub(crate) fn allows(self, role: Option<crate::features::identity::IdentityRole>) -> bool {
+        use crate::features::identity::IdentityRole;
+        match self {
+            Self::Everyone => true,
+            Self::Friend => role >= Some(IdentityRole::Friend),
+            Self::Admin => role >= Some(IdentityRole::Admin),
+            Self::Owner => role >= Some(IdentityRole::Owner),
+        }
+    }
+}
+
 /// `ai_chat` 配置段。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +137,9 @@ pub struct AiChatConfig {
     pub keyword: String,
     #[serde(default)]
     pub trigger_mode: TriggerMode,
+    /// 谁能触发 AI 聊天。默认所有人（保持既有行为）；可收紧到好友/管理员/所有者。
+    #[serde(default)]
+    pub min_access: AiChatAccess,
     /// 遗留配置兼容字段；当前没有被动记录外部机器人发言的路径。
     #[serde(default, rename = "bot_name", skip_serializing)]
     pub _legacy_bot_name: String,
@@ -275,6 +319,7 @@ impl Default for AiChatConfig {
             enabled: false,
             keyword: "橘子".to_string(),
             trigger_mode: TriggerMode::default(),
+            min_access: AiChatAccess::default(),
             _legacy_bot_name: String::new(),
             actor_token_budget: ACTOR_TOKEN_BUDGET,
             actor_summary_budget: ACTOR_SUMMARY_BUDGET,
@@ -2103,6 +2148,42 @@ mod tests {
                 "执行协议必须包含 {needle}，实际: {prompt}"
             );
         }
+    }
+    /// 权限档位必须真的挡住不该触发的人。
+    #[test]
+    fn access_levels_gate_the_trigger_by_role() {
+        use crate::features::identity::IdentityRole;
+        // 默认不限制：连身份映射里查不到的人也能触发，保持既有行为。
+        assert!(AiChatAccess::Everyone.allows(None));
+        assert!(AiChatAccess::Everyone.allows(Some(IdentityRole::Friend)));
+
+        // 收紧后，查不到身份的人一律拒绝——否则改个昵称就绕过限制。
+        for access in [
+            AiChatAccess::Friend,
+            AiChatAccess::Admin,
+            AiChatAccess::Owner,
+        ] {
+            assert!(!access.allows(None), "{access:?} 不该放过未登记的人");
+        }
+
+        assert!(AiChatAccess::Friend.allows(Some(IdentityRole::Friend)));
+        assert!(AiChatAccess::Friend.allows(Some(IdentityRole::Admin)));
+        assert!(!AiChatAccess::Admin.allows(Some(IdentityRole::Friend)));
+        assert!(AiChatAccess::Admin.allows(Some(IdentityRole::Admin)));
+        assert!(AiChatAccess::Admin.allows(Some(IdentityRole::Owner)));
+        assert!(!AiChatAccess::Owner.allows(Some(IdentityRole::Admin)));
+        assert!(AiChatAccess::Owner.allows(Some(IdentityRole::Owner)));
+    }
+
+    /// 新字段必须能被旧配置反序列化（缺省即所有人，不改变行为）。
+    #[test]
+    fn min_access_defaults_to_everyone_for_legacy_configs() {
+        let config: AiChatConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "keyword": "橘子"
+        }))
+        .expect("旧配置必须仍可解析");
+        assert_eq!(config.min_access, AiChatAccess::Everyone);
     }
 }
 

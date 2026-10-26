@@ -166,12 +166,33 @@ pub(super) fn ai_memory_hall_route(
     state.application.ai.memory_hall().map_err(ai_route_error)
 }
 
+/// 记忆接口的请求体。
+///
+/// 用 JSON body 而不是 query：记忆条目是任意自然语言，URL 编码容易在特殊
+/// 字符上出错，而且 POST 的语义本来就该带 body。
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MemoryTarget {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    fact: String,
+}
+
+fn memory_target(body: &[u8]) -> std::result::Result<MemoryTarget, AppError> {
+    if body.is_empty() {
+        return Ok(MemoryTarget::default());
+    }
+    parse_json_body(body, "记忆参数")
+}
+
 /// POST /ai/memory/forget-actor —— 删除某个玩家的记忆。
 pub(super) fn ai_memory_forget_actor_route(
-    query: &[(String, String)],
+    body: &[u8],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let actor = normalize_required_text(query_value(query, "name"), "name")?;
+    let target = memory_target(body)?;
+    let actor = normalize_required_text(Some(target.name.as_str()), "name")?;
     state
         .application
         .ai
@@ -181,11 +202,12 @@ pub(super) fn ai_memory_forget_actor_route(
 
 /// POST /ai/memory/delete-fact —— 删除某条事实。
 pub(super) fn ai_memory_delete_fact_route(
-    query: &[(String, String)],
+    body: &[u8],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let actor = normalize_required_text(query_value(query, "name"), "name")?;
-    let fact = normalize_required_text(query_value(query, "fact"), "fact")?;
+    let target = memory_target(body)?;
+    let actor = normalize_required_text(Some(target.name.as_str()), "name")?;
+    let fact = normalize_required_text(Some(target.fact.as_str()), "fact")?;
     state
         .application
         .ai
@@ -195,11 +217,12 @@ pub(super) fn ai_memory_delete_fact_route(
 
 /// POST /ai/memory/forget-hall —— 清空大厅共享记忆。
 pub(super) fn ai_memory_forget_hall_route(
-    _query: &[(String, String)],
+    _body: &[u8],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     state.application.ai.forget_hall().map_err(ai_route_error)
 }
+
 fn ai_route_error(error: anyhow::Error) -> AppError {
     // 内部错误(500)只记日志,响应用通用文案,避免错误链泄漏内部路径;
     // 仅用户输入类错误(400)保留原文。

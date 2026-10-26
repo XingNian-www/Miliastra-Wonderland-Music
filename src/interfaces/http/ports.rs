@@ -108,6 +108,18 @@ pub(crate) trait HttpCommandPort: Send + Sync {
     fn set_operator_commands(&self, enabled: bool) -> Result<String, HttpCommandError>;
     fn set_idle_exit(&self, minutes: u32) -> Result<String, HttpCommandError>;
     fn clear_idle_exit(&self) -> Result<String, HttpCommandError>;
+    /// 调试用：模拟一条聊天消息注入观察链路，按指定身份走完整路由与权限判定。
+    ///
+    /// role 决定消息的 authority 与发送者身份：
+    /// - `user`：大厅普通成员（blue，无身份映射）
+    /// - `friend`：大厅好友（blue，身份映射为 Friend）
+    /// - `admin`：大厅管理员（blue，身份映射为 Admin）
+    /// - `owner`：大厅主人（blue，身份映射为 Owner）
+    /// - `friend_private`：好友私聊（pink，Friend）
+    /// - `admin_private`：管理员私聊（pink，Admin）
+    ///
+    /// 只注入聊天链路，不点鼠标、不截图。
+    fn simulate_chat(&self, role: String, text: String) -> Result<String, HttpCommandError>;
     fn list_workflows(&self) -> Result<String, HttpCommandError>;
     fn run_workflow(&self, name: String, args: String) -> Result<String, HttpCommandError>;
 }

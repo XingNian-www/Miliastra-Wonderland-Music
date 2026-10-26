@@ -19,6 +19,14 @@ use miliastra_kernel::chat_source::{ChatSource, ChatSourceEvent, ExternalChatMes
 /// 断线超过这个时长就不再补拉：一次性重放大量命令比丢几条更糟。
 const MAX_BACKLOG_IDLE_MS: u64 = 60_000;
 
+/// 昵称补查"在途"标记的有效期。超过它还停在在途状态，说明补查线程卡住或
+/// 已退出，允许这个 UID 重新排队，避免它永久不再补查。
+const NAME_LOOKUP_IN_FLIGHT_MS: u64 = 10_000;
+
+/// 昵称补查失败后的冷却。拿不到名字通常意味着服务端也没有，
+/// 短期内反复查既没有收益，又会让后台线程空转。
+const NAME_LOOKUP_RETRY_MS: u64 = 30_000;
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -37,6 +45,8 @@ struct ExternalChatInner {
     /// 昵称 → 游戏 UID。外部源每条消息都带 UID，这里缓存下来供歌单等
     /// 需要"按人定位"的功能使用。程序重启后为空，此时歌单退化到 name: 键。
     nick_to_uid: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// 异步昵称补查的进度：已解析结果 + 下次允许查询的时间。
+    name_lookups: std::sync::Mutex<NameLookups>,
     /// 是否处于接管状态（已连接且租约未过期）。
     active: AtomicBool,
     /// 最近一次收到消息的序号，用于日志与断线补齐。
@@ -54,6 +64,15 @@ struct ExternalChatInner {
     epoch: AtomicU64,
     /// 是否已经用掉"首次遇到一级聊天界面时自动切二级"的机会。
     initial_secondary_switch_done: AtomicBool,
+}
+
+/// 昵称补查进度。由后台补查线程写、接收线程读。
+#[derive(Default)]
+struct NameLookups {
+    /// UID → 已补查到的昵称。命中后同一发送者的后续消息不再走网络。
+    resolved: std::collections::HashMap<String, String>,
+    /// UID → 允许再次补查的毫秒时间戳（在途与失败冷却共用）。
+    next_attempt_ms: std::collections::HashMap<String, u64>,
 }
 
 impl ExternalChatState {
@@ -135,6 +154,64 @@ impl ExternalChatState {
             .ok()?
             .get(nickname.trim())
             .cloned()
+    }
+
+    /// 已补查到的昵称；没有就返回 None。
+    pub(crate) fn cached_name(&self, uid: &str) -> Option<String> {
+        self.name_lookups().resolved.get(uid.trim()).cloned()
+    }
+
+    /// 申请一次异步昵称补查。
+    ///
+    /// 返回 false 表示已有结果、正在补查，或处于失败冷却中——调用方不要重复排队。
+    pub(crate) fn begin_name_lookup(&self, uid: &str) -> bool {
+        let uid = uid.trim();
+        if uid.is_empty() {
+            return false;
+        }
+        let now = now_millis();
+        let mut lookups = self.name_lookups();
+        if lookups.resolved.contains_key(uid) {
+            return false;
+        }
+        if lookups
+            .next_attempt_ms
+            .get(uid)
+            .is_some_and(|next| *next > now)
+        {
+            return false;
+        }
+        lookups
+            .next_attempt_ms
+            .insert(uid.to_string(), now + NAME_LOOKUP_IN_FLIGHT_MS);
+        true
+    }
+
+    /// 登记补查结果：成功则缓存昵称，失败或查不到则进入冷却。
+    pub(crate) fn finish_name_lookup(&self, uid: &str, name: Option<&str>) {
+        let uid = uid.trim();
+        if uid.is_empty() {
+            return;
+        }
+        let mut lookups = self.name_lookups();
+        match name.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(name) => {
+                lookups.resolved.insert(uid.to_string(), name.to_string());
+                lookups.next_attempt_ms.remove(uid);
+            }
+            None => {
+                lookups
+                    .next_attempt_ms
+                    .insert(uid.to_string(), now_millis() + NAME_LOOKUP_RETRY_MS);
+            }
+        }
+    }
+
+    fn name_lookups(&self) -> std::sync::MutexGuard<'_, NameLookups> {
+        self.inner
+            .name_lookups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 记录一次活跃（收到事件时调用）。
@@ -244,6 +321,15 @@ fn run(
 ) {
     let lease = Duration::from_millis(config.lease_timeout_ms);
     let reconnect = Duration::from_millis(config.reconnect_ms);
+    // 昵称补查放到独立线程：接收线程必须持续读 WS，任何 HTTP 等待都会让
+    // 后续消息（可能正是玩家的命令）排在它后面。结果回写缓存，之后同 UID 直接命中。
+    let names = spawn_name_resolver(
+        state.clone(),
+        ws_url_to_http(&config.url),
+        config.token.clone(),
+        identity_access.clone(),
+        config_store.clone(),
+    );
     loop {
         // 登录器角色：Miliastra-Wonderland-ChatBridge 没在监听时替用户拉起来。
         // 探测很便宜（300ms 超时），每次重连都试一次，这样用户中途关掉也能被重新拉起。
@@ -317,10 +403,10 @@ fn run(
                                             deliver(
                                                 &timeline,
                                                 &state,
-                                                &config,
                                                 identity_access.as_ref(),
                                                 config_store.as_ref(),
                                                 &config.url,
+                                                &names,
                                                 batch.messages,
                                             );
                                         }
@@ -343,10 +429,10 @@ fn run(
                             deliver(
                                 &timeline,
                                 &state,
-                                &config,
                                 identity_access.as_ref(),
                                 config_store.as_ref(),
                                 &config.url,
+                                &names,
                                 messages,
                             );
                         }
@@ -417,34 +503,23 @@ fn persist_identity(
 fn deliver(
     timeline: &ChatTimeline,
     state: &ExternalChatState,
-    config: &ChatSourceConfig,
     identity_access: Option<&crate::features::identity::IdentityAccess>,
     config_store: Option<&crate::config::SharedConfigStore>,
     source: &str,
+    names: &std::sync::mpsc::Sender<String>,
     messages: Vec<ExternalChatMessage>,
 ) {
     let mut messages = messages;
-    // 昵称异步到达是常态（API 文档 §5），缺了就补查一次；
-    // 仍查不到就留空，上层会按"未知发送者"处理、不授权任何权限。
-    let http_base = ws_url_to_http(&config.url);
+    // 这条路径在 WS 接收线程上：缺昵称只排队补查，**绝不能在这里等 HTTP**，
+    // 否则一条慢查询就会把后面所有消息（可能正是玩家的命令）一起拖住。
+    let mut lookups: Vec<String> = Vec::new();
     for message in &mut messages {
-        if message.sender.nickname.is_none() {
-            if let Some(uid) = message.sender.uid.as_ref() {
-                match crate::runtime::chat_source::resolve_missing_name(
-                    &http_base,
-                    &config.token,
-                    uid.as_str(),
-                ) {
-                    Ok(Some(name)) => {
-                        log::debug!("昵称补查命中: uid={} name={name}", uid.as_str());
-                        message.sender.nickname = Some(name);
-                    }
-                    Ok(None) => {
-                        log::debug!("昵称补查无结果，按未知发送者处理: uid={}", uid.as_str())
-                    }
-                    Err(error) => log::debug!("昵称补查失败: {error:#}"),
-                }
-            }
+        // 之前补查到的昵称直接复用，同一发送者不必再走网络。
+        if message.sender.nickname.is_none()
+            && let Some(uid) = message.sender.uid.as_ref()
+            && let Some(name) = state.cached_name(uid.as_str())
+        {
+            message.sender.nickname = Some(name);
         }
         state.remember_uid(
             message.sender.nickname.as_deref(),
@@ -474,6 +549,19 @@ fn deliver(
                 }
             }
         }
+        // 仍然缺昵称：交给后台线程补查，本线程立刻回去读 WS。
+        if message.sender.nickname.is_none()
+            && let Some(uid) = message.sender.uid.as_ref()
+            && state.begin_name_lookup(uid.as_str())
+        {
+            lookups.push(uid.as_str().to_string());
+        }
+    }
+    for uid in lookups {
+        if names.send(uid.clone()).is_err() {
+            // 补查线程没起来或已退出：解除在途标记，避免该 UID 永久不再补查。
+            state.finish_name_lookup(&uid, None);
+        }
     }
     state.touch();
     // 丢掉启动前的历史：水位之前的一律不执行。
@@ -502,6 +590,57 @@ fn deliver(
         }
         Err(error) => log::warn!("外部聊天源注入失败: {error:#}"),
     }
+}
+
+/// 后台昵称补查线程。
+///
+/// 接收线程只负责把缺昵称的 UID 丢进来；这里串行发请求（单次上限 1s），
+/// 结果写回缓存。同一个 UID 只查一次，之后同发送者的消息直接复用。
+fn spawn_name_resolver(
+    state: ExternalChatState,
+    http_base: String,
+    token: String,
+    identity_access: Option<crate::features::identity::IdentityAccess>,
+    config_store: Option<crate::config::SharedConfigStore>,
+) -> std::sync::mpsc::Sender<String> {
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    let spawned = thread::Builder::new()
+        .name("external-chat-names".into())
+        .spawn(move || {
+            for uid in receiver {
+                match crate::runtime::chat_source::resolve_missing_name(&http_base, &token, &uid) {
+                    Ok(Some(name)) => {
+                        state.remember_uid(Some(&name), Some(&uid));
+                        state.finish_name_lookup(&uid, Some(&name));
+                        log::debug!("昵称补查命中: uid={uid} name={name}");
+                        // 自动建的身份当时可能没有备注，补上（只填空值）。
+                        if let Some(identity) = identity_access.as_ref()
+                            && identity.backfill_account_note(
+                                miliastra_kernel::chat_source::GAME_GENSHIN,
+                                &uid,
+                                &name,
+                            )
+                            && let Some(store) = config_store.as_ref()
+                            && let Err(error) = persist_identity(store, identity)
+                        {
+                            log::warn!("补查到的昵称未能写入身份映射: {error:#}");
+                        }
+                    }
+                    Ok(None) => {
+                        state.finish_name_lookup(&uid, None);
+                        log::debug!("昵称补查无结果，按未知发送者处理: uid={uid}");
+                    }
+                    Err(error) => {
+                        state.finish_name_lookup(&uid, None);
+                        log::debug!("昵称补查失败: {error:#}");
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        log::warn!("启动昵称补查线程失败，缺昵称的消息将按未知发送者处理: {error}");
+    }
+    sender
 }
 
 /// 把 WS 地址转成同源的 HTTP 基地址，用于 `/names` 补查。
@@ -566,6 +705,29 @@ pub(crate) const EMPTY_FRAME_REASON: &str = "external chat source active";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 异步补查的去重：同一 UID 在途时不再排队，拿到结果后直接命中缓存。
+    #[test]
+    fn name_lookup_is_deduplicated_and_cached() {
+        let state = ExternalChatState::default();
+        assert!(state.begin_name_lookup("900000001"));
+        // 在途期间同 UID 的后续消息不能被重复排队。
+        assert!(!state.begin_name_lookup("900000001"));
+        state.finish_name_lookup("900000001", Some("玩家癸"));
+        assert_eq!(state.cached_name("900000001").as_deref(), Some("玩家癸"));
+        // 已有昵称就不再查网络。
+        assert!(!state.begin_name_lookup("900000001"));
+    }
+
+    /// 补查失败要进入冷却，避免每条缺昵称消息都打一次网络。
+    #[test]
+    fn failed_name_lookup_enters_cooldown() {
+        let state = ExternalChatState::default();
+        assert!(state.begin_name_lookup("42"));
+        state.finish_name_lookup("42", None);
+        assert_eq!(state.cached_name("42"), None);
+        assert!(!state.begin_name_lookup("42"), "失败后应处于冷却期");
+    }
 
     #[test]
     fn ws_url_to_http_maps_scheme_and_strips_endpoint() {

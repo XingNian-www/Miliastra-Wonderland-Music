@@ -399,6 +399,7 @@ mod tests {
             routed.command,
             ModuleCommand::Invite(InviteCommand {
                 username: "芦荟".to_string(),
+                search_names: Vec::new(),
                 display_name: "芦荟".to_string(),
                 seq: Some(2),
                 password: None,
@@ -782,6 +783,7 @@ mod tests {
             parsed.command,
             ModuleCommand::Invite(InviteCommand {
                 username: "Alice".to_string(),
+                search_names: Vec::new(),
                 display_name: "Alice".to_string(),
                 seq: Some(2),
                 password: None,
@@ -796,6 +798,7 @@ mod tests {
             parsed.command,
             ModuleCommand::Invite(InviteCommand {
                 username: "Alice".to_string(),
+                search_names: Vec::new(),
                 display_name: "Alice".to_string(),
                 seq: None,
                 password: Some("654321".to_string()),

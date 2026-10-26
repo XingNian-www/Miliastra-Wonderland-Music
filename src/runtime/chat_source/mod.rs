@@ -117,8 +117,10 @@ pub(crate) fn resolve_missing_name(
         base_http_url.trim_end_matches('/'),
         urlencode(uid.trim())
     );
+    // 1s 上限：这条查询由后台补查线程发起，慢一点只让昵称晚到；
+    // 不能让它长时间占住线程，更不能回到接收线程上。
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(1))
         .build()?;
     let response = client
         .get(url)

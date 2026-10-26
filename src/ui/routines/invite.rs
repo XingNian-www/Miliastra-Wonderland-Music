@@ -20,7 +20,12 @@ use crate::ui::template::best_template_hit;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExecuteInvite {
-    username: String,
+    /// 好友列表里可以匹配的名字，按优先级排列。
+    ///
+    /// **不是**发起人的 username：外部聊天源的 username 是纯 UID，
+    /// 好友列表上显示的是昵称/备注，拿 UID 去搜必然落空。
+    /// 这里存的是 composition 层用 UID 反查出来的候选名（备注 + 游戏内昵称）。
+    recipients: Vec<String>,
     password: Option<String>,
     notification: String,
     residency: UiResidencyTarget,
@@ -28,13 +33,13 @@ pub(crate) struct ExecuteInvite {
 
 impl ExecuteInvite {
     pub(crate) fn new(
-        username: impl Into<String>,
+        recipients: Vec<String>,
         password: Option<String>,
         notification: impl Into<String>,
         residency: UiResidencyTarget,
     ) -> Self {
         Self {
-            username: username.into(),
+            recipients,
             password,
             notification: notification.into(),
             residency,
@@ -233,7 +238,8 @@ fn execute_invite(
     let mut notification = InviteNotificationOutcome::NotAttempted;
     let mut failure = None;
 
-    if let Err(error) = open_friend_conversation(context, ocr, &config.friend, &request.username) {
+    if let Err(error) = open_friend_conversation(context, ocr, &config.friend, &request.recipients)
+    {
         failure = Some(error);
     } else {
         let notification_failed =
@@ -251,7 +257,7 @@ fn execute_invite(
 
         if notification_failed
             && let Err(error) =
-                open_friend_conversation(context, ocr, &config.friend, &request.username)
+                open_friend_conversation(context, ocr, &config.friend, &request.recipients)
         {
             failure = Some(error);
         }
@@ -705,7 +711,7 @@ mod tests {
 
         let outcome = invite_ui
             .submit(ExecuteInvite::new(
-                "甲",
+                vec!["甲".to_string()],
                 None,
                 "已同意加入大厅",
                 UiResidencyTarget::Primary,

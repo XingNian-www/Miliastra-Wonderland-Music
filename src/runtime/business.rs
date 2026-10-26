@@ -2088,13 +2088,21 @@ pub struct BusinessRuntimeEventSink {
 
 impl BusinessRuntimeEventSink {
     pub fn submit(&self, event: BusinessEvent) -> Result<(), BusinessRuntimeError> {
-        let state = self
-            .channel
-            .state
-            .lock()
-            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-        if *state == RuntimeChannelState::Stopped {
-            return Err(BusinessRuntimeError::RuntimeStopped);
+        // 锁外 send：队列打满时不能持锁阻塞。
+        //
+        // 与 `send_request` / `send_query` 对齐——那两处都用内层 block 提前释放
+        // guard，注释也写明「避免拖住同锁的 shutdown/stop_worker」。这里原来漏了，
+        // 于是队列满时 submit 持锁等空位、stop_worker 等同一把锁，两条链互卡，
+        // 关闭流程挂住而 join 无超时，进程退不掉。
+        {
+            let state = self
+                .channel
+                .state
+                .lock()
+                .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
+            if *state == RuntimeChannelState::Stopped {
+                return Err(BusinessRuntimeError::RuntimeStopped);
+            }
         }
         self.channel
             .sender

@@ -456,6 +456,10 @@ fn model_reply_json_object(reply: &str) -> Result<String> {
     let end = trimmed
         .rfind('}')
         .ok_or_else(|| anyhow::anyhow!("候选歌曲审核返回无效 JSON"))?;
+    // 同 ai.rs：`}` 可能在 `{` 之前，切片会 panic。
+    if end < start {
+        bail!("候选歌曲审核返回无效 JSON")
+    }
     let candidate = &trimmed[start..=end];
     if serde_json::from_str::<Value>(candidate).is_ok_and(|value| value.is_object()) {
         Ok(candidate.to_string())

@@ -1340,3 +1340,30 @@ mod tests {
         DynamicImage::ImageLuma8(image)
     }
 }
+
+/// POST /debug/simulate-chat：按指定角色注入一条模拟聊天消息。
+///
+/// 只注入观察链路并立即返回——命令在原有后台任务里执行，点歌/歌单会打开
+/// 20s 决策窗口，这个请求不跟着等，否则接口会长时间挂住且看不到中间状态。
+pub(super) fn simulate_chat_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SimulateChatRequest {
+        role: String,
+        text: String,
+    }
+
+    let request: SimulateChatRequest = parse_json_body(body, "模拟聊天参数")?;
+    let message = state
+        .application
+        .commands
+        .simulate_chat(request.role, request.text)
+        .map_err(|error| AppError {
+            status: error.status,
+            message: error.message,
+        })?;
+    Ok(message)
+}

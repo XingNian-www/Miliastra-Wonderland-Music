@@ -808,6 +808,8 @@ impl ApplicationRuntime {
             },
             lifecycle: FormalTaskLifecycleContext {
                 config: self.lifecycle.config.clone(),
+                // 命令执行发生在这个上下文里，决策窗口必须能读到真实的接管状态。
+                external_chat: self.lifecycle.external_chat.clone(),
                 config_store: self
                     .lifecycle
                     .config_store

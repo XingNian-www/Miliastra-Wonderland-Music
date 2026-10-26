@@ -2443,7 +2443,19 @@ impl ApplicationRuntime {
         routed.username = sender.to_string();
         routed.message_type = message.message_type.clone();
         routed.authority = CommandAuthority::HallMember;
-        routed.role = self.lifecycle.live_configs.identity.role_of(&sender);
+        // 身份必须与触发期判定**同源**。
+        //
+        // 触发期用的是 `role_of_sender(sender, account)`——有 UID 就按 UID 判；
+        // 而 `RoutedCommand::console` 构造出的 `account` 恒为 None，
+        // 如果这里只回填 `role_of(&sender)`（仅按昵称），
+        // 那么「UID 认出 Owner、昵称却是随机 OCR 备注名」的发送者会
+        // 触发期放行、执行期 role=None，命令被静默丢弃。
+        routed.account = account.cloned();
+        routed.role = self
+            .lifecycle
+            .live_configs
+            .identity
+            .role_of_sender(&sender, routed.account.as_ref());
         routed.observation = crate::features::command::CommandObservation {
             frame_id: None,
             captured_at: Some(captured_at),

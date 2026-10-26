@@ -399,6 +399,17 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
 
     pub(crate) fn pause_for_hall_expiry(&self) -> Result<String> {
         // 立即阻止自动推进，等待正在加载的操作完成后再暂停会话。
+        //
+        // 这里**必须**是阻塞 lock 而不是 try_lock：在途恢复/加载期间暂停会打断
+        // 会话，留下半途而废的播放状态（见
+        // `hall_expiry_waits_for_in_flight_recovery_before_pausing`，它明确要求
+        // 恢复结束前不得暂停）。
+        //
+        // 已知代价：这条路径会被主扫描线程触发，如果 lease 被一次跨网络的源解析
+        // 长期持有，主线程会跟着等——表现为整个 bot 静默。当前接受这个取舍，
+        // 因为大厅到期后自动推进已无意义，等恢复收尾是正确语义。
+        // 若将来要消除这个风险，应当限制 lease 内不做网络解析，而不是在这里改成
+        // 跳过暂停。
         self.playback_state
             .update(PlaybackStateUpdate::UserPaused)?;
         let _lease = self

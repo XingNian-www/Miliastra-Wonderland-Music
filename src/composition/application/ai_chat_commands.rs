@@ -422,7 +422,10 @@ impl ApplicationRuntime {
             return Ok(serde_json::json!({"status":"rejected","reason":"命令识别已禁用"}));
         }
         self.execute_command(&routed)?;
-        Ok(serde_json::json!({"status":"handled","reason":"命令已执行成功。"}))
+        // 回执是模型决定「敢不敢肯定回答」的唯一依据。说成「已执行成功」仍会
+        // 被解读成「只是提交了」，于是模型补一句「能不能成功看平台反馈」。
+        // 明确写出业务结果已确认。
+        Ok(serde_json::json!({"status":"handled","reason":"命令已执行完成，业务结果已确认。"}))
     }
 }
 

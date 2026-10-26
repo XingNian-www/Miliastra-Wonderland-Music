@@ -541,6 +541,7 @@ fn external_repeated_decision_text_is_accepted_twice() {
         message_type: "blue".to_string(),
         block: sentinel,
         text: "@换一批".to_string(),
+        sender: None,
     };
     let mut lock = DecisionScreenLock::inert();
     assert!(lock.accept_once(&msg), "外部源第一次决策必须生效");

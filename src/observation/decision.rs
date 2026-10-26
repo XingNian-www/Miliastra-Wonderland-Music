@@ -113,6 +113,7 @@ mod tests {
             message_type: message_type.to_string(),
             block: Rect::new(0, y, 100, 20),
             text: text.to_string(),
+            sender: None,
         }
     }
 

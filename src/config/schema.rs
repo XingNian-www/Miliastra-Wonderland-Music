@@ -144,7 +144,6 @@ impl Domain {
     }
 }
 
-
 /// chat_source 段：外部聊天源（Miliastra-Wonderland-ChatBridge WS）。
 fn chat_source_section() -> Vec<ConfigFieldSchema> {
     vec![
@@ -169,13 +168,19 @@ fn chat_source_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "reconnect_ms",
             "重连间隔",
-            FieldKind::Int { min: 100, max: 600_000 },
+            FieldKind::Int {
+                min: 100,
+                max: 600_000,
+            },
             "WS 断开后等待多久重连，单位毫秒",
         ),
         ConfigFieldSchema::db_idle_reload(
             "lease_timeout_ms",
             "失联回落阈值",
-            FieldKind::Int { min: 1_000, max: 600_000 },
+            FieldKind::Int {
+                min: 1_000,
+                max: 600_000,
+            },
             "外部源多久没有消息就回落到 OCR，单位毫秒；防止 Miliastra-Wonderland-ChatBridge 挂掉后聊天完全失聪",
         ),
         ConfigFieldSchema::db_idle_reload(
@@ -193,7 +198,10 @@ fn chat_source_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "self_uid",
             "本机账号 UID",
-            FieldKind::Int { min: 0, max: 4_294_967_295 },
+            FieldKind::Int {
+                min: 0,
+                max: 4_294_967_295,
+            },
             "本机游戏账号的 UID。Miliastra-Wonderland-ChatBridge 用它区分自己和玩家的消息，填错会把 BOT 自己的发言当成命令再执行一次。仅「自动启动」时由 BOT 传给对方；自行部署时请在你的启动命令里填 --self-uid，此处可留 0",
         ),
     ]
@@ -2339,21 +2347,45 @@ fn field_group(section: &str, path: &str) -> Option<&'static str> {
         ("ocr", "det_model" | "rec_model" | "charset" | "min_confidence" | "threads") => {
             Some("模型与置信度")
         }
-        ("ocr", "det_max_side_len" | "det_score_threshold" | "det_unclip_ratio" | "det_min_area"
-            | "det_box_border") => Some("检测参数"),
+        (
+            "ocr",
+            "det_max_side_len"
+            | "det_score_threshold"
+            | "det_unclip_ratio"
+            | "det_min_area"
+            | "det_box_border",
+        ) => Some("检测参数"),
         ("ocr", "request_timeout_ms" | "shutdown_timeout_ms" | "backend_priority") => {
             Some("运行控制")
         }
         ("ocr", "openvino") => Some("OpenVINO"),
-        ("ocr", "marker_search_width" | "marker_dedupe_min_x" | "marker_dedupe_min_y"
-            | "marker_dedupe_x" | "marker_dedupe_y") => Some("气泡定位"),
-        ("ocr", "text_left_gap" | "block_top_padding" | "block_bottom_padding"
-            | "max_block_height" | "same_line_y_tolerance" | "next_marker_min_gap"
-            | "right_padding") => Some("文本排版"),
+        (
+            "ocr",
+            "marker_search_width"
+            | "marker_dedupe_min_x"
+            | "marker_dedupe_min_y"
+            | "marker_dedupe_x"
+            | "marker_dedupe_y",
+        ) => Some("气泡定位"),
+        (
+            "ocr",
+            "text_left_gap"
+            | "block_top_padding"
+            | "block_bottom_padding"
+            | "max_block_height"
+            | "same_line_y_tolerance"
+            | "next_marker_min_gap"
+            | "right_padding",
+        ) => Some("文本排版"),
         ("ocr", "change_mean_threshold" | "change_pixel_threshold") => Some("变化检测"),
         // 启动流程：截图判定 vs 点击导航。
-        ("startup", "stable_mean_threshold" | "stable_changed_ratio_threshold"
-            | "stable_frame_count" | "settle_ms") => Some("稳定判定"),
+        (
+            "startup",
+            "stable_mean_threshold"
+            | "stable_changed_ratio_threshold"
+            | "stable_frame_count"
+            | "settle_ms",
+        ) => Some("稳定判定"),
         _ => None,
     }
 }
@@ -2664,9 +2696,27 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
         ),
         ConfigFieldSchema::db_idle_reload(
             "actor_token_budget",
-            "单人记忆预算",
+            "单人近期原文预算",
             int(1_000, 200_000),
-            "每个玩家的事实与对话合计 token 上限；超出淘汰最旧内容",
+            "每个玩家的近期问答原文 token 上限；超出部分压缩进中期摘要",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "actor_summary_budget",
+            "单人中期摘要预算",
+            int(200, 50_000),
+            "每个玩家的中期摘要 token 上限；摘要滚动覆盖，不是硬截断",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "hall_token_budget",
+            "大厅近期原文预算",
+            int(1_000, 400_000),
+            "大厅共享记忆的原文 token 上限；记录所有人在大厅的发言",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "hall_summary_budget",
+            "大厅中期摘要预算",
+            int(200, 100_000),
+            "大厅共享记忆的中期摘要 token 上限",
         ),
         ConfigFieldSchema::db_idle_reload(
             "bot_token_budget",
@@ -2933,9 +2983,7 @@ mod tests {
                 if !has_declared_children
                     && matches!(
                         kinds.get(prefix),
-                        Some(
-                            FieldKind::Object | FieldKind::Rect | FieldKind::Point
-                        )
+                        Some(FieldKind::Object | FieldKind::Rect | FieldKind::Point)
                     )
                 {
                     out.insert(prefix.to_string());

@@ -137,7 +137,70 @@ pub(super) fn model_list_error(error: ModelListError) -> AppError {
     }
 }
 
-pub(super) fn ai_route_error(error: anyhow::Error) -> AppError {
+/// GET /ai/memory/actors —— 列出有记忆的玩家。
+pub(super) fn ai_memory_actors_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    state.application.ai.memory_actors().map_err(ai_route_error)
+}
+
+/// GET /ai/memory/actor?name=… —— 读取某个玩家的完整记忆。
+pub(super) fn ai_memory_actor_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let actor = normalize_required_text(query_value(query, "name"), "name")?;
+    state
+        .application
+        .ai
+        .memory_actor(&actor)
+        .map_err(ai_route_error)
+}
+
+/// GET /ai/memory/hall —— 读取大厅共享记忆。
+pub(super) fn ai_memory_hall_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    state.application.ai.memory_hall().map_err(ai_route_error)
+}
+
+/// POST /ai/memory/forget-actor —— 删除某个玩家的记忆。
+pub(super) fn ai_memory_forget_actor_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let actor = normalize_required_text(query_value(query, "name"), "name")?;
+    state
+        .application
+        .ai
+        .forget_actor(&actor)
+        .map_err(ai_route_error)
+}
+
+/// POST /ai/memory/delete-fact —— 删除某条事实。
+pub(super) fn ai_memory_delete_fact_route(
+    query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let actor = normalize_required_text(query_value(query, "name"), "name")?;
+    let fact = normalize_required_text(query_value(query, "fact"), "fact")?;
+    state
+        .application
+        .ai
+        .delete_fact(&actor, &fact)
+        .map_err(ai_route_error)
+}
+
+/// POST /ai/memory/forget-hall —— 清空大厅共享记忆。
+pub(super) fn ai_memory_forget_hall_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    state.application.ai.forget_hall().map_err(ai_route_error)
+}
+fn ai_route_error(error: anyhow::Error) -> AppError {
     // 内部错误(500)只记日志,响应用通用文案,避免错误链泄漏内部路径;
     // 仅用户输入类错误(400)保留原文。
     if is_client_error(&error.to_string()) {

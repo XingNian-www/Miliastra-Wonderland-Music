@@ -27,10 +27,38 @@ use crate::features::command::{
     CommandAuthority, CommandEnvelope, CommandPrefix, FeatureCommandMatch,
 };
 
-/// 单人记忆预算：16K token（事实 + 对话）。
+/// 单人**近期原文**预算：16K token（问答原文，超出的进入中期摘要）。
 pub(crate) const ACTOR_TOKEN_BUDGET: usize = 16_000;
+/// 单人**中期摘要**预算：2K token。
+///
+/// 分层保留：近期原文 → 中期摘要 → 远期只留事实。
+/// 摘要本身也会滚动覆盖（旧摘要 + 新溢出再压一次），所以它只需要一个很小的容量。
+pub(crate) const ACTOR_SUMMARY_BUDGET: usize = 2_000;
+/// 大厅**近期原文**预算：32K token，全局共用。
+///
+/// 大厅记忆记录**所有人在大厅说的话**（不只 BOT 自己的），是所有玩家共享的上下文。
+pub(crate) const HALL_TOKEN_BUDGET: usize = 32_000;
+/// 大厅**中期摘要**预算：4K token。
+pub(crate) const HALL_SUMMARY_BUDGET: usize = 4_000;
 /// 机器人自身输出预算：32K token，全局共用。
 pub(crate) const BOT_TOKEN_BUDGET: usize = 32_000;
+/// 分层压缩的比例：达到预算后，从最旧的开始按这个比例重新分配。
+///
+/// - 70% 压进摘要（信息密度最高的一层）
+/// - 20% 保留为近期原文的补充（与 10% 一起构成「完整保留」区）
+/// - 10% 原样保留最近的内容
+///
+/// 用比例而不是固定条数：原文长度差异很大，固定条数在不同聊天节奏下
+/// 表现完全相反（短句多时几乎没压，长段多时一次压掉大半）。
+const COMPRESS_KEEP_RECENT_PERCENT: usize = 10;
+
+/// 压缩触发后，摘要允许占用的预算比例。
+const COMPRESS_SUMMARY_PERCENT: usize = 20;
+
+/// 压缩时把最旧的多少比例原文送去摘要。
+const COMPRESS_OLDEST_PERCENT: usize = 70;
+/// 摘要单次生成允许的最大 token。
+pub(crate) const SUMMARY_MAX_TOKENS: u32 = 800;
 /// 一次提问的最大字符数；超出直接拒绝，避免模型对着半句话编造。
 pub(crate) const MAX_QUESTION_CHARS: usize = 200;
 /// 同一个人两次触发之间的冷却。
@@ -71,9 +99,18 @@ pub struct AiChatConfig {
     /// 遗留配置兼容字段；当前没有被动记录外部机器人发言的路径。
     #[serde(default, rename = "bot_name", skip_serializing)]
     pub _legacy_bot_name: String,
-    /// 单人记忆 token 预算。
+    /// 单人**近期原文** token 预算；超出部分压缩进中期摘要。
     #[serde(default = "default_actor_budget")]
     pub actor_token_budget: usize,
+    /// 单人**中期摘要** token 预算。
+    #[serde(default = "default_actor_summary_budget")]
+    pub actor_summary_budget: usize,
+    /// 大厅**近期原文** token 预算（全局共用，记录所有人在大厅说的话）。
+    #[serde(default = "default_hall_budget")]
+    pub hall_token_budget: usize,
+    /// 大厅**中期摘要** token 预算。
+    #[serde(default = "default_hall_summary_budget")]
+    pub hall_summary_budget: usize,
     /// 机器人自身输出的 token 预算。
     #[serde(default = "default_bot_budget")]
     pub bot_token_budget: usize,
@@ -204,6 +241,18 @@ fn default_actor_budget() -> usize {
     ACTOR_TOKEN_BUDGET
 }
 
+fn default_actor_summary_budget() -> usize {
+    ACTOR_SUMMARY_BUDGET
+}
+
+fn default_hall_budget() -> usize {
+    HALL_TOKEN_BUDGET
+}
+
+fn default_hall_summary_budget() -> usize {
+    HALL_SUMMARY_BUDGET
+}
+
 fn default_bot_budget() -> usize {
     BOT_TOKEN_BUDGET
 }
@@ -228,6 +277,9 @@ impl Default for AiChatConfig {
             trigger_mode: TriggerMode::default(),
             _legacy_bot_name: String::new(),
             actor_token_budget: ACTOR_TOKEN_BUDGET,
+            actor_summary_budget: ACTOR_SUMMARY_BUDGET,
+            hall_token_budget: HALL_TOKEN_BUDGET,
+            hall_summary_budget: HALL_SUMMARY_BUDGET,
             bot_token_budget: BOT_TOKEN_BUDGET,
             cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
             allow_commands: true,
@@ -463,6 +515,56 @@ mod ai_reply_tests {
 /// 字数上限与 [`MAX_FACT_CHARS`] 保持一致：以前这里写死「不超过 40 个字」，
 /// 而代码允许 120 字，模型被无谓地压短，白白丢掉有效信息。
 /// 记忆只进 AI 上下文、不进游戏聊天，不受显示宽度约束，没必要压到 40 字。
+/// 压缩提示词：把溢出原文与旧摘要合成新摘要。
+///
+/// 分层保留的中间层：远期只留事实、近期保留原文，中间靠这段摘要衔接。
+/// 摘要必须**滚动**（旧摘要 + 新溢出再压一次），否则每次只压新内容，
+/// 早期信息会随原文删除而永久丢失。
+fn default_summary_prompt() -> String {
+    [
+        "把下面的聊天记录压缩成一段简洁摘要，保留人物关系、偏好、约定与仍在进行的事。",
+        "已有摘要（可能为空）：{{previous}}",
+        "新增记录：{{records}}",
+        "要求：只输出摘要正文，不要标题、不要列表符号；合并重复信息，丢弃寒暄。",
+    ]
+    .join("\n")
+}
+
+/// 组装压缩提示词：旧摘要 + 新溢出原文。
+pub(crate) fn summary_prompt(previous: &str, records: &str) -> String {
+    default_summary_prompt()
+        .replace(
+            "{{previous}}",
+            if previous.trim().is_empty() {
+                "（暂无）"
+            } else {
+                previous
+            },
+        )
+        .replace("{{records}}", records)
+}
+
+/// 取模型返回的摘要正文。模型可能套了 JSON 或引号，这里只做最小清洗。
+pub(crate) fn parse_summary(reply: &str) -> String {
+    let text = reply.trim();
+    // 兼容 {"summary": "…"} 这种结构化返回。
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(summary) = value.get("summary").and_then(|v| v.as_str())
+    {
+        return summary.trim().to_string();
+    }
+    text.trim_matches(['"', '“', '”']).trim().to_string()
+}
+
+/// 把一批原文渲染成压缩输入。
+fn render_records(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 fn default_extract_prompt() -> String {
     [
         "从下面这轮对话里抽取关于该玩家、值得长期记住的稳定信息（偏好、称呼、习惯、约定）。",
@@ -509,21 +611,67 @@ impl AiChatCommand {
 /// 一轮问答。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredTurn {
+    /// 提问人。历史里每条都带名字，模型才能分清「谁问的」。
+    pub(crate) asker: String,
     pub(crate) question: String,
     pub(crate) answer: String,
 }
 
+/// 提问人前缀的统一格式。
+///
+/// 大厅里同时在场的玩家很多，模型必须能在历史里分清谁是谁；
+/// 个人记忆虽然只有一个人，也用同一格式，保证两层的提示词风格一致。
+pub(crate) fn asker_prefix(asker: &str) -> String {
+    let asker = asker.trim();
+    if asker.is_empty() {
+        "[未知]".to_string()
+    } else {
+        format!("[{asker}]")
+    }
+}
+
 /// 组装提示词所需的记忆快照。
+///
+/// 分三层，靠预算各自维护：
+/// - `facts`：远期，AI 抽取的稳定信息，永不压缩
+/// - `summary`：中期，溢出的原文滚动压缩成一段话
+/// - `turns`：近期，问答原文
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ChatContext {
     pub(crate) facts: Vec<String>,
+    pub(crate) summary: Option<String>,
     pub(crate) turns: Vec<StoredTurn>,
     pub(crate) bot_history: Vec<String>,
 }
 
+/// 大厅共享记忆快照：所有人最近说过的话 + 滚动压缩的大厅摘要。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HallContext {
+    pub(crate) summary: Option<String>,
+    /// (说话人, 内容)，按时间从旧到新。
+    pub(crate) lines: Vec<(String, String)>,
+}
+
 /// 轻量记忆存储。
+/// 面板用的玩家记忆规模摘要。
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ActorMemorySummary {
+    pub(crate) actor: String,
+    pub(crate) facts: usize,
+    pub(crate) turns: usize,
+    pub(crate) tokens: usize,
+}
 pub(crate) struct AiChatMemory {
     connection: Mutex<Connection>,
+}
+
+/// 一次压缩需要做什么：取出哪些原文、旧摘要是什么。
+///
+/// 只在真正超预算时构造，避免每次问答都去统计。
+pub(crate) struct CompressionPlan {
+    pub(crate) scope: String,
+    pub(crate) previous_summary: String,
+    pub(crate) records: Vec<String>,
 }
 
 impl AiChatMemory {
@@ -556,6 +704,22 @@ impl AiChatMemory {
                  text     TEXT    NOT NULL,
                  tokens   INTEGER NOT NULL,
                  added_at INTEGER NOT NULL
+             );
+             -- 中期摘要：把溢出的原文压成一段话，滚动覆盖。
+             -- scope 用 'actor:<名字>' 或 'hall' 区分个人记忆与大厅共享记忆。
+             CREATE TABLE IF NOT EXISTS ai_chat_summaries (
+                 scope    TEXT    PRIMARY KEY,
+                 summary  TEXT    NOT NULL,
+                 tokens   INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             -- 大厅原文：记录**所有人在大厅说的话**，全局共享。
+             CREATE TABLE IF NOT EXISTS ai_chat_hall_turns (
+                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 speaker  TEXT    NOT NULL,
+                 text     TEXT    NOT NULL,
+                 tokens   INTEGER NOT NULL,
+                 added_at INTEGER NOT NULL
              );",
         )?;
         Ok(Self {
@@ -569,7 +733,19 @@ impl AiChatMemory {
             .map_err(|_| anyhow!("AI 聊天记忆存储不可用"))
     }
 
-    /// 读取某人的记忆：事实（旧→新）、最近对话（旧→新）与机器人最近发言。
+    /// 单个 scope 的记忆 scope 键。
+    fn actor_scope(actor: &str) -> String {
+        format!("actor:{actor}")
+    }
+
+    /// 大厅共享记忆的 scope 键。
+    pub(crate) fn hall_scope() -> &'static str {
+        "hall"
+    }
+
+    /// 读取某人的分层记忆：事实（远期）+ 摘要（中期）+ 原文（近期）。
+    ///
+    /// 三层各有预算，靠 `prune` 维护；这里只负责按顺序取出。
     pub(crate) fn context(&self, actor: &str, bot_budget: usize) -> Result<ChatContext> {
         let connection = self.connection()?;
         let facts = connection
@@ -582,19 +758,48 @@ impl AiChatMemory {
             .prepare("SELECT question, answer FROM ai_chat_turns WHERE actor = ?1 ORDER BY id ASC")?
             .query_map([actor], |row| {
                 Ok(StoredTurn {
+                    asker: actor.to_string(),
                     question: row.get(0)?,
                     answer: row.get(1)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let bot_history = bot_lines_within(&connection, bot_budget)?;
+        let summary = connection
+            .query_row(
+                "SELECT summary FROM ai_chat_summaries WHERE scope = ?1",
+                [Self::actor_scope(actor)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|text: &String| !text.trim().is_empty());
         Ok(ChatContext {
             facts,
+            summary,
             turns,
             bot_history,
         })
     }
 
+    /// 读取大厅共享记忆：所有人在大厅说过的话 + 大厅摘要。
+    pub(crate) fn hall_context(&self) -> Result<HallContext> {
+        let connection = self.connection()?;
+        let lines = connection
+            .prepare("SELECT speaker, text FROM ai_chat_hall_turns ORDER BY id ASC")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let summary = connection
+            .query_row(
+                "SELECT summary FROM ai_chat_summaries WHERE scope = ?1",
+                [Self::hall_scope()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|text: &String| !text.trim().is_empty());
+        Ok(HallContext { summary, lines })
+    }
     /// 记录一轮问答，并按单人 token 预算淘汰最旧记录。
     pub(crate) fn record_turn(
         &self,
@@ -680,6 +885,278 @@ impl AiChatMemory {
         Ok(facts + turns > 0)
     }
 
+    /// 记录大厅里的一句话（所有人在大厅说的，全局共享）。
+    ///
+    /// 与个人记忆分开存：大厅上下文是**所有玩家共享**的，谁都能引用；
+    /// 个人记忆是长久的，跟着具体的人走。
+    pub(crate) fn record_hall_line(&self, speaker: &str, text: &str, now_ms: i64) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let tokens = estimate_tokens(text);
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO ai_chat_hall_turns(speaker, text, tokens, added_at) VALUES (?1, ?2, ?3, ?4)",
+            params![speaker, text, tokens as i64, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// 大厅原文总 token。
+    fn hall_tokens(&self) -> Result<usize> {
+        let connection = self.connection()?;
+        let total: i64 = connection.query_row(
+            "SELECT COALESCE(SUM(tokens), 0) FROM ai_chat_hall_turns",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total as usize)
+    }
+
+    /// 个人原文总 token。
+    fn actor_tokens(&self, actor: &str) -> Result<usize> {
+        let connection = self.connection()?;
+        let total: i64 = connection.query_row(
+            "SELECT COALESCE((SELECT SUM(tokens) FROM ai_chat_turns WHERE actor = ?1), 0)
+                  + COALESCE((SELECT SUM(tokens) FROM ai_chat_facts WHERE actor = ?1), 0)",
+            [actor],
+            |row| row.get(0),
+        )?;
+        Ok(total as usize)
+    }
+
+    /// 取出某个 scope 需要压缩的原文条数估算：按最旧的顺序，直到降到预算内。
+    ///
+    /// 返回需要移出的条目数；0 表示不用压缩。
+    fn overflow_count(&self, table: &str, actor: Option<&str>, budget: usize) -> Result<usize> {
+        let connection = self.connection()?;
+        let sql = match actor {
+            Some(_) => format!("SELECT tokens FROM {table} WHERE actor = ?1 ORDER BY id ASC"),
+            None => format!("SELECT tokens FROM {table} ORDER BY id ASC"),
+        };
+        let mut stmt = connection.prepare(&sql)?;
+        let mut rows = match actor {
+            Some(actor) => stmt.query(params![actor])?,
+            None => stmt.query([])?,
+        };
+        let mut total = 0usize;
+        let mut counts = Vec::new();
+        while let Some(row) = rows.next()? {
+            let tokens: i64 = row.get(0)?;
+            total += tokens as usize;
+            counts.push(tokens as usize);
+        }
+        if total <= budget {
+            return Ok(0);
+        }
+        let mut remaining = total;
+        let mut taken = 0usize;
+        for tokens in counts {
+            if remaining <= budget {
+                break;
+            }
+            remaining -= tokens;
+            taken += 1;
+        }
+        Ok(taken)
+    }
+    /// 读取某个 scope 的中期摘要。
+    fn read_summary(&self, scope: &str) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        let summary = connection
+            .query_row(
+                "SELECT summary FROM ai_chat_summaries WHERE scope = ?1",
+                [scope],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(summary.filter(|text| !text.trim().is_empty()))
+    }
+
+    fn write_summary(&self, scope: &str, summary: &str, now_ms: i64) -> Result<()> {
+        let summary = summary.trim();
+        let connection = self.connection()?;
+        if summary.is_empty() {
+            connection.execute("DELETE FROM ai_chat_summaries WHERE scope = ?1", [scope])?;
+            return Ok(());
+        }
+        connection.execute(
+            concat!(
+                "INSERT INTO ai_chat_summaries(scope, summary, tokens, updated_at) ",
+                "VALUES (?1, ?2, ?3, ?4) ",
+                "ON CONFLICT(scope) DO UPDATE SET summary = excluded.summary, ",
+                "tokens = excluded.tokens, updated_at = excluded.updated_at"
+            ),
+            params![scope, summary, estimate_tokens(summary) as i64, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// 取出并删除最旧的一批原文，供压缩使用。
+    ///
+    /// `table` / `column` 只接受内部常量（不来自外部输入），拼接安全。
+    fn take_oldest(
+        &self,
+        table: &str,
+        column: &str,
+        actor: Option<&str>,
+        count: usize,
+    ) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut out = Vec::new();
+        let mut ids = Vec::new();
+        {
+            let sql = match actor {
+                Some(_) => format!(
+                    "SELECT id, {column} FROM {table} WHERE actor = ?1 ORDER BY id ASC LIMIT ?2"
+                ),
+                None => format!("SELECT id, {column} FROM {table} ORDER BY id ASC LIMIT ?1"),
+            };
+            let mut stmt = connection.prepare(&sql)?;
+            let mut rows = match actor {
+                Some(actor) => stmt.query(params![actor, count as i64])?,
+                None => stmt.query(params![count as i64])?,
+            };
+            while let Some(row) = rows.next()? {
+                ids.push(row.get::<_, i64>(0)?);
+                out.push(row.get::<_, String>(1)?);
+            }
+        }
+        for id in ids {
+            connection.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [id])?;
+        }
+        Ok(out)
+    }
+    /// 个人记忆：超预算时算出要压缩哪些原文。
+    ///
+    /// 分层：保留最近 10% 原文，其余连同旧摘要一起重新压缩成新摘要（摘要占 20% 预算）。
+    pub(crate) fn plan_actor_compression(
+        &self,
+        actor: &str,
+        budget: usize,
+    ) -> Result<Option<CompressionPlan>> {
+        let keep = budget * COMPRESS_KEEP_RECENT_PERCENT / 100;
+        let overflow = self.overflow_count("ai_chat_turns", Some(actor), keep)?;
+        if overflow == 0 {
+            return Ok(None);
+        }
+        let scope = Self::actor_scope(actor);
+        let previous_summary = self.read_summary(&scope)?.unwrap_or_default();
+        // 取「问 + 答」整段：只压问题会把机器人的回答丢掉，
+        // 而回答里往往含结论（点歌结果、约定内容），丢了等于记忆缺一半。
+        let records = self.take_oldest(
+            "ai_chat_turns",
+            "question || ' → ' || answer",
+            Some(actor),
+            overflow,
+        )?;
+        Ok(Some(CompressionPlan {
+            scope,
+            previous_summary,
+            records,
+        }))
+    }
+
+    /// 大厅记忆：同样的分层，但作用于共享的大厅原文。
+    pub(crate) fn plan_hall_compression(&self, budget: usize) -> Result<Option<CompressionPlan>> {
+        let keep = budget * COMPRESS_KEEP_RECENT_PERCENT / 100;
+        let overflow = self.overflow_count("ai_chat_hall_turns", None, keep)?;
+        if overflow == 0 {
+            return Ok(None);
+        }
+        let scope = Self::hall_scope().to_string();
+        let previous_summary = self.read_summary(&scope)?.unwrap_or_default();
+        // 带说话人：大厅是多人共享的记忆，压掉名字后「谁说了什么」就没了。
+        let records = self.take_oldest(
+            "ai_chat_hall_turns",
+            "speaker || '：' || text",
+            None,
+            overflow,
+        )?;
+        Ok(Some(CompressionPlan {
+            scope,
+            previous_summary,
+            records,
+        }))
+    }
+
+    /// 写回压缩结果。
+    ///
+    /// **绝不截断摘要正文**：摘要本身就是信息，砍掉尾巴等于丢记忆。
+    /// 容量靠下一轮压缩控制——摘要变长意味着下一轮会更早触发重新压缩。
+    /// 若模型返回空摘要，保留旧摘要，不能把已有记忆清空。
+    pub(crate) fn apply_compression(
+        &self,
+        plan: &CompressionPlan,
+        summary: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        let summary = summary.trim();
+        if summary.is_empty() {
+            log::warn!("压缩返回空摘要，保留旧摘要 scope={}", plan.scope);
+            return Ok(());
+        }
+        self.write_summary(&plan.scope, summary, now_ms)
+    }
+
+    /// 列出所有有记忆的玩家及其规模（面板用）。
+    ///
+    /// 事实与原文分开计数：面板要能一眼看出「这个人被记了什么、多不多」。
+    pub(crate) fn list_actors(&self) -> Result<Vec<ActorMemorySummary>> {
+        let connection = self.connection()?;
+        let mut stmt = connection.prepare(
+            "SELECT actor,
+                    (SELECT COUNT(*) FROM ai_chat_facts WHERE actor = t.actor),
+                    (SELECT COUNT(*) FROM ai_chat_turns WHERE actor = t.actor),
+                    (SELECT COALESCE(SUM(tokens), 0) FROM ai_chat_facts WHERE actor = t.actor)
+                  + (SELECT COALESCE(SUM(tokens), 0) FROM ai_chat_turns WHERE actor = t.actor)
+             FROM (SELECT DISTINCT actor FROM ai_chat_facts
+                   UNION SELECT DISTINCT actor FROM ai_chat_turns) AS t
+             ORDER BY actor ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ActorMemorySummary {
+                actor: row.get(0)?,
+                facts: row.get::<_, i64>(1)? as usize,
+                turns: row.get::<_, i64>(2)? as usize,
+                tokens: row.get::<_, i64>(3)? as usize,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 删除某条事实，返回是否确实删掉了。
+    pub(crate) fn delete_fact(&self, actor: &str, fact: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let removed = connection.execute(
+            "DELETE FROM ai_chat_facts WHERE actor = ?1 AND fact = ?2",
+            params![actor, fact],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// 清空大厅共享记忆（原文 + 摘要）。
+    pub(crate) fn forget_hall(&self) -> Result<usize> {
+        let connection = self.connection()?;
+        let lines = connection.execute("DELETE FROM ai_chat_hall_turns", [])?;
+        connection.execute(
+            "DELETE FROM ai_chat_summaries WHERE scope = ?1",
+            [Self::hall_scope()],
+        )?;
+        Ok(lines)
+    }
+
+    /// 大厅原文条数与 token 规模。
+    pub(crate) fn hall_stats(&self) -> Result<(usize, usize)> {
+        let connection = self.connection()?;
+        let row: (i64, i64) = connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM ai_chat_hall_turns",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((row.0 as usize, row.1 as usize))
+    }
     /// 记忆摘要：事实条数与最近一次提问。
     pub(crate) fn summary(&self, actor: &str) -> Result<(usize, Option<String>)> {
         let connection = self.connection()?;
@@ -839,6 +1316,10 @@ pub(crate) struct PromptInput<'a> {
     pub(crate) question: &'a str,
     pub(crate) context: &'a ChatContext,
     pub(crate) allowed_commands: &'a [String],
+    /// 提问人。大厅里同时在场的玩家很多，模型必须知道在跟谁说话。
+    pub(crate) asker: &'a str,
+    /// 大厅共享记忆（所有人最近说的 + 滚动摘要）。
+    pub(crate) hall: &'a HallContext,
 }
 
 /// 当前消息模板。历史由独立 user/assistant 消息承载，保留旧占位符兼容。
@@ -859,6 +1340,46 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
     } else {
         input.allowed_commands.join("、")
     };
+    let asker = if input.asker.trim().is_empty() {
+        "（未知）".to_string()
+    } else {
+        input.asker.trim().to_string()
+    };
+    // 大厅共享记忆分两段：摘要（中期）在前，原文（近期）在后。
+    let mut hall_parts = Vec::new();
+    if let Some(summary) = input.hall.summary.as_deref() {
+        hall_parts.push(format!("【较早的大厅对话摘要】{summary}"));
+    }
+    if !input.hall.lines.is_empty() {
+        let recent = input
+            .hall
+            .lines
+            .iter()
+            .map(|(speaker, text)| format!("{speaker}：{text}"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        hall_parts.push(format!(
+            "【最近的大厅对话】
+{recent}"
+        ));
+    }
+    let hall = if hall_parts.is_empty() {
+        "（暂无）".to_string()
+    } else {
+        hall_parts.join(
+            "
+",
+        )
+    };
+    // 个人记忆的中期摘要同样要注入，否则压缩后信息就看不到了。
+    let summary = input
+        .context
+        .summary
+        .clone()
+        .unwrap_or_else(|| "（暂无）".to_string());
     input
         .config
         .answer_prompt
@@ -868,6 +1389,9 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
         .replace("{{history}}", history)
         .replace("{{bot_history}}", &bot_history)
         .replace("{{commands}}", &commands)
+        .replace("{{asker}}", &asker)
+        .replace("{{hall}}", &hall)
+        .replace("{{summary}}", &summary)
 }
 
 /// 按时间顺序恢复角色化的个人会话，绝不把全局发言冒充该玩家的历史。
@@ -877,7 +1401,11 @@ pub(crate) fn conversation_history(context: &ChatContext) -> Vec<serde_json::Val
         .iter()
         .flat_map(|turn| {
             [
-                serde_json::json!({"role":"user", "content":turn.question}),
+                // 统一 `[昵称]:内容`：模型靠这个格式认人。
+                serde_json::json!({
+                    "role":"user",
+                    "content": format!("{}:{}", asker_prefix(&turn.asker), turn.question)
+                }),
                 serde_json::json!({"role":"assistant", "content":turn.answer}),
             ]
         })
@@ -984,6 +1512,45 @@ mod tests {
             keyword: "橘子".to_string(),
             ..AiChatConfig::default()
         }
+    }
+
+    /// 回归：超预算时把最旧的原文压进摘要，且**不丢内容**。
+    ///
+    /// 用户定的分层：最近 10% 原文完整保留，其余压成摘要（占 20% 预算）。
+    /// 关键约束：压缩出的摘要如果为空，必须保留旧摘要——
+    /// 空摘要覆盖旧摘要等于把整段记忆清空。
+    #[test]
+    fn compression_keeps_recent_turns_and_never_blanks_the_summary() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        // 预算设得很小，确保一定超。
+        for index in 0..12 {
+            memory
+                .record_turn(
+                    "甲",
+                    &format!("第{index}个问题，内容足够长以占用一些 token 空间"),
+                    &format!("第{index}个回答，也要够长才能触发压缩"),
+                    50,
+                    1,
+                )
+                .unwrap();
+        }
+        let plan = memory
+            .plan_actor_compression("甲", 50)
+            .unwrap()
+            .expect("超预算时必须给出压缩计划");
+        assert!(!plan.records.is_empty(), "应当取到需要压缩的原文");
+        // 压缩输入必须带问答双方，不能只剩问题。
+        assert!(
+            plan.records.iter().any(|r| r.contains("→")),
+            "压缩输入应包含问答双方，实际 {:?}",
+            plan.records
+        );
+
+        // 空摘要不能覆盖已有内容。
+        memory.apply_compression(&plan, "旧摘要内容", 1).unwrap();
+        memory.apply_compression(&plan, "   ", 2).unwrap();
+        let context = memory.context("甲", 1_000).unwrap();
+        assert_eq!(context.summary.as_deref(), Some("旧摘要内容"));
     }
 
     #[test]
@@ -1176,7 +1743,9 @@ mod tests {
         let config = config();
         let context = ChatContext {
             facts: vec!["喜欢周杰伦".to_string(), "常点晴天".to_string()],
+            summary: None,
             turns: vec![StoredTurn {
+                asker: "甲".to_string(),
                 question: "推荐一首歌".to_string(),
                 answer: "试试晴天".to_string(),
             }],
@@ -1188,6 +1757,8 @@ mod tests {
             question: "再推荐一首",
             context: &context,
             allowed_commands: &allowed,
+            asker: "甲",
+            hall: &HallContext::default(),
         });
 
         assert!(prompt.contains("喜欢周杰伦"));
@@ -1200,12 +1771,15 @@ mod tests {
     fn conversation_history_preserves_roles_and_excludes_global_bot_lines() {
         let context = ChatContext {
             facts: vec!["偏好".into()],
+            summary: None,
             turns: vec![
                 StoredTurn {
+                    asker: "甲".into(),
                     question: "第一问".into(),
                     answer: "第一答".into(),
                 },
                 StoredTurn {
+                    asker: "甲".into(),
                     question: "第二问".into(),
                     answer: "第二答".into(),
                 },
@@ -1215,9 +1789,9 @@ mod tests {
         assert_eq!(
             conversation_history(&context),
             vec![
-                serde_json::json!({"role":"user","content":"第一问"}),
+                serde_json::json!({"role":"user","content":"[甲]:第一问"}),
                 serde_json::json!({"role":"assistant","content":"第一答"}),
-                serde_json::json!({"role":"user","content":"第二问"}),
+                serde_json::json!({"role":"user","content":"[甲]:第二问"}),
                 serde_json::json!({"role":"assistant","content":"第二答"}),
             ]
         );
@@ -1228,6 +1802,8 @@ mod tests {
             question: "当前问题",
             context: &context,
             allowed_commands: &[],
+            asker: "甲",
+            hall: &HallContext::default(),
         });
         assert!(!prompt.contains("第一问"));
         assert!(prompt.contains("当前问题"));
@@ -1242,6 +1818,8 @@ mod tests {
             question: "你好",
             context: &ChatContext::default(),
             allowed_commands: &[],
+            asker: "甲",
+            hall: &HallContext::default(),
         });
 
         assert!(!prompt.contains("{{"));

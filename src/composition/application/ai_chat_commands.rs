@@ -61,12 +61,30 @@ impl ApplicationRuntime {
                     .business
                     .ai_chat_memory
                     .context(&actor, config.bot_token_budget)?;
+                // 给模型看的名字：先按 UID 反查（外部源的信封主语可能是 UID），
+                // 查不到再用 canonical 名。`actor` 仍是记忆归属键，两者分开。
+                let actor_display = match parsed.account.as_ref() {
+                    Some(account) => self
+                        .lifecycle
+                        .live_configs
+                        .identity
+                        .friend_row_names_for_account(&account.game, &account.uid)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| actor.clone()),
+                    None => actor.clone(),
+                };
+                // 大厅共享记忆：所有人最近说的 + 滚动摘要。
+                // 个人记忆只属于提问者，大厅上下文是所有人在同一空间里共享的。
+                let hall = self.business.ai_chat_memory.hall_context()?;
                 let allowed = self.ai_chat_allowed_commands(parsed);
                 let prompt = ai_chat::build_prompt(&ai_chat::PromptInput {
                     config: &config,
                     question,
                     context: &context,
                     allowed_commands: &allowed,
+                    asker: actor_display.as_str(),
+                    hall: &hall,
                 });
                 let tools = if config.allow_commands {
                     ai_chat::command_tools(&allowed)
@@ -162,6 +180,15 @@ impl ApplicationRuntime {
                         config.bot_token_budget,
                         now_ms,
                     )?;
+                    // 大厅共享记忆：写入的是「谁说了什么」。
+                    // 只有以关键词开头、真正触发 AI 的内容才进来，普通闲聊不入记忆。
+                    self.business.ai_chat_memory.record_hall_line(
+                        &actor_display,
+                        question,
+                        now_ms,
+                    )?;
+                    // 超预算时压缩。失败不影响已发出的回复。
+                    self.compress_ai_chat_memory(&actor, &config, now_ms);
                 }
                 self.log_executed_command(parsed, "ai_chat")?;
                 if let Err(error) =
@@ -252,6 +279,73 @@ impl ApplicationRuntime {
         Ok(())
     }
 
+    /// 超过预算时把最旧的记忆压成摘要。
+    ///
+    /// 分层（用户定的比例）：最远的 70% 压缩、20% 摘要、10% 最近原文完整保存。
+    /// 远期事实单独存，不参与压缩。
+    ///
+    /// 压缩失败只记日志：回复已经发出，不该因为整理记忆而报错；
+    /// 原文仍在库里，下一轮会再试。空摘要也不会覆盖旧摘要。
+    fn compress_ai_chat_memory(
+        &self,
+        actor: &str,
+        config: &crate::features::ai_chat::AiChatConfig,
+        now_ms: i64,
+    ) {
+        let memory = &self.business.ai_chat_memory;
+        // 个人记忆与大厅记忆各自独立压缩：两层预算不同，触发时机也不同。
+        let mut plans = Vec::new();
+        match memory.plan_actor_compression(actor, config.actor_token_budget) {
+            Ok(Some(plan)) => plans.push(plan),
+            Ok(None) => {}
+            Err(error) => log::warn!("个人记忆压缩规划失败: {error:#}"),
+        }
+        match memory.plan_hall_compression(config.hall_token_budget) {
+            Ok(Some(plan)) => plans.push(plan),
+            Ok(None) => {}
+            Err(error) => log::warn!("大厅记忆压缩规划失败: {error:#}"),
+        }
+        for plan in plans {
+            let summary = match self.summarize_memory(&plan, config) {
+                Ok(summary) => summary,
+                Err(error) => {
+                    log::warn!(
+                        "记忆压缩失败，原文保留待下轮重试 scope={}: {error:#}",
+                        plan.scope
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = memory.apply_compression(&plan, &summary, now_ms) {
+                log::warn!("记忆压缩结果写入失败 scope={}: {error:#}", plan.scope);
+            }
+        }
+    }
+
+    /// 调一次模型，把「旧摘要 + 新溢出的原文」压成新摘要。
+    fn summarize_memory(
+        &self,
+        plan: &crate::features::ai_chat::CompressionPlan,
+        config: &crate::features::ai_chat::AiChatConfig,
+    ) -> Result<String> {
+        let records = plan.records.join("\n");
+        let prompt = crate::features::ai_chat::summary_prompt(&plan.previous_summary, &records);
+        // 与事实抽取同样处理：不持 UI 租约干等模型。
+        let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
+        let reply = crate::config::ai::request_json(
+            &self.business.ai_chat_openai,
+            &self.business.ai_connection,
+            &crate::config::ai::AiCallOptions {
+                model: config.model.clone(),
+                reasoning: config.reasoning,
+            },
+            &prompt,
+            &records,
+            crate::features::ai_chat::SUMMARY_MAX_TOKENS,
+            self.business.ai_request_timeout,
+        )?;
+        Ok(crate::features::ai_chat::parse_summary(&reply))
+    }
     /// 执行 AI 给出的命令：复用正常路由与执行链路，身份仍是提问者本人。
     fn run_ai_chat_command(
         &mut self,

@@ -423,7 +423,7 @@ impl ApplicationRuntime {
         }
         self.execute_command(&routed)?;
         Ok(
-            serde_json::json!({"status":"handled","reason":"正常业务处理器已返回。业务可能已自行发送提示或启动异步流程；这不证明歌曲已入队、已播放等最终状态，不得据此声称最终成功。"}),
+            serde_json::json!({"status":"handled","reason":"命令已执行成功。"}),
         )
     }
 }

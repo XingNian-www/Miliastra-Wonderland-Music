@@ -1305,8 +1305,15 @@ impl ChatDecisionReader {
         if !self.any_conversation {
             return false;
         }
-        // 键一律用业务容器：外部帧没有屏幕桶，而屏幕桶本来也只是面板的别名，
-        // 两者混在一个集合里会让同一会话因来源不同而各记一次。
+        // 只对**屏幕帧**做首帧防护。
+        //
+        // 防护的目的是挡住「窗口打开后才被渲染出来的整屏历史」。外部聊天源的消息
+        // 每条只投递一次、且是真实事件而非屏幕重绘，首帧就是决策输入本身——把它
+        // 跳过等于永久吞掉这一次确认，窗口只能等到超时。
+        if !snapshot.source.is_ocr() {
+            return false;
+        }
+        // 键一律用业务容器：屏幕桶只是面板的别名，混用会让同一会话各记一次。
         // `insert` 返回 true 表示「这次才第一次见到」——那正是要跳过的一帧。
         self.settled_conversations.insert(snapshot.scope.clone())
     }

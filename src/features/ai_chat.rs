@@ -1357,11 +1357,18 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
         .summary
         .clone()
         .unwrap_or_else(|| "（暂无）".to_string());
+    // 提问必须带 [昵称] 前缀。
+    //
+    // 只提供 {{asker}} 占位符是不够的：模板存在配置库里，用户在面板改过或
+    // 沿用了旧默认值，就永远不会把这个占位符补上，模型也就看不到是谁在说话。
+    // 把标识做进 {{question}} 本身，任何模板下都成立。
+    // 昵称缺失时 asker_prefix 给 [未知]，不会出现空方括号。
+    let question = format!("{}:{}", asker_prefix(input.asker), input.question.trim());
     input
         .config
         .answer_prompt
         .replace("{{keyword}}", &input.config.keyword)
-        .replace("{{question}}", input.question)
+        .replace("{{question}}", &question)
         .replace("{{facts}}", &facts)
         .replace("{{history}}", history)
         .replace("{{bot_history}}", &bot_history)
@@ -1978,5 +1985,46 @@ mod tests {
             Some(AiChatCommand::Forget)
         ));
         let _ = CommandAuthority::HallMember;
+    }
+
+    /// 回归：模型必须能从提问里看出是谁在说话。
+    ///
+    /// 只提供 {{asker}} 占位符不够——模板存在配置库里，用户改过或沿用旧
+    /// 默认值就永远不会补上它，模型于是完全看不到昵称。标识做进 {{question}}
+    /// 本身，任何模板下都成立。
+    #[test]
+    fn question_carries_the_asker_nickname_regardless_of_template() {
+        let mut config = config();
+        // 刻意用一个不含任何身份占位符的旧模板。
+        config.answer_prompt = "玩家说：{{question}}".into();
+        let context = ChatContext::default();
+        let prompt = build_prompt(&PromptInput {
+            config: &config,
+            question: "喵一个",
+            context: &context,
+            allowed_commands: &[],
+            asker: "玩家乙",
+            hall: &HallContext::default(),
+        });
+        assert!(
+            prompt.contains("[玩家乙]:喵一个"),
+            "提问必须带昵称前缀，实际: {prompt}"
+        );
+    }
+
+    /// 昵称缺失时用占位称呼，不能出现空的方括号。
+    #[test]
+    fn missing_asker_yields_an_explicit_placeholder() {
+        let config = config();
+        let context = ChatContext::default();
+        let prompt = build_prompt(&PromptInput {
+            config: &config,
+            question: "你好",
+            context: &context,
+            allowed_commands: &[],
+            asker: "  ",
+            hall: &HallContext::default(),
+        });
+        assert!(prompt.contains("[未知]:你好"), "实际: {prompt}");
     }
 }

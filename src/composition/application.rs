@@ -2021,57 +2021,16 @@ struct SecondaryHallMessageClassification {
 fn secondary_hall_command_text(text: &str) -> Option<&str> {
     // 命令必须**从 @ / # 起头**，不能是正文里随便出现的符号。
     //
-    // 曾经为了兼容外部源补的「昵称：」前缀，这里改成在任意位置查找 `@`，
-    // 结果任何含有 @ 的闲聊都被当成命令从 @ 处截断：
-    // 「今天天气不错@某人」会被判成命令 `@某人`。
-    //
-    // 正确语义：昵称前缀只允许**一段**，剥掉后正文必须以命令前缀开头。
-    // 屏幕上的二级气泡本来就是「昵称：正文」排版，所以这一步同时覆盖 OCR 与外部源。
-    let body = strip_leading_sender(text).trim();
+    // 整个项目现在只有一套 sender 切分：OCR 扫描层与外部源投递层在交付前
+    // 就把昵称剥到独立的 sender 字段，所以这里拿到的一定是**纯正文**。
+    // 曾经为兼容「昵称：」前缀在任意位置查找 `@`，结果任何含 @ 的闲聊
+    // 都被从 @ 处截断成命令（「今天天气不错@某人」→ `@某人`）。
+    let body = text.trim();
     let first = body.chars().next()?;
     if matches!(first, '@' | '＠' | '#' | '＃') {
         return Some(body);
     }
     None
-}
-
-/// 剥掉行首的「昵称：」/「[昵称]：」前缀，返回正文。
-///
-/// 只剥**一段**：`甲：乙：@状态` 里 `乙` 是正文，不该被当成第二层昵称。
-/// 找不到分隔符时原样返回。
-fn strip_leading_sender(text: &str) -> &str {
-    let text = text.trim_start();
-    // `[甲]：@状态` 与 `甲：@状态` 两种排版都要认。
-    // 注意：`【】` 是 3 字节字符，偏移必须用该字符的字节长度，
-    // 不能 `close + 1`——那会切在字符内部直接 panic。
-    let after_brackets = if let Some(rest) = text.strip_prefix('[') {
-        match rest.find(']') {
-            Some(close) => &rest[close + ']'.len_utf8()..],
-            None => text,
-        }
-    } else if let Some(rest) = text.strip_prefix('【') {
-        match rest.find('】') {
-            Some(close) => &rest[close + '】'.len_utf8()..],
-            None => text,
-        }
-    } else {
-        text
-    };
-    // 括号形式剥完可能直接就是分隔符（`[甲]：@状态` → `：@状态`），先吃掉它。
-    let after_brackets = after_brackets
-        .trim_start()
-        .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-    // 昵称与正文之间的分隔符：全角/半角冒号。
-    for separator in ['：', ':'] {
-        if let Some(index) = after_brackets.find(separator) {
-            let (name, rest) = after_brackets.split_at(index);
-            // 昵称本身不能以命令符号开头，否则 `@甲：@状态` 会被误剥成 `@状态`。
-            if !name.trim().is_empty() && !name.trim_start().starts_with(['@', '＠', '#', '＃']) {
-                return rest[separator.len_utf8()..].trim_start();
-            }
-        }
-    }
-    after_brackets
 }
 
 /// 判断一条二级大厅消息属于哪类，以及它是否依赖真实发送者身份。
@@ -2228,16 +2187,12 @@ mod tests {
         assert_eq!(secondary_hall_command_text("聊天内容 #话题"), None);
         assert_eq!(secondary_hall_command_text("今天天气不错@某人"), None);
         assert_eq!(secondary_hall_command_text("想问一下@状态"), None);
-        // 昵称前缀只允许一段，剥掉后正文必须是命令。
-        assert_eq!(secondary_hall_command_text("昵称：#状态"), Some("#状态"));
-        assert_eq!(secondary_hall_command_text("昵称：@状态"), Some("@状态"));
-        assert_eq!(secondary_hall_command_text("[甲]：@状态"), Some("@状态"));
-        assert_eq!(secondary_hall_command_text("【甲】：#状态"), Some("#状态"));
-        // 行首直接是命令（OCR 气泡本来就可能不含昵称）。
+        // 行首直接是命令：昵称已由 OCR 扫描层剥到 sender 字段，正文是纯的。
         assert_eq!(secondary_hall_command_text("@状态"), Some("@状态"));
         assert_eq!(secondary_hall_command_text("＠状态"), Some("＠状态"));
-        // 只剥一段：「甲：乙：@状态」里 `乙` 是正文，不是第二层昵称。
-        assert_eq!(secondary_hall_command_text("甲：乙：@状态"), None);
+        // 带昵称前缀的文本不该再出现在这里；万一出现，宁可漏命令也不误判。
+        assert_eq!(secondary_hall_command_text("昵称：#状态"), None);
+        assert_eq!(secondary_hall_command_text("昵称：@状态"), None);
     }
 
     #[test]

@@ -422,9 +422,7 @@ impl ApplicationRuntime {
             return Ok(serde_json::json!({"status":"rejected","reason":"命令识别已禁用"}));
         }
         self.execute_command(&routed)?;
-        Ok(
-            serde_json::json!({"status":"handled","reason":"命令已执行成功。"}),
-        )
+        Ok(serde_json::json!({"status":"handled","reason":"命令已执行成功。"}))
     }
 }
 

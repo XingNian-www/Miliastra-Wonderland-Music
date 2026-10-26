@@ -2018,17 +2018,59 @@ struct SecondaryHallMessageClassification {
 }
 
 fn secondary_hall_command_text(text: &str) -> Option<&str> {
-    // 顺序与 OCR 既有语义一致：`@` 优先。
+    // 命令必须**从 @ / # 起头**，不能是正文里随便出现的符号。
     //
-    // 一级路径历史上就是「先找 @，找不到再找 #」（`CommandEnvelope` 的 At 分支
-    // 先判）。这里保持同一顺序，否则同时含 `@` 与 `#` 的文本（如歌名带 `#`）
-    // 会被截成后半段，两条路径派发不同结果——违反「OCR 行为不变」。
-    if let Some(index) = text.find(['@', '＠']) {
-        return Some(text[index..].trim());
+    // 曾经为了兼容外部源补的「昵称：」前缀，这里改成在任意位置查找 `@`，
+    // 结果任何含有 @ 的闲聊都被当成命令从 @ 处截断：
+    // 「今天天气不错@某人」会被判成命令 `@某人`。
+    //
+    // 正确语义：昵称前缀只允许**一段**，剥掉后正文必须以命令前缀开头。
+    // 屏幕上的二级气泡本来就是「昵称：正文」排版，所以这一步同时覆盖 OCR 与外部源。
+    let body = strip_leading_sender(text).trim();
+    let first = body.chars().next()?;
+    if matches!(first, '@' | '＠' | '#' | '＃') {
+        return Some(body);
     }
-    // `#` 不要求行首：外部聊天源统一补了「昵称：」前缀，`#` 会落在行中间。
-    // 屏幕上的一行本来也可能是「昵称：#状态」（二级面板的好友消息排版）。
-    text.find(['#', '＃']).map(|index| text[index..].trim())
+    None
+}
+
+/// 剥掉行首的「昵称：」/「[昵称]：」前缀，返回正文。
+///
+/// 只剥**一段**：`甲：乙：@状态` 里 `乙` 是正文，不该被当成第二层昵称。
+/// 找不到分隔符时原样返回。
+fn strip_leading_sender(text: &str) -> &str {
+    let text = text.trim_start();
+    // `[甲]：@状态` 与 `甲：@状态` 两种排版都要认。
+    // 注意：`【】` 是 3 字节字符，偏移必须用该字符的字节长度，
+    // 不能 `close + 1`——那会切在字符内部直接 panic。
+    let after_brackets = if let Some(rest) = text.strip_prefix('[') {
+        match rest.find(']') {
+            Some(close) => &rest[close + ']'.len_utf8()..],
+            None => text,
+        }
+    } else if let Some(rest) = text.strip_prefix('【') {
+        match rest.find('】') {
+            Some(close) => &rest[close + '】'.len_utf8()..],
+            None => text,
+        }
+    } else {
+        text
+    };
+    // 括号形式剥完可能直接就是分隔符（`[甲]：@状态` → `：@状态`），先吃掉它。
+    let after_brackets = after_brackets
+        .trim_start()
+        .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
+    // 昵称与正文之间的分隔符：全角/半角冒号。
+    for separator in ['：', ':'] {
+        if let Some(index) = after_brackets.find(separator) {
+            let (name, rest) = after_brackets.split_at(index);
+            // 昵称本身不能以命令符号开头，否则 `@甲：@状态` 会被误剥成 `@状态`。
+            if !name.trim().is_empty() && !name.trim_start().starts_with(['@', '＠', '#', '＃']) {
+                return rest[separator.len_utf8()..].trim_start();
+            }
+        }
+    }
+    after_brackets
 }
 
 /// 判断一条二级大厅消息属于哪类，以及它是否依赖真实发送者身份。
@@ -2173,20 +2215,28 @@ mod tests {
     fn secondary_hall_extracts_only_supported_command_prefixes() {
         assert_eq!(secondary_hall_command_text(" #状态 "), Some("#状态"));
         assert_eq!(secondary_hall_command_text("＃状态"), Some("＃状态"));
-        assert_eq!(
-            secondary_hall_command_text("聊天内容 @点歌 测试"),
-            Some("@点歌 测试")
-        );
-        assert_eq!(
-            secondary_hall_command_text("聊天内容 ＠点歌 测试"),
-            Some("＠点歌 测试")
-        );
+        // 正文中间出现的命令符号**不算命令**：那是闲聊里提到，不是指令。
+        assert_eq!(secondary_hall_command_text("聊天内容 @点歌 测试"), None);
+        assert_eq!(secondary_hall_command_text("聊天内容 ＠点歌 测试"), None);
         assert_eq!(secondary_hall_command_text("普通聊天"), None);
-        // 正文里出现 `#` 也会被截断出来，但**能不能执行取决于 router**：
-        // `#话题` 不是注册命令，`route` 返回 None，不会被当成命令派发。
-        // 这里只固定提取行为，执行与否由下游命令表决定。
-        assert_eq!(secondary_hall_command_text("聊天内容 #话题"), Some("#话题"));
+        // 命令必须**从 @ / # 起头**。
+        //
+        // 以前的实现为兼容「昵称：」前缀，改成在任意位置找 `@`/`#`，
+        // 于是任何含 @ 的闲聊都被从 @ 处截断成命令。
+        // 现在只允许正文首字符是命令前缀。
+        assert_eq!(secondary_hall_command_text("聊天内容 #话题"), None);
+        assert_eq!(secondary_hall_command_text("今天天气不错@某人"), None);
+        assert_eq!(secondary_hall_command_text("想问一下@状态"), None);
+        // 昵称前缀只允许一段，剥掉后正文必须是命令。
         assert_eq!(secondary_hall_command_text("昵称：#状态"), Some("#状态"));
+        assert_eq!(secondary_hall_command_text("昵称：@状态"), Some("@状态"));
+        assert_eq!(secondary_hall_command_text("[甲]：@状态"), Some("@状态"));
+        assert_eq!(secondary_hall_command_text("【甲】：#状态"), Some("#状态"));
+        // 行首直接是命令（OCR 气泡本来就可能不含昵称）。
+        assert_eq!(secondary_hall_command_text("@状态"), Some("@状态"));
+        assert_eq!(secondary_hall_command_text("＠状态"), Some("＠状态"));
+        // 只剥一段：「甲：乙：@状态」里 `乙` 是正文，不是第二层昵称。
+        assert_eq!(secondary_hall_command_text("甲：乙：@状态"), None);
     }
 
     #[test]

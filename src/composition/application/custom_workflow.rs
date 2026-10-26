@@ -433,7 +433,7 @@ impl InviteExecutionPort for ApplicationRuntime {
 
     fn execute_invite_ui(
         &self,
-        username: &str,
+        recipients: &[String],
         password: Option<&str>,
         notification: &str,
     ) -> Result<BusinessInviteUiOutcome> {
@@ -445,7 +445,7 @@ impl InviteExecutionPort for ApplicationRuntime {
             .ui
             .invite_ui
             .submit(ExecuteInvite::new(
-                username,
+                recipients.to_vec(),
                 password.map(str::to_string),
                 fit_chat_message(
                     &self

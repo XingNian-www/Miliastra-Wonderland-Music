@@ -416,6 +416,32 @@ impl IdentityAccess {
         Some(id)
     }
 
+    /// 后台补查到昵称后，回填自动创建身份的备注。
+    ///
+    /// 只填空备注，绝不覆盖用户手写的 note：面板里改过的名字优先。
+    /// 返回 true 表示确实改动了，调用方需要把映射写回配置库。
+    pub fn backfill_account_note(&self, game: &str, uid: &str, nickname: &str) -> bool {
+        let nickname = nickname.trim();
+        let uid = uid.trim();
+        if nickname.is_empty() || uid.is_empty() {
+            return false;
+        }
+        let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let Some(mapping) = config.mappings.iter_mut().find(|mapping| {
+            mapping
+                .accounts
+                .iter()
+                .any(|account| account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid)
+        }) else {
+            return false;
+        };
+        if !mapping.note.trim().is_empty() {
+            return false;
+        }
+        mapping.note = nickname.to_string();
+        true
+    }
+
     /// 测试辅助：当前映射条数。
     #[cfg(test)]
     pub(crate) fn mapping_count_for_test(&self) -> usize {
@@ -432,6 +458,30 @@ impl IdentityAccess {
             .unwrap_or_else(|| nickname.to_owned())
     }
 
+    /// 好友列表里可以拿来定位这个账号的候选名，按优先级排列。
+    ///
+    /// 为什么是**多个**：外部聊天源的发起人只有 UID，没有可信昵称。
+    /// ensure_identity_for_account 自动建的身份把 API 昵称写进 note、
+    /// 把随机 8 位串写进 nickname（那是 OCR 匹配键，不是真名）；
+    /// 手工维护的映射则反过来，真名在 nickname、备注在 note。
+    /// 两种来源都得试，否则必有一半玩家的邀请找不到人。
+    ///
+    /// 顺序：note（面板展示名，通常是玩家看得见的名字）优先，
+    /// nickname（OCR 匹配键，手工配置时就是好友备注名）次之。
+    /// 空串与重复项已剔除；一个都没有时返回空表，调用方据此在进 UI 前失败。
+    pub fn friend_row_names_for_account(&self, game: &str, uid: &str) -> Vec<String> {
+        let Some(identity) = self.resolve_account(game, uid) else {
+            return Vec::new();
+        };
+        let mut names = Vec::with_capacity(2);
+        for candidate in [identity.note.trim(), identity.nickname.trim()] {
+            if candidate.is_empty() || names.iter().any(|existing| existing == candidate) {
+                continue;
+            }
+            names.push(candidate.to_string());
+        }
+        names
+    }
     /// 获取好友操作接口使用的原始游戏昵称；备注昵称只用于身份识别和展示。
     pub fn canonical_name(&self, nickname: &str) -> String {
         self.resolve(nickname)
@@ -546,6 +596,60 @@ mod tests {
         }
     }
 
+    /// 回归：外部源的发起人只有 UID 时，邀请必须能搜到好友列表里的名字。
+    ///
+    /// 实机故障：`execute_invite_intent` 把信封主语（= UID）当昵称传下去，
+    /// 好友列表上显示的是昵称/备注，`recognized == "900000001"` 永假，
+    /// 报 `no unique stable friend row`。
+    ///
+    /// UID 反查得到的两个候选都要参与匹配：自动建身份把 API 昵称放 note、
+    /// 随机串放 nickname；手工映射反过来。
+    #[test]
+    fn invite_searches_both_note_and_nickname_for_a_uid_initiator() {
+        use crate::features::identity::{
+            GameAccount, IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
+        };
+
+        let identity = IdentityAccess::new(IdentityConfig {
+            mappings: vec![IdentityMapping {
+                // 手工维护：真名在 nickname，备注在 note
+                nickname: "玩家丙".to_string(),
+                id: uuid::Uuid::new_v4(),
+                role: IdentityRole::Friend,
+                note: "厅主".to_string(),
+                accounts: vec![GameAccount {
+                    game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
+                    uid: "900000001".to_string(),
+                }],
+            }],
+        });
+
+        let names = identity
+            .friend_row_names_for_account(miliastra_kernel::chat_source::GAME_GENSHIN, "900000001");
+        assert!(
+            names.contains(&"玩家丙".to_string()),
+            "必须包含游戏内昵称，实际 {names:?}"
+        );
+        assert!(
+            names.contains(&"厅主".to_string()),
+            "必须包含备注名，实际 {names:?}"
+        );
+        assert!(!names.iter().any(|name| name == "900000001"));
+    }
+
+    /// 未登记的 UID 拿不到任何候选名：调用方应回退到信封主语并在进 UI 前告警。
+    #[test]
+    fn unknown_uid_yields_no_search_names() {
+        let identity = crate::features::identity::IdentityAccess::new(Default::default());
+        assert!(
+            identity
+                .friend_row_names_for_account(
+                    miliastra_kernel::chat_source::GAME_GENSHIN,
+                    "999999999",
+                )
+                .is_empty()
+        );
+    }
     #[test]
     fn resolve_matches_exactly_and_never_maps_unknown() {
         let access = IdentityAccess::new(sample_config());

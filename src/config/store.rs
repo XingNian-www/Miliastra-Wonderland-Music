@@ -29,7 +29,11 @@ use super::{AppConfig, BootstrapConfig};
 ///
 /// 重置只重建配置三表，歌曲缓存与音频文件不受影响；重置前会先把整库
 /// 备份到同目录的 `.bak` 文件，便于用户找回旧配置。
-pub const CONFIG_SCHEMA_VERSION: i64 = 2;
+///
+/// v2 → v3：AI 聊天记忆改成三层结构，新增单人中期摘要预算、大厅原文预算、
+/// 大厅中期摘要预算三个字段。配置库要求键集与 schema 完全一致，旧库缺字段
+/// 会在加载时报「与当前 schema 不匹配」，因此必须升版本走断代重置。
+pub const CONFIG_SCHEMA_VERSION: i64 = 3;
 
 /// 打开连接（含头初始化）的重试次数：两个进程并发首次创建同一新库文件时，
 /// SQLite 头初始化阶段的锁竞争发生在 busy_timeout 生效之前，需要有限重试吸收。

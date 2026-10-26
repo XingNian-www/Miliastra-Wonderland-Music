@@ -2339,27 +2339,32 @@ impl BusinessRuntime {
 
     pub fn prepare_shutdown(&self) -> Result<BusinessRuntimeSnapshot, BusinessRuntimeError> {
         let (response, receiver) = mpsc::sync_channel(1);
-        {
+        // 锁内只改状态并挑选消息类型，**出锁再 send**。
+        //
+        // 队列是有界 channel，满时 send 会阻塞；持着 `state` 锁阻塞会拖住
+        // send_request / send_query（它们要先抢同一把锁），纯查询调用也跟着卡，
+        // 关闭期出现确定性卡顿与优先级反转。
+        let message = {
             let mut state = self
                 .handle
                 .channel
                 .state
                 .lock()
                 .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-            let message = match *state {
+            match *state {
                 RuntimeChannelState::Running => {
                     *state = RuntimeChannelState::Quiescing;
                     RuntimeMessage::PrepareShutdown(response)
                 }
                 RuntimeChannelState::Quiescing => RuntimeMessage::Snapshot(response),
                 RuntimeChannelState::Stopped => return Err(BusinessRuntimeError::RuntimeStopped),
-            };
-            self.handle
-                .channel
-                .sender
-                .send(message)
-                .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
-        }
+            }
+        };
+        self.handle
+            .channel
+            .sender
+            .send(message)
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?;
         receiver
             .recv()
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)
@@ -2383,7 +2388,9 @@ impl BusinessRuntime {
             return Err(BusinessRuntimeError::RuntimeStopped);
         };
         let (response, receiver) = mpsc::sync_channel(1);
-        let sent = {
+        // 同 prepare_shutdown：锁内只改状态，出锁再 send，避免队列满时
+        // 持锁阻塞、把并发请求与另一次 shutdown 一起拖住。
+        {
             let mut state = self
                 .handle
                 .channel
@@ -2394,12 +2401,13 @@ impl BusinessRuntime {
                 return Err(BusinessRuntimeError::RuntimeStopped);
             }
             *state = RuntimeChannelState::Stopped;
-            self.handle
-                .channel
-                .sender
-                .send(RuntimeMessage::Shutdown(response))
-                .is_ok()
-        };
+        }
+        let sent = self
+            .handle
+            .channel
+            .sender
+            .send(RuntimeMessage::Shutdown(response))
+            .is_ok();
         let snapshot = sent.then(|| receiver.recv().ok()).flatten();
         let worker_result = worker
             .join()

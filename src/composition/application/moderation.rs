@@ -330,7 +330,19 @@ impl AppModerationVotePort {
                         // 任何 OCR 基线可参照：OCR 消息的 source_sequence 恒为 0，拿它
                         // 去比服务端大序号会恒假，整窗 OCR 票静默丢弃。来源中途切换的
                         // 情形退回放行，由调用方的采样门槛兜住误读。
-                        let newer = if self.baseline.is_none() && snapshot.source.is_ocr() {
+                        // 单位必须**同源**才能比较：基线是按当时那一帧的来源算的，
+                        // 当前帧的来源可能已经切换。跨来源比较等于拿服务端大序号
+                        // 去比屏幕小序号（或反过来），一边恒假丢光整窗票，
+                        // 另一边恒真让积压消息混进本窗。
+                        let baseline_is_ocr = self
+                            .baseline
+                            .as_ref()
+                            .is_none_or(|baseline| baseline.source.is_ocr());
+                        let newer = if self.baseline.is_none()
+                            || baseline_is_ocr != snapshot.source.is_ocr()
+                        {
+                            // 没有基线，或来源中途切换：水位不可比，退回放行，
+                            // 由调用方的采样门槛兜住误读。
                             true
                         } else if snapshot.source.is_ocr() {
                             message.id.bubble_sequence.get() > self.baseline_sequence
@@ -936,6 +948,49 @@ mod tests {
             "回落 OCR 后票仍须计入；水位单位错配会让整窗票静默丢弃"
         );
     }
+    /// 回归：基线来自**外部源快照**时，窗口内回落到 OCR 仍要计票。
+    ///
+    /// 与 `from_external_watermark`（baseline 为 None）不同，这条路径里
+    /// `baseline` 是 Some，水位是服务端大序号。以前的判定只看
+    /// `baseline.is_none()`，于是 OCR 小序号恒小于大水位 → 整窗票静默丢弃。
+    #[test]
+    fn ocr_votes_count_when_the_baseline_came_from_an_external_snapshot() {
+        use crate::observation::chat::{ChatTimelineSnapshot, SourceId};
+        let shared = ChatTimeline::new();
+        let subscriber = shared.subscribe_scoped(ChatScope::hall()).unwrap();
+        let context = ModerationVoteContext {
+            running: Arc::new(AtomicBool::new(true)),
+            chat_timeline: shared.clone(),
+            baseline_timeout: Duration::from_secs(1),
+            vote_scope: ChatScope::hall(),
+            identity: crate::features::identity::IdentityAccess::new(Default::default()),
+            external_floor: None,
+        };
+        // 基线快照来自外部源，消息带服务端大序号。
+        let baseline = ChatTimelineSnapshot {
+            visual_session: crate::observation::chat::VisualSessionId::new(1),
+            captured_at: Instant::now(),
+            chat: Some(ChatIdentity::PrimaryHall),
+            scope: ChatScope::hall(),
+            source: SourceId::external("test"),
+            messages: Vec::new(),
+        };
+        let mut port = AppModerationVotePort::from_baseline(context, subscriber, baseline).unwrap();
+        // 窗口内聊天源回落到 OCR，带来一张票。
+        shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![shared_vote_input("[甲]：@同意", "pink", 10)],
+            )
+            .unwrap();
+        let votes = port.read_votes().unwrap();
+        assert!(
+            !votes.is_empty(),
+            "基线来自外部源时，回落 OCR 的票不能被水位单位错配丢掉"
+        );
+    }
+
     #[test]
     fn external_vote_counts_after_a_single_sample() {
         let shared = ChatTimeline::new();

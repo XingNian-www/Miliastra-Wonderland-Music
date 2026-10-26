@@ -131,16 +131,28 @@ impl ApplicationRuntime {
                                 serde_json::json!({"status":"rejected","reason":"未知工具"})
                             } else if let Ok(execution) = ai_chat::parse_execution(&call.arguments)
                             {
-                                if !executed.insert(execution.command.clone()) {
+                                // 去重键要规范化：`@点歌 晴天` 与 `@点歌晴天` 是同一命令
+                                // （全项目都不依赖空格分隔），原样比字符串会让模型绕过去重。
+                                let key = normalize_tool_command(&execution.command);
+                                if executed.contains(&key) {
                                     serde_json::json!({"status":"rejected","reason":"同一问答内禁止重复执行相同命令"})
-                                } else if executed.len() > ai_chat::MAX_TOOL_ROUNDS {
+                                } else if executed.len() >= ai_chat::MAX_TOOL_ROUNDS {
                                     serde_json::json!({"status":"rejected","reason":"已达到命令执行次数上限"})
                                 } else {
-                                    self.run_ai_chat_command(parsed, &execution.command)
+                                    // 只有真正执行成功才占用配额：原来 insert 在判定之前，
+                                    // 三条被拒的命令就会耗光次数，模型连自我纠错的机会都没有。
+                                    let outcome = self
+                                        .run_ai_chat_command(parsed, &execution.command)
                                         .unwrap_or_else(|error| {
                                             log::warn!("AI 工具执行结果未确认: {error:#}");
                                             serde_json::json!({"status":"unknown","reason":"执行异常，不得重试或声称成功"})
-                                        })
+                                        });
+                                    if outcome.get("status").and_then(|v| v.as_str())
+                                        == Some("handled")
+                                    {
+                                        executed.insert(key);
+                                    }
+                                    outcome
                                 }
                             } else {
                                 serde_json::json!({"status":"rejected","reason":"命令参数不符合工具 Schema"})
@@ -468,4 +480,15 @@ fn command_now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// 工具命令的去重键：去掉所有空白与全角空格，避免同一条命令换个空格就绕过。
+///
+/// 项目约定命令不依赖空格分隔（`@点歌晴天` 与 `@点歌 晴天` 等价），
+/// 这里按同一语义归一化，只用于去重，不改变真正下发的文本。
+fn normalize_tool_command(command: &str) -> String {
+    command
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '\u{3000}')
+        .collect()
 }

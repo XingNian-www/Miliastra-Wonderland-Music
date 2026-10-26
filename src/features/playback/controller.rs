@@ -873,11 +873,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         immediate_observation: bool,
     ) -> Result<QueueAdvanceDecision> {
         let status = snapshot_status;
-        // 失败信号消失（重试成功或干净结束）时重置重试窗口计时，避免残留时间戳
-        // 导致下一首歌的首次失败被误判为已超窗。
-        if status.failure_code.is_empty() {
-            self.engine_failure_at_ms.store(0, Ordering::Relaxed);
-        }
+        // 失败信号消失时重置重试窗口的时机很重要：必须等**归属校验之后**再清，
+        // 否则过期残留样本（同函数下文明确预期存在）能清掉当前会话的放弃窗口，
+        // 把「超窗放弃」变成可被无关样本无限延后。清零点见下方归属分支。
         let external_playback_ended_this_round = self.playback_state.snapshot()?.state
             == ConfirmedPlaybackState::ExternalPlayback
             && matches!(status.status.as_str(), "stopped" | "stoped" | "idle");
@@ -1114,6 +1112,26 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             });
         }
 
+        // 失败信号消失（流重试成功或干净结束）时重置重试窗口计时。
+        //
+        // 必须在这里而不是分支内：`failure_code` 为空时根本进不了失败分支，
+        // 之前把清零写在分支里等于永远不会执行。
+        //
+        // 也不能放在归属校验之前：过期残留样本能清掉当前会话的放弃窗口，
+        // 把「超窗放弃」变成可被无关样本无限延后。所以先判归属。
+        if status.failure_code.is_empty()
+            && runtime_snapshot
+                .active_request
+                .as_ref()
+                .is_none_or(|request| {
+                    request.expected_session_id.is_empty()
+                        || (request.expected_session_id == status.session_id.trim()
+                            && request.expected_generation == status.generation)
+                })
+        {
+            self.engine_failure_at_ms.store(0, Ordering::Relaxed);
+        }
+
         // 引擎报告播放失败（解码失败/流被拒等），播放已终止。
         // 失败观测放在点歌保护之前：失败是明确终止信号，不应被起步保护忽略。
         if !status.failure_code.is_empty() && runtime_snapshot.active_request.is_some() {
@@ -1148,6 +1166,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 );
                 return Ok(QueueAdvanceDecision::None);
             }
+
             // 音频输出设备不可用/丢失：换歌也没用。停止自动出队，等设备恢复后
             // 引擎重建输出流并清空失败信号，再自动续播；期间不再逐首跳歌。
             if status.failure_code == "engine_unavailable" {
@@ -3537,7 +3556,14 @@ mod tests {
         manual_clock.advance(Duration::from_secs(3)).unwrap();
 
         // 流重试成功：失败信号消失，窗口重置。
-        let recovered = status("目标", &request.uri(), 30.0, 180.0);
+        // 必须是**同一引擎会话**的样本：归属校验会忽略旧会话/无会话的残留，
+        // 用默认状态（session 为空）构造会让窗口清除被跳过。
+        let recovered = PlayerStatus {
+            session_id: "session-a".to_string(),
+            generation: 41,
+            runtime_identity: "runtime-a".to_string(),
+            ..status("目标", &request.uri(), 30.0, 180.0)
+        };
         assert_eq!(
             controller
                 .maybe_advance_queue(recovered, context.clone())

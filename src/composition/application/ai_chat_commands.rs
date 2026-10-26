@@ -187,6 +187,13 @@ impl ApplicationRuntime {
                         question,
                         now_ms,
                     )?;
+                    // BOT 的回答也进大厅记忆：
+                    // 大厅是双向对话，只有问没有答，模型下一轮就不知道刚才承诺了什么。
+                    self.business.ai_chat_memory.record_hall_line(
+                        &self.bot_display_name(),
+                        &text,
+                        now_ms,
+                    )?;
                     // 超预算时压缩。失败不影响已发出的回复。
                     self.compress_ai_chat_memory(&actor, &config, now_ms);
                 }
@@ -277,6 +284,29 @@ impl ApplicationRuntime {
         }
         let _ = parsed;
         Ok(())
+    }
+
+    /// 大厅记忆里代表 BOT 自己的名字。
+    ///
+    /// 优先用配置的 `chat_source.self_uid` 反查（玩家给 BOT 的备注名最自然），
+    /// 查不到才退回固定称呼。避免写成 UID —— 那对模型毫无意义。
+    fn bot_display_name(&self) -> String {
+        let self_uid = self.lifecycle.config.chat_source.self_uid;
+        if self_uid != 0
+            && let Some(name) = self
+                .lifecycle
+                .live_configs
+                .identity
+                .friend_row_names_for_account(
+                    miliastra_kernel::chat_source::GAME_GENSHIN,
+                    &self_uid.to_string(),
+                )
+                .into_iter()
+                .next()
+        {
+            return name;
+        }
+        "BOT".to_string()
     }
 
     /// 超过预算时把最旧的记忆压成摘要。

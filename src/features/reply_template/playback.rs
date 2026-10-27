@@ -518,7 +518,10 @@ mod tests {
             "平台无对应歌曲音源，已跳过当前歌曲",
         ),
         // 以下是 7.0.0 新增的动态行模板：金标值 = 拆分前后的等价输出。
-        ("playback.status.with_song", "播放:晴天 - 周杰伦 (1:05/3:05) 音量80"),
+        (
+            "playback.status.with_song",
+            "播放:晴天 - 周杰伦 (1:05/3:05) 音量80",
+        ),
         ("playback.status.without_song", "播放:(0:00/0:00) 音量0"),
         ("playback.status.requester", "  点歌人"),
         (

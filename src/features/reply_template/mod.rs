@@ -437,12 +437,14 @@ impl CommandReplyCatalogEntry {
 
 /// 命令回复目录。顺序即命令面板的展示顺序。
 pub(crate) fn command_reply_catalog() -> impl Iterator<Item = CommandReplyCatalogEntry> + 'static {
-    ownership::REPLY_GROUPS.iter().map(|group| CommandReplyCatalogEntry {
-        id: group.command_id,
-        name: group.name,
-        category: group.category,
-        keys: group.keys,
-    })
+    ownership::REPLY_GROUPS
+        .iter()
+        .map(|group| CommandReplyCatalogEntry {
+            id: group.command_id,
+            name: group.name,
+            category: group.category,
+            keys: group.keys,
+        })
 }
 
 /// 与已有分组共用回复的命令别名表。
@@ -480,8 +482,19 @@ pub(crate) fn spec_for_key(key: &str) -> Option<&'static ReplyTemplate> {
 pub(crate) fn reply_variables() -> &'static [ReplyVariable] {
     REPLY_VARIABLES
 }
+/// 回复模板里允许出现的变量名。
+///
+/// 三类都要认，缺一类就会出现「面板列出来、保存却报未知变量」：
+///
+/// 1. `REPLY_VARIABLES`：依赖命令上下文的常规变量
+/// 2. `GLOBAL_TAGS`：随机语气池（如 {卖萌}），渲染时由 resolve 动态取
+/// 3. `AI_TAG`：AI 标签，渲染前预生成，同样可让用户插入
+///
+/// 判定口径必须与 [`render`] 一致：渲染先查调用点注入的 vars，再查全局标签。
 pub(crate) fn reply_variable_allowed(name: &str) -> bool {
     REPLY_VARIABLES.iter().any(|v| v.name == name)
+        || crate::features::global_tags::find(name).is_some()
+        || name == crate::features::global_tags::AI_TAG
 }
 
 /// AI 聊天回复。
@@ -664,9 +677,9 @@ pub(crate) fn is_muted(
     let Some(entry) = command_reply_entry_for_key(key) else {
         return false;
     };
-    stored.get(entry.id).is_some_and(|rows| {
-        rows.is_empty() || !rows.iter().any(|reply| reply.key == key)
-    })
+    stored
+        .get(entry.id)
+        .is_some_and(|rows| rows.is_empty() || !rows.iter().any(|reply| reply.key == key))
 }
 
 // ---------------------------------------------------------------------------
@@ -847,11 +860,7 @@ mod tests {
                 "命令回复目录ID重复：{}",
                 entry.id
             );
-            assert!(
-                entry.replies().next().is_some(),
-                "{} 未登记回复",
-                entry.id
-            );
+            assert!(entry.replies().next().is_some(), "{} 未登记回复", entry.id);
             for spec in entry.replies() {
                 assert!(
                     owned_keys.insert(spec.key),
@@ -986,8 +995,7 @@ mod tests {
         // 静音是"按命令"生效的：同一命令下的 key 一起静音，
         // 其他命令不受影响。组合回复的嵌套片段分属不同命令时，
         // 任一被静音都会让整条不发（见 render_reply_text 的 ? 传播）。
-        let playlist_muted =
-            std::collections::BTreeMap::from([("@歌单".to_string(), Vec::new())]);
+        let playlist_muted = std::collections::BTreeMap::from([("@歌单".to_string(), Vec::new())]);
         assert!(is_muted(&playlist_muted, "playlist.window.header"));
         assert!(is_muted(&playlist_muted, "playlist.select.queued"));
         assert!(!is_muted(&playlist_muted, "playback.volume.set"));
@@ -1019,7 +1027,9 @@ mod tests {
         }
     }
 
-    fn stored(rows: &[(&str, &str)]) -> std::collections::BTreeMap<String, Vec<crate::config::StoredReply>> {
+    fn stored(
+        rows: &[(&str, &str)],
+    ) -> std::collections::BTreeMap<String, Vec<crate::config::StoredReply>> {
         std::collections::BTreeMap::from([(
             "@音量".to_string(),
             rows.iter()

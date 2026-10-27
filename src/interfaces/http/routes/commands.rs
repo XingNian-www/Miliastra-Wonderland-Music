@@ -582,5 +582,22 @@ mod tests {
         // 未闭合或空花括号按普通文本处理，渲染器同样如此。
         assert!(validate_reply_variables("只有左括号{").is_ok());
         assert!(validate_reply_variables("空{}").is_ok());
+
+        // 全局标签与 AI 标签必须放行：面板把它们列在变量按钮里，
+        // 校验若只认常规变量，就会出现「列出来却存不进去」。
+        for name in crate::features::global_tags::GLOBAL_TAGS
+            .iter()
+            .map(|t| t.name)
+        {
+            assert!(
+                validate_reply_variables(&format!("好{{}}{name}}}")).is_ok(),
+                "全局标签 {{{name}}} 应被接受"
+            );
+        }
+        assert!(
+            validate_reply_variables(&format!("好{{{}}}", crate::features::global_tags::AI_TAG))
+                .is_ok(),
+            "AI 标签应被接受"
+        );
     }
 }

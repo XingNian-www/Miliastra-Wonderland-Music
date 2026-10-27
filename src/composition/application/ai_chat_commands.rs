@@ -60,7 +60,9 @@ impl ApplicationRuntime {
                 let context = self
                     .business
                     .ai_chat_memory
-                    .context(&actor, config.bot_token_budget)?;
+                    // 用**读取**预算而不是落库预算：后者是 32000，当读取窗口用
+                    // 等于每题注入 32K token 的跨玩家、无归属回答。
+                    .context(&actor, crate::features::ai_chat::BOT_HISTORY_READ_BUDGET)?;
                 // 给模型看的名字：先按 UID 反查（外部源的信封主语可能是 UID），
                 // 查不到再用 canonical 名。`actor` 仍是记忆归属键，两者分开。
                 let actor_display = match parsed.account.as_ref() {
@@ -215,6 +217,7 @@ impl ApplicationRuntime {
                     self.business.ai_chat_memory.record_hall_line(
                         &actor_display,
                         question,
+                        crate::features::ai_chat::HallSpeakerRole::Player,
                         now_ms,
                     )?;
                     // BOT 的回答也进大厅记忆：
@@ -222,8 +225,17 @@ impl ApplicationRuntime {
                     self.business.ai_chat_memory.record_hall_line(
                         &self.bot_display_name(),
                         rendered,
+                        crate::features::ai_chat::HallSpeakerRole::Bot,
                         now_ms,
                     )?;
+                    // 记住「这个 actor 还用过哪个名字」。
+                    // actor 是按昵称存的，玩家改名后事实会落到新行、旧行成孤儿；
+                    // 不记录曾用名，模型只能去大厅散文里猜，一猜就把别人也带进来。
+                    let _ = self.business.ai_chat_memory.record_actor_name(
+                        &actor,
+                        &actor_display,
+                        now_ms,
+                    );
                     // 超预算时压缩。失败不影响已发出的回复。
                     self.compress_ai_chat_memory(&actor, &config, now_ms);
                 }
@@ -297,8 +309,15 @@ impl ApplicationRuntime {
         };
         // 抽取规则收在 features::ai_chat::fact_extraction_prompt，与历史重放清洗共用，
         // 避免两处口径不一致——否则清洗出来的结果和日常增量抽取会对不上。
-        let prompt =
-            crate::features::ai_chat::fact_extraction_prompt(&existing_text, question, answer);
+        // 必须把 actor 传进去：抽取模型原来只看到裸正文，不知道主语是谁，
+        // 于是把「玩家自称」和「玩家对助手的称呼」写反，也会把大厅里
+        // 别人的名字记到本人头上。
+        let prompt = crate::features::ai_chat::fact_extraction_prompt(
+            actor,
+            &existing_text,
+            question,
+            answer,
+        );
         // 同一次问答的第二次模型调用，同样不能在持有 UI 租约时干等。
         let reply = match {
             let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
@@ -376,8 +395,14 @@ impl ApplicationRuntime {
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            let prompt =
-                crate::features::ai_chat::fact_extraction_prompt(&existing_text, question, answer);
+            // 重放同样要传 actor，否则重建出来的事实仍然没有名字，
+            // 用户点一次「重建记忆」就把问题打回原形。
+            let prompt = crate::features::ai_chat::fact_extraction_prompt(
+                actor,
+                &existing_text,
+                question,
+                answer,
+            );
             let reply = crate::config::ai::request_json(
                 openai,
                 connection,

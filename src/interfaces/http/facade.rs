@@ -1371,7 +1371,9 @@ impl HttpAiPort for ApplicationHttpAiFacade {
         let lines = hall
             .lines
             .into_iter()
-            .map(|(speaker, text)| json!({ "speaker": speaker, "text": text }))
+            .map(|(speaker, text, role)| {
+                json!({ "speaker": speaker, "text": text, "role": role.as_str() })
+            })
             .collect::<Vec<_>>();
         Ok(serde_json::to_string(&json!({
             "summary": hall.summary,

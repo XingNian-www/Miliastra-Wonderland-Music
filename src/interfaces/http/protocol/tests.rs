@@ -2055,6 +2055,10 @@ impl HttpAiPort for HttpTestAiPort {
         Ok(r#"{"ok":true,"removed":0}"#.to_string())
     }
 
+    fn rebuild_facts(&self, actor: &str) -> Result<String> {
+        Ok(format!(r#"{{"ok":true,"actor":"{actor}","facts":0}}"#))
+    }
+
     fn recognize(&self, _query: &[(String, String)]) -> Result<String> {
         Ok("test recognition".to_string())
     }

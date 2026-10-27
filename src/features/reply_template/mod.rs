@@ -585,6 +585,33 @@ pub(crate) struct RenderedReply {
     pub(crate) missing: Vec<String>,
 }
 
+/// 从 `{选项1|选项2|…}` 里随机取一条。
+///
+/// 让用户在回复里直接写随机文案，不用去改代码里的标签表：
+/// 同一条回复反复出现也不会完全一样。
+///
+/// 判定条件：花括号内**不含** `{` 且**含** `|`。
+/// 空选项（末尾的 `|`、连续 `||`）会被剔除；全空时返回空串。
+fn pick_random_choice(inner: &str) -> Option<&str> {
+    if inner.contains('{') || !inner.contains('|') {
+        return None;
+    }
+    let choices: Vec<&str> = inner
+        .split('|')
+        .map(str::trim)
+        .filter(|choice| !choice.is_empty())
+        .collect();
+    if choices.is_empty() {
+        return Some("");
+    }
+    // 用纳秒做种子：不需要密码学强度，只要每次调用不同即可。
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or_default() as usize;
+    Some(choices[seed % choices.len()])
+}
+
 /// 渲染一条模板。
 ///
 /// override_text 为 Some 且非空白时使用配置覆盖，否则用 spec.default。
@@ -614,6 +641,13 @@ pub(crate) fn render(
         if name.is_empty() || name.contains('{') {
             // 空花括号或嵌套左花括号视为普通文本。
             out.push_str(&rest[open..open + 1 + close + 1]);
+            rest = &after[close + 1..];
+            continue;
+        }
+        // \u968f\u673a\u9009\u9879\u6700\u5148\uff1a\u5b83\u4e0d\u4f9d\u8d56\u4efb\u4f55\u4e1a\u52a1\u4e0a\u4e0b\u6587\uff0c
+        // \u800c\u4e14\u7528\u6237\u5199\u5728\u56de\u590d\u91cc\u5c31\u8981\u751f\u6548\u3002
+        if let Some(choice) = pick_random_choice(name) {
+            out.push_str(choice);
             rest = &after[close + 1..];
             continue;
         }
@@ -756,6 +790,44 @@ pub(crate) fn catalog() -> impl Iterator<Item = &'static ReplyTemplate> {
 
 #[cfg(test)]
 mod tests {
+    /// 随机选项 {a|b|c}：每次取到其中一条，且不留下花括号。
+    #[test]
+    fn random_choice_picks_one_of_the_options() {
+        let template = crate::features::reply_template::ReplyTemplate {
+            key: "test.random",
+            default: "好{喵~|诶嘿|嘻嘻}",
+            summary: "测试",
+            group: "测试",
+        };
+        let vars = crate::features::reply_template::ReplyVars::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..60 {
+            let text = crate::features::reply_template::render(&template, None, &vars).text;
+            assert!(!text.contains('{'), "不应残留花括号: {text}");
+            assert!(!text.contains('|'), "不应残留竖线: {text}");
+            assert!(text.starts_with('好'), "前缀应保留: {text}");
+            seen.insert(text.trim_start_matches('好').to_string());
+        }
+        // 60 次里至少要出现两个不同选项，否则随机没生效。
+        assert!(seen.len() >= 2, "随机未生效，只见到: {seen:?}");
+    }
+
+    /// 末尾空选项、连续竖线都要剔除。
+    #[test]
+    fn random_choice_skips_empty_options() {
+        let template = crate::features::reply_template::ReplyTemplate {
+            key: "test.random.empty",
+            default: "[{甲||乙|}]",
+            summary: "测试",
+            group: "测试",
+        };
+        let vars = crate::features::reply_template::ReplyVars::new();
+        for _ in 0..20 {
+            let text = crate::features::reply_template::render(&template, None, &vars).text;
+            assert!(text == "[甲]" || text == "[乙]", "实际: {text}");
+        }
+    }
+
     use super::*;
 
     const SPEC: ReplyTemplate = ReplyTemplate {

@@ -2125,20 +2125,44 @@ impl ApplicationRuntime {
     ///
     /// 返回空表示"无歌单"，调用方应提示用户先配置身份映射，
     /// 而不是退化成按昵称归属（昵称会改、会重名、OCR 会读错）。
-    pub(super) fn playlist_owner_candidates(&self, ocr_name: &str) -> Vec<String> {
+    pub(super) fn playlist_owner_candidates(
+        &self,
+        subject: &str,
+        account: Option<&miliastra_kernel::chat_source::CommandAccount>,
+    ) -> Vec<String> {
+        // 与权限判定同源：有 UID 就只认 UID，没有才按游戏内昵称。
+        //
+        // 原来这里直接调 `resolve(ocr_name)`（只按 nickname 精确匹配）。
+        // 外部聊天源的私聊 peer 是**数字 UID**，传进去必然落空，
+        // 已登记的玩家被判成未登记——线上表现为大厅能导入歌单、
+        // 好友私聊提示「该玩家未在身份映射登记」。
+        let hint = match account {
+            Some(account) => crate::features::identity::IdentityHint::Account {
+                game: &account.game,
+                uid: &account.uid,
+                nickname: Some(subject),
+            },
+            None => crate::features::identity::IdentityHint::Nickname(subject),
+        };
         let identity = self
             .lifecycle
             .live_configs
             .identity
-            .resolve(ocr_name)
+            .resolve_hint(hint)
             .map(|resolved| resolved.id.to_string());
         crate::features::playlist::owner_key::candidates(identity.as_deref())
     }
 
     /// 写入用的归属键：候选中优先级最高的那个。
     /// 写入用的归属键；没有身份映射时为 `None`（调用方应拒绝操作）。
-    pub(super) fn playlist_owner_key(&self, ocr_name: &str) -> Option<String> {
-        self.playlist_owner_candidates(ocr_name).into_iter().next()
+    pub(super) fn playlist_owner_key(
+        &self,
+        subject: &str,
+        account: Option<&miliastra_kernel::chat_source::CommandAccount>,
+    ) -> Option<String> {
+        self.playlist_owner_candidates(subject, account)
+            .into_iter()
+            .next()
     }
 
     fn map_command_actor(&self, mut command: RoutedCommand) -> RoutedCommand {

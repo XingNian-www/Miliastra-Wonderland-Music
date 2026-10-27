@@ -466,15 +466,15 @@ impl IdentityAccess {
     /// 手工维护的映射则反过来，真名在 nickname、备注在 note。
     /// 两种来源都得试，否则必有一半玩家的邀请找不到人。
     ///
-    /// 顺序：note（面板展示名，通常是玩家看得见的名字）优先，
-    /// nickname（OCR 匹配键，手工配置时就是好友备注名）次之。
+    /// 顺序：nickname（游戏内昵称，OCR 路径的权限依据）优先，
+    /// note（显示昵称，仅为 API 自动建的身份兜底）次之。
     /// 空串与重复项已剔除；一个都没有时返回空表，调用方据此在进 UI 前失败。
     pub fn friend_row_names_for_account(&self, game: &str, uid: &str) -> Vec<String> {
         let Some(identity) = self.resolve_account(game, uid) else {
             return Vec::new();
         };
         let mut names = Vec::with_capacity(2);
-        for candidate in [identity.note.trim(), identity.nickname.trim()] {
+        for candidate in [identity.nickname.trim(), identity.note.trim()] {
             if candidate.is_empty() || names.iter().any(|existing| existing == candidate) {
                 continue;
             }
@@ -769,6 +769,67 @@ mod tests {
     ///
     /// 外部源的昵称是随机 OCR 匹配键，与 UID 绑定无关。旧实现只按昵称查，
     /// 于是「路由按 UID 判有权限、执行按昵称判没权限」，管理员命令被静默丢弃。
+
+    /// 回归：歌单归属必须支持按 UID 解析。
+    ///
+    /// 外部聊天源的私聊 peer 是数字 UID，原来 playlist_owner_candidates 直接
+    /// 调 resolve()（只按 nickname 精确匹配），UID 传进去必然落空，
+    /// 已登记的玩家被判成未登记——线上表现为大厅能导入歌单、
+    /// 好友私聊提示「该玩家未在身份映射登记」。
+    #[test]
+    fn identity_resolves_by_uid_and_by_nickname() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            nickname: "abcd1234".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            note: "玩家甲".to_string(),
+            accounts: vec![GameAccount::new("900000002")],
+        });
+        let access = IdentityAccess::new(config);
+
+        // OCR 路径：只有游戏内昵称。
+        let by_name = access
+            .resolve_hint(IdentityHint::Nickname("abcd1234"))
+            .expect("按昵称应命中");
+        // API 路径：只有 UID。
+        let by_uid = access
+            .resolve_hint(IdentityHint::Account {
+                game: "genshin",
+                uid: "900000002",
+                nickname: None,
+            })
+            .expect("按 UID 应命中");
+
+        assert_eq!(by_name.id, by_uid.id, "两条路径必须指向同一身份");
+        assert_eq!(by_uid.role, IdentityRole::Friend);
+    }
+
+    /// 未登记的 UID 不能靠昵称兜底（安全要求：有 UID 时只认 UID）。
+    #[test]
+    fn unknown_uid_does_not_fall_back_to_nickname() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            nickname: "橘子".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Owner,
+            note: String::new(),
+            accounts: vec![GameAccount::new("111111")],
+        });
+        let access = IdentityAccess::new(config);
+        // 昵称对得上、UID 对不上：必须拒绝，否则改昵称就能提权。
+        assert!(
+            access
+                .resolve_hint(IdentityHint::Account {
+                    game: "genshin",
+                    uid: "999999",
+                    nickname: Some("橘子"),
+                })
+                .is_none(),
+            "UID 未登记时不得回退到昵称"
+        );
+    }
+
     #[test]
     fn role_of_sender_prefers_account_over_nickname() {
         let mut config = IdentityConfig::default();

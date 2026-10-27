@@ -513,7 +513,7 @@ impl ApplicationRuntime {
             );
         }
         // 歌单只属于已登记身份的玩家：没有 UUID 就没有歌单。
-        let Some(actor) = self.playlist_owner_key(&parsed.username) else {
+        let Some(actor) = self.playlist_owner_key(&parsed.username, parsed.account.as_ref()) else {
             log::info!(
                 "命令未执行：该玩家未在身份映射登记，无个人歌单 text={}",
                 parsed.raw

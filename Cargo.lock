@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "miliastra-wonderland-music"
-version = "7.0.31-dev"
+version = "7.0.32-dev"
 dependencies = [
  "anyhow",
  "async-openai",

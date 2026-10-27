@@ -230,9 +230,19 @@ pub(crate) fn sync_kugou_device_file(
     fs::create_dir_all(directory)?;
     let content = serde_json::to_vec_pretty(&device)
         .map_err(|error| io::Error::other(format!("serialize KuGou device identity: {error}")))?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, &content)?;
-    fs::rename(&temporary, &path)?;
+    // 临时名必须唯一：固定成 `kugou-device.json.tmp` 时，两个进程/线程同时
+    // 写同一 profile 目录会互相截断——B 的 fs::write 清空 A 正在写的临时文件，
+    // A 随后 rename 就把半截内容提交成正式文件；或 A 先 rename 走，
+    // B 的 rename 直接 ENOENT 失败。
+    let temporary = path.with_file_name(format!(".kugou-device.{}.tmp", std::process::id()));
+    if let Err(error) = fs::write(&temporary, &content) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     Ok(true)
 }
 
@@ -1009,15 +1019,19 @@ fn run_helper(
         });
     // 登录助手可能在 stderr 写入二维码 URL 或认证参数。持续排空该管道，
     // 但绝不记录原文，避免敏感信息进入主程序日志。
-    {
+    //
+    // 与 stdout 侧对称地做**有界等待**：WebView2 等孙进程可能继承 stderr 写端，
+    // 导致 read() 永不返回 EOF。原来直接把 JoinHandle 丢掉，每登录一次就泄漏
+    // 一个永久阻塞的线程和它的管道 fd；反复取消/重试会不断累积。
+    let stderr_reader = {
         let mut stderr = stderr;
         thread::Builder::new()
             .name("login-helper-diagnostic".to_owned())
             .spawn(move || {
                 drain_helper_stderr(&mut *stderr);
             })
-            .ok();
-    }
+            .ok()
+    };
 
     let mut failure = if reader.is_err() {
         Some(manager_failure(
@@ -1127,6 +1141,23 @@ fn run_helper(
             Ok(_) => {}
             Err(_) => {
                 log::error!("登录助手输出线程 join 超时,已分离(孙进程可能持有 stdout 管道写端)");
+            }
+        }
+        let _ = reaper;
+    }
+    // stderr 侧同样的有界等待。拿不到 JoinHandle 时说明 spawn 就失败了，
+    // 此时没有线程可等；拿到就限时 join，超时则分离（同上，靠 `let _` 释放句柄）。
+    if let Some(reader) = stderr_reader {
+        let (stderr_done_tx, stderr_done_rx) = std::sync::mpsc::sync_channel(1);
+        let reaper = thread::Builder::new()
+            .name("login-helper-diagnostic-reaper".to_owned())
+            .spawn(move || {
+                let _ = stderr_done_tx.send(reader.join());
+            });
+        match stderr_done_rx.recv_timeout(READER_JOIN_GRACE) {
+            Ok(_) => {}
+            Err(_) => {
+                log::error!("登录助手诊断线程 join 超时,已分离(孙进程可能持有 stderr 管道写端)");
             }
         }
         let _ = reaper;

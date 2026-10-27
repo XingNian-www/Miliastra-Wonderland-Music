@@ -406,6 +406,7 @@ fn run(
                                                 identity_access.as_ref(),
                                                 config_store.as_ref(),
                                                 &config.url,
+                                                config.self_uid,
                                                 &names,
                                                 batch.messages,
                                             );
@@ -432,6 +433,7 @@ fn run(
                                 identity_access.as_ref(),
                                 config_store.as_ref(),
                                 &config.url,
+                                config.self_uid,
                                 &names,
                                 messages,
                             );
@@ -500,12 +502,16 @@ fn persist_identity(
         .map_err(|error| anyhow::anyhow!("保存身份映射失败: {error}"))?;
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 fn deliver(
     timeline: &ChatTimeline,
     state: &ExternalChatState,
     identity_access: Option<&crate::features::identity::IdentityAccess>,
     config_store: Option<&crate::config::SharedConfigStore>,
     source: &str,
+    // 本机账号 UID：私聊 peer 必须排除它，否则玩家私聊 BOT 时
+    // peer 会变成 BOT 自己，按身份归属的功能（个人歌单等）全部失效。
+    self_uid: u32,
     names: &std::sync::mpsc::Sender<String>,
     messages: Vec<ExternalChatMessage>,
 ) {
@@ -581,7 +587,14 @@ fn deliver(
     }
     let last = messages.last().map(|message| message.sequence).unwrap_or(0);
     let epoch = crate::observation::chat::VisualSessionId::new(state.epoch());
-    match timeline.inject_external(Instant::now(), epoch, source, messages) {
+    match timeline.inject_external(
+        Instant::now(),
+        epoch,
+        source,
+        // self_uid 为 0 表示未配置：传 None 退回原行为。
+        (self_uid != 0).then(|| self_uid.to_string()).as_deref(),
+        messages,
+    ) {
         Ok(accepted) => {
             if !accepted.is_empty() {
                 state.inner.last_sequence.store(last, Ordering::Release);

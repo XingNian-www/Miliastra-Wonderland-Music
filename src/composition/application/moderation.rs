@@ -905,6 +905,7 @@ mod tests {
                 Instant::now(),
                 crate::observation::chat::VisualSessionId::new(u64::MAX),
                 "test",
+None,
                 vec![
                     external_vote_message(1, "甲", "@同意"),
                     external_vote_message(2, "路人乙", "@同意"),
@@ -1024,6 +1025,7 @@ mod tests {
                 Instant::now(),
                 crate::observation::chat::VisualSessionId::new(u64::MAX),
                 "test",
+None,
                 vec![miliastra_kernel::chat_source::ExternalChatMessage {
                     sequence: 1,
                     sent_at: None,

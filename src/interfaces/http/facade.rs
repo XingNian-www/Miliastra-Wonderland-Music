@@ -233,6 +233,8 @@ impl HttpCommandPort for ApplicationHttpCommandFacade {
                 std::time::Instant::now(),
                 crate::observation::chat::VisualSessionId::new(u64::MAX),
                 "simulate",
+                // 调试注入不带本机账号语义，不需要排除 self。
+                None,
                 vec![message],
             )
             .map_err(internal_command_error)?;

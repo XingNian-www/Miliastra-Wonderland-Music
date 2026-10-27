@@ -1292,6 +1292,11 @@ pub(crate) struct ApplicationHttpAiFacade {
     client: AiClient,
     /// 记忆库句柄。为 None 时（测试装配）记忆接口返回明确的未装配错误。
     memory: Option<std::sync::Arc<crate::features::ai_chat::AiChatMemory>>,
+    /// 历史重跑清洗：给定玩家名，用新规则重放其全部问答并重建事实表。
+    ///
+    /// 做成闭包而不是给 facade 塞 AI 运行时依赖：重跑需要模型调用与配置快照，
+    /// 那些都在 composition 侧，facade 不该为了一个维护动作把整条链路引进来。
+    rebuild: Option<std::sync::Arc<dyn Fn(&str) -> anyhow::Result<usize> + Send + Sync>>,
 }
 
 impl ApplicationHttpAiFacade {
@@ -1299,6 +1304,7 @@ impl ApplicationHttpAiFacade {
         Self {
             client,
             memory: None,
+            rebuild: None,
         }
     }
 
@@ -1306,10 +1312,12 @@ impl ApplicationHttpAiFacade {
     pub(crate) fn with_memory(
         client: AiClient,
         memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
+        rebuild: std::sync::Arc<dyn Fn(&str) -> anyhow::Result<usize> + Send + Sync>,
     ) -> Self {
         Self {
             client,
             memory: Some(memory),
+            rebuild: Some(rebuild),
         }
     }
 
@@ -1385,6 +1393,29 @@ impl HttpAiPort for ApplicationHttpAiFacade {
         Ok(serde_json::to_string(
             &json!({ "ok": true, "removed": removed }),
         )?)
+    }
+
+    fn rebuild_facts(&self, actor: &str) -> Result<String> {
+        let rebuild = self
+            .rebuild
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("记忆重建未装配"))?;
+        // 重放要为每一轮问答调一次模型，几十轮就是几十次请求，
+        // 同步做会让 HTTP 请求挂几分钟。这里只负责受理，结果看日志与面板。
+        let actor = actor.to_string();
+        let worker_actor = actor.clone();
+        std::thread::Builder::new()
+            .name("ai-memory-rebuild".to_string())
+            .spawn(move || match rebuild(&worker_actor) {
+                Ok(count) => log::info!("记忆重建完成: actor={worker_actor} facts={count}"),
+                Err(error) => log::warn!("记忆重建失败: actor={worker_actor} {error:#}"),
+            })?;
+        Ok(serde_json::to_string(&json!({
+            "ok": true,
+            "accepted": true,
+            "actor": actor,
+            "note": "重建在后台执行，结果见日志与记忆面板",
+        }))?)
     }
 
     fn forget_hall(&self) -> Result<String> {

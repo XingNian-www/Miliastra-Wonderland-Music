@@ -1299,6 +1299,10 @@ pub(crate) struct ApplicationHttpAiFacade {
     /// 做成闭包而不是给 facade 塞 AI 运行时依赖：重跑需要模型调用与配置快照，
     /// 那些都在 composition 侧，facade 不该为了一个维护动作把整条链路引进来。
     rebuild: Option<std::sync::Arc<dyn Fn(&str) -> anyhow::Result<usize> + Send + Sync>>,
+    /// 记忆键 → 显示昵称。记忆键是 UUID，面板必须换回人能认的名字。
+    ///
+    /// 同样做成闭包：身份映射在 composition 侧，facade 不该直接持有它。
+    display_name: Option<std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>>,
 }
 
 impl ApplicationHttpAiFacade {
@@ -1307,6 +1311,7 @@ impl ApplicationHttpAiFacade {
             client,
             memory: None,
             rebuild: None,
+            display_name: None,
         }
     }
 
@@ -1315,11 +1320,21 @@ impl ApplicationHttpAiFacade {
         client: AiClient,
         memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
         rebuild: std::sync::Arc<dyn Fn(&str) -> anyhow::Result<usize> + Send + Sync>,
+        display_name: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
     ) -> Self {
         Self {
             client,
             memory: Some(memory),
             rebuild: Some(rebuild),
+            display_name: Some(display_name),
+        }
+    }
+
+    /// 把记忆键换成人能认的名字；未装配时原样返回（测试装配）。
+    fn display_name_of(&self, key: &str) -> String {
+        match self.display_name.as_deref() {
+            Some(f) => f(key),
+            None => key.to_owned(),
         }
     }
 
@@ -1345,6 +1360,14 @@ impl HttpAiPort for ApplicationHttpAiFacade {
 
     fn memory_actors(&self) -> Result<String> {
         let actors = self.memory()?.list_actors()?;
+        // 记忆键现在是 UUID（跨改名稳定），面板必须换回人能认的名字。
+        let actors = actors
+            .into_iter()
+            .map(|mut summary| {
+                summary.actor = self.display_name_of(&summary.actor);
+                summary
+            })
+            .collect::<Vec<_>>();
         Ok(serde_json::to_string(&json!({ "actors": actors }))?)
     }
 

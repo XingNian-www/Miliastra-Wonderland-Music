@@ -1727,9 +1727,21 @@ impl ApplicationRuntime {
             PlaybackTimePorts::new(system_clock.clone(), system_clock.clone()),
             live_configs.clone(),
         );
-        if business.hall_state_snapshot()?.remaining_minutes_now() == Some(0) {
-            business.update_playback_state(PlaybackStateUpdate::UserPaused)?;
-            log::info!("关闭期间大厅倒计时已结束，恢复歌曲时保持暂停");
+        let cleared_stale_hall_cache = settle_expired_hall_at_startup(
+            business.hall_state_snapshot()?.remaining_minutes_now(),
+            || {
+                business.update_playback_state(PlaybackStateUpdate::UserPaused)?;
+                log::info!("关闭期间大厅倒计时已结束，恢复歌曲时保持暂停");
+                Ok(())
+            },
+            || {
+                business
+                    .clear_hall_countdown_cache()
+                    .map_err(anyhow::Error::from)
+            },
+        )?;
+        if cleared_stale_hall_cache {
+            log::info!("已清理关闭期间过期的大厅倒计时缓存");
         }
         // 重启恢复：上次会话有活动歌曲时，从最后可靠进度恢复播放（新引擎会话）。
         // 音量已持久化，恢复前由控制器重新应用；原用户暂停的歌曲恢复后保持暂停。
@@ -2078,6 +2090,28 @@ fn normalize_secondary_sender_name(value: &str) -> String {
         .to_string()
 }
 
+/// 启动时处理「关闭期间大厅倒计时已结束」。
+///
+/// 只有持久化的剩余分钟恰好为 0（上一轮运行结束时大厅就已经到期）才触发：
+/// 先让恢复中的歌曲保持暂停，再清掉过期的倒计时缓存。
+///
+/// 必须清理缓存：否则扫描循环会把上一轮残留的 `Some(0)` 当成「本次运行刚到期」，
+/// 每次启动都重新暂停并向大厅播报一次「大厅即将到期,已自动暂停音乐」。
+/// 进入新大厅（或重新 @大厅时间）时会重新检测剩余分钟，清空不影响后续判断。
+///
+/// 返回是否清理了缓存。用闭包注入便于单测。
+fn settle_expired_hall_at_startup(
+    remaining_minutes: Option<u32>,
+    pause_restored_playback: impl FnOnce() -> Result<()>,
+    clear_stale_countdown_cache: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    if remaining_minutes != Some(0) {
+        return Ok(false);
+    }
+    pause_restored_playback()?;
+    clear_stale_countdown_cache()
+}
+
 fn next_target_missing_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(TARGET_MISSING_BACKOFF_MAX)
 }
@@ -2148,6 +2182,62 @@ mod tests {
     #[test]
     fn advance_queue_is_a_playback_task() {
         assert!(PendingTask::AdvanceQueue { reason: "test" }.is_playback_task());
+    }
+
+    #[test]
+    fn expired_hall_at_startup_pauses_restore_then_clears_the_stale_cache() {
+        // 顺序不能被交换：先让恢复中的歌曲保持暂停，再清缓存。
+        let step = std::cell::Cell::new(0u8);
+        let cleared = settle_expired_hall_at_startup(
+            Some(0),
+            || {
+                assert_eq!(step.replace(1), 0, "必须先暂停");
+                Ok(())
+            },
+            || {
+                assert_eq!(step.replace(2), 1, "暂停之后才清缓存");
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(cleared);
+        assert_eq!(step.get(), 2);
+    }
+
+    #[test]
+    fn hall_with_remaining_time_at_startup_is_left_untouched() {
+        for remaining in [Some(1), Some(5), None] {
+            let touched = std::cell::Cell::new(false);
+            let cleared = settle_expired_hall_at_startup(
+                remaining,
+                || {
+                    touched.set(true);
+                    Ok(())
+                },
+                || {
+                    touched.set(true);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert!(!cleared, "remaining={remaining:?}");
+            assert!(!touched.get(), "remaining={remaining:?}");
+        }
+    }
+
+    #[test]
+    fn pause_failure_at_startup_keeps_the_stale_cache_for_retry() {
+        let cleared = std::cell::Cell::new(false);
+        let result = settle_expired_hall_at_startup(
+            Some(0),
+            || anyhow::bail!("pause failed"),
+            || {
+                cleared.set(true);
+                Ok(true)
+            },
+        );
+        assert!(result.is_err());
+        assert!(!cleared.get());
     }
 
     #[test]

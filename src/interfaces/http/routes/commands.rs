@@ -179,9 +179,7 @@ fn validate_reply_items(
                 "静态回复key不属于该命令，自定义key必须使用custom:前缀",
             ));
         }
-        if !reply_variables_valid(&reply.text) {
-            return Err(bad_request("回复包含未知变量占位符"));
-        }
+        validate_reply_variables(&reply.text).map_err(|reason| bad_request(&reason))?;
         saved.push(StoredReply {
             key: reply.key,
             text: reply.text,
@@ -226,23 +224,57 @@ pub(super) fn commands_replies_save_route(
     }
 }
 
-fn reply_variables_valid(text: &str) -> bool {
+/// 校验回复文案里的变量占位符。
+///
+/// 语法是**单花括号** `{变量名}`，与 AI 聊天提示词那套 `{{双花括号}}` 不同。
+///
+/// 两种误用都必须报错，否则用户以为生效、实际原样发到聊天框：
+///
+/// - `{{玩家}}`：双花括号会被当成普通文本原样输出。原来这里也放过了它，
+///   用户看不到任何提示，聊天里就出现字面量 `{{玩家}}`。
+/// - `{昵称}`：表里没有的名字。原来只回一句「包含未知变量占位符」，
+///   不说是哪个、也不说能用哪些，用户只能猜。
+fn validate_reply_variables(text: &str) -> std::result::Result<(), String> {
     let mut rest = text;
     while let Some(open) = rest.find('{') {
         let after = &rest[open + 1..];
         let Some(close) = after.find('}') else {
-            return true;
+            // 未闭合的左花括号：渲染器同样原样保留，不算错误。
+            return Ok(());
         };
         let name = &after[..close];
-        if !name.is_empty()
-            && !name.contains('{')
-            && !crate::features::reply_template::reply_variable_allowed(name)
-        {
-            return false;
+        if name.contains('{') {
+            // `{{名字}}` —— 用户很可能把 AI 提示词的双花括号语法带过来了。
+            let inner = name.trim_start_matches('{').trim();
+            let inner = inner.trim_end_matches('}').trim();
+            if !inner.is_empty() && inner.chars().all(|c| c != '{') {
+                return Err(format!(
+                    "回复里的 {{{{}}}} 不会被替换，请改用单花括号 {{{inner}}}"
+                ));
+            }
+            rest = &after[close + 1..];
+            continue;
+        }
+        if name.trim().is_empty() {
+            rest = &after[close + 1..];
+            continue;
+        }
+        if name.trim() != name {
+            return Err(format!(
+                "变量花括号内不能有空格，请写成 {{{}}}",
+                name.trim()
+            ));
+        }
+        if !crate::features::reply_template::reply_variable_allowed(name) {
+            return Err(format!("未知变量 {{{name}}}。可用变量见回复框下方的按钮"));
         }
         rest = &after[close + 1..];
     }
-    true
+    Ok(())
+}
+
+fn reply_variables_valid(text: &str) -> bool {
+    validate_reply_variables(text).is_ok()
 }
 
 pub(super) fn commands_catalog_route(
@@ -511,5 +543,44 @@ pub(super) fn commands_policy_save_route(
         )
         .map_err(internal_error),
         Err(error) => Err(internal_error(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 排查：哪些写法会被判成「未知变量占位符」。
+    #[test]
+    fn reply_variables_valid_edge_cases() {
+        // 覆盖常见写法，确认哪些被拒。
+        for (text, expected) in [
+            ("{玩家}", true),
+            ("{{玩家}}", false),
+            ("{UID}", true),
+            ("{昵称}", false),
+            ("{歌名}", true),
+            ("{点歌人}", true),
+            ("{玩家}点了{歌名}", true),
+            ("{{玩家}}点了{歌名}", false),
+        ] {
+            let actual = reply_variables_valid(text);
+            assert_eq!(actual, expected, "输入 {text:?}");
+        }
+
+        // 报错必须指明是哪个变量、该怎么写，否则用户只能猜。
+        let double = validate_reply_variables("{{玩家}}点了歌").unwrap_err();
+        assert!(double.contains("单花括号"), "实际: {double}");
+        assert!(double.contains("玩家"), "实际: {double}");
+
+        let unknown = validate_reply_variables("你好{昵称}").unwrap_err();
+        assert!(unknown.contains("昵称"), "实际: {unknown}");
+
+        let spaced = validate_reply_variables("{ 玩家 }").unwrap_err();
+        assert!(spaced.contains("空格"), "实际: {spaced}");
+
+        // 未闭合或空花括号按普通文本处理，渲染器同样如此。
+        assert!(validate_reply_variables("只有左括号{").is_ok());
+        assert!(validate_reply_variables("空{}").is_ok());
     }
 }

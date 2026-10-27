@@ -317,12 +317,12 @@ impl AiConfig {
         };
         let model = resolve_model(provider, effective_model(self, &options.model))?;
         // 规则按最终模型名匹配：模型可能来自功能覆盖或 ai.model，二者都要适用。
-        let reasoning = match apply_reasoning_rules(&model, options.reasoning, &self.reasoning_rules)
-        {
-            Ok(Some(wire)) => ReasoningEffort::from_wire_value(wire),
-            Ok(None) => ReasoningEffort::Unset,
-            Err(message) => bail!("{message}"),
-        };
+        let reasoning =
+            match apply_reasoning_rules(&model, options.reasoning, &self.reasoning_rules) {
+                Ok(Some(wire)) => ReasoningEffort::from_wire_value(wire),
+                Ok(None) => ReasoningEffort::Unset,
+                Err(message) => bail!("{message}"),
+            };
         Ok(ResolvedAiTarget {
             provider,
             endpoint,
@@ -530,9 +530,66 @@ pub(crate) fn request_json(
     max_tokens: u32,
     timeout: std::time::Duration,
 ) -> anyhow::Result<String> {
+    request_with_format(
+        openai,
+        config,
+        options,
+        system_prompt,
+        user_prompt,
+        max_tokens,
+        timeout,
+        true,
+    )
+}
+
+/// 同 `request_json`，但可以选择是否强制 JSON 输出。
+///
+/// `json_mode` 为 false 时必须传——强制 JSON 会要求模型输出一个 JSON 对象，
+/// 而「把聊天记录压成一段话」要的是**自然语言摘要**。真机上表现为每次压缩都
+/// 400 invalid_request_error，原文因此永远不被压缩、每轮重试一次注定失败的调用。
+pub(crate) fn request_plain_text(
+    openai: &miliastra_kernel::ai::OpenAiRuntimeHandle,
+    config: &AiConfig,
+    options: &AiCallOptions,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+    timeout: std::time::Duration,
+) -> anyhow::Result<String> {
+    request_with_format(
+        openai,
+        config,
+        options,
+        system_prompt,
+        user_prompt,
+        max_tokens,
+        timeout,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_with_format(
+    openai: &miliastra_kernel::ai::OpenAiRuntimeHandle,
+    config: &AiConfig,
+    options: &AiCallOptions,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+    timeout: std::time::Duration,
+    json_mode: bool,
+) -> anyhow::Result<String> {
     let target = config.resolve_with(options)?;
     let reasoning = target.reasoning;
-    match request_json_once(openai, &target, system_prompt, user_prompt, max_tokens, timeout) {
+    match request_json_once(
+        openai,
+        &target,
+        system_prompt,
+        user_prompt,
+        max_tokens,
+        timeout,
+        json_mode,
+    ) {
         Ok(text) => Ok(text),
         Err(error) => {
             // 兜底降级：某些模型不接受 reasoning 字段，会以 400 拒绝整个请求。
@@ -548,7 +605,15 @@ pub(crate) fn request_json(
             );
             let mut without = target.clone();
             without.reasoning = ReasoningEffort::Unset;
-            request_json_once(openai, &without, system_prompt, user_prompt, max_tokens, timeout)
+            request_json_once(
+                openai,
+                &without,
+                system_prompt,
+                user_prompt,
+                max_tokens,
+                timeout,
+                json_mode,
+            )
         }
     }
 }
@@ -568,8 +633,7 @@ fn looks_like_reasoning_rejection(error: &anyhow::Error) -> bool {
     ];
     // "invalid parameter" 单独出现太宽泛，必须同时出现 reasoning 相关词。
     REASONING_HINTS[..3].iter().any(|hint| text.contains(hint))
-        || (text.contains("parameter")
-            && (text.contains("reasoning") || text.contains("thinking")))
+        || (text.contains("parameter") && (text.contains("reasoning") || text.contains("thinking")))
 }
 
 fn request_json_once(
@@ -579,10 +643,12 @@ fn request_json_once(
     user_prompt: &str,
     max_tokens: u32,
     timeout: std::time::Duration,
+    json_mode: bool,
 ) -> anyhow::Result<String> {
     match target.wire_api {
         WireApi::Responses => {
-            let request = build_responses_request(target, system_prompt, user_prompt, max_tokens)?;
+            let request =
+                build_responses_request(target, system_prompt, user_prompt, max_tokens, json_mode)?;
             let response = openai
                 .create_response(
                     target.build_target()?,
@@ -595,7 +661,8 @@ fn request_json_once(
             responses_output_text(&response)
         }
         WireApi::ChatCompletions => {
-            let request = build_chat_request(target, system_prompt, user_prompt, max_tokens)?;
+            let request =
+                build_chat_request(target, system_prompt, user_prompt, max_tokens, json_mode)?;
             let response = openai
                 .chat_completion(
                     target.build_target()?,
@@ -605,6 +672,16 @@ fn request_json_once(
                 )?
                 .wait()
                 .context("AI 请求失败")?;
+            // 缓存命中率只能靠服务端回传的 usage 判断，本地估算不可靠。
+            // 注意 DeepSeek 把命中数放在 usage 顶层 prompt_cache_hit_tokens，
+            // 而 SDK 的 CompletionUsage 没有 flatten，会静默丢弃——
+            // 所以这里打印整个 usage 的 JSON，而不是只取 cached_tokens。
+            if let Some(usage) = response.usage.as_ref() {
+                log::debug!(
+                    "AI usage: {}",
+                    serde_json::to_string(usage).unwrap_or_else(|_| "<unserializable>".to_string())
+                );
+            }
             let choice = response
                 .choices
                 .first()
@@ -655,13 +732,20 @@ fn build_responses_request(
     system_prompt: &str,
     user_prompt: &str,
     max_tokens: u32,
+    json_mode: bool,
 ) -> anyhow::Result<CreateResponse> {
     Ok(CreateResponseArgs::default()
         .model(target.model.clone())
         .instructions(system_prompt)
         .input(user_prompt)
+        // 只有确实要求 JSON 输出的调用才设 format。
+        // 摘要要的是自然语言，强制 JsonObject 会被服务端 400 拒绝。
         .text(ResponseTextParam {
-            format: TextResponseFormatConfiguration::JsonObject,
+            format: if json_mode {
+                TextResponseFormatConfiguration::JsonObject
+            } else {
+                TextResponseFormatConfiguration::Text
+            },
             verbosity: None,
         })
         .temperature(0.1_f32)
@@ -676,6 +760,7 @@ fn build_chat_request(
     system_prompt: &str,
     user_prompt: &str,
     max_tokens: u32,
+    json_mode: bool,
 ) -> anyhow::Result<CreateChatCompletionRequest> {
     Ok(CreateChatCompletionRequestArgs::default()
         .model(target.model.clone())
@@ -689,7 +774,12 @@ fn build_chat_request(
                 .build()?
                 .into(),
         ])
-        .response_format(ResponseFormat::JsonObject)
+        // 同上：摘要要自然语言，不能强制 JSON。
+        .response_format(if json_mode {
+            ResponseFormat::JsonObject
+        } else {
+            ResponseFormat::Text
+        })
         .temperature(0.1_f32)
         .stream(false)
         .store(false)
@@ -1677,14 +1767,15 @@ mod tests {
     fn explicit_extra_body_reasoning_wins_over_the_structured_option() {
         // 用户手写 extra_body 时以他写的为准，避免结构化选项静默覆盖。
         let mut connection = config("openai");
-        connection.extra_body = HashMap::from([(
-            "reasoning".to_string(),
-            json!({"effort": "minimal"}),
-        )]);
+        connection.extra_body =
+            HashMap::from([("reasoning".to_string(), json!({"effort": "minimal"}))]);
         let target = connection
             .resolve_with(&AiCallOptions::new("").with_reasoning(ReasoningEffort::High))
             .expect("target");
-        assert_eq!(merged_extra_body(&target)["reasoning"]["effort"], json!("minimal"));
+        assert_eq!(
+            merged_extra_body(&target)["reasoning"]["effort"],
+            json!("minimal")
+        );
     }
 
     #[test]
@@ -1992,7 +2083,7 @@ mod tests {
         let mut connection = config("openai");
         connection.wire_api = WireApi::Responses;
         let target = connection.resolve("").expect("target");
-        let request = build_responses_request(&target, "系统", "用户", 512).expect("request");
+        let request = build_responses_request(&target, "系统", "用户", 512, true).expect("request");
         let body = serde_json::to_value(request).expect("request json");
 
         assert_eq!(body["text"]["format"]["type"], "json_object");
@@ -2002,12 +2093,30 @@ mod tests {
         assert!(body.get("tools").is_none());
     }
 
+    /// 回归：摘要这类自然语言输出**不能**强制 JSON 模式。
+    ///
+    /// 线上表现为每次记忆压缩都 400 invalid_request_error，
+    /// 原文因此永远压不掉、每轮重试一次注定失败的调用。
+    #[test]
+    fn plain_text_mode_does_not_force_json_object() {
+        let mut connection = config("openai");
+        connection.wire_api = WireApi::ChatCompletions;
+        let target = connection.resolve("").expect("target");
+        let request = build_chat_request(&target, "系统", "用户", 800, false).expect("request");
+        let body = serde_json::to_value(request).expect("request json");
+        let format = &body["response_format"]["type"];
+        assert_ne!(
+            format, "json_object",
+            "纯文本模式不能要求 JSON 对象，实际: {format}"
+        );
+    }
+
     #[test]
     fn chat_request_uses_typed_messages_and_json_object_format() {
         let mut connection = config("openai");
         connection.wire_api = WireApi::ChatCompletions;
         let target = connection.resolve("").expect("target");
-        let request = build_chat_request(&target, "系统", "用户", 1024).expect("request");
+        let request = build_chat_request(&target, "系统", "用户", 1024, true).expect("request");
         let body = serde_json::to_value(request).expect("request json");
 
         assert_eq!(body["messages"][0]["role"], "system");

@@ -2,6 +2,7 @@ pub(crate) mod administration;
 pub(crate) mod ai_chat;
 pub(crate) mod card_games;
 pub(crate) mod chat_text;
+pub(crate) mod clock_text;
 pub(crate) mod command;
 pub(crate) mod command_access;
 pub(crate) mod command_catalog;

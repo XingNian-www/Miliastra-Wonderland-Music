@@ -87,6 +87,11 @@ impl ApplicationRuntime {
                     allowed_commands: &allowed,
                     asker: actor_display.as_str(),
                     hall: &hall,
+                    // 一轮取一次：工具循环内不重算，避免同一次提问前后时间不一致。
+                    now_unix: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_secs())
+                        .unwrap_or(0),
                 });
                 let tools = if config.allow_commands {
                     ai_chat::command_tools(&allowed)

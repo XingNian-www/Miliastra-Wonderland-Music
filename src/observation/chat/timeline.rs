@@ -1010,6 +1010,9 @@ impl ChatTimeline {
         captured_at: Instant,
         epoch: VisualSessionId,
         source: &str,
+        // 本机账号 UID，用于把私聊 peer 从「接收者」纠正回「对方」。
+        // None 时退化为原行为（只能靠 to_uid/from.uid 先到先得）。
+        self_uid: Option<&str>,
         messages: Vec<crate::observation::chat::ExternalChatMessage>,
     ) -> Result<Vec<ObservedChatMessageId>> {
         if messages.is_empty() {
@@ -1023,7 +1026,7 @@ impl ChatTimeline {
         // 真正推给订阅者的消息；`accepted` 只记 id 供调用方核对。
         let mut delivered: Vec<ChatTimelineMessage> = Vec::new();
         for message in messages {
-            let Some(scope) = external_chat_scope(&message) else {
+            let Some(scope) = external_chat_scope(&message, self_uid) else {
                 log::debug!(
                     "外部聊天消息缺少可用的会话身份，已忽略: channel={}",
                     message.channel
@@ -1528,8 +1531,14 @@ fn dedup_identity_for_scope(scope: &ChatScope) -> ChatIdentity {
 ///
 /// 私聊的 peer **优先用 UID**：昵称可能迟到甚至永远不到（API 文档 §5），
 /// 而 UID 是必填的。以前用昵称当键，昵称一缺整条私聊就被丢弃。
+///
+/// `self_uid` 是本机账号 UID，**必须排除**：玩家私聊 BOT 时 `to_uid` 就是
+/// 接收者（BOT 自己），原来无条件先取 `to_uid`，于是 peer 变成 BOT 的 UID。
+/// 下游身份映射查不到该 UID，按身份归属的功能全部失效——线上表现为
+/// 「大厅里能导入歌单，好友私聊提示未在身份映射登记」。
 fn external_chat_scope(
     message: &crate::observation::chat::ExternalChatMessage,
+    self_uid: Option<&str>,
 ) -> Option<ChatScope> {
     if message.channel.is_current_hall() {
         return Some(match message.hall_id {
@@ -1538,12 +1547,18 @@ fn external_chat_scope(
         });
     }
     if message.channel.is_private() {
-        // 对方账号：优先 to_uid（我发给别人），其次 from.uid（别人发给我）。
-        let peer = match (&message.to_uid, &message.sender.uid) {
-            (Some(to), _) => to.as_str().to_string(),
-            (None, Some(from)) => from.as_str().to_string(),
-            (None, None) => {
-                // 两个 UID 都没有时才退回昵称；再没有就只能放弃。
+        // 对方账号：发送者优先，并排除本机账号。
+        //
+        // 原实现无条件先取 to_uid，但 `to_uid` 是**接收者**：玩家私聊 BOT 时
+        // 它就是 BOT 自己的 UID，于是 peer 变成 self_uid，下游身份映射查不到，
+        // 个人歌单等按身份归属的功能全部失效。BOT 主动发出去的消息里
+        // from.uid 才是 self_uid，此时要落到 to_uid，因此两边都要排除。
+        let is_self = |uid: &str| self_uid.is_some_and(|me| me == uid);
+        let peer = match (&message.sender.uid, &message.to_uid) {
+            (Some(from), _) if !is_self(from.as_str()) => from.as_str().to_string(),
+            (_, Some(to)) if !is_self(to.as_str()) => to.as_str().to_string(),
+            // 两个 UID 都没有（或都是本机账号）时才退回昵称；再没有就只能放弃。
+            _ => {
                 let name = message
                     .sender
                     .nickname
@@ -2093,6 +2108,66 @@ impl ChatTimeline {
 mod tests {
     use super::*;
 
+    /// 回归：玩家私聊 BOT 时，peer 必须是玩家，不能是 BOT 自己。
+    ///
+    /// `to_uid` 是**接收者**。玩家发消息给 BOT，接收者就是 BOT 自己，
+    /// 原来无条件优先取它，peer 变成 self_uid；下游身份映射查不到，
+    /// 个人歌单等按身份归属的功能全部失效——线上表现为
+    /// 「大厅里能导入歌单，好友私聊提示未在身份映射登记」。
+    #[test]
+    fn private_message_from_player_yields_the_player_not_the_bot() {
+        const SELF: &str = "900000001";
+        const PLAYER: &str = "900000002";
+        let message = crate::observation::chat::ExternalChatMessage {
+            sequence: 1,
+            sent_at: None,
+            channel: miliastra_kernel::chat_source::ChatChannel::private(),
+            hall_id: None,
+            sender: miliastra_kernel::chat_source::ExternalSender {
+                nickname: Some("玩家甲".into()),
+                uid: Some(miliastra_kernel::chat_source::GameUid::from_u32(
+                    340_699_619,
+                )),
+            },
+            // 接收者是 BOT 自己。
+            to_uid: Some(miliastra_kernel::chat_source::GameUid::from_u32(
+                127_138_439,
+            )),
+            text: "@导入QQ歌单9796591105".into(),
+        };
+        let scope = external_chat_scope(&message, Some(SELF)).expect("scope");
+        assert_eq!(
+            scope,
+            ChatScope::private(PLAYER),
+            "peer 必须是玩家，不能是 BOT 自己"
+        );
+    }
+
+    /// BOT 自己发出去的消息：from 是 self，peer 应当落到 to。
+    #[test]
+    fn private_message_sent_by_the_bot_yields_the_recipient() {
+        const SELF: &str = "900000001";
+        const PLAYER: &str = "900000002";
+        let message = crate::observation::chat::ExternalChatMessage {
+            sequence: 2,
+            sent_at: None,
+            channel: miliastra_kernel::chat_source::ChatChannel::private(),
+            hall_id: None,
+            sender: miliastra_kernel::chat_source::ExternalSender {
+                nickname: Some("橘子".into()),
+                uid: Some(miliastra_kernel::chat_source::GameUid::from_u32(
+                    127_138_439,
+                )),
+            },
+            to_uid: Some(miliastra_kernel::chat_source::GameUid::from_u32(
+                340_699_619,
+            )),
+            text: "哼，点好了喵".into(),
+        };
+        let scope = external_chat_scope(&message, Some(SELF)).expect("scope");
+        assert_eq!(scope, ChatScope::private(PLAYER));
+    }
+
     fn input(text: &str, y: i32) -> RecognizedChatMessage {
         RecognizedChatMessage {
             text: text.into(),
@@ -2186,6 +2261,7 @@ mod tests {
                 Instant::now(),
                 VisualSessionId::new(u64::MAX),
                 "test",
+                None,
                 vec![miliastra_kernel::chat_source::ExternalChatMessage {
                     sequence: 1,
                     sent_at: None,
@@ -2224,6 +2300,7 @@ mod tests {
                 Instant::now(),
                 VisualSessionId::new(u64::MAX),
                 "test",
+                None,
                 vec![miliastra_kernel::chat_source::ExternalChatMessage {
                     sequence: 1,
                     sent_at: None,
@@ -2271,7 +2348,7 @@ mod tests {
             text: "@状态".to_string(),
         };
         shared
-            .inject_external(Instant::now(), epoch, "test", vec![message])
+            .inject_external(Instant::now(), epoch, "test", None, vec![message])
             .unwrap();
         let outcome = shared
             .wait_for_snapshot(refresh, Duration::from_millis(50))
@@ -2302,7 +2379,7 @@ mod tests {
             text: "@状态".to_string(),
         };
         shared
-            .inject_external(Instant::now(), epoch, "test", vec![message])
+            .inject_external(Instant::now(), epoch, "test", None, vec![message])
             .unwrap();
         let frames = business.read().unwrap();
         assert_eq!(frames.len(), 1, "注入的消息必须进入业务订阅者队列");

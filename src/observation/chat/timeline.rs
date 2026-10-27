@@ -2126,12 +2126,12 @@ mod tests {
             sender: miliastra_kernel::chat_source::ExternalSender {
                 nickname: Some("玩家甲".into()),
                 uid: Some(miliastra_kernel::chat_source::GameUid::from_u32(
-                    340_699_619,
+                    900_000_002,
                 )),
             },
             // 接收者是 BOT 自己。
             to_uid: Some(miliastra_kernel::chat_source::GameUid::from_u32(
-                127_138_439,
+                900_000_001,
             )),
             text: "@导入QQ歌单9796591105".into(),
         };
@@ -2156,11 +2156,11 @@ mod tests {
             sender: miliastra_kernel::chat_source::ExternalSender {
                 nickname: Some("橘子".into()),
                 uid: Some(miliastra_kernel::chat_source::GameUid::from_u32(
-                    127_138_439,
+                    900_000_001,
                 )),
             },
             to_uid: Some(miliastra_kernel::chat_source::GameUid::from_u32(
-                340_699_619,
+                900_000_002,
             )),
             text: "哼，点好了喵".into(),
         };

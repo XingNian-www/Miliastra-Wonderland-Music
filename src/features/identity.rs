@@ -466,15 +466,15 @@ impl IdentityAccess {
     /// 手工维护的映射则反过来，真名在 nickname、备注在 note。
     /// 两种来源都得试，否则必有一半玩家的邀请找不到人。
     ///
-    /// 顺序：nickname（游戏内昵称，OCR 路径的权限依据）优先，
-    /// note（显示昵称，仅为 API 自动建的身份兜底）次之。
+    /// 顺序：note（显示昵称，玩家认得出的名字）优先，
+    /// nickname（游戏内随机串或 OCR 匹配键）次之。
     /// 空串与重复项已剔除；一个都没有时返回空表，调用方据此在进 UI 前失败。
     pub fn friend_row_names_for_account(&self, game: &str, uid: &str) -> Vec<String> {
         let Some(identity) = self.resolve_account(game, uid) else {
             return Vec::new();
         };
         let mut names = Vec::with_capacity(2);
-        for candidate in [identity.nickname.trim(), identity.note.trim()] {
+        for candidate in [identity.note.trim(), identity.nickname.trim()] {
             if candidate.is_empty() || names.iter().any(|existing| existing == candidate) {
                 continue;
             }
@@ -482,11 +482,92 @@ impl IdentityAccess {
         }
         names
     }
-    /// 获取好友操作接口使用的原始游戏昵称；备注昵称只用于身份识别和展示。
-    pub fn canonical_name(&self, nickname: &str) -> String {
+    /// 记忆归属键：**UUID 优先，未登记才退回显示昵称**。
+    ///
+    /// UUID 是唯一身份码，跨改名、跨显示名变化都稳定。用它当键，
+    /// 玩家怎么改游戏内昵称，记忆都不会分裂。
+    ///
+    /// 外部聊天源给的昵称是玩家当前的游戏内显示名（随时能改），
+    /// 它既可能对上 `nickname`（OCR 匹配键），也可能对上 `note`（显示昵称）；
+    /// 原来只按 `nickname` 查、查不到就原样返回，线上表现为
+    /// 记忆存在「甲」下而面板显示「乙」，同一个人的记忆分成两份。
+    ///
+    /// 未登记的玩家没有 UUID，只能继续用显示昵称当键——这类人本来也无法
+    /// 跨改名识别，分成两份是既有局限，不是新问题。
+    pub fn memory_key(&self, nickname: &str) -> String {
         self.resolve(nickname)
-            .map(|identity| identity.nickname)
+            .or_else(|| self.resolve_by_note(nickname))
+            .map(|identity| identity.id.to_string())
+            .unwrap_or_else(|| self.display_name_for(nickname))
+    }
+
+    /// 记忆键对应的展示名（BOT 称呼、面板、日志都用它）。
+    ///
+    /// UUID 键本身不可读，展示时必须换回显示昵称。
+    pub fn memory_display_name(&self, nickname: &str) -> String {
+        self.resolve(nickname)
+            .or_else(|| self.resolve_by_note(nickname))
+            .map(|identity| {
+                let note = identity.note.trim();
+                if note.is_empty() {
+                    identity.nickname
+                } else {
+                    note.to_owned()
+                }
+            })
             .unwrap_or_else(|| nickname.to_owned())
+    }
+
+    /// 由记忆键反查展示名：键是 UUID 时找对应身份，否则原样返回。
+    pub fn display_name_for_key(&self, key: &str) -> String {
+        if let Ok(uuid) = Uuid::parse_str(key) {
+            let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+            if let Some(mapping) = config.mappings.iter().find(|mapping| mapping.id == uuid) {
+                let note = mapping.note.trim();
+                return if note.is_empty() {
+                    mapping.nickname.clone()
+                } else {
+                    note.to_owned()
+                };
+            }
+        }
+        key.to_owned()
+    }
+
+    fn display_name_for(&self, nickname: &str) -> String {
+        self.resolve(nickname)
+            .or_else(|| self.resolve_by_note(nickname))
+            .map(|identity| {
+                let note = identity.note.trim();
+                if note.is_empty() {
+                    identity.nickname
+                } else {
+                    note.to_owned()
+                }
+            })
+            .unwrap_or_else(|| nickname.to_owned())
+    }
+
+    /// 按显示昵称（note）反查身份。
+    ///
+    /// 外部聊天源的昵称是玩家可随时改的游戏内显示名，命中 note 比命中
+    /// 随机串形式的 nickname 更常见。空 note 永不匹配。
+    fn resolve_by_note(&self, note: &str) -> Option<ResolvedIdentity> {
+        if note.trim().is_empty() {
+            return None;
+        }
+        let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        config
+            .mappings
+            .iter()
+            .find(|mapping| mapping.note.trim() == note.trim())
+            .map(|mapping| ResolvedIdentity {
+                id: mapping.id,
+                role: mapping.role,
+                nickname: mapping.nickname.clone(),
+                note: mapping.note.clone(),
+                fallback_name: short_uuid(mapping.id),
+            })
     }
 
     /// 在聊天发送前替换文本中的 OCR 身份昵称，避免把映射字符串原样发回大厅。
@@ -776,6 +857,54 @@ mod tests {
     /// 调 resolve()（只按 nickname 精确匹配），UID 传进去必然落空，
     /// 已登记的玩家被判成未登记——线上表现为大厅能导入歌单、
     /// 好友私聊提示「该玩家未在身份映射登记」。
+
+    /// 回归：记忆归属键是 UUID，展示名是显示昵称。
+    ///
+    /// 外部聊天源给的昵称是玩家当前的游戏内显示名（随时能改）。
+    /// 用 UUID 当键，玩家怎么改名记忆都不会分裂；展示时再换回显示昵称。
+    #[test]
+    fn memory_key_is_uuid_and_display_is_the_note() {
+        let mut config = IdentityConfig::default();
+        let id = Uuid::new_v4();
+        config.mappings.push(IdentityMapping {
+            nickname: "nick_alpha".to_string(),
+            id,
+            role: IdentityRole::Admin,
+            note: "显示名甲".to_string(),
+            accounts: vec![GameAccount::new("10001")],
+        });
+        let access = IdentityAccess::new(config);
+
+        // 命中 nickname 或 note，记忆键都是同一个 UUID。
+        assert_eq!(access.memory_key("nick_alpha"), id.to_string());
+        assert_eq!(access.memory_key("显示名甲"), id.to_string());
+        // 展示名统一是显示昵称。
+        assert_eq!(access.memory_display_name("nick_alpha"), "显示名甲");
+        assert_eq!(access.memory_display_name("显示名甲"), "显示名甲");
+        // 由 UUID 键反查展示名。
+        assert_eq!(access.display_name_for_key(&id.to_string()), "显示名甲");
+        // 未登记的玩家：键退回显示昵称本身。
+        assert_eq!(access.memory_key("陌生人"), "陌生人");
+    }
+
+    /// 好友列表候选名以显示昵称为先。
+    #[test]
+    fn friend_row_names_put_the_note_first() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            nickname: "nick_beta".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            note: "显示名乙".to_string(),
+            accounts: vec![GameAccount::new("10002")],
+        });
+        let access = IdentityAccess::new(config);
+        assert_eq!(
+            access.friend_row_names_for_account("genshin", "10002"),
+            vec!["显示名乙".to_string(), "nick_beta".to_string()]
+        );
+    }
+
     #[test]
     fn identity_resolves_by_uid_and_by_nickname() {
         let mut config = IdentityConfig::default();

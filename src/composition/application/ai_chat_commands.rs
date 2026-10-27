@@ -63,19 +63,12 @@ impl ApplicationRuntime {
                     // 用**读取**预算而不是落库预算：后者是 32000，当读取窗口用
                     // 等于每题注入 32K token 的跨玩家、无归属回答。
                     .context(&actor, crate::features::ai_chat::BOT_HISTORY_READ_BUDGET)?;
-                // 给模型看的名字：先按 UID 反查（外部源的信封主语可能是 UID），
-                // 查不到再用 canonical 名。`actor` 仍是记忆归属键，两者分开。
-                let actor_display = match parsed.account.as_ref() {
-                    Some(account) => self
-                        .lifecycle
-                        .live_configs
-                        .identity
-                        .friend_row_names_for_account(&account.game, &account.uid)
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(|| actor.clone()),
-                    None => actor.clone(),
-                };
+                // 记忆键是 UUID，不可读；给模型看的名字必须换回显示昵称。
+                //
+                // 曾经这里另外按 UID 反查一次名字，与 `actor` 各走一条链，
+                // 结果记忆键是「甲」，称呼却用「乙」——同一个人分裂成两份。
+                // 现在两者都从 `actor` 这一个键派生，不可能再对不上。
+                let actor_display = self.actor_display_name(&actor);
                 // 大厅共享记忆：所有人最近说的 + 滚动摘要。
                 // 个人记忆只属于提问者，大厅上下文是所有人在同一空间里共享的。
                 let hall = self.business.ai_chat_memory.hall_context()?;

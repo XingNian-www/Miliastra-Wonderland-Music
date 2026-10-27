@@ -223,6 +223,20 @@ pub(super) fn ai_memory_forget_hall_route(
     state.application.ai.forget_hall().map_err(ai_route_error)
 }
 
+/// POST /ai/memory/rebuild —— 用新规则重放历史，重建某个玩家的事实表。
+pub(super) fn ai_memory_rebuild_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let target = memory_target(body)?;
+    let actor = normalize_required_text(Some(target.name.as_str()), "name")?;
+    state
+        .application
+        .ai
+        .rebuild_facts(&actor)
+        .map_err(ai_route_error)
+}
+
 fn ai_route_error(error: anyhow::Error) -> AppError {
     // 内部错误(500)只记日志,响应用通用文案,避免错误链泄漏内部路径;
     // 仅用户输入类错误(400)保留原文。

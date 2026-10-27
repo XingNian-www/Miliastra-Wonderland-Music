@@ -773,6 +773,26 @@ impl ApplicationRuntime {
                 Arc::new(http_facade::ApplicationHttpAiFacade::with_memory(
                     self.business.ai.clone(),
                     self.business.ai_chat_memory.clone(),
+                    {
+                        // 重跑清洗：闭包捕获可克隆的句柄，模型配置走实时快照，
+                        // 这样面板请求时用的是当前生效的模型而不是装配时那份。
+                        let memory = self.business.ai_chat_memory.clone();
+                        let openai = self.business.ai_chat_openai.clone();
+                        let connection = self.business.ai_connection.clone();
+                        let timeout = self.business.ai_request_timeout;
+                        let live_configs = self.lifecycle.live_configs.clone();
+                        Arc::new(move |actor: &str| {
+                            let config = live_configs.snapshot().ai_chat.clone();
+                            crate::composition::application::ApplicationRuntime::rebuild_facts_with(
+                                &memory,
+                                &openai,
+                                &connection,
+                                timeout,
+                                &config,
+                                actor,
+                            )
+                        })
+                    },
                 )),
             ),
         );

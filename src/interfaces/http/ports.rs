@@ -440,6 +440,8 @@ pub(crate) trait HttpAiPort: Send + Sync {
     fn delete_fact(&self, actor: &str, fact: &str) -> Result<String>;
     /// 清空大厅共享记忆。
     fn forget_hall(&self) -> Result<String>;
+    /// 用当前抽取规则重放该玩家全部历史问答，重建事实表。
+    fn rebuild_facts(&self, actor: &str) -> Result<String>;
 }
 
 #[derive(Clone)]

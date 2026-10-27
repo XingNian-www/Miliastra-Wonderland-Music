@@ -155,6 +155,10 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
         handler: ai_memory_forget_actor_route,
     },
     BodyRouteSpec {
+        path: "/ai/memory/rebuild",
+        handler: ai_memory_rebuild_route,
+    },
+    BodyRouteSpec {
         path: "/ai/memory/delete-fact",
         handler: ai_memory_delete_fact_route,
     },

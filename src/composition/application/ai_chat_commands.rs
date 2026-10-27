@@ -91,7 +91,7 @@ impl ApplicationRuntime {
                 } else {
                     Vec::new()
                 };
-                let result = (|| -> Result<String> {
+                let result = (|| -> Result<ai_chat::AiChatAnswer> {
                     let mut session = crate::config::ai::ToolSession::with_history_options(
                         &self.business.ai_connection,
                         &crate::config::ai::AiCallOptions {
@@ -121,9 +121,24 @@ impl ApplicationRuntime {
                             )?
                         };
                         if response.calls.is_empty() {
-                            let text = ai_chat::sanitize_answer(&response.text);
-                            anyhow::ensure!(!text.is_empty(), "AI 未返回最终回复");
-                            return Ok(text);
+                            let reply = ai_chat::parse_reply(&response.text);
+                            let rendered = ai_chat::render_reply(&reply);
+                            anyhow::ensure!(!rendered.is_empty(), "AI 未返回最终回复");
+                            // 三个消费者要的不是同一份东西：
+                            // - 发送给玩家：渲染文本（`*动作* 台词`）
+                            // - conversation_history：原始 JSON（few-shot 一致，
+                            //   否则模型在历史里看到散文，就不会再按格式输出）
+                            // - 事实抽取：渲染文本（不能把 JSON 语法当玩家信息）
+                            let raw = if reply.action.is_empty() && reply.text.is_empty() {
+                                String::new()
+                            } else {
+                                serde_json::to_string(&serde_json::json!({
+                                    "action": reply.action,
+                                    "text": reply.text,
+                                }))
+                                .unwrap_or_else(|_| rendered.clone())
+                            };
+                            return Ok(ai_chat::AiChatAnswer { raw, rendered });
                         }
                         anyhow::ensure!(allow_tools, "AI 在工具关闭后仍请求执行");
                         for call in response.calls {
@@ -162,8 +177,8 @@ impl ApplicationRuntime {
                     }
                     anyhow::bail!("AI 工具循环未产生最终回复")
                 })();
-                let text = match result {
-                    Ok(text) => text,
+                let answer = match result {
+                    Ok(answer) => answer,
                     Err(error) => {
                         log::warn!("AI 聊天工具调用失败: {error:#}");
                         let text = self.render_reply(
@@ -174,21 +189,24 @@ impl ApplicationRuntime {
                         return ApplicationRuntime::reply(self, &text);
                     }
                 };
+                let rendered = &answer.rendered;
                 let now_ms = command_now_ms();
-                if !text.is_empty() {
-                    let lines = crate::text::split_numbered_chat_message("", &text);
+                if !rendered.is_empty() {
+                    let lines = crate::text::split_numbered_chat_message("", rendered);
                     let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
                     // 发送失败或仅部分发送时，不把完整回答写入下一轮会话。
                     self.reply_batch(&refs, 0)?;
+                    // 历史存原始 JSON：模型在 few-shot 里看到「上一轮就是这种格式」，
+                    // 才会继续按格式输出；存渲染后的散文会让它以为自由文本也可以。
                     self.business.ai_chat_memory.record_turn(
                         &actor,
                         question,
-                        &text,
+                        &answer.raw,
                         config.actor_token_budget,
                         now_ms,
                     )?;
                     self.business.ai_chat_memory.record_bot_line(
-                        &text,
+                        rendered,
                         config.bot_token_budget,
                         now_ms,
                     )?;
@@ -203,7 +221,7 @@ impl ApplicationRuntime {
                     // 大厅是双向对话，只有问没有答，模型下一轮就不知道刚才承诺了什么。
                     self.business.ai_chat_memory.record_hall_line(
                         &self.bot_display_name(),
-                        &text,
+                        rendered,
                         now_ms,
                     )?;
                     // 超预算时压缩。失败不影响已发出的回复。
@@ -211,7 +229,7 @@ impl ApplicationRuntime {
                 }
                 self.log_executed_command(parsed, "ai_chat")?;
                 if let Err(error) =
-                    self.extract_ai_chat_facts(parsed, &actor, question, &text, &config)
+                    self.extract_ai_chat_facts(parsed, &actor, question, rendered, &config)
                 {
                     log::warn!("AI 回复已发送，长期记忆更新失败: {error:#}");
                 }

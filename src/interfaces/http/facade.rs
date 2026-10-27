@@ -1229,6 +1229,17 @@ impl crate::interfaces::http::HttpDebugPort for ApplicationHttpDebugFacade {
         crate::debug_mode::enabled()
     }
     fn set_enabled(&self, enabled: bool) -> Result<(), HttpCommandError> {
+        // 完全控制与只读观察互斥。
+        //
+        // 两个开关原本各自独立：先开只读 observer、再开完全控制，会进入混合态，
+        // 而 execute_direct 优先选 ReadOnlyExecutor，于是「完全控制」下所有输入
+        // 命令都被「只读执行器拒绝输入或业务命令」挡掉——接口语义被推翻，
+        // 使用者只会看到莫名其妙的全量拒绝。
+        // 开启完全控制时主动关掉观察开关。
+        if enabled && crate::debug_read_only::observer().enabled() {
+            crate::debug_read_only::observer()
+                .set_enabled_state(false, crate::debug_read_only::ReadOnlyState::Active);
+        }
         crate::debug_mode::set_enabled(enabled);
         Ok(())
     }

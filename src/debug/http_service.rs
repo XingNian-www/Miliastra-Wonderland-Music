@@ -557,6 +557,14 @@ impl DebugHttpService {
             // 而绝大多数命令并不需要画面。需要画面的调用方应显式发 capture。
             capture_after_each: false,
         };
+        // 单条命令也必须过统一校验。
+        //
+        // 之前这里直接 start_snapshot：坐标上限 100000、文本 16KiB、等待 30s、
+        // |scroll|>10000、mouse button 白名单、空 key/text、startup kind 白名单、
+        // playback_set_volume 的 0..=100 全部不生效——校验函数写了但没接线。
+        // plugin_dispatch 的注释声称「execute_direct 内部会走 validate」也与事实不符。
+        task.validate(SandboxLimits::default())
+            .map_err(|reason| error(&format!("命令参数不合法: {reason}")))?;
         let run_id = {
             let mut runners = self.runners.lock().map_err(error)?;
             self.ensure_session_capacity(&mut runners)?;

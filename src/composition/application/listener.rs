@@ -793,6 +793,11 @@ impl ApplicationRuntime {
                             )
                         })
                     },
+                    {
+                        // 记忆键是 UUID，面板要显示成人能认的名字。
+                        let identity = self.lifecycle.live_configs.identity.clone();
+                        Arc::new(move |key: &str| identity.display_name_for_key(key))
+                    },
                 )),
             ),
         );
@@ -2110,11 +2115,17 @@ impl ApplicationRuntime {
         self.lifecycle.live_configs.identity.display_name(ocr_name)
     }
 
+    /// 记忆归属键：已登记玩家用 UUID，未登记退回显示昵称。
     pub(super) fn canonical_actor_name(&self, ocr_name: &str) -> String {
+        self.lifecycle.live_configs.identity.memory_key(ocr_name)
+    }
+
+    /// 记忆键对应的展示名（BOT 称呼、面板、日志用）。
+    pub(super) fn actor_display_name(&self, actor_key: &str) -> String {
         self.lifecycle
             .live_configs
             .identity
-            .canonical_name(ocr_name)
+            .display_name_for_key(actor_key)
     }
 
     /// 歌单归属键的候选列表，按优先级：UID > 身份映射 UUID > 昵称。

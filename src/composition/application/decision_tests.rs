@@ -29,6 +29,7 @@ fn external_message_with_sender_prefix_still_yields_the_command() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![external_hall_message(1, "@状态")],
         )
         .unwrap();
@@ -157,6 +158,7 @@ fn external_reader_uses_sequence_watermark_without_waiting_for_a_frame() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![
                 external_hall_message(3, "@1"),
                 external_hall_message(7, "@2"),
@@ -206,6 +208,7 @@ fn external_decision_window_is_ready_without_any_incoming_message() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![external_hall_message(5, "@1")],
         )
         .unwrap();
@@ -246,6 +249,7 @@ fn external_decision_window_receives_messages_carrying_a_hall_id() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![external_hall_message_with_hall(11, "@1", Some(9527))],
         )
         .unwrap();
@@ -294,6 +298,7 @@ fn external_window_is_ready_then_receives_the_decision() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![external_hall_message(11, "@1")],
         )
         .unwrap();
@@ -314,6 +319,7 @@ fn external_message_with_sender_prefix_still_yields_hash_commands() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![external_hall_message(1, "#状态")],
         )
         .unwrap();
@@ -382,6 +388,7 @@ fn screen_opened_window_still_receives_frames_after_external_takeover() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![external_hall_message(5, "@1")],
         )
         .unwrap();
@@ -515,6 +522,7 @@ fn multiple_conversations_delivers_first_external_frame() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![external_hall_message(1, "@确认")],
         )
         .unwrap();
@@ -568,6 +576,7 @@ fn external_decision_reader_matches_by_scope_not_screen_bucket() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![external_hall_message(2, "@1")],
         )
         .unwrap();
@@ -850,6 +859,7 @@ fn external_chatter_mentioning_at_is_not_truncated_into_a_command() {
             Instant::now(),
             crate::observation::chat::VisualSessionId::new(u64::MAX),
             "test",
+            None,
             vec![external_hall_message(2, "今天天气不错@某人")],
         )
         .unwrap();

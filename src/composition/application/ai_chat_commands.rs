@@ -263,23 +263,24 @@ impl ApplicationRuntime {
         if answer.trim().is_empty() {
             return Ok(());
         }
-        // 把已有事实交给模型：它才能判断这条是新增还是推翻旧的。
+        // 已有事实交给模型，它才能判断「这条推翻旧的」而不是「再补一条」。
         // 放在用户消息里而不是 extract_prompt 模板里——模板存在配置库，
         // 用户沿用的旧值不会有这个占位符，改代码默认值对已部署实例无效。
         let existing = self.business.ai_chat_memory.facts(actor)?;
         let existing_text = if existing.is_empty() {
             "（暂无）".to_string()
         } else {
-            existing.join("；")
+            existing
+                .iter()
+                .enumerate()
+                .map(|(index, fact)| format!("{}. {fact}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        let prompt = format!(
-            "已有事实（按时间从旧到新）：{existing_text}\n\
-             玩家说：{question}\n你回答：{answer}\n\
-             只返回 JSON：{{\"facts\":[\"…\"],\"remove\":[\"…\"]}}。\
-             facts 写这一轮新增或需要改写的信息；\
-             remove 原样列出已有事实中已被本轮明确推翻的句子（改名、改称呼、改偏好），\
-             没有就留空数组。不要重复已有事实。"
-        );
+        // 抽取规则收在 features::ai_chat::fact_extraction_prompt，与历史重放清洗共用，
+        // 避免两处口径不一致——否则清洗出来的结果和日常增量抽取会对不上。
+        let prompt =
+            crate::features::ai_chat::fact_extraction_prompt(&existing_text, question, answer);
         // 同一次问答的第二次模型调用，同样不能在持有 UI 租约时干等。
         let reply = match {
             let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
@@ -320,6 +321,71 @@ impl ApplicationRuntime {
         }
         let _ = parsed;
         Ok(())
+    }
+
+    /// 用新规则重放某个玩家的全部历史问答，重建事实表。
+    ///
+    /// 为什么需要重放而不是「等玩家下次提到再修正」：错误的旧事实会持续污染
+    /// BOT 的回答，而 BOT 的回答又会被下一轮抽取当上下文——形成自我强化闭环，
+    /// 只靠后续对话很难自行洗掉。历史原文都在库里，直接重跑最干净。
+    ///
+    /// 做成不依赖 `self` 的关联函数：HTTP 面板要用它，而面板拿不到 `&mut self`。
+    /// 所需句柄都可克隆，由调用方捕获进闭包。
+    pub(crate) fn rebuild_facts_with(
+        memory: &crate::features::ai_chat::AiChatMemory,
+        openai: &miliastra_kernel::ai::OpenAiRuntimeHandle,
+        connection: &crate::config::ai::AiConfig,
+        timeout: std::time::Duration,
+        config: &crate::features::ai_chat::AiChatConfig,
+        actor: &str,
+    ) -> Result<usize> {
+        let turns = memory.all_turns(actor)?;
+        if turns.is_empty() {
+            return Ok(0);
+        }
+        let mut facts: Vec<String> = Vec::new();
+        for (question, answer) in &turns {
+            if answer.trim().is_empty() {
+                continue;
+            }
+            let existing_text = if facts.is_empty() {
+                "（暂无）".to_string()
+            } else {
+                facts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, fact)| format!("{}. {fact}", index + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let prompt =
+                crate::features::ai_chat::fact_extraction_prompt(&existing_text, question, answer);
+            let reply = crate::config::ai::request_json(
+                openai,
+                connection,
+                &crate::config::ai::AiCallOptions {
+                    model: config.model.clone(),
+                    reasoning: config.reasoning,
+                },
+                &config.extract_prompt,
+                &prompt,
+                256,
+                timeout,
+            );
+            let Ok(reply) = reply else {
+                log::debug!("重放抽取失败，跳过该轮");
+                continue;
+            };
+            let (new_facts, remove) = crate::features::ai_chat::parse_fact_update(&reply);
+            facts.retain(|fact| !remove.iter().any(|item| item.trim() == fact.trim()));
+            for fact in new_facts {
+                if !facts.iter().any(|item| item.trim() == fact.trim()) {
+                    facts.push(fact);
+                }
+            }
+        }
+        memory.replace_facts(actor, &facts, command_now_ms())?;
+        Ok(facts.len())
     }
 
     /// 大厅记忆里代表 BOT 自己的名字。

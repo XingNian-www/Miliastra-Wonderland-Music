@@ -649,6 +649,9 @@ fn request_json_once(
         WireApi::Responses => {
             let request =
                 build_responses_request(target, system_prompt, user_prompt, max_tokens, json_mode)?;
+            // 线上出现过「每次压缩都报缺少 output_text，但手工复现请求却正常」。
+            // 在失败路径把请求一起打出来，才能定位差异（放在成功路径会刷屏）。
+            let debug_request = serde_json::to_string(&request).ok();
             let response = openai
                 .create_response(
                     target.build_target()?,
@@ -658,7 +661,11 @@ fn request_json_once(
                 )?
                 .wait()
                 .context("AI 请求失败")?;
-            responses_output_text(&response)
+            responses_output_text(&response).inspect_err(|_| {
+                if let Some(raw) = debug_request.as_deref() {
+                    log::warn!("AI responses 请求体（响应解析失败）: {raw}");
+                }
+            })
         }
         WireApi::ChatCompletions => {
             let request =
@@ -806,6 +813,12 @@ fn responses_output_text(response: &Response) -> anyhow::Result<String> {
                 }
             }
         }
+    }
+    // 失败时把实际结构打出来。这个错误在线上表现为「记忆压缩每轮都失败」，
+    // 而 Responses 协议下不同中转的 output 形状差异很大（reasoning 项、
+    // 空 content、非 message 类型），只看「缺少 output_text」无法定位。
+    if let Ok(raw) = serde_json::to_string(response) {
+        log::warn!("AI 响应结构（缺少 output_text）: {}", raw);
     }
     bail!("AI 响应缺少 output_text")
 }

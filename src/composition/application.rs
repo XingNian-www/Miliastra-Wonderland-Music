@@ -1835,31 +1835,38 @@ impl ApplicationRuntime {
                 startup: StartupService::new(),
                 custom_workflow,
             },
-            lifecycle: LifecycleBundle {
-                config,
-                live_configs,
-                http_server: None,
-                http_reload_blockers: Arc::new(AtomicUsize::new(0)),
-                http_reload_draining: Arc::new(AtomicBool::new(false)),
-                openai_runtime: Some(openai_runtime),
-                running,
-                shutdown: ShutdownState::new(),
-                reload_startup: ReloadStartupGate::default(),
-                reload_check_after: Instant::now(),
-                paused: Arc::new(AtomicBool::new(false)),
-                console_reply_context: Arc::new(AtomicBool::new(false)),
-                monitor,
-                config_store: Some(config_store.clone()),
-                external_chat: external_chat::spawn(
-                    chat_timeline_for_external,
-                    chat_source_config,
-                    Some(external_identity_access),
-                    Some(config_store),
-                )
-                .unwrap_or_else(|error| {
-                    log::error!("外部聊天源启动失败，继续走 OCR: {error:#}");
-                    external_chat::ExternalChatState::default()
-                }),
+            lifecycle: {
+                // spawn 需要自己那份 LiveConfigs：自动注册身份后要同步 effective
+                // 快照，否则下次 apply 会把新映射抹掉。必须在 live_configs 被
+                // move 进 LifecycleBundle 之前取出来。
+                let external_live_configs = live_configs.clone();
+                LifecycleBundle {
+                    config,
+                    live_configs,
+                    http_server: None,
+                    http_reload_blockers: Arc::new(AtomicUsize::new(0)),
+                    http_reload_draining: Arc::new(AtomicBool::new(false)),
+                    openai_runtime: Some(openai_runtime),
+                    running,
+                    shutdown: ShutdownState::new(),
+                    reload_startup: ReloadStartupGate::default(),
+                    reload_check_after: Instant::now(),
+                    paused: Arc::new(AtomicBool::new(false)),
+                    console_reply_context: Arc::new(AtomicBool::new(false)),
+                    monitor,
+                    config_store: Some(config_store.clone()),
+                    external_chat: external_chat::spawn(
+                        chat_timeline_for_external,
+                        chat_source_config,
+                        Some(external_identity_access),
+                        Some(config_store),
+                        external_live_configs,
+                    )
+                    .unwrap_or_else(|error| {
+                        log::error!("外部聊天源启动失败，继续走 OCR: {error:#}");
+                        external_chat::ExternalChatState::default()
+                    }),
+                }
             },
         })
     }

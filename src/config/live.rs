@@ -243,6 +243,22 @@ impl LiveConfigs {
     }
 
     /// 保存成功后合并全部 Live 字段；共享句柄保持不变，运行态读取点无需重建。
+    /// 只把身份映射同步进 effective 快照，不动其他字段。
+    ///
+    /// 自动注册好友身份时（外部聊天源首次见到某个 UID）只更新了
+    /// `IdentityAccess` 与配置库，没有回写这里。下一次 `apply` 会用
+    /// 旧快照 `identity.replace(...)` 把它抹掉——线上表现为
+    /// 「自动注册的身份不生效，去设置里手动保存一次才行」。
+    pub fn sync_identity_snapshot(&self, identity: crate::features::identity::IdentityConfig) {
+        let current = self.effective.snapshot();
+        if current.identity.mappings == identity.mappings {
+            return;
+        }
+        let mut next = (*current).clone();
+        next.identity = identity;
+        self.effective.replace(next);
+    }
+
     pub fn apply(&self, config: &AppConfig) {
         // 锁中毒时恢复继续使用,避免把可恢复的配置热更新升级为线程崩溃。
         use std::sync::PoisonError;
@@ -301,6 +317,7 @@ impl LiveConfigs {
             .write()
             .unwrap_or_else(PoisonError::into_inner) = config.custom_workflows.clone();
         self.identity.replace(config.identity.clone());
+        self.sync_identity_snapshot(config.identity.clone());
 
         let mut effective = Arc::unwrap_or_clone(self.effective.snapshot());
         effective.stability.secondary_hall_count = config.stability.secondary_hall_count;
@@ -498,6 +515,46 @@ mod tests {
         assert_eq!(
             live.begin_reload(),
             Some(BTreeSet::from(["queue.max_size".to_string()]))
+        );
+    }
+
+    /// 回归：自动注册的身份必须能立刻用，不需要去设置里手动保存。
+    ///
+    /// 原来只更新 `IdentityAccess` 与配置库，没有回写 effective 快照；
+    /// 下一次 `apply` 会用旧快照 `identity.replace(...)` 把它抹掉。
+    /// 线上表现为「新好友第一次说话时没有好友权限，保存一次设置才好」。
+    #[test]
+    fn auto_registered_identity_survives_the_next_apply() {
+        let mut config = AppConfig::default();
+        let live = LiveConfigs::from_config(&config);
+
+        // 模拟自动注册：直接改 IdentityAccess 再同步快照（生产里由
+        // external_chat 调 persist_identity 完成）。
+        let auto = crate::features::identity::IdentityMapping {
+            nickname: "auto_nick".to_string(),
+            id: uuid::Uuid::new_v4(),
+            role: crate::features::identity::IdentityRole::Friend,
+            note: "自动注册".to_string(),
+            accounts: vec![crate::features::identity::GameAccount::new("900000099")],
+        };
+        let mut updated = config.identity.clone();
+        updated.mappings.push(auto.clone());
+        live.identity.replace(updated.clone());
+        live.sync_identity_snapshot(updated.clone());
+
+        // 下一次 apply 用的是旧 AppConfig：快照若不带上新映射，它就会消失。
+        config.identity = updated.clone();
+        live.apply(&config);
+
+        assert!(
+            live.identity
+                .resolve_hint(crate::features::identity::IdentityHint::Account {
+                    game: "genshin",
+                    uid: "900000099",
+                    nickname: None,
+                })
+                .is_some(),
+            "自动注册的身份在 apply 之后必须仍然可用"
         );
     }
 

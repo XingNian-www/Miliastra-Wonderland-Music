@@ -512,7 +512,11 @@ impl ApplicationRuntime {
         let prompt = crate::features::ai_chat::summary_prompt(&plan.previous_summary, &records);
         // 与事实抽取同样处理：不持 UI 租约干等模型。
         let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
-        let reply = crate::config::ai::request_json(
+        // **必须走纯文本通道**：摘要要的是一段自然语言，
+        // 而 request_json 会强制 response_format=JsonObject。真机上表现为
+        // 每次压缩都 400 invalid_request_error，原文因此永远压不掉、
+        // 每轮重试一次注定失败的调用。
+        let reply = crate::config::ai::request_plain_text(
             &self.business.ai_chat_openai,
             &self.business.ai_connection,
             &crate::config::ai::AiCallOptions {

@@ -49,6 +49,13 @@ pub(crate) const BOT_TOKEN_BUDGET: usize = 32_000;
 /// context()，等于每题注入最多 32K token 的跨玩家、无归属的 BOT 回答，
 /// 而 max_tokens 只有 600、目标输出 160 字符。落库预算与读取窗口本该分开。
 pub(crate) const BOT_HISTORY_READ_BUDGET: usize = 800;
+
+/// 组装提示词时读取大厅原文（`ai_chat_hall_turns`）的**读取**预算。
+///
+/// 与 `HALL_TOKEN_BUDGET`（32000，那是**保留**预算）区分开：
+/// 原来 `hall_context` 的 SQL 没有 LIMIT，会全表读取，
+/// 大厅每轮写 2 行，几百轮后单次请求塞进上万 token，而目标输出只有 160 字符。
+const HALL_READ_BUDGET: usize = 1_200;
 /// 分层压缩的比例：达到预算后，从最旧的开始按这个比例重新分配。
 ///
 /// - 70% 压进摘要（信息密度最高的一层）
@@ -902,17 +909,34 @@ impl AiChatMemory {
     }
 
     /// 读取大厅共享记忆：所有人在大厅说过的话 + 大厅摘要。
+    ///
+    /// 只读**最近**若干条：原来这条 SQL 没有 LIMIT，会全表读取——大厅每次
+    /// 问答写 2 行，几百轮后单次请求就要塞进上万 token，而目标输出只有 160 字符。
+    /// 落库预算（32000 是**保留**预算）与读取窗口是两回事，和 bot_history 同理。
     pub(crate) fn hall_context(&self) -> Result<HallContext> {
         let connection = self.connection()?;
-        let lines = connection
-            .prepare("SELECT speaker, text, role FROM ai_chat_hall_turns ORDER BY id ASC")?
-            .query_map([], |row| {
+        // 从最新往回取，凑够读取预算就停，再反转成旧→新。
+        let mut lines = Vec::new();
+        let mut used = 0usize;
+        {
+            let mut stmt = connection.prepare(
+                "SELECT speaker, text, role, tokens FROM ai_chat_hall_turns ORDER BY id DESC",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let tokens: i64 = row.get(3)?;
+                // 至少保留最新一条，否则极小预算会把大厅上下文清空。
+                if !lines.is_empty() && used + tokens as usize > HALL_READ_BUDGET {
+                    break;
+                }
+                used += tokens as usize;
                 let speaker: String = row.get(0)?;
                 let text: String = row.get(1)?;
                 let role: String = row.get(2)?;
-                Ok((speaker, text, HallSpeakerRole::from_str(&role)))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+                lines.push((speaker, text, HallSpeakerRole::from_str(&role)));
+            }
+        }
+        lines.reverse();
         let summary = connection
             .query_row(
                 "SELECT summary FROM ai_chat_summaries WHERE scope = ?1",

@@ -29,11 +29,8 @@ pub(crate) const EMPTY_NO_TRACK_HINT: ReplyTemplate = spec(
 );
 
 /// 收藏为空（简短）。
-pub(crate) const EMPTY_PLAIN: ReplyTemplate = spec(
-    "playlist.empty.plain",
-    "你的歌单还是空的.",
-    "收藏为空",
-);
+pub(crate) const EMPTY_PLAIN: ReplyTemplate =
+    spec("playlist.empty.plain", "你的歌单还是空的.", "收藏为空");
 
 /// 窗口推荐的首行。
 pub(crate) const WINDOW_HEADER: ReplyTemplate = spec(
@@ -85,11 +82,8 @@ pub(crate) const REROLL_EXHAUSTED: ReplyTemplate = spec(
 );
 
 /// 关闭窗口。
-pub(crate) const WINDOW_CLOSED: ReplyTemplate = spec(
-    "playlist.window.closed",
-    "已关闭歌单窗口.",
-    "关闭歌单窗口",
-);
+pub(crate) const WINDOW_CLOSED: ReplyTemplate =
+    spec("playlist.window.closed", "已关闭歌单窗口.", "关闭歌单窗口");
 
 /// 收藏：当前没有播放中的歌曲。
 pub(crate) const FAVORITE_NO_TRACK: ReplyTemplate = spec(
@@ -267,11 +261,8 @@ pub(crate) const CLEAR_DONE: ReplyTemplate = spec(
 );
 
 /// 清空已取消。
-pub(crate) const CLEAR_ABORTED: ReplyTemplate = spec(
-    "playlist.clear.aborted",
-    "已取消清空.",
-    "清空-已取消",
-);
+pub(crate) const CLEAR_ABORTED: ReplyTemplate =
+    spec("playlist.clear.aborted", "已取消清空.", "清空-已取消");
 
 /// 全部歌单回复模板。
 pub(crate) const PLAYLIST: &[ReplyTemplate] = &[

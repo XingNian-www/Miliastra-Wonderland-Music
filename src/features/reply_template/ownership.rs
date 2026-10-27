@@ -110,42 +110,31 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@歌单帮助",
         name: "歌单帮助",
         category: "点歌",
-        keys: &[
-            "help.playlist",
-        ],
+        keys: &["help.playlist"],
     },
     CommandReplyGroup {
         command_id: "@暂停",
         name: "暂停",
         category: "播放",
-        keys: &[
-            "playback.pause.ok",
-        ],
+        keys: &["playback.pause.ok"],
     },
     CommandReplyGroup {
         command_id: "@继续",
         name: "继续 / 播放",
         category: "播放",
-        keys: &[
-            "playback.resume.ok",
-        ],
+        keys: &["playback.resume.ok"],
     },
     CommandReplyGroup {
         command_id: "@下一首",
         name: "下一首",
         category: "播放",
-        keys: &[
-            "playback.next.pool_fallback",
-            "playback.next.empty",
-        ],
+        keys: &["playback.next.pool_fallback", "playback.next.empty"],
     },
     CommandReplyGroup {
         command_id: "@上一首",
         name: "上一首",
         category: "播放",
-        keys: &[
-            "playback.previous.missing",
-        ],
+        keys: &["playback.previous.missing"],
     },
     CommandReplyGroup {
         command_id: "@删除",
@@ -163,9 +152,7 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@音量",
         name: "音量",
         category: "播放",
-        keys: &[
-            "playback.volume.set",
-        ],
+        keys: &["playback.volume.set"],
     },
     CommandReplyGroup {
         command_id: "@队列",
@@ -191,9 +178,7 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@队列清空",
         name: "队列清空",
         category: "播放",
-        keys: &[
-            "playback.queue.cleared",
-        ],
+        keys: &["playback.queue.cleared"],
     },
     CommandReplyGroup {
         command_id: "@歌词",
@@ -226,17 +211,13 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@后台歌词",
         name: "后台歌词",
         category: "播放",
-        keys: &[
-            "playback.lyrics.background.started",
-        ],
+        keys: &["playback.lyrics.background.started"],
     },
     CommandReplyGroup {
         command_id: "@单曲歌词",
         name: "单曲歌词",
         category: "播放",
-        keys: &[
-            "playback.lyrics.single_song.started",
-        ],
+        keys: &["playback.lyrics.single_song.started"],
     },
     CommandReplyGroup {
         command_id: "@停止歌词",
@@ -251,11 +232,7 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@大厅检测",
         name: "大厅检测",
         category: "大厅",
-        keys: &[
-            "hall.detect.failed",
-            "hall.public.current",
-            "hall.current",
-        ],
+        keys: &["hall.detect.failed", "hall.public.current", "hall.current"],
     },
     CommandReplyGroup {
         command_id: "@大厅时间",
@@ -273,9 +250,7 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@麦克风",
         name: "麦克风",
         category: "大厅",
-        keys: &[
-            "hall.microphone.toggled",
-        ],
+        keys: &["hall.microphone.toggled"],
     },
     CommandReplyGroup {
         command_id: "#塔罗牌",
@@ -295,9 +270,7 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "#塔罗牌帮助",
         name: "塔罗牌帮助",
         category: "娱乐",
-        keys: &[
-            "tarot.help",
-        ],
+        keys: &["tarot.help"],
     },
     CommandReplyGroup {
         command_id: "#接龙",
@@ -527,17 +500,13 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@帮助",
         name: "帮助",
         category: "管理",
-        keys: &[
-            "help.song_request",
-        ],
+        keys: &["help.song_request"],
     },
     CommandReplyGroup {
         command_id: "@娱乐帮助",
         name: "娱乐帮助",
         category: "管理",
-        keys: &[
-            "help.entertainment",
-        ],
+        keys: &["help.entertainment"],
     },
     CommandReplyGroup {
         command_id: "@启用",
@@ -565,27 +534,19 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
         command_id: "@拉黑",
         name: "拉黑 / 屏蔽",
         category: "管理",
-        keys: &[
-            "moderation.request.pending",
-            "moderation.vote.opened",
-        ],
+        keys: &["moderation.request.pending", "moderation.vote.opened"],
     },
     CommandReplyGroup {
         command_id: "@邀请",
         name: "邀请",
         category: "管理",
-        keys: &[
-            "invite.accepted",
-            "invite.sent",
-        ],
+        keys: &["invite.accepted", "invite.sent"],
     },
     CommandReplyGroup {
         command_id: "custom_workflow",
         name: "自定义流程",
         category: "管理",
-        keys: &[
-            "workflow.confirm.timeout",
-        ],
+        keys: &["workflow.confirm.timeout"],
     },
 ];
 
@@ -639,9 +600,7 @@ pub(crate) fn canonical_command_id(command_id: &str) -> &str {
 
 /// 一条 key 的归属命令。
 pub(crate) fn group_for_key(key: &str) -> Option<&'static CommandReplyGroup> {
-    REPLY_GROUPS
-        .iter()
-        .find(|group| group.keys.contains(&key))
+    REPLY_GROUPS.iter().find(|group| group.keys.contains(&key))
 }
 
 /// 一条命令拥有的全部 key。
@@ -650,4 +609,3 @@ pub(crate) fn group_for_command(command_id: &str) -> Option<&'static CommandRepl
         .iter()
         .find(|group| group.command_id == command_id)
 }
-

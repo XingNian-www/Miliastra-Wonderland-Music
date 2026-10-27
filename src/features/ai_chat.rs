@@ -806,14 +806,42 @@ impl AiChatMemory {
                  updated_at INTEGER NOT NULL
              );
              -- 大厅原文：记录**所有人在大厅说的话**，全局共享。
+             -- role 区分玩家发言与 BOT 自己的发言：BOT 的旧话会同时进
+             -- bot_lines 被再读一遍，模型容易把它当成玩家说过的话。
+             -- 只加标记、不删内容，符合「大厅保留完整对话」。
              CREATE TABLE IF NOT EXISTS ai_chat_hall_turns (
                  id       INTEGER PRIMARY KEY AUTOINCREMENT,
                  speaker  TEXT    NOT NULL,
                  text     TEXT    NOT NULL,
                  tokens   INTEGER NOT NULL,
-                 added_at INTEGER NOT NULL
+                 added_at INTEGER NOT NULL,
+                 role     TEXT    NOT NULL DEFAULT 'player'
+             );
+             -- 改名历史：actor 是按昵称存的，玩家改名后旧事实会变成孤儿行。
+             -- 这张表让「这个人用过哪些名字」成为结构事实，而不是靠模型从
+             -- 大厅散文里猜——线上出现过三个人的曾用名被算成一个人。
+             CREATE TABLE IF NOT EXISTS ai_chat_actor_names (
+                 actor  TEXT    NOT NULL,
+                 name   TEXT    NOT NULL,
+                 state  TEXT    NOT NULL DEFAULT 'current',
+                 since  INTEGER NOT NULL,
+                 PRIMARY KEY (actor, name)
              );",
         )?;
+        // 老库补 role 列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+        // 用 PRAGMA 判断而不是 prepare，空表时 prepare 也会成功。
+        let has_role = connection
+            .prepare("PRAGMA table_info(ai_chat_hall_turns)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "role");
+        if !has_role {
+            connection.execute(
+                "ALTER TABLE ai_chat_hall_turns ADD COLUMN role TEXT NOT NULL DEFAULT 'player'",
+                [],
+            )?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
         })

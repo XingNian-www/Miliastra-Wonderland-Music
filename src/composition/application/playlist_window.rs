@@ -243,7 +243,7 @@ impl ApplicationRuntime {
 
     pub(super) fn execute_playlist_window(&mut self, parsed: &RoutedCommand) -> Result<()> {
         // 歌单只属于已登记身份的玩家：没有 UUID 就没有歌单窗口。
-        let Some(owner) = self.playlist_owner_key(&parsed.username) else {
+        let Some(owner) = self.playlist_owner_key(&parsed.username, parsed.account.as_ref()) else {
             log::info!(
                 "命令未执行：该玩家未在身份映射登记，无个人歌单 text={}",
                 parsed.raw
@@ -345,7 +345,8 @@ impl ApplicationRuntime {
                 // 属主是 id:<uuid> 归属键、发送者是展示名：必须经身份解析比较，
                 // 否则属主本人也永远对不上，整个决策窗口不可用。
                 let sender_name = self.canonical_actor_name(envelope.username());
-                let sender_candidates = self.playlist_owner_candidates(&sender_name);
+                let sender_candidates =
+                    self.playlist_owner_candidates(&sender_name, envelope.account());
                 if !owner_matches_identity(&owner, &sender_name, &sender_candidates) {
                     log::info!(
                         "命令未执行：歌单窗口决策发送者不是当前窗口属主 sender={} owner={} text={}",

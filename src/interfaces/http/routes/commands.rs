@@ -259,6 +259,12 @@ fn validate_reply_variables(text: &str) -> std::result::Result<(), String> {
             rest = &after[close + 1..];
             continue;
         }
+        // 随机选项 {a|b|c}：含竖线且不含花括号。渲染器会随机取一条，
+        // 这里必须放行，否则用户写不出随机文案。
+        if name.contains('|') {
+            rest = &after[close + 1..];
+            continue;
+        }
         if name.trim() != name {
             return Err(format!(
                 "变量花括号内不能有空格，请写成 {{{}}}",

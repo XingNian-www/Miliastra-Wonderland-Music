@@ -2463,11 +2463,15 @@ impl ApplicationRuntime {
                     .identity
                     .role_of_sender(&sender, account);
                 if !config.min_access.allows(role) {
+                    // 带上 account 一起打：role=None 有两种成因——身份没登记，
+                    // 或者这条消息根本没带 UID（于是只按昵称查，随机 nickname 查不到）。
+                    // 不区分就只能看到「未触发」，分不清是配置问题还是链路问题。
                     log::info!(
-                        "AI 聊天未触发：需要{}才能触发 sender={} role={:?}",
+                        "AI 聊天未触发：需要{}才能触发 sender={} role={:?} account={:?}",
                         config.min_access.label(),
                         sender,
-                        role
+                        role,
+                        account.map(|a| format!("{}:{}", a.game, a.uid))
                     );
                     return Ok(());
                 }

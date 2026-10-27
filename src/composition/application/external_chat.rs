@@ -291,6 +291,7 @@ pub(crate) fn spawn(
     config: ChatSourceConfig,
     identity_access: Option<crate::features::identity::IdentityAccess>,
     config_store: Option<crate::config::SharedConfigStore>,
+    live_configs: crate::config::LiveConfigs,
 ) -> Result<ExternalChatState> {
     let state = ExternalChatState::default();
     if !config.enabled {
@@ -305,6 +306,7 @@ pub(crate) fn spawn(
                 config,
                 identity_access,
                 config_store,
+                live_configs,
                 worker_state,
             )
         })
@@ -317,6 +319,7 @@ fn run(
     config: ChatSourceConfig,
     identity_access: Option<crate::features::identity::IdentityAccess>,
     config_store: Option<crate::config::SharedConfigStore>,
+    live_configs: crate::config::LiveConfigs,
     state: ExternalChatState,
 ) {
     let lease = Duration::from_millis(config.lease_timeout_ms);
@@ -329,6 +332,7 @@ fn run(
         config.token.clone(),
         identity_access.clone(),
         config_store.clone(),
+        live_configs.clone(),
     );
     loop {
         // 登录器角色：Miliastra-Wonderland-ChatBridge 没在监听时替用户拉起来。
@@ -405,6 +409,7 @@ fn run(
                                                 &state,
                                                 identity_access.as_ref(),
                                                 config_store.as_ref(),
+                                                &live_configs,
                                                 &config.url,
                                                 config.self_uid,
                                                 &names,
@@ -432,6 +437,7 @@ fn run(
                                 &state,
                                 identity_access.as_ref(),
                                 config_store.as_ref(),
+                                &live_configs,
                                 &config.url,
                                 config.self_uid,
                                 &names,
@@ -480,9 +486,16 @@ fn run(
 /// 只更新 `identity` 段，其余段保持原值——避免与正在编辑的其他配置打架。
 fn persist_identity(
     store: &crate::config::SharedConfigStore,
+    live_configs: &crate::config::LiveConfigs,
     identity: &crate::features::identity::IdentityAccess,
 ) -> anyhow::Result<()> {
     let snapshot = identity.snapshot();
+    // 写库之后必须同步 effective 快照。
+    //
+    // 只改 `IdentityAccess` 与配置库是不够的：`LiveConfigs::apply` 会用
+    // 快照里的旧 identity 整体覆盖内存，自动注册的身份随即消失。
+    // 线上表现为「新好友第一次说话时没有好友权限，去设置里手动保存一次才好」。
+    live_configs.sync_identity_snapshot(snapshot.clone());
     let mut guard = store
         .lock()
         .map_err(|_| anyhow::anyhow!("配置库锁被毒化"))?;
@@ -508,6 +521,8 @@ fn deliver(
     state: &ExternalChatState,
     identity_access: Option<&crate::features::identity::IdentityAccess>,
     config_store: Option<&crate::config::SharedConfigStore>,
+    // 自动注册身份后要把新映射同步进 effective 快照，否则下次 apply 会抹掉它。
+    live_configs: &crate::config::LiveConfigs,
     source: &str,
     // 本机账号 UID：私聊 peer 必须排除它，否则玩家私聊 BOT 时
     // peer 会变成 BOT 自己，按身份归属的功能（个人歌单等）全部失效。
@@ -548,7 +563,7 @@ fn deliver(
                     // `identity.replace(...)` 把内存覆盖回去，身份直接消失。
                     if created.is_some()
                         && let Some(store) = config_store
-                        && let Err(error) = persist_identity(store, identity)
+                        && let Err(error) = persist_identity(store, &live_configs, identity)
                     {
                         log::warn!("自动创建的身份未能写入数据库: {error:#}");
                     }
@@ -615,6 +630,7 @@ fn spawn_name_resolver(
     token: String,
     identity_access: Option<crate::features::identity::IdentityAccess>,
     config_store: Option<crate::config::SharedConfigStore>,
+    live_configs: crate::config::LiveConfigs,
 ) -> std::sync::mpsc::Sender<String> {
     let (sender, receiver) = std::sync::mpsc::channel::<String>();
     let spawned = thread::Builder::new()
@@ -634,7 +650,7 @@ fn spawn_name_resolver(
                                 &name,
                             )
                             && let Some(store) = config_store.as_ref()
-                            && let Err(error) = persist_identity(store, identity)
+                            && let Err(error) = persist_identity(store, &live_configs, identity)
                         {
                             log::warn!("补查到的昵称未能写入身份映射: {error:#}");
                         }

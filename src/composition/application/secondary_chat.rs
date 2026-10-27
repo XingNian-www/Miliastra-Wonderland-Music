@@ -1154,8 +1154,9 @@ mod tests {
         use crate::features::command::CommandEnvelope;
         let text = "#状态";
         let command_text = super::secondary_hall_command_text(text).expect("# 命令必须能被提取");
-        let envelope = CommandEnvelope::new(text, "玩家癸", "blue", command_text, Default::default())
-            .expect("提取出的 #状态 必须能构造命令信封");
+        let envelope =
+            CommandEnvelope::new(text, "玩家癸", "blue", command_text, Default::default())
+                .expect("提取出的 #状态 必须能构造命令信封");
         assert_eq!(
             format!("{:?}", envelope.prefix()),
             "Hash",
@@ -1169,8 +1170,9 @@ mod tests {
         use crate::features::command::CommandEnvelope;
         let text = "@状态";
         let command_text = super::secondary_hall_command_text(text).expect("@ 命令必须能被提取");
-        let envelope = CommandEnvelope::new(text, "玩家癸", "blue", command_text, Default::default())
-            .expect("提取出的 @状态 必须能构造命令信封");
+        let envelope =
+            CommandEnvelope::new(text, "玩家癸", "blue", command_text, Default::default())
+                .expect("提取出的 @状态 必须能构造命令信封");
         assert_eq!(format!("{:?}", envelope.prefix()), "At");
     }
 

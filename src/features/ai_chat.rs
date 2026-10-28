@@ -73,6 +73,13 @@ const COMPRESS_SUMMARY_PERCENT: usize = 20;
 const COMPRESS_OLDEST_PERCENT: usize = 70;
 /// 摘要单次生成允许的最大 token。
 pub(crate) const SUMMARY_MAX_TOKENS: u32 = 800;
+
+/// 事实抽取与摘要的超时。
+///
+/// 全局的 `timing.external.ai_request_timeout_ms` 是 35 秒，那是给主聊天的；
+/// 抽取只是 256 token 的 JSON，用同一个预算会让一次卡住的请求长期占着队列。
+/// 抽不到事实只影响「记住多少」，不影响回复，本来就允许失败。
+pub(crate) const FACT_EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// 一次提问的最大字符数；超出直接拒绝，避免模型对着半句话编造。
 pub(crate) const MAX_QUESTION_CHARS: usize = 200;
 /// 同一个人两次触发之间的冷却。

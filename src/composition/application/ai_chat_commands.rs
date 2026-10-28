@@ -191,6 +191,26 @@ impl ApplicationRuntime {
                 };
                 let rendered = &answer.rendered;
                 let now_ms = command_now_ms();
+                // 事实抽取要在发送**之前**启动，让它与发送并行。
+                //
+                // 抽取是一次完整模型调用（3-5s），而发送要跑一趟 UI 例程
+                // （点焦点/粘贴/回车/恢复驻留，2-4s）。两者互不依赖，串行做
+                // 等于把两段时间相加——线上实测「AI 回复后下一条命令要等 9 秒」。
+                //
+                // 只做重叠，不做真异步：**提交点仍在正式任务线程**，因此
+                // forget / rebuild / added_at 顺序 / 按 actor 保序这些约束
+                // 全都不变，不需要额外的锁或代际戳。
+                let extraction = if rendered.is_empty() {
+                    None
+                } else {
+                    Some(self.spawn_fact_extraction(
+                        actor.clone(),
+                        question.to_string(),
+                        rendered.to_string(),
+                        config.clone(),
+                        now_ms,
+                    ))
+                };
                 if !rendered.is_empty() {
                     let lines = crate::text::split_numbered_chat_message("", rendered);
                     let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
@@ -238,10 +258,24 @@ impl ApplicationRuntime {
                     self.compress_ai_chat_memory(&actor, &config, now_ms);
                 }
                 self.log_executed_command(parsed, "ai_chat")?;
-                if let Err(error) =
-                    self.extract_ai_chat_facts(parsed, &actor, question, rendered, &config)
-                {
-                    log::warn!("AI 回复已发送，长期记忆更新失败: {error:#}");
+                // 发送已经完成，这里只等抽取的剩余部分，然后在主线程提交。
+                // 抽取失败不影响回复（本来就是 best-effort）。
+                if let Some(extraction) = extraction {
+                    match extraction.join() {
+                        Ok(Ok((facts, remove))) => {
+                            if let Err(error) =
+                                self.commit_fact_extraction(&actor, &config, now_ms, facts, remove)
+                            {
+                                log::warn!("AI 回复已发送，长期记忆更新失败: {error:#}");
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            log::warn!("AI 回复已发送，长期记忆更新失败: {error:#}");
+                        }
+                        Err(_) => {
+                            log::warn!("事实抽取线程 panic，本轮记忆未更新");
+                        }
+                    }
                 }
 
                 Ok(())
@@ -280,21 +314,27 @@ impl ApplicationRuntime {
     }
 
     /// 回答后单独调用一次抽取事实；失败只记日志，不影响已经发出的回复。
-    fn extract_ai_chat_facts(
+    /// 把事实抽取拆成「可在后台跑的部分」与「必须回主线程提交的部分」。
+    ///
+    /// 后台只做一件事：调模型拿 JSON。读 facts、写 facts 全部留在主线程，
+    /// 因为抽取是 read-modify-write——并发会让 remove 失效，
+    /// 退化成「新旧事实并存」，正是之前踩过的坑。
+    fn spawn_fact_extraction(
         &self,
-        parsed: &RoutedCommand,
-        actor: &str,
-        question: &str,
-        answer: &str,
-        config: &crate::features::ai_chat::AiChatConfig,
-    ) -> Result<()> {
-        if answer.trim().is_empty() {
-            return Ok(());
-        }
-        // 已有事实交给模型，它才能判断「这条推翻旧的」而不是「再补一条」。
-        // 放在用户消息里而不是 extract_prompt 模板里——模板存在配置库，
-        // 用户沿用的旧值不会有这个占位符，改代码默认值对已部署实例无效。
-        let existing = self.business.ai_chat_memory.facts(actor)?;
+        actor: String,
+        question: String,
+        answer: String,
+        config: crate::features::ai_chat::AiChatConfig,
+        now_ms: i64,
+    ) -> std::thread::JoinHandle<Result<(Vec<String>, Vec<String>)>> {
+        // 已登记事实在**主线程**读：与 forget / rebuild 保持同一串行域。
+        let existing = match self.business.ai_chat_memory.facts(&actor) {
+            Ok(facts) => facts,
+            Err(error) => {
+                log::debug!("读取已有事实失败，跳过本轮抽取: {error:#}");
+                return std::thread::spawn(|| Ok((Vec::new(), Vec::new())));
+            }
+        };
         let existing_text = if existing.is_empty() {
             "（暂无）".to_string()
         } else {
@@ -305,44 +345,55 @@ impl ApplicationRuntime {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        // 抽取规则收在 features::ai_chat::fact_extraction_prompt，与历史重放清洗共用，
-        // 避免两处口径不一致——否则清洗出来的结果和日常增量抽取会对不上。
-        // 必须把 actor 传进去：抽取模型原来只看到裸正文，不知道主语是谁，
-        // 于是把「玩家自称」和「玩家对助手的称呼」写反，也会把大厅里
-        // 别人的名字记到本人头上。
-        // 传**展示名**而不是记忆键：键是 UUID，传进去模型会被告知
-        // 「当前玩家昵称：00000000-…」，于是回答和事实里冒出 UUID 或
-        // 某个映射的 OCR 随机串。存储仍用 actor 键，只有提示词文本用名字。
-        let actor_display = self.actor_display_name(actor);
+        // 展示名而不是记忆键：键是 UUID，塞进提示词会让模型以为玩家叫 UUID。
+        let actor_display = self.actor_display_name(&actor);
         let prompt = crate::features::ai_chat::fact_extraction_prompt(
             &actor_display,
             &existing_text,
-            question,
-            answer,
+            &question,
+            &answer,
         );
-        // 同一次问答的第二次模型调用，同样不能在持有 UI 租约时干等。
-        let reply = match {
-            let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
-            crate::config::ai::request_json(
-                &self.business.ai_chat_openai,
-                &self.business.ai_connection,
+        // 只把可克隆的句柄搬进线程：运行时句柄与连接配置都是 Arc/Send。
+        let openai = self.business.ai_chat_openai.clone();
+        let connection = self.business.ai_connection.clone();
+        std::thread::spawn(move || {
+            let reply = match crate::config::ai::request_json(
+                &openai,
+                &connection,
                 &crate::config::ai::AiCallOptions {
                     model: config.model.clone(),
-                    reasoning: config.reasoning,
+                    // 抽取只输出 256 token 的 JSON，思考强度没有收益；
+                    // 且 Unset 时字段根本不发，也就不会触发「拒绝后重试」。
+                    reasoning: crate::config::ai::ReasoningEffort::Unset,
                 },
                 &config.extract_prompt,
                 &prompt,
                 256,
-                self.business.ai_request_timeout,
-            )
-        } {
-            Ok(reply) => reply,
-            Err(error) => {
-                log::debug!("AI 聊天事实抽取失败: {error:#}");
-                return Ok(());
-            }
-        };
-        let (facts, remove) = crate::features::ai_chat::parse_fact_update(&reply);
+                crate::features::ai_chat::FACT_EXTRACT_TIMEOUT,
+            ) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    log::debug!("AI 聊天事实抽取失败: {error:#}");
+                    return Ok((Vec::new(), Vec::new()));
+                }
+            };
+            let (facts, remove) = crate::features::ai_chat::parse_fact_update(&reply);
+            Ok((facts, remove))
+        })
+    }
+
+    /// 把抽取结果提交到事实表。
+    ///
+    /// 必须在主线程做：与 forget / rebuild 同一串行域，
+    /// 也是「按 actor 保序」与 added_at 顺序的前提。
+    fn commit_fact_extraction(
+        &mut self,
+        actor: &str,
+        config: &crate::features::ai_chat::AiChatConfig,
+        now_ms: i64,
+        facts: Vec<String>,
+        remove: Vec<String>,
+    ) -> Result<()> {
         // 先删被推翻的旧事实，再写新的：顺序反了会在中间态里同时存在新旧两条，
         // 而模型下一轮读取正是看这个列表。
         for fact in &remove {
@@ -355,10 +406,9 @@ impl ApplicationRuntime {
                 actor,
                 &fact,
                 config.actor_token_budget,
-                command_now_ms(),
+                now_ms,
             )?;
         }
-        let _ = parsed;
         Ok(())
     }
 

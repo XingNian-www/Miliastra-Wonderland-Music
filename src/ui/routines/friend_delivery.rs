@@ -2227,6 +2227,22 @@ mod tests {
         Friend(String),
     }
 
+    /// 读取固定截图里应当出现的好友名（每行一个）。
+    ///
+    /// 夹具图与真实昵称都不进公开仓库，所以期望值只能放在本地声明文件里。
+    /// 返回 None 表示没有本地声明，调用方跳过断言而不是报假红。
+    fn fixture_expected_friend_names() -> Option<Vec<String>> {
+        let text =
+            std::fs::read_to_string("tests/fixtures/ui/secondary-chat-friends.txt").ok()?;
+        let names = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        (!names.is_empty()).then_some(names)
+    }
+
     #[test]
     #[cfg(feature = "ocr-mnn")]
     fn fixed_secondary_chat_fixture_proves_stable_friend_row_and_title_first_identity_fallback() {
@@ -2242,23 +2258,23 @@ mod tests {
             .expect("open fixed secondary-chat screenshot");
         let region: Rect = config.invite.friend_list_region.into();
 
+        // 夹具图与真实昵称都不进公开仓库（.gitignore 的 /* 覆盖 tests/），
+        // 期望好友名改为读本地声明文件；没有声明就跳过，避免报假红。
+        let Some(expected) = fixture_expected_friend_names() else {
+            eprintln!(
+                "跳过稳定好友行断言：缺少本地夹具声明 tests/fixtures/ui/secondary-chat-friends.txt"
+            );
+            return;
+        };
         let handle = runtime.handle();
         let samples = (0..2)
             .map(|_| {
-                matching_text_rows(&handle, &image, region, &[normalize_lock_text("玩家丙")])
+                // 只取第一行做「唯一命中」目标：多为名字时命中数必然 >1，
+                // 这条用例验证的是同一行稳定定位。
+                matching_text_rows(&handle, &image, region, &[normalize_lock_text(&expected[0])])
                     .expect("locate exact friend row")
             })
             .collect::<Vec<_>>();
-
-        // 夹具图未入库（.gitignore 覆盖 tests/），本地换成别的截图时占位好友名
-        // 必然定位不到。那种情况跳过整条用例，避免把"夹具不匹配"报成回归。
-        if samples.iter().any(|hits| hits.len() != 1) {
-            eprintln!(
-                "跳过稳定好友行断言：本地夹具与占位好友名不一致（fixture 未入库），hits={:?}",
-                samples.iter().map(Vec::len).collect::<Vec<_>>()
-            );
-            return;
-        }
 
         assert!(samples.iter().all(|hits| hits.len() == 1));
         assert_eq!(samples[0][0].y, samples[1][0].y);

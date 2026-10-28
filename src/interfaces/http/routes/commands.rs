@@ -8,7 +8,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::StoredReply;
 
-const MAX_COMMAND_REPLIES: usize = 32;
+/// 每个命令可保存的回复条数上限。
+///
+/// **不能写死成固定值**：命令的默认回复数由产品自己决定，`#卧底` 有 57 条、
+/// `#斗地主` 56 条、`#海龟汤` 43 条、`@歌单` 38 条。原来这里是 32，比内置默认
+/// 还小，用户打开面板什么都没改、直接点保存就会失败——而且提示「最多32条」
+/// 与界面上明明列着 57 行自相矛盾。
+///
+/// 现在按「内置默认数 + 余量」动态算，默认数再多也不会被自己的上限拦住。
+const MAX_COMMAND_REPLIES_SLACK: usize = 8;
+
+fn max_command_replies(entry: &crate::features::reply_template::CommandReplyCatalogEntry) -> usize {
+    entry.replies().count() + MAX_COMMAND_REPLIES_SLACK
+}
 /// 单条回复的字数上限；与配置页的 replies.overrides 共用同一个来源，
 /// 避免两个编辑入口对同一条文案给出不同限制。
 const MAX_REPLY_CHARS: usize = crate::config::MAX_REPLY_OVERRIDE_CHARS;
@@ -91,7 +103,15 @@ pub(super) fn commands_replies_route(
         "revision": revision,
         "commands": commands,
         "variables": variables,
-        "limits": { "maxReplyChars": MAX_REPLY_CHARS, "maxRows": MAX_COMMAND_REPLIES },
+        // maxRows 也要按实际算：写死会误导面板，让前端以为只能编辑这么多行。
+        "limits": {
+            "maxReplyChars": MAX_REPLY_CHARS,
+            "maxRows": crate::features::reply_template::command_reply_catalog()
+                .map(|entry| entry.replies().count())
+                .max()
+                .unwrap_or(0)
+                + MAX_COMMAND_REPLIES_SLACK,
+        },
         // 共享回复的命令别名：前端据此把 @播放 这类命令指向它真正所在的回复分组。
         "aliases": crate::features::reply_template::command_id_aliases()
             .iter()
@@ -124,8 +144,10 @@ fn validate_reply_items(
     entry: &crate::features::reply_template::CommandReplyCatalogEntry,
     items: Vec<RepliesItem>,
 ) -> std::result::Result<Vec<StoredReply>, AppError> {
-    if items.len() > MAX_COMMAND_REPLIES {
-        return Err(bad_request("每个命令最多32条回复"));
+    let limit = max_command_replies(entry);
+    if items.len() > limit {
+        let message = format!("命令 {} 最多 {limit} 条回复", entry.id);
+        return Err(bad_request(message.as_str()));
     }
     let static_keys: BTreeSet<_> = entry.replies().map(|item| item.key).collect();
     let mut seen = BTreeSet::new();
@@ -540,6 +562,43 @@ pub(super) fn commands_policy_save_route(
 
 #[cfg(test)]
 mod tests {
+
+    /// 回归：保存上限不能比命令自己的默认回复数还小。
+    ///
+    /// 原来上限写死 32，而 `#卧底` 有 57 条、`#斗地主` 56 条、`#海龟汤` 43 条、
+    /// `@歌单` 38 条默认回复。用户打开面板什么都没改、直接点保存就必然失败，
+    /// 而且提示「最多32条」与界面上明明列着 57 行自相矛盾。
+    #[test]
+    fn reply_save_limit_never_blocks_builtin_defaults() {
+        use crate::features::reply_template::command_reply_catalog;
+        let mut exceeded = Vec::new();
+        for entry in command_reply_catalog() {
+            let defaults = entry.replies().count();
+            let limit = max_command_replies(&entry);
+            if defaults > limit {
+                exceeded.push(format!("{}: 默认 {defaults} 条 > 上限 {limit}", entry.id));
+            }
+        }
+        assert!(
+            exceeded.is_empty(),
+            "这些命令的默认回复数已经超过保存上限，用户无法保存：{exceeded:?}"
+        );
+    }
+
+    /// 上限必须留出余量，否则用户连一行都不能加。
+    #[test]
+    fn reply_save_limit_leaves_room_for_new_rows() {
+        use crate::features::reply_template::command_reply_catalog;
+        for entry in command_reply_catalog() {
+            let defaults = entry.replies().count();
+            assert!(
+                max_command_replies(&entry) > defaults,
+                "{} 的上限必须大于默认行数，否则无法新增回复",
+                entry.id
+            );
+        }
+    }
+
     use super::*;
 
     /// 排查：哪些写法会被判成「未知变量占位符」。

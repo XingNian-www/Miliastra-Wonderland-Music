@@ -3637,6 +3637,8 @@ function clearConfigMessage(){const el=$('configMessage');if(el)el.classList.add
 // 生成适合作为游戏内备注的短昵称，避开 OCR 容易混淆的字符。
 const REMARK_CHARSET='347ACDEFGHKNPQRTUVWXYacdefhknprtuwxy'
 function randomRemarkNickname(){
+  // 与后端 random_nickname 保持一致：6 位。游戏内好友备注有长度上限，
+  // 太长会超；真名由 ChatBridge 的 remarks 补上，这里只是临时占位键。
   const bytes=new Uint8Array(6)
   crypto.getRandomValues(bytes)
   return [...bytes].map(byte=>REMARK_CHARSET[byte%REMARK_CHARSET.length]).join('')

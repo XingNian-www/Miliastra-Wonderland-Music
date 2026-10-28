@@ -3239,6 +3239,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Admin,
                 note: String::new(),
+                remark_sourced: false,
                 accounts: Vec::new(),
             }],
         });

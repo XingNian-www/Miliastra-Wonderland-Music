@@ -883,6 +883,7 @@ mod tests {
                     role: crate::features::identity::IdentityRole::Friend,
                     note: String::new(),
                     // 有 UID 的消息只按 UID 认身份（防改昵称冒充），所以映射必须绑账号。
+                    remark_sourced: false,
                     accounts: vec![crate::features::identity::GameAccount {
                         game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
                         uid: "9001".to_string(),
@@ -1004,6 +1005,7 @@ mod tests {
                     id: uuid::Uuid::new_v4(),
                     role: crate::features::identity::IdentityRole::Friend,
                     note: String::new(),
+                    remark_sourced: false,
                     accounts: vec![crate::features::identity::GameAccount {
                         game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
                         uid: "1001".to_string(),
@@ -1658,6 +1660,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(index as u128 + 1),
                 role,
                 note: format!("{nickname}展示备注"),
+                remark_sourced: false,
                 accounts: Vec::new(),
             })
             .collect(),
@@ -1883,6 +1886,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Owner,
                 note: String::new(),
+                remark_sourced: false,
                 accounts: Vec::new(),
             }];
             if downgrade {
@@ -1891,6 +1895,7 @@ mod tests {
                     id: uuid::Uuid::from_u128(2),
                     role: IdentityRole::Friend,
                     note: String::new(),
+                    remark_sourced: false,
                     accounts: Vec::new(),
                 });
             }

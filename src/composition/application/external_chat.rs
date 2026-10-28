@@ -27,6 +27,13 @@ const NAME_LOOKUP_IN_FLIGHT_MS: u64 = 10_000;
 /// 短期内反复查既没有收益，又会让后台线程空转。
 const NAME_LOOKUP_RETRY_MS: u64 = 30_000;
 
+/// 名称缓存有效期。
+///
+/// 备注是玩家在游戏里随时可以改的，一次查到就永久缓存会让「后设的备注」
+/// 永远进不来。10 分钟是折中：改完备注最多等这么久就会同步，
+/// 而正常聊天里同一发送者远达不到这个频次，不会造成额外请求。
+const NAME_CACHE_TTL_MS: u64 = 600_000;
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -66,11 +73,27 @@ struct ExternalChatInner {
     initial_secondary_switch_done: AtomicBool,
 }
 
+/// 一次补查的结果。
+///
+/// name 来自资料包（可能为 null、到达时序不确定），remark 是玩家在游戏里
+/// 设的好友备注。两者任一有值就算查到过——否则 `names=null` 而 `remarks`
+/// 有值的常见组合会被当成失败，每 30 秒重查一次。
+#[derive(Clone, Default)]
+struct ResolvedNames {
+    name: Option<String>,
+    remark: Option<String>,
+    /// 查到时的毫秒时间戳，用于 TTL 过期重查。
+    fetched_at_ms: u64,
+}
+
 /// 昵称补查进度。由后台补查线程写、接收线程读。
 #[derive(Default)]
 struct NameLookups {
-    /// UID → 已补查到的昵称。命中后同一发送者的后续消息不再走网络。
-    resolved: std::collections::HashMap<String, String>,
+    /// UID → 已补查到的名称与备注。
+    ///
+    /// 带时间戳是必需的：备注是玩家在游戏里随时能改的，一次查到就永久
+    /// 缓存会让「后设的备注」永远进不来。超过 TTL 后允许重查。
+    resolved: std::collections::HashMap<String, ResolvedNames>,
     /// UID → 允许再次补查的毫秒时间戳（在途与失败冷却共用）。
     next_attempt_ms: std::collections::HashMap<String, u64>,
 }
@@ -156,14 +179,20 @@ impl ExternalChatState {
             .cloned()
     }
 
-    /// 已补查到的昵称；没有就返回 None。
+    /// 已补查到的昵称；没有或已过期就返回 None。
     pub(crate) fn cached_name(&self, uid: &str) -> Option<String> {
-        self.name_lookups().resolved.get(uid.trim()).cloned()
+        let lookups = self.name_lookups();
+        let resolved = lookups.resolved.get(uid.trim())?;
+        if now_millis().saturating_sub(resolved.fetched_at_ms) >= NAME_CACHE_TTL_MS {
+            return None;
+        }
+        resolved.name.clone()
     }
 
-    /// 申请一次异步昵称补查。
+    /// 申请一次异步补查。
     ///
-    /// 返回 false 表示已有结果、正在补查，或处于失败冷却中——调用方不要重复排队。
+    /// 返回 false 表示 TTL 内已有结果、正在补查，或处于失败冷却中。
+    /// 结果过期后必须放行——否则玩家后设的备注永远进不来。
     pub(crate) fn begin_name_lookup(&self, uid: &str) -> bool {
         let uid = uid.trim();
         if uid.is_empty() {
@@ -171,7 +200,11 @@ impl ExternalChatState {
         }
         let now = now_millis();
         let mut lookups = self.name_lookups();
-        if lookups.resolved.contains_key(uid) {
+        if lookups
+            .resolved
+            .get(uid)
+            .is_some_and(|resolved| now.saturating_sub(resolved.fetched_at_ms) < NAME_CACHE_TTL_MS)
+        {
             return false;
         }
         if lookups
@@ -187,24 +220,40 @@ impl ExternalChatState {
         true
     }
 
-    /// 登记补查结果：成功则缓存昵称，失败或查不到则进入冷却。
-    pub(crate) fn finish_name_lookup(&self, uid: &str, name: Option<&str>) {
+    /// 登记补查结果。
+    ///
+    /// **name 或 remark 任一有值就算查到过**：实测 /names 常见组合是
+    /// `names:{uid:null}` 配 `remarks:{uid:"某备注"}`，只认 name 会把这种情况
+    /// 判成失败，然后每 30 秒重查一次。两者都没有才进冷却。
+    pub(crate) fn finish_name_lookup(&self, uid: &str, name: Option<&str>, remark: Option<&str>) {
         let uid = uid.trim();
         if uid.is_empty() {
             return;
         }
+        let clean = |value: Option<&str>| {
+            value
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        let name = clean(name);
+        let remark = clean(remark);
         let mut lookups = self.name_lookups();
-        match name.map(str::trim).filter(|name| !name.is_empty()) {
-            Some(name) => {
-                lookups.resolved.insert(uid.to_string(), name.to_string());
-                lookups.next_attempt_ms.remove(uid);
-            }
-            None => {
-                lookups
-                    .next_attempt_ms
-                    .insert(uid.to_string(), now_millis() + NAME_LOOKUP_RETRY_MS);
-            }
+        if name.is_none() && remark.is_none() {
+            lookups
+                .next_attempt_ms
+                .insert(uid.to_string(), now_millis() + NAME_LOOKUP_RETRY_MS);
+            return;
         }
+        lookups.resolved.insert(
+            uid.to_string(),
+            ResolvedNames {
+                name,
+                remark,
+                fetched_at_ms: now_millis(),
+            },
+        );
+        lookups.next_attempt_ms.remove(uid);
     }
 
     fn name_lookups(&self) -> std::sync::MutexGuard<'_, NameLookups> {
@@ -531,6 +580,22 @@ fn deliver(
     messages: Vec<ExternalChatMessage>,
 ) {
     let mut messages = messages;
+    // **先丢启动前的历史，再决定补查**。
+    //
+    // 顺序反过来会放大请求量：`/messages` 补拉最多两千条启动前消息，
+    // 逐条排 `/names` 会让那次冷启动把所有历史发送者都查一遍，
+    // 而补查线程是串行的（单次 1 秒上限），后来的 UID 要排很久。
+    let watermark = state.watermark();
+    if watermark > 0 {
+        let before = messages.len();
+        messages.retain(|message| message.sequence > watermark);
+        if messages.len() != before {
+            log::debug!(
+                "外部聊天源丢弃启动前历史 {} 条（水位 {watermark}）",
+                before - messages.len()
+            );
+        }
+    }
     // 这条路径在 WS 接收线程上：缺昵称只排队补查，**绝不能在这里等 HTTP**，
     // 否则一条慢查询就会把后面所有消息（可能正是玩家的命令）一起拖住。
     let mut lookups: Vec<String> = Vec::new();
@@ -570,9 +635,13 @@ fn deliver(
                 }
             }
         }
-        // 仍然缺昵称：交给后台线程补查，本线程立刻回去读 WS。
-        if message.sender.nickname.is_none()
-            && let Some(uid) = message.sender.uid.as_ref()
+        // 交给后台线程补查名称信息，本线程立刻回去读 WS。
+        //
+        // 原来只在**缺昵称**时才查。但备注（remarks）与昵称是同一份响应里的
+        // 两个字段，只查昵称就永远拿不到备注——而身份映射要以备注为准。
+        // 所以只要带 UID 就查；begin_name_lookup 本身按 UID 去重，
+        // 同一发送者不会重复排队。
+        if let Some(uid) = message.sender.uid.as_ref()
             && state.begin_name_lookup(uid.as_str())
         {
             lookups.push(uid.as_str().to_string());
@@ -581,24 +650,12 @@ fn deliver(
     for uid in lookups {
         if names.send(uid.clone()).is_err() {
             // 补查线程没起来或已退出：解除在途标记，避免该 UID 永久不再补查。
-            state.finish_name_lookup(&uid, None);
+            state.finish_name_lookup(&uid, None, None);
         }
     }
     state.touch();
-    // 丢掉启动前的历史：水位之前的一律不执行。
-    let watermark = state.watermark();
-    if watermark > 0 {
-        let before = messages.len();
-        messages.retain(|message| message.sequence > watermark);
-        if messages.len() != before {
-            log::debug!(
-                "外部聊天源丢弃启动前历史 {} 条（水位 {watermark}）",
-                before - messages.len()
-            );
-        }
-        if messages.is_empty() {
-            return;
-        }
+    if messages.is_empty() {
+        return;
     }
     let last = messages.last().map(|message| message.sequence).unwrap_or(0);
     let epoch = crate::observation::chat::VisualSessionId::new(state.epoch());
@@ -637,30 +694,66 @@ fn spawn_name_resolver(
         .name("external-chat-names".into())
         .spawn(move || {
             for uid in receiver {
-                match crate::runtime::chat_source::resolve_missing_name(&http_base, &token, &uid) {
-                    Ok(Some(name)) => {
-                        state.remember_uid(Some(&name), Some(&uid));
-                        state.finish_name_lookup(&uid, Some(&name));
-                        log::debug!("昵称补查命中: uid={uid} name={name}");
-                        // 自动建的身份当时可能没有备注，补上（只填空值）。
-                        if let Some(identity) = identity_access.as_ref()
-                            && identity.backfill_account_note(
-                                miliastra_kernel::chat_source::GAME_GENSHIN,
-                                &uid,
-                                &name,
-                            )
-                            && let Some(store) = config_store.as_ref()
-                            && let Err(error) = persist_identity(store, &live_configs, identity)
-                        {
-                            log::warn!("补查到的昵称未能写入身份映射: {error:#}");
+                match crate::runtime::chat_source::resolve_sender_names(&http_base, &token, &uid) {
+                    Ok((name, remark)) => {
+                        state.finish_name_lookup(&uid, name.as_deref(), remark.as_deref());
+                        // 备注也要进 UID 缓存：names 为 null、remark 有值是常见组合，
+                        // 这时只缓存昵称的话，按备注名反查 UID（歌单归属）会落空。
+                        state.remember_uid(name.as_deref(), Some(&uid));
+                        state.remember_uid(remark.as_deref(), Some(&uid));
+                        // remarks 是玩家在游戏里给这个 UID 设的好友备注。
+                        //
+                        // 它正是 `nickname`（OCR 精确匹配键）该有的值：游戏里
+                        // 聊天区显示成「昵称(备注)」，而 OCR 侧
+                        // `SecondarySenderIdentity::effective_name()` 取的就是
+                        // 括号里的备注。自动注册时拿不到它只能随机生成占位串，
+                        // OCR 永远匹配不上；这里补上真名，备注优先、没有则保持占位。
+                        //
+                        // 注意消息体 `from.name` 永远是资料包昵称、不含备注
+                        // （ChatBridge 源码有测试 `message_sender_name_ignores_remarks`
+                        // 专门钉住这点），所以备注只能走 /names 拿。
+                        match remark.as_deref() {
+                            Some(remark) => {
+                                log::debug!(
+                                    "备注补查命中: uid={uid} remark={remark} name={:?}",
+                                    name
+                                );
+                                if let Some(identity) = identity_access.as_ref()
+                                    && identity.set_account_remark(
+                                        miliastra_kernel::chat_source::GAME_GENSHIN,
+                                        &uid,
+                                        remark,
+                                    )
+                                    && let Some(store) = config_store.as_ref()
+                                    && let Err(error) =
+                                        persist_identity(store, &live_configs, identity)
+                                {
+                                    log::warn!("ChatBridge 备注未能写入身份映射: {error:#}");
+                                }
+                            }
+                            None => {
+                                // 没有备注不代表没有信息：资料包昵称是展示名的兜底，
+                                // 自动注册时它可能还没到（note 为空），现在补上。
+                                if let Some(name) = name.as_deref() {
+                                    log::debug!("补查命中昵称（无备注）: uid={uid} name={name}");
+                                    if let Some(identity) = identity_access.as_ref()
+                                        && identity.backfill_account_note(
+                                            miliastra_kernel::chat_source::GAME_GENSHIN,
+                                            &uid,
+                                            name,
+                                        )
+                                        && let Some(store) = config_store.as_ref()
+                                        && let Err(error) =
+                                            persist_identity(store, &live_configs, identity)
+                                    {
+                                        log::warn!("补查到的昵称未能写入身份映射: {error:#}");
+                                    }
+                                }
+                            }
                         }
                     }
-                    Ok(None) => {
-                        state.finish_name_lookup(&uid, None);
-                        log::debug!("昵称补查无结果，按未知发送者处理: uid={uid}");
-                    }
                     Err(error) => {
-                        state.finish_name_lookup(&uid, None);
+                        state.finish_name_lookup(&uid, None, None);
                         log::debug!("昵称补查失败: {error:#}");
                     }
                 }
@@ -742,10 +835,51 @@ mod tests {
         assert!(state.begin_name_lookup("900000001"));
         // 在途期间同 UID 的后续消息不能被重复排队。
         assert!(!state.begin_name_lookup("900000001"));
-        state.finish_name_lookup("900000001", Some("玩家癸"));
+        state.finish_name_lookup("900000001", Some("玩家癸"), None);
         assert_eq!(state.cached_name("900000001").as_deref(), Some("玩家癸"));
         // 已有昵称就不再查网络。
         assert!(!state.begin_name_lookup("900000001"));
+    }
+
+    /// 回归：只有备注、没有资料包昵称时也必须算「查到了」。
+    ///
+    /// 实测 /names 的常见组合就是 `names:{uid:null}` 配 `remarks:{uid:"某备注"}`。
+    /// 如果只认 name，这种情况会被判失败进 30 秒冷却，然后永久重查——
+    /// 既打网络，又让备注迟迟写不进身份映射。
+    #[test]
+    fn remark_only_lookup_counts_as_resolved() {
+        let state = ExternalChatState::default();
+        assert!(state.begin_name_lookup("900000002"));
+        state.finish_name_lookup("900000002", None, Some("显示名甲"));
+        // 没有昵称，但结果已缓存，不该再排队。
+        assert_eq!(state.cached_name("900000002"), None);
+        assert!(
+            !state.begin_name_lookup("900000002"),
+            "只有备注也算查到过，不能进失败冷却重查"
+        );
+    }
+
+    /// 回归：TIL 过期后必须允许重查。
+    ///
+    /// 备注是玩家在游戏里随时能改的。如果命中一次就永久缓存，
+    /// 「后设的备注」永远进不来——这正是本轮要修的问题。
+    #[test]
+    fn expired_name_cache_allows_refetch() {
+        let state = ExternalChatState::default();
+        assert!(state.begin_name_lookup("900000003"));
+        state.finish_name_lookup("900000003", Some("玩家乙"), None);
+        assert!(!state.begin_name_lookup("900000003"), "TTL 内不重查");
+        // 把时间戳改成过期：模拟 TTL 之后。
+        {
+            let mut lookups = state.name_lookups();
+            if let Some(resolved) = lookups.resolved.get_mut("900000003") {
+                resolved.fetched_at_ms = 0;
+            }
+        }
+        assert!(
+            state.begin_name_lookup("900000003"),
+            "过期后必须放行，否则后设的备注永远同步不进来"
+        );
     }
 
     /// 补查失败要进入冷却，避免每条缺昵称消息都打一次网络。
@@ -753,7 +887,7 @@ mod tests {
     fn failed_name_lookup_enters_cooldown() {
         let state = ExternalChatState::default();
         assert!(state.begin_name_lookup("42"));
-        state.finish_name_lookup("42", None);
+        state.finish_name_lookup("42", None, None);
         assert_eq!(state.cached_name("42"), None);
         assert!(!state.begin_name_lookup("42"), "失败后应处于冷却期");
     }

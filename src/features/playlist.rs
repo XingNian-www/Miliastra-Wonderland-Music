@@ -325,7 +325,10 @@ pub(crate) mod owner_key {
                  WHERE owner = ?2",
                 rusqlite::params![
                     for_identity(uuid),
-                    format!("name:{}", crate::text::normalize_comparison_text(nickname.trim())),
+                    format!(
+                        "name:{}",
+                        crate::text::normalize_comparison_text(nickname.trim())
+                    ),
                 ],
             )?;
             // 兼容极早期未加前缀的裸昵称。
@@ -1240,10 +1243,7 @@ fn window_messages(tracks: &[PlayableTrack]) -> Vec<PlaylistReply> {
     if !tracks.is_empty() {
         messages.push(PlaylistReply::keyed(
             &templates::WINDOW_FOOTER,
-            ReplyVars::new().with(
-                "上限",
-                tracks.len().min(WINDOW_CANDIDATES).to_string(),
-            ),
+            ReplyVars::new().with("上限", tracks.len().min(WINDOW_CANDIDATES).to_string()),
         ));
     }
     messages
@@ -1298,7 +1298,7 @@ fn seed_from(now_epoch: i64, owner: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     mod owner_key_tests {
-        use super::super::{owner_key, PlaylistApplication};
+        use super::super::{PlaylistApplication, owner_key};
 
         #[test]
         fn owner_key_is_identity_only() {
@@ -1326,10 +1326,8 @@ mod tests {
 
         #[test]
         fn migration_rewrites_legacy_name_keys_to_uuid() {
-            let dir = std::env::temp_dir().join(format!(
-                "playlist-uuid-migrate-{}",
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("playlist-uuid-migrate-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("playlist.sqlite3");
@@ -1378,8 +1376,6 @@ mod tests {
                 "历史键改写为 UUID，已迁移的不受影响"
             );
         }
-
-
     }
 
     use super::*;
@@ -1746,9 +1742,10 @@ mod tests {
             current: None,
             played: Vec::new(),
         };
-        let other_owner = texts(app
-            .execute("乙", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
-            .unwrap());
+        let other_owner = texts(
+            app.execute("乙", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
+                .unwrap(),
+        );
         assert!(other_owner.is_empty());
         assert_eq!(app.count("甲").unwrap(), 0);
         assert!(
@@ -1759,9 +1756,10 @@ mod tests {
             !app.has_command_context("乙", &PlaylistCommand::ConfirmImport, now)
                 .unwrap()
         );
-        let owner = texts(app
-            .execute("甲", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
-            .unwrap());
+        let owner = texts(
+            app.execute("甲", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
+                .unwrap(),
+        );
         assert!(owner[0].contains("新增2首"));
         assert_eq!(app.count("甲").unwrap(), 2);
         assert_eq!(app.count("乙").unwrap(), 0);
@@ -1797,13 +1795,15 @@ mod tests {
         let now = Instant::now();
         app.add("甲", &track("a"), 1).unwrap();
         let mut port = ActiveModePlayback { stopped: false };
-        let prompt = texts(app
-            .execute("甲", &PlaylistCommand::Clear, &mut port, now, 1)
-            .unwrap());
+        let prompt = texts(
+            app.execute("甲", &PlaylistCommand::Clear, &mut port, now, 1)
+                .unwrap(),
+        );
         assert!(prompt[0].contains("确认清空"));
-        let cleared = texts(app
-            .execute("甲", &PlaylistCommand::ConfirmClear, &mut port, now, 1)
-            .unwrap());
+        let cleared = texts(
+            app.execute("甲", &PlaylistCommand::ConfirmClear, &mut port, now, 1)
+                .unwrap(),
+        );
         assert!(cleared[0].contains("已清空"));
         assert!(
             cleared[0].contains("已退出"),
@@ -1860,9 +1860,10 @@ mod tests {
         let mut port = RecordingExtendPlayback {
             extended: Vec::new(),
         };
-        let replies = texts(app
-            .execute("甲", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
-            .unwrap());
+        let replies = texts(
+            app.execute("甲", &PlaylistCommand::ConfirmImport, &mut port, now, 1)
+                .unwrap(),
+        );
         assert!(replies[0].contains("新增2首"));
         assert_eq!(port.extended.len(), 2, "确认导入应把新歌并入运行中的随机池");
     }
@@ -1994,15 +1995,16 @@ mod tests {
             .collect::<Vec<_>>();
         app.add_many("乙", &tracks, 1).unwrap();
         let mut port = AlreadyActivePlayback;
-        let replies = texts(app
-            .execute(
+        let replies = texts(
+            app.execute(
                 "乙",
                 &PlaylistCommand::PlayPlaylist,
                 &mut port,
                 Instant::now(),
                 1_700_000_000,
             )
-            .unwrap());
+            .unwrap(),
+        );
         assert_eq!(
             replies,
             vec!["当前为甲的歌单;如需切换请先发@大厅模式再发@歌单模式".to_string()]
@@ -2060,9 +2062,10 @@ mod tests {
         app.execute("甲", &PlaylistCommand::Clear, &mut port, started, 0)
             .unwrap();
         let later = started + CLEAR_CONFIRM_TTL + Duration::from_secs(1);
-        let reply = texts(app
-            .execute("甲", &PlaylistCommand::ConfirmClear, &mut port, later, 0)
-            .unwrap());
+        let reply = texts(
+            app.execute("甲", &PlaylistCommand::ConfirmClear, &mut port, later, 0)
+                .unwrap(),
+        );
         assert!(reply.is_empty());
         assert_eq!(app.count("甲").unwrap(), 1);
     }
@@ -2078,23 +2081,26 @@ mod tests {
             app.add("甲", &track(id), 0).unwrap();
         }
         let now = Instant::now();
-        let opened = texts(app
-            .execute("甲", &PlaylistCommand::Open, &mut port, now, 7)
-            .unwrap());
+        let opened = texts(
+            app.execute("甲", &PlaylistCommand::Open, &mut port, now, 7)
+                .unwrap(),
+        );
         assert_eq!(opened.len(), 5);
         assert!(opened[0].starts_with("为你推荐3首"));
         assert!(opened[1].starts_with("1. "));
         assert!(opened[4].contains("20秒内回复@1-@3加入下一曲"));
-        let reply = texts(app
-            .execute("甲", &PlaylistCommand::Select(1), &mut port, now, 7)
-            .unwrap());
+        let reply = texts(
+            app.execute("甲", &PlaylistCommand::Select(1), &mut port, now, 7)
+                .unwrap(),
+        );
         assert!(reply[0].contains("下一曲"), "{reply:?}");
         assert_eq!(port.played.len(), 1);
         assert!(port.played[0].starts_with("queued:"));
         // 选过之后窗口关闭。
-        let again = texts(app
-            .execute("甲", &PlaylistCommand::Select(1), &mut port, now, 7)
-            .unwrap());
+        let again = texts(
+            app.execute("甲", &PlaylistCommand::Select(1), &mut port, now, 7)
+                .unwrap(),
+        );
         assert!(again.is_empty());
     }
 
@@ -2135,9 +2141,10 @@ mod tests {
         app.execute("甲", &PlaylistCommand::Open, &mut port, started, 7)
             .unwrap();
         let later = started + WINDOW_TTL + Duration::from_secs(1);
-        let reply = texts(app
-            .execute("甲", &PlaylistCommand::Select(1), &mut port, later, 7)
-            .unwrap());
+        let reply = texts(
+            app.execute("甲", &PlaylistCommand::Select(1), &mut port, later, 7)
+                .unwrap(),
+        );
         assert!(reply.is_empty());
         assert!(port.played.is_empty(), "过期窗口不应触发播放");
     }

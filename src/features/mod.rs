@@ -1,5 +1,6 @@
 pub(crate) mod administration;
 pub(crate) mod ai_chat;
+pub(crate) mod ai_tag;
 pub(crate) mod card_games;
 pub(crate) mod chat_text;
 pub(crate) mod clock_text;
@@ -16,7 +17,6 @@ pub(crate) mod invite;
 pub(crate) mod moderation;
 pub(crate) mod playback;
 pub(crate) mod playlist;
-pub(crate) mod ai_tag;
 pub(crate) mod reply_template;
 pub(crate) mod song_request;
 pub(crate) mod startup;

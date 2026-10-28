@@ -1666,7 +1666,7 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
                 // 模型很容易把自己的猜测当成玩家说过的话。
                 HallSpeakerRole::Bot => format!("你（{speaker}，自己说过）：{text}"),
                 // 玩家名用方括号括起来，与 {{question}} 的 `[昵称]:内容` 同一套写法。
-                // 裸名字（`玩家乙：...`）和正文里的普通词长得一样，模型分不清
+                // 裸名字（`某玩家：...`）和正文里的普通词长得一样，模型分不清
                 // 哪段是说话人、哪段是内容里提到的别人，容易出现「把 A 的话
                 // 记到 B 头上」。方括号是显式的身份标记。
                 HallSpeakerRole::Player => format!("[{speaker}]：{text}"),

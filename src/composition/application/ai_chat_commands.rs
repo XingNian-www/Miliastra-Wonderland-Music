@@ -23,6 +23,11 @@ impl ApplicationRuntime {
         match command {
             ai_chat::AiChatCommand::Forget => {
                 let removed = self.business.ai_chat_memory.forget(&actor)?;
+                // 在途的后台抽取/压缩是在这次删除之前入队的，照常提交会把刚忘掉的
+                // 记忆再写回来；推进代际让它们提交前自己作废。
+                self.business
+                    .ai_chat_memory_generation
+                    .fetch_add(1, AtomicOrdering::SeqCst);
                 self.log_executed_command(parsed, "ai_chat_forget")?;
                 let text = self.render_reply(
                     crate::features::reply_template::AI_CHAT_FORGET.key,
@@ -191,33 +196,25 @@ impl ApplicationRuntime {
                 };
                 let rendered = &answer.rendered;
                 let now_ms = command_now_ms();
-                // 事实抽取要在发送**之前**启动，让它与发送并行。
+                // 事实抽取与记忆压缩**完全异步**：各自在后台线程里完成
+                // 「读库 → 调模型 → 写库」，正式任务发完回复立刻结束，不再等
+                // 这两个模型调用——线上实测串行等待让 BOT 发言后的下一条命令
+                // 多等约 9 秒。
                 //
-                // 抽取是一次完整模型调用（3-5s），而发送要跑一趟 UI 例程
-                // （点焦点/粘贴/回车/恢复驻留，2-4s）。两者互不依赖，串行做
-                // 等于把两段时间相加——线上实测「AI 回复后下一条命令要等 9 秒」。
-                //
-                // 只做重叠，不做真异步：**提交点仍在正式任务线程**，因此
-                // forget / rebuild / added_at 顺序 / 按 actor 保序这些约束
-                // 全都不变，不需要额外的锁或代际戳。
-                let extraction = if rendered.is_empty() {
-                    None
-                } else {
-                    Some(self.spawn_fact_extraction(
+                // 旧实现把提交留在正式任务线程，靠串行保证 forget/rebuild 的顺序；
+                // 现在改用「记忆代际」：入队时快照 generation，提交前发现期间执行过
+                // @忘记我 / 面板重建就丢弃结果。
+                if !rendered.is_empty() {
+                    self.spawn_fact_extraction(
                         actor.clone(),
+                        actor_display.clone(),
                         question.to_string(),
                         rendered.to_string(),
                         config.clone(),
                         now_ms,
-                    ))
-                };
-                // 压缩同样与发送并行：生成摘要要调一次模型（实测 4-5 秒），
-                // 而规划与写回都在主线程，只有模型调用搬进后台。
-                let compression = if rendered.is_empty() {
-                    None
-                } else {
-                    self.spawn_memory_compression(&actor, &config, now_ms)
-                };
+                    );
+                    self.spawn_memory_compression(&actor, &config, now_ms);
+                }
                 if !rendered.is_empty() {
                     let lines = crate::text::split_numbered_chat_message("", rendered);
                     let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
@@ -243,6 +240,7 @@ impl ApplicationRuntime {
                         &actor_display,
                         question,
                         crate::features::ai_chat::HallSpeakerRole::Player,
+                        config.hall_token_budget,
                         now_ms,
                     )?;
                     // BOT 的回答也进大厅记忆：
@@ -251,6 +249,7 @@ impl ApplicationRuntime {
                         &self.bot_display_name(),
                         rendered,
                         crate::features::ai_chat::HallSpeakerRole::Bot,
+                        config.hall_token_budget,
                         now_ms,
                     )?;
                     // 记住「这个 actor 还用过哪个名字」。
@@ -263,29 +262,6 @@ impl ApplicationRuntime {
                     );
                 }
                 self.log_executed_command(parsed, "ai_chat")?;
-                // 发送已经完成，这里只等后台任务的剩余部分，然后在主线程提交。
-                // 两者失败都不影响回复（本来就是 best-effort）。
-                if let Some(job) = compression {
-                    self.commit_memory_compression(job);
-                }
-                if let Some(extraction) = extraction {
-                    match extraction.join() {
-                        Ok(Ok((facts, remove))) => {
-                            if let Err(error) =
-                                self.commit_fact_extraction(&actor, &config, now_ms, facts, remove)
-                            {
-                                log::warn!("AI 回复已发送，长期记忆更新失败: {error:#}");
-                            }
-                        }
-                        Ok(Err(error)) => {
-                            log::warn!("AI 回复已发送，长期记忆更新失败: {error:#}");
-                        }
-                        Err(_) => {
-                            log::warn!("事实抽取线程 panic，本轮记忆未更新");
-                        }
-                    }
-                }
-
                 Ok(())
             }
         }
@@ -321,103 +297,100 @@ impl ApplicationRuntime {
         names
     }
 
-    /// 回答后单独调用一次抽取事实；失败只记日志，不影响已经发出的回复。
-    /// 把事实抽取拆成「可在后台跑的部分」与「必须回主线程提交的部分」。
+    /// 抢占一个记忆维护单飞键；已被占用返回 None。
     ///
-    /// 后台只做一件事：调模型拿 JSON。读 facts、写 facts 全部留在主线程，
-    /// 因为抽取是 read-modify-write——并发会让 remove 失效，
-    /// 退化成「新旧事实并存」，正是之前踩过的坑。
+    /// 用普通集合而不是队列：记忆维护是 best-effort，被放弃的那一轮
+    /// 原文仍在库里，下一轮会重新抽取/压缩，不需要补做。
+    fn claim_maintenance_slot(&self, key: &str) -> Option<MaintenanceSlot> {
+        let inflight = self.business.ai_chat_maintenance_inflight.clone();
+        {
+            let mut set = match inflight.lock() {
+                Ok(set) => set,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !set.insert(key.to_string()) {
+                return None;
+            }
+        }
+        Some(MaintenanceSlot {
+            inflight,
+            key: key.to_string(),
+        })
+    }
+
+    /// 后台抽取事实：读已有事实 → 调模型 → 写回，全部在线程里完成。
+    ///
+    /// 正式任务**不等待**它，回复发出后立刻可以执行下一条命令。
+    /// 抽取是 read-modify-write，读和写必须在同一线程里完成，否则并发会让
+    /// remove 失效、退化成「新旧事实并存」；同一 actor 靠单飞键互斥。
+    ///
+    /// 与 @忘记我 / 面板重建的先后顺序用「记忆代际」保证：入队时快照
+    /// generation，提交前发现期间代际前进过就丢弃本次结果。
     fn spawn_fact_extraction(
         &self,
         actor: String,
+        actor_display: String,
         question: String,
         answer: String,
         config: crate::features::ai_chat::AiChatConfig,
         now_ms: i64,
-    ) -> std::thread::JoinHandle<Result<(Vec<String>, Vec<String>)>> {
-        // 已登记事实在**主线程**读：与 forget / rebuild 保持同一串行域。
-        let existing = match self.business.ai_chat_memory.facts(&actor) {
-            Ok(facts) => facts,
-            Err(error) => {
-                log::debug!("读取已有事实失败，跳过本轮抽取: {error:#}");
-                return std::thread::spawn(|| Ok((Vec::new(), Vec::new())));
-            }
+    ) {
+        let Some(slot) = self.claim_maintenance_slot(&format!("extract:{actor}")) else {
+            log::debug!("该玩家已有抽取在跑，跳过本轮抽取: actor={}", actor_display);
+            return;
         };
-        let existing_text = if existing.is_empty() {
-            "（暂无）".to_string()
-        } else {
-            existing
-                .iter()
-                .enumerate()
-                .map(|(index, fact)| format!("{}. {fact}", index + 1))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        // 展示名而不是记忆键：键是 UUID，塞进提示词会让模型以为玩家叫 UUID。
-        let actor_display = self.actor_display_name(&actor);
-        let prompt = crate::features::ai_chat::fact_extraction_prompt(
-            &actor_display,
-            &existing_text,
-            &question,
-            &answer,
-        );
-        // 只把可克隆的句柄搬进线程：运行时句柄与连接配置都是 Arc/Send。
+        let memory = self.business.ai_chat_memory.clone();
+        let generation = self.business.ai_chat_memory_generation.clone();
+        let generation_at_spawn = generation.load(AtomicOrdering::SeqCst);
         let openai = self.business.ai_chat_openai.clone();
         let connection = self.business.ai_connection.clone();
-        std::thread::spawn(move || {
-            let reply = match crate::config::ai::request_json(
-                &openai,
-                &connection,
-                &crate::config::ai::AiCallOptions {
-                    model: config.model.clone(),
-                    // 抽取只输出 256 token 的 JSON，思考强度没有收益；
-                    // 且 Unset 时字段根本不发，也就不会触发「拒绝后重试」。
-                    reasoning: crate::config::ai::ReasoningEffort::Unset,
-                },
-                &config.extract_prompt,
-                &prompt,
-                256,
-                crate::features::ai_chat::FACT_EXTRACT_TIMEOUT,
-            ) {
-                Ok(reply) => reply,
-                Err(error) => {
-                    log::debug!("AI 聊天事实抽取失败: {error:#}");
-                    return Ok((Vec::new(), Vec::new()));
+        let spawned = std::thread::Builder::new()
+            .name("ai-memory-extract".to_string())
+            .spawn(move || {
+                // 保留 guard 到线程结束：线程 panic 时 Drop 仍会释放单飞键。
+                let _slot = slot;
+                // panic 隔离：线程内的 panic 会毒化记忆库连接锁，
+                // 一旦中毒后续所有记忆读写都会失败，直到进程重启。
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    extract_and_commit_facts(
+                        &memory,
+                        &generation,
+                        generation_at_spawn,
+                        &actor,
+                        &actor_display,
+                        &question,
+                        &answer,
+                        &config,
+                        now_ms,
+                        |system_prompt: &str, user_prompt: &str| {
+                            crate::config::ai::request_json(
+                                &openai,
+                                &connection,
+                                &crate::config::ai::AiCallOptions {
+                                    model: config.model.clone(),
+                                    // 抽取只输出 256 token 的 JSON，思考强度没有收益；
+                                    // 且 Unset 时字段根本不发，也就不会触发「拒绝后重试」。
+                                    reasoning: crate::config::ai::ReasoningEffort::Unset,
+                                },
+                                system_prompt,
+                                user_prompt,
+                                256,
+                                crate::features::ai_chat::FACT_EXTRACT_TIMEOUT,
+                            )
+                        },
+                    )
+                }));
+                match outcome {
+                    Ok(Ok(())) => log::debug!("事实抽取完成: actor={actor_display}"),
+                    Ok(Err(error)) => {
+                        log::warn!("AI 回复已发送，长期记忆更新失败: {error:#}")
+                    }
+                    Err(_) => log::error!("事实抽取线程 panic，本轮记忆未更新: actor={actor_display}"),
                 }
-            };
-            let (facts, remove) = crate::features::ai_chat::parse_fact_update(&reply);
-            Ok((facts, remove))
-        })
-    }
-
-    /// 把抽取结果提交到事实表。
-    ///
-    /// 必须在主线程做：与 forget / rebuild 同一串行域，
-    /// 也是「按 actor 保序」与 added_at 顺序的前提。
-    fn commit_fact_extraction(
-        &mut self,
-        actor: &str,
-        config: &crate::features::ai_chat::AiChatConfig,
-        now_ms: i64,
-        facts: Vec<String>,
-        remove: Vec<String>,
-    ) -> Result<()> {
-        // 先删被推翻的旧事实，再写新的：顺序反了会在中间态里同时存在新旧两条，
-        // 而模型下一轮读取正是看这个列表。
-        for fact in &remove {
-            if let Err(error) = self.business.ai_chat_memory.delete_fact(actor, fact) {
-                log::debug!("淘汰旧事实失败（跳过）: {error:#}");
-            }
+            });
+        if let Err(error) = spawned {
+            log::warn!("启动事实抽取线程失败: {error}");
         }
-        for fact in facts {
-            self.business.ai_chat_memory.add_fact(
-                actor,
-                &fact,
-                config.actor_token_budget,
-                now_ms,
-            )?;
-        }
-        Ok(())
     }
 
     /// 用新规则重放某个玩家的全部历史问答，重建事实表。
@@ -517,78 +490,104 @@ impl ApplicationRuntime {
         "BOT".to_string()
     }
 
-    /// 超过预算时把最旧的记忆压成摘要。
+    /// 超过预算时把最旧的记忆压成摘要（后台线程，完全不阻塞正式任务）。
     ///
     /// 分层（用户定的比例）：最远的 70% 压缩、20% 摘要、10% 最近原文完整保存。
     /// 远期事实单独存，不参与压缩。
     ///
     /// 压缩失败只记日志：回复已经发出，不该因为整理记忆而报错；
     /// 原文仍在库里，下一轮会再试。空摘要也不会覆盖旧摘要。
-    /// 规划压缩并在后台调模型，返回待写回的任务。
     ///
-    /// 规划必须在这里做（读库），写回也必须回主线程（与 forget / rebuild 同一串行域）；
-    /// 只有「调模型生成摘要」这一段搬进线程——它要 4-5 秒且完全不碰 UI/DB 语义。
+    /// 规划留在正式任务里做（读库，毫秒级），生成摘要与写回都在后台线程。
+    /// 与 @忘记我 / 面板重建的先后顺序同样靠「记忆代际」：提交前发现代际前进过就丢弃。
     fn spawn_memory_compression(
         &self,
         actor: &str,
         config: &crate::features::ai_chat::AiChatConfig,
         now_ms: i64,
-    ) -> Option<CompressionJob> {
+    ) {
         let memory = &self.business.ai_chat_memory;
+        // 代际必须在**规划之前**取：规划读库是同步的，但面板可能在线程启动前
+        // 完成一次 forget/重建；若先规划后取代际，这份过期计划会被当成新任务接受，
+        // 把刚被删掉的原文重新压成摘要写回去。
+        let generation = self.business.ai_chat_memory_generation.clone();
+        let generation_at_spawn = generation.load(AtomicOrdering::SeqCst);
         // 个人记忆与大厅记忆各自独立压缩：两层预算不同，触发时机也不同。
         let mut plans = Vec::new();
         match memory.plan_actor_compression(actor, config.actor_token_budget) {
-            Ok(Some(plan)) => plans.push(plan),
+            Ok(Some(plan)) => {
+                if let Some(slot) = self.claim_maintenance_slot(&format!("compress:{}", plan.scope)) {
+                    plans.push((plan, slot));
+                }
+            }
             Ok(None) => {}
             Err(error) => log::warn!("个人记忆压缩规划失败: {error:#}"),
         }
         match memory.plan_hall_compression(config.hall_token_budget) {
-            Ok(Some(plan)) => plans.push(plan),
+            Ok(Some(plan)) => {
+                if let Some(slot) = self.claim_maintenance_slot(&format!("compress:{}", plan.scope)) {
+                    plans.push((plan, slot));
+                }
+            }
             Ok(None) => {}
             Err(error) => log::warn!("大厅记忆压缩规划失败: {error:#}"),
         }
         if plans.is_empty() {
-            return None;
+            return;
         }
+        let memory = self.business.ai_chat_memory.clone();
         let openai = self.business.ai_chat_openai.clone();
         let connection = self.business.ai_connection.clone();
         let config = config.clone();
         let timeout = self.business.ai_request_timeout;
-        let handle = std::thread::spawn(move || {
-            let mut done = Vec::new();
-            for plan in plans {
-                match summarize_memory_with(&openai, &connection, &config, &plan, timeout) {
-                    Ok(summary) => done.push((plan, summary)),
-                    Err(error) => log::warn!(
-                        "记忆压缩失败，原文保留待下轮重试 scope={}: {error:#}",
-                        plan.scope
-                    ),
+        let spawned = std::thread::Builder::new()
+            .name("ai-memory-compress".to_string())
+            .spawn(move || {
+                let _slots = plans.iter().map(|(_, slot)| slot).collect::<Vec<_>>();
+                // 与抽取同样的 panic 隔离：不能让它毒化记忆库连接锁。
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    for (plan, _) in &plans {
+                        match summarize_memory_with(&openai, &connection, &config, plan, timeout) {
+                            Ok(summary) => {
+                                if generation.load(AtomicOrdering::SeqCst) != generation_at_spawn {
+                                    log::debug!(
+                                        "记忆压缩结果已过期（期间执行过忘记/重建），丢弃 scope={}",
+                                        plan.scope
+                                    );
+                                    continue;
+                                }
+                                let summary_budget = if plan.scope
+                                    == crate::features::ai_chat::AiChatMemory::hall_scope()
+                                {
+                                    config.hall_summary_budget
+                                } else {
+                                    config.actor_summary_budget
+                                };
+                                if let Err(error) = memory.apply_compression(
+                                    plan,
+                                    &summary,
+                                    summary_budget,
+                                    now_ms,
+                                ) {
+                                    log::warn!(
+                                        "记忆压缩结果写入失败 scope={}: {error:#}",
+                                        plan.scope
+                                    );
+                                }
+                            }
+                            Err(error) => log::warn!(
+                                "记忆压缩失败，原文保留待下轮重试 scope={}: {error:#}",
+                                plan.scope
+                            ),
+                        }
+                    }
+                }));
+                if outcome.is_err() {
+                    log::error!("记忆压缩线程 panic，本轮摘要丢弃");
                 }
-            }
-            done
-        });
-        Some(CompressionJob {
-            handle,
-            now_ms,
-            actor: actor.to_string(),
-        })
-    }
-
-    /// 把后台压缩出来的摘要写回库。
-    fn commit_memory_compression(&self, job: CompressionJob) {
-        let (handle, now_ms) = (job.handle, job.now_ms);
-        let done = match handle.join() {
-            Ok(done) => done,
-            Err(_) => {
-                log::warn!("记忆压缩线程 panic，本轮摘要丢弃: actor={}", job.actor);
-                return;
-            }
-        };
-        let memory = &self.business.ai_chat_memory;
-        for (plan, summary) in done {
-            if let Err(error) = memory.apply_compression(&plan, &summary, now_ms) {
-                log::warn!("记忆压缩结果写入失败 scope={}: {error:#}", plan.scope);
-            }
+            });
+        if let Err(error) = spawned {
+            log::warn!("启动记忆压缩线程失败: {error}");
         }
     }
 
@@ -699,11 +698,82 @@ fn summarize_memory_with(
     Ok(crate::features::ai_chat::parse_summary(&reply))
 }
 
-/// 后台压缩任务。
-struct CompressionJob {
-    handle: std::thread::JoinHandle<Vec<(crate::features::ai_chat::CompressionPlan, String)>>,
+/// 记忆维护单飞键的占用凭证；Drop 时自动释放。
+///
+/// 用 Drop 而不是在线程末尾手写释放：线程 panic 时也要把键还回去，
+/// 否则那一路记忆维护会永久停摆（键永远「在跑」）。
+struct MaintenanceSlot {
+    inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for MaintenanceSlot {
+    fn drop(&mut self) {
+        let mut set = match self.inflight.lock() {
+            Ok(set) => set,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        set.remove(&self.key);
+    }
+}
+
+/// 后台抽取事实：读已有事实 → 调模型 → 写回，全部在一个线程里完成。
+///
+/// 旧实现拆成「线程调模型 + 正式任务提交」；现在整体搬进后台线程，
+/// 正式任务不再等待。读-改-写必须在同一线程内，否则并发会让 remove 失效。
+/// 与 @忘记我 / 面板重建的先后顺序由记忆代际保证：期间代际前进过就丢弃结果。
+fn extract_and_commit_facts(
+    memory: &crate::features::ai_chat::AiChatMemory,
+    generation: &std::sync::atomic::AtomicU64,
+    generation_at_spawn: u64,
+    actor: &str,
+    actor_display: &str,
+    question: &str,
+    answer: &str,
+    config: &crate::features::ai_chat::AiChatConfig,
     now_ms: i64,
-    actor: String,
+    call_model: impl FnOnce(&str, &str) -> Result<String>,
+) -> Result<()> {
+    if generation.load(AtomicOrdering::SeqCst) != generation_at_spawn {
+        log::debug!("记忆维护任务已过期（期间执行过忘记/重建），跳过本轮事实抽取");
+        return Ok(());
+    }
+    let existing = memory.facts(actor)?;
+    let existing_text = if existing.is_empty() {
+        "（暂无）".to_string()
+    } else {
+        existing
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| format!("{}. {fact}", index + 1))
+            .collect::<Vec<_>>()
+            .join("
+")
+    };
+    let prompt = crate::features::ai_chat::fact_extraction_prompt(
+        actor_display,
+        &existing_text,
+        question,
+        answer,
+    );
+    let reply = call_model(&config.extract_prompt, &prompt)?;
+    // 模型调用期间被忘记/重建：写回会复活旧记忆，丢弃。
+    if generation.load(AtomicOrdering::SeqCst) != generation_at_spawn {
+        log::debug!("事实抽取期间记忆被清除/重建，丢弃本次结果");
+        return Ok(());
+    }
+    let (facts, remove) = crate::features::ai_chat::parse_fact_update(&reply);
+    // 先删被推翻的旧事实，再写新的：顺序反了会在中间态里同时存在新旧两条，
+    // 而模型下一轮读取正是看这个列表。
+    for fact in &remove {
+        if let Err(error) = memory.delete_fact(actor, fact) {
+            log::debug!("淘汰旧事实失败（跳过）: {error:#}");
+        }
+    }
+    for fact in facts {
+        memory.add_fact(actor, &fact, now_ms)?;
+    }
+    Ok(())
 }
 
 /// 命令前缀字符（用于提示词里展示可用命令）。
@@ -732,4 +802,57 @@ fn normalize_tool_command(command: &str) -> String {
         .chars()
         .filter(|ch| !ch.is_whitespace() && *ch != '\u{3000}')
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::ai_chat::{AiChatConfig, AiChatMemory};
+    use std::sync::atomic::AtomicU64;
+
+    fn memory() -> AiChatMemory {
+        AiChatMemory::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn fact_extraction_commits_new_facts_and_remove_list() {
+        let memory = memory();
+        memory.add_fact("actor", "玩家自称：小A", 1).unwrap();
+        let generation = AtomicU64::new(0);
+        extract_and_commit_facts(
+            &memory,
+            &generation,
+            0,
+            "actor",
+            "小明",
+            "以后叫我小B",
+            "好的，小B",
+            &AiChatConfig::default(),
+            2,
+            |_, _| Ok(r#"{"facts":["玩家自称：小B"],"remove":["玩家自称：小A"]}"#.to_string()),
+        )
+        .unwrap();
+        assert_eq!(memory.facts("actor").unwrap(), ["玩家自称：小B"]);
+    }
+
+    #[test]
+    fn stale_generation_discards_the_extracted_facts() {
+        let memory = memory();
+        // 入队后执行了 @忘记我：代际前进，本次结果不能再写回。
+        let generation = AtomicU64::new(7);
+        extract_and_commit_facts(
+            &memory,
+            &generation,
+            3,
+            "actor",
+            "小明",
+            "我叫什么",
+            "你叫小明",
+            &AiChatConfig::default(),
+            2,
+            |_, _| Ok(r#"{"facts":["玩家自称：小明"],"remove":[]}"#.to_string()),
+        )
+        .unwrap();
+        assert!(memory.facts("actor").unwrap().is_empty());
+    }
 }

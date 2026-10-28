@@ -24,7 +24,9 @@ mod workers;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
+};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -415,6 +417,15 @@ struct BusinessBundle {
     // 记忆与冷却门是「全局唯一一份」的进程内状态：facade 与正式执行上下文必须共享同一实例，
     // 因此用 Arc 而不是 Clone（它们本身也不该被复制出第二份冷却账本）。
     ai_chat_memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
+    /// 记忆维护代际：@忘记我 / 面板重建会自增；后台抽取/压缩提交前比较，
+    /// 不一致就丢弃结果，避免在途任务把刚清除的记忆写回来。
+    ai_chat_memory_generation: std::sync::Arc<AtomicU64>,
+    /// 记忆维护单飞键：同一 actor 的抽取、同一 scope 的压缩不能并发。
+    ///
+    /// 抽取是 read-modify-write，两次并发会让 remove 失效、新旧事实并存；
+    /// 压缩并发会让窄计划覆盖宽计划写出的摘要。冷却门在提问开始时判定，
+    /// 而抽取在回复生成后才启动，8s 冷却短于 10s 抽取超时，重叠是常态。
+    ai_chat_maintenance_inflight: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
     ai_chat_gate: std::sync::Arc<crate::features::ai_chat::TriggerGate>,
     ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
     ai_connection: crate::config::ai::AiConfig,
@@ -674,6 +685,8 @@ struct FormalTaskBusinessContext {
     background_commands: workers::BackgroundCommandManager,
     ai: AiClient,
     ai_chat_memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
+    ai_chat_memory_generation: std::sync::Arc<AtomicU64>,
+    ai_chat_maintenance_inflight: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
     ai_chat_gate: std::sync::Arc<crate::features::ai_chat::TriggerGate>,
     ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
     ai_connection: crate::config::ai::AiConfig,
@@ -763,6 +776,11 @@ impl FormalTaskExecutionContext {
                     background_commands: self.business.background_commands.clone(),
                     ai: self.business.ai.clone(),
                     ai_chat_memory: self.business.ai_chat_memory.clone(),
+                    ai_chat_memory_generation: self.business.ai_chat_memory_generation.clone(),
+                    ai_chat_maintenance_inflight: self
+                        .business
+                        .ai_chat_maintenance_inflight
+                        .clone(),
                     ai_chat_gate: self.business.ai_chat_gate.clone(),
                     ai_chat_openai: self.business.ai_chat_openai.clone(),
                     ai_connection: self.business.ai_connection.clone(),
@@ -1822,6 +1840,10 @@ impl ApplicationRuntime {
                 background_commands: workers::BackgroundCommandManager::new(),
                 ai,
                 ai_chat_memory,
+                ai_chat_memory_generation: Arc::new(AtomicU64::new(0)),
+                ai_chat_maintenance_inflight: Arc::new(Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
                 ai_chat_gate,
                 ai_chat_openai: ai_openai_for_chat,
                 ai_connection: config.ai.clone(),

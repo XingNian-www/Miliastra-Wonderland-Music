@@ -368,13 +368,13 @@ impl ApplicationRuntime {
                                 &connection,
                                 &crate::config::ai::AiCallOptions {
                                     model: config.model.clone(),
-                                    // 抽取只输出 256 token 的 JSON，思考强度没有收益；
-                                    // 且 Unset 时字段根本不发，也就不会触发「拒绝后重试」。
+                                    // Unset 时不发 reasoning 字段，但服务端的 thinking 仍会思考，
+                                    // 所以输出预算要按「思考 + JSON」一起给（见常量注释）。
                                     reasoning: crate::config::ai::ReasoningEffort::Unset,
                                 },
                                 system_prompt,
                                 user_prompt,
-                                256,
+                                crate::features::ai_chat::FACT_EXTRACT_MAX_TOKENS,
                                 crate::features::ai_chat::FACT_EXTRACT_TIMEOUT,
                             )
                         },
@@ -448,7 +448,7 @@ impl ApplicationRuntime {
                 },
                 &config.extract_prompt,
                 &prompt,
-                256,
+                crate::features::ai_chat::FACT_EXTRACT_MAX_TOKENS,
                 timeout,
             );
             let Ok(reply) = reply else {

@@ -800,8 +800,17 @@ fn finish_hall_batch_residency(
             "close_primary_chat",
             InputCertainty::AfterInputUnknown,
         )?;
+        // 关掉一级聊天后确实离开了目标界面，必须重新确认。
+        return restore_residency(context, ocr, config, target);
     }
-    restore_residency(context, ocr, config, target)
+    // SecondaryCurrentHall 且没开过一级聊天：发送路径的每一步都带
+    // VerifySecondary（run_verified_chat_input 的 6 步里有 3 次），
+    // 发完必然仍在二级大厅。开头 normalize_hall_batch_start 已经确认过一次，
+    // 这里再来一遍 ensure_secondary_chat（≥2 帧截图 + 模板 + 点击 + 再稳定）
+    // 只是重复确认同一件事，实测占 1-2 秒。
+    //
+    // 保留 Primary 分支的恢复：那是「按 Esc 之后」的真实界面变化。
+    Ok(())
 }
 
 fn retryable_certainty(certainty: InputCertainty) -> bool {
@@ -2671,6 +2680,89 @@ mod tests {
         assert_eq!(state.pasted, ["报名成功"]);
         assert_eq!(state.hall_clicks, 1);
         assert_eq!(state.conversation, Conversation::Hall);
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    /// 回归：二级大厅批量发送后不再重复恢复驻留。
+    ///
+    /// 发送路径的每一步都带 VerifySecondary（run_verified_chat_input 的 6 步里 3 次），
+    /// 发完必然仍在二级大厅。开头 normalize_hall_batch_start 已经确认过一次，
+    /// 结尾再调一次 restore_secondary_hall 只是重复确认同一件事——
+    /// 每次要 ≥2 帧截图 + 模板匹配 + 点击 + 再稳定，实测占 1-2 秒。
+    ///
+    /// hall_clicks 精确记录点了几次「当前大厅」行，正好用来钉住这个不变量。
+    #[test]
+    fn hall_batch_does_not_restore_secondary_residency_twice() {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.open_chat_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.input.text_ms = 0;
+        config.timing.input.send_ms = 0;
+        config.timing.workflow.default_timeout_ms = 2_000;
+        config.timing.workflow.default_poll_ms = 1;
+        let state = Arc::new(Mutex::new(TestUiState {
+            conversation: Conversation::Hall,
+            pasted: Vec::new(),
+            selected_friends: Vec::new(),
+            hall_clicks: 0,
+            scrolls: 0,
+            send_attempts: 0,
+            fail_send_attempt: None,
+        }));
+        let friend_list = config.invite.friend_list_region;
+        let title = SECONDARY_TITLE_RECT;
+        let frame = secondary_hall_row_frame(&config);
+        let hall_point = hall_row_click_point(&frame, &config);
+        let ui_runtime = start_test_ui_runtime(
+            RecordingDevice {
+                frame,
+                state: state.clone(),
+                friend_rows: Vec::new(),
+                hall_point,
+            },
+            &config,
+            4,
+        );
+        let ocr_runtime = OcrRuntime::start(
+            FriendOcrDevice {
+                state: state.clone(),
+                friend_list_size: (friend_list.width, friend_list.height),
+                title_size: (title.width, title.height),
+            },
+            4,
+        )
+        .unwrap();
+        let hall_ui = HallBatchUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+
+        let outcome = hall_ui
+            .submit(SendHallBatch::new(
+                ["第一条", "第二条"],
+                UiResidencyTarget::SecondaryCurrentHall,
+                0,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert_eq!(outcome.sent(), 2);
+        assert!(matches!(outcome.status(), HallBatchStatus::Complete));
+        // 驻留结论必须仍然是「已确认」，只是不再重复点一次大厅行。
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+        ));
+        let clicks = state.lock().unwrap().hall_clicks;
+        assert_eq!(
+            clicks, 1,
+            "大厅行只该点一次（开头规范化那次）；结尾重复恢复会让它变成 2，实际: {clicks}"
+        );
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();

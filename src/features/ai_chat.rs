@@ -56,21 +56,38 @@ pub(crate) const BOT_HISTORY_READ_BUDGET: usize = 800;
 /// 原来 `hall_context` 的 SQL 没有 LIMIT，会全表读取，
 /// 大厅每轮写 2 行，几百轮后单次请求塞进上万 token，而目标输出只有 160 字符。
 const HALL_READ_BUDGET: usize = 1_200;
-/// 分层压缩的比例：达到预算后，从最旧的开始按这个比例重新分配。
+/// 压缩**触发**水位：原文占用超过预算的这个百分比才压缩。
 ///
-/// - 70% 压进摘要（信息密度最高的一层）
-/// - 20% 保留为近期原文的补充（与 10% 一起构成「完整保留」区）
-/// - 10% 原样保留最近的内容
+/// 迟滞（hysteresis）是这套分层的关键：触发与回落必须是两个不同的水位，
+/// 否则"压到 X 之后立刻又超 X"会让每一轮都压一次（实测就是每轮烧一次摘要调用）。
+const COMPRESS_TRIGGER_PERCENT: usize = 75;
+
+/// 压缩**目标**水位：一次压缩把原文降到预算的这个百分比。
 ///
-/// 用比例而不是固定条数：原文长度差异很大，固定条数在不同聊天节奏下
-/// 表现完全相反（短句多时几乎没压，长段多时一次压掉大半）。
-const COMPRESS_KEEP_RECENT_PERCENT: usize = 10;
+/// 从 75% 压到 20%，按单轮约 200 token 计算，16000 预算下约 40 轮才再压一次。
+const COMPRESS_TARGET_PERCENT: usize = 20;
 
-/// 压缩触发后，摘要允许占用的预算比例。
-const COMPRESS_SUMMARY_PERCENT: usize = 20;
+/// 组装提示词时读取的近期问答轮数。
+///
+/// 与落库预算分离：压缩滞后或失败时，不能让整段原文（最多 16K token）
+/// 全塞进提示词。12 轮足够覆盖当前话题，再早的信息由摘要承担。
+const ACTOR_READ_RECENT_TURNS: usize = 12;
 
-/// 压缩时把最旧的多少比例原文送去摘要。
-const COMPRESS_OLDEST_PERCENT: usize = 70;
+/// 事实层（远期结论）的独立预算。
+///
+/// facts 是"这个人是谁"的权威结论，**不参与原文淘汰**：
+/// 以前 facts 和 turns 共用一个预算，超了会先把最旧的 facts 删掉，
+/// 等于把最需要长期保留的一层最先丢掉。
+pub(crate) const ACTOR_FACTS_BUDGET: usize = 800;
+
+/// 单人事实条数上限，防止模型把零碎观察无限追加成一堵墙。
+pub(crate) const MAX_FACTS_PER_ACTOR: usize = 30;
+
+/// 大厅原文硬上限：正常靠压缩回落，压缩失败时用它兜底，避免无限增长。
+///
+/// 取预算的 150%：正常触发线是 75%，真到 150% 说明压缩已经连续失败，
+/// 此时宁可丢最旧的几句，也不能让表无限涨。
+const HALL_HARD_CAP_PERCENT: usize = 150;
 /// 摘要单次生成允许的最大 token。
 /// 摘要的输出预算。
 ///
@@ -894,9 +911,14 @@ impl AiChatMemory {
             )?
             .query_map([actor], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // 读窗口与落库预算分开：落库可以留到预算上限，但每轮只注入最近一段。
+        // 压缩是异步的，滞后时不能让整段原文全塞进提示词。
         let turns = connection
-            .prepare("SELECT question, answer FROM ai_chat_turns WHERE actor = ?1 ORDER BY id ASC")?
-            .query_map([actor], |row| {
+            .prepare(
+                "SELECT question, answer FROM ai_chat_turns WHERE actor = ?1
+                 ORDER BY id DESC LIMIT ?2",
+            )?
+            .query_map(params![actor, ACTOR_READ_RECENT_TURNS as i64], |row| {
                 Ok(StoredTurn {
                     asker: actor.to_string(),
                     question: row.get(0)?,
@@ -904,6 +926,8 @@ impl AiChatMemory {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut turns = turns;
+        turns.reverse();
         let bot_history = bot_lines_within(&connection, bot_budget)?;
         let summary = connection
             .query_row(
@@ -1069,13 +1093,10 @@ impl AiChatMemory {
     }
 
     /// 写入事实；重复只刷新时间。整条内容超过上限时丢弃而不截断。
-    pub(crate) fn add_fact(
-        &self,
-        actor: &str,
-        fact: &str,
-        budget: usize,
-        now_ms: i64,
-    ) -> Result<()> {
+    ///
+    /// 事实走**独立预算**（[ACTOR_FACTS_BUDGET] / [MAX_FACTS_PER_ACTOR]）：
+    /// 不再和原文共用同一个 token 池，避免超预算时把最该长期保留的事实先删掉。
+    pub(crate) fn add_fact(&self, actor: &str, fact: &str, now_ms: i64) -> Result<()> {
         let fact = fact.trim();
         if fact.is_empty() || fact.chars().count() > MAX_FACT_CHARS {
             return Ok(());
@@ -1087,7 +1108,7 @@ impl AiChatMemory {
              ON CONFLICT(actor, fact) DO UPDATE SET added_at = excluded.added_at",
             params![actor, fact, tokens as i64, now_ms],
         )?;
-        prune_actor(&connection, actor, budget)?;
+        prune_facts(&connection, actor)?;
         Ok(())
     }
 
@@ -1155,6 +1176,7 @@ impl AiChatMemory {
         speaker: &str,
         text: &str,
         role: HallSpeakerRole,
+        budget: usize,
         now_ms: i64,
     ) -> Result<()> {
         let text = text.trim();
@@ -1167,17 +1189,26 @@ impl AiChatMemory {
             "INSERT INTO ai_chat_hall_turns(speaker, text, tokens, added_at, role)              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![speaker, text, tokens as i64, now_ms, role.as_str()],
         )?;
+        prune_hall_hard_cap(&connection, budget)?;
         Ok(())
     }
 
-    /// 取出某个 scope 需要压缩的原文条数估算：按最旧的顺序，直到降到预算内。
+    /// 迟滞压缩的核心判定：超过**触发水位**才压，并且一次压到**目标水位**。
     ///
     /// 返回需要移出的条目数；0 表示不用压缩。
+    ///
+    /// 旧实现把"保留 10%"同时当触发线和回落目标（keep = budget*10%），
+    /// 于是压完立刻又贴着触发线，下一轮必定再触发——线上表现为每轮一次摘要调用。
+    /// 现在两个水位分开：75% 触发、20% 回收，压缩间隔约 40 轮。
     fn overflow_count(&self, table: &str, actor: Option<&str>, budget: usize) -> Result<usize> {
+        let trigger = budget * COMPRESS_TRIGGER_PERCENT / 100;
+        let target = budget * COMPRESS_TARGET_PERCENT / 100;
         let connection = self.connection()?;
         let sql = match actor {
-            Some(_) => format!("SELECT tokens FROM {table} WHERE actor = ?1 ORDER BY id ASC"),
-            None => format!("SELECT tokens FROM {table} ORDER BY id ASC"),
+            Some(_) => {
+                format!("SELECT tokens, id FROM {table} WHERE actor = ?1 ORDER BY id ASC")
+            }
+            None => format!("SELECT tokens, id FROM {table} ORDER BY id ASC"),
         };
         let mut stmt = connection.prepare(&sql)?;
         let mut rows = match actor {
@@ -1185,20 +1216,28 @@ impl AiChatMemory {
             None => stmt.query([])?,
         };
         let mut total = 0usize;
-        let mut counts = Vec::new();
+        let mut counts: Vec<(Option<i64>, usize)> = Vec::new();
         while let Some(row) = rows.next()? {
+            // 行 id 只用于「跳过最新一条」，不参与外部输入拼接。
+            let id: Option<i64> = row.get(1).ok();
             let tokens: i64 = row.get(0)?;
             total += tokens as usize;
-            counts.push(tokens as usize);
+            counts.push((id, tokens as usize));
         }
-        if total <= budget {
+        if total <= trigger {
             return Ok(0);
         }
+        // 永远不压掉最新一条：它是"当前正在聊的话题"，压进摘要会让模型
+        // 对刚说过的话失忆。prune_actor 也有同样的保护。
+        let newest = counts.iter().filter_map(|(id, _)| *id).max();
         let mut remaining = total;
         let mut taken = 0usize;
-        for tokens in counts {
-            if remaining <= budget {
+        for (id, tokens) in counts {
+            if remaining <= target {
                 break;
+            }
+            if id.is_some() && id == newest {
+                continue;
             }
             remaining -= tokens;
             taken += 1;
@@ -1293,16 +1332,15 @@ impl AiChatMemory {
         transaction.commit()?;
         Ok(())
     }
-    /// 个人记忆：超预算时算出要压缩哪些原文。
+    /// 个人记忆：超**触发水位**时算出要压缩哪些原文。
     ///
-    /// 分层：保留最近 10% 原文，其余连同旧摘要一起重新压缩成新摘要（摘要占 20% 预算）。
+    /// 分层：原文占用 >75% 时压到 20%，其余连同旧摘要一起重新压缩成新摘要。
     pub(crate) fn plan_actor_compression(
         &self,
         actor: &str,
         budget: usize,
     ) -> Result<Option<CompressionPlan>> {
-        let keep = budget * COMPRESS_KEEP_RECENT_PERCENT / 100;
-        let overflow = self.overflow_count("ai_chat_turns", Some(actor), keep)?;
+        let overflow = self.overflow_count("ai_chat_turns", Some(actor), budget)?;
         if overflow == 0 {
             return Ok(None);
         }
@@ -1327,10 +1365,9 @@ impl AiChatMemory {
         }))
     }
 
-    /// 大厅记忆：同样的分层，但作用于共享的大厅原文。
+    /// 大厅记忆：同样的迟滞分层，但作用于共享的大厅原文。
     pub(crate) fn plan_hall_compression(&self, budget: usize) -> Result<Option<CompressionPlan>> {
-        let keep = budget * COMPRESS_KEEP_RECENT_PERCENT / 100;
-        let overflow = self.overflow_count("ai_chat_hall_turns", None, keep)?;
+        let overflow = self.overflow_count("ai_chat_hall_turns", None, budget)?;
         if overflow == 0 {
             return Ok(None);
         }
@@ -1366,6 +1403,7 @@ impl AiChatMemory {
         &self,
         plan: &CompressionPlan,
         summary: &str,
+        summary_budget: usize,
         now_ms: i64,
     ) -> Result<()> {
         let summary = summary.trim();
@@ -1374,7 +1412,10 @@ impl AiChatMemory {
             log::warn!("压缩返回空摘要，保留旧摘要与原文 scope={}", plan.scope);
             return Ok(());
         }
-        self.write_summary(&plan.scope, summary, now_ms)?;
+        // 摘要硬上限：面板上的 summary_budget 以前只存在于配置里，从不生效。
+        // 不设上限时一次坏摘要会长期占满提示词，把原文挤出去。
+        let summary = clip_to_budget(summary, summary_budget);
+        self.write_summary(&plan.scope, &summary, now_ms)?;
         self.consume_compressed(plan.source_table, &plan.source_ids)
     }
 
@@ -1476,11 +1517,13 @@ fn bot_lines_within(connection: &Connection, budget: usize) -> Result<Vec<String
     Ok(out)
 }
 
-/// 按单人预算删除最旧的对话与事实。
+/// 按单人预算淘汰最旧的**对话原文**。
+///
+/// 只动 turns：facts 有自己的预算（[prune_facts]）。以前两者共用一个池，
+/// 超预算时会先把最旧的事实删掉，与"事实是远期权威结论"的定位相反。
 fn prune_actor(connection: &Connection, actor: &str, budget: usize) -> Result<()> {
     let total: i64 = connection.query_row(
-        "SELECT COALESCE((SELECT SUM(tokens) FROM ai_chat_turns WHERE actor = ?1), 0)
-              + COALESCE((SELECT SUM(tokens) FROM ai_chat_facts WHERE actor = ?1), 0)",
+        "SELECT COALESCE((SELECT SUM(tokens) FROM ai_chat_turns WHERE actor = ?1), 0)",
         [actor],
         |row| row.get(0),
     )?;
@@ -1488,7 +1531,6 @@ fn prune_actor(connection: &Connection, actor: &str, budget: usize) -> Result<()
     if remaining as usize <= budget {
         return Ok(());
     }
-    // 先丢最旧的对话，再丢最旧的事实：事实更短、复用价值更高。
     // 始终保留最新一条：否则极小预算会把刚写入的内容也删掉，记忆永远为空。
     let newest_turn: Option<i64> = connection
         .query_row(
@@ -1518,29 +1560,128 @@ fn prune_actor(connection: &Connection, actor: &str, budget: usize) -> Result<()
     for id in stale_turns {
         connection.execute("DELETE FROM ai_chat_turns WHERE id = ?1", [id])?;
     }
-    if remaining as usize <= budget {
+    Ok(())
+}
+
+/// 事实层自己的淘汰：先按条数、再按 token。
+///
+/// 只删**最久未被更新**的那条：事实的 added_at 会在重复写入时刷新，
+/// 所以"最久没被提到"最接近"已经不重要"，比按插入顺序删更稳。
+fn prune_facts(connection: &Connection, actor: &str) -> Result<()> {
+    let total: i64 = connection.query_row(
+        "SELECT COALESCE((SELECT SUM(tokens) FROM ai_chat_facts WHERE actor = ?1), 0)",
+        [actor],
+        |row| row.get(0),
+    )?;
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM ai_chat_facts WHERE actor = ?1",
+        [actor],
+        |row| row.get(0),
+    )?;
+    let mut excess = count.saturating_sub(MAX_FACTS_PER_ACTOR as i64);
+    let mut over_tokens = total.saturating_sub(ACTOR_FACTS_BUDGET as i64);
+    if excess <= 0 && over_tokens <= 0 {
         return Ok(());
     }
-    let mut stale_facts = Vec::new();
+    let mut victims = Vec::new();
     {
         let mut stmt = connection.prepare(
-            "SELECT rowid, tokens FROM ai_chat_facts WHERE actor = ?1 ORDER BY added_at ASC, rowid ASC",
+            "SELECT rowid, tokens FROM ai_chat_facts WHERE actor = ?1
+             ORDER BY added_at ASC, rowid ASC",
         )?;
         let mut rows = stmt.query([actor])?;
         while let Some(row) = rows.next()? {
-            if remaining as usize <= budget {
+            if excess <= 0 && over_tokens <= 0 {
                 break;
             }
             let id: i64 = row.get(0)?;
             let tokens: i64 = row.get(1)?;
-            remaining -= tokens;
-            stale_facts.push(id);
+            victims.push(id);
+            excess -= 1;
+            over_tokens -= tokens;
         }
     }
-    for id in stale_facts {
+    for id in victims {
         connection.execute("DELETE FROM ai_chat_facts WHERE rowid = ?1", [id])?;
     }
     Ok(())
+}
+
+/// 大厅原文的硬上限兜底：压缩失败/模型不可用时仍不能让表无限增长。
+///
+/// 只在超过 [HALL_HARD_CAP_PERCENT] 预算时动手，且保留最新一条——
+/// 正常压缩路径永远先触发（75%），这里是最后一道保险。
+fn prune_hall_hard_cap(connection: &Connection, budget: usize) -> Result<()> {
+    let cap = budget * HALL_HARD_CAP_PERCENT / 100;
+    let total: i64 = connection.query_row(
+        "SELECT COALESCE((SELECT SUM(tokens) FROM ai_chat_hall_turns), 0)",
+        [],
+        |row| row.get(0),
+    )?;
+    if total as usize <= cap {
+        return Ok(());
+    }
+    let mut remaining = total as usize;
+    let mut victims = Vec::new();
+    {
+        let mut stmt =
+            connection.prepare("SELECT id, tokens FROM ai_chat_hall_turns ORDER BY id ASC")?;
+        let mut rows = stmt.query([])?;
+        // 至少留一条最新记录。
+        let mut collected = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let tokens: usize = row.get::<_, i64>(1)? as usize;
+            collected.push((id, tokens));
+        }
+        if collected.len() <= 1 {
+            return Ok(());
+        }
+        let last = collected.pop().map(|(id, _)| id);
+        for (id, tokens) in collected {
+            if remaining <= cap {
+                break;
+            }
+            remaining -= tokens;
+            victims.push(id);
+        }
+        debug_assert!(last.is_some());
+    }
+    for id in victims {
+        connection.execute("DELETE FROM ai_chat_hall_turns WHERE id = ?1", [id])?;
+    }
+    Ok(())
+}
+
+/// 把摘要裁到指定 token 预算内。
+///
+/// 按句子边界裁：摘要被拦腰截断会变成半句话，模型读起来比没有更糟。
+/// 一条句子都放不下时才退化成按字符截断。
+fn clip_to_budget(text: &str, budget: usize) -> String {
+    if budget == 0 || estimate_tokens(text) <= budget {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for sentence in text.split_inclusive(['。', '！', '？', '\n', '.', '!', '?']) {
+        let candidate_len = out.len() + sentence.len();
+        let candidate = &text[..candidate_len];
+        if estimate_tokens(candidate) > budget {
+            break;
+        }
+        out.push_str(sentence);
+    }
+    if out.trim().is_empty() {
+        // 单句就超预算：按字符退让，保证不返回空（空会被判为失败、下轮重试）。
+        let mut clipped = String::new();
+        for ch in text.chars() {
+            clipped.push(ch);
+            if estimate_tokens(&clipped) > budget.saturating_sub(1).max(1) {
+                break;
+            }
+        }
+        return clipped;
+    }
+    out.trim_end().to_string()
 }
 
 /// 粗略 token 估算：ASCII 约 0.3，其余（中日韩等）约 1。
@@ -2134,22 +2275,22 @@ mod tests {
     #[test]
     fn compression_keeps_recent_turns_and_never_blanks_the_summary() {
         let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
-        // 预算设得很小，确保一定超。
+        // 预算设得很小，确保一定越过触发水位（75%）。
         for index in 0..12 {
             memory
                 .record_turn(
                     "甲",
                     &format!("第{index}个问题，内容足够长以占用一些 token 空间"),
                     &format!("第{index}个回答，也要够长才能触发压缩"),
-                    50,
+                    200,
                     1,
                 )
                 .unwrap();
         }
         let plan = memory
-            .plan_actor_compression("甲", 50)
+            .plan_actor_compression("甲", 200)
             .unwrap()
-            .expect("超预算时必须给出压缩计划");
+            .expect("越过触发水位时必须给出压缩计划");
         assert!(!plan.records.is_empty(), "应当取到需要压缩的原文");
         // 压缩输入必须带问答双方，不能只剩问题。
         assert!(
@@ -2159,10 +2300,127 @@ mod tests {
         );
 
         // 空摘要不能覆盖已有内容。
-        memory.apply_compression(&plan, "旧摘要内容", 1).unwrap();
-        memory.apply_compression(&plan, "   ", 2).unwrap();
+        memory.apply_compression(&plan, "旧摘要内容", 2_000, 1).unwrap();
+        memory.apply_compression(&plan, "   ", 2_000, 2).unwrap();
         let context = memory.context("甲", 1_000).unwrap();
         assert_eq!(context.summary.as_deref(), Some("旧摘要内容"));
+    }
+
+    /// 迟滞：只有越过触发水位才压，且一次压到目标水位，压完不会立刻再触发。
+    ///
+    /// 这是"BOT 每轮都烧一次摘要调用"的根因回归：旧实现把 10% 同时当触发线和
+    /// 回落目标，压完即贴线，下一轮必定再压。
+    #[test]
+    fn compression_uses_hysteresis_watermarks_instead_of_triggering_every_turn() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        // 预算 1000：触发线 750，目标 200。每轮约 60 token，15 轮 ≈ 900。
+        let question = "中".repeat(30);
+        let answer = "文".repeat(30);
+        for _ in 0..15 {
+            memory
+                .record_turn("甲", &question, &answer, 1_000, 1)
+                .unwrap();
+        }
+        let total_before: usize = memory
+            .context("甲", 1_000)
+            .unwrap()
+            .turns
+            .iter()
+            .map(|turn| estimate_tokens(&turn.question) + estimate_tokens(&turn.answer))
+            .sum();
+        assert!(total_before > 0);
+
+        let plan = memory
+            .plan_actor_compression("甲", 1_000)
+            .unwrap()
+            .expect("越过 75% 触发线必须给计划");
+        let consumed = plan.source_ids.len();
+        let remaining: usize = {
+            let context = memory.context("甲", 1_000).unwrap();
+            context
+                .turns
+                .iter()
+                .map(|turn| estimate_tokens(&turn.question) + estimate_tokens(&turn.answer))
+                .sum()
+        };
+        assert!(consumed > 0, "计划里应包含待压条目");
+        // 压完必须明显低于触发线，否则下一轮又压——这就是迟滞要保证的。
+        assert!(
+            remaining < 1_000 * COMPRESS_TRIGGER_PERCENT / 100,
+            "压缩后应落到目标水位附近，实际 {remaining}"
+        );
+    }
+
+    /// 事实层独立预算：超限时淘汰最久未更新的记录，且不影响最近问答原文。
+    #[test]
+    fn facts_have_their_own_cap_and_do_not_evict_recent_turns() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        memory.record_turn("甲", "最近一轮问题", "最近一轮回答", 10_000, 1).unwrap();
+        for index in 0..(MAX_FACTS_PER_ACTOR + 5) {
+            memory
+                .add_fact("甲", &format!("事实{index}"), index as i64)
+                .unwrap();
+        }
+        let context = memory.context("甲", 10_000).unwrap();
+        assert_eq!(
+            context.facts.len(),
+            MAX_FACTS_PER_ACTOR,
+            "事实条数应按上限收敛"
+        );
+        assert_eq!(context.turns.len(), 1, "事实淘汰不能牵连问答原文");
+        assert_eq!(context.turns[0].question, "最近一轮问题");
+    }
+
+    /// 大厅原文的硬上限兜底：压缩没跑起来时不能无限增长。
+    #[test]
+    fn hall_lines_are_capped_even_without_compression() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let budget = 40;
+        for index in 0..40 {
+            memory
+                .record_hall_line(
+                    "甲",
+                    &format!("第{index}条大厅发言，内容足够长"),
+                    HallSpeakerRole::Player,
+                    budget,
+                    index as i64,
+                )
+                .unwrap();
+        }
+        let context = memory.hall_context().unwrap();
+        assert!(!context.lines.is_empty(), "至少要保留最新一条");
+        assert!(
+            context.lines.len() < 40,
+            "超出硬上限后应淘汰最旧记录，实际 {}",
+            context.lines.len()
+        );
+        // 保留的必须是较新的内容。
+        assert!(context.lines.last().unwrap().1.contains("第39条"));
+    }
+
+    /// 摘要硬上限：面板上的 summary_budget 必须真的生效。
+    #[test]
+    fn summary_is_clipped_to_its_configured_budget() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        // 预算 200：触发线 150。每轮约 60 token，4 轮后落在 150~200 之间。
+        for _ in 0..4 {
+            memory
+                .record_turn("甲", &"中".repeat(30), &"文".repeat(30), 200, 1)
+                .unwrap();
+        }
+        let plan = memory
+            .plan_actor_compression("甲", 200)
+            .unwrap()
+            .expect("应有压缩计划");
+        let long_summary = "很长的摘要句子。".repeat(80);
+        memory.apply_compression(&plan, &long_summary, 40, 2).unwrap();
+        let stored = memory.context("甲", 10_000).unwrap().summary.unwrap();
+        assert!(
+            estimate_tokens(&stored) <= 40,
+            "摘要应被裁到预算内，实际 {} token",
+            estimate_tokens(&stored)
+        );
+        assert!(!stored.trim().is_empty(), "裁剪后不能是空摘要");
     }
 
     #[test]
@@ -2550,13 +2808,13 @@ mod tests {
         memory
             .record_turn("甲", "问题一", "回答一", 10_000, 1)
             .unwrap();
-        memory.add_fact("甲", "喜欢晴天", 10_000, 2).unwrap();
+        memory.add_fact("甲", "喜欢晴天", 2).unwrap();
         let context = memory.context("甲", 10_000).unwrap();
         assert_eq!(context.turns.len(), 1);
         assert_eq!(context.facts, vec!["喜欢晴天".to_string()]);
 
         // 事实去重：重复写入仍只有一条。
-        memory.add_fact("甲", "喜欢晴天", 10_000, 3).unwrap();
+        memory.add_fact("甲", "喜欢晴天", 3).unwrap();
         assert_eq!(memory.summary("甲").unwrap().0, 1);
 
         // 预算收紧到只够一轮：最旧的一轮被淘汰，最新一轮保留。
@@ -2594,8 +2852,8 @@ mod tests {
     #[test]
     fn actors_are_isolated_from_each_other() {
         let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
-        memory.add_fact("甲", "只属于甲", 10_000, 1).unwrap();
-        memory.add_fact("乙", "只属于乙", 10_000, 2).unwrap();
+        memory.add_fact("甲", "只属于甲", 1).unwrap();
+        memory.add_fact("乙", "只属于乙", 2).unwrap();
 
         assert_eq!(
             memory.context("甲", 10_000).unwrap().facts,

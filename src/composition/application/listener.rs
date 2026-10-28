@@ -781,18 +781,26 @@ impl ApplicationRuntime {
                         let connection = self.business.ai_connection.clone();
                         let timeout = self.business.ai_request_timeout;
                         let live_configs = self.lifecycle.live_configs.clone();
+                        let generation = self.business.ai_chat_memory_generation.clone();
                         Arc::new(move |actor: &str| {
+                            // 重建是权威结果：先推进代际作废在途的抽取/压缩提交，
+                            // 再重放历史；结束后再推一次，防止重建期间新入队的
+                            // 任务用旧结果覆盖重建结果。
+                            generation.fetch_add(1, AtomicOrdering::SeqCst);
                             let config = live_configs.snapshot().ai_chat.clone();
                             let display = live_configs.identity.display_name_for_key(actor);
-                            crate::composition::application::ApplicationRuntime::rebuild_facts_with(
-                                &memory,
-                                &openai,
-                                &connection,
-                                timeout,
-                                &config,
-                                actor,
-                                &display,
-                            )
+                            let result =
+                                crate::composition::application::ApplicationRuntime::rebuild_facts_with(
+                                    &memory,
+                                    &openai,
+                                    &connection,
+                                    timeout,
+                                    &config,
+                                    actor,
+                                    &display,
+                                );
+                            generation.fetch_add(1, AtomicOrdering::SeqCst);
+                            result
                         })
                     },
                     {
@@ -805,6 +813,8 @@ impl ApplicationRuntime {
                         let identity = self.lifecycle.live_configs.identity.clone();
                         Arc::new(move |name: &str| identity.memory_key(name))
                     },
+                    // 面板删改记忆要能作废在途的抽取/压缩，必须共享同一份代际。
+                    self.business.ai_chat_memory_generation.clone(),
                 )),
             ),
         );

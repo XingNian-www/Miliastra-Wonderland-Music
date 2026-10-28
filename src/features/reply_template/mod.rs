@@ -400,6 +400,11 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
         example: "他认识死者吗",
     },
     ReplyVariable {
+        name: "角色",
+        label: "该玩家在本局的身份（地主/农民）",
+        example: "地主",
+    },
+    ReplyVariable {
         name: "阵营",
         label: "对局阵营（地主方/农民方）",
         example: "地主方",
@@ -785,6 +790,61 @@ pub(crate) fn catalog() -> impl Iterator<Item = &'static ReplyTemplate> {
 #[cfg(test)]
 mod tests {
     /// 随机选项 {a|b|c}：每次取到其中一条，且不留下花括号。
+
+    /// 回归：内置默认文案用到的变量，必须都在允许列表里。
+    ///
+    /// `#斗地主` 的默认回复用了 `{角色}`，但 `REPLY_VARIABLES` 漏登记了它——
+    /// 结果是用户打开面板、什么都不改、直接点保存就报「未知变量 {角色}」。
+    /// 产品自己的默认值过不了自己的校验，这类不一致必须由测试拦住。
+    #[test]
+    fn every_placeholder_in_default_replies_is_an_allowed_variable() {
+        let allowed: std::collections::BTreeSet<&str> =
+            REPLY_VARIABLES.iter().map(|v| v.name).collect();
+        let mut unknown = Vec::new();
+        for entry in command_reply_catalog() {
+            for template in entry.replies() {
+                for name in placeholder_names(template.default) {
+                    if !allowed.contains(name.as_str()) && name != crate::features::ai_tag::AI_TAG {
+                        unknown.push(format!("{} -> {{{name}}}", template.key));
+                    }
+                }
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "这些默认文案用了未登记的变量，用户一保存就会失败：{unknown:?}"
+        );
+    }
+
+    /// 抽出模板里的 `{变量}` 名，跳过 `{{...}}`（AI 提示词用的双括号）与 `{甲|乙}`（随机选择）。
+    fn placeholder_names(text: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'{' {
+                index += 1;
+                continue;
+            }
+            // `{{` 不是变量占位符。
+            if index + 1 < bytes.len() && bytes[index + 1] == b'{' {
+                index += 2;
+                continue;
+            }
+            let Some(end) = text[index..].find('}') else {
+                break;
+            };
+            let inner = &text[index + 1..index + end];
+            index += end + 1;
+            // `{甲|乙|丙}` 是随机选择，不是变量。
+            if inner.contains('|') || inner.is_empty() {
+                continue;
+            }
+            names.push(inner.trim().to_string());
+        }
+        names
+    }
+
     #[test]
     fn random_choice_picks_one_of_the_options() {
         let template = crate::features::reply_template::ReplyTemplate {

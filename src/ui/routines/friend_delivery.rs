@@ -2245,7 +2245,7 @@ mod tests {
         let handle = runtime.handle();
         let samples = (0..2)
             .map(|_| {
-                matching_text_rows(&handle, &image, region, &normalize_lock_text("玩家丙"))
+                matching_text_rows(&handle, &image, region, &[normalize_lock_text("玩家丙")])
                     .expect("locate exact friend row")
             })
             .collect::<Vec<_>>();
@@ -2343,7 +2343,12 @@ mod tests {
         type Output = std::result::Result<Point, UiRoutineFailure>;
 
         fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-            locate_stable_friend_row(context, &self.ocr, &self.config, &self.recipient)
+            locate_stable_friend_row(
+                context,
+                &self.ocr,
+                &self.config,
+                std::slice::from_ref(&self.recipient),
+            )
         }
     }
 

@@ -568,11 +568,28 @@ impl ApplicationRuntime {
         if self.command_is_disabled(&routed)? {
             return Ok(serde_json::json!({"status":"rejected","reason":"命令识别已禁用"}));
         }
-        self.execute_command(&routed)?;
+        // 捕获执行期间 BOT 实际发出的回复。
+        //
+        // 回执原来只有「已执行完成」一句话：点歌成功和「没找到《歌名》」
+        // 拿到的回执一模一样，模型因此无法判断自己做对没有，只能含糊其辞
+        // 或补一句「能不能入队看平台反馈」。业务自己生成的那句回复才是最准的
+        // 结果描述，直接透传给模型。
+        let capture = self.ui.chat_output.capture_replies();
+        let executed = self.execute_command(&routed);
+        let replies = capture.finish();
+        executed?;
         // 回执是模型决定「敢不敢肯定回答」的唯一依据。说成「已执行成功」仍会
         // 被解读成「只是提交了」，于是模型补一句「能不能成功看平台反馈」。
         // 明确写出业务结果已确认。
-        Ok(serde_json::json!({"status":"handled","reason":"命令已执行完成，业务结果已确认。"}))
+        let mut receipt = serde_json::json!({
+            "status":"handled",
+            "reason":"命令已执行完成，业务结果已确认。"
+        });
+        if !replies.is_empty() {
+            // 这是玩家实际看到的文案，模型据此判断成功与否、并保持口径一致。
+            receipt["replies"] = serde_json::json!(replies);
+        }
+        Ok(receipt)
     }
 }
 

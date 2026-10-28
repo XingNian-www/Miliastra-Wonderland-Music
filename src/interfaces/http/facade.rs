@@ -1308,6 +1308,11 @@ pub(crate) struct ApplicationHttpAiFacade {
     /// 面板列表下发的是显示名，回传时也带着 key；但书签 URL 与旧脚本只有名字，
     /// 所以入口统一过一遍这个解析。对 UUID 输入幂等，新旧两种入参都能用。
     memory_key: Option<std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>>,
+    /// 记忆维护代际：面板删除/清空后自增，作废在途的抽取/压缩提交。
+    ///
+    /// 不加这一步时，一条正在跑的抽取线程会把用户刚删掉的记忆再写回来
+    /// （"@忘记我 之后又被想起" 的同一类问题，只是入口变成面板）。
+    generation: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl ApplicationHttpAiFacade {
@@ -1318,6 +1323,14 @@ impl ApplicationHttpAiFacade {
             rebuild: None,
             display_name: None,
             memory_key: None,
+            generation: None,
+        }
+    }
+
+    /// 面板删改记忆后作废在途维护任务。没装配代际时什么也不做（测试装配）。
+    fn invalidate_pending_memory_tasks(&self) {
+        if let Some(generation) = &self.generation {
+            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -1328,6 +1341,7 @@ impl ApplicationHttpAiFacade {
         rebuild: std::sync::Arc<dyn Fn(&str) -> anyhow::Result<usize> + Send + Sync>,
         display_name: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
         memory_key: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
+        generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             client,
@@ -1335,6 +1349,7 @@ impl ApplicationHttpAiFacade {
             rebuild: Some(rebuild),
             display_name: Some(display_name),
             memory_key: Some(memory_key),
+            generation: Some(generation),
         }
     }
 
@@ -1466,6 +1481,8 @@ impl HttpAiPort for ApplicationHttpAiFacade {
         if key != actor && memory.forget(actor)? {
             removed = true;
         }
+        // 在途抽取看到的是删除前的 facts，提交时会把它们写回来。
+        self.invalidate_pending_memory_tasks();
         Ok(serde_json::to_string(
             &json!({ "ok": removed, "removed": removed, "key": key }),
         )?)
@@ -1478,6 +1495,8 @@ impl HttpAiPort for ApplicationHttpAiFacade {
         if !removed && key != actor {
             removed = memory.delete_fact(actor, fact)?;
         }
+        // 被删的这条可能正在某个抽取线程的 facts 快照里，提交会复活它。
+        self.invalidate_pending_memory_tasks();
         Ok(serde_json::to_string(
             &json!({ "ok": removed, "removed": removed, "key": key }),
         )?)
@@ -1514,6 +1533,8 @@ impl HttpAiPort for ApplicationHttpAiFacade {
 
     fn forget_hall(&self) -> Result<String> {
         let removed = self.memory()?.forget_hall()?;
+        // 大厅压缩线程会把「旧摘要 + 刚删掉的原文」再写回去，必须一并作废。
+        self.invalidate_pending_memory_tasks();
         Ok(serde_json::to_string(
             &json!({ "ok": true, "removed": removed }),
         )?)

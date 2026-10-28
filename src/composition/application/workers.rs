@@ -788,6 +788,8 @@ impl ApplicationRuntime {
                 background_commands: self.business.background_commands.clone(),
                 ai: self.business.ai.clone(),
                 ai_chat_memory: self.business.ai_chat_memory.clone(),
+                ai_chat_memory_generation: self.business.ai_chat_memory_generation.clone(),
+                ai_chat_maintenance_inflight: self.business.ai_chat_maintenance_inflight.clone(),
                 ai_chat_gate: self.business.ai_chat_gate.clone(),
                 ai_chat_openai: self.business.ai_chat_openai.clone(),
                 ai_connection: self.business.ai_connection.clone(),

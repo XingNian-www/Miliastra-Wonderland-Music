@@ -53,7 +53,7 @@ use crate::features::command::{
 use crate::features::custom_workflow::{CustomWorkflowService, WorkflowDefaults};
 use crate::features::friend_delivery::{FriendBatchOutcome, FriendMessage};
 use crate::features::hall::{HallApplication, HallCommand, HallStateService};
-use crate::features::identity::{IdentityAccess, IdentityRole};
+use crate::features::identity::IdentityRole;
 use crate::features::idiom_chain;
 use crate::features::idiom_chain::{IdiomChainApplication, IdiomChainService};
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
@@ -1767,8 +1767,13 @@ impl ApplicationRuntime {
         let chat_timeline_for_external = chat_timeline.clone();
         // config 稍后会被移入生命周期，先把外部聊天源配置取出来。
         let chat_source_config = config.chat_source.clone();
-        // 外部聊天源在好友私聊里遇到未登记的 UID 时要自动建身份，需要一个共享句柄。
-        let external_identity_access = IdentityAccess::new(config.identity.clone());
+        // 外部聊天源在好友私聊里遇到未登记的 UID 时要自动建身份。
+        //
+        // **必须与 live_configs.identity 是同一个句柄**：原来这里 new 了一个独立实例，
+        // 自动建的身份只写进了那份副本，命令执行时查的却是 live_configs.identity，
+        // 于是永远 role=None —— 线上表现为「自动注册了权限，但那人还是不能用」。
+        // 写库是对的，但写库不会反向刷新内存里的另一个实例。
+        let external_identity_access = live_configs.identity.clone();
         // API 模式默认走二级值守：socket 给消息，二级界面停留延迟最低。
         // 切不进去只是保持原模式，不影响消息接收。
         // 这里只置位 pending_mode；真正的界面切换由 "值守请求自愈" 在

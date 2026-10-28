@@ -783,6 +783,7 @@ impl ApplicationRuntime {
                         let live_configs = self.lifecycle.live_configs.clone();
                         Arc::new(move |actor: &str| {
                             let config = live_configs.snapshot().ai_chat.clone();
+                            let display = live_configs.identity.display_name_for_key(actor);
                             crate::composition::application::ApplicationRuntime::rebuild_facts_with(
                                 &memory,
                                 &openai,
@@ -790,6 +791,7 @@ impl ApplicationRuntime {
                                 timeout,
                                 &config,
                                 actor,
+                                &display,
                             )
                         })
                     },
@@ -797,6 +799,11 @@ impl ApplicationRuntime {
                         // 记忆键是 UUID，面板要显示成人能认的名字。
                         let identity = self.lifecycle.live_configs.identity.clone();
                         Arc::new(move |key: &str| identity.display_name_for_key(key))
+                    },
+                    {
+                        // 反向：面板/bookmark 传的是名字，查库要的是键。
+                        let identity = self.lifecycle.live_configs.identity.clone();
+                        Arc::new(move |name: &str| identity.memory_key(name))
                     },
                 )),
             ),

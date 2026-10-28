@@ -11,6 +11,13 @@ use miliastra_kernel::ai::OpenAiRuntimeHandle;
 const CANDIDATE_PICK_LIMIT: usize = 30;
 const CANDIDATES_PER_SOURCE: usize = 5;
 
+/// 点歌 AI 各 JSON 调用的输出预算。
+///
+/// 这些调用只要几百 token 的 JSON，但服务端开启 thinking 后 reasoning 会先吃预算：
+/// 1024/2048 时线上出现过「response incomplete、output 为空」，识别与匹配被静默跳过。
+/// 统一给到 4096，避免思考把正文挤没（单价低，多给的代价可以忽略）。
+const SONG_AI_MAX_TOKENS: u32 = 4_096;
+
 /// 点歌 AI 的提示词与模型覆盖；连接参数统一来自 \`ai\` 段。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,7 +133,7 @@ impl AiClient {
             &self.call_options(),
             system,
             prompt,
-            1024,
+            SONG_AI_MAX_TOKENS,
             self.request_timeout,
         )?;
         Ok(serde_json::from_str(&model_reply_json_object(&reply)?)?)
@@ -155,7 +162,7 @@ impl AiClient {
                 &song_name,
                 &song_singer,
             ),
-            1024,
+            SONG_AI_MAX_TOKENS,
             self.request_timeout,
         )?;
         let json = model_reply_json_object(&reply)?;
@@ -189,7 +196,7 @@ impl AiClient {
             &self.call_options(),
             &self.system_prompt(),
             &prompt,
-            1024,
+            SONG_AI_MAX_TOKENS,
             self.request_timeout,
         )?;
         parse_search_rewrite(&model_reply_json_object(&reply)?, &request)
@@ -217,7 +224,7 @@ impl AiClient {
                 prefer_accompaniment,
                 &candidates,
             ),
-            2048,
+            SONG_AI_MAX_TOKENS,
             self.request_timeout,
         )?;
         let json_text = model_reply_json_object(&reply)?;
@@ -325,7 +332,7 @@ impl AiClient {
             &self.call_options(),
             &self.system_prompt(),
             &build_recognize_prompt(&self.config.recognize_prompt, &text),
-            1024,
+            SONG_AI_MAX_TOKENS,
             self.request_timeout,
         )?;
         let json = model_reply_json_object(&reply)?;
@@ -368,7 +375,7 @@ impl AiClient {
                 prefer_accompaniment,
                 &indexed_candidates,
             ),
-            2048,
+            SONG_AI_MAX_TOKENS,
             self.request_timeout,
         )?;
         let json = model_reply_json_object(&reply)?;

@@ -862,6 +862,46 @@ mod tests {
     ///
     /// 外部聊天源给的昵称是玩家当前的游戏内显示名（随时能改）。
     /// 用 UUID 当键，玩家怎么改名记忆都不会分裂；展示时再换回显示昵称。
+
+    /// 回归：记忆键解析必须对 UUID 幂等，且能从显示名换回 UUID。
+    ///
+    /// 面板列表下发显示名，查询/删除/重建要的是记忆键（UUID）。
+    /// 原来列表换成正向显示名后，入口没做反向解析——已登记玩家点开全是空，
+    /// 删除返回 removed:false 却弹「已删除」。
+    #[test]
+    fn memory_key_round_trips_between_uuid_and_display_name() {
+        let mut config = IdentityConfig::default();
+        let id = Uuid::new_v4();
+        config.mappings.push(IdentityMapping {
+            nickname: "nick_alpha".to_string(),
+            id,
+            role: IdentityRole::Friend,
+            note: "显示名甲".to_string(),
+            accounts: vec![GameAccount::new("10001")],
+        });
+        let access = IdentityAccess::new(config);
+        let key = id.to_string();
+
+        // 正向：键 → 显示名。
+        assert_eq!(access.display_name_for_key(&key), "显示名甲");
+        // 反向：显示名 → 键。
+        assert_eq!(access.memory_key("显示名甲"), key);
+        // 幂等：UUID 本身再过一遍仍是 UUID（面板回传 key 时走这条）。
+        assert_eq!(access.memory_key(&key), key);
+        // 游戏内昵称也能回到同一个键。
+        assert_eq!(access.memory_key("nick_alpha"), key);
+    }
+
+    /// 未登记的名字原样返回：老库里有按昵称直接存的孤儿行。
+    #[test]
+    fn memory_key_leaves_unknown_names_untouched() {
+        let access = IdentityAccess::new(IdentityConfig::default());
+        assert_eq!(access.memory_key("路人甲"), "路人甲");
+        // 已知 UUID 但映射里没有，同样原样返回（不会误改成别的键）。
+        let orphan = "00000000-0000-4000-8000-000000000001";
+        assert_eq!(access.memory_key(orphan), orphan);
+    }
+
     #[test]
     fn memory_key_is_uuid_and_display_is_the_note() {
         let mut config = IdentityConfig::default();

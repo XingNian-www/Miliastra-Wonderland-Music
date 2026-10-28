@@ -310,8 +310,12 @@ impl ApplicationRuntime {
         // 必须把 actor 传进去：抽取模型原来只看到裸正文，不知道主语是谁，
         // 于是把「玩家自称」和「玩家对助手的称呼」写反，也会把大厅里
         // 别人的名字记到本人头上。
+        // 传**展示名**而不是记忆键：键是 UUID，传进去模型会被告知
+        // 「当前玩家昵称：00000000-…」，于是回答和事实里冒出 UUID 或
+        // 某个映射的 OCR 随机串。存储仍用 actor 键，只有提示词文本用名字。
+        let actor_display = self.actor_display_name(actor);
         let prompt = crate::features::ai_chat::fact_extraction_prompt(
-            actor,
+            &actor_display,
             &existing_text,
             question,
             answer,
@@ -373,6 +377,9 @@ impl ApplicationRuntime {
         timeout: std::time::Duration,
         config: &crate::features::ai_chat::AiChatConfig,
         actor: &str,
+        // 展示名单独传：actor 是记忆键（UUID），提示词要的是人能认的名字。
+        // 不分开就会出现「重建出来的事实里带 UUID」，与日常增量抽取口径不一致。
+        actor_display: &str,
     ) -> Result<usize> {
         let turns = memory.all_turns(actor)?;
         if turns.is_empty() {
@@ -396,7 +403,7 @@ impl ApplicationRuntime {
             // 重放同样要传 actor，否则重建出来的事实仍然没有名字，
             // 用户点一次「重建记忆」就把问题打回原形。
             let prompt = crate::features::ai_chat::fact_extraction_prompt(
-                actor,
+                actor_display,
                 &existing_text,
                 question,
                 answer,

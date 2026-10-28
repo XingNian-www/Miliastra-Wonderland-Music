@@ -397,6 +397,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(1),
                 role: crate::features::identity::IdentityRole::Owner,
                 note: String::new(),
+                remark_sourced: false,
                 accounts: Vec::new(),
             }],
         };
@@ -535,6 +536,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             role: crate::features::identity::IdentityRole::Friend,
             note: "自动注册".to_string(),
+            remark_sourced: false,
             accounts: vec![crate::features::identity::GameAccount::new("900000099")],
         };
         let mut updated = config.identity.clone();

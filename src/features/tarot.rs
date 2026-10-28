@@ -779,7 +779,8 @@ mod tests {
                 Instant::now(),
                 DAY,
                 &ai,
-            ).map(flatten)
+            )
+            .map(flatten)
             .unwrap();
         let seen = ai.seen.lock().unwrap();
         assert_eq!(seen[0].0, "最近学习");
@@ -809,7 +810,8 @@ mod tests {
                 now + COOLDOWN,
                 DAY,
                 &ai,
-            ).map(flatten)
+            )
+            .map(flatten)
             .unwrap();
         assert!(asked.len() > plain.len());
         let seen = ai.seen.lock().unwrap();
@@ -879,12 +881,14 @@ mod tests {
             ..Default::default()
         };
         let now = Instant::now();
-        app.execute_for_day("用户", &draw(false, true, "提问"), now, DAY, &ai).map(flatten)
+        app.execute_for_day("用户", &draw(false, true, "提问"), now, DAY, &ai)
+            .map(flatten)
             .unwrap();
         let state = stored(&app, "用户");
         let reply = app
             .clone()
-            .execute_for_day("用户", &draw(false, true, "再问"), now, DAY, &ai).map(flatten)
+            .execute_for_day("用户", &draw(false, true, "再问"), now, DAY, &ai)
+            .map(flatten)
             .unwrap();
         assert!(reply[0].contains("冷却"));
         assert_eq!(stored(&app, "用户"), state);
@@ -894,7 +898,8 @@ mod tests {
             .map(flatten)
             .unwrap();
         assert_eq!(stored(&app, "用户"), state);
-        app.execute_for_day("用户", &draw(false, true, "追问"), now + COOLDOWN, DAY, &ai).map(flatten)
+        app.execute_for_day("用户", &draw(false, true, "追问"), now + COOLDOWN, DAY, &ai)
+            .map(flatten)
             .unwrap();
         assert_eq!(ai.seen.lock().unwrap().len(), 2);
     }
@@ -908,8 +913,9 @@ mod tests {
                 ..Default::default()
             };
             let messages = app
-                .execute_for_day("用户", &draw(false, true, "问题"), Instant::now(), DAY, &ai).map(flatten)
-            .unwrap();
+                .execute_for_day("用户", &draw(false, true, "问题"), Instant::now(), DAY, &ai)
+                .map(flatten)
+                .unwrap();
             assert!(messages.iter().any(|m| m.contains("基础牌义")));
             let state = stored(&app, "用户");
             assert_eq!((state.2, state.3), (3, None));
@@ -926,19 +932,22 @@ mod tests {
         let ai = FakeAi::default();
         let now = Instant::now();
         assert!(
-            app.execute_for_day("用户", &TarotCommand::Help, now, DAY, &ai).map(flatten)
-            .unwrap()
+            app.execute_for_day("用户", &TarotCommand::Help, now, DAY, &ai)
+                .map(flatten)
+                .unwrap()
                 .iter()
                 .all(|m| display_width(m) <= 80)
         );
         assert!(
-            app.execute_for_day("用户", &draw(false, false, &"字".repeat(81)), now, DAY, &ai).map(flatten)
-            .unwrap()[0]
+            app.execute_for_day("用户", &draw(false, false, &"字".repeat(81)), now, DAY, &ai)
+                .map(flatten)
+                .unwrap()[0]
                 .contains("80字")
         );
         assert!(
-            app.execute_for_day("", &draw(false, false, ""), now, DAY, &ai).map(flatten)
-            .unwrap()[0]
+            app.execute_for_day("", &draw(false, false, ""), now, DAY, &ai)
+                .map(flatten)
+                .unwrap()[0]
                 .contains("发言者")
         );
         assert_eq!(
@@ -1031,12 +1040,9 @@ mod tests {
         };
         assert_eq!(spec.key, "tarot.help");
         // 三行内容都在，且拆条后每行都不含换行。
-        let lines = crate::text::split_configured_lines(&crate::features::reply_template::render(
-            spec,
-            None,
-            &ReplyVars::new(),
-        )
-        .text);
+        let lines = crate::text::split_configured_lines(
+            &crate::features::reply_template::render(spec, None, &ReplyVars::new()).text,
+        );
         assert_eq!(lines.len(), 3);
         assert!(lines.iter().all(|line| !line.contains(['\n', '\r'])));
     }
@@ -1048,7 +1054,13 @@ mod tests {
         let app = app();
         let ai = FakeAi::default();
         let replies = app
-            .execute_for_day("用户", &parsed("#塔罗牌").unwrap(), Instant::now(), DAY, &ai)
+            .execute_for_day(
+                "用户",
+                &parsed("#塔罗牌").unwrap(),
+                Instant::now(),
+                DAY,
+                &ai,
+            )
             .unwrap();
         // 标题保留模板 key（否则标题覆盖会失效），牌面行必须是 Raw 数据。
         assert!(

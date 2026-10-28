@@ -3428,9 +3428,7 @@ mod tests {
     fn judgment_reply_uses_bracketed_question_style() {
         let question = "男人是灯塔管理员吗？";
         assert_eq!(
-            Judgment::Yes
-                .player_reply("甲", question)
-                .render_default(),
+            Judgment::Yes.player_reply("甲", question).render_default(),
             "[甲]的男人是灯....理员吗？回复：是"
         );
         assert_eq!(

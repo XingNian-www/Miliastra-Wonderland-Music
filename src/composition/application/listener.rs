@@ -1041,6 +1041,10 @@ impl ApplicationRuntime {
         let mut force_scan_after: Option<Instant> = None;
         let mut force_scan_reason: Option<&'static str> = None;
         let mut primary_visible = false;
+        // 二级值守时 primary_visible 恒为 false（进入二级分支就先置 false）。
+        // 大厅到期提醒只应要求"当前聊天界面能看到本大厅"，因此单独记一个
+        // 「二级大厅聊天界面已确认」标志，否则二级值守下永远不提醒。
+        let mut secondary_hall_visible = false;
         let mut game_location_baseline_reset = false;
         let mut secondary_friend_bubble_fingerprint: Option<ChangeFingerprint> = None;
         let mut secondary_hall_bubble_sequence: Option<Vec<SecondaryHallBubble>> = None;
@@ -1093,6 +1097,7 @@ impl ApplicationRuntime {
             self.consume_shared_chat_snapshots(shared_subscriber, &mut shared_backlog)?;
             self.forward_completion_advances(completion_subscriber)?;
             let loop_started = Instant::now();
+            secondary_hall_visible = false;
             self.update_monitor_operational_state();
             self.tick_entertainment();
             let Some(scan_lease) = self.ui.coordinator.try_acquire_scan() else {
@@ -1480,7 +1485,9 @@ impl ApplicationRuntime {
                                     None
                                 };
                                 let scanned = outcome.is_some_and(|outcome| outcome.scanned);
-                                if outcome.is_some_and(|outcome| outcome.verified) {
+                                secondary_hall_visible =
+                                    outcome.is_some_and(|outcome| outcome.verified);
+                                if secondary_hall_visible {
                                     listener_ready_evidence =
                                         Some(ListenerReadyEvidence::SecondaryCurrentHall);
                                 }
@@ -1644,7 +1651,9 @@ impl ApplicationRuntime {
                     continue;
                 }
             }
-            if primary_visible
+            // 一级模式看 primary_visible；二级值守停在"本大厅聊天界面"时
+            // secondary_hall_visible 才为真——两者都代表"现在能往大厅说话"。
+            if (primary_visible || secondary_hall_visible)
                 && self.business.task_engine.is_idle()?
                 && self.maybe_warn_hall_expiring()?
             {

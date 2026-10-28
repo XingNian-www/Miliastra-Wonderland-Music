@@ -1337,6 +1337,10 @@ const AI_CHAT_GROUPS=[
  * 记忆内容是模型抽取的自然语言，手改容易与后续抽取冲突；
  * 删掉重新积累更可控。
  */
+// 面板列表的本地缓存：data-* 只存下标，值一律从这里面取，
+// 避免把玩家昵称（含引号/换行/尖括号）拼进 HTML 或 JS 字面量。
+let aiChatActors=[]
+
 async function loadAiChatMemory(){
   const body=$('aiChatMemoryBody'),hint=$('aiChatMemoryHint')
   if(!body)return
@@ -1368,18 +1372,41 @@ async function loadAiChatMemory(){
       parts.push('<p class="config-field-hint">（还没有任何玩家记忆）</p>')
     }else{
       parts.push('<div style="max-height:320px;overflow:auto">')
-      for(const actor of actors){
+      // 不用内联 onclick：esc() 把 ' 转成 &#39;，HTML 解析属性时又还原成裸单引号，
+      // 昵称里有一个 ' 就截断 JS 字符串、整个 handler 编译失败（点了没反应）；
+      // 反过来也没做 JS 转义，昵称里塞 x');alert(1)// 就能在面板执行任意脚本。
+      // 改用 data-* 存下标 + 事件委托，值只经 textContent 落地。
+      aiChatActors=actors
+      for(let i=0;i<actors.length;i++){
+        const actor=actors[i]
         parts.push('<div style="padding:6px 0;border-bottom:1px solid var(--border,#eee)">'
-          +'<div style="display:flex;gap:8px;align-items:center">'
-          +'<strong>'+esc(actor.actor)+'</strong>'
+          +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          +'<strong class="ai-actor-name"></strong>'
           +'<span class="config-field-hint">事实 '+actor.facts+' 条 / 对话 '+actor.turns+' 轮 / 约 '+actor.tokens+' token</span>'
-          +'<button class="btn small" onclick="viewAiChatActor(\''+esc(actor.actor).replace(/'/g,"\\'")+'\')">查看</button>'
-          +'<button class="btn small danger" onclick="forgetAiChatActor(\''+esc(actor.actor).replace(/'/g,"\\'")+'\')">删除</button>'
-          +'</div><div id="aiChatActor-'+esc(actor.actor)+'"></div></div>')
+          +'<button class="btn small" data-ai-view="'+i+'">查看</button>'
+          +'<button class="btn small danger" data-ai-forget="'+i+'">删除</button>'
+          +'</div><div class="ai-actor-detail" data-ai-detail="'+i+'"></div></div>')
       }
       parts.push('</div>')
     }
     body.innerHTML=parts.join('')
+    // 名字用 textContent 落地，绝不进 HTML 字符串。
+    body.querySelectorAll('.ai-actor-name').forEach((node,index)=>{
+      const actor=aiChatActors[index]
+      if(actor)node.textContent=actor.actor
+    })
+    body.querySelectorAll('[data-ai-view]').forEach(button=>{
+      button.addEventListener('click',()=>{
+        const actor=aiChatActors[Number(button.dataset.aiView)]
+        if(actor)viewAiChatActor(actor.key||actor.actor)
+      })
+    })
+    body.querySelectorAll('[data-ai-forget]').forEach(button=>{
+      button.addEventListener('click',()=>{
+        const actor=aiChatActors[Number(button.dataset.aiForget)]
+        if(actor)forgetAiChatActor(actor.key||actor.actor)
+      })
+    })
     if(hint)hint.textContent='已读取 '+actors.length+' 位玩家'
   }catch(error){
     body.innerHTML='<p class="config-message err">读取失败：'+esc(error.message)+'</p>'
@@ -1387,26 +1414,55 @@ async function loadAiChatMemory(){
   }
 }
 
-async function viewAiChatActor(name){
-  const el=$('aiChatActor-'+name)
-  if(!el)return
+// 摘要为空时的解释：让「没有摘要」看起来像正常状态，而不是数据丢了。
+function aiSummaryEmptyNote(tokens){
+  const values=aiChatData&&aiChatData.values?aiChatData.values:null
+  const raw=values?Number(values.actor_token_budget):NaN
+  const budget=Number.isFinite(raw)&&raw>0?raw:16000
+  const used=tokens||0
+  const pct=Math.min(100,Math.round(used*100/budget))
+  if(used>=budget*0.9){
+    return '原文已接近上限（约 '+used+' / '+budget+' token），下一轮对话就会压缩出摘要。'
+  }
+  return '这一层还没有摘要：原文约 '+used+' / '+budget+' token（'+pct+'%），没到触发压缩的门槛。'
+    +'摘要只在原文超出预算后才会滚动生成，不是记忆丢失——下面的事实和近期对话就是当前全部记忆。'
+}
+
+async function viewAiChatActor(key){
+  const index=aiChatActors.findIndex(a=>(a.key||a.actor)===key)
+  const el=index>=0?document.querySelector('[data-ai-detail="'+index+'"]'):null
+  if(!el){alert('列表已刷新，请重新点「查看」');return}
   el.innerHTML='<p class="config-field-hint">读取中…</p>'
   try{
-    const data=await request('/ai/memory/actor?name='+encodeURIComponent(name))
-    const parts=[]
-    if(data.summary){
-      parts.push('<div class="panel" style="padding:8px;margin:6px 0"><strong>中期摘要</strong><pre style="white-space:pre-wrap;margin:4px 0 0">'+esc(data.summary)+'</pre></div>')
+    const data=await request('/ai/memory/actor?name='+encodeURIComponent(key))
+    if(data.found===false){
+      el.innerHTML='<p class="config-message err">没有这个玩家的记忆（可能已被删除）</p>'
+      return
     }
+    const parts=[]
+    // 摘要区块无条件渲染：空白在用户眼里同时可能是「没记忆」「读失败」
+    // 「点错了」「点击没生效」，四种含义共用一个视觉结果是困惑的来源。
+    const summaryText=data.summary&&String(data.summary).trim()?String(data.summary):''
+    const usedTokens=(data.turns||[]).length===0?0:(aiChatActors[index].tokens||0)
+    parts.push('<div class="panel" style="padding:8px;margin:6px 0">'
+      +'<div style="display:flex;gap:8px;align-items:baseline;justify-content:space-between;flex-wrap:wrap">'
+      +'<strong>中期摘要</strong>'
+      +'<span class="config-field-hint">'+(summaryText?'已生成 · 约 '+summaryText.length+' 字':'未生成（原文未超预算）')+'</span>'
+      +'</div>'
+      +(summaryText
+        ?'<pre style="white-space:pre-wrap;margin:4px 0 0">'+esc(summaryText)+'</pre>'
+        :'<p class="config-field-hint" style="margin:4px 0 0">'+esc(aiSummaryEmptyNote(usedTokens))+'</p>')
+      +'</div>')
     const facts=data.facts||[]
-    if(facts.length){
-      parts.push('<div style="margin:6px 0"><strong>事实</strong></div>')
-      for(const fact of facts){
-        parts.push('<div style="display:flex;gap:8px;align-items:center;padding:2px 0">'
-          +'<span style="flex:1">'+esc(fact)+'</span>'
-          +'<button class="btn small danger" onclick="deleteAiChatFact(\''+esc(name).replace(/'/g,"\\'")+'\',\''+esc(fact).replace(/'/g,"\\'").replace(/\\/g,'\\\\')+'\')">删除</button></div>')
-      }
-    }else{
+    if(!facts.length){
       parts.push('<p class="config-field-hint">（暂无事实）</p>')
+    }else{
+      parts.push('<div style="margin:6px 0"><strong>事实</strong></div>')
+      for(let i=0;i<facts.length;i++){
+        parts.push('<div style="display:flex;gap:8px;align-items:center;padding:2px 0">'
+          +'<span style="flex:1" class="ai-fact-text"></span>'
+          +'<button class="btn small danger" data-ai-del-fact="'+i+'">删除</button></div>')
+      }
     }
     const turns=data.turns||[]
     if(turns.length){
@@ -1418,6 +1474,15 @@ async function viewAiChatActor(name){
       parts.push('</div>')
     }
     el.innerHTML=parts.join('')
+    // 事实文本用 textContent 填，不进 HTML、不进 JS 字面量。
+    el.querySelectorAll('.ai-fact-text').forEach((node,factIndex)=>{
+      node.textContent=facts[factIndex]
+    })
+    el.querySelectorAll('[data-ai-del-fact]').forEach(button=>{
+      button.addEventListener('click',()=>{
+        deleteAiChatFact(key,facts[Number(button.dataset.aiDelFact)],key)
+      })
+    })
   }catch(error){
     el.innerHTML='<p class="config-message err">读取失败：'+esc(error.message)+'</p>'
   }

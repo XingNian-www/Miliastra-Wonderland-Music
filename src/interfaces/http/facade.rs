@@ -1303,6 +1303,11 @@ pub(crate) struct ApplicationHttpAiFacade {
     ///
     /// 同样做成闭包：身份映射在 composition 侧，facade 不该直接持有它。
     display_name: Option<std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>>,
+    /// 显示昵称 → 记忆键。
+    ///
+    /// 面板列表下发的是显示名，回传时也带着 key；但书签 URL 与旧脚本只有名字，
+    /// 所以入口统一过一遍这个解析。对 UUID 输入幂等，新旧两种入参都能用。
+    memory_key: Option<std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>>,
 }
 
 impl ApplicationHttpAiFacade {
@@ -1312,6 +1317,7 @@ impl ApplicationHttpAiFacade {
             memory: None,
             rebuild: None,
             display_name: None,
+            memory_key: None,
         }
     }
 
@@ -1321,12 +1327,14 @@ impl ApplicationHttpAiFacade {
         memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
         rebuild: std::sync::Arc<dyn Fn(&str) -> anyhow::Result<usize> + Send + Sync>,
         display_name: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
+        memory_key: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
     ) -> Self {
         Self {
             client,
             memory: Some(memory),
             rebuild: Some(rebuild),
             display_name: Some(display_name),
+            memory_key: Some(memory_key),
         }
     }
 
@@ -1335,6 +1343,17 @@ impl ApplicationHttpAiFacade {
         match self.display_name.as_deref() {
             Some(f) => f(key),
             None => key.to_owned(),
+        }
+    }
+
+    /// 把面板传来的名字解析回记忆键。
+    ///
+    /// 对 UUID 幂等：UUID 既不是任何映射的 nickname 也不是 note，原样返回。
+    /// 未装配时（测试）原样返回，行为不变。
+    fn resolve_key(&self, name_or_key: &str) -> String {
+        match self.memory_key.as_deref() {
+            Some(f) => f(name_or_key),
+            None => name_or_key.to_owned(),
         }
     }
 
@@ -1360,12 +1379,21 @@ impl HttpAiPort for ApplicationHttpAiFacade {
 
     fn memory_actors(&self) -> Result<String> {
         let actors = self.memory()?.list_actors()?;
-        // 记忆键现在是 UUID（跨改名稳定），面板必须换回人能认的名字。
+        // key 是身份（进 SQL），actor 是标签（只给人看）。
+        //
+        // 原来这里把 key 直接换成显示名下发，而查询接口又把显示名当 key 用——
+        // 已登记玩家的键是 UUID，于是点开永远是空。两者必须分开返回。
         let actors = actors
             .into_iter()
-            .map(|mut summary| {
-                summary.actor = self.display_name_of(&summary.actor);
-                summary
+            .map(|summary| {
+                let key = summary.actor;
+                json!({
+                    "key": key,
+                    "actor": self.display_name_of(&key),
+                    "facts": summary.facts,
+                    "turns": summary.turns,
+                    "tokens": summary.tokens,
+                })
             })
             .collect::<Vec<_>>();
         Ok(serde_json::to_string(&json!({ "actors": actors }))?)
@@ -1373,16 +1401,38 @@ impl HttpAiPort for ApplicationHttpAiFacade {
 
     fn memory_actor(&self, actor: &str) -> Result<String> {
         let memory = self.memory()?;
-        let context = memory.context(actor, usize::MAX / 4)?;
+        let key = self.resolve_key(actor);
+        // 用读取预算而不是 usize::MAX：后者会让 bot_lines 全表扫，
+        // 而结果在面板里根本用不到（面板只展示 facts/turns/summary）。
+        let mut context =
+            memory.context(&key, crate::features::ai_chat::BOT_HISTORY_READ_BUDGET)?;
+        // 老库有按昵称直接存的孤儿行（见 ai_chat_actor_names 的建表注释）。
+        // 解析后的键查空时按原文再试一次，否则那些历史会凭空消失。
+        let mut used = key.clone();
+        if context.facts.is_empty() && context.turns.is_empty() && context.summary.is_none() {
+            let legacy =
+                memory.context(actor, crate::features::ai_chat::BOT_HISTORY_READ_BUDGET)?;
+            if !legacy.facts.is_empty() || !legacy.turns.is_empty() || legacy.summary.is_some() {
+                used = actor.to_owned();
+                context = legacy;
+            }
+        }
+        // context() 把 asker 填成入参本身；不换回显示名，面板会显示一行 UUID。
+        let display = self.display_name_of(&used);
         let facts = context.facts;
         let summary = context.summary;
+        let found = !facts.is_empty() || !context.turns.is_empty() || summary.is_some();
         let turns = context
             .turns
             .into_iter()
-            .map(|turn| json!({ "asker": turn.asker, "question": turn.question, "answer": turn.answer }))
+            .map(|turn| {
+                json!({ "asker": display, "question": turn.question, "answer": turn.answer })
+            })
             .collect::<Vec<_>>();
         Ok(serde_json::to_string(&json!({
-            "actor": actor,
+            "key": used,
+            "actor": display,
+            "found": found,
             "facts": facts,
             "summary": summary,
             "turns": turns,
@@ -1409,16 +1459,27 @@ impl HttpAiPort for ApplicationHttpAiFacade {
     }
 
     fn forget_actor(&self, actor: &str) -> Result<String> {
-        let removed = self.memory()?.forget(actor)?;
+        let memory = self.memory()?;
+        let key = self.resolve_key(actor);
+        let mut removed = memory.forget(&key)?;
+        // 旧行可能直接存在显示名之下；原样删只命中字面量行，不会误删别人。
+        if key != actor && memory.forget(actor)? {
+            removed = true;
+        }
         Ok(serde_json::to_string(
-            &json!({ "ok": true, "removed": removed }),
+            &json!({ "ok": removed, "removed": removed, "key": key }),
         )?)
     }
 
     fn delete_fact(&self, actor: &str, fact: &str) -> Result<String> {
-        let removed = self.memory()?.delete_fact(actor, fact)?;
+        let memory = self.memory()?;
+        let key = self.resolve_key(actor);
+        let mut removed = memory.delete_fact(&key, fact)?;
+        if !removed && key != actor {
+            removed = memory.delete_fact(actor, fact)?;
+        }
         Ok(serde_json::to_string(
-            &json!({ "ok": true, "removed": removed }),
+            &json!({ "ok": removed, "removed": removed, "key": key }),
         )?)
     }
 
@@ -1429,18 +1490,24 @@ impl HttpAiPort for ApplicationHttpAiFacade {
             .ok_or_else(|| anyhow::anyhow!("记忆重建未装配"))?;
         // 重放要为每一轮问答调一次模型，几十轮就是几十次请求，
         // 同步做会让 HTTP 请求挂几分钟。这里只负责受理，结果看日志与面板。
-        let actor = actor.to_string();
-        let worker_actor = actor.clone();
+        //
+        // 必须先解析成记忆键：传显示名时 all_turns 查空，重建会「成功」地
+        // 写入 0 条事实——返回 accepted:true 却什么都没做。
+        let key = self.resolve_key(actor);
+        let display = self.display_name_of(&key);
+        let worker_key = key.clone();
+        let worker_display = display.clone();
         std::thread::Builder::new()
             .name("ai-memory-rebuild".to_string())
-            .spawn(move || match rebuild(&worker_actor) {
-                Ok(count) => log::info!("记忆重建完成: actor={worker_actor} facts={count}"),
-                Err(error) => log::warn!("记忆重建失败: actor={worker_actor} {error:#}"),
+            .spawn(move || match rebuild(&worker_key) {
+                Ok(count) => log::info!("记忆重建完成: actor={worker_display} facts={count}"),
+                Err(error) => log::warn!("记忆重建失败: actor={worker_display} {error:#}"),
             })?;
         Ok(serde_json::to_string(&json!({
             "ok": true,
             "accepted": true,
-            "actor": actor,
+            "key": key,
+            "actor": display,
             "note": "重建在后台执行，结果见日志与记忆面板",
         }))?)
     }

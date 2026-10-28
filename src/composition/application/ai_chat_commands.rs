@@ -211,6 +211,13 @@ impl ApplicationRuntime {
                         now_ms,
                     ))
                 };
+                // 压缩同样与发送并行：生成摘要要调一次模型（实测 4-5 秒），
+                // 而规划与写回都在主线程，只有模型调用搬进后台。
+                let compression = if rendered.is_empty() {
+                    None
+                } else {
+                    self.spawn_memory_compression(&actor, &config, now_ms)
+                };
                 if !rendered.is_empty() {
                     let lines = crate::text::split_numbered_chat_message("", rendered);
                     let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
@@ -254,12 +261,13 @@ impl ApplicationRuntime {
                         &actor_display,
                         now_ms,
                     );
-                    // 超预算时压缩。失败不影响已发出的回复。
-                    self.compress_ai_chat_memory(&actor, &config, now_ms);
                 }
                 self.log_executed_command(parsed, "ai_chat")?;
-                // 发送已经完成，这里只等抽取的剩余部分，然后在主线程提交。
-                // 抽取失败不影响回复（本来就是 best-effort）。
+                // 发送已经完成，这里只等后台任务的剩余部分，然后在主线程提交。
+                // 两者失败都不影响回复（本来就是 best-effort）。
+                if let Some(job) = compression {
+                    self.commit_memory_compression(job);
+                }
                 if let Some(extraction) = extraction {
                     match extraction.join() {
                         Ok(Ok((facts, remove))) => {
@@ -516,12 +524,16 @@ impl ApplicationRuntime {
     ///
     /// 压缩失败只记日志：回复已经发出，不该因为整理记忆而报错；
     /// 原文仍在库里，下一轮会再试。空摘要也不会覆盖旧摘要。
-    fn compress_ai_chat_memory(
+    /// 规划压缩并在后台调模型，返回待写回的任务。
+    ///
+    /// 规划必须在这里做（读库），写回也必须回主线程（与 forget / rebuild 同一串行域）；
+    /// 只有「调模型生成摘要」这一段搬进线程——它要 4-5 秒且完全不碰 UI/DB 语义。
+    fn spawn_memory_compression(
         &self,
         actor: &str,
         config: &crate::features::ai_chat::AiChatConfig,
         now_ms: i64,
-    ) {
+    ) -> Option<CompressionJob> {
         let memory = &self.business.ai_chat_memory;
         // 个人记忆与大厅记忆各自独立压缩：两层预算不同，触发时机也不同。
         let mut plans = Vec::new();
@@ -535,51 +547,51 @@ impl ApplicationRuntime {
             Ok(None) => {}
             Err(error) => log::warn!("大厅记忆压缩规划失败: {error:#}"),
         }
-        for plan in plans {
-            let summary = match self.summarize_memory(&plan, config) {
-                Ok(summary) => summary,
-                Err(error) => {
-                    log::warn!(
+        if plans.is_empty() {
+            return None;
+        }
+        let openai = self.business.ai_chat_openai.clone();
+        let connection = self.business.ai_connection.clone();
+        let config = config.clone();
+        let timeout = self.business.ai_request_timeout;
+        let handle = std::thread::spawn(move || {
+            let mut done = Vec::new();
+            for plan in plans {
+                match summarize_memory_with(&openai, &connection, &config, &plan, timeout) {
+                    Ok(summary) => done.push((plan, summary)),
+                    Err(error) => log::warn!(
                         "记忆压缩失败，原文保留待下轮重试 scope={}: {error:#}",
                         plan.scope
-                    );
-                    continue;
+                    ),
                 }
-            };
+            }
+            done
+        });
+        Some(CompressionJob {
+            handle,
+            now_ms,
+            actor: actor.to_string(),
+        })
+    }
+
+    /// 把后台压缩出来的摘要写回库。
+    fn commit_memory_compression(&self, job: CompressionJob) {
+        let (handle, now_ms) = (job.handle, job.now_ms);
+        let done = match handle.join() {
+            Ok(done) => done,
+            Err(_) => {
+                log::warn!("记忆压缩线程 panic，本轮摘要丢弃: actor={}", job.actor);
+                return;
+            }
+        };
+        let memory = &self.business.ai_chat_memory;
+        for (plan, summary) in done {
             if let Err(error) = memory.apply_compression(&plan, &summary, now_ms) {
                 log::warn!("记忆压缩结果写入失败 scope={}: {error:#}", plan.scope);
             }
         }
     }
 
-    /// 调一次模型，把「旧摘要 + 新溢出的原文」压成新摘要。
-    fn summarize_memory(
-        &self,
-        plan: &crate::features::ai_chat::CompressionPlan,
-        config: &crate::features::ai_chat::AiChatConfig,
-    ) -> Result<String> {
-        let records = plan.records.join("\n");
-        let prompt = crate::features::ai_chat::summary_prompt(&plan.previous_summary, &records);
-        // 与事实抽取同样处理：不持 UI 租约干等模型。
-        let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
-        // **必须走纯文本通道**：摘要要的是一段自然语言，
-        // 而 request_json 会强制 response_format=JsonObject。真机上表现为
-        // 每次压缩都 400 invalid_request_error，原文因此永远压不掉、
-        // 每轮重试一次注定失败的调用。
-        let reply = crate::config::ai::request_plain_text(
-            &self.business.ai_chat_openai,
-            &self.business.ai_connection,
-            &crate::config::ai::AiCallOptions {
-                model: config.model.clone(),
-                reasoning: config.reasoning,
-            },
-            &prompt,
-            &records,
-            crate::features::ai_chat::SUMMARY_MAX_TOKENS,
-            self.business.ai_request_timeout,
-        )?;
-        Ok(crate::features::ai_chat::parse_summary(&reply))
-    }
     /// 执行 AI 给出的命令：复用正常路由与执行链路，身份仍是提问者本人。
     fn run_ai_chat_command(
         &mut self,
@@ -648,6 +660,50 @@ impl ApplicationRuntime {
         }
         Ok(receipt)
     }
+}
+
+/// 调一次模型，把「旧摘要 + 新溢出的原文」压成新摘要。
+///
+/// 做成自由函数而不是方法：压缩要搬到后台线程，那里没有 &self，
+/// 只能拿可克隆的运行时句柄。
+fn summarize_memory_with(
+    openai: &miliastra_kernel::ai::OpenAiRuntimeHandle,
+    connection: &crate::config::ai::AiConfig,
+    config: &crate::features::ai_chat::AiChatConfig,
+    plan: &crate::features::ai_chat::CompressionPlan,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    let records = plan.records.join("\n");
+    let prompt = crate::features::ai_chat::summary_prompt(&plan.previous_summary, &records);
+    // **必须走纯文本通道**：摘要要的是一段自然语言，
+    // 而 request_json 会强制 response_format=JsonObject。真机上表现为
+    // 每次压缩都 400 invalid_request_error，原文因此永远压不掉、
+    // 每轮重试一次注定失败的调用。
+    //
+    // reasoning **保留**：摘要要判断哪些信息值得留下，需要模型思考。
+    // 之前失败的真正原因是预算太小——线上实测 reasoning_tokens 恰好吃满
+    // 800，输出为空、status 变成 incomplete(reason=max_output_tokens)。
+    // 现在输出预算放到 128k（模型实测支持），思考有多少空间都不会挤掉正文。
+    let reply = crate::config::ai::request_plain_text(
+        openai,
+        connection,
+        &crate::config::ai::AiCallOptions {
+            model: config.model.clone(),
+            reasoning: config.reasoning,
+        },
+        &prompt,
+        &records,
+        crate::features::ai_chat::SUMMARY_MAX_TOKENS,
+        timeout,
+    )?;
+    Ok(crate::features::ai_chat::parse_summary(&reply))
+}
+
+/// 后台压缩任务。
+struct CompressionJob {
+    handle: std::thread::JoinHandle<Vec<(crate::features::ai_chat::CompressionPlan, String)>>,
+    now_ms: i64,
+    actor: String,
 }
 
 /// 命令前缀字符（用于提示词里展示可用命令）。

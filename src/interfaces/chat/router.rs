@@ -1086,6 +1086,7 @@ mod tests {
                         id: uuid::Uuid::from_u128(1),
                         role,
                         note: "展示备注".to_string(),
+                        remark_sourced: false,
                         accounts: Vec::new(),
                     })
                     .collect(),
@@ -1139,6 +1140,7 @@ mod tests {
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Admin,
                 note: String::new(),
+                remark_sourced: false,
                 accounts: Vec::new(),
             }],
         });
@@ -1224,6 +1226,7 @@ mod tests {
                     id: uuid::Uuid::from_u128(1),
                     role: IdentityRole::Owner,
                     note: String::new(),
+                    remark_sourced: false,
                     accounts: Vec::new(),
                 },
                 IdentityMapping {
@@ -1231,6 +1234,7 @@ mod tests {
                     id: uuid::Uuid::from_u128(2),
                     role: IdentityRole::Admin,
                     note: String::new(),
+                    remark_sourced: false,
                     accounts: Vec::new(),
                 },
                 IdentityMapping {
@@ -1238,6 +1242,7 @@ mod tests {
                     id: uuid::Uuid::from_u128(3),
                     role: IdentityRole::Friend,
                     note: "好友备注".to_string(),
+                    remark_sourced: false,
                     accounts: Vec::new(),
                 },
             ],

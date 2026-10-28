@@ -142,10 +142,7 @@ impl AdministrationApplication {
                         "disable commands"
                     },
                 )?;
-                port.send_hall_template(
-                    command_availability_feedback(*enabled),
-                    &ReplyVars::new(),
-                )
+                port.send_hall_template(command_availability_feedback(*enabled), &ReplyVars::new())
             }
             AdministrationCommand::IdleExit { minutes } => {
                 port.configure_idle_exit((*minutes).max(IDLE_EXIT_MIN_MINUTES))?;

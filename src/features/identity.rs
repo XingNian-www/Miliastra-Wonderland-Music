@@ -35,6 +35,13 @@ pub struct IdentityMapping {
     /// 面板展示用备注（记录这是谁）；旧数据缺失时视为空串。
     #[serde(default)]
     pub note: String,
+    /// 该身份的 nickname 是否来自 ChatBridge 的好友备注。
+    ///
+    /// 用来避免 `replace_display_names` 把真实姓名改写成别的：
+    /// 以前 nickname 是随机占位串，几乎不可能出现在出站文本里；
+    /// 现在是玩家的真实备注，出现在消息里就该原样保留。
+    #[serde(default)]
+    pub remark_sourced: bool,
     /// 该身份绑定的游戏账号。
     ///
     /// 用列表而不是单个可选值：一个玩家常有多个小号，它们该共用同一份
@@ -152,12 +159,17 @@ impl ResolvedIdentity {
 /// 是为了在日志里读起来仍像一个昵称。
 fn random_nickname() -> String {
     // 与 Web 面板 `REMARK_CHARSET` 完全一致：35 个易辨识的英数字母，
-    // 去掉了 I/l/0/O 等易混淆字符。8 位 → 35^8 ≈ 2.2e12 组合，
-    // 足以抵御"猜一个名字来伪装成自动身份"。
+    // 去掉了 I/l/0/O 等易混淆字符。
+    //
+    // 长度取 6：游戏内好友备注有长度上限，8 位在部分昵称上会超。
+    // 6 位 → 35^6 ≈ 1.8e9，对「随机占位、不与他人冲突」这个用途足够；
+    // 真名由 ChatBridge 的 remarks 补上，占位串只是等待期的临时键。
+    // 与面板 `randomRemarkNickname` 的字节数保持一致。
     const CHARSET: &[u8] = b"347ACDEFGHKNPQRTUVWXYacdefhknprtuwxy";
+    const LEN: usize = 6;
     let bytes = uuid::Uuid::new_v4().as_u128().to_le_bytes();
-    let mut out = String::with_capacity(8);
-    for index in 0..8 {
+    let mut out = String::with_capacity(LEN);
+    for index in 0..LEN {
         // 每个字节取模会略微偏向小下标；对"防碰撞"没有实际影响，
         // 且比引入 rand 依赖更简单。
         out.push(CHARSET[bytes[index] as usize % CHARSET.len()] as char);
@@ -228,6 +240,7 @@ impl IdentityAccess {
                 id: Uuid::new_v4(),
                 role,
                 note: "模拟命令（调试）".to_string(),
+                remark_sourced: false,
                 accounts: vec![GameAccount {
                     game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
                     uid,
@@ -402,11 +415,17 @@ impl IdentityAccess {
             nickname: rng_nickname,
             id,
             role: IdentityRole::Friend,
+            // note 是**面板展示用**的备注，与 OCR 匹配键（上面的随机昵称）
+            // 是两回事：随机串只用于屏幕识别，绝不能拿去展示。
+            //
+            // 这里的昵称是兜底：ChatBridge 还没给出 remarks 时先用它，
+            // 一旦补查到真备注，set_account_note 会覆盖（备注优先）。
             note: nickname
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .unwrap_or_default()
                 .to_string(),
+            remark_sourced: false,
             accounts: vec![GameAccount {
                 game: game.to_string(),
                 uid: uid.to_string(),
@@ -416,10 +435,11 @@ impl IdentityAccess {
         Some(id)
     }
 
-    /// 后台补查到昵称后，回填自动创建身份的备注。
+    /// 补查到资料包昵称后回填展示备注。
     ///
-    /// 只填空备注，绝不覆盖用户手写的 note：面板里改过的名字优先。
-    /// 返回 true 表示确实改动了，调用方需要把映射写回配置库。
+    /// **只填空备注，绝不覆盖用户手写的 note**：note 是面板展示用标签，
+    /// 用户可能已经手填了更有意义的名字。这里只是防止自动注册的身份
+    /// 一直显示成 UUID 前缀。
     pub fn backfill_account_note(&self, game: &str, uid: &str, nickname: &str) -> bool {
         let nickname = nickname.trim();
         let uid = uid.trim();
@@ -439,6 +459,52 @@ impl IdentityAccess {
             return false;
         }
         mapping.note = nickname.to_string();
+        true
+    }
+
+    /// 用 ChatBridge 的备注覆盖昵称（OCR 匹配键）。
+    ///
+    /// `nickname` 是**游戏内好友备注**，也是 OCR 精确匹配的唯一依据。
+    /// 自动注册时因为拿不到它只能随机生成 6 位占位串，那样 OCR 永远匹配不上。
+    /// ChatBridge 的 `remarks` 就是玩家在游戏里设的那个备注，所以它才是
+    /// 这个字段的正主：有就用，没有则不动。
+    ///
+    /// 唯一性由这里保证——昵称重复会让 `validate` 直接拒绝整份配置，
+    /// 所以撞名时放弃写入并返回 false，交给调用方保留占位串。
+    pub fn set_account_remark(&self, game: &str, uid: &str, remark: &str) -> bool {
+        let remark = remark.trim();
+        let uid = uid.trim();
+        if remark.is_empty() || uid.is_empty() {
+            return false;
+        }
+        let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        // 昵称必须全局唯一：已被**别人**占用就不写，避免把配置搞成非法。
+        let taken_by_other = config.mappings.iter().any(|mapping| {
+            mapping.nickname.trim() == remark
+                && !mapping.accounts.iter().any(|account| {
+                    account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid
+                })
+        });
+        if taken_by_other {
+            log::warn!("ChatBridge 备注与已有昵称重复，{uid} 保留原匹配键: {remark}");
+            return false;
+        }
+        let Some(mapping) = config.mappings.iter_mut().find(|mapping| {
+            mapping
+                .accounts
+                .iter()
+                .any(|account| account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid)
+        }) else {
+            return false;
+        };
+        if mapping.nickname == remark {
+            return false;
+        }
+        mapping.nickname = remark.to_string();
+        mapping.remark_sourced = true;
+        // **不写 note**：用户明确要求「remarks 只能覆盖 nickname」。
+        // note 是面板展示标签，与 OCR 匹配键绑死会让两者悄悄分叉
+        // （以后备注改名，note 仍停在旧值）。
         true
     }
 
@@ -462,7 +528,7 @@ impl IdentityAccess {
     ///
     /// 为什么是**多个**：外部聊天源的发起人只有 UID，没有可信昵称。
     /// ensure_identity_for_account 自动建的身份把 API 昵称写进 note、
-    /// 把随机 8 位串写进 nickname（那是 OCR 匹配键，不是真名）；
+    /// 把随机 6 位串写进 nickname（那是 OCR 匹配键，不是真名）；
     /// 手工维护的映射则反过来，真名在 nickname、备注在 note。
     /// 两种来源都得试，否则必有一半玩家的邀请找不到人。
     ///
@@ -579,6 +645,12 @@ impl IdentityAccess {
             .mappings
             .iter()
             .filter_map(|mapping| {
+                // nickname 来自 ChatBridge 备注时不要改写：那是玩家的真实名字，
+                // 出站文本里出现它就该原样保留。以前 nickname 是随机占位串，
+                // 几乎不可能命中，所以这条改写一直无害；现在会误伤。
+                if mapping.remark_sourced {
+                    return None;
+                }
                 let display_name = mapping.note.trim();
                 (!mapping.nickname.is_empty() && !display_name.is_empty())
                     .then(|| (mapping.nickname.clone(), display_name.to_owned()))
@@ -661,6 +733,7 @@ mod tests {
             id,
             role,
             note: String::new(),
+            remark_sourced: false,
             accounts: Vec::new(),
         }
     }
@@ -698,6 +771,7 @@ mod tests {
                 id: uuid::Uuid::new_v4(),
                 role: IdentityRole::Friend,
                 note: "厅主".to_string(),
+                remark_sourced: false,
                 accounts: vec![GameAccount {
                     game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
                     uid: "900000001".to_string(),
@@ -756,6 +830,7 @@ mod tests {
             id: Uuid::from_u128(4),
             role: IdentityRole::Friend,
             note: "短备注".to_string(),
+            remark_sourced: false,
             accounts: Vec::new(),
         });
         let access = IdentityAccess::new(config);
@@ -877,6 +952,7 @@ mod tests {
             id,
             role: IdentityRole::Friend,
             note: "显示名甲".to_string(),
+            remark_sourced: false,
             accounts: vec![GameAccount::new("10001")],
         });
         let access = IdentityAccess::new(config);
@@ -940,6 +1016,7 @@ mod tests {
             id,
             role: IdentityRole::Admin,
             note: "显示名甲".to_string(),
+            remark_sourced: false,
             accounts: vec![GameAccount::new("10001")],
         });
         let access = IdentityAccess::new(config);
@@ -965,6 +1042,7 @@ mod tests {
             id: Uuid::new_v4(),
             role: IdentityRole::Friend,
             note: "显示名乙".to_string(),
+            remark_sourced: false,
             accounts: vec![GameAccount::new("10002")],
         });
         let access = IdentityAccess::new(config);
@@ -982,6 +1060,7 @@ mod tests {
             id: Uuid::new_v4(),
             role: IdentityRole::Friend,
             note: "玩家甲".to_string(),
+            remark_sourced: false,
             accounts: vec![GameAccount::new("900000002")],
         });
         let access = IdentityAccess::new(config);
@@ -1012,6 +1091,7 @@ mod tests {
             id: Uuid::new_v4(),
             role: IdentityRole::Owner,
             note: String::new(),
+            remark_sourced: false,
             accounts: vec![GameAccount::new("111111")],
         });
         let access = IdentityAccess::new(config);
@@ -1036,6 +1116,7 @@ mod tests {
             id: Uuid::from_u128(11),
             role: IdentityRole::Admin,
             note: String::new(),
+            remark_sourced: false,
             accounts: vec![GameAccount {
                 game: "genshin".to_string(),
                 uid: "100000001".to_string(),
@@ -1080,6 +1161,7 @@ mod tests {
             id: Uuid::from_u128(7),
             role: IdentityRole::Owner,
             note: String::new(),
+            remark_sourced: false,
             accounts: Vec::new(),
         });
         let access = IdentityAccess::new(config);
@@ -1118,14 +1200,33 @@ mod tests {
             .expect("应创建身份");
         let resolved = access.resolve_account("genshin", "900000001").unwrap();
         assert_eq!(resolved.id, id);
-        // API 昵称作为显示昵称（note），方便用户认人。
-        assert_eq!(resolved.display_name(), "荧");
-        // OCR 匹配键必须随机且不等于 API 昵称：否则 OCR 读到同名玩家会误命中。
+        // note 是面板展示用的：ChatBridge 还没给 remarks 时用昵称兜底。
+        // 注意它和 OCR 匹配键是两回事，随机串绝不能拿去展示。
+        assert_eq!(resolved.note, "荧");
+        // 占位键必须是与真名无关的随机英数串，OCR 才不会误命中。
         assert_ne!(resolved.nickname, "荧");
-        assert_eq!(resolved.nickname.chars().count(), 8);
-        assert!(
-            resolved.nickname.is_ascii(),
-            "随机昵称用英数，不带非 ASCII 字符"
+        assert_eq!(resolved.nickname.chars().count(), 6);
+        assert!(resolved.nickname.is_ascii(), "占位键用英数");
+        // ChatBridge 的 remarks 是游戏内好友备注，也正是 nickname
+        // （OCR 精确匹配键）该有的值——备注优先，覆盖随机占位串。
+        assert!(access.set_account_remark("genshin", "900000001", "显示名甲"));
+        assert_eq!(
+            access
+                .resolve_account("genshin", "900000001")
+                .unwrap()
+                .nickname,
+            "显示名甲"
+        );
+        // 覆盖后 OCR 读到这个名字就能直接定位到身份。
+        assert!(access.resolve("显示名甲").is_some());
+        // 空备注不能把已有匹配键擦掉。
+        assert!(!access.set_account_remark("genshin", "900000001", "  "));
+        assert_eq!(
+            access
+                .resolve_account("genshin", "900000001")
+                .unwrap()
+                .nickname,
+            "显示名甲"
         );
     }
 
@@ -1140,8 +1241,8 @@ mod tests {
         // 随机昵称是 OCR 匹配键，出现在展示位就等于给出可冒充的名字。
         assert_eq!(resolved.display_name().chars().count(), 8);
         assert_ne!(resolved.display_name(), resolved.nickname);
-        // OCR 匹配键仍是随机昵称（英数 8 位）。
-        assert_eq!(resolved.nickname.chars().count(), 8);
+        // OCR 匹配键仍是随机昵称（英数 6 位）。
+        assert_eq!(resolved.nickname.chars().count(), 6);
         assert!(resolved.nickname.is_ascii());
     }
 

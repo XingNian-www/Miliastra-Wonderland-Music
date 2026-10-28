@@ -418,7 +418,6 @@ fn execute_enter_game(
     ))
 }
 
-
 /// 让 Miliastra-Wonderland-ChatBridge 拉起游戏，并等待窗口出现。
 ///
 /// Miliastra-Wonderland-ChatBridge 会用 CREATE_SUSPENDED 启动游戏、注入 DLL、再恢复主线程，

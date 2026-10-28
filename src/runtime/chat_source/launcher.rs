@@ -120,7 +120,9 @@ pub(crate) fn ensure_running(config: &ChatSourceConfig) -> Result<bool> {
     }
     // 冷却期内不重复尝试：上一次可能因游戏已在运行而立刻退出。
     {
-        let mut last = LAST_ATTEMPT.lock().unwrap_or_else(|error| error.into_inner());
+        let mut last = LAST_ATTEMPT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(at) = *last
             && at.elapsed() < LAUNCH_COOLDOWN
         {
@@ -158,10 +160,16 @@ pub(crate) fn ensure_running(config: &ChatSourceConfig) -> Result<bool> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    command
-        .spawn()
-        .with_context(|| format!("启动 Miliastra-Wonderland-ChatBridge 失败: {}", exe.display()))?;
-    log::info!("已拉起 Miliastra-Wonderland-ChatBridge: {} (端口 {port})", exe.display());
+    command.spawn().with_context(|| {
+        format!(
+            "启动 Miliastra-Wonderland-ChatBridge 失败: {}",
+            exe.display()
+        )
+    })?;
+    log::info!(
+        "已拉起 Miliastra-Wonderland-ChatBridge: {} (端口 {port})",
+        exe.display()
+    );
     Ok(true)
 }
 

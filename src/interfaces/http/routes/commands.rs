@@ -66,13 +66,8 @@ pub(super) fn commands_replies_route(
         let mut allowed_variables = crate::features::reply_template::reply_variables().iter()
             .filter(|variable| referenced_variables.contains(variable.name))
             .map(|variable| variable.name).collect::<Vec<_>>();
-        // 全局标签与命令无关：任何回复都能用，因此总是放行。
-        allowed_variables.extend(
-            crate::features::global_tags::GLOBAL_TAGS
-                .iter()
-                .map(|tag| tag.name),
-        );
-        allowed_variables.push(crate::features::global_tags::AI_TAG);
+        // AI 标签与命令无关：任何回复都能用，因此总是放行。
+        allowed_variables.push(crate::features::ai_tag::AI_TAG);
         json!({ "id": entry.id, "name": entry.name, "category": entry.category, "replies": replies, "defaultReplies": defaults, "allowedVariables": allowed_variables })
     }).collect::<Vec<_>>();
     let mut variables = crate::features::reply_template::reply_variables()
@@ -85,20 +80,11 @@ pub(super) fn commands_replies_route(
             })
         })
         .collect::<Vec<_>>();
-    // 全局标签排在最后：它们不依赖命令上下文，示例取候选里第一条。
-    variables.extend(crate::features::global_tags::GLOBAL_TAGS.iter().map(|tag| {
-        json!({
-            "name": tag.name,
-            "label": tag.label,
-            "example": tag.choices.first().copied().unwrap_or(""),
-            "global": true,
-        })
-    }));
     // AI 标签走另一条求值路径（渲染前预生成），但同样要能让用户插入。
     variables.push(json!({
-        "name": crate::features::global_tags::AI_TAG,
-        "label": crate::features::global_tags::AI_TAG_LABEL,
-        "example": crate::features::global_tags::AI_TAG_EXAMPLE,
+        "name": crate::features::ai_tag::AI_TAG,
+        "label": crate::features::ai_tag::AI_TAG_LABEL,
+        "example": crate::features::ai_tag::AI_TAG_EXAMPLE,
         "global": true,
     }));
     serde_json::to_string(&json!({
@@ -589,20 +575,10 @@ mod tests {
         assert!(validate_reply_variables("只有左括号{").is_ok());
         assert!(validate_reply_variables("空{}").is_ok());
 
-        // 全局标签与 AI 标签必须放行：面板把它们列在变量按钮里，
+        // AI 标签必须放行：面板把它列在变量按钮里，
         // 校验若只认常规变量，就会出现「列出来却存不进去」。
-        for name in crate::features::global_tags::GLOBAL_TAGS
-            .iter()
-            .map(|t| t.name)
-        {
-            assert!(
-                validate_reply_variables(&format!("好{{}}{name}}}")).is_ok(),
-                "全局标签 {{{name}}} 应被接受"
-            );
-        }
         assert!(
-            validate_reply_variables(&format!("好{{{}}}", crate::features::global_tags::AI_TAG))
-                .is_ok(),
+            validate_reply_variables(&format!("好{{{}}}", crate::features::ai_tag::AI_TAG)).is_ok(),
             "AI 标签应被接受"
         );
     }

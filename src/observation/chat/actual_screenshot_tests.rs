@@ -151,7 +151,7 @@ fn route_diagnostic(message: &RecognizedChatMessage, frame: &Frame, primary: boo
     if primary {
         try_envelope(
             "primary-parse-command-envelope",
-            parse_command_envelope(&message.text, &message.message_type, obs),
+            parse_command_envelope(&message.text, &message.message_type, None, obs),
         );
     } else if !try_envelope(
         "secondary-structured-song",

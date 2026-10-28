@@ -72,7 +72,13 @@ const COMPRESS_SUMMARY_PERCENT: usize = 20;
 /// 压缩时把最旧的多少比例原文送去摘要。
 const COMPRESS_OLDEST_PERCENT: usize = 70;
 /// 摘要单次生成允许的最大 token。
-pub(crate) const SUMMARY_MAX_TOKENS: u32 = 800;
+/// 摘要的输出预算。
+///
+/// 原来只有 800：模型一开思考就把预算吃光（线上实测 reasoning_tokens 恰好 800），
+/// 正文一个字都出不来，status 变成 incomplete(reason=max_output_tokens)，
+/// 压缩因此永远失败、每轮白烧一次调用。
+/// 128k 是模型实测支持的上限（16k/32k/64k 也都能过），留足思考空间。
+pub(crate) const SUMMARY_MAX_TOKENS: u32 = 131_072;
 
 /// 事实抽取与摘要的超时。
 ///

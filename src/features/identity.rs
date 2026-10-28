@@ -893,6 +893,35 @@ mod tests {
     }
 
     /// 未登记的名字原样返回：老库里有按昵称直接存的孤儿行。
+
+    /// 回归：自动注册的身份必须对命令执行侧立即可见。
+    ///
+    /// 原来外部聊天源用 `IdentityAccess::new(config.identity.clone())` 建了一份
+    /// **独立副本**，自动建的身份只进了那份副本，命令执行时查的却是
+    /// `live_configs.identity`——同一个 UID 永远 role=None。
+    /// 写库是对的，但写库不会反向刷新另一个内存实例。
+    ///
+    /// 这条测试钉住「两者是同一个句柄」这个前提：clone 出来的一侧写入，
+    /// 另一侧必须立刻读到。
+    #[test]
+    fn identity_access_clone_shares_the_same_mappings() {
+        let access = IdentityAccess::new(IdentityConfig::default());
+        // 模拟 application.rs 的接线：外部源与 live_configs 共享同一句柄。
+        let external_side = access.clone();
+
+        let created =
+            external_side.ensure_identity_for_account("genshin", "10001", Some("自动注册"));
+        assert!(created.is_some(), "应当自动创建身份");
+
+        // 命令执行侧（同一个句柄）必须立刻查得到。
+        let resolved = access.resolve_account("genshin", "10001");
+        assert!(
+            resolved.is_some(),
+            "clone 出来的 IdentityAccess 必须共享同一份映射，否则自动注册对命令侧不可见"
+        );
+        assert_eq!(resolved.unwrap().role, IdentityRole::Friend);
+    }
+
     #[test]
     fn memory_key_leaves_unknown_names_untouched() {
         let access = IdentityAccess::new(IdentityConfig::default());

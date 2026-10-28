@@ -234,7 +234,7 @@ impl ApplicationRuntime {
         spec: &crate::features::reply_template::ReplyTemplate,
         rendered: crate::features::reply_template::RenderedReply,
     ) -> crate::features::reply_template::RenderedReply {
-        let tag = format!("{{{}}}", crate::features::global_tags::AI_TAG);
+        let tag = format!("{{{}}}", crate::features::ai_tag::AI_TAG);
         if !rendered.text.contains(&tag) {
             return rendered;
         }

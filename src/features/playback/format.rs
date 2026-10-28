@@ -93,9 +93,7 @@ pub(crate) fn format_status_with_mode(
             crate::features::reply_template::render(
                 &templates::STATUS_PLAYLIST_PREFIX,
                 None,
-                &ReplyVars::new()
-                    .with("歌单归属", owner)
-                    .with("内容", inner),
+                &ReplyVars::new().with("歌单归属", owner).with("内容", inner),
             )
             .text
         }

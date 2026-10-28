@@ -6,7 +6,9 @@
 pub(crate) mod launcher;
 pub(crate) mod ws;
 
-use miliastra_kernel::chat_source::{ChatChannel, ChatSourceEvent, ExternalChatMessage, ExternalSender, GameUid};
+use miliastra_kernel::chat_source::{
+    ChatChannel, ChatSourceEvent, ExternalChatMessage, ExternalSender, GameUid,
+};
 
 /// 一条 WS 推送的原始 JSON。
 ///
@@ -70,9 +72,7 @@ pub(crate) fn parse_frame(text: &str) -> anyhow::Result<Option<ChatSourceEvent>>
         WireEvent::Hello { last_message_id } => ChatSourceEvent::Connected {
             last_sequence: last_message_id,
         },
-        WireEvent::Message { message } => {
-            ChatSourceEvent::Messages(vec![to_external(message)])
-        }
+        WireEvent::Message { message } => ChatSourceEvent::Messages(vec![to_external(message)]),
         WireEvent::HallChanged { hall_id, hall_type } => {
             ChatSourceEvent::HallChanged { hall_id, hall_type }
         }
@@ -100,17 +100,21 @@ fn to_external(message: WireMessage) -> ExternalChatMessage {
     }
 }
 
-/// 昵称补查：`from.name` 为 null 时调用 `GET /names?uids=`。
+/// 昵称与备注补查：`from.name` 为 null 时调用 `GET /names?uids=`。
 ///
 /// 文档 §5 明确说昵称到达时序不确定、且服务端**不会补发**，因此这条补查
 /// 是拿到发送者的最后手段；查不到就按"未知发送者"处理，不授权任何权限。
-pub(crate) fn resolve_missing_name(
+///
+/// 响应同时带 `remarks`（玩家给该 UID 设置的备注）。备注是用户在游戏里
+/// 亲自命名的，比 OCR 猜出来的昵称可靠，身份映射优先用它；没有就返回 None，
+/// 由调用方回退到昵称——不编造、不留空。
+pub(crate) fn resolve_sender_names(
     base_http_url: &str,
     token: &str,
     uid: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, Option<String>)> {
     if uid.trim().is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
     let url = format!(
         "{}/names?uids={}",
@@ -122,22 +126,30 @@ pub(crate) fn resolve_missing_name(
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(1))
         .build()?;
-    let response = client
-        .get(url)
-        .header("x-miliastra-token", token)
-        .send()?;
+    let response = client.get(url).header("x-miliastra-token", token).send()?;
     if !response.status().is_success() {
         // 503 game_not_connected 等都属于"暂时查不到"，不是致命错误。
         log::debug!("昵称补查失败: status={}", response.status());
-        return Ok(None);
+        return Ok((None, None));
     }
     let body: serde_json::Value = response.json()?;
-    Ok(body
-        .get("names")
-        .and_then(|names| names.get(uid.trim()))
-        .and_then(|name| name.as_str())
-        .map(str::to_string)
-        .filter(|name| !name.trim().is_empty()))
+    Ok(parse_sender_names(&body, uid.trim()))
+}
+
+/// 从 `/names` 的响应体里取出 (昵称, 备注)。
+///
+/// 抽成纯函数是为了能单测：真机上 /names 的常见组合是
+/// `names:{uid:null}` 配 `remarks:{uid:"某备注"}`，两条字段各自可能缺失、
+/// 也可能是空串，这些形状必须钉住。
+fn parse_sender_names(body: &serde_json::Value, uid: &str) -> (Option<String>, Option<String>) {
+    let read = |section: &str| {
+        body.get(section)
+            .and_then(|map| map.get(uid))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .filter(|text| !text.trim().is_empty())
+    };
+    (read("names"), read("remarks"))
 }
 
 /// 断线补拉：`GET /messages?since=<id>`。
@@ -163,10 +175,7 @@ pub(crate) fn fetch_messages_since(
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let response = client
-        .get(url)
-        .header("x-miliastra-token", token)
-        .send()?;
+    let response = client.get(url).header("x-miliastra-token", token).send()?;
     if !response.status().is_success() {
         anyhow::bail!("补拉失败: status={}", response.status());
     }
@@ -205,6 +214,49 @@ fn urlencode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// `/names` 的 remarks 解析：这个字段是本轮新接的，形状必须钉住。
+    #[test]
+    fn names_response_yields_remark_even_without_nickname() {
+        // 真机实测就是这个形状：昵称 null，备注有值。
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"names":{"100000001":null},"remarks":{"100000001":"显示名甲"}}"#,
+        )
+        .unwrap();
+        let (name, remark) = parse_sender_names(&body, "100000001");
+        assert_eq!(name, None);
+        assert_eq!(remark.as_deref(), Some("显示名甲"));
+    }
+
+    #[test]
+    fn names_response_without_remarks_key_yields_none() {
+        // 旧版 ChatBridge 没有 remarks 字段，必须当作「没有备注」而不是报错。
+        let body: serde_json::Value = serde_json::from_str(r#"{"names":{"42":"玩家甲"}}"#).unwrap();
+        let (name, remark) = parse_sender_names(&body, "42");
+        assert_eq!(name.as_deref(), Some("玩家甲"));
+        assert_eq!(remark, None);
+    }
+
+    #[test]
+    fn names_response_ignores_blank_values() {
+        // 空串等同于没有：不能把空串写进身份映射把占位键擦掉。
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"names":{"7":"   "},"remarks":{"7":""}}"#).unwrap();
+        let (name, remark) = parse_sender_names(&body, "7");
+        assert_eq!(name, None);
+        assert_eq!(remark, None);
+    }
+
+    #[test]
+    fn names_response_only_returns_the_requested_uid() {
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"names":{"1":"甲","2":"乙"},"remarks":{"1":"备注甲"}}"#)
+                .unwrap();
+        let (name, remark) = parse_sender_names(&body, "2");
+        assert_eq!(name.as_deref(), Some("乙"));
+        assert_eq!(remark, None);
+    }
+
     use super::*;
 
     #[test]
@@ -238,10 +290,7 @@ mod tests {
         };
         assert!(messages[0].channel.is_private());
         assert_eq!(messages[0].sender.nickname, None);
-        assert_eq!(
-            messages[0].to_uid.as_ref().unwrap().as_str(),
-            "900000001"
-        );
+        assert_eq!(messages[0].to_uid.as_ref().unwrap().as_str(), "900000001");
     }
 
     #[test]
@@ -251,8 +300,7 @@ mod tests {
             parse_frame(hello).unwrap().unwrap(),
             ChatSourceEvent::Connected { last_sequence: 42 }
         );
-        let changed =
-            r#"{"type":"hall_changed","hallId":7699842546315381217,"hallType":23}"#;
+        let changed = r#"{"type":"hall_changed","hallId":7699842546315381217,"hallType":23}"#;
         assert_eq!(
             parse_frame(changed).unwrap().unwrap(),
             ChatSourceEvent::HallChanged {
@@ -288,7 +336,11 @@ mod tests {
     #[test]
     fn unknown_frame_type_is_ignored_not_fatal() {
         // 协议向前兼容：服务端加新事件时旧客户端不该断开。
-        assert!(parse_frame(r#"{"type":"future_event","x":1}"#).unwrap().is_none());
+        assert!(
+            parse_frame(r#"{"type":"future_event","x":1}"#)
+                .unwrap()
+                .is_none()
+        );
         assert!(parse_frame("not json").unwrap().is_none());
     }
 }

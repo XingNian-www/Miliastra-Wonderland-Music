@@ -67,7 +67,6 @@ impl WebSocketChatSource {
     }
 }
 
-
 impl ChatSource for WebSocketChatSource {
     fn name(&self) -> &str {
         &self.name

@@ -600,6 +600,22 @@ mod tests {
         );
     }
 
+    /// 读取固定截图里应当出现的好友名（每行一个）。
+    ///
+    /// 夹具图与真实昵称都不进公开仓库，所以期望值只能放在本地声明文件里。
+    /// 返回 None 表示没有本地声明，调用方跳过断言而不是报假红。
+    fn fixture_expected_friend_names() -> Option<Vec<String>> {
+        let text =
+            std::fs::read_to_string("tests/fixtures/ui/secondary-chat-friends.txt").ok()?;
+        let names = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        (!names.is_empty()).then_some(names)
+    }
+
     #[test]
     #[cfg(feature = "ocr-mnn")]
     fn fixed_secondary_chat_fixture_recognizes_title_and_strict_friend_list() {
@@ -633,18 +649,18 @@ mod tests {
             recognize_lines(&mut engine, &friend_list).expect("recognize friend list"),
             12,
         );
-        // 这张图不进仓库（.gitignore 覆盖 tests/），本地替换成别的截图后
-        // 断言里的占位好友名必然对不上。那种情况跳过而不是报假红：
-        // 有真实夹具时这条断言仍然生效。
-        if !friend_text.contains("玩家丙") || !friend_text.contains("银河乐子人") {
-            eprintln!(
-                "跳过好友列表断言：本地夹具与占位好友名不一致（fixture 未入库）。实际 OCR: {friend_text}"
-            );
+        // 固定截图不进仓库（.gitignore 的 /* 覆盖整个 tests/），
+        // 因此图里的真实昵称不能写进源码。期望好友名改为读本地声明文件：
+        // 有声明就做真实回归，没有就跳过——公开源码里不出现真实昵称。
+        let Some(expected) = fixture_expected_friend_names() else {
+            eprintln!("跳过好友列表断言：缺少本地夹具声明 tests/fixtures/ui/secondary-chat-friends.txt");
             return;
+        };
+        for name in &expected {
+            assert!(
+                friend_text.contains(name),
+                "unexpected friend-list OCR（缺少 {name}）: {friend_text}"
+            );
         }
-        assert!(
-            friend_text.contains("玩家丙") && friend_text.contains("银河乐子人"),
-            "unexpected friend-list OCR: {friend_text}"
-        );
     }
 }

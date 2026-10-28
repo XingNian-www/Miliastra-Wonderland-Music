@@ -53,10 +53,46 @@ impl ChatBatchSendOutcome {
     }
 }
 
+/// 回复捕获守卫：drop 时结束捕获并取出结果。
+pub(crate) struct ReplyCapture {
+    slot: Arc<RwLock<Option<Vec<String>>>>,
+}
+
+impl ReplyCapture {
+    /// 结束捕获，返回期间发出的全部回复文本。
+    pub(crate) fn finish(self) -> Vec<String> {
+        let _ = &self.slot;
+        std::mem::take(
+            &mut *self
+                .slot
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .unwrap_or_default()
+    }
+}
+
+impl Drop for ReplyCapture {
+    fn drop(&mut self) {
+        // 未显式 finish 时也要关掉，避免捕获槽长期打开。
+        let _ = self
+            .slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
 #[derive(Clone)]
 pub struct ChatOutput {
     enabled: Arc<RwLock<bool>>,
     hall_batch_ui: HallBatchUi,
+    /// 命令执行期间的回复捕获槽。
+    ///
+    /// AI 代执行命令时，把 BOT 实际发出的文本记下来回传给模型——
+    /// 否则它只知道「命令已执行完成」，无法判断点歌到底成没成
+    /// （歌名不存在时业务会回「没找到」，但回执原来一模一样）。
+    capture: Arc<RwLock<Option<Vec<String>>>>,
 }
 
 impl ChatOutput {
@@ -67,7 +103,42 @@ impl ChatOutput {
         Self {
             enabled,
             hall_batch_ui,
+            capture: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// 开始捕获回复，返回一个守卫；守卫 drop 时结束捕获。
+    ///
+    /// 用守卫而不是成对的 start/stop：命令执行中途出错提前返回时，
+    /// 成对调用很容易漏掉 stop，捕获槽会一直开着把无关回复也记进去。
+    pub(crate) fn capture_replies(&self) -> ReplyCapture {
+        *self
+            .capture
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Vec::new());
+        ReplyCapture {
+            slot: self.capture.clone(),
+        }
+    }
+
+    /// 捕获通道打开时把这条回复记下来。
+    fn record_captured(&self, message: &str) {
+        let mut guard = self
+            .capture
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(replies) = guard.as_mut() {
+            replies.push(message.to_string());
+        }
+    }
+
+    /// 结束捕获并取回期间发出的全部回复。
+    fn take_captured(&self) -> Vec<String> {
+        self.capture
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default()
     }
 
     fn enabled(&self) -> bool {
@@ -108,6 +179,7 @@ impl ChatOutput {
 
     fn send_primary(&self, message: &str, restore_after_task: bool) -> Result<()> {
         let message = fit_chat_message(message);
+        self.record_captured(&message);
         log::info!("游戏内回复: {}", redacted_chat_text(&message));
         if !self.enabled() {
             log::info!("游戏内回复发送已关闭，仅记录日志");
@@ -118,6 +190,7 @@ impl ChatOutput {
 
     pub fn send_current_chat(&self, message: &str) -> Result<()> {
         let message = fit_chat_message(message);
+        self.record_captured(&message);
         log::info!("当前聊天回复: {}", redacted_chat_text(&message));
         if !self.enabled() {
             log::info!("当前聊天回复发送已关闭，仅记录日志");
@@ -135,6 +208,7 @@ impl ChatOutput {
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
         for message in &messages {
+            self.record_captured(message);
             log::info!("当前聊天回复: {}", redacted_chat_text(message));
         }
         if !self.enabled() {
@@ -476,6 +550,36 @@ fn take_display_end(value: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 捕获器只记「守卫存活期间」的回复，finish 之后自动关闭。
+    ///
+    /// 直接测捕获槽本身：`ChatOutput` 的完整构造需要 UI 句柄，
+    /// 而这里要验证的语义与发送通道无关。
+    #[test]
+    fn reply_capture_records_only_while_open() {
+        let slot: Arc<RwLock<Option<Vec<String>>>> = Arc::new(RwLock::new(None));
+        let capture = ReplyCapture { slot: slot.clone() };
+
+        // 打开之前：没有槽，写入被忽略。
+        *slot.write().unwrap() = None;
+
+        // 模拟捕获期间的回复。
+        *slot.write().unwrap() = Some(vec!["已加入队列".to_string(), "第二段".to_string()]);
+        let replies = capture.finish();
+        assert_eq!(
+            replies,
+            vec!["已加入队列".to_string(), "第二段".to_string()]
+        );
+        // finish 之后槽已清空，后续写入不会带回来。
+        assert!(slot.read().unwrap().is_none(), "finish 应关闭捕获槽");
+
+        // 守卫 drop 而未 finish 时同样关闭。
+        *slot.write().unwrap() = Some(vec!["未 finish".to_string()]);
+        {
+            let _guard = ReplyCapture { slot: slot.clone() };
+        }
+        assert!(slot.read().unwrap().is_none(), "守卫 drop 应关闭捕获槽");
+    }
 
     #[test]
     fn numbered_split_preserves_all_content_without_truncation() {

@@ -484,17 +484,14 @@ pub(crate) fn reply_variables() -> &'static [ReplyVariable] {
 }
 /// 回复模板里允许出现的变量名。
 ///
-/// 三类都要认，缺一类就会出现「面板列出来、保存却报未知变量」：
+/// 两类都要认，缺一类就会出现「面板列出来、保存却报未知变量」：
 ///
 /// 1. `REPLY_VARIABLES`：依赖命令上下文的常规变量
-/// 2. `GLOBAL_TAGS`：随机语气池（如 {卖萌}），渲染时由 resolve 动态取
-/// 3. `AI_TAG`：AI 标签，渲染前预生成，同样可让用户插入
+/// 2. `AI_TAG`：AI 标签，渲染前预生成，同样可让用户插入
 ///
-/// 判定口径必须与 [`render`] 一致：渲染先查调用点注入的 vars，再查全局标签。
+/// 随机的 `{a|b|c}` 不在这里判定——它不是具名变量，由调用方单独放行。
 pub(crate) fn reply_variable_allowed(name: &str) -> bool {
-    REPLY_VARIABLES.iter().any(|v| v.name == name)
-        || crate::features::global_tags::find(name).is_some()
-        || name == crate::features::global_tags::AI_TAG
+    REPLY_VARIABLES.iter().any(|v| v.name == name) || name == crate::features::ai_tag::AI_TAG
 }
 
 /// AI 聊天回复。
@@ -562,7 +559,7 @@ impl ReplyVars {
     /// 占位符名与全局标签 `{AI回复}` 一致：模板里写 `{AI回复}`，
     /// 由调用方预生成后注入，渲染时与普通变量同路径取得。
     pub(crate) fn with_ai(self, value: impl Into<String>) -> Self {
-        self.with(crate::features::global_tags::AI_TAG, value)
+        self.with(crate::features::ai_tag::AI_TAG, value)
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&str> {
@@ -653,16 +650,13 @@ pub(crate) fn render(
         }
         match vars.get(name) {
             Some(value) => out.push_str(value),
-            // 全局标签在渲染时动态生成（随机池），不占用调用点的注入槽。
-            // 顺序在 vars 之后：调用点显式注入的值优先于随机候选。
-            None => match crate::features::global_tags::resolve(name) {
-                Some(value) => out.push_str(value),
-                None => {
-                    if !missing.iter().any(|seen| seen == name) {
-                        missing.push(name.to_string());
-                    }
+            // 已知但未注入（如 {AI回复} 预生成失败）替换为空串并记入 missing；
+            // 未知名字同样记进去，由调用方决定怎么处理。
+            None => {
+                if !missing.iter().any(|seen| seen == name) {
+                    missing.push(name.to_string());
                 }
-            },
+            }
         }
         rest = &after[close + 1..];
     }

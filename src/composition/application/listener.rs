@@ -2578,8 +2578,11 @@ impl ApplicationRuntime {
             .live_configs
             .identity
             .role_of_sender(&command.username, command.account.as_ref());
-        let actor = crate::features::command_access::actor_permission(role);
-        Ok(!policy.allows(actor)
+        // 与路由期同一口径：身份命中**覆盖**，未命中退回来源下界
+        // （粉色好友消息 / 大厅好友标记 → Friend，蓝色大厅 → User）。
+        let actor =
+            crate::features::command_access::actor_permission_with_floor(role, command.authority);
+        Ok(!policy.allows(Some(actor))
             || (!self.commands_enabled()?
                 && command.authority == CommandAuthority::HallMember
                 && role.is_none()))

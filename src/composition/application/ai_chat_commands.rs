@@ -272,12 +272,14 @@ impl ApplicationRuntime {
         let catalog = crate::features::command_catalog::all_specs();
         let mut names = Vec::new();
         let snapshot = self.lifecycle.live_configs.snapshot();
-        // 与路由期同一判定：有账号按 UID，否则按昵称。
-        let actor = crate::features::command_access::actor_permission(
+        // 与路由期同一判定：有账号按 UID，否则按昵称；
+        // 身份命中**覆盖**，未命中退回来源下界。
+        let actor = crate::features::command_access::actor_permission_with_floor(
             self.lifecycle
                 .live_configs
                 .identity
                 .role_of_sender(&parsed.username, parsed.account.as_ref()),
+            parsed.authority,
         );
         for spec in catalog {
             let id = if spec.prefix == crate::features::command::CommandPrefix::At {
@@ -289,7 +291,7 @@ impl ApplicationRuntime {
             };
             let allowed =
                 crate::features::command_access::catalog_policy(&snapshot.command_access, &id)
-                    .is_some_and(|policy| policy.allows(actor));
+                    .is_some_and(|policy| policy.allows(Some(actor)));
             if allowed && !spec.hidden && spec.name != "忘记我" {
                 names.push(id);
             }

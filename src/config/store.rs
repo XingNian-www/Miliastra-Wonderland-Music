@@ -576,12 +576,15 @@ impl ConfigStore {
     /// （http/logging/state.playback_state_path），解析相对路径并通过完整校验。
     pub fn load_full(&self) -> Result<AppConfig> {
         let sections = self.read_all_sections()?;
-        let config = AppConfig::from_db_value(
+        let mut config = AppConfig::from_db_value(
             Value::Object(sections),
             &self.bootstrap,
             &self.executable_root,
         )
         .context("从配置数据库组装完整配置失败")?;
+        // 顺序不能反：先丢弃已废弃的面板条目（如 `@点歌`），再校验。
+        // 反过来的话，老配置库里一条早就不生效的死条目会让整个程序启动失败。
+        config.command_access.sanitize_deprecated_overrides();
         config.validate().context("数据库中的配置未通过校验")?;
         Ok(config)
     }
@@ -636,10 +639,14 @@ impl ConfigStore {
         let mut forced_cleared = BTreeSet::new();
         apply_secret_clear_markers(&mut merged, &mut forced_cleared);
         retain_secret_fields(&mut merged, &current_sections, &forced_cleared);
-        let config = match self.build_config(&merged) {
+        let mut config = match self.build_config(&merged) {
             Ok(config) => config,
             Err(error) => return Ok(field_errors_from_message(&error.to_string()).errors),
         };
+        // 与 load_full / LiveConfigs::apply 同一口径：预检阶段也先丢弃已废弃的
+        // 面板条目，否则预检会比实际保存更严——用户什么都没改，点保存却报
+        // 「未知命令ID: @点歌」。
+        config.command_access.sanitize_deprecated_overrides();
         match config.validate() {
             Ok(()) => Ok(Vec::new()),
             Err(error) => Ok(field_errors_from_anyhow(&error).errors),
@@ -670,7 +677,7 @@ impl ConfigStore {
         apply_secret_clear_markers(&mut merged, &mut forced_cleared);
         retain_secret_fields(&mut merged, &current_sections, &forced_cleared);
         // 组装完整配置并校验；失败返回字段级错误，不写库。
-        let config = match self.build_config(&merged) {
+        let mut config = match self.build_config(&merged) {
             Ok(config) => config,
             Err(error) => {
                 return Err(ConfigSaveError::Other(
@@ -678,6 +685,8 @@ impl ConfigStore {
                 ));
             }
         };
+        // 与 load_full 同一口径：落库前也丢弃废弃条目，避免「读得进、存不回」。
+        config.command_access.sanitize_deprecated_overrides();
         if let Err(error) = config.validate() {
             return Err(ConfigSaveError::Other(
                 field_errors_from_anyhow(&error).into(),
@@ -2080,7 +2089,11 @@ mod tests {
         let bootstrap = test_bootstrap(&database_path);
         let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
         // 当前 schema 已有的权限段只有 overrides；新可选字段没有落库。
-        let access = json!({"overrides": {"@点歌": {"enabled": false, "minimum_role": "admin"}}});
+        //
+        // 样例 id 用**真实存在的平台条目**，不要用已废弃的 `@点歌`：这条测试
+        // 要验证的是「可选字段 default_song_source 未落库时能严格 load/save/reopen
+        // 且不触发迁移」，与某个具体命令无关。用废弃 id 会让它顺带依赖 sanitize 行为。
+        let access = json!({"overrides": {"@QQ点歌": {"enabled": false, "minimum_role": "admin"}}});
         store
             .connection
             .execute(
@@ -2093,7 +2106,7 @@ mod tests {
         let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
         let loaded = store.load_full().unwrap();
         assert_eq!(loaded.command_access.default_song_source, None);
-        assert!(!loaded.command_access.overrides["@点歌"].enabled);
+        assert!(!loaded.command_access.overrides["@QQ点歌"].enabled);
         assert_eq!(store.current_revision().unwrap(), 1, "打开旧段不能触发迁移");
         assert_eq!(stored_section(&database_path, "command_access"), access);
         let sections = Map::from_iter([("command_access".into(), access.clone())]);
@@ -2153,6 +2166,50 @@ mod tests {
                 with_source
             );
         }
+        drop(store);
+        cleanup(&root);
+    }
+
+    /// A1 集成回归：老配置库里还留着 `@点歌` override 时，
+    /// `load_full()` 必须**成功**并在内存里把这条死配置丢掉。
+    ///
+    /// 这是「老用户不会因为一条早已不生效的条目启动失败」的真正防线：
+    /// 只测 sanitize 函数本身不够，要覆盖「读库 → 校验」这条真实链路。
+    /// 并且库里的原始值**保持不动**（不回写），回滚旧版本仍能读到。
+    #[test]
+    fn deprecated_song_override_in_an_old_database_loads_and_is_dropped() {
+        let (root, database_path) = temp_database("deprecated-song-override");
+        let bootstrap = test_bootstrap(&database_path);
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let legacy = json!({"overrides": {"@点歌": {"enabled": false, "minimum_role": "admin"}}});
+        store
+            .connection
+            .execute(
+                "UPDATE config_sections SET value_json = ?1 WHERE section = 'command_access'",
+                rusqlite::params![serde_json::to_string(&legacy).unwrap()],
+            )
+            .unwrap();
+        drop(store);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let loaded = store
+            .load_full()
+            .expect("老库里的 @点歌 override 不能让加载失败");
+        assert!(
+            !loaded.command_access.overrides.contains_key("@点歌"),
+            "废弃条目必须在内存里被丢弃"
+        );
+        // 丢弃只发生在内存，库里的原始值不动（回滚旧版本仍读得到）。
+        assert_eq!(stored_section(&database_path, "command_access"), legacy);
+        assert_eq!(store.current_revision().unwrap(), 1, "打开旧段不能触发迁移");
+
+        // 保存预检同口径：同一份老 sections 预检必须通过（否则用户点什么保存都报错）。
+        let sections = Map::from_iter([("command_access".into(), legacy.clone())]);
+        assert!(
+            store.validate_candidate(&sections).unwrap().is_empty(),
+            "预检也必须先 sanitize 再 validate：{:?}",
+            store.validate_candidate(&sections).unwrap()
+        );
         drop(store);
         cleanup(&root);
     }

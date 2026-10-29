@@ -17,18 +17,58 @@ use crate::features::turtle_soup::{
     QuestionSubmitOutcome, TurtleSoupApplicationPort, TurtleSoupCommandOutcome,
 };
 
-/// 歌单与收藏仅对好友及以上开放；好友私聊或大厅身份映射均可授权。
-fn playlist_command_allows_friend(authority: CommandAuthority, role: Option<IdentityRole>) -> bool {
-    authority == CommandAuthority::Friend || role.is_some()
+/// `execute_command` 那条「排队期 permission_required 过期」路径的文案。
+///
+/// **不另写文案表**：把 `IdentityRole` 映射成对应的 `CommandPermission` 档位，
+/// 再复用拦截点的单一来源 [`CommandGate::message`]。
+fn required_message(required: IdentityRole) -> &'static str {
+    use crate::features::command_access::CommandPermission;
+    let permission = match required {
+        IdentityRole::Friend => CommandPermission::Friend,
+        // Admin 与 Owner 面向玩家是同一句「仅限管理员」；Owner 档位更严，
+        // 单独给 CommandPermission::Owner 会让文案随内部档位变化而漂移。
+        IdentityRole::Admin | IdentityRole::Owner => CommandPermission::Admin,
+    };
+    crate::composition::application::listener::CommandGate::BelowMinimum(permission)
+        .message()
+        .expect("BelowMinimum 恒有文案")
 }
 
-/// B站 音源与本地曲库兜底要求好友及以上权限：好友私聊、靠映射获得权限的大厅成员
-/// （好友/管理员/主人），以及控制面板发起的点歌都算。
-fn song_request_allows_bilibili(parsed: &RoutedCommand, command: &SongCommand) -> bool {
-    parsed.authority == CommandAuthority::Friend
-        || parsed.role.is_some()
-        || !command.friend_username.trim().is_empty()
-        || parsed.message_type == "控制台"
+/// 歌单与收藏是否放行。
+///
+/// **唯一判据是 `@歌单` 这条命令的 `minimum_role`**，与其它命令同一套判定
+/// （`catalog_policy` + `actor_permission_with_floor`）。
+///
+/// 旧实现是 `authority == Friend || role.is_some()`：粉色来源无条件放行，
+/// 等于绕开面板上「@歌单 最低权限」的配置，也和「来源只给下界、身份命中即覆盖」
+/// 的定稿口径不一致。现在粉色未登记的人靠**来源下界**拿到 Friend 照样能进，
+/// 大厅里已映射 Friend/Admin/Owner 的人靠**身份覆盖**能进，蓝字普通成员被拒。
+///
+/// 注意用 `role_of_sender` 现场解析，不用 `parsed.role` 快照：队列等待期间
+/// 身份映射可能已经变化，执行期必须读当前值（与 `command_is_disabled` 同口径）。
+fn playlist_command_allows_friend(
+    runtime: &ApplicationRuntime,
+    parsed: &RoutedCommand,
+) -> bool {
+    let snapshot = runtime.lifecycle.live_configs.snapshot();
+    // 现场解析，不用 parsed.role 快照：队列等待期间身份映射可能已经变化。
+    let role = runtime
+        .lifecycle
+        .live_configs
+        .identity
+        .role_of_sender(&parsed.username, parsed.account.as_ref());
+    playlist_policy_allows(&snapshot.command_access, parsed.authority, role)
+}
+
+/// [`playlist_command_allows_friend`] 的纯判定部分，便于脱离运行时单测。
+fn playlist_policy_allows(
+    command_access: &crate::features::command_access::CommandAccessConfig,
+    authority: CommandAuthority,
+    role: Option<IdentityRole>,
+) -> bool {
+    use crate::features::command_access::{actor_permission_with_floor, catalog_policy};
+    let actor = actor_permission_with_floor(role, authority);
+    catalog_policy(command_access, "@歌单").is_some_and(|policy| policy.allows(Some(actor)))
 }
 
 pub(super) struct ImmediateAdministrationPort {
@@ -410,10 +450,14 @@ impl ApplicationRuntime {
                 parsed.role,
                 parsed.raw
             );
-            let message = match required {
-                IdentityRole::Admin | IdentityRole::Owner => "权限不足：该命令仅限管理员使用",
-                IdentityRole::Friend => "权限不足：该命令仅限好友使用",
-            };
+            // 走到这里只有一个原因：**路由期**记下的 permission_required 仍是旧值，
+            // 而拦截期（listener 的 CommandGate）已按当前配置放行——典型场景是
+            // 命令排队期间管理员把该命令的档位调宽了。此时不再重复拦截，
+            // 只把这句过期的记录如实回给玩家（常见来源是 route_as_permission_denied）。
+            //
+            // 文案**不另写一份**：直接复用拦截点的单一来源 `CommandGate::message()`，
+            // 否则同一个原因会有两张表，改一处就会漂移。
+            let message = required_message(required);
             return ApplicationRuntime::reply(self, message);
         }
         match &parsed.command {
@@ -486,7 +530,7 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         command: &crate::features::playlist::PlaylistCommand,
     ) -> Result<()> {
-        if !playlist_command_allows_friend(parsed.authority, parsed.role) {
+        if !playlist_command_allows_friend(self, parsed) {
             log::info!(
                 "命令未执行：个人歌单仅对好友及以上开放（authority={:?} role={:?}）text={}",
                 parsed.authority,
@@ -1100,73 +1144,244 @@ impl HallMaintenancePort for ApplicationRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::composition::application::listener::CommandGate;
     use crate::features::command::CommandAuthority;
+    use crate::features::command_access::{catalog_policy, CommandPermission};
 
+    /// 构造一个走真实 CommandEnvelope::new 的视频信封（与路由测试同形）。
+    fn access_envelope(message_type: &str, command: &str) -> CommandEnvelope {
+        CommandEnvelope::new(
+            format!("玩家甲：{command}"),
+            "玩家甲",
+            message_type,
+            command,
+            crate::features::command::CommandObservation::default(),
+        )
+        .expect("test command envelope")
+    }
+
+    /// 空的自定义流程服务：这两条测试只关心权限策略层，不涉及流程。
+    fn empty_workflows() -> CustomWorkflowService {
+        CustomWorkflowService::new(
+            crate::features::custom_workflow::CustomWorkflowConfig::default(),
+            crate::features::custom_workflow::WorkflowDefaults {
+                default_timeout_ms: 1000,
+                default_poll_ms: 100,
+                default_step_wait_ms: 100,
+                decision_timeout_ms: 1000,
+                decision_poll_ms: 100,
+                after_activate_ms: 100,
+                clipboard_hold_ms: 100,
+                stability_mean_threshold: 1.0,
+                stability_changed_ratio_threshold: 0.1,
+            },
+        )
+    }
+
+    /// 面板关掉命令时，玩家看到的必须是「已禁用」，而不是「仅限好友」。
+    ///
+    /// 回归：旧实现把 `User | Friend` 一起映射成 `IdentityRole::Friend`，
+    /// 面板 `enabled=false` 关掉命令后玩家收到「该命令仅限好友使用」，
+    /// 排查方向直接被带偏到身份映射上。
     #[test]
-    fn playlist_commands_require_friend_or_above() {
-        assert!(!playlist_command_allows_friend(
-            CommandAuthority::HallMember,
-            None
-        ));
-        assert!(playlist_command_allows_friend(
+    fn disabled_command_reports_disabled_not_friend_only() {
+        use crate::features::command::DeniedReason;
+        use crate::features::command_access::{
+            CommandAccessConfig, CommandPermission, CommandPolicy,
+        };
+        let mut access = CommandAccessConfig::default();
+        access.overrides.insert(
+            "@删除".into(),
+            CommandPolicy {
+                enabled: false,
+                // 即使档位是 Friend，关闭也要优先表达为 Disabled。
+                minimum_role: CommandPermission::Friend,
+            },
+        );
+        let identity = crate::features::identity::IdentityAccess::default();
+        let workflows = empty_workflows();
+        let routed =
+            crate::interfaces::chat::ChatCommandRouter::with_access(&workflows, &identity, &access)
+                .route(&access_envelope("pink", "@删除"), None)
+                .expect("@删除 应被路由（拒绝发生在策略层）");
+
+        // 诊断字段仍在（route 期记录），但**它不是玩家可见文案的来源**。
+        assert_eq!(routed.denied_reason, Some(DeniedReason::Disabled));
+        // permission_required 的**既有语义不变**（Friend 仍是一票否决的摘要）。
+        assert_eq!(routed.permission_required, Some(IdentityRole::Friend));
+        // 真正的门在这里：入队前按 policy.enabled 判为 Disabled。
+        // 这是玩家唯一会经过的拦截点——上一版只在 execute_command 出文案，
+        // 而命令根本走不到那里，所以玩家什么都收不到。
+        let policy = catalog_policy(&access, "@删除").expect("@删除 有策略");
+        let gate = CommandGate::from_policy(
+            &policy,
+            CommandPermission::Friend,
             CommandAuthority::Friend,
-            None
-        ));
-        for role in [
-            IdentityRole::Friend,
-            IdentityRole::Admin,
-            IdentityRole::Owner,
+            true,
+            true,
+        );
+        assert_eq!(
+            gate,
+            CommandGate::Disabled,
+            "面板关掉命令时 gate 必须报 Disabled",
+        );
+        assert_eq!(gate.message(), Some("该命令已在面板禁用"));
+    }
+
+    /// 权限不够（命令本身是开着的）时要说出真正需要的档位。
+    #[test]
+    fn below_minimum_reports_the_actual_required_role() {
+        use crate::features::command::DeniedReason;
+        use crate::features::command_access::{
+            CommandAccessConfig, CommandPermission, CommandPolicy,
+        };
+        let mut access = CommandAccessConfig::default();
+        access.overrides.insert(
+            "@暂停".into(),
+            CommandPolicy {
+                enabled: true,
+                minimum_role: CommandPermission::Admin,
+            },
+        );
+        let identity = crate::features::identity::IdentityAccess::default();
+        let workflows = empty_workflows();
+        let routed =
+            crate::interfaces::chat::ChatCommandRouter::with_access(&workflows, &identity, &access)
+                .route(&access_envelope("blue", "@暂停"), None)
+                .expect("@暂停 应被路由");
+
+        assert_eq!(
+            routed.denied_reason,
+            Some(DeniedReason::BelowMinimum(CommandPermission::Admin))
+        );
+        assert_eq!(routed.permission_required, Some(IdentityRole::Admin));
+        // 拦截点的判定：命令开着但档位不够 → BelowMinimum(Admin)。
+        let policy = catalog_policy(&access, "@暂停").expect("@暂停 有策略");
+        let gate = CommandGate::from_policy(
+            &policy,
+            CommandPermission::User,
+            CommandAuthority::HallMember,
+            false,
+            true,
+        );
+        assert_eq!(gate, CommandGate::BelowMinimum(CommandPermission::Admin));
+        assert_eq!(gate.message(), Some("权限不足：该命令仅限管理员使用"));
+    }
+
+    /// `execute_command` 的过期 permission_required 文案，必须与拦截点逐字相同。
+    ///
+    /// 复核要求：窗口两侧（`execute_command` 与 `CommandGate::message`）
+    /// 都各写死 `&'static str` 时，必须有一条测试把它们钉在一起，
+    /// 否则改一处就会漂移，玩家会看到两套说法。
+    ///
+    /// 当前实现已把 `execute_command` 侧收敛到复用 `CommandGate::message()`
+    /// （见 `required_message`），本条测试既验证收敛生效，也把玩家可见的
+    /// 字面量钉死——将来任一侧被改回硬编码，这里就会红。
+    #[test]
+    fn execute_command_reuses_the_gate_message_table() {
+        use crate::features::command_access::CommandPermission;
+        for (role, gate_permission, expected) in [
+            (
+                IdentityRole::Friend,
+                CommandPermission::Friend,
+                "权限不足：该命令仅限好友使用",
+            ),
+            (
+                IdentityRole::Admin,
+                CommandPermission::Admin,
+                "权限不足：该命令仅限管理员使用",
+            ),
+            (
+                IdentityRole::Owner,
+                CommandPermission::Admin,
+                "权限不足：该命令仅限管理员使用",
+            ),
         ] {
-            assert!(playlist_command_allows_friend(
-                CommandAuthority::HallMember,
-                Some(role)
-            ));
+            // ① execute_command 实际用的文案
+            let from_execute = required_message(role);
+            // ② 拦截点 gate 实际用的文案
+            let from_gate = CommandGate::BelowMinimum(gate_permission)
+                .message()
+                .expect("BelowMinimum 恒有文案");
+            // 两者必须逐字相同
+            assert_eq!(
+                from_execute, from_gate,
+                "execute_command 与拦截点文案漂移：{role:?}",
+            );
+            // 且等于玩家应当看到的字面量
+            assert_eq!(
+                from_execute, expected,
+                "玩家可见文案被意外改写：{role:?}",
+            );
         }
     }
 
+    /// 歌单的放行必须走 `@歌单` 的 minimum_role，而不是"粉色来源无条件放行"。
     #[test]
-    fn song_request_bilibili_permission_follows_hall_identity_mapping() {
-        let command = SongCommand {
-            keyword: "降生 纯享版".to_string(),
-            source: crate::features::song_request::SongSource::QqMusic,
-            prefix: "点歌".to_string(),
-            prefer_accompaniment: false,
-            ai_assisted: false,
-            friend_username: String::new(),
+    fn playlist_commands_require_friend_or_above_via_the_catalog_policy() {
+        use crate::features::command_access::{
+            CommandAccessConfig, CommandPermission, CommandPolicy,
         };
-        let mut routed = RoutedCommand::console(
-            "点歌",
-            "点歌 降生 纯享版",
-            ModuleCommand::SongRequest(command.clone()),
-        );
-        // 大厅里未映射的成员：没有 B站 权限。
-        routed.message_type = "blue".to_string();
-        routed.authority = CommandAuthority::HallMember;
-        routed.role = None;
-        assert!(!song_request_allows_bilibili(&routed, &command));
+        let default = CommandAccessConfig::default();
 
-        // 大厅里靠映射获得好友、管理员或主人权限的成员：算好友及以上。
+        // 蓝字普通大厅成员（无映射）：来源下界 User < Friend → 拒绝。
+        assert!(!playlist_policy_allows(
+            &default,
+            CommandAuthority::HallMember,
+            None
+        ));
+        // 粉色好友消息（未映射）：来源下界 Friend → 放行。
+        assert!(playlist_policy_allows(
+            &default,
+            CommandAuthority::Friend,
+            None
+        ));
+        // 大厅里已映射 Friend/Admin/Owner：身份覆盖 → 放行。
         for role in [
             IdentityRole::Friend,
             IdentityRole::Admin,
             IdentityRole::Owner,
         ] {
-            routed.role = Some(role);
             assert!(
-                song_request_allows_bilibili(&routed, &command),
-                "mapped role"
+                playlist_policy_allows(&default, CommandAuthority::HallMember, Some(role)),
+                "mapped role {role:?}"
             );
         }
 
-        // 未映射的好友私聊：命令带 friend_username，同样保留 B站。
-        routed.role = None;
-        routed.authority = CommandAuthority::Friend;
-        assert!(song_request_allows_bilibili(&routed, &command));
+        // 面板把 @歌单 降到 User：蓝字普通成员也能进（证明判据真的是面板配置）。
+        let mut opened = CommandAccessConfig::default();
+        opened.overrides.insert(
+            "@歌单".into(),
+            CommandPolicy {
+                enabled: true,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        assert!(playlist_policy_allows(
+            &opened,
+            CommandAuthority::HallMember,
+            None
+        ));
 
-        // 控制面板发起的点歌：按好友及以上处理。
-        routed.authority = CommandAuthority::HallMember;
-        routed.message_type = "控制台".to_string();
-        assert!(song_request_allows_bilibili(&routed, &command));
+        // 面板把 @歌单 关掉：连粉色好友也进不去（enabled 优先）。
+        let mut closed = CommandAccessConfig::default();
+        closed.overrides.insert(
+            "@歌单".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        assert!(!playlist_policy_allows(
+            &closed,
+            CommandAuthority::Friend,
+            None
+        ));
+        assert!(!playlist_policy_allows(
+            &closed,
+            CommandAuthority::HallMember,
+            Some(IdentityRole::Owner)
+        ));
     }
 
     #[test]
@@ -1214,6 +1429,7 @@ mod tests {
             authority: CommandAuthority::HallMember,
             role: None,
             permission_required: None,
+            denied_reason: None,
             command: ModuleCommand::CardGame(LandlordCommand::Status),
             observation: CommandObservation {
                 captured_at: Some(captured_at),

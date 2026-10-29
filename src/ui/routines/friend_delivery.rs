@@ -2232,8 +2232,7 @@ mod tests {
     /// 夹具图与真实昵称都不进公开仓库，所以期望值只能放在本地声明文件里。
     /// 返回 None 表示没有本地声明，调用方跳过断言而不是报假红。
     fn fixture_expected_friend_names() -> Option<Vec<String>> {
-        let text =
-            std::fs::read_to_string("tests/fixtures/ui/secondary-chat-friends.txt").ok()?;
+        let text = std::fs::read_to_string("tests/fixtures/ui/secondary-chat-friends.txt").ok()?;
         let names = text
             .lines()
             .map(str::trim)
@@ -2271,8 +2270,13 @@ mod tests {
             .map(|_| {
                 // 只取第一行做「唯一命中」目标：多为名字时命中数必然 >1，
                 // 这条用例验证的是同一行稳定定位。
-                matching_text_rows(&handle, &image, region, &[normalize_lock_text(&expected[0])])
-                    .expect("locate exact friend row")
+                matching_text_rows(
+                    &handle,
+                    &image,
+                    region,
+                    &[normalize_lock_text(&expected[0])],
+                )
+                .expect("locate exact friend row")
             })
             .collect::<Vec<_>>();
 

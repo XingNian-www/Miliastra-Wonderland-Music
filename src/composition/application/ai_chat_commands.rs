@@ -385,7 +385,9 @@ impl ApplicationRuntime {
                     Ok(Err(error)) => {
                         log::warn!("AI 回复已发送，长期记忆更新失败: {error:#}")
                     }
-                    Err(_) => log::error!("事实抽取线程 panic，本轮记忆未更新: actor={actor_display}"),
+                    Err(_) => {
+                        log::error!("事实抽取线程 panic，本轮记忆未更新: actor={actor_display}")
+                    }
                 }
             });
         if let Err(error) = spawned {
@@ -516,7 +518,8 @@ impl ApplicationRuntime {
         let mut plans = Vec::new();
         match memory.plan_actor_compression(actor, config.actor_token_budget) {
             Ok(Some(plan)) => {
-                if let Some(slot) = self.claim_maintenance_slot(&format!("compress:{}", plan.scope)) {
+                if let Some(slot) = self.claim_maintenance_slot(&format!("compress:{}", plan.scope))
+                {
                     plans.push((plan, slot));
                 }
             }
@@ -525,7 +528,8 @@ impl ApplicationRuntime {
         }
         match memory.plan_hall_compression(config.hall_token_budget) {
             Ok(Some(plan)) => {
-                if let Some(slot) = self.claim_maintenance_slot(&format!("compress:{}", plan.scope)) {
+                if let Some(slot) = self.claim_maintenance_slot(&format!("compress:{}", plan.scope))
+                {
                     plans.push((plan, slot));
                 }
             }
@@ -563,12 +567,9 @@ impl ApplicationRuntime {
                                 } else {
                                     config.actor_summary_budget
                                 };
-                                if let Err(error) = memory.apply_compression(
-                                    plan,
-                                    &summary,
-                                    summary_budget,
-                                    now_ms,
-                                ) {
+                                if let Err(error) =
+                                    memory.apply_compression(plan, &summary, summary_budget, now_ms)
+                                {
                                     log::warn!(
                                         "记忆压缩结果写入失败 scope={}: {error:#}",
                                         plan.scope
@@ -747,8 +748,10 @@ fn extract_and_commit_facts(
             .enumerate()
             .map(|(index, fact)| format!("{}. {fact}", index + 1))
             .collect::<Vec<_>>()
-            .join("
-")
+            .join(
+                "
+",
+            )
     };
     let prompt = crate::features::ai_chat::fact_extraction_prompt(
         actor_display,

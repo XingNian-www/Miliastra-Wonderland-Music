@@ -1087,8 +1087,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_blue_bilibili_song_command() {
-        assert!(parse_text("用户：@B站点歌 晴天 周杰伦", "blue").is_none());
+    fn accepts_blue_bilibili_song_command_for_permission_check() {
+        // 大厅现在能解析 B站点歌——否则管理员在大厅发它时连命令都匹配不上，
+        // 表现为「管理员触发不了 B站点歌」。能不能执行交给权限档位判定：
+        // 默认 Friend，所以大厅普通成员仍会被拒。
+        let parsed =
+            parse_text("用户：@B站点歌 BV1xx411c7mD", "blue").expect("大厅应能解析 B站点歌");
+        assert_eq!(
+            parsed.command,
+            ModuleCommand::SongRequest(SongCommand {
+                keyword: "BV1xx411c7mD".to_string(),
+                source: SongSource::Bilibili,
+                prefix: "B站点歌".to_string(),
+                prefer_accompaniment: false,
+                ai_assisted: false,
+                friend_username: String::new(),
+            })
+        );
+        assert_eq!(parsed.message_type, "blue");
     }
 
     #[test]

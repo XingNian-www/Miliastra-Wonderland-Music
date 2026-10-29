@@ -868,42 +868,172 @@ mod tests {
         }
     }
 
+    /// 回归：五个点歌命令各自独立，改一个不牵连别人。
+    ///
+    /// 原来 `catalog_policy` 在本命令没有 override 时会**回退到 "@点歌"**，
+    /// 于是 `@点歌` 一份配置同时管着 QQ/网易/酷狗/B站/AI 五个平台，
+    /// 用户在面板上根本没法单独调某一个——这就是「这几个点歌没法独立控制权限」。
+    ///
+    /// 现在每条命令只认自己的 override，没配就用它自己的默认值。
+    /// 回归：好友备注（nickname）可以用于授权，游戏真名（note）不行。
+    ///
+    /// 线上形态：identity 的 `nickname` 存的是**好友备注**（玩家自己写的
+    /// 随机串，如 `abcd1234`），`note` 才是游戏真名。大厅 OCR 读到的是真名。
+    ///
+    /// 曾经为了让"大厅读到真名也能认出管理员"给 resolve_hint 加过 note 兜底，
+    /// 结果 moderation 的防冒充测试立刻变红：**玩家可以把自己昵称改成管理员的
+    /// 显示名来冒充**。MUST_READ §2「未确认发送者不能用于授权」。
+    ///
+    /// 所以正确行为是：备注名能认出、真名认不出（Unknown 不授权）；
+    /// 大厅要可靠识别角色，必须走带 UID 的路径（外部聊天源）。
     #[test]
-    fn legacy_song_policy_falls_back_without_overwriting_platform_override() {
+    fn hall_bilibili_song_permission_requires_a_trusted_name() {
+        use crate::features::identity::{GameAccount, IdentityConfig, IdentityMapping};
+
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            // 好友备注：玩家在游戏里给对方写的那种随机串，玩家自己改不了。
+            nickname: "abcd1234".to_string(),
+            id: uuid::Uuid::new_v4(),
+            role: IdentityRole::Admin,
+            // 游戏真名：屏幕大厅里显示的就是它，但任何人都能把昵称改成一样。
+            note: "管理员甲".to_string(),
+            remark_sourced: true,
+            accounts: vec![GameAccount::new("100000001")],
+        });
+        let identity = IdentityAccess::new(config);
+
+        // 备注名（好友私聊标题）可以认出身份。
+        let by_remark = identity
+            .resolve_hint(crate::features::identity::IdentityHint::Nickname("abcd1234"))
+            .expect("好友备注应能认出身份");
+        assert_eq!(by_remark.role, IdentityRole::Admin);
+
+        // 游戏真名**不**用于授权：否则改个昵称就能冒充管理员。
+        assert!(
+            identity
+                .resolve_hint(crate::features::identity::IdentityHint::Nickname(
+                    "管理员甲"
+                ))
+                .is_none(),
+            "游戏真名不能被当作授权依据"
+        );
+
+        // 带 UID 时可靠识别：外部聊天源给的消息带 account，凭它拿 Admin。
+        let by_uid = identity
+            .resolve_hint(crate::features::identity::IdentityHint::Account {
+                game: "genshin",
+                uid: "100000001",
+                nickname: Some("管理员甲"),
+            })
+            .expect("有 UID 时应能认出身份");
+        assert_eq!(by_uid.role, IdentityRole::Admin);
+    }
+
+    #[test]
+    fn hall_bilibili_song_allows_admin_but_rejects_plain_member() {
+        use crate::features::command_access::CommandAccessConfig;
+        use crate::features::identity::{GameAccount, IdentityConfig, IdentityMapping};
+
+        let access = CommandAccessConfig::default();
+        let mut identity_config = IdentityConfig::default();
+        identity_config.mappings.push(IdentityMapping {
+            nickname: "管理员甲".to_string(),
+            id: uuid::Uuid::new_v4(),
+            role: IdentityRole::Admin,
+            note: "管理员甲".to_string(),
+            remark_sourced: false,
+            accounts: vec![GameAccount::new("100000001")],
+        });
+        let identity = IdentityAccess::new(identity_config);
+        let router = ChatCommandRouter {
+            custom_workflow: None,
+            identity: Some(&identity),
+            access: Some(&access),
+        };
+
+        // 管理员在大厅发：能路由，且 Admin >= Friend → 放行。
+        let admin = CommandEnvelope::new(
+            "管理员甲：@B站点歌BV1xx411c7mD".to_string(),
+            "管理员甲",
+            "blue",
+            "@B站点歌BV1xx411c7mD",
+            CommandObservation::default(),
+        )
+        .expect("admin envelope");
+        let routed = router
+            .route(&admin, None)
+            .expect("管理员在大厅应能路由 B站点歌");
+        assert_eq!(routed.role, Some(IdentityRole::Admin));
+        assert!(
+            routed.permission_required.is_none(),
+            "Admin >= Friend，应放行；实际 {:?}",
+            routed.permission_required
+        );
+
+        // 普通成员在大厅发：能路由，但 User < Friend → 被拒。
+        let plain = CommandEnvelope::new(
+            "路人甲：@B站点歌BV1xx411c7mD".to_string(),
+            "路人甲",
+            "blue",
+            "@B站点歌BV1xx411c7mD",
+            CommandObservation::default(),
+        )
+        .expect("plain envelope");
+        let routed = router
+            .route(&plain, None)
+            .expect("大厅应能路由 B站点歌，权限在之后判定");
+        assert_eq!(routed.role, None);
+        assert!(
+            routed.permission_required.is_some(),
+            "User < Friend，应被拒"
+        );
+    }
+
+    #[test]
+    fn song_platform_policies_are_editable_independently() {
         use crate::features::command_access::*;
         let mut access = CommandAccessConfig::default();
-        access.overrides.insert(
-            "@点歌".into(),
-            CommandPolicy {
-                enabled: false,
-                minimum_role: CommandPermission::Admin,
-            },
-        );
+
+        // 默认值：B站是 Friend（原来"仅好友"的意图保留为默认档位），
+        // 其余平台是 User。
+        for id in ["@QQ点歌", "@网易点歌", "@酷狗点歌", "@AI点歌"] {
+            let policy = catalog_policy(&access, id).unwrap();
+            assert!(policy.enabled, "{id}");
+            assert_eq!(policy.minimum_role, CommandPermission::User, "{id}");
+        }
+        let bilibili = catalog_policy(&access, "@B站点歌").unwrap();
+        assert!(bilibili.enabled);
+        assert_eq!(bilibili.minimum_role, CommandPermission::Friend);
+
+        // 只禁掉酷狗：其它四个平台必须完全不受影响。
         access.overrides.insert(
             "@酷狗点歌".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        access.validate().unwrap();
+        assert!(!catalog_policy(&access, "@酷狗点歌").unwrap().enabled);
+        for id in ["@QQ点歌", "@网易点歌", "@B站点歌", "@AI点歌"] {
+            assert!(
+                catalog_policy(&access, id).unwrap().enabled,
+                "{id} 不该被 @酷狗点歌 的配置牵连",
+            );
+        }
+
+        // 把 B站放宽到 User：用户在面板上自己决定，大厅任何人都能用。
+        access.overrides.insert(
+            "@B站点歌".into(),
             CommandPolicy {
                 enabled: true,
                 minimum_role: CommandPermission::User,
             },
         );
-        access.validate().unwrap();
-        for text in [
-            "@点歌晴天",
-            "@网易云点歌晴天",
-            "@B站点歌BV1xx411c7mD",
-            "@AI点歌晴天",
-        ] {
-            assert!(
-                song_policy_route(&access, "pink", text)
-                    .permission_required
-                    .is_some(),
-                "{text}"
-            );
-        }
-        assert!(
-            song_policy_route(&access, "pink", "@酷狗点歌晴天")
-                .permission_required
-                .is_none()
+        assert_eq!(
+            catalog_policy(&access, "@B站点歌").unwrap().minimum_role,
+            CommandPermission::User,
         );
     }
 
@@ -997,8 +1127,11 @@ mod tests {
                 .unwrap();
             assert!(routed.permission_required.is_none());
         }
+        // `@点歌` 是 `@QQ点歌` 的别名，真实 policy_id 是 "@QQ点歌"。
+        // 原来这里插 "@点歌" 只是想验证"禁用之后被拒"，靠的是 fallback 那条
+        // 已经移除的兼容层；现在直接配它自己的 id。
         access.overrides.insert(
-            "@点歌".into(),
+            "@QQ点歌".into(),
             CommandPolicy {
                 enabled: false,
                 minimum_role: CommandPermission::User,
@@ -1010,6 +1143,14 @@ mod tests {
                 .unwrap()
                 .permission_required
                 .is_some()
+        );
+        // 且不影响其它平台。
+        assert!(
+            ChatCommandRouter::with_access(&service, &identity, &access)
+                .route(&envelope("blue", "@网易点歌晴天"), None)
+                .unwrap()
+                .permission_required
+                .is_none()
         );
     }
 

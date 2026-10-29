@@ -605,8 +605,7 @@ mod tests {
     /// 夹具图与真实昵称都不进公开仓库，所以期望值只能放在本地声明文件里。
     /// 返回 None 表示没有本地声明，调用方跳过断言而不是报假红。
     fn fixture_expected_friend_names() -> Option<Vec<String>> {
-        let text =
-            std::fs::read_to_string("tests/fixtures/ui/secondary-chat-friends.txt").ok()?;
+        let text = std::fs::read_to_string("tests/fixtures/ui/secondary-chat-friends.txt").ok()?;
         let names = text
             .lines()
             .map(str::trim)
@@ -653,7 +652,9 @@ mod tests {
         // 因此图里的真实昵称不能写进源码。期望好友名改为读本地声明文件：
         // 有声明就做真实回归，没有就跳过——公开源码里不出现真实昵称。
         let Some(expected) = fixture_expected_friend_names() else {
-            eprintln!("跳过好友列表断言：缺少本地夹具声明 tests/fixtures/ui/secondary-chat-friends.txt");
+            eprintln!(
+                "跳过好友列表断言：缺少本地夹具声明 tests/fixtures/ui/secondary-chat-friends.txt"
+            );
             return;
         };
         for name in &expected {

@@ -86,24 +86,22 @@ pub(crate) fn minimum_floor(id: &str) -> CommandPermission {
     }
 }
 
-/// 点歌类命令的权限下限。
+/// 点歌类命令的默认权限下限。
 ///
-/// 不能一律给 User：`@B站点歌` 在命令目录里声明 `authorities: &[Friend]`，
-/// 文案也写着「好友 B站音源点歌」。之前这里短路成 User，声明与实际判据矛盾，
-/// 大厅普通成员可以直接用它点 B 站音源。
+/// **不再从 `authorities` 推断。** 渠道（HallMember/Friend）现在只回答
+/// 「这条命令在哪些界面能被识别」，不代表「仅好友可用」——原来靠它推断，
+/// 于是 `@B站点歌` 在大厅连匹配都匹配不上，管理员也触发不了。
 ///
-/// 以命令目录的声明为准：只有 Friend 才抬高下限，BOTH 保持 User。
+/// 权限的唯一判据是 `minimum_role` 的 `>=` 比较：设成 Friend，则
+/// Friend/Admin/Owner 都能用，大厅与私聊都行；设成 User 就是所有人都能用。
+/// 用户可以在面板逐条改，这才是「独立控制」。
+///
+/// B站音源默认仍是 Friend（它在好友私聊里最可靠），但只作为**默认值**，
+/// 不再是一道绕不过去的渠道墙。
 fn song_minimum_role(id: &str) -> CommandPermission {
-    let restricted_to_friend = super::song_request::command_specs()
-        .iter()
-        .find(|spec| super::song_request::permission_id_for_command_name(spec.name) == Some(id))
-        .is_some_and(|spec| {
-            spec.authorities == &[crate::features::command::CommandAuthority::Friend]
-        });
-    if restricted_to_friend {
-        CommandPermission::Friend
-    } else {
-        CommandPermission::User
+    match id {
+        "@B站点歌" => CommandPermission::Friend,
+        _ => CommandPermission::User,
     }
 }
 fn default_policy(id: &str) -> Option<CommandPolicy> {
@@ -164,20 +162,11 @@ fn default_policy(id: &str) -> Option<CommandPolicy> {
 }
 pub(crate) fn catalog_policy(config: &CommandAccessConfig, id: &str) -> Option<CommandPolicy> {
     let default = default_policy(id)?;
-    let mut policy = config
-        .overrides
-        .get(id)
-        .cloned()
-        .or_else(|| {
-            super::song_request::command_specs()
-                .iter()
-                .any(|spec| {
-                    super::song_request::permission_id_for_command_name(spec.name) == Some(id)
-                })
-                .then(|| config.overrides.get("@点歌").cloned())
-                .flatten()
-        })
-        .unwrap_or(default);
+    // **不能回退到 "@点歌"**：那会让五个点歌命令共用同一份配置，
+    // 用户在面板改了 "@QQ点歌" 的权限，其他平台跟着一起变，
+    // 表现为「这几个点歌没法独立控制」。每条命令各用各的 override，
+    // 没配就用它自己的默认值。
+    let mut policy = config.overrides.get(id).cloned().unwrap_or(default);
     policy.minimum_role = policy.minimum_role.max(minimum_floor(id));
     Some(policy)
 }

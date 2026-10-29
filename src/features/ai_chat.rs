@@ -2311,7 +2311,9 @@ mod tests {
         );
 
         // 空摘要不能覆盖已有内容。
-        memory.apply_compression(&plan, "旧摘要内容", 2_000, 1).unwrap();
+        memory
+            .apply_compression(&plan, "旧摘要内容", 2_000, 1)
+            .unwrap();
         memory.apply_compression(&plan, "   ", 2_000, 2).unwrap();
         let context = memory.context("甲", 1_000).unwrap();
         assert_eq!(context.summary.as_deref(), Some("旧摘要内容"));
@@ -2366,7 +2368,9 @@ mod tests {
     #[test]
     fn facts_have_their_own_cap_and_do_not_evict_recent_turns() {
         let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
-        memory.record_turn("甲", "最近一轮问题", "最近一轮回答", 10_000, 1).unwrap();
+        memory
+            .record_turn("甲", "最近一轮问题", "最近一轮回答", 10_000, 1)
+            .unwrap();
         for index in 0..(MAX_FACTS_PER_ACTOR + 5) {
             memory
                 .add_fact("甲", &format!("事实{index}"), index as i64)
@@ -2424,7 +2428,9 @@ mod tests {
             .unwrap()
             .expect("应有压缩计划");
         let long_summary = "很长的摘要句子。".repeat(80);
-        memory.apply_compression(&plan, &long_summary, 40, 2).unwrap();
+        memory
+            .apply_compression(&plan, &long_summary, 40, 2)
+            .unwrap();
         let stored = memory.context("甲", 10_000).unwrap().summary.unwrap();
         assert!(
             estimate_tokens(&stored) <= 40,

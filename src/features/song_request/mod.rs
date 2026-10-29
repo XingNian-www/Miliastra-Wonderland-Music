@@ -311,7 +311,16 @@ mod tests {
                 .source,
             SongSource::QqMusic
         );
-        assert!(parse_hall_syntax(&format!("B站点歌{bv}")).is_none());
+        // 大厅也能识别 B站点歌：渠道只决定"在哪些界面能被识别"，
+        // 不再代表"仅好友可用"。真正的门是权限档位（>= minimum_role），
+        // 管理员在大厅发 @B站点歌 因此能得到权限判定的机会，而不是连解析都失败。
+        assert_eq!(
+            parse_hall_syntax(&format!("B站点歌{bv}"))
+                .unwrap()
+                .command
+                .source,
+            SongSource::Bilibili
+        );
         assert_eq!(
             parse_friend_command("AI点歌晴天", "friend").unwrap().source,
             SongSource::All

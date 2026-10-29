@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::StoredReply;
+use crate::features::song_request::SongSource;
 
 /// 每个命令可保存的回复条数上限。
 ///
@@ -291,6 +292,37 @@ fn reply_variables_valid(text: &str) -> bool {
     validate_reply_variables(text).is_ok()
 }
 
+/// 「@点歌 默认平台」下拉的可选项：**排除 B站**。
+///
+/// `@点歌` 的 source 在权限判定**之前**就被 `apply_default_song_source` 改写成
+/// 面板默认平台，而平台权限仍按改写后的 source 查各平台命令——B站是
+/// `@B站点歌`（默认 Friend）。一旦默认平台设为 B站，普通大厅成员发 `@点歌`
+/// 就会被好友门槛拒绝，可面板上**没有 `@点歌` 这一行**可改，用户完全看不出原因。
+///
+/// 因此默认平台只提供 QQ / 网易 / 酷狗；`@B站点歌` 作为独立命令照旧保留
+/// （权限面板里仍有它那一行，可按需调整门槛），只是不能当 `@点歌` 的默认平台。
+fn default_song_platform_options() -> Vec<(&'static str, &'static str)> {
+    crate::features::song_request::platform_sources()
+        .filter(|(source, _)| *source != SongSource::Bilibili)
+        .map(|(source, label)| (source.as_str(), label))
+        .collect()
+}
+
+/// 当前默认平台 + 「它是否还在下拉里」。
+///
+/// 历史配置可能存着已经从下拉移除的平台（当前只有 B站）。这里**不改写**存着的值：
+/// 运行期 `apply_default_song_source` 仍按它改写 `@点歌`，面板若谎报成 QQ，
+/// 用户会看到「面板写 QQ、实际按 B站 判定」。所以如实返回原值 + 不可选标记，
+/// 由面板渲染成置灰项并提示改选。
+fn default_song_source_state(
+    stored: Option<&str>,
+    options: &[(&'static str, &'static str)],
+) -> (String, bool) {
+    let current = stored.unwrap_or("qqmusic").to_string();
+    let selectable = options.iter().any(|(value, _)| *value == current);
+    (current, selectable)
+}
+
 pub(super) fn commands_catalog_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
@@ -304,16 +336,21 @@ pub(super) fn commands_catalog_route(
     let mut view = serde_json::to_value(crate::features::command_catalog::catalog_view(enabled))
         .map_err(internal_error)?;
     view["revision"] = json!(store.current_revision().map_err(internal_error)?);
-    view["defaultSongSource"] = json!(
-        config
-            .command_access
-            .default_song_source
-            .as_deref()
-            .unwrap_or("qqmusic")
+    let options = default_song_platform_options();
+    let (stored_source, stored_selectable) = default_song_source_state(
+        config.command_access.default_song_source.as_deref(),
+        &options,
     );
+    view["defaultSongSource"] = json!(stored_source);
+    // 历史配置可能已经把默认平台存成不再提供的平台（当前只有 B站，见
+    // `default_song_platform_options`）。如实告诉面板「这个值现在不能选」，
+    // 让用户看得见并改选，而不是把下拉静默显示成第一项（QQ）造成
+    // 「面板写着 QQ、实际按 B站 判定」的错觉。
+    view["defaultSongSourceSelectable"] = json!(stored_selectable);
     view["songPlatforms"] = json!(
-        crate::features::song_request::platform_sources()
-            .map(|(source, label)| json!({"value":source.as_str(),"label":label}))
+        options
+            .iter()
+            .map(|(value, label)| json!({"value":value,"label":label}))
             .collect::<Vec<_>>()
     );
     let defaults = CommandAccessConfig::default();
@@ -600,6 +637,56 @@ mod tests {
     }
 
     use super::*;
+
+    /// 默认平台下拉**必须**排除 B站：`@点歌` 的 source 在权限判定前就被改写，
+    /// 而 B站 对应 `@B站点歌`（默认 Friend），面板上却没有 `@点歌` 这一行可调。
+    /// 一旦 B站 能当默认平台，普通大厅成员发 `@点歌` 就会被好友门槛静默拒绝。
+    #[test]
+    fn default_song_platform_options_exclude_bilibili_but_keep_other_platforms() {
+        let options = default_song_platform_options();
+        let values: Vec<&str> = options.iter().map(|(value, _)| *value).collect();
+        assert_eq!(values, ["qqmusic", "netease", "kugou"]);
+        assert!(
+            !values.contains(&"bilibili"),
+            "B站 是独立命令 @B站点歌，不能作为 @点歌 的默认平台：{values:?}"
+        );
+        // 三个平台仍要能通过 SongSource 往返，否则保存时会被 validate 拒掉。
+        for value in &values {
+            assert!(
+                SongSource::from_str(value).is_some(),
+                "默认平台 {value} 必须是合法 SongSource"
+            );
+        }
+        // 全量平台仍在，@B站点歌 的权限行不能因为过滤而消失。
+        assert_eq!(
+            crate::features::song_request::platform_sources().count(),
+            4,
+            "过滤只作用于默认平台下拉，不影响五平台权限目录"
+        );
+    }
+
+    /// 历史配置存着 bilibili 时必须**如实**告诉面板「不可选」，不能悄悄显示成 QQ。
+    #[test]
+    fn stored_default_song_source_reports_unselectable_platform_verbatim() {
+        let options = default_song_platform_options();
+        // 未配置 → 按运行期默认 qqmusic 展示，且可选。
+        assert_eq!(
+            default_song_source_state(None, &options),
+            ("qqmusic".to_string(), true)
+        );
+        for source in ["qqmusic", "netease", "kugou"] {
+            assert_eq!(
+                default_song_source_state(Some(source), &options),
+                (source.to_string(), true),
+                "{source} 仍应可选"
+            );
+        }
+        // 老配置存了 bilibili：值原样保留（运行期仍按它改写 @点歌），但标记不可选。
+        assert_eq!(
+            default_song_source_state(Some("bilibili"), &options),
+            ("bilibili".to_string(), false)
+        );
+    }
 
     /// 排查：哪些写法会被判成「未知变量占位符」。
     #[test]

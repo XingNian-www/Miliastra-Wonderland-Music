@@ -116,6 +116,96 @@ fn game_location_probe_blocks_residency(observation: Option<&UiStateObservation>
             || state.classification().label() == "unknown:game_probe")
 }
 
+/// 命令在**拦截点**被挡下的具体原因。
+///
+/// 拦截点在入队/派发之前（[\`ApplicationRuntime::command_gate\`]），
+/// 命令走不到 \`execute_command\`，所以文案必须在这里出；
+/// 只有把原因结构化，才能对玩家说清「是面板关了」还是「你权限不够」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CommandGate {
+    /// 放行。
+    Allowed,
+    /// 面板把这条命令关掉了。
+    Disabled,
+    /// 命令开着，但发送者档位低于 \`minimum_role\`。
+    BelowMinimum(crate::features::command_access::CommandPermission),
+    /// 全局命令开关（\`@禁用\`）关着，且发送者是未登记的大厅成员。
+    GlobalOff,
+}
+
+impl CommandGate {
+    /// 这次拦截是否需要给玩家一句提示。
+    const fn is_blocked(self) -> bool {
+        !matches!(self, Self::Allowed)
+    }
+
+    /// 纯判定：给定策略、发送者档位与全局开关，得出拦截原因。
+    ///
+    /// 抽成纯函数是为了能脱离 \`ApplicationRuntime\` 单测——上一版把文案写在
+    /// \`execute_command\` 里，纯函数测得通、玩家却永远收不到，正是漏掉这一层。
+    pub(super) fn from_policy(
+        policy: &crate::features::command_access::CommandPolicy,
+        actor: crate::features::command_access::CommandPermission,
+        authority: CommandAuthority,
+        sender_is_mapped: bool,
+        commands_enabled: bool,
+    ) -> Self {
+        if !policy.allows(Some(actor)) {
+            return if policy.enabled {
+                Self::BelowMinimum(policy.minimum_role)
+            } else {
+                Self::Disabled
+            };
+        }
+        // 全局开关（@禁用）只挡「未登记的大厅成员」；好友与已映射角色不受影响。
+        if !commands_enabled && authority == CommandAuthority::HallMember && !sender_is_mapped {
+            return Self::GlobalOff;
+        }
+        Self::Allowed
+    }
+
+    /// 面向玩家的文案；\`None\` 表示不放行但也不提示（目前没有这种情形）。
+    ///
+    /// 与旧 \`execute_command\` 的三档文案保持一致，避免同一个原因两处说得不一样。
+    pub(super) const fn message(self) -> Option<&'static str> {
+        use crate::features::command_access::CommandPermission;
+        match self {
+            Self::Allowed => None,
+            // 命令本身是关的：不要去谈权限档位，那会把排查方向带偏。
+            Self::Disabled => Some("该命令已在面板禁用"),
+            // minimum_role=User 却仍被拒：说明不是档位问题（User 已是最低档），
+            // 而是更外层把命令整体关了。
+            Self::BelowMinimum(CommandPermission::User) => {
+                Some("该命令当前对所有大厅成员关闭")
+            }
+            Self::BelowMinimum(CommandPermission::Friend) => Some("权限不足：该命令仅限好友使用"),
+            Self::BelowMinimum(CommandPermission::Admin | CommandPermission::Owner) => {
+                Some("权限不足：该命令仅限管理员使用")
+            }
+            // 沿用旧说法：这条只针对全局开关，不是单条命令的权限。
+            Self::GlobalOff => Some("命令识别已禁用"),
+        }
+    }
+}
+
+/// 拦截后应当回给玩家的提示；\`None\` 表示不回复。
+///
+/// 单独成函数，是为了让「什么时候该回、回什么」能被直接断言：
+/// - 只有**看起来像命令**的文本才回，闲聊不打扰（防刷屏第一道）；
+/// - 放行时当然不回。
+///
+/// 传入的必须是**带前缀**的命令文本（`RoutedCommand::user_command`）。
+/// `RoutedCommand::raw` 已剥掉 @/#，喂进 `looks_like_command` 只会得到 false。
+fn gate_notice(gate: CommandGate, command_text: &str) -> Option<&'static str> {
+    if !gate.is_blocked() {
+        return None;
+    }
+    if !crate::interfaces::chat::looks_like_command(command_text) {
+        return None;
+    }
+    gate.message()
+}
+
 fn chat_listener_mode_dispatch(parsed: &RoutedCommand) -> Option<ChatListenerModeCommand> {
     if parsed.permission_required.is_some() {
         return None;
@@ -2407,15 +2497,18 @@ impl ApplicationRuntime {
             .store(true, AtomicOrdering::SeqCst);
 
         for routed in parsed {
-            if self.command_is_disabled(&routed)? {
+            let gate = self.command_gate(&routed)?;
+            if gate.is_blocked() {
                 // 文案必须反映真实原因：这里既可能是全局命令开关关闭，
                 // 也可能是该命令的最低角色/单条启用策略拒绝。写成「识别已禁用」
                 // 会把人引去查全局开关，而实际原因是权限。
                 log::info!(
-                    "命令未执行：权限或启用策略拒绝（全局开关或该命令的最低角色） text={}",
+                    "命令未执行：权限或启用策略拒绝（{gate:?}） text={}",
                     routed.raw
                 );
-                // 被禁用不是“执行成功”，只确认不写锁。
+                // 命令在这里就被丢掉，走不到 execute_command，所以提示只能在这里出。
+                self.notify_gate_denied(&routed, gate)?;
+                // 被禁用不是"执行成功"，只确认不写锁。
                 acknowledge_primary_command(&self.ui.chat_timeline, &routed, false)?;
                 continue;
             }
@@ -2560,10 +2653,26 @@ impl ApplicationRuntime {
     ///
     /// AI 转述的命令也必须过这一关，否则管理员关掉命令后，
     /// 真人 `@点歌` 不执行、AI 转述的同一条却照跑。
+    ///
+    /// 返回 `bool` 只回答「挡不挡」，调用方无法据此给出正确文案。
+    /// 需要文案的拦截点请用 [`Self::command_gate`]。
     pub(super) fn command_is_disabled(&self, command: &RoutedCommand) -> Result<bool> {
+        Ok(!matches!(
+            self.command_gate(command)?,
+            CommandGate::Allowed
+        ))
+    }
+
+    /// [`Self::command_is_disabled`] 的结构化版本：**为什么**被挡。
+    ///
+    /// 这里才是命令真正被丢弃的地方（入队/派发之前）。旧实现只返回 bool，
+    /// 于是「面板关掉了命令」和「档位不够」在拦截点无法区分——玩家什么提示
+    /// 都收不到（命令在进 `execute_command` 之前就被丢掉），而曾写在
+    /// `execute_command` 里的文案分支因此**永远不可达**。
+    pub(super) fn command_gate(&self, command: &RoutedCommand) -> Result<CommandGate> {
         // 控制台来源仅由已鉴权HTTP/内部任务构造，游戏颜色解析不能创建此来源。
         if command.message_type == "控制台" {
-            return Ok(false);
+            return Ok(CommandGate::Allowed);
         }
         let snapshot = self.lifecycle.live_configs.snapshot();
         let (_, policy) = crate::features::command_access::resolve_with_active(
@@ -2582,10 +2691,32 @@ impl ApplicationRuntime {
         // （粉色好友消息 / 大厅好友标记 → Friend，蓝色大厅 → User）。
         let actor =
             crate::features::command_access::actor_permission_with_floor(role, command.authority);
-        Ok(!policy.allows(Some(actor))
-            || (!self.commands_enabled()?
-                && command.authority == CommandAuthority::HallMember
-                && role.is_none()))
+        Ok(CommandGate::from_policy(
+            &policy,
+            actor,
+            command.authority,
+            role.is_some(),
+            self.commands_enabled()?,
+        ))
+    }
+
+    /// 命令在拦截点被挡下时，给玩家一句**说明原因**的提示。
+    ///
+    /// 纪律：
+    /// - 只对像命令的消息回（\`looks_like_command\`），闲聊不回复，避免刷屏；
+    /// - 文案按 [\`CommandGate\`] 结构化产出，不靠字符串猜原因；
+    /// - 回复失败不能影响「命令已被丢弃」这个事实，因此只记日志不上抛。
+    fn notify_gate_denied(&self, routed: &RoutedCommand, gate: CommandGate) -> Result<()> {
+        // 用 user_command（带 @/# 前缀）而不是 raw：raw 已经剥掉前缀
+        // （例如 @删除 的 raw 是「删除」），拿它喂 looks_like_command 会恒为 false，
+        // 于是提示永远发不出去——正是「代码正确但玩家看不到」的复发。
+        let Some(message) = gate_notice(gate, &routed.user_command) else {
+            return Ok(());
+        };
+        if let Err(error) = self.reply(message) {
+            log::warn!("提示命令被拒原因失败（{gate:?}）: {error:#}");
+        }
+        Ok(())
     }
 
     fn enqueue_chat_listener_command(&self, parsed: &RoutedCommand) -> Result<bool> {
@@ -2746,12 +2877,12 @@ impl ApplicationRuntime {
         if self.enqueue_chat_listener_command(&parsed)? {
             return Ok(true);
         }
-        if self.command_is_disabled(&parsed)? {
-            // 同上一级：区分「全局开关」与「该命令权限不够」，否则会误导排查方向。
-            log::info!(
-                "命令未执行：二级命令被权限或启用策略拒绝 text={}",
-                parsed.raw
-            );
+        let gate = self.command_gate(&parsed)?;
+        if gate.is_blocked() {
+            // 同上一级：区分「全局开关」「面板关闭」与「该命令权限不够」，
+            // 否则会误导排查方向；文案也只能在这里出（命令不会进 execute_command）。
+            log::info!("命令未执行：二级命令被权限或启用策略拒绝（{gate:?}） text={}", parsed.raw);
+            self.notify_gate_denied(&parsed, gate)?;
             return Ok(false);
         }
         if let ModuleCommand::Invite(invite) = &parsed.command
@@ -3151,7 +3282,7 @@ mod tests {
 
     use super::{
         CHAT_LISTENER_UNRESOLVED_UI_GRACE, CONFIG_RELOAD_UI_FALLBACK_GRACE, ChatListenerMode,
-        ListenerReadyEvidence, hall_consumes_scope, listener_mode_matches_ui,
+        CommandGate, ListenerReadyEvidence, gate_notice, hall_consumes_scope, listener_mode_matches_ui,
         listener_ready_after_recheck, load_persisted_chat_listener_mode, lock_anchor_for,
         persist_chat_listener_mode, primary_rescan_can_publish, replacement_ready_allowed,
         replacement_startup_fallback_due, replacement_startup_retry_due, scan_frame_is_fresh,
@@ -3163,6 +3294,110 @@ mod tests {
         PrimaryObservedMessage, RecognizedChatMessage, SourceId, VisualSessionId,
     };
     use std::time::{Duration, Instant};
+
+    /// 端到端：面板关掉命令 → 玩家**真的收到**一句提示。
+    ///
+    /// 这条覆盖的是 C-CMD-077 要求的**拦截 → 回复**全链路，不是纯函数返回值：
+    /// 1. 用真实 `ChatCommandRouter` 路由（与生产同一条路径）；
+    /// 2. 用拦截点真正调用的 `CommandGate::from_policy` 判定；
+    /// 3. 用拦截点真正调用的 `gate_notice` 决定回什么；
+    /// 4. 断言玩家收到的文本。
+    ///
+    /// 上一版只在 `execute_command` 出文案，而命令在入队前就被丢掉，
+    /// 纯函数测得通、玩家永远收不到——正是这条测试要钉住的差别。
+    #[test]
+    fn disabled_command_end_to_end_delivers_a_notice_to_the_player() {
+        use crate::features::command_access::{
+            CommandAccessConfig, CommandPermission, CommandPolicy, actor_permission_with_floor,
+            catalog_policy,
+        };
+
+        let mut access = CommandAccessConfig::default();
+        access.overrides.insert(
+            "@删除".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::Friend,
+            },
+        );
+        let identity = IdentityAccess::default();
+        let workflows = CustomWorkflowService::new(CustomWorkflowConfig::default(), WorkflowDefaults {
+            default_timeout_ms: 1000,
+            default_poll_ms: 100,
+            default_step_wait_ms: 100,
+            decision_timeout_ms: 1000,
+            decision_poll_ms: 100,
+            after_activate_ms: 100,
+            clipboard_hold_ms: 100,
+            stability_mean_threshold: 1.0,
+            stability_changed_ratio_threshold: 0.1,
+        });
+        let envelope = CommandEnvelope::new(
+            "玩家甲：@删除",
+            "玩家甲",
+            "pink",
+            "@删除",
+            CommandObservation::default(),
+        )
+        .expect("envelope");
+        let routed = ChatCommandRouter::with_access(&workflows, &identity, &access)
+            .route(&envelope, None)
+            .expect("@删除 应被路由");
+
+        // 拦截点用的正是这两个调用（listener::command_gate）。
+        let policy = catalog_policy(&access, "@删除").expect("@删除 有策略");
+        let actor = actor_permission_with_floor(routed.role, routed.authority);
+        let gate = CommandGate::from_policy(
+            &policy,
+            actor,
+            routed.authority,
+            routed.role.is_some(),
+            true,
+        );
+        assert_eq!(gate, CommandGate::Disabled);
+
+        // 玩家实际收到的那句话。
+        // raw 已剥掉 @ 前缀，必须用 user_command；这条断言同时钉住该差异。
+        assert_eq!(routed.raw, "删除", "raw 不含前缀，不能拿来判命令");
+        assert_eq!(routed.user_command, "@删除");
+        assert_eq!(
+            gate_notice(gate, &routed.raw),
+            None,
+            "用 raw 会恒静默——这正是要把 user_command 传进去的原因",
+        );
+        assert_eq!(
+            gate_notice(gate, &routed.user_command),
+            Some("该命令已在面板禁用"),
+            "面板关掉的命令必须明确告诉玩家『已禁用』，而不是静默或说成权限问题",
+        );
+    }
+
+    /// 端到端第二半：闲聊被拦时**不回复**（防刷屏）。
+    #[test]
+    fn chit_chat_blocked_by_the_gate_does_not_trigger_a_notice() {
+        use crate::features::command_access::CommandPermission;
+
+        let gate = CommandGate::BelowMinimum(CommandPermission::Friend);
+        // 闲聊文本（不像命令）→ 不打扰。
+        for chit_chat in ["今天天气不错", "哈哈哈", "1"] {
+            assert_eq!(
+                gate_notice(gate, chit_chat),
+                None,
+                "闲聊不该收到权限提示：{chit_chat}",
+            );
+        }
+        // 命令样式文本 → 要提示。
+        assert_eq!(
+            gate_notice(gate, "@删除"),
+            Some("权限不足：该命令仅限好友使用")
+        );
+        // 放行时当然不提示。
+        assert_eq!(
+            gate_notice(CommandGate::Allowed, "@删除"),
+            None,
+            "放行不能回提示",
+        );
+    }
 
     fn listener_snapshot(
         mode: ChatListenerMode,
@@ -3732,6 +3967,7 @@ mod tests {
             authority: CommandAuthority::HallMember,
             role: None,
             permission_required: None,
+            denied_reason: None,
             command: ModuleCommand::Playback(PlaybackCommand::Status),
             observation: CommandObservation {
                 frame_id: None,

@@ -362,6 +362,24 @@ impl ModuleCommand {
     }
 }
 
+/// 路由期拒绝这条命令的**具体原因**。
+///
+/// 与 `permission_required` 并存而不是替代它：
+/// - `permission_required` 是既有的「需要什么角色」摘要，moderation.rs、listener.rs
+///   等 6 处拿它做一票否决，语义不能动；
+/// - `denied_reason` 只用于**对外文案**，把「面板上关掉了」和「权限不够」分开。
+///
+/// 旧实现把 `User | Friend` 一起映射成 `IdentityRole::Friend`，于是面板
+/// `enabled=false` 关掉命令时，玩家看到的是「该命令仅限好友使用」——指向了
+/// 完全错误的排查方向。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeniedReason {
+    /// 面板把这条命令关掉了（`policy.enabled == false`）。
+    Disabled,
+    /// 命令开着，但发送者档位低于 `minimum_role`。
+    BelowMinimum(super::command_access::CommandPermission),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RoutedCommand {
     pub(crate) matched: String,
@@ -378,6 +396,8 @@ pub(crate) struct RoutedCommand {
     pub(crate) authority: CommandAuthority,
     pub(crate) role: Option<IdentityRole>,
     pub(crate) permission_required: Option<IdentityRole>,
+    /// 拒绝的**具体原因**；仅用于对外文案，授权判定不看它。
+    pub(crate) denied_reason: Option<DeniedReason>,
     pub(crate) command: ModuleCommand,
     pub(crate) observation: CommandObservation,
 }
@@ -398,6 +418,7 @@ impl RoutedCommand {
             authority: envelope.authority,
             role: None,
             permission_required: None,
+            denied_reason: None,
             command: matched.command,
             observation: envelope.observation().clone(),
         }
@@ -420,6 +441,7 @@ impl RoutedCommand {
             authority: CommandAuthority::HallMember,
             role: None,
             permission_required: None,
+            denied_reason: None,
             command,
             observation: CommandObservation {
                 captured_at: Some(Instant::now()),

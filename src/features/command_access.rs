@@ -46,6 +46,40 @@ pub(crate) fn actor_permission(role: Option<IdentityRole>) -> Option<CommandPerm
         Some(IdentityRole::Owner) => CommandPermission::Owner,
     })
 }
+
+/// 消息来源能给出的**最低权限**。
+///
+/// 用户原话：大厅里好友发言带显式粉色标记、二级聊天里好友发言进左侧列表（小红点），
+/// 这两个信号「用于最低权限推断」——即便身份没登记，也至少是好友。
+/// 蓝色大厅（普通成员发言）只给 User。
+pub(crate) fn authority_floor(authority: CommandAuthority) -> CommandPermission {
+    match authority {
+        CommandAuthority::Friend => CommandPermission::Friend,
+        CommandAuthority::HallMember => CommandPermission::User,
+    }
+}
+
+/// 判定用的权限档位：**身份命中时覆盖，未命中时退回来源的最低推断。**
+///
+/// 用户原话：「nickname 是用来推断权限的，如果读取到 nickname 就默认用这个的权限
+/// （是覆盖而不是最低）」。
+///
+/// - 身份命中（UID 或 nickname 解析出 role）→ **直接采用**该 role 的档位，
+///   不与来源下界取 min/max，也不"至少好友"地兜底——精确身份优先。
+/// - 身份未命中 → 用来源下界：粉色好友消息 / 大厅好友标记 → Friend；蓝色大厅 → User。
+///
+/// 这样"大厅里未登记的好友"仍能用好友级命令（粉色标记兜底），
+/// 而"登记成 Admin 的人"在大厅不会因为来源是 HallMember 被降级。
+pub(crate) fn actor_permission_with_floor(
+    role: Option<IdentityRole>,
+    authority: CommandAuthority,
+) -> CommandPermission {
+    match role {
+        // Some 分支里 actor_permission 恒返回 Some，兜底只为消除 Option。
+        Some(_) => actor_permission(role).unwrap_or(CommandPermission::User),
+        None => authority_floor(authority),
+    }
+}
 fn prefix(p: CommandPrefix) -> char {
     match p {
         CommandPrefix::At => '@',
@@ -290,6 +324,59 @@ pub(crate) fn resolve_with_active(
 
 #[cfg(test)]
 mod tests {
+
+    /// 用户规则：**身份命中就覆盖来源下界，未命中才用下界。**
+    ///
+    /// 原话：「nickname 是用来推断权限的，如果读取到 nickname 就默认用这个的
+    /// 权限（是覆盖而不是最低）」。
+    ///
+    /// 覆盖的含义：Admin 在大厅（来源下界 User）仍是 Admin，不会被来源降级；
+    /// Friend 在好友来源（下界 Friend）也不会被抬高成别的。
+    #[test]
+    fn named_identity_overrides_the_source_floor() {
+        use crate::features::command::CommandAuthority;
+        use crate::features::identity::IdentityRole;
+
+        assert_eq!(
+            actor_permission_with_floor(Some(IdentityRole::Admin), CommandAuthority::HallMember),
+            CommandPermission::Admin,
+            "Admin 在大厅不能被来源降级",
+        );
+        assert_eq!(
+            actor_permission_with_floor(Some(IdentityRole::Owner), CommandAuthority::HallMember),
+            CommandPermission::Owner,
+        );
+        assert_eq!(
+            actor_permission_with_floor(Some(IdentityRole::Friend), CommandAuthority::Friend),
+            CommandPermission::Friend,
+        );
+        // 身份是 Friend、来源是蓝色大厅：仍按身份算 Friend，不看来源下界。
+        assert_eq!(
+            actor_permission_with_floor(Some(IdentityRole::Friend), CommandAuthority::HallMember),
+            CommandPermission::Friend,
+        );
+    }
+
+    /// 未登记时退回**来源下界**：粉色好友消息/大厅好友标记 → Friend，蓝色大厅 → User。
+    ///
+    /// 这就是用户说的「大厅里好友发言有粉色标记、二级聊天里好友发言进左侧列表，
+    /// 用于最低权限推断」——没登记也至少是好友。
+    #[test]
+    fn unnamed_sender_falls_back_to_the_source_floor() {
+        use crate::features::command::CommandAuthority;
+
+        assert_eq!(
+            actor_permission_with_floor(None, CommandAuthority::Friend),
+            CommandPermission::Friend,
+            "粉色好友消息：未登记也至少是好友",
+        );
+        assert_eq!(
+            actor_permission_with_floor(None, CommandAuthority::HallMember),
+            CommandPermission::User,
+            "蓝色大厅普通成员：只给 User",
+        );
+    }
+
     use super::*;
     #[test]
     fn source_is_not_identity_and_higher_roles_inherit() {

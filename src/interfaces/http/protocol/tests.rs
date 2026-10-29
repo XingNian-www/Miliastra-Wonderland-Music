@@ -3539,6 +3539,33 @@ fn startup_routes_are_queued_json_post_routes() {
     assert!(PAGE.contains("call('/startup/enter-wonderland','POST')"));
 }
 
+/// 面板「@点歌 默认平台」的说明必须写清「只影响搜索平台、不改变权限」。
+///
+/// 只把 bilibili 从下拉里过滤掉还不够：用户需要知道 @点歌 与 @B站点歌 是
+/// **两条不同的权限**，否则会以为「默认平台换成 B站 就等于给 @点歌 调了权限」。
+#[test]
+fn command_panel_explains_default_song_source_semantics() {
+    assert!(
+        PAGE.contains("默认平台只影响 @点歌 走哪个平台的搜索，不改变各平台命令的权限"),
+        "面板必须说明默认平台只改搜索平台、不改权限"
+    );
+    assert!(
+        PAGE.contains("id=\"commandDefaultSongSourceNote\""),
+        "说明段落需要稳定 id，避免渲染时被误删"
+    );
+    // 默认平台下拉是动态渲染的：页面里不能再硬编码平台选项，
+    // 否则过滤只会被前端那份列表绕过。
+    let select = PAGE
+        .split("id=\"commandDefaultSongSource\"")
+        .nth(1)
+        .expect("默认平台下拉存在");
+    let select = &select[..select.find("</select>").expect("下拉闭合")];
+    assert!(
+        !select.contains("<option value=\"bilibili\""),
+        "默认平台下拉不能硬编码 B站 选项"
+    );
+}
+
 #[test]
 fn queue_add_defaults_api_requester_when_not_provided() {
     let state = test_state();
@@ -5456,6 +5483,19 @@ fn song_platform_panel_catalog_and_policy_save_are_independent_and_live() {
         .iter()
         .flat_map(|group| group["commands"].as_array().unwrap())
         .collect();
+    // 默认平台下拉只提供 QQ / 网易 / 酷狗。B站 是独立命令（默认好友门槛），
+    // 一旦允许它当 @点歌 的默认平台，apply_default_song_source 就会在权限判定**之前**
+    // 把 @点歌 改写成 @B站点歌，而面板上没有 @点歌 这一行可改，用户看不出被拒原因。
+    let platforms: Vec<&str> = catalog["songPlatforms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(platforms, ["qqmusic", "netease", "kugou"]);
+    assert!(!platforms.contains(&"bilibili"));
+    assert_eq!(catalog["defaultSongSource"], "qqmusic");
+    assert_eq!(catalog["defaultSongSourceSelectable"], true);
     for id in ["@QQ点歌", "@网易点歌", "@酷狗点歌", "@AI点歌"] {
         let matches: Vec<_> = rows.iter().filter(|row| row["id"] == id).collect();
         assert_eq!(
@@ -5527,6 +5567,51 @@ fn song_platform_panel_catalog_and_policy_save_are_independent_and_live() {
         assert_eq!(row["enabled"], enabled, "{id}");
         assert_eq!(row["minimumRole"], role, "{id}");
     }
+    server.shutdown().unwrap();
+}
+
+/// 历史配置把默认平台存成 B站 时，面板必须**如实**显示它不可选。
+///
+/// 过滤掉 bilibili 只改了「默认平台下拉」，没有改 validate（B站 仍是合法的
+/// SongSource，运行期 `apply_default_song_source` 照旧按它改写 `@点歌`）。
+/// 因此这里的关键不是「自动修好老配置」，而是**不许静默显示成 QQ**：
+/// 下拉若按选项列表渲染，未命中会默认选中第一项，用户以为存的是 QQ，
+/// 实际仍按 B站（好友门槛）判定。
+#[test]
+fn legacy_bilibili_default_song_source_is_reported_unselectable_in_catalog() {
+    let mut state = test_state();
+    let server = start_test_http_server(&mut state, "");
+    let address = server.local_addr();
+    {
+        let mut sections = full_config_sections(&state);
+        sections["command_access"]["default_song_source"] = json!("bilibili");
+        let mut store = state.config_store.lock().unwrap();
+        let base = store.current_revision().unwrap();
+        store
+            .save(base, sections.as_object().expect("sections 对象").clone())
+            .expect("legacy bilibili default source still saves");
+    }
+    let catalog: Value =
+        serde_json::from_str(&http_get(address, "/commands/catalog", None).body).unwrap();
+    // 值原样回传：面板据此展示「B站（不能作为默认平台）」，不谎报成 QQ。
+    assert_eq!(catalog["defaultSongSource"], "bilibili");
+    assert_eq!(catalog["defaultSongSourceSelectable"], false);
+    let platforms: Vec<&str> = catalog["songPlatforms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["value"].as_str().unwrap())
+        .collect();
+    assert!(!platforms.contains(&"bilibili"));
+    // 改选一个合法平台后即恢复正常。
+    let revision = catalog["revision"].as_u64().unwrap();
+    let body = json!({"baseRevision":revision,"items":[],"defaultSongSource":"kugou"}).to_string();
+    let saved = http_post_json(address, "/commands/policy", &body, None);
+    assert_eq!(saved.status_line, "HTTP/1.1 200 OK", "{}", saved.body);
+    let updated: Value =
+        serde_json::from_str(&http_get(address, "/commands/catalog", None).body).unwrap();
+    assert_eq!(updated["defaultSongSource"], "kugou");
+    assert_eq!(updated["defaultSongSourceSelectable"], true);
     server.shutdown().unwrap();
 }
 

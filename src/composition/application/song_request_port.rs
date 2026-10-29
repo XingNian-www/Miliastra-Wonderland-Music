@@ -11,28 +11,32 @@ impl SongRequestPort for ApplicationRuntime {
         &self,
         username: &str,
         account: Option<&crate::features::command::CommandAccount>,
+        authority: crate::features::command::CommandAuthority,
         console: bool,
     ) -> bool {
         if console {
             return true;
         }
         let snapshot = self.lifecycle.live_configs.snapshot();
-        // 与路由期同一判定：有账号按 UID，否则按昵称。
-        // 只按昵称会让外部源（username 是 uid:/随机匹配键）在这里被降级成 User。
-        let actor = crate::features::command_access::actor_permission(
+        // 与路由期**完全同一口径**：有账号按 UID，否则按昵称；
+        // 身份命中就覆盖，未命中退回来源下界（粉色好友→Friend，蓝色大厅→User）。
+        // 少了 floor 就会出现「路由放行、执行拒绝」，用户看到的是权限不够。
+        let actor = crate::features::command_access::actor_permission_with_floor(
             self.lifecycle
                 .live_configs
                 .identity
                 .role_of_sender(username, account),
+            authority,
         );
         crate::features::command_access::catalog_policy(&snapshot.command_access, "@AI点歌")
-            .is_some_and(|policy| policy.allows(actor))
+            .is_some_and(|policy| policy.allows(Some(actor)))
     }
 
     fn song_source_allowed(
         &self,
         username: &str,
         account: Option<&crate::features::command::CommandAccount>,
+        authority: crate::features::command::CommandAuthority,
         source: &str,
         console: bool,
     ) -> bool {
@@ -46,14 +50,15 @@ impl SongRequestPort for ApplicationRuntime {
             return false;
         };
         let snapshot = self.lifecycle.live_configs.snapshot();
-        let actor = crate::features::command_access::actor_permission(
+        let actor = crate::features::command_access::actor_permission_with_floor(
             self.lifecycle
                 .live_configs
                 .identity
                 .role_of_sender(username, account),
+            authority,
         );
         crate::features::command_access::catalog_policy(&snapshot.command_access, id)
-            .is_some_and(|policy| policy.allows(actor))
+            .is_some_and(|policy| policy.allows(Some(actor)))
     }
 
     fn reply(&self, message: &str) -> Result<()> {

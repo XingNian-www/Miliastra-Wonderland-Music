@@ -263,7 +263,7 @@ mod tests {
     fn parses_hall_message_from_documented_shape() {
         let raw = r#"{"type":"message","message":{"id":41,"ts":1792772291,
             "channel":"current_hall","hallId":1159597756390572032,"hallType":16,
-            "from":{"uid":346724821,"name":"荧"},"to":null,"text":"@点歌 晴天"}}"#;
+            "from":{"uid":900000001,"name":"荧"},"to":null,"text":"@点歌 晴天"}}"#;
         let Some(ChatSourceEvent::Messages(messages)) = parse_frame(raw).unwrap() else {
             panic!("应解析为消息事件");
         };
@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(message.sent_at, Some(1792772291));
         assert!(message.channel.is_current_hall());
         assert_eq!(message.hall_id, Some(1159597756390572032));
-        assert_eq!(message.sender.uid.as_ref().unwrap().as_str(), "346724821");
+        assert_eq!(message.sender.uid.as_ref().unwrap().as_str(), "900000001");
         assert_eq!(message.sender.nickname.as_deref(), Some("荧"));
         assert_eq!(message.to_uid, None);
         assert_eq!(message.text, "@点歌 晴天");
@@ -317,7 +317,7 @@ mod tests {
             "id": 42, "ts": 1792772291,
             "channel": "current_hall",
             "hallId": 1159597756390572032u64, "hallType": 16,
-            "from": {"uid": 346724821u64, "name": "荧"},
+            "from": {"uid": 900000001u64, "name": "荧"},
             "to": null, "text": "@点歌 晴天"
         });
         let message = parse_wire_message(&raw).expect("应解析成功");

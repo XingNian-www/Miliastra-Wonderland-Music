@@ -77,8 +77,11 @@ const ENTRIES: &[SongEntry] = &[
                 allows_argument: true,
             },
             group: CommandGroup::Song,
-            authorities: &[Friend],
-            summary: "好友 B站音源点歌",
+            // 渠道只决定「在哪些界面能被识别」，不再代表「仅好友可用」。
+            // 原来只声明 Friend，结果大厅里连命令都匹配不上——管理员也触发不了。
+            // 真正的门是权限档位（>= minimum_role），由 command_access 统一判定。
+            authorities: BOTH,
+            summary: "B站音源点歌（默认好友及以上）",
             usage: &["@B站点歌BV1xx411c7mD"],
             hidden: false,
         },

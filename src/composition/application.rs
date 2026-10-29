@@ -24,9 +24,7 @@ mod workers;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::{
-    AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
-};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1841,9 +1839,9 @@ impl ApplicationRuntime {
                 ai,
                 ai_chat_memory,
                 ai_chat_memory_generation: Arc::new(AtomicU64::new(0)),
-                ai_chat_maintenance_inflight: Arc::new(Mutex::new(
-                    std::collections::HashSet::new(),
-                )),
+                ai_chat_maintenance_inflight: Arc::new(
+                    Mutex::new(std::collections::HashSet::new()),
+                ),
                 ai_chat_gate,
                 ai_chat_openai: ai_openai_for_chat,
                 ai_connection: config.ai.clone(),

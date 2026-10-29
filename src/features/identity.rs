@@ -297,7 +297,18 @@ impl IdentityAccess {
     /// 这是刻意的方向选择——宁可让旧配置失效，也不让改昵称就能提权。
     pub fn resolve_hint(&self, hint: IdentityHint<'_>) -> Option<ResolvedIdentity> {
         match hint {
+            // **只匹配 `nickname`（好友备注），绝不回退到 `note`（游戏真名）。**
+            //
+            // `nickname` 是"你给对方起的备注"，玩家自己改不了；`note` 是游戏
+            // 真名，任何人都能把自己的昵称改成一样来冒充。所以名字只能用于
+            // 归属（记忆、歌单），授权一律靠 UID。
+            //
+            // 曾为了让"大厅 OCR 读到真名也能认出管理员"加过 note 兜底，
+            // 结果 moderation 的防冒充测试立刻变红：伪造的 requester 拿到了
+            // Admin。这正是本节开头那段注释说的方向，不能破。
             IdentityHint::Nickname(name) => self.resolve(name),
+            // **有 UID 时只认 UID**：UID 是最可靠的账号标识，
+            // 回退到名字会让"改个昵称就顶替别人身份"成为可能。
             IdentityHint::Account { game, uid, .. } => self.resolve_account(game, uid),
         }
     }

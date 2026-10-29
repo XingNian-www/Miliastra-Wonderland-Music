@@ -224,8 +224,13 @@ impl<'a> ChatCommandRouter<'a> {
                 &routed,
                 active_entertainment,
             );
-            let actor = crate::features::command_access::actor_permission(routed.role);
-            if !policy.allows(actor) {
+            // 身份命中就**覆盖**（精确身份优先），未命中退回来源下界：
+            // 粉色好友消息/大厅好友标记 → Friend，蓝色大厅 → User。
+            let actor = crate::features::command_access::actor_permission_with_floor(
+                routed.role,
+                routed.authority,
+            );
+            if !policy.allows(Some(actor)) {
                 routed.permission_required = Some(match policy.minimum_role {
                     crate::features::command_access::CommandPermission::User
                     | crate::features::command_access::CommandPermission::Friend => {
@@ -905,7 +910,9 @@ mod tests {
 
         // 备注名（好友私聊标题）可以认出身份。
         let by_remark = identity
-            .resolve_hint(crate::features::identity::IdentityHint::Nickname("abcd1234"))
+            .resolve_hint(crate::features::identity::IdentityHint::Nickname(
+                "abcd1234",
+            ))
             .expect("好友备注应能认出身份");
         assert_eq!(by_remark.role, IdentityRole::Admin);
 
@@ -1103,15 +1110,17 @@ mod tests {
             .unwrap();
         assert!(runfast.permission_required.is_some());
         access.overrides.clear();
-        for source in ["pink", "blue"] {
+        // @删除 默认门槛是 Friend（catalog 摘要「好友删除当前曲目」），
+        // 不是 Admin——旧断言把「仅好友」误解成了「好友且管理员」。
+        //
+        // 但两个来源的判定结果不同，因为**来源本身就是最低权限推断的信号**：
+        //   pink（好友消息/大厅好友标记）→ 下界 Friend → 直接放行；
+        //   blue（普通大厅成员）→ 下界 User → 仍要求 Friend。
+        for (source, expected) in [("pink", None), ("blue", Some(IdentityRole::Friend))] {
             let routed = ChatCommandRouter::with_access(&service, &identity, &access)
                 .route(&envelope(source, "@删除"), None)
                 .unwrap();
-            // @删除 声明 FRIEND_ONLY（catalog 摘要「好友删除当前曲目」），
-            // 且 playback::claims_chat 的大厅分支明确排除「删除」。
-            // 所以默认门槛是 Friend，不是 Admin——旧断言把「仅好友」
-            // 误解成了「好友且管理员」。
-            assert_eq!(routed.permission_required, Some(IdentityRole::Friend));
+            assert_eq!(routed.permission_required, expected, "source={source}");
             assert_eq!(routed.message_type, source);
         }
         access.overrides.insert(

@@ -29,6 +29,9 @@ pub(crate) struct SongRequestContext {
     /// 计算后写入，但**生产代码从未读过它**——真正的判定在 port 里。已删除，
     /// 避免两份判断并存且互相矛盾。
     pub(crate) account: Option<crate::features::command::CommandAccount>,
+    /// 消息来源。身份未登记时用它做**最低权限推断**（粉色好友→Friend，
+    /// 蓝色大厅→User），必须与路由期同一口径。
+    pub(crate) authority: crate::features::command::CommandAuthority,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +189,7 @@ pub(crate) trait SongRequestPort {
         &self,
         _username: &str,
         _account: Option<&crate::features::command::CommandAccount>,
+        _authority: crate::features::command::CommandAuthority,
         _source: &str,
         _console: bool,
     ) -> bool {
@@ -196,6 +200,7 @@ pub(crate) trait SongRequestPort {
         &self,
         _username: &str,
         _account: Option<&crate::features::command::CommandAccount>,
+        _authority: crate::features::command::CommandAuthority,
         _console: bool,
     ) -> bool {
         true
@@ -499,6 +504,7 @@ impl SongRequestApplication {
             console_bypass_dedup: self.console_bypass_dedup,
             actor_username: &context.username,
             actor_account: context.account.as_ref(),
+            actor_authority: context.authority,
             console: context.message_type == "控制台",
             port,
         }
@@ -517,6 +523,9 @@ struct SongRequestExecution<'a> {
     /// 平台权限必须按它与 `actor_username` 一起判定，否则 API 链路只能按
     /// 不可解析的 uid 主语查角色，被静默降级成 User。
     actor_account: Option<&'a crate::features::command::CommandAccount>,
+    /// 消息来源（大厅/好友）。身份未登记时用它的**最低权限推断**，
+    /// 必须与路由期同一口径，否则会出现「路由放行、执行拒绝」。
+    actor_authority: crate::features::command::CommandAuthority,
     console: bool,
     port: &'a mut dyn SongRequestPort,
 }
@@ -526,14 +535,19 @@ impl SongRequestExecution<'_> {
         self.port.song_source_allowed(
             self.actor_username,
             self.actor_account,
+            self.actor_authority,
             source,
             self.console,
         )
     }
 
     fn ai_command_allowed(&self) -> bool {
-        self.port
-            .song_ai_command_allowed(self.actor_username, self.actor_account, self.console)
+        self.port.song_ai_command_allowed(
+            self.actor_username,
+            self.actor_account,
+            self.actor_authority,
+            self.console,
+        )
     }
 
     fn require_ai_command(&self) -> Result<bool> {
@@ -2412,6 +2426,7 @@ mod tests {
             username: "Alice".to_string(),
             user_command: "@点歌 晴天".to_string(),
             account: None,
+            authority: crate::features::command::CommandAuthority::HallMember,
         }
     }
 
@@ -2534,6 +2549,7 @@ mod tests {
             &self,
             username: &str,
             _account: Option<&crate::features::command::CommandAccount>,
+            _authority: crate::features::command::CommandAuthority,
             console: bool,
         ) -> bool {
             self.ai_permission_checks
@@ -2551,6 +2567,7 @@ mod tests {
             &self,
             username: &str,
             _account: Option<&crate::features::command::CommandAccount>,
+            _authority: crate::features::command::CommandAuthority,
             source: &str,
             console: bool,
         ) -> bool {

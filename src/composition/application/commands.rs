@@ -424,6 +424,7 @@ impl ApplicationRuntime {
                     username: command_username(parsed).to_string(),
                     user_command: parsed.user_command.clone(),
                     account: parsed.account.clone(),
+                    authority: parsed.authority,
                 };
                 self.business
                     .song_requests

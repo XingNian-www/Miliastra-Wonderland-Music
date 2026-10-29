@@ -600,19 +600,7 @@ impl ApplicationRuntime {
         parsed: &RoutedCommand,
         command: &str,
     ) -> Result<serde_json::Value> {
-        // 工具给的是一条**裸命令**（形如 `@点歌晴天`、`#提示`），不含发送者前缀。
-        //
-        // 不能走 `parse_command_envelope`：它第一步要把整行切成「发送者 + 正文」，
-        // 而裸命令里没有 `：`/`:`/`]`/`】` 分隔符，会直接返回 None，
-        // 于是工具命令 100% 被拒——表现为模型每次只拿到「命令无法解析」。
-        // 身份不是从文本推出来的，而是提问者本人：直接用 `parsed` 里的发送者构造信封。
-        let Some(request) = crate::features::command::CommandEnvelope::new(
-            command.to_string(),
-            parsed.username.clone(),
-            parsed.message_type.clone(),
-            command.trim().to_string(),
-            crate::features::command::CommandObservation::default(),
-        ) else {
+        let Some(request) = ai_chat_command_envelope(parsed, command) else {
             return Ok(serde_json::json!({"status":"rejected","reason":"命令无法解析"}));
         };
         let active = self.business.business.active_entertainment()?;
@@ -662,6 +650,33 @@ impl ApplicationRuntime {
         }
         Ok(receipt)
     }
+}
+
+/// 用提问者本人身份重建一条工具命令的信封。
+///
+/// 工具给的是一条**裸命令**（形如 `@点歌晴天`、`#提示`），不含发送者前缀。
+/// 不能走 `parse_command_envelope`：它第一步要把整行切成「发送者 + 正文」，
+/// 而裸命令里没有 `：`/`:`/`]`/`】` 分隔符，会直接返回 None，
+/// 于是工具命令 100% 被拒——表现为模型每次只拿到「命令无法解析」。
+/// 身份不是从文本推出来的，而是提问者本人：直接用 `parsed` 里的发送者构造信封。
+///
+/// **必须补 `.with_account(...)`**：`CommandEnvelope::new` 把 account 固定成
+/// `None`（那条路径服务 OCR，OCR 拿不到 UID），而外部聊天源的提问者完全可能
+/// 只登记了 UID、昵称是随机匹配键。丢掉 account 后路由期只能按昵称解析身份，
+/// 于是出现「listener 按 UID 放行、AI 代执行按昵称被拒」，模型只能回一句
+/// 「提问者权限不足」。这与 secondary_chat.rs 里 `with_account` 的用法同源。
+fn ai_chat_command_envelope(
+    parsed: &RoutedCommand,
+    command: &str,
+) -> Option<crate::features::command::CommandEnvelope> {
+    crate::features::command::CommandEnvelope::new(
+        command.to_string(),
+        parsed.username.clone(),
+        parsed.message_type.clone(),
+        command.trim().to_string(),
+        crate::features::command::CommandObservation::default(),
+    )
+    .map(|envelope| envelope.with_account(parsed.account.clone()))
 }
 
 /// 调一次模型，把「旧摘要 + 新溢出的原文」压成新摘要。
@@ -838,6 +853,106 @@ mod tests {
         )
         .unwrap();
         assert_eq!(memory.facts("actor").unwrap(), ["玩家自称：小B"]);
+    }
+
+    /// 提问者本人在路由层的形态：外部聊天源（蓝色大厅）消息，可带 UID。
+    fn asker(
+        username: &str,
+        account: Option<crate::features::command::CommandAccount>,
+    ) -> RoutedCommand {
+        let mut parsed = RoutedCommand::console(
+            "队列清空",
+            "队列清空",
+            ModuleCommand::Playback(PlaybackCommand::QueueClear),
+        );
+        parsed.username = username.to_string();
+        parsed.message_type = "blue".to_string();
+        parsed.authority = CommandAuthority::HallMember;
+        parsed.account = account;
+        parsed
+    }
+
+    fn workflow_service() -> CustomWorkflowService {
+        CustomWorkflowService::new(
+            crate::features::custom_workflow::CustomWorkflowConfig::default(),
+            WorkflowDefaults {
+                default_timeout_ms: 1_000,
+                default_poll_ms: 100,
+                default_step_wait_ms: 100,
+                decision_timeout_ms: 1_000,
+                decision_poll_ms: 100,
+                after_activate_ms: 100,
+                clipboard_hold_ms: 100,
+                stability_mean_threshold: 1.0,
+                stability_changed_ratio_threshold: 0.1,
+            },
+        )
+    }
+
+    /// 只登记了 UID、昵称留空的管理员（外部聊天源的昵称是随机匹配键）。
+    fn uid_only_admin_identity() -> crate::features::identity::IdentityAccess {
+        use crate::features::identity::{GameAccount, IdentityConfig, IdentityMapping};
+        crate::features::identity::IdentityAccess::new(IdentityConfig {
+            mappings: vec![IdentityMapping {
+                nickname: String::new(),
+                id: uuid::Uuid::from_u128(1),
+                role: IdentityRole::Admin,
+                note: String::new(),
+                remark_sourced: false,
+                accounts: vec![GameAccount::new("100000001")],
+            }],
+        })
+    }
+
+    fn gamer_account(uid: &str) -> crate::features::command::CommandAccount {
+        crate::features::command::CommandAccount::new(
+            miliastra_kernel::chat_source::GAME_GENSHIN,
+            uid,
+        )
+    }
+
+    #[test]
+    fn ai_tool_envelope_keeps_the_askers_account() {
+        // 工具信封必须原样带上提问者的账号：丢掉它，路由期就只能按昵称查身份。
+        let account = gamer_account("100000001");
+        let envelope =
+            ai_chat_command_envelope(&asker("abcd1234", Some(account.clone())), "@队列清空")
+                .expect("工具命令应能构造信封");
+        assert_eq!(envelope.account(), Some(&account));
+        assert_eq!(envelope.username(), "abcd1234");
+        assert_eq!(envelope.message_type(), "blue");
+    }
+
+    #[test]
+    fn ai_tool_command_passes_permission_check_for_uid_only_admin() {
+        // 回归：只登记 UID（昵称未登记）的管理员让 AI 代执行 @队列清空。
+        // 修前信封 account 恒 None → 路由只能按昵称查 → permission_required 非空
+        // → 模型拿到「提问者权限不足」，而同一人自己发命令是被 listener 按 UID 放行的。
+        use crate::features::command_access::CommandAccessConfig;
+        let identity = uid_only_admin_identity();
+        let workflows = workflow_service();
+        let access = CommandAccessConfig::default();
+        let router = ChatCommandRouter::with_access(&workflows, &identity, &access);
+
+        let with_account = ai_chat_command_envelope(
+            &asker("abcd1234", Some(gamer_account("100000001"))),
+            "@队列清空",
+        )
+        .expect("工具命令应能构造信封");
+        let routed = router.route(&with_account, None).expect("命令应被认领");
+        assert_eq!(routed.role, Some(IdentityRole::Admin));
+        assert_eq!(routed.permission_required, None, "UID 管理员应通过权限判定");
+
+        // 对照：同一条命令丢掉 account 后只能按昵称解析，必须被拒（不放松门槛）。
+        let without_account =
+            ai_chat_command_envelope(&asker("abcd1234", None), "@队列清空").expect("信封");
+        let routed = router.route(&without_account, None).expect("命令应被认领");
+        assert_eq!(routed.role, None);
+        assert_eq!(
+            routed.permission_required,
+            Some(IdentityRole::Admin),
+            "没有账号线索时不能凭空获得管理权限"
+        );
     }
 
     #[test]

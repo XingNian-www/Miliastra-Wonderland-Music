@@ -299,8 +299,12 @@ pub struct ModerationResultTask {
     lease: ModerationWorkflowLease,
     // 直接执行不创建投票驻留；UI 事务仍负责定位、确认及恢复。
     hold: Option<ModerationHoldLease>,
-    // 组合层从路由发送者绑定，正式任务执行前再次检查实时身份。
+    // 组合层从路由发送者绑定（昵称 + 账号），正式任务执行前再次检查实时身份。
+    //
+    // 账号必须一起保留：外部聊天源的昵称是随机 OCR 匹配键，准入按 UID 判权、
+    // 复查只按昵称查就必然「准入放行 → 复查失败 → 静默取消」。
     direct_sender: Option<String>,
+    direct_account: Option<crate::features::command::CommandAccount>,
 }
 
 pub enum ModerationResultExecution {
@@ -473,6 +477,7 @@ impl ModerationService {
             lease,
             hold: None,
             direct_sender: None,
+            direct_account: None,
         })))
     }
 
@@ -752,6 +757,7 @@ impl ModerationVoteWork {
             lease: self.lease,
             hold: Some(self.hold),
             direct_sender: None,
+            direct_account: None,
         }
     }
 
@@ -766,12 +772,27 @@ impl ModerationResultTask {
         self.hold.is_none()
     }
 
-    pub(crate) fn bind_direct_sender(&mut self, sender: &str) {
+    /// 绑定发起直执行的管理员：昵称与账号一起存。
+    ///
+    /// 刻意不提供「只绑昵称」的重载：那条路径会让复查退化成只按昵称解析，
+    /// 而外部聊天源的昵称只是随机匹配键——准入按 UID 放行、复查按昵称查不到，
+    /// 管理员拉黑会被静默取消。两个来源线索必须同源绑定。
+    pub(crate) fn bind_direct_sender(
+        &mut self,
+        sender: &str,
+        account: Option<crate::features::command::CommandAccount>,
+    ) {
         self.direct_sender = Some(sender.to_string());
+        self.direct_account = account;
     }
 
     pub(crate) fn direct_sender(&self) -> Option<&str> {
         self.direct_sender.as_deref()
+    }
+
+    /// 绑定时的账号线索（仅外部聊天源提供；OCR 路径为 None）。
+    pub(crate) fn direct_account(&self) -> Option<&crate::features::command::CommandAccount> {
+        self.direct_account.as_ref()
     }
 
     pub fn label(&self) -> String {

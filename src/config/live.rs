@@ -319,6 +319,10 @@ impl LiveConfigs {
         self.identity.replace(config.identity.clone());
         self.sync_identity_snapshot(config.identity.clone());
 
+        // 与 load_full 同一口径：活配置里也不能留着已废弃的面板条目。
+        let mut command_access = config.command_access.clone();
+        command_access.sanitize_deprecated_overrides();
+
         let mut effective = Arc::unwrap_or_clone(self.effective.snapshot());
         effective.stability.secondary_hall_count = config.stability.secondary_hall_count;
         effective.timing.watchdog_restart_ms = config.timing.watchdog_restart_ms;
@@ -348,7 +352,7 @@ impl LiveConfigs {
         effective.matching = config.matching.clone();
         effective.custom_workflows = config.custom_workflows.clone();
         effective.identity = config.identity.clone();
-        effective.command_access = config.command_access.clone();
+        effective.command_access = command_access;
         effective.visual = config.visual.clone();
         self.effective.replace(effective);
     }
@@ -410,7 +414,7 @@ mod tests {
         let mut changed = AppConfig::default();
         changed.visual.name = "我的档案".into();
         changed.command_access.overrides.insert(
-            "@点歌".into(),
+            "@QQ点歌".into(),
             crate::features::command_access::CommandPolicy {
                 enabled: false,
                 minimum_role: crate::features::command_access::CommandPermission::Admin,
@@ -418,10 +422,40 @@ mod tests {
         );
         live.apply(&changed);
         assert_eq!(live.snapshot().visual.name, "我的档案");
-        assert!(!live.snapshot().command_access.overrides["@点歌"].enabled);
+        assert!(!live.snapshot().command_access.overrides["@QQ点歌"].enabled);
         live.apply(&AppConfig::default());
         assert!(live.snapshot().command_access.overrides.is_empty());
         assert_eq!(live.snapshot().visual.name, "1080P");
+    }
+
+    /// A1：活配置与启动加载同一口径——已废弃的 `@点歌` 条目在 `apply` 时被丢弃，
+    /// 不能留在运行态快照里「看起来生效、实际没人读」。
+    #[test]
+    fn applying_a_deprecated_policy_entry_drops_it_from_the_effective_snapshot() {
+        let live = LiveConfigs::default();
+        let mut changed = AppConfig::default();
+        changed.command_access.overrides.insert(
+            "@点歌".into(),
+            crate::features::command_access::CommandPolicy {
+                enabled: false,
+                minimum_role: crate::features::command_access::CommandPermission::Admin,
+            },
+        );
+        changed.command_access.overrides.insert(
+            "@QQ点歌".into(),
+            crate::features::command_access::CommandPolicy {
+                enabled: false,
+                minimum_role: crate::features::command_access::CommandPermission::User,
+            },
+        );
+        live.apply(&changed);
+        let snapshot = live.snapshot();
+        assert!(
+            !snapshot.command_access.overrides.contains_key("@点歌"),
+            "废弃条目必须被丢弃"
+        );
+        // 正常条目不受影响。
+        assert!(!snapshot.command_access.overrides["@QQ点歌"].enabled);
     }
 
     #[test]

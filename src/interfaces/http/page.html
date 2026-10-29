@@ -694,6 +694,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         <button class="btn small ghost" onclick="loadCommandCatalog(true)">刷新目录</button>
       </div>
       <div class="row"><label for="commandDefaultSongSource">@点歌默认平台</label><select id="commandDefaultSongSource" onchange="changeCommandDefaultSongSource(this.value)" disabled><option value="">读取中…</option></select><span id="commandDefaultSongSourceHint" role="status"></span></div>
+      <p class="config-field-hint" id="commandDefaultSongSourceNote">默认平台只影响 @点歌 走哪个平台的搜索，不改变各平台命令的权限；各平台（含 @B站点歌）的门槛在下面各自那行单独设置。B站 不作为默认平台，需要 B站 请直接发 @B站点歌。</p>
       <div class="command-toolbar">
         <input id="commandSearch" type="text" placeholder="搜索命令名称 / 别名 / 摘要" aria-label="搜索命令" oninput="renderCommandCatalog()">
         <div class="tabs" role="group" aria-label="按来源过滤">
@@ -3081,16 +3082,23 @@ function changeCommandDefaultSongSource(value){
   commandDefaultSongSourceDraft=value===commandCatalog.defaultSongSource?null:value
   updateCommandPolicyUI()
 }
+function defaultSongPlatformLabel(value){return sourceLabel(String(value??''))}
 function updateCommandPolicyUI(){
   const source=$('commandDefaultSongSource')
+  const options=commandCatalog?.songPlatforms||[]
+  const selected=commandDefaultSongSourceDraft??commandCatalog?.defaultSongSource
+  // 历史配置可能存着已不再提供的默认平台（当前是 B站）：如实显示它被选中且不可选。
+  // 若直接按选项列表渲染，下拉会静默跳到第一项（QQ），用户会以为保存的就是 QQ，
+  // 但运行期 @点歌 仍按存着的平台改写 source，导致权限表现与面板显示不一致。
+  const unsupported=Boolean(selected)&&commandCatalog?.defaultSongSourceSelectable===false&&commandDefaultSongSourceDraft===null
   if(source){
-    const options=commandCatalog?.songPlatforms||[]
-    const selected=commandDefaultSongSourceDraft??commandCatalog?.defaultSongSource
-    source.innerHTML=options.length?options.map(item=>'<option value="'+commandEscape(item.value)+'"'+(selected===item.value?' selected':'')+'>'+commandEscape(item.label)+'</option>').join(''):'<option value="">暂无可用平台</option>'
+    const rows=options.map(item=>'<option value="'+commandEscape(item.value)+'"'+(selected===item.value?' selected':'')+'>'+commandEscape(item.label)+'</option>')
+    if(unsupported)rows.push('<option value="'+commandEscape(selected)+'" selected disabled>'+commandEscape(defaultSongPlatformLabel(selected))+'（不能作为默认平台）</option>')
+    source.innerHTML=rows.length?rows.join(''):'<option value="">暂无可用平台</option>'
     source.disabled=commandPolicySaving||commandReplySaving||!options.length
   }
   const hint=$('commandDefaultSongSourceHint')
-  if(hint)hint.textContent=commandDefaultSongSourceDraft!==null?'默认平台未保存':''
+  if(hint)hint.textContent=commandDefaultSongSourceDraft!==null?'默认平台未保存':(unsupported?'当前默认平台「'+defaultSongPlatformLabel(selected)+'」已不能作为 @点歌 的默认平台，请改选后保存':'')
   const save=$('commandPolicySave')
   if(save){save.disabled=commandPolicySaving||commandReplySaving||!commandPolicyHasChanges();save.textContent=commandPolicySaving?'保存中…':'保存权限与平台（'+(commandPolicyDraft.size+(commandDefaultSongSourceDraft!==null?1:0))+'）'}
   const replySave=$('commandReplySave')
@@ -3128,7 +3136,12 @@ async function saveCommandPolicies(){
       const saved=commandPolicyDraft.get(String(item.id));if(saved)Object.assign(item,saved)
     }
     commandCatalog.revision=result.revision
-    if(commandDefaultSongSourceDraft!==null)commandCatalog.defaultSongSource=commandDefaultSongSourceDraft
+    if(commandDefaultSongSourceDraft!==null){
+      commandCatalog.defaultSongSource=commandDefaultSongSourceDraft
+      // 草稿只能从下拉里选，必然是可选平台；不更新这个标记的话，
+      // 刷新目录失败时会拿旧的 false 把新值误渲染成「不能作为默认平台」。
+      commandCatalog.defaultSongSourceSelectable=true
+    }
     commandPolicyDraft.clear();commandDefaultSongSourceDraft=null;commandPolicyBaseRevision=null
     await loadCommandCatalog(true)
     $('commandPolicyStatus').textContent='命令设置已保存，版本 '+result.revision+(commandCatalogError?'；目录刷新失败，当前显示已保存策略。':'')
@@ -3335,7 +3348,7 @@ async function loadCommandCatalog(force){
     if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('命令目录响应格式不正确')
     if(!Array.isArray(data.groups))throw new Error('命令目录缺少 groups 字段')
     // 编辑时固定基线与目录，周期刷新不能覆盖草稿或悄悄提升保存版本。
-    if(!commandPolicyHasChanges())commandCatalog={commandsEnabled:data.commandsEnabled,groups:data.groups,revision:data.revision,defaultSongSource:data.defaultSongSource,songPlatforms:data.songPlatforms}
+    if(!commandPolicyHasChanges())commandCatalog={commandsEnabled:data.commandsEnabled,groups:data.groups,revision:data.revision,defaultSongSource:data.defaultSongSource,defaultSongSourceSelectable:data.defaultSongSourceSelectable,songPlatforms:data.songPlatforms}
     else if(data.revision!==commandPolicyBaseRevision){
       commandCatalogError='配置已有新版本；本地草稿已保留，保存时将检查冲突。'
       return

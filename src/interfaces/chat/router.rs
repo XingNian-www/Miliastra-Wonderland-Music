@@ -216,14 +216,25 @@ impl<'a> ChatCommandRouter<'a> {
             };
             let mut routed =
                 self.route_with_authorities(envelope, active_entertainment, None, Some(other))?;
-            if let ModuleCommand::SongRequest(song) = &mut routed.command {
-                access.apply_default_song_source(song);
-            }
+            // **顺序很重要**：先按用户实际敲的命令解析权限，再改写默认平台。
+            //
+            // `resolve_for_routed` 用 `SongCommand::permission_id()` 反查策略，
+            // 而那个 id 由 `song.source` 决定。旧实现先 `apply_default_song_source`
+            // 再解析权限，于是默认平台一设成 B站，`@点歌` 就被按 `@B站点歌`
+            // （默认 Friend）判定——普通大厅成员发 `@点歌` 直接被拒，而面板上
+            // 根本没有 `@点歌` 这一行可改，用户完全看不出原因。
+            //
+            // 现在的语义（与面板文案一致）：**默认平台只影响搜索走哪个平台，
+            // 不改变各平台命令的权限**。`@点歌` 恒按 `@QQ点歌` 判权限。
             let (_, policy) = crate::features::command_access::resolve_with_active(
                 access,
                 &routed,
                 active_entertainment,
             );
+            // 权限已定，再改写实际搜索平台（这个改写必须保留：搜索仍走默认平台）。
+            if let ModuleCommand::SongRequest(song) = &mut routed.command {
+                access.apply_default_song_source(song);
+            }
             // 身份命中就**覆盖**（精确身份优先），未命中退回来源下界：
             // 粉色好友消息/大厅好友标记 → Friend，蓝色大厅 → User。
             let actor = crate::features::command_access::actor_permission_with_floor(
@@ -231,6 +242,8 @@ impl<'a> ChatCommandRouter<'a> {
                 routed.authority,
             );
             if !policy.allows(Some(actor)) {
+                // permission_required 的既有语义**保持不变**：moderation.rs、listener.rs
+                // 等 6 处拿它做一票否决，这里只额外记录「到底为什么被拒」。
                 routed.permission_required = Some(match policy.minimum_role {
                     crate::features::command_access::CommandPermission::User
                     | crate::features::command_access::CommandPermission::Friend => {
@@ -242,6 +255,14 @@ impl<'a> ChatCommandRouter<'a> {
                     crate::features::command_access::CommandPermission::Owner => {
                         IdentityRole::Owner
                     }
+                });
+                // 仅作诊断记录：**玩家可见文案不从这里出**。命令在入队前就被
+                // `CommandGate` 拦下，走不到 execute_command；真正的原因与文案
+                // 由 listener 的 gate 产出（见 `CommandGate::message`）。
+                routed.denied_reason = Some(if policy.enabled {
+                    crate::features::command::DeniedReason::BelowMinimum(policy.minimum_role)
+                } else {
+                    crate::features::command::DeniedReason::Disabled
                 });
             }
             return Some(routed);
@@ -659,7 +680,24 @@ fn role_for_envelope(
         },
         None => crate::features::identity::IdentityHint::Nickname(envelope.username()),
     };
-    identity.resolve_hint(hint).map(|resolved| resolved.role)
+    let resolved = identity.resolve_hint(hint)?;
+    // 审计：高权限身份**仅凭昵称**解析出来时记一条日志。
+    //
+    // 判定**不改**——用户已定稿 nickname 就是权限推断键；这里只留排查线索，
+    // 供事后回答「这条管理员命令当初是按哪个名字认出来的」。
+    //
+    // 日志里绝不出现昵称原文：nickname 是 OCR 匹配键，落进日志等于把
+    // 「可以被改成一样的名字」泄露出去了（见 identity.rs 的 display_name 注释）。
+    // 只用 display_name()，它在没有备注时返回不可用于匹配的 UUID 前缀。
+    if envelope.account().is_none() && matches!(resolved.role, IdentityRole::Admin | IdentityRole::Owner)
+    {
+        log::warn!(
+            "高权限身份仅凭昵称解析：role={:?} 身份={}（无可信 UID，昵称可被改名冒充；仅记录，不改变判定）",
+            resolved.role,
+            resolved.display_name()
+        );
+    }
+    Some(resolved.role)
 }
 
 // 开局表的解析器只解析开局语法。
@@ -744,8 +782,9 @@ mod tests {
     fn song_platform_permissions_are_independent_and_aliases_cannot_bypass() {
         use crate::features::command_access::*;
         let mut access = CommandAccessConfig::default();
-        // 其余平台命令对所有人开放；`@B站点歌` 在命令目录里声明 authorities:
-        // &[Friend]，文案也是「好友 B站音源点歌」，下限必须跟随声明。
+        // 其余平台命令对所有人开放；`@B站点歌` 的 authorities 现在也是 BOTH
+        // （渠道只决定「哪些界面能识别」，不再代表「仅好友可用」），
+        // 它的 Friend 是 `song_minimum_role` 给的**默认档位**，不是渠道推导。
         for id in ["@QQ点歌", "@网易点歌", "@酷狗点歌", "@AI点歌"] {
             let policy = catalog_policy(&access, id).unwrap();
             assert!(policy.enabled, "{id}");
@@ -839,18 +878,28 @@ mod tests {
         assert!(explicit.permission_required.is_none());
     }
 
+    /// 默认平台**不改变权限**，只改变实际搜索平台。
+    ///
+    /// 旧实现（已修）：`route()` 先 `apply_default_song_source` 再解析权限，
+    /// 而 `resolve_for_routed` 用 `SongCommand::permission_id()`（由 `song.source`
+    /// 推导）反查策略。于是默认平台一设成 B站，`@点歌` 就被按 `@B站点歌`
+    /// （默认 Friend）判定——普通大厅成员发 `@点歌` 直接被拒，而面板上根本没有
+    /// `@点歌` 这一行可改，用户完全看不出原因。
+    ///
+    /// 现在与面板文案一致：「默认平台只影响 @点歌 走哪个平台的搜索，
+    /// 不改变各平台命令的权限」。所以断言分两半：
+    /// - **权限**：无论默认平台是什么，`@点歌` 恒按 `@QQ点歌` 判；
+    /// - **行为**：`song.source` 仍被正确改写成默认平台（搜索不受影响）。
     #[test]
-    fn default_song_source_selects_its_platform_policy_not_qq_policy() {
+    fn default_song_source_changes_search_platform_but_not_permission() {
         use crate::features::command_access::*;
-        for (source, id) in [
-            ("qqmusic", "@QQ点歌"),
-            ("netease", "@网易点歌"),
-            ("kugou", "@酷狗点歌"),
-        ] {
+        // 只对「非 QQ」的默认平台做「默认平台命令被抬到 Owner」的检验：
+        // 若权限跟着默认平台漂移，@点歌 就会被这条 override 判成 Owner 而遭拒。
+        for (source, platform_id) in [("netease", "@网易点歌"), ("kugou", "@酷狗点歌")] {
             let mut access = CommandAccessConfig::default();
             access.default_song_source = Some(source.into());
             access.overrides.insert(
-                id.into(),
+                platform_id.into(),
                 CommandPolicy {
                     enabled: true,
                     minimum_role: CommandPermission::Owner,
@@ -858,19 +907,87 @@ mod tests {
             );
             for transport in ["blue", "pink"] {
                 let routed = song_policy_route(&access, transport, "@点歌晴天");
-                assert_eq!(resolve_for_routed(&access, &routed).0, id);
-                assert_eq!(routed.permission_required, Some(IdentityRole::Owner));
+                // 蓝色大厅的普通成员（来源下界 User）仍能用 @点歌。
+                assert_eq!(
+                    routed.permission_required, None,
+                    "默认平台 {source} 下 @点歌 不该继承 {platform_id} 的 Owner 门槛"
+                );
+                // 但搜索平台仍被改写成默认平台：功能没被削弱。
                 let ModuleCommand::SongRequest(song) = routed.command else {
                     panic!("expected song");
                 };
-                assert_eq!(song.source.as_str(), source);
-                if source != "qqmusic" {
-                    let explicit = song_policy_route(&access, transport, "@QQ点歌晴天");
-                    assert_eq!(resolve_for_routed(&access, &explicit).0, "@QQ点歌");
-                    assert!(explicit.permission_required.is_none());
-                }
+                assert_eq!(
+                    song.source.as_str(),
+                    source,
+                    "@点歌 的搜索仍须走默认平台"
+                );
             }
         }
+
+        // 反向证据：把 @QQ点歌 抬到 Owner，@点歌 必须被拒——
+        // 这证明它判权限时用的 id 确实是 @QQ点歌，而不是默认平台那一条。
+        for source in ["qqmusic", "netease", "kugou", "bilibili"] {
+            let mut access = CommandAccessConfig::default();
+            access.default_song_source = Some(source.into());
+            access.overrides.insert(
+                "@QQ点歌".into(),
+                CommandPolicy {
+                    enabled: true,
+                    minimum_role: CommandPermission::Owner,
+                },
+            );
+            let routed = song_policy_route(&access, "blue", "@点歌晴天");
+            assert_eq!(
+                routed.permission_required,
+                Some(IdentityRole::Owner),
+                "默认平台 {source} 下 @点歌 的权限条目必须恒为 @QQ点歌"
+            );
+        }
+    }
+
+    /// 复核 P2-3 的可执行证据：默认平台设成 `bilibili` 时，
+    /// `@点歌` 的判定档位必须**不受影响**（按 `@QQ点歌`），
+    /// 同时 `song.source` 确实被改写成 Bilibili。
+    ///
+    /// 这一条专门钉死回归点：`@B站点歌` 默认是 Friend，
+    /// 若权限随默认平台漂移，蓝色大厅的普通成员发 `@点歌` 就会被无声拒绝。
+    #[test]
+    fn bilibili_default_source_does_not_gate_plain_song_command() {
+        use crate::features::command_access::*;
+        use crate::features::song_request::SongSource;
+        let mut access = CommandAccessConfig::default();
+        access.default_song_source = Some("bilibili".into());
+
+        // 蓝色大厅（来源下界 User）发 @点歌：放行 —— 不继承 @B站点歌 的 Friend 门槛。
+        let routed = song_policy_route(&access, "blue", "@点歌晴天");
+        assert_eq!(
+            routed.permission_required, None,
+            "默认平台是 B站 时，@点歌 不该继承 @B站点歌 的 Friend 门槛"
+        );
+        let ModuleCommand::SongRequest(song) = routed.command else {
+            panic!("expected song");
+        };
+        assert_eq!(song.source, SongSource::Bilibili, "搜索仍走默认平台");
+
+        // 显式 @B站点歌 仍按 @B站点歌 判（Friend）：普通成员被拒。
+        let explicit = song_policy_route(&access, "blue", "@B站点歌晴天");
+        assert_eq!(explicit.permission_required, Some(IdentityRole::Friend));
+
+        // 反向证据：把 @QQ点歌 抬到 Owner，@点歌 立刻被拒 ——
+        // 证明默认平台是 B站 时它判权限用的仍是 @QQ点歌。
+        access.overrides.insert(
+            "@QQ点歌".into(),
+            CommandPolicy {
+                enabled: true,
+                minimum_role: CommandPermission::Owner,
+            },
+        );
+        let routed = song_policy_route(&access, "blue", "@点歌晴天");
+        assert_eq!(
+            routed.permission_required,
+            Some(IdentityRole::Owner),
+            "@点歌 的权限条目恒为 @QQ点歌，与默认平台无关"
+        );
     }
 
     /// 回归：五个点歌命令各自独立，改一个不牵连别人。

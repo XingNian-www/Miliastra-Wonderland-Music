@@ -627,11 +627,26 @@ fn prepare_direct_blacklist(
     let mut reserved =
         service.reserve_direct_blacklist(command, moderation_requester_role(identity, parsed))?;
     if let Some(ModerationStart::Ready(task)) = &mut reserved {
-        task.bind_direct_sender(&parsed.username);
+        // 昵称与账号**一起**绑定，复查才能与准入同源（都走 role_of_sender）。
+        task.bind_direct_sender(&parsed.username, parsed.account.clone());
     }
     Ok(reserved)
 }
 
+/// 执行前用**实时**身份复查直执行发起者。
+///
+/// 必须与准入同源：准入走 `role_of_sender(username, account)`（有 UID 按 UID），
+/// 复查若退回 `role_of(sender)`（只认昵称），外部聊天源的管理员就会
+/// 「准入放行 → 复查失败 → 静默取消」。两个来源线索一起交给同一个函数。
+///
+/// 防冒充不变量不变：身份来源始终是**实时映射表**，不读 requester 字段、
+/// 也不信任排队时的 role 快照与来源下界。fail-closed 同样不变——绑定缺失、
+/// 账号/昵称都查不到、期间被降权，一律取消。
+///
+/// 复查**刻意不吃** `permission_required`：它是路由期的快照，「需要什么角色」
+/// 在排队期间可能已被面板改掉；复查要的是**实时身份**，而不是再读一遍快照。
+/// 准入侧那两个判断（`permission_required` 一票否决 + 实时身份）不能合并成
+/// 一个——前者是「这条命令当初就不该进队」，后者是「这个人现在还有没有权限」。
 fn reauthorize_moderation_result(
     identity: &IdentityAccess,
     task: &mut ModerationResultTask,
@@ -639,11 +654,11 @@ fn reauthorize_moderation_result(
     if !task.is_direct() {
         return true;
     }
-    if task
-        .direct_sender()
-        .and_then(|sender| identity.role_of(sender))
-        .is_some_and(|role| matches!(role, IdentityRole::Admin | IdentityRole::Owner))
-    {
+    if task.direct_sender().is_some_and(|sender| {
+        identity
+            .role_of_sender(sender, task.direct_account())
+            .is_some_and(|role| matches!(role, IdentityRole::Admin | IdentityRole::Owner))
+    }) {
         return true;
     }
     // 排队期间撤权或缺少可信发送者时，绝不执行预批准的管理员操作。
@@ -690,6 +705,11 @@ impl ApplicationRuntime {
         match moderation.start(command, requester_role, self)? {
             ModerationStart::Duplicate => Ok(false),
             ModerationStart::Ready(task) => {
+                // 这条「立即执行」路径**故意不绑 direct_account、也不复查**：它同步执行，
+                // 没有排队窗口，准入刚在 moderation_requester_role 用带 account 的口径判过
+                // （start 内部的 reserve_direct_blacklist 不 bind，direct_account 恒为 None）。
+                // 若将来把它改成异步入队，必须同时补 bind_direct_sender 与
+                // reauthorize_moderation_result，否则会变成「未绑定 = 复查必 false」的静默取消。
                 moderation.execute_result(task, self)?;
                 Ok(true)
             }
@@ -1948,6 +1968,96 @@ mod tests {
         assert!(!service.is_active(command).unwrap());
     }
 
+    #[test]
+    fn moderation_reauthorization_accepts_the_same_account_path_as_admission() {
+        use crate::features::identity::{GameAccount, IdentityConfig, IdentityMapping};
+        // 外部聊天源路径：管理员只登记了 UID，昵称是随机匹配键（未登记）。
+        // 准入按 UID 放行；复查若只按昵称查就会失败并静默取消——这就是本用例守的回归。
+        let identity = IdentityAccess::new(IdentityConfig {
+            mappings: vec![IdentityMapping {
+                nickname: String::new(),
+                id: uuid::Uuid::from_u128(9),
+                role: IdentityRole::Admin,
+                note: String::new(),
+                remark_sourced: false,
+                accounts: vec![GameAccount::new("100000001")],
+            }],
+        });
+        let service = test_moderation_service();
+        let mut parsed = moderation_routed("abcd1234");
+        parsed.account = Some(crate::features::command::CommandAccount::new(
+            miliastra_kernel::chat_source::GAME_GENSHIN,
+            "100000001",
+        ));
+        // 准入：按 UID 认出管理员。
+        assert_eq!(
+            moderation_requester_role(&identity, &parsed),
+            Some(IdentityRole::Admin)
+        );
+        let Some(ModerationStart::Ready(mut task)) =
+            prepare_direct_blacklist(&service, &identity, &parsed).unwrap()
+        else {
+            panic!("direct task expected");
+        };
+        assert_eq!(
+            task.direct_account().map(|account| account.uid.as_str()),
+            Some("100000001")
+        );
+        // 复查：必须与准入同源通过，而不是因为「昵称查不到」被静默取消。
+        assert!(reauthorize_moderation_result(&identity, &mut task));
+        let mut port = TestModerationPort::default();
+        service.execute_result(task, &mut port).unwrap();
+        assert_eq!(port.actions, 1, "UID 管理员的操作必须真的执行");
+    }
+
+    #[test]
+    fn moderation_reauthorization_fails_closed_for_unknown_uid_and_revocation() {
+        use crate::features::identity::{GameAccount, IdentityConfig, IdentityMapping};
+        let identity = IdentityAccess::new(IdentityConfig {
+            mappings: vec![IdentityMapping {
+                nickname: String::new(),
+                id: uuid::Uuid::from_u128(9),
+                role: IdentityRole::Admin,
+                note: String::new(),
+                remark_sourced: false,
+                accounts: vec![GameAccount::new("100000001")],
+            }],
+        });
+        let service = test_moderation_service();
+        let mut parsed = moderation_routed("abcd1234");
+        parsed.account = Some(crate::features::command::CommandAccount::new(
+            miliastra_kernel::chat_source::GAME_GENSHIN,
+            "100000001",
+        ));
+        // ① 绑定成未登记的 UID：有账号时只认 UID，不能用昵称兜底。
+        let Some(ModerationStart::Ready(mut unknown_account)) =
+            prepare_direct_blacklist(&service, &identity, &parsed).unwrap()
+        else {
+            panic!("direct expected");
+        };
+        unknown_account.bind_direct_sender(
+            "abcd1234",
+            Some(crate::features::command::CommandAccount::new(
+                miliastra_kernel::chat_source::GAME_GENSHIN,
+                "900000001",
+            )),
+        );
+        assert!(
+            !reauthorize_moderation_result(&identity, &mut unknown_account),
+            "未登记 UID 不能靠昵称拿到管理权限"
+        );
+        // ② 准入时是管理员，排队期间被撤权：复查仍按实时映射表，必须取消。
+        let Some(ModerationStart::Ready(mut revoked)) =
+            prepare_direct_blacklist(&service, &identity, &parsed).unwrap()
+        else {
+            panic!("direct expected");
+        };
+        identity.replace(IdentityConfig::default());
+        assert!(
+            !reauthorize_moderation_result(&identity, &mut revoked),
+            "撤权后不能执行预批准的管理员操作"
+        );
+    }
     #[test]
     fn applied_action_is_not_erased_by_residency_failure() {
         let command = ModerationCommand {

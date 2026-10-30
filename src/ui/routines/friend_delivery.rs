@@ -3374,7 +3374,12 @@ mod tests {
             4,
         );
         let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
-        routine_config.timeout_ms = 300;
+        // 这条用例验证的是「按 Esc 后截图必然失败 → 结论必须是结果未知」，
+        // 而 CaptureFailsAfterEscapeDevice 一旦 escaped 就恒返回 Err，所以失败本身是确定的。
+        // timeout_ms 只决定「等状态机走完」的预算：原先 300ms 在并发跑全量测试时
+        // 会被真实 UI 线程的调度延迟吃掉（实测 3 次全量跑偶发 1 次红），
+        // 与同文件其它用例的 2000ms 口径对齐，不改断言语义。
+        routine_config.timeout_ms = 2_000;
         routine_config.poll_ms = 1;
 
         let failure = ui_runtime

@@ -842,12 +842,16 @@ impl ApplicationRuntime {
             return Ok(Vec::new());
         }
         if let Err(error) = &result {
-            log::error!("确认窗口读取失败: {error:#}");
+            log::error!(
+                "确认窗口读取失败（步骤：等待玩家在确认窗口内回复），本轮拿不到任何回复；已提示玩家窗口结束，可稍后重试: {error:#}"
+            );
             if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
                 if let Err(reply_error) =
                     self.reply("确认窗口已结束：无法继续读取聊天，请稍后重试。")
                 {
-                    log::warn!("确认窗口失败反馈发送失败: {reply_error:#}");
+                    log::warn!(
+                        "确认窗口的结束提示发送失败（步骤：读取失败后告知玩家窗口已结束），玩家不知道这次选择没被收到，可能继续等待或重复发送指令: {reply_error:#}"
+                    );
                 }
             }
         }
@@ -901,12 +905,16 @@ impl ApplicationRuntime {
             return Ok(Vec::new());
         }
         if let Err(error) = &result {
-            log::error!("确认窗口读取失败: {error:#}");
+            log::error!(
+                "确认窗口读取失败（步骤：等待玩家在确认窗口内回复），本轮拿不到任何回复；已提示玩家窗口结束，可稍后重试: {error:#}"
+            );
             if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
                 if let Err(reply_error) =
                     self.reply("确认窗口已结束：无法继续读取聊天，请稍后重试。")
                 {
-                    log::warn!("确认窗口失败反馈发送失败: {reply_error:#}");
+                    log::warn!(
+                        "确认窗口的结束提示发送失败（步骤：读取失败后告知玩家窗口已结束），玩家不知道这次选择没被收到，可能继续等待或重复发送指令: {reply_error:#}"
+                    );
                 }
             }
         }

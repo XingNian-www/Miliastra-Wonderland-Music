@@ -26,7 +26,13 @@ impl PlaylistWindowSession {
 impl Drop for PlaylistWindowCleanup {
     fn drop(&mut self) {
         if let Err(error) = self.application.discard_window(&self.owner) {
-            log::warn!("歌单窗口清理失败: {error:#}");
+            // 唯一失败原因是窗口状态表的互斥锁已中毒（discard_window 没有其它出错路径），
+            // 也就是说状态**读不出来也清不掉**，不只是"清理没做"。
+            // 刻意不打印 owner：那是歌单归属键（身份 UUID 或昵称），属隐私面，
+            // 而"状态表不可用"这个结论本身与具体玩家无关。
+            log::warn!(
+                "歌单窗口清理失败（步骤：退出时清除该玩家的歌单窗口状态）：窗口状态表已不可用，本次没能清掉对应记录，该玩家的歌单窗口会残留到 20 秒有效期结束；期间若重新打开歌单，新窗口虽然会覆盖旧记录、但仍可能继承旧截止时间，导致选择窗口提前关闭：{error:#}"
+            );
         }
     }
 }

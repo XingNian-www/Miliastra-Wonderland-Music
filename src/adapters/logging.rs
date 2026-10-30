@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
@@ -56,6 +56,11 @@ struct FileLogger {
     level: LevelFilter,
     monitor: Mutex<Option<MonitorLogSink>>,
     stderr: AtomicBool,
+    /// 兜底输出的节流状态：上次真正输出的时刻。
+    ///
+    /// 磁盘写满时**每一条**日志都会触发一次兜底，而兜底没有级别过滤、直接写 stderr，
+    /// 不节流会把终端刷爆、把真正有用的那几行挤走。
+    fallback_last_emitted: Mutex<Option<Instant>>,
 }
 
 struct LogFiles {
@@ -95,6 +100,12 @@ impl Log for FileLogger {
             self.write_fallback(&format!("日志轮转失败，继续写入当前文件: {error:#}"));
         }
         if is_timing_target(record.target()) {
+            // 性能日志写入失败**刻意静默**：
+            //
+            // 它是给脚本做性能分析的字段流，不是排障依据——真正需要排障时看主日志。
+            // 而且它与主日志同目录同磁盘，一旦磁盘写满，它会和主日志一起失败；
+            // 若这里也走 fallback，就变成「同一故障在 stderr 上重复两遍」，只会刷屏。
+            // 主日志那条 fallback 已经足以告知用户「日志写不进去了」。
             let _ = files.timing.write_all(format!("{line}\n").as_bytes());
             return;
         }
@@ -118,9 +129,17 @@ impl Log for FileLogger {
             monitor.push(line.clone());
         }
         if self.stderr.load(Ordering::Relaxed) {
+            // stderr 自身写失败不做任何补救：它是最后的出路，坏了就没有别的通道了。
             let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
         }
-        let _ = files.main.write_all(format!("{line}\n").as_bytes());
+        if let Err(error) = files.main.write_all(format!("{line}\n").as_bytes()) {
+            // 主日志写不进去时，用户会在日志里看到「什么都没有」，
+            // 无法区分「没发生」与「没写进去」——而这正是最需要日志的时刻。
+            // 因此必须显式告知：写到大日志失败这件事本身要出现在 stderr 上。
+            self.write_fallback(&format!(
+                "日志写入失败（步骤：追加到当日日志文件），本条及后续日志可能丢失；请检查磁盘空间与文件权限：{error:#}"
+            ));
+        }
     }
 
     fn flush(&self) {
@@ -132,16 +151,42 @@ impl Log for FileLogger {
 }
 
 impl FileLogger {
-    /// 文件日志器自身不可用时（锁损坏、轮转失败）的兜底输出。
+    /// 文件日志器自身不可用时（锁损坏、轮转失败、写入失败）的兜底输出。
     ///
     /// 走到这里说明**本条日志进不了文件**：不能再用 `log::warn!`（会递归回到
     /// 同一个坏掉的文件器），只能直接写 stderr。前缀与主格式保持一致，避免
     /// 出现第二种行形状；级别固定为 WARN，因为能触发兜底的只有可降级的故障。
+    ///
+    /// **内部带 60 秒节流。** 磁盘写满时每一条日志都会触发一次兜底，
+    /// 而这里没有级别过滤，不节流会把 stderr 刷爆、把真正有用的几行挤走。
+    /// 窗口内的重复故障静默（第一次已经告诉过用户了），窗口过后再提示一次。
     fn write_fallback(&self, message: &str) {
-        if self.stderr.load(Ordering::Relaxed) {
-            let prefix = format_prefix_at(log::Level::Warn, SystemTime::now());
-            let _ = std::io::stderr().write_all(format!("{prefix} {message}\n").as_bytes());
+        if !self.stderr.load(Ordering::Relaxed) {
+            return;
         }
+        if !self.should_emit_fallback(Instant::now()) {
+            return;
+        }
+        let prefix = format_prefix_at(log::Level::Warn, SystemTime::now());
+        let _ = std::io::stderr().write_all(
+            format!("{prefix} {message}；同类错误在 60 秒内不再重复\n").as_bytes(),
+        );
+    }
+
+    /// 兜底输出是否应当真正发生（节流判定）。
+    ///
+    /// 抽成独立方法是为了能直接单测窗口语义，不必真的把磁盘写满。
+    /// 首次一定放行；窗口内拒绝；窗口过后放行一次并推进窗口。
+    fn should_emit_fallback(&self, now: Instant) -> bool {
+        let Ok(mut last) = self.fallback_last_emitted.lock() else {
+            // 节流状态锁损坏：退回「每次都输出」。宁可刷屏，也不能把错误吞掉。
+            return true;
+        };
+        if fallback_allowed(*last, now) {
+            *last = Some(now);
+            return true;
+        }
+        false
     }
 }
 
@@ -174,6 +219,22 @@ impl LogFiles {
             cleanup_old_daily_logs(log_dir, day, retain_days)?;
         }
         Ok(())
+    }
+}
+
+/// 兜底输出的节流窗口。
+///
+/// 磁盘写满属于持续性故障，每条日志都会命中；60 秒足以让用户看到提示，
+/// 又不至于让同类错误反复打断 TUI 输出。
+const FALLBACK_THROTTLE: Duration = Duration::from_secs(60);
+
+/// 纯函数：给定「上次输出时刻」与「现在」，判断这次是否应当输出。
+///
+/// 首次（`last == None`）放行；距上次不足 60 秒则抑制；超过则放行。
+fn fallback_allowed(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(last) => now.duration_since(last) >= FALLBACK_THROTTLE,
     }
 }
 
@@ -269,6 +330,7 @@ pub(crate) fn init_file(config: &LoggingConfig) -> Result<LogPaths> {
         level,
         monitor: Mutex::new(None),
         stderr: AtomicBool::new(true),
+        fallback_last_emitted: Mutex::new(None),
     };
     set_logger(logger).context("注册全局日志器（可能已被其它组件抢先注册）")?;
     log::set_max_level(level);
@@ -615,6 +677,98 @@ mod tests {
             target_level("web_token", configured),
             LevelFilter::Warn,
             "web_token 只用于报告访问令牌异常，本身是 warn 级事件；它走的是「不落文件」分支而不是「跟随配置」分支"
+        );
+    }
+
+    /// 节流纯函数：首次放行、窗口内抑制、窗口后再次放行。
+    ///
+    /// 这是「只输出一次」的核心判据，可以脱离真实磁盘故障单测。
+    #[test]
+    fn fallback_throttle_allows_once_per_window() {
+        let start = Instant::now();
+        assert!(fallback_allowed(None, start), "首次必须放行");
+
+        let just_after = start + Duration::from_millis(1);
+        assert!(
+            !fallback_allowed(Some(start), just_after),
+            "窗口内必须抑制"
+        );
+
+        let almost = start + FALLBACK_THROTTLE - Duration::from_millis(1);
+        assert!(
+            !fallback_allowed(Some(start), almost),
+            "差 1ms 到窗口末尾仍应抑制"
+        );
+
+        let exactly = start + FALLBACK_THROTTLE;
+        assert!(
+            fallback_allowed(Some(start), exactly),
+            "恰好满 60 秒应放行（边界取 >=）"
+        );
+
+        let later = start + Duration::from_secs(300);
+        assert!(fallback_allowed(Some(start), later), "远超窗口应放行");
+    }
+
+    /// 端到端：连写 100 条失败日志，兜底只出现 1 次。
+    ///
+    /// 用真实 FileLogger + 真实写失败（/dev/full 在 Linux 上恒返回 ENOSPC），
+    /// 而不是只测纯函数——纯函数测不出「log() 是否真的调用了它」。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repeated_write_failures_emit_fallback_only_once_per_window() {
+        // /dev/full：任何写入都返回 ENOSPC，正好模拟磁盘满。
+        let Ok(device) = OpenOptions::new().write(true).open("/dev/full") else {
+            eprintln!("跳过：当前环境没有 /dev/full");
+            return;
+        };
+        let Ok(timing_device) = OpenOptions::new().write(true).open("/dev/full") else {
+            eprintln!("跳过：当前环境没有 /dev/full");
+            return;
+        };
+        let now = SystemTime::now();
+        let logger = FileLogger {
+            files: Mutex::new(LogFiles {
+                day: local_day(now),
+                main_path: PathBuf::from("/dev/full"),
+                timing_path: PathBuf::from("/dev/full"),
+                main: device,
+                timing: timing_device,
+            }),
+            log_dir: PathBuf::from("/tmp"),
+            rotate_daily: false,
+            retain_days: 1,
+            level: LevelFilter::Trace,
+            monitor: Mutex::new(None),
+            stderr: AtomicBool::new(true),
+            fallback_last_emitted: Mutex::new(None),
+        };
+
+        for index in 0..100 {
+            // 这 100 条会经正常的 stderr 分支各打一行，属于**预期输出**：
+            // stderr 那条 `let _ =` 刻意不节流，60 秒窗口只作用于 fallback。
+            // 本用例断言的是 fallback 的节流状态，不是 stderr 的输出次数。
+            //
+            // format_args! 产生的是临时值，必须绑到 let 上再交给 Record，
+            // 否则借用会活过临时值的作用域（E0716）。这里用 String 拼好再取引用。
+            let message = format!("第 {index} 条");
+            let args = format_args!("{message}");
+            let record = log::Record::builder()
+                .args(args)
+                .level(log::Level::Info)
+                .target("miliastra_wonderland_music::test")
+                .build();
+            logger.log(&record);
+        }
+
+        // 节流状态必须已被推进：窗口内后续失败不再输出。
+        assert!(
+            logger.fallback_last_emitted.lock().unwrap().is_some(),
+            "写入失败后应记录节流时间"
+        );
+        assert!(
+            !logger.should_emit_fallback(Instant::now()),
+            "窗口内第二次兜底必须被抑制"
         );
     }
 

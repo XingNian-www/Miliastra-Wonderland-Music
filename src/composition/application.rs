@@ -1054,12 +1054,23 @@ impl PendingTask {
         match self {
             PendingTask::SetChatListenerMode { target } => {
                 if let Err(error) = business.cancel_chat_listener_mode_request(*target) {
-                    log::error!("取消值守模式切换失败: {error}");
+                    // 核实要点：CancelModeRequest 的 handler 内部 `cancel_mode_request()` 无返回值、
+                    // 且 `response.send(Ok(()))` 恒成功，所以这里失败**只可能是运行时通道故障**
+                    // （运行时已停止 / 线程崩溃），不是「取消动作本身没做成」。
+                    // 因此影响要说成「补偿没送达」，而不是「运行时留下残留」。
+                    log::error!(
+                        "取消值守模式切换失败（步骤：通知运行时撤销已排队的模式切换请求）：补偿请求没能送达运行时（运行时可能已停止或线程已崩溃），目标模式{}的切换请求是否仍在无法确认；若运行时仍在运行，该请求会按原计划生效，本应放弃的切换不会被执行撤销：{error}",
+                        target.label()
+                    );
                 }
             }
             PendingTask::SecondaryUnread { .. } | PendingTask::RestoreSecondaryHall => {
                 if let Err(error) = business.release_chat_listener_unread_task() {
-                    log::error!("释放二级未读任务失败: {error}");
+                    // 同理：ReleaseUnreadTask 的 handler 也是无条件 send(Ok(()))，
+                    // 失败只可能是运行时通道故障，不能写成「任务残留」。
+                    log::error!(
+                        "释放二级未读任务失败（步骤：通知运行时归还二级未读任务占用的值守状态）：补偿请求没能送达运行时（运行时可能已停止或线程已崩溃），该任务的占用是否已归还无法确认；若运行时仍在运行，占位会继续存在，后续二级未读可能被拒绝派发直到占位被覆盖：{error}"
+                    );
                 }
             }
             PendingTask::ModerationResult(task) => {

@@ -442,7 +442,9 @@ impl FormalTaskRuntime {
                     post_settle,
                     coordinator,
                 ) {
-                    log::error!("正式任务运行时异常退出: {error:#}");
+                    log::error!(
+                        "正式任务运行时异常退出（步骤：正式任务主循环取任务并执行），此后不再有正式任务被执行；已入队的点歌/管理/邀请等任务会一直停在待处理，玩家看到的表现是「命令没反应」: {error:#}"
+                    );
                 }
                 let _ = finished_sender.send(());
             })
@@ -517,7 +519,9 @@ impl FormalTaskRuntime {
 impl Drop for FormalTaskRuntime {
     fn drop(&mut self) {
         if let Err(error) = self.stop(DROP_SHUTDOWN_GRACE) {
-            log::error!("正式任务运行时关闭失败: {error:#}");
+            log::error!(
+                "正式任务运行时关闭失败（步骤：析构时等待任务线程退出），任务线程可能仍在运行并持有 UI 租约；本次退出不完整，进程结束时可能残留线程: {error:#}"
+            );
         }
     }
 }
@@ -625,11 +629,15 @@ fn execute_diagnostic_task(
     let completion = match catch_unwind(AssertUnwindSafe(|| task.execute())) {
         Ok(Ok(result)) => DiagnosticTaskCompletion::Succeeded(result),
         Ok(Err(error)) => {
-            log::error!("Web 工具执行失败 {label}: {error:#}");
+            log::error!(
+                "Web 工具「{label}」执行失败（步骤：执行面板发起的这次调用），本次操作没有生效，面板会收到失败结果，可修正后重试: {error:#}"
+            );
             DiagnosticTaskCompletion::Failed(format!("{error:#}"))
         }
         Err(_) => {
-            log::error!("Web 工具执行发生未捕获异常: {label}");
+            log::error!(
+                "Web 工具「{label}」执行时发生未捕获异常（步骤：执行面板发起的这次调用），本次操作没有生效，面板会收到失败结果；异常已被隔离，正式任务循环不受影响，可重试"
+            );
             DiagnosticTaskCompletion::Failed("Web 工具执行发生未捕获异常".to_string())
         }
     };

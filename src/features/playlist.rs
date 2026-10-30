@@ -384,7 +384,7 @@ impl PlaylistApplication {
         let connection = self.connection()?;
         let migrated = owner_key::migrate_named_rows(&connection, nickname_to_uuid)?;
         if migrated > 0 {
-            log::info!("歌单归属键迁移：{migrated} 条记录已改为身份 UUID");
+            log::info!("歌单归属键迁移完成：{migrated} 条记录已按身份 UUID 重新归属");
         }
         Ok(migrated)
     }
@@ -540,7 +540,9 @@ impl PlaylistApplication {
             match serde_json::from_str::<PlayableTrack>(&json) {
                 Ok(track) => tracks.push(track),
                 // 单条损坏不应让整个歌单不可用。
-                Err(error) => log::warn!("歌单条目解析失败，已跳过: {error}"),
+                Err(error) => log::warn!(
+                    "歌单中有一条记录无法解析，已跳过该条；该歌不会出现在歌单里: {error}"
+                ),
             }
         }
         Ok(tracks)

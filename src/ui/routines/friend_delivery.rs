@@ -621,21 +621,50 @@ fn execute_friend_deliveries(
                             && retryable_certainty(attempt.failure.certainty()) =>
                     {
                         retry = retry.saturating_add(1);
-                        log::warn!(
-                            "好友投递确认未发送，执行自动重试 {}/{} stage={}",
-                            retry,
-                            *config
-                                .auto_retry_count
-                                .read()
-                                .expect("好友投递自动重试次数共享锁已中毒"),
-                            attempt.failure.stage()
-                        );
+                        // 首次重试只是 debug：这是流程内的正常兜底，玩家还没感知到失败。
+                        // 反复重试才说明环境有问题，那时才值得进主日志（见下面升级逻辑）。
+                        let limit = *config
+                            .auto_retry_count
+                            .read()
+                            .expect("好友投递自动重试次数共享锁已中毒");
+                        // 文案注意：这里**本次重试正要执行**，所以 retry==limit 时
+                        // 说的是「最后一次自动重试」，不能说「已用尽」。
+                        if retry < limit {
+                            log::debug!(
+                                "好友投递「{}」未送达，执行第 {}/{} 次自动重试（步骤：「{}」），本次失败可重试，流程继续：{}",
+                                delivery.recipient(),
+                                retry,
+                                limit,
+                                attempt.failure.stage_label(),
+                                attempt.failure.reason()
+                            );
+                        } else {
+                            log::warn!(
+                                "好友投递「{}」已连续 {} 次未送达，第 {}/{} 次为最后一次自动重试（步骤：「{}」），若再失败本次投递将放弃：{}",
+                                delivery.recipient(),
+                                retry.saturating_sub(1),
+                                retry,
+                                limit,
+                                attempt.failure.stage_label(),
+                                attempt.failure.reason()
+                            );
+                        }
                     }
                     Err(attempt) => {
                         if let Some(index) = attempt.unknown_message_index {
                             outcomes[recipient_index].message_statuses[index] =
                                 FriendDeliveryMessageStatus::ResultUnknown;
                         }
+                        // 这里是**最终放弃**分支。以前完全没有日志：
+                        // auto_retry_count 默认为 0 时根本进不了上面的重试分支，
+                        // 于是投递失败在日志里彻底查不到（复核 P1-2 指出的漏报）。
+                        log::warn!(
+                            "好友投递放弃（步骤：「{}」）：收件人「{}」的这批消息本次未送达，不会自动重试，收件人需重新发起请求（{}）：{}",
+                            attempt.failure.stage_label(),
+                            delivery.recipient(),
+                            attempt.failure.certainty().label(),
+                            attempt.failure.reason()
+                        );
                         outcomes[recipient_index].failure = Some(attempt.failure);
                         break;
                     }
@@ -1574,7 +1603,11 @@ fn restore_primary(
         ));
     }
     if state == UiStateKind::Unknown {
-        log::warn!("一级驻留持续稳定为 Unknown，按 Esc 尝试关闭残留面板后重新确认一级界面");
+        // 到这里说明已经等待过稳定窗口、仍未得到可识别的一级界面。
+        // 需要写清「此前尝试过什么」，否则维护者无法判断该 Esc 是第几次兜底。
+        log::warn!(
+            "一级界面驻留未就绪（步骤：恢复一级界面驻留）：已等待界面稳定超时，状态仍为无法识别，说明可能有残留面板遮挡；本次按 Esc 尝试关闭残留面板后重新确认一级界面，若仍失败则后续投递无法继续"
+        );
     }
     context
         .device()
@@ -1659,7 +1692,7 @@ fn confirm_primary_visual_stability(
                 ));
             }
             log::warn!(
-                "好友按钮区域持续变化 {}ms，按已确认的一级界面继续",
+                "一级界面驻留确认超时（步骤：确认一级界面驻留）：好友按钮区域持续变化 {}ms 未稳定，但此前已确认过一级界面，因此按已确认结果继续，本次投递不受影响",
                 PRIMARY_STABILITY_TIMEOUT_MS
             );
             return Ok(());

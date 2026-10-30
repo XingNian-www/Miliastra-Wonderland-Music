@@ -77,6 +77,20 @@ pub(crate) enum OcrPriority {
     Diagnostic,
 }
 
+impl OcrPriority {
+    /// 性能日志里的可读标签。
+    ///
+    /// `performance` 是给脚本解析的独立日志流，字段名与分隔方式不能变；
+    /// 但原先用 `{:?}` 打的枚举值对人不友好，这里换成固定单词。
+    pub(crate) const fn as_log_label(self) -> &'static str {
+        match self {
+            Self::UiConfirmation => "ui-confirmation",
+            Self::ChatObservation => "chat-observation",
+            Self::Diagnostic => "diagnostic",
+        }
+    }
+}
+
 struct OcrJob {
     priority: OcrPriority,
     sequence: u64,
@@ -201,7 +215,7 @@ impl ProductionOcrDevice {
                 Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
             return;
         }
-        log::info!("OCR 引擎运行超过 1 小时，开始后台重建");
+        log::info!("OCR 引擎已连续运行超过 1 小时，开始后台重建；重建期间识别由旧引擎继续服务，不受影响");
         let started = Instant::now();
         let args = self.args.clone();
         let engine = self.engine.clone();
@@ -214,7 +228,7 @@ impl ProductionOcrDevice {
                 match make_ocr_engine(&args) {
                     Ok(replacement) => {
                         *lock_ocr_engine(&engine) = replacement;
-                        log::info!("OCR 引擎后台重建完成");
+                        log::info!("OCR 引擎后台重建完成，新引擎已接管识别");
                         log::info!(
                             target: "timing",
                             "OCR 引擎重建耗时: {}ms",
@@ -224,7 +238,9 @@ impl ProductionOcrDevice {
                     Err(error) => {
                         *lock_rebuild_due_at(&rebuild_due_at) =
                             Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
-                        log::error!("OCR 引擎重建失败，继续使用旧引擎: {error:#}");
+                        log::error!(
+                            "OCR 引擎后台重建失败（步骤：加载识别模型），本次重建未完成，识别继续由旧引擎承担，将于稍后重试: {error:#}"
+                        );
                     }
                 }
                 inflight.store(false, Ordering::Release);
@@ -233,7 +249,9 @@ impl ProductionOcrDevice {
             self.rebuild_inflight.store(false, Ordering::Release);
             *lock_rebuild_due_at(&self.rebuild_due_at) =
                 Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
-            log::error!("启动 OCR 引擎重建线程失败: {error:#}");
+            log::error!(
+                "无法启动 OCR 引擎后台重建线程（步骤：创建重建线程），本次重建跳过，识别继续由旧引擎承担，将于稍后重试: {error:#}"
+            );
         } else {
             *lock_rebuild_due_at(&self.rebuild_due_at) = Instant::now() + OCR_REBUILD_INTERVAL;
         }
@@ -387,7 +405,7 @@ impl OcrRuntime {
                 self.abandoned_workers.push(worker);
                 if self.abandoned_workers.len() > 8 {
                     log::error!(
-                        "OCR worker 累计 {} 个未退出线程,可能存在原生推理卡死",
+                        "OCR 识别线程累计 {} 个在关闭超时后仍未退出（步骤：等待识别线程结束），可能存在原生推理卡死；这些线程已被放弃回收，后续每次关闭仍会累积",
                         self.abandoned_workers.len()
                     );
                 }
@@ -486,7 +504,7 @@ fn run_ocr_runtime(mut device: impl OcrDevice, channel: Arc<OcrChannel>) {
         };
         let started = Instant::now();
         if log::log_enabled!(target: "performance", log::Level::Debug) {
-            log::debug!(target: "performance", "ocr sequence={} priority={:?} queue_wait_us={} expired={}", job.sequence, job.priority, started.duration_since(job.queued_at).as_micros(), started >= job.deadline);
+            log::debug!(target: "performance", "ocr sequence={} priority={} queue_wait_us={} expired={}", job.sequence, job.priority.as_log_label(), started.duration_since(job.queued_at).as_micros(), started >= job.deadline);
         }
         if started >= job.deadline {
             let _ = job.response.try_send(Err(OcrRuntimeError::TimedOut));
@@ -496,7 +514,7 @@ fn run_ocr_runtime(mut device: impl OcrDevice, channel: Arc<OcrChannel>) {
             .recognize_lines(&job.image)
             .map_err(OcrRuntimeError::Inference);
         if log::log_enabled!(target: "performance", log::Level::Debug) {
-            log::debug!(target: "performance", "ocr sequence={} priority={:?} inference_us={} success={}", job.sequence, job.priority, started.elapsed().as_micros(), result.is_ok());
+            log::debug!(target: "performance", "ocr sequence={} priority={} inference_us={} success={}", job.sequence, job.priority.as_log_label(), started.elapsed().as_micros(), result.is_ok());
         }
         let should_respond = match channel.state.lock() {
             Ok(mut state) => {

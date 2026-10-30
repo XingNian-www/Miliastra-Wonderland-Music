@@ -480,7 +480,7 @@ impl TurtleSoupWorkerRuntime {
                 worker.run(index + 1, completion_port)
             }));
         }
-        log::info!("海龟汤 AI Worker 已启动: concurrency={}", worker_count);
+        log::info!("海龟汤 AI 线程组已启动，并发线程数为 {worker_count} 个");
         Self {
             shutting_down,
             workers,
@@ -494,7 +494,9 @@ impl TurtleSoupWorkerRuntime {
         for worker in self.workers.drain(..) {
             if worker.is_finished() {
                 if worker.join().is_err() {
-                    log::error!("海龟汤 AI Worker 退出时 panic");
+                    log::error!(
+                        "海龟汤 AI 线程在退出时崩溃，该线程的队列任务会丢失，需重启程序恢复"
+                    );
                 }
                 continue;
             }
@@ -506,10 +508,14 @@ impl TurtleSoupWorkerRuntime {
                 let _ = done_tx.send(result);
             });
             match done_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok(Err(_)) => log::error!("海龟汤 AI Worker 退出时 panic"),
+                Ok(Err(_)) => log::error!(
+                    "海龟汤 AI 线程在退出时崩溃，该线程的队列任务会丢失，需重启程序恢复"
+                ),
                 Ok(Ok(())) => {}
                 Err(_) => {
-                    log::error!("海龟汤 AI Worker 未能在 5 秒内退出,已分离(可能阻塞在 AI 请求)");
+                    log::error!(
+                        "海龟汤 AI 线程 5 秒内未能退出，已与主流程分离；该线程可能仍阻塞在 AI 请求上，关闭程序前会残留"
+                    );
                     let _ = reaper;
                 }
             }
@@ -1212,7 +1218,7 @@ impl TurtleSoupService {
                     .or_insert_with(|| question.player.clone());
                 record_question_activity(session, observed_at);
                 log::info!(
-                    "海龟汤批量答案已暂存: nickname={} part={} stored={}",
+                    "海龟汤收到「{}」的第 {} 段批量答案，已暂存 {} 条，凑齐后一并提交",
                     normalize_log_text(&question.player),
                     index,
                     stored
@@ -1324,9 +1330,9 @@ impl TurtleSoupService {
         session.question_count = session.question_count.saturating_add(1);
         record_question_activity(session, observed_at);
         log::info!(
-            "海龟汤 AI 请求已排队: request_id={} nickname={}",
-            request_id,
-            normalize_log_text(&player_for_log)
+            "「{}」的海龟汤提问已进入 AI 裁决队列，排队号 {}",
+            normalize_log_text(&player_for_log),
+            request_id
         );
         Ok(QuestionSubmitOutcome::Queued { request_id })
     }
@@ -1400,7 +1406,9 @@ impl TurtleSoupService {
         if let Some(reason) = reason
             && let Err(error) = self.begin_settlement(reason, delivery)
         {
-            log::error!("海龟汤自动结算失败: {error:#}");
+            log::error!(
+                "海龟汤自动结算失败（步骤：会话到期后生成结算结果）；本局未公布汤底，玩家不会收到结算消息: {error:#}"
+            );
         }
     }
 
@@ -1426,7 +1434,10 @@ impl TurtleSoupService {
         };
         self.cancel_waiting_generation(_old_generation);
         entertainment.release(EntertainmentKind::TurtleSoup);
-        log::warn!("海龟汤会话已中止且不公布汤底: {}", reason);
+        log::warn!(
+            "海龟汤会话因上下文丢失而中止，不公布汤底（原因：{}）",
+            reason
+        );
     }
 
     pub(crate) fn delivery_is_current(&self, delivery: TurtleSoupDelivery) -> bool {
@@ -1462,7 +1473,7 @@ impl TurtleSoupService {
                     session.last_question_at = Some(now);
                 }
                 state.phase = TurtleSoupPhase::Active;
-                log::info!("海龟汤汤面已完整发送，开始接受提问");
+                log::info!("海龟汤汤面已完整发送，本局开始接受提问");
             }
             TurtleSoupDeliveryPurpose::Settlement => {
                 self.finish_settlement(delivery.generation, false, None);
@@ -1495,10 +1506,16 @@ impl TurtleSoupService {
                 );
             }
             TurtleSoupDeliveryPurpose::SurfaceRepeat => {
-                log::error!("海龟汤汤面重发失败，已丢弃: {}", summary);
+                log::error!(
+                    "海龟汤汤面重发失败，已丢弃该条消息；玩家可能没看到汤面，本局无法正常提问: {}",
+                    summary
+                );
             }
             TurtleSoupDeliveryPurpose::Judgment => {
-                log::error!("海龟汤普通裁决回复发送失败，已丢弃: {}", summary);
+                log::error!(
+                    "海龟汤裁决回复发送失败，已丢弃该条消息；提问的玩家不会收到判定结果: {}",
+                    summary
+                );
             }
         }
         self.reconcile_entertainment(entertainment);
@@ -1648,15 +1665,11 @@ impl TurtleSoupService {
                     bail!("延迟聊天队列已被受保护批次占满")
                 }
                 TurtleSoupDeliveryOutcome::DroppedEarlierMessage => {
-                    log::warn!("海龟汤开局入队时淘汰了一条较早的非关键回复")
+                    log::warn!("海龟汤开局消息入队时队列已满，淘汰了一条较早的非关键回复")
                 }
                 TurtleSoupDeliveryOutcome::Added => {}
             }
-            log::info!(
-                "海龟汤题目已选中并持久化为已使用: id={} remaining={}",
-                puzzle.id,
-                remaining
-            );
+            log::info!("海龟汤已选题并标记为已使用，剩余可用题目 {} 道", remaining);
             Ok(())
         })();
 
@@ -1694,7 +1707,7 @@ impl TurtleSoupService {
             bail!("延迟聊天队列已满");
         }
         if outcome == TurtleSoupDeliveryOutcome::DroppedEarlierMessage {
-            log::warn!("海龟汤汤面重发入队时淘汰了一条较早的普通回复");
+            log::warn!("海龟汤汤面重发入队时队列已满，淘汰了一条较早的普通回复");
         }
         Ok(())
     }
@@ -1775,7 +1788,7 @@ impl TurtleSoupService {
             bail!("结算批次无法进入延迟聊天队列");
         }
         if outcome == TurtleSoupDeliveryOutcome::DroppedEarlierMessage {
-            log::warn!("海龟汤结算入队时淘汰了一条较早的非关键回复");
+            log::warn!("海龟汤结算消息入队时队列已满，淘汰了一条较早的非关键回复");
         }
         Ok(true)
     }
@@ -1797,9 +1810,11 @@ impl TurtleSoupService {
         if finished {
             self.cancel_waiting_generation(generation);
             if incomplete {
-                log::error!("海龟汤结算已结束，但游戏内消息发送不完整");
+                log::error!(
+                    "海龟汤结算已结束，但游戏内消息发送不完整；部分玩家看不到完整结算，娱乐互斥已释放"
+                );
             } else {
-                log::info!("海龟汤结算消息已完整发送，娱乐互斥已释放");
+                log::info!("海龟汤结算消息已完整发送，本局结束并释放娱乐互斥");
             }
         }
     }
@@ -1847,7 +1862,7 @@ fn record_question_activity(session: &mut TurtleSoupSession, observed_at: Instan
 
 impl TurtleSoupWorker {
     fn run(&self, index: usize, completion_port: Arc<dyn TurtleSoupAiCompletionPort>) {
-        log::info!("海龟汤 AI Worker {} 已就绪", index);
+        log::debug!("海龟汤 AI 线程 {} 已就绪", index);
         while !self.shutting_down.load(Ordering::SeqCst) {
             let Some(job) = self.wait_for_job() else {
                 continue;
@@ -1858,7 +1873,7 @@ impl TurtleSoupWorker {
             let outcome = self.adjudicate(&job, &context);
             completion_port.submit(TurtleSoupAiCompletion { job, outcome });
         }
-        log::info!("海龟汤 AI Worker {} 已停止", index);
+        log::debug!("海龟汤 AI 线程 {} 已停止", index);
     }
 
     fn wait_for_job(&self) -> Option<TurtleSoupJob> {
@@ -2010,19 +2025,19 @@ impl TurtleSoupService {
     ) {
         let TurtleSoupAiCompletion { job, outcome } = completion;
         let log_error = outcome.error_summary.clone();
-        log::info!(
-            "海龟汤 AI 裁决完成: request_id={} nickname={} verdict={} elapsed={}ms retries={}",
-            job.request_id,
+        log::debug!(
+            "海龟汤 AI 裁决完成：「{}」的提问判定为「{}」，耗时 {} 毫秒，重试 {} 次（排队号 {}）",
             normalize_log_text(&job.player),
             outcome.judgment.label(),
             outcome.elapsed_ms,
-            outcome.retries
+            outcome.retries,
+            job.request_id
         );
         if let Some(error) = &log_error {
             log::warn!(
-                "海龟汤 AI 裁决错误: request_id={} nickname={} error={}",
-                job.request_id,
+                "「{}」的海龟汤提问 AI 裁决出错（排队号 {}），本次按错误结果回复玩家: {}",
                 normalize_log_text(&job.player),
+                job.request_id,
                 normalize_log_text(error)
             );
         }
@@ -2078,7 +2093,7 @@ impl TurtleSoupService {
             ) {
                 Ok(TurtleSoupDeliveryOutcome::Added) => {}
                 Ok(TurtleSoupDeliveryOutcome::DroppedEarlierMessage) => {
-                    log::warn!("海龟汤获胜结算入队时淘汰了一条较早的非关键回复")
+                    log::warn!("海龟汤获胜结算入队时队列已满，淘汰了一条较早的非关键回复")
                 }
                 Ok(TurtleSoupDeliveryOutcome::Rejected) | Err(_) => self.finish_settlement(
                     generation,
@@ -2094,13 +2109,15 @@ impl TurtleSoupService {
                 TurtleSoupDeliveryPurpose::Judgment,
             ) {
                 Ok(TurtleSoupDeliveryOutcome::Rejected) => {
-                    log::warn!("海龟汤普通裁决回复队列已满，已丢弃")
+                    log::warn!("海龟汤裁决回复队列已满，本次回复已丢弃；提问的玩家不会收到判定结果")
                 }
                 Ok(TurtleSoupDeliveryOutcome::DroppedEarlierMessage) => {
-                    log::warn!("海龟汤普通裁决回复入队时淘汰了一条较早的普通回复")
+                    log::warn!("海龟汤裁决回复入队时队列已满，淘汰了一条较早的普通回复")
                 }
                 Ok(TurtleSoupDeliveryOutcome::Added) => {}
-                Err(error) => log::error!("海龟汤普通裁决回复入队失败: {error:#}"),
+                Err(error) => log::error!(
+                    "海龟汤裁决回复入队失败（步骤：把判定结果交给延迟聊天队列）；提问的玩家不会收到判定结果: {error:#}"
+                ),
             }
         }
         self.reconcile_entertainment(entertainment);

@@ -1026,7 +1026,7 @@ fn prepare_local_runtime_loading() {
                     library.display()
                 ),
                 Err(error) => log::warn!(
-                    "加载 EXE 目录中的 OpenVINO runtime 失败，继续使用环境变量查找: path={} error={error}",
+                    "加载 EXE 目录中的 OpenVINO 运行时失败（步骤：按 EXE 位置查找推理库），本次改用环境变量查找；路径 {}，原因 {error}",
                     library.display()
                 ),
             }
@@ -1127,7 +1127,7 @@ fn configure_cache(core: &mut Core, device: &DeviceType<'static>, cache_dir: Opt
     };
     if let Err(error) = std::fs::create_dir_all(cache_dir) {
         log::warn!(
-            "创建 OpenVINO 缓存目录失败，继续无持久化缓存: {} error={error:#}",
+            "创建 OpenVINO 缓存目录失败（步骤：准备模型缓存），本次不启用持久化缓存，下次启动会重试；目录 {}，原因 {error:#}",
             cache_dir.display()
         );
         return;
@@ -1142,13 +1142,13 @@ fn configure_cache(core: &mut Core, device: &DeviceType<'static>, cache_dir: Opt
         ],
     ) {
         log::warn!(
-            "配置 OpenVINO 持久化缓存失败，继续无持久化缓存: device={} dir={} error={error:#}",
+            "配置 OpenVINO 持久化缓存失败（步骤：向推理设备写入缓存设置），本次不启用持久化缓存，下次启动会重新编译模型；设备 {}，目录 {}，原因 {error:#}",
             device,
             cache_dir.display()
         );
     } else {
         log::info!(
-            "已启用 OpenVINO 持久化缓存: device={} dir={}",
+            "已启用 OpenVINO 持久化缓存，下次启动可跳过模型重编译；设备 {}，目录 {}",
             device,
             cache_dir.display()
         );

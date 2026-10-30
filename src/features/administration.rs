@@ -132,7 +132,11 @@ impl AdministrationApplication {
                 )
             }
             AdministrationCommand::SetCommandsEnabled { enabled, .. } => {
-                log::info!("收到{}命令", if *enabled { "启用" } else { "禁用" });
+                log::info!(
+                    "收到「{}」命令，命令识别将切换为{}",
+                    if *enabled { "启用" } else { "禁用" },
+                    if *enabled { "开启" } else { "关闭" }
+                );
                 port.set_commands_enabled(*enabled)?;
                 port.log_executed(
                     context,
@@ -151,7 +155,7 @@ impl AdministrationApplication {
             AdministrationCommand::ChatListenerMode(command) => {
                 port.log_executed(context, &format!("chat listener {}", command.label()))?;
                 log::warn!(
-                    "值守模式命令未经过专用队列分发，已只记录: {}",
+                    "「{}」值守模式命令没有走专用队列分发，本次只记录不执行；值守模式状态未改变",
                     command.label()
                 );
                 Ok(())
@@ -181,7 +185,9 @@ impl AdministrationApplication {
                 if propagate_log_error {
                     log_result?;
                 } else if let Err(error) = log_result {
-                    log::error!("写入执行命令日志失败: {error:#}");
+                    log::error!(
+                        "写入执行命令日志失败（步骤：把本次命令记入执行历史）；命令本身已生效，但历史里查不到这次操作: {error:#}"
+                    );
                 }
                 port.enqueue_hall_template(
                     command_availability_feedback(enabled),
@@ -196,7 +202,9 @@ impl AdministrationApplication {
                 if propagate_log_error {
                     log_result?;
                 } else if let Err(error) = log_result {
-                    log::error!("写入执行命令日志失败: {error:#}");
+                    log::error!(
+                        "写入执行命令日志失败（步骤：把本次命令记入执行历史）；命令本身已生效，但历史里查不到这次操作: {error:#}"
+                    );
                 }
                 Ok(ImmediateAdministrationOutcome::Handled)
             }

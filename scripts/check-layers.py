@@ -79,21 +79,51 @@ def strip_test_code(text):
             i = marker.end()
             continue
         # 内联块：从 '{' 起做花括号配对，跳过字符串与字符字面量里的括号。
+        #
+        # 必须识别**字符字面量**（`'x'` / `'"'` / `'\\''`）：测试里出现 `find('"')`
+        # 这类写法时，若只处理双引号字符串，那个单引号包住的引号会被当成字符串起点，
+        # 后续扫描整体错位，整个 `#[cfg(test)]` 块剥不干净，测试代码里的
+        # `crate::ui::…` 就被误算成生产层的层间依赖（曾因此让边数从 240 变 241）。
         depth = 0
         j = marker.end() - 1
+        prev_sig = ''  # 上一个非空白字符，用于区分「字符字面量」与「生命周期标注」
         while j < len(text):
             ch = text[j]
+            if ch == '/' and j + 1 < len(text) and text[j + 1] == '/':
+                nl = text.find('\n', j)
+                j = len(text) if nl < 0 else nl + 1
+                continue
             if ch == '"':
                 j += 1
                 while j < len(text) and text[j] != '"':
                     j += 2 if text[j] == '\\' else 1
-            elif ch == '{':
+                j += 1
+                prev_sig = '"'
+                continue
+            if ch == "'":
+                # 字符字面量：''' / '"' / 'a' / '\\n' 形态；生命周期 'a 与标签 'outer 不匹配。
+                nxt = text[j + 1] if j + 1 < len(text) else ''
+                if nxt == '\\':
+                    k = j + 3
+                    while k < len(text) and text[k] != "'":
+                        k += 1
+                    j = k + 1
+                    prev_sig = "'"
+                    continue
+                if j + 2 < len(text) and text[j + 2] == "'":
+                    j += 3
+                    prev_sig = "'"
+                    continue
+                # 否则是生命周期标注，按普通字符跳过。
+            if ch == '{':
                 depth += 1
             elif ch == '}':
                 depth -= 1
                 if depth == 0:
                     j += 1
                     break
+            if not ch.isspace():
+                prev_sig = ch
             j += 1
         i = j
     return "".join(out)

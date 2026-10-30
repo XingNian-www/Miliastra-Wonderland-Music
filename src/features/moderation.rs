@@ -422,9 +422,9 @@ impl ModerationService {
         }
         let Some(lease) = self.try_acquire(command, false)? else {
             log::info!(
-                "{} UID{} 已有投票或执行流程，跳过重复请求",
-                command.action.label(),
-                command.uid
+                "对 UID{} 的{}已有投票或执行流程在跑，本次重复请求已跳过",
+                command.uid,
+                command.action.label()
             );
             port.send_hall_template(
                 &crate::features::reply_template::moderation::MODERATION[0],
@@ -490,7 +490,11 @@ impl ModerationService {
         let approved = match self.wait_for_votes(&work.command, &work.lease, vote_port) {
             Ok(approved) => approved,
             Err(error) => {
-                log::error!("{}后台投票失败: {error:#}", work.command.action.label());
+                log::error!(
+                    "对 UID{} 的{}投票统计失败（步骤：后台线程等待并统计可见票数）；本局按未通过处理，管理员可直接重发命令接管: {error:#}",
+                    work.command.uid,
+                    work.command.action.label()
+                );
                 false
             }
         };
@@ -563,7 +567,10 @@ impl ModerationService {
                 return Err(error);
             }
             // 通知不是管理员直接拉黑的审批条件，发送失败也只执行一次 UI 动作。
-            log::error!("管理员直接拉黑开始通告发送失败: {error:#}");
+            log::error!(
+                "管理员拉黑 UID{} 前的开始通告发送失败（步骤：先告知大厅再执行）；拉黑操作本身仍会继续执行: {error:#}",
+                task.command.uid
+            );
         }
 
         let result = port.execute_action(&task.command);
@@ -577,7 +584,11 @@ impl ModerationService {
                     task.command.uid,
                     task.command.action.label()
                 )) {
-                    log::error!("{}成功通告发送失败: {error:#}", task.command.action.label());
+                    log::error!(
+                        "UID{} 的{}已执行成功，但成功通告发送失败；大厅其他成员看不到这条结果: {error:#}",
+                        task.command.uid,
+                        task.command.action.label()
+                    );
                 }
             }
             Ok(false) => {
@@ -589,7 +600,8 @@ impl ModerationService {
             }
             Err(error) => {
                 log::error!(
-                    "{}执行结果未知，禁止重放: {error:#}",
+                    "UID{} 的{}执行结果未知（步骤：提交管理界面操作后等待确认）；为防止重复操作，本任务不会重放，需人工确认: {error:#}",
+                    task.command.uid,
                     task.command.action.label()
                 );
                 let _ = port.send_hall(&format!(
@@ -655,14 +667,17 @@ impl ModerationService {
                     }
                 }
                 Err(error) => {
-                    log::error!("{}投票扫描失败: {error:#}", command.action.label());
+                    log::error!(
+                        "{}投票扫描可见消息失败（步骤：每轮读取投票截图）；本轮票数不变，下一轮重试: {error:#}",
+                        command.action.label()
+                    );
                     continue;
                 }
             }
             let agree = stable_votes.values().filter(|agreed| **agreed).count() as i32;
             let disagree = stable_votes.values().filter(|agreed| !**agreed).count() as i32;
-            log::info!(
-                "{}投票: 同意={} 不同意={} 差值={} 目标差值={}",
+            log::debug!(
+                "{}投票进行中：同意 {} 票，不同意 {} 票，差值 {}，目标差值 {}",
                 command.action.label(),
                 agree,
                 disagree,
@@ -688,12 +703,12 @@ impl ModerationService {
         if disagree == 0 {
             if agree == 0 {
                 log::warn!(
-                    "{}投票超时: 同意=0 不同意=0，无任何观测，按既有策略通过；若这不是预期，请检查共享观察与外部聊天源是否正常工作",
+                    "{}投票超时且没有观测到任何选票，按既有策略视为通过；若这不是预期，请检查共享观察与外部聊天源是否正常工作",
                     command.action.label(),
                 );
             } else {
                 log::info!(
-                    "{}投票超时: 同意={} 不同意=0，无反对，按通过处理",
+                    "{}投票超时：同意 {} 票、无反对票，按通过处理",
                     command.action.label(),
                     agree,
                 );
@@ -701,7 +716,7 @@ impl ModerationService {
             Ok(true)
         } else {
             log::info!(
-                "{}投票超时: 同意={} 不同意={}，未达到目标差值，按未通过处理",
+                "{}投票超时：同意 {} 票、不同意 {} 票，未达到目标差值，按未通过处理",
                 command.action.label(),
                 agree,
                 disagree,
@@ -866,9 +881,9 @@ impl ModerationWorkflowLease {
         self.active = false;
         if let Err(error) = self.ledger.release(self.key.clone(), self.token.clone()) {
             log::error!(
-                "无法释放管理工作流 {}:{}: {error:#}",
-                self.key.action.label(),
-                self.key.uid
+                "释放 UID{} 的{}工作流失败（步骤：任务结束后交还租约）；该操作会一直被判定为进行中，后续同类请求将被当作重复跳过: {error:#}",
+                self.key.uid,
+                self.key.action.label()
             );
         }
     }

@@ -5,6 +5,23 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObservationSequence(u64);
 
+impl ObservationSequence {
+    /// 序号本身。日志与面向维护者的提示用它，不要用 `{:?}` 打出结构体包装。
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// 直接输出序号，便于写进句子（`缺失序号 {}..={}`）。
+///
+/// 观察缺口的告警需要把「从哪一帧丢到哪一帧」讲清楚，
+/// 用 `Display` 可以避免每处调用都写 `.get()`。
+impl std::fmt::Display for ObservationSequence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationGapKind {
     HistoryEvicted,

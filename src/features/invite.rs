@@ -314,9 +314,9 @@ impl InviteExecution {
         let recipients = self.recipients;
         let display_name = self.display_name;
         let password = self.password;
-        log::info!("邀请: 先检测是否公共大厅");
+        log::info!("开始邀请流程：先检测当前是否公共大厅");
         if port.is_public_hall()? {
-            log::info!("邀请: 当前在公共大厅，直接执行");
+            log::info!("当前在公共大厅，无需大厅成员同意，直接执行邀请");
             return execute_approved_invite(
                 port,
                 &recipients,
@@ -331,7 +331,9 @@ impl InviteExecution {
         )
         .text;
         if let Err(error) = port.send_hall(&announce) {
-            log::error!("邀请通告发送失败，直接执行邀请: {error:#}");
+            log::error!(
+                "邀请通告发送失败（步骤：在大厅征求成员同意）；改为直接执行邀请，未征求同意: {error:#}"
+            );
             return execute_approved_invite(
                 port,
                 &recipients,
@@ -353,7 +355,7 @@ impl InviteExecution {
                 "已默认同意加入大厅,请等待BOT进入大厅并发送就绪信息后再开启麦克风",
             ),
             InviteDecision::Reject => {
-                log::info!("收到邀请拒绝，取消邀请");
+                log::info!("大厅成员已拒绝邀请，本次邀请取消");
                 port.notify_friend(&recipients, "大厅成员已拒绝邀请");
                 Ok(false)
             }
@@ -376,7 +378,9 @@ fn execute_approved_invite(
     {
         let message = format!("邀请已完成，但好友通知失败：{warning}");
         if let Err(error) = port.send_hall(&message) {
-            log::error!("邀请通知警告发送失败: {error:#}");
+            log::error!(
+                "发送邀请通知警告失败（步骤：邀请前提醒目标玩家）；邀请流程继续，对方可能没收到提醒: {error:#}"
+            );
         }
     }
     Ok(outcome.entered())

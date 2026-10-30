@@ -271,7 +271,9 @@ fn prepare_kugou_device(
     directory: &Path,
 ) -> io::Result<KugouDeviceIdentity> {
     if let Err(error) = sync_kugou_device_file(config, directory) {
-        log::warn!("写入酷狗设备信息失败，将沿用已有文件: {error}");
+        log::warn!(
+            "写入酷狗设备信息失败（步骤：保存设备标识文件），本次沿用已有文件继续登录，设备标识可能与新配置不一致: {error}"
+        );
     }
     load_kugou_device(directory)
 }
@@ -1140,7 +1142,9 @@ fn run_helper(
         match reader_done_rx.recv_timeout(READER_JOIN_GRACE) {
             Ok(_) => {}
             Err(_) => {
-                log::error!("登录助手输出线程 join 超时,已分离(孙进程可能持有 stdout 管道写端)");
+                log::error!(
+                    "登录助手标准输出读取线程在等待超时后仍未结束（步骤：回收登录助手输出），已放弃回收；孙进程可能仍持有管道写端，该线程会随进程退出而消失"
+                );
             }
         }
         let _ = reaper;
@@ -1157,7 +1161,9 @@ fn run_helper(
         match stderr_done_rx.recv_timeout(READER_JOIN_GRACE) {
             Ok(_) => {}
             Err(_) => {
-                log::error!("登录助手诊断线程 join 超时,已分离(孙进程可能持有 stderr 管道写端)");
+                log::error!(
+                    "登录助手诊断输出线程在等待超时后仍未结束（步骤：回收登录助手诊断输出），已放弃回收；孙进程可能仍持有管道写端，该线程会随进程退出而消失"
+                );
             }
         }
         let _ = reaper;

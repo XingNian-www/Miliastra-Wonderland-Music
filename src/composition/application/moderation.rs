@@ -262,9 +262,7 @@ impl AppModerationVotePort {
                 // A rebuilt view of the same chat gets new bubble IDs. Rebase
                 // before counting so restored historical votes are not replayed.
                 log::info!(
-                    "管理投票共享 OCR 视图重建，更新基线: session={:?} -> {:?}",
-                    baseline.visual_session,
-                    snapshot.visual_session
+                    "管理投票：共享 OCR 视图已重建，投票基线随之更新，重建前的历史票不会被重放"
                 );
                 let rebased = snapshot
                     .messages

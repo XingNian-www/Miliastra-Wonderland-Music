@@ -583,7 +583,9 @@ pub(super) fn hall_screenshot_response(
         .capture_hall_screenshot()
         .map_err(|error| {
             // 内部错误详情只写日志，响应体不携带内部路径/错误链。
-            log::error!("主动检测大厅失败: {error:#}");
+            log::error!(
+                "主动检测大厅失败（步骤：截取大厅画面），本次检测未完成，面板会收到 503，可稍后重试: {error:#}"
+            );
             AppError {
                 status: 503,
                 message: "主动检测大厅失败".to_string(),

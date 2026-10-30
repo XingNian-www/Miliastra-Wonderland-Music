@@ -274,12 +274,226 @@ impl UiRoutineFailure {
     }
 }
 
+impl InputCertainty {
+    /// 面向人的副作用说明：这次失败会不会让游戏里已经发生了动作。
+    ///
+    /// 这是排查时最先要看的一件事——它决定能不能直接重试，
+    /// 还是必须先人工确认界面实际停在哪一步。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BeforeInput => "输入前失败，可安全重试",
+            Self::AfterInputUnknown => "输入已发出但结果未知，需人工确认",
+            Self::ConfirmedFailure => "已确认失败，游戏内无残留动作",
+            Self::Cancelled => "已取消，当前操作未继续执行",
+        }
+    }
+}
+
+impl UiRoutineFailure {
+    /// 步骤名转成玩家与维护者都能看懂的中文。
+    ///
+    /// 内部步骤名是给代码定位用的英文标识，直接写进日志会得到一句
+    /// 「在 locate_friend 步骤失败」，对排查没有帮助。这里逐个给出业务语言，
+    /// 未登记的新步骤回退到原名——回退是**显式**的，不会静默变成空白。
+    pub fn stage_label(&self) -> &str {
+        stage_label(self.stage)
+    }
+}
+
+/// 步骤标识 → 业务语言。新增步骤时在此登记中文名。
+fn stage_label(stage: &'static str) -> &'static str {
+    match stage {
+        // 好友邀请
+        "locate_friend" => "搜索好友",
+        "locate_friend_fuzzy" => "模糊匹配好友",
+        "validate_friend_name" => "校验收件人名称",
+        "open_secondary_chat" => "打开二级聊天",
+        "confirm_ready_secondary" => "确认二级界面就绪",
+        "confirm_friend_conversation" => "确认已打开好友会话",
+        "confirm_secondary_chat" => "确认已进入二级聊天",
+        "select_invite_avatar" => "点击好友头像进入会话",
+        "confirm_scrolled_friend_list" => "滚动后确认好友列表",
+        "input_invite_ready_message" => "填写邀请就绪通知",
+        "invite_ready_cancelled" => "发送邀请就绪通知",
+        "input_friend_message" => "填写好友通知",
+        "send_friend_message" => "发送好友通知",
+        "confirm_invite_primary_stability" => "确认邀请前一级界面稳定",
+        "enter_hall_password" => "填写大厅密码",
+        "confirm_entered_hall" => "确认已进入大厅",
+        // 一级驻留
+        "restore_primary_residency" => "恢复一级界面驻留",
+        "confirm_primary_residency" => "确认一级界面驻留",
+        "confirm_primary_stability" => "确认一级界面稳定",
+        "restore_secondary_hall" => "恢复二级大厅",
+        "wait_secondary_unread_message" => "等待二级未读消息",
+        "deliver_secondary_unread" => "交付二级未读消息",
+        "confirm_secondary_unread" => "确认二级未读消息",
+        "ocr_secondary_unread" => "识别二级未读消息",
+        "prepare_secondary_unread" => "准备二级未读任务",
+        "capture_hall_info" => "采集大厅信息",
+        "drag_hall_member_list" => "滚动大厅成员列表",
+        "restore_hall_member_list" => "还原大厅成员列表",
+        // 通用输入动作
+        "click_point" => "点击界面",
+        "press_key" => "按键",
+        "marker" => "识别聊天标记",
+        "test_ready" => "确认测试就绪",
+        // 好友管理
+        "normalize_moderation_start" => "整理好友管理命令",
+        "confirm_action_applied" => "确认管理动作已生效",
+        "recover_moderation" => "从管理流程中恢复界面",
+        // 启动流程
+        "resolve_game_path" => "定位游戏程序",
+        "launch_game" => "启动游戏",
+        "wait_game_window" => "等待游戏窗口",
+        "ensure_game_window" => "确认游戏窗口可用",
+        "wait_cancellable" => "等待可取消的步骤完成",
+        "ensure_game_ready_for_input" => "确认游戏可以接受输入",
+        "launch_chat_api" => "启动聊天接口",
+        "click_enter_game" => "点击进入游戏",
+        "open_wonderland_map" => "打开千星地图",
+        "locate_wonderland_map_star" => "定位千星地图星标",
+        "click_wonderland_map_star" => "点击千星地图星标",
+        "locate_wonderland_hall" => "定位千星大厅选项",
+        "select_wonderland_hall" => "选择千星大厅",
+        "locate_wonderland_confirm" => "定位千星确认按钮",
+        "confirm_enter_wonderland" => "确认进入千星",
+        "observe_wonderland_primary" => "观察千星后的一级界面",
+        "confirm_wonderland_absent" => "确认千星确认按钮已消失",
+        "confirm_wonderland_stable" => "确认千星切换区域稳定",
+        "recover_startup_primary" => "从启动流程中恢复界面",
+        "confirm_startup_primary" => "确认启动后的一级界面",
+        "recheck_automatic_entry" => "复查自动进入条件",
+        // 大厅页面
+        "open_hall_page" => "打开大厅页面",
+        "wait_hall_page_ready" => "等待大厅页面就绪",
+        "close_hall_page" => "关闭大厅页面",
+        "toggle_microphone" => "切换麦克风",
+        "capture_frame" => "截图",
+        // 其他
+        "close_window" => "关闭窗口",
+
+        // ── 好友列表读取与滚动（好友邀请/投递的中间步骤）──
+        "capture_friend_list" => "截取好友列表区域",
+        "crop_friend_list" => "截取好友列表区域",
+        "ocr_friend_list" => "识别好友列表",
+        "fingerprint_friend_list" => "记录好友列表指纹",
+        "drag_friend_list" => "拖动好友列表",
+        "scroll_friend_list_to_top" => "把好友列表滚到顶部",
+        "observe_scrolled_friend_list" => "观察滚动后的好友列表",
+        "select_friend" => "选择好友",
+        "fuzzy_friend_list" => "模糊匹配好友列表",
+        "open_friend_panel" => "打开好友面板",
+        "open_friend_search" => "打开好友搜索",
+        "submit_uid_search" => "按 UID 搜索好友",
+        "focus_uid_input" => "定位 UID 输入框",
+        "input_uid" => "填写 UID",
+
+        // ── 会话与大厅切换 ──
+        "open_primary_chat" => "打开一级聊天",
+        "close_primary_chat" => "关闭一级聊天",
+        "locate_secondary_hall" => "定位二级大厅",
+        "select_secondary_hall" => "选择二级大厅",
+        "drag_to_secondary_hall" => "拖动切换到二级大厅",
+        "fingerprint_secondary_hall_list" => "记录二级大厅列表指纹",
+        "focus_friend_message" => "定位好友消息输入框",
+
+        // ── 二级未读 ──
+        "open_secondary_unread" => "打开二级未读会话",
+        "reacquire_secondary_unread" => "重新定位二级未读",
+        "confirm_secondary_unread_hit" => "确认二级未读位置",
+        "confirm_secondary_unread_opened" => "确认二级未读会话已打开",
+        "confirm_secondary_bubble" => "确认二级气泡稳定",
+        "discard_secondary_unread" => "放弃本次二级未读",
+        "suppress_secondary_unread" => "抑制二级未读重复派发",
+        "refresh_secondary_unread" => "刷新二级会话内容",
+
+        // ── 大厅信息读取（截取与识别）──
+        "crop_hall_name" => "截取大厅名称区域",
+        "ocr_hall_name" => "识别大厅名称",
+        "crop_hall_time" => "截取大厅剩余时间区域",
+        "ocr_hall_time" => "识别大厅剩余时间",
+        "crop_hall_member_count" => "截取大厅成员人数区域",
+        "ocr_hall_member_count" => "识别大厅成员人数",
+        "check_hall_page_visibility" => "确认大厅页面是否可见",
+        "prepare_hall_operation" => "准备大厅操作",
+        "prepare_hall_batch" => "准备批量大厅操作",
+        "wait_hall_batch" => "等待批量大厅操作完成",
+
+        // ── 启动：进入游戏与千星 ──
+        "focus_game_window" => "激活游戏窗口",
+        "parse_game_args" => "解析游戏启动参数",
+        "confirm_enter_game" => "确认已进入游戏",
+        "observe_enter_game" => "观察进入游戏后的界面",
+        "locate_startup_template" => "定位启动流程模板",
+        "ensure_wonderland_window" => "确认千星窗口可用",
+        "focus_wonderland_window" => "激活千星窗口",
+        "crop_wonderland_hall" => "截取千星大厅选项区域",
+        "ocr_wonderland_hall" => "识别千星大厅选项",
+        "observe_wonderland_map" => "观察千星地图界面",
+        "observe_wonderland_transition" => "观察千星切换过程",
+
+        // ── 好友管理（UID 搜索与确认）──
+        "prepare_moderation" => "准备好友管理操作",
+        "crop_ocr_confirmation" => "截取确认弹窗区域",
+        "ocr_confirmation" => "识别确认弹窗",
+
+        // ── 自定义动作流程（每条对应工作流里的一种操作）──
+        "activate_custom_game" => "激活游戏窗口",
+        "focus_custom_game" => "聚焦游戏窗口",
+        "press_custom_key" => "按下按键",
+        "hold_custom_key" => "长按按键",
+        "parse_custom_key" => "解析按键名称",
+        "parse_custom_hold_key" => "解析长按键名称",
+        "click_custom_point" => "点击指定坐标",
+        "click_custom_mouse_button" => "点击鼠标按键",
+        "click_custom_template" => "点击识别到的模板",
+        "click_custom_text" => "点击识别到的文字",
+        "paste_custom_text" => "粘贴文本",
+        "capture_custom_action" => "截取自定义动作画面",
+        "crop_custom_text" => "截取文字识别区域",
+        "ocr_custom_text" => "识别屏幕文字",
+        "match_custom_template" => "匹配画面模板",
+        "fingerprint_custom_region" => "记录区域指纹",
+        "wait_custom_action" => "等待固定时长",
+        "wait_custom_template" => "等待模板出现",
+        "wait_custom_template_absent" => "等待模板消失",
+        "wait_custom_text" => "等待文字出现",
+        "wait_custom_pixels_stable" => "等待画面稳定",
+        "prepare_custom_residency" => "准备界面驻留",
+        "resolve_custom_listener_residency" => "恢复值守目标界面",
+
+        // ── 界面驻留观察 ──
+        "observe_primary_residency" => "观察一级界面驻留",
+
+        // ── 启动：千星地图与进入游戏 ──
+        "confirm_wonderland_map_star_absent" => "确认千星地图星标已消失",
+        "match_startup_template" => "匹配启动流程模板",
+        "ocr_enter_game_text" => "识别进入游戏按钮文字",
+
+        // ── 邀请：选择目标大厅 ──
+        "enter_friend_hall" => "进入好友所在大厅",
+        "select_friend_hall" => "选择好友所在大厅",
+        "select_wonderland_profile" => "查看千星档案卡",
+
+        // ── 自定义动作：取消 ──
+        "custom_action_cancelled" => "自定义动作已取消",
+
+        // ── 各流程的预备动作 ──
+        "prepare_residency" => "准备界面驻留",
+        "prepare_friend_delivery" => "准备好友投递",
+        _ => stage,
+    }
+}
+
 impl Display for UiRoutineFailure {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "UI routine failed at {} ({:?}): {}",
-            self.stage, self.certainty, self.reason
+            "在「{}」步骤失败（{}）：{}",
+            self.stage_label(),
+            self.certainty.label(),
+            self.reason
         )
     }
 }
@@ -358,6 +572,23 @@ impl UiStateKind {
             Self::Loading => "loading",
             Self::Panel => "panel",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// 面向人的界面名，用于日志正文。
+    ///
+    /// `name()` 是给事件与查询接口用的稳定标识（英文、不随文案改动），
+    /// 日志正文另需一个可读名；两者分开，避免为了日志改坏对外契约。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "一级界面",
+            Self::Secondary => "二级聊天",
+            Self::MainMenu => "主菜单",
+            Self::GameGate => "登录入口",
+            Self::Overworld => "大世界",
+            Self::Loading => "加载界面",
+            Self::Panel => "游戏内面板",
+            Self::Unknown => "无法识别的界面",
         }
     }
 }
@@ -1069,6 +1300,25 @@ impl UiObservationRuntime {
             captured_at,
             ui_state,
         })
+    }
+}
+
+
+/// 把线程 panic 载荷转成可读文本。
+///
+/// `catch_unwind` 与 `JoinHandle::join` 的错误值是 `Box<dyn Any + Send>`，
+/// 不实现 `Display`；直接 `{:?}` 会打出 `Any { .. }` 之类的内部结构，对排查没有帮助。
+/// 这里按最常见的两种形态（`&str` / `String`）取出原始 panic 文案——它通常是
+/// `index out of bounds`、`assertion failed` 这类**唯一能说明为什么崩**的线索。
+///
+/// 未登记形态返回固定句子，不静默变成空串。
+pub(crate) fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        format!("线程因错误「{text}」终止")
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        format!("线程因错误「{text}」终止")
+    } else {
+        "线程因未知错误终止".to_string()
     }
 }
 
@@ -2277,7 +2527,7 @@ impl UiRuntime {
         }
         if self.detached_joins.len() > 8 {
             log::error!(
-                "UI worker 累计 {} 个未退出 join 线程,可能存在设备调用卡死",
+                "界面线程累计 {} 个已脱管但未退出的工作线程，说明设备调用可能卡死；这些线程无法回收，继续累积会耗尽线程资源",
                 self.detached_joins.len()
             );
         }
@@ -2406,14 +2656,18 @@ impl CaptureFailureLog {
         let reason = format!("{error:#}");
         if !self.should_report(error) {
             // 同样的失败连续发生：细节留在 debug，不刷主日志。
-            log::debug!("UI runtime 按需截图仍失败（重复）: {reason}");
+            log::debug!("界面运行时按需截图再次失败，失败原因与上一次相同，本条不重复告警：{reason}");
             return;
         }
         // 游戏窗口不存在是预期状态：游戏没开而已，不是程序错误。
         if is_window_unavailable(&reason) {
-            log::warn!("UI runtime 按需截图失败: {reason}");
+            log::warn!(
+                "界面运行时按需截图失败（步骤：抓取游戏画面），未取到画面，本轮观测与识别不会执行，游戏窗口未就绪时会持续处于该状态：{reason}"
+            );
         } else {
-            log::error!("UI runtime 按需截图失败: {reason}");
+            log::error!(
+                "界面运行时按需截图失败（步骤：抓取游戏画面），未取到画面，本轮观测与依赖画面的动作全部不会执行：{reason}"
+            );
         }
         self.mark_reported(error);
     }
@@ -2498,6 +2752,78 @@ fn publish_frame(
 mod tests {
     use super::*;
 
+    /// 从源码文本里抽出所有可能的 stage 标识字面量。
+    ///
+    /// 不做完整词法分析：只在已知的四种传参形态附近抓 `"snake_case"`。
+    /// 宁可多抓（随后用映射表判定），不可漏抓——漏抓正是本轮要防的失误。
+    fn extract_stage_literals(source: &'static str) -> Vec<String> {
+        const ANCHORS: &[&str] = &[
+            "InputCertainty::BeforeInput,",
+            "InputCertainty::AfterInputUnknown,",
+            "InputCertainty::ConfirmedFailure,",
+            "before_input_failure(",
+            "after_input_failure(",
+            "input_failure(",
+            "observation_failure(",
+            "observation_reason(",
+            "stage:",
+        ];
+        let mut found = Vec::new();
+        for anchor in ANCHORS {
+            let mut from = 0usize;
+            while let Some(offset) = source[from..].find(anchor) {
+                let start = from + offset + anchor.len();
+                // anchor 之后的一小段里找第一个 "..." 字面量。
+                // 不能直接 `start + 240`：源码含中文，可能切在多字节字符中间。
+                let window_end = floor_char_boundary(source, (start + 240).min(source.len()));
+                if let Some(literal) = first_string_literal(&source[start..window_end]) {
+                    found.push(literal);
+                }
+                from = start;
+            }
+        }
+        found
+    }
+
+    /// 把字节位置下调到最近的合法字符边界。
+    fn floor_char_boundary(text: &'static str, mut index: usize) -> usize {
+        while index > 0 && !text.is_char_boundary(index) {
+            index -= 1;
+        }
+        index
+    }
+
+    /// 取窗口里第一个形如 `"snake_case"` 的字符串内容。
+    fn first_string_literal(window: &str) -> Option<String> {
+        let mut rest = window;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let close = after.find('"')?;
+            let candidate = &after[..close];
+            let looks_like_stage = !candidate.is_empty()
+                && candidate.len() < 64
+                && candidate.starts_with(|c: char| c.is_ascii_lowercase())
+                && candidate
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && candidate.contains('_');
+            if looks_like_stage {
+                return Some(candidate.to_string());
+            }
+            rest = &after[close + 1..];
+        }
+        None
+    }
+
+    /// 该 stage 是否已在映射表里登记（回退分支不算登记）。
+    ///
+    /// `stage_label` 的签名是 `&'static str`（生产侧的 stage 都是 `&'static str`
+    /// 字面量）。测试里为把运行期字符串喂进去，泄漏一份——测试进程内可忽略。
+    fn stage_label_is_registered(stage: &str) -> bool {
+        let leaked: &'static str = Box::leak(stage.to_string().into_boxed_str());
+        stage_label(leaked) != stage
+    }
+
     fn classified(kind: UiStateKind) -> UiStateClassification {
         UiStateClassification::new(kind, format!("{kind:?}"))
     }
@@ -2508,6 +2834,105 @@ mod tests {
         fn capture(&mut self) -> Result<DynamicImage> {
             Ok(self.0.clone())
         }
+    }
+
+
+    /// 失败信息必须说清「哪一步 + 能不能重试 + 为什么」，且面向中文读者。
+    ///
+    /// 这个 `Display` 会被 composition 层的错误链直接 `to_string()` 后写进日志
+    /// （见 `custom_workflow.rs`、`tasks.rs`、`startup.rs`、`commands.rs`），
+    /// 一旦退回 `{:?}` 或英文句式，那些日志会同时失去可读性与副作用提示。
+    #[test]
+    fn routine_failure_display_is_readable_and_states_the_side_effect_risk() {
+        let before = UiRoutineFailure::new(
+            InputCertainty::BeforeInput,
+            "locate_friend",
+            "在好友列表里没有找到唯一稳定的目标行",
+        );
+        let text = before.to_string();
+        assert!(
+            text.contains("搜索好友"),
+            "步骤名应翻成业务语言，实际：{text}"
+        );
+        assert!(
+            text.contains("输入前失败，可安全重试"),
+            "必须说明可以安全重试，实际：{text}"
+        );
+        assert!(text.contains("没有找到唯一稳定"), "原因应原样带出，实际：{text}");
+        assert!(!text.contains("locate_friend"), "不应把内部步骤标识写进正文：{text}");
+        assert!(
+            !text.contains("{:?}") && !text.contains("UI routine failed"),
+            "不得退回英文/调试格式：{text}"
+        );
+
+        let after = UiRoutineFailure::new(
+            InputCertainty::AfterInputUnknown,
+            "select_invite_avatar",
+            "点击后未能确认会话已打开",
+        );
+        let text = after.to_string();
+        assert!(
+            text.contains("输入已发出但结果未知，需人工确认"),
+            "输入已发出必须提示需人工确认，实际：{text}"
+        );
+    }
+
+    /// 全量覆盖：源码里出现的**每一个** stage 标识都必须在 `stage_label` 里有中文名。
+    ///
+    /// 这是本轮修复的直接教训：最初只登记了 61 个，而实际有 147 个，
+    /// 未登记的在 Display 里会原样回退成英文蛇形命名，恰好违反日志规范。
+    /// 手工比对容易漏，所以把比对本身变成测试。
+    ///
+    /// 扫描面覆盖 stage 的全部传参形态（本仓库里实际用到的四种）：
+    /// - `InputCertainty::X, "stage"`（UiRoutineFailure::new 的经典形式）
+    /// - `before_input_failure("s") / after_input_failure("s") / input_failure("s")`
+    /// - `observation_failure(.., "s") / observation_reason(.., "s")`
+    /// - `stage: "s"`（结构体字面量）
+    #[test]
+    fn every_stage_identifier_in_source_has_a_chinese_label() {
+        let sources = [
+            include_str!("../ui/routines/friend_delivery.rs"),
+            include_str!("../ui/routines/invite.rs"),
+            include_str!("../ui/routines/startup.rs"),
+            include_str!("../ui/routines/custom_action.rs"),
+            include_str!("../ui/routines/hall.rs"),
+            include_str!("../ui/routines/secondary_unread.rs"),
+            include_str!("../ui/routines/moderation.rs"),
+            include_str!("../ui/routines/state_observation.rs"),
+            include_str!("../ui/atoms.rs"),
+        ];
+        // 测试专用的故意样例：用于验证「未登记回退」，不参与本断言。
+        const INTENTIONAL_SAMPLE: &str = "some_future_stage";
+        let mut missing: Vec<String> = Vec::new();
+        for source in sources {
+            for literal in extract_stage_literals(source) {
+                if literal == INTENTIONAL_SAMPLE || missing.contains(&literal) {
+                    continue;
+                }
+                if stage_label_is_registered(&literal) {
+                    continue;
+                }
+                missing.push(literal);
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "以下步骤缺少中文名，会在日志里原样显示英文标识：{missing:?}"
+        );
+    }
+
+    /// 未登记的新步骤回退到原名，而不是变成空白——静默丢失步骤名会让排障断链。
+    #[test]
+    fn unregistered_stage_falls_back_to_its_identifier() {
+        let failure = UiRoutineFailure::new(
+            InputCertainty::ConfirmedFailure,
+            "some_future_stage",
+            "原因",
+        );
+        assert_eq!(failure.stage(), "some_future_stage");
+        assert_eq!(failure.stage_label(), "some_future_stage");
+        assert!(failure.to_string().contains("some_future_stage"));
     }
 
     #[test]

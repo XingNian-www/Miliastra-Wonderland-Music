@@ -14,7 +14,9 @@ use crate::runtime::business::{BusinessOperationalSnapshot, BusinessStateSink};
 use crate::runtime::decision::DecisionSnapshot;
 use crate::runtime::scheduler::{DiagnosticTaskSnapshot, FormalTaskSnapshot};
 use crate::runtime::task_engine::{TaskEngineProjection, TaskEngineStateSink};
-use crate::runtime::ui::{UiRoutineProgress, UiRoutineProgressSink, UiRoutineProgressStage};
+use crate::runtime::ui::{
+    UiRoutineProgress, UiRoutineProgressSink, UiRoutineProgressStage,
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -241,6 +243,28 @@ struct MonitorState {
     undercover: UndercoverSnapshot,
 }
 
+/// TUI 事件日志面板单行字数上限。
+///
+/// 面板高度固定（8~18 行），一条异常长的日志（例如带完整错误链的失败信息）
+/// 会被 `Wrap { trim: false }` 折成十几行，把其余日志全挤出可视区。这里在
+/// 进入投影状态时就截断，面板只需要处理短行。
+const MONITOR_LOG_LINE_MAX_CHARS: usize = 200;
+
+/// 把一条日志行截断到 [MONITOR_LOG_LINE_MAX_CHARS] 个字符（按字符而非字节，
+/// 中文不会被切在 UTF-8 边界中间），超出部分以省略号代替。
+///
+/// 只影响 TUI/HTTP 的 monitor 投影，**不改写落到文件日志的内容**：
+/// 文件日志要保留完整错误链供事后排查。
+fn truncate_for_monitor(line: &str) -> String {
+    let mut chars = line.chars();
+    let head: String = chars.by_ref().take(MONITOR_LOG_LINE_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 struct MonitorProjection {
     state: MonitorState,
 }
@@ -252,7 +276,7 @@ impl MonitorProjection {
             MonitorEvent::Log(line) => {
                 let mut pushed = false;
                 for part in line.lines() {
-                    state.logs.push_back(part.to_string());
+                    state.logs.push_back(truncate_for_monitor(part));
                     pushed = true;
                     while state.logs.len() > state.log_limit {
                         state.logs.pop_front();
@@ -382,7 +406,11 @@ fn run_monitor_projection(receiver: Receiver<MonitorMessage>, log_limit: usize) 
             Err(payload) => {
                 // 投影线程 panic 后重建投影状态继续服务，不让面板/日志静默停滞；
                 // 已消费但未 apply 完成的事件无法重放，状态以下一条事件为准收敛。
-                log::error!("监控投影线程 panic，重建投影状态后继续: {payload:?}");
+                log::error!(
+                    "面板状态更新中断（步骤：监控投影线程处理事件），\
+本轮事件未能应用，重建状态后继续提供服务：{}",
+                    crate::runtime::ui::panic_payload_text(&payload)
+                );
                 thread::sleep(Duration::from_millis(500));
             }
         }
@@ -451,7 +479,10 @@ impl MonitorShared {
         match receiver.recv_timeout(Duration::from_secs(2)) {
             Ok(snapshot) => snapshot,
             Err(_) => {
-                log::warn!("monitor snapshot 等待超时,返回降级快照");
+                log::warn!(
+                    "读取面板状态超时（步骤：等待监控投影线程返回快照，已等待 2 秒），\
+本次读取返回降级快照，面板与 Web 接口暂时看不到最新状态"
+                );
                 unavailable_snapshot()
             }
         }
@@ -473,7 +504,10 @@ impl MonitorRuntime {
             let _ = done.recv();
         }
         if worker.join().is_err() {
-            log::error!("监控投影线程退出时 panic");
+            log::error!(
+                "面板状态更新线程退出异常（步骤：等待监控投影线程结束），\
+退出前可能丢失已投递但未应用的事件"
+            );
         }
     }
 
@@ -632,6 +666,42 @@ mod tests {
     use crate::runtime::ui::{
         UiDevice, UiRoutine, UiRoutineContext, UiRoutineProgressStage, UiRuntime, sealed,
     };
+
+    /// 超长日志行必须截断，否则一条带完整错误链的失败信息会把整个面板挤满。
+    #[test]
+    fn overlong_log_lines_are_truncated_for_the_panel_only() {
+        let long = "错误".repeat(300);
+        let truncated = truncate_for_monitor(&long);
+        assert_eq!(
+            truncated.chars().count(),
+            MONITOR_LOG_LINE_MAX_CHARS + 1,
+            "截断后应为上限字符数 + 一个省略号"
+        );
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.starts_with("错误"));
+
+        // 恰好等于上限时不加省略号，避免边界上凭空多一个字符。
+        let exact = "字".repeat(MONITOR_LOG_LINE_MAX_CHARS);
+        assert_eq!(truncate_for_monitor(&exact), exact);
+        // 短行原样返回。
+        assert_eq!(truncate_for_monitor("点歌成功：晴天"), "点歌成功：晴天");
+        assert_eq!(truncate_for_monitor(""), "");
+    }
+
+    /// 截断发生在进投影状态时：面板快照里的行不超过上限，且不影响队列裁剪。
+    #[test]
+    fn monitor_snapshot_holds_truncated_log_lines() {
+        let monitor = MonitorShared::new(20);
+        MonitorLogSink::push(
+            &monitor.log_sink(),
+            format!("第一条\n{}", "长".repeat(400)),
+        );
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.logs.len(), 2, "多行日志仍按行拆开");
+        assert_eq!(snapshot.logs[0], "第一条");
+        assert!(snapshot.logs[1].chars().count() <= MONITOR_LOG_LINE_MAX_CHARS + 1);
+        monitor.shutdown();
+    }
 
     /// monitor 是"关键状态变化"的唯一汇聚点：决策与队列变化必须同步推到事件流，
     /// 外部控制器才不必轮询 /monitor。这里断言的是"真的发出去了、且载荷够用"。

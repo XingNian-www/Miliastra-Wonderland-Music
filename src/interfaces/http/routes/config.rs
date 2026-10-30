@@ -165,8 +165,7 @@ pub(super) fn save_outcome_response_after_apply(
     ) = split_changed_fields_by_effect(&outcome.changed_fields);
     if let Some(error) = live_apply_error {
         log::error!(
-            "{}，但热更新应用失败，相关字段改为闲置重载: {}",
-            committed_label,
+            "{committed_label}，但热更新应用失败（步骤：把新配置推给运行中的各模块），这些字段改为闲置重载后才生效，界面上会短暂显示旧值；原因：{}",
             error.message
         );
         runtime_reload_fields.append(&mut applied_live_fields);

@@ -58,7 +58,7 @@ impl ApplicationRuntime {
                     return Ok(());
                 }
                 if let Err(seconds) = self.business.ai_chat_gate.check(&actor, Instant::now()) {
-                    log::debug!("AI 聊天冷却中: actor={actor} 剩余 {seconds}s");
+                    log::debug!("AI 聊天冷却中：玩家「{actor}」还需等待 {seconds} 秒");
                     return Ok(());
                 }
 
@@ -338,7 +338,7 @@ impl ApplicationRuntime {
         now_ms: i64,
     ) {
         let Some(slot) = self.claim_maintenance_slot(&format!("extract:{actor}")) else {
-            log::debug!("该玩家已有抽取在跑，跳过本轮抽取: actor={}", actor_display);
+            log::debug!("玩家「{actor_display}」已有抽取在进行，跳过本轮事实抽取");
             return;
         };
         let memory = self.business.ai_chat_memory.clone();
@@ -383,17 +383,23 @@ impl ApplicationRuntime {
                     )
                 }));
                 match outcome {
-                    Ok(Ok(())) => log::debug!("事实抽取完成: actor={actor_display}"),
+                    Ok(Ok(())) => log::debug!("玩家「{actor_display}」的事实抽取已完成"),
                     Ok(Err(error)) => {
-                        log::warn!("AI 回复已发送，长期记忆更新失败: {error:#}")
+                        log::warn!(
+                            "AI 回复已发出，但长期记忆更新失败（步骤：抽取并写入记忆事实），下一轮会重新尝试: {error:#}"
+                        )
                     }
                     Err(_) => {
-                        log::error!("事实抽取线程 panic，本轮记忆未更新: actor={actor_display}")
+                        log::error!(
+                            "事实抽取线程崩溃（步骤：为玩家「{actor_display}」抽取记忆事实），本轮记忆未更新，下一轮会重新尝试"
+                        )
                     }
                 }
             });
         if let Err(error) = spawned {
-            log::warn!("启动事实抽取线程失败: {error}");
+            log::warn!(
+                "长期记忆的事实抽取线程没能启动（步骤：AI 回复发出后启动后台抽取），本轮记忆不更新，下一轮会重新尝试: {error}"
+            );
         }
     }
 
@@ -557,8 +563,7 @@ impl ApplicationRuntime {
                             Ok(summary) => {
                                 if generation.load(AtomicOrdering::SeqCst) != generation_at_spawn {
                                     log::debug!(
-                                        "记忆压缩结果已过期（期间执行过忘记/重建），丢弃 scope={}",
-                                        plan.scope
+                                        "记忆压缩结果已过期（期间执行过忘记或重建），本次摘要丢弃，原文仍在库里"
                                     );
                                     continue;
                                 }
@@ -573,14 +578,12 @@ impl ApplicationRuntime {
                                     memory.apply_compression(plan, &summary, summary_budget, now_ms)
                                 {
                                     log::warn!(
-                                        "记忆压缩结果写入失败 scope={}: {error:#}",
-                                        plan.scope
+                                        "记忆压缩结果写入失败（步骤：把新摘要写回记忆库），本轮摘要丢弃、原文仍保留，下一轮会重新压缩: {error:#}"
                                     );
                                 }
                             }
                             Err(error) => log::warn!(
-                                "记忆压缩失败，原文保留待下轮重试 scope={}: {error:#}",
-                                plan.scope
+                                "记忆压缩失败（步骤：调用模型生成摘要），原文保留在库里，下一轮会重新尝试: {error:#}"
                             ),
                         }
                     }
@@ -590,7 +593,9 @@ impl ApplicationRuntime {
                 }
             });
         if let Err(error) = spawned {
-            log::warn!("启动记忆压缩线程失败: {error}");
+            log::warn!(
+                "记忆压缩线程没能启动（步骤：超预算后整理旧记忆），原文仍保留在库里，下一轮会重新规划: {error}"
+            );
         }
     }
 

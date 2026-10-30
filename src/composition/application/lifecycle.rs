@@ -1,5 +1,6 @@
 use super::*;
 use crate::RunOutcome;
+use crate::runtime::ui::panic_payload_text;
 
 fn should_run_startup_automation(
     config_reload_child: bool,
@@ -13,7 +14,7 @@ fn committed_run_result(result: Result<()>, reason: ShutdownReason) -> Result<Ru
     match (result, reason) {
         (Err(error), ShutdownReason::ConfigReload | ShutdownReason::ConfigReloadWithStartup) => {
             // 任务引擎停止接收工作后，进程替代不可逆。即使最后一次转发失败，也要保留看门狗交接信息。
-            log::error!("配置重载已提交，关停尾部错误: {error:#}");
+            log::error!("配置重载已提交，但关停收尾出错（步骤：提交重载后关停各子系统），部分子系统可能没有干净退出: {error:#}");
             Ok(match reason {
                 ShutdownReason::ConfigReload => RunOutcome::Reload,
                 ShutdownReason::ConfigReloadWithStartup => RunOutcome::ReloadWithStartup,
@@ -22,7 +23,7 @@ fn committed_run_result(result: Result<()>, reason: ShutdownReason) -> Result<Ru
         }
         (Err(error), ShutdownReason::UserExit) => {
             // 并发收尾失败不能把用户明确退出变成看门狗错误恢复，重新启动刚被用户停止的进程。
-            log::error!("用户退出已提交，关停尾部错误: {error:#}");
+            log::error!("用户退出已提交，但关停收尾出错（步骤：提交退出后关停各子系统），部分子系统可能没有干净退出: {error:#}");
             Ok(RunOutcome::Stopped)
         }
         (result, ShutdownReason::Running) => result.map(|()| RunOutcome::Stopped),
@@ -75,14 +76,14 @@ impl ApplicationRuntime {
                     self.enqueue_startup_task_if_enabled()?;
                 }
             } else {
-                log::info!("配置重载替代进程已确认目标窗口可复用，跳过冷启动自动化");
+                log::info!("配置重载的替代进程确认可以复用目标窗口，跳过冷启动自动化");
             }
             self.start_http_server()?;
             match self.start_hotkeys() {
                 Ok(runtime) => self.ui.hotkeys = Some(runtime),
                 // 热键被占用时降级继续运行:退出热键失效,但主流程不受影响。
                 Err(error) => {
-                    log::error!("全局热键不可用(继续运行,退出热键失效): {error:#}")
+                    log::error!("全局热键注册失败（步骤：注册热键），程序继续运行，但暂停与退出热键本次不可用: {error:#}")
                 }
             }
             deferred_chat_sender = Some(self.start_deferred_chat_sender());
@@ -99,90 +100,95 @@ impl ApplicationRuntime {
             log::debug!("关停时唤醒任务引擎等待线程失败: {error}");
         }
         if let Err(error) = self.business.background_commands.stop_all() {
-            log::error!("后台命令线程关闭失败: {error:#}");
+            log::error!("后台命令线程关闭失败（步骤：关停后台命令），可能有命令线程残留，进程退出时会被系统强制回收: {error:#}");
         }
         if let Some(hotkeys) = self.ui.hotkeys.take()
             && let Err(error) = hotkeys.shutdown()
         {
-            log::error!("全局热键线程关闭失败: {error:#}");
+            log::error!("全局热键线程关闭失败（步骤：关停热键监听），热键可能占用到进程结束: {error:#}");
         }
         if let Some(http_server) = self.lifecycle.http_server.take()
             && let Err(error) = http_server.shutdown()
         {
-            log::error!("HTTP/Web 面板关闭失败: {error:#}");
+            log::error!("HTTP 面板关闭失败（步骤：关停 Web 服务），端口可能仍被占用: {error:#}");
         }
         if let Some(deferred_chat_sender) = deferred_chat_sender
             && let Err(error) = deferred_chat_sender.join()
         {
-            log::error!("延迟聊天发送线程 panic: {error:?}");
+            // panic 载荷是判断「为什么崩」的唯一线索，不能丢；
+            // 统一转成可读文本，与 monitor 投影线程的写法保持一致。
+            log::error!(
+                "延迟聊天发送线程崩溃（步骤：关停时等待线程退出），排队中的回复没能发出，\
+本次关停无法正常收尾：{}",
+                panic_payload_text(error.as_ref())
+            );
         }
         if let Some(playback_monitor) = playback_monitor
             && let Err(error) = playback_monitor.join()
         {
-            log::error!("播放监控线程 panic: {error:?}");
+            log::error!(
+                "播放监控线程崩溃（步骤：关停时等待线程退出），本次关停可能不完整，\
+播放状态可能停在最后已知值：{}",
+                panic_payload_text(error.as_ref())
+            );
         }
         self.join_moderation_workers();
         if let Some(runtime) = self.business.formal_task_runtime.take() {
             match runtime.shutdown() {
                 Ok(report) if report.timed_out() => log::error!(
-                    "正式任务未在关闭宽限期内结束，停止等待并继续关闭其他运行时: active_task_id={:?}",
-                    report.active_task_id()
+                    "正式任务运行时未在关闭宽限期内结束（步骤：关停正式任务），本次停止等待并继续关闭其他运行时，该任务线程会被强制断开，可能残留未完成的写操作"
                 ),
-                Ok(_) => log::info!("正式任务运行时已关闭"),
-                Err(error) => log::error!("正式任务运行时关闭失败: {error:#}"),
+                Ok(_) => log::info!("正式任务运行时已正常关闭"),
+                Err(error) => log::error!("正式任务运行时关闭失败（步骤：关停正式任务），可能有任务线程残留: {error:#}"),
             }
         }
         self.persist_current_chat_listener_mode();
         if let Some(business_runtime) = self.business.business_runtime.take() {
             match business_runtime.shutdown() {
                 Ok(snapshot) => log::info!(
-                    "业务运行时组已关闭: deadline_forwarded={} business={:?}",
-                    snapshot.deadlines().forwarded_count(),
-                    snapshot.business()
+                    "业务运行时组已正常关闭，其中 {} 条期限已转交给后续流程",
+                    snapshot.deadlines().forwarded_count()
                 ),
                 Err(error) => log::error!(
-                    "业务运行时组关闭失败: {error}; prepare={:?} deadlines={:?} finish={:?}",
-                    error.prepare_error(),
-                    error.deadline_error(),
-                    error.finish_error()
+                    "业务运行时组关闭失败（步骤：依次关停准备阶段与期限处理），可能有业务线程残留、未提交的期限不会再生效: {error:#}"
                 ),
             }
         }
         if let Some(ui_runtime) = self.ui.ui_runtime.take() {
             match ui_runtime.shutdown() {
                 Ok(report) if report.timed_out() => log::warn!(
-                    "UI 运行时未在关闭宽限期内结束，阻塞任务无法强制取消，线程已脱离: detached={}",
+                    "UI 运行时未在关闭宽限期内结束（步骤：关停界面运行时），阻塞中的界面任务无法强制取消，其中 {} 个线程已脱离管理，进程退出时会被系统回收",
                     report.detached()
                 ),
-                Ok(_) => log::info!("UI 运行时已关闭"),
-                Err(error) => log::error!("UI 运行时关闭失败: {error}"),
+                Ok(_) => log::info!("UI 运行时已正常关闭"),
+                Err(error) => log::error!("UI 运行时关闭失败（步骤：关停界面运行时），窗口或后台线程可能残留: {error}"),
             }
         }
         if let Some(ocr_runtime) = self.ui.ocr_runtime.take() {
             match ocr_runtime.shutdown() {
                 Ok(report) if report.timed_out => {
-                    log::warn!("OCR 运行时关闭等待超时，底层推理线程已脱离");
+                    log::warn!("OCR 运行时关闭等待超时（步骤：等待推理线程退出），底层推理线程已脱离管理，进程退出时会被强制回收");
                 }
-                Err(error) => log::error!("OCR 运行时关闭失败: {error:#}"),
+                Err(error) => log::error!("OCR 运行时关闭失败（步骤：关停文字识别），推理线程可能残留: {error:#}"),
                 _ => {}
             }
         }
         if let Some(player_runtime) = self.playback.player_runtime.take()
             && let Err(error) = player_runtime.shutdown()
         {
-            log::error!("播放器运行时关闭失败: {error}");
+            log::error!("播放器运行时关闭失败（步骤：关停播放器），播放状态可能没有保存: {error}");
         }
         if let Err(error) = self.playback.login_helper.shutdown() {
-            log::error!("登录助手关闭失败: {error}");
+            log::error!("登录助手关闭失败（步骤：关停登录助手），助手线程可能残留: {error}");
         }
         if let Some(native_playback) = self.playback.native_playback_runtime.take()
             && let Err(error) = native_playback.shutdown()
         {
-            log::error!("原生播放器关闭失败: {error:#}");
+            log::error!("原生播放器关闭失败（步骤：关停原生播放器），音频设备可能仍被占用: {error:#}");
         }
         if let Some(openai_runtime) = self.lifecycle.openai_runtime.take() {
             openai_runtime.shutdown();
-            log::info!("OpenAI runtime 已关闭");
+            log::info!("OpenAI 运行时已正常关闭");
         }
         let shutdown_reason = self.lifecycle.shutdown.reason();
         let outcome = match shutdown_reason {

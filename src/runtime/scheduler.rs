@@ -826,7 +826,7 @@ impl FormalScheduler {
 
     fn update_record(&mut self, id: u64, update: impl FnOnce(&mut FormalTaskRecord)) {
         let Some(record) = self.formal_records.get_mut(&id) else {
-            log::warn!("正式任务追踪记录不存在: id={id}");
+            log::warn!("正式任务的追踪记录已不存在（编号 {id}），本次状态更新被跳过，任务列表可能少一条记录");
             return;
         };
         let was_terminal = record.finished_at_ms.is_some();

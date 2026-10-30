@@ -249,7 +249,13 @@ fn execute_invite(
                     false
                 }
                 Err(error) => {
-                    log::error!("邀请通知发送失败，继续邀请流程: {error}");
+                    // 只打印**首个**候选名：`recipients` 是好友列表匹配名
+                    // （备注 + 游戏内昵称）的候选集，逐个打印既泄露过多玩家标识，
+                    // 也不符合日志「够定位就够」的原则。首个候选就是实际用于搜索的名字。
+                    log::warn!(
+                        "邀请流程继续（步骤：填写通知）：向好友发送邀请通知消息失败，目标为好友列表中的「{}」，改为直接打开好友会话尝试邀请；通知未送达，对方不会提前收到入厅提示：{error}",
+                        request.recipients.first().map(String::as_str).unwrap_or("未知")
+                    );
                     notification = InviteNotificationOutcome::Failed(error);
                     true
                 }
@@ -388,8 +394,9 @@ fn click_current_friend_avatar(
                 .device()
                 .click_point(x, y)
                 .map_err(|error| after_input_failure("select_invite_avatar", error))?;
+            // 这是一次实际点击，属于玩家能感知的动作，保持 info。
             log::info!(
-                "邀请: 当前好友会话的左侧头像稳定确认，点击 samples={} x={} y={}",
+                "邀请流程（步骤：点击好友头像）：左侧头像连续 {} 次采样稳定，点击坐标 ({}, {}) 进入好友会话",
                 config.stable_count,
                 x,
                 y

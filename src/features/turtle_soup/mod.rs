@@ -180,7 +180,7 @@ impl TurtleSoupApplication {
             port.send_turtle_soup_reply(reply)?;
         }
         log::info!(
-            "海龟汤命令已处理: command={} action={}",
+            "海龟汤命令「{}」已处理，结果：{}",
             raw_command,
             outcome.action
         );
@@ -196,7 +196,7 @@ impl TurtleSoupApplication {
         match port.submit_question(question, observed_at)? {
             QuestionSubmitOutcome::Ignored => Ok(false),
             QuestionSubmitOutcome::Queued { request_id } => {
-                log::info!("海龟汤提问已进入 AI 队列: request_id={}", request_id);
+                log::debug!("海龟汤提问已进入 AI 裁决队列，排队号 {}", request_id);
                 Ok(true)
             }
             QuestionSubmitOutcome::Reply(reply) => {

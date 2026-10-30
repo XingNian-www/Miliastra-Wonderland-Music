@@ -25,6 +25,21 @@ static DOWNSCALED_GRAY_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<(PathBuf, u32), Ar
 /// 也就是说 min_score=0.80 时它几乎"匹配一切均匀区域"。
 const FLAT_TEMPLATE_STDDEV: f32 = 4.0;
 
+/// 已就近纯色告警过的模板路径。
+///
+/// 模板缺陷是静态属性，只需提示一次；用集合而非 `OnceLock<bool>` 是因为
+/// 不同模板各自独立，一份坏模板不应吞掉另一份的告警。
+static FLAT_TEMPLATE_WARNED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+
+/// 该模板是否**首次**被判定为近纯色。首次返回 true，之后恒为 false。
+fn warn_flat_template_once(label: &Path) -> bool {
+    let warned = FLAT_TEMPLATE_WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut warned = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    warned.insert(label.to_path_buf())
+}
+
 /// 灰度标准差：0 表示纯色。用来衡量模板对 SAD 的区分度。
 fn gray_stddev(gray: &GrayImage) -> f32 {
     let values = gray.as_raw();
@@ -191,11 +206,16 @@ impl GrayTemplate {
         };
         let gray_stddev = gray_stddev(&gray);
         if gray_stddev < FLAT_TEMPLATE_STDDEV {
-            log::warn!(
-                "模板 {} 的灰度标准差仅 {:.2}（近纯色），SAD 区分度极低，容易在大面积均匀区域误命中；建议改用多点签名断言",
-                label.display(),
-                gray_stddev
-            );
+            // 同一模板会被 build 两次（全分辨率与降采样版本），而模板有缺陷这件事
+            // 是静态的：每帧重复告警只会把真正有用的日志挤出文件。
+            // 按模板路径去重，同一份模板在整个进程生命周期内只提示一次。
+            if warn_flat_template_once(label) {
+                log::warn!(
+                    "模板「{}」的灰度标准差仅 {:.2}，属近纯色，SAD 区分度极低，容易在大面积均匀区域误命中；建议改用多点签名断言",
+                    label.display(),
+                    gray_stddev
+                );
+            }
         }
         Self {
             gray,
@@ -342,8 +362,33 @@ pub(crate) fn best_template_hit(
     template_path: &Path,
     threshold: f32,
 ) -> Result<Option<TemplateHit>> {
-    Ok(best_template_candidate(image, search_rect, template_path)?
-        .filter(|candidate| candidate.score >= threshold))
+    let candidate = best_template_candidate(image, search_rect, template_path)?;
+    // **逐帧调用**，所以未达阈值只走 trace：默认级别下不留痕，
+    // 排障时把 logging.level 调到 trace 就能看到每一帧的分数。
+    // 规范 §五要求「写明哪个模板、哪个区域、期望多少、实际多少」，四要素齐全。
+    if let Some(candidate) = &candidate
+        && candidate.score < threshold
+    {
+        log::trace!(
+            "模板「{}」未达阈值：搜索区域 {}，期望分数 {:.3}，实际 {:.3}",
+            template_path.display(),
+            describe_search_rect(search_rect),
+            threshold,
+            candidate.score
+        );
+    }
+    Ok(candidate.filter(|candidate| candidate.score >= threshold))
+}
+
+/// 搜索区域的简短描述：给了区域就写几何，全图就写「整幅画面」。
+fn describe_search_rect(search_rect: Option<Rect>) -> String {
+    match search_rect {
+        Some(rect) => format!(
+            "({}, {}) {}×{}",
+            rect.x, rect.y, rect.width, rect.height
+        ),
+        None => "整幅画面".to_string(),
+    }
 }
 
 /// Check presence without selecting a best position or constructing hit evidence.
@@ -614,6 +659,33 @@ enum GpuState {
 
 static GPU_STATE: OnceLock<Mutex<GpuState>> = OnceLock::new();
 
+/// wgpu 的显卡类型转成中文，避免日志里出现 `DiscreteGpu` 这类内部枚举名。
+fn gpu_device_type_label(device_type: wgpu::DeviceType) -> &'static str {
+    match device_type {
+        wgpu::DeviceType::DiscreteGpu => "独立显卡",
+        wgpu::DeviceType::IntegratedGpu => "集成显卡",
+        wgpu::DeviceType::VirtualGpu => "虚拟显卡",
+        wgpu::DeviceType::Cpu => "CPU 软件渲染",
+        wgpu::DeviceType::Other => "其他设备",
+    }
+}
+
+/// wgpu 的图形 API 转成业界通用缩写（这些缩写属于保留的英文）。
+///
+/// 必须穷尽 `wgpu::Backend`：新增变体时编译失败，而不是在日志里留下一个空洞。
+fn gpu_backend_label(backend: wgpu::Backend) -> &'static str {
+    match backend {
+        wgpu::Backend::Vulkan => "Vulkan",
+        wgpu::Backend::Metal => "Metal",
+        wgpu::Backend::Dx12 => "DirectX 12",
+        wgpu::Backend::Dx11 => "DirectX 11",
+        wgpu::Backend::Gl => "OpenGL",
+        wgpu::Backend::BrowserWebGpu => "WebGPU",
+        // 占位后端只在测试里出现，不会进入真实匹配路径。
+        wgpu::Backend::Empty => "无",
+    }
+}
+
 fn u32_bytes(values: &[u32]) -> Vec<u8> {
     // 一次分配 + 定长切片写入：避免逐元素扩容与边界检查，大模板上是主要开销之一。
     let mut bytes = vec![0u8; values.len() * 4];
@@ -726,11 +798,14 @@ impl GpuSearcher {
             entry_point: "main_sad",
         });
 
+        // 只在 GPU 匹配器真正创建成功时执行一次（整个进程生命周期），
+        // 因此用 info 记录「本次运行实际用的是哪块 GPU」是合适的；
+        // 重复失败/回退路径不在这里，不会刷屏。
         log::info!(
-            "模板匹配 GPU 后端: {} | {:?} | {:?}",
+            "模板匹配启用 GPU 后端：{}（{}，{}）",
             info.name,
-            info.device_type,
-            info.backend
+            gpu_device_type_label(info.device_type),
+            gpu_backend_label(info.backend)
         );
 
         Some(Self {
@@ -895,7 +970,9 @@ fn gpu_best_position(haystack: &GrayImage, matcher: &GrayMatcher<'_>) -> Option<
         *guard = match GpuSearcher::create() {
             Some(searcher) => GpuState::Ready(Box::new(searcher)),
             None => {
-                log::warn!("没有可用的硬件 GPU 适配器，模板匹配退回 CPU");
+                log::warn!(
+                    "未找到可用的硬件 GPU 适配器，模板匹配改用 CPU 计算，大区域匹配会比 GPU 明显更慢；本次运行不再重试 GPU"
+                );
                 GpuState::Unavailable
             }
         };

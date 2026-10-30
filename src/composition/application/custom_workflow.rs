@@ -165,7 +165,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn send_friend_message(&self, username: &str, message: &str) -> Result<bool> {
-        log::info!("好友发言: {} -> {}", username, redacted_chat_text(&message));
+        log::info!("好友发言：{} -> {}", username, redacted_chat_text(&message));
         self.send_friend_delivery_routine(username, &message)
     }
 

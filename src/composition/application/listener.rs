@@ -807,7 +807,7 @@ impl ApplicationRuntime {
             persist_chat_listener_mode(&self.lifecycle.config.state.playback_state_path, mode)
         {
             log::error!(
-                "保存聊天值守模式失败（步骤：写入值守模式状态文件），本次选择未落盘，进程重启后会回到上一次保存的值: {error:#}"
+                "保存聊天值守模式失败（步骤：写入值守模式状态文件），本次选择未落盘，进程重启后会回到上一次保存的值：{error:#}"
             );
         }
     }
@@ -816,7 +816,7 @@ impl ApplicationRuntime {
         match self.business.business.chat_listener_snapshot() {
             Ok(snapshot) => self.persist_listener_mode_best_effort(snapshot.mode),
             Err(error) => log::error!(
-                "保存聊天值守模式失败（步骤：读取当前值守模式），本次没有可保存的值，进程重启后会回到上一次保存的值: {error}"
+                "保存聊天值守模式失败（步骤：读取当前值守模式），本次没有可保存的值，进程重启后会回到上一次保存的值：{error}"
             ),
         }
     }
@@ -869,7 +869,7 @@ impl ApplicationRuntime {
             Ok(frame) => frame,
             Err(error) => {
                 log::warn!(
-                    "启动时截图失败（步骤：检查屏幕尺寸），本次尺寸校验跳过，扫描循环会等目标窗口恢复后继续: {error:#}"
+                    "启动时截图失败（步骤：检查屏幕尺寸），本次尺寸校验跳过，扫描循环会等目标窗口恢复后继续：{error:#}"
                 );
                 return Ok(());
             }
@@ -1084,7 +1084,7 @@ impl ApplicationRuntime {
             Arc::new(move || {
                 if let Err(error) = task_engine.wake() {
                     log::debug!(
-                        "热键切换暂停状态后唤醒任务调度失败，暂停或恢复要等下一轮扫描才生效: {error}"
+                        "热键切换暂停状态后唤醒任务调度失败，暂停或恢复要等下一轮扫描才生效：{error}"
                     );
                 }
             }),
@@ -1133,7 +1133,7 @@ impl ApplicationRuntime {
             ),
             Ok(false) => {}
             Err(error) => log::error!(
-                "配置重载的替代进程重排启动自动化失败（步骤：补排缺失的启动动作），该进程暂时无法完成交接，会按冷却间隔重试: {error:#}"
+                "配置重载的替代进程重排启动自动化失败（步骤：补排缺失的启动动作），该进程暂时无法完成交接，会按冷却间隔重试：{error:#}"
             ),
         }
         *retry_after = now + CONFIG_RELOAD_STARTUP_RETRY_INTERVAL;
@@ -1200,7 +1200,7 @@ impl ApplicationRuntime {
             }
             Err(error) => {
                 log::error!(
-                    "大厅到期处理失败（步骤：暂停播放并提示到期），本次没有暂停也没有提示，5 秒后重试: {error:#}"
+                    "大厅到期处理失败（步骤：暂停播放并提示到期），本次没有暂停也没有提示，5 秒后重试：{error:#}"
                 );
                 Duration::from_secs(5)
             }
@@ -1223,7 +1223,7 @@ impl ApplicationRuntime {
             Err(error) => {
                 if let Err(forward_error) = final_forward_result {
                     log::error!(
-                        "扫描循环退出时转发观察完成推进失败（步骤：把已完成的观察推进提交给业务运行时），业务可能因此收不到最后一批完成事件: {forward_error:#}"
+                        "扫描循环退出时转发观察完成推进失败（步骤：把已完成的观察推进提交给业务运行时），业务可能因此收不到最后一批完成事件：{forward_error:#}"
                     );
                 }
                 Err(error)
@@ -1326,7 +1326,7 @@ impl ApplicationRuntime {
                     && let Err(error) = subscription.cancel()
                 {
                     log::warn!(
-                        "撤销旧观察帧需求失败（触发原因：主循环间隔改变），旧订阅可能多存活一轮，下一轮会重新申请: {error}"
+                        "撤销旧观察帧需求失败（触发原因：主循环间隔改变），旧订阅可能多存活一轮，下一轮会重新申请：{error}"
                     );
                 }
                 frame_demand = FrameDemand::new(Duration::from_millis(next_frame_demand_ms))
@@ -1344,7 +1344,7 @@ impl ApplicationRuntime {
                     && let Err(error) = subscription.cancel()
                 {
                     log::warn!(
-                        "撤销观察帧需求失败（触发原因：正式任务占用界面），旧订阅可能多存活一轮，下一轮会重新申请: {error}"
+                        "撤销观察帧需求失败（触发原因：正式任务占用界面），旧订阅可能多存活一轮，下一轮会重新申请：{error}"
                     );
                 }
                 self.invalidate_latest_frame();
@@ -1375,7 +1375,7 @@ impl ApplicationRuntime {
                     && let Err(error) = subscription.cancel()
                 {
                     log::warn!(
-                        "撤销旧观察帧需求失败（触发原因：扫描新鲜度边界变化），旧订阅可能多存活一轮，下一轮会重新申请: {error}"
+                        "撤销旧观察帧需求失败（触发原因：扫描新鲜度边界变化），旧订阅可能多存活一轮，下一轮会重新申请：{error}"
                     );
                 }
                 self.invalidate_latest_frame();
@@ -1399,7 +1399,7 @@ impl ApplicationRuntime {
                     && let Err(error) = subscription.cancel()
                 {
                     log::warn!(
-                        "撤销观察帧需求失败（触发原因：暂停值守），旧订阅可能多存活一轮，恢复后会重新申请: {error}"
+                        "撤销观察帧需求失败（触发原因：暂停值守），旧订阅可能多存活一轮，恢复后会重新申请：{error}"
                     );
                 }
                 unresolved_ui_since = None;
@@ -1611,7 +1611,7 @@ impl ApplicationRuntime {
                                         )
                                     }
                                     Err(error) => log::warn!(
-                                        "聊天值守驻留恢复失败（步骤：把界面切回{}），逻辑模式保持不变，稍后重试；本条在问题持续期间最多每分钟重复一次: {error:#}",
+                                        "聊天值守驻留恢复失败（步骤：把界面切回{}），逻辑模式保持不变，稍后重试；本条在问题持续期间最多每分钟重复一次：{error:#}",
                                         residency_target_label(target)
                                     ),
                                 }
@@ -1665,7 +1665,7 @@ impl ApplicationRuntime {
                                         residency_target_label(target)
                                     ),
                                     Err(error) => log::warn!(
-                                        "持续未知界面的聊天值守驻留恢复失败（步骤：把界面切回{}），稍后重试；本条在问题持续期间最多每分钟重复一次: {error:#}",
+                                        "持续未知界面的聊天值守驻留恢复失败（步骤：把界面切回{}），稍后重试；本条在问题持续期间最多每分钟重复一次：{error:#}",
                                         residency_target_label(target)
                                     ),
                                 }
@@ -1850,11 +1850,11 @@ impl ApplicationRuntime {
                                     Instant::now(),
                                 ) {
                                     log::warn!(
-                                        "界面状态检测失败（步骤：识别当前界面），本轮不派发任何命令，下一轮重新识别；本条在问题持续期间最多每分钟重复一次: {error:#}"
+                                        "界面状态检测失败（步骤：识别当前界面），本轮不派发任何命令，下一轮重新识别；本条在问题持续期间最多每分钟重复一次：{error:#}"
                                     );
                                 } else {
                                     log::debug!(
-                                        "界面状态检测再次失败，继续下一轮识别: {error:#}"
+                                        "界面状态检测再次失败，继续下一轮识别：{error:#}"
                                     );
                                 }
                                 log::info!(target: "timing",
@@ -1890,7 +1890,7 @@ impl ApplicationRuntime {
                         && let Err(cancel_error) = subscription.cancel()
                     {
                         log::warn!(
-                            "撤销观察帧需求失败（触发原因：截图失败），旧订阅可能多存活一轮，重试时会重新申请: {cancel_error}"
+                            "撤销观察帧需求失败（触发原因：截图失败），旧订阅可能多存活一轮，重试时会重新申请：{cancel_error}"
                         );
                     }
                     let frame_ms = elapsed_ms(frame_started);
@@ -1911,12 +1911,12 @@ impl ApplicationRuntime {
                     let target_missing_wait = self.reload_aware_wait(target_missing_backoff);
                     if loop_failure_warn_due(&mut capture_failed_warned_at, Instant::now()) {
                         log::warn!(
-                            "截图失败（步骤：抓取游戏画面），本轮无法识别界面与聊天，{} 秒后重试；本条在问题持续期间最多每分钟重复一次: {error:#}",
+                            "截图失败（步骤：抓取游戏画面），本轮无法识别界面与聊天，{} 秒后重试；本条在问题持续期间最多每分钟重复一次：{error:#}",
                             target_missing_wait.as_secs()
                         );
                     } else {
                         log::debug!(
-                            "截图再次失败，{} 秒后重试: {error:#}",
+                            "截图再次失败，{} 秒后重试：{error:#}",
                             target_missing_wait.as_secs()
                         );
                     }
@@ -2028,7 +2028,7 @@ impl ApplicationRuntime {
             && let Err(error) = subscription.cancel()
         {
             log::warn!(
-                "扫描循环结束时撤销观察帧需求失败（步骤：退出前释放观察帧订阅），旧订阅随进程退出一起回收: {error}"
+                "扫描循环结束时撤销观察帧需求失败（步骤：退出前释放观察帧订阅），旧订阅随进程退出一起回收：{error}"
             );
         }
 
@@ -2516,12 +2516,18 @@ impl ApplicationRuntime {
             },
             None => crate::features::identity::IdentityHint::Nickname(subject),
         };
-        let identity = self
-            .lifecycle
-            .live_configs
-            .identity
-            .resolve_hint(hint)
-            .map(|resolved| resolved.id.to_string());
+        let identity = &self.lifecycle.live_configs.identity;
+        let uuid = identity.resolve_hint(hint).map(|resolved| resolved.id);
+        // 兜底：`resolve_hint` 只认 nickname（那是**授权**口径，不能放宽），
+        // 而外部聊天源给的发送者名字常常是 **note（游戏真名）**——
+        // 已登记玩家的 note 与 nickname 是两条不同字符串，前者解析不出来，
+        // 表现为「歌单窗口决策的发送者不是当前窗口属主」，`@1`~`@5` 全部失效。
+        //
+        // **这里只服务归属**（决定这份歌单属于谁），不是授权。
+        // 归属用 note 是允许的（见 identity.rs 的「note 可用于归属、不可用于授权」）。
+        // 绝不能把这段兜底上移到 `resolve_hint`：那会让「改昵称冒充管理员」复活。
+        let uuid = uuid.or_else(|| identity.ownership_uuid_by_name(subject));
+        let identity = uuid.map(|uuid| uuid.to_string());
         crate::features::playlist::owner_key::candidates(identity.as_deref())
     }
 
@@ -2992,7 +2998,7 @@ impl ApplicationRuntime {
         };
         if let Err(error) = self.reply(message) {
             log::warn!(
-                "向玩家说明命令被拒原因失败（原因：{}），命令仍不执行，玩家这次看不到提示: {error:#}",
+                "向玩家说明命令被拒原因失败（原因：{}），命令仍不执行，玩家这次看不到提示：{error:#}",
                 gate.log_reason()
             );
         }
@@ -3088,22 +3094,22 @@ impl ApplicationRuntime {
 
     pub(super) fn abort_entertainment_for_context_loss(&self, reason: &str) {
         if let Err(error) = self.business.business.abort_turtle_soup(reason) {
-            log::error!("无法中止海龟汤会话: {error:#}");
+            log::error!("无法中止海龟汤会话：{error:#}");
         }
         match self.business.undercover_game.abort() {
-            Ok(true) => log::warn!("谁是卧底已因聊天上下文变化中止: {}", reason),
+            Ok(true) => log::warn!("谁是卧底已因聊天上下文变化中止：{}", reason),
             Ok(false) => {}
-            Err(error) => log::error!("无法中止旧谁是卧底牌局: {error:#}"),
+            Err(error) => log::error!("无法中止旧谁是卧底牌局：{error:#}"),
         }
         match self.business.card_games.abort() {
-            Ok(true) => log::warn!("牌局已因聊天上下文变化中止: {}", reason),
+            Ok(true) => log::warn!("牌局已因聊天上下文变化中止：{}", reason),
             Ok(false) => {}
-            Err(error) => log::error!("无法中止旧牌局: {error:#}"),
+            Err(error) => log::error!("无法中止旧牌局：{error:#}"),
         }
         match self.business.business.abort_idiom_chain() {
-            Ok(true) => log::warn!("成语接龙已因聊天上下文变化中止: {}", reason),
+            Ok(true) => log::warn!("成语接龙已因聊天上下文变化中止：{}", reason),
             Ok(false) => {}
-            Err(error) => log::error!("无法中止旧成语接龙会话: {error:#}"),
+            Err(error) => log::error!("无法中止旧成语接龙会话：{error:#}"),
         }
     }
 
@@ -3111,7 +3117,7 @@ impl ApplicationRuntime {
         let scheduler_idle = match self.business.task_engine.snapshot() {
             Ok(snapshot) => snapshot.is_idle(),
             Err(error) => {
-                log::error!("无法读取业务调度状态，娱乐计时保持暂停: {error}");
+                log::error!("无法读取业务调度状态，娱乐计时保持暂停：{error}");
                 false
             }
         };
@@ -3121,7 +3127,7 @@ impl ApplicationRuntime {
             .business
             .refresh_turtle_soup_deadline(Instant::now(), clock_active)
         {
-            log::error!("无法同步海龟汤期限: {error:#}");
+            log::error!("无法同步海龟汤期限：{error:#}");
         }
         let card_game_outcome = match self
             .business
@@ -3130,7 +3136,7 @@ impl ApplicationRuntime {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                log::error!("无法推进牌局回合计时: {error:#}");
+                log::error!("无法推进牌局回合计时：{error:#}");
                 None
             }
         };
@@ -3144,7 +3150,7 @@ impl ApplicationRuntime {
                     "牌局计时结果入队失败（步骤：把超时效果加入待处理队列）：本次超时判定的出牌或结束动作没有执行，牌局停在当前回合；已在回滚该效果，若回滚成功下一轮计时会重新判定并可继续，回滚失败则牌局计时不再推进：{error:#}"
                 );
                 if let Err(cancel_error) = self.business.card_games.cancel_effect(key) {
-                    log::error!("牌局计时结果入队失败后无法清理牌局: {cancel_error:#}");
+                    log::error!("牌局计时结果入队失败后无法清理牌局：{cancel_error:#}");
                 }
             }
         }
@@ -3155,7 +3161,7 @@ impl ApplicationRuntime {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                log::error!("无法推进谁是卧底计时: {error:#}");
+                log::error!("无法推进谁是卧底计时：{error:#}");
                 None
             }
         };
@@ -3167,7 +3173,7 @@ impl ApplicationRuntime {
                     "谁是卧底计时消息入队失败（步骤：把超时效果加入待处理队列）：本次超时判定的淘汰或揭示动作没有执行，本局停在当前阶段；已在回滚该效果，若回滚成功下一轮计时会重新判定并可继续，回滚失败则本局计时不再推进：{error:#}"
                 );
                 if let Err(cancel_error) = self.business.undercover_game.cancel_effect(key) {
-                    log::error!("谁是卧底计时消息入队失败后无法清理牌局: {cancel_error:#}");
+                    log::error!("谁是卧底计时消息入队失败后无法清理牌局：{cancel_error:#}");
                 }
             }
         }
@@ -3312,7 +3318,7 @@ impl ApplicationRuntime {
             .request_chat_listener_mode(ChatListenerMode::Secondary)
         {
             log::warn!(
-                "外部聊天源自动切换到二级值守失败（步骤：请求切换值守模式），当前保持一级值守，不再自动重试: {error}"
+                "外部聊天源自动切换到二级值守失败（步骤：请求切换值守模式），当前保持一级值守，不再自动重试：{error}"
             );
         }
         Ok(())
@@ -3350,7 +3356,7 @@ impl ApplicationRuntime {
                 .cancel_chat_listener_mode_request(target)
             {
                 log::error!(
-                    "撤销值守切换请求失败（步骤：入队失败后回滚切换请求），该请求可能残留在待处理状态并挡住后续驻留恢复，需要人工核对: {cancel_error}"
+                    "撤销值守切换请求失败（步骤：入队失败后回滚切换请求），该请求可能残留在待处理状态并挡住后续驻留恢复，需要人工核对：{cancel_error}"
                 );
             }
             return Err(error);

@@ -491,7 +491,7 @@ impl ModerationService {
             Ok(approved) => approved,
             Err(error) => {
                 log::error!(
-                    "对 UID{} 的{}投票统计失败（步骤：后台线程等待并统计可见票数）；本局按未通过处理，管理员可直接重发命令接管: {error:#}",
+                    "对 UID{} 的{}投票统计失败（步骤：后台线程等待并统计可见票数）；本局按未通过处理，管理员可直接重发命令接管：{error:#}",
                     work.command.uid,
                     work.command.action.label()
                 );
@@ -568,7 +568,7 @@ impl ModerationService {
             }
             // 通知不是管理员直接拉黑的审批条件，发送失败也只执行一次 UI 动作。
             log::error!(
-                "管理员拉黑 UID{} 前的开始通告发送失败（步骤：先告知大厅再执行）；拉黑操作本身仍会继续执行: {error:#}",
+                "管理员拉黑 UID{} 前的开始通告发送失败（步骤：先告知大厅再执行）；拉黑操作本身仍会继续执行：{error:#}",
                 task.command.uid
             );
         }
@@ -585,7 +585,7 @@ impl ModerationService {
                     task.command.action.label()
                 )) {
                     log::error!(
-                        "UID{} 的{}已执行成功，但成功通告发送失败；大厅其他成员看不到这条结果: {error:#}",
+                        "UID{} 的{}已执行成功，但成功通告发送失败；大厅其他成员看不到这条结果：{error:#}",
                         task.command.uid,
                         task.command.action.label()
                     );
@@ -600,7 +600,7 @@ impl ModerationService {
             }
             Err(error) => {
                 log::error!(
-                    "UID{} 的{}执行结果未知（步骤：提交管理界面操作后等待确认）；为防止重复操作，本任务不会重放，需人工确认: {error:#}",
+                    "UID{} 的{}执行结果未知（步骤：提交管理界面操作后等待确认）；为防止重复操作，本任务不会重放，需人工确认：{error:#}",
                     task.command.uid,
                     task.command.action.label()
                 );
@@ -668,7 +668,7 @@ impl ModerationService {
                 }
                 Err(error) => {
                     log::error!(
-                        "{}投票扫描可见消息失败（步骤：每轮读取投票截图）；本轮票数不变，下一轮重试: {error:#}",
+                        "{}投票扫描可见消息失败（步骤：每轮读取投票截图）；本轮票数不变，下一轮重试：{error:#}",
                         command.action.label()
                     );
                     continue;
@@ -881,7 +881,7 @@ impl ModerationWorkflowLease {
         self.active = false;
         if let Err(error) = self.ledger.release(self.key.clone(), self.token.clone()) {
             log::error!(
-                "释放 UID{} 的{}工作流失败（步骤：任务结束后交还租约）；该操作会一直被判定为进行中，后续同类请求将被当作重复跳过: {error:#}",
+                "释放 UID{} 的{}工作流失败（步骤：任务结束后交还租约）；该操作会一直被判定为进行中，后续同类请求将被当作重复跳过：{error:#}",
                 self.key.uid,
                 self.key.action.label()
             );

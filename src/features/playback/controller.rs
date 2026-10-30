@@ -624,7 +624,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         if let Err(error) = result {
             if let Err(restore_error) = self.restore_failed_attempt(&attempt, "dispatch_failed") {
                 log::error!(
-                    "播放「{}」失败（步骤：向后端派发播放请求），且失败后恢复原播放状态也失败（{restore_error:#}）；本次播放未生效，队列保持原状等待下次重试: {error:#}",
+                    "播放「{}」失败（步骤：向后端派发播放请求），且失败后恢复原播放状态也失败（{restore_error:#}）；本次播放未生效，队列保持原状等待下次重试：{error:#}",
                     request.keyword
                 );
             }
@@ -646,7 +646,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .to_string(),
         ) {
             log::error!(
-                "记录播放派发历史失败（步骤：写入播放请求状态库）；本次播放不受影响，但重启后可能重复派发同一首: {error:#}"
+                "记录播放派发历史失败（步骤：写入播放请求状态库）；本次播放不受影响，但重启后可能重复派发同一首：{error:#}"
             );
         }
     }
@@ -658,7 +658,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             completed,
         ) {
             log::error!(
-                "记录播放器控制历史失败（步骤：写入播放请求状态库）；本次控制已生效，但这些记录不会出现在崩溃恢复的排查依据里: {error:#}"
+                "记录播放器控制历史失败（步骤：写入播放请求状态库）；本次控制已生效，但这些记录不会出现在崩溃恢复的排查依据里：{error:#}"
             );
         }
     }
@@ -798,7 +798,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         // 恢复前先应用持久化音量：引擎重启后默认 100，必须恢复到上次会话的音量。
         if let Err(error) = self.backend.set_volume(&runtime.volume.to_string()) {
             log::warn!(
-                "恢复上次播放时设置音量失败（步骤：恢复播放前应用持久化音量）；本次恢复继续执行，音量可能停在引擎默认值: {error:#}"
+                "恢复上次播放时设置音量失败（步骤：恢复播放前应用持久化音量）；本次恢复继续执行，音量可能停在引擎默认值：{error:#}"
             );
         }
         let mut attempt = self.begin_playback_attempt(&request)?;
@@ -807,7 +807,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         if let Err(error) = result {
             if let Err(restore_error) = self.restore_failed_attempt(&attempt, "dispatch_failed") {
                 log::error!(
-                    "恢复上次播放失败（步骤：向引擎派发恢复请求），且恢复原播放状态也失败（{restore_error:#}）；本次恢复未生效，队列已清空该请求等待重新点歌: {error:#}"
+                    "恢复上次播放失败（步骤：向引擎派发恢复请求），且恢复原播放状态也失败（{restore_error:#}）；本次恢复未生效，队列已清空该请求等待重新点歌：{error:#}"
                 );
             }
             return Err(error);
@@ -817,7 +817,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         // 明确设置（非 toggle），引擎加载中的歌词任务完成后按该模式显示。
         if let Err(error) = self.backend.set_lyrics_translation(runtime.use_translation) {
             log::warn!(
-                "恢复上次播放时设置歌词模式失败（步骤：恢复播放后应用持久化歌词模式）；歌曲已正常播放，歌词显示与重启前可能不一致: {error:#}"
+                "恢复上次播放时设置歌词模式失败（步骤：恢复播放后应用持久化歌词模式）；歌曲已正常播放，歌词显示与重启前可能不一致：{error:#}"
             );
         }
         // 原用户暂停：歌曲已开始播放，立即暂停以保持用户暂停语义。
@@ -832,7 +832,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     );
                 }
                 Err(error) => log::warn!(
-                    "恢复上次播放后重新暂停失败（步骤：恢复播放后保持用户暂停）；歌曲已开始播放，用户会听到音乐而未主动点播: {error:#}"
+                    "恢复上次播放后重新暂停失败（步骤：恢复播放后保持用户暂停）；歌曲已开始播放，用户会听到音乐而未主动点播：{error:#}"
                 ),
             }
         }
@@ -1277,7 +1277,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 && let Err(error) = self.backend.invalidate_audio_cache(&key)
             {
                 log::warn!(
-                    "清除该曲目的音频缓存失败（步骤：放弃曲目后清理缓存）；下次播放仍会复用这份可能损坏的缓存: {error:#}"
+                    "清除该曲目的音频缓存失败（步骤：放弃曲目后清理缓存）；下次播放仍会复用这份可能损坏的缓存：{error:#}"
                 );
             }
             self.clear_active_request()?;
@@ -1476,7 +1476,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 Ok(false) => return Ok(QueueAdvanceDecision::None),
                 Err(error) => {
                     log::error!(
-                        "播放运行时重启后的恢复失败（步骤：按上次曲目重新派发播放）；播放状态已标记为未知，队列保留等待人工确认: {error:#}"
+                        "播放运行时重启后的恢复失败（步骤：按上次曲目重新派发播放）；播放状态已标记为未知，队列保留等待人工确认：{error:#}"
                     );
                     self.mark_unknown()?;
                     return Ok(QueueAdvanceDecision::PlaybackStateChanged);
@@ -1621,7 +1621,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         // 只记 warning（下一次播放会重新登记）。
         if let Err(error) = self.record_song_dedup_playback(request, status) {
             log::warn!(
-                "记录同歌去重历史失败（步骤：起播确认后记账）；本次播放已生效，但该曲目可能被重复点播: {error:#}"
+                "记录同歌去重历史失败（步骤：起播确认后记账）；本次播放已生效，但该曲目可能被重复点播：{error:#}"
             );
         }
         if let Err(error) = self
@@ -1629,7 +1629,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .record_playback_pool_track(confirmed_track.clone())
         {
             log::warn!(
-                "把该曲目加入播放池失败（步骤：起播确认后记账）；本次播放已生效，但队列播完后不会随机播到它: {error:#}"
+                "把该曲目加入播放池失败（步骤：起播确认后记账）；本次播放已生效，但队列播完后不会随机播到它：{error:#}"
             );
         }
         log::debug!(

@@ -995,7 +995,7 @@ impl WindowDetectionSignal {
             .map_err(|_| anyhow!("window detection signal mutex poisoned"))?;
         *generation = generation.wrapping_add(1);
         cvar.notify_all();
-        log::info!("已请求重置窗口检测退避: {}", reason);
+        log::info!("已请求重置窗口检测退避：{}", reason);
         Ok(())
     }
 
@@ -1078,12 +1078,12 @@ impl PendingTask {
             }
             PendingTask::CardGameEffect(effect) => {
                 if let Err(error) = effect.cancel() {
-                    log::error!("撤销牌局计时结果后无法清理牌局: {error:#}");
+                    log::error!("撤销牌局计时结果后无法清理牌局：{error:#}");
                 }
             }
             PendingTask::UndercoverEffect(effect) => {
                 if let Err(error) = effect.cancel() {
-                    log::error!("撤销谁是卧底效果后无法清理牌局: {error:#}");
+                    log::error!("撤销谁是卧底效果后无法清理牌局：{error:#}");
                 }
             }
             _ => {}
@@ -1434,7 +1434,7 @@ impl TemporaryPrimaryHold {
     fn release(&mut self) {
         if self.active {
             if let Err(error) = self.business.end_chat_listener_temporary_primary() {
-                log::error!("释放临时一级值守保留失败: {error}");
+                log::error!("释放临时一级值守保留失败：{error}");
             }
             self.active = false;
         }
@@ -1496,7 +1496,7 @@ impl ApplicationRuntime {
             &config.kugou,
             &config.playback.credential_directory,
         ) {
-            log::warn!("写入酷狗设备信息失败，将沿用已有文件: {error}");
+            log::warn!("写入酷狗设备信息失败，将沿用已有文件：{error}");
         }
         let native_playback_runtime = NativePlaybackRuntime::start_with_lyrics_lead_and_helper(
             config.playback.credential_directory.clone(),
@@ -1529,7 +1529,7 @@ impl ApplicationRuntime {
         );
         let idiom_chain = IdiomChainService::load(config.idiom_chain.clone())?;
         if config.idiom_chain.enabled {
-            log::info!("已加载成语接龙词库: {} 条", idiom_chain.lexicon_len());
+            log::info!("已加载成语接龙词库：{} 条", idiom_chain.lexicon_len());
         }
         let landlord = CardGameService::new(config.landlord.clone());
         let undercover =
@@ -1564,7 +1564,7 @@ impl ApplicationRuntime {
                 .map(|mapping| (mapping.nickname.clone(), mapping.id.to_string()))
                 .collect::<std::collections::HashMap<_, _>>();
             if let Err(error) = playlist_application.migrate_to_identity_keys(&mappings) {
-                log::warn!("歌单归属键迁移失败（不影响启动）: {error:#}");
+                log::warn!("歌单归属键迁移失败（不影响启动）：{error:#}");
             }
         }
         let moderation_policy = ModerationPolicy::new(
@@ -1744,7 +1744,7 @@ impl ApplicationRuntime {
                 log::info!("已恢复持久化的{}", mode.label());
             }
             Ok(None) => log::info!("无持久化聊天值守模式，使用默认一级值守"),
-            Err(error) => log::warn!("加载聊天值守模式失败，使用默认一级值守: {error:#}"),
+            Err(error) => log::warn!("加载聊天值守模式失败，使用默认一级值守：{error:#}"),
         }
         let card_games = CardGameApplication::new(Arc::new(business.clone()));
         let undercover_game = UndercoverApplication::new(Arc::new(business.clone()));
@@ -1775,7 +1775,7 @@ impl ApplicationRuntime {
         match player.play_restored() {
             Ok(true) => log::info!("已恢复上次会话的活动歌曲"),
             Ok(false) => log::info!("无待恢复的活动歌曲"),
-            Err(error) => log::warn!("恢复上次会话的活动歌曲失败: {error:#}"),
+            Err(error) => log::warn!("恢复上次会话的活动歌曲失败：{error:#}"),
         }
         let playback_application = PlaybackApplication::new(PlaybackApplicationConfig {
             console_bypass_dedup: config.song_dedup.console_bypass,
@@ -1899,7 +1899,7 @@ impl ApplicationRuntime {
                         external_live_configs,
                     )
                     .unwrap_or_else(|error| {
-                        log::error!("外部聊天源启动失败，继续走 OCR: {error:#}");
+                        log::error!("外部聊天源启动失败，继续走 OCR：{error:#}");
                         external_chat::ExternalChatState::default()
                     }),
                 }

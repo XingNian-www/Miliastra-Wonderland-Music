@@ -81,7 +81,7 @@ impl Drop for SecondaryUnreadTaskCompletionGuard {
         };
         if let Err(error) = release {
             log::error!(
-                "二级未读任务异常结束，且释放待处理状态失败（步骤：回收未读任务占位），下一轮可能重复处理同一条未读，需要人工核对: {error}"
+                "二级未读任务异常结束，且释放待处理状态失败（步骤：回收未读任务占位），下一轮可能重复处理同一条未读，需要人工核对：{error}"
             );
         } else {
             log::warn!(
@@ -843,14 +843,14 @@ impl ApplicationRuntime {
         }
         if let Err(error) = &result {
             log::error!(
-                "确认窗口读取失败（步骤：等待玩家在确认窗口内回复），本轮拿不到任何回复；已提示玩家窗口结束，可稍后重试: {error:#}"
+                "确认窗口读取失败（步骤：等待玩家在确认窗口内回复），本轮拿不到任何回复；已提示玩家窗口结束，可稍后重试：{error:#}"
             );
             if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
                 if let Err(reply_error) =
                     self.reply("确认窗口已结束：无法继续读取聊天，请稍后重试。")
                 {
                     log::warn!(
-                        "确认窗口的结束提示发送失败（步骤：读取失败后告知玩家窗口已结束），玩家不知道这次选择没被收到，可能继续等待或重复发送指令: {reply_error:#}"
+                        "确认窗口的结束提示发送失败（步骤：读取失败后告知玩家窗口已结束），玩家不知道这次选择没被收到，可能继续等待或重复发送指令：{reply_error:#}"
                     );
                 }
             }
@@ -906,14 +906,14 @@ impl ApplicationRuntime {
         }
         if let Err(error) = &result {
             log::error!(
-                "确认窗口读取失败（步骤：等待玩家在确认窗口内回复），本轮拿不到任何回复；已提示玩家窗口结束，可稍后重试: {error:#}"
+                "确认窗口读取失败（步骤：等待玩家在确认窗口内回复），本轮拿不到任何回复；已提示玩家窗口结束，可稍后重试：{error:#}"
             );
             if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
                 if let Err(reply_error) =
                     self.reply("确认窗口已结束：无法继续读取聊天，请稍后重试。")
                 {
                     log::warn!(
-                        "确认窗口的结束提示发送失败（步骤：读取失败后告知玩家窗口已结束），玩家不知道这次选择没被收到，可能继续等待或重复发送指令: {reply_error:#}"
+                        "确认窗口的结束提示发送失败（步骤：读取失败后告知玩家窗口已结束），玩家不知道这次选择没被收到，可能继续等待或重复发送指令：{reply_error:#}"
                     );
                 }
             }
@@ -1110,7 +1110,7 @@ impl ApplicationRuntime {
                 }
             }
             let Some(index) = text.find(['@', '＠']) else {
-                log::debug!("二级值守气泡不是命令: {}", redacted_chat_text(&text));
+                log::debug!("二级值守气泡不是命令：{}", redacted_chat_text(&text));
                 outcome.unrecognized = true;
                 continue;
             };

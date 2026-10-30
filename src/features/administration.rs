@@ -186,7 +186,7 @@ impl AdministrationApplication {
                     log_result?;
                 } else if let Err(error) = log_result {
                     log::error!(
-                        "写入执行命令日志失败（步骤：把本次命令记入执行历史）；命令本身已生效，但历史里查不到这次操作: {error:#}"
+                        "写入执行命令日志失败（步骤：把本次命令记入执行历史）；命令本身已生效，但历史里查不到这次操作：{error:#}"
                     );
                 }
                 port.enqueue_hall_template(
@@ -203,7 +203,7 @@ impl AdministrationApplication {
                     log_result?;
                 } else if let Err(error) = log_result {
                     log::error!(
-                        "写入执行命令日志失败（步骤：把本次命令记入执行历史）；命令本身已生效，但历史里查不到这次操作: {error:#}"
+                        "写入执行命令日志失败（步骤：把本次命令记入执行历史）；命令本身已生效，但历史里查不到这次操作：{error:#}"
                     );
                 }
                 Ok(ImmediateAdministrationOutcome::Handled)

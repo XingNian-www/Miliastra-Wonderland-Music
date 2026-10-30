@@ -116,7 +116,7 @@ pub(crate) fn make_ocr_engine(args: &ResolvedOcrArgs) -> Result<OcrEngineBackend
         let backend_started = Instant::now();
         match new_ocr_engine(args, backend_choice) {
             Ok(engine) => {
-                log::info!("OCR 后端已启用: {}", backend_choice.name());
+                log::info!("OCR 后端已启用：{}", backend_choice.name());
                 log::info!(target: "timing",
                     "OCR 后端已启用: {} 初始化={}ms 总耗时={}ms",
                     backend_choice.name(),
@@ -129,7 +129,7 @@ pub(crate) fn make_ocr_engine(args: &ResolvedOcrArgs) -> Result<OcrEngineBackend
                 let backend = backend_choice.name();
                 let backend_ms = elapsed_ms(backend_started);
                 let message = format!("{backend}: {error:#}");
-                log::warn!("OCR 后端初始化失败，尝试下一个: {message}");
+                log::warn!("OCR 后端初始化失败，尝试下一个：{message}");
                 log::warn!(target: "timing",
                     "OCR 后端初始化失败耗时: backend={} total={}ms error={error:#}",
                     backend,
@@ -388,7 +388,7 @@ fn resolve_ocr_backends(values: &[String]) -> Vec<OcrBackendChoice> {
         match parse_ocr_backend(value) {
             Some(backend) if !backends.contains(&backend) => backends.push(backend),
             Some(_) => {}
-            None => log::warn!("未知 OCR 后端配置，已忽略: {}", value),
+            None => log::warn!("未知 OCR 后端配置，已忽略：{}", value),
         }
     }
     let has_mnn_backend = backends.iter().any(|backend| {

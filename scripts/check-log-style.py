@@ -121,8 +121,12 @@ def check():
                 if stripped and not has_cjk(msg) and len(stripped) >= 4:
                     problems.append((where, 'english-only', msg))
                 # 4) 可直译却仍用英文的技术词（warn/error 才严格要求）
+                #
+                # 检查前必须**先去掉占位符**：`{sequence}` / `{actor}` 里的名字是
+                # Rust 格式化参数名，输出时被运行期取值替换，读者永远看不到它。
+                # 曾因直接扫原文，把「序号 ≤ {sequence} …」误报成英文残留。
                 if level in ('warn', 'error'):
-                    hit = BAD_TECH_WORDS.search(msg)
+                    hit = BAD_TECH_WORDS.search(re.sub(r'\{[^}]*\}', '', msg))
                     if hit:
                         problems.append((where, 'english-word:' + hit.group(1), msg))
     return problems

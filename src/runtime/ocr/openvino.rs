@@ -1013,7 +1013,7 @@ fn prepare_local_runtime_loading() {
                 .find(|path| path.is_file())
             else {
                 log::debug!(
-                    "EXE 目录未发现本地 OpenVINO runtime，继续使用环境变量查找: {}",
+                    "EXE 目录中未发现本地 OpenVINO 运行时，本次改用环境变量查找；查找起点为 {}",
                     executable_dir.display()
                 );
                 return;
@@ -1022,7 +1022,7 @@ fn prepare_local_runtime_loading() {
             prepend_process_path(&search_paths);
             match openvino_sys::library::load_from(&library) {
                 Ok(()) => log::info!(
-                    "已优先加载 EXE 目录中的 OpenVINO runtime: {}",
+                    "已优先加载 EXE 目录中的 OpenVINO 运行时，推理将使用这份随程序分发的库；路径 {}",
                     library.display()
                 ),
                 Err(error) => log::warn!(

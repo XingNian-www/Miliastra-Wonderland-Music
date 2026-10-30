@@ -588,8 +588,12 @@ impl ApplicationRuntime {
                         }
                     }
                 }));
-                if outcome.is_err() {
-                    log::error!("记忆压缩线程 panic，本轮摘要丢弃");
+                if let Err(payload) = outcome {
+                    // 载荷是判断「为什么崩」的唯一线索；只报「崩溃」等于没报。
+                    log::error!(
+                        "记忆压缩线程崩溃（步骤：超预算后整理旧记忆），本轮摘要丢弃、原文仍保留在库里，下一轮会重新规划：{}",
+                        crate::runtime::ui::panic_payload_text(payload.as_ref())
+                    );
                 }
             });
         if let Err(error) = spawned {

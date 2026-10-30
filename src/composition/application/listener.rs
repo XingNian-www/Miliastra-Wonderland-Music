@@ -3138,7 +3138,11 @@ impl ApplicationRuntime {
             let key = outcome.key();
             let effect = self.business.card_games.timed_effect(outcome);
             if let Err(error) = self.push_pending_task(PendingTask::CardGameEffect(effect)) {
-                log::error!("牌局计时结果入队失败: {error:#}");
+                // 真实后果分两种：入队失败后立即回滚取消（下一轮计时会重新判定），
+                // 只有回滚也失败才会真的卡住——那种情况由下面那条 error 单独报。
+                log::error!(
+                    "牌局计时结果入队失败（步骤：把超时效果加入待处理队列）：本次超时判定的出牌或结束动作没有执行，牌局停在当前回合；已在回滚该效果，若回滚成功下一轮计时会重新判定并可继续，回滚失败则牌局计时不再推进：{error:#}"
+                );
                 if let Err(cancel_error) = self.business.card_games.cancel_effect(key) {
                     log::error!("牌局计时结果入队失败后无法清理牌局: {cancel_error:#}");
                 }
@@ -3159,7 +3163,9 @@ impl ApplicationRuntime {
             let key = outcome.key();
             let effect = self.business.undercover_game.timed_effect(outcome);
             if let Err(error) = self.push_pending_task(PendingTask::UndercoverEffect(effect)) {
-                log::error!("谁是卧底计时消息入队失败: {error:#}");
+                log::error!(
+                    "谁是卧底计时消息入队失败（步骤：把超时效果加入待处理队列）：本次超时判定的淘汰或揭示动作没有执行，本局停在当前阶段；已在回滚该效果，若回滚成功下一轮计时会重新判定并可继续，回滚失败则本局计时不再推进：{error:#}"
+                );
                 if let Err(cancel_error) = self.business.undercover_game.cancel_effect(key) {
                     log::error!("谁是卧底计时消息入队失败后无法清理牌局: {cancel_error:#}");
                 }

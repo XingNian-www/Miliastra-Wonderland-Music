@@ -350,10 +350,17 @@ impl ApplicationRuntime {
                 };
                 // 属主是 id:<uuid> 归属键、发送者是展示名：必须经身份解析比较，
                 // 否则属主本人也永远对不上，整个决策窗口不可用。
-                let sender_name = self.canonical_actor_name(envelope.username());
+                // **必须传原始显示名，不能先过 canonical_actor_name**。
+                //
+                // `canonical_actor_name` 返回的是归属键（已登记身份是 UUID 字符串）。
+                // 把 UUID 再喂给 `playlist_owner_candidates` 是双重转换：
+                // 后者要靠 nickname / note / UID 反查身份，而 UUID 三者都不是，
+                // OCR 路径（`account == None`）下必然落空 → 候选为空 → 属主匹配失败，
+                // 表现为「歌单窗口决策的发送者不是当前窗口属主」，`@1`~`@5` 全部失效。
+                let sender_name = envelope.username();
                 let sender_candidates =
-                    self.playlist_owner_candidates(&sender_name, envelope.account());
-                if !owner_matches_identity(&owner, &sender_name, &sender_candidates) {
+                    self.playlist_owner_candidates(sender_name, envelope.account());
+                if !owner_matches_identity(&owner, sender_name, &sender_candidates) {
                     log::info!(
                         "命令未执行：歌单窗口决策的发送者不是当前窗口属主（发送者「{}」，属主「{}」），忽略这条决策「{}」",
                         envelope.username(),
@@ -429,6 +436,28 @@ mod tests {
     use super::*;
     use crate::observation::chat::{ChatIdentity, ChatTimeline, RecognizedChatMessage};
     use miliastra_playback::{PlayableTrack, ProviderId, TrackKey, TrackMetadata, TrackRef};
+
+    /// 回归：归属键与发送者名字**不能**在同一条链上转换两次。
+    ///
+    /// `canonical_actor_name` 已经把名字转成归属键（UUID）。若把它的返回值再喂给
+    /// `playlist_owner_candidates`，后者会拿 UUID 当 nickname/note/UID 去查——
+    /// 三者都不是，OCR 路径（`account == None`）下候选必然为空，
+    /// 属主匹配失败，`@1`~`@5` 全部失效。
+    ///
+    /// 实机现象：「命令未执行：歌单窗口决策的发送者不是当前窗口属主」。
+    #[test]
+    fn owner_match_takes_the_display_name_not_a_pre_converted_key() {
+        let owner = "id:11111111-1111-4111-8111-111111111111";
+        // 正确：候选由**展示名**解析而来，与属主键同为同一身份时命中。
+        assert!(owner_matches_identity(
+            owner,
+            "显示名甲",
+            &[owner.to_string()]
+        ));
+        // 错误形态的守卫：把 UUID 当发送者名字传进来时，直比分支不会命中，
+        // 必须先经身份解析出候选才能匹配——所以调用方不能只传键。
+        assert!(!owner_matches_identity(owner, "另一个名字", &[]));
+    }
 
     struct Playback {
         played: usize,

@@ -411,7 +411,7 @@ fn run(
                     match event {
                         ChatSourceEvent::Connected { last_sequence } => {
                             state.set_active(true);
-                            log::info!("外部聊天源握手完成: lastSequence={last_sequence}");
+                            log::info!("外部聊天源握手完成，从服务端序号 {last_sequence} 之后开始接收消息");
                             // 首次连接：把启动前的历史挡在水位之外。
                             // 重连时水位已存在，不动它——断线期间的消息要补拉。
                             state.take_first_handshake(last_sequence);
@@ -427,8 +427,7 @@ fn run(
                             let skip_backlog = idle.is_some_and(|ms| ms > MAX_BACKLOG_IDLE_MS);
                             if skip_backlog {
                                 log::info!(
-                                    "断线 {:?} 超过 {} 秒，跳过补拉并从当前序号重新开始",
-                                    idle.map(std::time::Duration::from_millis),
+                                    "外部聊天源断线时间超过 {} 秒，跳过补拉历史消息，直接从当前序号继续接收（避免重放断线期间的旧命令）",
                                     MAX_BACKLOG_IDLE_MS / 1000
                                 );
                                 // 把水位推到服务端当前值：断线期间的消息一律不执行。
@@ -450,7 +449,7 @@ fn run(
                                         }
                                         if !batch.messages.is_empty() {
                                             log::info!(
-                                                "断线补拉 {} 条消息（since={local}）",
+                                                "外部聊天源断线后补拉到 {} 条历史消息，将逐条投递给业务处理",
                                                 batch.messages.len()
                                             );
                                             deliver(
@@ -474,7 +473,11 @@ fn run(
                         }
                         ChatSourceEvent::HallChanged { hall_id, hall_type } => {
                             log::info!(
-                                "外部聊天源报告大厅切换: hallId={hall_id} hallType={hall_type:?}，重置大厅相关状态"
+                                "外部聊天源报告大厅已切换（大厅标识 {}，服务端大厅类型 {}），重置大厅相关状态与聊天基线",
+                                hall_id,
+                                hall_type
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "未提供".to_string())
                             );
                             reset_after_source_change(&timeline);
                             state.set_active(true);
@@ -714,10 +717,9 @@ fn spawn_name_resolver(
                         // 专门钉住这点），所以备注只能走 /names 拿。
                         match remark.as_deref() {
                             Some(remark) => {
-                                log::debug!(
-                                    "备注补查命中: uid={uid} remark={remark} name={:?}",
-                                    name
-                                );
+                                // 不打印 UID / 备注 / 昵称：三者都是真实玩家数据。
+                                // 日志级别调到 debug 就整批落盘，违反 MUST_READ §9。
+                                log::debug!("备注补查命中，已用好友备注覆盖该账号的屏幕匹配名");
                                 if let Some(identity) = identity_access.as_ref()
                                     && identity.set_account_remark(
                                         miliastra_kernel::chat_source::GAME_GENSHIN,
@@ -735,7 +737,9 @@ fn spawn_name_resolver(
                                 // 没有备注不代表没有信息：资料包昵称是展示名的兜底，
                                 // 自动注册时它可能还没到（note 为空），现在补上。
                                 if let Some(name) = name.as_deref() {
-                                    log::debug!("补查命中昵称（无备注）: uid={uid} name={name}");
+                                    log::debug!(
+                                        "补查命中昵称（该好友没有备注），已用它回填展示名"
+                                    );
                                     if let Some(identity) = identity_access.as_ref()
                                         && identity.backfill_account_note(
                                             miliastra_kernel::chat_source::GAME_GENSHIN,

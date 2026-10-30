@@ -869,7 +869,7 @@ impl DebugHttpService {
                     record["evidenceDownscaled"] = serde_json::json!(true);
                     record["downscaledImageFrames"] = serde_json::json!(downscaled);
                     log::warn!(
-                        "沙盒归档超出 12 MiB 上限，已把 {downscaled} 帧缩小以保留全部步骤: run={id}"
+                        "沙盒归档记录超过 12 MiB 上限，已把 {downscaled} 帧截图缩小以保住全部步骤（编号 {id}）；画面细节会变糊，但步骤链完整"
                     );
                 }
             }
@@ -884,7 +884,7 @@ impl DebugHttpService {
                     ));
                 }
                 log::warn!(
-                    "沙盒归档超出 12 MiB 上限，已丢弃 {dropped} 帧截图并保留命令、结果与断言: run={id}"
+                    "沙盒归档记录在缩小后仍超过 12 MiB 上限，已丢弃 {dropped} 帧截图（编号 {id}）；命令、结果与断言仍保留，这些步骤的回放画面已永久丢失"
                 );
             }
             journal.save(id, &record).map_err(error)?;

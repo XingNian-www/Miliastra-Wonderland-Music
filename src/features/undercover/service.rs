@@ -1360,9 +1360,9 @@ impl UndercoverRuntimeService {
         failure: FriendBatchFailure,
     ) -> UndercoverResume {
         log::error!(
-            "谁是卧底私聊投递暂停: retryable={} kind={:?} reason={}",
+            "谁是卧底的私聊投递已暂停：仍有 {} 条待重试，失败性质为「{}」（{}）；本轮不会静默继续，已通知玩家处理",
             retryable.len(),
-            failure.kind(),
+            failure.kind().log_label(),
             failure.reason()
         );
         let reply = if retryable.is_empty() {

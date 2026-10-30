@@ -50,6 +50,22 @@ pub(crate) enum SongRequestDecision {
 }
 
 impl SongRequestDecision {
+    /// 日志用的中文说法：决策枚举不能直接 Debug 打给用户看。
+    pub(crate) fn log_label(self) -> &'static str {
+        match self {
+            Self::Confirm => "确认播放",
+            Self::Skip => "跳过",
+            Self::SwitchSource => "换源",
+            Self::Ai => "转 AI 点歌",
+            Self::Timeout => "等待超时",
+            Self::Stopped => "会话中止",
+            Self::Cancelled => "玩家取消",
+            Self::Select => "重新选择",
+            Self::SelectIndex(_) => "按序号选择",
+            Self::LocalLibrary => "本地曲库",
+        }
+    }
+
     pub(crate) fn parse(text: &str) -> Option<Self> {
         let raw = text.trim();
         let command_text = if let Some(index) = raw.find(['：', ':', ']', '】']) {
@@ -626,7 +642,7 @@ impl SongRequestExecution<'_> {
             return Ok(());
         }
         if self.queue_contains_request(&request)? {
-            log::info!("队列已有: {}", request.keyword);
+            log::info!("点歌「{}」已在播放队列中，本次不重复入队", request.keyword);
             self.log_executed_command(context, &request.final_command("duplicate"))?;
             self.reply_template(
                 &crate::features::reply_template::song::SONG[0],
@@ -698,7 +714,9 @@ impl SongRequestExecution<'_> {
                 }
             }
             Err(error) => {
-                log::error!("获取播放状态失败: {error:#}");
+                log::error!(
+                    "读取播放器状态失败（步骤：点歌前判断是否正在播放）；已改为直接入队，当前曲目播完后再播: {error:#}"
+                );
                 let outcome = self.push_queue_request(&request)?;
                 self.handle_queue_push_outcome(
                     context,
@@ -739,7 +757,7 @@ impl SongRequestExecution<'_> {
         context: &str,
         error: &SongSearchFailure,
     ) -> Result<()> {
-        log::error!("{context}: {error}");
+        log::error!("{context}：搜索阶段失败，本次点歌未执行，玩家会收到失败提示: {error}");
         self.reply_template(
             &crate::features::reply_template::song::SONG[9],
             &crate::features::reply_template::ReplyVars::new()
@@ -774,7 +792,7 @@ impl SongRequestExecution<'_> {
         let local = match self.port.search_library_candidates(keyword, allow_bilibili) {
             Ok(candidates) => candidates,
             Err(error) => {
-                log::warn!("AI点歌曲库检索失败，继续平台搜索: {error:#}");
+                log::warn!("AI 点歌的本地曲库检索失败，改为只用平台搜索结果: {error:#}");
                 Vec::new()
             }
         };
@@ -808,7 +826,7 @@ impl SongRequestExecution<'_> {
             Ok(candidates) => candidates.unwrap_or_default(),
             Err(error) if local.is_empty() => return Err(error),
             Err(error) => {
-                log::warn!("AI点歌平台搜索失败，使用曲库候选: {error}");
+                log::warn!("AI 点歌的平台搜索失败，降级为只用本地曲库候选: {error}");
                 Vec::new()
             }
         };
@@ -829,7 +847,7 @@ impl SongRequestExecution<'_> {
         }
         if !self.ai.enabled() {
             log::info!(
-                "命令未执行：AI点歌未启用 keyword={} label={}",
+                "点歌「{}」未执行：AI 点歌功能未启用，需在面板开启后才能使用{}",
                 song.keyword,
                 label
             );
@@ -912,7 +930,9 @@ impl SongRequestExecution<'_> {
                                         SongSearchCandidates::merge_rounds(candidates, second)
                                 }
                                 Err(error) => {
-                                    log::warn!("AI二次搜索失败，保留首次候选: {error}");
+                                    log::warn!(
+                                        "AI 点歌的二次搜索失败，保留首次搜索的候选继续: {error}"
+                                    );
                                     self.reply_template(
                                         &crate::features::reply_template::song::SONG[6],
                                         &crate::features::reply_template::ReplyVars::new()
@@ -924,7 +944,9 @@ impl SongRequestExecution<'_> {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => log::warn!("AI点歌语义分析失败，沿用首次搜索结果: {error:#}"),
+                Err(error) => {
+                    log::warn!("AI 点歌的语义改写分析失败，沿用首次搜索结果继续: {error:#}")
+                }
             }
         }
         candidates.merged.retain(|candidate| {
@@ -937,7 +959,10 @@ impl SongRequestExecution<'_> {
         candidates.local = self.allowed_candidates(candidates.local);
         candidates.online = self.allowed_candidates(candidates.online);
         if candidates.merged.is_empty() {
-            log::info!("命令未执行：无可用候选 keyword={}", song.keyword);
+            log::info!(
+                "点歌「{}」未执行：曲库与平台都没有可播放的候选",
+                song.keyword
+            );
             self.reply_template(
                 &crate::features::reply_template::song::SONG[7],
                 &crate::features::reply_template::ReplyVars::new().with("标签", label.clone()),
@@ -953,7 +978,9 @@ impl SongRequestExecution<'_> {
         ) {
             Ok(result) => result,
             Err(error) => {
-                log::error!("AI点歌选择候选失败: {error:#}");
+                log::error!(
+                    "AI 点歌挑选候选失败（步骤：从候选列表选出要播的一首）；本次点歌未执行，玩家会收到失败提示: {error:#}"
+                );
                 self.reply_template(
                     &crate::features::reply_template::song::SONG[8],
                     &crate::features::reply_template::ReplyVars::new().with("标签", label.clone()),
@@ -962,11 +989,10 @@ impl SongRequestExecution<'_> {
             }
         };
         log::info!(
-            "AI点歌候选: raw={} pick={} index={} uri={} score={:.2} reason={}",
+            "AI 点歌「{}」选中候选「{}」（第 {} 项，匹配度 {:.2}，理由：{}）",
             song.keyword,
             candidate.text,
             pick.index,
-            candidate.track_ref.key,
             pick.score,
             pick.reason
         );
@@ -993,7 +1019,9 @@ impl SongRequestExecution<'_> {
             {
                 Ok(result) => Some(result.score),
                 Err(error) => {
-                    log::warn!("在线候选打分失败，无法比较本地推荐: {error:#}");
+                    log::warn!(
+                        "给在线候选取匹配度失败，本次跳过本地曲库推荐对比，直接使用在线结果: {error:#}"
+                    );
                     None
                 }
             }
@@ -1030,10 +1058,10 @@ impl SongRequestExecution<'_> {
                 Some(candidate) => candidate,
                 None => {
                     log::info!(
-                        "命令未执行：AI点歌候选序号越界 index={} 候选数={} keyword={}",
+                        "点歌「{}」未执行：玩家选择了第 {} 项，但候选只有 {} 项，序号越界",
+                        song.keyword,
                         index,
-                        selection.len(),
-                        song.keyword
+                        selection.len()
                     );
                     return Ok(None);
                 }
@@ -1063,7 +1091,11 @@ impl SongRequestExecution<'_> {
             | SongRequestDecision::Cancelled
             | SongRequestDecision::SwitchSource
             | SongRequestDecision::Ai => {
-                log::info!("点歌未执行：决策={:?} keyword={}", decision, song.keyword);
+                log::info!(
+                    "点歌「{}」未执行：玩家选择了「{}」",
+                    song.keyword,
+                    decision.log_label()
+                );
                 return Ok(None);
             }
         };
@@ -1146,7 +1178,7 @@ impl SongRequestExecution<'_> {
                     NoCandidateOutcome::Ai => return self.resolve_and_confirm_song_ai(song),
                     NoCandidateOutcome::Skip => {
                         log::info!(
-                            "命令未执行：无在线候选且未选择本地/AI/换源 keyword={}",
+                            "点歌「{}」未执行：没有在线候选，玩家也没有选择本地曲库、AI 点歌或换源",
                             request.keyword
                         );
                         return Ok(None);
@@ -1183,10 +1215,10 @@ impl SongRequestExecution<'_> {
                 SongRequestDecision::SelectIndex(index) => {
                     let Some(candidate) = picked.candidate_snapshot.get(index - 1).cloned() else {
                         log::info!(
-                            "命令未执行：点歌候选序号越界 index={} 候选数={} keyword={}",
+                            "点歌「{}」未执行：玩家选择了第 {} 项，但候选只有 {} 项，序号越界",
+                            request.keyword,
                             index,
-                            picked.candidate_snapshot.len(),
-                            request.keyword
+                            picked.candidate_snapshot.len()
                         );
                         return Ok(None);
                     };
@@ -1220,9 +1252,9 @@ impl SongRequestExecution<'_> {
                         | SongRequestDecision::Cancelled
                         | SongRequestDecision::LocalLibrary => {
                             log::info!(
-                                "点歌未执行：决策={:?} keyword={}",
-                                decision,
-                                request.keyword
+                                "点歌「{}」未执行：玩家选择了「{}」",
+                                request.keyword,
+                                decision.log_label()
                             );
                             Ok(None)
                         }
@@ -1239,7 +1271,10 @@ impl SongRequestExecution<'_> {
                             if !self.ai_command_allowed() {
                                 self.require_ai_command()?;
                             }
-                            log::info!("命令未执行：AI点歌不可用 keyword={}", request.keyword);
+                            log::info!(
+                                "点歌「{}」未执行：AI 点歌当前不可用（未启用或提问者无权限）",
+                                request.keyword
+                            );
                             Ok(None)
                         }
                         SongRequestDecision::Confirm
@@ -1321,7 +1356,7 @@ impl SongRequestExecution<'_> {
                 NoCandidateOutcome::Ai => return self.resolve_and_confirm_song_ai(song),
                 NoCandidateOutcome::Skip => {
                     log::info!(
-                        "命令未执行：换源后仍无候选且未继续换源/本地/AI keyword={}",
+                        "点歌「{}」未执行：换源后仍无候选，玩家也没有继续换源、看本地曲库或转 AI",
                         song.keyword
                     );
                     return Ok(None);
@@ -1379,7 +1414,11 @@ impl SongRequestExecution<'_> {
                 }))
             }
             SongRequestDecision::Skip => {
-                log::info!("点歌未执行：决策={:?} keyword={}", decision, song.keyword);
+                log::info!(
+                    "点歌「{}」未执行：玩家选择了「{}」",
+                    song.keyword,
+                    decision.log_label()
+                );
                 Ok(None)
             }
             SongRequestDecision::SwitchSource => {
@@ -1394,7 +1433,11 @@ impl SongRequestExecution<'_> {
             | SongRequestDecision::Select
             | SongRequestDecision::Cancelled
             | SongRequestDecision::LocalLibrary => {
-                log::info!("点歌未执行：决策={:?} keyword={}", decision, song.keyword);
+                log::info!(
+                    "点歌「{}」未执行：玩家选择了「{}」",
+                    song.keyword,
+                    decision.log_label()
+                );
                 Ok(None)
             }
         }
@@ -1420,13 +1463,8 @@ impl SongRequestExecution<'_> {
     fn push_queue_request(&self, request: &ResolvedSongRequest) -> Result<SongQueuePushOutcome> {
         if self.song_dedup_limited(request)? {
             log::info!(
-                "长时间同歌去重入队拦截: keyword={} uri={}",
-                request.keyword,
-                request
-                    .track
-                    .as_ref()
-                    .map(|track| track.track_ref.key.to_string())
-                    .unwrap_or_default()
+                "点歌「{}」未入队：该曲目短时间内已播过，同歌去重规则拦截",
+                request.keyword
             );
             return Ok(SongQueuePushOutcome::DedupLimited);
         }
@@ -1460,7 +1498,9 @@ impl SongRequestExecution<'_> {
                 && let Some(track) = &request.track
                 && let Err(error) = self.port.preload_track(track)
             {
-                log::debug!("点歌入队后预加载音源失败，播放时将重试: {error:#}");
+                log::debug!(
+                    "点歌入队后预加载音源失败，本次不影响入队；真正播放时会重新解析音源: {error:#}"
+                );
             }
             Ok(SongQueuePushOutcome::Added(pushed.size))
         } else if pushed.duplicate {
@@ -1555,14 +1595,9 @@ impl SongRequestExecution<'_> {
             return Ok(true);
         }
         if context.message_type == "控制台" {
-            log::info!(
-                "候选歌曲审核跳过: 控制台最高权限免审 command={} uri={}",
-                context.raw,
-                request
-                    .track
-                    .as_ref()
-                    .map(|track| track.track_ref.key.to_string())
-                    .unwrap_or_default()
+            log::debug!(
+                "候选歌曲审核跳过：控制台来源拥有最高权限，命令「{}」直接放行",
+                context.raw
             );
             return Ok(true);
         }
@@ -1592,46 +1627,40 @@ impl SongRequestExecution<'_> {
         if decision.allowed {
             if decision.failed_open {
                 log::warn!(
-                    "候选歌曲审核放行: failure_policy=allow attempts={} threshold={} command={} title={} artist={} source={} uri={} reason={}",
+                    "候选歌曲审核放行（降级）：审核服务连续 {} 次失败，已超过阈值 {}，本次按放行处理；曲目「{}」/「{}」（{}），理由「{}」",
                     decision.attempts,
                     decision.threshold,
-                    context.raw,
                     candidate.title,
                     candidate.artist,
                     candidate.source,
-                    candidate.track_key,
                     reason
                 );
             } else {
                 log::info!(
-                    "候选歌曲审核通过: level={} threshold={} attempts={} command={} title={} artist={} source={} uri={} reason={} tags={}",
-                    level,
-                    decision.threshold,
-                    decision.attempts,
-                    context.raw,
+                    "候选歌曲审核通过：曲目「{}」/「{}」（{}），等级 {}，阈值 {}，采样 {} 次，标签「{}」，理由「{}」",
                     candidate.title,
                     candidate.artist,
                     candidate.source,
-                    candidate.track_key,
-                    reason,
-                    tags
+                    level,
+                    decision.threshold,
+                    decision.attempts,
+                    tags,
+                    reason
                 );
             }
             return Ok(true);
         }
 
         log::warn!(
-            "候选歌曲审核拒绝: level={} threshold={} attempts={} command={} title={} artist={} source={} uri={} reason={} tags={}",
-            level,
-            decision.threshold,
-            decision.attempts,
-            context.raw,
+            "候选歌曲审核拒绝：曲目「{}」/「{}」（{}），等级 {}，阈值 {}，采样 {} 次，标签「{}」，理由「{}」；本次点歌未执行，已回复玩家拒绝原因",
             candidate.title,
             candidate.artist,
             candidate.source,
-            candidate.track_key,
-            reason,
-            tags
+            level,
+            decision.threshold,
+            decision.attempts,
+            tags,
+            reason
         );
         let action = decision.level.map_or_else(
             || "review-reject-failed".to_string(),
@@ -1736,7 +1765,9 @@ impl SongRequestExecution<'_> {
         {
             Ok(candidates) => candidates,
             Err(error) => {
-                log::warn!("本地曲库检索失败，无法给出本地推荐: {error:#}");
+                log::warn!(
+                    "本地曲库检索失败（步骤：为在线候选补充本地推荐）；本次不展示本地推荐: {error:#}"
+                );
                 return None;
             }
         };
@@ -1751,7 +1782,9 @@ impl SongRequestExecution<'_> {
         if local_score <= online_score {
             return None;
         }
-        log::info!("本地曲库推荐: 在线匹配度={online_score:.2} 本地匹配度={local_score:.2}");
+        log::debug!(
+            "本地曲库推荐已生成：在线匹配度 {online_score:.2}，本地匹配度 {local_score:.2}"
+        );
         Some(local_library_choices(
             &local,
             picked.candidate_snapshot.len(),
@@ -1767,7 +1800,9 @@ impl SongRequestExecution<'_> {
         match self.port.search_library_candidates(keyword, allow_bilibili) {
             Ok(candidates) => local_library_choices(&self.allowed_candidates(candidates), 0),
             Err(error) => {
-                log::warn!("本地曲库检索失败，无法给出本地推荐: {error:#}");
+                log::warn!(
+                    "本地曲库检索失败（步骤：为无在线候选的点歌查找本地曲库）；本次不展示本地推荐: {error:#}"
+                );
                 Vec::new()
             }
         }
@@ -1804,21 +1839,23 @@ impl SongRequestExecution<'_> {
             .pick_song_candidate(keyword, prefer_accompaniment, &local)
         {
             Ok(local_pick) if local_pick.score > online_score => {
-                log::info!(
-                    "本地曲库推荐: 在线score={online_score:.2} 本地score={:.2}",
+                log::debug!(
+                    "已生成本地曲库推荐：本地匹配度 {:.2} 高于在线匹配度 {online_score:.2}",
                     local_pick.score
                 );
                 Some(local_library_choices(&local, online_count))
             }
             Ok(local_pick) => {
-                log::info!(
-                    "本地曲库不推荐: 在线score={online_score:.2} 本地score={:.2}",
+                log::debug!(
+                    "不推荐本地曲库结果：在线匹配度 {online_score:.2} 不低于本地匹配度 {:.2}",
                     local_pick.score
                 );
                 None
             }
             Err(error) => {
-                log::warn!("本地曲库候选打分失败，不推荐本地结果: {error:#}");
+                log::warn!(
+                    "给本地曲库候选打匹配度失败（步骤：比较本地与在线结果）；本次不展示本地推荐，直接使用在线结果: {error:#}"
+                );
                 None
             }
         }
@@ -1858,7 +1895,11 @@ impl SongRequestExecution<'_> {
                 // @选择 或越界序号：重发列表继续等待；其余（跳过、超时、停止）一律放弃。
                 SongRequestDecision::Select | SongRequestDecision::SelectIndex(_) => continue,
                 other => {
-                    log::info!("命令未执行：本地曲库选择放弃 decision={other:?} 候选数={count}");
+                    log::info!(
+                        "本地曲库选择已放弃：玩家选择了「{}」，列表共 {} 首，本次点歌未执行",
+                        other.log_label(),
+                        count
+                    );
                     return Ok(None);
                 }
             }
@@ -1917,7 +1958,11 @@ impl SongRequestExecution<'_> {
                 Ok(NoCandidateOutcome::Skip)
             }
             other => {
-                log::info!("命令未执行：无在线候选，决策={other:?} 按跳过处理 keyword={keyword}");
+                log::info!(
+                    "点歌「{}」未执行：没有在线候选，玩家选择了「{}」，按跳过处理",
+                    keyword,
+                    other.log_label()
+                );
                 Ok(NoCandidateOutcome::Skip)
             }
         }

@@ -171,7 +171,7 @@ impl BusinessTimerCounts {
             self.command_completed = self.command_completed.saturating_add(1);
             if is_failure {
                 self.command_failed = self.command_failed.saturating_add(1);
-                log::warn!("计时运行时命令失败: {event:?}");
+                log::warn!("计时运行时上报了一次命令失败，失败计数已累加，本局继续");
             }
         }
     }
@@ -808,7 +808,7 @@ impl DecisionSession {
     /// 避免并发 submit 在窗口退出前抢到「假成功」。
     pub(crate) fn close(&self) {
         if let Err(error) = self.handle.finish_decision(self.id) {
-            log::debug!("关闭 Web 决策失败: {error}");
+            log::debug!("Web 决策未能正常关闭，窗口可能延后释放: {error}");
         }
     }
 }
@@ -816,7 +816,7 @@ impl DecisionSession {
 impl Drop for DecisionSession {
     fn drop(&mut self) {
         if let Err(error) = self.handle.finish_decision(self.id) {
-            log::debug!("结束 Web 决策失败: {error}");
+            log::debug!("Web 决策未能正常结束，窗口可能延后释放: {error}");
         }
     }
 }
@@ -2121,7 +2121,7 @@ impl TurtleSoupAiCompletionPort for TurtleSoupBusinessEventPort {
             .sink
             .submit(BusinessEvent::TurtleSoupAiCompleted(completion))
         {
-            log::debug!("业务运行时已停止，丢弃海龟汤 AI 裁决结果: {error}");
+            log::debug!("业务运行时已停止，本次海龟汤 AI 裁决结果被丢弃，不影响已结束的对局: {error}");
         }
     }
 }
@@ -3203,7 +3203,7 @@ fn handle_business_timer(
         .expire_idle_at(entertainment, expired.emitted_at())
         .map_err(idiom_chain_operation_failed)?
     {
-        log::info!("成语接龙已因计时运行时期限到期结束，娱乐互斥已释放");
+        log::info!("成语接龙已到期结束，占用已释放，可以开始下一局玩法");
     }
     sync_idiom_deadline(
         idiom_chain,
@@ -3284,7 +3284,9 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         timer.as_ref(),
                         clock.as_ref(),
                     ) {
-                        log::error!("业务运行时处理计时事件失败: {error}");
+                        log::error!(
+                    "业务运行时处理计时事件失败（步骤：分发计时到期事件），该次定时动作未执行，玩法状态可能停在等待中: {error}"
+                );
                     }
                 }
                 BusinessEvent::TurtleSoupAiCompleted(completion) => {
@@ -3294,7 +3296,9 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         timer.as_ref(),
                         clock.as_ref(),
                     ) {
-                        log::error!("处理海龟汤 AI 裁决后同步期限失败: {error}");
+                        log::error!(
+                    "海龟汤 AI 裁决已应用，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时: {error}"
+                );
                     }
                 }
                 other => snapshot.apply(other),
@@ -3337,14 +3341,18 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 if let Err(error) =
                     entertainment.handle_card_game(message, timer.as_ref(), clock.as_ref())
                 {
-                    log::error!("业务运行时处理牌局消息失败: {error}");
+                    log::error!(
+                    "业务运行时处理牌局消息失败（步骤：分发牌局消息），该条消息对应的牌局动作未执行: {error}"
+                );
                 }
             }
             RuntimeMessage::Undercover(message) => {
                 if let Err(error) =
                     entertainment.handle_undercover(message, timer.as_ref(), clock.as_ref())
                 {
-                    log::error!("业务运行时处理谁是卧底消息失败: {error}");
+                    log::error!(
+                    "业务运行时处理谁是卧底消息失败（步骤：分发卧底消息），该条消息对应的动作未执行: {error}"
+                );
                 }
             }
             RuntimeMessage::UndercoverSnapshot(response) => {
@@ -3357,7 +3365,9 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     timer.as_ref(),
                     clock.as_ref(),
                 ) {
-                    log::error!("业务运行时处理海龟汤消息失败: {error}");
+                    log::error!(
+                    "业务运行时处理海龟汤消息失败（步骤：分发海龟汤消息），该条消息对应的动作未执行: {error}"
+                );
                 }
             }
             RuntimeMessage::RefreshTurtleSoup {
@@ -3423,7 +3433,9 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("unknown panic");
-            log::error!("business runtime 处理消息时 panic，已跳过该条并继续: {detail}");
+            log::error!(
+                "业务运行时处理消息时崩溃（步骤：分发一条聊天消息），该条消息已跳过且不会重试，后续消息继续处理: {detail}"
+            );
         }
         entertainment.publish(clock.as_ref());
     }
@@ -3467,10 +3479,14 @@ fn abort_business_modules(
     clock: &dyn Clock,
 ) {
     if let Err(error) = card_games.abort(entertainment) {
-        log::error!("业务运行时关闭时无法中止牌局: {error:#}");
+        log::error!(
+            "业务运行时关闭时无法中止牌局（步骤：结束牌局），牌局租约可能残留到下次启动: {error:#}"
+        );
     }
     if let Err(error) = idiom_chain.abort(entertainment) {
-        log::error!("业务运行时关闭时无法中止成语接龙: {error:#}");
+        log::error!(
+            "业务运行时关闭时无法中止成语接龙（步骤：结束接龙），接龙租约可能残留到下次启动: {error:#}"
+        );
     }
     let _ = undercover.abort(entertainment);
     if let Some(turtle_soup) = turtle_soup.as_deref_mut() {
@@ -3483,7 +3499,9 @@ fn abort_business_modules(
         operation_ids,
         session_generation,
     ) {
-        log::error!("业务运行时关闭时无法撤销成语接龙期限: {error}");
+        log::error!(
+            "业务运行时关闭时无法撤销成语接龙期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发: {error}"
+        );
     }
     if let Err(error) = sync_card_game_deadline(
         card_games,
@@ -3494,7 +3512,9 @@ fn abort_business_modules(
         clock.now(),
         clock_active,
     ) {
-        log::error!("业务运行时关闭时无法撤销牌局期限: {error}");
+        log::error!(
+            "业务运行时关闭时无法撤销牌局期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发: {error}"
+        );
     }
     if let Err(error) = sync_undercover_deadline(
         undercover,
@@ -3505,7 +3525,9 @@ fn abort_business_modules(
         clock.now(),
         clock_active,
     ) {
-        log::error!("业务运行时关闭时无法撤销谁是卧底期限: {error}");
+        log::error!(
+            "业务运行时关闭时无法撤销谁是卧底期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发: {error}"
+        );
     }
     if let Err(error) = sync_turtle_soup_deadline(
         turtle_soup.as_deref(),
@@ -3516,7 +3538,9 @@ fn abort_business_modules(
         clock.now(),
         clock_active,
     ) {
-        log::error!("业务运行时关闭时无法撤销海龟汤期限: {error}");
+        log::error!(
+            "业务运行时关闭时无法撤销海龟汤期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发: {error}"
+        );
     }
     pending_card_game_outcomes.clear();
     pending_card_game_cancellations.clear();
@@ -3766,7 +3790,9 @@ fn handle_turtle_soup_message(
                 clock.now(),
                 clock_active,
             ) {
-                log::error!("处理海龟汤大厅命令后同步期限失败: {error}");
+                log::error!(
+                    "海龟汤大厅命令已处理，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时: {error}"
+                );
             }
             let _ = response.send(outcome);
         }
@@ -3786,7 +3812,9 @@ fn handle_turtle_soup_message(
                 clock.now(),
                 clock_active,
             ) {
-                log::error!("处理海龟汤好友命令后同步期限失败: {error}");
+                log::error!(
+                    "海龟汤好友命令已处理，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时: {error}"
+                );
             }
             let _ = response.send(outcome);
         }

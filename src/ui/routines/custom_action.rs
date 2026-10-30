@@ -143,12 +143,13 @@ impl UiRoutine for CustomActionRoutine {
                 }
                 Err(failure) => {
                     log::error!(
-                        "自定义动作计划失败: workflow={} completed={}/{} stage={} certainty={:?}",
+                        "自定义动作流程失败（步骤：「{}」）：流程「{}」执行到第 {}/{} 个操作时中断，本次计划未完成，后续操作不会执行（{}）。{}",
+                        failure.stage_label(),
                         self.request.workflow,
-                        completed,
+                        completed + 1,
                         operation_count,
-                        failure.stage(),
-                        failure.certainty()
+                        failure.certainty().label(),
+                        failure.reason()
                     );
                     return CustomActionOutcome {
                         completed,

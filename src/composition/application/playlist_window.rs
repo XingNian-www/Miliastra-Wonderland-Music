@@ -221,7 +221,7 @@ impl ApplicationRuntime {
             self.log_executed_command(&interaction, "playlist")?;
         } else if let PlaylistCommand::Select(index) = command {
             log::info!(
-                "命令未执行：歌单序号越界 index={} window_len={} text={}",
+                "命令未执行：歌单序号 {} 超出当前候选数 {}「{}」",
                 index,
                 application.window_len(owner, Instant::now())?,
                 crate::privacy::redacted_chat_text(envelope.user_command())
@@ -245,8 +245,8 @@ impl ApplicationRuntime {
         // 歌单只属于已登记身份的玩家：没有 UUID 就没有歌单窗口。
         let Some(owner) = self.playlist_owner_key(&parsed.username, parsed.account.as_ref()) else {
             log::info!(
-                "命令未执行：该玩家未在身份映射登记，无个人歌单 text={}",
-                parsed.raw
+                "命令未执行：该玩家未在身份映射登记，因此没有个人歌单「{}」",
+                crate::privacy::redacted_chat_text(&parsed.raw)
             );
             let text = self.render_reply(
                 crate::features::reply_template::REPLY_SONG[0].key,
@@ -331,12 +331,12 @@ impl ApplicationRuntime {
                 let Some(envelope) = playlist_decision_envelope(&message, captured_at) else {
                     if crate::interfaces::chat::looks_like_command(&message.text) {
                         log::info!(
-                            "命令未执行：歌单窗口决策信封不成立 text={}",
+                            "命令未执行：歌单窗口决策信封不成立「{}」",
                             crate::privacy::redacted_chat_text(&message.text)
                         );
                     } else {
                         log::debug!(
-                            "歌单窗口忽略非命令消息 text={}",
+                            "歌单窗口忽略非命令消息「{}」",
                             crate::privacy::redacted_chat_text(&message.text)
                         );
                     }
@@ -349,7 +349,7 @@ impl ApplicationRuntime {
                     self.playlist_owner_candidates(&sender_name, envelope.account());
                 if !owner_matches_identity(&owner, &sender_name, &sender_candidates) {
                     log::info!(
-                        "命令未执行：歌单窗口决策发送者不是当前窗口属主 sender={} owner={} text={}",
+                        "命令未执行：歌单窗口决策的发送者不是当前窗口属主（发送者「{}」，属主「{}」），忽略这条决策「{}」",
                         envelope.username(),
                         owner,
                         crate::privacy::redacted_chat_text(&message.text)
@@ -358,14 +358,14 @@ impl ApplicationRuntime {
                 }
                 let Some(command) = playlist_decision(&envelope) else {
                     log::info!(
-                        "命令未执行：歌单窗口收到非窗口决策命令 text={}",
+                        "命令未执行：歌单窗口收到非窗口决策命令「{}」",
                         crate::privacy::redacted_chat_text(&message.text)
                     );
                     continue;
                 };
                 if !reader.accept_playlist_message(&self.ui.chat_timeline, &message)? {
                     log::info!(
-                        "命令未执行：歌单决策已被基线或已消费否决 text={} y={}",
+                        "命令未执行：歌单决策已被基线或已消费否决，忽略这条决策「{}」（屏幕纵坐标 {}）",
                         crate::privacy::redacted_chat_text(&message.text),
                         message.block.y
                     );

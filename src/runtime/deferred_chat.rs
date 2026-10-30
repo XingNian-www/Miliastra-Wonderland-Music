@@ -348,7 +348,9 @@ fn make_room_for_requeue(
     } else {
         // 队列已满且没有可驱逐项:拒绝入队(含受保护消息),保持容量契约。
         // 受保护消息由调用方的批次 max_attempts 机制负责重试/放弃。
-        log::warn!("延迟聊天队列已满({capacity})且无可驱逐项,拒绝消息入队");
+        log::warn!(
+            "延迟聊天队列已满（上限 {capacity} 条）且没有可驱逐的旧消息，本条消息未入队；调用方会按批次重试次数决定是否放弃"
+        );
         EnqueueOutcome::Rejected
     }
 }

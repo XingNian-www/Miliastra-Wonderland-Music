@@ -199,7 +199,7 @@ impl RequestStateStore {
                 // 统一库里还有配置/歌单/排行榜/缓存元数据：不删库、不迁移，
                 // 备份当前库后只重建 request_state 表，保留其它数据。
                 log::warn!(
-                    "请求状态快照不可用，已备份并仅重建 request_state 表: path={} error={error}",
+                    "播放请求状态快照读取失败（文件「{}」）；已备份原库并只重建请求状态表，其它数据（配置/歌单/缓存元数据）保留: {error}",
                     path.display()
                 );
                 Self::backup_corrupt_request_state(&path);
@@ -269,9 +269,12 @@ impl RequestStateStore {
         raw.push(format!(".corrupt-{stamp}"));
         let backup = PathBuf::from(raw);
         match std::fs::copy(path, &backup) {
-            Ok(_) => log::warn!("已备份损坏的请求状态库: path={}", backup.display()),
+            Ok(_) => log::warn!(
+                "损坏的播放请求状态库已备份到「{}」，便于事后排查",
+                backup.display()
+            ),
             Err(error) => log::warn!(
-                "备份损坏的请求状态库失败: path={} error={error}",
+                "备份损坏的播放请求状态库失败（原文件「{}」）；原库内容会被覆盖，无法事后排查损坏原因: {error}",
                 path.display()
             ),
         }
@@ -308,7 +311,7 @@ impl RequestStateStore {
             {
                 // 结构不匹配：只重建这一张表，保留同库其它数据。
                 log::warn!(
-                    "request_state 表结构不匹配，仅重建该表: path={}",
+                    "播放请求状态表结构不匹配（文件「{}」）；只重建该表，同库其它数据保留，重启后播放进度会重新积累",
                     path.display()
                 );
                 connection.execute_batch("DROP TABLE request_state")?;

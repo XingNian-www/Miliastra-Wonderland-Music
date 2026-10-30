@@ -663,6 +663,15 @@ fn hash_entertainment_session_mismatch(
             || UndercoverCommand::claims_active_chat(envelope))
 }
 
+/// 角色转成面向维护者的中文称谓（用于日志，不参与判定）。
+fn role_label(role: IdentityRole) -> &'static str {
+    match role {
+        IdentityRole::Friend => "好友",
+        IdentityRole::Admin => "管理员",
+        IdentityRole::Owner => "主人",
+    }
+}
+
 /// 按消息来源解析角色：有账号走 UID，否则走昵称。
 ///
 /// 两条链路共用这一个入口——OCR 只有昵称，外部聊天 API 有 UID。
@@ -692,8 +701,8 @@ fn role_for_envelope(
     if envelope.account().is_none() && matches!(resolved.role, IdentityRole::Admin | IdentityRole::Owner)
     {
         log::warn!(
-            "高权限身份仅凭昵称解析：role={:?} 身份={}（无可信 UID，昵称可被改名冒充；仅记录，不改变判定）",
-            resolved.role,
+            "高权限身份仅凭昵称解析出来（角色为{}，身份显示名「{}」）：这条消息没有可信 UID，昵称可以被改名冒充；仅记录线索，本次判定不变",
+            role_label(resolved.role),
             resolved.display_name()
         );
     }

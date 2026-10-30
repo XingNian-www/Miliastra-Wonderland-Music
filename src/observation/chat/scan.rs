@@ -264,17 +264,21 @@ pub(crate) fn recognize_prepared_chat(
         });
     }
     // 扫描频率是每秒一次级别，逐次打印整段气泡文本会让日志按扫描次数膨胀。
-    // 只在识别到的内容真正变化时留一条 info 记录；同样的内容降到 debug。
+    //
+    // 级别按频繁度定：这是**内部 OCR 输出**，不是玩家能感知的事件（那种由
+    // 上层的「收到命令 / 命令执行完成」记录）。大厅只要有人说话内容就会变，
+    // 长期留在 info 里会把真正的玩家事件淹掉，因此两条都归 debug；
+    // 内容有变化与无变化靠文案区分，不再靠级别区分。
     let scan_result = format_scan_result(&messages);
     if remember_scan_result_for_log(&scan_result) {
-        log::info!(target: CHAT_SCAN_RESULT_LOG_TARGET,
-            "聊天扫描结果: markers={} messages={} {scan_result}",
+        log::debug!(target: CHAT_SCAN_RESULT_LOG_TARGET,
+            "聊天扫描结果有变化：标记 {} 个，消息 {} 条，内容为 {scan_result}",
             prepared.markers.len(),
             messages.len()
         );
     } else {
         log::debug!(target: CHAT_SCAN_RESULT_LOG_TARGET,
-            "聊天扫描结果未变化: markers={} messages={}",
+            "聊天扫描结果与上次相同：标记 {} 个，消息 {} 条",
             prepared.markers.len(),
             messages.len()
         );

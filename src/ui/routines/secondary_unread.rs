@@ -192,14 +192,14 @@ fn process_unread(
 
     let Some(hit) = reacquire_unread_hit(context, config)? else {
         log::debug!(
-            "二级好友未读任务执行前红点已失效: queued_y={}",
+            "二级好友未读任务执行前红点已失效：排队时记录的行位置为 {}，该未读已被其它路径消费或界面已滚动，本次任务不再执行",
             request.hit.row_click.y
         );
         return Ok(SecondaryUnreadEffect::Stale);
     };
     if hit.row_click.y != request.hit.row_click.y {
         log::debug!(
-            "二级好友未读任务已重新定位红点: queued_y={} current_y={}",
+            "二级好友未读任务已重新定位红点：排队时为 {}，当前为 {}，按当前行继续处理",
             request.hit.row_click.y,
             hit.row_click.y
         );
@@ -272,11 +272,16 @@ fn process_unread(
                 // 要么它从未进过基线，此时不会有任何派发。如实记录以区分这两种情况，
                 // 不在这里自行发明"再读一次"的规则。
                 log::warn!(
-                    "二级好友未读提升未生效（气泡不在首屏基线）: friend={} pending={}",
+                    "二级好友未读提升未生效（步骤：提升未读消息）：好友「{}」的这条气泡不在首屏基线内，无法据此派发命令；该气泡可能已按常规路径交付过（{}）",
                     friend_name,
-                    chat_timeline
+                    if chat_timeline
                         .is_business_pending(&message.id)
                         .unwrap_or(false)
+                    {
+                        "当前仍在待处理队列中"
+                    } else {
+                        "当前不在待处理队列中"
+                    }
                 );
             }
             return Ok(SecondaryUnreadEffect::Message {
@@ -373,7 +378,10 @@ fn wait_promoted_unread_consumed(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            log::warn!("二级好友未读提升在超时前未被消费: id={id:?}");
+            log::warn!(
+                "二级好友未读消息在超时前未被消费（步骤：确认二级未读消息）：该气泡是二级会话的第 {} 条，消费者未在期限内取走，本次未读提升放弃且不会重试",
+                id.bubble_sequence.get()
+            );
             return Ok(());
         }
         if chat_timeline

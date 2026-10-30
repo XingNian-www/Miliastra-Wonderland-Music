@@ -1,5 +1,17 @@
 use super::*;
 
+/// 日志里的缺失变量名：用「」包住并按顿号串起，避免打印 Vec 的调试格式。
+///
+/// `pub(super)`：`commands.rs` 与 `workers.rs` 的同类告警也复用它，
+/// 保证「模板缺少变量」这一类事件只有一种写法。
+pub(super) fn missing_vars_label(missing: &[String]) -> String {
+    missing
+        .iter()
+        .map(|name| format!("「{name}」"))
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
 impl ApplicationRuntime {
     /// 渲染一条歌单回复；带 key 的条目在此处才查用户覆盖与静音。
     ///
@@ -141,8 +153,8 @@ impl ApplicationRuntime {
         let rendered = crate::features::reply_template::render(&spec, Some(&override_text), vars);
         if !rendered.missing.is_empty() {
             log::warn!(
-                "回复模板 {key} 缺少变量 {:?}，已按空串渲染",
-                rendered.missing
+                "回复模板「{key}」缺少变量 {}，这些位置已按空串渲染，玩家会看到内容缺一段",
+                missing_vars_label(&rendered.missing)
             );
         }
         rendered.text
@@ -220,7 +232,11 @@ impl ApplicationRuntime {
         // 直接把未渲染的模板交给模型，它只能看到占位符，等于瞎编。
         let rendered = self.fill_ai_reply(spec, rendered);
         if !rendered.missing.is_empty() {
-            log::warn!("回复模板 {} 缺少变量 {:?}", spec.key, rendered.missing);
+            log::warn!(
+                "回复模板「{}」缺少变量 {}，这些位置已按空串渲染，玩家会看到内容缺一段",
+                spec.key,
+                missing_vars_label(&rendered.missing)
+            );
         }
         Some(rendered.text)
     }
@@ -255,7 +271,10 @@ impl ApplicationRuntime {
             }
             Err(error) => {
                 // 生成失败就删掉占位符，别让花括号发到游戏里。
-                log::debug!("{} 的 AI 回复生成失败，留空继续: {error:#}", spec.key);
+                log::debug!(
+                    "回复模板「{}」的 AI 回复生成失败，该位置留空继续发送，玩家看到的是模板其余部分: {error:#}",
+                    spec.key
+                );
                 out.text = out.text.replace(&tag, "");
             }
         }

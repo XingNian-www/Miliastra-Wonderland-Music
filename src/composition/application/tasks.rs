@@ -194,7 +194,7 @@ impl ApplicationRuntime {
             || {
                 self.playback.player.pause_for_hall_expiry()?;
                 self.update_monitor_playback_controller();
-                log::info!("大厅倒计时已结束，未确认进入新大厅，已暂停播放");
+                log::info!("大厅倒计时已结束但未确认进入新大厅，已暂停播放");
                 Ok(())
             },
             || {
@@ -213,20 +213,20 @@ impl ApplicationRuntime {
             return Ok(());
         };
         log::info!(
-            "闲置退出触发: {}分钟无新命令，自动暂停播放器并关闭目标游戏进程，保留软件进程",
+            "闲置退出已触发：{} 分钟没有新命令，自动暂停播放器并关闭目标游戏进程，本程序继续运行",
             timeout.as_secs() / 60
         );
         self.abort_entertainment_for_context_loss("闲置退出即将关闭游戏");
         if let Err(error) = self.playback.player.pause_for_idle_exit() {
-            log::error!("闲置退出自动暂停播放器失败: {error:#}");
+            log::error!("闲置退出时暂停播放器失败（步骤：闲置退出前暂停播放），播放可能自行继续，退出后仍可能出队: {error:#}");
         } else {
-            log::info!("闲置退出已自动暂停播放器，防止退出后自动恢复或出队");
+            log::info!("闲置退出已暂停播放器，避免退出后自动恢复播放或继续出队");
         }
         self.update_monitor_playback_controller();
         match self.ui.game_ui.close_window() {
             Ok(()) => self.invalidate_latest_frame(),
             Err(error) => {
-                log::error!("关闭目标窗口失败: {error:#}");
+                log::error!("关闭目标游戏窗口失败（步骤：闲置退出关闭游戏），游戏窗口可能仍然打开: {error:#}");
             }
         }
         Ok(())
@@ -388,8 +388,8 @@ impl ApplicationRuntime {
             self.lifecycle.shutdown.require_startup_after_reload();
         }
         log::info!(
-            "运行环境已闲置，开始配置重载关停: fields={}",
-            fields.into_iter().collect::<Vec<_>>().join(",")
+            "运行环境已闲置，开始配置重载关停（需要重载的配置项：{}）",
+            fields.into_iter().collect::<Vec<_>>().join("、")
         );
         self.lifecycle.running.store(false, AtomicOrdering::SeqCst);
     }
@@ -446,7 +446,7 @@ impl ApplicationRuntime {
                 .maybe_advance_queue_for_reload(status.clone(), context)?,
             QueueAdvanceDecision::AdvanceQueue { .. }
         ) {
-            log::info!("配置重载待处理，刷新播放状态后抑制自动出队");
+            log::debug!("配置重载待处理，刷新播放状态后抑制自动出队");
         }
         Ok(status)
     }
@@ -509,11 +509,11 @@ impl ApplicationRuntime {
         };
         match result {
             Ok(PendingTaskExecution::Completed) => {
-                log::info!("待处理任务完成: {}", label);
+                log::info!("待处理任务已完成：{label}");
                 Ok(PendingTaskExecution::Completed)
             }
             Err(error) => {
-                log::error!("待处理任务失败 {}: {error:#}", label);
+                log::error!("待处理任务失败（步骤：执行待处理任务「{label}」），该任务已放弃，不会自动重试: {error:#}");
                 Err(error)
             }
         }
@@ -521,11 +521,11 @@ impl ApplicationRuntime {
 
     pub(super) fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
         let command_log = private_safe_command_log(&pending.routed);
-        log::info!(
-            "执行待处理命令: {} lock={}",
+        log::debug!(
+            "开始执行待处理命令：{}（命令锁：{}）",
             command_log,
             if is_private_undercover_input(&pending.routed) {
-                "[hidden]"
+                "已隐藏"
             } else {
                 pending.lock_key.as_str()
             }
@@ -541,7 +541,7 @@ impl ApplicationRuntime {
         match self.execute_command(&pending.routed) {
             Ok(()) => {
                 let command_ms = elapsed_ms(command_started);
-                log::info!("命令执行完成: {}", command_log);
+                log::info!("命令执行完成：{command_log}");
                 log::info!(target: "timing",
                     "命令执行耗时: command={} success=true total={}ms",
                     command_log,
@@ -550,7 +550,7 @@ impl ApplicationRuntime {
             }
             Err(error) => {
                 let command_ms = elapsed_ms(command_started);
-                log::error!("命令执行失败 {}: {error:#}", command_log);
+                log::error!("命令执行失败（步骤：执行命令「{command_log}」），这条命令没有生效，玩家不会收到执行结果: {error:#}");
                 log::info!(target: "timing",
                     "命令执行耗时: command={} success=false total={}ms",
                     command_log,
@@ -615,7 +615,7 @@ impl ApplicationRuntime {
         match tasks.enqueue(task)? {
             FormalTaskEnqueueOutcome::Queued(_) => Ok(()),
             FormalTaskEnqueueOutcome::Duplicate => {
-                log::info!("正式任务已在待执行范围内，跳过重复入队");
+                log::debug!("正式任务已在待执行范围内，跳过重复入队");
                 Ok(())
             }
         }

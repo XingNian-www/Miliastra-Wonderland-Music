@@ -47,6 +47,16 @@ pub enum FriendBatchFailureKind {
     ResultUnknown,
 }
 
+impl FriendBatchFailureKind {
+    /// 日志用的中文说法：失败性质决定能否安全重试，必须写清。
+    pub(crate) fn log_label(self) -> &'static str {
+        match self {
+            Self::ConfirmedUnsent => "确认未送达，可安全重试",
+            Self::ResultUnknown => "送达结果未知，重试可能重复发送",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FriendBatchFailure {
     kind: FriendBatchFailureKind,

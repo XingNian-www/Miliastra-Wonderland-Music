@@ -61,7 +61,7 @@ impl ApplicationRuntime {
 
     pub(super) fn execute_advance_queue_task(&mut self, reason: &'static str) -> Result<()> {
         if !automatic_advance_allowed(&self.lifecycle.live_configs) {
-            log::info!("配置重载待处理，跳过自动下一曲: reason={reason}");
+            log::debug!("配置重载待处理，跳过自动下一曲（原因：{reason}）");
             return Ok(());
         }
         self.playback
@@ -81,17 +81,22 @@ impl ApplicationRuntime {
             .playback_application
             .clone()
             .play_confirmed(&selection, self)?;
+        // 写成句子而不是字段堆砌：维护者要能一眼读出「请求了什么、最后播了什么、
+        // 有没有换源、失败原因是什么」，而不是对着 key=value 逐个翻译。
+        let actual_uri = result
+            .status()
+            .map(|status| status.current_uri.as_str())
+            .unwrap_or_default();
         log::info!(
-            "播放流程完成: outcome={:?} requested_uri={} final_uri={} actual_uri={} source_switched={} reason={}",
-            result.outcome(),
+            "播放流程完成：请求「{}」，最终播放「{}」，实际播放「{}」{}",
             result.requested().uri(),
             result.final_request().uri(),
-            result
-                .status()
-                .map(|status| status.current_uri.as_str())
-                .unwrap_or_default(),
-            result.source_switched(),
-            result.failure_reason().unwrap_or_default()
+            if actual_uri.is_empty() {
+                "（播放器未回报曲目）"
+            } else {
+                actual_uri
+            },
+            playback_outcome_label(&result)
         );
         Ok(result)
     }
@@ -170,14 +175,14 @@ impl ApplicationRuntime {
                 }
                 let Some(decision) = SongRequestDecision::parse(&message.text) else {
                     log::info!(
-                        "命令未执行：点歌确认窗口未识别为决策 text={}",
+                        "命令未执行：点歌确认窗口没能把这条消息识别为决策（应回「@确认」「@跳过」「@换源」等）「{}」",
                         redacted_chat_text(&message.text)
                     );
                     continue;
                 };
                 if !reader.accept_once(&message) {
                     log::info!(
-                        "命令未执行：点歌决策被基线或已消费否决 text={}",
+                        "命令未执行：这条点歌决策属于开场前历史或已被消费，因此不再采纳「{}」",
                         redacted_chat_text(&message.text)
                     );
                     continue;
@@ -200,8 +205,8 @@ impl ApplicationRuntime {
                     }
                     _ => {
                         log::info!(
-                            "命令未执行：点歌决策动作未开放 decision={:?} allow_switch_source={} allow_ai={} allow_local={} text={}",
-                            decision,
+                            "命令未执行：点歌决策「{}」当前未开放（换源可用：{}，AI 可用：{}，本地曲库可用：{}），忽略「{}」",
+                            decision.log_label(),
                             allow_switch_source,
                             allow_ai,
                             allow_local,
@@ -228,6 +233,24 @@ impl ApplicationRuntime {
 /// 当前请求进入终态后，队列仍会持久化并由替代进程继续消费。
 fn automatic_advance_allowed(live_configs: &crate::config::LiveConfigs) -> bool {
     !live_configs.has_pending_reload()
+}
+
+/// 播放结果的书面说法：把枚举换成维护者能直接读的中文，并带上失败原因。
+fn playback_outcome_label(result: &PlaybackResult) -> String {
+    use crate::features::playback::PlaybackOutcome;
+    match result.outcome() {
+        PlaybackOutcome::Success if result.source_switched() => "（已切换音源后播放成功）".to_string(),
+        PlaybackOutcome::Success => String::new(),
+        PlaybackOutcome::ItemScopedFailure => format!(
+            "（本条点歌失败，已跳过并继续下一项；原因：{}）",
+            result.failure_reason().unwrap_or("未回报")
+        ),
+        PlaybackOutcome::QueueBlockingFailure => format!(
+            "（播放器状态不确定，已保留队首等待重试；原因：{}）",
+            result.failure_reason().unwrap_or("未回报")
+        ),
+        PlaybackOutcome::DedupLimited => "（重复点歌已达上限，本次未执行）".to_string(),
+    }
 }
 
 impl PlaybackExecutionPort for ApplicationRuntime {

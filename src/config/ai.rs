@@ -18,8 +18,8 @@ use async_openai::types::chat::{
     CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ResponseFormat,
 };
 use async_openai::types::responses::{
-    CreateResponse, CreateResponseArgs, OutputItem, OutputMessageContent, Response,
-    ResponseTextParam, TextResponseFormatConfiguration,
+    CreateResponse, CreateResponseArgs, InputParam, OutputItem, OutputMessageContent, Response,
+    ResponseTextParam, Status, TextResponseFormatConfiguration,
 };
 use miliastra_kernel::ai::{Authentication, Target, validate_http_proxy};
 
@@ -599,9 +599,9 @@ fn request_with_format(
                 return Err(error);
             }
             log::warn!(
-                "模型 {} 拒绝了思考强度 {}，已去掉该字段重试: {error}",
+                "模型「{}」不接受当前思考强度「{}」（步骤：首次请求），已去掉该字段自动重试一次；若重试仍失败则本次调用失败: {error}",
                 target.model,
-                reasoning.as_wire_value().unwrap_or("unset")
+                reasoning.as_wire_value().unwrap_or("未设置")
             );
             let mut without = target.clone();
             without.reasoning = ReasoningEffort::Unset;
@@ -650,8 +650,12 @@ fn request_json_once(
             let request =
                 build_responses_request(target, system_prompt, user_prompt, max_tokens, json_mode)?;
             // 线上出现过「每次压缩都报缺少 output_text，但手工复现请求却正常」。
-            // 在失败路径把请求一起打出来，才能定位差异（放在成功路径会刷屏）。
-            let debug_request = serde_json::to_string(&request).ok();
+            // 失败路径需要可定位的差异信息（放在成功路径会刷屏）。
+            //
+            // 但请求体的 `instructions` 与 `input` 就是**系统提示词与玩家原文**，
+            // 直接落盘等于把聊天内容写进日志文件。因此只预先算好「形状摘要」：
+            // 模型、输入长度、输出格式、工具数、思考强度，不含任何正文。
+            let request_shape = describe_responses_request(&request);
             let response = openai
                 .create_response(
                     target.build_target()?,
@@ -662,9 +666,9 @@ fn request_json_once(
                 .wait()
                 .context("AI 请求失败")?;
             responses_output_text(&response).inspect_err(|_| {
-                if let Some(raw) = debug_request.as_deref() {
-                    log::warn!("AI responses 请求体（响应解析失败）: {raw}");
-                }
+                log::warn!(
+                    "AI 响应缺少可用正文（步骤：解析 Responses 协议返回），本次调用未产出结果，调用方可重试；请求形状：{request_shape}"
+                );
             })
         }
         WireApi::ChatCompletions => {
@@ -683,10 +687,18 @@ fn request_json_once(
             // 注意 DeepSeek 把命中数放在 usage 顶层 prompt_cache_hit_tokens，
             // 而 SDK 的 CompletionUsage 没有 flatten，会静默丢弃——
             // 所以这里打印整个 usage 的 JSON，而不是只取 cached_tokens。
+            // 用量本身是给排障看的内部数据，按字段展开成句子；
+            // 服务端还有未建模的字段（如缓存命中数）时，附一行原始 JSON 供核对。
             if let Some(usage) = response.usage.as_ref() {
                 log::debug!(
-                    "AI usage: {}",
-                    serde_json::to_string(usage).unwrap_or_else(|_| "<unserializable>".to_string())
+                    "AI 调用用量：输入 {} token，输出 {} token，合计 {} token",
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.total_tokens
+                );
+                log::trace!(
+                    "AI 调用用量的原始结构（含服务端额外字段）：{}",
+                    serde_json::to_string(usage).unwrap_or_else(|_| "无法序列化".to_string())
                 );
             }
             let choice = response
@@ -794,6 +806,116 @@ fn build_chat_request(
         .build()?)
 }
 
+/// Responses 请求的**形状摘要**：只含结构信息，不含提示词与玩家原文。
+///
+/// 用于响应解析失败时定位「请求本身与手工复现差在哪」。逐字打印请求体会把
+/// 系统提示词与玩家聊天原文写进日志文件，因此这里只保留可比较的形状字段。
+fn describe_responses_request(request: &CreateResponse) -> String {
+    let format = request
+        .text
+        .as_ref()
+        .map(|text| match text.format {
+            TextResponseFormatConfiguration::Text => "纯文本",
+            TextResponseFormatConfiguration::JsonObject => "JSON 对象",
+            TextResponseFormatConfiguration::JsonSchema(_) => "JSON Schema",
+        })
+        .unwrap_or("未指定");
+    let input = match &request.input {
+        InputParam::Text(text) => format!("单段文本 {} 字", text.chars().count()),
+        InputParam::Items(items) => format!("{} 条结构化输入", items.len()),
+    };
+    let instructions = request
+        .instructions
+        .as_ref()
+        .map(|text| format!("{} 字", text.chars().count()))
+        .unwrap_or_else(|| "未提供".to_string());
+    let tools = request.tools.as_ref().map(Vec::len).unwrap_or(0);
+    let reasoning = request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_ref())
+        .map(reasoning_effort_label)
+        .unwrap_or("未设置");
+    format!(
+        "模型 {}，输入 {input}，系统提示词 {instructions}，输出格式 {format}，工具 {tools} 个，思考强度 {reasoning}，最大输出 {} token",
+        request.model.as_deref().unwrap_or("未指定"),
+        request
+            .max_output_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "未设置".to_string())
+    )
+}
+
+/// 请求里的思考强度，转成人能读的说明。
+fn reasoning_effort_label(effort: &async_openai::types::responses::ReasoningEffort) -> &'static str {
+    use async_openai::types::responses::ReasoningEffort;
+    match effort {
+        ReasoningEffort::None => "不思考",
+        ReasoningEffort::Minimal => "最低",
+        ReasoningEffort::Low => "低",
+        ReasoningEffort::Medium => "中等",
+        ReasoningEffort::High => "高",
+        ReasoningEffort::Xhigh => "极高",
+    }
+}
+
+/// Responses 返回的状态，转成人能读的说明。
+fn response_status_label(status: &Status) -> &'static str {
+    match status {
+        Status::Completed => "已完成",
+        Status::Failed => "失败",
+        Status::InProgress => "仍在进行中",
+        Status::Cancelled => "已取消",
+        Status::Queued => "排队中",
+        Status::Incomplete => "未完成（可能被截断）",
+    }
+}
+
+/// Responses 返回的 output **结构摘要**：类型序列 + 每项的内容类型，不含正文。
+fn describe_response_output(output: &[OutputItem]) -> String {
+    if output.is_empty() {
+        return "空".to_string();
+    }
+    let mut parts = Vec::with_capacity(output.len());
+    for item in output {
+        parts.push(match item {
+            OutputItem::Message(message) => {
+                let contents = message
+                    .content
+                    .iter()
+                    .map(|content| match content {
+                        OutputMessageContent::OutputText(text) => {
+                            if text.text.trim().is_empty() {
+                                "空文本".to_string()
+                            } else {
+                                format!("文本 {} 字", text.text.chars().count())
+                            }
+                        }
+                        OutputMessageContent::Refusal(_) => "拒绝回答".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("、");
+                format!("消息[{}]", if contents.is_empty() { "无内容".to_string() } else { contents })
+            }
+            OutputItem::Reasoning(_) => "思考过程".to_string(),
+            OutputItem::FunctionCall(_) => "函数调用".to_string(),
+            OutputItem::FunctionCallOutput(_) => "函数调用结果".to_string(),
+            OutputItem::WebSearchCall(_) => "联网搜索".to_string(),
+            OutputItem::FileSearchCall(_) => "文件检索".to_string(),
+            OutputItem::ComputerCall(_) => "计算机操作".to_string(),
+            OutputItem::ComputerCallOutput(_) => "计算机操作结果".to_string(),
+            OutputItem::ImageGenerationCall(_) => "图像生成".to_string(),
+            OutputItem::CodeInterpreterCall(_) => "代码解释器".to_string(),
+            OutputItem::LocalShellCall(_) => "本地命令".to_string(),
+            OutputItem::ShellCall(_) => "命令行调用".to_string(),
+            OutputItem::ShellCallOutput(_) => "命令行结果".to_string(),
+            OutputItem::Compaction(_) => "上下文压缩".to_string(),
+            _ => "其他类型".to_string(),
+        });
+    }
+    parts.join("、")
+}
+
 /// Responses 的 output_text：跳过 refusal、未完成与缺失内容。
 fn responses_output_text(response: &Response) -> anyhow::Result<String> {
     for output in &response.output {
@@ -814,12 +936,17 @@ fn responses_output_text(response: &Response) -> anyhow::Result<String> {
             }
         }
     }
-    // 失败时把实际结构打出来。这个错误在线上表现为「记忆压缩每轮都失败」，
+    // 失败时打出响应**结构**。这个错误在线上表现为「记忆压缩每轮都失败」，
     // 而 Responses 协议下不同中转的 output 形状差异很大（reasoning 项、
     // 空 content、非 message 类型），只看「缺少 output_text」无法定位。
-    if let Ok(raw) = serde_json::to_string(response) {
-        log::warn!("AI 响应结构（缺少 output_text）: {}", raw);
-    }
+    //
+    // 但响应体里带模型生成的正文，可能包含玩家原文的回显，不能整段落盘。
+    // 这里只列 output 的类型序列与每项内容类型，足以区分上述四种形状。
+    log::warn!(
+        "AI 响应缺少 output_text（步骤：从 Responses 返回里取正文），本次调用未产出结果，调用方可重试；响应状态：{}，输出项：{}",
+        response_status_label(&response.status),
+        describe_response_output(&response.output)
+    );
     bail!("AI 响应缺少 output_text")
 }
 

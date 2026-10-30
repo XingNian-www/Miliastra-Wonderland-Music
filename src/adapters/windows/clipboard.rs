@@ -153,7 +153,9 @@ impl TextRestoreGuard {
                 RestoreTarget::NoText
             }
             Err(error) => {
-                log::warn!("读取原剪贴板文本失败，粘贴结束后会清空临时文本: {error:#}");
+                log::warn!(
+                    "无法读取原剪贴板文本（步骤：暂存剪贴板），粘贴结束后将清空临时文本，用户原有的剪贴板内容无法恢复: {error:#}"
+                );
                 RestoreTarget::NoText
             }
         };
@@ -171,7 +173,9 @@ impl Drop for TextRestoreGuard {
                 RestoreTarget::Text(previous) => {
                     let previous_summary = TextSummary::new(&previous);
                     if let Err(error) = set_text(&previous) {
-                        log::warn!("恢复原剪贴板文本失败: {error:#}");
+                        log::warn!(
+                            "恢复原剪贴板文本失败（步骤：粘贴完成后还原剪贴板），用户的剪贴板内容停留为本次输入文本: {error:#}"
+                        );
                     } else {
                         log::info!(target: "timing",
                             "剪贴板临时占用结束: 已恢复原文本 chars={} hash={:016x}",
@@ -182,7 +186,9 @@ impl Drop for TextRestoreGuard {
                 }
                 RestoreTarget::NoText => {
                     if let Err(error) = clear() {
-                        log::warn!("清空临时剪贴板文本失败: {error:#}");
+                        log::warn!(
+                            "清空临时剪贴板文本失败（步骤：粘贴完成后清空），本次输入的文本仍留在剪贴板中: {error:#}"
+                        );
                     } else {
                         log::info!(target: "timing", "剪贴板临时占用结束: 已清空临时文本");
                     }

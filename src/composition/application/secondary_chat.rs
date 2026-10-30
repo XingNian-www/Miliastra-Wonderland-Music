@@ -80,9 +80,13 @@ impl Drop for SecondaryUnreadTaskCompletionGuard {
             self.business.release_chat_listener_unread_task()
         };
         if let Err(error) = release {
-            log::error!("二级未读任务异常结束后释放 pending 状态失败: {error}");
+            log::error!(
+                "二级未读任务异常结束，且释放待处理状态失败（步骤：回收未读任务占位），下一轮可能重复处理同一条未读，需要人工核对: {error}"
+            );
         } else {
-            log::warn!("二级未读任务异常结束，已释放 pending 状态并等待下一轮恢复");
+            log::warn!(
+                "二级未读任务异常结束（未读到预期界面），待处理状态已释放，下一轮会重新尝试"
+            );
         }
     }
 }
@@ -492,7 +496,7 @@ impl ApplicationRuntime {
             return Err(error);
         }
         log::info!(
-            "二级值守检测到好友未读红点: y={} discard_only={}",
+            "二级值守检测到好友未读红点（屏幕纵坐标 {}，仅丢弃不执行：{}），已排入本轮处理",
             queued_y,
             discard_only
         );
@@ -984,7 +988,7 @@ impl ApplicationRuntime {
             account,
         } in messages
         {
-            log::debug!("处理二级观察消息: id={message_id:?}");
+            log::debug!("开始处理一条二级观察消息");
             let command_observation = CommandObservation {
                 frame_id: Some(frame.id()),
                 captured_at: Some(frame.captured_at()),
@@ -1027,12 +1031,12 @@ impl ApplicationRuntime {
                     if command::looks_like_command(&text) {
                         if unclaimed {
                             log::info!(
-                                "命令未执行：二级消息无模块认领（当前无对应玩法/开关） text={}",
+                                "命令未执行：二级消息没有被任何模块认领（当前没有对应玩法，或该命令已在面板关闭）「{}」",
                                 redacted_chat_text(&text)
                             );
                         } else {
                             log::info!(
-                                "命令暂缓：二级命令缺少可确认身份（UID 与昵称皆无），等待身份修订 text={}",
+                                "命令暂缓：这条二级消息既没有账号也没有昵称，无法确认发送者，等身份修订后再判断「{}」",
                                 redacted_chat_text(&text)
                             );
                         }
@@ -1113,7 +1117,7 @@ impl ApplicationRuntime {
             .map(|envelope| envelope.with_account(account.clone())) else {
                 if command::looks_like_command(&text) {
                     log::info!(
-                        "命令未执行：二级消息无法解析为命令信封 text={}",
+                        "命令未执行：二级消息无法解析为命令信封（缺发送者或前缀不成立）「{}」",
                         redacted_chat_text(&text)
                     );
                 }
@@ -1124,7 +1128,7 @@ impl ApplicationRuntime {
             let Some(parsed) = router.route(&envelope, active_entertainment) else {
                 if command::looks_like_command(&text) {
                     log::info!(
-                        "命令未执行：{} text={}",
+                        "命令未执行：{}「{}」",
                         ChatCommandRouter::unclaimed_command_reason(
                             &envelope,
                             active_entertainment

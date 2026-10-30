@@ -349,7 +349,7 @@ fn publish_completion_advance(state: &mut ChatObservationState, advance: Complet
     for event in advance.events() {
         if let ObservationCompletionEvent::TerminalFailure { frame, reason } = event {
             log::error!(
-                "聊天观察帧终止失败: frame={} reason={}",
+                "聊天观察帧终止失败（步骤：处理该帧的观察事件），该帧之后的观察结果不会产出，需等待下一帧重建；帧号 {}，原因 {}",
                 frame.id().get(),
                 reason
             );
@@ -357,7 +357,7 @@ fn publish_completion_advance(state: &mut ChatObservationState, advance: Complet
     }
     if let Some(watermark) = advance.watermark() {
         log::debug!(
-            "聊天观察完成水位推进: frame={} age={}ms",
+            "聊天观察完成水位推进：已推进到帧号 {}，该帧距采集已过 {} 毫秒",
             watermark.completed_through.get(),
             watermark.captured_through.elapsed().as_millis()
         );

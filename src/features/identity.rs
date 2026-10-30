@@ -442,7 +442,7 @@ impl IdentityAccess {
                 uid: uid.to_string(),
             }],
         });
-        log::info!("已为游戏 UID {game}:{uid} 自动创建身份 {id}（好友权限）");
+        log::info!("已为 UID {uid} 自动创建身份（好友权限），昵称待补；可在面板补充备注与更高权限");
         Some(id)
     }
 
@@ -497,7 +497,11 @@ impl IdentityAccess {
                 })
         });
         if taken_by_other {
-            log::warn!("ChatBridge 备注与已有昵称重复，{uid} 保留原匹配键: {remark}");
+            log::warn!(
+                "外部聊天源给出的备注「{}」与已登记昵称重复，UID{} 仍保留原匹配键，不覆盖",
+                remark,
+                uid
+            );
             return false;
         }
         let Some(mapping) = config.mappings.iter_mut().find(|mapping| {

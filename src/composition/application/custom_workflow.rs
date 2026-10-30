@@ -270,8 +270,7 @@ impl ApplicationRuntime {
         if messages_complete {
             if !outcome.is_complete() {
                 log::error!(
-                    "好友消息已全部发送，但值守驻留恢复失败: {:?}",
-                    outcome.residency()
+                    "好友消息已全部发送，但恢复值守驻留界面失败（步骤：发送完成后把界面切回聊天值守界面），本轮投递记为结果未知，需要下一轮确认界面状态后才能继续"
                 );
                 return Ok(FriendBatchOutcome::Failed {
                     retryable: Vec::new(),

@@ -462,11 +462,13 @@ impl ConfigStore {
         // 而缓存与旧配置都还在原库里。
         match backup_before_reset(connection, path, stale_version) {
             Ok(Some(backup)) => log::warn!(
-                "配置 schema v{stale_version} → v{CONFIG_SCHEMA_VERSION} 断代前已备份旧库: {}",
+                "配置结构版本从 v{stale_version} 升级到 v{CONFIG_SCHEMA_VERSION}，需要重建配置表；旧库已备份到「{}」，可据此手工找回旧配置",
                 backup.display()
             ),
             Ok(None) => {}
-            Err(error) => log::warn!("断代前备份旧库失败（继续升级）: {error:#}"),
+            Err(error) => log::warn!(
+                "配置断代前的旧库备份失败（步骤：复制旧配置库），升级仍会继续，但旧配置无法还原: {error:#}"
+            ),
         }
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -488,7 +490,7 @@ impl ConfigStore {
         Self::initialize_database_transaction(&transaction, now_ms() as i64)?;
         transaction.commit()?;
         log::warn!(
-            "旧配置 schema v{stale_version} 已重置为 v{CONFIG_SCHEMA_VERSION} 默认值；歌曲缓存保留: {}",
+            "旧配置已重置为默认值（v{stale_version} → v{CONFIG_SCHEMA_VERSION}），用户此前的面板设置需要重新填写；歌曲缓存与音频文件未受影响: {}",
             path.display()
         );
         Ok(())

@@ -62,7 +62,7 @@ impl WebSocketChatSource {
             .block_on(async { tokio_tungstenite::connect_async(request).await })
             .context("连接外部聊天 WS 失败")?;
         self.connection = Some(stream);
-        log::info!("外部聊天 WS 已连接: {}", self.url);
+        log::info!("外部聊天源已连接，地址「{}」，开始接收大厅与好友消息", self.url);
         Ok(())
     }
 }
@@ -105,7 +105,7 @@ impl ChatSource for WebSocketChatSource {
         match read {
             Ok(Read::Message(Message::Text(text))) => super::parse_frame(text.as_str()),
             Ok(Read::Message(Message::Close(_))) => {
-                log::info!("外部聊天 WS 被对端关闭");
+                log::info!("外部聊天源连接被对端关闭，将按重连间隔重新建立");
                 self.connection = None;
                 Ok(None)
             }
@@ -120,7 +120,9 @@ impl ChatSource for WebSocketChatSource {
             }
             Err(error) => {
                 // 读失败视为连接已断：交给上层重连，不要在这里退避。
-                log::warn!("外部聊天 WS 读取出错: {error}");
+                log::warn!(
+                    "外部聊天源读取消息失败，本次连接已断开，等待重新连接；断开期间的外部聊天消息不会被接收: {error}"
+                );
                 self.connection = None;
                 Err(error)
             }

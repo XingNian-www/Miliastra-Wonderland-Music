@@ -456,7 +456,7 @@ impl CustomWorkflowService {
     ) -> Result<WorkflowCompletion> {
         let plan = self.prepare(invocation)?;
         log::info!(
-            "执行自定义流程: {} steps={}",
+            "开始执行自定义流程「{}」，共 {} 个步骤",
             plan.workflow,
             plan.steps.len()
         );
@@ -479,7 +479,7 @@ impl CustomWorkflowService {
                     FreshMessageOutcome::Stopped => None,
                 };
             if decision != Some(WorkflowConfirmationDecision::Confirm) {
-                log::info!("自定义流程已取消: {}", plan.workflow);
+                log::info!("自定义流程「{}」已被取消", plan.workflow);
                 return Ok(WorkflowCompletion::Cancelled);
             }
         }
@@ -489,7 +489,7 @@ impl CustomWorkflowService {
             match step {
                 WorkflowPlanStep::ActionPlan(operations) => {
                     log::info!(
-                        "自定义流程机械段 {}/{}: operations={}",
+                        "自定义流程第 {}/{} 步：执行 {} 个机械操作",
                         index + 1,
                         step_count,
                         operations.len()
@@ -498,7 +498,7 @@ impl CustomWorkflowService {
                 }
                 WorkflowPlanStep::Capability(capability) => {
                     log::info!(
-                        "自定义流程能力步骤 {}/{}: {}",
+                        "自定义流程第 {}/{} 步：执行「{}」",
                         index + 1,
                         step_count,
                         capability_label(&capability)

@@ -512,6 +512,40 @@ mod tests {
         }
     }
 
+    /// `FileLogger::log` 与 `write_fallback` 两条写出行必须**逐字同形**。
+    ///
+    /// 上一版只断言了 `format!("{prefix}正文")`，恰好漏掉 `log()` 那一层的
+    /// `"{} {}"` 拼接：前缀自带尾随空格 + 拼接再加一个 = 三个空格，而兜底路径
+    /// 只有两个。测试全绿、产物却是两种行形状。
+    ///
+    /// 这里复现两条路径**各自的拼接方式**并断言相等——这是唯一能锁住
+    /// 「正文起点列一致」的断言；形状层的问题 `check-log-style.py` 抓不到。
+    #[test]
+    fn main_and_fallback_paths_render_identical_columns() {
+        let at = UNIX_EPOCH + std::time::Duration::from_secs(1_793_319_423);
+        let text = "点歌成功：晴天（QQ音乐）";
+        for (level, label) in [
+            (log::Level::Info, "INFO"),
+            (log::Level::Warn, "WARN"),
+            (log::Level::Error, "ERROR"),
+            (log::Level::Debug, "DEBUG"),
+            (log::Level::Trace, "TRACE"),
+        ] {
+            let prefix = format_prefix_at(level, at);
+            // FileLogger::log: format!("{} {}", prefix, record.args())
+            let main = format!("{} {}", prefix, text);
+            // write_fallback: format!("{prefix} {message}")
+            let fallback = format!("{prefix} {text}");
+            assert_eq!(
+                main, fallback,
+                "主路径与兜底路径的正文列不一致: {main:?} vs {fallback:?}"
+            );
+            // 正文应恰好从「时间戳 + 5 宽级别 + 一个空格」之后开始。
+            let expected = format!("[10-30 08:17:03] {label:<5} {text}");
+            assert_eq!(main, expected, "正文起点列不是预期的两空格");
+        }
+    }
+
     /// 前缀里不得残留旧格式的分隔符：方括号只包住时间戳，级别后面不带冒号。
     #[test]
     fn prefix_carries_no_legacy_separators() {

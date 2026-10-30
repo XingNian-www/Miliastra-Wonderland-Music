@@ -126,6 +126,45 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &Monitor
     }
 }
 
+/// 从 monitor 推送的日志行里拆出「级别」与「正文」。
+///
+/// monitor 每行存的是完整的一行：`[10-30 08:17:03] INFO  正文`。面板宽度有限，
+/// 时间戳在每一行重复只占位置，所以面板只显示「级别 + 正文」，级别另用颜色区分。
+///
+/// 不符合该形状的行（空白行、降级提示）返回 `None`，由调用方原样显示。
+fn split_log_prefix(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix('[')?;
+    let (_, rest) = rest.split_once("] ")?;
+    let (level, body) = rest.split_once(' ')?;
+    Some((level.trim_end(), body.trim_start()))
+}
+
+/// 级别对应的面板颜色：错误红、警告黄、调试灰，其余（INFO）用默认前景色。
+fn log_level_style(level: &str) -> Style {
+    match level {
+        "ERROR" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "WARN" => Style::default().fg(Color::Yellow),
+        "DEBUG" | "TRACE" => Style::default().fg(Color::DarkGray),
+        _ => Style::default(),
+    }
+}
+
+/// 单条日志行在面板里的呈现。无前缀的行（空白行、降级提示）原样显示。
+fn event_log_line(line: &str) -> Line<'_> {
+    match split_log_prefix(line) {
+        Some((level, body)) => Line::from(vec![
+            Span::styled(level, log_level_style(level)),
+            Span::raw("  "),
+            Span::raw(body),
+        ]),
+        None => Line::from(line),
+    }
+}
+
+/// 渲染事件日志面板。
+///
+/// 这里是**每帧**调用的渲染路径（`render_loop` 按刷新间隔循环）：函数内不得
+/// 写任何日志，否则刷新频率会直接变成日志频率。
 fn draw_event_log(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &MonitorSnapshot) {
     let log_lines = state
         .logs
@@ -133,7 +172,7 @@ fn draw_event_log(frame: &mut ratatui::Frame<'_>, area: TuiRect, state: &Monitor
         .rev()
         .take(area.height.saturating_sub(2) as usize)
         .rev()
-        .map(|line| Line::from(line.as_str()))
+        .map(|line| event_log_line(line))
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(log_lines)
@@ -296,6 +335,87 @@ fn format_queue_item(item: &MonitorQueueItem) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 面板只显示「级别 + 正文」：时间戳每行重复，占掉本就紧张的行宽。
+    #[test]
+    fn event_log_strips_the_timestamp_and_keeps_level_and_body() {
+        assert_eq!(
+            split_log_prefix("[10-30 08:17:03] INFO  点歌成功：晴天（QQ音乐）"),
+            Some(("INFO", "点歌成功：晴天（QQ音乐）"))
+        );
+        assert_eq!(
+            split_log_prefix("[10-30 08:17:03] ERROR 处理失败：网络不可达"),
+            Some(("ERROR", "处理失败：网络不可达"))
+        );
+        // 级别宽度对齐后正文前可能只有一个空格（INFO/ERROR 宽度不同）。
+        assert_eq!(
+            split_log_prefix("[10-30 08:17:03] TRACE 逐帧匹配分数 0.93"),
+            Some(("TRACE", "逐帧匹配分数 0.93"))
+        );
+        // 不是日志行（空白行、降级提示）不拆，避免误删正文。
+        assert_eq!(split_log_prefix(""), None);
+        assert_eq!(split_log_prefix("监控状态不可用"), None);
+        assert_eq!(split_log_prefix("[10-30 08:17:03]"), None);
+    }
+
+    /// 边界：级别后没有正文（行尾就是级别）时不要吞掉整行。
+    ///
+    /// 拆前缀要求「级别 + 空格 + 正文」三段齐全；缺正文时 `split_once(' ')`
+    /// 返回 `None`，函数必须原样回退，否则面板上这一行会整行消失。
+    #[test]
+    fn event_log_keeps_lines_that_have_a_level_but_no_body() {
+        assert_eq!(split_log_prefix("[10-30 08:17:03] INFO"), None);
+        assert_eq!(split_log_prefix("[10-30 08:17:03] WARN"), None);
+        // 原样显示：整行（含时间戳）都在，不会因为拆不出正文而丢行。
+        let line = event_log_line("[10-30 08:17:03] INFO");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "[10-30 08:17:03] INFO");
+    }
+
+    /// 边界：未登记的级别名走默认配色，不能因为不认识就整行变红或消失。
+    ///
+    /// 级别集合由 `log::Level` 决定，但第三方 logger 或将来新增级别可能给出
+    /// 表外名字；此时按 INFO 处理（默认前景色）比猜一个醒目颜色更安全。
+    #[test]
+    fn unregistered_levels_fall_back_to_the_default_style() {
+        assert_eq!(log_level_style("NOTICE").fg, None);
+        assert_eq!(log_level_style("").fg, None);
+        // 仍然能正常渲染出正文，只是不着色。
+        let line = event_log_line("[10-30 08:17:03] NOTICE  保留了这一行");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "NOTICE  保留了这一行");
+    }
+
+    /// 级别用颜色区分，且 INFO 保持默认前景色（不额外加粗/变色）。
+    #[test]
+    fn event_log_colors_levels_without_touching_info() {
+        assert_eq!(log_level_style("ERROR").fg, Some(Color::Red));
+        assert_eq!(log_level_style("WARN").fg, Some(Color::Yellow));
+        assert_eq!(log_level_style("DEBUG").fg, Some(Color::DarkGray));
+        assert_eq!(log_level_style("TRACE").fg, Some(Color::DarkGray));
+        assert_eq!(log_level_style("INFO").fg, None);
+    }
+
+    /// 渲染出来的行只保留级别与正文，正文不能被时间戳残留污染。
+    #[test]
+    fn event_log_line_renders_level_then_body() {
+        let line = event_log_line("[10-30 08:17:03] WARN  好友会话未确认，改用大厅流程");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "WARN  好友会话未确认，改用大厅流程");
+        assert!(!text.contains("10-30"));
+    }
 
     #[test]
     fn event_log_gets_a_taller_default_area() {

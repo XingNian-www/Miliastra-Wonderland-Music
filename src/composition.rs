@@ -68,13 +68,13 @@ pub(crate) fn run(config_path: &Path) -> Result<RunOutcome> {
     log::info!("性能日志文件: {}", log_paths.timing.display());
     log::info!("配置文件: {}", config_path.display());
     log::info!(
-        "HTTP/Web 面板: {}:{} enabled={}",
+        "HTTP/Web 面板监听 {}:{}，面板{}",
         app_config.http.host,
         app_config.http.port,
-        app_config.http.enabled
+        if app_config.http.enabled { "已启用" } else { "已禁用" }
     );
     log::info!(
-        "原生播放器: credentials={} helper={}",
+        "原生播放器凭据目录 {}, 登录助手可执行文件 {}",
         app_config.playback.credential_directory.display(),
         app_config.playback.login_helper_executable.display()
     );

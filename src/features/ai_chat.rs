@@ -1420,7 +1420,10 @@ impl AiChatMemory {
         let summary = summary.trim();
         if summary.is_empty() {
             // 原文一条都没删，下轮会重新规划。
-            log::warn!("压缩返回空摘要，保留旧摘要与原文 scope={}", plan.scope);
+            log::warn!(
+                "记忆压缩返回空摘要，本次保留旧摘要与原文（范围：{}）",
+                plan.scope
+            );
             return Ok(());
         }
         // 摘要硬上限：面板上的 summary_budget 以前只存在于配置里，从不生效。

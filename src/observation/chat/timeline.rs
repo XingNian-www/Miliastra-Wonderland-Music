@@ -1028,7 +1028,7 @@ impl ChatTimeline {
         for message in messages {
             let Some(scope) = external_chat_scope(&message, self_uid) else {
                 log::debug!(
-                    "外部聊天消息缺少可用的会话身份，已忽略: channel={}",
+                    "外部聊天消息缺少可用的会话身份，已忽略该条；消息频道为 {}",
                     message.channel
                 );
                 continue;
@@ -1518,6 +1518,31 @@ impl ChatTimeline {
 ///
 /// 注意这个值**不进快照的 `chat` 字段**：外部快照的 `chat` 恒为 `None`，
 /// 业务归属一律看 `scope`。消费侧不应再读 `chat`。
+/// 视觉会话号的可读标签，未绑定时写明「尚未建立」。
+///
+/// 会话号是内部自增序号，直接打 `{:?}` 只会得到 `Some(VisualSessionId(7))`。
+fn visual_session_label(session: Option<VisualSessionId>) -> String {
+    match session {
+        Some(session) => session.get().to_string(),
+        None => "尚未建立".to_string(),
+    }
+}
+
+/// 聊天范围的可读类别。
+///
+/// **不输出好友昵称**：`ChatIdentity::Friend` 里装的是 OCR 读到的玩家名，
+/// 写进日志等于把可被改名冒充的匹配键落盘。
+fn chat_scope_label(chat: &ChatIdentity) -> &'static str {
+    match chat {
+        ChatIdentity::PrimaryHall => "一级大厅",
+        ChatIdentity::SecondaryHall => "二级大厅",
+        ChatIdentity::Friend(_) => "好友私聊",
+        ChatIdentity::PublicChannel => "公共频道",
+        ChatIdentity::StrangerMessages => "陌生人消息",
+        ChatIdentity::Unknown => "未识别",
+    }
+}
+
 fn dedup_identity_for_scope(scope: &ChatScope) -> ChatIdentity {
     match scope {
         // 外部源的大厅消息归到二级桶：它本来就是「当前所在大厅」，
@@ -1858,10 +1883,12 @@ fn deliver_snapshot(
         if session_changed {
             // 同一个聊天里的视图重建（机器人自己发言、面板滚动、重新申请帧）会让视觉会话号自增。
             // 确认读者重置基线继续等待；业务读者保留尚未消费的旧会话快照。
-            log::info!(
-                "共享聊天读者改绑新视觉会话: session={:?} -> {:?}",
-                subscriber.session,
-                snapshot.visual_session
+            // 视图重建在正常值守中会反复发生（机器人自己发言、面板滚动、
+            // 重新申请帧都会让视觉会话号自增），属于内部状态流转，按 debug 记录。
+            log::debug!(
+                "共享聊天读者改绑到新的视觉会话：原会话 {}，新会话 {}",
+                visual_session_label(subscriber.session),
+                snapshot.visual_session.get()
             );
             if !subscriber.durable_business {
                 subscriber.queue.clear();
@@ -1870,7 +1897,14 @@ fn deliver_snapshot(
         // 聊天视图曾瞬态消失、同一会话恢复：留一条日志，便于排查「读者为什么停了」。
         // 队列清理已由上面的 session_changed 分支覆盖，这里只补可观测性。
         if !session_changed && subscriber.session.is_none() && subscriber.chat.is_some() {
-            log::info!("共享聊天读者在聊天恢复后重新绑定: chat={:?}", snapshot.chat);
+            log::debug!(
+                "共享聊天读者在聊天恢复后重新绑定，聊天范围是{}",
+                snapshot
+                    .chat
+                    .as_ref()
+                    .map(chat_scope_label)
+                    .unwrap_or("未绑定")
+            );
         }
         subscriber.session = Some(snapshot.visual_session);
         subscriber.queue.push_back(snapshot.clone());

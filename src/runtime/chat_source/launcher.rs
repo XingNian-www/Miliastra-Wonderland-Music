@@ -167,7 +167,7 @@ pub(crate) fn ensure_running(config: &ChatSourceConfig) -> Result<bool> {
         )
     })?;
     log::info!(
-        "已拉起 Miliastra-Wonderland-ChatBridge: {} (端口 {port})",
+        "已启动外部聊天桥接程序「{}」，监听端口 {port}，接下来等待它报告连接成功",
         exe.display()
     );
     Ok(true)

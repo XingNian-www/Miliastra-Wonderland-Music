@@ -64,7 +64,12 @@ pub(crate) fn parse_frame(text: &str) -> anyhow::Result<Option<ChatSourceEvent>>
         Err(error) => {
             // 协议演进时可能出现未知 type，serde 会报 missing variant；
             // 这里降级为"忽略"而不是让整条连接失败。
-            log::debug!("无法解析的外部聊天帧，已忽略: {error}; raw={text}");
+            // 不打印原始帧：帧体里含玩家昵称、会话 ID 与聊天正文。
+            // 只记长度，够判断「是不是整帧都没解析出来」。
+            log::debug!(
+                "收到无法解析的外部聊天帧，已忽略并继续读取下一帧；帧长 {} 字节: {error}",
+                text.len()
+            );
             return Ok(None);
         }
     };
@@ -129,7 +134,7 @@ pub(crate) fn resolve_sender_names(
     let response = client.get(url).header("x-miliastra-token", token).send()?;
     if !response.status().is_success() {
         // 503 game_not_connected 等都属于"暂时查不到"，不是致命错误。
-        log::debug!("昵称补查失败: status={}", response.status());
+        log::debug!("昵称补查未取到结果（HTTP 状态 {}），本次沿用已有昵称，不影响消息投递", response.status());
         return Ok((None, None));
     }
     let body: serde_json::Value = response.json()?;

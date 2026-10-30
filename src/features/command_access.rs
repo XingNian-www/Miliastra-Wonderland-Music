@@ -262,7 +262,7 @@ impl CommandAccessConfig {
             if self.overrides.remove(*id).is_some() {
                 dropped += 1;
                 log::warn!(
-                    "command_access.overrides 中的 {} 已废弃并忽略：点歌已拆分为五个平台命令（@QQ点歌/@网易点歌/@酷狗点歌/@B站点歌/@AI点歌），请改用对应的平台条目",
+                    "命令权限配置里的「{}」已废弃并忽略：点歌已拆分为五个平台命令（@QQ点歌/@网易点歌/@酷狗点歌/@B站点歌/@AI点歌），请改用对应的平台条目",
                     id
                 );
             }
@@ -397,7 +397,7 @@ pub(crate) fn resolve_for_routed(
         | ModuleCommand::CustomWorkflow(_)
         | ModuleCommand::AiChat(_) => {
             log::warn!(
-                "命令没有对应的面板策略，按内部来源处理（命令目录与权限表漂移）: matched={} text={}",
+                "命令「{}」（原文「{}」）在权限表里查不到对应策略，按内部来源放行；这通常是命令目录与权限表不同步",
                 command.matched,
                 command.raw
             );
@@ -408,7 +408,10 @@ pub(crate) fn resolve_for_routed(
         INTERNAL_SOURCE_POLICY
     } else {
         catalog_policy(config, id).unwrap_or_else(|| {
-            log::warn!("命令 {} 查不到权限策略，按内部来源处理", id);
+            log::warn!(
+                "命令「{}」查不到权限策略，按内部来源放行；该命令的门槛配置不会生效",
+                id
+            );
             INTERNAL_SOURCE_POLICY
         })
     };
@@ -731,20 +734,21 @@ mod tests {
     fn empty_policy_id_is_limited_to_whitelisted_internal_sources() {
         use crate::features::command::{CommandObservation, CommandPrefix, ModuleCommand};
         let config = CommandAccessConfig::default();
-        let routed = |command: ModuleCommand, matched: &str| crate::features::command::RoutedCommand {
-            matched: matched.to_string(),
-            raw: matched.to_string(),
-            user_command: format!("@{matched}"),
-            message_type: "blue".to_string(),
-            username: "玩家甲".to_string(),
-            account: None,
-            authority: CommandAuthority::HallMember,
-            role: None,
-            permission_required: None,
-            denied_reason: None,
-            command,
-            observation: CommandObservation::default(),
-        };
+        let routed =
+            |command: ModuleCommand, matched: &str| crate::features::command::RoutedCommand {
+                matched: matched.to_string(),
+                raw: matched.to_string(),
+                user_command: format!("@{matched}"),
+                message_type: "blue".to_string(),
+                username: "玩家甲".to_string(),
+                account: None,
+                authority: CommandAuthority::HallMember,
+                role: None,
+                permission_required: None,
+                denied_reason: None,
+                command,
+                observation: CommandObservation::default(),
+            };
         let _ = CommandPrefix::At;
 
         // 白名单内：歌单窗口选择、AI 关键词提问 → 允许空 id。
@@ -764,8 +768,7 @@ mod tests {
             assert!(id.is_empty(), "{matched} 应走内部来源白名单");
             assert_eq!(policy.enabled, INTERNAL_SOURCE_POLICY.enabled);
             assert_eq!(
-                policy.minimum_role,
-                INTERNAL_SOURCE_POLICY.minimum_role,
+                policy.minimum_role, INTERNAL_SOURCE_POLICY.minimum_role,
                 "内部来源策略必须显式且唯一：不默认 Admin"
             );
         }
@@ -893,19 +896,11 @@ mod tests {
             observation: crate::features::command::CommandObservation::default(),
         };
         let active = Some(EntertainmentKind::RunFast);
-        let (id, policy) = resolve_with_active(
-            &config,
-            &routed(LandlordCommand::Status),
-            active,
-        );
+        let (id, policy) = resolve_with_active(&config, &routed(LandlordCommand::Status), active);
         assert_eq!(id, "#斗地主", "查询类走它自己的条目，不被 #跑得快 牵连");
         assert!(policy.enabled, "禁用 #跑得快 不该连看状态一起拒掉");
 
-        let (id, policy) = resolve_with_active(
-            &config,
-            &routed(LandlordCommand::Pass),
-            active,
-        );
+        let (id, policy) = resolve_with_active(&config, &routed(LandlordCommand::Pass), active);
         assert_eq!(id, "#跑得快");
         assert!(!policy.enabled, "跟着对局走的动作仍受 #跑得快 开关约束");
     }

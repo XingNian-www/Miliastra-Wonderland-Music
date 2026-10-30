@@ -335,12 +335,15 @@ fn read_hall_info_transaction(
     let mut screenshot = initial_image.clone();
     match read_hall_member_count(ocr, &initial_image, config) {
         Ok(Some(member_count)) => {
-            log::info!(
-                "大厅成员人数 OCR 结果: {}，滚动阈值={}",
-                member_count,
-                HALL_MEMBER_SCROLL_THRESHOLD
-            );
+            // 日志必须与**实际是否滚动**一致：人数没超阈值时不能声称「将滚动」。
+            // 大厅检测是玩家主动触发的单次流程（不是逐帧），真正滚动时才用 info；
+            // 单屏已完整只是常规路径，留 debug。
             if member_count > HALL_MEMBER_SCROLL_THRESHOLD {
+                log::info!(
+                    "大厅成员人数识别为 {} 人，超过滚动阈值 {} 人，本次将滚动成员列表再截一帧以拼出完整名单",
+                    member_count,
+                    HALL_MEMBER_SCROLL_THRESHOLD
+                );
                 let (from, to) = friend_list_drag_points(config.hall_member_list_region);
                 context
                     .device()
@@ -357,10 +360,18 @@ fn read_hall_info_transaction(
                 let (lower_image, lower_sample) = scrolled?;
                 samples.extend([upper_sample, lower_sample]);
                 screenshot = merge_hall_screenshots(&upper_image, &lower_image);
+            } else {
+                log::debug!(
+                    "大厅成员人数识别为 {} 人，未超过滚动阈值 {} 人，单屏内容已完整，本次不滚动成员列表",
+                    member_count,
+                    HALL_MEMBER_SCROLL_THRESHOLD
+                );
             }
         }
-        Ok(None) => log::debug!("大厅成员人数 OCR 未识别，跳过成员列表滚动"),
-        Err(failure) => log::warn!("大厅成员人数 OCR 失败，跳过成员列表滚动: {failure}"),
+        Ok(None) => log::debug!("大厅成员人数识别未得到结果，跳过成员列表滚动，按单屏内容继续读取大厅信息"),
+        Err(failure) => log::warn!(
+            "大厅成员人数识别失败（步骤：读取大厅成员人数），跳过成员列表滚动，成员列表可能显示不全；大厅名称与剩余时间仍会照常读取：{failure}"
+        ),
     }
     let screenshot = Arc::new(screenshot);
     while samples.len() < HALL_INFO_OCR_SAMPLES {
@@ -379,8 +390,10 @@ fn read_hall_info_transaction(
         samples.push(read_hall_sample(ocr, &image, config)?);
     }
     for (index, sample) in samples.iter().enumerate() {
-        log::info!(
-            "大厅检测 OCR 采样: {}/{} name={} time={} minutes={}",
+        // 这是多帧采样的逐帧明细（最多几次），属诊断细节：玩家只需要最终结论，
+        // 逐帧原文留 debug 供排查识别漂移。
+        log::debug!(
+            "大厅检测采样第 {}/{} 帧：大厅名「{}」，剩余时间「{}」，剩余「{}」分钟",
             index + 1,
             HALL_INFO_OCR_SAMPLES,
             display_or_empty(&sample.name),

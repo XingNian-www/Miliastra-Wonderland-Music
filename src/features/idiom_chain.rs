@@ -302,14 +302,16 @@ impl IdiomChainApplication {
         match delivery? {
             IdiomDeliveryOutcome::Added => {}
             IdiomDeliveryOutcome::DroppedEarlierMessage => {
-                log::warn!("延迟聊天发送队列已满，已丢弃一条较早的回复");
+                log::warn!("成语接龙的延迟聊天队列已满，已淘汰一条较早的回复")
             }
             IdiomDeliveryOutcome::Rejected => {
-                log::warn!("延迟聊天发送队列已被受保护批次占满，成语接龙回复已丢弃");
+                log::warn!(
+                    "延迟聊天队列已被受保护批次占满，本次成语接龙回复已丢弃；玩家看不到这条回复"
+                )
             }
         }
         log::info!(
-            "成语接龙已处理，回复进入延迟发送队列: command={} action={}",
+            "成语接龙命令「{}」已处理，结果「{}」，回复已进入延迟发送队列",
             raw_command,
             action
         );

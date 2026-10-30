@@ -301,13 +301,15 @@ impl StartupService {
     }
 
     fn start_game(&self, source: StartupSource, port: &dyn StartupExecutionPort) -> Result<()> {
-        log::info!("执行启动游戏任务: {}", source);
+        log::info!("开始执行启动游戏任务（来源：{}）", source);
         port.invalidate_chat_context(START_GAME_CONTEXT_LOSS_REASON);
         port.request_window_rescan(START_GAME_RESCAN_REASON)?;
 
         let mut reset_window_detection = |reason| {
             if let Err(error) = port.request_window_rescan(reason) {
-                log::error!("请求重置窗口检测退避失败: {error:#}");
+                log::error!(
+                    "重置窗口检测退避失败（步骤：启动过程中重新请求扫描窗口）；后续窗口检测可能沿用旧的退避节奏: {error:#}"
+                );
             }
         };
         port.run_start_game(
@@ -321,7 +323,7 @@ impl StartupService {
         source: StartupSource,
         port: &dyn StartupExecutionPort,
     ) -> Result<()> {
-        log::info!("执行进入千星任务: {}", source);
+        log::info!("开始执行进入千星任务（来源：{}）", source);
         port.invalidate_chat_context(ENTER_WONDERLAND_CONTEXT_LOSS_REASON);
         port.request_window_rescan(ENTER_WONDERLAND_RESCAN_REASON)?;
         port.run_enter_wonderland(source == StartupSource::AUTOMATIC_UI)?;

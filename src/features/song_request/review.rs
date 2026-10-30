@@ -204,7 +204,7 @@ impl SongReviewClient {
                 }
                 Err(error) => {
                     log::warn!(
-                        "候选歌曲审核请求失败 attempt={}/{}: {error:#}",
+                        "候选歌曲审核请求第 {}/{} 次失败（步骤：调用审核服务），将按退避间隔重试: {error:#}",
                         attempt,
                         max_attempts
                     );

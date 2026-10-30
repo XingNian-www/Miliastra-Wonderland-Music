@@ -1224,8 +1224,10 @@ async fn axum_entry(
             default_cors_headers(&fallback_host, fallback_port),
         ),
         Err(error) => {
-            // 内部错误详情只记日志,响应体不包含 panic 位置/内部路径。
-            log::error!("HTTP 请求处理失败(worker panic): {error:#}");
+            // 内部错误详情只记日志，响应体不包含崩溃位置与内部路径。
+            log::error!(
+                "HTTP 请求处理失败（请求工作线程崩溃），本次请求未返回结果，服务继续运行；原因：{error:#}"
+            );
             plain_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "错误: HTTP请求处理失败".to_string(),
@@ -1263,10 +1265,43 @@ fn request_from_axum(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) 
     }
 }
 
+/// 当前线程正在处理的请求，供只在深处做错误构造的代码取「哪个接口」。
+///
+/// HTTP 路由按线程串行处理请求，用线程局部保存即可把上下文带到
+/// `internal_error` 这类拿不到 `Request` 的构造点，避免给 `AppError`
+/// 加字段而波及全部 49 处字面量初始化。
+thread_local! {
+    static CURRENT_REQUEST: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 在一次请求处理期间绑定「方法 + 路径」，退出时恢复原值。
+struct RequestContextGuard(Option<(String, String)>);
+
+impl RequestContextGuard {
+    fn enter(method: &str, path: &str) -> Self {
+        let previous = CURRENT_REQUEST.with(|slot| slot.borrow_mut().replace((method.to_string(), path.to_string())));
+        Self(previous)
+    }
+}
+
+impl Drop for RequestContextGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CURRENT_REQUEST.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// 当前请求的「方法 + 路径」；不在请求处理中时为 None。
+fn current_request_label() -> Option<(String, String)> {
+    CURRENT_REQUEST.with(|slot| slot.borrow().clone())
+}
+
 fn handle_request(
     request: Request,
     state: &HttpSharedState,
 ) -> std::result::Result<Response, AppError> {
+    let _request_context = RequestContextGuard::enter(&request.method, &request.path);
     if !is_allowed_origin(&request, &state.config.http.host, state.config.http.port) {
         return Err(AppError {
             status: 403,
@@ -1353,6 +1388,26 @@ fn handle_request(
     let (body, ok) = match routed {
         Ok(body) => (body, true),
         Err(error) => {
+            // 经 internal_error 构造的 5xx 已在落点打过带完整错误链的 error 日志，
+            // 这里不重复。但有些 5xx 是直接构造的（如搜索失败、登录错误映射），
+            // 不记就会静默，因此用通用文案作为「已由构造处记录」的判据补齐。
+            const GENERIC_INTERNAL: &str = "内部错误";
+            if error.status >= 500 && error.message != GENERIC_INTERNAL {
+                log::error!(
+                    "{method} {path} 处理失败：本次操作未生效，面板可重试，服务继续运行；原因：{reason}",
+                    method = request.method,
+                    path = request.path,
+                    reason = error.message
+                );
+            } else if error.status < 500 {
+                log::warn!(
+                    "{method} {path} 请求被拒绝（状态码 {status}）：{reason}",
+                    method = request.method,
+                    path = request.path,
+                    status = error.status,
+                    reason = error.message
+                );
+            }
             push_history(&request, &error.message, false, state);
             if request.path.starts_with("/debug/read-only/") {
                 return Ok(readonly_error_response(&request, state, error));
@@ -1959,8 +2014,15 @@ fn method_not_allowed(message: &str) -> AppError {
 }
 
 fn internal_error(error: impl std::fmt::Display) -> AppError {
-    // 内部错误详情只写日志，响应体用通用信息，避免泄漏内部路径/错误链。
-    log::error!("HTTP 内部错误: {error:#}");
+    // 三要素：卡在哪一步（请求方法与路径，由 RequestContextGuard 提供）、
+    // 因为什么（完整错误链）、影响是什么（本次操作未生效，面板可重试）。
+    // 响应体仍用通用信息，避免把内部路径与错误链回给浏览器。
+    match current_request_label() {
+        Some((method, path)) => log::error!(
+            "{method} {path} 处理失败：本次操作未生效，面板可重试，服务继续运行；原因：{error:#}"
+        ),
+        None => log::error!("内部请求处理失败：本次操作未生效，服务继续运行；原因：{error:#}"),
+    }
     AppError {
         status: 500,
         message: "内部错误".to_string(),

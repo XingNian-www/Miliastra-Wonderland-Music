@@ -21,7 +21,9 @@ impl Drop for SharedChatObserverGuard {
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
-            log::error!("shared chat observer panicked during shutdown");
+            log::error!(
+                "共享聊天观察线程在关停时崩溃（步骤：等待观察线程退出），该线程没能正常收尾，本轮观测结果可能不完整"
+            );
         }
     }
 }
@@ -282,7 +284,9 @@ impl ApplicationRuntime {
                         // Failures never advance the successful scan cache or satisfy refresh.
                         let _ =
                             timeline.report_failure(format!("passive chat recognition: {error:#}"));
-                        log::warn!("shared chat observer recognition failed: {error:#}");
+                        log::warn!(
+                            "共享聊天观察本轮识别失败（步骤：被动 OCR 识别聊天区），这一帧不计入成功扫描缓存，也不会满足刷新请求，下一轮会重新尝试: {error:#}"
+                        );
                     }
                 }
             })

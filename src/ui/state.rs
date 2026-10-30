@@ -308,6 +308,13 @@ impl TemplateUiStateClassifier {
         self
     }
 
+    /// 逐帧界面分类。
+    ///
+    /// **关于 `target: "timing"` 的级别**：这些耗时日志是逐帧执行的（值守循环每轮都分类），
+    /// 按 logging-style.md 二「每轮都会执行的上限 trace 或 debug，绝不允许 info」
+    /// 定为 `debug`。级别调整不影响脚本消费——`timing` 是独立日志流，
+    /// 字段格式完全未变（§六要求保持），脚本按 `total=`/`marker=` 等键解析照旧。
+    /// 需要采集性能数据时把 `logging.level` 设成 `debug` 即可，此时行数与以前一致。
     pub(crate) fn classify_at(
         &mut self,
         image: &DynamicImage,
@@ -737,7 +744,7 @@ fn detect_ui_state_with_evidence(
         marker_hits,
     );
     if blue > 0 || yellow > 0 {
-        log::info!(target: "timing",
+        log::debug!(target: "timing",
             "UI 状态检测耗时: total={}ms marker={}ms state=primary rule=primary_chat_markers blue={} yellow={} pink={}",
             elapsed_ms(started),
             marker_ms,
@@ -765,7 +772,7 @@ fn detect_ui_state_with_evidence(
         && hall_max_height_px <= HALL_BAR_MAX_TILE_HEIGHT_PX
         && hall_top_spread_px <= HALL_BAR_MAX_TILE_TOP_SPREAD_PX;
     if hall_structure {
-        log::info!(target: "timing",
+        log::debug!(target: "timing",
             "UI 状态检测耗时: total={}ms marker={}ms state=primary rule=primary_hall_bar tiles={} h_min={} h_max={} top_spread={}",
             elapsed_ms(started),
             marker_ms,
@@ -785,7 +792,7 @@ fn detect_ui_state_with_evidence(
     // 因此放在最前面既便宜又不会抢掉其它状态。具体外观由证据里的规则名区分。
     if let Some(rule) = loading_rule(image) {
         let total_ms = elapsed_ms(started);
-        log::info!(target: "timing",
+        log::debug!(target: "timing",
             "UI 状态检测耗时: total={}ms state={rule}",
             total_ms,
         );
@@ -823,7 +830,7 @@ fn detect_ui_state_with_evidence(
         ));
         let back_ms = elapsed_ms(back_started);
         if menu_visible {
-            log::info!(target: "timing",
+            log::debug!(target: "timing",
                 "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=main_menu",
                 elapsed_ms(started),
                 back_ms,
@@ -852,7 +859,7 @@ fn detect_ui_state_with_evidence(
         ));
         if paimon_visible {
             let back_ms = elapsed_ms(back_started);
-            log::info!(target: "timing",
+            log::debug!(target: "timing",
                 "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=paimon_menu",
                 elapsed_ms(started),
                 back_ms,
@@ -863,7 +870,7 @@ fn detect_ui_state_with_evidence(
                 UiStateEvidence::new(template_probes, None, "paimon_menu_panel_template"),
             ));
         }
-        log::info!(target: "timing",
+        log::debug!(target: "timing",
             "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=secondary_chat",
             elapsed_ms(started),
             back_ms,
@@ -876,7 +883,7 @@ fn detect_ui_state_with_evidence(
     }
     let back_ms = elapsed_ms(back_started);
 
-    log::info!(target: "timing",
+    log::debug!(target: "timing",
         "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=unknown",
         elapsed_ms(started),
         back_ms,

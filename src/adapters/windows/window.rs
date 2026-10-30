@@ -739,7 +739,7 @@ impl Drop for WgcSession {
         if let Some(control) = self.control.take()
             && let Err(error) = control.stop()
         {
-            log::debug!("停止 WGC 会话失败: {error}");
+            log::debug!("WGC 采集会话未能正常停止，采集资源可能延后释放: {error}");
         }
     }
 }
@@ -819,7 +819,7 @@ fn note_wgc_unavailable(hwnd: HWND, error: &anyhow::Error) {
     if already_noted {
         return;
     }
-    log::info!("WGC 采集不可用，已回落到 GDI 窗口采集: {message}");
+    log::info!("WGC 采集不可用，本次已回落到 GDI 窗口采集，截图可继续但帧率可能下降: {message}");
     *noted = Some((window, message));
 }
 
@@ -1184,7 +1184,8 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
 
     match process_name(process_id) {
         Ok(name) => {
-            log::debug!("窗口进程: pid={} exe={}", process_id, name);
+            // 每个候选窗口都会走到这里（逐窗口枚举），必须是 debug。
+            log::debug!("枚举到窗口，所属进程是「{name}」（进程号 {process_id}）");
             if state
                 .targets
                 .iter()
@@ -1203,7 +1204,9 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
             }
         }
         Err(error) => {
-            log::debug!("读取窗口进程名失败: pid={} error={:#}", process_id, error);
+            log::debug!(
+                "无法读取窗口所属进程名（进程号 {process_id}），该窗口按「非目标窗口」跳过: {error:#}"
+            );
         }
     }
     true.into()

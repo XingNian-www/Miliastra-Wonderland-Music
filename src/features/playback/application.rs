@@ -1071,7 +1071,7 @@ impl PlaybackApplication {
 
         loop {
             if port.should_stop_continuous_lyrics()? {
-                log::info!("持续歌词输出已结束");
+                log::debug!("持续歌词推送已结束（播放已停止或模式已切换）");
                 break;
             }
 
@@ -1082,7 +1082,9 @@ impl PlaybackApplication {
                     }
                 }
                 Err(error) => {
-                    log::warn!("持续歌词读取播放器状态失败: {error:#}");
+                    log::warn!(
+                        "持续歌词推送时读取播放器状态失败（步骤：每轮歌词刷新）；本轮跳过，下一轮继续: {error:#}"
+                    );
                 }
             }
 
@@ -1124,7 +1126,9 @@ impl PlaybackApplication {
                         next_status_at = now + Duration::from_millis(status_ms);
                     }
                     Err(error) => {
-                        log::error!("播放监控状态查询失败: {error:#}");
+                        log::error!(
+                            "播放监控查询播放器状态失败（步骤：定期校准播放进度）；本轮不校准，下次轮询重试，期间进度显示可能滞后: {error:#}"
+                        );
                         snapshot = None;
                         next_status_at = now + Duration::from_millis(status_ms);
                     }
@@ -1142,7 +1146,9 @@ impl PlaybackApplication {
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        log::error!("播放监控处理失败: {error:#}");
+                        log::error!(
+                            "播放监控处理本轮观测失败（步骤：解析播放状态并决定是否推进队列）；本轮不推进，下次轮询重试: {error:#}"
+                        );
                         next_status_at = port.now() + Duration::from_millis(status_ms);
                     }
                 }
@@ -1216,11 +1222,11 @@ impl PlaybackApplication {
         let mut playlist_attempted: HashSet<String> = HashSet::new();
         loop {
             if purpose.stop_when_user_paused() && port.user_pause_active()? {
-                log::info!("自动出队已跳过: 播放器处于用户暂停状态");
+                log::debug!("暂不自动出队：播放器处于用户暂停状态");
                 return Ok(None);
             }
             if purpose.stop_when_user_paused() && !port.automatic_queue_advance_allowed()? {
-                log::info!("自动出队已跳过: 配置重载待处理");
+                log::debug!("暂不自动出队：配置重载尚未处理完");
                 return Ok(None);
             }
             self.refill_personal_playlist_queue(port)?;
@@ -1248,7 +1254,11 @@ impl PlaybackApplication {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
                 if let Some(selection) = last {
-                    log::info!("单曲循环重播({}): {}", reason, selection.keyword);
+                    log::info!(
+                        "单曲循环：重新播放「{}」（触发原因：{}）",
+                        selection.keyword,
+                        reason
+                    );
                     let completion =
                         self.run_request(&selection, &selection, PlaybackPurpose::Repeat, port)?;
                     match self.finish_playback(completion, port)?.outcome() {
@@ -1258,11 +1268,17 @@ impl PlaybackApplication {
                             }));
                         }
                         PlaybackOutcome::QueueBlockingFailure => {
-                            log::warn!("单曲循环重播被阻断，保留队列状态");
+                            log::warn!(
+                                "单曲循环重播「{}」被阻断（队列阻塞失败），保留当前队列状态等待下次重试",
+                                selection.keyword
+                            );
                             return Ok(None);
                         }
                         _ => {
-                            log::warn!("单曲循环重播失败，清除重播记忆: {}", selection.keyword);
+                            log::warn!(
+                                "单曲循环重播「{}」失败，已清除重播记忆；下一轮改播队列中的曲目",
+                                selection.keyword
+                            );
                             *self
                                 .last_played
                                 .lock()
@@ -1285,7 +1301,11 @@ impl PlaybackApplication {
                     stop_when_user_paused: purpose.stop_when_user_paused(),
                 };
                 let selection = pool_selection(&track);
-                log::info!("播放池随机播放({}): {}", reason, selection.keyword);
+                log::info!(
+                    "队列为空，从播放池随机播放「{}」（触发原因：{}）",
+                    selection.keyword,
+                    reason
+                );
                 let completion = self.run_selection(&selection, pool_purpose, port)?;
                 match self.finish_playback(completion, port)?.outcome() {
                     PlaybackOutcome::Success => {
@@ -1295,13 +1315,20 @@ impl PlaybackApplication {
                     }
                     PlaybackOutcome::QueueBlockingFailure => return Ok(None),
                     _ => {
-                        log::warn!("播放池歌曲不可用，已跳过: {}", selection.keyword);
+                        log::warn!(
+                            "播放池随机抽到的「{}」不可播放，已跳过并继续抽下一首",
+                            selection.keyword
+                        );
                         continue;
                     }
                 }
             };
             pool_excluded.clear();
-            log::info!("消费队列({}): {}", reason, item.keyword);
+            log::info!(
+                "从队列取出「{}」开始播放（触发原因：{}）",
+                item.keyword,
+                reason
+            );
             let request = PlaybackSelection {
                 keyword: item.keyword.clone(),
                 source: item.source.clone(),
@@ -1354,17 +1381,26 @@ impl PlaybackApplication {
                     }));
                 }
                 PlaybackOutcome::ItemScopedFailure => {
-                    log::error!("队列项不可播放，已丢弃: {}", item.keyword);
+                    log::error!(
+                        "队列中的「{}」不可播放（平台无音源），已从队列丢弃并继续下一首",
+                        item.keyword
+                    );
                     self.clear_queue_block_failure(item.id);
                     if item.playlist_auto {
                         playlist_attempted.insert(playlist_attempt_key(&item));
                     }
                 }
                 PlaybackOutcome::QueueBlockingFailure => {
-                    log::error!("队列项播放被阻断，保留在队首: {}", item.keyword);
+                    log::error!(
+                        "队列中的「{}」播放被阻断（非单曲问题），保留在队首等待重试",
+                        item.keyword
+                    );
                     // 连续失败超限的队首不再无限重试：丢弃并继续，避免毒化整条队列。
                     if self.record_queue_block_failure(item.id) {
-                        log::error!("队列项连续失败超限，已跳过: {}", item.keyword);
+                        log::error!(
+                            "队列中的「{}」连续失败次数已达上限，已跳过以免阻塞整条队列",
+                            item.keyword
+                        );
                         port.remove_playback_queue(QueueRemoval::Id(item.id))?;
                         self.clear_queue_block_failure(item.id);
                         // 必须记进 playlist_attempted：否则循环顶部 refill 会拿**新 id**
@@ -1378,7 +1414,7 @@ impl PlaybackApplication {
                     return Ok(None);
                 }
                 PlaybackOutcome::DedupLimited => {
-                    log::info!("队列项近期已播放过，已跳过: {}", item.keyword);
+                    log::info!("队列中的「{}」近期已播放过，同歌去重规则跳过", item.keyword);
                     self.clear_queue_block_failure(item.id);
                     if item.playlist_auto {
                         playlist_attempted.insert(playlist_attempt_key(&item));
@@ -1436,7 +1472,9 @@ impl PlaybackApplication {
         if let Some(track) = next
             && let Err(error) = port.preload_track(&track)
         {
-            log::debug!("预加载下一首音源失败: {error:#}");
+            log::debug!(
+                "预加载下一首音源失败（步骤：提前解析并下载下一首）；不影响当前播放，切歌时会重新解析: {error:#}"
+            );
         }
         Ok(())
     }
@@ -1450,7 +1488,7 @@ impl PlaybackApplication {
         self.note_playback_purpose(purpose);
         let requested = selection.request();
         if purpose.stop_when_user_paused() && port.user_pause_active()? {
-            log::info!("自动出队已跳过: 用户暂停状态在播放前生效");
+            log::debug!("暂不播放：进入播放流程前用户已暂停播放器");
             return Ok(PlaybackCompletion::new(
                 PlaybackResult::error(&requested, &requested, None, "用户暂停"),
                 None,
@@ -1459,13 +1497,8 @@ impl PlaybackApplication {
         }
         if purpose.checks_dedup() && self.selection_dedup_limited(selection, port)? {
             log::info!(
-                "长时间同歌去重拦截: keyword={} uri={}",
-                selection.keyword,
-                selection
-                    .track
-                    .as_ref()
-                    .map(|track| track.track_ref.key.to_string())
-                    .unwrap_or_default()
+                "点歌「{}」未播放：该曲目短时间内已播过，同歌去重规则拦截",
+                selection.keyword
             );
             let mut completion =
                 PlaybackCompletion::new(PlaybackResult::dedup_limited(&requested), None, false);
@@ -1498,7 +1531,10 @@ impl PlaybackApplication {
                     .templated(&playback_templates::NO_SOURCE, ReplyVars::new()));
                 }
                 Err(error) => {
-                    log::error!("点歌搜索失败: {error}");
+                    log::error!(
+                        "点歌搜索失败（步骤：在平台搜索「{}」）；本次点歌未执行，玩家会收到失败提示: {error}",
+                        selection.keyword
+                    );
                     let message = ReplyMessage::new(
                         &playback_templates::SEARCH_FAILED,
                         ReplyVars::new()
@@ -1514,11 +1550,7 @@ impl PlaybackApplication {
                     return Ok(completion);
                 }
             };
-            log::info!(
-                "播放器候选: {} -> {}",
-                picked.text,
-                picked.track.track_ref.key
-            );
+            log::debug!("平台搜索命中：把「{}」解析为可播放音源", picked.text);
             let mut resolved = selection.clone();
             resolved.keyword = picked.text;
             resolved.source = source.to_string();
@@ -1549,7 +1581,7 @@ impl PlaybackApplication {
     ) -> Result<PlaybackCompletion> {
         self.note_playback_purpose(purpose);
         if purpose.stop_when_user_paused() && port.user_pause_active()? {
-            log::info!("自动出队已跳过: 用户暂停状态在播放请求发送前生效");
+            log::debug!("暂不播放：发送播放请求前用户已暂停播放器");
             return Ok(PlaybackCompletion::new(
                 PlaybackResult::error(requested, request, None, "用户暂停"),
                 None,
@@ -1557,7 +1589,7 @@ impl PlaybackApplication {
             ));
         }
         if purpose.stop_when_user_paused() && !port.automatic_queue_advance_allowed()? {
-            log::info!("自动出队已跳过: 配置重载在播放请求发送前生效");
+            log::debug!("暂不播放：发送播放请求前配置重载已生效，等待重载处理完");
             return Ok(PlaybackCompletion::new(
                 PlaybackResult::error(requested, request, None, "配置重载待处理"),
                 None,
@@ -1567,7 +1599,10 @@ impl PlaybackApplication {
         let verification = match port.play_and_verify(request) {
             Ok(verification) => verification,
             Err(error) => {
-                log::warn!("播放候选失败: uri={} error={error:#}", request.uri());
+                log::warn!(
+                    "播放「{}」失败（步骤：向播放后端派发请求）；将按错误类型判断是换源还是直接回报失败: {error:#}",
+                    request.keyword
+                );
                 let item_message = port.item_scoped_playback_error_message(&error);
                 if port.is_track_unavailable_error(&error) || item_message.is_some() {
                     let reason = item_message.map_or_else(
@@ -1604,7 +1639,10 @@ impl PlaybackApplication {
                 } else {
                     message.trim().to_string()
                 };
-                log::error!("播放候选失败: {reply}");
+                log::error!(
+                    "播放「{}」失败（步骤：播放后端报错且不属于可换源的音源问题）；本次点歌未生效: {reply}",
+                    request.keyword
+                );
                 let mut completion = PlaybackCompletion::new(
                     PlaybackResult::error(requested, request, None, reply.clone()),
                     None,
@@ -1672,10 +1710,9 @@ impl PlaybackApplication {
             resolved.source = candidate.track_ref.key.provider.to_string();
             resolved.track = Some(candidate.playable_track());
             log::info!(
-                "自动换源候选: source={} keyword={} uri={}",
-                resolved.source,
+                "原音源不可用，尝试换源播放「{}」：改用平台「{}」",
                 resolved.keyword,
-                resolved.uri()
+                resolved.source
             );
             completion = self.run_request(
                 requested,

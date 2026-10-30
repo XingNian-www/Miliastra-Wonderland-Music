@@ -17,6 +17,35 @@ use crate::features::turtle_soup::{
     QuestionSubmitOutcome, TurtleSoupApplicationPort, TurtleSoupCommandOutcome,
 };
 
+/// 日志里的聊天原文：先脱敏、再折叠空白并截断。
+///
+/// 与 `listener::compact_for_log` 同义。放在这里而不是复用 `listener` 的私有函数，
+/// 是因为 `listener` 是同级模块、其辅助函数未对外暴露；两处逻辑保持一致：
+/// 先 `redacted_chat_text`（歌单导入链接等按整串匹配，截断后再脱敏会漏）。
+fn compact_chat_for_log(text: &str) -> String {
+    let compact = crate::privacy::redacted_chat_text(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.chars().count() > 120 {
+        let mut truncated: String = compact.chars().take(120).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        compact
+    }
+}
+
+/// 日志里的身份角色名：`IdentityRole` 不能直接 `{:?}` 打给维护者看。
+fn identity_role_label(role: crate::features::identity::IdentityRole) -> &'static str {
+    use crate::features::identity::IdentityRole;
+    match role {
+        IdentityRole::Friend => "好友",
+        IdentityRole::Admin => "管理员",
+        IdentityRole::Owner => "主人",
+    }
+}
+
 /// `execute_command` 那条「排队期 permission_required 过期」路径的文案。
 ///
 /// **不另写文案表**：把 `IdentityRole` 映射成对应的 `CommandPermission` 档位，
@@ -99,7 +128,7 @@ impl ApplicationRuntime {
         let Some(owner) = application.take_personal_playlist_mode() else {
             return Ok(());
         };
-        log::info!("{reason}: 已结束个人歌单模式 (owner={owner})");
+        log::info!("{reason}，已结束「{owner}」的个人歌单模式");
         // 原子清理自动项，避免与并发点歌入队产生索引错位而误删用户点歌。
         self.business
             .business
@@ -281,10 +310,12 @@ impl IdiomChainDeferredPort for DeferredIdiomChainPort {
             &template.vars,
         );
         if !rendered.missing.is_empty() {
+            // 与 delivery.rs / workers.rs 同一口径：用 missing_vars_label 渲染变量名，
+            // 并说明玩家可见后果（空串渲染会让这条回复缺一段）。
             log::warn!(
-                "回复模板 {} 缺少变量 {:?}",
+                "回复模板「{}」缺少变量 {}，这些位置已按空串渲染，玩家会看到内容缺一段",
                 template.spec.key,
-                rendered.missing
+                super::delivery::missing_vars_label(&rendered.missing)
             );
         }
         self.enqueue_message(rendered.text)
@@ -439,16 +470,21 @@ impl ApplicationRuntime {
     pub(super) fn execute_command(&mut self, parsed: &RoutedCommand) -> Result<()> {
         // 队列等待期间权限/开关可能变化，执行时再次读取当前策略。
         if self.command_is_disabled(parsed)? {
-            log::info!("命令未执行：当前权限或启用策略拒绝: {}", parsed.raw);
+            log::info!(
+                "命令未执行：当前权限或启用策略拒绝（排队期间策略或全局开关发生变化）「{}」",
+                compact_chat_for_log(&parsed.raw)
+            );
             return Ok(());
         }
         if let Some(required) = parsed.permission_required {
             log::info!(
-                "命令未执行：权限不足（需要 {:?}，authority={:?} role={:?}）text={}",
-                required,
-                parsed.authority,
-                parsed.role,
-                parsed.raw
+                "命令未执行：权限不足，需要{}；该发送者身份为{}「{}」",
+                identity_role_label(required),
+                parsed
+                    .role
+                    .map(identity_role_label)
+                    .unwrap_or("未登记的普通成员"),
+                compact_chat_for_log(&parsed.raw)
             );
             // 走到这里只有一个原因：**路由期**记下的 permission_required 仍是旧值，
             // 而拦截期（listener 的 CommandGate）已按当前配置放行——典型场景是
@@ -532,10 +568,12 @@ impl ApplicationRuntime {
     ) -> Result<()> {
         if !playlist_command_allows_friend(self, parsed) {
             log::info!(
-                "命令未执行：个人歌单仅对好友及以上开放（authority={:?} role={:?}）text={}",
-                parsed.authority,
-                parsed.role,
-                parsed.raw
+                "命令未执行：个人歌单仅对好友及以上开放，该发送者身份为{}「{}」",
+                parsed
+                    .role
+                    .map(identity_role_label)
+                    .unwrap_or("未登记的普通成员"),
+                compact_chat_for_log(&parsed.raw)
             );
             // 文案可被配置中心覆盖；变量留空，渲染时按内置默认文案输出。
             let text = self.render_reply(
@@ -560,8 +598,8 @@ impl ApplicationRuntime {
         // 歌单只属于已登记身份的玩家：没有 UUID 就没有歌单。
         let Some(actor) = self.playlist_owner_key(&parsed.username, parsed.account.as_ref()) else {
             log::info!(
-                "命令未执行：该玩家未在身份映射登记，无个人歌单 text={}",
-                parsed.raw
+                "命令未执行：该玩家未在身份映射登记，因此没有个人歌单「{}」",
+                compact_chat_for_log(&parsed.raw)
             );
             let text = self.render_reply(
                 crate::features::reply_template::REPLY_SONG[0].key,
@@ -727,13 +765,16 @@ impl ApplicationRuntime {
                 .identity
                 .friend_row_names_for_account(&account.game, &account.uid);
             if !names.is_empty() {
-                log::info!("邀请: UID {} 反查到候选名 {:?}", account.uid, names);
+                log::info!(
+                    "邀请流程：UID「{}」反查到 {} 个候选名，将依次尝试搜索好友",
+                    account.uid,
+                    names.len()
+                );
                 request.search_names = names;
             } else {
+                // 不打印真实 UID 与信封主语：两者都是玩家标识（MUST_READ §9）。
                 log::warn!(
-                    "邀请: UID {} 未登记任何昵称，只能尝试用信封主语 {:?} 搜索",
-                    account.uid,
-                    invite.username
+                    "邀请流程：该发起者未在身份映射登记任何昵称（步骤：按 UID 反查好友列表候选名），本次只能退回用信封主语搜索，很可能在好友列表里定位不到人"
                 );
             }
         }
@@ -949,7 +990,16 @@ impl AdministrationApplicationPort for ApplicationRuntime {
         let rendered =
             crate::features::reply_template::render(template, override_text.as_deref(), vars);
         if !rendered.missing.is_empty() {
-            log::warn!("帮助模板 {} 缺少变量 {:?}", template.key, rendered.missing);
+            log::warn!(
+                "帮助模板「{}」缺少变量，这些位置已按空串渲染，玩家会看到帮助少一段：{}",
+                template.key,
+                rendered
+                    .missing
+                    .iter()
+                    .map(|name| format!("「{name}」"))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            );
         }
         let messages = crate::text::split_configured_lines(&rendered.text);
         let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();

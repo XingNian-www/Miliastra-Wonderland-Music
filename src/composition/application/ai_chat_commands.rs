@@ -165,7 +165,7 @@ impl ApplicationRuntime {
                                         .run_ai_chat_command(parsed, &execution.command)
                                         .unwrap_or_else(|error| {
                                             log::warn!(
-                                "AI 工具代执行的命令结果未确认（步骤：执行模型给出的命令后等待回执），本次按「未知」回给模型；命令可能已经生效，玩家再发一次就会重复执行: {error:#}"
+                                "AI 工具代执行的命令结果未确认（步骤：执行模型给出的命令后等待回执），本次按「未知」回给模型；命令可能已经生效，玩家再发一次就会重复执行：{error:#}"
                             );
                                             serde_json::json!({"status":"unknown","reason":"执行异常，不得重试或声称成功"})
                                         });
@@ -188,7 +188,7 @@ impl ApplicationRuntime {
                     Ok(answer) => answer,
                     Err(error) => {
                         log::warn!(
-                            "AI 聊天工具调用失败（步骤：多轮工具循环中调用模型或执行命令），本轮改用「AI 暂不可用」兜底回复，玩家拿不到这次提问的完整回答: {error:#}"
+                            "AI 聊天工具调用失败（步骤：多轮工具循环中调用模型或执行命令），本轮改用「AI 暂不可用」兜底回复，玩家拿不到这次提问的完整回答：{error:#}"
                         );
                         let text = self.render_reply(
                             crate::features::reply_template::AI_CHAT_UNAVAILABLE.key,
@@ -390,7 +390,7 @@ impl ApplicationRuntime {
                     Ok(Ok(())) => log::debug!("玩家「{actor_display}」的事实抽取已完成"),
                     Ok(Err(error)) => {
                         log::warn!(
-                            "AI 回复已发出，但长期记忆更新失败（步骤：抽取并写入记忆事实），下一轮会重新尝试: {error:#}"
+                            "AI 回复已发出，但长期记忆更新失败（步骤：抽取并写入记忆事实），下一轮会重新尝试：{error:#}"
                         )
                     }
                     Err(_) => {
@@ -402,7 +402,7 @@ impl ApplicationRuntime {
             });
         if let Err(error) = spawned {
             log::warn!(
-                "长期记忆的事实抽取线程没能启动（步骤：AI 回复发出后启动后台抽取），本轮记忆不更新，下一轮会重新尝试: {error}"
+                "长期记忆的事实抽取线程没能启动（步骤：AI 回复发出后启动后台抽取），本轮记忆不更新，下一轮会重新尝试：{error}"
             );
         }
     }
@@ -537,7 +537,7 @@ impl ApplicationRuntime {
             }
             Ok(None) => {}
             Err(error) => log::warn!(
-                "个人记忆压缩规划失败（步骤：检查该玩家的记忆是否超预算），本轮不压缩，该玩家记忆继续增长；超预算的原文会一直占着提示词预算，回答质量会逐步下降: {error:#}"
+                "个人记忆压缩规划失败（步骤：检查该玩家的记忆是否超预算），本轮不压缩，该玩家记忆继续增长；超预算的原文会一直占着提示词预算，回答质量会逐步下降：{error:#}"
             ),
         }
         match memory.plan_hall_compression(config.hall_token_budget) {
@@ -549,7 +549,7 @@ impl ApplicationRuntime {
             }
             Ok(None) => {}
             Err(error) => log::warn!(
-                "大厅记忆压缩规划失败（步骤：检查大厅共享记忆是否超预算），本轮不压缩，大厅记忆继续增长；超预算的原文会一直占着提示词预算，回答质量会逐步下降: {error:#}"
+                "大厅记忆压缩规划失败（步骤：检查大厅共享记忆是否超预算），本轮不压缩，大厅记忆继续增长；超预算的原文会一直占着提示词预算，回答质量会逐步下降：{error:#}"
             ),
         }
         if plans.is_empty() {
@@ -586,12 +586,12 @@ impl ApplicationRuntime {
                                     memory.apply_compression(plan, &summary, summary_budget, now_ms)
                                 {
                                     log::warn!(
-                                        "记忆压缩结果写入失败（步骤：把新摘要写回记忆库），本轮摘要丢弃、原文仍保留，下一轮会重新压缩: {error:#}"
+                                        "记忆压缩结果写入失败（步骤：把新摘要写回记忆库），本轮摘要丢弃、原文仍保留，下一轮会重新压缩：{error:#}"
                                     );
                                 }
                             }
                             Err(error) => log::warn!(
-                                "记忆压缩失败（步骤：调用模型生成摘要），原文保留在库里，下一轮会重新尝试: {error:#}"
+                                "记忆压缩失败（步骤：调用模型生成摘要），原文保留在库里，下一轮会重新尝试：{error:#}"
                             ),
                         }
                     }
@@ -606,7 +606,7 @@ impl ApplicationRuntime {
             });
         if let Err(error) = spawned {
             log::warn!(
-                "记忆压缩线程没能启动（步骤：超预算后整理旧记忆），原文仍保留在库里，下一轮会重新规划: {error}"
+                "记忆压缩线程没能启动（步骤：超预算后整理旧记忆），原文仍保留在库里，下一轮会重新规划：{error}"
             );
         }
     }
@@ -804,7 +804,7 @@ fn extract_and_commit_facts(
     // 而模型下一轮读取正是看这个列表。
     for fact in &remove {
         if let Err(error) = memory.delete_fact(actor, fact) {
-            log::debug!("淘汰旧事实失败（跳过）: {error:#}");
+            log::debug!("淘汰旧事实失败（跳过）：{error:#}");
         }
     }
     for fact in facts {

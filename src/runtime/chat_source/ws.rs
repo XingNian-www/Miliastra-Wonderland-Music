@@ -121,7 +121,7 @@ impl ChatSource for WebSocketChatSource {
             Err(error) => {
                 // 读失败视为连接已断：交给上层重连，不要在这里退避。
                 log::warn!(
-                    "外部聊天源读取消息失败，本次连接已断开，等待重新连接；断开期间的外部聊天消息不会被接收: {error}"
+                    "外部聊天源读取消息失败，本次连接已断开，等待重新连接；断开期间的外部聊天消息不会被接收：{error}"
                 );
                 self.connection = None;
                 Err(error)

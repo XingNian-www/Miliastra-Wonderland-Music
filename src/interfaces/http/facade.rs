@@ -1523,7 +1523,7 @@ impl HttpAiPort for ApplicationHttpAiFacade {
                     "玩家「{worker_display}」的记忆重建完成，共整理出 {count} 条事实"
                 ),
                 Err(error) => log::warn!(
-                    "玩家「{worker_display}」的记忆重建失败（步骤：从历史对话抽取事实），本次重建未生效，该玩家记忆保持原样: {error:#}"
+                    "玩家「{worker_display}」的记忆重建失败（步骤：从历史对话抽取事实），本次重建未生效，该玩家记忆保持原样：{error:#}"
                 ),
             })?;
         Ok(serde_json::to_string(&json!({

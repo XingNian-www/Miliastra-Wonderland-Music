@@ -1415,7 +1415,7 @@ impl TurtleSoupService {
             && let Err(error) = self.begin_settlement(reason, delivery)
         {
             log::error!(
-                "海龟汤自动结算失败（步骤：会话到期后生成结算结果）；本局未公布汤底，玩家不会收到结算消息: {error:#}"
+                "海龟汤自动结算失败（步骤：会话到期后生成结算结果）；本局未公布汤底，玩家不会收到结算消息：{error:#}"
             );
         }
     }
@@ -1515,13 +1515,13 @@ impl TurtleSoupService {
             }
             TurtleSoupDeliveryPurpose::SurfaceRepeat => {
                 log::error!(
-                    "海龟汤汤面重发失败，已丢弃该条消息；玩家可能没看到汤面，本局无法正常提问: {}",
+                    "海龟汤汤面重发失败，已丢弃该条消息；玩家可能没看到汤面，本局无法正常提问：{}",
                     summary
                 );
             }
             TurtleSoupDeliveryPurpose::Judgment => {
                 log::error!(
-                    "海龟汤裁决回复发送失败，已丢弃该条消息；提问的玩家不会收到判定结果: {}",
+                    "海龟汤裁决回复发送失败，已丢弃该条消息；提问的玩家不会收到判定结果：{}",
                     summary
                 );
             }
@@ -2043,7 +2043,7 @@ impl TurtleSoupService {
         );
         if let Some(error) = &log_error {
             log::warn!(
-                "「{}」的海龟汤提问 AI 裁决出错（排队号 {}），本次按错误结果回复玩家: {}",
+                "「{}」的海龟汤提问 AI 裁决出错（排队号 {}），本次按错误结果回复玩家：{}",
                 normalize_log_text(&job.player),
                 job.request_id,
                 normalize_log_text(error)
@@ -2124,7 +2124,7 @@ impl TurtleSoupService {
                 }
                 Ok(TurtleSoupDeliveryOutcome::Added) => {}
                 Err(error) => log::error!(
-                    "海龟汤裁决回复入队失败（步骤：把判定结果交给延迟聊天队列）；提问的玩家不会收到判定结果: {error:#}"
+                    "海龟汤裁决回复入队失败（步骤：把判定结果交给延迟聊天队列）；提问的玩家不会收到判定结果：{error:#}"
                 ),
             }
         }

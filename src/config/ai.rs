@@ -599,7 +599,7 @@ fn request_with_format(
                 return Err(error);
             }
             log::warn!(
-                "模型「{}」不接受当前思考强度「{}」（步骤：首次请求），已去掉该字段自动重试一次；若重试仍失败则本次调用失败: {error}",
+                "模型「{}」不接受当前思考强度「{}」（步骤：首次请求），已去掉该字段自动重试一次；若重试仍失败则本次调用失败：{error}",
                 target.model,
                 reasoning.as_wire_value().unwrap_or("未设置")
             );

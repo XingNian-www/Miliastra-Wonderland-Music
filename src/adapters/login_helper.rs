@@ -272,7 +272,7 @@ fn prepare_kugou_device(
 ) -> io::Result<KugouDeviceIdentity> {
     if let Err(error) = sync_kugou_device_file(config, directory) {
         log::warn!(
-            "写入酷狗设备信息失败（步骤：保存设备标识文件），本次沿用已有文件继续登录，设备标识可能与新配置不一致: {error}"
+            "写入酷狗设备信息失败（步骤：保存设备标识文件），本次沿用已有文件继续登录，设备标识可能与新配置不一致：{error}"
         );
     }
     load_kugou_device(directory)

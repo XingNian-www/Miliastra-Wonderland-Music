@@ -256,13 +256,13 @@ impl Drop for BusinessRuntimeGroupBuilder {
 
 fn cleanup_failed_attach(timer: TimerRuntime<BusinessDeadlineToken>, business: BusinessRuntime) {
     if let Err(error) = business.prepare_shutdown() {
-        log::error!("业务期限 bridge 启动失败后的业务静默关闭失败: {error}");
+        log::error!("业务期限 bridge 启动失败后的业务静默关闭失败：{error}");
     }
     if let Err(error) = business.shutdown() {
-        log::error!("业务期限 bridge 启动失败后的业务运行时关闭失败: {error}");
+        log::error!("业务期限 bridge 启动失败后的业务运行时关闭失败：{error}");
     }
     if let Err(error) = timer.shutdown() {
-        log::error!("业务期限 bridge 启动失败后的计时运行时关闭失败: {error}");
+        log::error!("业务期限 bridge 启动失败后的计时运行时关闭失败：{error}");
     }
 }
 

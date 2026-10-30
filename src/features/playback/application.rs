@@ -352,6 +352,18 @@ impl PlaybackCompletion {
 pub(crate) trait PlaybackExecutionPort {
     fn reply(&mut self, message: &str) -> Result<()>;
 
+    /// 把**内部归属键**翻译成面向玩家的展示名。
+    ///
+    /// 歌单归属键是 `id:<uuid>` 形态（见 `playlist::owner_key`），它是内部标识，
+    /// **绝不能直接渲染给玩家**——玩家会看到「[id:00000000-…的歌单] 播放中」。
+    ///
+    /// 翻译需要身份映射（配置层对象），而 features 层不能反向依赖配置，
+    /// 所以由实现方（composition 层）覆写这个方法完成解析；
+    /// 默认实现原样返回，保证不接身份的调用方（测试替身）行为不变。
+    fn playlist_owner_display(&self, owner: &str) -> String {
+        owner.to_string()
+    }
+
     /// 渲染一条模板，返回成品文案（不发送）。
     ///
     /// 业务层只声明"用哪条模板、带哪些变量"，**不知道配置存在**；
@@ -918,8 +930,11 @@ impl PlaybackApplication {
                 let status = port.player_status()?;
                 port.log_executed(context, "status")?;
                 // 只对确实来自个人歌单自动队列的当前曲目标注归属；大厅点歌/窗口选曲保留点歌人。
+                // 归属键是 `id:<uuid>` 内部形态，必须先翻成展示名再渲染：
+                // 否则玩家会看到「[id:00000000-…的歌单] 播放中」。
                 let playlist_owner = if self.current_is_playlist_auto() {
                     self.personal_playlist_owner()
+                        .map(|owner| port.playlist_owner_display(&owner))
                 } else {
                     None
                 };
@@ -1083,7 +1098,7 @@ impl PlaybackApplication {
                 }
                 Err(error) => {
                     log::warn!(
-                        "持续歌词推送时读取播放器状态失败（步骤：每轮歌词刷新）；本轮跳过，下一轮继续: {error:#}"
+                        "持续歌词推送时读取播放器状态失败（步骤：每轮歌词刷新）；本轮跳过，下一轮继续：{error:#}"
                     );
                 }
             }
@@ -1127,7 +1142,7 @@ impl PlaybackApplication {
                     }
                     Err(error) => {
                         log::error!(
-                            "播放监控查询播放器状态失败（步骤：定期校准播放进度）；本轮不校准，下次轮询重试，期间进度显示可能滞后: {error:#}"
+                            "播放监控查询播放器状态失败（步骤：定期校准播放进度）；本轮不校准，下次轮询重试，期间进度显示可能滞后：{error:#}"
                         );
                         snapshot = None;
                         next_status_at = now + Duration::from_millis(status_ms);
@@ -1147,7 +1162,7 @@ impl PlaybackApplication {
                     Ok(false) => {}
                     Err(error) => {
                         log::error!(
-                            "播放监控处理本轮观测失败（步骤：解析播放状态并决定是否推进队列）；本轮不推进，下次轮询重试: {error:#}"
+                            "播放监控处理本轮观测失败（步骤：解析播放状态并决定是否推进队列）；本轮不推进，下次轮询重试：{error:#}"
                         );
                         next_status_at = port.now() + Duration::from_millis(status_ms);
                     }
@@ -1439,10 +1454,12 @@ impl PlaybackApplication {
         Ok(result)
     }
 
-    /// 直接播放一首已收藏的结构化曲目（个人歌单 @歌单随机 使用）。
+    /// 直接播放一首已收藏的结构化曲目（个人歌单窗口里 `@1`~`@5` 选中后使用）。
     ///
     /// 与点歌确认走同一条 play_confirmed 路径，因此同样计入播放池与后续预加载。
-    #[allow(dead_code)]
+    ///
+    /// 注意：`@歌单随机` 不走这里——它把抽到的曲子**加入队列**（`enqueue_next`），
+    /// 不打断当前播放。此前注释写成「@歌单随机 使用」是错的。
     pub(crate) fn play_structured_track<P: PlaybackExecutionPort + ?Sized>(
         &self,
         track: &PlayableTrack,
@@ -1473,7 +1490,7 @@ impl PlaybackApplication {
             && let Err(error) = port.preload_track(&track)
         {
             log::debug!(
-                "预加载下一首音源失败（步骤：提前解析并下载下一首）；不影响当前播放，切歌时会重新解析: {error:#}"
+                "预加载下一首音源失败（步骤：提前解析并下载下一首）；不影响当前播放，切歌时会重新解析：{error:#}"
             );
         }
         Ok(())
@@ -1532,7 +1549,7 @@ impl PlaybackApplication {
                 }
                 Err(error) => {
                     log::error!(
-                        "点歌搜索失败（步骤：在平台搜索「{}」）；本次点歌未执行，玩家会收到失败提示: {error}",
+                        "点歌搜索失败（步骤：在平台搜索「{}」）；本次点歌未执行，玩家会收到失败提示：{error}",
                         selection.keyword
                     );
                     let message = ReplyMessage::new(
@@ -1600,7 +1617,7 @@ impl PlaybackApplication {
             Ok(verification) => verification,
             Err(error) => {
                 log::warn!(
-                    "播放「{}」失败（步骤：向播放后端派发请求）；将按错误类型判断是换源还是直接回报失败: {error:#}",
+                    "播放「{}」失败（步骤：向播放后端派发请求）；将按错误类型判断是换源还是直接回报失败：{error:#}",
                     request.keyword
                 );
                 let item_message = port.item_scoped_playback_error_message(&error);
@@ -1640,7 +1657,7 @@ impl PlaybackApplication {
                     message.trim().to_string()
                 };
                 log::error!(
-                    "播放「{}」失败（步骤：播放后端报错且不属于可换源的音源问题）；本次点歌未生效: {reply}",
+                    "播放「{}」失败（步骤：播放后端报错且不属于可换源的音源问题）；本次点歌未生效：{reply}",
                     request.keyword
                 );
                 let mut completion = PlaybackCompletion::new(

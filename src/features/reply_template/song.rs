@@ -76,8 +76,11 @@ pub(crate) const SONG: &[ReplyTemplate] = &[
     },
     ReplyTemplate {
         key: "song.queue.added",
-        default: "{前缀}({当前}/{上限}): {歌名}",
-        summary: "入队成功及队列占用",
+        // {序号} = 这首在队列中的位置；{当前} 仍是队列总数（历史语义不变），
+        // {上限} 仍是容量上限。只新增 {序号}，旧模板里的 {当前}/{上限} 照旧渲染，
+        // 不会因为缺变量变成空串。
+        default: "{前缀}(第{序号}首，共{当前}/{上限}): {歌名}",
+        summary: "入队成功、队列位置与占用",
         group: "点歌",
     },
     ReplyTemplate {

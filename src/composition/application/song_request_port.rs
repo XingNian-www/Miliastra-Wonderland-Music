@@ -145,7 +145,7 @@ impl SongRequestPort for ApplicationRuntime {
             Ok(tracks) => tracks,
             Err(error) => {
                 log::warn!(
-                    "读取 AI 点歌的曲库播放池失败（步骤：汇总本地曲库候选），本次本地推荐少掉播放池这一路，只剩引擎缓存里的记录；本地推荐命中率下降，AI 点歌会更多退回平台搜索: {error}"
+                    "读取 AI 点歌的曲库播放池失败（步骤：汇总本地曲库候选），本次本地推荐少掉播放池这一路，只剩引擎缓存里的记录；本地推荐命中率下降，AI 点歌会更多退回平台搜索：{error}"
                 );
                 Vec::new()
             }
@@ -157,7 +157,7 @@ impl SongRequestPort for ApplicationRuntime {
                     .map(|candidate| candidate.playable_track()),
             ),
             Err(error) => log::warn!(
-                "读取 AI 点歌的引擎曲库缓存失败（步骤：汇总本地曲库候选），本次本地推荐只剩播放池这一路，没有缓存记录可用；本地推荐命中率下降，AI 点歌会更多退回平台搜索: {error}"
+                "读取 AI 点歌的引擎曲库缓存失败（步骤：汇总本地曲库候选），本次本地推荐只剩播放池这一路，没有缓存记录可用；本地推荐命中率下降，AI 点歌会更多退回平台搜索：{error}"
             ),
         }
         Ok(miliastra_playback::search_library_tracks(&query, tracks))

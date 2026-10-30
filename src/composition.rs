@@ -33,14 +33,14 @@ pub(crate) fn run(config_path: &Path) -> Result<RunOutcome> {
     let log_paths = logging::init_file(&logging_config).with_context(|| "初始化日志失败")?;
     let store = ConfigStore::open(&bootstrap.database_path, executable_root, bootstrap.clone())
         .map_err(|error| {
-            log::error!("打开统一配置数据库失败: {error:#}");
+            log::error!("打开统一配置数据库失败：{error:#}");
             error.context(format!(
                 "打开统一配置数据库失败: {}",
                 bootstrap.database_path.display()
             ))
         })?;
     let app_config = store.load_full().map_err(|error| {
-        log::error!("从统一配置数据库加载完整配置失败: {error:#}");
+        log::error!("从统一配置数据库加载完整配置失败：{error:#}");
         error.context("从统一配置数据库加载完整配置失败")
     })?;
     let config = ResolvedApplicationConfig::resolve(app_config)?;
@@ -50,7 +50,7 @@ pub(crate) fn run(config_path: &Path) -> Result<RunOutcome> {
         match TuiHandle::start(&app_config.tui, monitor.clone()) {
             Ok(handle) => Some(handle),
             Err(error) => {
-                log::warn!("TUI 启动失败，回退普通日志输出: {error:#}");
+                log::warn!("TUI 启动失败，回退普通日志输出：{error:#}");
                 None
             }
         }
@@ -64,9 +64,9 @@ pub(crate) fn run(config_path: &Path) -> Result<RunOutcome> {
     // TUI 全屏时关闭 stderr（避免终端界面被日志输出干扰），未启用时保持开启。
     logging::attach_sink(monitor.log_sink());
     logging::set_stderr(tui_handle.is_none());
-    log::info!("日志文件: {}", log_paths.main.display());
-    log::info!("性能日志文件: {}", log_paths.timing.display());
-    log::info!("配置文件: {}", config_path.display());
+    log::info!("日志文件：{}", log_paths.main.display());
+    log::info!("性能日志文件：{}", log_paths.timing.display());
+    log::info!("配置文件：{}", config_path.display());
     log::info!(
         "HTTP/Web 面板监听 {}:{}，面板{}",
         app_config.http.host,

@@ -41,7 +41,7 @@ mod imp {
                     if let Err(error) =
                         PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
                     {
-                        log::warn!("发送热键线程退出消息失败: {error}");
+                        log::warn!("发送热键线程退出消息失败：{error}");
                     }
                 }
             }
@@ -133,7 +133,7 @@ mod imp {
                 }
                 Err(error) => {
                     log::error!(
-                        "热键注册失败（步骤：后台线程尝试注册全局热键），本次热键不会生效，需要重启程序后重试: {error}"
+                        "热键注册失败（步骤：后台线程尝试注册全局热键），本次热键不会生效，需要重启程序后重试：{error}"
                     );
                     let _ = ready.send(Err(error));
                     return;

@@ -189,6 +189,26 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
             .playlist_mode_owner()
     }
 
+    /// 归属键 `id:<uuid>` 是内部标识，翻译成展示名后才能给玩家看。
+    fn playlist_owner_display(&self, owner: &str) -> String {
+        // `display_name_for_key` 内部走 `Uuid::parse_str`，带 `id:` 前缀会解析失败，
+        // 必须先剥掉前缀。
+        let key = owner
+            .strip_prefix(crate::features::playlist::owner_key::IDENTITY)
+            .unwrap_or(owner);
+        let display = self
+            .runtime
+            .lifecycle
+            .live_configs
+            .identity
+            .display_name_for_key(key);
+        if display.trim().is_empty() {
+            owner.to_string()
+        } else {
+            display
+        }
+    }
+
     fn extend_playlist_tracks(
         &mut self,
         owner: &str,
@@ -545,9 +565,13 @@ impl ApplicationRuntime {
                 0,
             );
         }
+        // 内部键负责「按谁记账」，展示名负责「给玩家看什么名字」——两者分开传，
+        // 否则已登记身份的 UUID 会被当作玩家名渲染进塔罗标题。
         let actor = self.canonical_actor_name(&parsed.username);
-        let messages = self.business.tarot_application.execute(
+        let actor_display = self.mapped_actor_name(&parsed.username);
+        let messages = self.business.tarot_application.execute_with_display(
             &actor,
+            &actor_display,
             command,
             Instant::now(),
             &self.business.ai,
@@ -691,10 +715,14 @@ impl ApplicationRuntime {
         command: &LandlordCommand,
     ) -> Result<()> {
         let observed_at = command_observed_at(parsed);
+        // 内部键负责「谁在操作」，展示名负责「文案里写谁」——分开传，
+        // 否则已登记身份的 UUID 会被渲染进「{玩家} 抢地主」这类文案。
         let player = self.canonical_actor_name(&parsed.username);
+        let player_display = self.mapped_actor_name(&parsed.username);
         match card_game_effect_lane(command) {
-            CardGameEffectLane::Formal => self.business.card_games.execute_command(
+            CardGameEffectLane::Formal => self.business.card_games.execute_command_with_display(
                 &player,
+                &player_display,
                 command,
                 observed_at,
                 CardGameEffectLane::Formal,
@@ -704,8 +732,9 @@ impl ApplicationRuntime {
                 let port = DeferredCardGamePort {
                     task_engine: self.business.task_engine.clone(),
                 };
-                self.business.card_games.execute_command(
+                self.business.card_games.execute_command_with_display(
                     &player,
+                    &player_display,
                     command,
                     observed_at,
                     CardGameEffectLane::Deferred,
@@ -873,7 +902,7 @@ fn card_game_effect_lane(command: &LandlordCommand) -> CardGameEffectLane {
 fn configure_idle_exit(business: &BusinessRuntimeHandle, minutes: u32) -> Result<()> {
     business.configure_idle_exit(Duration::from_secs(u64::from(minutes) * 60), Instant::now())?;
     log::info!(
-        "已设置闲置退出: {}分钟无新命令后暂停播放器、关闭目标游戏进程，软件主进程和播放器运行时继续运行",
+        "已设置闲置退出：{}分钟无新命令后暂停播放器、关闭目标游戏进程，软件主进程和播放器运行时继续运行",
         minutes
     );
     Ok(())
@@ -1142,7 +1171,7 @@ fn detect_public_hall(hall_ui: &HallUi) -> Result<Option<HallObservation>> {
             info.clone()
         }
         DetectPublicHallEffect::Failed(failure) => {
-            log::error!("大厅检测 OCR 失败，按非公共大厅处理: {failure}");
+            log::error!("大厅检测 OCR 失败，按非公共大厅处理：{failure}");
             return Ok(None);
         }
     };

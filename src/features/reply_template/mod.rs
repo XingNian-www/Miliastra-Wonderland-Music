@@ -738,7 +738,7 @@ pub(crate) const HELP_SONG_REQUEST: ReplyTemplate = ReplyTemplate {
 /// 大厅帮助（歌单类）。
 pub(crate) const HELP_PLAYLIST: ReplyTemplate = ReplyTemplate {
     key: "help.playlist",
-    default: "歌单: @歌单 推荐5首歌; @随机歌单/@歌单随机 随机推荐\n收藏: @收藏 收藏当前歌曲; @取消收藏\n模式: @歌单模式/@播放歌单 进入歌单模式; @退出歌单模式/@大厅模式 退出歌单模式\n导入: @导入QQ歌单<数字ID>; @导入网易歌单<数字ID>; @歌单清空",
+    default: "歌单: @歌单 推荐5首歌; @随机歌单/@歌单随机 随机加入队列\n收藏: @收藏 收藏当前歌曲; @取消收藏\n模式: @歌单模式/@播放歌单 进入歌单模式; @退出歌单模式/@大厅模式 退出歌单模式\n导入: @导入QQ歌单<数字ID>; @导入网易歌单<数字ID>; @歌单清空",
     summary: "大厅帮助（歌单）",
     group: "歌单",
 };

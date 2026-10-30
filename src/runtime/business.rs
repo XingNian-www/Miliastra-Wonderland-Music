@@ -653,6 +653,9 @@ type ActiveTurtleSoupDeadline = ActiveDeadline;
 enum CardGameRuntimeMessage {
     Begin {
         player: String,
+        // 面向玩家的展示名。`player` 是身份键（已登记身份为 UUID），
+        // 只参与比较；展示名只参与渲染。两者必须分开，否则 UUID 会进文案。
+        player_display: String,
         command: LandlordCommand,
         now: Instant,
         response: SyncSender<Result<CardGameCommandStart, BusinessRuntimeError>>,
@@ -808,7 +811,7 @@ impl DecisionSession {
     /// 避免并发 submit 在窗口退出前抢到「假成功」。
     pub(crate) fn close(&self) {
         if let Err(error) = self.handle.finish_decision(self.id) {
-            log::debug!("Web 决策未能正常关闭，窗口可能延后释放: {error}");
+            log::debug!("Web 决策未能正常关闭，窗口可能延后释放：{error}");
         }
     }
 }
@@ -816,19 +819,20 @@ impl DecisionSession {
 impl Drop for DecisionSession {
     fn drop(&mut self) {
         if let Err(error) = self.handle.finish_decision(self.id) {
-            log::debug!("Web 决策未能正常结束，窗口可能延后释放: {error}");
+            log::debug!("Web 决策未能正常结束，窗口可能延后释放：{error}");
         }
     }
 }
 
 impl CardGameRuntimePort for BusinessRuntimeHandle {
-    fn begin(
+    fn begin_with_display(
         &self,
         player: &str,
+        player_display: &str,
         command: &LandlordCommand,
         now: Instant,
     ) -> anyhow::Result<CardGameCommandStart> {
-        Ok(self.begin_card_game(player, command, now)?)
+        Ok(self.begin_card_game_with_display(player, player_display, command, now)?)
     }
 
     fn claim(&self, key: CardGameEffectKey) -> anyhow::Result<CardGameEffectClaim> {
@@ -1677,9 +1681,22 @@ impl BusinessRuntimeHandle {
         command: &LandlordCommand,
         now: Instant,
     ) -> Result<CardGameCommandStart, BusinessRuntimeError> {
+        // 兼容入口：展示名与身份键相同（测试与未登记玩家）。
+        self.begin_card_game_with_display(player, player, command, now)
+    }
+
+    /// 展示名与内部键分开的入口；生产路径走这条。
+    pub fn begin_card_game_with_display(
+        &self,
+        player: &str,
+        player_display: &str,
+        command: &LandlordCommand,
+        now: Instant,
+    ) -> Result<CardGameCommandStart, BusinessRuntimeError> {
         self.request(|response| {
             RuntimeMessage::CardGame(CardGameRuntimeMessage::Begin {
                 player: player.to_string(),
+                player_display: player_display.to_string(),
                 command: command.clone(),
                 now,
                 response,
@@ -2121,7 +2138,7 @@ impl TurtleSoupAiCompletionPort for TurtleSoupBusinessEventPort {
             .sink
             .submit(BusinessEvent::TurtleSoupAiCompleted(completion))
         {
-            log::debug!("业务运行时已停止，本次海龟汤 AI 裁决结果被丢弃，不影响已结束的对局: {error}");
+            log::debug!("业务运行时已停止，本次海龟汤 AI 裁决结果被丢弃，不影响已结束的对局：{error}");
         }
     }
 }
@@ -3285,7 +3302,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         clock.as_ref(),
                     ) {
                         log::error!(
-                    "业务运行时处理计时事件失败（步骤：分发计时到期事件），该次定时动作未执行，玩法状态可能停在等待中: {error}"
+                    "业务运行时处理计时事件失败（步骤：分发计时到期事件），该次定时动作未执行，玩法状态可能停在等待中：{error}"
                 );
                     }
                 }
@@ -3297,7 +3314,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         clock.as_ref(),
                     ) {
                         log::error!(
-                    "海龟汤 AI 裁决已应用，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时: {error}"
+                    "海龟汤 AI 裁决已应用，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时：{error}"
                 );
                     }
                 }
@@ -3342,7 +3359,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     entertainment.handle_card_game(message, timer.as_ref(), clock.as_ref())
                 {
                     log::error!(
-                    "业务运行时处理牌局消息失败（步骤：分发牌局消息），该条消息对应的牌局动作未执行: {error}"
+                    "业务运行时处理牌局消息失败（步骤：分发牌局消息），该条消息对应的牌局动作未执行：{error}"
                 );
                 }
             }
@@ -3351,7 +3368,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     entertainment.handle_undercover(message, timer.as_ref(), clock.as_ref())
                 {
                     log::error!(
-                    "业务运行时处理谁是卧底消息失败（步骤：分发卧底消息），该条消息对应的动作未执行: {error}"
+                    "业务运行时处理谁是卧底消息失败（步骤：分发卧底消息），该条消息对应的动作未执行：{error}"
                 );
                 }
             }
@@ -3366,7 +3383,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     clock.as_ref(),
                 ) {
                     log::error!(
-                    "业务运行时处理海龟汤消息失败（步骤：分发海龟汤消息），该条消息对应的动作未执行: {error}"
+                    "业务运行时处理海龟汤消息失败（步骤：分发海龟汤消息），该条消息对应的动作未执行：{error}"
                 );
                 }
             }
@@ -3434,7 +3451,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("unknown panic");
             log::error!(
-                "业务运行时处理消息时崩溃（步骤：分发一条聊天消息），该条消息已跳过且不会重试，后续消息继续处理: {detail}"
+                "业务运行时处理消息时崩溃（步骤：分发一条聊天消息），该条消息已跳过且不会重试，后续消息继续处理：{detail}"
             );
         }
         entertainment.publish(clock.as_ref());
@@ -3480,12 +3497,12 @@ fn abort_business_modules(
 ) {
     if let Err(error) = card_games.abort(entertainment) {
         log::error!(
-            "业务运行时关闭时无法中止牌局（步骤：结束牌局），牌局租约可能残留到下次启动: {error:#}"
+            "业务运行时关闭时无法中止牌局（步骤：结束牌局），牌局租约可能残留到下次启动：{error:#}"
         );
     }
     if let Err(error) = idiom_chain.abort(entertainment) {
         log::error!(
-            "业务运行时关闭时无法中止成语接龙（步骤：结束接龙），接龙租约可能残留到下次启动: {error:#}"
+            "业务运行时关闭时无法中止成语接龙（步骤：结束接龙），接龙租约可能残留到下次启动：{error:#}"
         );
     }
     let _ = undercover.abort(entertainment);
@@ -3500,7 +3517,7 @@ fn abort_business_modules(
         session_generation,
     ) {
         log::error!(
-            "业务运行时关闭时无法撤销成语接龙期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发: {error}"
+            "业务运行时关闭时无法撤销成语接龙期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发：{error}"
         );
     }
     if let Err(error) = sync_card_game_deadline(
@@ -3513,7 +3530,7 @@ fn abort_business_modules(
         clock_active,
     ) {
         log::error!(
-            "业务运行时关闭时无法撤销牌局期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发: {error}"
+            "业务运行时关闭时无法撤销牌局期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发：{error}"
         );
     }
     if let Err(error) = sync_undercover_deadline(
@@ -3526,7 +3543,7 @@ fn abort_business_modules(
         clock_active,
     ) {
         log::error!(
-            "业务运行时关闭时无法撤销谁是卧底期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发: {error}"
+            "业务运行时关闭时无法撤销谁是卧底期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发：{error}"
         );
     }
     if let Err(error) = sync_turtle_soup_deadline(
@@ -3539,7 +3556,7 @@ fn abort_business_modules(
         clock_active,
     ) {
         log::error!(
-            "业务运行时关闭时无法撤销海龟汤期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发: {error}"
+            "业务运行时关闭时无法撤销海龟汤期限（步骤：注销定时器），该定时器可能在新一轮启动时误触发：{error}"
         );
     }
     pending_card_game_outcomes.clear();
@@ -3565,12 +3582,19 @@ fn handle_card_game_message(
     match message {
         CardGameRuntimeMessage::Begin {
             player,
+            player_display,
             command,
             now,
             response,
         } => {
             let result = card_games
-                .begin_command(entertainment, &player, &command, now)
+                .begin_command_with_display(
+                    entertainment,
+                    &player,
+                    &player_display,
+                    &command,
+                    now,
+                )
                 .map_err(card_game_operation_failed)
                 .and_then(|result| {
                     sync_card_game_deadline(
@@ -3791,7 +3815,7 @@ fn handle_turtle_soup_message(
                 clock_active,
             ) {
                 log::error!(
-                    "海龟汤大厅命令已处理，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时: {error}"
+                    "海龟汤大厅命令已处理，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时：{error}"
                 );
             }
             let _ = response.send(outcome);
@@ -3813,7 +3837,7 @@ fn handle_turtle_soup_message(
                 clock_active,
             ) {
                 log::error!(
-                    "海龟汤好友命令已处理，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时: {error}"
+                    "海龟汤好友命令已处理，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时：{error}"
                 );
             }
             let _ = response.send(outcome);

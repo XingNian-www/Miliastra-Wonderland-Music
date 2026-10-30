@@ -162,10 +162,10 @@ pub(crate) const MODE_ALREADY_HALL: ReplyTemplate = spec(
     "已在大厅模式",
 );
 
-/// 随机推荐。
-pub(crate) const RANDOM_PICKED: ReplyTemplate = spec(
-    "playlist.random.picked",
-    "为你随机推荐: {歌名} (收藏夹共{数量}首)",
+/// 随机推荐并加入队列。
+pub(crate) const RANDOM_QUEUED: ReplyTemplate = spec(
+    "playlist.random.queued",
+    "为你随机推荐: {歌名} - {歌手} (收藏夹共{数量}首)\n已加入队列,当前曲目播完后播放.",
     "随机推荐一首",
 );
 
@@ -288,7 +288,7 @@ pub(crate) const PLAYLIST: &[ReplyTemplate] = &[
     PLAY_OCCUPIED,
     MODE_EXITED,
     MODE_ALREADY_HALL,
-    RANDOM_PICKED,
+    RANDOM_QUEUED,
     IMPORT_PENDING,
     IMPORT_BUSY,
     IMPORT_LOADING,

@@ -198,6 +198,18 @@ pub trait CardGameRuntimePort: Send + Sync {
         player: &str,
         command: &LandlordCommand,
         now: Instant,
+    ) -> Result<CardGameCommandStart> {
+        // 未区分展示名时两者相同：保留既有签名给测试替身。
+        self.begin_with_display(player, player, command, now)
+    }
+
+    /// `player` 是身份键，`player_display` 是给玩家看的名字。
+    fn begin_with_display(
+        &self,
+        player: &str,
+        player_display: &str,
+        command: &LandlordCommand,
+        now: Instant,
     ) -> Result<CardGameCommandStart>;
 
     fn claim(&self, key: CardGameEffectKey) -> Result<CardGameEffectClaim>;
@@ -229,6 +241,10 @@ impl CardGameApplication {
         Self { runtime }
     }
 
+    /// 执行牌类命令。
+    ///
+    /// `player` 是身份键（参与加入/查找/比较），`player_display` 是给玩家看的名字。
+    /// 已登记身份的 `player` 是 UUID，直接渲染会让玩家看到一长串十六进制。
     pub fn execute_command(
         &self,
         player: &str,
@@ -237,7 +253,23 @@ impl CardGameApplication {
         lane: CardGameEffectLane,
         delivery: &dyn CardGameDeliveryPort,
     ) -> Result<()> {
-        let start = self.runtime.begin(player, command, now)?;
+        // 兼容入口：展示名与身份键相同（测试与未登记玩家）。
+        self.execute_command_with_display(player, player, command, now, lane, delivery)
+    }
+
+    /// 展示名与内部键分开的入口；生产路径走这条。
+    pub fn execute_command_with_display(
+        &self,
+        player: &str,
+        player_display: &str,
+        command: &LandlordCommand,
+        now: Instant,
+        lane: CardGameEffectLane,
+        delivery: &dyn CardGameDeliveryPort,
+    ) -> Result<()> {
+        let start = self
+            .runtime
+            .begin_with_display(player, player_display, command, now)?;
         self.drive_start(start, lane, delivery)
     }
 
@@ -522,10 +554,23 @@ impl CardGameService {
         }
     }
 
+    /// 兼容入口：展示名与身份键相同（测试与未登记玩家走这条）。
     pub fn begin_command(
         &mut self,
         entertainment: &mut EntertainmentState,
         player: &str,
+        command: &LandlordCommand,
+        now: Instant,
+    ) -> Result<CardGameCommandStart> {
+        self.begin_command_with_display(entertainment, player, player, command, now)
+    }
+
+    /// `player` 是身份键，`player_display` 是给玩家看的名字。
+    pub fn begin_command_with_display(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        player: &str,
+        player_display: &str,
         command: &LandlordCommand,
         now: Instant,
     ) -> Result<CardGameCommandStart> {
@@ -588,7 +633,12 @@ impl CardGameService {
                         Self::release_active_card_game(entertainment);
                         return Err(error);
                     }
-                    let outcome = self.state.game.handle(player, command, now);
+                    let outcome = self.state.game.handle_with_display(
+                        player,
+                        player_display,
+                        command,
+                        now,
+                    );
                     let action = outcome.action;
                     let Some(message) = outcome.private_reply else {
                         return Ok(CardGameCommandStart::Completed(CardGameCompletion {
@@ -619,7 +669,14 @@ impl CardGameService {
                     } else {
                         CardGameEffectLane::Deferred
                     };
-                    self.begin_game_outcome_in_state(entertainment, player, command, now, lane)?
+                    self.begin_game_outcome_in_state_with_display(
+                        entertainment,
+                        player,
+                        player_display,
+                        command,
+                        now,
+                        lane,
+                    )?
                 }
             }
         };
@@ -775,6 +832,26 @@ impl CardGameService {
         now: Instant,
         lane: CardGameEffectLane,
     ) -> Result<(CardGameCommandStart, bool)> {
+        self.begin_game_outcome_in_state_with_display(
+            entertainment,
+            player,
+            player,
+            command,
+            now,
+            lane,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_game_outcome_in_state_with_display(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        player: &str,
+        player_display: &str,
+        command: &LandlordCommand,
+        now: Instant,
+        lane: CardGameEffectLane,
+    ) -> Result<(CardGameCommandStart, bool)> {
         let outcome = if command.reports_entertainment_conflict()
             && let Some(active) = entertainment.active()
             && !is_card_game_kind(active)
@@ -789,7 +866,9 @@ impl CardGameService {
                 Self::release_active_card_game(entertainment);
                 return Err(error);
             }
-            self.state.game.handle(player, command, now)
+            self.state
+                .game
+                .handle_with_display(player, player_display, command, now)
         };
         if outcome.ended {
             advance_session_generation(&mut self.state)?;

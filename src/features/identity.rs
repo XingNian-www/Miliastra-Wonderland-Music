@@ -582,6 +582,27 @@ impl IdentityAccess {
             .unwrap_or_else(|| self.display_name_for(nickname))
     }
 
+    /// **归属专用**：按 nickname 或 note 解析出身份 UUID。
+    ///
+    /// 这是给「歌单归属、记忆、队列」这类**归属**用途准备的入口。
+    ///
+    /// # 为什么单独开一个方法，而不是让 `resolve_hint` 支持 note 兜底
+    ///
+    /// `resolve_hint` 是**授权**路径（`router.rs` 的 `role_for_envelope`、
+    /// `listener` 的 `role_of_sender` 都走它）。note 是游戏真名，任何人都能把
+    /// 自己的昵称改成一样来冒充；一旦让 `resolve_hint` 回退查 note，
+    /// 「改名冒充管理员」的漏洞就回来了——`moderation` 的防冒充测试会立刻变红。
+    ///
+    /// 所以这里**只返回 UUID，不返回 role**：归属用途不需要角色，
+    /// 拿不到角色也就不可能被误用成授权判据。
+    pub fn ownership_uuid_by_name(&self, name: &str) -> Option<Uuid> {
+        // 先按 nickname（OCR 匹配键，不可被对方随意改）再按 note（游戏真名）。
+        // 顺序不能反：note 可被冒充，优先级必须低于 nickname。
+        self.resolve(name)
+            .or_else(|| self.resolve_by_note(name))
+            .map(|identity| identity.id)
+    }
+
     /// 记忆键对应的展示名（BOT 称呼、面板、日志都用它）。
     ///
     /// UUID 键本身不可读，展示时必须换回显示昵称。
@@ -1048,6 +1069,84 @@ mod tests {
         assert_eq!(access.memory_key("陌生人"), "陌生人");
     }
 
+
+    /// 归属专用解析：note（游戏真名）能解析出 UUID，但**不返回角色**。
+    ///
+    /// 实机故障：`@歌单` 窗口里 `@1`~`@5` 选歌失败，日志显示
+    /// 「发送者『示例玩家』（note）不是属主『id:00000000-…』」。
+    /// `playlist_owner_candidates` 走 `resolve_hint`（只认 nickname），
+    /// note 形式的发送者解析失败 → 候选为空 → 决策被丢弃。
+    #[test]
+    fn ownership_uuid_resolves_both_nickname_and_note() {
+        let mut config = IdentityConfig::default();
+        let id = Uuid::new_v4();
+        config.mappings.push(IdentityMapping {
+            nickname: "abcd1234".to_string(),
+            id,
+            role: IdentityRole::Admin,
+            note: "显示名甲".to_string(),
+            remark_sourced: true,
+            accounts: vec![GameAccount::new("10001")],
+        });
+        let access = IdentityAccess::new(config);
+
+        // 两个名字都指向同一个 UUID——归属需要这个性质。
+        assert_eq!(access.ownership_uuid_by_name("abcd1234"), Some(id));
+        assert_eq!(access.ownership_uuid_by_name("显示名甲"), Some(id));
+        assert_eq!(access.ownership_uuid_by_name("陌生人"), None);
+    }
+
+    /// **安全不变量**：归属能用 note，授权不能。
+    ///
+    /// `ownership_uuid_by_name` 只返回 UUID、不返回 role；而授权路径走的
+    /// `resolve_hint` 必须继续**只认 nickname / UID**。这条测试把两者钉在一起：
+    /// 同一个 note 名字，归属能命中，授权必须落空。
+    ///
+    /// 若有人为了「让大厅认得出管理员」把 note 兜底上移到 `resolve_hint`，
+    /// 这条会立刻变红。
+    #[test]
+    fn note_resolves_for_ownership_but_never_for_authorization() {
+        let mut config = IdentityConfig::default();
+        let id = Uuid::new_v4();
+        config.mappings.push(IdentityMapping {
+            nickname: "abcd1234".to_string(),
+            id,
+            role: IdentityRole::Admin,
+            note: "显示名甲".to_string(),
+            remark_sourced: true,
+            accounts: vec![GameAccount::new("10001")],
+        });
+        let access = IdentityAccess::new(config);
+
+        // 归属：note 命中。
+        assert_eq!(access.ownership_uuid_by_name("显示名甲"), Some(id));
+
+        // 授权：note 命中不了。nickname 分支只查 nickname，
+        // Account 分支只查 UID——两条都不碰 note。
+        assert_eq!(
+            access.role_of("显示名甲"),
+            None,
+            "note 绝不能被当作授权依据：任何人都能把游戏昵称改成一样来冒充"
+        );
+        assert_eq!(
+            access
+                .resolve_hint(IdentityHint::Nickname("显示名甲"))
+                .map(|resolved| resolved.role),
+            None,
+            "resolve_hint 的昵称分支必须只认 nickname"
+        );
+        assert_eq!(
+            access
+                .resolve_hint(IdentityHint::Account {
+                    game: "genshin",
+                    uid: "999999999",
+                    nickname: Some("显示名甲"),
+                })
+                .map(|resolved| resolved.role),
+            None,
+            "UID 未登记时不得回退昵称或 note"
+        );
+    }
     /// 好友列表候选名以显示昵称为先。
     #[test]
     fn friend_row_names_put_the_note_first() {

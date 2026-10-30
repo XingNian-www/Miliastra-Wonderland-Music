@@ -443,7 +443,7 @@ impl FormalTaskRuntime {
                     coordinator,
                 ) {
                     log::error!(
-                        "正式任务运行时异常退出（步骤：正式任务主循环取任务并执行），此后不再有正式任务被执行；已入队的点歌/管理/邀请等任务会一直停在待处理，玩家看到的表现是「命令没反应」: {error:#}"
+                        "正式任务运行时异常退出（步骤：正式任务主循环取任务并执行），此后不再有正式任务被执行；已入队的点歌/管理/邀请等任务会一直停在待处理，玩家看到的表现是「命令没反应」：{error:#}"
                     );
                 }
                 let _ = finished_sender.send(());
@@ -480,7 +480,7 @@ impl FormalTaskRuntime {
         let active_task_id = prepare_result.as_ref().ok().copied().flatten();
         self.stop_requested.store(true, AtomicOrdering::SeqCst);
         if let Err(error) = self.task_engine.wake() {
-            log::debug!("唤醒正在关闭的任务引擎失败: {error}");
+            log::debug!("唤醒正在关闭的任务引擎失败：{error}");
         }
         let timed_out = match self.finished.recv_timeout(timeout) {
             Ok(()) => {
@@ -520,7 +520,7 @@ impl Drop for FormalTaskRuntime {
     fn drop(&mut self) {
         if let Err(error) = self.stop(DROP_SHUTDOWN_GRACE) {
             log::error!(
-                "正式任务运行时关闭失败（步骤：析构时等待任务线程退出），任务线程可能仍在运行并持有 UI 租约；本次退出不完整，进程结束时可能残留线程: {error:#}"
+                "正式任务运行时关闭失败（步骤：析构时等待任务线程退出），任务线程可能仍在运行并持有 UI 租约；本次退出不完整，进程结束时可能残留线程：{error:#}"
             );
         }
     }
@@ -591,7 +591,9 @@ fn execute_formal_task(
 ) -> Result<bool> {
     let task_id = task.task_id();
     let task_label = task.label().to_string();
-    log::info!("待处理任务开始: {task_label}");
+    // 调度层只留「开始」与失败/取消三类；成功路径交由执行层在真正做完时记录，
+    // 避免与 tasks.rs 的完成日志在同一时刻重复打两条（实机日志暴露的问题）。
+    log::info!("待处理任务开始：{task_label}");
     let outcome = match catch_unwind(AssertUnwindSafe(|| task.execute())) {
         Ok(outcome) => outcome,
         Err(_) => {
@@ -600,21 +602,30 @@ fn execute_formal_task(
     };
     match outcome {
         FormalTaskExecutionOutcome::Completed(Ok(result)) => {
+            // 不在这里再打一条「完成」：执行层（tasks.rs）已经在任务真正做完时
+            // 打过「待处理任务已完成：<任务>」。两层同时记录会让同一事件出现两条
+            // 时间戳相同、主体相同的日志（实机日志已证实）。
+            // 调度层这里只负责记账，记账失败会由 `?` 上报成错误，不会静默丢失。
             task_engine.complete_formal(task_id, FormalTaskCompletion::Succeeded(result))?;
-            log::info!("待处理任务完成: {task_label}");
             Ok(true)
         }
         FormalTaskExecutionOutcome::Completed(Err(error)) => {
+            // 失败也可能有两层：执行层（tasks.rs）已在具体步骤失败时记过一条带任务名的
+            // error。这里再记一条是为了覆盖**执行层来不及记录**的情形（panic 被 catch_unwind
+            // 接住、或错误在调度层记账时才暴露），因此文案要标明这是调度层视角，
+            // 不能与执行层那条写成同一句话。
             task_engine.complete_formal(
                 task_id,
                 FormalTaskCompletion::Failed(format!("错误: {error:#}")),
             )?;
-            log::error!("待处理任务执行异常: {error:#}");
+            log::error!(
+                "待处理任务「{task_label}」在调度层判定为失败（执行层可能已单独记录过具体步骤），该任务已结束、不会重试；若上面没有执行层日志，说明失败发生在任务完成之后或执行过程中崩溃：{error:#}"
+            );
             Ok(false)
         }
         FormalTaskExecutionOutcome::Canceled(reason) => {
             task_engine.complete_formal(task_id, FormalTaskCompletion::Canceled(reason.clone()))?;
-            log::info!("待处理任务已取消: {task_label}; {reason}");
+            log::info!("待处理任务已取消：{task_label}（原因：{reason}）");
             Ok(false)
         }
     }
@@ -630,7 +641,7 @@ fn execute_diagnostic_task(
         Ok(Ok(result)) => DiagnosticTaskCompletion::Succeeded(result),
         Ok(Err(error)) => {
             log::error!(
-                "Web 工具「{label}」执行失败（步骤：执行面板发起的这次调用），本次操作没有生效，面板会收到失败结果，可修正后重试: {error:#}"
+                "Web 工具「{label}」执行失败（步骤：执行面板发起的这次调用），本次操作没有生效，面板会收到失败结果，可修正后重试：{error:#}"
             );
             DiagnosticTaskCompletion::Failed(format!("{error:#}"))
         }

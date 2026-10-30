@@ -218,7 +218,7 @@ impl ApplicationRuntime {
         );
         self.abort_entertainment_for_context_loss("闲置退出即将关闭游戏");
         if let Err(error) = self.playback.player.pause_for_idle_exit() {
-            log::error!("闲置退出时暂停播放器失败（步骤：闲置退出前暂停播放），播放可能自行继续，退出后仍可能出队: {error:#}");
+            log::error!("闲置退出时暂停播放器失败（步骤：闲置退出前暂停播放），播放可能自行继续，退出后仍可能出队：{error:#}");
         } else {
             log::info!("闲置退出已暂停播放器，避免退出后自动恢复播放或继续出队");
         }
@@ -226,7 +226,7 @@ impl ApplicationRuntime {
         match self.ui.game_ui.close_window() {
             Ok(()) => self.invalidate_latest_frame(),
             Err(error) => {
-                log::error!("关闭目标游戏窗口失败（步骤：闲置退出关闭游戏），游戏窗口可能仍然打开: {error:#}");
+                log::error!("关闭目标游戏窗口失败（步骤：闲置退出关闭游戏），游戏窗口可能仍然打开：{error:#}");
             }
         }
         Ok(())
@@ -259,7 +259,7 @@ impl ApplicationRuntime {
                 self.lifecycle
                     .http_reload_draining
                     .store(false, AtomicOrdering::SeqCst);
-                log::warn!("读取闲置重载状态失败，本轮保持运行: {error:#}");
+                log::warn!("读取闲置重载状态失败，本轮保持运行：{error:#}");
                 return;
             }
         };
@@ -282,7 +282,7 @@ impl ApplicationRuntime {
                 self.lifecycle
                     .http_reload_draining
                     .store(false, AtomicOrdering::SeqCst);
-                log::warn!("进入 HTTP 排空后复查重载状态失败，本轮保持运行: {error:#}");
+                log::warn!("进入 HTTP 排空后复查重载状态失败，本轮保持运行：{error:#}");
                 return;
             }
         };
@@ -309,7 +309,7 @@ impl ApplicationRuntime {
                 self.lifecycle
                     .http_reload_draining
                     .store(false, AtomicOrdering::SeqCst);
-                log::warn!("HTTP 排空后复查重载状态失败，本轮保持运行: {error:#}");
+                log::warn!("HTTP 排空后复查重载状态失败，本轮保持运行：{error:#}");
                 return;
             }
         };
@@ -329,7 +329,7 @@ impl ApplicationRuntime {
                 self.lifecycle
                     .http_reload_draining
                     .store(false, AtomicOrdering::SeqCst);
-                log::warn!("配置重载前刷新播放器状态失败，本轮保持运行: {error:#}");
+                log::warn!("配置重载前刷新播放器状态失败，本轮保持运行：{error:#}");
                 return;
             }
         };
@@ -339,7 +339,7 @@ impl ApplicationRuntime {
                 self.lifecycle
                     .http_reload_draining
                     .store(false, AtomicOrdering::SeqCst);
-                log::warn!("刷新播放器状态后复查重载条件失败，本轮保持运行: {error:#}");
+                log::warn!("刷新播放器状态后复查重载条件失败，本轮保持运行：{error:#}");
                 return;
             }
         };
@@ -371,7 +371,7 @@ impl ApplicationRuntime {
                 self.lifecycle
                     .http_reload_draining
                     .store(false, AtomicOrdering::SeqCst);
-                log::warn!("重载关停前原子锁定任务引擎失败，本轮保持运行: {error}");
+                log::warn!("重载关停前原子锁定任务引擎失败，本轮保持运行：{error}");
                 return;
             }
         }
@@ -513,7 +513,7 @@ impl ApplicationRuntime {
                 Ok(PendingTaskExecution::Completed)
             }
             Err(error) => {
-                log::error!("待处理任务失败（步骤：执行待处理任务「{label}」），该任务已放弃，不会自动重试: {error:#}");
+                log::error!("待处理任务失败（步骤：执行待处理任务「{label}」），该任务已放弃，不会自动重试：{error:#}");
                 Err(error)
             }
         }
@@ -550,7 +550,7 @@ impl ApplicationRuntime {
             }
             Err(error) => {
                 let command_ms = elapsed_ms(command_started);
-                log::error!("命令执行失败（步骤：执行命令「{command_log}」），这条命令没有生效，玩家不会收到执行结果: {error:#}");
+                log::error!("命令执行失败（步骤：执行命令「{command_log}」），这条命令没有生效，玩家不会收到执行结果：{error:#}");
                 log::info!(target: "timing",
                     "命令执行耗时: command={} success=false total={}ms",
                     command_log,

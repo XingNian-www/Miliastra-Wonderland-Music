@@ -227,7 +227,6 @@ pub(crate) trait PlaylistPlaybackPort {
     /// 当前正在播放的曲目；未播放时为 None。
     fn current_track(&self) -> Option<PlayableTrack>;
     /// 播放一首曲目。
-    #[allow(dead_code)]
     fn play(&mut self, track: &PlayableTrack) -> Result<()>;
     fn import_playlist(&mut self, provider: &str, input: &str) -> Result<PlaylistImportOperation>;
     fn enqueue_next(&mut self, _track: &PlayableTrack) -> Result<bool> {
@@ -242,6 +241,14 @@ pub(crate) trait PlaylistPlaybackPort {
     }
     fn stop_playlist(&mut self) -> Result<bool> {
         anyhow::bail!("个人歌单播放模式不可用")
+    }
+    /// 把歌单归属键（`id:<uuid>`）翻译成玩家看得懂的名字。
+    ///
+    /// 归属键是内部标识，直接渲染会让玩家看到一长串 UUID。
+    /// 翻译需要身份映射（配置层对象），features 层拿不到，由实现方覆写。
+    /// 默认原样返回，保证不接身份的测试替身行为不变。
+    fn playlist_owner_display(&self, owner: &str) -> String {
+        owner.to_string()
     }
     /// 当前歌单模式的归属昵称；未激活为 None。
     fn playlist_mode_owner(&self) -> Option<String> {
@@ -541,7 +548,7 @@ impl PlaylistApplication {
                 Ok(track) => tracks.push(track),
                 // 单条损坏不应让整个歌单不可用。
                 Err(error) => log::warn!(
-                    "歌单中有一条记录无法解析，已跳过该条；该歌不会出现在歌单里: {error}"
+                    "歌单中有一条记录无法解析，已跳过该条；该歌不会出现在歌单里：{error}"
                 ),
             }
         }
@@ -1042,9 +1049,12 @@ impl PlaylistApplication {
                         ReplyVars::new().with("数量", queued.to_string()),
                     )]),
                     PersonalPlaylistStart::AlreadyActive { owner: current } => {
+                        // `current` 是内部归属键（`id:<uuid>`），必须先翻成展示名，
+                        // 否则玩家会看到「当前为 id:00000000-… 的歌单」。
+                        let display = playback.playlist_owner_display(&current);
                         Ok(vec![PlaylistReply::keyed(
                             &templates::PLAY_OCCUPIED,
-                            ReplyVars::new().with("歌手", current),
+                            ReplyVars::new().with("歌手", display),
                         )])
                     }
                 }
@@ -1077,10 +1087,23 @@ impl PlaylistApplication {
                         ReplyVars::new(),
                     )]);
                 };
+                // 随机抽到的那首**加入队列**，与 `@歌单` 窗口里 `@1`~`@5` 选歌走同一条
+                // `enqueue_next` 路径：排在当前曲目之后，不打断正在播放的歌。
+                //
+                // 此前只回一条「为你随机推荐…」，玩家看到歌名却听不到声音，
+                // 与「随机推荐」这个措辞的直觉不符。
+                let queued = playback.enqueue_next(&track)?;
+                if !queued {
+                    return Ok(vec![PlaylistReply::keyed(
+                        &templates::SELECT_QUEUE_FULL,
+                        ReplyVars::new(),
+                    )]);
+                }
                 Ok(vec![PlaylistReply::keyed(
-                    &templates::RANDOM_PICKED,
+                    &templates::RANDOM_QUEUED,
                     ReplyVars::new()
                         .with("歌名", track_title(&track))
+                        .with("歌手", track_artists(&track))
                         .with("数量", total.to_string()),
                 )])
             }
@@ -1509,7 +1532,7 @@ mod tests {
         assert_eq!(
             messages.iter().map(String::as_str).collect::<Vec<_>>(),
             [
-                "歌单: @歌单 推荐5首歌; @随机歌单/@歌单随机 随机推荐",
+                "歌单: @歌单 推荐5首歌; @随机歌单/@歌单随机 随机加入队列",
                 "收藏: @收藏 收藏当前歌曲; @取消收藏",
                 "模式: @歌单模式/@播放歌单 进入歌单模式; @退出歌单模式/@大厅模式 退出歌单模式",
                 "导入: @导入QQ歌单<数字ID>; @导入网易歌单<数字ID>; @歌单清空",
@@ -2014,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn random_recommends_one_song_without_starting_playback() {
+    fn random_enqueues_the_picked_song_without_interrupting_current_playback() {
         let app = app();
         let mut port = FakePlayback {
             current: None,
@@ -2026,9 +2049,22 @@ mod tests {
             played: Vec::new(),
         };
         play(&app, "甲", &PlaylistCommand::Favorite, &mut port);
-        let recommendation = play(&app, "甲", &PlaylistCommand::Random, &mut port);
-        assert!(recommendation[0].contains("随机推荐"));
-        assert!(port.played.is_empty());
+        let reply = play(&app, "甲", &PlaylistCommand::Random, &mut port);
+        assert!(reply[0].contains("随机推荐"));
+        // 抽到的曲子必须**进入队列**（`enqueue_next` 在 FakePlayback 里记成 "queued:<key>"），
+        // 而不是只回一句推荐文案。这与 @歌单 窗口里 @1~@5 选歌走同一条路径。
+        assert_eq!(
+            port.played.iter().filter(|e| e.starts_with("queued:")).count(),
+            1,
+            "随机抽取的曲目必须入队: {:?}",
+            port.played
+        );
+        // 且**不能**打断当前播放：直接的 play 不应该被调用。
+        assert!(
+            !port.played.iter().any(|e| !e.starts_with("queued:")),
+            "不应直接播放，只入队: {:?}",
+            port.played
+        );
     }
 
     #[test]

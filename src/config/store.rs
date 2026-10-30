@@ -467,7 +467,7 @@ impl ConfigStore {
             ),
             Ok(None) => {}
             Err(error) => log::warn!(
-                "配置断代前的旧库备份失败（步骤：复制旧配置库），升级仍会继续，但旧配置无法还原: {error:#}"
+                "配置断代前的旧库备份失败（步骤：复制旧配置库），升级仍会继续，但旧配置无法还原：{error:#}"
             ),
         }
         let transaction =
@@ -490,7 +490,7 @@ impl ConfigStore {
         Self::initialize_database_transaction(&transaction, now_ms() as i64)?;
         transaction.commit()?;
         log::warn!(
-            "旧配置已重置为默认值（v{stale_version} → v{CONFIG_SCHEMA_VERSION}），用户此前的面板设置需要重新填写；歌曲缓存与音频文件未受影响: {}",
+            "旧配置已重置为默认值（v{stale_version} → v{CONFIG_SCHEMA_VERSION}），用户此前的面板设置需要重新填写；歌曲缓存与音频文件未受影响：{}",
             path.display()
         );
         Ok(())

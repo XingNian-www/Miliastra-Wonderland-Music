@@ -440,7 +440,14 @@ impl ResolvedSongRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SongQueuePushOutcome {
-    Added(usize),
+    /// 入队成功。`position` 是这首在队列中的位置（1 起算），`total` 是入队后的队列总数。
+    ///
+    /// 两者必须分开：手动点歌插在歌单自动项之前，`@歌单` 窗口选歌更会插到队首，
+    /// 位置和总数并不相等，用总数冒充位置会让玩家看到「每首都排第 5」。
+    Added {
+        position: usize,
+        total: usize,
+    },
     Duplicate,
     Full,
     DedupLimited,
@@ -715,7 +722,7 @@ impl SongRequestExecution<'_> {
             }
             Err(error) => {
                 log::error!(
-                    "读取播放器状态失败（步骤：点歌前判断是否正在播放）；已改为直接入队，当前曲目播完后再播: {error:#}"
+                    "读取播放器状态失败（步骤：点歌前判断是否正在播放）；已改为直接入队，当前曲目播完后再播：{error:#}"
                 );
                 let outcome = self.push_queue_request(&request)?;
                 self.handle_queue_push_outcome(
@@ -757,7 +764,7 @@ impl SongRequestExecution<'_> {
         context: &str,
         error: &SongSearchFailure,
     ) -> Result<()> {
-        log::error!("{context}：搜索阶段失败，本次点歌未执行，玩家会收到失败提示: {error}");
+        log::error!("{context}：搜索阶段失败，本次点歌未执行，玩家会收到失败提示：{error}");
         self.reply_template(
             &crate::features::reply_template::song::SONG[9],
             &crate::features::reply_template::ReplyVars::new()
@@ -792,7 +799,7 @@ impl SongRequestExecution<'_> {
         let local = match self.port.search_library_candidates(keyword, allow_bilibili) {
             Ok(candidates) => candidates,
             Err(error) => {
-                log::warn!("AI 点歌的本地曲库检索失败，改为只用平台搜索结果: {error:#}");
+                log::warn!("AI 点歌的本地曲库检索失败，改为只用平台搜索结果：{error:#}");
                 Vec::new()
             }
         };
@@ -826,7 +833,7 @@ impl SongRequestExecution<'_> {
             Ok(candidates) => candidates.unwrap_or_default(),
             Err(error) if local.is_empty() => return Err(error),
             Err(error) => {
-                log::warn!("AI 点歌的平台搜索失败，降级为只用本地曲库候选: {error}");
+                log::warn!("AI 点歌的平台搜索失败，降级为只用本地曲库候选：{error}");
                 Vec::new()
             }
         };
@@ -931,7 +938,7 @@ impl SongRequestExecution<'_> {
                                 }
                                 Err(error) => {
                                     log::warn!(
-                                        "AI 点歌的二次搜索失败，保留首次搜索的候选继续: {error}"
+                                        "AI 点歌的二次搜索失败，保留首次搜索的候选继续：{error}"
                                     );
                                     self.reply_template(
                                         &crate::features::reply_template::song::SONG[6],
@@ -945,7 +952,7 @@ impl SongRequestExecution<'_> {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    log::warn!("AI 点歌的语义改写分析失败，沿用首次搜索结果继续: {error:#}")
+                    log::warn!("AI 点歌的语义改写分析失败，沿用首次搜索结果继续：{error:#}")
                 }
             }
         }
@@ -979,7 +986,7 @@ impl SongRequestExecution<'_> {
             Ok(result) => result,
             Err(error) => {
                 log::error!(
-                    "AI 点歌挑选候选失败（步骤：从候选列表选出要播的一首）；本次点歌未执行，玩家会收到失败提示: {error:#}"
+                    "AI 点歌挑选候选失败（步骤：从候选列表选出要播的一首）；本次点歌未执行，玩家会收到失败提示：{error:#}"
                 );
                 self.reply_template(
                     &crate::features::reply_template::song::SONG[8],
@@ -1020,7 +1027,7 @@ impl SongRequestExecution<'_> {
                 Ok(result) => Some(result.score),
                 Err(error) => {
                     log::warn!(
-                        "给在线候选取匹配度失败，本次跳过本地曲库推荐对比，直接使用在线结果: {error:#}"
+                        "给在线候选取匹配度失败，本次跳过本地曲库推荐对比，直接使用在线结果：{error:#}"
                     );
                     None
                 }
@@ -1460,6 +1467,28 @@ impl SongRequestExecution<'_> {
         })
     }
 
+    /// 这首歌在播放队列里的位置（1 起算）；找不到返回 None。
+    ///
+    /// 不能用「队列总数」冒充位置：手动点歌插在歌单自动项之前，`@歌单` 窗口选歌
+    /// 更会插到队首，所以同一时刻入队的两首歌位置可以相同、总数也各不相同。
+    /// 队列里已有判重保证（同曲不重复入队），命中的第一条就是刚入队的这首。
+    fn queued_song_position(&self, request: &ResolvedSongRequest) -> Option<usize> {
+        let queue = self.port.playback_queue().ok()?;
+        queue
+            .iter()
+            .position(|item| {
+                match (&item.track, &request.track) {
+                    (Some(queued), Some(requested)) => {
+                        queued.track_ref.key == requested.track_ref.key
+                    }
+                    // 没有结构化曲目时按关键词精确比对：入队时 `keyword` 原样写入队列，
+                    // 所以这里不需要再折叠全角/空白，也不会因此引入跨层依赖。
+                    _ => item.keyword == request.keyword,
+                }
+            })
+            .map(|index| index + 1)
+    }
+
     fn push_queue_request(&self, request: &ResolvedSongRequest) -> Result<SongQueuePushOutcome> {
         if self.song_dedup_limited(request)? {
             log::info!(
@@ -1499,10 +1528,16 @@ impl SongRequestExecution<'_> {
                 && let Err(error) = self.port.preload_track(track)
             {
                 log::debug!(
-                    "点歌入队后预加载音源失败，本次不影响入队；真正播放时会重新解析音源: {error:#}"
+                    "点歌入队后预加载音源失败，本次不影响入队；真正播放时会重新解析音源：{error:#}"
                 );
             }
-            Ok(SongQueuePushOutcome::Added(pushed.size))
+            // 位置必须从队列里查：手动点歌是「插在歌单自动项之前」，
+            // 队列里可能已有自动项占位，位置 ≠ 总数。
+            let position = self.queued_song_position(request).unwrap_or(pushed.size);
+            Ok(SongQueuePushOutcome::Added {
+                position,
+                total: pushed.size,
+            })
         } else if pushed.duplicate {
             Ok(SongQueuePushOutcome::Duplicate)
         } else {
@@ -1519,13 +1554,15 @@ impl SongRequestExecution<'_> {
     ) -> Result<()> {
         match outcome {
             SongQueuePushOutcome::PermissionDenied => {}
-            SongQueuePushOutcome::Added(len) => {
+            SongQueuePushOutcome::Added { position, total } => {
                 self.log_executed_command(context, &request.final_command(feedback.queued_action))?;
                 self.reply_template(
                     &crate::features::reply_template::song::SONG[10],
                     &crate::features::reply_template::ReplyVars::new()
                         .with("前缀", feedback.queued_prefix)
-                        .with("当前", len.to_string())
+                        // {序号} 是这首的位置，{当前} 仍是队列总数：旧模板继续可用。
+                        .with("序号", position.to_string())
+                        .with("当前", total.to_string())
                         .with("上限", self.queue_max_size.to_string())
                         .with("歌名", request.keyword.clone()),
                 )?;
@@ -1766,7 +1803,7 @@ impl SongRequestExecution<'_> {
             Ok(candidates) => candidates,
             Err(error) => {
                 log::warn!(
-                    "本地曲库检索失败（步骤：为在线候选补充本地推荐）；本次不展示本地推荐: {error:#}"
+                    "本地曲库检索失败（步骤：为在线候选补充本地推荐）；本次不展示本地推荐：{error:#}"
                 );
                 return None;
             }
@@ -1801,7 +1838,7 @@ impl SongRequestExecution<'_> {
             Ok(candidates) => local_library_choices(&self.allowed_candidates(candidates), 0),
             Err(error) => {
                 log::warn!(
-                    "本地曲库检索失败（步骤：为无在线候选的点歌查找本地曲库）；本次不展示本地推荐: {error:#}"
+                    "本地曲库检索失败（步骤：为无在线候选的点歌查找本地曲库）；本次不展示本地推荐：{error:#}"
                 );
                 Vec::new()
             }
@@ -1854,7 +1891,7 @@ impl SongRequestExecution<'_> {
             }
             Err(error) => {
                 log::warn!(
-                    "给本地曲库候选打匹配度失败（步骤：比较本地与在线结果）；本次不展示本地推荐，直接使用在线结果: {error:#}"
+                    "给本地曲库候选打匹配度失败（步骤：比较本地与在线结果）；本次不展示本地推荐，直接使用在线结果：{error:#}"
                 );
                 None
             }
@@ -3127,17 +3164,33 @@ mod tests {
         assert_eq!(rendered.text, "队列已有: 晴天");
         assert!(rendered.missing.is_empty(), "变量应全部被消费");
 
-        // 入队回执：前缀/当前/上限/歌名 四个变量，格式 "{前缀}({当前}/{上限}): {歌名}"
+        // 入队回执：{序号}=这首的位置，{当前}=队列总数，{上限}=容量。
         let rendered = render(
             &SONG[10],
             None,
             &ReplyVars::new()
                 .with("前缀", "队列已加入")
-                .with("当前", "3")
+                .with("序号", "3")
+                .with("当前", "5")
                 .with("上限", "10")
                 .with("歌名", "晴天"),
         );
-        assert_eq!(rendered.text, "队列已加入(3/10): 晴天");
+        assert_eq!(rendered.text, "队列已加入(第3首，共5/10): 晴天");
+
+        // 旧模板（用户已编辑过的）只用了 {当前}/{上限}，必须仍能完整渲染——
+        // 这是我们不删旧变量的理由：删了它就会渲染成空串。
+        let legacy = render(
+            &SONG[10],
+            Some("{前缀}({当前}/{上限}): {歌名}"),
+            &ReplyVars::new()
+                .with("前缀", "队列已加入")
+                .with("序号", "3")
+                .with("当前", "5")
+                .with("上限", "10")
+                .with("歌名", "晴天"),
+        );
+        assert_eq!(legacy.text, "队列已加入(5/10): 晴天");
+        assert!(legacy.missing.is_empty(), "旧模板不该缺变量");
 
         // 搜索失败："{标签}{原因}" 是两个变量直接相接，不能插入空格。
         let rendered = render(
@@ -3235,6 +3288,70 @@ mod tests {
                 .borrow()
                 .iter()
                 .any(|reply| reply == "队列已满，请稍后再试")
+        );
+    }
+
+    #[test]
+    fn queue_position_reports_the_slot_ahead_of_playlist_items() {
+        // 回归：手动点歌插在歌单自动项之前，因此「第几首」不等于队列总数。
+        // 旧实现用总数冒充位置，队列满时每一首都显示 (5/5)，玩家无法区分先后。
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
+        port.queue_limit = Some(3);
+        port.queue.borrow_mut().extend([
+            QueueItem {
+                keyword: "歌单自动项A".to_string(),
+                playlist_auto: true,
+                ..QueueItem::default()
+            },
+            QueueItem {
+                keyword: "歌单自动项B".to_string(),
+                playlist_auto: true,
+                ..QueueItem::default()
+            },
+        ]);
+        let application = SongRequestApplication::with_gateways(
+            Arc::new(DisabledAiGateway),
+            Arc::new(DisabledReviewGateway),
+            3,
+            true,
+        );
+
+        application
+            .execute(&context(), &command(), &mut port)
+            .expect("manual request ahead of playlist items");
+
+        // 插在自动项之前 → 位置 1，队列总数 3。
+        assert_eq!(port.queue.borrow()[0].keyword, "晴天 - 周杰伦");
+        assert_eq!(
+            port.replies.borrow().last().map(String::as_str),
+            Some("队列已加入(第1首，共3/3): 晴天 - 周杰伦")
+        );
+    }
+
+    #[test]
+    fn queue_position_counts_appended_items_in_order() {
+        // 追加在队尾时位置 == 总数，两条读数一致；用它证明位置不是常量 1。
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
+        port.queue.borrow_mut().extend([
+            QueueItem {
+                keyword: "已有第一首".to_string(),
+                ..QueueItem::default()
+            },
+            QueueItem {
+                keyword: "已有第二首".to_string(),
+                ..QueueItem::default()
+            },
+        ]);
+
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("appended request");
+
+        assert_eq!(
+            port.replies.borrow().last().map(String::as_str),
+            Some("队列已加入(第3首，共3/20): 晴天 - 周杰伦")
         );
     }
 
@@ -4201,7 +4318,7 @@ mod tests {
         );
         assert_eq!(
             port.replies.borrow().last().map(String::as_str),
-            Some("状态未知，队列已加入(1/20): 晴天 - 周杰伦")
+            Some("状态未知，队列已加入(第1首，共1/20): 晴天 - 周杰伦")
         );
     }
 

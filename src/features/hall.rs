@@ -285,7 +285,7 @@ impl HallApplication {
             Ok(info) => info,
             Err(error) => {
                 log::error!(
-                    "大厅检测失败（步骤：识别当前大厅名称）；无法判断所在大厅，本次命令未执行: {error:#}"
+                    "大厅检测失败（步骤：识别当前大厅名称）；无法判断所在大厅，本次命令未执行：{error:#}"
                 );
                 return port.reply_template(&templates::DETECT_FAILED, &ReplyVars::new());
             }
@@ -333,7 +333,7 @@ impl HallApplication {
             Ok(info) => info,
             Err(error) => {
                 log::error!(
-                    "读取大厅剩余时间失败（步骤：识别大厅时间文字）；无法给出剩余时长，本次命令未执行: {error:#}"
+                    "读取大厅剩余时间失败（步骤：识别大厅时间文字）；无法给出剩余时长，本次命令未执行：{error:#}"
                 );
                 return port.reply_template(&templates::TIME_UNKNOWN, &ReplyVars::new());
             }

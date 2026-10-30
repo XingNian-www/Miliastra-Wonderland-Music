@@ -1130,7 +1130,15 @@ fn detect_public_hall(hall_ui: &HallUi) -> Result<Option<HallObservation>> {
         .context("等待公共大厅检测 UI 事务")?;
     let info = match outcome.effect() {
         DetectPublicHallEffect::Detected { is_public, info } => {
-            log::debug!("公共大厅 UI 判断: {}", is_public);
+            // 补判定依据：只看布尔值无法区分「读到的是别的大厅名」与「OCR 读错」，
+            // 而大厅判定错误会让邀请流程走错分支（公共大厅直接邀请 vs 需征求同意）。
+            // 判定规则见 HallRoutine：大厅名归一化后与「公共大厅」逐字相等。
+            log::debug!(
+                "公共大厅判定：{}（依据：识别到的大厅名为「{}」，与「公共大厅」归一化比对{}）",
+                if *is_public { "是公共大厅" } else { "不是公共大厅" },
+                info.name,
+                if *is_public { "一致" } else { "不一致" }
+            );
             info.clone()
         }
         DetectPublicHallEffect::Failed(failure) => {

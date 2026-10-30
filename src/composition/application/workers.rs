@@ -7,6 +7,46 @@ use crate::features::playback::{
     PlayerStatus, QueueAdvanceContext, QueueAdvanceDecision,
 };
 
+/// 同一条日志在**高频循环**内的重复抑制。
+///
+/// 这些 warn 所在的循环每秒会跑 1 到 16 次，持续故障时一整晚能刷几万行，
+/// 把其余真正需要人看的告警冲掉。策略与 `listener.rs` 的驻留告警一致：
+///
+/// - **首次立即 warn**：保证故障有痕迹，不会被抑制掉；
+/// - 窗口内（默认 60 秒）重复出现降 `debug`：保留排障信息但不刷屏；
+/// - 窗口过后仍然失败，**再 warn 一次**：说明问题没自愈，需要重新提醒。
+///
+/// 刻意不做成全局静态：抑制状态属于**具体那个循环**，跨实例共享会互相干扰，
+/// 而且全局可变状态在测试之间会串味。
+#[derive(Debug, Default)]
+struct RepeatWarn {
+    last_warned_at: Option<Instant>,
+}
+
+/// 重复抑制窗口：与 `listener.rs` 保持一致，便于读日志的人形成统一预期。
+const REPEAT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+impl RepeatWarn {
+    /// 这次是否应当以 `warn` 输出。
+    ///
+    /// 返回 `true` 时**已经把计时推进到当下**，调用方随即打 warn；
+    /// 返回 `false` 时调用方应打 debug。
+    fn should_warn(&mut self, now: Instant) -> bool {
+        self.should_warn_within(now, REPEAT_WARN_INTERVAL)
+    }
+
+    /// 可指定窗口的版本，供单测直接驱动，不必真的等 60 秒。
+    fn should_warn_within(&mut self, now: Instant, interval: Duration) -> bool {
+        let due = self
+            .last_warned_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= interval);
+        if due {
+            self.last_warned_at = Some(now);
+        }
+        due
+    }
+}
+
 pub(super) struct BackgroundCommandManager {
     inner: Arc<BackgroundCommandManagerInner>,
 }
@@ -187,6 +227,10 @@ fn run_background_lyrics(
     let deadline = duration.map(|duration| Instant::now() + duration);
     let mut lyric_tracker = LyricTracker::default();
     let mut first_key = None::<TrackKey>;
+    // 两个失败点各自计时：任务引擎查询失败与入队失败是不同故障，
+    // 共用一个计时器会让后者的首次告警被前者压掉。
+    let mut snapshot_fail = RepeatWarn::default();
+    let mut enqueue_fail = RepeatWarn::default();
 
     while running.load(AtomicOrdering::SeqCst)
         && !stop.load(AtomicOrdering::SeqCst)
@@ -195,7 +239,15 @@ fn run_background_lyrics(
         let scheduler = match task_engine.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                log::warn!("后台歌词暂缓发送（步骤：查询正式任务状态），本轮不发送歌词，等下一次刷新再试: {error}");
+                if snapshot_fail.should_warn(Instant::now()) {
+                    log::warn!(
+                        "后台歌词暂缓发送（步骤：查询正式任务状态），本轮不发送歌词，等下一次刷新再试: {error:#}；本条在问题持续期间最多每分钟重复一次"
+                    );
+                } else {
+                    log::debug!(
+                        "后台歌词仍在暂缓发送（步骤：查询正式任务状态），等待任务调度恢复: {error:#}"
+                    );
+                }
                 if !sleep_background_lyrics_poll(poll, deadline, &running, &stop) {
                     break;
                 }
@@ -233,7 +285,15 @@ fn run_background_lyrics(
                             log::debug!("后台歌词输出因延迟回复队列受保护而跳过");
                         }
                         Err(error) => {
-                            log::warn!("后台歌词入队失败（步骤：把歌词加入发送队列），这段歌词不会显示: {error}");
+                            if enqueue_fail.should_warn(Instant::now()) {
+                                log::warn!(
+                                    "后台歌词入队失败（步骤：把歌词加入发送队列），这段歌词不会显示: {error:#}；本条在问题持续期间最多每分钟重复一次"
+                                );
+                            } else {
+                                log::debug!(
+                                    "后台歌词仍无法入队（步骤：把歌词加入发送队列），继续跳过本段歌词: {error:#}"
+                                );
+                            }
                         }
                     }
                 }
@@ -322,6 +382,10 @@ impl ApplicationRuntime {
             task_engine: self.business.task_engine.clone(),
             business: self.business.business.clone(),
             chat_output: self.ui.chat_output.clone(),
+            epoch_check_fail: RepeatWarn::default(),
+            requeue_fail: RepeatWarn::default(),
+            queue_full_dropped: RepeatWarn::default(),
+            target_inactive_dropped: RepeatWarn::default(),
         };
         thread::spawn(move || {
             log::info!("延迟聊天发送线程已启动");
@@ -340,6 +404,15 @@ struct DeferredChatSender {
     task_engine: TaskEngineHandle,
     business: BusinessRuntimeHandle,
     chat_output: ChatOutput,
+    /// 四个高频失败点各自的重复抑制计时。
+    ///
+    /// 分开而不是共用一个：它们代表四种不同的故障（代际校验失败、重新入队失败、
+    /// 队列满丢弃、目标未激活丢弃），合并计时会让后来者的首次告警被前者吞掉，
+    /// 而这正是排查时最需要看到的信息。
+    epoch_check_fail: RepeatWarn,
+    requeue_fail: RepeatWarn,
+    queue_full_dropped: RepeatWarn,
+    target_inactive_dropped: RepeatWarn,
 }
 
 /// 读取命令面板保存的覆盖文案；与立即发送路径共用同一查询语义。
@@ -438,7 +511,7 @@ impl DeferredChatSender {
         }
     }
 
-    fn run(self) -> Result<()> {
+    fn run(mut self) -> Result<()> {
         let mut generation = self.task_engine.generation()?;
         while self.running.load(AtomicOrdering::SeqCst) {
             if self.paused.load(AtomicOrdering::SeqCst) {
@@ -472,10 +545,26 @@ impl DeferredChatSender {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        log::warn!("后台歌词暂缓发送（步骤：校验正式任务代际），本轮不发送，等下一次刷新再试: {error}");
+                        if self.epoch_check_fail.should_warn(Instant::now()) {
+                            log::warn!(
+                                "后台歌词暂缓发送（步骤：校验正式任务代际），本轮不发送，等下一次刷新再试: {error:#}；本条在问题持续期间最多每分钟重复一次"
+                            );
+                        } else {
+                            log::debug!(
+                                "后台歌词仍在暂缓发送（步骤：校验正式任务代际），继续等待任务调度恢复: {error:#}"
+                            );
+                        }
                         drop(sending);
                         if let Err(requeue_error) = self.task_engine.requeue_deferred_front(item) {
-                            log::warn!("后台歌词重新入队失败（步骤：暂缓后重新排队），这段歌词不会显示: {requeue_error}");
+                            if self.requeue_fail.should_warn(Instant::now()) {
+                                log::warn!(
+                                    "后台歌词重新入队失败（步骤：暂缓后重新排队），这段歌词不会显示: {requeue_error:#}；本条在问题持续期间最多每分钟重复一次"
+                                );
+                            } else {
+                                log::debug!(
+                                    "后台歌词仍无法重新入队（步骤：暂缓后重新排队），继续丢弃这段歌词: {requeue_error:#}"
+                                );
+                            }
                         }
                         self.wait_for_retry(&mut generation)?;
                         continue;
@@ -511,10 +600,26 @@ impl DeferredChatSender {
                 drop(sending);
                 match self.task_engine.requeue_deferred_back(item)? {
                     EnqueueOutcome::DroppedMessage => {
-                        log::warn!("延迟聊天发送队列已满，已丢弃一条较早的普通回复，玩家会少收到一句")
+                        if self.queue_full_dropped.should_warn(Instant::now()) {
+                            log::warn!(
+                                "延迟聊天发送队列已满，已丢弃一条较早的普通回复，玩家会少收到一句；本条在问题持续期间最多每分钟重复一次"
+                            );
+                        } else {
+                            log::debug!(
+                                "延迟聊天发送队列仍然已满，继续丢弃较早的普通回复"
+                            );
+                        }
                     }
                     EnqueueOutcome::Rejected => {
-                        log::warn!("延迟聊天目标未激活且队列已满，当前回复已丢弃，玩家收不到这句")
+                        if self.target_inactive_dropped.should_warn(Instant::now()) {
+                            log::warn!(
+                                "延迟聊天目标未激活且队列已满，当前回复已丢弃，玩家收不到这句；本条在问题持续期间最多每分钟重复一次"
+                            );
+                        } else {
+                            log::debug!(
+                                "延迟聊天目标仍未激活且队列已满，继续丢弃当前回复"
+                            );
+                        }
                     }
                     EnqueueOutcome::Added => {}
                 }
@@ -994,6 +1099,85 @@ fn suppress_automatic_advance_for_reload(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// 首次必须 warn：抑制不能把故障的第一条痕迹也吞掉。
+    #[test]
+    fn repeat_warn_warns_immediately_on_first_failure() {
+        let mut gate = RepeatWarn::default();
+        let now = Instant::now();
+        assert!(gate.should_warn(now), "首次失败必须 warn，不能一上来就静默");
+    }
+
+    /// 窗口内重复出现降为 debug（返回 false），这是抑制的核心。
+    #[test]
+    fn repeat_warn_suppresses_repeats_inside_the_window() {
+        let mut gate = RepeatWarn::default();
+        let start = Instant::now();
+        assert!(gate.should_warn(start), "首次 warn");
+        // 窗口内的每一次重复都不该再 warn。
+        for offset_ms in [1u64, 500, 1_000, 16_000, 59_999] {
+            let later = start + Duration::from_millis(offset_ms);
+            assert!(
+                !gate.should_warn(later),
+                "窗口内（{offset_ms}ms）重复不应 warn，否则高频循环会刷屏"
+            );
+        }
+    }
+
+    /// 窗口过后仍失败要再 warn 一次：问题没自愈，必须重新提醒。
+    #[test]
+    fn repeat_warn_warns_again_after_the_window() {
+        let mut gate = RepeatWarn::default();
+        let start = Instant::now();
+        assert!(gate.should_warn(start));
+        assert!(!gate.should_warn(start + Duration::from_millis(59_999)));
+        assert!(
+            gate.should_warn(start + REPEAT_WARN_INTERVAL),
+            "窗口过后仍在失败必须再 warn，否则日志里只剩一次、看不出持续故障"
+        );
+        // 重新 warn 之后窗口重新计时。
+        assert!(!gate.should_warn(
+            start + REPEAT_WARN_INTERVAL + Duration::from_millis(1)
+        ));
+        assert!(gate.should_warn(start + REPEAT_WARN_INTERVAL * 2));
+    }
+
+    /// 模拟真实轮询节奏：60ms 一轮跑 10 秒，只应产生 1 条 warn。
+    ///
+    /// 这条直接对应任务里的量化依据：`wait_for_retry` 每秒约 16 次。
+    #[test]
+    fn repeat_warn_caps_a_sixty_millisecond_loop_to_one_warn_per_window() {
+        let mut gate = RepeatWarn::default();
+        let start = Instant::now();
+        let mut warns = 0usize;
+        let mut ticks = 0usize;
+        for tick in 0..167u64 {
+            // 167 × 60ms ≈ 10 秒
+            let now = start + Duration::from_millis(tick * 60);
+            if gate.should_warn(now) {
+                warns += 1;
+            }
+            ticks += 1;
+        }
+        assert_eq!(ticks, 167);
+        assert_eq!(
+            warns, 1,
+            "10 秒内 167 次失败只该留 1 条 warn，实际 {warns} 条"
+        );
+    }
+
+    /// 不同故障点各自计时：一个点刚 warn 过，另一个点的首次仍要 warn。
+    #[test]
+    fn separate_gates_do_not_suppress_each_other() {
+        let mut queue_full = RepeatWarn::default();
+        let mut target_inactive = RepeatWarn::default();
+        let now = Instant::now();
+        assert!(queue_full.should_warn(now));
+        assert!(
+            target_inactive.should_warn(now + Duration::from_millis(60)),
+            "不同故障点的首次告警不能被另一个点压掉"
+        );
+    }
 
     #[test]
     fn deferred_turtle_reply_uses_independent_command_store_override() {

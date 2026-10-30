@@ -53,6 +53,131 @@ impl ChatBatchSendOutcome {
     }
 }
 
+/// 一次批量回复的发送目标。日志文案只依赖它，三条发送路径因此共用同一套措辞。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChatSendTarget {
+    /// 一级大厅。
+    PrimaryHall,
+    /// 二级聊天里的「当前聊天」。
+    CurrentChat,
+}
+
+impl ChatSendTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PrimaryHall => "一级大厅",
+            Self::CurrentChat => "当前聊天",
+        }
+    }
+
+}
+
+/// 发送前的提交记录：**只写数量，不写正文**。
+///
+/// 正文可能含歌名、玩家昵称或玩法秘密；数量足够定位「这批到底提交了几条」。
+/// 做成纯函数是为了让测试能直接断言条数与措辞，不必安装全局 logger。
+fn submission_log_line(target: ChatSendTarget, total: usize) -> Option<(log::Level, String)> {
+    if total == 0 {
+        return None;
+    }
+    Some((
+        log::Level::Debug,
+        format!("向{}提交 {} 条回复", target.label(), total),
+    ))
+}
+
+/// 发送后的结果摘要。
+///
+/// 关键点：**成功数与提交总数一起写**。旧实现只遍历 `outcome.sent`，
+/// 提交 5 条成功 3 条时日志里只有 3 行，读起来像「只准备了 3 条」，
+/// 完全看不出还有 2 条没送达。
+struct ChatSendReport<'a> {
+    target: ChatSendTarget,
+    total: usize,
+    sent: usize,
+    error: Option<&'a anyhow::Error>,
+}
+
+impl<'a> ChatSendReport<'a> {
+    fn new(
+        target: ChatSendTarget,
+        outcome: &'a ChatBatchSendOutcome,
+        total: usize,
+    ) -> Self {
+        Self {
+            target,
+            total,
+            sent: outcome.sent,
+            error: match &outcome.status {
+                ChatBatchSendStatus::Complete => None,
+                ChatBatchSendStatus::Failed(error) => Some(error),
+            },
+        }
+    }
+
+    /// 结果日志行：`(级别, 文案)`。纯函数，测试直接断言。
+    ///
+    /// 分级口径：
+    /// - 全部送达 → `info`（玩家能感知的结果）
+    /// - 部分送达 → `info` 说清 N/M，再补 `warn` 说明有几条玩家看不到
+    /// - 一条都没送达 → `error`（本篇功能不可用）
+    fn lines(&self) -> Vec<(log::Level, String)> {
+        if self.total == 0 {
+            return Vec::new();
+        }
+        let label = self.target.label();
+        let failure = self
+            .error
+            .map(|error| format!("：{error}"))
+            .unwrap_or_default();
+        if self.sent >= self.total {
+            let mut lines = vec![(
+                log::Level::Info,
+                format!("已在{label}发送 {}/{} 条回复", self.sent, self.total),
+            )];
+            // 正文都已发出，但发送后恢复界面驻留失败：不能谎称整批没问题。
+            if self.error.is_some() {
+                lines.push((
+                    log::Level::Warn,
+                    format!(
+                        "{label}的 {} 条回复已全部送达，但发送后未能恢复到原界面，当前界面位置未知，后续截图与点击可能识别错界面{failure}",
+                        self.sent
+                    ),
+                ));
+            }
+            return lines;
+        }
+        if self.sent == 0 {
+            return vec![(
+                log::Level::Error,
+                format!(
+                    "在{label}发送 {}/{} 条回复全部失败，这批回复玩家看不到{failure}",
+                    self.sent, self.total
+                ),
+            )];
+        }
+        vec![
+            (
+                log::Level::Info,
+                format!("已在{label}发送 {}/{} 条回复", self.sent, self.total),
+            ),
+            (
+                log::Level::Warn,
+                format!(
+                    "{label}有 {} 条回复未送达，玩家看不到这几条{failure}",
+                    self.total - self.sent
+                ),
+            ),
+        ]
+    }
+
+    fn emit(&self) {
+        for (level, text) in self.lines() {
+            log::log!(level, "{text}");
+        }
+    }
+}
+
 /// 回复捕获守卫：drop 时结束捕获并取出结果。
 pub(crate) struct ReplyCapture {
     slot: Arc<RwLock<Option<Vec<String>>>>,
@@ -165,12 +290,11 @@ impl ChatOutput {
         }
         let request = SendHallBatch::new([message.clone()], residency, 0)
             .after_invite_primary_stability(running);
-        self.send_batch_request(request).into_result(1)?;
-        log::info!(
-            "邀请就绪回复已通过标准发送流程: {}",
-            redacted_chat_text(&message)
-        );
-        Ok(())
+        let outcome = self.send_batch_request(request);
+        // 邀请就绪通知走的是自定义驻留跟随，不是三条标准发送路径，
+        // 但结果记账沿用同一套措辞，避免同一件事出现两种日志形状。
+        ChatSendReport::new(ChatSendTarget::PrimaryHall, &outcome, 1).emit();
+        outcome.into_result(1)
     }
 
     pub fn send_for_command(&self, message: &str) -> Result<()> {
@@ -180,23 +304,22 @@ impl ChatOutput {
     fn send_primary(&self, message: &str, restore_after_task: bool) -> Result<()> {
         let message = fit_chat_message(message);
         self.record_captured(&message);
-        log::info!("准备在一级大厅发送回复「{}」", redacted_chat_text(&message));
-        if !self.enabled() {
-            log::info!("游戏内回复发送已关闭，本条回复只记录日志、不发送");
-            return Ok(());
-        }
-        self.send_with_input(&message, restore_after_task)
+        let messages = [message];
+        self.send_batch_logged(
+            ChatSendTarget::PrimaryHall,
+            &messages,
+            0,
+            restore_after_task,
+        )
+        .into_result(1)
     }
 
     pub fn send_current_chat(&self, message: &str) -> Result<()> {
         let message = fit_chat_message(message);
         self.record_captured(&message);
-        log::info!("准备在当前聊天发送回复「{}」", redacted_chat_text(&message));
-        if !self.enabled() {
-            log::info!("当前聊天回复发送已关闭，本条回复只记录日志、不发送");
-            return Ok(());
-        }
-        self.send_current_chat_with_input(&message)
+        let messages = [message];
+        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, 0, false)
+            .into_result(1)
     }
 
     pub fn send_current_chat_batch(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
@@ -209,15 +332,10 @@ impl ChatOutput {
             .collect::<Vec<_>>();
         for message in &messages {
             self.record_captured(message);
-            log::info!("准备在当前聊天发送回复「{}」", redacted_chat_text(message));
         }
-        if !self.enabled() {
-            log::info!("当前聊天回复发送已关闭，本条回复只记录日志、不发送");
-            return Ok(());
-        }
-        let expected = messages.len();
-        self.send_current_chat_batch_with_input(&messages, delay_ms)
-            .into_result(expected)
+        let total = messages.len();
+        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, delay_ms, false)
+            .into_result(total)
     }
 
     pub fn send_batch_for_command(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
@@ -229,17 +347,9 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
-        log::info!(
-            "准备在一级大厅发送 {} 条批量回复，内容含卧底玩法文本，日志中已隐藏",
-            messages.len()
-        );
-        if !self.enabled() {
-            log::info!("游戏内回复发送已关闭，本批回复只记录脱敏日志、不发送");
-            return Ok(());
-        }
-        let expected = messages.len();
-        self.send_batch_with_input(&messages, delay_ms, true)
-            .into_result(expected)
+        let total = messages.len();
+        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms, true)
+            .into_result(total)
     }
 
     pub fn send_current_chat_batch_redacted(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
@@ -247,17 +357,9 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
-        log::info!(
-            "准备在当前聊天发送 {} 条批量回复，内容含卧底玩法文本，日志中已隐藏",
-            messages.len()
-        );
-        if !self.enabled() {
-            log::info!("当前聊天回复发送已关闭，本批回复只记录脱敏日志、不发送");
-            return Ok(());
-        }
-        let expected = messages.len();
-        self.send_current_chat_batch_with_input(&messages, delay_ms)
-            .into_result(expected)
+        let total = messages.len();
+        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, delay_ms, false)
+            .into_result(total)
     }
 
     fn send_primary_batch(
@@ -273,16 +375,9 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
-        for message in &messages {
-            log::info!("准备在一级大厅发送回复「{}」", redacted_chat_text(message));
-        }
-        if !self.enabled() {
-            log::info!("游戏内回复发送已关闭，本条回复只记录日志、不发送");
-            return Ok(());
-        }
-        let expected = messages.len();
-        self.send_batch_with_input(&messages, delay_ms, restore_after_task)
-            .into_result(expected)
+        let total = messages.len();
+        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms, restore_after_task)
+            .into_result(total)
     }
 
     pub(crate) fn send_current_chat_batch_outcome(
@@ -294,20 +389,7 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
-        if !self.enabled() {
-            for message in &messages {
-                log::info!("准备在当前聊天发送回复「{}」", redacted_chat_text(message));
-            }
-            if !messages.is_empty() {
-                log::info!("当前聊天回复发送已关闭，本条回复只记录日志、不发送");
-            }
-            return ChatBatchSendOutcome::complete(messages.len());
-        }
-        let outcome = self.send_current_chat_batch_with_input(&messages, delay_ms);
-        for message in messages.iter().take(outcome.sent) {
-            log::info!("准备在当前聊天发送回复「{}」", redacted_chat_text(message));
-        }
-        outcome
+        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, delay_ms, false)
     }
 
     pub(crate) fn send_batch_outcome(
@@ -319,32 +401,61 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
+        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms, false)
+    }
+
+    /// 全部发送路径唯一的共同实现：**先记提交数量，再发，再按结果记账**。
+    ///
+    /// 旧实现里三条路径各自编排日志：`send_primary_batch` 发送**前**逐条打 info，
+    /// 另两条发送**后**只遍历 `outcome.sent`。于是同一次「提交 5 条」在两种路径上
+    /// 一是「发了 5 行」、一是「发了 3 行」，后者读起来像只准备了 3 条，
+    /// 完全看不出还有 2 条没送达。集中到这里之后，一级大厅与当前聊天的
+    /// 措辞、级别与时序完全一致。
+    fn send_batch_logged(
+        &self,
+        target: ChatSendTarget,
+        messages: &[String],
+        delay_ms: u64,
+        restore_after_task: bool,
+    ) -> ChatBatchSendOutcome {
+        let total = messages.len();
+        // 关闭时仍要走一遍「提交 N 条 + 结果」的记录，避免日志里凭空少一段；
+        // 但结果按「全部就绪、未实际发送」处理——玩家看不到、也不算失败。
         if !self.enabled() {
-            for message in &messages {
-                log::info!("准备在一级大厅发送回复「{}」", redacted_chat_text(message));
+            if let Some((level, text)) = submission_log_line(target, total) {
+                log::log!(level, "{text}");
             }
-            if !messages.is_empty() {
-                log::info!("游戏内回复发送已关闭，本条回复只记录日志、不发送");
+            if total > 0 {
+                log::info!(
+                    "游戏内回复发送已关闭，{}的 {} 条回复只记录日志、不发送",
+                    target.label(),
+                    total
+                );
             }
-            return ChatBatchSendOutcome::complete(messages.len());
+            return ChatBatchSendOutcome::complete(total);
         }
-        let outcome = self.send_batch_with_input(&messages, delay_ms, false);
-        for message in messages.iter().take(outcome.sent) {
-            log::info!("准备在一级大厅发送回复「{}」", redacted_chat_text(message));
+        if let Some((level, text)) = submission_log_line(target, total) {
+            log::log!(level, "{text}");
         }
+        // 正文只留在 trace：需要逐条核对发的是什么时才开。
+        // 脱敏不能省——歌名、昵称、玩法秘密都可能出现在正文里。
+        for message in messages {
+            log::trace!(
+                "{}待发回复：{}",
+                target.label(),
+                redacted_chat_text(message)
+            );
+        }
+        let outcome = match target {
+            ChatSendTarget::PrimaryHall => {
+                self.send_batch_with_input(messages, delay_ms, restore_after_task)
+            }
+            ChatSendTarget::CurrentChat => {
+                self.send_current_chat_batch_with_input(messages, delay_ms)
+            }
+        };
+        ChatSendReport::new(target, &outcome, total).emit();
         outcome
-    }
-
-    fn send_with_input(&self, message: &str, restore_after_task: bool) -> Result<()> {
-        let messages = [message.to_string()];
-        self.send_batch_with_input(&messages, 0, restore_after_task)
-            .into_result(messages.len())
-    }
-
-    fn send_current_chat_with_input(&self, message: &str) -> Result<()> {
-        let messages = [message.to_string()];
-        self.send_current_chat_batch_with_input(&messages, 0)
-            .into_result(messages.len())
     }
 
     fn send_current_chat_batch_with_input(
@@ -626,6 +737,113 @@ mod tests {
                 .iter()
                 .all(|message| display_width(message) <= MAX_CHAT_WIDTH)
         );
+    }
+
+    /// 发送前的提交记录：**只有数量、没有正文**，级别固定 debug。
+    ///
+    /// 正文可能在「提交 5 条」这一步就泄出歌名/昵称/玩法秘密，所以提交日志
+    /// 刻意不带内容；内容另走 trace（见 send_batch_logged）。
+    #[test]
+    fn submission_line_reports_only_the_count_at_debug() {
+        let (level, text) = submission_log_line(ChatSendTarget::PrimaryHall, 5).unwrap();
+        assert_eq!(level, log::Level::Debug);
+        assert_eq!(text, "向一级大厅提交 5 条回复");
+
+        let (level, text) = submission_log_line(ChatSendTarget::CurrentChat, 2).unwrap();
+        assert_eq!(level, log::Level::Debug);
+        assert_eq!(text, "向当前聊天提交 2 条回复");
+
+        // 没有提交内容时不该产出日志行，避免刷出「提交 0 条」。
+        assert!(submission_log_line(ChatSendTarget::PrimaryHall, 0).is_none());
+        assert!(submission_log_line(ChatSendTarget::CurrentChat, 0).is_none());
+    }
+
+    /// 全成功：一条 info，写明 `成功数/总数`，不额外告警。
+    #[test]
+    fn full_delivery_reports_sent_over_total_at_info() {
+        let outcome = ChatBatchSendOutcome::complete(5);
+        let lines = ChatSendReport::new(ChatSendTarget::PrimaryHall, &outcome, 5).lines();
+        assert_eq!(lines.len(), 1, "全部送达只应有一条结果日志: {lines:?}");
+        assert_eq!(lines[0].0, log::Level::Info);
+        assert_eq!(lines[0].1, "已在一级大厅发送 5/5 条回复");
+    }
+
+    /// **核心回归**：提交 5 条成功 3 条——必须同时写出「3/5」和「2 条未送达」。
+    ///
+    /// 旧实现只遍历 `outcome.sent`，于是日志只有 3 行「准备发送」，
+    /// 读起来像「只准备了 3 条」，完全看不出还有 2 条玩家没收到。
+    #[test]
+    fn partial_delivery_reports_sent_total_and_the_undelivered_count() {
+        let outcome = ChatBatchSendOutcome::failed(3, anyhow!("第二条超时"));
+        let lines = ChatSendReport::new(ChatSendTarget::CurrentChat, &outcome, 5).lines();
+        assert_eq!(lines.len(), 2, "部分失败必须有 info + warn 两条: {lines:?}");
+        assert_eq!(lines[0].0, log::Level::Info);
+        assert_eq!(lines[0].1, "已在当前聊天发送 3/5 条回复");
+        assert_eq!(lines[1].0, log::Level::Warn);
+        assert!(
+            lines[1].1.contains("有 2 条回复未送达"),
+            "必须写明未送达条数（5-3=2），实际：{}",
+            lines[1].1
+        );
+        assert!(
+            lines[1].1.contains("玩家看不到"),
+            "必须说明影响：玩家看不到这几条，实际：{}",
+            lines[1].1
+        );
+        assert!(
+            lines[1].1.contains("第二条超时"),
+            "必须带出失败原因，实际：{}",
+            lines[1].1
+        );
+    }
+
+    /// 一条都没送到：error 级别，且说明整批玩家都看不到。
+    #[test]
+    fn zero_delivery_is_reported_as_error() {
+        let outcome = ChatBatchSendOutcome::failed(0, anyhow!("一级大厅不可用"));
+        let lines = ChatSendReport::new(ChatSendTarget::PrimaryHall, &outcome, 4).lines();
+        assert_eq!(lines.len(), 1, "全失败只报一条 error: {lines:?}");
+        assert_eq!(lines[0].0, log::Level::Error);
+        assert!(lines[0].1.contains("发送 0/4 条回复全部失败"), "{}", lines[0].1);
+        assert!(lines[0].1.contains("玩家看不到"), "{}", lines[0].1);
+        assert!(lines[0].1.contains("一级大厅不可用"), "{}", lines[0].1);
+    }
+
+    /// 正文都发出去了但发送后恢复驻留失败：不能谎称整批没问题。
+    ///
+    /// 这类失败 `sent == total`，但界面位置未知、后续截图可能识别错，
+    /// 必须在 info 之外补一条 warn。
+    #[test]
+    fn delivered_but_residency_failed_still_warns() {
+        let outcome = ChatBatchSendOutcome::failed(3, anyhow!("恢复驻留超时"));
+        let lines = ChatSendReport::new(ChatSendTarget::PrimaryHall, &outcome, 3).lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0].0, log::Level::Info);
+        assert_eq!(lines[0].1, "已在一级大厅发送 3/3 条回复");
+        assert_eq!(lines[1].0, log::Level::Warn);
+        assert!(lines[1].1.contains("已全部送达"), "{}", lines[1].1);
+        assert!(lines[1].1.contains("未能恢复到原界面"), "{}", lines[1].1);
+        assert!(lines[1].1.contains("恢复驻留超时"), "{}", lines[1].1);
+    }
+
+    /// 三条发送路径共用同一套措辞：换目标只能改称谓，不能改句式与级别。
+    #[test]
+    fn every_send_target_uses_the_same_log_shape() {
+        for (target, label) in [
+            (ChatSendTarget::PrimaryHall, "一级大厅"),
+            (ChatSendTarget::CurrentChat, "当前聊天"),
+        ] {
+            assert_eq!(target.label(), label);
+            let (level, text) = submission_log_line(target, 1).unwrap();
+            assert_eq!(level, log::Level::Debug);
+            assert_eq!(text, format!("向{label}提交 1 条回复"));
+
+            let lines =
+                ChatSendReport::new(target, &ChatBatchSendOutcome::complete(1), 1).lines();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].0, log::Level::Info);
+            assert_eq!(lines[0].1, format!("已在{label}发送 1/1 条回复"));
+        }
     }
 
     #[test]

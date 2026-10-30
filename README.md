@@ -15,6 +15,38 @@ Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌�
 发布包包含主程序、登录辅助器和运行所需的媒体、OCR 资源；OCR 默认使用 OpenVINO（随包内置 Windows x64 运行时与 PP-OCRv6 IR 模型，CPU 推理），初始化失败时自动回退 MNN CPU。Windows WebView2 Evergreen Runtime 是登录功能的系统前置条件。系统需为 64 位 Windows 10/11；若启动时提示缺少 MSVC 运行库（例如 `vcruntime140.dll`），请安装 x64 Microsoft Visual C++ Redistributable。
 登录信息保存在本机的 `deps/data/credentials/`。
 
+## 外部聊天源（可选）
+
+本项目**可选**接入 `Miliastra-Wonderland-ChatBridge`，用它的消息代替屏幕 OCR 识别聊天内容。
+
+### 它是什么
+
+`Miliastra-Wonderland-ChatBridge` 是一个**独立的第三方可执行文件**，不是本项目的一部分，**不随本项目分发，需自行获取**。本程序只负责「发现它没在监听时把它拉起来」（需开启「自动启动」），不修改它、不控制它的行为。
+
+它的工作方式是：**拉起游戏 → 向游戏进程注入 DLL → 嗅探聊天包 → 通过本地 HTTP/WebSocket 把消息提供给本程序**。
+
+### 它能带来什么
+
+- 消息即时到达，没有 OCR 的滚动延迟与漏读。
+- 每条消息都带 UID，身份不再靠名字推断。
+- 能拿到好友备注名，歌单与记忆的归属更稳定。
+
+### ⚠️ 风险（请逐条阅读后自行判断）
+
+1. **注入类工具存在账号风险。** 向游戏进程注入 DLL 属于修改游戏运行时的行为，**可能违反游戏的用户协议**，存在被判定为第三方工具、进而导致账号处罚的可能。这个风险来自 ChatBridge 本身的工作方式，不是本项目的某个开关引入的。本项目**不做任何保证，也无法替使用者承担后果**。
+
+2. **「自动启动」会让本程序替你启动该注入器。** 开启 `chat_source.auto_start` 后，本程序发现 ChatBridge 没在监听就会启动它。该开关要求游戏未运行，因为 ChatBridge 要自己拉起游戏再注入。关闭此开关后，本程序不会主动启动任何外部程序。
+
+3. **访问令牌以命令行参数明文传递。** 本程序通过 `--token` 把访问令牌作为命令行参数传给 ChatBridge，**同一台机器上的其他程序与用户可以在进程列表中看到该令牌**。多账号或多用户共用一台机器时尤其需要注意。
+
+4. **不要把它指向不受信任的地址。** `chat_source.url` 与 `chat_source.token` 一旦配错，聊天内容（含玩家昵称、UID、正文）会发往该地址。默认地址为本机回环地址，请勿改成本机以外的地址，除非明确知道自己在做什么。
+
+### 不开启也能正常使用
+
+不启用外部聊天源时，程序**自动回落到纯 OCR 链路**，原有功能全部保留。差别是消息有延迟、可能漏读、拿不到备注名、身份只能靠名字推断。**这是设计边界，不是故障。** 外部源失联超过配置的「失联回落阈值」时，也会自动回落到 OCR。
+
+配置方法见 [用户使用指南 · 外部聊天源（ChatBridge）](docs/user-guide.md#13-外部聊天源chatbridge)。
+
 ## 简易配置流程
 
 1. 解压发布包，在 `config.yaml` 中确认 `database_path`、`http.host` 和 `http.port`。
@@ -29,6 +61,7 @@ Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌�
 ## 用户文档
 
 - [用户使用指南](docs/user-guide.md)：安装、配置、常用命令、好友操作、歌词、队列和故障排查。
+- [外部聊天源（ChatBridge）](docs/user-guide.md#13-外部聊天源chatbridge)：可选的第三方消息源，含配置方法与风险说明。
 - [成语接龙](docs/idiom-chain.md)：玩法、命令和词库配置。
 - [海龟汤](docs/turtle-soup.md)：开局、提问、长答案和题库配置。
 - [斗地主与跑得快](docs/card-games.md)：组局、抢地主、出牌、手牌查询和投递重试。

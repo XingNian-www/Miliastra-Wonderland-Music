@@ -394,7 +394,10 @@ fn run(
         let mut source = match WebSocketChatSource::new(config.url.clone(), config.token.clone()) {
             Ok(source) => source,
             Err(error) => {
-                log::error!("外部聊天源初始化失败: {error:#}");
+                log::error!(
+                    "外部聊天源初始化失败（步骤：建立 WebSocket 连接），{} 毫秒后重试；重试期间外部聊天源没有接管，聊天仍由 OCR 识别，外部源独有的消息（含备注名）拿不到: {error:#}",
+                    reconnect.as_millis()
+                );
                 thread::sleep(reconnect);
                 continue;
             }
@@ -633,7 +636,9 @@ fn deliver(
                         && let Some(store) = config_store
                         && let Err(error) = persist_identity(store, &live_configs, identity)
                     {
-                        log::warn!("自动创建的身份未能写入数据库: {error:#}");
+                        log::warn!(
+                            "自动创建的身份未能写入数据库（步骤：好友首次私聊时自动登记身份），本次运行内该身份仍有效（可按 UID 判权限），但面板看不到它；配置重载或重启后会被库里的旧值覆盖，重新创建一次: {error:#}"
+                        );
                     }
                 }
             }
@@ -676,7 +681,9 @@ fn deliver(
                 log::debug!("外部聊天源注入 {} 条消息", accepted.len());
             }
         }
-        Err(error) => log::warn!("外部聊天源注入失败: {error:#}"),
+        Err(error) => log::warn!(
+            "外部聊天源注入失败（步骤：把本批消息写入聊天时间线），本批消息没有进入处理流程，玩家的命令不会执行；序号水位不推进，重连后会重新补拉这一段: {error:#}"
+        ),
     }
 }
 
@@ -730,7 +737,9 @@ fn spawn_name_resolver(
                                     && let Err(error) =
                                         persist_identity(store, &live_configs, identity)
                                 {
-                                    log::warn!("ChatBridge 备注未能写入身份映射: {error:#}");
+                                    log::warn!(
+                                        "ChatBridge 备注未能写入身份映射（步骤：用备注覆盖昵称作匹配键），本次匹配仍沿用旧昵称；备注对应的权限判定可能对不上，下次配置重载或重启前不会自动纠正: {error:#}"
+                                    );
                                 }
                             }
                             None => {
@@ -750,7 +759,9 @@ fn spawn_name_resolver(
                                         && let Err(error) =
                                             persist_identity(store, &live_configs, identity)
                                     {
-                                        log::warn!("补查到的昵称未能写入身份映射: {error:#}");
+                                        log::warn!(
+                                            "补查到的昵称未能写入身份映射（步骤：把资料包昵称补进展示名），该身份在面板里仍显示原占位名；配置重载或重启后会被库里的旧值覆盖，需重新补查: {error:#}"
+                                        );
                                     }
                                 }
                             }
@@ -809,11 +820,15 @@ fn ws_url_to_http(ws_url: &str) -> String {
 /// "千星/大厅"，否则会得到"蓝色判新"从而重放历史），并清空命令锁。
 fn reset_after_source_change(timeline: &ChatTimeline) {
     if let Err(error) = timeline.note_baseline("外部聊天源切换") {
-        log::warn!("重置聊天基线失败: {error:#}");
+        log::warn!(
+            "重置聊天基线失败（步骤：切换数据源后重建聊天基线），命令锁也因此没有清空；新数据源的首屏历史可能被当作新消息重放到业务层，同一命令有被执行两次的风险: {error:#}"
+        );
         return;
     }
     if let Err(error) = timeline.clear_command_locks() {
-        log::warn!("重置命令锁失败: {error:#}");
+        log::warn!(
+            "重置命令锁失败（步骤：切换数据源后清空旧的命令锁），旧锁的屏幕坐标对新数据源无意义；同文本命令可能被误判为已处理而静默跳过，也可能重复执行: {error:#}"
+        );
     }
 }
 

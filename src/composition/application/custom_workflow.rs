@@ -99,7 +99,9 @@ impl ApplicationRuntime {
 
     fn notify_friend_invite_decision(&self, recipients: &[String], message: &str) -> bool {
         if recipients.is_empty() {
-            log::error!("好友邀请确认回复失败: 没有可用的收件人名字");
+            log::error!(
+                "好友邀请确认回复失败（步骤：确定收件人），没有可用的收件人名字，本次无法回复该好友，对方不知道邀请处理结果；通常是发起人未登记身份映射或昵称/UID 均缺失，需先补全身份配置"
+            );
             return false;
         }
         // 收件人主键沿用第一个候选，其余候选随投递一起下发用于搜列表。
@@ -121,11 +123,19 @@ impl ApplicationRuntime {
                 false
             }
             Ok(FriendBatchOutcome::Failed { failure, .. }) => {
-                log::error!("好友邀请确认回复失败: {}", failure.reason());
+                log::error!(
+                    "好友邀请确认回复失败（步骤：向好友发送确认结果），本次没有回复该好友，对方不知道邀请处理结果；本次流程仍会继续，后续可重试：{}",
+                    failure.reason()
+                );
                 false
             }
             Err(error) => {
-                log::error!("好友邀请确认回复失败: {error:#}");
+                // 核实要点：投递失败大多被转成 Ok(Failed{..}) 由上一条分支处理，
+                // 走到 Err 的是**前置查询**失败（如读不到当前界面驻留），
+                // 也就是说连"该往哪个界面投递"都确定不了。
+                log::error!(
+                    "好友邀请确认回复失败（步骤：准备好友投递批次），本次没有回复该好友，对方不知道邀请处理结果；失败发生在投递开始前的环境查询（通常是取不到当前界面驻留），投递本身没有发出，在界面状态恢复正常前后续好友回复也会同样失败：{error:#}"
+                );
                 false
             }
         }
@@ -501,7 +511,11 @@ impl InviteExecutionPort for ApplicationRuntime {
                 if residency_failure.is_none() {
                     if let Err(error) = self.reply_invite_ready("BOT已经就绪,可以使用@麦克风指令了")
                     {
-                        log::error!("邀请就绪消息发送失败: {error:#}");
+                        // 影响要写清：这只是「通知没发出去」，大厅其实已经进了，
+                        // 玩家会看到 BOT 已在大厅但没收到提示，容易重复发 @邀请。
+                        log::error!(
+                            "邀请就绪消息发送失败（步骤：在一级大厅播报就绪）：邀请本身已成功进入目标大厅，但玩家没收到「可以开始使用命令」的提示，可能重复发起邀请；本次不重试该播报：{error:#}"
+                        );
                         let warning = format!("邀请已进入，但就绪消息未确认发送: {error:#}");
                         notification_warning = Some(match notification_warning.take() {
                             Some(previous) => format!("{previous}; {warning}"),

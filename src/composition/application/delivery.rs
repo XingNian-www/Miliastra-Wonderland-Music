@@ -272,7 +272,7 @@ impl ApplicationRuntime {
             Err(error) => {
                 // 生成失败就删掉占位符，别让花括号发到游戏里。
                 log::debug!(
-                    "回复模板「{}」的 AI 回复生成失败，该位置留空继续发送，玩家看到的是模板其余部分: {error:#}",
+                    "回复模板「{}」的 AI 回复生成失败，该位置留空继续发送，玩家看到的是模板其余部分：{error:#}",
                     spec.key
                 );
                 out.text = out.text.replace(&tag, "");

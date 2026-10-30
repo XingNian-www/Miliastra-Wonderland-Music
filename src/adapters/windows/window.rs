@@ -739,7 +739,7 @@ impl Drop for WgcSession {
         if let Some(control) = self.control.take()
             && let Err(error) = control.stop()
         {
-            log::debug!("WGC 采集会话未能正常停止，采集资源可能延后释放: {error}");
+            log::debug!("WGC 采集会话未能正常停止，采集资源可能延后释放：{error}");
         }
     }
 }
@@ -819,7 +819,7 @@ fn note_wgc_unavailable(hwnd: HWND, error: &anyhow::Error) {
     if already_noted {
         return;
     }
-    log::info!("WGC 采集不可用，本次已回落到 GDI 窗口采集，截图可继续但帧率可能下降: {message}");
+    log::info!("WGC 采集不可用，本次已回落到 GDI 窗口采集，截图可继续但帧率可能下降：{message}");
     *noted = Some((window, message));
 }
 
@@ -1205,7 +1205,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         }
         Err(error) => {
             log::debug!(
-                "无法读取窗口所属进程名（进程号 {process_id}），该窗口按「非目标窗口」跳过: {error:#}"
+                "无法读取窗口所属进程名（进程号 {process_id}），该窗口按「非目标窗口」跳过：{error:#}"
             );
         }
     }

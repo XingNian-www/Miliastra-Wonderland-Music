@@ -239,7 +239,7 @@ impl ProductionOcrDevice {
                         *lock_rebuild_due_at(&rebuild_due_at) =
                             Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
                         log::error!(
-                            "OCR 引擎后台重建失败（步骤：加载识别模型），本次重建未完成，识别继续由旧引擎承担，将于稍后重试: {error:#}"
+                            "OCR 引擎后台重建失败（步骤：加载识别模型），本次重建未完成，识别继续由旧引擎承担，将于稍后重试：{error:#}"
                         );
                     }
                 }
@@ -250,7 +250,7 @@ impl ProductionOcrDevice {
             *lock_rebuild_due_at(&self.rebuild_due_at) =
                 Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
             log::error!(
-                "无法启动 OCR 引擎后台重建线程（步骤：创建重建线程），本次重建跳过，识别继续由旧引擎承担，将于稍后重试: {error:#}"
+                "无法启动 OCR 引擎后台重建线程（步骤：创建重建线程），本次重建跳过，识别继续由旧引擎承担，将于稍后重试：{error:#}"
             );
         } else {
             *lock_rebuild_due_at(&self.rebuild_due_at) = Instant::now() + OCR_REBUILD_INTERVAL;

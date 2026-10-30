@@ -587,7 +587,7 @@ fn moderation_action_result(
             ) =>
         {
             log::error!(
-                "{} UID{} 未执行（步骤：在管理界面完成搜索与点击并确认结果），目标账号状态没有变化；执行器返回「确认未执行」，因此按失败回报，大厅会收到流程出错提示: {failure}",
+                "{} UID{} 未执行（步骤：在管理界面完成搜索与点击并确认结果），目标账号状态没有变化；执行器返回「确认未执行」，因此按失败回报，大厅会收到流程出错提示：{failure}",
                 command.action.label(),
                 command.uid
             );
@@ -756,7 +756,7 @@ impl ApplicationRuntime {
                 Ok(mut port) => moderation.run_vote(work, &mut port, &task_context),
                 Err(error) => {
                     log::error!(
-                        "{} UID{} 的后台投票无法开始（步骤：建立投票观察窗口），本局改按「未通过」处理并已公布结果；若管理员本来要执行，需要重新发起命令: {error:#}",
+                        "{} UID{} 的后台投票无法开始（步骤：建立投票观察窗口），本局改按「未通过」处理并已公布结果；若管理员本来要执行，需要重新发起命令：{error:#}",
                         action.label(),
                         uid
                     );
@@ -766,7 +766,7 @@ impl ApplicationRuntime {
             if let Err(error) = result {
                 // 结果没能入队 = 这次投票的结论丢了：既不会执行动作，也不会有任何大厅通告。
                 log::error!(
-                    "{} UID{} 的投票结果未能加入待执行队列（步骤：投票结束后把结论交给正式任务），本局结论丢失——既不执行动作也不公布结果，管理员需要重新发起命令: {error:#}",
+                    "{} UID{} 的投票结果未能加入待执行队列（步骤：投票结束后把结论交给正式任务），本局结论丢失——既不执行动作也不公布结果，管理员需要重新发起命令：{error:#}",
                     action.label(),
                     uid
                 );

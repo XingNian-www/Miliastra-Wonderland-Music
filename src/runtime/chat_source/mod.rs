@@ -67,7 +67,7 @@ pub(crate) fn parse_frame(text: &str) -> anyhow::Result<Option<ChatSourceEvent>>
             // 不打印原始帧：帧体里含玩家昵称、会话 ID 与聊天正文。
             // 只记长度，够判断「是不是整帧都没解析出来」。
             log::debug!(
-                "收到无法解析的外部聊天帧，已忽略并继续读取下一帧；帧长 {} 字节: {error}",
+                "收到无法解析的外部聊天帧，已忽略并继续读取下一帧；帧长 {} 字节：{error}",
                 text.len()
             );
             return Ok(None);

@@ -1114,7 +1114,7 @@ impl HttpServer {
 impl Drop for HttpServer {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown_inner() {
-            log::error!("HTTP/Web 面板关闭失败: {error:#}");
+            log::error!("HTTP/Web 面板关闭失败：{error:#}");
         }
     }
 }
@@ -1150,7 +1150,7 @@ pub fn start(state: HttpSharedState) -> Result<HttpServer> {
         .name("http-server".to_string())
         .spawn(move || run_server(runtime, listener, state, shutdown_receiver))
         .context("启动 HTTP server thread")?;
-    log::info!("HTTP/Web 面板已启动: http://{}", local_addr);
+    log::info!("HTTP/Web 面板已启动：http://{}", local_addr);
     Ok(HttpServer {
         #[cfg(test)]
         local_addr,

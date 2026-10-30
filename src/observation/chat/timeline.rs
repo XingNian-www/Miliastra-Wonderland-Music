@@ -1045,7 +1045,7 @@ impl ChatTimeline {
                 BubbleSequence::new(external_sequence(&dedup)),
             );
             if state.ledger.claimed.contains(&id) || state.ledger.pending.contains(&id) {
-                log::debug!("外部聊天消息重复，已忽略: {dedup}");
+                log::debug!("外部聊天消息重复，已忽略：{dedup}");
                 continue;
             }
             let sender = message
@@ -1055,7 +1055,7 @@ impl ChatTimeline {
                 .filter(|name| !name.trim().is_empty());
             if sender.is_none() {
                 // 昵称缺失时无法解析命令主语：按"未知发送者"处理，不授权。
-                log::debug!("外部聊天消息缺少昵称，按未授权处理: {dedup}");
+                log::debug!("外部聊天消息缺少昵称，按未授权处理：{dedup}");
             }
             let revision = BusinessMessageRevision {
                 text: message.text.clone(),

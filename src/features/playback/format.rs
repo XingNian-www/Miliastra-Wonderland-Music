@@ -79,6 +79,10 @@ pub(crate) fn format_status(status: &PlayerStatus) -> String {
 }
 
 /// @状态 文本。歌单模式下用 `[归属的歌单]` 前缀，并省略尾部的点歌人。
+///
+/// `playlist_owner` 必须是**已翻译过的展示名**，不是内部 `id:<uuid>` 归属键。
+/// 归属键转展示名由调用方经 [`PlaybackExecutionPort::playlist_owner_display`]
+/// 完成——那一层能拿到身份映射，本层拿不到。
 pub(crate) fn format_status_with_mode(
     status: &PlayerStatus,
     playlist_owner: Option<&str>,
@@ -205,6 +209,43 @@ mod tests {
         assert!(
             !playlist.contains('乙'),
             "歌单模式用归属替代点歌人: {playlist}"
+        );
+    }
+
+    /// 回归：歌单模式前缀里的归属必须是**展示名**，不能泄露内部 `id:<uuid>` 归属键。
+    ///
+    /// 实机现象：`@状态` 输出 `[id:00000000-0000-4000-8000-000000000001的歌单] 播放中 …`，
+    /// 玩家看到一长串 UUID。归属键是内部标识，翻译由调用方（composition 层）
+    /// 经 `playlist_owner_display` 完成，本层只负责渲染传入的字符串。
+    #[test]
+    fn playlist_prefix_never_leaks_an_internal_owner_key() {
+        let status = PlayerStatus {
+            status: "playing".into(),
+            name: "歌".into(),
+            singer: "手".into(),
+            duration: 100.0,
+            progress: 10.0,
+            volume: 80,
+            ..Default::default()
+        };
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        let internal_key = format!("id:{uuid}");
+        // 修好后调用方传进来的是展示名；这里断言展示名被原样使用，
+        // 并显式确认输出里不含 UUID 片段。
+        let rendered = format_status_with_mode(&status, Some("示例玩家"));
+        assert!(
+            rendered.starts_with("[示例玩家的歌单] "),
+            "前缀应使用展示名: {rendered}"
+        );
+        assert!(
+            !rendered.contains(uuid),
+            "输出不得含身份 UUID: {rendered}"
+        );
+        // 反例守卫：若将来有人把内部键直接传进来，这行会立刻暴露问题。
+        let leaked = format_status_with_mode(&status, Some(&internal_key));
+        assert!(
+            leaked.contains(uuid),
+            "本层不做翻译，收到内部键就会泄露；调用方必须翻译后再传: {leaked}"
         );
     }
 

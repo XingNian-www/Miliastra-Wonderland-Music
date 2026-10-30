@@ -395,7 +395,7 @@ impl Drop for ChatObservationExclusiveGuard {
             return;
         };
         if let Err(error) = self.shared.finish_exclusive(session) {
-            log::error!("结束独占聊天观察会话失败: {error:#}");
+            log::error!("结束独占聊天观察会话失败：{error:#}");
         }
     }
 }

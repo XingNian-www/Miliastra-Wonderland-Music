@@ -395,7 +395,10 @@ impl CardGameVariant {
 
 #[derive(Clone)]
 struct Player {
+    /// 面向玩家的展示名（note 优先）。**绝不可是内部 UUID 归属键**：
+    /// 它会被渲染进「{玩家} 抢地主」这类文案。
     name: String,
+    /// 身份比较键。同一玩家的 `name` 可能变（改备注、换映射），`key` 保持稳定。
     key: String,
     hand: Vec<Card>,
     timeouts: u32,
@@ -404,10 +407,25 @@ struct Player {
 }
 
 impl Player {
+    /// 仅供测试与「无身份映射」场景；生产路径用 `with_display` 分别传展示名与比较键。
+    /// 两者相等会让 UUID 渲染进玩家文案——见 `uid_key_never_leaks_into_card_game_copy`。
     fn new(name: &str) -> Self {
+        Self::with_display(name, name)
+    }
+
+    /// 建玩家，但**展示名与身份键分开**。
+    ///
+    /// `key_source` 是内部归属键（已登记身份为 UUID），只参与比较与查找；
+    /// `display` 是玩家看得懂的名字，只参与渲染。
+    fn with_display(key_source: &str, display: &str) -> Self {
+        let display = display.trim();
         Self {
-            name: name.trim().to_string(),
-            key: player_key(name),
+            name: if display.is_empty() {
+                key_source.trim().to_string()
+            } else {
+                display.to_string()
+            },
+            key: player_key(key_source),
             hand: Vec::new(),
             timeouts: 0,
             trustee: false,
@@ -590,6 +608,16 @@ impl LandlordGame {
         variant: CardGameVariant,
         now: Instant,
     ) -> LandlordOutcome {
+        self.create_variant_with_display(player, player, variant, now)
+    }
+
+    fn create_variant_with_display(
+        &mut self,
+        player: &str,
+        player_display: &str,
+        variant: CardGameVariant,
+        now: Instant,
+    ) -> LandlordOutcome {
         if !self.config.enabled {
             return LandlordOutcome::public(
                 "disabled",
@@ -606,7 +634,7 @@ impl LandlordGame {
             );
         }
         self.state = GameState::Lobby(Lobby {
-            players: vec![Player::new(player)],
+            players: vec![Player::with_display(player, player_display)],
             variant,
             timer: ActiveTimer::new(now),
         });
@@ -615,13 +643,27 @@ impl LandlordGame {
             keyed_reply(
                 &templates::LOBBY_CREATED,
                 ReplyVars::new()
-                    .with("玩家", player.trim())
+                    .with("玩家", player_display.trim())
                     .with("玩法", variant.label()),
             ),
         )
     }
 
+    /// 兼容入口：展示名与身份键相同。
+    pub fn create_with_display(&mut self, player: &str, player_display: &str, now: Instant) -> LandlordOutcome {
+        self.create_variant_with_display(player, player_display, CardGameVariant::Landlord, now)
+    }
+
     pub fn join(&mut self, player: &str, now: Instant) -> LandlordOutcome {
+        self.join_with_display(player, player, now)
+    }
+
+    pub fn join_with_display(
+        &mut self,
+        player: &str,
+        player_display: &str,
+        now: Instant,
+    ) -> LandlordOutcome {
         let GameState::Lobby(lobby) = &mut self.state else {
             return LandlordOutcome::public(
                 "no-lobby",
@@ -638,7 +680,9 @@ impl LandlordGame {
                 ),
             );
         }
-        lobby.players.push(Player::new(player));
+        lobby
+            .players
+            .push(Player::with_display(player, player_display));
         lobby.timer.reset(now);
         if lobby.players.len() < 3 {
             return LandlordOutcome::public(
@@ -646,7 +690,7 @@ impl LandlordGame {
                 keyed_reply(
                     &templates::LOBBY_JOINED,
                     ReplyVars::new()
-                        .with("玩家", player.trim())
+                        .with("玩家", player_display.trim())
                         .with("玩法", lobby.variant.label()),
                 ),
             );
@@ -716,10 +760,32 @@ impl LandlordGame {
         command: &LandlordCommand,
         now: Instant,
     ) -> LandlordOutcome {
+        // 未区分展示名与身份键时两者相同：保留既有签名给测试与内部调用。
+        self.handle_with_display(player, player, command, now)
+    }
+
+    /// `player` 是身份键（参与比较与查找），`player_display` 是给玩家看的名字。
+    ///
+    /// 两者必须分开：已登记身份的 `player` 是 UUID，直接渲染会让玩家看到
+    /// 一长串十六进制。
+    pub fn handle_with_display(
+        &mut self,
+        player: &str,
+        player_display: &str,
+        command: &LandlordCommand,
+        now: Instant,
+    ) -> LandlordOutcome {
         match command {
-            LandlordCommand::Start => self.create(player, now),
-            LandlordCommand::RunFastStart => self.create_run_fast(player, now),
-            LandlordCommand::Join => self.join(player, now),
+            LandlordCommand::Start => self.create_with_display(player, player_display, now),
+            LandlordCommand::RunFastStart => {
+                self.create_variant_with_display(
+                    player,
+                    player_display,
+                    CardGameVariant::HunanRunFast,
+                    now,
+                )
+            }
+            LandlordCommand::Join => self.join_with_display(player, player_display, now),
             LandlordCommand::Rob => self.bid(player, true, now),
             LandlordCommand::Decline => self.bid(player, false, now),
             LandlordCommand::Status => self.status(),
@@ -2437,6 +2503,41 @@ mod tests {
         );
     }
 
+
+    /// 回归：已登记身份的 UUID 不得进玩家可见文案。
+    ///
+    /// `player` 是身份键（UUID），`player_display` 是展示名。若两者混用，
+    /// 「{玩家}创建了牌局」里会出现一长串十六进制。
+    #[test]
+    fn uid_key_never_leaks_into_card_game_copy() {
+        let mut game = LandlordGame::new(LandlordConfig::default());
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        let outcome = game.create_with_display(uuid, "显示名甲", Instant::now());
+        let text = outcome
+            .public_reply_template
+            .as_ref()
+            .expect("创建牌局应当返回模板")
+            .render_default();
+        assert!(
+            !text.contains(uuid),
+            "文案不得含身份 UUID: {text}"
+        );
+        assert!(
+            text.contains("显示名甲"),
+            "文案应使用展示名: {text}"
+        );
+    }
+
+    /// 同一人的 `key` 与 `name` 分离后，加入牌局仍能按身份键去重。
+    #[test]
+    fn identity_key_still_deduplicates_when_display_differs() {
+        let mut game = LandlordGame::new(LandlordConfig::default());
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        game.create_with_display(uuid, "显示名甲", Instant::now());
+        // 同一 UUID、展示名换成另一个（例如期间改了备注）：仍应判为重复。
+        let outcome = game.join_with_display(uuid, "显示名乙", Instant::now());
+        assert_eq!(outcome.action, "duplicate-player");
+    }
     #[test]
     fn aborting_while_a_formal_effect_is_in_flight_fails_its_command_chain() {
         let mut service = TestCardGameService::new(LandlordConfig::default());

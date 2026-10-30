@@ -77,7 +77,7 @@ pub(crate) const REPLY_GROUPS: &[CommandReplyGroup] = &[
             "playlist.unfavorite.no_track",
             "playlist.unfavorite.removed",
             "playlist.unfavorite.missing",
-            "playlist.random.picked",
+            "playlist.random.queued",
             "playlist.empty.hint",
             "playlist.empty.plain",
             // 歌单模式开关。

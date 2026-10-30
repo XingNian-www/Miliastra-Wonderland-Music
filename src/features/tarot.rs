@@ -207,6 +207,11 @@ impl TarotApplication {
         transaction.commit()?;
         Ok(cards)
     }
+    /// 执行塔罗命令。
+    ///
+    /// `actor` 是**内部归属键**（已登记身份为 UUID），只用于按日抽牌与存储，
+    /// **绝不出现在文案里**；`actor_display` 是给玩家看的展示名（note 优先）。
+    /// 两个参数分开传，是因为「用谁的身份记账」与「给人看什么名字」是两件事。
     pub(crate) fn execute(
         &self,
         actor: &str,
@@ -214,12 +219,46 @@ impl TarotApplication {
         now: Instant,
         gateway: &dyn TarotAiGateway,
     ) -> Result<Vec<TarotReply>> {
-        // 每次命令只读取一次墙上时间，模型等待跨午夜不会混用两天的牌。
-        self.execute_for_day(actor, command, now, utc8_day_at(SystemTime::now()), gateway)
+        // 兼容入口：未区分展示名时两者相同（测试与未登记玩家）。
+        self.execute_with_display(actor, actor, command, now, gateway)
     }
+
+    /// 展示名与内部键分开的入口；生产路径走这条。
+    pub(crate) fn execute_with_display(
+        &self,
+        actor: &str,
+        actor_display: &str,
+        command: &TarotCommand,
+        now: Instant,
+        gateway: &dyn TarotAiGateway,
+    ) -> Result<Vec<TarotReply>> {
+        // 每次命令只读取一次墙上时间，模型等待跨午夜不会混用两天的牌。
+        self.execute_for_day_with_display(
+            actor,
+            actor_display,
+            command,
+            now,
+            utc8_day_at(SystemTime::now()),
+            gateway,
+        )
+    }
+
     fn execute_for_day(
         &self,
         actor: &str,
+        command: &TarotCommand,
+        now: Instant,
+        day: i64,
+        gateway: &dyn TarotAiGateway,
+    ) -> Result<Vec<TarotReply>> {
+        self.execute_for_day_with_display(actor, actor, command, now, day, gateway)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_for_day_with_display(
+        &self,
+        actor: &str,
+        actor_display: &str,
         command: &TarotCommand,
         now: Instant,
         day: i64,
@@ -281,11 +320,19 @@ impl TarotApplication {
         }
         // 释放存储锁之后才调用AI，网络等待不会持有数据库事务。
         let cards = self.cards_for_day(actor, day, reroll)?;
-        let nickname: String = actor
+        // 展示名取自调用方传入的 `actor_display`；**不能拿 `actor` 兜底**——
+        // 已登记身份的 `actor` 是 UUID，直接渲染会给玩家看一长串十六进制。
+        let nickname: String = actor_display
+            .trim()
             .chars()
             .take(12)
             .filter(|ch| !matches!(ch, '@' | '#' | '＃') && !ch.is_control())
             .collect();
+        let nickname = if nickname.is_empty() {
+            "玩家".to_string()
+        } else {
+            nickname
+        };
         // 标题保留模板 key：在这里先渲染成 Raw 会让用户的塔罗标题覆盖失效。
         let mut messages: Vec<TarotReply> = vec![TarotReply::KeyedFitted {
             label: "塔罗",
@@ -322,7 +369,7 @@ impl TarotApplication {
                     Ok(result) => messages.extend(result.into_iter().map(TarotReply::Raw)),
                     Err(error) => {
                         log::warn!(
-                            "塔罗 AI 解读失败（步骤：请模型解牌）；本次改为回复「AI 暂不可用」提示: {error:#}"
+                            "塔罗 AI 解读失败（步骤：请模型解牌）；本次改为回复「AI 暂不可用」提示：{error:#}"
                         );
                         messages.push(TarotReply::Keyed {
                             spec: &templates::AI_UNAVAILABLE,

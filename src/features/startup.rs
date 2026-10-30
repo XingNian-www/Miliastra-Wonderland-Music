@@ -308,7 +308,7 @@ impl StartupService {
         let mut reset_window_detection = |reason| {
             if let Err(error) = port.request_window_rescan(reason) {
                 log::error!(
-                    "重置窗口检测退避失败（步骤：启动过程中重新请求扫描窗口）；后续窗口检测可能沿用旧的退避节奏: {error:#}"
+                    "重置窗口检测退避失败（步骤：启动过程中重新请求扫描窗口）；后续窗口检测可能沿用旧的退避节奏：{error:#}"
                 );
             }
         };

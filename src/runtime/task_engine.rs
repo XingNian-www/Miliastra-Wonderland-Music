@@ -90,7 +90,7 @@ impl Drop for TaskEnginePermit {
             return;
         };
         if let Err(error) = self.engine.release_lane(lease) {
-            log::debug!("任务引擎通道未能正常释放，任务槽位可能延后归还: {error}");
+            log::debug!("任务引擎通道未能正常释放，任务槽位可能延后归还：{error}");
         }
     }
 }

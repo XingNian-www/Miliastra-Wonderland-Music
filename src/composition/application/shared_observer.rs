@@ -285,7 +285,7 @@ impl ApplicationRuntime {
                         let _ =
                             timeline.report_failure(format!("passive chat recognition: {error:#}"));
                         log::warn!(
-                            "共享聊天观察本轮识别失败（步骤：被动 OCR 识别聊天区），这一帧不计入成功扫描缓存，也不会满足刷新请求，下一轮会重新尝试: {error:#}"
+                            "共享聊天观察本轮识别失败（步骤：被动 OCR 识别聊天区），这一帧不计入成功扫描缓存，也不会满足刷新请求，下一轮会重新尝试：{error:#}"
                         );
                     }
                 }

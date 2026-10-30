@@ -332,7 +332,7 @@ impl InviteExecution {
         .text;
         if let Err(error) = port.send_hall(&announce) {
             log::error!(
-                "邀请通告发送失败（步骤：在大厅征求成员同意）；改为直接执行邀请，未征求同意: {error:#}"
+                "邀请通告发送失败（步骤：在大厅征求成员同意）；改为直接执行邀请，未征求同意：{error:#}"
             );
             return execute_approved_invite(
                 port,
@@ -379,7 +379,7 @@ fn execute_approved_invite(
         let message = format!("邀请已完成，但好友通知失败：{warning}");
         if let Err(error) = port.send_hall(&message) {
             log::error!(
-                "发送邀请通知警告失败（步骤：邀请前提醒目标玩家）；邀请流程继续，对方可能没收到提醒: {error:#}"
+                "发送邀请通知警告失败（步骤：邀请前提醒目标玩家）；邀请流程继续，对方可能没收到提醒：{error:#}"
             );
         }
     }

@@ -502,7 +502,7 @@ impl ChatOutput {
             HallBatchStatus::Failed(failure) => {
                 if let UiResidencyOutcome::Failed(residency) = outcome.residency() {
                     log::error!(
-                        "大厅批量回复发送失败，之后恢复界面驻留也失败（步骤：发送后回到原界面），当前界面位置未知，后续截图与点击可能识别错界面: {residency}"
+                        "大厅批量回复发送失败，之后恢复界面驻留也失败（步骤：发送后回到原界面），当前界面位置未知，后续截图与点击可能识别错界面：{residency}"
                     );
                 }
                 ChatBatchSendOutcome::failed(sent, anyhow!(failure.to_string()))

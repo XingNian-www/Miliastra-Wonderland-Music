@@ -241,11 +241,11 @@ fn run_background_lyrics(
             Err(error) => {
                 if snapshot_fail.should_warn(Instant::now()) {
                     log::warn!(
-                        "后台歌词暂缓发送（步骤：查询正式任务状态），本轮不发送歌词，等下一次刷新再试: {error:#}；本条在问题持续期间最多每分钟重复一次"
+                        "后台歌词暂缓发送（步骤：查询正式任务状态），本轮不发送歌词，等下一次刷新再试：{error:#}；本条在问题持续期间最多每分钟重复一次"
                     );
                 } else {
                     log::debug!(
-                        "后台歌词仍在暂缓发送（步骤：查询正式任务状态），等待任务调度恢复: {error:#}"
+                        "后台歌词仍在暂缓发送（步骤：查询正式任务状态），等待任务调度恢复：{error:#}"
                     );
                 }
                 if !sleep_background_lyrics_poll(poll, deadline, &running, &stop) {
@@ -287,18 +287,18 @@ fn run_background_lyrics(
                         Err(error) => {
                             if enqueue_fail.should_warn(Instant::now()) {
                                 log::warn!(
-                                    "后台歌词入队失败（步骤：把歌词加入发送队列），这段歌词不会显示: {error:#}；本条在问题持续期间最多每分钟重复一次"
+                                    "后台歌词入队失败（步骤：把歌词加入发送队列），这段歌词不会显示：{error:#}；本条在问题持续期间最多每分钟重复一次"
                                 );
                             } else {
                                 log::debug!(
-                                    "后台歌词仍无法入队（步骤：把歌词加入发送队列），继续跳过本段歌词: {error:#}"
+                                    "后台歌词仍无法入队（步骤：把歌词加入发送队列），继续跳过本段歌词：{error:#}"
                                 );
                             }
                         }
                     }
                 }
             }
-            Err(error) => log::debug!("后台歌词读取播放器状态失败: {error:#}"),
+            Err(error) => log::debug!("后台歌词读取播放器状态失败：{error:#}"),
         }
 
         if !sleep_background_lyrics_poll(poll, deadline, &running, &stop) {
@@ -390,7 +390,7 @@ impl ApplicationRuntime {
         thread::spawn(move || {
             log::info!("延迟聊天发送线程已启动");
             if let Err(error) = sender.run() {
-                log::error!("延迟聊天发送线程异常退出（步骤：发送队列循环），后续排队中的回复不会再发出，需要重启程序: {error:#}");
+                log::error!("延迟聊天发送线程异常退出（步骤：发送队列循环），后续排队中的回复不会再发出，需要重启程序：{error:#}");
             }
         })
     }
@@ -547,22 +547,22 @@ impl DeferredChatSender {
                     Err(error) => {
                         if self.epoch_check_fail.should_warn(Instant::now()) {
                             log::warn!(
-                                "后台歌词暂缓发送（步骤：校验正式任务代际），本轮不发送，等下一次刷新再试: {error:#}；本条在问题持续期间最多每分钟重复一次"
+                                "后台歌词暂缓发送（步骤：校验正式任务代际），本轮不发送，等下一次刷新再试：{error:#}；本条在问题持续期间最多每分钟重复一次"
                             );
                         } else {
                             log::debug!(
-                                "后台歌词仍在暂缓发送（步骤：校验正式任务代际），继续等待任务调度恢复: {error:#}"
+                                "后台歌词仍在暂缓发送（步骤：校验正式任务代际），继续等待任务调度恢复：{error:#}"
                             );
                         }
                         drop(sending);
                         if let Err(requeue_error) = self.task_engine.requeue_deferred_front(item) {
                             if self.requeue_fail.should_warn(Instant::now()) {
                                 log::warn!(
-                                    "后台歌词重新入队失败（步骤：暂缓后重新排队），这段歌词不会显示: {requeue_error:#}；本条在问题持续期间最多每分钟重复一次"
+                                    "后台歌词重新入队失败（步骤：暂缓后重新排队），这段歌词不会显示：{requeue_error:#}；本条在问题持续期间最多每分钟重复一次"
                                 );
                             } else {
                                 log::debug!(
-                                    "后台歌词仍无法重新入队（步骤：暂缓后重新排队），继续丢弃这段歌词: {requeue_error:#}"
+                                    "后台歌词仍无法重新入队（步骤：暂缓后重新排队），继续丢弃这段歌词：{requeue_error:#}"
                                 );
                             }
                         }
@@ -650,7 +650,7 @@ impl DeferredChatSender {
                     };
                     drop(sending);
                     if let Err(error) = result {
-                        log::error!("延迟聊天回复发送失败（步骤：发送普通回复），本条已丢弃不会重试，玩家收不到这句: {error:#}");
+                        log::error!("延迟聊天回复发送失败（步骤：发送普通回复），本条已丢弃不会重试，玩家收不到这句：{error:#}");
                     }
                 }
                 DeferredChatItem::Batch(mut batch) => {
@@ -722,7 +722,7 @@ impl DeferredChatSender {
                     let all_sent = match batch.mark_sent(sent) {
                         Ok(all_sent) => all_sent,
                         Err(error) => {
-                            log::error!("海龟汤批量发送进度无效（步骤：读取批量发送进度），该批消息可能没有全部送达: {error:#}");
+                            log::error!("海龟汤批量发送进度无效（步骤：读取批量发送进度），该批消息可能没有全部送达：{error:#}");
                             self.business.turtle_soup_delivery_failure(delivery, &error);
                             continue;
                         }
@@ -735,7 +735,7 @@ impl DeferredChatSender {
                     if all_sent {
                         if let ChatBatchSendStatus::Failed(error) = &status {
                             log::warn!(
-                                "海龟汤批次内容已完整发送，但聊天界面收尾失败，不重发内容: {error:#}"
+                                "海龟汤批次内容已完整发送，但聊天界面收尾失败，不重发内容：{error:#}"
                             );
                         }
                         self.business.turtle_soup_delivery_success(delivery);
@@ -750,7 +750,7 @@ impl DeferredChatSender {
                                 batch.remaining_replies().count()
                             );
                             log::error!(
-                                "海龟汤批量发送中断（步骤：等待剩余消息发送完成），已发送 {} 条、剩余 {} 条未发出，本轮投递判为失败并通知等待方: {error:#}",
+                                "海龟汤批量发送中断（步骤：等待剩余消息发送完成），已发送 {} 条、剩余 {} 条未发出，本轮投递判为失败并通知等待方：{error:#}",
                                 sent,
                                 batch.remaining_replies().count()
                             );
@@ -780,7 +780,7 @@ impl DeferredChatSender {
                                             let requeue_error =
                                                 anyhow!("海龟汤批量重试无法重新进入延迟队列");
                                             log::error!(
-                                                "海龟汤批量重试无法重新入队（步骤：把失败的批量消息放回延迟队列队首），剩余消息不会再自动重试，本轮投递判为失败: {requeue_error:#}"
+                                                "海龟汤批量重试无法重新入队（步骤：把失败的批量消息放回延迟队列队首），剩余消息不会再自动重试，本轮投递判为失败：{requeue_error:#}"
                                             );
                                             self.business.turtle_soup_delivery_failure(
                                                 delivery,
@@ -792,7 +792,7 @@ impl DeferredChatSender {
                                 }
                                 BatchFailureOutcome::Exhausted => {
                                     log::error!(
-                                        "海龟汤批量消息发送失败且已用尽重试（步骤：逐条发送批量回复，已发出 {} 条、最多重试 {} 次），剩余消息不会自动补发，本轮投递判为失败: {error:#}",
+                                        "海龟汤批量消息发送失败且已用尽重试（步骤：逐条发送批量回复，已发出 {} 条、最多重试 {} 次），剩余消息不会自动补发，本轮投递判为失败：{error:#}",
                                         sent,
                                         max_attempts
                                     );
@@ -1046,7 +1046,7 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
                 background_key: None,
                 formal_epoch: None,
             }) {
-                log::warn!("回报播放失败状态失败（步骤：把播放失败同步给界面与监控），面板可能仍显示播放中: {error:#}");
+                log::warn!("回报播放失败状态失败（步骤：把播放失败同步给界面与监控），面板可能仍显示播放中：{error:#}");
             }
         }
         Ok(decision)

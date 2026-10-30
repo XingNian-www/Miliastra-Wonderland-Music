@@ -92,7 +92,7 @@ mod imp {
             Err(error) => return Err(anyhow::anyhow!("热键注册失败: {error}")),
         };
         log::info!(
-            "全局热键已启用: 暂停={} 退出={}",
+            "全局热键已启用，暂停/恢复键为 {}，退出键为 {}",
             config.pause_key,
             config.exit_key
         );
@@ -132,7 +132,9 @@ mod imp {
                     let _ = ready.send(Ok(thread_id));
                 }
                 Err(error) => {
-                    log::error!("{error}");
+                    log::error!(
+                        "热键注册失败（步骤：后台线程尝试注册全局热键），本次热键不会生效，需要重启程序后重试: {error}"
+                    );
                     let _ = ready.send(Err(error));
                     return;
                 }
@@ -151,10 +153,13 @@ mod imp {
                             let now_paused = !paused.load(Ordering::SeqCst);
                             paused.store(now_paused, Ordering::SeqCst);
                             wake_tasks();
-                            log::info!("脚本{}", if now_paused { "已暂停" } else { "已恢复" });
+                            log::info!(
+                                "收到暂停/恢复热键，值守已{}",
+                                if now_paused { "暂停" } else { "恢复" }
+                            );
                         }
                         EXIT_ID => {
-                            log::info!("收到退出热键");
+                            log::info!("收到退出热键，开始停止值守并退出程序");
                             request_exit();
                             running.store(false, Ordering::SeqCst);
                             wake_tasks();

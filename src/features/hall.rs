@@ -259,18 +259,18 @@ impl HallApplication {
                 self.reply_hall_time(port)
             }
             HallCommand::ToggleMicrophone { username } => {
-                log::info!("收到麦克风命令: {}", username);
+                log::info!("收到「{}」的麦克风命令", username);
                 if self.check_public_hall(port)? {
                     port.log_executed(
                         context,
                         &format!("microphone skipped publicHall {}", username),
                     )?;
-                    log::info!("麦克风: 当前在公共大厅，跳过状态切换和通告");
+                    log::debug!("麦克风：当前在公共大厅，跳过状态切换和通告");
                     Ok(())
                 } else {
                     port.log_executed(context, &format!("microphone toggle {}", username))?;
                     port.toggle_microphone()?;
-                    log::info!("麦克风: 已按 N 切换状态");
+                    log::info!("麦克风状态已切换（按 N 键）");
                     port.reply_template(
                         &templates::MICROPHONE_TOGGLED,
                         &ReplyVars::new().with("玩家", username.as_str()),
@@ -284,18 +284,20 @@ impl HallApplication {
         let info = match port.read_hall_info() {
             Ok(info) => info,
             Err(error) => {
-                log::error!("大厅检测 OCR 失败: {error:#}");
+                log::error!(
+                    "大厅检测失败（步骤：识别当前大厅名称）；无法判断所在大厅，本次命令未执行: {error:#}"
+                );
                 return port.reply_template(&templates::DETECT_FAILED, &ReplyVars::new());
             }
         };
-        log::info!("大厅检测 OCR 结果: {}", info.name);
+        log::info!("大厅检测结果：当前大厅为「{}」", info.name);
         if is_public_hall(&info.name) {
             port.clear_hall_remaining_minutes()?;
             port.reply_template(&templates::PUBLIC_HALL_CURRENT, &ReplyVars::new())
         } else {
             if let Some(minutes) = info.remaining_minutes {
                 port.update_hall_remaining_minutes(minutes)?;
-                log::info!("大厅剩余时间 OCR 结果: {}分钟", minutes);
+                log::info!("大厅剩余时间识别结果：{} 分钟", minutes);
             }
             let name = if info.name.is_empty() {
                 "未识别到大厅名称"
@@ -326,11 +328,13 @@ impl HallApplication {
             );
         }
 
-        log::info!("大厅时间未知，执行一次大厅识别");
+        log::info!("当前没有已知的大厅剩余时间，先执行一次大厅识别");
         let info = match port.read_hall_info() {
             Ok(info) => info,
             Err(error) => {
-                log::error!("大厅时间 OCR 失败: {error:#}");
+                log::error!(
+                    "读取大厅剩余时间失败（步骤：识别大厅时间文字）；无法给出剩余时长，本次命令未执行: {error:#}"
+                );
                 return port.reply_template(&templates::TIME_UNKNOWN, &ReplyVars::new());
             }
         };
@@ -356,13 +360,13 @@ impl HallApplication {
         let Some(info) = port.detect_public_hall()? else {
             return Ok(false);
         };
-        log::info!("大厅检测 OCR 结果: {}", info.name);
+        log::info!("大厅检测结果：当前大厅为「{}」", info.name);
         let public = is_public_hall(&info.name);
         if public {
             port.clear_hall_remaining_minutes()?;
         } else if let Some(minutes) = info.remaining_minutes {
             port.update_hall_remaining_minutes(minutes)?;
-            log::info!("大厅剩余时间 OCR 结果: {}分钟", minutes);
+            log::info!("大厅剩余时间识别结果：{} 分钟", minutes);
         }
         Ok(public)
     }

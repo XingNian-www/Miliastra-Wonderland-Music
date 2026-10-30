@@ -160,7 +160,7 @@ impl ChatOutput {
     ) -> Result<()> {
         let message = fit_chat_message(message);
         if !self.enabled() {
-            log::info!("游戏内回复发送已关闭，不发送邀请就绪消息");
+            log::info!("游戏内回复发送已关闭，邀请就绪通知不发送，邀请流程继续");
             return Ok(());
         }
         let request = SendHallBatch::new([message.clone()], residency, 0)
@@ -180,9 +180,9 @@ impl ChatOutput {
     fn send_primary(&self, message: &str, restore_after_task: bool) -> Result<()> {
         let message = fit_chat_message(message);
         self.record_captured(&message);
-        log::info!("游戏内回复: {}", redacted_chat_text(&message));
+        log::info!("准备在一级大厅发送回复「{}」", redacted_chat_text(&message));
         if !self.enabled() {
-            log::info!("游戏内回复发送已关闭，仅记录日志");
+            log::info!("游戏内回复发送已关闭，本条回复只记录日志、不发送");
             return Ok(());
         }
         self.send_with_input(&message, restore_after_task)
@@ -191,9 +191,9 @@ impl ChatOutput {
     pub fn send_current_chat(&self, message: &str) -> Result<()> {
         let message = fit_chat_message(message);
         self.record_captured(&message);
-        log::info!("当前聊天回复: {}", redacted_chat_text(&message));
+        log::info!("准备在当前聊天发送回复「{}」", redacted_chat_text(&message));
         if !self.enabled() {
-            log::info!("当前聊天回复发送已关闭，仅记录日志");
+            log::info!("当前聊天回复发送已关闭，本条回复只记录日志、不发送");
             return Ok(());
         }
         self.send_current_chat_with_input(&message)
@@ -209,10 +209,10 @@ impl ChatOutput {
             .collect::<Vec<_>>();
         for message in &messages {
             self.record_captured(message);
-            log::info!("当前聊天回复: {}", redacted_chat_text(message));
+            log::info!("准备在当前聊天发送回复「{}」", redacted_chat_text(message));
         }
         if !self.enabled() {
-            log::info!("当前聊天回复发送已关闭，仅记录日志");
+            log::info!("当前聊天回复发送已关闭，本条回复只记录日志、不发送");
             return Ok(());
         }
         let expected = messages.len();
@@ -229,9 +229,12 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
-        log::info!("游戏内批量回复: [谁是卧底内容已隐藏] {}条", messages.len());
+        log::info!(
+            "准备在一级大厅发送 {} 条批量回复，内容含卧底玩法文本，日志中已隐藏",
+            messages.len()
+        );
         if !self.enabled() {
-            log::info!("游戏内回复发送已关闭，仅记录脱敏日志");
+            log::info!("游戏内回复发送已关闭，本批回复只记录脱敏日志、不发送");
             return Ok(());
         }
         let expected = messages.len();
@@ -245,11 +248,11 @@ impl ChatOutput {
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
         log::info!(
-            "当前聊天批量回复: [谁是卧底内容已隐藏] {}条",
+            "准备在当前聊天发送 {} 条批量回复，内容含卧底玩法文本，日志中已隐藏",
             messages.len()
         );
         if !self.enabled() {
-            log::info!("当前聊天回复发送已关闭，仅记录脱敏日志");
+            log::info!("当前聊天回复发送已关闭，本批回复只记录脱敏日志、不发送");
             return Ok(());
         }
         let expected = messages.len();
@@ -271,10 +274,10 @@ impl ChatOutput {
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
         for message in &messages {
-            log::info!("游戏内回复: {}", redacted_chat_text(message));
+            log::info!("准备在一级大厅发送回复「{}」", redacted_chat_text(message));
         }
         if !self.enabled() {
-            log::info!("游戏内回复发送已关闭，仅记录日志");
+            log::info!("游戏内回复发送已关闭，本条回复只记录日志、不发送");
             return Ok(());
         }
         let expected = messages.len();
@@ -293,16 +296,16 @@ impl ChatOutput {
             .collect::<Vec<_>>();
         if !self.enabled() {
             for message in &messages {
-                log::info!("当前聊天回复: {}", redacted_chat_text(message));
+                log::info!("准备在当前聊天发送回复「{}」", redacted_chat_text(message));
             }
             if !messages.is_empty() {
-                log::info!("当前聊天回复发送已关闭，仅记录日志");
+                log::info!("当前聊天回复发送已关闭，本条回复只记录日志、不发送");
             }
             return ChatBatchSendOutcome::complete(messages.len());
         }
         let outcome = self.send_current_chat_batch_with_input(&messages, delay_ms);
         for message in messages.iter().take(outcome.sent) {
-            log::info!("当前聊天回复: {}", redacted_chat_text(message));
+            log::info!("准备在当前聊天发送回复「{}」", redacted_chat_text(message));
         }
         outcome
     }
@@ -318,16 +321,16 @@ impl ChatOutput {
             .collect::<Vec<_>>();
         if !self.enabled() {
             for message in &messages {
-                log::info!("游戏内回复: {}", redacted_chat_text(message));
+                log::info!("准备在一级大厅发送回复「{}」", redacted_chat_text(message));
             }
             if !messages.is_empty() {
-                log::info!("游戏内回复发送已关闭，仅记录日志");
+                log::info!("游戏内回复发送已关闭，本条回复只记录日志、不发送");
             }
             return ChatBatchSendOutcome::complete(messages.len());
         }
         let outcome = self.send_batch_with_input(&messages, delay_ms, false);
         for message in messages.iter().take(outcome.sent) {
-            log::info!("游戏内回复: {}", redacted_chat_text(message));
+            log::info!("准备在一级大厅发送回复「{}」", redacted_chat_text(message));
         }
         outcome
     }
@@ -387,7 +390,9 @@ impl ChatOutput {
         match outcome.status() {
             HallBatchStatus::Failed(failure) => {
                 if let UiResidencyOutcome::Failed(residency) = outcome.residency() {
-                    log::error!("大厅批量发送失败后驻留恢复也失败: {residency}");
+                    log::error!(
+                        "大厅批量回复发送失败，之后恢复界面驻留也失败（步骤：发送后回到原界面），当前界面位置未知，后续截图与点击可能识别错界面: {residency}"
+                    );
                 }
                 ChatBatchSendOutcome::failed(sent, anyhow!(failure.to_string()))
             }

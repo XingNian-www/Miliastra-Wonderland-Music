@@ -14,6 +14,77 @@ const CONFIG_RELOAD_UI_FALLBACK_GRACE: Duration = Duration::from_secs(15);
 /// 等观察帧的切片长度：让主循环能在大约 25ms 内感知共享聊天发布并提前回顶部派发。
 const FRAME_WAIT_SLICE: Duration = Duration::from_millis(25);
 
+/// 二级值守落在非二级界面时，重复告警的最短间隔。
+///
+/// 该分支每轮都会走到（`loop_idle_ms` 默认 60ms）。无条件 `warn` 会每秒刷十几条，
+/// 把真正需要关注的告警挤出日志；但完全不告警又会让值守卡住时查不到线索，
+/// 所以首次立即告警、之后按本间隔重申。
+const SECONDARY_UI_MISMATCH_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 日志里的消息来源：把内部的 blue/pink 换成玩家能理解的说法。
+///
+/// 直接打印内部枚举会让日志出现代码词，不符合书面陈述句要求。
+fn message_source_label(message_type: &str) -> &'static str {
+    match message_type {
+        "blue" => "大厅普通成员消息",
+        "pink" => "好友消息",
+        _ => "其他来源消息",
+    }
+}
+
+/// 日志里的观察缺口原因：把内部枚举换成业务语言。
+fn gap_kind_label(kind: crate::observation::shared::ObservationGapKind) -> &'static str {
+    use crate::observation::shared::ObservationGapKind;
+    match kind {
+        ObservationGapKind::HistoryEvicted => "观察历史被挤掉",
+        ObservationGapKind::ExclusiveSession => "独占会话期间未消费",
+    }
+}
+
+/// 日志里的身份角色名：`IdentityRole` 不能直接 `{:?}` 打给维护者看。
+fn actor_role_label(role: crate::features::identity::IdentityRole) -> &'static str {
+    use crate::features::identity::IdentityRole;
+    match role {
+        IdentityRole::Friend => "好友",
+        IdentityRole::Admin => "管理员",
+        IdentityRole::Owner => "主人",
+    }
+}
+
+/// 日志里的聊天区名称：把内部枚举换成界面语言。
+fn chat_identity_label(chat: &ChatIdentity) -> &'static str {
+    match chat {
+        ChatIdentity::PrimaryHall => "一级大厅",
+        ChatIdentity::SecondaryHall => "二级大厅",
+        ChatIdentity::Friend(_) => "好友私聊",
+        ChatIdentity::PublicChannel => "公共频道",
+        ChatIdentity::StrangerMessages => "陌生人消息",
+        ChatIdentity::Unknown => "未识别聊天区",
+    }
+}
+
+/// 日志里的消息交付状态。
+fn delivery_state_label(
+    state: crate::observation::chat::BusinessDeliveryState,
+) -> &'static str {
+    use crate::observation::chat::BusinessDeliveryState;
+    match state {
+        BusinessDeliveryState::Pending => "仅排队未派发",
+        BusinessDeliveryState::Claimed => "已认领",
+        BusinessDeliveryState::IgnoredRevision => "等待有效修订",
+        BusinessDeliveryState::Fenced => "被交付栅栏挡住",
+        BusinessDeliveryState::NotTracked => "未入账",
+    }
+}
+
+/// 日志里的界面驻留目标名称。
+fn residency_target_label(target: UiResidency) -> &'static str {
+    match target {
+        UiResidency::Primary => "一级聊天界面",
+        UiResidency::SecondaryCurrentHall => "二级当前大厅界面",
+    }
+}
+
 /// 排查日志用：折叠空白并截断，避免日志里塞入超长文本。
 /// 命令锁锚点：OCR 消息用屏幕 y，外部消息用服务端序号。
 ///
@@ -162,6 +233,21 @@ impl CommandGate {
             return Self::GlobalOff;
         }
         Self::Allowed
+    }
+
+    /// 日志里的原因说明：把档位转成中文，避免 `{:?}` 打出代码词。
+    pub(super) const fn log_reason(self) -> &'static str {
+        use crate::features::command_access::CommandPermission;
+        match self {
+            Self::Allowed => "已放行",
+            Self::Disabled => "该命令已在面板禁用",
+            Self::BelowMinimum(CommandPermission::User) => "该命令当前对所有大厅成员关闭",
+            Self::BelowMinimum(CommandPermission::Friend) => "权限不足：该命令仅限好友使用",
+            Self::BelowMinimum(CommandPermission::Admin | CommandPermission::Owner) => {
+                "权限不足：该命令仅限管理员使用"
+            }
+            Self::GlobalOff => "全局命令开关已关闭，未登记的大厅成员不派发命令",
+        }
     }
 
     /// 面向玩家的文案；\`None\` 表示不放行但也不提示（目前没有这种情形）。
@@ -652,11 +738,12 @@ fn acknowledge_primary_command(
             (Some(text), Some(anchor)) => {
                 chat_timeline.acknowledge_command_at(message_id, text, anchor)?
             }
-            (text, anchor) => {
+            // 文本或锚点任一缺失：不再打印它们本身（缺的就是不可信内容），
+            // 只说明缺了什么、后果如何。
+            (_text, _anchor) => {
                 log::warn!(
-                    "命令锁未写入：观察缺少可信文本或锚点（chat={:?}, text={:?}, anchor={anchor:?}, id={message_id:?}），本轮只确认不写锁",
-                    message_id.chat,
-                    text.map(redacted_chat_text),
+                    "命令锁未写入：这条命令的观察缺少可信文本或屏幕锚点（所属聊天区：{}），本轮只确认、不写锁，下次重整画面后会重新判定",
+                    chat_identity_label(&message_id.chat),
                 );
                 chat_timeline.acknowledge_business(message_id)?
             }
@@ -665,7 +752,7 @@ fn acknowledge_primary_command(
         chat_timeline.acknowledge_business(message_id)?
     };
     if !acknowledged {
-        log::debug!("一级命令完成处理时消息已滚出当前画面: id={message_id:?}");
+        log::debug!("一级命令完成处理时，该消息已滚出当前画面，本次确认未生效");
     }
     Ok(())
 }
@@ -704,14 +791,18 @@ impl ApplicationRuntime {
         if let Err(error) =
             persist_chat_listener_mode(&self.lifecycle.config.state.playback_state_path, mode)
         {
-            log::error!("持久化聊天值守模式失败: {error:#}");
+            log::error!(
+                "保存聊天值守模式失败（步骤：写入值守模式状态文件），本次选择未落盘，进程重启后会回到上一次保存的值: {error:#}"
+            );
         }
     }
 
     pub(super) fn persist_current_chat_listener_mode(&self) {
         match self.business.business.chat_listener_snapshot() {
             Ok(snapshot) => self.persist_listener_mode_best_effort(snapshot.mode),
-            Err(error) => log::error!("读取聊天值守模式用于持久化失败: {error}"),
+            Err(error) => log::error!(
+                "保存聊天值守模式失败（步骤：读取当前值守模式），本次没有可保存的值，进程重启后会回到上一次保存的值: {error}"
+            ),
         }
     }
 
@@ -736,7 +827,10 @@ impl ApplicationRuntime {
         let cleared = self.business.business.clear_hall_countdown_cache()?;
         self.reset_chat_observation_baseline(reason)?;
         if cleared {
-            log::info!("{reason}，已清理大厅倒计时缓存，等待本次大厅检测重新确认");
+            log::debug!(
+                "大厅倒计时缓存已清理（原因：{}），等待本次大厅检测重新确认剩余时间",
+                reason
+            );
         }
         Ok(cleared)
     }
@@ -747,8 +841,9 @@ impl ApplicationRuntime {
             .store(false, AtomicOrdering::SeqCst);
         self.ui.chat_timeline.note_baseline(reason)?;
         let visual_session = self.ui.chat_observations.begin_visual_session()?;
-        log::info!(
-            "{reason}，聊天观察进入新视觉会话：仅粉色首屏建立历史基线，其他颜色继续交付: {}",
+        log::debug!(
+            "聊天观察已进入新的视觉会话（原因：{}，会话序号 {}）：仅粉色首屏建立历史基线，其他颜色照常交付",
+            reason,
             visual_session.get()
         );
         Ok(())
@@ -758,7 +853,9 @@ impl ApplicationRuntime {
         let frame = match self.ui.game_ui.capture() {
             Ok(frame) => frame,
             Err(error) => {
-                log::warn!("启动时未能截图，扫描循环将等待目标窗口恢复: {error:#}");
+                log::warn!(
+                    "启动时截图失败（步骤：检查屏幕尺寸），本次尺寸校验跳过，扫描循环会等目标窗口恢复后继续: {error:#}"
+                );
                 return Ok(());
             }
         };
@@ -767,7 +864,7 @@ impl ApplicationRuntime {
                 || frame.height() != self.lifecycle.config.screen.expected_height)
         {
             log::warn!(
-                "截图尺寸为 {}x{}，预期 {}x{}，程序继续运行",
+                "截图尺寸与预期不一致：实际 {}x{}，预期 {}x{}。模板匹配可能失准，程序继续运行，建议核对游戏窗口分辨率",
                 frame.width(),
                 frame.height(),
                 self.lifecycle.config.screen.expected_width,
@@ -971,7 +1068,9 @@ impl ApplicationRuntime {
             Arc::new(move || shutdown.request_user_exit()),
             Arc::new(move || {
                 if let Err(error) = task_engine.wake() {
-                    log::debug!("热键切换暂停状态后唤醒任务引擎失败: {error}");
+                    log::debug!(
+                        "热键切换暂停状态后唤醒任务调度失败，暂停或恢复要等下一轮扫描才生效: {error}"
+                    );
                 }
             }),
         )
@@ -989,7 +1088,10 @@ impl ApplicationRuntime {
         if !self.require_reload_startup_automation()? {
             return Ok(false);
         }
-        log::warn!("配置重载替代进程无法复用业务界面，启用启动自动化回退: {reason}");
+        log::warn!(
+            "配置重载的替代进程无法复用业务界面（原因：{}），改为重新执行启动自动化进入游戏",
+            reason
+        );
         Ok(true)
     }
 
@@ -1011,9 +1113,13 @@ impl ApplicationRuntime {
             return Ok(());
         }
         match self.enqueue_reload_startup_tasks_if_needed() {
-            Ok(true) => log::warn!("配置重载替代进程 startup 尚未完成，已按冷却重新排队缺失动作"),
+            Ok(true) => log::warn!(
+                "配置重载的替代进程尚未完成启动自动化，已按冷却间隔重新排队缺失的启动动作"
+            ),
             Ok(false) => {}
-            Err(error) => log::error!("配置重载替代进程重排启动自动化失败: {error:#}"),
+            Err(error) => log::error!(
+                "配置重载的替代进程重排启动自动化失败（步骤：补排缺失的启动动作），该进程暂时无法完成交接，会按冷却间隔重试: {error:#}"
+            ),
         }
         *retry_after = now + CONFIG_RELOAD_STARTUP_RETRY_INTERVAL;
         Ok(())
@@ -1078,7 +1184,9 @@ impl ApplicationRuntime {
                 Duration::from_secs(1)
             }
             Err(error) => {
-                log::error!("大厅到期暂停或提示失败，将重试: {error:#}");
+                log::error!(
+                    "大厅到期处理失败（步骤：暂停播放并提示到期），本次没有暂停也没有提示，5 秒后重试: {error:#}"
+                );
                 Duration::from_secs(5)
             }
         };
@@ -1099,7 +1207,9 @@ impl ApplicationRuntime {
         match scan_result {
             Err(error) => {
                 if let Err(forward_error) = final_forward_result {
-                    log::error!("扫描循环退出时转发观察完成推进失败: {forward_error:#}");
+                    log::error!(
+                        "扫描循环退出时转发观察完成推进失败（步骤：把已完成的观察推进提交给业务运行时），业务可能因此收不到最后一批完成事件: {forward_error:#}"
+                    );
                 }
                 Err(error)
             }
@@ -1157,13 +1267,17 @@ impl ApplicationRuntime {
         let mut reload_startup_retry_after = Instant::now() + CONFIG_RELOAD_STARTUP_RETRY_INTERVAL;
         let mut replacement_ui_unverified_since = config_reload_child.then(Instant::now);
         let mut unresolved_ui_since: Option<Instant> = None;
+        // 二级值守落在非二级界面时的告警节流：该分支每轮都会走到
+        // （loop_idle_ms 默认 60ms），无条件 warn 会每秒刷十几条把其余告警冲掉。
+        // 首次立即告警留痕，之后每 SECONDARY_UI_MISMATCH_WARN_INTERVAL 才重申一次。
+        let mut secondary_ui_mismatch_warned_at: Option<Instant> = None;
         let mut target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
         let mut target_missing = false;
         let mut hall_expiry_pause_applied = false;
         let mut hall_expiry_notice_sent = false;
         let mut hall_expiry_check_after = Instant::now();
         let mut shared_backlog = std::collections::VecDeque::new();
-        log::info!("自动化扫描已启动");
+        log::info!("自动化扫描已启动，开始按界面状态轮询");
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) {
             self.poll_hall_expiry(
                 &mut hall_expiry_pause_applied,
@@ -1188,7 +1302,9 @@ impl ApplicationRuntime {
                 if let Some(subscription) = frame_subscription.take()
                     && let Err(error) = subscription.cancel()
                 {
-                    log::warn!("主循环间隔变化时撤销旧观察帧需求失败: {error}");
+                    log::warn!(
+                        "撤销旧观察帧需求失败（触发原因：主循环间隔改变），旧订阅可能多存活一轮，下一轮会重新申请: {error}"
+                    );
                 }
                 frame_demand = FrameDemand::new(Duration::from_millis(next_frame_demand_ms))
                     .context("更新聊天观察帧需求")?;
@@ -1204,7 +1320,9 @@ impl ApplicationRuntime {
                 if let Some(subscription) = frame_subscription.take()
                     && let Err(error) = subscription.cancel()
                 {
-                    log::warn!("正式任务占用 UI 时撤销观察帧需求失败: {error}");
+                    log::warn!(
+                        "撤销观察帧需求失败（触发原因：正式任务占用界面），旧订阅可能多存活一轮，下一轮会重新申请: {error}"
+                    );
                 }
                 self.invalidate_latest_frame();
                 primary_visible = false;
@@ -1233,7 +1351,9 @@ impl ApplicationRuntime {
                 if let Some(subscription) = frame_subscription.take()
                     && let Err(error) = subscription.cancel()
                 {
-                    log::warn!("扫描新鲜度边界变化时撤销旧观察帧需求失败: {error}");
+                    log::warn!(
+                        "撤销旧观察帧需求失败（触发原因：扫描新鲜度边界变化），旧订阅可能多存活一轮，下一轮会重新申请: {error}"
+                    );
                 }
                 self.invalidate_latest_frame();
                 primary_visible = false;
@@ -1255,7 +1375,9 @@ impl ApplicationRuntime {
                 if let Some(subscription) = frame_subscription.take()
                     && let Err(error) = subscription.cancel()
                 {
-                    log::warn!("暂停值守时撤销观察帧需求失败: {error}");
+                    log::warn!(
+                        "撤销观察帧需求失败（触发原因：暂停值守），旧订阅可能多存活一轮，恢复后会重新申请: {error}"
+                    );
                 }
                 unresolved_ui_since = None;
                 self.maybe_idle_exit()?;
@@ -1324,7 +1446,9 @@ impl ApplicationRuntime {
                     if let Ok(mut latest_frame) = self.ui.latest_frame.lock() {
                         latest_frame.store(Arc::clone(&frame.image));
                     } else {
-                        log::error!("主扫描画面缓存锁已损坏");
+                        log::error!(
+                            "主扫描画面缓存已损坏（步骤：写入最新观察帧），本次截图不会进入缓存，依赖该画面的下游步骤本轮拿不到新画面"
+                        );
                     }
                     let frame_ms = elapsed_ms(frame_started);
                     log::debug!(target: "timing",
@@ -1333,7 +1457,7 @@ impl ApplicationRuntime {
                         frame.captured_at.elapsed().as_millis()
                     );
                     if target_missing {
-                        log::info!("目标窗口已恢复，重置截图退避");
+                        log::debug!("目标窗口已恢复，截图退避重置为初始值");
                         self.reset_chat_observation_baseline("目标窗口恢复")?;
                         target_missing = false;
                     }
@@ -1407,7 +1531,10 @@ impl ApplicationRuntime {
                                 && Instant::now() >= automatic_startup_retry_after
                                 && let Some(task) = automatic_startup_task(&live_config, *kind)
                             {
-                                log::info!("界面已稳定，排队执行自动进入: {}", task.label());
+                                log::debug!(
+                                    "界面已稳定，排队执行自动进入任务：{}",
+                                    task.label()
+                                );
                                 self.push_pending_task(PendingTask::Startup(task))?;
                                 automatic_startup_pending = true;
                                 residency_recovery_attempted = true;
@@ -1434,19 +1561,24 @@ impl ApplicationRuntime {
                                     listener_snapshot.temporary_primary,
                                 );
                                 log::warn!(
-                                    "聊天值守逻辑模式与当前界面不一致，尝试恢复驻留: mode={} ui={} target={target:?}",
+                                    "聊天值守模式与当前界面不一致（逻辑模式：{}，实际界面：{}），尝试把界面切回{}",
                                     listener_snapshot.mode.label(),
-                                    ui_state
+                                    ui_state,
+                                    residency_target_label(target)
                                 );
                                 match self.establish_ui_residency(
                                     target,
                                     ResidencyPurpose::IndependentRecovery("恢复持久化聊天值守驻留"),
                                 ) {
                                     Ok(()) => {
-                                        log::info!("聊天值守驻留恢复完成: target={target:?}")
+                                        log::debug!(
+                                            "聊天值守驻留恢复完成，界面已切回{}",
+                                            residency_target_label(target)
+                                        )
                                     }
                                     Err(error) => log::warn!(
-                                        "聊天值守驻留恢复失败，保留逻辑模式并稍后重试: {error:#}"
+                                        "聊天值守驻留恢复失败（步骤：把界面切回{}），逻辑模式保持不变，稍后重试: {error:#}",
+                                        residency_target_label(target)
                                     ),
                                 }
                                 listener_residency_retry_after =
@@ -1474,9 +1606,10 @@ impl ApplicationRuntime {
                                     listener_snapshot.temporary_primary,
                                 );
                                 log::warn!(
-                                    "界面持续无法验证，尝试恢复聊天值守驻留: mode={} ui={} target={target:?}",
+                                    "界面持续无法验证（逻辑模式：{}，最后识别结果：{}），尝试把界面切回{}",
                                     listener_snapshot.mode.label(),
-                                    ui_state
+                                    ui_state,
+                                    residency_target_label(target)
                                 );
                                 match self.establish_ui_residency(
                                     target,
@@ -1484,11 +1617,13 @@ impl ApplicationRuntime {
                                         "恢复持续未知界面的聊天值守驻留",
                                     ),
                                 ) {
-                                    Ok(()) => log::info!(
-                                        "持续未知界面的聊天值守驻留恢复完成: target={target:?}"
+                                    Ok(()) => log::debug!(
+                                        "持续未知界面的聊天值守驻留恢复完成，界面已切回{}",
+                                        residency_target_label(target)
                                     ),
                                     Err(error) => log::warn!(
-                                        "持续未知界面的聊天值守驻留恢复失败，稍后重试: {error:#}"
+                                        "持续未知界面的聊天值守驻留恢复失败（步骤：把界面切回{}），稍后重试: {error:#}",
+                                        residency_target_label(target)
                                     ),
                                 }
                                 listener_residency_retry_after =
@@ -1533,7 +1668,10 @@ impl ApplicationRuntime {
                                 secondary_identity = None;
                             }
                             Ok((ui_state, None)) => {
-                                log::debug!("界面仍在过渡，暂停聊天扫描: {}", ui_state);
+                                log::debug!(
+                                    "界面仍在过渡中（当前判定：{}），本轮暂停聊天扫描",
+                                    ui_state
+                                );
                                 log::info!(target: "timing",
                                     "主循环阶段耗时: total={}ms frame={}ms ui={}ms state={} scanned=false",
                                     elapsed_ms(loop_started),
@@ -1569,15 +1707,29 @@ impl ApplicationRuntime {
                                     )?)
                                 } else if command_executing {
                                     log::debug!(
-                                        "二级值守任务临时离开二级界面，等待任务状态机恢复: {}",
+                                        "二级值守任务临时离开二级界面（当前界面：{}），等待任务状态机恢复",
                                         ui_state
                                     );
                                     None
                                 } else {
-                                    log::warn!(
-                                        "二级值守当前不在二级聊天界面: {}，保留逻辑模式并等待驻留恢复",
-                                        ui_state
-                                    );
+                                    // 该分支每轮都会走到，必须节流：否则 60ms 一轮时
+                                    // 每秒刷十几条 warn，把其余告警全冲掉。
+                                    let warn_due = secondary_ui_mismatch_warned_at
+                                        .is_none_or(|last| {
+                                            last.elapsed() >= SECONDARY_UI_MISMATCH_WARN_INTERVAL
+                                        });
+                                    if warn_due {
+                                        secondary_ui_mismatch_warned_at = Some(Instant::now());
+                                        log::warn!(
+                                            "二级值守当前不在二级聊天界面（当前界面：{}），保留逻辑模式并等待驻留恢复；本条在界面切换回来前最多每分钟重复一次",
+                                            ui_state
+                                        );
+                                    } else {
+                                        log::debug!(
+                                            "二级值守仍不在二级聊天界面（当前界面：{}），继续等待驻留恢复",
+                                            ui_state
+                                        );
+                                    }
                                     secondary_friend_bubble_fingerprint = None;
                                     secondary_hall_bubble_sequence = None;
                                     secondary_hall_command_tracker.reset();
@@ -1627,7 +1779,10 @@ impl ApplicationRuntime {
                                 secondary_hall_bubble_sequence = None;
                                 secondary_hall_command_tracker.reset();
                                 secondary_identity = None;
-                                log::debug!("当前不是一级聊天界面，跳过聊天扫描: {}", ui_state);
+                                log::debug!(
+                                    "当前是一级值守但不在聊天界面（当前界面：{}），本轮跳过聊天扫描",
+                                    ui_state
+                                );
                                 log::info!(target: "timing",
                                     "主循环阶段耗时: total={}ms frame={}ms ui={}ms state={} scanned=false",
                                     elapsed_ms(loop_started),
@@ -1640,11 +1795,16 @@ impl ApplicationRuntime {
                             Ok((ui_state, Some(UiStateKind::Unknown))) => {
                                 primary_visible = false;
                                 last_fingerprint = None;
-                                log::debug!("界面状态仍为过渡态，暂停聊天扫描: {}", ui_state);
+                                log::debug!(
+                                    "界面状态仍在过渡中（当前判定：{}），本轮暂停聊天扫描",
+                                    ui_state
+                                );
                             }
                             Err(error) => {
                                 primary_visible = false;
-                                log::error!("界面状态检测失败: {error:#}");
+                                log::warn!(
+                                    "界面状态检测失败（步骤：识别当前界面），本轮不派发任何命令，下一轮重新识别: {error:#}"
+                                );
                                 log::info!(target: "timing",
                                     "主循环阶段耗时: total={}ms frame={}ms ui={}ms state=ui_error scanned=false",
                                     elapsed_ms(loop_started),
@@ -1677,7 +1837,9 @@ impl ApplicationRuntime {
                     if let Some(subscription) = frame_subscription.take()
                         && let Err(cancel_error) = subscription.cancel()
                     {
-                        log::warn!("截图失败后撤销观察帧需求失败: {cancel_error}");
+                        log::warn!(
+                            "撤销观察帧需求失败（触发原因：截图失败），旧订阅可能多存活一轮，重试时会重新申请: {cancel_error}"
+                        );
                     }
                     let frame_ms = elapsed_ms(frame_started);
                     if !target_missing {
@@ -1696,7 +1858,7 @@ impl ApplicationRuntime {
                         self.ui.window_detection_signal.generation()?;
                     let target_missing_wait = self.reload_aware_wait(target_missing_backoff);
                     log::warn!(
-                        "截图失败，{}秒后重试: {error:#}",
+                        "截图失败（步骤：抓取游戏画面），本轮无法识别界面与聊天，{} 秒后重试: {error:#}",
                         target_missing_wait.as_secs()
                     );
                     log::info!(target: "timing",
@@ -1742,7 +1904,7 @@ impl ApplicationRuntime {
                         }
                     };
                     if window_reset {
-                        log::info!("收到窗口检测重置请求，立即重试并重置截图退避");
+                        log::debug!("收到窗口检测重置请求，立即重试截图并重置退避");
                         target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
                     } else {
                         target_missing_backoff =
@@ -1786,7 +1948,7 @@ impl ApplicationRuntime {
                 && crate::mark_config_reload_child_ready()?
             {
                 if std::env::var_os(crate::CONFIG_RELOAD_CHILD_ENV).is_some() {
-                    log::info!("配置重载替代进程已 ready");
+                    log::info!("配置重载的替代进程已完成交接并进入就绪状态");
                 }
             } else if listener_ready {
                 // 必需的启动工作仍在运行或已经失败。仅验证屏幕不能确认退出码 77 的交接已就绪。
@@ -1806,7 +1968,9 @@ impl ApplicationRuntime {
         if let Some(subscription) = frame_subscription
             && let Err(error) = subscription.cancel()
         {
-            log::warn!("扫描循环结束时撤销观察帧需求失败: {error}");
+            log::warn!(
+                "扫描循环结束时撤销观察帧需求失败（步骤：退出前释放观察帧订阅），旧订阅随进程退出一起回收: {error}"
+            );
         }
 
         Ok(())
@@ -1830,7 +1994,9 @@ impl ApplicationRuntime {
             let discarded = subscriber.read()?.len().saturating_add(backlog.len());
             backlog.clear();
             if discarded > 0 {
-                log::debug!("值守已暂停，丢弃 {discarded} 帧共享聊天观察，恢复后按冷基线重建");
+                log::debug!(
+                    "值守已暂停，本次丢弃 {discarded} 帧共享聊天观察，恢复后按冷基线重建"
+                );
             }
             return Ok(());
         }
@@ -1854,7 +2020,7 @@ impl ApplicationRuntime {
             else {
                 // 临时暂缓（backlog 保留，窗口结束后继续），走 debug 防刷屏。
                 log::debug!(
-                    "命令暂缓：独占聊天观察进行中，积压 {} 帧，窗口结束后继续",
+                    "命令暂缓：独占聊天观察正在进行，当前积压 {} 帧，该窗口结束后继续派发",
                     backlog.len()
                 );
                 break;
@@ -1884,21 +2050,33 @@ impl ApplicationRuntime {
                 &snapshot.source,
                 snapshot.chat.as_ref(),
             ) {
-                if snapshot
-                    .messages
-                    .iter()
-                    .any(|message| command::looks_like_command(&message.text))
-                {
-                    log::info!(
-                        "命令未执行：值守模式={} 不消费 {:?} 观察（含命令样式消息）",
-                        listener_mode.label(),
-                        snapshot.chat
-                    );
+                // 按消息 id 去重：同一个快照批次被反复消费时（同一条卡在屏上的
+                // 命令样式消息会随帧重复投递），不重复记同一句。
+                // 该分支在值守模式互斥时每轮都会进，不去重会逐帧刷 info。
+                for message in &snapshot.messages {
+                    if command::looks_like_command(&message.text)
+                        && self.ui.chat_timeline.note_not_executed_log(&message.id)?
+                    {
+                        log::info!(
+                            "命令未执行：当前为{}，不消费{}里的命令（该聊天区归另一种值守模式处理）「{}」",
+                            listener_mode.label(),
+                            snapshot
+                                .chat
+                                .as_ref()
+                                .map(chat_identity_label)
+                                .unwrap_or("未识别聊天区"),
+                            compact_for_log(&message.text)
+                        );
+                    }
                 }
                 log::debug!(
-                    "{}不消费{:?}观察，仅保留只读发布",
+                    "{}不消费{}的观察，仅保留只读发布",
                     listener_mode.label(),
-                    snapshot.chat
+                    snapshot
+                        .chat
+                        .as_ref()
+                        .map(chat_identity_label)
+                        .unwrap_or("未识别聊天区")
                 );
                 return Ok(());
             }
@@ -1971,9 +2149,11 @@ impl ApplicationRuntime {
                                 && self.ui.chat_timeline.note_not_executed_log(&message.id)?
                             {
                                 log::info!(
-                                    "命令未执行：二级消息未判为新增追加 state={:?} chat={:?} text={}",
-                                    self.ui.chat_timeline.business_delivery_state(&message.id)?,
-                                    chat,
+                                    "命令未执行：二级消息未判为新增追加（交付状态：{}，聊天区：{}）「{}」",
+                                    delivery_state_label(
+                                        self.ui.chat_timeline.business_delivery_state(&message.id)?
+                                    ),
+                                    chat_identity_label(chat),
                                     compact_for_log(&message.text)
                                 );
                             }
@@ -2017,7 +2197,7 @@ impl ApplicationRuntime {
                                     && self.ui.chat_timeline.note_not_executed_log(&message.id)?
                                 {
                                     log::info!(
-                                        "命令未执行：二级消息缺少可用身份（无 UID 也无昵称） text={}",
+                                        "命令未执行：这条二级消息既没有 UID 也没有昵称，无法确认发送者，因此不授权「{}」",
                                         compact_for_log(&message.text)
                                     );
                                 }
@@ -2043,8 +2223,10 @@ impl ApplicationRuntime {
                                 && self.ui.chat_timeline.note_not_executed_log(&message.id)?
                             {
                                 log::info!(
-                                    "命令未执行：二级命令认领失败（已被基线/已消费或修订否决）state={:?} text={}",
-                                    self.ui.chat_timeline.business_delivery_state(&message.id)?,
+                                    "命令未执行：二级命令认领失败（已被基线或先前轮次消费，或本条修订被否决；交付状态：{}）「{}」",
+                                    delivery_state_label(
+                                        self.ui.chat_timeline.business_delivery_state(&message.id)?
+                                    ),
                                     compact_for_log(&message.text)
                                 );
                             }
@@ -2119,8 +2301,12 @@ impl ApplicationRuntime {
                             && self.ui.chat_timeline.note_not_executed_log(&message.id)?
                         {
                             log::info!(
-                                "命令未执行：{:?} 身份不派发业务，永久丢弃 text={}",
-                                snapshot.chat,
+                                "命令未执行：{}不派发业务，本轮永久丢弃「{}」",
+                                snapshot
+                                    .chat
+                                    .as_ref()
+                                    .map(chat_identity_label)
+                                    .unwrap_or("未识别聊天区"),
                                 compact_for_log(&message.text)
                             );
                         }
@@ -2193,7 +2379,7 @@ impl ApplicationRuntime {
                 log::debug!("调试模式已启用，丢弃游戏内聊天命令与问题，不执行自动化");
             } else {
                 log::info!(
-                    "命令未执行：调试/完全控制模式启用，本进程不执行游戏内命令 text={}",
+                    "命令未执行：调试或完全控制模式已启用，本进程不执行游戏内命令「{}」",
                     compact_for_log(&command_like.join(" | "))
                 );
             }
@@ -2215,11 +2401,11 @@ impl ApplicationRuntime {
                     self.ui
                         .chat_baseline_primed
                         .store(false, AtomicOrdering::SeqCst);
+                    // 缺口序号是内部枚举且不对外暴露 Display，这里只写原因与后果；
+                    // 需要精确序号时看 observation 层的 trace。
                     log::warn!(
-                        "聊天观察流出现缺口，下一屏重建观察状态（仅粉色建立历史基线）: kind={:?} missing={:?}..={:?}",
-                        gap.kind,
-                        gap.missing_from,
-                        gap.missing_through
+                        "聊天观察流出现缺口（{}），这一屏之后的观察不连续；下一屏会重建观察状态，只有粉色首屏才建立历史基线，缺口期间的消息可能不会派发",
+                        gap_kind_label(gap.kind)
                     );
                 }
             }
@@ -2356,15 +2542,15 @@ impl ApplicationRuntime {
                         .chat_timeline
                         .business_delivery_state(&observed.id)?;
                     log::info!(
-                        "命令未执行：未判为新增追加 state={:?}（Pending=仅排队未派发/Claimed=已认领/IgnoredRevision=等待有效修订/Fenced=交付栅栏/NotTracked=未入账，通常为基线或视图不连续）type={} text={}",
-                        state,
-                        message.message_type,
+                        "命令未执行：这条消息未判为新增追加（交付状态：{}，来源：{}），通常因为它是基线历史或画面不连续「{}」",
+                        delivery_state_label(state),
+                        message_source_label(&message.message_type),
                         compact_for_log(&message.text)
                     );
                 }
                 continue;
             }
-            log::debug!("处理一级观察消息: id={:?}", observed.id);
+            log::debug!("处理一级观察消息");
             if message.text.is_empty() {
                 if observed.is_new {
                     acknowledge_unrecognized_primary_message(
@@ -2421,8 +2607,8 @@ impl ApplicationRuntime {
                 // 若并非新增追加，则命令不会执行，需留痕。
                 if command_like && self.ui.chat_timeline.note_not_executed_log(&observed.id)? {
                     log::info!(
-                        "命令未执行：海龟汤提问采样中且本轮未判为新增追加 type={} text={}",
-                        message.message_type,
+                        "命令未执行：本轮正在进行海龟汤提问采样，这条消息未判为新增追加（来源：{}）「{}」",
+                        message_source_label(&message.message_type),
                         compact_for_log(&message.text)
                     );
                 }
@@ -2436,9 +2622,9 @@ impl ApplicationRuntime {
                         "信封可解析但无模块认领（或保留的决策语法被正常分发排除）"
                     };
                     log::info!(
-                        "命令未执行：{} type={} text={}",
+                        "命令未执行：{}（来源：{}）「{}」",
                         reason,
-                        message.message_type,
+                        message_source_label(&message.message_type),
                         compact_for_log(&message.text)
                     );
                 }
@@ -2456,7 +2642,7 @@ impl ApplicationRuntime {
                 let application = &self.business.playlist_application;
                 if !application.has_command_context(&owner, command, Instant::now())? {
                     log::info!(
-                        "命令未执行：歌单命令缺少当前窗口上下文 text={}",
+                        "命令未执行：歌单命令没有对应的当前窗口上下文，先打开歌单窗口再操作「{}」",
                         compact_for_log(&message.text)
                     );
                     acknowledge_unrecognized_primary_message(
@@ -2472,7 +2658,11 @@ impl ApplicationRuntime {
                 && !self.business.business.invite_should_accept(invite.seq)?
             {
                 let seq = invite.seq.expect("unsequenced invites are always accepted");
-                log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed_command.raw);
+                log::info!(
+                    "邀请参数 {} 已执行过，本次跳过，不会重复发送邀请（命令：{}）",
+                    seq,
+                    parsed_command.raw
+                );
                 self.ui.chat_timeline.acknowledge_business(&observed.id)?;
                 continue;
             }
@@ -2480,9 +2670,9 @@ impl ApplicationRuntime {
                 parsed_command.command,
                 ModuleCommand::Playlist(crate::features::playlist::PlaylistCommand::Import { .. })
             ) {
-                log::debug!("解析到歌单导入命令（分享链接已隐藏）");
+                log::debug!("解析到歌单导入命令，分享链接已隐藏不记入日志");
             } else {
-                log::debug!("解析命令: {}", parsed_command.raw);
+                log::debug!("解析出命令：{}", parsed_command.raw);
             }
             parsed.push(parsed_command);
         }
@@ -2503,7 +2693,8 @@ impl ApplicationRuntime {
                 // 也可能是该命令的最低角色/单条启用策略拒绝。写成「识别已禁用」
                 // 会把人引去查全局开关，而实际原因是权限。
                 log::info!(
-                    "命令未执行：权限或启用策略拒绝（{gate:?}） text={}",
+                    "命令未执行：{}（命令：{}）",
+                    gate.log_reason(),
                     routed.raw
                 );
                 // 命令在这里就被丢掉，走不到 execute_command，所以提示只能在这里出。
@@ -2582,15 +2773,19 @@ impl ApplicationRuntime {
                     .identity
                     .role_of_sender(&sender, account);
                 if !config.min_access.allows(role) {
-                    // 带上 account 一起打：role=None 有两种成因——身份没登记，
-                    // 或者这条消息根本没带 UID（于是只按昵称查，随机 nickname 查不到）。
-                    // 不区分就只能看到「未触发」，分不清是配置问题还是链路问题。
+                    // role=None 有两种成因：身份没登记，或这条消息根本没带账号
+                    // （于是只按昵称查，随机 nickname 查不到）。日志必须能区分这两者，
+                    // 但**不能打印 UID 本身**——那是真实玩家标识（MUST_READ §9）。
                     log::info!(
-                        "AI 聊天未触发：需要{}才能触发 sender={} role={:?} account={:?}",
+                        "AI 聊天未触发：需要{}权限才能触发，发送者「{}」当前身份为{}，本条消息{}",
                         config.min_access.label(),
                         sender,
-                        role,
-                        account.map(|a| format!("{}:{}", a.game, a.uid))
+                        role.map(actor_role_label).unwrap_or("未登记"),
+                        if account.is_some() {
+                            "带账号（按账号查身份）"
+                        } else {
+                            "不带账号（只能按昵称查身份）"
+                        }
                     );
                     return Ok(());
                 }
@@ -2601,16 +2796,17 @@ impl ApplicationRuntime {
                 // debug 级日志在默认配置下根本不落盘，排查时还是「什么都看不到」。
                 // 只在真正收到聊天消息时打印，不会淹没日志。
                 log::info!(
-                    "AI 聊天未触发：{} type={} text={}",
+                    "AI 聊天未触发：{}（消息来源：{}）「{}」",
                     skip.reason(),
-                    message.message_type,
+                    message_source_label(&message.message_type),
                     compact_for_log(&message.text)
                 );
                 return Ok(());
             }
         };
         log::info!(
-            "AI 聊天触发: sender={sender} question={}",
+            "收到 AI 聊天提问，提问者「{}」，问题「{}」，开始生成回答",
+            sender,
             compact_for_log(&question)
         );
         let mut routed = RoutedCommand::console(
@@ -2714,7 +2910,10 @@ impl ApplicationRuntime {
             return Ok(());
         };
         if let Err(error) = self.reply(message) {
-            log::warn!("提示命令被拒原因失败（{gate:?}）: {error:#}");
+            log::warn!(
+                "向玩家说明命令被拒原因失败（原因：{}），命令仍不执行，玩家这次看不到提示: {error:#}",
+                gate.log_reason()
+            );
         }
         Ok(())
     }
@@ -2730,8 +2929,12 @@ impl ApplicationRuntime {
                     .pending_mode
                     .map(|mode| format!("，等待切换{}", mode.label()))
                     .unwrap_or_default();
-                let message = format!("值守模式状态: {}{}", snapshot.mode.label(), pending);
-                log::info!("{}", message);
+                // 监控事件流与日志共用同一句。已确认消费方只做原样显示：
+                // TUI 的 draw_commands 逐行 Line::from(command.as_str())，
+                // HTTP 的 commands 只走 map_text_collection 做身份名替换，
+                // 两者都不解析这段文本，因此统一措辞是安全的。
+                let message = format!("值守模式查询：当前为{}{}", snapshot.mode.label(), pending);
+                log::info!("「{}」{}", parsed.username, message);
                 self.lifecycle
                     .monitor
                     .publish(MonitorEvent::Command(format!(
@@ -2753,10 +2956,13 @@ impl ApplicationRuntime {
                 let (queued, snapshot) =
                     self.business.business.request_chat_listener_mode(target)?;
                 if !queued {
-                    log::info!(
-                        "值守模式切换已处于当前或等待状态，跳过: current={} pending={:?}",
+                    log::debug!(
+                        "值守模式切换请求被跳过：当前已是{}，或已有待处理的切换请求「{}」",
                         snapshot.mode.label(),
-                        snapshot.pending_mode
+                        snapshot
+                            .pending_mode
+                            .map(|mode| mode.label())
+                            .unwrap_or("无")
                     );
                     return Ok(true);
                 }
@@ -2782,7 +2988,10 @@ impl ApplicationRuntime {
         observed_at: Instant,
     ) -> Result<()> {
         self.record_command_activity(observed_at)?;
-        log::info!("海龟汤提问已加入正式输入队列: nickname={}", question.player);
+        log::info!(
+            "海龟汤提问已加入正式输入队列，提问者「{}」",
+            question.player
+        );
         self.push_pending_task(PendingTask::TurtleSoupQuestion {
             question: Box::new(question),
             observed_at,
@@ -2881,7 +3090,11 @@ impl ApplicationRuntime {
         if gate.is_blocked() {
             // 同上一级：区分「全局开关」「面板关闭」与「该命令权限不够」，
             // 否则会误导排查方向；文案也只能在这里出（命令不会进 execute_command）。
-            log::info!("命令未执行：二级命令被权限或启用策略拒绝（{gate:?}） text={}", parsed.raw);
+            log::info!(
+                "命令未执行：{}（二级命令：{}）",
+                gate.log_reason(),
+                parsed.raw
+            );
             self.notify_gate_denied(&parsed, gate)?;
             return Ok(false);
         }
@@ -2889,7 +3102,11 @@ impl ApplicationRuntime {
             && !self.business.business.invite_should_accept(invite.seq)?
         {
             let seq = invite.seq.expect("unsequenced invites are always accepted");
-            log::info!("邀请参数 {} 已执行过，跳过: {}", seq, parsed.raw);
+            log::info!(
+                "邀请参数 {} 已执行过，本次跳过，不会重复发送邀请（命令：{}）",
+                seq,
+                parsed.raw
+            );
             return Ok(false);
         }
         if self.apply_immediate_administration(&parsed, true)? {
@@ -2909,11 +3126,14 @@ impl ApplicationRuntime {
             return Ok(());
         }
         if self.pending_contains_command(&pending.routed)? {
-            log::info!("命令已在待处理队列，本轮跳过: {}", pending.routed.raw);
+            log::info!(
+                "命令已在待处理队列，本轮跳过避免重复入队（命令：{}）",
+                pending.routed.raw
+            );
             return Ok(());
         }
         self.record_command_activity(command_observed_at(&pending.routed))?;
-        log::info!("命令已加入待处理队列: {}", pending.routed.raw);
+        log::info!("命令已加入待处理队列，等待执行：{}", pending.routed.raw);
         self.push_pending_task(PendingTask::Command(Box::new(pending)))
     }
 
@@ -2988,13 +3208,18 @@ impl ApplicationRuntime {
         {
             return Ok(());
         }
-        log::info!("外部聊天源首次遇到一级聊天界面，自动切换二级值守: ui={ui_state}");
+        log::info!(
+            "外部聊天源首次遇到一级聊天界面，自动切换到二级值守（当前界面：{}）",
+            ui_state
+        );
         if let Err(error) = self
             .business
             .business
             .request_chat_listener_mode(ChatListenerMode::Secondary)
         {
-            log::warn!("外部聊天源默认切换二级失败（保持一级）: {error}");
+            log::warn!(
+                "外部聊天源自动切换到二级值守失败（步骤：请求切换值守模式），当前保持一级值守，不再自动重试: {error}"
+            );
         }
         Ok(())
     }
@@ -3006,7 +3231,10 @@ impl ApplicationRuntime {
         if snapshot.mode == target {
             // 已经切到了目标模式，pending 只是残留：直接收尾。
             self.business.business.complete_chat_listener_mode(target)?;
-            log::info!("值守模式已是{}，清理残留的切换请求", target.label());
+            log::info!(
+                "值守模式已经是{}，清理残留的切换请求，避免它继续挡住驻留恢复",
+                target.label()
+            );
             return Ok(());
         }
         let key = crate::runtime::scheduler::FormalTaskDedupKey::new(format!(
@@ -3017,7 +3245,7 @@ impl ApplicationRuntime {
             return Ok(());
         }
         log::warn!(
-            "值守切换请求没有对应任务（pending={}），补入队",
+            "值守切换请求没有对应的排队任务（目标模式：{}），已补入队，否则该请求会一直悬挂",
             target.label()
         );
         if let Err(error) = self.push_pending_task(PendingTask::SetChatListenerMode { target }) {
@@ -3027,7 +3255,9 @@ impl ApplicationRuntime {
                 .business
                 .cancel_chat_listener_mode_request(target)
             {
-                log::error!("撤销值守切换请求失败: {cancel_error}");
+                log::error!(
+                    "撤销值守切换请求失败（步骤：入队失败后回滚切换请求），该请求可能残留在待处理状态并挡住后续驻留恢复，需要人工核对: {cancel_error}"
+                );
             }
             return Err(error);
         }
@@ -3048,7 +3278,7 @@ impl ApplicationRuntime {
             .is_ok()
         {
             self.complete_chat_listener_mode(target)?;
-            log::info!("聊天值守模式已切换为{}", target.label());
+            log::info!("聊天值守模式已切换为{}并生效", target.label());
             return Ok(());
         }
 

@@ -9,6 +9,7 @@ pub(crate) const OCR_TRAILING_NOISE: &[char] = &[
     '—', '」', '』', '”', '’', '）', ')', '】', ']', ' ', '\t', '　',
 ];
 
+
 /// 归一化聊天文本：**只做不丢信息的修正**，且**空白一律丢弃**。
 ///
 /// - 全角 ASCII 折半角：游戏里的冒号/括号本来就是半角，OCR 偶尔读成全角；
@@ -244,6 +245,7 @@ fn is_comparison_punctuation(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[test]
     fn comparison_text_ignores_width_case_whitespace_and_punctuation() {

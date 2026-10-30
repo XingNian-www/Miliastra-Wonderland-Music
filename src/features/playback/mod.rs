@@ -79,6 +79,18 @@ pub(crate) use state::{
     SongRequestEvent, SongRequestLeaderboardEntry,
 };
 
+/// 播放状态的中文说法，供日志使用（内部枚举名不该直接出现在日志里）。
+fn describe_confirmed_state(state: ConfirmedPlaybackState) -> &'static str {
+    match state {
+        ConfirmedPlaybackState::Idle => "空闲",
+        ConfirmedPlaybackState::Starting => "正在开始播放",
+        ConfirmedPlaybackState::RequestedSongPlaying => "点歌播放中",
+        ConfirmedPlaybackState::PausedByUser => "用户已暂停",
+        ConfirmedPlaybackState::ExternalPlayback => "外部应用正在播放",
+        ConfirmedPlaybackState::Unknown => "未知",
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlaybackTimingConfig {
@@ -721,7 +733,7 @@ impl PlaybackService {
         let mut queue = PersistentQueue::from_request_store(request_state.clone(), queue_max_size)?;
         let stale_auto = queue.remove_playlist_auto_items()?;
         if stale_auto > 0 {
-            log::info!("已清理重启残留的个人歌单自动项: {stale_auto} 首");
+            log::info!("已清理上次运行残留的个人歌单自动项 {stale_auto} 首，避免重启后重复排队");
         }
         let playback_state = PersistentPlaybackState::from_request_store(request_state.clone())?;
         let song_dedup_history =
@@ -731,12 +743,15 @@ impl PlaybackService {
             .map_err(|_| anyhow::anyhow!("请求状态存储锁已中毒"))?
             .playback_pool_snapshot()
             .len();
-        log::info!("已加载队列: {} 首", queue.len());
-        log::info!("已加载播放池: {} 首", pool_size);
-        log::info!("已加载长时间同歌去重历史: {} 条", song_dedup_history.len());
         log::info!(
-            "已加载播放状态: playback_state={:?}",
-            playback_state.state().state
+            "已恢复播放数据：队列 {} 首，播放池 {} 首，同歌去重历史 {} 条",
+            queue.len(),
+            pool_size,
+            song_dedup_history.len()
+        );
+        log::debug!(
+            "已恢复播放状态：{}",
+            describe_confirmed_state(playback_state.state().state)
         );
         let mut service = Self::new(
             queue,

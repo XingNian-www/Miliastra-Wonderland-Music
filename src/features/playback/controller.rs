@@ -386,7 +386,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         self.clear_external_playback_tracker()?;
         self.playback_state
             .update(PlaybackStateUpdate::UserPaused)?;
-        log::info!("播放器状态转移: pause_reason=user");
+        log::debug!("暂停播放：用户主动暂停，播放器已进入暂停状态");
         Ok(message)
     }
 
@@ -432,7 +432,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         );
         match (tracker_result, pause_result) {
             (Ok(()), Ok(message)) => {
-                log::info!("播放器状态转移: pause_reason=user reason={reason}");
+                log::debug!("暂停播放：{label}触发暂停，播放器已进入暂停状态");
                 Ok(message)
             }
             (Err(tracker_error), Ok(_)) => Err(anyhow!(
@@ -456,7 +456,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         let message = result?;
         self.playback_state
             .update(PlaybackStateUpdate::UserResumed)?;
-        log::info!("播放器状态转移: pause_reason=none");
+        log::debug!("恢复播放：用户主动恢复，播放器已离开暂停状态");
         Ok(message)
     }
 
@@ -606,7 +606,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             },
             navigation: request.navigation,
         })?;
-        log::info!("播放器状态转移: Starting keyword={}", request.keyword);
+        log::info!("开始播放「{}」：正在切到该曲目", request.keyword);
         Ok(PlaybackAttempt {
             previous_playback,
             started_at_ms,
@@ -624,7 +624,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         if let Err(error) = result {
             if let Err(restore_error) = self.restore_failed_attempt(&attempt, "dispatch_failed") {
                 log::error!(
-                    "播放失败且状态恢复也失败: play_error={error:#} restore_error={restore_error:#}"
+                    "播放「{}」失败（步骤：向后端派发播放请求），且失败后恢复原播放状态也失败（{restore_error:#}）；本次播放未生效，队列保持原状等待下次重试: {error:#}",
+                    request.keyword
                 );
             }
             return Err(error);
@@ -644,7 +645,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             }
             .to_string(),
         ) {
-            log::error!("持久化播放派发历史失败: {error:#}");
+            log::error!(
+                "记录播放派发历史失败（步骤：写入播放请求状态库）；本次播放不受影响，但重启后可能重复派发同一首: {error:#}"
+            );
         }
     }
 
@@ -654,7 +657,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             requested_at_ms,
             completed,
         ) {
-            log::error!("持久化播放器控制历史失败: {error:#}");
+            log::error!(
+                "记录播放器控制历史失败（步骤：写入播放请求状态库）；本次控制已生效，但这些记录不会出现在崩溃恢复的排查依据里: {error:#}"
+            );
         }
     }
 
@@ -701,7 +706,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         self.record_observation(&status, classify_observation(&status))?;
         let message = format_play_message(&status);
         self.confirm_playback_success(request, &status)?;
-        log::info!("播放成功: {}", message);
+        log::info!("起播已确认：{message}");
         Ok(PlaybackVerification::Success { status, message })
     }
 
@@ -744,7 +749,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         if let Some(expected) = expected_active
             && active.identity().as_ref() != Some(expected)
         {
-            log::info!("跳过过期的播放恢复：活动请求已在取得播放 lease 后发生变化");
+            log::debug!("跳过恢复上次播放：等待期间活动的播放请求已换成另一首，旧请求不再恢复");
             return Ok(false);
         }
         if !matches!(
@@ -754,14 +759,18 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             // 崩溃/断电落在起播确认前会留下 Starting：既不能恢复，也不应阻塞
             // monitor 的自动出队。视为过期并清除活动请求（保留队列项与 id 分配器）。
             if matches!(runtime.state, ConfirmedPlaybackState::Starting) {
-                log::warn!("清理崩溃残留的播放 Starting 状态，保留队列等待重播");
+                log::warn!(
+                    "上次播放停在「开始播放」状态且没有后续确认，判定为崩溃残留；已清理该状态，队列保留等待重播"
+                );
                 self.playback_state
                     .update(PlaybackStateUpdate::ClearActiveRequest)?;
             }
             return Ok(false);
         }
         let Some(active_track) = active.track.as_ref() else {
-            log::warn!("跳过恢复缺少结构化曲目的活动请求，并清理过期播放状态");
+            log::warn!(
+                "跳过恢复上次播放：活动请求没有结构化曲目信息，无法定位音源；已清理该过期状态，队列保持不动"
+            );
             self.playback_state
                 .update(PlaybackStateUpdate::ClearActiveRequest)?;
             return Ok(false);
@@ -772,7 +781,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             .is_some_and(|observation| restoration_observation_conflicts(active_track, observation))
         {
             log::warn!(
-                "最后播放器观测与活动请求冲突，跳过恢复并清理过期播放状态: uri={}",
+                "跳过恢复上次播放：播放器最后观测到的曲目「{}」与活动请求不是同一首；已清理该过期状态，避免恢复成错误的歌",
                 active_track.track_ref.key
             );
             self.playback_state
@@ -788,7 +797,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         );
         // 恢复前先应用持久化音量：引擎重启后默认 100，必须恢复到上次会话的音量。
         if let Err(error) = self.backend.set_volume(&runtime.volume.to_string()) {
-            log::warn!("恢复播放前设置音量失败: {error:#}");
+            log::warn!(
+                "恢复上次播放时设置音量失败（步骤：恢复播放前应用持久化音量）；本次恢复继续执行，音量可能停在引擎默认值: {error:#}"
+            );
         }
         let mut attempt = self.begin_playback_attempt(&request)?;
         let result = self.backend.play_restored(active_track, seek_seconds);
@@ -796,7 +807,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         if let Err(error) = result {
             if let Err(restore_error) = self.restore_failed_attempt(&attempt, "dispatch_failed") {
                 log::error!(
-                    "恢复播放失败且状态恢复也失败: play_error={error:#} restore_error={restore_error:#}"
+                    "恢复上次播放失败（步骤：向引擎派发恢复请求），且恢复原播放状态也失败（{restore_error:#}）；本次恢复未生效，队列已清空该请求等待重新点歌: {error:#}"
                 );
             }
             return Err(error);
@@ -805,7 +816,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         // 应用持久化歌词模式：引擎起播默认使用翻译，恢复时必须按上次会话的设置。
         // 明确设置（非 toggle），引擎加载中的歌词任务完成后按该模式显示。
         if let Err(error) = self.backend.set_lyrics_translation(runtime.use_translation) {
-            log::warn!("恢复播放后设置歌词模式失败: {error:#}");
+            log::warn!(
+                "恢复上次播放时设置歌词模式失败（步骤：恢复播放后应用持久化歌词模式）；歌曲已正常播放，歌词显示与重启前可能不一致: {error:#}"
+            );
         }
         // 原用户暂停：歌曲已开始播放，立即暂停以保持用户暂停语义。
         if keep_paused {
@@ -813,19 +826,32 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 Ok(_) => {
                     self.playback_state
                         .update(PlaybackStateUpdate::UserPaused)?;
-                    log::info!("恢复播放后保持用户暂停: uri={}", request.uri());
+                    log::debug!(
+                        "恢复上次播放后已重新暂停：重启前是用户暂停状态，恢复后保持暂停语义，曲目「{}」",
+                        request.keyword
+                    );
                 }
-                Err(error) => log::warn!("恢复播放后保持暂停失败: {error:#}"),
+                Err(error) => log::warn!(
+                    "恢复上次播放后重新暂停失败（步骤：恢复播放后保持用户暂停）；歌曲已开始播放，用户会听到音乐而未主动点播: {error:#}"
+                ),
             }
         }
         // 恢复会话是新引擎会话：立即绑定，避免监控把新会话误判为 runtime 重启。
         let PlaybackVerification::Success { status, .. } = &verification;
         let _ = self.reconcile_player_session(&self.playback_state.snapshot()?, status)?;
+        // 只在真正发生恢复时输出：进度是可读的秒数，不是调试结构。
+        let seek_note = match seek_seconds {
+            Some(seconds) => format!("从 {seconds:.0} 秒处继续"),
+            None => "从头开始".to_string(),
+        };
         log::info!(
-            "播放器状态转移: restored uri={} seek={:?} keep_paused={}",
-            request.uri(),
-            seek_seconds,
-            keep_paused
+            "已恢复上次播放：曲目「{}」，{seek_note}{}",
+            request.keyword,
+            if keep_paused {
+                "，保持用户暂停"
+            } else {
+                ""
+            }
         );
         Ok(true)
     }
@@ -855,7 +881,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         let _lease = match self.playback_operation_lease.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
-                log::debug!("播放操作进行中，跳过本轮自动出队检查");
+                log::trace!("跳过本轮自动出队检查：另一条播放操作正持有播放租约");
                 return Ok(QueueAdvanceDecision::None);
             }
             Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -989,9 +1015,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             }
             SessionReconciliation::Bound => {
                 if !incoming_live_session_verified && !incoming_initial_terminal_session_verified {
-                    log::debug!(
-                        "忽略未验证的播放器会话: reconciliation={:?} runtime={} session={} status={}",
-                        session_reconciliation,
+                    log::trace!(
+                        "忽略未通过校验的播放器会话（会话步态：{}，播放器运行时「{}」，会话「{}」，状态「{}」）",
+                        describe_reconciliation(session_reconciliation),
                         runtime_identity,
                         status.session_id,
                         status.status
@@ -1006,9 +1032,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             }
             SessionReconciliation::Replaced => {
                 if !incoming_live_session_verified {
-                    log::debug!(
-                        "忽略未验证的播放器会话: reconciliation={:?} runtime={} session={} status={}",
-                        session_reconciliation,
+                    log::trace!(
+                        "忽略未通过校验的播放器会话（会话步态：{}，播放器运行时「{}」，会话「{}」，状态「{}」）",
+                        describe_reconciliation(session_reconciliation),
                         runtime_identity,
                         status.session_id,
                         status.status
@@ -1038,7 +1064,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             && status.current_track.is_some()
             && !status_matches_active
         {
-            log::debug!("忽略与当前活动 TrackKey 不一致的播放器观测");
+            log::trace!("忽略本次播放器观测：观测到的曲目与当前活动请求的曲目不匹配");
             return Ok(QueueAdvanceDecision::None);
         }
         // 只有已接受运行时的观察才能替换持久化续播点。替代运行时在恢复派发前尤其会先处于停止状态。
@@ -1052,7 +1078,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 classify_observation(&status),
                 immediate_observation,
             )? {
-                log::debug!("活动请求已变化，丢弃过期播放器观测");
+                log::trace!("丢弃过期的播放器观测：写入前发现活动请求已被新请求替换");
                 return Ok(QueueAdvanceDecision::None);
             }
         } else {
@@ -1099,12 +1125,15 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             if now_ms.saturating_sub(self.last_idle_advance_at_ms.load(Ordering::Relaxed))
                 < IDLE_ADVANCE_COOLDOWN_MS
             {
-                log::debug!("空闲续播冷却中，暂不触发");
+                log::trace!(
+                    "暂不触发空闲续播：距上次空闲续播不足冷却时间（{} 毫秒）",
+                    IDLE_ADVANCE_COOLDOWN_MS
+                );
                 return Ok(QueueAdvanceDecision::None);
             }
             self.last_idle_advance_at_ms
                 .store(now_ms, Ordering::Relaxed);
-            log::info!("队列推进决策: advance reason=idle_keep_alive");
+            log::info!("自动播放列表空闲，已触发续播：继续播放下一首");
             return Ok(QueueAdvanceDecision::AdvanceQueue {
                 reason: "空闲续播"
             });
@@ -1117,7 +1146,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             && !context.has_pending_playback_task
             && !context.queue_empty
         {
-            log::info!("队列推进决策: advance reason=external_not_stable");
+            log::info!("检测到外部播放已结束且当前没有活动点歌，已触发续播");
             return Ok(QueueAdvanceDecision::AdvanceQueue {
                 reason: "外部播放未稳定",
             });
@@ -1150,7 +1179,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             // （暂停命令发出后引擎流可能仍在缓冲，源站断流时会产生失败信号。）
             if self.playback_state.snapshot()?.pause_reason == PauseReason::User {
                 log::debug!(
-                    "用户暂停中，播放失败保留暂停状态: code={} message={}",
+                    "用户暂停期间播放器报告失败（错误码 {}：{}）；保留暂停状态，不推进队列",
                     status.failure_code,
                     status.failure_message
                 );
@@ -1169,8 +1198,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                                 && request.expected_generation == status.generation)
                     });
             if !belongs_to_active {
-                log::debug!(
-                    "忽略非当前会话的失败残留: code={} session={} generation={}",
+                log::trace!(
+                    "忽略失败信号：属于已结束的旧会话（错误码 {}，会话「{}」，第 {} 代），不影响当前播放",
                     status.failure_code,
                     status.session_id,
                     status.generation
@@ -1182,21 +1211,19 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             // 引擎重建输出流并清空失败信号，再自动续播；期间不再逐首跳歌。
             if status.failure_code == "engine_unavailable" {
                 log::error!(
-                    "音频输出设备不可用，暂停自动出队直到设备恢复: message={}",
+                    "音频输出设备不可用（{}）；已暂停自动出队，设备恢复前不会切歌，恢复后自动续播",
                     status.failure_message
                 );
                 return Ok(QueueAdvanceDecision::None);
             }
             if status.failure_retryable {
                 log::error!(
-                    "引擎播放失败: code={} message={}",
+                    "播放「{}」失败（引擎错误码 {}：{}）",
+                    status.current_uri,
                     status.failure_code,
                     status.failure_message
                 );
-                log::warn!(
-                    "失败可重试，保留队首等待重新播放: uri={}",
-                    status.current_uri
-                );
+                log::warn!("该失败可重试：曲目保留在队首，等待引擎重新播放，不切下一首");
                 return Ok(QueueAdvanceDecision::None);
             }
             // 不可重试失败：core 层仍会流重试（第一轮缓存、第二轮清缓存直连），
@@ -1206,7 +1233,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             if first_seen == 0 {
                 self.engine_failure_at_ms.store(now_ms, Ordering::Relaxed);
                 log::error!(
-                    "引擎播放失败: code={} message={}，等待流重试(窗口{}ms)",
+                    "播放「{}」失败（引擎错误码 {}：{}）；进入流重试窗口 {} 毫秒，窗口内不切歌，超时才放弃该曲目",
+                    status.current_uri,
                     status.failure_code,
                     status.failure_message,
                     ENGINE_RETRY_WINDOW_MS
@@ -1215,8 +1243,8 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             }
             let elapsed = now_ms.saturating_sub(first_seen);
             if elapsed < ENGINE_RETRY_MIN_INTERVAL_MS {
-                log::debug!(
-                    "引擎播放失败持续，最小间隔内暂不决策: code={} message={}",
+                log::trace!(
+                    "播放失败仍在持续，但处于最小决策间隔内（错误码 {}：{}），本轮不重复决策",
                     status.failure_code,
                     status.failure_message
                 );
@@ -1224,7 +1252,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             }
             if elapsed < ENGINE_RETRY_WINDOW_MS {
                 log::debug!(
-                    "引擎播放失败持续，等待流重试(剩余{}ms): code={} message={}",
+                    "播放失败仍在持续，继续等待流重试（剩余 {} 毫秒，错误码 {}：{}）",
                     ENGINE_RETRY_WINDOW_MS - elapsed,
                     status.failure_code,
                     status.failure_message
@@ -1232,7 +1260,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 return Ok(QueueAdvanceDecision::None);
             }
             log::warn!(
-                "流重试窗口超时，放弃当前曲目: code={} message={}",
+                "流重试窗口已超时，放弃当前曲目（引擎错误码 {}：{}）；将清除该曲目音频缓存并切下一首",
                 status.failure_code,
                 status.failure_message
             );
@@ -1248,7 +1276,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 .map(|track| track.track_ref.key.clone())
                 && let Err(error) = self.backend.invalidate_audio_cache(&key)
             {
-                log::warn!("清除曲目音频缓存失败: {error:#}");
+                log::warn!(
+                    "清除该曲目的音频缓存失败（步骤：放弃曲目后清理缓存）；下次播放仍会复用这份可能损坏的缓存: {error:#}"
+                );
             }
             self.clear_active_request()?;
             let _ = self.playback_state.reconcile_player_session(None)?;
@@ -1258,7 +1288,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             {
                 return Ok(QueueAdvanceDecision::PlaybackStateChanged);
             }
-            log::info!("队列推进决策: advance reason=playback_failure");
+            log::info!("当前曲目连续失败已超重试窗口，已切到下一首");
             return Ok(QueueAdvanceDecision::AdvanceQueue {
                 reason: "播放失败"
             });
@@ -1268,7 +1298,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             && guard_active
             && !is_notify_controller_natural_end(&status)
         {
-            log::debug!("点歌刚开始，暂不触发队列自动出队");
+            log::trace!("暂不触发队列自动出队：点歌刚开始，仍处于起播保护期");
             return Ok(QueueAdvanceDecision::None);
         }
 
@@ -1286,7 +1316,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                 self.wall_clock.unix_millis(),
             )?;
             if !claimed {
-                log::debug!("已处理过同一 播放运行时自然结束，忽略重复观测");
+                log::trace!("忽略重复观测：这一代的自然结束事件已经处理过");
                 return Ok(QueueAdvanceDecision::None);
             }
             // 自然结束清空前保留上一曲历史，与手动点歌路径一致（@上一曲可用）。
@@ -1302,7 +1332,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             {
                 return Ok(QueueAdvanceDecision::PlaybackStateChanged);
             }
-            log::info!("队列推进决策: advance reason=natural_end");
+            log::info!("当前曲目已自然播放结束，已切到下一首");
             return Ok(QueueAdvanceDecision::AdvanceQueue {
                 reason: "自然结束"
             });
@@ -1421,7 +1451,9 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         // 播放任务并发起播，新会话互相覆盖。恢复由播放任务完成后的下一次
         // 决策接管（其 context 中这两个标志已复位）。
         if context.command_executing || context.has_pending_playback_task {
-            log::debug!("播放运行时已重启，但播放任务仍在执行，跳过恢复");
+            log::debug!(
+                "播放运行时已重启，但当前仍有播放任务在执行；本轮跳过恢复，等任务结束后由下一轮决策接管"
+            );
             return Ok(QueueAdvanceDecision::None);
         }
         let Some(active) = runtime.active_request.as_ref() else {
@@ -1435,15 +1467,17 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         {
             let request = playback_request_from_active(active);
             log::warn!(
-                "检测到 playback runtime 重启，控制器授权新恢复会话: previous_uri={}",
-                request.uri()
+                "播放运行时已重启并停在空闲状态；已授权按上次曲目「{}」建立新的恢复会话",
+                request.keyword
             );
             // `maybe_advance_queue*` 已持有共享播放操作租约。派发前重新检查精确活动身份，避免较早取得租约的请求被过期恢复决策替换。
             match self.play_restored_with_lease(Some(&expected_active)) {
                 Ok(true) => return Ok(QueueAdvanceDecision::PlaybackStateChanged),
                 Ok(false) => return Ok(QueueAdvanceDecision::None),
                 Err(error) => {
-                    log::error!("播放运行时重启后的恢复会话无法播放: {error:#}");
+                    log::error!(
+                        "播放运行时重启后的恢复失败（步骤：按上次曲目重新派发播放）；播放状态已标记为未知，队列保留等待人工确认: {error:#}"
+                    );
                     self.mark_unknown()?;
                     return Ok(QueueAdvanceDecision::PlaybackStateChanged);
                 }
@@ -1586,15 +1620,22 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         // 起播已确认且队首已出队：去重/播放池记账失败不能把成功改判成播放失败，
         // 只记 warning（下一次播放会重新登记）。
         if let Err(error) = self.record_song_dedup_playback(request, status) {
-            log::warn!("记录同歌去重历史失败（不影响本次播放）: {error:#}");
+            log::warn!(
+                "记录同歌去重历史失败（步骤：起播确认后记账）；本次播放已生效，但该曲目可能被重复点播: {error:#}"
+            );
         }
         if let Err(error) = self
             .playback_state
             .record_playback_pool_track(confirmed_track.clone())
         {
-            log::warn!("登记播放池失败（不影响本次播放）: {error:#}");
+            log::warn!(
+                "把该曲目加入播放池失败（步骤：起播确认后记账）；本次播放已生效，但队列播完后不会随机播到它: {error:#}"
+            );
         }
-        log::info!("播放器状态转移: Starting -> RequestedSongPlaying reason={reason}");
+        log::debug!(
+            "播放状态已从「开始播放」推进到「已确认播放」（原因：{}）",
+            describe_confirm_reason(reason)
+        );
         Ok(())
     }
 
@@ -1774,7 +1815,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         }
         if observation.protected && !observation.was_protected {
             log::info!(
-                "外部播放已稳定 {}s，加入当前歌曲保护: {}",
+                "检测到外部播放已稳定 {} 秒，曲目「{}」加入保护：保护期内不自动切歌",
                 *self
                     .queue_external_protect_seconds
                     .read()
@@ -1802,10 +1843,16 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     fn restore_failed_attempt(&self, attempt: &PlaybackAttempt, reason: &str) -> Result<()> {
         if reason == "dispatch_failed" {
             self.restore_playback_state(attempt.previous_playback.clone())?;
-            log::info!("播放器状态转移: Starting -> previous reason={}", reason);
+            log::debug!(
+                "播放失败后已回滚到上一次确认的播放状态（原因：{}）",
+                describe_confirm_reason(reason)
+            );
         } else {
             self.mark_unknown()?;
-            log::info!("播放器状态转移: Starting -> Unknown reason={}", reason);
+            log::debug!(
+                "播放失败后无法回滚，播放状态已标记为未知，等待后续观测校准（原因：{}）",
+                describe_confirm_reason(reason)
+            );
         }
         Ok(())
     }
@@ -2063,6 +2110,25 @@ fn format_pause_reason(reason: PauseReason) -> String {
     .to_string()
 }
 
+/// 会话协调步态的中文说法，供日志使用（避免把内部枚举名直接打给用户看）。
+fn describe_reconciliation(reconciliation: SessionReconciliation) -> &'static str {
+    match reconciliation {
+        SessionReconciliation::Idle => "空闲，没有活动请求",
+        SessionReconciliation::Bound => "已绑定会话但尚未校验",
+        SessionReconciliation::Match => "与当前会话一致",
+        SessionReconciliation::Restarted => "播放器已重启",
+        SessionReconciliation::Replaced => "会话已被替换",
+        SessionReconciliation::Unknown => "无法判断",
+    }
+}
+
+/// 播放确认原因的中文说法。
+fn describe_confirm_reason(reason: &str) -> &str {
+    match reason {
+        "playback_confirmed" => "起播确认完成",
+        other => other,
+    }
+}
 fn format_reliability(reliability: ObservationReliability) -> String {
     match reliability {
         ObservationReliability::Reliable => "reliable",

@@ -314,7 +314,12 @@ fn confirm_automatic_entry(
             _ => unreachable!("automatic entry only starts from the gate or overworld"),
         };
         if !visible {
-            log::info!("自动进入前界面已变化，跳过本次任务: expected={expected:?}");
+            // 界面已变化说明玩家自己切走了，跳过是正常行为，不是失败；
+            // 但「跳过了什么」对排查有价值，保持 info 偏噪音，降到 debug。
+            log::debug!(
+                "自动进入游戏任务跳过（步骤：复查自动进入条件）：界面已变化，不再满足进入前提，本次不执行自动进入；本次期望的界面是「{}」，实际已不是它",
+                expected.label()
+            );
             return Ok(false);
         }
         wait_ms(
@@ -932,6 +937,20 @@ fn wait_template_absent(
             InputCertainty::AfterInputUnknown,
         )?;
     }
+    // 超时是**排障入口**：trace 级只在显式开启时可见，这里用 debug 给出
+    // 「哪个模板、哪个区域、期望多少」——没有这些，投递/启动卡住时无从判断
+    // 是模板不匹配还是界面根本不对。
+    log::debug!(
+        "等待模板「{}」消失超时（步骤：{}）：搜索区域 ({}, {}) {}×{}，期望分数 {:.3}，超时 {}ms 内一直判为可见；本次按「仍可见」继续处理",
+        wait.template.display(),
+        wait.stage,
+        wait.region.x,
+        wait.region.y,
+        wait.region.width,
+        wait.region.height,
+        wait.threshold,
+        wait.timeout_ms
+    );
     Err(UiRoutineFailure::new(
         InputCertainty::AfterInputUnknown,
         wait.stage,
@@ -1024,6 +1043,16 @@ fn wait_template_hit(
             wait.certainty,
         )?;
     }
+    log::debug!(
+        "等待模板「{}」出现超时（步骤：定位启动流程模板）：搜索区域 ({}, {}) {}×{}，期望分数 {:.3}，超时 {}ms 内未命中；本次按「未找到」继续",
+        wait.template.display(),
+        wait.region.x,
+        wait.region.y,
+        wait.region.width,
+        wait.region.height,
+        wait.threshold,
+        wait.timeout_ms
+    );
     Ok(None)
 }
 

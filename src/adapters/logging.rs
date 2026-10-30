@@ -1,3 +1,35 @@
+//! 文件日志器。
+//!
+//! # 两个日志流
+//!
+//! - **主日志**（`miliastra-wonderland-music[-日期].log`）：运行期全部常规日志。
+//!   面向「事后读日志的人」，一行一条事件，格式为
+//!   `[月-日 时:分:秒] 级别  正文`（级别后两个空格对齐正文）。
+//! - **性能日志**（`…-timing[-日期].log`，`target: "timing"`）：给脚本做性能分析用，
+//!   是字段化的 `key=value`，不参与可读性重构，格式由消费脚本决定。
+//!
+//! 另有 `target: "performance"`（独立字段流，同属脚本消费）与
+//! `target: "web_token"`（内容含完整访问令牌，只进 TUI/stderr，不落文件）。
+//!
+//! # 级别语义
+//!
+//! 分级按**事件在正常运行中出现的频繁程度**判定，不按严重程度：
+//!
+//! | 级别 | 频繁程度 | 典型内容 |
+//! |---|---|---|
+//! | `trace` | 每帧 / 每轮循环 | 逐帧匹配分数、每轮扫描分类结果 |
+//! | `debug` | 每次状态流转 | 命令解析、队列增删、OCR 单次输出 |
+//! | `info` | 玩家能感知 | 收到命令、点歌结果、值守切换、启停 |
+//! | `warn` | 偶发 | 可恢复异常、降级、重试、兜底路径生效 |
+//! | `error` | 罕见 | 本次功能最终失败，需要人工介入 |
+//!
+//! 完整规范见 `technical-docs/logging-style.md`。
+//!
+//! # 级别过滤
+//!
+//! 配置里的级别是**全局上限**，但第三方 crate（wgpu / naga 等）另受限：
+//! 见 [target_level]。
+
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -100,9 +132,15 @@ impl Log for FileLogger {
 }
 
 impl FileLogger {
+    /// 文件日志器自身不可用时（锁损坏、轮转失败）的兜底输出。
+    ///
+    /// 走到这里说明**本条日志进不了文件**：不能再用 `log::warn!`（会递归回到
+    /// 同一个坏掉的文件器），只能直接写 stderr。前缀与主格式保持一致，避免
+    /// 出现第二种行形状；级别固定为 WARN，因为能触发兜底的只有可降级的故障。
     fn write_fallback(&self, message: &str) {
         if self.stderr.load(Ordering::Relaxed) {
-            let _ = std::io::stderr().write_all(format!("[WARN ] : {message}\n").as_bytes());
+            let prefix = format_prefix_at(log::Level::Warn, SystemTime::now());
+            let _ = std::io::stderr().write_all(format!("{prefix} {message}\n").as_bytes());
         }
     }
 }
@@ -144,8 +182,19 @@ pub(crate) struct LogPaths {
     pub(crate) timing: PathBuf,
 }
 
+/// 日志行前缀：`[月-日 时:分:秒] 级别  正文`。
+///
+/// 级别右对齐到 5 字符，**前缀不含尾随空格**。
+///
+/// 前缀与正文之间的分隔空格由调用方统一提供（主路径 `log()` 用 `"{{}} {{}}"`，
+/// 兜底路径同样在中括号后加一个空格），两条路径的正文因此落在同一列。
+/// 此前前缀带尾随空格、`log()` 又补一个，实际输出三个空格；而兜底路径只补
+/// 一个格式串里的空格——正是本规范要消灭的「第二种行形状」。
+///
+/// 不再使用方括号包住级别、也不再在正文前加冒号分隔符。
+/// 不带年份：日志按日归档，文件名里已有完整日期，行内再写一遍只是噪音。
 fn format_prefix_at(level: log::Level, now: SystemTime) -> String {
-    format!("[{}][{level:<5}] :", format_timestamp(now))
+    format!("[{}] {level:<5}", format_timestamp(now))
 }
 
 pub(crate) fn format_time(now: SystemTime) -> String {
@@ -201,16 +250,16 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// 动态附加 monitor sink 并关闭 stderr。
 pub(crate) fn init_file(config: &LoggingConfig) -> Result<LogPaths> {
     fs::create_dir_all(&config.dir)
-        .with_context(|| format!("create log directory {}", config.dir.display()))?;
+        .with_context(|| format!("创建日志目录「{}」", config.dir.display()))?;
     let now = SystemTime::now();
     let files = LogFiles::open(&config.dir, config.rotate_daily, now)?;
     let paths = LogPaths {
         main: files.main_path.clone(),
         timing: files.timing_path.clone(),
     };
-    let cleanup_warning = cleanup_old_daily_logs(&config.dir, local_day(now), config.retain_days)
+    let cleanup_error = cleanup_old_daily_logs(&config.dir, local_day(now), config.retain_days)
         .err()
-        .map(|error| format!("清理过期日志失败，后续运行会重试: {error:#}"));
+        .map(|error| format!("{error:#}"));
     let level = parse_level(&config.level);
     let logger = FileLogger {
         files: Mutex::new(files),
@@ -221,10 +270,12 @@ pub(crate) fn init_file(config: &LoggingConfig) -> Result<LogPaths> {
         monitor: Mutex::new(None),
         stderr: AtomicBool::new(true),
     };
-    set_logger(logger).context("initialize logger")?;
+    set_logger(logger).context("注册全局日志器（可能已被其它组件抢先注册）")?;
     log::set_max_level(level);
-    if let Some(warning) = cleanup_warning {
-        log::warn!("{warning}");
+    if let Some(error) = cleanup_error {
+        log::warn!(
+            "启动时清理过期日志失败（步骤：初始化日志目录），本次保留全部旧日志，磁盘占用暂时偏高，下一次启动会重试：{error}"
+        );
     }
     Ok(paths)
 }
@@ -257,7 +308,7 @@ fn open_append_file(path: &Path, label: &str) -> Result<File> {
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("open {label} file {}", path.display()))
+        .with_context(|| format!("打开{label}文件「{}」", path.display()))
 }
 
 fn log_paths_for_day(log_dir: &Path, day: i64, rotate_daily: bool) -> Result<(PathBuf, PathBuf)> {
@@ -281,13 +332,14 @@ fn cleanup_old_daily_logs(log_dir: &Path, today: i64, retain_days: u32) -> Resul
     }
     let oldest_day = today - i64::from(retain_days.saturating_sub(1));
     for entry in fs::read_dir(log_dir)
-        .with_context(|| format!("read log directory {}", log_dir.display()))?
+        .with_context(|| format!("读取日志目录「{}」", log_dir.display()))?
     {
-        let entry = entry.with_context(|| format!("read entry in {}", log_dir.display()))?;
+        let entry =
+            entry.with_context(|| format!("读取日志目录「{}」中的条目", log_dir.display()))?;
         let path = entry.path();
         if !entry
             .file_type()
-            .with_context(|| format!("read file type {}", path.display()))?
+            .with_context(|| format!("读取文件类型「{}」", path.display()))?
             .is_file()
         {
             continue;
@@ -301,7 +353,7 @@ fn cleanup_old_daily_logs(log_dir: &Path, today: i64, retain_days: u32) -> Resul
         };
         if day < oldest_day {
             fs::remove_file(&path)
-                .with_context(|| format!("remove expired log {}", path.display()))?;
+                .with_context(|| format!("删除过期日志「{}」", path.display()))?;
         }
     }
     Ok(())
@@ -424,6 +476,113 @@ fn is_file_hidden_target(target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 行前缀形状：`[月-日 时:分:秒] 级别`（**不含尾随空格**）。
+    ///
+    /// 用户明确要求不带年份（按日归档，文件名里已有完整日期）；
+    /// 级别右对齐到 5 字符。前缀与正文之间的那个空格由**拼接层**提供，
+    /// 这样主路径与兜底路径才能落在同一列——见下一个测试的断言。
+    #[test]
+    fn prefix_shape_has_no_year_and_aligns_levels() {
+        // 2026-10-30 08:17:03 +08:00
+        let at = UNIX_EPOCH + std::time::Duration::from_secs(1_793_319_423);
+        // 4 字符级别靠 `{:<5}` 补齐，所以前缀本身可能以**对齐用**的单个空格结尾；
+        // 5 字符级别（ERROR/DEBUG/TRACE）则完全没有尾随空格。
+        assert_eq!(format_prefix_at(log::Level::Info, at), "[10-30 08:17:03] INFO ");
+        assert_eq!(format_prefix_at(log::Level::Warn, at), "[10-30 08:17:03] WARN ");
+        assert_eq!(format_prefix_at(log::Level::Error, at), "[10-30 08:17:03] ERROR");
+        assert_eq!(format_prefix_at(log::Level::Debug, at), "[10-30 08:17:03] DEBUG");
+        assert_eq!(format_prefix_at(log::Level::Trace, at), "[10-30 08:17:03] TRACE");
+        // 真正的不变量：**级别字段固定 5 字符宽，前缀里最多只有对齐用的填充**。
+        // 若再额外补一个空格（旧实现的写法），拼接后正文会比预期右移一列。
+        let stamps = "[10-30 08:17:03] ".len();
+        for level in [
+            log::Level::Info,
+            log::Level::Warn,
+            log::Level::Error,
+            log::Level::Debug,
+            log::Level::Trace,
+        ] {
+            let prefix = format_prefix_at(level, at);
+            assert_eq!(
+                prefix.len(),
+                stamps + 5,
+                "前缀应恰好是「时间戳 + 5 字符级别」，不能多出分隔空格: {prefix:?}"
+            );
+        }
+    }
+
+    /// 前缀里不得残留旧格式的分隔符：方括号只包住时间戳，级别后面不带冒号。
+    #[test]
+    fn prefix_carries_no_legacy_separators() {
+        let at = UNIX_EPOCH + std::time::Duration::from_secs(1_793_319_423);
+        for (level, label) in [
+            (log::Level::Info, "INFO"),
+            (log::Level::Warn, "WARN"),
+            (log::Level::Error, "ERROR"),
+            (log::Level::Debug, "DEBUG"),
+            (log::Level::Trace, "TRACE"),
+        ] {
+            let prefix = format_prefix_at(level, at);
+            assert!(
+                !prefix.contains("] :") && !prefix.contains("]["),
+                "前缀残留旧分隔符: {prefix:?}"
+            );
+            assert_eq!(prefix.matches('[').count(), 1, "只应有一个方括号开始: {prefix:?}");
+            assert_eq!(prefix.matches(']').count(), 1, "只应有一个方括号结束: {prefix:?}");
+            // 拼上正文后，级别与正文之间始终是两个空格（级别不足 5 字符时补齐）。
+            // 注意：这个空格由**拼接层**提供，前缀本身不带尾随空格。
+            let line = format!("{prefix} 点歌成功：晴天（QQ音乐）");
+            assert_eq!(
+                line,
+                format!("[10-30 08:17:03] {label:<5} 点歌成功：晴天（QQ音乐）")
+            );
+        }
+    }
+
+    /// 兜底输出与主格式同形：不能出现第二种行形状（旧实现硬编码 `[WARN ] `）。
+    #[test]
+    fn fallback_prefix_matches_the_main_format() {
+        let prefix = format_prefix_at(log::Level::Warn, SystemTime::now());
+        assert!(prefix.contains("] WARN"), "兜底前缀应含对齐后的 WARN: {prefix:?}");
+        assert!(!prefix.contains("[WARN ]"), "不得残留旧硬编码前缀: {prefix:?}");
+        // 兜底与主路径都用「前缀 + 一个空格 + 正文」，正文列必须相同。
+        let text = "日志文件锁已损坏，本条日志未写入文件";
+        assert_eq!(
+            format!("{prefix} {text}"),
+            format!("{} {}", prefix, text),
+            "兜底路径与主路径的拼接方式必须一致"
+        );
+    }
+
+    /// 第三方 crate 的日志固定在 Warn 一档（wgpu/naga 的每帧噪声不再进文件），
+    /// 本程序 target 与两个脚本消费的 target 跟随配置。
+    ///
+    /// 注意 `wgpu`/`naga` 走的是**硬编码 Warn**，不是 `configured.min(Warn)`：
+    /// 即使配置调到 error，这两个 crate 的 warn 仍会输出。这是既有取舍——
+    /// 显卡初始化只在启动阶段发生，warn 量有限；保留不动。
+    #[test]
+    fn third_party_targets_stay_capped_at_warn() {
+        let configured = LevelFilter::Trace;
+        assert_eq!(target_level("wgpu_core", configured), LevelFilter::Warn);
+        assert_eq!(target_level("naga", configured), LevelFilter::Warn);
+        assert_eq!(target_level("some_other_crate", configured), LevelFilter::Warn);
+        assert_eq!(
+            target_level("miliastra_wonderland_music::runtime::monitor", configured),
+            LevelFilter::Trace,
+            "本程序 target 不应被降级"
+        );
+        assert_eq!(
+            target_level("timing", configured),
+            LevelFilter::Trace,
+            "性能日志跟随配置，它由脚本消费"
+        );
+        assert_eq!(
+            target_level("web_token", configured),
+            LevelFilter::Warn,
+            "web_token 只用于报告访问令牌异常，本身是 warn 级事件；它走的是「不落文件」分支而不是「跟随配置」分支"
+        );
+    }
 
     #[test]
     fn daily_log_names_parse_both_log_streams() {

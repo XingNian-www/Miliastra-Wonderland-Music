@@ -321,7 +321,9 @@ impl TarotApplication {
                 match interpretation {
                     Ok(result) => messages.extend(result.into_iter().map(TarotReply::Raw)),
                     Err(error) => {
-                        log::warn!("塔罗AI解读失败: {error:#}");
+                        log::warn!(
+                            "塔罗 AI 解读失败（步骤：请模型解牌）；本次改为回复「AI 暂不可用」提示: {error:#}"
+                        );
                         messages.push(TarotReply::Keyed {
                             spec: &templates::AI_UNAVAILABLE,
                             vars: ReplyVars::new(),

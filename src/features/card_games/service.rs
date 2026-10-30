@@ -1007,9 +1007,9 @@ impl CardGameService {
     ) -> Result<CardGameResume> {
         let deliveries = retryable;
         log::error!(
-            "牌局私聊投递暂停: retryable={} kind={:?} reason={}",
+            "牌局私聊投递已暂停：仍有 {} 条待重试，失败性质为「{}」（{}）；已通知玩家选择重试或结束",
             deliveries.len(),
-            failure.kind(),
+            failure.kind().log_label(),
             failure.reason()
         );
         let message = if deliveries.is_empty() {

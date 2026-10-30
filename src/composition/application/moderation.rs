@@ -776,7 +776,12 @@ impl ApplicationRuntime {
         };
         for worker in workers {
             if let Err(error) = worker.join() {
-                log::error!("管理投票线程 panic: {error:?}");
+                // panic 载荷是唯一能说明「为什么崩」的线索，不能打成内部结构；
+                // 与 lifecycle.rs 关停路径的写法保持一致。
+                log::error!(
+                    "管理投票线程崩溃（步骤：关停时等待投票线程退出），本轮投票统计中止，票数不完整：{}",
+                    crate::runtime::ui::panic_payload_text(error.as_ref())
+                );
             }
         }
     }

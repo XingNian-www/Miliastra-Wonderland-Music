@@ -21,6 +21,21 @@ const FRAME_WAIT_SLICE: Duration = Duration::from_millis(25);
 /// 所以首次立即告警、之后按本间隔重申。
 const SECONDARY_UI_MISMATCH_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// 持续失败类 warn 的重复间隔（与 [SECONDARY_UI_MISMATCH_WARN_INTERVAL] 同值同语义）。
+const LOOP_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 该告警这次是否应当真的写 warn。
+///
+/// `slot` 为「上次真正告警的时刻」；为 None 或已过窗口则返回 true 并就地更新。
+fn loop_failure_warn_due(slot: &mut Option<Instant>, now: Instant) -> bool {
+    if slot.is_none_or(|last| now.saturating_duration_since(last) >= LOOP_FAILURE_WARN_INTERVAL) {
+        *slot = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
 /// 日志里的消息来源：把内部的 blue/pink 换成玩家能理解的说法。
 ///
 /// 直接打印内部枚举会让日志出现代码词，不符合书面陈述句要求。
@@ -1271,6 +1286,14 @@ impl ApplicationRuntime {
         // （loop_idle_ms 默认 60ms），无条件 warn 会每秒刷十几条把其余告警冲掉。
         // 首次立即告警留痕，之后每 SECONDARY_UI_MISMATCH_WARN_INTERVAL 才重申一次。
         let mut secondary_ui_mismatch_warned_at: Option<Instant> = None;
+        // 以下四个闸门针对主循环里**持续失败**的 warn：loop_idle_ms 默认 60ms，
+        // 无闸门时每秒十几条，会把偶发但重要的告警冲掉。
+        // 规则统一：首次立即 warn 留痕，之后窗口内降 debug，窗口后再 warn 一次。
+        // 与 secondary_ui_mismatch_warned_at 同一模式。
+        let mut listener_residency_mismatch_warned_at: Option<Instant> = None;
+        let mut unresolved_ui_warned_at: Option<Instant> = None;
+        let mut ui_classify_failed_warned_at: Option<Instant> = None;
+        let mut capture_failed_warned_at: Option<Instant> = None;
         let mut target_missing_backoff = TARGET_MISSING_BACKOFF_INITIAL;
         let mut target_missing = false;
         let mut hall_expiry_pause_applied = false;
@@ -1560,12 +1583,23 @@ impl ApplicationRuntime {
                                     listener_snapshot.mode,
                                     listener_snapshot.temporary_primary,
                                 );
-                                log::warn!(
-                                    "聊天值守模式与当前界面不一致（逻辑模式：{}，实际界面：{}），尝试把界面切回{}",
-                                    listener_snapshot.mode.label(),
-                                    ui_state,
-                                    residency_target_label(target)
-                                );
+                                if loop_failure_warn_due(
+                                    &mut listener_residency_mismatch_warned_at,
+                                    Instant::now(),
+                                ) {
+                                    log::warn!(
+                                        "聊天值守模式与当前界面不一致（逻辑模式：{}，实际界面：{}），尝试把界面切回{}；本条在问题持续期间最多每分钟重复一次",
+                                        listener_snapshot.mode.label(),
+                                        ui_state,
+                                        residency_target_label(target)
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "聊天值守模式仍与界面不一致（实际界面：{}），继续尝试切回{}",
+                                        ui_state,
+                                        residency_target_label(target)
+                                    );
+                                }
                                 match self.establish_ui_residency(
                                     target,
                                     ResidencyPurpose::IndependentRecovery("恢复持久化聊天值守驻留"),
@@ -1577,7 +1611,7 @@ impl ApplicationRuntime {
                                         )
                                     }
                                     Err(error) => log::warn!(
-                                        "聊天值守驻留恢复失败（步骤：把界面切回{}），逻辑模式保持不变，稍后重试: {error:#}",
+                                        "聊天值守驻留恢复失败（步骤：把界面切回{}），逻辑模式保持不变，稍后重试；本条在问题持续期间最多每分钟重复一次: {error:#}",
                                         residency_target_label(target)
                                     ),
                                 }
@@ -1605,12 +1639,21 @@ impl ApplicationRuntime {
                                     listener_snapshot.mode,
                                     listener_snapshot.temporary_primary,
                                 );
-                                log::warn!(
-                                    "界面持续无法验证（逻辑模式：{}，最后识别结果：{}），尝试把界面切回{}",
-                                    listener_snapshot.mode.label(),
-                                    ui_state,
-                                    residency_target_label(target)
-                                );
+                                if loop_failure_warn_due(&mut unresolved_ui_warned_at, Instant::now())
+                                {
+                                    log::warn!(
+                                        "界面持续无法验证（逻辑模式：{}，最后识别结果：{}），尝试把界面切回{}；本条在问题持续期间最多每分钟重复一次",
+                                        listener_snapshot.mode.label(),
+                                        ui_state,
+                                        residency_target_label(target)
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "界面仍无法验证（最后识别结果：{}），继续尝试切回{}",
+                                        ui_state,
+                                        residency_target_label(target)
+                                    );
+                                }
                                 match self.establish_ui_residency(
                                     target,
                                     ResidencyPurpose::IndependentRecovery(
@@ -1622,7 +1665,7 @@ impl ApplicationRuntime {
                                         residency_target_label(target)
                                     ),
                                     Err(error) => log::warn!(
-                                        "持续未知界面的聊天值守驻留恢复失败（步骤：把界面切回{}），稍后重试: {error:#}",
+                                        "持续未知界面的聊天值守驻留恢复失败（步骤：把界面切回{}），稍后重试；本条在问题持续期间最多每分钟重复一次: {error:#}",
                                         residency_target_label(target)
                                     ),
                                 }
@@ -1802,9 +1845,18 @@ impl ApplicationRuntime {
                             }
                             Err(error) => {
                                 primary_visible = false;
-                                log::warn!(
-                                    "界面状态检测失败（步骤：识别当前界面），本轮不派发任何命令，下一轮重新识别: {error:#}"
-                                );
+                                if loop_failure_warn_due(
+                                    &mut ui_classify_failed_warned_at,
+                                    Instant::now(),
+                                ) {
+                                    log::warn!(
+                                        "界面状态检测失败（步骤：识别当前界面），本轮不派发任何命令，下一轮重新识别；本条在问题持续期间最多每分钟重复一次: {error:#}"
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "界面状态检测再次失败，继续下一轮识别: {error:#}"
+                                    );
+                                }
                                 log::info!(target: "timing",
                                     "主循环阶段耗时: total={}ms frame={}ms ui={}ms state=ui_error scanned=false",
                                     elapsed_ms(loop_started),
@@ -1857,10 +1909,17 @@ impl ApplicationRuntime {
                     let observed_window_detection_generation =
                         self.ui.window_detection_signal.generation()?;
                     let target_missing_wait = self.reload_aware_wait(target_missing_backoff);
-                    log::warn!(
-                        "截图失败（步骤：抓取游戏画面），本轮无法识别界面与聊天，{} 秒后重试: {error:#}",
-                        target_missing_wait.as_secs()
-                    );
+                    if loop_failure_warn_due(&mut capture_failed_warned_at, Instant::now()) {
+                        log::warn!(
+                            "截图失败（步骤：抓取游戏画面），本轮无法识别界面与聊天，{} 秒后重试；本条在问题持续期间最多每分钟重复一次: {error:#}",
+                            target_missing_wait.as_secs()
+                        );
+                    } else {
+                        log::debug!(
+                            "截图再次失败，{} 秒后重试: {error:#}",
+                            target_missing_wait.as_secs()
+                        );
+                    }
                     log::info!(target: "timing",
                         "主循环阶段耗时: total={}ms frame={}ms state=capture_error retry={}ms",
                         elapsed_ms(loop_started),
@@ -2550,7 +2609,12 @@ impl ApplicationRuntime {
                 }
                 continue;
             }
-            log::debug!("处理一级观察消息");
+            // 这两个数在函数入口就能算，成本为零；只写主语等于没有信息。
+            log::debug!(
+                "处理一级观察消息：本批 {} 条，其中新增 {} 条",
+                observed_messages.len(),
+                observed_messages.iter().filter(|item| item.is_new).count()
+            );
             if message.text.is_empty() {
                 if observed.is_new {
                     acknowledge_unrecognized_primary_message(
@@ -2616,13 +2680,23 @@ impl ApplicationRuntime {
             }
             let Some(parsed_command) = routed else {
                 if command_like && self.ui.chat_timeline.note_not_executed_log(&observed.id)? {
-                    let reason = if envelope.is_none() {
-                        "无法解析为命令信封（发送者/前缀或结构化点歌不成立）"
+                    // 加**固定类别标签**：正文细节各不相同，类别才可被 grep 统计。
+                    // 这里只有两个类别——本分支只覆盖「没解析出来」与「没模块认领」；
+                    // 权限不足/去重跳过/界面不符/参数无效 各有自己的日志点，不在此处编造。
+                    let (category, reason) = if envelope.is_none() {
+                        (
+                            "解析失败",
+                            "无法解析为命令信封（发送者/前缀或结构化点歌不成立）",
+                        )
                     } else {
-                        "信封可解析但无模块认领（或保留的决策语法被正常分发排除）"
+                        (
+                            "无模块认领",
+                            "信封可解析但无模块认领（或保留的决策语法被正常分发排除）",
+                        )
                     };
                     log::info!(
-                        "命令未执行：{}（来源：{}）「{}」",
+                        "命令未执行（{}）：{}（来源：{}）「{}」",
+                        category,
                         reason,
                         message_source_label(&message.message_type),
                         compact_for_log(&message.text)
@@ -2672,7 +2746,14 @@ impl ApplicationRuntime {
             ) {
                 log::debug!("解析到歌单导入命令，分享链接已隐藏不记入日志");
             } else {
-                log::debug!("解析出命令：{}", parsed_command.raw);
+                // 只打命令原文无法回答「谁发的、从哪个聊天区来的」，
+                // 而这两点正是排查「为什么这条命令被执行/没被执行」的起点。
+                log::debug!(
+                    "解析出命令「{}」，发送者「{}」，来源：{}",
+                    parsed_command.raw,
+                    command_username(&parsed_command),
+                    message_source_label(&message.message_type)
+                );
             }
             parsed.push(parsed_command);
         }
@@ -2976,7 +3057,14 @@ impl ApplicationRuntime {
                         .cancel_chat_listener_mode_request(target)?;
                     return Err(error);
                 }
-                log::info!("值守模式切换已加入待处理队列: {}", target.label());
+                // 补当前模式与触发者：只看目标模式无法判断「这次切换到底改了什么、谁要求的」。
+                // snapshot 是 request_chat_listener_mode 返回的**切换前**快照。
+                log::info!(
+                    "值守模式切换已加入待处理队列：{} → {}（触发者「{}」）",
+                    snapshot.mode.label(),
+                    target.label(),
+                    command_username(parsed)
+                );
             }
         }
         Ok(true)

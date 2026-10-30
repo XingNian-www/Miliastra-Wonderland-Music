@@ -491,11 +491,15 @@ impl TurtleSoupWorkerRuntime {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
-        for worker in self.workers.drain(..) {
+        for (position, worker) in self.workers.drain(..).enumerate() {
+            // 线程编号与启动时一致（`run(index + 1, ..)`），便于对上「海龟汤 AI 线程 N 已就绪」。
+            let worker_index = position + 1;
             if worker.is_finished() {
+                // 分支一：线程在收到关停信号前**就已经自行结束**。
+                // 此时 join 只做回收，返回 Err 说明它在结束前发生了 panic。
                 if worker.join().is_err() {
                     log::error!(
-                        "海龟汤 AI 线程在退出时崩溃，该线程的队列任务会丢失，需重启程序恢复"
+                        "海龟汤 AI 线程 {worker_index} 在关停通知前已自行结束，回收时发现它是崩溃退出的（步骤：关停时回收已结束的线程），该线程队列中未处理的任务已丢失，需重启程序恢复"
                     );
                 }
                 continue;
@@ -508,13 +512,17 @@ impl TurtleSoupWorkerRuntime {
                 let _ = done_tx.send(result);
             });
             match done_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                // 分支二：线程在关停时仍在运行，等待期间崩溃退出。
+                // 与分支一的关键区别是「崩溃发生在收到关停通知之后、5 秒等待窗口之内」。
                 Ok(Err(_)) => log::error!(
-                    "海龟汤 AI 线程在退出时崩溃，该线程的队列任务会丢失，需重启程序恢复"
+                    "海龟汤 AI 线程 {worker_index} 在收到关停通知后、等待退出的 5 秒内崩溃（步骤：关停时等待运行中的线程退出），该线程队列中未处理的任务已丢失，需重启程序恢复"
                 ),
                 Ok(Ok(())) => {}
                 Err(_) => {
+                    // 分支三：5 秒内没退出，但**没有崩溃**——只是还卡着。
+                    // 与上面两条的区别是「线程仍然活着」，不是崩溃，因此不说「任务丢失」。
                     log::error!(
-                        "海龟汤 AI 线程 5 秒内未能退出，已与主流程分离；该线程可能仍阻塞在 AI 请求上，关闭程序前会残留"
+                        "海龟汤 AI 线程 {worker_index} 在关停通知后 5 秒内仍未退出，已与主流程分离（步骤：关停时等待运行中的线程退出）；该线程可能仍阻塞在 AI 请求上，队列中未处理的任务会随进程退出而丢失"
                     );
                     let _ = reaper;
                 }

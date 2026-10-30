@@ -111,7 +111,13 @@ impl ApplicationRuntime {
             Ok(FriendBatchOutcome::Failed { failure, .. })
                 if failure.kind() == FriendBatchFailureKind::ConfirmedUnsent =>
             {
-                log::error!("好友邀请确认回复失败: 未能打开好友聊天 {recipients:?}");
+                // 不打印 recipients：它是好友昵称/备注候选，属隐私面（MUST_READ §9）；
+                // 数量足以说明「搜索时试了几个候选名」，具体名字留在配置里可查。
+                log::error!(
+                    "好友邀请确认回复失败（步骤：打开好友私聊），本次没有回复该好友，对方不会收到确认；搜索时用了 {} 个候选名：{}",
+                    recipients.len(),
+                    failure.reason()
+                );
                 false
             }
             Ok(FriendBatchOutcome::Failed { failure, .. }) => {

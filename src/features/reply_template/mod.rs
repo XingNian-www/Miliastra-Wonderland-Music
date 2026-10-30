@@ -679,18 +679,50 @@ pub(crate) fn render(
 /// 避免各写一份导致同一条配置在不同路径上表现不一致。
 ///
 /// 覆盖文案含换行时由发送路径拆条，这里只负责取合并后的整段文本。
+/// 历史上发布过的默认文案：key -> 旧默认值列表。
+///
+/// 回复文案在首次启动时整表写进数据库，此后面板读的都是库里的值。
+/// 默认文案改进之后（例如给入队回执加上「第几首」），已部署的库仍保存旧文本，
+/// 新默认值永远不生效——线上表现为「改了代码，玩家看到的还是旧文案」。
+///
+/// 这里登记的是**曾经作为默认值发布过**的原文。命中即视为「用户从未改过」，
+/// 渲染时回落到当前 `default`。用户自己写过的文本不会出现在这张表里，
+/// 因此不会被误删。
+///
+/// 新增条目时务必逐字复制旧默认值（含标点与空格），否则匹配不上、等于没登记。
+const LEGACY_DEFAULTS: &[(&str, &[&str])] = &[
+    (
+        "song.queue.added",
+        &["{前缀}({当前}/{上限}): {歌名}"],
+    ),
+];
+
+/// 该 key 在库里存的值是否只是某个历史默认值。
+fn is_legacy_default(key: &str, text: &str) -> bool {
+    LEGACY_DEFAULTS
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .is_some_and(|(_, versions)| versions.iter().any(|version| *version == text))
+}
+
 pub(crate) fn stored_override(
     stored: &std::collections::BTreeMap<String, Vec<crate::config::StoredReply>>,
     key: &str,
 ) -> Option<String> {
     let entry = command_reply_entry_for_key(key)?;
-    stored
+    let text = stored
         .get(entry.id)?
         .iter()
         .find(|reply| reply.key == key)
         .map(|reply| reply.text.clone())
         // 空文本表示"使用内置默认"，不是覆盖。
-        .filter(|text| !text.trim().is_empty())
+        .filter(|text| !text.trim().is_empty())?;
+    // 库里存的是历史默认值：用户从未自定义过，回落到当前 default，
+    // 否则改进后的默认文案永远到不了玩家眼前。
+    if is_legacy_default(key, &text) {
+        return None;
+    }
+    Some(text)
 }
 
 /// 某条 key 是否被命令面板静音。
@@ -1167,6 +1199,22 @@ mod tests {
         )])
     }
 
+    /// 按真实命令容器构造：key 必须挂在它所属的命令下才查得到。
+    /// `stored` 固定用 @音量 做容器，测别的命令要单独搭。
+    fn stored_under(
+        command_id: &str,
+        key: &str,
+        text: &str,
+    ) -> std::collections::BTreeMap<String, Vec<crate::config::StoredReply>> {
+        std::collections::BTreeMap::from([(
+            command_id.to_string(),
+            vec![crate::config::StoredReply {
+                key: key.to_string(),
+                text: text.to_string(),
+            }],
+        )])
+    }
+
     #[test]
     fn stored_override_reads_the_row_saved_under_its_own_command() {
         // "改了没反应"的根因就是查不到这一行；这条测试直接钉住查询路径。
@@ -1174,6 +1222,27 @@ mod tests {
         assert_eq!(
             stored_override(&stored, "playback.volume.set").as_deref(),
             Some("音量已设为{音量}")
+        );
+    }
+
+    /// 库里存着**旧默认值**时，必须回落到当前 default。
+    ///
+    /// 否则改进后的默认文案永远到不了玩家眼前：回复文案首次启动就整表写库，
+    /// 之后渲染只读库里的值。入队回执从「(4/5)」改成「(第3首，共4/5)」时，
+    /// 线上玩家看到的仍是旧形态，根因就在这里。
+    #[test]
+    fn stored_override_ignores_a_row_that_still_holds_the_old_default() {
+        let stored = stored_under("@QQ点歌", "song.queue.added", "{前缀}({当前}/{上限}): {歌名}");
+        assert_eq!(stored_override(&stored, "song.queue.added"), None);
+    }
+
+    /// 用户真改过的文本必须原样返回，不能被当成旧默认值吞掉。
+    #[test]
+    fn stored_override_keeps_a_genuine_custom_text() {
+        let stored = stored_under("@QQ点歌", "song.queue.added", "已排上：{歌名}");
+        assert_eq!(
+            stored_override(&stored, "song.queue.added").as_deref(),
+            Some("已排上：{歌名}")
         );
     }
 

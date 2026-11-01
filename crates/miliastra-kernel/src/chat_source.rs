@@ -185,7 +185,14 @@ pub enum ChatSourceEvent {
         hall_type: Option<u32>,
     },
     /// 连接建立（含重连）。携带服务端已知的最大序号，便于补拉。
-    Connected { last_sequence: u64 },
+    ///
+    /// boot_id 是宿主进程的启动标识：同一进程内恒定、宿主重启后变化。
+    /// 旧版宿主没有该字段时为 None，调用方用「last_sequence 小于本地
+    /// 已处理序号」作为宿主重启的兜底判据。
+    Connected {
+        last_sequence: u64,
+        boot_id: Option<u64>,
+    },
 }
 
 /// 外部聊天数据源。
@@ -206,9 +213,11 @@ pub trait ChatSource: Send {
     /// 连接此刻是否仍然可用（未关闭）。
     ///
     /// `next_event` 返回 `None` 时调用方需要区分两种情形：连接还活着
-    /// （读超时 / Ping / Pong），此时应刷新租约；连接已关，此时应等租约
-    /// 超时后回落 OCR 并重连。实现方默认返回 `true`，避免新增来源时
-    /// 被迫重写——但凡是会把连接置空的实现都必须覆盖它。
+    /// （读超时 / Ping / Pong），或连接已关（此时应回落 OCR 并重连）。
+    /// 注意**不能**仅凭它刷新聊天接管租约：WS 活着不代表游戏已接入，
+    /// 租约只能由真实消息或 /health 的 gameConnected=true 刷新。
+    /// 实现方默认返回 `true`，避免新增来源时被迫重写——但凡是会把连接
+    /// 置空的实现都必须覆盖它。
     fn is_connected(&self) -> bool {
         true
     }

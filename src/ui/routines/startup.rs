@@ -432,13 +432,14 @@ fn ensure_game_window_via_chat_api(
     config: &StartupRoutineConfig,
     chat_source: &crate::config::ChatSourceConfig,
 ) -> Result<(), UiRoutineFailure> {
-    crate::runtime::chat_source::launcher::ensure_running(chat_source).map_err(|error| {
-        UiRoutineFailure::new(
-            InputCertainty::BeforeInput,
-            "launch_chat_api",
-            format!("{error:#}"),
-        )
-    })?;
+    crate::runtime::chat_source::launcher::ensure_running(chat_source, &config.target_process)
+        .map_err(|error| {
+            UiRoutineFailure::new(
+                InputCertainty::BeforeInput,
+                "launch_chat_api",
+                format!("{error:#}"),
+            )
+        })?;
     for _ in 0..config.startup.launch_retries.max(1) {
         wait_ms(
             context,

@@ -11,7 +11,7 @@ resolver = "3"
 
 [package]
 name = "miliastra-wonderland-music"
-version = "7.2.0"
+version = "7.2.1-dev"
 edition = "2024"
 license = "MIT"
 
@@ -96,6 +96,7 @@ windows = { version = "0.62", features = [
   "Win32_System_DataExchange",
   "Win32_System_Console",
   "Win32_System_LibraryLoader",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Memory",
   "Win32_System_Registry",
   "Win32_System_Threading",

@@ -12,12 +12,19 @@ use anyhow::Result;
 
 use crate::config::ChatSourceConfig;
 use crate::observation::chat::ChatTimeline;
-use crate::observation::chat::ViewAbsence;
+use crate::runtime::chat_source::fetch_health;
 use crate::runtime::chat_source::ws::WebSocketChatSource;
 use miliastra_kernel::chat_source::{ChatSource, ChatSourceEvent, ExternalChatMessage};
 
 /// 断线超过这个时长就不再补拉：一次性重放大量命令比丢几条更糟。
 const MAX_BACKLOG_IDLE_MS: u64 = 60_000;
+
+/// 接管期间的健康检查间隔。
+///
+/// WS 连接存活只代表传输层还在；reattach 等待期里宿主可能还没有接入游戏
+/// （gameConnected=false），此时如果继续接管、关掉 OCR，就会出现「连接正常
+/// 但永远收不到消息」的静默失聪。active 期间每 5 秒带 token 核实一次。
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 昵称补查"在途"标记的有效期。超过它还停在在途状态，说明补查线程卡住或
 /// 已退出，允许这个 UID 重新排队，避免它永久不再补查。
@@ -39,6 +46,17 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default()
+}
+
+/// 一次握手对本地水位的影响。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandshakeAction {
+    /// 本进程第一次连上：建立启动水位，丢弃宿主启动前的历史。
+    FirstConnect,
+    /// 同一宿主内的普通重连：水位保持，断线期间的消息走补拉。
+    Reconnect,
+    /// 宿主进程重启：旧水位作废，水位与本地游标一起归零。
+    HostRestarted,
 }
 
 /// 外部聊天源共享状态：供观察线程查询"该不该跳过 OCR"。
@@ -69,6 +87,8 @@ struct ExternalChatInner {
     last_seen_ms: AtomicU64,
     /// 注入用的保留会话号；重连且需要丢弃旧墓碑时递增。
     epoch: AtomicU64,
+    /// 宿主进程的启动标识（hello.bootId）。同一宿主内恒定；变化即宿主重启。
+    host_boot_id: std::sync::Mutex<Option<u64>>,
     /// 是否已经用掉"首次遇到一级聊天界面时自动切二级"的机会。
     initial_secondary_switch_done: AtomicBool,
 }
@@ -325,6 +345,63 @@ impl ExternalChatState {
         }
     }
 
+    /// 这条消息序号是否应该被处理（过滤宿主启动前的历史）。
+    ///
+    /// 水位 0 表示不过滤：宿主重启后序号从 1 重新计数，旧的启动水位
+    /// （例如 500）必须先被 apply_handshake 清零，否则新消息会被
+    /// 「序号 ≤ 500」整批丢弃，而接管状态又会关掉 OCR，造成永久静默失聪。
+    pub(crate) fn accepts_sequence(&self, sequence: u64) -> bool {
+        let watermark = self.watermark();
+        watermark == 0 || sequence > watermark
+    }
+
+    /// 处理一次握手，返回本次连接是否需要重置水位。
+    ///
+    /// 宿主重启的判定（任一成立）：
+    /// 1. hello.bootId 与已记录的 bootId 不同；
+    /// 2. hello.lastMessageId 小于本地已处理序号与本地水位中的较大者
+    ///    （旧宿主没有 bootId 时的兜底判据）。
+    ///
+    /// 重置会把水位与本地游标一起归零：新宿主从 1 开始计数的消息不会再被
+    /// 旧水位过滤。普通重连（bootId 不变且序号没有回退）不重置，断线期间
+    /// 的消息仍可补拉。
+    pub(crate) fn apply_handshake(
+        &self,
+        last_sequence: u64,
+        boot_id: Option<u64>,
+    ) -> HandshakeAction {
+        let previous_boot = *self
+            .inner
+            .host_boot_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if boot_id.is_some() {
+            *self
+                .inner
+                .host_boot_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = boot_id;
+        }
+        if self.take_first_handshake(last_sequence) {
+            return HandshakeAction::FirstConnect;
+        }
+        let boot_changed = matches!((previous_boot, boot_id), (Some(old), Some(new)) if old != new);
+        let local_high = self.last_sequence().max(self.watermark());
+        let sequence_regressed = last_sequence < local_high;
+        if boot_changed || sequence_regressed {
+            self.inner.watermark.store(0, Ordering::Release);
+            self.inner.last_sequence.store(0, Ordering::Release);
+            let previous_boot_text =
+                previous_boot.map_or_else(|| "无".to_string(), |id| id.to_string());
+            let current_boot_text = boot_id.map_or_else(|| "无".to_string(), |id| id.to_string());
+            log::warn!(
+                "检测到宿主进程重启（bootId 由 {previous_boot_text} 变为 {current_boot_text}，服务端序号为 {last_sequence}，本地水位为 {local_high}），已重置外部聊天水位；新消息序号从 1 重新计数，不会被旧水位丢弃"
+            );
+            return HandshakeAction::HostRestarted;
+        }
+        HandshakeAction::Reconnect
+    }
+
     fn bump_epoch(&self) -> u64 {
         self.inner.epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -375,9 +452,10 @@ fn run(
     let reconnect = Duration::from_millis(config.reconnect_ms);
     // 昵称补查放到独立线程：接收线程必须持续读 WS，任何 HTTP 等待都会让
     // 后续消息（可能正是玩家的命令）排在它后面。结果回写缓存，之后同 UID 直接命中。
+    let http_base = ws_url_to_http(&config.url);
     let names = spawn_name_resolver(
         state.clone(),
-        ws_url_to_http(&config.url),
+        http_base.clone(),
         config.token.clone(),
         identity_access.clone(),
         config_store.clone(),
@@ -386,10 +464,15 @@ fn run(
     loop {
         // 登录器角色：Miliastra-Wonderland-ChatBridge 没在监听时替用户拉起来。
         // 探测很便宜（300ms 超时），每次重连都试一次，这样用户中途关掉也能被重新拉起。
-        if config.auto_start
-            && let Err(error) = crate::runtime::chat_source::launcher::ensure_running(&config)
-        {
-            log::warn!("无法自动启动 Miliastra-Wonderland-ChatBridge，等待人工处理：{error:#}");
+        if config.auto_start {
+            // target_process 用于退出码 3 的「等游戏退出」判定；配置可能热更新，
+            // 每轮都读一次最新快照。
+            let target_process = live_configs.snapshot().window.target_process.clone();
+            if let Err(error) =
+                crate::runtime::chat_source::launcher::ensure_running(&config, &target_process)
+            {
+                log::warn!("无法自动启动 Miliastra-Wonderland-ChatBridge，等待人工处理：{error:#}");
+            }
         }
         let mut source = match WebSocketChatSource::new(config.url.clone(), config.token.clone()) {
             Ok(source) => source,
@@ -403,21 +486,86 @@ fn run(
             }
         };
         let mut last_event_at = Instant::now();
+        let mut last_health_at = Instant::now();
         loop {
-            // 租约超时：外部源失联太久，必须回落到 OCR，否则聊天完全失聪。
+            // 租约超时：最近一次真实消息/健康检查太久，必须回落到 OCR，
+            // 否则聊天完全失聪。
             if last_event_at.elapsed() > lease {
                 state.set_active(false);
+            }
+            // H2：active 期间每 5 秒带 token 核实游戏是否真的接入。
+            //
+            // 租约只能由真实消息或健康检查刷新；WS 的 Ping/读超时不能续租。
+            // 否则 reattach 等待期（WS 活着、游戏未接入）会一直保持接管，
+            // OCR 被关掉又收不到消息，形成静默失聪。
+            if state.is_active() && last_health_at.elapsed() >= HEALTH_POLL_INTERVAL {
+                last_health_at = Instant::now();
+                match fetch_health(&http_base, &config.token) {
+                    Ok(health) if health.game_connected => {
+                        log::debug!("外部聊天源健康检查通过，游戏仍处于接入状态");
+                        last_event_at = Instant::now();
+                    }
+                    Ok(_) => {
+                        state.set_active(false);
+                        log::warn!(
+                            "外部聊天源健康检查显示游戏已断开（gameConnected=false），已恢复 OCR 聊天识别；WS 保持连接，等待游戏重新接入"
+                        );
+                    }
+                    Err(error) => {
+                        // 健康检查失败不刷新 last_event_at：租约到期后自动回落 OCR。
+                        log::warn!(
+                            "外部聊天源健康检查失败，本次不刷新接管租约；租约到期后会自动恢复 OCR：{error:#}"
+                        );
+                    }
+                }
             }
             match source.next_event() {
                 Ok(Some(event)) => {
                     last_event_at = Instant::now();
                     match event {
-                        ChatSourceEvent::Connected { last_sequence } => {
-                            state.set_active(true);
-                            log::info!("外部聊天源握手完成，从服务端序号 {last_sequence} 之后开始接收消息");
-                            // 首次连接：把启动前的历史挡在水位之外。
-                            // 重连时水位已存在，不动它——断线期间的消息要补拉。
-                            state.take_first_handshake(last_sequence);
+                        ChatSourceEvent::Connected {
+                            last_sequence,
+                            boot_id,
+                        } => {
+                            // H1：宿主重启后消息序号从 1 重新开始。先判断并重置
+                            // 旧水位，否则新消息会被「序号 ≤ 旧水位」当成启动前历史
+                            // 整批丢弃，而 active=true 又关掉 OCR —— 永久静默失聪。
+                            let handshake = state.apply_handshake(last_sequence, boot_id);
+                            if handshake == HandshakeAction::HostRestarted {
+                                state.bump_epoch();
+                                reset_after_source_change(&timeline);
+                                log::warn!(
+                                    "外部聊天源检测到宿主重启，已重置水位与聊天基线；后续消息序号从 1 重新计数"
+                                );
+                            }
+                            // H2：WS 握手只说明连接建立，不代表游戏已接入。
+                            // reattach 等待期里 WS 能正常连上却没有任何游戏消息，
+                            // 此时必须保持 OCR，而不是凭 is_connected 就接管。
+                            let attached = match fetch_health(&http_base, &config.token) {
+                                Ok(health) if health.game_connected => {
+                                    last_event_at = Instant::now();
+                                    last_health_at = Instant::now();
+                                    state.set_active(true);
+                                    log::info!(
+                                        "外部聊天源握手完成且 /health 确认游戏已接入，从服务端序号 {last_sequence} 之后开始接收消息"
+                                    );
+                                    true
+                                }
+                                Ok(_) => {
+                                    state.set_active(false);
+                                    log::warn!(
+                                        "外部聊天源握手完成但游戏尚未接入（gameConnected=false），保持 OCR 聊天识别，等待游戏接入"
+                                    );
+                                    false
+                                }
+                                Err(error) => {
+                                    state.set_active(false);
+                                    log::warn!(
+                                        "外部聊天源握手完成但读取 /health 失败，暂不接管 OCR（避免游戏未接入时静默失聪）：{error:#}"
+                                    );
+                                    false
+                                }
+                            };
                             // 这里**不再**直接切二级：首次握手发生在 BOT 刚启动、
                             // 游戏还没进界面的时候，那一刻不可能停在一级聊天页。
                             // 默认切换改由主导航循环在「首次真正停在一级」时完成
@@ -436,9 +584,9 @@ fn run(
                                 // 把水位推到服务端当前值：断线期间的消息一律不执行。
                                 state.force_watermark(last_sequence);
                             }
-                            if !skip_backlog && last_sequence > local {
+                            if attached && !skip_backlog && last_sequence > local {
                                 match crate::runtime::chat_source::fetch_messages_since(
-                                    &ws_url_to_http(&config.url),
+                                    &http_base,
                                     &config.token,
                                     local,
                                 ) {
@@ -502,15 +650,12 @@ fn run(
                     }
                 }
                 Ok(None) => {
-                    // 这里既可能是「读超时」，也可能是收到了 Ping/Pong/Close。
-                    // 必须区分：ChatBridge 每 30s 发一次 Ping，若把心跳当成
-                    // 无活动，租约(默认 10s)永远先超时，外部源会周期性地
-                    // 「已退出 → 已接管」抖动，聊天源等于一直在断。
-                    // conn: Some(_) 表示连接还在读，心跳/超时都算存活；
-                    // None 表示连接已关闭，交给上层重连。
-                    if source.is_connected() {
-                        last_event_at = Instant::now();
-                    } else if last_event_at.elapsed() > lease {
+                    // 读超时 / Ping / Pong / Close 都不刷新接管租约：
+                    // WS 活着不等于游戏已接入，续租只能靠真实消息或 /health。
+                    // 连接确实关闭时立即回落到 OCR；否则由健康检查续租、
+                    // 租约到期兜底。这样既不会因为 30 秒一次的 Ping 造成
+                    // 「已退出 → 已接管」抖动，也不会在游戏未接入时空转接管。
+                    if !source.is_connected() {
                         state.set_active(false);
                     }
                     continue;
@@ -594,7 +739,7 @@ fn deliver(
     let watermark = state.watermark();
     if watermark > 0 {
         let before = messages.len();
-        messages.retain(|message| message.sequence > watermark);
+        messages.retain(|message| state.accepts_sequence(message.sequence));
         if messages.len() != before {
             log::debug!(
                 "外部聊天源丢弃启动前历史 {} 条（水位 {watermark}）",
@@ -619,28 +764,27 @@ fn deliver(
         );
         // 好友私聊的发送者若还没在身份映射里登记，自动建一条 friend 身份。
         // 依据是 UID（聊天 API 给的最可靠账号标识），昵称仅作可读备注。
-        if message.channel.is_private() {
-            if let Some(uid) = message.sender.uid.as_ref() {
-                if let Some(identity) = identity_access {
-                    let created = identity.ensure_identity_for_account(
-                        miliastra_kernel::chat_source::GAME_GENSHIN,
-                        uid.as_str(),
-                        message.sender.nickname.as_deref(),
-                    );
-                    // 自动建出来的身份必须落库。
-                    //
-                    // 只改内存的话有两个后果：面板看不到这条映射（用户无法
-                    // 调权限），而且每次配置重载 live_configs 都会用库里的值
-                    // `identity.replace(...)` 把内存覆盖回去，身份直接消失。
-                    if created.is_some()
-                        && let Some(store) = config_store
-                        && let Err(error) = persist_identity(store, &live_configs, identity)
-                    {
-                        log::warn!(
-                            "自动创建的身份未能写入数据库（步骤：好友首次私聊时自动登记身份），本次运行内该身份仍有效（可按 UID 判权限），但面板看不到它；配置重载或重启后会被库里的旧值覆盖，重新创建一次：{error:#}"
-                        );
-                    }
-                }
+        if message.channel.is_private()
+            && let Some(uid) = message.sender.uid.as_ref()
+            && let Some(identity) = identity_access
+        {
+            let created = identity.ensure_identity_for_account(
+                miliastra_kernel::chat_source::GAME_GENSHIN,
+                uid.as_str(),
+                message.sender.nickname.as_deref(),
+            );
+            // 自动建出来的身份必须落库。
+            //
+            // 只改内存的话有两个后果：面板看不到这条映射（用户无法
+            // 调权限），而且每次配置重载 live_configs 都会用库里的值
+            // identity.replace(...) 把内存覆盖回去，身份直接消失。
+            if created.is_some()
+                && let Some(store) = config_store
+                && let Err(error) = persist_identity(store, live_configs, identity)
+            {
+                log::warn!(
+                    "自动创建的身份未能写入数据库（步骤：好友首次私聊时自动登记身份），本次运行内该身份仍有效（可按 UID 判权限），但面板看不到它；配置重载或重启后会被库里的旧值覆盖，重新创建一次：{error:#}"
+                );
             }
         }
         // 交给后台线程补查名称信息，本线程立刻回去读 WS。
@@ -957,6 +1101,130 @@ mod tests {
         assert_eq!(state.watermark(), 4);
     }
 
+    /// H1 回归（必须）：宿主重启后消息序号从 1 重新开始，旧水位必须清零。
+    ///
+    /// 旧行为只在首次握手建立水位且重连不更新：本地水位 500 时，宿主重启后的
+    /// 新消息（id=1）会被「sequence > watermark」全部过滤；同时 hello 把状态
+    /// 置为 active、OCR 被关掉，于是 BOT 永久静默失聪直到 Music 重启。
+    #[test]
+    fn host_restart_resets_watermark_and_keeps_new_message_id_1() {
+        let state = ExternalChatState::default();
+        // 旧宿主：启动水位 500（本进程已按旧规则建立过）。
+        state.establish_watermark(500);
+        assert_eq!(state.watermark(), 500);
+
+        // 新宿主：bootId 变化且 lastMessageId 回退到 0。
+        let action = state.apply_handshake(0, Some(1_802_240_000_000_000));
+        assert_eq!(action, HandshakeAction::HostRestarted);
+        assert_eq!(state.watermark(), 0, "宿主重启后旧水位必须清零");
+        assert_eq!(state.last_sequence(), 0, "本地游标也要一起清零");
+
+        // 关键断言：新宿主的第一条消息 id=1 不能被旧水位 500 丢弃。
+        assert!(
+            state.accepts_sequence(1),
+            "宿主重启后 id=1 的新消息必须被处理，否则 BOT 静默失聪"
+        );
+    }
+
+    /// 没有 bootId 的旧宿主：hello.lastMessageId 回退即视为宿主重启。
+    #[test]
+    fn missing_boot_id_falls_back_to_sequence_regression() {
+        let state = ExternalChatState::default();
+        state.establish_watermark(500);
+        // 旧宿主不带 bootId，只能靠序号回退兜底。
+        assert_eq!(
+            state.apply_handshake(0, None),
+            HandshakeAction::HostRestarted
+        );
+        assert_eq!(state.watermark(), 0);
+        assert!(state.accepts_sequence(1));
+    }
+
+    /// bootId 变化优先于序号：即使 lastMessageId 看起来更大也要重置。
+    #[test]
+    fn boot_id_change_resets_even_with_larger_last_message_id() {
+        let state = ExternalChatState::default();
+        assert_eq!(
+            state.apply_handshake(100, Some(7)),
+            HandshakeAction::FirstConnect
+        );
+        assert_eq!(state.watermark(), 100);
+        // 同一宿主内的普通重连：水位保持，断线期间的消息仍可补拉。
+        assert_eq!(
+            state.apply_handshake(150, Some(7)),
+            HandshakeAction::Reconnect
+        );
+        assert_eq!(state.watermark(), 100);
+        // 宿主重启：即使 lastMessageId=200 > 本地水位、序号没有回退，旧水位也已失效。
+        // 这里 sequence_regressed 为 false，只有 bootId 判定能捕获——不要
+        // 因为有序号回退兜底就删掉 bootId 比较。
+        assert_eq!(
+            state.apply_handshake(200, Some(8)),
+            HandshakeAction::HostRestarted
+        );
+        assert_eq!(state.watermark(), 0);
+        assert!(state.accepts_sequence(1));
+    }
+
+    /// 复审建议：bootId 判定的独立价值——宿主重启但新进程序号恰好没有回退。
+    ///
+    /// 真实事故形态通常是「旧水位 500 → 新宿主 hello 0」，这种会被
+    /// sequence_regressed 兜住；但如果新宿主在握手前已经收到 600 条消息，
+    /// hello=600 > 本地水位 500，序号完全没有回退，只有 bootId 变化能识别重启。
+    /// 不要因为有序号回退兜底就删掉 bootId 比较。
+    #[test]
+    fn boot_id_change_catches_restart_even_without_sequence_regression() {
+        let state = ExternalChatState::default();
+        assert_eq!(
+            state.apply_handshake(500, Some(1)),
+            HandshakeAction::FirstConnect
+        );
+        // 同一 bootId 的普通重连：hello 600 不小于本地水位，序号回退兜底不会触发。
+        assert_eq!(
+            state.apply_handshake(600, Some(1)),
+            HandshakeAction::Reconnect
+        );
+        assert_eq!(state.watermark(), 500, "普通重连保持水位");
+        // 宿主重启：bootId 变化；hello=600 比本地水位 500 还大，没有序号回退。
+        assert_eq!(
+            state.apply_handshake(600, Some(2)),
+            HandshakeAction::HostRestarted
+        );
+        assert_eq!(state.watermark(), 0);
+        assert!(state.accepts_sequence(1));
+    }
+
+    /// 启动水位只挡宿主启动前的历史；首次握手建立后，同一宿主内不因重连改变。
+    #[test]
+    fn reconnect_without_restart_keeps_watermark_for_backlog() {
+        let state = ExternalChatState::default();
+        assert_eq!(
+            state.apply_handshake(42, Some(7)),
+            HandshakeAction::FirstConnect
+        );
+        assert_eq!(
+            state.apply_handshake(100, Some(7)),
+            HandshakeAction::Reconnect
+        );
+        assert_eq!(state.watermark(), 42, "普通重连不得抬高或清除水位");
+        // 断线期间 43..100 的消息仍然应该被补拉后处理。
+        assert!(state.accepts_sequence(43));
+        assert!(state.accepts_sequence(100));
+        assert!(!state.accepts_sequence(42));
+    }
+
+    /// 无 bootId 且序号没有回退：保持水位（不能把所有重连都误判成宿主重启）。
+    #[test]
+    fn reconnect_without_boot_id_and_without_regression_keeps_watermark() {
+        let state = ExternalChatState::default();
+        assert_eq!(
+            state.apply_handshake(42, None),
+            HandshakeAction::FirstConnect
+        );
+        assert_eq!(state.apply_handshake(43, None), HandshakeAction::Reconnect);
+        assert_eq!(state.watermark(), 42);
+    }
+
     /// 默认二级切换只认领一次。
     ///
     /// 认领后即使用户手动切回一级，也不会被再次顶回二级。
@@ -967,15 +1235,16 @@ mod tests {
         assert!(!state.claim_initial_secondary_switch());
         assert!(!state.claim_initial_secondary_switch());
     }
-    /// 回归：心跳/读超时不能被当成「外部源失联」。
+    /// 回归：心跳/读超时期间连接仍被报告为存活，但接管租约不再由它刷新。
     ///
-    /// ChatBridge 每 30s 才发一次 Ping，而租约默认 10s。旧实现里
-    /// next_event() 对 Ping/Pong 返回 Ok(None)，上层既没有事件可刷新
-    /// last_event_at，也没有任何存活信号，于是必然「已退出 → 已接管」
-    /// 周期性抖动，外部聊天等于一直在断。
+    /// H2 修复后，WS 活着不等于游戏已接入：租约只由真实消息或
+    /// /health 的 gameConnected=true 刷新；is_connected 只用于区分
+    /// 「读超时/Ping」与「连接已关」，不再续租，因此不会因为 30 秒一次的
+    /// Ping 造成接管抖动，也不会在游戏未接入时空转接管。
     #[test]
-    fn heartbeat_keeps_source_connected_so_lease_is_not_lost() {
-        // is_connected 是新增的存活判据：连接还在就必须算活跃。
+    fn heartbeat_reports_connection_state_without_renewing_lease() {
+        // is_connected 只回答「连接是否还开着」，用于区分读超时/心跳与
+        // 连接已关；它不再刷新接管租约（租约由真实消息或 /health 维护）。
         // 默认实现为 true，保证新增来源不会被误判为断线。
         struct AlwaysConnected;
         impl ChatSource for AlwaysConnected {
@@ -989,7 +1258,7 @@ mod tests {
         let source = AlwaysConnected;
         assert!(
             source.is_connected(),
-            "读超时/心跳期间连接仍在，上层据此刷新租约"
+            "读超时/心跳期间 is_connected 仍报告连接存活；接管租约不由它刷新"
         );
     }
 

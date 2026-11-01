@@ -13,12 +13,12 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 /// 鉴权头名称，与 BOT 自身的 HTTP 服务保持一致。
 const TOKEN_HEADER: &str = "x-miliastra-token";
 
-/// 单次读取的超时：只是让调用方能周期性回到上层检查租约与停止信号。
+/// 单次读取的超时：只是让调用方能周期性回到上层检查停止信号与健康状态。
 ///
-/// 必须明显短于 `chat_source.lease_timeout_ms`（默认 10s）：读超时返回
-/// `Ok(None)` 而连接仍在，上层据此刷新租约；若这里设得比租约还长，
-/// 上层在两次返回之间根本得不到机会，租约也只能靠消息到达来维持。
-/// 服务端 30 秒一次 Ping，3 秒的轮询不会打断它。
+/// 必须明显短于 `chat_source.lease_timeout_ms`（默认 10s），否则上层在两次
+/// 返回之间得不到执行健康检查的机会。注意读超时本身**不**刷新接管租约：
+/// WS 活着不代表游戏已接入，租约只由真实消息或 /health 的 gameConnected=true
+/// 刷新。服务端 30 秒一次 Ping，3 秒的轮询不会打断它。
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) struct WebSocketChatSource {
@@ -62,7 +62,10 @@ impl WebSocketChatSource {
             .block_on(async { tokio_tungstenite::connect_async(request).await })
             .context("连接外部聊天 WS 失败")?;
         self.connection = Some(stream);
-        log::info!("外部聊天源已连接，地址「{}」，开始接收大厅与好友消息", self.url);
+        log::info!(
+            "外部聊天源已连接，地址「{}」，开始接收大厅与好友消息",
+            self.url
+        );
         Ok(())
     }
 }
@@ -109,7 +112,8 @@ impl ChatSource for WebSocketChatSource {
                 self.connection = None;
                 Ok(None)
             }
-            // 心跳只说明连接活着，不产生业务事件；调用方按"连接仍在"刷新租约。
+            // 心跳只说明传输层活着，不产生业务事件，也不刷新接管租约
+            // （WS 活着不等于游戏已接入；租约由真实消息或 /health 维护）。
             Ok(Read::Message(Message::Ping(_))) | Ok(Read::Message(Message::Pong(_))) => Ok(None),
             Ok(Read::Message(_)) => Ok(None),
             // 读超时：连接保持不动，让上层周期性检查租约与停止信号。

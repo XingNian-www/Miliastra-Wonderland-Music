@@ -43,6 +43,9 @@ enum WireEvent {
     Hello {
         #[serde(rename = "lastMessageId")]
         last_message_id: u64,
+        /// 宿主进程启动标识；旧宿主没有该字段时为 None。
+        #[serde(rename = "bootId", default)]
+        boot_id: Option<u64>,
     },
     Message {
         message: WireMessage,
@@ -74,8 +77,12 @@ pub(crate) fn parse_frame(text: &str) -> anyhow::Result<Option<ChatSourceEvent>>
         }
     };
     Ok(Some(match event {
-        WireEvent::Hello { last_message_id } => ChatSourceEvent::Connected {
+        WireEvent::Hello {
+            last_message_id,
+            boot_id,
+        } => ChatSourceEvent::Connected {
             last_sequence: last_message_id,
+            boot_id,
         },
         WireEvent::Message { message } => ChatSourceEvent::Messages(vec![to_external(message)]),
         WireEvent::HallChanged { hall_id, hall_type } => {
@@ -134,7 +141,10 @@ pub(crate) fn resolve_sender_names(
     let response = client.get(url).header("x-miliastra-token", token).send()?;
     if !response.status().is_success() {
         // 503 game_not_connected 等都属于"暂时查不到"，不是致命错误。
-        log::debug!("昵称补查未取到结果（HTTP 状态 {}），本次沿用已有昵称，不影响消息投递", response.status());
+        log::debug!(
+            "昵称补查未取到结果（HTTP 状态 {}），本次沿用已有昵称，不影响消息投递",
+            response.status()
+        );
         return Ok((None, None));
     }
     let body: serde_json::Value = response.json()?;
@@ -155,6 +165,45 @@ fn parse_sender_names(body: &serde_json::Value, uid: &str) -> (Option<String>, O
             .filter(|text| !text.trim().is_empty())
     };
     (read("names"), read("remarks"))
+}
+
+/// `GET /health` 中与聊天接入判断直接相关的字段。
+///
+/// WS 存活只说明连接还在，不代表宿主真的把游戏聊天接进来了：reattach
+/// 等待期（最长约 180s）里 WS 可以正常握手，却没有任何游戏消息。
+/// 只有 health 的 `gameConnected=true` 才能证明聊天链路已接入。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HealthSnapshot {
+    pub(crate) game_connected: bool,
+}
+
+/// 带 token 查询 `GET /health`。
+///
+/// 超时压到 2 秒：这个请求由 WS 接收线程周期性发起，不能让它长时间占住
+/// 读循环；超时/失败由调用方按「本次不刷新租约」处理，租约到期后自动回落到 OCR。
+pub(crate) fn fetch_health(base_http_url: &str, token: &str) -> anyhow::Result<HealthSnapshot> {
+    let url = format!("{}/health", base_http_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    let response = client.get(url).header("x-miliastra-token", token).send()?;
+    if !response.status().is_success() {
+        anyhow::bail!("/health 返回 HTTP {}", response.status());
+    }
+    let body: serde_json::Value = response.json()?;
+    parse_health_body(&body)
+}
+
+/// 从 `/health` 响应体里取接入判据。
+///
+/// `gameConnected` 缺失时返回错误而不是默认 false：旧宿主也一直有该字段，
+/// 缺失只可能是响应形状不对；这时不能把外部源当成「已接入」。
+pub(crate) fn parse_health_body(body: &serde_json::Value) -> anyhow::Result<HealthSnapshot> {
+    let game_connected = body
+        .get("gameConnected")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| anyhow::anyhow!("/health 缺少布尔字段 gameConnected"))?;
+    Ok(HealthSnapshot { game_connected })
 }
 
 /// 断线补拉：`GET /messages?since=<id>`。
@@ -303,7 +352,20 @@ mod tests {
         let hello = r#"{"type":"hello","version":"0.1.0","lastMessageId":42}"#;
         assert_eq!(
             parse_frame(hello).unwrap().unwrap(),
-            ChatSourceEvent::Connected { last_sequence: 42 }
+            ChatSourceEvent::Connected {
+                last_sequence: 42,
+                boot_id: None,
+            }
+        );
+        // 新宿主在 hello 里带 bootId：必须解析出来，供水位重置判定使用。
+        let hello_with_boot =
+            r#"{"type":"hello","version":"0.1.0","lastMessageId":42,"bootId":1802240000000000}"#;
+        assert_eq!(
+            parse_frame(hello_with_boot).unwrap().unwrap(),
+            ChatSourceEvent::Connected {
+                last_sequence: 42,
+                boot_id: Some(1_802_240_000_000_000),
+            }
         );
         let changed = r#"{"type":"hall_changed","hallId":7699842546315381217,"hallType":23}"#;
         assert_eq!(
@@ -336,6 +398,32 @@ mod tests {
         assert_eq!(urlencode("900000001"), "900000001");
         assert_eq!(urlencode("a b"), "a%20b");
         assert_eq!(urlencode("甲"), "%E7%94%B2");
+    }
+
+    #[test]
+    fn health_snapshot_reads_game_connected() {
+        // 正常接入：gameConnected=true；其余字段（bootId 等）不属于接入判据，忽略即可。
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"ok":true,"version":"0.1.0","uptimeSec":9,"gameConnected":true,
+                "currentHall":{"id":1,"type":16},"lastMessageId":3,"subscribers":1,
+                "bootId":1802240000000000,"attached":true,"reattachWaiting":false}"#,
+        )
+        .unwrap();
+        let health = parse_health_body(&body).expect("应解析成功");
+        assert!(health.game_connected);
+
+        // reattach 等待期 / 游戏没接入：WS 可以握手，但这里必须是 false。
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"gameConnected":false,"reattachWaiting":true}"#).unwrap();
+        let health = parse_health_body(&body).expect("应解析成功");
+        assert!(!health.game_connected);
+    }
+
+    #[test]
+    fn health_snapshot_rejects_missing_game_connected() {
+        // 缺少 gameConnected 时不能默认「已接入」，否则会关掉 OCR 后静默失聪。
+        let body: serde_json::Value = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(parse_health_body(&body).is_err());
     }
 
     #[test]

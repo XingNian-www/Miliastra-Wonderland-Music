@@ -1040,12 +1040,14 @@ impl TurtleSoupService {
     pub(crate) fn handle_hall_command(
         &mut self,
         entertainment: &mut EntertainmentState,
-        player: &str,
+        player_display: &str,
         command: &TurtleSoupCommand,
         delivery: &mut dyn TurtleSoupDeliveryPort,
     ) -> TurtleSoupCommandOutcome {
         match command {
-            TurtleSoupCommand::Start => self.start_or_repeat(entertainment, player, delivery),
+            TurtleSoupCommand::Start => {
+                self.start_or_repeat(entertainment, player_display, delivery)
+            }
             TurtleSoupCommand::Status => TurtleSoupCommandOutcome {
                 action: "status",
                 immediate_reply: Some(self.status_message()),
@@ -1063,7 +1065,7 @@ impl TurtleSoupService {
     pub(crate) fn handle_friend_command(
         &mut self,
         entertainment: &mut EntertainmentState,
-        player: &str,
+        player_display: &str,
         command: &TurtleSoupCommand,
         delivery: &mut dyn TurtleSoupDeliveryPort,
     ) -> TurtleSoupCommandOutcome {
@@ -1074,7 +1076,7 @@ impl TurtleSoupService {
             };
         }
         let outcome = match self.begin_settlement(
-            SettlementReason::Friend(normalize_player_display(player)),
+            SettlementReason::Friend(normalize_player_display(player_display)),
             delivery,
         ) {
             Ok(true) => TurtleSoupCommandOutcome {
@@ -3591,6 +3593,43 @@ mod tests {
         assert!(!json.contains("绝密汤底内容"));
         assert!(!json.contains("裁决备注"));
     }
+
+    /// 回归：好友结束海龟汤时，结算文案必须写玩家名，不能把内部键（UUID）渲染进去。
+    /// 曾经 execute_turtle_soup_intent 传的是 canonical_actor_name，已登记玩家会显示成一串 UUID。
+    #[test]
+    fn friend_settlement_names_the_player_instead_of_the_identity_key() {
+        let session = TurtleSoupSession {
+            puzzle: TurtleSoupPuzzle {
+                id: "soup-secret".to_string(),
+                title: "测试题".to_string(),
+                surface: "公开汤面".to_string(),
+                bottom: "绝密汤底内容".to_string(),
+                adjudication_notes: "裁决备注".to_string(),
+                enabled: true,
+            },
+            starter: "显示名甲".to_string(),
+            selected_at: Instant::now(),
+            active_at: Some(Instant::now()),
+            last_question_at: Some(Instant::now()),
+            participants: HashMap::new(),
+            question_count: 0,
+        };
+        let messages = settlement_messages(
+            &session,
+            &SettlementReason::Friend("显示名甲".to_string()),
+        );
+        let rendered = messages
+            .iter()
+            .map(|message| message.render_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("显示名甲"), "结算文案应写玩家名: {rendered}");
+        assert!(
+            !rendered.contains("00000000-0000-4000-8000"),
+            "结算文案不得含内部键: {rendered}"
+        );
+    }
+
 
     #[test]
     fn snapshot_elapsed_time_uses_the_injected_clock() {

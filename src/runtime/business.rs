@@ -684,6 +684,7 @@ enum CardGameRuntimeMessage {
 enum UndercoverRuntimeMessage {
     Begin {
         player: String,
+        player_display: String,
         source: UndercoverCommandSource,
         command: UndercoverCommand,
         now: Instant,
@@ -713,12 +714,14 @@ enum UndercoverRuntimeMessage {
 #[allow(dead_code)]
 enum TurtleSoupRuntimeMessage {
     HallCommand {
-        player: String,
+        /// 展示名。海龟汤的命令方只用它渲染「开局者」与「好友结束」文案，
+        /// 内部键（UUID）不得从这里进来。
+        player_display: String,
         command: TurtleSoupCommand,
         response: SyncSender<TurtleSoupCommandOutcome>,
     },
     FriendCommand {
-        player: String,
+        player_display: String,
         command: TurtleSoupCommand,
         response: SyncSender<TurtleSoupCommandOutcome>,
     },
@@ -869,11 +872,12 @@ impl UndercoverRuntimePort for BusinessRuntimeHandle {
     fn begin(
         &self,
         player: &str,
+        player_display: &str,
         source: UndercoverCommandSource,
         command: &UndercoverCommand,
         now: Instant,
     ) -> anyhow::Result<UndercoverCommandStart> {
-        Ok(self.begin_undercover(player, source, command, now)?)
+        Ok(self.begin_undercover(player, player_display, source, command, now)?)
     }
 
     fn claim(&self, key: UndercoverEffectKey) -> anyhow::Result<UndercoverEffectClaim> {
@@ -1757,6 +1761,7 @@ impl BusinessRuntimeHandle {
     pub fn begin_undercover(
         &self,
         player: &str,
+        player_display: &str,
         source: UndercoverCommandSource,
         command: &UndercoverCommand,
         now: Instant,
@@ -1764,6 +1769,7 @@ impl BusinessRuntimeHandle {
         self.request(|response| {
             RuntimeMessage::Undercover(UndercoverRuntimeMessage::Begin {
                 player: player.to_string(),
+                player_display: player_display.to_string(),
                 source,
                 command: command.clone(),
                 now,
@@ -1854,12 +1860,12 @@ impl BusinessRuntimeHandle {
 
     pub(crate) fn handle_turtle_soup_hall_command(
         &self,
-        player: &str,
+        player_display: &str,
         command: &TurtleSoupCommand,
     ) -> Result<TurtleSoupCommandOutcome, BusinessRuntimeError> {
         self.request_value(|response| {
             RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::HallCommand {
-                player: player.to_string(),
+                player_display: player_display.to_string(),
                 command: command.clone(),
                 response,
             })
@@ -1868,12 +1874,12 @@ impl BusinessRuntimeHandle {
 
     pub(crate) fn handle_turtle_soup_friend_command(
         &self,
-        player: &str,
+        player_display: &str,
         command: &TurtleSoupCommand,
     ) -> Result<TurtleSoupCommandOutcome, BusinessRuntimeError> {
         self.request_value(|response| {
             RuntimeMessage::TurtleSoup(TurtleSoupRuntimeMessage::FriendCommand {
-                player: player.to_string(),
+                player_display: player_display.to_string(),
                 command: command.clone(),
                 response,
             })
@@ -3800,11 +3806,12 @@ fn handle_turtle_soup_message(
 
     match message {
         TurtleSoupRuntimeMessage::HallCommand {
-            player,
+            player_display,
             command,
             response,
         } => {
-            let outcome = service.handle_hall_command(entertainment, &player, &command, task_port);
+            let outcome =
+                service.handle_hall_command(entertainment, &player_display, &command, task_port);
             if let Err(error) = sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
@@ -3821,12 +3828,12 @@ fn handle_turtle_soup_message(
             let _ = response.send(outcome);
         }
         TurtleSoupRuntimeMessage::FriendCommand {
-            player,
+            player_display,
             command,
             response,
         } => {
             let outcome =
-                service.handle_friend_command(entertainment, &player, &command, task_port);
+                service.handle_friend_command(entertainment, &player_display, &command, task_port);
             if let Err(error) = sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
@@ -4002,6 +4009,7 @@ fn handle_undercover_message(
     match message {
         UndercoverRuntimeMessage::Begin {
             player,
+            player_display,
             source,
             command,
             now,
@@ -4011,7 +4019,15 @@ fn handle_undercover_message(
                 BusinessRuntimeError::UndercoverOperationFailed(error.to_string())
             })?;
             let result = undercover
-                .begin_command(entertainment, &player, source, &command, now, operation_id)
+                .begin_command(
+                    entertainment,
+                    &player,
+                    &player_display,
+                    source,
+                    &command,
+                    now,
+                    operation_id,
+                )
                 .map_err(undercover_operation_failed)
                 .and_then(|result| {
                     sync_undercover_deadline(
@@ -4875,7 +4891,7 @@ mod tests {
         assert_eq!(verification.lane, CardGameEffectLane::Formal);
         assert!(matches!(
             verification.effect,
-            CardGameEffect::FriendVerify { ref player, .. } if player == "甲"
+            CardGameEffect::FriendVerify { ref player_display, .. } if player_display == "甲"
         ));
         assert_eq!(
             handle.claim_card_game_effect(verification.key).unwrap(),

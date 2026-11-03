@@ -42,11 +42,13 @@ pub enum CardGameEffectLane {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CardGameEffect {
     FriendVerify {
-        player: String,
+        /// 收件人显示名。好友查找按昵称进行，**不能放内部键（UUID）**。
+        player_display: String,
         message: String,
     },
     PrivateDelivery {
-        player: String,
+        /// 收件人显示名。同上，内部键放进来会导致「好友列表未找到」。
+        player_display: String,
         message: String,
         template: Option<CardGameReplyTemplate>,
     },
@@ -340,25 +342,26 @@ impl CardGameApplication {
             }
             let key = request.key;
             let result = match request.effect {
-                CardGameEffect::FriendVerify { player, message } => {
-                    CardGameEffectResult::FriendVerify(run_card_game_delivery(
-                        "好友验证",
-                        || delivery.verify_friend(&player, &message),
-                    ))
-                }
+                CardGameEffect::FriendVerify {
+                    player_display,
+                    message,
+                } => CardGameEffectResult::FriendVerify(run_card_game_delivery(
+                    "好友验证",
+                    || delivery.verify_friend(&player_display, &message),
+                )),
                 CardGameEffect::PrivateDelivery {
-                    player,
+                    player_display,
                     message,
                     template,
                 } => match template {
                     Some(template) => CardGameEffectResult::PrivateDeliveryTemplate(
                         run_card_game_delivery("好友消息发送", || {
-                            delivery.send_friend_template(&player, &message, &template)
+                            delivery.send_friend_template(&player_display, &message, &template)
                         }),
                     ),
                     None => CardGameEffectResult::PrivateDelivery(run_card_game_delivery(
                         "好友消息发送",
-                        || delivery.send_friend(&player, &message),
+                        || delivery.send_friend(&player_display, &message),
                     )),
                 },
                 CardGameEffect::PrivateBatch { deliveries } => {
@@ -472,13 +475,17 @@ struct PendingEffectState {
 
 enum PendingCardGameEffect {
     VerifyStart {
+        /// 内部键：只用于牌局内匹配。
         player: String,
+        /// 显示名：用于渲染与错误文案。
+        player_display: String,
         command: LandlordCommand,
         reservation: CardGameStartReservation,
         now: Instant,
     },
     VerifyJoin {
         player: String,
+        player_display: String,
         kind: EntertainmentKind,
         now: Instant,
     },
@@ -487,6 +494,7 @@ enum PendingCardGameEffect {
     },
     DeliverHand {
         player: String,
+        player_display: String,
         action: &'static str,
     },
     Hall {
@@ -591,7 +599,13 @@ impl CardGameService {
             ensure_operation_capacity(&self.state)?;
             match command {
                 LandlordCommand::Start | LandlordCommand::RunFastStart => (
-                    self.begin_start_in_state(entertainment, player, command, now)?,
+                    self.begin_start_in_state(
+                        entertainment,
+                        player,
+                        player_display,
+                        command,
+                        now,
+                    )?,
                     false,
                 ),
                 LandlordCommand::Join => {
@@ -607,11 +621,12 @@ impl CardGameService {
                             generation,
                             CardGameEffectLane::Formal,
                             CardGameEffect::FriendVerify {
-                                player: player.to_string(),
+                                player_display: player_display.to_string(),
                                 message: format!("{}报名成功，请回到大厅等待开局", kind.label()),
                             },
                             PendingCardGameEffect::VerifyJoin {
                                 player: player.to_string(),
+                                player_display: player_display.to_string(),
                                 kind,
                                 now,
                             },
@@ -652,12 +667,13 @@ impl CardGameService {
                         generation,
                         CardGameEffectLane::Formal,
                         CardGameEffect::PrivateDelivery {
-                            player: player.to_string(),
+                            player_display: player_display.to_string(),
                             message,
                             template,
                         },
                         PendingCardGameEffect::DeliverHand {
                             player: player.to_string(),
+                            player_display: player_display.to_string(),
                             action,
                         },
                     )?;
@@ -758,6 +774,7 @@ impl CardGameService {
         &mut self,
         entertainment: &mut EntertainmentState,
         player: &str,
+        player_display: &str,
         command: &LandlordCommand,
         now: Instant,
     ) -> Result<CardGameCommandStart> {
@@ -787,11 +804,12 @@ impl CardGameService {
                         reservation.session_generation,
                         CardGameEffectLane::Formal,
                         CardGameEffect::FriendVerify {
-                            player: player.to_string(),
+                            player_display: player_display.to_string(),
                             message: format!("{}报名成功，请回到大厅等待组局", label),
                         },
                         PendingCardGameEffect::VerifyStart {
                             player: player.to_string(),
+                            player_display: player_display.to_string(),
                             command: command.clone(),
                             reservation,
                             now,
@@ -919,6 +937,7 @@ impl CardGameService {
             (
                 PendingCardGameEffect::VerifyStart {
                     player,
+                    player_display,
                     command,
                     reservation,
                     now,
@@ -934,7 +953,12 @@ impl CardGameService {
                         return Ok(CardGameResume::Late(CardGameLateResult { key }));
                     }
                     self.state.pending_start = None;
-                    let outcome = self.state.game.handle(&player, &command, now);
+                    let outcome = self.state.game.handle_with_display(
+                        &player,
+                        &player_display,
+                        &command,
+                        now,
+                    );
                     if outcome.action != "created" {
                         entertainment.release(kind);
                     }
@@ -977,14 +1001,18 @@ impl CardGameService {
                 }
             },
             (
-                PendingCardGameEffect::DeliverHand { player, action },
+                PendingCardGameEffect::DeliverHand {
+                    player,
+                    player_display,
+                    action,
+                },
                 CardGameEffectResult::PrivateDelivery(result)
                 | CardGameEffectResult::PrivateDeliveryTemplate(result),
             ) => match result {
                 Ok(true) => Ok(CardGameResume::Completed(CardGameCompletion { action })),
                 Ok(false) => {
                     self.state.game.retry_hand_delivery(&player);
-                    bail!("牌局手牌发送失败：好友列表未找到 {}", player)
+                    bail!("牌局手牌发送失败：好友列表未找到「{}」", player_display)
                 }
                 Err(error) => {
                     self.state.game.retry_hand_delivery(&player);
@@ -992,11 +1020,21 @@ impl CardGameService {
                 }
             },
             (
-                PendingCardGameEffect::VerifyJoin { player, kind, now },
+                PendingCardGameEffect::VerifyJoin {
+                    player,
+                    player_display,
+                    kind,
+                    now,
+                },
                 CardGameEffectResult::FriendVerify(result),
             ) => match result {
                 Ok(true) => {
-                    let outcome = self.state.game.handle(&player, &LandlordCommand::Join, now);
+                    let outcome = self.state.game.handle_with_display(
+                        &player,
+                        &player_display,
+                        &LandlordCommand::Join,
+                        now,
+                    );
                     if outcome.ended {
                         advance_session_generation(&mut self.state)?;
                         entertainment.release(kind);

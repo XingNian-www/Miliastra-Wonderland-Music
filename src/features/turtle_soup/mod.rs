@@ -132,12 +132,12 @@ pub(crate) fn render_reply(spec: &ReplyTemplate, vars: &ReplyVars) -> String {
 pub(crate) trait TurtleSoupApplicationPort {
     fn handle_hall_command(
         &mut self,
-        player: &str,
+        player_display: &str,
         command: &TurtleSoupCommand,
     ) -> Result<TurtleSoupCommandOutcome>;
     fn handle_friend_command(
         &mut self,
-        player: &str,
+        player_display: &str,
         command: &TurtleSoupCommand,
     ) -> Result<TurtleSoupCommandOutcome>;
     fn submit_question(
@@ -166,15 +166,15 @@ impl TurtleSoupApplication {
     pub(crate) fn execute_command<P: TurtleSoupApplicationPort + ?Sized>(
         &self,
         raw_command: &str,
-        player: &str,
+        player_display: &str,
         from_friend: bool,
         command: &TurtleSoupCommand,
         port: &mut P,
     ) -> Result<()> {
         let outcome = if from_friend {
-            port.handle_friend_command(player, command)?
+            port.handle_friend_command(player_display, command)?
         } else {
-            port.handle_hall_command(player, command)?
+            port.handle_hall_command(player_display, command)?
         };
         if let Some(reply) = outcome.immediate_reply {
             port.send_turtle_soup_reply(reply)?;
@@ -466,7 +466,7 @@ mod tests {
     impl TurtleSoupApplicationPort for CommandPort {
         fn handle_hall_command(
             &mut self,
-            _player: &str,
+            _player_display: &str,
             _command: &TurtleSoupCommand,
         ) -> Result<TurtleSoupCommandOutcome> {
             Ok(TurtleSoupCommandOutcome {
@@ -480,7 +480,7 @@ mod tests {
 
         fn handle_friend_command(
             &mut self,
-            _player: &str,
+            _player_display: &str,
             _command: &TurtleSoupCommand,
         ) -> Result<TurtleSoupCommandOutcome> {
             unreachable!("hall command")

@@ -420,8 +420,10 @@ impl Player {
     fn with_display(key_source: &str, display: &str) -> Self {
         let display = display.trim();
         Self {
-            name: if display.is_empty() {
-                key_source.trim().to_string()
+            name: if display.trim().is_empty() {
+                // 绝不回退到内部键：已登记身份的 key_source 是 UUID，
+                // 一旦回退就会把 UUID 显示给玩家。
+                UNKNOWN_PLAYER_DISPLAY.to_string()
             } else {
                 display.to_string()
             },
@@ -1866,6 +1868,9 @@ fn find_player(players: &[Player], name: &str) -> Option<usize> {
     players.iter().position(|player| player.key == key)
 }
 
+/// 展示名缺失时的占位。不能用内部键顶替，那会把 UUID 打到玩家面前。
+const UNKNOWN_PLAYER_DISPLAY: &str = "未知玩家";
+
 fn player_key(name: &str) -> String {
     // 只做去首尾空白 + 小写,保留标点:避免 "小明!" 与 "小明" 碰撞
     // (否则可代他人出牌/抢地主/收到私聊手牌)。
@@ -2021,6 +2026,22 @@ mod tests {
         ) -> Result<CardGameCommandStart> {
             self.inner
                 .begin_command(&mut self.entertainment, player, command, now)
+        }
+
+        fn begin_command_with_display(
+            &mut self,
+            player: &str,
+            player_display: &str,
+            command: &LandlordCommand,
+            now: Instant,
+        ) -> Result<CardGameCommandStart> {
+            self.inner.begin_command_with_display(
+                &mut self.entertainment,
+                player,
+                player_display,
+                command,
+                now,
+            )
         }
 
         fn resume(
@@ -2297,20 +2318,23 @@ mod tests {
                 return Ok(());
             }
             let result = match request.effect {
-                CardGameEffect::FriendVerify { player, message } => {
-                    CardGameEffectResult::FriendVerify(port.verify_friend(&player, &message))
-                }
+                CardGameEffect::FriendVerify {
+                    player_display,
+                    message,
+                } => CardGameEffectResult::FriendVerify(
+                    port.verify_friend(&player_display, &message),
+                ),
                 CardGameEffect::PrivateDelivery {
-                    player,
+                    player_display,
                     message,
                     template,
                 } => match template {
                     Some(template) => CardGameEffectResult::PrivateDeliveryTemplate(
-                        port.send_friend_template(&player, &message, &template),
+                        port.send_friend_template(&player_display, &message, &template),
                     ),
-                    None => {
-                        CardGameEffectResult::PrivateDelivery(port.send_friend(&player, &message))
-                    }
+                    None => CardGameEffectResult::PrivateDelivery(
+                        port.send_friend(&player_display, &message),
+                    ),
                 },
                 CardGameEffect::PrivateBatch { deliveries } => {
                     CardGameEffectResult::PrivateBatchTemplates(
@@ -2350,7 +2374,7 @@ mod tests {
         assert_eq!(verification.lane, CardGameEffectLane::Formal);
         assert!(matches!(
             verification.effect,
-            CardGameEffect::FriendVerify { ref player, .. } if player == "甲"
+            CardGameEffect::FriendVerify { ref player_display, .. } if player_display == "甲"
         ));
 
         let CardGameResume::Suspended(failure_reply) = service
@@ -2526,6 +2550,75 @@ mod tests {
             text.contains("显示名甲"),
             "文案应使用展示名: {text}"
         );
+    }
+
+
+
+    /// 把一条已挂起的效果链走完（好友验证 / 批量投递 / 大厅回复都给成功结果）。
+    fn drain_card_game_effects(service: &mut TestCardGameService, mut request: CardGameEffectRequest) {
+        loop {
+            let result = match &request.effect {
+                CardGameEffect::FriendVerify { .. } => {
+                    CardGameEffectResult::FriendVerify(Ok(true))
+                }
+                CardGameEffect::PrivateDelivery {
+                    template: Some(_), ..
+                } => CardGameEffectResult::PrivateDeliveryTemplate(Ok(true)),
+                CardGameEffect::PrivateDelivery { .. } => {
+                    CardGameEffectResult::PrivateDelivery(Ok(true))
+                }
+                CardGameEffect::PrivateBatch { .. } => CardGameEffectResult::PrivateBatchTemplates(
+                    Ok(CardGameFriendBatchOutcome::Complete),
+                ),
+                CardGameEffect::HallDelivery { .. } => CardGameEffectResult::HallDelivery(Ok(())),
+            };
+            match service.resume_claimed_for_test(request.key, result).unwrap() {
+                CardGameResume::Suspended(next) => request = next,
+                CardGameResume::Completed(_) | CardGameResume::Late(_) => return,
+            }
+        }
+    }
+
+    /// 回归：服务层交给好友通道的收件人必须是展示名。
+    /// 曾经把内部键（UUID）塞进 FriendVerify / PrivateDelivery，
+    /// 结果「报名」和「发手牌」都拿 UUID 去好友列表里找人，必然找不到。
+    #[test]
+    fn service_effects_use_display_name_never_the_identity_key() {
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        let mut service = TestCardGameService::new(LandlordConfig::default());
+        let now = Instant::now();
+
+        let verification = suspended(
+            service
+                .begin_command_with_display(uuid, "显示名甲", &LandlordCommand::Start, now)
+                .unwrap(),
+        );
+        match &verification.effect {
+            CardGameEffect::FriendVerify { player_display, .. } => {
+                assert_eq!(player_display, "显示名甲");
+                assert!(!player_display.contains(uuid), "好友验证收件人不得是内部键");
+            }
+            other => panic!("期望好友验证效果，实际 {other:?}"),
+        }
+        drain_card_game_effects(&mut service, verification);
+
+        for name in ["玩家乙", "玩家丙"] {
+            let joined = suspended(service.begin_command(name, &LandlordCommand::Join, now).unwrap());
+            drain_card_game_effects(&mut service, joined);
+        }
+
+        let hand = suspended(
+            service
+                .begin_command_with_display(uuid, "显示名甲", &LandlordCommand::Hand, now)
+                .unwrap(),
+        );
+        match &hand.effect {
+            CardGameEffect::PrivateDelivery { player_display, .. } => {
+                assert_eq!(player_display, "显示名甲");
+                assert!(!player_display.contains(uuid), "私聊投递收件人不得是内部键");
+            }
+            other => panic!("期望私聊投递效果，实际 {other:?}"),
+        }
     }
 
     /// 同一人的 `key` 与 `name` 分离后，加入牌局仍能按身份键去重。
@@ -2760,8 +2853,8 @@ mod tests {
         assert_ne!(first_hand.key.operation_id, retry.key.operation_id);
         assert!(matches!(
             retry.effect,
-            CardGameEffect::PrivateDelivery { ref player, ref template, .. }
-                if player == "甲" && matches!(template, Some(CardGameReplyTemplate::Template { spec, .. }) if spec.key == "card_games.hand.current")
+            CardGameEffect::PrivateDelivery { ref player_display, ref template, .. }
+                if player_display == "甲" && matches!(template, Some(CardGameReplyTemplate::Template { spec, .. }) if spec.key == "card_games.hand.current")
         ));
     }
 
@@ -2810,8 +2903,8 @@ mod tests {
         );
         assert!(matches!(
             retry.effect,
-            CardGameEffect::PrivateDelivery { ref player, ref template, .. }
-                if player == "甲" && matches!(template, Some(CardGameReplyTemplate::Template { spec, .. }) if spec.key == "card_games.hand.current")
+            CardGameEffect::PrivateDelivery { ref player_display, ref template, .. }
+                if player_display == "甲" && matches!(template, Some(CardGameReplyTemplate::Template { spec, .. }) if spec.key == "card_games.hand.current")
         ));
     }
 

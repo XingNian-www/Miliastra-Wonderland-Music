@@ -375,21 +375,21 @@ impl CardGameDeliveryPort for DeferredCardGamePort {
 impl TurtleSoupApplicationPort for TurtleSoupCommandPort<'_> {
     fn handle_hall_command(
         &mut self,
-        player: &str,
+        player_display: &str,
         command: &turtle_soup::TurtleSoupCommand,
     ) -> Result<TurtleSoupCommandOutcome> {
         self.business
-            .handle_turtle_soup_hall_command(player, command)
+            .handle_turtle_soup_hall_command(player_display, command)
             .map_err(anyhow::Error::from)
     }
 
     fn handle_friend_command(
         &mut self,
-        player: &str,
+        player_display: &str,
         command: &turtle_soup::TurtleSoupCommand,
     ) -> Result<TurtleSoupCommandOutcome> {
         self.business
-            .handle_turtle_soup_friend_command(player, command)
+            .handle_turtle_soup_friend_command(player_display, command)
             .map_err(anyhow::Error::from)
     }
 
@@ -751,10 +751,12 @@ impl ApplicationRuntime {
     ) -> Result<()> {
         log::debug!("海龟汤控制命令已按正式队列顺序处理，回复进入延迟聊天队列");
         let mut port = self.turtle_soup_command_port();
-        let player = self.canonical_actor_name(&parsed.username);
+        // 海龟汤命令方只把玩家名用于渲染「开局者」与「好友结束」文案，
+        // 内部键（已登记身份是 UUID）不能从这里进文案。
+        let player_display = self.mapped_actor_name(&parsed.username);
         self.business.turtle_soup_application.execute_command(
             &parsed.raw,
-            &player,
+            &player_display,
             parsed.authority == CommandAuthority::Friend,
             command,
             &mut port,
@@ -869,9 +871,12 @@ impl ApplicationRuntime {
             CommandAuthority::Friend => UndercoverCommandSource::Friend,
             CommandAuthority::HallMember => UndercoverCommandSource::Hall,
         };
+        // 身份键（可能为 UUID）只用于比较/查找/记账；渲染与好友投递必须用展示名。
         let player = self.canonical_actor_name(&parsed.username);
-        self.business.undercover_game.execute_command(
+        let player_display = self.mapped_actor_name(&parsed.username);
+        self.business.undercover_game.execute_command_with_display(
             &player,
+            &player_display,
             source,
             command,
             command_observed_at(parsed),

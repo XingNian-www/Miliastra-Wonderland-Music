@@ -769,7 +769,7 @@ impl IdiomChainGame {
                 keyed_reply(&templates::NO_SESSION, ReplyVars::new()),
             );
         };
-        if !self.allow_anyone_stop && !same_player(player, &session.starter) {
+        if !self.allow_anyone_stop && !same_player(player, &session.starter_key) {
             return templated_outcome(
                 "stop-denied",
                 keyed_reply(&templates::STOP_DENIED, ReplyVars::new()),
@@ -812,7 +812,9 @@ impl IdiomChainGame {
 }
 
 struct IdiomChainSession {
-    starter: String,
+    /// 开局者的**比较键**（已登记身份为 UUID）。只用于「是否本人可结束」的判断，
+    /// 绝不能渲染进文案；要显示名字请由 composition 传 display。
+    starter_key: String,
     last_idiom: String,
     expected_first: char,
     mode: IdiomChainMode,
@@ -831,7 +833,7 @@ impl IdiomChainSession {
         now: Instant,
     ) -> Self {
         Self {
-            starter: player.trim().to_string(),
+            starter_key: player.trim().to_string(),
             last_idiom: idiom,
             expected_first,
             mode,

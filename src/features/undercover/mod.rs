@@ -433,13 +433,27 @@ struct Player {
 }
 
 impl Player {
-    fn lobby(name: &str) -> Self {
+    /// `key` 是身份键（比较/查找/记账），`display` 是给玩家看的名字（渲染/投递）。
+    ///
+    /// 两者必须分开：已登记身份的身份键是 UUID，直接当人名渲染会让玩家看到一串 UUID，
+    /// 拿去搜好友也必然落空。display 为空时留空串，由渲染层回退成占位符，
+    /// **绝不回退成 key**。
+    fn lobby(key: &str, display: &str) -> Self {
         Self {
-            name: name.trim().to_string(),
-            key: player_key(name),
+            name: display.trim().to_string(),
+            key: player_key(key),
             position: '?',
             role: Role::Civilian,
             alive: true,
+        }
+    }
+
+    /// 渲染用的人名：display 为空时用占位符，**不回退成身份键**。
+    fn display_name(&self) -> &str {
+        if self.name.trim().is_empty() {
+            "未知玩家"
+        } else {
+            self.name.as_str()
         }
     }
 }
@@ -521,13 +535,24 @@ impl UndercoverGame {
     }
 
     pub fn create(&mut self, player: &str, mode: UndercoverMode, now: Instant) -> Result<()> {
+        self.create_with_display(player, player, mode, now)
+    }
+
+    /// `player` 是身份键，`player_display` 是给玩家看的名字。
+    pub fn create_with_display(
+        &mut self,
+        player: &str,
+        player_display: &str,
+        mode: UndercoverMode,
+        now: Instant,
+    ) -> Result<()> {
         if !self.config.enabled {
             bail!("谁是卧底未启用");
         }
         if !matches!(self.state, GameState::Idle) {
             bail!("已有谁是卧底房间或牌局进行中");
         }
-        let player = Player::lobby(player);
+        let player = Player::lobby(player, player_display);
         self.state = GameState::Lobby(Lobby {
             mode,
             creator_key: player.key.clone(),
@@ -538,6 +563,16 @@ impl UndercoverGame {
     }
 
     pub fn join(&mut self, player: &str, now: Instant) -> Result<()> {
+        self.join_with_display(player, player, now)
+    }
+
+    /// `player` 是身份键，`player_display` 是给玩家看的名字。
+    pub fn join_with_display(
+        &mut self,
+        player: &str,
+        player_display: &str,
+        now: Instant,
+    ) -> Result<()> {
         let GameState::Lobby(lobby) = &mut self.state else {
             bail!("当前没有等待加入的谁是卧底房间");
         };
@@ -548,7 +583,9 @@ impl UndercoverGame {
         if lobby.players.len() >= self.config.max_players.clamp(4, 11) {
             bail!("谁是卧底房间已满");
         }
-        lobby.players.push(Player::lobby(player));
+        lobby
+            .players
+            .push(Player::lobby(player, player_display));
         lobby.last_activity = now;
         Ok(())
     }
@@ -597,7 +634,7 @@ impl UndercoverGame {
             .iter()
             .map(|player| {
                 UndercoverDelivery::KeyedFriend(UndercoverFriendDelivery::new(
-                    player.name.clone(),
+                    player.display_name().to_string(),
                     UndercoverReply::keyed(
                         &templates::SECRET,
                         &&ReplyVars::new()
@@ -831,6 +868,23 @@ impl UndercoverGame {
         matches!(self.state, GameState::Lobby(_))
     }
 
+    /// 按身份键查展示名。玩家尚未加入（如 create 失败）时返回 None。
+    ///
+    /// 这是给「只知道身份键、又需要展示名」的补偿路径用的：优先复用房间里
+    /// 已经记住的 display，避免为了传一个名字而给十几处调用点加参数。
+    pub fn display_of(&self, player: &str) -> Option<&str> {
+        let key = player_key(player);
+        let players = match &self.state {
+            GameState::Lobby(lobby) => &lobby.players,
+            GameState::Playing(game) => &game.players,
+            GameState::Idle => return None,
+        };
+        players
+            .iter()
+            .find(|item| item.key == key)
+            .map(Player::display_name)
+    }
+
     pub fn lobby_contains(&self, player: &str) -> bool {
         let key = player_key(player);
         matches!(&self.state, GameState::Lobby(lobby)
@@ -880,7 +934,7 @@ impl UndercoverGame {
                             lobby
                                 .players
                                 .iter()
-                                .map(|player| player.name.as_str())
+                                .map(|player| player.display_name())
                                 .collect::<Vec<_>>()
                                 .join("、"),
                         ),
@@ -1038,7 +1092,7 @@ impl UndercoverGame {
                     .iter()
                     .map(|player| UndercoverPlayerSnapshot {
                         position: None,
-                        name: player.name.clone(),
+                        name: player.display_name().to_string(),
                         alive: true,
                     })
                     .collect(),
@@ -1062,7 +1116,7 @@ impl UndercoverGame {
                         .iter()
                         .map(|player| UndercoverPlayerSnapshot {
                             position: Some(player.position),
-                            name: player.name.clone(),
+                            name: player.display_name().to_string(),
                             alive: player.alive,
                         })
                         .collect(),
@@ -1582,7 +1636,7 @@ fn position_mapping_lines(players: &[Player]) -> Vec<UndercoverReply> {
                     &templates::POSITION_MAPPING,
                     &ReplyVars::new()
                         .with("位置", player.position.to_string())
-                        .with("玩家", player.name.as_str()),
+                        .with("玩家", player.display_name()),
                 ));
             }
             UndercoverReply::Joined { fragments }
@@ -1608,7 +1662,7 @@ fn settlement_lines(game: &Playing, winner: Winner) -> Vec<UndercoverReply> {
                 spec: &templates::SETTLEMENT_PLAYER,
                 vars: ReplyVars::new()
                     .with("位置", player.position.to_string())
-                    .with("玩家", player.name.as_str()),
+                    .with("玩家", player.display_name()),
                 fragments: vec![("身份", player.role.reply())],
             });
         }
@@ -1771,7 +1825,7 @@ mod tests {
             .into_iter()
             .zip(["甲", "乙", "丙", "丁"])
             .map(|(position, name)| {
-                let mut player = Player::lobby(name);
+                let mut player = Player::lobby(name, name);
                 player.position = position;
                 player
             })

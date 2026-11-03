@@ -173,9 +173,14 @@ pub trait UndercoverDeliveryPort {
 }
 
 pub trait UndercoverRuntimePort: Send + Sync {
+    /// `player` 是身份键（参与加入/查找/比较），`player_display` 是给玩家看的名字。
+    ///
+    /// 两者必须分开：身份键可能是 UUID（已登记身份走 `memory_key()`），
+    /// 直接当人名渲染或当私聊收件人会让玩家看到一串 UUID，且按 UUID 搜好友必然落空。
     fn begin(
         &self,
         player: &str,
+        player_display: &str,
         source: UndercoverCommandSource,
         command: &UndercoverCommand,
         now: Instant,
@@ -210,6 +215,10 @@ impl UndercoverApplication {
         Self { runtime }
     }
 
+    /// 兼容入口：调用方没有单独提供展示名时，用身份键兼任两者。
+    ///
+    /// **只应被测试和历史调用点使用**；生产路径请走 [`Self::execute_command_with_display`]，
+    /// 否则已登记身份（身份键为 UUID）会把 UUID 当人名渲染。
     pub fn execute_command(
         &self,
         player: &str,
@@ -218,7 +227,22 @@ impl UndercoverApplication {
         now: Instant,
         delivery: &dyn UndercoverDeliveryPort,
     ) -> Result<()> {
-        let start = self.runtime.begin(player, source, command, now)?;
+        self.execute_command_with_display(player, player, source, command, now, delivery)
+    }
+
+    /// `player` 是身份键（比较/查找/记账），`player_display` 是给玩家看的名字（渲染/投递）。
+    pub fn execute_command_with_display(
+        &self,
+        player: &str,
+        player_display: &str,
+        source: UndercoverCommandSource,
+        command: &UndercoverCommand,
+        now: Instant,
+        delivery: &dyn UndercoverDeliveryPort,
+    ) -> Result<()> {
+        let start = self
+            .runtime
+            .begin(player, player_display, source, command, now)?;
         self.drive_start(start, delivery)
     }
 
@@ -410,12 +434,14 @@ struct PendingUndercoverEffect {
 enum UndercoverContinuation {
     VerifyCreate {
         player: String,
+        player_display: String,
         mode: UndercoverMode,
         source: UndercoverCommandSource,
         now: Instant,
     },
     VerifyJoin {
         player: String,
+        player_display: String,
         source: UndercoverCommandSource,
         now: Instant,
     },
@@ -447,10 +473,14 @@ impl UndercoverRuntimeService {
         }
     }
 
+    /// `player` 是身份键（比较/查找/记账），`player_display` 是给玩家看的名字。
+    ///
+    /// 只有创建/加入需要记住 display（写进 `Player`）；其余命令只按身份键查找玩家。
     pub fn begin_command(
         &mut self,
         entertainment: &mut EntertainmentState,
         player: &str,
+        player_display: &str,
         source: UndercoverCommandSource,
         command: &UndercoverCommand,
         now: Instant,
@@ -461,7 +491,7 @@ impl UndercoverRuntimeService {
             return Ok(self.begin_retry_delivery(key));
         }
         if matches!(command, UndercoverCommand::Reveal) {
-            let result = self.begin_reveal(key, player, source);
+            let result = self.begin_reveal(key, player, player_display, source);
             self.reconcile_entertainment(entertainment);
             return result;
         }
@@ -482,12 +512,24 @@ impl UndercoverRuntimeService {
             }
         }
         let result = match command {
-            UndercoverCommand::CreateSingle | UndercoverCommand::CreateDouble => {
-                self.begin_create(entertainment, player, source, command, now, operation_id)
-            }
-            UndercoverCommand::Join => {
-                self.begin_join(entertainment, player, source, now, operation_id)
-            }
+            UndercoverCommand::CreateSingle | UndercoverCommand::CreateDouble => self
+                .begin_create(
+                    entertainment,
+                    player,
+                    player_display,
+                    source,
+                    command,
+                    now,
+                    operation_id,
+                ),
+            UndercoverCommand::Join => self.begin_join(
+                entertainment,
+                player,
+                player_display,
+                source,
+                now,
+                operation_id,
+            ),
             UndercoverCommand::Start => self.begin_start(source, player, now, operation_id),
             UndercoverCommand::Status => {
                 let status = self.game.status(player, now);
@@ -729,6 +771,7 @@ impl UndercoverRuntimeService {
         &mut self,
         entertainment: &mut EntertainmentState,
         player: &str,
+        player_display: &str,
         source: UndercoverCommandSource,
         command: &UndercoverCommand,
         now: Instant,
@@ -785,6 +828,7 @@ impl UndercoverRuntimeService {
             },
             UndercoverContinuation::VerifyCreate {
                 player: player.trim().to_string(),
+                player_display: player_display.trim().to_string(),
                 mode,
                 source,
                 now,
@@ -797,32 +841,33 @@ impl UndercoverRuntimeService {
         &mut self,
         entertainment: &EntertainmentState,
         player: &str,
+        player_display: &str,
         source: UndercoverCommandSource,
         now: Instant,
         operation_id: BusinessOperationId,
     ) -> Result<UndercoverCommandStart> {
         let key = UndercoverEffectKey::new(operation_id, self.generation);
         if entertainment.active() != Some(EntertainmentKind::Undercover) {
-            return self.begin_error(
+            return self.begin_error_to_display(
                 key,
                 source,
-                player,
+                player_display,
                 UndercoverReply::keyed(&templates::ERROR_NO_LOBBY, &ReplyVars::new()),
             );
         }
         if !self.game.is_lobby() {
-            return self.begin_error(
+            return self.begin_error_to_display(
                 key,
                 source,
-                player,
+                player_display,
                 UndercoverReply::keyed(&templates::ERROR_ALREADY_STARTED, &ReplyVars::new()),
             );
         }
         if self.game.lobby_contains(player) {
-            return self.begin_error(
+            return self.begin_error_to_display(
                 key,
                 source,
-                player,
+                player_display,
                 UndercoverReply::keyed(&templates::ERROR_ALREADY_JOINED, &ReplyVars::new()),
             );
         }
@@ -836,6 +881,7 @@ impl UndercoverRuntimeService {
             },
             UndercoverContinuation::VerifyJoin {
                 player: player.trim().to_string(),
+                player_display: player_display.trim().to_string(),
                 source,
                 now,
             },
@@ -901,22 +947,32 @@ impl UndercoverRuntimeService {
         &mut self,
         key: UndercoverEffectKey,
         player: &str,
+        player_display: &str,
         source: UndercoverCommandSource,
     ) -> Result<UndercoverCommandStart> {
         if source != UndercoverCommandSource::Friend {
-            return self.begin_error(
+            return self.begin_error_to_display(
                 key,
                 source,
-                player,
+                player_display,
                 UndercoverReply::keyed(&templates::REVEAL_FRIEND_ONLY, &ReplyVars::new()),
             );
         }
         match self.game.reveal(player) {
             Ok(lines) => {
-                let deliveries = lines
-                    .into_iter()
-                    .map(|reply| UndercoverFriendDelivery::new(player.trim(), reply))
-                    .collect::<Vec<_>>();
+                // 收件人用展示名：优先用调用方给的，查不到才回退牌局里记录的名字。
+                let display = if player_display.trim().is_empty() {
+                    self.game.display_of(player).map(str::to_string)
+                } else {
+                    Some(player_display.trim().to_string())
+                };
+                let deliveries = match display {
+                    Some(display) => lines
+                        .into_iter()
+                        .map(|reply| UndercoverFriendDelivery::new(&display, reply))
+                        .collect::<Vec<_>>(),
+                    None => Vec::new(),
+                };
                 let request = self.insert_effect(
                     key,
                     UndercoverEffectLane::Formal,
@@ -930,9 +986,12 @@ impl UndercoverRuntimeService {
                 );
                 Ok(UndercoverCommandStart::Suspended(request))
             }
-            Err(error) => {
-                self.begin_error(key, source, player, UndercoverReply::Raw(error.to_string()))
-            }
+            Err(error) => self.begin_error_to_display(
+                key,
+                source,
+                player_display,
+                UndercoverReply::Raw(error.to_string()),
+            ),
         }
     }
 
@@ -945,12 +1004,13 @@ impl UndercoverRuntimeService {
         match continuation {
             UndercoverContinuation::VerifyCreate {
                 player,
+                player_display,
                 mode,
                 source,
                 now,
             } => match result {
                 UndercoverEffectResult::KeyedFriendVerify(Ok(true)) => {
-                    if let Err(error) = self.game.create(&player, mode, now) {
+                    if let Err(error) = self.game.create_with_display(&player, &player_display, mode, now) {
                         return self
                             .begin_error(
                                 key,
@@ -992,11 +1052,12 @@ impl UndercoverRuntimeService {
             },
             UndercoverContinuation::VerifyJoin {
                 player,
+                player_display,
                 source,
                 now,
             } => match result {
                 UndercoverEffectResult::KeyedFriendVerify(Ok(true)) => {
-                    let outcome = self.game.join(&player, now);
+                    let outcome = self.game.join_with_display(&player, &player_display, now);
                     match outcome {
                         Ok(()) if self.game.lobby_is_full() => self
                             .begin_start(source, &player, now, key.operation_id)
@@ -1212,12 +1273,16 @@ impl UndercoverRuntimeService {
         messages: Vec<String>,
         action: &'static str,
     ) -> UndercoverCommandStart {
-        let deliveries = messages
+        // 同上：只按展示名投递；查不到展示名就没有可用的好友名。
+        let display = self.game.display_of(player).map(str::to_string);
+        let deliveries: Vec<UndercoverFriendDelivery> = messages
             .into_iter()
-            .map(|message| {
-                UndercoverFriendDelivery::new(player.trim(), UndercoverReply::Raw(message))
+            .filter_map(|message| {
+                display.as_ref().map(|display| {
+                    UndercoverFriendDelivery::new(display, UndercoverReply::Raw(message))
+                })
             })
-            .collect::<Vec<_>>();
+            .collect();
         if deliveries.is_empty() {
             return UndercoverCommandStart::Completed(UndercoverCompletion {
                 action,
@@ -1282,12 +1347,46 @@ impl UndercoverRuntimeService {
         player: &str,
         reply: UndercoverReply,
     ) -> Result<UndercoverCommandStart> {
-        let effect = if source == UndercoverCommandSource::Friend {
-            UndercoverEffect::KeyedFriendBatch {
-                deliveries: vec![UndercoverFriendDelivery::new(player.trim(), reply)],
+        // 收件人必须是展示名：身份键可能是 UUID，拿去搜好友必然落空。
+        // 查不到展示名（玩家还没加入过房间）时**退回大厅广播**，绝不把身份键
+        // 当好友名交给投递层——既搜不到人，也会把内部键暴露到日志里。
+        let display = self.game.display_of(player).map(str::to_string);
+        let effect = match (source, display) {
+            (UndercoverCommandSource::Friend, Some(display)) => {
+                UndercoverEffect::KeyedFriendBatch {
+                    deliveries: vec![UndercoverFriendDelivery::new(&display, reply)],
+                }
             }
-        } else {
-            UndercoverEffect::KeyedHall { reply }
+            _ => UndercoverEffect::KeyedHall { reply },
+        };
+        Ok(UndercoverCommandStart::Suspended(self.insert_effect(
+            key,
+            UndercoverEffectLane::Formal,
+            effect,
+            UndercoverContinuation::Deliveries {
+                remaining: VecDeque::new(),
+                lane: UndercoverEffectLane::Formal,
+                action: "error",
+                ended: false,
+            },
+        )))
+    }
+
+    /// 与 `begin_error` 相同，但收件人直接由调用方给出**展示名**。
+    /// 用于玩家还没进房间、`display_of` 查不到的场合（例如好友 `@加入` 但还没开局）。
+    fn begin_error_to_display(
+        &mut self,
+        key: UndercoverEffectKey,
+        source: UndercoverCommandSource,
+        player_display: &str,
+        reply: UndercoverReply,
+    ) -> Result<UndercoverCommandStart> {
+        let display = player_display.trim();
+        let effect = match (source, display.is_empty()) {
+            (UndercoverCommandSource::Friend, false) => UndercoverEffect::KeyedFriendBatch {
+                deliveries: vec![UndercoverFriendDelivery::new(display, reply)],
+            },
+            _ => UndercoverEffect::KeyedHall { reply },
         };
         Ok(UndercoverCommandStart::Suspended(self.insert_effect(
             key,
@@ -1518,6 +1617,7 @@ mod runtime_tests {
             .begin_command(
                 entertainment,
                 player,
+                player,
                 UndercoverCommandSource::Friend,
                 &command,
                 now,
@@ -1579,6 +1679,7 @@ mod runtime_tests {
             .begin_command(
                 &mut entertainment,
                 "甲",
+                "甲",
                 UndercoverCommandSource::Hall,
                 &UndercoverCommand::Start,
                 now,
@@ -1637,6 +1738,7 @@ mod runtime_tests {
             .begin_command(
                 &mut entertainment,
                 "甲",
+                "甲",
                 UndercoverCommandSource::Hall,
                 &UndercoverCommand::Start,
                 now,
@@ -1691,6 +1793,7 @@ mod runtime_tests {
             .begin_command(
                 &mut entertainment,
                 "甲",
+                "甲",
                 UndercoverCommandSource::Hall,
                 &UndercoverCommand::Retry,
                 now,
@@ -1714,6 +1817,7 @@ mod runtime_tests {
         let start = service
             .begin_command(
                 &mut entertainment,
+                "甲",
                 "甲",
                 UndercoverCommandSource::Friend,
                 &UndercoverCommand::Join,
@@ -1761,6 +1865,7 @@ mod runtime_tests {
             .begin_command(
                 &mut entertainment,
                 "甲",
+                "甲",
                 UndercoverCommandSource::Hall,
                 &UndercoverCommand::Start,
                 now,
@@ -1803,6 +1908,7 @@ mod runtime_tests {
         let reveal = service
             .begin_command(
                 &mut entertainment,
+                "旁观者",
                 "旁观者",
                 UndercoverCommandSource::Friend,
                 &UndercoverCommand::Reveal,
@@ -1861,6 +1967,7 @@ mod runtime_tests {
             .begin_command(
                 &mut entertainment,
                 "甲",
+                "甲",
                 UndercoverCommandSource::Friend,
                 &UndercoverCommand::Reveal,
                 now,
@@ -1881,6 +1988,7 @@ mod runtime_tests {
         let hall_reveal = service
             .begin_command(
                 &mut entertainment,
+                "旁观者",
                 "旁观者",
                 UndercoverCommandSource::Hall,
                 &UndercoverCommand::Reveal,
@@ -1905,6 +2013,7 @@ mod runtime_tests {
         let start = service
             .begin_command(
                 &mut entertainment,
+                "甲",
                 "甲",
                 UndercoverCommandSource::Friend,
                 &UndercoverCommand::CreateSingle,
@@ -1960,6 +2069,7 @@ mod runtime_tests {
         let start = service
             .begin_command(
                 &mut entertainment,
+                "甲",
                 "甲",
                 UndercoverCommandSource::Friend,
                 &UndercoverCommand::CreateSingle,
@@ -2018,6 +2128,7 @@ mod runtime_tests {
         let start = service
             .begin_command(
                 &mut entertainment,
+                "甲",
                 "甲",
                 UndercoverCommandSource::Friend,
                 &UndercoverCommand::CreateSingle,

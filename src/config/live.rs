@@ -397,11 +397,12 @@ mod tests {
         config.custom_workflows.default_threshold = 0.73;
         config.identity = IdentityConfig {
             mappings: vec![crate::features::identity::IdentityMapping {
-                nickname: "派蒙本蒙".to_string(),
+                remark: "派蒙本蒙".to_string(),
                 id: uuid::Uuid::from_u128(1),
                 role: crate::features::identity::IdentityRole::Owner,
-                note: String::new(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: String::new(),
+                remark_from_chatbridge: false,
                 accounts: Vec::new(),
             }],
         };
@@ -566,11 +567,12 @@ mod tests {
         // 模拟自动注册：直接改 IdentityAccess 再同步快照（生产里由
         // external_chat 调 persist_identity 完成）。
         let auto = crate::features::identity::IdentityMapping {
-            nickname: "auto_nick".to_string(),
+            remark: "auto_nick".to_string(),
             id: uuid::Uuid::new_v4(),
             role: crate::features::identity::IdentityRole::Friend,
-            note: "自动注册".to_string(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: "自动注册".to_string(),
+            remark_from_chatbridge: false,
             accounts: vec![crate::features::identity::GameAccount::new("900000099")],
         };
         let mut updated = config.identity.clone();

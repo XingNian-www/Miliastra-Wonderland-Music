@@ -191,7 +191,7 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
 
     /// 归属键 `id:<uuid>` 是内部标识，翻译成展示名后才能给玩家看。
     fn playlist_owner_display(&self, owner: &str) -> String {
-        // `display_name_for_key` 内部走 `Uuid::parse_str`，带 `id:` 前缀会解析失败，
+        // `player_name_for_key` 内部走 `Uuid::parse_str`，带 `id:` 前缀会解析失败，
         // 必须先剥掉前缀。
         let key = owner
             .strip_prefix(crate::features::playlist::owner_key::IDENTITY)
@@ -201,7 +201,7 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
             .lifecycle
             .live_configs
             .identity
-            .display_name_for_key(key);
+            .player_name_for_key(key);
         if display.trim().is_empty() {
             owner.to_string()
         } else {
@@ -568,7 +568,7 @@ impl ApplicationRuntime {
         // 内部键负责「按谁记账」，展示名负责「给玩家看什么名字」——两者分开传，
         // 否则已登记身份的 UUID 会被当作玩家名渲染进塔罗标题。
         let actor = self.canonical_actor_name(&parsed.username);
-        let actor_display = self.mapped_actor_name(&parsed.username);
+        let actor_display = self.mapped_actor_name(&parsed.username, parsed.account.as_ref());
         let messages = self.business.tarot_application.execute_with_display(
             &actor,
             &actor_display,
@@ -718,7 +718,7 @@ impl ApplicationRuntime {
         // 内部键负责「谁在操作」，展示名负责「文案里写谁」——分开传，
         // 否则已登记身份的 UUID 会被渲染进「{玩家} 抢地主」这类文案。
         let player = self.canonical_actor_name(&parsed.username);
-        let player_display = self.mapped_actor_name(&parsed.username);
+        let player_display = self.mapped_actor_name(&parsed.username, parsed.account.as_ref());
         match card_game_effect_lane(command) {
             CardGameEffectLane::Formal => self.business.card_games.execute_command_with_display(
                 &player,
@@ -753,7 +753,7 @@ impl ApplicationRuntime {
         let mut port = self.turtle_soup_command_port();
         // 海龟汤命令方只把玩家名用于渲染「开局者」与「好友结束」文案，
         // 内部键（已登记身份是 UUID）不能从这里进文案。
-        let player_display = self.mapped_actor_name(&parsed.username);
+        let player_display = self.mapped_actor_name(&parsed.username, parsed.account.as_ref());
         self.business.turtle_soup_application.execute_command(
             &parsed.raw,
             &player_display,
@@ -794,7 +794,7 @@ impl ApplicationRuntime {
                 .lifecycle
                 .live_configs
                 .identity
-                .friend_row_names_for_account(&account.game, &account.uid);
+                .search_names_for_account(&account.game, &account.uid);
             if !names.is_empty() {
                 log::info!(
                     "邀请流程：UID「{}」反查到 {} 个候选名，将依次尝试搜索好友",
@@ -873,7 +873,7 @@ impl ApplicationRuntime {
         };
         // 身份键（可能为 UUID）只用于比较/查找/记账；渲染与好友投递必须用展示名。
         let player = self.canonical_actor_name(&parsed.username);
-        let player_display = self.mapped_actor_name(&parsed.username);
+        let player_display = self.mapped_actor_name(&parsed.username, parsed.account.as_ref());
         self.business.undercover_game.execute_command_with_display(
             &player,
             &player_display,

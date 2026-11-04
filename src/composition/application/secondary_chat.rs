@@ -1198,11 +1198,12 @@ mod tests {
 
         let identity = IdentityAccess::new(IdentityConfig {
             mappings: vec![IdentityMapping {
-                nickname: "管理员".to_string(),
+                remark: "管理员".to_string(),
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Admin,
-                note: String::new(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: String::new(),
+                remark_from_chatbridge: false,
                 accounts: Vec::new(),
             }],
         });

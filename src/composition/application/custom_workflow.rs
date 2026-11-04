@@ -216,7 +216,17 @@ impl ApplicationRuntime {
                 .identity
                 .replace_display_names(message.message());
             let display_message = fit_chat_message(&display_message);
-            let search_names = message.search_names().to_vec();
+            // 特征层只知道「发给谁」（通常是软件显示名），而好友列表显示的是
+            // 备注串；这里把展示名换回屏幕名再搜。换不回来（未登记玩家）时
+            // 退回展示名本身，行为与以前一致。
+            let search_names = if message.search_names().is_empty() {
+                self.lifecycle
+                    .live_configs
+                    .identity
+                    .search_names_for_display_name(message.recipient())
+            } else {
+                message.search_names().to_vec()
+            };
             if let Some((recipient, items)) = grouped.last_mut()
                 && recipient == message.recipient()
             {

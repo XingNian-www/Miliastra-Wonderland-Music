@@ -583,7 +583,7 @@ input.config-invalid:focus,textarea.config-invalid:focus{border-color:var(--dang
  .topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.page-grid{grid-template-columns:1fr}.page-grid>.panel{grid-column:auto}.overview-layout{grid-template-columns:1fr}.turtle-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.tools-grid{grid-template-columns:1fr}.tools-grid>.panel{grid-column:auto}.config-layout{grid-template-columns:1fr}.config-sidebar{position:static;max-height:none}.config-num-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
  @media(max-width:720px){.app-nav{position:sticky;top:0;width:100%;height:auto;padding:var(--sp-2);border-right:0;border-bottom:1px solid var(--sep-1);overflow:hidden}.nav-brand{display:none}.nav-links{flex-direction:row;overflow-x:auto;scrollbar-width:thin}.nav-link{width:auto;flex:0 0 auto;white-space:nowrap}.nav-tools{margin-top:0}.shell{margin-left:0;padding:0 var(--sp-3) var(--sp-5)}.controls,.two,.three,.compact-form,.ocr-send,.ocr-options,.turtle-toolbar,.turtle-grid,.login-row,.login-session-grid,.login-facts,.login-qr{grid-template-columns:1fr}.login-row .controls{min-width:0}.login-qr img{width:min(180px,100%);justify-self:center}.turtle-stats{grid-template-columns:1fr 1fr}.undercover-toolbar{justify-content:stretch}.undercover-toolbar .btn{flex:1}.global-result{bottom:var(--sp-2)}.tools-grid{gap:var(--sp-4)}.playback-player-panel,.playback-request-panel{padding-left:var(--sp-2);padding-right:var(--sp-2)}.playback-player-panel .controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls{grid-template-columns:repeat(2,minmax(0,1fr))}.playback-request-panel>.panel-body>.controls .btn.primary{grid-column:auto}.candidate-item{grid-template-columns:1fr}.candidate-actions{justify-content:flex-start}}
 .identity-table-wrap{overflow-x:auto;border:1px solid var(--sep-2);border-radius:var(--radius-s)}
-.identity-table{width:100%;border-collapse:collapse;font-size:var(--fs-item);min-width:620px}
+.identity-table{width:100%;border-collapse:collapse;font-size:var(--fs-item);min-width:800px}
 .identity-table th,.identity-table td{padding:var(--sp-2);text-align:left;border-bottom:1px solid var(--sep-2);vertical-align:middle}
 .identity-table th{color:var(--text-2);font-size:var(--fs-meta);font-weight:600;white-space:nowrap}
 .identity-table tbody tr:last-child td{border-bottom:0}
@@ -3700,15 +3700,18 @@ function identityRenderTable(){
       +'<button type="button" class="btn small ghost" onclick="identityCopyUid('+i+')" title="复制 UUID">复制</button></td>'
     // 游戏 UID 可编辑、支持多个（逗号分隔）：一个身份可绑大小号，匹配时任一命中即算同一人。
     const gameUidCell='<td><input value="'+esc(accounts.map(a=>a&&a.uid?a.uid:'').filter(Boolean).join(','))+'" placeholder="可填多个，用 , 分隔" oninput="identityTableSetUids('+i+',this.value)"></td>'
-    // 昵称与显示昵称属于 OCR 路径，聊天 API 接管时不需要它们。
+    // 三个名字各司其职：备注串是屏幕名/匹配键，显示名只做软件内文案，
+    // 真实昵称由聊天桥自动写入、只读。**不要互相替代**。
+    const realNicknameCell='<td class="identity-real-nickname" title="由聊天桥自动写入，只读；仅用于展示与搜索兜底，不参与授权"><code>'+esc(mapping.real_nickname||'—')+'</code></td>'
     return '<tr>'+uidCell
       +gameUidCell
-      +'<td><input value="'+esc(mapping.nickname||'')+'" placeholder="OCR 模式匹配键（API 模式自动生成）" oninput="identityTableSet('+i+',\'nickname\',this.value)"></td>'
-      +'<td><input value="'+esc(mapping.note||'')+'" placeholder="仅 OCR 模式使用" oninput="identityTableSet('+i+',\'note\',this.value)"></td>'
+      +'<td><input value="'+esc(mapping.nickname||'')+'" placeholder="游戏内好友备注（屏幕名/OCR 匹配键；留空随机生成）" oninput="identityTableSet('+i+',\'nickname\',this.value)"></td>'
+      +'<td><input value="'+esc(mapping.note||'')+'" placeholder="软件内显示名（可空；文案用，不回退备注串）" oninput="identityTableSet('+i+',\'note\',this.value)"></td>'
+      +realNicknameCell
       +'<td><select onchange="identityTableSet('+i+',\'role\',this.value)">'+select+'</select></td>'
       +'<td><button type="button" class="btn small warn" onclick="identityTableRemove('+i+')">删除</button></td></tr>'
   }).join('')
-  wrap.innerHTML='<div class="identity-table-wrap"><table class="identity-table"><thead><tr><th>UUID<span class="identity-th-hint">只读标识</span></th><th>游戏 UID<span class="identity-th-hint">API 模式主键，可多个</span></th><th>游戏内昵称<span class="identity-th-hint">OCR 模式匹配用；API 模式自动随机生成</span></th><th>显示昵称<span class="identity-th-hint">仅 OCR 模式使用；API 模式可留空</span></th><th>角色</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="6" class="identity-empty">暂无映射</td></tr>')+'</tbody></table></div>'
+  wrap.innerHTML='<div class="identity-table-wrap"><table class="identity-table"><thead><tr><th>UUID<span class="identity-th-hint">只读标识</span></th><th>游戏 UID<span class="identity-th-hint">授权与归属的优先依据，可多个</span></th><th>游戏内备注<span class="identity-th-hint">屏幕显示名/OCR 匹配键；留空随机生成，聊天桥 remarks 会覆盖</span></th><th>显示名<span class="identity-th-hint">游戏回复、Web 与 API 文案；可留空，回退真实昵称再回退「玩家」</span></th><th>真实昵称<span class="identity-th-hint">聊天桥自动写入，只读；仅展示/搜索兜底</span></th><th>角色</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="7" class="identity-empty">暂无映射</td></tr>')+'</tbody></table></div>'
 }
 function identityRepairJsonApply(){
   const repair=$('identityRepairJson');if(!repair)return
@@ -3725,7 +3728,7 @@ function identityTableSet(index,field,value){
   const items=identityMappingsList();if(!items||!items[index]||typeof items[index]!=='object'||Array.isArray(items[index]))return
   const next=String(value??'')
   if(field==='nickname'&&items.some((item,i)=>i!==index&&item&&item.nickname===next.trim())){
-    showConfigMessage('昵称 '+next.trim()+' 已存在','err');identityRenderTable();return
+    showConfigMessage('备注串 '+next.trim()+' 已存在','err');identityRenderTable();return
   }
   items[index][field]=field==='nickname'?next.trim():next
   identityMappingsWrite(items)
@@ -3760,7 +3763,7 @@ function identityAddRow(){
   const note=String($('identityNewNote').value||'').trim()
   const role=$('identityNewRole').value||'friend'
   if(!nickname){nickname=randomRemarkNickname()}
-  if(items.some(m=>m&&m.nickname===nickname)){showConfigMessage('昵称 '+nickname+' 已存在','err');return}
+  if(items.some(m=>m&&m.nickname===nickname)){showConfigMessage('备注串 '+nickname+' 已存在','err');return}
   if(role==='owner'&&items.some(m=>m&&m.role==='owner')){showConfigMessage('主人只能有一位','err');return}
   items.push({nickname:nickname,id:identityRandomUuid(),role:role,note:note})
   identityMappingsWrite(items)
@@ -3778,9 +3781,9 @@ function identityMappingsEditor(path,value){
   const id=configControlId(path)
   const text=value==null?'[]':JSON.stringify(value,null,2)
   return '<textarea id="'+id+'" data-cfg="'+path+'" data-cfg-object="1" style="display:none" data-identity-editor="1">'+esc(text)+'</textarea>'
-    +'<div class="identity-add-row"><button type="button" class="btn small" onclick="identityCopyRandomNickname()">生成随机昵称</button>'
-    +'<input id="identityNewNickname" placeholder="游戏内昵称（留空自动随机）">'
-    +'<input id="identityNewNote" placeholder="显示昵称（可选）">'
+    +'<div class="identity-add-row"><button type="button" class="btn small" onclick="identityCopyRandomNickname()">生成随机备注</button>'
+    +'<input id="identityNewNickname" placeholder="游戏内好友备注（留空自动随机）">'
+    +'<input id="identityNewNote" placeholder="软件内显示名（可选，文案用）">'
     +'<select id="identityNewRole"><option value="friend">好友</option><option value="admin">管理员</option><option value="owner">主人</option></select>'
     +'<button type="button" class="btn small primary" onclick="identityAddRow()">添加</button></div>'
     +'<div id="'+id+'-table" style="margin-top:8px"></div>'

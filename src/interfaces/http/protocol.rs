@@ -990,7 +990,7 @@ pub(super) fn map_api_identity_json(value: &mut serde_json::Value, identity: &Id
 
     fn map_exact(value: &mut serde_json::Value, identity: &IdentityAccess) {
         if let serde_json::Value::String(text) = value {
-            *text = identity.display_name(text);
+            *text = identity.player_name(text, None);
         } else {
             visit(value, identity, None);
         }

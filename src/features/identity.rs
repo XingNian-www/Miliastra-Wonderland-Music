@@ -19,34 +19,58 @@ pub enum IdentityRole {
     Owner,
 }
 
-/// 一条映射：游戏内备注昵称 → 系统标识、角色与对外显示备注。
+/// 一条身份映射。
+///
+/// 五个值各司其职，**不要互相替代**（见 identity-name-display-and-permission.md）：
+///
+/// | 字段 | 是什么 | 用在哪 |
+/// | --- | --- | --- |
+/// | `id` | 系统维护的 UUID | 归属键（记忆/歌单/牌局） |
+/// | `remark` | **游戏内好友备注串** = 屏幕显示的名字 | OCR 精确匹配、好友列表搜索 |
+/// | `real_nickname` | 从 ChatBridge 拿到的玩家自设昵称 | 仅展示/搜索兜底 |
+/// | `display_name` | **软件里显示的昵称**（可空） | 玩家可见文案（「XXX 的歌单」「XXX 出牌」） |
+/// | `accounts` | 绑定的游戏 UID | 授权与归属的优先依据 |
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityMapping {
-    /// 游戏内好友备注昵称，与 OCR 结果精确匹配。
+    /// **备注串**：游戏内好友备注，也是屏幕显示的名字与 OCR 精确匹配键。
     ///
-    /// 可留空：好友私聊首次出现时会自动建一条只有 UUID 的映射，
-    /// 等用户把昵称与 UID 补上后即可精确定位。
-    #[serde(default)]
-    pub nickname: String,
+    /// 自动注册时随机生成，需要用户把它设成游戏内好友备注才会出现在屏幕上；
+    /// ChatBridge 的 `remarks` 补到时会覆盖它（`remark_from_chatbridge=true`）。
+    /// 可留空：好友私聊首次出现时可能只建了一条只有 UUID 的映射。
+    ///
+    /// **JSON 键名仍保留旧名 `nickname`**（`rename`）：配置库里的存量数据
+    /// 与 `validate_persisted_shape` 都按旧键校验，改键名会让旧库启动失败。
+    #[serde(default, rename = "nickname")]
+    pub remark: String,
     /// 系统维护的映射标识。
     pub id: Uuid,
     pub role: IdentityRole,
-    /// 面板展示用备注（记录这是谁）；旧数据缺失时视为空串。
-    #[serde(default)]
-    pub note: String,
-    /// 该身份的 nickname 是否来自 ChatBridge 的好友备注。
+    /// **软件中显示昵称**：玩家可见文案优先用它，**可以为空**。
     ///
-    /// 用来避免 `replace_display_names` 把真实姓名改写成别的：
-    /// 以前 nickname 是随机占位串，几乎不可能出现在出站文本里；
-    /// 现在是玩家的真实备注，出现在消息里就该原样保留。
+    /// 只用于展示（「XXX 的歌单」「XXX 出牌」），不参与授权、不参与 OCR 匹配、
+    /// 不用于搜索好友。空时回退 `real_nickname`，再空则用占位「玩家」。
+    /// JSON 键名保留旧名 `note`，理由同上。
+    #[serde(default, rename = "note")]
+    pub display_name: String,
+    /// **当前获取的真实昵称**：ChatBridge `/names.names` 的最近值，可以为空。
+    ///
+    /// 这是玩家自己随时能改的昵称，**只能做展示与搜索兜底**；
+    /// 一旦进入授权或 OCR 匹配键，就等于把"改名冒充"的漏洞放回来。
     #[serde(default)]
-    pub remark_sourced: bool,
+    pub real_nickname: String,
+    /// `remark` 是否来自 ChatBridge 的好友备注。
+    ///
+    /// 只表示来源，**不能**用它判断 remark 是不是随机串——手填的真名同样是 false。
+    /// 用于让 `replace_display_names` 跳过玩家真实备注。
+    /// JSON 键名保留旧名 `remark_sourced`，理由同上。
+    #[serde(default, rename = "remark_sourced")]
+    pub remark_from_chatbridge: bool,
     /// 该身份绑定的游戏账号。
     ///
     /// 用列表而不是单个可选值：一个玩家常有多个小号，它们该共用同一份
     /// 身份与歌单。UID 参与歌单归属键（优先级最高），因此这里填了就能
-    /// 跨改名稳定定位；留空则退化到昵称键。
+    /// 跨改名稳定定位；留空则退化到备注串键。
     #[serde(default)]
     pub accounts: Vec<GameAccount>,
 }
@@ -85,15 +109,18 @@ pub struct IdentityConfig {
 
 impl IdentityConfig {
     pub fn validate(&self) -> Result<()> {
-        let mut nicknames = std::collections::HashSet::new();
+        let mut remarks = std::collections::HashSet::new();
         let mut ids = std::collections::HashSet::new();
         let mut accounts = std::collections::HashSet::new();
         let mut owners = 0usize;
         for mapping in &self.mappings {
-            // 空昵称允许存在（自建身份还没绑定昵称），但只能有一条：
-            // 多条空昵称会让"按昵称查找"永远落空，也失去可读性。
-            if !mapping.nickname.trim().is_empty() && !nicknames.insert(mapping.nickname.as_str()) {
-                bail!("identity.mappings 昵称重复: {}", mapping.nickname);
+            // 空备注串允许存在（自建身份还没绑定备注），但只能有一条：
+            // 多条空备注串会让"按备注串查找"永远落空，也失去可读性。
+            //
+            // 只校验 remark：real_nickname 是玩家可改的昵称，允许重复；
+            // display_name 是软件内标签，也允许重复。
+            if !mapping.remark.trim().is_empty() && !remarks.insert(mapping.remark.as_str()) {
+                bail!("identity.mappings 备注串重复: {}", mapping.remark);
             }
             if !ids.insert(mapping.id) {
                 bail!("identity.mappings UUID 重复: {}", mapping.id);
@@ -101,8 +128,8 @@ impl IdentityConfig {
             for account in &mapping.accounts {
                 if account.uid.trim().is_empty() {
                     bail!(
-                        "identity.mappings 账号 UID 不能为空（昵称: {}）",
-                        mapping.nickname
+                        "identity.mappings 账号 UID 不能为空（备注串: {}）",
+                        mapping.remark
                     );
                 }
                 if !accounts.insert((
@@ -127,28 +154,38 @@ impl IdentityConfig {
     }
 }
 
-/// 解析结果：稳定 UUID、角色与用户备注。
+/// 玩家可见文案在三个来源都为空时的占位。
+///
+/// **绝不能用 UUID 前缀兜底**：那是内部键，出现在玩家可见文本里既难读也违反隐私约定。
+pub(crate) const PLAYER_NAME_PLACEHOLDER: &str = "玩家";
+
+/// 解析结果：稳定 UUID、角色与三个名字。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedIdentity {
     pub id: Uuid,
     pub role: IdentityRole,
-    pub nickname: String,
-    pub note: String,
-    /// 无备注无昵称时的兜底称呼（UUID 前 8 位），构造时算好，
-    /// 避免 display_name 返回借用局部变量的引用。
-    pub fallback_name: String,
+    /// 备注串（屏幕显示名 / OCR 匹配键）。
+    pub remark: String,
+    /// 软件中显示昵称（可空）。
+    pub display_name: String,
+    /// 当前获取的真实昵称（可空）。
+    pub real_nickname: String,
 }
 
 impl ResolvedIdentity {
-    pub fn display_name(&self) -> &str {
-        let note = self.note.trim();
-        if !note.is_empty() {
-            return note;
+    /// **玩家可见文案的展示名**：软件中显示昵称 → 真实昵称 → 占位「玩家」。
+    ///
+    /// 不包含备注串：它是玩家特意设的随机串（防被认出），打到玩家面前既无意义又难看。
+    pub fn player_name(&self) -> &str {
+        let display = self.display_name.trim();
+        if !display.is_empty() {
+            return display;
         }
-        // 不回退到 `nickname`：它是 OCR 匹配键，一旦出现在日志/回复/面板里
-        // 就等于把"能被冒充的名字"泄露出去了。没有备注时用 UUID 前缀，
-        // 它不可用于匹配，展示上也足够区分。
-        &self.fallback_name
+        let real = self.real_nickname.trim();
+        if !real.is_empty() {
+            return real;
+        }
+        PLAYER_NAME_PLACEHOLDER
     }
 }
 
@@ -236,11 +273,12 @@ impl IdentityAccess {
         match existing {
             Some(mapping) => mapping.role = role,
             None => config.mappings.push(IdentityMapping {
-                nickname: nickname.to_string(),
+                remark: nickname.to_string(),
                 id: Uuid::new_v4(),
                 role,
-                note: "模拟命令（调试）".to_string(),
-                remark_sourced: false,
+                display_name: "模拟命令（调试）".to_string(),
+                real_nickname: String::new(),
+                remark_from_chatbridge: false,
                 accounts: vec![GameAccount {
                     game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
                     uid,
@@ -272,13 +310,13 @@ impl IdentityAccess {
         config
             .mappings
             .iter()
-            .find(|mapping| mapping.nickname == nickname)
+            .find(|mapping| mapping.remark == nickname)
             .map(|mapping| ResolvedIdentity {
                 id: mapping.id,
                 role: mapping.role,
-                nickname: mapping.nickname.clone(),
-                note: mapping.note.clone(),
-                fallback_name: short_uuid(mapping.id),
+                remark: mapping.remark.clone(),
+                display_name: mapping.display_name.clone(),
+                real_nickname: mapping.real_nickname.clone(),
             })
     }
 
@@ -334,9 +372,9 @@ impl IdentityAccess {
                 .then(|| ResolvedIdentity {
                     id: mapping.id,
                     role: mapping.role,
-                    nickname: mapping.nickname.clone(),
-                    note: mapping.note.clone(),
-                    fallback_name: short_uuid(mapping.id),
+                    remark: mapping.remark.clone(),
+                    display_name: mapping.display_name.clone(),
+                    real_nickname: mapping.real_nickname.clone(),
                 })
         })
     }
@@ -404,15 +442,18 @@ impl IdentityAccess {
             return Some(existing.id);
         }
         let id = Uuid::new_v4();
-        // 游戏内昵称（OCR 匹配用）随机生成：API 模式拿不到可靠的 OCR 昵称，
-        // 留空会让"按昵称查找"永远落空；随机名保证唯一且不与他人冲突。
-        // 聊天 API 给的昵称写进 note（展示用），不污染 OCR 匹配键。
+        // 备注串（OCR 匹配用）随机生成：API 模式拿不到游戏内备注，留空会让
+        // "按备注串查找"永远落空；随机串保证唯一且不与他人冲突。
+        //
+        // **这个随机串需要用户去游戏里设成好友备注**，否则它不会出现在屏幕上，
+        // OCR 也就永远匹配不到（只有 ChatBridge 的 UID 路径能用）。
+        // 聊天 API 给的昵称写进 real_nickname（展示/搜索兜底），不污染匹配键。
         let mut rng_nickname = random_nickname();
         let mut attempts = 0;
         while config
             .mappings
             .iter()
-            .any(|mapping| mapping.nickname == rng_nickname)
+            .any(|mapping| mapping.remark == rng_nickname)
         {
             attempts += 1;
             if attempts > 64 {
@@ -423,35 +464,37 @@ impl IdentityAccess {
             rng_nickname = random_nickname();
         }
         config.mappings.push(IdentityMapping {
-            nickname: rng_nickname,
+            remark: rng_nickname,
             id,
             role: IdentityRole::Friend,
-            // note 是**面板展示用**的备注，与 OCR 匹配键（上面的随机昵称）
-            // 是两回事：随机串只用于屏幕识别，绝不能拿去展示。
-            //
-            // 这里的昵称是兜底：ChatBridge 还没给出 remarks 时先用它，
-            // 一旦补查到真备注，set_account_note 会覆盖（备注优先）。
-            note: nickname
+            // 软件中显示昵称留空：等用户填一个自己认得出的名字；
+            // 空时展示回退到 real_nickname，不会外泄内部键。
+            display_name: String::new(),
+            // 聊天 API 给的玩家自设昵称：只做展示与搜索兜底。
+            real_nickname: nickname
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .unwrap_or_default()
                 .to_string(),
-            remark_sourced: false,
+            remark_from_chatbridge: false,
             accounts: vec![GameAccount {
                 game: game.to_string(),
                 uid: uid.to_string(),
             }],
         });
-        log::info!("已为 UID {uid} 自动创建身份（好友权限），昵称待补；可在面板补充备注与更高权限");
+        // 不打印 UID：它是真实玩家数据（MUST_READ §9）。
+        log::info!(
+            "已为一位好友自动创建身份（好友权限）；请把面板里该身份的备注串设为游戏内好友备注，OCR 才能识别，否则只有聊天桥可用"
+        );
         Some(id)
     }
 
-    /// 补查到资料包昵称后回填展示备注。
+    /// 记录 ChatBridge 补查到的**真实昵称**。
     ///
-    /// **只填空备注，绝不覆盖用户手写的 note**：note 是面板展示用标签，
-    /// 用户可能已经手填了更有意义的名字。这里只是防止自动注册的身份
-    /// 一直显示成 UUID 前缀。
-    pub fn backfill_account_note(&self, game: &str, uid: &str, nickname: &str) -> bool {
+    /// 写进 `real_nickname`（玩家自设昵称），**不动 `display_name`**：
+    /// 后者是用户在面板里填的软件显示名，不该被自动值覆盖。
+    /// 玩家随时能改昵称，所以这里每次都更新为最新值。
+    pub fn record_real_nickname(&self, game: &str, uid: &str, nickname: &str) -> bool {
         let nickname = nickname.trim();
         let uid = uid.trim();
         if nickname.is_empty() || uid.is_empty() {
@@ -466,22 +509,20 @@ impl IdentityAccess {
         }) else {
             return false;
         };
-        if !mapping.note.trim().is_empty() {
+        if mapping.real_nickname == nickname {
             return false;
         }
-        mapping.note = nickname.to_string();
+        mapping.real_nickname = nickname.to_string();
         true
     }
 
-    /// 用 ChatBridge 的备注覆盖昵称（OCR 匹配键）。
+    /// 用 ChatBridge 的备注覆盖**备注串**（OCR 匹配键）。
     ///
-    /// `nickname` 是**游戏内好友备注**，也是 OCR 精确匹配的唯一依据。
-    /// 自动注册时因为拿不到它只能随机生成 6 位占位串，那样 OCR 永远匹配不上。
-    /// ChatBridge 的 `remarks` 就是玩家在游戏里设的那个备注，所以它才是
-    /// 这个字段的正主：有就用，没有则不动。
+    /// `remarks` 是玩家在游戏里设的好友备注，也正是屏幕显示的名字，
+    /// 所以它才是 `remark` 的正主：有就用，没有则不动。
     ///
-    /// 唯一性由这里保证——昵称重复会让 `validate` 直接拒绝整份配置，
-    /// 所以撞名时放弃写入并返回 false，交给调用方保留占位串。
+    /// 唯一性由这里保证——备注串重复会让 `validate` 直接拒绝整份配置，
+    /// 所以撞名时放弃写入并返回 false，交给调用方保留原值。
     pub fn set_account_remark(&self, game: &str, uid: &str, remark: &str) -> bool {
         let remark = remark.trim();
         let uid = uid.trim();
@@ -491,16 +532,15 @@ impl IdentityAccess {
         let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         // 昵称必须全局唯一：已被**别人**占用就不写，避免把配置搞成非法。
         let taken_by_other = config.mappings.iter().any(|mapping| {
-            mapping.nickname.trim() == remark
+            mapping.remark.trim() == remark
                 && !mapping.accounts.iter().any(|account| {
                     account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid
                 })
         });
         if taken_by_other {
             log::warn!(
-                "外部聊天源给出的备注「{}」与已登记昵称重复，UID{} 仍保留原匹配键，不覆盖",
-                remark,
-                uid
+                "外部聊天源给出的备注「{}」与已登记的备注串重复，该好友仍保留原匹配键，不覆盖",
+                remark
             );
             return false;
         }
@@ -512,14 +552,14 @@ impl IdentityAccess {
         }) else {
             return false;
         };
-        if mapping.nickname == remark {
+        if mapping.remark == remark {
             return false;
         }
-        mapping.nickname = remark.to_string();
-        mapping.remark_sourced = true;
-        // **不写 note**：用户明确要求「remarks 只能覆盖 nickname」。
-        // note 是面板展示标签，与 OCR 匹配键绑死会让两者悄悄分叉
-        // （以后备注改名，note 仍停在旧值）。
+        mapping.remark = remark.to_string();
+        mapping.remark_from_chatbridge = true;
+        // **不写 display_name**：用户明确要求「remarks 只能覆盖备注串」。
+        // display_name 是软件内展示标签，与匹配键绑死会让两者悄悄分叉
+        // （以后备注改名，展示名仍停在旧值）。
         true
     }
 
@@ -533,29 +573,34 @@ impl IdentityAccess {
             .len()
     }
 
-    pub fn display_name(&self, nickname: &str) -> String {
-        self.resolve(nickname)
-            .map(|identity| identity.display_name().to_owned())
-            .unwrap_or_else(|| nickname.to_owned())
+    /// **玩家可见文案的展示名**：软件中显示昵称 → 真实昵称 → 占位「玩家」。
+    ///
+    /// 有账号时先按 UID 解析：外部聊天源的 `from.name` 是资料包昵称，
+    /// 与屏幕名无关，只按名字查会落空。
+    /// 解析不到身份时退回传入的名字（OCR 文本 / `from.name`）。
+    pub fn player_name(&self, name: &str, account: Option<(&str, &str)>) -> String {
+        let identity = account
+            .and_then(|(game, uid)| self.resolve_account(game, uid))
+            .or_else(|| self.resolve(name))
+            .or_else(|| self.resolve_by_display_name(name));
+        match identity {
+            Some(identity) => identity.player_name().to_owned(),
+            None => name.to_owned(),
+        }
     }
 
-    /// 好友列表里可以拿来定位这个账号的候选名，按优先级排列。
+    /// 名字对应的玩家可见展示名（面板、日志、BOT 称呼用它）。
+    pub fn player_name_for_name(&self, name: &str) -> String {
+        self.player_name(name, None)
+    }
+
+    /// 好友搜索名：**备注串 → 真实昵称**，去重后返回。
     ///
-    /// 为什么是**多个**：外部聊天源的发起人只有 UID，没有可信昵称。
-    /// ensure_identity_for_account 自动建的身份把 API 昵称写进 note、
-    /// 把随机 6 位串写进 nickname（那是 OCR 匹配键，不是真名）；
-    /// 手工维护的映射则反过来，真名在 nickname、备注在 note。
-    /// 两种来源都得试，否则必有一半玩家的邀请找不到人。
-    ///
-    /// 顺序：note（显示昵称，玩家认得出的名字）优先，
-    /// nickname（游戏内随机串或 OCR 匹配键）次之。
-    /// 空串与重复项已剔除；一个都没有时返回空表，调用方据此在进 UI 前失败。
-    pub fn friend_row_names_for_account(&self, game: &str, uid: &str) -> Vec<String> {
-        let Some(identity) = self.resolve_account(game, uid) else {
-            return Vec::new();
-        };
+    /// 屏幕显示的是备注串（无备注时是玩家自设昵称），所以只试这两个名字；
+    /// 软件显示名与 UUID 都不该拿去搜好友列表。
+    fn search_names_of(identity: &ResolvedIdentity) -> Vec<String> {
         let mut names = Vec::with_capacity(2);
-        for candidate in [identity.note.trim(), identity.nickname.trim()] {
+        for candidate in [identity.remark.trim(), identity.real_nickname.trim()] {
             if candidate.is_empty() || names.iter().any(|existing| existing == candidate) {
                 continue;
             }
@@ -563,113 +608,144 @@ impl IdentityAccess {
         }
         names
     }
-    /// 记忆归属键：**UUID 优先，未登记才退回显示昵称**。
+
+    /// 按账号反查好友搜索名：**备注串 → 真实昵称**。
     ///
-    /// UUID 是唯一身份码，跨改名、跨显示名变化都稳定。用它当键，
-    /// 玩家怎么改游戏内昵称，记忆都不会分裂。
-    ///
-    /// 外部聊天源给的昵称是玩家当前的游戏内显示名（随时能改），
-    /// 它既可能对上 `nickname`（OCR 匹配键），也可能对上 `note`（显示昵称）；
-    /// 原来只按 `nickname` 查、查不到就原样返回，线上表现为
-    /// 记忆存在「甲」下而面板显示「乙」，同一个人的记忆分成两份。
-    ///
-    /// 未登记的玩家没有 UUID，只能继续用显示昵称当键——这类人本来也无法
-    /// 跨改名识别，分成两份是既有局限，不是新问题。
-    pub fn memory_key(&self, nickname: &str) -> String {
-        self.resolve(nickname)
-            .or_else(|| self.resolve_by_note(nickname))
-            .map(|identity| identity.id.to_string())
-            .unwrap_or_else(|| self.display_name_for(nickname))
+    /// 为什么是**多个**：屏幕显示备注串，没有备注时显示玩家自设昵称；
+    /// 两种来源都得试，否则必有一半玩家的邀请/私聊找不到人。
+    /// 空串与重复项已剔除；一个都没有时返回空表，调用方据此在进 UI 前失败。
+    pub fn search_names_for_account(&self, game: &str, uid: &str) -> Vec<String> {
+        self.resolve_account(game, uid)
+            .map(|identity| Self::search_names_of(&identity))
+            .unwrap_or_default()
     }
 
-    /// **归属专用**：按 nickname 或 note 解析出身份 UUID。
+    /// 按「已知的显示名」反查好友搜索名：**备注串 → 真实昵称**。
     ///
-    /// 这是给「歌单归属、记忆、队列」这类**归属**用途准备的入口。
+    /// 投递层只知道展示名（特征层传出来的是软件显示名），要换回屏幕上的名字
+    /// 才能搜好友列表。三个名字（备注串 / 软件显示名 / 真实昵称）任一命中即可。
+    pub fn search_names_for_display_name(&self, name: &str) -> Vec<String> {
+        self.resolve(name)
+            .or_else(|| self.resolve_by_display_name(name))
+            .or_else(|| self.resolve_by_real_nickname(name))
+            .map(|identity| Self::search_names_of(&identity))
+            .unwrap_or_default()
+    }
+
+    /// 搜索链：**备注串 → 真实昵称 → 传入的名字**（只用于搜好友列表）。
     ///
-    /// # 为什么单独开一个方法，而不是让 `resolve_hint` 支持 note 兜底
+    /// `account` 是外部聊天源带来的真实账号：消息里的 `from.name` 是**资料包昵称**，
+    /// 与屏幕名无关，只按名字查会落空，必须先用 UID 解析出身份。
+    pub fn search_name(&self, name: &str, account: Option<(&str, &str)>) -> String {
+        let identity = account
+            .and_then(|(game, uid)| self.resolve_account(game, uid))
+            .or_else(|| self.resolve(name))
+            .or_else(|| self.resolve_by_display_name(name));
+        let Some(identity) = identity else {
+            return name.to_owned();
+        };
+        Self::search_names_of(&identity)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// 记忆归属键：**UUID 优先，未登记才退回展示名**。
+    ///
+    /// UUID 是唯一身份码，跨改名、跨显示名变化都稳定。
+    /// 外部源给的昵称依次按「备注串 → 真实昵称 → 软件显示名」试：
+    /// ChatBridge 的 `from.name` 是真实昵称，OCR 文本是备注串，面板回传的是显示名。
+    /// 未登记的玩家没有 UUID，只能用展示名当键（既有局限）。
+    pub fn memory_key(&self, name: &str) -> String {
+        self.resolve(name)
+            .or_else(|| self.resolve_by_real_nickname(name))
+            .or_else(|| self.resolve_by_display_name(name))
+            .map(|identity| identity.id.to_string())
+            .unwrap_or_else(|| self.player_name_for_name(name))
+    }
+
+    /// **归属专用**：按「备注串 → 真实昵称 → 软件显示名」解析出身份 UUID。
+    ///
+    /// 给「歌单归属、记忆、队列」这类**归属**用途准备；**绝不用于授权**。
+    /// 所以这里**只返回 UUID，不返回 role**：拿不到角色就不可能被误用成授权判据。
+    ///
+    /// # 为什么不让 `resolve_hint` 支持 display_name 兜底
     ///
     /// `resolve_hint` 是**授权**路径（`router.rs` 的 `role_for_envelope`、
-    /// `listener` 的 `role_of_sender` 都走它）。note 是游戏真名，任何人都能把
-    /// 自己的昵称改成一样来冒充；一旦让 `resolve_hint` 回退查 note，
+    /// `listener` 的 `role_of_sender` 都走它）。软件显示名是手填/自动值，
+    /// 任何人都能把自己的昵称改成一样来冒充；一旦让 `resolve_hint` 回退，
     /// 「改名冒充管理员」的漏洞就回来了——`moderation` 的防冒充测试会立刻变红。
-    ///
-    /// 所以这里**只返回 UUID，不返回 role**：归属用途不需要角色，
-    /// 拿不到角色也就不可能被误用成授权判据。
     pub fn ownership_uuid_by_name(&self, name: &str) -> Option<Uuid> {
-        // 先按 nickname（OCR 匹配键，不可被对方随意改）再按 note（游戏真名）。
-        // 顺序不能反：note 可被冒充，优先级必须低于 nickname。
+        // 顺序：备注串（对方改不了）→ 真实昵称（外部源的 from.name）→
+        // 软件显示名（面板里手填的标签，只做最后的兜底）。
         self.resolve(name)
-            .or_else(|| self.resolve_by_note(name))
+            .or_else(|| self.resolve_by_real_nickname(name))
+            .or_else(|| self.resolve_by_display_name(name))
             .map(|identity| identity.id)
     }
 
     /// 记忆键对应的展示名（BOT 称呼、面板、日志都用它）。
     ///
-    /// UUID 键本身不可读，展示时必须换回显示昵称。
-    pub fn memory_display_name(&self, nickname: &str) -> String {
-        self.resolve(nickname)
-            .or_else(|| self.resolve_by_note(nickname))
-            .map(|identity| {
-                let note = identity.note.trim();
-                if note.is_empty() {
-                    identity.nickname
-                } else {
-                    note.to_owned()
-                }
-            })
-            .unwrap_or_else(|| nickname.to_owned())
+    /// UUID 键本身不可读，展示时必须换回玩家看得懂的名字。
+    pub fn memory_display_name(&self, name: &str) -> String {
+        self.player_name_for_name(name)
     }
 
     /// 由记忆键反查展示名：键是 UUID 时找对应身份，否则原样返回。
-    pub fn display_name_for_key(&self, key: &str) -> String {
+    pub fn player_name_for_key(&self, key: &str) -> String {
         if let Ok(uuid) = Uuid::parse_str(key) {
             let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
             if let Some(mapping) = config.mappings.iter().find(|mapping| mapping.id == uuid) {
-                let note = mapping.note.trim();
-                return if note.is_empty() {
-                    mapping.nickname.clone()
-                } else {
-                    note.to_owned()
-                };
+                return ResolvedIdentity {
+                    id: mapping.id,
+                    role: mapping.role,
+                    remark: mapping.remark.clone(),
+                    display_name: mapping.display_name.clone(),
+                    real_nickname: mapping.real_nickname.clone(),
+                }
+                .player_name()
+                .to_owned();
             }
         }
         key.to_owned()
     }
 
-    fn display_name_for(&self, nickname: &str) -> String {
-        self.resolve(nickname)
-            .or_else(|| self.resolve_by_note(nickname))
-            .map(|identity| {
-                let note = identity.note.trim();
-                if note.is_empty() {
-                    identity.nickname
-                } else {
-                    note.to_owned()
-                }
-            })
-            .unwrap_or_else(|| nickname.to_owned())
-    }
-
-    /// 按显示昵称（note）反查身份。
-    ///
-    /// 外部聊天源的昵称是玩家可随时改的游戏内显示名，命中 note 比命中
-    /// 随机串形式的 nickname 更常见。空 note 永不匹配。
-    fn resolve_by_note(&self, note: &str) -> Option<ResolvedIdentity> {
-        if note.trim().is_empty() {
+    /// 按**软件显示名**反查身份（归属用途；不参与授权）。
+    fn resolve_by_display_name(&self, name: &str) -> Option<ResolvedIdentity> {
+        if name.trim().is_empty() {
             return None;
         }
         let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         config
             .mappings
             .iter()
-            .find(|mapping| mapping.note.trim() == note.trim())
-            .map(|mapping| ResolvedIdentity {
-                id: mapping.id,
-                role: mapping.role,
-                nickname: mapping.nickname.clone(),
-                note: mapping.note.clone(),
-                fallback_name: short_uuid(mapping.id),
-            })
+            .find(|mapping| mapping.display_name.trim() == name.trim())
+            .map(Self::resolved_from_mapping)
+    }
+
+    /// 按**真实昵称**反查身份。
+    ///
+    /// 只用于投递层把展示名换回屏幕名；真实昵称可被玩家随意改，**不参与授权**。
+    fn resolve_by_real_nickname(&self, name: &str) -> Option<ResolvedIdentity> {
+        if name.trim().is_empty() {
+            return None;
+        }
+        let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        config
+            .mappings
+            .iter()
+            .find(|mapping| mapping.real_nickname.trim() == name.trim())
+            .map(Self::resolved_from_mapping)
+    }
+
+    fn resolved_from_mapping(mapping: &IdentityMapping) -> ResolvedIdentity {
+        ResolvedIdentity {
+            id: mapping.id,
+            role: mapping.role,
+            remark: mapping.remark.clone(),
+            display_name: mapping.display_name.clone(),
+            real_nickname: mapping.real_nickname.clone(),
+        }
     }
 
     /// 在聊天发送前替换文本中的 OCR 身份昵称，避免把映射字符串原样发回大厅。
@@ -681,15 +757,14 @@ impl IdentityAccess {
             .mappings
             .iter()
             .filter_map(|mapping| {
-                // nickname 来自 ChatBridge 备注时不要改写：那是玩家的真实名字，
-                // 出站文本里出现它就该原样保留。以前 nickname 是随机占位串，
-                // 几乎不可能命中，所以这条改写一直无害；现在会误伤。
-                if mapping.remark_sourced {
+                // 备注串来自 ChatBridge 时不要改写：那是屏幕上真实显示的名字，
+                // 出站文本里出现它就该原样保留。
+                if mapping.remark_from_chatbridge {
                     return None;
                 }
-                let display_name = mapping.note.trim();
-                (!mapping.nickname.is_empty() && !display_name.is_empty())
-                    .then(|| (mapping.nickname.clone(), display_name.to_owned()))
+                let display_name = mapping.display_name.trim();
+                (!mapping.remark.is_empty() && !display_name.is_empty())
+                    .then(|| (mapping.remark.clone(), display_name.to_owned()))
             })
             .collect::<Vec<_>>();
         mappings.sort_by_key(|mapping| std::cmp::Reverse(mapping.0.len()));
@@ -763,20 +838,21 @@ impl IdentityAccess {
 mod tests {
     use super::*;
 
-    fn mapping(nickname: &str, id: Uuid, role: IdentityRole) -> IdentityMapping {
+    fn mapping(remark: &str, id: Uuid, role: IdentityRole) -> IdentityMapping {
         IdentityMapping {
-            nickname: nickname.to_owned(),
+            remark: remark.to_owned(),
             id,
             role,
-            note: String::new(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: String::new(),
+            remark_from_chatbridge: false,
             accounts: Vec::new(),
         }
     }
 
     fn sample_config() -> IdentityConfig {
         let mut owner = mapping("派蒙本蒙", Uuid::from_u128(1), IdentityRole::Owner);
-        owner.note = "主人备注".to_string();
+        owner.display_name = "主人备注".to_string();
         IdentityConfig {
             mappings: vec![
                 owner,
@@ -803,11 +879,12 @@ mod tests {
         let identity = IdentityAccess::new(IdentityConfig {
             mappings: vec![IdentityMapping {
                 // 手工维护：真名在 nickname，备注在 note
-                nickname: "玩家丙".to_string(),
+                remark: "玩家丙".to_string(),
                 id: uuid::Uuid::new_v4(),
                 role: IdentityRole::Friend,
-                note: "厅主".to_string(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: "厅主".to_string(),
+                remark_from_chatbridge: false,
                 accounts: vec![GameAccount {
                     game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
                     uid: "900000001".to_string(),
@@ -816,16 +893,12 @@ mod tests {
         });
 
         let names = identity
-            .friend_row_names_for_account(miliastra_kernel::chat_source::GAME_GENSHIN, "900000001");
-        assert!(
-            names.contains(&"玩家丙".to_string()),
-            "必须包含游戏内昵称，实际 {names:?}"
-        );
-        assert!(
-            names.contains(&"厅主".to_string()),
-            "必须包含备注名，实际 {names:?}"
-        );
-        assert!(!names.iter().any(|name| name == "900000001"));
+            .search_names_for_account(miliastra_kernel::chat_source::GAME_GENSHIN, "900000001");
+        // 好友列表显示的是备注串，所以搜索名必须有它。
+        assert_eq!(names, vec!["玩家丙".to_string()], "搜索名应只含备注串");
+        // 软件显示名只做文案，**不能**拿去搜好友列表。
+        assert!(!names.iter().any(|name| name == "厅主"), "显示名不参与搜索");
+        assert!(!names.iter().any(|name| name == "900000001"), "UID 不参与搜索");
     }
 
     /// 未登记的 UID 拿不到任何候选名：调用方应回退到信封主语并在进 UI 前告警。
@@ -834,7 +907,7 @@ mod tests {
         let identity = crate::features::identity::IdentityAccess::new(Default::default());
         assert!(
             identity
-                .friend_row_names_for_account(
+                .search_names_for_account(
                     miliastra_kernel::chat_source::GAME_GENSHIN,
                     "999999999",
                 )
@@ -847,13 +920,16 @@ mod tests {
         let owner = access.resolve("派蒙本蒙").expect("主人应被解析");
         assert_eq!(owner.id, Uuid::from_u128(1));
         assert_eq!(owner.role, IdentityRole::Owner);
-        assert_eq!(owner.display_name(), "主人备注");
-        // 没有备注的映射用 UUID 前缀展示，**不**回退到游戏内昵称：
-        // 昵称是 OCR 匹配键，出现在展示位上就等于泄露了可冒充的名字。
-        assert_eq!(access.display_name("管理小助手"), "00000000");
-        assert_eq!(access.display_name("主人备注"), "主人备注");
+        assert_eq!(owner.player_name(), "主人备注");
+        // 没有软件显示名、也没有真实昵称时用固定占位：
+        // **不**回退到备注串（随机串对玩家无意义），更不回退到 UUID。
+        assert_eq!(
+            access.player_name("管理小助手", None),
+            PLAYER_NAME_PLACEHOLDER
+        );
+        assert_eq!(access.player_name("主人备注", None), "主人备注");
         assert_eq!(access.role_of("主人备注"), None);
-        assert_eq!(access.display_name("陌生人"), "陌生人");
+        assert_eq!(access.player_name("陌生人", None), "陌生人");
         assert!(access.resolve("派蒙本蒙 ").is_none(), "尾部空白不模糊匹配");
         assert!(access.resolve("陌生人").is_none(), "未知昵称不映射");
     }
@@ -862,11 +938,12 @@ mod tests {
     fn replace_display_names_maps_longest_names_and_preserves_unknown_text() {
         let mut config = sample_config();
         config.mappings.push(IdentityMapping {
-            nickname: "好友".to_string(),
+            remark: "好友".to_string(),
             id: Uuid::from_u128(4),
             role: IdentityRole::Friend,
-            note: "短备注".to_string(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: "短备注".to_string(),
+            remark_from_chatbridge: false,
             accounts: Vec::new(),
         });
         let access = IdentityAccess::new(config);
@@ -929,11 +1006,23 @@ mod tests {
             "UUID 全局唯一，重复须拒绝"
         );
 
-        let without_note: IdentityMapping = serde_json::from_str(
+        // 旧配置（键名 nickname / note / remark_sourced）必须能读进新字段：
+        // 面板与数据库里都是旧键，改字段名不能把配置读挂。
+        let legacy: IdentityMapping = serde_json::from_str(
+            r#"{"nickname":"甲","note":"显示名甲","remark_sourced":true,"id":"00000000-0000-0000-0000-000000000001","role":"friend"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.remark, "甲", "旧 nickname 读进 remark");
+        assert_eq!(legacy.display_name, "显示名甲", "旧 note 读进 display_name");
+        assert!(legacy.remark_from_chatbridge, "旧 remark_sourced 读进新标记");
+        assert!(legacy.real_nickname.is_empty(), "旧配置没有真实昵称");
+
+        let without_display: IdentityMapping = serde_json::from_str(
             r#"{"nickname":"甲","id":"00000000-0000-0000-0000-000000000001","role":"friend"}"#,
         )
         .unwrap();
-        assert!(without_note.note.is_empty(), "缺 note 一律按空串处理");
+        assert!(without_display.display_name.is_empty(), "缺 display_name 按空串处理");
+        assert!(without_display.real_nickname.is_empty(), "缺 real_nickname 按空串处理");
 
         let invalid_id = serde_json::from_str::<IdentityMapping>(
             r#"{"nickname":"甲","id":"invalid","role":"friend"}"#,
@@ -984,18 +1073,19 @@ mod tests {
         let mut config = IdentityConfig::default();
         let id = Uuid::new_v4();
         config.mappings.push(IdentityMapping {
-            nickname: "nick_alpha".to_string(),
+            remark: "nick_alpha".to_string(),
             id,
             role: IdentityRole::Friend,
-            note: "显示名甲".to_string(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: "显示名甲".to_string(),
+            remark_from_chatbridge: false,
             accounts: vec![GameAccount::new("10001")],
         });
         let access = IdentityAccess::new(config);
         let key = id.to_string();
 
         // 正向：键 → 显示名。
-        assert_eq!(access.display_name_for_key(&key), "显示名甲");
+        assert_eq!(access.player_name_for_key(&key), "显示名甲");
         // 反向：显示名 → 键。
         assert_eq!(access.memory_key("显示名甲"), key);
         // 幂等：UUID 本身再过一遍仍是 UUID（面板回传 key 时走这条）。
@@ -1048,11 +1138,12 @@ mod tests {
         let mut config = IdentityConfig::default();
         let id = Uuid::new_v4();
         config.mappings.push(IdentityMapping {
-            nickname: "nick_alpha".to_string(),
+            remark: "nick_alpha".to_string(),
             id,
             role: IdentityRole::Admin,
-            note: "显示名甲".to_string(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: "显示名甲".to_string(),
+            remark_from_chatbridge: false,
             accounts: vec![GameAccount::new("10001")],
         });
         let access = IdentityAccess::new(config);
@@ -1064,7 +1155,7 @@ mod tests {
         assert_eq!(access.memory_display_name("nick_alpha"), "显示名甲");
         assert_eq!(access.memory_display_name("显示名甲"), "显示名甲");
         // 由 UUID 键反查展示名。
-        assert_eq!(access.display_name_for_key(&id.to_string()), "显示名甲");
+        assert_eq!(access.player_name_for_key(&id.to_string()), "显示名甲");
         // 未登记的玩家：键退回显示昵称本身。
         assert_eq!(access.memory_key("陌生人"), "陌生人");
     }
@@ -1081,11 +1172,12 @@ mod tests {
         let mut config = IdentityConfig::default();
         let id = Uuid::new_v4();
         config.mappings.push(IdentityMapping {
-            nickname: "abcd1234".to_string(),
+            remark: "abcd1234".to_string(),
             id,
             role: IdentityRole::Admin,
-            note: "显示名甲".to_string(),
-            remark_sourced: true,
+            real_nickname: String::new(),
+            display_name: "显示名甲".to_string(),
+            remark_from_chatbridge: true,
             accounts: vec![GameAccount::new("10001")],
         });
         let access = IdentityAccess::new(config);
@@ -1109,11 +1201,12 @@ mod tests {
         let mut config = IdentityConfig::default();
         let id = Uuid::new_v4();
         config.mappings.push(IdentityMapping {
-            nickname: "abcd1234".to_string(),
+            remark: "abcd1234".to_string(),
             id,
             role: IdentityRole::Admin,
-            note: "显示名甲".to_string(),
-            remark_sourced: true,
+            real_nickname: String::new(),
+            display_name: "显示名甲".to_string(),
+            remark_from_chatbridge: true,
             accounts: vec![GameAccount::new("10001")],
         });
         let access = IdentityAccess::new(config);
@@ -1149,32 +1242,66 @@ mod tests {
     }
     /// 好友列表候选名以显示昵称为先。
     #[test]
-    fn friend_row_names_put_the_note_first() {
+    fn search_names_use_the_remark_then_the_real_nickname() {
         let mut config = IdentityConfig::default();
         config.mappings.push(IdentityMapping {
-            nickname: "nick_beta".to_string(),
+            remark: "nick_beta".to_string(),
             id: Uuid::new_v4(),
             role: IdentityRole::Friend,
-            note: "显示名乙".to_string(),
-            remark_sourced: false,
+            real_nickname: "真名乙".to_string(),
+            display_name: "显示名乙".to_string(),
+            remark_from_chatbridge: false,
             accounts: vec![GameAccount::new("10002")],
         });
         let access = IdentityAccess::new(config);
+        // 备注串优先（屏幕显示的就是它），真实昵称兜底；显示名不进搜索。
         assert_eq!(
-            access.friend_row_names_for_account("genshin", "10002"),
-            vec!["显示名乙".to_string(), "nick_beta".to_string()]
+            access.search_names_for_account("genshin", "10002"),
+            vec!["nick_beta".to_string(), "真名乙".to_string()]
         );
+    }
+
+
+    /// 屏幕名回退链：**备注(nickname) → note → 原始名字**。
+    ///
+    /// 依据 identity-name-display-and-permission.md：屏幕显示的是 nickname（好友备注优先），
+    /// note 只是面板标签。外部聊天源的 from.name 是资料包昵称，必须先用账号 UID 解析身份。
+    #[test]
+    fn screen_name_prefers_the_remark_then_note_then_the_raw_name() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            remark: "abcd1234".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            real_nickname: String::new(),
+            display_name: "显示名乙".to_string(),
+            remark_from_chatbridge: false,
+            accounts: vec![GameAccount::new("10002")],
+        });
+        let access = IdentityAccess::new(config);
+        // 1) 外部源只有 UID：from.name 是资料包昵称，必须靠 UID 解析出备注名。
+        assert_eq!(
+            access.search_name("资料包昵称", Some(("genshin", "10002"))),
+            "abcd1234"
+        );
+        // 2) 名字本身就是备注（OCR 路径）。
+        assert_eq!(access.search_name("abcd1234", None), "abcd1234");
+        // 3) 名字命中的是 note：回退链取备注，不是 note。
+        assert_eq!(access.search_name("显示名乙", None), "abcd1234");
+        // 4) 都解析不到：原样返回 from.name。
+        assert_eq!(access.search_name("未登记玩家", None), "未登记玩家");
     }
 
     #[test]
     fn identity_resolves_by_uid_and_by_nickname() {
         let mut config = IdentityConfig::default();
         config.mappings.push(IdentityMapping {
-            nickname: "abcd1234".to_string(),
+            remark: "abcd1234".to_string(),
             id: Uuid::new_v4(),
             role: IdentityRole::Friend,
-            note: "玩家甲".to_string(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: "玩家甲".to_string(),
+            remark_from_chatbridge: false,
             accounts: vec![GameAccount::new("900000002")],
         });
         let access = IdentityAccess::new(config);
@@ -1201,11 +1328,12 @@ mod tests {
     fn unknown_uid_does_not_fall_back_to_nickname() {
         let mut config = IdentityConfig::default();
         config.mappings.push(IdentityMapping {
-            nickname: "橘子".to_string(),
+            remark: "橘子".to_string(),
             id: Uuid::new_v4(),
             role: IdentityRole::Owner,
-            note: String::new(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: String::new(),
+            remark_from_chatbridge: false,
             accounts: vec![GameAccount::new("111111")],
         });
         let access = IdentityAccess::new(config);
@@ -1226,11 +1354,12 @@ mod tests {
     fn role_of_sender_prefers_account_over_nickname() {
         let mut config = IdentityConfig::default();
         config.mappings.push(IdentityMapping {
-            nickname: "随机匹配键".to_string(),
+            remark: "随机匹配键".to_string(),
             id: Uuid::from_u128(11),
             role: IdentityRole::Admin,
-            note: String::new(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: String::new(),
+            remark_from_chatbridge: false,
             accounts: vec![GameAccount {
                 game: "genshin".to_string(),
                 uid: "100000001".to_string(),
@@ -1271,11 +1400,12 @@ mod tests {
     fn uid_miss_never_falls_back_to_nickname_authority() {
         let mut config = IdentityConfig::default();
         config.mappings.push(IdentityMapping {
-            nickname: "可信昵称".to_string(),
+            remark: "可信昵称".to_string(),
             id: Uuid::from_u128(7),
             role: IdentityRole::Owner,
-            note: String::new(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: String::new(),
+            remark_from_chatbridge: false,
             accounts: Vec::new(),
         });
         let access = IdentityAccess::new(config);
@@ -1314,21 +1444,22 @@ mod tests {
             .expect("应创建身份");
         let resolved = access.resolve_account("genshin", "900000001").unwrap();
         assert_eq!(resolved.id, id);
-        // note 是面板展示用的：ChatBridge 还没给 remarks 时用昵称兜底。
-        // 注意它和 OCR 匹配键是两回事，随机串绝不能拿去展示。
-        assert_eq!(resolved.note, "荧");
-        // 占位键必须是与真名无关的随机英数串，OCR 才不会误命中。
-        assert_ne!(resolved.nickname, "荧");
-        assert_eq!(resolved.nickname.chars().count(), 6);
-        assert!(resolved.nickname.is_ascii(), "占位键用英数");
-        // ChatBridge 的 remarks 是游戏内好友备注，也正是 nickname
-        // （OCR 精确匹配键）该有的值——备注优先，覆盖随机占位串。
+        // 自动注册：备注串是随机占位（等用户设成游戏内好友备注），
+        // 资料包昵称进 real_nickname，软件显示昵称留空等用户填。
+        assert!(resolved.display_name.is_empty());
+        assert_eq!(resolved.real_nickname, "荧");
+        assert_ne!(resolved.remark, "荧");
+        assert_eq!(resolved.remark.chars().count(), 6);
+        assert!(resolved.remark.is_ascii(), "备注串用英数");
+        // 展示链：显示名为空 → 回退真实昵称。
+        assert_eq!(resolved.player_name(), "荧");
+        // ChatBridge 的 remarks 是游戏内好友备注，覆盖备注串。
         assert!(access.set_account_remark("genshin", "900000001", "显示名甲"));
         assert_eq!(
             access
                 .resolve_account("genshin", "900000001")
                 .unwrap()
-                .nickname,
+                .remark,
             "显示名甲"
         );
         // 覆盖后 OCR 读到这个名字就能直接定位到身份。
@@ -1339,7 +1470,7 @@ mod tests {
             access
                 .resolve_account("genshin", "900000001")
                 .unwrap()
-                .nickname,
+                .remark,
             "显示名甲"
         );
     }
@@ -1351,13 +1482,14 @@ mod tests {
             .ensure_identity_for_account("genshin", "999", None)
             .expect("应创建身份");
         let resolved = access.resolve_account("genshin", "999").unwrap();
-        // 没有 API 昵称时用 UUID 前缀展示，**绝不**回退到随机昵称：
-        // 随机昵称是 OCR 匹配键，出现在展示位就等于给出可冒充的名字。
-        assert_eq!(resolved.display_name().chars().count(), 8);
-        assert_ne!(resolved.display_name(), resolved.nickname);
-        // OCR 匹配键仍是随机昵称（英数 6 位）。
-        assert_eq!(resolved.nickname.chars().count(), 6);
-        assert!(resolved.nickname.is_ascii());
+        // 三个展示来源都为空时用固定占位，**绝不**回退到内部键或备注串。
+        assert!(resolved.display_name.is_empty());
+        assert!(resolved.real_nickname.is_empty());
+        assert_eq!(resolved.player_name(), PLAYER_NAME_PLACEHOLDER);
+        assert!(!resolved.player_name().contains('-'), "展示名不得像 UUID");
+        // 备注串仍是随机英数（6 位），只用于匹配。
+        assert_eq!(resolved.remark.chars().count(), 6);
+        assert!(resolved.remark.is_ascii());
     }
 
     #[test]

@@ -855,60 +855,46 @@ fn spawn_name_resolver(
                         // 这时只缓存昵称的话，按备注名反查 UID（歌单归属）会落空。
                         state.remember_uid(name.as_deref(), Some(&uid));
                         state.remember_uid(remark.as_deref(), Some(&uid));
-                        // remarks 是玩家在游戏里给这个 UID 设的好友备注。
+                        // 三个名字各写各的字段，**互不覆盖**：
+                        //   names   → real_nickname（玩家自设昵称，只做展示/搜索兜底）
+                        //   remarks → remark（游戏内好友备注 = 屏幕显示名 = OCR 匹配键）
                         //
-                        // 它正是 `nickname`（OCR 精确匹配键）该有的值：游戏里
-                        // 聊天区显示成「昵称(备注)」，而 OCR 侧
-                        // `SecondarySenderIdentity::effective_name()` 取的就是
-                        // 括号里的备注。自动注册时拿不到它只能随机生成占位串，
-                        // OCR 永远匹配不上；这里补上真名，备注优先、没有则保持占位。
-                        //
+                        // 备注是 OCR 侧 `SecondarySenderIdentity::effective_name()`
+                        // 取的值（聊天区显示「昵称(备注)」），所以它才是匹配键的正主。
                         // 注意消息体 `from.name` 永远是资料包昵称、不含备注
-                        // （ChatBridge 源码有测试 `message_sender_name_ignores_remarks`
+                        // （ChatBridge 有测试 `message_sender_name_ignores_remarks`
                         // 专门钉住这点），所以备注只能走 /names 拿。
-                        match remark.as_deref() {
-                            Some(remark) => {
-                                // 不打印 UID / 备注 / 昵称：三者都是真实玩家数据。
-                                // 日志级别调到 debug 就整批落盘，违反 MUST_READ §9。
-                                log::debug!("备注补查命中，已用好友备注覆盖该账号的屏幕匹配名");
-                                if let Some(identity) = identity_access.as_ref()
-                                    && identity.set_account_remark(
+                        //
+                        // 不打印 UID / 备注 / 昵称：三者都是真实玩家数据（MUST_READ §9）。
+                        if let Some(identity) = identity_access.as_ref() {
+                            let mut changed = false;
+                            if let Some(name) = name.as_deref() {
+                                changed |=
+                                    identity.record_real_nickname(
                                         miliastra_kernel::chat_source::GAME_GENSHIN,
                                         &uid,
-                                        remark,
-                                    )
-                                    && let Some(store) = config_store.as_ref()
-                                    && let Err(error) =
-                                        persist_identity(store, &live_configs, identity)
-                                {
-                                    log::warn!(
-                                        "ChatBridge 备注未能写入身份映射（步骤：用备注覆盖昵称作匹配键），本次匹配仍沿用旧昵称；备注对应的权限判定可能对不上，下次配置重载或重启前不会自动纠正：{error:#}"
+                                        name,
                                     );
-                                }
                             }
-                            None => {
-                                // 没有备注不代表没有信息：资料包昵称是展示名的兜底，
-                                // 自动注册时它可能还没到（note 为空），现在补上。
-                                if let Some(name) = name.as_deref() {
-                                    log::debug!(
-                                        "补查命中昵称（该好友没有备注），已用它回填展示名"
-                                    );
-                                    if let Some(identity) = identity_access.as_ref()
-                                        && identity.backfill_account_note(
-                                            miliastra_kernel::chat_source::GAME_GENSHIN,
-                                            &uid,
-                                            name,
-                                        )
-                                        && let Some(store) = config_store.as_ref()
-                                        && let Err(error) =
-                                            persist_identity(store, &live_configs, identity)
-                                    {
-                                        log::warn!(
-                                            "补查到的昵称未能写入身份映射（步骤：把资料包昵称补进展示名），该身份在面板里仍显示原占位名；配置重载或重启后会被库里的旧值覆盖，需重新补查：{error:#}"
-                                        );
-                                    }
-                                }
+                            if let Some(remark) = remark.as_deref() {
+                                changed |= identity.set_account_remark(
+                                    miliastra_kernel::chat_source::GAME_GENSHIN,
+                                    &uid,
+                                    remark,
+                                );
                             }
+                            if changed
+                                && let Some(store) = config_store.as_ref()
+                                && let Err(error) =
+                                    persist_identity(store, &live_configs, identity)
+                            {
+                                log::warn!(
+                                    "补查到的名字未能写入身份映射（步骤：同步真实昵称与好友备注），本次运行内仍生效；配置重载或重启后会被库里的旧值覆盖，重新补查一次即可：{error:#}"
+                                );
+                            }
+                        }
+                        if remark.is_some() {
+                            log::debug!("备注补查命中，已用好友备注覆盖该账号的屏幕匹配名");
                         }
                     }
                     Err(error) => {

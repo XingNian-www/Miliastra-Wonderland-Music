@@ -492,7 +492,7 @@ impl ApplicationRuntime {
                 .lifecycle
                 .live_configs
                 .identity
-                .friend_row_names_for_account(
+                .search_names_for_account(
                     miliastra_kernel::chat_source::GAME_GENSHIN,
                     &self_uid.to_string(),
                 )
@@ -911,11 +911,12 @@ mod tests {
         use crate::features::identity::{GameAccount, IdentityConfig, IdentityMapping};
         crate::features::identity::IdentityAccess::new(IdentityConfig {
             mappings: vec![IdentityMapping {
-                nickname: String::new(),
+                remark: String::new(),
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Admin,
-                note: String::new(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: String::new(),
+                remark_from_chatbridge: false,
                 accounts: vec![GameAccount::new("100000001")],
             }],
         })

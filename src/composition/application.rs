@@ -1561,7 +1561,7 @@ impl ApplicationRuntime {
                 .identity
                 .mappings
                 .iter()
-                .map(|mapping| (mapping.nickname.clone(), mapping.id.to_string()))
+                .map(|mapping| (mapping.remark.clone(), mapping.id.to_string()))
                 .collect::<std::collections::HashMap<_, _>>();
             if let Err(error) = playlist_application.migrate_to_identity_keys(&mappings) {
                 log::warn!("歌单归属键迁移失败（不影响启动）：{error:#}");

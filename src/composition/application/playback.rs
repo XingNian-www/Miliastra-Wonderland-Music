@@ -259,7 +259,7 @@ impl PlaybackExecutionPort for ApplicationRuntime {
     /// 归属键是内部标识，泄露到文案里玩家会看到一长串 UUID。
     /// 这里能拿到身份映射，所以翻译放在这一层；features 层只声明需求。
     fn playlist_owner_display(&self, owner: &str) -> String {
-        // 归属键带 `id:` 前缀，而 `display_name_for_key` 内部走 `Uuid::parse_str`，
+        // 归属键带 `id:` 前缀，而 `player_name_for_key` 内部走 `Uuid::parse_str`，
         // 带前缀会解析失败、原样返回——必须先剥掉前缀。
         let key = owner
             .strip_prefix(crate::features::playlist::owner_key::IDENTITY)
@@ -268,7 +268,7 @@ impl PlaybackExecutionPort for ApplicationRuntime {
             .lifecycle
             .live_configs
             .identity
-            .display_name_for_key(key);
+            .player_name_for_key(key);
         // 翻译不出来（键是裸昵称、或身份已被删除）时退回原值：
         // 至少不比 UUID 更差，也不会凭空丢信息。
         if display.trim().is_empty() {

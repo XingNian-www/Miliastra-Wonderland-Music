@@ -1048,11 +1048,12 @@ fn api_identity_mapping_changes_display_fields_without_changing_track_metadata()
 
     let identity = IdentityAccess::new(IdentityConfig {
         mappings: vec![IdentityMapping {
-            nickname: "游戏备注".to_string(),
+            remark: "游戏备注".to_string(),
             id: Uuid::from_u128(1),
             role: IdentityRole::Friend,
-            note: "显示昵称".to_string(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: "显示昵称".to_string(),
+            remark_from_chatbridge: false,
             accounts: Vec::new(),
         }],
     });
@@ -3329,19 +3330,21 @@ fn playback_leaderboard_maps_display_names_without_merging_people() {
     state.live_configs.identity.replace(IdentityConfig {
         mappings: vec![
             IdentityMapping {
-                nickname: "Alice".into(),
+                remark: "Alice".into(),
                 id: Uuid::from_u128(11),
                 role: IdentityRole::Friend,
-                note: "同一备注".into(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: "同一备注".into(),
+                remark_from_chatbridge: false,
                 accounts: Vec::new(),
             },
             IdentityMapping {
-                nickname: "Bob".into(),
+                remark: "Bob".into(),
                 id: Uuid::from_u128(12),
                 role: IdentityRole::Friend,
-                note: "同一备注".into(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: "同一备注".into(),
+                remark_from_chatbridge: false,
                 accounts: Vec::new(),
             },
         ],

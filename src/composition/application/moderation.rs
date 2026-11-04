@@ -910,12 +910,13 @@ mod tests {
         let identity = crate::features::identity::IdentityAccess::new(
             crate::features::identity::IdentityConfig {
                 mappings: vec![crate::features::identity::IdentityMapping {
-                    nickname: "甲".to_string(),
+                    remark: "甲".to_string(),
                     id: uuid::Uuid::new_v4(),
                     role: crate::features::identity::IdentityRole::Friend,
-                    note: String::new(),
+                    real_nickname: String::new(),
+                    display_name: String::new(),
                     // 有 UID 的消息只按 UID 认身份（防改昵称冒充），所以映射必须绑账号。
-                    remark_sourced: false,
+                    remark_from_chatbridge: false,
                     accounts: vec![crate::features::identity::GameAccount {
                         game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
                         uid: "9001".to_string(),
@@ -1033,11 +1034,12 @@ mod tests {
         let identity = crate::features::identity::IdentityAccess::new(
             crate::features::identity::IdentityConfig {
                 mappings: vec![crate::features::identity::IdentityMapping {
-                    nickname: "甲".to_string(),
+                    remark: "甲".to_string(),
                     id: uuid::Uuid::new_v4(),
                     role: crate::features::identity::IdentityRole::Friend,
-                    note: String::new(),
-                    remark_sourced: false,
+                    real_nickname: String::new(),
+                    display_name: String::new(),
+                    remark_from_chatbridge: false,
                     accounts: vec![crate::features::identity::GameAccount {
                         game: miliastra_kernel::chat_source::GAME_GENSHIN.to_string(),
                         uid: "1001".to_string(),
@@ -1688,11 +1690,12 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, (nickname, role))| IdentityMapping {
-                nickname: nickname.to_string(),
+                remark: nickname.to_string(),
                 id: uuid::Uuid::from_u128(index as u128 + 1),
                 role,
-                note: format!("{nickname}展示备注"),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: format!("{nickname}展示备注"),
+                remark_from_chatbridge: false,
                 accounts: Vec::new(),
             })
             .collect(),
@@ -1914,20 +1917,22 @@ mod tests {
                 panic!("direct task expected");
             };
             let mut mappings = vec![IdentityMapping {
-                nickname: "主人".to_string(),
+                remark: "主人".to_string(),
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Owner,
-                note: String::new(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: String::new(),
+                remark_from_chatbridge: false,
                 accounts: Vec::new(),
             }];
             if downgrade {
                 mappings.push(IdentityMapping {
-                    nickname: "管理员".to_string(),
+                    remark: "管理员".to_string(),
                     id: uuid::Uuid::from_u128(2),
                     role: IdentityRole::Friend,
-                    note: String::new(),
-                    remark_sourced: false,
+                    real_nickname: String::new(),
+                    display_name: String::new(),
+                    remark_from_chatbridge: false,
                     accounts: Vec::new(),
                 });
             }
@@ -1987,11 +1992,12 @@ mod tests {
         // 准入按 UID 放行；复查若只按昵称查就会失败并静默取消——这就是本用例守的回归。
         let identity = IdentityAccess::new(IdentityConfig {
             mappings: vec![IdentityMapping {
-                nickname: String::new(),
+                remark: String::new(),
                 id: uuid::Uuid::from_u128(9),
                 role: IdentityRole::Admin,
-                note: String::new(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: String::new(),
+                remark_from_chatbridge: false,
                 accounts: vec![GameAccount::new("100000001")],
             }],
         });
@@ -2027,11 +2033,12 @@ mod tests {
         use crate::features::identity::{GameAccount, IdentityConfig, IdentityMapping};
         let identity = IdentityAccess::new(IdentityConfig {
             mappings: vec![IdentityMapping {
-                nickname: String::new(),
+                remark: String::new(),
                 id: uuid::Uuid::from_u128(9),
                 role: IdentityRole::Admin,
-                note: String::new(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: String::new(),
+                remark_from_chatbridge: false,
                 accounts: vec![GameAccount::new("100000001")],
             }],
         });

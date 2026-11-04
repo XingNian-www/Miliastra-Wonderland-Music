@@ -990,7 +990,7 @@ impl ApplicationRuntime {
                             // 任务用旧结果覆盖重建结果。
                             generation.fetch_add(1, AtomicOrdering::SeqCst);
                             let config = live_configs.snapshot().ai_chat.clone();
-                            let display = live_configs.identity.display_name_for_key(actor);
+                            let display = live_configs.identity.player_name_for_key(actor);
                             let result =
                                 crate::composition::application::ApplicationRuntime::rebuild_facts_with(
                                     &memory,
@@ -1008,7 +1008,7 @@ impl ApplicationRuntime {
                     {
                         // 记忆键是 UUID，面板要显示成人能认的名字。
                         let identity = self.lifecycle.live_configs.identity.clone();
-                        Arc::new(move |key: &str| identity.display_name_for_key(key))
+                        Arc::new(move |key: &str| identity.player_name_for_key(key))
                     },
                     {
                         // 反向：面板/bookmark 传的是名字，查库要的是键。
@@ -2472,8 +2472,18 @@ impl ApplicationRuntime {
         Ok(secondary)
     }
 
-    pub(super) fn mapped_actor_name(&self, ocr_name: &str) -> String {
-        self.lifecycle.live_configs.identity.display_name(ocr_name)
+    /// 屏幕名（给玩家看、也是好友列表里能搜到的名字）：备注 → note → 原名。
+    ///
+    /// 外部聊天源的 `from.name` 是资料包昵称、与屏幕名无关，必须用账号 UID 先解析身份。
+    pub(super) fn mapped_actor_name(
+        &self,
+        ocr_name: &str,
+        account: Option<&crate::features::command::CommandAccount>,
+    ) -> String {
+        self.lifecycle.live_configs.identity.player_name(
+            ocr_name,
+            account.map(|account| (account.game.as_str(), account.uid.as_str())),
+        )
     }
 
     /// 记忆归属键：已登记玩家用 UUID，未登记退回显示昵称。
@@ -2486,7 +2496,7 @@ impl ApplicationRuntime {
         self.lifecycle
             .live_configs
             .identity
-            .display_name_for_key(actor_key)
+            .player_name_for_key(actor_key)
     }
 
     /// 歌单归属键的候选列表，按优先级：UID > 身份映射 UUID > 昵称。
@@ -2550,21 +2560,9 @@ impl ApplicationRuntime {
         // 也就是收件人＝BOT 自己），拿去当昵称查必然落空、原样返回一串数字，
         // 于是大厅通告会念出「900000001邀请BOT前往大厅」。
         // 帐号里的 uid 才是真正的发送者。
-        let actor = match command.account.as_ref() {
-            Some(account) => {
-                let names = self
-                    .lifecycle
-                    .live_configs
-                    .identity
-                    .friend_row_names_for_account(&account.game, &account.uid);
-                // 反查不到时退回原本的昵称路径（OCR 场景 account 为 None，走 else 分支）。
-                names
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| self.mapped_actor_name(&command.username))
-            }
-            None => self.mapped_actor_name(&command.username),
-        };
+        // 展示名走「软件显示昵称 → 真实昵称」；有账号时先按 UID 解析身份，
+        // 因为外部源的 username 可能是 UID 或资料包昵称，按名字查会落空。
+        let actor = self.mapped_actor_name(&command.username, command.account.as_ref());
         match &mut command.command {
             ModuleCommand::Invite(invite) => invite.display_name = actor,
             ModuleCommand::Moderation(moderation) => moderation.requester = actor,
@@ -3822,11 +3820,12 @@ mod tests {
     fn listener_mode_dispatch_preserves_router_permissions() {
         let identity = IdentityAccess::new(IdentityConfig {
             mappings: vec![IdentityMapping {
-                nickname: "管理员".to_string(),
+                remark: "管理员".to_string(),
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Admin,
-                note: String::new(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: String::new(),
+                remark_from_chatbridge: false,
                 accounts: Vec::new(),
             }],
         });

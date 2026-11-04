@@ -703,7 +703,7 @@ fn role_for_envelope(
         log::warn!(
             "高权限身份仅凭昵称解析出来（角色为{}，身份显示名「{}」）：这条消息没有可信 UID，昵称可以被改名冒充；仅记录线索，本次判定不变",
             role_label(resolved.role),
-            resolved.display_name()
+            resolved.player_name()
         );
     }
     Some(resolved.role)
@@ -1024,12 +1024,13 @@ mod tests {
         let mut config = IdentityConfig::default();
         config.mappings.push(IdentityMapping {
             // 好友备注：玩家在游戏里给对方写的那种随机串，玩家自己改不了。
-            nickname: "abcd1234".to_string(),
+            remark: "abcd1234".to_string(),
             id: uuid::Uuid::new_v4(),
             role: IdentityRole::Admin,
+            real_nickname: String::new(),
             // 游戏真名：屏幕大厅里显示的就是它，但任何人都能把昵称改成一样。
-            note: "管理员甲".to_string(),
-            remark_sourced: true,
+            display_name: "管理员甲".to_string(),
+            remark_from_chatbridge: true,
             accounts: vec![GameAccount::new("100000001")],
         });
         let identity = IdentityAccess::new(config);
@@ -1071,11 +1072,12 @@ mod tests {
         let access = CommandAccessConfig::default();
         let mut identity_config = IdentityConfig::default();
         identity_config.mappings.push(IdentityMapping {
-            nickname: "管理员甲".to_string(),
+            remark: "管理员甲".to_string(),
             id: uuid::Uuid::new_v4(),
             role: IdentityRole::Admin,
-            note: "管理员甲".to_string(),
-            remark_sourced: false,
+            real_nickname: String::new(),
+            display_name: "管理员甲".to_string(),
+            remark_from_chatbridge: false,
             accounts: vec![GameAccount::new("100000001")],
         });
         let identity = IdentityAccess::new(identity_config);
@@ -1358,11 +1360,12 @@ mod tests {
                 mappings: role
                     .into_iter()
                     .map(|role| IdentityMapping {
-                        nickname: "用户".to_string(),
+                        remark: "用户".to_string(),
                         id: uuid::Uuid::from_u128(1),
                         role,
-                        note: "展示备注".to_string(),
-                        remark_sourced: false,
+                        real_nickname: String::new(),
+                        display_name: "展示备注".to_string(),
+                        remark_from_chatbridge: false,
                         accounts: Vec::new(),
                     })
                     .collect(),
@@ -1412,11 +1415,12 @@ mod tests {
     fn moderation_admin_routing_keeps_uid_validation() {
         let identity = IdentityAccess::new(IdentityConfig {
             mappings: vec![IdentityMapping {
-                nickname: "用户".to_string(),
+                remark: "用户".to_string(),
                 id: uuid::Uuid::from_u128(1),
                 role: IdentityRole::Admin,
-                note: String::new(),
-                remark_sourced: false,
+                real_nickname: String::new(),
+                display_name: String::new(),
+                remark_from_chatbridge: false,
                 accounts: Vec::new(),
             }],
         });
@@ -1498,27 +1502,30 @@ mod tests {
         let identity = IdentityAccess::new(IdentityConfig {
             mappings: vec![
                 IdentityMapping {
-                    nickname: "用户".to_string(),
+                    remark: "用户".to_string(),
                     id: uuid::Uuid::from_u128(1),
                     role: IdentityRole::Owner,
-                    note: String::new(),
-                    remark_sourced: false,
+                    real_nickname: String::new(),
+                    display_name: String::new(),
+                    remark_from_chatbridge: false,
                     accounts: Vec::new(),
                 },
                 IdentityMapping {
-                    nickname: "管理员".to_string(),
+                    remark: "管理员".to_string(),
                     id: uuid::Uuid::from_u128(2),
                     role: IdentityRole::Admin,
-                    note: String::new(),
-                    remark_sourced: false,
+                    real_nickname: String::new(),
+                    display_name: String::new(),
+                    remark_from_chatbridge: false,
                     accounts: Vec::new(),
                 },
                 IdentityMapping {
-                    nickname: "好友".to_string(),
+                    remark: "好友".to_string(),
                     id: uuid::Uuid::from_u128(3),
                     role: IdentityRole::Friend,
-                    note: "好友备注".to_string(),
-                    remark_sourced: false,
+                    real_nickname: String::new(),
+                    display_name: "好友备注".to_string(),
+                    remark_from_chatbridge: false,
                     accounts: Vec::new(),
                 },
             ],

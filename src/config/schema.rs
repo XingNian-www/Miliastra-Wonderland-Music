@@ -2288,13 +2288,13 @@ fn custom_workflows_section() -> Vec<ConfigFieldSchema> {
     ]
 }
 
-/// identity 段：游戏内昵称到角色和对外显示昵称的映射表。
+/// identity 段：身份映射表（备注串 / 显示名 / 真实昵称 / UID → 角色）。
 fn identity_section() -> Vec<ConfigFieldSchema> {
     vec![ConfigFieldSchema::db_live(
         "mappings",
-        "昵称身份映射",
+        "身份映射",
         FieldKind::Object,
-        "游戏内昵称与 OCR 结果精确匹配；显示昵称用于游戏回复、Web 和 API，留空时显示游戏内昵称；角色控制命令权限。保存后立即生效。",
+        "备注串（游戏内好友备注，也就是屏幕上显示的名字）与 OCR 精确匹配；显示名用于游戏回复、Web 和 API，可留空，留空时依次回退真实昵称与「玩家」；真实昵称由聊天桥自动写入，只做展示与搜索兜底；角色控制命令权限。保存后立即生效。",
     )]
 }
 

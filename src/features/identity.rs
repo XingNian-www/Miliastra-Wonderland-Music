@@ -594,13 +594,19 @@ impl IdentityAccess {
         self.player_name(name, None)
     }
 
-    /// 好友搜索名：**备注串 → 真实昵称**，去重后返回。
+    /// 好友搜索名：**备注串 → 显示名 → 真实昵称**，去重后返回。
     ///
-    /// 屏幕显示的是备注串（无备注时是玩家自设昵称），所以只试这两个名字；
-    /// 软件显示名与 UUID 都不该拿去搜好友列表。
+    /// 屏幕显示的是备注串；没有备注时显示玩家自设昵称——老身份里那个值可能
+    /// 存在 `display_name`（自动注册时曾把资料包昵称写进这里），也可能是
+    /// `real_nickname`。三档都试一次，否则「随机备注串没在游戏里用过」的
+    /// 身份会一个可用名字都没有。UUID 永不参与搜索。
     fn search_names_of(identity: &ResolvedIdentity) -> Vec<String> {
-        let mut names = Vec::with_capacity(2);
-        for candidate in [identity.remark.trim(), identity.real_nickname.trim()] {
+        let mut names = Vec::with_capacity(3);
+        for candidate in [
+            identity.remark.trim(),
+            identity.display_name.trim(),
+            identity.real_nickname.trim(),
+        ] {
             if candidate.is_empty() || names.iter().any(|existing| existing == candidate) {
                 continue;
             }
@@ -609,7 +615,7 @@ impl IdentityAccess {
         names
     }
 
-    /// 按账号反查好友搜索名：**备注串 → 真实昵称**。
+    /// 按账号反查好友搜索名：**备注串 → 显示名 → 真实昵称**。
     ///
     /// 为什么是**多个**：屏幕显示备注串，没有备注时显示玩家自设昵称；
     /// 两种来源都得试，否则必有一半玩家的邀请/私聊找不到人。
@@ -620,7 +626,7 @@ impl IdentityAccess {
             .unwrap_or_default()
     }
 
-    /// 按「已知的显示名」反查好友搜索名：**备注串 → 真实昵称**。
+    /// 按「已知的显示名」反查好友搜索名：**备注串 → 显示名 → 真实昵称**。
     ///
     /// 投递层只知道展示名（特征层传出来的是软件显示名），要换回屏幕上的名字
     /// 才能搜好友列表。三个名字（备注串 / 软件显示名 / 真实昵称）任一命中即可。
@@ -632,7 +638,7 @@ impl IdentityAccess {
             .unwrap_or_default()
     }
 
-    /// 搜索链：**备注串 → 真实昵称 → 传入的名字**（只用于搜好友列表）。
+    /// 搜索链：**备注串 → 显示名 → 真实昵称 → 传入的名字**（只用于搜好友列表）。
     ///
     /// `account` 是外部聊天源带来的真实账号：消息里的 `from.name` 是**资料包昵称**，
     /// 与屏幕名无关，只按名字查会落空，必须先用 UID 解析出身份。
@@ -894,10 +900,9 @@ mod tests {
 
         let names = identity
             .search_names_for_account(miliastra_kernel::chat_source::GAME_GENSHIN, "900000001");
-        // 好友列表显示的是备注串，所以搜索名必须有它。
-        assert_eq!(names, vec!["玩家丙".to_string()], "搜索名应只含备注串");
-        // 软件显示名只做文案，**不能**拿去搜好友列表。
-        assert!(!names.iter().any(|name| name == "厅主"), "显示名不参与搜索");
+        // 好友列表显示的是备注串，所以搜索名必须有它；
+        // 显示名作为第二档兜底（老身份的资料包昵称存在这里）。
+        assert_eq!(names, vec!["玩家丙".to_string(), "厅主".to_string()]);
         assert!(!names.iter().any(|name| name == "900000001"), "UID 不参与搜索");
     }
 
@@ -1242,7 +1247,7 @@ mod tests {
     }
     /// 好友列表候选名以显示昵称为先。
     #[test]
-    fn search_names_use_the_remark_then_the_real_nickname() {
+    fn search_names_try_remark_display_then_real_nickname() {
         let mut config = IdentityConfig::default();
         config.mappings.push(IdentityMapping {
             remark: "nick_beta".to_string(),
@@ -1254,10 +1259,15 @@ mod tests {
             accounts: vec![GameAccount::new("10002")],
         });
         let access = IdentityAccess::new(config);
-        // 备注串优先（屏幕显示的就是它），真实昵称兜底；显示名不进搜索。
+        // 备注串优先（屏幕显示的就是它），显示名与真实昵称依次兜底：
+        // 老身份的资料包昵称可能落在显示名里，随机备注串没在游戏里用过时靠它。
         assert_eq!(
             access.search_names_for_account("genshin", "10002"),
-            vec!["nick_beta".to_string(), "真名乙".to_string()]
+            vec![
+                "nick_beta".to_string(),
+                "显示名乙".to_string(),
+                "真名乙".to_string()
+            ]
         );
     }
 

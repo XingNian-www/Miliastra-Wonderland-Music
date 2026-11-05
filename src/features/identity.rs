@@ -795,9 +795,18 @@ impl IdentityAccess {
                 if mapping.remark_from_chatbridge {
                     return None;
                 }
-                let display_name = mapping.display_name.trim();
-                (!mapping.remark.is_empty() && !display_name.is_empty())
-                    .then(|| (mapping.remark.clone(), display_name.to_owned()))
+                // 展示名走统一展示链：显示名 → 真实昵称。
+                // 原来只认 display_name，它一为空（自动注册的常见形态）就换不掉，
+                // 随机备注串会被原样念给全大厅。两者都为空时保持原文，
+                // 不能用占位「玩家」去替换——那会把句子改得莫名其妙。
+                let display = mapping.display_name.trim();
+                let display = if display.is_empty() {
+                    mapping.real_nickname.trim()
+                } else {
+                    display
+                };
+                (!mapping.remark.trim().is_empty() && !display.is_empty())
+                    .then(|| (mapping.remark.clone(), display.to_owned()))
             })
             .collect::<Vec<_>>();
         mappings.sort_by_key(|mapping| std::cmp::Reverse(mapping.0.len()));
@@ -987,6 +996,27 @@ mod tests {
             "@主人备注的请求,@短备注甲已处理,陌生人"
         );
         assert_eq!(access.replace_display_names("好友甲好友"), "短备注甲短备注");
+    }
+
+    #[test]
+    fn replace_display_names_falls_back_to_the_real_nickname() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            remark: "abcd1234".to_owned(),
+            id: Uuid::from_u128(9),
+            role: IdentityRole::Friend,
+            real_nickname: "真名甲".to_owned(),
+            // 自动注册的常见形态：显示名留空，只有聊天桥给的真实昵称。
+            display_name: String::new(),
+            remark_from_chatbridge: false,
+            accounts: Vec::new(),
+        });
+        let access = IdentityAccess::new(config);
+        // 备注串不能出现在出站文本里；显示名为空时回退真实昵称，而不是原样放过。
+        assert_eq!(
+            access.replace_display_names("abcd1234 点了一首歌"),
+            "真名甲 点了一首歌"
+        );
     }
 
     #[test]

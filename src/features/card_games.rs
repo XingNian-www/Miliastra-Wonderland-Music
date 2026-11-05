@@ -106,8 +106,6 @@ pub enum LandlordCommand {
     /// 叫地主（传统抢地主流程第一阶段）。
     Call,
     Rob,
-    /// 反抢（原叫地主者被抢后的一次机会）。
-    CounterRob,
     Decline,
     Status,
     Play(String),
@@ -176,7 +174,6 @@ impl LandlordCommand {
             "叫地主" | "叫" => Self::Call,
             "不叫" | "不抢" => Self::Decline,
             "抢" | "抢地主" => Self::Rob,
-            "反抢" => Self::CounterRob,
             "过" | "要不起" => Self::Pass,
             "状态" => Self::Status,
             "重试" => Self::Retry,
@@ -208,7 +205,6 @@ impl LandlordCommand {
             Self::Join => "landlord:join".to_string(),
             Self::Call => "landlord:call".to_string(),
             Self::Rob => "landlord:rob".to_string(),
-            Self::CounterRob => "landlord:counter_rob".to_string(),
             Self::Decline => "landlord:decline".to_string(),
             Self::Status => "landlord:status".to_string(),
             Self::Play(cards) => format!("landlord:play:{}", command_identity(cards)),
@@ -227,7 +223,6 @@ impl LandlordCommand {
                 | Self::Join
                 | Self::Call
                 | Self::Rob
-                | Self::CounterRob
                 | Self::Decline
                 | Self::Hand
                 | Self::Retry
@@ -391,7 +386,6 @@ enum BidAction {
     Call,
     Decline,
     Rob,
-    CounterRob,
 }
 
 /// 抢地主的结束方式，决定收尾文案。
@@ -851,7 +845,6 @@ impl LandlordGame {
             LandlordCommand::Join => self.join_with_display(player, player_display, now),
             LandlordCommand::Call => self.bid(player, BidAction::Call, now),
             LandlordCommand::Rob => self.bid(player, BidAction::Rob, now),
-            LandlordCommand::CounterRob => self.bid(player, BidAction::CounterRob, now),
             LandlordCommand::Decline => self.bid(player, BidAction::Decline, now),
             LandlordCommand::Status => self.status(),
             LandlordCommand::Play(cards) => self.play(player, cards, now),
@@ -891,10 +884,8 @@ impl LandlordGame {
         let allowed = match bidding.phase {
             BiddingPhase::Calling => matches!(action, BidAction::Call | BidAction::Decline),
             BiddingPhase::Robbing => matches!(action, BidAction::Rob | BidAction::Decline),
-            BiddingPhase::CounterRobbing => matches!(
-                action,
-                BidAction::CounterRob | BidAction::Rob | BidAction::Decline
-            ),
+            // 反抢阶段直接复用 #抢：逻辑不变，玩家不用记新命令。
+            BiddingPhase::CounterRobbing => matches!(action, BidAction::Rob | BidAction::Decline),
         };
         if !allowed {
             return LandlordOutcome::public(
@@ -998,7 +989,7 @@ impl LandlordGame {
                 )
             }
             BiddingPhase::CounterRobbing => {
-                if matches!(action, BidAction::CounterRob | BidAction::Rob) {
+                if action == BidAction::Rob {
                     bidding.candidate = bidding.caller;
                     self.finish_bidding(bidding, now, BiddingFinish::CounterRobbed)
                 } else {
@@ -4024,7 +4015,7 @@ mod tests {
             game.handle(&player, &LandlordCommand::Rob, now);
         }
         let caller = current_name(game);
-        game.handle(&caller, &LandlordCommand::CounterRob, now);
+        game.handle(&caller, &LandlordCommand::Rob, now);
         assert!(matches!(game.state, GameState::Playing(_)));
     }
 
@@ -4872,7 +4863,8 @@ mod tests {
             game.handle(&player, &LandlordCommand::Rob, now);
         }
         assert_eq!(current_bidder(&game), caller);
-        let outcome = game.handle(&caller, &LandlordCommand::CounterRob, now);
+        // 反抢阶段直接用 #抢，不需要单独的反抢命令。
+        let outcome = game.handle(&caller, &LandlordCommand::Rob, now);
         assert_eq!(outcome.action, "counter-robbed");
 
         let GameState::Playing(playing) = &game.state else {

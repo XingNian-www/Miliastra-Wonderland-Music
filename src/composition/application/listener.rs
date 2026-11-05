@@ -2529,12 +2529,12 @@ impl ApplicationRuntime {
         let identity = &self.lifecycle.live_configs.identity;
         let uuid = identity.resolve_hint(hint).map(|resolved| resolved.id);
         // 兜底：`resolve_hint` 只认 nickname（那是**授权**口径，不能放宽），
-        // 而外部聊天源给的发送者名字常常是 **note（游戏真名）**——
-        // 已登记玩家的 note 与 nickname 是两条不同字符串，前者解析不出来，
+        // 而外部聊天源给的发送者名字常常是 **真实昵称（玩家自设）**——
+        // 已登记玩家的真实昵称与备注串是两条不同字符串，前者解析不出来，
         // 表现为「歌单窗口决策的发送者不是当前窗口属主」，`@1`~`@5` 全部失效。
         //
         // **这里只服务归属**（决定这份歌单属于谁），不是授权。
-        // 归属用 note 是允许的（见 identity.rs 的「note 可用于归属、不可用于授权」）。
+        // 归属允许匹配显示名/真实昵称（见 identity.rs 的「它们可用于归属、不可用于授权」）。
         // 绝不能把这段兜底上移到 `resolve_hint`：那会让「改昵称冒充管理员」复活。
         let uuid = uuid.or_else(|| identity.ownership_uuid_by_name(subject));
         let identity = uuid.map(|uuid| uuid.to_string());

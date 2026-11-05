@@ -58,6 +58,7 @@ use crate::features::idiom_chain;
 use crate::features::idiom_chain::{IdiomChainApplication, IdiomChainService};
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{ModerationPolicy, ModerationResultTask, ModerationService};
+use crate::features::number_bomb::NumberBombService;
 use crate::features::playback::{
     ActivePlaybackIdentity, ConfirmedPlaybackState, ExternalPlaybackObservation,
     PlaybackApplication, PlaybackApplicationConfig, PlaybackCommand, PlaybackObservation,
@@ -1725,6 +1726,7 @@ impl ApplicationRuntime {
                     idiom_chain,
                     landlord,
                     undercover,
+                    NumberBombService::new(config.number_bomb.clone()),
                     turtle_soup,
                     hall,
                     playback,

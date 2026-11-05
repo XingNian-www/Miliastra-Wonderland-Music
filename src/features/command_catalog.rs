@@ -666,6 +666,17 @@ pub(crate) const ENTERTAINMENT_START: &[CommandSpec] = &[
         usage: &["#卧底", "#卧底双"],
         hidden: false,
     },
+    CommandSpec {
+        name: "数字炸弹",
+        aliases: &[],
+        prefix: Hash,
+        match_rule: CommandMatch::Compact,
+        group: CommandGroup::Entertainment,
+        authorities: HALL_ONLY,
+        summary: "开局数字炸弹（大厅直接发数字猜）",
+        usage: &["#数字炸弹"],
+        hidden: false,
+    },
 ];
 
 /// 歌单命令（@ 前缀，压缩文本精确匹配）。
@@ -988,6 +999,20 @@ pub(crate) const SESSION_DISPATCH: &[SessionDispatch] = &[
         ],
         label: "谁是卧底",
     },
+    SessionDispatch {
+        kind: crate::features::entertainment::EntertainmentKind::NumberBomb,
+        module: crate::features::command::ChatCommandModule::NumberBomb,
+        claims: crate::features::number_bomb::NumberBombCommand::claims_active_chat,
+        parse: |envelope| {
+            crate::features::number_bomb::NumberBombCommand::parse_active_chat(envelope)
+                .map(|matched| matched.map(crate::features::command::ModuleCommand::NumberBomb))
+        },
+        // 进行中接受大厅里的纯数字；这里标 true 让面板提示“可自由输入”，
+        // 纯数字在 listener 里补井号信封后才进入这张表。
+        open_ended: true,
+        keywords: &["加入", "开始", "状态", "结束", "重来"],
+        label: "数字炸弹",
+    },
 ];
 
 /// 按当前玩法状态查可用规则。
@@ -1280,6 +1305,7 @@ mod tests {
             EntertainmentKind::RunFast,
             EntertainmentKind::TurtleSoup,
             EntertainmentKind::Undercover,
+            EntertainmentKind::NumberBomb,
         ] {
             let rules = session_rules(Some(kind));
             assert!(!rules.is_empty(), "{kind:?} 没有会话态规则");
@@ -1303,6 +1329,8 @@ mod tests {
         assert!(open_ended(EntertainmentKind::IdiomChain));
         assert!(open_ended(EntertainmentKind::Landlord));
         assert!(open_ended(EntertainmentKind::RunFast));
+        // 数字炸弹进行中接受大厅纯数字，解析器有 "Guess" 兜底。
+        assert!(open_ended(EntertainmentKind::NumberBomb));
         // 海龟汤与谁是卧底只认固定关键词。
         assert!(!open_ended(EntertainmentKind::TurtleSoup));
         assert!(!open_ended(EntertainmentKind::Undercover));
@@ -1360,7 +1388,7 @@ mod tests {
             .map(|command| command.name)
             .collect();
         // 这三个玩法有 "_ =>" 兜底，会话中接受任意输入。
-        for expected in ["成语接龙", "斗地主", "跑得快"] {
+        for expected in ["成语接龙", "斗地主", "跑得快", "数字炸弹"] {
             assert!(
                 open_ended.contains(&expected),
                 "{expected} 应标记为会话中可自由输入，实际：{open_ended:?}"
@@ -1481,6 +1509,9 @@ mod tests {
                             &envelope,
                         )
                         || crate::features::undercover::UndercoverCommand::claims_start_chat(
+                            &envelope,
+                        )
+                        || crate::features::number_bomb::NumberBombCommand::claims_start_chat(
                             &envelope,
                         )
                         || crate::features::administration::AdministrationCommand::claims_chat(

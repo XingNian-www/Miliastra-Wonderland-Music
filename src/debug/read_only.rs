@@ -982,6 +982,7 @@ pub(crate) fn command_parameters(parsed: &RoutedCommand) -> Value {
         ModuleCommand::Tarot(_) => "tarot",
         ModuleCommand::Playlist(_) => "playlist",
         ModuleCommand::Undercover(_) => "undercover",
+        ModuleCommand::NumberBomb(_) => "numberBomb",
         ModuleCommand::Invite(_) => "invite",
         ModuleCommand::Moderation(_) => "moderation",
         ModuleCommand::CustomWorkflow(_) => "customWorkflow",

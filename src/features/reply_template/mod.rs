@@ -13,6 +13,7 @@ pub(crate) mod card_games;
 pub(crate) mod hall;
 pub(crate) mod idiom_chain;
 pub(crate) mod moderation;
+pub(crate) mod number_bomb;
 pub(crate) mod ownership;
 pub(crate) mod playback;
 pub(crate) mod playlist;
@@ -73,6 +74,26 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
         name: "上限",
         label: "队列数量上限",
         example: "20",
+    },
+    ReplyVariable {
+        name: "下限",
+        label: "数字炸弹当前范围下界",
+        example: "1",
+    },
+    ReplyVariable {
+        name: "数字",
+        label: "玩家猜的数字",
+        example: "42",
+    },
+    ReplyVariable {
+        name: "炸弹数字",
+        label: "本局隐藏的炸弹数字",
+        example: "37",
+    },
+    ReplyVariable {
+        name: "最少人数",
+        label: "玩法开局所需最少人数",
+        example: "2",
     },
     ReplyVariable {
         name: "下一位",
@@ -783,7 +804,7 @@ pub(crate) const HELP_PLAYLIST: ReplyTemplate = ReplyTemplate {
 /// 大厅帮助（娱乐类）。
 pub(crate) const HELP_ENTERTAINMENT: ReplyTemplate = ReplyTemplate {
     key: "help.entertainment",
-    default: "塔罗: #塔罗牌抽当天三张;#塔罗牌重抽提前换组;带问题自动AI\n塔罗: UTC+8每日更新;#塔罗牌AI解读当前三张;#塔罗牌帮助\n成语接龙: #接龙随机开局;同音模式用 #同音接龙随机开局;进行中直接发送成语/#提示/#解释\n斗地主: #斗地主/#加入/#抢/#不抢/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌\n跑得快: #跑得快/#加入/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌\n海龟汤: #海龟汤;进行中 #状态/#结束;提问直接以#开头,如#他认识死者吗\n海龟汤长答案: ##1第一段,##2第二段,最后发送##提交;取消用##取消\n谁是卧底: #卧底/#卧底双;公屏 #开局/#状态/#退出/#结束/#重试/#内容\n谁是卧底: 好友私聊 #加入/#退出/#弃权/#A/#投A;局外好友私聊 #谜底",
+    default: "塔罗: #塔罗牌抽当天三张;#塔罗牌重抽提前换组;带问题自动AI\n塔罗: UTC+8每日更新;#塔罗牌AI解读当前三张;#塔罗牌帮助\n成语接龙: #接龙随机开局;同音模式用 #同音接龙随机开局;进行中直接发送成语/#提示/#解释\n斗地主: #斗地主/#加入/#抢/#不抢/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌\n跑得快: #跑得快/#加入/#出3334/#过/#状态/#重试/#结束;好友私聊 #手牌\n海龟汤: #海龟汤;进行中 #状态/#结束;提问直接以#开头,如#他认识死者吗\n海龟汤长答案: ##1第一段,##2第二段,最后发送##提交;取消用##取消\n谁是卧底: #卧底/#卧底双;公屏 #开局/#状态/#退出/#结束/#重试/#内容\n谁是卧底: 好友私聊 #加入/#退出/#弃权/#A/#投A;局外好友私聊 #谜底\n数字炸弹: #数字炸弹/#加入/#开始;公屏直接发送数字;进行中 #状态/#重来/#结束",
     summary: "大厅帮助（娱乐）",
     group: "管理",
 };
@@ -822,6 +843,7 @@ pub(crate) fn catalog() -> impl Iterator<Item = &'static ReplyTemplate> {
         .chain(idiom_chain::IDIOM_CHAIN.iter())
         .chain(tarot::TAROT.iter())
         .chain(moderation::MODERATION.iter())
+        .chain(number_bomb::NUMBER_BOMB.iter())
 }
 
 #[cfg(test)]

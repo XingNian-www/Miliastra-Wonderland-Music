@@ -36,6 +36,11 @@ use crate::features::moderation::{
     ModerationWorkflowKey, ModerationWorkflowLedger, ModerationWorkflowRegistry,
     ModerationWorkflowToken,
 };
+use crate::features::number_bomb::{
+    NumberBombCommand, NumberBombCommandOutcome, NumberBombService, NumberBombTimeout,
+};
+#[cfg(test)]
+use crate::features::number_bomb::NumberBombConfig;
 use crate::features::playback::{
     ActivePlaybackIdentity, ExternalPlaybackObservation, PlaybackMutationIntent,
     PlaybackMutationOutcome, PlaybackObservation, PlaybackRuntimeState, PlaybackService,
@@ -338,6 +343,7 @@ pub enum BusinessRuntimeError {
     IdiomChainOperationFailed(String),
     CardGameOperationFailed(String),
     UndercoverOperationFailed(String),
+    NumberBombOperationFailed(String),
     TurtleSoupOperationFailed(String),
     HallOperationFailed(String),
     PlaybackOperationFailed(String),
@@ -363,6 +369,9 @@ impl Display for BusinessRuntimeError {
             }
             Self::UndercoverOperationFailed(message) => {
                 write!(formatter, "undercover operation failed: {message}")
+            }
+            Self::NumberBombOperationFailed(message) => {
+                write!(formatter, "number bomb operation failed: {message}")
             }
             Self::TurtleSoupOperationFailed(message) => {
                 write!(formatter, "turtle soup operation failed: {message}")
@@ -431,6 +440,7 @@ enum RuntimeMessage {
     CardGame(CardGameRuntimeMessage),
     Undercover(UndercoverRuntimeMessage),
     UndercoverSnapshot(SyncSender<Result<UndercoverSnapshot, BusinessRuntimeError>>),
+    NumberBomb(NumberBombRuntimeMessage),
     TurtleSoup(TurtleSoupRuntimeMessage),
     TurtleSoupSnapshot(SyncSender<Result<TurtleSoupSnapshot, BusinessRuntimeError>>),
     InviteShouldAccept {
@@ -707,6 +717,22 @@ enum UndercoverRuntimeMessage {
         now: Instant,
         clock_active: bool,
         response: SyncSender<Result<Option<UndercoverTimedOutcome>, BusinessRuntimeError>>,
+    },
+    Abort(SyncSender<Result<bool, BusinessRuntimeError>>),
+}
+
+enum NumberBombRuntimeMessage {
+    Handle {
+        player: String,
+        player_display: String,
+        command: NumberBombCommand,
+        now: Instant,
+        response: SyncSender<Result<NumberBombCommandOutcome, BusinessRuntimeError>>,
+    },
+    Poll {
+        now: Instant,
+        clock_active: bool,
+        response: SyncSender<Result<Option<NumberBombTimeout>, BusinessRuntimeError>>,
     },
     Abort(SyncSender<Result<bool, BusinessRuntimeError>>),
 }
@@ -1838,6 +1864,45 @@ impl BusinessRuntimeHandle {
             .map_err(|_| BusinessRuntimeError::RuntimeStopped)?
     }
 
+    /// 数字炸弹命令只走单写者业务线程：加入/回合/超时都依赖同一份状态。
+    pub(crate) fn handle_number_bomb(
+        &self,
+        player: &str,
+        player_display: &str,
+        command: &NumberBombCommand,
+        now: Instant,
+    ) -> Result<NumberBombCommandOutcome, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::NumberBomb(NumberBombRuntimeMessage::Handle {
+                player: player.to_string(),
+                player_display: player_display.to_string(),
+                command: command.clone(),
+                now,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn poll_number_bomb_timeout(
+        &self,
+        now: Instant,
+        clock_active: bool,
+    ) -> Result<Option<NumberBombTimeout>, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::NumberBomb(NumberBombRuntimeMessage::Poll {
+                now,
+                clock_active,
+                response,
+            })
+        })
+    }
+
+    pub(crate) fn abort_number_bomb(&self) -> Result<bool, BusinessRuntimeError> {
+        self.request(|response| {
+            RuntimeMessage::NumberBomb(NumberBombRuntimeMessage::Abort(response))
+        })
+    }
+
     pub(crate) fn refresh_turtle_soup_deadline(
         &self,
         now: Instant,
@@ -2159,6 +2224,7 @@ pub(crate) struct BusinessRuntimeWorker {
     idiom_chain: IdiomChainService,
     card_games: CardGameService,
     undercover: UndercoverRuntimeService,
+    number_bomb: NumberBombService,
     turtle_soup: Option<TurtleSoupService>,
     hall: Option<HallStateService>,
     playback: Option<PlaybackService>,
@@ -2175,6 +2241,7 @@ impl BusinessRuntimeWorker {
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
         undercover: UndercoverRuntimeService,
+        number_bomb: NumberBombService,
         turtle_soup: TurtleSoupService,
         hall: HallStateService,
         playback: PlaybackService,
@@ -2188,6 +2255,7 @@ impl BusinessRuntimeWorker {
             idiom_chain,
             card_games,
             undercover,
+            number_bomb,
             turtle_soup: Some(turtle_soup),
             hall: Some(hall),
             playback: Some(playback),
@@ -2267,6 +2335,7 @@ impl BusinessRuntime {
                 idiom_chain,
                 card_games,
                 undercover: default_undercover_service(),
+                number_bomb: NumberBombService::new(NumberBombConfig::default()),
                 turtle_soup: None,
                 hall: None,
                 playback: None,
@@ -2294,6 +2363,7 @@ impl BusinessRuntime {
                 idiom_chain,
                 card_games,
                 undercover: default_undercover_service(),
+                number_bomb: NumberBombService::new(NumberBombConfig::default()),
                 turtle_soup: None,
                 hall: Some(hall),
                 playback: Some(playback),
@@ -3242,6 +3312,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
         idiom_chain,
         card_games,
         undercover,
+        number_bomb,
         turtle_soup,
         hall,
         playback,
@@ -3256,6 +3327,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
         idiom_chain,
         card_games,
         undercover,
+        number_bomb,
         turtle_soup,
         invite,
         state_sink.clone(),
@@ -3381,6 +3453,13 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             RuntimeMessage::UndercoverSnapshot(response) => {
                 let _ = response.send(Ok(entertainment.undercover_snapshot(clock.now())));
             }
+            RuntimeMessage::NumberBomb(message) => {
+                if let Err(error) = entertainment.handle_number_bomb(message) {
+                    log::error!(
+                    "业务运行时处理数字炸弹消息失败（步骤：分发数字炸弹命令或超时），该条消息对应的动作未执行：{error}"
+                );
+                }
+            }
             RuntimeMessage::TurtleSoup(message) => {
                 if let Err(error) = entertainment.handle_turtle_soup(
                     message,
@@ -3485,6 +3564,7 @@ fn abort_business_modules(
     idiom_chain: &mut IdiomChainService,
     card_games: &mut CardGameService,
     undercover: &mut UndercoverRuntimeService,
+    number_bomb: &mut NumberBombService,
     mut turtle_soup: Option<&mut TurtleSoupService>,
     timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
     active_idiom_deadline: &mut Option<ActiveIdiomDeadline>,
@@ -3512,6 +3592,7 @@ fn abort_business_modules(
         );
     }
     let _ = undercover.abort(entertainment);
+    let _ = number_bomb.abort(entertainment);
     if let Some(turtle_soup) = turtle_soup.as_deref_mut() {
         turtle_soup.abort_for_context_loss(entertainment, "业务运行时关闭");
     }

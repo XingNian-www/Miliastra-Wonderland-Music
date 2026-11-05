@@ -8,6 +8,7 @@
 - [斗地主与跑得快](card-games.md)：组局、出牌、手牌查询和投递重试。
 - [海龟汤](turtle-soup.md)：海龟汤的命令、提问方式和题库配置。
 - [谁是卧底](undercover.md)：报名、发言、投票和词库配置。
+- [数字炸弹](number-bomb.md)：轮流猜数字、区间收窄和上限随人数增长。
 - [Web 面板使用](web-tools.md)：本地网页、远程控制和高级工具。
 - [沙盒只读模式](sandbox-read-only.md)：主动读取、仅命令/流程触发推送、原图与复现证据下载。
 - [平台登录](login-qr-feasibility.md)：音乐平台登录、二维码和凭据状态。

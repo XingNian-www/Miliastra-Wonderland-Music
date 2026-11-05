@@ -10,6 +10,7 @@ use super::identity::IdentityRole;
 use super::idiom_chain::IdiomChainCommand;
 use super::invite::InviteCommand;
 use super::moderation::ModerationCommand;
+use super::number_bomb::NumberBombCommand;
 use super::playback::PlaybackCommand;
 use super::song_request::SongCommand;
 use super::turtle_soup::TurtleSoupCommand;
@@ -269,6 +270,7 @@ pub(crate) enum ChatCommandModule {
     Tarot,
     Playlist,
     Undercover,
+    NumberBomb,
     Invite,
     Moderation,
     CustomWorkflow,
@@ -290,6 +292,7 @@ pub(crate) enum ModuleCommand {
     Tarot(super::tarot::TarotCommand),
     Playlist(super::playlist::PlaylistCommand),
     Undercover(UndercoverCommand),
+    NumberBomb(NumberBombCommand),
     Invite(InviteCommand),
     Moderation(ModerationCommand),
     CustomWorkflow(CustomWorkflowCommand),
@@ -356,6 +359,7 @@ impl ModuleCommand {
             | Self::TurtleSoup(_)
             | Self::Tarot(_)
             | Self::Playlist(_)
+            | Self::NumberBomb(_)
             | Self::Invite(_)
             | Self::CustomWorkflow(_) => None,
         }
@@ -462,6 +466,7 @@ impl ModuleCommand {
             Self::CardGame(command) => command.lock_key(),
             Self::TurtleSoup(command) => command.lock_key().to_string(),
             Self::Undercover(command) => command.lock_key(),
+            Self::NumberBomb(command) => command.lock_key(),
             Self::Tarot(command) => command.lock_key(),
             Self::Playlist(command) => command.lock_key(),
             Self::Invite(command) => command.lock_key(),
@@ -478,6 +483,7 @@ impl ModuleCommand {
             self,
             Self::CardGame(_)
                 | Self::Undercover(_)
+                | Self::NumberBomb(_)
                 | Self::Tarot(_)
                 | Self::Playlist(_)
                 | Self::AiChat(_)
@@ -505,6 +511,8 @@ impl ModuleCommand {
             Self::Tarot(command) => !matches!(command, super::tarot::TarotCommand::Help),
             Self::Playlist(command) => !matches!(command, super::playlist::PlaylistCommand::Help),
             Self::Undercover(command) => !matches!(command, UndercoverCommand::Retry),
+            // 数字炸弹的加入/开局/结束都按真实发言者判发起人与回合，状态也不接受 Unknown。
+            Self::NumberBomb(_) => true,
             // 这些模块目前仅对好友开放，或将触发用户作为执行契约的一部分。后续增加大厅路由时仍保持保守处理。
             Self::Invite(_) | Self::Moderation(_) | Self::CustomWorkflow(_) => true,
             Self::AiChat(_) => true,

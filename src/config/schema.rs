@@ -1696,6 +1696,54 @@ fn turtle_soup_section() -> Vec<ConfigFieldSchema> {
     ]
 }
 
+/// number_bomb 段：数字炸弹。
+fn number_bomb_section() -> Vec<ConfigFieldSchema> {
+    vec![
+        ConfigFieldSchema::db_idle_reload(
+            "enabled",
+            "启用数字炸弹",
+            FieldKind::Bool,
+            "大厅发起、轮流猜数字的娱乐玩法",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "min",
+            "范围下界",
+            int(0, 1_000_000_000),
+            "炸弹与猜测范围的固定下界；必须小于上限",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "max",
+            "默认上限",
+            int(1, 1_000_000_000),
+            "不超过 5 人时的范围上限；必须大于下界",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "turn_timeout_seconds",
+            "回合超时",
+            int(1, 86_400),
+            "当前玩家多久未猜就自动在剩余范围内随机猜一个，单位秒",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "min_players",
+            "最少玩家",
+            int(2, 64),
+            "开局所需最少玩家数；必须至少为 2",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "max_players",
+            "最多玩家",
+            int(2, 64),
+            "房间最多玩家数；必须不小于最少玩家数",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "extra_range_per_player",
+            "超员上限加成",
+            int(0, 1_000_000),
+            "超过 5 人后，每多 1 人给默认上限增加多少；0 表示不加",
+        ),
+    ]
+}
+
 /// ai 段：统一 AI 连接配置（点歌、歌曲审核、海龟汤共用）。
 fn ai_section() -> Vec<ConfigFieldSchema> {
     vec![
@@ -2574,6 +2622,13 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             domain: Domain::Entertainment,
             order: 19,
             fields: with_section_prefix("turtle_soup", turtle_soup_section()),
+        },
+        ConfigSectionSchema {
+            name: "number_bomb".to_string(),
+            label: "数字炸弹".to_string(),
+            domain: Domain::Entertainment,
+            order: 31,
+            fields: with_section_prefix("number_bomb", number_bomb_section()),
         },
         ConfigSectionSchema {
             name: "ai".to_string(),

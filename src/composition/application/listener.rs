@@ -2645,8 +2645,41 @@ impl ApplicationRuntime {
                 &message.text,
                 &message.message_type,
                 message.sender.as_deref(),
-                observation,
+                observation.clone(),
             );
+            // 数字炸弹进行中，玩家按需求直接发纯数字；这种文本没有 @/# 前缀，
+            // 不会形成命令信封。这里只在该玩法进行中补一个井号信封，
+            // 再交给统一路由/命令锁，避免为它另造一条绕过锁的执行旁路。
+            let envelope = envelope.or_else(|| {
+                // 数字炸弹进行中，当前玩家直接发数字；非数字也进来只提示本人。
+                // 只包装蓝字大厅：好友私聊消息不应被玩法吞掉。
+                (active_entertainment
+                    == Some(crate::features::entertainment::EntertainmentKind::NumberBomb)
+                    && message.message_type == "blue"
+                    && !message.text.trim().is_empty())
+                .then(|| {
+                    let trimmed = message.text.trim();
+                    // 非数字前面加一个“猜”字再补井号：否则裸说的“加入/结束”
+                    // 会被会话路由当成控制命令执行。它只作为数字炸弹的一次
+                    // 无效猜测进入业务层，由业务判断是不是当前玩家再决定提示。
+                    let wrapped = if crate::features::number_bomb::NumberBombCommand::plain_guess(
+                        trimmed,
+                    )
+                    .is_some()
+                    {
+                        format!("#{trimmed}")
+                    } else {
+                        format!("#猜{trimmed}")
+                    };
+                    command::parse_command_envelope(
+                        &wrapped,
+                        &message.message_type,
+                        message.sender.as_deref(),
+                        observation,
+                    )
+                })
+                .flatten()
+            });
             let routed = envelope
                 .as_ref()
                 .and_then(|envelope| command_router.route(envelope, active_entertainment));
@@ -3109,6 +3142,11 @@ impl ApplicationRuntime {
             Ok(false) => {}
             Err(error) => log::error!("无法中止旧成语接龙会话：{error:#}"),
         }
+        match self.business.business.abort_number_bomb() {
+            Ok(true) => log::warn!("数字炸弹已因聊天上下文变化中止：{}", reason),
+            Ok(false) => {}
+            Err(error) => log::error!("无法中止旧数字炸弹会话：{error:#}"),
+        }
     }
 
     fn tick_entertainment(&self) {
@@ -3172,6 +3210,33 @@ impl ApplicationRuntime {
                 );
                 if let Err(cancel_error) = self.business.undercover_game.cancel_effect(key) {
                     log::error!("谁是卧底计时消息入队失败后无法清理牌局：{cancel_error:#}");
+                }
+            }
+        }
+        // 数字炸弹的超时推进在业务线程内完成，这里只把已经产生的文案送入
+        // 延迟聊天队列；不需要 claim/resume，因为超时没有需要回滚的 UI 效果。
+        let number_bomb_outcome = match self
+            .business
+            .business
+            .poll_number_bomb_timeout(Instant::now(), clock_active)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log::error!("无法推进数字炸弹计时：{error:#}");
+                None
+            }
+        };
+        if let Some(outcome) = number_bomb_outcome {
+            for reply in &outcome.replies {
+                let Some(text) = self.render_template_text(reply.spec, &reply.vars) else {
+                    continue;
+                };
+                if let Err(error) =
+                    enqueue_current_hall_reply(&self.business.task_engine, &text)
+                {
+                    log::error!(
+                        "数字炸弹超时提示入队失败（步骤：把自动猜测结果加入延迟聊天队列），本次提示不会发送给玩家，玩局状态已经推进：{error:#}"
+                    );
                 }
             }
         }

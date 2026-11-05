@@ -344,6 +344,7 @@ pub(crate) fn resolve_for_routed(
         ModuleCommand::CardGame(_) => Some("#斗地主"),
         ModuleCommand::Undercover(_) => Some("#卧底"),
         ModuleCommand::TurtleSoup(_) => Some("#海龟汤"),
+        ModuleCommand::NumberBomb(_) => Some("#数字炸弹"),
         _ => None,
     };
     if let Some(id) = forced {
@@ -369,6 +370,7 @@ pub(crate) fn resolve_for_routed(
         ModuleCommand::CardGame(_) => "#斗地主",
         ModuleCommand::Undercover(_) => "#卧底",
         ModuleCommand::TurtleSoup(_) => "#海龟汤",
+        ModuleCommand::NumberBomb(_) => "#数字炸弹",
         // 帮助类：必须给真实 id。
         //
         // `administration::claims_chat` 把 matched 固定写成 "#"，而上面按 matched

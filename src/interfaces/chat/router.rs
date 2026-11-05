@@ -14,6 +14,7 @@ use crate::features::idiom_chain::IdiomChainCommand;
 use crate::features::idiom_chain::IdiomChainMode;
 use crate::features::invite::InviteCommand;
 use crate::features::moderation::ModerationCommand;
+use crate::features::number_bomb::NumberBombCommand;
 use crate::features::playback::PlaybackCommand;
 use crate::features::song_request::SongCommand;
 use crate::features::turtle_soup::TurtleSoupCommand;
@@ -141,6 +142,11 @@ pub(crate) const HASH_START_HANDLERS: &[ChatHandler] = &[
         ChatCommandModule::Undercover,
         UndercoverCommand::claims_start_chat,
         |envelope| route_undercover(envelope).map(|matched| matched.map(ModuleCommand::Undercover)),
+    ),
+    handler(
+        ChatCommandModule::NumberBomb,
+        NumberBombCommand::claims_start_chat,
+        |envelope| route_number_bomb(envelope).map(|matched| matched.map(ModuleCommand::NumberBomb)),
     ),
     handler(
         ChatCommandModule::Administration,
@@ -493,6 +499,52 @@ mod tarot_routing_tests {
     }
 
     #[test]
+    fn number_bomb_start_and_session_commands_route_through_the_hash_tables() {
+        let router = ChatCommandRouter::without_custom_workflow();
+        let start = router
+            .route(&envelope("blue", "#数字炸弹"), None)
+            .expect("数字炸弹应能开局");
+        assert!(matches!(
+            start.command,
+            ModuleCommand::NumberBomb(crate::features::number_bomb::NumberBombCommand::Start)
+        ));
+
+        let active = Some(EntertainmentKind::NumberBomb);
+        for (text, expected) in [
+            ("#加入", crate::features::number_bomb::NumberBombCommand::Join),
+            (
+                "#开始",
+                crate::features::number_bomb::NumberBombCommand::StartGame,
+            ),
+            (
+                "#状态",
+                crate::features::number_bomb::NumberBombCommand::Status,
+            ),
+            (
+                "#结束",
+                crate::features::number_bomb::NumberBombCommand::End,
+            ),
+            (
+                "#重来",
+                crate::features::number_bomb::NumberBombCommand::Retry,
+            ),
+            ("#42", crate::features::number_bomb::NumberBombCommand::Guess(42)),
+        ] {
+            let routed = router
+                .route(&envelope("blue", text), active)
+                .unwrap_or_else(|| panic!("{text} 应路由到数字炸弹"));
+            assert_eq!(
+                routed.command,
+                ModuleCommand::NumberBomb(expected),
+                "{text}"
+            );
+        }
+
+        // 没有进行中的玩法时，纯数字不是命令；进行中才由 listener 补井号信封。
+        assert!(router.route(&envelope("blue", "#42"), None).is_none());
+    }
+
+    #[test]
     fn hash_entertainment_help_accepts_the_full_name_too() {
         let router = ChatCommandRouter::without_custom_workflow();
         for text in ["#娱乐", "#帮助", "#娱乐帮助"] {
@@ -654,13 +706,15 @@ fn hash_entertainment_session_mismatch(
         }
         Some(EntertainmentKind::TurtleSoup) => TurtleSoupCommand::claims_active_chat(envelope),
         Some(EntertainmentKind::Undercover) => UndercoverCommand::claims_active_chat(envelope),
+        Some(EntertainmentKind::NumberBomb) => NumberBombCommand::claims_active_chat(envelope),
         _ => false,
     };
     !matches_active
         && (IdiomChainCommand::claims_active_chat(envelope)
             || LandlordCommand::claims_active_chat(envelope)
             || TurtleSoupCommand::claims_active_chat(envelope)
-            || UndercoverCommand::claims_active_chat(envelope))
+            || UndercoverCommand::claims_active_chat(envelope)
+            || NumberBombCommand::claims_recognized_session_chat(envelope))
 }
 
 /// 角色转成面向维护者的中文称谓（用于日志，不参与判定）。
@@ -729,6 +783,10 @@ fn route_turtle_soup(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<T
 
 fn route_undercover(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<UndercoverCommand>> {
     UndercoverCommand::parse_start_chat(envelope)
+}
+
+fn route_number_bomb(envelope: &CommandEnvelope) -> Option<FeatureCommandMatch<NumberBombCommand>> {
+    NumberBombCommand::parse_start_chat(envelope)
 }
 
 /// OCR 容错：去掉命令文本首尾的噪声标点后重试路由。

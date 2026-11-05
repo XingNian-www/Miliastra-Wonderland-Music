@@ -393,6 +393,25 @@ pub(crate) struct ResolvedSongRequest {
 }
 
 impl ResolvedSongRequest {
+    /// 装配候选结果：把「所有选歌路径都一样」的字段集中在一处。
+    ///
+    /// 原来 11 处结构体字面量各抄一遍 prefer_accompaniment / requester /
+    /// console_bypass_dedup / friend_username，任何一处漏改就会让某条选歌路径
+    /// 丢失展示名或去重标记。差异字段由调用方显式覆盖。
+    fn base(song: &SongCommand, friend_username: String) -> Self {
+        Self {
+            keyword: song.keyword.clone(),
+            source: song.source.as_str().to_owned(),
+            prefer_accompaniment: song.prefer_accompaniment,
+            ai_original_text: String::new(),
+            track: None,
+            friend_username,
+            requester: String::new(),
+            console_bypass_dedup: false,
+            candidate_snapshot: Vec::new(),
+        }
+    }
+
     pub(crate) fn label(&self) -> String {
         source_label(&self.friend_username)
     }
@@ -800,13 +819,10 @@ impl SongRequestExecution<'_> {
             return Ok(Some(ResolvedSongRequest {
                 keyword: song.keyword.clone(),
                 source: song.source.as_str().to_string(),
-                prefer_accompaniment: song.prefer_accompaniment,
                 ai_original_text: String::new(),
                 track: None,
-                friend_username: self.display_or_actor(&song.friend_username),
-                requester: String::new(),
-                console_bypass_dedup: false,
                 candidate_snapshot: Vec::new(),
+                ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
             }));
         }
         self.resolve_ai_song_request(song, true)
@@ -1105,13 +1121,10 @@ impl SongRequestExecution<'_> {
                 return Ok(Some(ResolvedSongRequest {
                     keyword: selected.text.clone(),
                     source: String::new(),
-                    prefer_accompaniment: song.prefer_accompaniment,
                     ai_original_text: song.keyword.clone(),
                     track: Some(selected.playable_track()),
-                    friend_username: self.display_or_actor(&song.friend_username),
-                    requester: String::new(),
-                    console_bypass_dedup: false,
                     candidate_snapshot: vec![selected],
+                    ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
                 }));
             }
             SongRequestDecision::Skip
@@ -1131,13 +1144,10 @@ impl SongRequestExecution<'_> {
         Ok(Some(ResolvedSongRequest {
             keyword: candidate.text.clone(),
             source: String::new(),
-            prefer_accompaniment: song.prefer_accompaniment,
             ai_original_text: song.keyword.clone(),
             track: Some(candidate.playable_track()),
-            friend_username: self.display_or_actor(&song.friend_username),
-            requester: String::new(),
-            console_bypass_dedup: false,
             candidate_snapshot: selection,
+            ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
         }))
     }
 
@@ -1369,13 +1379,10 @@ impl SongRequestExecution<'_> {
                     return Ok(Some(ResolvedSongRequest {
                         keyword: candidate.text.clone(),
                         source: source.to_string(),
-                        prefer_accompaniment: song.prefer_accompaniment,
                         ai_original_text: String::new(),
                         track: Some(candidate.playable_track()),
-                        friend_username: self.display_or_actor(&song.friend_username),
-                        requester: String::new(),
-                        console_bypass_dedup: false,
                         candidate_snapshot: vec![candidate],
+                        ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
                     }));
                 }
                 NoCandidateOutcome::SwitchSource => {
@@ -1416,13 +1423,10 @@ impl SongRequestExecution<'_> {
                 Ok(Some(ResolvedSongRequest {
                     keyword: picked.candidate.text.clone(),
                     source: source.to_string(),
-                    prefer_accompaniment: song.prefer_accompaniment,
                     ai_original_text: String::new(),
                     track: Some(picked.candidate.playable_track()),
-                    friend_username: self.display_or_actor(&song.friend_username),
-                    requester: String::new(),
-                    console_bypass_dedup: false,
                     candidate_snapshot: picked.candidate_snapshot,
+                    ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
                 }))
             }
             SongRequestDecision::SelectIndex(index) => {
@@ -1433,13 +1437,10 @@ impl SongRequestExecution<'_> {
                 Ok(Some(ResolvedSongRequest {
                     keyword: candidate.text.clone(),
                     source: source.to_string(),
-                    prefer_accompaniment: song.prefer_accompaniment,
                     ai_original_text: String::new(),
                     track: Some(candidate.playable_track()),
-                    friend_username: self.display_or_actor(&song.friend_username),
-                    requester: String::new(),
-                    console_bypass_dedup: false,
                     candidate_snapshot: picked.candidate_snapshot,
+                    ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
                 }))
             }
             SongRequestDecision::Skip => {

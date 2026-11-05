@@ -941,7 +941,10 @@ pub(crate) const SESSION_DISPATCH: &[SessionDispatch] = &[
         },
         // 斗地主进行中，任何没有被保留关键词接住的文本都会被当成"出的牌"。
         open_ended: true,
-        keywords: &["加入", "抢", "不抢", "过", "状态", "重试", "结束", "手牌"],
+        keywords: &[
+            "加入", "叫地主", "叫", "不叫", "抢", "抢地主", "不抢", "反抢", "过", "状态",
+            "重试", "结束", "手牌",
+        ],
         label: "斗地主",
     },
     SessionDispatch {

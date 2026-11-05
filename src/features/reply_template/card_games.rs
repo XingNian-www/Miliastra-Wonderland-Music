@@ -143,7 +143,7 @@ pub(crate) const BIDDING_ROB_DECLINED: ReplyTemplate = spec(
 /// 有人抢后，原叫地主者获得一次反抢机会。
 pub(crate) const BIDDING_COUNTER_PROMPT: ReplyTemplate = spec(
     "card_games.bidding.counter_prompt",
-    "{抢地主}抢地主，{玩家}可发 #反抢 或 #不抢",
+    "{抢地主}抢地主，{玩家}可发 #抢 或 #不抢",
     "反抢提示",
 );
 

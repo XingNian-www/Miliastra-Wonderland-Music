@@ -830,7 +830,13 @@ impl ApplicationRuntime {
                 .lifecycle
                 .live_configs
                 .identity
-                .search_names_for_account(&account.game, &account.uid);
+                .friend_search_names(
+                    &parsed.username,
+                    parsed
+                        .account
+                        .as_ref()
+                        .map(|account| (account.game.as_str(), account.uid.as_str())),
+                );
             if !names.is_empty() {
                 // 不打印真实 UID：它是玩家标识（MUST_READ §9）。
                 log::info!(

@@ -216,14 +216,15 @@ impl ApplicationRuntime {
                 .identity
                 .replace_display_names(message.message());
             let display_message = fit_chat_message(&display_message);
-            // 特征层只知道「发给谁」（通常是软件显示名），而好友列表显示的是
-            // 备注串；这里把展示名换回屏幕名再搜。换不回来（未登记玩家）时
-            // 退回展示名本身，行为与以前一致。
+            // 特征层只知道「发给谁」：可能是软件显示名，也可能是内部身份键。
+            // 好友列表显示的是备注串，所以这里先认身份再换回屏幕名；
+            // 换不回来（未登记玩家）时退回收件人本身，行为与以前一致。
+            // 同名歧义时该函数返回空表，宁可在 UI 前失败，也不发给另一个人。
             let search_names = if message.search_names().is_empty() {
                 self.lifecycle
                     .live_configs
                     .identity
-                    .search_names_for_display_name(message.recipient())
+                    .search_names_for_key(message.recipient())
             } else {
                 message.search_names().to_vec()
             };

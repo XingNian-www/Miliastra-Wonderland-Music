@@ -307,10 +307,13 @@ impl IdentityAccess {
             return None;
         }
         let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        // 只归一化存下来的那一侧：面板粘贴/手改可能带首尾空白，
+        // 而 OCR 读出来是干净的，不 trim 就永远匹配不上。
+        // 输入侧仍精确匹配（尾部空白不模糊匹配是既有语义）。
         config
             .mappings
             .iter()
-            .find(|mapping| mapping.remark == nickname)
+            .find(|mapping| mapping.remark.trim() == nickname)
             .map(|mapping| ResolvedIdentity {
                 id: mapping.id,
                 role: mapping.role,
@@ -958,6 +961,25 @@ mod tests {
                 .is_empty()
         );
     }
+    #[test]
+    fn stored_remark_with_padding_still_matches_the_clean_ocr_name() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            // 面板粘贴/手改可能带首尾空白；OCR 读出来是干净的。
+            remark: "  abcd1234  ".to_owned(),
+            id: Uuid::from_u128(21),
+            role: IdentityRole::Friend,
+            real_nickname: String::new(),
+            display_name: String::new(),
+            remark_from_chatbridge: false,
+            accounts: Vec::new(),
+        });
+        let access = IdentityAccess::new(config);
+        assert!(access.resolve("abcd1234").is_some(), "存下来的空白不该影响匹配");
+        // 输入侧仍精确：多一个尾空格就不匹配（既有语义）。
+        assert!(access.resolve("abcd1234 ").is_none());
+    }
+
     #[test]
     fn resolve_matches_exactly_and_never_maps_unknown() {
         let access = IdentityAccess::new(sample_config());

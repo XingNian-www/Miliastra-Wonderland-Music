@@ -1,11 +1,11 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FriendMessage {
-    recipient: String,
-    /// 搜好友列表时可尝试的其他名字。
+    /// 收件人：可以是软件显示名、内部身份键，或只有 UID 时的命令主语。
     ///
-    /// 用于只有 UID 的场景：`recipient` 可能是纯 UID（外部聊天源的信封主语），
-    /// 而好友列表上显示的是昵称/备注。这里补上真正可匹配的名字。
-    search_names: Vec<String>,
+    /// 搜好友列表要用的名字**不在这里给**：装配层统一用
+    /// identity.friend_search_names 从收件人反查（备注串 → 真实昵称），
+    /// 避免调用方各拼一份候选导致口径分叉。
+    recipient: String,
     message: String,
 }
 
@@ -13,23 +13,8 @@ impl FriendMessage {
     pub(crate) fn new(recipient: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             recipient: recipient.into(),
-            search_names: Vec::new(),
             message: message.into(),
         }
-    }
-
-    /// 追加可搜索的候选名（UID 反查得到）。
-    pub(crate) fn with_search_names<I, S>(mut self, names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.search_names = names.into_iter().map(Into::into).collect();
-        self
-    }
-
-    pub(crate) fn search_names(&self) -> &[String] {
-        &self.search_names
     }
 
     pub(crate) fn recipient(&self) -> &str {

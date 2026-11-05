@@ -30,6 +30,70 @@ use crate::ui::routines::{
     ExecuteModeration, ModerationEffect, ModerationUiAction, UiResidencyOutcome,
 };
 
+/// 等待一份可作为基线的共享聊天快照。
+///
+/// 二级确认窗口（`secondary_chat.rs`）与管理投票共用这套「请求刷新 → 限时等待 →
+/// NoChat 退避重挂」的骨架，差异只由两个闭包表达：
+/// - `ensure_ready`：每轮等待前的取消条件（停止/暂停/配置重载/值守模式切换）。
+///   返回 `Err` 时立即结束等待并原样返回该错误。
+/// - `accept`：筛选快照（大厅容器、屏幕桶、空帧规则）。返回 `false` 时换一个新
+///   token 继续等，不把这份快照当基线消耗掉。
+///
+/// 行为约定（与改造前两处实现一致）：
+/// - 总期限不因重试延长；到期返回 `Ok(None)`，由调用方决定超时文案。
+/// - `NoChatRefreshError` 是瞬态视图缺口，不是观察失败：重挂刷新围栏后按剩余
+///   期限最多退避 50ms。
+/// - 单次等待最长 50ms，循环重试；`Ok(None)`（等待分片超时）不重挂 token。
+/// - `error_context` 只加在等待本身的终态错误上；取消错误与 `request_refresh`
+///   的错误保持原样，避免改写既有错误链。
+pub(super) fn wait_for_chat_baseline(
+    timeline: &ChatTimeline,
+    deadline: Instant,
+    mut ensure_ready: impl FnMut() -> Result<()>,
+    mut accept: impl FnMut(&ChatTimelineSnapshot) -> bool,
+    error_context: Option<&'static str>,
+) -> Result<Option<ChatTimelineSnapshot>> {
+    ensure_ready()?;
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
+    let mut refresh = timeline.request_refresh()?;
+    loop {
+        ensure_ready()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match timeline.wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50))) {
+            Ok(Some(snapshot)) => {
+                if accept(&snapshot) {
+                    return Ok(Some(snapshot));
+                }
+                refresh = timeline.request_refresh()?;
+            }
+            Ok(None) => {}
+            Err(error) if error.downcast_ref::<NoChatRefreshError>().is_some() => {
+                // No chat is a transient view gap, not an OCR failure. Rearm the
+                // capture fence without extending the caller's deadline.
+                let backoff = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50));
+                if backoff.is_zero() {
+                    return Ok(None);
+                }
+                refresh = timeline.request_refresh()?;
+                thread::sleep(backoff);
+            }
+            Err(error) => {
+                return match error_context {
+                    Some(context) => Err(error).context(context),
+                    None => Err(error),
+                };
+            }
+        }
+    }
+}
+
 struct ModerationVoteContext {
     running: Arc<AtomicBool>,
     chat_timeline: ChatTimeline,
@@ -79,65 +143,45 @@ impl ModerationVoteContext {
         scope: &ChatScope,
         deadline: Instant,
     ) -> Result<Option<ChatTimelineSnapshot>> {
+        // 保持原顺序：先确认还在运行，再判断期限，最后才请求刷新围栏。
         if !self.running.load(AtomicOrdering::SeqCst) {
             anyhow::bail!("运行已停止，已结束管理投票");
         }
         if Instant::now() >= deadline {
             return Ok(None);
         }
-        let mut refresh = self.chat_timeline.request_refresh()?;
-        loop {
-            if !self.running.load(AtomicOrdering::SeqCst) {
-                anyhow::bail!("运行已停止，已结束管理投票");
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(None);
-            }
-            match self
-                .chat_timeline
-                .wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50)))
-            {
-                Ok(Some(snapshot)) => {
-                    // 只认当前大厅这个业务容器：一级区/二级区是同一大厅的两块
-                    // 面板，按 scope 判就不必再区分；外部源没有屏幕也同样成立。
-                    if !snapshot.scope.same_container(scope) {
-                        refresh = self.chat_timeline.request_refresh()?;
-                        continue;
-                    }
-                    // 空帧能否作基线，取决于它是不是「真正的大厅帧」。
-                    //
-                    // 旧实现按 `chat == PrimaryHall` 判：空的 PrimaryHall 帧可以，
-                    // 其它桶（PublicChannel/Stranger/Unknown，scope 也算大厅）不行。
-                    // 现在按 scope 判会让这些桶都通过——那是本轮引入的行为改变。
-                    //
-                    // 所以这里补回原判据：只有一级/二级大厅面板的空帧才算基线。
-                    // 它们之后出现的整屏历史由序号水位挡住（空帧水位 0、历史序号 > 0，
-                    // 这是既有语义）；跨面板时由消息级时间比较挡住。
-                    if snapshot.messages.is_empty()
-                        && !matches!(
-                            snapshot.chat.as_ref(),
-                            Some(ChatIdentity::PrimaryHall | ChatIdentity::SecondaryHall)
-                        )
-                    {
-                        refresh = self.chat_timeline.request_refresh()?;
-                        continue;
-                    }
-                    return Ok(Some(snapshot));
+        wait_for_chat_baseline(
+            &self.chat_timeline,
+            deadline,
+            || {
+                if !self.running.load(AtomicOrdering::SeqCst) {
+                    anyhow::bail!("运行已停止，已结束管理投票");
                 }
-                Ok(None) => {}
-                Err(error) if error.downcast_ref::<NoChatRefreshError>().is_some() => {
-                    // No chat is a transient view gap, not an OCR failure. Rearm
-                    // the capture fence without extending the caller's deadline.
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if !remaining.is_zero() && self.running.load(AtomicOrdering::SeqCst) {
-                        refresh = self.chat_timeline.request_refresh()?;
-                        thread::sleep(remaining.min(Duration::from_millis(50)));
-                    }
+                Ok(())
+            },
+            |snapshot| {
+                // 只认当前大厅这个业务容器：一级区/二级区是同一大厅的两块
+                // 面板，按 scope 判就不必再区分；外部源没有屏幕也同样成立。
+                if !snapshot.scope.same_container(scope) {
+                    return false;
                 }
-                Err(error) => return Err(error).context("管理投票共享 OCR 基线失败"),
-            }
-        }
+                // 空帧能否作基线，取决于它是不是「真正的大厅帧」。
+                //
+                // 旧实现按 `chat == PrimaryHall` 判：空的 PrimaryHall 帧可以，
+                // 其它桶（PublicChannel/Stranger/Unknown，scope 也算大厅）不行。
+                // 现在按 scope 判会让这些桶都通过——那是本轮引入的行为改变。
+                //
+                // 所以这里补回原判据：只有一级/二级大厅面板的空帧才算基线。
+                // 它们之后出现的整屏历史由序号水位挡住（空帧水位 0、历史序号 > 0，
+                // 这是既有语义）；跨面板时由消息级时间比较挡住。
+                !(snapshot.messages.is_empty()
+                    && !matches!(
+                        snapshot.chat.as_ref(),
+                        Some(ChatIdentity::PrimaryHall | ChatIdentity::SecondaryHall)
+                    ))
+            },
+            Some("管理投票共享 OCR 基线失败"),
+        )
     }
 }
 
@@ -1517,6 +1561,43 @@ mod tests {
         assert!(result.is_err());
         assert!(!port.is_running());
         assert!(stopped_at.elapsed() < Duration::from_secs(1));
+    }
+
+    /// 取消条件成立后，等待器必须在下一轮检查时立刻结束，不能等满总期限。
+    ///
+    /// 前两轮允许通过：第一轮是入口检查，第二轮进入一次 50ms 的等待分片，
+    /// 之后闭包才报告「运行已停止」，覆盖的是**等待中途**取消，而不是入口直接拒绝。
+    #[test]
+    fn shared_baseline_wait_returns_early_when_the_cancel_condition_trips() {
+        let shared = ChatTimeline::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let started = Instant::now();
+        let error = wait_for_chat_baseline(
+            &shared,
+            deadline,
+            || {
+                if checks.fetch_add(1, AtomicOrdering::SeqCst) < 2 {
+                    Ok(())
+                } else {
+                    anyhow::bail!("运行已停止，已结束管理投票")
+                }
+            },
+            |_| true,
+            None,
+        )
+        .expect_err("取消后应立即返回错误，而不是等满 5 秒");
+        assert_eq!(format!("{error}"), "运行已停止，已结束管理投票");
+        assert_eq!(
+            checks.load(AtomicOrdering::SeqCst),
+            3,
+            "取消条件必须每轮等待前都检查一次"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "取消检查未及时生效，实际等待 {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

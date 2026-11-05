@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
 use image::DynamicImage;
-use image::imageops::FilterType;
 
 use crate::runtime::ui::{
     InputCertainty, UiRoutineContext, UiRoutineFailure, UiStateKind, UiStateObservation,
 };
+use crate::ui::frame::{Canvas, resize_to_canvas};
 
 #[derive(Clone, Copy)]
 pub(super) struct UiStateObservationConfig {
@@ -45,15 +45,13 @@ pub(super) fn capture_normalized_ui_state(
         .capture_frame()
         .map_err(|error| UiRoutineFailure::new(certainty, stage, format!("{error:#}")))?;
     let image = image.into_image();
-    if image.width() == config.canvas_width && image.height() == config.canvas_height {
-        Ok(image)
-    } else {
-        Ok(image.resize_exact(
-            config.canvas_width,
-            config.canvas_height,
-            FilterType::Triangle,
-        ))
-    }
+    let canvas = Canvas {
+        width: config.canvas_width,
+        height: config.canvas_height,
+        resize: true,
+    };
+    let normalized = resize_to_canvas(&image, &canvas, None);
+    Ok(normalized.unwrap_or(image))
 }
 
 pub(super) fn wait_for_stable_ui_kind(

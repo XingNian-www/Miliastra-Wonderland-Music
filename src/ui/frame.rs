@@ -68,36 +68,51 @@ impl LatestFrameCache {
 pub(crate) fn from_captured_frame(frame: &CapturedFrame, canvas: &Canvas) -> Frame {
     let started = Instant::now();
     let source = frame.image_arc();
+    let image = match resize_to_canvas(&source, canvas, Some(started)) {
+        Some(normalized) => Arc::new(normalized),
+        None => source,
+    };
     Frame {
         source_frame_id: Some(frame.id()),
-        image: normalize_frame(source, canvas, started),
+        image,
         captured_at: frame.captured_at(),
         ui_state: frame.ui_state().cloned(),
     }
 }
 
-fn normalize_frame(
-    image: Arc<DynamicImage>,
+/// 把截图缩放到画布；返回 `None` 表示无需缩放，调用方应沿用原图。
+///
+/// - `canvas.resize == false`：画布缩放开关关闭，绝不缩放。
+/// - 尺寸已等于画布：不分配新图（调用方沿用原图，避免无谓拷贝）。
+/// - 其余情况：`resize_exact(.., Triangle)`。
+///
+/// 耗时日志只在传入 `started` 时输出。截图入口传入采集起点；分类与 UI 事务的
+/// 逐帧路径传 `None`，避免给每帧都加一条 info（logging-style.md 要求逐帧日志
+/// 上限 debug，且这些路径原本没有这条日志）。
+pub(crate) fn resize_to_canvas(
+    image: &DynamicImage,
     canvas: &Canvas,
-    started: Instant,
-) -> Arc<DynamicImage> {
+    started: Option<Instant>,
+) -> Option<DynamicImage> {
     let (source_width, source_height) = image.dimensions();
-    let image = if canvas.resize && (source_width != canvas.width || source_height != canvas.height)
-    {
-        Arc::new(image.resize_exact(canvas.width, canvas.height, FilterType::Triangle))
-    } else {
-        image
-    };
-    log::info!(target: "timing",
-        "截图加载耗时: {}ms source={}x{} output={}x{} resize={}",
-        elapsed_ms(started),
-        source_width,
-        source_height,
-        image.width(),
-        image.height(),
-        canvas.resize && (source_width != canvas.width || source_height != canvas.height)
-    );
-    image
+    let resized = (canvas.resize
+        && (source_width != canvas.width || source_height != canvas.height))
+        .then(|| image.resize_exact(canvas.width, canvas.height, FilterType::Triangle));
+    if let Some(started) = started {
+        let (output_width, output_height) = resized
+            .as_ref()
+            .map_or((source_width, source_height), |image| image.dimensions());
+        log::info!(target: "timing",
+            "截图加载耗时: {}ms source={}x{} output={}x{} resize={}",
+            elapsed_ms(started),
+            source_width,
+            source_height,
+            output_width,
+            output_height,
+            resized.is_some()
+        );
+    }
+    resized
 }
 
 fn elapsed_ms(started: Instant) -> u128 {
@@ -110,13 +125,51 @@ mod tests {
     use std::time::Instant;
 
     use image::DynamicImage;
+    use image::GenericImageView;
 
-    use super::Frame;
+    use super::{Canvas, Frame, resize_to_canvas};
     use crate::runtime::ui::{
         UiEvidenceRect, UiMarkerProbeEvidence, UiStateClassification, UiStateEvidence, UiStateKind,
         UiStateTracker,
     };
     use crate::ui::template::TemplateHit;
+
+    #[test]
+    fn canvas_resize_flag_controls_screenshot_normalization() {
+        let source = DynamicImage::new_rgba8(100, 50);
+
+        // 开关打开：尺寸不匹配时缩放到画布。
+        let resize_on = Canvas {
+            width: 20,
+            height: 10,
+            resize: true,
+        };
+        let resized =
+            resize_to_canvas(&source, &resize_on, None).expect("尺寸不匹配时应返回缩放后的图像");
+        assert_eq!(resized.dimensions(), (20, 10));
+
+        // 开关关闭：即使尺寸不匹配也保持原图，也不分配新图。
+        let resize_off = Canvas {
+            width: 20,
+            height: 10,
+            resize: false,
+        };
+        assert!(
+            resize_to_canvas(&source, &resize_off, None).is_none(),
+            "画布缩放开关关闭时不得缩放"
+        );
+
+        // 尺寸已匹配：无需缩放，调用方沿用原图。
+        let matching = Canvas {
+            width: 100,
+            height: 50,
+            resize: true,
+        };
+        assert!(
+            resize_to_canvas(&source, &matching, None).is_none(),
+            "尺寸已匹配时不应产生新图"
+        );
+    }
 
     #[test]
     fn marker_hits_are_reused_in_the_classifier_coordinate_space() {

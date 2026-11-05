@@ -1977,24 +1977,22 @@ impl TurtleSoupWorker {
         verification: bool,
     ) -> std::result::Result<(Judgment, u32), (anyhow::Error, u32)> {
         let max_attempts = self.config.retry_count.saturating_add(1);
-        let mut last_error = None;
-        for attempt in 1..=max_attempts {
-            match self.call_ai_once(job, context, verification) {
-                Ok(judgment) => return Ok((judgment, attempt.saturating_sub(1))),
-                Err(error) => {
-                    last_error = Some(error);
-                    if attempt < max_attempts {
-                        self.retry_delay
-                            .wait(Duration::from_millis(self.config.retry_delay_ms));
-                    }
-                }
+        match crate::retry::retry_with_backoff(
+            max_attempts,
+            Duration::from_millis(self.config.retry_delay_ms),
+            || self.call_ai_once(job, context, verification),
+            |_, _, _| {},
+            |delay| self.retry_delay.wait(delay),
+        ) {
+            crate::retry::RetryOutcome::Ok { value, attempts } => {
+                Ok((value, attempts.saturating_sub(1)))
+            }
+            crate::retry::RetryOutcome::Err { error, attempts } => {
+                Err((error, attempts.saturating_sub(1)))
             }
         }
-        Err((
-            last_error.unwrap_or_else(|| anyhow!("海龟汤 AI 审查失败")),
-            max_attempts.saturating_sub(1),
-        ))
     }
+
 
     fn call_ai_once(
         &self,
@@ -2315,29 +2313,19 @@ fn question_content_identity(question: &TurtleSoupQuestion) -> QuestionContentId
 }
 
 fn normalize_ocr_content(value: &str) -> String {
-    value
+    // 全角折算与空白策略复用共享实现，这里只保留 OCR 特有的中文标点映射
+    // （折叠后被折成半角的那些分支不会命中，保留只为可读性）。
+    crate::text::fold_wide(value)
         .chars()
         .filter(|ch| !ch.is_whitespace())
-        .filter_map(|ch| {
-            if ('\u{ff01}'..='\u{ff5e}').contains(&ch) {
-                return char::from_u32(ch as u32 - 0xfee0);
-            }
-            Some(match ch {
-                '，' => ',',
-                '。' => '.',
-                '、' => ',',
-                '；' => ';',
-                '：' => ':',
-                '？' => '?',
-                '！' => '!',
-                '（' => '(',
-                '）' => ')',
-                '【' => '[',
-                '】' => ']',
-                _ => ch,
-            })
+        .map(|ch| match ch {
+            '。' => '.',
+            '、' => ',',
+            '【' => '[',
+            '】' => ']',
+            other => other,
         })
-        .flat_map(|ch| ch.to_lowercase())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 
@@ -2350,7 +2338,7 @@ fn normalize_player_display(value: &str) -> String {
 }
 
 fn normalize_player_key(value: &str) -> String {
-    normalize_player_display(value).to_ascii_lowercase()
+    crate::text::player_match_key(value)
 }
 
 fn load_used_state(path: &Path, store: &dyn StateStore) -> Result<UsedQuestionState> {

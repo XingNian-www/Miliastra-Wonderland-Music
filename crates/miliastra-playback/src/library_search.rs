@@ -14,18 +14,7 @@ fn compact(value: &str) -> String {
 
 /// 仅归一化大小写、全角 ASCII 和空白；保留版本词及有意义的标点。
 fn normalize(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '　' => ' ',
-            '！'..='～' => char::from_u32(ch as u32 - 0xfee0).unwrap_or(ch),
-            _ => ch,
-        })
-        .flat_map(char::to_lowercase)
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    miliastra_kernel::text::normalize_folded(value)
 }
 
 /// 连写片段短于这个长度时，必须等于整个字段，避免把关键词拆成无意义碎片。

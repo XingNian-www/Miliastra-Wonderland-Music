@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use image::DynamicImage;
-use image::imageops::FilterType;
 use serde::Serialize;
 
 use crate::config::{self, OcrConfig, TemplateConfig};
@@ -17,6 +16,7 @@ use crate::runtime::ui::{
     UiStateEvidence, UiStateKind as RuntimeUiStateKind, UiTemplateProbeEvidence,
     UiWorldProbeEvidence,
 };
+use crate::ui::frame::{Canvas, resize_to_canvas};
 #[cfg(test)]
 use crate::ui::template::best_template_hit;
 use crate::ui::template::{
@@ -320,19 +320,14 @@ impl TemplateUiStateClassifier {
         image: &DynamicImage,
         now: Instant,
     ) -> Result<UiStateClassification> {
-        let normalized;
-        let image = if image.width() == self.screen.expected_width
-            && image.height() == self.screen.expected_height
-        {
-            image
-        } else {
-            normalized = image.resize_exact(
-                self.screen.expected_width,
-                self.screen.expected_height,
-                FilterType::Triangle,
-            );
-            &normalized
+        // 与截图入口共用同一套「缩放到画布」实现：尺寸不匹配时缩放，匹配时直接借用原图。
+        let canvas = Canvas {
+            width: self.screen.expected_width,
+            height: self.screen.expected_height,
+            resize: true,
         };
+        let normalized = resize_to_canvas(image, &canvas, None);
+        let image = normalized.as_ref().unwrap_or(image);
         let (state, evidence) =
             match detect_ui_state_with_evidence(image, &self.templates, &self.screen) {
                 Ok(result) => result,

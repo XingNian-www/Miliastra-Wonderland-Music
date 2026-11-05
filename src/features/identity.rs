@@ -724,13 +724,6 @@ impl IdentityAccess {
             .map(|identity| identity.id)
     }
 
-    /// 记忆键对应的展示名（BOT 称呼、面板、日志都用它）。
-    ///
-    /// UUID 键本身不可读，展示时必须换回玩家看得懂的名字。
-    pub fn memory_display_name(&self, name: &str) -> String {
-        self.player_name_for_name(name)
-    }
-
     /// 由记忆键反查展示名：键是 UUID 时找对应身份，否则原样返回。
     pub fn player_name_for_key(&self, key: &str) -> String {
         if let Ok(uuid) = Uuid::parse_str(key) {
@@ -908,17 +901,17 @@ mod tests {
     /// 好友列表上显示的是昵称/备注，`recognized == "900000001"` 永假，
     /// 报 `no unique stable friend row`。
     ///
-    /// UID 反查得到的两个候选都要参与匹配：自动建身份把 API 昵称放 note、
-    /// 随机串放 nickname；手工映射反过来。
+    /// UID 反查得到的候选是「备注串 → 真实昵称」：备注串是屏幕显示名，
+    /// 没有备注时屏幕上显示的就是玩家自设昵称。
     #[test]
-    fn invite_searches_both_note_and_nickname_for_a_uid_initiator() {
+    fn invite_searches_the_remark_and_real_nickname_for_a_uid_initiator() {
         use crate::features::identity::{
             GameAccount, IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
         };
 
         let identity = IdentityAccess::new(IdentityConfig {
             mappings: vec![IdentityMapping {
-                // 手工维护：真名在 nickname，备注在 note
+                // 备注串是屏幕显示名；显示名只是软件内标签，不参与搜索
                 remark: "玩家丙".to_string(),
                 id: uuid::Uuid::new_v4(),
                 role: IdentityRole::Friend,
@@ -1193,9 +1186,8 @@ mod tests {
         // 命中 nickname 或 note，记忆键都是同一个 UUID。
         assert_eq!(access.memory_key("nick_alpha"), id.to_string());
         assert_eq!(access.memory_key("显示名甲"), id.to_string());
-        // 展示名统一是显示昵称。
-        assert_eq!(access.memory_display_name("nick_alpha"), "显示名甲");
-        assert_eq!(access.memory_display_name("显示名甲"), "显示名甲");
+        // 展示名统一走展示链（显示名优先）。
+        assert_eq!(access.player_name_for_name("nick_alpha"), "显示名甲");
         // 由 UUID 键反查展示名。
         assert_eq!(access.player_name_for_key(&id.to_string()), "显示名甲");
         // 未登记的玩家：键退回显示昵称本身。
@@ -1356,8 +1348,9 @@ mod tests {
 
     /// 好友搜索候选：**备注串 → 真实昵称**，解析不到才退回传入的名字。
     ///
-    /// 依据 identity-name-display-and-permission.md：屏幕显示的是 nickname（好友备注优先），
-    /// note 只是面板标签。外部聊天源的 from.name 是资料包昵称，必须先用账号 UID 解析身份。
+    /// 依据 identity-name-display-and-permission.md：屏幕显示的是备注串（remark），
+    /// 软件显示名（display_name）只是面板标签、不会出现在好友列表上。
+    /// 外部聊天源的 from.name 是资料包昵称，必须先用账号 UID 解析身份。
     #[test]
     fn friend_search_names_prefer_the_remark_then_fall_back_to_the_raw_name() {
         let mut config = IdentityConfig::default();

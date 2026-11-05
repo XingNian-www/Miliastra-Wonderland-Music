@@ -9,8 +9,9 @@
 
 默认只打印计划（dry-run）。加 --apply 才真正写库，且会先备份。
 
-映射规则不写死：从 config_sections 的 identity 段读取，
-按 nickname / note 两个字段匹配，与运行时 canonical_name 的口径一致。
+映射规则不写死：从 config_sections 的 identity 段读取。JSON 键名沿用旧名，
+对应关系是 nickname=备注串(remark)、note=软件显示名(display_name)、real_nickname=真实昵称。
+三者都当作 actor 的候选名，与运行时 canonical_actor_name / friend_search_names 的口径一致。
 未匹配到的 actor 视为路人，保持昵称键不动。
 """
 import argparse
@@ -32,7 +33,7 @@ def load_identity(conn):
 
 
 def build_index(mappings):
-    """nickname 与 note 都指向同一个 UUID；note 可能为空。"""
+    """三个名字都指向同一个 UUID；显示名与真实昵称可能为空。"""
     by_key = {}
     for mapping in mappings:
         uuid = mapping.get("id")
@@ -44,6 +45,9 @@ def build_index(mappings):
             by_key[nickname] = uuid
         if note:
             by_key.setdefault(note, uuid)
+        real = (mapping.get("real_nickname") or "").strip()
+        if real:
+            by_key.setdefault(real, uuid)
     return by_key
 
 

@@ -2645,41 +2645,8 @@ impl ApplicationRuntime {
                 &message.text,
                 &message.message_type,
                 message.sender.as_deref(),
-                observation.clone(),
+                observation,
             );
-            // 数字炸弹进行中，玩家按需求直接发纯数字；这种文本没有 @/# 前缀，
-            // 不会形成命令信封。这里只在该玩法进行中补一个井号信封，
-            // 再交给统一路由/命令锁，避免为它另造一条绕过锁的执行旁路。
-            let envelope = envelope.or_else(|| {
-                // 数字炸弹进行中，当前玩家直接发数字；非数字也进来只提示本人。
-                // 只包装蓝字大厅：好友私聊消息不应被玩法吞掉。
-                (active_entertainment
-                    == Some(crate::features::entertainment::EntertainmentKind::NumberBomb)
-                    && message.message_type == "blue"
-                    && !message.text.trim().is_empty())
-                .then(|| {
-                    let trimmed = message.text.trim();
-                    // 非数字前面加一个“猜”字再补井号：否则裸说的“加入/结束”
-                    // 会被会话路由当成控制命令执行。它只作为数字炸弹的一次
-                    // 无效猜测进入业务层，由业务判断是不是当前玩家再决定提示。
-                    let wrapped = if crate::features::number_bomb::NumberBombCommand::plain_guess(
-                        trimmed,
-                    )
-                    .is_some()
-                    {
-                        format!("#{trimmed}")
-                    } else {
-                        format!("#猜{trimmed}")
-                    };
-                    command::parse_command_envelope(
-                        &wrapped,
-                        &message.message_type,
-                        message.sender.as_deref(),
-                        observation,
-                    )
-                })
-                .flatten()
-            });
             let routed = envelope
                 .as_ref()
                 .and_then(|envelope| command_router.route(envelope, active_entertainment));

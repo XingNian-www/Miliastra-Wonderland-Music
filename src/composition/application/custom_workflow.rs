@@ -106,8 +106,7 @@ impl ApplicationRuntime {
         }
         // 收件人主键沿用第一个候选，其余候选随投递一起下发用于搜列表。
         let outcome =
-            self.send_friend_delivery_batch(&[FriendMessage::new(recipients[0].as_str(), message)
-                .with_search_names(recipients.iter().cloned())]);
+            self.send_friend_delivery_batch(&[FriendMessage::new(recipients[0].as_str(), message)]);
         match outcome {
             Ok(FriendBatchOutcome::Complete) => true,
             Ok(FriendBatchOutcome::Failed { failure, .. })
@@ -220,14 +219,11 @@ impl ApplicationRuntime {
             // 好友列表显示的是备注串，所以这里先认身份再换回屏幕名；
             // 换不回来（未登记玩家）时退回收件人本身，行为与以前一致。
             // 同名歧义时该函数返回空表，宁可在 UI 前失败，也不发给另一个人。
-            let search_names = if message.search_names().is_empty() {
-                self.lifecycle
-                    .live_configs
-                    .identity
-                    .friend_search_names(message.recipient(), None)
-            } else {
-                message.search_names().to_vec()
-            };
+            let search_names = self
+                .lifecycle
+                .live_configs
+                .identity
+                .friend_search_names(message.recipient(), None);
             if let Some((recipient, items)) = grouped.last_mut()
                 && recipient == message.recipient()
             {

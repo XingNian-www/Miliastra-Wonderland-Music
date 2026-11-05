@@ -1105,7 +1105,16 @@ impl ApplicationRuntime {
                     .map(str::trim)
                     .filter(|player| !player.is_empty())
                     .and_then(|player| turtle_soup::parse_question_message(&text, Some(player)));
-                if let Some(question) = question {
+                if let Some(mut question) = question {
+                    // 提问里的玩家名走统一展示链（显示名 → 真实昵称 → 占位）：
+                    // OCR 拿到的只是屏幕名（备注串或真实昵称），直接渲染会把
+                    // 随机备注串打到大厅。player_key 仍是原始屏幕名，匹配不受影响。
+                    question.player = self.lifecycle.live_configs.identity.player_name(
+                        &question.player,
+                        account
+                            .as_ref()
+                            .map(|account| (account.game.as_str(), account.uid.as_str())),
+                    );
                     self.enqueue_turtle_soup_question(question, frame.captured_at())?;
                     continue;
                 }

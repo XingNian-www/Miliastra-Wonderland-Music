@@ -41,6 +41,18 @@ const NAME_LOOKUP_RETRY_MS: u64 = 30_000;
 /// 而正常聊天里同一发送者远达不到这个频次，不会造成额外请求。
 const NAME_CACHE_TTL_MS: u64 = 600_000;
 
+/// 主动补查的扫描间隔。
+///
+/// 只在"有人说话"时才查会漏掉从不说话的好友，所以另外按身份映射表定期扫一遍。
+/// 真正的去重仍由 prime_name_lookup 的冷却窗口负责，这里只决定多久看一次表。
+const NAME_PRIME_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 主动补查里"还缺真实昵称"的账号重试间隔。
+///
+/// 比成功后的长 TTL 短得多（/names 的 names 可能当时为 null），
+/// 又不能短到刷屏：本地 ChatBridge 一次请求很便宜，但仍按两分钟收敛。
+const NAME_PRIME_INCOMPLETE_MS: u64 = 120_000;
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -224,6 +236,44 @@ impl ExternalChatState {
             .resolved
             .get(uid)
             .is_some_and(|resolved| now.saturating_sub(resolved.fetched_at_ms) < NAME_CACHE_TTL_MS)
+        {
+            return false;
+        }
+        if lookups
+            .next_attempt_ms
+            .get(uid)
+            .is_some_and(|next| *next > now)
+        {
+            return false;
+        }
+        lookups
+            .next_attempt_ms
+            .insert(uid.to_string(), now + NAME_LOOKUP_IN_FLIGHT_MS);
+        true
+    }
+
+    /// 主动补查的排队申请（按身份映射表扫描用）。
+    ///
+    /// 与消息路径的 begin_name_lookup 区别只在冷却窗口：
+    /// incomplete（身份里还缺真实昵称或备注）时用重试冷却，
+    /// 而不是"成功查过就等 10 分钟"，否则 /names 当时返回 null 的玩家
+    /// 要等很久才会被再补一次。
+    pub(crate) fn prime_name_lookup(&self, uid: &str, incomplete: bool) -> bool {
+        let uid = uid.trim();
+        if uid.is_empty() {
+            return false;
+        }
+        let now = now_millis();
+        let window = if incomplete {
+            NAME_PRIME_INCOMPLETE_MS
+        } else {
+            NAME_CACHE_TTL_MS
+        };
+        let mut lookups = self.name_lookups();
+        if lookups
+            .resolved
+            .get(uid)
+            .is_some_and(|resolved| now.saturating_sub(resolved.fetched_at_ms) < window)
         {
             return false;
         }
@@ -461,6 +511,9 @@ fn run(
         config_store.clone(),
         live_configs.clone(),
     );
+    // 消息驱动的补查只覆盖"说过话的人"。再开一个扫描线程按身份映射表主动补，
+    // 尽量把从不说话的好友的真实昵称也拿到。
+    spawn_name_priming(state.clone(), identity_access.clone(), names.clone());
     loop {
         // 登录器角色：Miliastra-Wonderland-ChatBridge 没在监听时替用户拉起来。
         // 探测很便宜（300ms 超时），每次重连都试一次，这样用户中途关掉也能被重新拉起。
@@ -833,6 +886,54 @@ fn deliver(
 
 /// 后台昵称补查线程。
 ///
+/// 按身份映射表定期扫描，把还没拿到名字的账号排进补查队列。
+///
+/// 消息驱动的补查只在有人说话时发生，从不说话的好友永远拿不到真实昵称；
+/// 这里主动扫表：缺真实昵称或备注串的用短冷却反复重试，齐全的按长 TTL 刷新。
+fn spawn_name_priming(
+    state: ExternalChatState,
+    identity_access: Option<crate::features::identity::IdentityAccess>,
+    names: std::sync::mpsc::Sender<String>,
+) {
+    let Some(identity_access) = identity_access else {
+        return;
+    };
+    let spawned = thread::Builder::new()
+        .name("external-chat-names-prime".into())
+        .spawn(move || {
+            loop {
+                // 先扫一遍再睡：启动后立刻补，不用等一个间隔。
+                let config = identity_access.snapshot();
+                let mut queued = 0usize;
+                for mapping in &config.mappings {
+                    // 只看真实昵称：备注串是玩家在游戏里设的，可能永远为空，
+                    // 那种情况由长 TTL 定期刷新，不该进短冷却反复查。
+                    let incomplete = mapping.real_nickname.trim().is_empty();
+                    for account in &mapping.accounts {
+                        if !state.prime_name_lookup(&account.uid, incomplete) {
+                            continue;
+                        }
+                        if names.send(account.uid.clone()).is_err() {
+                            // 补查线程已退出：解除在途标记，本线程也没必要再跑。
+                            state.finish_name_lookup(&account.uid, None, None);
+                            return;
+                        }
+                        queued += 1;
+                    }
+                }
+                if queued > 0 {
+                    log::debug!("主动补查：本轮排入 {queued} 个账号的名称查询");
+                }
+                thread::sleep(NAME_PRIME_INTERVAL);
+            }
+        });
+    if let Err(error) = spawned {
+        log::warn!(
+            "启动昵称主动补查线程失败，从不说话的好友将拿不到真实昵称：{error}"
+        );
+    }
+}
+
 /// 接收线程只负责把缺昵称的 UID 丢进来；这里串行发请求（单次上限 1s），
 /// 结果写回缓存。同一个 UID 只查一次，之后同发送者的消息直接复用。
 fn spawn_name_resolver(
@@ -1299,5 +1400,20 @@ mod tests {
         state.remember_uid(None, Some("1"));
         state.remember_uid(Some("甲"), None);
         assert_eq!(state.uid_for("甲"), None);
+    }
+
+    #[test]
+    fn prime_lookup_queues_once_then_respects_the_cooldown() {
+        let state = ExternalChatState::default();
+        // 第一次必须放行。
+        assert!(state.prime_name_lookup("100000001", true));
+        // 在途期间不能重复排队。
+        assert!(!state.prime_name_lookup("100000001", true));
+        // 查到之后：缺名字的走短冷却，齐全的走长 TTL，两条路都不能立刻再排。
+        state.finish_name_lookup("100000001", Some("玩家甲"), None);
+        assert!(!state.prime_name_lookup("100000001", true));
+        assert!(!state.prime_name_lookup("100000001", false));
+        // 空 UID 永远不排队。
+        assert!(!state.prime_name_lookup("  ", true));
     }
 }

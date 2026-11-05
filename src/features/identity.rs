@@ -566,6 +566,16 @@ impl IdentityAccess {
         true
     }
 
+    /// 这个字符串像不像内部键：纯数字（UID）或 UUID。
+    ///
+    /// 只用于决定"能不能把未解析的名字直接展示"，不参与任何匹配。
+    fn looks_like_internal_key(name: &str) -> bool {
+        let name = name.trim();
+        !name.is_empty()
+            && (name.chars().all(|character| character.is_ascii_digit())
+                || Uuid::parse_str(name).is_ok())
+    }
+
     /// 测试辅助：当前映射条数。
     #[cfg(test)]
     pub(crate) fn mapping_count_for_test(&self) -> usize {
@@ -591,6 +601,9 @@ impl IdentityAccess {
             .or_else(|| self.resolve_by_display_name(name));
         match identity {
             Some(identity) => identity.player_name().to_owned(),
+            // 解析不到身份时，OCR 文本/from.name 就是玩家屏幕上看到的名字，可以原样用；
+            // 但内部键（纯数字 UID、UUID）对玩家毫无意义，不能出现在文案里。
+            None if Self::looks_like_internal_key(name) => PLAYER_NAME_PLACEHOLDER.to_owned(),
             None => name.to_owned(),
         }
     }
@@ -704,7 +717,9 @@ impl IdentityAccess {
             .or_else(|| self.resolve_by_real_nickname(name))
             .or_else(|| self.resolve_by_display_name(name))
             .map(|identity| identity.id.to_string())
-            .unwrap_or_else(|| self.player_name_for_name(name))
+            // 记忆键是**键**，不是文案：未登记时必须原样保留传入的名字，
+            // 不能走展示名兜底（那会把 UID/UUID 换成占位，键就变了）。
+            .unwrap_or_else(|| name.to_owned())
     }
 
     /// **归属专用**：按「备注串 → 真实昵称 → 软件显示名」解析出身份 UUID。
@@ -961,6 +976,19 @@ mod tests {
                 .is_empty()
         );
     }
+    #[test]
+    fn unresolved_text_never_leaks_an_internal_key() {
+        let access = IdentityAccess::new(IdentityConfig::default());
+        // 未登记玩家：屏幕上看到的名字可以原样展示。
+        assert_eq!(access.player_name("陌生人", None), "陌生人");
+        // 内部键不行：UID 与 UUID 对玩家没有意义，换成占位。
+        assert_eq!(access.player_name("900000001", None), PLAYER_NAME_PLACEHOLDER);
+        assert_eq!(
+            access.player_name("00000000-0000-4000-8000-000000000001", None),
+            PLAYER_NAME_PLACEHOLDER
+        );
+    }
+
     #[test]
     fn stored_remark_with_padding_still_matches_the_clean_ocr_name() {
         let mut config = IdentityConfig::default();

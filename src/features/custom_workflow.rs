@@ -281,7 +281,10 @@ pub type CustomWorkflowMatch = FeatureCommandMatch<CustomWorkflowCommand>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomWorkflowInvocation {
     pub command: CustomWorkflowCommand,
+    /// 命令主语（身份键）：私聊下可能是 UID 或备注串，只用于身份与投递定位。
     pub username: String,
+    /// 渲染用的玩家名（软件显示名 → 真实昵称），由组合层填充；为空时退回主语。
+    pub actor_display: String,
     pub message_type: String,
     pub user_command: String,
 }
@@ -560,7 +563,8 @@ impl CustomWorkflowService {
         let message = if workflow.confirm_message.trim().is_empty() {
             format!(
                 "{} 请求执行 {},@确认@跳过",
-                context.username, context.command
+                context.display_name(),
+                context.command
             )
         } else {
             context.render(workflow.confirm_message.trim())
@@ -898,11 +902,25 @@ struct WorkflowContext {
     args: String,
     argv: Vec<String>,
     username: String,
+    display: String,
     message_type: String,
     user_command: String,
 }
 
 impl WorkflowContext {
+    /// 渲染用玩家名：优先软件显示名，没有才退回命令主语。
+    ///
+    /// 命令主语在外部聊天源的私聊里是 UID，OCR 私聊里是备注串，
+    /// 直接渲染会把内部键或随机备注念到大厅。
+    fn display_name(&self) -> &str {
+        let display = self.display.trim();
+        if display.is_empty() {
+            self.username.trim()
+        } else {
+            display
+        }
+    }
+
     fn new(invocation: &CustomWorkflowInvocation) -> Self {
         Self {
             workflow: invocation.command.workflow.clone(),
@@ -915,6 +933,7 @@ impl WorkflowContext {
                 .map(str::to_string)
                 .collect(),
             username: invocation.username.clone(),
+            display: invocation.actor_display.clone(),
             message_type: invocation.message_type.clone(),
             user_command: invocation.user_command.clone(),
         }
@@ -1120,7 +1139,7 @@ fn custom_step_message(step: &CustomWorkflowStep, context: &WorkflowContext) -> 
 fn custom_step_target(step: &CustomWorkflowStep, context: &WorkflowContext) -> String {
     let target = step.target.as_deref().unwrap_or("").trim();
     if target.is_empty() {
-        context.username.trim().to_string()
+        context.display_name().to_string()
     } else {
         context.render(target)
     }
@@ -1177,7 +1196,7 @@ fn workflow_variable(key: &str, context: &WorkflowContext) -> Option<String> {
         "workflow" | "workflow_name" => Some(context.workflow.clone()),
         "command" | "command_name" => Some(context.command.clone()),
         "args" | "param" | "params" => Some(context.args.clone()),
-        "username" | "user" => Some(context.username.clone()),
+        "username" | "user" => Some(context.display_name().to_owned()),
         "message_type" => Some(context.message_type.clone()),
         "user_command" => Some(context.user_command.clone()),
         _ => key.strip_prefix("arg").and_then(|index| {
@@ -1492,6 +1511,7 @@ mod tests {
                 args: args.to_string(),
             },
             username: "用户".to_string(),
+            actor_display: String::new(),
             message_type: "blue".to_string(),
             user_command: joined_command("@测试流程", args),
         }
@@ -1582,6 +1602,28 @@ mod tests {
                 "send:完成 3",
             ]
         );
+    }
+
+    #[test]
+    fn confirmation_and_username_variable_use_the_display_name() {
+        // 外部源私聊的命令主语是 UID；确认文案与 {username} 变量都不能念它。
+        let mut value = workflow();
+        value.confirm_before_run = true;
+        value.success_message = "完成 {{username}}".to_owned();
+        let service = CustomWorkflowService::new(config(value), defaults());
+        let mut port = RecordingPort::new(FreshMessageOutcome::Message("用户：@确认".to_owned()));
+        let mut invocation = invocation("3");
+        invocation.username = "900000001".to_owned();
+        invocation.actor_display = "显示名甲".to_owned();
+
+        let completion = service.execute(&invocation, &mut port).unwrap();
+
+        assert_eq!(completion, WorkflowCompletion::Completed);
+        let sent = port.events.join("
+");
+        assert!(sent.contains("显示名甲 请求执行"), "确认文案应用显示名: {sent}");
+        assert!(!sent.contains("900000001"), "文案不应出现 UID: {sent}");
+        assert!(sent.contains("完成 显示名甲"), "用户名变量应用显示名: {sent}");
     }
 
     #[test]

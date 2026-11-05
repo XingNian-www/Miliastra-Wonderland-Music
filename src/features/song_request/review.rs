@@ -446,26 +446,8 @@ fn response_error_token(value: Option<&str>) -> &str {
 }
 
 fn model_reply_json_object(reply: &str) -> Result<String> {
-    let trimmed = reply.trim();
-    if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
-        return Ok(trimmed.to_string());
-    }
-    let start = trimmed
-        .find('{')
-        .ok_or_else(|| anyhow::anyhow!("候选歌曲审核返回无效 JSON"))?;
-    let end = trimmed
-        .rfind('}')
-        .ok_or_else(|| anyhow::anyhow!("候选歌曲审核返回无效 JSON"))?;
-    // 同 ai.rs：`}` 可能在 `{` 之前，切片会 panic。
-    if end < start {
-        bail!("候选歌曲审核返回无效 JSON")
-    }
-    let candidate = &trimmed[start..=end];
-    if serde_json::from_str::<Value>(candidate).is_ok_and(|value| value.is_object()) {
-        Ok(candidate.to_string())
-    } else {
-        bail!("候选歌曲审核返回无效 JSON")
-    }
+    crate::text::extract_json_object(reply)
+        .ok_or_else(|| anyhow::anyhow!("候选歌曲审核返回无效 JSON"))
 }
 
 fn parse_review_result(text: &str) -> Result<SongReviewResult> {

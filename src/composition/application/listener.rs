@@ -2666,7 +2666,10 @@ impl ApplicationRuntime {
             }
 
             if sample_as_question && routed.is_none() {
-                if let Some(question) = turtle_soup::parse_question_message(&message.text, None) {
+                if let Some(mut question) = turtle_soup::parse_question_message(&message.text, None) {
+                    // 与二级大厅同一条展示链：正文里读到的是屏幕名（备注串或真实昵称），
+                    // 直接渲染会把随机备注念到大厅。player_key 保留原文，匹配不受影响。
+                    question.player = self.mapped_actor_name(&question.player, None);
                     visible_turtle_questions.push(question);
                 }
             }

@@ -36,6 +36,27 @@ pub(crate) fn normalize_comparison_text(text: &str) -> String {
         .collect()
 }
 
+/// 从模型回复里取出 JSON 对象文本。
+///
+/// 模型常把 JSON 裹在说明文字里，也常输出「好的 } 我无法处理 {」这类畸形文本：
+/// 最后一个右括号可能出现在第一个左括号之前，直接切片会 panic 打崩业务线程。
+/// 三处（AI 点歌、候选审核、海龟汤判定）共用这一份，禁止再各自复制。
+pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
+    let trimmed = reply.trim();
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok_and(|value| value.is_object()) {
+        return Some(trimmed.to_owned());
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    let candidate = &trimmed[start..=end];
+    serde_json::from_str::<serde_json::Value>(candidate)
+        .is_ok_and(|value| value.is_object())
+        .then(|| candidate.to_owned())
+}
+
 pub(crate) const MAX_CHAT_WIDTH: usize = 80;
 
 pub(crate) fn display_width(value: &str) -> usize {
@@ -245,6 +266,20 @@ fn is_comparison_punctuation(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_json_object_handles_reversed_braces_without_panicking() {
+        // 模型输出畸形文本：最后一个右括号在第一个左括号之前。
+        // 这里必须返回 None，而不是越界切片 panic 打崩业务线程。
+        assert_eq!(extract_json_object("好的 } 我无法处理 {"), None);
+        // 正常包着说明文字仍能取出对象。
+        assert_eq!(
+            extract_json_object("结果如下：{\"decision\": \"yes\"} 以上"),
+            Some("{\"decision\": \"yes\"}".to_owned())
+        );
+        assert_eq!(extract_json_object("完全没有 JSON"), None);
+    }
+
 
 
     #[test]

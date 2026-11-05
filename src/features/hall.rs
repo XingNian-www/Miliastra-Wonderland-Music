@@ -155,7 +155,10 @@ impl HallStateService {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HallCommandContext {
     pub(crate) message_type: String,
+    /// 命令主语（身份键）：私聊下可能是 UID 或备注串，只用于身份与日志。
     pub(crate) username: String,
+    /// 渲染用的玩家名（软件显示名 → 真实昵称），由组合层填充；为空时退回主语。
+    pub(crate) actor_display: String,
     pub(crate) user_command: String,
 }
 
@@ -271,9 +274,16 @@ impl HallApplication {
                     port.log_executed(context, &format!("microphone toggle {}", username))?;
                     port.toggle_microphone()?;
                     log::info!("麦克风状态已切换（按 N 键）");
+                    // 通告里的玩家名走展示链：命令主语可能是 UID 或备注串。
+                    let display = context.actor_display.trim();
+                    let shown = if display.is_empty() {
+                        username.as_str()
+                    } else {
+                        display
+                    };
                     port.reply_template(
                         &templates::MICROPHONE_TOGGLED,
-                        &ReplyVars::new().with("玩家", username.as_str()),
+                        &ReplyVars::new().with("玩家", shown),
                     )
                 }
             }
@@ -686,6 +696,7 @@ mod tests {
         let context = HallCommandContext {
             message_type: "blue".to_string(),
             username: "测试".to_string(),
+            actor_display: String::new(),
             user_command: "@大厅检测".to_string(),
         };
 
@@ -898,9 +909,41 @@ mod tests {
         HallCommandContext {
             message_type: "blue".to_string(),
             username: "测试".to_string(),
+            actor_display: String::new(),
             user_command: "@大厅检测".to_string(),
         }
     }
+
+    #[test]
+    fn microphone_announcement_uses_the_display_name_not_the_command_subject() {
+        let mut port = TemplateRecordingPort {
+            detected_hall: Some(HallObservation {
+                name: "一级大厅".to_owned(),
+                remaining_minutes: None,
+            }),
+            ..TemplateRecordingPort::default()
+        };
+        let context = HallCommandContext {
+            actor_display: "显示名甲".to_owned(),
+            ..hall_context()
+        };
+
+        HallApplication
+            .execute(
+                &context,
+                &HallCommand::ToggleMicrophone {
+                    username: "900000001".to_owned(),
+                },
+                &mut port,
+            )
+            .expect("microphone toggle");
+
+        assert!(port.toggled);
+        let rendered = &port.rendered[0].1;
+        assert!(rendered.contains("显示名甲"), "通告应用显示名: {rendered}");
+        assert!(!rendered.contains("900000001"), "通告不应出现 UID: {rendered}");
+    }
+
 
     #[test]
     fn hall_detection_replies_through_the_current_template_keys() {

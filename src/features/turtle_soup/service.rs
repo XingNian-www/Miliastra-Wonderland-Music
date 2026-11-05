@@ -2571,22 +2571,8 @@ fn parse_judgment(reply: &str) -> Result<Judgment> {
 }
 
 fn extract_json_object(reply: &str) -> Result<String> {
-    let trimmed = reply.trim();
-    if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
-        return Ok(trimmed.to_string());
-    }
-    let start = trimmed
-        .find('{')
-        .ok_or_else(|| anyhow!("海龟汤 AI 返回无效 JSON"))?;
-    let end = trimmed
-        .rfind('}')
-        .ok_or_else(|| anyhow!("海龟汤 AI 返回无效 JSON"))?;
-    let candidate = &trimmed[start..=end];
-    if serde_json::from_str::<Value>(candidate).is_ok_and(|value| value.is_object()) {
-        Ok(candidate.to_string())
-    } else {
-        bail!("海龟汤 AI 返回无效 JSON")
-    }
+    crate::text::extract_json_object(reply)
+        .ok_or_else(|| anyhow::anyhow!("海龟汤 AI 返回无效 JSON"))
 }
 
 fn error_excerpt(text: &str) -> String {

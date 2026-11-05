@@ -608,7 +608,7 @@ impl UndercoverGame {
         if words.civilian.trim().is_empty() || words.undercover.trim().is_empty() {
             bail!("谁是卧底词语不能为空");
         }
-        if normalized_word(&words.civilian) == normalized_word(&words.undercover) {
+        if crate::text::player_match_key(&words.civilian) == crate::text::player_match_key(&words.undercover) {
             bail!("平民词和卧底词不能相同");
         }
 
@@ -1676,33 +1676,12 @@ fn settlement_lines(game: &Playing, winner: Winner) -> Vec<UndercoverReply> {
 }
 
 fn player_key(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
+    crate::text::player_match_key(value)
 }
 
-fn normalized_word(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
 
 pub(super) fn normalized_word_component(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .filter_map(|ch| match ch {
-            '\u{3000}' => None,
-            '\u{FF01}'..='\u{FF5E}' => char::from_u32(ch as u32 - 0xFEE0),
-            ch if ch.is_whitespace() => None,
-            ch => Some(ch),
-        })
-        .flat_map(char::to_lowercase)
-        .collect()
+    crate::text::word_match_key(value)
 }
 
 pub(super) fn unordered_word_key(left: &str, right: &str) -> String {

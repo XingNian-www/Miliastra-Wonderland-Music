@@ -823,7 +823,7 @@ impl UndercoverRuntimeService {
             key,
             UndercoverEffectLane::Formal,
             UndercoverEffect::KeyedFriendVerify {
-                player: player.trim().to_string(),
+                player: player_display.trim().to_string(),
                 reply: UndercoverReply::keyed(&templates::VERIFY_CREATE_OK, &verify_vars),
             },
             UndercoverContinuation::VerifyCreate {
@@ -876,7 +876,7 @@ impl UndercoverRuntimeService {
             key,
             UndercoverEffectLane::Formal,
             UndercoverEffect::KeyedFriendVerify {
-                player: player.trim().to_string(),
+                player: player_display.trim().to_string(),
                 reply: UndercoverReply::keyed(&templates::VERIFY_JOIN_OK, &verify_vars),
             },
             UndercoverContinuation::VerifyJoin {
@@ -1603,6 +1603,34 @@ mod runtime_tests {
             crate::test_support::test_state_store(),
         );
         (service, entertainment)
+    }
+
+    #[test]
+    fn friend_verification_targets_the_display_name_not_the_identity_key() {
+        let (mut service, mut entertainment) = service(30);
+        let now = Instant::now();
+        let key = "00000000-0000-4000-8000-000000000001";
+        let display = "展示甲";
+        let start = service
+            .begin_command(
+                &mut entertainment,
+                key,
+                display,
+                UndercoverCommandSource::Friend,
+                &UndercoverCommand::CreateSingle,
+                now,
+                BusinessOperationId::new(1),
+            )
+            .expect("begin create");
+        let UndercoverCommandStart::Suspended(verification) = start else {
+            panic!("create should wait for friend verification");
+        };
+        let UndercoverEffect::KeyedFriendVerify { player, .. } = &verification.effect else {
+            panic!("expected keyed friend verify, got {:?}", verification.effect);
+        };
+        // 投递层只按展示名反查好友候选；传身份键会退回拿 UUID 搜好友列表，必然落空。
+        assert_eq!(player, display);
+        assert_ne!(player, key);
     }
 
     fn complete_membership(

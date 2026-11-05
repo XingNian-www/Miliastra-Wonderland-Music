@@ -872,6 +872,26 @@ impl LandlordGame {
                 keyed_reply(&templates::NOT_IN_LANDLORD_GAME, ReplyVars::new()),
             );
         };
+        self.bid_at(index, action, now)
+    }
+
+    /// 按下标表态。
+    ///
+    /// 超时路径必须走这里：`Player.name` 是展示名、`Player.key` 是身份键，
+    /// 已登记玩家两者不同，拿展示名回灌 `bid()` 会 `find_player` 落空。
+    fn bid_at(&mut self, index: usize, action: BidAction, now: Instant) -> LandlordOutcome {
+        let GameState::Bidding(bidding) = &self.state else {
+            return LandlordOutcome::public(
+                "not-bidding",
+                keyed_reply(&templates::BIDDING_NOT_BIDDING, ReplyVars::new()),
+            );
+        };
+        if index >= bidding.players.len() {
+            return LandlordOutcome::public(
+                "not-player",
+                keyed_reply(&templates::NOT_IN_LANDLORD_GAME, ReplyVars::new()),
+            );
+        }
         if index != bidding.current {
             return LandlordOutcome::public(
                 "wrong-bidder",
@@ -1147,7 +1167,11 @@ impl LandlordGame {
                     return None;
                 }
                 let player = game.players[game.current].name.clone();
-                let mut outcome = self.bid(&player, BidAction::Decline, now);
+                // 超时按**下标**表态：已登记玩家的 name 是展示名、key 是身份键，
+                // 拿展示名回灌 bid() 会 find_player 落空；而失败分支不重置计时器，
+                // 于是每次 tick 重复报错、抢地主永远推进不下去。
+                let index = game.current;
+                let mut outcome = self.bid_at(index, BidAction::Decline, now);
                 if let Some(continuation) = outcome.public_reply.take() {
                     outcome.public_reply = Some(reply(
                         &templates::BIDDING_TIMEOUT,
@@ -4913,6 +4937,60 @@ mod tests {
         assert_eq!(bidding.decisions, 0);
         assert!(bidding.players.iter().all(|player| player.hand.len() == 17));
         assert_eq!(bidding.bottom.len(), 3);
+    }
+
+    #[test]
+    fn bidding_timeout_uses_the_turn_index_not_the_display_name() {
+        let now = Instant::now();
+        // 90 秒：warning 在 60 秒，避免 1 秒配置下"重置后立刻又发警告"干扰断言。
+        let config = LandlordConfig {
+            turn_timeout_seconds: 90,
+            ..LandlordConfig::default()
+        };
+        let mut game = LandlordGame::with_seed(config, 41);
+        // 已登记玩家：name 是展示名、key 是身份键，两者不同。
+        // 旧实现拿 name 回灌 bid()，find_player 必然落空。
+        game.state = GameState::Bidding(Bidding {
+            players: vec![
+                Player {
+                    key: player_key("00000000-0000-4000-8000-000000000001"),
+                    name: "展示甲".to_string(),
+                    ..Player::new("甲")
+                },
+                Player {
+                    key: player_key("00000000-0000-4000-8000-000000000002"),
+                    name: "展示乙".to_string(),
+                    ..Player::new("乙")
+                },
+                Player {
+                    key: player_key("00000000-0000-4000-8000-000000000003"),
+                    name: "展示丙".to_string(),
+                    ..Player::new("丙")
+                },
+            ],
+            bottom: Vec::new(),
+            phase: BiddingPhase::Calling,
+            current: 0,
+            decisions: 0,
+            caller: None,
+            candidate: None,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+        });
+
+        let deadline = now + Duration::from_secs(90);
+        let outcome = game
+            .tick(deadline, true)
+            .expect("bidding timeout must produce an outcome");
+
+        assert_eq!(outcome.action, "call-declined", "超时不能判成 not-player");
+        let GameState::Bidding(bidding) = &game.state else {
+            panic!("expected bidding")
+        };
+        assert_eq!(bidding.current, 1);
+        assert_eq!(bidding.decisions, 1);
+        // 计时器必须已重置，否则每次 tick 都会重复报同一次超时。
+        assert!(game.tick(deadline, true).is_none(), "计时器必须已重置");
     }
 
     #[test]

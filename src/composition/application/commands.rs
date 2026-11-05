@@ -823,8 +823,8 @@ impl ApplicationRuntime {
         // （实机表现：locate_friend / no unique stable friend row）。
         //
         // 这里用 UID 反查出可以匹配的名字。之所以是多个：
-        // 自动建的身份把 API 昵称放在 note、随机串放在 nickname，
-        // 手工映射则真名在 nickname——两种来源都得试。
+        // 备注串是屏幕显示名、真实昵称是聊天桥给的资料包昵称，两者都可能在
+        // 好友列表上出现，所以候选名要一起给。
         if let Some(account) = parsed.account.as_ref() {
             let names = self
                 .lifecycle
@@ -832,9 +832,9 @@ impl ApplicationRuntime {
                 .identity
                 .search_names_for_account(&account.game, &account.uid);
             if !names.is_empty() {
+                // 不打印真实 UID：它是玩家标识（MUST_READ §9）。
                 log::info!(
-                    "邀请流程：UID「{}」反查到 {} 个候选名，将依次尝试搜索好友",
-                    account.uid,
+                    "邀请流程：该发起者反查到 {} 个候选名，将依次尝试搜索好友",
                     names.len()
                 );
                 request.search_names = names;

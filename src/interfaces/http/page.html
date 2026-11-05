@@ -3705,7 +3705,8 @@ function identityRenderTable(){
     const realNicknameCell='<td class="identity-real-nickname" title="由聊天桥自动写入，只读；仅用于展示与搜索兜底，不参与授权"><code>'+esc(mapping.real_nickname||'—')+'</code></td>'
     return '<tr>'+uidCell
       +gameUidCell
-      +'<td><input value="'+esc(mapping.nickname||'')+'" placeholder="游戏内好友备注（屏幕名/OCR 匹配键；留空随机生成）" oninput="identityTableSet('+i+',\'nickname\',this.value)"></td>'
+      +'<td><input value="'+esc(mapping.nickname||'')+'" placeholder="游戏内好友备注（屏幕名/OCR 匹配键；留空随机生成）" oninput="identityTableSet('+i+',\'nickname\',this.value)">'
+      +'<span class="identity-th-hint">'+(mapping.remark_sourced?'来源：聊天桥备注（手改后转为手填）':'来源：手填/随机')+'</span></td>'
       +'<td><input value="'+esc(mapping.note||'')+'" placeholder="软件内显示名（可空；文案用，不回退备注串）" oninput="identityTableSet('+i+',\'note\',this.value)"></td>'
       +realNicknameCell
       +'<td><select onchange="identityTableSet('+i+',\'role\',this.value)">'+select+'</select></td>'
@@ -3731,6 +3732,9 @@ function identityTableSet(index,field,value){
     showConfigMessage('备注串 '+next.trim()+' 已存在','err');identityRenderTable();return
   }
   items[index][field]=field==='nickname'?next.trim():next
+  // 手改备注串后它就不再是聊天桥给的值：清掉来源标记，
+  // 否则 replace_display_names 会一直跳过这个身份，出站文案永远换不回显示名。
+  if(field==='nickname')items[index].remark_sourced=false
   identityMappingsWrite(items)
 }
 function identityCopyUid(index){
@@ -3747,7 +3751,12 @@ function identityCopyUid(index){
 function identityTableSetUids(index,value){
   const items=identityMappingsList();if(!items||!items[index]||typeof items[index]!=='object'||Array.isArray(items[index]))return
   const uids=String(value||'').split(',').map(v=>v.trim()).filter(Boolean)
-  items[index].accounts=uids.map(uid=>({game:'genshin',uid:uid}))
+  // 保留原有 game：整体重建 accounts 会把非原神账号的 game 冲成 genshin。
+  const existing=Array.isArray(items[index].accounts)?items[index].accounts:[]
+  items[index].accounts=uids.map(uid=>{
+    const kept=existing.find(a=>a&&a.uid===uid)
+    return {game:(kept&&kept.game)||'genshin',uid:uid}
+  })
   identityMappingsWrite(items)
 }
 function identityTableRemove(index){

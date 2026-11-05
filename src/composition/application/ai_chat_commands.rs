@@ -487,19 +487,15 @@ impl ApplicationRuntime {
     /// 查不到才退回固定称呼。避免写成 UID —— 那对模型毫无意义。
     fn bot_display_name(&self) -> String {
         let self_uid = self.lifecycle.config.chat_source.self_uid;
-        if self_uid != 0
-            && let Some(name) = self
-                .lifecycle
-                .live_configs
-                .identity
-                .search_names_for_account(
-                    miliastra_kernel::chat_source::GAME_GENSHIN,
-                    &self_uid.to_string(),
-                )
-                .into_iter()
-                .next()
-        {
-            return name;
+        if self_uid != 0 {
+            let uid = self_uid.to_string();
+            let names = self.lifecycle.live_configs.identity.friend_search_names(
+                &uid,
+                Some((miliastra_kernel::chat_source::GAME_GENSHIN, uid.as_str())),
+            );
+            if let Some(name) = names.into_iter().next() {
+                return name;
+            }
         }
         "BOT".to_string()
     }

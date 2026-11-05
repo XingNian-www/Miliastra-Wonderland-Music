@@ -71,7 +71,7 @@ pub(crate) const RUN_FAST_STARTED: ReplyTemplate = spec(
 /// 斗地主发牌进入抢地主。
 pub(crate) const BIDDING_STARTED: ReplyTemplate = spec(
     "card_games.bidding.started",
-    "斗地主已发手牌，随机由{玩家}开始抢地主；发送 #抢 或 #不抢",
+    "斗地主已发手牌，随机由{玩家}开始叫地主；发送 #叫地主 或 #不叫",
     "斗地主开局抢地主",
 );
 
@@ -110,6 +110,62 @@ pub(crate) const BIDDING_DECIDED: ReplyTemplate = spec(
     "card_games.bidding.decided",
     "{玩家}{决定}；轮到{下一位}抢地主",
     "抢地主阶段推进",
+);
+
+/// 叫地主阶段：有人叫地主，进入抢地主。
+pub(crate) const BIDDING_CALLED: ReplyTemplate = spec(
+    "card_games.bidding.called",
+    "{玩家}叫地主，进入抢地主；轮到{下一位}",
+    "叫地主",
+);
+
+/// 叫地主阶段：不叫。
+pub(crate) const BIDDING_CALL_DECLINED: ReplyTemplate = spec(
+    "card_games.bidding.call_declined",
+    "{玩家}不叫；轮到{下一位}叫地主",
+    "不叫地主",
+);
+
+/// 抢地主阶段：有人抢。
+pub(crate) const BIDDING_ROBBED: ReplyTemplate = spec(
+    "card_games.bidding.robbed",
+    "{玩家}抢地主；轮到{下一位}",
+    "抢地主",
+);
+
+/// 抢地主阶段：不抢。
+pub(crate) const BIDDING_ROB_DECLINED: ReplyTemplate = spec(
+    "card_games.bidding.rob_declined",
+    "{玩家}不抢；轮到{下一位}",
+    "不抢地主",
+);
+
+/// 有人抢后，原叫地主者获得一次反抢机会。
+pub(crate) const BIDDING_COUNTER_PROMPT: ReplyTemplate = spec(
+    "card_games.bidding.counter_prompt",
+    "{抢地主}抢地主，{玩家}可发 #反抢 或 #不抢",
+    "反抢提示",
+);
+
+/// 无人抢地主，叫地主者直接成为地主。
+pub(crate) const BIDDING_CALLER_LANDLORD: ReplyTemplate = spec(
+    "card_games.bidding.caller_landlord",
+    "无人抢地主，{玩家}成为地主，底牌：{底牌}",
+    "叫地主者当地主",
+);
+
+/// 反抢成功。
+pub(crate) const BIDDING_COUNTER_ROBBED: ReplyTemplate = spec(
+    "card_games.bidding.counter_robbed",
+    "{玩家}反抢成功，成为地主，底牌：{底牌}",
+    "反抢成功",
+);
+
+/// 当前阶段不接受这个动作。
+pub(crate) const BIDDING_WRONG_PHASE: ReplyTemplate = spec(
+    "card_games.bidding.wrong_phase",
+    "现在不是{阶段}阶段",
+    "抢地主阶段不匹配",
 );
 
 /// 三人均未抢地主，重新发牌。
@@ -425,6 +481,20 @@ pub(crate) const PASS_FORCED_LEAD: ReplyTemplate = spec(
     "双方无牌可压后领出",
 );
 
+/// 斗地主「要不起」自动跳过，下一家继续。
+pub(crate) const PASS_FORCED_MERGED_NEXT: ReplyTemplate = spec(
+    "card_games.pass.forced_merged_next",
+    "{玩家列表}要不起，自动跳过；轮到{下一位}",
+    "要不起自动跳过",
+);
+
+/// 斗地主连续「要不起」后重新领出（连跳合并成一条）。
+pub(crate) const PASS_FORCED_MERGED_LEAD: ReplyTemplate = spec(
+    "card_games.pass.forced_merged_lead",
+    "{玩家列表}要不起，{下一位}领出",
+    "要不起后领出",
+);
+
 /// 斗地主过牌后重新领出。
 pub(crate) const PASS_NEW_TRICK: ReplyTemplate = spec(
     "card_games.pass.new_trick",
@@ -465,6 +535,14 @@ pub(crate) const CARD_GAMES: &[ReplyTemplate] = &[
     NOT_IN_LANDLORD_GAME,
     BIDDING_TURN,
     BIDDING_DECIDED,
+    BIDDING_CALLED,
+    BIDDING_CALL_DECLINED,
+    BIDDING_ROBBED,
+    BIDDING_ROB_DECLINED,
+    BIDDING_COUNTER_PROMPT,
+    BIDDING_CALLER_LANDLORD,
+    BIDDING_COUNTER_ROBBED,
+    BIDDING_WRONG_PHASE,
     BIDDING_REDEALT,
     HAND_INITIAL,
     HAND_LANDLORD_INITIAL,
@@ -511,6 +589,8 @@ pub(crate) const CARD_GAMES: &[ReplyTemplate] = &[
     PASS_TIMEOUT_LEAD,
     PASS_FORCED_NEXT,
     PASS_FORCED_LEAD,
+    PASS_FORCED_MERGED_NEXT,
+    PASS_FORCED_MERGED_LEAD,
     PASS_NEW_TRICK,
     PASS_NEXT,
     PARSE_UNKNOWN_CARD,
@@ -585,7 +665,7 @@ mod tests {
         );
         assert_eq!(
             text(&BIDDING_STARTED, ReplyVars::new().with("玩家", "乙")),
-            "斗地主已发手牌，随机由乙开始抢地主；发送 #抢 或 #不抢"
+            "斗地主已发手牌，随机由乙开始叫地主；发送 #叫地主 或 #不叫"
         );
         assert_eq!(
             text(&RETRY_NONE, ReplyVars::new()),

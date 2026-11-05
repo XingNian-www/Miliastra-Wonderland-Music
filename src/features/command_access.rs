@@ -433,11 +433,13 @@ fn runfast_session_action(command: &super::card_games::LandlordCommand) -> bool 
         LandlordCommand::Start | LandlordCommand::RunFastStart => false,
         // 纯查询：只报告状态，不影响对局，禁用玩法不该连查询一起关掉。
         LandlordCommand::Status | LandlordCommand::Retry | LandlordCommand::Hand => false,
-        // 其余都改变对局状态：出牌、过、加入、抢、不抢、退出。
+        // 其余都改变对局状态：出牌、过、加入、叫地主、抢、反抢、不抢、退出。
         LandlordCommand::Play(_)
         | LandlordCommand::Pass
         | LandlordCommand::Join
+        | LandlordCommand::Call
         | LandlordCommand::Rob
+        | LandlordCommand::CounterRob
         | LandlordCommand::Decline
         | LandlordCommand::Exit => true,
     }

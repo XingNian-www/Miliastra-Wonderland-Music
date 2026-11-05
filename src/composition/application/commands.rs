@@ -522,6 +522,9 @@ impl ApplicationRuntime {
                     message_type: parsed.message_type.clone(),
                     raw: parsed.raw.clone(),
                     username: command_username(parsed).to_string(),
+                    // 渲染名单独给：命令主语在私聊里是 UID 或备注串。
+                    actor_display: self
+                        .mapped_actor_name(&parsed.username, parsed.account.as_ref()),
                     user_command: parsed.user_command.clone(),
                     account: parsed.account.clone(),
                     authority: parsed.authority,

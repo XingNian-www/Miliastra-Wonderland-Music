@@ -2675,6 +2675,7 @@ dependencies = [
  "http-body-util",
  "log",
  "md5",
+ "miliastra-kernel",
  "num-bigint",
  "rand 0.8.7",
  "reqwest",

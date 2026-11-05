@@ -28,8 +28,8 @@ pub(crate) fn format_play_message(status: &PlayerStatus) -> String {
     format!(
         "播放: {} ({}/{}) 音量{}",
         song_title(&status.name, &status.singer),
-        format_time(status.progress),
-        format_time(status.duration),
+        format_duration(status.progress),
+        format_duration(status.duration),
         status.volume
     )
 }
@@ -60,8 +60,8 @@ fn status_vars(status: &PlayerStatus, requester: &str) -> ReplyVars {
     ReplyVars::new()
         .with("状态", state)
         .with("曲名", title)
-        .with("进度", format_seconds(status.progress))
-        .with("总长", format_seconds(status.duration))
+        .with("进度", format_duration(status.progress))
+        .with("总长", format_duration(status.duration))
         .with("音量", status.volume.to_string())
         .with("点歌人", requester_text)
 }
@@ -115,11 +115,15 @@ pub(crate) fn format_lyrics(status: &PlayerStatus) -> String {
     crate::features::reply_template::render(spec, None, &ReplyVars::new().with("歌词", text)).text
 }
 
-fn format_seconds(value: f64) -> String {
+/// 播放时长/进度统一格式化：mm:ss。
+///
+/// 取整用 floor：进度不能虚报（59.6 秒还没到 1 分钟）。
+/// 原来有两份实现（一份 round、一份 floor），同一进度能差一秒。
+fn format_duration(value: f64) -> String {
     if !value.is_finite() || value <= 0.0 {
         return "0:00".to_string();
     }
-    let seconds = value.round() as u64;
+    let seconds = value.floor() as u64;
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
@@ -148,13 +152,6 @@ pub(crate) fn song_title(name: &str, singer: &str) -> String {
     format!("{} - {}", name, singer)
 }
 
-pub(super) fn format_time(value: f64) -> String {
-    if !value.is_finite() || value <= 0.0 {
-        return "0:00".to_string();
-    }
-    let total = value.floor() as i64;
-    format!("{}:{:02}", total / 60, total % 60)
-}
 
 #[cfg(test)]
 mod tests {

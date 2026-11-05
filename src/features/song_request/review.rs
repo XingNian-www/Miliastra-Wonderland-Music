@@ -186,36 +186,34 @@ impl SongReviewClient {
             };
         }
 
-        let mut last_error = None;
         let max_attempts = self.config.retry_count.saturating_add(1);
-        for attempt in 1..=max_attempts {
-            match self.review_once(candidate) {
-                Ok(result) => {
-                    let allowed = result.level <= threshold;
-                    return SongReviewDecision {
-                        allowed,
-                        level: Some(result.level),
-                        threshold,
-                        reason: result.reason,
-                        tags: result.tags,
-                        attempts: attempt,
-                        failed_open: false,
-                    };
-                }
-                Err(error) => {
-                    log::warn!(
-                        "候选歌曲审核请求第 {}/{} 次失败（步骤：调用审核服务），将按退避间隔重试：{error:#}",
-                        attempt,
-                        max_attempts
-                    );
-                    last_error = Some(error.to_string());
-                    if attempt < max_attempts {
-                        self.retry_delay
-                            .wait(Duration::from_millis(self.config.retry_delay_ms));
-                    }
-                }
+        let last_error = match crate::retry::retry_with_backoff(
+            max_attempts,
+            Duration::from_millis(self.config.retry_delay_ms),
+            || self.review_once(candidate),
+            |attempt, total, error| {
+                log::warn!(
+                    "候选歌曲审核请求第 {}/{} 次失败（步骤：调用审核服务），将按退避间隔重试：{error:#}",
+                    attempt,
+                    total
+                );
+            },
+            |delay| self.retry_delay.wait(delay),
+        ) {
+            crate::retry::RetryOutcome::Ok { value, attempts } => {
+                let allowed = value.level <= threshold;
+                return SongReviewDecision {
+                    allowed,
+                    level: Some(value.level),
+                    threshold,
+                    reason: value.reason,
+                    tags: value.tags,
+                    attempts,
+                    failed_open: false,
+                };
             }
-        }
+            crate::retry::RetryOutcome::Err { error, .. } => Some(format!("{error:#}")),
+        };
 
         let reason = last_error
             .filter(|text| !text.trim().is_empty())

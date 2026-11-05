@@ -191,22 +191,7 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
 
     /// 归属键 `id:<uuid>` 是内部标识，翻译成展示名后才能给玩家看。
     fn playlist_owner_display(&self, owner: &str) -> String {
-        // `player_name_for_key` 内部走 `Uuid::parse_str`，带 `id:` 前缀会解析失败，
-        // 必须先剥掉前缀。
-        let key = owner
-            .strip_prefix(crate::features::playlist::owner_key::IDENTITY)
-            .unwrap_or(owner);
-        let display = self
-            .runtime
-            .lifecycle
-            .live_configs
-            .identity
-            .player_name_for_key(key);
-        if display.trim().is_empty() {
-            owner.to_string()
-        } else {
-            display
-        }
+        super::playlist_owner_display(&self.runtime.lifecycle.live_configs.identity, owner)
     }
 
     fn extend_playlist_tracks(

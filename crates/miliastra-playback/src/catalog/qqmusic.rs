@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use cbc::Encryptor;
 use cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+use miliastra_kernel::date_time::{civil_from_days, utc8_datetime};
 use rand::Rng;
 use reqwest::{Client, StatusCode};
 use rsa::pkcs8::DecodePublicKey;
@@ -1989,6 +1990,7 @@ fn random_hex(rng: &mut impl Rng, length: usize) -> String {
 
 /// QIMEI beacon 有意使用合成值，但保持与 Android SDK 相同的字段布局，以便服务器解析设备指纹。
 fn random_beacon_id(timestamp: u64, rng: &mut impl Rng) -> String {
+    // 保持既有指纹形状：月初按 UTC 日序号取，不额外套 UTC+8 偏移。
     let (year, month, _) = civil_from_days((timestamp / 86_400) as i64);
     let month_start = format!("{year:04}-{month:02}-01");
     let rand1 = rng.gen_range(100_000..1_000_000);
@@ -2018,33 +2020,10 @@ fn random_hex_nonzero(rng: &mut impl Rng, length: usize) -> String {
         .collect()
 }
 
-// C++/Android SDK 使用的公历日期转换逆运算。结果是自 1970-01-01 起 UTC 天数对应的公历年、月、日。
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    let year = year + i64::from(month <= 2);
-    (year, month as u32, day as u32)
-}
-
 /// 把 epoch 秒格式化为 UTC+8 的 "YYYY-MM-DD HH:MM:SS"。
 fn format_utc8_datetime(epoch: u64) -> String {
-    let shifted = epoch + 8 * 3600;
-    let days = (shifted / 86_400) as i64;
-    let seconds = shifted % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
-        seconds / 3600,
-        (seconds % 3600) / 60,
-        seconds % 60
-    )
+    let (year, month, day, hour, minute, second) = utc8_datetime(epoch as i64);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
 }
 
 fn qimei_payload(device: &QqDevice) -> Result<QimeiRequest, CatalogError> {
@@ -2628,7 +2607,7 @@ mod tests {
 
     use super::{
         PlaybackEligibility, QQ_QIMEI_FALLBACK, QqDevice, QqMusicAdapter, QqQimei, QqQimeiCache,
-        QqRequestOptions, civil_from_days, classify_qq_refresh_code, merge_qq_web_cookie_updates,
+        QqRequestOptions, classify_qq_refresh_code, merge_qq_web_cookie_updates,
         parse_qimei_response, parse_qq_date_ms, parse_search_candidates, qimei_is_fresh,
         qimei_payload, qq_account_is_vip, qq_eligibility, qq_filename, qq_is_auth_response_code,
         qq_refresh_login_type, qq_resolver_ids, qq_response_business_error, qq_response_code,
@@ -3411,8 +3390,7 @@ mod tests {
     }
 
     #[test]
-    fn qimei_beacon_and_civil_date_are_stable_shapes() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    fn qimei_beacon_has_a_stable_shape() {
         let mut rng = rand::thread_rng();
         let beacon = random_beacon_id(0, &mut rng);
         assert_eq!(beacon.matches("k1:").count(), 1);

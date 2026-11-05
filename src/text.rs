@@ -18,14 +18,26 @@ pub(crate) const OCR_TRAILING_NOISE: &[char] = &[
 ///   保留它只会让同一句话时而带空格时而不带；统一丢弃后文本才是确定且可逐字比较的。
 ///
 /// 命令锁与聊天比较共用这一份实现，禁止再各自复制一份（否则同/全角抖动会互相打不中）。
+/// 全角 ASCII（！ 到 ～）折成半角；其它字符原样返回。
+///
+/// 这是所有归一化共用的唯一一份折算实现：OCR 偶尔把半角读成全角，
+/// 折回去只是恢复屏幕上的真实字形，不丢信息。
+pub(crate) fn fold_wide_char(ch: char) -> Option<char> {
+    if ('\u{ff01}'..='\u{ff5e}').contains(&ch) {
+        return char::from_u32(ch as u32 - 0xfee0);
+    }
+    Some(ch)
+}
+
+/// 只折全角、保留空白与大小写。给需要自己决定空白/大小写策略的调用方用。
+pub(crate) fn fold_wide(text: &str) -> String {
+    text.chars().filter_map(fold_wide_char).collect()
+}
+
 pub(crate) fn normalize_chat_text(text: &str) -> String {
     text.chars()
-        .filter_map(|ch| match ch {
-            // 全角 ！ 到 ～ 与半角 ASCII 一一对应，码位偏移 0xFEE0。
-            '\u{FF01}'..='\u{FF5E}' => Some(char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch)),
-            ch if ch.is_whitespace() => None,
-            other => Some(other),
-        })
+        .filter(|ch| !ch.is_whitespace())
+        .filter_map(fold_wide_char)
         .collect()
 }
 
@@ -55,6 +67,28 @@ pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(candidate)
         .is_ok_and(|value| value.is_object())
         .then(|| candidate.to_owned())
+}
+
+/// 玩家/词语比较键的共享实现。
+///
+/// - player_match_key：折叠空白（保留一个空格）——玩家名里可能有空格，
+///   直接删掉会把「Li Na」和「LiNa」当成同一个人；
+/// - word_match_key：丢弃全部空白——词面比较时空白与全角抖动都不该影响结果。
+///
+/// 四种玩法（牌局、数字炸弹、谁是卧底、海龟汤）原来各写一份且策略不一致，
+/// 同一个玩家跨玩法会得到不同键。这里统一成两份明确语义的实现。
+pub(crate) fn player_match_key(value: &str) -> String {
+    // 注意：这里不能用 normalize_chat_text——它会丢弃全部空白，
+    // 之后再折叠就永远是单串了。玩家名要保留一个空格。
+    fold_wide(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+pub(crate) fn word_match_key(value: &str) -> String {
+    normalize_chat_text(value).to_lowercase()
 }
 
 pub(crate) const MAX_CHAT_WIDTH: usize = 80;
@@ -229,10 +263,7 @@ fn normalize_comparison_char(ch: char) -> Option<char> {
     if ch.is_whitespace() || is_comparison_punctuation(ch) {
         return None;
     }
-    if ('\u{ff01}'..='\u{ff5e}').contains(&ch) {
-        return char::from_u32(ch as u32 - 0xfee0);
-    }
-    Some(ch)
+    fold_wide_char(ch)
 }
 
 fn is_comparison_punctuation(ch: char) -> bool {

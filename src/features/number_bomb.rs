@@ -313,7 +313,10 @@ impl NumberBombService {
         Self::with_seed(config, random_seed())
     }
 
-    #[cfg(test)]
+    /// 带显式种子的构造：生产用 new()（随机种子），测试用它固定随机源。
+    ///
+    /// 不能加 #[cfg(test)]：new() 本身要调它，只在测试配置里存在会让
+    /// 非测试构建直接编译失败（发布构建就是非测试配置）。
     pub(crate) fn with_seed(config: NumberBombConfig, seed: u64) -> Self {
         Self {
             config,
@@ -883,7 +886,7 @@ fn too_many(players: usize, config: &NumberBombConfig) -> NumberBombCommandOutco
 }
 
 fn player_key(value: &str) -> String {
-    value.trim().chars().flat_map(char::to_lowercase).collect()
+    crate::text::player_match_key(value)
 }
 
 struct SplitMix64 {

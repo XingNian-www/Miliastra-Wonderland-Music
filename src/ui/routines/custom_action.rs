@@ -3,8 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use image::imageops::FilterType;
-
 use super::friend_delivery::{FriendDeliveryRoutineConfig, UiResidencyTarget, restore_residency};
 use crate::adapters::input::parse_key;
 use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
@@ -15,6 +13,7 @@ use crate::runtime::ui::{
     UiRoutineProgressStage, UiRuntimeHandle, UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
+use crate::ui::frame::{Canvas, resize_to_canvas};
 use crate::ui::plan::{
     WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
     WorkflowResidency,
@@ -613,11 +612,13 @@ fn capture_normalized(
         .capture_frame()
         .map_err(|error| observation_failure(input_performed, "capture_custom_action", error))?;
     let image = image.into_image();
-    if image.width() == canvas.width && image.height() == canvas.height {
-        Ok(image)
-    } else {
-        Ok(image.resize_exact(canvas.width, canvas.height, FilterType::Triangle))
-    }
+    let frame_canvas = Canvas {
+        width: canvas.width,
+        height: canvas.height,
+        resize: true,
+    };
+    let normalized = resize_to_canvas(&image, &frame_canvas, None);
+    Ok(normalized.unwrap_or(image))
 }
 
 fn click(context: &mut UiRoutineContext<'_>, point: WorkflowPoint) -> anyhow::Result<()> {

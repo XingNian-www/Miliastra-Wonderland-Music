@@ -393,6 +393,9 @@ fn reply(spec: &super::reply_template::ReplyTemplate, vars: ReplyVars) -> String
 }
 
 /// 固定UTC+8日序号，不依赖操作系统时区，也没有夏令时偏移。
+///
+/// 1970-01-01 之前的时刻按「最后一个完整秒」向下取整，再交给
+/// `miliastra_kernel::date_time` 的同一份 UTC+8 日序号换算。
 fn utc8_day_at(time: SystemTime) -> i64 {
     let seconds = match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => i128::from(duration.as_secs()),
@@ -401,7 +404,7 @@ fn utc8_day_at(time: SystemTime) -> i64 {
                 - i128::from(error.duration().subsec_nanos() != 0)
         }
     };
-    (seconds + 8 * 60 * 60).div_euclid(24 * 60 * 60) as i64
+    miliastra_kernel::date_time::utc8_day(seconds as i64)
 }
 fn stable_seed(actor: &str, day: i64) -> [u8; 32] {
     let mut hash = Sha256::new();

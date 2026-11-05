@@ -1,17 +1,19 @@
 //! 给模型看的时钟文本。
 //!
-//! 固定 UTC+8：项目里 `adapters::logging` 与 `features::tarot` 都是硬编码 `+8*3600`，
-//! 注释明确「不依赖操作系统时区，也没有夏令时偏移」。用 OS 本地时区会在 Linux 服务器 / CI 上
+//! 固定 UTC+8：日期时间换算统一走 `miliastra_kernel::date_time`，
+//! 与 `adapters::logging`、`features::tarot` 共用同一份「不依赖操作系统时区、
+//! 也没有夏令时偏移」的实现。用 OS 本地时区会在 Linux 服务器 / CI 上
 //! 变成 UTC，给模型完全错误的作息判断。
 //!
 //! 名称刻意不叫 `time_text`：`ui::locator::time_text` 是歌单剩余时间，不是时钟。
 
-const UTC8_OFFSET_SECS: i64 = 8 * 3600;
+use miliastra_kernel::date_time::{utc8_datetime, utc8_day as kernel_utc8_day};
+
 const WEEKDAYS: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
-/// 固定 UTC+8 的 UTC 日序号（1970-01-01 为 0）。
+/// 固定 UTC+8 的日序号（1970-01-01 为 0）。
 pub(crate) fn utc8_day(unix_seconds: u64) -> i64 {
-    (unix_seconds as i64 + UTC8_OFFSET_SECS).div_euclid(86_400)
+    kernel_utc8_day(unix_seconds as i64)
 }
 
 /// 给模型看的单行时间文本，形如 `2026-10-27 周二 23:47（深夜）`。
@@ -19,14 +21,9 @@ pub(crate) fn utc8_day(unix_seconds: u64) -> i64 {
 /// **不输出秒**：秒级对「晚安」「今天/明天」这类判断毫无价值，
 /// 却会让同一分钟内的多次调用产生不同提示词，白白破坏前缀缓存。
 pub(crate) fn describe(unix_seconds: u64) -> String {
-    let local = unix_seconds as i64 + UTC8_OFFSET_SECS;
-    let days = local.div_euclid(86_400);
-    let second_of_day = local.rem_euclid(86_400);
-    let (year, month, date) = civil_from_days(days);
+    let (year, month, date, hour, minute, _) = utc8_datetime(unix_seconds as i64);
     // 1970-01-01 是周四。
-    let weekday = WEEKDAYS[((days + 4).rem_euclid(7)) as usize];
-    let hour = second_of_day / 3600;
-    let minute = second_of_day % 3600 / 60;
+    let weekday = WEEKDAYS[((utc8_day(unix_seconds) + 4).rem_euclid(7)) as usize];
     format!(
         "{year:04}-{month:02}-{date:02} {weekday} {hour:02}:{minute:02}（{}）",
         period_label(hour)
@@ -34,7 +31,7 @@ pub(crate) fn describe(unix_seconds: u64) -> String {
 }
 
 /// 时段标签。模型直接从词拿「深夜/早上」，比让它从 `23:47` 自己推更稳。
-fn period_label(hour: i64) -> &'static str {
+fn period_label(hour: u32) -> &'static str {
     match hour {
         0..=4 => "凌晨",
         5..=7 => "早上",
@@ -44,20 +41,6 @@ fn period_label(hour: i64) -> &'static str {
         18..=22 => "晚上",
         _ => "深夜",
     }
-}
-
-/// 日序号 → 公历年月日。算法与 `adapters::logging` 一致（Howard Hinnant 的 civil_from_days）。
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]

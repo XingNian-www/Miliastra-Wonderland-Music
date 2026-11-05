@@ -40,6 +40,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
+use miliastra_kernel::date_time::{civil_from_days, utc8_datetime, utc8_day};
 
 use crate::config::LoggingConfig;
 use crate::runtime::monitor::MonitorLogSink;
@@ -267,41 +268,18 @@ pub(crate) fn format_time(now: SystemTime) -> String {
 /// 日志用的 `MM-DD HH:MM:SS` 含空格与冒号，Windows 文件名不接受；
 /// 备份文件名还要年份才能区分不同年份的升级。
 pub(crate) fn format_timestamp_compact(now: SystemTime) -> String {
-    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let seconds = duration.as_secs() as i64 + 8 * 3600;
-    let days = seconds.div_euclid(86_400);
-    let second_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = second_of_day / 3600;
-    let minute = second_of_day % 3600 / 60;
-    let second = second_of_day % 60;
+    let seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let (year, month, day, hour, minute, second) = utc8_datetime(seconds);
     format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
 }
 
 fn format_timestamp(time: SystemTime) -> String {
-    let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let seconds = duration.as_secs() as i64 + 8 * 3600;
-    let days = seconds.div_euclid(86_400);
-    let second_of_day = seconds.rem_euclid(86_400);
-    let (_, month, day) = civil_from_days(days);
-    let hour = second_of_day / 3600;
-    let minute = second_of_day % 3600 / 60;
-    let second = second_of_day % 60;
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let (_, month, day, hour, minute, second) = utc8_datetime(seconds);
     format!("{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
-    (year, month as u32, day as u32)
 }
 
 /// 两阶段日志第一步：仅初始化文件日志（stderr 输出开启、monitor sink 未附加）。
@@ -456,12 +434,11 @@ fn daily_log_day(name: &str) -> Option<i64> {
 }
 
 fn local_day(time: SystemTime) -> i64 {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-        + 8 * 3600;
-    seconds.div_euclid(86_400)
+    utc8_day(
+        time.duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+    )
 }
 
 fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {

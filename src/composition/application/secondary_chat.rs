@@ -1,4 +1,5 @@
 use super::*;
+use super::moderation::wait_for_chat_baseline;
 
 impl ChatDecisionReader {
     /// 与 `read_messages` 同一套基线/新鲜度去重规则，但保留观察 id：
@@ -665,71 +666,42 @@ impl ApplicationRuntime {
         // MUST_READ §2 的「首屏历史不执行」就建立在这个基线上。
         //
         // 外部源不需要这条路：它是有序队列，新旧由服务端序号直接回答。
-        let mut refresh = self.ui.chat_timeline.request_refresh()?;
-        let baseline = loop {
-            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
-                return Err(anyhow!("运行已停止，已结束确认窗口"));
-            }
-            if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
-                return Err(anyhow!("运行已暂停，已结束确认窗口"));
-            }
-            if self.lifecycle.live_configs.has_pending_reload() {
-                return Err(anyhow!("配置重载待处理，已结束确认窗口"));
-            }
-            let mode = self.business.business.chat_listener_snapshot()?;
-            if mode.mode != listener_mode || mode.pending_mode.is_some() {
-                return Err(anyhow!("值守模式正在切换，已结束确认窗口"));
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(anyhow!("等待共享聊天确认基线超时"));
-            }
-            let refreshed = self
-                .ui
-                .chat_timeline
-                .wait_for_snapshot(refresh, remaining.min(Duration::from_millis(50)));
-            let snapshot = match refreshed {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => continue,
-                Err(error)
-                    if error
-                        .downcast_ref::<crate::observation::chat::NoChatRefreshError>()
-                        .is_some() =>
-                {
-                    // 退避一小段再重挂：投递层在「整批无可用容器」时也会用 NoChat
-                    // 完成围栏，若不可映射的频道持续连发，这里会高频空转抢占锁。
-                    // 与 moderation.rs 的 NoChat 分支保持一致。
-                    let backoff = deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(50));
-                    if !backoff.is_zero() {
-                        std::thread::sleep(backoff);
-                    }
-                    refresh = self.ui.chat_timeline.request_refresh()?;
-                    continue;
+        let baseline = wait_for_chat_baseline(
+            &self.ui.chat_timeline,
+            deadline,
+            || {
+                if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                    return Err(anyhow!("运行已停止，已结束确认窗口"));
                 }
-                Err(error) => return Err(error),
-            };
-            // 每轮重新判断来源：窗口打开期间外部源可能才刚连上（或刚好断线），
-            // 用入口处的一次快照会让后面这半段永远走错分支，一路空转到超时。
-            let external_now = self.lifecycle.external_chat.supplies_hall_messages();
-            let matched = if external_now {
-                // 外部源：只看业务范围。外部帧没有屏幕桶（chat 恒为 None），
-                // 按屏幕桶匹配会让窗口永远等不到基线。
-                snapshot.scope.is_hall()
-            } else {
-                // OCR：只认绑定的那一块聊天。另一块大厅面板的快照会被这里拒绝，
-                // 换新 token 继续等——那是同一大厅的另一块面板，属预期内的瞬时状态，
-                // 不得用它做基线游标，也不得重用已完成的 token。
-                snapshot.chat.as_ref() == Some(&chat)
-            };
-            if !matched {
-                // 这块快照不是窗口要的：换一个新 token 继续等，不要消耗掉当前这份。
-                refresh = self.ui.chat_timeline.request_refresh()?;
-                continue;
-            }
-            break snapshot;
-        };
+                if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+                    return Err(anyhow!("运行已暂停，已结束确认窗口"));
+                }
+                if self.lifecycle.live_configs.has_pending_reload() {
+                    return Err(anyhow!("配置重载待处理，已结束确认窗口"));
+                }
+                let mode = self.business.business.chat_listener_snapshot()?;
+                if mode.mode != listener_mode || mode.pending_mode.is_some() {
+                    return Err(anyhow!("值守模式正在切换，已结束确认窗口"));
+                }
+                Ok(())
+            },
+            |snapshot| {
+                // 每轮重新判断来源：窗口打开期间外部源可能才刚连上（或刚好断线），
+                // 用入口处的一次快照会让后面这半段永远走错分支，一路空转到超时。
+                if self.lifecycle.external_chat.supplies_hall_messages() {
+                    // 外部源：只看业务范围。外部帧没有屏幕桶（chat 恒为 None），
+                    // 按屏幕桶匹配会让窗口永远等不到基线。
+                    snapshot.scope.is_hall()
+                } else {
+                    // OCR：只认绑定的那一块聊天。另一块大厅面板的快照会被这里拒绝，
+                    // 换新 token 继续等——那是同一大厅的另一块面板，属预期内的瞬时状态，
+                    // 不得用它做基线游标，也不得重用已完成的 token。
+                    snapshot.chat.as_ref() == Some(&chat)
+                }
+            },
+            None,
+        )?
+        .ok_or_else(|| anyhow!("等待共享聊天确认基线超时"))?;
         if baseline.source.is_ocr() && baseline.chat.as_ref() != Some(&chat) {
             return Err(anyhow!("共享聊天确认基线会话不匹配"));
         }

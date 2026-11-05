@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{PointConfig, RectConfig};
 use crate::features::command::{CommandEnvelope, CommandPrefix, FeatureCommandMatch};
-use crate::text::normalize_comparison_text;
 pub use crate::ui::plan::{
     WorkflowMouseButton, WorkflowOperation, WorkflowPixelStability, WorkflowPoint, WorkflowRect,
     WorkflowResidency,
@@ -259,8 +258,8 @@ pub struct CustomWorkflowCommand {
 impl CustomWorkflowCommand {
     pub fn lock_identity(&self) -> WorkflowLockIdentity {
         WorkflowLockIdentity {
-            workflow: identity_text(&self.workflow),
-            args: identity_text(&self.args),
+            workflow: crate::features::chat_text::command_identity(&self.workflow),
+            args: crate::features::chat_text::command_identity(&self.args),
         }
     }
 
@@ -1298,14 +1297,6 @@ fn normalize_name(text: &str) -> String {
     text.trim().to_ascii_lowercase()
 }
 
-fn identity_text(text: &str) -> String {
-    let normalized = normalize_comparison_text(text);
-    if normalized.is_empty() {
-        text.split_whitespace().collect::<Vec<_>>().join(" ")
-    } else {
-        normalized
-    }
-}
 
 fn joined_command(command: &str, args: &str) -> String {
     if args.is_empty() {

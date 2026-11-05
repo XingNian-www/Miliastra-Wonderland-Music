@@ -16,6 +16,7 @@ cpal = "0.18.1"
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-resampling"] }
 log = { version = "0.4", features = ["std"] }
 md5 = "0.7"
+miliastra-kernel = { workspace = true }
 num-bigint = "0.4"
 rand = "0.8"
 reqwest = { workspace = true, features = ["blocking", "form", "json", "query", "rustls"] }

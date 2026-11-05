@@ -2135,9 +2135,7 @@ fn find_player(players: &[Player], name: &str) -> Option<usize> {
 const UNKNOWN_PLAYER_DISPLAY: &str = "未知玩家";
 
 fn player_key(name: &str) -> String {
-    // 只做去首尾空白 + 小写,保留标点:避免 "小明!" 与 "小明" 碰撞
-    // (否则可代他人出牌/抢地主/收到私聊手牌)。
-    name.trim().chars().flat_map(char::to_lowercase).collect()
+    crate::text::player_match_key(name)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

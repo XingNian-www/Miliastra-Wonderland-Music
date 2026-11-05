@@ -268,19 +268,7 @@ pub(super) fn validated_search_rewrite(request: &str, query: &str) -> Option<Str
     if query.is_empty() || query.chars().count() > 160 || query.starts_with(['@', '#']) {
         return None;
     }
-    let normalize = |text: &str| {
-        text.chars()
-            .map(|ch| match ch {
-                '　' => ' ',
-                '！'..='～' => char::from_u32(ch as u32 - 0xfee0).unwrap_or(ch),
-                _ => ch,
-            })
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
+    let normalize = miliastra_kernel::text::normalize_folded;
     (normalize(request) != normalize(&query)).then_some(query)
 }
 

@@ -385,63 +385,23 @@ fn call_review_http(
 }
 
 fn response_output_text(value: &Response) -> Result<String> {
-    if let Some(error) = &value.error {
-        let code = response_error_token(Some(error.code.as_str()));
+    let parts = crate::config::ai::responses_text_parts(value);
+    if let Some(code) = parts.error_code {
         bail!("候选歌曲审核响应失败 code={code}");
     }
-    if value.status != Status::Completed {
-        let reason = value
-            .incomplete_details
-            .as_ref()
-            .map(|details| details.reason.as_str())
-            .or_else(|| {
-                Some(match value.status {
-                    Status::Failed => "failed",
-                    Status::InProgress => "in_progress",
-                    Status::Cancelled => "cancelled",
-                    Status::Queued => "queued",
-                    Status::Incomplete => "incomplete",
-                    Status::Completed => "unknown",
-                })
-            })
-            .map_or("unknown", |reason| response_error_token(Some(reason)));
+    if let Some(reason) = parts.status_reason {
         bail!("候选歌曲审核响应未完成: {reason}");
     }
-    let mut texts = Vec::new();
-    for output in &value.output {
-        if let OutputItem::Message(message) = output {
-            for content in &message.content {
-                match content {
-                    OutputMessageContent::Refusal(_) => {
-                        bail!("候选歌曲审核拒绝处理");
-                    }
-                    OutputMessageContent::OutputText(text) => {
-                        let text = text.text.trim();
-                        if !text.is_empty() {
-                            texts.push(text);
-                        }
-                    }
-                }
-            }
-        }
+    if parts.refusal.is_some() {
+        bail!("候选歌曲审核拒绝处理");
     }
-    if texts.is_empty() {
+    if parts.texts.is_empty() {
         bail!("候选歌曲审核响应缺少 output_text");
     }
-    Ok(texts.join(""))
+    Ok(parts.texts.join(""))
 }
 
-fn response_error_token(value: Option<&str>) -> &str {
-    value
-        .filter(|value| {
-            !value.is_empty()
-                && value.len() <= 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-        })
-        .unwrap_or("unknown")
-}
+
 
 fn model_reply_json_object(reply: &str) -> Result<String> {
     crate::text::extract_json_object(reply)

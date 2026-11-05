@@ -916,8 +916,43 @@ fn describe_response_output(output: &[OutputItem]) -> String {
     parts.join("、")
 }
 
-/// Responses 的 output_text：跳过 refusal、未完成与缺失内容。
-fn responses_output_text(response: &Response) -> anyhow::Result<String> {
+/// 把 Responses 的 output 解析成「文本片段 / 拒绝 / 未完成原因 / 响应级错误」。
+///
+/// 应用层（取对话正文）与候选审核层原来各写一遍同样的遍历，只在
+/// “取第一个还是拼接全部”与错误文案上不同。这里只做解析，
+/// 文案与取舍留给调用方。
+pub(crate) struct ResponsesTextParts {
+    pub(crate) texts: Vec<String>,
+    pub(crate) refusal: Option<String>,
+    pub(crate) error_code: Option<String>,
+    pub(crate) status_reason: Option<String>,
+}
+
+pub(crate) fn responses_text_parts(response: &Response) -> ResponsesTextParts {
+    let error_code = response
+        .error
+        .as_ref()
+        .map(|error| response_error_token(Some(error.code.as_str())).to_owned());
+    let status_reason = (response.status != Status::Completed).then(|| {
+        response
+            .incomplete_details
+            .as_ref()
+            .map(|details| details.reason.as_str())
+            .or_else(|| {
+                Some(match response.status {
+                    Status::Failed => "failed",
+                    Status::InProgress => "in_progress",
+                    Status::Cancelled => "cancelled",
+                    Status::Queued => "queued",
+                    Status::Incomplete => "incomplete",
+                    Status::Completed => "unknown",
+                })
+            })
+            .map_or("unknown", |reason| response_error_token(Some(reason)))
+            .to_owned()
+    });
+    let mut texts = Vec::new();
+    let mut refusal = None;
     for output in &response.output {
         let OutputItem::Message(message) = output else {
             continue;
@@ -927,14 +962,52 @@ fn responses_output_text(response: &Response) -> anyhow::Result<String> {
                 OutputMessageContent::OutputText(text) => {
                     let text = text.text.trim();
                     if !text.is_empty() {
-                        return Ok(text.to_string());
+                        texts.push(text.to_owned());
                     }
                 }
-                OutputMessageContent::Refusal(refusal) => {
-                    bail!("AI 拒绝回答: {}", refusal.refusal)
+                OutputMessageContent::Refusal(value) => {
+                    if refusal.is_none() {
+                        refusal = Some(value.refusal.clone());
+                    }
                 }
             }
         }
+    }
+    ResponsesTextParts {
+        texts,
+        refusal,
+        error_code,
+        status_reason,
+    }
+}
+
+/// 上游返回的错误码/原因脱敏：只保留短的安全 token，避免把响应体写进日志。
+pub(crate) fn response_error_token(value: Option<&str>) -> &str {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+        .unwrap_or("unknown")
+}
+
+/// Responses 的 output_text：跳过 refusal、未完成与缺失内容。
+fn responses_output_text(response: &Response) -> anyhow::Result<String> {
+    let parts = responses_text_parts(response);
+    if let Some(code) = parts.error_code {
+        bail!("AI 响应失败 code={code}")
+    }
+    if let Some(reason) = parts.status_reason {
+        bail!("AI 响应未完成: {reason}")
+    }
+    if let Some(refusal) = parts.refusal {
+        bail!("AI 拒绝回答: {refusal}")
+    }
+    if let Some(text) = parts.texts.first() {
+        return Ok(text.clone());
     }
     // 失败时打出响应**结构**。这个错误在线上表现为「记忆压缩每轮都失败」，
     // 而 Responses 协议下不同中转的 output 形状差异很大（reasoning 项、

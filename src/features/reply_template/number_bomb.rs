@@ -86,7 +86,7 @@ pub(crate) const NUMBER_BOMB: &[ReplyTemplate] = &[
     },
     ReplyTemplate {
         key: "number_bomb.start.started",
-        default: "数字炸弹开始！范围 [{下限}, {上限}]，{人数} 人轮流猜；{玩家} 先猜，直接发送数字。",
+        default: "数字炸弹开始！范围 [{下限}, {上限}]，{人数} 人轮流猜；{玩家} 先猜，发送 #数字（例如 #50）。",
         summary: "开局公布范围",
         group: "娱乐",
     },
@@ -110,19 +110,19 @@ pub(crate) const NUMBER_BOMB: &[ReplyTemplate] = &[
     },
     ReplyTemplate {
         key: "number_bomb.guess.out_of_range",
-        default: "超出范围：请猜 {下限} 到 {上限} 之间的数字",
+        default: "超出范围：请发送 #{下限} 到 #{上限} 之间的数字",
         summary: "越界猜测",
         group: "娱乐",
     },
     ReplyTemplate {
         key: "number_bomb.guess.duplicate",
-        default: "{数字} 已经猜过了，换一个数字",
+        default: "#{数字} 已经猜过了，换一个数字",
         summary: "重复猜测",
         group: "娱乐",
     },
     ReplyTemplate {
         key: "number_bomb.guess.accepted",
-        default: "{玩家} 猜 {数字}，范围收窄为 [{下限}, {上限}]；轮到 {下一位}",
+        default: "{玩家} 猜 #{数字}，范围收窄为 [{下限}, {上限}]；轮到 {下一位}",
         summary: "安全猜测后的收窄提示",
         group: "娱乐",
     },
@@ -134,7 +134,7 @@ pub(crate) const NUMBER_BOMB: &[ReplyTemplate] = &[
     },
     ReplyTemplate {
         key: "number_bomb.timeout.auto",
-        default: "{玩家} 超时，自动猜 {数字}",
+        default: "{玩家} 超时，自动猜 #{数字}",
         summary: "回合超时自动猜测",
         group: "娱乐",
     },
@@ -176,7 +176,7 @@ pub(crate) const NUMBER_BOMB: &[ReplyTemplate] = &[
     },
     ReplyTemplate {
         key: "number_bomb.guess.not_number",
-        default: "请发送纯数字来猜，当前范围 [{下限}, {上限}]",
+        default: "请发送 #数字 来猜，当前范围 [{下限}, {上限}]",
         summary: "当前玩家发了非数字",
         group: "娱乐",
     },

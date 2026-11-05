@@ -1007,8 +1007,8 @@ pub(crate) const SESSION_DISPATCH: &[SessionDispatch] = &[
             crate::features::number_bomb::NumberBombCommand::parse_active_chat(envelope)
                 .map(|matched| matched.map(crate::features::command::ModuleCommand::NumberBomb))
         },
-        // 进行中接受大厅里的纯数字；这里标 true 让面板提示“可自由输入”，
-        // 纯数字在 listener 里补井号信封后才进入这张表。
+        // 进行中接受大厅里的 #数字；这里标 true 让面板提示“可自由输入”，
+        // 解析器只认 # 开头的猜测与固定关键词。
         open_ended: true,
         keywords: &["加入", "开始", "状态", "结束", "重来"],
         label: "数字炸弹",
@@ -1329,7 +1329,7 @@ mod tests {
         assert!(open_ended(EntertainmentKind::IdiomChain));
         assert!(open_ended(EntertainmentKind::Landlord));
         assert!(open_ended(EntertainmentKind::RunFast));
-        // 数字炸弹进行中接受大厅纯数字，解析器有 "Guess" 兜底。
+        // 数字炸弹进行中接受大厅 #数字，解析器有 "Guess" 兜底。
         assert!(open_ended(EntertainmentKind::NumberBomb));
         // 海龟汤与谁是卧底只认固定关键词。
         assert!(!open_ended(EntertainmentKind::TurtleSoup));

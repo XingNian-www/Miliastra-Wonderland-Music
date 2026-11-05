@@ -58,7 +58,7 @@ pub enum NumberBombCommand {
     End,
     /// 发起人保留成员重开一局。
     Retry,
-    /// 大厅里的一个纯数字；也接受带井号的写法，方便控制台与诊断复制。
+    /// 大厅里的一次猜测：必须带井号，例如 #42。
     Guess(u32),
     /// 当前玩家发了非数字内容；只提示本人，不消耗回合。
     Invalid,
@@ -137,15 +137,6 @@ impl NumberBombCommand {
     }
 
     /// 大厅纯数字猜测的入口。
-    ///
-    /// 游戏里玩家按需求直接发数字而不是井号命令，这种消息不会形成 CommandEnvelope；
-    /// listener 在数字炸弹进行中先用这里判定，再补一个井号信封交给统一路由。
-    /// 只认 ASCII 数字：全角归一化属于 OCR 上游职责，不在业务模块重复实现。
-    pub(crate) fn plain_guess(text: &str) -> Option<u32> {
-        let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-        parse_guess(&compact)
-    }
-
     pub(crate) fn lock_key(&self) -> String {
         match self {
             Self::Start => "number_bomb:start".to_string(),
@@ -160,7 +151,7 @@ impl NumberBombCommand {
     }
 }
 
-/// 解析纯数字猜测；0 也先交给业务范围校验，避免解析层与配置下界各写一套门槛。
+/// 解析猜测里的数字；0 也先交给业务范围校验，避免解析层与配置下界各写一套门槛。
 fn parse_guess(value: &str) -> Option<u32> {
     if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
@@ -982,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn command_parsing_covers_keywords_and_plain_guesses() {
+    fn command_parsing_covers_keywords_and_explicit_guesses() {
         let envelope = |text: &str| {
             CommandEnvelope::new(text, "玩家甲", "blue", text, CommandObservation::default())
                 .expect("envelope")
@@ -1008,10 +999,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{text} 应被数字炸弹认领"));
             assert_eq!(matched.command, command, "{text}");
         }
-        assert_eq!(NumberBombCommand::plain_guess(" 42 "), Some(42));
-        assert_eq!(NumberBombCommand::plain_guess("4 2"), Some(42));
-        assert_eq!(NumberBombCommand::plain_guess("４２"), None);
-        assert_eq!(NumberBombCommand::plain_guess("炸弹"), None);
+        // 猜测必须显式带井号：裸数字根本不会形成命令信封，自然也不会被认领。
+        assert!(
+            CommandEnvelope::new("42", "玩家甲", "blue", "42", CommandObservation::default())
+                .is_none(),
+            "裸数字不构成命令"
+        );
     }
 
     #[test]
@@ -1289,7 +1282,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(current.action, "not-a-number");
-        assert!(last_text(&current).contains("纯数字"));
+        assert!(last_text(&current).contains("#数字"));
         assert_eq!(service.session.as_ref().unwrap().turn, 0);
     }
 

@@ -355,6 +355,11 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
         example: "甲、乙、丙",
     },
     ReplyVariable {
+        name: "抢地主",
+        label: "抢地主的玩家名",
+        example: "小红",
+    },
+    ReplyVariable {
         name: "玩法",
         label: "玩法名称",
         example: "斗地主",

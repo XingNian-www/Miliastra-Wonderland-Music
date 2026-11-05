@@ -103,7 +103,11 @@ pub enum LandlordCommand {
     Start,
     RunFastStart,
     Join,
+    /// 叫地主（传统抢地主流程第一阶段）。
+    Call,
     Rob,
+    /// 反抢（原叫地主者被抢后的一次机会）。
+    CounterRob,
     Decline,
     Status,
     Play(String),
@@ -169,9 +173,11 @@ impl LandlordCommand {
     pub(crate) fn parse_hall(payload: &str) -> Option<Self> {
         let command = match compact_command(payload).as_str() {
             "加入" => Self::Join,
-            "抢" => Self::Rob,
-            "不抢" => Self::Decline,
-            "过" => Self::Pass,
+            "叫地主" | "叫" => Self::Call,
+            "不叫" | "不抢" => Self::Decline,
+            "抢" | "抢地主" => Self::Rob,
+            "反抢" => Self::CounterRob,
+            "过" | "要不起" => Self::Pass,
             "状态" => Self::Status,
             "重试" => Self::Retry,
             "结束" => Self::Exit,
@@ -200,7 +206,9 @@ impl LandlordCommand {
             Self::Start => "landlord:start".to_string(),
             Self::RunFastStart => "run_fast:start".to_string(),
             Self::Join => "landlord:join".to_string(),
+            Self::Call => "landlord:call".to_string(),
             Self::Rob => "landlord:rob".to_string(),
+            Self::CounterRob => "landlord:counter_rob".to_string(),
             Self::Decline => "landlord:decline".to_string(),
             Self::Status => "landlord:status".to_string(),
             Self::Play(cards) => format!("landlord:play:{}", command_identity(cards)),
@@ -217,7 +225,9 @@ impl LandlordCommand {
             Self::Start
                 | Self::RunFastStart
                 | Self::Join
+                | Self::Call
                 | Self::Rob
+                | Self::CounterRob
                 | Self::Decline
                 | Self::Hand
                 | Self::Retry
@@ -342,11 +352,57 @@ struct Lobby {
 struct Bidding {
     players: Vec<Player>,
     bottom: Vec<Card>,
+    phase: BiddingPhase,
     current: usize,
+    /// 本阶段已表态的人数（叫地主阶段数"不叫"，抢地主阶段数"抢/不抢"）。
     decisions: u8,
+    /// 叫地主的人，也就是暂定地主。
+    caller: Option<usize>,
+    /// 当前抢到的地主候选。
     candidate: Option<usize>,
     timer: ActiveTimer,
     warning_sent: bool,
+}
+
+/// 抢地主的三个阶段：叫地主 → 抢地主 → 反抢。
+///
+/// 传统流程：随机起手依次「叫地主/不叫」，第一个叫的人成为暂定地主；
+/// 其余两家依次「抢地主/不抢」；有人抢则原叫地主者获得一次「反抢」机会。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BiddingPhase {
+    Calling,
+    Robbing,
+    CounterRobbing,
+}
+
+impl BiddingPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Calling => "叫地主",
+            Self::Robbing => "抢地主",
+            Self::CounterRobbing => "反抢",
+        }
+    }
+}
+
+/// 一次抢地主表态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BidAction {
+    Call,
+    Decline,
+    Rob,
+    CounterRob,
+}
+
+/// 抢地主的结束方式，决定收尾文案。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BiddingFinish {
+    /// 无人抢，叫地主者直接当地主。
+    CallerLandlord,
+    /// 有人抢，最后抢到的人当地主。
+    RobberLandlord,
+    /// 原叫地主者反抢成功。
+    CounterRobbed,
 }
 
 struct Playing {
@@ -550,7 +606,10 @@ impl LandlordGame {
                 Some((kind, deadline_after(now, elapsed, target)))
             }
             GameState::Playing(game) => {
-                if forced_run_fast_action(game).is_some() || game.players[game.current].trustee {
+                if forced_run_fast_action(game).is_some()
+                    || landlord_must_pass(game)
+                    || game.players[game.current].trustee
+                {
                     return Some((CardGameDeadlineKind::TurnExpiry, now));
                 }
                 let elapsed = game.timer.elapsed_at(now, true);
@@ -740,8 +799,10 @@ impl LandlordGame {
         self.state = GameState::Bidding(Bidding {
             players,
             bottom,
+            phase: BiddingPhase::Calling,
             current: first,
             decisions: 0,
+            caller: None,
             candidate: None,
             timer: ActiveTimer::new(now),
             warning_sent: false,
@@ -788,8 +849,10 @@ impl LandlordGame {
                 )
             }
             LandlordCommand::Join => self.join_with_display(player, player_display, now),
-            LandlordCommand::Rob => self.bid(player, true, now),
-            LandlordCommand::Decline => self.bid(player, false, now),
+            LandlordCommand::Call => self.bid(player, BidAction::Call, now),
+            LandlordCommand::Rob => self.bid(player, BidAction::Rob, now),
+            LandlordCommand::CounterRob => self.bid(player, BidAction::CounterRob, now),
+            LandlordCommand::Decline => self.bid(player, BidAction::Decline, now),
             LandlordCommand::Status => self.status(),
             LandlordCommand::Play(cards) => self.play(player, cards, now),
             LandlordCommand::Pass => self.pass(player, now),
@@ -802,8 +865,9 @@ impl LandlordGame {
         }
     }
 
-    fn bid(&mut self, player: &str, rob: bool, now: Instant) -> LandlordOutcome {
-        let GameState::Bidding(bidding) = &mut self.state else {
+    /// 抢地主一次表态。传统流程：叫地主 → 抢地主 → 反抢。
+    fn bid(&mut self, player: &str, action: BidAction, now: Instant) -> LandlordOutcome {
+        let GameState::Bidding(bidding) = &self.state else {
             return LandlordOutcome::public(
                 "not-bidding",
                 keyed_reply(&templates::BIDDING_NOT_BIDDING, ReplyVars::new()),
@@ -824,25 +888,20 @@ impl LandlordGame {
                 ),
             );
         }
-
-        if rob {
-            bidding.candidate = Some(index);
-        }
-        bidding.decisions = bidding.decisions.saturating_add(1);
-        let name = bidding.players[index].name.clone();
-        if bidding.decisions < bidding.players.len() as u8 {
-            bidding.current = (bidding.current + 1) % bidding.players.len();
-            bidding.timer.reset(now);
-            bidding.warning_sent = false;
-            let next = bidding.players[bidding.current].name.clone();
+        let allowed = match bidding.phase {
+            BiddingPhase::Calling => matches!(action, BidAction::Call | BidAction::Decline),
+            BiddingPhase::Robbing => matches!(action, BidAction::Rob | BidAction::Decline),
+            BiddingPhase::CounterRobbing => matches!(
+                action,
+                BidAction::CounterRob | BidAction::Rob | BidAction::Decline
+            ),
+        };
+        if !allowed {
             return LandlordOutcome::public(
-                if rob { "robbed" } else { "declined" },
+                "wrong-phase",
                 keyed_reply(
-                    &templates::BIDDING_DECIDED,
-                    ReplyVars::new()
-                        .with("玩家", name)
-                        .with("决定", if rob { "抢地主" } else { "不抢" })
-                        .with("下一位", next),
+                    &templates::BIDDING_WRONG_PHASE,
+                    ReplyVars::new().with("阶段", bidding.phase.label()),
                 ),
             );
         }
@@ -851,53 +910,166 @@ impl LandlordGame {
         else {
             unreachable!("bidding state was checked")
         };
-        let Some(landlord) = bidding.candidate else {
-            let (hands, bottom) = deal(&mut self.rng);
-            for (player, hand) in bidding.players.iter_mut().zip(hands) {
-                player.hand = hand;
-                player.timeouts = 0;
-                player.trustee = false;
-                player.last_hand_reply = None;
+        let name = bidding.players[index].name.clone();
+        match bidding.phase {
+            BiddingPhase::Calling => {
+                if action == BidAction::Call {
+                    bidding.caller = Some(index);
+                    bidding.candidate = Some(index);
+                    bidding.phase = BiddingPhase::Robbing;
+                    bidding.decisions = 0;
+                    bidding.current = Self::next_robbing_player(&bidding, index);
+                    bidding.timer.reset(now);
+                    bidding.warning_sent = false;
+                    let next = bidding.players[bidding.current].name.clone();
+                    self.state = GameState::Bidding(bidding);
+                    return LandlordOutcome::public(
+                        "called",
+                        keyed_reply(
+                            &templates::BIDDING_CALLED,
+                            ReplyVars::new().with("玩家", name).with("下一位", next),
+                        ),
+                    );
+                }
+                bidding.decisions = bidding.decisions.saturating_add(1);
+                if bidding.decisions >= bidding.players.len() as u8 {
+                    // 三家都不叫：流局重发。
+                    return self.redeal(bidding, now);
+                }
+                bidding.current = (bidding.current + 1) % bidding.players.len();
+                bidding.timer.reset(now);
+                bidding.warning_sent = false;
+                let next = bidding.players[bidding.current].name.clone();
+                self.state = GameState::Bidding(bidding);
+                LandlordOutcome::public(
+                    "call-declined",
+                    keyed_reply(
+                        &templates::BIDDING_CALL_DECLINED,
+                        ReplyVars::new().with("玩家", name).with("下一位", next),
+                    ),
+                )
             }
-            let first = self.rng.index(bidding.players.len());
-            let first_name = bidding.players[first].name.clone();
-            let deliveries = initial_hand_deliveries(&bidding.players, CardGameVariant::Landlord);
-            self.state = GameState::Bidding(Bidding {
-                players: bidding.players,
-                bottom,
-                current: first,
-                decisions: 0,
-                candidate: None,
-                timer: ActiveTimer::new(now),
-                warning_sent: false,
-            });
-            return LandlordOutcome::public(
-                "redealt",
-                keyed_reply(
-                    &templates::BIDDING_REDEALT,
-                    ReplyVars::new().with("玩家", first_name),
-                ),
-            )
-            .with_private_deliveries(deliveries);
-        };
+            BiddingPhase::Robbing => {
+                if action == BidAction::Rob {
+                    bidding.candidate = Some(index);
+                }
+                bidding.decisions = bidding.decisions.saturating_add(1);
+                // 除叫地主者外，其余两家各表态一次。
+                if bidding.decisions < bidding.players.len().saturating_sub(1) as u8 {
+                    bidding.current = Self::next_robbing_player(&bidding, index);
+                    bidding.timer.reset(now);
+                    bidding.warning_sent = false;
+                    let next = bidding.players[bidding.current].name.clone();
+                    self.state = GameState::Bidding(bidding);
+                    let spec = if action == BidAction::Rob {
+                        &templates::BIDDING_ROBBED
+                    } else {
+                        &templates::BIDDING_ROB_DECLINED
+                    };
+                    return LandlordOutcome::public(
+                        if action == BidAction::Rob {
+                            "robbed"
+                        } else {
+                            "rob-declined"
+                        },
+                        keyed_reply(spec, ReplyVars::new().with("玩家", name).with("下一位", next)),
+                    );
+                }
+                if bidding.candidate == bidding.caller {
+                    // 没人抢：叫地主者直接当地主。
+                    return self.finish_bidding(bidding, now, BiddingFinish::CallerLandlord);
+                }
+                // 有人抢：原叫地主者获得一次反抢机会。
+                bidding.phase = BiddingPhase::CounterRobbing;
+                bidding.decisions = 0;
+                bidding.current = bidding.caller.expect("caller recorded when calling");
+                bidding.timer.reset(now);
+                bidding.warning_sent = false;
+                let caller_name = bidding.players[bidding.current].name.clone();
+                self.state = GameState::Bidding(bidding);
+                LandlordOutcome::public(
+                    "counter-prompt",
+                    keyed_reply(
+                        &templates::BIDDING_COUNTER_PROMPT,
+                        ReplyVars::new()
+                            .with("玩家", caller_name)
+                            .with("抢地主", name),
+                    ),
+                )
+            }
+            BiddingPhase::CounterRobbing => {
+                if matches!(action, BidAction::CounterRob | BidAction::Rob) {
+                    bidding.candidate = bidding.caller;
+                    self.finish_bidding(bidding, now, BiddingFinish::CounterRobbed)
+                } else {
+                    self.finish_bidding(bidding, now, BiddingFinish::RobberLandlord)
+                }
+            }
+        }
+    }
 
+    /// 三家都不叫：重新发牌并重新开始叫地主。
+    fn redeal(&mut self, mut bidding: Bidding, now: Instant) -> LandlordOutcome {
+        let (hands, bottom) = deal(&mut self.rng);
+        for (player, hand) in bidding.players.iter_mut().zip(hands) {
+            player.hand = hand;
+            player.timeouts = 0;
+            player.trustee = false;
+            player.last_hand_reply = None;
+        }
+        let first = self.rng.index(bidding.players.len());
+        let first_name = bidding.players[first].name.clone();
+        let deliveries = initial_hand_deliveries(&bidding.players, CardGameVariant::Landlord);
+        self.state = GameState::Bidding(Bidding {
+            players: bidding.players,
+            bottom,
+            phase: BiddingPhase::Calling,
+            current: first,
+            decisions: 0,
+            caller: None,
+            candidate: None,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+        });
+        LandlordOutcome::public(
+            "redealt",
+            keyed_reply(
+                &templates::BIDDING_REDEALT,
+                ReplyVars::new().with("玩家", first_name),
+            ),
+        )
+        .with_private_deliveries(deliveries)
+    }
+
+    /// 抢地主结束：定地主、发底牌、进入出牌阶段。
+    fn finish_bidding(
+        &mut self,
+        mut bidding: Bidding,
+        now: Instant,
+        reason: BiddingFinish,
+    ) -> LandlordOutcome {
+        let landlord = bidding
+            .candidate
+            .expect("bidding always has a landlord candidate when finishing");
         let bottom_text = format_play(&bidding.bottom);
         bidding.players[landlord].hand.append(&mut bidding.bottom);
         sort_hand(&mut bidding.players[landlord].hand);
         let landlord_name = bidding.players[landlord].name.clone();
+        let hand_text = format_hand(&bidding.players[landlord].hand);
+        let hand_count = bidding.players[landlord].hand.len().to_string();
         let landlord_delivery = LandlordPrivateDelivery {
             player: landlord_name.clone(),
             message: reply(
                 &templates::HAND_LANDLORD_INITIAL,
                 ReplyVars::new()
-                    .with("张数", bidding.players[landlord].hand.len().to_string())
-                    .with("手牌", format_hand(&bidding.players[landlord].hand)),
+                    .with("张数", hand_count.clone())
+                    .with("手牌", hand_text.clone()),
             ),
             template: Some(keyed_reply(
                 &templates::HAND_LANDLORD_INITIAL,
                 ReplyVars::new()
-                    .with("张数", bidding.players[landlord].hand.len().to_string())
-                    .with("手牌", format_hand(&bidding.players[landlord].hand)),
+                    .with("张数", hand_count)
+                    .with("手牌", hand_text),
             )),
         };
         self.state = GameState::Playing(Playing {
@@ -913,16 +1085,31 @@ impl LandlordGame {
             bombs: 0,
             opening_spade_three_required: false,
         });
+        let (action, spec) = match reason {
+            BiddingFinish::CallerLandlord => ("caller-landlord", &templates::BIDDING_CALLER_LANDLORD),
+            BiddingFinish::CounterRobbed => ("counter-robbed", &templates::BIDDING_COUNTER_ROBBED),
+            BiddingFinish::RobberLandlord => ("landlord-selected", &templates::LANDLORD_SELECTED),
+        };
         LandlordOutcome::public(
-            "landlord-selected",
+            action,
             keyed_reply(
-                &templates::LANDLORD_SELECTED,
+                spec,
                 ReplyVars::new()
                     .with("玩家", landlord_name)
                     .with("底牌", bottom_text),
             ),
         )
         .with_private_deliveries(vec![landlord_delivery])
+    }
+
+    /// 抢地主：从 from 之后找下一个表态者，跳过叫地主者。
+    fn next_robbing_player(bidding: &Bidding, from: usize) -> usize {
+        let len = bidding.players.len();
+        let mut next = (from + 1) % len;
+        if Some(next) == bidding.caller {
+            next = (next + 1) % len;
+        }
+        next
     }
 
     pub fn tick(&mut self, now: Instant, clock_active: bool) -> Option<LandlordOutcome> {
@@ -969,7 +1156,7 @@ impl LandlordGame {
                     return None;
                 }
                 let player = game.players[game.current].name.clone();
-                let mut outcome = self.bid(&player, false, now);
+                let mut outcome = self.bid(&player, BidAction::Decline, now);
                 if let Some(continuation) = outcome.public_reply.take() {
                     outcome.public_reply = Some(reply(
                         &templates::BIDDING_TIMEOUT,
@@ -984,6 +1171,11 @@ impl LandlordGame {
                 game.timer.tick(now, clock_active);
                 if !clock_active {
                     return None;
+                }
+                // 斗地主「要不起」：轮到自己就立即跳过，不等玩家输入也不等超时。
+                // 连跳在 auto_pass_landlord 里合并成一条消息。
+                if landlord_must_pass(game) {
+                    return Some(self.auto_pass_landlord(now));
                 }
                 let current = game.current;
                 if let Some(action) = forced_run_fast_action(game) {
@@ -1034,6 +1226,42 @@ impl LandlordGame {
                 }
             }
         }
+    }
+
+    /// 斗地主「要不起」自动跳过：连续两家都压不过时合并成一条消息。
+    ///
+    /// 立即生效（不等超时）；合并是为了避免一次连跳刷两条消息。
+    fn auto_pass_landlord(&mut self, now: Instant) -> LandlordOutcome {
+        let GameState::Playing(game) = &mut self.state else {
+            unreachable!("auto pass requires an active game");
+        };
+        let mut skipped: Vec<String> = Vec::new();
+        let mut new_trick = false;
+        // 最多循环一圈，防止状态异常时死循环。
+        for _ in 0..game.players.len() {
+            if !landlord_must_pass(game) {
+                break;
+            }
+            let current = game.current;
+            skipped.push(game.players[current].name.clone());
+            pass_playing(game, current, now, ActionOrigin::Forced);
+            new_trick = game.last_play.is_none();
+        }
+        let next = game.players[game.current].name.clone();
+        let spec = if new_trick {
+            &templates::PASS_FORCED_MERGED_LEAD
+        } else {
+            &templates::PASS_FORCED_MERGED_NEXT
+        };
+        LandlordOutcome::public(
+            "forced-pass",
+            reply(
+                spec,
+                ReplyVars::new()
+                    .with("玩家列表", skipped.join("、"))
+                    .with("下一位", next),
+            ),
+        )
     }
 
     fn timeout_action(&mut self, now: Instant) -> LandlordOutcome {
@@ -1603,6 +1831,26 @@ fn report_one_largest_single(game: &Playing, player: usize) -> Option<Card> {
                 .copied()
         })
         .flatten()
+}
+
+/// 斗地主：当前玩家是否「要不起」（手里没有任何能压过上家的牌）。
+///
+/// 只对斗地主生效。跑得快走 `forced_run_fast_action`，那边还会自动出唯一解，
+/// 这里只处理"压不过就自动跳过"，不替玩家选牌。
+fn landlord_must_pass(game: &Playing) -> bool {
+    if game.variant != CardGameVariant::Landlord {
+        return false;
+    }
+    let current = game.current;
+    let Some(previous) = game
+        .last_play
+        .as_ref()
+        .filter(|last| last.player != current)
+        .map(|last| &last.pattern)
+    else {
+        return false;
+    };
+    lowest_beating_play_for_variant(&game.players[current].hand, previous, game.variant).is_none()
 }
 
 fn forced_run_fast_action(game: &Playing) -> Option<ForcedRunFastAction> {
@@ -3185,9 +3433,24 @@ mod tests {
 
     #[test]
     fn redealt_and_landlord_bottom_delivery_failures_pause_the_game() {
-        for (command, expected_action) in [
-            (LandlordCommand::Decline, "redealt"),
-            (LandlordCommand::Rob, "landlord-selected"),
+        for (commands, expected_action) in [
+            (
+                vec![
+                    LandlordCommand::Decline,
+                    LandlordCommand::Decline,
+                    LandlordCommand::Decline,
+                ],
+                "redealt",
+            ),
+            (
+                vec![
+                    LandlordCommand::Call,
+                    LandlordCommand::Rob,
+                    LandlordCommand::Decline,
+                    LandlordCommand::Decline,
+                ],
+                "landlord-selected",
+            ),
         ] {
             let mut service = TestCardGameService::new(LandlordConfig::default());
             let port = FakeCardGamePort::new(true, true);
@@ -3203,11 +3466,13 @@ mod tests {
                 .unwrap();
 
             let mut final_outcome = None;
-            for _ in 0..3 {
+            for command in &commands {
                 let accepted = ["甲", "乙", "丙"]
                     .into_iter()
-                    .map(|player| service.handle(player, &command, now).unwrap())
-                    .find(|outcome| outcome.action != "wrong-bidder")
+                    .map(|player| service.handle(player, command, now).unwrap())
+                    .find(|outcome| {
+                        outcome.action != "wrong-bidder" && outcome.action != "wrong-phase"
+                    })
                     .expect("one player must own the bidding turn");
                 final_outcome = Some(accepted);
             }
@@ -3744,14 +4009,22 @@ mod tests {
         parse_cards(text).unwrap()
     }
 
+    /// 走完整套传统抢地主：叫地主 → 两家抢 → 原叫地主者反抢。
     fn finish_bidding_with_all_players_robbing(game: &mut LandlordGame, now: Instant) {
-        for _ in 0..3 {
+        fn current_name(game: &LandlordGame) -> String {
             let GameState::Bidding(bidding) = &game.state else {
                 panic!("expected bidding")
             };
-            let player = bidding.players[bidding.current].name.clone();
+            bidding.players[bidding.current].name.clone()
+        }
+        let caller = current_name(game);
+        game.handle(&caller, &LandlordCommand::Call, now);
+        for _ in 0..2 {
+            let player = current_name(game);
             game.handle(&player, &LandlordCommand::Rob, now);
         }
+        let caller = current_name(game);
+        game.handle(&caller, &LandlordCommand::CounterRob, now);
         assert!(matches!(game.state, GameState::Playing(_)));
     }
 
@@ -4529,40 +4802,98 @@ mod tests {
         assert_eq!(playing.players[playing.landlord].hand.len(), 20);
     }
 
+    fn current_bidder(game: &LandlordGame) -> String {
+        let GameState::Bidding(bidding) = &game.state else {
+            panic!("expected bidding")
+        };
+        bidding.players[bidding.current].name.clone()
+    }
+
     #[test]
-    fn last_player_to_rob_becomes_landlord_and_leads() {
+    fn caller_becomes_landlord_when_nobody_robs() {
         let now = Instant::now();
         let mut game = LandlordGame::with_seed(LandlordConfig::default(), 29);
         game.create("甲", now);
         game.join("乙", now);
         game.join("丙", now);
 
-        let mut last_robber = String::new();
-        for rob in [true, false, true] {
-            let GameState::Bidding(bidding) = &game.state else {
-                panic!("expected bidding")
-            };
-            let player = bidding.players[bidding.current].name.clone();
-            if rob {
-                last_robber = player.clone();
-            }
-            game.handle(
-                &player,
-                if rob {
-                    &LandlordCommand::Rob
-                } else {
-                    &LandlordCommand::Decline
-                },
-                now,
-            );
+        let caller = current_bidder(&game);
+        game.handle(&caller, &LandlordCommand::Call, now);
+        for _ in 0..2 {
+            let player = current_bidder(&game);
+            game.handle(&player, &LandlordCommand::Decline, now);
         }
 
         let GameState::Playing(playing) = &game.state else {
             panic!("expected playing")
         };
-        assert_eq!(playing.players[playing.landlord].name, last_robber);
+        assert_eq!(playing.players[playing.landlord].name, caller);
+        assert_eq!(playing.players[playing.landlord].hand.len(), 20);
+    }
+
+    #[test]
+    fn robber_becomes_landlord_when_caller_declines_counter_rob() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 29);
+        game.create("甲", now);
+        game.join("乙", now);
+        game.join("丙", now);
+
+        let caller = current_bidder(&game);
+        game.handle(&caller, &LandlordCommand::Call, now);
+        let robber = current_bidder(&game);
+        game.handle(&robber, &LandlordCommand::Rob, now);
+        let other = current_bidder(&game);
+        game.handle(&other, &LandlordCommand::Decline, now);
+        // 有人抢，原叫地主者获得一次反抢机会。
+        assert_eq!(current_bidder(&game), caller);
+        game.handle(&caller, &LandlordCommand::Decline, now);
+
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.players[playing.landlord].name, robber);
         assert_eq!(playing.current, playing.landlord);
         assert_eq!(playing.players[playing.landlord].hand.len(), 20);
+    }
+
+    #[test]
+    fn caller_counter_robs_and_becomes_landlord() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 29);
+        game.create("甲", now);
+        game.join("乙", now);
+        game.join("丙", now);
+
+        let caller = current_bidder(&game);
+        game.handle(&caller, &LandlordCommand::Call, now);
+        for _ in 0..2 {
+            let player = current_bidder(&game);
+            game.handle(&player, &LandlordCommand::Rob, now);
+        }
+        assert_eq!(current_bidder(&game), caller);
+        let outcome = game.handle(&caller, &LandlordCommand::CounterRob, now);
+        assert_eq!(outcome.action, "counter-robbed");
+
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.players[playing.landlord].name, caller);
+        assert_eq!(playing.players[playing.landlord].hand.len(), 20);
+    }
+
+    #[test]
+    fn robbing_before_calling_is_rejected() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 29);
+        game.create("甲", now);
+        game.join("乙", now);
+        game.join("丙", now);
+
+        let player = current_bidder(&game);
+        let outcome = game.handle(&player, &LandlordCommand::Rob, now);
+        assert_eq!(outcome.action, "wrong-phase");
+        assert!(matches!(game.state, GameState::Bidding(_)));
     }
 
     #[test]
@@ -4611,7 +4942,7 @@ mod tests {
         let outcome = game
             .tick(now + Duration::from_secs(1), true)
             .expect("bidding timeout");
-        assert_eq!(outcome.action, "declined");
+        assert_eq!(outcome.action, "call-declined");
         let GameState::Bidding(bidding) = &game.state else {
             panic!("expected bidding")
         };
@@ -4838,6 +5169,150 @@ mod tests {
         assert!(outcome.ended);
         assert_eq!(outcome.action, "won");
         assert!(!game.is_active());
+    }
+
+#[test]
+    fn landlord_parses_yaobuqi_as_pass() {
+        assert_eq!(LandlordCommand::parse_hall("要不起"), Some(LandlordCommand::Pass));
+        assert_eq!(LandlordCommand::parse_hall("过"), Some(LandlordCommand::Pass));
+    }
+
+    #[test]
+    fn landlord_auto_passes_when_the_current_player_cannot_beat() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 7);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::Nine)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Five), Card::new(Rank::Six)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Four), Card::new(Rank::Four)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::Landlord,
+            landlord: 0,
+            current: 1,
+            last_play: Some(LastPlay {
+                player: 0,
+                cards: vec![Card::new(Rank::Three), Card::new(Rank::Three)],
+                pattern: PlayPattern::Pair(Rank::Three),
+            }),
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 1,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        let outcome = game.tick(now, true).expect("auto pass");
+
+        assert_eq!(outcome.action, "forced-pass");
+        assert_eq!(
+            outcome.public_reply.as_deref(),
+            Some("乙要不起，自动跳过；轮到丙")
+        );
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.current, 2);
+        assert!(playing.last_play.is_some(), "丙还能压，本轮不清空");
+    }
+
+    #[test]
+    fn landlord_merges_consecutive_auto_passes_and_starts_a_new_trick() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 8);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::Nine)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Five), Card::new(Rank::Six)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Seven), Card::new(Rank::Eight)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::Landlord,
+            landlord: 0,
+            current: 1,
+            last_play: Some(LastPlay {
+                player: 0,
+                cards: vec![Card::new(Rank::Three), Card::new(Rank::Three)],
+                pattern: PlayPattern::Pair(Rank::Three),
+            }),
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 1,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        let outcome = game.tick(now, true).expect("auto pass chain");
+
+        assert_eq!(outcome.action, "forced-pass");
+        assert_eq!(
+            outcome.public_reply.as_deref(),
+            Some("乙、丙要不起，甲领出"),
+            "连跳必须合并成一条"
+        );
+        let GameState::Playing(playing) = &game.state else {
+            panic!("expected playing")
+        };
+        assert_eq!(playing.current, 0);
+        assert!(playing.last_play.is_none(), "两家都要不起后重新领出");
+        assert_eq!(playing.consecutive_passes, 0);
+    }
+
+    #[test]
+    fn landlord_does_not_auto_pass_when_a_beating_play_exists() {
+        let now = Instant::now();
+        let mut game = LandlordGame::with_seed(LandlordConfig::default(), 9);
+        game.state = GameState::Playing(Playing {
+            players: vec![
+                Player {
+                    hand: vec![Card::new(Rank::Nine)],
+                    ..Player::new("甲")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Four), Card::new(Rank::Four)],
+                    ..Player::new("乙")
+                },
+                Player {
+                    hand: vec![Card::new(Rank::Five)],
+                    ..Player::new("丙")
+                },
+            ],
+            variant: CardGameVariant::Landlord,
+            landlord: 0,
+            current: 1,
+            last_play: Some(LastPlay {
+                player: 0,
+                cards: vec![Card::new(Rank::Three), Card::new(Rank::Three)],
+                pattern: PlayPattern::Pair(Rank::Three),
+            }),
+            consecutive_passes: 0,
+            timer: ActiveTimer::new(now),
+            warning_sent: false,
+            turns: 1,
+            bombs: 0,
+            opening_spade_three_required: false,
+        });
+
+        assert!(game.tick(now, true).is_none(), "能压就必须等玩家自己出牌");
     }
 
     #[test]

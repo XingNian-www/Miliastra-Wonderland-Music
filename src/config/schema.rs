@@ -1741,6 +1741,12 @@ fn number_bomb_section() -> Vec<ConfigFieldSchema> {
             int(0, 1_000_000),
             "超过 5 人后，每多 1 人给默认上限增加多少；0 表示不加",
         ),
+        ConfigFieldSchema::db_idle_reload(
+            "upper_bound_cap",
+            "上限封顶",
+            int(1, 1_000_000_000),
+            "人数再多，范围上限也不会超过这个值；不能小于默认上限",
+        ),
     ]
 }
 

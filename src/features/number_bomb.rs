@@ -170,6 +170,8 @@ pub struct NumberBombConfig {
     pub min_players: usize,
     /// 超过 5 人后每多 1 人给上限加多少。
     pub extra_range_per_player: u32,
+    /// 上限的绝对封顶值；人数再多也不会超过它。
+    pub upper_bound_cap: u32,
 }
 
 impl Default for NumberBombConfig {
@@ -181,7 +183,8 @@ impl Default for NumberBombConfig {
             turn_timeout_seconds: 60,
             max_players: 11,
             min_players: 2,
-            extra_range_per_player: 20,
+            extra_range_per_player: 100,
+            upper_bound_cap: 1000,
         }
     }
 }
@@ -202,6 +205,9 @@ impl NumberBombConfig {
         }
         if self.turn_timeout_seconds == 0 {
             bail!("number_bomb.turn_timeout_seconds 必须大于 0");
+        }
+        if self.upper_bound_cap < self.max {
+            bail!("number_bomb.upper_bound_cap 不能小于 number_bomb.max");
         }
         Ok(())
     }
@@ -759,6 +765,7 @@ fn range_upper_bound(config: &NumberBombConfig, players: usize) -> u32 {
     config
         .max
         .saturating_add(extra_players.saturating_mul(config.extra_range_per_player))
+        .min(config.upper_bound_cap.max(config.max))
 }
 
 /// 在剩余范围内随机取一个没猜过的数字。
@@ -923,7 +930,8 @@ mod tests {
             turn_timeout_seconds: 60,
             max_players: 11,
             min_players: 2,
-            extra_range_per_player: 20,
+            extra_range_per_player: 100,
+            upper_bound_cap: 1000,
         }
     }
 
@@ -955,8 +963,25 @@ mod tests {
         assert_eq!(config.turn_timeout_seconds, 60);
         assert_eq!(config.min_players, 2);
         assert_eq!(config.max_players, 11);
-        assert_eq!(config.extra_range_per_player, 20);
+        assert_eq!(config.extra_range_per_player, 100);
+        assert_eq!(config.upper_bound_cap, 1000);
         config.validate().expect("默认配置必须合法");
+    }
+
+    #[test]
+    fn upper_bound_is_capped_by_configuration() {
+        let config = NumberBombConfig {
+            extra_range_per_player: 100,
+            upper_bound_cap: 300,
+            ..NumberBombConfig::default()
+        };
+        // 6 人按加成是 200，7 人是 300，8 人本该 400 但被封顶到 300。
+        assert_eq!(range_upper_bound(&config, 6), 200);
+        assert_eq!(range_upper_bound(&config, 7), 300);
+        assert_eq!(range_upper_bound(&config, 8), 300);
+        let mut invalid = config.clone();
+        invalid.upper_bound_cap = 50;
+        assert!(invalid.validate().is_err(), "封顶不能小于默认上限");
     }
 
     #[test]
@@ -1117,8 +1142,9 @@ mod tests {
             )
             .unwrap();
         let session = service.session.as_ref().expect("session");
-        assert_eq!(session.upper, 120);
-        assert!((1..=120).contains(&session.bomb.expect("bomb")));
+        // 6 人：100 + 1×100。
+        assert_eq!(session.upper, 200);
+        assert!((1..=200).contains(&session.bomb.expect("bomb")));
     }
 
     #[test]

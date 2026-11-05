@@ -679,28 +679,8 @@ fn json_string(value: &Value, key: &str) -> String {
 }
 
 fn model_reply_json_object(reply: &str) -> Result<String> {
-    let trimmed = reply.trim();
-    if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
-        return Ok(trimmed.to_string());
-    }
-    let start = trimmed
-        .find('{')
-        .ok_or_else(|| anyhow::anyhow!("AI返回无效JSON"))?;
-    let end = trimmed
-        .rfind('}')
-        .ok_or_else(|| anyhow::anyhow!("AI返回无效JSON"))?;
-    // `start > end` 是可达的：外部返回「好的 } 我无法处理 {」这类畸形文本时，
-    // 最后一个 `}` 在第一个 `{` 之前。直接切片会 panic 打崩业务线程，
-    // 而这里本该返回错误。
-    if end < start {
-        bail!("AI返回无效JSON")
-    }
-    let candidate = &trimmed[start..=end];
-    if serde_json::from_str::<Value>(candidate).is_ok_and(|value| value.is_object()) {
-        Ok(candidate.to_string())
-    } else {
-        bail!("AI返回无效JSON")
-    }
+    crate::text::extract_json_object(reply)
+        .ok_or_else(|| anyhow::anyhow!("AI返回无效JSON"))
 }
 
 fn validate_recognize_json(text: &str) -> Result<()> {

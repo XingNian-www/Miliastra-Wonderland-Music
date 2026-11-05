@@ -672,6 +672,7 @@ impl ApplicationRuntime {
         let context = HallCommandContext {
             message_type: parsed.message_type.clone(),
             username: command_username(parsed).to_string(),
+            actor_display: self.mapped_actor_name(&parsed.username, parsed.account.as_ref()),
             user_command: parsed.user_command.clone(),
         };
         let application = self.business.hall_application;

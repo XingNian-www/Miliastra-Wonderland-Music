@@ -37,6 +37,7 @@ impl ApplicationRuntime {
         let invocation = CustomWorkflowInvocation {
             command: command.clone(),
             username: parsed.username.clone(),
+            actor_display: self.mapped_actor_name(&parsed.username, parsed.account.as_ref()),
             message_type: parsed.message_type.clone(),
             user_command: parsed.user_command.clone(),
         };

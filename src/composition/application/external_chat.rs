@@ -846,10 +846,23 @@ fn deliver(
         // 两个字段，只查昵称就永远拿不到备注——而身份映射要以备注为准。
         // 所以只要带 UID 就查；begin_name_lookup 本身按 UID 去重，
         // 同一发送者不会重复排队。
-        if let Some(uid) = message.sender.uid.as_ref()
-            && state.begin_name_lookup(uid.as_str())
-        {
-            lookups.push(uid.as_str().to_string());
+        if let Some(uid) = message.sender.uid.as_ref() {
+            // 缺任一名字就走短冷却：备注串和真实昵称一样要贪婪补，避免遗漏。
+            let incomplete = identity_access
+                .as_ref()
+                .and_then(|identity| {
+                    identity.resolve_account(
+                        miliastra_kernel::chat_source::GAME_GENSHIN,
+                        uid.as_str(),
+                    )
+                })
+                .is_none_or(|resolved| {
+                    resolved.real_nickname.trim().is_empty()
+                        || resolved.remark.trim().is_empty()
+                });
+            if state.prime_name_lookup(uid.as_str(), incomplete) {
+                lookups.push(uid.as_str().to_string());
+            }
         }
     }
     for uid in lookups {
@@ -886,6 +899,17 @@ fn deliver(
 
 /// 后台昵称补查线程。
 ///
+/// 这个身份还需要贪婪补查吗？
+///
+/// 两个名字都算：备注串（游戏内好友备注）与真实昵称。任一为空，
+/// 或备注串还没被聊天桥确认过（玩家可能刚在游戏里设上），都按短冷却反复查。
+/// 只补真实昵称会让"好友后设了备注"要等十分钟才生效。
+fn needs_greedy_name_refresh(mapping: &crate::features::identity::IdentityMapping) -> bool {
+    mapping.real_nickname.trim().is_empty()
+        || mapping.remark.trim().is_empty()
+        || !mapping.remark_from_chatbridge
+}
+
 /// 按身份映射表定期扫描，把还没拿到名字的账号排进补查队列。
 ///
 /// 消息驱动的补查只在有人说话时发生，从不说话的好友永远拿不到真实昵称；
@@ -906,9 +930,7 @@ fn spawn_name_priming(
                 let config = identity_access.snapshot();
                 let mut queued = 0usize;
                 for mapping in &config.mappings {
-                    // 只看真实昵称：备注串是玩家在游戏里设的，可能永远为空，
-                    // 那种情况由长 TTL 定期刷新，不该进短冷却反复查。
-                    let incomplete = mapping.real_nickname.trim().is_empty();
+                    let incomplete = needs_greedy_name_refresh(mapping);
                     for account in &mapping.accounts {
                         if !state.prime_name_lookup(&account.uid, incomplete) {
                             continue;
@@ -1400,6 +1422,28 @@ mod tests {
         state.remember_uid(None, Some("1"));
         state.remember_uid(Some("甲"), None);
         assert_eq!(state.uid_for("甲"), None);
+    }
+
+    #[test]
+    fn greedy_refresh_covers_both_names() {
+        use crate::features::identity::{IdentityMapping, IdentityRole};
+        let mapping = |remark: &str, real: &str, from_chatbridge: bool| IdentityMapping {
+            remark: remark.to_owned(),
+            id: uuid::Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            display_name: String::new(),
+            real_nickname: real.to_owned(),
+            remark_from_chatbridge: from_chatbridge,
+            accounts: Vec::new(),
+        };
+        // 两个名字都齐、且备注串已被聊天桥确认：不必再贪婪补。
+        assert!(!needs_greedy_name_refresh(&mapping("abcd1234", "真名甲", true)));
+        // 真实昵称缺失。
+        assert!(needs_greedy_name_refresh(&mapping("abcd1234", "", true)));
+        // 备注串缺失。
+        assert!(needs_greedy_name_refresh(&mapping("", "真名甲", true)));
+        // 备注串还是随机占位（没被聊天桥确认过）：玩家可能刚在游戏里设上备注。
+        assert!(needs_greedy_name_refresh(&mapping("abcd1234", "真名甲", false)));
     }
 
     #[test]

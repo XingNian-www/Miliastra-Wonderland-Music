@@ -2472,7 +2472,7 @@ impl ApplicationRuntime {
         Ok(secondary)
     }
 
-    /// 屏幕名（给玩家看、也是好友列表里能搜到的名字）：备注 → note → 原名。
+    /// 展示名（给玩家看）：显示名 → 真实昵称 → 占位「玩家」。
     ///
     /// 外部聊天源的 `from.name` 是资料包昵称、与屏幕名无关，必须用账号 UID 先解析身份。
     pub(super) fn mapped_actor_name(

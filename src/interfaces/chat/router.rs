@@ -749,9 +749,9 @@ fn role_for_envelope(
     // 判定**不改**——用户已定稿 nickname 就是权限推断键；这里只留排查线索，
     // 供事后回答「这条管理员命令当初是按哪个名字认出来的」。
     //
-    // 日志里绝不出现昵称原文：nickname 是 OCR 匹配键，落进日志等于把
-    // 「可以被改成一样的名字」泄露出去了（见 identity.rs 的 display_name 注释）。
-    // 只用 display_name()，它在没有备注时返回不可用于匹配的 UUID 前缀。
+    // 日志里绝不出现备注串原文：remark 是 OCR 匹配键，落进日志等于把
+    // 「可以被改成一样的名字」泄露出去了（见 identity.rs 的 player_name 注释）。
+    // 只用 player_name()：显示名 → 真实昵称 → 占位「玩家」，不会外泄内部键。
     if envelope.account().is_none() && matches!(resolved.role, IdentityRole::Admin | IdentityRole::Owner)
     {
         log::warn!(
@@ -1066,8 +1066,9 @@ mod tests {
     /// 现在每条命令只认自己的 override，没配就用它自己的默认值。
     /// 回归：好友备注（nickname）可以用于授权，游戏真名（note）不行。
     ///
-    /// 线上形态：identity 的 `nickname` 存的是**好友备注**（玩家自己写的
-    /// 随机串，如 `abcd1234`），`note` 才是游戏真名。大厅 OCR 读到的是真名。
+    /// 线上形态：identity 的 nickname 键存的是**备注串**（remark，玩家自己写的
+    /// 随机串，如 abcd1234），note 键是软件显示名（display_name）。
+    /// 屏幕显示的是备注串，OCR 读到的就是它。
     ///
     /// 曾经为了让"大厅读到真名也能认出管理员"给 resolve_hint 加过 note 兜底，
     /// 结果 moderation 的防冒充测试立刻变红：**玩家可以把自己昵称改成管理员的

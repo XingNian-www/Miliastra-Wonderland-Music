@@ -15,6 +15,7 @@ pub(crate) mod identity;
 pub(crate) mod idiom_chain;
 pub(crate) mod invite;
 pub(crate) mod moderation;
+pub(crate) mod number_bomb;
 pub(crate) mod playback;
 pub(crate) mod playlist;
 pub(crate) mod reply_template;

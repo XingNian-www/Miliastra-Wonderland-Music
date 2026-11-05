@@ -18,6 +18,7 @@ use crate::features::moderation::{ModerationConfig, ModerationTimingConfig};
 use crate::features::playback::{MatchConfig, PlaybackTimingConfig, QueueConfig, SongDedupConfig};
 use crate::features::song_request::{SongAiConfig, SongReviewConfig};
 use crate::features::startup::{StartupConfig, StartupTemplateConfig};
+use crate::features::number_bomb::NumberBombConfig;
 use crate::features::turtle_soup::TurtleSoupConfig;
 use crate::features::undercover::UndercoverConfig;
 use crate::runtime::player::PlayerObservationConfig;
@@ -183,6 +184,9 @@ pub struct AppConfig {
     /// 谁是卧底；内嵌段可省略。
     #[serde(default)]
     pub undercover: UndercoverConfig,
+    /// 数字炸弹；内嵌段可省略。
+    #[serde(default)]
+    pub number_bomb: NumberBombConfig,
     /// 海龟汤；内嵌段可省略。
     #[serde(default)]
     pub turtle_soup: TurtleSoupConfig,
@@ -344,6 +348,7 @@ impl Default for AppConfig {
             kugou: KugouDeviceConfig::default(),
             landlord: LandlordConfig::default(),
             undercover: UndercoverConfig::default(),
+            number_bomb: NumberBombConfig::default(),
             turtle_soup: TurtleSoupConfig::default(),
             ai: AiConfig::default(),
             song_ai: SongAiConfig::default(),
@@ -629,6 +634,7 @@ impl AppConfig {
         self.idiom_chain.validate()?;
         self.landlord.validate()?;
         self.undercover.validate()?;
+        self.number_bomb.validate()?;
         self.invite.validate(&self.timing.invite)?;
         self.moderation.validate(&self.timing.moderation)?;
         self.custom_workflows.validate()?;

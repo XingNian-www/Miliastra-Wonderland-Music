@@ -10,6 +10,7 @@ use crate::features::card_games::{CardGameService, CardGameTimedOutcome};
 use crate::features::entertainment::{EntertainmentKind, EntertainmentState};
 use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainOutcome, IdiomChainService};
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
+use crate::features::number_bomb::NumberBombService;
 use crate::features::turtle_soup::{TurtleSoupAiCompletion, TurtleSoupService, TurtleSoupSnapshot};
 use crate::features::undercover::{
     UndercoverRuntimeService, UndercoverSnapshot, UndercoverTimedOutcome,
@@ -20,7 +21,8 @@ use crate::runtime::task_engine::BusinessTaskPort;
 use super::{
     ActiveCardGameDeadline, ActiveIdiomDeadline, ActiveTurtleSoupDeadline,
     ActiveUndercoverDeadline, BusinessRuntimeError, BusinessStateSink, CardGameRuntimeMessage,
-    TurtleSoupHandlerContext, TurtleSoupRuntimeMessage, UndercoverRuntimeMessage,
+    NumberBombRuntimeMessage, TurtleSoupHandlerContext, TurtleSoupRuntimeMessage,
+    UndercoverRuntimeMessage,
     abort_business_modules, handle_business_timer, handle_card_game_message,
     handle_turtle_soup_message, handle_undercover_message, idiom_chain_operation_failed,
     publish_business_state, sync_idiom_deadline, sync_turtle_soup_deadline,
@@ -34,6 +36,7 @@ pub(super) struct EntertainmentRuntimeState {
     idiom_chain: IdiomChainService,
     card_games: CardGameService,
     undercover: UndercoverRuntimeService,
+    number_bomb: NumberBombService,
     turtle_soup: Option<TurtleSoupService>,
     invite: InviteService,
     active_idiom_deadline: Option<ActiveIdiomDeadline>,
@@ -56,6 +59,7 @@ impl EntertainmentRuntimeState {
         idiom_chain: IdiomChainService,
         card_games: CardGameService,
         undercover: UndercoverRuntimeService,
+        number_bomb: NumberBombService,
         turtle_soup: Option<TurtleSoupService>,
         invite: InviteService,
         state_sink: Option<Arc<dyn BusinessStateSink>>,
@@ -66,6 +70,7 @@ impl EntertainmentRuntimeState {
             idiom_chain,
             card_games,
             undercover,
+            number_bomb,
             turtle_soup,
             invite,
             active_idiom_deadline: None,
@@ -258,6 +263,46 @@ impl EntertainmentRuntimeState {
         )
     }
 
+    pub(super) fn handle_number_bomb(
+        &mut self,
+        message: NumberBombRuntimeMessage,
+    ) -> Result<(), BusinessRuntimeError> {
+        match message {
+            NumberBombRuntimeMessage::Handle {
+                player,
+                player_display,
+                command,
+                now,
+                response,
+            } => {
+                let result = self
+                    .number_bomb
+                    .handle_command(
+                        &mut self.entertainment,
+                        &player,
+                        &player_display,
+                        &command,
+                        now,
+                    )
+                    .map_err(|error| {
+                        BusinessRuntimeError::NumberBombOperationFailed(format!("{error:#}"))
+                    });
+                let _ = response.send(result);
+            }
+            NumberBombRuntimeMessage::Poll {
+                now,
+                clock_active,
+                response,
+            } => {
+                let _ = response.send(Ok(self.number_bomb.tick(now, clock_active)));
+            }
+            NumberBombRuntimeMessage::Abort(response) => {
+                let _ = response.send(Ok(self.number_bomb.abort(&mut self.entertainment)));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn handle_turtle_soup(
         &mut self,
         message: TurtleSoupRuntimeMessage,
@@ -300,6 +345,7 @@ impl EntertainmentRuntimeState {
             &mut self.idiom_chain,
             &mut self.card_games,
             &mut self.undercover,
+            &mut self.number_bomb,
             self.turtle_soup.as_mut(),
             timer,
             &mut self.active_idiom_deadline,

@@ -7,6 +7,7 @@ pub(crate) enum EntertainmentKind {
     RunFast,
     TurtleSoup,
     Undercover,
+    NumberBomb,
 }
 
 impl EntertainmentKind {
@@ -17,6 +18,7 @@ impl EntertainmentKind {
             Self::RunFast => "跑得快",
             Self::TurtleSoup => "海龟汤",
             Self::Undercover => "谁是卧底",
+            Self::NumberBomb => "数字炸弹",
         }
     }
 }

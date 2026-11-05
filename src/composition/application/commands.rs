@@ -542,6 +542,9 @@ impl ApplicationRuntime {
             ModuleCommand::Tarot(command) => self.execute_tarot_intent(parsed, command),
             ModuleCommand::Playlist(command) => self.execute_playlist_intent(parsed, command),
             ModuleCommand::Undercover(command) => self.execute_undercover_intent(parsed, command),
+            ModuleCommand::NumberBomb(command) => {
+                self.execute_number_bomb_intent(parsed, command)
+            }
             ModuleCommand::Invite(command) => self.execute_invite_intent(parsed, command),
             ModuleCommand::Moderation(command) => self.execute_moderation_intent(parsed, command),
             ModuleCommand::CustomWorkflow(command) => {
@@ -769,6 +772,39 @@ impl ApplicationRuntime {
         command: &UndercoverCommand,
     ) -> Result<()> {
         self.execute_undercover_command(parsed, command)
+    }
+
+    /// 数字炸弹的回复只有在发送边界才渲染，才能读到命令面板里的覆盖与静音。
+    fn execute_number_bomb_intent(
+        &self,
+        parsed: &RoutedCommand,
+        command: &crate::features::number_bomb::NumberBombCommand,
+    ) -> Result<()> {
+        let player = self.canonical_actor_name(&parsed.username);
+        let player_display = self.mapped_actor_name(&parsed.username, parsed.account.as_ref());
+        let outcome = self.business.business.handle_number_bomb(
+            &player,
+            &player_display,
+            command,
+            command_observed_at(parsed),
+        )?;
+        if outcome.action != "ignored" {
+            self.log_executed_command(parsed, &format!("number_bomb {}", outcome.action))?;
+        }
+        for reply in &outcome.replies {
+            // 静音由 render_template_text 统一处理：None 表示这条不该发。
+            let Some(text) = self.render_template_text(reply.spec, &reply.vars) else {
+                continue;
+            };
+            if let Err(error) = enqueue_current_hall_reply(&self.business.task_engine, &text) {
+                // 状态已经推进（例如轮次已换人），发送失败只影响这一条提示，
+                // 不能让整条命令报失败后又被命令锁当成“没执行”重试一次。
+                log::error!(
+                    "数字炸弹回复入队失败（步骤：把结果加入延迟聊天队列），本次提示不会发送给玩家，玩局状态已经推进：{error:#}"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn execute_invite_intent(

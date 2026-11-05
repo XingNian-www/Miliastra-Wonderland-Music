@@ -18,7 +18,14 @@ use crate::features::playback::{
 pub(crate) struct SongRequestContext {
     pub(crate) message_type: String,
     pub(crate) raw: String,
+    /// 命令主语（身份键）：外部聊天源的私聊里是 UID，OCR 私聊里是备注串。
+    /// **只用于身份匹配与命令锁，绝不直接渲染。**
     pub(crate) username: String,
+    /// 渲染用的玩家名（软件显示名 → 真实昵称），由组合层填充。
+    ///
+    /// 大厅/面板文案一律用它：私聊主语是 UID 或备注串，直接渲染会把内部键
+    /// 或随机备注念给玩家。为空时退回 username。
+    pub(crate) actor_display: String,
     pub(crate) user_command: String,
     /// 发送者的游戏账号（仅外部聊天源提供；OCR 为 None）。
     ///
@@ -526,6 +533,7 @@ impl SongRequestApplication {
             queue_max_size: self.queue_max_size,
             console_bypass_dedup: self.console_bypass_dedup,
             actor_username: &context.username,
+            actor_display: &context.actor_display,
             actor_account: context.account.as_ref(),
             actor_authority: context.authority,
             console: context.message_type == "控制台",
@@ -535,12 +543,26 @@ impl SongRequestApplication {
     }
 }
 
+impl SongRequestExecution<'_> {
+    /// 渲染用玩家名：优先软件显示名，没有才退回命令主语。
+    fn display_or_actor(&self, fallback: &str) -> String {
+        let display = self.actor_display.trim();
+        if display.is_empty() {
+            fallback.to_owned()
+        } else {
+            display.to_owned()
+        }
+    }
+}
+
 struct SongRequestExecution<'a> {
     ai: &'a dyn SongRequestAiGateway,
     song_review: &'a dyn SongReviewGateway,
     queue_max_size: usize,
     console_bypass_dedup: bool,
     actor_username: &'a str,
+    /// 渲染用玩家名；为空时退回 actor_username。
+    actor_display: &'a str,
     /// 发送者的游戏账号（仅外部聊天源提供；OCR 为 None）。
     ///
     /// 平台权限必须按它与 `actor_username` 一起判定，否则 API 链路只能按
@@ -640,7 +662,7 @@ impl SongRequestExecution<'_> {
         let Some(mut request) = self.resolve_and_confirm_song(song)? else {
             return Ok(());
         };
-        request.requester = context.username.clone();
+        request.requester = self.display_or_actor(&context.username);
         request.console_bypass_dedup = context.message_type == "控制台";
         if !self.require_request_source(&request)? {
             return Ok(());
@@ -781,7 +803,7 @@ impl SongRequestExecution<'_> {
                 prefer_accompaniment: song.prefer_accompaniment,
                 ai_original_text: String::new(),
                 track: None,
-                friend_username: song.friend_username.clone(),
+                friend_username: self.display_or_actor(&song.friend_username),
                 requester: String::new(),
                 console_bypass_dedup: false,
                 candidate_snapshot: Vec::new(),
@@ -1086,7 +1108,7 @@ impl SongRequestExecution<'_> {
                     prefer_accompaniment: song.prefer_accompaniment,
                     ai_original_text: song.keyword.clone(),
                     track: Some(selected.playable_track()),
-                    friend_username: song.friend_username.clone(),
+                    friend_username: self.display_or_actor(&song.friend_username),
                     requester: String::new(),
                     console_bypass_dedup: false,
                     candidate_snapshot: vec![selected],
@@ -1112,7 +1134,7 @@ impl SongRequestExecution<'_> {
             prefer_accompaniment: song.prefer_accompaniment,
             ai_original_text: song.keyword.clone(),
             track: Some(candidate.playable_track()),
-            friend_username: song.friend_username.clone(),
+            friend_username: self.display_or_actor(&song.friend_username),
             requester: String::new(),
             console_bypass_dedup: false,
             candidate_snapshot: selection,
@@ -1350,7 +1372,7 @@ impl SongRequestExecution<'_> {
                         prefer_accompaniment: song.prefer_accompaniment,
                         ai_original_text: String::new(),
                         track: Some(candidate.playable_track()),
-                        friend_username: song.friend_username.clone(),
+                        friend_username: self.display_or_actor(&song.friend_username),
                         requester: String::new(),
                         console_bypass_dedup: false,
                         candidate_snapshot: vec![candidate],
@@ -1397,7 +1419,7 @@ impl SongRequestExecution<'_> {
                     prefer_accompaniment: song.prefer_accompaniment,
                     ai_original_text: String::new(),
                     track: Some(picked.candidate.playable_track()),
-                    friend_username: song.friend_username.clone(),
+                    friend_username: self.display_or_actor(&song.friend_username),
                     requester: String::new(),
                     console_bypass_dedup: false,
                     candidate_snapshot: picked.candidate_snapshot,
@@ -1414,7 +1436,7 @@ impl SongRequestExecution<'_> {
                     prefer_accompaniment: song.prefer_accompaniment,
                     ai_original_text: String::new(),
                     track: Some(candidate.playable_track()),
-                    friend_username: song.friend_username.clone(),
+                    friend_username: self.display_or_actor(&song.friend_username),
                     requester: String::new(),
                     console_bypass_dedup: false,
                     candidate_snapshot: picked.candidate_snapshot,
@@ -2506,6 +2528,7 @@ mod tests {
             message_type: "blue".to_string(),
             raw: "@点歌 晴天".to_string(),
             username: "Alice".to_string(),
+            actor_display: String::new(),
             user_command: "@点歌 晴天".to_string(),
             account: None,
             authority: crate::features::command::CommandAuthority::HallMember,
@@ -3102,6 +3125,31 @@ mod tests {
         .expect_err("zero is not a one-based candidate index");
 
         assert!(error.to_string().contains("候选索引: 0"));
+    }
+
+    #[test]
+    fn requester_and_label_use_the_display_name_not_the_command_subject() {
+        // 私聊点歌时命令主语是 UID（外部源）或备注串（OCR），
+        // 渲染必须走软件显示名，否则大厅会念出内部键。
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
+        let context = SongRequestContext {
+            username: "900000001".to_owned(),
+            actor_display: "显示名甲".to_owned(),
+            ..context()
+        };
+        let song = SongCommand {
+            friend_username: "900000001".to_owned(),
+            ..command()
+        };
+
+        application()
+            .execute(&context, &song, &mut port)
+            .expect("song request");
+
+        assert_eq!(port.played.borrow()[0].requester, "显示名甲");
+        // 命令锁仍用命令主语：身份稳定，不随显示名变化。
+        assert!(song.lock_key().contains("900000001"));
     }
 
     #[test]

@@ -85,13 +85,21 @@ impl FriendDelivery {
         &self.recipient
     }
 
-    /// 实际拿去搜好友列表的名字：有候选就用候选，否则退回 `recipient`。
+    /// 实际拿去搜好友列表的名字。
+    ///
+    /// 候选由装配层统一用 identity.friend_search_names 生成，这里只做兜底：
+    /// 没给候选时用收件人本身，但**内部键（UUID）除外**——拿它去搜好友列表
+    /// 只会白跑一轮，还会把 UUID 写进日志。返回空表时上层直接报「没有可搜索的
+    /// 好友名」，不会盲点。
     pub(crate) fn search_recipients(&self) -> Vec<String> {
-        if self.search_names.is_empty() {
-            vec![self.recipient.clone()]
-        } else {
-            self.search_names.clone()
+        if !self.search_names.is_empty() {
+            return self.search_names.clone();
         }
+        let recipient = self.recipient.trim();
+        if recipient.is_empty() || uuid::Uuid::parse_str(recipient).is_ok() {
+            return Vec::new();
+        }
+        vec![self.recipient.clone()]
     }
 
     pub(crate) fn messages(&self) -> &[String] {

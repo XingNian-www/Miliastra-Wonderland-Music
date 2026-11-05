@@ -224,7 +224,7 @@ impl ApplicationRuntime {
                 self.lifecycle
                     .live_configs
                     .identity
-                    .search_names_for_key(message.recipient())
+                    .friend_search_names(message.recipient(), None)
             } else {
                 message.search_names().to_vec()
             };

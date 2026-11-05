@@ -597,7 +597,7 @@ impl IdentityAccess {
         self.player_name(name, None)
     }
 
-    /// 好友搜索名：**备注串 → 真实昵称**，去重后返回。
+    /// 好友搜索名候选：**备注串 → 真实昵称**，去重后返回。
     ///
     /// 屏幕显示的是备注串（无备注时是玩家自设昵称），所以只试这两个名字；
     /// 软件显示名与 UUID 都不该拿去搜好友列表。
@@ -607,32 +607,73 @@ impl IdentityAccess {
             if candidate.is_empty() || names.iter().any(|existing| existing == candidate) {
                 continue;
             }
-            names.push(candidate.to_string());
+            names.push(candidate.to_owned());
         }
         names
     }
 
-    /// 按账号反查好友搜索名：**备注串 → 真实昵称**。
+    /// 按三档名字解析身份：命中唯一返回 Ok(Some)，某一档命中多条返回 Err（歧义）。
     ///
-    /// 为什么是**多个**：屏幕显示备注串，没有备注时显示玩家自设昵称；
-    /// 两种来源都得试，否则必有一半玩家的邀请/私聊找不到人。
-    /// 空串与重复项已剔除；一个都没有时返回空表，调用方据此在进 UI 前失败。
-    pub fn search_names_for_account(&self, game: &str, uid: &str) -> Vec<String> {
-        self.resolve_account(game, uid)
-            .map(|identity| Self::search_names_of(&identity))
-            .unwrap_or_default()
+    /// 显示名与真实昵称都允许重名，猜错就是把私聊发给另一个人。
+    #[allow(clippy::result_unit_err)]
+    fn resolve_by_any_name(&self, name: &str) -> std::result::Result<Option<ResolvedIdentity>, ()> {
+        fn count(mappings: &[IdentityMapping], predicate: impl Fn(&IdentityMapping) -> bool) -> usize {
+            mappings.iter().filter(|mapping| predicate(mapping)).count()
+        }
+        let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let mappings = config.mappings.as_slice();
+        let remark = count(mappings, |mapping| mapping.remark.trim() == name);
+        if remark > 1 {
+            return Err(());
+        }
+        if remark == 1 {
+            return Ok(mappings
+                .iter()
+                .find(|mapping| mapping.remark.trim() == name)
+                .map(Self::resolved_from_mapping));
+        }
+        let display = count(mappings, |mapping| mapping.display_name.trim() == name);
+        if display > 1 {
+            return Err(());
+        }
+        if display == 1 {
+            return Ok(mappings
+                .iter()
+                .find(|mapping| mapping.display_name.trim() == name)
+                .map(Self::resolved_from_mapping));
+        }
+        let real = count(mappings, |mapping| mapping.real_nickname.trim() == name);
+        if real > 1 {
+            return Err(());
+        }
+        if real == 1 {
+            return Ok(mappings
+                .iter()
+                .find(|mapping| mapping.real_nickname.trim() == name)
+                .map(Self::resolved_from_mapping));
+        }
+        Ok(None)
     }
 
-    /// 按**身份键或已知名字**取好友搜索名。
+    /// **好友列表搜索名的唯一入口**：所有 UI 投递都只认这一份候选。
     ///
-    /// 投递层拿到的收件人可能是内部键（UUID），直接当名字查会落空、
-    /// 退回拿 UUID 搜好友列表。这里先按 UUID 认身份。
-    pub fn search_names_for_key(&self, key: &str) -> Vec<String> {
-        let key = key.trim();
-        if key.is_empty() {
-            return Vec::new();
+    /// `who` 是「要找谁」，可以是任意已知标识：内部身份键（UUID）、备注串、
+    /// 软件显示名或真实昵称；`account` 是外部聊天源给的真实账号。
+    ///
+    /// 输出按屏幕显示优先级去重：备注串 → 真实昵称。三条边界：
+    /// - 传了账号但没登记：返回空表，让调用方告警——`who` 这时可能是 UID，
+    ///   拿去搜好友列表既搜不到也不该写进日志；
+    /// - 名字命中多条不同身份：返回空表，宁可报找不到人也不发给另一个人；
+    /// - 完全解析不到且没有账号：退回 `who` 本身，UI 仍有一次机会（但 UUID 除外）。
+    pub fn friend_search_names(&self, who: &str, account: Option<(&str, &str)>) -> Vec<String> {
+        let who = who.trim();
+        if let Some((game, uid)) = account {
+            return self
+                .resolve_account(game, uid)
+                .map(|identity| Self::search_names_of(&identity))
+                .unwrap_or_default();
         }
-        if let Ok(uuid) = Uuid::parse_str(key) {
+        if let Ok(uuid) = Uuid::parse_str(who) {
             let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
             return config
                 .mappings
@@ -642,69 +683,13 @@ impl IdentityAccess {
                 .map(|identity| Self::search_names_of(&identity))
                 .unwrap_or_default();
         }
-        self.search_names_for_display_name(key)
-    }
-
-    /// 按「已知的名字」反查好友搜索名：**备注串 → 显示名 → 真实昵称**。
-    ///
-    /// 投递层只知道展示名（特征层传出来的是软件显示名），要换回屏幕上的名字
-    /// 才能搜好友列表。三个名字任一命中即可，但**同一档命中多条就放弃**：
-    /// 显示名允许重名，猜错就是把私聊发给另一个人，宁可报找不到人。
-    pub fn search_names_for_display_name(&self, name: &str) -> Vec<String> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Vec::new();
+        match self.resolve_by_any_name(who) {
+            Ok(Some(identity)) => Self::search_names_of(&identity),
+            Ok(None) if who.is_empty() => Vec::new(),
+            Ok(None) => vec![who.to_owned()],
+            Err(()) => Vec::new(),
         }
-        // 收件人本身就是内部键时按身份键解析。
-        if Uuid::parse_str(name).is_ok() {
-            return self.search_names_for_key(name);
-        }
-        // 同一档里唯一命中才算数：命中两条不同身份就返回 None。
-        fn unique<'a>(
-            mappings: &'a [IdentityMapping],
-            predicate: impl Fn(&IdentityMapping) -> bool,
-        ) -> Option<&'a IdentityMapping> {
-            let mut hit: Option<&'a IdentityMapping> = None;
-            for mapping in mappings {
-                if !predicate(mapping) {
-                    continue;
-                }
-                match hit {
-                    None => hit = Some(mapping),
-                    Some(previous) if previous.id == mapping.id => {}
-                    Some(_) => return None,
-                }
-            }
-            hit
-        }
-        let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        let mappings = config.mappings.as_slice();
-        unique(mappings, |mapping| mapping.remark.trim() == name)
-            .or_else(|| unique(mappings, |mapping| mapping.display_name.trim() == name))
-            .or_else(|| unique(mappings, |mapping| mapping.real_nickname.trim() == name))
-            .map(Self::resolved_from_mapping)
-            .map(|identity| Self::search_names_of(&identity))
-            .unwrap_or_default()
     }
-
-    /// 搜索链：**备注串 → 真实昵称 → 传入的名字**（只用于搜好友列表）。
-    ///
-    /// `account` 是外部聊天源带来的真实账号：消息里的 `from.name` 是**资料包昵称**，
-    /// 与屏幕名无关，只按名字查会落空，必须先用 UID 解析出身份。
-    pub fn search_name(&self, name: &str, account: Option<(&str, &str)>) -> String {
-        let identity = account
-            .and_then(|(game, uid)| self.resolve_account(game, uid))
-            .or_else(|| self.resolve(name))
-            .or_else(|| self.resolve_by_display_name(name));
-        let Some(identity) = identity else {
-            return name.to_owned();
-        };
-        Self::search_names_of(&identity)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| name.to_owned())
-    }
-
     /// 记忆归属键：**UUID 优先，未登记才退回展示名**。
     ///
     /// UUID 是唯一身份码，跨改名、跨显示名变化都稳定。
@@ -947,8 +932,10 @@ mod tests {
             }],
         });
 
-        let names = identity
-            .search_names_for_account(miliastra_kernel::chat_source::GAME_GENSHIN, "900000001");
+        let names = identity.friend_search_names(
+            "900000001",
+            Some((miliastra_kernel::chat_source::GAME_GENSHIN, "900000001")),
+        );
         // 好友列表显示的是备注串，所以搜索名必须有它。
         assert_eq!(names, vec!["玩家丙".to_string()], "搜索名应只含备注串");
         // 软件显示名只做文案，**不能**拿去搜好友列表。
@@ -962,9 +949,9 @@ mod tests {
         let identity = crate::features::identity::IdentityAccess::new(Default::default());
         assert!(
             identity
-                .search_names_for_account(
-                    miliastra_kernel::chat_source::GAME_GENSHIN,
+                .friend_search_names(
                     "999999999",
+                    Some((miliastra_kernel::chat_source::GAME_GENSHIN, "999999999")),
                 )
                 .is_empty()
         );
@@ -1313,18 +1300,11 @@ mod tests {
         let access = IdentityAccess::new(config);
 
         // 收件人是内部键时必须认得出身份，不能拿 UUID 去搜好友列表。
-        assert_eq!(
-            access.search_names_for_key(&id.to_string()),
-            vec!["pGAxP".to_string(), "真名甲".to_string()]
-        );
-        assert_eq!(
-            access.search_names_for_display_name(&id.to_string()),
-            vec!["pGAxP".to_string(), "真名甲".to_string()],
-            "内部键走名字入口也要能解析"
-        );
-        assert!(access.search_names_for_key("").is_empty());
+        let by_key = access.friend_search_names(&id.to_string(), None);
+        assert_eq!(by_key, vec!["pGAxP".to_owned(), "真名甲".to_owned()]);
+        assert!(access.friend_search_names("", None).is_empty());
         assert!(access
-            .search_names_for_key("00000000-0000-4000-8000-0000000000ff")
+            .friend_search_names("00000000-0000-4000-8000-0000000000ff", None)
             .is_empty());
     }
 
@@ -1346,14 +1326,15 @@ mod tests {
 
         // 显示名允许重名：命中两条不同身份时放弃，宁可报找不到人，
         // 也不能把私聊发给另一个同名玩家。
-        assert!(access.search_names_for_display_name("同名").is_empty());
+        assert!(access.friend_search_names("同名", None).is_empty());
         // 备注串唯一，仍能正常解析。
         assert_eq!(
-            access.search_names_for_display_name("aa11"),
-            vec!["aa11".to_string()]
+            access.friend_search_names("aa11", None),
+            vec!["aa11".to_owned()]
         );
     }
 
+    #[test]
     fn search_names_use_the_remark_then_the_real_nickname() {
         let mut config = IdentityConfig::default();
         config.mappings.push(IdentityMapping {
@@ -1368,18 +1349,17 @@ mod tests {
         let access = IdentityAccess::new(config);
         // 备注串优先（屏幕显示的就是它），真实昵称兜底；显示名不进搜索。
         assert_eq!(
-            access.search_names_for_account("genshin", "10002"),
-            vec!["nick_beta".to_string(), "真名乙".to_string()]
+            access.friend_search_names("10002", Some(("genshin", "10002"))),
+            vec!["nick_beta".to_owned(), "真名乙".to_owned()]
         );
     }
 
-
-    /// 屏幕名回退链：**备注(nickname) → note → 原始名字**。
+    /// 好友搜索候选：**备注串 → 真实昵称**，解析不到才退回传入的名字。
     ///
     /// 依据 identity-name-display-and-permission.md：屏幕显示的是 nickname（好友备注优先），
     /// note 只是面板标签。外部聊天源的 from.name 是资料包昵称，必须先用账号 UID 解析身份。
     #[test]
-    fn screen_name_prefers_the_remark_then_note_then_the_raw_name() {
+    fn friend_search_names_prefer_the_remark_then_fall_back_to_the_raw_name() {
         let mut config = IdentityConfig::default();
         config.mappings.push(IdentityMapping {
             remark: "abcd1234".to_string(),
@@ -1393,15 +1373,24 @@ mod tests {
         let access = IdentityAccess::new(config);
         // 1) 外部源只有 UID：from.name 是资料包昵称，必须靠 UID 解析出备注名。
         assert_eq!(
-            access.search_name("资料包昵称", Some(("genshin", "10002"))),
-            "abcd1234"
+            access.friend_search_names("资料包昵称", Some(("genshin", "10002"))),
+            vec!["abcd1234".to_owned()]
         );
         // 2) 名字本身就是备注（OCR 路径）。
-        assert_eq!(access.search_name("abcd1234", None), "abcd1234");
-        // 3) 名字命中的是 note：回退链取备注，不是 note。
-        assert_eq!(access.search_name("显示名乙", None), "abcd1234");
-        // 4) 都解析不到：原样返回 from.name。
-        assert_eq!(access.search_name("未登记玩家", None), "未登记玩家");
+        assert_eq!(
+            access.friend_search_names("abcd1234", None),
+            vec!["abcd1234".to_owned()]
+        );
+        // 3) 名字命中的是显示名：仍返回屏幕候选，不是显示名本身。
+        assert_eq!(
+            access.friend_search_names("显示名乙", None),
+            vec!["abcd1234".to_owned()]
+        );
+        // 4) 都解析不到：退回传入的名字，UI 仍有一次机会。
+        assert_eq!(
+            access.friend_search_names("未登记玩家", None),
+            vec!["未登记玩家".to_owned()]
+        );
     }
 
     #[test]

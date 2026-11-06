@@ -171,7 +171,8 @@ async fn run_download(
     inner.active_downloads.fetch_sub(1, Ordering::SeqCst);
 
     // 更新注册表状态（先取句柄，避免借用冲突）。
-    let max_bytes = inner.config.max_bytes;
+    // 容量上限每次下载结束按最新限额读取（配置可热更新，不重建缓存实例）。
+    let max_bytes = (inner.limits)().max_bytes;
     let (notify, handle, completed, completed_size) = {
         let mut entries = inner.entries.write().await;
         // 以下两个提前返回实际不可达：下载中条目 last_used 最新不会被淘汰，
@@ -240,11 +241,13 @@ async fn download_to_file(
     part_file: &std::path::Path,
     task_handle: &DownloadHandle,
 ) -> Result<(), String> {
+    // 每次下载开始时读取当前限额：超时/单文件上限随配置热更新，不重建缓存。
+    let limits = (inner.limits)();
     let mut request = inner.client.get(source.url.clone());
     for (name, value) in &source.headers {
         request = request.header(name, value);
     }
-    let mut response = tokio::time::timeout(inner.config.request_timeout, request.send())
+    let mut response = tokio::time::timeout(limits.request_timeout, request.send())
         .await
         .map_err(|_| "等待源站响应头超时".to_owned())?
         .map_err(|_| "源站请求失败".to_owned())?;
@@ -254,10 +257,10 @@ async fn download_to_file(
     // 有明确 Content-Length 时，下载结束必须与之相符，否则视为源站截断：
     // 残缺文件一旦改名 .complete 会被当作完整缓存反复播放失败。
     let expected_bytes = response.content_length();
-    if expected_bytes.is_some_and(|bytes| bytes > inner.config.max_bytes) {
+    if expected_bytes.is_some_and(|bytes| bytes > limits.max_bytes) {
         return Err(format!(
             "源站文件超过单文件缓存上限 {} 字节",
-            inner.config.max_bytes
+            limits.max_bytes
         ));
     }
     let mut file = tokio::fs::File::create(part_file)
@@ -265,17 +268,17 @@ async fn download_to_file(
         .map_err(|error| format!("创建缓存文件失败: {error}"))?;
     let mut written = 0usize;
     loop {
-        let chunk = tokio::time::timeout(inner.config.request_timeout, response.chunk())
+        let chunk = tokio::time::timeout(limits.request_timeout, response.chunk())
             .await
             .map_err(|_| "读取源站响应流超时".to_owned())?
             .map_err(|_| "读取源站响应流失败".to_owned())?;
         let Some(chunk) = chunk else {
             break;
         };
-        if (written as u64).saturating_add(chunk.len() as u64) > inner.config.max_bytes {
+        if (written as u64).saturating_add(chunk.len() as u64) > limits.max_bytes {
             return Err(format!(
                 "源站文件超过单文件缓存上限 {} 字节",
-                inner.config.max_bytes
+                limits.max_bytes
             ));
         }
         let entries = inner.entries.read().await;

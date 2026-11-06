@@ -878,7 +878,6 @@ pub struct HttpSharedState {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct HttpInterfaceConfig {
     http: HttpConfig,
     screen: ScreenConfig,

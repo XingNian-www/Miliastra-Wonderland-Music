@@ -16,14 +16,6 @@ pub(crate) use debug::debug_http_service;
 // （runtime 17 次、adapters 17 次、ui、interfaces），不是调试专属。
 // 提到根级后，runtime→debug 的最大一条反边消失；保留别名供既有调用点。
 #[allow(dead_code)]
-pub(crate) use debug::debug_plugin_dispatch;
-#[allow(dead_code)]
-pub(crate) use debug::debug_plugin_process;
-#[allow(dead_code)]
-pub(crate) use debug::debug_plugin_session;
-#[allow(dead_code)]
-pub(crate) use debug::debug_plugin_stdio;
-#[allow(dead_code)]
 pub(crate) use debug::debug_read_only;
 #[allow(dead_code)]
 pub(crate) use debug::debug_sandbox;

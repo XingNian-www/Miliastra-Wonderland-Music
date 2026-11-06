@@ -583,7 +583,9 @@ impl ApplicationRuntime {
         P: Fn(&str) -> bool,
     {
         let deadline = Instant::now()
-            + Duration::from_millis(self.lifecycle.config.timing.decision.timeout_ms);
+            + Duration::from_millis(super::live_decision_timeout_ms(
+                &self.lifecycle.live_configs,
+            ));
         self.begin_chat_decision_reader_until(scope, accepts_message_type, is_decision, deadline)
     }
 

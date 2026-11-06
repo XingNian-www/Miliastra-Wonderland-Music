@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,7 +17,7 @@ use rusqlite::OptionalExtension;
 use serde_json::{Map, Value};
 
 use super::schema::SECRET_PATHS;
-use super::{AppConfig, BootstrapConfig};
+use super::{AppConfig, BootstrapConfig, FieldKind, config_sections, normalize_native_path_string};
 
 /// 配置数据库 schema 版本；与请求状态快照版本及缓存 user_version 完全独立。
 ///
@@ -618,6 +618,11 @@ impl ConfigStore {
                 );
             }
         }
+        if let Some(object) = value.as_object_mut() {
+            // 库里的旧值可能是混合分隔符甚至 root 下的绝对路径：显示前统一成
+            // 原生分隔符，并把 root 下的绝对路径回落为相对（与默认值语义一致）。
+            normalize_path_fields(object, &self.executable_root, true);
+        }
         mask_secrets(&mut value);
         Ok(value)
     }
@@ -641,6 +646,7 @@ impl ConfigStore {
         let mut forced_cleared = BTreeSet::new();
         apply_secret_clear_markers(&mut merged, &mut forced_cleared);
         retain_secret_fields(&mut merged, &current_sections, &forced_cleared);
+        normalize_path_fields(&mut merged, &self.executable_root, false);
         let mut config = match self.build_config(&merged) {
             Ok(config) => config,
             Err(error) => return Ok(field_errors_from_message(&error.to_string()).errors),
@@ -678,6 +684,7 @@ impl ConfigStore {
         let mut forced_cleared = BTreeSet::new();
         apply_secret_clear_markers(&mut merged, &mut forced_cleared);
         retain_secret_fields(&mut merged, &current_sections, &forced_cleared);
+        normalize_path_fields(&mut merged, &self.executable_root, false);
         // 组装完整配置并校验；失败返回字段级错误，不写库。
         let mut config = match self.build_config(&merged) {
             Ok(config) => config,
@@ -1438,6 +1445,70 @@ fn set_path(map: &mut Map<String, Value>, path: &str, value: Value) -> bool {
     true
 }
 
+/// schema 中声明为路径（`FieldKind::Path`）的字段点路径，进程内只计算一次。
+fn path_field_paths() -> &'static [String] {
+    static PATHS: OnceLock<Vec<String>> = OnceLock::new();
+    PATHS.get_or_init(|| {
+        config_sections()
+            .into_iter()
+            .flat_map(|section| section.fields)
+            .filter(|field| field.kind == FieldKind::Path)
+            .map(|field| field.path)
+            .collect()
+    })
+}
+
+/// 规范化一段配置对象里的路径类字段（只认 schema 声明的 `FieldKind::Path`，
+/// 不凭空猜任意字符串是路径）。
+///
+/// - 任何情况下都把 `/` 与 `\` 统一成平台原生分隔符（Windows 上是 `\`）；
+/// - `relativize_under_root` 为真时，**位于 executable_root 之下**的绝对路径
+///   回落为相对路径（与默认值 `deps/...` 语义一致，避免 Web 保存又把绝对路径
+///   写回库）；root 之外的绝对路径原样保留。
+///
+/// 覆盖范围：schema 的 43 个 `FieldKind::Path` 字段，含启动引导注入的
+/// `logging.dir`（http 段没有路径字段）。bootstrap 注入值也走同一套规范化。
+///
+/// 已知限制（仅影响显示，不损坏数据）：`Path::strip_prefix` 在 Windows 上是
+/// 大小写敏感的路径比较；若用户实际盘符/目录大小写与 executable_root 不一致
+/// （如 `C:\Users\XingNian` vs `c:\users\...`），回落可能失败，此时继续
+/// 显示规范化后的绝对路径；下一次保存仍得到纯原生分隔符，不产生混合分隔符。
+fn normalize_path_fields(
+    sections: &mut Map<String, Value>,
+    executable_root: &Path,
+    relativize_under_root: bool,
+) {
+    for path in path_field_paths() {
+        let Some(current) = get_path(sections, path)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if current.is_empty() {
+            continue;
+        }
+        let normalized = if relativize_under_root {
+            let candidate = Path::new(&current);
+            if candidate.is_absolute() {
+                match candidate.strip_prefix(executable_root) {
+                    Ok(relative) => relative
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/"),
+                    Err(_) => normalize_native_path_string(&current),
+                }
+            } else {
+                normalize_native_path_string(&current)
+            }
+        } else {
+            normalize_native_path_string(&current)
+        };
+        if normalized != current {
+            let _ = set_path(sections, path, Value::String(normalized));
+        }
+    }
+}
+
 /// 应用 secret 清除标记：候选值等于 JSON 对象 `{"__clear__": true}`
 /// （[`SECRET_CLEAR_MARKER`]）时，把 merged 中该路径写为空字符串，并记入
 /// `forced_cleared` 集合（[`retain_secret_fields`] 跳过该路径，防止保留规则
@@ -1716,6 +1787,62 @@ mod tests {
 
     fn cleanup(root: &Path) {
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Web 显示层：root 之下的绝对路径回落为相对，root 之外保留绝对；
+    /// 只处理 schema 声明的路径字段，普通字符串不猜成路径。
+    #[test]
+    fn normalize_path_fields_relativizes_under_root_and_preserves_outside_root() {
+        let root =
+            std::env::temp_dir().join(format!("config-normalize-root-{}", uuid::Uuid::new_v4()));
+        let inside = root.join("deps/assets/idioms.txt");
+        let outside = std::env::temp_dir().join("config-normalize-outside/game.exe");
+        let outside_text = outside.to_string_lossy().into_owned();
+        let mut sections = Map::new();
+        sections.insert(
+            "idiom_chain".to_string(),
+            json!({"lexicon_path": inside.to_string_lossy().into_owned()}),
+        );
+        sections.insert(
+            "startup".to_string(),
+            json!({"exe_path": outside_text.clone()}),
+        );
+        sections.insert("ai".to_string(), json!({"model": "gpt-4o/测试"}));
+
+        normalize_path_fields(&mut sections, &root, true);
+
+        assert_eq!(
+            get_path(&sections, "idiom_chain.lexicon_path").and_then(Value::as_str),
+            Some("deps/assets/idioms.txt"),
+            "root 下的绝对路径必须回落为相对路径"
+        );
+        assert_eq!(
+            get_path(&sections, "startup.exe_path").and_then(Value::as_str),
+            Some(outside_text.as_str()),
+            "root 之外的绝对路径必须保留"
+        );
+        assert_eq!(
+            get_path(&sections, "ai.model").and_then(Value::as_str),
+            Some("gpt-4o/测试"),
+            "非路径字段不能被改写"
+        );
+    }
+
+    /// 相对路径只做分隔符规范化（Windows 上 `/`→`\`，其他平台原样）。
+    #[test]
+    fn normalize_path_fields_keeps_relative_values_native() {
+        let root = std::env::temp_dir();
+        let mut sections = Map::new();
+        sections.insert(
+            "ocr".to_string(),
+            json!({"charset": "deps/assets/chars.txt"}),
+        );
+        normalize_path_fields(&mut sections, &root, true);
+        let expected = normalize_native_path_string("deps/assets/chars.txt");
+        assert_eq!(
+            get_path(&sections, "ocr.charset").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
     }
 
     /// 读取 config_meta 的当前 revision（独立连接）。
@@ -2152,21 +2279,54 @@ mod tests {
             latest_snapshot(&database_path)["command_access"],
             with_source
         );
-        for invalid in [Value::Null, json!("unknown-platform")] {
+        // 显式 null = 未设置：schema 声明 nullable，Web 表单空值就提交 null，
+        // 必须与字段缺失等价（不再被「字段已不存在」拒绝）。
+        let mut with_null = access.clone();
+        with_null["default_song_source"] = Value::Null;
+        let sections = Map::from_iter([("command_access".into(), with_null.clone())]);
+        assert!(
+            store.validate_candidate(&sections).unwrap().is_empty(),
+            "显式 null 应通过预检"
+        );
+        assert_eq!(store.save(3, sections).unwrap().revision, 4);
+        assert_eq!(stored_section(&database_path, "command_access"), with_null);
+        assert_eq!(latest_snapshot(&database_path)["command_access"], with_null);
+        drop(store);
+
+        let mut store =
+            ConfigStore::open(&database_path, &root, test_bootstrap(&database_path)).unwrap();
+        assert_eq!(
+            store
+                .load_full()
+                .unwrap()
+                .command_access
+                .default_song_source,
+            None,
+            "显式 null 重新加载后仍是未设置"
+        );
+        assert_eq!(store.current_value().unwrap()["command_access"], with_null);
+
+        // 非法平台值仍然报中文错误，且不写库、不推进 revision。
+        for invalid in [
+            json!("unknown-platform"),
+            json!(""),
+            json!("qq_music"),
+            json!("QQ音乐"),
+        ] {
             let mut candidate = access.clone();
-            candidate["default_song_source"] = invalid;
+            candidate["default_song_source"] = invalid.clone();
             let sections = Map::from_iter([("command_access".into(), candidate)]);
-            assert!(!store.validate_candidate(&sections).unwrap().is_empty());
-            assert!(store.save(3, sections).is_err());
-            assert_eq!(store.current_revision().unwrap(), 3);
-            assert_eq!(
-                stored_section(&database_path, "command_access"),
-                with_source
+            let errors = store.validate_candidate(&sections).unwrap();
+            assert!(!errors.is_empty(), "非法值 {invalid} 应被拒绝");
+            let message = errors[0].message.clone();
+            assert!(
+                message.contains("默认点歌平台") && message.contains("qqmusic"),
+                "错误文案应可理解并列出可选平台，实际: {message}"
             );
-            assert_eq!(
-                latest_snapshot(&database_path)["command_access"],
-                with_source
-            );
+            assert!(store.save(4, sections).is_err());
+            assert_eq!(store.current_revision().unwrap(), 4);
+            assert_eq!(stored_section(&database_path, "command_access"), with_null);
+            assert_eq!(latest_snapshot(&database_path)["command_access"], with_null);
         }
         drop(store);
         cleanup(&root);

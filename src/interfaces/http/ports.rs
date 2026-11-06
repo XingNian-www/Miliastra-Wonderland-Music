@@ -244,8 +244,6 @@ pub(crate) struct HttpDebugRunRequest {
     #[serde(default)]
     pub assertions: Vec<crate::debug_sandbox_runner::StepAssertion>,
     pub fixture: Option<crate::debug_sandbox::SandboxFixture>,
-    pub plugin_id: Option<String>,
-    pub manifest: Option<crate::debug_sandbox::PluginManifest>,
 }
 fn default_debug_mode() -> String {
     "simulated".into()

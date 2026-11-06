@@ -57,7 +57,13 @@ impl ApplicationRuntime {
                 if !config.enabled {
                     return Ok(());
                 }
-                if let Err(seconds) = self.business.ai_chat_gate.check(&actor, Instant::now()) {
+                // 冷却时长每次从实时配置读取（`ai_chat.cooldown_seconds`），保存后下一条消息即生效。
+                let cooldown = std::time::Duration::from_secs(config.cooldown_seconds);
+                if let Err(seconds) = self
+                    .business
+                    .ai_chat_gate
+                    .check(&actor, Instant::now(), cooldown)
+                {
                     log::debug!("AI 聊天冷却中：玩家「{actor}」还需等待 {seconds} 秒");
                     return Ok(());
                 }

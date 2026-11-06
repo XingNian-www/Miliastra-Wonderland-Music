@@ -110,7 +110,8 @@ use crate::runtime::ocr::{
     ProductionOcrDevice, ResolvedOcrArgs, probe_ocr_backend_support,
 };
 use crate::runtime::player_io::{
-    PlayerRuntime, PlayerRuntimeConfig, PlayerSearchClient, PlayerSearchClientError,
+    PlayerLiveTuning, PlayerLiveTuningProvider, PlayerRuntime, PlayerRuntimeConfig,
+    PlayerSearchClient, PlayerSearchClientError,
 };
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::task_engine::TaskEngineHandle;
@@ -1499,26 +1500,63 @@ impl ApplicationRuntime {
         ) {
             log::warn!("写入酷狗设备信息失败，将沿用已有文件：{error}");
         }
-        let native_playback_runtime = NativePlaybackRuntime::start_with_lyrics_lead_and_helper(
-            config.playback.credential_directory.clone(),
-            // 统一数据库：缓存元数据与配置共用同一个 playback.sqlite3。
-            config.playback.audio_cache_runtime_config(
-                config
-                    .state
-                    .playback_state_path
-                    .parent()
-                    .expect("统一数据库路径必须有父目录"),
-            ),
-            live_configs.lyrics_lead_seconds.clone(),
-            Some(config.playback.login_helper_executable.clone()),
-        )
-        .context("启动原生播放器")?;
+        // 音频缓存限额（容量/请求超时/seek 超时）每次下载或等待时从 live 快照读取：
+        // task-33 注册 Live 后无需再改消费方；未注册前快照即启动值，行为不变。
+        let cache_limits: miliastra_playback::CacheLiveLimitsProvider = {
+            let live_configs = live_configs.clone();
+            Arc::new(move || {
+                let cache = live_configs.snapshot().playback.audio_cache.clone();
+                let (max_bytes, request_timeout_ms, seek_wait_timeout_ms) = match cache {
+                    Some(cache) => (
+                        cache.max_bytes_mb.saturating_mul(1024 * 1024),
+                        cache.request_timeout_ms,
+                        cache.seek_wait_timeout_ms,
+                    ),
+                    None => {
+                        // 未启用缓存时这些值不会被读取；给安全默认值以保持类型完整。
+                        let defaults = miliastra_playback::AudioCacheConfig::default();
+                        (
+                            defaults.max_bytes,
+                            defaults.request_timeout.as_millis() as u64,
+                            defaults.seek_wait_timeout.as_millis() as u64,
+                        )
+                    }
+                };
+                miliastra_playback::CacheLiveLimits {
+                    max_bytes,
+                    request_timeout: Duration::from_millis(request_timeout_ms),
+                    seek_wait_timeout: Duration::from_millis(seek_wait_timeout_ms),
+                }
+            })
+        };
+        let native_playback_runtime =
+            NativePlaybackRuntime::start_with_lyrics_lead_and_helper_and_cache_limits(
+                config.playback.credential_directory.clone(),
+                // 统一数据库：缓存元数据与配置共用同一个 playback.sqlite3。
+                config.playback.audio_cache_runtime_config(
+                    config
+                        .state
+                        .playback_state_path
+                        .parent()
+                        .expect("统一数据库路径必须有父目录"),
+                ),
+                live_configs.lyrics_lead_seconds.clone(),
+                Some(config.playback.login_helper_executable.clone()),
+                Some(cache_limits),
+            )
+            .context("启动原生播放器")?;
         let native_playback = native_playback_runtime.handle();
-        let login_helper = LoginHelperManager::new(
+        // 登录超时每次登录会话开始时读取 live 快照（task-33 注册后即热更新）。
+        let live_timeout_source: Arc<dyn Fn() -> u64 + Send + Sync> = {
+            let live_configs = live_configs.clone();
+            Arc::new(move || live_configs.snapshot().playback.login_timeout_ms)
+        };
+        let login_helper = LoginHelperManager::new_with_live_timeout(
             native_playback.clone(),
             config.playback.login_helper_executable.clone(),
             config.playback.credential_directory.clone(),
             Duration::from_millis(config.playback.login_timeout_ms),
+            Some(live_timeout_source),
             Arc::new({
                 let live_configs = live_configs.clone();
                 move || live_configs.snapshot().kugou.clone()
@@ -1603,12 +1641,25 @@ impl ApplicationRuntime {
             },
         )?;
         let ocr = ocr_runtime.handle();
-        let player_runtime = PlayerRuntime::start_with_live_observation_interval(
+        // 稳定判定参数每轮观测读取 live 快照：task-33 注册后即热更新，不重建播放器。
+        let playback_tuning: PlayerLiveTuningProvider = {
+            let live_configs = live_configs.clone();
+            Arc::new(move || {
+                let playback = live_configs.snapshot().timing.playback.clone();
+                PlayerLiveTuning {
+                    uri_stable_samples: playback.uri_stable_samples as usize,
+                    transport_stable_samples: playback.transport_stable_samples as usize,
+                    stale_timeout: Duration::from_millis(playback.stale_timeout_ms),
+                }
+            })
+        };
+        let player_runtime = PlayerRuntime::start_with_live_observation_interval_and_tuning(
             playback_adapter.clone(),
             playback_adapter.clone(),
             playback_adapter,
             player_runtime_config,
             live_configs.monitor_status_ms.clone(),
+            Some(playback_tuning),
         )
         .context("启动播放器运行时")?;
         let player_runtime_handle = player_runtime.handle();
@@ -1691,9 +1742,7 @@ impl ApplicationRuntime {
             crate::features::ai_chat::AiChatMemory::open(&config.state.playback_state_path)
                 .context("打开 AI 聊天记忆库")?,
         );
-        let ai_chat_gate = std::sync::Arc::new(crate::features::ai_chat::TriggerGate::new(
-            std::time::Duration::from_secs(config.ai_chat.cooldown_seconds),
-        ));
+        let ai_chat_gate = std::sync::Arc::new(crate::features::ai_chat::TriggerGate::new());
         let song_review = SongReviewClient::new(
             &config.song_review,
             &config.ai,
@@ -1787,10 +1836,8 @@ impl ApplicationRuntime {
             monitor_status_ms: live_configs.monitor_status_ms.clone(),
             help_batch_ms: config.timing.command.help_batch_ms,
         });
-        let administration_application =
-            AdministrationApplication::new(config.timing.command.help_batch_ms);
-        let idiom_chain_application =
-            IdiomChainApplication::new(config.timing.command.help_batch_ms);
+        let administration_application = AdministrationApplication::new();
+        let idiom_chain_application = IdiomChainApplication::new();
         let moderation = ModerationService::new(moderation_policy, Arc::new(business.clone()));
         // 外部聊天源与观察线程共用同一份时间线；UiBundle 会接管所有权，先克隆。
         let chat_timeline_for_external = chat_timeline.clone();
@@ -1996,8 +2043,8 @@ fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 enum SecondaryHallSequenceDelta {
     EstablishBaseline,
     RetainedPrefix,
@@ -2006,7 +2053,7 @@ enum SecondaryHallSequenceDelta {
     NewFrom(usize),
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn secondary_hall_sequence_delta(
     previous: Option<&[SecondaryHallBubble]>,
     current: &[SecondaryHallBubble],
@@ -2198,10 +2245,66 @@ fn web_tool_panel_response_rect(config: &AppConfig) -> Rect {
     )
 }
 
+/// task-29 热更新读取点：以下四类值改为每次使用时从 `LiveConfigs` 快照读取，
+/// 而不是读启动期冻结的 `lifecycle.config`。在 interface-config 的 task-30 把
+/// 这些字段注册为 Live（schema / `LIVE_CONFIG_PATHS` / `apply`）之前，快照里仍是
+/// 启动值，行为与旧代码一致；注册后无需再改消费方。
+/// 见 technical-docs/team-reports/live-audit-composition-runtime.md §0.2.1。
+fn live_decision_timeout_ms(live: &LiveConfigs) -> u64 {
+    live.snapshot().timing.decision.timeout_ms
+}
+
+fn live_decision_poll_ms(live: &LiveConfigs) -> u64 {
+    live.snapshot().timing.decision.poll_ms
+}
+
+fn live_chat_source_reconnect_ms(live: &LiveConfigs) -> u64 {
+    live.snapshot().chat_source.reconnect_ms
+}
+
+fn live_chat_source_lease_ms(live: &LiveConfigs) -> u64 {
+    live.snapshot().chat_source.lease_timeout_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::observation::chat::secondary_hall_bubbles;
+
+    /// task-29：四个字段必须从 live 快照读取，而不是启动期冻结的 AppConfig。
+    /// 用不同的 timeout/poll/reconnect/lease 构造 `LiveConfigs`，断言辅助函数取到
+    /// 快照值，并断言与 `AppConfig::default()` 的启动值不同（证明不是读冻结值）。
+    /// task-30 注册 Live 后，`apply()` 会把这些字段合并进同一快照，无需改消费方。
+    #[test]
+    fn decision_and_chat_source_timings_are_read_from_the_live_snapshot() {
+        let mut config = AppConfig::default();
+        config.timing.decision.timeout_ms = 12_345;
+        config.timing.decision.poll_ms = 678;
+        config.chat_source.reconnect_ms = 4_321;
+        config.chat_source.lease_timeout_ms = 9_876;
+        let live = LiveConfigs::from_config(&config);
+
+        assert_eq!(live_decision_timeout_ms(&live), 12_345);
+        assert_eq!(live_decision_poll_ms(&live), 678);
+        assert_eq!(live_chat_source_reconnect_ms(&live), 4_321);
+        assert_eq!(live_chat_source_lease_ms(&live), 9_876);
+
+        // 与冻结的启动配置不同：如果将来有人改回读 `lifecycle.config`，这里会暴露。
+        let frozen = AppConfig::default();
+        assert_ne!(
+            frozen.timing.decision.timeout_ms,
+            live_decision_timeout_ms(&live)
+        );
+        assert_ne!(frozen.timing.decision.poll_ms, live_decision_poll_ms(&live));
+        assert_ne!(
+            frozen.chat_source.reconnect_ms,
+            live_chat_source_reconnect_ms(&live)
+        );
+        assert_ne!(
+            frozen.chat_source.lease_timeout_ms,
+            live_chat_source_lease_ms(&live)
+        );
+    }
 
     #[test]
     fn advance_queue_uses_a_stable_dedup_key() {

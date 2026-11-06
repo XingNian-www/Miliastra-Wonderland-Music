@@ -531,7 +531,7 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .config-status .chip{padding-right:var(--sp-3);border-right:1px solid var(--sep-2)}
 .config-dirty{color:var(--warn);font-weight:600}
 .config-layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:var(--sp-4);align-items:start}
-.config-sidebar{background:var(--bg-card);border:1px solid var(--sep-1);border-radius:var(--radius-m);padding:var(--sp-2);display:flex;flex-direction:column;gap:2px;position:sticky;top:76px;max-height:calc(100vh - 96px);overflow:auto}
+.config-sidebar{background:var(--bg-card);border:1px solid var(--sep-1);border-radius:var(--radius-m);padding:var(--sp-2);display:flex;flex-direction:column;gap:2px;position:sticky;top:var(--topbar-h,76px);max-height:calc(100vh - 96px);overflow:auto}
 .config-section-item{width:100%;display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2);padding:var(--sp-2) var(--sp-3);border:0;border-radius:var(--radius-s);background:transparent;color:var(--text-2);text-align:left;cursor:pointer;font-size:var(--fs-item);line-height:var(--lh-item)}
 .config-section-item:hover{background:var(--fill-1);color:var(--text-1)}
 .config-section-item.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
@@ -617,6 +617,109 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
   .status-chips{overflow-x:auto;scrollbar-width:none}
   .status-chips::-webkit-scrollbar{display:none}
 }
+
+/* ===== 配置中心精致化（task-11：沿用现有深色 token，不换肤） ===== */
+/* 补两处未定义变量：--fs-small 用于分组标题/域计数，--bg-hover 用于域头 hover。
+   值均从现有 token 派生，不引入新配色。 */
+:root{--fs-small:var(--fs-meta);--bg-hover:var(--fill-1)}
+/* 顶部状态条 + 粘滞工具栏（保存按钮常驻可见） */
+#page-config .config-status{margin-bottom:var(--sp-3)}
+#page-config .config-toolbar{position:sticky;top:var(--topbar-h,76px);z-index:4;background:var(--bg-ground);padding:var(--sp-2) 0;border-bottom:1px solid var(--sep-2)}
+.config-search-wrap{flex:1;display:flex;align-items:center;gap:var(--sp-2);min-width:220px;position:relative}
+.config-search-wrap input{flex:1}
+.config-search-count{color:var(--text-2);font-size:var(--fs-meta);white-space:nowrap;flex:none}
+/* 段标题 + effect 汇总 */
+.config-section-head{display:flex;align-items:baseline;gap:var(--sp-2);flex-wrap:wrap;padding:2px var(--sp-1) 0}
+.config-section-head h2{margin:0;font-size:16px;line-height:22px;font-weight:700;color:var(--text-1)}
+.config-section-head code{font-family:var(--font-mono);font-size:var(--fs-tiny);color:var(--text-3)}
+.config-section-stats{margin-left:auto;color:var(--text-2);font-size:var(--fs-meta);display:flex;gap:var(--sp-2);flex-wrap:wrap;align-items:center}
+.config-effect-legend{display:inline-flex;align-items:center;gap:2px}
+/* 分组卡片：一组字段一张卡，组标题吸顶；替代“每字段一张卡” */
+.config-group-card{background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-l);box-shadow:var(--shadow);margin-top:var(--sp-3)}
+.config-group-head{position:sticky;top:calc(var(--topbar-h,76px) + 52px);z-index:1;padding:var(--sp-2) var(--sp-3);background:var(--bg-raised);border-bottom:1px solid var(--sep-2);font-size:var(--fs-item);font-weight:600;color:var(--text-1);letter-spacing:.2px}
+/* 字段两行网格：label 固定列 + 控件 + effect 右置；提示/默认下沉 */
+#configForm .config-group-card .config-field{display:grid;grid-template-columns:200px minmax(0,1fr) auto;grid-template-areas:"label control side" "foot foot foot";column-gap:var(--sp-3);row-gap:2px;align-items:center;padding:10px var(--sp-3);background:transparent;border:0;border-radius:0;min-width:0;gap:0}
+#configForm .config-group-card .config-field+.config-field{border-top:1px solid var(--sep-2)}
+#configForm .config-group-card .config-field.bootstrap{opacity:.62}
+#configForm .config-group-card .config-field-label{grid-area:label;display:flex;flex-direction:column;gap:1px;min-width:0}
+#configForm .config-group-card .config-field-label b{font-size:var(--fs-item);line-height:var(--lh-item);font-weight:600;color:var(--text-1);word-break:break-word}
+#configForm .config-group-card .config-field-label code{font-family:var(--font-mono);font-size:10px;line-height:13px;color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#configForm .config-group-card .config-field-control{grid-area:control;min-width:0;display:flex;align-items:center;gap:var(--sp-2)}
+#configForm .config-group-card .config-field-side{grid-area:side;display:flex;justify-content:flex-end;align-items:center;gap:var(--sp-1)}
+#configForm .config-group-card .config-field-foot{grid-area:foot;display:flex;flex-wrap:wrap;gap:2px var(--sp-3);align-items:baseline;padding-left:calc(200px + var(--sp-3))}
+#configForm .config-group-card .config-field-foot .config-field-hint{margin:0;font-size:var(--fs-tiny);line-height:var(--lh-tiny);color:var(--text-2)}
+#configForm .config-group-card .config-field-foot .config-field-default{font-size:var(--fs-tiny);line-height:var(--lh-tiny);color:var(--text-3)}
+#configForm .config-group-card .config-field.err{box-shadow:inset 3px 0 0 var(--danger)}
+#configForm .config-group-card .config-field.err .config-field-label b{color:var(--danger)}
+/* 控件按 kind 定宽：数值/枚举不再满宽 */
+#configForm .config-group-card .config-field[data-kind=number] .config-field-control input[type=number]{max-width:150px}
+#configForm .config-group-card .config-field[data-kind=path] .config-field-control input[type=text],#configForm .config-group-card .config-field[data-kind=string] .config-field-control input[type=text]{max-width:560px}
+#configForm .config-group-card .config-field[data-kind=secret] .config-field-control input[type=password]{max-width:360px}
+#configForm .config-group-card .config-field[data-kind=enum] .config-field-control select{max-width:300px}
+#configForm .config-group-card .config-field[data-kind=rect] .config-num-row,#configForm .config-group-card .config-field[data-kind=point] .config-num-row{max-width:420px}
+#configForm .config-group-card .config-field[data-kind=array] .config-array{max-width:560px}
+#configForm .config-group-card .config-field[data-kind=bool] .config-field-control{justify-content:flex-end}
+#configForm .config-group-card .config-field[data-kind=bool] .config-field-side{order:-1;justify-content:flex-start}
+#configForm .config-group-card .config-field[data-kind=bool] .config-field-side .config-effect{margin-right:auto}
+/* 搜索命中高亮（文本已 esc，再包 mark） */
+#configForm .config-group-card .config-field-label b mark,.config-section-item mark,.config-domain-head mark{background:var(--accent-soft);color:var(--accent);border-radius:3px;padding:0 2px}
+.config-empty{color:var(--text-3);text-align:center;padding:var(--sp-5);background:var(--bg-card);border:1px dashed var(--sep-1);border-radius:var(--radius-m)}
+#configRevisionsPanel{scroll-margin-top:calc(var(--topbar-h,76px) + 52px)}
+/* 顶栏状态徽章：1440 可用宽度收紧内边距/间距，避免 6 徽章被截断（1024/1920 不受影响） */
+@media(max-width:1600px){
+  .status-chips{gap:6px}
+  .status-chips .chip{padding:5px 6px;gap:5px}
+  .status-chips .chip em{max-width:220px}
+}
+@media(min-width:1051px) and (max-width:1366px){
+  /* 1280：顶栏让出品牌列（左侧全局导航已有品牌），6 枚状态徽章完整显示、不换行 */
+  .topbar{grid-template-columns:minmax(0,1fr) auto}
+  .topbar .brand{display:none}
+  .status-chips{gap:4px}
+  .status-chips .chip{padding:4px 5px;gap:4px;font-size:11px}
+  .status-chips .chip em{max-width:180px}
+  .status-chips .chip .dot{width:6px;height:6px}
+}
+/* 全局“响应”浮层：可折叠为标题条，避免遮挡表单/保存栏；新结果会自动展开。 */
+.global-result{width:min(380px,calc(100vw - 32px))}
+.global-result .global-result-toggle{margin-left:auto;flex:none}
+.global-result.collapsed{width:auto;max-width:240px;padding:var(--sp-2)}
+.global-result.collapsed .panel-body{display:none}
+.global-result.collapsed .panel-head{height:24px}
+
+/* 粘滞底部保存栏 */
+.config-savebar{position:sticky;bottom:0;z-index:4;display:flex;align-items:center;gap:var(--sp-2);margin-top:var(--sp-3);padding:var(--sp-2) 150px var(--sp-2) var(--sp-3);background:var(--bg-card);border:1px solid var(--sep-1);border-radius:var(--radius-m);box-shadow:0 -2px 12px rgba(0,0,0,.25)}
+.config-savebar-hint{color:var(--text-2);font-size:var(--fs-meta);margin-right:auto}
+.config-savebar .btn{flex:0 0 auto}
+.config-savebar .config-dirty{color:var(--warn);font-weight:600}
+/* 身份映射独立页 */
+#page-identity .config-status{margin-bottom:var(--sp-3)}
+#page-identity .identity-toolbar{display:flex;gap:var(--sp-2);flex-wrap:wrap;align-items:center;margin-bottom:var(--sp-3)}
+#page-identity .identity-page-note{margin:0 0 var(--sp-3)}
+#page-identity .identity-add-row{margin-bottom:var(--sp-3)}
+#page-identity .identity-add-row select{width:auto;flex:0 0 auto}
+#page-identity .identity-add-row input{flex:1 1 160px}
+@media(max-width:1200px){
+  #configForm .config-group-card .config-field{grid-template-columns:160px minmax(0,1fr) auto}
+  #configForm .config-group-card .config-field-foot{padding-left:calc(160px + var(--sp-3))}
+}
+@media(max-width:1050px){
+  /* 窄屏：段导航改为顶部横向 chips 条，避免整列 35 段把表单/保存推到屏外 */
+  .config-sidebar{position:static;max-height:none;display:flex;flex-direction:row;flex-wrap:nowrap;align-items:center;overflow-x:auto;gap:4px;padding:6px}
+  .config-domain{display:contents}
+  .config-domain-head{width:auto;white-space:nowrap;padding:5px 8px;border-radius:var(--radius-s);background:var(--fill-1);font-size:var(--fs-meta);flex:0 0 auto}
+  .config-domain-body{display:flex!important;flex-direction:row;padding:0;gap:2px;flex:0 0 auto}
+  .config-section-item{width:auto;white-space:nowrap;padding:6px 10px;flex:0 0 auto}
+  .config-section-item .section-name{display:none}
+  .config-domain-count{display:none}
+}
+@media(max-width:720px){
+  #configForm .config-group-card .config-field{grid-template-columns:1fr;grid-template-areas:"label" "control" "side" "foot";row-gap:4px}
+  #configForm .config-group-card .config-field-foot{padding-left:0}
+  #configForm .config-group-card .config-field-side{justify-content:flex-start}
+  #configForm .config-group-card .config-field[data-kind=bool] .config-field-control{justify-content:flex-start}
+  #configForm .config-group-card .config-field[data-kind=bool] .config-field-side{order:0;justify-content:flex-start}
+}
 </style>
 </head>
 <body>
@@ -633,6 +736,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
     <button class="nav-link" data-route="tasks" onclick="navigateTo('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15l2 2 4-4"/></svg>任务与日志</button>
     <button class="nav-link" data-route="tools" onclick="navigateTo('tools')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>高级控制</button>
     <button class="nav-link" data-route="config" onclick="navigateTo('config')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/></svg>配置中心</button>
+    <button class="nav-link" data-route="identity" onclick="navigateTo('identity')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="9" cy="10" r="2.2"/><path d="M5.5 17c.6-2 2-3 3.5-3s2.9 1 3.5 3"/><path d="M15 9h4M15 13h4"/></svg>身份映射</button>
     <button class="nav-link" data-route="settings" onclick="navigateTo('settings')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>设置</button>
   </div>
 </nav>
@@ -819,7 +923,11 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         <div class="config-sidebar" id="configSectionList"></div>
         <div class="config-main">
           <div class="config-toolbar">
-            <input id="configSearch" type="text" placeholder="搜索字段（名称 / 路径 / 说明）" aria-label="搜索配置字段">
+            <div class="config-search-wrap">
+              <input id="configSearch" type="text" placeholder="搜索字段（名称 / 路径 / 说明）" aria-label="搜索配置字段">
+              <span class="config-search-count" id="configSearchCount" hidden></span>
+              <button type="button" class="btn small ghost hidden" id="configSearchClear" onclick="clearConfigSearch()">清除</button>
+            </div>
             <button class="btn" id="configVisualToggle" onclick="toggleVisualFields()">显示档案字段</button>
             <button class="btn" onclick="restoreDefaults()">恢复默认</button>
             <button class="btn" onclick="toggleConfigRevisions()">历史版本</button>
@@ -827,11 +935,37 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
           </div>
           <div class="config-message hidden" id="configMessage"></div>
           <div id="configForm"></div>
+          <div class="config-savebar" id="configSaveBar">
+            <span class="config-savebar-hint" id="configSaveBarHint">未修改</span>
+            <button class="btn" onclick="discardCurrentSection()">放弃本段修改</button>
+            <button class="btn primary" onclick="saveConfig()">保存全部</button>
+          </div>
           <div class="panel" id="configRevisionsPanel" hidden>
-            <div class="panel-head"><h2>历史版本</h2><small>回滚会记录为新版本</small></div>
+            <div class="panel-head"><h2>历史版本</h2><small>回滚会记录为新版本</small><button type="button" class="btn small ghost" onclick="toggleConfigRevisions()" style="margin-left:auto" title="收起历史版本">关闭</button></div>
             <div class="panel-body"><div class="history" id="configRevisions">暂无历史版本</div></div>
           </div>
         </div>
+      </div>
+    </section>
+    <section class="page-section" id="page-identity" data-page="identity">
+      <h1 class="page-title">身份映射</h1>
+      <p class="page-subtitle">游戏内备注/UID 与软件权限（好友 / 管理员 / 主人）的对应关系；保存后立即生效</p>
+      <div class="config-status" id="identityStatusBar">
+        <span class="chip"><i class="dot"></i><span>当前版本</span><em id="identityRevision">-</em></span>
+        <span class="config-effect live">live · 保存后立即生效</span>
+        <span id="identityDirtyHint" class="config-dirty hidden">有未保存的修改</span>
+        <button class="btn small" onclick="loadIdentitySettings()">重新读取</button>
+        <button class="btn small ghost" onclick="navigateTo('config')">打开完整配置</button>
+      </div>
+      <div class="config-message hidden" id="identityMessage"></div>
+      <div class="config-group-card">
+        <div class="config-group-head">映射列表<span class="config-domain-count" id="identityCount"></span></div>
+        <div id="identityEditorHost" style="padding:var(--sp-3)"><p class="config-field-hint">正在读取身份映射…</p></div>
+      </div>
+      <div class="config-savebar">
+        <span class="config-savebar-hint" id="identitySaveHint">修改后点「保存身份映射」</span>
+        <button class="btn" onclick="discardIdentitySettings()">放弃修改</button>
+        <button class="btn primary" id="identitySaveBtn" onclick="saveIdentitySettings()">保存身份映射</button>
       </div>
     </section>
     <section class="page-section" id="page-settings" data-page="settings"><h1 class="page-title">设置</h1><p class="page-subtitle">访问令牌与页面偏好</p><div class="page-grid" id="settingsGrid">
@@ -1144,8 +1278,8 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         </div>
       </div>
 
-      <div class="panel" id="responsePanel">
-        <div class="panel-head"><h2>响应</h2><small>最近操作</small></div>
+      <div class="panel collapsed" id="responsePanel">
+        <div class="panel-head"><h2>响应</h2><small>最近操作</small><button type="button" class="btn small ghost global-result-toggle" id="globalResultToggle" title="折叠/展开响应面板" aria-label="折叠或展开响应面板" aria-expanded="false" onclick="toggleGlobalResult()">＋</button></div>
           <div class="panel-body"><div class="result" id="result" role="status" aria-live="polite">等待操作</div></div>
       </div>
 
@@ -1196,7 +1330,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
 
 <script>
 function $(id){return document.getElementById(id)}
-const pageRoutes=['overview','playback','login','game','entertainment','commands','aichat','tasks','tools','config','settings']
+const pageRoutes=['overview','playback','login','game','entertainment','commands','aichat','tasks','tools','config','identity','settings']
 function setupPages(){
   const playbackPanelClasses={
     songState:'playback-player-panel',
@@ -1308,6 +1442,14 @@ async function navigateTo(route,updateHash=true){
     }
     aiChatDirty=false
   }
+  // 身份映射页有未保存修改时也要拦一次（与 AI 聊天页同款）。
+  if(identityPageDirty&&currentRoute==='identity'&&route!==currentRoute){
+    if(!await confirmDialog('有未保存的身份映射修改，确定离开？',{title:'离开身份映射'})){
+      if(!updateHash&&currentRoute&&location.hash!=='#'+currentRoute)history.replaceState(null,'','#'+currentRoute)
+      return
+    }
+    identityPageDirty=false
+  }
   // 离开高级控制页时停掉工具任务轮询：那条 500ms 自续链不看当前路由，
   // 切走后仍会一直打 /tools/task 与 /monitor。
   if(currentRoute==='tools'&&route!=='tools')cancelToolTaskPolling()
@@ -1321,6 +1463,7 @@ async function navigateTo(route,updateHash=true){
     if(!commandReplyCatalog&&!commandReplyLoading)loadCommandReplies()
   }
   if(route==='aichat'){if(!aiChatData)loadAiChatSettings();if(!$('aiChatMemoryBody')||!$('aiChatMemoryBody').childElementCount)loadAiChatMemory()}
+  if(route==='identity'){if(!identityData)loadIdentitySettings()}
 }
 /* ===== AI 聊天功能页 =====
  * 复用配置中心 schema 渲染与保存接口，仅编辑 ai_chat 段。
@@ -1746,8 +1889,22 @@ let loginStatusRequestApplied=0
 let operatorWorkflows=[]
 let taskSnapshots=[]
 let activeDecisionId=0
+function setGlobalResultToggle(collapsed){
+  const btn=$('globalResultToggle');if(!btn)return
+  btn.textContent=collapsed?'＋':'−'
+  btn.setAttribute('aria-expanded',collapsed?'false':'true')
+  btn.title=collapsed?'展开响应面板':'折叠响应面板'
+}
+function toggleGlobalResult(){
+  const panel=$('responsePanel');if(!panel)return
+  const collapsed=panel.classList.toggle('collapsed')
+  setGlobalResultToggle(collapsed)
+}
 function setResult(value,kind){
   const el=$('result')
+  // 有新结果时自动展开“响应”浮层；用户仍可点标题右侧按钮折叠。
+  const panel=$('responsePanel')
+  if(panel&&panel.classList.contains('collapsed')){panel.classList.remove('collapsed');setGlobalResultToggle(false)}
   // 成功/错误着色：左侧色条一眼区分结果性质
   el.parentElement.classList.remove('result-ok','result-err')
   if(kind)el.parentElement.classList.add(kind)
@@ -3687,7 +3844,7 @@ function identityMappingsWrite(items){
   const el=identityMappingsControl();if(!el)return
   el.value=JSON.stringify(items,null,2)
   el.classList.remove('config-invalid')
-  markConfigDirty('identity')
+  markIdentityDirty()
 }
 function identityRenderTable(){
   const wrap=$(configControlId('identity.mappings')+'-table')
@@ -3744,14 +3901,14 @@ function identityRepairJsonApply(){
     if(!Array.isArray(value))throw new Error('必须是数组')
     identityMappingsWrite(value)
     identityRenderTable()
-    showConfigMessage('JSON 已应用，请检查映射后保存','ok')
-  }catch(e){showConfigMessage('身份映射 JSON 无效：'+e.message,'err')}
+    showIdentityMessage('JSON 已应用，请检查映射后保存','ok')
+  }catch(e){showIdentityMessage('身份映射 JSON 无效：'+e.message,'err')}
 }
 function identityTableSet(index,field,value){
   const items=identityMappingsList();if(!items||!items[index]||typeof items[index]!=='object'||Array.isArray(items[index]))return
   const next=String(value??'')
   if(field==='nickname'&&items.some((item,i)=>i!==index&&item&&item.nickname===next.trim())){
-    showConfigMessage('备注串 '+next.trim()+' 已存在','err');identityRenderTable();return
+    showIdentityMessage('备注串 '+next.trim()+' 已存在','err');identityRenderTable();return
   }
   items[index][field]=field==='nickname'?next.trim():next
   // 手改备注串后它就不再是聊天桥给的值：清掉来源标记，
@@ -3766,8 +3923,8 @@ function identityCopyUid(index){
   // 复制失败时不弹错误：多数浏览器在非安全上下文禁用 clipboard，
   // 此时用户仍可从只读列手动选中。
   navigator.clipboard?.writeText(uid).then(
-    ()=>showConfigMessage('UID 已复制','ok'),
-    ()=>showConfigMessage('复制失败，请手动选中','err')
+    ()=>showIdentityMessage('UID 已复制','ok'),
+    ()=>showIdentityMessage('复制失败，请手动选中','err')
   )
 }
 function identityTableSetUids(index,value){
@@ -3789,24 +3946,24 @@ function identityTableRemove(index){
 }
 function identityAddRow(){
   const items=identityMappingsList()
-  if(!items){showConfigMessage('身份映射 JSON 无法解析，请先修正','err');return}
+  if(!items){showIdentityMessage('身份映射 JSON 无法解析，请先修正','err');return}
   let nickname=String($('identityNewNickname').value||'').trim()
   const note=String($('identityNewNote').value||'').trim()
   const role=$('identityNewRole').value||'friend'
   if(!nickname){nickname=randomRemarkNickname()}
-  if(items.some(m=>m&&m.nickname===nickname)){showConfigMessage('备注串 '+nickname+' 已存在','err');return}
-  if(role==='owner'&&items.some(m=>m&&m.role==='owner')){showConfigMessage('主人只能有一位','err');return}
+  if(items.some(m=>m&&m.nickname===nickname)){showIdentityMessage('备注串 '+nickname+' 已存在','err');return}
+  if(role==='owner'&&items.some(m=>m&&m.role==='owner')){showIdentityMessage('主人只能有一位','err');return}
   items.push({nickname:nickname,id:identityRandomUuid(),role:role,note:note})
   identityMappingsWrite(items)
   identityRenderTable()
   $('identityNewNickname').value='';$('identityNewNote').value=''
-  showConfigMessage('已添加「'+nickname+'」，记得保存','ok')
+  showIdentityMessage('已添加「'+nickname+'」，记得保存','ok')
 }
 async function identityCopyRandomNickname(){
   const nick=randomRemarkNickname()
   $('identityNewNickname').value=nick
-  try{await navigator.clipboard.writeText(nick);showConfigMessage('已生成并填入/复制昵称: '+nick,'ok')}
-  catch{showConfigMessage('已生成昵称: '+nick,'ok')}
+  try{await navigator.clipboard.writeText(nick);showIdentityMessage('已生成并填入/复制昵称: '+nick,'ok')}
+  catch{showIdentityMessage('已生成昵称: '+nick,'ok')}
 }
 function identityMappingsEditor(path,value){
   const id=configControlId(path)
@@ -3873,6 +4030,7 @@ function markConfigDirty(sectionName){
   clearConfigFieldErrors()
   renderConfigStatus()
   renderConfigSectionList()
+  renderConfigSaveBar()
 }
 function renderConfigStatus(){
   const rev=$('configRevision')
@@ -3887,16 +4045,70 @@ function renderConfigStatus(){
     hint.classList.toggle('hidden',!configUnsaved)
     hint.textContent='有未保存的修改（'+configDirty.size+' 段）'
   }
+  renderConfigSaveBar()
 }
-// 配置域的固定顺序：与后端 Domain::ALL 一致，按"用户找东西的习惯"排。
-const configDomainOrder=['recognition','playback','entertainment','interaction','system']
+// 底部粘滞保存条：显示未保存段数，让长表单滚到中段也能看到保存入口。
+function renderConfigSaveBar(){
+  const hint=$('configSaveBarHint')
+  if(!hint)return
+  if(configDirty.size){hint.className='config-savebar-hint config-dirty';hint.textContent='有未保存的修改（'+configDirty.size+' 段）'}
+  else{hint.className='config-savebar-hint';hint.textContent='未修改'}
+}
+// 放弃当前段的本地修改：直接从已保存的 configData 重新渲染（不触发保存）。
+function discardCurrentSection(){
+  if(!configActiveSection||!configDirty.has(configActiveSection))return
+  configDirty.delete(configActiveSection)
+  configUnsaved=configDirty.size>0
+  renderConfigStatus();renderConfigSectionList();renderConfigForm()
+}
+// 搜索框计数/清除按钮状态（供搜索结果反馈）。
+function updateConfigSearchUI(count){
+  const chip=$('configSearchCount'),clear=$('configSearchClear')
+  const active=!!configSearchText
+  if(chip){chip.hidden=!active;if(active)chip.textContent=count+' 个字段'}
+  if(clear)clear.classList.toggle('hidden',!active)
+}
+function clearConfigSearch(){
+  const el=$('configSearch');if(el)el.value=''
+  configSearchText=''
+  updateConfigSearchUI(0)
+  renderConfigSectionList();renderConfigForm()
+}
+// 配置域的固定顺序：按「相关性 + 从上到下配置流程」= 先能看/能采(识别画面) → 能放(播放点歌)
+// → 怎么授权/交互(AI与交互，含身份/命令权限) → 玩什么(娱乐玩法) → 底层系统(系统)。
+// 用户已认可 5 域集合；此序把 interaction 提到 entertainment 之前，符合“先设置后依赖”。
+const configDomainOrder=['recognition','playback','interaction','entertainment','system']
 const configDomainLabels={recognition:'识别与画面',playback:'播放与点歌',entertainment:'娱乐玩法',interaction:'AI 与交互',system:'系统'}
+// 域内推荐顺序：人工复核后的「先设置、再依赖」流程序（不采用 schema.order 的历史追加序）。
+// schema.order 只作兜底；此表缺省时保持 API 顺序。identity 仍列出（它已移出配置中心，
+// 由 configSectionVisible 过滤），避免以后若要回退时排序缺项。
+const configSectionFlow={
+  recognition:['visual','window','screen','stability','ocr','templates','matching'],
+  playback:['playback','song_ai','song_dedup','queue','song_review'],
+  interaction:['identity','command_access','output','chat_source','ai','ai_chat','custom_workflows'],
+  entertainment:['turtle_soup','undercover','landlord','idiom_chain','number_bomb','hotkeys'],
+  system:['timing','startup','invite','friend_delivery','moderation','http','logging','tui','state','kugou']
+}
+function configSectionRank(domain,name){
+  const list=configSectionFlow[domain]
+  const index=list?list.indexOf(name):-1
+  return index<0?999:index
+}
+// identity 段已移到左侧「身份映射」独立页，配置中心侧栏/搜索/表单都不再出现它。
+function configSectionVisible(section){return section && section.name!=='identity'}
+// 搜索命中高亮：文本先 esc 再对命中片段包 <mark>（防 XSS）。
+function configHighlight(text){
+  const safe=esc(String(text==null?'':text))
+  if(!configSearchText)return safe
+  const term=configSearchText.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')
+  try{return safe.replace(new RegExp('('+term+')','ig'),'<mark>$1</mark>')}catch(e){return safe}
+}
 function renderConfigSectionList(){
   const el=$('configSectionList')
   if(!el)return
-  const visible=(configSchema||[]).filter(section=>configSectionHasMatch(section))
+  const visible=(configSchema||[]).filter(section=>configSectionVisible(section)&&configSectionHasMatch(section))
   if(!visible.length){el.innerHTML='<div class="config-field-hint" style="padding:var(--sp-2)">没有匹配的配置段</div>';return}
-  // 按域分组：33 个段平铺时用户无法凭直觉定位，分组后先选域再选段。
+  // 按域分组：先选域再选段，避免 30+ 段平铺。
   const groups=new Map()
   for(const section of visible){
     const domain=String(section.domain||'system')
@@ -3908,18 +4120,21 @@ function renderConfigSectionList(){
     return (ai<0?99:ai)-(bi<0?99:bi)
   })
   el.innerHTML=ordered.map(domain=>{
-    const sections=groups.get(domain)
-    // 当前段所属的域默认展开，其余域收起，避免一次铺满 33 项。
-    const expanded=configDomainOpen.has(domain)||sections.some(s=>s.name===configActiveSection)
+    const sections=groups.get(domain).slice().sort((a,b)=>{
+      return configSectionRank(domain,a.name)-configSectionRank(domain,b.name)||((a.order||0)-(b.order||0))
+    })
+    // 当前段所属的域默认展开，其余域收起；搜索时有命中的域也展开。
+    const expanded=configDomainOpen.has(domain)||sections.some(s=>s.name===configActiveSection)||!!configSearchText
+    const domDirty=sections.some(s=>configDirty.has(s.name))
     const items=sections.map(section=>{
       const dirty=configDirty.has(section.name)
       const active=section.name===configActiveSection?' active':''
-      return '<button type="button" class="config-section-item'+active+'" onclick="selectConfigSection('+esc(JSON.stringify(section.name))+')"><span>'+esc(section.label)+'</span><span class="section-name">'+esc(section.name)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
+      return '<button type="button" class="config-section-item'+active+'"'+(active?' aria-current="true"':'')+' onclick="selectConfigSection('+esc(JSON.stringify(section.name))+')"><span>'+configHighlight(section.label)+'</span><span class="section-name">'+esc(section.name)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
     }).join('')
-    const label=esc(configDomainLabels[domain]||domain)
+    const label=configHighlight(configDomainLabels[domain]||domain)
     return '<div class="config-domain'+(expanded?' open':'')+'">'+
       '<button type="button" class="config-domain-head" aria-expanded="'+(expanded?'true':'false')+'" onclick="toggleConfigDomain('+esc(JSON.stringify(domain))+')">'+
-        '<span>'+label+'</span><span class="config-domain-count">'+sections.length+'</span></button>'+
+        '<span>'+label+'</span><span style="display:inline-flex;align-items:center;gap:4px"><span class="config-domain-count">'+sections.length+'</span>'+(domDirty?'<span class="dirty-dot" title="该域有未保存修改"></span>':'')+'</span></button>'+
       '<div class="config-domain-body">'+items+'</div></div>'
   }).join('')
 }
@@ -3961,7 +4176,7 @@ function toggleVisualFields(){
     btn.textContent=configShowVisualFields?'隐藏档案字段':'显示档案字段'
     btn.classList.toggle('primary',configShowVisualFields)
   }
-  const visible=(configSchema||[]).filter(configSectionHasMatch)
+  const visible=(configSchema||[]).filter(s=>configSectionVisible(s)&&configSectionHasMatch(s))
   if(!visible.some(section=>section.name===configActiveSection))configActiveSection=visible.length?visible[0].name:null
   renderConfigSectionList()
   renderConfigForm()
@@ -3970,6 +4185,22 @@ function toggleVisualFields(){
 function configSectionHidesVisual(section){
   return !configShowVisualFields
 }
+function configDefaultSection(){
+  // 默认落点：优先“记忆上次段”，否则按侧栏流程序取首个非视觉档案段（视觉档案是技术编辑器，不做首选）。
+  // 注意 /config/schema 的 sections 数组并非按 order 排序，必须按域+流程序自己排。
+  const visible=(configSchema||[]).filter(configSectionVisible)
+  let remembered=null
+  try{remembered=localStorage.getItem('miliastraConfigSection')}catch(e){}
+  if(remembered&&visible.some(s=>s.name===remembered))return remembered
+  const ordered=[]
+  for(const domain of configDomainOrder){
+    const secs=visible.filter(s=>String(s.domain||'system')===domain).sort((a,b)=>configSectionRank(domain,a.name)-configSectionRank(domain,b.name)||((a.order||0)-(b.order||0)))
+    ordered.push(...secs)
+  }
+  for(const s of visible)if(!ordered.includes(s))ordered.push(s)
+  const preferred=ordered.find(s=>s.name!=='visual')
+  return preferred?preferred.name:(ordered[0]?ordered[0].name:null)
+}
 function selectConfigSection(name){
   if(name===configActiveSection)return
   if(!syncConfigFormToData()){
@@ -3977,6 +4208,7 @@ function selectConfigSection(name){
     return
   }
   configActiveSection=name
+  try{localStorage.setItem('miliastraConfigSection',name)}catch(e){}
   renderConfigSectionList()
   renderConfigForm()
 }
@@ -4112,54 +4344,82 @@ function visualProfileBind(){
   configDirty.delete('visual')
 }
 
+function configFieldKind(field){
+  const t=field.kind&&field.kind.type
+  const map={int:'number',float:'number',string:'path',path:'path',text:'text',enum:'enum',bool:'bool',object:'object',stringArray:'array',rect:'rect',point:'point',secret:'secret',modelName:'string'}
+  return map[t]||'other'
+}
+// 单个字段：label 固定左列 + 控件 + effect 右置；提示/默认值下沉为第二行。
+function renderConfigFieldHtml(field,section,isAi){
+  const id=configControlId(field.path)
+  const value=configValueAt(section.name,field.path)
+  const bootstrap=field.source==='bootstrap'
+  const kind=configFieldKind(field)
+  const parts=[]
+  if(isAi&&field.path==='ai.provider')parts.push('<div class="config-step-title">第一步：选择服务商</div>')
+  if(isAi&&field.path==='ai.api_key')parts.push('<div class="config-step-title">第二步：服务商参数</div><div class="config-field-hint ai-provider-info" id="aiProviderInfo"></div>')
+  parts.push('<div class="config-field'+(bootstrap?' bootstrap':'')+'" data-kind="'+kind+'" data-cfg-field="'+esc(field.path)+'" id="cfg-field-'+id+'">')
+  parts.push('<div class="config-field-label"><b>'+configHighlight(field.label)+'</b><code title="'+esc(field.path)+'">'+esc(field.path)+'</code></div>')
+  parts.push('<div class="config-field-control">'+configControlHtml(field,value)+'</div>')
+  parts.push('<div class="config-field-side">'+configEffectTag(field)+'</div>')
+  parts.push('<div class="config-field-foot">')
+  if(field.managedBy==='visual')parts.push('<span class="config-field-hint">已并入上方“视觉档案”，建议统一修改。</span>')
+  if(field.hint)parts.push('<span class="config-field-hint">'+esc(field.hint)+'</span>')
+  if(field.default!=null)parts.push('<span class="config-field-default">默认: '+configDefaultText(field.default)+'</span>')
+  if(bootstrap)parts.push('<span class="config-readonly-note">由 config.yaml 提供，修改后重启生效</span>')
+  parts.push('</div></div>')
+  return parts.join('')
+}
+// 段级 effect 汇总：让用户一眼知道“本段保存后何时生效”。
+function configEffectSummary(fields){
+  const c={live:0,idleReload:0,playbackIdleReload:0,restart:0}
+  for(const f of fields){if(f.source==='bootstrap')continue;c[f.effect]=(c[f.effect]||0)+1}
+  const tags=[]
+  if(c.live)tags.push('<span class="config-effect live">立即生效 '+c.live+'</span>')
+  if(c.idleReload)tags.push('<span class="config-effect idle-reload">任务结束后重载 '+c.idleReload+'</span>')
+  if(c.playbackIdleReload)tags.push('<span class="config-effect playback-idle-reload">播放结束/暂停后重载 '+c.playbackIdleReload+'</span>')
+  if(c.restart)tags.push('<span class="config-effect restart">重启生效 '+c.restart+'</span>')
+  return tags.join('')
+}
 function renderConfigForm(){
   const form=$('configForm')
   if(!form)return
   const section=configSectionByName(configActiveSection)
   if(!section){form.innerHTML='<div class="config-message">没有匹配的配置字段</div>';return}
+  // 身份映射已移到左侧独立页，配置中心不再渲染它。
+  if(section.name==='identity'){form.innerHTML='<div class="config-message">身份映射已移到左侧「身份映射」页，请在那里编辑。</div>';return}
   // 视觉档案不是普通字段表：它有画布、分组、JSON 导入与预览。
-  // 这里直接挂载档案编辑器，避免"同一个东西两个入口"。
   if(section.name==='visual'){
     form.innerHTML=visualProfilePanelHtml()
     visualProfileBind()
     loadVisualProfile(false)
     return
   }
-  const parts=['<div class="config-form">']
   const isAi=section.name==='ai'
   const hidesVisual=configSectionHidesVisual(section)
+  const visibleFields=section.fields.filter(f=>configFieldMatches(f)&&!(hidesVisual&&f.managedBy==='visual'))
   const hiddenVisual=hidesVisual?section.fields.filter(f=>f.source!=='bootstrap'&&f.managedBy==='visual').length:0
-  if(hiddenVisual)parts.push('<div class="config-message">本段有 '+hiddenVisual+' 个模板/区域/分辨率字段已并入上方“视觉档案”；点工具栏“显示档案字段”可临时展开原表单，保存仍会保留这些值。</div>')
-  // 大段（timing/ocr/startup 等）按后端给的 group 分子节，避免 30+ 字段平铺。
-  let lastGroup=null
-  for(const field of section.fields){
-    const id=configControlId(field.path)
-    const value=configValueAt(section.name,field.path)
-    const bootstrap=field.source==='bootstrap'
-    const hiddenBySearch=!configFieldMatches(field)||(hidesVisual&&field.managedBy==='visual')
-    // 只在可见字段之间插入小节标题；被搜索隐藏的字段不应留下空标题。
-    if(!hiddenBySearch&&field.group&&field.group!==lastGroup){
-      lastGroup=field.group
-      parts.push('<div class="config-subgroup-title">'+esc(field.group)+'</div>')
+  const parts=['<div class="config-form">']
+  parts.push('<div class="config-section-head"><h2>'+esc(section.label)+'</h2><code>'+esc(section.name)+'</code><span class="config-section-stats">'+visibleFields.length+' 项 '+configEffectSummary(visibleFields)+'</span></div>')
+  if(hiddenVisual)parts.push('<div class="config-message">本段有 '+hiddenVisual+' 个模板/区域/分辨率字段已并入“视觉档案”；点工具栏“显示档案字段”可临时展开原表单，保存仍会保留这些值。</div>')
+  if(!visibleFields.length)parts.push('<div class="config-empty">没有匹配的配置字段</div>')
+  // 按 schema group 合并成“分组卡片”，组内字段紧凑排列；无 group 的段整段一张卡。
+  let currentGroup=null, first=true, open=false
+  for(const field of visibleFields){
+    const group=field.group||''
+    if(first||group!==currentGroup){
+      if(open)parts.push('</div>')
+      parts.push('<div class="config-group-card">')
+      if(group)parts.push('<div class="config-group-head">'+esc(group)+'</div>')
+      currentGroup=group; open=true; first=false
     }
-    // 点歌 AI 二段式：第一步选服务商，第二步按服务商填参数。
-    if(isAi&&field.path==='ai.provider')parts.push('<div class="config-step-title">第一步：选择服务商</div>')
-    if(isAi&&field.path==='ai.api_key')parts.push('<div class="config-step-title">第二步：服务商参数</div><div class="config-field-hint ai-provider-info" id="aiProviderInfo"></div>')
-    parts.push('<div class="config-field'+(bootstrap?' bootstrap':'')+(hiddenBySearch?' hidden':'')+'" data-cfg-field="'+field.path+'" id="cfg-field-'+id+'">')
-    parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code>'+configEffectTag(field)+'</div>')
-    if(field.managedBy==='visual')parts.push('<div class="config-field-hint">该字段已并入上方“视觉档案”，建议从档案统一修改。</div>')
-    if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
-    parts.push(configControlHtml(field,value))
-    parts.push('<div class="config-field-meta">')
-    if(field.default!=null)parts.push('<span>默认: '+configDefaultText(field.default)+'</span>')
-    parts.push('</div>')
-    if(bootstrap)parts.push('<div class="config-readonly-note">该字段由 config.yaml 提供，在 config.yaml 修改后重启生效</div>')
-    parts.push('</div>')
+    parts.push(renderConfigFieldHtml(field,section,isAi))
   }
+  if(open)parts.push('</div>')
   parts.push('</div>')
   form.innerHTML=parts.join('')
-  if(form.querySelector('[data-identity-editor]'))identityRenderTable()
   if(isAi)aiProviderBind()
+  renderConfigSaveBar()
 }
 function aiProviderBind(){
   const providerEl=document.getElementById(configControlId('ai.provider'))
@@ -4314,7 +4574,9 @@ function collectConfigFieldValue(field,sectionName){
   if(kind==='bool')return {value:el.checked}
   if(kind==='int'||kind==='float'){
     const raw=String(el.value||'').trim()
-    if(raw==='')return {invalid:true}
+    // 可空数值留空 = 未设置（后端接受 null）；非可空才判非法。避免 nullable 数值
+    // （如 ocr.openvino.rec_fixed_width）让整段保存被前端误拦。
+    if(raw==='')return field.nullable?{value:null}:{invalid:true}
     const integer=kind==='int'
     const syntax=integer?/^[+-]?\d+$/.test(raw):/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(raw)
     const n=Number(raw)
@@ -4357,9 +4619,11 @@ function collectConfigFieldValue(field,sectionName){
   if(kind==='rect'||kind==='point'){
     const keys=kind==='rect'?['x','y','width','height']:['x','y']
     const out={}
-    for(const key of keys){
-      const input=document.getElementById(configControlId(field.path)+'-'+key)
-      const raw=String(input?input.value||'':'').trim()
+    const raws=keys.map(key=>{const input=document.getElementById(configControlId(field.path)+'-'+key);return String(input?input.value||'':'').trim()})
+    if(raws.every(r=>r===''))return field.nullable?{value:null}:{invalid:true}
+    for(let i=0;i<keys.length;i++){
+      const key=keys[i]
+      const raw=raws[i]
       if(raw==='')return {invalid:true}
       const value=Number(raw)
       if(!Number.isSafeInteger(value))return {invalid:true}
@@ -4552,6 +4816,9 @@ function invalidateVisualPreview(){
   $('visualImportButton').disabled=true
 }
 async function loadVisualProfile(replaceDraft=false){
+  // 视觉档案面板只在“视觉档案”段挂载；其它段（或已移出配置中心的默认落点）没有这些节点，
+  // 直接跳过，避免把 null.textContent 当成加载失败。
+  if(!$('visualProfileStatus'))return false
   if(replaceDraft&&visualDraftDirty&&!confirm('重新加载会丢弃未保存的视觉修改，继续？'))return
   const generation=++visualLoadGeneration
   const draftGeneration=visualPreviewGeneration
@@ -4647,11 +4914,13 @@ async function loadConfigPage(){
     configUnsaved=false
     const latest=Array.isArray(revisions&&revisions.revisions)&&revisions.revisions.length?revisions.revisions[0]:null
     configLatestRevisionAtMs=latest&&latest.createdAtMs?Number(latest.createdAtMs):null
-    if(!configActiveSection||!configSchema.some(s=>s.name===configActiveSection))configActiveSection=configSchema.length?configSchema[0].name:null
+    if(!configActiveSection||!configSchema.some(s=>s.name===configActiveSection)){
+      configActiveSection=configDefaultSection()
+    }
     renderConfigStatus()
     renderConfigSectionList()
     renderConfigForm()
-    if(!visualDraft)await loadVisualProfile()
+    if(!visualDraft&&configActiveSection==='visual')await loadVisualProfile()
     clearConfigMessage()
     if(configRevisionsOpen)loadConfigRevisions()
   }catch(e){
@@ -4698,7 +4967,8 @@ function configDefaultSections(){
   // 时子字段不写入；http/logging 为启动引导段，不参与恢复。
   const sections={}
   for(const section of configSchema){
-    if(section.name==='http'||section.name==='logging')continue
+    // http/logging 是启动引导段；identity 已移到独立页，恢复默认不应清空身份映射。
+    if(section.name==='http'||section.name==='logging'||section.name==='identity')continue
     const obj={}
     for(const field of section.fields){
       if(field.source==='bootstrap')continue
@@ -4711,6 +4981,88 @@ function configDefaultSections(){
     sections[section.name]=obj
   }
   return sections
+}
+/* ===== 身份映射独立页（复用配置中心 schema 渲染与保存接口，仅编辑 identity 段） =====
+ * 与 AI 聊天页同一模式：单独 GET /config/section?name=identity，保存只 POST identity 段，
+ * 不复制保存逻辑、不改 HTTP API。真实昵称/UUID 只在运行时读取，不写入代码/报告/截图。 */
+let identityData=null
+let identitySectionFields=[]
+let identityPageDirty=false
+let identityLoading=false
+function showIdentityMessage(text,kind){
+  const el=$('identityMessage');if(!el)return
+  el.textContent=text||''
+  el.className='config-message'+(kind?' '+kind:'')+(text?'':' hidden')
+}
+function markIdentityDirty(){identityPageDirty=true;updateIdentityStatus()}
+function updateIdentityStatus(){
+  const rev=$('identityRevision');if(rev)rev.textContent=identityData&&identityData.revision!=null?String(identityData.revision):'-'
+  const hint=$('identityDirtyHint');if(hint)hint.classList.toggle('hidden',!identityPageDirty)
+  const saveHint=$('identitySaveHint');if(saveHint)saveHint.textContent=identityPageDirty?'有未保存的修改':'修改后点「保存身份映射」'
+  const cnt=$('identityCount');if(cnt)cnt.textContent=(identityData&&identityData.values&&Array.isArray(identityData.values.mappings))?'（'+identityData.values.mappings.length+' 条）':''
+}
+async function loadIdentitySettings(){
+  if(identityLoading)return
+  identityLoading=true
+  showIdentityMessage('',null)
+  try{
+    const schema=await request('/config/schema')
+    const section=(schema.sections||[]).find(item=>item.name==='identity')
+    if(!section)throw new Error('配置 schema 中没有 identity 段')
+    identitySectionFields=section.fields||[]
+    const current=await request('/config/section?name=identity')
+    identityData={revision:current.revision,values:current.values||{}}
+    identityPageDirty=false
+    renderIdentityPage()
+  }catch(error){
+    const host=$('identityEditorHost');if(host)host.innerHTML='<p class="config-message err">读取失败：'+esc(error.message)+'</p>'
+    showIdentityMessage('读取失败：'+error.message,'err')
+  }finally{identityLoading=false;updateIdentityStatus()}
+}
+function renderIdentityPage(){
+  const host=$('identityEditorHost');if(!host)return
+  const field=identitySectionFields.find(f=>f.path==='identity.mappings')
+  if(!field){host.innerHTML='<p class="config-field-hint">没有 identity.mappings 字段</p>';return}
+  const value=identityData&&identityData.values?identityData.values.mappings:undefined
+  host.innerHTML=configControlHtml(field,value,'identity','')
+  identityRenderTable()
+  host.querySelectorAll('[data-cfg]').forEach(el=>{
+    el.addEventListener('input',markIdentityDirty)
+    el.addEventListener('change',markIdentityDirty)
+  })
+}
+function collectIdentitySection(){
+  const values=JSON.parse(JSON.stringify(identityData&&identityData.values?identityData.values:{}))
+  const field=identitySectionFields.find(f=>f.path==='identity.mappings')
+  if(field){
+    const collected=collectConfigFieldValue(field,'identity')
+    if(collected&&collected.invalid)throw new Error('身份映射 JSON 无效，请修正后再保存')
+    if(collected&&!collected.skip)values.mappings=collected.value
+  }
+  return values
+}
+async function saveIdentitySettings(){
+  const btn=$('identitySaveBtn');if(btn)btn.disabled=true
+  try{
+    const section=collectIdentitySection()
+    const baseRevision=identityData&&identityData.revision!=null?identityData.revision:0
+    const validation=await requestJson('/config/validate',{sections:{identity:section}})
+    if(validation&&Array.isArray(validation.errors)&&validation.errors.length){
+      showIdentityMessage('保存校验失败：'+validation.errors.map(e=>(e&&e.message)||e).join('；'),'err');return
+    }
+    const resp=await requestJson('/config/save',{baseRevision,sections:{identity:section}})
+    if(resp&&resp.ok===false){showIdentityMessage('保存失败：'+(resp.message||'校验未通过'),'err');return}
+    showIdentityMessage('已保存，当前版本 '+(resp&&resp.revision!=null?resp.revision:'')+'（保存后立即生效）','ok')
+    identityPageDirty=false
+    await loadIdentitySettings()
+  }catch(error){
+    showIdentityMessage('保存失败：'+((error&&error.message)||'未知错误'),'err')
+  }finally{if(btn)btn.disabled=false;updateIdentityStatus()}
+}
+async function discardIdentitySettings(){
+  if(identityPageDirty&&!await confirmDialog('放弃未保存的身份映射修改？',{title:'放弃修改'}))return
+  identityPageDirty=false
+  await loadIdentitySettings()
 }
 async function restoreDefaults(){
   if(configSaving)return
@@ -4739,11 +5091,20 @@ async function restoreDefaults(){
     if(configRevisionsOpen)loadConfigRevisions()
   }
 }
-function toggleConfigRevisions(){
+async function toggleConfigRevisions(){
   configRevisionsOpen=!configRevisionsOpen
   const panel=$('configRevisionsPanel')
-  if(panel)panel.hidden=!configRevisionsOpen
-  if(configRevisionsOpen)loadConfigRevisions()
+  if(!panel)return
+  panel.hidden=!configRevisionsOpen
+  if(configRevisionsOpen){
+    // 面板挂在 #configForm 之后，长表单下位于页面最底部；先渲染列表再滚到可视区，
+    // 否则用户点“历史版本”会以为没反应（scroll-margin-top 避开 sticky 顶栏/工具栏）。
+    await loadConfigRevisions()
+    panel.scrollIntoView({block:'end'})
+  }else{
+    const toolbar=document.querySelector('#page-config .config-toolbar')
+    if(toolbar)toolbar.scrollIntoView({block:'start'})
+  }
 }
 async function loadConfigRevisions(){
   const el=$('configRevisions')
@@ -4787,19 +5148,34 @@ $('configForm').addEventListener('input',onConfigFormInput)
 $('configForm').addEventListener('change',onConfigFormChange)
 let configSearchTimer=0
 $('configSearch').addEventListener('input',()=>{
-  // 200ms 防抖：搜索过滤是只读操作，不依赖表单同步成功；校验未通过仅提示，不阻断搜索。
+  // 200ms 防抖：搜索过滤是只读操作；先把已编辑值同步回内存，避免重建表单丢改动。
   clearTimeout(configSearchTimer)
   configSearchTimer=setTimeout(()=>{
     if(!syncConfigFormToData())showConfigMessage('当前配置存在格式错误，搜索仅按已加载配置过滤','err')
     configSearchText=$('configSearch').value.trim().toLowerCase()
-    const visible=(configSchema||[]).filter(configSectionHasMatch)
+    const visible=(configSchema||[]).filter(s=>configSectionVisible(s)&&configSectionHasMatch(s))
+    const count=visible.reduce((n,s)=>n+s.fields.filter(configFieldMatches).length,0)
+    updateConfigSearchUI(count)
     if(!visible.some(section=>section.name===configActiveSection))configActiveSection=visible.length?visible[0].name:null
     renderConfigSectionList()
     renderConfigForm()
   },200)
 })
+$('configSearch').addEventListener('keydown',(e)=>{if(e.key==='Escape'){e.preventDefault();clearConfigSearch()}})
+// 顶栏实际高度写入 --topbar-h：配置页工具栏/侧栏/分组标题的 sticky top 依赖它，
+// 避免窄屏（顶栏会换成多行）工具栏被 sticky 顶栏盖住。
+function syncTopbarHeight(){
+  const tb=document.querySelector('.topbar')
+  if(!tb)return
+  document.documentElement.style.setProperty('--topbar-h',Math.round(tb.getBoundingClientRect().height)+'px')
+}
+window.addEventListener('resize',syncTopbarHeight)
+try{const tbEl=document.querySelector('.topbar');if(tbEl)new ResizeObserver(syncTopbarHeight).observe(tbEl)}catch(e){}
+syncTopbarHeight()
+// 顶栏状态徽章：窄屏时文本可能被 ellipsis 截断，用 title 提供完整值（不改结构/语义）。
+;(function(){const bar=document.querySelector('.status-chips');if(!bar)return;const sync=()=>bar.querySelectorAll('.chip em').forEach(e=>{e.title=e.textContent});sync();try{new MutationObserver(sync).observe(bar,{subtree:true,childList:true,characterData:true})}catch(e){}})()
 window.addEventListener('beforeunload',(e)=>{
-  if(configUnsaved||visualDraftDirty||aiChatDirty||commandPolicyHasChanges()||commandReplyHasChanges()){e.preventDefault();e.returnValue='有未保存的修改，确定离开？'}
+  if(configUnsaved||visualDraftDirty||aiChatDirty||identityPageDirty||commandPolicyHasChanges()||commandReplyHasChanges()){e.preventDefault();e.returnValue='有未保存的修改，确定离开？'}
 })
 // 配置中心 Ctrl+S / Cmd+S 快捷保存
 document.addEventListener('keydown',(e)=>{

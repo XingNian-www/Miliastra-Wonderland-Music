@@ -675,7 +675,15 @@ impl ApplicationRuntime {
             user_command: parsed.user_command.clone(),
         };
         let application = self.business.administration_application;
-        application.execute(&context, command, self)
+        // 帮助分批发送间隔是既有 Live 字段：每次执行时取实时快照，避免用启动副本。
+        let help_batch_ms = self
+            .lifecycle
+            .live_configs
+            .snapshot()
+            .timing
+            .command
+            .help_batch_ms;
+        application.execute(&context, command, self, help_batch_ms)
     }
 
     fn execute_idiom_chain_intent(
@@ -687,7 +695,15 @@ impl ApplicationRuntime {
         let player = self.canonical_actor_name(&parsed.username);
         if command.requires_executor() {
             let application = self.business.idiom_chain_application;
-            application.execute_explanation(&player, command, observed_at, self)
+            // 解释批次间隔同样读实时快照（既有 Live 字段，不使用启动副本）。
+            let help_batch_ms = self
+                .lifecycle
+                .live_configs
+                .snapshot()
+                .timing
+                .command
+                .help_batch_ms;
+            application.execute_explanation(&player, command, observed_at, self, help_batch_ms)
         } else {
             log::debug!("成语接龙命令已按正式队列顺序处理，回复进入延迟聊天队列");
             let mut port = self.deferred_idiom_chain_port();

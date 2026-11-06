@@ -165,7 +165,7 @@ fn chat_source_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Secret,
             "Miliastra-Wonderland-ChatBridge 的鉴权令牌，通常与 http.access_token 相同；留空则连接会被拒绝",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "reconnect_ms",
             "重连间隔",
             FieldKind::Int {
@@ -174,7 +174,7 @@ fn chat_source_section() -> Vec<ConfigFieldSchema> {
             },
             "WS 断开后等待多久重连，单位毫秒",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "lease_timeout_ms",
             "失联回落阈值",
             FieldKind::Int {
@@ -603,31 +603,31 @@ fn timing_section() -> Vec<ConfigFieldSchema> {
             float(0.0, miliastra_playback::MAX_LYRICS_LEAD_SECONDS),
             "按当前播放进度向前查询歌词的秒数，支持小数，范围 0 到 60；保存后立即生效",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "playback.uri_stable_samples",
             "URI 稳定确认次数",
             int(0, MAX_STABLE_COUNT),
             "播放 URI 连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "playback.transport_stable_samples",
             "播放状态确认次数",
             int(0, MAX_STABLE_COUNT),
             "播放状态连续确认次数；大于 1 时覆盖全局值，0 或 1 表示继承",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "playback.stale_timeout_ms",
             "陈旧观测保留超时",
             int(1, MAX_TIMEOUT_MS),
             "播放器异常时保留上一条稳定观测的最长时间，必须为正整数，单位毫秒",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "decision.timeout_ms",
             "确认等待超时",
             int(1, MAX_TIMEOUT_MS),
             "匹配失败/AI 自动匹配后等待用户确认的最长时间，单位毫秒",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "decision.poll_ms",
             "确认扫描间隔",
             int(1, MAX_TIMEOUT_MS),
@@ -1236,7 +1236,7 @@ fn playback_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Path,
             "受控登录使用的短生命周期助手",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "login_timeout_ms",
             "登录超时",
             int(1, MAX_TIMEOUT_MS),
@@ -1263,7 +1263,7 @@ fn playback_section() -> Vec<ConfigFieldSchema> {
             "音频文件目录；相对路径基于程序 exe 所在目录，留空默认 deps/cache/audio",
         )
         .optional_parent(),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "audio_cache.max_bytes_mb",
             "磁盘占用上限",
             int(1, 1_048_576),
@@ -1277,14 +1277,14 @@ fn playback_section() -> Vec<ConfigFieldSchema> {
             "同时进行的源站下载任务上限",
         )
         .optional_parent(),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "audio_cache.request_timeout_ms",
             "源站请求超时",
             int(1, MAX_TIMEOUT_MS),
             "源站连接/响应超时，单位毫秒",
         )
         .optional_parent(),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "audio_cache.seek_wait_timeout_ms",
             "跳转等待超时",
             int(1, MAX_TIMEOUT_MS),
@@ -1297,13 +1297,13 @@ fn playback_section() -> Vec<ConfigFieldSchema> {
 /// moderation 段：拉黑/屏蔽 UID 流程的投票参数与区域。
 fn moderation_section() -> Vec<ConfigFieldSchema> {
     vec![
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "stable_vote_samples",
             "连续稳定识别次数",
             int(1, MAX_STABLE_COUNT),
             "同一好友同一判决需要连续稳定识别次数",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "required_vote_margin",
             "投票差额",
             int(1, MAX_STABLE_COUNT),
@@ -1842,13 +1842,13 @@ fn song_ai_section() -> Vec<ConfigFieldSchema> {
             ]),
             "点歌匹配的思考强度；留空跟随服务端默认。点歌偏重低延迟，通常用最低",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "local_recommend",
             "本地曲库推荐",
             FieldKind::Bool,
-            "在线匹配偏低时额外给出本地曲库推荐；默认开启，保存后空闲时生效",
+            "在线匹配偏低时额外给出本地曲库推荐；默认开启，保存后立即生效",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "local_recommend_min_score",
             "本地推荐触发分数",
             float(0.0, 1.0),
@@ -2059,7 +2059,7 @@ fn hotkeys_section() -> Vec<ConfigFieldSchema> {
 /// startup 段：启动流程。
 fn startup_section() -> Vec<ConfigFieldSchema> {
     vec![
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "enabled",
             "启用启动流程",
             FieldKind::Bool,
@@ -2071,13 +2071,13 @@ fn startup_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Bool,
             "找不到游戏窗口时是否启动游戏",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "enter_game",
             "自动进入游戏",
             FieldKind::Bool,
             "持续未知时 OCR 检测到“点击进入”，确认大门界面后自动进入游戏",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "enter_wonderland",
             "自动进入千星",
             FieldKind::Bool,
@@ -2734,19 +2734,19 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
 /// ai_chat 段：AI 聊天与轻量记忆。
 fn ai_chat_section() -> Vec<ConfigFieldSchema> {
     vec![
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "enabled",
             "启用 AI 聊天",
             FieldKind::Bool,
             "关键词触发的大厅聊天机器人；未配置 ai.api_key 时不会回复",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "keyword",
             "触发关键词",
             FieldKind::String,
             "消息包含该关键词时触发；默认 橘子",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "trigger_mode",
             "触发方式",
             FieldKind::Enum(vec![
@@ -2755,7 +2755,7 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             ]),
             "默认只在消息以关键词开头时触发",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "min_access",
             "触发权限",
             FieldKind::Enum(vec![
@@ -2766,55 +2766,55 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             ]),
             "谁能让 AI 回应；身份映射里查不到的人，除「所有人」外一律拒绝",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "actor_token_budget",
             "单人近期原文预算",
             int(1_000, 200_000),
             "每个玩家的近期问答原文 token 上限；超出部分压缩进中期摘要",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "actor_summary_budget",
             "单人中期摘要预算",
             int(200, 50_000),
             "每个玩家的中期摘要 token 上限；摘要滚动覆盖，不是硬截断",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "hall_token_budget",
             "大厅近期原文预算",
             int(1_000, 400_000),
             "大厅共享记忆的原文 token 上限；记录所有人在大厅的发言",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "hall_summary_budget",
             "大厅中期摘要预算",
             int(200, 100_000),
             "大厅共享记忆的中期摘要 token 上限",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "bot_token_budget",
             "机器人记忆预算",
             int(1_000, 400_000),
             "机器人自身发言的全局 token 上限",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "cooldown_seconds",
             "冷却秒数",
             int(0, 86_400),
             "同一玩家两次触发之间的最小间隔",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "allow_commands",
             "允许执行命令",
             FieldKind::Bool,
             "允许 AI 通过原生工具调用执行命令；程序按提问者身份与命令权限策略复核后执行",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "model",
             "专用模型",
             FieldKind::ModelName,
             "留空沿用 ai.model",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "reasoning",
             "思考强度",
             FieldKind::Enum(vec![
@@ -2826,31 +2826,31 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             ]),
             "AI 聊天的思考强度；留空跟随服务端默认",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "max_tokens",
             "最大 Token",
             int(1, 100_000),
             "单次回答允许生成的最大 token",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "system_prompt",
             "系统提示词",
             FieldKind::Text,
             "留空使用内置默认值",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "answer_prompt",
             "回答模板",
             FieldKind::Text,
             "可使用 {{keyword}}、{{question}}、{{facts}}、{{bot_history}}、{{commands}}；玩家历史按独立角色消息传输，{{history}} 仅作兼容占位",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "extract_prompt",
             "事实抽取提示词",
             FieldKind::Text,
             "留空使用内置默认值；从每轮对话中抽取值得长期记住的信息",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "ai_reply.mode",
             "AI回复 生成方式",
             FieldKind::Enum(vec![
@@ -2859,37 +2859,37 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             ]),
             "回复文案里写入 {AI回复} 时的生成方式；改写模式会让 AI 重写整条，事实可能被改动，默认补充一句",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "ai_reply.include_template",
             "把回复内容给 AI 看",
             FieldKind::Bool,
             "开启后 AI 能看到已填充变量的真实回复（如「小明点播的《晴天》已排上」）；关闭只能看到占位符骨架，不建议关闭",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "ai_reply.include_command",
             "把命令名给 AI 看",
             FieldKind::Bool,
             "开启后 AI 知道自己在响应哪条命令，如 @QQ点歌",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "ai_reply.system_prompt",
             "系统提示词",
             FieldKind::Text,
             "留空使用内置默认值；用于约束 AI 的语气与输出格式",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "ai_reply.user_prompt",
             "用户提示词",
             FieldKind::Text,
             "可使用 {{command}}、{{template}}；留空使用内置默认值",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "ai_reply.max_tokens",
             "生成上限",
             FieldKind::Int { min: 16, max: 4096 },
             "单次生成的最大 token 数；回复本来就很短，默认 120 足够",
         ),
-        ConfigFieldSchema::db_idle_reload(
+        ConfigFieldSchema::db_live(
             "ai_reply.timeout_seconds",
             "超时秒数",
             FieldKind::Int { min: 1, max: 120 },
@@ -3163,17 +3163,27 @@ mod tests {
         );
         for path in [
             "stability.default_count",
-            "timing.playback.uri_stable_samples",
-            "timing.playback.transport_stable_samples",
-            "timing.playback.stale_timeout_ms",
             "timing.external.volume_smooth_step_ms",
             "playback.login_helper_executable",
-            "playback.login_timeout_ms",
             "playback.audio_cache.enabled",
         ] {
             assert_eq!(
                 config_effect_for_path(path),
                 Some(Effect::IdleReload),
+                "field={path}"
+            );
+        }
+        // task-33：这些字段已改为 Live（消费方每次读 live 快照），不再是
+        // PlaybackIdleReload/IdleReload；保留本测试只守「哪些字段必须等播放空闲」。
+        for path in [
+            "playback.login_timeout_ms",
+            "timing.playback.uri_stable_samples",
+            "timing.playback.transport_stable_samples",
+            "timing.playback.stale_timeout_ms",
+        ] {
+            assert_eq!(
+                config_effect_for_path(path),
+                Some(Effect::Live),
                 "field={path}"
             );
         }

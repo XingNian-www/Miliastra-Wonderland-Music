@@ -38,6 +38,17 @@ impl Default for PlayerRuntimeConfig {
     }
 }
 
+/// 播放器稳定判定的运行期参数（由上层从 live 配置提供）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayerLiveTuning {
+    pub uri_stable_samples: usize,
+    pub transport_stable_samples: usize,
+    pub stale_timeout: Duration,
+}
+
+/// 每次观测循环调用一次：返回当前生效的稳定判定参数。
+pub type PlayerLiveTuningProvider = Arc<dyn Fn() -> PlayerLiveTuning + Send + Sync>;
+
 impl PlayerRuntimeConfig {
     pub(crate) fn fast_observation_interval_for(normal_interval: Duration) -> Duration {
         let interval = if normal_interval > FAST_OBSERVATION_INTERVAL_LIMIT {
@@ -643,7 +654,10 @@ struct LatestObservationStore {
     state: Mutex<LatestObservationState>,
     changed: Condvar,
     clock: Arc<dyn Clock>,
+    /// 启动期的 stale 超时（live 提供者缺席时使用）。
     stale_timeout: Duration,
+    /// `timing.playback.stale_timeout_ms` 的每次读取源（live）。
+    tuning: Option<PlayerLiveTuningProvider>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -654,13 +668,26 @@ enum ObservationPublishOutcome {
 }
 
 impl LatestObservationStore {
-    fn new(stale_timeout: Duration, clock: Arc<dyn Clock>) -> Self {
+    fn new(
+        stale_timeout: Duration,
+        clock: Arc<dyn Clock>,
+        tuning: Option<PlayerLiveTuningProvider>,
+    ) -> Self {
         Self {
             state: Mutex::new(LatestObservationState::default()),
             changed: Condvar::new(),
             clock,
             stale_timeout,
+            tuning,
         }
+    }
+
+    /// 当前 stale 超时：live 提供者优先，否则用启动值。
+    fn current_stale_timeout(&self) -> Duration {
+        self.tuning
+            .as_ref()
+            .map(|provider| provider().stale_timeout)
+            .unwrap_or(self.stale_timeout)
     }
 
     fn publish(
@@ -695,7 +722,7 @@ impl LatestObservationStore {
         self.lock()
             .latest
             .as_ref()
-            .map(|latest| latest.reevaluated_at(now, self.stale_timeout))
+            .map(|latest| latest.reevaluated_at(now, self.current_stale_timeout()))
     }
 
     fn wait_after(
@@ -712,7 +739,7 @@ impl LatestObservationStore {
                 .filter(|latest| latest.revision > revision)
             {
                 return ObservationWaitOutcome::Advanced(
-                    latest.reevaluated_at(self.clock.now(), self.stale_timeout),
+                    latest.reevaluated_at(self.clock.now(), self.current_stale_timeout()),
                 );
             }
             if state.closed {
@@ -1255,6 +1282,27 @@ impl PlayerRuntime {
         config: PlayerRuntimeConfig,
         normal_interval_ms: Arc<RwLock<u64>>,
     ) -> Result<Self, PlayerRuntimeStartError> {
+        Self::start_with_live_observation_interval_and_tuning(
+            observation_port,
+            control_port,
+            search_port,
+            config,
+            normal_interval_ms,
+            None,
+        )
+    }
+
+    /// 同 [`Self::start_with_live_observation_interval`]，并可注入稳定判定的运行期参数
+    /// （`timing.playback.uri_stable_samples` / `transport_stable_samples` / `stale_timeout_ms`）。
+    /// 参数在观测循环里每轮读取，不重建播放器、不中断在播歌曲。
+    pub fn start_with_live_observation_interval_and_tuning(
+        observation_port: impl PlayerObservationPort,
+        control_port: impl PlayerControlPort,
+        search_port: impl PlayerSearchPort,
+        config: PlayerRuntimeConfig,
+        normal_interval_ms: Arc<RwLock<u64>>,
+        tuning: Option<PlayerLiveTuningProvider>,
+    ) -> Result<Self, PlayerRuntimeStartError> {
         Self::start_with_clock_and_live_observation_interval(
             observation_port,
             control_port,
@@ -1262,6 +1310,7 @@ impl PlayerRuntime {
             config,
             Arc::new(SystemClock),
             Some(normal_interval_ms),
+            tuning,
         )
     }
 
@@ -1279,6 +1328,7 @@ impl PlayerRuntime {
             config,
             clock,
             None,
+            None,
         )
     }
 
@@ -1289,6 +1339,7 @@ impl PlayerRuntime {
         config: PlayerRuntimeConfig,
         clock: Arc<dyn Clock>,
         normal_interval_ms: Option<Arc<RwLock<u64>>>,
+        tuning: Option<PlayerLiveTuningProvider>,
     ) -> Result<Self, PlayerRuntimeStartError> {
         config
             .validate()
@@ -1304,6 +1355,7 @@ impl PlayerRuntime {
         let latest_observation = Arc::new(LatestObservationStore::new(
             config.observation.stale_timeout,
             clock,
+            tuning.clone(),
         ));
         let control_completions = Arc::new(ControlCompletionWorkers::default());
 
@@ -1319,6 +1371,7 @@ impl PlayerRuntime {
                     worker_latest,
                     config,
                     normal_interval_ms,
+                    tuning.clone(),
                 );
             })
             .map_err(|source| PlayerRuntimeStartError::Spawn {
@@ -1467,6 +1520,7 @@ fn run_observation_lane(
     latest: Arc<LatestObservationStore>,
     config: PlayerRuntimeConfig,
     normal_interval_ms: Option<Arc<RwLock<u64>>>,
+    tuning: Option<PlayerLiveTuningProvider>,
 ) {
     let _close_guard = ObservationCloseGuard(Arc::clone(&latest));
     let mut observer = PlayerObserver::new(SystemClock, config.observation);
@@ -1480,6 +1534,15 @@ fn run_observation_lane(
         }
 
         let now = Instant::now();
+        // 每轮读取 live 稳定判定参数：配置热更新后下个采样周期起生效。
+        if let Some(provider) = tuning.as_ref() {
+            let current = provider();
+            observer.set_live_tuning(
+                current.uri_stable_samples,
+                current.transport_stable_samples,
+                current.stale_timeout,
+            );
+        }
         active_fast_demands.retain(|_, expires_at| *expires_at > now);
         let (normal_interval, fast_interval) =
             observation_intervals(&config, normal_interval_ms.as_ref());
@@ -1833,8 +1896,9 @@ mod tests {
         ControlDispatch, ControlDispatchOutcome, FastObservationCancelStatus,
         FastObservationDemandStatus, ObservationWaitOutcome, PickedCandidate, PlayerControl,
         PlayerControlPort, PlayerLane, PlayerLaneError, PlayerObservationPort,
-        PlayerObservationReadError, PlayerOperationReceiveError, PlayerRuntime,
-        PlayerRuntimeConfig, PlayerRuntimeConfigError, PlayerSearch, PlayerSearchClient,
+        PlayerObservationReadError, PlayerOperationReceiveError, PlayerLiveTuning,
+        PlayerLiveTuningProvider, PlayerRuntime, PlayerRuntimeConfig, PlayerRuntimeConfigError,
+        PlayerSearch, PlayerSearchClient, LatestObservationStore,
         PlayerSearchClientError, PlayerSearchError, PlayerSearchOutcome, PlayerSearchPort,
         SearchCandidate,
     };
@@ -2179,6 +2243,28 @@ mod tests {
                     .expect("test search port release timed out");
             }
         }
+    }
+
+    #[test]
+    fn observation_store_reads_stale_timeout_from_live_provider() {
+        use std::sync::Mutex as StdMutex;
+        let live = Arc::new(StdMutex::new(Duration::from_secs(1)));
+        let provider: PlayerLiveTuningProvider = {
+            let live = Arc::clone(&live);
+            Arc::new(move || PlayerLiveTuning {
+                uri_stable_samples: 2,
+                transport_stable_samples: 2,
+                stale_timeout: *live.lock().unwrap(),
+            })
+        };
+        let store = LatestObservationStore::new(
+            Duration::from_secs(9),
+            Arc::new(miliastra_kernel::clock::SystemClock),
+            Some(provider),
+        );
+        assert_eq!(store.current_stale_timeout(), Duration::from_secs(1));
+        *live.lock().unwrap() = Duration::from_secs(30);
+        assert_eq!(store.current_stale_timeout(), Duration::from_secs(30));
     }
 
     fn config() -> PlayerRuntimeConfig {

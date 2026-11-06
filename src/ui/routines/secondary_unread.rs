@@ -29,7 +29,6 @@ impl ProcessSecondaryUnread {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) enum SecondaryUnreadEffect {
     Message {
         captured_at: Instant,

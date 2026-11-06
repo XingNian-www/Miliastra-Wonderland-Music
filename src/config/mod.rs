@@ -872,10 +872,99 @@ impl AppConfig {
     }
 }
 
+/// 把字符串里的 `/` 与 `\` 统一成给定分隔符。
+///
+/// 只在**路径类字段**上调用（`FieldKind::Path`），不要拿它处理任意字符串。
+/// 保留 Windows 盘符前缀（`C:`）、UNC 前缀（`\\server`）、verbatim 前缀
+/// （`\\?\`）；连续分隔符折叠为一个；尾随分隔符去掉；空串与纯文件名不变。
+/// 纯函数、与平台无关，便于在 Linux 上直接回归 Windows 行为。
+pub(crate) fn normalize_separators_text(value: &str, separator: char) -> String {
+    let is_separator = |character: char| character == '/' || character == '\\';
+    let characters: Vec<char> = value.chars().collect();
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    if characters.len() >= 2 && is_separator(characters[0]) && is_separator(characters[1]) {
+        // UNC（`\\server\share`）或 verbatim（`\\?\C:\...`）：前两个分隔符必须保留。
+        output.push(separator);
+        output.push(separator);
+        index = 2;
+        if index < characters.len() && characters[index] == '?' {
+            output.push('?');
+            index += 1;
+            if index < characters.len() && is_separator(characters[index]) {
+                output.push(separator);
+                index += 1;
+            }
+        }
+    } else if characters.len() >= 2 && characters[1] == ':' && characters[0].is_ascii_alphabetic() {
+        // Windows 盘符前缀：`C:` 不是分隔符，不能把盘符后的相对路径当绝对路径。
+        output.push(characters[0]);
+        output.push(':');
+        index = 2;
+        if index < characters.len() && is_separator(characters[index]) {
+            output.push(separator);
+            index += 1;
+        }
+    } else if !characters.is_empty() && is_separator(characters[0]) {
+        // 根路径（`/foo` 或 `\foo`）。
+        output.push(separator);
+        index = 1;
+    }
+    let mut pending_separator = false;
+    for character in &characters[index..] {
+        if is_separator(*character) {
+            pending_separator = !output.is_empty();
+        } else {
+            if pending_separator {
+                output.push(separator);
+                pending_separator = false;
+            }
+            output.push(*character);
+        }
+    }
+    output
+}
+
+/// 运行期路径规范化：Windows 上把 `/` 与 `\` 统一成 `\`；其他平台原样返回
+/// （Unix 的反斜杠是合法文件名字符，不能改写）。保留盘符与绝对路径语义。
+pub(crate) fn normalize_native_path(path: &Path) -> PathBuf {
+    if path.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(normalize_separators_text(
+            &path.to_string_lossy(),
+            std::path::MAIN_SEPARATOR,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+/// 字符串形态的 [`normalize_native_path`]（Web 显示/保存复用同一实现）。
+pub(crate) fn normalize_native_path_string(value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        normalize_native_path(Path::new(value))
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 fn resolve_path(root: &Path, path: &mut PathBuf) {
-    if !path.as_os_str().is_empty() && path.is_relative() {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if path.is_relative() {
         *path = root.join(&*path);
     }
+    // `PathBuf::join` 只是在根后原样拼接相对组件：相对值里若带 `/`，Windows 上
+    // 会得到 `C:\root\deps/assets/x` 这种混合分隔符。这里统一成平台原生形式。
+    *path = normalize_native_path(path);
 }
 
 fn resolve_path_with_default(root: &Path, path: &mut PathBuf, default: &str) {
@@ -2565,6 +2654,11 @@ stale_timeout_ms: 7500
                 "路径未基于 EXE 根目录: {}",
                 path.display()
             );
+            let rendered = path.to_string_lossy();
+            assert!(
+                !rendered.contains(r"\/") && !rendered.contains(r"/\"),
+                "解析后的路径出现混合分隔符: {rendered}"
+            );
         }
         assert_eq!(
             config.startup.exe_path,
@@ -2573,9 +2667,54 @@ stale_timeout_ms: 7500
         let workflow = &config.custom_workflows.workflows[0];
         assert_eq!(
             workflow.steps[0].template.as_deref(),
-            Some(r"C:\发布目录\inline/button.png")
+            Some(r"C:\发布目录\inline\button.png")
         );
         assert_eq!(workflow.steps[1].template.as_deref(), Some("按钮"));
+    }
+
+    /// 分隔符规范化是纯函数：Linux 上也要能回归 Windows 路径的最终形态。
+    #[test]
+    fn normalize_separators_text_unifies_windows_paths() {
+        let cases = [
+            (
+                r"C:\Users\玩家甲\Desktop\deps/assets/idioms.txt",
+                r"C:\Users\玩家甲\Desktop\deps\assets\idioms.txt",
+            ),
+            ("models/det.xml", r"models\det.xml"),
+            (r"\\server\share/模板.png", r"\\server\share\模板.png"),
+            (r"\\?\C:\a/b\c", r"\\?\C:\a\b\c"),
+            (r"C:\a\\b", r"C:\a\b"),
+            (r"C:/a/b/", r"C:\a\b"),
+            (r"C:foo/bar", r"C:foo\bar"),
+            ("plain.txt", "plain.txt"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_separators_text(input, '\\'),
+                expected,
+                "输入 {input:?}"
+            );
+        }
+        // 正斜杠为目标时，Windows 反斜杠同样被统一（同一纯函数的对称用法）。
+        assert_eq!(
+            normalize_separators_text(r"C:\Users\玩家甲\deps\assets", '/'),
+            "C:/Users/玩家甲/deps/assets"
+        );
+        // 幂等：规范化两次结果一致。
+        let once = normalize_separators_text("a//b\\c", '\\');
+        assert_eq!(normalize_separators_text(&once, '\\'), once);
+    }
+
+    #[test]
+    fn normalize_native_path_is_idempotent_on_this_platform() {
+        for raw in ["deps/assets/a.txt", "/tmp/x/y", "relative/name"] {
+            let once = normalize_native_path(Path::new(raw));
+            let twice = normalize_native_path(&once);
+            assert_eq!(once, twice, "输入 {raw:?}");
+        }
+        assert_eq!(normalize_native_path(Path::new("")), PathBuf::new());
+        assert_eq!(normalize_native_path_string(""), "");
     }
 
     /// 启动流程每个阶段的**上限**都不超过一分钟（用户明确要求）。

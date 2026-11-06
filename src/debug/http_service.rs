@@ -1,7 +1,6 @@
 //! HTTP sandbox sessions use simulated fixtures or the injected live UI runtime.
 use crate::debug_sandbox::{
-    AtomicCommand, Capability, CapabilityPolicy, PluginApiVersion, SandboxFixture, SandboxLimits,
-    SandboxRun, SandboxTask,
+    AtomicCommand, SandboxFixture, SandboxLimits, SandboxRun, SandboxTask,
 };
 use crate::debug_sandbox_journal::SandboxJournal;
 use crate::debug_sandbox_runner::{
@@ -562,7 +561,6 @@ impl DebugHttpService {
         // 之前这里直接 start_snapshot：坐标上限 100000、文本 16KiB、等待 30s、
         // |scroll|>10000、mouse button 白名单、空 key/text、startup kind 白名单、
         // playback_set_volume 的 0..=100 全部不生效——校验函数写了但没接线。
-        // plugin_dispatch 的注释声称「execute_direct 内部会走 validate」也与事实不符。
         task.validate(SandboxLimits::default())
             .map_err(|reason| error(&format!("命令参数不合法: {reason}")))?;
         let run_id = {
@@ -592,45 +590,6 @@ impl DebugHttpService {
     }
 
     pub fn start(&self, r: HttpDebugRunRequest) -> Result<SandboxRun, HttpCommandError> {
-        match (&r.plugin_id, &r.manifest) {
-            (Some(plugin_id), Some(manifest)) => {
-                if plugin_id != &manifest.plugin_id {
-                    return Err(error("pluginId与manifest.pluginId不一致"));
-                }
-                let policy = CapabilityPolicy {
-                    allowed: [
-                        Capability::Observe,
-                        Capability::Input,
-                        Capability::Task,
-                        Capability::Assert,
-                    ]
-                    .into_iter()
-                    .collect(),
-                    debug_mode: crate::debug_mode::enabled(),
-                };
-                manifest
-                    .authorize(Capability::Task, PluginApiVersion::new(1, 0), &policy)
-                    .map_err(error)?;
-                if !r.assertions.is_empty() {
-                    manifest
-                        .authorize(Capability::Assert, PluginApiVersion::new(1, 0), &policy)
-                        .map_err(error)?;
-                }
-                if r.mode == "readOnly" {
-                    manifest
-                        .authorize(Capability::Observe, PluginApiVersion::new(1, 0), &policy)
-                        .map_err(error)?;
-                }
-                if r.mode == "live" {
-                    manifest
-                        .authorize(Capability::Input, PluginApiVersion::new(1, 0), &policy)
-                        .map_err(error)?;
-                }
-            }
-            (Some(_), None) => return Err(error("pluginId请求必须包含manifest")),
-            (None, Some(_)) => return Err(error("manifest必须与pluginId一起提供")),
-            (None, None) => {}
-        }
         let task = self
             .store
             .task(&r.task_id)
@@ -1417,8 +1376,6 @@ mod tests {
                 height: 2,
                 rgba: [1, 2, 3, 255],
             }),
-            plugin_id: None,
-            manifest: None,
         }
     }
 
@@ -1455,8 +1412,6 @@ mod tests {
                 expected_version: Some(1),
                 assertions: vec![],
                 fixture: None,
-                plugin_id: None,
-                manifest: None,
             })
             .unwrap();
         let done = service
@@ -1545,8 +1500,6 @@ mod tests {
                 expected_version: Some(1),
                 assertions: vec![],
                 fixture: None,
-                plugin_id: None,
-                manifest: None,
             })
             .unwrap();
         service.cancel(&run.run_id).unwrap();
@@ -1555,48 +1508,6 @@ mod tests {
         assert!(done.results.is_empty());
         assert!(service.evidence(&run.run_id, None).unwrap().is_empty());
         assert!(!runtime.shutdown().unwrap().timed_out());
-    }
-
-    #[test]
-    fn plugin_run_with_assertions_requires_assert_capability() {
-        use crate::debug_sandbox::{PluginApiVersion, PluginManifest};
-        let service = DebugHttpService::default();
-        service.save(task()).unwrap();
-        let mut req = request();
-        req.plugin_id = Some("plugin".into());
-        req.manifest = Some(PluginManifest {
-            manifest_version: 1,
-            plugin_id: "plugin".into(),
-            name: "Plugin".into(),
-            version: "1".into(),
-            api: PluginApiVersion::new(1, 0),
-            capabilities: [Capability::Task].into_iter().collect(),
-        });
-        req.assertions = vec![StepAssertion {
-            index: 0,
-            assertion: crate::debug_sandbox_runner::SandboxAssertion::Dimensions {
-                width: 2,
-                height: 2,
-            },
-        }];
-        assert!(
-            service
-                .start(req.clone())
-                .unwrap_err()
-                .to_string()
-                .contains("Assert")
-        );
-        assert!(service.runs().unwrap().is_empty());
-        req.manifest
-            .as_mut()
-            .unwrap()
-            .capabilities
-            .insert(Capability::Assert);
-        let run = service.start(req).unwrap();
-        assert_eq!(
-            service.advance(&run.run_id, true).unwrap().status,
-            SandboxStatus::Passed
-        );
     }
 
     #[test]

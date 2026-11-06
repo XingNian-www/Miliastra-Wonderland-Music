@@ -954,6 +954,13 @@ const LOADING_DARK_RATIO_MIN: f32 = 0.6223;
 /// ⇒ 取 (43.31 + 99.77) / 2 = **71.54%**。
 const LOADING_WHITE_RATIO_MIN: f32 = 0.7154;
 
+/// 加载界面的**色彩一致度下限**：主色桶样本占比。
+///
+/// 实测：黑底加载 97.67~98.19%、白底加载 99.69~100%，
+/// 而暗色大厅虽然暗像素占比可达 75.23%，颜色仍分散（主色桶仅 38.56%）。
+/// 要求一致性同时达标，避免把“暗场景”误判成加载界面。
+const LOADING_COLOR_CONSISTENCY_MIN: f32 = 0.90;
+
 /// 世界判据（提瓦特 vs 千星）统计的**青色条纹带**区域。
 ///
 /// 千星在大厅左上角派蒙头像周围多了一整套装饰（半透明蓝色圆盘、青色条纹带、
@@ -1249,16 +1256,20 @@ impl RgbSampler<'_> {
     }
 }
 
-/// 整屏统计，返回 (暗像素占比, 近白像素占比)。
+/// 整屏统计，返回 (暗像素占比, 近白像素占比, 主色桶占比)。
 ///
-/// 加载界面的两种外观都是**整屏极端色调**（黑底 98%+ 暗 / 白底 99%+ 白），
-/// 与任何游戏画面都不重叠，所以这个量与位置、缩放都无关，非常稳。
-fn screen_tone(image: &DynamicImage) -> (f32, f32) {
+/// 主色桶占比衡量**色彩一致性**：把 RGB 各通道量化到 16 级后取最大桶的样本占比。
+/// 加载界面几乎整屏同一色调（黑底 ≈97.7~98.1%、白底 ≈99.7%），
+/// 而暗色大厅虽然暗像素可达 75%，颜色仍分散（主色桶仅 ≈38.6%）。
+/// 所以“暗/白占比”必须与“主色桶占比”同时达标，才能判加载界面。
+fn screen_tone(image: &DynamicImage) -> (f32, f32, f32) {
     let sampler = RgbSampler::new(image);
     let (width, height) = sampler.dimensions();
     let mut total = 0_u32;
     let mut dark = 0_u32;
     let mut white = 0_u32;
+    let mut buckets = [0_u32; 4096];
+    let mut dominant = 0_u32;
     let mut y = 0;
     while y < height {
         let mut x = 0;
@@ -1273,15 +1284,24 @@ fn screen_tone(image: &DynamicImage) -> (f32, f32) {
             if pixel[0].min(pixel[1]).min(pixel[2]) >= SCREEN_TONE_WHITE_MIN {
                 white += 1;
             }
+            let bucket = (usize::from(pixel[0] >> 4) << 8)
+                | (usize::from(pixel[1] >> 4) << 4)
+                | usize::from(pixel[2] >> 4);
+            buckets[bucket] += 1;
+            dominant = dominant.max(buckets[bucket]);
             total += 1;
             x += SCREEN_TONE_SAMPLE_STEP;
         }
         y += SCREEN_TONE_SAMPLE_STEP;
     }
     if total == 0 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, 0.0);
     }
-    (dark as f32 / total as f32, white as f32 / total as f32)
+    (
+        dark as f32 / total as f32,
+        white as f32 / total as f32,
+        dominant as f32 / total as f32,
+    )
 }
 
 /// 判断画面是否为加载界面；是则返回证据里的规则名（区分黑底/白底两种）。
@@ -1292,7 +1312,12 @@ fn loading_rule(image: &DynamicImage) -> Option<&'static str> {
     if width < FULL_FRAME_MIN_WIDTH || height < FULL_FRAME_MIN_HEIGHT {
         return None;
     }
-    let (dark_ratio, white_ratio) = screen_tone(image);
+    let (dark_ratio, white_ratio, dominant_ratio) = screen_tone(image);
+    // 色彩一致性是加载界面的强特征：加载画面几乎整屏一色。
+    // 暗色大厅也可能有 75% 暗像素，但颜色分散，不能仅凭暗占比判加载。
+    if dominant_ratio < LOADING_COLOR_CONSISTENCY_MIN {
+        return None;
+    }
     if dark_ratio >= LOADING_DARK_RATIO_MIN {
         return Some("loading_dark_screen");
     }
@@ -2293,6 +2318,7 @@ mod tests {
 
         // 黑底徽记型（传送等短加载）：实测暗像素占比 98.46~98.53%
         let mut dark_floor = f32::MAX;
+        let mut dark_consistency_floor = f32::MAX;
         for name in [
             "loading-screens/loading-dark-A.jpg",
             "loading-screens/loading-dark-B.jpg",
@@ -2302,7 +2328,7 @@ mod tests {
             "loading-screens/loading-dark-teleport.jpg",
         ] {
             let path = format!("technical-docs/ui-state-evidence/{name}");
-            let (kind, rule, (dark, _white)) = classify_with_rule(&path);
+            let (kind, rule, (dark, _white, dominant)) = classify_with_rule(&path);
             assert_eq!(
                 kind,
                 RuntimeUiStateKind::Loading,
@@ -2310,10 +2336,12 @@ mod tests {
             );
             assert_eq!(rule, "loading_dark_screen", "{path} 应走黑底那条规则");
             dark_floor = dark_floor.min(dark);
+            dark_consistency_floor = dark_consistency_floor.min(dominant);
         }
 
         // 白底元素型（冷启动进世界）：实测近白占比 99.77~100%
         let mut white_floor = f32::MAX;
+        let mut white_consistency_floor = f32::MAX;
         for name in [
             "blank-frame.jpg",
             "loading-screen.jpg",
@@ -2321,15 +2349,17 @@ mod tests {
             "cold-start/stage-1.jpg",
         ] {
             let path = format!("technical-docs/ui-state-evidence/{name}");
-            let (kind, rule, (_dark, white)) = classify_with_rule(&path);
+            let (kind, rule, (_dark, white, dominant)) = classify_with_rule(&path);
             assert_eq!(kind, RuntimeUiStateKind::Loading, "{path} 是白底加载界面");
             assert_eq!(rule, "loading_white_screen", "{path} 应走白底那条规则");
             white_floor = white_floor.min(white);
+            white_consistency_floor = white_consistency_floor.min(dominant);
         }
 
-        // 分离度自证：真实画面里暗像素占比最高、近白占比最高分别是多少
+        // 分离度自证：真实画面里暗像素占比最高、近白占比最高、色彩一致度最高分别是多少
         let mut dark_ceiling = 0.0_f32;
         let mut white_ceiling = 0.0_f32;
+        let mut consistency_ceiling = 0.0_f32;
         for name in [
             "loading-screens/teyvat-map-with-wp-panel.jpg",
             "loading-screens/after-teleport-new-scene.jpg",
@@ -2362,9 +2392,10 @@ mod tests {
                 format!("dist/sandbox-run/{name}")
             };
             let image = image::open(&path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
-            let (dark, white) = screen_tone(&image);
+            let (dark, white, dominant) = screen_tone(&image);
             dark_ceiling = dark_ceiling.max(dark);
             white_ceiling = white_ceiling.max(white);
+            consistency_ceiling = consistency_ceiling.max(dominant);
         }
         assert!(
             dark_floor > dark_ceiling,
@@ -2373,6 +2404,55 @@ mod tests {
         assert!(
             white_floor > white_ceiling,
             "白底加载与真实画面必须不重叠：加载最低 {white_floor} vs 真实最高 {white_ceiling}"
+        );
+        assert!(
+            dark_consistency_floor >= LOADING_COLOR_CONSISTENCY_MIN
+                && white_consistency_floor >= LOADING_COLOR_CONSISTENCY_MIN,
+            "加载界面色彩必须高度一致：黑底最低 {dark_consistency_floor}、白底最低 \
+             {white_consistency_floor}，阈值 {LOADING_COLOR_CONSISTENCY_MIN}"
+        );
+        assert!(
+            consistency_ceiling < LOADING_COLOR_CONSISTENCY_MIN,
+            "真实画面色彩一致度最高 {consistency_ceiling} 必须低于加载阈值 \
+             {LOADING_COLOR_CONSISTENCY_MIN}"
+        );
+    }
+
+    /// 暗色但色彩分散的真实场景（如夜间大厅）：不能仅凭“暗”判成加载界面。
+    #[test]
+    fn dark_but_colorful_scene_is_not_loading() {
+        let palette = [
+            [220, 40, 40],
+            [40, 200, 80],
+            [30, 90, 220],
+            [230, 200, 40],
+            [200, 40, 200],
+            [40, 200, 200],
+            [240, 240, 240],
+            [120, 120, 120],
+        ];
+        let image = image::RgbImage::from_fn(1920, 1080, |x, y| {
+            let cell = (x / 48 + y / 48) as usize;
+            if cell % 10 < 3 {
+                image::Rgb(palette[cell % palette.len()])
+            } else {
+                image::Rgb([16, 14, 26])
+            }
+        });
+        let image = image::DynamicImage::ImageRgb8(image);
+        let (dark, _white, dominant) = screen_tone(&image);
+        assert!(
+            dark >= LOADING_DARK_RATIO_MIN,
+            "测试画面前提：暗像素占比 {dark} 应达到加载暗阈值"
+        );
+        assert!(
+            dominant < LOADING_COLOR_CONSISTENCY_MIN,
+            "测试画面前提：主色桶占比 {dominant} 应低于加载一致度阈值"
+        );
+        assert_eq!(
+            loading_rule(&image),
+            None,
+            "暗色但色彩分散的场景不是加载界面"
         );
     }
 

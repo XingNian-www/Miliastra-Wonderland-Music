@@ -796,8 +796,14 @@ mod tests {
         );
         // 一级帧用**真实千星大厅**：合成黑底帧会被状态机的 `loading` 判据吞掉
         // （`src/ui/state.rs` 第 55 节），代表不了真实执行路径。
-        let primary = image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg")
+        let mut primary = image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg")
             .expect("打开真实大厅帧失败");
+        // 夹具是有损 JPEG，底栏没有纯白；吸附成纯白以匹配线上无损抓图的前提。
+        crate::ui::state::snap_near_white_to_pure_white(
+            &mut primary,
+            config.screen.hall_bar_rect.into(),
+            225,
+        );
         assert_eq!(
             (primary.width(), primary.height()),
             (config.screen.expected_width, config.screen.expected_height),

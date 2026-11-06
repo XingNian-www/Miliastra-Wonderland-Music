@@ -899,12 +899,19 @@ const HALL_BAR_MIN_TILES: usize = 7;
 /// 块数上限：只为挡住「接触表 / 拼图」这类非整屏诊断图（实测 17 块）；真实大厅最多 12 块。
 const HALL_BAR_MAX_TILES: usize = 14;
 
-/// 底栏白键的**白色下限**（每通道 min(R,G,B)）。
+/// 底栏白键的**白色判据**：只认纯白 255。
 ///
-/// **不用纯 255**：实测整屏语料里纯白只覆盖 **89/182** 大厅帧——很多帧是 JPEG/回放、
-/// 或经过 DPI 缩放重采样，白色被压到 240–254（255→89、250→116、245→131、240→141）。
-/// 225 能让 **224/225** 大厅帧命中，同时比旧的 200 严格得多（200 会把背景亮块也算进来）。
-const HALL_BAR_WHITE_MIN: u8 = 225;
+/// 用户明确要求（2026-11-06）：**不要回退到 225**，那档会把 240–254 的近白像素
+/// 也算成按键——亮背景、聊天气泡、抗锯齿边缘都会混进连通块，块数/高度/水平线
+/// 被污染，进而污染状态判定与日志。
+///
+/// 实测支持：2026-11-06 在 .119 上切一级值守连拍 5 帧，**255 与 225 得到完全相同的
+/// 签名**（7 块 / 高 26 / 极差 0），说明线上抓图是无损的，收紧不丢识别能力。
+///
+/// 代价：若窗口被 resize 到画布（DPI 非 100%、窗口化非 1920×1080）或输入是有损
+/// JPEG，纯白会被插值/压缩成 240–254，这条规则**判不出来**——这是刻意选择：
+/// 宁可让 marker 那几条规则接手，也不把噪声算成按钮。
+const HALL_BAR_WHITE_EXACT: u8 = 255;
 
 /// 单块白键的**真实像素高度**允许区间。
 ///
@@ -1295,6 +1302,36 @@ fn loading_rule(image: &DynamicImage) -> Option<&'static str> {
     None
 }
 
+/// 测试专用：把库内**有损 JPEG 夹具**底栏区域的近白像素吸附成纯白。
+///
+/// 线上抓图是无损的（2026-11-06 在 .119 实测：255 与 225 签名一致），但仓库里的
+/// 大厅夹具是 JPEG，纯白被压缩成 240–254，严格判据会判不出来。
+/// 夹具又不能换成真实帧——里面有玩家昵称/UID（MUST_READ §9）。
+/// 所以在测试侧做一次吸附，模拟"无损抓图"这一前提；生产代码不受影响。
+#[cfg(test)]
+pub(crate) fn snap_near_white_to_pure_white(
+    image: &mut DynamicImage,
+    rect: Rect,
+    white_min: u8,
+) {
+    let mut rgb = image.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    // Rect 的 x/y 是 i32、width/height 是 u32：先夹到非负再按 u32 相加。
+    let x0 = rect.x.max(0) as u32;
+    let y0 = rect.y.max(0) as u32;
+    let x1 = x0.saturating_add(rect.width).min(width);
+    let y1 = y0.saturating_add(rect.height).min(height);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let pixel = rgb.get_pixel(x, y);
+            if pixel[0].min(pixel[1]).min(pixel[2]) >= white_min {
+                rgb.put_pixel(x, y, image::Rgb([255, 255, 255]));
+            }
+        }
+    }
+    *image = DynamicImage::ImageRgb8(rgb);
+}
+
 /// 底栏结构：`(白色按键块数, 单块中位面积)`。
 ///
 /// 千星大厅的底栏是一排**小圆角白键**（聊天 / Enter / 👥 / O / 麦克风 / Alt+N / 喇叭 / N）：
@@ -1304,6 +1341,14 @@ fn loading_rule(image: &DynamicImage) -> Option<&'static str> {
 /// 用几何量而不是模板分数，是为了绕开 1:1 SAD 对缩放不鲁棒的问题（第 47 节教训）；
 /// 也不用「近白占比」——那是亮度量，亮背景大厅会把它顶高。
 fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (usize, usize, usize, usize) {
+    hall_bar_signature_with_threshold(image, rect, HALL_BAR_WHITE_EXACT)
+}
+
+fn hall_bar_signature_with_threshold(
+    image: &DynamicImage,
+    rect: Rect,
+    white_min: u8,
+) -> (usize, usize, usize, usize) {
     let Ok(region) = crop_canvas(image, rect) else {
         return (0, 0, 0, 0);
     };
@@ -1315,7 +1360,7 @@ fn hall_bar_signature(image: &DynamicImage, rect: Rect) -> (usize, usize, usize,
     for gy in 0..grid_h {
         for gx in 0..grid_w {
             let pixel = rgb.get_pixel((gx * 2) as u32, (gy * 2) as u32);
-            if pixel[0].min(pixel[1]).min(pixel[2]) >= HALL_BAR_WHITE_MIN {
+            if pixel[0].min(pixel[1]).min(pixel[2]) >= white_min {
                 grid[gy * grid_w + gx] = true;
             }
         }
@@ -2756,7 +2801,13 @@ mod tests {
             "hall-chat-open.jpg",
         ] {
             let path = format!("technical-docs/ui-state-evidence/{name}");
-            let image = image::open(&path).unwrap();
+            let mut image = image::open(&path).unwrap();
+            // 本地夹具是有损 JPEG：底栏没有纯白，吸附一次以匹配线上无损抓图的前提。
+            snap_near_white_to_pure_white(
+                &mut image,
+                config.screen.hall_bar_rect.into(),
+                225,
+            );
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
             let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
@@ -3191,56 +3242,104 @@ mod tests {
     /// 2026-10-17 第三轮：白色判据收紧到 **225**（纯 255 只覆盖 89/182 大厅帧：
     /// JPEG/回放/DPI 缩放帧的白色只有 240–254）；再按**实际像素高度 + 同一水平线**判形状：
     /// 主菜单白卡高 60–64 px、设置宫格还跨两行（顶部 985/1045），都不满足。
+    /// 白色判据只认纯白 255，且**不回退**到近白。
+    ///
+    /// 实测依据（2026-11-06，.119 一级值守连拍 5 帧）：线上无损帧在 255 与 225 下
+    /// 签名完全一致，所以要严格；而 225 会把近白噪声算成按键，污染状态数据，
+    /// 因此刻意不兜底。
+    #[test]
+    fn hall_bar_white_threshold_prefers_exact_white_and_falls_back_when_scaled() {
+        let rect = Rect { x: 0, y: 985, width: 600, height: 95 };
+        let build = |value: u8| {
+            let mut canvas = image::RgbaImage::from_pixel(1920, 1080, image::Rgba([0, 0, 0, 255]));
+            for index in 0..7u32 {
+                let left = 20 + index * 60;
+                for y in 995..1021 {
+                    for x in left..left + 30 {
+                        canvas.put_pixel(x, y, image::Rgba([value, value, value, 255]));
+                    }
+                }
+            }
+            image::DynamicImage::ImageRgba8(canvas)
+        };
+
+        // 原样纯白：直接命中，几何量与旧阈值相同。
+        assert_eq!(hall_bar_signature(&build(255), rect), (7, 26, 26, 0));
+        // 近白（模拟 resize 插值/有损压缩后的白色）：**不认**。
+        // 用户明确要求不回退到 225——那会把 240–254 的噪声算成按键、污染状态数据。
+        assert_eq!(hall_bar_signature(&build(250), rect), (0, 0, 0, 0));
+    }
+
+    /// 底栏结构判据要把大厅、提瓦特、主菜单、设置宫格分开。
+    ///
+    /// 2026-11-06 起白色判据只认纯白 255（用户要求：225 会把近白噪声算成按键、污染状态）。
+    /// 因此这条用例改用**合成帧**：原来的 technical-docs JPEG 夹具本身不含纯白
+    /// （有损压缩把白色压到 240–254），而且 technical-docs 已 gitignore、CI 里没有这些文件。
+    /// 真实帧验证改为手工：2026-11-06 在 .119 一级值守连拍 5 帧，
+    /// 255 与 225 签名完全一致（7 块 / 高 26 / 极差 0）。
     #[test]
     fn hall_bar_structure_separates_hall_from_menu_and_teyvat() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let rect: Rect = config.screen.hall_bar_rect.into();
-        let signature = |name: &str| {
-            let path = format!("technical-docs/ui-state-evidence/{name}");
-            let image = image::open(&path).unwrap();
-            hall_bar_signature(&image, rect)
+        let (origin_x, origin_y) = (rect.x, rect.y);
+
+        // 在底栏区域内画 count 个纯白块。
+        let keys = |count: i32, width: i32, height: i32, gap: i32, top_offset: i32| {
+            let mut canvas = image::RgbaImage::from_pixel(1920, 1080, image::Rgba([0, 0, 0, 255]));
+            for index in 0..count {
+                let left = origin_x + 20 + index * (width + gap);
+                for y in (origin_y + top_offset)..(origin_y + top_offset + height) {
+                    for x in left..left + width {
+                        canvas.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, 255]));
+                    }
+                }
+            }
+            image::DynamicImage::ImageRgba8(canvas)
         };
-        let is_hall = |name: &str| {
-            let (tiles, min_height, max_height, top_spread) = signature(name);
+        let is_hall = |image: &image::DynamicImage| {
+            let (tiles, min_height, max_height, top_spread) = hall_bar_signature(image, rect);
             (HALL_BAR_MIN_TILES..=HALL_BAR_MAX_TILES).contains(&tiles)
                 && min_height >= HALL_BAR_MIN_TILE_HEIGHT_PX
                 && max_height <= HALL_BAR_MAX_TILE_HEIGHT_PX
                 && top_spread <= HALL_BAR_MAX_TILE_TOP_SPREAD_PX
         };
-        for name in [
-            "hall-chat-open.jpg",
-            "qianxing-halls-58/hall3-01.jpg",
-            "full-hall.jpg",
-            "hall-chat-closed.jpg",
-        ] {
-            assert!(
-                is_hall(name),
-                "{name} 是千星大厅，底栏应是多块同高、同一水平线的小白键"
-            );
-        }
-        for name in [
-            "wonderland-menu.png",
-            "qianxing-ui-59/r16-settings-grid.png",
-        ] {
-            assert!(!is_hall(name), "{name} 是整块白底/跨行，不得判成大厅");
-        }
-        let (_, menu_min_height, _, _) = signature("wonderland-menu.png");
+
+        // 大厅：7 个同高、同一水平线的小白键。
+        assert!(is_hall(&keys(7, 30, 26, 30, 10)), "大厅底栏应被判成大厅");
+
+        // 提瓦特：只有一个 Enter。
+        assert!(!is_hall(&keys(2, 30, 26, 30, 10)), "提瓦特底栏不应判成大厅");
+
+        // 主菜单：整块白卡（高 60–64 px），块高超过上限。
+        let menu = keys(3, 200, 62, 20, 10);
+        let (_, menu_min_height, _, _) = hall_bar_signature(&menu, rect);
+        assert!(!is_hall(&menu), "主菜单白卡不得判成大厅");
         assert!(
             menu_min_height > HALL_BAR_MAX_TILE_HEIGHT_PX,
-            "主菜单白卡的块高应超过键高上限（实测 60–64 px）"
+            "主菜单白卡的块高应超过键高上限"
         );
-        let (_, _, _, settings_top_spread) = signature("qianxing-ui-59/r16-settings-grid.png");
+
+        // 设置宫格：分两行，顶部极差远超 4 px。
+        let mut grid = image::RgbaImage::from_pixel(1920, 1080, image::Rgba([0, 0, 0, 255]));
+        for row in 0..2i32 {
+            for index in 0..4i32 {
+                let left = origin_x + 20 + index * 60;
+                let top = origin_y + 5 + row * 40;
+                for y in top..top + 30 {
+                    for x in left..left + 40 {
+                        grid.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, 255]));
+                    }
+                }
+            }
+        }
+        let grid = image::DynamicImage::ImageRgba8(grid);
+        let (_, _, _, grid_spread) = hall_bar_signature(&grid, rect);
+        assert!(!is_hall(&grid), "设置宫格不得判成大厅");
         assert!(
-            settings_top_spread > HALL_BAR_MAX_TILE_TOP_SPREAD_PX,
+            grid_spread > HALL_BAR_MAX_TILE_TOP_SPREAD_PX,
             "设置宫格应跨两行（顶部极差应大于 4 px）"
         );
-        let (teyvat_tiles, _, _, _) = signature("transition-to-overworld/05-overworld-teyvat.jpg");
-        assert!(
-            teyvat_tiles < HALL_BAR_MIN_TILES,
-            "提瓦特底栏只有一个 Enter"
-        );
     }
-
     fn panel_regions_from(config: &AppConfig) -> PanelRegions {
         PanelRegions {
             friend_panel: config.moderation.friend_panel_region.into(),

@@ -1,9 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::sync::{Arc, RwLock};
 
-#[cfg(test)]
-use crate::text::split_numbered_chat_message;
-use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
+use crate::text::{MAX_CHAT_WIDTH, char_width, display_width, split_numbered_chat_message};
 use crate::ui::routines::{
     HallBatchStatus, HallBatchUi, SendHallBatch, UiResidencyOutcome, UiResidencyTarget,
 };
@@ -338,6 +336,33 @@ impl ChatOutput {
             .into_result(total)
     }
 
+    /// 自动换行发送（一级大厅）。
+    ///
+    /// 只用于「一次性长文本」（玩法/延迟回复）：超过聊天单条宽度时按标点优先切段，
+    /// 再用批量发送逐段发出；≤80 仍走原来的单条路径，内容与换行都不变。
+    /// 段间间隔由调用方的批量节奏决定，不在这里硬编码。
+    pub fn send_wrapped(&self, message: &str, delay_ms: u64) -> Result<()> {
+        let segments = wrap_chat_message(message);
+        if segments.len() <= 1 {
+            return self.send(message);
+        }
+        // 捕获槽记录「实际发出的每一段」由 send_primary_batch 统一完成。
+        let refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        self.send_primary_batch(&refs, delay_ms, false)
+    }
+
+    /// 自动换行发送（当前聊天：二级大厅 / 好友会话）。
+    ///
+    /// 语义与 [`Self::send_wrapped`] 相同，走 `send_current_chat_batch`。
+    pub fn send_current_chat_wrapped(&self, message: &str, delay_ms: u64) -> Result<()> {
+        let segments = wrap_chat_message(message);
+        if segments.len() <= 1 {
+            return self.send_current_chat(message);
+        }
+        let refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        self.send_current_chat_batch(&refs, delay_ms)
+    }
+
     pub fn send_batch_for_command(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
         self.send_primary_batch(messages, delay_ms, true)
     }
@@ -375,6 +400,11 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
+        // 与单条 `send` 一致：捕获=实际发出的每一段（send_batch_for_command /
+        // send_wrapped 的一级大厅路径都经过这里）。
+        for message in &messages {
+            self.record_captured(message);
+        }
         let total = messages.len();
         self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms, restore_after_task)
             .into_result(total)
@@ -514,6 +544,19 @@ impl ChatOutput {
                 }
             },
         }
+    }
+}
+
+/// 按显示宽度把一条聊天文本切成可发送的段。
+///
+/// 未超宽时返回**原样一条**（保留内部换行，调用方走单条发送路径）；
+/// 超宽时用 `split_numbered_chat_message("", …)`：80 宽、标点优先断行、
+/// 不劈开全角字符、不加「1/2：」编号。
+fn wrap_chat_message(message: &str) -> Vec<String> {
+    if display_width(message) <= MAX_CHAT_WIDTH {
+        vec![message.to_string()]
+    } else {
+        split_numbered_chat_message("", message)
     }
 }
 
@@ -723,6 +766,31 @@ mod tests {
                     index + 1,
                     total
                 )))
+        );
+    }
+
+    /// 自动换行入口的分段决策：超宽才切段（⇒ 批量 API），短文本原样一条（⇒ 单条 API）。
+    #[test]
+    fn wrap_chat_message_splits_only_over_width_text() {
+        let long = "数字炸弹很好玩。".repeat(30);
+        assert!(display_width(&long) > MAX_CHAT_WIDTH);
+        let segments = wrap_chat_message(&long);
+        assert!(segments.len() > 1, "超宽文本必须切成多段（⇒ 走批量发送）");
+        for segment in &segments {
+            assert!(
+                display_width(segment) <= MAX_CHAT_WIDTH,
+                "每段都不能超过 80：{segment}"
+            );
+            assert!(!segment.starts_with("1/"), "玩法文本不允许加编号：{segment}");
+        }
+        assert_eq!(segments.join(""), long, "按原顺序拼接必须还原原文");
+
+        let short = "第一行\n第二行";
+        assert!(display_width(short) <= MAX_CHAT_WIDTH);
+        assert_eq!(
+            wrap_chat_message(short),
+            vec![short.to_string()],
+            "短文本必须原样一条（⇒ 走单条发送），连内部换行都不改"
         );
     }
 

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 mod application;
 mod controller;
 mod dedup;
-mod format;
+pub(crate) mod format;
 mod matcher;
 mod queue;
 mod state;

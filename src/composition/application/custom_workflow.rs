@@ -428,7 +428,17 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
                     .live_configs
                     .identity
                     .replace_display_names(&message);
-                self.ui.chat_output.send_current_chat(&message)
+                // 与 reply 的 prose 路径一致：超宽自动换行，短文本仍是单条。
+                let delay_ms = self
+                    .lifecycle
+                    .live_configs
+                    .snapshot()
+                    .timing
+                    .command
+                    .help_batch_ms;
+                self.ui
+                    .chat_output
+                    .send_current_chat_wrapped(&message, delay_ms)
             }
             WorkflowCapability::SendFriendMessage { target, message } => {
                 if self.send_friend_message(&target, &message)? {

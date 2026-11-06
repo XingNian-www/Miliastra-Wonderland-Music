@@ -89,9 +89,29 @@ impl ApplicationRuntime {
                 self.lifecycle.running.clone(),
             );
         }
+        // 正文超宽时按显示宽度切段（复用 task-37 的 wrapped 入口）；
+        // 必须单行的系统通告仍走原单条路径，保留 invite/microphone/colon 压缩语义。
+        let delay_ms = self
+            .lifecycle
+            .live_configs
+            .snapshot()
+            .timing
+            .command
+            .help_batch_ms;
+        if crate::text::chat_layout::is_single_line_notice(message) {
+            return match residency {
+                UiResidency::Primary => self.ui.chat_output.send_for_command(message),
+                UiResidency::SecondaryCurrentHall => {
+                    self.ui.chat_output.send_current_chat(message)
+                }
+            };
+        }
         match residency {
-            UiResidency::Primary => self.ui.chat_output.send_for_command(message),
-            UiResidency::SecondaryCurrentHall => self.ui.chat_output.send_current_chat(message),
+            UiResidency::Primary => self.ui.chat_output.send_wrapped(message, delay_ms),
+            UiResidency::SecondaryCurrentHall => {
+                self.ui.chat_output
+                    .send_current_chat_wrapped(message, delay_ms)
+            }
         }
     }
 
@@ -103,16 +123,34 @@ impl ApplicationRuntime {
             .timing
             .command
             .help_batch_ms;
-        let mapped = messages
+        // 正文先按显示宽度展开（每行标点优先、无编号、带段数上限）；
+        // 必须单行的系统通告保持原样，继续走 fit_* 兜底。
+        let expanded: Vec<String> = messages
             .iter()
-            .map(|message| {
-                self.lifecycle
+            .flat_map(|message| {
+                let mapped = self
+                    .lifecycle
                     .live_configs
                     .identity
-                    .replace_display_names(message)
+                    .replace_display_names(message);
+                if crate::text::chat_layout::is_single_line_notice(&mapped) {
+                    vec![mapped]
+                } else {
+                    crate::text::chat_layout::expand_chat_segments(
+                        &mapped,
+                        crate::text::chat_layout::MAX_SEGMENTS_PER_REPLY,
+                    )
+                }
             })
-            .collect::<Vec<_>>();
-        let messages = mapped.iter().map(String::as_str).collect::<Vec<_>>();
+            .collect();
+        let expanded = crate::text::chat_layout::cap_chat_segments(
+            expanded,
+            crate::text::chat_layout::MAX_SEGMENTS_PER_BATCH,
+        );
+        if expanded.is_empty() {
+            return Ok(());
+        }
+        let messages = expanded.iter().map(String::as_str).collect::<Vec<_>>();
         match self.active_ui_residency()? {
             UiResidency::Primary => self
                 .ui
@@ -348,8 +386,16 @@ impl ApplicationRuntime {
         let Some(text) = self.render_template_text(spec, vars) else {
             return Ok(());
         };
-        // 用户可以在一条回复里写多行：一行发一条消息，超宽的行按聊天宽度硬切。
-        let messages = crate::text::split_configured_lines(&text);
+        // 用户可以在一条回复里写多行；正文按显示宽度标点优先切段（一行=一条、
+        // 无编号、带段数上限）。必须单行的系统通告仍沿用原来的硬切/压缩路径。
+        let messages = if crate::text::chat_layout::is_single_line_notice(&text) {
+            crate::text::split_configured_lines(&text)
+        } else {
+            crate::text::chat_layout::expand_chat_segments(
+                &text,
+                crate::text::chat_layout::MAX_SEGMENTS_PER_REPLY,
+            )
+        };
         if messages.is_empty() {
             return Ok(());
         }

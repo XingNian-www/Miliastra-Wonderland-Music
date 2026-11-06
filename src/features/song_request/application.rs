@@ -692,10 +692,11 @@ impl SongRequestExecution<'_> {
         if self.queue_contains_request(&request)? {
             log::info!("点歌「{}」已在播放队列中，本次不重复入队", request.keyword);
             self.log_executed_command(context, &request.final_command("duplicate"))?;
+            let spec = &crate::features::reply_template::song::SONG[0];
             self.reply_template(
-                &crate::features::reply_template::song::SONG[0],
+                spec,
                 &crate::features::reply_template::ReplyVars::new()
-                    .with("歌名", request.keyword.clone()),
+                    .with("歌名", song_reply_label(&request, spec)),
             )?;
             return Ok(());
         }
@@ -715,10 +716,11 @@ impl SongRequestExecution<'_> {
                         .is_some_and(|current| current.track_ref.key == requested.track_ref.key)
                 }) {
                     self.log_executed_command(context, &request.final_command("already-playing"))?;
+                    let spec = &crate::features::reply_template::song::SONG[1];
                     self.reply_template(
-                        &crate::features::reply_template::song::SONG[1],
+                        spec,
                         &crate::features::reply_template::ReplyVars::new()
-                            .with("歌名", request.keyword.clone()),
+                            .with("歌名", song_reply_label(&request, spec)),
                     )?;
                     return Ok(());
                 }
@@ -1081,9 +1083,10 @@ impl SongRequestExecution<'_> {
         });
         let selection = selection_candidates(&candidates.online, &candidates.local);
         // @本地 只出现在下面那条本地推荐里，不在这里重复列出。
-        let mut messages = vec![format!(
-            "{}AI匹配:{},@确认@跳过@选择",
-            label, candidate.text
+        let mut messages = vec![decision_track_line(
+            &format!("{label}AI匹配:"),
+            ",@确认@跳过@选择",
+            &candidate,
         )];
         if let Some(offer) = &local_offer {
             messages.push(local_library_line(&label, &offer[0]));
@@ -1404,11 +1407,10 @@ impl SongRequestExecution<'_> {
         } else {
             "@确认@跳过@换源@选择"
         };
-        let prompt = format!(
-            "{}搜索到:{},{}",
-            song_label(song),
-            picked.candidate.text,
-            actions
+        let prompt = decision_track_line(
+            &format!("{}搜索到:", song_label(song)),
+            &format!(",{actions}"),
+            &picked.candidate,
         );
         let decision = self.prompt_candidate_decision(
             &[prompt],
@@ -1579,23 +1581,25 @@ impl SongRequestExecution<'_> {
             SongQueuePushOutcome::PermissionDenied => {}
             SongQueuePushOutcome::Added { position, total } => {
                 self.log_executed_command(context, &request.final_command(feedback.queued_action))?;
+                let spec = &crate::features::reply_template::song::SONG[10];
                 self.reply_template(
-                    &crate::features::reply_template::song::SONG[10],
+                    spec,
                     &crate::features::reply_template::ReplyVars::new()
                         .with("前缀", feedback.queued_prefix)
                         // {序号} 是这首的位置，{当前} 仍是队列总数：旧模板继续可用。
                         .with("序号", position.to_string())
                         .with("当前", total.to_string())
                         .with("上限", self.queue_max_size.to_string())
-                        .with("歌名", request.keyword.clone()),
+                        .with("歌名", song_reply_label(&request, spec)),
                 )?;
             }
             SongQueuePushOutcome::Duplicate => {
                 self.log_executed_command(context, &request.final_command("duplicate"))?;
+                let spec = &crate::features::reply_template::song::SONG[0];
                 self.reply_template(
-                    &crate::features::reply_template::song::SONG[0],
+                    spec,
                     &crate::features::reply_template::ReplyVars::new()
-                        .with("歌名", request.keyword.clone()),
+                        .with("歌名", song_reply_label(&request, spec)),
                 )?;
             }
             SongQueuePushOutcome::Full => {
@@ -1611,10 +1615,11 @@ impl SongRequestExecution<'_> {
             }
             SongQueuePushOutcome::DedupLimited => {
                 self.log_executed_command(context, &request.final_command("dedup-limited-queue"))?;
+                let spec = &crate::features::reply_template::song::SONG[13];
                 self.reply_template(
-                    &crate::features::reply_template::song::SONG[13],
+                    spec,
                     &crate::features::reply_template::ReplyVars::new()
-                        .with("歌名", request.keyword.clone()),
+                        .with("歌名", song_reply_label(&request, spec)),
                 )?;
             }
         }
@@ -1773,7 +1778,7 @@ impl SongRequestExecution<'_> {
             .iter()
             .take(5)
             .enumerate()
-            .map(|(index, candidate)| format!("{}. {}", index + 1, candidate.selection_text()))
+            .map(|(index, candidate)| candidate_choice_line(index + 1, candidate))
             .collect::<Vec<_>>();
         let switch_source_action = if allow_switch_source {
             "，或@换源重新搜索"
@@ -1941,7 +1946,7 @@ impl SongRequestExecution<'_> {
             .iter()
             .take(count)
             .enumerate()
-            .map(|(index, candidate)| format!("{}. {}", index + 1, candidate.text))
+            .map(|(index, candidate)| candidate_choice_line(index + 1, candidate))
             .collect();
         messages.push(format!("请输入@1至@{}选择本地曲库歌曲，或@跳过", count));
         loop {
@@ -2165,11 +2170,82 @@ fn selection_candidates(
     list
 }
 
+/// ---- 聊天展示层排版（方案 A / P0）-------------------------------------------
+/// 只裁「给玩家看的一行」；`candidate.text` / `request.keyword` 仍是队列 keyword
+/// 与去重身份，绝不改动数据语义。
+
+fn candidate_duration(candidate: &SearchCandidate) -> Option<String> {
+    candidate
+        .metadata
+        .duration_ms
+        .map(|ms| crate::features::playback::format::format_duration(ms as f64 / 1000.0))
+}
+
+fn candidate_display_label(candidate: &SearchCandidate, budget: usize) -> String {
+    let local_marker = if candidate.text.contains("[曲库]") {
+        " [曲库]"
+    } else {
+        ""
+    };
+    let label_budget = budget
+        .saturating_sub(crate::text::display_width(local_marker))
+        .max(8);
+    let label = crate::text::chat_layout::chat_track_label(
+        &candidate.metadata.title,
+        &candidate.metadata.artists,
+        label_budget,
+    );
+    format!("{label}{local_marker}")
+}
+
+fn candidate_choice_line(index: usize, candidate: &SearchCandidate) -> String {
+    crate::text::chat_layout::chat_candidate_line(
+        index,
+        &candidate.metadata.title,
+        &candidate.metadata.artists,
+        candidate_duration(candidate).as_deref(),
+        crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+    )
+}
+
+fn decision_track_line(prefix: &str, suffix: &str, candidate: &SearchCandidate) -> String {
+    let budget = crate::text::chat_layout::CHAT_LAYOUT_BUDGET
+        .saturating_sub(
+            crate::text::display_width(prefix) + crate::text::display_width(suffix),
+        )
+        .max(8);
+    format!("{prefix}{}{suffix}", candidate_display_label(candidate, budget))
+}
+
+fn request_display_label(request: &ResolvedSongRequest, budget: usize) -> String {
+    match &request.track {
+        Some(track) => crate::text::chat_layout::chat_track_label(
+            &track.metadata.title,
+            &track.metadata.artists,
+            budget,
+        ),
+        None => crate::text::chat_layout::chat_track_label(&request.keyword, &[], budget),
+    }
+}
+
+/// 按模板里「除 {歌名} 外」的固定文本计算这首歌能占的显示宽度。
+fn song_reply_label(
+    request: &ResolvedSongRequest,
+    spec: &crate::features::reply_template::ReplyTemplate,
+) -> String {
+    let skeleton = spec.default.replace("{歌名}", "");
+    let budget = crate::text::chat_layout::CHAT_LAYOUT_BUDGET
+        .saturating_sub(crate::text::display_width(&skeleton))
+        .max(8);
+    request_display_label(request, budget)
+}
+
 /// 在线匹配偏低时追加的本地推荐消息；不展示任何匹配分数。
 fn local_library_line(label: &str, candidate: &SearchCandidate) -> String {
-    format!(
-        "{label}在线没找到合适的,本地曲库推荐:{},@本地",
-        candidate.text
+    decision_track_line(
+        &format!("{label}在线没找到合适的,本地曲库推荐:"),
+        ",@本地",
+        candidate,
     )
 }
 
@@ -3801,6 +3877,37 @@ mod tests {
         let mut candidate = test_candidate(id, &format!("miliastra://track/qqmusic/{id}"));
         candidate.eligibility = CandidateEligibility::Unknown;
         candidate
+    }
+
+    /// P0：平台给出 60 位歌手时，候选行/首条提示必须仍是一行且 ≤78 显示宽度，
+    /// 展示层裁切不得改动 `candidate.text` 的数据语义。
+    #[test]
+    fn structured_song_lines_stay_within_chat_budget_with_many_artists() {
+        let mut candidate = test_candidate("夜空中最亮的星", "miliastra://track/qqmusic/60");
+        candidate.metadata.artists = (0..60).map(|index| format!("歌手{index}")).collect();
+        candidate.metadata.duration_ms = Some(252_000);
+        let original_text = candidate.text.clone();
+
+        for index in 1..=5 {
+            let line = candidate_choice_line(index, &candidate);
+            assert!(
+                crate::text::display_width(&line)
+                    <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+                "候选行超过预算：{line}"
+            );
+            assert!(line.starts_with(&format!("{index}. ")), "序号不可截：{line}");
+            assert!(!line.contains('\n'));
+        }
+        let prompt = decision_track_line("@点歌搜索到:", ",@确认@跳过@选择", &candidate);
+        assert!(
+            crate::text::display_width(&prompt)
+                <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+            "首条提示超过预算：{prompt}"
+        );
+        assert!(prompt.contains("歌手0"), "歌手应保留可辨识前缀：{prompt}");
+
+        // 展示层只读：candidate.text 仍是队列 keyword / 去重身份。
+        assert_eq!(candidate.text, original_text);
     }
 
     #[test]

@@ -419,7 +419,7 @@ impl ApplicationRuntime {
                 }
             }
             reader.wait_for_input(
-                self.lifecycle.config.timing.decision.poll_ms,
+                super::live_decision_poll_ms(&self.lifecycle.live_configs),
                 deadline.saturating_duration_since(Instant::now()),
             )?;
         }

@@ -742,6 +742,15 @@ impl ApplicationRuntime {
         command: &command::ModerationCommand,
     ) -> Result<bool> {
         let moderation = self.business.moderation.clone();
+        // 投票阈值（stable_vote_samples / required_vote_margin）每次命令入口从实时配置读取，
+        // 保存后下一条管理命令即按新阈值判定；不重建服务、不影响进行中的播放/游戏。
+        {
+            let config = self.lifecycle.live_configs.snapshot();
+            moderation.update_vote_thresholds(
+                config.moderation.stable_vote_samples,
+                config.moderation.required_vote_margin,
+            );
+        }
         let requester_role =
             moderation_requester_role(&self.lifecycle.live_configs.identity, parsed);
         match moderation.start(command, requester_role, self)? {
@@ -775,9 +784,9 @@ impl ApplicationRuntime {
         let vote_context = ModerationVoteContext {
             running: Arc::clone(&self.lifecycle.running),
             chat_timeline: self.ui.chat_timeline.clone(),
-            baseline_timeout: Duration::from_millis(
-                self.lifecycle.config.timing.decision.timeout_ms,
-            ),
+            baseline_timeout: Duration::from_millis(super::live_decision_timeout_ms(
+                &self.lifecycle.live_configs,
+            )),
             // 投票永远属于「当前所在大厅」这个业务容器，与屏幕桶、消息来源无关。
             vote_scope: self.ui.chat_timeline.current_hall_scope()?,
             identity: self.lifecycle.live_configs.identity.clone(),

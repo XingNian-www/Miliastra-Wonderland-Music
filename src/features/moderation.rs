@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
@@ -279,6 +280,11 @@ pub(crate) trait ModerationWorkflowLedger: Send + Sync {
 pub struct ModerationService {
     ledger: Arc<dyn ModerationWorkflowLedger>,
     policy: ModerationPolicy,
+    /// 投票阈值（`stable_vote_samples`, `required_vote_margin`）的实时值。
+    ///
+    /// 不缓存启动值：由组装层在每个管理命令入口用
+    /// `live_configs.snapshot().moderation.*` 刷新，下一次投票即按新阈值判定。
+    live_thresholds: Arc<RwLock<(u32, i32)>>,
 }
 
 pub enum ModerationStart {
@@ -404,7 +410,32 @@ struct ModerationHoldLease {
 
 impl ModerationService {
     pub(crate) fn new(policy: ModerationPolicy, ledger: Arc<dyn ModerationWorkflowLedger>) -> Self {
-        Self { ledger, policy }
+        let live_thresholds = Arc::new(RwLock::new((
+            policy.stable_vote_samples,
+            policy.required_vote_margin,
+        )));
+        Self {
+            ledger,
+            policy,
+            live_thresholds,
+        }
+    }
+
+    /// 用实时配置刷新投票阈值；下一次投票判定即生效（不需要重建服务或重启）。
+    pub(crate) fn update_vote_thresholds(&self, stable_vote_samples: u32, required_vote_margin: i32) {
+        let mut thresholds = self
+            .live_thresholds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *thresholds = (stable_vote_samples, required_vote_margin);
+    }
+
+    /// 当前生效的投票阈值（`(stable_vote_samples, required_vote_margin)`）。
+    fn vote_thresholds(&self) -> (u32, i32) {
+        *self
+            .live_thresholds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn start(
@@ -657,7 +688,7 @@ impl ModerationService {
                             .and_modify(|value| *value += 1)
                             .or_insert(1);
                         let needed = if port.requires_repeated_samples() {
-                            self.policy.stable_vote_samples.max(1)
+                            self.vote_thresholds().0.max(1)
                         } else {
                             1
                         };
@@ -682,9 +713,9 @@ impl ModerationService {
                 agree,
                 disagree,
                 agree - disagree,
-                self.policy.required_vote_margin,
+                self.vote_thresholds().1,
             );
-            if agree - disagree >= self.policy.required_vote_margin {
+            if agree - disagree >= self.vote_thresholds().1 {
                 return Ok(true);
             }
         }
@@ -1238,6 +1269,21 @@ mod tests {
             ),
             Arc::new(TestLedger::default()),
         )
+    }
+
+    /// 投票阈值随实时配置更新：新值下一次投票判定即生效，且克隆（投票线程用的就是克隆）
+    /// 与共享服务看到同一份阈值。
+    #[test]
+    fn vote_thresholds_follow_live_updates() {
+        let svc = service(3, 2);
+        assert_eq!(svc.vote_thresholds(), (3, 2));
+        let worker_clone = svc.clone();
+        svc.update_vote_thresholds(1, 1);
+        assert_eq!(
+            worker_clone.vote_thresholds(),
+            (1, 1),
+            "克隆实例共享同一份实时阈值（后台投票线程能看到新值）"
+        );
     }
 
     fn command() -> ModerationCommand {

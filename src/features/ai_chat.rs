@@ -1710,29 +1710,35 @@ pub(crate) fn estimate_tokens(text: &str) -> usize {
 }
 
 /// 每个玩家的触发冷却。
+///
+/// 冷却时长**不缓存**：由调用方每次 `check` 时传入（来自
+/// `live_configs.snapshot().ai_chat.cooldown_seconds`），保存后下一条消息即按新值判定。
 pub(crate) struct TriggerGate {
-    cooldown: Duration,
     recent: Mutex<std::collections::HashMap<String, Instant>>,
 }
 
 impl TriggerGate {
-    pub(crate) fn new(cooldown: Duration) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            cooldown,
             recent: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     /// 允许触发返回 true；否则返回还需等待的秒数。
-    pub(crate) fn check(&self, actor: &str, now: Instant) -> std::result::Result<(), u64> {
+    ///
+    /// `cooldown` 由调用方每次从实时配置读取，保证不必重启即可改变冷却。
+    pub(crate) fn check(
+        &self,
+        actor: &str,
+        now: Instant,
+        cooldown: Duration,
+    ) -> std::result::Result<(), u64> {
         let Ok(mut recent) = self.recent.lock() else {
             return Err(1);
         };
-        recent.retain(|_, at| now.saturating_duration_since(*at) < self.cooldown);
+        recent.retain(|_, at| now.saturating_duration_since(*at) < cooldown);
         if let Some(at) = recent.get(actor) {
-            let wait = self
-                .cooldown
-                .saturating_sub(now.saturating_duration_since(*at));
+            let wait = cooldown.saturating_sub(now.saturating_duration_since(*at));
             return Err(wait.as_millis().div_ceil(1000).max(1) as u64);
         }
         if recent.len() >= MAX_TRACKED_ACTORS {
@@ -2887,13 +2893,32 @@ mod tests {
 
     #[test]
     fn trigger_gate_enforces_cooldown_per_actor() {
-        let gate = TriggerGate::new(Duration::from_secs(8));
+        let gate = TriggerGate::new();
         let now = Instant::now();
+        let cd = Duration::from_secs(8);
 
-        assert!(gate.check("甲", now).is_ok());
-        assert!(gate.check("甲", now).is_err(), "同一人立刻再触发被拦");
-        assert!(gate.check("乙", now).is_ok(), "不同人互不影响");
-        assert!(gate.check("甲", now + Duration::from_secs(9)).is_ok());
+        assert!(gate.check("甲", now, cd).is_ok());
+        assert!(gate.check("甲", now, cd).is_err(), "同一人立刻再触发被拦");
+        assert!(gate.check("乙", now, cd).is_ok(), "不同人互不影响");
+        assert!(gate.check("甲", now + Duration::from_secs(9), cd).is_ok());
+    }
+
+    /// 冷却值由调用方每次传入：同一条冷却记录，换用更短的冷却后立刻可再次触发。
+    /// 这保证 `ai_chat.cooldown_seconds` 保存后下一条消息就按新值判定，无需重启。
+    #[test]
+    fn trigger_gate_reads_cooldown_from_caller_each_check() {
+        let gate = TriggerGate::new();
+        let now = Instant::now();
+        assert!(gate.check("甲", now, Duration::from_secs(8)).is_ok());
+        let later = now + Duration::from_secs(3);
+        assert!(
+            gate.check("甲", later, Duration::from_secs(8)).is_err(),
+            "旧冷却 8 秒下，3 秒后仍在冷却"
+        );
+        assert!(
+            gate.check("甲", later, Duration::from_secs(2)).is_ok(),
+            "改成 2 秒冷却后，同一时刻应立刻放行（证明按调用时传入的实时值判定）"
+        );
     }
 
     #[test]

@@ -4849,7 +4849,7 @@ fn playback_configuration_uses_the_stricter_reload_barrier() {
 }
 
 #[test]
-fn playback_runtime_settings_use_the_normal_reload_barrier() {
+fn playback_runtime_settings_apply_live_immediately() {
     let state = test_state();
     let sections = full_config_sections(&state);
     let body = serde_json::to_string(&json!({ "baseRevision": 1, "sections": sections })).unwrap();
@@ -4864,11 +4864,18 @@ fn playback_runtime_settings_use_the_normal_reload_barrier() {
     let response: Value =
         serde_json::from_str(&config_save_route(body.as_bytes(), &state).unwrap()).unwrap();
 
+    // playback.login_timeout_ms 已是 Live：保存后立即生效，不再排进重载队列。
+    assert!(
+        response["appliedLiveFields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("playback.login_timeout_ms"))
+    );
     assert!(
         response["runtimeReloadFields"]
             .as_array()
             .unwrap()
-            .contains(&json!("playback.login_timeout_ms"))
+            .is_empty()
     );
     assert!(
         response["playbackReloadFields"]

@@ -55,6 +55,57 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "matching.long_chinese_singer_min_score",
     "matching.en_max_edit_fraction",
     "matching.en_singer_max_edit_fraction",
+    // ai_chat：除 cooldown_seconds 外的全部字段（cooldown 由启动期 TriggerGate 使用，
+    // 不能实时改；其余消费方每次读 snapshot）。
+    "ai_chat.enabled",
+    "ai_chat.keyword",
+    "ai_chat.trigger_mode",
+    "ai_chat.min_access",
+    "ai_chat.actor_token_budget",
+    "ai_chat.actor_summary_budget",
+    "ai_chat.hall_token_budget",
+    "ai_chat.hall_summary_budget",
+    "ai_chat.bot_token_budget",
+    "ai_chat.allow_commands",
+    "ai_chat.model",
+    "ai_chat.reasoning",
+    "ai_chat.max_tokens",
+    "ai_chat.system_prompt",
+    "ai_chat.answer_prompt",
+    "ai_chat.extract_prompt",
+    "ai_chat.ai_reply.mode",
+    "ai_chat.ai_reply.include_template",
+    "ai_chat.ai_reply.include_command",
+    "ai_chat.ai_reply.system_prompt",
+    "ai_chat.ai_reply.user_prompt",
+    "ai_chat.ai_reply.max_tokens",
+    "ai_chat.ai_reply.timeout_seconds",
+    // song_ai：本地推荐两项由点歌端口每次读 snapshot。
+    "song_ai.local_recommend",
+    "song_ai.local_recommend_min_score",
+    // 点歌决策窗口（task-29 已把消费方改为每次读 snapshot）。
+    "timing.decision.timeout_ms",
+    "timing.decision.poll_ms",
+    // 启动流程三个开关/入口（listener 每次读 live 快照）。
+    "startup.enabled",
+    "startup.enter_game",
+    "startup.enter_wonderland",
+    // 外部聊天源：仅连接参数实时，其余（开关/url/token/自动启动/路径/uid）保留旧值。
+    "chat_source.reconnect_ms",
+    "chat_source.lease_timeout_ms",
+    // task-28：task-27 已完成接线（消费方读 live 快照）。
+    "ai_chat.cooldown_seconds",
+    "moderation.stable_vote_samples",
+    "moderation.required_vote_margin",
+    // task-33：播放/缓存 7 项（消费方已由 task-31 接线为读 live 快照；
+    // audio_cache 只实时三个数值，启用/目录/并发数仍需重载）。
+    "playback.login_timeout_ms",
+    "playback.audio_cache.max_bytes_mb",
+    "playback.audio_cache.request_timeout_ms",
+    "playback.audio_cache.seek_wait_timeout_ms",
+    "timing.playback.uri_stable_samples",
+    "timing.playback.transport_stable_samples",
+    "timing.playback.stale_timeout_ms",
     "custom_workflows.enabled",
     "custom_workflows.default_threshold",
     "custom_workflows.wait_template_absent_stable_default",
@@ -353,6 +404,40 @@ impl LiveConfigs {
         effective.custom_workflows = config.custom_workflows.clone();
         effective.identity = config.identity.clone();
         effective.command_access = command_access;
+        // ai_chat：schema 字段现已全部 Live（含 cooldown_seconds），整体 clone。
+        effective.ai_chat = config.ai_chat.clone();
+        // moderation：只实时两个投票阈值；区域/点位等其它字段保留旧值。
+        effective.moderation.stable_vote_samples = config.moderation.stable_vote_samples;
+        effective.moderation.required_vote_margin = config.moderation.required_vote_margin;
+        // playback：登录超时直接赋值；audio_cache 只实时三个数值，且仅在
+        // 新旧两侧都启用（Some）时逐字段合并——启用开关/目录/并发数属于
+        // 结构配置，仍走空闲重载。
+        effective.playback.login_timeout_ms = config.playback.login_timeout_ms;
+        if let (Some(effective_cache), Some(config_cache)) = (
+            effective.playback.audio_cache.as_mut(),
+            config.playback.audio_cache.as_ref(),
+        ) {
+            effective_cache.max_bytes_mb = config_cache.max_bytes_mb;
+            effective_cache.request_timeout_ms = config_cache.request_timeout_ms;
+            effective_cache.seek_wait_timeout_ms = config_cache.seek_wait_timeout_ms;
+        }
+        effective.timing.playback.uri_stable_samples = config.timing.playback.uri_stable_samples;
+        effective.timing.playback.transport_stable_samples =
+            config.timing.playback.transport_stable_samples;
+        effective.timing.playback.stale_timeout_ms = config.timing.playback.stale_timeout_ms;
+        effective.song_ai.local_recommend = config.song_ai.local_recommend;
+        effective.song_ai.local_recommend_min_score = config.song_ai.local_recommend_min_score;
+        effective.timing.decision.timeout_ms = config.timing.decision.timeout_ms;
+        effective.timing.decision.poll_ms = config.timing.decision.poll_ms;
+        effective.startup.enabled = config.startup.enabled;
+        effective.startup.enter_game = config.startup.enter_game;
+        effective.startup.enter_wonderland = config.startup.enter_wonderland;
+        // chat_source：只实时 reconnect/lease 两项；其余字段（含 secret token、
+        // 自动启动与可执行路径）必须保留旧值，避免未登记字段被悄悄实时。
+        let mut chat_source = effective.chat_source.clone();
+        chat_source.reconnect_ms = config.chat_source.reconnect_ms;
+        chat_source.lease_timeout_ms = config.chat_source.lease_timeout_ms;
+        effective.chat_source = chat_source;
         effective.visual = config.visual.clone();
         self.effective.replace(effective);
     }
@@ -681,6 +766,310 @@ mod tests {
         assert_eq!(
             schema_live, covered,
             "schema 中 effect==Live 的字段路径集合必须与 LiveConfigs 覆盖的路径集合完全一致"
+        );
+    }
+
+    fn set_json_path(root: &mut serde_json::Value, path: &str, value: serde_json::Value) {
+        let mut current = root;
+        let segments: Vec<&str> = path.split('.').collect();
+        for segment in &segments[..segments.len() - 1] {
+            current = current
+                .get_mut(*segment)
+                .expect("测试路径的中间节点必须存在");
+        }
+        current[segments[segments.len() - 1]] = value;
+    }
+
+    fn json_at<'a>(root: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+        path.split('.').fold(root, |current, segment| {
+            current.get(segment).expect("测试路径必须存在")
+        })
+    }
+
+    /// P2-0 缺口补丁：新增 Live 字段必须逐条证明 `apply()` 真的把值写进快照。
+    /// 表驱动：每个路径先证明「改动值 ≠ 默认值」，apply 后快照 == 改动值；
+    /// 未登记 Live 的 cooldown_seconds / song_ai.system_prompt / song_ai.model
+    /// 即使被改动，也必须保留旧值。
+    #[test]
+    fn newly_live_ai_chat_and_song_ai_fields_reach_the_snapshot() {
+        use serde_json::json;
+
+        let live = LiveConfigs::default();
+        let baseline = serde_json::to_value(AppConfig::default()).expect("默认配置序列化");
+        let mut changed_value = serde_json::to_value(AppConfig::default()).expect("序列化默认配置");
+        let live_values: Vec<(&str, serde_json::Value)> = vec![
+            ("ai_chat.enabled", json!(true)),
+            ("ai_chat.keyword", json!("测试关键词")),
+            ("ai_chat.trigger_mode", json!("contains")),
+            ("ai_chat.min_access", json!("owner")),
+            ("ai_chat.actor_token_budget", json!(123_456)),
+            ("ai_chat.actor_summary_budget", json!(23_456)),
+            ("ai_chat.hall_token_budget", json!(234_567)),
+            ("ai_chat.hall_summary_budget", json!(34_567)),
+            ("ai_chat.bot_token_budget", json!(45_678)),
+            ("ai_chat.allow_commands", json!(false)),
+            ("ai_chat.model", json!("test-model")),
+            ("ai_chat.reasoning", json!("high")),
+            ("ai_chat.max_tokens", json!(54_321)),
+            ("ai_chat.system_prompt", json!("changed-system-prompt")),
+            ("ai_chat.answer_prompt", json!("changed-answer-prompt")),
+            ("ai_chat.extract_prompt", json!("changed-extract-prompt")),
+            ("ai_chat.ai_reply.mode", json!("rewrite")),
+            ("ai_chat.ai_reply.include_template", json!(false)),
+            ("ai_chat.ai_reply.include_command", json!(false)),
+            (
+                "ai_chat.ai_reply.system_prompt",
+                json!("changed-reply-system-prompt"),
+            ),
+            (
+                "ai_chat.ai_reply.user_prompt",
+                json!("changed-reply-user-prompt"),
+            ),
+            ("ai_chat.ai_reply.max_tokens", json!(321)),
+            ("ai_chat.ai_reply.timeout_seconds", json!(77)),
+            ("song_ai.local_recommend", json!(false)),
+            ("song_ai.local_recommend_min_score", json!(0.42)),
+            ("ai_chat.cooldown_seconds", json!(9_999)),
+        ];
+        for (path, value) in &live_values {
+            assert_ne!(
+                json_at(&baseline, path),
+                value,
+                "测试值必须与默认值不同（证明 apply 真的覆盖）: {path}"
+            );
+            set_json_path(&mut changed_value, path, value.clone());
+        }
+        // 未登记 Live 的字段：改动后必须被 apply 丢弃（保留旧值）。
+        set_json_path(
+            &mut changed_value,
+            "song_ai.system_prompt",
+            json!("should-not-apply"),
+        );
+        set_json_path(
+            &mut changed_value,
+            "song_ai.model",
+            json!("should-not-apply-model"),
+        );
+        let changed: AppConfig =
+            serde_json::from_value(changed_value.clone()).expect("改动配置反序列化");
+
+        live.apply(&changed);
+        let snapshot = serde_json::to_value(&*live.snapshot()).expect("快照序列化");
+
+        for (path, _) in &live_values {
+            assert_eq!(
+                json_at(&snapshot, path),
+                json_at(&changed_value, path),
+                "新增 Live 字段 apply 后必须等于改动值: {path}"
+            );
+        }
+        for path in ["song_ai.system_prompt", "song_ai.model"] {
+            assert_eq!(
+                json_at(&snapshot, path),
+                json_at(&baseline, path),
+                "未登记 Live 的字段必须保留旧值: {path}"
+            );
+        }
+    }
+    /// task-30：startup 3 + decision 2 + chat_source 2 的表驱动 apply 断言。
+    /// 未登记 Live 的 startup.launch_game / chat_source.enabled / url 必须保留旧值。
+    #[test]
+    fn newly_live_startup_decision_chat_source_fields_reach_the_snapshot() {
+        use serde_json::json;
+
+        let live = LiveConfigs::default();
+        let baseline = serde_json::to_value(AppConfig::default()).expect("默认配置序列化");
+        let mut changed_value = serde_json::to_value(AppConfig::default()).expect("序列化默认配置");
+        let live_values: Vec<(&str, serde_json::Value)> = vec![
+            ("startup.enabled", json!(true)),
+            ("startup.enter_game", json!(true)),
+            ("startup.enter_wonderland", json!(true)),
+            ("timing.decision.timeout_ms", json!(21_000)),
+            ("timing.decision.poll_ms", json!(2_100)),
+            ("chat_source.reconnect_ms", json!(4_321)),
+            ("chat_source.lease_timeout_ms", json!(54_321)),
+        ];
+        for (path, value) in &live_values {
+            assert_ne!(
+                json_at(&baseline, path),
+                value,
+                "测试值必须与默认值不同（证明 apply 真的覆盖）: {path}"
+            );
+            set_json_path(&mut changed_value, path, value.clone());
+        }
+        // 未登记 Live 的字段：改动后必须被 apply 丢弃（保留旧值）。
+        set_json_path(&mut changed_value, "startup.launch_game", json!(true));
+        set_json_path(&mut changed_value, "chat_source.enabled", json!(true));
+        set_json_path(
+            &mut changed_value,
+            "chat_source.url",
+            json!("ws://127.0.0.1:19999/stream"),
+        );
+        let changed: AppConfig =
+            serde_json::from_value(changed_value.clone()).expect("改动配置反序列化");
+
+        live.apply(&changed);
+        let snapshot = serde_json::to_value(&*live.snapshot()).expect("快照序列化");
+
+        for (path, _) in &live_values {
+            assert_eq!(
+                json_at(&snapshot, path),
+                json_at(&changed_value, path),
+                "新增 Live 字段 apply 后必须等于改动值: {path}"
+            );
+        }
+        for path in [
+            "startup.launch_game",
+            "chat_source.enabled",
+            "chat_source.url",
+        ] {
+            assert_eq!(
+                json_at(&snapshot, path),
+                json_at(&baseline, path),
+                "未登记 Live 的字段必须保留旧值: {path}"
+            );
+        }
+    }
+    /// task-28：cooldown + moderation 两个投票阈值的表驱动 apply 断言。
+    /// moderation 的区域/点位等未登记字段必须保留旧值。
+    #[test]
+    fn newly_live_cooldown_and_moderation_fields_reach_the_snapshot() {
+        use serde_json::json;
+
+        let live = LiveConfigs::default();
+        let baseline = serde_json::to_value(AppConfig::default()).expect("默认配置序列化");
+        let mut changed_value = serde_json::to_value(AppConfig::default()).expect("序列化默认配置");
+        let live_values: Vec<(&str, serde_json::Value)> = vec![
+            ("ai_chat.cooldown_seconds", json!(9_999)),
+            ("moderation.stable_vote_samples", json!(7)),
+            ("moderation.required_vote_margin", json!(5)),
+        ];
+        for (path, value) in &live_values {
+            assert_ne!(
+                json_at(&baseline, path),
+                value,
+                "测试值必须与默认值不同（证明 apply 真的覆盖）: {path}"
+            );
+            set_json_path(&mut changed_value, path, value.clone());
+        }
+        // moderation 未登记字段：改动后必须被 apply 丢弃。
+        set_json_path(
+            &mut changed_value,
+            "moderation.friend_panel_region",
+            json!({"x": 1, "y": 2, "width": 3, "height": 4}),
+        );
+        let changed: AppConfig =
+            serde_json::from_value(changed_value.clone()).expect("改动配置反序列化");
+
+        live.apply(&changed);
+        let snapshot = serde_json::to_value(&*live.snapshot()).expect("快照序列化");
+
+        for (path, _) in &live_values {
+            assert_eq!(
+                json_at(&snapshot, path),
+                json_at(&changed_value, path),
+                "新增 Live 字段 apply 后必须等于改动值: {path}"
+            );
+        }
+        assert_eq!(
+            json_at(&snapshot, "moderation.friend_panel_region"),
+            json_at(&baseline, "moderation.friend_panel_region"),
+            "moderation 未登记字段必须保留旧值"
+        );
+    }
+
+    /// task-33：播放/缓存 7 项的表驱动 apply 断言。
+    /// audio_cache 只实时三个数值，启用/目录/并发数保留旧值；父级 None 不清空已生效缓存。
+    #[test]
+    fn newly_live_playback_and_cache_fields_reach_the_snapshot() {
+        use serde_json::json;
+
+        let mut base = AppConfig::default();
+        base.playback.audio_cache = Some(crate::config::AudioCacheFileConfig {
+            enabled: true,
+            directory: std::path::PathBuf::from("deps/cache/audio"),
+            max_bytes_mb: 1_000,
+            max_concurrent_downloads: 2,
+            request_timeout_ms: 30_000,
+            seek_wait_timeout_ms: 5_000,
+        });
+        let live = LiveConfigs::from_config(&base);
+        let baseline = serde_json::to_value(&base).expect("基线配置序列化");
+        let mut changed_value = serde_json::to_value(&base).expect("序列化基线配置");
+        let live_values: Vec<(&str, serde_json::Value)> = vec![
+            ("playback.login_timeout_ms", json!(190_000)),
+            ("playback.audio_cache.max_bytes_mb", json!(2_000)),
+            ("playback.audio_cache.request_timeout_ms", json!(31_000)),
+            ("playback.audio_cache.seek_wait_timeout_ms", json!(6_000)),
+            ("timing.playback.uri_stable_samples", json!(2)),
+            ("timing.playback.transport_stable_samples", json!(3)),
+            ("timing.playback.stale_timeout_ms", json!(9_000)),
+        ];
+        for (path, value) in &live_values {
+            assert_ne!(
+                json_at(&baseline, path),
+                value,
+                "测试值必须与默认值不同（证明 apply 真的覆盖）: {path}"
+            );
+            set_json_path(&mut changed_value, path, value.clone());
+        }
+        // audio_cache 未登记字段：改动后必须被 apply 丢弃（保留旧值）。
+        set_json_path(
+            &mut changed_value,
+            "playback.audio_cache.enabled",
+            json!(false),
+        );
+        set_json_path(
+            &mut changed_value,
+            "playback.audio_cache.directory",
+            json!("changed/cache"),
+        );
+        set_json_path(
+            &mut changed_value,
+            "playback.audio_cache.max_concurrent_downloads",
+            json!(9),
+        );
+        let changed: AppConfig =
+            serde_json::from_value(changed_value.clone()).expect("改动配置反序列化");
+
+        live.apply(&changed);
+        let snapshot = serde_json::to_value(&*live.snapshot()).expect("快照序列化");
+
+        for (path, _) in &live_values {
+            assert_eq!(
+                json_at(&snapshot, path),
+                json_at(&changed_value, path),
+                "新增 Live 字段 apply 后必须等于改动值: {path}"
+            );
+        }
+        for path in [
+            "playback.audio_cache.enabled",
+            "playback.audio_cache.directory",
+            "playback.audio_cache.max_concurrent_downloads",
+        ] {
+            assert_eq!(
+                json_at(&snapshot, path),
+                json_at(&baseline, path),
+                "audio_cache 未登记字段必须保留旧值: {path}"
+            );
+        }
+
+        // 父级 audio_cache 变 None（结构性变更，走重载）不得把已生效的缓存清空：
+        // 第二次 apply 后缓存字段应保持第一次 apply 后的实时值。
+        let cache_before_second_apply =
+            json_at(&snapshot, "playback.audio_cache.max_bytes_mb").clone();
+        let mut disabled = AppConfig::default();
+        disabled.playback.login_timeout_ms = 123_456;
+        live.apply(&disabled);
+        let snapshot_after = serde_json::to_value(&*live.snapshot()).expect("快照序列化");
+        assert_eq!(
+            json_at(&snapshot_after, "playback.audio_cache.max_bytes_mb"),
+            &cache_before_second_apply,
+            "父级 None 不清空已生效缓存"
+        );
+        assert_eq!(
+            json_at(&snapshot_after, "playback.login_timeout_ms"),
+            &json!(123_456)
         );
     }
 }

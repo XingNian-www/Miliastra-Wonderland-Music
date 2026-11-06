@@ -83,6 +83,34 @@ impl Default for AudioCacheConfig {
     }
 }
 
+/// 运行期可变的缓存限额（容量上限 + 两个超时）。
+///
+/// 上层通过 [`CacheLiveLimitsProvider`] 在每次下载/淘汰/seek 等待时取最新值：
+/// 配置热更新只需让 provider 返回新值，**不重建缓存实例、不断开在播音频流**。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CacheLiveLimits {
+    /// 磁盘占用上限（字节）。
+    pub max_bytes: u64,
+    /// 单次源站请求（响应头/分块）超时。
+    pub request_timeout: Duration,
+    /// 等待下载推进（seek 到未完成位置）的最长时间。
+    pub seek_wait_timeout: Duration,
+}
+
+/// 缓存限额提供者：每次使用时调用，返回当前生效值。
+pub type CacheLiveLimitsProvider = Arc<dyn Fn() -> CacheLiveLimits + Send + Sync>;
+
+impl AudioCacheConfig {
+    /// 由启动配置派生一份静态限额（未注入 provider 时使用）。
+    pub(crate) fn default_live_limits(&self) -> CacheLiveLimits {
+        CacheLiveLimits {
+            max_bytes: self.max_bytes,
+            request_timeout: self.request_timeout,
+            seek_wait_timeout: self.seek_wait_timeout,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioCacheStats {
@@ -251,6 +279,8 @@ pub struct AudioCache {
 
 pub(crate) struct CacheInner {
     pub(crate) config: AudioCacheConfig,
+    /// 容量/超时的运行期最新值（每次下载/淘汰/seek 时调用，不缓存）。
+    pub(crate) limits: CacheLiveLimitsProvider,
     pub(crate) port: std::sync::atomic::AtomicU16,
     pub(crate) shutdown: watch::Sender<bool>,
     pub(crate) entries: RwLock<HashMap<String, Entry>>,
@@ -319,8 +349,25 @@ fn local_proxy_stream(
 }
 
 impl AudioCache {
+    /// 当前生效的限额（读取注入的 provider；测试与诊断用）。
+    pub fn live_limits(&self) -> CacheLiveLimits {
+        (self.inner.limits)()
+    }
+
     /// 启动本地代理服务器（监听 127.0.0.1 随机端口）并加载已有缓存。
-    pub async fn spawn(mut config: AudioCacheConfig) -> Result<Self, CacheError> {
+    pub async fn spawn(config: AudioCacheConfig) -> Result<Self, CacheError> {
+        Self::spawn_with_limits(config, None).await
+    }
+
+    /// 同 [`Self::spawn`]，但可注入运行期限额提供者（见 [`CacheLiveLimits`]）。
+    pub async fn spawn_with_limits(
+        mut config: AudioCacheConfig,
+        limits: Option<CacheLiveLimitsProvider>,
+    ) -> Result<Self, CacheError> {
+        let limits = limits.unwrap_or_else(|| {
+            let snapshot = config.default_live_limits();
+            Arc::new(move || snapshot)
+        });
         // 空目录解析为系统临时目录，并回写配置：后续文件路径与容量回收都以解析后的目录为准。
         let directory = if config.directory.as_os_str().is_empty() {
             std::env::temp_dir().join("miliastra-audio-cache")
@@ -353,6 +400,7 @@ impl AudioCache {
         let download_slots = inner_concurrency(config.max_concurrent_downloads);
         let inner = Arc::new(CacheInner {
             config,
+            limits,
             port: std::sync::atomic::AtomicU16::new(0),
             shutdown,
             entries: RwLock::new(HashMap::new()),
@@ -377,7 +425,8 @@ impl AudioCache {
         inner
             .downloaded_bytes
             .store(complete_bytes as usize, Ordering::SeqCst);
-        trim_cache(inner.clone(), inner.config.max_bytes).await;
+        let startup_max_bytes = (inner.limits)().max_bytes;
+        trim_cache(inner.clone(), startup_max_bytes).await;
         Ok(Self { inner })
     }
 
@@ -663,7 +712,7 @@ impl AudioCache {
                 directory: directory.to_string_lossy().into_owned(),
                 complete_entries: stats.complete_tracks,
                 complete_bytes: stats.complete_bytes,
-                max_bytes: inner.config.max_bytes,
+                max_bytes: (inner.limits)().max_bytes,
                 active_downloads: inner.active_downloads.load(Ordering::SeqCst),
                 lyrics_entries: stats.lyrics_tracks,
                 lyrics_bytes: stats.lyrics_bytes,
@@ -994,6 +1043,66 @@ pub(crate) fn complete_file_size(directory: &Path, hash: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 注入的限额 provider 必须在每次读取时返回最新值（配置热更新路径），
+    /// 且不重建缓存实例（同一实例 live_limits 随 provider 变化）。
+    #[tokio::test]
+    async fn cache_live_limits_provider_is_read_on_every_call() {
+        use std::sync::Mutex as StdMutex;
+        let shared = Arc::new(StdMutex::new(CacheLiveLimits {
+            max_bytes: 1024,
+            request_timeout: Duration::from_millis(111),
+            seek_wait_timeout: Duration::from_millis(222),
+        }));
+        let provider = {
+            let shared = Arc::clone(&shared);
+            Arc::new(move || *shared.lock().unwrap())
+        };
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-cache-live-{}", uuid::Uuid::new_v4()));
+        let cache = AudioCache::spawn_with_limits(
+            AudioCacheConfig {
+                directory: directory.clone(),
+                metadata_directory: directory.join("index"),
+                ..Default::default()
+            },
+            Some(provider),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cache.live_limits().max_bytes, 1024);
+        assert_eq!(cache.live_limits().seek_wait_timeout, Duration::from_millis(222));
+
+        // 模拟配置热更新：只改 provider 来源值，不重建实例。
+        *shared.lock().unwrap() = CacheLiveLimits {
+            max_bytes: 2048,
+            request_timeout: Duration::from_millis(333),
+            seek_wait_timeout: Duration::from_millis(444),
+        };
+        assert_eq!(cache.live_limits().max_bytes, 2048);
+        assert_eq!(cache.live_limits().request_timeout, Duration::from_millis(333));
+        assert_eq!(cache.live_limits().seek_wait_timeout, Duration::from_millis(444));
+    }
+
+    /// 未注入 provider 时，默认 provider 取启动配置值。
+    #[tokio::test]
+    async fn cache_without_provider_uses_startup_config_limits() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-cache-static-{}", uuid::Uuid::new_v4()));
+        let cache = AudioCache::spawn(AudioCacheConfig {
+            directory: directory.clone(),
+            metadata_directory: directory.join("index"),
+            max_bytes: 4096,
+            request_timeout: Duration::from_millis(55),
+            seek_wait_timeout: Duration::from_millis(66),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(cache.live_limits().max_bytes, 4096);
+        assert_eq!(cache.live_limits().request_timeout, Duration::from_millis(55));
+        assert_eq!(cache.live_limits().seek_wait_timeout, Duration::from_millis(66));
+    }
 
     #[test]
     fn cache_key_hash_is_stable_and_source_scoped() {

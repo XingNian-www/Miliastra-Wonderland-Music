@@ -460,6 +460,27 @@ impl<C: Clock> PlayerObserver<C> {
         }
     }
 
+    /// 运行期热更新稳定判定参数（稳定样本数、stale 超时）。
+    ///
+    /// 不重建观测器、不丢已积累的稳定证据；下一个采样周期起生效。
+    pub fn set_live_tuning(
+        &mut self,
+        uri_stable_samples: usize,
+        transport_stable_samples: usize,
+        stale_timeout: Duration,
+    ) {
+        let mut config = self.config;
+        config.uri_stable_samples = uri_stable_samples;
+        config.transport_stable_samples = transport_stable_samples;
+        config.stale_timeout = stale_timeout;
+        self.config = config.normalized();
+    }
+
+    /// 当前生效的观测参数（诊断与测试用）。
+    pub fn observation_config(&self) -> PlayerObservationConfig {
+        self.config
+    }
+
     pub fn observe_sample(&mut self, sample: RawPlayerSample) -> PlayerObservation {
         let now = self.clock.now();
         self.expire_stale_fields(now);
@@ -899,6 +920,24 @@ mod tests {
 
     fn key(uri: &str) -> miliastra_playback::TrackKey {
         track(uri).track_ref.key
+    }
+
+    #[test]
+    fn set_live_tuning_switches_stability_parameters_without_rebuilding_observer() {
+        let clock = ManualClock::new(Instant::now());
+        let mut observer = PlayerObserver::new(clock, PlayerObservationConfig::default());
+        let before = observer.observation_config();
+        assert_ne!(before.uri_stable_samples, 5);
+
+        observer.set_live_tuning(5, 7, Duration::from_secs(42));
+
+        let after = observer.observation_config();
+        assert_eq!(after.uri_stable_samples, 5);
+        assert_eq!(after.transport_stable_samples, 7);
+        assert_eq!(after.stale_timeout, Duration::from_secs(42));
+        // 其它重启参数不受影响（同一观测器继续服务，不丢状态）。
+        assert_eq!(after.restart_near_start, before.restart_near_start);
+        assert_eq!(after.restart_minimum_drop, before.restart_minimum_drop);
     }
 
     #[test]

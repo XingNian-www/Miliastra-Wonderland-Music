@@ -140,7 +140,8 @@ impl ApplicationRuntime {
         allow_local: bool,
         timeout_confirms: bool,
     ) -> Result<SongRequestDecision> {
-        let timeout = Duration::from_millis(self.lifecycle.config.timing.decision.timeout_ms);
+        let timeout =
+            Duration::from_millis(super::live_decision_timeout_ms(&self.lifecycle.live_configs));
         let map_web_decision = |decision| match decision {
             DecisionAction::Confirm => SongRequestDecision::Confirm,
             DecisionAction::Skip => SongRequestDecision::Skip,
@@ -157,7 +158,7 @@ impl ApplicationRuntime {
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
             let messages = self.wait_for_chat_decision_messages_with_ids(
                 &mut reader,
-                self.lifecycle.config.timing.decision.poll_ms,
+                super::live_decision_poll_ms(&self.lifecycle.live_configs),
                 deadline.saturating_duration_since(Instant::now()),
             )?;
             if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {

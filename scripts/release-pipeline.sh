@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/release-pipeline.sh
 #
-# 7.4.x 及后续版本的「发布 + 双机部署」可复用流程脚本（本地留存的 runbook）。
+# 7.4.x 及后续版本的「发布 + 双机部署」可复用流程脚本（已纳入仓库，随版本发布）。
 #
 # 为什么有这个脚本：每次发版都要记住一串容易漏的约束——
 #   * 推送必须绕开全局 insteadOf / ghfast.top 镜像，否则 TLS 被改写；
@@ -14,16 +14,20 @@
 #   1) **默认 dry-run**：只打印将执行的命令；只有显式 `--execute` 才做远端写操作
 #      （push / workflow_dispatch / 下载 / 部署 / commit）。
 #   2) 不重复造轮子：部署复用 scripts/deploy-exe.sh，代理下载 + .119 单机链路
-#      复用 technical-docs/scripts/deploy-remote.sh（该文件在 gitignored 的
-#      technical-docs 下，因此本脚本是本机 runbook，不随仓库分发）。
+#      复用 technical-docs/scripts/deploy-remote.sh（后者在 gitignored 的
+#      technical-docs 下，克隆仓库后需在本机补齐该组件）。
+#      本脚本自身已随仓库版本化：commit 步骤用 `git add -A -- .` 正常暂存，
+#      以后改脚本时改动会一并提交，不再排除自身。
 #   3) 提交信息不允许任何 trailer（AGENTS.md 明确要求）。
 #   4) 验收只注入「应被拒绝」的命令，避免在真实公共大厅刷屏。
 #   5) 远程面板令牌**绝不写进文件/提交/报告**：只从环境变量
 #      `MILIASTRA_PANEL_TOKEN` 读取；`--execute` 且跑 verify / announce 时为空直接报错。
 #      dry-run 不要求该变量。不要用命令行参数传令牌（会留在 shell history）。
-#   6) 部署前先经 `POST /chat/send` **发言一次**，提示「5 秒后将更新版本，
-#      期间会有短暂停止」，再 sleep 5 秒才动 exe；默认只在第一台机器发一次，
-#      避免两台克隆机重复刷屏（`--announce-hosts` 可显式指定）。
+#   6) 部署前经 `POST /chat/send` 对**每台被部署主机各发一次**预告，
+#      提示「5 秒后将更新版本，期间会有短暂停止」，全部发完后统一 sleep 5 秒
+#      才动 exe；避免只提醒其中一台导致另一台玩家毫无准备。
+#      默认主机集合 = 去重后的 `--hosts`（部署主机），`--announce-hosts` 可显式覆盖，
+#      `--skip-announce` 可整体跳过。
 #
 # 用法：
 #   scripts/release-pipeline.sh --version 7.4.1 --step all
@@ -32,7 +36,7 @@
 #   # 需要 --execute 且涉及 announce / verify 时，先从环境/密钥管理器注入令牌（不要写进文件）：
 #   export MILIASTRA_PANEL_TOKEN='<从密钥管理器取得的令牌>'
 #   scripts/release-pipeline.sh --version 7.4.1 --step verify --execute
-#   # 只想单独发一次更新预告（5 秒后由调用方自行部署）：
+#   # 只想单独对每台部署主机各发一次更新预告（5 秒后由调用方自行部署）：
 #   scripts/release-pipeline.sh --version 7.4.1 --step announce --execute
 #   # CI 已完成、只想补部署：
 #   scripts/release-pipeline.sh --version 7.4.1 --step deploy --execute \
@@ -61,7 +65,7 @@ EXE_NAME='miliastra-wonderland-music.exe'
 PANEL_TOKEN="${MILIASTRA_PANEL_TOKEN:-}"
 ANNOUNCE_TEXT='5秒后将更新版本，期间会有短暂停止，请稍候。'
 ANNOUNCE_DELAY=5
-ANNOUNCE_HOSTS=''   # 空=默认只在 HOSTS 的第一台发言一次
+ANNOUNCE_HOSTS=''   # 空=默认对 HOSTS 去重后的每一台被部署主机各发一次
 SKIP_ANNOUNCE=0
 ARTIFACT_NAME='miliastra-wonderland-music-windows-x64-openvino'
 DEPLOY_EXE="scripts/deploy-exe.sh"
@@ -139,7 +143,11 @@ preflight() {
   if [[ -z "$VERSION" ]]; then VERSION="${cargo_version%-dev*}"; fi
   [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "版本号必须是 X.Y.Z：$VERSION"
   [[ "$VERSION" == "$cargo_version" ]] || warn "Cargo.toml=$cargo_version 与脚本版本=$VERSION 不一致"
-  [[ -f ".github/release-notes/v${VERSION}.md" ]] || die "缺少发布说明 .github/release-notes/v${VERSION}.md"
+  # commit / test / preflight 不创建 Release，不应要求该版本的发布说明已存在
+  # （例如只改脚本时用 --version 7.4.2 --step commit 做 dry-run）。
+  if [[ "$STEP" != 'commit' && "$STEP" != 'test' && "$STEP" != 'preflight' ]]; then
+    [[ -f ".github/release-notes/v${VERSION}.md" ]] || die "缺少发布说明 .github/release-notes/v${VERSION}.md"
+  fi
   [[ -f "$DEPLOY_EXE" ]] || die "缺少组件 $DEPLOY_EXE"
   [[ -f "$DEPLOY_REMOTE" ]] || warn "缺少组件 $DEPLOY_REMOTE（--deploy-mode local 可不用）"
   for cmd in git gh curl unzip ssh scp awk python3; do command -v "$cmd" >/dev/null || die "缺少命令 $cmd"; done
@@ -150,7 +158,7 @@ preflight() {
   printf '  工作树：\n'
   git status --short | sed 's/^/    /'
   printf '  发布说明：.github/release-notes/v%s.md\n' "$VERSION"
-  printf '  本脚本仅本地留存，commit 步骤会排除它\n'
+  printf '  脚本已入库，commit 步骤会一并提交脚本改动\n'
   # --execute 且本步骤会跑到 announce / verify 时提前要求令牌，
   # 避免先做了一串远端写操作才在最后报错。
   local need_token=0
@@ -176,8 +184,7 @@ step_commit() {
     *Co-authored-by:*|*Signed-off-by:*|*Reviewed-by:*|*Co-Authored-By:*)
       die '提交信息禁止任何 trailer（AGENTS.md）' ;;
   esac
-  run '暂存改动（排除本脚本：按要求只本地留存，不进仓库）' \
-    git add -A -- . ':(exclude)scripts/release-pipeline.sh'
+  run '暂存改动（脚本已入库，改动一并提交）' git add -A -- .
   run '提交（无 trailer）' git commit -m "$MESSAGE"
 }
 
@@ -288,8 +295,9 @@ download_artifact() {
 
 step_download() { download_artifact; }
 
-# 部署前经面板 API `POST /chat/send` 发言一次，再等 5 秒才动 exe。
-# 只发一次（默认第一台机器），避免两台克隆机在大厅重复刷屏。
+# 部署前经面板 API `POST /chat/send` 对每台被部署主机各发一次预告，
+# 全部发完后**统一**等 5 秒才动 exe（不要每台各睡一次）。
+# 默认主机 = 去重后的 `--hosts`；`--announce-hosts` 显式覆盖时也去重。
 # 端点语义见 src/interfaces/http/routes/tasks_chat.rs:98：query 参数 text /
 # usePrefix，mutating 路由必须 POST，鉴权头 x-miliastra-token。
 step_announce() {
@@ -297,15 +305,23 @@ step_announce() {
     warn '已指定 --skip-announce，跳过更新预告'
     return 0
   fi
+  local announce_source
+  if [[ -n "$ANNOUNCE_HOSTS" ]]; then
+    announce_source="$ANNOUNCE_HOSTS"
+  else
+    announce_source="$HOSTS"
+  fi
+  # 按空白切分并去重；--hosts 里写重复项也只发一次。
+  ANNOUNCE_HOSTS="$(printf '%s\n' $announce_source | awk 'NF && !seen[$0]++')"
   if [[ -z "$ANNOUNCE_HOSTS" ]]; then
-    ANNOUNCE_HOSTS="$(printf '%s\n' $HOSTS | head -1)"
+    die '没有可发送更新预告的主机'
   fi
   if [[ $DRY -eq 1 ]]; then
     for host in $ANNOUNCE_HOSTS; do
-      printf '  [dry-run] POST http://%s:18888/chat/send?text=<URL编码>&usePrefix=false（发言一次）\n' "$host"
+      printf '  [dry-run] POST http://%s:18888/chat/send?text=<URL编码>&usePrefix=false（每台各发一次）\n' "$host"
       printf '            文本=%s\n' "$ANNOUNCE_TEXT"
     done
-    printf '  [dry-run] sleep %s（给玩家缓冲）后进入部署\n' "$ANNOUNCE_DELAY"
+    printf '  [dry-run] sleep %s（全部发完后统一给玩家缓冲）后进入部署\n' "$ANNOUNCE_DELAY"
     return 0
   fi
   [[ -n "$PANEL_TOKEN" ]] || die 'announce 需要环境变量 MILIASTRA_PANEL_TOKEN（令牌不得写入文件/提交/报告）'
@@ -314,13 +330,13 @@ step_announce() {
   encoded="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$ANNOUNCE_TEXT")"
   for host in $ANNOUNCE_HOSTS; do
     url="http://$host:18888/chat/send?text=$encoded&usePrefix=false"
-    log "更新预告：调用 $host 的 /chat/send 发言一次"
+    log "更新预告：调用 $host 的 /chat/send（每台各发一次）"
     response="$(curl -sS -m 10 -X POST -H "x-miliastra-token: $PANEL_TOKEN" "$url")"
     printf '%s' "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' \
       || die "$host /chat/send 未返回 ok:true：$response"
     printf '  已入队：%s\n' "$response"
   done
-  log "等待 ${ANNOUNCE_DELAY}s 后开始更新（期间会有短暂停止）"
+  log "全部主机已预告，等待 ${ANNOUNCE_DELAY}s 后开始更新（期间会有短暂停止）"
   sleep "$ANNOUNCE_DELAY"
 }
 
@@ -332,7 +348,8 @@ step_deploy() {
       die '部署需要 artifact id / expected bytes，先跑 --step artifact'
     fi
   fi
-  # 无论 all 流程还是单独 --step deploy，部署前都先发言一次并等 5 秒。
+  # 无论 all 流程还是单独 --step deploy，部署前都对每台主机各发一次预告，
+  # 全部发完后统一等 5 秒。
   step_announce
   if [[ "$DEPLOY_MODE" == 'components' && "$HOSTS" == "$HOSTS_DEFAULT" ]]; then
     # 组件 1：deploy-remote.sh 自带「代理下载 + .119 哈希校验 + 备份/停进程/替换 + 计划任务启动 + 面板健康检查」。

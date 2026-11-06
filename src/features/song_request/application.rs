@@ -572,6 +572,23 @@ impl SongRequestExecution<'_> {
             display.to_owned()
         }
     }
+
+    /// 结果文案的「来源显示名」：只有好友私聊点歌才带名字。
+    ///
+    /// `SongCommand::friend_username` 由 `parse_friend_command` 填充，大厅命令恒为空；
+    /// 它也参与 `SongCommand::lock_key()`，是数据身份，绝不能为了排版改写它。
+    /// 旧实现无条件用 `display_or_actor(&song.friend_username)`：大厅请求的
+    /// `actor_display`（软件显示名）非空时会被塞进 `ResolvedSongRequest::friend_username`，
+    /// 于是大厅结果也渲染成「好友XXX:搜索到:」。这里按命令形状区分，而不是按
+    /// `actor_authority`——后者只是颜色/身份映射推出来的**最低权限**，大厅里
+    /// 被映射成 Friend 的成员仍是大厅命令，不该带好友前缀。
+    fn source_display_name(&self, song: &SongCommand) -> String {
+        if song.friend_username.trim().is_empty() {
+            String::new()
+        } else {
+            self.display_or_actor(&song.friend_username)
+        }
+    }
 }
 
 struct SongRequestExecution<'a> {
@@ -824,7 +841,7 @@ impl SongRequestExecution<'_> {
                 ai_original_text: String::new(),
                 track: None,
                 candidate_snapshot: Vec::new(),
-                ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
+                ..ResolvedSongRequest::base(song, self.source_display_name(song))
             }));
         }
         self.resolve_ai_song_request(song, true)
@@ -1127,7 +1144,7 @@ impl SongRequestExecution<'_> {
                     ai_original_text: song.keyword.clone(),
                     track: Some(selected.playable_track()),
                     candidate_snapshot: vec![selected],
-                    ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
+                    ..ResolvedSongRequest::base(song, self.source_display_name(song))
                 }));
             }
             SongRequestDecision::Skip
@@ -1150,7 +1167,7 @@ impl SongRequestExecution<'_> {
             ai_original_text: song.keyword.clone(),
             track: Some(candidate.playable_track()),
             candidate_snapshot: selection,
-            ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
+            ..ResolvedSongRequest::base(song, self.source_display_name(song))
         }))
     }
 
@@ -1230,17 +1247,16 @@ impl SongRequestExecution<'_> {
             // 本地匹配度严格高于在线结果时才展示本地搜索结果。
             let local_offer = self.plain_local_offer_after_online_pick(&request.keyword, &picked);
             let allow_local = local_offer.is_some();
-            let song_title = picked.candidate.text.clone();
             let actions = if self.ai.enabled() && self.ai_command_allowed() {
                 "@确认@跳过@换源@AI@选择"
             } else {
                 "@确认@跳过@换源@选择"
             };
-            let mut messages = vec![format!(
-                "{}搜索到:{},{}",
-                request.label(),
-                song_title,
-                actions
+            // 与其它搜索结果共用同一套结构化单行排版（78 显示宽度预算）。
+            let mut messages = vec![decision_track_line(
+                &format!("{}搜索到:", request.label()),
+                &format!(",{actions}"),
+                &picked.candidate,
             )];
             if let Some(candidate) = local_offer.as_ref().and_then(|offer| offer.first()) {
                 messages.push(local_library_line(&request.label(), candidate));
@@ -1385,7 +1401,7 @@ impl SongRequestExecution<'_> {
                         ai_original_text: String::new(),
                         track: Some(candidate.playable_track()),
                         candidate_snapshot: vec![candidate],
-                        ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
+                        ..ResolvedSongRequest::base(song, self.source_display_name(song))
                     }));
                 }
                 NoCandidateOutcome::SwitchSource => {
@@ -1428,7 +1444,7 @@ impl SongRequestExecution<'_> {
                     ai_original_text: String::new(),
                     track: Some(picked.candidate.playable_track()),
                     candidate_snapshot: picked.candidate_snapshot,
-                    ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
+                    ..ResolvedSongRequest::base(song, self.source_display_name(song))
                 }))
             }
             SongRequestDecision::SelectIndex(index) => {
@@ -1442,7 +1458,7 @@ impl SongRequestExecution<'_> {
                     ai_original_text: String::new(),
                     track: Some(candidate.playable_track()),
                     candidate_snapshot: picked.candidate_snapshot,
-                    ..ResolvedSongRequest::base(song, self.display_or_actor(&song.friend_username))
+                    ..ResolvedSongRequest::base(song, self.source_display_name(song))
                 }))
             }
             SongRequestDecision::Skip => {
@@ -2340,12 +2356,15 @@ fn song_label(song: &SongCommand) -> String {
     source_label(&song.friend_username)
 }
 
+/// 来源前缀：好友私聊点歌保留「好友X」标识，但**不带冒号**——下游文案
+/// 自己带「搜索到:」「AI匹配:」等冒号，旧写法 `好友X:搜索到:` 会出现两个冒号。
+/// 大厅命令的 username 为空 → 直接返回空串（结果就是 `搜索到: …`）。
 fn source_label(username: &str) -> String {
     let username = username.trim();
     if username.is_empty() {
         String::new()
     } else {
-        format!("好友{}:", username)
+        format!("好友{username} ")
     }
 }
 
@@ -3908,6 +3927,97 @@ mod tests {
 
         // 展示层只读：candidate.text 仍是队列 keyword / 去重身份。
         assert_eq!(candidate.text, original_text);
+    }
+
+    /// task-40：来源前缀只用于好友私聊，且不再带冒号（避免 `好友X:搜索到:` 双冒号）。
+    #[test]
+    fn source_labels_keep_one_prefix_and_no_double_colon() {
+        assert_eq!(source_label(""), "");
+        assert_eq!(source_label("  "), "");
+        assert_eq!(source_label("Alice"), "好友Alice ");
+        // 大厅命令的 friend_username 为空 → 结果直接是 `搜索到: …`。
+        assert_eq!(song_label(&command()), "");
+        let friend = SongCommand {
+            friend_username: "Alice".to_string(),
+            ..command()
+        };
+        assert_eq!(song_label(&friend), "好友Alice ");
+    }
+
+    /// 改前：大厅请求带 actor_display 时结果渲染成 `好友大厅玩家:搜索到:…`；
+    /// 改后：大厅结果不带任何好友前缀，且与 78 列预算兼容、keyword 不变。
+    #[test]
+    fn hall_search_result_has_no_friend_prefix_even_with_actor_display() {
+        let mut ctx = context();
+        ctx.actor_display = "大厅玩家".to_string();
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
+        application()
+            .execute(&ctx, &command(), &mut port)
+            .expect("hall request");
+        let prompt = port.decision_prompts.borrow()[0].clone();
+        assert!(
+            prompt.starts_with("搜索到:"),
+            "改前=好友大厅玩家:搜索到:…；改后=搜索到:…：{prompt}"
+        );
+        assert!(!prompt.contains("好友"), "大厅结果不该出现好友前缀：{prompt}");
+        assert!(
+            crate::text::display_width(&prompt)
+                <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+            "结果行必须兼容 78 列预算：{prompt}"
+        );
+        // 展示文案改动不能碰队列 keyword / 去重身份。
+        assert_eq!(port.played.borrow()[0].keyword, "晴天 - 周杰伦");
+    }
+
+    /// 改前：好友结果 `好友Alice:搜索到:…`（两个冒号）；
+    /// 改后：`好友Alice 搜索到:…`，保留来源、只有一个冒号。
+    #[test]
+    fn friend_search_result_keeps_single_source_prefix_without_double_colon() {
+        let mut ctx = context();
+        ctx.message_type = "pink".to_string();
+        ctx.username = "Alice".to_string();
+        ctx.authority = crate::features::command::CommandAuthority::Friend;
+        let friend = SongCommand {
+            friend_username: "Alice".to_string(),
+            ..command()
+        };
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
+        application()
+            .execute(&ctx, &friend, &mut port)
+            .expect("friend request");
+        let prompt = port.decision_prompts.borrow()[0].clone();
+        assert!(
+            prompt.starts_with("好友Alice 搜索到:"),
+            "改前=好友Alice:搜索到:…；改后=好友Alice 搜索到:…：{prompt}"
+        );
+        assert_eq!(prompt.matches(':').count(), 1, "只能有一个冒号：{prompt}");
+        assert!(
+            crate::text::display_width(&prompt)
+                <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+            "结果行必须兼容 78 列预算：{prompt}"
+        );
+        assert_eq!(port.played.borrow()[0].keyword, "晴天 - 周杰伦");
+    }
+
+    /// @N 下标映射不受前缀改动影响：@3 仍选中 snapshot[2]，keyword 仍是候选 text。
+    #[test]
+    fn candidate_index_mapping_and_keyword_survive_prefix_cleanup() {
+        let first = test_candidate("第一首 - 甲", "miliastra://track/qqmusic/1");
+        let second = test_candidate("第二首 - 乙", "miliastra://track/qqmusic/2");
+        let third = test_candidate("第三首 - 丙", "miliastra://track/qqmusic/3");
+        let mut selected = picked("第一首 - 甲", "miliastra://track/qqmusic/1");
+        selected.candidate_snapshot = vec![first, second, third.clone()];
+        let mut port = FakePort::idle([Some(selected)]);
+        port.decisions = VecDeque::from([
+            SongRequestDecision::Select,
+            SongRequestDecision::SelectIndex(3),
+        ]);
+        application()
+            .execute(&context(), &command(), &mut port)
+            .expect("song request");
+        assert_eq!(port.played.borrow()[0].keyword, third.text);
     }
 
     #[test]

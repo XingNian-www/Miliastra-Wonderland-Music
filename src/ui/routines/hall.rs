@@ -890,8 +890,14 @@ mod tests {
     /// 真实一级（千星大厅）截图。合成黑底帧会被状态机的 loading 判据吞掉
     /// （`src/ui/state.rs` 第 55 节），改用实际执行路径上的真帧。
     fn primary_frame(config: &AppConfig) -> DynamicImage {
-        let frame = image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg")
+        let mut frame = image::open("tests/fixtures/ui/hall-primary-1920x1080.jpg")
             .expect("打开真实大厅帧失败");
+        // 夹具是有损 JPEG，底栏没有纯白；吸附成纯白以匹配线上无损抓图的前提。
+        crate::ui::state::snap_near_white_to_pure_white(
+            &mut frame,
+            config.screen.hall_bar_rect.into(),
+            225,
+        );
         assert_eq!(
             (frame.width(), frame.height()),
             (config.screen.expected_width, config.screen.expected_height),

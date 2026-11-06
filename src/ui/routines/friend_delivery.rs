@@ -3409,7 +3409,14 @@ mod tests {
     /// 合成黑底帧会被判成 loading（`src/ui/state.rs` 第 55 节），代表不了真实执行路径；
     /// 这里统一改用实际运行路径上的真帧，让状态机按真实界面归类。
     fn primary_frame(config: &AppConfig) -> DynamicImage {
-        load_real_frame("tests/fixtures/ui/hall-primary-1920x1080.jpg", config)
+        let mut frame = load_real_frame("tests/fixtures/ui/hall-primary-1920x1080.jpg", config);
+        // 夹具是有损 JPEG，底栏没有纯白；吸附成纯白以匹配线上无损抓图的前提。
+        crate::ui::state::snap_near_white_to_pure_white(
+            &mut frame,
+            config.screen.hall_bar_rect.into(),
+            225,
+        );
+        frame
     }
 
     /// 真实二级（私聊）截图，列表**已滚动、无大厅行**（多数好友投递用例的默认帧）。

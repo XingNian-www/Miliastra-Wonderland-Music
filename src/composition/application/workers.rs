@@ -633,18 +633,27 @@ impl DeferredChatSender {
                         .live_configs
                         .identity
                         .replace_display_names(&message.text);
+                    // 普通回复同样可能超过聊天单条显示宽度（超过会被游戏截断）：
+                    // 走 ChatOutput 的自动换行入口——超宽才按 80 宽切段并批量发送，
+                    // 短文本仍是单条。段间间隔与批量发送同源，不另造硬编码节奏。
+                    let batch_interval_ms =
+                        self.live_configs.snapshot().timing.command.help_batch_ms;
                     let result = match target {
-                        DeferredChatTarget::Primary => self.chat_output.send(&text),
-                        DeferredChatTarget::SecondaryCurrentHall => {
-                            self.chat_output.send_current_chat(&text)
+                        DeferredChatTarget::Primary => {
+                            self.chat_output.send_wrapped(&text, batch_interval_ms)
                         }
+                        DeferredChatTarget::SecondaryCurrentHall => self
+                            .chat_output
+                            .send_current_chat_wrapped(&text, batch_interval_ms),
                         DeferredChatTarget::CurrentHall => {
                             let residency = self.active_ui_residency()?;
                             match residency {
-                                UiResidency::Primary => self.chat_output.send(&text),
-                                UiResidency::SecondaryCurrentHall => {
-                                    self.chat_output.send_current_chat(&text)
+                                UiResidency::Primary => {
+                                    self.chat_output.send_wrapped(&text, batch_interval_ms)
                                 }
+                                UiResidency::SecondaryCurrentHall => self
+                                    .chat_output
+                                    .send_current_chat_wrapped(&text, batch_interval_ms),
                             }
                         }
                     };

@@ -38,8 +38,7 @@ pub(crate) fn format_play_message(status: &PlayerStatus) -> String {
 ///
 /// 单独拆出来，是为了让"状态行模板"和"歌单前缀模板"共用同一批值：
 /// 前缀模板拿到的 {内容} 就是这里渲染出的整行。
-fn status_vars(status: &PlayerStatus, requester: &str) -> ReplyVars {
-    let title = optional_song_title(&status.name, &status.singer);
+fn status_vars(status: &PlayerStatus, requester: &str, title: String) -> ReplyVars {
     let state = match status.status.as_str() {
         "playing" => "播放",
         "paused" => "暂停",
@@ -67,15 +66,44 @@ fn status_vars(status: &PlayerStatus, requester: &str) -> ReplyVars {
 }
 
 pub(crate) fn format_status(status: &PlayerStatus) -> String {
-    let vars = status_vars(status, status.requester.trim());
+    format_status_with_budget(status, status.requester.trim(), crate::text::chat_layout::CHAT_LAYOUT_BUDGET)
+}
+
+/// `@状态` 一行排版：曲名（含歌手）让位给前缀/进度/音量/点歌人后缀，整行 ≤ budget。
+fn format_status_with_budget(status: &PlayerStatus, requester: &str, budget: usize) -> String {
+    let has_title = !optional_song_title(&status.name, &status.singer).is_empty();
     // 有歌 / 无歌用两张主模板：两种排版的冒号与空格位置不同，
     // 不能靠同一张模板加空变量凑出来。
-    let spec = if vars.get("曲名").is_some_and(|title| title.is_empty()) {
-        &templates::STATUS_WITHOUT_SONG
-    } else {
+    let spec = if has_title {
         &templates::STATUS_WITH_SONG
+    } else {
+        &templates::STATUS_WITHOUT_SONG
     };
-    crate::features::reply_template::render(spec, None, &vars).text
+    if !has_title {
+        let vars = status_vars(status, requester, String::new());
+        return crate::features::reply_template::render(spec, None, &vars).text;
+    }
+    // 先渲染「曲名为空」的骨架，量出前后缀占的宽度，再给曲名分配剩余预算。
+    let skeleton = crate::features::reply_template::render(
+        spec,
+        None,
+        &status_vars(status, requester, String::new()),
+    )
+    .text;
+    let title_budget = budget
+        .saturating_sub(crate::text::display_width(&skeleton))
+        .max(8);
+    let title = if status.name.trim().is_empty() {
+        crate::text::chat_layout::chat_track_label(&status.singer, &[], title_budget)
+    } else {
+        let artists = if status.singer.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![status.singer.clone()]
+        };
+        crate::text::chat_layout::chat_track_label(&status.name, &artists, title_budget)
+    };
+    crate::features::reply_template::render(spec, None, &status_vars(status, requester, title)).text
 }
 
 /// @状态 文本。歌单模式下用 `[归属的歌单]` 前缀，并省略尾部的点歌人。
@@ -91,9 +119,19 @@ pub(crate) fn format_status_with_mode(
         Some(owner) => {
             // 歌单模式用归属替代点歌人：清空 requester 渲染整行，
             // 再由前缀模板包一层，两处都能被用户改写。
+            // 前缀本身也占显示宽度，内层曲名预算要把它扣掉，保证前缀与内容同条。
+            let prefix_skeleton = crate::features::reply_template::render(
+                &templates::STATUS_PLAYLIST_PREFIX,
+                None,
+                &ReplyVars::new().with("歌单归属", owner).with("内容", ""),
+            )
+            .text;
+            let inner_budget = crate::text::chat_layout::CHAT_LAYOUT_BUDGET
+                .saturating_sub(crate::text::display_width(&prefix_skeleton))
+                .max(8);
             let mut bare = status.clone();
             bare.requester.clear();
-            let inner = format_status(&bare);
+            let inner = format_status_with_budget(&bare, "", inner_budget);
             crate::features::reply_template::render(
                 &templates::STATUS_PLAYLIST_PREFIX,
                 None,
@@ -119,7 +157,7 @@ pub(crate) fn format_lyrics(status: &PlayerStatus) -> String {
 ///
 /// 取整用 floor：进度不能虚报（59.6 秒还没到 1 分钟）。
 /// 原来有两份实现（一份 round、一份 floor），同一进度能差一秒。
-fn format_duration(value: f64) -> String {
+pub(crate) fn format_duration(value: f64) -> String {
     if !value.is_finite() || value <= 0.0 {
         return "0:00".to_string();
     }

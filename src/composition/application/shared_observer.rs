@@ -150,14 +150,18 @@ impl ApplicationRuntime {
                         )?;
                         hash_time = finish_observer_stage(&mut stage_started);
                         let now = Instant::now();
+                        // 变化门控阈值每次从当前 live 快照取（保存配置后下一帧即生效），
+                        // 不能退回启动期冻结的 `self.lifecycle.config` 副本。
+                        let (change_mean_threshold, change_pixel_threshold) =
+                            chat_change_thresholds(&live);
                         let scan_due = gate.scan_due(
                             &fingerprint,
                             now,
                             refresh.is_some(),
                             Duration::from_millis(live.timing.chat_scan.fallback_ms.max(1)),
                             Duration::from_millis(live.timing.chat_scan.change_debounce_ms),
-                            config.ocr.change_mean_threshold,
-                            config.ocr.change_pixel_threshold,
+                            change_mean_threshold,
+                            change_pixel_threshold,
                         );
                         gate_time = finish_observer_stage(&mut stage_started);
                         if !scan_due {
@@ -314,6 +318,18 @@ fn finish_observer_stage(started: &mut Option<Instant>) -> Duration {
 
 fn capture_satisfies_refresh(captured_at: Instant, refresh: Option<Instant>) -> bool {
     refresh.is_none_or(|requested_at| captured_at >= requested_at)
+}
+
+/// 聊天区变化门控的两个阈值。
+///
+/// 入参必须是**当前** live 快照（`live_configs.snapshot()`），而不是启动期
+/// 缓存的配置：`ocr.change_mean_threshold` / `ocr.change_pixel_threshold`
+/// 接线为 Live 后，保存配置应在下一帧生效，无需重载子进程。
+fn chat_change_thresholds(config: &crate::config::AppConfig) -> (f32, f32) {
+    (
+        config.ocr.change_mean_threshold,
+        config.ocr.change_pixel_threshold,
+    )
 }
 
 #[cfg(test)]
@@ -588,6 +604,29 @@ mod tests {
         assert_eq!(
             passive_secondary_identity(false, Some("player(remark)")),
             ChatIdentity::Friend("remark".into())
+        );
+    }
+
+    /// 回归（Live 化批次4b）：变化门控阈值取自当前 live 快照，不是启动期缓存。
+    ///
+    /// 生产读取点在观察循环里传 `&live`（`live_configs.snapshot()`）；
+    /// 这里直接证明该纯函数使用传入配置的 `ocr.change_*`，且 LiveConfigs
+    /// 的快照携带被保存后的新值——若有人改回读 `self.lifecycle.config`，
+    /// 该读取点就不再经过此函数，需同步修改本测试。
+    #[test]
+    fn chat_change_thresholds_read_the_current_live_snapshot() {
+        let mut config = crate::config::AppConfig::default();
+        config.ocr.change_mean_threshold = 12.5;
+        config.ocr.change_pixel_threshold = 0.25;
+        assert_eq!(chat_change_thresholds(&config), (12.5, 0.25));
+
+        let live = crate::config::LiveConfigs::from_config(&config);
+        assert_eq!(chat_change_thresholds(&live.snapshot()), (12.5, 0.25));
+
+        assert_ne!(
+            chat_change_thresholds(&crate::config::AppConfig::default()),
+            (12.5, 0.25),
+            "默认配置应与自定义值不同，避免测试因默认值巧合通过"
         );
     }
 }

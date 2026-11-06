@@ -97,13 +97,11 @@ pub(crate) enum ImmediateAdministrationOutcome {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct AdministrationApplication {
-    help_batch_ms: u64,
-}
+pub(crate) struct AdministrationApplication;
 
 impl AdministrationApplication {
-    pub(crate) const fn new(help_batch_ms: u64) -> Self {
-        Self { help_batch_ms }
+    pub(crate) const fn new() -> Self {
+        Self
     }
 
     pub(crate) fn execute<P: AdministrationApplicationPort + ?Sized>(
@@ -111,6 +109,7 @@ impl AdministrationApplication {
         context: &AdministrationCommandContext,
         command: &AdministrationCommand,
         port: &mut P,
+        help_batch_ms: u64,
     ) -> Result<()> {
         match command {
             AdministrationCommand::Help => {
@@ -119,7 +118,7 @@ impl AdministrationApplication {
                     "@帮助",
                     &reply_template::HELP_SONG_REQUEST,
                     &ReplyVars::new(),
-                    self.help_batch_ms,
+                    help_batch_ms,
                 )
             }
             AdministrationCommand::EntertainmentHelp => {
@@ -128,7 +127,7 @@ impl AdministrationApplication {
                     "@娱乐帮助",
                     &reply_template::HELP_ENTERTAINMENT,
                     &ReplyVars::new(),
-                    self.help_batch_ms,
+                    help_batch_ms,
                 )
             }
             AdministrationCommand::SetCommandsEnabled { enabled, .. } => {
@@ -479,6 +478,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingPort {
         batches: Vec<Vec<String>>,
+        /// 每批实际收到的发送间隔，用于证明间隔是**每次调用传入**的实时值。
+        delays: Vec<u64>,
         commands_enabled: bool,
         replies: Vec<String>,
     }
@@ -514,7 +515,7 @@ mod tests {
     #[test]
     fn alternating_command_switches_complete_without_queued_state_replay() {
         let mut port = RecordingPort::default();
-        let application = AdministrationApplication::new(150);
+        let application = AdministrationApplication::new();
         for enabled in [false, true, false] {
             let context = AdministrationCommandContext {
                 message_type: "pink".to_string(),
@@ -551,7 +552,8 @@ mod tests {
             Ok(())
         }
 
-        fn send_hall_batch(&mut self, messages: &[&str], _delay_ms: u64) -> Result<()> {
+        fn send_hall_batch(&mut self, messages: &[&str], delay_ms: u64) -> Result<()> {
+            self.delays.push(delay_ms);
             self.batches.push(
                 messages
                     .iter()
@@ -570,16 +572,36 @@ mod tests {
             username: "测试".to_string(),
             user_command: "@帮助".to_string(),
         };
-        let application = AdministrationApplication::new(150);
+        let application = AdministrationApplication::new();
 
         application
-            .execute(&context, &AdministrationCommand::Help, &mut port)
+            .execute(&context, &AdministrationCommand::Help, &mut port, 150)
             .expect("help command");
 
         assert_eq!(port.batches.len(), 1);
         assert_eq!(port.batches[0].len(), 3);
         assert!(port.batches[0].iter().all(|line| line.contains("点歌")));
         assert!(port.batches[0].iter().all(|line| !line.contains("斗地主")));
+    }
+
+    /// 帮助分批间隔是既有 Live 字段：执行时从实时快照取值，每次调用各用各自的值。
+    /// 这条钉住「不再使用启动副本」——两次执行传入不同间隔，端口必须收到两个不同值。
+    #[test]
+    fn help_batch_delay_is_taken_per_call_not_from_a_startup_copy() {
+        let mut port = RecordingPort::default();
+        let context = AdministrationCommandContext {
+            message_type: "blue".to_string(),
+            username: "测试".to_string(),
+            user_command: "@帮助".to_string(),
+        };
+        let application = AdministrationApplication::new();
+        application
+            .execute(&context, &AdministrationCommand::Help, &mut port, 250)
+            .expect("first help");
+        application
+            .execute(&context, &AdministrationCommand::Help, &mut port, 900)
+            .expect("second help");
+        assert_eq!(port.delays, [250, 900], "两次执行各用传入的实时间隔");
     }
 
     /// 帮助文案必须经过 port.render_template，否则 replies.overrides 不生效。
@@ -639,8 +661,8 @@ mod tests {
             username: "测试".to_string(),
             user_command: "@帮助".to_string(),
         };
-        AdministrationApplication::new(150)
-            .execute(&context, &AdministrationCommand::Help, &mut port)
+        AdministrationApplication::new()
+            .execute(&context, &AdministrationCommand::Help, &mut port, 150)
             .expect("help command");
 
         // 帮助是单条模板：必须经 port 渲染过一次，才能让用户覆盖生效。

@@ -176,7 +176,16 @@ fn scan_frame_is_fresh(captured_at: Instant, not_before: Option<Instant>) -> boo
     not_before.is_none_or(|boundary| captured_at >= boundary)
 }
 
-#[allow(dead_code)]
+/// 尺寸不符告警开关：每次从 live 快照读，避免保存后仍用启动值。
+///
+/// 注意：当前唯一调用点是启动时的 `warn_if_screen_size_mismatch`（lifecycle.rs:51），
+/// 因此接线后的可观察变化要到该检查再次被调用时才出现；这里只负责取值来源，
+/// 不改变调用时机。
+fn screen_size_warning_enabled(config: &AppConfig) -> bool {
+    config.screen.warn_on_size_mismatch
+}
+
+#[cfg(test)]
 fn primary_rescan_can_publish(stable_kind: Option<UiStateKind>) -> bool {
     stable_kind == Some(UiStateKind::Primary)
 }
@@ -874,7 +883,10 @@ impl ApplicationRuntime {
                 return Ok(());
             }
         };
-        if self.lifecycle.config.screen.warn_on_size_mismatch
+        // 告警开关每次读 live 快照（保存后下一次调用即生效），不缓存启动值。
+        let warn_on_size_mismatch =
+            screen_size_warning_enabled(&self.lifecycle.live_configs.snapshot());
+        if warn_on_size_mismatch
             && (frame.width() != self.lifecycle.config.screen.expected_width
                 || frame.height() != self.lifecycle.config.screen.expected_height)
         {
@@ -3426,6 +3438,22 @@ impl ApplicationRuntime {
 
 #[cfg(test)]
 mod tests {
+    /// 回归（Live 化批次4b）：尺寸不符告警开关取自 live 快照，不是启动期缓存。
+    ///
+    /// 生产读取点传 `&self.lifecycle.live_configs.snapshot()`；本测试证明该纯函数
+    /// 使用传入配置的值、且 LiveConfigs 快照携带被保存后的新值。
+    #[test]
+    fn screen_size_warning_flag_reads_the_current_live_snapshot() {
+        let mut config = super::AppConfig::default();
+        config.screen.warn_on_size_mismatch = false;
+        assert!(!super::screen_size_warning_enabled(&config));
+        config.screen.warn_on_size_mismatch = true;
+        assert!(super::screen_size_warning_enabled(&config));
+
+        let live = crate::config::LiveConfigs::from_config(&config);
+        assert!(super::screen_size_warning_enabled(&live.snapshot()));
+    }
+
     /// 回归：AI 聊天的触发关键词必须作用在「去掉前导分隔符」的正文上。
     ///
     /// split_sender_line 只切在分隔符**之前**，body 仍带着那个分隔符：

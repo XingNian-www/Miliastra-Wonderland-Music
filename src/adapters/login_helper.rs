@@ -378,7 +378,10 @@ struct ManagerInner {
     kugou_device_registrar: Arc<dyn KugouDeviceRegistrar>,
     credential_directory: PathBuf,
     profile_root: PathBuf,
+    /// 固定超时（未注入 live 提供者时使用）。
     timeout: Duration,
+    /// `playback.login_timeout_ms` 的每次登录读取源（毫秒）；None 时用固定 `timeout`。
+    live_timeout_ms: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     /// 读取用户在设置页填写的酷狗设备信息（实时配置快照）。
     kugou_device: Arc<dyn Fn() -> crate::config::KugouDeviceConfig + Send + Sync>,
     state: Mutex<ManagerState>,
@@ -499,12 +502,43 @@ impl LoginHelperFailure {
     }
 }
 
+impl ManagerInner {
+    /// 每次登录开始时读取当前超时：live 提供者优先，否则用固定值；至少 1ms。
+    fn effective_timeout(&self) -> Duration {
+        match &self.live_timeout_ms {
+            Some(provider) => Duration::from_millis(provider().max(1)),
+            None => self.timeout,
+        }
+    }
+}
+
 impl LoginHelperManager {
     pub(crate) fn new(
         playback: PlaybackHandle,
         executable: PathBuf,
         credential_directory: PathBuf,
         timeout: Duration,
+        kugou_device: Arc<dyn Fn() -> crate::config::KugouDeviceConfig + Send + Sync>,
+    ) -> Self {
+        Self::new_with_live_timeout(
+            playback,
+            executable,
+            credential_directory,
+            timeout,
+            None,
+            kugou_device,
+        )
+    }
+
+    /// 同 [`Self::new`]，但注入 `playback.login_timeout_ms` 的实时读取源（毫秒）。
+    /// 每次登录开始时调用一次 provider，因此配置热更新对下一次登录生效，
+    /// 不重建管理器、不中断进行中的登录（进行中的登录沿用其启动时的超时）。
+    pub(crate) fn new_with_live_timeout(
+        playback: PlaybackHandle,
+        executable: PathBuf,
+        credential_directory: PathBuf,
+        timeout: Duration,
+        live_timeout_ms: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
         kugou_device: Arc<dyn Fn() -> crate::config::KugouDeviceConfig + Send + Sync>,
     ) -> Self {
         Self::new_with_dependencies(
@@ -517,6 +551,7 @@ impl LoginHelperManager {
             Arc::new(DirectKugouDeviceRegistrar),
             credential_directory,
             timeout,
+            live_timeout_ms,
             kugou_device,
         )
     }
@@ -527,6 +562,7 @@ impl LoginHelperManager {
         kugou_device_registrar: Arc<dyn KugouDeviceRegistrar>,
         credential_directory: PathBuf,
         timeout: Duration,
+        live_timeout_ms: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
         kugou_device: Arc<dyn Fn() -> crate::config::KugouDeviceConfig + Send + Sync>,
     ) -> Self {
         Self {
@@ -537,6 +573,7 @@ impl LoginHelperManager {
                 credential_directory: credential_directory.clone(),
                 profile_root: credential_directory.join(PROFILE_ROOT_NAME),
                 timeout: timeout.max(Duration::from_millis(1)),
+                live_timeout_ms,
                 kugou_device,
                 state: Mutex::new(ManagerState {
                     active: None,
@@ -631,7 +668,9 @@ impl LoginHelperManager {
     pub(crate) fn start(&self, provider: ProviderId) -> Result<LoginSession, LoginHelperFailure> {
         self.join_finished_worker()?;
         let started_at_ms = unix_time_ms();
-        let deadline_at_ms = started_at_ms.saturating_add(duration_ms(self.inner.timeout));
+        // 每次登录会话开始时读取当前超时（live 提供者），进行中的登录沿用该值。
+        let login_timeout = self.inner.effective_timeout();
+        let deadline_at_ms = started_at_ms.saturating_add(duration_ms(login_timeout));
         {
             let mut state = self.inner.state.lock().map_err(|_| {
                 manager_failure(
@@ -681,7 +720,7 @@ impl LoginHelperManager {
         let spawned = match self
             .inner
             .launcher
-            .spawn(provider, &profile, self.inner.timeout)
+            .spawn(provider, &profile, login_timeout)
         {
             Ok(spawned) => spawned,
             Err(_) => {
@@ -1012,7 +1051,7 @@ fn run_helper(
     stderr: Box<dyn Read + Send>,
     profile: PathBuf,
 ) {
-    let deadline = Instant::now() + inner.timeout;
+    let deadline = Instant::now() + inner.effective_timeout();
     let (output_tx, output_rx) = std::sync::mpsc::sync_channel(1);
     let reader = thread::Builder::new()
         .name("login-helper-output".to_owned())
@@ -2199,8 +2238,35 @@ mod tests {
             Arc::new(FakeKugouDeviceRegistrar),
             profile_root(name),
             timeout,
+            None,
             Arc::new(test_kugou_device_config),
         )
+    }
+
+    #[test]
+    fn login_timeout_is_read_from_live_provider_per_login() {
+        use std::sync::Mutex as StdMutex;
+        let playback = FakePlayback::new();
+        let launcher = FakeLauncher::new([FakeScenario::Blocking]);
+        let live = Arc::new(StdMutex::new(1_234u64));
+        let provider = {
+            let live = Arc::clone(&live);
+            Arc::new(move || *live.lock().unwrap())
+        };
+        let manager = LoginHelperManager::new_with_dependencies(
+            playback,
+            launcher,
+            Arc::new(FakeKugouDeviceRegistrar),
+            profile_root("live-login-timeout"),
+            Duration::from_secs(9),
+            Some(provider),
+            Arc::new(test_kugou_device_config),
+        );
+        // 注入 provider 时优先取实时值，而不是固定的 9s。
+        assert_eq!(manager.inner.effective_timeout(), Duration::from_millis(1_234));
+        // 模拟配置热更新：只改来源值，无需重建管理器。
+        *live.lock().unwrap() = 45_678;
+        assert_eq!(manager.inner.effective_timeout(), Duration::from_millis(45_678));
     }
 
     /// 测试用设备信息：模拟用户在设置页填写的酷狗设备。

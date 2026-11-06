@@ -275,13 +275,11 @@ pub(crate) trait IdiomChainExplanationPort {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct IdiomChainApplication {
-    batch_delay_ms: u64,
-}
+pub(crate) struct IdiomChainApplication;
 
 impl IdiomChainApplication {
-    pub(crate) const fn new(batch_delay_ms: u64) -> Self {
-        Self { batch_delay_ms }
+    pub(crate) const fn new() -> Self {
+        Self
     }
 
     pub(crate) fn execute_deferred<P: IdiomChainDeferredPort + ?Sized>(
@@ -324,6 +322,7 @@ impl IdiomChainApplication {
         command: &IdiomChainCommand,
         observed_at: Instant,
         port: &mut P,
+        batch_delay_ms: u64,
     ) -> Result<()> {
         let outcome = port.explain(player, command, observed_at)?;
         let mut messages = vec![match outcome.reply_template {
@@ -345,7 +344,7 @@ impl IdiomChainApplication {
                     .map(IdiomExplanationMessage::Raw),
             );
         }
-        port.send_explanation_batch(&messages, self.batch_delay_ms)
+        port.send_explanation_batch(&messages, batch_delay_ms)
     }
 }
 
@@ -1152,6 +1151,8 @@ mod tests {
     struct ExplanationPort {
         batches: Vec<Vec<String>>,
         keyed_batches: Vec<Vec<IdiomExplanationMessage>>,
+        /// 每批实际收到的间隔，用于证明解释批次间隔是每次调用传入的实时值。
+        delays: Vec<u64>,
     }
 
     impl IdiomChainExplanationPort for ExplanationPort {
@@ -1184,8 +1185,9 @@ mod tests {
         fn send_explanation_batch(
             &mut self,
             messages: &[IdiomExplanationMessage],
-            _delay_ms: u64,
+            delay_ms: u64,
         ) -> Result<()> {
+            self.delays.push(delay_ms);
             self.keyed_batches.push(messages.to_vec());
             let rendered = messages
                 .iter()
@@ -1206,14 +1208,16 @@ mod tests {
         let mut port = ExplanationPort {
             batches: Vec::new(),
             keyed_batches: Vec::new(),
+            delays: Vec::new(),
         };
 
-        IdiomChainApplication::new(100)
+        IdiomChainApplication::new()
             .execute_explanation(
                 "Alice",
                 &IdiomChainCommand::Explain(Some("画蛇添足".to_string())),
                 Instant::now(),
                 &mut port,
+                100,
             )
             .expect("explanation delivery");
 
@@ -1240,6 +1244,26 @@ mod tests {
             &port.keyed_batches[0][2],
             IdiomExplanationMessage::Raw(text) if text == "解释1/1：比喻多此一举"
         ));
+    }
+
+    /// 解释批次间隔是既有 Live 字段：每次执行传入当时快照值，不使用启动副本。
+    /// 两次调用传不同间隔 → 端口必须收到两个不同值。
+    #[test]
+    fn explanation_batch_delay_is_taken_per_call_not_from_a_startup_copy() {
+        let mut port = ExplanationPort {
+            batches: Vec::new(),
+            keyed_batches: Vec::new(),
+            delays: Vec::new(),
+        };
+        let application = IdiomChainApplication::new();
+        let command = IdiomChainCommand::Explain(Some("画蛇添足".to_string()));
+        application
+            .execute_explanation("Alice", &command, Instant::now(), &mut port, 250)
+            .expect("first explanation");
+        application
+            .execute_explanation("Alice", &command, Instant::now(), &mut port, 900)
+            .expect("second explanation");
+        assert_eq!(port.delays, [250, 900], "两次执行各用传入的实时间隔");
     }
 
     #[test]

@@ -737,7 +737,6 @@ enum NumberBombRuntimeMessage {
     Abort(SyncSender<Result<bool, BusinessRuntimeError>>),
 }
 
-#[allow(dead_code)]
 enum TurtleSoupRuntimeMessage {
     HallCommand {
         /// 展示名。海龟汤的命令方只用它渲染「开局者」与「好友结束」文案，

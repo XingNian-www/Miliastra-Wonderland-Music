@@ -43,7 +43,14 @@ impl CommandPolicy {
 #[serde(deny_unknown_fields)]
 pub struct CommandAccessConfig {
     pub overrides: BTreeMap<String, CommandPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 默认点歌平台（schema 声明为 nullable）。
+    ///
+    /// 不能加 `skip_serializing_if = "Option::is_none"`：那样 `None` 会被序列化层
+    /// 整体省略，而 Web 表单按 schema 的 nullable 契约提交显式 `null`，
+    /// `validate_persisted_shape` 会把「库里有键、结构体却没有」误判成
+    /// 「字段被删除或改名」，导致保存 command_access 段直接失败。
+    /// 显式 `null` 与缺失都反序列化为 `None`，两种写法都要接受。
+    #[serde(default)]
     pub default_song_source: Option<String>,
 }
 /// 角色 → 权限档位。
@@ -280,12 +287,12 @@ impl CommandAccessConfig {
                 .unwrap_or(SongSource::QqMusic);
     }
     pub fn validate(&self) -> Result<()> {
-        if self
-            .default_song_source
-            .as_deref()
-            .is_some_and(|source| super::song_request::SongSource::from_str(source).is_none())
+        if let Some(source) = self.default_song_source.as_deref()
+            && super::song_request::SongSource::from_str(source).is_none()
         {
-            bail!("默认点歌平台无效");
+            bail!(
+                "默认点歌平台「{source}」无效：可选 qqmusic、netease、kugou、bilibili；留空表示不设置"
+            );
         }
         for (id, policy) in &self.overrides {
             if default_policy(id).is_none() {

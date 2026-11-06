@@ -348,6 +348,24 @@ impl PlaybackRuntime {
         lyrics_lead_seconds: Arc<RwLock<f64>>,
         login_helper_executable: Option<PathBuf>,
     ) -> Result<Self, PlaybackError> {
+        Self::start_with_lyrics_lead_and_helper_and_cache_limits(
+            credential_directory,
+            audio_cache_config,
+            lyrics_lead_seconds,
+            login_helper_executable,
+            None,
+        )
+    }
+
+    /// 同上，但可注入音频缓存的运行期限额提供者（容量/请求超时/seek 超时可热更新，
+    /// 不重建缓存实例、不断开在播音频流）。见 [`crate::cache::CacheLiveLimits`]。
+    pub fn start_with_lyrics_lead_and_helper_and_cache_limits(
+        credential_directory: impl Into<PathBuf>,
+        audio_cache_config: Option<crate::cache::AudioCacheConfig>,
+        lyrics_lead_seconds: Arc<RwLock<f64>>,
+        login_helper_executable: Option<PathBuf>,
+        cache_limits: Option<crate::cache::CacheLiveLimitsProvider>,
+    ) -> Result<Self, PlaybackError> {
         let credential_directory = credential_directory.into();
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
@@ -359,6 +377,7 @@ impl PlaybackRuntime {
                     audio_cache_config,
                     lyrics_lead_seconds,
                     login_helper_executable,
+                    cache_limits,
                     command_rx,
                     ready_tx,
                 )
@@ -690,6 +709,7 @@ fn run_runtime_thread(
     audio_cache_config: Option<crate::cache::AudioCacheConfig>,
     lyrics_lead_seconds: Arc<RwLock<f64>>,
     login_helper_executable: Option<PathBuf>,
+    cache_limits: Option<crate::cache::CacheLiveLimitsProvider>,
     command_rx: mpsc::Receiver<Command>,
     ready: std_mpsc::SyncSender<Result<(), PlaybackError>>,
 ) {
@@ -727,7 +747,7 @@ fn run_runtime_thread(
             }
         };
         let audio_cache = match audio_cache_config {
-            Some(config) if config.enabled => match crate::cache::AudioCache::spawn(config).await {
+            Some(config) if config.enabled => match crate::cache::AudioCache::spawn_with_limits(config, cache_limits).await {
                 Ok(cache) => {
                     tracing::info!("音频数据缓存已启用");
                     Some(cache)

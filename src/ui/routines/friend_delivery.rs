@@ -52,7 +52,6 @@ pub(crate) struct FriendDelivery {
     /// 用于只有 UID 的场景：外部聊天源给的身份证是 UID，好友列表上显示的是
     /// 昵称或备注，拿 UID 搜必然落空。`recipient` 仍是主键（去重/日志/分组都用它），
     /// 这里只补充「还能拿哪些名字去找」。
-    #[allow(dead_code)]
     search_names: Vec<String>,
     messages: Vec<String>,
 }

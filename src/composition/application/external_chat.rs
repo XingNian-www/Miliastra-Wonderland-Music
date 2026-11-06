@@ -498,8 +498,8 @@ fn run(
     live_configs: crate::config::LiveConfigs,
     state: ExternalChatState,
 ) {
-    let lease = Duration::from_millis(config.lease_timeout_ms);
-    let reconnect = Duration::from_millis(config.reconnect_ms);
+    // 租约/重连间隔不再在启动时缓存：下面每轮从 live 快照读取，
+    // 热更新后下一次判定/重连即生效（不重启进程、不断开游戏）。
     // 昵称补查放到独立线程：接收线程必须持续读 WS，任何 HTTP 等待都会让
     // 后续消息（可能正是玩家的命令）排在它后面。结果回写缓存，之后同 UID 直接命中。
     let http_base = ws_url_to_http(&config.url);
@@ -530,6 +530,8 @@ fn run(
         let mut source = match WebSocketChatSource::new(config.url.clone(), config.token.clone()) {
             Ok(source) => source,
             Err(error) => {
+                let reconnect =
+                    Duration::from_millis(super::live_chat_source_reconnect_ms(&live_configs));
                 log::error!(
                     "外部聊天源初始化失败（步骤：建立 WebSocket 连接），{} 毫秒后重试；重试期间外部聊天源没有接管，聊天仍由 OCR 识别，外部源独有的消息（含备注名）拿不到：{error:#}",
                     reconnect.as_millis()
@@ -542,7 +544,8 @@ fn run(
         let mut last_health_at = Instant::now();
         loop {
             // 租约超时：最近一次真实消息/健康检查太久，必须回落到 OCR，
-            // 否则聊天完全失聪。
+            // 否则聊天完全失聪。阈值每轮读 live 快照，热更新后下一次判定生效。
+            let lease = Duration::from_millis(super::live_chat_source_lease_ms(&live_configs));
             if last_event_at.elapsed() > lease {
                 state.set_active(false);
             }
@@ -714,9 +717,11 @@ fn run(
                     continue;
                 }
                 Err(error) => {
+                    let reconnect =
+                        Duration::from_millis(super::live_chat_source_reconnect_ms(&live_configs));
                     log::warn!(
                         "外部聊天源读取失败，{}ms 后重连：{error:#}",
-                        config.reconnect_ms
+                        reconnect.as_millis()
                     );
                     state.set_active(false);
                     // 重连前重置：旧墓碑与会话号都不再适用于新连接。

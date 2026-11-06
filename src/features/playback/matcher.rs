@@ -19,10 +19,8 @@ fn normalize(value: &str) -> String {
         .filter_map(|ch| {
             if ch.is_whitespace() || is_punctuation(ch) {
                 None
-            } else if ('\u{ff01}'..='\u{ff5e}').contains(&ch) {
-                char::from_u32(ch as u32 - 0xfee0)
             } else {
-                Some(ch)
+                crate::text::fold_wide_char(ch)
             }
         })
         .flat_map(|ch| ch.to_lowercase())

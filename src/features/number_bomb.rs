@@ -152,11 +152,27 @@ impl NumberBombCommand {
 }
 
 /// 解析猜测里的数字；0 也先交给业务范围校验，避免解析层与配置下界各写一套门槛。
+///
+/// 前导 0 直接交给 `u32::from_str` 处理：`#064` 与 `#64` 都解析成 64，
+/// 内部数值与命令锁一致（不同写法不会造成重复入队）。
 fn parse_guess(value: &str) -> Option<u32> {
     if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
     value.parse().ok()
+}
+
+/// 出站数字的展示格式：**只有 64 补前导 0**。
+///
+/// 用户实测：游戏聊天里发「64」这种写法会被过滤，改成「064」才能出现在聊天里；
+/// 其它数字（63、65、100、1000…）保持原样。这里只改出站文案，
+/// 不改内部数值、范围与猜中判定。
+pub(crate) fn format_outbound_number(number: u32) -> String {
+    if number == 64 {
+        "064".to_string()
+    } else {
+        number.to_string()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -366,7 +382,7 @@ impl NumberBombService {
             &templates::TIMEOUT_AUTO,
             ReplyVars::new()
                 .with("玩家", player)
-                .with("数字", number.to_string()),
+                .with("数字", format_outbound_number(number)),
         )];
         replies.extend(apply_guess(&self.config, session, number, now));
         Some(NumberBombTimeout { replies })
@@ -567,8 +583,8 @@ impl NumberBombService {
             vec![keyed(
                 &templates::STARTED,
                 ReplyVars::new()
-                    .with("下限", config.min.to_string())
-                    .with("上限", upper.to_string())
+                    .with("下限", format_outbound_number(config.min))
+                    .with("上限", format_outbound_number(upper))
                     .with("人数", players.to_string())
                     .with("玩家", player),
             )],
@@ -588,8 +604,8 @@ impl NumberBombService {
                 vec![keyed(
                     &templates::STATUS_PLAYING,
                     ReplyVars::new()
-                        .with("下限", session.lower.to_string())
-                        .with("上限", session.upper.to_string())
+                        .with("下限", format_outbound_number(session.lower))
+                        .with("上限", format_outbound_number(session.upper))
                         .with(
                             "玩家",
                             session
@@ -608,7 +624,7 @@ impl NumberBombService {
                         vec![keyed(
                             &templates::STATUS_SETTLED,
                             ReplyVars::new()
-                                .with("炸弹数字", result.bomb.to_string())
+                                .with("炸弹数字", format_outbound_number(result.bomb))
                                 .with(
                                     "玩家",
                                     session
@@ -697,8 +713,8 @@ impl NumberBombService {
             vec![keyed(
                 &templates::GUESS_NOT_NUMBER,
                 ReplyVars::new()
-                    .with("下限", session.lower.to_string())
-                    .with("上限", session.upper.to_string()),
+                    .with("下限", format_outbound_number(session.lower))
+                    .with("上限", format_outbound_number(session.upper)),
             )],
         )
     }
@@ -742,7 +758,7 @@ impl NumberBombService {
                 "duplicate",
                 vec![keyed(
                     &templates::GUESS_DUPLICATE,
-                    ReplyVars::new().with("数字", number.to_string()),
+                    ReplyVars::new().with("数字", format_outbound_number(number)),
                 )],
             );
         }
@@ -752,8 +768,8 @@ impl NumberBombService {
                 vec![keyed(
                     &templates::GUESS_OUT_OF_RANGE,
                     ReplyVars::new()
-                        .with("下限", session.lower.to_string())
-                        .with("上限", session.upper.to_string()),
+                        .with("下限", format_outbound_number(session.lower))
+                        .with("上限", format_outbound_number(session.upper)),
                 )],
             );
         }
@@ -820,7 +836,7 @@ fn apply_guess(
             &templates::EXPLODED,
             ReplyVars::new()
                 .with("玩家", player)
-                .with("炸弹数字", bomb.to_string()),
+                .with("炸弹数字", format_outbound_number(bomb)),
         )];
     }
     if number < bomb {
@@ -839,9 +855,9 @@ fn apply_guess(
         &templates::GUESS_ACCEPTED,
         ReplyVars::new()
             .with("玩家", player)
-            .with("数字", number.to_string())
-            .with("下限", session.lower.to_string())
-            .with("上限", session.upper.to_string())
+            .with("数字", format_outbound_number(number))
+            .with("下限", format_outbound_number(session.lower))
+            .with("上限", format_outbound_number(session.upper))
             .with("下一位", next),
     )]
 }
@@ -1035,6 +1051,69 @@ mod tests {
         );
     }
 
+    /// 解析侧：`#064` 与 `#64` 等价（同一数值、同一命令锁），内部逻辑不受写法影响。
+    ///
+    /// 游戏聊天会过滤「64」这一种写法，玩家只能发 `#064`；解析必须照收。
+    #[test]
+    fn padded_guess_parses_to_the_same_number_as_plain_guess() {
+        let envelope = |text: &str| {
+            CommandEnvelope::new(text, "玩家甲", "blue", text, CommandObservation::default())
+                .expect("envelope")
+        };
+        let plain = NumberBombCommand::parse_active_chat(&envelope("#64")).expect("#64");
+        let padded = NumberBombCommand::parse_active_chat(&envelope("#064")).expect("#064");
+        assert_eq!(plain.command, NumberBombCommand::Guess(64));
+        assert_eq!(padded.command, NumberBombCommand::Guess(64));
+        assert_eq!(
+            plain.command.lock_key(),
+            padded.command.lock_key(),
+            "两种写法必须等价，否则同一次猜测会因写法不同被当成两条命令"
+        );
+    }
+
+    /// 出站侧：只有 64 补前导 0，其它数字原样；命令写法渲染成 `#064`。
+    #[test]
+    fn outbound_text_pads_only_the_number_64() {
+        assert_eq!(format_outbound_number(64), "064");
+        for number in [5_u32, 63, 65, 100, 1000] {
+            assert_eq!(
+                format_outbound_number(number),
+                number.to_string(),
+                "{number} 不应补 0"
+            );
+        }
+        let render = |spec: &ReplyTemplate, vars: ReplyVars| {
+            crate::features::reply_template::render(spec, None, &vars).text
+        };
+        assert_eq!(
+            render(
+                &templates::TIMEOUT_AUTO,
+                ReplyVars::new()
+                    .with("玩家", "甲")
+                    .with("数字", format_outbound_number(64)),
+            ),
+            "甲 超时，自动猜 #064"
+        );
+        assert_eq!(
+            render(
+                &templates::TIMEOUT_AUTO,
+                ReplyVars::new()
+                    .with("玩家", "甲")
+                    .with("数字", format_outbound_number(63)),
+            ),
+            "甲 超时，自动猜 #63"
+        );
+        assert_eq!(
+            render(
+                &templates::EXPLODED,
+                ReplyVars::new()
+                    .with("玩家", "甲")
+                    .with("炸弹数字", format_outbound_number(64)),
+            ),
+            "砰！甲 猜中了炸弹 064，本局结束；发起人可发送 #重来 再来一局"
+        );
+    }
+
     #[test]
     fn lock_keys_do_not_collide() {
         let keys = [
@@ -1197,6 +1276,69 @@ mod tests {
         assert_eq!(session.lower, guess + 1);
         assert_eq!(session.turn, 1);
         assert!(last_text(&outcome).contains("乙"));
+    }
+
+    /// 端到端：真正入队的那条文案里，64 必须是 `064`（其它数字保持原样）。
+    #[test]
+    fn enqueued_round_text_uses_padded_64_for_guess_range_and_bomb() {
+        let (mut service, mut entertainment) = service();
+        let now = now();
+        service
+            .handle_command(&mut entertainment, "p1", "甲", &NumberBombCommand::Start, now)
+            .unwrap();
+        service
+            .handle_command(&mut entertainment, "p2", "乙", &NumberBombCommand::Join, now)
+            .unwrap();
+        service
+            .handle_command(&mut entertainment, "p1", "甲", &NumberBombCommand::StartGame, now)
+            .unwrap();
+
+        // 猜 63（保持原样）后下界收窄为 64：区间里的 64 必须显示成 064。
+        {
+            let session = service.session.as_mut().expect("session");
+            session.bomb = Some(80);
+        }
+        let accepted = service
+            .handle_command(
+                &mut entertainment,
+                "p1",
+                "甲",
+                &NumberBombCommand::Guess(63),
+                now,
+            )
+            .unwrap();
+        assert_eq!(accepted.action, "guessed");
+        let accepted_text = last_text(&accepted);
+        assert!(accepted_text.contains("猜 #63"), "{accepted_text}");
+        assert!(
+            accepted_text.contains("[064, 100]"),
+            "区间下界 64 也要补 0：{accepted_text}"
+        );
+
+        // 冲入炸弹 64：爆点文案里的炸弹数字必须是 064。
+        {
+            let session = service.session.as_mut().expect("session");
+            session.bomb = Some(64);
+            session.lower = 64;
+            session.upper = 100;
+            session.turn = 0;
+            session.guessed.clear();
+        }
+        let exploded = service
+            .handle_command(
+                &mut entertainment,
+                "p1",
+                "甲",
+                &NumberBombCommand::Guess(64),
+                now,
+            )
+            .unwrap();
+        assert_eq!(exploded.action, "exploded");
+        let exploded_text = last_text(&exploded);
+        assert!(
+            exploded_text.contains("炸弹 064"),
+            "爆点文案必须带前导 0：{exploded_text}"
+        );
     }
 
     #[test]

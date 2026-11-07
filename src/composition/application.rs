@@ -430,6 +430,7 @@ struct BusinessBundle {
     ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
     ai_connection: crate::config::ai::AiConfig,
     ai_request_timeout: std::time::Duration,
+    tts: Arc<crate::features::tts::TtsRuntime>,
     song_requests: SongRequestApplication,
     card_games: CardGameApplication,
     administration_application: AdministrationApplication,
@@ -691,6 +692,7 @@ struct FormalTaskBusinessContext {
     ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
     ai_connection: crate::config::ai::AiConfig,
     ai_request_timeout: std::time::Duration,
+    tts: Arc<crate::features::tts::TtsRuntime>,
     song_requests: SongRequestApplication,
     card_games: CardGameApplication,
     administration_application: AdministrationApplication,
@@ -785,6 +787,7 @@ impl FormalTaskExecutionContext {
                     ai_chat_openai: self.business.ai_chat_openai.clone(),
                     ai_connection: self.business.ai_connection.clone(),
                     ai_request_timeout: self.business.ai_request_timeout,
+                    tts: self.business.tts.clone(),
                     song_requests: self.business.song_requests.clone(),
                     card_games: self.business.card_games.clone(),
                     administration_application: self.business.administration_application,
@@ -1546,6 +1549,7 @@ impl ApplicationRuntime {
             )
             .context("启动原生播放器")?;
         let native_playback = native_playback_runtime.handle();
+        let tts_runtime = Arc::new(crate::features::tts::TtsRuntime::new(native_playback.clone()));
         // 登录超时每次登录会话开始时读取 live 快照（task-33 注册后即热更新）。
         let live_timeout_source: Arc<dyn Fn() -> u64 + Send + Sync> = {
             let live_configs = live_configs.clone();
@@ -1906,6 +1910,7 @@ impl ApplicationRuntime {
                 ai_chat_openai: ai_openai_for_chat,
                 ai_connection: config.ai.clone(),
                 ai_request_timeout,
+                tts: tts_runtime,
                 song_requests,
                 card_games,
                 administration_application,

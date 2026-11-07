@@ -40,6 +40,16 @@ pub(crate) enum EngineCommand {
     SetVolume {
         volume: u8,
     },
+    /// 独立的输出「压低增益」（TTS 说话时压低音乐用），0–100，100=不压低。
+    ///
+    /// 与 `SetVolume` 的关键区别：本命令**只改实际输出增益**，不修改
+    /// `PlaybackSnapshot.volume`、不发布快照、不落库，因此 `@状态`/状态栏
+    /// 显示的音量保持不变（符合「不回显示」）。
+    /// 目前由上层（task-49 TTS 编排）通过引擎命令通道构造；本 crate 内暂无调用点。
+    #[allow(dead_code)]
+    SetDuckGain {
+        gain: u8,
+    },
 }
 
 #[derive(Clone, Debug, thiserror::Error)]

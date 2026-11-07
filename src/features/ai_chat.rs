@@ -16,10 +16,16 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{DynamicImage, GenericImageView};
+
 use anyhow::{Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::config::ai::ImageAttachment;
+use crate::features::tts::{TtsSpeakOptions, tts_model_capabilities};
 use crate::text::MAX_CHAT_WIDTH;
 
 use crate::features::chat_text::parse_prefixed_command;
@@ -179,6 +185,147 @@ impl AiChatAccess {
     }
 }
 
+/// AI 聊天的视觉输入配置。
+///
+/// 默认开启，截图范围默认整个一级大厅；模型是否支持图片由 `/models` 返回的
+/// 能力字段查询决定，不根据模型名推断；查询不到或请求侧拒绝时自动降级纯文本。
+/// 图片只在内存中裁剪/缩放/编码，不落盘、不写入日志正文。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiChatVisionConfig {
+    /// 是否在 AI 聊天请求中附带当前一级界面截图。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 识图调用方式：auto=每轮自动附图；tool=暴露 look 工具；both=两者。
+    #[serde(default)]
+    pub mode: VisionMode,
+    /// 截图范围；P0 只实现整个一级大厅。
+    #[serde(default)]
+    pub capture_scope: VisionCaptureScope,
+    /// 长边缩放到该像素值再编码。
+    #[serde(default = "default_vision_max_edge")]
+    pub max_edge: u32,
+    /// JPEG 编码质量（40..=95）。
+    #[serde(default = "default_vision_jpeg_quality")]
+    pub jpeg_quality: u8,
+    /// 编码后允许的最大字节数；超过则降采样/降质量，仍超限则放弃图片。
+    #[serde(default = "default_vision_max_bytes")]
+    pub max_bytes: u64,
+    /// 截图+编码的截止时间（毫秒）；超时降级纯文本。
+    #[serde(default = "default_vision_timeout_ms")]
+    pub timeout_ms: u64,
+    /// 视觉专用模型；空字符串沿用 `ai_chat.model`。
+    #[serde(default)]
+    pub model: String,
+    /// 是否允许整屏截图（会包含 UID/HUD，用户明确选择默认开启）。
+    #[serde(default = "default_true")]
+    pub allow_full_screen: bool,
+}
+
+/// 识图调用方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionMode {
+    /// 每轮自动附一级大厅截图。
+    #[default]
+    Auto,
+    /// 不自动附图，只暴露 `look` 工具。
+    Tool,
+    /// 自动附图 + `look` 工具。
+    Both,
+}
+
+impl VisionMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动附图",
+            Self::Tool => "工具调用",
+            Self::Both => "自动附图+工具",
+        }
+    }
+}
+
+/// 视觉截图范围。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionCaptureScope {
+    /// 整个一级大厅（P0 默认）。
+    #[default]
+    PrimaryScreen,
+}
+
+impl Default for AiChatVisionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: VisionMode::default(),
+            capture_scope: VisionCaptureScope::default(),
+            max_edge: default_vision_max_edge(),
+            jpeg_quality: default_vision_jpeg_quality(),
+            max_bytes: default_vision_max_bytes(),
+            timeout_ms: default_vision_timeout_ms(),
+            model: String::new(),
+            allow_full_screen: true,
+        }
+    }
+}
+
+/// 是否本轮自动附截图。
+pub(crate) fn auto_image_enabled(config: &AiChatConfig, supports_image: bool) -> bool {
+    config.vision.enabled
+        && supports_image
+        && matches!(config.vision.mode, VisionMode::Auto | VisionMode::Both)
+}
+
+/// 是否暴露 `look` 工具（enabled=false 时关闭）。
+pub(crate) fn look_tool_available(config: &AiChatConfig) -> bool {
+    config.vision.enabled && matches!(config.vision.mode, VisionMode::Tool | VisionMode::Both)
+}
+
+/// 把一帧截图压缩成可随请求发送的内存 JPEG。
+///
+/// - 长边超过 `max_edge` 时等比缩放；
+/// - 按 `jpeg_quality` 编码；超过 `max_bytes` 时降质量重试，仍超限返回 `None`；
+/// - 返回的对象 `Debug` 不含字节，调用方也不得把 data URL 写日志。
+pub(crate) fn encode_vision_image(
+    image: &DynamicImage,
+    max_edge: u32,
+    jpeg_quality: u8,
+    max_bytes: u64,
+) -> Option<ImageAttachment> {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 || max_edge == 0 || max_bytes == 0 {
+        return None;
+    }
+    let mut target = image.clone();
+    if width.max(height) > max_edge {
+        let scale = f64::from(max_edge) / f64::from(width.max(height));
+        let new_width = (f64::from(width) * scale).round().max(1.0) as u32;
+        let new_height = (f64::from(height) * scale).round().max(1.0) as u32;
+        target = target.resize_exact(new_width, new_height, FilterType::Lanczos3);
+    }
+    let mut quality = jpeg_quality.clamp(40, 95);
+    for attempt in 0..3 {
+        let mut bytes = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut bytes, quality);
+        if encoder.encode_image(&target).is_err() {
+            return None;
+        }
+        if bytes.len() as u64 <= max_bytes {
+            return Some(ImageAttachment::new_jpeg(
+                bytes,
+                target.width(),
+                target.height(),
+            ));
+        }
+        if attempt == 2 {
+            return None;
+        }
+        quality = quality.saturating_sub(20).max(40);
+    }
+    None
+}
+
 /// `ai_chat` 配置段。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -233,6 +380,9 @@ pub struct AiChatConfig {
     /// 事实抽取提示词；留空使用内置默认值。
     #[serde(default = "default_extract_prompt")]
     pub extract_prompt: String,
+    /// 视觉输入配置：是否附带一级界面截图、截图范围与编码参数。
+    #[serde(default)]
+    pub vision: AiChatVisionConfig,
     /// `{AI回复}` 标签的生成参数。
     #[serde(default)]
     pub ai_reply: AiReplyConfig,
@@ -362,6 +512,22 @@ fn default_true() -> bool {
     true
 }
 
+fn default_vision_max_edge() -> u32 {
+    1_280
+}
+
+fn default_vision_jpeg_quality() -> u8 {
+    80
+}
+
+fn default_vision_max_bytes() -> u64 {
+    4_000_000
+}
+
+fn default_vision_timeout_ms() -> u64 {
+    800
+}
+
 fn default_max_tokens() -> u32 {
     // 含思考预算：600 时上线出现过 response incomplete（reasoning 吃满、回复被截断）。
     1_500
@@ -388,6 +554,7 @@ impl Default for AiChatConfig {
             system_prompt: default_system_prompt(),
             answer_prompt: default_answer_prompt(),
             extract_prompt: default_extract_prompt(),
+            vision: AiChatVisionConfig::default(),
             ai_reply: AiReplyConfig::default(),
         }
     }
@@ -404,6 +571,20 @@ impl AiChatConfig {
             }
             if self.max_tokens == 0 {
                 anyhow::bail!("ai_chat.max_tokens 必须大于 0");
+            }
+            if self.vision.enabled {
+                if self.vision.max_edge == 0 {
+                    anyhow::bail!("ai_chat.vision.max_edge 必须大于 0");
+                }
+                if !(40..=95).contains(&self.vision.jpeg_quality) {
+                    anyhow::bail!("ai_chat.vision.jpeg_quality 必须在 40..=95");
+                }
+                if self.vision.max_bytes == 0 {
+                    anyhow::bail!("ai_chat.vision.max_bytes 必须大于 0");
+                }
+                if self.vision.timeout_ms == 0 {
+                    anyhow::bail!("ai_chat.vision.timeout_ms 必须大于 0");
+                }
             }
         }
         Ok(())
@@ -1960,6 +2141,260 @@ pub(crate) struct AiChatExecution {
 pub(crate) const COMMAND_TOOL: &str = "execute_game_command";
 pub(crate) const MAX_TOOL_ROUNDS: usize = 3;
 
+/// AI 聊天内置的识图工具名。
+pub(crate) const LOOK_TOOL: &str = "look";
+
+/// `look` 工具定义：按需查看当前一级大厅截图；instruction 可选。
+pub(crate) fn look_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": LOOK_TOOL,
+            "description": "查看当前一级大厅截图并回答视觉问题。仅在确实需要看画面时调用。示例：用户问「屏幕上写着什么」时调用，instruction 填「描述聊天区域里的文字」。",
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "希望从截图了解什么；省略则简要描述画面",
+                        "maxLength": 200
+                    }
+                },
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+/// 解析 `look` 工具参数；instruction 可省略。
+pub(crate) fn parse_look_arguments(raw: &str) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LookArguments {
+        #[serde(default)]
+        instruction: Option<String>,
+    }
+    let arguments: LookArguments = serde_json::from_str(raw)?;
+    let Some(instruction) = arguments.instruction else {
+        return Ok(None);
+    };
+    let instruction = instruction.trim().to_string();
+    if instruction.is_empty() {
+        anyhow::bail!("look.instruction 不能为空");
+    }
+    if instruction.chars().count() > 200 {
+        anyhow::bail!("look.instruction 不能超过 200 个字符");
+    }
+    if instruction.chars().any(char::is_control) {
+        anyhow::bail!("look.instruction 不能包含控制字符");
+    }
+    Ok(Some(instruction))
+}
+
+/// `look` 子请求的 system prompt；短小，不自动注入聊天主提示词。
+pub(crate) fn look_system_prompt() -> &'static str {
+    "你在看一张游戏截图。只根据截图回答用户要求；看不清就说看不清，不要编造。输出一段简短自然语言，不要 Markdown、URL 或游戏命令。"
+}
+
+/// AI 聊天内置的语音工具名。只有 AI 聊天会暴露/处理它；普通回复不自动朗读。
+pub(crate) const SPEAK_TOOL: &str = "speak";
+
+/// `speak` 工具定义（未知模型安全默认，只暴露 text）。
+pub(crate) fn speak_tool(max_chars: usize) -> serde_json::Value {
+    speak_tool_for_model("", max_chars)
+}
+
+/// 按当前 TTS 模型能力生成 `speak` 工具 schema；不支持的参数不暴露。
+pub(crate) fn speak_tool_for_model(model: &str, max_chars: usize) -> serde_json::Value {
+    let capabilities = tts_model_capabilities(model);
+    let mut properties = serde_json::Map::new();
+    let text_description = match capabilities.style_mode {
+        crate::features::tts::TtsStyleMode::Parentheses => {
+            "要朗读的自然口语；可内联 S1 固定括号标签，如 (sad)"
+        }
+        crate::features::tts::TtsStyleMode::Brackets => {
+            "要朗读的自然口语；可内联方括号自然语言 cue，如 [whispers sweetly]"
+        }
+        crate::features::tts::TtsStyleMode::DramaDirections => {
+            "要朗读的自然口语；可内联 [导演指示] 和 <whisper>…</whisper>"
+        }
+        crate::features::tts::TtsStyleMode::None => "要朗读的自然口语",
+    };
+    properties.insert(
+        "text".to_string(),
+        serde_json::json!({
+            "type": "string",
+            "description": text_description,
+            "minLength": 1,
+            "maxLength": max_chars.max(1)
+        }),
+    );
+    if capabilities.supports_emotion {
+        let description = match capabilities.style_mode {
+            crate::features::tts::TtsStyleMode::Parentheses => "S1 固定括号标签词，如 sad",
+            crate::features::tts::TtsStyleMode::Brackets => {
+                "S2/S2.1 自由自然语言 cue，如 whispers sweetly"
+            }
+            crate::features::tts::TtsStyleMode::DramaDirections => {
+                "Drama 3 导演指示，如 calm, measured storyteller voice"
+            }
+            crate::features::tts::TtsStyleMode::None => "",
+        };
+        properties.insert(
+            "emotion".to_string(),
+            serde_json::json!({"type":"string","description":description,"minLength":1,"maxLength":60}),
+        );
+    }
+    if capabilities.supports_style {
+        let style_description = match capabilities.style_mode {
+            crate::features::tts::TtsStyleMode::DramaDirections => "Drama 3 导演/表演风格，如 平静克制",
+            _ => "自然语言语气/风格，如 温柔",
+        };
+        properties.insert(
+            "style".to_string(),
+            serde_json::json!({
+                "type":"string",
+                "description":style_description,
+                "minLength":1,
+                "maxLength":60
+            }),
+        );
+    }
+    if capabilities.supports_speed {
+        properties.insert(
+            "speed".to_string(),
+            serde_json::json!({
+                "type":"number",
+                "description":"语速倍率，0.5=慢一半，2.0=快一倍；默认 1.0",
+                "minimum":0.5,
+                "maximum":2.0
+            }),
+        );
+    }
+    if capabilities.supports_volume_db {
+        properties.insert(
+            "volume_db".to_string(),
+            serde_json::json!({
+                "type":"number",
+                "description":"语音音量增益（dB），-20..20；0=不调整",
+                "minimum":-20.0,
+                "maximum":20.0
+            }),
+        );
+    }
+    let example = match capabilities.style_mode {
+        crate::features::tts::TtsStyleMode::Parentheses => {
+            "示例：text=我没事, emotion=sad（写成 (sad)）"
+        }
+        crate::features::tts::TtsStyleMode::Brackets => {
+            "示例：text=我没事, emotion=laughing nervously（写成 [laughing nervously]）"
+        }
+        crate::features::tts::TtsStyleMode::DramaDirections => {
+            "示例：text=我没事。[small laugh], emotion=forcing a smile"
+        }
+        crate::features::tts::TtsStyleMode::None => "示例：text=我没事",
+    };
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": SPEAK_TOOL,
+            "description": format!("让 BOT 用语音说出文本；仅在用户明确要求语音/确实需要声音时调用，不要每条回复都读。text 用自然口语，不要 Markdown/URL/命令。{example}"),
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": serde_json::Value::Object(properties),
+                "required": ["text"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeakArguments {
+    text: String,
+    #[serde(default)]
+    emotion: Option<String>,
+    #[serde(default)]
+    style: Option<String>,
+    #[serde(default)]
+    speed: Option<f32>,
+    #[serde(default)]
+    volume_db: Option<f32>,
+}
+
+/// 解析旧调用（未知模型，仅 text）。
+pub(crate) fn parse_speak_arguments(raw: &str) -> Result<String> {
+    parse_speak_arguments_for_model(raw, "").map(|(text, _)| text)
+}
+
+/// 按所选模型能力解析/校验 `speak` 参数；不支持的字段直接拒绝，不静默忽略。
+pub(crate) fn parse_speak_arguments_for_model(
+    raw: &str,
+    model: &str,
+) -> Result<(String, TtsSpeakOptions)> {
+    let capabilities = tts_model_capabilities(model);
+    let arguments: SpeakArguments = serde_json::from_str(raw)?;
+    let text = arguments.text.trim().to_string();
+    if text.is_empty() {
+        anyhow::bail!("speak.text 不能为空");
+    }
+    if text.chars().any(char::is_control) {
+        anyhow::bail!("speak.text 不能包含控制字符");
+    }
+    let normalize_text = |value: Option<String>, field: &str| -> Result<Option<String>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            anyhow::bail!("speak.{field} 不能为空");
+        }
+        if value.chars().count() > 60 {
+            anyhow::bail!("speak.{field} 不能超过 60 个字符");
+        }
+        if value.chars().any(char::is_control) {
+            anyhow::bail!("speak.{field} 不能包含控制字符");
+        }
+        Ok(Some(value))
+    };
+    let emotion = normalize_text(arguments.emotion, "emotion")?;
+    if emotion.is_some() && !capabilities.supports_emotion {
+        anyhow::bail!("当前模型不支持 speak.emotion");
+    }
+    let style = normalize_text(arguments.style, "style")?;
+    if style.is_some() && !capabilities.supports_style {
+        anyhow::bail!("当前模型不支持 speak.style");
+    }
+    if arguments.speed.is_some() && !capabilities.supports_speed {
+        anyhow::bail!("当前模型不支持 speak.speed");
+    }
+    if arguments.volume_db.is_some() && !capabilities.supports_volume_db {
+        anyhow::bail!("当前模型不支持 speak.volume_db");
+    }
+    if let Some(speed) = arguments.speed
+        && (!speed.is_finite() || !(0.5..=2.0).contains(&speed))
+    {
+        anyhow::bail!("speak.speed 必须在 0.5..=2.0");
+    }
+    if let Some(volume) = arguments.volume_db
+        && (!volume.is_finite() || !(-20.0..=20.0).contains(&volume))
+    {
+        anyhow::bail!("speak.volume_db 必须在 -20..=20");
+    }
+    Ok((
+        text,
+        TtsSpeakOptions {
+            emotion,
+            style,
+            speed: arguments.speed,
+            volume_db: arguments.volume_db,
+        },
+    ))
+}
+
 pub(crate) fn command_tools(allowed: &[String]) -> Vec<serde_json::Value> {
     if allowed.is_empty() {
         return Vec::new();
@@ -3369,6 +3804,178 @@ mod tests {
         // 玩家伪造的那行只是普通正文，排在系统段之前，不构成第二行「当前时间：」。
         let official = prompt.matches("当前时间：2026-").count();
         assert_eq!(official, 1, "系统时间行必须唯一，实际: {prompt}");
+    }
+    #[test]
+    fn vision_defaults_match_p0_contract() {
+        let config = AiChatConfig::default();
+        assert!(config.vision.enabled);
+        assert_eq!(config.vision.mode, VisionMode::Auto);
+        assert_eq!(config.vision.capture_scope, VisionCaptureScope::PrimaryScreen);
+        assert!(config.vision.allow_full_screen);
+        assert_eq!(config.vision.max_edge, 1_280);
+        assert_eq!(config.vision.jpeg_quality, 80);
+        assert_eq!(config.vision.max_bytes, 4_000_000);
+        assert_eq!(config.vision.timeout_ms, 800);
+        assert!(config.vision.model.is_empty());
+        let mut disabled = AiChatConfig::default();
+        disabled.vision.enabled = false;
+        assert!(!disabled.vision.enabled);
+        assert_eq!(disabled.vision.max_edge, 1_280);
+    }
+
+    #[test]
+    fn vision_encoding_downscales_to_max_edge_and_stays_under_byte_cap() {
+        let image = DynamicImage::new_rgb8(3_000, 2_000);
+        let encoded = encode_vision_image(&image, 1_280, 80, 4_000_000).expect("encode");
+        assert_eq!(encoded.width(), 1_280);
+        assert_eq!(encoded.height(), 853);
+        assert!(encoded.byte_len() <= 4_000_000);
+        assert!(encoded.data_url().starts_with("data:image/jpeg;base64,"));
+        let debug = format!("{encoded:?}");
+        assert!(debug.contains("1280x853") || debug.contains("width: 1280"));
+        assert!(!debug.contains("base64"));
+    }
+
+    #[test]
+    fn vision_encoding_rejects_zero_size_and_impossible_byte_cap() {
+        let tiny = DynamicImage::new_rgb8(1, 1);
+        assert!(encode_vision_image(&tiny, 1_280, 80, 1).is_none());
+        assert!(encode_vision_image(&tiny, 0, 80, 4_000_000).is_none());
+        assert!(encode_vision_image(&tiny, 1_280, 80, 0).is_none());
+    }
+
+    #[test]
+    fn speak_tool_schema_varies_by_model_capabilities() {
+        let s1 = speak_tool_for_model("s1", 120);
+        let s1_props = s1["function"]["parameters"]["properties"].as_object().unwrap();
+        assert!(s1_props.contains_key("emotion"));
+        assert!(!s1_props.contains_key("style"));
+        assert!(s1_props.contains_key("speed"));
+        assert!(s1_props.contains_key("volume_db"));
+
+        let s2 = speak_tool_for_model("s2.1-pro", 120);
+        let s2_props = s2["function"]["parameters"]["properties"].as_object().unwrap();
+        assert!(s2_props.contains_key("emotion"));
+        assert!(s2_props.contains_key("style"));
+        assert_eq!(s2_props["speed"]["maximum"].as_f64().unwrap(), 2.0);
+        let s2_text = s2_props["text"]["description"].as_str().unwrap();
+        assert!(s2_text.contains("whispers sweetly"), "S2 text 描述缺少示例");
+        assert!(s2["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("laughing nervously"), "S2 工具描述缺少示例");
+
+        let drama = speak_tool_for_model("drama-3", 120);
+        let drama_props = drama["function"]["parameters"]["properties"]
+            .as_object()
+            .unwrap();
+        let drama_text = drama_props["text"]["description"].as_str().unwrap();
+        for needle in ["<whisper>", "导演指示"] {
+            assert!(drama_text.contains(needle), "Drama text 描述缺少 {needle}");
+        }
+
+        let unknown = speak_tool_for_model("unknown-model", 120);
+        let unknown_props = unknown["function"]["parameters"]["properties"]
+            .as_object()
+            .unwrap();
+        assert_eq!(unknown_props.len(), 1, "未知模型只暴露 text");
+        assert!(unknown_props.contains_key("text"));
+    }
+
+    #[test]
+    fn speak_parser_rejects_unsupported_or_out_of_range_options() {
+        assert!(parse_speak_arguments_for_model(r#"{"text":"你好"}"#, "s1").is_ok());
+        assert!(parse_speak_arguments_for_model(
+            r#"{"text":"你好","style":"温柔"}"#,
+            "s1"
+        )
+        .is_err());
+        assert!(parse_speak_arguments_for_model(
+            r#"{"text":"你好","speed":2.5}"#,
+            "s2.1-pro"
+        )
+        .is_err());
+        assert!(parse_speak_arguments_for_model(
+            r#"{"text":"你好","volume_db":21}"#,
+            "s2.1-pro"
+        )
+        .is_err());
+        assert!(parse_speak_arguments_for_model(
+            r#"{"text":"你好","emotion":"laugh"}"#,
+            "unknown-model"
+        )
+        .is_err());
+        let (text, options) = parse_speak_arguments_for_model(
+            r#"{"text":"你好","emotion":"laugh","style":"温柔","speed":1.2,"volume_db":-2}"#,
+            "s2.1-pro",
+        )
+        .unwrap();
+        assert_eq!(text, "你好");
+        assert_eq!(options.emotion.as_deref(), Some("laugh"));
+        assert_eq!(options.style.as_deref(), Some("温柔"));
+        assert_eq!(options.speed, Some(1.2));
+        assert_eq!(options.volume_db, Some(-2.0));
+    }
+
+    #[test]
+    fn vision_mode_controls_auto_image_and_look_tool() {
+        let mut config = AiChatConfig::default();
+        assert_eq!(config.vision.mode, VisionMode::Auto);
+        assert!(auto_image_enabled(&config, true));
+        assert!(!look_tool_available(&config));
+
+        config.vision.mode = VisionMode::Tool;
+        assert!(!auto_image_enabled(&config, true));
+        assert!(look_tool_available(&config));
+
+        config.vision.mode = VisionMode::Both;
+        assert!(auto_image_enabled(&config, true));
+        assert!(look_tool_available(&config));
+
+        config.vision.enabled = false;
+        assert!(!auto_image_enabled(&config, true));
+        assert!(!look_tool_available(&config));
+    }
+
+    #[test]
+    fn look_tool_schema_and_parser_are_optional_instruction() {
+        let tool = look_tool();
+        assert_eq!(tool["function"]["name"], LOOK_TOOL);
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["instruction"]["maxLength"],
+            200
+        );
+        assert_eq!(parse_look_arguments("{}").unwrap(), None);
+        assert_eq!(
+            parse_look_arguments(r#"{"instruction":"看聊天区"}"#).unwrap(),
+            Some("看聊天区".to_string())
+        );
+        assert!(parse_look_arguments(r#"{"instruction":"  "}"#).is_err());
+        assert!(parse_look_arguments(r#"{"extra":1}"#).is_err());
+        assert!(parse_look_arguments(r#"{"instruction":"a\nb"}"#).is_err());
+    }
+
+    #[test]
+    fn default_system_prompt_does_not_inject_tts_protocol() {
+        let prompt = response_system_prompt(&config());
+        assert!(!prompt.contains("语音工具规范"));
+        assert!(!prompt.contains("当前 TTS 模型"));
+        assert!(!prompt.contains("speak.text"));
+    }
+
+    #[test]
+    fn speak_tool_schema_and_argument_parser_are_strict() {
+        let tool = speak_tool(120);
+        assert_eq!(tool["function"]["name"], SPEAK_TOOL);
+        assert_eq!(tool["function"]["parameters"]["properties"]["text"]["maxLength"], 120);
+        let description = tool["function"]["description"].as_str().unwrap_or_default();
+        for needle in ["明确要求语音", "不要每条回复都读", "Markdown/URL", "示例"] {
+            assert!(description.contains(needle), "工具描述缺少约束：{needle}");
+        }
+        assert_eq!(parse_speak_arguments(r#"{"text":"你好"}"#).unwrap(), "你好");
+        assert!(parse_speak_arguments(r#"{"text":"  "}"#).is_err());
+        assert!(parse_speak_arguments(r#"{"text":"a\nb"}"#).is_err());
+        assert!(parse_speak_arguments("not json").is_err());
     }
 }
 

@@ -4144,6 +4144,118 @@ fn ai_models_route_requires_post_and_rejects_unknown_fields() {
 }
 
 #[test]
+fn ai_vision_status_route_registered_and_shape_degrades_without_guessing() {
+    assert!(body_route_spec("/ai/vision/status").is_some());
+    assert!(route_spec("/ai/vision/status").is_some_and(|route| !route.mutating));
+
+    use crate::config::ai::{ModelCapabilities, ModelListError};
+    use crate::features::ai_chat::VisionCaptureScope;
+
+    let scope = VisionCaptureScope::PrimaryScreen;
+    let supported = vision_status_payload(
+        true,
+        "vision-model",
+        &scope,
+        true,
+        Ok(ModelCapabilities {
+            supports_image: Some(true),
+        }),
+    );
+    assert_eq!(supported["enabled"], true);
+    assert_eq!(supported["model"], "vision-model");
+    assert_eq!(supported["supports_image"], true);
+    assert_eq!(supported["source"], "api");
+    assert_eq!(supported["capture_scope"], "primary_screen");
+    assert_eq!(supported["allow_full_screen"], true);
+
+    let unknown = vision_status_payload(
+        false,
+        "plain-model",
+        &scope,
+        false,
+        Ok(ModelCapabilities {
+            supports_image: None,
+        }),
+    );
+    assert_eq!(unknown["enabled"], false);
+    assert_eq!(unknown["supports_image"], false);
+    assert_eq!(unknown["source"], "unknown");
+
+    let failed = vision_status_payload(
+        true,
+        "plain-model",
+        &scope,
+        true,
+        Err(ModelListError::Request("secret-key must not leak".to_string())),
+    );
+    assert_eq!(failed["supports_image"], false);
+    assert_eq!(failed["source"], "unknown");
+    assert!(!failed.to_string().contains("secret-key"));
+    assert!(!failed.to_string().contains("base64"));
+
+    let explicit_no = vision_status_payload(
+        true,
+        "text-only",
+        &scope,
+        true,
+        Ok(ModelCapabilities {
+            supports_image: Some(false),
+        }),
+    );
+    assert_eq!(explicit_no["supports_image"], false);
+    assert_eq!(explicit_no["source"], "api");
+}
+
+#[test]
+fn ai_vision_status_overrides_merge_missing_and_empty() {
+    let mut ai = crate::config::ai::AiConfig::default();
+    let mut ai_chat = crate::features::ai_chat::AiChatConfig::default();
+    ai_chat.vision.model = "saved-vision".to_string();
+    ai_chat.model = "saved-chat".to_string();
+
+    let sparse: AiVisionStatusOverrides = serde_json::from_str("{}").expect("empty");
+    assert!(apply_ai_vision_status_overrides(&mut ai, &mut ai_chat, sparse).is_none());
+    assert_eq!(ai_chat.vision.model, "saved-vision");
+
+    let explicit: AiVisionStatusOverrides = serde_json::from_str(
+        r#"{"model":"panel-model","provider":"custom","endpoint":"https://panel.example","api_key":"panel-key"}"#,
+    )
+    .expect("overrides");
+    let model = apply_ai_vision_status_overrides(&mut ai, &mut ai_chat, explicit);
+    assert_eq!(model.as_deref(), Some("panel-model"));
+    assert_eq!(ai.provider, "custom");
+    assert_eq!(ai.endpoint, "https://panel.example");
+    assert_eq!(ai.api_key, "panel-key");
+    assert_eq!(ai_chat.vision.model, "panel-model");
+    assert_eq!(ai_chat.model, "panel-model");
+}
+
+#[test]
+fn tts_models_route_registered_and_overrides_distinguish_missing_from_empty() {
+    assert!(body_route_spec("/tts/models").is_some());
+    assert!(route_spec("/tts/models").is_some_and(|route| !route.mutating));
+
+    let sparse: TtsModelsOverrides = serde_json::from_str("{}").expect("missing fields");
+    let sparse = tts_catalog_overrides(sparse);
+    assert!(sparse.endpoint.is_none());
+    assert!(sparse.api_key.is_none());
+
+    let explicit_empty: TtsModelsOverrides =
+        serde_json::from_str(r#"{"endpoint":"","api_key":""}"#).expect("empty fields");
+    let explicit_empty = tts_catalog_overrides(explicit_empty);
+    assert_eq!(explicit_empty.endpoint.as_deref(), Some(""));
+    assert_eq!(explicit_empty.api_key.as_deref(), Some(""));
+
+    let state = test_state();
+    let unknown = br#"{"proxy":"http://127.0.0.1:1"}"#;
+    let error = tts_models_body_route(unknown, &state).expect_err("unknown field");
+    assert_eq!(error.status, 400, "{}", error.message);
+    let not_json = b"not json";
+    let error = tts_models_body_route(not_json, &state).expect_err("invalid JSON");
+    assert_eq!(error.status, 400, "{}", error.message);
+}
+
+#[test]
 fn ai_models_overrides_distinguish_missing_from_empty() {
     // 字段缺失 -> 沿用已保存配置；空串 -> 面板上确实是空的。
     // 二者混用会让用户清空 endpoint 时悄悄回落到旧网关。

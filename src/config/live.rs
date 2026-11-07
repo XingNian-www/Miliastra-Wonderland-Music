@@ -73,6 +73,15 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "ai_chat.system_prompt",
     "ai_chat.answer_prompt",
     "ai_chat.extract_prompt",
+    "ai_chat.vision.enabled",
+    "ai_chat.vision.mode",
+    "ai_chat.vision.capture_scope",
+    "ai_chat.vision.max_edge",
+    "ai_chat.vision.jpeg_quality",
+    "ai_chat.vision.max_bytes",
+    "ai_chat.vision.timeout_ms",
+    "ai_chat.vision.model",
+    "ai_chat.vision.allow_full_screen",
     "ai_chat.ai_reply.mode",
     "ai_chat.ai_reply.include_template",
     "ai_chat.ai_reply.include_command",
@@ -80,6 +89,18 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "ai_chat.ai_reply.user_prompt",
     "ai_chat.ai_reply.max_tokens",
     "ai_chat.ai_reply.timeout_seconds",
+    // tts：除 endpoint/api_key（IdleReload）外的运行期字段。
+    "tts.enabled",
+    "tts.model",
+    "tts.reference_id",
+    "tts.voice",
+    "tts.format",
+    "tts.duck_volume",
+    "tts.duck_fade_ms",
+    "tts.max_chars",
+    "tts.timeout_ms",
+    "tts.queue_max",
+    "tts.trigger_scope",
     // song_ai：本地推荐两项由点歌端口每次读 snapshot。
     "song_ai.local_recommend",
     "song_ai.local_recommend_min_score",
@@ -438,6 +459,11 @@ impl LiveConfigs {
         chat_source.reconnect_ms = config.chat_source.reconnect_ms;
         chat_source.lease_timeout_ms = config.chat_source.lease_timeout_ms;
         effective.chat_source = chat_source;
+        // tts：只实时 Live 字段；endpoint/api_key 保留旧值（IdleReload）。
+        let mut tts = config.tts.clone();
+        tts.endpoint = effective.tts.endpoint.clone();
+        tts.api_key = effective.tts.api_key.clone();
+        effective.tts = tts;
         effective.visual = config.visual.clone();
         self.effective.replace(effective);
     }
@@ -827,6 +853,14 @@ mod tests {
             ),
             ("ai_chat.ai_reply.max_tokens", json!(321)),
             ("ai_chat.ai_reply.timeout_seconds", json!(77)),
+            ("ai_chat.vision.enabled", json!(false)),
+            ("ai_chat.vision.mode", json!("tool")),
+            ("ai_chat.vision.max_edge", json!(1_024)),
+            ("ai_chat.vision.jpeg_quality", json!(60)),
+            ("ai_chat.vision.max_bytes", json!(2_000_000)),
+            ("ai_chat.vision.timeout_ms", json!(1_200)),
+            ("ai_chat.vision.model", json!("vision-test-model")),
+            ("ai_chat.vision.allow_full_screen", json!(false)),
             ("song_ai.local_recommend", json!(false)),
             ("song_ai.local_recommend_min_score", json!(0.42)),
             ("ai_chat.cooldown_seconds", json!(9_999)),
@@ -868,6 +902,59 @@ mod tests {
                 json_at(&snapshot, path),
                 json_at(&baseline, path),
                 "未登记 Live 的字段必须保留旧值: {path}"
+            );
+        }
+    }
+    /// tts：Live 字段逐项进快照，endpoint/api_key 保留旧值（IdleReload）。
+    #[test]
+    fn newly_live_tts_fields_reach_the_snapshot() {
+        use serde_json::json;
+
+        let live = LiveConfigs::default();
+        let baseline = serde_json::to_value(AppConfig::default()).expect("默认配置序列化");
+        let mut changed_value = serde_json::to_value(AppConfig::default()).expect("序列化默认配置");
+        let live_values: Vec<(&str, serde_json::Value)> = vec![
+            ("tts.enabled", json!(true)),
+            ("tts.model", json!("tts-test-model")),
+            ("tts.reference_id", json!("tts-test-reference")),
+            ("tts.voice", json!("tts-test-voice")),
+            ("tts.duck_volume", json!(45)),
+            ("tts.duck_fade_ms", json!(300)),
+            ("tts.max_chars", json!(120)),
+            ("tts.timeout_ms", json!(9_000)),
+            ("tts.queue_max", json!(4)),
+        ];
+        for (path, value) in &live_values {
+            assert_ne!(
+                json_at(&baseline, path),
+                value,
+                "测试值必须与默认值不同（证明 apply 真的覆盖）: {path}"
+            );
+            set_json_path(&mut changed_value, path, value.clone());
+        }
+        set_json_path(
+            &mut changed_value,
+            "tts.endpoint",
+            json!("https://should-not-apply.example"),
+        );
+        set_json_path(&mut changed_value, "tts.api_key", json!("should-not-apply-key"));
+        let changed: AppConfig =
+            serde_json::from_value(changed_value.clone()).expect("改动配置反序列化");
+
+        live.apply(&changed);
+        let snapshot = serde_json::to_value(&*live.snapshot()).expect("快照序列化");
+        for (path, _) in &live_values {
+            assert_eq!(
+                json_at(&snapshot, path),
+                json_at(&changed_value, path),
+                "tts Live 字段 apply 后必须等于改动值: {path}"
+            );
+        }
+        for path in ["tts.endpoint", "tts.api_key"] {
+            assert_eq!(
+                json_at(&snapshot, path),
+                json_at(&baseline, path),
+                "tts 的 IdleReload 字段必须保留旧值: {path}"
             );
         }
     }

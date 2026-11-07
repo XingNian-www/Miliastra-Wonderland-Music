@@ -79,7 +79,7 @@ pub enum FieldKind {
 /// （`get_path` 找不到即跳过）天然兼容，无需特殊处理。
 ///
 /// `store.rs` 的 `SECRET_PATHS` 引用本常量，禁止在别处重复定义。
-pub const SECRET_PATHS: &[&str] = &["http.access_token", "ai.api_key", "chat_source.token"];
+pub const SECRET_PATHS: &[&str] = &["http.access_token", "ai.api_key", "chat_source.token", "tts.api_key"];
 
 /// 配置字段 schema：路径、中文名、类型、生效级别、来源与提示。
 #[derive(Clone, Debug)]
@@ -2720,6 +2720,13 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             order: 32,
             fields: with_section_prefix("ai_chat", ai_chat_section()),
         },
+        ConfigSectionSchema {
+            name: "tts".to_string(),
+            label: "语音 TTS".to_string(),
+            domain: Domain::Interaction,
+            order: 35,
+            fields: with_section_prefix("tts", tts_section()),
+        },
     ];
     // 统一补段内小节：声明点不必逐个手写 group。
     for section in &mut sections {
@@ -2851,6 +2858,67 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "留空使用内置默认值；从每轮对话中抽取值得长期记住的信息",
         ),
         ConfigFieldSchema::db_live(
+            "vision.enabled",
+            "识别截图",
+            FieldKind::Bool,
+            "开启 AI 识图；模型不支持图片时自动降级为纯文本",
+        ),
+        ConfigFieldSchema::db_live(
+            "vision.mode",
+            "识图调用方式",
+            FieldKind::Enum(vec![
+                ("auto".to_string(), "每轮自动附图".to_string()),
+                ("tool".to_string(), "仅 look 工具".to_string()),
+                ("both".to_string(), "自动附图 + look 工具".to_string()),
+            ]),
+            "auto 每轮自动附一级大厅截图；tool 不自动附图，由模型按需调用 look；both 两者都启用；enabled=false 时全部关闭",
+        ),
+        ConfigFieldSchema::db_live(
+            "vision.capture_scope",
+            "截图范围",
+            FieldKind::Enum(vec![(
+                "primary_screen".to_string(),
+                "整个一级大厅".to_string(),
+            )]),
+            "P0 只支持整个一级大厅；整屏可能包含 UID/HUD，日志不会保存截图内容",
+        ),
+        ConfigFieldSchema::db_live(
+            "vision.max_edge",
+            "截图长边上限",
+            int(512, 2_048),
+            "截图长边超过该值时等比缩小，单位像素",
+        ),
+        ConfigFieldSchema::db_live(
+            "vision.jpeg_quality",
+            "截图 JPEG 质量",
+            int(40, 95),
+            "JPEG 编码质量；越大越清晰、字节越多",
+        ),
+        ConfigFieldSchema::db_live(
+            "vision.max_bytes",
+            "截图字节上限",
+            int(100_000, 20_000_000),
+            "编码后超过该字节数会降采样/降质量，仍超限则本轮不附带图片",
+        ),
+        ConfigFieldSchema::db_live(
+            "vision.timeout_ms",
+            "截图超时",
+            int(100, 5_000),
+            "截图与编码的截止时间，单位毫秒；超时降级纯文本",
+        ),
+        ConfigFieldSchema::db_live(
+            "vision.model",
+            "视觉专用模型",
+            FieldKind::ModelName,
+            "留空沿用 ai_chat.model；模型是否支持图片由 API 查询结果决定",
+        ),
+        ConfigFieldSchema::db_live(
+            "vision.allow_full_screen",
+            "允许整屏截图",
+            FieldKind::Bool,
+            "用户明确选择整屏时开启；整屏可能包含昵称/UID/HUD",
+        ),
+        ConfigFieldSchema::db_live(
             "ai_reply.mode",
             "AI回复 生成方式",
             FieldKind::Enum(vec![
@@ -2894,6 +2962,90 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "超时秒数",
             FieldKind::Int { min: 1, max: 120 },
             "超过该时长按失败处理，AI回复 留空继续发送",
+        ),
+    ]
+}
+
+/// `tts` 段：fish.audio 语音合成（仅 AI 聊天工具 speak 可触发）。
+fn tts_section() -> Vec<ConfigFieldSchema> {
+    vec![
+        ConfigFieldSchema::db_live(
+            "enabled",
+            "启用 TTS",
+            FieldKind::Bool,
+            "允许 AI 聊天工具 speak 请求 fish.audio；未配置 api_key 时不发请求",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "endpoint",
+            "fish 接口地址",
+            FieldKind::String,
+            "fish.audio 基础地址；默认 https://api.fish.audio，实际请求 {endpoint}/v1/tts",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "api_key",
+            "fish API Key",
+            FieldKind::Secret,
+            "fish.audio API key，只以 Authorization Bearer 发送；保存后需重载子进程生效",
+        ),
+        ConfigFieldSchema::db_live(
+            "model",
+            "TTS 模型",
+            FieldKind::ModelName,
+            "作为 HTTP model 头发送，默认 s2.1-pro",
+        ),
+        ConfigFieldSchema::db_live(
+            "reference_id",
+            "参考音色 ID",
+            FieldKind::String,
+            "fish reference_id；留空时可使用 voice",
+        ),
+        ConfigFieldSchema::db_live(
+            "voice",
+            "音色别名",
+            FieldKind::String,
+            "reference_id 为空时作为 fish reference_id 发送",
+        ),
+        ConfigFieldSchema::db_live(
+            "format",
+            "音频格式",
+            FieldKind::Enum(vec![("wav".to_string(), "WAV".to_string())]),
+            "P0 只支持 WAV；SpeechPlayer 直接解码 WAV",
+        ),
+        ConfigFieldSchema::db_live(
+            "duck_volume",
+            "说话时音乐音量",
+            int(0, 100),
+            "说话期间实际输出增益百分比；100=不压低，默认 30",
+        ),
+        ConfigFieldSchema::db_live(
+            "duck_fade_ms",
+            "duck 淡入淡出",
+            int(0, 2_000),
+            "压低/恢复增益的渐变时长，默认 200ms",
+        ),
+        ConfigFieldSchema::db_live(
+            "max_chars",
+            "单条文本上限",
+            int(1, 2_000),
+            "超过该字符数截断，控制费用与延迟，默认 200",
+        ),
+        ConfigFieldSchema::db_live(
+            "timeout_ms",
+            "请求超时",
+            int(1_000, 60_000),
+            "fish 请求超时，默认 8000ms；超时静默跳过语音",
+        ),
+        ConfigFieldSchema::db_live(
+            "queue_max",
+            "语音队列上限",
+            int(1, 64),
+            "排队等待播放的语音条数上限，默认 8",
+        ),
+        ConfigFieldSchema::db_live(
+            "trigger_scope",
+            "触发范围",
+            FieldKind::Enum(vec![("ai_chat".to_string(), "仅 AI 聊天".to_string())]),
+            "P0 固定仅 AI 聊天工具 speak 可触发，普通回复不自动朗读",
         ),
     ]
 }

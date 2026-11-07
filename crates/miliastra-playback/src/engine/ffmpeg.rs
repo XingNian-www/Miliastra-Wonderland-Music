@@ -354,7 +354,11 @@ impl PcmBuffer {
         self.rendered_samples.load(Ordering::Acquire)
     }
 
-    fn fill<T>(&self, output: &mut [T], volume: u8)
+    /// 每帧输出 = 样本 × `volume/100 × duck/100`。
+    ///
+    /// `duck` 是 TTS 说话期间的独立压低增益（100=不压低），与 `volume` 正交：
+    /// 它只影响实际输出，不同步进快照，因此 `@状态` 显示的音量永远来自 `volume`。
+    fn fill<T>(&self, output: &mut [T], volume: u8, duck: u8)
     where
         T: SizedSample + FromSample<f32>,
     {
@@ -368,7 +372,7 @@ impl PcmBuffer {
             output.fill(silence);
             return;
         };
-        let gain = f32::from(volume) / 100.0;
+        let gain = (f32::from(volume) / 100.0) * (f32::from(duck) / 100.0);
         let mut consumed = 0_u64;
         for value in output {
             match samples.pop_front() {
@@ -525,6 +529,9 @@ async fn run_actor(
 struct OutputRuntime {
     audio: Arc<PcmBuffer>,
     volume: Arc<AtomicU8>,
+    /// TTS 说话期间的独立「压低增益」（0–100，100=不压低）。只作用于实际输出，
+    /// 与 `volume`（用户音量/快照）解耦：`SetDuckGain` 不写 `PlaybackSnapshot.volume`。
+    duck: Arc<AtomicU8>,
     format: OutputFormat,
     io_timeout: Duration,
 }
@@ -557,12 +564,14 @@ fn open_output_stream(
         .max(f64::from(format.channels)) as usize;
     let audio = Arc::new(PcmBuffer::new(capacity_samples));
     let volume = Arc::new(AtomicU8::new(100));
+    let duck = Arc::new(AtomicU8::new(100));
     let stream = build_output_stream(
         &device,
         stream_config,
         sample_format,
         audio.clone(),
         volume.clone(),
+        duck.clone(),
         worker_events_tx,
     )?;
     Ok((
@@ -570,6 +579,7 @@ fn open_output_stream(
         OutputRuntime {
             audio,
             volume,
+            duck,
             format,
             io_timeout,
         },
@@ -604,6 +614,7 @@ fn rebuild_output_stream(
         sample_format,
         output.audio.clone(),
         output.volume.clone(),
+        output.duck.clone(),
         worker_events_tx.clone(),
     )
 }
@@ -614,11 +625,19 @@ fn build_output_stream(
     sample_format: SampleFormat,
     audio: Arc<PcmBuffer>,
     volume: Arc<AtomicU8>,
+    duck: Arc<AtomicU8>,
     worker_events_tx: mpsc::UnboundedSender<WorkerEvent>,
 ) -> Result<Stream, EngineError> {
     macro_rules! build {
         ($sample:ty) => {
-            build_typed_output_stream::<$sample>(device, config, audio, volume, worker_events_tx)
+            build_typed_output_stream::<$sample>(
+                device,
+                config,
+                audio,
+                volume,
+                duck,
+                worker_events_tx,
+            )
         };
     }
 
@@ -646,6 +665,7 @@ fn build_typed_output_stream<T>(
     config: StreamConfig,
     audio: Arc<PcmBuffer>,
     volume: Arc<AtomicU8>,
+    duck: Arc<AtomicU8>,
     worker_events_tx: mpsc::UnboundedSender<WorkerEvent>,
 ) -> Result<Stream, EngineError>
 where
@@ -653,12 +673,17 @@ where
 {
     let callback_audio = audio;
     let callback_volume = volume;
+    let callback_duck = duck;
     let stream_events = worker_events_tx;
     device
         .build_output_stream(
             config,
             move |output: &mut [T], _| {
-                callback_audio.fill(output, callback_volume.load(Ordering::Relaxed));
+                callback_audio.fill(
+                    output,
+                    callback_volume.load(Ordering::Relaxed),
+                    callback_duck.load(Ordering::Relaxed),
+                );
             },
             move |_| {
                 let _ = stream_events.send(WorkerEvent::OutputFailed);
@@ -898,6 +923,17 @@ fn handle_command(
             output.volume.store(volume, Ordering::Release);
             state.snapshot.volume = volume;
             state.publish(snapshots);
+            Ok(())
+        }
+        EngineCommand::SetDuckGain { gain } => {
+            if gain > 100 {
+                return Err(EngineError::Rejected(
+                    "duck gain must be between 0 and 100".to_owned(),
+                ));
+            }
+            // 只改实际输出增益；**绝不**触碰 state.snapshot.volume / 不发布快照，
+            // 这样 `@状态`、状态栏与持久化音量都保持原值（「不回显示」）。
+            output.duck.store(gain, Ordering::Release);
             Ok(())
         }
     }
@@ -1752,12 +1788,96 @@ mod tests {
         OutputRuntime {
             audio: Arc::new(PcmBuffer::new(96_000)),
             volume: Arc::new(AtomicU8::new(100)),
+            duck: Arc::new(AtomicU8::new(100)),
             format: OutputFormat {
                 sample_rate: 48_000,
                 channels: 2,
             },
             io_timeout: Duration::from_secs(15),
         }
+    }
+
+    /// 实际输出 = 样本 × volume/100 × duck/100：volume=80、duck=30 → 0.8×0.3=0.24。
+    #[test]
+    fn fill_applies_volume_and_duck_gain_product() {
+        let buffer = PcmBuffer::new(8);
+        buffer.activate(1, false);
+        let cancelled = AtomicBool::new(false);
+        assert!(buffer.push(1, &[1.0_f32, 1.0, 1.0, 1.0], &cancelled));
+        let mut out = vec![0.0_f32; 4];
+        buffer.fill(&mut out, 80, 30);
+        for value in out {
+            assert!(
+                (value - 0.24).abs() < 1e-6,
+                "期望 0.8*0.3=0.24，实际 {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn fill_gain_defaults_to_full_when_volume_and_duck_are_100() {
+        let buffer = PcmBuffer::new(8);
+        buffer.activate(1, false);
+        let cancelled = AtomicBool::new(false);
+        assert!(buffer.push(1, &[0.5_f32, -0.25], &cancelled));
+        let mut out = vec![0.0_f32; 2];
+        buffer.fill(&mut out, 100, 100);
+        assert!((out[0] - 0.5).abs() < 1e-6);
+        assert!((out[1] + 0.25).abs() < 1e-6);
+    }
+
+    /// 关键不变量：`SetDuckGain` 只改实际 duck 增益，**不修改** `snapshot.volume`
+    /// （`@状态`/持久化音量不变）；对照 `SetVolume` 会改 snapshot.volume。
+    #[test]
+    fn set_duck_gain_does_not_change_snapshot_volume_while_set_volume_does() {
+        let output = output();
+        let mut state = ActorState::new();
+        state.snapshot.volume = 80;
+        let (snapshots, _snapshot_rx) = watch::channel(state.snapshot.clone());
+        let (worker_tx, _worker_rx) = mpsc::unbounded_channel();
+
+        handle_command(
+            EngineCommand::SetDuckGain { gain: 30 },
+            &mut state,
+            &snapshots,
+            &output,
+            &worker_tx,
+        )
+        .unwrap();
+        assert_eq!(output.duck.load(Ordering::Acquire), 30);
+        assert_eq!(
+            state.snapshot.volume, 80,
+            "SetDuckGain 不得修改 snapshot.volume（不回显示）"
+        );
+
+        // 反例对照：SetVolume 会改 snapshot.volume。
+        handle_command(
+            EngineCommand::SetVolume { volume: 60 },
+            &mut state,
+            &snapshots,
+            &output,
+            &worker_tx,
+        )
+        .unwrap();
+        assert_eq!(state.snapshot.volume, 60, "SetVolume 应当修改 snapshot.volume");
+    }
+
+    #[test]
+    fn set_duck_gain_rejects_out_of_range() {
+        let output = output();
+        let mut state = ActorState::new();
+        let (snapshots, _rx) = watch::channel(state.snapshot.clone());
+        let (worker_tx, _worker_rx) = mpsc::unbounded_channel();
+        let error = handle_command(
+            EngineCommand::SetDuckGain { gain: 101 },
+            &mut state,
+            &snapshots,
+            &output,
+            &worker_tx,
+        )
+        .unwrap_err();
+        assert!(matches!(error, EngineError::Rejected(_)));
+        assert_eq!(output.duck.load(Ordering::Acquire), 100, "非法值不得改动 duck");
     }
 
     fn active_state(session: SessionRef, engine_state: EngineState) -> ActorState {

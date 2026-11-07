@@ -8,6 +8,7 @@
 //! 只实现 Chat Completions，可用 `ai.wire_api` 单独切回。
 
 use std::collections::HashMap;
+use std::fmt;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -847,7 +848,9 @@ fn describe_responses_request(request: &CreateResponse) -> String {
 }
 
 /// 请求里的思考强度，转成人能读的说明。
-fn reasoning_effort_label(effort: &async_openai::types::responses::ReasoningEffort) -> &'static str {
+fn reasoning_effort_label(
+    effort: &async_openai::types::responses::ReasoningEffort,
+) -> &'static str {
     use async_openai::types::responses::ReasoningEffort;
     match effort {
         ReasoningEffort::None => "不思考",
@@ -895,7 +898,14 @@ fn describe_response_output(output: &[OutputItem]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join("、");
-                format!("消息[{}]", if contents.is_empty() { "无内容".to_string() } else { contents })
+                format!(
+                    "消息[{}]",
+                    if contents.is_empty() {
+                        "无内容".to_string()
+                    } else {
+                        contents
+                    }
+                )
             }
             OutputItem::Reasoning(_) => "思考过程".to_string(),
             OutputItem::FunctionCall(_) => "函数调用".to_string(),
@@ -1051,13 +1061,43 @@ impl std::error::Error for ModelListError {}
 /// 因此 Responses 与 Chat Completions 两种配置都能用同一个接口。
 /// 只读，不改任何配置；失败时把服务端原文带给调用方，便于排查网关差异。
 pub(crate) fn fetch_models(config: &AiConfig) -> std::result::Result<Vec<String>, ModelListError> {
+    let body = fetch_models_payload(config)?;
+    parse_model_list(&body).map_err(|error| ModelListError::Request(error.to_string()))
+}
+
+/// 查询某个模型是否声明支持图片输入。
+///
+/// 只解析 `GET /models` 返回的模型元数据（不同网关字段不统一），不根据模型名猜。
+/// 没有能力字段时返回 `supports_image: None`，调用方按“不确定”处理（不附图）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ModelCapabilities {
+    pub(crate) supports_image: Option<bool>,
+}
+
+pub(crate) fn fetch_model_capabilities(
+    config: &AiConfig,
+    model: &str,
+) -> std::result::Result<ModelCapabilities, ModelListError> {
+    let body = fetch_models_payload_with_timeout(config, std::time::Duration::from_secs(5))?;
+    Ok(parse_model_capabilities(&body, model))
+}
+
+fn fetch_models_payload(config: &AiConfig) -> std::result::Result<String, ModelListError> {
+    fetch_models_payload_with_timeout(config, std::time::Duration::from_secs(20))
+}
+
+fn fetch_models_payload_with_timeout(
+    config: &AiConfig,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, ModelListError> {
     let provider = parse_provider(&config.provider).map_err(config_error)?;
     let base = models_base_url(provider, config).map_err(config_error)?;
     let url = format!("{base}/models");
     ensure_http_url(&url, "models 地址").map_err(config_error)?;
     let api_key = normalize_api_key(&config.api_key).map_err(config_error)?;
 
-    let client = build_model_list_client(&config.http_proxy).map_err(config_error)?;
+    let client =
+        build_model_list_client_with_timeout(&config.http_proxy, timeout).map_err(config_error)?;
     let mut request = client.get(&url);
     // 与 kernel 的鉴权方式保持一致：Mimo 用 api-key，其余用 Bearer。
     request = match authentication(provider) {
@@ -1078,7 +1118,101 @@ pub(crate) fn fetch_models(config: &AiConfig) -> std::result::Result<Vec<String>
             body.chars().take(300).collect::<String>()
         )));
     }
-    parse_model_list(&body).map_err(|error| ModelListError::Request(error.to_string()))
+    Ok(body)
+}
+
+fn parse_model_capabilities(body: &str, model: &str) -> ModelCapabilities {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return ModelCapabilities::default();
+    };
+    let Some(item) = find_model_item(&value, model) else {
+        return ModelCapabilities::default();
+    };
+    model_capabilities_from_item(item)
+}
+
+fn find_model_item<'a>(value: &'a Value, model: &str) -> Option<&'a Value> {
+    let wanted = model.trim();
+    let items = value
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| value.get("models").and_then(Value::as_array))
+        .or_else(|| value.as_array())?;
+    items.iter().find(|item| {
+        item.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.trim() == wanted)
+    })
+}
+
+fn model_capabilities_from_item(item: &Value) -> ModelCapabilities {
+    for key in [
+        "supports_vision",
+        "supports_image",
+        "vision",
+        "image_input",
+        "image",
+    ] {
+        if let Some(value) = item.get(key).and_then(Value::as_bool) {
+            return ModelCapabilities {
+                supports_image: Some(value),
+            };
+        }
+    }
+    let mut saw_modality_list = false;
+    for key in ["input_modalities", "modalities", "supported_modalities"] {
+        if let Some(list) = item.get(key).and_then(Value::as_array) {
+            saw_modality_list = true;
+            if modality_list_supports_image(list) {
+                return ModelCapabilities {
+                    supports_image: Some(true),
+                };
+            }
+        }
+    }
+    if let Some(architecture) = item.get("architecture")
+        && let Some(list) = architecture
+            .get("input_modalities")
+            .and_then(Value::as_array)
+    {
+        saw_modality_list = true;
+        if modality_list_supports_image(list) {
+            return ModelCapabilities {
+                supports_image: Some(true),
+            };
+        }
+    }
+    if let Some(capabilities) = item.get("capabilities") {
+        if let Some(list) = capabilities.as_array() {
+            saw_modality_list = true;
+            if modality_list_supports_image(list) {
+                return ModelCapabilities {
+                    supports_image: Some(true),
+                };
+            }
+        } else if let Some(object) = capabilities.as_object() {
+            for (key, value) in object {
+                let key = key.to_ascii_lowercase();
+                if (key.contains("image") || key.contains("vision"))
+                    && value.as_bool() == Some(true)
+                {
+                    return ModelCapabilities {
+                        supports_image: Some(true),
+                    };
+                }
+            }
+        }
+    }
+    ModelCapabilities {
+        supports_image: saw_modality_list.then_some(false),
+    }
+}
+
+fn modality_list_supports_image(list: &[Value]) -> bool {
+    list.iter().filter_map(Value::as_str).any(|modality| {
+        let modality = modality.to_ascii_lowercase();
+        modality.contains("image") || modality.contains("vision")
+    })
 }
 
 fn config_error(error: anyhow::Error) -> ModelListError {
@@ -1159,8 +1293,15 @@ fn parse_model_list(body: &str) -> Result<Vec<String>> {
 ///
 /// reqwest 默认不发 User-Agent，部分网关会因此直接 403。
 fn build_model_list_client(proxy: &str) -> Result<reqwest::blocking::Client> {
+    build_model_list_client_with_timeout(proxy, std::time::Duration::from_secs(20))
+}
+
+fn build_model_list_client_with_timeout(
+    proxy: &str,
+    timeout: std::time::Duration,
+) -> Result<reqwest::blocking::Client> {
     let mut builder = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(timeout)
         .user_agent(concat!(
             "miliastra-wonderland-music/",
             env!("CARGO_PKG_VERSION")
@@ -1172,6 +1313,57 @@ fn build_model_list_client(proxy: &str) -> Result<reqwest::blocking::Client> {
     builder.build().context("构建模型列表客户端失败")
 }
 
+/// 当前 user 消息附带的一张内存图片。
+///
+/// 只保存 JPEG 字节与尺寸；`Debug` 故意不打印字节或 data URL，避免截图内容
+/// 进入日志/错误链。需要发送时临时生成 `data:image/jpeg;base64,...`。
+#[derive(Clone)]
+pub(crate) struct ImageAttachment {
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl fmt::Debug for ImageAttachment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ImageAttachment")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl ImageAttachment {
+    pub(crate) fn new_jpeg(bytes: Vec<u8>, width: u32, height: u32) -> Self {
+        Self {
+            bytes,
+            width,
+            height,
+        }
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub(crate) fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn data_url(&self) -> String {
+        format!(
+            "data:image/jpeg;base64,{}",
+            crate::debug_http_service::base64_encode(&self.bytes)
+        )
+    }
+}
+
 /// One native tool conversation. History is replayed in full, including Responses
 /// reasoning items, so this does not depend on server-side response storage.
 pub(crate) struct ToolSession {
@@ -1181,6 +1373,7 @@ pub(crate) struct ToolSession {
     tools: Vec<Value>,
     names: std::collections::HashSet<String>,
     history: Vec<Value>,
+    image: Option<ImageAttachment>,
     seen: std::collections::HashSet<String>,
     pending: std::collections::HashSet<String>,
 }
@@ -1241,9 +1434,23 @@ impl ToolSession {
         config: &AiConfig,
         options: &AiCallOptions,
         system: &str,
+        history: Vec<Value>,
+        user: &str,
+        tools: Vec<Value>,
+    ) -> Result<Self> {
+        Self::with_history_options_and_image(config, options, system, history, user, tools, None)
+    }
+
+    /// 带调用点选项与可选图片的构造。图片只注入当前 user 消息；
+    /// 历史消息仍保持纯文本，避免历史图片重复计费/污染回归。
+    pub(crate) fn with_history_options_and_image(
+        config: &AiConfig,
+        options: &AiCallOptions,
+        system: &str,
         mut history: Vec<Value>,
         user: &str,
         tools: Vec<Value>,
+        image: Option<ImageAttachment>,
     ) -> Result<Self> {
         if history.len() % 2 != 0 {
             bail!("AI 历史消息必须包含完整的 user/assistant 对话轮次");
@@ -1291,9 +1498,40 @@ impl ToolSession {
             tools,
             names,
             history,
+            image,
             seen: Default::default(),
             pending: Default::default(),
         })
+    }
+
+    /// Responses 的历史副本：仅最后一条当前 user 消息可带 `input_text + input_image`。
+    fn history_with_image_for_responses(&self) -> Vec<Value> {
+        let mut items = self.history.clone();
+        if let Some(image) = &self.image
+            && let Some(last) = items.last_mut()
+        {
+            let text = last["content"].as_str().unwrap_or_default().to_string();
+            last["content"] = serde_json::json!([
+                {"type": "input_text", "text": text},
+                {"type": "input_image", "image_url": image.data_url()},
+            ]);
+        }
+        items
+    }
+
+    /// Chat Completions 的历史副本：仅最后一条当前 user 消息可带 `text + image_url`。
+    fn history_with_image_for_chat(&self) -> Vec<Value> {
+        let mut messages = self.history.clone();
+        if let Some(image) = &self.image
+            && let Some(last) = messages.last_mut()
+        {
+            let text = last["content"].as_str().unwrap_or_default().to_string();
+            last["content"] = serde_json::json!([
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": image.data_url()}},
+            ]);
+        }
+        messages
     }
 
     fn request_body(&self, max_tokens: u32, allow_tools: bool) -> Result<Value> {
@@ -1324,14 +1562,14 @@ impl ToolSession {
             WireApi::Responses => {
                 body["instructions"] = self.system.clone().into();
                 body["max_output_tokens"] = max_tokens.into();
-                body["input"] = self.history.clone().into();
+                body["input"] = self.history_with_image_for_responses().into();
                 // With store:false, retain the encrypted reasoning content when provided.
                 body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
             }
             WireApi::ChatCompletions => {
                 let mut messages =
                     vec![serde_json::json!({"role":"system", "content":self.system})];
-                messages.extend(self.history.clone());
+                messages.extend(self.history_with_image_for_chat());
                 body["messages"] = messages.into();
                 body["max_completion_tokens"] = max_tokens.into();
             }
@@ -1347,8 +1585,8 @@ impl ToolSession {
         body["input"] = serde_json::json!([]);
         let mut request: CreateResponse =
             serde_json::from_value(body).context("AI Responses 工具请求无效")?;
-        let items = self
-            .history
+        let history = self.history_with_image_for_responses();
+        let items = history
             .iter()
             .map(|item| {
                 if item.get("type").is_some() {
@@ -2339,5 +2577,112 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], 1024);
         assert_eq!(body["stream"], false);
         assert_eq!(body["store"], false);
+    }
+    fn image_attachment() -> ImageAttachment {
+        ImageAttachment::new_jpeg(vec![0xff, 0xd8, 0xff, 0xd9], 2, 2)
+    }
+
+    #[test]
+    fn tool_session_attaches_image_only_to_current_user_on_both_wires() {
+        let history = vec![
+            json!({"role":"user", "content":"First question"}),
+            json!({"role":"assistant", "content":"First answer"}),
+        ];
+        for wire in [WireApi::Responses, WireApi::ChatCompletions] {
+            let mut config = config("openai");
+            config.wire_api = wire;
+            let session = ToolSession::with_history_options_and_image(
+                &config,
+                &AiCallOptions::new(""),
+                "Persona",
+                history.clone(),
+                "Current question",
+                Vec::new(),
+                Some(image_attachment()),
+            )
+            .unwrap();
+            let body = session_body(&session, false);
+            let messages = match wire {
+                WireApi::Responses => body["input"].as_array().unwrap().clone(),
+                WireApi::ChatCompletions => body["messages"].as_array().unwrap()[1..].to_vec(),
+            };
+            assert_eq!(messages.len(), history.len() + 1);
+            for (actual, expected) in messages.iter().zip(&history) {
+                assert_eq!(actual["role"], expected["role"]);
+                assert_eq!(actual["content"], expected["content"]);
+            }
+            let current = messages.last().unwrap();
+            assert_eq!(current["role"], "user");
+            let parts = current["content"]
+                .as_array()
+                .expect("当前 user 必须是 content 数组");
+            match wire {
+                WireApi::Responses => {
+                    assert_eq!(parts[0]["type"], "input_text");
+                    assert_eq!(parts[0]["text"], "Current question");
+                    assert_eq!(parts[1]["type"], "input_image");
+                    assert!(
+                        parts[1]["image_url"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("data:image/jpeg;base64,")
+                    );
+                }
+                WireApi::ChatCompletions => {
+                    assert_eq!(parts[0]["type"], "text");
+                    assert_eq!(parts[0]["text"], "Current question");
+                    assert_eq!(parts[1]["type"], "image_url");
+                    assert!(
+                        parts[1]["image_url"]["url"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("data:image/jpeg;base64,")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_session_without_image_keeps_text_content_shape() {
+        let mut config = config("openai");
+        config.wire_api = WireApi::Responses;
+        let session = ToolSession::with_history_options(
+            &config,
+            &AiCallOptions::new(""),
+            "Persona",
+            Vec::new(),
+            "Current question",
+            Vec::new(),
+        )
+        .unwrap();
+        let body = session_body(&session, false);
+        assert_eq!(body["input"][0]["content"], "Current question");
+    }
+
+    #[test]
+    fn model_capabilities_are_read_from_models_metadata_not_model_name() {
+        let body = json!({"data":[
+            {"id":"vision-model", "architecture":{"input_modalities":["text","image"]}},
+            {"id":"text-model", "capabilities":["text"]},
+            {"id":"plain-model"}
+        ]})
+        .to_string();
+        assert_eq!(
+            parse_model_capabilities(&body, "vision-model").supports_image,
+            Some(true)
+        );
+        assert_eq!(
+            parse_model_capabilities(&body, "text-model").supports_image,
+            Some(false)
+        );
+        assert_eq!(
+            parse_model_capabilities(&body, "plain-model").supports_image,
+            None
+        );
+        assert_eq!(
+            parse_model_capabilities(&body, "missing-model").supports_image,
+            None
+        );
     }
 }

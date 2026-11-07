@@ -23,4 +23,5 @@ pub(crate) mod song_request;
 pub(crate) mod startup;
 pub(crate) mod tarot;
 pub(crate) mod turtle_soup;
+pub(crate) mod tts;
 pub(crate) mod undercover;

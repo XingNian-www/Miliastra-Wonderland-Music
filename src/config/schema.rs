@@ -2858,6 +2858,24 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "留空使用内置默认值；从每轮对话中抽取值得长期记住的信息",
         ),
         ConfigFieldSchema::db_live(
+            "tool_prompts.look",
+            "look 工具提示词",
+            FieldKind::Text,
+            "只在实际暴露 look 工具时注入；留空使用内置默认文案",
+        ),
+        ConfigFieldSchema::db_live(
+            "tool_prompts.speak",
+            "speak 工具提示词",
+            FieldKind::Text,
+            "只在实际暴露 speak 工具时注入；留空使用内置默认文案",
+        ),
+        ConfigFieldSchema::db_live(
+            "tool_prompts.command",
+            "命令工具提示词",
+            FieldKind::Text,
+            "只在 execute_game_command 暴露时注入；留空使用内置默认文案",
+        ),
+        ConfigFieldSchema::db_live(
             "vision.enabled",
             "识别截图",
             FieldKind::Bool,

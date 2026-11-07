@@ -288,7 +288,12 @@ impl ApplicationRuntime {
                 if text.is_empty() {
                     serde_json::json!({"status":"unavailable","reason":"视觉模型未返回文本"})
                 } else {
-                    serde_json::json!({"status":"looked","description":text})
+                    serde_json::json!({
+                        "status":"looked",
+                        "kind":"vision_transcript",
+                        "description":text,
+                        "note":"这是视觉子模型的文字转述，主模型没有直接看到原图"
+                    })
                 }
             }
             Err(error) => {
@@ -419,6 +424,13 @@ impl ApplicationRuntime {
                     ))
                     .then(|| self.ai_chat_model_supports_vision(&main_model))
                     .unwrap_or(false);
+                let command_enabled = config.allow_commands && !allowed.is_empty();
+                let system_prompt = ai_chat::response_system_prompt_with_tools(
+                    &config,
+                    look_enabled,
+                    tts_tool_available,
+                    command_enabled,
+                );
                 let ai_deadline = Instant::now() + self.business.ai_request_timeout;
                 let mut vision_image = if ai_chat::auto_image_enabled(&config, main_supports_vision) {
                     self.capture_ai_chat_vision_image(&config, Some(ai_deadline))
@@ -439,7 +451,7 @@ impl ApplicationRuntime {
                                 model: session_model,
                                 reasoning: config.reasoning,
                             },
-                            &ai_chat::response_system_prompt(&config),
+                            &system_prompt,
                             ai_chat::conversation_history(&context),
                             &prompt,
                             tools.clone(),
@@ -554,7 +566,10 @@ impl ApplicationRuntime {
                                         // 先记下，等文字回复发送后再入队，避免语音抢在文字前。
                                         spoken.insert(text.clone());
                                         pending_speaks.push((text, options));
-                                        serde_json::json!({"status":"queued","reason":"语音已排队，将在文字回复后播放"})
+                                        serde_json::json!({
+                                            "status":"queued",
+                                            "reason":"语音已排队，将在文字回复后播放；queued 不代表已播放"
+                                        })
                                     }
                                     Err(_) => serde_json::json!({
                                         "status":"rejected",

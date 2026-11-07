@@ -1862,6 +1862,53 @@ mod tests {
         assert_eq!(state.snapshot.volume, 60, "SetVolume 应当修改 snapshot.volume");
     }
 
+    /// SetDuckGain 不得发布快照（否则 Web/monitor 会看到音量变化）；
+    /// 对照 SetVolume 会发布。
+    #[test]
+    fn set_duck_gain_does_not_publish_a_snapshot() {
+        let output = output();
+        let mut state = ActorState::new();
+        state.snapshot.volume = 80;
+        let (snapshots, mut rx) = watch::channel(state.snapshot.clone());
+        let (worker_tx, _worker_rx) = mpsc::unbounded_channel();
+        rx.borrow_and_update();
+
+        handle_command(
+            EngineCommand::SetDuckGain { gain: 30 },
+            &mut state,
+            &snapshots,
+            &output,
+            &worker_tx,
+        )
+        .unwrap();
+        assert_eq!(output.duck.load(Ordering::Acquire), 30);
+        assert_eq!(state.snapshot.volume, 80);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "SetDuckGain 不得发布快照（不改状态/不落库）"
+        );
+
+        // 对照：SetVolume 会发布快照。
+        handle_command(
+            EngineCommand::SetVolume { volume: 80 },
+            &mut state,
+            &snapshots,
+            &output,
+            &worker_tx,
+        )
+        .unwrap();
+        assert!(rx.has_changed().unwrap(), "SetVolume 应发布快照");
+    }
+
+    #[test]
+    fn output_runtime_duck_defaults_to_100() {
+        assert_eq!(
+            output().duck.load(Ordering::Acquire),
+            100,
+            "duck 默认 100（不压低）"
+        );
+    }
+
     #[test]
     fn set_duck_gain_rejects_out_of_range() {
         let output = output();

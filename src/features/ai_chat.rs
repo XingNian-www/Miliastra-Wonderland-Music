@@ -25,7 +25,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ai::ImageAttachment;
-use crate::features::tts::{TtsSpeakOptions, tts_model_capabilities};
+use crate::features::tts::{DEFAULT_TTS_MODEL, TtsSpeakOptions, tts_model_capabilities};
 use crate::text::MAX_CHAT_WIDTH;
 
 use crate::features::chat_text::parse_prefixed_command;
@@ -194,7 +194,11 @@ impl AiChatAccess {
 #[serde(deny_unknown_fields)]
 pub struct AiChatVisionConfig {
     /// 是否在 AI 聊天请求中附带当前一级界面截图。
-    #[serde(default = "default_true")]
+    ///
+    /// 结构体默认（新配置）为 true；但旧配置缺少整个 `vision` 段时由
+    /// `default_vision_config_for_legacy()` 返回 false，避免“页面显示关闭、
+    /// 运行时却默认开启”的错位。`vision: {}` 缺该字段也按 false 处理。
+    #[serde(default)]
     pub enabled: bool,
     /// 识图调用方式：auto=每轮自动附图；tool=暴露 look 工具；both=两者。
     #[serde(default)]
@@ -279,7 +283,18 @@ pub(crate) fn auto_image_enabled(config: &AiChatConfig, supports_image: bool) ->
 
 /// 是否暴露 `look` 工具（enabled=false 时关闭）。
 pub(crate) fn look_tool_available(config: &AiChatConfig) -> bool {
-    config.vision.enabled && matches!(config.vision.mode, VisionMode::Tool | VisionMode::Both)
+    config.vision.enabled
+        && config.vision.allow_full_screen
+        && matches!(config.vision.mode, VisionMode::Tool | VisionMode::Both)
+}
+
+/// 单轮 look 配额：最多 2 次且同 instruction 不得重复。
+pub(crate) fn look_quota_allows(
+    looked: usize,
+    seen: &std::collections::HashSet<String>,
+    key: &str,
+) -> bool {
+    looked < 2 && !seen.contains(key)
 }
 
 /// 把一帧截图压缩成可随请求发送的内存 JPEG。
@@ -381,7 +396,7 @@ pub struct AiChatConfig {
     #[serde(default = "default_extract_prompt")]
     pub extract_prompt: String,
     /// 视觉输入配置：是否附带一级界面截图、截图范围与编码参数。
-    #[serde(default)]
+    #[serde(default = "default_vision_config_for_legacy")]
     pub vision: AiChatVisionConfig,
     /// `{AI回复}` 标签的生成参数。
     #[serde(default)]
@@ -510,6 +525,16 @@ fn default_cooldown() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+/// 旧配置缺少整个 `vision` 段时的安全默认：关闭识图。
+///
+/// 新配置由 `AiChatVisionConfig::default()` 决定（enabled=true）；这里只处理
+/// 从旧库/旧 JSON 反序列化时缺段的情况，避免 UI 显示关闭但运行时自动附图。
+fn default_vision_config_for_legacy() -> AiChatVisionConfig {
+    let mut config = AiChatVisionConfig::default();
+    config.enabled = false;
+    config
 }
 
 fn default_vision_max_edge() -> u32 {
@@ -2141,6 +2166,10 @@ pub(crate) struct AiChatExecution {
 pub(crate) const COMMAND_TOOL: &str = "execute_game_command";
 pub(crate) const MAX_TOOL_ROUNDS: usize = 3;
 
+/// 二级界面导航截图等待上界；独立于 `vision.timeout_ms`（后者只用于单次截图）。
+/// debug 实测约 2.3s，这里给 12s，覆盖设备唤醒 + 观察稳定 + 导航 + 返回。
+pub(crate) const VISION_NAVIGATION_TIMEOUT_MS: u64 = 12_000;
+
 /// AI 聊天内置的识图工具名。
 pub(crate) const LOOK_TOOL: &str = "look";
 
@@ -2150,14 +2179,16 @@ pub(crate) fn look_tool() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": LOOK_TOOL,
-            "description": "查看当前一级大厅截图并回答视觉问题。仅在确实需要看画面时调用。示例：用户问「屏幕上写着什么」时调用，instruction 填「描述聊天区域里的文字」。",
-            "strict": true,
+            "description": "查看当前一级大厅截图，由视觉子模型返回文字转述；主模型不会直接看到原图。instruction 要自包含。示例：instruction=描述聊天区域里的文字。",
+            // instruction 是可选参数，strict:true 会要求 required 覆盖所有字段；
+            // 这里关掉 strict，保留“可选 instruction”语义。
+            "strict": false,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "instruction": {
                         "type": "string",
-                        "description": "希望从截图了解什么；省略则简要描述画面",
+                        "description": "希望从截图了解什么，需自包含；省略则简要描述画面",
                         "maxLength": 200
                     }
                 },
@@ -2207,6 +2238,11 @@ pub(crate) fn speak_tool(max_chars: usize) -> serde_json::Value {
 
 /// 按当前 TTS 模型能力生成 `speak` 工具 schema；不支持的参数不暴露。
 pub(crate) fn speak_tool_for_model(model: &str, max_chars: usize) -> serde_json::Value {
+    let model = if model.trim().is_empty() {
+        DEFAULT_TTS_MODEL
+    } else {
+        model
+    };
     let capabilities = tts_model_capabilities(model);
     let mut properties = serde_json::Map::new();
     let text_description = match capabilities.style_mode {
@@ -2299,8 +2335,10 @@ pub(crate) fn speak_tool_for_model(model: &str, max_chars: usize) -> serde_json:
         "type": "function",
         "function": {
             "name": SPEAK_TOOL,
-            "description": format!("让 BOT 用语音说出文本；仅在用户明确要求语音/确实需要声音时调用，不要每条回复都读。text 用自然口语，不要 Markdown/URL/命令。{example}"),
-            "strict": true,
+            "description": format!("让 BOT 用语音说出文本。text 用自然口语，不要 Markdown/URL/命令。{example}"),
+            // text 必填、emotion/style/speed/volume_db 可选；strict:true 要求所有
+            // properties 都在 required 里，否则部分 OpenAI 兼容端点会整包 400。
+            "strict": false,
             "parameters": {
                 "type": "object",
                 "properties": serde_json::Value::Object(properties),
@@ -2335,6 +2373,11 @@ pub(crate) fn parse_speak_arguments_for_model(
     raw: &str,
     model: &str,
 ) -> Result<(String, TtsSpeakOptions)> {
+    let model = if model.trim().is_empty() {
+        DEFAULT_TTS_MODEL
+    } else {
+        model
+    };
     let capabilities = tts_model_capabilities(model);
     let arguments: SpeakArguments = serde_json::from_str(raw)?;
     let text = arguments.text.trim().to_string();
@@ -3824,6 +3867,21 @@ mod tests {
     }
 
     #[test]
+    fn missing_legacy_vision_section_defaults_disabled() {
+        let mut value = serde_json::to_value(AiChatConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("vision");
+        let parsed: AiChatConfig = serde_json::from_value(value).unwrap();
+        assert!(!parsed.vision.enabled, "旧配置缺 vision 应默认关闭");
+        assert_eq!(parsed.vision.mode, VisionMode::Auto);
+        // 保存 round-trip：后端读到的旧配置必须写回 false，页面/运行时口径一致。
+        let saved = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(saved["vision"]["enabled"], false);
+        let reloaded: AiChatConfig = serde_json::from_value(saved).unwrap();
+        assert!(!reloaded.vision.enabled);
+        assert!(AiChatConfig::default().vision.enabled, "新默认仍应开启");
+    }
+
+    #[test]
     fn vision_encoding_downscales_to_max_edge_and_stays_under_byte_cap() {
         let image = DynamicImage::new_rgb8(3_000, 2_000);
         let encoded = encode_vision_image(&image, 1_280, 80, 4_000_000).expect("encode");
@@ -3932,6 +3990,9 @@ mod tests {
         assert!(auto_image_enabled(&config, true));
         assert!(look_tool_available(&config));
 
+        config.vision.allow_full_screen = false;
+        assert!(!look_tool_available(&config), "整屏权限关闭时不应暴露 look");
+        config.vision.allow_full_screen = true;
         config.vision.enabled = false;
         assert!(!auto_image_enabled(&config, true));
         assert!(!look_tool_available(&config));
@@ -3941,6 +4002,7 @@ mod tests {
     fn look_tool_schema_and_parser_are_optional_instruction() {
         let tool = look_tool();
         assert_eq!(tool["function"]["name"], LOOK_TOOL);
+        assert_eq!(tool["function"]["strict"], false);
         assert_eq!(
             tool["function"]["parameters"]["properties"]["instruction"]["maxLength"],
             200
@@ -3953,6 +4015,12 @@ mod tests {
         assert!(parse_look_arguments(r#"{"instruction":"  "}"#).is_err());
         assert!(parse_look_arguments(r#"{"extra":1}"#).is_err());
         assert!(parse_look_arguments(r#"{"instruction":"a\nb"}"#).is_err());
+        let mut seen = std::collections::HashSet::new();
+        assert!(look_quota_allows(0, &seen, "a"));
+        seen.insert("a".to_string());
+        assert!(!look_quota_allows(1, &seen, "a"));
+        assert!(look_quota_allows(1, &seen, "b"));
+        assert!(!look_quota_allows(2, &seen, "c"));
     }
 
     #[test]
@@ -3968,10 +4036,17 @@ mod tests {
         let tool = speak_tool(120);
         assert_eq!(tool["function"]["name"], SPEAK_TOOL);
         assert_eq!(tool["function"]["parameters"]["properties"]["text"]["maxLength"], 120);
+        assert_eq!(tool["function"]["strict"], false, "可选字段不能配 strict:true");
+        let required = tool["function"]["parameters"]["required"].as_array().unwrap();
+        assert_eq!(required, &vec![serde_json::json!("text")]);
         let description = tool["function"]["description"].as_str().unwrap_or_default();
-        for needle in ["明确要求语音", "不要每条回复都读", "Markdown/URL", "示例"] {
+        for needle in ["让 BOT 用语音说出文本", "Markdown/URL", "示例"] {
             assert!(description.contains(needle), "工具描述缺少约束：{needle}");
         }
+        assert!(
+            !description.contains("仅在"),
+            "工具描述不应规定何时调用；交给用户 system_prompt"
+        );
         assert_eq!(parse_speak_arguments(r#"{"text":"你好"}"#).unwrap(), "你好");
         assert!(parse_speak_arguments(r#"{"text":"  "}"#).is_err());
         assert!(parse_speak_arguments(r#"{"text":"a\nb"}"#).is_err());

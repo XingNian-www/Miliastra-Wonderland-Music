@@ -37,6 +37,8 @@ const SOURCE_TIMEOUT: Duration = Duration::from_secs(15);
 const REFRESH_CHECK_INTERVAL_MS: u64 = DAILY_REFRESH_INTERVAL_MS;
 const ACCOUNT_STATUS_CHECK_INTERVAL_MS: u64 = DAILY_REFRESH_INTERVAL_MS;
 const REFRESH_FAILURE_BACKOFF_MS: u64 = 15 * 60 * 1000;
+/// `set_duck_gain` 的有界等待：TTS 恢复路径不能被无超时的同步 request 永久卡住。
+const DUCK_GAIN_TIMEOUT: Duration = Duration::from_millis(300);
 
 type Reply<T> = std_mpsc::SyncSender<Result<T, PlaybackError>>;
 
@@ -515,7 +517,9 @@ impl PlaybackHandle {
     /// 只改实际输出增益，**不修改 `PlaybackSnapshot.volume`**（`@状态`/持久化音量不变）。
     /// 供主 crate 的 TTS 编排在说话开始/结束时调用。
     pub fn set_duck_gain(&self, gain: u8) -> Result<(), PlaybackError> {
-        self.request(|reply| Command::SetDuckGain(gain, reply))
+        // 有界等待：超时返回 `PlaybackError::Busy`（可检测），避免 TTS 恢复路径永久阻塞。
+        // 即使命令稍后才被处理，SetDuckGain 也只改实际输出增益、不写 snapshot/不持久化。
+        self.request_timeout(DUCK_GAIN_TIMEOUT, |reply| Command::SetDuckGain(gain, reply))
     }
 
     pub fn snapshot(&self) -> Result<PlaybackSnapshot, PlaybackError> {
@@ -668,6 +672,16 @@ impl PlaybackHandle {
         self.submit(command)?
             .recv()
             .map_err(|_| PlaybackError::RuntimeStopped)?
+    }
+
+    /// 有界等待的 request：超时映射为 [`PlaybackError::Busy`]，供可降级路径使用。
+    fn request_timeout<T>(
+        &self,
+        timeout: Duration,
+        command: impl FnOnce(Reply<T>) -> Command,
+    ) -> Result<T, PlaybackError> {
+        let reply = self.submit(command)?;
+        recv_reply_timeout(reply, timeout)
     }
 
     fn submit<T>(
@@ -2018,6 +2032,18 @@ fn block_result(result: Result<(), PlaybackCoreError>) -> Result<(), PlaybackErr
     result.map_err(PlaybackError::from)
 }
 
+/// 等待命令回复；超时返回 `Busy`（可检测），通道断开返回 `RuntimeStopped`。
+fn recv_reply_timeout<T>(
+    reply: std_mpsc::Receiver<Result<T, PlaybackError>>,
+    timeout: Duration,
+) -> Result<T, PlaybackError> {
+    match reply.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std_mpsc::RecvTimeoutError::Timeout) => Err(PlaybackError::Busy),
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(PlaybackError::RuntimeStopped),
+    }
+}
+
 fn internal_error(error: impl std::fmt::Display) -> PlaybackError {
     PlaybackError::Internal(error.to_string())
 }
@@ -3332,6 +3358,39 @@ mod tests {
         assert!(handle.set_duck_gain(101).is_err(), "duck gain 101 应被拒绝");
 
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recv_reply_timeout_maps_timeout_to_busy_and_disconnect_to_stopped() {
+        // 超时 → Busy（有界等待，不永久阻塞）。
+        let (_tx, rx) = std_mpsc::sync_channel::<Result<(), PlaybackError>>(1);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            recv_reply_timeout(rx, Duration::from_millis(20)),
+            Err(PlaybackError::Busy)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // 发送端已断开 → RuntimeStopped。
+        let (tx, rx) = std_mpsc::sync_channel::<Result<(), PlaybackError>>(1);
+        drop(tx);
+        assert!(matches!(
+            recv_reply_timeout(rx, Duration::from_millis(20)),
+            Err(PlaybackError::RuntimeStopped)
+        ));
+    }
+
+    #[test]
+    fn set_duck_gain_fails_fast_after_runtime_stopped() {
+        let runtime = test_runtime();
+        let handle = runtime.handle();
+        runtime.shutdown().unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            handle.set_duck_gain(30),
+            Err(PlaybackError::RuntimeStopped)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1), "停机后必须快速失败");
     }
 
     #[test]

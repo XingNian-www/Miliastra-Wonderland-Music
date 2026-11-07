@@ -482,6 +482,8 @@ fn stage_label(stage: &'static str) -> &'static str {
         // ── 各流程的预备动作 ──
         "prepare_residency" => "准备界面驻留",
         "prepare_friend_delivery" => "准备好友投递",
+        "prepare_capture_primary" => "准备一级截图",
+        "observe_capture_residency" => "观察一级/二级驻留",
         _ => stage,
     }
 }

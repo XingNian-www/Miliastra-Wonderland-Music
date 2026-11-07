@@ -4,7 +4,9 @@
 //! - **与音乐播放完全隔离**：自己的线程（`tts-runtime`）+ 自己的 CPAL 输出流，独立 PCM
 //!   缓冲；不占用、不暂停、不替换音乐 session，也**不触碰**音乐的 `PlaybackSnapshot`。
 //! - 音乐侧压低由引擎独立的 `EngineCommand::SetDuckGain` 完成（本模块只负责播语音）。
-//! - 失败可降级：无音频设备 / 解码失败时返回 `SpeechError`，调用方静默跳过即可。
+//! - **流健康可观测**：CPAL 输出流错误 / 线程异常退出会反映到 [`SpeechHealth`] 与
+//!   [`SpeechPlayer::is_alive`]，`is_speaking` 自动回落；可 [`SpeechPlayer::restart`] 恢复。
+//! - 失败可降级：无音频设备 / 解码失败时返回 [`SpeechError`]，调用方静默跳过即可。
 //!
 //! 输入支持：
 //! - [`SpeechAudio::Pcm`]：已解码的交错 f32 PCM（样本范围 -1.0..=1.0）；
@@ -18,11 +20,40 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use thiserror::Error;
 use tokio::sync::watch;
+
+/// 语音播放器/输出流的健康状态。
+///
+/// - [`SpeechHealth::Healthy`]：已初始化且流仍存活；
+/// - [`SpeechHealth::Degraded`]：输出流报错（如设备被拔出/独占失败）或线程异常退出，
+///   `is_alive` 会变 false，`is_speaking` 回落；调用方应停止 duck 并（可选）`restart`；
+/// - [`SpeechHealth::Closed`]：正常关闭（`shutdown`/`Drop`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpeechHealth {
+    Healthy,
+    Degraded { reason: String },
+    Closed,
+}
+
+impl SpeechHealth {
+    /// 是否健康可用。
+    pub fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+
+    /// 降级原因（仅 `Degraded` 有值）。
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Degraded { reason } => Some(reason),
+            _ => None,
+        }
+    }
+}
 
 /// 语音播放错误。
 #[derive(Debug, Clone, Error)]
@@ -30,10 +61,13 @@ pub enum SpeechError {
     /// 无可用音频输出设备 / 打开输出流失败。
     #[error("speech audio device is unavailable: {0}")]
     Unavailable(String),
-    /// 音频数据无法解析（目前支持 WAV PCM16 / IEEE-F32）。
+    /// 音频数据损坏/形状非法（可重试或丢弃该条语音，不应据此判定设备不可用）。
+    #[error("speech audio decode failed: {0}")]
+    Decode(String),
+    /// 音频格式合法但当前不支持（如 WAV 24-bit）。
     #[error("speech audio format is unsupported: {0}")]
     UnsupportedFormat(String),
-    /// 播放器线程已关闭，无法继续投递。
+    /// 播放器线程已关闭/已降级，无法继续投递。
     #[error("speech player is closed")]
     Closed,
 }
@@ -62,6 +96,9 @@ pub struct PcmAudio {
 
 impl SpeechAudio {
     /// 解码成统一的交错 f32 PCM。
+    ///
+    /// 错误分类：数据损坏/形状非法 → [`SpeechError::Decode`]；格式合法但不支持 →
+    /// [`SpeechError::UnsupportedFormat`]。
     pub fn decode(self) -> Result<PcmAudio, SpeechError> {
         match self {
             SpeechAudio::Pcm {
@@ -70,12 +107,12 @@ impl SpeechAudio {
                 samples,
             } => {
                 if sample_rate == 0 || channels == 0 {
-                    return Err(SpeechError::UnsupportedFormat(
-                        "sample_rate/channels must be non-zero".to_owned(),
+                    return Err(SpeechError::Decode(
+                        "PCM sample_rate/channels must be non-zero".to_owned(),
                     ));
                 }
                 if samples.len() % usize::from(channels) != 0 {
-                    return Err(SpeechError::UnsupportedFormat(
+                    return Err(SpeechError::Decode(
                         "PCM sample count is not a multiple of channels".to_owned(),
                     ));
                 }
@@ -93,7 +130,7 @@ impl SpeechAudio {
 /// 解析 WAV（RIFF/WAVE）。仅支持 `audio_format` = 1 (PCM16) 或 3 (IEEE float32)。
 fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err(SpeechError::UnsupportedFormat(
+        return Err(SpeechError::Decode(
             "not a RIFF/WAVE file".to_owned(),
         ));
     }
@@ -111,12 +148,14 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
         let body_start = pos + 8;
         let body_end = body_start.saturating_add(size);
         if body_end > bytes.len() {
-            break;
+            return Err(SpeechError::Decode(
+                "wav chunk is truncated".to_owned(),
+            ));
         }
         let body = &bytes[body_start..body_end];
         if id == b"fmt " {
             if body.len() < 16 {
-                return Err(SpeechError::UnsupportedFormat(
+                return Err(SpeechError::Decode(
                     "wav fmt chunk too short".to_owned(),
                 ));
             }
@@ -132,11 +171,12 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
         pos = body_end + (size & 1);
     }
     let (audio_format, channels, sample_rate, bits) = fmt.ok_or_else(|| {
-        SpeechError::UnsupportedFormat("wav is missing fmt chunk".to_owned())
+        SpeechError::Decode("wav is missing fmt chunk".to_owned())
     })?;
-    let data = data.ok_or_else(|| SpeechError::UnsupportedFormat("wav is missing data chunk".to_owned()))?;
+    let data =
+        data.ok_or_else(|| SpeechError::Decode("wav is missing data chunk".to_owned()))?;
     if channels == 0 || sample_rate == 0 {
-        return Err(SpeechError::UnsupportedFormat(
+        return Err(SpeechError::Decode(
             "wav has invalid channels/sample_rate".to_owned(),
         ));
     }
@@ -147,9 +187,7 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
             .collect::<Vec<_>>(),
         (3, 32) => data
             .chunks_exact(4)
-            .map(|chunk| {
-                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-            })
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect::<Vec<_>>(),
         (format, bits) => {
             return Err(SpeechError::UnsupportedFormat(format!(
@@ -158,7 +196,7 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
         }
     };
     if samples.len() % usize::from(channels) != 0 {
-        return Err(SpeechError::UnsupportedFormat(
+        return Err(SpeechError::Decode(
             "wav data length is not a multiple of channels".to_owned(),
         ));
     }
@@ -229,20 +267,76 @@ fn prepare_for_device(input: &PcmAudio, target_rate: u32, target_channels: u16) 
     interleaved
 }
 
+/// 语音播放器的共享健康/状态监督器（可由 CPAL error callback 跨线程上报）。
+struct Supervisor {
+    alive: Arc<AtomicBool>,
+    failed: AtomicBool,
+    health: watch::Sender<SpeechHealth>,
+    active: watch::Sender<bool>,
+}
+
+impl Supervisor {
+    fn new() -> Self {
+        let (health, _health_rx) = watch::channel(SpeechHealth::Healthy);
+        let (active, _active_rx) = watch::channel(false);
+        Self {
+            alive: Arc::new(AtomicBool::new(false)),
+            failed: AtomicBool::new(false),
+            health,
+            active,
+        }
+    }
+
+    fn set_speaking(&self, speaking: bool) {
+        self.active.send_replace(speaking);
+    }
+
+    /// CPAL 输出流错误 / 线程异常：标记降级并立即让 `is_speaking` 回落。
+    fn fail(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.failed.store(true, Ordering::Release);
+        self.health.send_replace(SpeechHealth::Degraded { reason });
+        self.active.send_replace(false);
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// 若尚未降级，标记为正常关闭。
+    fn mark_closed_if_healthy(&self) {
+        if !self.is_failed() {
+            self.health.send_replace(SpeechHealth::Closed);
+        }
+        self.active.send_replace(false);
+    }
+}
+
+/// 线程退出时保证 `alive=false` 且健康状态落到 Closed/Degraded（覆盖 panic 路径）。
+struct AliveGuard {
+    supervisor: Arc<Supervisor>,
+}
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.supervisor.alive.store(false, Ordering::Release);
+        self.supervisor.mark_closed_if_healthy();
+    }
+}
+
 /// 语音 PCM 缓冲（独立于音乐 `PcmBuffer`）。
 struct SpeechBuffer {
     samples: Mutex<VecDeque<f32>>,
     playing: AtomicBool,
-    /// 说话状态广播（true=正在输出语音），供上层做 duck 编排。
-    active: watch::Sender<bool>,
+    supervisor: Arc<Supervisor>,
 }
 
 impl SpeechBuffer {
-    fn new(active: watch::Sender<bool>) -> Self {
+    fn new(supervisor: Arc<Supervisor>) -> Self {
         Self {
             samples: Mutex::new(VecDeque::new()),
             playing: AtomicBool::new(false),
-            active,
+            supervisor,
         }
     }
 
@@ -255,7 +349,7 @@ impl SpeechBuffer {
             queue.extend(pcm);
         }
         self.playing.store(true, Ordering::Release);
-        self.active.send_replace(true);
+        self.supervisor.set_speaking(true);
     }
 
     fn stop(&self) {
@@ -264,7 +358,7 @@ impl SpeechBuffer {
             queue.clear();
         }
         if self.playing.swap(false, Ordering::AcqRel) {
-            self.active.send_replace(false);
+            self.supervisor.set_speaking(false);
         }
     }
 
@@ -290,7 +384,7 @@ impl SpeechBuffer {
         let drained = queue.is_empty();
         drop(queue);
         if any && drained && self.playing.swap(false, Ordering::AcqRel) {
-            self.active.send_replace(false);
+            self.supervisor.set_speaking(false);
         }
     }
 }
@@ -301,10 +395,22 @@ enum SpeechCommand {
     Shutdown,
 }
 
+/// 已打开的语音输出（真实 CPAL 流；测试用 fake 无流）。
+struct SpeechOutput {
+    _stream: Option<Stream>,
+    target_rate: u32,
+    target_channels: u16,
+}
+
+/// 语音输出工厂：在 `tts-runtime` 线程内打开设备并构建流（CPAL 流必须同线程创建）。
+type OutputFactory =
+    dyn Fn(&Arc<SpeechBuffer>, &Arc<Supervisor>) -> Result<SpeechOutput, SpeechError> + Send + Sync;
+
 /// 独立语音播放器句柄。内部持有 `tts-runtime` 线程与独立 CPAL 输出流。
 pub struct SpeechPlayer {
     tx: Mutex<mpsc::Sender<SpeechCommand>>,
-    active: watch::Receiver<bool>,
+    supervisor: Arc<Supervisor>,
+    factory: Arc<OutputFactory>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -313,36 +419,27 @@ impl SpeechPlayer {
     ///
     /// 无可用音频设备时返回 `SpeechError::Unavailable`（调用方静默降级即可）。
     pub fn spawn() -> Result<Self, SpeechError> {
-        let (command_tx, command_rx) = mpsc::channel::<SpeechCommand>();
-        let (active_tx, active_rx) = watch::channel(false);
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), SpeechError>>(1);
+        let factory: Arc<OutputFactory> = Arc::new(open_default_output);
+        Self::spawn_with_factory(factory)
+    }
 
-        let thread = thread::Builder::new()
-            .name("tts-runtime".to_owned())
-            .spawn(move || run_speech_thread(command_rx, active_tx, ready_tx))
-            .map_err(|error| SpeechError::Unavailable(format!("spawn tts-runtime: {error}")))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                tx: Mutex::new(command_tx),
-                active: active_rx,
-                thread: Some(thread),
-            }),
-            Ok(Err(error)) => {
-                let _ = thread.join();
-                Err(error)
-            }
-            Err(_) => {
-                let _ = thread.join();
-                Err(SpeechError::Unavailable(
-                    "tts-runtime exited during initialization".to_owned(),
-                ))
-            }
-        }
+    fn spawn_with_factory(factory: Arc<OutputFactory>) -> Result<Self, SpeechError> {
+        let parts = spawn_speech_thread(factory)?;
+        Ok(Self {
+            tx: Mutex::new(parts.tx),
+            supervisor: parts.supervisor,
+            factory: parts.factory,
+            thread: Some(parts.thread),
+        })
     }
 
     /// 异步投递一段音频：立即返回，实际播放由 `tts-runtime` 线程完成。
+    ///
+    /// 播放器已降级/关闭时返回 [`SpeechError::Closed`]。
     pub fn speak(&self, audio: SpeechAudio) -> Result<(), SpeechError> {
+        if !self.is_alive() {
+            return Err(SpeechError::Closed);
+        }
         let pcm = audio.decode()?;
         let sender = self.tx.lock().unwrap_or_else(|error| error.into_inner());
         sender
@@ -356,101 +453,204 @@ impl SpeechPlayer {
         sender.send(SpeechCommand::Stop).map_err(|_| SpeechError::Closed)
     }
 
-    /// 当前是否正在输出语音。
+    /// 当前是否正在输出语音。流错误/线程退出后恒为 false（健康回落）。
     pub fn is_speaking(&self) -> bool {
-        *self.active.borrow()
+        self.is_alive() && *self.supervisor.active.borrow()
     }
 
-    /// 订阅说话状态（true/正在说），供上层做 duck 的淡入淡出编排。
+    /// 线程/输出流是否仍存活。
+    pub fn is_alive(&self) -> bool {
+        self.supervisor.alive.load(Ordering::Acquire)
+    }
+
+    /// 当前健康状态快照。
+    pub fn health(&self) -> SpeechHealth {
+        let guard = self.supervisor.health.borrow();
+        (*guard).clone()
+    }
+
+    /// 降级原因（健康时返回 None）。
+    pub fn last_error(&self) -> Option<String> {
+        self.health().reason().map(str::to_owned)
+    }
+
+    /// 订阅健康状态变化（供上层停止 duck / 触发重启）。
+    pub fn subscribe_health(&self) -> watch::Receiver<SpeechHealth> {
+        self.supervisor.health.subscribe()
+    }
+
+    /// 订阅说话状态（true=正在说），供上层做 duck 的淡入淡出编排。
     pub fn subscribe_active(&self) -> watch::Receiver<bool> {
-        self.active.clone()
+        self.supervisor.active.subscribe()
     }
 
-    /// 关闭播放器：停止语音并等待线程退出。
+    /// 关闭旧线程并重新打开语音输出（设备恢复/流降级后由上层调用）。
+    ///
+    /// 失败时旧播放器保持关闭状态，健康为 `Closed/Degraded`，不会卡住上层。
+    pub fn restart(&mut self) -> Result<(), SpeechError> {
+        self.shutdown_inner();
+        let parts = spawn_speech_thread(self.factory.clone())?;
+        self.tx = Mutex::new(parts.tx);
+        self.supervisor = parts.supervisor;
+        self.thread = Some(parts.thread);
+        Ok(())
+    }
+
+    /// 关闭播放器：停止语音并等待线程退出（消耗句柄，保持既有调用方兼容）。
     pub fn shutdown(mut self) {
-        {
-            let sender = self.tx.lock().unwrap_or_else(|error| error.into_inner());
+        self.shutdown_inner();
+    }
+
+    fn shutdown_inner(&mut self) {
+        if let Ok(sender) = self.tx.lock() {
             let _ = sender.send(SpeechCommand::Shutdown);
         }
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
+        self.supervisor.alive.store(false, Ordering::Release);
     }
 }
 
 impl Drop for SpeechPlayer {
     fn drop(&mut self) {
-        if let Ok(sender) = self.tx.lock() {
-            let _ = sender.send(SpeechCommand::Shutdown);
+        self.shutdown_inner();
+    }
+}
+
+struct SpeechParts {
+    tx: mpsc::Sender<SpeechCommand>,
+    supervisor: Arc<Supervisor>,
+    factory: Arc<OutputFactory>,
+    thread: JoinHandle<()>,
+}
+
+fn spawn_speech_thread(factory: Arc<OutputFactory>) -> Result<SpeechParts, SpeechError> {
+    let supervisor = Arc::new(Supervisor::new());
+    let buffer = Arc::new(SpeechBuffer::new(supervisor.clone()));
+    let (command_tx, command_rx) = mpsc::channel::<SpeechCommand>();
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), SpeechError>>(1);
+
+    let thread_supervisor = supervisor.clone();
+    let thread_buffer = buffer.clone();
+    let thread_factory = factory.clone();
+    let thread = thread::Builder::new()
+        .name("tts-runtime".to_owned())
+        .spawn(move || {
+            run_speech_thread(
+                thread_factory,
+                command_rx,
+                thread_supervisor,
+                thread_buffer,
+                ready_tx,
+            )
+        })
+        .map_err(|error| SpeechError::Unavailable(format!("spawn tts-runtime: {error}")))?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(SpeechParts {
+            tx: command_tx,
+            supervisor,
+            factory,
+            thread,
+        }),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(error)
         }
-        if let Some(handle) = self.thread.take() {
-            // 线程可能在等待 CPAL 回调，join 一般很快；不 join 也不会泄漏 Stream。
-            let _ = handle.join();
+        Err(_) => {
+            let _ = thread.join();
+            Err(SpeechError::Unavailable(
+                "tts-runtime exited during initialization".to_owned(),
+            ))
         }
     }
 }
 
 fn run_speech_thread(
+    factory: Arc<OutputFactory>,
     command_rx: mpsc::Receiver<SpeechCommand>,
-    active_tx: watch::Sender<bool>,
+    supervisor: Arc<Supervisor>,
+    buffer: Arc<SpeechBuffer>,
     ready_tx: mpsc::SyncSender<Result<(), SpeechError>>,
 ) {
-    let host = cpal::default_host();
-    let Some(device) = host.default_output_device() else {
-        let _ = ready_tx.send(Err(SpeechError::Unavailable(
-            "no default audio output device is available".to_owned(),
-        )));
-        return;
+    // 任何路径退出（含 panic）都保证 alive=false + 健康回落。
+    let _guard = AliveGuard {
+        supervisor: supervisor.clone(),
     };
-    let supported = match device.default_output_config() {
-        Ok(config) => config,
-        Err(error) => {
-            let _ = ready_tx.send(Err(SpeechError::Unavailable(format!(
-                "query speech output device: {error}"
-            ))));
-            return;
-        }
-    };
-    let sample_format = supported.sample_format();
-    let stream_config: StreamConfig = supported.into();
-    if stream_config.channels == 0 || stream_config.sample_rate == 0 {
-        let _ = ready_tx.send(Err(SpeechError::Unavailable(
-            "speech output device returned an invalid format".to_owned(),
-        )));
-        return;
-    }
-    let target_rate = stream_config.sample_rate;
-    let target_channels = stream_config.channels;
-    let buffer = Arc::new(SpeechBuffer::new(active_tx.clone()));
 
-    let stream = match build_speech_stream(&device, stream_config, sample_format, buffer.clone()) {
-        Ok(stream) => stream,
+    let output = match factory(&buffer, &supervisor) {
+        Ok(output) => output,
         Err(error) => {
+            supervisor.fail(error.to_string());
             let _ = ready_tx.send(Err(error));
             return;
         }
     };
-    if let Err(error) = stream.play() {
-        let _ = ready_tx.send(Err(SpeechError::Unavailable(format!(
-            "start speech output stream: {error}"
-        ))));
+    supervisor.alive.store(true, Ordering::Release);
+    if ready_tx.send(Ok(())).is_err() {
         return;
     }
-    let _ = ready_tx.send(Ok(()));
 
     // 常驻：保持 stream 存活，串行处理投递的语音。
-    for command in command_rx {
-        match command {
-            SpeechCommand::Speak(pcm) => {
-                let prepared = prepare_for_device(&pcm, target_rate, target_channels);
+    // 用 recv_timeout 周期性检查 CPAL error callback 是否已把流标记为降级。
+    loop {
+        match command_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(SpeechCommand::Speak(pcm)) => {
+                if supervisor.is_failed() {
+                    break;
+                }
+                let prepared = prepare_for_device(&pcm, output.target_rate, output.target_channels);
                 buffer.enqueue(prepared);
             }
-            SpeechCommand::Stop => buffer.stop(),
-            SpeechCommand::Shutdown => break,
+            Ok(SpeechCommand::Stop) => buffer.stop(),
+            Ok(SpeechCommand::Shutdown) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if supervisor.is_failed() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     buffer.stop();
-    drop(stream);
+    drop(output);
+    // 正常退出由 AliveGuard 标记 Closed；流错误路径已标记 Degraded。
+}
+
+fn open_default_output(
+    buffer: &Arc<SpeechBuffer>,
+    supervisor: &Arc<Supervisor>,
+) -> Result<SpeechOutput, SpeechError> {
+    let host = cpal::default_host();
+    let device = host.default_output_device().ok_or_else(|| {
+        SpeechError::Unavailable("no default audio output device is available".to_owned())
+    })?;
+    let supported = device.default_output_config().map_err(|error| {
+        SpeechError::Unavailable(format!("query speech output device: {error}"))
+    })?;
+    let sample_format = supported.sample_format();
+    let stream_config: StreamConfig = supported.into();
+    if stream_config.channels == 0 || stream_config.sample_rate == 0 {
+        return Err(SpeechError::Unavailable(
+            "speech output device returned an invalid format".to_owned(),
+        ));
+    }
+    let stream = build_speech_stream(
+        &device,
+        stream_config,
+        sample_format,
+        buffer.clone(),
+        supervisor.clone(),
+    )?;
+    stream.play().map_err(|error| {
+        SpeechError::Unavailable(format!("start speech output stream: {error}"))
+    })?;
+    Ok(SpeechOutput {
+        _stream: Some(stream),
+        target_rate: stream_config.sample_rate,
+        target_channels: stream_config.channels,
+    })
 }
 
 fn build_speech_stream(
@@ -458,10 +658,11 @@ fn build_speech_stream(
     config: StreamConfig,
     sample_format: SampleFormat,
     buffer: Arc<SpeechBuffer>,
+    supervisor: Arc<Supervisor>,
 ) -> Result<Stream, SpeechError> {
     macro_rules! build {
         ($sample:ty) => {
-            build_typed_speech_stream::<$sample>(device, config, buffer)
+            build_typed_speech_stream::<$sample>(device, config, buffer, supervisor)
         };
     }
     match sample_format {
@@ -487,16 +688,22 @@ fn build_typed_speech_stream<T>(
     device: &cpal::Device,
     config: StreamConfig,
     buffer: Arc<SpeechBuffer>,
+    supervisor: Arc<Supervisor>,
 ) -> Result<Stream, SpeechError>
 where
     T: SizedSample + FromSample<f32>,
 {
+    let data_buffer = buffer.clone();
+    // CPAL error callback 不能空实现：设备丢失/独占失败必须让上层可观测并回落 duck。
+    let error_buffer = buffer;
+    let error_supervisor = supervisor;
     device
         .build_output_stream(
             config,
-            move |output: &mut [T], _| buffer.fill(output),
-            move |_| {
-                // 语音设备错误只影响语音，不能让音乐停；这里静默（上层可据 active 观察）。
+            move |output: &mut [T], _| data_buffer.fill(output),
+            move |error| {
+                error_buffer.stop();
+                error_supervisor.fail(format!("speech output stream error: {error}"));
             },
             None,
         )
@@ -505,8 +712,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{PcmAudio, SpeechAudio, SpeechBuffer, decode_wav, prepare_for_device};
-    use tokio::sync::watch;
+    use super::{
+        PcmAudio, SpeechAudio, SpeechBuffer, SpeechError, SpeechHealth, SpeechOutput,
+        SpeechPlayer, Supervisor, decode_wav, prepare_for_device,
+    };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn wav_pcm16_mono(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
         let data_len = (samples.len() * 2) as u32;
@@ -530,6 +741,28 @@ mod tests {
         out
     }
 
+    /// 测试用输出工厂：不打开真实声卡，只提供一个假的 target 格式。
+    fn fake_factory() -> Arc<super::OutputFactory> {
+        Arc::new(|_buffer, _supervisor| {
+            Ok(SpeechOutput {
+                _stream: None,
+                target_rate: 16_000,
+                target_channels: 1,
+            })
+        })
+    }
+
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("condition not reached within 2s");
+    }
+
     #[test]
     fn wav_pcm16_mono_decodes_to_f32() {
         let bytes = wav_pcm16_mono(16_000, &[0, i16::MAX, i16::MIN, 16_384]);
@@ -544,12 +777,40 @@ mod tests {
     }
 
     #[test]
-    fn wav_rejects_non_riff() {
-        assert!(decode_wav(b"not a wav").is_err());
+    fn wav_corruption_is_decode_error_not_unsupported() {
+        assert!(matches!(decode_wav(b"not a wav"), Err(SpeechError::Decode(_))));
+        // 截断的 chunk → Decode
+        let mut bytes = wav_pcm16_mono(16_000, &[0, 1]);
+        bytes.truncate(20);
+        assert!(matches!(decode_wav(&bytes), Err(SpeechError::Decode(_))));
     }
 
     #[test]
-    fn pcm_passthrough_validates_shape() {
+    fn wav_unsupported_bits_is_unsupported_format() {
+        // 构造 24-bit fmt：audio_format=1, channels=1, rate=16000, bits=24
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36u32 + 6).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&16_000u32.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&24u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            decode_wav(&bytes),
+            Err(SpeechError::UnsupportedFormat(_))
+        ));
+    }
+
+    #[test]
+    fn pcm_passthrough_validates_shape_as_decode_error() {
         let audio = SpeechAudio::Pcm {
             sample_rate: 8_000,
             channels: 2,
@@ -557,13 +818,18 @@ mod tests {
         };
         let pcm = audio.decode().unwrap();
         assert_eq!(pcm.channels, 2);
-        // 样本数不是声道整数倍 → 报错
         let bad = SpeechAudio::Pcm {
             sample_rate: 8_000,
             channels: 2,
             samples: vec![0.0; 3],
         };
-        assert!(bad.decode().is_err());
+        assert!(matches!(bad.decode(), Err(SpeechError::Decode(_))));
+        let zero = SpeechAudio::Pcm {
+            sample_rate: 0,
+            channels: 2,
+            samples: vec![0.0; 4],
+        };
+        assert!(matches!(zero.decode(), Err(SpeechError::Decode(_))));
     }
 
     #[test]
@@ -574,9 +840,7 @@ mod tests {
             samples: vec![0.25, 0.5, -0.25, -0.5],
         };
         let out = prepare_for_device(&input, 16_000, 2);
-        // 24000 帧/秒不变下：4 帧 @8k → 8 帧 @16k，双声道 → 16 个样本
         assert_eq!(out.len(), 8 * 2);
-        // 每帧两个声道相同（mono→stereo 复制）
         assert!((out[0] - out[1]).abs() < 1e-6);
     }
 
@@ -595,14 +859,14 @@ mod tests {
 
     #[test]
     fn speech_buffer_toggles_active_when_drained() {
-        let (tx, rx) = watch::channel(false);
-        let buffer = SpeechBuffer::new(tx);
+        let supervisor = Arc::new(Supervisor::new());
+        let buffer = SpeechBuffer::new(supervisor.clone());
+        let rx = supervisor.active.subscribe();
         assert!(!*rx.borrow());
         buffer.enqueue(vec![0.1, 0.2, 0.3]);
         assert!(*rx.borrow());
         let mut out = vec![0.0_f32; 8];
         buffer.fill(&mut out);
-        // 3 个样本被消费，缓冲排空 → active 回 false
         assert!((out[0] - 0.1).abs() < 1e-6);
         assert!((out[2] - 0.3).abs() < 1e-6);
         assert!((out[3]).abs() < 1e-6);
@@ -611,8 +875,9 @@ mod tests {
 
     #[test]
     fn speech_buffer_stop_clears_and_deactivates() {
-        let (tx, rx) = watch::channel(false);
-        let buffer = SpeechBuffer::new(tx);
+        let supervisor = Arc::new(Supervisor::new());
+        let buffer = SpeechBuffer::new(supervisor.clone());
+        let rx = supervisor.active.subscribe();
         buffer.enqueue(vec![0.5; 16]);
         assert!(*rx.borrow());
         buffer.stop();
@@ -620,5 +885,105 @@ mod tests {
         let mut out = vec![1.0_f32; 4];
         buffer.fill(&mut out);
         assert!(out.iter().all(|value| value.abs() < 1e-6));
+    }
+
+    #[test]
+    fn speech_player_health_and_speaking_fall_back_on_stream_error() {
+        let player = SpeechPlayer::spawn_with_factory(fake_factory()).unwrap();
+        assert!(player.is_alive());
+        assert_eq!(player.health(), SpeechHealth::Healthy);
+        assert!(!player.is_speaking());
+
+        player
+            .speak(SpeechAudio::Pcm {
+                sample_rate: 16_000,
+                channels: 1,
+                samples: vec![0.25; 1_600],
+            })
+            .unwrap();
+        wait_until(|| player.is_speaking());
+
+        // 模拟 CPAL error callback：健康降级、is_speaking 回落、线程退出。
+        player.supervisor.fail("simulated cpal stream error");
+        wait_until(|| !player.is_alive());
+        assert!(matches!(player.health(), SpeechHealth::Degraded { .. }));
+        assert!(player
+            .last_error()
+            .unwrap()
+            .contains("simulated cpal stream error"));
+        assert!(!player.is_speaking());
+        // 降级后 speak 返回 Closed，不会永久等待。
+        let error = player
+            .speak(SpeechAudio::Pcm {
+                sample_rate: 16_000,
+                channels: 1,
+                samples: vec![0.0; 16],
+            })
+            .unwrap_err();
+        assert!(matches!(error, SpeechError::Closed));
+        player.shutdown();
+    }
+
+    #[test]
+    fn speech_player_restart_recovers_after_stream_error() {
+        let mut player = SpeechPlayer::spawn_with_factory(fake_factory()).unwrap();
+        player.supervisor.fail("simulated cpal stream error");
+        wait_until(|| !player.is_alive());
+        assert!(!player.health().is_healthy());
+
+        player.restart().unwrap();
+        assert!(player.is_alive());
+        assert_eq!(player.health(), SpeechHealth::Healthy);
+        assert!(!player.is_speaking());
+        let health = player.subscribe_health();
+        player.shutdown();
+        assert_eq!(*health.borrow(), SpeechHealth::Closed);
+    }
+
+    #[test]
+    fn speech_player_consecutive_speak_stop_shutdown_do_not_leak_or_block() {
+        let player = SpeechPlayer::spawn_with_factory(fake_factory()).unwrap();
+        for index in 0..5 {
+            player
+                .speak(SpeechAudio::Pcm {
+                    sample_rate: 16_000,
+                    channels: 1,
+                    samples: vec![0.01 * index as f32; 320],
+                })
+                .unwrap();
+            player.stop().unwrap();
+        }
+        let health = player.subscribe_health();
+        let active = player.subscribe_active();
+        player.shutdown();
+        // shutdown 已 join 线程：健康落 Closed、说话状态回落，无残留线程/永久等待。
+        assert_eq!(*health.borrow(), SpeechHealth::Closed);
+        assert!(!*active.borrow());
+    }
+
+    #[test]
+    fn speech_player_spawn_failure_reports_unavailable_without_leak() {
+        let factory: Arc<super::OutputFactory> = Arc::new(|_buffer, _supervisor| {
+            Err(SpeechError::Unavailable("no test device".to_owned()))
+        });
+        match SpeechPlayer::spawn_with_factory(factory) {
+            Err(error) => assert!(matches!(error, SpeechError::Unavailable(_))),
+            Ok(_) => panic!("expected spawn failure to be reported, got a live player"),
+        }
+    }
+
+    #[test]
+    fn speech_health_reason_and_flags() {
+        let supervisor = Arc::new(Supervisor::new());
+        assert_eq!(*supervisor.health.borrow(), SpeechHealth::Healthy);
+        supervisor.fail("boom");
+        assert_eq!(
+            *supervisor.health.borrow(),
+            SpeechHealth::Degraded {
+                reason: "boom".to_owned()
+            }
+        );
+        assert!(!supervisor.health.borrow().is_healthy());
+        assert_eq!(supervisor.health.borrow().reason(), Some("boom"));
     }
 }

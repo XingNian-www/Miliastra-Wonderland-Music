@@ -1485,6 +1485,9 @@ let visionStatusLoading=false
 let visionStatusFetchedAt=0
 let visionPreviewLoading=false
 let visionPreviewUrl=null
+// 旧配置缺 ai_chat.vision.* 时记录“未设置”字段：不伪装默认值，未改动前不写回。
+let aiChatVisionUnset=new Set()
+let configVisionUnset=new Set()
 const AI_CHAT_GROUPS=[
   {id:'aiChatTriggerPanel',keys:['enabled','keyword','trigger_mode','min_access','cooldown_seconds','allow_commands']},
   {id:'aiChatMemoryPanel',keys:['actor_token_budget','bot_token_budget']},
@@ -1747,7 +1750,12 @@ function renderAiChatPage(){
       parts.push('<div class="config-field">')
       parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code></div>')
       if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
-      parts.push(configControlHtml(field,aiChatFieldValue(field.path),'ai_chat','aichat-'))
+      let fieldValue=aiChatFieldValue(field.path)
+      const isVision=String(field.path).startsWith('ai_chat.vision.')
+      const visionUnset=isVision&&fieldValue===undefined
+      if(isVision){if(visionUnset)aiChatVisionUnset.add(field.path);else aiChatVisionUnset.delete(field.path)}
+      // 旧配置缺 vision 时不拿 schema default 伪装成“已设置”；控件保持未选/空，改动后才写入。
+      parts.push(configControlHtml(field,fieldValue,'ai_chat','aichat-')+(visionUnset?'<div class="config-field-hint">旧配置未设置（沿用后端默认）；改动该项后才会写入。</div>':''))
       parts.push('</div>')
     }
     if(group.id==='aiChatVisionPanel')parts.push(visionPanelExtraHtml(found===0))
@@ -1756,8 +1764,9 @@ function renderAiChatPage(){
     host.innerHTML=parts.join('')
   }
   document.querySelectorAll('#page-aichat [data-cfg]').forEach(input=>{
-    input.addEventListener('change',()=>{aiChatDirty=true})
-    input.addEventListener('input',()=>{aiChatDirty=true})
+    const touch=()=>{aiChatDirty=true;input.dataset.cfgTouched='1'}
+    input.addEventListener('change',touch)
+    input.addEventListener('input',touch)
   })
   if($('aiChatVisionPanel'))loadVisionStatus(false)
 }
@@ -1767,14 +1776,18 @@ function visionPanelExtraHtml(noSchema){
   const modeNote=hasMode?'':'<p class="config-field-hint">当前后端未提供 ai_chat.vision.mode 下拉；可选值：<b>auto</b>=每轮自动附截图（默认）、<b>tool</b>=不自动附图、由 AI 调用 look、<b>both</b>=自动附图并允许 look。</p>'
   const note=noSchema?'<p class="config-field-hint">当前后端版本未提供 ai_chat.vision.* 配置；升级后端后这里会出现开关、模式、截图范围与限额。下面仍可预览画面。</p>':''
   return note
-    +'<p class="config-field-hint">识图模式：auto=每轮自动附截图（默认）；tool=不自动附图，由 AI 调用 <code>look</code>；both=自动附图并允许 <code>look</code>。只给工具与示例，是否调用、何时调用由你在 system_prompt 里自行决定。</p>'
+    +'<p class="config-field-hint">识图模式：auto=每轮自动附截图（默认）；tool=不自动附图，由 AI 调用 <code>look</code>；both=已有初始截图，<code>look</code> 仅在需要新画面时用，可能多一次视觉请求/费用。<b>both 会每轮附图并允许 look 再抓新画面，成本与请求数更高。</b>只给工具与示例，是否调用、何时调用由你在 system_prompt 里自行决定。</p>'
+    +'<p class="config-field-hint">视觉专用模型（vision.model）只用于 <code>look</code> 子请求；auto 自动附图仍使用 AI 聊天模型（ai_chat.model）。</p>'
+    +'<p class="config-field-hint">「允许整屏截图」关闭时识图不可用（当前截图范围只支持一级大厅整屏）。</p>'
     +modeNote
-    +'<div class="config-message config-vision-note">隐私说明：截图默认是整个一级大厅，可能包含昵称/HUD/UID。截图只在本机内存中编码，不写入磁盘；打开“识别截图”后才会随 AI 聊天请求发送给下方所配置的模型。模型不支持图片或查询失败时自动降级为纯文本。</div>'
+    +'<div class="config-message config-vision-note">隐私说明：截图默认是整个一级大厅，可能包含昵称/HUD/UID；非一级大厅或整屏画面还可能包含更多 UID/昵称。截图只在本机内存中编码，不写入磁盘；打开“识别截图”后才会随 AI 聊天请求发送给下方所配置的模型。模型不支持图片或查询失败时自动降级为纯文本。</div>'
     +'<details class="config-vision-tools"><summary>工具调用示例（look / speak）</summary>'
-    +'<p class="config-field-hint">下面只是<b>调用形状示例</b>，不是提示词；请在你自己的 system_prompt 里决定何时调用、说什么，本面板不会自动注入“何时说/说什么”。</p>'
-    +'<pre>look  →  {"tool":"look","arguments":{}}</pre>'
-    +'<pre>speak →  {"tool":"speak","arguments":{"text":"要朗读的短句"}}</pre>'
-    +'<p class="config-field-hint">工具名/参数以后端实现为准；speak 受上方「语音 TTS」配置与单条字数上限约束。</p>'
+    +'<p class="config-field-hint">下面只是<b>真实 function call 形状示例（name/arguments）</b>，不是提示词；请在你自己的 system_prompt 里决定何时调用、说什么，本面板不会自动注入“何时说/说什么”。</p>'
+    +'<pre>{"name":"look","arguments":"{\\\"instruction\\\":\\\"描述聊天区域里的文字\\\"}"}</pre>'
+    +'<pre>{"name":"speak","arguments":"{\\"text\\":\\"我没事\\",\\"emotion\\":\\"sad\\"}"}</pre>'
+    +'<p class="config-field-hint">speak 可选参数（按模型能力）：emotion / style / speed / volume_db，例如 <code>{"text":"我没事","emotion":"sad"}</code>；S1 用 (sad) 内联、S2/S2.1 用 [laughs]、Drama 3 用导演指示 + &lt;whisper&gt;…&lt;/whisper&gt;。以后端工具 schema 为准。</p>'
+    +'<p class="config-field-hint">arguments 是 JSON 字符串（OpenAI function call 形状）。工具名/参数以后端实现为准；speak 受「配置中心 → 语音 TTS」配置与单条字数上限约束。</p>'
+    +'<p class="config-field-hint"><b>instruction 示例（写在你自己的 system_prompt 里，可自行改写）</b>：需要看画面时调用 look；需要朗读时调用 speak，text 填要朗读的短句。本面板不会自动注入。</p>'
     +'</details>'
     +'<div class="row wrap" style="align-items:center;gap:var(--sp-2)">'
     +'<button type="button" class="btn small" id="aiVisionPreviewBtn" onclick="previewVisionFrame()">预览当前画面</button>'
@@ -1785,6 +1798,24 @@ function visionPanelExtraHtml(noSchema){
     +'<div id="aiVisionPreview" class="config-vision-preview hidden"></div>'
 }
 function aiChatVisionControl(path){return document.getElementById('aichat-'+configControlId('ai_chat.'+path))}
+function visionStatusOverrides(){
+  // 用面板未保存的值查能力：视觉模型优先，其次 ai_chat.model；provider/endpoint 若同页存在也带上。
+  const out={}
+  const vm=aiChatVisionControl('vision.model')
+  const chatModel=document.getElementById('aichat-'+configControlId('ai_chat.model'))
+  const model=(vm&&String(vm.value||'').trim())||(chatModel&&String(chatModel.value||'').trim())||''
+  if(model)out.model=model
+  const provider=document.getElementById('cfg-ai-provider')
+  if(provider&&String(provider.value||'').trim())out.provider=String(provider.value).trim()
+  const endpoint=document.getElementById('cfg-ai-endpoint')
+  if(endpoint&&String(endpoint.value||'').trim())out.endpoint=String(endpoint.value).trim()
+  return out
+}
+function visionNumber(path,fallback){
+  const el=aiChatVisionControl(path)
+  const n=el?Number(el.value):NaN
+  return Number.isFinite(n)?n:fallback
+}
 async function loadVisionStatus(force){
   if(visionStatusLoading)return
   if(!force&&Date.now()-visionStatusFetchedAt<5000)return
@@ -1793,14 +1824,20 @@ async function loadVisionStatus(force){
   visionStatusLoading=true
   visionStatusFetchedAt=Date.now()
   try{
-    const resp=await request('/ai/vision/status')
-    const supported=!!(resp&&(resp.supported===true||resp.vision===true||resp.ok===true||resp.enabled===true||resp.image_supported===true))
+    // 必须 POST：把面板未保存的 model/provider/endpoint 带上，不能只查保存值。
+    const resp=await requestJson('/ai/vision/status',visionStatusOverrides())
+    const raw=resp?resp.supports_image:undefined
+    // task-63 三态：true=支持 / false=明确不支持 / null·缺失=未知；disabled 单独表示“识图未启用”，
+    // 不能把 unknown/disabled 显示成“明确不支持”。
+    const capability=(resp&&resp.disabled===true)?'disabled':(raw===true?'yes':raw===false?'no':'unknown')
     const source=String((resp&&(resp.source||resp.provider||resp.modelSource||''))||'')
     const reason=String((resp&&(resp.reason||resp.message||resp.detail||''))||'')
-    if(el)el.textContent='模型能力：'+(supported?'支持图片':'暂不支持图片（将降级为纯文本）')+(source?' · 来源 '+source:'')+(reason?' · '+reason:'')
+    const labels={yes:'支持图片',no:'明确不支持图片（将降级为纯文本）',unknown:'未知（无法确认图片能力，按降级纯文本处理）',disabled:'识图未启用（后端 disabled，降级纯文本）'}
+    const label=labels[capability]||labels.unknown
+    if(el)el.textContent='模型能力：'+label+(source?' · 来源 '+source:'')+(reason?' · '+reason:'')
   }catch(e){
-    // task-56 后端可能尚未部署：404/失败时降级提示，不阻塞配置/保存。
-    if(el)el.textContent='模型能力：暂不可用（未取到 /ai/vision/status），已降级纯文本；可手填视觉模型并保存。'+((e&&e.message)?'（'+e.message+'）':'')
+    // 后端未实现/失败时降级提示，不阻塞配置与保存。
+    if(el)el.textContent='模型能力：暂不可用（POST /ai/vision/status 失败），已降级纯文本；可手填视觉模型并保存。'+((e&&e.message)?'（'+e.message+'）':'')
   }finally{visionStatusLoading=false}
 }
 async function previewVisionFrame(){
@@ -1808,14 +1845,14 @@ async function previewVisionFrame(){
   const btn=$('aiVisionPreviewBtn')
   const meta=$('aiVisionPreviewMeta')
   const host=$('aiVisionPreview')
-  let q=NaN
-  const qc=aiChatVisionControl('vision.jpeg_quality')
-  if(qc)q=Number(qc.value)
-  if(!Number.isFinite(q)||q<1||q>100)q=80
-  q=Math.round(q)
+  // quality 与 schema 40..95 对齐
+  let q=visionNumber('vision.jpeg_quality',80)
+  q=Math.max(40,Math.min(95,Math.round(q)))
+  const maxEdge=Math.max(1,Math.round(visionNumber('vision.max_edge',1280)))
+  const maxBytes=Math.max(1,Math.round(visionNumber('vision.max_bytes',4000000)))
   visionPreviewLoading=true
   if(btn){btn.disabled=true;btn.textContent='截图中…'}
-  if(meta)meta.textContent='截图中（quality='+q+'）…'
+  if(meta)meta.textContent='截图中（debug-only 预览：quality='+q+'；真实识图另按 max_edge='+maxEdge+'、max_bytes='+maxBytes+' 处理）…'
   const started=performance.now()
   try{
     const r=await fetch('/debug/screenshot?quality='+q,{headers:requestHeaders(),cache:'no-store'})
@@ -1829,9 +1866,15 @@ async function previewVisionFrame(){
     if(visionPreviewUrl)URL.revokeObjectURL(visionPreviewUrl)
     visionPreviewUrl=url
     if(host){host.innerHTML='';host.appendChild(img);host.classList.remove('hidden')}
-    if(meta)meta.textContent='预览：'+img.naturalWidth+'×'+img.naturalHeight+' · '+(blob.size/1024).toFixed(1)+' KB · '+ms+' ms（仅本机显示，未上传模型、未落盘）'
+    const warnings=[]
+    if(img.naturalWidth>maxEdge||img.naturalHeight>maxEdge)warnings.push('原图长边超过 max_edge='+maxEdge+'，真实识图会等比缩小')
+    if(blob.size>maxBytes)warnings.push('原图超过 max_bytes='+maxBytes+'，真实识图会降质量/降采样，仍超限则不附图')
+    const head='预览（debug-only：仅 quality 生效，实际识图按 max_edge/max_bytes 处理）：'
+    const tail='（仅本机显示，未上传模型、未落盘）'
+    if(meta)meta.textContent=head+img.naturalWidth+'×'+img.naturalHeight+' · '+(blob.size/1024).toFixed(1)+' KB · '+ms+' ms'
+      +(warnings.length?'；'+warnings.join('；'):'')+tail
   }catch(e){
-    // 失败只影响预览，不动任何配置控件。
+    // 失败只影响预览，不动任何配置控件、不产脏值。
     if(meta)meta.textContent=''
     if(host){host.innerHTML='';host.classList.add('hidden')}
     showAiChatMessage('预览当前画面失败：'+((e&&e.message)||'未知错误'),'err')
@@ -1848,6 +1891,7 @@ function collectAiChatSection(){
     // AI 聊天页控件用 aichat- 前缀，与配置中心的同 path 控件区分开。
     const el=document.getElementById('aichat-'+configControlId(field.path))
     if(!el)continue
+    if(aiChatVisionUnset.has(field.path)&&el.dataset.cfgTouched!=='1')continue
     const previous=aiChatValueAt(aiChatData&&aiChatData.values,key)
     const kind=field.kind&&field.kind.type
     let value
@@ -1911,7 +1955,7 @@ function ttsFieldControlHtml(field,value){
   const src='<span class="config-field-hint" data-tts-source="'+esc(path)+'">'+esc(ttsSourceText(path==='tts.model'?'model':'voice'))+'</span>'
   if(path==='tts.model'){
     const opts=ttsCatalog.models.map(m=>'<option value="'+esc(m)+'">'+esc(m)+'</option>').join('')
-    return '<div class="model-picker"><input id="'+id+'" type="text" data-cfg="'+path+'" value="'+esc(text)+'" placeholder="留空沿用默认模型"><select data-tts-model-pick onchange="ttsPickModel(this)"><option value="">'+(opts?'从列表选择…':'（尚未获取模型列表）')+'</option>'+opts+'</select>'+btn+'</div>'+src
+    return '<div class="model-picker"><input id="'+id+'" type="text" data-cfg="'+path+'" value="'+esc(text)+'" placeholder="必填（默认 s2.1-pro，不能留空）"><select data-tts-model-pick onchange="ttsPickModel(this)"><option value="">'+(opts?'从列表选择…':'（尚未获取模型列表）')+'</option>'+opts+'</select>'+btn+'</div>'+'<span class="config-field-hint">TTS 模型不能为空；模型名需为内置列表中的值（s1 / s2-pro / s2.1-pro / s2.1-pro-free / drama-3），默认 s2.1-pro。</span>'+src
   }
   const listId=id+'-voice-list'
   const datalist='<datalist id="'+listId+'" data-tts-voice-list>'+ttsVoiceOptionsHtml()+'</datalist>'
@@ -4558,17 +4602,24 @@ function configFieldKind(field){
 // 单个字段：label 固定左列 + 控件 + effect 右置；提示/默认值下沉为第二行。
 function renderConfigFieldHtml(field,section,isAi){
   const id=configControlId(field.path)
-  const value=configValueAt(section.name,field.path)
+  let value=configValueAt(section.name,field.path)
+  // tts.model 缺省时用 schema default（TTS 模型不允许空值）；ai_chat.vision 缺省则保持未设置，
+  // 避免旧配置被默认值伪装成“已开启/已配置”。
+  if(value===undefined&&field.default!==undefined&&section.name==='tts'&&field.path==='tts.model')value=field.default
+  const isVision=section.name==='ai_chat'&&String(field.path).startsWith('ai_chat.vision.')
+  const visionUnset=isVision&&value===undefined
+  if(isVision){if(visionUnset)configVisionUnset.add(field.path);else configVisionUnset.delete(field.path)}
   const bootstrap=field.source==='bootstrap'
   const kind=configFieldKind(field)
   const parts=[]
   if(isAi&&field.path==='ai.provider')parts.push('<div class="config-step-title">第一步：选择服务商</div>')
   if(isAi&&field.path==='ai.api_key')parts.push('<div class="config-step-title">第二步：服务商参数</div><div class="config-field-hint ai-provider-info" id="aiProviderInfo"></div>')
-  parts.push('<div class="config-field'+(bootstrap?' bootstrap':'')+'" data-kind="'+kind+'" data-cfg-field="'+esc(field.path)+'" id="cfg-field-'+id+'">')
+  parts.push('<div class="config-field'+(bootstrap?' bootstrap':'')+'" data-kind="'+kind+'"'+(visionUnset?' data-vision-unset="1"':'')+' data-cfg-field="'+esc(field.path)+'" id="cfg-field-'+id+'">')
   parts.push('<div class="config-field-label"><b>'+configHighlight(field.label)+'</b><code title="'+esc(field.path)+'">'+esc(field.path)+'</code></div>')
   parts.push('<div class="config-field-control">'+configControlHtml(field,value,section.name)+'</div>')
   parts.push('<div class="config-field-side">'+configEffectTag(field)+'</div>')
   parts.push('<div class="config-field-foot">')
+  if(visionUnset)parts.push('<span class="config-field-hint">旧配置未设置（沿用后端默认）；改动该项后才会写入。</span>')
   if(field.managedBy==='visual')parts.push('<span class="config-field-hint">已并入上方“视觉档案”，建议统一修改。</span>')
   if(field.hint)parts.push('<span class="config-field-hint">'+esc(field.hint)+'</span>')
   if(field.default!=null)parts.push('<span class="config-field-default">默认: '+configDefaultText(field.default)+'</span>')
@@ -4609,6 +4660,19 @@ function renderConfigForm(){
   parts.push('<div class="config-section-head"><h2>'+esc(section.label)+'</h2><code>'+esc(section.name)+'</code><span class="config-section-stats">'+visibleFields.length+' 项 '+configEffectSummary(visibleFields)+'</span></div>')
   if(hiddenVisual)parts.push('<div class="config-message">本段有 '+hiddenVisual+' 个模板/区域/分辨率字段已并入“视觉档案”；点工具栏“显示档案字段”可临时展开原表单，保存仍会保留这些值。</div>')
   if(!visibleFields.length)parts.push('<div class="config-empty">没有匹配的配置字段</div>')
+  if(section.name==='tts'){
+    const hasFormat=section.fields.some(f=>f.path==='tts.format')
+    const hasVoice=section.fields.some(f=>f.path==='tts.voice')
+    parts.push('<div class="config-message config-vision-note">'
+      +'<b>语音 TTS 用法与隐私</b>：仅在 AI 调用 <code>speak</code> 工具时朗读，需要在「AI 聊天」的 system_prompt 里自行要求 AI 使用 speak。'
+      +'TTS 模型语法（按模型）：S1 固定括号标签如 (sad)；S2/S2.1 方括号自然语言如 [laughs]；Drama 3 导演指示如 [calm] 并配合 &lt;whisper&gt;…&lt;/whisper&gt;；内置模型 s1 / s2-pro / s2.1-pro / s2.1-pro-free / drama-3。'
+      +'speak 可选参数（按模型能力）：text 必填，emotion/style/speed/volume_db 可选，例如 {"text":"我没事","emotion":"sad"}。'
+      +(hasVoice?'voice 是 reference_id 的别名（reference_id 为空时生效），留空=fish 默认音色。':'')
+      +(hasFormat?'format 目前仅 WAV。':'')
+      +'duck_volume 是相对当前音乐音量再乘的比例（100=不压低），duck_fade_ms 是渐变时长。'
+      +'超过「单条文本上限」的文本会被截断（truncated），不会完整朗读。'
+      +'隐私：合成文本可能包含玩家昵称/聊天内容，会发送给所配置的 fish.audio，不写入磁盘。</div>')
+  }
   // 按 schema group 合并成“分组卡片”，组内字段紧凑排列；无 group 的段整段一张卡。
   let currentGroup=null, first=true, open=false
   for(const field of visibleFields){
@@ -4715,6 +4779,7 @@ function onConfigFormInput(e){
   if(kind==='object'&&el.tagName==='TEXTAREA')onConfigObjectInput(el,field)
   if(kind==='object'&&el.dataset.cfgObjectToggle!==undefined)onConfigObjectToggle(el,field)
   if(el.dataset.cfgClear!==undefined)delete el.dataset.cfgClear
+  el.dataset.cfgTouched='1'
   markConfigDirty(String(path).split('.')[0])
 }
 function onConfigFormChange(e){
@@ -4727,6 +4792,7 @@ function onConfigFormChange(e){
     const state=el.closest('label')&&el.closest('label').querySelector('[data-switch-state]')
     if(state)state.textContent=el.checked?'已启用':'未启用'
   }
+  el.dataset.cfgTouched='1'
   markConfigDirty(String(path).split('.')[0])
 }
 function configArrayAdd(path){
@@ -4761,6 +4827,8 @@ function collectConfigFieldValue(field,sectionName){
   const el=document.getElementById((sectionName==='ai_chat'?'aichat-':'')+configControlId(field.path))
     ||document.getElementById(configControlId(field.path))
   if(!el)return {skip:true}
+  // 旧配置缺 ai_chat.vision.*：未改动的字段不提交，避免把 schema 默认值写成真实配置。
+  if(sectionName==='ai_chat'&&String(field.path).startsWith('ai_chat.vision.')&&configVisionUnset.has(field.path)&&el.dataset.cfgTouched!=='1')return {skip:true}
   // 父级 nullable object 未启用（开关关闭 / textarea 为 null / 库中为 null）
   // → 跳过子字段，避免把旧子字段写回提交段导致父级重新变成对象。
   const parent=configNullableObjectParent(sectionName,field.path)
@@ -4798,13 +4866,10 @@ function collectConfigFieldValue(field,sectionName){
     return {value:v}
   }
   if(kind==='enum'){
-    // 未知枚举值仍回传原值，避免用户修改同段其他字段时破坏旧配置。
-    const value=el.value===''?null:el.value
-    if(value===null&&!field.nullable){
-      const current=configValueAt(sectionName,field.path)
-      return current==null?{invalid:true}:{value:current}
-    }
-    return {value}
+    // 空选择不提交 ""（旧配置缺字段时尤其危险）；未知枚举值仍回传原值，
+    // 避免用户修改同段其他字段时破坏旧配置。
+    if(el.value==='')return {skip:true}
+    return {value:el.value}
   }
   if(kind==='stringArray'){
     const rows=el.closest('.config-field')?el.closest('.config-field').querySelectorAll('input[data-cfg-array]'):[]
@@ -4847,6 +4912,8 @@ function collectConfigFieldValue(field,sectionName){
   // 实际提交的是旧值，重拉后旧值又渲染回表单。
   if(kind==='modelName'){
     const v=String(el.value||'')
+    // TTS 模型不允许空值（默认 s2.1-pro），空值保存会写出无效配置。
+    if(field.path==='tts.model'&&v.trim()==='')return {invalid:true}
     if(field.nullable&&v.trim()==='')return {value:null}
     return {value:v}
   }

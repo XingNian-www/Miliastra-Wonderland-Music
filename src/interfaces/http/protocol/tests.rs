@@ -4246,6 +4246,13 @@ fn tts_models_route_registered_and_overrides_distinguish_missing_from_empty() {
     assert_eq!(explicit_empty.endpoint.as_deref(), Some(""));
     assert_eq!(explicit_empty.api_key.as_deref(), Some(""));
 
+    // 换 endpoint 但没显式给 key：不能复用已保存 key 发到新地址。
+    let endpoint_only: TtsModelsOverrides =
+        serde_json::from_str(r#"{"endpoint":"https://other.example"}"#).expect("endpoint");
+    let endpoint_only = tts_catalog_overrides(endpoint_only);
+    assert_eq!(endpoint_only.endpoint.as_deref(), Some("https://other.example"));
+    assert_eq!(endpoint_only.api_key.as_deref(), Some(""));
+
     let state = test_state();
     let unknown = br#"{"proxy":"http://127.0.0.1:1"}"#;
     let error = tts_models_body_route(unknown, &state).expect_err("unknown field");
@@ -4253,6 +4260,21 @@ fn tts_models_route_registered_and_overrides_distinguish_missing_from_empty() {
     let not_json = b"not json";
     let error = tts_models_body_route(not_json, &state).expect_err("invalid JSON");
     assert_eq!(error.status, 400, "{}", error.message);
+}
+
+#[test]
+fn tts_catalog_errors_map_to_actionable_statuses() {
+    use crate::features::tts::TtsCatalogError;
+    use super::ai_routes::tts_catalog_error;
+
+    let auth = tts_catalog_error(TtsCatalogError::Auth("bad key".to_string()));
+    assert_eq!(auth.status, 401);
+    let rate = tts_catalog_error(TtsCatalogError::RateLimited("slow down".to_string()));
+    assert_eq!(rate.status, 429);
+    let timeout = tts_catalog_error(TtsCatalogError::Timeout("timeout".to_string()));
+    assert_eq!(timeout.status, 504);
+    let config = tts_catalog_error(TtsCatalogError::Config("bad".to_string()));
+    assert_eq!(config.status, 400);
 }
 
 #[test]

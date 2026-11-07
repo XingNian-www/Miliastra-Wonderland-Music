@@ -157,9 +157,14 @@ pub(super) struct TtsModelsOverrides {
 pub(super) fn tts_catalog_overrides(
     overrides: TtsModelsOverrides,
 ) -> crate::features::tts::TtsCatalogOverrides {
+    let mut api_key = overrides.api_key;
+    // 换 endpoint 时不能把已保存的 key 发到新地址；明确清空，走 fallback。
+    if overrides.endpoint.is_some() && api_key.is_none() {
+        api_key = Some(String::new());
+    }
     crate::features::tts::TtsCatalogOverrides {
         endpoint: overrides.endpoint,
-        api_key: overrides.api_key,
+        api_key,
     }
 }
 
@@ -182,10 +187,22 @@ pub(super) fn tts_models_body_route(
     serde_json::to_string(&catalog).map_err(internal_error)
 }
 
-fn tts_catalog_error(error: crate::features::tts::TtsCatalogError) -> AppError {
+pub(super) fn tts_catalog_error(error: crate::features::tts::TtsCatalogError) -> AppError {
     match error {
         crate::features::tts::TtsCatalogError::Config(message) => AppError {
             status: 400,
+            message,
+        },
+        crate::features::tts::TtsCatalogError::Auth(message) => AppError {
+            status: 401,
+            message,
+        },
+        crate::features::tts::TtsCatalogError::RateLimited(message) => AppError {
+            status: 429,
+            message,
+        },
+        crate::features::tts::TtsCatalogError::Timeout(message) => AppError {
+            status: 504,
             message,
         },
         crate::features::tts::TtsCatalogError::Request(message) => internal_error(anyhow!(message)),
@@ -207,20 +224,28 @@ pub(super) fn ai_vision_status_route(
         .load_full()
         .map_err(internal_error)?;
     let model = ai_vision_model(&config.ai_chat, &config.ai);
-    let capabilities = if model.is_empty() {
-        Err(crate::config::ai::ModelListError::Config(
-            "未配置视觉/聊天模型".to_string(),
-        ))
+    let payload = if !config.ai_chat.vision.enabled {
+        disabled_vision_status_payload(
+            &model,
+            &config.ai_chat.vision.capture_scope,
+            config.ai_chat.vision.allow_full_screen,
+        )
     } else {
-        crate::config::ai::fetch_model_capabilities(&config.ai, &model)
+        let capabilities = if model.is_empty() {
+            Err(crate::config::ai::ModelListError::Config(
+                "未配置视觉/聊天模型".to_string(),
+            ))
+        } else {
+            crate::config::ai::fetch_model_capabilities(&config.ai, &model)
+        };
+        vision_status_payload(
+            true,
+            &model,
+            &config.ai_chat.vision.capture_scope,
+            config.ai_chat.vision.allow_full_screen,
+            capabilities,
+        )
     };
-    let payload = vision_status_payload(
-        config.ai_chat.vision.enabled,
-        &model,
-        &config.ai_chat.vision.capture_scope,
-        config.ai_chat.vision.allow_full_screen,
-        capabilities,
-    );
     serde_json::to_string(&payload).map_err(internal_error)
 }
 
@@ -278,20 +303,28 @@ pub(super) fn ai_vision_status_body_route(
         overrides,
     );
     let model = model_override.unwrap_or_else(|| ai_vision_model(&config.ai_chat, &config.ai));
-    let capabilities = if model.is_empty() {
-        Err(crate::config::ai::ModelListError::Config(
-            "未配置视觉/聊天模型".to_string(),
-        ))
+    let payload = if !config.ai_chat.vision.enabled {
+        disabled_vision_status_payload(
+            &model,
+            &config.ai_chat.vision.capture_scope,
+            config.ai_chat.vision.allow_full_screen,
+        )
     } else {
-        crate::config::ai::fetch_model_capabilities(&config.ai, &model)
+        let capabilities = if model.is_empty() {
+            Err(crate::config::ai::ModelListError::Config(
+                "未配置视觉/聊天模型".to_string(),
+            ))
+        } else {
+            crate::config::ai::fetch_model_capabilities(&config.ai, &model)
+        };
+        vision_status_payload(
+            true,
+            &model,
+            &config.ai_chat.vision.capture_scope,
+            config.ai_chat.vision.allow_full_screen,
+            capabilities,
+        )
     };
-    let payload = vision_status_payload(
-        config.ai_chat.vision.enabled,
-        &model,
-        &config.ai_chat.vision.capture_scope,
-        config.ai_chat.vision.allow_full_screen,
-        capabilities,
-    );
     serde_json::to_string(&payload).map_err(internal_error)
 }
 
@@ -310,6 +343,27 @@ fn ai_vision_model(
     ai.model.trim().to_string()
 }
 
+fn disabled_vision_status_payload(
+    model: &str,
+    capture_scope: &crate::features::ai_chat::VisionCaptureScope,
+    allow_full_screen: bool,
+) -> serde_json::Value {
+    let capture_scope = match capture_scope {
+        crate::features::ai_chat::VisionCaptureScope::PrimaryScreen => "primary_screen",
+    };
+    serde_json::json!({
+        "enabled": false,
+        "disabled": true,
+        "model": model,
+        "supports_image": false,
+        "capability": "disabled",
+        "source": "unknown",
+        "reason": "识图未启用，未查询模型能力",
+        "capture_scope": capture_scope,
+        "allow_full_screen": allow_full_screen
+    })
+}
+
 pub(super) fn vision_status_payload(
     enabled: bool,
     model: &str,
@@ -320,21 +374,33 @@ pub(super) fn vision_status_payload(
         crate::config::ai::ModelListError,
     >,
 ) -> serde_json::Value {
-    let (supports_image, source, reason) = match capabilities {
+    let (supports_image, capability, source, reason) = match capabilities {
         Ok(capabilities) => match capabilities.supports_image {
-            Some(true) => (true, "api", "模型 API 声明支持图片"),
-            Some(false) => (false, "api", "模型 API 声明不支持图片"),
-            None => (false, "unknown", "模型 API 未返回图片能力字段，按不支持图片降级"),
+            Some(true) => (true, "supported", "api", "模型 API 声明支持图片"),
+            Some(false) => (false, "unsupported", "api", "模型 API 声明不支持图片"),
+            None => (
+                false,
+                "unknown",
+                "unknown",
+                "模型 API 未返回图片能力字段，能力未知",
+            ),
         },
-        Err(_) => (false, "unknown", "查询模型能力失败，按不支持图片降级"),
+        Err(_) => (
+            false,
+            "unknown",
+            "unknown",
+            "查询模型能力失败，能力未知",
+        ),
     };
     let capture_scope = match capture_scope {
         crate::features::ai_chat::VisionCaptureScope::PrimaryScreen => "primary_screen",
     };
     serde_json::json!({
         "enabled": enabled,
+        "disabled": false,
         "model": model,
         "supports_image": supports_image,
+        "capability": capability,
         "source": source,
         "reason": reason,
         "capture_scope": capture_scope,

@@ -2908,9 +2908,9 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
         ),
         ConfigFieldSchema::db_live(
             "vision.model",
-            "视觉专用模型",
+            "look 子请求模型",
             FieldKind::ModelName,
-            "留空沿用 ai_chat.model；模型是否支持图片由 API 查询结果决定",
+            "只用于 look 的视觉子请求；主聊天始终使用 ai_chat.model；留空沿用 ai_chat.model",
         ),
         ConfigFieldSchema::db_live(
             "vision.allow_full_screen",

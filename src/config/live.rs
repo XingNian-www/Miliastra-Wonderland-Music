@@ -427,6 +427,8 @@ impl LiveConfigs {
         effective.command_access = command_access;
         // ai_chat：schema 字段现已全部 Live（含 cooldown_seconds），整体 clone。
         effective.ai_chat = config.ai_chat.clone();
+        // 模型/能力配置可能变化，清掉视觉能力缓存，避免旧“不支持”状态粘住。
+        crate::config::ai::clear_vision_capability_cache();
         // moderation：只实时两个投票阈值；区域/点位等其它字段保留旧值。
         effective.moderation.stable_vote_samples = config.moderation.stable_vote_samples;
         effective.moderation.required_vote_margin = config.moderation.required_vote_margin;

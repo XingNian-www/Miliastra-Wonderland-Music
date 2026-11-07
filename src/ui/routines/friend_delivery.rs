@@ -268,6 +268,19 @@ impl ResidencyUi {
             config: self.config.clone(),
         })
     }
+
+    /// 抓一张一级界面整帧：当前在二级时先导航到一级，截完图再回到当前大厅二级。
+    ///
+    /// 返回值语义见 [`CapturedPrimaryOutcome`]；截图失败或返回驻守失败都会如实
+    /// 写进产物，不会让调用方误以为成功。
+    pub(crate) fn capture_primary_and_restore(
+        &self,
+    ) -> std::result::Result<UiOperation<CapturedPrimaryOutcome>, UiSubmitError> {
+        self.runtime.submit(CapturePrimaryAndRestoreRoutine {
+            ocr: self.ocr.clone(),
+            config: self.config.clone(),
+        })
+    }
 }
 
 struct EstablishResidencyRoutine {
@@ -290,6 +303,193 @@ impl UiRoutine for EstablishResidencyRoutine {
             Ok(()) => UiResidencyOutcome::Confirmed(self.request.target),
             Err(failure) => UiResidencyOutcome::Failed(failure),
         }
+    }
+}
+
+/// 一级界面截图产物：图像 + 是否发生过导航 + 截图之后实际所在的驻留界面。
+///
+/// 消费约定（Task-62 的 AI 聊天按此接入）：
+/// - `Captured`：已拿到一级整帧。`residency` 说明返回驻守界面的结果：
+///   本来就在一级时为 `Confirmed(Primary)`（`navigated == false`）；
+///   从二级导航过去时为 `Confirmed(SecondaryCurrentHall)`（`navigated == true`）；
+///   若返回驻守失败，`residency == Failed`，但**图像仍然可用**——调用方必须
+///   把驻留异常如实报给用户，不能当作完全成功。
+/// - `Failed`：没有拿到图像（观察/导航/截图失败）。`residency` 仍如实：
+///   导航前失败时与 `failure` 相同；导航后失败时记录返回驻守是否成功。
+#[derive(Clone, Debug)]
+pub(crate) enum CapturedPrimaryOutcome {
+    Captured {
+        image: DynamicImage,
+        navigated: bool,
+        residency: UiResidencyOutcome,
+    },
+    Failed {
+        failure: UiRoutineFailure,
+        navigated: bool,
+        residency: UiResidencyOutcome,
+    },
+}
+
+impl CapturedPrimaryOutcome {
+    /// 截图图像；只有 `Captured` 变体有值。
+    pub(crate) fn image(&self) -> Option<&DynamicImage> {
+        match self {
+            Self::Captured { image, .. } => Some(image),
+            Self::Failed { .. } => None,
+        }
+    }
+
+    /// 截图/导航失败原因；只有 `Failed` 变体有值。
+    pub(crate) fn failure(&self) -> Option<&UiRoutineFailure> {
+        match self {
+            Self::Failed { failure, .. } => Some(failure),
+            Self::Captured { .. } => None,
+        }
+    }
+
+    /// 本次是否为了截图离开过驻守界面（当前为二级恒为 true）。
+    pub(crate) fn navigated(&self) -> bool {
+        match self {
+            Self::Captured { navigated, .. } | Self::Failed { navigated, .. } => *navigated,
+        }
+    }
+
+    /// 截图之后实际驻留的界面（如实反映返回驻守的结果）。
+    pub(crate) fn residency(&self) -> &UiResidencyOutcome {
+        match self {
+            Self::Captured { residency, .. } | Self::Failed { residency, .. } => residency,
+        }
+    }
+}
+
+/// 是否允许为了截图离开当前界面。
+///
+/// 只有二级聊天才需要导航到一级；已经在一级时直接截图。其余状态
+/// （登录入口/大世界/主菜单/加载/面板/无法识别）一律不盲发输入：
+/// 在这些界面上按 Escape 可能关掉玩家的东西，也可能把状态推得更远。
+fn capture_navigation_is_allowed(current: UiStateKind) -> bool {
+    current == UiStateKind::Secondary
+}
+
+/// 一级截图后自动回到驻守界面。
+///
+/// 时序：观察稳定界面 →（二级时）导航到一级并确认 → 截图 → **无论截图成败**
+/// 都尽力返回当前大厅二级。任何一步失败都写进返回值，不假装成功。
+struct CapturePrimaryAndRestoreRoutine {
+    ocr: OcrRuntimeHandle,
+    config: FriendDeliveryRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for CapturePrimaryAndRestoreRoutine {}
+
+impl UiRoutine for CapturePrimaryAndRestoreRoutine {
+    type Output = CapturedPrimaryOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let config = self.config;
+        capture_primary_and_restore_with(context, &self.ocr, &config, |context, navigated| {
+            let certainty = if navigated {
+                InputCertainty::AfterInputUnknown
+            } else {
+                InputCertainty::BeforeInput
+            };
+            capture_normalized(context, &config, "capture_primary_frame", certainty)
+        })
+    }
+}
+
+/// `CapturePrimaryAndRestoreRoutine` 的可测试主体；`capture` 是截图注入点，
+/// 生产走 `capture_normalized`，测试用它验证「截图失败也必须返回驻守界面」。
+fn capture_primary_and_restore_with<C>(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &FriendDeliveryRoutineConfig,
+    capture: C,
+) -> CapturedPrimaryOutcome
+where
+    C: FnOnce(
+        &mut UiRoutineContext<'_>,
+        bool,
+    ) -> std::result::Result<DynamicImage, UiRoutineFailure>,
+{
+    context.publish_progress(UiRoutineProgressStage::NormalizingStart);
+    if let Err(error) = context.device().ensure_ready(config.after_activate_ms) {
+        let failure = before_input_failure("prepare_capture_primary", error);
+        return CapturedPrimaryOutcome::Failed {
+            residency: UiResidencyOutcome::Failed(failure.clone()),
+            failure,
+            navigated: false,
+        };
+    }
+    let current = match wait_for_stable_ui_kind_or_unknown(
+        context,
+        config.state_observation(),
+        None,
+        config.timeout_ms,
+        "observe_capture_residency",
+        InputCertainty::BeforeInput,
+    ) {
+        Ok(kind) => kind,
+        Err(failure) => {
+            return CapturedPrimaryOutcome::Failed {
+                residency: UiResidencyOutcome::Failed(failure.clone()),
+                failure,
+                navigated: false,
+            };
+        }
+    };
+    if current == UiStateKind::Primary {
+        return match capture(context, false) {
+            Ok(image) => CapturedPrimaryOutcome::Captured {
+                image,
+                navigated: false,
+                residency: UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+            },
+            Err(failure) => CapturedPrimaryOutcome::Failed {
+                residency: UiResidencyOutcome::Failed(failure.clone()),
+                failure,
+                navigated: false,
+            },
+        };
+    }
+    if !capture_navigation_is_allowed(current) {
+        let failure = UiRoutineFailure::new(
+            InputCertainty::BeforeInput,
+            "observe_capture_residency",
+            format!(
+                "一级截图只支持一级或二级聊天界面；当前为{}（{}），不发送任何导航输入",
+                current.label(),
+                current.name()
+            ),
+        );
+        return CapturedPrimaryOutcome::Failed {
+            residency: UiResidencyOutcome::Failed(failure.clone()),
+            failure,
+            navigated: false,
+        };
+    }
+    // 二级聊天：先导航到一级并确认，再截图。导航失败也继续走返回驻守。
+    let navigation = restore_primary(context, config);
+    let capture_result = match &navigation {
+        Ok(()) => capture(context, true),
+        Err(failure) => Err(failure.clone()),
+    };
+    context.publish_progress(UiRoutineProgressStage::RecoveringResidency);
+    let residency = match restore_secondary_hall(context, ocr, config) {
+        Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
+        Err(failure) => UiResidencyOutcome::Failed(failure),
+    };
+    match capture_result {
+        Ok(image) => CapturedPrimaryOutcome::Captured {
+            image,
+            navigated: true,
+            residency,
+        },
+        Err(failure) => CapturedPrimaryOutcome::Failed {
+            failure,
+            navigated: true,
+            residency,
+        },
     }
 }
 
@@ -2614,7 +2814,7 @@ mod tests {
         config.timing.invite.step_ms = 0;
         // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
         // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
-        config.timing.workflow.default_timeout_ms = 2_000;
+        config.timing.workflow.default_timeout_ms = 5_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2698,7 +2898,7 @@ mod tests {
         config.timing.invite.step_ms = 0;
         // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
         // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
-        config.timing.workflow.default_timeout_ms = 2_000;
+        config.timing.workflow.default_timeout_ms = 5_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2770,7 +2970,7 @@ mod tests {
         config.timing.input.send_ms = 0;
         // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
         // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
-        config.timing.workflow.default_timeout_ms = 2_000;
+        config.timing.workflow.default_timeout_ms = 5_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2874,7 +3074,7 @@ mod tests {
         config.timing.invite.step_ms = 0;
         // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
         // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
-        config.timing.workflow.default_timeout_ms = 2_000;
+        config.timing.workflow.default_timeout_ms = 5_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -2952,7 +3152,7 @@ mod tests {
         config.timing.invite.step_ms = 0;
         // 真帧下每帧分类在 debug 里要数百毫秒，200ms 的观测预算会随并发负载抖动；
         // 放宽到 2s（与 invite 用例一致），等待逻辑本身仍由稳定性计数收敛。
-        config.timing.workflow.default_timeout_ms = 2_000;
+        config.timing.workflow.default_timeout_ms = 5_000;
         config.timing.workflow.default_poll_ms = 1;
         let state = Arc::new(Mutex::new(TestUiState {
             conversation: Conversation::Hall,
@@ -3571,5 +3771,407 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ==== 二级 → 一级截图 → 返回驻守（task-61）====
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CaptureResidencyView {
+        SecondaryHallRow,
+        Primary,
+        SecondaryWithoutHallRow,
+    }
+
+    struct CaptureResidencyState {
+        view: CaptureResidencyView,
+        secondary_after_return: CaptureResidencyView,
+        keys: Vec<Key>,
+        clicks: Vec<(i32, i32)>,
+        drags: usize,
+    }
+
+    struct CaptureResidencyDevice {
+        primary: DynamicImage,
+        secondary_hall_row: DynamicImage,
+        secondary_without_hall_row: DynamicImage,
+        state: Arc<Mutex<CaptureResidencyState>>,
+    }
+
+    impl CaptureResidencyDevice {
+        fn new(
+            config: &AppConfig,
+            view: CaptureResidencyView,
+            secondary_after_return: CaptureResidencyView,
+        ) -> (Self, Arc<Mutex<CaptureResidencyState>>) {
+            let state = Arc::new(Mutex::new(CaptureResidencyState {
+                view,
+                secondary_after_return,
+                keys: Vec::new(),
+                clicks: Vec::new(),
+                drags: 0,
+            }));
+            (
+                Self {
+                    primary: primary_frame(config),
+                    secondary_hall_row: secondary_hall_row_frame(config),
+                    secondary_without_hall_row: secondary_frame(config),
+                    state: Arc::clone(&state),
+                },
+                state,
+            )
+        }
+    }
+
+    impl UiDevice for CaptureResidencyDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            let view = self.state.lock().unwrap().view;
+            Ok(match view {
+                CaptureResidencyView::SecondaryHallRow => self.secondary_hall_row.clone(),
+                CaptureResidencyView::Primary => self.primary.clone(),
+                CaptureResidencyView::SecondaryWithoutHallRow => {
+                    self.secondary_without_hall_row.clone()
+                }
+            })
+        }
+
+        fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.keys.push(key);
+            if key == Key::Escape && state.view == CaptureResidencyView::SecondaryHallRow {
+                state.view = CaptureResidencyView::Primary;
+            } else if key == Key::Return && state.view == CaptureResidencyView::Primary {
+                let next = state.secondary_after_return;
+                state.view = next;
+            }
+            Ok(())
+        }
+
+        fn click_point(&mut self, x: i32, y: i32) -> Result<()> {
+            self.state.lock().unwrap().clicks.push((x, y));
+            Ok(())
+        }
+
+        fn drag_point(&mut self, _from_x: i32, _from_y: i32, _to_x: i32, _to_y: i32) -> Result<()> {
+            self.state.lock().unwrap().drags += 1;
+            Ok(())
+        }
+    }
+
+    struct EmptyOcr;
+
+    impl OcrDevice for EmptyOcr {
+        fn recognize_lines(&mut self, _image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn capture_test_config() -> AppConfig {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.open_chat_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.workflow.default_timeout_ms = 5_000;
+        config.timing.workflow.default_poll_ms = 1;
+        config
+    }
+
+    fn capture_routine_config(config: &AppConfig) -> FriendDeliveryRoutineConfig {
+        let mut routine = FriendDeliveryRoutineConfig::from_app(config);
+        routine.timeout_ms = 5_000;
+        routine.poll_ms = 1;
+        routine
+    }
+
+    fn submit_capture_primary(
+        runtime: &UiRuntime,
+        ocr: OcrRuntimeHandle,
+        config: FriendDeliveryRoutineConfig,
+    ) -> CapturedPrimaryOutcome {
+        runtime
+            .handle()
+            .submit(CapturePrimaryAndRestoreRoutine { ocr, config })
+            .unwrap()
+            .wait()
+            .unwrap()
+    }
+
+    #[test]
+    fn secondary_capture_navigates_to_primary_then_returns_to_secondary_hall() {
+        let config = capture_test_config();
+        let (device, state) = CaptureResidencyDevice::new(
+            &config,
+            CaptureResidencyView::SecondaryHallRow,
+            CaptureResidencyView::SecondaryHallRow,
+        );
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+
+        let outcome = submit_capture_primary(
+            &ui_runtime,
+            ocr_runtime.handle(),
+            capture_routine_config(&config),
+        );
+
+        let image = outcome.image().unwrap_or_else(|| {
+            panic!("二级导航到一级后必须拿到截图，实际失败：{:?}", outcome.failure())
+        });
+        assert_eq!(
+            (image.width(), image.height()),
+            (config.screen.expected_width, config.screen.expected_height)
+        );
+        assert!(outcome.navigated(), "从二级截图必须标记发生过导航");
+        assert!(outcome.failure().is_none());
+        assert_eq!(
+            outcome.residency(),
+            &UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
+            "截完图必须回到当前大厅二级"
+        );
+
+        let hall_point = hall_row_click_point(&secondary_hall_row_frame(&config), &config);
+        let state = state.lock().unwrap();
+        assert_eq!(state.keys, [Key::Escape, Key::Return]);
+        assert_eq!(state.clicks, [hall_point], "必须点击「当前大厅」行返回驻守");
+        drop(state);
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn primary_capture_never_sends_navigation_input() {
+        let config = capture_test_config();
+        let (device, state) = CaptureResidencyDevice::new(
+            &config,
+            CaptureResidencyView::Primary,
+            CaptureResidencyView::Primary,
+        );
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+
+        let outcome = submit_capture_primary(
+            &ui_runtime,
+            ocr_runtime.handle(),
+            capture_routine_config(&config),
+        );
+
+        let image = outcome.image().unwrap_or_else(|| {
+            panic!("已在一级时必须直接拿到截图，实际失败：{:?}", outcome.failure())
+        });
+        assert_eq!(
+            (image.width(), image.height()),
+            (config.screen.expected_width, config.screen.expected_height)
+        );
+        assert!(!outcome.navigated());
+        assert_eq!(
+            outcome.residency(),
+            &UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        );
+        let state = state.lock().unwrap();
+        assert!(state.keys.is_empty(), "一级截图不允许任何按键：{:?}", state.keys);
+        assert!(state.clicks.is_empty(), "一级截图不允许任何点击");
+        drop(state);
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn unknown_residency_fails_before_input_without_pressing_escape() {
+        let config = capture_test_config();
+
+        struct UnknownCaptureDevice {
+            frame: DynamicImage,
+            keys: Arc<Mutex<Vec<Key>>>,
+        }
+
+        impl UiDevice for UnknownCaptureDevice {
+            fn capture(&mut self) -> Result<DynamicImage> {
+                Ok(self.frame.clone())
+            }
+
+            fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
+                Ok(())
+            }
+
+            fn press_key(&mut self, key: Key) -> Result<()> {
+                self.keys.lock().unwrap().push(key);
+                Ok(())
+            }
+        }
+
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            UnknownCaptureDevice {
+                frame: unknown_frame(&config),
+                keys: Arc::clone(&keys),
+            },
+            &config,
+            4,
+        );
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+
+        let outcome = submit_capture_primary(
+            &ui_runtime,
+            ocr_runtime.handle(),
+            capture_routine_config(&config),
+        );
+
+        assert!(outcome.image().is_none());
+        assert!(!outcome.navigated());
+        let failure = outcome.failure().expect("无法识别的界面必须明确失败");
+        assert_eq!(failure.certainty(), InputCertainty::BeforeInput);
+        assert_eq!(failure.stage(), "observe_capture_residency");
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Failed(_)
+        ));
+        let recorded_keys = keys.lock().unwrap().clone();
+        assert!(
+            recorded_keys.is_empty(),
+            "Unknown 不许盲按 Escape：{recorded_keys:?}"
+        );
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn navigation_guard_allows_only_secondary_residency() {
+        for kind in [
+            UiStateKind::GameGate,
+            UiStateKind::Overworld,
+            UiStateKind::MainMenu,
+            UiStateKind::Loading,
+            UiStateKind::Panel,
+            UiStateKind::Unknown,
+            UiStateKind::Primary,
+        ] {
+            assert!(
+                !capture_navigation_is_allowed(kind),
+                "{kind:?} 不允许为截图发送导航输入"
+            );
+        }
+        assert!(capture_navigation_is_allowed(UiStateKind::Secondary));
+    }
+
+    struct FailingCaptureRoutine {
+        ocr: OcrRuntimeHandle,
+        config: FriendDeliveryRoutineConfig,
+    }
+
+    impl sealed::UiRoutineSealed for FailingCaptureRoutine {}
+
+    impl UiRoutine for FailingCaptureRoutine {
+        type Output = CapturedPrimaryOutcome;
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            let config = self.config;
+            capture_primary_and_restore_with(context, &self.ocr, &config, |_context, navigated| {
+                Err(UiRoutineFailure::new(
+                    if navigated {
+                        InputCertainty::AfterInputUnknown
+                    } else {
+                        InputCertainty::BeforeInput
+                    },
+                    "capture_primary_frame",
+                    "injected capture failure",
+                ))
+            })
+        }
+    }
+
+    #[test]
+    fn capture_failure_after_navigation_still_returns_to_secondary_hall() {
+        let config = capture_test_config();
+        let (device, state) = CaptureResidencyDevice::new(
+            &config,
+            CaptureResidencyView::SecondaryHallRow,
+            CaptureResidencyView::SecondaryHallRow,
+        );
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+
+        let outcome = ui_runtime
+            .handle()
+            .submit(FailingCaptureRoutine {
+                ocr: ocr_runtime.handle(),
+                config: capture_routine_config(&config),
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(outcome.image().is_none());
+        assert!(outcome.navigated());
+        let failure = outcome.failure().expect("截图失败必须如实回报");
+        assert_eq!(failure.stage(), "capture_primary_frame");
+        assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
+        assert_eq!(
+            outcome.residency(),
+            &UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
+            "截图失败也必须回到当前大厅二级"
+        );
+
+        let hall_point = hall_row_click_point(&secondary_hall_row_frame(&config), &config);
+        let state = state.lock().unwrap();
+        assert!(state.keys.contains(&Key::Escape));
+        assert!(state.keys.contains(&Key::Return));
+        assert_eq!(state.clicks, [hall_point], "截图失败后仍必须点击当前大厅返回");
+        drop(state);
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn restore_secondary_failure_is_reported_truthfully_with_captured_image() {
+        let config = capture_test_config();
+        let (device, state) = CaptureResidencyDevice::new(
+            &config,
+            CaptureResidencyView::SecondaryHallRow,
+            CaptureResidencyView::SecondaryWithoutHallRow,
+        );
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+
+        let outcome = submit_capture_primary(
+            &ui_runtime,
+            ocr_runtime.handle(),
+            capture_routine_config(&config),
+        );
+
+        let image = outcome.image().unwrap_or_else(|| {
+            panic!(
+                "返回驻守失败不影响已经拿到的截图，实际失败：{:?}",
+                outcome.failure()
+            )
+        });
+        assert_eq!(
+            (image.width(), image.height()),
+            (config.screen.expected_width, config.screen.expected_height)
+        );
+        assert!(outcome.navigated());
+        assert!(
+            outcome.failure().is_none(),
+            "截图成功不应被记成截图失败"
+        );
+        match outcome.residency() {
+            UiResidencyOutcome::Failed(failure) => {
+                assert_eq!(failure.stage(), "restore_secondary_hall");
+                assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
+            }
+            other => panic!("返回驻守失败必须如实回报，实际 {other:?}"),
+        }
+        let state = state.lock().unwrap();
+        assert!(state.drags >= 1, "找不到大厅行时必须尝试向列表顶部拖动");
+        assert!(state.clicks.is_empty(), "找不到大厅行时不许乱点");
+        drop(state);
+
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
     }
 }

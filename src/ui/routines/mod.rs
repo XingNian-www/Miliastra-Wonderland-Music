@@ -8,11 +8,14 @@ mod startup;
 mod state_observation;
 
 pub(crate) use custom_action::{CustomActionPlan, CustomActionUi};
+// `CapturedPrimaryOutcome` 由 task-62 的 AI 聊天接入后才在库内被引用；
+// 先在这里导出，避免接入方跨私有模块路径取类型。
+#[allow(unused_imports)]
 pub(crate) use friend_delivery::{
-    EstablishResidency, FriendDelivery, FriendDeliveryMessageStatus, FriendDeliveryRoutineConfig,
-    FriendDeliveryRoutineConfigSource, FriendDeliveryUi, HallBatchStatus, HallBatchUi, ResidencyUi,
-    SendFriendDeliveries, SendHallBatch, UiResidencyOutcome, UiResidencyTarget,
-    highlighted_conversation_row,
+    CapturedPrimaryOutcome, EstablishResidency, FriendDelivery, FriendDeliveryMessageStatus,
+    FriendDeliveryRoutineConfig, FriendDeliveryRoutineConfigSource, FriendDeliveryUi,
+    HallBatchStatus, HallBatchUi, ResidencyUi, SendFriendDeliveries, SendHallBatch,
+    UiResidencyOutcome, UiResidencyTarget, highlighted_conversation_row,
 };
 pub(crate) use hall::{
     DetectPublicHall, DetectPublicHallEffect, HallRoutineConfig, HallUi, ReadHallInfo,

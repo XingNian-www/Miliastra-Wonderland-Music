@@ -20,7 +20,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use miliastra_playback::{PlaybackHandle, SpeechAudio, SpeechPlayer};
+use miliastra_playback::{PlaybackHandle, SpeechAudio, SpeechHealth, SpeechPlayer};
 
 /// fish.audio 默认地址。
 pub const DEFAULT_TTS_ENDPOINT: &str = "https://api.fish.audio";
@@ -162,14 +162,17 @@ impl TtsConfig {
         if self.duck_volume > 100 {
             anyhow::bail!("tts.duck_volume 必须在 0..=100");
         }
-        if self.max_chars == 0 {
-            anyhow::bail!("tts.max_chars 必须大于 0");
+        if self.duck_fade_ms > 2_000 {
+            anyhow::bail!("tts.duck_fade_ms 必须在 0..=2000");
         }
-        if self.timeout_ms == 0 {
-            anyhow::bail!("tts.timeout_ms 必须大于 0");
+        if !(1..=2_000).contains(&self.max_chars) {
+            anyhow::bail!("tts.max_chars 必须在 1..=2000");
         }
-        if self.queue_max == 0 {
-            anyhow::bail!("tts.queue_max 必须大于 0");
+        if !(1_000..=60_000).contains(&self.timeout_ms) {
+            anyhow::bail!("tts.timeout_ms 必须在 1000..=60000");
+        }
+        if !(1..=64).contains(&self.queue_max) {
+            anyhow::bail!("tts.queue_max 必须在 1..=64");
         }
         if self.enabled {
             if self.endpoint.trim().is_empty() {
@@ -182,6 +185,16 @@ impl TtsConfig {
             }
         }
         Ok(())
+    }
+
+    /// 模型名为空时回退默认模型，保证不会发送空 `model` 头。
+    pub(crate) fn effective_model(&self) -> &str {
+        let model = self.model.trim();
+        if model.is_empty() {
+            DEFAULT_TTS_MODEL
+        } else {
+            model
+        }
     }
 
     pub(crate) fn voice_id(&self) -> &str {
@@ -227,6 +240,9 @@ pub struct TtsCatalog {
     pub source: TtsCatalogSource,
     #[serde(rename = "modelSource")]
     pub model_source: TtsCatalogSource,
+    /// 音色列表只取到第一页时为 true；避免 UI 把不完整列表当真。
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 impl TtsCatalog {
@@ -239,6 +255,7 @@ impl TtsCatalog {
             voices: Vec::new(),
             source: TtsCatalogSource::Fallback,
             model_source: TtsCatalogSource::Fallback,
+            truncated: false,
         }
     }
 }
@@ -446,6 +463,12 @@ pub struct TtsCatalogOverrides {
 pub enum TtsCatalogError {
     #[error("tts catalog config error: {0}")]
     Config(String),
+    #[error("tts catalog auth failed: {0}")]
+    Auth(String),
+    #[error("tts catalog rate limited: {0}")]
+    RateLimited(String),
+    #[error("tts catalog request timed out: {0}")]
+    Timeout(String),
     #[error("tts catalog request failed: {0}")]
     Request(String),
 }
@@ -495,19 +518,42 @@ pub fn fetch_catalog(
         .get(url)
         .header("Authorization", format!("Bearer {api_key}"))
         .send()
-        .map_err(|error| TtsCatalogError::Request(error.to_string()))?;
-    if let Some(error) = tts_error_for_status(response.status().as_u16()) {
-        return Err(TtsCatalogError::Request(error.to_string()));
+        .map_err(|error| {
+            if error.is_timeout() {
+                TtsCatalogError::Timeout("音色列表请求超时".to_string())
+            } else {
+                TtsCatalogError::Request(error.to_string())
+            }
+        })?;
+    let status = response.status().as_u16();
+    if let Some(message) = tts_error_for_status(status) {
+        return Err(match status {
+            401 | 403 => TtsCatalogError::Auth(message.to_string()),
+            429 => TtsCatalogError::RateLimited(message.to_string()),
+            408 => TtsCatalogError::Timeout(message.to_string()),
+            _ => TtsCatalogError::Request(message.to_string()),
+        });
     }
     let body = response
         .text()
         .map_err(|error| TtsCatalogError::Request(error.to_string()))?;
     let voices = parse_voice_catalog(&body)?;
+    let truncated = serde_json::from_str::<Value>(&body)
+        .ok()
+        .map(|value| {
+            value.get("has_more").and_then(Value::as_bool).unwrap_or(false)
+                || value
+                    .get("total")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|total| total as usize > voices.len())
+        })
+        .unwrap_or(false);
     Ok(TtsCatalog {
         models: TtsCatalog::fallback().models,
         voices,
         source: TtsCatalogSource::Api,
         model_source: TtsCatalogSource::Fallback,
+        truncated,
     })
 }
 
@@ -627,51 +673,97 @@ enum TtsMessage {
     Shutdown,
 }
 
-/// TTS 编排线程句柄。语音设备不可用时退化为 disabled，不影响主进程启动。
+/// TTS 编排线程句柄。SpeechPlayer 懒加载；未启用/未配置 key 时不打开音频设备。
 pub struct TtsRuntime {
-    sender: Option<SyncSender<TtsMessage>>,
+    playback: Option<PlaybackHandle>,
+    worker: Mutex<Option<TtsWorker>>,
     pending: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    unavailable: AtomicBool,
+    health: Arc<Mutex<Option<SpeechHealth>>>,
+}
+
+struct TtsWorker {
+    sender: SyncSender<TtsMessage>,
+    thread: JoinHandle<()>,
 }
 
 impl TtsRuntime {
     pub fn new(playback: PlaybackHandle) -> Self {
-        let player = match SpeechPlayer::spawn() {
-            Ok(player) => player,
-            Err(error) => {
-                log::warn!("TTS 语音播放器不可用（speak 工具将返回不可用）：{error}");
-                return Self::disabled();
-            }
-        };
-        let (sender, receiver) = mpsc::sync_channel(256);
-        let pending = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_pending = Arc::clone(&pending);
-        let worker_stop = Arc::clone(&stop);
-        let worker = thread::Builder::new()
-            .name("tts-worker".to_string())
-            .spawn(move || run_tts_worker(receiver, playback, player, worker_pending, worker_stop))
-            .map_err(|error| log::error!("TTS worker 线程创建失败：{error}"))
-            .ok();
-        if worker.is_none() {
-            return Self::disabled();
-        }
         Self {
-            sender: Some(sender),
-            pending,
-            stop,
-            worker,
+            playback: Some(playback),
+            worker: Mutex::new(None),
+            pending: Arc::new(AtomicUsize::new(0)),
+            stop: Arc::new(AtomicBool::new(false)),
+            unavailable: AtomicBool::new(false),
+            health: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn disabled() -> Self {
         Self {
-            sender: None,
+            playback: None,
+            worker: Mutex::new(None),
             pending: Arc::new(AtomicUsize::new(0)),
             stop: Arc::new(AtomicBool::new(true)),
-            worker: None,
+            unavailable: AtomicBool::new(true),
+            health: Arc::new(Mutex::new(Some(SpeechHealth::Closed))),
         }
+    }
+
+    /// 播放器是否仍可能可用（懒加载前为 true；启动失败后为 false）。
+    pub fn available(&self) -> bool {
+        if self.unavailable.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        health.as_ref().is_none_or(SpeechHealth::is_healthy)
+    }
+
+    fn ensure_worker(&self) -> Result<(), TtsError> {
+        let mut guard = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_some() {
+            return Ok(());
+        }
+        if self.unavailable.load(Ordering::Acquire) {
+            return Err(TtsError::Player("speech player unavailable".to_string()));
+        }
+        let player = SpeechPlayer::spawn().map_err(|error| {
+            self.unavailable.store(true, Ordering::Release);
+            TtsError::Player(error.to_string())
+        })?;
+        let playback = self
+            .playback
+            .clone()
+            .ok_or_else(|| TtsError::Player("playback unavailable".to_string()))?;
+        let (sender, receiver) = mpsc::sync_channel(256);
+        let worker_pending = Arc::clone(&self.pending);
+        let worker_stop = Arc::clone(&self.stop);
+        let worker_health = Arc::clone(&self.health);
+        let thread = thread::Builder::new()
+            .name("tts-worker".to_string())
+            .spawn(move || {
+                run_tts_worker(
+                    receiver,
+                    playback,
+                    player,
+                    worker_pending,
+                    worker_stop,
+                    worker_health,
+                )
+            })
+            .map_err(|error| {
+                self.unavailable.store(true, Ordering::Release);
+                TtsError::Player(format!("spawn tts-worker: {error}"))
+            })?;
+        *guard = Some(TtsWorker { sender, thread });
+        Ok(())
     }
 
     /// 异步入队（无语气/风格参数）；只检查配置和队列，不做网络请求。
@@ -692,7 +784,7 @@ impl TtsRuntime {
         if config.trigger_scope != TtsTriggerScope::AiChat {
             return Err(TtsError::Disabled);
         }
-        let capabilities = tts_model_capabilities(&config.model);
+        let capabilities = tts_model_capabilities(config.effective_model());
         if options.emotion.is_some() && !capabilities.supports_emotion {
             return Err(TtsError::UnsupportedOption("emotion".to_string()));
         }
@@ -709,12 +801,19 @@ impl TtsRuntime {
         if text.is_empty() {
             return Err(TtsError::Audio);
         }
+        self.ensure_worker()?;
         let max = config.queue_max.max(1);
         if self.pending.fetch_add(1, Ordering::AcqRel) >= max {
             self.pending.fetch_sub(1, Ordering::AcqRel);
             return Err(TtsError::QueueFull);
         }
-        let Some(sender) = self.sender.as_ref() else {
+        let sender = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|worker| worker.sender.clone());
+        let Some(sender) = sender else {
             self.pending.fetch_sub(1, Ordering::AcqRel);
             return Err(TtsError::Disabled);
         };
@@ -740,13 +839,21 @@ impl TtsRuntime {
 impl Drop for TtsRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(sender) = self.sender.take() {
-            // 队列满时不能阻塞关停；drop(sender) 会让 worker 的 recv 断开，
-            // 它处理完当前条目后会按 stop 退出。
-            let _ = sender.try_send(TtsMessage::Shutdown);
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        let Some(worker) = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let _ = worker.sender.try_send(TtsMessage::Shutdown);
+        if worker.thread.is_finished() {
+            let _ = worker.thread.join();
+        } else {
+            // 不阻塞退出；worker 会在当前 HTTP/播放结束后看到 stop 并退出。
+            log::warn!("TTS worker 未在关停时立即结束，已放弃 join 以避免阻塞退出");
+            drop(worker.thread);
         }
     }
 }
@@ -754,9 +861,10 @@ impl Drop for TtsRuntime {
 fn run_tts_worker(
     receiver: mpsc::Receiver<TtsMessage>,
     playback: PlaybackHandle,
-    player: SpeechPlayer,
+    mut player: SpeechPlayer,
     pending: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
+    health: Arc<Mutex<Option<SpeechHealth>>>,
 ) {
     while let Ok(message) = receiver.recv() {
         match message {
@@ -766,12 +874,25 @@ fn run_tts_worker(
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
+                if !player.is_alive() {
+                    log::warn!("TTS SpeechPlayer 失活，尝试 restart 后再处理队列");
+                    if let Err(error) = player.restart() {
+                        log::warn!("TTS SpeechPlayer restart 失败：{error}");
+                    }
+                }
+                if let Ok(mut health) = health.lock() {
+                    *health = Some(player.health());
+                }
                 if job.queued_at.elapsed() > tts_job_ttl(&job.config) {
                     log::debug!("TTS 队列条目已过期，跳过");
                     continue;
                 }
-                if let Err(error) = synthesize_and_speak(&playback, &player, &job, &stop) {
+                let result = synthesize_and_speak(&playback, &mut player, &job, &stop);
+                if let Err(error) = &result {
                     log::warn!("TTS 语音跳过（文本回复不受影响）：{error}");
+                }
+                if let Ok(mut health) = health.lock() {
+                    *health = Some(player.health());
                 }
             }
         }
@@ -779,36 +900,104 @@ fn run_tts_worker(
     player.shutdown();
 }
 
+fn tts_play_wait_limit(audio_duration: Duration) -> Duration {
+    (audio_duration + Duration::from_secs(2)).max(Duration::from_secs(3))
+}
+
 fn tts_job_ttl(config: &TtsConfig) -> Duration {
-    // 队列里的旧回复没有播放价值；默认给 30s，至少覆盖一次请求超时。
-    Duration::from_millis(config.timeout_ms.saturating_mul(3).max(30_000))
+    // 队列里的旧回复没有播放价值：按一次请求+预估播放时长给 TTL，至少 30s、最多 120s。
+    let playback_estimate_ms = (config.max_chars as u64).saturating_mul(150);
+    Duration::from_millis(
+        config
+            .timeout_ms
+            .saturating_mul(2)
+            .saturating_add(playback_estimate_ms)
+            .clamp(30_000, 120_000),
+    )
 }
 
 fn synthesize_and_speak(
     playback: &PlaybackHandle,
-    player: &SpeechPlayer,
+    player: &mut SpeechPlayer,
     job: &TtsJob,
     stop: &AtomicBool,
 ) -> Result<(), TtsError> {
     let bytes = synthesize_fish(&job.config, &job.text, &job.options)?;
-    let audio = SpeechAudio::Wav(bytes);
+    // 先解码成功，再 engage duck；解码失败不压音乐。
+    let pcm = SpeechAudio::Wav(bytes)
+        .decode()
+        .map_err(|error| TtsError::Player(error.to_string()))?;
+    let frames = pcm.samples.len() / usize::from(pcm.channels.max(1));
+    let audio_duration = if pcm.sample_rate == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(frames as f64 / f64::from(pcm.sample_rate))
+    };
+    // 等待上界按实际音频时长 + 2s 收尾；不再用 30s 硬顶截断长语音。
+    // 真正的异常由 health/停止标志提前结束；max_chars 已限制文本上限。
+    let wait_limit = tts_play_wait_limit(audio_duration);
     let mut duck = DuckGuard::new(playback.clone());
     duck.engage(job.config.duck_volume, job.config.duck_fade_ms);
-    if let Err(error) = player.speak(audio) {
+    if let Err(error) = player.speak(SpeechAudio::Pcm {
+        sample_rate: pcm.sample_rate,
+        channels: pcm.channels,
+        samples: pcm.samples,
+    }) {
         duck.restore();
         return Err(TtsError::Player(error.to_string()));
     }
-    // 等待语音线程真正开始，再等它结束；轮询 avoid watch runtime dependency。
+    // 等待语音线程真正开始，再等它结束；同时监听 health，设备异常立即停等恢复 duck。
+    let mut health = player.subscribe_health();
     let started = Instant::now();
     while !player.is_speaking() && started.elapsed() < Duration::from_millis(500) {
         if stop.load(Ordering::Acquire) {
             let _ = player.stop();
+            duck.restore();
+            return Ok(());
+        }
+        match health.borrow_and_update().clone() {
+            SpeechHealth::Healthy => {}
+            SpeechHealth::Degraded { reason } => {
+                log::warn!("TTS 播放器降级（{reason}），停止等待并恢复 duck");
+                let _ = player.stop();
+                let _ = player.restart();
+                duck.restore();
+                return Ok(());
+            }
+            SpeechHealth::Closed => {
+                log::warn!("TTS 播放器已关闭，停止等待并恢复 duck");
+                duck.restore();
+                return Ok(());
+            }
+        }
+        if started.elapsed() > wait_limit {
+            log::warn!("TTS 等待播放启动超过上界（{wait_limit:?}），停止本段语音");
+            let _ = player.stop();
+            duck.restore();
             return Ok(());
         }
         thread::sleep(Duration::from_millis(5));
     }
     while player.is_speaking() {
         if stop.load(Ordering::Acquire) {
+            let _ = player.stop();
+            break;
+        }
+        match health.borrow_and_update().clone() {
+            SpeechHealth::Healthy => {}
+            SpeechHealth::Degraded { reason } => {
+                log::warn!("TTS 播放器降级（{reason}），停止播放并恢复 duck");
+                let _ = player.stop();
+                let _ = player.restart();
+                break;
+            }
+            SpeechHealth::Closed => {
+                log::warn!("TTS 播放器已关闭，停止播放并恢复 duck");
+                break;
+            }
+        }
+        if started.elapsed() > wait_limit {
+            log::warn!("TTS 播放超过上界（{wait_limit:?}），停止本段语音");
             let _ = player.stop();
             break;
         }
@@ -837,18 +1026,26 @@ impl DuckGuard {
 
     fn engage(&mut self, target: u8, fade_ms: u64) {
         let target = target.min(100);
-        self.active = true;
         self.gain = target;
         self.fade_ms = fade_ms;
-        fade_duck(&self.playback, 100, target, fade_ms);
+        self.active = fade_duck(&self.playback, 100, target, fade_ms);
+        if !self.active {
+            log::warn!("TTS duck 压低失败，已尝试直接恢复 100");
+            force_duck_full(&self.playback);
+        }
     }
 
     fn restore(&mut self) {
-        if self.active {
-            fade_duck(&self.playback, self.gain, 100, self.fade_ms);
-            self.gain = 100;
-            self.active = false;
+        if !self.active {
+            return;
         }
+        let restored = fade_duck(&self.playback, self.gain, 100, self.fade_ms);
+        if !restored {
+            log::warn!("TTS duck 恢复渐变失败，直设/重试恢复 100");
+            force_duck_full(&self.playback);
+        }
+        self.active = false;
+        self.gain = 100;
     }
 }
 
@@ -858,7 +1055,33 @@ impl Drop for DuckGuard {
     }
 }
 
-fn fade_duck(playback: &PlaybackHandle, from: u8, to: u8, fade_ms: u64) {
+fn force_duck_full(playback: &PlaybackHandle) {
+    for attempt in 0..3 {
+        match playback.set_duck_gain(100) {
+            Ok(()) => return,
+            Err(error) => {
+                log::warn!("TTS duck 直设 100 失败（第 {} 次）：{error}", attempt + 1);
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    // 立即重试仍失败（例如引擎 Busy）：后台看门狗继续重试，避免永久压低。
+    let playback = playback.clone();
+    let _ = thread::Builder::new()
+        .name("tts-duck-watchdog".to_string())
+        .spawn(move || {
+            for attempt in 0..50 {
+                if playback.set_duck_gain(100).is_ok() {
+                    log::warn!("TTS duck 看门狗恢复 100 成功（第 {} 次）", attempt + 1);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            log::error!("TTS duck 看门狗 10s 内仍无法恢复 100，请检查播放引擎");
+        });
+}
+
+fn fade_duck(playback: &PlaybackHandle, from: u8, to: u8, fade_ms: u64) -> bool {
     let steps = if fade_ms == 0 {
         1
     } else {
@@ -871,13 +1094,18 @@ fn fade_duck(playback: &PlaybackHandle, from: u8, to: u8, fade_ms: u64) {
     };
     for gain in duck_gain_steps(from, to, steps) {
         if let Err(error) = playback.set_duck_gain(gain) {
-            log::debug!("TTS duck 增益设置失败（继续播放语音）：{error}");
-            return;
+            log::warn!("TTS duck 增益设置失败：{error}");
+            // 目标不是 100 时立即尝试直接恢复，避免音乐一直压低。
+            if to < 100 {
+                force_duck_full(playback);
+            }
+            return false;
         }
         if !pause.is_zero() {
             thread::sleep(pause);
         }
     }
+    true
 }
 
 fn synthesize_fish(
@@ -897,23 +1125,26 @@ fn synthesize_fish(
         ))
         .build()
         .map_err(|error| TtsError::Request(error.to_string()))?;
-    let capabilities = tts_model_capabilities(&config.model);
+    let capabilities = tts_model_capabilities(config.effective_model());
     let text = decorate_speak_text(text, options, &capabilities);
+    let format = match config.format {
+        TtsFormat::Wav => "wav",
+    };
     let mut body = json!({
         "text": text,
-        "format": "wav",
+        "format": format,
     });
     if let Some(prosody) = speak_prosody_body(options, &capabilities) {
         body["prosody"] = prosody;
     }
     let voice = config.voice_id();
-    if !voice.is_empty() {
+    if capabilities.supports_reference_id && !voice.is_empty() {
         body["reference_id"] = serde_json::Value::String(voice.to_string());
     }
     let response = client
         .post(tts_url(&config.endpoint))
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("model", config.model.trim())
+        .header("model", config.effective_model())
         .json(&body)
         .send()
         .map_err(|error| {
@@ -962,6 +1193,40 @@ impl TtsQueueState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_audio_is_not_truncated_by_a_30s_hard_cap() {
+        assert_eq!(
+            tts_play_wait_limit(Duration::from_secs(45)),
+            Duration::from_secs(47)
+        );
+        assert_eq!(
+            tts_play_wait_limit(Duration::ZERO),
+            Duration::from_secs(3)
+        );
+        assert!(!TtsRuntime::disabled().available());
+    }
+
+    #[test]
+    fn empty_model_falls_back_and_validate_uses_schema_bounds() {
+        let mut config = TtsConfig::default();
+        config.model.clear();
+        assert_eq!(config.effective_model(), DEFAULT_TTS_MODEL);
+        config.duck_fade_ms = 2_001;
+        assert!(config.validate().is_err());
+        config.duck_fade_ms = 0;
+        config.max_chars = 2_001;
+        assert!(config.validate().is_err());
+        config.max_chars = 200;
+        config.timeout_ms = 999;
+        assert!(config.validate().is_err());
+        config.timeout_ms = 1_000;
+        config.queue_max = 65;
+        assert!(config.validate().is_err());
+        config.queue_max = 64;
+        assert!(config.validate().is_ok());
+        assert!(!TtsCatalog::fallback().truncated);
+    }
 
     #[test]
     fn tts_defaults_match_p0_contract() {

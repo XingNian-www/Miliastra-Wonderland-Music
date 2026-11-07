@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -1082,6 +1084,54 @@ pub(crate) fn fetch_model_capabilities(
     Ok(parse_model_capabilities(&body, model))
 }
 
+const VISION_CAPABILITY_TTL: Duration = Duration::from_secs(300);
+
+struct CachedVisionCapability {
+    capabilities: ModelCapabilities,
+    cached_at: Instant,
+}
+
+fn vision_capability_cache() -> &'static Mutex<HashMap<String, CachedVisionCapability>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedVisionCapability>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 带 TTL 的能力查询：成功结果（含 unknown）缓存 5 分钟；网络/配置错误不缓存。
+pub(crate) fn cached_model_capabilities(config: &AiConfig, model: &str) -> ModelCapabilities {
+    let key = format!(
+        "{}|{}|{}|{}",
+        config.provider, config.endpoint, config.responses_endpoint, model
+    );
+    if let Ok(cache) = vision_capability_cache().lock()
+        && let Some(entry) = cache.get(&key)
+        && entry.cached_at.elapsed() < VISION_CAPABILITY_TTL
+    {
+        return entry.capabilities;
+    }
+    match fetch_model_capabilities(config, model) {
+        Ok(capabilities) => {
+            if let Ok(mut cache) = vision_capability_cache().lock() {
+                cache.insert(
+                    key,
+                    CachedVisionCapability {
+                        capabilities,
+                        cached_at: Instant::now(),
+                    },
+                );
+            }
+            capabilities
+        }
+        Err(_) => ModelCapabilities::default(),
+    }
+}
+
+/// 配置 apply 后清除能力缓存，避免旧模型的“不支持”结果长期粘住。
+pub(crate) fn clear_vision_capability_cache() {
+    if let Ok(mut cache) = vision_capability_cache().lock() {
+        cache.clear();
+    }
+}
+
 fn fetch_models_payload(config: &AiConfig) -> std::result::Result<String, ModelListError> {
     fetch_models_payload_with_timeout(config, std::time::Duration::from_secs(20))
 }
@@ -1146,13 +1196,7 @@ fn find_model_item<'a>(value: &'a Value, model: &str) -> Option<&'a Value> {
 }
 
 fn model_capabilities_from_item(item: &Value) -> ModelCapabilities {
-    for key in [
-        "supports_vision",
-        "supports_image",
-        "vision",
-        "image_input",
-        "image",
-    ] {
+    for key in ["supports_vision", "supports_image", "vision", "image_input"] {
         if let Some(value) = item.get(key).and_then(Value::as_bool) {
             return ModelCapabilities {
                 supports_image: Some(value),
@@ -1160,7 +1204,7 @@ fn model_capabilities_from_item(item: &Value) -> ModelCapabilities {
         }
     }
     let mut saw_modality_list = false;
-    for key in ["input_modalities", "modalities", "supported_modalities"] {
+    for key in ["input_modalities"] {
         if let Some(list) = item.get(key).and_then(Value::as_array) {
             saw_modality_list = true;
             if modality_list_supports_image(list) {
@@ -1180,27 +1224,6 @@ fn model_capabilities_from_item(item: &Value) -> ModelCapabilities {
             return ModelCapabilities {
                 supports_image: Some(true),
             };
-        }
-    }
-    if let Some(capabilities) = item.get("capabilities") {
-        if let Some(list) = capabilities.as_array() {
-            saw_modality_list = true;
-            if modality_list_supports_image(list) {
-                return ModelCapabilities {
-                    supports_image: Some(true),
-                };
-            }
-        } else if let Some(object) = capabilities.as_object() {
-            for (key, value) in object {
-                let key = key.to_ascii_lowercase();
-                if (key.contains("image") || key.contains("vision"))
-                    && value.as_bool() == Some(true)
-                {
-                    return ModelCapabilities {
-                        supports_image: Some(true),
-                    };
-                }
-            }
         }
     }
     ModelCapabilities {
@@ -1374,6 +1397,8 @@ pub(crate) struct ToolSession {
     names: std::collections::HashSet<String>,
     history: Vec<Value>,
     image: Option<ImageAttachment>,
+    /// 当前 user 消息在 `history` 中的固定下标；工具调用/结果追加后仍指向它。
+    image_anchor: Option<usize>,
     seen: std::collections::HashSet<String>,
     pending: std::collections::HashSet<String>,
 }
@@ -1491,6 +1516,7 @@ impl ToolSession {
                 bail!("AI 工具 parameters 必须是 JSON object");
             }
         }
+        let image_anchor = image.as_ref().map(|_| history.len() - 1);
         Ok(Self {
             target,
             http_proxy: config.http_proxy.clone(),
@@ -1499,19 +1525,30 @@ impl ToolSession {
             names,
             history,
             image,
+            image_anchor,
             seen: Default::default(),
             pending: Default::default(),
         })
     }
 
-    /// Responses 的历史副本：仅最后一条当前 user 消息可带 `input_text + input_image`。
+    /// Responses 的历史副本：只给**构造时的当前 user 消息**挂图。
+    ///
+    /// 工具调用会把 assistant tool-call / function_call_output 追加到历史末尾，
+    /// 因此不能再用 `last_mut()`；否则会把图片塞进工具结果，破坏协议结构。
     fn history_with_image_for_responses(&self) -> Vec<Value> {
         let mut items = self.history.clone();
-        if let Some(image) = &self.image
-            && let Some(last) = items.last_mut()
-        {
-            let text = last["content"].as_str().unwrap_or_default().to_string();
-            last["content"] = serde_json::json!([
+        let Some(index) = self.image_anchor else {
+            return items;
+        };
+        let Some(item) = items.get_mut(index) else {
+            return items;
+        };
+        if item["role"].as_str() != Some("user") || !item["content"].is_string() {
+            return items;
+        }
+        if let Some(image) = &self.image {
+            let text = item["content"].as_str().unwrap_or_default().to_string();
+            item["content"] = serde_json::json!([
                 {"type": "input_text", "text": text},
                 {"type": "input_image", "image_url": image.data_url()},
             ]);
@@ -1519,19 +1556,32 @@ impl ToolSession {
         items
     }
 
-    /// Chat Completions 的历史副本：仅最后一条当前 user 消息可带 `text + image_url`。
+    /// Chat Completions 的历史副本：只给构造时的当前 user 消息挂图。
     fn history_with_image_for_chat(&self) -> Vec<Value> {
         let mut messages = self.history.clone();
-        if let Some(image) = &self.image
-            && let Some(last) = messages.last_mut()
-        {
-            let text = last["content"].as_str().unwrap_or_default().to_string();
-            last["content"] = serde_json::json!([
+        let Some(index) = self.image_anchor else {
+            return messages;
+        };
+        let Some(item) = messages.get_mut(index) else {
+            return messages;
+        };
+        if item["role"].as_str() != Some("user") || !item["content"].is_string() {
+            return messages;
+        }
+        if let Some(image) = &self.image {
+            let text = item["content"].as_str().unwrap_or_default().to_string();
+            item["content"] = serde_json::json!([
                 {"type": "text", "text": text},
                 {"type": "image_url", "image_url": {"url": image.data_url()}},
             ]);
         }
         messages
+    }
+
+    /// 去掉当前消息的图片（图片被模型拒绝时保留已 append 的工具结果）。
+    pub(crate) fn drop_image(&mut self) {
+        self.image = None;
+        self.image_anchor = None;
     }
 
     fn request_body(&self, max_tokens: u32, allow_tools: bool) -> Result<Value> {
@@ -2644,6 +2694,91 @@ mod tests {
     }
 
     #[test]
+    fn image_stays_on_current_user_after_one_tool_round_on_both_wires() {
+        for wire in [WireApi::Responses, WireApi::ChatCompletions] {
+            let mut config = config("openai");
+            config.wire_api = wire;
+            let mut session = ToolSession::with_history_options_and_image(
+                &config,
+                &AiCallOptions::new(""),
+                "Persona",
+                Vec::new(),
+                "Current question",
+                tool_definitions(),
+                Some(image_attachment()),
+            )
+            .unwrap();
+            let output = match wire {
+                WireApi::Responses => vec![json!({
+                    "type":"function_call",
+                    "call_id":"call_1",
+                    "name":"lookup",
+                    "arguments":"{}",
+                    "status":"completed"
+                })],
+                WireApi::ChatCompletions => vec![json!({
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"lookup","arguments":"{}"}
+                    }]
+                })],
+            };
+            session.accept_output(output, true).unwrap();
+            session.append_result("call_1", "tool-result").unwrap();
+            let body = session_body(&session, true);
+            let messages = match wire {
+                WireApi::Responses => body["input"].as_array().unwrap().clone(),
+                WireApi::ChatCompletions => body["messages"].as_array().unwrap()[1..].to_vec(),
+            };
+            let current = messages
+                .iter()
+                .find(|message| message["role"] == "user")
+                .expect("current user");
+            assert!(current["content"].is_array(), "当前 user 仍应有图片数组");
+            let tool_output = messages
+                .iter()
+                .find(|message| {
+                    message["type"] == "function_call_output"
+                        || message["role"] == "tool"
+                        || message["tool_call_id"] == "call_1"
+                })
+                .expect("tool output");
+            assert!(
+                tool_output["content"].is_string() || tool_output["output"].is_string(),
+                "工具结果 content/output 必须保持字符串结构: {tool_output}"
+            );
+            assert!(
+                !tool_output.to_string().contains("data:image"),
+                "工具结果不能混入图片"
+            );
+
+            // 图片被拒绝时只去图，不重建会话；工具结果必须还在。
+            session.drop_image();
+            let body = session_body(&session, true);
+            let messages = match wire {
+                WireApi::Responses => body["input"].as_array().unwrap().clone(),
+                WireApi::ChatCompletions => body["messages"].as_array().unwrap()[1..].to_vec(),
+            };
+            let current = messages
+                .iter()
+                .find(|message| message["role"] == "user")
+                .expect("current user");
+            assert!(current["content"].is_string(), "去图后当前 user 回到字符串");
+            assert!(
+                messages.iter().any(|message| {
+                    message["type"] == "function_call_output"
+                        || message["role"] == "tool"
+                        || message["tool_call_id"] == "call_1"
+                }),
+                "去图不能丢工具结果"
+            );
+        }
+    }
+
+    #[test]
     fn tool_session_without_image_keeps_text_content_shape() {
         let mut config = config("openai");
         config.wire_api = WireApi::Responses;
@@ -2664,7 +2799,8 @@ mod tests {
     fn model_capabilities_are_read_from_models_metadata_not_model_name() {
         let body = json!({"data":[
             {"id":"vision-model", "architecture":{"input_modalities":["text","image"]}},
-            {"id":"text-model", "capabilities":["text"]},
+            {"id":"text-model", "input_modalities":["text"]},
+            {"id":"output-image-model", "output_modalities":["image"]},
             {"id":"plain-model"}
         ]})
         .to_string();
@@ -2675,6 +2811,11 @@ mod tests {
         assert_eq!(
             parse_model_capabilities(&body, "text-model").supports_image,
             Some(false)
+        );
+        assert_eq!(
+            parse_model_capabilities(&body, "output-image-model").supports_image,
+            None,
+            "输出图片能力不能被当成输入图片能力"
         );
         assert_eq!(
             parse_model_capabilities(&body, "plain-model").supports_image,

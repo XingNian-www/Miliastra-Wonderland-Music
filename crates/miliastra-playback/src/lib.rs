@@ -37,4 +37,4 @@ pub use runtime::{
     LoginOperation, LoginOperationWaitError, LoginSession, LoginStatus, PlaybackError,
     PlaybackHandle, PlaybackOperation, PlaybackRuntime, PlaybackSnapshot, PlaylistImportOperation,
 };
-pub use speech::{PcmAudio, SpeechAudio, SpeechError, SpeechPlayer};
+pub use speech::{PcmAudio, SpeechAudio, SpeechError, SpeechHealth, SpeechPlayer};

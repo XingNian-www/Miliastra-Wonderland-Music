@@ -9,16 +9,6 @@
 
 use super::*;
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
-/// 一次进程内缓存 `/models` 查询到的图片能力，避免每轮聊天都打模型列表接口。
-/// 配置改动会通过子进程重载生效，新进程缓存自然清空。
-fn vision_capability_cache() -> &'static Mutex<HashMap<String, bool>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// 图片/视觉相关错误判定：模型不支持图片时通常以 400/415/422 拒绝整个请求。
 /// 只匹配明确的图片、内容或媒体关键词，避免把余额不足、模型不存在当成图片拒绝。
 fn is_image_rejection(error: &anyhow::Error) -> bool {
@@ -46,6 +36,33 @@ fn should_retry_without_image(
     had_image && !retry_done && is_image_rejection(error)
 }
 
+/// 识别截图结果；失败时保留驻留结果，日志/调用方都能看到。
+struct VisionCapture {
+    image: Option<crate::config::ai::ImageAttachment>,
+    failure: Option<String>,
+    residency: String,
+    navigated: bool,
+}
+
+impl VisionCapture {
+    fn failed(reason: impl Into<String>, residency: impl Into<String>, navigated: bool) -> Self {
+        Self {
+            image: None,
+            failure: Some(reason.into()),
+            residency: residency.into(),
+            navigated,
+        }
+    }
+}
+
+fn vision_navigation_budget(deadline: Option<Instant>) -> Duration {
+    let navigation = Duration::from_millis(crate::features::ai_chat::VISION_NAVIGATION_TIMEOUT_MS);
+    match deadline {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(navigation),
+        None => navigation,
+    }
+}
+
 impl ApplicationRuntime {
     /// 当前视觉请求使用的模型名：优先 `ai_chat.vision.model`，否则沿用聊天模型。
     fn ai_chat_vision_model(&self, config: &crate::features::ai_chat::AiChatConfig) -> String {
@@ -60,64 +77,110 @@ impl ApplicationRuntime {
         self.business.ai_connection.model.trim().to_string()
     }
 
-    /// 通过模型列表 API 查询该模型是否声明图片输入；查不到/查询失败不猜，返回 false。
-    fn ai_chat_model_supports_vision(&self, model: &str) -> bool {
-        let key = format!(
-            "{}|{:?}|{}|{}",
-            self.business.ai_connection.provider,
-            self.business.ai_connection.wire_api,
-            self.business.ai_connection.endpoint,
-            model
-        );
-        if let Ok(cache) = vision_capability_cache().lock()
-            && let Some(value) = cache.get(&key)
-        {
-            return *value;
+    /// 主聊天模型：`ai_chat.model` 为空时沿用 `ai.model`。
+    fn ai_chat_main_model(&self, config: &crate::features::ai_chat::AiChatConfig) -> String {
+        let configured = config.model.trim();
+        if configured.is_empty() {
+            self.business.ai_connection.model.trim().to_string()
+        } else {
+            configured.to_string()
         }
-        let supported = match crate::config::ai::fetch_model_capabilities(
-            &self.business.ai_connection,
-            model,
-        ) {
-            Ok(capabilities) => capabilities.supports_image == Some(true),
-            Err(error) => {
-                log::debug!("AI 聊天查询模型图片能力失败（本轮按纯文本处理）：{error}");
-                false
-            }
-        };
-        if let Ok(mut cache) = vision_capability_cache().lock() {
-            cache.insert(key, supported);
-        }
-        if !supported {
-            log::debug!("模型「{model}」未声明图片能力，AI 聊天本轮不附带截图");
-        }
-        supported
     }
 
-    /// 按需截取一级大厅并编码为内存 JPEG；任何失败都返回 None，由调用方降级纯文本。
+    /// 三态图片能力：Some(true)=明确支持、Some(false)=明确不支持、None=未知。
+    fn ai_chat_model_vision_capability(&self, model: &str) -> Option<bool> {
+        crate::config::ai::cached_model_capabilities(&self.business.ai_connection, model)
+            .supports_image
+    }
+
+    /// 通过模型列表 API 查询该模型是否声明图片输入；查不到/查询失败不猜，返回 false。
+    fn ai_chat_model_supports_vision(&self, model: &str) -> bool {
+        let supports = self.ai_chat_model_vision_capability(model);
+        if supports != Some(true) {
+            log::debug!("模型「{model}」未声明图片能力，AI 聊天本轮不附带截图");
+        }
+        supports == Some(true)
+    }
+
+    /// 按需截取一级/二级界面并编码为内存 JPEG。
+    ///
+    /// 统一走 `ResidencyUi::capture_primary_and_restore`：一级直接截图；二级
+    /// 自动导航到一级截图再回当前大厅二级。失败、返回驻守失败、超时都把
+    /// `residency` 写进日志，调用方降级纯文本或 look unavailable。
     fn capture_ai_chat_vision_image(
         &self,
         config: &crate::features::ai_chat::AiChatConfig,
-    ) -> Option<crate::config::ai::ImageAttachment> {
+        deadline: Option<Instant>,
+    ) -> VisionCapture {
         if config.vision.capture_scope
             != crate::features::ai_chat::VisionCaptureScope::PrimaryScreen
             || !config.vision.allow_full_screen
         {
-            return None;
+            return VisionCapture::failed(
+                "capture_scope/allow_full_screen 不允许整屏截图",
+                "not_attempted",
+                false,
+            );
+        }
+        let budget = vision_navigation_budget(deadline);
+        if budget.is_zero() {
+            log::warn!("AI 聊天截图未执行：总 deadline 已到");
+            return VisionCapture::failed("总 deadline 已到", "deadline_exceeded", false);
         }
         let started = Instant::now();
-        let image = match self
-            .ui
-            .game_ui
-            .capture_with_timeout(Duration::from_millis(config.vision.timeout_ms))
-        {
-            Ok(image) => image,
+        let operation = match self.ui.residency_ui.capture_primary_and_restore() {
+            Ok(operation) => operation,
             Err(error) => {
-                log::warn!("AI 聊天截图失败/超时（已降级纯文本）：{error:#}");
-                return None;
+                log::warn!("AI 聊天导航截图提交失败（已降级纯文本）：{error}");
+                return VisionCapture::failed(
+                    format!("提交导航截图失败：{error}"),
+                    "submit_failed",
+                    false,
+                );
             }
         };
+        let outcome = match operation.wait_timeout(budget) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log::warn!(
+                    "AI 聊天导航截图等待超时（budget={budget:?}）：{error:?}；不假定已返回驻守"
+                );
+                return VisionCapture::failed(
+                    format!("导航截图等待超时：{error:?}"),
+                    "wait_timeout",
+                    false,
+                );
+            }
+        };
+        let navigated = outcome.navigated();
+        let residency = format!("{:?}", outcome.residency());
+        if let Some(failure) = outcome.failure() {
+            log::warn!(
+                "AI 聊天导航截图失败（navigated={navigated} residency={residency}）：{failure}"
+            );
+            return VisionCapture::failed(failure.to_string(), residency, navigated);
+        }
+        if !matches!(
+            outcome.residency(),
+            crate::ui::routines::UiResidencyOutcome::Confirmed(_)
+        ) {
+            log::warn!(
+                "AI 聊天截图成功但返回驻守失败（navigated={navigated} residency={residency}）；按失败降级，不留下二级界面丢失"
+            );
+            return VisionCapture::failed(
+                "截图成功但返回驻守失败",
+                residency,
+                navigated,
+            );
+        }
+        let Some(image) = outcome.image() else {
+            log::warn!(
+                "AI 聊天导航截图没有图像（navigated={navigated} residency={residency}）"
+            );
+            return VisionCapture::failed("没有截图图像", residency, navigated);
+        };
         let encoded = crate::features::ai_chat::encode_vision_image(
-            &image,
+            image,
             config.vision.max_edge,
             config.vision.jpeg_quality,
             config.vision.max_bytes,
@@ -125,17 +188,24 @@ impl ApplicationRuntime {
         match encoded {
             Some(image) => {
                 log::debug!(
-                    "AI 聊天截图已编码：{}x{} bytes={} elapsed_ms={}",
+                    "AI 聊天截图已编码：{}x{} bytes={} navigated={} residency={} elapsed_ms={}",
                     image.width(),
                     image.height(),
                     image.byte_len(),
+                    navigated,
+                    residency,
                     started.elapsed().as_millis()
                 );
-                Some(image)
+                VisionCapture {
+                    image: Some(image),
+                    failure: None,
+                    residency,
+                    navigated,
+                }
             }
             None => {
                 log::warn!("AI 聊天截图编码失败（超限或空图，已降级纯文本）");
-                None
+                VisionCapture::failed("截图编码失败", residency, navigated)
             }
         }
     }
@@ -145,18 +215,48 @@ impl ApplicationRuntime {
         &self,
         config: &crate::features::ai_chat::AiChatConfig,
         instruction: Option<&str>,
-        timeout: Duration,
+        deadline: Instant,
+        reuse_image: Option<&crate::config::ai::ImageAttachment>,
     ) -> serde_json::Value {
+        let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return serde_json::json!({"status":"unavailable","reason":"look 已超过总期限"});
+        }
         if !config.vision.enabled || !crate::features::ai_chat::look_tool_available(config) {
             return serde_json::json!({"status":"unavailable","reason":"AI 识图未启用"});
         }
         let model = self.ai_chat_vision_model(config);
-        if !self.ai_chat_model_supports_vision(&model) {
-            return serde_json::json!({"status":"unavailable","reason":"当前模型未声明支持图片"});
+        if self.ai_chat_model_vision_capability(&model) == Some(false) {
+            return serde_json::json!({"status":"unavailable","reason":"当前视觉模型明确不支持图片"});
         }
-        let Some(image) = self.capture_ai_chat_vision_image(config) else {
-            return serde_json::json!({"status":"unavailable","reason":"截图失败或超时"});
+        // unknown 仍允许尝试一次；失败由下面的截图/视觉请求返回 unavailable。
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return serde_json::json!({"status":"unavailable","reason":"look 已超过总期限"});
+        }
+        let image = if let Some(image) = reuse_image {
+            // both 模式已为当前轮抓过图，look 直接复用，避免重复截图。
+            image.clone()
+        } else {
+            let capture = self.capture_ai_chat_vision_image(config, Some(deadline));
+            let Some(image) = capture.image else {
+                log::warn!(
+                    "look 截图失败（navigated={} residency={} failure={:?}）",
+                    capture.navigated,
+                    capture.residency,
+                    capture.failure
+                );
+                return serde_json::json!({
+                    "status":"unavailable",
+                    "reason":"截图/导航/返回驻守失败",
+                    "residency": capture.residency
+                });
+            };
+            image
         };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return serde_json::json!({"status":"unavailable","reason":"look 已超过总期限"});
+        }
         let prompt = instruction.unwrap_or("请简要描述当前一级大厅画面。");
         let max_tokens = config.max_tokens.clamp(64, 800);
         let mut session = match crate::config::ai::ToolSession::with_history_options_and_image(
@@ -180,7 +280,7 @@ impl ApplicationRuntime {
         match session.request(
             &self.business.ai_chat_openai,
             max_tokens,
-            timeout,
+            remaining,
             false,
         ) {
             Ok(reply) => {
@@ -188,7 +288,7 @@ impl ApplicationRuntime {
                 if text.is_empty() {
                     serde_json::json!({"status":"unavailable","reason":"视觉模型未返回文本"})
                 } else {
-                    serde_json::json!({"status":"handled","description":text})
+                    serde_json::json!({"status":"looked","description":text})
                 }
             }
             Err(error) => {
@@ -292,31 +392,46 @@ impl ApplicationRuntime {
                     Vec::new()
                 };
                 let tts_tool_available = tts_config.enabled
-                    && tts_config.trigger_scope == crate::features::tts::TtsTriggerScope::AiChat;
+                    && tts_config.trigger_scope == crate::features::tts::TtsTriggerScope::AiChat
+                    && !tts_config.api_key.trim().is_empty()
+                    && self.business.tts.available();
                 if tts_tool_available {
                     tools.push(ai_chat::speak_tool_for_model(
                         &tts_config.model,
                         tts_config.max_chars,
                     ));
                 }
-                if ai_chat::look_tool_available(&config) {
+                let vision_model = self.ai_chat_vision_model(&config);
+                let look_enabled = ai_chat::look_tool_available(&config)
+                    && config.vision.enabled
+                    && self.ai_chat_model_vision_capability(&vision_model) != Some(false);
+                if look_enabled {
                     tools.push(ai_chat::look_tool());
                 }
-                // 模型能力由 API 查询决定，不根据默认模型名猜；查不到能力时不附图。
-                let vision_model = self.ai_chat_vision_model(&config);
-                let supports_vision = self.ai_chat_model_supports_vision(&vision_model);
-                let vision_image = if ai_chat::auto_image_enabled(&config, supports_vision) {
-                    self.capture_ai_chat_vision_image(&config)
+                // 只有 auto/both 需要查主模型是否支持图片；tool 模式不为 auto 查。
+                // vision.model 仅给 look 子请求，主聊天始终用 ai_chat.model。
+                let main_model = self.ai_chat_main_model(&config);
+                let main_supports_vision = (config.vision.enabled
+                    && matches!(
+                        config.vision.mode,
+                        crate::features::ai_chat::VisionMode::Auto
+                            | crate::features::ai_chat::VisionMode::Both
+                    ))
+                    .then(|| self.ai_chat_model_supports_vision(&main_model))
+                    .unwrap_or(false);
+                let ai_deadline = Instant::now() + self.business.ai_request_timeout;
+                let mut vision_image = if ai_chat::auto_image_enabled(&config, main_supports_vision) {
+                    self.capture_ai_chat_vision_image(&config, Some(ai_deadline))
+                        .image
                 } else {
                     None
                 };
+                let mut pending_speaks: Vec<(String, crate::features::tts::TtsSpeakOptions)> =
+                    Vec::new();
                 let result = (|| -> Result<ai_chat::AiChatAnswer> {
                     let mut image_retry_done = false;
-                    let session_model = if vision_image.is_some() {
-                        vision_model.clone()
-                    } else {
-                        config.model.clone()
-                    };
+                    // 主聊天始终使用 ai_chat.model；vision.model 只用于 look 子请求。
+                    let session_model = config.model.clone();
                     let mut session =
                         crate::config::ai::ToolSession::with_history_options_and_image(
                             &self.business.ai_connection,
@@ -330,9 +445,11 @@ impl ApplicationRuntime {
                             tools.clone(),
                             vision_image.clone(),
                         )?;
-                    let deadline = Instant::now() + self.business.ai_request_timeout;
+                    let deadline = ai_deadline;
                     let mut executed = std::collections::HashSet::new();
                     let mut spoken = std::collections::HashSet::new();
+                    let mut looked = 0usize;
+                    let mut looked_instructions = std::collections::HashSet::new();
                     for round in 0..=ai_chat::MAX_TOOL_ROUNDS {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         anyhow::ensure!(!remaining.is_zero(), "AI 工具调用总期限已到");
@@ -361,17 +478,9 @@ impl ApplicationRuntime {
                                         "模型「{}」不接受图片输入，已去掉图片重试一次纯文本：{error:#}",
                                         vision_model
                                     );
-                                    session = crate::config::ai::ToolSession::with_history_options(
-                                        &self.business.ai_connection,
-                                        &crate::config::ai::AiCallOptions {
-                                            model: config.model.clone(),
-                                            reasoning: config.reasoning,
-                                        },
-                                        &ai_chat::response_system_prompt(&config),
-                                        ai_chat::conversation_history(&context),
-                                        &prompt,
-                                        tools.clone(),
-                                    )?;
+                                    // 保留已 append 的工具调用/结果，只剥离当前 user 图片。
+                                    session.drop_image();
+                                    vision_image = None;
                                     session.request(
                                         &self.business.ai_chat_openai,
                                         config.max_tokens,
@@ -406,11 +515,28 @@ impl ApplicationRuntime {
                         for call in response.calls {
                             let outcome = if call.name == ai_chat::LOOK_TOOL {
                                 match ai_chat::parse_look_arguments(&call.arguments) {
-                                    Ok(instruction) => self.run_ai_chat_look(
-                                        &config,
-                                        instruction.as_deref(),
-                                        remaining,
-                                    ),
+                                    Ok(instruction) => {
+                                        let key = instruction.clone().unwrap_or_default();
+                                        if !ai_chat::look_quota_allows(
+                                            looked,
+                                            &looked_instructions,
+                                            &key,
+                                        ) {
+                                            serde_json::json!({
+                                                "status":"rejected",
+                                                "reason":"同一回答内 look 最多 2 次且不得重复"
+                                            })
+                                        } else {
+                                            looked += 1;
+                                            looked_instructions.insert(key);
+                                            self.run_ai_chat_look(
+                                                &config,
+                                                instruction.as_deref(),
+                                                deadline,
+                                                vision_image.as_ref(),
+                                            )
+                                        }
+                                    }
                                     Err(_) => serde_json::json!({
                                         "status":"rejected",
                                         "reason":"look 参数不符合工具 Schema"
@@ -425,20 +551,10 @@ impl ApplicationRuntime {
                                         serde_json::json!({"status":"rejected","reason":"同一回答内禁止重复朗读相同文本"})
                                     }
                                     Ok((text, options)) => {
-                                        match self.business.tts.enqueue_with_options(
-                                            &tts_config,
-                                            &text,
-                                            options,
-                                        ) {
-                                            Ok(()) => {
-                                                spoken.insert(text);
-                                                serde_json::json!({"status":"handled","reason":"语音已入队"})
-                                            }
-                                            Err(error) => serde_json::json!({
-                                                "status":"rejected",
-                                                "reason": format!("语音不可用：{error}")
-                                            }),
-                                        }
+                                        // 先记下，等文字回复发送后再入队，避免语音抢在文字前。
+                                        spoken.insert(text.clone());
+                                        pending_speaks.push((text, options));
+                                        serde_json::json!({"status":"queued","reason":"语音已排队，将在文字回复后播放"})
                                     }
                                     Err(_) => serde_json::json!({
                                         "status":"rejected",
@@ -522,6 +638,14 @@ impl ApplicationRuntime {
                     let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
                     // 发送失败或仅部分发送时，不把完整回答写入下一轮会话。
                     self.reply_batch(&refs, 0)?;
+                    // 文字回复已发送后再入队语音，保证顺序。
+                    for (text, options) in pending_speaks.drain(..) {
+                        if let Err(error) =
+                            self.business.tts.enqueue_with_options(&tts_config, &text, options)
+                        {
+                            log::warn!("AI 语音入队失败（文字回复已发送）：{error}");
+                        }
+                    }
                     // 历史存原始 JSON：模型在 few-shot 里看到「上一轮就是这种格式」，
                     // 才会继续按格式输出；存渲染后的散文会让它以为自由文本也可以。
                     self.business.ai_chat_memory.record_turn(
@@ -1304,6 +1428,40 @@ mod tests {
         assert!(!is_image_rejection(&anyhow::anyhow!(
             "HTTP 400 missing api key"
         )));
+    }
+
+    #[test]
+    fn vision_navigation_budget_is_bounded_and_deadline_aware() {
+        assert!(
+            crate::features::ai_chat::VISION_NAVIGATION_TIMEOUT_MS >= 5_000,
+            "导航/返回预算不少于 5s"
+        );
+        let full = vision_navigation_budget(None);
+        assert_eq!(
+            full,
+            Duration::from_millis(crate::features::ai_chat::VISION_NAVIGATION_TIMEOUT_MS)
+        );
+        let far = Instant::now() + Duration::from_secs(30);
+        assert_eq!(vision_navigation_budget(Some(far)), full);
+        let near = Instant::now() + Duration::from_millis(50);
+        let budget = vision_navigation_budget(Some(near));
+        assert!(budget <= Duration::from_millis(50));
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(vision_navigation_budget(Some(past)).is_zero());
+    }
+
+    #[test]
+    fn vision_capture_failure_keeps_navigation_and_residency_state() {
+        let primary = VisionCapture::failed("截图失败", "Confirmed(Primary)", false);
+        assert!(primary.image.is_none());
+        assert!(!primary.navigated);
+        assert!(primary.residency.contains("Primary"));
+        assert!(primary.failure.is_some());
+
+        let secondary_return_failed =
+            VisionCapture::failed("返回驻守失败", "Failed", true);
+        assert!(secondary_return_failed.navigated);
+        assert_eq!(secondary_return_failed.residency, "Failed");
     }
 
     #[test]

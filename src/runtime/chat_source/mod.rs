@@ -124,9 +124,9 @@ pub(crate) fn resolve_sender_names(
     base_http_url: &str,
     token: &str,
     uid: &str,
-) -> anyhow::Result<(Option<String>, Option<String>)> {
+) -> anyhow::Result<SenderNames> {
     if uid.trim().is_empty() {
-        return Ok((None, None));
+        return Ok(SenderNames::none());
     }
     let url = format!(
         "{}/names?uids={}",
@@ -139,24 +139,37 @@ pub(crate) fn resolve_sender_names(
         .timeout(std::time::Duration::from_secs(1))
         .build()?;
     let response = client.get(url).header("x-miliastra-token", token).send()?;
-    if !response.status().is_success() {
-        // 503 game_not_connected 等都属于"暂时查不到"，不是致命错误。
+    if response.status() != reqwest::StatusCode::OK {
+        // 只有明确的 200 才写回名字/备注；503 等暂时失败一律保留旧值。
         log::debug!(
             "昵称补查未取到结果（HTTP 状态 {}），本次沿用已有昵称，不影响消息投递",
             response.status()
         );
-        return Ok((None, None));
+        return Ok(SenderNames::none());
     }
     let body: serde_json::Value = response.json()?;
     Ok(parse_sender_names(&body, uid.trim()))
 }
 
-/// 从 `/names` 的响应体里取出 (昵称, 备注)。
+/// `/names` 的解析结果。备注为空/缺失都只表示“本次没拿到”，不触发删除。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SenderNames {
+    pub(crate) name: Option<String>,
+    pub(crate) remark: Option<String>,
+}
+
+impl SenderNames {
+    pub(crate) fn none() -> Self {
+        Self::default()
+    }
+}
+
+/// 从 `/names` 的响应体里取出昵称、备注。
 ///
-/// 抽成纯函数是为了能单测：真机上 /names 的常见组合是
-/// `names:{uid:null}` 配 `remarks:{uid:"某备注"}`，两条字段各自可能缺失、
-/// 也可能是空串，这些形状必须钉住。
-fn parse_sender_names(body: &serde_json::Value, uid: &str) -> (Option<String>, Option<String>) {
+/// 真机上 /names 的常见组合是 `names:{uid:null}` 配 `remarks:{uid:"某备注"}`，
+/// 两条字段各自可能缺失、也可能是空串。备注只在有值时写回；空/缺失一律保留旧值，
+/// 删除只由 `/friends complete` 严格快照路径处理。
+fn parse_sender_names(body: &serde_json::Value, uid: &str) -> SenderNames {
     let read = |section: &str| {
         body.get(section)
             .and_then(|map| map.get(uid))
@@ -164,7 +177,129 @@ fn parse_sender_names(body: &serde_json::Value, uid: &str) -> (Option<String>, O
             .map(str::to_string)
             .filter(|text| !text.trim().is_empty())
     };
-    (read("names"), read("remarks"))
+    SenderNames {
+        name: read("names"),
+        remark: read("remarks"),
+    }
+}
+
+/// 一条好友快照条目（`GET /friends`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FriendEntry {
+    pub(crate) uid: u32,
+    pub(crate) name: Option<String>,
+    pub(crate) remark: Option<String>,
+    /// `remark` 字段存在（值可为 null）；缺失视为坏形状，防止代理裁剪后误清全部。
+    pub(crate) remark_present: bool,
+}
+
+/// `GET /friends` 的全量好友快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FriendSnapshot {
+    /// true = 全量快照，缺席者与 remark:null 都是权威结论；false = 只能增补。
+    pub(crate) complete: bool,
+    pub(crate) updated_at: Option<u64>,
+    pub(crate) friends: Vec<FriendEntry>,
+}
+
+/// 拉取 `/friends`：只有 HTTP 200 才解析；404 返回 `Ok(None)`（旧桥无此端点）。
+pub(crate) fn fetch_friends(
+    base_http_url: &str,
+    token: &str,
+) -> anyhow::Result<Option<FriendSnapshot>> {
+    let url = format!("{}/friends", base_http_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    let response = client.get(url).header("x-miliastra-token", token).send()?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if response.status() != reqwest::StatusCode::OK {
+        anyhow::bail!("/friends 返回 HTTP {}", response.status());
+    }
+    let body: serde_json::Value = response.json()?;
+    parse_friend_snapshot(&body).map(Some)
+}
+
+/// 解析 `/friends` 响应体；形状严格钉住（uid 必须是数字）。
+fn parse_friend_snapshot(body: &serde_json::Value) -> anyhow::Result<FriendSnapshot> {
+    if let Some(ok) = body.get("ok")
+        && ok.as_bool() != Some(true)
+    {
+        anyhow::bail!("/friends 的 ok 必须为 true");
+    }
+    let complete = body
+        .get("complete")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| anyhow::anyhow!("/friends 缺少 complete"))?;
+    let updated_at = match body.get("updatedAt") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("/friends.updatedAt 不是 uint64"))?,
+        ),
+    };
+    let count = match body.get("count") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("/friends.count 不是 uint64"))?,
+        ),
+    };
+    let rows = body
+        .get("friends")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow::anyhow!("/friends 缺少 friends 数组"))?;
+    let mut friends = Vec::with_capacity(rows.len());
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        let uid = row
+            .get("uid")
+            .and_then(|value| value.as_u64())
+            .and_then(|uid| u32::try_from(uid).ok())
+            .ok_or_else(|| anyhow::anyhow!("/friends.friends[].uid 不是 uint32"))?;
+        if complete && !seen.insert(uid) {
+            anyhow::bail!("/friends 全量快照的 UID 重复");
+        }
+        let name = parse_optional_friend_text(row.get("name"))?;
+        let remark_value = row
+            .get("remark")
+            .ok_or_else(|| anyhow::anyhow!("/friends.friends[].remark 字段缺失"))?;
+        let remark = parse_optional_friend_text(Some(remark_value))?;
+        friends.push(FriendEntry {
+            uid,
+            name,
+            remark,
+            remark_present: true,
+        });
+    }
+    if complete {
+        if updated_at.is_none() {
+            anyhow::bail!("/friends 全量快照缺少 updatedAt");
+        }
+        if count != Some(friends.len() as u64) {
+            anyhow::bail!("/friends 全量快照 count 与 friends 数量不一致");
+        }
+    }
+    Ok(FriendSnapshot {
+        complete,
+        updated_at,
+        friends,
+    })
+}
+
+fn parse_optional_friend_text(value: Option<&serde_json::Value>) -> anyhow::Result<Option<String>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => {
+            let text = text.trim();
+            Ok((!text.is_empty()).then(|| text.to_string()))
+        }
+        Some(_) => anyhow::bail!("/friends 名称/备注不是字符串或 null"),
+    }
 }
 
 /// `GET /health` 中与聊天接入判断直接相关的字段。
@@ -269,6 +404,94 @@ fn urlencode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn friends_snapshot_parses_complete_and_null_fields() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"ok":true,"complete":true,"updatedAt":1794070520,"count":3,
+                "friends":[
+                    {"uid":100000001,"name":"Alice","remark":"老板"},
+                    {"uid":100000002,"name":null,"remark":null},
+                    {"uid":100000003,"name":"Bob","remark":"  "}
+                ]}"#,
+        )
+        .unwrap();
+        let snapshot = parse_friend_snapshot(&body).unwrap();
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.updated_at, Some(1794070520));
+        assert_eq!(snapshot.friends.len(), 3);
+        assert_eq!(snapshot.friends[0].uid, 100000001);
+        assert_eq!(snapshot.friends[0].name.as_deref(), Some("Alice"));
+        assert_eq!(snapshot.friends[0].remark.as_deref(), Some("老板"));
+        assert_eq!(snapshot.friends[1].name, None);
+        assert_eq!(snapshot.friends[1].remark, None);
+        assert_eq!(snapshot.friends[2].remark, None, "空白备注按无备注");
+    }
+
+    #[test]
+    fn friends_snapshot_parses_incomplete_and_rejects_bad_shapes() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"ok":true,"complete":false,"updatedAt":null,"count":0,"friends":[]}"#,
+        )
+        .unwrap();
+        let snapshot = parse_friend_snapshot(&body).unwrap();
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.updated_at, None);
+        assert!(snapshot.friends.is_empty());
+
+        let bad_uid: serde_json::Value = serde_json::from_str(
+            r#"{"complete":true,"friends":[{"uid":"100000001","name":"A","remark":null}]}"#,
+        )
+        .unwrap();
+        assert!(parse_friend_snapshot(&bad_uid).is_err());
+        let bad_name: serde_json::Value = serde_json::from_str(
+            r#"{"complete":true,"friends":[{"uid":1,"name":1,"remark":null}]}"#,
+        )
+        .unwrap();
+        assert!(parse_friend_snapshot(&bad_name).is_err());
+        let missing_complete: serde_json::Value =
+            serde_json::from_str(r#"{"friends":[]}"#).unwrap();
+        assert!(parse_friend_snapshot(&missing_complete).is_err());
+    }
+
+    #[test]
+    fn friends_snapshot_complete_requires_count_updated_at_and_unique_uids() {
+        let no_updated: serde_json::Value = serde_json::from_str(
+            r#"{"complete":true,"count":1,"friends":[{"uid":1,"name":"A","remark":null}]}"#,
+        )
+        .unwrap();
+        assert!(parse_friend_snapshot(&no_updated).is_err());
+
+        let count_mismatch: serde_json::Value = serde_json::from_str(
+            r#"{"complete":true,"updatedAt":1,"count":2,"friends":[{"uid":1,"name":"A","remark":null}]}"#,
+        )
+        .unwrap();
+        assert!(parse_friend_snapshot(&count_mismatch).is_err());
+
+        let duplicate: serde_json::Value = serde_json::from_str(
+            r#"{"complete":true,"updatedAt":1,"count":2,"friends":[{"uid":1,"name":"A","remark":null},{"uid":1,"name":"B","remark":null}]}"#,
+        )
+        .unwrap();
+        assert!(parse_friend_snapshot(&duplicate).is_err());
+
+        let ok_false: serde_json::Value = serde_json::from_str(
+            r#"{"ok":false,"complete":false,"friends":[]}"#,
+        )
+        .unwrap();
+        assert!(parse_friend_snapshot(&ok_false).is_err());
+        let ok_string: serde_json::Value =
+            serde_json::from_str(r#"{"ok":"true","complete":false,"friends":[]}"#).unwrap();
+        assert!(parse_friend_snapshot(&ok_string).is_err());
+
+        let missing_remark: serde_json::Value = serde_json::from_str(
+            r#"{"complete":true,"updatedAt":1,"count":1,"friends":[{"uid":1,"name":"A"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            parse_friend_snapshot(&missing_remark).is_err(),
+            "remark 字段缺失是坏形状，不能当作显式 null"
+        );
+    }
+
     /// `/names` 的 remarks 解析：这个字段是本轮新接的，形状必须钉住。
     #[test]
     fn names_response_yields_remark_even_without_nickname() {
@@ -277,18 +500,18 @@ mod tests {
             r#"{"names":{"100000001":null},"remarks":{"100000001":"显示名甲"}}"#,
         )
         .unwrap();
-        let (name, remark) = parse_sender_names(&body, "100000001");
-        assert_eq!(name, None);
-        assert_eq!(remark.as_deref(), Some("显示名甲"));
+        let names = parse_sender_names(&body, "100000001");
+        assert_eq!(names.name, None);
+        assert_eq!(names.remark.as_deref(), Some("显示名甲"));
     }
 
     #[test]
     fn names_response_without_remarks_key_yields_none() {
         // 旧版 ChatBridge 没有 remarks 字段，必须当作「没有备注」而不是报错。
         let body: serde_json::Value = serde_json::from_str(r#"{"names":{"42":"玩家甲"}}"#).unwrap();
-        let (name, remark) = parse_sender_names(&body, "42");
-        assert_eq!(name.as_deref(), Some("玩家甲"));
-        assert_eq!(remark, None);
+        let names = parse_sender_names(&body, "42");
+        assert_eq!(names.name.as_deref(), Some("玩家甲"));
+        assert_eq!(names.remark, None);
     }
 
     #[test]
@@ -296,9 +519,9 @@ mod tests {
         // 空串等同于没有：不能把空串写进身份映射把占位键擦掉。
         let body: serde_json::Value =
             serde_json::from_str(r#"{"names":{"7":"   "},"remarks":{"7":""}}"#).unwrap();
-        let (name, remark) = parse_sender_names(&body, "7");
-        assert_eq!(name, None);
-        assert_eq!(remark, None);
+        let names = parse_sender_names(&body, "7");
+        assert_eq!(names.name, None);
+        assert_eq!(names.remark, None);
     }
 
     #[test]
@@ -306,9 +529,9 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(r#"{"names":{"1":"甲","2":"乙"},"remarks":{"1":"备注甲"}}"#)
                 .unwrap();
-        let (name, remark) = parse_sender_names(&body, "2");
-        assert_eq!(name.as_deref(), Some("乙"));
-        assert_eq!(remark, None);
+        let names = parse_sender_names(&body, "2");
+        assert_eq!(names.name.as_deref(), Some("乙"));
+        assert_eq!(names.remark, None);
     }
 
     use super::*;

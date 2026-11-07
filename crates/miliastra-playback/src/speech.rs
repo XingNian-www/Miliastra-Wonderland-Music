@@ -146,12 +146,26 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
             bytes[pos + 7],
         ]) as usize;
         let body_start = pos + 8;
-        let body_end = body_start.saturating_add(size);
-        if body_end > bytes.len() {
-            return Err(SpeechError::Decode(
-                "wav chunk is truncated".to_owned(),
-            ));
-        }
+        let declared_end = body_start.saturating_add(size);
+        // fish.audio 流式 WAV 会在 `data` chunk 里写占位长度（实测 0xFFFFFF00），
+        // 而实际数据在文件尾就结束。仅对 `data` 的“高位哨兵占位值”做
+        // “声明长度超过剩余字节 → 按实际剩余字节截断”的容错：
+        // - 其它 chunk（fmt 等）声明超长 → 仍严格报错；
+        // - data 声明一个正常但略大的长度（真实截断）→ 仍严格报错，不静默吞数据；
+        // - clamp 后还必须能组成整数帧且非空（见下方校验）。
+        // 注：RIFF 总长度字段当前不参与校验，因此同一占位值不会造成误判。
+        const STREAMING_SIZE_SENTINEL: usize = 0x7FFF_FF00;
+        let body_end = if declared_end > bytes.len() {
+            if id == b"data" && size >= STREAMING_SIZE_SENTINEL {
+                bytes.len()
+            } else {
+                return Err(SpeechError::Decode(
+                    "wav chunk is truncated".to_owned(),
+                ));
+            }
+        } else {
+            declared_end
+        };
         let body = &bytes[body_start..body_end];
         if id == b"fmt " {
             if body.len() < 16 {
@@ -180,24 +194,35 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
             "wav has invalid channels/sample_rate".to_owned(),
         ));
     }
-    let samples = match (audio_format, bits) {
-        (1, 16) => data
-            .chunks_exact(2)
-            .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
-            .collect::<Vec<_>>(),
-        (3, 32) => data
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect::<Vec<_>>(),
+    let (samples, bytes_per_sample) = match (audio_format, bits) {
+        (1, 16) => (
+            data.chunks_exact(2)
+                .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
+                .collect::<Vec<_>>(),
+            2usize,
+        ),
+        (3, 32) => (
+            data.chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<_>>(),
+            4usize,
+        ),
         (format, bits) => {
             return Err(SpeechError::UnsupportedFormat(format!(
                 "wav audio_format={format}, bits={bits} not supported (need PCM16 or F32)"
             )))
         }
     };
-    if samples.len() % usize::from(channels) != 0 {
+    // 真实截断的严格边界：剩余数据必须能组成整数个帧（不能靠 clamp 静默吞掉半帧）。
+    let frame_size = usize::from(channels) * bytes_per_sample;
+    if data.len() % frame_size != 0 {
         return Err(SpeechError::Decode(
-            "wav data length is not a multiple of channels".to_owned(),
+            "wav data length is not a whole number of frames".to_owned(),
+        ));
+    }
+    if samples.is_empty() {
+        return Err(SpeechError::Decode(
+            "wav contains no audio frames".to_owned(),
         ));
     }
     Ok(PcmAudio {
@@ -774,6 +799,87 @@ mod tests {
         assert!((decoded.samples[1] - 1.0).abs() < 1e-4);
         assert!((decoded.samples[2] + 1.0).abs() < 1e-4);
         assert!((decoded.samples[3] - 0.5).abs() < 1e-4);
+    }
+
+    /// 构造只含标准 44 字节头 + 指定 data 声明长度的 WAV（payload 由调用方追加）。
+    fn wav_header_with_data_size(
+        sample_rate: u32,
+        data_size: u32,
+        channels: u16,
+        bits: u16,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&data_size.wrapping_add(36).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&channels.to_le_bytes());
+        out.extend_from_slice(&sample_rate.to_le_bytes());
+        let block_align = u32::from(channels) * u32::from(bits / 8);
+        out.extend_from_slice(&(sample_rate * block_align).to_le_bytes());
+        out.extend_from_slice(&(block_align as u16).to_le_bytes());
+        out.extend_from_slice(&bits.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_size.to_le_bytes());
+        out
+    }
+
+    /// fish 流式 WAV：data 声明 0xFFFFFF00，实际 466,944 字节（44.1kHz mono PCM16）。
+    /// RIFF 总长度也写成占位值，确认当前实现不依赖它。
+    #[test]
+    fn streaming_data_size_placeholder_is_clamped_to_actual_bytes() {
+        let frames = 233_472usize; // 466,944 bytes / 2
+        let mut payload = Vec::with_capacity(frames * 2);
+        for index in 0..frames {
+            payload.extend_from_slice(&((index % 30_000) as i16).to_le_bytes());
+        }
+        let mut bytes = wav_header_with_data_size(44_100, 0xFFFF_FF00, 1, 16);
+        bytes[4..8].copy_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        assert_eq!(bytes.len(), 44 + 466_944);
+
+        let pcm = decode_wav(&bytes).unwrap();
+        assert_eq!(pcm.sample_rate, 44_100);
+        assert_eq!(pcm.channels, 1);
+        assert_eq!(pcm.samples.len(), frames);
+        assert!((pcm.samples[0]).abs() < 1e-6);
+    }
+
+    /// clamp 只允许“剩余字节能组成整数帧”；半帧属于真实截断，必须继续失败。
+    #[test]
+    fn streaming_placeholder_with_partial_frame_is_still_rejected() {
+        let mut bytes = wav_header_with_data_size(16_000, 0xFFFF_FF00, 1, 16);
+        bytes.extend_from_slice(&[0x01, 0x02, 0x03]);
+        assert!(matches!(decode_wav(&bytes), Err(SpeechError::Decode(_))));
+    }
+
+    #[test]
+    fn streaming_placeholder_without_audio_frames_is_rejected() {
+        let bytes = wav_header_with_data_size(16_000, 0xFFFF_FF00, 1, 16);
+        assert!(matches!(decode_wav(&bytes), Err(SpeechError::Decode(_))));
+    }
+
+    /// 非 data chunk 的声明长度超过剩余字节仍严格报错，不被 clamp 掩盖。
+    #[test]
+    fn non_data_chunk_truncation_is_still_strict() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]); // 声明 16，只剩 8
+        assert!(matches!(decode_wav(&bytes), Err(SpeechError::Decode(_))));
+    }
+
+    /// data 声明一个正常但略大的长度（真实截断）仍严格失败，不按 clamp 静默接受。
+    #[test]
+    fn data_chunk_real_truncation_is_still_rejected() {
+        let mut bytes = wav_header_with_data_size(16_000, 1_000, 1, 16);
+        bytes.extend_from_slice(&[0u8; 900]); // 声明 1000，实际 900（整帧但确实不足）
+        assert!(matches!(decode_wav(&bytes), Err(SpeechError::Decode(_))));
     }
 
     #[test]

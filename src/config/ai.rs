@@ -1345,6 +1345,8 @@ pub(crate) struct ImageAttachment {
     bytes: Vec<u8>,
     width: u32,
     height: u32,
+    /// 只随本张图附带的上下文（如备注↔昵称对照）；普通文字轮次不会看到。
+    context: Option<String>,
 }
 
 impl fmt::Debug for ImageAttachment {
@@ -1364,7 +1366,17 @@ impl ImageAttachment {
             bytes,
             width,
             height,
+            context: None,
         }
+    }
+
+    pub(crate) fn with_context(mut self, context: Option<String>) -> Self {
+        self.context = context.filter(|context| !context.trim().is_empty());
+        self
+    }
+
+    pub(crate) fn context(&self) -> Option<&str> {
+        self.context.as_deref()
     }
 
     pub(crate) fn width(&self) -> u32 {
@@ -1548,10 +1560,14 @@ impl ToolSession {
         }
         if let Some(image) = &self.image {
             let text = item["content"].as_str().unwrap_or_default().to_string();
-            item["content"] = serde_json::json!([
-                {"type": "input_text", "text": text},
-                {"type": "input_image", "image_url": image.data_url()},
-            ]);
+            let mut content = vec![
+                serde_json::json!({"type": "input_text", "text": text}),
+                serde_json::json!({"type": "input_image", "image_url": image.data_url()}),
+            ];
+            if let Some(context) = image.context() {
+                content.push(serde_json::json!({"type": "input_text", "text": context}));
+            }
+            item["content"] = serde_json::Value::Array(content);
         }
         items
     }
@@ -1570,10 +1586,14 @@ impl ToolSession {
         }
         if let Some(image) = &self.image {
             let text = item["content"].as_str().unwrap_or_default().to_string();
-            item["content"] = serde_json::json!([
-                {"type": "text", "text": text},
-                {"type": "image_url", "image_url": {"url": image.data_url()}},
-            ]);
+            let mut content = vec![
+                serde_json::json!({"type": "text", "text": text}),
+                serde_json::json!({"type": "image_url", "image_url": {"url": image.data_url()}}),
+            ];
+            if let Some(context) = image.context() {
+                content.push(serde_json::json!({"type": "text", "text": context}));
+            }
+            item["content"] = serde_json::Value::Array(content);
         }
         messages
     }
@@ -2775,6 +2795,36 @@ mod tests {
                 }),
                 "去图不能丢工具结果"
             );
+        }
+    }
+
+    #[test]
+    fn image_context_is_only_attached_with_the_image_and_removed_on_drop() {
+        let context = "在图片中,昵称与身份对照关系如下\n- 「备注A」是「显示A」";
+        for wire in [WireApi::Responses, WireApi::ChatCompletions] {
+            let mut config = config("openai");
+            config.wire_api = wire;
+            let mut session = ToolSession::with_history_options_and_image(
+                &config,
+                &AiCallOptions::new(""),
+                "Persona",
+                Vec::new(),
+                "Current question",
+                Vec::new(),
+                Some(image_attachment().with_context(Some(context.to_string()))),
+            )
+            .unwrap();
+            let body = session_body(&session, false);
+            let serialized = body.to_string();
+            assert!(serialized.contains("昵称与身份对照"), "带图消息应含上下文");
+            assert_eq!(
+                serialized.matches("昵称与身份对照").count(),
+                1,
+                "对照只应出现一次"
+            );
+            session.drop_image();
+            let without = session_body(&session, false).to_string();
+            assert!(!without.contains("昵称与身份对照"), "去图后不能残留对照");
         }
     }
 

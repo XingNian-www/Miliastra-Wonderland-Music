@@ -46,6 +46,10 @@ const NAME_CACHE_TTL_MS: u64 = 600_000;
 /// 只在"有人说话"时才查会漏掉从不说话的好友，所以另外按身份映射表定期扫一遍。
 /// 真正的去重仍由 prime_name_lookup 的冷却窗口负责，这里只决定多久看一次表。
 const NAME_PRIME_INTERVAL: Duration = Duration::from_secs(60);
+/// 全量好友快照的轮询间隔；与 ChatBridge 的 60 秒全量重发对齐。
+const FRIENDS_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
+/// 快照新鲜期略小于 60s，避免与 `/names` 轮询相位锁死后一直跳过。
+const FRIENDS_SNAPSHOT_FRESH_MS: u64 = 45_000;
 
 /// 主动补查里"还缺真实昵称"的账号重试间隔。
 ///
@@ -103,6 +107,10 @@ struct ExternalChatInner {
     host_boot_id: std::sync::Mutex<Option<u64>>,
     /// 是否已经用掉"首次遇到一级聊天界面时自动切二级"的机会。
     initial_secondary_switch_done: AtomicBool,
+    /// 最近一次**完整** `/friends` 快照写入身份映射的时间（毫秒）；0=从未。
+    friends_snapshot_at_ms: AtomicU64,
+    /// 旧桥 404 只 debug 一次。
+    friends_unsupported: AtomicBool,
 }
 
 /// 一次补查的结果。
@@ -346,6 +354,24 @@ impl ExternalChatState {
         (seen > 0).then(|| now_millis().saturating_sub(seen))
     }
 
+    /// 完整好友快照成功应用后标记；60 秒内优先信快照，跳过逐 UID `/names` 轮询。
+    fn mark_friends_snapshot(&self) {
+        self.inner
+            .friends_snapshot_at_ms
+            .store(now_millis(), Ordering::Release);
+    }
+
+    /// 最近是否有一份完整好友快照覆盖当前 60 秒窗口。
+    fn friends_snapshot_recent(&self) -> bool {
+        let at = self.inner.friends_snapshot_at_ms.load(Ordering::Acquire);
+        at > 0 && now_millis().saturating_sub(at) < FRIENDS_SNAPSHOT_FRESH_MS
+    }
+
+    /// 旧桥无 `/friends` 时只记一次 debug。
+    fn mark_friends_unsupported(&self) -> bool {
+        !self.inner.friends_unsupported.swap(true, Ordering::AcqRel)
+    }
+
     /// 首次连接时建立启动水位；已有水位则不动（重连场景）。
     pub(crate) fn establish_watermark(&self, sequence: u64) {
         if !self.inner.watermark_set.swap(true, Ordering::AcqRel) {
@@ -514,6 +540,14 @@ fn run(
     // 消息驱动的补查只覆盖"说过话的人"。再开一个扫描线程按身份映射表主动补，
     // 尽量把从不说话的好友的真实昵称也拿到。
     spawn_name_priming(state.clone(), identity_access.clone(), names.clone());
+    spawn_friends_snapshot(
+        state.clone(),
+        http_base.clone(),
+        config.token.clone(),
+        identity_access.clone(),
+        config_store.clone(),
+        live_configs.clone(),
+    );
     loop {
         // 登录器角色：Miliastra-Wonderland-ChatBridge 没在监听时替用户拉起来。
         // 探测很便宜（300ms 超时），每次重连都试一次，这样用户中途关掉也能被重新拉起。
@@ -735,6 +769,21 @@ fn run(
     }
 }
 
+/// 身份持久化的进程级串行锁。
+///
+/// `persist_identity` 被消息投递自动建身份、`/names` 补查、`/friends` 三个线程调用。
+/// 旧实现先在锁外 snapshot，再取 store 锁保存；两个线程交错时旧快照可能覆盖新值。
+/// 现在锁内 snapshot + sync + save，保证写入的一定是当前最新快照。
+static IDENTITY_PERSIST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn identity_persist_guard() -> std::sync::MutexGuard<'static, ()> {
+    IDENTITY_PERSIST_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// 把内存里的身份映射整体写回配置库的 `identity` 段。
 ///
 /// 自动为好友 UID 建身份时调用。不写库的话，这条映射只活在当前进程：
@@ -747,6 +796,7 @@ fn persist_identity(
     live_configs: &crate::config::LiveConfigs,
     identity: &crate::features::identity::IdentityAccess,
 ) -> anyhow::Result<()> {
+    let _persist_guard = identity_persist_guard();
     let snapshot = identity.snapshot();
     // 写库之后必须同步 effective 快照。
     //
@@ -865,7 +915,17 @@ fn deliver(
                     resolved.real_nickname.trim().is_empty()
                         || resolved.remark.trim().is_empty()
                 });
-            if state.prime_name_lookup(uid.as_str(), incomplete) {
+            let covered_by_recent_snapshot = state.friends_snapshot_recent()
+                && identity_access
+                    .as_ref()
+                    .and_then(|identity| {
+                        identity.resolve_account(
+                            miliastra_kernel::chat_source::GAME_GENSHIN,
+                            uid.as_str(),
+                        )
+                    })
+                    .is_some_and(|resolved| !resolved.real_nickname.trim().is_empty());
+            if !covered_by_recent_snapshot && state.prime_name_lookup(uid.as_str(), incomplete) {
                 lookups.push(uid.as_str().to_string());
             }
         }
@@ -915,6 +975,169 @@ fn needs_greedy_name_refresh(mapping: &crate::features::identity::IdentityMappin
         || !mapping.remark_from_chatbridge
 }
 
+/// 好友快照应用结果；不打印 UID/昵称/备注，只用于计数。
+#[derive(Default)]
+struct FriendApplyStats {
+    changed: bool,
+    /// 快照里命中已登记身份的数量。
+    matched: usize,
+    /// 快照里未登记、按约定不自动创建的数量。
+    skipped_unregistered: usize,
+    /// complete=true 时被清理旧备注的已有映射数量。
+    cleared_absent: usize,
+}
+
+/// 把 `/friends` 全量快照应用到身份映射；不自动创建未登记 UID。
+///
+/// - 已登记 UID：name 非空写 real_nickname；remark 有值覆盖 remark。
+/// - 清除只按 **identity UUID 聚合**，且仅在 complete=true：
+///   * 只看该身份的 Genshin 账号；没有 Genshin 账号的映射完全跳过；
+///   * 任一账号 remark 有值 → 保留；
+///   * 所有 Genshin 账号都缺席，或全部出现且都 remark=null → 清缓存 remark；
+///   * 只有 `remark_from_chatbridge=true` 的缓存值会被清，手填/随机键保留。
+/// - complete=false：只更新列表内条目，绝不清理。
+fn apply_friend_snapshot(
+    identity: &crate::features::identity::IdentityAccess,
+    snapshot: &crate::runtime::chat_source::FriendSnapshot,
+) -> FriendApplyStats {
+    let game = miliastra_kernel::chat_source::GAME_GENSHIN;
+    let mut stats = FriendApplyStats::default();
+    let mut by_uid: std::collections::HashMap<String, &crate::runtime::chat_source::FriendEntry> =
+        std::collections::HashMap::new();
+    for friend in &snapshot.friends {
+        by_uid.insert(friend.uid.to_string(), friend);
+        let uid = friend.uid.to_string();
+        if identity.resolve_account(game, &uid).is_none() {
+            stats.skipped_unregistered += 1;
+            continue;
+        }
+        stats.matched += 1;
+        if let Some(name) = friend.name.as_deref()
+            && identity.record_real_nickname(game, &uid, name)
+        {
+            stats.changed = true;
+        }
+        if let Some(remark) = friend.remark.as_deref()
+            && identity.set_account_remark(game, &uid, remark)
+        {
+            stats.changed = true;
+        }
+    }
+    // 坏快照/跨账号护栏：本次没有任何已登记好友命中时（例如桥连了另一个号、
+    // 空列表或全是不认识的人），只增补，绝不按“缺席”清任何身份。
+    if !snapshot.complete || stats.matched == 0 {
+        return stats;
+    }
+    for mapping in identity.snapshot().mappings {
+        if mapping.role != crate::features::identity::IdentityRole::Friend {
+            // Owner/Admin 永不因好友快照被自动清缓存。
+            continue;
+        }
+        let genshin_accounts: Vec<String> = mapping
+            .accounts
+            .iter()
+            .filter(|account| account.game.eq_ignore_ascii_case(game))
+            .map(|account| account.uid.trim().to_string())
+            .filter(|uid| !uid.is_empty())
+            .collect();
+        if genshin_accounts.is_empty() {
+            // 没有 Genshin 账号的身份不归这份快照管。
+            continue;
+        }
+        let mut present = 0usize;
+        let mut absent = 0usize;
+        let mut all_present_explicit_null = true;
+        for uid in &genshin_accounts {
+            match by_uid.get(uid) {
+                Some(friend) => {
+                    present += 1;
+                    // 只有字段存在且显式为 null 才算“明确无备注”；
+                    // remark 有值或字段缺失都视为不可清。
+                    if !friend.remark_present || friend.remark.is_some() {
+                        all_present_explicit_null = false;
+                    }
+                }
+                None => absent += 1,
+            }
+        }
+        let all_absent = present == 0;
+        let all_present_without_remark =
+            absent == 0 && present > 0 && all_present_explicit_null;
+        if (all_absent || all_present_without_remark)
+            && identity.clear_remark_for_identity(mapping.id)
+        {
+            stats.cleared_absent += 1;
+            stats.changed = true;
+        }
+    }
+    stats
+}
+
+/// 每 60 秒拉一次全量好友快照。
+///
+/// 成功且 complete=true 时，60 秒内标记为“快照新鲜”，主动 `/names` 轮询会跳过，
+/// 避免全量快照与逐 UID 补查同时高频请求；404 只 debug 一次并继续保留 `/names` 兜底。
+fn spawn_friends_snapshot(
+    state: ExternalChatState,
+    http_base: String,
+    token: String,
+    identity_access: Option<crate::features::identity::IdentityAccess>,
+    config_store: Option<crate::config::SharedConfigStore>,
+    live_configs: crate::config::LiveConfigs,
+) {
+    let Some(identity) = identity_access else {
+        return;
+    };
+    let spawned = thread::Builder::new()
+        .name("external-chat-friends".into())
+        .spawn(move || loop {
+            match crate::runtime::chat_source::fetch_friends(&http_base, &token) {
+                Ok(Some(snapshot)) => {
+                    let stats = apply_friend_snapshot(&identity, &snapshot);
+                    if snapshot.complete {
+                        state.mark_friends_snapshot();
+                    }
+                    if stats.changed
+                        && let Some(store) = config_store.as_ref()
+                        && let Err(error) = persist_identity(store, &live_configs, &identity)
+                    {
+                        log::warn!(
+                            "好友快照已更新身份映射，但未能写入配置库（步骤：全量好友快照同步）；本次运行内仍生效，配置重载后会被旧值覆盖：{error:#}"
+                        );
+                    }
+                    if snapshot.complete {
+                        log::debug!(
+                            "全量好友快照已应用：命中 {} 条，未登记跳过 {} 条，清理缺席映射 {} 条",
+                            stats.matched,
+                            stats.skipped_unregistered,
+                            stats.cleared_absent
+                        );
+                    } else {
+                        log::debug!(
+                            "增量好友快照已增补：命中 {} 条，未登记跳过 {} 条",
+                            stats.matched,
+                            stats.skipped_unregistered
+                        );
+                    }
+                }
+                Ok(None) => {
+                    if state.mark_friends_unsupported() {
+                        log::debug!(
+                            "ChatBridge 没有 /friends 端点（旧版），继续使用 /names 逐 UID 补查兜底"
+                        );
+                    }
+                }
+                Err(error) => {
+                    log::debug!("好友快照拉取失败，本次不写回身份映射：{error}");
+                }
+            }
+            thread::sleep(FRIENDS_SNAPSHOT_INTERVAL);
+        });
+    if let Err(error) = spawned {
+        log::warn!("启动好友快照线程失败，本次运行继续用 /names 兜底：{error}");
+    }
+}
+
 /// 按身份映射表定期扫描，把还没拿到名字的账号排进补查队列。
 ///
 /// 消息驱动的补查只在有人说话时发生，从不说话的好友永远拿不到真实昵称；
@@ -931,6 +1154,11 @@ fn spawn_name_priming(
         .name("external-chat-names-prime".into())
         .spawn(move || {
             loop {
+                // 完整好友快照 60 秒内已覆盖名字信息：跳过逐 UID 轮询，避免双频请求。
+                if state.friends_snapshot_recent() {
+                    thread::sleep(NAME_PRIME_INTERVAL);
+                    continue;
+                }
                 // 先扫一遍再睡：启动后立刻补，不用等一个间隔。
                 let config = identity_access.snapshot();
                 let mut queued = 0usize;
@@ -963,6 +1191,31 @@ fn spawn_name_priming(
 
 /// 接收线程只负责把缺昵称的 UID 丢进来；这里串行发请求（单次上限 1s），
 /// 结果写回缓存。同一个 UID 只查一次，之后同发送者的消息直接复用。
+/// 把一次成功的 `/names` 结果写进身份映射；失败路径不会调用，因此不会误清备注。
+fn apply_sender_names(
+    identity: &crate::features::identity::IdentityAccess,
+    uid: &str,
+    names: &crate::runtime::chat_source::SenderNames,
+) -> bool {
+    let mut changed = false;
+    if let Some(name) = names.name.as_deref() {
+        changed |= identity.record_real_nickname(
+            miliastra_kernel::chat_source::GAME_GENSHIN,
+            uid,
+            name,
+        );
+    }
+    // `/names` 只写不删：remark 为空/缺失都不清缓存，删除只由 `/friends complete` 做。
+    if let Some(remark) = names.remark.as_deref() {
+        changed |= identity.set_account_remark(
+            miliastra_kernel::chat_source::GAME_GENSHIN,
+            uid,
+            remark,
+        );
+    }
+    changed
+}
+
 fn spawn_name_resolver(
     state: ExternalChatState,
     http_base: String,
@@ -977,12 +1230,16 @@ fn spawn_name_resolver(
         .spawn(move || {
             for uid in receiver {
                 match crate::runtime::chat_source::resolve_sender_names(&http_base, &token, &uid) {
-                    Ok((name, remark)) => {
-                        state.finish_name_lookup(&uid, name.as_deref(), remark.as_deref());
+                    Ok(names) => {
+                        state.finish_name_lookup(
+                            &uid,
+                            names.name.as_deref(),
+                            names.remark.as_deref(),
+                        );
                         // 备注也要进 UID 缓存：names 为 null、remark 有值是常见组合，
                         // 这时只缓存昵称的话，按备注名反查 UID（歌单归属）会落空。
-                        state.remember_uid(name.as_deref(), Some(&uid));
-                        state.remember_uid(remark.as_deref(), Some(&uid));
+                        state.remember_uid(names.name.as_deref(), Some(&uid));
+                        state.remember_uid(names.remark.as_deref(), Some(&uid));
                         // 三个名字各写各的字段，**互不覆盖**：
                         //   names   → real_nickname（玩家自设昵称，只做展示/搜索兜底）
                         //   remarks → remark（游戏内好友备注 = 屏幕显示名 = OCR 匹配键）
@@ -995,22 +1252,7 @@ fn spawn_name_resolver(
                         //
                         // 不打印 UID / 备注 / 昵称：三者都是真实玩家数据（MUST_READ §9）。
                         if let Some(identity) = identity_access.as_ref() {
-                            let mut changed = false;
-                            if let Some(name) = name.as_deref() {
-                                changed |=
-                                    identity.record_real_nickname(
-                                        miliastra_kernel::chat_source::GAME_GENSHIN,
-                                        &uid,
-                                        name,
-                                    );
-                            }
-                            if let Some(remark) = remark.as_deref() {
-                                changed |= identity.set_account_remark(
-                                    miliastra_kernel::chat_source::GAME_GENSHIN,
-                                    &uid,
-                                    remark,
-                                );
-                            }
+                            let changed = apply_sender_names(identity, &uid, &names);
                             if changed
                                 && let Some(store) = config_store.as_ref()
                                 && let Err(error) =
@@ -1021,7 +1263,7 @@ fn spawn_name_resolver(
                                 );
                             }
                         }
-                        if remark.is_some() {
+                        if names.remark.is_some() {
                             log::debug!("备注补查命中，已用好友备注覆盖该账号的屏幕匹配名");
                         }
                     }
@@ -1449,6 +1691,310 @@ mod tests {
         assert!(needs_greedy_name_refresh(&mapping("", "真名甲", true)));
         // 备注串还是随机占位（没被聊天桥确认过）：玩家可能刚在游戏里设上备注。
         assert!(needs_greedy_name_refresh(&mapping("abcd1234", "真名甲", false)));
+    }
+
+    fn identity_with_remark(uid: &str) -> crate::features::identity::IdentityAccess {
+        let mut config = crate::features::identity::IdentityConfig::default();
+        config
+            .mappings
+            .push(crate::features::identity::IdentityMapping {
+                remark: "旧备注".to_string(),
+                id: uuid::Uuid::new_v4(),
+                role: crate::features::identity::IdentityRole::Friend,
+                display_name: "显示甲".to_string(),
+                real_nickname: "真实甲".to_string(),
+                remark_from_chatbridge: true,
+                accounts: vec![crate::features::identity::GameAccount::new(uid)],
+            });
+        crate::features::identity::IdentityAccess::new(config)
+    }
+
+    #[test]
+    fn friends_snapshot_apply_only_updates_existing_and_clears_absent_on_complete() {
+        let mut config = crate::features::identity::IdentityConfig::default();
+        for (uid, remark, real) in [
+            ("10001", "旧备注甲", "旧真名甲"),
+            ("10002", "旧备注乙", "旧真名乙"),
+        ] {
+            config
+                .mappings
+                .push(crate::features::identity::IdentityMapping {
+                    remark: remark.to_string(),
+                    id: uuid::Uuid::new_v4(),
+                    role: crate::features::identity::IdentityRole::Friend,
+                    display_name: String::new(),
+                    real_nickname: real.to_string(),
+                    remark_from_chatbridge: true,
+                    accounts: vec![crate::features::identity::GameAccount::new(uid)],
+                });
+        }
+        let identity = crate::features::identity::IdentityAccess::new(config);
+        let snapshot = crate::runtime::chat_source::FriendSnapshot {
+            complete: true,
+            updated_at: Some(1),
+            friends: vec![
+                crate::runtime::chat_source::FriendEntry {
+                    uid: 10001,
+                    name: Some("新真名甲".to_string()),
+                    remark: Some("新备注甲".to_string()),
+                    remark_present: true,
+                },
+                crate::runtime::chat_source::FriendEntry {
+                    uid: 99999,
+                    name: Some("未登记".to_string()),
+                    remark: Some("不会创建".to_string()),
+                    remark_present: true,
+                },
+            ],
+        };
+        let stats = apply_friend_snapshot(&identity, &snapshot);
+        assert!(stats.changed);
+        assert_eq!(stats.matched, 1);
+        assert_eq!(stats.skipped_unregistered, 1);
+        assert_eq!(stats.cleared_absent, 1);
+        let mappings = identity.snapshot().mappings;
+        assert_eq!(mappings.len(), 2, "不能自动创建未登记 UID");
+        let first = mappings
+            .iter()
+            .find(|mapping| mapping.accounts.iter().any(|account| account.uid == "10001"))
+            .unwrap();
+        assert_eq!(first.real_nickname, "新真名甲");
+        assert_eq!(first.remark, "新备注甲");
+        let absent = mappings
+            .iter()
+            .find(|mapping| mapping.accounts.iter().any(|account| account.uid == "10002"))
+            .unwrap();
+        assert!(absent.remark.is_empty(), "complete 快照缺席者清备注");
+        assert_eq!(absent.real_nickname, "旧真名乙", "保留真实昵称/身份");
+        assert!(!identity
+            .ai_name_pairs()
+            .iter()
+            .any(|pair| pair.left() == "旧备注乙"));
+
+        // complete=false：列表内 remark:null 也不清，缺席者更不动。
+        let identity = identity_with_remark("10003");
+        let incomplete = crate::runtime::chat_source::FriendSnapshot {
+            complete: false,
+            updated_at: None,
+            friends: vec![crate::runtime::chat_source::FriendEntry {
+                uid: 10003,
+                name: None,
+                remark: None,
+                remark_present: true,
+            }],
+        };
+        assert!(!apply_friend_snapshot(&identity, &incomplete).changed);
+        assert_eq!(identity.snapshot().mappings[0].remark, "旧备注");
+    }
+
+    #[test]
+    fn friends_snapshot_clears_by_identity_uuid_and_preserves_handfilled() {
+        use crate::features::identity::{
+            GameAccount, IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
+        };
+        use crate::runtime::chat_source::{FriendEntry, FriendSnapshot};
+        let mut config = IdentityConfig::default();
+        let mut index = 0usize;
+        let mut push = |accounts: Vec<GameAccount>, remark: &str, flag: bool| {
+            let current = index;
+            index += 1;
+            config.mappings.push(IdentityMapping {
+                remark: remark.to_string(),
+                id: uuid::Uuid::new_v4(),
+                role: IdentityRole::Friend,
+                display_name: String::new(),
+                real_nickname: String::new(),
+                remark_from_chatbridge: flag,
+                accounts,
+            });
+            current
+        };
+        let multi = push(
+            vec![GameAccount::new("30001"), GameAccount::new("30002")],
+            "旧缓存甲",
+            true,
+        );
+        let null_only = push(vec![GameAccount::new("30003")], "旧缓存乙", true);
+        let other_game = push(
+            vec![GameAccount {
+                game: "starrail".to_string(),
+                uid: "30004".to_string(),
+            }],
+            "旧缓存丙",
+            true,
+        );
+        let no_accounts = push(Vec::new(), "旧缓存丁", true);
+        let handfilled = push(vec![GameAccount::new("30005")], "手填备注", false);
+        let missing_remark_field = push(vec![GameAccount::new("30007")], "旧缓存戊", true);
+        let owner = index;
+        config.mappings.push(IdentityMapping {
+            remark: "管理员缓存".to_string(),
+            id: uuid::Uuid::new_v4(),
+            role: IdentityRole::Owner,
+            display_name: String::new(),
+            real_nickname: String::new(),
+            remark_from_chatbridge: true,
+            accounts: vec![GameAccount::new("30006")],
+        });
+        let identity = IdentityAccess::new(config);
+        let ids: Vec<uuid::Uuid> = identity
+            .snapshot()
+            .mappings
+            .iter()
+            .map(|mapping| mapping.id)
+            .collect();
+        let snapshot = FriendSnapshot {
+            complete: true,
+            updated_at: Some(1),
+            friends: vec![
+                FriendEntry {
+                    uid: 30001,
+                    name: None,
+                    remark: Some("新缓存甲".to_string()),
+                    remark_present: true,
+                },
+                FriendEntry {
+                    uid: 30002,
+                    name: None,
+                    remark: None,
+                    remark_present: true,
+                },
+                FriendEntry {
+                    uid: 30003,
+                    name: None,
+                    remark: None,
+                    remark_present: true,
+                },
+                FriendEntry {
+                    uid: 30007,
+                    name: None,
+                    remark: None,
+                    remark_present: false,
+                },
+            ],
+        };
+        let stats = apply_friend_snapshot(&identity, &snapshot);
+        assert_eq!(stats.cleared_absent, 1, "只有全 null 的身份清缓存");
+        let mappings = identity.snapshot().mappings;
+        let multi = mappings.iter().find(|m| m.id == ids[multi]).unwrap();
+        assert_eq!(multi.remark, "新缓存甲", "一个账号有备注就保留");
+        let null_only = mappings.iter().find(|m| m.id == ids[null_only]).unwrap();
+        assert!(null_only.remark.is_empty(), "全部出现且都 null 才清");
+        assert_eq!(
+            mappings.iter().find(|m| m.id == ids[other_game]).unwrap().remark,
+            "旧缓存丙",
+            "其他游戏账号跳过"
+        );
+        assert_eq!(
+            mappings.iter().find(|m| m.id == ids[no_accounts]).unwrap().remark,
+            "旧缓存丁",
+            "无账号映射跳过"
+        );
+        assert_eq!(
+            mappings.iter().find(|m| m.id == ids[handfilled]).unwrap().remark,
+            "手填备注",
+            "手填备注保留"
+        );
+        assert_eq!(
+            mappings.iter().find(|m| m.id == ids[owner]).unwrap().remark,
+            "管理员缓存",
+            "Owner/Admin 永不自动清"
+        );
+        assert_eq!(
+            mappings.iter().find(|m| m.id == ids[missing_remark_field]).unwrap().remark,
+            "旧缓存戊",
+            "remark 字段缺失不得当 null 清"
+        );
+
+        // complete=false 即使全 null 也不清。
+        let identity = identity_with_remark("30003");
+        let incomplete = FriendSnapshot {
+            complete: false,
+            updated_at: None,
+            friends: vec![FriendEntry {
+                uid: 30003,
+                name: None,
+                remark: None,
+                remark_present: true,
+            }],
+        };
+        assert!(!apply_friend_snapshot(&identity, &incomplete).changed);
+        assert_eq!(identity.snapshot().mappings[0].remark, "旧备注");
+
+        // complete 空列表但 matched=0：按坏快照/跨账号护栏只增补、不清缺席。
+        let empty = FriendSnapshot {
+            complete: true,
+            updated_at: Some(1),
+            friends: Vec::new(),
+        };
+        let stats = apply_friend_snapshot(&identity, &empty);
+        assert!(!stats.changed);
+        assert_eq!(identity.snapshot().mappings[0].remark, "旧备注");
+    }
+
+    #[test]
+    fn identity_persist_lock_serializes_writers() {
+        let guard = identity_persist_guard();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _guard = identity_persist_guard();
+            let _ = sender.send(());
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            receiver.try_recv().is_err(),
+            "持锁期间另一个写者不能进入持久化临界区"
+        );
+        drop(guard);
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("释放锁后写者应完成");
+        worker.join().expect("写线程");
+    }
+
+    #[test]
+    fn friends_snapshot_freshness_and_unsupported_are_one_shot() {
+        let state = ExternalChatState::default();
+        assert!(!state.friends_snapshot_recent());
+        state.mark_friends_snapshot();
+        assert!(state.friends_snapshot_recent());
+        assert!(state.mark_friends_unsupported());
+        assert!(!state.mark_friends_unsupported());
+    }
+
+    #[test]
+    fn names_never_clear_remark_but_can_still_update_name() {
+        let identity = identity_with_remark("10001");
+        // 200 + 明确 remarks 字段但为空：/names 也不清，只更新 name。
+        let empty = crate::runtime::chat_source::SenderNames {
+            name: Some("新真名".to_string()),
+            remark: None,
+        };
+        assert!(apply_sender_names(&identity, "10001", &empty));
+        let mapping = &identity.snapshot().mappings[0];
+        assert_eq!(mapping.remark, "旧备注", "/names 绝不能清 remark");
+        assert!(mapping.remark_from_chatbridge);
+        assert_eq!(mapping.real_nickname, "新真名");
+        assert_eq!(mapping.display_name, "显示甲");
+
+        // 无 remarks 字段：旧 ChatBridge，保留旧值。
+        let legacy = identity_with_remark("10002");
+        let no_field = crate::runtime::chat_source::SenderNames {
+            name: None,
+            remark: None,
+        };
+        assert!(!apply_sender_names(&legacy, "10002", &no_field));
+        assert_eq!(legacy.snapshot().mappings[0].remark, "旧备注");
+
+        // 有备注：覆盖。
+        let replaced = identity_with_remark("10003");
+        let with_remark = crate::runtime::chat_source::SenderNames {
+            name: None,
+            remark: Some("新备注".to_string()),
+        };
+        assert!(apply_sender_names(&replaced, "10003", &with_remark));
+        assert_eq!(replaced.snapshot().mappings[0].remark, "新备注");
+        assert!(replaced.snapshot().mappings[0].remark_from_chatbridge);
     }
 
     #[test]

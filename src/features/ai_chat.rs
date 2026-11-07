@@ -209,7 +209,7 @@ pub struct AiChatVisionConfig {
     /// 长边缩放到该像素值再编码。
     #[serde(default = "default_vision_max_edge")]
     pub max_edge: u32,
-    /// JPEG 编码质量（40..=95）。
+    /// JPEG 编码质量（40..=100）。
     #[serde(default = "default_vision_jpeg_quality")]
     pub jpeg_quality: u8,
     /// 编码后允许的最大字节数；超过则降采样/降质量，仍超限则放弃图片。
@@ -319,7 +319,7 @@ pub(crate) fn encode_vision_image(
         let new_height = (f64::from(height) * scale).round().max(1.0) as u32;
         target = target.resize_exact(new_width, new_height, FilterType::Lanczos3);
     }
-    let mut quality = jpeg_quality.clamp(40, 95);
+    let mut quality = jpeg_quality.clamp(40, 100);
     for attempt in 0..3 {
         let mut bytes = Vec::new();
         let mut encoder = JpegEncoder::new_with_quality(&mut bytes, quality);
@@ -538,11 +538,11 @@ fn default_vision_config_for_legacy() -> AiChatVisionConfig {
 }
 
 fn default_vision_max_edge() -> u32 {
-    1_280
+    1_600
 }
 
 fn default_vision_jpeg_quality() -> u8 {
-    80
+    100
 }
 
 fn default_vision_max_bytes() -> u64 {
@@ -601,8 +601,8 @@ impl AiChatConfig {
                 if self.vision.max_edge == 0 {
                     anyhow::bail!("ai_chat.vision.max_edge 必须大于 0");
                 }
-                if !(40..=95).contains(&self.vision.jpeg_quality) {
-                    anyhow::bail!("ai_chat.vision.jpeg_quality 必须在 40..=95");
+                if !(40..=100).contains(&self.vision.jpeg_quality) {
+                    anyhow::bail!("ai_chat.vision.jpeg_quality 必须在 40..=100");
                 }
                 if self.vision.max_bytes == 0 {
                     anyhow::bail!("ai_chat.vision.max_bytes 必须大于 0");
@@ -3855,15 +3855,15 @@ mod tests {
         assert_eq!(config.vision.mode, VisionMode::Auto);
         assert_eq!(config.vision.capture_scope, VisionCaptureScope::PrimaryScreen);
         assert!(config.vision.allow_full_screen);
-        assert_eq!(config.vision.max_edge, 1_280);
-        assert_eq!(config.vision.jpeg_quality, 80);
+        assert_eq!(config.vision.max_edge, 1_600);
+        assert_eq!(config.vision.jpeg_quality, 100);
         assert_eq!(config.vision.max_bytes, 4_000_000);
         assert_eq!(config.vision.timeout_ms, 800);
         assert!(config.vision.model.is_empty());
         let mut disabled = AiChatConfig::default();
         disabled.vision.enabled = false;
         assert!(!disabled.vision.enabled);
-        assert_eq!(disabled.vision.max_edge, 1_280);
+        assert_eq!(disabled.vision.max_edge, 1_600);
     }
 
     #[test]
@@ -3892,6 +3892,33 @@ mod tests {
         let debug = format!("{encoded:?}");
         assert!(debug.contains("1280x853") || debug.contains("width: 1280"));
         assert!(!debug.contains("base64"));
+    }
+
+    #[test]
+    fn vision_encoding_accepts_quality_100_and_still_honors_byte_cap() {
+        let image = DynamicImage::new_rgb8(64, 64);
+        let encoded = encode_vision_image(&image, 1_600, 100, 4_000_000).expect("quality 100");
+        assert_eq!(encoded.width(), 64);
+        assert_eq!(encoded.height(), 64);
+        // 超限时仍会降质量/放弃，quality=100 不绕过 max_bytes。
+        assert!(encode_vision_image(&image, 1_600, 100, 1).is_none());
+        // 超范围输入按 40..=100 clamp，不 panic。
+        assert!(encode_vision_image(&image, 1_600, 255, 4_000_000).is_some());
+    }
+
+    #[test]
+    fn vision_validate_accepts_quality_100_and_rejects_out_of_range() {
+        let mut config = AiChatConfig::default();
+        config.enabled = true;
+        config.vision.enabled = true;
+        config.vision.jpeg_quality = 100;
+        config.validate().expect("100 合法");
+        config.vision.jpeg_quality = 101;
+        assert!(config.validate().is_err());
+        config.vision.jpeg_quality = 39;
+        assert!(config.validate().is_err());
+        config.vision.jpeg_quality = 40;
+        config.validate().expect("40 合法");
     }
 
     #[test]

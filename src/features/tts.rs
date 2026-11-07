@@ -40,6 +40,9 @@ pub struct TtsConfig {
     /// fish.audio API key；Secret + IdleReload，不打印。
     #[serde(default)]
     pub api_key: String,
+    /// 可选独立代理；空=沿用 reqwest 环境代理。作用于音色目录与 /v1/tts。
+    #[serde(default)]
+    pub http_proxy: String,
     /// 模型名，作为 HTTP `model` 头发送。
     #[serde(default = "default_tts_model")]
     pub model: String,
@@ -122,6 +125,7 @@ impl Default for TtsConfig {
             enabled: false,
             endpoint: default_tts_endpoint(),
             api_key: String::new(),
+            http_proxy: String::new(),
             model: default_tts_model(),
             reference_id: String::new(),
             voice: String::new(),
@@ -143,6 +147,14 @@ impl fmt::Debug for TtsConfig {
             .field("enabled", &self.enabled)
             .field("endpoint", &self.endpoint)
             .field("api_key", &"<redacted>")
+            .field(
+                "http_proxy",
+                &if self.http_proxy.trim().is_empty() {
+                    ""
+                } else {
+                    "<set>"
+                },
+            )
             .field("model", &self.model)
             .field("reference_id", &self.reference_id)
             .field("voice", &self.voice)
@@ -159,6 +171,7 @@ impl fmt::Debug for TtsConfig {
 
 impl TtsConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        validate_tts_http_proxy(&self.http_proxy)?;
         if self.duck_volume > 100 {
             anyhow::bail!("tts.duck_volume 必须在 0..=100");
         }
@@ -473,6 +486,47 @@ pub enum TtsCatalogError {
     Request(String),
 }
 
+/// 校验 TTS 代理。kernel 的 `validate_http_proxy` 只接受 http/https；
+/// TTS 额外允许 `socks5://`（reqwest 支持），其余仍复用它。
+fn validate_tts_http_proxy(proxy: &str) -> anyhow::Result<()> {
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        return Ok(());
+    }
+    if proxy.to_ascii_lowercase().starts_with("socks5://") {
+        let parsed = url::Url::parse(proxy)
+            .map_err(|error| anyhow::anyhow!("tts.http_proxy 配置无效：{error}"))?;
+        if parsed.host().is_none() {
+            anyhow::bail!("tts.http_proxy 的 socks5 地址缺少主机");
+        }
+        return Ok(());
+    }
+    miliastra_kernel::ai::validate_http_proxy(proxy)
+        .map_err(|error| anyhow::anyhow!("tts.http_proxy 配置无效：{error}"))
+}
+
+/// 统一构建 fish HTTP client：空代理走 reqwest 默认环境代理；非空显式设置代理。
+fn build_tts_client(
+    config: &TtsConfig,
+    timeout: Duration,
+) -> std::result::Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .user_agent(concat!(
+            "miliastra-wonderland-music/",
+            env!("CARGO_PKG_VERSION")
+        ));
+    let proxy = config.http_proxy.trim();
+    if !proxy.is_empty() {
+        let proxy = reqwest::Proxy::all(proxy)
+            .map_err(|error| format!("tts.http_proxy 配置无效：{error}"))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("构建 TTS HTTP 客户端失败：{error}"))
+}
+
 /// 拉取 fish voice 列表并附上内置 TTS 模型 fallback。
 ///
 /// - key 为空时直接返回 fallback，不发网络请求；
@@ -506,14 +560,11 @@ pub fn fetch_catalog(
         return Ok(TtsCatalog::fallback());
     }
     let url = catalog_url(&endpoint);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(config.timeout_ms.max(1_000).min(15_000)))
-        .user_agent(concat!(
-            "miliastra-wonderland-music/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .build()
-        .map_err(|error| TtsCatalogError::Request(error.to_string()))?;
+    let client = build_tts_client(
+        config,
+        Duration::from_millis(config.timeout_ms.max(1_000).min(15_000)),
+    )
+    .map_err(TtsCatalogError::Config)?;
     let response = client
         .get(url)
         .header("Authorization", format!("Bearer {api_key}"))
@@ -616,6 +667,8 @@ pub enum TtsError {
     Timeout,
     #[error("tts request failed with status {0}")]
     Http(u16),
+    #[error("tts config error: {0}")]
+    Config(String),
     #[error("tts request failed: {0}")]
     Request(String),
     #[error("tts audio is empty or unsupported")]
@@ -1117,14 +1170,8 @@ fn synthesize_fish(
     if api_key.is_empty() {
         return Err(TtsError::Disabled);
     }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(config.timeout_ms))
-        .user_agent(concat!(
-            "miliastra-wonderland-music/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .build()
-        .map_err(|error| TtsError::Request(error.to_string()))?;
+    let client = build_tts_client(config, Duration::from_millis(config.timeout_ms))
+        .map_err(TtsError::Config)?;
     let capabilities = tts_model_capabilities(config.effective_model());
     let text = decorate_speak_text(text, options, &capabilities);
     let format = match config.format {
@@ -1226,6 +1273,32 @@ mod tests {
         config.queue_max = 64;
         assert!(config.validate().is_ok());
         assert!(!TtsCatalog::fallback().truncated);
+    }
+
+    #[test]
+    fn tts_http_proxy_defaults_roundtrips_and_builds_clients() {
+        let config = TtsConfig::default();
+        assert!(config.http_proxy.is_empty());
+        let encoded = serde_json::to_string(&config).expect("serialize");
+        let decoded: TtsConfig = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, config);
+        assert!(build_tts_client(&config, Duration::from_secs(1)).is_ok());
+
+        for proxy in ["http://127.0.0.1:7890", "https://proxy.example:8443", "socks5://127.0.0.1:1080"] {
+            let mut config = TtsConfig::default();
+            config.http_proxy = proxy.to_string();
+            config.validate().expect("合法代理");
+            assert!(
+                build_tts_client(&config, Duration::from_secs(1)).is_ok(),
+                "代理应能构建 client: {proxy}"
+            );
+        }
+
+        let mut invalid = TtsConfig::default();
+        invalid.http_proxy = "not a proxy".to_string();
+        let error = invalid.validate().expect_err("无效代理");
+        assert!(error.to_string().contains("tts.http_proxy"));
+        assert!(build_tts_client(&invalid, Duration::from_secs(1)).is_err());
     }
 
     #[test]

@@ -667,6 +667,13 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
 .config-vision-note{font-size:var(--fs-tiny);line-height:var(--lh-tiny);background:var(--info-soft);color:var(--text-1);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-2) var(--sp-3);margin-top:var(--sp-2)}
 .config-subhead{display:flex;align-items:baseline;gap:var(--sp-2);margin:var(--sp-4) 0 var(--sp-2);padding-top:var(--sp-3);border-top:1px solid var(--sep-2)}
 .config-subhead h3{margin:0;font-size:var(--fs-title);color:var(--text-1)}
+.config-tool-prompts{display:grid;gap:var(--sp-3)}
+.config-tool-prompt{padding:var(--sp-3);border:1px solid var(--sep-2);border-radius:var(--radius-m);background:var(--bg-card)}
+.config-tool-prompt .config-field-head{margin-bottom:var(--sp-1)}
+.config-tool-actions{display:flex;flex-wrap:wrap;gap:var(--sp-2);align-items:center;margin-top:var(--sp-1)}
+.config-tool-default{margin-top:var(--sp-2);border-top:1px dashed var(--sep-2);padding-top:var(--sp-1)}
+.config-tool-default summary{cursor:pointer;font-size:var(--fs-tiny);color:var(--text-3)}
+.config-tool-default pre{margin:var(--sp-1) 0 0;max-height:140px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-family:var(--font-mono);font-size:var(--fs-tiny);line-height:var(--lh-tiny);color:var(--text-2);background:var(--bg-raised);border-radius:var(--radius-s);padding:var(--sp-1) var(--sp-2)}
 .config-subhead code{font-size:var(--fs-tiny);color:var(--text-3)}
 .config-vision-preview{margin-top:var(--sp-2)}
 .config-vision-preview img{display:block;max-width:100%;max-height:380px;width:auto;height:auto;background:#000;border:1px solid var(--sep-1);border-radius:var(--radius-m)}
@@ -1463,6 +1470,8 @@ let visionPreviewLoading=false
 let visionPreviewUrl=null
 // 旧配置缺 ai_chat.vision.* 时记录“未设置”字段：不伪装默认值，未改动前不写回。
 let configVisionUnset=new Set()
+// 旧配置缺 ai_chat.tool_prompts.* 时记录未设置字段：未改动前不写默认值。
+let configToolPromptUnset=new Set()
 /* ===== AI 记忆库面板 =====
  * 只读查询 + 精确删除。不做「编辑事实」：
  * 记忆内容是模型抽取的自然语言，手改容易与后续抽取冲突；
@@ -4642,6 +4651,52 @@ function configFieldsBlockHtml(section,fields){
 function configSubheadHtml(id,title,code,hint){
   return '<div class="config-subhead" id="'+esc(id)+'"><h3>'+esc(title)+'</h3><code>'+esc(code)+'</code>'+(hint?'<span class="config-field-hint">'+hint+'</span>':'')+'</div>'
 }
+// 每个工具独立的提示词：只作用于对应工具子请求，不替代 AI 聊天 system_prompt。
+// 复用现有字段渲染（configControlHtml/collect/default/脏值），只补“恢复默认”入口。
+function aiToolPromptDefs(){return [
+  {key:'look',label:'look（识图）',hint:'仅作用于 look 子请求，不替代 AI 聊天 system_prompt。'},
+  {key:'speak',label:'speak（语音）',hint:'仅作用于 speak 工具；默认文案同时包含 S2.1 与 Drama-3 两套写法，按实际模型删掉另一套。'},
+  {key:'command',label:'command（游戏命令）',hint:'仅作用于游戏命令工具，不替代 AI 聊天 system_prompt。'}
+]}
+function restoreToolPromptDefault(path){
+  const field=configFieldByPath(path)
+  const el=document.getElementById(configControlId(path))
+  if(!field||!el)return
+  // 空默认 = 沿用后端内置工具提示词；不写前端占位文案。
+  el.value=field.default!=null?String(field.default):''
+  el.dataset.cfgTouched='1'
+  el.dispatchEvent(new Event('input',{bubbles:true}))
+}
+function aiToolPromptRowHtml(chatSection,def){
+  const path='ai_chat.tool_prompts.'+def.key
+  const field=chatSection&&chatSection.fields.find(f=>f.path===path)
+  if(configSearchText&&field&&!configFieldMatches(field)&&!String(def.label+' '+def.hint).toLowerCase().includes(configSearchText))return null
+  if(configSearchText&&!field&&!String(def.key+' '+def.label+' '+def.hint).toLowerCase().includes(configSearchText))return null
+  if(!field){
+    return '<div class="config-tool-prompt"><div class="config-field"><div class="config-field-head"><b>'+esc(def.label)+'</b><code>'+esc(path)+'</code></div>'
+      +'<p class="config-field-hint">当前后端未提供该字段（task-71 上线后自动出现）；无法显示/保存后端默认文案。</p></div></div>'
+  }
+  const value=configValueAt('ai_chat',path)
+  const unset=value===undefined
+  if(unset)configToolPromptUnset.add(path);else configToolPromptUnset.delete(path)
+  const defaultText=field.default!=null?String(field.default):''
+  return '<div class="config-tool-prompt">'
+    +renderConfigFieldHtml(field,chatSection,false)
+    +'<div class="config-tool-actions"><button type="button" class="btn small ghost" onclick="restoreToolPromptDefault('+esc(JSON.stringify(path))+')">恢复默认</button><span class="config-field-hint">'+esc(def.hint)+'</span></div>'
+    +(defaultText.trim()!==''?'<details class="config-tool-default" open><summary>'+(def.key==='speak'?'默认文案（含 S2.1 / Drama-3 两套）':'默认文案')+'</summary><pre>'+esc(defaultText)+'</pre></details>':'<p class="config-field-hint">默认：后端内置（schema 未提供文案，留空即沿用）。</p>')
+    +(unset?'<p class="config-field-hint">旧配置未设置（沿用后端默认）；改动该项后才会写入。</p>':'')
+    +'</div>'
+}
+function renderToolPromptsHtml(chatSection){
+  const intro='<p class="config-field-hint">speak 的默认文案同时包含 S2.1 与 Drama-3 两套写法；请按当前 TTS 模型保留实际使用的一套，删掉另一套即可。本组提示词只作用于对应工具，不替代 AI 聊天 system_prompt。</p>'
+  const rows=[]
+  for(const def of aiToolPromptDefs()){
+    const row=aiToolPromptRowHtml(chatSection,def)
+    if(row)rows.push(row)
+  }
+  if(!rows.length)return '<div class="config-empty">没有匹配的工具提示词字段</div>'
+  return '<div class="config-tool-prompts">'+intro+rows.join('')+'</div>'
+}
 function aiPromptExamplesHtml(){
   return '<details class="config-vision-tools" open><summary>提示词示例（可复制；只是示例，不会自动注入）</summary>'
     +'<p class="config-field-hint">下面只是示例，不会自动注入；AI 是否调用工具、何时调用，完全由你自己的 system_prompt 决定。</p>'
@@ -4675,7 +4730,7 @@ function renderAiConfigFormHtml(aiSection){
   const pick=sec=>sec?sec.fields.filter(f=>configFieldMatches(f)&&!(configSectionHidesVisual(sec)&&f.managedBy==='visual')):[]
   const aiFields=pick(aiSection)
   const chatAll=pick(aiChat)
-  const chatFields=chatAll.filter(f=>!String(f.path).startsWith('ai_chat.vision.'))
+  const chatFields=chatAll.filter(f=>!String(f.path).startsWith('ai_chat.vision.')&&!String(f.path).startsWith('ai_chat.tool_prompts.'))
   const visionFields=chatAll.filter(f=>String(f.path).startsWith('ai_chat.vision.'))
   const ttsFields=pick(tts)
   const total=aiFields.length+chatFields.length+visionFields.length+ttsFields.length
@@ -4686,6 +4741,8 @@ function renderAiConfigFormHtml(aiSection){
   parts.push(aiFields.length?configFieldsBlockHtml(aiSection,aiFields):'<div class="config-empty">没有匹配字段</div>')
   parts.push(configSubheadHtml('aiConfigChat','AI 聊天','ai_chat',''))
   parts.push(chatFields.length?configFieldsBlockHtml(aiChat,chatFields):'<div class="config-empty">没有匹配字段</div>')
+  parts.push(configSubheadHtml('aiConfigToolPrompts','工具提示词','ai_chat.tool_prompts','每个工具独立生效，不替代 system_prompt；留空=沿用后端内置提示词'))
+  parts.push(renderToolPromptsHtml(aiChat))
   parts.push(aiPromptExamplesHtml())
   parts.push(configSubheadHtml('aiConfigVision','AI 识图','ai_chat.vision',''))
   parts.push(visionFields.length?configFieldsBlockHtml(aiChat,visionFields):'<div class="config-empty">没有匹配字段（后端尚未提供 ai_chat.vision.*）</div>')
@@ -4834,6 +4891,7 @@ function collectConfigFieldValue(field,sectionName){
   if(!el)return {skip:true}
   // 旧配置缺 ai_chat.vision.*：未改动的字段不提交，避免把 schema 默认值写成真实配置。
   if(sectionName==='ai_chat'&&String(field.path).startsWith('ai_chat.vision.')&&configVisionUnset.has(field.path)&&el.dataset.cfgTouched!=='1')return {skip:true}
+  if(sectionName==='ai_chat'&&String(field.path).startsWith('ai_chat.tool_prompts.')&&configToolPromptUnset.has(field.path)&&el.dataset.cfgTouched!=='1')return {skip:true}
   // 父级 nullable object 未启用（开关关闭 / textarea 为 null / 库中为 null）
   // → 跳过子字段，避免把旧子字段写回提交段导致父级重新变成对象。
   const parent=configNullableObjectParent(sectionName,field.path)

@@ -9,6 +9,7 @@ mod login;
 mod lyrics;
 mod model;
 mod runtime;
+mod speech;
 
 pub use cache::{
     AudioCache, AudioCacheConfig, AudioCacheStats, AudioCacheTrackStatus, CacheLiveLimits,
@@ -36,3 +37,4 @@ pub use runtime::{
     LoginOperation, LoginOperationWaitError, LoginSession, LoginStatus, PlaybackError,
     PlaybackHandle, PlaybackOperation, PlaybackRuntime, PlaybackSnapshot, PlaylistImportOperation,
 };
+pub use speech::{PcmAudio, SpeechAudio, SpeechError, SpeechPlayer};

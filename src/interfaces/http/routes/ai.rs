@@ -123,6 +123,225 @@ pub(super) fn ai_models_body_route(
     serde_json::to_string(&json!({ "models": models })).map_err(internal_error)
 }
 
+/// GET /tts/models：用已保存的 tts 配置拉 fish 音色列表 + TTS 模型 fallback。
+pub(super) fn tts_models_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let config = state
+        .config_store
+        .lock()
+        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
+        .load_full()
+        .map_err(internal_error)?
+        .tts;
+    let catalog = crate::features::tts::fetch_catalog(
+        &config,
+        &crate::features::tts::TtsCatalogOverrides::default(),
+    )
+    .map_err(tts_catalog_error)?;
+    serde_json::to_string(&catalog).map_err(internal_error)
+}
+
+/// POST /tts/models 的未保存配置覆盖；`None` 沿用已保存值，空串表示明确清空。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TtsModelsOverrides {
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+/// 把面板当前值合并成 catalog 查询覆盖；纯函数便于测试。
+pub(super) fn tts_catalog_overrides(
+    overrides: TtsModelsOverrides,
+) -> crate::features::tts::TtsCatalogOverrides {
+    crate::features::tts::TtsCatalogOverrides {
+        endpoint: overrides.endpoint,
+        api_key: overrides.api_key,
+    }
+}
+
+/// POST /tts/models：面板未保存的 endpoint/api_key 也能查询。
+pub(super) fn tts_models_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let overrides: TtsModelsOverrides = parse_json_body(body, "TTS 模型列表参数")?;
+    let overrides = tts_catalog_overrides(overrides);
+    let config = state
+        .config_store
+        .lock()
+        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
+        .load_full()
+        .map_err(internal_error)?
+        .tts;
+    let catalog =
+        crate::features::tts::fetch_catalog(&config, &overrides).map_err(tts_catalog_error)?;
+    serde_json::to_string(&catalog).map_err(internal_error)
+}
+
+fn tts_catalog_error(error: crate::features::tts::TtsCatalogError) -> AppError {
+    match error {
+        crate::features::tts::TtsCatalogError::Config(message) => AppError {
+            status: 400,
+            message,
+        },
+        crate::features::tts::TtsCatalogError::Request(message) => internal_error(anyhow!(message)),
+    }
+}
+
+/// GET /ai/vision/status：返回 AI 识图模型能力状态。
+///
+/// 只读、永远 200：查不到/网络失败按“未知、不支持图片”返回，供面板提示降级，
+/// 不把网络错误变成 500 阻塞配置页；不返回/记录任何图片或 base64。
+pub(super) fn ai_vision_status_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let config = state
+        .config_store
+        .lock()
+        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
+        .load_full()
+        .map_err(internal_error)?;
+    let model = ai_vision_model(&config.ai_chat, &config.ai);
+    let capabilities = if model.is_empty() {
+        Err(crate::config::ai::ModelListError::Config(
+            "未配置视觉/聊天模型".to_string(),
+        ))
+    } else {
+        crate::config::ai::fetch_model_capabilities(&config.ai, &model)
+    };
+    let payload = vision_status_payload(
+        config.ai_chat.vision.enabled,
+        &model,
+        &config.ai_chat.vision.capture_scope,
+        config.ai_chat.vision.allow_full_screen,
+        capabilities,
+    );
+    serde_json::to_string(&payload).map_err(internal_error)
+}
+
+/// POST /ai/vision/status 的未保存参数覆盖；字段缺失=沿用已保存值。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AiVisionStatusOverrides {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+/// 合并面板当前值到已保存配置上；纯函数便于测试。
+pub(super) fn apply_ai_vision_status_overrides(
+    ai: &mut crate::config::ai::AiConfig,
+    ai_chat: &mut crate::features::ai_chat::AiChatConfig,
+    overrides: AiVisionStatusOverrides,
+) -> Option<String> {
+    if let Some(value) = overrides.provider {
+        ai.provider = value;
+    }
+    if let Some(value) = overrides.endpoint {
+        ai.endpoint = value;
+    }
+    if let Some(value) = overrides.api_key {
+        ai.api_key = value;
+    }
+    overrides.model.map(|model| {
+        ai_chat.vision.model = model.clone();
+        ai_chat.model = model.clone();
+        model
+    })
+}
+
+/// POST /ai/vision/status：用面板当前未保存值查询能力，返回与 GET 相同 shape。
+pub(super) fn ai_vision_status_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let overrides: AiVisionStatusOverrides = parse_json_body(body, "AI 识图状态参数")?;
+    let mut config = state
+        .config_store
+        .lock()
+        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
+        .load_full()
+        .map_err(internal_error)?;
+    let model_override = apply_ai_vision_status_overrides(
+        &mut config.ai,
+        &mut config.ai_chat,
+        overrides,
+    );
+    let model = model_override.unwrap_or_else(|| ai_vision_model(&config.ai_chat, &config.ai));
+    let capabilities = if model.is_empty() {
+        Err(crate::config::ai::ModelListError::Config(
+            "未配置视觉/聊天模型".to_string(),
+        ))
+    } else {
+        crate::config::ai::fetch_model_capabilities(&config.ai, &model)
+    };
+    let payload = vision_status_payload(
+        config.ai_chat.vision.enabled,
+        &model,
+        &config.ai_chat.vision.capture_scope,
+        config.ai_chat.vision.allow_full_screen,
+        capabilities,
+    );
+    serde_json::to_string(&payload).map_err(internal_error)
+}
+
+fn ai_vision_model(
+    ai_chat: &crate::features::ai_chat::AiChatConfig,
+    ai: &crate::config::ai::AiConfig,
+) -> String {
+    let configured = ai_chat.vision.model.trim();
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    let chat = ai_chat.model.trim();
+    if !chat.is_empty() {
+        return chat.to_string();
+    }
+    ai.model.trim().to_string()
+}
+
+pub(super) fn vision_status_payload(
+    enabled: bool,
+    model: &str,
+    capture_scope: &crate::features::ai_chat::VisionCaptureScope,
+    allow_full_screen: bool,
+    capabilities: std::result::Result<
+        crate::config::ai::ModelCapabilities,
+        crate::config::ai::ModelListError,
+    >,
+) -> serde_json::Value {
+    let (supports_image, source, reason) = match capabilities {
+        Ok(capabilities) => match capabilities.supports_image {
+            Some(true) => (true, "api", "模型 API 声明支持图片"),
+            Some(false) => (false, "api", "模型 API 声明不支持图片"),
+            None => (false, "unknown", "模型 API 未返回图片能力字段，按不支持图片降级"),
+        },
+        Err(_) => (false, "unknown", "查询模型能力失败，按不支持图片降级"),
+    };
+    let capture_scope = match capture_scope {
+        crate::features::ai_chat::VisionCaptureScope::PrimaryScreen => "primary_screen",
+    };
+    serde_json::json!({
+        "enabled": enabled,
+        "model": model,
+        "supports_image": supports_image,
+        "source": source,
+        "reason": reason,
+        "capture_scope": capture_scope,
+        "allow_full_screen": allow_full_screen
+    })
+}
+
 /// 配置形状问题按 400 回原文（用户能照着改），上游/网络问题按 500 只记日志。
 ///
 /// 不用 `is_client_error` 的关键字匹配：这类报错是"地址后缀不对""缺少 apiKey"

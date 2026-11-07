@@ -151,6 +151,14 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
         handler: ai_models_body_route,
     },
     BodyRouteSpec {
+        path: "/ai/vision/status",
+        handler: ai_vision_status_body_route,
+    },
+    BodyRouteSpec {
+        path: "/tts/models",
+        handler: tts_models_body_route,
+    },
+    BodyRouteSpec {
         path: "/ai/memory/forget-actor",
         handler: ai_memory_forget_actor_route,
     },
@@ -659,6 +667,20 @@ const ROUTES: &[RouteSpec] = &[
         // 只读：拉取服务端模型列表，不改配置。
         mutating: false,
         handler: ai_models_route,
+    },
+    RouteSpec {
+        path: "/ai/vision/status",
+        json: true,
+        // 只读：查询当前视觉模型能力，不改配置。
+        mutating: false,
+        handler: ai_vision_status_route,
+    },
+    RouteSpec {
+        path: "/tts/models",
+        json: true,
+        // 只读：拉取 fish 音色目录，不改配置。
+        mutating: false,
+        handler: tts_models_route,
     },
     RouteSpec {
         path: "/ai/memory/actors",

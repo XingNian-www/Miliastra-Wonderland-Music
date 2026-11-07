@@ -180,6 +180,8 @@ enum Command {
     /// 跳转到指定播放位置(秒)。
     Seek(f64, Reply<()>),
     SetVolume(u8, Reply<()>),
+    /// TTS 说话期间的独立输出压低增益（0–100，100=不压低），不改 snapshot.volume。
+    SetDuckGain(u8, Reply<()>),
     Snapshot(Reply<PlaybackSnapshot>),
     ToggleLyrics(Reply<bool>),
     /// 明确设置歌词是否使用翻译（不等价于切换）：恢复播放时应用持久化模式。
@@ -506,6 +508,14 @@ impl PlaybackHandle {
 
     pub fn set_volume(&self, volume: u8) -> Result<(), PlaybackError> {
         self.request(|reply| Command::SetVolume(volume, reply))
+    }
+
+    /// 设置 TTS 说话期间的独立输出压低增益（0–100，100=不压低）。
+    ///
+    /// 只改实际输出增益，**不修改 `PlaybackSnapshot.volume`**（`@状态`/持久化音量不变）。
+    /// 供主 crate 的 TTS 编排在说话开始/结束时调用。
+    pub fn set_duck_gain(&self, gain: u8) -> Result<(), PlaybackError> {
+        self.request(|reply| Command::SetDuckGain(gain, reply))
     }
 
     pub fn snapshot(&self) -> Result<PlaybackSnapshot, PlaybackError> {
@@ -1177,6 +1187,9 @@ async fn run_commands(
             }
             Command::SetVolume(volume, reply) => {
                 let _ = reply.send(block_result(core.set_volume(volume).await));
+            }
+            Command::SetDuckGain(gain, reply) => {
+                let _ = reply.send(block_result(core.set_duck_gain(gain).await));
             }
             Command::Snapshot(reply) => {
                 let engine_snapshot = core.snapshot();
@@ -2460,6 +2473,7 @@ mod tests {
                 EngineCommand::Pause { .. }
                 | EngineCommand::Resume { .. }
                 | EngineCommand::SetVolume { .. }
+                | EngineCommand::SetDuckGain { .. }
                 | EngineCommand::RefreshStream { .. }
                 | EngineCommand::Seek { .. } => {}
             }
@@ -2506,6 +2520,8 @@ mod tests {
                 EngineCommand::Stop { .. } => snapshot.state = EngineState::Stopped,
                 EngineCommand::SetVolume { volume } => snapshot.volume = *volume,
                 EngineCommand::RefreshStream { .. } | EngineCommand::Seek { .. } => {}
+                // duck 只作用于实际输出增益，不改持久的 snapshot.volume。
+                EngineCommand::SetDuckGain { .. } => {}
             }
             self.commands.lock().unwrap().push(command);
             self.snapshot_tx.send_replace(snapshot);
@@ -3289,6 +3305,31 @@ mod tests {
             commands.as_slice(),
             [EngineCommand::Start { seek_seconds: Some(seek), .. }] if (*seek - 73.5).abs() < 1e-9
         ));
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn set_duck_gain_changes_output_gain_without_touching_snapshot_volume() {
+        let runtime = test_runtime();
+        let handle = runtime.handle();
+        // 默认：音量 100、duck 默认不压低。
+        assert_eq!(handle.snapshot().unwrap().volume, 100);
+        handle.set_duck_gain(100).unwrap();
+        assert_eq!(handle.snapshot().unwrap().volume, 100);
+
+        // 设一个非默认音量，再由 duck 压低：snapshot.volume 必须保持 42。
+        handle.set_volume(42).unwrap();
+        assert_eq!(handle.snapshot().unwrap().volume, 42);
+        handle.set_duck_gain(30).unwrap();
+        assert_eq!(
+            handle.snapshot().unwrap().volume,
+            42,
+            "SetDuckGain 不得修改 snapshot.volume（不回显示）"
+        );
+
+        // 越界拒绝。
+        assert!(handle.set_duck_gain(101).is_err(), "duck gain 101 应被拒绝");
 
         runtime.shutdown().unwrap();
     }

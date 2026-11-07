@@ -1,46 +1,53 @@
 #!/usr/bin/env bash
 # scripts/release-pipeline.sh
 #
-# 7.4.x 及后续版本的「发布 + 双机部署」可复用流程脚本（已纳入仓库，随版本发布）。
+# 7.4.x 及后续版本的「发布 + 多机部署」可复用流程脚本（已纳入仓库，随版本发布）。
 #
 # 为什么有这个脚本：每次发版都要记住一串容易漏的约束——
-#   * 推送必须绕开全局 insteadOf / ghfast.top 镜像，否则 TLS 被改写；
+#   * 推送必须绕开全局 insteadOf / 镜像重写，否则 TLS 被改写；
 #   * 版本号提交会自动触发 CI，手动 workflow_dispatch 不能重复触发同一个 Release；
 #   * GitHub 大文件直连会反复截断，必须走 socks5h 代理 + 断点续传 + 精确字节数校验；
 #   * Windows exe 被运行中的进程锁住，必须先停进程再替换，且必须用计划任务启动；
-#   * 两台克隆虚机（.119/.242）同名同配置，只能按 IP 逐台部署并各自验收。
+#   * 多台部署主机同名同配置，只能按 --hosts 逐台部署并各自验收。
+#
+# 环境变量（--execute 时按步骤需要；dry-run 全部不需要，缺值自动打印占位符）：
+#   MILIASTRA_REPO            仓库 owner/name；--execute 缺省时从 git remote / gh repo view 推导，dry-run 用占位符
+#   MILIASTRA_DEPLOY_HOSTS    空格分隔的部署主机（或 --hosts）
+#   MILIASTRA_PROXY_HOST / MILIASTRA_PROXY_PORT         下载用 socks5h 代理（或 --proxy）
+#   MILIASTRA_SSH_USER / MILIASTRA_SSH_KEY / MILIASTRA_REMOTE_DIR   Windows 目标信息
+#   MILIASTRA_PANEL_PORT      面板端口（或 --panel-port）
+#   MILIASTRA_PANEL_TOKEN     面板令牌（只从环境/密钥管理器取，绝不写进文件）
+#   MILIASTRA_TASK_NAME       计划任务名（可选）
 #
 # 设计原则：
 #   1) **默认 dry-run**：只打印将执行的命令；只有显式 `--execute` 才做远端写操作
 #      （push / workflow_dispatch / 下载 / 部署 / commit）。
-#   2) 不重复造轮子：部署复用 scripts/deploy-exe.sh，代理下载 + .119 单机链路
+#   2) 不重复造轮子：部署复用 scripts/deploy-exe.sh，代理下载 + 首台单机链路
 #      复用 technical-docs/scripts/deploy-remote.sh（后者在 gitignored 的
 #      technical-docs 下，克隆仓库后需在本机补齐该组件）。
-#      本脚本自身已随仓库版本化：commit 步骤用 `git add -A -- .` 正常暂存，
-#      以后改脚本时改动会一并提交，不再排除自身。
+#      本脚本自身已随仓库版本化：commit 步骤用 `git add -A -- .` 正常暂存。
 #   3) 提交信息不允许任何 trailer（AGENTS.md 明确要求）。
 #   4) 验收只注入「应被拒绝」的命令，避免在真实公共大厅刷屏。
-#   5) 远程面板令牌**绝不写进文件/提交/报告**：只从环境变量
-#      `MILIASTRA_PANEL_TOKEN` 读取；`--execute` 且跑 verify / announce 时为空直接报错。
-#      dry-run 不要求该变量。不要用命令行参数传令牌（会留在 shell history）。
+#   5) 远程面板令牌**绝不写进文件/提交/报告**：只从 `MILIASTRA_PANEL_TOKEN` 读取。
 #   6) 部署前经 `POST /chat/send` 对**每台被部署主机各发一次**预告，
 #      提示「5 秒后将更新版本，期间会有短暂停止」，全部发完后统一 sleep 5 秒
 #      才动 exe；避免只提醒其中一台导致另一台玩家毫无准备。
-#      默认主机集合 = 去重后的 `--hosts`（部署主机），`--announce-hosts` 可显式覆盖，
+#      默认主机集合 = 去重后的 `--hosts`，`--announce-hosts` 可显式覆盖，
 #      `--skip-announce` 可整体跳过。
+#   7) 环境拓扑/账号/路径/密钥/端口全部外置；仓库名缺省时动态推导。
 #
 # 用法：
 #   scripts/release-pipeline.sh --version 7.4.1 --step all
 #   scripts/release-pipeline.sh --version 7.4.1 --step all --execute \
 #       --message "fix(chat): ..." --dispatch
-#   # 需要 --execute 且涉及 announce / verify 时，先从环境/密钥管理器注入令牌（不要写进文件）：
+#   # 需要 --execute 且涉及 announce / verify 时，先从环境/密钥管理器注入令牌：
 #   export MILIASTRA_PANEL_TOKEN='<从密钥管理器取得的令牌>'
 #   scripts/release-pipeline.sh --version 7.4.1 --step verify --execute
-#   # 只想单独对每台部署主机各发一次更新预告（5 秒后由调用方自行部署）：
+#   # 只想单独对每台部署主机各发一次更新预告：
 #   scripts/release-pipeline.sh --version 7.4.1 --step announce --execute
 #   # CI 已完成、只想补部署：
 #   scripts/release-pipeline.sh --version 7.4.1 --step deploy --execute \
-#       --run-id 42205610473
+#       --run-id <RUN_ID>
 #   # 已有 artifact：
 #   scripts/release-pipeline.sh --version 7.4.1 --step deploy --execute \
 #       --artifact-id <ID> --expected-bytes <BYTES>
@@ -52,15 +59,17 @@
 
 set -euo pipefail
 
-REPO='XingNian-www/Miliastra-Wonderland-Music'
+# 环境拓扑/账号/路径/密钥/端口只从环境变量或 CLI 取，绝不写死。
+REPO="${MILIASTRA_REPO:-}"
 WORKFLOW='build-windows-exe.yml'
 BRANCH='main'
-PROXY_HOST='192.168.31.183'
-PROXY_PORT='7893'
-HOSTS_DEFAULT='192.168.31.119 192.168.31.242'
-REMOTE_USER='XingNian'
-SSH_KEY="$HOME/.ssh/yae_server"
-REMOTE_DIR='C:\Users\XingNian\Desktop\5.1'
+PROXY_HOST="${MILIASTRA_PROXY_HOST:-}"
+PROXY_PORT="${MILIASTRA_PROXY_PORT:-}"
+REMOTE_USER="${MILIASTRA_SSH_USER:-}"
+SSH_KEY="${MILIASTRA_SSH_KEY:-}"
+REMOTE_DIR="${MILIASTRA_REMOTE_DIR:-}"
+PANEL_PORT="${MILIASTRA_PANEL_PORT:-}"
+TASK_NAME="${MILIASTRA_TASK_NAME:-Miliastra}"
 EXE_NAME='miliastra-wonderland-music.exe'
 PANEL_TOKEN="${MILIASTRA_PANEL_TOKEN:-}"
 ANNOUNCE_TEXT='5秒后将更新版本，期间会有短暂停止，请稍候。'
@@ -79,15 +88,30 @@ ARTIFACT_ID=''
 EXPECTED_BYTES=''
 MESSAGE=''
 DISPATCH=0
-HOSTS="$HOSTS_DEFAULT"
+HOSTS="${MILIASTRA_DEPLOY_HOSTS:-}"
 DEPLOY_MODE='components'   # components=复用两个既有脚本；local=自己下载后逐台 deploy-exe.sh
 WORK=''
 
-usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() {
+  awk 'NR>1 { if ($0 ~ /^set -euo pipefail$/) exit; print }' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
 
 log()  { printf '\n== %s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# 从当前仓库 origin 推导 owner/name，支持 https / 代理镜像 / SCP 形式；不写死账号。
+detect_repo_from_remote() {
+  local url slug
+  url="$(git remote get-url origin 2>/dev/null || true)"
+  [[ -n "$url" ]] || return 1
+  slug="$(printf '%s\n' "$url" \
+    | sed -E 's#\.git$##; s#^[^@]+@[^:]+:#/#; s#^[a-zA-Z0-9+.-]+://##' \
+    | awk -F/ 'NF>=2 { print $(NF-1) "/" $NF }')"
+  [[ "$slug" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]] || return 1
+  printf '%s' "$slug"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -103,6 +127,11 @@ while [[ $# -gt 0 ]]; do
     --deploy-mode) DEPLOY_MODE="$2"; shift 2 ;;
     --proxy) PROXY_HOST="${2%%:*}"; PROXY_PORT="${2##*:}"; shift 2 ;;
     --ssh-key) SSH_KEY="$2"; shift 2 ;;
+    --repo) REPO="$2"; shift 2 ;;
+    --ssh-user) REMOTE_USER="$2"; shift 2 ;;
+    --remote-dir) REMOTE_DIR="$2"; shift 2 ;;
+    --panel-port) PANEL_PORT="$2"; shift 2 ;;
+    --task-name) TASK_NAME="$2"; shift 2 ;;
     --announce-hosts) ANNOUNCE_HOSTS="$2"; shift 2 ;;
     --announce-text) ANNOUNCE_TEXT="$2"; shift 2 ;;
     --announce-delay) ANNOUNCE_DELAY="$2"; shift 2 ;;
@@ -143,10 +172,65 @@ preflight() {
   if [[ -z "$VERSION" ]]; then VERSION="${cargo_version%-dev*}"; fi
   [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "版本号必须是 X.Y.Z：$VERSION"
   [[ "$VERSION" == "$cargo_version" ]] || warn "Cargo.toml=$cargo_version 与脚本版本=$VERSION 不一致"
-  # commit / test / preflight 不创建 Release，不应要求该版本的发布说明已存在
-  # （例如只改脚本时用 --version 7.4.2 --step commit 做 dry-run）。
+  # 仓库名：CLI/环境变量 > 执行期从 git remote / gh repo view 推导 > dry-run 占位符。
+  # dry-run 不打印本机 remote 里的账号名，避免日志外泄。
+  if [[ -z "$REPO" ]]; then
+    if [[ $DRY -eq 1 ]]; then
+      REPO='<OWNER>/<REPO>'
+      warn 'dry-run 用 <OWNER>/<REPO> 占位；--execute 时从 git remote / gh repo view 推导'
+    else
+      REPO="$(detect_repo_from_remote || true)"
+      if [[ -z "$REPO" ]]; then
+        REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
+      fi
+      [[ -n "$REPO" ]] || die '请设置 MILIASTRA_REPO / --repo，或让 git remote / gh repo view 可用'
+    fi
+  fi
+  # dry-run 不需要任何环境：缺值统一用占位符，保证 --step all 能完整走完。
+  if [[ $DRY -eq 1 ]]; then
+    [[ -n "$HOSTS" ]] || HOSTS='<HOST>'
+    [[ -n "$PROXY_HOST" ]] || PROXY_HOST='<PROXY_HOST>'
+    [[ -n "$PROXY_PORT" ]] || PROXY_PORT='<PROXY_PORT>'
+    [[ -n "$REMOTE_USER" ]] || REMOTE_USER='<USER>'
+    [[ -n "$SSH_KEY" ]] || SSH_KEY='<SSH_KEY>'
+    [[ -n "$REMOTE_DIR" ]] || REMOTE_DIR='<REMOTE_DIR>'
+    [[ -n "$PANEL_PORT" ]] || PANEL_PORT='<PORT>'
+  else
+    # --execute 提前校验必要环境，避免跑一半才失败。
+    local requires=''
+    case "$STEP" in
+      all) requires='hosts ssh remote_dir panel_port token proxy' ;;
+      deploy)
+        requires='hosts ssh remote_dir panel_port proxy'
+        [[ $SKIP_ANNOUNCE -eq 1 ]] || requires="$requires token"
+        ;;
+      verify) requires='hosts ssh remote_dir panel_port token' ;;
+      announce)
+        if [[ $SKIP_ANNOUNCE -eq 0 ]]; then requires='hosts panel_port token'; fi
+        ;;
+      download) requires='proxy' ;;
+    esac
+    for need in $requires; do
+      case "$need" in
+        hosts) [[ -n "$HOSTS" ]] || die '请设置 MILIASTRA_DEPLOY_HOSTS 或 --hosts' ;;
+        ssh) [[ -n "$REMOTE_USER" && -n "$SSH_KEY" ]] || die '请设置 MILIASTRA_SSH_USER / MILIASTRA_SSH_KEY（或 --ssh-user / --ssh-key）' ;;
+        remote_dir) [[ -n "$REMOTE_DIR" ]] || die '请设置 MILIASTRA_REMOTE_DIR 或 --remote-dir' ;;
+        panel_port) [[ -n "$PANEL_PORT" ]] || die '请设置 MILIASTRA_PANEL_PORT 或 --panel-port' ;;
+        token) [[ -n "$PANEL_TOKEN" ]] || die '请先导出环境变量 MILIASTRA_PANEL_TOKEN（令牌不得写入文件/提交/报告）' ;;
+        proxy) [[ -n "$PROXY_HOST" && -n "$PROXY_PORT" ]] || die '请设置 MILIASTRA_PROXY_HOST / MILIASTRA_PROXY_PORT 或 --proxy' ;;
+      esac
+    done
+    [[ "$PANEL_PORT" =~ ^[0-9]+$ ]] || die 'MILIASTRA_PANEL_PORT 必须是数字端口'
+  fi
+  # commit / test / preflight 不创建 Release；dry-run 缺发布说明只告警。
   if [[ "$STEP" != 'commit' && "$STEP" != 'test' && "$STEP" != 'preflight' ]]; then
-    [[ -f ".github/release-notes/v${VERSION}.md" ]] || die "缺少发布说明 .github/release-notes/v${VERSION}.md"
+    if [[ ! -f ".github/release-notes/v${VERSION}.md" ]]; then
+      if [[ $DRY -eq 1 ]]; then
+        warn "缺少发布说明 .github/release-notes/v${VERSION}.md（dry-run 继续）"
+      else
+        die "缺少发布说明 .github/release-notes/v${VERSION}.md"
+      fi
+    fi
   fi
   [[ -f "$DEPLOY_EXE" ]] || die "缺少组件 $DEPLOY_EXE"
   [[ -f "$DEPLOY_REMOTE" ]] || warn "缺少组件 $DEPLOY_REMOTE（--deploy-mode local 可不用）"
@@ -154,26 +238,13 @@ preflight() {
   command -v cargo >/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
   command -v cargo >/dev/null || die '缺少 cargo（~/.cargo/bin 也不在 PATH）'
   printf '  版本=%s  分支=%s  仓库=%s\n' "$VERSION" "$BRANCH" "$REPO"
-  printf '  主机=%s\n' "$HOSTS"
+  printf '  主机=%s  代理=%s:%s  面板端口=%s\n' "$HOSTS" "$PROXY_HOST" "$PROXY_PORT" "$PANEL_PORT"
   printf '  工作树：\n'
   git status --short | sed 's/^/    /'
   printf '  发布说明：.github/release-notes/v%s.md\n' "$VERSION"
   printf '  脚本已入库，commit 步骤会一并提交脚本改动\n'
-  # --execute 且本步骤会跑到 announce / verify 时提前要求令牌，
-  # 避免先做了一串远端写操作才在最后报错。
-  local need_token=0
-  case "$STEP" in
-    all|verify) need_token=1 ;;
-    announce|deploy)
-      if [[ $SKIP_ANNOUNCE -eq 0 ]]; then need_token=1; fi
-      ;;
-  esac
-  if [[ $DRY -eq 0 && $need_token -eq 1 && -z "$PANEL_TOKEN" ]]; then
-    die '请先导出环境变量 MILIASTRA_PANEL_TOKEN（远程面板令牌不得写入文件/提交/报告）'
-  fi
   printf '  模式：%s\n' "$([[ $DRY -eq 1 ]] && echo dry-run || echo execute)"
 }
-
 step_test() {
   run '全量单线程 lib 测试' cargo test --lib --no-default-features -- --test-threads=1
 }
@@ -189,7 +260,7 @@ step_commit() {
 }
 
 step_push() {
-  # 绕开 ghfast.top：全局 insteadOf 会破坏 TLS，必须清空全局配置并直连 GitHub。
+  # 绕开全局 insteadOf / 镜像重写：否则 TLS 被改写，必须清空全局配置直连 GitHub。
   if [[ $DRY -eq 1 ]]; then
     printf '  [dry-run] 推送 main（直连 GitHub，GIT_CONFIG_GLOBAL=/dev/null，令牌隐藏）\n'
     printf '            $ GIT_CONFIG_GLOBAL=/dev/null GIT_HTTP_VERSION=HTTP/1.1 git push "https://x-access-token:***@github.com/%s.git" %s\n' "$REPO" "$BRANCH"
@@ -199,7 +270,7 @@ step_push() {
   token="$(GH_HOST=github.com gh auth token)"
   [[ -n "$token" ]] || die 'gh auth token 为空'
   url="https://x-access-token:${token}@github.com/${REPO}.git"
-  log '推送 main（直连 GitHub，绕过 ghfast.top rewrite）'
+  log '推送 main（清空全局 git 配置，直连 GitHub）'
   GIT_CONFIG_GLOBAL=/dev/null GIT_HTTP_VERSION=HTTP/1.1 git push "$url" "$BRANCH"
   unset token url
 }
@@ -318,7 +389,7 @@ step_announce() {
   fi
   if [[ $DRY -eq 1 ]]; then
     for host in $ANNOUNCE_HOSTS; do
-      printf '  [dry-run] POST http://%s:18888/chat/send?text=<URL编码>&usePrefix=false（每台各发一次）\n' "$host"
+      printf '  [dry-run] POST http://%s:%s/chat/send?text=<URL编码>&usePrefix=false（每台各发一次）\n' "$host" "$PANEL_PORT"
       printf '            文本=%s\n' "$ANNOUNCE_TEXT"
     done
     printf '  [dry-run] sleep %s（全部发完后统一给玩家缓冲）后进入部署\n' "$ANNOUNCE_DELAY"
@@ -329,7 +400,7 @@ step_announce() {
   local encoded url response
   encoded="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$ANNOUNCE_TEXT")"
   for host in $ANNOUNCE_HOSTS; do
-    url="http://$host:18888/chat/send?text=$encoded&usePrefix=false"
+    url="http://$host:$PANEL_PORT/chat/send?text=$encoded&usePrefix=false"
     log "更新预告：调用 $host 的 /chat/send（每台各发一次）"
     response="$(curl -sS -m 10 -X POST -H "x-miliastra-token: $PANEL_TOKEN" "$url")"
     printf '%s' "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' \
@@ -351,30 +422,51 @@ step_deploy() {
   # 无论 all 流程还是单独 --step deploy，部署前都对每台主机各发一次预告，
   # 全部发完后统一等 5 秒。
   step_announce
-  if [[ "$DEPLOY_MODE" == 'components' && "$HOSTS" == "$HOSTS_DEFAULT" ]]; then
-    # 组件 1：deploy-remote.sh 自带「代理下载 + .119 哈希校验 + 备份/停进程/替换 + 计划任务启动 + 面板健康检查」。
-    # TMPDIR 固定到我们可控的目录，便于复用它下载并解压出的同一份 exe 给 .242。
+  if [[ "$DEPLOY_MODE" == 'components' ]]; then
+    local -a hosts_arr=()
+    read -r -a hosts_arr <<< "$HOSTS"
+    local first="${hosts_arr[0]:-<HOST>}"
+    local -a rest=("${hosts_arr[@]:1}")
     if [[ $DRY -eq 1 ]]; then
-      printf '  [dry-run] 组件1：TMPDIR=<workdir> %s %s %s（下载并部署 .119）\n' \
-        "$DEPLOY_REMOTE" "${ARTIFACT_ID:-<id>}" "${EXPECTED_BYTES:-<bytes>}"
-      printf '  [dry-run] 组件2：%s --host 192.168.31.242 --exe <同一份 exe>\n' "$DEPLOY_EXE"
+      printf '  [dry-run] 组件1：MILIASTRA_DEPLOY_HOST=%s TMPDIR=<workdir> %s %s %s（代理下载并部署首台）\n' \
+        "$first" "$DEPLOY_REMOTE" "${ARTIFACT_ID:-<id>}" "${EXPECTED_BYTES:-<bytes>}"
+      if [[ ${#rest[@]} -eq 0 ]]; then
+        printf '  [dry-run] 组件2：（无其余主机，跳过）\n'
+      else
+        for host in "${rest[@]}"; do
+          printf '  [dry-run] 组件2：%s --host %s --exe <同一份 exe> --user %s --key <SSH_KEY> --dir <REMOTE_DIR>\n' \
+            "$DEPLOY_EXE" "$host" "$REMOTE_USER"
+        done
+      fi
       return 0
     fi
     WORK="$(mktemp -d)"
-    log '组件 1：deploy-remote.sh（代理下载 + .119 部署）'
+    log "组件 1：deploy-remote.sh（代理下载 + $first 部署）"
+    MILIASTRA_DEPLOY_HOST="$first" \
+    MILIASTRA_SSH_USER="$REMOTE_USER" \
+    MILIASTRA_SSH_KEY="$SSH_KEY" \
+    MILIASTRA_REMOTE_DIR="$REMOTE_DIR" \
+    MILIASTRA_PROXY_HOST="$PROXY_HOST" \
+    MILIASTRA_PROXY_PORT="$PROXY_PORT" \
+    MILIASTRA_PANEL_PORT="$PANEL_PORT" \
+    MILIASTRA_REPO="$REPO" \
+    MILIASTRA_TASK_NAME="$TASK_NAME" \
     TMPDIR="$WORK" bash "$DEPLOY_REMOTE" "$ARTIFACT_ID" "$EXPECTED_BYTES"
     EXE_PATH="$(find "$WORK" -type f -path "*/x/$EXE_NAME" -print -quit)"
     [[ -n "$EXE_PATH" ]] || die "deploy-remote.sh 未留下 $EXE_NAME"
-    log '组件 2：deploy-exe.sh（.242）'
-    bash "$DEPLOY_EXE" --host 192.168.31.242 --exe "$EXE_PATH" --key "$SSH_KEY"
+    for host in "${rest[@]}"; do
+      log "组件 2：deploy-exe.sh（$host）"
+      bash "$DEPLOY_EXE" --host "$host" --exe "$EXE_PATH" \
+        --user "$REMOTE_USER" --key "$SSH_KEY" --dir "$REMOTE_DIR" --task "$TASK_NAME"
+    done
   else
     download_artifact
     for host in $HOSTS; do
-      run "部署 $host" bash "$DEPLOY_EXE" --host "$host" --exe "${EXE_PATH:-<exe>}" --key "$SSH_KEY"
+      run "部署 $host" bash "$DEPLOY_EXE" --host "$host" --exe "${EXE_PATH:-<exe>}" \
+        --user "$REMOTE_USER" --key "$SSH_KEY" --dir "$REMOTE_DIR" --task "$TASK_NAME"
     done
   fi
 }
-
 step_verify() {
   # 远端面板令牌只认环境变量：--execute 且需要注入 simulate-chat 时为空就退出，
   # 绝不回落到任何字面量。dry-run 只打印流程，不要求变量。
@@ -389,14 +481,14 @@ step_verify() {
     log "验收 $host"
     local code=''
     for _ in $(seq 1 20); do
-      code="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$host:18888/health" || true)"
+      code="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$host:$PANEL_PORT/health" || true)"
       [[ "$code" == '200' ]] && break
       sleep 3
     done
     [[ "$code" == '200' ]] || die "$host 面板 /health 未就绪（$code）"
     printf '  /health=200\n'
     # 只注入「应被拒绝」的命令：不会在真实大厅产生回复，避免刷屏。
-    curl -s -m 10 -X POST "http://$host:18888/debug/simulate-chat" \
+    curl -s -m 10 -X POST "http://$host:$PANEL_PORT/debug/simulate-chat" \
       -H 'Content-Type: application/json' -H "x-miliastra-token: $PANEL_TOKEN" \
       -d '{"role":"friend","text":"@这个命令不存在"}' >/dev/null || warn "$host simulate-chat 失败"
     # 版本核对：exe 的 ProductVersion 应等于发布版本（失败只告警，不阻断）。
@@ -434,7 +526,7 @@ case "$STEP" in
     step_wait
     step_release
     step_artifact
-    # step_deploy 内部会先发一次更新预告并等 5 秒，再下载/停进程/替换/重启；
+    # step_deploy 内部会对每台主机各发一次预告、统一等 5 秒，再下载/停进程/替换/重启；
     # 下载由 deploy 步骤负责：components 模式交给 deploy-remote.sh（避免重复下载），
     # local 模式由 deploy 步骤内的 download_artifact 完成。
     step_deploy

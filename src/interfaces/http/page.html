@@ -665,6 +665,9 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
 #configForm .config-group-card .config-field-label b mark,.config-section-item mark,.config-domain-head mark{background:var(--accent-soft);color:var(--accent);border-radius:3px;padding:0 2px}
 .config-empty{color:var(--text-3);text-align:center;padding:var(--sp-5);background:var(--bg-card);border:1px dashed var(--sep-1);border-radius:var(--radius-m)}
 .config-vision-note{font-size:var(--fs-tiny);line-height:var(--lh-tiny);background:var(--info-soft);color:var(--text-1);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-2) var(--sp-3);margin-top:var(--sp-2)}
+.config-subhead{display:flex;align-items:baseline;gap:var(--sp-2);margin:var(--sp-4) 0 var(--sp-2);padding-top:var(--sp-3);border-top:1px solid var(--sep-2)}
+.config-subhead h3{margin:0;font-size:var(--fs-title);color:var(--text-1)}
+.config-subhead code{font-size:var(--fs-tiny);color:var(--text-3)}
 .config-vision-preview{margin-top:var(--sp-2)}
 .config-vision-preview img{display:block;max-width:100%;max-height:380px;width:auto;height:auto;background:#000;border:1px solid var(--sep-1);border-radius:var(--radius-m)}
 .config-vision-tools{margin-top:var(--sp-2);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-2) var(--sp-3);background:var(--bg-input)}
@@ -834,31 +837,15 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
       <p class="page-subtitle">关键词触发的大厅聊天机器人；记忆按玩家个人隔离，仅保存轻量事实与最近对话</p>
       <div class="config-status" id="aiChatStatusBar">
         <span class="chip"><i class="dot"></i><span>状态</span><em id="aiChatStatusText">读取中…</em></span>
-        <span id="aiChatStatusHint">来源：GET /config/section?name=ai_chat</span>
+        <span id="aiChatStatusHint">来源：GET /config（只读摘要）</span>
         <button class="btn small" onclick="loadAiChatSettings()">重新读取</button>
-        <button class="btn small" onclick="navigateTo('config')">打开完整配置</button>
+        <button class="btn small primary" onclick="openAiConfig()">去配置中心 → AI 配置</button>
       </div>
       <div class="config-message err hidden" id="aiChatMessage" role="status" aria-live="polite"></div>
       <div class="page-grid" id="aiChatGrid">
-        <details class="panel" open>
-          <summary class="panel-head">触发与开关</summary>
-          <div class="panel-body" id="aiChatTriggerPanel"><p class="config-field-hint">正在读取配置…</p></div>
-        </details>
-        <details class="panel" open>
-          <summary class="panel-head">记忆容量</summary>
-          <div class="panel-body" id="aiChatMemoryPanel"><p class="config-field-hint">正在读取配置…</p></div>
-        </details>
-        <details class="panel" open>
-          <summary class="panel-head">模型与提示词</summary>
-          <div class="panel-body" id="aiChatPromptPanel"><p class="config-field-hint">正在读取配置…</p></div>
-        </details>
-        <details class="panel" open id="aiChatVisionPanelWrap">
-          <summary class="panel-head">AI 识图</summary>
-          <div class="panel-body" id="aiChatVisionPanel"><p class="config-field-hint">正在读取配置…</p></div>
-        </details>
-        <details class="panel" open>
-          <summary class="panel-head">AI回复 标签</summary>
-          <div class="panel-body" id="aiChatReplyPanel"><p class="config-field-hint">正在读取配置…</p></div>
+        <details class="panel" open id="aiChatSummaryPanelWrap">
+          <summary class="panel-head">AI 配置摘要（只读）</summary>
+          <div class="panel-body" id="aiChatSummaryPanel"><p class="config-field-hint">正在读取配置…</p></div>
         </details>
 
         <details class="panel" open id="aiChatMemoryPanelWrap">
@@ -1443,16 +1430,7 @@ async function navigateTo(route,updateHash=true){
     configData=null
     configActiveSection=null
   }
-  // AI 聊天页的未保存修改也要拦一次：aiChatDirty 原先只写不读，
-  // 改完直接切走或刷新就静默丢掉了。
-  if(aiChatDirty&&currentRoute==='aichat'&&route!==currentRoute){
-    if(!await confirmDialog('有未保存的 AI 聊天修改，确定离开？',{title:'离开 AI 聊天'})){
-      if(!updateHash&&currentRoute&&location.hash!=='#'+currentRoute)history.replaceState(null,'','#'+currentRoute)
-      return
-    }
-    aiChatDirty=false
-  }
-  // 身份映射页有未保存修改时也要拦一次（与 AI 聊天页同款）。
+  // 身份映射页有未保存修改时也要拦一次。
   if(identityPageDirty&&currentRoute==='identity'&&route!==currentRoute){
     if(!await confirmDialog('有未保存的身份映射修改，确定离开？',{title:'离开身份映射'})){
       if(!updateHash&&currentRoute&&location.hash!=='#'+currentRoute)history.replaceState(null,'','#'+currentRoute)
@@ -1479,30 +1457,12 @@ async function navigateTo(route,updateHash=true){
  * 复用配置中心 schema 渲染与保存接口，仅编辑 ai_chat 段。
  */
 let aiChatData=null
-let aiChatFields=[]
-let aiChatDirty=false
 let visionStatusLoading=false
 let visionStatusFetchedAt=0
 let visionPreviewLoading=false
 let visionPreviewUrl=null
 // 旧配置缺 ai_chat.vision.* 时记录“未设置”字段：不伪装默认值，未改动前不写回。
-let aiChatVisionUnset=new Set()
 let configVisionUnset=new Set()
-const AI_CHAT_GROUPS=[
-  {id:'aiChatTriggerPanel',keys:['enabled','keyword','trigger_mode','min_access','cooldown_seconds','allow_commands']},
-  {id:'aiChatMemoryPanel',keys:['actor_token_budget','bot_token_budget']},
-  {id:'aiChatPromptPanel',keys:['model','reasoning','max_tokens','system_prompt','answer_prompt','extract_prompt']},
-  // AI 识图：ai_chat.vision.*；截图只在本机内存编码，模型不支持时后端自动降级纯文本。
-  {id:'aiChatVisionPanel',keys:['vision.enabled','vision.mode','vision.capture_scope','vision.max_edge','vision.jpeg_quality','vision.max_bytes','vision.timeout_ms','vision.model','vision.allow_full_screen']},
-  // {AI回复} 是回复模板里的独立标签，生成参数在 ai_reply.* 下；
-  // 不在这里列出的话，用户根本看不到它、也没法调。
-  {id:'aiChatReplyPanel',keys:[
-    'ai_reply.mode','ai_reply.include_template','ai_reply.include_command',
-    'ai_reply.system_prompt','ai_reply.user_prompt',
-    'ai_reply.max_tokens','ai_reply.timeout_seconds'
-  ]}
-]
-
 /* ===== AI 记忆库面板 =====
  * 只读查询 + 精确删除。不做「编辑事实」：
  * 记忆内容是模型抽取的自然语言，手改容易与后续抽取冲突；
@@ -1685,15 +1645,11 @@ async function deleteAiChatFact(name,fact){
 async function loadAiChatSettings(){
   const status=$('aiChatStatusText')
   try{
-    const schema=await request('/config/schema')
-    const section=(schema.sections||[]).find(item=>item.name==='ai_chat')
-    if(!section)throw new Error('配置 schema 中没有 ai_chat 段')
-    aiChatFields=section.fields||[]
-    const current=await request('/config/section?name=ai_chat')
-    aiChatData={revision:current.revision,values:current.values||{}}
-    aiChatDirty=false
-    renderAiChatPage()
-    if(status)status.textContent=aiChatData.values.enabled===true||aiChatData.values.enabled==='true'?'已启用':'未启用'
+    const data=await request('/config')
+    aiChatData={revision:data&&data.revision!=null?data.revision:null,sections:(data&&data.sections)||{}}
+    renderAiChatSummary()
+    const enabled=aiChatData.sections.ai_chat&&aiChatData.sections.ai_chat.enabled===true
+    if(status)status.textContent=enabled?'已启用':'未启用'
     showAiChatMessage('',null)
   }catch(error){
     showAiChatMessage('读取失败：'+error.message,'err')
@@ -1706,73 +1662,66 @@ function showAiChatMessage(text,kind){
   el.textContent=text||''
   el.className='config-message'+(kind?' '+kind:'')+(text?'':' hidden')
 }
-// ai_chat 段里既有扁平字段（enabled），也有嵌套字段（ai_reply.mode）。
-// 早期按扁平 key 读写，导致 ai_reply.* 永远读不到、存回去还会多出
-// 一个叫 "ai_reply.mode" 的顶层键，AI回复 的配置因此一直是默认值。
-function aiChatKey(path){return String(path||'').replace(/^ai_chat\./,'')}
-function aiChatValueAt(values,key){
-  if(!values)return undefined
-  let node=values
-  for(const seg of String(key).split('.')){
+function aiSummaryValue(sections,sectionName,path){
+  let node=sections&&sections[sectionName]
+  for(const seg of String(path).split('.').slice(1)){
     if(node==null||typeof node!=='object')return undefined
     node=node[seg]
   }
   return node
 }
-function aiChatSetValue(target,key,value){
-  const seg=String(key).split('.')
-  let node=target
-  for(let i=0;i<seg.length-1;i++){
-    if(node[seg[i]]==null||typeof node[seg[i]]!=='object')node[seg[i]]={}
-    node=node[seg[i]]
-  }
-  node[seg[seg.length-1]]=value
+function aiSummaryRow(label,value){
+  const text=(value==null||String(value).trim()==='')?'（未设置）':String(value)
+  return '<div class="config-field"><div class="config-field-head"><b>'+esc(label)+'</b></div><div class="config-field-hint">'+esc(text)+'</div></div>'
 }
-// 放弃 AI 聊天页的未保存修改：有改动时先确认，避免误点丢配置。
-async function discardAiChatSettings(){
-  if(aiChatDirty&&!await confirmDialog('放弃未保存的 AI 聊天修改？',{title:'放弃修改'}))return
-  aiChatDirty=false
-  await loadAiChatSettings()
+function renderAiChatSummary(){
+  const host=$('aiChatSummaryPanel')
+  if(!host)return
+  const sections=aiChatData&&aiChatData.sections?aiChatData.sections:{}
+  const chat=sections.ai_chat||{}
+  const vision=chat.vision||{}
+  const ai=sections.ai||{}
+  const tts=sections.tts||{}
+  const parts=[]
+  parts.push('<div class="config-message config-vision-note">这里只读展示。所有 AI 配置（连接/模型、聊天、识图、语音 TTS）都在左侧「配置中心 → AI 配置」编辑，一次保存同一 revision。</div>')
+  parts.push('<div class="config-group-card">')
+  parts.push('<div class="config-group-head">运行状态</div>')
+  parts.push(aiSummaryRow('AI 聊天',chat.enabled===true?'已启用':'未启用'))
+  parts.push(aiSummaryRow('触发关键词',chat.keyword))
+  parts.push(aiSummaryRow('触发方式',chat.trigger_mode))
+  parts.push(aiSummaryRow('触发权限',chat.min_access))
+  parts.push(aiSummaryRow('冷却秒数',chat.cooldown_seconds))
+  parts.push('</div>')
+  parts.push('<div class="config-group-card">')
+  parts.push('<div class="config-group-head">模型与工具</div>')
+  parts.push(aiSummaryRow('AI 连接 provider',ai.provider))
+  parts.push(aiSummaryRow('AI 模型',ai.model||chat.model))
+  parts.push(aiSummaryRow('识图',vision.enabled===true?'已启用 · 模式 '+(vision.mode||'auto'):'未启用'))
+  parts.push(aiSummaryRow('识图范围/质量',vision.capture_scope?vision.capture_scope+' · 长边 '+(vision.max_edge==null?'默认':vision.max_edge)+' · JPEG '+(vision.jpeg_quality==null?'默认':vision.jpeg_quality):''))
+  parts.push(aiSummaryRow('语音 TTS',tts.enabled===true?'已启用 · 模型 '+(tts.model||'默认'):'未启用'))
+  parts.push('</div>')
+  parts.push('<div class="config-string-row"><button class="btn primary" onclick="openAiConfig()">去配置中心 → AI 配置</button><button class="btn" onclick="loadAiChatSettings()">重新读取</button></div>')
+  host.innerHTML=parts.join('')
 }
-function aiChatFieldValue(path){
-  return aiChatValueAt(aiChatData&&aiChatData.values,aiChatKey(path))
-}
-function renderAiChatPage(){
-  for(const group of AI_CHAT_GROUPS){
-    const host=$(group.id)
-    if(!host)continue
-    const parts=[]
-    let found=0
-    for(const key of group.keys){
-      const field=aiChatFields.find(item=>item.path==='ai_chat.'+key)
-      if(!field)continue
-      found++
-      parts.push('<div class="config-field">')
-      parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code></div>')
-      if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
-      let fieldValue=aiChatFieldValue(field.path)
-      const isVision=String(field.path).startsWith('ai_chat.vision.')
-      const visionUnset=isVision&&fieldValue===undefined
-      if(isVision){if(visionUnset)aiChatVisionUnset.add(field.path);else aiChatVisionUnset.delete(field.path)}
-      // 旧配置缺 vision 时不拿 schema default 伪装成“已设置”；控件保持未选/空，改动后才写入。
-      parts.push(configControlHtml(field,fieldValue,'ai_chat','aichat-')+(visionUnset?'<div class="config-field-hint">旧配置未设置（沿用后端默认）；改动该项后才会写入。</div>':''))
-      parts.push('</div>')
+function openAiConfig(){
+  navigateTo('config')
+  let tries=0
+  const select=()=>{
+    if(configSchema&&configSchema.some(s=>s.name==='ai')){
+      selectConfigSection('ai')
+      const anchor=document.getElementById('aiConfigChat')
+      if(anchor)anchor.scrollIntoView({block:'start'})
+      return
     }
-    if(group.id==='aiChatVisionPanel')parts.push(visionPanelExtraHtml(found===0))
-    parts.push('<div class="config-string-row"><button class="btn" onclick="saveAiChatSettings()">保存本页</button>')
-    parts.push('<button class="btn ghost" onclick="discardAiChatSettings()">放弃修改</button></div>')
-    host.innerHTML=parts.join('')
+    if(tries++<40)setTimeout(select,80)
   }
-  document.querySelectorAll('#page-aichat [data-cfg]').forEach(input=>{
-    const touch=()=>{aiChatDirty=true;input.dataset.cfgTouched='1'}
-    input.addEventListener('change',touch)
-    input.addEventListener('input',touch)
-  })
-  if($('aiChatVisionPanel'))loadVisionStatus(false)
+  select()
 }
+
 // AI 识图分组内的隐私说明 + 能力状态 + 本机预览（不写配置、不上传模型、不落盘）。
 function visionPanelExtraHtml(noSchema){
-  const hasMode=aiChatFields.some(f=>f.path==='ai_chat.vision.mode')
+  const chatSchema=configSectionByName('ai_chat')
+  const hasMode=!!chatSchema&&chatSchema.fields.some(f=>f.path==='ai_chat.vision.mode')
   const modeNote=hasMode?'':'<p class="config-field-hint">当前后端未提供 ai_chat.vision.mode 下拉；可选值：<b>auto</b>=每轮自动附截图（默认）、<b>tool</b>=不自动附图、由 AI 调用 look、<b>both</b>=自动附图并允许 look。</p>'
   const note=noSchema?'<p class="config-field-hint">当前后端版本未提供 ai_chat.vision.* 配置；升级后端后这里会出现开关、模式、截图范围与限额。下面仍可预览画面。</p>':''
   return note
@@ -1786,7 +1735,7 @@ function visionPanelExtraHtml(noSchema){
     +'<pre>{"name":"look","arguments":"{\\\"instruction\\\":\\\"描述聊天区域里的文字\\\"}"}</pre>'
     +'<pre>{"name":"speak","arguments":"{\\"text\\":\\"我没事\\",\\"emotion\\":\\"sad\\"}"}</pre>'
     +'<p class="config-field-hint">speak 可选参数（按模型能力）：emotion / style / speed / volume_db，例如 <code>{"text":"我没事","emotion":"sad"}</code>；S1 用 (sad) 内联、S2/S2.1 用 [laughs]、Drama 3 用导演指示 + &lt;whisper&gt;…&lt;/whisper&gt;。以后端工具 schema 为准。</p>'
-    +'<p class="config-field-hint">arguments 是 JSON 字符串（OpenAI function call 形状）。工具名/参数以后端实现为准；speak 受「配置中心 → 语音 TTS」配置与单条字数上限约束。</p>'
+    +'<p class="config-field-hint">arguments 是 JSON 字符串（OpenAI function call 形状）。工具名/参数以后端实现为准；speak 受本页「语音 TTS」配置与单条字数上限约束。</p>'
     +'<p class="config-field-hint"><b>instruction 示例（写在你自己的 system_prompt 里，可自行改写）</b>：需要看画面时调用 look；需要朗读时调用 speak，text 填要朗读的短句。本面板不会自动注入。</p>'
     +'</details>'
     +'<div class="row wrap" style="align-items:center;gap:var(--sp-2)">'
@@ -1797,12 +1746,12 @@ function visionPanelExtraHtml(noSchema){
     +'<div class="config-field-hint" id="aiVisionPreviewMeta"></div>'
     +'<div id="aiVisionPreview" class="config-vision-preview hidden"></div>'
 }
-function aiChatVisionControl(path){return document.getElementById('aichat-'+configControlId('ai_chat.'+path))}
+function configVisionControl(path){return document.getElementById(configControlId('ai_chat.'+path))}
 function visionStatusOverrides(){
   // 用面板未保存的值查能力：视觉模型优先，其次 ai_chat.model；provider/endpoint 若同页存在也带上。
   const out={}
-  const vm=aiChatVisionControl('vision.model')
-  const chatModel=document.getElementById('aichat-'+configControlId('ai_chat.model'))
+  const vm=configVisionControl('vision.model')
+  const chatModel=document.getElementById(configControlId('ai_chat.model'))
   const model=(vm&&String(vm.value||'').trim())||(chatModel&&String(chatModel.value||'').trim())||''
   if(model)out.model=model
   const provider=document.getElementById('cfg-ai-provider')
@@ -1812,7 +1761,7 @@ function visionStatusOverrides(){
   return out
 }
 function visionNumber(path,fallback){
-  const el=aiChatVisionControl(path)
+  const el=configVisionControl(path)
   const n=el?Number(el.value):NaN
   return Number.isFinite(n)?n:fallback
 }
@@ -1845,10 +1794,10 @@ async function previewVisionFrame(){
   const btn=$('aiVisionPreviewBtn')
   const meta=$('aiVisionPreviewMeta')
   const host=$('aiVisionPreview')
-  // quality 与 schema 40..95 对齐
-  let q=visionNumber('vision.jpeg_quality',80)
-  q=Math.max(40,Math.min(95,Math.round(q)))
-  const maxEdge=Math.max(1,Math.round(visionNumber('vision.max_edge',1280)))
+  // quality 与 schema 40..100 对齐（task-65 默认 100）；max_edge 默认 1600。
+  let q=visionNumber('vision.jpeg_quality',100)
+  q=Math.max(40,Math.min(100,Math.round(q)))
+  const maxEdge=Math.max(1,Math.round(visionNumber('vision.max_edge',1600)))
   const maxBytes=Math.max(1,Math.round(visionNumber('vision.max_bytes',4000000)))
   visionPreviewLoading=true
   if(btn){btn.disabled=true;btn.textContent='截图中…'}
@@ -1877,43 +1826,12 @@ async function previewVisionFrame(){
     // 失败只影响预览，不动任何配置控件、不产脏值。
     if(meta)meta.textContent=''
     if(host){host.innerHTML='';host.classList.add('hidden')}
-    showAiChatMessage('预览当前画面失败：'+((e&&e.message)||'未知错误'),'err')
+    showConfigMessage('预览当前画面失败：'+((e&&e.message)||'未知错误'),'err')
   }finally{
     visionPreviewLoading=false
     if(btn){btn.disabled=false;btn.textContent='预览当前画面'}
   }
 }
-function collectAiChatSection(){
-  // 以已保存值为基线：页面上没渲染的字段（其他分组里的）不能被写丢。
-  const values=JSON.parse(JSON.stringify(aiChatData&&aiChatData.values?aiChatData.values:{}))
-  for(const field of aiChatFields){
-    const key=aiChatKey(field.path)
-    // AI 聊天页控件用 aichat- 前缀，与配置中心的同 path 控件区分开。
-    const el=document.getElementById('aichat-'+configControlId(field.path))
-    if(!el)continue
-    if(aiChatVisionUnset.has(field.path)&&el.dataset.cfgTouched!=='1')continue
-    const previous=aiChatValueAt(aiChatData&&aiChatData.values,key)
-    const kind=field.kind&&field.kind.type
-    let value
-    if(kind==='bool')value=el.checked
-    else if(kind==='int'){const n=Number(el.value);value=Number.isFinite(n)?Math.trunc(n):previous}
-    else if(kind==='float'){const n=Number(el.value);value=Number.isFinite(n)?n:previous}
-    else if(kind==='enum'||kind==='string'||kind==='text')value=el.value
-    else value=previous
-    aiChatSetValue(values,key,value)
-  }
-  return values
-}
-async function saveAiChatSettings(){
-  try{
-    const section=collectAiChatSection()
-    const resp=await requestJson('/config/save',{baseRevision:aiChatData.revision!=null?aiChatData.revision:0,sections:{ai_chat:section}})
-    if(resp&&resp.ok===false){showAiChatMessage('保存失败：'+(resp.message||'校验未通过'),'err');return}
-    showAiChatMessage('已保存','ok')
-    await loadAiChatSettings()
-  }catch(error){showAiChatMessage('保存失败：'+error.message,'err')}
-}
-
 /* ===== AI 模型列表 ===== */
 let modelChoices=[]
 let modelLoading=false
@@ -4269,6 +4187,9 @@ function configFieldMatches(field){
 }
 function configSectionHasMatch(section){
   if(!configSearchText)return true
+  if(section.name==='ai'){
+    return configAiMergedSections.some(name=>{const sec=configSectionByName(name);return !!sec&&sec.fields.some(configFieldMatches)})
+  }
   return section.fields.some(configFieldMatches)
 }
 function markConfigDirty(sectionName){
@@ -4336,13 +4257,22 @@ const configSectionFlow={
   entertainment:['turtle_soup','undercover','landlord','idiom_chain','number_bomb','hotkeys'],
   system:['timing','startup','invite','friend_delivery','moderation','http','logging','tui','state','kugou']
 }
+// 新 IA：AI 配置把 ai / ai_chat / tts 合并成一个页面，共用同一套保存按钮与 revision。
+const configAiMergedSections=['ai','ai_chat','tts']
+function configActiveSectionNames(){
+  if(!configActiveSection)return []
+  return configActiveSection==='ai'?configAiMergedSections.filter(name=>configSectionByName(name)):[configActiveSection]
+}
 function configSectionRank(domain,name){
   const list=configSectionFlow[domain]
   const index=list?list.indexOf(name):-1
   return index<0?999:index
 }
-// identity 段已移到左侧「身份映射」独立页，配置中心侧栏/搜索/表单都不再出现它。
-function configSectionVisible(section){return section && section.name!=='identity'}
+// identity 段已移到左侧「身份映射」独立页；ai_chat/tts 合并进「AI 配置」，
+// 侧栏/搜索/默认落点都不再单独出现它们。
+function configSectionVisible(section){
+  return section && section.name!=='identity' && section.name!=='ai_chat' && section.name!=='tts'
+}
 // 搜索命中高亮：文本先 esc 再对命中片段包 <mark>（防 XSS）。
 function configHighlight(text){
   const safe=esc(String(text==null?'':text))
@@ -4372,11 +4302,14 @@ function renderConfigSectionList(){
     })
     // 当前段所属的域默认展开，其余域收起；搜索时有命中的域也展开。
     const expanded=configDomainOpen.has(domain)||sections.some(s=>s.name===configActiveSection)||!!configSearchText
-    const domDirty=sections.some(s=>configDirty.has(s.name))
+    const sectionDirtyNames=s=>s.name==='ai'?configAiMergedSections:[s.name]
+    const domDirty=sections.some(s=>sectionDirtyNames(s).some(name=>configDirty.has(name)))
     const items=sections.map(section=>{
-      const dirty=configDirty.has(section.name)
+      const dirty=sectionDirtyNames(section).some(name=>configDirty.has(name))
       const active=section.name===configActiveSection?' active':''
-      return '<button type="button" class="config-section-item'+active+'"'+(active?' aria-current="true"':'')+' onclick="selectConfigSection('+esc(JSON.stringify(section.name))+')"><span>'+configHighlight(section.label)+'</span><span class="section-name">'+esc(section.name)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
+      const label=section.name==='ai'?'AI 配置':section.label
+      const nameLabel=section.name==='ai'?'ai':section.name
+      return '<button type="button" class="config-section-item'+active+'"'+(active?' aria-current="true"':'')+' onclick="selectConfigSection('+esc(JSON.stringify(section.name))+')"><span>'+configHighlight(label)+'</span><span class="section-name">'+esc(nameLabel)+'</span>'+(dirty?'<span class="dirty-dot" title="有未保存修改"></span>':'')+'</button>'
     }).join('')
     const label=configHighlight(configDomainLabels[domain]||domain)
     return '<div class="config-domain'+(expanded?' open':'')+'">'+
@@ -4392,21 +4325,24 @@ function toggleConfigDomain(domain){
   renderConfigSectionList()
 }
 function syncConfigFormToData(){
-  if(!configActiveSection||!configData||!configDirty.has(configActiveSection))return true
-  const section=configSectionByName(configActiveSection)
-  if(!section)return true
-  const out={}
-  for(const field of section.fields){
-    if(field.source==='bootstrap')continue
-    const collected=collectConfigFieldValue(field,configActiveSection)
-    if(collected.invalid)return false
-    if(collected.skip)continue
-    const seg=String(field.path).split('.').slice(1)
-    if(collected.clear)setNestedValue(out,seg,{'__clear__':true})
-    else setNestedValue(out,seg,collected.value)
+  if(!configActiveSection||!configData)return true
+  for(const name of configActiveSectionNames()){
+    if(!configDirty.has(name))continue
+    const section=configSectionByName(name)
+    if(!section)continue
+    const out={}
+    for(const field of section.fields){
+      if(field.source==='bootstrap')continue
+      const collected=collectConfigFieldValue(field,name)
+      if(collected.invalid)return false
+      if(collected.skip)continue
+      const seg=String(field.path).split('.').slice(1)
+      if(collected.clear)setNestedValue(out,seg,{'__clear__':true})
+      else setNestedValue(out,seg,collected.value)
+    }
+    const base=configData.sections[name]
+    configData.sections[name]=Object.assign(base&&typeof base==='object'?JSON.parse(JSON.stringify(base)):{},out)
   }
-  const base=configData.sections[configActiveSection]
-  configData.sections[configActiveSection]=Object.assign(base&&typeof base==='object'?JSON.parse(JSON.stringify(base)):{},out)
   return true
 }
 function toggleVisualFields(){
@@ -4652,6 +4588,13 @@ function renderConfigForm(){
     loadVisualProfile(false)
     return
   }
+  if(section.name==='ai'){
+    form.innerHTML=renderAiConfigFormHtml(section)
+    aiProviderBind()
+    loadVisionStatus(false)
+    renderConfigSaveBar()
+    return
+  }
   const isAi=section.name==='ai'
   const hidesVisual=configSectionHidesVisual(section)
   const visibleFields=section.fields.filter(f=>configFieldMatches(f)&&!(hidesVisual&&f.managedBy==='visual'))
@@ -4673,9 +4616,17 @@ function renderConfigForm(){
       +'超过「单条文本上限」的文本会被截断（truncated），不会完整朗读。'
       +'隐私：合成文本可能包含玩家昵称/聊天内容，会发送给所配置的 fish.audio，不写入磁盘。</div>')
   }
-  // 按 schema group 合并成“分组卡片”，组内字段紧凑排列；无 group 的段整段一张卡。
+  parts.push(configFieldsBlockHtml(section,visibleFields))
+  parts.push('</div>')
+  form.innerHTML=parts.join('')
+  if(isAi)aiProviderBind()
+  renderConfigSaveBar()
+}
+// 通用“分组卡片”渲染：同一 section 的字段按 schema group 紧凑排列。
+function configFieldsBlockHtml(section,fields){
   let currentGroup=null, first=true, open=false
-  for(const field of visibleFields){
+  const parts=[]
+  for(const field of fields){
     const group=field.group||''
     if(first||group!==currentGroup){
       if(open)parts.push('</div>')
@@ -4683,13 +4634,67 @@ function renderConfigForm(){
       if(group)parts.push('<div class="config-group-head">'+esc(group)+'</div>')
       currentGroup=group; open=true; first=false
     }
-    parts.push(renderConfigFieldHtml(field,section,isAi))
+    parts.push(renderConfigFieldHtml(field,section,section.name==='ai'))
   }
   if(open)parts.push('</div>')
+  return parts.join('')
+}
+function configSubheadHtml(id,title,code,hint){
+  return '<div class="config-subhead" id="'+esc(id)+'"><h3>'+esc(title)+'</h3><code>'+esc(code)+'</code>'+(hint?'<span class="config-field-hint">'+hint+'</span>':'')+'</div>'
+}
+function aiPromptExamplesHtml(){
+  return '<details class="config-vision-tools" open><summary>提示词示例（可复制；只是示例，不会自动注入）</summary>'
+    +'<p class="config-field-hint">下面只是示例，不会自动注入；AI 是否调用工具、何时调用，完全由你自己的 system_prompt 决定。</p>'
+    +'<p class="config-field-hint"><b>system_prompt 片段</b>（可直接改写后贴进上面的系统提示词）</p>'
+    +'<pre>你可以在需要时使用工具：\n- 想了解当前游戏画面时，调用 look（可带 instruction，例如“描述聊天区域里的文字”）。\n- 需要把回复读出来时，调用 speak，text 填要朗读的短句。\n只在确实需要时调用工具，不要把工具调用写进普通回复。</pre>'
+    +'<p class="config-field-hint"><b>look 的自然语言用例</b></p>'
+    +'<pre>看看当前大厅有几个人。\n现在界面上发生了什么？</pre>'
+    +'<p class="config-field-hint"><b>speak 的自然语言用例</b></p>'
+    +'<pre>把这句话读出来。\n用语音回答。</pre>'
+    +'</details>'
+}
+function ttsUsageNoteHtml(section){
+  if(!section)return ''
+  const hasFormat=section.fields.some(f=>f.path==='tts.format')
+  const hasVoice=section.fields.some(f=>f.path==='tts.voice')
+  const hasProxy=section.fields.some(f=>f.path==='tts.http_proxy')
+  return '<div class="config-message config-vision-note">'
+    +'<b>语音 TTS 用法与隐私</b>：仅在 AI 调用 <code>speak</code> 工具时朗读，需要在「AI 聊天」的 system_prompt 里自行要求 AI 使用 speak。'
+    +'TTS 模型语法（按模型）：S1 固定括号标签如 (sad)；S2/S2.1 方括号自然语言如 [laughs]；Drama 3 导演指示如 [calm] 并配合 &lt;whisper&gt;…&lt;/whisper&gt;；内置模型 s1 / s2-pro / s2.1-pro / s2.1-pro-free / drama-3。'
+    +'speak 可选参数（按模型能力）：text 必填，emotion/style/speed/volume_db 可选，例如 <code>{"text":"我没事","emotion":"sad"}</code>。'
+    +(hasVoice?'voice 是 reference_id 的别名（reference_id 为空时生效），留空=fish 默认音色。':'')
+    +(hasFormat?'format 目前仅 WAV。':'')
+    +(hasProxy?'http_proxy 作用于 fish 音色目录与合成请求，留空沿用环境代理（支持 http/https/socks5）。':'')
+    +'duck_volume 是相对当前音乐音量再乘的比例（100=不压低），duck_fade_ms 是渐变时长。'
+    +'超过「单条文本上限」的文本会被截断（truncated），不会完整朗读。'
+    +'隐私：合成文本可能包含玩家昵称/聊天内容，会发送给所配置的 fish.audio，不写入磁盘。</div>'
+}
+function renderAiConfigFormHtml(aiSection){
+  const aiChat=configSectionByName('ai_chat')
+  const tts=configSectionByName('tts')
+  const pick=sec=>sec?sec.fields.filter(f=>configFieldMatches(f)&&!(configSectionHidesVisual(sec)&&f.managedBy==='visual')):[]
+  const aiFields=pick(aiSection)
+  const chatAll=pick(aiChat)
+  const chatFields=chatAll.filter(f=>!String(f.path).startsWith('ai_chat.vision.'))
+  const visionFields=chatAll.filter(f=>String(f.path).startsWith('ai_chat.vision.'))
+  const ttsFields=pick(tts)
+  const total=aiFields.length+chatFields.length+visionFields.length+ttsFields.length
+  const parts=['<div class="config-form">']
+  parts.push('<div class="config-section-head"><h2>AI 配置</h2><code>ai + ai_chat + tts</code><span class="config-section-stats">'+total+' 项 '+configEffectSummary([...aiFields,...chatFields,...visionFields,...ttsFields])+'</span></div>')
+  parts.push('<div class="config-message config-vision-note">AI 连接与模型、AI 聊天、AI 识图、语音 TTS 在同一页编辑，点一次保存写入同一 revision；不需要分别保存。</div>')
+  parts.push(configSubheadHtml('aiConfigConnection','AI 连接与模型','ai',''))
+  parts.push(aiFields.length?configFieldsBlockHtml(aiSection,aiFields):'<div class="config-empty">没有匹配字段</div>')
+  parts.push(configSubheadHtml('aiConfigChat','AI 聊天','ai_chat',''))
+  parts.push(chatFields.length?configFieldsBlockHtml(aiChat,chatFields):'<div class="config-empty">没有匹配字段</div>')
+  parts.push(aiPromptExamplesHtml())
+  parts.push(configSubheadHtml('aiConfigVision','AI 识图','ai_chat.vision',''))
+  parts.push(visionFields.length?configFieldsBlockHtml(aiChat,visionFields):'<div class="config-empty">没有匹配字段（后端尚未提供 ai_chat.vision.*）</div>')
+  parts.push(visionPanelExtraHtml(!visionFields.length))
+  parts.push(configSubheadHtml('aiConfigTts','语音 TTS','tts',''))
+  parts.push(ttsUsageNoteHtml(tts))
+  parts.push(ttsFields.length?configFieldsBlockHtml(tts,ttsFields):'<div class="config-empty">没有匹配字段（后端尚未提供 tts 段）</div>')
   parts.push('</div>')
-  form.innerHTML=parts.join('')
-  if(isAi)aiProviderBind()
-  renderConfigSaveBar()
+  return parts.join('')
 }
 function aiProviderBind(){
   const providerEl=document.getElementById(configControlId('ai.provider'))
@@ -5448,7 +5453,7 @@ syncTopbarHeight()
 // 顶栏状态徽章：窄屏时文本可能被 ellipsis 截断，用 title 提供完整值（不改结构/语义）。
 ;(function(){const bar=document.querySelector('.status-chips');if(!bar)return;const sync=()=>bar.querySelectorAll('.chip em').forEach(e=>{e.title=e.textContent});sync();try{new MutationObserver(sync).observe(bar,{subtree:true,childList:true,characterData:true})}catch(e){}})()
 window.addEventListener('beforeunload',(e)=>{
-  if(configUnsaved||visualDraftDirty||aiChatDirty||identityPageDirty||commandPolicyHasChanges()||commandReplyHasChanges()){e.preventDefault();e.returnValue='有未保存的修改，确定离开？'}
+  if(configUnsaved||visualDraftDirty||identityPageDirty||commandPolicyHasChanges()||commandReplyHasChanges()){e.preventDefault();e.returnValue='有未保存的修改，确定离开？'}
 })
 // 配置中心 Ctrl+S / Cmd+S 快捷保存
 document.addEventListener('keydown',(e)=>{

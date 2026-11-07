@@ -1668,11 +1668,11 @@ fn parse_jpeg_quality(value: Option<&str>) -> std::result::Result<u8, AppError> 
     let quality = value
         .trim()
         .parse::<u8>()
-        .map_err(|_| bad_request("quality参数必须是80-95"))?;
-    if (80..=95).contains(&quality) {
+        .map_err(|_| bad_request("quality参数必须是40-100"))?;
+    if (40..=100).contains(&quality) {
         Ok(quality)
     } else {
-        Err(bad_request("quality参数必须是80-95"))
+        Err(bad_request("quality参数必须是40-100"))
     }
 }
 

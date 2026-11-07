@@ -897,12 +897,8 @@ fn deliver(
         }
         // 交给后台线程补查名称信息，本线程立刻回去读 WS。
         //
-        // 原来只在**缺昵称**时才查。但备注（remarks）与昵称是同一份响应里的
-        // 两个字段，只查昵称就永远拿不到备注——而身份映射要以备注为准。
-        // 所以只要带 UID 就查；begin_name_lookup 本身按 UID 去重，
-        // 同一发送者不会重复排队。
+        // 备注由 `/friends` 权威同步；这里只补真实昵称。
         if let Some(uid) = message.sender.uid.as_ref() {
-            // 缺任一名字就走短冷却：备注串和真实昵称一样要贪婪补，避免遗漏。
             let incomplete = identity_access
                 .as_ref()
                 .and_then(|identity| {
@@ -911,10 +907,7 @@ fn deliver(
                         uid.as_str(),
                     )
                 })
-                .is_none_or(|resolved| {
-                    resolved.real_nickname.trim().is_empty()
-                        || resolved.remark.trim().is_empty()
-                });
+                .is_none_or(|resolved| resolved.real_nickname.trim().is_empty());
             let covered_by_recent_snapshot = state.friends_snapshot_recent()
                 && identity_access
                     .as_ref()
@@ -966,13 +959,10 @@ fn deliver(
 ///
 /// 这个身份还需要贪婪补查吗？
 ///
-/// 两个名字都算：备注串（游戏内好友备注）与真实昵称。任一为空，
-/// 或备注串还没被聊天桥确认过（玩家可能刚在游戏里设上），都按短冷却反复查。
-/// 只补真实昵称会让"好友后设了备注"要等十分钟才生效。
+/// remark 是游戏内备注，可手填/新建占位，空值也正常，不再拿它判断“不完整”；
+/// 游戏备注由 `/friends` 每 60 秒权威同步。这里只补真实昵称。
 fn needs_greedy_name_refresh(mapping: &crate::features::identity::IdentityMapping) -> bool {
     mapping.real_nickname.trim().is_empty()
-        || mapping.remark.trim().is_empty()
-        || !mapping.remark_from_chatbridge
 }
 
 /// 好友快照应用结果；不打印 UID/昵称/备注，只用于计数。
@@ -993,8 +983,8 @@ struct FriendApplyStats {
 /// - 清除只按 **identity UUID 聚合**，且仅在 complete=true：
 ///   * 只看该身份的 Genshin 账号；没有 Genshin 账号的映射完全跳过；
 ///   * 任一账号 remark 有值 → 保留；
-///   * 所有 Genshin 账号都缺席，或全部出现且都 remark=null → 清缓存 remark；
-///   * 只有 `remark_from_chatbridge=true` 的缓存值会被清，手填/随机键保留。
+///   * 所有 Genshin 账号都缺席，或全部出现且都 remark=null → 清 remark；
+///   * remark 现在只表示真实游戏备注，清理不区分来源标记。
 /// - complete=false：只更新列表内条目，绝不清理。
 fn apply_friend_snapshot(
     identity: &crate::features::identity::IdentityAccess,
@@ -1672,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn greedy_refresh_covers_both_names() {
+    fn greedy_refresh_only_needs_real_nickname() {
         use crate::features::identity::{IdentityMapping, IdentityRole};
         let mapping = |remark: &str, real: &str, from_chatbridge: bool| IdentityMapping {
             remark: remark.to_owned(),
@@ -1683,14 +1673,11 @@ mod tests {
             remark_from_chatbridge: from_chatbridge,
             accounts: Vec::new(),
         };
-        // 两个名字都齐、且备注串已被聊天桥确认：不必再贪婪补。
+        // remark 可手填/占位，空值也正常；只有真实昵称缺失才需要贪婪补查。
         assert!(!needs_greedy_name_refresh(&mapping("abcd1234", "真名甲", true)));
-        // 真实昵称缺失。
+        assert!(!needs_greedy_name_refresh(&mapping("", "真名甲", true)));
+        assert!(!needs_greedy_name_refresh(&mapping("abcd1234", "真名甲", false)));
         assert!(needs_greedy_name_refresh(&mapping("abcd1234", "", true)));
-        // 备注串缺失。
-        assert!(needs_greedy_name_refresh(&mapping("", "真名甲", true)));
-        // 备注串还是随机占位（没被聊天桥确认过）：玩家可能刚在游戏里设上备注。
-        assert!(needs_greedy_name_refresh(&mapping("abcd1234", "真名甲", false)));
     }
 
     fn identity_with_remark(uid: &str) -> crate::features::identity::IdentityAccess {
@@ -1788,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn friends_snapshot_clears_by_identity_uuid_and_preserves_handfilled() {
+    fn friends_snapshot_clears_by_identity_uuid_and_scope() {
         use crate::features::identity::{
             GameAccount, IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
         };
@@ -1874,7 +1861,7 @@ mod tests {
             ],
         };
         let stats = apply_friend_snapshot(&identity, &snapshot);
-        assert_eq!(stats.cleared_absent, 1, "只有全 null 的身份清缓存");
+        assert_eq!(stats.cleared_absent, 2, "全 null 与缺席的手填身份都清");
         let mappings = identity.snapshot().mappings;
         let multi = mappings.iter().find(|m| m.id == ids[multi]).unwrap();
         assert_eq!(multi.remark, "新缓存甲", "一个账号有备注就保留");
@@ -1890,10 +1877,14 @@ mod tests {
             "旧缓存丁",
             "无账号映射跳过"
         );
-        assert_eq!(
-            mappings.iter().find(|m| m.id == ids[handfilled]).unwrap().remark,
-            "手填备注",
-            "手填备注保留"
+        assert!(
+            mappings
+                .iter()
+                .find(|m| m.id == ids[handfilled])
+                .unwrap()
+                .remark
+                .is_empty(),
+            "手填备注已不是合法 remark，缺席时清空"
         );
         assert_eq!(
             mappings.iter().find(|m| m.id == ids[owner]).unwrap().remark,
@@ -1950,6 +1941,41 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("释放锁后写者应完成");
         worker.join().expect("写线程");
+    }
+
+    #[test]
+    fn complete_null_clears_handfilled_remark_too() {
+        use crate::features::identity::{
+            GameAccount, IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
+        };
+        use crate::runtime::chat_source::{FriendEntry, FriendSnapshot};
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            remark: "手填备注".to_string(),
+            id: uuid::Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            display_name: String::new(),
+            real_nickname: "真名".to_string(),
+            remark_from_chatbridge: false,
+            accounts: vec![GameAccount::new("50001")],
+        });
+        let identity = IdentityAccess::new(config);
+        let snapshot = FriendSnapshot {
+            complete: true,
+            updated_at: Some(1),
+            friends: vec![FriendEntry {
+                uid: 50001,
+                name: None,
+                remark: None,
+                remark_present: true,
+            }],
+        };
+        let stats = apply_friend_snapshot(&identity, &snapshot);
+        assert!(stats.changed);
+        assert_eq!(stats.cleared_absent, 1);
+        let mapping = &identity.snapshot().mappings[0];
+        assert!(mapping.remark.is_empty());
+        assert!(!mapping.remark_from_chatbridge);
     }
 
     #[test]

@@ -962,6 +962,7 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         <button class="btn small ghost" onclick="navigateTo('config')">打开完整配置</button>
       </div>
       <div class="config-message hidden" id="identityMessage"></div>
+      <div class="config-message config-vision-note" id="identityHelp">游戏内备注可以手动填写并保存，OCR 会用它匹配大厅发言；ChatBridge 每 60 秒用游戏内真实好友备注权威覆盖，如果游戏内没有真实备注，覆盖后可能被清空（本页面不会自动清空）。新增映射时留空才会随机生成。</div>
       <div class="config-group-card">
         <div class="config-group-head">映射列表<span class="config-domain-count" id="identityCount"></span></div>
         <div id="identityEditorHost" style="padding:var(--sp-3)"><p class="config-field-hint">正在读取身份映射…</p></div>
@@ -4052,7 +4053,7 @@ function identityRenderTable(){
       +'<span class="identity-field-hint">授权与归属的优先依据，可填多个</span></span>'
       +'<input value="'+esc(accounts.map(a=>a&&a.uid?a.uid:'').filter(Boolean).join(','))+'" placeholder="多个用 , 分隔" oninput="identityTableSetUids('+i+',this.value)"></label>'
       +'<label class="identity-field"><span class="identity-field-label">游戏内备注'
-      +'<span class="identity-field-hint">屏幕显示名 / OCR 匹配键；留空随机生成</span></span>'
+      +'<span class="identity-field-hint">屏幕显示名 / OCR 匹配键；可手动修改并保存，新增时留空才会随机生成</span></span>'
       +'<input value="'+remark+'" placeholder="游戏内好友备注" oninput="identityTableSet('+i+',\'nickname\',this.value)">'
       +'<span class="identity-field-note">'+(mapping.remark_sourced?'来源：聊天桥备注（手改后转为手填）':'来源：手填 / 随机')+'</span></label>'
       +'<label class="identity-field"><span class="identity-field-label">显示名'

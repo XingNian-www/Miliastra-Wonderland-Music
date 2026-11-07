@@ -237,6 +237,51 @@ pub enum IdentityHint<'a> {
     },
 }
 
+/// 一条给 AI 使用的称呼对照；不包含 UID/UUID/角色/账号。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AiNamePair {
+    /// 游戏内备注/屏幕显示名；没有备注时为 None。
+    pub remark: Option<String>,
+    pub real_nickname: String,
+    pub display_name: String,
+}
+
+/// 最多注入 64 对，避免 prompt 膨胀。
+pub(crate) const AI_NAME_PAIR_LIMIT: usize = 64;
+/// 对照段总字符预算（含格式开销）。
+pub(crate) const AI_NAME_PAIR_TOTAL_CHARS: usize = 4_000;
+const AI_NAME_MAX_CHARS: usize = 80;
+
+impl AiNamePair {
+    pub(crate) fn effective_display(&self) -> &str {
+        let display = self.display_name.trim();
+        if display.is_empty() {
+            self.real_nickname.trim()
+        } else {
+            display
+        }
+    }
+
+    pub(crate) fn left(&self) -> &str {
+        self.remark
+            .as_deref()
+            .unwrap_or_else(|| self.real_nickname.trim())
+    }
+
+    pub(crate) fn is_remark(&self) -> bool {
+        self.remark.is_some()
+    }
+}
+
+fn clean_ai_name(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control() && !matches!(ch, '\u{2028}' | '\u{2029}'))
+        .take(AI_NAME_MAX_CHARS)
+        .collect()
+}
+
 /// 身份查询共享句柄；LiveConfigs 持有并在配置保存后整体替换快照。
 #[derive(Clone, Default)]
 pub struct IdentityAccess {
@@ -286,6 +331,72 @@ impl IdentityAccess {
             }),
         }
     }
+    /// 给 AI 理解称呼用的「备注/真实昵称 ↔ 显示昵称」对照；不含 UID/UUID/角色/账号。
+    ///
+    /// 只认实际游戏备注 `remark_from_chatbridge=true && remark 非空`；手填/随机备注
+    /// 不作为游戏备注（与 `replace_display_names` 的“真实备注”语义一致），改用真实昵称。
+    /// 有效显示昵称 = display_name 非空则用，否则 real_nickname；两边相同/为空跳过。
+    pub(crate) fn ai_name_pairs(&self) -> Vec<AiNamePair> {
+        let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let mut pairs = Vec::new();
+        let mut total_chars = 0usize;
+        for mapping in &config.mappings {
+            let display = clean_ai_name(&mapping.display_name);
+            let real = clean_ai_name(&mapping.real_nickname);
+            let effective_display = if display.is_empty() {
+                real.clone()
+            } else {
+                display.clone()
+            };
+            if effective_display.is_empty() {
+                continue;
+            }
+            let remark = if mapping.remark_from_chatbridge {
+                clean_ai_name(&mapping.remark)
+            } else {
+                String::new()
+            };
+            let pair = if !remark.is_empty() {
+                if remark == effective_display {
+                    continue;
+                }
+                AiNamePair {
+                    remark: Some(remark),
+                    real_nickname: real,
+                    display_name: display,
+                }
+            } else {
+                if real.is_empty() || real == effective_display {
+                    continue;
+                }
+                AiNamePair {
+                    remark: None,
+                    real_nickname: real,
+                    display_name: display,
+                }
+            };
+            let cost = pair.left().chars().count()
+                + pair.effective_display().chars().count()
+                + 32;
+            if total_chars.saturating_add(cost) > AI_NAME_PAIR_TOTAL_CHARS {
+                break;
+            }
+            total_chars += cost;
+            pairs.push(pair);
+            if pairs.len() >= AI_NAME_PAIR_LIMIT {
+                break;
+            }
+        }
+        pairs.sort_by(|a, b| {
+            a.effective_display()
+                .cmp(b.effective_display())
+                .then_with(|| a.left().cmp(b.left()))
+        });
+        pairs.dedup();
+        pairs.truncate(AI_NAME_PAIR_LIMIT);
+        pairs
+    }
+
     /// 当前映射表的快照。
     ///
     /// 自动为好友 UID 建身份后需要把它写回配置库；不取快照就没法持久化，
@@ -542,8 +653,8 @@ impl IdentityAccess {
         });
         if taken_by_other {
             log::warn!(
-                "外部聊天源给出的备注「{}」与已登记的备注串重复，该好友仍保留原匹配键，不覆盖",
-                remark
+                "外部聊天源给出的备注与已登记的备注串重复（长度 {}），该好友仍保留原匹配键，不覆盖",
+                remark.chars().count()
             );
             return false;
         }
@@ -556,13 +667,64 @@ impl IdentityAccess {
             return false;
         };
         if mapping.remark == remark {
-            return false;
+            // 自动随机备注串被用户设成游戏内备注后，ChatBridge 会返回同值；
+            // 此时仍必须把来源标记置 true，否则 AI 对照/清备注/补查判断全部失真。
+            if mapping.remark_from_chatbridge {
+                return false;
+            }
+            mapping.remark_from_chatbridge = true;
+            return true;
         }
         mapping.remark = remark.to_string();
         mapping.remark_from_chatbridge = true;
         // **不写 display_name**：用户明确要求「remarks 只能覆盖备注串」。
         // display_name 是软件内展示标签，与匹配键绑死会让两者悄悄分叉
         // （以后备注改名，展示名仍停在旧值）。
+        true
+    }
+
+    /// ChatBridge **全量好友快照**明确表示该 UID 当前没有备注：清空缓存 remark。
+    ///
+    /// 只清 `remark_from_chatbridge=true` 的缓存值；手填/随机 OCR 键保留。
+    /// 保留 real_nickname/display_name/role/accounts/id。
+    #[cfg(test)]
+    /// 仅测试辅助：生产删除路径用 [`Self::clear_remark_for_identity`]。
+    pub(crate) fn clear_account_remark(&self, game: &str, uid: &str) -> bool {
+        let uid = uid.trim();
+        if uid.is_empty() {
+            return false;
+        }
+        let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let Some(mapping) = config.mappings.iter_mut().find(|mapping| {
+            mapping
+                .accounts
+                .iter()
+                .any(|account| account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid)
+        }) else {
+            return false;
+        };
+        if !mapping.remark_from_chatbridge {
+            return false;
+        }
+        mapping.remark.clear();
+        mapping.remark_from_chatbridge = false;
+        true
+    }
+
+    /// 按身份 UUID 清缓存 remark：用于全量好友快照里某个身份无有效备注的情况。
+    ///
+    /// 只清 `remark_from_chatbridge=true` 的缓存值；手填/随机 OCR 键保留。
+    /// 保留 real_nickname/display_name/role/accounts/id，不删除身份。
+    pub fn clear_remark_for_identity(&self, id: Uuid) -> bool {
+        let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let Some(mapping) = config.mappings.iter_mut().find(|mapping| mapping.id == id) else {
+            return false;
+        };
+        if !mapping.remark_from_chatbridge {
+            return false;
+        }
+        mapping.remark.clear();
+        mapping.remark_from_chatbridge = false;
         true
     }
 
@@ -1237,6 +1399,127 @@ mod tests {
             "clone 出来的 IdentityAccess 必须共享同一份映射，否则自动注册对命令侧不可见"
         );
         assert_eq!(resolved.unwrap().role, IdentityRole::Friend);
+    }
+
+    #[test]
+    fn same_value_remark_sets_chatbridge_source_flag() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            remark: "随机备注键".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            display_name: String::new(),
+            real_nickname: String::new(),
+            remark_from_chatbridge: false,
+            accounts: vec![GameAccount::new("30001")],
+        });
+        let access = IdentityAccess::new(config);
+        // ChatBridge 返回与自动随机串相同的值：必须置来源标记。
+        assert!(access.set_account_remark("genshin", "30001", "随机备注键"));
+        assert!(access.snapshot().mappings[0].remark_from_chatbridge);
+        // 已标记后同值幂等。
+        assert!(!access.set_account_remark("genshin", "30001", "随机备注键"));
+        // 不同值覆盖并保持标记。
+        assert!(access.set_account_remark("genshin", "30001", "新备注"));
+        assert_eq!(access.snapshot().mappings[0].remark, "新备注");
+        assert!(access.snapshot().mappings[0].remark_from_chatbridge);
+    }
+
+    #[test]
+    fn clearing_account_remark_preserves_other_fields_and_drops_ai_mapping() {
+        let mut config = IdentityConfig::default();
+        let id = Uuid::new_v4();
+        config.mappings.push(IdentityMapping {
+            remark: "旧游戏备注".to_string(),
+            id,
+            role: IdentityRole::Admin,
+            display_name: "显示甲".to_string(),
+            real_nickname: "真实甲".to_string(),
+            remark_from_chatbridge: true,
+            accounts: vec![GameAccount::new("10001")],
+        });
+        let access = IdentityAccess::new(config);
+        assert!(access.clear_account_remark("genshin", "10001"));
+        let mapping = &access.snapshot().mappings[0];
+        assert!(mapping.remark.is_empty());
+        assert!(!mapping.remark_from_chatbridge);
+        assert_eq!(mapping.real_nickname, "真实甲");
+        assert_eq!(mapping.display_name, "显示甲");
+        assert_eq!(mapping.role, IdentityRole::Admin);
+        assert_eq!(mapping.accounts[0].uid, "10001");
+        assert_eq!(mapping.id, id);
+        assert!(!access.clear_account_remark("genshin", "10001"));
+        assert!(!access.clear_account_remark("genshin", "missing"));
+
+        // 手填/随机 OCR 键（flag=false）不是缓存值，清除必须保留。
+        let mut handfilled = IdentityConfig::default();
+        handfilled.mappings.push(IdentityMapping {
+            remark: "手填备注".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            display_name: String::new(),
+            real_nickname: "真实乙".to_string(),
+            remark_from_chatbridge: false,
+            accounts: vec![GameAccount::new("20001")],
+        });
+        let handfilled_access = IdentityAccess::new(handfilled);
+        assert!(!handfilled_access.clear_account_remark("genshin", "20001"));
+        assert_eq!(handfilled_access.snapshot().mappings[0].remark, "手填备注");
+
+        // AI 对照不再使用旧备注；无实际备注时回退真实昵称。
+        let pairs = access.ai_name_pairs();
+        assert!(!pairs.iter().any(|pair| pair.left() == "旧游戏备注"));
+        assert!(pairs.iter().any(|pair| pair.left() == "真实甲"));
+    }
+
+    #[test]
+    fn ai_name_pairs_use_real_game_remark_or_real_nickname_without_private_ids() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            remark: "游戏备注A".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Admin,
+            display_name: "显示A".to_string(),
+            real_nickname: "真A".to_string(),
+            remark_from_chatbridge: true,
+            accounts: vec![GameAccount::new("10001")],
+        });
+        config.mappings.push(IdentityMapping {
+            remark: "手填或随机键".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            display_name: "显示B".to_string(),
+            real_nickname: "真B".to_string(),
+            remark_from_chatbridge: false,
+            accounts: vec![GameAccount::new("10002")],
+        });
+        config.mappings.push(IdentityMapping {
+            remark: "相同".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            display_name: "相同".to_string(),
+            real_nickname: String::new(),
+            remark_from_chatbridge: true,
+            accounts: Vec::new(),
+        });
+        let access = IdentityAccess::new(config);
+        let pairs = access.ai_name_pairs();
+        let remark = pairs
+            .iter()
+            .find(|pair| pair.remark.as_deref() == Some("游戏备注A"))
+            .expect("实际游戏备注");
+        assert_eq!(remark.effective_display(), "显示A");
+        let real = pairs
+            .iter()
+            .find(|pair| pair.real_nickname == "真B")
+            .expect("无实际备注回退真实昵称");
+        assert!(real.remark.is_none());
+        assert_eq!(real.effective_display(), "显示B");
+        assert!(!pairs.iter().any(|pair| pair.left() == "手填或随机键"));
+        assert!(!pairs.iter().any(|pair| pair.effective_display() == "相同"));
+        let debug = format!("{pairs:?}");
+        assert!(!debug.contains("10001"));
+        assert!(!debug.contains("10002"));
     }
 
     #[test]

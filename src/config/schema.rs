@@ -2880,19 +2880,19 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
                 "primary_screen".to_string(),
                 "整个一级大厅".to_string(),
             )]),
-            "P0 只支持整个一级大厅；整屏可能包含 UID/HUD，日志不会保存截图内容",
+            "当前仅支持整个一级大厅；整屏可能包含 UID/HUD，日志不会保存截图内容",
         ),
         ConfigFieldSchema::db_live(
             "vision.max_edge",
             "截图长边上限",
             int(512, 2_048),
-            "截图长边超过该值时等比缩小，单位像素",
+            "截图长边上限（默认 1600）；超过时等比缩小，服务端仍可自行降采样",
         ),
         ConfigFieldSchema::db_live(
             "vision.jpeg_quality",
             "截图 JPEG 质量",
-            int(40, 95),
-            "JPEG 编码质量；越大越清晰、字节越多",
+            int(40, 100),
+            "JPEG 编码质量（40..=100）；越大越清晰、字节越多，默认 100",
         ),
         ConfigFieldSchema::db_live(
             "vision.max_bytes",
@@ -2982,6 +2982,12 @@ fn tts_section() -> Vec<ConfigFieldSchema> {
             "fish.audio 基础地址；默认 https://api.fish.audio，实际请求 {endpoint}/v1/tts",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "http_proxy",
+            "TTS 代理",
+            FieldKind::String,
+            "可选独立 HTTP(S)/SOCKS 代理，作用于 fish 音色目录与 /v1/tts 合成；留空沿用环境代理",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "api_key",
             "fish API Key",
             FieldKind::Secret,
@@ -3009,7 +3015,7 @@ fn tts_section() -> Vec<ConfigFieldSchema> {
             "format",
             "音频格式",
             FieldKind::Enum(vec![("wav".to_string(), "WAV".to_string())]),
-            "P0 只支持 WAV；SpeechPlayer 直接解码 WAV",
+            "当前仅支持 WAV；SpeechPlayer 直接解码 WAV",
         ),
         ConfigFieldSchema::db_live(
             "duck_volume",
@@ -3045,7 +3051,7 @@ fn tts_section() -> Vec<ConfigFieldSchema> {
             "trigger_scope",
             "触发范围",
             FieldKind::Enum(vec![("ai_chat".to_string(), "仅 AI 聊天".to_string())]),
-            "P0 固定仅 AI 聊天工具 speak 可触发，普通回复不自动朗读",
+            "当前仅 AI 聊天工具 speak 可触发，普通回复不自动朗读",
         ),
     ]
 }

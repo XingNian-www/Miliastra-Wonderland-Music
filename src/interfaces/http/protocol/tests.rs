@@ -2259,7 +2259,7 @@ fn hall_screenshot_rejects_invalid_quality_before_touching_the_game() {
     let request = Request {
         method: "GET".to_string(),
         path: "/hall-screenshot".to_string(),
-        query: vec![("quality".to_string(), "79".to_string())],
+        query: vec![("quality".to_string(), "39".to_string())],
         headers: HeaderMap::new(),
         body: Vec::new(),
     };
@@ -4066,9 +4066,10 @@ fn remote_plain_song_rejects_multi_source() {
 #[test]
 fn screenshot_quality_is_bounded() {
     assert_eq!(parse_jpeg_quality(None).unwrap(), 88);
-    assert_eq!(parse_jpeg_quality(Some("95")).unwrap(), 95);
-    assert!(parse_jpeg_quality(Some("79")).is_err());
-    assert!(parse_jpeg_quality(Some("96")).is_err());
+    assert_eq!(parse_jpeg_quality(Some("40")).unwrap(), 40);
+    assert_eq!(parse_jpeg_quality(Some("100")).unwrap(), 100);
+    assert!(parse_jpeg_quality(Some("39")).is_err());
+    assert!(parse_jpeg_quality(Some("101")).is_err());
 }
 
 #[test]

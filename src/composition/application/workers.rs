@@ -914,6 +914,7 @@ impl ApplicationRuntime {
                 ai_chat_openai: self.business.ai_chat_openai.clone(),
                 ai_connection: self.business.ai_connection.clone(),
                 ai_request_timeout: self.business.ai_request_timeout,
+                tts: self.business.tts.clone(),
                 song_requests: self.business.song_requests.clone(),
                 card_games: self.business.card_games.clone(),
                 administration_application: self.business.administration_application,

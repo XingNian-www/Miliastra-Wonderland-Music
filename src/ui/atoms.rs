@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use enigo::Key;
@@ -14,6 +15,11 @@ use crate::runtime::ui::{
 
 pub(crate) trait GameUiBackend: Send + Sync + 'static {
     fn capture(&self) -> Result<DynamicImage>;
+
+    /// 带截止时间的截图；默认实现仅用于无 UI 队列的测试后端。
+    fn capture_with_timeout(&self, _timeout: Duration) -> Result<DynamicImage> {
+        self.capture()
+    }
     fn benchmark_capture(&self, _rounds: u32) -> Result<String> {
         anyhow::bail!("capture benchmark is unavailable")
     }
@@ -37,6 +43,11 @@ impl GameUi {
 
     pub(crate) fn capture(&self) -> Result<DynamicImage> {
         self.backend.capture()
+    }
+
+    /// 带截止时间的截图；超时/队列满/窗口不可用时由调用方降级纯文本。
+    pub(crate) fn capture_with_timeout(&self, timeout: Duration) -> Result<DynamicImage> {
+        self.backend.capture_with_timeout(timeout)
     }
 
     pub(crate) fn benchmark_capture(&self, rounds: u32) -> Result<String> {
@@ -182,6 +193,15 @@ impl GameUiBackend for RuntimeGameUiBackend {
         Ok(self.execute(CaptureFrame)??.into_image())
     }
 
+    fn capture_with_timeout(&self, timeout: Duration) -> Result<DynamicImage> {
+        let operation = self.handle.submit(CaptureFrame)?;
+        match operation.wait_timeout(timeout) {
+            Ok(Ok(frame)) => Ok(frame.into_image()),
+            Ok(Err(error)) => Err(anyhow::anyhow!("{error}")),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+
     fn benchmark_capture(&self, rounds: u32) -> Result<String> {
         self.execute(crate::runtime::ui::BenchmarkCapture { rounds })?
     }
@@ -231,6 +251,36 @@ mod tests {
             self.keys.lock().unwrap().push(key);
             Ok(())
         }
+    }
+
+    struct FailingBackend;
+
+    impl GameUiBackend for FailingBackend {
+        fn capture(&self) -> Result<DynamicImage> {
+            anyhow::bail!("simulated capture failure")
+        }
+
+        fn press_key(&self, _key: Key) -> Result<()> {
+            anyhow::bail!("not used")
+        }
+
+        fn click_point(&self, _point: crate::config::PointConfig) -> Result<()> {
+            anyhow::bail!("not used")
+        }
+
+        fn ensure_ready(&self, _after_activate_ms: u64) -> Result<()> {
+            anyhow::bail!("not used")
+        }
+
+        fn close_window(&self) -> Result<()> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    #[test]
+    fn capture_with_timeout_propagates_capture_failure() {
+        let ui = GameUi::new(FailingBackend);
+        assert!(ui.capture_with_timeout(Duration::from_millis(1)).is_err());
     }
 
     #[test]

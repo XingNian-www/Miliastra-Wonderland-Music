@@ -20,6 +20,7 @@ use crate::features::song_request::{SongAiConfig, SongReviewConfig};
 use crate::features::startup::{StartupConfig, StartupTemplateConfig};
 use crate::features::number_bomb::NumberBombConfig;
 use crate::features::turtle_soup::TurtleSoupConfig;
+use crate::features::tts::TtsConfig;
 use crate::features::undercover::UndercoverConfig;
 use crate::runtime::player::PlayerObservationConfig;
 use crate::runtime::player_io::{PlayerRuntimeConfig, PlayerRuntimeConfigError};
@@ -199,6 +200,9 @@ pub struct AppConfig {
     /// AI 聊天与轻量记忆；内嵌段可省略。
     #[serde(default)]
     pub ai_chat: AiChatConfig,
+    /// TTS 语音（fish.audio）；内嵌段可省略。
+    #[serde(default)]
+    pub tts: TtsConfig,
     /// 歌曲审核；内嵌段可省略。
     #[serde(default)]
     pub song_review: SongReviewConfig,
@@ -353,6 +357,7 @@ impl Default for AppConfig {
             ai: AiConfig::default(),
             song_ai: SongAiConfig::default(),
             ai_chat: AiChatConfig::default(),
+            tts: TtsConfig::default(),
             song_review: SongReviewConfig::default(),
             matching: MatchConfig::default(),
             hotkeys: HotkeyConfig::default(),
@@ -642,6 +647,7 @@ impl AppConfig {
         self.ai.validate()?;
         self.song_ai.validate()?;
         self.ai_chat.validate()?;
+        self.tts.validate()?;
         self.song_review.validate()?;
         self.turtle_soup.validate()?;
         self.identity.validate()?;

@@ -9,7 +9,195 @@
 
 use super::*;
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// 一次进程内缓存 `/models` 查询到的图片能力，避免每轮聊天都打模型列表接口。
+/// 配置改动会通过子进程重载生效，新进程缓存自然清空。
+fn vision_capability_cache() -> &'static Mutex<HashMap<String, bool>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 图片/视觉相关错误判定：模型不支持图片时通常以 400/415/422 拒绝整个请求。
+/// 只匹配明确的图片、内容或媒体关键词，避免把余额不足、模型不存在当成图片拒绝。
+fn is_image_rejection(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    let image_related = [
+        "image",
+        "vision",
+        "image_url",
+        "input_image",
+        "media",
+        "modality",
+        "content",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    let status = ["400", "415", "422"].iter().any(|code| text.contains(code));
+    image_related && (status || text.contains("invalid") || text.contains("unsupported"))
+}
+
+fn should_retry_without_image(
+    had_image: bool,
+    retry_done: bool,
+    error: &anyhow::Error,
+) -> bool {
+    had_image && !retry_done && is_image_rejection(error)
+}
+
 impl ApplicationRuntime {
+    /// 当前视觉请求使用的模型名：优先 `ai_chat.vision.model`，否则沿用聊天模型。
+    fn ai_chat_vision_model(&self, config: &crate::features::ai_chat::AiChatConfig) -> String {
+        let configured = config.vision.model.trim();
+        if !configured.is_empty() {
+            return configured.to_string();
+        }
+        let chat = config.model.trim();
+        if !chat.is_empty() {
+            return chat.to_string();
+        }
+        self.business.ai_connection.model.trim().to_string()
+    }
+
+    /// 通过模型列表 API 查询该模型是否声明图片输入；查不到/查询失败不猜，返回 false。
+    fn ai_chat_model_supports_vision(&self, model: &str) -> bool {
+        let key = format!(
+            "{}|{:?}|{}|{}",
+            self.business.ai_connection.provider,
+            self.business.ai_connection.wire_api,
+            self.business.ai_connection.endpoint,
+            model
+        );
+        if let Ok(cache) = vision_capability_cache().lock()
+            && let Some(value) = cache.get(&key)
+        {
+            return *value;
+        }
+        let supported = match crate::config::ai::fetch_model_capabilities(
+            &self.business.ai_connection,
+            model,
+        ) {
+            Ok(capabilities) => capabilities.supports_image == Some(true),
+            Err(error) => {
+                log::debug!("AI 聊天查询模型图片能力失败（本轮按纯文本处理）：{error}");
+                false
+            }
+        };
+        if let Ok(mut cache) = vision_capability_cache().lock() {
+            cache.insert(key, supported);
+        }
+        if !supported {
+            log::debug!("模型「{model}」未声明图片能力，AI 聊天本轮不附带截图");
+        }
+        supported
+    }
+
+    /// 按需截取一级大厅并编码为内存 JPEG；任何失败都返回 None，由调用方降级纯文本。
+    fn capture_ai_chat_vision_image(
+        &self,
+        config: &crate::features::ai_chat::AiChatConfig,
+    ) -> Option<crate::config::ai::ImageAttachment> {
+        if config.vision.capture_scope
+            != crate::features::ai_chat::VisionCaptureScope::PrimaryScreen
+            || !config.vision.allow_full_screen
+        {
+            return None;
+        }
+        let started = Instant::now();
+        let image = match self
+            .ui
+            .game_ui
+            .capture_with_timeout(Duration::from_millis(config.vision.timeout_ms))
+        {
+            Ok(image) => image,
+            Err(error) => {
+                log::warn!("AI 聊天截图失败/超时（已降级纯文本）：{error:#}");
+                return None;
+            }
+        };
+        let encoded = crate::features::ai_chat::encode_vision_image(
+            &image,
+            config.vision.max_edge,
+            config.vision.jpeg_quality,
+            config.vision.max_bytes,
+        );
+        match encoded {
+            Some(image) => {
+                log::debug!(
+                    "AI 聊天截图已编码：{}x{} bytes={} elapsed_ms={}",
+                    image.width(),
+                    image.height(),
+                    image.byte_len(),
+                    started.elapsed().as_millis()
+                );
+                Some(image)
+            }
+            None => {
+                log::warn!("AI 聊天截图编码失败（超限或空图，已降级纯文本）");
+                None
+            }
+        }
+    }
+    /// 执行 `look` 工具：抓图 -> 独立视觉模型请求 -> 返回文本工具结果。
+    /// 不递归工具、不阻塞主回复；任何失败都返回 unavailable。
+    fn run_ai_chat_look(
+        &self,
+        config: &crate::features::ai_chat::AiChatConfig,
+        instruction: Option<&str>,
+        timeout: Duration,
+    ) -> serde_json::Value {
+        if !config.vision.enabled || !crate::features::ai_chat::look_tool_available(config) {
+            return serde_json::json!({"status":"unavailable","reason":"AI 识图未启用"});
+        }
+        let model = self.ai_chat_vision_model(config);
+        if !self.ai_chat_model_supports_vision(&model) {
+            return serde_json::json!({"status":"unavailable","reason":"当前模型未声明支持图片"});
+        }
+        let Some(image) = self.capture_ai_chat_vision_image(config) else {
+            return serde_json::json!({"status":"unavailable","reason":"截图失败或超时"});
+        };
+        let prompt = instruction.unwrap_or("请简要描述当前一级大厅画面。");
+        let max_tokens = config.max_tokens.clamp(64, 800);
+        let mut session = match crate::config::ai::ToolSession::with_history_options_and_image(
+            &self.business.ai_connection,
+            &crate::config::ai::AiCallOptions {
+                model,
+                reasoning: config.reasoning,
+            },
+            crate::features::ai_chat::look_system_prompt(),
+            Vec::new(),
+            prompt,
+            Vec::new(),
+            Some(image),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                log::debug!("AI look 会话创建失败（本次返回 unavailable）：{error:#}");
+                return serde_json::json!({"status":"unavailable","reason":"视觉请求不可用"});
+            }
+        };
+        match session.request(
+            &self.business.ai_chat_openai,
+            max_tokens,
+            timeout,
+            false,
+        ) {
+            Ok(reply) => {
+                let text = reply.text.trim();
+                if text.is_empty() {
+                    serde_json::json!({"status":"unavailable","reason":"视觉模型未返回文本"})
+                } else {
+                    serde_json::json!({"status":"handled","description":text})
+                }
+            }
+            Err(error) => {
+                log::debug!("AI look 视觉请求失败（本次返回 unavailable）：{error:#}");
+                serde_json::json!({"status":"unavailable","reason":"视觉请求失败或超时"})
+            }
+        }
+    }
+
     /// AI 聊天：关键词触发已在上游转成 `AiChatCommand::Ask`；
     /// `Forget` 来自 @忘记我。AI 产出的命令按**提问者本人权限**复核后执行。
     pub(super) fn execute_ai_chat_intent(
@@ -59,10 +247,10 @@ impl ApplicationRuntime {
                 }
                 // 冷却时长每次从实时配置读取（`ai_chat.cooldown_seconds`），保存后下一条消息即生效。
                 let cooldown = std::time::Duration::from_secs(config.cooldown_seconds);
-                if let Err(seconds) = self
-                    .business
-                    .ai_chat_gate
-                    .check(&actor, Instant::now(), cooldown)
+                if let Err(seconds) =
+                    self.business
+                        .ai_chat_gate
+                        .check(&actor, Instant::now(), cooldown)
                 {
                     log::debug!("AI 聊天冷却中：玩家「{actor}」还需等待 {seconds} 秒");
                     return Ok(());
@@ -97,25 +285,54 @@ impl ApplicationRuntime {
                         .map(|elapsed| elapsed.as_secs())
                         .unwrap_or(0),
                 });
-                let tools = if config.allow_commands {
+                let tts_config = self.lifecycle.live_configs.snapshot().tts.clone();
+                let mut tools = if config.allow_commands {
                     ai_chat::command_tools(&allowed)
                 } else {
                     Vec::new()
                 };
+                let tts_tool_available = tts_config.enabled
+                    && tts_config.trigger_scope == crate::features::tts::TtsTriggerScope::AiChat;
+                if tts_tool_available {
+                    tools.push(ai_chat::speak_tool_for_model(
+                        &tts_config.model,
+                        tts_config.max_chars,
+                    ));
+                }
+                if ai_chat::look_tool_available(&config) {
+                    tools.push(ai_chat::look_tool());
+                }
+                // 模型能力由 API 查询决定，不根据默认模型名猜；查不到能力时不附图。
+                let vision_model = self.ai_chat_vision_model(&config);
+                let supports_vision = self.ai_chat_model_supports_vision(&vision_model);
+                let vision_image = if ai_chat::auto_image_enabled(&config, supports_vision) {
+                    self.capture_ai_chat_vision_image(&config)
+                } else {
+                    None
+                };
                 let result = (|| -> Result<ai_chat::AiChatAnswer> {
-                    let mut session = crate::config::ai::ToolSession::with_history_options(
-                        &self.business.ai_connection,
-                        &crate::config::ai::AiCallOptions {
-                            model: config.model.clone(),
-                            reasoning: config.reasoning,
-                        },
-                        &ai_chat::response_system_prompt(&config),
-                        ai_chat::conversation_history(&context),
-                        &prompt,
-                        tools.clone(),
-                    )?;
+                    let mut image_retry_done = false;
+                    let session_model = if vision_image.is_some() {
+                        vision_model.clone()
+                    } else {
+                        config.model.clone()
+                    };
+                    let mut session =
+                        crate::config::ai::ToolSession::with_history_options_and_image(
+                            &self.business.ai_connection,
+                            &crate::config::ai::AiCallOptions {
+                                model: session_model,
+                                reasoning: config.reasoning,
+                            },
+                            &ai_chat::response_system_prompt(&config),
+                            ai_chat::conversation_history(&context),
+                            &prompt,
+                            tools.clone(),
+                            vision_image.clone(),
+                        )?;
                     let deadline = Instant::now() + self.business.ai_request_timeout;
                     let mut executed = std::collections::HashSet::new();
+                    let mut spoken = std::collections::HashSet::new();
                     for round in 0..=ai_chat::MAX_TOOL_ROUNDS {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         anyhow::ensure!(!remaining.is_zero(), "AI 工具调用总期限已到");
@@ -124,12 +341,46 @@ impl ApplicationRuntime {
                         let response = {
                             let _scan_permit =
                                 self.ui.coordinator.permit_scans_for_current_thread();
-                            session.request(
+                            let attempt = session.request(
                                 &self.business.ai_chat_openai,
                                 config.max_tokens,
                                 remaining,
                                 allow_tools,
-                            )?
+                            );
+                            match attempt {
+                                Ok(response) => response,
+                                Err(error)
+                                    if should_retry_without_image(
+                                        vision_image.is_some(),
+                                        image_retry_done,
+                                        &error,
+                                    ) =>
+                                {
+                                    image_retry_done = true;
+                                    log::warn!(
+                                        "模型「{}」不接受图片输入，已去掉图片重试一次纯文本：{error:#}",
+                                        vision_model
+                                    );
+                                    session = crate::config::ai::ToolSession::with_history_options(
+                                        &self.business.ai_connection,
+                                        &crate::config::ai::AiCallOptions {
+                                            model: config.model.clone(),
+                                            reasoning: config.reasoning,
+                                        },
+                                        &ai_chat::response_system_prompt(&config),
+                                        ai_chat::conversation_history(&context),
+                                        &prompt,
+                                        tools.clone(),
+                                    )?;
+                                    session.request(
+                                        &self.business.ai_chat_openai,
+                                        config.max_tokens,
+                                        remaining,
+                                        allow_tools,
+                                    )?
+                                }
+                                Err(error) => return Err(error),
+                            }
                         };
                         if response.calls.is_empty() {
                             let reply = ai_chat::parse_reply(&response.text);
@@ -153,7 +404,48 @@ impl ApplicationRuntime {
                         }
                         anyhow::ensure!(allow_tools, "AI 在工具关闭后仍请求执行");
                         for call in response.calls {
-                            let outcome = if call.name != ai_chat::COMMAND_TOOL {
+                            let outcome = if call.name == ai_chat::LOOK_TOOL {
+                                match ai_chat::parse_look_arguments(&call.arguments) {
+                                    Ok(instruction) => self.run_ai_chat_look(
+                                        &config,
+                                        instruction.as_deref(),
+                                        remaining,
+                                    ),
+                                    Err(_) => serde_json::json!({
+                                        "status":"rejected",
+                                        "reason":"look 参数不符合工具 Schema"
+                                    }),
+                                }
+                            } else if call.name == ai_chat::SPEAK_TOOL {
+                                match ai_chat::parse_speak_arguments_for_model(
+                                    &call.arguments,
+                                    &tts_config.model,
+                                ) {
+                                    Ok((text, options)) if spoken.contains(&text) => {
+                                        serde_json::json!({"status":"rejected","reason":"同一回答内禁止重复朗读相同文本"})
+                                    }
+                                    Ok((text, options)) => {
+                                        match self.business.tts.enqueue_with_options(
+                                            &tts_config,
+                                            &text,
+                                            options,
+                                        ) {
+                                            Ok(()) => {
+                                                spoken.insert(text);
+                                                serde_json::json!({"status":"handled","reason":"语音已入队"})
+                                            }
+                                            Err(error) => serde_json::json!({
+                                                "status":"rejected",
+                                                "reason": format!("语音不可用：{error}")
+                                            }),
+                                        }
+                                    }
+                                    Err(_) => serde_json::json!({
+                                        "status":"rejected",
+                                        "reason":"speak 参数不符合工具 Schema 或当前模型不支持"
+                                    }),
+                                }
+                            } else if call.name != ai_chat::COMMAND_TOOL {
                                 serde_json::json!({"status":"rejected","reason":"未知工具"})
                             } else if let Ok(execution) = ai_chat::parse_execution(&call.arguments)
                             {
@@ -995,4 +1287,36 @@ mod tests {
         .unwrap();
         assert!(memory.facts("actor").unwrap().is_empty());
     }
+    #[test]
+    fn image_rejection_only_matches_image_related_client_errors() {
+        assert!(is_image_rejection(&anyhow::anyhow!(
+            "HTTP 400 invalid image_url for this model"
+        )));
+        assert!(is_image_rejection(&anyhow::anyhow!(
+            "HTTP 415 unsupported media type"
+        )));
+        assert!(is_image_rejection(&anyhow::anyhow!(
+            "HTTP 422 content contains unsupported modality"
+        )));
+        assert!(!is_image_rejection(&anyhow::anyhow!(
+            "HTTP 500 model not found"
+        )));
+        assert!(!is_image_rejection(&anyhow::anyhow!(
+            "HTTP 400 missing api key"
+        )));
+    }
+
+    #[test]
+    fn image_retry_happens_at_most_once() {
+        let error = anyhow::anyhow!("HTTP 400 invalid image_url for this model");
+        assert!(should_retry_without_image(true, false, &error));
+        assert!(!should_retry_without_image(true, true, &error));
+        assert!(!should_retry_without_image(false, false, &error));
+        assert!(!should_retry_without_image(
+            true,
+            false,
+            &anyhow::anyhow!("HTTP 500 model not found")
+        ));
+    }
+
 }

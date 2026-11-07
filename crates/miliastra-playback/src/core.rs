@@ -753,6 +753,22 @@ impl PlaybackCore {
         Ok(())
     }
 
+    /// TTS 说话期间的独立「压低增益」（0–100，100=不压低）。
+    ///
+    /// 只改实际输出增益；**不修改 `PlaybackSnapshot.volume`**、不发布快照、不落库，
+    /// 因此 `@状态`/状态栏显示的音量与持久化音量都保持原值（「不回显示」）。
+    pub async fn set_duck_gain(&self, gain: u8) -> Result<(), PlaybackCoreError> {
+        if gain > 100 {
+            return Err(PlaybackCoreError::InvalidRequest(
+                "duck gain must be between 0 and 100".to_owned(),
+            ));
+        }
+        self.engine
+            .command(EngineCommand::SetDuckGain { gain })
+            .await?;
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> PlaybackSnapshot {
         let receiver = self.engine.subscribe();
         let mut snapshot = receiver.borrow().clone();

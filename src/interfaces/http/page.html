@@ -664,6 +664,12 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
 /* 搜索命中高亮（文本已 esc，再包 mark） */
 #configForm .config-group-card .config-field-label b mark,.config-section-item mark,.config-domain-head mark{background:var(--accent-soft);color:var(--accent);border-radius:3px;padding:0 2px}
 .config-empty{color:var(--text-3);text-align:center;padding:var(--sp-5);background:var(--bg-card);border:1px dashed var(--sep-1);border-radius:var(--radius-m)}
+.config-vision-note{font-size:var(--fs-tiny);line-height:var(--lh-tiny);background:var(--info-soft);color:var(--text-1);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-2) var(--sp-3);margin-top:var(--sp-2)}
+.config-vision-preview{margin-top:var(--sp-2)}
+.config-vision-preview img{display:block;max-width:100%;max-height:380px;width:auto;height:auto;background:#000;border:1px solid var(--sep-1);border-radius:var(--radius-m)}
+.config-vision-tools{margin-top:var(--sp-2);border:1px solid var(--sep-2);border-radius:var(--radius-m);padding:var(--sp-2) var(--sp-3);background:var(--bg-input)}
+.config-vision-tools summary{cursor:pointer;font-size:var(--fs-item);font-weight:600;color:var(--text-1)}
+.config-vision-tools pre{margin:var(--sp-1) 0;font-family:var(--font-mono);font-size:var(--fs-tiny);line-height:var(--lh-tiny);white-space:pre-wrap;word-break:break-word;color:var(--text-1);background:var(--bg-raised);border-radius:var(--radius-s);padding:var(--sp-1) var(--sp-2)}
 #configRevisionsPanel{scroll-margin-top:calc(var(--topbar-h,76px) + 52px)}
 /* 顶栏状态徽章：1440 可用宽度收紧内边距/间距，避免 6 徽章被截断（1024/1920 不受影响） */
 @media(max-width:1600px){
@@ -845,6 +851,10 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
         <details class="panel" open>
           <summary class="panel-head">模型与提示词</summary>
           <div class="panel-body" id="aiChatPromptPanel"><p class="config-field-hint">正在读取配置…</p></div>
+        </details>
+        <details class="panel" open id="aiChatVisionPanelWrap">
+          <summary class="panel-head">AI 识图</summary>
+          <div class="panel-body" id="aiChatVisionPanel"><p class="config-field-hint">正在读取配置…</p></div>
         </details>
         <details class="panel" open>
           <summary class="panel-head">AI回复 标签</summary>
@@ -1471,10 +1481,16 @@ async function navigateTo(route,updateHash=true){
 let aiChatData=null
 let aiChatFields=[]
 let aiChatDirty=false
+let visionStatusLoading=false
+let visionStatusFetchedAt=0
+let visionPreviewLoading=false
+let visionPreviewUrl=null
 const AI_CHAT_GROUPS=[
   {id:'aiChatTriggerPanel',keys:['enabled','keyword','trigger_mode','min_access','cooldown_seconds','allow_commands']},
   {id:'aiChatMemoryPanel',keys:['actor_token_budget','bot_token_budget']},
   {id:'aiChatPromptPanel',keys:['model','reasoning','max_tokens','system_prompt','answer_prompt','extract_prompt']},
+  // AI 识图：ai_chat.vision.*；截图只在本机内存编码，模型不支持时后端自动降级纯文本。
+  {id:'aiChatVisionPanel',keys:['vision.enabled','vision.mode','vision.capture_scope','vision.max_edge','vision.jpeg_quality','vision.max_bytes','vision.timeout_ms','vision.model','vision.allow_full_screen']},
   // {AI回复} 是回复模板里的独立标签，生成参数在 ai_reply.* 下；
   // 不在这里列出的话，用户根本看不到它、也没法调。
   {id:'aiChatReplyPanel',keys:[
@@ -1723,15 +1739,18 @@ function renderAiChatPage(){
     const host=$(group.id)
     if(!host)continue
     const parts=[]
+    let found=0
     for(const key of group.keys){
       const field=aiChatFields.find(item=>item.path==='ai_chat.'+key)
       if(!field)continue
+      found++
       parts.push('<div class="config-field">')
       parts.push('<div class="config-field-head"><b>'+esc(field.label)+'</b><code>'+esc(field.path)+'</code></div>')
       if(field.hint)parts.push('<div class="config-field-hint">'+esc(field.hint)+'</div>')
       parts.push(configControlHtml(field,aiChatFieldValue(field.path),'ai_chat','aichat-'))
       parts.push('</div>')
     }
+    if(group.id==='aiChatVisionPanel')parts.push(visionPanelExtraHtml(found===0))
     parts.push('<div class="config-string-row"><button class="btn" onclick="saveAiChatSettings()">保存本页</button>')
     parts.push('<button class="btn ghost" onclick="discardAiChatSettings()">放弃修改</button></div>')
     host.innerHTML=parts.join('')
@@ -1740,6 +1759,86 @@ function renderAiChatPage(){
     input.addEventListener('change',()=>{aiChatDirty=true})
     input.addEventListener('input',()=>{aiChatDirty=true})
   })
+  if($('aiChatVisionPanel'))loadVisionStatus(false)
+}
+// AI 识图分组内的隐私说明 + 能力状态 + 本机预览（不写配置、不上传模型、不落盘）。
+function visionPanelExtraHtml(noSchema){
+  const hasMode=aiChatFields.some(f=>f.path==='ai_chat.vision.mode')
+  const modeNote=hasMode?'':'<p class="config-field-hint">当前后端未提供 ai_chat.vision.mode 下拉；可选值：<b>auto</b>=每轮自动附截图（默认）、<b>tool</b>=不自动附图、由 AI 调用 look、<b>both</b>=自动附图并允许 look。</p>'
+  const note=noSchema?'<p class="config-field-hint">当前后端版本未提供 ai_chat.vision.* 配置；升级后端后这里会出现开关、模式、截图范围与限额。下面仍可预览画面。</p>':''
+  return note
+    +'<p class="config-field-hint">识图模式：auto=每轮自动附截图（默认）；tool=不自动附图，由 AI 调用 <code>look</code>；both=自动附图并允许 <code>look</code>。只给工具与示例，是否调用、何时调用由你在 system_prompt 里自行决定。</p>'
+    +modeNote
+    +'<div class="config-message config-vision-note">隐私说明：截图默认是整个一级大厅，可能包含昵称/HUD/UID。截图只在本机内存中编码，不写入磁盘；打开“识别截图”后才会随 AI 聊天请求发送给下方所配置的模型。模型不支持图片或查询失败时自动降级为纯文本。</div>'
+    +'<details class="config-vision-tools"><summary>工具调用示例（look / speak）</summary>'
+    +'<p class="config-field-hint">下面只是<b>调用形状示例</b>，不是提示词；请在你自己的 system_prompt 里决定何时调用、说什么，本面板不会自动注入“何时说/说什么”。</p>'
+    +'<pre>look  →  {"tool":"look","arguments":{}}</pre>'
+    +'<pre>speak →  {"tool":"speak","arguments":{"text":"要朗读的短句"}}</pre>'
+    +'<p class="config-field-hint">工具名/参数以后端实现为准；speak 受上方「语音 TTS」配置与单条字数上限约束。</p>'
+    +'</details>'
+    +'<div class="row wrap" style="align-items:center;gap:var(--sp-2)">'
+    +'<button type="button" class="btn small" id="aiVisionPreviewBtn" onclick="previewVisionFrame()">预览当前画面</button>'
+    +'<button type="button" class="btn small ghost" onclick="loadVisionStatus(true)">刷新模型能力</button>'
+    +'<span class="config-field-hint" id="aiVisionStatus">模型能力：读取中…</span>'
+    +'</div>'
+    +'<div class="config-field-hint" id="aiVisionPreviewMeta"></div>'
+    +'<div id="aiVisionPreview" class="config-vision-preview hidden"></div>'
+}
+function aiChatVisionControl(path){return document.getElementById('aichat-'+configControlId('ai_chat.'+path))}
+async function loadVisionStatus(force){
+  if(visionStatusLoading)return
+  if(!force&&Date.now()-visionStatusFetchedAt<5000)return
+  const el=$('aiVisionStatus')
+  if(el)el.textContent='模型能力：读取中…'
+  visionStatusLoading=true
+  visionStatusFetchedAt=Date.now()
+  try{
+    const resp=await request('/ai/vision/status')
+    const supported=!!(resp&&(resp.supported===true||resp.vision===true||resp.ok===true||resp.enabled===true||resp.image_supported===true))
+    const source=String((resp&&(resp.source||resp.provider||resp.modelSource||''))||'')
+    const reason=String((resp&&(resp.reason||resp.message||resp.detail||''))||'')
+    if(el)el.textContent='模型能力：'+(supported?'支持图片':'暂不支持图片（将降级为纯文本）')+(source?' · 来源 '+source:'')+(reason?' · '+reason:'')
+  }catch(e){
+    // task-56 后端可能尚未部署：404/失败时降级提示，不阻塞配置/保存。
+    if(el)el.textContent='模型能力：暂不可用（未取到 /ai/vision/status），已降级纯文本；可手填视觉模型并保存。'+((e&&e.message)?'（'+e.message+'）':'')
+  }finally{visionStatusLoading=false}
+}
+async function previewVisionFrame(){
+  if(visionPreviewLoading)return
+  const btn=$('aiVisionPreviewBtn')
+  const meta=$('aiVisionPreviewMeta')
+  const host=$('aiVisionPreview')
+  let q=NaN
+  const qc=aiChatVisionControl('vision.jpeg_quality')
+  if(qc)q=Number(qc.value)
+  if(!Number.isFinite(q)||q<1||q>100)q=80
+  q=Math.round(q)
+  visionPreviewLoading=true
+  if(btn){btn.disabled=true;btn.textContent='截图中…'}
+  if(meta)meta.textContent='截图中（quality='+q+'）…'
+  const started=performance.now()
+  try{
+    const r=await fetch('/debug/screenshot?quality='+q,{headers:requestHeaders(),cache:'no-store'})
+    if(!r.ok)throw new Error((await r.text()).slice(0,200)||('HTTP '+r.status))
+    const blob=await r.blob()
+    if(!blob.size)throw new Error('返回空图片')
+    const ms=Math.round(performance.now()-started)
+    const url=URL.createObjectURL(blob)
+    const img=new Image()
+    await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=()=>reject(new Error('图片解码失败'));img.src=url})
+    if(visionPreviewUrl)URL.revokeObjectURL(visionPreviewUrl)
+    visionPreviewUrl=url
+    if(host){host.innerHTML='';host.appendChild(img);host.classList.remove('hidden')}
+    if(meta)meta.textContent='预览：'+img.naturalWidth+'×'+img.naturalHeight+' · '+(blob.size/1024).toFixed(1)+' KB · '+ms+' ms（仅本机显示，未上传模型、未落盘）'
+  }catch(e){
+    // 失败只影响预览，不动任何配置控件。
+    if(meta)meta.textContent=''
+    if(host){host.innerHTML='';host.classList.add('hidden')}
+    showAiChatMessage('预览当前画面失败：'+((e&&e.message)||'未知错误'),'err')
+  }finally{
+    visionPreviewLoading=false
+    if(btn){btn.disabled=false;btn.textContent='预览当前画面'}
+  }
 }
 function collectAiChatSection(){
   // 以已保存值为基线：页面上没渲染的字段（其他分组里的）不能被写丢。
@@ -1774,10 +1873,114 @@ async function saveAiChatSettings(){
 /* ===== AI 模型列表 ===== */
 let modelChoices=[]
 let modelLoading=false
+// TTS 模型/音色目录（task-52）。models 始终是内置 fallback；source 表示音色是否来自 fish API。
+let ttsCatalog={models:[],voices:[],source:null,modelSource:null,loaded:false,error:''}
+let ttsLoading=false
 // 只取会影响"连到哪台服务"的字段，用表单当前值（未保存也算）。
 // 字段不提交表示"沿用已保存配置"，提交空串表示"面板上确实是空的"，两者语义不同。
 // 密钥框永远渲染为空（占位符是"留空表示不修改"），所以只有它需要特判：
 // 没输入就不提交，让后端用已保存的 key；点了"清除"才提交空串。
+// ===== TTS 模型/音色目录（task-52） =====
+// 复用 /ai/models 的 requestJson + 未保存覆盖模式：POST /tts/models 带面板当前 endpoint/api_key，
+// 字段缺失=沿用已保存配置，api_key 空串=明确清空（只有点“清除”才会这样）。
+function ttsCatalogOverrides(){
+  const out={}
+  const ep=document.getElementById(configControlId('tts.endpoint'))
+  if(ep)out.endpoint=String(ep.value||'').trim()
+  const key=document.getElementById(configControlId('tts.api_key'))
+  if(key){
+    if(key.dataset.cfgClear==='1')out.api_key=''
+    else{const v=String(key.value||'').trim();if(v)out.api_key=v}
+  }
+  return out
+}
+function ttsSourceText(kind){
+  if(ttsCatalog.error)return (kind==='model'?'模型':'音色')+'：获取失败（可手填）'
+  if(!ttsCatalog.loaded)return (kind==='model'?'模型':'音色')+'：未获取（可手填或点“获取列表”）'
+  if(kind==='model')return ttsCatalog.modelSource==='api'?'模型：API 获取':'模型：内置列表（非 API 获取）'
+  return ttsCatalog.source==='api'
+    ?'音色：来自 fish API（'+ttsCatalog.voices.length+' 个）'
+    :'音色：fallback/未获取（'+ttsCatalog.voices.length+' 个，可手填）'
+}
+function ttsVoiceOptionsHtml(){
+  return ttsCatalog.voices.map(v=>'<option value="'+esc(v.id)+'">'+esc(v.title||v.id)+' · '+esc(v.id)+'</option>').join('')
+}
+function ttsFieldControlHtml(field,value){
+  const path=field.path,id=configControlId(path),text=value==null?'':String(value)
+  const btn='<button type="button" class="btn small ghost" data-tts-fetch onclick="loadTtsCatalog()">'+(ttsLoading?'获取中…':'获取列表')+'</button>'
+  const src='<span class="config-field-hint" data-tts-source="'+esc(path)+'">'+esc(ttsSourceText(path==='tts.model'?'model':'voice'))+'</span>'
+  if(path==='tts.model'){
+    const opts=ttsCatalog.models.map(m=>'<option value="'+esc(m)+'">'+esc(m)+'</option>').join('')
+    return '<div class="model-picker"><input id="'+id+'" type="text" data-cfg="'+path+'" value="'+esc(text)+'" placeholder="留空沿用默认模型"><select data-tts-model-pick onchange="ttsPickModel(this)"><option value="">'+(opts?'从列表选择…':'（尚未获取模型列表）')+'</option>'+opts+'</select>'+btn+'</div>'+src
+  }
+  const listId=id+'-voice-list'
+  const datalist='<datalist id="'+listId+'" data-tts-voice-list>'+ttsVoiceOptionsHtml()+'</datalist>'
+  if(path==='tts.reference_id'){
+    return '<div class="model-picker"><input id="'+id+'" type="text" list="'+listId+'" data-cfg="'+path+'" value="'+esc(text)+'" placeholder="手填 reference_id 或从音色列表选择"><select data-tts-voice-pick onchange="ttsPickVoice(this)"><option value="">'+(ttsCatalog.voices.length?'从音色选择…':'（未获取到音色，可手填）')+'</option>'+ttsVoiceOptionsHtml()+'</select>'+btn+'</div>'+datalist+src
+  }
+  // tts.voice：保留手填；给同一份音色 datalist 辅助，选择仍写入 reference_id（见 ttsPickVoice）。
+  return '<div class="model-picker"><input id="'+id+'" type="text" list="'+listId+'" data-cfg="'+path+'" value="'+esc(text)+'" placeholder="手填音色别名"><select data-tts-voice-pick onchange="ttsPickVoice(this)"><option value="">'+(ttsCatalog.voices.length?'选择音色（写入 reference_id）':'（未获取到音色，可手填）')+'</option>'+ttsVoiceOptionsHtml()+'</select>'+btn+'</div>'+datalist+src
+}
+function renderTtsPickers(){
+  const modelOpts=ttsCatalog.models.map(m=>'<option value="'+esc(m)+'">'+esc(m)+'</option>').join('')
+  document.querySelectorAll('[data-tts-model-pick]').forEach(sel=>{
+    const cur=sel.value
+    sel.innerHTML='<option value="">'+(modelOpts?'从列表选择…':'（尚未获取模型列表）')+'</option>'+modelOpts
+    if([...sel.options].some(o=>o.value===cur))sel.value=cur
+  })
+  const voiceOpts=ttsVoiceOptionsHtml()
+  document.querySelectorAll('[data-tts-voice-pick]').forEach(sel=>{
+    const cur=sel.value
+    sel.innerHTML='<option value="">'+(voiceOpts?'从音色选择…':'（未获取到音色，可手填）')+'</option>'+voiceOpts
+    if([...sel.options].some(o=>o.value===cur))sel.value=cur
+  })
+  document.querySelectorAll('[data-tts-voice-list]').forEach(dl=>{dl.innerHTML=voiceOpts})
+  document.querySelectorAll('[data-tts-source]').forEach(el=>{
+    const p=el.getAttribute('data-tts-source')
+    el.textContent=ttsSourceText(p==='tts.model'?'model':'voice')
+  })
+  document.querySelectorAll('[data-tts-fetch]').forEach(b=>{b.textContent=ttsLoading?'获取中…':'获取列表'})
+}
+function ttsPickModel(select){
+  const val=select.value
+  if(!val)return
+  const input=document.getElementById(configControlId('tts.model'))
+  if(input){input.value=val;input.dispatchEvent(new Event('input',{bubbles:true}))}
+  select.value=''
+}
+function ttsPickVoice(select){
+  const val=select.value
+  if(!val)return
+  // 音色目录选择统一写入 reference_id（voice 只是 reference_id 为空时的别名）。
+  const input=document.getElementById(configControlId('tts.reference_id'))
+  if(input){input.value=val;input.dispatchEvent(new Event('input',{bubbles:true}))}
+  select.value=''
+}
+async function loadTtsCatalog(){
+  if(ttsLoading)return
+  ttsLoading=true
+  ttsCatalog.error=''
+  renderTtsPickers()
+  try{
+    const resp=await requestJson('/tts/models',ttsCatalogOverrides())
+    if(!resp||typeof resp!=='object')throw new Error('返回格式无效')
+    ttsCatalog.models=Array.isArray(resp.models)?resp.models:[]
+    ttsCatalog.voices=Array.isArray(resp.voices)?resp.voices:[]
+    ttsCatalog.source=resp.source==='api'?'api':'fallback'
+    ttsCatalog.modelSource=resp.modelSource==='api'?'api':'fallback'
+    ttsCatalog.loaded=true
+    const parts=['模型 '+ttsCatalog.models.length+' 个','音色 '+ttsCatalog.voices.length+' 个']
+    if(ttsCatalog.voices.length===0)parts.push('当前没有可用音色，可手填 reference_id/voice')
+    showConfigMessage('已获取 TTS 目录：'+parts.join('，')+'（模型为内置列表，非 API 获取）','ok')
+  }catch(e){
+    // 失败只提示，不清空已有列表，也不覆盖用户的未保存输入。
+    ttsCatalog.error=(e&&e.message)||'获取失败'
+    showConfigMessage('获取 TTS 目录失败：'+ttsCatalog.error+'；可继续手填模型/音色。','err')
+  }finally{
+    ttsLoading=false
+    renderTtsPickers()
+  }
+}
 function aiModelOverrides(){
   const out={}
   for(const key of ['provider','endpoint','responses_endpoint','api_key','http_proxy','wire_api']){
@@ -4240,6 +4443,9 @@ function configControlHtml(field,value,sectionName,idPrefix){
   const parent=configNullableObjectParent(section,path)
   const parentNull=parent&&configValueAt(section,parent.path)==null
   const parentAttr=parent?(' data-cfg-parent="'+parent.path+'"'+(parentNull?' disabled':'')):''
+  // TTS 段：模型/音色需要“获取列表 + 手填”，走专用控件（放在通用 kind 分支之前，
+  // 否则 string/path 分支会先返回普通输入框）。
+  if(section==='tts'&&(path==='tts.model'||path==='tts.reference_id'||path==='tts.voice'))return ttsFieldControlHtml(field,value)
   if(kind==='bool'){
     return '<label class="switch-line"><input id="'+id+'" type="checkbox" data-cfg="'+path+'"'+(value===true?' checked':'')+disabledAttr+parentAttr+'><span data-switch-state>'+(value===true?'已启用':'未启用')+'</span></label>'
   }
@@ -4360,7 +4566,7 @@ function renderConfigFieldHtml(field,section,isAi){
   if(isAi&&field.path==='ai.api_key')parts.push('<div class="config-step-title">第二步：服务商参数</div><div class="config-field-hint ai-provider-info" id="aiProviderInfo"></div>')
   parts.push('<div class="config-field'+(bootstrap?' bootstrap':'')+'" data-kind="'+kind+'" data-cfg-field="'+esc(field.path)+'" id="cfg-field-'+id+'">')
   parts.push('<div class="config-field-label"><b>'+configHighlight(field.label)+'</b><code title="'+esc(field.path)+'">'+esc(field.path)+'</code></div>')
-  parts.push('<div class="config-field-control">'+configControlHtml(field,value)+'</div>')
+  parts.push('<div class="config-field-control">'+configControlHtml(field,value,section.name)+'</div>')
   parts.push('<div class="config-field-side">'+configEffectTag(field)+'</div>')
   parts.push('<div class="config-field-foot">')
   if(field.managedBy==='visual')parts.push('<span class="config-field-hint">已并入上方“视觉档案”，建议统一修改。</span>')

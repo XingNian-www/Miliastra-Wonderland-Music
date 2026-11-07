@@ -1731,14 +1731,17 @@ function openAiConfig(){
 function visionPanelExtraHtml(noSchema){
   const chatSchema=configSectionByName('ai_chat')
   const hasMode=!!chatSchema&&chatSchema.fields.some(f=>f.path==='ai_chat.vision.mode')
+  const hasDirect=!!chatSchema&&chatSchema.fields.some(f=>f.path==='ai_chat.vision.direct_to_main')
   const modeNote=hasMode?'':'<p class="config-field-hint">当前后端未提供 ai_chat.vision.mode 下拉；可选值：<b>auto</b>=每轮自动附截图（默认）、<b>tool</b>=不自动附图、由 AI 调用 look、<b>both</b>=自动附图并允许 look。</p>'
+  const directNote='<p class="config-field-hint"><b>主模型直接看图（direct_to_main）</b>：只决定是否把截图直接交给主模型，需要主模型支持图片；它不改变 auto/tool/both 的截图与工具行为，也不会因 direct 重复截图；tool 模式下与 look 并存；<b>both 仍可能因 look 多一次请求/费用</b>。'+(hasDirect?'':'当前后端未提供该开关，升级后自动出现。')+'</p>'
   const note=noSchema?'<p class="config-field-hint">当前后端版本未提供 ai_chat.vision.* 配置；升级后端后这里会出现开关、模式、截图范围与限额。下面仍可预览画面。</p>':''
   return note
     +'<p class="config-field-hint">识图模式：auto=每轮自动附截图（默认）；tool=不自动附图，由 AI 调用 <code>look</code>；both=已有初始截图，<code>look</code> 仅在需要新画面时用，可能多一次视觉请求/费用。<b>both 会每轮附图并允许 look 再抓新画面，成本与请求数更高。</b>只给工具与示例，是否调用、何时调用由你在 system_prompt 里自行决定。</p>'
     +'<p class="config-field-hint">视觉专用模型（vision.model）只用于 <code>look</code> 子请求；auto 自动附图仍使用 AI 聊天模型（ai_chat.model）。</p>'
     +'<p class="config-field-hint">「允许整屏截图」关闭时识图不可用（当前截图范围只支持一级大厅整屏）。</p>'
+    +directNote
     +modeNote
-    +'<div class="config-message config-vision-note">隐私说明：截图默认是整个一级大厅，可能包含昵称/HUD/UID；非一级大厅或整屏画面还可能包含更多 UID/昵称。截图只在本机内存中编码，不写入磁盘；打开“识别截图”后才会随 AI 聊天请求发送给下方所配置的模型。模型不支持图片或查询失败时自动降级为纯文本。</div>'
+    +'<div class="config-message config-vision-note">隐私说明：截图默认是整个一级大厅，可能包含昵称/HUD/UID；非一级大厅或整屏画面还可能包含更多 UID/昵称。带图轮次还会附带备注/真实昵称↔显示昵称对照（不含 UID）。截图只在本机内存中编码，不写入磁盘；打开“识别截图”后才会随 AI 聊天请求发送给下方所配置的模型。模型不支持图片或查询失败时自动降级为纯文本。</div>'
     +'<details class="config-vision-tools"><summary>工具调用示例（look / speak）</summary>'
     +'<p class="config-field-hint">下面只是<b>真实 function call 形状示例（name/arguments）</b>，不是提示词；请在你自己的 system_prompt 里决定何时调用、说什么，本面板不会自动注入“何时说/说什么”。</p>'
     +'<pre>{"name":"look","arguments":"{\\\"instruction\\\":\\\"描述聊天区域里的文字\\\"}"}</pre>'
@@ -4731,7 +4734,7 @@ function renderAiConfigFormHtml(aiSection){
   const aiFields=pick(aiSection)
   const chatAll=pick(aiChat)
   const chatFields=chatAll.filter(f=>!String(f.path).startsWith('ai_chat.vision.')&&!String(f.path).startsWith('ai_chat.tool_prompts.'))
-  const visionFields=chatAll.filter(f=>String(f.path).startsWith('ai_chat.vision.'))
+  const visionFields=chatAll.filter(f=>String(f.path).startsWith('ai_chat.vision.')).map(f=>f.path==='ai_chat.vision.direct_to_main'?Object.assign({},f,{hint:'只决定是否把截图直接交给主模型，需主模型支持图片；tool 模式与 look 并存；both 仍可能多一次 look 请求/费用'}):f)
   const ttsFields=pick(tts)
   const total=aiFields.length+chatFields.length+visionFields.length+ttsFields.length
   const parts=['<div class="config-form">']

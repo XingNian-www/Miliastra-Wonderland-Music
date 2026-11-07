@@ -63,6 +63,36 @@ fn vision_navigation_budget(deadline: Option<Instant>) -> Duration {
     }
 }
 
+const LOOK_CONTEXT_MAX_CHARS: usize = 500;
+
+fn sanitize_look_context(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control() && !matches!(ch, '\u{2028}' | '\u{2029}'))
+        .take(LOOK_CONTEXT_MAX_CHARS)
+        .collect()
+}
+
+/// look 子请求 prompt：把用户本轮问题与主模型 instruction 一起交给视觉子模型。
+fn build_look_vision_prompt(question: &str, instruction: Option<&str>) -> String {
+    let question = sanitize_look_context(question);
+    if question.is_empty() {
+        return "请简要描述当前一级大厅画面。".to_string();
+    }
+    let instruction = instruction
+        .map(sanitize_look_context)
+        .filter(|instruction| !instruction.is_empty());
+    match instruction {
+        Some(instruction) => format!(
+            "用户本轮问题：{question}\n视觉子任务：{instruction}\n只提取回答该问题所需的信息。"
+        ),
+        None => format!(
+            "用户本轮问题：{question}\n请查看当前画面，提取回答该问题所需的信息。"
+        ),
+    }
+}
+
 impl ApplicationRuntime {
     /// 当前视觉请求使用的模型名：优先 `ai_chat.vision.model`，否则沿用聊天模型。
     fn ai_chat_vision_model(&self, config: &crate::features::ai_chat::AiChatConfig) -> String {
@@ -100,6 +130,12 @@ impl ApplicationRuntime {
             log::debug!("模型「{model}」未声明图片能力，AI 聊天本轮不附带截图");
         }
         supports == Some(true)
+    }
+
+    /// 只随图片附件发送的备注↔昵称对照；无有效对照返回 None。
+    fn ai_name_context(&self) -> Option<String> {
+        let pairs = self.lifecycle.live_configs.identity.ai_name_pairs();
+        crate::features::ai_chat::format_ai_name_pairs(&pairs)
     }
 
     /// 按需截取一级/二级界面并编码为内存 JPEG。
@@ -197,7 +233,7 @@ impl ApplicationRuntime {
                     started.elapsed().as_millis()
                 );
                 VisionCapture {
-                    image: Some(image),
+                    image: Some(image.with_context(self.ai_name_context())),
                     failure: None,
                     residency,
                     navigated,
@@ -214,6 +250,7 @@ impl ApplicationRuntime {
     fn run_ai_chat_look(
         &self,
         config: &crate::features::ai_chat::AiChatConfig,
+        question: &str,
         instruction: Option<&str>,
         deadline: Instant,
         reuse_image: Option<&crate::config::ai::ImageAttachment>,
@@ -257,7 +294,7 @@ impl ApplicationRuntime {
         if remaining.is_zero() {
             return serde_json::json!({"status":"unavailable","reason":"look 已超过总期限"});
         }
-        let prompt = instruction.unwrap_or("请简要描述当前一级大厅画面。");
+        let prompt = build_look_vision_prompt(question, instruction);
         let max_tokens = config.max_tokens.clamp(64, 800);
         let mut session = match crate::config::ai::ToolSession::with_history_options_and_image(
             &self.business.ai_connection,
@@ -267,7 +304,7 @@ impl ApplicationRuntime {
             },
             crate::features::ai_chat::look_system_prompt(),
             Vec::new(),
-            prompt,
+            &prompt,
             Vec::new(),
             Some(image),
         ) {
@@ -292,7 +329,7 @@ impl ApplicationRuntime {
                         "status":"looked",
                         "kind":"vision_transcript",
                         "description":text,
-                        "note":"这是视觉子模型的文字转述，主模型没有直接看到原图"
+                        "note":"这是视觉子模型的文字转述；主模型是否另收到原图取决于当前配置"
                     })
                 }
             }
@@ -417,11 +454,11 @@ impl ApplicationRuntime {
                 // vision.model 仅给 look 子请求，主聊天始终用 ai_chat.model。
                 let main_model = self.ai_chat_main_model(&config);
                 let main_supports_vision = (config.vision.enabled
-                    && matches!(
+                    && (matches!(
                         config.vision.mode,
                         crate::features::ai_chat::VisionMode::Auto
                             | crate::features::ai_chat::VisionMode::Both
-                    ))
+                    ) || config.vision.direct_to_main))
                     .then(|| self.ai_chat_model_supports_vision(&main_model))
                     .unwrap_or(false);
                 let command_enabled = config.allow_commands && !allowed.is_empty();
@@ -543,6 +580,7 @@ impl ApplicationRuntime {
                                             looked_instructions.insert(key);
                                             self.run_ai_chat_look(
                                                 &config,
+                                                question,
                                                 instruction.as_deref(),
                                                 deadline,
                                                 vision_image.as_ref(),
@@ -1477,6 +1515,34 @@ mod tests {
             VisionCapture::failed("返回驻守失败", "Failed", true);
         assert!(secondary_return_failed.navigated);
         assert_eq!(secondary_return_failed.residency, "Failed");
+    }
+
+    #[test]
+    fn look_vision_prompt_includes_user_question_and_instruction() {
+        let with_instruction =
+            build_look_vision_prompt("画面里有人说话吗", Some("提取聊天区域文字"));
+        assert!(with_instruction.contains("用户本轮问题：画面里有人说话吗"));
+        assert!(with_instruction.contains("视觉子任务：提取聊天区域文字"));
+        assert!(with_instruction.contains("只提取回答该问题所需的信息"));
+
+        let without_instruction = build_look_vision_prompt("现在大厅发生了什么", None);
+        assert!(without_instruction.contains("用户本轮问题：现在大厅发生了什么"));
+        assert!(without_instruction.contains("提取回答该问题所需的信息"));
+        assert!(!without_instruction.contains("视觉子任务："));
+
+        assert_eq!(
+            build_look_vision_prompt("  ", Some("看画面")),
+            "请简要描述当前一级大厅画面。"
+        );
+
+        let controlled = build_look_vision_prompt("问题\u{7}正文", Some("指令\u{7}内容"));
+        assert!(!controlled.contains('\u{7}'));
+        assert!(controlled.contains("问题正文"));
+        assert!(controlled.contains("指令内容"));
+
+        let long_question = "问".repeat(LOOK_CONTEXT_MAX_CHARS + 50);
+        let long = build_look_vision_prompt(&long_question, None);
+        assert!(long.chars().count() < LOOK_CONTEXT_MAX_CHARS + 100);
     }
 
     #[test]

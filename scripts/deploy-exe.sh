@@ -6,23 +6,28 @@
 # 漏一步就得到「进程起来十几秒后无声退出」。脚本把这些约束固定下来。
 #
 # 用法：
-#   scripts/deploy-exe.sh --host 192.168.31.119 --exe /tmp/build/miliastra-wonderland-music.exe
-#   scripts/deploy-exe.sh --host 192.168.31.119 --exe ... --dry-run
+#   scripts/deploy-exe.sh --host <HOST> --exe <EXE> \
+#       --user <USER> --key <SSH_KEY> --dir <REMOTE_DIR> --task <TASK>
+#   scripts/deploy-exe.sh --host <HOST> --exe <EXE> --dry-run
 #
-# 前置：本机已能免密 ssh 到目标（默认用户 XingNian，密钥 ~/.ssh/yae_server）。
+# 环境变量（--execute 时必填；CLI 参数优先）：
+#   MILIASTRA_SSH_USER / MILIASTRA_SSH_KEY / MILIASTRA_REMOTE_DIR / MILIASTRA_TASK_NAME
+# dry-run 不要求任何环境信息。
 set -euo pipefail
 
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
 HOST=''
-USER_NAME='XingNian'
-KEY="$HOME/.ssh/yae_server"
-REMOTE_DIR='C:\\Users\\XingNian\\Desktop\\5.1'
+USER_NAME="${MILIASTRA_SSH_USER:-}"
+KEY="${MILIASTRA_SSH_KEY:-}"
+REMOTE_DIR="${MILIASTRA_REMOTE_DIR:-}"
+TASK_NAME="${MILIASTRA_TASK_NAME:-}"
 EXE_NAME='miliastra-wonderland-music.exe'
-TASK_NAME='Miliastra'
 EXE=''
 DRY_RUN=0
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  awk 'NR>1 { if ($0 ~ /^set -euo pipefail$/) exit; print }' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -33,21 +38,29 @@ while [[ $# -gt 0 ]]; do
     --key) KEY="$2"; shift 2 ;;
     --exe) EXE="$2"; shift 2 ;;
     --dir) REMOTE_DIR="$2"; shift 2 ;;
+    --task) TASK_NAME="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage ;;
-    *) echo "未知参数: $1" >&2; usage ;;
+    *) die "未知参数: $1" ;;
   esac
 done
 
-[[ -n "$HOST" ]] || { echo '缺少 --host' >&2; exit 1; }
-[[ -n "$EXE" ]] || { echo '缺少 --exe' >&2; exit 1; }
-[[ -f "$EXE" ]] || { echo "找不到可执行文件: $EXE" >&2; exit 1; }
+[[ -n "$HOST" ]] || die '缺少 --host'
+[[ -n "$EXE" ]] || die '缺少 --exe'
+[[ -f "$EXE" ]] || die "找不到可执行文件: $EXE"
+
+if [[ $DRY_RUN -eq 0 ]]; then
+  [[ -n "$USER_NAME" ]] || die '缺少 --user 或 MILIASTRA_SSH_USER'
+  [[ -n "$KEY" ]] || die '缺少 --key 或 MILIASTRA_SSH_KEY'
+  [[ -n "$REMOTE_DIR" ]] || die '缺少 --dir 或 MILIASTRA_REMOTE_DIR'
+  [[ -n "$TASK_NAME" ]] || die '缺少 --task 或 MILIASTRA_TASK_NAME'
+fi
 
 LOCAL_SHA=$(sha256sum "$EXE" | awk '{print $1}')
 LOCAL_SIZE=$(stat -c%s "$EXE")
 TS=$(date +%Y%m%d-%H%M%S)
 
-echo "== 目标 $USER_NAME@$HOST:$REMOTE_DIR"
+echo "== 目标 ${USER_NAME:-<USER>}@$HOST:${REMOTE_DIR:-<REMOTE_DIR>}"
 echo "== 文件 $(basename "$EXE") ($LOCAL_SIZE 字节)"
 echo "== sha256 $LOCAL_SHA"
 

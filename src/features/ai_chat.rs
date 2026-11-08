@@ -2559,7 +2559,9 @@ pub(crate) fn format_ai_name_pairs(pairs: &[AiNamePair]) -> Option<String> {
     if body.is_empty() {
         return None;
     }
-    Some(format!("在图片中,昵称与身份对照关系如下\n{body}"))
+    Some(format!(
+        "在图片中,昵称与身份对照关系如下\n{body}「」左侧的备注/真实昵称是内部识别信息，不要在回复中说出或复述；只可使用右侧显示昵称。"
+    ))
 }
 
 /// 兼容无工具场景（例如纯文本调用）；工具提示词按需使用上面的函数。
@@ -3370,7 +3372,7 @@ mod tests {
         let text = format_ai_name_pairs(&pairs).expect("有对照");
         assert_eq!(
             text,
-            "在图片中,昵称与身份对照关系如下\n- 「备注A」是「显示A」\n- 「真B」是「显示B」\n"
+            "在图片中,昵称与身份对照关系如下\n- 「备注A」是「显示A」\n- 「真B」是「显示B」\n「」左侧的备注/真实昵称是内部识别信息，不要在回复中说出或复述；只可使用右侧显示昵称。"
         );
         assert!(format_ai_name_pairs(&[]).is_none());
         let prompt = response_system_prompt_with_tools(&config(), true, true, true);

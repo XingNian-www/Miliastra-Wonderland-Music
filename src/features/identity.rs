@@ -262,6 +262,21 @@ impl AiNamePair {
     }
 }
 
+/// 末端脱敏：只删除完整的已知 remark 字符串，不按单字模糊删除。
+///
+/// 调用方用 [`IdentityAccess::remark_texts`] 提供列表；display_name/real_nickname
+/// 不在列表里，因此不会被误删。空 remark 安全跳过。
+pub(crate) fn redact_remark_strings(text: &str, remarks: &[String]) -> String {
+    let mut result = text.to_string();
+    for remark in remarks {
+        if remark.is_empty() {
+            continue;
+        }
+        result = result.replace(remark, "");
+    }
+    result.trim().to_string()
+}
+
 fn clean_ai_name(value: &str) -> String {
     value
         .trim()
@@ -380,6 +395,27 @@ impl IdentityAccess {
         pairs.dedup();
         pairs.truncate(AI_NAME_PAIR_LIMIT);
         pairs
+    }
+
+    /// 当前所有非空 `remark`（游戏内备注/手填 OCR 键），按长度降序去重。
+    ///
+    /// 只供末端脱敏使用；不包含 display_name/real_nickname，避免误删正常昵称。
+    pub fn remark_texts(&self) -> Vec<String> {
+        let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let mut remarks: Vec<String> = config
+            .mappings
+            .iter()
+            .map(|mapping| mapping.remark.trim().to_string())
+            .filter(|remark| !remark.is_empty())
+            .collect();
+        remarks.sort_by(|a, b| {
+            b.chars()
+                .count()
+                .cmp(&a.chars().count())
+                .then_with(|| a.cmp(b))
+        });
+        remarks.dedup();
+        remarks
     }
 
     /// 当前映射表的快照。
@@ -1404,6 +1440,45 @@ mod tests {
         assert!(access.set_account_remark("genshin", "30001", "新备注"));
         assert_eq!(access.snapshot().mappings[0].remark, "新备注");
         assert!(access.snapshot().mappings[0].remark_from_chatbridge);
+    }
+
+    #[test]
+    fn remark_texts_and_redaction_only_touch_full_remark_strings() {
+        let mut config = IdentityConfig::default();
+        config.mappings.push(IdentityMapping {
+            remark: "老板".to_string(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            display_name: "显示甲".to_string(),
+            real_nickname: "真名甲".to_string(),
+            remark_from_chatbridge: true,
+            accounts: vec![GameAccount::new("70001")],
+        });
+        config.mappings.push(IdentityMapping {
+            remark: String::new(),
+            id: Uuid::new_v4(),
+            role: IdentityRole::Friend,
+            display_name: "显示乙".to_string(),
+            real_nickname: "真名乙".to_string(),
+            remark_from_chatbridge: false,
+            accounts: vec![GameAccount::new("70002")],
+        });
+        let access = IdentityAccess::new(config);
+        assert_eq!(access.remark_texts(), vec!["老板".to_string()]);
+        assert_eq!(
+            redact_remark_strings("老板你好，显示甲和真名甲都在", &access.remark_texts()),
+            "你好，显示甲和真名甲都在"
+        );
+        assert_eq!(
+            redact_remark_strings("老板", &access.remark_texts()),
+            "",
+            "过滤后仅剩备注时为空，调用方应跳过"
+        );
+        assert_eq!(
+            redact_remark_strings("普通回复", &[]),
+            "普通回复",
+            "空 remark 列表安全"
+        );
     }
 
     #[test]

@@ -1019,10 +1019,6 @@ fn apply_friend_snapshot(
         return stats;
     }
     for mapping in identity.snapshot().mappings {
-        if mapping.role != crate::features::identity::IdentityRole::Friend {
-            // Owner/Admin 永不因好友快照被自动清缓存。
-            continue;
-        }
         let genshin_accounts: Vec<String> = mapping
             .accounts
             .iter()
@@ -1861,7 +1857,7 @@ mod tests {
             ],
         };
         let stats = apply_friend_snapshot(&identity, &snapshot);
-        assert_eq!(stats.cleared_absent, 2, "全 null 与缺席的手填身份都清");
+        assert_eq!(stats.cleared_absent, 3, "全 null、缺席的手填与 owner 都清");
         let mappings = identity.snapshot().mappings;
         let multi = mappings.iter().find(|m| m.id == ids[multi]).unwrap();
         assert_eq!(multi.remark, "新缓存甲", "一个账号有备注就保留");
@@ -1886,10 +1882,14 @@ mod tests {
                 .is_empty(),
             "手填备注已不是合法 remark，缺席时清空"
         );
-        assert_eq!(
-            mappings.iter().find(|m| m.id == ids[owner]).unwrap().remark,
-            "管理员缓存",
-            "Owner/Admin 永不自动清"
+        assert!(
+            mappings
+                .iter()
+                .find(|m| m.id == ids[owner])
+                .unwrap()
+                .remark
+                .is_empty(),
+            "Owner 缺席也由完整快照清空"
         );
         assert_eq!(
             mappings.iter().find(|m| m.id == ids[missing_remark_field]).unwrap().remark,
@@ -1976,6 +1976,70 @@ mod tests {
         let mapping = &identity.snapshot().mappings[0];
         assert!(mapping.remark.is_empty());
         assert!(!mapping.remark_from_chatbridge);
+    }
+
+    #[test]
+    fn complete_snapshot_overwrites_and_clears_owner_admin_remarks() {
+        use crate::features::identity::{
+            GameAccount, IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
+        };
+        use crate::runtime::chat_source::{FriendEntry, FriendSnapshot};
+        let mut config = IdentityConfig::default();
+        for (uid, role, remark) in [
+            ("100290996", IdentityRole::Owner, "yXxDWR"),
+            ("222742527", IdentityRole::Admin, "pGAxP"),
+            ("269989892", IdentityRole::Admin, "3kfaXy"),
+            ("10001", IdentityRole::Friend, "好友旧备注"),
+        ] {
+            config.mappings.push(IdentityMapping {
+                remark: remark.to_string(),
+                id: uuid::Uuid::new_v4(),
+                role,
+                display_name: String::new(),
+                real_nickname: String::new(),
+                remark_from_chatbridge: true,
+                accounts: vec![GameAccount::new(uid)],
+            });
+        }
+        let identity = IdentityAccess::new(config);
+        let snapshot = FriendSnapshot {
+            complete: true,
+            updated_at: Some(1),
+            friends: vec![
+                FriendEntry {
+                    uid: 100290996,
+                    name: None,
+                    remark: Some("实际owner备注".to_string()),
+                    remark_present: true,
+                },
+                FriendEntry {
+                    uid: 222742527,
+                    name: None,
+                    remark: None,
+                    remark_present: true,
+                },
+                FriendEntry {
+                    uid: 10001,
+                    name: None,
+                    remark: None,
+                    remark_present: true,
+                },
+            ],
+        };
+        let stats = apply_friend_snapshot(&identity, &snapshot);
+        assert_eq!(stats.matched, 3);
+        assert_eq!(stats.cleared_absent, 3, "admin null、缺席 admin、friend null 清空");
+        let mappings = identity.snapshot().mappings;
+        let by_uid = |uid: &str| {
+            mappings
+                .iter()
+                .find(|mapping| mapping.accounts.iter().any(|account| account.uid == uid))
+                .unwrap()
+        };
+        assert_eq!(by_uid("100290996").remark, "实际owner备注");
+        assert!(by_uid("222742527").remark.is_empty());
+        assert!(by_uid("269989892").remark.is_empty(), "缺席 admin 清空");
+        assert!(by_uid("10001").remark.is_empty());
     }
 
     #[test]

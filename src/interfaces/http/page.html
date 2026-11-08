@@ -1734,7 +1734,7 @@ function visionPanelExtraHtml(noSchema){
   const hasMode=!!chatSchema&&chatSchema.fields.some(f=>f.path==='ai_chat.vision.mode')
   const hasDirect=!!chatSchema&&chatSchema.fields.some(f=>f.path==='ai_chat.vision.direct_to_main')
   const modeNote=hasMode?'':'<p class="config-field-hint">当前后端未提供 ai_chat.vision.mode 下拉；可选值：<b>auto</b>=每轮自动附截图（默认）、<b>tool</b>=不自动附图、由 AI 调用 look、<b>both</b>=自动附图并允许 look。</p>'
-  const directNote='<p class="config-field-hint"><b>主模型直接看图（direct_to_main）</b>：只决定是否把截图直接交给主模型，需要主模型支持图片；它不改变 auto/tool/both 的截图与工具行为，也不会因 direct 重复截图；tool 模式下与 look 并存；<b>both 仍可能因 look 多一次请求/费用</b>。'+(hasDirect?'':'当前后端未提供该开关，升级后自动出现。')+'</p>'
+  const directNote='<p class="config-field-hint"><b>主模型直接看图（direct_to_main）</b>：只在 AI 调用 <code>look</code> 时把当前截图直接交给主模型（需主模型支持图片），<b>不会因此每轮自动截图</b>。tool 模式下由 AI 决定是否调用 look；auto/both 仍会自动附图。'+(hasDirect?'':'当前后端未提供该开关，升级后自动出现。')+'</p>'
   const note=noSchema?'<p class="config-field-hint">当前后端版本未提供 ai_chat.vision.* 配置；升级后端后这里会出现开关、模式、截图范围与限额。下面仍可预览画面。</p>':''
   return note
     +'<p class="config-field-hint">识图模式：auto=每轮自动附截图（默认）；tool=不自动附图，由 AI 调用 <code>look</code>；both=已有初始截图，<code>look</code> 仅在需要新画面时用，可能多一次视觉请求/费用。<b>both 会每轮附图并允许 look 再抓新画面，成本与请求数更高。</b>只给工具与示例，是否调用、何时调用由你在 system_prompt 里自行决定。</p>'
@@ -4735,7 +4735,7 @@ function renderAiConfigFormHtml(aiSection){
   const aiFields=pick(aiSection)
   const chatAll=pick(aiChat)
   const chatFields=chatAll.filter(f=>!String(f.path).startsWith('ai_chat.vision.')&&!String(f.path).startsWith('ai_chat.tool_prompts.'))
-  const visionFields=chatAll.filter(f=>String(f.path).startsWith('ai_chat.vision.')).map(f=>f.path==='ai_chat.vision.direct_to_main'?Object.assign({},f,{hint:'只决定是否把截图直接交给主模型，需主模型支持图片；tool 模式与 look 并存；both 仍可能多一次 look 请求/费用'}):f)
+  const visionFields=chatAll.filter(f=>String(f.path).startsWith('ai_chat.vision.')).map(f=>f.path==='ai_chat.vision.direct_to_main'?Object.assign({},f,{hint:'开启后 AI 调用 look 时把当前截图直接交给主模型（需主模型支持图片），不每轮自动截图；auto/both 仍自动附图'}):f)
   const ttsFields=pick(tts)
   const total=aiFields.length+chatFields.length+visionFields.length+ttsFields.length
   const parts=['<div class="config-form">']

@@ -255,6 +255,10 @@ impl ApplicationRuntime {
         deadline: Instant,
         reuse_image: Option<&crate::config::ai::ImageAttachment>,
     ) -> serde_json::Value {
+        log::info!(
+            "AI 识图：调用 look 工具（instruction 字数 {}）",
+            instruction.map(str::chars).map(Iterator::count).unwrap_or(0)
+        );
         let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return serde_json::json!({"status":"unavailable","reason":"look 已超过总期限"});
@@ -323,8 +327,10 @@ impl ApplicationRuntime {
             Ok(reply) => {
                 let text = reply.text.trim();
                 if text.is_empty() {
+                    log::warn!("AI 识图：look 失败（视觉模型未返回文本）");
                     serde_json::json!({"status":"unavailable","reason":"视觉模型未返回文本"})
                 } else {
+                    log::info!("AI 识图：look 成功（转述字数 {}）", text.chars().count());
                     serde_json::json!({
                         "status":"looked",
                         "kind":"vision_transcript",
@@ -334,6 +340,7 @@ impl ApplicationRuntime {
                 }
             }
             Err(error) => {
+                log::warn!("AI 识图：look 失败（视觉请求失败或超时）");
                 log::debug!("AI look 视觉请求失败（本次返回 unavailable）：{error:#}");
                 serde_json::json!({"status":"unavailable","reason":"视觉请求失败或超时"})
             }
@@ -479,6 +486,7 @@ impl ApplicationRuntime {
                     Vec::new();
                 let result = (|| -> Result<ai_chat::AiChatAnswer> {
                     let mut image_retry_done = false;
+                    let mut main_image_logged = false;
                     // 主聊天始终使用 ai_chat.model；vision.model 只用于 look 子请求。
                     let session_model = config.model.clone();
                     let mut session =
@@ -540,6 +548,10 @@ impl ApplicationRuntime {
                                 Err(error) => return Err(error),
                             }
                         };
+                        if vision_image.is_some() && !main_image_logged {
+                            main_image_logged = true;
+                            log::info!("AI 识图：本轮已附带主模型截图");
+                        }
                         if response.calls.is_empty() {
                             let reply = ai_chat::parse_reply(&response.text);
                             let rendered = ai_chat::render_reply(&reply);
@@ -597,22 +609,32 @@ impl ApplicationRuntime {
                                     &call.arguments,
                                     &tts_config.model,
                                 ) {
-                                    Ok((text, options)) if spoken.contains(&text) => {
-                                        serde_json::json!({"status":"rejected","reason":"同一回答内禁止重复朗读相同文本"})
-                                    }
                                     Ok((text, options)) => {
-                                        // 先记下，等文字回复发送后再入队，避免语音抢在文字前。
-                                        spoken.insert(text.clone());
-                                        pending_speaks.push((text, options));
+                                        log::info!(
+                                            "AI TTS：调用 speak 工具（text 字数 {}）",
+                                            text.chars().count()
+                                        );
+                                        if spoken.contains(&text) {
+                                            log::warn!("AI TTS：speak 参数拒绝（重复文本）");
+                                            serde_json::json!({"status":"rejected","reason":"同一回答内禁止重复朗读相同文本"})
+                                        } else {
+                                            // 先记下，等文字回复发送后再入队，避免语音抢在文字前。
+                                            spoken.insert(text.clone());
+                                            pending_speaks.push((text, options));
+                                            log::info!("AI TTS：speak 已入队");
+                                            serde_json::json!({
+                                                "status":"queued",
+                                                "reason":"语音已排队，将在文字回复后播放；queued 不代表已播放"
+                                            })
+                                        }
+                                    }
+                                    Err(_) => {
+                                        log::warn!("AI TTS：speak 参数拒绝（Schema 或模型不支持）");
                                         serde_json::json!({
-                                            "status":"queued",
-                                            "reason":"语音已排队，将在文字回复后播放；queued 不代表已播放"
+                                            "status":"rejected",
+                                            "reason":"speak 参数不符合工具 Schema 或当前模型不支持"
                                         })
                                     }
-                                    Err(_) => serde_json::json!({
-                                        "status":"rejected",
-                                        "reason":"speak 参数不符合工具 Schema 或当前模型不支持"
-                                    }),
                                 }
                             } else if call.name != ai_chat::COMMAND_TOOL {
                                 serde_json::json!({"status":"rejected","reason":"未知工具"})
@@ -665,7 +687,13 @@ impl ApplicationRuntime {
                         return ApplicationRuntime::reply(self, &text);
                     }
                 };
-                let rendered = &answer.rendered;
+                // 末端防泄露：只删除完整 remark 字符串，display_name/real_nickname 不动。
+                let known_remarks = self.lifecycle.live_configs.identity.remark_texts();
+                let filtered_rendered = crate::features::identity::redact_remark_strings(
+                    &answer.rendered,
+                    &known_remarks,
+                );
+                let rendered = &filtered_rendered;
                 let now_ms = command_now_ms();
                 // 事实抽取与记忆压缩**完全异步**：各自在后台线程里完成
                 // 「读库 → 调模型 → 写库」，正式任务发完回复立刻结束，不再等
@@ -693,6 +721,13 @@ impl ApplicationRuntime {
                     self.reply_batch(&refs, 0)?;
                     // 文字回复已发送后再入队语音，保证顺序。
                     for (text, options) in pending_speaks.drain(..) {
+                        let text = crate::features::identity::redact_remark_strings(
+                            &text,
+                            &known_remarks,
+                        );
+                        if text.is_empty() {
+                            continue;
+                        }
                         if let Err(error) =
                             self.business.tts.enqueue_with_options(&tts_config, &text, options)
                         {

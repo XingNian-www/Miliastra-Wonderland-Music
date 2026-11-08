@@ -1057,6 +1057,10 @@ fn synthesize_and_speak(
         thread::sleep(Duration::from_millis(20));
     }
     duck.restore();
+    log::info!(
+        "AI TTS：语音播放完成（时长 {:.1}s）",
+        audio_duration.as_secs_f64()
+    );
     Ok(())
 }
 

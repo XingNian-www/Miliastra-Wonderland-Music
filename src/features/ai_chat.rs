@@ -284,8 +284,7 @@ impl Default for AiChatVisionConfig {
 pub(crate) fn auto_image_enabled(config: &AiChatConfig, supports_image: bool) -> bool {
     config.vision.enabled
         && supports_image
-        && (matches!(config.vision.mode, VisionMode::Auto | VisionMode::Both)
-            || config.vision.direct_to_main)
+        && matches!(config.vision.mode, VisionMode::Auto | VisionMode::Both)
 }
 
 /// 是否暴露 `look` 工具（enabled=false 时关闭）。
@@ -4220,15 +4219,15 @@ mod tests {
         assert!(!auto_image_enabled(&config, true));
         assert!(!look_tool_available(&config));
 
-        // direct_to_main 独立于 mode：tool 也可直接附图，look 仍暴露。
+        // direct_to_main 只影响 look 时的直接附图，不再自动截图。
         let mut direct = AiChatConfig::default();
         direct.vision.direct_to_main = true;
         direct.vision.mode = VisionMode::Tool;
-        assert!(auto_image_enabled(&direct, true));
-        assert!(look_tool_available(&direct));
+        assert!(!auto_image_enabled(&direct, true), "tool+direct 普通聊天不截图");
+        assert!(look_tool_available(&direct), "look 仍暴露");
         assert!(!auto_image_enabled(&direct, false), "主模型不支持图片时不附图");
         direct.vision.mode = VisionMode::Auto;
-        assert!(auto_image_enabled(&direct, true));
+        assert!(auto_image_enabled(&direct, true), "auto 模式仍按原逻辑自动附图");
         direct.vision.enabled = false;
         assert!(!auto_image_enabled(&direct, true));
         assert!(!look_tool_available(&direct));

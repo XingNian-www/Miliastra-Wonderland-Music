@@ -590,13 +590,47 @@ impl ApplicationRuntime {
                                         } else {
                                             looked += 1;
                                             looked_instructions.insert(key);
-                                            self.run_ai_chat_look(
-                                                &config,
-                                                question,
-                                                instruction.as_deref(),
-                                                deadline,
-                                                vision_image.as_ref(),
-                                            )
+                                            let use_direct = config.vision.direct_to_main
+                                                && main_supports_vision;
+                                            let direct_image = if use_direct {
+                                                match vision_image.as_ref() {
+                                                    Some(image) => Some(image.clone()),
+                                                    None => {
+                                                        let capture = self
+                                                            .capture_ai_chat_vision_image(
+                                                                &config,
+                                                                Some(deadline),
+                                                            );
+                                                        capture.image.map(|image| {
+                                                            vision_image = Some(image.clone());
+                                                            image
+                                                        })
+                                                    }
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                            match direct_image {
+                                                Some(image) => {
+                                                    session.attach_image(image);
+                                                    main_image_logged = true;
+                                                    log::info!(
+                                                        "AI 识图：look 原图已直接附给主模型"
+                                                    );
+                                                    serde_json::json!({
+                                                        "status":"looked",
+                                                        "kind":"main_image_attached",
+                                                        "note":"原图已直接附给主模型，请结合原图回答"
+                                                    })
+                                                }
+                                                None => self.run_ai_chat_look(
+                                                    &config,
+                                                    question,
+                                                    instruction.as_deref(),
+                                                    deadline,
+                                                    vision_image.as_ref(),
+                                                ),
+                                            }
                                         }
                                     }
                                     Err(_) => serde_json::json!({

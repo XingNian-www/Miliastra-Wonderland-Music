@@ -1598,6 +1598,22 @@ impl ToolSession {
         messages
     }
 
+    /// 把图片挂到当前对话最后一个 user 消息（look 直给主模型时使用）。
+    ///
+    /// 工具调用会把 assistant/function_call_output 追加到历史末尾，因此不能
+    /// 用 `last_mut()`；这里取最后一个 `role=user` 作为当前 user 消息锚点。
+    pub(crate) fn attach_image(&mut self, image: ImageAttachment) {
+        let Some(index) = self
+            .history
+            .iter()
+            .rposition(|item| item["role"].as_str() == Some("user"))
+        else {
+            return;
+        };
+        self.image = Some(image);
+        self.image_anchor = Some(index);
+    }
+
     /// 去掉当前消息的图片（图片被模型拒绝时保留已 append 的工具结果）。
     pub(crate) fn drop_image(&mut self) {
         self.image = None;
@@ -2796,6 +2812,31 @@ mod tests {
                 "去图不能丢工具结果"
             );
         }
+    }
+
+    #[test]
+    fn attach_image_targets_current_user_message_and_can_be_dropped() {
+        let config = config("openai");
+        let mut session = ToolSession::with_history_options(
+            &config,
+            &AiCallOptions::new(""),
+            "Persona",
+            Vec::new(),
+            "Current question",
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!session_body(&session, false).to_string().contains("image_url"));
+        session.attach_image(image_attachment());
+        let attached = session_body(&session, false);
+        assert!(attached.to_string().contains("image_url"));
+        assert_eq!(
+            session.image_anchor.and_then(|index| session.history.get(index)),
+            session.history.last(),
+            "图片锚点应指向当前 user 消息"
+        );
+        session.drop_image();
+        assert!(!session_body(&session, false).to_string().contains("image_url"));
     }
 
     #[test]

@@ -2895,7 +2895,7 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "vision.direct_to_main",
             "直接给主模型看图",
             FieldKind::Bool,
-            "开启后当前轮截图直接附给主聊天模型，需主模型支持图片；tool 模式下会与 look 并存；仅影响主模型输入，不改变 look 子请求",
+            "仅当 AI 调用 look 时把当前截图直接给主聊天模型，不每轮自动截图；需主模型支持图片；auto/both 仍按原模式自动附图；截图失败或不支持图片时回退 look 视觉子模型",
         ),
         ConfigFieldSchema::db_live(
             "vision.capture_scope",

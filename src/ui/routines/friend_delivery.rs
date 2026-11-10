@@ -4,7 +4,7 @@ use miliastra_kernel::clock::{Clock, SystemClock};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use enigo::Key;
 use image::{DynamicImage, GenericImageView};
@@ -27,8 +27,8 @@ use crate::ui::locator::secondary_hall_search_rect;
 use crate::ui::template::best_template_hit;
 
 use super::state_observation::{
-    UiStateObservationConfig, capture_normalized_ui_state, wait_for_stable_ui_kind,
-    wait_for_stable_ui_kind_or_unknown,
+    UiStateObservationConfig, UiStateSnapshot, capture_normalized_ui_state, observe_ui_state_once,
+    wait_for_stable_ui_kind, wait_for_stable_ui_kind_or_unknown,
 };
 
 const FRIEND_ROW_Y_TOLERANCE: i32 = 6;
@@ -37,6 +37,21 @@ const FRIEND_AVATAR_TEXT_OFFSET_X: i32 = 40;
 const FRIEND_DRAG_MAX_EDGE_INSET: i32 = 50;
 const PRIMARY_STABILITY_POLL_MS: u64 = 100;
 const PRIMARY_STABILITY_TIMEOUT_MS: u64 = 1_000;
+/// 状态驱动恢复：单次恢复最多按 Esc 的次数（超过即失败，不再继续试探）。
+const RECOVERY_MAX_ESC: u32 = 3;
+/// 无进展熔断：动作后连续两次观察到同一 (kind,label)，判定为没有进展。
+const RECOVERY_NO_PROGRESS_LIMIT: u32 = 2;
+/// 恢复循环的最大采样步数（防止异常状态机空转）。
+const RECOVERY_MAX_STEPS: u32 = 24;
+/// 诊断历史保留条数（失败原因里附带，便于现场回放）。
+const RECOVERY_HISTORY_LIMIT: usize = 12;
+/// 连续 Unknown 至少采样这么多次、且持续这么久，才允许判定"无证据"。
+const RECOVERY_UNKNOWN_MIN_SAMPLES: u32 = 3;
+const RECOVERY_UNKNOWN_WINDOW_MS: u64 = 600;
+/// Panel 必须连续确认这么多次（仍是 Panel）才允许按 Esc。
+const RECOVERY_PANEL_CONFIRM_SAMPLES: u32 = 2;
+/// Primary↔MainMenu 振荡：连续来回这么多次即熔断。
+const RECOVERY_OSCILLATION_LIMIT: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UiResidencyTarget {
@@ -1381,42 +1396,7 @@ fn ensure_secondary_chat(
         .device()
         .ensure_ready(config.after_activate_ms)
         .map_err(|error| before_input_failure("prepare_friend_delivery", error))?;
-    let state = wait_for_stable_ui_kind_or_unknown(
-        context,
-        config.state_observation(),
-        None,
-        config.timeout_ms,
-        "observe_friend_delivery_start",
-        InputCertainty::BeforeInput,
-    )?;
-    if state == UiStateKind::Secondary {
-        return Ok(());
-    }
-    if matches!(state, UiStateKind::GameGate | UiStateKind::Overworld) {
-        return Err(UiRoutineFailure::new(
-            InputCertainty::BeforeInput,
-            "open_secondary_chat",
-            "chat residency is unavailable at the game gate or in the overworld",
-        ));
-    }
-    context
-        .device()
-        .press_key(Key::Return)
-        .map_err(|error| after_input_failure("open_secondary_chat", error))?;
-    wait_ms(
-        context,
-        config.open_chat_ms,
-        "open_secondary_chat",
-        InputCertainty::AfterInputUnknown,
-    )?;
-    wait_for_stable_ui_kind(
-        context,
-        config.state_observation(),
-        Some(UiStateKind::Secondary),
-        config.timeout_ms,
-        "confirm_secondary_chat",
-        InputCertainty::AfterInputUnknown,
-    )?;
+    settle_ui(context, config, UiResidencyTarget::SecondaryCurrentHall)?;
     Ok(())
 }
 
@@ -1775,6 +1755,416 @@ fn highlighted_rows(image: &DynamicImage, region: Rect) -> Vec<Rect> {
         .collect()
 }
 
+/// 状态驱动恢复允许的下一步动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryAction {
+    /// 已到达目标稳定界面。
+    Done,
+    /// 只等待/重新采样，不发送任何输入。
+    Wait,
+    /// 按 Esc：仅用于已确认的二级、千星主菜单或稳定 Panel。
+    Escape,
+    /// 按 Return 打开二级聊天（目标为二级时）。
+    OpenChat,
+    /// 拒绝恢复：不给游戏发任何输入。
+    Reject(&'static str),
+}
+
+/// 恢复结果：成功到达目标时返回，供调用方与测试断言。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RecoveryReport {
+    pub(super) target: UiResidencyTarget,
+    pub(super) settled_as: UiStateKind,
+    pub(super) esc_presses: u32,
+    pub(super) open_chat_presses: u32,
+    pub(super) resamples: u32,
+    pub(super) history: Vec<String>,
+}
+
+/// 恢复过程的累计状态（纯数据；决策函数可在无 UI 设备的单测里驱动）。
+#[derive(Default)]
+struct RecoveryProgress {
+    esc_presses: u32,
+    open_chat_presses: u32,
+    resamples: u32,
+    fresh_identity: Option<String>,
+    fresh_samples: u32,
+    unknown_samples: u32,
+    unknown_since: Option<Instant>,
+    loading_samples: u32,
+    loading_since: Option<Instant>,
+    panel_samples: u32,
+    pending_action_identity: Option<String>,
+    no_progress_streak: u32,
+    kind_tail: Vec<UiStateKind>,
+    history: Vec<String>,
+}
+
+impl RecoveryProgress {
+    fn record(&mut self, snapshot: &UiStateSnapshot, now: Instant) {
+        self.resamples = self.resamples.saturating_add(1);
+        self.history.push(snapshot.describe());
+        if self.history.len() > RECOVERY_HISTORY_LIMIT {
+            self.history.remove(0);
+        }
+
+        let identity = snapshot.identity();
+        let same_fresh = self.fresh_identity.as_deref() == Some(identity.as_str());
+        if same_fresh {
+            self.fresh_samples = self.fresh_samples.saturating_add(1);
+        } else {
+            self.fresh_identity = Some(identity.clone());
+            self.fresh_samples = 1;
+        }
+
+        // 动作后验证：同一 (kind,label) 反复出现即"无进展"。
+        if let Some(pending) = self.pending_action_identity.as_deref() {
+            if pending == identity.as_str() {
+                self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+            } else {
+                self.no_progress_streak = 0;
+            }
+        }
+
+        match snapshot.kind {
+            UiStateKind::Unknown => {
+                self.unknown_samples = self.unknown_samples.saturating_add(1);
+                self.unknown_since.get_or_insert(now);
+            }
+            _ => {
+                self.unknown_samples = 0;
+                self.unknown_since = None;
+            }
+        }
+        match snapshot.kind {
+            UiStateKind::Loading => {
+                self.loading_samples = self.loading_samples.saturating_add(1);
+                self.loading_since.get_or_insert(now);
+            }
+            _ => {
+                self.loading_samples = 0;
+                self.loading_since = None;
+            }
+        }
+        if snapshot.kind == UiStateKind::Panel {
+            self.panel_samples = self.panel_samples.saturating_add(1);
+        } else {
+            self.panel_samples = 0;
+        }
+
+        if self.kind_tail.last().copied() != Some(snapshot.kind) {
+            self.kind_tail.push(snapshot.kind);
+            if self.kind_tail.len() > 6 {
+                self.kind_tail.remove(0);
+            }
+        }
+    }
+
+    /// 运行时与本次恢复的"新鲜稳定"双重确认：既要求跟踪器判稳定，
+    /// 也要求本次恢复自己连续采到 required_count 帧同一状态。
+    fn settled(&self, snapshot: &UiStateSnapshot) -> bool {
+        snapshot.runtime_stable && self.fresh_samples >= snapshot.required_count.max(1)
+    }
+
+    fn primary_main_menu_oscillations(&self) -> u32 {
+        let mut count = 0;
+        for pair in self.kind_tail.windows(2) {
+            if matches!(
+                (pair[0], pair[1]),
+                (UiStateKind::Primary, UiStateKind::MainMenu)
+                    | (UiStateKind::MainMenu, UiStateKind::Primary)
+            ) {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
+/// 纯决策：根据一次分类快照与累计进度，决定下一步动作。
+///
+/// 顺序与约束（本事故的核心）：
+/// - Primary 稳定即成功；Primary 未稳定只等，不按任何键；
+/// - Secondary 仅在目标为 Primary 时 Esc，且必须已确认稳定；
+/// - MainMenu 按 `final_rule` 区分：千星主菜单可 Esc，派蒙菜单**拒绝**；
+/// - Panel 需连续确认仍是 Panel 才 Esc；
+/// - Loading 只等待；
+/// - Unknown 先等待/重采样，连续无证据才失败，**绝不立刻盲按 Esc**；
+/// - GameGate / Overworld 直接拒绝。
+fn decide_recovery_step(
+    snapshot: &UiStateSnapshot,
+    target: UiResidencyTarget,
+    progress: &RecoveryProgress,
+) -> RecoveryAction {
+    if progress.no_progress_streak >= RECOVERY_NO_PROGRESS_LIMIT {
+        return RecoveryAction::Reject("恢复动作没有产生任何状态变化（无进展熔断）");
+    }
+    if progress.primary_main_menu_oscillations() >= RECOVERY_OSCILLATION_LIMIT {
+        return RecoveryAction::Reject("一级界面与主菜单反复来回（振荡熔断）");
+    }
+
+    match snapshot.kind {
+        UiStateKind::Primary => {
+            if !progress.settled(snapshot) {
+                return RecoveryAction::Wait;
+            }
+            match target {
+                UiResidencyTarget::Primary => RecoveryAction::Done,
+                UiResidencyTarget::SecondaryCurrentHall => RecoveryAction::OpenChat,
+            }
+        }
+        UiStateKind::Secondary => {
+            if !progress.settled(snapshot) {
+                return RecoveryAction::Wait;
+            }
+            match target {
+                UiResidencyTarget::SecondaryCurrentHall => RecoveryAction::Done,
+                UiResidencyTarget::Primary => {
+                    if progress.esc_presses < RECOVERY_MAX_ESC {
+                        RecoveryAction::Escape
+                    } else {
+                        RecoveryAction::Reject("按 Esc 次数已达上限，二级聊天仍未退出")
+                    }
+                }
+            }
+        }
+        UiStateKind::MainMenu => {
+            if snapshot.is_paimon_menu() {
+                // 派蒙菜单是提瓦特 ESC 系统菜单，不是千星大厅主菜单：
+                // 在这里按 Esc / Return 会把玩家推得更远，明确拒绝。
+                return RecoveryAction::Reject(
+                    "当前是派蒙菜单（ESC 系统菜单），不是千星大厅主菜单，拒绝发送导航输入",
+                );
+            }
+            if !progress.settled(snapshot) {
+                return RecoveryAction::Wait;
+            }
+            if progress.esc_presses < RECOVERY_MAX_ESC {
+                // 千星奇域主菜单：Esc 关闭浮层回到大厅（一级）。
+                RecoveryAction::Escape
+            } else {
+                RecoveryAction::Reject("按 Esc 次数已达上限，主菜单仍未关闭")
+            }
+        }
+        UiStateKind::Panel => {
+            // 面板抖动常见：必须连续确认仍是 Panel，才允许 Esc 关闭。
+            if progress.panel_samples < RECOVERY_PANEL_CONFIRM_SAMPLES
+                || !progress.settled(snapshot)
+            {
+                return RecoveryAction::Wait;
+            }
+            if progress.esc_presses < RECOVERY_MAX_ESC {
+                RecoveryAction::Escape
+            } else {
+                RecoveryAction::Reject("按 Esc 次数已达上限，残留面板仍未关闭")
+            }
+        }
+        UiStateKind::Loading => RecoveryAction::Wait,
+        UiStateKind::Unknown => {
+            let sustained = progress.unknown_samples >= RECOVERY_UNKNOWN_MIN_SAMPLES
+                && progress
+                    .unknown_since
+                    .is_some_and(|since| since.elapsed() >= Duration::from_millis(RECOVERY_UNKNOWN_WINDOW_MS));
+            if sustained {
+                RecoveryAction::Reject("界面持续无法识别且没有任何稳定证据，拒绝盲按 Esc")
+            } else {
+                RecoveryAction::Wait
+            }
+        }
+        UiStateKind::GameGate | UiStateKind::Overworld => {
+            RecoveryAction::Reject("登录入口或大世界不可恢复聊天驻留")
+        }
+    }
+}
+
+/// 恢复失败时的统一诊断：包含当前事实、动作次数与历史。
+fn recovery_failure(
+    stage: &'static str,
+    certainty: InputCertainty,
+    target: UiResidencyTarget,
+    snapshot: &UiStateSnapshot,
+    progress: &RecoveryProgress,
+    reason: &str,
+) -> UiRoutineFailure {
+    UiRoutineFailure::new(
+        certainty,
+        stage,
+        format!(
+            "状态驱动恢复中止（{reason}）：目标={target:?}；当前={}；Esc={} Return={} 采样={}；历史={}",
+            snapshot.describe(),
+            progress.esc_presses,
+            progress.open_chat_presses,
+            progress.resamples,
+            progress.history.join(" <- ")
+        ),
+    )
+}
+
+/// 统一状态驱动恢复入口：把界面安全地驱动到目标驻留界面。
+///
+/// 供 `restore_primary` / `ensure_secondary_chat` / `restore_secondary_hall` 复用。
+/// 原则：**只有已确认的状态才允许输入**；Unknown/Loading 只等待；主菜单按证据区分
+/// 千星（可 Esc）与派蒙（拒绝）；无进展或振荡立即熔断。
+/// 统一状态驱动恢复入口：把界面安全地驱动到目标驻留界面。
+///
+/// 供 `restore_primary` / `ensure_secondary_chat` / `restore_secondary_hall` 复用。
+/// 原则：**只有已确认的状态才允许输入**；Unknown/Loading 只等待；主菜单按证据区分
+/// 千星（可 Esc）与派蒙（拒绝）；无进展或振荡立即熔断。
+///
+/// `ocr` 目前不参与恢复决策（决策只依赖 UI 状态证据），保留参数是为了与
+/// 驻留恢复的统一入口签名一致，后续需要 OCR 佐证时无需再改调用方。
+pub(super) fn settle_to(
+    context: &mut UiRoutineContext<'_>,
+    _ocr: &OcrRuntimeHandle,
+    config: &FriendDeliveryRoutineConfig,
+    target: UiResidencyTarget,
+) -> std::result::Result<RecoveryReport, UiRoutineFailure> {
+    settle_ui(context, config, target)
+}
+
+fn settle_ui(
+    context: &mut UiRoutineContext<'_>,
+    config: &FriendDeliveryRoutineConfig,
+    target: UiResidencyTarget,
+) -> std::result::Result<RecoveryReport, UiRoutineFailure> {
+    let observation_config = config.state_observation();
+    let deadline = Instant::now() + Duration::from_millis(config.timeout_ms.max(1));
+    let mut progress = RecoveryProgress::default();
+    let mut action_taken = false;
+    let mut steps = 0_u32;
+
+    loop {
+        if steps >= RECOVERY_MAX_STEPS {
+            return Err(UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
+                match target {
+                    UiResidencyTarget::Primary => "confirm_primary_residency",
+                    UiResidencyTarget::SecondaryCurrentHall => "confirm_secondary_chat",
+                },
+                format!(
+                    "状态驱动恢复超过最大动作步数（{}）：目标={target:?}；Esc={} Return={}；历史={}",
+                    RECOVERY_MAX_STEPS,
+                    progress.esc_presses,
+                    progress.open_chat_presses,
+                    progress.history.join(" <- ")
+                ),
+            ));
+        }
+        let now = Instant::now();
+        // 输入前失败可安全重试；一旦按过键，结论只能是"动作后状态未知"。
+        let (stage, certainty) = if action_taken {
+            match target {
+                UiResidencyTarget::Primary => (
+                    "confirm_primary_residency",
+                    InputCertainty::AfterInputUnknown,
+                ),
+                UiResidencyTarget::SecondaryCurrentHall => (
+                    "confirm_secondary_chat",
+                    InputCertainty::AfterInputUnknown,
+                ),
+            }
+        } else {
+            match target {
+                UiResidencyTarget::Primary => {
+                    ("observe_primary_residency", InputCertainty::BeforeInput)
+                }
+                UiResidencyTarget::SecondaryCurrentHall => {
+                    ("observe_friend_delivery_start", InputCertainty::BeforeInput)
+                }
+            }
+        };
+
+        let snapshot = observe_ui_state_once(context, observation_config, stage, certainty)?;
+        progress.record(&snapshot, now);
+
+        // 超出本次恢复预算：按当前界面给出可操作的诊断；期间不按任何键。
+        if now >= deadline {
+            let reason = match snapshot.kind {
+                UiStateKind::Loading => "加载界面持续超出恢复预算",
+                UiStateKind::Unknown => "界面持续无法识别且没有任何稳定证据，拒绝盲按 Esc",
+                _ => "恢复未在时间预算内到达目标界面",
+            };
+            return Err(recovery_failure(
+                stage,
+                certainty,
+                target,
+                &snapshot,
+                &progress,
+                reason,
+            ));
+        }
+
+        match decide_recovery_step(&snapshot, target, &progress) {
+            RecoveryAction::Done => {
+                return Ok(RecoveryReport {
+                    target,
+                    settled_as: snapshot.kind,
+                    esc_presses: progress.esc_presses,
+                    open_chat_presses: progress.open_chat_presses,
+                    resamples: progress.resamples,
+                    history: progress.history,
+                });
+            }
+            RecoveryAction::Wait => {}
+            RecoveryAction::Escape => {
+                action_taken = true;
+                steps = steps.saturating_add(1);
+                let pre_action_identity = snapshot.identity();
+                context
+                    .device()
+                    .press_key(Key::Escape)
+                    .map_err(|error| after_input_failure("restore_residency", error))?;
+                progress.esc_presses = progress.esc_presses.saturating_add(1);
+                progress.pending_action_identity = Some(pre_action_identity);
+                wait_ms(
+                    context,
+                    config.poll_ms.max(10),
+                    "restore_residency_wait",
+                    InputCertainty::AfterInputUnknown,
+                )?;
+            }
+            RecoveryAction::OpenChat => {
+                action_taken = true;
+                steps = steps.saturating_add(1);
+                let pre_action_identity = snapshot.identity();
+                context
+                    .device()
+                    .press_key(Key::Return)
+                    .map_err(|error| after_input_failure("open_secondary_chat", error))?;
+                progress.open_chat_presses = progress.open_chat_presses.saturating_add(1);
+                progress.pending_action_identity = Some(pre_action_identity);
+                wait_ms(
+                    context,
+                    config.open_chat_ms,
+                    "open_secondary_chat",
+                    InputCertainty::AfterInputUnknown,
+                )?;
+            }
+            RecoveryAction::Reject(reason) => {
+                return Err(recovery_failure(
+                    stage,
+                    certainty,
+                    target,
+                    &snapshot,
+                    &progress,
+                    reason,
+                ));
+            }
+        }
+
+        wait_ms(
+            context,
+            config.poll_ms.max(10),
+            stage,
+            if action_taken {
+                InputCertainty::AfterInputUnknown
+            } else {
+                InputCertainty::BeforeInput
+            },
+        )?;
+    }
+}
+
 pub(super) fn restore_residency(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
@@ -1782,7 +2172,10 @@ pub(super) fn restore_residency(
     target: UiResidencyTarget,
 ) -> std::result::Result<(), UiRoutineFailure> {
     match target {
-        UiResidencyTarget::Primary => restore_primary(context, config),
+        UiResidencyTarget::Primary => {
+            settle_to(context, ocr, config, target)?;
+            confirm_primary_residency(context, config)
+        }
         UiResidencyTarget::SecondaryCurrentHall => restore_secondary_hall(context, ocr, config),
     }
 }
@@ -1791,35 +2184,10 @@ fn restore_primary(
     context: &mut UiRoutineContext<'_>,
     config: &FriendDeliveryRoutineConfig,
 ) -> std::result::Result<(), UiRoutineFailure> {
-    let state = wait_for_stable_ui_kind_or_unknown(
-        context,
-        config.state_observation(),
-        None,
-        config.timeout_ms,
-        "observe_primary_residency",
-        InputCertainty::ConfirmedFailure,
-    )?;
-    if state == UiStateKind::Primary {
-        return Ok(());
-    }
-    if matches!(state, UiStateKind::GameGate | UiStateKind::Overworld) {
-        return Err(UiRoutineFailure::new(
-            InputCertainty::BeforeInput,
-            "restore_primary_residency",
-            "chat residency is unavailable at the game gate or in the overworld",
-        ));
-    }
-    if state == UiStateKind::Unknown {
-        // 到这里说明已经等待过稳定窗口、仍未得到可识别的一级界面。
-        // 需要写清「此前尝试过什么」，否则维护者无法判断该 Esc 是第几次兜底。
-        log::warn!(
-            "一级界面驻留未就绪（步骤：恢复一级界面驻留）：已等待界面稳定超时，状态仍为无法识别，说明可能有残留面板遮挡；本次按 Esc 尝试关闭残留面板后重新确认一级界面，若仍失败则后续投递无法继续"
-        );
-    }
-    context
-        .device()
-        .press_key(Key::Escape)
-        .map_err(|error| after_input_failure("restore_primary_residency", error))?;
+    // 状态驱动：只对已确认的二级/千星主菜单/稳定面板按 Esc；
+    // Unknown/Loading 只等待，主菜单按 final_rule 区分千星与派蒙。
+    settle_ui(context, config, UiResidencyTarget::Primary)?;
+    // 保留原有的"视觉驻留稳定"二次确认（好友按钮区域指纹不抖动）。
     confirm_primary_residency(context, config)
 }
 
@@ -2456,6 +2824,35 @@ mod tests {
                 UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
                 config.screen.clone(),
             ),
+            config.resolve_stability_count(0),
+        )
+        .unwrap()
+    }
+
+    /// 与生产装配一致地注入面板判据区域：只有注入后残留面板才会判成 `Panel`，
+    /// 注入前后的差异本身也是"面板判据需装配层开启"的回归保护。
+    fn start_test_ui_runtime_with_panel_regions(
+        device: impl UiDevice,
+        config: &AppConfig,
+        queue_capacity: usize,
+    ) -> UiRuntime {
+        let panels = crate::ui::state::PanelRegions {
+            friend_panel: config.moderation.friend_panel_region.into(),
+            friend_search_panel: config.moderation.search_panel_region.into(),
+            friend_block_chat: config.moderation.block_chat_region.into(),
+            friend_confirm: config.moderation.confirm_region.into(),
+            invite_view_star: config.invite.view_star_region.into(),
+            invite_goto_hall: config.invite.goto_hall_region.into(),
+            invite_enter_hall: config.invite.enter_hall_region.into(),
+        };
+        UiRuntime::start_with_state_classifier(
+            device,
+            queue_capacity,
+            TemplateUiStateClassifier::new(
+                UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+                config.screen.clone(),
+            )
+            .with_panel_regions(panels),
             config.resolve_stability_count(0),
         )
         .unwrap()
@@ -3262,115 +3659,551 @@ mod tests {
         }
     }
 
-    struct UnknownResidencyDevice {
-        frame: DynamicImage,
-        keys: Arc<Mutex<Vec<Key>>>,
+    /// 按"状态机"出帧的设备：同一状态重复出帧，直到收到指定按键；
+    /// `auto_advance` 模拟"还没等到输入就自己消失"的瞬态帧（事故回放的 Unknown 瞬失）。
+    #[derive(Default)]
+    struct ScriptedStateDeviceState {
+        state: usize,
+        keys: Vec<Key>,
+        clicks: Vec<(i32, i32)>,
+        captures_in_state: Vec<usize>,
+        captures_total: usize,
+        first_escape_after: Option<usize>,
     }
 
-    impl UiDevice for UnknownResidencyDevice {
+    struct ScriptedStateDevice {
+        frames: Vec<DynamicImage>,
+        transitions: Vec<(usize, Key, usize)>,
+        auto_advance: std::collections::HashMap<usize, usize>,
+        shared: Arc<Mutex<ScriptedStateDeviceState>>,
+    }
+
+    impl ScriptedStateDevice {
+        fn new(frames: Vec<DynamicImage>) -> (Self, Arc<Mutex<ScriptedStateDeviceState>>) {
+            let shared = Arc::new(Mutex::new(ScriptedStateDeviceState {
+                captures_in_state: vec![0; frames.len()],
+                ..ScriptedStateDeviceState::default()
+            }));
+            (
+                Self {
+                    frames,
+                    transitions: Vec::new(),
+                    auto_advance: std::collections::HashMap::new(),
+                    shared: Arc::clone(&shared),
+                },
+                shared,
+            )
+        }
+
+        fn auto_advance(mut self, from: usize, to: usize) -> Self {
+            self.auto_advance.insert(from, to);
+            self
+        }
+
+        fn on_key(mut self, from: usize, key: Key, to: usize) -> Self {
+            self.transitions.push((from, key, to));
+            self
+        }
+    }
+
+    impl UiDevice for ScriptedStateDevice {
         fn capture(&mut self) -> Result<DynamicImage> {
-            Ok(self.frame.clone())
+            let mut state = self.shared.lock().unwrap();
+            let current = state.state;
+            state.captures_total += 1;
+            if let Some(count) = state.captures_in_state.get_mut(current) {
+                *count += 1;
+            }
+            let frame = self.frames[current].clone();
+            if let Some(next) = self.auto_advance.get(&current) {
+                state.state = *next;
+            }
+            Ok(frame)
+        }
+
+        fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
         }
 
         fn press_key(&mut self, key: Key) -> Result<()> {
-            self.keys.lock().unwrap().push(key);
+            let mut state = self.shared.lock().unwrap();
+            state.keys.push(key);
+            if key == Key::Escape && state.first_escape_after.is_none() {
+                state.first_escape_after = Some(state.captures_total);
+            }
+            if let Some((_, _, to)) = self
+                .transitions
+                .iter()
+                .find(|(from, bound, _)| *from == state.state && *bound == key)
+            {
+                state.state = *to;
+            }
             Ok(())
         }
     }
 
-    #[test]
-    fn persistent_unknown_residency_escapes_once_then_reports_primary_failure() {
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
-        let keys = Arc::new(Mutex::new(Vec::new()));
-        let ui_runtime = start_test_ui_runtime(
-            UnknownResidencyDevice {
-                frame: unknown_frame(&config),
-                keys: keys.clone(),
-            },
-            &config,
-            2,
-        );
-        let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
-        // Classification of real 1920x1080 frames must fit before testing the post-Esc timeout.
-        // Use the configured workflow budget so parallel test load cannot skip the input stage.
-        routine_config.poll_ms = 1;
-
-        let failure = ui_runtime
-            .handle()
-            .submit(RestorePrimaryRoutine {
-                config: routine_config,
-            })
-            .unwrap()
-            .wait()
-            .unwrap()
-            .expect_err("persistent unknown cannot confirm primary after escape");
-
-        assert_eq!(failure.stage(), "confirm_primary_residency");
-        assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
-        assert_eq!(*keys.lock().unwrap(), [Key::Escape]);
-        ui_runtime.shutdown().unwrap();
+    struct EnsureSecondaryChatRoutine {
+        config: FriendDeliveryRoutineConfig,
     }
 
-    struct StableUnknownThenPrimaryDevice {
-        unknown: DynamicImage,
-        primary: DynamicImage,
-        keys: Arc<Mutex<Vec<Key>>>,
-        escaped: bool,
-        captures_after_escape: usize,
-    }
+    impl sealed::UiRoutineSealed for EnsureSecondaryChatRoutine {}
 
-    impl UiDevice for StableUnknownThenPrimaryDevice {
-        fn capture(&mut self) -> Result<DynamicImage> {
-            if !self.escaped {
-                return Ok(self.unknown.clone());
-            }
-            self.captures_after_escape += 1;
-            if self.captures_after_escape <= 2 {
-                return Ok(self.unknown.clone());
-            }
-            Ok(self.primary.clone())
-        }
+    impl UiRoutine for EnsureSecondaryChatRoutine {
+        type Output = std::result::Result<(), UiRoutineFailure>;
 
-        fn press_key(&mut self, key: Key) -> Result<()> {
-            self.keys.lock().unwrap().push(key);
-            if key == Key::Escape {
-                self.escaped = true;
-            }
-            Ok(())
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            ensure_secondary_chat(context, &self.config)
         }
     }
 
-    #[test]
-    fn stable_unknown_residency_escapes_then_confirms_primary() {
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
-        let keys = Arc::new(Mutex::new(Vec::new()));
-        let ui_runtime = start_test_ui_runtime(
-            StableUnknownThenPrimaryDevice {
-                unknown: unknown_frame(&config),
-                primary: primary_frame(&config),
-                keys: keys.clone(),
-                escaped: false,
-                captures_after_escape: 0,
-            },
-            &config,
-            2,
-        );
-        let mut routine_config = FriendDeliveryRoutineConfig::from_app(&config);
-        routine_config.timeout_ms = 5_000;
+    fn main_menu_frame(config: &AppConfig) -> DynamicImage {
+        load_real_frame("tests/fixtures/ui/main-menu-wonderland-1920x1080.png", config)
+    }
+
+    fn paimon_menu_frame(config: &AppConfig) -> DynamicImage {
+        load_real_frame("tests/fixtures/ui/menu-paimon-1920x1080.jpg", config)
+    }
+
+    fn loading_frame(config: &AppConfig) -> DynamicImage {
+        load_real_frame("tests/fixtures/ui/loading-dark-1920x1080.jpg", config)
+    }
+
+    fn overworld_frame(config: &AppConfig) -> DynamicImage {
+        load_real_frame("tests/fixtures/ui/overworld-teyvat-1920x1080.jpg", config)
+    }
+
+    fn panel_frame(config: &AppConfig) -> DynamicImage {
+        load_real_frame("tests/fixtures/ui/panel-hall-card-1920x1080.jpg", config)
+    }
+
+    fn recovery_config(config: &AppConfig, timeout_ms: u64) -> FriendDeliveryRoutineConfig {
+        let mut routine_config = FriendDeliveryRoutineConfig::from_app(config);
+        routine_config.timeout_ms = timeout_ms;
         routine_config.poll_ms = 1;
+        routine_config
+    }
+
+    /// 事故回放：Unknown 只闪一帧就恢复成一级界面。旧实现会立刻按 Esc；
+    /// 新实现必须先等待/重采样，确认 Primary 后零按键成功。
+    #[test]
+    fn unknown_blip_is_waited_out_without_any_input() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) = ScriptedStateDevice::new(vec![
+            unknown_frame(&config),
+            primary_frame(&config),
+        ]);
+        let device = device.auto_advance(0, 1);
+        let ui_runtime = start_test_ui_runtime(device, &config, 2);
 
         ui_runtime
             .handle()
             .submit(RestorePrimaryRoutine {
-                config: routine_config,
+                config: recovery_config(&config, 5_000),
             })
             .unwrap()
             .wait()
             .unwrap()
-            .expect("stable unknown should authorize one escape");
+            .expect("Unknown 瞬失必须等待并恢复一级界面");
 
-        assert_eq!(*keys.lock().unwrap(), [Key::Escape]);
+        let state = state.lock().unwrap();
+        assert!(state.keys.is_empty(), "Unknown 瞬失不允许任何按键：{:?}", state.keys);
         ui_runtime.shutdown().unwrap();
+    }
+
+    /// 持续 Unknown：只重新采样，绝不盲按 Esc；失败诊断要带 rule/world/last_stable。
+    #[test]
+    fn persistent_unknown_fails_with_diagnostics_and_no_keys() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) =
+            ScriptedStateDevice::new(vec![unknown_frame(&config)]);
+        let ui_runtime = start_test_ui_runtime(device, &config, 2);
+
+        let failure = ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: recovery_config(&config, 2_000),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect_err("持续 Unknown 必须失败");
+
+        assert!(state.lock().unwrap().keys.is_empty(), "不允许盲按 Esc");
+        let reason = failure.reason().to_string();
+        assert!(
+            reason.contains("无法识别") || reason.contains("加载界面"),
+            "失败原因必须说明持续不可识别：{reason}"
+        );
+        assert!(reason.contains("rule="), "诊断必须带 final_rule：{reason}");
+        assert!(reason.contains("last_stable="), "诊断必须带 last_stable：{reason}");
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// 千星主菜单：Esc 关闭浮层回到一级界面。
+    #[test]
+    fn wonderland_main_menu_is_escaped_back_to_primary() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) = ScriptedStateDevice::new(vec![
+            main_menu_frame(&config),
+            primary_frame(&config),
+        ]);
+        let device = device.on_key(0, Key::Escape, 1);
+        let ui_runtime = start_test_ui_runtime(device, &config, 2);
+
+        ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: recovery_config(&config, 5_000),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("千星主菜单必须能通过 Esc 回到一级界面");
+
+        assert_eq!(*state.lock().unwrap().keys, [Key::Escape].to_vec());
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// 派蒙菜单不是大厅菜单：明确拒绝，零输入。
+    #[test]
+    fn paimon_menu_is_rejected_without_input() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) =
+            ScriptedStateDevice::new(vec![paimon_menu_frame(&config)]);
+        let ui_runtime = start_test_ui_runtime(device, &config, 2);
+
+        let failure = ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: recovery_config(&config, 2_000),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect_err("派蒙菜单必须被拒绝");
+
+        assert!(state.lock().unwrap().keys.is_empty(), "派蒙菜单不允许任何输入");
+        assert!(
+            failure.reason().contains("派蒙"),
+            "必须说明是派蒙菜单：{}",
+            failure.reason()
+        );
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// Panel 需要连续确认仍是 Panel 才允许 Esc（防止一帧抖动就按键）。
+    #[test]
+    fn panel_is_confirmed_twice_before_escape() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) =
+            ScriptedStateDevice::new(vec![panel_frame(&config), primary_frame(&config)]);
+        let device = device.on_key(0, Key::Escape, 1);
+        let ui_runtime = start_test_ui_runtime_with_panel_regions(device, &config, 2);
+
+        ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: recovery_config(&config, 5_000),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("稳定 Panel 必须能通过 Esc 关闭");
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.keys, [Key::Escape].to_vec());
+        assert!(
+            state.captures_in_state[0] >= 2,
+            "Panel 必须先被重采样确认，实际只采了 {} 帧",
+            state.captures_in_state[0]
+        );
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// Loading：只等待，不发任何按键；超预算后如实失败。
+    #[test]
+    fn loading_waits_without_input_and_times_out() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) = ScriptedStateDevice::new(vec![loading_frame(&config)]);
+        let ui_runtime = start_test_ui_runtime(device, &config, 2);
+
+        let failure = ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: recovery_config(&config, 1_200),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect_err("持续 Loading 必须失败");
+
+        assert!(state.lock().unwrap().keys.is_empty(), "Loading 不允许按键");
+        assert!(
+            failure.reason().contains("加载"),
+            "失败原因必须说明加载界面：{}",
+            failure.reason()
+        );
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// 大世界：拒绝恢复，零输入。
+    #[test]
+    fn overworld_is_rejected_without_input() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) =
+            ScriptedStateDevice::new(vec![overworld_frame(&config)]);
+        let ui_runtime = start_test_ui_runtime(device, &config, 2);
+
+        ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: recovery_config(&config, 2_000),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect_err("大世界必须拒绝恢复");
+
+        assert!(state.lock().unwrap().keys.is_empty(), "大世界不允许输入");
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// 事故完整回放：二级 → Esc → Unknown（不得再 Esc）→ 千星主菜单 → Esc → 一级。
+    #[test]
+    fn unknown_after_escape_then_main_menu_then_escape_reaches_primary() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) = ScriptedStateDevice::new(vec![
+            secondary_frame(&config),
+            unknown_frame(&config),
+            main_menu_frame(&config),
+            primary_frame(&config),
+        ]);
+        let device = device
+            .on_key(0, Key::Escape, 1)
+            .auto_advance(1, 2)
+            .on_key(2, Key::Escape, 3);
+        let ui_runtime = start_test_ui_runtime(device, &config, 2);
+
+        ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: recovery_config(&config, 8_000),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("Unknown 过渡后必须靠主菜单 Esc 回到一级界面");
+
+        assert_eq!(
+            *state.lock().unwrap().keys,
+            [Key::Escape, Key::Escape].to_vec(),
+            "只允许两次 Esc：一次退出二级、一次关闭千星主菜单"
+        );
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// 千星主菜单按 Esc 没反应（无进展）时，必须在 2 次后熔断，不能无限按。
+    #[test]
+    fn main_menu_without_progress_trips_the_breaker() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) =
+            ScriptedStateDevice::new(vec![main_menu_frame(&config)]);
+        let ui_runtime = start_test_ui_runtime(device, &config, 2);
+
+        let failure = ui_runtime
+            .handle()
+            .submit(RestorePrimaryRoutine {
+                config: recovery_config(&config, 8_000),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect_err("无进展必须熔断");
+
+        let keys = state.lock().unwrap().keys.clone();
+        assert!(
+            keys.len() <= RECOVERY_NO_PROGRESS_LIMIT as usize,
+            "无进展熔断前最多按 {} 次 Esc，实际 {} 次",
+            RECOVERY_NO_PROGRESS_LIMIT,
+            keys.len()
+        );
+        let reason = failure.reason();
+        assert!(
+            reason.contains("无进展") || reason.contains("振荡"),
+            "失败原因必须写明熔断：{reason}"
+        );
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// 二次恢复：目标二级聊天时遇千星主菜单，必须先 Esc 回一级，再 Return 打开聊天。
+    #[test]
+    fn secondary_target_escapes_main_menu_first_then_returns() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) = ScriptedStateDevice::new(vec![
+            main_menu_frame(&config),
+            primary_frame(&config),
+            secondary_frame(&config),
+        ]);
+        let device = device
+            .on_key(0, Key::Escape, 1)
+            .on_key(1, Key::Return, 2);
+        let ui_runtime = start_test_ui_runtime(device, &config, 2);
+
+        ui_runtime
+            .handle()
+            .submit(EnsureSecondaryChatRoutine {
+                config: recovery_config(&config, 8_000),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("必须先 Esc 回一级再 Return 回二级聊天");
+
+        assert_eq!(
+            *state.lock().unwrap().keys,
+            [Key::Escape, Key::Return].to_vec(),
+            "动作顺序必须是 Esc → Return"
+        );
+        ui_runtime.shutdown().unwrap();
+    }
+
+    // ---- 决策函数的纯单测：不依赖真实帧，覆盖无法用夹具触发的情况 ----
+
+    fn snap(kind: UiStateKind, label: &str, rule: &str) -> UiStateSnapshot {
+        UiStateSnapshot {
+            kind,
+            label: label.to_string(),
+            final_rule: rule.to_string(),
+            world_guess: "unknown".to_string(),
+            last_stable_kind: Some(kind),
+            runtime_stable: true,
+            candidate_count: 2,
+            required_count: 2,
+        }
+    }
+
+    fn settled_progress(snapshot: &UiStateSnapshot) -> RecoveryProgress {
+        let mut progress = RecoveryProgress::default();
+        for _ in 0..snapshot.required_count.max(1) {
+            progress.record(snapshot, Instant::now());
+        }
+        progress
+    }
+
+    #[test]
+    fn recovery_decision_rejects_game_gate_and_overworld_without_input() {
+        for kind in [UiStateKind::GameGate, UiStateKind::Overworld] {
+            let snapshot = snap(kind, "gate", "game_gate_template");
+            let mut progress = settled_progress(&snapshot);
+            let action = decide_recovery_step(&snapshot, UiResidencyTarget::Primary, &mut progress);
+            assert!(
+                matches!(action, RecoveryAction::Reject(_)),
+                "{kind:?} 必须拒绝恢复，实际 {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_decision_unknown_waits_then_rejects_without_escape() {
+        let snapshot = snap(UiStateKind::Unknown, "unknown", "no_reliable_anchor");
+        let mut progress = settled_progress(&snapshot);
+        assert_eq!(
+            decide_recovery_step(&snapshot, UiResidencyTarget::Primary, &mut progress),
+            RecoveryAction::Wait,
+            "刚出现的 Unknown 只允许等待"
+        );
+        for _ in 0..RECOVERY_UNKNOWN_MIN_SAMPLES {
+            progress.record(&snapshot, Instant::now());
+        }
+        progress.unknown_since = Some(Instant::now() - Duration::from_millis(RECOVERY_UNKNOWN_WINDOW_MS + 50));
+        let action = decide_recovery_step(&snapshot, UiResidencyTarget::Primary, &mut progress);
+        assert!(
+            matches!(action, RecoveryAction::Reject(_)),
+            "持续 Unknown 必须失败而不是 Esc，实际 {action:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_decision_paimon_menu_is_rejected_even_when_stable() {
+        let snapshot = snap(UiStateKind::MainMenu, "main_menu", "paimon_menu_panel_template");
+        let mut progress = settled_progress(&snapshot);
+        let action = decide_recovery_step(&snapshot, UiResidencyTarget::Primary, &mut progress);
+        assert!(matches!(action, RecoveryAction::Reject(_)), "派蒙菜单必须拒绝：{action:?}");
+        let action = decide_recovery_step(
+            &snapshot,
+            UiResidencyTarget::SecondaryCurrentHall,
+            &mut progress,
+        );
+        assert!(
+            matches!(action, RecoveryAction::Reject(_)),
+            "目标二级时派蒙菜单同样必须拒绝：{action:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_decision_panel_requires_two_confirmations() {
+        let panel = snap(UiStateKind::Panel, "panel", "panel_template");
+        // 新鲜稳定已满足，但 Panel 只确认过一次：必须继续等到第二次确认。
+        let mut progress = RecoveryProgress {
+            fresh_identity: Some(panel.identity()),
+            fresh_samples: panel.required_count,
+            panel_samples: 1,
+            ..RecoveryProgress::default()
+        };
+        assert_eq!(
+            decide_recovery_step(&panel, UiResidencyTarget::Primary, &mut progress),
+            RecoveryAction::Wait
+        );
+        progress.record(&panel, Instant::now());
+        assert_eq!(
+            decide_recovery_step(&panel, UiResidencyTarget::Primary, &mut progress),
+            RecoveryAction::Escape
+        );
+    }
+
+    #[test]
+    fn recovery_decision_oscillation_trips_breaker() {
+        let primary = snap(UiStateKind::Primary, "primary", "primary_friend_template");
+        let menu = snap(UiStateKind::MainMenu, "main_menu", "main_menu_template");
+        let mut progress = RecoveryProgress::default();
+        progress.kind_tail = vec![
+            UiStateKind::Primary,
+            UiStateKind::MainMenu,
+            UiStateKind::Primary,
+            UiStateKind::MainMenu,
+        ];
+        let action = decide_recovery_step(&primary, UiResidencyTarget::Primary, &mut progress);
+        assert!(
+            matches!(action, RecoveryAction::Reject(_)),
+            "Primary↔MainMenu 振荡必须熔断：{action:?}"
+        );
+        let _ = menu;
+    }
+
+    #[test]
+    fn recovery_decision_no_progress_trips_breaker() {
+        let primary = snap(UiStateKind::Primary, "primary", "primary_friend_template");
+        let mut progress = settled_progress(&primary);
+        progress.pending_action_identity = Some(primary.identity());
+        for _ in 0..RECOVERY_NO_PROGRESS_LIMIT {
+            progress.record(&primary, Instant::now());
+        }
+        let action = decide_recovery_step(&primary, UiResidencyTarget::Primary, &mut progress);
+        assert!(
+            matches!(action, RecoveryAction::Reject(_)),
+            "动作后状态未变必须熔断：{action:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_decision_loading_only_waits() {
+        let loading = snap(UiStateKind::Loading, "loading", "loading_dark");
+        let mut progress = settled_progress(&loading);
+        assert_eq!(
+            decide_recovery_step(&loading, UiResidencyTarget::Primary, &mut progress),
+            RecoveryAction::Wait,
+            "Loading 只能等待，不得发输入"
+        );
     }
 
     struct TransitionResidencyDevice {

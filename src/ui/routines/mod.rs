@@ -6,6 +6,7 @@ mod moderation;
 mod secondary_unread;
 mod startup;
 mod state_observation;
+mod transaction;
 
 pub(crate) use custom_action::{CustomActionPlan, CustomActionUi};
 // `CapturedPrimaryOutcome` 由 task-62 的 AI 聊天接入后才在库内被引用；
@@ -31,6 +32,11 @@ pub(crate) use moderation::{
 };
 pub(crate) use secondary_unread::{
     ProcessSecondaryUnread, SecondaryUnreadEffect, SecondaryUnreadRoutineConfig, SecondaryUnreadUi,
+};
+
+#[allow(unused_imports)]
+pub(crate) use transaction::{
+    EntryPolicy, EntryUiState, FinishPolicy, FinishReport, UiTask, UiTaskOutcome, UiTaskSpec,
 };
 pub(crate) use startup::{
     EnterGame, EnterGameEffect, EnterWonderland, EnterWonderlandEffect, StartupRoutineConfig,

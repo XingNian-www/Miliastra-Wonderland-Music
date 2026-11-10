@@ -128,100 +128,148 @@ pub trait UiDevice: Send + 'static {
 /// 维护注意：新增 UiDevice 方法后，这里若忘记转发，调用会**静默退回 trait 默认实现**。
 /// 只读观测方法的默认实现会报错（真机上表现为 does not support ... observation），
 /// 但默认实现返回 Ok(()) 的方法会无声失败。新增方法时务必同步这里，并补一条转发用例。
-struct IsolatedDevice<D: UiDevice>(D);
+struct IsolatedDevice<D: UiDevice> {
+    device: D,
+    /// 输入尝试计数：供 `UiRoutineContext::input_epoch` 判断"是否已发过输入"。
+    /// 与设备同一个所有者（worker 级），不借用 `&mut dyn UiDevice`，因此不违反
+    /// `UiDevice: 'static` 的约束；只读观测不计数。
+    input_epoch: Arc<AtomicU64>,
+}
+
+impl<D: UiDevice> IsolatedDevice<D> {
+    fn new(device: D) -> Self {
+        Self {
+            device,
+            input_epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn with_epoch(device: D, input_epoch: Arc<AtomicU64>) -> Self {
+        Self {
+            device,
+            input_epoch,
+        }
+    }
+
+    fn record_input_attempt(&self) {
+        self.input_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    fn into_device(self) -> D {
+        self.device
+    }
+}
+
 impl<D: UiDevice> UiDevice for IsolatedDevice<D> {
     fn capture(&mut self) -> Result<DynamicImage> {
-        self.0.capture()
+        self.device.capture()
     }
     fn benchmark_capture(&mut self, rounds: u32) -> Result<String> {
-        self.0.benchmark_capture(rounds)
+        self.device.benchmark_capture(rounds)
     }
     fn ensure_foreground(&mut self) -> Result<()> {
-        self.0.ensure_foreground()
+        self.device.ensure_foreground()
     }
     fn window_foreground(&mut self) -> Result<bool> {
-        self.0.window_foreground()
+        self.device.window_foreground()
     }
     fn window_available(&mut self) -> Result<bool> {
-        self.0.window_available()
+        self.device.window_available()
     }
     /// 只读观测：与 capture / window_* 一致，不做输入授权检查。
     fn clipboard_text(&mut self) -> Result<Option<String>> {
-        self.0.clipboard_text()
+        self.device.clipboard_text()
     }
     fn ensure_window(&mut self) -> Result<()> {
-        self.0.ensure_window()
+        self.device.ensure_window()
     }
     fn press_key(&mut self, key: Key) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.press_key(key)
+        self.record_input_attempt();
+        self.device.press_key(key)
     }
     fn key_down(&mut self, key: Key) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.key_down(key)
+        self.record_input_attempt();
+        self.device.key_down(key)
     }
     fn key_up(&mut self, key: Key) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.key_up(key)
+        self.record_input_attempt();
+        self.device.key_up(key)
     }
     fn click_point(&mut self, x: i32, y: i32) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.click_point(x, y)
+        self.record_input_attempt();
+        self.device.click_point(x, y)
     }
     fn click_button(&mut self, button: Button) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.click_button(button)
+        self.record_input_attempt();
+        self.device.click_button(button)
     }
     fn mouse_down(&mut self, button: Button) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.mouse_down(button)
+        self.record_input_attempt();
+        self.device.mouse_down(button)
     }
     fn mouse_up(&mut self, button: Button) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.mouse_up(button)
+        self.record_input_attempt();
+        self.device.mouse_up(button)
     }
     fn scroll_point(&mut self, x: i32, y: i32, length: i32) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.scroll_point(x, y, length)
+        self.record_input_attempt();
+        self.device.scroll_point(x, y, length)
     }
     fn drag_point(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.drag_point(from_x, from_y, to_x, to_y)
+        self.record_input_attempt();
+        self.device.drag_point(from_x, from_y, to_x, to_y)
     }
     fn activate(&mut self, after_activate_ms: u64) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.activate(after_activate_ms)
+        self.record_input_attempt();
+        self.device.activate(after_activate_ms)
     }
     fn focus(&mut self, after_activate_ms: u64) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.focus(after_activate_ms)
+        self.record_input_attempt();
+        self.device.focus(after_activate_ms)
     }
     fn ensure_ready(&mut self, after_activate_ms: u64) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.ensure_ready(after_activate_ms)
+        self.record_input_attempt();
+        self.device.ensure_ready(after_activate_ms)
     }
     fn paste_text(&mut self, text: &str, clipboard_hold_ms: u64) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.paste_text(text, clipboard_hold_ms)
+        self.record_input_attempt();
+        self.device.paste_text(text, clipboard_hold_ms)
     }
     fn input_text(&mut self, text: &str, input_settle_ms: u64) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.input_text(text, input_settle_ms)
+        self.record_input_attempt();
+        self.device.input_text(text, input_settle_ms)
     }
     fn hold_key(&mut self, key: Key, duration: Duration, running: Arc<AtomicBool>) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.hold_key(key, duration, running)
+        self.record_input_attempt();
+        self.device.hold_key(key, duration, running)
     }
     fn close_window(&mut self) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.close_window()
+        self.record_input_attempt();
+        self.device.close_window()
     }
     fn launch_game(&mut self, executable: &Path, args: &[String]) -> Result<()> {
         crate::debug_mode::require_input()?;
-        self.0.launch_game(executable, args)
+        self.record_input_attempt();
+        self.device.launch_game(executable, args)
     }
     fn recover(&mut self) -> Result<()> {
-        self.0.recover()
+        self.device.recover()
     }
 }
 
@@ -484,6 +532,17 @@ fn stage_label(stage: &'static str) -> &'static str {
         "prepare_friend_delivery" => "准备好友投递",
         "prepare_capture_primary" => "准备一级截图",
         "observe_capture_residency" => "观察一级/二级驻留",
+
+        // ── UI 任务事务包装器（ui/routines/transaction.rs）──
+        "ui_task_start" => "开始 UI 任务",
+        "ui_task_activate" => "激活游戏窗口",
+        "ui_task_observe_entry" => "采集任务入口界面",
+        "ui_task_enter_target" => "进入任务目标界面",
+        "ui_task_finish" => "收尾恢复入口界面",
+        "ui_task_settle" => "统一恢复目标界面",
+        "test_inner" => "事务包装器测试内层例程",
+        "restore_residency" => "恢复界面驻留",
+        "restore_residency_wait" => "等待界面驻留恢复",
         _ => stage,
     }
 }
@@ -1659,6 +1718,39 @@ impl UiRoutineProgressSink for DiscardUiRoutineProgress {
     fn publish(&self, _progress: UiRoutineProgress) {}
 }
 
+/// 一次 UI 操作的收尾阶段状态。
+///
+/// 进入收尾后**忽略业务取消**：调用方 `wait_timeout` 到期会置位取消标志，
+/// 但界面恢复不能因此半途而废（否则任务返回时界面停在随机位置）。
+/// 收尾只受自己的 deadline 约束，deadline 用完由收尾状态机按"未恢复"如实上报。
+#[derive(Debug, Default)]
+struct FinishPhaseState {
+    active: AtomicBool,
+    deadline: Mutex<Option<Instant>>,
+}
+
+impl FinishPhaseState {
+    fn begin(&self, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        if let Ok(mut slot) = self.deadline.lock() {
+            *slot = Some(deadline);
+        }
+        self.active.store(true, Ordering::Release);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        if !self.is_active() {
+            return None;
+        }
+        let deadline = self.deadline.lock().ok().and_then(|slot| *slot)?;
+        Some(deadline.saturating_duration_since(Instant::now()))
+    }
+}
+
 pub struct UiRoutineContext<'a> {
     operation_id: UiOperationId,
     device: &'a mut dyn UiDevice,
@@ -1667,6 +1759,11 @@ pub struct UiRoutineContext<'a> {
     latest_frame: &'a Mutex<Option<Arc<CapturedFrame>>>,
     demands: &'a mut HashMap<u64, ActiveFrameDemand>,
     cancelled: &'a AtomicBool,
+    /// 本次操作的输入尝试计数（由 `IsolatedDevice` 递增）。
+    /// 只用于判断"是否已发过输入"，不记录正文；禁止用它做业务判定。
+    input_epoch: &'a AtomicU64,
+    /// 收尾阶段状态；`begin_finish_phase()` 之后业务取消不再中止等待。
+    finish_phase: &'a FinishPhaseState,
     /// 单次操作内的截图失败去重；每次操作独立，不需要跨操作共享。
     failure_log: CaptureFailureLog,
 }
@@ -1680,6 +1777,8 @@ impl<'a> UiRoutineContext<'a> {
         latest_frame: &'a Mutex<Option<Arc<CapturedFrame>>>,
         demands: &'a mut HashMap<u64, ActiveFrameDemand>,
         cancelled: &'a AtomicBool,
+        input_epoch: &'a AtomicU64,
+        finish_phase: &'a FinishPhaseState,
     ) -> Self {
         Self {
             operation_id,
@@ -1689,6 +1788,8 @@ impl<'a> UiRoutineContext<'a> {
             latest_frame,
             demands,
             cancelled,
+            input_epoch,
+            finish_phase,
             failure_log: CaptureFailureLog::default(),
         }
     }
@@ -1707,15 +1808,20 @@ impl<'a> UiRoutineContext<'a> {
     ) -> std::result::Result<(), UiRoutineFailure> {
         let deadline = Instant::now() + duration;
         loop {
-            if self.is_cancelled() {
-                return Err(UiRoutineFailure::new(
-                    InputCertainty::Cancelled,
-                    "wait_cancellable",
-                    "UI operation cancelled",
-                ));
+            if let Some(failure) = self.wait_abort_failure() {
+                return Err(failure);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                return Ok(());
+            }
+            // 收尾阶段受自己的期限约束：自己的期限到了就交回给收尾状态机上报，
+            // 不能因为"业务已经取消"就无限等下去。
+            if self
+                .finish_phase
+                .remaining()
+                .is_some_and(|remaining| remaining.is_zero())
+            {
                 return Ok(());
             }
             if !self.demands.is_empty() {
@@ -1727,20 +1833,34 @@ impl<'a> UiRoutineContext<'a> {
                     &mut self.failure_log,
                 );
             }
-            if self.is_cancelled() {
-                return Err(UiRoutineFailure::new(
-                    InputCertainty::Cancelled,
-                    "wait_cancellable",
-                    "UI operation cancelled",
-                ));
+            if let Some(failure) = self.wait_abort_failure() {
+                return Err(failure);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(());
             }
-            let until_capture = next_frame_timeout(self.demands).unwrap_or(remaining);
-            thread::sleep(remaining.min(until_capture).min(Duration::from_millis(25)));
+            let slice = match self.finish_phase.remaining() {
+                Some(finish_remaining) => remaining.min(finish_remaining),
+                None => remaining,
+            };
+            let until_capture = next_frame_timeout(self.demands).unwrap_or(slice);
+            thread::sleep(slice.min(until_capture).min(Duration::from_millis(25)));
         }
+    }
+
+    /// 收尾阶段忽略业务取消；只有普通执行阶段才让取消中止等待。
+    fn wait_abort_failure(&self) -> Option<UiRoutineFailure> {
+        if self.finish_phase.is_active() {
+            return None;
+        }
+        self.is_cancelled().then(|| {
+            UiRoutineFailure::new(
+                InputCertainty::Cancelled,
+                "wait_cancellable",
+                "UI operation cancelled",
+            )
+        })
     }
 
     pub fn device(&mut self) -> &mut dyn UiDevice {
@@ -1777,6 +1897,27 @@ impl<'a> UiRoutineContext<'a> {
             .lock()
             .ok()
             .and_then(|state| state.clone())
+    }
+
+    /// 本次操作开始后**尝试过**的真实输入次数（不记录输入正文）。
+    pub fn input_epoch(&self) -> u64 {
+        self.input_epoch.load(Ordering::Acquire)
+    }
+
+    /// 进入收尾阶段：之后的 [`Self::wait_cancellable`] 忽略业务取消，只受 `budget` 约束。
+    ///
+    /// 由事务包装器在 `finally` 里调用；普通执行流程不要调用，否则任务超时后无法中止。
+    pub fn begin_finish_phase(&mut self, budget: Duration) {
+        self.finish_phase.begin(budget);
+    }
+
+    pub fn in_finish_phase(&self) -> bool {
+        self.finish_phase.is_active()
+    }
+
+    /// 收尾剩余时间；未进入收尾阶段时为 `None`。
+    pub(crate) fn finish_remaining(&self) -> Option<Duration> {
+        self.finish_phase.remaining()
     }
 
     pub fn publish_progress(&self, stage: UiRoutineProgressStage) {
@@ -1991,6 +2132,7 @@ trait ErasedUiJob: Send {
         observation: &mut UiObservationRuntime,
         demands: &mut HashMap<u64, ActiveFrameDemand>,
         latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
+        input_epoch: &AtomicU64,
     );
 }
 
@@ -2011,6 +2153,7 @@ impl<R: UiRoutine> ErasedUiJob for TypedUiJob<R> {
         observation: &mut UiObservationRuntime,
         demands: &mut HashMap<u64, ActiveFrameDemand>,
         latest_frame: &Mutex<Option<Arc<CapturedFrame>>>,
+        input_epoch: &AtomicU64,
     ) {
         let Self {
             operation_id,
@@ -2028,6 +2171,9 @@ impl<R: UiRoutine> ErasedUiJob for TypedUiJob<R> {
             // Mode changed after enqueue; dropping the response makes wait() fail without executing.
             return;
         };
+        // 收尾阶段状态每次操作独立；输入计数由 worker 级的 IsolatedDevice 维护，
+        // 这里只借用计数器的当前值（事务层用差值判断"本次是否发过输入"）。
+        let finish_phase = FinishPhaseState::default();
         let mut context = UiRoutineContext::new(
             operation_id,
             device,
@@ -2036,6 +2182,8 @@ impl<R: UiRoutine> ErasedUiJob for TypedUiJob<R> {
             latest_frame,
             demands,
             &cancelled,
+            input_epoch,
+            &finish_phase,
         );
         let output = routine.execute(&mut context);
         if let Some(publication) = R::frame_publication(&output) {
@@ -2313,6 +2461,53 @@ impl Drop for FrameDemandSubscription {
     }
 }
 
+/// 测试用：不经过 `ui-runtime` 线程，直接在一个新建的观察运行时上执行一次例程。
+///
+/// 供 `ui/routines/transaction` 等跨模块单测构造 `UiRoutineContext`（生产上用
+/// `TypedUiJob::execute`）。返回的输出与本次操作的输入尝试计数。
+#[cfg(test)]
+pub(crate) struct TestRoutineExecution<D, T> {
+    pub(crate) output: T,
+    pub(crate) input_epoch: u64,
+    /// 归还设备，便于测试断言它记录到的动作。
+    pub(crate) device: D,
+}
+
+#[cfg(test)]
+pub(crate) fn execute_routine_for_test<D: UiDevice, R: UiRoutine>(
+    device: D,
+    classifier: Option<Box<dyn UiStateClassifier>>,
+    stable_count: u32,
+    cancelled: Arc<AtomicBool>,
+    routine: R,
+) -> TestRoutineExecution<D, R::Output> {
+    let latest_state = Arc::new(Mutex::new(None));
+    let mut observation = UiObservationRuntime::new(classifier, stable_count, latest_state);
+    let mut demands = HashMap::new();
+    let latest_frame: Mutex<Option<Arc<CapturedFrame>>> = Mutex::new(None);
+    let input_epoch = Arc::new(AtomicU64::new(0));
+    let finish_phase = FinishPhaseState::default();
+    let progress = DiscardUiRoutineProgress;
+    let mut isolated = IsolatedDevice::with_epoch(device, Arc::clone(&input_epoch));
+    let mut context = UiRoutineContext::new(
+        UiOperationId(1),
+        &mut isolated,
+        &progress,
+        &mut observation,
+        &latest_frame,
+        &mut demands,
+        &cancelled,
+        &input_epoch,
+        &finish_phase,
+    );
+    let output = routine.execute(&mut context);
+    TestRoutineExecution {
+        output,
+        input_epoch: input_epoch.load(Ordering::Acquire),
+        device: isolated.into_device(),
+    }
+}
+
 /// 测试期串行化所有 `UiRuntime` 实例。
 ///
 /// UI worker 在执行前会校验入队时记录的 `debug_mode` generation，一旦变化就**丢弃该操作且不回传**
@@ -2559,7 +2754,8 @@ fn run_ui_runtime(
     stable_count: u32,
     stop_requested: Arc<AtomicBool>,
 ) {
-    let mut device = IsolatedDevice(device);
+    let input_epoch = Arc::new(AtomicU64::new(0));
+    let mut device = IsolatedDevice::with_epoch(device, Arc::clone(&input_epoch));
     let mut demands = HashMap::<u64, ActiveFrameDemand>::new();
     let mut observation = UiObservationRuntime::new(classifier, stable_count, latest_ui_state);
     let mut failure_log = CaptureFailureLog::default();
@@ -2586,6 +2782,7 @@ fn run_ui_runtime(
                     &mut observation,
                     &mut demands,
                     &latest_frame,
+                    &input_epoch,
                 );
                 publish_due_frame(
                     &mut device,
@@ -2901,6 +3098,7 @@ mod tests {
             include_str!("../ui/routines/secondary_unread.rs"),
             include_str!("../ui/routines/moderation.rs"),
             include_str!("../ui/routines/state_observation.rs"),
+            include_str!("../ui/routines/transaction.rs"),
             include_str!("../ui/atoms.rs"),
         ];
         // 测试专用的故意样例：用于验证「未登记回退」，不参与本断言。
@@ -3124,7 +3322,7 @@ mod tests {
     /// 而 capture / window_* 因为转发过所以看起来一切正常。
     #[test]
     fn isolated_device_forwards_read_only_observations() {
-        let mut isolated = IsolatedDevice(IsolationProbeDevice::default());
+        let mut isolated = IsolatedDevice::new(IsolationProbeDevice::default());
         crate::debug_mode::with_test_execution(true, false, || {
             assert_eq!(
                 isolated.clipboard_text().unwrap(),
@@ -3139,7 +3337,7 @@ mod tests {
         let device = IsolationProbeDevice::default();
         let captures = device.captures.clone();
         let presses = device.presses.clone();
-        let mut isolated = IsolatedDevice(device);
+        let mut isolated = IsolatedDevice::new(device);
 
         crate::debug_mode::with_test_execution(true, false, || {
             assert!(isolated.press_key(Key::Return).is_err());
@@ -3156,7 +3354,7 @@ mod tests {
         let device = IsolationProbeDevice::default();
         let presses = device.presses.clone();
         let foreground_checks = device.foreground_checks.clone();
-        let mut isolated = IsolatedDevice(device);
+        let mut isolated = IsolatedDevice::new(device);
 
         crate::debug_mode::with_test_execution(true, true, || {
             isolated.ensure_foreground().unwrap();
@@ -3171,7 +3369,7 @@ mod tests {
     fn isolated_device_does_not_leak_test_authorization_between_scopes() {
         let device = IsolationProbeDevice::default();
         let presses = device.presses.clone();
-        let mut isolated = IsolatedDevice(device);
+        let mut isolated = IsolatedDevice::new(device);
 
         crate::debug_mode::with_test_execution(true, true, || {
             isolated.press_key(Key::Return).unwrap();

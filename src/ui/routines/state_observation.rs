@@ -148,3 +148,107 @@ fn wait_for_stable_ui_kind_internal(
         wait_ms(context, config.poll_ms, stage, certainty)?;
     }
 }
+
+/// 一次分类后的只读快照：恢复决策与失败诊断所需的最小事实集。
+///
+/// 只读取 `UiStateClassification` 已公开的字段，不新增运行时接口，
+/// 因此可用于 friend_delivery 的状态驱动恢复，而不改 `runtime/ui.rs`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct UiStateSnapshot {
+    pub(super) kind: UiStateKind,
+    /// 分类标签（如 `main_menu`、`secondary:chat`、`primary:hall`）。
+    pub(super) label: String,
+    /// 判据最终规则名（区分千星主菜单 `main_menu_template` 与
+    /// 派蒙菜单 `paimon_menu_panel_template` 的唯一依据）。
+    pub(super) final_rule: String,
+    /// 世界判据结论（`teyvat` / `qianxing` / `unknown` / `not_applicable`…）。
+    pub(super) world_guess: String,
+    /// 运行时跟踪器给出的"最后一次稳定类型"，用于诊断瞬失。
+    pub(super) last_stable_kind: Option<UiStateKind>,
+    /// 本帧是否已被跟踪器判为稳定（连续 required_count 帧一致）。
+    pub(super) runtime_stable: bool,
+    pub(super) candidate_count: u32,
+    pub(super) required_count: u32,
+}
+
+impl UiStateSnapshot {
+    /// 状态身份：动作前后比较"是否有进展"用（kind + label，不含证据）。
+    pub(super) fn identity(&self) -> String {
+        format!("{}|{}", self.kind.name(), self.label)
+    }
+
+    /// 失败诊断用的一行事实串（含 rule / world / last_stable）。
+    pub(super) fn describe(&self) -> String {
+        format!(
+            "kind={} label={} rule={} world={} last_stable={:?} stable={} samples={}/{}",
+            self.kind.name(),
+            self.label,
+            self.final_rule,
+            self.world_guess,
+            self.last_stable_kind,
+            self.runtime_stable,
+            self.candidate_count,
+            self.required_count
+        )
+    }
+
+    /// 是否为千星奇域主菜单（由「返回提瓦特」模板判出）。
+    pub(super) fn is_wonderland_main_menu(&self) -> bool {
+        self.kind == UiStateKind::MainMenu && self.final_rule == "main_menu_template"
+    }
+
+    /// 是否为派蒙菜单（ESC 系统菜单）：它复用主菜单状态，但绝不是大厅菜单。
+    pub(super) fn is_paimon_menu(&self) -> bool {
+        self.kind == UiStateKind::MainMenu && self.final_rule == "paimon_menu_panel_template"
+    }
+}
+
+/// 采一帧并返回分类快照；分类失败也如实返回错误（带 last_stable 诊断）。
+///
+/// 与 [`wait_for_stable_ui_kind`] 的区别：它只采样一次、把完整证据交回调用方，
+/// 由调用方按状态机决策下一步动作（恢复入口 `settle_to` 用）。
+pub(super) fn observe_ui_state_once(
+    context: &mut UiRoutineContext<'_>,
+    config: UiStateObservationConfig,
+    stage: &'static str,
+    certainty: InputCertainty,
+) -> Result<UiStateSnapshot, UiRoutineFailure> {
+    capture_normalized_ui_state(context, &config, stage, certainty)?;
+    let observation = context.latest_ui_state().ok_or_else(|| {
+        UiRoutineFailure::new(
+            certainty,
+            stage,
+            "UI runtime has no configured template state classifier",
+        )
+    })?;
+    match &observation {
+        UiStateObservation::Classified(state) => {
+            let classification = state.classification();
+            Ok(UiStateSnapshot {
+                kind: classification.kind(),
+                label: classification.label().to_string(),
+                final_rule: classification.evidence().final_rule().to_string(),
+                world_guess: classification
+                    .evidence()
+                    .world_probe()
+                    .map(|probe| probe.guess().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                last_stable_kind: state.last_stable_kind(),
+                runtime_stable: state.stable_kind() == Some(classification.kind()),
+                candidate_count: state.candidate_count(),
+                required_count: state.required_count(),
+            })
+        }
+        UiStateObservation::Failed {
+            reason,
+            last_stable_kind,
+            ..
+        } => Err(UiRoutineFailure::new(
+            certainty,
+            stage,
+            format!(
+                "template UI state classification failed: {reason}; last_stable={last_stable_kind:?}"
+            ),
+        )),
+    }
+}

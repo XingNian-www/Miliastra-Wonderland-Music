@@ -1,10 +1,10 @@
 use enigo::Key;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
-    before_input_failure, capture_normalized, confirm_primary_residency, friend_list_drag_points,
-    restore_residency, wait_ms,
+    capture_normalized, friend_list_drag_points, wait_ms,
 };
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -15,6 +15,7 @@ use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
 };
+use super::transaction::{FinishPolicy, UiTask, UiTaskSpec};
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::locator::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty, merge_hall_info_samples,
@@ -128,7 +129,7 @@ impl HallUi {
         &self,
         request: ReadHallInfo,
     ) -> Result<UiOperation<ReadHallInfoOutcome>, UiSubmitError> {
-        self.runtime.submit(ReadHallInfoRoutine {
+        self.runtime.submit(ReadHallInfoTask {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
@@ -139,7 +140,7 @@ impl HallUi {
         &self,
         request: DetectPublicHall,
     ) -> Result<UiOperation<DetectPublicHallOutcome>, UiSubmitError> {
-        self.runtime.submit(DetectPublicHallRoutine {
+        self.runtime.submit(DetectPublicHallTask {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
@@ -150,7 +151,7 @@ impl HallUi {
         &self,
         request: ToggleMicrophone,
     ) -> Result<UiOperation<ToggleMicrophoneOutcome>, UiSubmitError> {
-        self.runtime.submit(ToggleMicrophoneRoutine {
+        self.runtime.submit(ToggleMicrophoneTask {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
@@ -219,10 +220,14 @@ impl UiRoutine for ReadHallInfoRoutine {
                 Ok((info, screenshot)) => (ReadHallInfoEffect::Read(info), Some(screenshot)),
                 Err(failure) => (ReadHallInfoEffect::Failed(failure), None),
             };
-        let residency = finish_hall_page(context, &self.ocr, &self.config, opened);
+        if opened
+            && let Err(error) = close_hall_page(context)
+        {
+            log::warn!("关闭大厅信息页失败，交给 UiTask 收尾恢复界面：{error}");
+        }
         ReadHallInfoOutcome {
             effect,
-            residency,
+            residency: UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
             screenshot,
         }
     }
@@ -250,8 +255,15 @@ impl UiRoutine for DetectPublicHallRoutine {
             }
             Err(failure) => DetectPublicHallEffect::Failed(failure),
         };
-        let residency = finish_hall_page(context, &self.ocr, &self.config, opened);
-        DetectPublicHallOutcome { effect, residency }
+        if opened
+            && let Err(error) = close_hall_page(context)
+        {
+            log::warn!("关闭大厅信息页失败，交给 UiTask 收尾恢复界面：{error}");
+        }
+        DetectPublicHallOutcome {
+            effect,
+            residency: UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+        }
     }
 }
 
@@ -268,50 +280,27 @@ impl UiRoutine for ToggleMicrophoneRoutine {
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let _ = self.request;
-        let effect = match prepare_primary(context, &self.ocr, &self.config) {
-            Ok(()) => match context.device().press_key(Key::Unicode('n')) {
-                Ok(()) => {
-                    match wait_ms(
-                        context,
-                        100,
-                        "toggle_microphone",
-                        InputCertainty::AfterInputUnknown,
-                    ) {
-                        Ok(()) => ToggleMicrophoneEffect::Toggled,
-                        Err(failure) => ToggleMicrophoneEffect::Failed(failure),
-                    }
-                }
-                Err(error) => ToggleMicrophoneEffect::Failed(UiRoutineFailure::new(
-                    InputCertainty::AfterInputUnknown,
-                    "toggle_microphone",
-                    format!("{error:#}"),
-                )),
+        let effect = match context.device().press_key(Key::Unicode('n')) {
+            Ok(()) => match wait_ms(
+                context,
+                100,
+                "toggle_microphone",
+                InputCertainty::AfterInputUnknown,
+            ) {
+                Ok(()) => ToggleMicrophoneEffect::Toggled,
+                Err(failure) => ToggleMicrophoneEffect::Failed(failure),
             },
-            Err(failure) => ToggleMicrophoneEffect::Failed(failure),
+            Err(error) => ToggleMicrophoneEffect::Failed(UiRoutineFailure::new(
+                InputCertainty::AfterInputUnknown,
+                "toggle_microphone",
+                format!("{error:#}"),
+            )),
         };
-        let residency = match restore_residency(
-            context,
-            &self.ocr,
-            &self.config.residency,
-            UiResidencyTarget::Primary,
-        ) {
-            Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
-            Err(failure) => UiResidencyOutcome::Failed(failure),
-        };
-        ToggleMicrophoneOutcome { effect, residency }
+        ToggleMicrophoneOutcome {
+            effect,
+            residency: UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+        }
     }
-}
-
-fn prepare_primary(
-    context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
-    config: &HallRoutineConfig,
-) -> Result<(), UiRoutineFailure> {
-    context
-        .device()
-        .ensure_ready(config.residency.after_activate_ms)
-        .map_err(|error| before_input_failure("prepare_hall_operation", error))?;
-    restore_residency(context, ocr, &config.residency, UiResidencyTarget::Primary)
 }
 
 fn read_hall_info_transaction(
@@ -320,7 +309,6 @@ fn read_hall_info_transaction(
     config: &HallRoutineConfig,
     opened: &mut bool,
 ) -> Result<(HallInfo, Arc<image::DynamicImage>), UiRoutineFailure> {
-    prepare_primary(context, ocr, config)?;
     context.device().press_key(Key::F2).map_err(|error| {
         UiRoutineFailure::new(
             InputCertainty::AfterInputUnknown,
@@ -539,29 +527,152 @@ fn read_hall_sample(
     })
 }
 
-fn finish_hall_page(
-    context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
-    config: &HallRoutineConfig,
-    opened: bool,
-) -> UiResidencyOutcome {
-    if opened {
-        if let Err(error) = context.device().press_key(Key::Escape) {
-            return UiResidencyOutcome::Failed(UiRoutineFailure::new(
-                InputCertainty::AfterInputUnknown,
-                "close_hall_page",
-                format!("{error:#}"),
-            ));
+fn hall_task_spec() -> UiTaskSpec {
+    UiTaskSpec::new(
+        UiResidencyTarget::Primary,
+        FinishPolicy::RestoreEntry {
+            fallback: UiResidencyTarget::Primary,
+        },
+    )
+    .with_activate(true)
+    .with_total_budget(Duration::from_secs(40))
+}
+
+struct ReadHallInfoTask {
+    request: ReadHallInfo,
+    ocr: OcrRuntimeHandle,
+    config: HallRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for ReadHallInfoTask {}
+
+impl UiRoutine for ReadHallInfoTask {
+    type Output = ReadHallInfoOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let outcome = UiTask::new(
+            hall_task_spec(),
+            ReadHallInfoRoutine {
+                request: self.request,
+                ocr: self.ocr,
+                config: self.config,
+            },
+        )
+        .execute(context);
+        match outcome.output {
+            Some(mut output) => {
+                output.residency = outcome.residency;
+                output
+            }
+            None => {
+                let failure = outcome.entry_failure.clone().unwrap_or_else(|| {
+                    UiRoutineFailure::new(
+                        InputCertainty::BeforeInput,
+                        "hall_task",
+                        "大厅信息任务未开始执行",
+                    )
+                });
+                ReadHallInfoOutcome {
+                    effect: ReadHallInfoEffect::Failed(failure),
+                    residency: outcome.residency,
+                    screenshot: None,
+                }
+            }
         }
-        return match confirm_primary_residency(context, &config.residency) {
-            Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
-            Err(failure) => UiResidencyOutcome::Failed(failure),
-        };
     }
-    match restore_residency(context, ocr, &config.residency, UiResidencyTarget::Primary) {
-        Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
-        Err(failure) => UiResidencyOutcome::Failed(failure),
+}
+
+struct DetectPublicHallTask {
+    request: DetectPublicHall,
+    ocr: OcrRuntimeHandle,
+    config: HallRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for DetectPublicHallTask {}
+
+impl UiRoutine for DetectPublicHallTask {
+    type Output = DetectPublicHallOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let outcome = UiTask::new(
+            hall_task_spec(),
+            DetectPublicHallRoutine {
+                request: self.request,
+                ocr: self.ocr,
+                config: self.config,
+            },
+        )
+        .execute(context);
+        match outcome.output {
+            Some(mut output) => {
+                output.residency = outcome.residency;
+                output
+            }
+            None => {
+                let failure = outcome.entry_failure.clone().unwrap_or_else(|| {
+                    UiRoutineFailure::new(
+                        InputCertainty::BeforeInput,
+                        "hall_task",
+                        "大厅检测任务未开始执行",
+                    )
+                });
+                DetectPublicHallOutcome {
+                    effect: DetectPublicHallEffect::Failed(failure),
+                    residency: outcome.residency,
+                }
+            }
+        }
     }
+}
+
+struct ToggleMicrophoneTask {
+    request: ToggleMicrophone,
+    ocr: OcrRuntimeHandle,
+    config: HallRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for ToggleMicrophoneTask {}
+
+impl UiRoutine for ToggleMicrophoneTask {
+    type Output = ToggleMicrophoneOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let outcome = UiTask::new(
+            hall_task_spec(),
+            ToggleMicrophoneRoutine {
+                request: self.request,
+                ocr: self.ocr,
+                config: self.config,
+            },
+        )
+        .execute(context);
+        match outcome.output {
+            Some(mut output) => {
+                output.residency = outcome.residency;
+                output
+            }
+            None => {
+                let failure = outcome.entry_failure.clone().unwrap_or_else(|| {
+                    UiRoutineFailure::new(
+                        InputCertainty::BeforeInput,
+                        "hall_task",
+                        "麦克风任务未开始执行",
+                    )
+                });
+                ToggleMicrophoneOutcome {
+                    effect: ToggleMicrophoneEffect::Failed(failure),
+                    residency: outcome.residency,
+                }
+            }
+        }
+    }
+}
+
+fn close_hall_page(context: &mut UiRoutineContext<'_>) -> Result<(), UiRoutineFailure> {
+    context
+        .device()
+        .press_key(Key::Escape)
+        .map_err(|error| after_input_failure("close_hall_page", error))
 }
 
 #[cfg(test)]
@@ -589,6 +700,10 @@ mod tests {
     impl UiDevice for HallDevice {
         fn capture(&mut self) -> Result<DynamicImage> {
             Ok(self.frame.clone())
+        }
+
+        fn activate(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
         }
 
         fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
@@ -650,6 +765,10 @@ mod tests {
                 }
                 Some(_) => Ok(self.loading.clone()),
             }
+        }
+
+        fn activate(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
         }
 
         fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
@@ -883,6 +1002,85 @@ mod tests {
         );
         assert_eq!(*keys.lock().unwrap(), [Key::F2, Key::Escape]);
 
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    struct EntryHallDevice {
+        secondary: DynamicImage,
+        primary: DynamicImage,
+        keys: Arc<Mutex<Vec<Key>>>,
+    }
+
+    impl UiDevice for EntryHallDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            let last = self.keys.lock().unwrap().last().cloned();
+            Ok(match last {
+                None | Some(Key::Return) => self.secondary.clone(),
+                Some(_) => self.primary.clone(),
+            })
+        }
+
+        fn activate(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<()> {
+            self.keys.lock().unwrap().push(key);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn secondary_entry_navigates_primary_and_returns_to_secondary() {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.hall.page_settle_ms = 0;
+        config.timing.hall.ocr_sample_interval_ms = 0;
+        config.timing.workflow.default_timeout_ms = 5_000;
+        config.timing.workflow.default_poll_ms = 1;
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = start_test_ui_runtime(
+            EntryHallDevice {
+                secondary: image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
+                    .expect("打开真实二级帧失败"),
+                primary: primary_frame(&config),
+                keys: keys.clone(),
+            },
+            &config,
+        );
+        let ocr_runtime = OcrRuntime::start(
+            HallOcrDevice {
+                member_count: "大厅人数 3/12",
+            },
+            4,
+        )
+        .unwrap();
+        let hall_ui = HallUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            HallRoutineConfig::from_app(&config),
+        );
+        // 二级入口先一次 Esc 回一级；业务按 N 切换麦克风；收尾回二级一次 Return。
+        let outcome = hall_ui
+            .submit_microphone(ToggleMicrophone)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(outcome.effect(), ToggleMicrophoneEffect::Toggled));
+        assert!(
+            matches!(
+                outcome.residency(),
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+            ),
+            "{:?}",
+            outcome.residency()
+        );
+        assert_eq!(*keys.lock().unwrap(), [Key::Escape, Key::Unicode('n'), Key::Return]);
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }

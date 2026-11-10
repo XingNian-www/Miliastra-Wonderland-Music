@@ -26,6 +26,9 @@ use crate::runtime::ui::{
 pub(crate) enum EntryPolicy {
     /// 抓一次稳定入口快照，并复用它做“是否已经在目标界面”的判断（默认）。
     Observe,
+    /// 抓一次稳定入口快照，但**要求入口已经是目标**；不满足时按 `BeforeInput` 直接拒绝，不做任何导航。
+    /// 用于“只允许从一级界面执行”的例程（例如管理操作）。
+    RequireTarget,
     /// 不观测，直接认为入口就是目标（调用方自己保证）；不会做入口导航。
     AssumeTarget,
     /// 完全旁路：不观测、不导航、不按键（调试/只读观察用）。
@@ -254,21 +257,59 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
             return finish_outcome(outcome, context, started_epoch);
         }
 
+        let mut navigate_to_target = false;
         match self.spec.entry {
             EntryPolicy::Passthrough => {
-                // 旁路：不观测、不导航；内层自己负责安全。
+                // 旁路：不观测、不导航；但若收尾策略要求固定目标，仍走统一收尾
+                // （例如邀请任务：入口不做任何导航，进新大厅后统一落到 Primary）。
                 outcome.output = Some(self.inner.execute(context));
-                outcome.finish = no_action_finish(self.spec.finish, outcome.entry.as_ref());
-                outcome.residency = no_action_residency(&outcome.finish);
+                outcome.finish = match self.spec.finish {
+                    FinishPolicy::KeepCurrent | FinishPolicy::ScriptDeclared => {
+                        no_action_finish(self.spec.finish, outcome.entry.as_ref())
+                    }
+                    FinishPolicy::Fixed(_) | FinishPolicy::RestoreEntry { .. } => run_finish(
+                        context,
+                        self.spec.finish,
+                        outcome.entry.as_ref(),
+                        deadline,
+                    ),
+                };
+                outcome.residency = finish_residency(&outcome.finish);
                 return finish_outcome(outcome, context, started_epoch);
             }
             EntryPolicy::AssumeTarget => {
                 outcome.entry = Some(EntryUiState::assumed(self.spec.target));
             }
-            EntryPolicy::Observe => {
+            EntryPolicy::Observe | EntryPolicy::RequireTarget => {
                 let entry_budget = entry_budget(deadline);
                 match observe_entry(context, entry_budget) {
-                    Ok(entry) => outcome.entry = Some(entry),
+                    Ok(entry) => {
+                        let matches_target = kind_matches(entry.kind, self.spec.target);
+                        outcome.entry = Some(entry);
+                        if self.spec.entry == EntryPolicy::RequireTarget && !matches_target {
+                            let entry = outcome
+                                .entry
+                                .as_ref()
+                                .expect("entry was just stored");
+                            outcome.entry_failure = Some(failure(
+                                InputCertainty::BeforeInput,
+                                "ui_task_entry",
+                                format!(
+                                    "入口界面不满足任务前置要求（需要 {}，当前：{}）；未发送任何输入",
+                                    target_label(self.spec.target),
+                                    entry.label
+                                ),
+                            ));
+                            outcome.residency = UiResidencyOutcome::Failed(
+                                outcome
+                                    .entry_failure
+                                    .clone()
+                                    .expect("entry failure was just set"),
+                            );
+                            return outcome;
+                        }
+                        navigate_to_target = !matches_target;
+                    }
                     Err(error) => {
                         outcome.entry_failure = Some(error);
                         outcome.residency = UiResidencyOutcome::Failed(
@@ -284,9 +325,7 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
         }
 
         // 目标检查复用入口观测：已在目标就不导航。
-        if let Some(entry) = outcome.entry.as_ref()
-            && !kind_matches(entry.kind, self.spec.target)
-        {
+        if navigate_to_target && outcome.entry.is_some() {
             let remaining = remaining_until(deadline);
             if let Err(error) = settle_to(context, self.spec.target, remaining) {
                 outcome.entry_failure = Some(error);
@@ -356,6 +395,13 @@ fn kind_for(target: UiResidencyTarget) -> UiStateKind {
     match target {
         UiResidencyTarget::Primary => UiStateKind::Primary,
         UiResidencyTarget::SecondaryCurrentHall => UiStateKind::Secondary,
+    }
+}
+
+fn target_label(target: UiResidencyTarget) -> &'static str {
+    match target {
+        UiResidencyTarget::Primary => "一级界面",
+        UiResidencyTarget::SecondaryCurrentHall => "二级当前大厅",
     }
 }
 
@@ -512,14 +558,8 @@ fn settle_to(
                         "收尾预算耗尽，界面仍未恢复",
                     ));
                 }
-                context.device().press_key(key).map_err(|error| {
-                    failure(
-                        InputCertainty::AfterInputUnknown,
-                        "ui_task_settle",
-                        format!("收尾按键失败: {error:#}"),
-                    )
-                })?;
-                actions += 1;
+                // 动手前先判“无进展”：同一 (kind,label) 连续第三次就不再按键，
+                // 保证 Unknown/Panel 振荡时 Esc 次数有界（最多 2 次同一状态）。
                 let signature = (observed.kind, observed.label.clone());
                 if last_signature.as_ref() == Some(&signature) {
                     no_progress += 1;
@@ -534,6 +574,14 @@ fn settle_to(
                     last_signature = Some(signature);
                     no_progress = 0;
                 }
+                context.device().press_key(key).map_err(|error| {
+                    failure(
+                        InputCertainty::AfterInputUnknown,
+                        "ui_task_settle",
+                        format!("收尾按键失败: {error:#}"),
+                    )
+                })?;
+                actions += 1;
                 context.wait_cancellable(SETTLE_POLL)?;
             }
         }
@@ -1081,6 +1129,56 @@ mod tests {
         assert!(device.keys().is_empty());
         assert_eq!(outcome.input_epoch, 0);
         assert!(outcome.safe_retry(), "没有发过输入时允许安全重试");
+    }
+
+    #[test]
+    fn require_target_rejects_secondary_without_pressing_keys() {
+        let mut script = vec![secondary(), secondary()];
+        script.extend(vec![primary(), primary()]);
+        let spec = UiTaskSpec::new(
+            UiResidencyTarget::Primary,
+            FinishPolicy::RestoreEntry {
+                fallback: UiResidencyTarget::Primary,
+            },
+        )
+        .with_entry(EntryPolicy::RequireTarget);
+        let (outcome, device) = run_task_with(
+            RecordingDevice::default(),
+            script,
+            spec,
+            Noop,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(device.keys().is_empty(), "入口不满足时不允许任何按键");
+        assert!(outcome.output.is_none());
+        let failure = outcome.entry_failure.as_ref().expect("entry failure");
+        assert_eq!(failure.certainty(), InputCertainty::BeforeInput);
+        assert!(outcome.safe_retry());
+    }
+
+    #[test]
+    fn passthrough_still_settles_a_fixed_finish_target() {
+        // 邀请类任务：入口不观测/不导航，但结束后要统一落到 Primary（不回旧界面）。
+        let mut script = vec![secondary(), secondary()];
+        script.extend(vec![primary(), primary()]);
+        let spec = UiTaskSpec::new(
+            UiResidencyTarget::Primary,
+            FinishPolicy::Fixed(UiResidencyTarget::Primary),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run_task_with(
+            RecordingDevice::default(),
+            script,
+            spec,
+            Noop,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(device.keys(), vec![Key::Escape]);
+        assert!(outcome.entry.is_none());
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
     }
 
     #[test]

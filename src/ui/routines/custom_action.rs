@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::friend_delivery::{FriendDeliveryRoutineConfig, UiResidencyTarget, restore_residency};
+use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 use crate::adapters::input::parse_key;
 use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
 use crate::geometry::{Point, Rect, crop_canvas};
@@ -89,7 +90,7 @@ impl CustomActionUi {
         &self,
         request: CustomActionPlan,
     ) -> Result<UiOperation<CustomActionOutcome>, UiSubmitError> {
-        self.runtime.submit(CustomActionRoutine {
+        self.runtime.submit(CustomActionTask {
             request,
             ocr: self.ocr.clone(),
             running: Arc::clone(&self.running),
@@ -160,6 +161,61 @@ impl UiRoutine for CustomActionRoutine {
         CustomActionOutcome {
             completed,
             failure: None,
+        }
+    }
+}
+
+/// 自定义动作脚本的收尾由脚本自己声明（`EnsureResidency` / `ReturnListenerResidency`
+/// 都是显式脚本步骤，后者由应用层在提交前解析一次），包装器不再额外收尾。
+///
+/// 因此用 `ScriptDeclared` + `Passthrough`：不观测入口、不导航、不在脚本结束后
+/// 补 Esc/Return。默认语义就是“脚本跑完停在最后一步所在的界面”。
+fn custom_action_task_spec() -> UiTaskSpec {
+    UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::ScriptDeclared)
+        .with_entry(EntryPolicy::Passthrough)
+}
+
+fn task_not_started_failure(failure: Option<UiRoutineFailure>) -> UiRoutineFailure {
+    failure.unwrap_or_else(|| {
+        UiRoutineFailure::new(
+            InputCertainty::Cancelled,
+            "ui_task_start",
+            "UI 任务在开始前已取消，内层例程没有执行",
+        )
+    })
+}
+
+struct CustomActionTask {
+    request: CustomActionPlan,
+    ocr: OcrRuntimeHandle,
+    running: Arc<AtomicBool>,
+    canvas: CustomActionCanvas,
+    residency: FriendDeliveryRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for CustomActionTask {}
+
+impl UiRoutine for CustomActionTask {
+    type Output = CustomActionOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let outcome = UiTask::new(
+            custom_action_task_spec(),
+            CustomActionRoutine {
+                request: self.request,
+                ocr: self.ocr,
+                running: self.running,
+                canvas: self.canvas,
+                residency: self.residency,
+            },
+        )
+        .execute(context);
+        match outcome.output {
+            Some(output) => output,
+            None => CustomActionOutcome {
+                completed: 0,
+                failure: Some(task_not_started_failure(outcome.entry_failure)),
+            },
         }
     }
 }
@@ -1015,6 +1071,103 @@ mod tests {
                 OrderedInputEvent::Hold(Key::Unicode('w'), 3),
                 OrderedInputEvent::Key(Key::Control),
             ]
+        );
+        ocr_runtime.shutdown().unwrap();
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// P1 迁移批次 3：自定义脚本自己声明收尾；包装器不得在脚本结束后补动作。
+    #[test]
+    fn custom_action_task_spec_is_script_declared() {
+        let spec = custom_action_task_spec();
+        assert_eq!(spec.entry, EntryPolicy::Passthrough);
+        assert_eq!(spec.finish, FinishPolicy::ScriptDeclared);
+    }
+
+    /// 脚本没有声明任何收尾 → 跑完就停在最后一步，不补 Esc/Return/回驻留。
+    #[test]
+    fn script_without_a_finish_step_stops_after_the_last_operation() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(RecordingDevice { keys: keys.clone() }, 4).unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let action_ui = CustomActionUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            Arc::new(AtomicBool::new(true)),
+            config.screen.expected_width,
+            config.screen.expected_height,
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+
+        let outcome = action_ui
+            .submit(CustomActionPlan::new(
+                "no-finish",
+                vec![
+                    WorkflowOperation::PressKey {
+                        key: "a".to_string(),
+                    },
+                    WorkflowOperation::PressKey {
+                        key: "b".to_string(),
+                    },
+                ],
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.completed(), 2);
+        assert_eq!(
+            *keys.lock().unwrap(),
+            vec![Key::Unicode('a'), Key::Unicode('b')],
+            "包装器不得在脚本结束后补发任何收尾输入"
+        );
+        ocr_runtime.shutdown().unwrap();
+        ui_runtime.shutdown().unwrap();
+    }
+
+    /// `ReturnListenerResidency` 必须由应用层在提交前解析一次；直接提交未解析的
+    /// 计划时，例程只能在该步骤失败一次，不能自行猜测驻留、也不能继续执行后续步骤。
+    #[test]
+    fn unresolved_return_listener_residency_fails_once_at_that_step() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(RecordingDevice { keys: keys.clone() }, 4).unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let action_ui = CustomActionUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            Arc::new(AtomicBool::new(true)),
+            config.screen.expected_width,
+            config.screen.expected_height,
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+
+        let outcome = action_ui
+            .submit(CustomActionPlan::new(
+                "unresolved-listener-residency",
+                vec![
+                    WorkflowOperation::PressKey {
+                        key: "a".to_string(),
+                    },
+                    WorkflowOperation::ReturnListenerResidency,
+                    WorkflowOperation::PressKey {
+                        key: "b".to_string(),
+                    },
+                ],
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let failure = outcome.failure().expect("未解析的步骤必须失败");
+        assert_eq!(failure.stage(), "resolve_custom_listener_residency");
+        assert_eq!(outcome.completed(), 1, "失败步骤之前的操作已执行");
+        assert_eq!(
+            *keys.lock().unwrap(),
+            vec![Key::Unicode('a')],
+            "失败后不得继续执行后续操作，也不得补发收尾输入"
         );
         ocr_runtime.shutdown().unwrap();
         ui_runtime.shutdown().unwrap();

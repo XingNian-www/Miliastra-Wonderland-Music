@@ -15,6 +15,9 @@ use crate::privacy::{REDACTED_TURTLE_SOUP_BOTTOM, REDACTED_UNDERCOVER_INPUT};
 pub(crate) struct ChatBatchSendOutcome {
     pub sent: usize,
     pub status: ChatBatchSendStatus,
+    /// 发送之后的界面驻留失败。**与发送结果分开记账**：
+    /// 消息全送达但收尾失败时仍是"送达"，只是界面位置未知。
+    pub residency_failure: Option<anyhow::Error>,
 }
 
 #[derive(Debug)]
@@ -28,6 +31,7 @@ impl ChatBatchSendOutcome {
         Self {
             sent,
             status: ChatBatchSendStatus::Complete,
+            residency_failure: None,
         }
     }
 
@@ -35,11 +39,25 @@ impl ChatBatchSendOutcome {
         Self {
             sent,
             status: ChatBatchSendStatus::Failed(error),
+            residency_failure: None,
+        }
+    }
+
+    /// 发送成功但发送后驻留失败：投递判定仍然是成功，驻留失败单独记录。
+    pub(crate) fn delivered_but_residency_failed(
+        sent: usize,
+        residency_failure: anyhow::Error,
+    ) -> Self {
+        Self {
+            sent,
+            status: ChatBatchSendStatus::Complete,
+            residency_failure: Some(residency_failure),
         }
     }
 
     fn into_result(self, expected: usize) -> Result<()> {
         match self.status {
+            // 投递只看"是否全部送达"：驻留失败不能把已送达的消息判成未送达。
             ChatBatchSendStatus::Complete if self.sent == expected => Ok(()),
             ChatBatchSendStatus::Complete => Err(anyhow!(
                 "批量发送提前完成: sent={} expected={}",
@@ -93,7 +111,10 @@ struct ChatSendReport<'a> {
     target: ChatSendTarget,
     total: usize,
     sent: usize,
+    /// 发送本身的失败（一条都没成功时的原因）。
     error: Option<&'a anyhow::Error>,
+    /// 发送之后的界面驻留失败；与 `error` 分开，避免把"已送达+收尾失败"写成未送达。
+    residency_error: Option<&'a anyhow::Error>,
 }
 
 impl<'a> ChatSendReport<'a> {
@@ -110,6 +131,7 @@ impl<'a> ChatSendReport<'a> {
                 ChatBatchSendStatus::Complete => None,
                 ChatBatchSendStatus::Failed(error) => Some(error),
             },
+            residency_error: outcome.residency_failure.as_ref(),
         }
     }
 
@@ -134,11 +156,11 @@ impl<'a> ChatSendReport<'a> {
                 format!("已在{label}发送 {}/{} 条回复", self.sent, self.total),
             )];
             // 正文都已发出，但发送后恢复界面驻留失败：不能谎称整批没问题。
-            if self.error.is_some() {
+            if let Some(residency_error) = self.residency_error {
                 lines.push((
                     log::Level::Warn,
                     format!(
-                        "{label}的 {} 条回复已全部送达，但发送后未能恢复到原界面，当前界面位置未知，后续截图与点击可能识别错界面{failure}",
+                        "{label}的 {} 条回复已全部送达，但发送后未能恢复到原界面，当前界面位置未知，后续截图与点击可能识别错界面：{residency_error}",
                         self.sent
                     ),
                 ));
@@ -272,7 +294,7 @@ impl ChatOutput {
     }
 
     pub fn send(&self, message: &str) -> Result<()> {
-        self.send_primary(message, false)
+        self.send_primary(message)
     }
 
     pub(crate) fn send_invite_ready(
@@ -296,27 +318,21 @@ impl ChatOutput {
     }
 
     pub fn send_for_command(&self, message: &str) -> Result<()> {
-        self.send_primary(message, true)
+        self.send_primary(message)
     }
 
-    fn send_primary(&self, message: &str, restore_after_task: bool) -> Result<()> {
+    fn send_primary(&self, message: &str) -> Result<()> {
         let message = fit_chat_message(message);
         self.record_captured(&message);
         let messages = [message];
-        self.send_batch_logged(
-            ChatSendTarget::PrimaryHall,
-            &messages,
-            0,
-            restore_after_task,
-        )
-        .into_result(1)
+        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, 0).into_result(1)
     }
 
     pub fn send_current_chat(&self, message: &str) -> Result<()> {
         let message = fit_chat_message(message);
         self.record_captured(&message);
         let messages = [message];
-        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, 0, false)
+        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, 0)
             .into_result(1)
     }
 
@@ -332,7 +348,7 @@ impl ChatOutput {
             self.record_captured(message);
         }
         let total = messages.len();
-        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, delay_ms, false)
+        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, delay_ms)
             .into_result(total)
     }
 
@@ -348,7 +364,7 @@ impl ChatOutput {
         }
         // 捕获槽记录「实际发出的每一段」由 send_primary_batch 统一完成。
         let refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
-        self.send_primary_batch(&refs, delay_ms, false)
+        self.send_primary_batch(&refs, delay_ms)
     }
 
     /// 自动换行发送（当前聊天：二级大厅 / 好友会话）。
@@ -364,7 +380,7 @@ impl ChatOutput {
     }
 
     pub fn send_batch_for_command(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
-        self.send_primary_batch(messages, delay_ms, true)
+        self.send_primary_batch(messages, delay_ms)
     }
 
     pub fn send_batch_for_command_redacted(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
@@ -373,7 +389,7 @@ impl ChatOutput {
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
         let total = messages.len();
-        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms, true)
+        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms)
             .into_result(total)
     }
 
@@ -383,16 +399,11 @@ impl ChatOutput {
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
         let total = messages.len();
-        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, delay_ms, false)
+        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, delay_ms)
             .into_result(total)
     }
 
-    fn send_primary_batch(
-        &self,
-        messages: &[&str],
-        delay_ms: u64,
-        restore_after_task: bool,
-    ) -> Result<()> {
+    fn send_primary_batch(&self, messages: &[&str], delay_ms: u64) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -406,7 +417,7 @@ impl ChatOutput {
             self.record_captured(message);
         }
         let total = messages.len();
-        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms, restore_after_task)
+        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms)
             .into_result(total)
     }
 
@@ -419,7 +430,7 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
-        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, delay_ms, false)
+        self.send_batch_logged(ChatSendTarget::CurrentChat, &messages, delay_ms)
     }
 
     pub(crate) fn send_batch_outcome(
@@ -431,7 +442,7 @@ impl ChatOutput {
             .iter()
             .map(|message| fit_chat_message(message))
             .collect::<Vec<_>>();
-        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms, false)
+        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, delay_ms)
     }
 
     /// 全部发送路径唯一的共同实现：**先记提交数量，再发，再按结果记账**。
@@ -446,7 +457,6 @@ impl ChatOutput {
         target: ChatSendTarget,
         messages: &[String],
         delay_ms: u64,
-        restore_after_task: bool,
     ) -> ChatBatchSendOutcome {
         let total = messages.len();
         // 关闭时仍要走一遍「提交 N 条 + 结果」的记录，避免日志里凭空少一段；
@@ -477,9 +487,7 @@ impl ChatOutput {
             );
         }
         let outcome = match target {
-            ChatSendTarget::PrimaryHall => {
-                self.send_batch_with_input(messages, delay_ms, restore_after_task)
-            }
+            ChatSendTarget::PrimaryHall => self.send_batch_with_input(messages, delay_ms),
             ChatSendTarget::CurrentChat => {
                 self.send_current_chat_batch_with_input(messages, delay_ms)
             }
@@ -496,12 +504,7 @@ impl ChatOutput {
         self.send_target_batch(messages, delay_ms, UiResidencyTarget::SecondaryCurrentHall)
     }
 
-    fn send_batch_with_input(
-        &self,
-        messages: &[String],
-        delay_ms: u64,
-        _restore_after_task: bool,
-    ) -> ChatBatchSendOutcome {
+    fn send_batch_with_input(&self, messages: &[String], delay_ms: u64) -> ChatBatchSendOutcome {
         self.send_target_batch(messages, delay_ms, UiResidencyTarget::Primary)
     }
 
@@ -528,20 +531,27 @@ impl ChatOutput {
             Err(error) => return ChatBatchSendOutcome::failed(0, anyhow!(error)),
         };
         let sent = outcome.sent();
+        let residency_failure = match outcome.residency() {
+            UiResidencyOutcome::Confirmed(_) => None,
+            UiResidencyOutcome::Failed(failure) => Some(anyhow!(failure.to_string())),
+        };
         match outcome.status() {
             HallBatchStatus::Failed(failure) => {
-                if let UiResidencyOutcome::Failed(residency) = outcome.residency() {
+                if let Some(residency) = &residency_failure {
                     log::error!(
                         "大厅批量回复发送失败，之后恢复界面驻留也失败（步骤：发送后回到原界面），当前界面位置未知，后续截图与点击可能识别错界面：{residency}"
                     );
                 }
-                ChatBatchSendOutcome::failed(sent, anyhow!(failure.to_string()))
-            }
-            HallBatchStatus::Complete => match outcome.residency() {
-                UiResidencyOutcome::Confirmed(_) => ChatBatchSendOutcome::complete(sent),
-                UiResidencyOutcome::Failed(failure) => {
-                    ChatBatchSendOutcome::failed(sent, anyhow!(failure.to_string()))
+                ChatBatchSendOutcome {
+                    sent,
+                    status: ChatBatchSendStatus::Failed(anyhow!(failure.to_string())),
+                    residency_failure,
                 }
+            }
+            HallBatchStatus::Complete => match residency_failure {
+                // 消息全部送达、只有收尾失败：投递结果仍是成功，驻留失败单独记录。
+                Some(failure) => ChatBatchSendOutcome::delivered_but_residency_failed(sent, failure),
+                None => ChatBatchSendOutcome::complete(sent),
             },
         }
     }
@@ -883,7 +893,7 @@ mod tests {
     /// 必须在 info 之外补一条 warn。
     #[test]
     fn delivered_but_residency_failed_still_warns() {
-        let outcome = ChatBatchSendOutcome::failed(3, anyhow!("恢复驻留超时"));
+        let outcome = ChatBatchSendOutcome::delivered_but_residency_failed(3, anyhow!("恢复驻留超时"));
         let lines = ChatSendReport::new(ChatSendTarget::PrimaryHall, &outcome, 3).lines();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(lines[0].0, log::Level::Info);
@@ -892,6 +902,13 @@ mod tests {
         assert!(lines[1].1.contains("已全部送达"), "{}", lines[1].1);
         assert!(lines[1].1.contains("未能恢复到原界面"), "{}", lines[1].1);
         assert!(lines[1].1.contains("恢复驻留超时"), "{}", lines[1].1);
+    }
+
+    /// 投递成功但收尾失败：整体结果必须仍是“送达成功”，不能当未送达触发重发。
+    #[test]
+    fn delivered_but_residency_failed_is_still_a_delivery_success() {
+        let outcome = ChatBatchSendOutcome::delivered_but_residency_failed(2, anyhow!("恢复驻留超时"));
+        assert!(outcome.into_result(2).is_ok());
     }
 
     /// 三条发送路径共用同一套措辞：换目标只能改称谓，不能改句式与级别。

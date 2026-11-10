@@ -11,6 +11,7 @@ use crate::observation::chat::{
     unread_hit_still_visible,
 };
 use crate::runtime::ocr::OcrRuntimeHandle;
+use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
@@ -84,7 +85,7 @@ impl SecondaryUnreadUi {
         &self,
         request: ProcessSecondaryUnread,
     ) -> Result<UiOperation<ProcessSecondaryUnreadOutcome>, UiSubmitError> {
-        self.runtime.submit(ProcessSecondaryUnreadRoutine {
+        self.runtime.submit(ProcessSecondaryUnreadTask {
             request,
             ocr: self.ocr.clone(),
             chat_timeline: self.chat_timeline.clone(),
@@ -168,6 +169,67 @@ impl UiRoutine for ProcessSecondaryUnreadRoutine {
             Err(failure) => UiResidencyOutcome::Failed(failure),
         };
         ProcessSecondaryUnreadOutcome { effect, residency }
+    }
+}
+
+/// 二级好友未读任务的价值基线固定为“当前大厅二级”。
+///
+/// 例程内部已有一次 `restore_residency(SecondaryCurrentHall)` 作为**唯一收尾**
+/// （它包含“点当前大厅行”的会话级确认，这是 `UiTask::settle_to` 目前还不能替代的），
+/// 这就是 `Fixed(SecondaryCurrentHall)` 的实际执行点。包装器若再声明 Fixed 会在
+/// Passthrough 下触发第二次 `settle_to`（可能额外 Return/等待），因此声明
+/// `ScriptDeclared`：脚本（例程）已完成收尾，包装器不再动作、也不额外回入口。
+fn process_secondary_unread_task_spec() -> UiTaskSpec {
+    UiTaskSpec::new(
+        UiResidencyTarget::SecondaryCurrentHall,
+        FinishPolicy::ScriptDeclared,
+    )
+    .with_entry(EntryPolicy::Passthrough)
+}
+
+fn task_not_started_failure(failure: Option<UiRoutineFailure>) -> UiRoutineFailure {
+    failure.unwrap_or_else(|| {
+        UiRoutineFailure::new(
+            InputCertainty::Cancelled,
+            "ui_task_start",
+            "UI 任务在开始前已取消，内层例程没有执行",
+        )
+    })
+}
+
+struct ProcessSecondaryUnreadTask {
+    request: ProcessSecondaryUnread,
+    ocr: OcrRuntimeHandle,
+    chat_timeline: ChatTimeline,
+    config: SecondaryUnreadRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for ProcessSecondaryUnreadTask {}
+
+impl UiRoutine for ProcessSecondaryUnreadTask {
+    type Output = ProcessSecondaryUnreadOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let outcome = UiTask::new(
+            process_secondary_unread_task_spec(),
+            ProcessSecondaryUnreadRoutine {
+                request: self.request,
+                ocr: self.ocr,
+                chat_timeline: self.chat_timeline,
+                config: self.config,
+            },
+        )
+        .execute(context);
+        match outcome.output {
+            Some(output) => output,
+            None => {
+                let failure = task_not_started_failure(outcome.entry_failure);
+                ProcessSecondaryUnreadOutcome {
+                    effect: SecondaryUnreadEffect::Failed(failure.clone()),
+                    residency: UiResidencyOutcome::Failed(failure),
+                }
+            }
+        }
     }
 }
 
@@ -786,5 +848,19 @@ mod tests {
 
         assert!(same_unread_hit(&first, &close));
         assert!(!same_unread_hit(&first, &moved));
+    }
+
+    /// P1 迁移批次 3：未读任务的价值基线是“当前大厅二级”，
+    /// 收尾固定在这里且只由例程内部那一次 restore 完成（包装器 Passthrough 不重复）。
+    #[test]
+    fn secondary_unread_task_spec_is_fixed_to_current_hall() {
+        let spec = process_secondary_unread_task_spec();
+        assert_eq!(spec.entry, EntryPolicy::Passthrough);
+        assert_eq!(
+            spec.finish,
+            FinishPolicy::ScriptDeclared,
+            "Fixed(SecondaryCurrentHall) 由例程内部 restore_residency 完成；包装器不得二次收尾"
+        );
+        assert_eq!(spec.target, UiResidencyTarget::SecondaryCurrentHall);
     }
 }

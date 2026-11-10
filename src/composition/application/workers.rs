@@ -727,7 +727,7 @@ impl DeferredChatSender {
                     };
                     drop(sending);
 
-                    let ChatBatchSendOutcome { sent, status } = outcome;
+                    let ChatBatchSendOutcome { sent, status, .. } = outcome;
                     let all_sent = match batch.mark_sent(sent) {
                         Ok(all_sent) => all_sent,
                         Err(error) => {

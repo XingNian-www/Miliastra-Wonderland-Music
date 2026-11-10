@@ -1,12 +1,14 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use enigo::Key;
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
-    capture_normalized, current_ui_is_primary, open_friend_conversation, restore_residency,
-    send_current_chat_message, wait_ms,
+    capture_normalized, current_ui_is_primary, open_friend_conversation, send_current_chat_message,
+    wait_ms,
 };
+use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskOutcome, UiTaskSpec};
 #[cfg(test)]
 use crate::config::AppConfig;
 use crate::geometry::Rect;
@@ -28,6 +30,9 @@ pub(crate) struct ExecuteInvite {
     recipients: Vec<String>,
     password: Option<String>,
     notification: String,
+    /// 兼容旧调用方保留：**不再作为收尾目标**。邀请进入新大厅后旧入口已不存在，
+    /// 统一由 `UiTask` 的 `Fixed(Primary)` 收尾（见 design §5）。
+    #[allow(dead_code)]
     residency: UiResidencyTarget,
 }
 
@@ -65,6 +70,8 @@ pub(crate) enum InviteNotificationOutcome {
 pub(crate) struct ExecuteInviteOutcome {
     effect: InviteEffect,
     notification: InviteNotificationOutcome,
+    /// 通知失败后为了重试发送而重新打开好友会话的次数（最多 1 次）。
+    notification_reopens: u32,
     failure: Option<UiRoutineFailure>,
     residency: UiResidencyOutcome,
 }
@@ -84,6 +91,10 @@ impl ExecuteInviteOutcome {
 
     pub(crate) fn residency(&self) -> &UiResidencyOutcome {
         &self.residency
+    }
+
+    pub(crate) fn notification_reopens(&self) -> u32 {
+        self.notification_reopens
     }
 }
 
@@ -224,6 +235,65 @@ impl UiRoutine for ExecuteInviteRoutine {
     type Output = ExecuteInviteOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        // 邀请进的是**新大厅**：入口不再存在，收尾固定 Primary，不回旧界面。
+        // 入口不做观测/导航（`Passthrough`），避免与内部“打开好友会话”叠加导航。
+        let spec = invite_task_spec(&self.config);
+        let inner = InviteInner {
+            request: self.request,
+            ocr: self.ocr,
+            config: self.config,
+        };
+        let outcome: UiTaskOutcome<InviteExecution> =
+            UiRoutine::execute(UiTask::new(spec, inner), context);
+        let execution = outcome.output.unwrap_or_else(|| InviteExecution {
+            effect: InviteEffect::NotAttempted,
+            notification: InviteNotificationOutcome::NotAttempted,
+            notification_reopens: 0,
+            failure: outcome.entry_failure.clone(),
+        });
+        ExecuteInviteOutcome {
+            effect: execution.effect,
+            notification: execution.notification,
+            notification_reopens: execution.notification_reopens,
+            failure: execution.failure,
+            residency: outcome.residency,
+        }
+    }
+}
+
+/// 邀请任务的总预算：内部按钮/完成等待 + 收尾预留（一次 Primary 稳定观察）。
+fn invite_task_spec(config: &InviteRoutineConfig) -> UiTaskSpec {
+    let total_ms = config
+        .button_timeout_ms
+        .saturating_add(config.completion_timeout_ms)
+        .saturating_add(config.completion_timeout_ms.max(2_000));
+    UiTaskSpec::new(
+        UiResidencyTarget::Primary,
+        FinishPolicy::Fixed(UiResidencyTarget::Primary),
+    )
+    .with_entry(EntryPolicy::Passthrough)
+    .with_total_budget(Duration::from_millis(total_ms))
+}
+
+struct InviteExecution {
+    effect: InviteEffect,
+    notification: InviteNotificationOutcome,
+    notification_reopens: u32,
+    failure: Option<UiRoutineFailure>,
+}
+
+struct InviteInner {
+    request: ExecuteInvite,
+    ocr: OcrRuntimeHandle,
+    config: InviteRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for InviteInner {}
+
+impl UiRoutine for InviteInner {
+    type Output = InviteExecution;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         execute_invite(context, self.request, &self.ocr, &self.config)
     }
 }
@@ -233,9 +303,10 @@ fn execute_invite(
     request: ExecuteInvite,
     ocr: &OcrRuntimeHandle,
     config: &InviteRoutineConfig,
-) -> ExecuteInviteOutcome {
+) -> InviteExecution {
     let mut effect = InviteEffect::NotAttempted;
     let mut notification = InviteNotificationOutcome::NotAttempted;
+    let mut notification_reopens = 0_u32;
     let mut failure = None;
 
     if let Err(error) = open_friend_conversation(context, ocr, &config.friend, &request.recipients)
@@ -261,11 +332,14 @@ fn execute_invite(
                 }
             };
 
-        if notification_failed
-            && let Err(error) =
+        if notification_failed {
+            // 通知没发出去时只允许**一次**重开会话；显式计数便于测试与日志定位。
+            notification_reopens = notification_reopens.saturating_add(1);
+            if let Err(error) =
                 open_friend_conversation(context, ocr, &config.friend, &request.recipients)
-        {
-            failure = Some(error);
+            {
+                failure = Some(error);
+            }
         }
         if failure.is_none()
             && let Err(error) =
@@ -280,15 +354,12 @@ fn execute_invite(
         }
     }
 
-    let residency = match restore_residency(context, ocr, &config.friend, request.residency) {
-        Ok(()) => UiResidencyOutcome::Confirmed(request.residency),
-        Err(error) => UiResidencyOutcome::Failed(error),
-    };
-    ExecuteInviteOutcome {
+    // 收尾交给外层 `UiTask`（Fixed Primary）；这里不再恢复旧入口。
+    InviteExecution {
         effect,
         notification,
+        notification_reopens,
         failure,
-        residency,
     }
 }
 
@@ -582,6 +653,8 @@ mod tests {
         view_star: (i32, i32),
         goto_hall: (i32, i32),
         enter_hall: (i32, i32),
+        /// 注入粘贴失败：用于覆盖“通知发送失败 → 重开会话一次”的兜底分支。
+        fail_paste: bool,
     }
 
     impl UiDevice for InviteDevice {
@@ -620,6 +693,9 @@ mod tests {
         }
 
         fn paste_text(&mut self, text: &str, _clipboard_hold_ms: u64) -> Result<()> {
+            if self.fail_paste {
+                bail!("injected paste failure");
+            }
             self.state.lock().unwrap().pasted.push(text.to_string());
             Ok(())
         }
@@ -692,6 +768,7 @@ mod tests {
                 view_star,
                 goto_hall,
                 enter_hall,
+                fail_paste: false,
             },
             2,
             TemplateUiStateClassifier::new(
@@ -721,7 +798,8 @@ mod tests {
                 vec!["甲".to_string()],
                 None,
                 "已同意加入大厅",
-                UiResidencyTarget::Primary,
+                // 旧入口声明为二级当前大厅：新实现必须忽略它、收尾到 Primary。
+                UiResidencyTarget::SecondaryCurrentHall,
             ))
             .unwrap()
             .wait()
@@ -733,10 +811,19 @@ mod tests {
             "unexpected invite outcome: {outcome:?}"
         );
         assert_eq!(outcome.notification(), &InviteNotificationOutcome::Sent);
-        assert!(matches!(
-            outcome.residency(),
-            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
-        ));
+        assert_eq!(
+            outcome.notification_reopens(),
+            0,
+            "通知成功时不允许重开好友会话"
+        );
+        assert!(
+            matches!(
+                outcome.residency(),
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+            ),
+            "邀请进新大厅后必须收尾到 Primary，不回旧大厅：{:?}",
+            outcome.residency()
+        );
         let state = state.lock().unwrap();
         assert_eq!(state.pasted, ["已同意加入大厅"]);
         assert_eq!(
@@ -750,6 +837,113 @@ mod tests {
             ]
         );
 
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn failed_notification_reopens_the_friend_conversation_at_most_once() {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.open_chat_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.input.text_ms = 0;
+        config.timing.input.send_ms = 0;
+        config.timing.invite.step_ms = 0;
+        config.timing.workflow.default_timeout_ms = 2_000;
+        config.timing.workflow.default_poll_ms = 20;
+        config.timing.command.ui_timeout_ms = 2_000;
+        // 注入粘贴失败：通知必然发送失败，触发“重开会话再邀请”的兜底分支。
+        let state = Arc::new(Mutex::new(InviteTestState {
+            phase: InvitePhase::Hall,
+            pasted: Vec::new(),
+            clicks: Vec::new(),
+        }));
+        let (frames, friend_avatar, view_star, goto_hall, enter_hall) = invite_frames(&config);
+        let friend_list = config.invite.friend_list_region;
+        let title = SECONDARY_TITLE_RECT;
+        let ui_runtime = UiRuntime::start_with_state_classifier(
+            InviteDevice {
+                state: state.clone(),
+                frames,
+                friend_row: (friend_list.x + 45, friend_list.y + 85),
+                friend_avatar,
+                view_star,
+                goto_hall,
+                enter_hall,
+                fail_paste: true,
+            },
+            2,
+            TemplateUiStateClassifier::new(
+                UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+                config.screen.clone(),
+            ),
+            config.resolve_stability_count(0),
+        )
+        .unwrap();
+        let ocr_runtime = OcrRuntime::start(
+            InviteOcrDevice {
+                state: state.clone(),
+                friend_list_size: (friend_list.width, friend_list.height),
+                title_size: (title.width, title.height),
+            },
+            4,
+        )
+        .unwrap();
+        let invite_ui = InviteUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            InviteRoutineConfig::from_app(&config),
+        );
+
+        let outcome = invite_ui
+            .submit(ExecuteInvite::new(
+                vec!["甲".to_string()],
+                None,
+                "已同意加入大厅",
+                UiResidencyTarget::SecondaryCurrentHall,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(
+            matches!(outcome.notification(), InviteNotificationOutcome::Failed(_)),
+            "关闭发送后通知必须失败：{:?}",
+            outcome.notification()
+        );
+        assert_eq!(
+            outcome.notification_reopens(),
+            1,
+            "通知失败只允许重开会话一次"
+        );
+        assert_eq!(
+            outcome.effect(),
+            InviteEffect::Entered,
+            "重开会话后仍应完成邀请进入：{outcome:?}"
+        );
+        assert!(
+            matches!(
+                outcome.residency(),
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+            ),
+            "即使通知失败，成功后也应收尾 Primary 而不是旧大厅：{:?}",
+            outcome.residency()
+        );
+        let state = state.lock().unwrap();
+        assert!(state.pasted.is_empty(), "发送关闭时不应粘贴任何文本");
+        let friend_clicks = state
+            .clicks
+            .iter()
+            .filter(|click| click.to_string() == "friend")
+            .count();
+        assert!(
+            (1..=2).contains(&friend_clicks),
+            "一次初始打开 + 至多一次重开，clicks={:?}",
+            state.clicks
+        );
+
+        drop(state);
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }

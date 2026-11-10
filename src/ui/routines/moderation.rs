@@ -7,11 +7,11 @@ use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
     before_input_failure, capture_normalized, wait_ms,
 };
-use super::state_observation::wait_for_stable_ui_kind;
+use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskOutcome, UiTaskSpec};
 use crate::geometry::{Point, Rect};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
-    UiStateKind, UiStateObservation, UiSubmitError, sealed,
+    UiStateObservation, UiSubmitError, sealed,
 };
 use crate::ui::template::{best_template_hit, template_exists};
 
@@ -171,12 +171,60 @@ impl UiRoutine for ExecuteModerationRoutine {
     type Output = ExecuteModerationOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let effect = match execute_moderation(context, &self.request, &self.config) {
+        // 统一事务：入口必须是稳定 Primary（RequireTarget：不满足时零按键拒绝），
+        // 收尾由 settle_to 吸收，面板/弹窗的有界 Esc 不再由例程自己 recover。
+        let inner = ModerationInner {
+            request: self.request,
+            config: self.config,
+        };
+        let outcome: UiTaskOutcome<ModerationEffect> =
+            UiRoutine::execute(UiTask::new(moderation_task_spec(), inner), context);
+        let effect = outcome.output.unwrap_or_else(|| {
+            ModerationEffect::Failed(outcome.entry_failure.clone().unwrap_or_else(|| {
+                UiRoutineFailure::new(
+                    InputCertainty::BeforeInput,
+                    "ui_task_entry",
+                    "管理任务未开始执行",
+                )
+            }))
+        });
+        ExecuteModerationOutcome {
+            effect,
+            residency: outcome.residency,
+        }
+    }
+}
+
+/// 管理任务事务声明：
+/// - 目标 Primary；收尾回入口（入口本来就强制 Primary，因此是恒等收尾，面板由 settle_to 有界 Esc 关闭）；
+/// - `RequireTarget` 保证“入口必须稳定 Primary”：Secondary/Unknown 等直接 BeforeInput 拒绝，零按键；
+/// - 总预算覆盖搜索/确认/收尾（收尾预留一个 `ui_timeout`）。
+fn moderation_task_spec() -> UiTaskSpec {
+    UiTaskSpec::new(
+        UiResidencyTarget::Primary,
+        FinishPolicy::RestoreEntry {
+            fallback: UiResidencyTarget::Primary,
+        },
+    )
+    .with_entry(EntryPolicy::RequireTarget)
+    .with_total_budget(Duration::from_secs(60))
+}
+
+struct ModerationInner {
+    request: ExecuteModeration,
+    config: ModerationRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for ModerationInner {}
+
+impl UiRoutine for ModerationInner {
+    type Output = ModerationEffect;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        match execute_moderation(context, &self.request, &self.config) {
             Ok(()) => ModerationEffect::Applied,
             Err(failure) => ModerationEffect::Failed(failure),
-        };
-        let residency = recover_primary(context, &self.config);
-        ExecuteModerationOutcome { effect, residency }
+        }
     }
 }
 
@@ -277,6 +325,8 @@ fn execute_moderation(
     confirm_template_absent(context, config)
 }
 
+/// 入口“必须是稳定 Primary”由 `UiTaskSpec::RequireTarget` 在事务层保证；
+/// 这里只做真实的输入准备（激活/前台），不再重复采样状态。
 fn normalize_primary(
     context: &mut UiRoutineContext<'_>,
     config: &ModerationRoutineConfig,
@@ -284,24 +334,7 @@ fn normalize_primary(
     context
         .device()
         .ensure_ready(config.residency.after_activate_ms)
-        .map_err(|error| before_input_failure("prepare_moderation", error))?;
-    let state = wait_for_stable_ui_kind(
-        context,
-        config.residency.state_observation(),
-        None,
-        config.ui_timeout_ms,
-        "observe_moderation_start",
-        InputCertainty::BeforeInput,
-    )?;
-    if state == UiStateKind::Primary {
-        Ok(())
-    } else {
-        Err(UiRoutineFailure::new(
-            InputCertainty::BeforeInput,
-            "normalize_moderation_start",
-            "moderation requires a stable primary UI",
-        ))
-    }
+        .map_err(|error| before_input_failure("prepare_moderation", error))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -405,91 +438,11 @@ fn confirm_template_absent(
     ))
 }
 
-fn recover_primary(
-    context: &mut UiRoutineContext<'_>,
-    config: &ModerationRoutineConfig,
-) -> UiResidencyOutcome {
-    let deadline = Instant::now() + Duration::from_millis(config.ui_timeout_ms);
-    let mut escape_count = 0_u32;
-    let mut panel_stability = PanelStability::default();
-    while Instant::now() < deadline {
-        let image = match capture_normalized(
-            context,
-            &config.residency,
-            "recover_moderation",
-            InputCertainty::AfterInputUnknown,
-        ) {
-            Ok(image) => image,
-            Err(failure) => return UiResidencyOutcome::Failed(failure),
-        };
-        let observation = match context.latest_ui_state() {
-            Some(observation) => observation,
-            None => {
-                return UiResidencyOutcome::Failed(UiRoutineFailure::new(
-                    InputCertainty::AfterInputUnknown,
-                    "recover_moderation",
-                    "UI runtime has no configured template state classifier",
-                ));
-            }
-        };
-        let stable_kind = match observation {
-            UiStateObservation::Classified(state) => state.stable_kind(),
-            UiStateObservation::Failed { reason, .. } => {
-                return UiResidencyOutcome::Failed(UiRoutineFailure::new(
-                    InputCertainty::AfterInputUnknown,
-                    "recover_moderation",
-                    format!("template UI state classification failed: {reason}"),
-                ));
-            }
-        };
-        if stable_kind == Some(UiStateKind::Primary) {
-            return UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary);
-        }
-        let panel_candidate = match recoverable_panel_candidate(&image, config) {
-            Ok(candidate) => candidate,
-            Err(failure) => return UiResidencyOutcome::Failed(failure),
-        };
-        let escape_authorized = stable_kind == Some(UiStateKind::Secondary)
-            || panel_stability.observe(panel_candidate, config.residency.stable_count);
-        if !escape_authorized {
-            if let Err(failure) = wait_ms(
-                context,
-                config.residency.poll_ms,
-                "recover_moderation",
-                InputCertainty::AfterInputUnknown,
-            ) {
-                return UiResidencyOutcome::Failed(failure);
-            }
-            continue;
-        }
-        if escape_count >= 6 {
-            break;
-        }
-        if let Err(error) = context.device().press_key(Key::Escape) {
-            return UiResidencyOutcome::Failed(UiRoutineFailure::new(
-                InputCertainty::AfterInputUnknown,
-                "recover_moderation",
-                format!("{error:#}"),
-            ));
-        }
-        escape_count += 1;
-        panel_stability = PanelStability::default();
-        if let Err(failure) = wait_ms(
-            context,
-            config.return_retry_ms,
-            "recover_moderation",
-            InputCertainty::AfterInputUnknown,
-        ) {
-            return UiResidencyOutcome::Failed(failure);
-        }
-    }
-    UiResidencyOutcome::Failed(UiRoutineFailure::new(
-        InputCertainty::AfterInputUnknown,
-        "recover_moderation",
-        "primary UI was not reached after bounded recovery",
-    ))
-}
-
+/// 面板有界 Esc 的稳定性判定。
+///
+/// 收尾恢复已统一到 `transaction::UiTask`（按稳定 kind 决定是否动作）；
+/// 这里保留判定与模板清单，供后续“会话级/面板级恢复”复用与单测，不在本任务删除。
+#[allow(dead_code)]
 #[derive(Default)]
 struct PanelStability {
     candidate: Option<usize>,
@@ -497,6 +450,7 @@ struct PanelStability {
 }
 
 impl PanelStability {
+    #[allow(dead_code)]
     fn observe(&mut self, candidate: Option<usize>, required_samples: u32) -> bool {
         let Some(candidate) = candidate else {
             self.candidate = None;
@@ -513,6 +467,8 @@ impl PanelStability {
     }
 }
 
+/// 面板模板清单：保留“哪些面板算可 Esc 恢复”的单一来源，后续会话级恢复复用。
+#[allow(dead_code)]
 fn recoverable_panel_candidate(
     image: &image::DynamicImage,
     config: &ModerationRoutineConfig,
@@ -539,7 +495,161 @@ fn recoverable_panel_candidate(
 
 #[cfg(test)]
 mod tests {
-    use super::PanelStability;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    use image::DynamicImage;
+
+    use super::*;
+    use crate::runtime::ui::{
+        UiDevice, UiRoutine, UiRoutineContext, UiRoutineFailure, UiStateClassification,
+        UiStateClassifier, UiStateEvidence, UiStateKind, execute_routine_for_test,
+        sealed::UiRoutineSealed,
+    };
+    use crate::ui::routines::transaction::{FinishPolicy, UiTask, UiTaskOutcome};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RecordedKey {
+        Capture,
+        Key(enigo::Key),
+    }
+
+    #[derive(Default)]
+    struct RecordingDevice {
+        actions: Arc<Mutex<Vec<RecordedKey>>>,
+    }
+
+    impl RecordingDevice {
+        fn keys(&self) -> Vec<enigo::Key> {
+            self.actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|action| match action {
+                    RecordedKey::Key(key) => Some(*key),
+                    RecordedKey::Capture => None,
+                })
+                .collect()
+        }
+    }
+
+    impl UiDevice for RecordingDevice {
+        fn capture(&mut self) -> anyhow::Result<DynamicImage> {
+            self.actions.lock().unwrap().push(RecordedKey::Capture);
+            Ok(DynamicImage::new_rgba8(16, 16))
+        }
+
+        fn press_key(&mut self, key: enigo::Key) -> anyhow::Result<()> {
+            self.actions.lock().unwrap().push(RecordedKey::Key(key));
+            Ok(())
+        }
+    }
+
+    struct ScriptedClassifier {
+        states: Vec<UiStateClassification>,
+        index: usize,
+    }
+
+    impl ScriptedClassifier {
+        fn new(states: Vec<UiStateClassification>) -> Self {
+            Self { states, index: 0 }
+        }
+    }
+
+    impl UiStateClassifier for ScriptedClassifier {
+        fn classify(
+            &mut self,
+            _image: &DynamicImage,
+        ) -> anyhow::Result<UiStateClassification> {
+            let index = self.index.min(self.states.len() - 1);
+            self.index += 1;
+            Ok(self.states[index].clone())
+        }
+    }
+
+    fn state(kind: UiStateKind) -> UiStateClassification {
+        UiStateClassification::with_evidence(
+            kind,
+            kind.label(),
+            UiStateEvidence::new(Vec::new(), None, kind.name()),
+        )
+    }
+
+    struct AppliedNoop;
+
+    impl UiRoutineSealed for AppliedNoop {}
+
+    impl UiRoutine for AppliedNoop {
+        type Output = ModerationEffect;
+
+        fn execute(self, _context: &mut UiRoutineContext<'_>) -> Self::Output {
+            ModerationEffect::Applied
+        }
+    }
+
+    fn run_task(
+        script: Vec<UiStateClassification>,
+    ) -> (UiTaskOutcome<ModerationEffect>, RecordingDevice) {
+        let spec = moderation_task_spec();
+        let execution = execute_routine_for_test(
+            RecordingDevice::default(),
+            Some(Box::new(ScriptedClassifier::new(script))),
+            2,
+            Arc::new(AtomicBool::new(false)),
+            UiTask::new(spec, AppliedNoop),
+        );
+        (execution.output, execution.device)
+    }
+
+    #[test]
+    fn panel_stack_uses_bounded_escape() {
+        // 面板一直关不掉时，只允许有界 Esc，不能无限按键（更不能把玩家会话当地板刷）。
+        let script = vec![state(UiStateKind::Primary), state(UiStateKind::Primary)]
+            .into_iter()
+            .chain(std::iter::repeat(state(UiStateKind::Panel)).take(20))
+            .collect();
+        let (outcome, device) = run_task(script);
+        assert!(device.keys().len() <= 2, "Esc 必须是有界的");
+        assert!(!outcome.finish.settled);
+        assert!(!device.keys().is_empty());
+    }
+
+    #[test]
+    fn entry_secondary_is_rejected_before_any_input() {
+        // 管理操作只允许从一级界面开始；二级（玩家会话）上必须零按键拒绝。
+        let script = vec![state(UiStateKind::Secondary); 4];
+        let (outcome, device) = run_task(script);
+        assert!(device.keys().is_empty(), "入口不满足时不允许按 Esc 退出玩家会话");
+        assert!(outcome.output.is_none());
+        let failure = outcome.entry_failure.as_ref().expect("entry failure");
+        assert_eq!(failure.certainty(), InputCertainty::BeforeInput);
+        assert!(outcome.safe_retry());
+    }
+
+    #[test]
+    fn entry_primary_with_panels_closed_returns_primary_without_extra_input() {
+        let script = vec![state(UiStateKind::Primary); 6];
+        let (outcome, device) = run_task(script);
+        assert!(device.keys().is_empty());
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn panel_closes_then_returns_primary() {
+        let mut script = vec![state(UiStateKind::Primary), state(UiStateKind::Primary)];
+        script.extend(vec![state(UiStateKind::Panel), state(UiStateKind::Panel)]);
+        script.extend(vec![state(UiStateKind::Primary), state(UiStateKind::Primary)]);
+        let (outcome, device) = run_task(script);
+        assert_eq!(device.keys(), vec![enigo::Key::Escape]);
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
 
     #[test]
     fn recoverable_panel_requires_consecutive_matching_samples_before_escape() {

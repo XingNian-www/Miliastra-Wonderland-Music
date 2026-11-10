@@ -30,6 +30,7 @@ use super::state_observation::{
     UiStateObservationConfig, UiStateSnapshot, capture_normalized_ui_state, observe_ui_state_once,
     wait_for_stable_ui_kind, wait_for_stable_ui_kind_or_unknown,
 };
+use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 
 const FRIEND_ROW_Y_TOLERANCE: i32 = 6;
 const MAX_FRIEND_LIST_DRAGS: usize = 2;
@@ -173,6 +174,9 @@ pub(crate) enum UiResidencyOutcome {
 pub(crate) struct SendFriendDeliveriesOutcome {
     deliveries: Vec<FriendDeliveryOutcome>,
     residency: UiResidencyOutcome,
+    /// 会话级恢复能力边界：入口是某个二级会话、收尾只回到“二级界面类型”时置真。
+    /// 当前包装器没有会话锚点，无法保证回到入口那个具体会话。
+    session_restore_degraded: bool,
 }
 
 impl SendFriendDeliveriesOutcome {
@@ -182,6 +186,11 @@ impl SendFriendDeliveriesOutcome {
 
     pub(crate) fn residency(&self) -> &UiResidencyOutcome {
         &self.residency
+    }
+
+    /// 是否发生了“只回到二级类型、未回到入口具体会话”的降级。
+    pub(crate) fn session_restore_degraded(&self) -> bool {
+        self.session_restore_degraded
     }
 
     pub(crate) fn is_complete(&self) -> bool {
@@ -310,14 +319,52 @@ impl UiRoutine for EstablishResidencyRoutine {
     type Output = UiResidencyOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let target = self.request.target;
+        // 它本身就是恢复器：包装器不导航、不重复收尾（AssumeTarget + KeepCurrent）。
+        let spec = UiTaskSpec::new(target, FinishPolicy::KeepCurrent)
+            .with_entry(EntryPolicy::AssumeTarget);
+        let task = UiTask::new(
+            spec,
+            EstablishResidencyExecution {
+                target,
+                ocr: self.ocr,
+                config: self.config,
+            },
+        );
+        let outcome = task.execute(context);
+        match outcome.output {
+            Some(Ok(())) => UiResidencyOutcome::Confirmed(target),
+            Some(Err(failure)) => UiResidencyOutcome::Failed(failure),
+            None => UiResidencyOutcome::Failed(outcome.entry_failure.clone().unwrap_or_else(|| {
+                UiRoutineFailure::new(
+                    InputCertainty::BeforeInput,
+                    "prepare_residency",
+                    "驻留恢复任务没有开始",
+                )
+            })),
+        }
+    }
+}
+
+/// 驻留恢复内层：保留原有恢复算法（它本身就是恢复器，不应被包装器再导航）。
+struct EstablishResidencyExecution {
+    target: UiResidencyTarget,
+    ocr: OcrRuntimeHandle,
+    config: FriendDeliveryRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for EstablishResidencyExecution {}
+
+impl UiRoutine for EstablishResidencyExecution {
+    type Output = std::result::Result<(), UiRoutineFailure>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         context.publish_progress(UiRoutineProgressStage::NormalizingStart);
-        if let Err(error) = context.device().ensure_ready(self.config.after_activate_ms) {
-            return UiResidencyOutcome::Failed(before_input_failure("prepare_residency", error));
-        }
-        match restore_residency(context, &self.ocr, &self.config, self.request.target) {
-            Ok(()) => UiResidencyOutcome::Confirmed(self.request.target),
-            Err(failure) => UiResidencyOutcome::Failed(failure),
-        }
+        context
+            .device()
+            .ensure_ready(self.config.after_activate_ms)
+            .map_err(|error| before_input_failure("prepare_residency", error))?;
+        restore_residency(context, &self.ocr, &self.config, self.target)
     }
 }
 
@@ -402,31 +449,61 @@ impl UiRoutine for CapturePrimaryAndRestoreRoutine {
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let config = self.config;
-        capture_primary_and_restore_with(context, &self.ocr, &config, |context, navigated| {
-            let certainty = if navigated {
-                InputCertainty::AfterInputUnknown
-            } else {
-                InputCertainty::BeforeInput
-            };
-            capture_normalized(context, &config, "capture_primary_frame", certainty)
-        })
+        capture_primary_and_restore_with(context, &self.ocr, &config, capture_primary_frame)
+    }
+}
+
+/// 生产截图注入点；与测试注入保持同一函数签名。
+fn capture_primary_frame(
+    context: &mut UiRoutineContext<'_>,
+    config: &FriendDeliveryRoutineConfig,
+    navigated: bool,
+) -> std::result::Result<DynamicImage, UiRoutineFailure> {
+    let certainty = if navigated {
+        InputCertainty::AfterInputUnknown
+    } else {
+        InputCertainty::BeforeInput
+    };
+    capture_normalized(context, config, "capture_primary_frame", certainty)
+}
+
+/// 截图内层：只抓一帧，导航与收尾都交给 [`UiTask`]。
+struct CapturePrimaryFrameTask {
+    config: FriendDeliveryRoutineConfig,
+    navigated: bool,
+    capture: fn(
+        &mut UiRoutineContext<'_>,
+        &FriendDeliveryRoutineConfig,
+        bool,
+    ) -> std::result::Result<DynamicImage, UiRoutineFailure>,
+}
+
+impl sealed::UiRoutineSealed for CapturePrimaryFrameTask {}
+
+impl UiRoutine for CapturePrimaryFrameTask {
+    type Output = std::result::Result<DynamicImage, UiRoutineFailure>;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        (self.capture)(context, &self.config, self.navigated)
     }
 }
 
 /// `CapturePrimaryAndRestoreRoutine` 的可测试主体；`capture` 是截图注入点，
-/// 生产走 `capture_normalized`，测试用它验证「截图失败也必须返回驻守界面」。
-fn capture_primary_and_restore_with<C>(
+/// 生产走 [`capture_primary_frame`]，测试用它验证「截图失败也必须返回驻守界面」。
+///
+/// 迁移（task-94）：导航与收尾改由 [`UiTask`] 统一负责，本函数只保留
+/// **安全前置**（非一级/二级一律零输入失败）与结果整形，不再自己
+/// `restore_primary` / `restore_secondary_hall` 两段导航。
+fn capture_primary_and_restore_with(
     context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
+    _ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
-    capture: C,
-) -> CapturedPrimaryOutcome
-where
-    C: FnOnce(
+    capture: fn(
         &mut UiRoutineContext<'_>,
+        &FriendDeliveryRoutineConfig,
         bool,
     ) -> std::result::Result<DynamicImage, UiRoutineFailure>,
-{
+) -> CapturedPrimaryOutcome {
     context.publish_progress(UiRoutineProgressStage::NormalizingStart);
     if let Err(error) = context.device().ensure_ready(config.after_activate_ms) {
         let failure = before_input_failure("prepare_capture_primary", error);
@@ -436,15 +513,14 @@ where
             navigated: false,
         };
     }
-    let current = match wait_for_stable_ui_kind_or_unknown(
+    // 安全前置（事故后保留）：只允许一级/二级入口，其余状态一律不发送导航输入。
+    let entry = match observe_ui_state_once(
         context,
         config.state_observation(),
-        None,
-        config.timeout_ms,
         "observe_capture_residency",
         InputCertainty::BeforeInput,
     ) {
-        Ok(kind) => kind,
+        Ok(snapshot) => snapshot,
         Err(failure) => {
             return CapturedPrimaryOutcome::Failed {
                 residency: UiResidencyOutcome::Failed(failure.clone()),
@@ -453,28 +529,14 @@ where
             };
         }
     };
-    if current == UiStateKind::Primary {
-        return match capture(context, false) {
-            Ok(image) => CapturedPrimaryOutcome::Captured {
-                image,
-                navigated: false,
-                residency: UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
-            },
-            Err(failure) => CapturedPrimaryOutcome::Failed {
-                residency: UiResidencyOutcome::Failed(failure.clone()),
-                failure,
-                navigated: false,
-            },
-        };
-    }
-    if !capture_navigation_is_allowed(current) {
+    if !capture_navigation_is_allowed(entry.kind) && entry.kind != UiStateKind::Primary {
         let failure = UiRoutineFailure::new(
             InputCertainty::BeforeInput,
             "observe_capture_residency",
             format!(
                 "一级截图只支持一级或二级聊天界面；当前为{}（{}），不发送任何导航输入",
-                current.label(),
-                current.name()
+                entry.kind.label(),
+                entry.kind.name()
             ),
         );
         return CapturedPrimaryOutcome::Failed {
@@ -483,26 +545,48 @@ where
             navigated: false,
         };
     }
-    // 二级聊天：先导航到一级并确认，再截图。导航失败也继续走返回驻守。
-    let navigation = restore_primary(context, config);
-    let capture_result = match &navigation {
-        Ok(()) => capture(context, true),
-        Err(failure) => Err(failure.clone()),
+    let navigated = entry.kind == UiStateKind::Secondary;
+    // 目标一级；收尾回到入口（入口二级回二级，入口一级回一级；入口不可重建时退二级）。
+    let spec = UiTaskSpec::new(
+        UiResidencyTarget::Primary,
+        FinishPolicy::RestoreEntry {
+            fallback: UiResidencyTarget::SecondaryCurrentHall,
+        },
+    );
+    let task = CapturePrimaryFrameTask {
+        config: config.clone(),
+        navigated,
+        capture,
     };
-    context.publish_progress(UiRoutineProgressStage::RecoveringResidency);
-    let residency = match restore_secondary_hall(context, ocr, config) {
-        Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
-        Err(failure) => UiResidencyOutcome::Failed(failure),
-    };
-    match capture_result {
-        Ok(image) => CapturedPrimaryOutcome::Captured {
+    let outcome = UiTask::new(spec, task).execute(context);
+    let mut residency = outcome.residency.clone();
+    // 入口是二级会话时，包装器只保证回到"二级类型"；按固定 fallback 回到当前大厅
+    // （确定性、不点好友行），与旧 restore_secondary_hall 语义一致。
+    if navigated && matches!(residency, UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)) {
+        if let Err(failure) = restore_secondary_hall(context, _ocr, config) {
+            residency = UiResidencyOutcome::Failed(failure);
+        }
+    }
+    match outcome.output {
+        Some(Ok(image)) => CapturedPrimaryOutcome::Captured {
             image,
-            navigated: true,
+            navigated,
             residency,
         },
-        Err(failure) => CapturedPrimaryOutcome::Failed {
+        Some(Err(failure)) => CapturedPrimaryOutcome::Failed {
             failure,
-            navigated: true,
+            navigated,
+            residency,
+        },
+        None => CapturedPrimaryOutcome::Failed {
+            failure: outcome.entry_failure.clone().unwrap_or_else(|| {
+                UiRoutineFailure::new(
+                    InputCertainty::AfterInputUnknown,
+                    "capture_primary_frame",
+                    "截图任务没有开始：入口观测或导航失败",
+                )
+            }),
+            navigated,
             residency,
         },
     }
@@ -610,6 +694,103 @@ impl sealed::UiRoutineSealed for SendHallBatchRoutine {}
 
 impl UiRoutine for SendHallBatchRoutine {
     type Output = SendHallBatchOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let request = self.request;
+        let ready_gated = request.ready.is_some();
+        let spec = hall_batch_task_spec(&request);
+        let task = UiTask::new(
+            spec,
+            HallBatchExecution {
+                request,
+                ocr: self.ocr,
+                config: self.config,
+            },
+        );
+        let outcome = task.execute(context);
+
+        let (sent, status, primary_chat_opened) = match outcome.output.as_ref() {
+            Some(inner) => (
+                inner.sent,
+                inner.status.clone(),
+                inner.primary_chat_opened,
+            ),
+            None => {
+                let failure = outcome.entry_failure.clone().unwrap_or_else(|| {
+                    UiRoutineFailure::new(
+                        InputCertainty::BeforeInput,
+                        "execute_hall_batch",
+                        "大厅批量发送没有开始：入口观测或导航失败",
+                    )
+                });
+                (0, HallBatchStatus::Failed(failure), false)
+            }
+        };
+        if primary_chat_opened {
+            // 业务状态保留：本次发送曾主动从一级大厅打开聊天。
+            log::debug!("大厅批量发送曾在打开聊天后发送（primary_chat_opened=true）");
+        }
+        // 就绪闸门取消/失败时不再发输入，驻留结论就是闸门失败本身（旧语义）。
+        let residency = if ready_gated && matches!(status, HallBatchStatus::Failed(_)) {
+            match &status {
+                HallBatchStatus::Failed(failure) => UiResidencyOutcome::Failed(failure.clone()),
+                HallBatchStatus::Complete => unreachable!(),
+            }
+        } else {
+            outcome.residency.clone()
+        };
+        SendHallBatchOutcome {
+            sent,
+            status,
+            residency,
+        }
+    }
+}
+
+/// 大厅批量发送的事务声明。
+///
+/// - 普通发送：发送发生在二级聊天，包装器负责入口→二级的一次导航，
+///   收尾回到入口（入口不可重建时退逻辑驻留）——不再自做
+///   `finish_hall_batch_residency` 的 "Esc + restore_residency" 双重恢复。
+/// - 邀请就绪（ready 闸门）：闸门与一级稳定确认必须先于任何导航，
+///   所以用 `AssumeTarget` 让包装器不导航，由内层按邀请流程准备发送位置；
+///   收尾仍交给包装器，取消时零输入。
+fn hall_batch_task_spec(request: &SendHallBatch) -> UiTaskSpec {
+    if request.ready.is_some() {
+        UiTaskSpec::new(
+            request.residency,
+            FinishPolicy::RestoreEntry {
+                fallback: request.residency,
+            },
+        )
+        .with_entry(EntryPolicy::AssumeTarget)
+    } else {
+        UiTaskSpec::new(
+            UiResidencyTarget::SecondaryCurrentHall,
+            FinishPolicy::RestoreEntry {
+                fallback: request.residency,
+            },
+        )
+    }
+}
+
+struct HallBatchExecution {
+    request: SendHallBatch,
+    ocr: OcrRuntimeHandle,
+    config: FriendDeliveryRoutineConfig,
+}
+
+struct HallBatchInner {
+    sent: usize,
+    status: HallBatchStatus,
+    /// 本次是否主动从一级大厅打开了聊天（业务状态；收尾由包装器负责）。
+    primary_chat_opened: bool,
+}
+
+impl sealed::UiRoutineSealed for HallBatchExecution {}
+
+impl UiRoutine for HallBatchExecution {
+    type Output = HallBatchInner;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         execute_hall_batch(context, self.request, &self.ocr, &self.config)
@@ -757,6 +938,11 @@ impl FriendDeliveryRoutineConfig {
     }
 }
 
+/// 逻辑驻留是否为"当前大厅二级"（决定会话降级时是否回到大厅）。
+fn target_wants_current_hall(request: &SendFriendDeliveries) -> bool {
+    request.residency == UiResidencyTarget::SecondaryCurrentHall
+}
+
 struct SendFriendDeliveriesRoutine {
     request: SendFriendDeliveries,
     ocr: OcrRuntimeHandle,
@@ -769,7 +955,100 @@ impl UiRoutine for SendFriendDeliveriesRoutine {
     type Output = SendFriendDeliveriesOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        execute_friend_deliveries(context, self.request, &self.ocr, &self.config)
+        let request = self.request;
+        let request_for_failure = request.clone();
+        let ocr = self.ocr.clone();
+        let config = self.config.clone();
+        // 好友投递在二级聊天里完成；收尾回到入口（入口不可重建时退逻辑驻留）。
+        let spec = UiTaskSpec::new(
+            UiResidencyTarget::SecondaryCurrentHall,
+            FinishPolicy::RestoreEntry {
+                fallback: request.residency,
+            },
+        );
+        let task = UiTask::new(
+            spec,
+            FriendDeliveriesExecution {
+                request,
+                ocr: self.ocr,
+                config: self.config,
+            },
+        );
+        let outcome = task.execute(context);
+
+        let entry_was_secondary = outcome
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.kind == UiStateKind::Secondary);
+        let residency = outcome.residency.clone();
+        let deliveries = match outcome.output {
+            Some(inner) => inner.outcomes,
+            None => {
+                // 入口观测/导航失败：沿用旧语义，把失败记在第一个收件人上。
+                let mut outcomes = request_for_failure
+                    .deliveries
+                    .iter()
+                    .map(|delivery| FriendDeliveryOutcome {
+                        message_statuses: vec![
+                            FriendDeliveryMessageStatus::NotAttempted;
+                            delivery.messages.len()
+                        ],
+                        failure: None,
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(first) = outcomes.first_mut() {
+                    first.failure = outcome.entry_failure.clone();
+                }
+                outcomes
+            }
+        };
+        // 会话级恢复能力边界：包装器只保证 "在二级界面类型"，没有会话锚点。
+        // 入口是某个二级会话时，用**确定性的当前大厅**作为显式 fallback
+        // （不猜测、不点好友行），并标记 session_restore_degraded。
+        let mut residency = residency;
+        let session_restore_degraded = entry_was_secondary
+            && matches!(
+                residency,
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+            );
+        if session_restore_degraded {
+            log::warn!(
+                "好友投递收尾只回到二级聊天界面类型，未确认回到入口的具体会话（会话级恢复尚无锚点），按固定 fallback 回到当前大厅"
+            );
+            if target_wants_current_hall(&request_for_failure) {
+                if let Err(failure) = restore_secondary_hall(context, &ocr, &config) {
+                    residency = UiResidencyOutcome::Failed(failure);
+                }
+            }
+        }
+        SendFriendDeliveriesOutcome {
+            deliveries,
+            residency,
+            session_restore_degraded,
+        }
+    }
+}
+
+/// 好友投递内层：只在二级聊天内做业务（导航与收尾由 [`UiTask`] 负责）。
+struct FriendDeliveriesExecution {
+    request: SendFriendDeliveries,
+    ocr: OcrRuntimeHandle,
+    config: FriendDeliveryRoutineConfig,
+}
+
+struct FriendDeliveriesInner {
+    outcomes: Vec<FriendDeliveryOutcome>,
+}
+
+impl sealed::UiRoutineSealed for FriendDeliveriesExecution {}
+
+impl UiRoutine for FriendDeliveriesExecution {
+    type Output = FriendDeliveriesInner;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        FriendDeliveriesInner {
+            outcomes: execute_friend_deliveries(context, self.request, &self.ocr, &self.config),
+        }
     }
 }
 
@@ -797,7 +1076,7 @@ fn execute_friend_deliveries(
     request: SendFriendDeliveries,
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
-) -> SendFriendDeliveriesOutcome {
+) -> Vec<FriendDeliveryOutcome> {
     let recipient_count = request.deliveries.len();
     let mut outcomes = request
         .deliveries
@@ -899,14 +1178,8 @@ fn execute_friend_deliveries(
     }
 
     context.publish_progress(UiRoutineProgressStage::RecoveringResidency);
-    let residency = match restore_residency(context, ocr, config, request.residency) {
-        Ok(()) => UiResidencyOutcome::Confirmed(request.residency),
-        Err(failure) => UiResidencyOutcome::Failed(failure),
-    };
-    SendFriendDeliveriesOutcome {
-        deliveries: outcomes,
-        residency,
-    }
+    // 收尾（回到入口/逻辑驻留）由外层 `UiTask` 统一完成，内层不再第二次导航。
+    outcomes
 }
 
 fn execute_hall_batch(
@@ -914,7 +1187,7 @@ fn execute_hall_batch(
     request: SendHallBatch,
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
-) -> SendHallBatchOutcome {
+) -> HallBatchInner {
     let mut sent = 0_usize;
     let mut status = HallBatchStatus::Complete;
     let mut primary_chat_opened = false;
@@ -926,7 +1199,7 @@ fn execute_hall_batch(
         || request.messages.is_empty()
     {
         sent = request.messages.len();
-    } else if let Err(failure) = normalize_hall_batch_start(
+    } else if let Err(failure) = prepare_hall_batch_send_location(
         context,
         ocr,
         config,
@@ -963,32 +1236,17 @@ fn execute_hall_batch(
         }
     }
 
-    // 就绪闸门失败后不再按键恢复，避免取消后意外提交残留输入。
-    let residency = if request.ready.is_some() && matches!(&status, HallBatchStatus::Failed(_)) {
-        match &status {
-            HallBatchStatus::Failed(failure) => UiResidencyOutcome::Failed(failure.clone()),
-            HallBatchStatus::Complete => unreachable!(),
-        }
-    } else {
-        match finish_hall_batch_residency(
-            context,
-            ocr,
-            config,
-            request.residency,
-            primary_chat_opened,
-        ) {
-            Ok(()) => UiResidencyOutcome::Confirmed(request.residency),
-            Err(failure) => UiResidencyOutcome::Failed(failure),
-        }
-    };
-    SendHallBatchOutcome {
+    HallBatchInner {
         sent,
         status,
-        residency,
+        primary_chat_opened,
     }
 }
 
-fn normalize_hall_batch_start(
+/// 把界面准备到"可发送的二级聊天（当前大厅聊天）"。
+///
+/// 这是发送位置的会话级前置，不是任务收尾：收尾统一由包装器完成。
+fn prepare_hall_batch_send_location(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
@@ -1004,18 +1262,12 @@ fn normalize_hall_batch_start(
         .ensure_ready(config.after_activate_ms)
         .map_err(|error| before_input_failure("prepare_hall_batch", error))?;
     if let Some(gate) = ready {
+        // 邀请就绪：闸门与一级稳定必须先于导航（包装器已用 AssumeTarget 跳过导航）。
         check_invite_ready_running(gate)?;
         restore_primary(context, config)?;
         confirm_invite_primary_stability(context, config, gate)?;
-    }
-    match target {
-        UiResidencyTarget::Primary => {
-            if ready.is_none() {
-                restore_primary(context, config)?;
-            }
-            if let Some(gate) = ready {
-                check_invite_ready_running(gate)?;
-            }
+        if target == UiResidencyTarget::Primary {
+            check_invite_ready_running(gate)?;
             context
                 .device()
                 .press_key(Key::Return)
@@ -1027,41 +1279,11 @@ fn normalize_hall_batch_start(
                 "open_primary_chat",
                 InputCertainty::AfterInputUnknown,
             )?;
-            restore_secondary_hall(context, ocr, config)
         }
-        UiResidencyTarget::SecondaryCurrentHall => restore_secondary_hall(context, ocr, config),
     }
-}
-
-fn finish_hall_batch_residency(
-    context: &mut UiRoutineContext<'_>,
-    ocr: &OcrRuntimeHandle,
-    config: &FriendDeliveryRoutineConfig,
-    target: UiResidencyTarget,
-    primary_chat_opened: bool,
-) -> std::result::Result<(), UiRoutineFailure> {
-    if target == UiResidencyTarget::Primary && primary_chat_opened {
-        context
-            .device()
-            .press_key(Key::Escape)
-            .map_err(|error| after_input_failure("close_primary_chat", error))?;
-        wait_ms(
-            context,
-            config.click_ms,
-            "close_primary_chat",
-            InputCertainty::AfterInputUnknown,
-        )?;
-    }
-    // 结束时的驻留恢复**必须保留**。
-    //
-    // 一度以为可以省掉：AI 聊天路径 ready=None，VerifySecondary 三步都是空操作，
-    // 发送只做 Focus/Input/Submit，看起来不会离开二级大厅。
-    // 但线上日志证明界面**确实会漂**：
-    //   「二级值守当前不在二级聊天界面: primary:hall，保留逻辑模式并等待驻留恢复」
-    // 省掉它会让本函数直接返回 Ok(())，对外报 Confirmed(SecondaryCurrentHall)——
-    // 界面实际不在这里却宣称已确认，等于假确认。
-    // MUST_READ 明确要求 UI 租约与安全协作等待必须保留，这里退回原实现。
-    restore_residency(context, ocr, config, target)
+    // 发送位置固定为"二级聊天的当前大厅"：索引/点击大厅行是会话级动作，
+    // 包装器的 kind 级导航不替代它（设计 §4 会话锚点尚未实现）。
+    restore_secondary_hall(context, ocr, config)
 }
 
 fn retryable_certainty(certainty: InputCertainty) -> bool {
@@ -3640,6 +3862,7 @@ mod tests {
                 },
             ],
             residency: UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+            session_restore_degraded: false,
         };
 
         assert!(outcome.safe_retry_request(&request).is_none());
@@ -3666,6 +3889,7 @@ mod tests {
         state: usize,
         keys: Vec<Key>,
         clicks: Vec<(i32, i32)>,
+        pasted: Vec<String>,
         captures_in_state: Vec<usize>,
         captures_total: usize,
         first_escape_after: Option<usize>,
@@ -3722,6 +3946,16 @@ mod tests {
         }
 
         fn ensure_ready(&mut self, _after_activate_ms: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn click_point(&mut self, x: i32, y: i32) -> Result<()> {
+            self.shared.lock().unwrap().clicks.push((x, y));
+            Ok(())
+        }
+
+        fn paste_text(&mut self, text: &str, _clipboard_hold_ms: u64) -> Result<()> {
+            self.shared.lock().unwrap().pasted.push(text.to_string());
             Ok(())
         }
 
@@ -4065,6 +4299,248 @@ mod tests {
             "动作顺序必须是 Esc → Return"
         );
         ui_runtime.shutdown().unwrap();
+    }
+
+    // ---- task-94 迁移测试：发送/好友投递/截图统一走 UiTask ----
+
+    fn migration_config(config: &AppConfig) -> FriendDeliveryRoutineConfig {
+        let mut config = config.clone();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.open_chat_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.input.text_ms = 0;
+        config.timing.input.send_ms = 0;
+        config.timing.invite.step_ms = 0;
+        config.timing.workflow.default_timeout_ms = 5_000;
+        config.timing.workflow.default_poll_ms = 1;
+        FriendDeliveryRoutineConfig::from_app(&config)
+    }
+
+    /// 入口一级 → 发送 → 回到一级：只有“打开聊天一次 + 提交一次 + 收尾 Esc 一次”，
+    /// 不再出现旧 `finish_hall_batch_residency` 的二次恢复。
+    #[test]
+    fn hall_batch_from_primary_returns_to_primary_with_one_round_trip() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) = ScriptedStateDevice::new(vec![
+            primary_frame(&config),
+            secondary_hall_row_frame(&config),
+        ]);
+        let device = device
+            .on_key(0, Key::Return, 1)
+            .on_key(1, Key::Escape, 0);
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let hall_ui = HallBatchUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            migration_config(&config),
+        );
+
+        let outcome = hall_ui
+            .submit(SendHallBatch::new(
+                ["第一条"],
+                UiResidencyTarget::Primary,
+                0,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert_eq!(outcome.sent(), 1);
+        assert!(matches!(outcome.status(), HallBatchStatus::Complete));
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.keys.iter().filter(|key| **key == Key::Escape).count(),
+            1,
+            "收尾只允许一次 Esc，实际：{:?}",
+            state.keys
+        );
+        assert_eq!(state.pasted, ["第一条"]);
+    }
+
+    /// 入口二级 → 发送 → 回到二级当前大厅：不做任何多余导航。
+    #[test]
+    fn hall_batch_from_secondary_returns_to_current_hall_without_navigation() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) = ScriptedStateDevice::new(vec![secondary_hall_row_frame(&config)]);
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let hall_ui = HallBatchUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            migration_config(&config),
+        );
+
+        let outcome = hall_ui
+            .submit(SendHallBatch::new(
+                ["第一条"],
+                UiResidencyTarget::SecondaryCurrentHall,
+                0,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert_eq!(outcome.sent(), 1);
+        assert!(matches!(outcome.status(), HallBatchStatus::Complete));
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+        ));
+        let state = state.lock().unwrap();
+        assert_eq!(state.keys, [Key::Return].to_vec(), "只允许提交那一次 Return");
+        assert_eq!(state.pasted, ["第一条"]);
+    }
+
+    /// 消息全送达但收尾失败：发送结果仍是 Complete，驻留单独报 Failed。
+    #[test]
+    fn delivered_but_residency_failed_keeps_send_status_complete() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) = ScriptedStateDevice::new(vec![
+            primary_frame(&config),
+            secondary_hall_row_frame(&config),
+        ]);
+        // 只允许打开聊天，不允许 Esc 回去：收尾必然失败。
+        let device = device.on_key(0, Key::Return, 1);
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let hall_ui = HallBatchUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            migration_config(&config),
+        );
+
+        let outcome = hall_ui
+            .submit(SendHallBatch::new(
+                ["第一条", "第二条"],
+                UiResidencyTarget::Primary,
+                0,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert_eq!(outcome.sent(), 2, "两条都已送达，不能当未送达");
+        assert!(matches!(outcome.status(), HallBatchStatus::Complete));
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Failed(_)
+        ));
+        let state = state.lock().unwrap();
+        assert_eq!(state.pasted, ["第一条", "第二条"], "送达后不得重发");
+    }
+
+    /// 好友投递：入口是二级会话，收尾只能回到“二级类型”，必须显式标记会话级降级。
+    #[test]
+    fn friend_delivery_from_secondary_reports_session_restore_fallback() {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.open_chat_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.input.text_ms = 0;
+        config.timing.input.send_ms = 0;
+        config.timing.invite.step_ms = 0;
+        config.timing.workflow.default_timeout_ms = 5_000;
+        config.timing.workflow.default_poll_ms = 1;
+        let state = Arc::new(Mutex::new(TestUiState {
+            conversation: Conversation::Hall,
+            pasted: Vec::new(),
+            selected_friends: Vec::new(),
+            hall_clicks: 0,
+            scrolls: 0,
+            send_attempts: 0,
+            fail_send_attempt: None,
+        }));
+        let friend_list = config.invite.friend_list_region;
+        let title = SECONDARY_TITLE_RECT;
+        let frame = secondary_hall_row_frame(&config);
+        let hall_point = hall_row_click_point(&frame, &config);
+        let ui_runtime = start_test_ui_runtime(
+            RecordingDevice {
+                frame,
+                state: state.clone(),
+                // 避开大厅行（y=365）的高亮区域，确保确认走的是好友行。
+                friend_rows: vec![(friend_list.y + 165, "乙".to_string())],
+                hall_point,
+            },
+            &config,
+            4,
+        );
+        let ocr_runtime = OcrRuntime::start(
+            FriendOcrDevice {
+                state: state.clone(),
+                friend_list_size: (friend_list.width, friend_list.height),
+                title_size: (title.width, title.height),
+            },
+            4,
+        )
+        .unwrap();
+        let friend_ui = FriendDeliveryUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+
+        let outcome = friend_ui
+            .submit(SendFriendDeliveries::new(
+                vec![FriendDelivery::new("乙", ["报名成功"])],
+                UiResidencyTarget::SecondaryCurrentHall,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(
+            outcome.is_complete(),
+            "消息送达且仍在二级，应视为完成: {:?}",
+            (
+                outcome.deliveries()[0].message_statuses(),
+                outcome.deliveries()[0].failure(),
+                outcome.residency()
+            )
+        );
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+        ));
+        assert!(
+            outcome.session_restore_degraded(),
+            "入口是二级会话时，包装器无法确认回到同一会话，必须显式标记降级"
+        );
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    /// 截图例程的安全前置：入口 Unknown 时零按键失败（事故回放）。
+    #[test]
+    fn capture_from_unknown_entry_sends_no_input() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let (device, state) = ScriptedStateDevice::new(vec![unknown_frame(&config)]);
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+
+        let outcome = ui_runtime
+            .handle()
+            .submit(CapturePrimaryAndRestoreRoutine {
+                ocr: ocr_runtime.handle(),
+                config: migration_config(&config),
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(outcome.image().is_none());
+        assert_eq!(
+            outcome.failure().map(|failure| failure.stage()),
+            Some("observe_capture_residency")
+        );
+        assert!(state.lock().unwrap().keys.is_empty(), "Unknown 入口不允许任何按键");
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
     }
 
     // ---- 决策函数的纯单测：不依赖真实帧，覆盖无法用夹具触发的情况 ----
@@ -4671,6 +5147,11 @@ mod tests {
             Ok(())
         }
 
+        fn click_point(&mut self, x: i32, y: i32) -> Result<()> {
+            self.state.lock().unwrap().clicks.push((x, y));
+            Ok(())
+        }
+
         fn press_key(&mut self, key: Key) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             state.keys.push(key);
@@ -4680,11 +5161,6 @@ mod tests {
                 let next = state.secondary_after_return;
                 state.view = next;
             }
-            Ok(())
-        }
-
-        fn click_point(&mut self, x: i32, y: i32) -> Result<()> {
-            self.state.lock().unwrap().clicks.push((x, y));
             Ok(())
         }
 
@@ -4903,7 +5379,11 @@ mod tests {
 
         fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
             let config = self.config;
-            capture_primary_and_restore_with(context, &self.ocr, &config, |_context, navigated| {
+            capture_primary_and_restore_with(
+                context,
+                &self.ocr,
+                &config,
+                |_context, _config, navigated| {
                 Err(UiRoutineFailure::new(
                     if navigated {
                         InputCertainty::AfterInputUnknown

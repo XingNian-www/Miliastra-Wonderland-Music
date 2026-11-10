@@ -381,6 +381,13 @@ fn stage_label(stage: &'static str) -> &'static str {
         "capture_hall_info" => "采集大厅信息",
         "drag_hall_member_list" => "滚动大厅成员列表",
         "restore_hall_member_list" => "还原大厅成员列表",
+        // 一级截图 / 大厅任务（P1 迁移批次 2~3 新增步骤；
+        // capture_primary_frame 来自 task-61，execute_hall_batch/hall_task 来自
+        // task-94，ui_task_entry 来自 transaction 的 RequireTarget 入口检查）
+        "capture_primary_frame" => "抓取一级界面截图",
+        "execute_hall_batch" => "发送大厅批次",
+        "hall_task" => "执行大厅任务",
+        "ui_task_entry" => "检查任务入口界面",
         // 通用输入动作
         "click_point" => "点击界面",
         "press_key" => "按键",

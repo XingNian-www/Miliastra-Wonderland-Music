@@ -6,6 +6,7 @@ use super::friend_delivery::{
     before_input_failure, capture_normalized, wait_ms,
 };
 use super::state_observation::wait_for_stable_ui_kind;
+use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 use crate::adapters::game_path::resolve_game_executable;
 use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
 use crate::geometry::{Point, Rect, crop_canvas};
@@ -116,7 +117,7 @@ impl StartupUi {
         &self,
         request: EnterGame,
     ) -> Result<UiOperation<EnterGameOutcome>, UiSubmitError> {
-        self.runtime.submit(EnterGameRoutine {
+        self.runtime.submit(EnterGameTask {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
@@ -127,7 +128,7 @@ impl StartupUi {
         &self,
         request: EnterWonderland,
     ) -> Result<UiOperation<EnterWonderlandOutcome>, UiSubmitError> {
-        self.runtime.submit(EnterWonderlandRoutine {
+        self.runtime.submit(EnterWonderlandTask {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
@@ -283,6 +284,106 @@ impl UiRoutine for EnterWonderlandRoutine {
         EnterWonderlandOutcome {
             effect,
             residency: Some(residency),
+        }
+    }
+}
+
+/// 启动链任务的收尾策略：任务结束后没有“可回入口”可恢复，界面停在任务结束处。
+///
+/// `FinishPolicy` 目前没有独立的 `Leave` 变体，`UiResidencyTarget` 也无法表达
+/// Overworld/GameGate，因此用 `KeepCurrent` 声明“不恢复入口”，并配合
+/// `EntryPolicy::Passthrough` 保证包装器**不观测、不导航、不二次收尾**。
+fn enter_game_task_spec() -> UiTaskSpec {
+    UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::KeepCurrent)
+        .with_entry(EntryPolicy::Passthrough)
+        .with_total_budget(Duration::from_secs(15))
+}
+
+/// 进千星的任务目标是一级大厅，收尾语义是 `Fixed(Primary)`——但它由例程内部的
+/// `wait_for_primary` 实现（保留原有失败语义与驻留结论）。包装器若再声明 Fixed
+/// 会触发第二次收尾（Passthrough 下 Fixed 仍会走 `settle_to`），因此这里声明
+/// `ScriptDeclared`：脚本（例程）已完成收尾，包装器不再动作。
+fn enter_wonderland_task_spec() -> UiTaskSpec {
+    UiTaskSpec::new(
+        UiResidencyTarget::Primary,
+        FinishPolicy::ScriptDeclared,
+    )
+    .with_entry(EntryPolicy::Passthrough)
+    .with_total_budget(Duration::from_secs(15))
+}
+
+/// 包装器在“开始前取消/入口失败”时没有内层输出；旧调用点只认识旧 Outcome 类型，
+/// 这里把它如实降级为业务失败，而不是凭空成功。
+fn task_not_started_failure(failure: Option<UiRoutineFailure>) -> UiRoutineFailure {
+    failure.unwrap_or_else(|| {
+        UiRoutineFailure::new(
+            InputCertainty::Cancelled,
+            "ui_task_start",
+            "UI 任务在开始前已取消，内层例程没有执行",
+        )
+    })
+}
+
+struct EnterGameTask {
+    request: EnterGame,
+    ocr: OcrRuntimeHandle,
+    config: StartupRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for EnterGameTask {}
+
+impl UiRoutine for EnterGameTask {
+    type Output = EnterGameOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let outcome = UiTask::new(
+            enter_game_task_spec(),
+            EnterGameRoutine {
+                request: self.request,
+                ocr: self.ocr,
+                config: self.config,
+            },
+        )
+        .execute(context);
+        match outcome.output {
+            Some(output) => output,
+            None => EnterGameOutcome {
+                effect: EnterGameEffect::Failed(task_not_started_failure(outcome.entry_failure)),
+            },
+        }
+    }
+}
+
+struct EnterWonderlandTask {
+    request: EnterWonderland,
+    ocr: OcrRuntimeHandle,
+    config: StartupRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for EnterWonderlandTask {}
+
+impl UiRoutine for EnterWonderlandTask {
+    type Output = EnterWonderlandOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let outcome = UiTask::new(
+            enter_wonderland_task_spec(),
+            EnterWonderlandRoutine {
+                request: self.request,
+                ocr: self.ocr,
+                config: self.config,
+            },
+        )
+        .execute(context);
+        match outcome.output {
+            Some(output) => output,
+            None => {
+                let failure = task_not_started_failure(outcome.entry_failure);
+                EnterWonderlandOutcome {
+                    effect: EnterWonderlandEffect::Failed(failure.clone()),
+                    residency: Some(UiResidencyOutcome::Failed(failure)),
+                }
+            }
         }
     }
 }
@@ -1344,5 +1445,74 @@ mod tests {
     #[test]
     fn split_command_args_rejects_unclosed_quote() {
         assert!(split_command_args(r#""abc"#).is_err());
+    }
+
+    /// P1 迁移批次 3：启动链没有“可回入口”，收尾只能保持任务结束界面；
+    /// 进千星的目标是一级，但实际等待/失败仍由例程的 wait_for_primary 负责。
+    #[test]
+    fn startup_tasks_declare_leave_and_primary_finish() {
+        let game = enter_game_task_spec();
+        assert_eq!(game.entry, EntryPolicy::Passthrough);
+        assert_eq!(
+            game.finish,
+            FinishPolicy::KeepCurrent,
+            "EnterGame 结束后没有可回入口，不允许包装器强行恢复"
+        );
+
+        let wonderland = enter_wonderland_task_spec();
+        assert_eq!(wonderland.entry, EntryPolicy::Passthrough);
+        assert_eq!(
+            wonderland.finish,
+            FinishPolicy::ScriptDeclared,
+            "Fixed(Primary) 由例程内部 wait_for_primary 完成；包装器不得二次收尾"
+        );
+    }
+
+    /// 走向包装器的真实入口（StartupUi）也不能多按一个键：失败时设备输入必须
+    /// 与例程自身完全一致（这里只有一次 M）。
+    #[test]
+    fn wrapped_wonderland_failure_keeps_the_routine_input_log() {
+        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut config = test_startup_config(&app);
+        config.startup.enter_wonderland_timeout_ms = 1;
+        config.startup.wonderland_map_star_retries = 1;
+        config.startup.wonderland_map_star_retry_ms = 1;
+        config.startup.final_primary_timeout_ms = 1;
+
+        let frame = image::open("tests/fixtures/ui/overworld-teyvat-1920x1080.jpg")
+            .expect("打开真实提瓦特帧失败");
+        let map = image::open("tests/fixtures/ui/map-teyvat-1920x1080.png")
+            .expect("打开真实提瓦特地图帧失败");
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(
+            PaimonOnlyDevice {
+                frame,
+                after_m: Some(map),
+                keys: keys.clone(),
+            },
+            4,
+        )
+        .unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let startup = StartupUi::new(ui_runtime.handle(), ocr_runtime.handle(), config);
+
+        let outcome = startup
+            .submit_enter_wonderland(EnterWonderland::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let EnterWonderlandEffect::Failed(failure) = outcome.effect() else {
+            panic!("夹具故意没有千星家园模板，必须失败在定位星标");
+        };
+        assert_eq!(failure.stage(), "locate_wonderland_map_star");
+        assert!(outcome.residency().is_some());
+        assert_eq!(
+            keys.lock().unwrap().as_slice(),
+            &[Key::Unicode('m')],
+            "包装器不得在例程之外补发任何导航输入"
+        );
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
     }
 }

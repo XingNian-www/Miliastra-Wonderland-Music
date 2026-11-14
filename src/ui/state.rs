@@ -747,14 +747,34 @@ impl TemplateUiStateClassifier {
             .get("confirm_button")
             .copied()
             .unwrap_or(1);
-        let button = best_template_candidate_downscaled(
+        let button_candidate = best_template_candidate_downscaled(
             image,
             Some(panels.confirm_button),
             &self.templates.confirm_button_template,
             button_scale,
-        )
-        .ok()
-        .flatten()?;
+        );
+        // 诊断：确认弹窗在实机上判不出来时，需要知道按钮候选到底是"没候选"
+        // 还是"有候选但分数/质量不够"。限速 2 秒，不会刷屏。
+        if confirm_probe_log_due() {
+            match &button_candidate {
+                Ok(Some(hit)) => log::debug!(
+                    "确认弹窗按钮候选 score={:.4} quality={} threshold={:.3} scale={} region={:?}",
+                    hit.score,
+                    hit.quality_ok,
+                    threshold,
+                    button_scale,
+                    panels.confirm_button
+                ),
+                Ok(None) => log::debug!(
+                    "确认弹窗按钮无候选 scale={} region={:?} template={:?}",
+                    button_scale,
+                    panels.confirm_button,
+                    self.templates.confirm_button_template
+                ),
+                Err(error) => log::debug!("确认弹窗按钮探针失败：{error:#}"),
+            }
+        }
+        let button = button_candidate.ok().flatten()?;
         if !button.quality_ok || button.score < threshold {
             // 只有分数接近阈值时才记一条：逐帧无条件打会刷屏，但确认弹窗
             // 现场需要知道"按钮到底差多少、是不是质量门控拒绝"。
@@ -3081,6 +3101,22 @@ const TEYVAT_PROFILE_ADD_FRIEND_SEARCH: Rect = Rect::new(1179, 783, 162, 89);
 ///
 /// 文案模板只保留关键词（6/5/3 个汉字，169×29 / 142×29 / 94×32），
 /// 搜索区是 620×90 的整行；1/2 下采样即可保住字形，代价约为全分辨率的 1/16。
+static LAST_CONFIRM_PROBE_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn confirm_probe_log_due() -> bool {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_CONFIRM_PROBE_LOG_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 2_000 {
+        return false;
+    }
+    LAST_CONFIRM_PROBE_LOG_MS.store(now, Ordering::Relaxed);
+    true
+}
+
 pub(crate) const CONFIRM_MESSAGE_MIN: f32 = 0.95;
 pub(crate) const CONFIRM_MESSAGE_SCALE: u32 = 2;
 

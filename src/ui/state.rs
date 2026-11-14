@@ -413,6 +413,44 @@ impl TemplateUiStateClassifier {
         ))
     }
 
+    /// 头像弹窗窄探针：只匹配「查看千星奇域档案」一个模板。
+    /// 叠在二级聊天之上时基础链只会判成 secondary，这里用单次下采样匹配兜住。
+    fn avatar_popup_probe(&self, image: &DynamicImage) -> Option<UiStateClassification> {
+        let threshold = self.templates.chat_templates.marker_threshold;
+        let region = self.panels.as_ref()?.invite_view_star;
+        let scale = self
+            .templates
+            .panel_downsample_factors
+            .get("invite_view_star")
+            .copied()
+            .unwrap_or(2);
+        let candidate = best_template_candidate_downscaled(
+            image,
+            Some(region),
+            &self.templates.invite_view_star_template,
+            scale,
+        )
+        .ok()
+        .flatten()?;
+        if !candidate_matches(&Some(candidate.clone()), threshold) {
+            return None;
+        }
+        Some(UiStateClassification::with_evidence(
+            RuntimeUiStateKind::Panel,
+            "panel:avatar_popup",
+            UiStateEvidence::new(
+                vec![template_probe(
+                    &self.templates.invite_view_star_template,
+                    region,
+                    threshold,
+                    Some(&candidate),
+                )],
+                None,
+                "panel:avatar_popup",
+            ),
+        ))
+    }
+
     /// 逐帧界面分类。
     ///
     /// **关于 `target: "timing"` 的级别**：这些耗时日志是逐帧执行的（值守循环每轮都分类），
@@ -441,6 +479,53 @@ impl TemplateUiStateClassifier {
                     return Err(error);
                 }
             };
+        // **层级短路**：一级/二级是正常值守的两种界面，基础判据一旦确认，
+        // 就直接返回，不跑世界探针、F2 按钮、资料卡四分类等逐帧重活。
+        // 只有基础判据不是一级/二级时，才进入下面的覆盖层/面板细化链。
+        let base_kind = state.runtime_kind();
+        // 一级：正常返回；只有右上圆形关闭按钮存在时才做一次廉价覆盖页纠正
+        // （千星覆盖页的蓝色图标会被聊天 marker 误数成 8 个蓝点）。
+        if base_kind == RuntimeUiStateKind::Primary {
+            if self.panels.is_some() && is_qianxing_overlay_close(image) {
+                return Ok(self.profile_page_by_buttons(image).unwrap_or_else(|| {
+                    UiStateClassification::with_evidence(
+                        RuntimeUiStateKind::Panel,
+                        "panel:qianxing_page",
+                        evidence.clone(),
+                    )
+                }));
+            }
+            return Ok(UiStateClassification::with_evidence(
+                base_kind,
+                state.to_string(),
+                evidence,
+            ));
+        }
+        // 二级：正常返回；头像弹窗叠在二级之上时会先看到 secondary，用一个
+        // 窄区域模板兜住这类面板，避免为它每帧跑整条面板细化链。
+        if base_kind == RuntimeUiStateKind::Secondary {
+            if let Some(profile) = self.avatar_popup_probe(image) {
+                return Ok(profile);
+            }
+            return Ok(UiStateClassification::with_evidence(
+                base_kind,
+                state.to_string(),
+                evidence,
+            ));
+        }
+        if matches!(
+            base_kind,
+            RuntimeUiStateKind::Loading
+                | RuntimeUiStateKind::GameGate
+                | RuntimeUiStateKind::MainMenu
+                | RuntimeUiStateKind::Overworld
+        ) {
+            return Ok(UiStateClassification::with_evidence(
+                base_kind,
+                state.to_string(),
+                evidence,
+            ));
+        }
         // 世界判据是**正交于界面状态**的一维：它回答"哪个世界"，不参与
         // primary/secondary/... 的判定，只是随证据一起报出去，供查询与断言。
         // 计数落在两侧空档之间时它的结论是 unknown，不会倒向任何一侧。
@@ -450,6 +535,7 @@ impl TemplateUiStateClassifier {
         // 「返回提瓦特」或通用 chrome；也不会落成覆盖层·大厅卡 / 主菜单。
         // 这个判据放在所有状态分支之前：该页偶尔会被聊天 marker 误抢成 Primary，
         // 精确按钮对命中时应统一纠正为 Secondary·多人面板。
+        // 走到这里只会是 Panel/Unknown：F2 多人面板只可能出现在这两类语境。
         if let Some(classification) = self.f2_hall_page_by_buttons(image) {
             self.game_fallback.reset();
             return Ok(classification);
@@ -1068,14 +1154,16 @@ impl TemplateUiStateClassifier {
         // ── 更多设置菜单优先于资料卡 ────────────────────────────────────
         // ⋯菜单展开时底下仍是资料卡；先判资料卡会把「更多设置」误判成
         // 「千星资料卡·好友」。菜单锚点只在自身窄条区域内匹配。
-        if let Some(menu) = self.more_settings_by_menu(image, panels, threshold) {
+        if let Some(menu) = self.more_settings_by_menu(image, panels, threshold)
+        {
             return Some(menu);
         }
         // ── 资料卡四分类优先（模板匹配，不用 OCR）────────────────────────
         // 顺序要求：必须在旧 `panel:archive_card`、添加好友详情之前命中即停，
         // 否则资料卡会被旧档案卡判据或 `not_state` 抢走。
         // 四类只由「冒险等阶+世界等级 / 奇域等级」与「添加好友 / 查看资料」决定。
-        if let Some(profile) = self.profile_card_by_templates(image, threshold) {
+        if let Some(profile) = self.profile_card_by_templates(image, threshold)
+        {
             return Some(profile);
         }
         let anchor_threshold = threshold.max(0.95);
@@ -1083,7 +1171,8 @@ impl TemplateUiStateClassifier {
         // 比「右上白色关闭按钮」更具体，也便宜：只在右下角 520×130 里做两次
         // 1/2 下采样匹配。命中即停，不再计算米黄/暗度门控，也不会被
         // 档案卡/大厅卡分支抢走；单个按钮命中时返回 None，继续走原分支。
-        if let Some(profile) = self.profile_page_by_buttons(image) {
+        if let Some(profile) = self.profile_page_by_buttons(image)
+        {
             return Some(profile);
         }
         // ── 千星覆盖页优先（经验证集校验的门控）──────────────────────────

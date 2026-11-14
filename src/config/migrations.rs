@@ -214,7 +214,36 @@ fn migrate_v3_to_v4(sections: &mut BTreeMap<String, Value>) -> Result<()> {
             );
         }
     }
+    rewrite_renamed_template_paths(sections);
     Ok(())
+}
+
+/// 模板文件改名后，旧配置里的路径会指向已删除文件。
+///
+/// 实机事故：`templates.confirm_button` 仍指向 `friend-confirm.png`，文件在
+/// v4 清理时已删除，确认弹窗探针每帧 open 失败，整条确认判据静默失效。
+/// 这里只按**文件名**改写，保留用户自己的目录前缀。
+fn rewrite_renamed_template_paths(sections: &mut BTreeMap<String, Value>) {
+    const RENAMED: [(&str, &str); 2] = [
+        ("friend-confirm.png", "confirm-button.png"),
+        ("ui-primary-friend.png", "friend-panel.png"),
+    ];
+    let Some(templates) = sections.get_mut("templates").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for value in templates.values_mut() {
+        let Some(raw) = value.as_str() else {
+            continue;
+        };
+        let Some((old, new)) = RENAMED.iter().find(|(old, _)| raw.ends_with(old)) else {
+            continue;
+        };
+        let replaced = format!("{}{new}", &raw[..raw.len() - old.len()]);
+        log::warn!(
+            "配置迁移 v3→v4：模板路径「{raw}」指向已删除文件，已改写为「{replaced}」"
+        );
+        *value = Value::String(replaced);
+    }
 }
 
 /// 迁移后进行剪枝用的 schema 索引：当前结构声明的全部点路径。
@@ -562,6 +591,32 @@ mod tests {
         assert_eq!(sections["queue"]["max_size"], json!(23), "无关字段必须保留");
         assert_eq!(sections["ai"]["api_key"], json!("old-secret"));
         // 迁移结果必须能被当前结构接受。
+        validate_migrated(&sections).unwrap();
+    }
+
+    #[test]
+    fn template_paths_pointing_to_deleted_files_are_rewritten() {
+        let mut sections = v3_view();
+        seg_mut(&mut sections, "templates").insert(
+            "confirm_button".into(),
+            json!("custom/extra/friend-confirm.png"),
+        );
+        seg_mut(&mut sections, "templates").insert(
+            "friend_panel".into(),
+            json!("deps/assets/ui-primary-friend.png"),
+        );
+
+        migrate_sections(3, &mut sections).unwrap();
+
+        assert_eq!(
+            sections["templates"]["confirm_button"],
+            json!("custom/extra/confirm-button.png"),
+            "旧确认模板路径必须改到新文件名，否则实机 open 失败"
+        );
+        assert_eq!(
+            sections["templates"]["friend_panel"],
+            json!("deps/assets/friend-panel.png")
+        );
         validate_migrated(&sections).unwrap();
     }
 

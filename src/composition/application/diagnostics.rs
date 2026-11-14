@@ -62,9 +62,6 @@ impl ApplicationRuntime {
                 let frame = self.latest_frame()?;
                 let default_threshold = match &template {
                     WebToolTemplate::WorldWish => self.lifecycle.config.templates.marker_threshold,
-                    WebToolTemplate::WonderlandConfirm => {
-                        self.lifecycle.config.startup.wonderland_confirm_threshold
-                    }
                     WebToolTemplate::PaimonMenu => self.lifecycle.config.startup.template_threshold,
                     WebToolTemplate::WonderlandMapStar => {
                         self.lifecycle.config.startup.template_threshold
@@ -82,7 +79,6 @@ impl ApplicationRuntime {
                     WebToolTemplate::PinkMarker => {
                         self.lifecycle.config.templates.pink_marker.clone()
                     }
-                    WebToolTemplate::Friend => self.lifecycle.config.templates.friend.clone(),
                     WebToolTemplate::SecondaryBack => {
                         self.lifecycle.config.templates.secondary_back.clone()
                     }
@@ -116,16 +112,9 @@ impl ApplicationRuntime {
                     WebToolTemplate::FriendBlacklist => {
                         self.lifecycle.config.templates.friend_blacklist.clone()
                     }
-                    WebToolTemplate::FriendConfirm => {
-                        self.lifecycle.config.templates.friend_confirm.clone()
+                    WebToolTemplate::ConfirmButton => {
+                        self.lifecycle.config.templates.confirm_button.clone()
                     }
-                    WebToolTemplate::WonderlandConfirm => self
-                        .lifecycle
-                        .config
-                        .startup
-                        .templates
-                        .wonderland_confirm
-                        .clone(),
                     WebToolTemplate::PaimonMenu => {
                         self.lifecycle.config.startup.templates.paimon_menu.clone()
                     }

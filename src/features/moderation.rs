@@ -25,7 +25,10 @@ pub struct ModerationConfig {
     pub more_settings_region: RectConfig,
     pub block_chat_region: RectConfig,
     pub blacklist_region: RectConfig,
-    pub confirm_region: RectConfig,
+    pub confirm_button_region: RectConfig,
+    /// 确认弹窗提示文案行搜索区域。确认弹窗必须**确认按钮 + 文案锚点**双命中，
+    /// 只命中按钮不算（见 `refine_panel` 的确认弹窗分支）。
+    pub confirm_message_region: RectConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,7 +62,14 @@ impl ModerationConfig {
             (self.more_settings_region, "moderation.more_settings_region"),
             (self.block_chat_region, "moderation.block_chat_region"),
             (self.blacklist_region, "moderation.blacklist_region"),
-            (self.confirm_region, "moderation.confirm_region"),
+            (
+                self.confirm_button_region,
+                "moderation.confirm_button_region",
+            ),
+            (
+                self.confirm_message_region,
+                "moderation.confirm_message_region",
+            ),
         ] {
             validate_rect(rect, field)?;
         }

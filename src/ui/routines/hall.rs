@@ -15,7 +15,10 @@ use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
 };
-use super::transaction::{FinishPolicy, UiTask, UiTaskSpec};
+use super::residency::{ResidencyTarget, SettleEnvironment};
+use super::transaction::{
+    ActivationPolicy, EntryPolicy, FinishPolicy, UiTask, UiTaskSpec,
+};
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::locator::{
     HALL_INFO_OCR_SAMPLES, HallInfo, HallInfoSample, display_or_empty, merge_hall_info_samples,
@@ -527,14 +530,17 @@ fn read_hall_sample(
     })
 }
 
-fn hall_task_spec() -> UiTaskSpec {
+fn hall_task_spec(environment: SettleEnvironment, activate_wait_ms: u64) -> UiTaskSpec {
     UiTaskSpec::new(
-        UiResidencyTarget::Primary,
+        ResidencyTarget::Primary,
         FinishPolicy::RestoreEntry {
-            fallback: UiResidencyTarget::Primary,
+            fallback: ResidencyTarget::Primary,
         },
+        environment,
     )
-    .with_activate(true)
+    .with_activation(ActivationPolicy::Activate {
+        wait_ms: activate_wait_ms,
+    })
     .with_total_budget(Duration::from_secs(40))
 }
 
@@ -550,8 +556,11 @@ impl UiRoutine for ReadHallInfoTask {
     type Output = ReadHallInfoOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let environment =
+            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let activate_wait_ms = self.config.residency.after_activate_ms;
         let outcome = UiTask::new(
-            hall_task_spec(),
+            hall_task_spec(environment, activate_wait_ms),
             ReadHallInfoRoutine {
                 request: self.request,
                 ocr: self.ocr,
@@ -594,8 +603,11 @@ impl UiRoutine for DetectPublicHallTask {
     type Output = DetectPublicHallOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let environment =
+            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let activate_wait_ms = self.config.residency.after_activate_ms;
         let outcome = UiTask::new(
-            hall_task_spec(),
+            hall_task_spec(environment, activate_wait_ms),
             DetectPublicHallRoutine {
                 request: self.request,
                 ocr: self.ocr,
@@ -637,8 +649,11 @@ impl UiRoutine for ToggleMicrophoneTask {
     type Output = ToggleMicrophoneOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let environment =
+            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let activate_wait_ms = self.config.residency.after_activate_ms;
         let outcome = UiTask::new(
-            hall_task_spec(),
+            hall_task_spec(environment, activate_wait_ms),
             ToggleMicrophoneRoutine {
                 request: self.request,
                 ocr: self.ocr,

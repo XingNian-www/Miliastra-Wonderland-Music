@@ -489,6 +489,7 @@ mod tests {
             width,
             height,
             score: 1.0,
+            quality_ok: true,
         }
     }
 

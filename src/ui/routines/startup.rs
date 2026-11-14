@@ -6,6 +6,7 @@ use super::friend_delivery::{
     before_input_failure, capture_normalized, wait_ms,
 };
 use super::state_observation::wait_for_stable_ui_kind;
+use super::residency::{ResidencyTarget, SettleEnvironment};
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 use crate::adapters::game_path::resolve_game_executable;
 use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
@@ -16,9 +17,11 @@ use crate::runtime::ui::{
     UiStateKind, UiSubmitError, sealed,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
-use crate::ui::state::find_enter_game_text as locate_enter_game_text;
-use crate::ui::state::world_is_teyvat;
-use crate::ui::template::best_template_hit;
+use crate::ui::state::{
+    CONFIRM_MESSAGE_MIN, CONFIRM_MESSAGE_SCALE, find_enter_game_text as locate_enter_game_text,
+    world_is_teyvat,
+};
+use crate::ui::template::{best_template_candidate_downscaled, best_template_hit};
 use enigo::Key;
 
 const TEMPLATE_STABLE_HITS: u32 = 2;
@@ -173,7 +176,10 @@ pub(crate) struct StartupUiConfig {
     pub(crate) enter_game_text_region: Rect,
     pub(crate) world_wish_region: Rect,
     pub(crate) wonderland_hall_ocr_region: Rect,
-    pub(crate) wonderland_confirm_region: Rect,
+    /// 通用「确认」按钮的搜索区（与好友操作确认弹窗共用）。
+    pub(crate) confirm_button_region: Rect,
+    /// 确认弹窗关键词文案行搜索区，用于点击前判定子类型。
+    pub(crate) confirm_message_region: Rect,
     pub(crate) main_ui_region: Rect,
     pub(crate) wonderland_map_star_region: Rect,
 }
@@ -181,7 +187,9 @@ pub(crate) struct StartupUiConfig {
 #[derive(Clone)]
 pub(crate) struct StartupUiTemplates {
     pub(crate) wonderland_map_star: PathBuf,
-    pub(crate) wonderland_confirm: PathBuf,
+    pub(crate) confirm_button: PathBuf,
+    /// 「进入大厅」确认弹窗关键词文案；启动流程只接受这一子类型。
+    pub(crate) confirm_message_random_hall: PathBuf,
     pub(crate) paimon_menu: PathBuf,
     pub(crate) world_wish: PathBuf,
 }
@@ -275,6 +283,13 @@ impl UiRoutine for EnterWonderlandRoutine {
                 Ok(()) => EnterWonderlandEffect::Entered,
                 Err(failure) => EnterWonderlandEffect::Failed(failure),
             };
+        // 已强制完成（检测到千星）时不再做收尾导航：直接结束。
+        if context.is_force_finished() {
+            return EnterWonderlandOutcome {
+                effect,
+                residency: None,
+            };
+        }
         let residency = wait_for_primary(
             context,
             &self.config,
@@ -290,23 +305,21 @@ impl UiRoutine for EnterWonderlandRoutine {
 
 /// 启动链任务的收尾策略：任务结束后没有“可回入口”可恢复，界面停在任务结束处。
 ///
-/// `FinishPolicy` 目前没有独立的 `Leave` 变体，`UiResidencyTarget` 也无法表达
-/// Overworld/GameGate，因此用 `KeepCurrent` 声明“不恢复入口”，并配合
-/// `EntryPolicy::Passthrough` 保证包装器**不观测、不导航、不二次收尾**。
-fn enter_game_task_spec() -> UiTaskSpec {
-    UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::KeepCurrent)
+/// `Leave` 是正式建模（不是兼容层）：不导航、不恢复入口，只如实记录离开时界面；
+/// 配合 `EntryPolicy::Passthrough` 保证包装器**不观测、不导航**。
+fn enter_game_task_spec(environment: SettleEnvironment) -> UiTaskSpec {
+    UiTaskSpec::new(ResidencyTarget::Primary, FinishPolicy::Leave, environment)
         .with_entry(EntryPolicy::Passthrough)
         .with_total_budget(Duration::from_secs(15))
 }
 
-/// 进千星的任务目标是一级大厅，收尾语义是 `Fixed(Primary)`——但它由例程内部的
-/// `wait_for_primary` 实现（保留原有失败语义与驻留结论）。包装器若再声明 Fixed
-/// 会触发第二次收尾（Passthrough 下 Fixed 仍会走 `settle_to`），因此这里声明
-/// `ScriptDeclared`：脚本（例程）已完成收尾，包装器不再动作。
-fn enter_wonderland_task_spec() -> UiTaskSpec {
+/// 进千星的任务目标是一级大厅，收尾语义是 `Fixed(Primary)`；由唯一 residency
+/// 引擎验证（已在 Primary 时零动作）。
+fn enter_wonderland_task_spec(environment: SettleEnvironment) -> UiTaskSpec {
     UiTaskSpec::new(
-        UiResidencyTarget::Primary,
-        FinishPolicy::ScriptDeclared,
+        ResidencyTarget::Primary,
+        FinishPolicy::Fixed(ResidencyTarget::Primary),
+        environment,
     )
     .with_entry(EntryPolicy::Passthrough)
     .with_total_budget(Duration::from_secs(15))
@@ -336,8 +349,10 @@ impl UiRoutine for EnterGameTask {
     type Output = EnterGameOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let environment =
+            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
         let outcome = UiTask::new(
-            enter_game_task_spec(),
+            enter_game_task_spec(environment),
             EnterGameRoutine {
                 request: self.request,
                 ocr: self.ocr,
@@ -366,8 +381,10 @@ impl UiRoutine for EnterWonderlandTask {
     type Output = EnterWonderlandOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let environment =
+            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
         let outcome = UiTask::new(
-            enter_wonderland_task_spec(),
+            enter_wonderland_task_spec(environment),
             EnterWonderlandRoutine {
                 request: self.request,
                 ocr: self.ocr,
@@ -433,6 +450,24 @@ fn confirm_automatic_entry(
     Ok(true)
 }
 
+/// 当前界面是否已到达目标；命中就立即强制完成，不再继续任何步骤。
+///
+/// 用户要求：进入游戏只要检测到主世界就无条件停止；进入千星只要检测到千星就
+/// 无条件停止。这里直接读最近一次 UI 分类，不额外截图、不发输入。
+fn force_finish_if_kind(context: &mut UiRoutineContext<'_>, kinds: &[UiStateKind]) -> bool {
+    let Some(observation) = context.latest_ui_state() else {
+        return false;
+    };
+    let crate::runtime::ui::UiStateObservation::Classified(state) = observation else {
+        return false;
+    };
+    if kinds.contains(&state.classification().kind()) {
+        context.force_finish();
+        return true;
+    }
+    false
+}
+
 fn execute_enter_game(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
@@ -461,6 +496,10 @@ fn execute_enter_game(
                 InputCertainty::BeforeInput
             },
         )?;
+        // 用户要求：只要检测到主世界就无条件停止，完成。
+        if force_finish_if_kind(context, &[UiStateKind::Overworld]) {
+            return Ok(EnterGameEffect::Entered);
+        }
         if template_visible(
             &image,
             config.startup.main_ui_region,
@@ -630,6 +669,17 @@ fn execute_enter_wonderland(
         .device()
         .focus(config.residency.after_activate_ms)
         .map_err(|error| before_input_failure("focus_wonderland_window", error))?;
+    // 已经在千星（任意千星界面）就直接完成，不再按 M / 点星标 / 确认。
+    if force_finish_if_kind(
+        context,
+        &[
+            UiStateKind::MainMenu,
+            UiStateKind::Secondary,
+            UiStateKind::Panel,
+        ],
+    ) {
+        return Ok(());
+    }
     wait_for_paimon_menu(context, config)?;
 
     context
@@ -650,6 +700,16 @@ fn execute_enter_wonderland(
     // 所以「世界判据由真变假」就是地图已开的充分可观测证据。
     // （第 71 节也试过为提瓦特地图单独建区域/二维统计判据，全部过拟合失败，见该节。）
     wait_for_wonderland_map_open(context, config)?;
+    if force_finish_if_kind(
+        context,
+        &[
+            UiStateKind::MainMenu,
+            UiStateKind::Secondary,
+            UiStateKind::Panel,
+        ],
+    ) {
+        return Ok(());
+    }
 
     let map_attempts = capped_attempts(
         config.startup.wonderland_map_star_retries,
@@ -693,6 +753,16 @@ fn execute_enter_wonderland(
             )
         })?;
     *goal_attempted = true;
+    if force_finish_if_kind(
+        context,
+        &[
+            UiStateKind::MainMenu,
+            UiStateKind::Secondary,
+            UiStateKind::Panel,
+        ],
+    ) {
+        return Ok(());
+    }
     wait_template_absent(
         context,
         config,
@@ -729,23 +799,13 @@ fn execute_enter_wonderland(
             )
         })?;
 
-    let Some(confirm_point) = wait_template_hit(
-        context,
-        config,
-        TemplateHit {
-            template: &config.startup.templates.wonderland_confirm,
-            region: config.startup.wonderland_confirm_region,
-            threshold: config.startup.wonderland_confirm_threshold,
-            timeout_ms: config.startup.wonderland_transition_timeout_ms,
-            poll_ms: config.startup.poll_ms,
-            certainty: InputCertainty::AfterInputUnknown,
-        },
-    )?
+    let Some(confirm_point) =
+        wait_confirm_button(context, config, InputCertainty::AfterInputUnknown)?
     else {
         return Err(UiRoutineFailure::new(
             InputCertainty::AfterInputUnknown,
             "locate_wonderland_confirm",
-            "wonderland confirm template was not found",
+            "confirm button with the enter-hall dialog subtype was not found",
         ));
     };
     context
@@ -854,7 +914,7 @@ fn confirm_wonderland_transition(
     context: &mut UiRoutineContext<'_>,
     config: &StartupRoutineConfig,
 ) -> Result<(), UiRoutineFailure> {
-    let region = config.startup.wonderland_confirm_region;
+    let region = config.startup.confirm_button_region;
     let deadline =
         Instant::now() + Duration::from_millis(config.startup.wonderland_transition_timeout_ms);
     while Instant::now() < deadline {
@@ -867,7 +927,7 @@ fn confirm_wonderland_transition(
         if !template_visible(
             &image,
             region,
-            &config.startup.templates.wonderland_confirm,
+            &config.startup.templates.confirm_button,
             config.startup.wonderland_confirm_threshold,
             InputCertainty::AfterInputUnknown,
         )? {
@@ -1112,6 +1172,85 @@ fn is_wonderland_hall_text(text: &str) -> bool {
     normalized.contains("千星奇域") || normalized.contains("大厅")
 }
 
+/// 定位通用「确认」按钮，并在点击前先判确认弹窗子类型。
+///
+/// 启动流程不再单独保存一张「千星确认」模板：它和好友操作弹窗共用
+/// `templates.confirm_button` + `moderation.confirm_button_region`。通用按钮
+/// 会出现在多种确认弹窗上，所以按钮命中后还要求「进入大厅」关键词文案同时命中；
+/// 文案不命中就继续等，超时按未找到处理，绝不盲点。
+fn wait_confirm_button(
+    context: &mut UiRoutineContext<'_>,
+    config: &StartupRoutineConfig,
+    certainty: InputCertainty,
+) -> Result<Option<Point>, UiRoutineFailure> {
+    let deadline =
+        Instant::now() + Duration::from_millis(config.startup.wonderland_transition_timeout_ms);
+    while Instant::now() < deadline {
+        let image = capture_normalized(
+            context,
+            &config.residency,
+            "locate_wonderland_confirm",
+            certainty,
+        )?;
+        let Some(button) = best_template_hit(
+            &image,
+            Some(config.startup.confirm_button_region),
+            &config.startup.templates.confirm_button,
+            config.startup.wonderland_confirm_threshold,
+        )
+        .map_err(|error| {
+            UiRoutineFailure::new(
+                certainty,
+                "locate_wonderland_confirm",
+                format!("{error:#}"),
+            )
+        })?
+        else {
+            wait_ms(
+                context,
+                config.startup.poll_ms,
+                "locate_wonderland_confirm",
+                certainty,
+            )?;
+            continue;
+        };
+        let message = best_template_candidate_downscaled(
+            &image,
+            Some(config.startup.confirm_message_region),
+            &config.startup.templates.confirm_message_random_hall,
+            CONFIRM_MESSAGE_SCALE,
+        )
+        .map_err(|error| {
+            UiRoutineFailure::new(
+                certainty,
+                "locate_wonderland_confirm",
+                format!("{error:#}"),
+            )
+        })?;
+        let subtype_ok = message
+            .as_ref()
+            .is_some_and(|hit| hit.quality_ok && hit.score >= CONFIRM_MESSAGE_MIN);
+        if !subtype_ok {
+            log::debug!(
+                "确认按钮已命中但弹窗子类型不是「进入大厅」（步骤：定位启动流程确认按钮）：本次不点击，继续等待"
+            );
+            wait_ms(
+                context,
+                config.startup.poll_ms,
+                "locate_wonderland_confirm",
+                certainty,
+            )?;
+            continue;
+        }
+        return Ok(Some(button.center()));
+    }
+    log::debug!(
+        "等待「进入大厅」确认弹窗超时（步骤：定位启动流程确认按钮）：{}ms 内按钮与文案未同时命中；本次按「未找到」继续",
+        config.startup.wonderland_transition_timeout_ms
+    );
+    Ok(None)
+}
+
 fn wait_template_hit(
     context: &mut UiRoutineContext<'_>,
     config: &StartupRoutineConfig,
@@ -1219,6 +1358,7 @@ mod tests {
 
     use crate::config::AppConfig;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
+    use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
     use crate::runtime::ui::{UiDevice, UiRuntime};
     use anyhow::Result;
     use image::DynamicImage;
@@ -1292,14 +1432,16 @@ mod tests {
                 world_wish_threshold: app.templates.marker_threshold,
                 templates: StartupUiTemplates {
                     wonderland_map_star: startup.templates.wonderland_map_star.clone(),
-                    wonderland_confirm: startup.templates.wonderland_confirm.clone(),
                     paimon_menu: startup.templates.paimon_menu.clone(),
+                    confirm_button: app.templates.confirm_button.clone(),
+                    confirm_message_random_hall: app.templates.confirm_message_random_hall.clone(),
                     world_wish: app.templates.world_wish.clone(),
                 },
                 enter_game_text_region: startup.enter_game_text_region.into(),
                 world_wish_region: app.screen.world_wish_rect.into(),
                 wonderland_hall_ocr_region: startup.wonderland_hall_ocr_region.into(),
-                wonderland_confirm_region: startup.wonderland_confirm_region.into(),
+                confirm_button_region: app.moderation.confirm_button_region.into(),
+                confirm_message_region: app.moderation.confirm_message_region.into(),
                 main_ui_region: startup.main_ui_region.into(),
                 wonderland_map_star_region: startup.wonderland_map_star_region.into(),
             },
@@ -1451,20 +1593,24 @@ mod tests {
     /// 进千星的目标是一级，但实际等待/失败仍由例程的 wait_for_primary 负责。
     #[test]
     fn startup_tasks_declare_leave_and_primary_finish() {
-        let game = enter_game_task_spec();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let environment = SettleEnvironment::without_ocr(
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+        let game = enter_game_task_spec(environment.clone());
         assert_eq!(game.entry, EntryPolicy::Passthrough);
         assert_eq!(
             game.finish,
-            FinishPolicy::KeepCurrent,
-            "EnterGame 结束后没有可回入口，不允许包装器强行恢复"
+            FinishPolicy::Leave,
+            "EnterGame 结束后没有可回入口，必须正式声明 Leave"
         );
 
-        let wonderland = enter_wonderland_task_spec();
+        let wonderland = enter_wonderland_task_spec(environment);
         assert_eq!(wonderland.entry, EntryPolicy::Passthrough);
         assert_eq!(
             wonderland.finish,
-            FinishPolicy::ScriptDeclared,
-            "Fixed(Primary) 由例程内部 wait_for_primary 完成；包装器不得二次收尾"
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            "进千星固定收尾到 Primary，由唯一引擎验证（已在 Primary 时零动作）"
         );
     }
 

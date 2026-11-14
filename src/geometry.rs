@@ -120,6 +120,10 @@ pub(crate) struct TemplateHit {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) score: f32,
+    /// 命中位置是否通过文字内容质量校验；非文字模板恒为 true。
+    /// 不进入序列化：证据 JSON 仍只暴露几何与分数，避免改变对外协议。
+    #[serde(skip)]
+    pub(crate) quality_ok: bool,
 }
 
 impl TemplateHit {

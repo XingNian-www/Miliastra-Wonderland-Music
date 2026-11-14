@@ -1,4 +1,5 @@
 mod adapters;
+mod ai_trace;
 mod change_detection;
 mod composition;
 mod config;

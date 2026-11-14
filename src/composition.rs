@@ -14,6 +14,9 @@ pub(crate) mod application;
 use application::{ApplicationRuntime, ResolvedApplicationConfig};
 
 pub(crate) fn run(config_path: &Path) -> Result<RunOutcome> {
+    // AI 实际报文追踪只存内存，必须在任何 AI 调用之前装好观察者；
+    // 失败（例如单元测试里已注册）不影响启动。
+    crate::ai_trace::install();
     let executable_root = config_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("配置路径缺少 EXE 根目录: {}", config_path.display()))?;

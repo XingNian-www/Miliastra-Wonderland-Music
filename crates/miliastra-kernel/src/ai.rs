@@ -120,10 +120,9 @@ fn normalize_endpoint(endpoint: &str, expected_path: &str) -> Result<String> {
 }
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_openai::Client;
 use async_openai::error::OpenAIError;
@@ -136,6 +135,52 @@ use tokio::runtime::{Builder, Runtime};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_THREADS: usize = 2;
+
+/// 一次真正发往 provider 的 HTTP 报文往返。
+///
+/// 只用于诊断展示（Web 面板的「AI 实际请求」）：内核不解释字段、不落盘，
+/// 也不在这里做脱敏——调用方拿到完整报文后自行按需裁剪/脱敏。
+#[derive(Clone, Debug)]
+pub struct WireExchange {
+    /// `"ChatCompletions"` 或 `"Responses"`。
+    pub wire_api: &'static str,
+    /// 实际发出去的请求体（已合并 extra_body）。
+    pub request: Value,
+    /// 成功时的原始响应体；失败时为 `None`。
+    pub response: Option<Value>,
+    /// 失败原因（已按内核口径脱敏；不含请求正文）。
+    pub error: Option<String>,
+    /// 请求开始时间（Unix 毫秒）。
+    pub started_at_ms: u64,
+    /// 从提交到拿到响应的耗时。
+    pub elapsed: Duration,
+}
+
+/// 报文观察者。进程内只注册一次，避免多个面板各存一份。
+pub type WireObserver = Arc<dyn Fn(WireExchange) + Send + Sync>;
+
+static WIRE_OBSERVER: OnceLock<WireObserver> = OnceLock::new();
+
+/// 注册全局报文观察者；返回是否注册成功（已注册过则返回 false）。
+pub fn set_wire_observer(observer: WireObserver) -> bool {
+    WIRE_OBSERVER.set(observer).is_ok()
+}
+
+fn notify_wire(exchange: WireExchange) {
+    let Some(observer) = WIRE_OBSERVER.get() else {
+        return;
+    };
+    // 诊断观察者是纯附加能力：它 panic 不能把已经拿到的模型响应变成失败，
+    // 也不能让等待 `wait()` 的调用方只看到「runtime 停止」。
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(exchange)));
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 pub struct OpenAiRuntime {
     runtime: Option<Runtime>,
@@ -235,11 +280,17 @@ impl OpenAiRuntimeHandle {
         timeout: Duration,
     ) -> Result<OpenAiOperation<CreateChatCompletionResponse>> {
         let timeout = validate_timeout(timeout)?;
-        if extra_body.values().any(|value| !value.is_null()) {
-            self.submit_chat_byot(target, merge_extra_body(&request, extra_body)?, timeout)
-        } else {
-            self.submit_chat_typed(target, request, timeout)
-        }
+        // 所有请求统一走 BYOT 的 `Value` 路径：既保留 extra_body 合并，
+        // 也让报文观察者拿到 provider 原样返回的 JSON（typed 结构体会静默丢掉
+        // DeepSeek 的 prompt_cache_hit_tokens 等未建模字段）。
+        let body = merge_extra_body(&request, extra_body)?;
+        self.submit_json(
+            target,
+            timeout,
+            "Chat Completions",
+            WireCall::ChatCompletions,
+            body,
+        )
     }
 
     pub fn create_response(
@@ -250,11 +301,8 @@ impl OpenAiRuntimeHandle {
         timeout: Duration,
     ) -> Result<OpenAiOperation<Response>> {
         let timeout = validate_timeout(timeout)?;
-        if extra_body.values().any(|value| !value.is_null()) {
-            self.submit_response_byot(target, merge_extra_body(&request, extra_body)?, timeout)
-        } else {
-            self.submit_response_typed(target, request, timeout)
-        }
+        let body = merge_extra_body(&request, extra_body)?;
+        self.submit_json(target, timeout, "Responses", WireCall::Responses, body)
     }
 
     fn begin_submission(&self) -> Result<MutexGuard<'_, ()>> {
@@ -269,82 +317,95 @@ impl OpenAiRuntimeHandle {
         Ok(guard)
     }
 
-    fn submit_chat_typed(
-        &self,
-        target: Target,
-        request: CreateChatCompletionRequest,
-        timeout: Duration,
-    ) -> Result<OpenAiOperation<CreateChatCompletionResponse>> {
-        self.submit_request(
-            target,
-            timeout,
-            "Chat Completions",
-            move |client| async move { client.chat().create(request).await },
-        )
-    }
-
-    fn submit_chat_byot(
-        &self,
-        target: Target,
-        request: Value,
-        timeout: Duration,
-    ) -> Result<OpenAiOperation<CreateChatCompletionResponse>> {
-        self.submit_request(
-            target,
-            timeout,
-            "Chat Completions",
-            move |client| async move {
-                client
-                    .chat()
-                    .create_byot::<_, CreateChatCompletionResponse>(request)
-                    .await
-            },
-        )
-    }
-
-    fn submit_response_typed(
-        &self,
-        target: Target,
-        request: CreateResponse,
-        timeout: Duration,
-    ) -> Result<OpenAiOperation<Response>> {
-        self.submit_request(target, timeout, "Responses", move |client| async move {
-            client.responses().create(request).await
-        })
-    }
-
-    fn submit_response_byot(
-        &self,
-        target: Target,
-        request: Value,
-        timeout: Duration,
-    ) -> Result<OpenAiOperation<Response>> {
-        self.submit_request(target, timeout, "Responses", move |client| async move {
-            client.responses().create_byot::<_, Response>(request).await
-        })
-    }
-
-    fn submit_request<T, F, Fut>(
+    /// 统一提交入口：请求体按 JSON 发送，先记原始响应再反序列化成 typed 结果。
+    fn submit_json<T>(
         &self,
         target: Target,
         timeout: Duration,
         response_name: &'static str,
-        send: F,
+        call: WireCall,
+        request: Value,
     ) -> Result<OpenAiOperation<T>>
     where
-        T: Send + 'static,
-        F: FnOnce(Client<EndpointConfig>) -> Fut + Send + 'static,
-        Fut: Future<Output = std::result::Result<T, OpenAIError>> + Send + 'static,
+        T: Send + 'static + serde::de::DeserializeOwned,
     {
         let _submission = self.begin_submission()?;
         let (sender, receiver) = mpsc::sync_channel(1);
         let http = self.http.clone();
+        let started_at_ms = unix_now_ms();
+        let started = Instant::now();
         self.runtime.spawn(async move {
             let service = ReqwestService::new(http.clone());
             let client = Client::build(http, target.config).with_http_service(service);
-            let result = match tokio::time::timeout(timeout, send(client)).await {
-                Ok(result) => result.map_err(sdk_error),
-                Err(_) => Err(anyhow!("OpenAI {response_name} 请求超时")),
+            let outbound = request.clone();
+            let outcome = match call {
+                WireCall::ChatCompletions => {
+                    tokio::time::timeout(timeout, client.chat().create_byot::<_, Value>(outbound))
+                        .await
+                }
+                WireCall::Responses => {
+                    tokio::time::timeout(
+                        timeout,
+                        client.responses().create_byot::<_, Value>(outbound),
+                    )
+                    .await
+                }
+            };
+            let result = match outcome {
+                Ok(Ok(raw)) => {
+                    // 先反序列化再上报：HTTP 200 但结构不符合 typed 约定的响应
+                    // 对调用方是失败，面板不能记成「成功」。
+                    match serde_json::from_value::<T>(raw.clone()) {
+                        Ok(value) => {
+                            notify_wire(WireExchange {
+                                wire_api: call.label(),
+                                request,
+                                response: Some(raw),
+                                error: None,
+                                started_at_ms,
+                                elapsed: started.elapsed(),
+                            });
+                            Ok(value)
+                        }
+                        Err(error) => {
+                            let error =
+                                anyhow!("OpenAI {response_name} 响应结构不符合预期: {error}");
+                            notify_wire(WireExchange {
+                                wire_api: call.label(),
+                                request,
+                                response: Some(raw),
+                                error: Some(format!("{error:#}")),
+                                started_at_ms,
+                                elapsed: started.elapsed(),
+                            });
+                            Err(error)
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    let error = sdk_error(error);
+                    notify_wire(WireExchange {
+                        wire_api: call.label(),
+                        request,
+                        response: None,
+                        error: Some(format!("{error:#}")),
+                        started_at_ms,
+                        elapsed: started.elapsed(),
+                    });
+                    Err(error)
+                }
+                Err(_) => {
+                    let error = anyhow!("OpenAI {response_name} 请求超时");
+                    notify_wire(WireExchange {
+                        wire_api: call.label(),
+                        request,
+                        response: None,
+                        error: Some(format!("{error:#}")),
+                        started_at_ms,
+                        elapsed: started.elapsed(),
+                    });
+                    Err(error)
+                }
             };
             let _ = sender.send(result);
         });
@@ -352,6 +413,22 @@ impl OpenAiRuntimeHandle {
             receiver,
             response_name,
         })
+    }
+}
+
+/// 两种线上协议：决定调用哪一组 SDK 方法，也决定展示用的 wire 名称。
+#[derive(Clone, Copy)]
+enum WireCall {
+    ChatCompletions,
+    Responses,
+}
+
+impl WireCall {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "ChatCompletions",
+            Self::Responses => "Responses",
+        }
     }
 }
 
@@ -542,6 +619,144 @@ mod tests {
         assert!(validate_http_proxy("socks5://127.0.0.1:1080").is_err());
         assert!(validate_http_proxy("not-a-url").is_err());
         assert!(validate_http_proxy("http://proxy.example#fragment").is_err());
+    }
+
+    /// 报文观察者必须拿到 provider 原样返回的 JSON：typed 结构体会丢掉
+    /// DeepSeek 的 `prompt_cache_hit_tokens` 之类未建模字段，缓存命中率就
+    /// 再也无法核对。这里用原始响应体钉住这条链路。
+    #[test]
+    fn wire_observer_sees_the_raw_provider_payload() {
+        const TRACE_RESPONSE: &str = r#"{
+            "id":"chatcmpl-trace",
+            "choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":"ok"},
+                "finish_reason":"stop"
+            }],
+            "created":0,
+            "model":"trace-model",
+            "object":"chat.completion",
+            "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,
+                     "prompt_cache_hit_tokens":7}
+        }"#;
+        let captured: Arc<Mutex<Vec<WireExchange>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        assert!(
+            set_wire_observer(Arc::new(move |exchange| {
+                if exchange.request["model"] == "trace-model" {
+                    sink.lock().expect("observer sink").push(exchange);
+                }
+            })),
+            "观察者只允许注册一次，测试按首个注册者运行"
+        );
+
+        let runtime = OpenAiRuntime::start().expect("OpenAI runtime");
+        let (origin, _requests, server) =
+            mock_server(200, TRACE_RESPONSE, Duration::from_millis(300), 32);
+        let target = Target::chat(
+            &format!("{origin}/v1/chat/completions"),
+            "secret",
+            Authentication::Bearer,
+        )
+        .expect("target");
+        let request = CreateChatCompletionRequestArgs::default()
+            .model("trace-model")
+            .messages(vec![
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content("test")
+                    .build()
+                    .expect("message")
+                    .into(),
+            ])
+            .stream(false)
+            .store(false)
+            .build()
+            .expect("chat request");
+        runtime
+            .handle()
+            .chat_completion(
+                target,
+                request,
+                &HashMap::from([("temperature".to_string(), json!(0.2))]),
+                Duration::from_secs(2),
+            )
+            .expect("submit chat request")
+            .wait()
+            .expect("chat response");
+        server.join().expect("mock server");
+
+        let exchanges = captured.lock().expect("captured exchanges");
+        let exchange = exchanges
+            .first()
+            .expect("observer must receive the exchange");
+        assert_eq!(exchange.wire_api, "ChatCompletions");
+        assert_eq!(exchange.request["model"], "trace-model");
+        assert_eq!(
+            exchange.request["temperature"], 0.2,
+            "合并后的 extra_body 必须出现在观察到的请求里"
+        );
+        assert_eq!(
+            exchange.response.as_ref().unwrap()["usage"]["prompt_cache_hit_tokens"],
+            7,
+            "原始响应里的 provider 扩展字段不能被 typed 结构体吃掉"
+        );
+        assert!(exchange.error.is_none());
+        assert!(exchange.elapsed > Duration::ZERO);
+        drop(exchanges);
+
+        // HTTP 200 但结构不符合 typed 约定：调用方必须失败，观察者也要记
+        // error（原始响应仍保留，便于排障）。
+        const BROKEN_RESPONSE: &str = r#"{"unexpected":true}"#;
+        let (broken_origin, _broken_requests, broken_server) =
+            mock_server(200, BROKEN_RESPONSE, Duration::from_millis(300), 32);
+        let broken_target = Target::chat(
+            &format!("{broken_origin}/v1/chat/completions"),
+            "secret",
+            Authentication::Bearer,
+        )
+        .expect("target");
+        let broken_request = CreateChatCompletionRequestArgs::default()
+            .model("trace-model")
+            .messages(vec![
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content("test")
+                    .build()
+                    .expect("message")
+                    .into(),
+            ])
+            .stream(false)
+            .store(false)
+            .build()
+            .expect("chat request");
+        let broken = runtime
+            .handle()
+            .chat_completion(
+                broken_target,
+                broken_request,
+                &HashMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("submit broken request")
+            .wait();
+        assert!(broken.is_err(), "结构不符合 typed 约定的响应必须失败");
+        broken_server.join().expect("mock server");
+
+        let captured = captured.lock().expect("captured exchanges");
+        let broken = captured
+            .get(1)
+            .expect("observer must receive broken exchange");
+        assert!(
+            broken
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("响应结构不符合预期")),
+            "面板必须看到失败原因，实际 {:?}",
+            broken.error
+        );
+        assert!(
+            broken.response.is_some(),
+            "失败时仍要保留 provider 原始响应"
+        );
     }
 
     #[test]

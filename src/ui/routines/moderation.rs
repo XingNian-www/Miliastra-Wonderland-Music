@@ -7,6 +7,7 @@ use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
     before_input_failure, capture_normalized, wait_ms,
 };
+use super::residency::{ResidencyTarget, SettleEnvironment};
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskOutcome, UiTaskSpec};
 use crate::geometry::{Point, Rect};
 use crate::runtime::ui::{
@@ -88,13 +89,13 @@ pub(crate) struct ModerationRoutineConfig {
     more_settings_template: PathBuf,
     blacklist_template: PathBuf,
     block_chat_template: PathBuf,
-    confirm_template: PathBuf,
+    confirm_button_template: PathBuf,
     friend_panel_region: Rect,
     search_panel_region: Rect,
     more_settings_region: Rect,
     blacklist_region: Rect,
     block_chat_region: Rect,
-    confirm_region: Rect,
+    confirm_button_region: Rect,
     search_input: Point,
     search_button: Point,
     marker_threshold: f32,
@@ -113,13 +114,13 @@ pub(crate) struct ModerationRoutineConfigSource {
     pub(crate) more_settings_template: PathBuf,
     pub(crate) blacklist_template: PathBuf,
     pub(crate) block_chat_template: PathBuf,
-    pub(crate) confirm_template: PathBuf,
+    pub(crate) confirm_button_template: PathBuf,
     pub(crate) friend_panel_region: Rect,
     pub(crate) search_panel_region: Rect,
     pub(crate) more_settings_region: Rect,
     pub(crate) blacklist_region: Rect,
     pub(crate) block_chat_region: Rect,
-    pub(crate) confirm_region: Rect,
+    pub(crate) confirm_button_region: Rect,
     pub(crate) search_input: Point,
     pub(crate) search_button: Point,
     pub(crate) marker_threshold: f32,
@@ -140,13 +141,13 @@ impl ModerationRoutineConfig {
             more_settings_template: source.more_settings_template,
             blacklist_template: source.blacklist_template,
             block_chat_template: source.block_chat_template,
-            confirm_template: source.confirm_template,
+            confirm_button_template: source.confirm_button_template,
             friend_panel_region: source.friend_panel_region,
             search_panel_region: source.search_panel_region,
             more_settings_region: source.more_settings_region,
             blacklist_region: source.blacklist_region,
             block_chat_region: source.block_chat_region,
-            confirm_region: source.confirm_region,
+            confirm_button_region: source.confirm_button_region,
             search_input: source.search_input,
             search_button: source.search_button,
             marker_threshold: source.marker_threshold,
@@ -173,12 +174,14 @@ impl UiRoutine for ExecuteModerationRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         // 统一事务：入口必须是稳定 Primary（RequireTarget：不满足时零按键拒绝），
         // 收尾由 settle_to 吸收，面板/弹窗的有界 Esc 不再由例程自己 recover。
+        // 管理任务只恢复 Primary/面板，不需要 OCR；仍走同一环境类型与唯一引擎。
+        let environment = SettleEnvironment::without_ocr(self.config.residency.clone());
         let inner = ModerationInner {
             request: self.request,
             config: self.config,
         };
         let outcome: UiTaskOutcome<ModerationEffect> =
-            UiRoutine::execute(UiTask::new(moderation_task_spec(), inner), context);
+            UiRoutine::execute(UiTask::new(moderation_task_spec(environment), inner), context);
         let effect = outcome.output.unwrap_or_else(|| {
             ModerationEffect::Failed(outcome.entry_failure.clone().unwrap_or_else(|| {
                 UiRoutineFailure::new(
@@ -199,12 +202,13 @@ impl UiRoutine for ExecuteModerationRoutine {
 /// - 目标 Primary；收尾回入口（入口本来就强制 Primary，因此是恒等收尾，面板由 settle_to 有界 Esc 关闭）；
 /// - `RequireTarget` 保证“入口必须稳定 Primary”：Secondary/Unknown 等直接 BeforeInput 拒绝，零按键；
 /// - 总预算覆盖搜索/确认/收尾（收尾预留一个 `ui_timeout`）。
-fn moderation_task_spec() -> UiTaskSpec {
+fn moderation_task_spec(environment: SettleEnvironment) -> UiTaskSpec {
     UiTaskSpec::new(
-        UiResidencyTarget::Primary,
+        ResidencyTarget::Primary,
         FinishPolicy::RestoreEntry {
-            fallback: UiResidencyTarget::Primary,
+            fallback: ResidencyTarget::Primary,
         },
+        environment,
     )
     .with_entry(EntryPolicy::RequireTarget)
     .with_total_budget(Duration::from_secs(60))
@@ -316,13 +320,13 @@ fn execute_moderation(
     wait_template(
         context,
         config,
-        &config.confirm_template,
-        config.confirm_region,
+        &config.confirm_button_template,
+        config.confirm_button_region,
         config.ui_timeout_ms,
         true,
         "confirm_moderation_action",
     )?;
-    confirm_template_absent(context, config)
+    confirm_button_template_absent(context, config)
 }
 
 /// 入口“必须是稳定 Primary”由 `UiTaskSpec::RequireTarget` 在事务层保证；
@@ -390,7 +394,7 @@ fn wait_template(
     }
 }
 
-fn confirm_template_absent(
+fn confirm_button_template_absent(
     context: &mut UiRoutineContext<'_>,
     config: &ModerationRoutineConfig,
 ) -> Result<(), UiRoutineFailure> {
@@ -405,8 +409,8 @@ fn confirm_template_absent(
         )?;
         let present = template_exists(
             &image,
-            Some(config.confirm_region),
-            &config.confirm_template,
+            Some(config.confirm_button_region),
+            &config.confirm_button_template,
             config.marker_threshold,
         )
         .map_err(|error| {
@@ -479,7 +483,7 @@ fn recoverable_panel_candidate(
         (&config.more_settings_template, config.more_settings_region),
         (&config.blacklist_template, config.blacklist_region),
         (&config.block_chat_template, config.block_chat_region),
-        (&config.confirm_template, config.confirm_region),
+        (&config.confirm_button_template, config.confirm_button_region),
     ]
     .into_iter()
     .enumerate()
@@ -507,7 +511,10 @@ mod tests {
         UiStateClassifier, UiStateEvidence, UiStateKind, execute_routine_for_test,
         sealed::UiRoutineSealed,
     };
+    use crate::config::AppConfig;
+    use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
     use crate::ui::routines::transaction::{FinishPolicy, UiTask, UiTaskOutcome};
+    use std::path::Path;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RecordedKey {
@@ -591,7 +598,10 @@ mod tests {
     fn run_task(
         script: Vec<UiStateClassification>,
     ) -> (UiTaskOutcome<ModerationEffect>, RecordingDevice) {
-        let spec = moderation_task_spec();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let spec = moderation_task_spec(SettleEnvironment::without_ocr(
+            FriendDeliveryRoutineConfig::from_app(&config),
+        ));
         let execution = execute_routine_for_test(
             RecordingDevice::default(),
             Some(Box::new(ScriptedClassifier::new(script))),

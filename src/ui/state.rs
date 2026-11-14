@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -25,7 +27,6 @@ use crate::ui::template::{
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UiTemplateArgs {
-    friend_template: Option<PathBuf>,
     secondary_back_template: Option<PathBuf>,
     main_menu_template: Option<PathBuf>,
     chat_templates: TemplateArgs,
@@ -34,11 +35,30 @@ pub(crate) struct UiTemplateArgs {
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedUiTemplateArgs {
     pub(crate) panel_downsample_factors: std::collections::BTreeMap<String, u32>,
-    pub(crate) friend_template: PathBuf,
     pub(crate) secondary_back_template: PathBuf,
     /// 主菜单「返回提瓦特」按钮模板。它比 secondary_back 优先判定：
     /// 奇域主菜单上也有那个圆形返回按钮，若不先挡住，菜单会被误判成二级聊天。
     pub(crate) main_menu_template: PathBuf,
+    /// 二级聊天输入行「发送」圆钮模板；与圆形返回按钮一起判二级。
+    pub(crate) secondary_chat_submit_template: PathBuf,
+    /// F2 千星大厅页（多人面板）两个底部按钮锚点：左下「大厅列表」、右下「邀请玩家」。
+    pub(crate) qianxing_f2_hall_list_template: PathBuf,
+    pub(crate) qianxing_f2_invite_player_template: PathBuf,
+    pub(crate) qianxing_exit_menu_template: PathBuf,
+    /// 千星地图右下角锚点（「千星奇域·大厅」文字 + 庙宇图标；红色未读角标已 alpha 透明化）。
+    pub(crate) qianxing_map_label_template: PathBuf,
+    /// 个人资料页右下角「心愿单」字形模板（66×23，bbox + 2px 透明 padding）。
+    pub(crate) qianxing_profile_page_wishlist_template: PathBuf,
+    /// 个人资料页右下角「衣橱」字形模板（45×23，bbox + 2px 透明 padding）。
+    pub(crate) qianxing_profile_page_wardrobe_template: PathBuf,
+    /// 资料卡四分类锚点（全部纯文字模板）：
+    /// 提瓦特「冒险等阶 / 世界等级 / 添加好友」，千星「奇域等级 / 添加好友 / 查看资料」。
+    pub(crate) teyvat_profile_adventure_rank_template: PathBuf,
+    pub(crate) teyvat_profile_world_level_template: PathBuf,
+    pub(crate) teyvat_profile_add_friend_template: PathBuf,
+    pub(crate) qianxing_profile_domain_level_template: PathBuf,
+    pub(crate) qianxing_profile_add_friend_template: PathBuf,
+    pub(crate) qianxing_profile_view_profile_template: PathBuf,
     pub(crate) world_wish_template: PathBuf,
     pub(crate) chat_templates: ResolvedTemplateArgs,
     /// 面板判据模板（好友面板 / 更多设置菜单 / 添加好友页 / 确认弹窗 /
@@ -50,13 +70,15 @@ pub(crate) struct ResolvedUiTemplateArgs {
     pub(crate) friend_panel_template: PathBuf,
     pub(crate) friend_search_panel_template: PathBuf,
     pub(crate) friend_block_chat_template: PathBuf,
-    pub(crate) friend_confirm_template: PathBuf,
+    /// 确认按钮模板（拉黑/屏蔽弹窗，65×34 纯文字「确认」）。
+    pub(crate) confirm_button_template: PathBuf,
+    /// 确认弹窗文案关键词锚点：进入大厅 / 离开大厅 / 屏蔽玩家。
+    pub(crate) confirm_message_random_hall_template: PathBuf,
+    pub(crate) confirm_message_return_teyvat_template: PathBuf,
+    pub(crate) confirm_message_block_template: PathBuf,
     pub(crate) invite_view_star_template: PathBuf,
     pub(crate) invite_goto_hall_template: PathBuf,
     pub(crate) invite_enter_hall_template: PathBuf,
-    /// 提瓦特派蒙菜单（ESC 系统菜单）的专属锚点。它和二级聊天共用同一个圆形返回
-    /// 按钮，只靠返回按钮会把菜单误判成二级；这个「商城」图标只在该菜单出现。
-    pub(crate) paimon_menu_panel_template: PathBuf,
 }
 
 impl UiTemplateArgs {
@@ -67,10 +89,6 @@ impl UiTemplateArgs {
     ) -> ResolvedUiTemplateArgs {
         ResolvedUiTemplateArgs {
             panel_downsample_factors: templates.panel_downsample_factors.clone(),
-            friend_template: self
-                .friend_template
-                .clone()
-                .unwrap_or_else(|| templates.friend.clone()),
             secondary_back_template: self
                 .secondary_back_template
                 .clone()
@@ -79,16 +97,39 @@ impl UiTemplateArgs {
                 .main_menu_template
                 .clone()
                 .unwrap_or_else(|| templates.main_menu.clone()),
+            secondary_chat_submit_template: templates.secondary_chat_submit.clone(),
+            qianxing_f2_hall_list_template: templates.qianxing_f2_hall_list.clone(),
+            qianxing_f2_invite_player_template: templates.qianxing_f2_invite_player.clone(),
+            qianxing_exit_menu_template: templates.qianxing_exit_menu.clone(),
+            qianxing_map_label_template: templates.qianxing_map_label.clone(),
+            qianxing_profile_page_wishlist_template: templates
+                .qianxing_profile_page_wishlist
+                .clone(),
+            qianxing_profile_page_wardrobe_template: templates
+                .qianxing_profile_page_wardrobe
+                .clone(),
+            teyvat_profile_adventure_rank_template: templates
+                .teyvat_profile_adventure_rank
+                .clone(),
+            teyvat_profile_world_level_template: templates.teyvat_profile_world_level.clone(),
+            teyvat_profile_add_friend_template: templates.teyvat_profile_add_friend.clone(),
+            qianxing_profile_domain_level_template: templates.qianxing_profile_domain_level.clone(),
+            qianxing_profile_add_friend_template: templates.qianxing_profile_add_friend.clone(),
+            qianxing_profile_view_profile_template: templates.qianxing_profile_view_profile.clone(),
             world_wish_template: templates.world_wish.clone(),
             chat_templates: self.chat_templates.resolve(templates, ocr),
             friend_panel_template: templates.friend_panel.clone(),
             friend_search_panel_template: templates.friend_search_panel.clone(),
             friend_block_chat_template: templates.friend_block_chat.clone(),
-            friend_confirm_template: templates.friend_confirm.clone(),
+            confirm_button_template: templates.confirm_button.clone(),
+            confirm_message_random_hall_template: templates.confirm_message_random_hall.clone(),
+            confirm_message_return_teyvat_template: templates
+                .confirm_message_return_teyvat
+                .clone(),
+            confirm_message_block_template: templates.confirm_message_block.clone(),
             invite_view_star_template: templates.invite_view_star.clone(),
             invite_goto_hall_template: templates.invite_goto_hall.clone(),
             invite_enter_hall_template: templates.invite_enter_hall.clone(),
-            paimon_menu_panel_template: templates.paimon_menu_panel.clone(),
         }
     }
 }
@@ -183,7 +224,7 @@ impl UiState {
         }
     }
 
-    /// 提瓦特派蒙菜单（ESC 系统菜单）。它属于主菜单一族（`MainMenu`），
+    /// 主菜单大世界（ESC 系统菜单）。它属于主菜单一族（`MainMenu`），
     /// 但用**专属锚点**判定，因此证据里的规则名与奇域主菜单不同。
     fn paimon_menu() -> Self {
         Self {
@@ -265,7 +306,9 @@ pub(crate) struct PanelRegions {
     pub(crate) friend_panel: Rect,
     pub(crate) friend_search_panel: Rect,
     pub(crate) friend_block_chat: Rect,
-    pub(crate) friend_confirm: Rect,
+    pub(crate) confirm_button: Rect,
+    /// 确认弹窗提示文案行（三种关键词模板共用的宽行搜索区）。
+    pub(crate) confirm_message: Rect,
     pub(crate) invite_view_star: Rect,
     pub(crate) invite_goto_hall: Rect,
     pub(crate) invite_enter_hall: Rect,
@@ -308,6 +351,68 @@ impl TemplateUiStateClassifier {
         self
     }
 
+    /// F2 千星大厅页（多人面板）的**首选**判据：左下「大厅列表」+ 右下「邀请玩家」
+    /// 两个按钮锚点都命中。
+    ///
+    /// 两个模板都只保留文字（纯文字裁剪后 88x25 / 117x32），不含图标、底栏或背景；
+    /// 搜索区分别复用 `screen.hall_bar_rect`（左下）和 `screen.qianxing_f2_invite_rect`
+    /// （右下），所以不会拿宽背景冒充按钮。命中后返回 Secondary·多人面板，
+    /// 由 `surface_of` 映射为 `Secondary(MultiplayerPanel)`。
+    fn f2_hall_page_by_buttons(&self, image: &DynamicImage) -> Option<UiStateClassification> {
+        let threshold = self
+            .templates
+            .chat_templates
+            .marker_threshold
+            .max(QIANXING_F2_BUTTON_MIN);
+        let left_region: Rect = self.screen.hall_bar_rect.into();
+        let right_region: Rect = self.screen.qianxing_f2_invite_rect.into();
+        let left = best_template_candidate_downscaled(
+            image,
+            Some(left_region),
+            &self.templates.qianxing_f2_hall_list_template,
+            QIANXING_F2_BUTTON_SCALE,
+        )
+        .ok()
+        .flatten()?;
+        if !left.quality_ok || left.score < threshold {
+            return None;
+        }
+        let right = best_template_candidate_downscaled(
+            image,
+            Some(right_region),
+            &self.templates.qianxing_f2_invite_player_template,
+            QIANXING_F2_BUTTON_SCALE,
+        )
+        .ok()
+        .flatten()?;
+        if !right.quality_ok || right.score < threshold {
+            return None;
+        }
+        Some(UiStateClassification::with_evidence(
+            RuntimeUiStateKind::Secondary,
+            "secondary:qianxing_panel",
+            UiStateEvidence::new(
+                vec![
+                    template_probe(
+                        &self.templates.qianxing_f2_hall_list_template,
+                        left_region,
+                        threshold,
+                        Some(&left),
+                    ),
+                    template_probe(
+                        &self.templates.qianxing_f2_invite_player_template,
+                        right_region,
+                        threshold,
+                        Some(&right),
+                    ),
+                ],
+                None,
+                "secondary:qianxing_panel_buttons",
+            )
+            .with_world_probe(world_probe_evidence(image)),
+        ))
+    }
+
     /// 逐帧界面分类。
     ///
     /// **关于 `target: "timing"` 的级别**：这些耗时日志是逐帧执行的（值守循环每轮都分类），
@@ -340,20 +445,90 @@ impl TemplateUiStateClassifier {
         // primary/secondary/... 的判定，只是随证据一起报出去，供查询与断言。
         // 计数落在两侧空档之间时它的结论是 unknown，不会倒向任何一侧。
         let evidence = evidence.with_world_probe(world_probe_evidence(image));
+        // F2 千星大厅页（大厅内按 F2 打开的多人面板）首选**两个底部按钮**锚点：
+        // 左下「大厅列表」+ 右下「邀请玩家」。两者都命中才判 F2，因此不靠顶部
+        // 「返回提瓦特」或通用 chrome；也不会落成覆盖层·大厅卡 / 主菜单。
+        // 这个判据放在所有状态分支之前：该页偶尔会被聊天 marker 误抢成 Primary，
+        // 精确按钮对命中时应统一纠正为 Secondary·多人面板。
+        if let Some(classification) = self.f2_hall_page_by_buttons(image) {
+            self.game_fallback.reset();
+            return Ok(classification);
+        }
         // 千星大厅的**多人面板**（在大厅里按 F2 打开）第 60 节之前一直落在 `Unknown`，
         // 于是连续两帧之后会触发回退探针。这里在回退**之前**把它认出来，
         // 归到二级面板。放在这个位置是有讲究的：
         //   - 它在 `Unknown` 之后才判，所以不会抢走 primary/chat/main_menu 等已有状态；
         //   - 它在回退之前判，所以不会再被回退探针误认成大世界。
         if state.runtime_kind() == RuntimeUiStateKind::Unknown {
+            // **首选：右下角锚点模板匹配**（第 74 节）。整屏暗青比例只是后备：
+            // 它判的是"整屏偏暗青"，对亮底地图变体、对其它深色页都不够特异；
+            // 而右下角「千星奇域·大厅」+ 庙宇图标是这一页独有的措辞 + 图形。
+            // 放在 Unknown 分支最前面：它比 F2 面板（底栏描述子）、提瓦特世界判据都更具体。
+            // 证据沿用检测链（保留世界判据/标记探针），只追加本锚点探针并换 final_rule。
+            if let Some(matched) = qianxing_map_anchor_measure(
+                image,
+                &self.templates.qianxing_map_label_template,
+            )? && matched.score >= QIANXING_MAP_ANCHOR_SCORE_MIN
+            {
+                self.game_fallback.reset();
+                let anchor_rect =
+                    qianxing_map_anchor_rect(image).unwrap_or(QIANXING_MAP_ANCHOR_SEARCH);
+                let hit = TemplateHit {
+                    kind: "template".to_string(),
+                    x: matched.x,
+                    y: matched.y,
+                    width: QIANXING_MAP_ANCHOR_TEMPLATE_WIDTH,
+                    height: QIANXING_MAP_ANCHOR_TEMPLATE_HEIGHT,
+                    score: matched.score,
+                    quality_ok: true,
+                };
+                let evidence = evidence
+                    .clone()
+                    .with_template_probe(template_probe(
+                        &self.templates.qianxing_map_label_template,
+                        anchor_rect,
+                        QIANXING_MAP_ANCHOR_SCORE_MIN,
+                        Some(&hit),
+                    ))
+                    .with_final_rule("qianxing_map_label_template");
+                return Ok(UiStateClassification::with_evidence(
+                    RuntimeUiStateKind::Secondary,
+                    "secondary:qianxing_map",
+                    evidence,
+                ));
+            }
             // 顺序有讲究：先 F2 多人面板（更具体），再千星地图。
             // 两者的特征完全不同（前者是底栏描述子、后者是全屏色调），实测不会互相抢，
             // 但把更具体的放前面是更稳的写法。
             if is_qianxing_player_panel(image) {
+                // 冻结描述子兜底：按钮锚点因缩放/位移/局部遮挡没同时命中时，
+                // 仍用已标定的底栏左半结构把 F2 认出来。它只是**兜底**，标签与
+                // 按钮判据一致（Secondary·多人面板），不再归到覆盖层·大厅卡。
                 self.game_fallback.reset();
                 return Ok(UiStateClassification::with_evidence(
                     RuntimeUiStateKind::Secondary,
                     "secondary:qianxing_panel",
+                    UiStateEvidence::new(
+                        evidence.template_probes().to_vec(),
+                        evidence.marker_probe().cloned(),
+                        "secondary:qianxing_panel_ref",
+                    )
+                    .with_world_probe(world_probe_evidence(image)),
+                ));
+            }
+            // **提瓦特大世界**：第 63 节的覆盖率清点发现，150 帧整屏证据里有 **30 帧**
+            // 是货真价实的提瓦特大世界（世界判据判为 `teyvat`），却全部落在 `unknown`。
+            // 原因是 app 的 `overworld` 判定依赖右上角祈愿顶栏这一个模板，
+            // 那段录制里没有它，于是整段失判（第 59 节已量化过一次）。
+            //
+            // 这里直接用第 57/58 节已验证的**世界判据**补：HUD 在场**且**判为提瓦特，
+            // 那就是提瓦特大世界。它比"祈愿顶栏"正交得多——菜单/面板的 HUD 不在场，
+            // 会被 `world_hud_scale` 直接挡掉（第 59 节实测：千星面板 `not_applicable`）。
+            if world_is_teyvat_in(image, self.screen.hall_bar_rect.into()) {
+                self.game_fallback.reset();
+                return Ok(UiStateClassification::with_evidence(
+                    RuntimeUiStateKind::Overworld,
+                    "overworld:world_criterion",
                     evidence,
                 ));
             }
@@ -365,30 +540,59 @@ impl TemplateUiStateClassifier {
                     evidence,
                 ));
             }
-            // **提瓦特大世界**：第 63 节的覆盖率清点发现，150 帧整屏证据里有 **30 帧**
-            // 是货真价实的提瓦特大世界（世界判据判为 `teyvat`），却全部落在 `unknown`。
-            // 原因是 app 的 `overworld` 判定依赖右上角祈愿顶栏这一个模板，
-            // 那段录制里没有它，于是整段失判（第 59 节已量化过一次）。
-            //
-            // 这里直接用第 57/58 节已验证的**世界判据**补：HUD 在场**且**判为提瓦特，
-            // 那就是提瓦特大世界。它比"祈愿顶栏"正交得多——菜单/面板的 HUD 不在场，
-            // 会被 `world_hud_scale` 直接挡掉（第 59 节实测：千星面板 `not_applicable`）。
-            if world_is_teyvat(image) {
+            // 亮底千星地图变体：必须在提瓦特世界判据之后（提瓦特地图/传送帧归 Overworld）。
+            if is_bright_qianxing_map(image) {
                 self.game_fallback.reset();
                 return Ok(UiStateClassification::with_evidence(
-                    RuntimeUiStateKind::Overworld,
-                    "overworld:world_criterion",
+                    RuntimeUiStateKind::Secondary,
+                    "secondary:qianxing_map",
                     evidence,
                 ));
             }
         }
-        let base =
+        let mut base =
             UiStateClassification::with_evidence(state.runtime_kind(), state.to_string(), evidence);
+        // 千星覆盖页偶尔会被聊天 marker 误抢成 Primary（例：wonderland-collection 的蓝色圆形图标
+        // 被当成 8 个蓝 marker）。覆盖页有"右上白色关闭按钮"、大厅没有（实测 ≤0.13），
+        // 因此 Primary 只要带这个关闭按钮就改判覆盖层。
+        if self.panels.is_some()
+            && base.kind() == RuntimeUiStateKind::Primary
+            && is_qianxing_overlay_close(image)
+        {
+            // 个人资料页同样带这个白色关闭按钮，蓝色星点背景还可能被当成聊天 marker。
+            // 右下角「心愿单」+「衣橱」双命中时优先判个人资料页；否则维持覆盖层·其他。
+            base = self.profile_page_by_buttons(image).unwrap_or_else(|| {
+                UiStateClassification::with_evidence(
+                    RuntimeUiStateKind::Panel,
+                    "panel:qianxing_page",
+                    base.evidence().clone(),
+                )
+            });
+        }
         if base.kind() != RuntimeUiStateKind::Unknown {
             self.game_fallback.reset();
             // 面板叠在二级聊天之上时（例如头像弹窗），基础链只看到 secondary；
             // 这里做一次面板细化，把它认出来。
-            return Ok(self.refine_panel(image).unwrap_or(base));
+            // **只在 Secondary 上细化**：MainMenu/Loading/Primary/Overworld 已有强判据，
+            // 面板模板不能把它们覆盖掉（否则主菜单千星会被大厅卡模板误判成 Panel）。
+            if base.kind() == RuntimeUiStateKind::Secondary {
+                // F2 页面的基础链偶尔会先判成二级聊天（聊天 marker 在），
+                // 描述子命中时纠正为多人面板；否则再做普通面板细化。
+                if is_qianxing_player_panel(image) {
+                    return Ok(UiStateClassification::with_evidence(
+                        RuntimeUiStateKind::Secondary,
+                        "secondary:qianxing_panel",
+                        UiStateEvidence::new(
+                            Vec::new(),
+                            base.evidence().marker_probe().cloned(),
+                            "secondary:qianxing_panel_ref",
+                        )
+                        .with_world_probe(world_probe_evidence(image)),
+                    ));
+                }
+                return Ok(self.refine_panel(image).unwrap_or(base));
+            }
+            return Ok(base);
         }
         let result = self.game_fallback.observe_unknown(now, base, || {
             probe_game_state(
@@ -398,7 +602,437 @@ impl TemplateUiStateClassifier {
                 self.game_entry.as_ref(),
             )
         })?;
-        Ok(self.refine_panel(image).unwrap_or(result))
+        if let Some(refined) = self.refine_panel(image) {
+            return Ok(refined);
+        }
+        // refine_panel 的专属锚点没命中时，再看"右上白色关闭按钮"这个千星全屏覆盖页结构。
+        // 放在 refine 之后是为了保留已有专属 label（大厅卡/好友面板…），
+        // 也让 friend_delivery 依赖的"大厅信息页(大厅卡)"保持原有行为。
+        // 覆盖页判据只在面板接线已注入时启用（生产/门禁都会注入）。未注入面板的
+        // 轻量测试运行时保持原有 unknown 行为，避免改变旧调用点的语义。
+        if self.panels.is_some() && is_qianxing_overlay_close(image) {
+            // 大厅卡/主菜单这类页面右上角是「返回提瓦特」胶囊 + 关闭按钮；
+            // 千星全屏覆盖页只有圆形关闭按钮。存在返回提瓦特时保留原有大厅卡语义。
+            let threshold = self.templates.chat_templates.marker_threshold;
+            let strip = Rect {
+                x: image.width().saturating_sub(300) as i32,
+                y: 0,
+                width: 300,
+                height: 90,
+            };
+            let back_to_teyvat = best_template_candidate(
+                image,
+                Some(strip),
+                &self.templates.main_menu_template,
+            )
+            .ok()
+            .flatten()
+            .is_some_and(|hit| hit.quality_ok && hit.score >= threshold);
+            let (label, rule) = if back_to_teyvat {
+                ("panel:hall_card", "panel:hall_card")
+            } else {
+                ("panel:qianxing_page", "panel:qianxing_page")
+            };
+            return Ok(UiStateClassification::with_evidence(
+                RuntimeUiStateKind::Panel,
+                label,
+                UiStateEvidence::new(Vec::new(), None, rule),
+            ));
+        }
+        Ok(result)
+    }
+
+    /// 确认弹窗：**确认按钮 + 关键词文案**双锚点。
+    ///
+    /// 子类型由文案决定，优先级 `屏蔽玩家 > 进入大厅 > 离开大厅`；多个文案同时
+    /// 命中时只取最高优先级，避免一帧出现两个确认子类型。按钮或文案任一缺失都
+    /// 返回 `None`，调用方继续按其它面板判据分类——绝不回退到旧的单一按钮标签。
+    fn confirm_dialog_by_anchors(
+        &self,
+        image: &DynamicImage,
+        panels: &PanelRegions,
+        threshold: f32,
+    ) -> Option<UiStateClassification> {
+        // 「确认」已裁到 59×30（bbox + 2px）；1× 正样本 0.989、命中
+        // (1151,741)，4× 会被 floor 成 56×28 并把位置量化到 (1152,740)。
+        let button_scale = self
+            .templates
+            .panel_downsample_factors
+            .get("confirm_button")
+            .copied()
+            .unwrap_or(1);
+        let button = best_template_candidate_downscaled(
+            image,
+            Some(panels.confirm_button),
+            &self.templates.confirm_button_template,
+            button_scale,
+        )
+        .ok()
+        .flatten()?;
+        if !button.quality_ok || button.score < threshold {
+            return None;
+        }
+        let messages = [
+            (
+                "panel:confirm_block_player",
+                &self.templates.confirm_message_block_template,
+            ),
+            (
+                "panel:confirm_enter_hall",
+                &self.templates.confirm_message_random_hall_template,
+            ),
+            (
+                "panel:confirm_leave_hall",
+                &self.templates.confirm_message_return_teyvat_template,
+            ),
+        ];
+        for (label, template) in messages {
+            let Some(message) = best_template_candidate_downscaled(
+                image,
+                Some(panels.confirm_message),
+                template,
+                CONFIRM_MESSAGE_SCALE,
+            )
+            .ok()
+            .flatten() else {
+                continue;
+            };
+            if !message.quality_ok || message.score < CONFIRM_MESSAGE_MIN {
+                continue;
+            }
+            return Some(UiStateClassification::with_evidence(
+                RuntimeUiStateKind::Panel,
+                label,
+                UiStateEvidence::new(
+                    vec![
+                        template_probe(
+                            &self.templates.confirm_button_template,
+                            panels.confirm_button,
+                            threshold,
+                            Some(&button),
+                        ),
+                        template_probe(
+                            template,
+                            panels.confirm_message,
+                            CONFIRM_MESSAGE_MIN,
+                            Some(&message),
+                        ),
+                    ],
+                    None,
+                    label,
+                ),
+            ));
+        }
+        None
+    }
+
+    /// 个人资料页：右下角「心愿单」+「衣橱」**两个按钮模板同时命中**才成立。
+    ///
+    /// 为什么是双按钮，而不是整页/单一锚点：
+    /// - 这一页没有独有的标题文字，左侧资料卡与其它千星子页共用版式，
+    ///   单靠「右上白色关闭按钮」只能判到 `panel:qianxing_page`（Other）；
+    /// - 两个按钮是固定布局（同一 y、间隙 24 px），且只属于这一页；
+    /// - **单命中不算**：其它页面同位置也可能出现白色胶囊按钮，只有成对命中
+    ///   才代表个人资料页，因此任一模板低于阈值或不在自己的按钮位置立即返回 `None`。
+    ///
+    /// 两个搜索区分别只覆盖各自按钮，模板窗口永远碰不到底部 UID 行，
+    /// 既不影响匹配分数，也不会因为 UID 内容变化而漂移。
+    ///
+    /// 调用方必须传入**已归一化到规范画布（1920×1080）**的画面——按钮位置门控
+    /// 用的是规范坐标，`classify_at` 入口已经做过 `resize_to_canvas`。
+    fn profile_page_by_buttons(&self, image: &DynamicImage) -> Option<UiStateClassification> {
+        let (wishlist_region, wardrobe_region) = profile_page_button_rects(image)?;
+        let wishlist = best_template_candidate_downscaled(
+            image,
+            Some(wishlist_region),
+            &self.templates.qianxing_profile_page_wishlist_template,
+            PROFILE_PAGE_BUTTON_SCALE,
+        )
+        .ok()
+        .flatten()?;
+        if !profile_page_button_hit(
+            &wishlist,
+            PROFILE_PAGE_WISHLIST_ORIGIN,
+            PROFILE_PAGE_BUTTON_SCORE_MIN,
+        ) {
+            return None;
+        }
+        let wardrobe = best_template_candidate_downscaled(
+            image,
+            Some(wardrobe_region),
+            &self.templates.qianxing_profile_page_wardrobe_template,
+            PROFILE_PAGE_BUTTON_SCALE,
+        )
+        .ok()
+        .flatten()?;
+        if !profile_page_button_hit(
+            &wardrobe,
+            PROFILE_PAGE_WARDROBE_ORIGIN,
+            PROFILE_PAGE_BUTTON_SCORE_MIN,
+        ) {
+            return None;
+        }
+        Some(UiStateClassification::with_evidence(
+            RuntimeUiStateKind::Panel,
+            "panel:profile_page",
+            UiStateEvidence::new(
+                vec![
+                    template_probe(
+                        &self.templates.qianxing_profile_page_wishlist_template,
+                        wishlist_region,
+                        PROFILE_PAGE_BUTTON_SCORE_MIN,
+                        Some(&wishlist),
+                    ),
+                    template_probe(
+                        &self.templates.qianxing_profile_page_wardrobe_template,
+                        wardrobe_region,
+                        PROFILE_PAGE_BUTTON_SCORE_MIN,
+                        Some(&wardrobe),
+                    ),
+                ],
+                None,
+                "panel:profile_page",
+            ),
+        ))
+    }
+
+    /// 更多设置菜单优先于资料卡四分类。
+    ///
+    /// ⋯ 菜单展开时，底下仍然是资料卡；如果先判资料卡，会把「更多设置」
+    /// 误判成「千星资料卡·好友」。这个探针只在菜单自身窄条区域里匹配，
+    /// 不会扫到资料卡的其它按钮。
+    fn more_settings_by_menu(
+        &self,
+        image: &DynamicImage,
+        panels: &PanelRegions,
+        threshold: f32,
+    ) -> Option<UiStateClassification> {
+        // 菜单锚点本身已经限定在菜单窄条区域，不再依赖米黄占比；
+        // 否则「⋯菜单叠在资料卡上」时米黄只有 0.26，会被资料卡抢走。
+        // 菜单里独有的「屏蔽聊天」：区域仍是菜单自身，阈值 0.92
+        // （与 refine_panel 后面同一条判据保持一致）。
+        let block_min = threshold.max(0.92);
+        if let Some(candidate) = best_template_candidate_downscaled(
+            image,
+            Some(panels.friend_block_chat),
+            &self.templates.friend_block_chat_template,
+            4,
+        )
+        .ok()
+        .flatten()
+            && candidate.quality_ok
+            && candidate.score >= block_min
+        {
+            return Some(UiStateClassification::with_evidence(
+                RuntimeUiStateKind::Panel,
+                "panel:more_settings",
+                UiStateEvidence::new(
+                    vec![template_probe(
+                        &self.templates.friend_block_chat_template,
+                        panels.friend_block_chat,
+                        block_min,
+                        Some(&candidate),
+                    )],
+                    None,
+                    "panel:more_settings",
+                ),
+            ));
+        }
+        None
+    }
+
+    /// 资料卡四分类：提瓦特 / 千星 × 好友 / 非好友，全部模板匹配，不用 OCR。
+    ///
+    /// 判据（与用户确认的效果一致）：
+    /// - 提瓦特：`冒险等阶` **且** `世界等级` → 提瓦特资料卡；
+    ///   `添加好友`（深色按钮白字）命中 → 非好友，未命中 → 好友。
+    /// - 千星：`奇域等级` → 千星资料卡；`添加好友`（白色胶囊深色字）命中 → 非好友；
+    ///   未命中但 `查看资料`（白色胶囊）命中 → 好友。
+    ///
+    /// 为什么放在旧档案卡之前：旧的 `panel:archive_card` 只是兼容兜底，
+    /// 只要资料卡专属锚点命中就必须先出具体四分类，不能让旧判据抢走。
+    /// 也不用「本期缤纷评分」：它会随赛季变化，且不是好友判据。
+    fn profile_card_by_templates(
+        &self,
+        image: &DynamicImage,
+        threshold: f32,
+    ) -> Option<UiStateClassification> {
+        let anchor_min = threshold.max(PROFILE_CARD_ANCHOR_MIN);
+        let action_min = threshold.max(PROFILE_CARD_ACTION_MIN);
+        let view_min = threshold.max(PROFILE_CARD_VIEW_MIN);
+
+        // ── 提瓦特资料卡：冒险等阶 + 世界等级 双文字锚点 ──────────────────
+        let teyvat_rank = best_template_candidate_downscaled(
+            image,
+            Some(TEYVAT_PROFILE_RANK_SEARCH),
+            &self.templates.teyvat_profile_adventure_rank_template,
+            TEYVAT_PROFILE_ANCHOR_SCALE,
+        )
+        .ok()
+        .flatten();
+        let teyvat_world = best_template_candidate_downscaled(
+            image,
+            Some(TEYVAT_PROFILE_WORLD_SEARCH),
+            &self.templates.teyvat_profile_world_level_template,
+            TEYVAT_PROFILE_ANCHOR_SCALE,
+        )
+        .ok()
+        .flatten();
+        let teyvat_anchors = teyvat_rank
+            .as_ref()
+            .is_some_and(|hit| hit_matches(hit, anchor_min))
+            && teyvat_world
+                .as_ref()
+                .is_some_and(|hit| hit_matches(hit, anchor_min));
+        if teyvat_anchors {
+            let add = best_template_candidate_downscaled(
+                image,
+                Some(TEYVAT_PROFILE_ADD_FRIEND_SEARCH),
+                &self.templates.teyvat_profile_add_friend_template,
+                1,
+            )
+            .ok()
+            .flatten();
+            // 位置门控：好友帧没有按钮，纯文字模板仍可能在卡片右下角附近拿到
+            // 0.947；分数 + 实测原点双门控才能把好友帧稳定挡在 0.95 以下。
+            let nonfriend = add.as_ref().is_some_and(|hit| {
+                hit_matches(hit, action_min)
+                    && (hit.x - TEYVAT_PROFILE_ADD_FRIEND_ORIGIN.0).abs()
+                        <= TEYVAT_PROFILE_ADD_FRIEND_TOLERANCE
+                    && (hit.y - TEYVAT_PROFILE_ADD_FRIEND_ORIGIN.1).abs()
+                        <= TEYVAT_PROFILE_ADD_FRIEND_TOLERANCE
+            });
+            let label = if nonfriend {
+                "panel:teyvat_profile_nonfriend"
+            } else {
+                "panel:teyvat_profile_friend"
+            };
+            return Some(UiStateClassification::with_evidence(
+                RuntimeUiStateKind::Panel,
+                label,
+                UiStateEvidence::new(
+                    vec![
+                        template_probe(
+                            &self.templates.teyvat_profile_adventure_rank_template,
+                            TEYVAT_PROFILE_RANK_SEARCH,
+                            anchor_min,
+                            teyvat_rank.as_ref(),
+                        ),
+                        template_probe(
+                            &self.templates.teyvat_profile_world_level_template,
+                            TEYVAT_PROFILE_WORLD_SEARCH,
+                            anchor_min,
+                            teyvat_world.as_ref(),
+                        ),
+                        template_probe(
+                            &self.templates.teyvat_profile_add_friend_template,
+                            TEYVAT_PROFILE_ADD_FRIEND_SEARCH,
+                            action_min,
+                            add.as_ref(),
+                        ),
+                    ],
+                    None,
+                    label,
+                ),
+            ));
+        }
+
+        // ── 千星资料卡：奇域等级 单文字锚点 ──────────────────────────────
+        let domain = best_template_candidate_downscaled(
+            image,
+            Some(QIANXING_PROFILE_DOMAIN_SEARCH),
+            &self.templates.qianxing_profile_domain_level_template,
+            1,
+        )
+        .ok()
+        .flatten();
+        if !domain
+            .as_ref()
+            .is_some_and(|hit| hit_matches(hit, anchor_min))
+        {
+            return None;
+        }
+        let add = best_template_candidate_downscaled(
+            image,
+            Some(QIANXING_PROFILE_ADD_FRIEND_SEARCH),
+            &self.templates.qianxing_profile_add_friend_template,
+            1,
+        )
+        .ok()
+        .flatten();
+        if add
+            .as_ref()
+            .is_some_and(|hit| hit_matches(hit, action_min))
+        {
+            let label = "panel:qianxing_profile_nonfriend";
+            return Some(UiStateClassification::with_evidence(
+                RuntimeUiStateKind::Panel,
+                label,
+                UiStateEvidence::new(
+                    vec![
+                        template_probe(
+                            &self.templates.qianxing_profile_domain_level_template,
+                            QIANXING_PROFILE_DOMAIN_SEARCH,
+                            anchor_min,
+                            domain.as_ref(),
+                        ),
+                        template_probe(
+                            &self.templates.qianxing_profile_add_friend_template,
+                            QIANXING_PROFILE_ADD_FRIEND_SEARCH,
+                            action_min,
+                            add.as_ref(),
+                        ),
+                    ],
+                    None,
+                    label,
+                ),
+            ));
+        }
+        let view = best_template_candidate_downscaled(
+            image,
+            Some(QIANXING_PROFILE_VIEW_SEARCH),
+            &self.templates.qianxing_profile_view_profile_template,
+            1,
+        )
+        .ok()
+        .flatten()
+        .filter(|hit| hit_matches(hit, view_min));
+        let (label, region, candidate) = match view {
+            Some(candidate) => (
+                "panel:qianxing_profile_friend",
+                QIANXING_PROFILE_VIEW_SEARCH,
+                Some(candidate),
+            ),
+            None => return None,
+        };
+        Some(UiStateClassification::with_evidence(
+            RuntimeUiStateKind::Panel,
+            label,
+            UiStateEvidence::new(
+                vec![
+                    template_probe(
+                        &self.templates.qianxing_profile_domain_level_template,
+                        QIANXING_PROFILE_DOMAIN_SEARCH,
+                        anchor_min,
+                        domain.as_ref(),
+                    ),
+                    template_probe(
+                        &self.templates.qianxing_profile_add_friend_template,
+                        QIANXING_PROFILE_ADD_FRIEND_SEARCH,
+                        action_min,
+                        add.as_ref(),
+                    ),
+                    template_probe(
+                        &self.templates.qianxing_profile_view_profile_template,
+                        region,
+                        view_min,
+                        candidate.as_ref(),
+                    ),
+                ],
+                None,
+                label,
+            ),
+        ))
     }
 
     /// 面板细化：好友面板 / 添加好友页 / 更多设置 / 确认弹窗 /
@@ -410,6 +1044,10 @@ impl TemplateUiStateClassifier {
     /// 因此它**不是**任何面板的判据；更多设置菜单改用**只有菜单展开时才存在**的
     /// `屏蔽聊天` 条目（实测 0.989，其它帧最高 0.854）。
     ///
+    /// **文字锚点还必须限定区域**：`屏蔽聊天` 只保留文字，搜索区收窄到
+    /// `panels.friend_block_chat`（⋯下拉菜单自身所在窄条），不扫全帧，避免把
+    /// 提瓦特好友详情卡的同类按钮列误判成⋯菜单。
+    ///
     /// **顺序也参与判别**：大厅卡与档案卡都含一条深色通栏按钮，`进入该大厅`
     /// （大厅卡 0.994）排在 `前往其大厅`（档案卡 0.962）之前，避免大厅卡被
     /// `前往其大厅` 的暗按钮误命中（实测大厅卡 0.905）。
@@ -419,10 +1057,90 @@ impl TemplateUiStateClassifier {
     fn refine_panel(&self, image: &DynamicImage) -> Option<UiStateClassification> {
         let panels = self.panels.as_ref()?;
         let threshold = self.templates.chat_templates.marker_threshold;
+        // ── 确认弹窗优先：确认按钮 + 关键词文案双锚点 ──────────────────────
+        // 所有确认弹窗都必须双锚点；只有按钮、没有文案不算确认弹窗。
+        // 放在最前面：确认弹窗可能叠在千星覆盖页/好友页之上，若先走覆盖页门控
+        // 就会在到达这里之前返回 `panel:qianxing_page`。按钮探针区域只有 81×58，
+        // 未命中时成本可忽略；命中后才扫描 620×90 的文案行。
+        if let Some(confirm) = self.confirm_dialog_by_anchors(image, panels, threshold) {
+            return Some(confirm);
+        }
+        // ── 更多设置菜单优先于资料卡 ────────────────────────────────────
+        // ⋯菜单展开时底下仍是资料卡；先判资料卡会把「更多设置」误判成
+        // 「千星资料卡·好友」。菜单锚点只在自身窄条区域内匹配。
+        if let Some(menu) = self.more_settings_by_menu(image, panels, threshold) {
+            return Some(menu);
+        }
+        // ── 资料卡四分类优先（模板匹配，不用 OCR）────────────────────────
+        // 顺序要求：必须在旧 `panel:archive_card`、添加好友详情之前命中即停，
+        // 否则资料卡会被旧档案卡判据或 `not_state` 抢走。
+        // 四类只由「冒险等阶+世界等级 / 奇域等级」与「添加好友 / 查看资料」决定。
+        if let Some(profile) = self.profile_card_by_templates(image, threshold) {
+            return Some(profile);
+        }
+        let anchor_threshold = threshold.max(0.95);
+        // ── 个人资料页优先（右下角双按钮）──────────────────────────────
+        // 比「右上白色关闭按钮」更具体，也便宜：只在右下角 520×130 里做两次
+        // 1/2 下采样匹配。命中即停，不再计算米黄/暗度门控，也不会被
+        // 档案卡/大厅卡分支抢走；单个按钮命中时返回 None，继续走原分支。
+        if let Some(profile) = self.profile_page_by_buttons(image) {
+            return Some(profile);
+        }
+        // ── 千星覆盖页优先（经验证集校验的门控）──────────────────────────
+        // 千星页和提瓦特面板共用白色圆角控件，提瓦特模板在千星页会误命中（0.73–0.92）。
+        // 门控来自正/负验证集：米黄面板占比（teyvat ≥0.34）、页面暗度（退出菜单 ≥0.55）、
+        // 右上关闭按钮（千星页有）。每类专属锚点只在对应门控内使用，避免互串。
+        let beige = beige_panel_fraction(image);
+        let dark_ratio = screen_tone(image).0;
+        let overlay_close = is_qianxing_overlay_close(image);
+        if overlay_close {
+            let close_frac = overlay_close_white_fraction(image);
+            if beige < 0.34 || close_frac > 0.5 {
+                return Some(UiStateClassification::with_evidence(
+                    RuntimeUiStateKind::Panel,
+                    "panel:qianxing_page",
+                    UiStateEvidence::new(Vec::new(), None, "panel:qianxing_page"),
+                ));
+            }
+        }
+        // 退出菜单覆层：米黄极少（0.047）或整片偏暗（暗占比高）。
+        // 模板只保留第一行「退出至登录界面」（197×29），搜索区固定在该行实测位置
+        // 附近；单行文字很短，再用原点门控挡住区域内其它近似文字。
+        if beige < 0.12 || dark_ratio >= 0.40 {
+            let candidate = best_template_candidate_downscaled(
+                image,
+                Some(QIANXING_EXIT_MENU_SEARCH),
+                &self.templates.qianxing_exit_menu_template,
+                QIANXING_EXIT_MENU_SCALE,
+            )
+            .ok()
+            .flatten();
+            if candidate.as_ref().is_some_and(|hit| {
+                hit.quality_ok
+                    && hit.score >= anchor_threshold
+                    && (hit.x - QIANXING_EXIT_MENU_ORIGIN.0).abs() <= QIANXING_EXIT_MENU_TOLERANCE
+                    && (hit.y - QIANXING_EXIT_MENU_ORIGIN.1).abs() <= QIANXING_EXIT_MENU_TOLERANCE
+            }) {
+                return Some(UiStateClassification::with_evidence(
+                    RuntimeUiStateKind::Panel,
+                    "panel:qianxing_page",
+                    UiStateEvidence::new(
+                        vec![template_probe(
+                            &self.templates.qianxing_exit_menu_template,
+                            QIANXING_EXIT_MENU_SEARCH,
+                            anchor_threshold,
+                            candidate.as_ref(),
+                        )],
+                        None,
+                        "panel:qianxing_page",
+                    ),
+                ));
+            }
+        }
         // 最后一个数字是**降采样倍数**：代价 ≈ 候选位置数 × 模板像素数，两个维度都除以
         // `scale`，总代价降到约 `1/scale⁴`（4 即约 256×）。只给"大模板"降采样；小图标
-        // （friend-panel 49×35 / search 96×33）本身几乎免费，降采样反而把信息抹掉。
-        let cases: [(&str, &PathBuf, Rect, u32); 7] = [
+        // （friend-panel 49×35 / search 50×25）本身几乎免费，降采样反而把信息抹掉。
+        let cases: [(&str, &PathBuf, Rect, u32); 6] = [
             (
                 "panel:friend_list",
                 &self.templates.friend_panel_template,
@@ -436,34 +1154,36 @@ impl TemplateUiStateClassifier {
                 4,
             ),
             (
+                "panel:hall_card",
+                &self.templates.invite_enter_hall_template,
+                panels.invite_enter_hall,
+                // 纯文字「进入该大厅」：1/2 下采样正样本 ~0.96；
+                // 1/4 会把字形压得太小、正样本掉到阈值下。
+                2,
+            ),
+            (
+                "panel:archive_card",
+                &self.templates.invite_goto_hall_template,
+                panels.invite_goto_hall,
+                // 纯文字「前往其大厅」本次裁到 122×26（bbox + 2px）。1/2 下采样时
+                // 模板原点 (1017,573) 与区域原点 (780,560) 的相位差 2px，正样本
+                // 掉到 0.889；1× 实测正样本 0.990/1.000、负样本 ≤0.863（质量拒绝），
+                // 因此改回 1×。同区域的「查看资料」兜底也用同一个 1×。
+                1,
+            ),
+            (
                 "panel:add_friend",
                 &self.templates.friend_search_panel_template,
                 panels.friend_search_panel,
                 1,
             ),
             (
-                "panel:confirm_dialog",
-                &self.templates.friend_confirm_template,
-                panels.friend_confirm,
-                4,
-            ),
-            (
-                "panel:hall_card",
-                &self.templates.invite_enter_hall_template,
-                panels.invite_enter_hall,
-                4,
-            ),
-            (
-                "panel:archive_card",
-                &self.templates.invite_goto_hall_template,
-                panels.invite_goto_hall,
-                4,
-            ),
-            (
                 "panel:avatar_popup",
                 &self.templates.invite_view_star_template,
                 panels.invite_view_star,
-                4,
+                // 纯文字「查看千星奇域档案」：1/2 正样本 0.946，负样本
+                // （大厅卡/更多设置）分数虽然接近 0.90，但文字质量校验会拒绝。
+                2,
             ),
         ];
         for (label, path, region, scale) in cases {
@@ -471,7 +1191,6 @@ impl TemplateUiStateClassifier {
                 "panel:friend_list" => "friend_panel",
                 "panel:more_settings" => "friend_block_chat",
                 "panel:add_friend" => "friend_search_panel",
-                "panel:confirm_dialog" => "friend_confirm",
                 "panel:hall_card" => "invite_enter_hall",
                 "panel:archive_card" => "invite_goto_hall",
                 "panel:avatar_popup" => "invite_view_star",
@@ -488,16 +1207,62 @@ impl TemplateUiStateClassifier {
                     Ok(candidate) => candidate,
                     Err(_) => continue,
                 };
-            if candidate_matches(&candidate, threshold) {
+            // 「屏蔽聊天」只有 4 个字：纯文字化后字形完整、抗锯齿连续，质量校验不再
+            // 像旧版残缺 mask 那样偶然拒绝近似按钮（实测地图侧栏「真境剧诗」、
+            // 好友详情「申请加入」都能到 0.90–0.91）。真面板实测 0.947–0.979，因此这个
+            // 短文字锚点单独要求 ≥0.92；其余面板仍用统一阈值。
+            let case_threshold = if label == "panel:more_settings" {
+                threshold.max(0.92)
+            } else {
+                threshold
+            };
+            if candidate_matches(&candidate, case_threshold) {
                 return Some(UiStateClassification::with_evidence(
                     RuntimeUiStateKind::Panel,
                     label,
                     UiStateEvidence::new(
-                        vec![template_probe(path, region, threshold, candidate.as_ref())],
+                        vec![template_probe(
+                            path,
+                            region,
+                            case_threshold,
+                            candidate.as_ref(),
+                        )],
                         None,
                         label,
                     ),
                 ));
+            }
+            // 档案卡有两种按钮版式：旧版有「前往其大厅」，新版只有「查看资料」。
+            // 两者都是纯文字锚点（同一套文字质量校验），新版用同目录的
+            // `invite-view-profile.png` 在同一搜索区内兜底；文件不存在时匹配器返回
+            // None，分类继续按原流程落到 qianxing_page/unknown。
+            // 「添加好友」不再是档案卡兜底：它只服务提瓦特资料卡「非好友」判据，
+            // 且该按钮会被资料卡浮层覆盖。
+            if label == "panel:archive_card" {
+                let alternate = path.with_file_name("invite-view-profile.png");
+                if let Ok(Some(candidate)) = best_template_candidate_downscaled(
+                    image,
+                    Some(region),
+                    &alternate,
+                    scale,
+                ) && candidate.quality_ok
+                    && candidate.score >= threshold
+                {
+                    return Some(UiStateClassification::with_evidence(
+                        RuntimeUiStateKind::Panel,
+                        label,
+                        UiStateEvidence::new(
+                            vec![template_probe(
+                                &alternate,
+                                region,
+                                threshold,
+                                Some(&candidate),
+                            )],
+                            None,
+                            label,
+                        ),
+                    ));
+                }
             }
         }
         None
@@ -652,12 +1417,12 @@ fn probe_game_state(
     let wish_matched = candidate_matches(&candidate, templates.chat_templates.marker_threshold);
     // 祈愿顶栏命中**还不够**：千星大厅的多人面板也会命中它（第 59 节实测）。
     // 再叠一道正交的世界判据——必须「有 HUD 且判为提瓦特」才算大世界。
-    let world_is_teyvat = wish_matched && world_is_teyvat(image);
+    let world_is_teyvat = wish_matched && world_is_teyvat_in(image, screen.hall_bar_rect.into());
     let rule = match (wish_matched, world_is_teyvat) {
         (true, true) => "world_wish_template",
         // 明确区分「顶栏命中但世界判据否掉」：这条规则名让误判在日志里一眼可见，
         // 不会再伪装成正常的大世界判定。
-        (true, false) => "world_wish_without_teyvat_hud",
+        (true, false) => "world_wish_without_hud_bottom_bar",
         (false, _) => "no_game_anchor",
     };
     let evidence = UiStateEvidence::new(
@@ -670,6 +1435,21 @@ fn probe_game_state(
         None,
         rule,
     );
+    // **可选 OCR 后备**（不参与常规路径）：模板锚点没命中时（例如标签被缩放 /
+    // 抗锯齿改写导致形状分掉到阈值以下），再用同一块右下角 ROI 的文本确认一次。
+    // 只在回退探针里跑（`Unknown` 且每 `GAME_STATE_PROBE_INTERVAL` 一次），
+    // 不给每帧分类增加 OCR 负担；离线门禁与单测走 `game_entry = None` 分支，
+    // 模板路径完全不依赖 OCR。
+    if !world_is_teyvat
+        && let Some(game_entry) = game_entry
+        && let Some(region) = qianxing_map_anchor_rect(image)
+        && qianxing_map_label_via_ocr(&game_entry.ocr, image, region)?
+    {
+        return Ok(UiStateClassification::new(
+            RuntimeUiStateKind::Secondary,
+            "secondary:qianxing_map",
+        ));
+    }
     Ok(UiStateClassification::with_evidence(
         if world_is_teyvat {
             RuntimeUiStateKind::Overworld
@@ -709,6 +1489,171 @@ fn detect_ui_state(
     screen: &config::ScreenConfig,
 ) -> Result<UiState> {
     Ok(detect_ui_state_with_evidence(image, templates, screen)?.0)
+}
+
+/// 主菜单大世界左侧功能宫格的**布局无关**检测参数。
+///
+/// 用户 2026-11-10 指出固定「队伍配置/成就」坐标不稳定、蓝色区域会变，要求**极快**；
+/// 因此不再用固定模板/固定列距，改为：
+///  ① downscale 1/8 后按**瓦片底色**取掩码（深蓝灰，不是白色图标）；
+///  ② 4 连通域分析，取尺寸/长宽比符合"功能瓦片"的连通块；
+///  ③ 要求足够多块（≥8）且排成多列多行（≥3 列、≥2 行）——**只看结构，不看坐标**；
+///  ④ 允许菜单项平移/增删/顺序变化：检测只依赖"多块同尺寸瓦片构成的宫格"。
+///
+/// 颜色范围来自 1920×1080 真实派蒙 ESC 帧的瓦片底色实测（≈(66,75,92)），
+/// 不是商城/图标/OCR 文案。
+const PAIMON_GRID_DOWNSCALE: u32 = 8;
+/// 只扫画面左侧这一条（菜单面板所在侧），不是固定瓦片坐标。
+const PAIMON_GRID_LEFT_PERCENT: u32 = 45;
+const PAIMON_GRID_MIN_TILES: usize = 8;
+const PAIMON_GRID_MIN_COLS: usize = 3;
+const PAIMON_GRID_MIN_ROWS: usize = 2;
+
+/// 一块「功能瓦片」在 1/8 下采样网格里的尺寸/面积范围。
+const PAIMON_GRID_TILE_MIN_AREA: usize = 60;
+const PAIMON_GRID_TILE_MAX_AREA: usize = 900;
+const PAIMON_GRID_TILE_MIN_W: usize = 10;
+const PAIMON_GRID_TILE_MAX_W: usize = 26;
+const PAIMON_GRID_TILE_MIN_H: usize = 12;
+const PAIMON_GRID_TILE_MAX_H: usize = 30;
+
+/// 瓦片底色（深蓝灰）的通道范围；图标白、面板浅底、世界背景都不落在这里。
+fn is_paimon_grid_tile_pixel(pixel: &image::Rgb<u8>) -> bool {
+    let (r, g, b) = (pixel[0] as i32, pixel[1] as i32, pixel[2] as i32);
+    (40..=115).contains(&r)
+        && (45..=125).contains(&g)
+        && (60..=150).contains(&b)
+        && b > r + 8
+        && g + 2 >= r
+        && (5..=40).contains(&(b - g))
+}
+
+/// 左侧菜单「多瓦片宫格结构」检测。返回 `(瓦片数, 行数, 列数)`；不是该结构返回 `None`。
+///
+/// **耗时**：1920×1080 → 只看左侧 45% → 1/8 采样（≈32k 像素）→ 14k 格掩码 +
+/// 4 连通域；实测单帧远低于 5ms（见 `paimon_grid_detection_is_fast`）。
+fn paimon_menu_grid_structure(image: &DynamicImage) -> Option<(usize, usize, usize)> {
+    let (width, height) = (image.width(), image.height());
+    if width < 640 || height < 360 {
+        return None;
+    }
+    let step = PAIMON_GRID_DOWNSCALE;
+    let grid_w = (width * PAIMON_GRID_LEFT_PERCENT / 100 / step).max(1) as usize;
+    let grid_h = (height / step).max(1) as usize;
+    // Rgb8 帧直接借用；RGBA/灰度帧才做一次转换（线上截图是 Rgb8）。
+    let converted = if image.as_rgb8().is_none() {
+        Some(image.to_rgb8())
+    } else {
+        None
+    };
+    let rgb = image.as_rgb8().or(converted.as_ref())?;
+
+    let mut mask = vec![false; grid_w * grid_h];
+    for gy in 0..grid_h {
+        let y = (gy as u32 * step + step / 2).min(height - 1);
+        for gx in 0..grid_w {
+            let x = (gx as u32 * step + step / 2).min(width - 1);
+            mask[gy * grid_w + gx] = is_paimon_grid_tile_pixel(rgb.get_pixel(x, y));
+        }
+    }
+
+    // 4 连通域 + 尺寸/长宽比过滤，收集"瓦片"包围盒。
+    let mut seen = vec![false; mask.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut tiles: Vec<(i32, i32, i32, i32)> = Vec::new(); // (x0, y0, w, h)
+    for start in 0..mask.len() {
+        if !mask[start] || seen[start] {
+            continue;
+        }
+        stack.clear();
+        stack.push(start);
+        seen[start] = true;
+        let (mut area, mut x0, mut x1, mut y0, mut y1) = (0usize, i32::MAX, 0, i32::MAX, 0);
+        while let Some(index) = stack.pop() {
+            area += 1;
+            let x = (index % grid_w) as i32;
+            let y = (index / grid_w) as i32;
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+            let mut push = |nx: usize, ny: usize, stack: &mut Vec<usize>, seen: &mut Vec<bool>| {
+                let n = ny * grid_w + nx;
+                if mask[n] && !seen[n] {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            };
+            if x > 0 {
+                push((x - 1) as usize, y as usize, &mut stack, &mut seen);
+            }
+            if (x as usize) + 1 < grid_w {
+                push((x + 1) as usize, y as usize, &mut stack, &mut seen);
+            }
+            if y > 0 {
+                push(x as usize, (y - 1) as usize, &mut stack, &mut seen);
+            }
+            if (y as usize) + 1 < grid_h {
+                push(x as usize, (y + 1) as usize, &mut stack, &mut seen);
+            }
+        }
+        let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+        if (PAIMON_GRID_TILE_MIN_AREA..=PAIMON_GRID_TILE_MAX_AREA).contains(&area)
+            && (PAIMON_GRID_TILE_MIN_W..=PAIMON_GRID_TILE_MAX_W).contains(&(w as usize))
+            && (PAIMON_GRID_TILE_MIN_H..=PAIMON_GRID_TILE_MAX_H).contains(&(h as usize))
+            && {
+                let ratio = w as f32 / h as f32;
+                (0.55..=1.2).contains(&ratio)
+            }
+        {
+            tiles.push((x0, y0, w, h));
+        }
+    }
+    if tiles.len() < PAIMON_GRID_MIN_TILES {
+        return None;
+    }
+
+    // 宫格结构：按包围盒起点聚列/聚行（容差=中位宽/高的一半），不依赖绝对坐标。
+    let mut widths: Vec<i32> = tiles.iter().map(|tile| tile.2).collect();
+    let mut heights: Vec<i32> = tiles.iter().map(|tile| tile.3).collect();
+    widths.sort_unstable();
+    heights.sort_unstable();
+    let median_w = widths[widths.len() / 2];
+    let median_h = heights[heights.len() / 2];
+    let consistent = tiles
+        .iter()
+        .filter(|tile| (tile.2 - median_w).abs() <= 3 && (tile.3 - median_h).abs() <= 3)
+        .count();
+    if consistent * 5 < tiles.len() * 4 {
+        // 至少 80% 的块尺寸一致，否则不是同一套功能宫格。
+        return None;
+    }
+    let mut xs: Vec<i32> = tiles.iter().map(|tile| tile.0).collect();
+    let mut ys: Vec<i32> = tiles.iter().map(|tile| tile.1).collect();
+    xs.sort_unstable();
+    ys.sort_unstable();
+    let cols = cluster_axis_count(&xs, (median_w / 2).max(2));
+    let rows = cluster_axis_count(&ys, (median_h / 2).max(2));
+    if cols < PAIMON_GRID_MIN_COLS || rows < PAIMON_GRID_MIN_ROWS {
+        return None;
+    }
+    Some((tiles.len(), rows, cols))
+}
+
+/// 把一维坐标聚成簇并返回簇数（容差内算同一列/行）。
+fn cluster_axis_count(sorted: &[i32], tolerance: i32) -> usize {
+    let mut count = 0;
+    let mut last: Option<i32> = None;
+    for &value in sorted {
+        match last {
+            Some(previous) if (value - previous).abs() <= tolerance => {}
+            _ => {
+                count += 1;
+                last = Some(value);
+            }
+        }
+    }
+    count
 }
 
 fn detect_ui_state_with_evidence(
@@ -755,22 +1700,65 @@ fn detect_ui_state_with_evidence(
 
     // ── 2) 没有蓝/黄（无标记，或只有粉色）：底栏结构 → 大厅 ─────────────
     // 底栏是**唯一**的大厅判据（蓝/黄标记之外），按实际像素几何看三件事：
-    //   ① 块数 7–14（一排键；拼图 17 块被上限挡掉）
+    //   ① 块数 **7–8**（用户 2026-11-10 明确：千星大厅底栏只有 7~8 个白键；
+    //      聊天框开=7、关=8，两者都是 Primary。旧范围 7–14 过宽）
     //   ② 每块高度落在 22–36 px（实测 26–28；菜单整块白底是 60–64）
     //   ③ 所有块在**同一条水平线**上：顶部 y 极差 ≤4 px
     // 白色判据用严格的 225（不是纯 255：JPEG/缩放帧的白色只有 240–254）。
     let hall_region: Rect = screen.hall_bar_rect.into();
     let (hall_tiles, hall_min_height_px, hall_max_height_px, hall_top_spread_px) =
         hall_bar_signature(image, hall_region);
-    let hall_structure = (HALL_BAR_MIN_TILES..=HALL_BAR_MAX_TILES).contains(&hall_tiles)
-        && hall_min_height_px >= HALL_BAR_MIN_TILE_HEIGHT_PX
-        && hall_max_height_px <= HALL_BAR_MAX_TILE_HEIGHT_PX
-        && hall_top_spread_px <= HALL_BAR_MAX_TILE_TOP_SPREAD_PX;
-    if hall_structure {
+    let hall_structure = hall_bar_looks_like_hall_keys(
+        hall_tiles,
+        hall_min_height_px,
+        hall_max_height_px,
+        hall_top_spread_px,
+    );
+    // **有损输入兜底**：JPEG/DPI 缩放帧的白键被压到 240–254，严格 255 会数出 0 块。
+    // 用户要求 Primary 的键数判据只认纯 255，所以这里**不拿 225 数键**，只在
+    // 「严格 255 一块都没有」时用近白结构确认它确实是大厅那排 7–8 键（同高、同一水平线），
+    // 再判 Primary；证据规则名为 `primary_hall_bar_near_white`，日志可区分。
+    // 线上无损抓图仍走严格 255 主路径。
+    let near_white_hall = if !hall_structure && hall_tiles == 0 {
+        let (near_tiles, near_min, near_max, near_spread) = hall_bar_signature_with_threshold(
+            image,
+            hall_region,
+            HALL_BAR_WHITE_NEAR,
+        );
+        // **关键护栏**：主菜单千星 hub 宫格也有 7–9 块白瓦片，但它右下角有「返回提瓦特」，
+        // 必须先让主菜单判据优先，不能把菜单判成大厅。
+        let menu_visible = if near_tiles >= 7 {
+            let region: Rect = screen.main_menu_rect.into();
+            let candidate =
+                best_template_candidate(image, Some(region), &templates.main_menu_template)?;
+            candidate_matches(&candidate, threshold)
+        } else {
+            false
+        };
+        // 有损 JPEG 的大厅底栏白键会被压到 240–254，且可能多/少拆出一块：
+        // 同高（26–32px）、同水平线（极差 ≤4px）、7–9 块即按大厅兜底；
+        // 严格 255 主路径与「7–8」用户口径不变。
+        let loose_lossy = (7..=9).contains(&near_tiles)
+            && near_min >= 26
+            && near_max <= 32
+            && near_spread <= 4;
+        !menu_visible
+            && (hall_bar_looks_like_hall_keys(near_tiles, near_min, near_max, near_spread)
+                || loose_lossy)
+    } else {
+        false
+    };
+    if hall_structure || near_white_hall {
+        let hall_rule = if hall_structure {
+            "primary_hall_bar"
+        } else {
+            "primary_hall_bar_near_white"
+        };
         log::debug!(target: "timing",
-            "UI 状态检测耗时: total={}ms marker={}ms state=primary rule=primary_hall_bar tiles={} h_min={} h_max={} top_spread={}",
+            "UI 状态检测耗时: total={}ms marker={}ms state=primary rule={} tiles={} h_min={} h_max={} top_spread={}",
             elapsed_ms(started),
             marker_ms,
+            hall_rule,
             hall_tiles,
             hall_min_height_px,
             hall_max_height_px,
@@ -778,7 +1766,7 @@ fn detect_ui_state_with_evidence(
         );
         return Ok((
             UiState::primary_hall(),
-            UiStateEvidence::new(template_probes, Some(marker_probe), "primary_hall_bar"),
+            UiStateEvidence::new(template_probes, Some(marker_probe), hall_rule),
         ));
     }
 
@@ -836,44 +1824,76 @@ fn detect_ui_state_with_evidence(
                 UiStateEvidence::new(template_probes, None, "main_menu_template"),
             ));
         }
-        // 提瓦特派蒙菜单（ESC 系统菜单）也挂着**同一个**圆形返回按钮：右侧世界照常，
-        // 左侧换成功能宫格。用「商城」袋状图标作专属锚点，把它从二级聊天里摘出来。
-        // 与主菜单探针同层、同样只在返回按钮命中后才跑，不给常见路径加开销。
-        let paimon_region: Rect = screen.paimon_menu_rect.into();
-        let paimon_candidate = best_template_candidate(
+        // 二级聊天**专属锚点**：输入行右侧的「发送」圆钮（深色圆底 + 黄色对勾）。
+        // 主菜单/主菜单大世界/千星多人面板/千星地图都没有它；而奇域主菜单淡出过渡帧
+        // 仍带着左上圆形返回按钮（旧实现会把这类帧判成 Secondary，见 §44）。
+        // 先于派蒙探针判定：聊天界面必须直接判二级，同时「无发送锚点」本身就是
+        // 主菜单大世界多证据中的一条（无聊天证据）。
+        let submit_region: Rect = screen.secondary_chat_submit_rect.into();
+        let submit_candidate = best_template_candidate(
             image,
-            Some(paimon_region),
-            &templates.paimon_menu_panel_template,
+            Some(submit_region),
+            &templates.secondary_chat_submit_template,
         )?;
-        let paimon_visible = candidate_matches(&paimon_candidate, threshold);
+        let submit_visible = candidate_matches(&submit_candidate, threshold);
         template_probes.push(template_probe(
-            &templates.paimon_menu_panel_template,
-            paimon_region,
+            &templates.secondary_chat_submit_template,
+            submit_region,
             threshold,
-            paimon_candidate.as_ref(),
+            submit_candidate.as_ref(),
         ));
-        if paimon_visible {
-            let back_ms = elapsed_ms(back_started);
+        if submit_visible {
             log::debug!(target: "timing",
-                "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=paimon_menu",
+                "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=secondary_chat",
                 elapsed_ms(started),
                 back_ms,
                 marker_ms
             );
             return Ok((
-                UiState::paimon_menu(),
-                UiStateEvidence::new(template_probes, None, "paimon_menu_panel_template"),
+                UiState::secondary_chat(),
+                UiStateEvidence::new(template_probes, None, "secondary_chat_anchor"),
             ));
         }
+        let back_ms = elapsed_ms(back_started);
+
+        // 主菜单大世界（ESC 系统菜单）**布局无关**判定（用户要求极快、不用商城、
+        // 不依赖固定坐标）：
+        //   ① 返回按钮命中（已走到这里）；② 无「返回提瓦特」（上方已否决）；
+        //   ③ 无聊天发送锚点（刚判过）；
+        //   ④ 左侧菜单区域检测到「多瓦片宫格结构」（downscale 颜色 + 连通域，
+        //      要求 ≥8 块同尺寸瓦片、≥3 列、≥2 行）。
+        // 菜单项平移/增删/顺序变化都不影响：只看结构，不看「队伍配置/成就」位置。
+        let grid_started = Instant::now();
+        let paimon_grid = paimon_menu_grid_structure(image);
+        let grid_ms = elapsed_ms(grid_started);
+        if let Some((grid_tiles, grid_rows, grid_cols)) = paimon_grid {
+            log::debug!(target: "timing",
+                "UI 状态检测耗时: total={}ms back={}ms marker={}ms grid={}ms state=paimon_menu tiles={} rows={} cols={}",
+                elapsed_ms(started),
+                back_ms,
+                marker_ms,
+                grid_ms,
+                grid_tiles,
+                grid_rows,
+                grid_cols
+            );
+            // 规则名 `paimon_menu_grid`：residency/transaction/state_observation
+            // 用它区分「主菜单大世界 vs 主菜单千星」来决定是否允许 Esc 恢复大厅。
+            return Ok((
+                UiState::paimon_menu(),
+                UiStateEvidence::new(template_probes, None, "paimon_menu_grid"),
+            ));
+        }
+        // 返回按钮命中但没有足够的派蒙/聊天证据：这是主菜单/过渡/其它面板，不硬猜。
         log::debug!(target: "timing",
-            "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=secondary_chat",
+            "UI 状态检测耗时: total={}ms back={}ms marker={}ms state=unknown (back_hit_without_chat_anchor)",
             elapsed_ms(started),
             back_ms,
             marker_ms
         );
         return Ok((
-            UiState::secondary_chat(),
-            UiStateEvidence::new(template_probes, None, "secondary_back_template"),
+            UiState::unknown(),
+            UiStateEvidence::new(template_probes, Some(marker_probe), "no_reliable_anchor"),
         ));
     }
     let back_ms = elapsed_ms(back_started);
@@ -895,9 +1915,16 @@ fn detect_ui_state_with_evidence(
 /// 来源（1133 帧整屏实测，2026-10-17）：大厅 **7–12 块**；提瓦特 2–4 块；主菜单 3–10 块；登录/加载 0 块。
 /// 这是**结构**量而不是模板分数，对位移/缩放不敏感；改采样步长或 `screen.hall_bar_rect` 必须重测。
 const HALL_BAR_MIN_TILES: usize = 7;
+/// 千星大厅底栏白键的**上限**。用户 2026-11-10 明确：大厅底栏只有 7~8 个白键
+/// （聊天框关 8 个、开 7 个）；旧值 14 会把拼图/设置宫格等更宽的白色结构算进大厅。
+const HALL_BAR_MAX_TILES: usize = 8;
+/// Overworld 底栏白键数的允许范围（用户 2026-11-10 第二次修正）：**1~4 个**，
+/// 实测主世界通常 2 个（Enter + 聊天/派蒙等 1~2 个白键）。下限 1 排除
+/// "根本没有白键"的帧（0 个 ⇒ 没有证据，不猜）；上限 4 与千星大厅的 7–8 个
+/// 之间留 5–6 的空档。
+const HALL_BAR_OVERWORLD_MIN_TILES: usize = 1;
+const HALL_BAR_OVERWORLD_MAX_TILES: usize = 4;
 
-/// 块数上限：只为挡住「接触表 / 拼图」这类非整屏诊断图（实测 17 块）；真实大厅最多 12 块。
-const HALL_BAR_MAX_TILES: usize = 14;
 
 /// 底栏白键的**白色判据**：只认纯白 255。
 ///
@@ -912,6 +1939,13 @@ const HALL_BAR_MAX_TILES: usize = 14;
 /// JPEG，纯白会被插值/压缩成 240–254，这条规则**判不出来**——这是刻意选择：
 /// 宁可让 marker 那几条规则接手，也不把噪声算成按钮。
 const HALL_BAR_WHITE_EXACT: u8 = 255;
+/// 近白阈值：**只用于 Overworld 判据里的「有损大厅帧」否决**。
+///
+/// 用户明确要求 Primary 的白键判据只认纯 255（225 会把 240–254 的噪声算成按键、
+/// 污染状态数据），因此这里**不拿它数键数**，只用它回答"这排 7–8 块的近白结构
+/// 是不是千星大厅的底栏"——有损压缩帧里大厅底栏恰好落在这个区间。提瓦特底栏
+/// 只有 1–2 块，不会被它误否决。
+const HALL_BAR_WHITE_NEAR: u8 = 225;
 
 /// 单块白键的**真实像素高度**允许区间。
 ///
@@ -1313,6 +2347,19 @@ fn loading_rule(image: &DynamicImage) -> Option<&'static str> {
         return None;
     }
     let (dark_ratio, white_ratio, dominant_ratio) = screen_tone(image);
+    // **亮底加载变体**（例：cold-to-qianxing-59/001-t000.jpg：整屏亮天空+白塔，
+    // 色彩并不统一，dominant 只有 3%）。特征是：几乎无暗像素、亮像素占比不低、
+    // **画面正中有一个深色 spinner 方块**。只在整帧上判，避免裁图误报。
+    // 实测：该帧 dark=0.000 white=0.283 center_dark=0.425；
+    // 负样本：千星大厅帧 center_dark≤0.29 或 dark>0.02，round78 dark=0.09。
+    if dark_ratio < 0.02 && white_ratio >= 0.12 && dominant_ratio < 0.5 {
+        let (center_dark, center480) = loading_center_dark_ratios(image);
+        // spinner 是**中心一小块**深色方块：中心 160 暗占比高，而中心 480 仍然很亮。
+        // 菜单/面板的中心是大片深色内容（center480 0.2–0.55），会被这条挡掉。
+        if center_dark >= 0.35 && center480 < 0.10 {
+            return Some("loading_bright_screen");
+        }
+    }
     // 色彩一致性是加载界面的强特征：加载画面几乎整屏一色。
     // 暗色大厅也可能有 75% 暗像素，但颜色分散，不能仅凭暗占比判加载。
     if dominant_ratio < LOADING_COLOR_CONSISTENCY_MIN {
@@ -1325,6 +2372,161 @@ fn loading_rule(image: &DynamicImage) -> Option<&'static str> {
         return Some("loading_white_screen");
     }
     None
+}
+
+/// 加载界面正中的 spinner：返回 `(中心 160×160 暗占比, 中心 480×480 暗占比)`（步长 2）。
+fn loading_center_dark_ratios(image: &DynamicImage) -> (f32, f32) {
+    let sampler = RgbSampler::new(image);
+    let (width, height) = sampler.dimensions();
+    let cx0 = (width / 2).saturating_sub(80);
+    let cy0 = (height / 2).saturating_sub(80);
+    let (mut dark, mut total) = (0_u32, 0_u32);
+    let mut y = cy0;
+    while y < (cy0 + 160).min(height) {
+        let mut x = cx0;
+        while x < (cx0 + 160).min(width) {
+            let pixel = sampler.pixel(x, y);
+            let luma = 0.299 * f32::from(pixel[0])
+                + 0.587 * f32::from(pixel[1])
+                + 0.114 * f32::from(pixel[2]);
+            if luma < 90.0 {
+                dark += 1;
+            }
+            total += 1;
+            x += 2;
+        }
+        y += 2;
+    }
+    let (mut dark480, mut total480) = (0_u32, 0_u32);
+    let big_x0 = (width / 2).saturating_sub(240);
+    let big_y0 = (height / 2).saturating_sub(240);
+    let mut y = big_y0;
+    while y < (big_y0 + 480).min(height) {
+        let mut x = big_x0;
+        while x < (big_x0 + 480).min(width) {
+            let pixel = sampler.pixel(x, y);
+            let luma = 0.299 * f32::from(pixel[0])
+                + 0.587 * f32::from(pixel[1])
+                + 0.114 * f32::from(pixel[2]);
+            if luma < 90.0 {
+                dark480 += 1;
+            }
+            total480 += 1;
+            x += 2;
+        }
+        y += 2;
+    }
+    (
+        dark as f32 / total.max(1) as f32,
+        dark480 as f32 / total480.max(1) as f32,
+    )
+}
+
+
+/// 右上关闭按钮白色占比（千星页的关闭按钮比提瓦特面板更大更白）。
+fn overlay_close_white_fraction(image: &DynamicImage) -> f32 {
+    let sampler = RgbSampler::new(image);
+    let (width, height) = sampler.dimensions();
+    if width < FULL_FRAME_MIN_WIDTH || height < FULL_FRAME_MIN_HEIGHT {
+        return 0.0;
+    }
+    let x1 = width.saturating_sub(20);
+    let x0 = x1.saturating_sub(80);
+    let (mut white, mut total) = (0_u32, 0_u32);
+    let mut y = 10;
+    while y < 70.min(height) {
+        let mut x = x0;
+        while x < x1 {
+            let pixel = sampler.pixel(x, y);
+            if pixel[0].min(pixel[1]).min(pixel[2]) >= 220 {
+                white += 1;
+            }
+            total += 1;
+            x += 2;
+        }
+        y += 2;
+    }
+    white as f32 / total.max(1) as f32
+}
+
+/// 页面"米黄面板占比"：提瓦特面板多为米黄大面板，千星页多为深蓝/星空。
+fn beige_panel_fraction(image: &DynamicImage) -> f32 {
+    let sampler = RgbSampler::new(image);
+    let (width, height) = sampler.dimensions();
+    let (mut beige, mut total) = (0_u32, 0_u32);
+    let mut y = 0;
+    while y < height {
+        let mut x = 0;
+        while x < width {
+            let pixel = sampler.pixel(x, y);
+            let (r, g, b) = (pixel[0] as i32, pixel[1] as i32, pixel[2] as i32);
+            if r > 195 && g > 185 && b > 165 && (r - b).abs() < 45 {
+                beige += 1;
+            }
+            total += 1;
+            x += 8;
+        }
+        y += 8;
+    }
+    beige as f32 / total.max(1) as f32
+}
+
+/// 千星全屏覆盖页（商城 / 装扮搭配 / 更换角色 / 颂愿 / 纪游 / 我的奇域 / 档案卡 ...）
+/// 的**结构性**判据：右上角有一个白色圆形关闭按钮（深色 X 在白色圆内）。
+///
+/// 这些页面各自内容不同，但都是"整屏深色页 + 右上关闭"。用**关闭按钮白色占比**
+/// （右上角 100×60 区域，近白像素占比）判定，不依赖任何单个页面的文案/图标。
+///
+/// 实测（1920×1080）：覆盖页 0.374–0.377；负样本最高 0.261（一张加载帧，
+/// 且加载判据更早命中）；千星大厅 0.128、二级聊天 0.130、千星地图 0.030。
+fn is_qianxing_overlay_close(image: &DynamicImage) -> bool {
+    let sampler = RgbSampler::new(image);
+    let (width, height) = sampler.dimensions();
+    if width < FULL_FRAME_MIN_WIDTH || height < FULL_FRAME_MIN_HEIGHT {
+        return false;
+    }
+    // 纯白/纯黑/无蓝色调的测试合成帧不算覆盖页（避免误伤空画面测试）。
+    let mut total_blue = 0_u32;
+    let mut total_samples = 0_u32;
+    let mut yy = 0;
+    while yy < height {
+        let mut xx = 0;
+        while xx < width {
+            let pixel = sampler.pixel(xx, yy);
+            if (pixel[2] as i32) > (pixel[0] as i32) + 15
+                && pixel[2] > 60
+                && pixel[0] < 120
+                && pixel[1] < 160
+            {
+                total_blue += 1;
+            }
+            total_samples += 1;
+            xx += 16;
+        }
+        yy += 16;
+    }
+    if total_samples == 0 || total_blue as f32 / (total_samples as f32) < 0.20 {
+        return false;
+    }
+    let x1 = width.saturating_sub(20);
+    let x0 = x1.saturating_sub(80);
+    let (mut white, mut total) = (0_u32, 0_u32);
+    let mut y = 10;
+    while y < 70.min(height) {
+        let mut x = x0;
+        while x < x1 {
+            let pixel = sampler.pixel(x, y);
+            if pixel[0].min(pixel[1]).min(pixel[2]) >= 220 {
+                white += 1;
+            }
+            total += 1;
+            x += 2;
+        }
+        y += 2;
+    }
+    // 阈值 0.35：真实千星覆盖页右上白色关闭按钮占比 0.374–0.377；
+    // 大厅卡/主菜单（含返回提瓦特胶囊）只有 0.31 左右，用它避免把大厅卡抢成覆盖页。
+    total > 0 && white as f32 / (total as f32) >= 0.35
 }
 
 /// 测试专用：把库内**有损 JPEG 夹具**底栏区域的近白像素吸附成纯白。
@@ -1455,6 +2657,25 @@ fn hall_bar_signature_with_threshold(
     (heights_px.len(), min_height, max_height, top_spread)
 }
 
+/// 底栏签名是否**长得像千星大厅那排白键**：块数 7–8、同高、同一水平线。
+///
+/// 抽出来有两个用处：① 大厅 Primary 判据（严格 255）；② Overworld 判据里把
+/// 有损压缩帧（白键被压到 240–254、严格 255 数出 0 块）**否决**掉，避免把
+/// 千星大厅误判成提瓦特大世界。它只做"像不像大厅"的结构判断，不改变
+/// 「白色判据只认纯 255」的既有用户要求。
+fn hall_bar_looks_like_hall_keys(
+    tiles: usize,
+    min_height_px: usize,
+    max_height_px: usize,
+    top_spread_px: usize,
+) -> bool {
+    (HALL_BAR_MIN_TILES..=HALL_BAR_MAX_TILES).contains(&tiles)
+        && min_height_px >= HALL_BAR_MIN_TILE_HEIGHT_PX
+        && max_height_px <= HALL_BAR_MAX_TILE_HEIGHT_PX
+        && top_spread_px <= HALL_BAR_MAX_TILE_TOP_SPREAD_PX
+}
+
+
 /// 世界判据的结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorldGuess {
@@ -1541,7 +2762,7 @@ fn guess_world_from_cyan_count(count: Option<usize>) -> WorldGuess {
 /// 组装世界判据的证据。
 ///
 /// **只在 HUD 在场时给结论。** 这条判据读的是左上角派蒙头像区的青色条纹带，
-/// 而全屏菜单（奇域枢纽菜单、派蒙菜单、提瓦特地图、背包、祈愿…）的左上角是
+/// 而全屏菜单（奇域枢纽菜单、主菜单大世界、提瓦特地图、背包、祈愿…）的左上角是
 /// **菜单内容**不是 HUD，那里青色计数恒为 0 —— 不加这道门就会把菜单一律
 /// 自信地误报成「提瓦特」，正是目标禁止的行为。
 ///
@@ -1554,27 +2775,54 @@ fn guess_world_from_cyan_count(count: Option<usize>) -> WorldGuess {
 /// 门内如果计数落在两侧空档里，结论仍然是 `unknown`。
 /// 画面是不是「**提瓦特大世界**」——人站在提瓦特露天地面、HUD 俱全。
 ///
-/// **为什么要单独抽出来**：第 59 节实测到一次自信误判——**千星大厅的多人面板**
-/// （左侧「当前大厅」、右侧玩家列表、右下「邀请玩家」）在实时路径上被判成了 `overworld`。
-/// 根因是 `probe_game_state` 回退探针只看右上角祈愿顶栏这一个模板，
-/// 而那个模板在千星面板上**也会命中**。
+/// **用户口径（task-105 修正）**：Overworld = **HUD 在场 + 底栏白键数 1~4 个**
+/// （实测主世界通常 2 个；大厅 7–8 个，5–6 是空档）。旧的「青色条纹带」判据在
+/// `teleport-53` 的连续生活帧上落在 unknown 空档（650 帧语料里 195 帧提瓦特
+/// 被判 Unknown），所以主判据换成底栏白键数；青带仍由 `world_probe_evidence`
+/// 作为「哪个世界」的正交证据单独上报。
 ///
-/// 所以「祈愿顶栏命中」不足以判大世界，必须再加一道**正交**的世界判据：
-/// 既要**有 HUD**（`world_hud_scale` 为 `Some`），又要**判为提瓦特**。
-/// 千星大厅本身也有 HUD，但青带计数落在 `qianxing` 一侧，于是被这里挡住。
+/// 负例纪律：**有损压缩帧**里的千星大厅底栏白键会掉到 240–254，严格 255 数出
+/// 0 块。这里额外用近白结构（`HALL_BAR_WHITE_NEAR`）确认"这排 7–8 块像不像
+/// 大厅底栏"，像就**不判提瓦特**——而不是回退成用 225 数键（那会违反用户
+/// 「只认纯 255」的要求）。主菜单/面板/地图 HUD 不在场，直接被门挡住。
 pub(crate) fn world_is_teyvat(image: &DynamicImage) -> bool {
+    // 外部调用方（如启动链"是否已在大世界"）没有 screen 配置；用默认画布上的
+    // 底栏区域（与默认配置 0,985,600,95 一致）走同一条判据。
+    world_is_teyvat_in(
+        image,
+        crate::config::ScreenConfig::default().hall_bar_rect.into(),
+    )
+}
+
+/// 与 [`world_is_teyvat`] 相同的判据，但由调用方显式给出底栏区域
+/// （界面分类器自己有 `screen` 配置，必须用实际区域，不能用默认值）。
+pub(crate) fn world_is_teyvat_in(image: &DynamicImage, hall_bar: Rect) -> bool {
     // 必须用 `world_hud_scale` 而不是 `world_hud_distances`：前者带**HUD 在场门**
     // （`teyvat.min(qianxing) <= WORLD_HUD_PRESENT_MAX`），后者没有。
-    // 少了这道门，全屏面板会被放行，而它左上角的青色计数接近 0，
-    // 于是被自信判成提瓦特 —— 这正是第一版写错的地方，实测被回归用例当场抓住。
-    let Some(scale) = world_hud_scale(image) else {
+    // 少了这道门，全屏面板会被放行，而它底栏也几乎没有白键。
+    if world_hud_scale(image).is_none() {
         // HUD 不在场 ⇒ 这是全屏面板/菜单，不是大世界。
         return false;
-    };
-    let Some(count) = world_cyan_band_count(image, scale) else {
+    }
+    // 白色判据严格 255；先量一次。
+    let (raw_tiles, _, _, _) = hall_bar_signature(image, hall_bar);
+    // 近白（225）只在两种情况下用：① 有损帧的大厅底栏否决；② 严格 255 = 0 时
+    // 还原"无损抓图里本该是纯白"的底栏键数（等价于仓库测试里的
+    // `snap_near_white_to_pure_white`，线上 DPI 缩放/有损输入也需要）。
+    // **绝不用近白去数 Primary 大厅的键**——那条判据仍只认纯 255。
+    let (near_tiles, near_min_height, near_max_height, near_top_spread) =
+        hall_bar_signature_with_threshold(image, hall_bar, HALL_BAR_WHITE_NEAR);
+    if hall_bar_looks_like_hall_keys(
+        near_tiles,
+        near_min_height,
+        near_max_height,
+        near_top_spread,
+    ) {
+        // 近白结构就是千星大厅那排 7–8 键（有损帧）⇒ 不是提瓦特。
         return false;
-    };
-    matches!(guess_world_from_cyan_count(Some(count)), WorldGuess::Teyvat)
+    }
+    let tiles = if raw_tiles > 0 { raw_tiles } else { near_tiles };
+    (HALL_BAR_OVERWORLD_MIN_TILES..=HALL_BAR_OVERWORLD_MAX_TILES).contains(&tiles)
 }
 
 fn world_probe_evidence(image: &DynamicImage) -> UiWorldProbeEvidence {
@@ -1664,6 +2912,68 @@ const QIANXING_PANEL_MAX: f32 = 0.22;
 /// 2. 第 61 节对本判据的扰动实测——不做搜索时位移 ±3 距离 0.1969、几乎贴住阈值 0.22，
 ///    加 ±2 搜索后最优对齐只剩 1 像素残差，距离掉回 ≈±1 的水平。
 const QIANXING_PANEL_SEARCH: i32 = 2;
+
+/// F2 大厅页两个底部按钮锚点的最低分。
+///
+/// 实测（**1/2 下采样**、真实帧集，模板去掉白色胶囊填充后）：
+/// - 正样本「大厅列表」0.9582、「邀请玩家」0.9684–0.9688；
+/// - 负样本最高 0.8569（主菜单/大厅），大厅/二级聊天/覆盖层/地图/加载均更低。
+/// 阈值仍取 0.95：落在两侧空档内；两个锚点**同时**命中才判 F2。
+///
+/// 为什么从 1/4 改成 1/2：模板只留图标+文字后，1/4 下采样把笔画糊成几个像素，
+/// 正样本掉到 0.9476–0.9491（低于 0.95），负样本仍在 0.86–0.89；1/2 下采样
+/// 既恢复正样本余量，又保持两侧 ~0.10 的空档。区域只有 600×95 / 140×54，
+/// 1/2 的总代价仍远小于整帧千星卡模板。
+const QIANXING_F2_BUTTON_MIN: f32 = 0.95;
+/// 按钮锚点的降采样倍数：区域小、模板只含图标+文字，1/2 后正样本 >0.95 且余量最大。
+const QIANXING_F2_BUTTON_SCALE: u32 = 2;
+
+/// ── 资料卡四分类（提瓦特 / 千星 × 好友 / 非好友）─────────────────────────
+///
+/// 全部使用纯文字模板，不依赖 OCR。每个模板有独立搜索区，且都限定在资料卡内：
+/// - 提瓦特资料卡：左页上部 `冒险等阶` / `世界等级`（两张 1920×1080 实拍帧一致）；
+/// - 千星资料卡：上部 `奇域等级`，下部白色胶囊 `添加好友` / `查看资料`。
+/// 坐标以规范画布 1920×1080 为准（`classify_at` 已归一化）。
+///
+/// 判定顺序本身就是判据：
+/// 1. 提瓦特：两个文字锚点**同时命中** → 提瓦特资料卡；再按「添加好友」有无分好友/非好友。
+/// 2. 千星：`奇域等级` 命中 → 千星资料卡；`添加好友` 命中=非好友，否则 `查看资料`=好友。
+///    不使用「本期缤纷评分」，避免把其它千星页/评分变化卷进来。
+const TEYVAT_PROFILE_RANK_SEARCH: Rect = Rect::new(415, 447, 300, 42);
+const TEYVAT_PROFILE_WORLD_SEARCH: Rect = Rect::new(415, 489, 300, 40);
+/// 两个文字锚点用 1/2 下采样：模板 85×23/86×23，搜索区 300×42/300×40，
+/// 正样本 0.944/0.927，千星页与其它面板 ≤0.77（实测），空档充足。
+const TEYVAT_PROFILE_ANCHOR_SCALE: u32 = 2;
+/// 提瓦特「添加好友」在卡片右下角的实测原点（模板 98×25 纯文字）。
+/// 好友帧没有该按钮，纯文字模板仍可能在附近拿到 0.947；因此**分数 + 位置**双门控。
+const TEYVAT_PROFILE_ADD_FRIEND_ORIGIN: (i32, i32) = (1211, 815);
+const TEYVAT_PROFILE_ADD_FRIEND_TOLERANCE: i32 = 12;
+/// 千星「奇域等级」：蓝紫渐变带内的白色文字，只留文字、不含左侧星标。
+const QIANXING_PROFILE_DOMAIN_SEARCH: Rect = Rect::new(780, 345, 120, 50);
+/// 千星「添加好友」：卡片下部左侧白色胶囊（非好友）；好友帧这里没有按钮。
+const QIANXING_PROFILE_ADD_FRIEND_SEARCH: Rect = Rect::new(700, 550, 260, 60);
+/// 千星「查看资料」：好友单按钮在左（新帧 ~793,573）、4 按钮版式在右（旧档案卡 ~1028,631），
+/// 统一用同一块**三行按钮区**覆盖两种版式；区域仍限定在资料卡内。
+const QIANXING_PROFILE_VIEW_SEARCH: Rect = Rect::new(740, 540, 460, 190);
+/// 资料卡文字锚点 / 动作胶囊的最低分。文字锚点正样本 ≥0.927，负样本 ≤0.77；
+/// 动作胶囊正样本 0.915–1.0，负样本 ≤0.80（好友帧的「查看资料」模板 vs「添加好友」0.744）。
+const PROFILE_CARD_ANCHOR_MIN: f32 = 0.90;
+const PROFILE_CARD_ACTION_MIN: f32 = 0.95;
+const PROFILE_CARD_VIEW_MIN: f32 = 0.90;
+
+/// 提瓦特资料卡「添加好友」的搜索区（`teyvat-profile-add-friend.png`，1×）。
+///
+/// 按钮只在非好友帧出现，位于卡片右下角；纯文字裁剪后实测命中左上角恒为
+/// (1211,815)（98×25）。这里只覆盖按钮块 + 上下 32px 余量，能容纳卡片高度 /
+/// UI 缩放的抖动，又不是整帧，也不与千星资料卡按钮区重叠。
+const TEYVAT_PROFILE_ADD_FRIEND_SEARCH: Rect = Rect::new(1179, 783, 162, 89);
+
+/// 确认弹窗文案关键词锚点的最低分与降采样倍数。
+///
+/// 文案模板只保留关键词（6/5/3 个汉字，169×29 / 142×29 / 94×32），
+/// 搜索区是 620×90 的整行；1/2 下采样即可保住字形，代价约为全分辨率的 1/16。
+pub(crate) const CONFIRM_MESSAGE_MIN: f32 = 0.95;
+pub(crate) const CONFIRM_MESSAGE_SCALE: u32 = 2;
 
 /// 解析冻结参考，返回 `(x, y, width, height)` 与**参考本体的字节切片**。
 ///
@@ -1858,10 +3168,317 @@ fn is_qianxing_map(image: &DynamicImage) -> bool {
         dark >= QIANXING_MAP_DARK_MIN && dark_teal >= QIANXING_MAP_DARK_TEAL_MIN
     })
 }
+
+/// **亮底千星地图变体**（`map-screen.png`：地图画面本身较亮，暗占比只有 ~10%，
+/// 但暗青占比仍有 ~66%）。严格判据（暗≥0.32）要求暗青虚空型；这个变体是
+/// 千星地图的亮色版。为了不把提瓦特／千星大厅误判，只在**不是提瓦特大世界**时使用，
+/// 且暗占比必须落在窄带 `[0.06, 0.16]`（实测 0.080–0.103），比提瓦特地图/大厅都特异。
+fn is_bright_qianxing_map(image: &DynamicImage) -> bool {
+    qianxing_map_tone(image).is_some_and(|(dark, dark_teal)| {
+        (0.06..=0.16).contains(&dark) && dark_teal >= QIANXING_MAP_DARK_TEAL_MIN
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 千星地图右下角锚点（首选判据：模板匹配）
+// ---------------------------------------------------------------------------
+
+/// 右下角锚点的**搜索区**（规范画布 1920×1080 坐标）。
+///
+/// 裁的是「千星奇域·大厅」文字 + 庙宇图标这一段 UI（红色未读角标在 alpha 层清掉，
+/// 但模板尺寸/位置保持不变），**不含 UID**，
+/// 更不含整条右下角大背景。真实帧 `07-qianxing-map.jpg` 的像素边界实测：
+/// 文字 x 1609–1787 / y 991–1014，庙宇图标 x 1807–1875 / y 987–1050，
+/// 红色角标 x 1871–1890 / y 980–993；UID 从 y≈1047 才开始，所以模板下沿停在 1052。
+const QIANXING_MAP_ANCHOR_SEARCH: Rect = Rect::new(1596, 980, 304, 76);
+/// 模板尺寸（`assets/qianxing-map-label.png`）：搜索区正中，四周各留 4 px 位移余量。
+const QIANXING_MAP_ANCHOR_TEMPLATE_WIDTH: u32 = 296;
+const QIANXING_MAP_ANCHOR_TEMPLATE_HEIGHT: u32 = 68;
+/// 模板在搜索区内的左上角偏移（= 规范坐标 x1600 / y984）。
+const QIANXING_MAP_ANCHOR_INSET: i32 = 4;
+/// 位移搜索半径（像素）。HUD 锚点是固定布局，实测 9 帧真实地图全部落在 0 位移。
+const QIANXING_MAP_ANCHOR_SHIFT: i32 = 4;
+/// 二值化亮度阈值（0–255）：文字/图标实心笔画远高于它，深蓝/紫背景远低于它。
+const QIANXING_MAP_ANCHOR_BRIGHT_MIN: u8 = 150;
+/// 形状 F1 阈值。
+///
+/// 来源（实测空档中点，不是凑的）：2636 张整帧证据里，9 帧真实千星地图
+/// **0.9594–1.0000**；其余最高 **0.4489**（提瓦特地图，右下角同样有
+/// 「文字 + 圆形图标 + 红点」，是最难的近邻）。空档宽 0.51，阈值取 0.75。
+const QIANXING_MAP_ANCHOR_SCORE_MIN: f32 = 0.75;
+
+// ---------------------------------------------------------------------------
+// 千星退出菜单（只认第一行「退出至登录界面」）
+// ---------------------------------------------------------------------------
+
+/// 「退出至登录界面」单行纯文字模板的搜索区（规范画布 1920×1080）。
+///
+/// 真实帧 `qianxing-ui-59/r12-ctrl-gear.jpg`、`r16-y1000-a.jpg` 上该行均固定
+/// 命中 (878,526)，模板 197×29（字形 bbox + 2px 透明 padding）。两帧位置完全
+/// 一致，菜单本身是固定叠层，因此搜索区只覆盖该行 ±32px，不再扫全帧：
+/// `48×40 @856,512` 的旧讨论尺寸放不下 197px 宽的整行文字，按生产实测改为
+/// 现在这块 240×96。
+///
+/// 只匹配第一行是用户确认的语义：退出菜单第二行「退出至桌面」不参与判据。
+const QIANXING_EXIT_MENU_SEARCH: Rect = Rect::new(838, 484, 240, 96);
+const QIANXING_EXIT_MENU_SCALE: u32 = 1;
+/// 第一行文字的实测左上角（模板原点）与容差。
+const QIANXING_EXIT_MENU_ORIGIN: (i32, i32) = (878, 525);
+const QIANXING_EXIT_MENU_TOLERANCE: i32 = 8;
+
+// ---------------------------------------------------------------------------
+// 个人资料页右下角「心愿单」+「衣橱」双按钮判据
+// ---------------------------------------------------------------------------
+
+/// 两个按钮的**搜索区**（规范画布 1920×1080 坐标）。
+///
+/// 真实帧 `Snipaste_2026-11-12_19-51-34.png` 实测按钮像素边界：
+/// - 心愿单：x 1464–1655、y 996–1043（192×48）
+/// - 衣橱：  x 1680–1871、y 996–1043（192×48）
+///
+/// 透明化后模板只保留字形（心愿单 66×23、衣橱 45×23，见
+/// `pure-text-templates.md`），模板原点变为按钮原点 + 字形裁剪原点：
+/// 心愿单 → (1526,1008)，衣橱 → (1753,1008)。搜索区分别围绕这两个实测原点
+/// 给 ±32px 位移余量，且模板窗口最低到 y=1036，仍碰不到 y≥1044 的 UID 行。
+///
+/// 两个按钮分开给区域而不是共用一个 520×130：字形模板很小，分开后每次
+/// 只要约 8M 次像素比较（共用大区且要在字形模板上保持分数需要 1× 匹配，
+/// 代价约 125M），同时天然避免两个按钮互相串位。
+const PROFILE_PAGE_WISHLIST_SEARCH: Rect = Rect::new(1480, 976, 140, 60);
+const PROFILE_PAGE_WARDROBE_SEARCH: Rect = Rect::new(1707, 976, 140, 60);
+/// 字形模板很小，直接用 1× 匹配：不做降采样就没有采样相位/量化误差，
+/// 正样本能到 1.0，代价也远低于旧版 192×48 模板的 1/2 下采样。
+const PROFILE_PAGE_BUTTON_SCALE: u32 = 1;
+/// 双命中阈值。
+///
+/// 纯文字化后分数不再被白色胶囊底撑高：
+/// - 正样本（真实帧 + 同页 3 帧）实测 **1.0000 / 0.9999**；
+/// - 最难的负样本（同位置、同尺寸的「另存为 / 保存」对话框）显著下降，
+///   其它页面右下角按钮更不会同时命中两个字形。
+/// 阈值仍取 **0.975**（旧版实测空档中点），没有为了新模板降阈值。
+const PROFILE_PAGE_BUTTON_SCORE_MIN: f32 = 0.975;
+/// 两个按钮模板在规范画布上的实测左上角（模板 = 字形 bbox + 2px）。
+const PROFILE_PAGE_WISHLIST_ORIGIN: (i32, i32) = (1526, 1008);
+const PROFILE_PAGE_WARDROBE_ORIGIN: (i32, i32) = (1753, 1008);
+/// 命中位置容差（像素）。按钮是固定布局；1× 匹配没有量化误差，
+/// 容差 8 px 足够吸收缩放取整，又远小于两按钮 216 px 的间距。
+///
+/// **为什么必须有位置门控**：两个字形模板都很小，单看分数可能被别的
+/// 白色胶囊按钮里的近似文字撑高；要求两个模板分别落在各自按钮位置，
+/// 才是真正的「两个按钮同时命中」。
+const PROFILE_PAGE_BUTTON_POSITION_TOLERANCE: i32 = 8;
+
+/// 一次锚点匹配的结果：形状分 + 命中位置（规范画布坐标，已含位移）。
+#[derive(Clone, Copy, Debug)]
+struct QianxingMapAnchorMatch {
+    score: f32,
+    x: i32,
+    y: i32,
+}
+
+/// 锚点模板的**二值形状**（缓存；模板缺陷是静态属性，无需每帧重算）。
+struct AnchorShape {
+    width: u32,
+    height: u32,
+    bright: Vec<bool>,
+    bright_count: u32,
+}
+
+static ANCHOR_SHAPE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<AnchorShape>>>> = OnceLock::new();
+
+fn cached_anchor_shape(path: &Path) -> Result<Arc<AnchorShape>> {
+    let cache = ANCHOR_SHAPE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("anchor template cache mutex poisoned"))?;
+    if let Some(shape) = cache.get(path) {
+        return Ok(Arc::clone(shape));
+    }
+    let gray = image::open(path)
+        .map_err(|error| anyhow::anyhow!("打开锚点模板 {} 失败: {error}", path.display()))?
+        .to_luma8();
+    let bright: Vec<bool> = gray
+        .pixels()
+        .map(|pixel| pixel[0] >= QIANXING_MAP_ANCHOR_BRIGHT_MIN)
+        .collect();
+    let bright_count = bright.iter().filter(|bright| **bright).count() as u32;
+    let shape = Arc::new(AnchorShape {
+        width: gray.width(),
+        height: gray.height(),
+        bright,
+        bright_count,
+    });
+    cache.insert(path.to_path_buf(), Arc::clone(&shape));
+    Ok(shape)
+}
+
+/// 锚点搜索区在当前画面上的位置（按宽高比缩放到规范画布）；画面太小就拒判。
+fn qianxing_map_anchor_rect(image: &DynamicImage) -> Option<Rect> {
+    if image.width() < FULL_FRAME_MIN_WIDTH || image.height() < FULL_FRAME_MIN_HEIGHT {
+        return None;
+    }
+    let scale_x = image.width() as f32 / 1920.0;
+    let scale_y = image.height() as f32 / 1080.0;
+    Some(Rect::new(
+        (QIANXING_MAP_ANCHOR_SEARCH.x as f32 * scale_x).round() as i32,
+        (QIANXING_MAP_ANCHOR_SEARCH.y as f32 * scale_y).round() as i32,
+        (QIANXING_MAP_ANCHOR_SEARCH.width as f32 * scale_x).round() as u32,
+        (QIANXING_MAP_ANCHOR_SEARCH.height as f32 * scale_y).round() as u32,
+    ))
+}
+
+/// 单个按钮是否「分数达标 **且** 落在自己那个位置上」。
+fn profile_page_button_hit(hit: &TemplateHit, origin: (i32, i32), score_min: f32) -> bool {
+    hit.score >= score_min
+        && (hit.x - origin.0).abs() <= PROFILE_PAGE_BUTTON_POSITION_TOLERANCE
+        && (hit.y - origin.1).abs() <= PROFILE_PAGE_BUTTON_POSITION_TOLERANCE
+}
+
+/// 个人资料页两个按钮搜索区在当前画面上的位置（按宽高比缩放到规范画布）；
+/// 画面太小就拒判（与千星地图锚点同一护栏）。
+fn profile_page_button_rects(image: &DynamicImage) -> Option<(Rect, Rect)> {
+    if image.width() < FULL_FRAME_MIN_WIDTH || image.height() < FULL_FRAME_MIN_HEIGHT {
+        return None;
+    }
+    let scale_x = image.width() as f32 / 1920.0;
+    let scale_y = image.height() as f32 / 1080.0;
+    let scale = |rect: Rect| {
+        Rect::new(
+            (rect.x as f32 * scale_x).round() as i32,
+            (rect.y as f32 * scale_y).round() as i32,
+            (rect.width as f32 * scale_x).round() as u32,
+            (rect.height as f32 * scale_y).round() as u32,
+        )
+    };
+    Some((
+        scale(PROFILE_PAGE_WISHLIST_SEARCH),
+        scale(PROFILE_PAGE_WARDROBE_SEARCH),
+    ))
+}
+
+/// 右下角锚点的**形状 F1**（0–1）与命中位置；量不了（画面太小 / 模板尺寸不符）返回 `None`。
+///
+/// 为什么不是普通灰度 SAD：模板要同时覆盖「深色虚空版」与「亮底版」两种地图，两者
+/// 右下角背景亮度差很多，整块灰度 SAD 会被背景拉低；而只比较亮块（masked SAD）又
+/// 对“画面里凭空多出一块亮光”没有惩罚——实测千星大厅帧能混到 0.86。这里对
+/// **模板亮块与画面亮块做 F1**：少一块（缺字/缺图标）和多一块（背景里有别的亮东西）
+/// 都会被惩罚，实测负样本最高只有 0.4489。
+///
+/// 成本：304×76 的小裁剪 + 81 个位移 × 20128 像素；命中后（≥0.90）直接短路，
+/// 单帧远低于 1 ms，不需要降采样，也不需要 OCR。
+fn qianxing_map_anchor_measure(
+    image: &DynamicImage,
+    template: &Path,
+) -> Result<Option<QianxingMapAnchorMatch>> {
+    let Some(rect) = qianxing_map_anchor_rect(image) else {
+        return Ok(None);
+    };
+    let shape = cached_anchor_shape(template)?;
+    if shape.width != QIANXING_MAP_ANCHOR_TEMPLATE_WIDTH
+        || shape.height != QIANXING_MAP_ANCHOR_TEMPLATE_HEIGHT
+    {
+        return Ok(None);
+    }
+    let (width, height) = (
+        QIANXING_MAP_ANCHOR_SEARCH.width,
+        QIANXING_MAP_ANCHOR_SEARCH.height,
+    );
+    let crop = crop_canvas(image, rect)?;
+    let crop = if crop.width() == width && crop.height() == height {
+        crop
+    } else {
+        crop.resize_exact(width, height, image::imageops::FilterType::Triangle)
+    };
+    let gray = crop.to_luma8();
+    let frame: Vec<bool> = gray
+        .pixels()
+        .map(|pixel| pixel[0] >= QIANXING_MAP_ANCHOR_BRIGHT_MIN)
+        .collect();
+
+    let score_at = |dx: i32, dy: i32| -> f32 {
+        let mut intersection = 0_u32;
+        let mut frame_bright = 0_u32;
+        for ty in 0..shape.height {
+            let y = (QIANXING_MAP_ANCHOR_INSET + dy) as u32 + ty;
+            let row = (y * width) as usize;
+            for tx in 0..shape.width {
+                let x = (QIANXING_MAP_ANCHOR_INSET + dx) as u32 + tx;
+                if frame[row + x as usize] {
+                    frame_bright += 1;
+                    if shape.bright[(ty * shape.width + tx) as usize] {
+                        intersection += 1;
+                    }
+                }
+            }
+        }
+        let denominator = shape.bright_count + frame_bright;
+        if denominator == 0 {
+            0.0
+        } else {
+            2.0 * intersection as f32 / denominator as f32
+        }
+    };
+
+    let center = score_at(0, 0);
+    let (best_score, best_dx, best_dy) = if center >= QIANXING_MAP_ANCHOR_SCORE_MIN + 0.15 {
+        // 命中已经足够强，不必再扫其余 80 个位移（正样本全部走这条）。
+        (center, 0, 0)
+    } else {
+        let mut best = (center, 0, 0);
+        for dy in -QIANXING_MAP_ANCHOR_SHIFT..=QIANXING_MAP_ANCHOR_SHIFT {
+            for dx in -QIANXING_MAP_ANCHOR_SHIFT..=QIANXING_MAP_ANCHOR_SHIFT {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let score = score_at(dx, dy);
+                if score > best.0 {
+                    best = (score, dx, dy);
+                }
+            }
+        }
+        best
+    };
+    Ok(Some(QianxingMapAnchorMatch {
+        score: best_score,
+        x: QIANXING_MAP_ANCHOR_SEARCH.x + QIANXING_MAP_ANCHOR_INSET + best_dx,
+        y: QIANXING_MAP_ANCHOR_SEARCH.y + QIANXING_MAP_ANCHOR_INSET + best_dy,
+    }))
+}
+
+/// 右下角标签的**文本判据**（OCR 可选后备用）。
+///
+/// 去空白后必须**同时**出现「千星奇域」和「大厅」：单看「千星奇域」会把主菜单、
+/// 活动页也算进去；单看「大厅」会命中大厅列表/大厅卡。纯字符串函数，
+/// 离线单测直接喂文本，不需要 OCR 模型。
+fn qianxing_map_label_text_matches(text: &str) -> bool {
+    let normalized: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    normalized.contains("千星奇域") && normalized.contains("大厅")
+}
+
+/// 对右下角 ROI 调一次 OCR 再套文本判据（可选后备）。
+///
+/// 只在回退探针里使用（`probe_game_state`，`Unknown` 且每 `GAME_STATE_PROBE_INTERVAL`
+/// 一次），不给常规路径增加 OCR 负担；离线门禁/单测走 `game_entry = None` 分支，
+/// 完全不依赖 OCR 也能验证模板路径。
+fn qianxing_map_label_via_ocr(
+    ocr: &OcrRuntimeHandle,
+    image: &DynamicImage,
+    region: Rect,
+) -> Result<bool> {
+    let lines = ocr.recognize_lines(crop_canvas(image, region)?, OcrPriority::UiConfirmation)?;
+    Ok(lines
+        .iter()
+        .any(|line| qianxing_map_label_text_matches(&line.text)))
+}
+
+fn hit_matches(hit: &TemplateHit, threshold: f32) -> bool {
+    hit.quality_ok && hit.score >= threshold
+}
+
 fn candidate_matches(candidate: &Option<TemplateHit>, threshold: f32) -> bool {
     candidate
         .as_ref()
-        .is_some_and(|candidate| candidate.score >= threshold)
+        .is_some_and(|candidate| candidate.quality_ok && candidate.score >= threshold)
 }
 
 fn template_probe(
@@ -1870,9 +3487,11 @@ fn template_probe(
     threshold: f32,
     candidate: Option<&TemplateHit>,
 ) -> UiTemplateProbeEvidence {
-    let hit = candidate.filter(|candidate| candidate.score >= threshold);
+    let hit =
+        candidate.filter(|candidate| candidate.quality_ok && candidate.score >= threshold);
     let outcome = match (candidate, hit) {
         (_, Some(_)) => "matched",
+        (Some(candidate), None) if !candidate.quality_ok => "quality_rejected",
         (Some(_), None) => "below_threshold",
         (None, None) => "template_not_comparable",
     };
@@ -1896,6 +3515,496 @@ fn elapsed_ms(started: Instant) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(test)]
+    /// `game_gate` / `panel:<label>`；负样本写 `!<同上>`。
+    #[test]
+    #[ignore = "证据画廊数据导出：需要 MILIASTRA_GALLERY_FRAMES / MILIASTRA_GALLERY_OUT"]
+    fn dump_ui_state_evidence_for_gallery() {
+        let Ok(list_path) = std::env::var("MILIASTRA_GALLERY_FRAMES") else {
+            return;
+        };
+        let out_path =
+            std::env::var("MILIASTRA_GALLERY_OUT").expect("MILIASTRA_GALLERY_OUT 必须给出");
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let panels = panel_regions_from(&config);
+        let canvas = Canvas {
+            width: config.screen.expected_width,
+            height: config.screen.expected_height,
+            resize: true,
+        };
+        let hall_bar_rect: Rect = config.screen.hall_bar_rect.into();
+        let list = std::fs::read_to_string(&list_path)
+            .unwrap_or_else(|error| panic!("读不到 {list_path}: {error}"));
+        let mut output = String::new();
+        let mut count = 0_usize;
+        for (line_number, line) in list.lines().enumerate() {
+            if line_number == 0 || line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let columns: Vec<&str> = line.split('\t').collect();
+            assert_eq!(
+                columns.len(),
+                4,
+                "画廊帧清单第 {} 行列数不是 4: {line:?}",
+                line_number + 1
+            );
+            let (surface_key, role, frame, expected) =
+                (columns[0], columns[1], columns[2], columns[3]);
+            let source =
+                image::open(frame).unwrap_or_else(|error| panic!("打不开 {frame}: {error}"));
+            let normalized = resize_to_canvas(&source, &canvas, None);
+            let image = normalized.as_ref().unwrap_or(&source);
+            // 每帧独立分类器：避免 game_fallback 的跨帧状态污染单帧证据。
+            let mut classifier =
+                TemplateUiStateClassifier::new(templates.clone(), config.screen.clone())
+                    .with_panel_regions(panels);
+            let classification = classifier
+                .classify_at(image, Instant::now())
+                .unwrap_or_else(|error| panic!("{frame} 分类失败: {error}"));
+            let evidence = classification.evidence();
+            let probes: Vec<serde_json::Value> = evidence
+                .template_probes()
+                .iter()
+                .map(|probe| {
+                    serde_json::json!({
+                        "template": probe.template(),
+                        "search_rect": gallery_evidence_rect_json(probe.search_rect()),
+                        "score": probe.best_score(),
+                        "threshold": probe.threshold(),
+                        "hit_rect": probe.hit_rect().map(gallery_evidence_rect_json),
+                        "outcome": probe.outcome(),
+                    })
+                })
+                .collect();
+            let marker = evidence.marker_probe().map(|marker| {
+                serde_json::json!({
+                    "search_rect": gallery_evidence_rect_json(marker.search_rect()),
+                    "blue": marker.blue_count(),
+                    "yellow": marker.yellow_count(),
+                    "pink": marker.pink_count(),
+                    "threshold": templates.chat_templates.marker_threshold,
+                })
+            });
+            let world = evidence.world_probe().map(|world| {
+                serde_json::json!({
+                    "region": gallery_evidence_rect_json(world.region()),
+                    "count": world.count(),
+                    "teyvat_max": world.teyvat_max(),
+                    "qianxing_min": world.qianxing_min(),
+                    "guess": world.guess(),
+                })
+            });
+            let exact = hall_bar_signature(image, hall_bar_rect);
+            let near =
+                hall_bar_signature_with_threshold(image, hall_bar_rect, HALL_BAR_WHITE_NEAR);
+            let (dark, white, dominant) = screen_tone(image);
+            let (center160, center480) = loading_center_dark_ratios(image);
+            let grid = paimon_menu_grid_structure(image);
+            let map_tone = qianxing_map_tone(image);
+            let panel_distance = qianxing_player_panel_distance(image);
+            let close_ratios = gallery_overlay_close_ratios(image);
+            let surface = crate::ui::routines::test_surface_of(
+                classification.kind(),
+                classification.label(),
+                evidence.final_rule(),
+            );
+            let record = serde_json::json!({
+                "surface_key": surface_key,
+                "role": role,
+                "frame": frame,
+                "expected": expected,
+                "kind": classification.kind().name(),
+                "label": classification.label(),
+                "final_rule": evidence.final_rule(),
+                "surface_debug": format!("{surface:?}"),
+                "surface_chinese": surface.chinese_name(),
+                "image": {"w": image.width(), "h": image.height()},
+                "probes": probes,
+                "panel_scores": gallery_panel_probe_scores(image, &templates, panels, &config.screen),
+                "marker": marker,
+                "world": world,
+                "metrics": {
+                    "hall_bar_exact": {
+                        "tiles": exact.0,
+                        "min_height_px": exact.1,
+                        "max_height_px": exact.2,
+                        "top_spread_px": exact.3,
+                        "looks_like_hall_keys": hall_bar_looks_like_hall_keys(exact.0, exact.1, exact.2, exact.3),
+                    },
+                    "hall_bar_near_white": {
+                        "tiles": near.0,
+                        "min_height_px": near.1,
+                        "max_height_px": near.2,
+                        "top_spread_px": near.3,
+                        "looks_like_hall_keys": hall_bar_looks_like_hall_keys(near.0, near.1, near.2, near.3),
+                    },
+                    "paimon_grid": grid.map(|(tiles, rows, cols)| serde_json::json!({
+                        "tiles": tiles, "rows": rows, "cols": cols,
+                        "min_tiles": PAIMON_GRID_MIN_TILES,
+                        "min_cols": PAIMON_GRID_MIN_COLS,
+                        "min_rows": PAIMON_GRID_MIN_ROWS,
+                    })),
+                    "screen_tone": {"dark": dark, "white": white, "dominant": dominant},
+                    "loading_center": {"center160_dark": center160, "center480_dark": center480},
+                    "loading_rule": loading_rule(image),
+                    "qianxing_map_anchor": gallery_qianxing_map_anchor(image, &templates),
+                    "qianxing_map_tone": map_tone.map(|(dark, dark_teal)| serde_json::json!({
+                        "dark": dark, "dark_teal": dark_teal,
+                        "dark_min": QIANXING_MAP_DARK_MIN,
+                        "dark_teal_min": QIANXING_MAP_DARK_TEAL_MIN,
+                    })),
+                    "qianxing_panel_distance": panel_distance,
+                    "qianxing_panel_max": QIANXING_PANEL_MAX,
+                    "overlay_close": close_ratios.map(|(blue, white)| serde_json::json!({
+                        "blue_ratio": blue,
+                        "white_ratio": white,
+                        "blue_gate": 0.20,
+                        "white_threshold": 0.35,
+                        "hit": is_qianxing_overlay_close(image),
+                    })),
+                    "world_is_teyvat": world_is_teyvat_in(image, hall_bar_rect),
+                    "beige_panel_fraction": beige_panel_fraction(image),
+                    "anchor_threshold": templates.chat_templates.marker_threshold.max(0.95),
+                },
+                "rects": {
+                    "chat": gallery_rect_json(config.screen.chat_rect.into()),
+                    "secondary_back": gallery_rect_json(config.screen.secondary_back_rect.into()),
+                    "secondary_chat_submit": gallery_rect_json(config.screen.secondary_chat_submit_rect.into()),
+                    "main_menu": gallery_rect_json(config.screen.main_menu_rect.into()),
+                    "hall_bar": gallery_rect_json(hall_bar_rect),
+                    "world_wish": gallery_rect_json(config.screen.world_wish_rect.into()),
+                    "panel_friend_list": gallery_rect_json(panels.friend_panel),
+                    "panel_search": gallery_rect_json(panels.friend_search_panel),
+                    "panel_block_chat": gallery_rect_json(panels.friend_block_chat),
+                    "panel_confirm": gallery_rect_json(panels.confirm_button),
+                    "panel_confirm_message": gallery_rect_json(panels.confirm_message),
+                    "panel_view_star": gallery_rect_json(panels.invite_view_star),
+                    "panel_goto_hall": gallery_rect_json(panels.invite_goto_hall),
+                    "panel_enter_hall": gallery_rect_json(panels.invite_enter_hall),
+                },
+                "threshold": templates.chat_templates.marker_threshold,
+            });
+            output.push_str(&serde_json::to_string(&record).unwrap());
+            output.push('\n');
+            count += 1;
+        }
+        std::fs::write(&out_path, output)
+            .unwrap_or_else(|error| panic!("写不到 {out_path}: {error}"));
+        eprintln!("证据画廊：已导出 {count} 帧 -> {out_path}");
+    }
+
+    // ── 单帧 UI 检测报告（只读，#[ignore]） ─────────────────────────────
+    //
+    // 给 `scripts/ui-report.py` 用：读一张截图，跑**生产分类器**与生产匹配函数，
+    // 把 kind/label/final_rule、生产探针、诊断探针（逐模板分数/阈值/命中框）、
+    // 结构判据测量值、OCR 区域、耗时原样导出为 JSON。
+    //
+    // 诊断探针只是把生产匹配函数再跑一遍用于展示，**不参与判定**，也不写回分类结果；
+    // 这里没有任何新的锚点或阈值。
+
+    #[cfg(test)]
+    fn report_probe_json(
+        image: &DynamicImage,
+        label: &str,
+        template: &PathBuf,
+        region: Rect,
+        threshold: f32,
+        downscale: u32,
+    ) -> serde_json::Value {
+        let candidate = best_template_candidate_downscaled(image, Some(region), template, downscale)
+            .ok()
+            .flatten();
+        serde_json::json!({
+            "label": label,
+            "template": template.display().to_string(),
+            "search_rect": gallery_rect_json(region),
+            "score": candidate.as_ref().map(|hit| hit.score),
+            "threshold": threshold,
+            "hit_rect": candidate
+                .as_ref()
+                .filter(|hit| hit.quality_ok)
+                .map(|hit| gallery_rect_json(hit.rect())),
+            "pass": candidate
+                .as_ref()
+                .is_some_and(|hit| hit.quality_ok && hit.score >= threshold),
+            "downscale": downscale,
+            "source": "diagnostic",
+        })
+    }
+
+    #[cfg(test)]
+    fn gallery_overlay_close_ratios(image: &DynamicImage) -> Option<(f32, f32)> {
+            let sampler = RgbSampler::new(image);
+            let (width, height) = sampler.dimensions();
+            if width < FULL_FRAME_MIN_WIDTH || height < FULL_FRAME_MIN_HEIGHT {
+                return None;
+            }
+            let mut total_blue = 0_u32;
+            let mut total_samples = 0_u32;
+            let mut yy = 0;
+            while yy < height {
+                let mut xx = 0;
+                while xx < width {
+                    let pixel = sampler.pixel(xx, yy);
+                    if (pixel[2] as i32) > (pixel[0] as i32) + 15
+                        && pixel[2] > 60
+                        && pixel[0] < 120
+                        && pixel[1] < 160
+                    {
+                        total_blue += 1;
+                    }
+                    total_samples += 1;
+                    xx += 16;
+                }
+                yy += 16;
+            }
+            if total_samples == 0 {
+                return None;
+            }
+            let x1 = width.saturating_sub(20);
+            let x0 = x1.saturating_sub(80);
+            let (mut white, mut total) = (0_u32, 0_u32);
+            let mut y = 10;
+            while y < 70.min(height) {
+                let mut x = x0;
+                while x < x1 {
+                    let pixel = sampler.pixel(x, y);
+                    if pixel[0].min(pixel[1]).min(pixel[2]) >= 220 {
+                        white += 1;
+                    }
+                    total += 1;
+                    x += 2;
+                }
+                y += 2;
+            }
+            if total == 0 {
+                return None;
+            }
+            Some((
+                total_blue as f32 / total_samples as f32,
+                white as f32 / total as f32,
+            ))
+        }
+
+        #[cfg(test)]
+    fn report_diagnostic_probes(
+            image: &DynamicImage,
+            templates: &ResolvedUiTemplateArgs,
+            panels: PanelRegions,
+            screen: &config::ScreenConfig,
+            kind: RuntimeUiStateKind,
+        ) -> Vec<serde_json::Value> {
+            let threshold = templates.chat_templates.marker_threshold;
+            let mut values = Vec::new();
+            // 主链通用锚点（与 detect_ui_state_with_evidence 使用同一区域/阈值）。
+            for (label, template, region) in [
+                (
+                    "main_menu:return_to_teyvat",
+                    &templates.main_menu_template,
+                    screen.main_menu_rect.into(),
+                ),
+                (
+                    "secondary:back_button",
+                    &templates.secondary_back_template,
+                    screen.secondary_back_rect.into(),
+                ),
+                (
+                    "secondary:chat_submit",
+                    &templates.secondary_chat_submit_template,
+                    screen.secondary_chat_submit_rect.into(),
+                ),
+                (
+                    "overworld:world_wish",
+                    &templates.world_wish_template,
+                    screen.world_wish_rect.into(),
+                ),
+            ] {
+                values.push(report_probe_json(image, label, template, region, threshold, 1));
+            }
+            // 面板专属锚点（同 refine_panel 的模板/区域/降采样）。
+            let panel_cases: [(&str, &PathBuf, Rect, u32); 6] = [
+                (
+                    "panel:friend_list",
+                    &templates.friend_panel_template,
+                    panels.friend_panel,
+                    1,
+                ),
+                (
+                    "panel:more_settings",
+                    &templates.friend_block_chat_template,
+                    panels.friend_block_chat,
+                    4,
+                ),
+                (
+                    "panel:add_friend",
+                    &templates.friend_search_panel_template,
+                    panels.friend_search_panel,
+                    1,
+                ),
+                (
+                    "panel:hall_card",
+                    &templates.invite_enter_hall_template,
+                    panels.invite_enter_hall,
+                    templates
+                        .panel_downsample_factors
+                        .get("invite_enter_hall")
+                        .copied()
+                        .unwrap_or(2),
+                ),
+                (
+                    "panel:archive_card",
+                    &templates.invite_goto_hall_template,
+                    panels.invite_goto_hall,
+                    templates
+                        .panel_downsample_factors
+                        .get("invite_goto_hall")
+                        .copied()
+                        .unwrap_or(1),
+                ),
+                (
+                    "panel:avatar_popup",
+                    &templates.invite_view_star_template,
+                    panels.invite_view_star,
+                    templates
+                        .panel_downsample_factors
+                        .get("invite_view_star")
+                        .copied()
+                        .unwrap_or(2),
+                ),
+            ];
+            for (label, template, region, downscale) in panel_cases {
+                values.push(report_probe_json(
+                    image, label, template, region, threshold, downscale,
+                ));
+            }
+            // 确认弹窗双锚点：确认按钮 + 三个关键词文案。
+            values.push(report_probe_json(
+                image,
+                "panel:confirm(button)",
+                &templates.confirm_button_template,
+                panels.confirm_button,
+                threshold,
+                templates
+                    .panel_downsample_factors
+                    .get("confirm_button")
+                    .copied()
+                    .unwrap_or(1),
+            ));
+            for (label, template) in [
+                (
+                    "panel:confirm_block_player(message)",
+                    &templates.confirm_message_block_template,
+                ),
+                (
+                    "panel:confirm_enter_hall(message)",
+                    &templates.confirm_message_random_hall_template,
+                ),
+                (
+                    "panel:confirm_leave_hall(message)",
+                    &templates.confirm_message_return_teyvat_template,
+                ),
+            ] {
+                values.push(report_probe_json(
+                    image,
+                    label,
+                    template,
+                    panels.confirm_message,
+                    CONFIRM_MESSAGE_MIN,
+                    CONFIRM_MESSAGE_SCALE,
+                ));
+            }
+            // 千星专属锚点：大厅卡/档案卡仍是全帧 + 4x 降采样 + 更严阈值（与
+            // refine_panel 一致）；退出菜单已裁成 197×29 的单行模板并收窄到固定
+            // 位置，区域小、1× 匹配也很便宜，因此不受下面的成本护栏限制。
+            // **成本护栏**：全帧大模板匹配单次就要数秒；分类器已经给出 Primary /
+            // Secondary / MainMenu / Loading / Overworld 时，refine_panel 根本不会走到
+            // 这些锚点，因此只记录“未测量”，不为了报告把每帧拖慢十几秒。
+            // Panel / Unknown 才是 refine_panel 的候选分支，照常实测。
+            let full = Rect {
+                x: 0,
+                y: 0,
+                width: image.width(),
+                height: image.height(),
+            };
+            let anchor_threshold = threshold.max(0.95);
+            let measure_anchors = std::env::var_os("MILIASTRA_REPORT_FULL_PROBES").is_some()
+                || matches!(
+                    kind,
+                    RuntimeUiStateKind::Panel | RuntimeUiStateKind::Unknown
+                );
+            let qianxing_cases: [(&str, &PathBuf, Rect, u32); 1] = [(
+                "panel:qianxing_page(exit)",
+                &templates.qianxing_exit_menu_template,
+                QIANXING_EXIT_MENU_SEARCH,
+                QIANXING_EXIT_MENU_SCALE,
+            )];
+            for (label, template, region, scale) in qianxing_cases {
+                if label == "panel:qianxing_page(exit)" || measure_anchors {
+                    values.push(report_probe_json(
+                        image,
+                        label,
+                        template,
+                        region,
+                        anchor_threshold,
+                        scale,
+                    ));
+                } else {
+                    values.push(serde_json::json!({
+                        "label": label,
+                        "template": template.display().to_string(),
+                        "search_rect": gallery_rect_json(region),
+                        "score": null,
+                        "threshold": anchor_threshold,
+                        "hit_rect": null,
+                        "pass": false,
+                        "downscale": scale,
+                        "source": "diagnostic",
+                        "outcome": "skipped_cost_guard",
+                        "note": format!(
+                            "分类器已判 {}/{}，未进入 refine_panel；为控制耗时未做全帧匹配",
+                            kind.name(),
+                            kind.label()
+                        ),
+                    }));
+                }
+            }
+            // F2 多人面板两个按钮锚点。
+            let f2_threshold = threshold.max(QIANXING_F2_BUTTON_MIN);
+            for (label, template, region) in [
+                (
+                    "secondary:qianxing_panel(hall_list)",
+                    &templates.qianxing_f2_hall_list_template,
+                    screen.hall_bar_rect.into(),
+                ),
+                (
+                    "secondary:qianxing_panel(invite)",
+                    &templates.qianxing_f2_invite_player_template,
+                    screen.qianxing_f2_invite_rect.into(),
+                ),
+            ] {
+                values.push(report_probe_json(
+                    image,
+                    label,
+                    template,
+                    region,
+                    f2_threshold,
+                    QIANXING_F2_BUTTON_SCALE,
+                ));
+            }
+            // 千星地图右下角锚点：专用 F1 形状匹配（不是灰度 SAD）。
+            let mut anchor = gallery_qianxing_map_anchor(image, templates);
+            anchor["label"] = serde_json::json!("secondary:qianxing_map(anchor)");
+            anchor["source"] = serde_json::json!("diagnostic");
+            anchor["search_rect"] = anchor["rect"].clone();
+            anchor["downscale"] = serde_json::json!(1);
+            anchor["pass"] = serde_json::json!(anchor["score"]
+                .as_f64()
+                .is_some_and(|score| score as f32 >= QIANXING_MAP_ANCHOR_SCORE_MIN));
+            values.push(anchor);
+            values
+        }
+
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2160,14 +4269,13 @@ mod tests {
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
             let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
-            // 特征化断言：把"已知残留"钉死。淡出帧按钮只剩两成不透明度，
-            // 主菜单模板抓不到，于是落到 secondary_back。将来若这条规则改成
-            // 能连淡出帧一起覆盖，本断言会失败，提醒回来更新文档结论。
-            // 实机侧风险有限：过渡帧不稳定，应用只在稳定类型变化时才推 ui.state 事件。
+            // 淡出帧按钮只剩两成不透明度：主菜单模板抓不到，但底栏也没有二级聊天
+            // 的「发送」圆钮——task-102 起 Secondary 要求**返回按钮 + 聊天锚点**同时成立，
+            // 因此这类过渡帧不再被判成二级聊天（旧实现会落到 secondary_back）。
             assert_eq!(
                 c.evidence().final_rule(),
-                "secondary_back_template",
-                "{path} 的已知残留行为变了，请更新 technical-docs/ui-state-machine.md §44"
+                "no_reliable_anchor",
+                "{path} 无聊天发送锚点，不得判成二级聊天"
             );
         }
         let secondaries = ["secondary-full.png", "sec-fixture.jpg", "round78-live.png"];
@@ -2214,7 +4322,19 @@ mod tests {
         let fixture =
             image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg").unwrap();
         let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-        let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
+        // 与生产同一条构造路径（composition/application.rs）：面板判据必须注入区域，否则
+        // 覆盖层会全部落回 Unknown，门禁会把"没接线"误报成"分类错误"。
+        let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone())
+            .with_panel_regions(PanelRegions {
+                friend_panel: config.moderation.friend_panel_region.into(),
+                friend_search_panel: config.moderation.search_panel_region.into(),
+                friend_block_chat: config.moderation.block_chat_region.into(),
+                confirm_button: config.moderation.confirm_button_region.into(),
+            confirm_message: config.moderation.confirm_message_region.into(),
+                invite_view_star: config.invite.view_star_region.into(),
+                invite_goto_hall: config.invite.goto_hall_region.into(),
+                invite_enter_hall: config.invite.enter_hall_region.into(),
+            });
         let c = classifier.classify_at(&fixture, Instant::now()).unwrap();
         assert_eq!(c.kind(), RuntimeUiStateKind::Secondary);
     }
@@ -2555,11 +4675,11 @@ mod tests {
     /// 世界判据**必须只在 HUD 在场时给结论**。
     ///
     /// 全屏菜单的左上角是菜单内容，青色计数恒为 0，与提瓦特的 0 无法区分。
-    /// 没有这道门时，判据会把派蒙菜单、奇域枢纽菜单、提瓦特地图一律**自信地**
+    /// 没有这道门时，判据会把主菜单大世界、奇域枢纽菜单、提瓦特地图一律**自信地**
     /// 报成「提瓦特」—— 这正是目标禁止的行为：判不出来就返回 unknown，而不是猜一个。
     ///
     /// 这条测试是补写的：第 58 节先把青色标量接进了证据链，实测立刻发现
-    /// 派蒙菜单被判成 teyvat，才回头补门。第一版门用的是界面 kind，实测又发现
+    /// 主菜单大世界被判成 teyvat，才回头补门。第一版门用的是界面 kind，实测又发现
     /// 它同时挡住了提瓦特侧（overworld 只能靠连续 2 帧 unknown 的回退得到），
     /// 于是改成 HUD 在场检测 —— 见下面两条正面测试。
     #[test]
@@ -2801,6 +4921,238 @@ mod tests {
         assert_eq!(qianxing_map_tone(&tiny), None);
         assert!(!is_qianxing_map(&tiny));
     }
+
+    /// 千星地图**右下角锚点**：正负两侧必须不重叠，阈值落在空档内。
+    ///
+    /// 与整屏色调判据的分工：这里量的是右下角那一小块 UI（「千星奇域·大厅」文字 +
+    /// 庙宇图标），对“整屏其它地方是不是暗青”不再敏感，所以亮底地图变体与深色虚空版
+    /// 都能命中；反过来，任何“整屏恰好偏暗青但没有这块标签”的页面也不会被它收进来。
+    #[test]
+    fn qianxing_map_anchor_separates_real_maps_from_every_other_screen() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let score_of = |path: &str| -> f32 {
+            let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
+            qianxing_map_anchor_measure(&image, &templates.qianxing_map_label_template)
+                .unwrap_or_else(|e| panic!("{path} 锚点计算失败: {e}"))
+                .unwrap_or_else(|| panic!("{path} 应能算出锚点分数"))
+                .score
+        };
+
+        // 正样本：9 帧真实千星地图（总览 / 放大 / 亮底变体 / 不同缩放）。
+        let mut positive_floor = f32::MAX;
+        for name in [
+            "qianxing-entry-56/07-qianxing-map.jpg",
+            "map-screen.png",
+            "map-via-M.png",
+            "qianxing-ui-59/qxmap-a.jpg",
+            "qianxing-ui-59/qxmap-b.jpg",
+            "qianxing-ui-59/qxmap-c.jpg",
+            "qianxing-ui-59/r17-地图.jpg",
+            "qianxing-ui-59/r17-cal-180.jpg",
+            "qianxing-ui-59/r18sub/r2c0-map.jpg",
+        ] {
+            let path = format!("technical-docs/ui-state-evidence/{name}");
+            let score = score_of(&path);
+            assert!(
+                score >= QIANXING_MAP_ANCHOR_SCORE_MIN,
+                "{path} 是千星地图，右下角锚点必须命中（实测 F1 {score:.4} < 阈值 {}）",
+                QIANXING_MAP_ANCHOR_SCORE_MIN
+            );
+            positive_floor = positive_floor.min(score);
+        }
+
+        // 负样本：千星大厅 / 主菜单千星 / 主菜单大世界 / F2 大厅页 / 二级聊天 /
+        // 覆盖层大厅卡·档案卡 / 提瓦特地图（含右下角同样是「文字+圆形图标+红点」的
+        // 月之高地帧，是最难的近邻）/ Loading / Overworld。
+        let mut negative_ceiling = 0.0_f32;
+        for name in [
+            "qianxing-entry-56/04-hall-entered.jpg",
+            "qianxing-halls-58/hall2-01.jpg",
+            "qianxing-entry-56/05-hub-menu.jpg",
+            "qianxing-ui-59/r12-hub-live.jpg",
+            "sweep-49/01-paimon-menu.jpg",
+            "qianxing-ui-59/qxf2-from-hall.jpg",
+            "qianxing-ui-59/r10-panel-live.jpg",
+            "qianxing-ui-59/r17-大厅.jpg",
+            "modF-11.png",
+            "qianxing-ui-59/qxchat-open.jpg",
+            "hall-chat-open.jpg",
+            "cold-to-qianxing-59/c01-map.jpg",
+            "cold-to-qianxing-59/c03-map-zoomedout.jpg",
+            "cold-to-qianxing-59/001-t000.jpg",
+            "cold-start/stage-6.jpg",
+        ] {
+            let path = format!("technical-docs/ui-state-evidence/{name}");
+            let score = score_of(&path);
+            assert!(
+                score < QIANXING_MAP_ANCHOR_SCORE_MIN,
+                "{path} 不是千星地图，右下角锚点必须拒绝（实测 F1 {score:.4} >= 阈值 {}）",
+                QIANXING_MAP_ANCHOR_SCORE_MIN
+            );
+            negative_ceiling = negative_ceiling.max(score);
+        }
+
+        assert!(
+            negative_ceiling < QIANXING_MAP_ANCHOR_SCORE_MIN,
+            "负样本最高 {negative_ceiling:.4} 必须低于阈值"
+        );
+        assert!(
+            QIANXING_MAP_ANCHOR_SCORE_MIN < positive_floor,
+            "正样本最低 {positive_floor:.4} 必须高于阈值"
+        );
+        assert!(
+            positive_floor - negative_ceiling >= 0.20,
+            "正负两侧至少留 0.20 的空档：正最低 {positive_floor:.4} / 负最高 {negative_ceiling:.4}"
+        );
+
+        // 小裁剪图必须拒判，不能拿右下角一小块去猜整屏。
+        let tiny = DynamicImage::new_rgb8(120, 68);
+        assert!(
+            qianxing_map_anchor_measure(&tiny, &templates.qianxing_map_label_template)
+                .unwrap()
+                .is_none(),
+            "小裁剪图必须拒判"
+        );
+    }
+
+    /// 右下角锚点命中 → `Secondary(secondary:qianxing_map)`，且证据里带的是锚点探针。
+    #[test]
+    fn qianxing_map_anchor_classifies_as_secondary_hall_map() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        for name in [
+            "qianxing-entry-56/07-qianxing-map.jpg",
+            "map-screen.png",
+            "map-via-M.png",
+            "qianxing-ui-59/r17-地图.jpg",
+        ] {
+            let path = format!("technical-docs/ui-state-evidence/{name}");
+            let image = image::open(&path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
+            let mut classifier = TemplateUiStateClassifier::new(
+                UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+                config.screen.clone(),
+            );
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_eq!(
+                classification.kind(),
+                RuntimeUiStateKind::Secondary,
+                "{path} 必须归到 Secondary，实际 {}",
+                classification.kind().name()
+            );
+            assert_eq!(
+                classification.label(),
+                "secondary:qianxing_map",
+                "{path} 的 label 必须是 secondary:qianxing_map"
+            );
+            assert_eq!(
+                classification.evidence().final_rule(),
+                "qianxing_map_label_template",
+                "{path} 的最终判据必须是右下角锚点，而不是整屏色调"
+            );
+            let probe = classification
+                .evidence()
+                .template_probes()
+                .iter()
+                .find(|probe| probe.template().ends_with("qianxing-map-label.png"))
+                .unwrap_or_else(|| panic!("{path} 证据里应带右下角锚点模板探针"));
+            assert_eq!(probe.outcome(), "matched");
+            assert!(
+                probe.best_score().is_some_and(|score| score >= QIANXING_MAP_ANCHOR_SCORE_MIN),
+                "{path} 锚点探针分数应不低于阈值"
+            );
+            let region = probe.search_rect();
+            assert_eq!(
+                (region.x(), region.y(), region.width(), region.height()),
+                (
+                    QIANXING_MAP_ANCHOR_SEARCH.x,
+                    QIANXING_MAP_ANCHOR_SEARCH.y,
+                    QIANXING_MAP_ANCHOR_SEARCH.width,
+                    QIANXING_MAP_ANCHOR_SEARCH.height,
+                ),
+                "{path} 锚点 ROI 必须就是右下角那一块"
+            );
+            // 有模板就够，不需要 OCR：这里没有注入任何 OCR handle。
+            let _ = &templates;
+        }
+    }
+
+    /// 缩放稳健性：真实帧缩到 1280×720 / 1600×900 / 2560×1440 后锚点仍要命中。
+    ///
+    /// ROI 是按宽高比缩放后再归一到规范尺寸的，所以换分辨率不需要重新标定坐标；
+    /// 这条测试防的是"把 1920×1080 的绝对坐标当成所有画面的坐标"。
+    #[test]
+    fn qianxing_map_anchor_survives_frame_scaling() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let source =
+            image::open("technical-docs/ui-state-evidence/qianxing-entry-56/07-qianxing-map.jpg")
+                .unwrap();
+        for (width, height) in [(1280_u32, 720_u32), (1600, 900), (2560, 1440)] {
+            let scaled = source.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
+            let matched = qianxing_map_anchor_measure(
+                &scaled,
+                &templates.qianxing_map_label_template,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("{width}x{height} 应能算出锚点分数"));
+            assert!(
+                matched.score >= QIANXING_MAP_ANCHOR_SCORE_MIN,
+                "{width}x{height} 缩放到该分辨率后锚点仍须命中（实测 F1 {:.4}）",
+                matched.score
+            );
+            assert!(
+                matched.x > QIANXING_MAP_ANCHOR_SEARCH.x - 32
+                    && matched.y > QIANXING_MAP_ANCHOR_SEARCH.y - 32,
+                "{width}x{height} 的命中位置必须仍在右下角（实测 {},{}）",
+                matched.x,
+                matched.y
+            );
+        }
+    }
+
+    /// 可选 OCR 后备的**文本判据**（纯字符串，不需要模型）。
+    #[test]
+    fn qianxing_map_label_text_requires_both_words() {
+        assert!(qianxing_map_label_text_matches("千星奇域·大厅"));
+        assert!(qianxing_map_label_text_matches("  千 星 奇 域 · 大 厅  "));
+        assert!(qianxing_map_label_text_matches("UID: 10000001 千星奇域 · 大厅"));
+        assert!(!qianxing_map_label_text_matches("月之高地 探索度 91%"));
+        assert!(!qianxing_map_label_text_matches("千星奇域"));
+        assert!(!qianxing_map_label_text_matches("大厅列表"));
+        assert!(!qianxing_map_label_text_matches(""));
+    }
+
+    /// 可选 OCR 后备：对右下角 ROI 调一次 OCR 再套文本判据。
+    /// 离线可测——OCR 设备是桩，不依赖模型文件；模板路径本身也不需要 OCR。
+    #[test]
+    fn qianxing_map_label_ocr_backup_reads_the_bottom_right_label() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let image = image::open("technical-docs/ui-state-evidence/qianxing-entry-56/07-qianxing-map.jpg")
+            .unwrap();
+        let region = qianxing_map_anchor_rect(&image).expect("整帧应能算出锚点区域");
+        let text = Arc::new(Mutex::new("千星奇域 · 大厅".to_string()));
+        let ocr = OcrRuntime::start(
+            TestGateOcr {
+                calls: Arc::new(AtomicUsize::new(0)),
+                text: Arc::clone(&text),
+            },
+            1,
+        )
+        .unwrap();
+        assert!(
+            qianxing_map_label_via_ocr(&ocr.handle(), &image, region).unwrap(),
+            "右下角 OCR 文本是「千星奇域·大厅」时必须命中"
+        );
+        *text.lock().unwrap() = "月之高地 探索度 91%".to_string();
+        assert!(
+            !qianxing_map_label_via_ocr(&ocr.handle(), &image, region).unwrap(),
+            "提瓦特地图右下角的「月之高地」不能命中"
+        );
+        ocr.shutdown().unwrap();
+        let _ = &config;
+    }
+
     /// 反向保证：把上面那批真实画面逐帧过一遍分类器，**一个都不许**被判成 loading。
     #[test]
     fn no_real_screen_is_classified_as_loading() {
@@ -2954,16 +5306,23 @@ mod tests {
             assert_ne!(
                 probed.evidence().final_rule(),
                 "world_wish_template",
-                "{path} 被世界判据否掉时应报 world_wish_without_teyvat_hud"
+                "{path} 被世界判据否掉时应报 world_wish_without_hud_bottom_bar"
             );
         }
         // 正样本：真实的提瓦特大世界帧仍须通过世界判据，别把门关死。
+        // 证据是 JPEG（白色被压到 240–254），按仓库既有口径先 snap 成纯白再判——
+        // 等价于线上的无损抓图；Overworld 判据是「底栏白键 1~4」，0 个不猜。
         for name in [
             "teyvat-regions-58/snow-01.jpg",
             "teyvat-regions-58/desert-01.jpg",
         ] {
             let path = format!("technical-docs/ui-state-evidence/{name}");
-            let image = image::open(&path).unwrap();
+            let mut image = image::open(&path).unwrap();
+            snap_near_white_to_pure_white(
+                &mut image,
+                config.screen.hall_bar_rect.into(),
+                225,
+            );
             assert!(
                 world_is_teyvat(&image),
                 "{path} 是提瓦特大世界，必须判为 true"
@@ -3085,6 +5444,163 @@ mod tests {
         }
     }
 
+    /// F2 大厅页（千星多人面板）首选判据 = **左下「大厅列表」+ 右下「邀请玩家」**
+    /// 两个底部按钮锚点同时命中；任一不中就不判 F2，交给描述子兜底。
+    ///
+    /// 这条用例同时钉住：
+    /// - 正样本（13 帧真实 F2，含公共/私人大厅、不同玩家列表）两个锚点都 >= 0.95，
+    ///   分类输出必须是 `Secondary` / `secondary:qianxing_panel`（surface
+    ///   `Secondary(MultiplayerPanel)`），不能再落成 `panel:hall_card` 或 `main_menu`；
+    /// - 负样本（大厅/主菜单/派蒙/二级聊天/覆盖层大厅卡/好友面板/地图/加载/大世界）
+    ///   锚点分数都低于 0.95，分类不得是 F2 多人面板。
+    #[test]
+    fn f2_hall_page_bottom_buttons_classify_secondary_multiplayer_panel() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let threshold = templates
+            .chat_templates
+            .marker_threshold
+            .max(QIANXING_F2_BUTTON_MIN);
+        let left_region: Rect = config.screen.hall_bar_rect.into();
+        let right_region: Rect = config.screen.qianxing_f2_invite_rect.into();
+        let score_of = |image: &DynamicImage, region: Rect, template: &PathBuf| {
+            best_template_candidate_downscaled(
+                image,
+                Some(region),
+                template,
+                QIANXING_F2_BUTTON_SCALE,
+            )
+            .ok()
+            .flatten()
+            .map(|hit| hit.score)
+            .unwrap_or(0.0)
+        };
+        let classify = |image: &DynamicImage| {
+            let mut classifier = TemplateUiStateClassifier::new(
+                templates.clone(),
+                config.screen.clone(),
+            )
+            .with_panel_regions(panel_regions_from(&config));
+            classifier.classify_at(image, Instant::now()).unwrap()
+        };
+
+        let mut positive_floor = f32::MAX;
+        for path in [
+            "technical-docs/ui-state-evidence/qianxing-ui-59/after-fix-f2.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/qxf2-from-hall.jpg",
+            "technical-docs/ui-state-evidence/hall-page.png",
+            "tests/fixtures/ui/unknown-panel-1920x1080.png",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/probe-a.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/probe-b.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/qxchat-closed2.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/qxchat-from-hall.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r10-now.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r10-panel-live.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r10-set.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r17-大厅.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r1c0-hall.jpg",
+        ] {
+            let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
+            let left = score_of(
+                &image,
+                left_region,
+                &templates.qianxing_f2_hall_list_template,
+            );
+            let right = score_of(
+                &image,
+                right_region,
+                &templates.qianxing_f2_invite_player_template,
+            );
+            println!("F2POS {path} hall_list={left:.4} invite={right:.4}");
+            assert!(
+                left >= threshold && right >= threshold,
+                "{path} 两个按钮锚点应同时 >= {threshold}（大厅列表 {left:.4}、邀请玩家 {right:.4}）"
+            );
+            positive_floor = positive_floor.min(left.min(right));
+            let classification = classify(&image);
+            assert_eq!(
+                classification.kind(),
+                RuntimeUiStateKind::Secondary,
+                "{path} 应判 Secondary，实际 {}/{}",
+                classification.kind().name(),
+                classification.label()
+            );
+            assert_eq!(
+                classification.label(),
+                "secondary:qianxing_panel",
+                "{path} 应判 F2 多人面板，实际 {}/{}",
+                classification.kind().name(),
+                classification.label()
+            );
+            assert_eq!(
+                classification.evidence().final_rule(),
+                "secondary:qianxing_panel_buttons",
+                "{path} 应走按钮首选判据"
+            );
+            let surface = crate::ui::routines::test_surface_of(
+                classification.kind(),
+                classification.label(),
+                classification.evidence().final_rule(),
+            );
+            assert_eq!(surface.chinese_name(), "二级界面·多人面板", "{path}");
+            assert!(
+                surface.is_secondary_interface(),
+                "{path} surface 应为二级界面子型"
+            );
+        }
+
+        // 负样本覆盖：千星大厅、主菜单千星、主菜单大世界、二级聊天（大厅/好友）、
+        // 覆盖层大厅卡/好友面板、千星地图、Loading、Overworld。
+        let mut negative_ceiling = 0.0_f32;
+        for path in [
+            "tests/fixtures/ui/hall-primary-1920x1080.jpg",
+            "tests/fixtures/ui/main-menu-wonderland-1920x1080.png",
+            "technical-docs/ui-state-evidence/wonderland-menu.png",
+            "tests/fixtures/ui/menu-paimon-1920x1080.jpg",
+            "tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/qxchat-open.jpg",
+            "tests/fixtures/ui/panel-hall-card-1920x1080.jpg",
+            "tests/fixtures/ui/panel-friend-list-1920x1080.jpg",
+            "technical-docs/ui-state-evidence/friend-list.png",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/qxmap-a.jpg",
+            "tests/fixtures/ui/map-teyvat-1920x1080.png",
+            "tests/fixtures/ui/loading-dark-1920x1080.jpg",
+            "tests/fixtures/ui/overworld-teyvat-1920x1080.jpg",
+        ] {
+            let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
+            let left = score_of(
+                &image,
+                left_region,
+                &templates.qianxing_f2_hall_list_template,
+            );
+            let right = score_of(
+                &image,
+                right_region,
+                &templates.qianxing_f2_invite_player_template,
+            );
+            let classification = classify(&image);
+            println!(
+                "F2NEG {path} hall_list={left:.4} invite={right:.4} label={}",
+                classification.label()
+            );
+            assert!(
+                left < threshold && right < threshold,
+                "{path} 不得同时命中 F2 按钮锚点（大厅列表 {left:.4}、邀请玩家 {right:.4}）"
+            );
+            negative_ceiling = negative_ceiling.max(left.max(right));
+            assert_ne!(
+                classification.label(),
+                "secondary:qianxing_panel",
+                "{path} 被误判成 F2 多人面板"
+            );
+        }
+        assert!(
+            QIANXING_F2_BUTTON_MIN > negative_ceiling
+                && QIANXING_F2_BUTTON_MIN < positive_floor,
+            "阈值 {QIANXING_F2_BUTTON_MIN} 必须落在空档 ({negative_ceiling:.4}, {positive_floor:.4}) 内"
+        );
+    }
+
     #[test]
     fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grace() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -3163,7 +5679,7 @@ mod tests {
         assert_eq!(probed.label(), "unknown");
         assert_eq!(
             probed.evidence().final_rule(),
-            "world_wish_without_teyvat_hud",
+            "world_wish_without_hud_bottom_bar",
             "祈愿顶栏命中但没有提瓦特 HUD，回退探针必须被世界判据拦下"
         );
         // 第 32 秒：还在探针冷却期（5 秒）里，返回的是基础分类 ⇒ 判据名回到 no_reliable_anchor。
@@ -3173,9 +5689,10 @@ mod tests {
             .unwrap();
         assert_eq!(cooled.label(), "unknown");
         assert_eq!(cooled.evidence().final_rule(), "no_reliable_anchor");
-        // OCR 调用次数是 3 不是 4：第 32 秒在冷却期里，探针根本没跑，
-        // 所以不会产生第 4 次 `点击进入` 识别。次数本身也被钉住了。
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // 第 31 秒那次探针会产生两次 OCR：一次「点击进入」门禁文本，一次
+        // 千星地图右下角标签的可选后备（`qianxing_map_label_via_ocr`）。
+        // 第 32 秒在冷却期里，探针根本没跑，因此总数停在 4。
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!(
             classifier
                 .classify_at(&secondary, now + Duration::from_secs(33))
@@ -3191,8 +5708,8 @@ mod tests {
                 .kind(),
             RuntimeUiStateKind::Unknown
         );
-        // 仍然是 3：第 34 秒还在同一次冷却期内，第 33 秒那帧是 secondary 直接返回。
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // 仍然是 4：第 34 秒还在同一次冷却期内，第 33 秒那帧是 secondary 直接返回。
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
         // 好友判据已并入大厅；现在链首扫的是聊天标记，所以用聊天区的非法矩形验证"坏区域必须报错"。
         classifier.screen.chat_rect.width = 3000;
         assert!(
@@ -3292,11 +5809,10 @@ mod tests {
             .classify(&image)
             .expect("classify fixed secondary-chat screenshot");
         let evidence = classification.evidence();
-        assert_eq!(evidence.final_rule(), "secondary_back_template");
-        // 探针顺序：secondary_back，然后是返回按钮命中后才跑的两个否决探针
-        // （main_menu 奇域主菜单、paimon_menu 提瓦特派蒙菜单）。后两者都用来挡住
-        // 和二级聊天共用的那个圆形返回按钮。
-        // 2026-10-17：好友按钮判据并入大厅（与大厅重复，65/66 帧同判），探针从 4 个减到 3 个。
+        assert_eq!(evidence.final_rule(), "secondary_chat_anchor");
+        // 探针顺序：secondary_back → main_menu（返回提瓦特）→ secondary_chat_submit
+        // （发送圆钮）。派蒙的双锚点探针排在聊天锚点之后：聊天界面先判二级，
+        // "不是聊天"才继续查派蒙。
         assert_eq!(evidence.template_probes().len(), 3);
         assert!(
             evidence
@@ -3310,8 +5826,8 @@ mod tests {
             "二级界面上不该出现主菜单的返回提瓦特按钮"
         );
         assert!(
-            evidence.template_probes()[2].hit_rect().is_none(),
-            "二级界面上不该出现派蒙菜单的功能宫格锚点"
+            evidence.template_probes()[2].hit_rect().is_some(),
+            "二级聊天必须命中「发送」锚点才能判二级"
         );
     }
 
@@ -3420,12 +5936,241 @@ mod tests {
             "设置宫格应跨两行（顶部极差应大于 4 px）"
         );
     }
+    /// 用户 2026-11-10 明确：千星大厅底栏只有 7~8 个白键（聊天框关 8、开 7），
+    /// 旧上限 14 把更宽的白色结构也算了进来。合成帧钉住边界 7/8 通过、6/9/10/14 拒绝。
+    #[test]
+    fn hall_bottom_bar_accepts_seven_or_eight_keys_only() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let rect: Rect = config.screen.hall_bar_rect.into();
+        let (origin_x, origin_y) = (rect.x, rect.y);
+        let keys = |count: i32| {
+            let mut canvas = image::RgbaImage::from_pixel(1920, 1080, image::Rgba([0, 0, 0, 255]));
+            for index in 0..count {
+                let left = origin_x + 20 + index * 60;
+                for y in (origin_y + 10)..(origin_y + 36) {
+                    for x in left..left + 30 {
+                        canvas.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, 255]));
+                    }
+                }
+            }
+            image::DynamicImage::ImageRgba8(canvas)
+        };
+        for count in [7, 8] {
+            let image = keys(count);
+            let (tiles, min_height, max_height, top_spread) = hall_bar_signature(&image, rect);
+            assert!(
+                hall_bar_looks_like_hall_keys(tiles, min_height, max_height, top_spread),
+                "{count} 个白键应判成千星大厅底栏（实测聊天关=8、开=7）"
+            );
+        }
+        for count in [6, 9, 10, 14] {
+            let image = keys(count);
+            let (tiles, min_height, max_height, top_spread) = hall_bar_signature(&image, rect);
+            assert!(
+                !hall_bar_looks_like_hall_keys(tiles, min_height, max_height, top_spread),
+                "{count} 个白键不得判成千星大厅底栏"
+            );
+        }
+    }
+
+    /// Overworld 判据（用户 2026-11-10 第二次修正）：**HUD 在场 + 底栏白键 1~4 个**
+    /// （实测主世界通常 2 个）。旧阈值 `<7` 会把 5–6 个键的帧也放进来，这次收紧。
+    ///
+    /// 有损 JPEG 帧的白色被压到 240–254，严格 255 会数出 0 个；测试沿用仓库既有口径，
+    /// 先用 `snap_near_white_to_pure_white` 把白色还原成纯白（等价于线上的无损抓图）再跑判据。
+    #[test]
+    fn overworld_requires_hud_and_one_to_four_bottom_keys() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let hall_rect: Rect = config.screen.hall_bar_rect.into();
+
+        // ── 边界样本：真实提瓦特帧（HUD 在场）上清空底栏后精确画 0..=8 个白键。
+        // 1~4 必须通过；0（没证据）与 5/6/7/8（大厅是 7–8）必须拒绝。
+        let base = image::open("tests/fixtures/ui/overworld-teyvat-1920x1080.jpg").unwrap();
+        let (origin_x, origin_y) = (hall_rect.x.max(0) as u32, hall_rect.y.max(0) as u32);
+        let frame_with_keys = |count: usize| {
+            let mut rgb = base.to_rgb8();
+            for y in origin_y..origin_y + hall_rect.height {
+                for x in origin_x..origin_x + hall_rect.width {
+                    rgb.put_pixel(x, y, image::Rgb([0, 0, 0]));
+                }
+            }
+            for index in 0..count {
+                let left = origin_x + 20 + index as u32 * 60;
+                for y in origin_y + 10..origin_y + 36 {
+                    for x in left..left + 30 {
+                        rgb.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                    }
+                }
+            }
+            image::DynamicImage::ImageRgb8(rgb)
+        };
+        for count in 1..=4usize {
+            let image = frame_with_keys(count);
+            let (tiles, _, _, _) = hall_bar_signature(&image, hall_rect);
+            assert_eq!(tiles, count, "边界样本应有 {count} 个白键");
+            assert!(
+                world_is_teyvat_in(&image, hall_rect),
+                "{count} 个白键落在 1~4，应判提瓦特大世界"
+            );
+            let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+            let mut classifier =
+                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            assert_eq!(
+                classifier.classify_at(&image, Instant::now()).unwrap().kind(),
+                RuntimeUiStateKind::Overworld,
+                "{count} 个白键的提瓦特帧应判 Overworld"
+            );
+        }
+        for count in [0usize, 5, 6, 7, 8] {
+            let image = frame_with_keys(count);
+            let (tiles, _, _, _) = hall_bar_signature(&image, hall_rect);
+            assert_eq!(tiles, count);
+            assert!(
+                !world_is_teyvat_in(&image, hall_rect),
+                "{count} 个白键不在 1~4，不得判成提瓦特大世界"
+            );
+        }
+
+        // ── 真实提瓦特帧（含旧青带判据漏掉的 teleport-53 生活帧）：
+        // 有损帧 snap 成纯白后底栏应为 1~2 个键 → Overworld。
+        for name in [
+            "teyvat-regions-58/desert-01.jpg",
+            "teyvat-regions-58/snow-01.jpg",
+            "teleport-53/live-220.jpg",
+            "transition-to-overworld/05-overworld-teyvat.jpg",
+        ] {
+            let path = format!("technical-docs/ui-state-evidence/{name}");
+            let mut image = image::open(&path).unwrap();
+            snap_near_white_to_pure_white(&mut image, hall_rect, 225);
+            let (tiles, _, _, _) = hall_bar_signature(&image, hall_rect);
+            assert!(
+                (1..=4).contains(&tiles),
+                "{path} 提瓦特底栏白键实测 {tiles} 个，应落在 1~4"
+            );
+            assert!(
+                world_is_teyvat_in(&image, hall_rect),
+                "{path} 是提瓦特大世界（HUD 在场 + 底栏 {tiles} 键），必须判 true"
+            );
+            let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+            let mut classifier =
+                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            assert_eq!(
+                classifier.classify_at(&image, Instant::now()).unwrap().kind(),
+                RuntimeUiStateKind::Overworld,
+                "{path} 应判成 Overworld"
+            );
+        }
+
+        // ── 负样本：千星大厅 7–8 键绝不判 Overworld。
+        // hb-01..05 是有损帧：严格 255 只数出 2–4 块（落在 1~4 内！），必须靠
+        // 「近白结构 7 块 = 大厅底栏」否决；snap 成纯白后是 7 块，直接超出 1~4。
+        for name in [
+            "hallbar-56/hb-01.jpg",
+            "hallbar-56/hb-02.jpg",
+            "hallbar-56/hb-03.jpg",
+            "hallbar-56/hb-04.jpg",
+            "hallbar-56/hb-05.jpg",
+            "qianxing-halls-58/hall2-01.jpg",
+            "round78-live2.png",
+        ] {
+            let path = format!("technical-docs/ui-state-evidence/{name}");
+            let raw = image::open(&path).unwrap();
+            assert!(
+                !world_is_teyvat_in(&raw, hall_rect),
+                "{path} 是千星大厅（有损帧），世界判据不得放行"
+            );
+            let mut snapped = raw.clone();
+            snap_near_white_to_pure_white(&mut snapped, hall_rect, 225);
+            let (tiles, _, _, _) = hall_bar_signature(&snapped, hall_rect);
+            assert!(
+                tiles > HALL_BAR_OVERWORLD_MAX_TILES,
+                "{path} snap 后应数出大厅的 7–8 键（实际 {tiles}）"
+            );
+            assert!(
+                !world_is_teyvat_in(&snapped, hall_rect),
+                "{path} 千星大厅 {tiles} 键不得判 Overworld"
+            );
+        }
+        // 菜单 / F2 面板 / 千星地图 / 二级聊天：HUD 不在场，一律不是 Overworld。
+        for name in [
+            "wonderland-menu.png",
+            "qianxing-ui-59/after-fix-f2.jpg",
+            "qianxing-ui-59/qxmap-a.jpg",
+            "secondary-full.png",
+        ] {
+            let path = format!("technical-docs/ui-state-evidence/{name}");
+            let image = image::open(&path).unwrap();
+            assert!(
+                !world_is_teyvat_in(&image, hall_rect),
+                "{path} HUD 不在场或非大世界，世界判据不得放行"
+            );
+            let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+            let mut classifier =
+                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_ne!(
+                classification.kind(),
+                RuntimeUiStateKind::Overworld,
+                "{path} 不得判成 Overworld（{}）",
+                classification.label()
+            );
+        }
+    }
+
+    /// 二级判据 = 左上圆形返回按钮 **且** 底栏「发送」圆钮。主菜单淡出过渡帧只有
+    /// 返回按钮（旧实现会判成 Secondary），现在必须落 Unknown；真实大厅二级聊天
+    /// 与好友会话仍然判 Secondary。
+    #[test]
+    fn secondary_chat_requires_the_send_anchor() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let secondary = [
+            "technical-docs/ui-state-evidence/round78-live.png",
+            "technical-docs/ui-state-evidence/secondary-full.png",
+            "technical-docs/ui-state-evidence/sec-fixture.jpg",
+            "tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg",
+        ];
+        for path in secondary {
+            let image = image::open(path).unwrap();
+            let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+            let mut classifier =
+                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_eq!(
+                classification.kind(),
+                RuntimeUiStateKind::Secondary,
+                "{path} 是真实的二级聊天，必须判 Secondary（实际 {}）",
+                classification.label()
+            );
+            assert_eq!(
+                classification.evidence().final_rule(),
+                "secondary_chat_anchor",
+                "{path} 应报返回按钮 + 聊天锚点规则"
+            );
+        }
+        for path in [
+            "technical-docs/ui-state-evidence/step-5.png",
+            "technical-docs/ui-state-evidence/step-last.png",
+        ] {
+            let image = image::open(path).unwrap();
+            let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+            let mut classifier =
+                TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_ne!(
+                classification.kind(),
+                RuntimeUiStateKind::Secondary,
+                "{path} 是主菜单淡出帧，只有返回按钮，不得判成二级聊天"
+            );
+        }
+    }
+
     fn panel_regions_from(config: &AppConfig) -> PanelRegions {
         PanelRegions {
             friend_panel: config.moderation.friend_panel_region.into(),
             friend_search_panel: config.moderation.search_panel_region.into(),
             friend_block_chat: config.moderation.block_chat_region.into(),
-            friend_confirm: config.moderation.confirm_region.into(),
+            confirm_button: config.moderation.confirm_button_region.into(),
+            confirm_message: config.moderation.confirm_message_region.into(),
             invite_view_star: config.invite.view_star_region.into(),
             invite_goto_hall: config.invite.goto_hall_region.into(),
             invite_enter_hall: config.invite.enter_hall_region.into(),
@@ -3447,9 +6192,20 @@ mod tests {
         for (name, label) in [
             ("panel-friend-list-1920x1080.jpg", "panel:friend_list"),
             ("panel-add-friend-1920x1080.jpg", "panel:add_friend"),
-            ("panel-more-settings-1920x1080.jpg", "panel:more_settings"),
-            ("panel-confirm-dialog-1920x1080.jpg", "panel:confirm_dialog"),
-            ("panel-archive-card-1920x1080.jpg", "panel:archive_card"),
+            // 逐帧目检：这张是⋯菜单展开；菜单优先级高于底层资料卡。
+            (
+                "panel-more-settings-1920x1080.jpg",
+                "panel:more_settings",
+            ),
+            (
+                "panel-confirm-dialog-1920x1080.jpg",
+                "panel:confirm_block_player",
+            ),
+            // 逐帧目检：这张是千星资料卡（奇域等级 + 查看资料），不是提瓦特档案卡。
+            (
+                "panel-archive-card-1920x1080.jpg",
+                "panel:qianxing_profile_friend",
+            ),
             ("panel-hall-card-1920x1080.jpg", "panel:hall_card"),
             ("panel-avatar-popup-1920x1080.jpg", "panel:avatar_popup"),
         ] {
@@ -3473,26 +6229,1933 @@ mod tests {
         }
     }
 
-    /// 派蒙菜单（提瓦特 ESC 系统菜单）和二级聊天共用**同一个**圆形返回按钮，但它左侧
-    /// 换成功能宫格。只靠 `secondary_back` 会把它误判成二级聊天；改用「商城」图标这个专属
-    /// 锚点后判为 `MainMenu`，证据规则名与奇域主菜单区分开。
+    /// 确认弹窗的正样本：按钮 + 对应关键词文案必须判成对应子类型。
     #[test]
-    fn paimon_menu_is_not_mistaken_for_secondary_chat() {
+    fn confirm_dialogs_are_classified_by_button_and_message() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
-        let image = image::open("tests/fixtures/ui/menu-paimon-1920x1080.jpg")
-            .expect("打开派蒙菜单夹具失败");
-        let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
-        let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+        let panels = panel_regions_from(&config);
+        for (path, label) in [
+            (
+                "technical-docs/ui-state-evidence/cold-to-qianxing-59/c05-region-confirm.jpg",
+                "panel:confirm_enter_hall",
+            ),
+            (
+                "technical-docs/ui-state-evidence/qianxing-entry-56/03-confirm-dialog.jpg",
+                "panel:confirm_enter_hall",
+            ),
+            (
+                "technical-docs/ui-state-evidence/exit-to-teyvat-56/02-leave-confirm.jpg",
+                "panel:confirm_leave_hall",
+            ),
+            (
+                "technical-docs/ui-state-evidence/leave-hall-confirm.jpg",
+                "panel:confirm_leave_hall",
+            ),
+            (
+                "technical-docs/ui-state-evidence/qianxing-ui-59/r12-ctrl-return.jpg",
+                "panel:confirm_leave_hall",
+            ),
+            (
+                "technical-docs/ui-state-evidence/qianxing-ui-59/r12-ctrl-team.jpg",
+                "panel:confirm_leave_hall",
+            ),
+            (
+                "technical-docs/ui-state-evidence/transition-to-overworld/03-leave-confirm.jpg",
+                "panel:confirm_leave_hall",
+            ),
+            (
+                "tests/fixtures/ui/panel-confirm-dialog-1920x1080.jpg",
+                "panel:confirm_block_player",
+            ),
+        ] {
+            let image = image::open(path).unwrap();
+            let mut classifier =
+                TemplateUiStateClassifier::new(templates.clone(), config.screen.clone())
+                    .with_panel_regions(panels);
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_eq!(
+                classification.kind(),
+                RuntimeUiStateKind::Panel,
+                "{path} 应判为 panel，实际是 {}",
+                classification.kind().name()
+            );
+            assert_eq!(classification.label(), label, "{path} 的确认弹窗子类型错了");
+        }
+    }
+
+    fn fill_rgb_rect(image: &mut image::RgbImage, rect: Rect, color: image::Rgb<u8>) {
+        let x0 = rect.x.max(0);
+        let y0 = rect.y.max(0);
+        let x1 = (rect.x + rect.width as i32).min(image.width() as i32);
+        let y1 = (rect.y + rect.height as i32).min(image.height() as i32);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                image.put_pixel(x as u32, y as u32, color);
+            }
+        }
+    }
+
+    /// 负样本：确认按钮在但文案被去掉 → 不判任何确认子类型（绝不回退单按钮标签）。
+    /// 文案在但确认按钮被去掉 → 同样不判。文案换成「屏蔽聊天」也不得判确认。
+    #[test]
+    fn confirm_dialog_requires_both_button_and_message_anchors() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let panels = panel_regions_from(&config);
+        let source = image::open("tests/fixtures/ui/panel-confirm-dialog-1920x1080.jpg")
+            .unwrap()
+            .to_rgb8();
+        let background = *source.get_pixel(700, 650);
+        let message_region = Rect::new(650, 460, 620, 90);
+        let classify = |image: &image::RgbImage| {
+            let mut classifier =
+                TemplateUiStateClassifier::new(templates.clone(), config.screen.clone())
+                    .with_panel_regions(panels);
+            classifier
+                .classify_at(&DynamicImage::ImageRgb8(image.clone()), Instant::now())
+                .unwrap()
+                .label()
+                .to_string()
+        };
+
+        // 只有确认按钮：抹掉整行文案。
+        let mut only_button = source.clone();
+        fill_rgb_rect(&mut only_button, message_region, background);
+        let label = classify(&only_button);
+        assert!(
+            !label.starts_with("panel:confirm_"),
+            "只有确认按钮、没有文案锚点，不得判确认弹窗，实际 {label}"
+        );
+
+        // 只有文案：抹掉确认按钮。
+        let mut only_message = source.clone();
+        fill_rgb_rect(
+            &mut only_message,
+            panels.confirm_button,
+            background,
+        );
+        let label = classify(&only_message);
+        assert!(
+            !label.starts_with("panel:confirm_"),
+            "只有文案、没有确认按钮，不得判确认弹窗，实际 {label}"
+        );
+
+        // 文案换成其它文字（「屏蔽聊天」）：不得判确认。
+        let other = image::open("tests/fixtures/ui/panel-more-settings-1920x1080.jpg")
+            .unwrap()
+            .to_rgb8();
+        let patch = image::imageops::crop_imm(&other, 1380, 360, 170, 70).to_image();
+        let mut replaced = source;
+        fill_rgb_rect(&mut replaced, message_region, background);
+        image::imageops::overlay(&mut replaced, &patch, 900, 480);
+        let label = classify(&replaced);
+        assert!(
+            !label.starts_with("panel:confirm_"),
+            "文案换成「屏蔽聊天」后不得判确认弹窗，实际 {label}"
+        );
+    }
+
+    /// 主菜单大世界**布局无关**判定：返回按钮命中 + 无「返回提瓦特」+ 无聊天发送锚点 +
+    /// 左侧「多瓦片宫格结构」（downscale 颜色 + 连通域）。不再依赖「队伍配置/成就」
+    /// 固定坐标、固定列距、商城图标或 OCR。
+    #[test]
+    fn paimon_menu_is_detected_by_layout_independent_grid() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        for path in [
+            "tests/fixtures/ui/menu-paimon-1920x1080.jpg",
+            "technical-docs/ui-state-evidence/sweep-49/01-paimon-menu.jpg",
+            "technical-docs/ui-state-evidence/sweep-49/10-F2.jpg",
+            "technical-docs/ui-state-evidence/sweep-49/10-F2b.jpg",
+            "technical-docs/ui-state-evidence/sweep-50/01-map.jpg",
+            "technical-docs/ui-state-evidence/sweep-50/02-waypoint-selected.jpg",
+            "technical-docs/ui-state-evidence/sweep-50/06-F2-real.jpg",
+        ] {
+            let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
+            let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_eq!(
+                classification.kind(),
+                RuntimeUiStateKind::MainMenu,
+                "{path} 被误判成 {}",
+                classification.label()
+            );
+            assert_eq!(
+                classification.evidence().final_rule(),
+                "paimon_menu_grid",
+                "{path} 应报宫格结构规则"
+            );
+        }
+        // 负样本覆盖：主菜单千星/淡出帧/hub 过渡/二级·当前大厅/二级·好友私聊/
+        // F2 多人面板/千星地图/覆盖层/Loading/Unknown。
+        for path in [
+            "technical-docs/ui-state-evidence/wonderland-menu.png",
+            "technical-docs/ui-state-evidence/settled-3.png",
+            "technical-docs/ui-state-evidence/final.png",
+            "technical-docs/ui-state-evidence/restored.png",
+            "technical-docs/ui-state-evidence/modR-5.png",
+            "technical-docs/ui-state-evidence/step-5.png",
+            "technical-docs/ui-state-evidence/step-last.png",
+            "technical-docs/ui-state-evidence/transition-to-overworld/02-hub-menu.jpg",
+            "technical-docs/ui-state-evidence/qianxing-entry-56/05-hub-menu.jpg",
+            "technical-docs/ui-state-evidence/round78-live.png",
+            "technical-docs/ui-state-evidence/secondary-full.png",
+            "technical-docs/ui-state-evidence/sec-fixture.jpg",
+            "tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/after-fix-f2.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/qxmap-a.jpg",
+            "technical-docs/ui-state-evidence/map-screen.png",
+            "technical-docs/ui-state-evidence/map-via-M.png",
+            "technical-docs/ui-state-evidence/more-settings.png",
+            "technical-docs/ui-state-evidence/friend-panel-via-O.png",
+            "technical-docs/ui-state-evidence/journey-page.png",
+            "technical-docs/ui-state-evidence/loading-screen.jpg",
+            "technical-docs/ui-state-evidence/loading-screens/00-now.jpg",
+            "technical-docs/ui-state-evidence/blank-frame.jpg",
+            "technical-docs/ui-state-evidence/hud-hidden.png",
+            "technical-docs/ui-state-evidence/cat-paimon-menu.png",
+            "technical-docs/ui-state-evidence/hall-page.png",
+        ] {
+            let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
+            let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+            let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_ne!(
+                classification.evidence().final_rule(),
+                "paimon_menu_grid",
+                "{path} 不是主菜单大世界，不得被宫格结构判成 MainMenu"
+            );
+        }
+    }
+
+    /// 布局无关性：菜单整体**平移**、菜单项**增删**后仍能命中。
+    /// 旧方案（固定「队伍配置/成就」坐标 + 列距 325）在这些变换下会失效。
+    #[test]
+    fn paimon_grid_survives_translation_and_item_changes() {
+        let base = image::open("tests/fixtures/ui/menu-paimon-1920x1080.jpg")
+            .unwrap()
+            .to_rgb8();
+        let (width, height) = base.dimensions();
+        let as_image = |rgb: image::RgbImage| DynamicImage::ImageRgb8(rgb);
+        let baseline = paimon_menu_grid_structure(&as_image(base.clone()))
+            .expect("真实主菜单大世界帧应命中宫格结构");
+
+        // 整体平移：整帧内容移动 (+37,+23) / (-41,-29)，结构不变。
+        for (dx, dy) in [(37_i64, 23_i64), (-41, -29)] {
+            let mut canvas = image::RgbImage::from_pixel(width, height, image::Rgb([0, 0, 0]));
+            image::imageops::overlay(&mut canvas, &base, dx, dy);
+            let shifted = paimon_menu_grid_structure(&as_image(canvas))
+                .unwrap_or_else(|| panic!("平移 ({dx},{dy}) 后应仍命中"));
+            assert!(shifted.0 >= PAIMON_GRID_MIN_TILES);
+        }
+
+        // 菜单项减少：抹掉整行前两块瓦片（用面板浅底色覆盖），仍应命中且块数减少。
+        let mut removed = base.clone();
+        let panel = image::Rgb([237, 229, 216]);
+        for y in 340..500 {
+            for x in 270..600 {
+                removed.put_pixel(x, y, panel);
+            }
+        }
+        let removed_hit = paimon_menu_grid_structure(&as_image(removed))
+            .expect("删除两块菜单项后仍应命中（剩余宫格 ≥8 块）");
+        assert!(
+            removed_hit.0 < baseline.0,
+            "删除菜单项后块数应减少：{} vs {}",
+            removed_hit.0,
+            baseline.0
+        );
+
+        // 菜单项增加：把一块真实瓦片（含四周留白，保证独立连通域）复制到玩家卡片区，
+        // 块数应增加。旧方案靠固定坐标找指定瓦片，这一步无从谈起。
+        let mut added = base.clone();
+        for y in 0..160 {
+            for x in 0..160 {
+                let pixel = base.get_pixel(272 + x, 344 + y);
+                added.put_pixel(272 + x, 150 + y, *pixel);
+            }
+        }
+        let added_hit = paimon_menu_grid_structure(&as_image(added))
+            .expect("增加菜单项后仍应命中");
+        assert!(
+            added_hit.0 > baseline.0,
+            "增加菜单项后块数应增加：{} vs {}",
+            added_hit.0,
+            baseline.0
+        );
+    }
+
+    /// 检测必须**快**：1920×1080 真实 Rgb8 帧上多次取均值。
+    /// debug 构建给宽松上限（CI 的 debug 几倍慢），release 断言目标 <5ms。
+    #[test]
+    fn paimon_grid_detection_is_fast() {
+        let rgb = image::open("tests/fixtures/ui/menu-paimon-1920x1080.jpg")
+            .unwrap()
+            .to_rgb8();
+        let image = DynamicImage::ImageRgb8(rgb);
+        let runs = 200;
+        let started = Instant::now();
+        for _ in 0..runs {
+            assert!(paimon_menu_grid_structure(&image).is_some());
+        }
+        let mean_ms = started.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+        println!("paimon_menu_grid_structure: {mean_ms:.3} ms/frame @1920x1080 (runs={runs})");
+        let bound_ms = if cfg!(debug_assertions) { 50.0 } else { 5.0 };
+        assert!(
+            mean_ms < bound_ms,
+            "宫格检测太慢：{mean_ms:.3} ms/frame（上限 {bound_ms}ms）"
+        );
+    }
+
+
+    /// task-119：好友列表新变体（申请加入/前往其大厅）判 Panel·好友面板；
+    /// 旧版式（互动按钮）继续靠 friend_panel 模板命中；hall 页/主菜单/加载/大厅不得误判。
+    #[test]
+    fn friend_list_new_variant_is_panel_and_old_layout_still_works() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let classify = |path: &str| {
+            let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
+            let mut classifier = TemplateUiStateClassifier::new(
+                templates.clone(),
+                config.screen.clone(),
+            )
+            .with_panel_regions(panel_regions_from(&config));
+            classifier.classify_at(&image, Instant::now()).unwrap()
+        };
+        // 新变体与旧版式都必须是 Panel·好友面板。
+        for path in [
+            "technical-docs/ui-state-evidence/friend-list-goto-hall.jpg",
+            "technical-docs/ui-state-evidence/friend-list.png",
+            "technical-docs/ui-state-evidence/friend-panel-via-O.png",
+            "tests/fixtures/ui/panel-friend-list-1920x1080.jpg",
+        ] {
+            let classification = classify(path);
+            assert_eq!(classification.kind(), RuntimeUiStateKind::Panel, "{path} 应为 Panel");
+            assert_eq!(
+                classification.label(),
+                "panel:friend_list",
+                "{path} 应为好友面板"
+            );
+        }
+        // 负样本：不能被好友列表锚点吃掉。
+        for (path, kind) in [
+            ("technical-docs/ui-state-evidence/hall-page.png", RuntimeUiStateKind::Secondary),
+            ("technical-docs/ui-state-evidence/qianxing-ui-59/after-fix-f2.jpg", RuntimeUiStateKind::Secondary),
+            ("technical-docs/ui-state-evidence/wonderland-menu.png", RuntimeUiStateKind::MainMenu),
+            ("technical-docs/ui-state-evidence/round78-live.png", RuntimeUiStateKind::Secondary),
+            ("technical-docs/ui-state-evidence/full-hall.jpg", RuntimeUiStateKind::Primary),
+            ("technical-docs/ui-state-evidence/loading-screen.jpg", RuntimeUiStateKind::Loading),
+            ("technical-docs/ui-state-evidence/loading-screens/after-x.jpg", RuntimeUiStateKind::Unknown),
+            ("tests/fixtures/ui/menu-paimon-1920x1080.jpg", RuntimeUiStateKind::MainMenu),
+        ] {
+            let classification = classify(path);
+            assert_eq!(classification.kind(), kind, "{path} kind 变了：{}", classification.label());
+            assert_ne!(classification.label(), "panel:friend_list", "{path} 被好友列表锚点误判");
+        }
+    }
+
+    // ===== task-113：全量语料提交门禁（默认 #[ignore]，本地提交前用 scripts/corpus-gate.sh 跑）=====
+
+    /// transitional 的显式白名单：只能这 4 张，且 `label_source` 必须带理由。
+    const TRANSITIONAL_WHITELIST: [&str; 4] = [
+        "technical-docs/ui-state-evidence/cold-to-qianxing-59/020-t398.jpg",
+        "technical-docs/ui-state-evidence/step-5.png",
+        "technical-docs/ui-state-evidence/step-last.png",
+        "technical-docs/ui-state-evidence/transition-to-overworld/04-after-confirm.jpg",
+    ];
+
+    /// 门禁总耗时预算（debug 构建，含解码；task-112 release 基线 mean≈48ms/张全量）。
+    /// 超出即失败——防止分类器悄悄变慢导致提交前门禁不可用。
+    const CORPUS_GATE_MAX_TOTAL_MS: u128 = 900_000;
+
+    fn expected_kind_for_manifest_label(label: &str) -> Option<RuntimeUiStateKind> {
+        if label.starts_with("覆盖层") {
+            return Some(RuntimeUiStateKind::Panel);
+        }
+        let table: [(&str, RuntimeUiStateKind); 8] = [
+            ("千星大厅", RuntimeUiStateKind::Primary),
+            ("二级聊天", RuntimeUiStateKind::Secondary),
+            ("二级界面", RuntimeUiStateKind::Secondary),
+            ("主菜单千星", RuntimeUiStateKind::MainMenu),
+            ("主菜单大世界", RuntimeUiStateKind::MainMenu),
+            ("加载界面", RuntimeUiStateKind::Loading),
+            ("提瓦特大世界", RuntimeUiStateKind::Overworld),
+            ("登录入口", RuntimeUiStateKind::GameGate),
+        ];
+        table
+            .iter()
+            .find(|(prefix, _)| label.contains(prefix))
+            .map(|(_, kind)| *kind)
+    }
+
+
+    /// task-125 严格 surface 门禁：kind 之外还必须比较具体界面子型。
+    /// 说明：`ui::routines::state_observation::surface_of` 是唯一映射，但该模块对
+    /// `ui::state` 私有（改 mod.rs 属 task-125 写域之外），故在门禁测试内镜像同一映射；
+    /// 若那边映射变更必须同步这里。`expected` 来自 manifest 的人工标签。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GateSurface {
+        PrimaryHall,
+        SecondaryChat,
+        SecondaryMultiplayerPanel,
+        SecondaryHallMap,
+        OverlayFriendPanel,
+        OverlaySearchPage,
+        OverlayMoreSettings,
+        OverlayBlockList,
+        OverlayConfirmEnterHall,
+        OverlayConfirmLeaveHall,
+        OverlayConfirmBlockPlayer,
+        OverlayProfileCard,
+        OverlayTeyvatProfileCardNonFriend,
+        OverlayTeyvatProfileCardFriend,
+        OverlayQianxingProfileCardNonFriend,
+        OverlayQianxingProfileCardFriend,
+        OverlayProfilePage,
+        OverlayHallCard,
+        OverlayAvatarPopup,
+        OverlayOther,
+        WonderlandMainMenu,
+        PaimonMenu,
+        Loading,
+        Overworld,
+        GameGate,
+        Unknown,
+    }
+
+    impl GateSurface {
+        fn name(self) -> &'static str {
+            match self {
+                Self::PrimaryHall => "PrimaryHall",
+                Self::SecondaryChat => "Secondary(Chat)",
+                Self::SecondaryMultiplayerPanel => "Secondary(MultiplayerPanel)",
+                Self::SecondaryHallMap => "Secondary(HallMap)",
+                Self::OverlayFriendPanel => "Overlay(FriendPanel)",
+                Self::OverlaySearchPage => "Overlay(SearchPage)",
+                Self::OverlayMoreSettings => "Overlay(MoreSettings)",
+                Self::OverlayBlockList => "Overlay(BlockList)",
+                Self::OverlayConfirmEnterHall => "Overlay(ConfirmEnterHall)",
+                Self::OverlayConfirmLeaveHall => "Overlay(ConfirmLeaveHall)",
+                Self::OverlayConfirmBlockPlayer => "Overlay(ConfirmBlockPlayer)",
+                Self::OverlayProfileCard => "Overlay(ProfileCard)",
+                Self::OverlayTeyvatProfileCardNonFriend => "Overlay(TeyvatProfileCardNonFriend)",
+                Self::OverlayTeyvatProfileCardFriend => "Overlay(TeyvatProfileCardFriend)",
+                Self::OverlayQianxingProfileCardNonFriend => {
+                    "Overlay(QianxingProfileCardNonFriend)"
+                }
+                Self::OverlayQianxingProfileCardFriend => "Overlay(QianxingProfileCardFriend)",
+                Self::OverlayProfilePage => "Overlay(ProfilePage)",
+                Self::OverlayHallCard => "Overlay(HallCard)",
+                Self::OverlayAvatarPopup => "Overlay(AvatarPopup)",
+                Self::OverlayOther => "Overlay(Other)",
+                Self::WonderlandMainMenu => "WonderlandMainMenu",
+                Self::PaimonMenu => "PaimonMenu",
+                Self::Loading => "Loading",
+                Self::Overworld => "Overworld",
+                Self::GameGate => "GameGate",
+                Self::Unknown => "Unknown",
+            }
+        }
+    }
+
+    fn gate_secondary_from_label(label: &str) -> GateSurface {
+        let tail = label.rsplit(':').next().unwrap_or(label);
+        if tail == "panel" || tail.ends_with("_panel") {
+            GateSurface::SecondaryMultiplayerPanel
+        } else if tail == "map" || tail.ends_with("_map") {
+            GateSurface::SecondaryHallMap
+        } else {
+            GateSurface::SecondaryChat
+        }
+    }
+
+    fn gate_overlay_from_label(label: &str) -> GateSurface {
+        match label {
+            "panel:friend_list" => GateSurface::OverlayFriendPanel,
+            "panel:add_friend" | "panel:search" => GateSurface::OverlaySearchPage,
+            "panel:more_settings" => GateSurface::OverlayMoreSettings,
+            "panel:block_list" | "panel:block_chat" => GateSurface::OverlayBlockList,
+            "panel:confirm_enter_hall" => GateSurface::OverlayConfirmEnterHall,
+            "panel:confirm_leave_hall" => GateSurface::OverlayConfirmLeaveHall,
+            "panel:confirm_block_player" => GateSurface::OverlayConfirmBlockPlayer,
+            "panel:archive_card" => GateSurface::OverlayProfileCard,
+            "panel:teyvat_profile_nonfriend" => GateSurface::OverlayTeyvatProfileCardNonFriend,
+            "panel:teyvat_profile_friend" => GateSurface::OverlayTeyvatProfileCardFriend,
+            "panel:qianxing_profile_nonfriend" => {
+                GateSurface::OverlayQianxingProfileCardNonFriend
+            }
+            "panel:qianxing_profile_friend" => GateSurface::OverlayQianxingProfileCardFriend,
+            "panel:profile_page" => GateSurface::OverlayProfilePage,
+            "panel:hall_card" => GateSurface::OverlayHallCard,
+            "panel:avatar_popup" => GateSurface::OverlayAvatarPopup,
+            _ => GateSurface::OverlayOther,
+        }
+    }
+
+    /// 镜像 `state_observation::surface_of`（kind/label/final_rule → surface）。
+    fn gate_predicted_surface(
+        kind: RuntimeUiStateKind,
+        label: &str,
+        final_rule: &str,
+    ) -> GateSurface {
+        match kind {
+            RuntimeUiStateKind::Primary => GateSurface::PrimaryHall,
+            RuntimeUiStateKind::Secondary => gate_secondary_from_label(label),
+            RuntimeUiStateKind::Panel => gate_overlay_from_label(label),
+            RuntimeUiStateKind::MainMenu => {
+                if final_rule == "paimon_menu_grid" {
+                    GateSurface::PaimonMenu
+                } else {
+                    GateSurface::WonderlandMainMenu
+                }
+            }
+            RuntimeUiStateKind::Loading => GateSurface::Loading,
+            RuntimeUiStateKind::Overworld => GateSurface::Overworld,
+            RuntimeUiStateKind::GameGate => GateSurface::GameGate,
+            RuntimeUiStateKind::Unknown => GateSurface::Unknown,
+        }
+    }
+
+    fn gate_expected_surface(label: &str) -> Option<GateSurface> {
+        if label.starts_with("覆盖层") {
+            let surface = if label.contains("好友面板") {
+                GateSurface::OverlayFriendPanel
+            } else if label.contains("搜索页") {
+                GateSurface::OverlaySearchPage
+            } else if label.contains("更多设置") {
+                GateSurface::OverlayMoreSettings
+            } else if label.contains("拉黑") {
+                GateSurface::OverlayBlockList
+            } else if label.contains("确认弹窗·进入随机大厅") {
+                GateSurface::OverlayConfirmEnterHall
+            } else if label.contains("确认弹窗·离开大厅") {
+                GateSurface::OverlayConfirmLeaveHall
+            } else if label.contains("确认弹窗·屏蔽玩家") {
+                GateSurface::OverlayConfirmBlockPlayer
+            } else if label.contains("提瓦特资料卡·非好友") {
+                GateSurface::OverlayTeyvatProfileCardNonFriend
+            } else if label.contains("提瓦特资料卡·好友") {
+                GateSurface::OverlayTeyvatProfileCardFriend
+            } else if label.contains("千星资料卡·非好友") {
+                GateSurface::OverlayQianxingProfileCardNonFriend
+            } else if label.contains("千星资料卡·好友") {
+                GateSurface::OverlayQianxingProfileCardFriend
+            } else if label.contains("档案卡") {
+                GateSurface::OverlayProfileCard
+            } else if label.contains("个人资料页") {
+                GateSurface::OverlayProfilePage
+            } else if label.contains("大厅卡") {
+                GateSurface::OverlayHallCard
+            } else if label.contains("头像弹窗") {
+                GateSurface::OverlayAvatarPopup
+            } else {
+                // 分类器没有专属判据的覆盖层：strict 只要求 Panel/Other，不猜具体页。
+                GateSurface::OverlayOther
+            };
+            return Some(surface);
+        }
+        let table: [(&str, GateSurface); 10] = [
+            ("千星大厅", GateSurface::PrimaryHall),
+            ("二级聊天", GateSurface::SecondaryChat),
+            ("二级界面·千星多人面板", GateSurface::SecondaryMultiplayerPanel),
+            ("二级界面·千星地图", GateSurface::SecondaryHallMap),
+            ("主菜单千星", GateSurface::WonderlandMainMenu),
+            ("主菜单大世界", GateSurface::PaimonMenu),
+            ("加载界面", GateSurface::Loading),
+            ("提瓦特大世界", GateSurface::Overworld),
+            ("登录入口", GateSurface::GameGate),
+            ("过渡帧", GateSurface::Unknown),
+        ];
+        table
+            .iter()
+            .find(|(prefix, _)| label.contains(prefix))
+            .map(|(_, surface)| *surface)
+    }
+
+    #[test]
+    #[ignore = "全量图像分类提交门禁：需 technical-docs/ui-state-corpus；用 scripts/corpus-gate.sh 一键运行"]
+    fn corpus_manifest_confirmed_classification_gate() {
+        // 允许用 env 指向 manifest 副本（诊断/预演）；默认就是仓库内最终清单。
+        let manifest_path = std::env::var_os("MILIASTRA_CORPUS_MANIFEST")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| Path::new("technical-docs/ui-state-corpus/manifest.tsv").to_path_buf());
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+            panic!(
+                "不可提交：门禁失败：读不到 manifest {}（不允许跳过）：{error}",
+                manifest_path.display()
+            )
+        });
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml"))
+            .expect("不可提交：门禁失败：测试配置加载失败");
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        // 与生产同一条构造路径（composition/application.rs）：面板判据必须注入区域，否则
+        // 覆盖层会全部落回 Unknown，门禁会把"没接线"误报成"分类错误"。
+        let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone())
+            .with_panel_regions(PanelRegions {
+                friend_panel: config.moderation.friend_panel_region.into(),
+                friend_search_panel: config.moderation.search_panel_region.into(),
+                friend_block_chat: config.moderation.block_chat_region.into(),
+                confirm_button: config.moderation.confirm_button_region.into(),
+            confirm_message: config.moderation.confirm_message_region.into(),
+                invite_view_star: config.invite.view_star_region.into(),
+                invite_goto_hall: config.invite.goto_hall_region.into(),
+                invite_enter_hall: config.invite.enter_hall_region.into(),
+            });
+
+        let mut confirmed = 0usize;
+        let mut not_state = 0usize;
+        let mut transitional = 0usize;
+        let mut mismatches: Vec<String> = Vec::new();
+        let mut surface_mismatches: Vec<String> = Vec::new();
+        let mut transitional_seen: Vec<String> = Vec::new();
+        let mut invalid_status: Vec<String> = Vec::new();
+        let mut decode_failures: Vec<String> = Vec::new();
+        // GameGate 判据依赖 Windows OCR（enter_game 文本识别），离线 Linux 测试无法复现；
+        // 显式单列、计数并如实失败/告警，绝不当成"分类通过"。
+        let mut OCR_DEPENDENT_GAMEGATE: Vec<String> = Vec::new();
+        let started = Instant::now();
+        let mut classify_ms = 0u128;
+
+        for (line_number, line) in manifest.lines().enumerate() {
+            if line_number == 0 || line.is_empty() {
+                continue;
+            }
+            let columns: Vec<&str> = line.split('\t').collect();
+            assert_eq!(
+                columns.len(),
+                13,
+                "不可提交：门禁失败：manifest 第 {} 行列数不是 13: {:?}",
+                line_number + 1,
+                line
+            );
+            let path = columns[0];
+            let expected_label = columns[9];
+            let status = columns[10];
+            let label_source = columns[11];
+            match status {
+                "confirmed" => {
+                    confirmed += 1;
+                    assert!(
+                        !expected_label.trim().is_empty(),
+                        "不可提交：门禁失败：confirmed 行 expected 为空: {path}"
+                    );
+                    let expected_kind =
+                        expected_kind_for_manifest_label(expected_label).unwrap_or_else(|| {
+                            panic!(
+                                "不可提交：门禁失败：confirmed 标签无法映射到运行时 kind: {path} -> {expected_label}"
+                            )
+                        });
+                    let image = match image::open(path) {
+                        Ok(image) => image,
+                        Err(error) => {
+                            // 不静默跳过：记入清单并在末尾失败；anomaly 帮助区分"损坏"还是"格式不符"。
+                            decode_failures.push(format!(
+                                "{path} | anomaly={} | {error}",
+                                columns[12]
+                            ));
+                            continue;
+                        }
+                    };
+                    let classify_started = Instant::now();
+                    let classification = classifier
+                        .classify_at(&image, Instant::now())
+                        .unwrap_or_else(|error| {
+                            panic!("不可提交：门禁失败：confirmed 图片分类出错 {path}: {error}")
+                        });
+                    classify_ms = classify_ms.saturating_add(classify_started.elapsed().as_millis());
+                    let expected_surface = gate_expected_surface(expected_label).unwrap_or_else(|| {
+                        panic!(
+                            "门禁失败：confirmed 标签无法映射到 surface: {path} -> {expected_label}"
+                        )
+                    });
+                    let predicted_surface = gate_predicted_surface(
+                        classification.kind(),
+                        classification.label(),
+                        classification.evidence().final_rule(),
+                    );
+                    if expected_kind == RuntimeUiStateKind::GameGate {
+                        // GameGate 判据依赖 Windows OpenVINO OCR（enter_game 文本）；
+                        // Linux 离线不能给可信 predicted：单列"OCR 依赖"清单，逐条打印+计数，
+                        // 不计为通过、也不混进 Linux mismatch 断言。Windows/带 OCR 环境另行核验。
+                        OCR_DEPENDENT_GAMEGATE.push(format!(
+                            "{path} | predicted={}({}) | expected=game_gate({expected_label}) | deferred=windows_ocr",
+                            classification.kind().name(),
+                            classification.label()
+                        ));
+                        continue;
+                    }
+                    if predicted_surface != expected_surface {
+                        surface_mismatches.push(format!(
+                            "{path} | predicted={}(label={},rule={}) | expected={} | label={}",
+                            predicted_surface.name(),
+                            classification.label(),
+                            classification.evidence().final_rule(),
+                            expected_surface.name(),
+                            expected_label
+                        ));
+                    }
+                    if classification.kind() != expected_kind {
+                        mismatches.push(format!(
+                            "{path} | predicted={}({}) | expected={}({})",
+                            classification.kind().name(),
+                            classification.label(),
+                            expected_kind.name(),
+                            expected_label
+                        ));
+                    }
+                }
+                "not_state" => not_state += 1,
+                "transitional" => {
+                    transitional += 1;
+                    assert!(
+                        !label_source.trim().is_empty(),
+                        "不可提交：门禁失败：transitional 必须带理由（label_source 为空）: {path}"
+                    );
+                    assert!(
+                        TRANSITIONAL_WHITELIST.contains(&path),
+                        "不可提交：门禁失败：transitional 不在显式白名单: {path}"
+                    );
+                    transitional_seen.push(path.to_string());
+                }
+                other => invalid_status.push(format!("{path} | status={other}")),
+            }
+        }
+        let total_ms = started.elapsed().as_millis();
+
+        // 先把关键结果落盘，便于失败时把 mismatch 清单发给 lead（即使后续统计断言失败也可取）。
+        let report = format!(
+            "confirmed={confirmed} not_state={not_state} transitional={transitional}\n\
+             mismatches={}\n{}\n\
+             surface_mismatches={}\n{}\n\
+             decode_failures={}\n{}\n\
+             OCR_DEPENDENT_GAMEGATE={}\n{}\n\
+             invalid_status={}\n{}",
+            mismatches.len(),
+            mismatches.join("\n"),
+            surface_mismatches.len(),
+            surface_mismatches.join("\n"),
+            decode_failures.len(),
+            decode_failures.join("\n"),
+            OCR_DEPENDENT_GAMEGATE.len(),
+            OCR_DEPENDENT_GAMEGATE.join("\n"),
+            invalid_status.len(),
+            invalid_status.join("\n"),
+        );
+        let _ = std::fs::write("target/corpus-gate-report.txt", &report);
+        assert!(
+            decode_failures.is_empty(),
+            "不可提交：门禁失败：{} 张 confirmed 图片无法解码（manifest 需修正或移出 confirmed，禁止静默跳过）：\n{}",
+            decode_failures.len(),
+            decode_failures.join("\n")
+        );
+        assert!(
+            mismatches.is_empty(),
+            "不可提交：门禁失败：{}/{} 张 confirmed 分类错误（predicted != expected）：\n{}",
+            mismatches.len(),
+            confirmed,
+            mismatches.join("\n")
+        );
+        assert!(
+            surface_mismatches.is_empty(),
+            "不可提交：strict surface 门禁失败：{}/{} 张 confirmed 的 predicted surface != expected surface：\n{}",
+            surface_mismatches.len(),
+            confirmed,
+            surface_mismatches.join("\n")
+        );
+        assert!(
+            invalid_status.is_empty(),
+            "不可提交：门禁失败：manifest 出现非 confirmed/not_state/transitional 状态（unlabeled/whitelisted/uncertain 一律失败）：\n{}",
+            invalid_status.join("\n")
+        );
         assert_eq!(
+            transitional, TRANSITIONAL_WHITELIST.len(),
+            "不可提交：门禁失败：transitional 数量与白名单不一致（manifest={transitional}，白名单={}）",
+            TRANSITIONAL_WHITELIST.len()
+        );
+        assert_eq!(
+            OCR_DEPENDENT_GAMEGATE.len(),
+            22,
+            "不可提交：门禁失败：GameGate(OCR 依赖) 数量应为 22，实际 {}；清单变化时需同步门禁基线：\n{}",
+            OCR_DEPENDENT_GAMEGATE.len(),
+            OCR_DEPENDENT_GAMEGATE.join("\n")
+        );
+        assert!(
+            confirmed >= 750,
+            "不可提交：门禁失败：confirmed 数量低于预期基线（≥750），疑似 manifest 被截断：{confirmed}"
+        );
+        assert!(
+            total_ms <= CORPUS_GATE_MAX_TOTAL_MS,
+            "不可提交：门禁失败：耗时 {total_ms}ms 超过预算 {CORPUS_GATE_MAX_TOTAL_MS}ms（classify={classify_ms}ms）"
+        );
+        println!(
+            "corpus-gate PASS: confirmed={confirmed} not_state={not_state} transitional={transitional} kind_mismatches=0 surface_mismatches=0 OCR_DEPENDENT_GAMEGATE={} total={total_ms}ms classify={classify_ms}ms mean={:.2}ms",
+            OCR_DEPENDENT_GAMEGATE.len(),
+            classify_ms as f64 / confirmed.max(1) as f64
+        );
+        for deferred in &OCR_DEPENDENT_GAMEGATE {
+            println!("corpus-gate OCR_DEPENDENT_GAMEGATE (Windows 另行核验): {deferred}");
+        }
+    }
+
+    /// task-121：21 张非 OCR mismatch 的回归（千星覆盖页/亮底加载/亮底千星地图/派蒙误标）。
+    #[test]
+    fn task121_overlay_loading_and_bright_map_regressions() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let classify = |path: &str| {
+            let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
+            let mut classifier = TemplateUiStateClassifier::new(
+                templates.clone(),
+                config.screen.clone(),
+            )
+            .with_panel_regions(panel_regions_from(&config));
+            classifier.classify_at(&image, Instant::now()).unwrap()
+        };
+        // 千星全屏覆盖页：右上白色关闭按钮（不依赖单个页面文案）。
+        for path in [
+            "technical-docs/ui-state-evidence/modF-11.png",
+            "technical-docs/ui-state-evidence/modF-14.png",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r17-cal-300.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r17-cal-420.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r17-cal-540.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r17-好友.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r17-纪游.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r0c0-qianxing-shop.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r1c1-dressup.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r1c2-friend.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r2c1-change-char.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r2c2-songyuan.jpg",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r2c3-jiyou.jpg",
+            "technical-docs/ui-state-evidence/wonderland-collection.png",
+        ] {
+            let classification = classify(path);
+            assert_eq!(
+                classification.kind(),
+                RuntimeUiStateKind::Panel,
+                "{path} 应是覆盖层，实际 {}",
+                classification.label()
+            );
+        }
+        // 亮底加载变体（正中 spinner）。
+        assert_eq!(
+            classify("technical-docs/ui-state-evidence/cold-to-qianxing-59/001-t000.jpg").kind(),
+            RuntimeUiStateKind::Loading
+        );
+        // 千星大厅内漫游 HUD：底栏 8 个混合高度白键（Enter/Alt+N 长条 + 图标方键），
+        // 中心线对齐 → Primary（而不是靠改标签绕过）。
+        assert_eq!(
+            classify("technical-docs/ui-state-evidence/final-frame.jpg").kind(),
+            RuntimeUiStateKind::Primary
+        );
+        // HUD 完全隐藏的千星大厅场景：没有任何界面判据，保持 Unknown（manifest not_state）。
+        assert_eq!(
+            classify("technical-docs/ui-state-evidence/hud-hidden.png").kind(),
+            RuntimeUiStateKind::Unknown
+        );
+        // 亮底千星地图变体。
+        assert_eq!(
+            classify("technical-docs/ui-state-evidence/map-screen.png").kind(),
+            RuntimeUiStateKind::Secondary
+        );
+        // manifest 误标（实为主菜单大世界）。
+        for path in [
+            "technical-docs/mic-primary-residency-shots/03-before-failure-2338-live.png",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r16-settings-grid.png",
+            "technical-docs/ui-state-evidence/qianxing-ui-59/r16-settings.jpg",
+        ] {
+            assert_eq!(
+                classify(path).kind(),
+                RuntimeUiStateKind::MainMenu,
+                "{path} 实为主菜单大世界"
+            );
+        }
+        // 负样本：提瓦特帧/主菜单千星/大厅/覆盖层不得被新判据抢走。
+        for (path, kind) in [
+            ("technical-docs/ui-state-evidence/loading-screens/ac-012.jpg", RuntimeUiStateKind::Overworld),
+            ("technical-docs/ui-state-evidence/exit-to-teyvat-56/01-hub-menu.jpg", RuntimeUiStateKind::MainMenu),
+            ("technical-docs/ui-state-evidence/transition-to-overworld/02-hub-menu.jpg", RuntimeUiStateKind::MainMenu),
+            ("technical-docs/ui-state-evidence/qianxing-ui-59/r20sub/r1c3-c3-team.jpg", RuntimeUiStateKind::MainMenu),
+            ("technical-docs/ui-state-evidence/team-finder.png", RuntimeUiStateKind::Panel),
+            ("technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r0c2-qiyu-collect.jpg", RuntimeUiStateKind::Panel),
+            ("technical-docs/ui-state-evidence/full-hall.jpg", RuntimeUiStateKind::Primary),
+            ("technical-docs/ui-state-evidence/round78-live.png", RuntimeUiStateKind::Secondary),
+            ("technical-docs/ui-state-evidence/loading-screen.jpg", RuntimeUiStateKind::Loading),
+            ("tests/fixtures/ui/menu-paimon-1920x1080.jpg", RuntimeUiStateKind::MainMenu),
+        ] {
+            assert_eq!(classify(path).kind(), kind, "{path} kind 回归");
+        }
+    }
+
+    // ── 证据画廊诊断（只读，#[ignore]） ──────────────────────────────────
+    //
+    // 供 technical-docs/ui-state-evidence/evidence-gallery 的画图脚本使用：
+    // 用**生产分类器**跑代表帧，把 `kind/label/final_rule`、证据探针原样、
+    // 以及结构判据（底栏白键 / 派蒙宫格 / 整屏色调 / 千星地图色调 /
+    // F2 参考距离 / 覆盖页关闭按钮）的真实测量值写成 JSONL。
+    //
+    // 不复制匹配器：模板分数直接来自 `UiStateEvidence::template_probes()`；
+    // 结构量直接调用生产函数。`gallery_panel_probe_scores` 只是把 refine_panel
+    // 里那张固定表再跑一遍（同模板/同区域/同降采样倍数），用于展示**每个子型**
+    // 各得多少分，不参与最终判定，也不会写回分类结果。
+
+    #[cfg(test)]
+    fn gallery_rect_json(rect: Rect) -> serde_json::Value {
+        serde_json::json!({
+            "x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height,
+        })
+    }
+
+    #[cfg(test)]
+    fn gallery_evidence_rect_json(rect: UiEvidenceRect) -> serde_json::Value {
+        serde_json::json!({
+            "x": rect.x(), "y": rect.y(), "w": rect.width(), "h": rect.height(),
+        })
+    }
+
+    /// 千星地图右下角锚点的测量结果（标注图直接用它画 ROI / 模板框 / 分数阈值）。
+    #[cfg(test)]
+    fn gallery_qianxing_map_anchor(
+        image: &DynamicImage,
+        templates: &ResolvedUiTemplateArgs,
+    ) -> serde_json::Value {
+        let measured = qianxing_map_anchor_measure(image, &templates.qianxing_map_label_template)
+            .unwrap_or_else(|error| panic!("锚点测量失败: {error}"));
+        let rect = qianxing_map_anchor_rect(image).unwrap_or(QIANXING_MAP_ANCHOR_SEARCH);
+        serde_json::json!({
+            "template": templates.qianxing_map_label_template.display().to_string(),
+            "template_width": QIANXING_MAP_ANCHOR_TEMPLATE_WIDTH,
+            "template_height": QIANXING_MAP_ANCHOR_TEMPLATE_HEIGHT,
+            "bright_min": QIANXING_MAP_ANCHOR_BRIGHT_MIN,
+            "threshold": QIANXING_MAP_ANCHOR_SCORE_MIN,
+            "score": measured.map(|matched| matched.score),
+            "rect": {"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height},
+            "hit_rect": measured.map(|matched| serde_json::json!({
+                "x": matched.x, "y": matched.y,
+                "width": QIANXING_MAP_ANCHOR_TEMPLATE_WIDTH,
+                "height": QIANXING_MAP_ANCHOR_TEMPLATE_HEIGHT,
+            })),
+        })
+    }
+
+    /// 逐模板独立测量（与 `refine_panel` 同一模板、同一区域、同一降采样倍数）。
+    #[cfg(test)]
+    fn gallery_panel_probe_scores(
+        image: &DynamicImage,
+        templates: &ResolvedUiTemplateArgs,
+        panels: PanelRegions,
+        screen: &config::ScreenConfig,
+    ) -> Vec<serde_json::Value> {
+        let threshold = templates.chat_templates.marker_threshold;
+        let cases: [(&str, &PathBuf, Rect, u32); 6] = [
+            (
+                "panel:friend_list",
+                &templates.friend_panel_template,
+                panels.friend_panel,
+                1,
+            ),
+            (
+                "panel:more_settings",
+                &templates.friend_block_chat_template,
+                panels.friend_block_chat,
+                4,
+            ),
+            (
+                "panel:add_friend",
+                &templates.friend_search_panel_template,
+                panels.friend_search_panel,
+                1,
+            ),
+            (
+                "panel:hall_card",
+                &templates.invite_enter_hall_template,
+                panels.invite_enter_hall,
+                // 与 refine_panel 默认表一致：去掉按钮底色后 1/4 会掉到阈值下。
+                2,
+            ),
+            (
+                "panel:archive_card",
+                &templates.invite_goto_hall_template,
+                panels.invite_goto_hall,
+                // 与 refine_panel 默认表一致。
+                4,
+            ),
+            (
+                "panel:avatar_popup",
+                &templates.invite_view_star_template,
+                panels.invite_view_star,
+                // 与 refine_panel 默认表一致。
+                2,
+            ),
+        ];
+        let mut values = Vec::new();
+        for (label, path, region, scale) in cases {
+            let key = match label {
+                "panel:friend_list" => "friend_panel",
+                "panel:more_settings" => "friend_block_chat",
+                "panel:add_friend" => "friend_search_panel",
+                "panel:hall_card" => "invite_enter_hall",
+                "panel:archive_card" => "invite_goto_hall",
+                "panel:avatar_popup" => "invite_view_star",
+                _ => unreachable!("fixed panel table"),
+            };
+            let scale = templates
+                .panel_downsample_factors
+                .get(key)
+                .copied()
+                .unwrap_or(scale);
+            let score = best_template_candidate_downscaled(image, Some(region), path, scale)
+                .ok()
+                .flatten()
+                .map(|hit| hit.score);
+            values.push(serde_json::json!({
+                "label": label,
+                "template": path.display().to_string(),
+                "region": gallery_rect_json(region),
+                "downscale": scale,
+                "score": score,
+                "threshold": threshold,
+                "pass": score.is_some_and(|score| score >= threshold),
+            }));
+        }
+        // 确认弹窗双锚点：确认按钮 + 三个文案关键词各量一次。
+        let confirm_button_scale = templates
+            .panel_downsample_factors
+            .get("confirm_button")
+            .copied()
+            .unwrap_or(1);
+        let confirm_button = best_template_candidate_downscaled(
+            image,
+            Some(panels.confirm_button),
+            &templates.confirm_button_template,
+            confirm_button_scale,
+        )
+        .ok()
+        .flatten();
+        values.push(serde_json::json!({
+            "label": "panel:confirm(button)",
+            "template": templates.confirm_button_template.display().to_string(),
+            "region": gallery_rect_json(panels.confirm_button),
+            "downscale": confirm_button_scale,
+            "score": confirm_button.as_ref().map(|hit| hit.score),
+            "threshold": threshold,
+            "pass": confirm_button.as_ref().is_some_and(|hit| hit.quality_ok && hit.score >= threshold),
+        }));
+        for (label, path) in [
+            (
+                "panel:confirm_block_player",
+                &templates.confirm_message_block_template,
+            ),
+            (
+                "panel:confirm_enter_hall",
+                &templates.confirm_message_random_hall_template,
+            ),
+            (
+                "panel:confirm_leave_hall",
+                &templates.confirm_message_return_teyvat_template,
+            ),
+        ] {
+            let hit = best_template_candidate_downscaled(
+                image,
+                Some(panels.confirm_message),
+                path,
+                CONFIRM_MESSAGE_SCALE,
+            )
+            .ok()
+            .flatten();
+            values.push(serde_json::json!({
+                "label": label,
+                "template": path.display().to_string(),
+                "region": gallery_rect_json(panels.confirm_message),
+                "downscale": CONFIRM_MESSAGE_SCALE,
+                "score": hit.as_ref().map(|hit| hit.score),
+                "threshold": CONFIRM_MESSAGE_MIN,
+                "pass": hit.as_ref().is_some_and(|hit| hit.quality_ok && hit.score >= CONFIRM_MESSAGE_MIN),
+            }));
+        }
+        // 千星地图右下角锚点：专用 F1 形状匹配（不是灰度 SAD）。
+        let mut anchor = gallery_qianxing_map_anchor(image, templates);
+        anchor["label"] = serde_json::json!("secondary:qianxing_map(anchor)");
+        anchor["source"] = serde_json::json!("diagnostic");
+        anchor["search_rect"] = anchor["rect"].clone();
+        anchor["downscale"] = serde_json::json!(1);
+        anchor["pass"] = serde_json::json!(anchor["score"]
+            .as_f64()
+            .is_some_and(|score| score as f32 >= QIANXING_MAP_ANCHOR_SCORE_MIN));
+        values.push(anchor);
+        values
+    }
+
+    /// 单帧检测报告导出。环境变量：
+    /// - `MILIASTRA_REPORT_IMAGE`：输入截图（必填）
+    /// - `MILIASTRA_REPORT_OUT`：输出 JSON（必填）
+    /// - `MILIASTRA_REPORT_EXPECT`：可选期望标签，仅原样记录
+    /// - `MILIASTRA_REPORT_CONFIG`：可选配置，默认 `tests/fixtures/config.full.yaml`
+    #[test]
+    #[ignore = "单帧 UI 检测报告导出：需要 MILIASTRA_REPORT_IMAGE / MILIASTRA_REPORT_OUT"]
+    #[cfg(test)]
+    fn dump_ui_detect_report() {
+        let Ok(image_path) = std::env::var("MILIASTRA_REPORT_IMAGE") else {
+            return;
+        };
+        let out_path =
+            std::env::var("MILIASTRA_REPORT_OUT").expect("MILIASTRA_REPORT_OUT 必须给出");
+        let config_path = std::env::var("MILIASTRA_REPORT_CONFIG")
+            .unwrap_or_else(|_| "tests/fixtures/config.full.yaml".to_string());
+        let expect = std::env::var("MILIASTRA_REPORT_EXPECT").ok();
+        let config = AppConfig::load(Path::new(&config_path)).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let panels = panel_regions_from(&config);
+        let canvas = Canvas {
+            width: config.screen.expected_width,
+            height: config.screen.expected_height,
+            resize: true,
+        };
+        let started = Instant::now();
+        let source = match image::open(&image_path) {
+            Ok(source) => source,
+            Err(error) => {
+                let record = serde_json::json!({
+                    "schema": "miliastra-ui-report/1",
+                    "image": {"path": image_path, "decode_error": error.to_string()},
+                    "error": format!("图片解码失败: {error}"),
+                });
+                std::fs::write(&out_path, serde_json::to_string_pretty(&record).unwrap())
+                    .unwrap_or_else(|error| panic!("写不到 {out_path}: {error}"));
+                return;
+            }
+        };
+        let (source_width, source_height) = (source.width(), source.height());
+        let normalized = resize_to_canvas(&source, &canvas, None);
+        let resized = normalized.is_some();
+        let image = normalized.as_ref().unwrap_or(&source);
+        let normalize_ms = started.elapsed().as_millis();
+        let classify_started = Instant::now();
+        // 每帧独立分类器：避免 game_fallback 的跨帧状态污染单帧报告。
+        let mut classifier = TemplateUiStateClassifier::new(templates.clone(), config.screen.clone())
+            .with_panel_regions(panels);
+        let classification = match classifier.classify_at(image, Instant::now()) {
+            Ok(classification) => classification,
+            Err(error) => {
+                let record = serde_json::json!({
+                    "schema": "miliastra-ui-report/1",
+                    "image": {
+                        "path": image_path,
+                        "width": source_width,
+                        "height": source_height,
+                    },
+                    "error": format!("分类器失败: {error}"),
+                    "elapsed_ms": started.elapsed().as_millis(),
+                });
+                std::fs::write(&out_path, serde_json::to_string_pretty(&record).unwrap())
+                    .unwrap_or_else(|error| panic!("写不到 {out_path}: {error}"));
+                return;
+            }
+        };
+        let classify_ms = classify_started.elapsed().as_millis();
+        let evidence = classification.evidence();
+        let surface = crate::ui::routines::test_surface_of(
             classification.kind(),
-            RuntimeUiStateKind::MainMenu,
-            "派蒙菜单被误判成 {}",
-            classification.kind().name()
+            classification.label(),
+            evidence.final_rule(),
+        );
+        let probes: Vec<serde_json::Value> = evidence
+            .template_probes()
+            .iter()
+            .map(|probe| {
+                serde_json::json!({
+                    "label": probe
+                        .template()
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(probe.template()),
+                    "template": probe.template(),
+                    "search_rect": gallery_evidence_rect_json(probe.search_rect()),
+                    "score": probe.best_score(),
+                    "threshold": probe.threshold(),
+                    "hit_rect": probe.hit_rect().map(gallery_evidence_rect_json),
+                    "pass": probe
+                        .best_score()
+                        .is_some_and(|score| score >= probe.threshold()),
+                    "outcome": probe.outcome(),
+                    "source": "production",
+                })
+            })
+            .collect();
+        let marker = evidence.marker_probe().map(|marker| {
+            serde_json::json!({
+                "search_rect": gallery_evidence_rect_json(marker.search_rect()),
+                "blue": marker.blue_count(),
+                "yellow": marker.yellow_count(),
+                "pink": marker.pink_count(),
+                "threshold": templates.chat_templates.marker_threshold,
+                "source": "production",
+            })
+        });
+        let world = evidence.world_probe().map(|world| {
+            serde_json::json!({
+                "region": gallery_evidence_rect_json(world.region()),
+                "count": world.count(),
+                "teyvat_max": world.teyvat_max(),
+                "qianxing_min": world.qianxing_min(),
+                "guess": world.guess(),
+            })
+        });
+        let hall_region: Rect = config.screen.hall_bar_rect.into();
+        let exact = hall_bar_signature(image, hall_region);
+        let near = hall_bar_signature_with_threshold(image, hall_region, HALL_BAR_WHITE_NEAR);
+        let (dark, white, dominant) = screen_tone(image);
+        let (center160, center480) = loading_center_dark_ratios(image);
+        let grid = paimon_menu_grid_structure(image);
+        let map_tone = qianxing_map_tone(image);
+        let panel_distance = qianxing_player_panel_distance(image);
+        let close_ratios = gallery_overlay_close_ratios(image);
+        let paimon_region = Rect {
+            x: 0,
+            y: 0,
+            width: image.width() * PAIMON_GRID_LEFT_PERCENT / 100,
+            height: image.height(),
+        };
+        let world_region = world.as_ref().map_or_else(
+            || gallery_rect_json(WORLD_CYAN_BAND_RECT),
+            |value| value["region"].clone(),
+        );
+        let structural_regions = serde_json::json!([
+            {"name": "底栏白键判据", "key": "screen.hall_bar_rect", "rect": gallery_rect_json(hall_region)},
+            {"name": "主菜单返回提瓦特锚点", "key": "screen.main_menu_rect", "rect": gallery_rect_json(config.screen.main_menu_rect.into())},
+            {"name": "左上圆形返回按钮", "key": "screen.secondary_back_rect", "rect": gallery_rect_json(config.screen.secondary_back_rect.into())},
+            {"name": "二级聊天发送按钮", "key": "screen.secondary_chat_submit_rect", "rect": gallery_rect_json(config.screen.secondary_chat_submit_rect.into())},
+            {"name": "F2 邀请玩家按钮", "key": "screen.qianxing_f2_invite_rect", "rect": gallery_rect_json(config.screen.qianxing_f2_invite_rect.into())},
+            {"name": "大世界祈愿顶栏", "key": "screen.world_wish_rect", "rect": gallery_rect_json(config.screen.world_wish_rect.into())},
+            {"name": "派蒙宫格（左 45% 全高）", "key": "paimon_grid", "rect": gallery_rect_json(paimon_region)},
+            {"name": "千星地图右下锚点", "key": "qianxing_map_anchor", "rect": gallery_rect_json(qianxing_map_anchor_rect(image).unwrap_or(QIANXING_MAP_ANCHOR_SEARCH))},
+            {"name": "世界判据青色条纹带", "key": "world_probe", "rect": world_region},
+            {"name": "好友面板锚点", "key": "moderation.friend_panel_region", "rect": gallery_rect_json(panels.friend_panel)},
+            {"name": "添加好友页锚点", "key": "moderation.search_panel_region", "rect": gallery_rect_json(panels.friend_search_panel)},
+            {"name": "更多设置锚点", "key": "moderation.block_chat_region", "rect": gallery_rect_json(panels.friend_block_chat)},
+            {"name": "确认弹窗按钮锚点", "key": "moderation.confirm_button_region", "rect": gallery_rect_json(panels.confirm_button)},
+            {"name": "确认弹窗文案锚点", "key": "moderation.confirm_message_region", "rect": gallery_rect_json(panels.confirm_message)},
+            {"name": "头像弹窗锚点", "key": "invite.view_star_region", "rect": gallery_rect_json(panels.invite_view_star)},
+            {"name": "档案卡锚点", "key": "invite.goto_hall_region", "rect": gallery_rect_json(panels.invite_goto_hall)},
+            {"name": "大厅卡锚点", "key": "invite.enter_hall_region", "rect": gallery_rect_json(panels.invite_enter_hall)},
+        ]);
+        let ocr_regions = serde_json::json!([
+            {"name": "聊天正文 OCR", "source": "screen.chat_rect", "purpose": "chat", "rect": gallery_rect_json(config.screen.chat_rect.into()), "text": null, "status": "UNVERIFIABLE (offline)"},
+            {"name": "大厅名称 OCR", "source": "screen.hall_name_rect", "purpose": "hall_name", "rect": gallery_rect_json(config.screen.hall_name_rect.into()), "text": null, "status": "UNVERIFIABLE (offline)"},
+            {"name": "大厅人数 OCR", "source": "screen.hall_member_count_rect", "purpose": "hall_member_count", "rect": gallery_rect_json(config.screen.hall_member_count_rect.into()), "text": null, "status": "UNVERIFIABLE (offline)"},
+            {"name": "大厅时间 OCR", "source": "screen.hall_time_rect", "purpose": "hall_time", "rect": gallery_rect_json(config.screen.hall_time_rect.into()), "text": null, "status": "UNVERIFIABLE (offline)"},
+            {"name": "大厅成员列表 OCR", "source": "screen.hall_member_list_rect", "purpose": "hall_member_list", "rect": gallery_rect_json(config.screen.hall_member_list_rect.into()), "text": null, "status": "UNVERIFIABLE (offline)"},
+            {"name": "二级聊天左侧「大厅」入口 OCR", "source": "screen.secondary_hall_rect", "purpose": "secondary_hall", "rect": gallery_rect_json(config.screen.secondary_hall_rect.into()), "text": null, "status": "UNVERIFIABLE (offline)"},
+            {"name": "好友行 OCR", "source": "invite.friend_list_region", "purpose": "friend_rows", "rect": gallery_rect_json(config.invite.friend_list_region.into()), "text": null, "status": "UNVERIFIABLE (offline)"},
+            {"name": "好友私聊正文 OCR", "source": "invite.friend_chat_region", "purpose": "friend_chat", "rect": gallery_rect_json(config.invite.friend_chat_region.into()), "text": null, "status": "UNVERIFIABLE (offline)"},
+            {"name": "GameGate「点击进入」OCR（来自配置区域）", "source": "startup.enter_game_text_region", "purpose": "game_gate", "rect": gallery_rect_json(config.startup.enter_game_text_region.into()), "text": null, "status": "UNVERIFIABLE (offline)"},
+        ]);
+        let record = serde_json::json!({
+            "schema": "miliastra-ui-report/1",
+            "image": {
+                "path": image_path,
+                "width": source_width,
+                "height": source_height,
+                "canvas_width": image.width(),
+                "canvas_height": image.height(),
+                "resized": resized,
+                "scale_x": image.width() as f64 / source_width as f64,
+                "scale_y": image.height() as f64 / source_height as f64,
+            },
+            "config": config_path,
+            "expect": expect,
+            "kind": classification.kind().name(),
+            "label": classification.label(),
+            "final_rule": evidence.final_rule(),
+            "surface": {
+                "debug": format!("{surface:?}"),
+                "chinese": surface.chinese_name(),
+            },
+            "elapsed_ms": {
+                "normalize": normalize_ms,
+                "classify": classify_ms,
+                "total": started.elapsed().as_millis(),
+            },
+            "template_probes": probes,
+            "diagnostic_probes": report_diagnostic_probes(
+                image,
+                &templates,
+                panels,
+                &config.screen,
+                classification.kind(),
+            ),
+            "marker": marker,
+            "world": world,
+            "structural": {
+                "hall_bar_exact": {
+                    "tiles": exact.0,
+                    "min_height_px": exact.1,
+                    "max_height_px": exact.2,
+                    "top_spread_px": exact.3,
+                    "looks_like_hall_keys": hall_bar_looks_like_hall_keys(exact.0, exact.1, exact.2, exact.3),
+                },
+                "hall_bar_near_white": {
+                    "tiles": near.0,
+                    "min_height_px": near.1,
+                    "max_height_px": near.2,
+                    "top_spread_px": near.3,
+                    "looks_like_hall_keys": hall_bar_looks_like_hall_keys(near.0, near.1, near.2, near.3),
+                },
+                "paimon_grid": grid.map(|(tiles, rows, cols)| serde_json::json!({
+                    "tiles": tiles, "rows": rows, "cols": cols,
+                    "min_tiles": PAIMON_GRID_MIN_TILES,
+                    "min_cols": PAIMON_GRID_MIN_COLS,
+                    "min_rows": PAIMON_GRID_MIN_ROWS,
+                })),
+                "screen_tone": {"dark": dark, "white": white, "dominant": dominant},
+                "loading_center": {"center160_dark": center160, "center480_dark": center480},
+                "loading_rule": loading_rule(image),
+                "qianxing_map_anchor": gallery_qianxing_map_anchor(image, &templates),
+                "qianxing_map_tone": map_tone.map(|(dark, dark_teal)| serde_json::json!({
+                    "dark": dark, "dark_teal": dark_teal,
+                    "dark_min": QIANXING_MAP_DARK_MIN,
+                    "dark_teal_min": QIANXING_MAP_DARK_TEAL_MIN,
+                })),
+                "qianxing_panel_distance": panel_distance,
+                "qianxing_panel_max": QIANXING_PANEL_MAX,
+                "overlay_close": close_ratios.map(|(blue, white)| serde_json::json!({
+                    "blue_ratio": blue,
+                    "white_ratio": white,
+                    "blue_gate": 0.20,
+                    "white_threshold": 0.35,
+                    "hit": is_qianxing_overlay_close(image),
+                })),
+                "world_is_teyvat": world_is_teyvat_in(image, hall_region),
+                "beige_panel_fraction": beige_panel_fraction(image),
+                "anchor_threshold": templates.chat_templates.marker_threshold.max(0.95),
+                "marker_threshold": templates.chat_templates.marker_threshold,
+            },
+            "structural_regions": structural_regions,
+            "ocr_regions": ocr_regions,
+        });
+        std::fs::write(&out_path, serde_json::to_string_pretty(&record).unwrap())
+            .unwrap_or_else(|error| panic!("写不到 {out_path}: {error}"));
+        eprintln!(
+            "UI 检测报告：{} -> {}（kind={} label={}）",
+            record["image"]["path"].as_str().unwrap_or("?"),
+            out_path,
+            classification.kind().name(),
+            classification.label()
+        );
+    }
+
+    /// task-126 验证集：每个 surface 正/负样本，先验证再改模板。
+    #[test]
+    fn task126_surface_validation_sets() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let classify = |path: &str| {
+            let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
+            let mut classifier = TemplateUiStateClassifier::new(templates.clone(), config.screen.clone())
+                .with_panel_regions(panel_regions_from(&config));
+            classifier.classify_at(&image, Instant::now()).unwrap()
+        };
+        let ev = |p: &str| format!("technical-docs/ui-state-evidence/{p}");
+        // F2 多人面板（大厅页）→ Secondary·多人面板；绝不能再落成覆盖层·大厅卡。
+        for p in [
+            "qianxing-ui-59/after-fix-f2.jpg",
+            "qianxing-ui-59/qxf2-from-hall.jpg",
+            "qianxing-ui-59/r10-now.jpg",
+            "qianxing-ui-59/r10-panel-live.jpg",
+            "qianxing-ui-59/r10-set.jpg",
+            "qianxing-ui-59/r17-大厅.jpg",
+            "qianxing-ui-59/r18sub/r1c0-hall.jpg",
+            "hall-page.png",
+        ] {
+            let c = classify(&ev(p));
+            assert_eq!(c.kind(), RuntimeUiStateKind::Secondary, "{p} 应判 Secondary，实际 {}/{}", c.kind().name(), c.label());
+            assert_eq!(c.label(), "secondary:qianxing_panel", "{p} 应判 F2 多人面板，实际 {}/{}", c.kind().name(), c.label());
+        }
+        // 真正的覆盖层·大厅卡（叠在二级聊天之上的进入大厅弹窗）仍是 panel:hall_card。
+        let c = classify("tests/fixtures/ui/panel-hall-card-1920x1080.jpg");
+        assert_eq!(c.label(), "panel:hall_card", "覆盖层大厅卡正样本被误判成 {}", c.label());
+        // modF-11 / modF-14 是**千星个人资料页**（右下角同样有「心愿单」+「衣橱」），
+        // 不是提瓦特好友档案卡；旧语料曾把它标成档案卡，双按钮判据接入后统一改判。
+        for p in ["modF-11.png", "modF-14.png"] {
+            let c = classify(&ev(p));
+            assert_eq!(c.label(), "panel:profile_page", "{p} 应判个人资料页，实际 {}", c.label());
+        }
+        // 真正的提瓦特好友档案卡（角色展柜 / 添加好友版式）绝不能被个人资料页判据抢走。
+        // 这里只断言"不落个人资料页"：档案卡自身的 panel:archive_card 判据属于另一条
+        // 模板链，其回归由档案卡自己的测试负责，不在这里耦合。
+        for p in ["modI-2.png", "recov-3.png"] {
+            let c = classify(&ev(p));
+            assert_ne!(c.label(), "panel:profile_page", "{p} 被个人资料页判据误判");
+        }
+        // Other 正样本（千星子页）
+        for p in [
+            "qianxing-ui-59/r18sub/r0c1-pop-qiyu.jpg",
+            "qianxing-ui-59/r18sub/r0c2-qiyu-collect.jpg",
+            "qianxing-ui-59/r18sub/r0c3-my-qiyu.jpg",
+            "qianxing-ui-59/r18sub/r3c0-guide.jpg",
+            "team-finder.png",
+            "wonderland-level-page.png",
+            "journey-page.png",
+            "qianxing-ui-59/r18sub/r1c2-friend.jpg",
+        ] {
+            let c = classify(&ev(p));
+            assert_eq!(c.label(), "panel:qianxing_page", "{p} 应为 Other，实际 {}", c.label());
+        }
+        // 非常规入口的「特典活动」页：用户确认它不是常规 UI 状态，直接从状态模型
+        // 丢弃（不再有专属探针）。这三帧必须落 `Unknown`，也不得再被其它千星
+        // 覆盖页判据回收成 `panel:qianxing_page`。
+        for p in [
+            "qianxing-ui-59/r18sub/r3c1-special-event.jpg",
+            "qianxing-ui-59/r18sub/r3c2-community.jpg",
+            "qianxing-ui-59/r20sub/r3c1-c1-event.jpg",
+        ] {
+            let c = classify(&ev(p));
+            assert_eq!(
+                c.kind(),
+                RuntimeUiStateKind::Unknown,
+                "{p} 是非常规入口的特典活动页，应丢弃为 Unknown，实际 {}/{}",
+                c.kind().name(),
+                c.label()
+            );
+        }
+        // 退出菜单正样本
+        for p in ["qianxing-ui-59/r12-ctrl-gear.jpg", "qianxing-ui-59/r16-y1000-a.jpg"] {
+            let c = classify(&ev(p));
+            assert_eq!(c.label(), "panel:qianxing_page", "{p} 应判退出菜单(Other)，实际 {}", c.label());
+        }
+        // 负样本：提瓦特面板/大厅/主菜单不得被千星锚点抢判
+        for (p, label) in [
+            ("friend-list.png", "panel:friend_list"),
+            ("friend-list-goto-hall.jpg", "panel:friend_list"),
+            ("friend-panel-via-O.png", "panel:friend_list"),
+            ("modC-4.png", "panel:add_friend"),
+            // 逐帧目检：这张是⋯菜单展开；菜单优先级高于底层资料卡。
+            (
+                "tests/fixtures/ui/panel-more-settings-1920x1080.jpg",
+                "panel:more_settings",
+            ),
+            ("tests/fixtures/ui/panel-friend-list-1920x1080.jpg", "panel:friend_list"),
+            ("tests/fixtures/ui/panel-avatar-popup-1920x1080.jpg", "panel:avatar_popup"),
+        ] {
+            let path = if p.starts_with("tests/") { p.to_string() } else { ev(p) };
+            let c = classify(&path);
+            assert_eq!(c.label(), label, "{path} 负样本被误判为 {}", c.label());
+        }
+        // 提瓦特好友详情卡（more-settings.png / looknow.png，与 friend-detail-actions.png
+        // 字节相同）：⋯下拉弹窗没打开，画面只是好友详情卡上的同名按钮列。
+        // 更多设置判据的区域收窄后，它们**不得**再被判成更多设置弹窗；落 archive_card
+        // 是档案卡「添加好友」兜底锚点的行为，这里只钉住"不是更多设置、不是千星页"。
+        for p in ["more-settings.png", "looknow.png"] {
+            let c = classify(&ev(p));
+            assert_ne!(
+                c.label(),
+                "panel:more_settings",
+                "{p} 不是⋯下拉弹窗（区域外文字块），不得判更多设置"
+            );
+            assert_ne!(c.label(), "panel:qianxing_page", "{p} 是提瓦特帧，不得判千星页");
+        }
+        // 大厅/二级不得被千星锚点抢判（kind 级）
+        assert_eq!(
+            classify(&ev("full-hall.jpg")).kind(),
+            RuntimeUiStateKind::Primary
         );
         assert_eq!(
-            classification.evidence().final_rule(),
-            "paimon_menu_panel_template"
+            classify(&ev("round78-live.png")).kind(),
+            RuntimeUiStateKind::Secondary
         );
+    }
+
+
+
+
+    // ── 个人资料页双模板：分数分布诊断（#[ignore]） ──────────────────────
+    //
+    // 用生产匹配路径（同模板/同搜索区/同 1/2 下采样）量每一帧的两个按钮分数，
+    // 供选择阈值与记录负样本上界。`MILIASTRA_PROFILE_PAGE_SCAN=1` 时扫描整棵
+    // technical-docs/ui-state-evidence（约 1000 帧），否则只量固定代表帧。
+
+    #[cfg(test)]
+    fn profile_page_button_scores(
+        image: &DynamicImage,
+        templates: &ResolvedUiTemplateArgs,
+    ) -> (Option<f32>, Option<f32>) {
+        let Some((wishlist_region, wardrobe_region)) = profile_page_button_rects(image) else {
+            return (None, None);
+        };
+        let score = |path: &PathBuf, region: Rect| {
+            best_template_candidate_downscaled(
+                image,
+                Some(region),
+                path,
+                PROFILE_PAGE_BUTTON_SCALE,
+            )
+            .ok()
+            .flatten()
+            .map(|hit| hit.score)
+        };
+        (
+            score(
+                &templates.qianxing_profile_page_wishlist_template,
+                wishlist_region,
+            ),
+            score(
+                &templates.qianxing_profile_page_wardrobe_template,
+                wardrobe_region,
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    fn profile_page_scan_paths(root: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                profile_page_scan_paths(&path, out);
+            } else if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg")
+                })
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "诊断：个人资料页双模板在证据帧上的分数分布；MILIASTRA_PROFILE_PAGE_SCAN=1 扫描全量"]
+    fn profile_page_button_score_diagnostic() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let mut paths: Vec<PathBuf> = Vec::new();
+        if std::env::var_os("MILIASTRA_PROFILE_PAGE_SCAN").is_some() {
+            profile_page_scan_paths(Path::new("technical-docs/ui-state-evidence"), &mut paths);
+            profile_page_scan_paths(Path::new("tests/fixtures/ui"), &mut paths);
+        } else {
+            for p in [
+                "technical-docs/ui-state-evidence/qianxing-profile-page.png",
+                "tests/fixtures/ui/panel-archive-card-1920x1080.jpg",
+                "tests/fixtures/ui/panel-hall-card-1920x1080.jpg",
+                "tests/fixtures/ui/panel-more-settings-1920x1080.jpg",
+                "tests/fixtures/ui/panel-friend-list-1920x1080.jpg",
+                "tests/fixtures/ui/panel-add-friend-1920x1080.jpg",
+                "technical-docs/ui-state-evidence/qianxing-ui-59/qxf2-from-hall.jpg",
+                "technical-docs/ui-state-evidence/qianxing-ui-59/qxmap-a.jpg",
+                "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r0c3-my-qiyu.jpg",
+                "tests/fixtures/ui/main-menu-wonderland-1920x1080.png",
+                "technical-docs/ui-state-evidence/qianxing-ui-59/r12-ctrl-gear.jpg",
+                "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r3c1-special-event.jpg",
+                "technical-docs/ui-state-evidence/full-hall.jpg",
+                "technical-docs/ui-state-evidence/round78-live.png",
+            ] {
+                paths.push(PathBuf::from(p));
+            }
+        }
+        let mut rows: Vec<(f32, String, Option<f32>, Option<f32>)> = Vec::new();
+        for path in paths {
+            let Ok(image) = image::open(&path) else {
+                continue;
+            };
+            if image.width() != 1920 || image.height() != 1080 {
+                continue;
+            }
+            let (wishlist, wardrobe) = profile_page_button_scores(&image, &templates);
+            let max = wishlist.unwrap_or(0.0).max(wardrobe.unwrap_or(0.0));
+            rows.push((max, path.display().to_string(), wishlist, wardrobe));
+        }
+        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("=== 个人资料页双模板分数（降序，含正样本） ===");
+        for (max, path, wishlist, wardrobe) in rows.iter().take(40) {
+            eprintln!(
+                "max={max:.4} wishlist={:.4} wardrobe={:.4} {path}",
+                wishlist.unwrap_or(0.0),
+                wardrobe.unwrap_or(0.0),
+            );
+        }
+    }
+
+
+    // ── 个人资料页（右下角「心愿单」+「衣橱」双按钮） ────────────────────
+
+    fn profile_page_classifier(config: &AppConfig) -> TemplateUiStateClassifier {
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        TemplateUiStateClassifier::new(templates, config.screen.clone())
+            .with_panel_regions(panel_regions_from(config))
+    }
+
+    const PROFILE_PAGE_FRAME: &str =
+        "technical-docs/ui-state-evidence/qianxing-profile-page.png";
+
+    #[test]
+    fn profile_page_frame_is_panel_profile_page() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut classifier = profile_page_classifier(&config);
+        let image = image::open(PROFILE_PAGE_FRAME)
+            .unwrap_or_else(|error| panic!("打不开 {PROFILE_PAGE_FRAME}: {error}"));
+        let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+        assert_eq!(classification.kind(), RuntimeUiStateKind::Panel);
+        assert_eq!(classification.label(), "panel:profile_page");
+        assert_eq!(classification.evidence().final_rule(), "panel:profile_page");
+        // 两个按钮模板都必须作为证据出现并达到阈值（分数量自生产探针，不写死）。
+        let probes = classification.evidence().template_probes();
+        assert_eq!(probes.len(), 2, "双按钮判据必须记录两个模板探针");
+        for probe in probes {
+            assert_eq!(probe.outcome(), "matched", "{} 未命中", probe.template());
+            assert!(
+                probe.best_score().is_some_and(|score| score >= probe.threshold()),
+                "{} 分数 {:?} 低于阈值 {}",
+                probe.template(),
+                probe.best_score(),
+                probe.threshold(),
+            );
+            // 透明化模板的原点就是「按钮原点 + 字形裁剪原点」；真实帧上必须精确
+            // 落在各自按钮位置，否则位置门控就形同虚设。
+            let expected = if probe
+                .template()
+                .ends_with("qianxing-profile-page-wishlist.png")
+            {
+                PROFILE_PAGE_WISHLIST_ORIGIN
+            } else if probe
+                .template()
+                .ends_with("qianxing-profile-page-wardrobe.png")
+            {
+                PROFILE_PAGE_WARDROBE_ORIGIN
+            } else {
+                panic!("意外的按钮模板：{}", probe.template());
+            };
+            let hit = probe
+                .hit_rect()
+                .unwrap_or_else(|| panic!("{} 没有命中矩形", probe.template()));
+            assert_eq!(
+                (hit.x(), hit.y()),
+                expected,
+                "{} 命中原点与位置门控期望不一致",
+                probe.template()
+            );
+        }
+        let surface = crate::ui::routines::test_surface_of(
+            classification.kind(),
+            classification.label(),
+            classification.evidence().final_rule(),
+        );
+        assert_eq!(surface.chinese_name(), "覆盖层·个人资料页");
+        assert_eq!(format!("{surface:?}"), "Overlay(ProfilePage)");
+    }
+
+    /// 负样本：现有面板/二级/主菜单不得被个人资料页双按钮判据抢走。
+    #[test]
+    fn profile_page_does_not_steal_existing_panels() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut classifier = profile_page_classifier(&config);
+        let cases = [
+            // 档案卡 / 大厅卡 / 更多设置 / 好友面板 / 搜索页 / 头像弹窗（提瓦特面板）
+            (
+                "tests/fixtures/ui/panel-archive-card-1920x1080.jpg",
+                RuntimeUiStateKind::Panel,
+                "panel:qianxing_profile_friend",
+            ),
+            // 同位置、同尺寸的「另存为 / 保存」对话框（最难的负样本，实测 0.9552）
+            (
+                "technical-docs/ui-state-evidence/qianxing-ui-59/r17-好友.jpg",
+                RuntimeUiStateKind::Panel,
+                "panel:qianxing_page",
+            ),
+            (
+                "tests/fixtures/ui/panel-hall-card-1920x1080.jpg",
+                RuntimeUiStateKind::Panel,
+                "panel:hall_card",
+            ),
+            (
+                "tests/fixtures/ui/panel-more-settings-1920x1080.jpg",
+                RuntimeUiStateKind::Panel,
+                "panel:more_settings",
+            ),
+            (
+                "tests/fixtures/ui/panel-friend-list-1920x1080.jpg",
+                RuntimeUiStateKind::Panel,
+                "panel:friend_list",
+            ),
+            (
+                "tests/fixtures/ui/panel-add-friend-1920x1080.jpg",
+                RuntimeUiStateKind::Panel,
+                "panel:add_friend",
+            ),
+            (
+                "tests/fixtures/ui/panel-avatar-popup-1920x1080.jpg",
+                RuntimeUiStateKind::Panel,
+                "panel:avatar_popup",
+            ),
+            // 主菜单千星（返回提瓦特）
+            (
+                "tests/fixtures/ui/main-menu-wonderland-1920x1080.png",
+                RuntimeUiStateKind::MainMenu,
+                "",
+            ),
+            // 千星 F2 多人面板 / 千星地图（底栏区域同样有白色胶囊按钮）
+            (
+                "technical-docs/ui-state-evidence/qianxing-ui-59/qxf2-from-hall.jpg",
+                RuntimeUiStateKind::Secondary,
+                "secondary:qianxing_panel",
+            ),
+            (
+                "technical-docs/ui-state-evidence/qianxing-ui-59/qxmap-a.jpg",
+                RuntimeUiStateKind::Secondary,
+                "secondary:qianxing_map",
+            ),
+            // 千星 Other 覆盖页（个人资料页的最近邻：同版式、同关闭按钮）
+            (
+                "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r0c3-my-qiyu.jpg",
+                RuntimeUiStateKind::Panel,
+                "panel:qianxing_page",
+            ),
+            // 非常规入口的特典活动页：已从 UI 状态模型丢弃，必须是 Unknown，
+            // 也不能被个人资料页判据误判。
+            (
+                "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r3c1-special-event.jpg",
+                RuntimeUiStateKind::Unknown,
+                "",
+            ),
+            // 大厅 + 二级聊天
+            ("technical-docs/ui-state-evidence/full-hall.jpg", RuntimeUiStateKind::Primary, ""),
+            (
+                "technical-docs/ui-state-evidence/round78-live.png",
+                RuntimeUiStateKind::Secondary,
+                "",
+            ),
+        ];
+        for (path, kind, label) in cases {
+            let image = image::open(path).unwrap_or_else(|error| panic!("打不开 {path}: {error}"));
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_ne!(
+                classification.label(),
+                "panel:profile_page",
+                "{path} 被个人资料页判据误判"
+            );
+            assert_eq!(classification.kind(), kind, "{path} kind 回归");
+            if !label.is_empty() {
+                assert_eq!(classification.label(), label, "{path} label 回归");
+            }
+        }
+        // 提瓦特好友档案卡：只保证不被个人资料页判据抢走；档案卡自身的 label 归
+        // `invite_goto_hall` 模板链，属于另一条判据，不在本测试里锁死。
+        for path in [
+            "technical-docs/ui-state-evidence/modI-2.png",
+            "technical-docs/ui-state-evidence/recov-3.png",
+        ] {
+            let image = image::open(path).unwrap_or_else(|error| panic!("打不开 {path}: {error}"));
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_ne!(classification.label(), "panel:profile_page", "{path} 被个人资料页判据误判");
+        }
+    }
+
+    /// 两个按钮只命中一个时不得判个人资料页：抹掉任一个按钮后，
+    /// 另一个模板仍达到阈值（证明是「双命中」要求把它拦下来的，不是分数掉下去）。
+    #[test]
+    fn profile_page_requires_both_buttons() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut classifier = profile_page_classifier(&config);
+        let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
+        let base = image::open(PROFILE_PAGE_FRAME)
+            .unwrap_or_else(|error| panic!("打不开 {PROFILE_PAGE_FRAME}: {error}"))
+            .to_rgba8();
+        // 按钮实测像素边界（与模板同源）：心愿单 x1464–1655、衣橱 x1680–1871，y996–1043。
+        let erase = |mut image: image::RgbaImage, x: u32| {
+            // 用按钮左侧背景色填掉整块按钮，保证不是“按钮还在但被压暗”。
+            let background = image.get_pixel(x - 20, 1020).0;
+            for y in 996..1044 {
+                for px in x..x + 192 {
+                    image.put_pixel(px, y, image::Rgba(background));
+                }
+            }
+            DynamicImage::ImageRgba8(image)
+        };
+        for (missing, remaining_is_wardrobe) in [(1464u32, true), (1680u32, false)] {
+            let single = erase(base.clone(), missing);
+            let (wishlist, wardrobe) = profile_page_button_scores(&single, &templates);
+            let remaining = if remaining_is_wardrobe { wardrobe } else { wishlist };
+            assert!(
+                remaining.is_some_and(|score| score >= PROFILE_PAGE_BUTTON_SCORE_MIN),
+                "抹掉 x={missing} 后另一按钮仍应命中，实际 wishlist={wishlist:?} wardrobe={wardrobe:?}"
+            );
+            assert!(
+                classifier.profile_page_by_buttons(&single).is_none(),
+                "只剩一个按钮时不得判个人资料页（抹掉 x={missing}）"
+            );
+            let classification = classifier.classify_at(&single, Instant::now()).unwrap();
+            assert_ne!(classification.label(), "panel:profile_page");
+        }
+    }
+
+    // ── 资料卡四分类（提瓦特 / 千星 × 好友 / 非好友） ────────────────────
+
+    /// 四张用户实拍帧 + 三张旧档案卡帧必须逐帧判出具体四分类。
+    #[test]
+    fn profile_card_four_way_classification() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut classifier = profile_page_classifier(&config);
+        for (path, label) in [
+            (
+                "technical-docs/ui-state-evidence/teyvat-profile-card-nonfriend.png",
+                "panel:teyvat_profile_nonfriend",
+            ),
+            (
+                "technical-docs/ui-state-evidence/teyvat-profile-card-friend.png",
+                "panel:teyvat_profile_friend",
+            ),
+            (
+                "technical-docs/ui-state-evidence/qianxing-profile-card-nonfriend.png",
+                "panel:qianxing_profile_nonfriend",
+            ),
+            (
+                "technical-docs/ui-state-evidence/qianxing-profile-card-friend.png",
+                "panel:qianxing_profile_friend",
+            ),
+            // 旧「档案卡」3 帧逐帧目检后归入具体类型。
+            (
+                "technical-docs/ui-state-evidence/modI-2.png",
+                "panel:teyvat_profile_nonfriend",
+            ),
+            (
+                "technical-docs/ui-state-evidence/recov-3.png",
+                "panel:teyvat_profile_nonfriend",
+            ),
+            (
+                "tests/fixtures/ui/panel-archive-card-1920x1080.jpg",
+                "panel:qianxing_profile_friend",
+            ),
+            // ⋯菜单叠在提瓦特非好友资料卡上，仍应判非好友。
+            (
+                "technical-docs/ui-state-evidence/friend-detail-actions.png",
+                "panel:teyvat_profile_nonfriend",
+            ),
+            (
+                "technical-docs/ui-state-evidence/looknow.png",
+                "panel:teyvat_profile_nonfriend",
+            ),
+        ] {
+            let image = image::open(path).unwrap_or_else(|error| panic!("打不开 {path}: {error}"));
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_eq!(classification.kind(), RuntimeUiStateKind::Panel, "{path}");
+            assert_eq!(
+                classification.label(),
+                label,
+                "{path} 的资料卡四分类错了（final_rule={}）",
+                classification.evidence().final_rule()
+            );
+        }
+    }
+
+    /// 把 `source` 的 `source_rect` 贴到 `image` 的 `dest`；只用于合成负样本
+    /// （抹掉「添加好友」），不改变真实语料。
+    fn paste_rect(
+        image: &DynamicImage,
+        dest: Rect,
+        source: &DynamicImage,
+        source_rect: Rect,
+    ) -> DynamicImage {
+        let mut canvas = image.to_rgba8();
+        let patch = source.to_rgba8();
+        for y in 0..dest.height as i32 {
+            for x in 0..dest.width as i32 {
+                let sx = (source_rect.x + x).max(0) as u32;
+                let sy = (source_rect.y + y).max(0) as u32;
+                canvas.put_pixel(
+                    (dest.x + x).max(0) as u32,
+                    (dest.y + y).max(0) as u32,
+                    *patch.get_pixel(sx, sy),
+                );
+            }
+        }
+        DynamicImage::ImageRgba8(canvas)
+    }
+
+    /// 好友/非好友只差「添加好友」：抹掉按钮后必须从非好友翻成好友。
+    #[test]
+    fn profile_card_friend_flag_flips_when_add_friend_is_erased() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut classifier = profile_page_classifier(&config);
+        // 负样本背景来自同版式的好友/空白帧，只覆盖按钮本身，不手绘内容。
+        let teyvat_blank = image::open(
+            "technical-docs/ui-state-evidence/teyvat-profile-card-friend.png",
+        )
+        .unwrap();
+        let qianxing_blank = image::open(
+            "technical-docs/ui-state-evidence/qianxing-profile-card-nonfriend.png",
+        )
+        .unwrap();
+        for (path, expected_nonfriend, dest, source, source_rect) in [
+            (
+                "technical-docs/ui-state-evidence/teyvat-profile-card-nonfriend.png",
+                "panel:teyvat_profile_nonfriend",
+                Rect::new(1130, 795, 270, 65),
+                &teyvat_blank,
+                Rect::new(1130, 795, 270, 65),
+            ),
+            (
+                "technical-docs/ui-state-evidence/modI-2.png",
+                "panel:teyvat_profile_nonfriend",
+                Rect::new(1130, 795, 270, 65),
+                &teyvat_blank,
+                Rect::new(1130, 795, 270, 65),
+            ),
+            (
+                "technical-docs/ui-state-evidence/qianxing-profile-card-nonfriend.png",
+                "panel:qianxing_profile_nonfriend",
+                Rect::new(720, 555, 250, 55),
+                &qianxing_blank,
+                Rect::new(720, 690, 250, 55),
+            ),
+        ] {
+            let image = image::open(path).unwrap_or_else(|error| panic!("打不开 {path}: {error}"));
+            let original = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_eq!(original.label(), expected_nonfriend, "{path} 原图应判非好友");
+            let erased = paste_rect(&image, dest, source, source_rect);
+            let classification = classifier.classify_at(&erased, Instant::now()).unwrap();
+            let expected_friend = expected_nonfriend.replace("nonfriend", "friend");
+            assert_eq!(
+                classification.label(),
+                expected_friend,
+                "{path} 抹掉「添加好友」后应翻成好友"
+            );
+        }
+    }
+
+    /// 千星好友帧：没有「添加好友」，但「查看资料」必须命中。
+    #[test]
+    fn qianxing_profile_friend_uses_view_profile_without_add_friend() {
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut classifier = profile_page_classifier(&config);
+        for path in [
+            "technical-docs/ui-state-evidence/qianxing-profile-card-friend.png",
+            "tests/fixtures/ui/panel-archive-card-1920x1080.jpg",
+        ] {
+            let image = image::open(path).unwrap_or_else(|error| panic!("打不开 {path}: {error}"));
+            let classification = classifier.classify_at(&image, Instant::now()).unwrap();
+            assert_eq!(classification.label(), "panel:qianxing_profile_friend", "{path}");
+            let mut add_seen = false;
+            let mut view_matched = false;
+            let mut domain_matched = false;
+            for probe in classification.evidence().template_probes() {
+                let name = probe.template();
+                if name.contains("qianxing-profile-add-friend") {
+                    add_seen = true;
+                    assert_ne!(probe.outcome(), "matched", "{path} 好友帧不应命中「添加好友」");
+                }
+                if name.contains("invite-view-profile") {
+                    view_matched = probe.outcome() == "matched";
+                }
+                if name.contains("qianxing-profile-domain-level") {
+                    domain_matched = probe.outcome() == "matched";
+                }
+            }
+            assert!(add_seen, "{path} 证据里缺少「添加好友」负样本探针");
+            assert!(view_matched, "{path} 好友帧必须由「查看资料」命中");
+            assert!(domain_matched, "{path} 千星资料卡必须由「奇域等级」命中");
+        }
     }
 }

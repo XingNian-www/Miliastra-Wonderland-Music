@@ -1986,9 +1986,9 @@ mod tests {
         use crate::runtime::chat_source::{FriendEntry, FriendSnapshot};
         let mut config = IdentityConfig::default();
         for (uid, role, remark) in [
-            ("示例玩家A", IdentityRole::Owner, "yXxDWR"),
-            ("示例玩家I", IdentityRole::Admin, "pGAxP"),
-            ("示例玩家C", IdentityRole::Admin, "3kfaXy"),
+            ("10000001", IdentityRole::Owner, "示例备注A"),
+            ("10000002", IdentityRole::Admin, "示例备注B"),
+            ("10000003", IdentityRole::Admin, "示例备注C"),
             ("10001", IdentityRole::Friend, "好友旧备注"),
         ] {
             config.mappings.push(IdentityMapping {
@@ -2007,13 +2007,13 @@ mod tests {
             updated_at: Some(1),
             friends: vec![
                 FriendEntry {
-                    uid: 示例玩家A,
+                    uid: 10000001,
                     name: None,
-                    remark: Some("实际owner备注".to_string()),
+                    remark: Some("实际备注".to_string()),
                     remark_present: true,
                 },
                 FriendEntry {
-                    uid: 示例玩家I,
+                    uid: 10000002,
                     name: None,
                     remark: None,
                     remark_present: true,
@@ -2036,9 +2036,9 @@ mod tests {
                 .find(|mapping| mapping.accounts.iter().any(|account| account.uid == uid))
                 .unwrap()
         };
-        assert_eq!(by_uid("示例玩家A").remark, "实际owner备注");
-        assert!(by_uid("示例玩家I").remark.is_empty());
-        assert!(by_uid("示例玩家C").remark.is_empty(), "缺席 admin 清空");
+        assert_eq!(by_uid("10000001").remark, "实际备注");
+        assert!(by_uid("10000002").remark.is_empty());
+        assert!(by_uid("10000003").remark.is_empty(), "缺席 admin 清空");
         assert!(by_uid("10001").remark.is_empty());
     }
 

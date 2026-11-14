@@ -3001,7 +3001,6 @@ fn web_tool_templates_expose_configured_fixed_regions() {
             state.config.screen.chat_rect,
             marker_threshold,
         ),
-        ("friend", state.config.screen.friend_rect, marker_threshold),
         (
             "secondary-back",
             state.config.screen.secondary_back_rect,
@@ -3058,14 +3057,9 @@ fn web_tool_templates_expose_configured_fixed_regions() {
             marker_threshold,
         ),
         (
-            "friend-confirm",
-            state.config.moderation.confirm_region,
+            "confirm-button",
+            state.config.moderation.confirm_button_region,
             marker_threshold,
-        ),
-        (
-            "wonderland-confirm",
-            state.config.startup.wonderland_confirm_region,
-            state.config.startup.wonderland_confirm_threshold,
         ),
         (
             "paimon-menu",
@@ -4622,7 +4616,14 @@ fn config_schema_route_lists_all_sections_with_defaults() {
         .find(|field| field["path"] == "templates.blue_marker")
         .expect("templates.blue_marker field");
     assert_eq!(blue["managedBy"], "visual");
-    assert_eq!(templates["visualFields"], 20);
+    assert_eq!(
+        templates["visualFields"].as_u64().unwrap() as usize,
+        crate::config::visual::managed_paths()
+            .iter()
+            .filter(|path| path.starts_with("templates."))
+            .count(),
+        "templates.visualFields 必须与 managed_paths 的模板字段数一致"
+    );
     let ocr = sections
         .iter()
         .find(|section| section["name"] == "ocr")
@@ -5445,7 +5446,7 @@ fn visual_profile_preview_is_read_only_and_import_preserves_other_settings() {
     assert!(profile.get("custom_workflows").is_none());
     profile["thresholds"]["builtin"] = json!(0.81);
     profile["chat_geometry"]["marker_search_width"] = json!(72);
-    profile["matching"]["panel_downsample_factors"] = json!({"friend_confirm":2});
+    profile["matching"]["panel_downsample_factors"] = json!({"confirm_button":2});
     let before = state.config_store.lock().unwrap().current_value().unwrap();
     let preview_body = serde_json::to_vec(&json!({"profile":profile})).unwrap();
     let preview: Value =
@@ -5471,7 +5472,7 @@ fn visual_profile_preview_is_read_only_and_import_preserves_other_settings() {
     assert_eq!(saved["templates"]["marker_threshold"], 0.81);
     assert_eq!(saved["ocr"]["marker_search_width"], 72);
     assert_eq!(
-        saved["templates"]["panel_downsample_factors"]["friend_confirm"],
+        saved["templates"]["panel_downsample_factors"]["confirm_button"],
         2
     );
     for key in ["custom_workflows", "ai", "timing", "playback"] {
@@ -6009,5 +6010,62 @@ mod memory_route_tests {
             assert!(!spec.mutating, "{path} 应为只读");
             assert!(spec.json, "{path} 应返回 JSON");
         }
+    }
+}
+
+mod ai_trace_route_tests {
+    use super::{
+        ai_trace_entry_route, ai_trace_route, http_get, route_spec, start_test_http_server,
+        test_state,
+    };
+
+    /// 面板要读的两条路由必须真的登记在 ROUTES 里，并且是只读。
+    #[test]
+    fn trace_endpoints_are_registered_read_only() {
+        for path in ["/ai/trace", "/ai/trace/entry"] {
+            let spec = route_spec(path).unwrap_or_else(|| panic!("GET {path} 未注册"));
+            assert!(!spec.mutating, "{path} 应为只读");
+            assert!(spec.json, "{path} 应返回 JSON");
+        }
+    }
+
+    /// 真实 HTTP 链路：面板拿到的是 JSON，而不是 404 或 HTML。
+    #[test]
+    fn trace_endpoints_serve_json_over_real_http() {
+        let mut state = test_state();
+        let server = start_test_http_server(&mut state, "");
+
+        let response = http_get(server.local_addr(), "/ai/trace", None);
+        assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+        let value: serde_json::Value =
+            serde_json::from_str(&response.body).expect("列表必须是 JSON");
+        assert!(value["entries"].is_array());
+        assert!(value["stats"].is_object());
+        assert!(value["capacity"].as_u64().unwrap_or(0) > 0);
+
+        let missing = http_get(server.local_addr(), "/ai/trace/entry?id=999999", None);
+        assert!(
+            missing.status_line.contains("404"),
+            "滚出内存的条目应返回 404，实际 {}",
+            missing.status_line
+        );
+        server.shutdown().expect("shutdown HTTP server");
+    }
+
+    #[test]
+    fn trace_route_returns_list_and_validates_entry_id() {
+        let state = test_state();
+        let list = ai_trace_route(&[], &state).expect("列表接口应成功");
+        assert!(list.contains("\"entries\""), "列表必须带 entries 字段");
+        assert!(list.contains("\"stats\""), "列表必须带汇总字段");
+
+        let error = ai_trace_entry_route(&[], &state).expect_err("缺少 id");
+        assert_eq!(error.status, 400, "{}", error.message);
+        let error =
+            ai_trace_entry_route(&[("id".into(), "abc".into())], &state).expect_err("非法 id");
+        assert_eq!(error.status, 400, "{}", error.message);
+        let error = ai_trace_entry_route(&[("id".into(), "999999".into())], &state)
+            .expect_err("不存在的 id");
+        assert_eq!(error.status, 404, "{}", error.message);
     }
 }

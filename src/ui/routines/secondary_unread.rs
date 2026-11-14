@@ -2,8 +2,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::friend_delivery::{
-    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
-    before_input_failure, capture_normalized, restore_residency, wait_ms,
+    FriendDeliveryRoutineConfig, UiResidencyOutcome, after_input_failure,
+    before_input_failure, capture_normalized, wait_ms,
 };
 use crate::observation::chat::{
     ChatIdentity, ChatTimeline, ChatTimelineSnapshot, FriendUnreadLayout, ObservedChatMessageId,
@@ -11,6 +11,7 @@ use crate::observation::chat::{
     unread_hit_still_visible,
 };
 use crate::runtime::ocr::OcrRuntimeHandle;
+use super::residency::{ConversationRef, ResidencyTarget, SettleEnvironment};
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
@@ -159,30 +160,29 @@ impl UiRoutine for ProcessSecondaryUnreadRoutine {
             Ok(effect) => effect,
             Err(failure) => SecondaryUnreadEffect::Failed(failure),
         };
-        let residency = match restore_residency(
-            context,
-            &self.ocr,
-            &self.config.residency,
-            UiResidencyTarget::SecondaryCurrentHall,
-        ) {
-            Ok(()) => UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
-            Err(failure) => UiResidencyOutcome::Failed(failure),
-        };
-        ProcessSecondaryUnreadOutcome { effect, residency }
+        // 收尾固定为包装器的 `Fixed(Secondary(CurrentHall))`；内层不再自己
+        // 调恢复，避免“例程结尾一次 + 包装器一次”的重复导航。
+        ProcessSecondaryUnreadOutcome {
+            effect,
+            residency: UiResidencyOutcome::Failed(UiRoutineFailure::new(
+                InputCertainty::BeforeInput,
+                "ui_task_finish",
+                "收尾由 UiTask 的 Fixed(SecondaryCurrentHall) 负责",
+            )),
+        }
     }
 }
 
 /// 二级好友未读任务的价值基线固定为“当前大厅二级”。
 ///
-/// 例程内部已有一次 `restore_residency(SecondaryCurrentHall)` 作为**唯一收尾**
-/// （它包含“点当前大厅行”的会话级确认，这是 `UiTask::settle_to` 目前还不能替代的），
-/// 这就是 `Fixed(SecondaryCurrentHall)` 的实际执行点。包装器若再声明 Fixed 会在
-/// Passthrough 下触发第二次 `settle_to`（可能额外 Return/等待），因此声明
-/// `ScriptDeclared`：脚本（例程）已完成收尾，包装器不再动作、也不额外回入口。
-fn process_secondary_unread_task_spec() -> UiTaskSpec {
+/// 收尾只由包装器的 `Fixed(Secondary(CurrentHall))` 执行一次；例程开头那一次
+/// `settle_to` 只是“红线/未读位置必须在当前大厅上才有意义”的业务前置，
+/// 不是收尾。
+fn process_secondary_unread_task_spec(environment: SettleEnvironment) -> UiTaskSpec {
     UiTaskSpec::new(
-        UiResidencyTarget::SecondaryCurrentHall,
-        FinishPolicy::ScriptDeclared,
+        ResidencyTarget::Secondary(ConversationRef::CurrentHall),
+        FinishPolicy::Fixed(ResidencyTarget::Secondary(ConversationRef::CurrentHall)),
+        environment,
     )
     .with_entry(EntryPolicy::Passthrough)
 }
@@ -210,8 +210,10 @@ impl UiRoutine for ProcessSecondaryUnreadTask {
     type Output = ProcessSecondaryUnreadOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let environment =
+            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
         let outcome = UiTask::new(
-            process_secondary_unread_task_spec(),
+            process_secondary_unread_task_spec(environment),
             ProcessSecondaryUnreadRoutine {
                 request: self.request,
                 ocr: self.ocr,
@@ -220,8 +222,12 @@ impl UiRoutine for ProcessSecondaryUnreadTask {
             },
         )
         .execute(context);
+        let residency = outcome.residency.clone();
         match outcome.output {
-            Some(output) => output,
+            Some(mut output) => {
+                output.residency = residency;
+                output
+            }
             None => {
                 let failure = task_not_started_failure(outcome.entry_failure);
                 ProcessSecondaryUnreadOutcome {
@@ -244,11 +250,12 @@ fn process_unread(
         .device()
         .ensure_ready(config.residency.after_activate_ms)
         .map_err(|error| before_input_failure("prepare_secondary_unread", error))?;
-    restore_residency(
+    // 业务前置：未读红点的行坐标只对“当前大厅”有意义；这里只建立一次基线，
+    // 不承担任务收尾。收尾由包装器 Fixed(Secondary(CurrentHall)) 唯一执行。
+    super::residency::settle_to(
         context,
-        ocr,
-        &config.residency,
-        UiResidencyTarget::SecondaryCurrentHall,
+        &SettleEnvironment::new(ocr.clone(), config.residency.clone()),
+        ResidencyTarget::Secondary(ConversationRef::CurrentHall),
     )?;
 
     let Some(hit) = reacquire_unread_hit(context, config)? else {
@@ -641,7 +648,9 @@ fn optional_fingerprint_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
     use crate::geometry::Rect;
+    use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
 
     #[test]
     fn unread_selection_promotes_latest_incoming_without_replaying_history() {
@@ -850,17 +859,26 @@ mod tests {
         assert!(!same_unread_hit(&first, &moved));
     }
 
-    /// P1 迁移批次 3：未读任务的价值基线是“当前大厅二级”，
-    /// 收尾固定在这里且只由例程内部那一次 restore 完成（包装器 Passthrough 不重复）。
+    /// P1 最终收口：未读任务的价值基线是“当前大厅二级”，
+    /// 收尾固定在这里且只由包装器 Fixed 的唯一引擎执行一次。
     #[test]
     fn secondary_unread_task_spec_is_fixed_to_current_hall() {
-        let spec = process_secondary_unread_task_spec();
+        let config = AppConfig::load(std::path::Path::new(
+            "tests/fixtures/config.full.yaml",
+        ))
+        .unwrap();
+        let spec = process_secondary_unread_task_spec(SettleEnvironment::without_ocr(
+            FriendDeliveryRoutineConfig::from_app(&config),
+        ));
         assert_eq!(spec.entry, EntryPolicy::Passthrough);
         assert_eq!(
             spec.finish,
-            FinishPolicy::ScriptDeclared,
-            "Fixed(SecondaryCurrentHall) 由例程内部 restore_residency 完成；包装器不得二次收尾"
+            FinishPolicy::Fixed(ResidencyTarget::Secondary(ConversationRef::CurrentHall)),
+            "未读任务必须用会话级 Fixed 收尾，且只由唯一引擎执行一次"
         );
-        assert_eq!(spec.target, UiResidencyTarget::SecondaryCurrentHall);
+        assert_eq!(
+            spec.target,
+            ResidencyTarget::Secondary(ConversationRef::CurrentHall)
+        );
     }
 }

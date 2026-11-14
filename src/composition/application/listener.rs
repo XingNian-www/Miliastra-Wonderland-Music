@@ -472,7 +472,7 @@ fn ui_state_display_label(label: &str) -> String {
     let name = match family {
         "primary" => "一级大厅",
         "secondary" => "二级界面",
-        "main_menu" => "千星主菜单",
+        "main_menu" => "主菜单千星",
         "game_gate" => "大门界面",
         "overworld" => "主世界",
         "loading" => "加载界面",
@@ -3553,7 +3553,7 @@ mod tests {
             super::ui_state_display_label("secondary:qianxing_panel"),
             "二级界面"
         );
-        assert_eq!(super::ui_state_display_label("main_menu"), "千星主菜单");
+        assert_eq!(super::ui_state_display_label("main_menu"), "主菜单千星");
         assert_eq!(super::ui_state_display_label("game_gate"), "大门界面");
         assert_eq!(super::ui_state_display_label("overworld"), "主世界");
         assert_eq!(

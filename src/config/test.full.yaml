@@ -60,19 +60,20 @@ screen:
     y: 985
     width: 600
     height: 95
+  # F2 大厅页右下「邀请玩家」按钮的窄搜索区；左下「大厅列表」复用 hall_bar_rect
+  qianxing_f2_invite_rect:
+    x: 1650
+    y: 993
+    width: 140
+    height: 54
+  # 好友列表新变体（申请加入/前往其大厅）右侧按钮列
+
   # 主世界右上角祈愿图标搜索区域，覆盖图标栏以适应横向位置变化
   world_wish_rect:
     x: 1300
     y: 0
     width: 620
     height: 110
-  # 派蒙菜单专属锚点（「商城」的袋状图标本体）的搜索区，只给 ±6px 平移余量；
-  # 与 secondary_back 共用返回按钮，靠它把派蒙菜单从二级聊天里摘出来
-  paimon_menu_rect:
-    x: 152
-    y: 358
-    width: 92
-    height: 92
   # F2 大厅页顶部大厅名称 OCR 区域
   hall_name_rect:
     x: 75
@@ -269,8 +270,6 @@ templates:
   yellow_marker: assets/chat-marker-yellow.png
   # 粉色聊天标志模板，用于识别好友私聊命令
   pink_marker: assets/chat-marker-pink.png
-  # 一级聊天界面的好友按钮模板
-  friend: assets/ui-primary-friend.png
   # 二级聊天界面左上角返回按钮模板，用于稳定判断二级界面
   secondary_back: assets/ui-secondary-back.png
   # 二级大厅/面板界面模板
@@ -295,10 +294,33 @@ templates:
   friend_block_chat: assets/friend-block-chat.png
   # 更多设置里的拉黑按钮模板
   friend_blacklist: assets/friend-blacklist.png
-  # 拉黑/屏蔽弹窗里的确认按钮模板
-  friend_confirm: assets/friend-confirm.png
-  # 派蒙菜单（ESC 系统菜单）专属锚点模板：左侧功能宫格第一行瓦片
-  paimon_menu_panel: assets/ui-paimon-menu-panel.png
+  # 通用「确认」按钮模板；好友操作与启动流程共用
+  confirm_button: assets/confirm-button.png
+  # 确认弹窗文案关键词模板：进入大厅 / 离开大厅 / 屏蔽玩家
+  confirm_message_random_hall: assets/confirm-message-random-hall.png
+  confirm_message_return_teyvat: assets/confirm-message-return-teyvat.png
+  confirm_message_block: assets/confirm-message-block.png
+  # F2 大厅页左下「大厅列表」按钮（图标+文字，168x36）
+  qianxing_f2_hall_list: assets/qianxing-f2-hall-list.png
+  # F2 大厅页右下「邀请玩家」按钮（图标+文字，240x50）
+  qianxing_f2_invite_player: assets/qianxing-f2-invite-player.png
+  # 千星退出菜单：只认第一行「退出至登录界面」的单行纯文字（197×29）
+  qianxing_exit_menu: assets/qianxing-exit-menu.png
+  # 千星地图右下角锚点：「千星奇域·大厅」文字 + 庙宇图标（首选判据）
+  # 模板只保留亮色文字/图标：深色地图底与红色未读角标已 alpha 透明化，尺寸仍为 296x68。
+  qianxing_map_label: assets/qianxing-map-label.png
+  # 个人资料页右下角「心愿单」：只保留字形的透明模板（66×23，bbox + 2px）
+  qianxing_profile_page_wishlist: assets/qianxing-profile-page-wishlist.png
+  # 个人资料页右下角「衣橱」：只保留字形的透明模板（45×23）；两个按钮必须同时命中
+  qianxing_profile_page_wardrobe: assets/qianxing-profile-page-wardrobe.png
+  # 提瓦特资料卡：左页「冒险等阶」+「世界等级」成对，底部「添加好友」区分好友/非好友
+  teyvat_profile_adventure_rank: assets/teyvat-profile-adventure-rank.png
+  teyvat_profile_world_level: assets/teyvat-profile-world-level.png
+  teyvat_profile_add_friend: assets/teyvat-profile-add-friend.png
+  # 千星资料卡：上部「奇域等级」，下部「添加好友」=非好友 /「查看资料」=好友
+  qianxing_profile_domain_level: assets/qianxing-profile-domain-level.png
+  qianxing_profile_add_friend: assets/qianxing-profile-add-friend.png
+  qianxing_profile_view_profile: assets/invite-view-profile.png
   # UI/聊天标志模板匹配阈值，越高越严格
   marker_threshold: 0.9
 
@@ -321,16 +343,16 @@ moderation:
   required_vote_margin: 3
   # 好友界面模板搜索区域
   friend_panel_region:
-    x: 770
-    y: 20
-    width: 75
-    height: 50
+    x: 740
+    y: 10
+    width: 230
+    height: 95
   # 搜索按钮模板搜索区域；命中后会点击按钮左侧 500 像素处粘贴 UID，再点击按钮
   search_panel_region:
-    x: 1600
-    y: 100
-    width: 240
-    height: 90
+    x: 1645
+    y: 114
+    width: 74
+    height: 49
   # UID 搜索输入框点击点
   search_input_point:
     x: 1180
@@ -347,22 +369,28 @@ moderation:
     height: 70
   # 屏蔽聊天按钮模板搜索区域
   block_chat_region:
-    x: 1240
-    y: 130
-    width: 440
-    height: 505
+    x: 1400
+    y: 362
+    width: 124
+    height: 112
   # 拉黑按钮模板搜索区域
   blacklist_region:
-    x: 1240
-    y: 130
-    width: 440
-    height: 505
-  # 拉黑/屏蔽弹窗确认按钮模板搜索区域
-  confirm_region:
-    x: 900
-    y: 700
-    width: 500
-    height: 100
+    x: 1388
+    y: 494
+    width: 146
+    height: 117
+  # 通用「确认」按钮模板搜索区域
+  confirm_button_region:
+    x: 1140
+    y: 728
+    width: 81
+    height: 58
+  # 确认弹窗提示文案行搜索区域；确认按钮与关键词文案必须同时命中
+  confirm_message_region:
+    x: 650
+    y: 460
+    width: 620
+    height: 90
 playback:
   # 三个平台凭据的版本化存储目录
   credential_directory: data/credentials
@@ -688,23 +716,21 @@ startup:
   wonderland_transition_timeout_ms: 4000
   # 确认按钮消失后等待该区域像素稳定的最长时间，单位毫秒
   wonderland_confirm_stable_timeout_ms: 3000
-  # 启动游戏结束时等待派蒙菜单模板的最长时间，单位毫秒
+  # 启动游戏结束时等待主菜单大世界模板的最长时间，单位毫秒
   final_primary_timeout_ms: 10000
   poll_ms: 1000
   # 像素稳定平均差阈值
   stable_mean_threshold: 2.0
   # 像素稳定变化比例阈值
   stable_changed_ratio_threshold: 0.01
-  # 启动界面模板匹配阈值（例如派蒙菜单）；越高越严格
+  # 启动界面模板匹配阈值（例如主菜单大世界）；越高越严格
   template_threshold: 0.9
-  # 千星确认按钮模板匹配阈值；越高越严格
+  # 通用「确认」按钮模板匹配阈值；越高越严格
   wonderland_confirm_threshold: 0.9
   # 进入千星流程模板资源；启动游戏完成判断使用 paimon_menu
   templates:
     # 地图右下角星型入口模板
     wonderland_map_star: assets/startup-wonderland-map-star.png
-    # 千星弹窗“确认”按钮模板
-    wonderland_confirm: assets/startup-wonderland-confirm.png
     paimon_menu: assets/startup-paimon-menu.png
   # “点击进入”按钮 OCR 区域
   enter_game_text_region:
@@ -718,13 +744,7 @@ startup:
     y: 0
     width: 640
     height: 1040
-  # 千星确认按钮模板区域
-  wonderland_confirm_region:
-    x: 900
-    y: 650
-    width: 500
-    height: 250
-  # 派蒙菜单/主界面模板区域
+  # 主菜单大世界/主界面模板区域
   main_ui_region:
     x: 0
     y: 0
@@ -755,22 +775,22 @@ invite:
     height: 850
   # “查看千星”模板搜索区域
   view_star_region:
-    x: 400
+    x: 498
     y: 80
-    width: 440
+    width: 217
     height: 860
   # “前往其大厅”模板搜索区域
   goto_hall_region:
-    x: 700
+    x: 780
     y: 560
-    width: 500
-    height: 300
+    width: 372
+    height: 112
   # “进入大厅”模板搜索区域
   enter_hall_region:
-    x: 700
-    y: 700
-    width: 500
-    height: 100
+    x: 896
+    y: 730
+    width: 164
+    height: 54
 
 friend_delivery:
   # 好友投递中确认尚未发送项的自动重试次数；0 表示禁用

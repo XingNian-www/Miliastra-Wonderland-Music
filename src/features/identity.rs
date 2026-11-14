@@ -1707,7 +1707,7 @@ mod tests {
         let mut config = IdentityConfig::default();
         let id = Uuid::new_v4();
         config.mappings.push(IdentityMapping {
-            remark: "pGAxP".to_string(),
+            remark: "示例备注B".to_string(),
             id,
             role: IdentityRole::Friend,
             real_nickname: "真名甲".to_string(),
@@ -1719,7 +1719,7 @@ mod tests {
 
         // 收件人是内部键时必须认得出身份，不能拿 UUID 去搜好友列表。
         let by_key = access.friend_search_names(&id.to_string(), None);
-        assert_eq!(by_key, vec!["pGAxP".to_owned(), "真名甲".to_owned()]);
+        assert_eq!(by_key, vec!["示例备注B".to_owned(), "真名甲".to_owned()]);
         assert!(access.friend_search_names("", None).is_empty());
         assert!(access
             .friend_search_names("00000000-0000-4000-8000-0000000000ff", None)

@@ -58,9 +58,21 @@ fn fields() -> Vec<(String, String, String)> {
         "blue_marker",
         "yellow_marker",
         "pink_marker",
-        "friend",
         "secondary_back",
         "secondary_hall",
+        "secondary_chat_submit",
+        "qianxing_f2_hall_list",
+        "qianxing_f2_invite_player",
+        "qianxing_exit_menu",
+        "qianxing_map_label",
+        "qianxing_profile_page_wishlist",
+        "qianxing_profile_page_wardrobe",
+        "teyvat_profile_adventure_rank",
+        "teyvat_profile_world_level",
+        "teyvat_profile_add_friend",
+        "qianxing_profile_domain_level",
+        "qianxing_profile_add_friend",
+        "qianxing_profile_view_profile",
         "main_menu",
         "world_wish",
         "invite_view_star",
@@ -71,12 +83,14 @@ fn fields() -> Vec<(String, String, String)> {
         "friend_more_settings",
         "friend_block_chat",
         "friend_blacklist",
-        "friend_confirm",
-        "paimon_menu_panel",
+        "confirm_button",
+        "confirm_message_random_hall",
+        "confirm_message_return_teyvat",
+        "confirm_message_block",
     ] {
         add("templates", key.into(), format!("templates.{key}"));
     }
-    for key in ["wonderland_map_star", "wonderland_confirm", "paimon_menu"] {
+    for key in ["wonderland_map_star", "paimon_menu"] {
         add(
             "templates",
             format!("startup.{key}"),
@@ -95,10 +109,11 @@ fn fields() -> Vec<(String, String, String)> {
         "friend",
         "secondary_back",
         "secondary_hall",
+        "secondary_chat_submit",
         "main_menu",
         "hall_bar",
+        "qianxing_f2_invite",
         "world_wish",
-        "paimon_menu",
         "hall_name",
         "hall_member_count",
         "hall_time",
@@ -115,7 +130,8 @@ fn fields() -> Vec<(String, String, String)> {
                 "more_settings",
                 "block_chat",
                 "blacklist",
-                "confirm",
+                "confirm_button",
+                "confirm_message",
             ][..],
         ),
         (
@@ -133,7 +149,6 @@ fn fields() -> Vec<(String, String, String)> {
             &[
                 "enter_game_text",
                 "wonderland_hall_ocr",
-                "wonderland_confirm",
                 "main_ui",
                 "wonderland_map_star",
             ][..],
@@ -377,8 +392,8 @@ impl VisualProfile {
 pub fn match_catalog() -> Value {
     json!({
         "algorithms": {"chat_markers":"rgb_sad", "other_templates":"gray_sad"},
-        "panelDownsampleFactors": {"friend_panel":1,"friend_search_panel":1,"friend_block_chat":4,"friend_confirm":4,"invite_enter_hall":4,"invite_goto_hall":4,"invite_view_star":4},
-        "diagnosticOnlyAssets":["friend"],
+        "panelDownsampleFactors": {"friend_panel":1,"friend_search_panel":1,"friend_block_chat":4,"confirm_button":4,"invite_enter_hall":4,"invite_goto_hall":4,"invite_view_star":4},
+        "f2HallButtonAnchors": {"hall_list":"screen.hall_bar_rect","invite_player":"screen.qianxing_f2_invite_rect","downscale":4,"min_score":0.95},
         "structuralClassification":{"hall_bar":"screen.hall_bar_rect"},
         "derivedRegions":{"friend_delivery.secondary_hall_search":{"operation":"bounding_union","sources":["secondary_hall","invite.friend_list"]}},
         "notes":["更多设置模板仍供管理点击和恢复使用", "面板用途降采样可覆盖；流程点击继续使用原精度", "自定义流程保留独立 Live 配置与步骤覆盖", "更换同路径资源需重载进程清除模板缓存", "实际窗口尺寸不等于基准画布尺寸"]
@@ -422,7 +437,7 @@ mod tests {
     fn visual_profile_roundtrip_preserves_nondefault_and_unrelated_fields() {
         let mut config = AppConfig::default();
         config.templates.marker_threshold = 0.81;
-        config.templates.friend_confirm = "custom/确认.png".into();
+        config.templates.confirm_button = "custom/确认.png".into();
         config.startup.template_threshold = 0.72;
         config.custom_workflows.default_threshold = 0.63;
         let current = serde_json::to_value(config).unwrap();
@@ -440,7 +455,7 @@ mod tests {
             sections["startup"]["enabled"],
             current["startup"]["enabled"]
         );
-        assert_eq!(sections["templates"]["friend_confirm"], "custom/确认.png");
+        assert_eq!(sections["templates"]["confirm_button"], "custom/确认.png");
     }
     #[test]
     fn editable_profile_name_and_recognition_fields_survive_serialized_reload() {
@@ -510,7 +525,7 @@ mod tests {
         let current = serde_json::to_value(AppConfig::default()).unwrap();
         let p = VisualProfile::export(&current).unwrap();
         let mut bad = p.clone();
-        bad.templates.remove("friend");
+        bad.templates.remove("secondary_back");
         assert!(bad.candidate(&current).is_err());
         let mut bad = p.clone();
         bad.thresholds.insert("builtin".into(), json!(2));

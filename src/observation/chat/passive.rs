@@ -228,7 +228,7 @@ pub(crate) fn passive_ui_excludes_chat(
     match classification.kind() {
         UiStateKind::MainMenu => matches!(
             classification.evidence().final_rule(),
-            "main_menu_template" | "paimon_menu_panel_template"
+            "main_menu_template" | "paimon_menu_grid"
         ),
         UiStateKind::Secondary => matches!(
             classification.label(),

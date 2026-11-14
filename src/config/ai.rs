@@ -1660,6 +1660,19 @@ impl ToolSession {
                 body["max_completion_tokens"] = max_tokens.into();
             }
         }
+        // OpenAI 的前缀缓存还需要一个稳定的路由键：同一前缀被调度到同一台
+        // 机器才能命中。key 只由 **system + tools** 派生——历史与当前问题
+        // 不参与，否则每轮都会变，反而把缓存拆散。
+        // DeepSeek/Mimo/自定义网关不保证接受这个字段，只在官方 OpenAI 发送；
+        // 用户已在 extra_body 显式配置时尊重用户值。
+        let user_cache_key = self
+            .target
+            .extra_body
+            .get("prompt_cache_key")
+            .is_some_and(|value| !value.is_null());
+        if self.target.provider == AiProvider::OpenAi && !user_cache_key {
+            body["prompt_cache_key"] = Value::String(prefix_cache_key(&self.system, &self.tools));
+        }
         Ok(body)
     }
 
@@ -1852,6 +1865,27 @@ fn tool_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value[field]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("AI 工具响应缺少字符串 {field}"))
+}
+
+/// 稳定前缀（system + tools）的缓存路由键。
+///
+/// 用 FNV-1a 而不是 `DefaultHasher`：这里不要求抗碰撞，只要求跨进程/跨版本
+/// 对同一份前缀给出同一个值，方便日志和面板比对。
+fn prefix_cache_key(system: &str, tools: &[Value]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    feed(system.as_bytes());
+    feed(b"\0");
+    for tool in tools {
+        feed(tool.to_string().as_bytes());
+        feed(b"\0");
+    }
+    format!("miliastra-{hash:016x}")
 }
 
 fn validate_tool_name(name: &str) -> Result<()> {
@@ -2054,6 +2088,165 @@ mod tests {
             assert_eq!(session_body(&session, false)["tool_choice"], "none");
             let empty = ToolSession::new(&config, "", "system", "user", vec![]).unwrap();
             assert_eq!(session_body(&empty, true)["tool_choice"], "none");
+        }
+    }
+
+    #[test]
+    fn openai_prompt_cache_key_is_stable_across_questions_and_history() {
+        for wire in [WireApi::Responses, WireApi::ChatCompletions] {
+            let mut config = config("openai");
+            config.wire_api = wire;
+            let history = vec![
+                json!({"role":"user", "content":"旧问题"}),
+                json!({"role":"assistant", "content":"旧回答"}),
+            ];
+            let first = ToolSession::with_history(
+                &config,
+                "",
+                "stable system",
+                history,
+                "第一问",
+                tool_definitions(),
+            )
+            .unwrap();
+            let second = ToolSession::with_history(
+                &config,
+                "",
+                "stable system",
+                vec![],
+                "完全不同的第二问",
+                tool_definitions(),
+            )
+            .unwrap();
+            let first_body = session_body(&first, true);
+            let second_body = session_body(&second, true);
+            let key = first_body["prompt_cache_key"]
+                .as_str()
+                .expect("OpenAI 请求必须带 prompt_cache_key");
+            assert!(key.starts_with("miliastra-"));
+            assert_eq!(
+                key,
+                second_body["prompt_cache_key"].as_str().unwrap(),
+                "问题与历史变化不得改变缓存路由键"
+            );
+
+            // 稳定前缀（system 或 tools）变化时必须换 key，否则会把不同前缀
+            // 路由到同一台机器的同一缓存槽。
+            let changed_system = ToolSession::with_history(
+                &config,
+                "",
+                "different system",
+                vec![],
+                "问题",
+                tool_definitions(),
+            )
+            .unwrap();
+            assert_ne!(
+                key,
+                session_body(&changed_system, true)["prompt_cache_key"]
+                    .as_str()
+                    .unwrap()
+            );
+            let changed_tools =
+                ToolSession::new(&config, "", "stable system", "问题", vec![]).unwrap();
+            assert_ne!(
+                key,
+                session_body(&changed_tools, true)["prompt_cache_key"]
+                    .as_str()
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn non_openai_providers_keep_the_default_request_shape() {
+        for provider in ["deepseek", "mimo"] {
+            let mut config = config(provider);
+            // deepseek 默认 wire_api 是 Responses，这里固定成 Chat 以走同一条断言。
+            config.wire_api = WireApi::ChatCompletions;
+            let session = ToolSession::new(&config, "", "system", "user", vec![]).unwrap();
+            assert!(
+                session_body(&session, true)
+                    .get("prompt_cache_key")
+                    .is_none(),
+                "{provider} 不应收到 OpenAI 专属字段"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_extra_body_cache_key_is_not_overwritten() {
+        let mut explicit = config("openai");
+        explicit
+            .extra_body
+            .insert("prompt_cache_key".into(), json!("my-own-key"));
+        let session = ToolSession::new(&explicit, "", "system", "user", vec![]).unwrap();
+        // request_body 不覆盖显式配置；真正的合并发生在内核 merge_extra_body，
+        // 标准字段会覆盖 extra_body，因此这里保持未设置，让 extra_body 生效。
+        assert!(
+            session_body(&session, true)
+                .get("prompt_cache_key")
+                .is_none(),
+            "用户显式配置时必须沿用 extra_body，不能被自动 key 覆盖"
+        );
+
+        // 显式 null 是「未设置」而不是「用户值」：内核会过滤 null 字段，
+        // 此时必须回落到自动 key，否则请求一个缓存键都没有。
+        let mut null_config = config("openai");
+        null_config
+            .extra_body
+            .insert("prompt_cache_key".into(), json!(null));
+        let session = ToolSession::new(&null_config, "", "system", "user", vec![]).unwrap();
+        assert!(
+            session_body(&session, true)["prompt_cache_key"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("miliastra-")),
+            "extra_body 的 null 占位必须回落到自动缓存键"
+        );
+    }
+
+    #[test]
+    fn tool_round_messages_start_with_the_same_stable_prefix() {
+        for wire in [WireApi::Responses, WireApi::ChatCompletions] {
+            let mut config = config("openai");
+            config.wire_api = wire;
+            let mut session =
+                ToolSession::new(&config, "", "system", "第一问", tool_definitions()).unwrap();
+            let first = session_body(&session, true);
+            let call = match wire {
+                WireApi::Responses => {
+                    json!({"type":"function_call", "call_id":"c1", "name":"lookup",
+                        "arguments":"{}", "status":"completed"})
+                }
+                WireApi::ChatCompletions => json!({"role":"assistant", "content":null,
+                    "tool_calls":[{"id":"c1","type":"function",
+                        "function":{"name":"lookup","arguments":"{}"}}]}),
+            };
+            session.accept_output(vec![call], true).unwrap();
+            session.append_result("c1", "结果").unwrap();
+            let second = session_body(&session, false);
+
+            let (first_messages, second_messages) = match wire {
+                WireApi::Responses => (
+                    first["input"].as_array().unwrap().clone(),
+                    second["input"].as_array().unwrap().clone(),
+                ),
+                WireApi::ChatCompletions => (
+                    first["messages"].as_array().unwrap().clone(),
+                    second["messages"].as_array().unwrap().clone(),
+                ),
+            };
+            assert!(
+                second_messages.len() > first_messages.len(),
+                "工具结果必须追加到历史"
+            );
+            assert_eq!(
+                &second_messages[..first_messages.len()],
+                first_messages.as_slice(),
+                "同一轮工具调用的消息前缀必须逐字节一致，{wire:?}"
+            );
+            assert_eq!(first["tools"], second["tools"]);
+            assert_eq!(first["model"], second["model"]);
         }
     }
 

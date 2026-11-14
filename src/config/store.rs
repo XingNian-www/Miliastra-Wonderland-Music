@@ -3,7 +3,9 @@
 //! 配置三表（config_meta / config_sections / config_revisions）与既有表
 //! （request_state、cached_* 等）共存于统一数据库；配置 schema 版本
 //! （[`CONFIG_SCHEMA_VERSION`]）与请求状态快照版本、缓存 user_version 完全独立。
-//! 版本不匹配时配置断代重置为新默认值；只操作配置三表，不删除歌曲缓存表或文件。
+//! 版本不匹配时优先按字段映射表平滑迁移（见 [`super::migrations`]），没有迁移
+//! 路径的更老版本才断代重置为新默认值；两条路径都只操作配置三表，不删除歌曲
+//! 缓存表或文件，都会在改库前先备份整库到 `.bak`。
 //!
 //! 启动流程读取完整配置，Web 配置中心负责保存、历史版本和回滚。
 
@@ -16,6 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Map, Value};
 
+use super::migrations;
 use super::schema::SECRET_PATHS;
 use super::{AppConfig, BootstrapConfig, FieldKind, config_sections, normalize_native_path_string};
 
@@ -33,9 +36,27 @@ use super::{AppConfig, BootstrapConfig, FieldKind, config_sections, normalize_na
 /// v2 → v3：AI 聊天记忆改成三层结构，新增单人中期摘要预算、大厅原文预算、
 /// 大厅中期摘要预算三个字段。
 ///
+/// v3 → v4（本轮）：模板/区域改名与删除，**不再断代重置**，改由
+/// [`super::migrations`] 在事务内按键搬运旧值：
+///
+/// | 旧键 | 新键 |
+/// |---|---|
+/// | `templates.friend_confirm` | `templates.confirm_button` |
+/// | `moderation.confirm_region` | `moderation.confirm_button_region` |
+///
+/// | 删除的键 | 原因 |
+/// |---|---|
+/// | `templates.paimon_menu_panel` | 派蒙菜单锚点随旧版 UI 判定一起移除 |
+/// | `screen.paimon_menu_rect` | 同上 |
+/// | `startup.templates.wonderland_confirm` | 千星确认改用共用确认按钮模板 |
+/// | `startup.wonderland_confirm_region` | 区域改由 `moderation.confirm_button_region` 承担 |
+///
 /// 只有**删除或改名**字段才需要升版本：新增字段由 serde 默认值补齐，加载器
 /// 明确允许「存储里缺字段」，因此加配置项不再触发断代重置。
-pub const CONFIG_SCHEMA_VERSION: i64 = 3;
+///
+/// 有迁移路径的旧版本（[`super::migrations::has_migration_path`]）直接迁移；
+/// 没有迁移路径的更老版本（v1/v2 及更早）仍走断代重置并留 `.bak` 备份。
+pub const CONFIG_SCHEMA_VERSION: i64 = 4;
 
 /// 打开连接（含头初始化）的重试次数：两个进程并发首次创建同一新库文件时，
 /// SQLite 头初始化阶段的锁竞争发生在 busy_timeout 生效之前，需要有限重试吸收。
@@ -117,6 +138,17 @@ pub struct ConfigRevisionInfo {
     pub created_at_ms: u64,
 }
 
+/// 一次 schema 平滑迁移的统计（只用于日志，不落库）。
+#[derive(Clone, Copy, Debug, Default)]
+struct MigrationOutcome {
+    /// 迁移后写回的段数。
+    rewritten_sections: usize,
+    /// 相对于迁移前的 sections，值发生变化的字段点路径数。
+    changed_fields: usize,
+    /// 同步迁移的历史快照条数。
+    migrated_revisions: usize,
+}
+
 /// 配置保存/回滚的结构化错误,路由层按变体分类,不依赖错误消息文本。
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigSaveError {
@@ -145,7 +177,8 @@ impl ConfigStore {
     ///
     /// 库不存在时创建三表并以 [`AppConfig::default()`] 初始化完整配置
     /// （分 section 写入 config_sections、meta 记 revision=1、写入 revision 1 快照）；
-    /// v1 配置自动重置为新默认值；未来版本或损坏的表结构明确失败。
+    /// 有迁移路径的旧配置平滑迁移（保留用户设置）；没有迁移路径的更老版本
+    /// 重置为新默认值；未来版本或损坏的表结构明确失败。
     /// 库中已有 request_state / cached_* 等其他表不视为冲突。
     pub fn open(
         database_path: &Path,
@@ -436,9 +469,15 @@ impl ConfigStore {
                 path.display()
             );
         };
-        // 低于当前版本的配置一律断代重置：本项目只保证同一版本内的配置兼容，
-        // 跨版本仅保留歌曲缓存（见 MUST_READ「配置断代」）。
+        // 低于当前版本：有迁移路径就平滑迁移（保留用户设置），没有才断代重置。
         if schema_version < CONFIG_SCHEMA_VERSION {
+            if migrations::has_migration_path(schema_version) {
+                return Self::migrate_previous_schema(connection, path, schema_version);
+            }
+            log::warn!(
+                "配置 schema 版本 v{schema_version} 早于最早可迁移版本，缺少字段映射表，只能断代重置为默认值（迁移路径覆盖 v{} → v{CONFIG_SCHEMA_VERSION}）",
+                migrations::migration_start_version(),
+            );
             return Self::reset_previous_schema(connection, path, schema_version);
         }
         if schema_version > CONFIG_SCHEMA_VERSION {
@@ -460,7 +499,7 @@ impl ConfigStore {
         // 备份必须在改库之前完成：断代会删掉旧配置，事后无法还原。
         // 备份失败只告警不阻断——否则用户会被卡在"升级不了也回不去"的死局里，
         // 而缓存与旧配置都还在原库里。
-        match backup_before_reset(connection, path, stale_version) {
+        match backup_before_schema_change(connection, path, stale_version) {
             Ok(Some(backup)) => log::warn!(
                 "配置结构版本从 v{stale_version} 升级到 v{CONFIG_SCHEMA_VERSION}，需要重建配置表；旧库已备份到「{}」，可据此手工找回旧配置",
                 backup.display()
@@ -494,6 +533,167 @@ impl ConfigStore {
             path.display()
         );
         Ok(())
+    }
+
+    /// 旧配置平滑迁移：先备份整库，再取写锁重查版本，在同一事务内读 sections
+    /// → 迁移 → 写回 sections → 更新 `config_meta.schema_version`。
+    ///
+    /// **不 DROP 配置表**：迁移只改被改名/删除的键，用户其余设置与歌曲缓存
+    /// 原样保留。任何一步失败都会让事务回滚，原库保持不变并返回错误，不会半写。
+    ///
+    /// 历史快照（`config_revisions`）也按同一张映射表迁移；单条快照迁移失败
+    /// 只告警保留原样（该版本回滚时会明确报字段不存在），不影响本次升级。
+    fn migrate_previous_schema(
+        connection: &mut rusqlite::Connection,
+        path: &Path,
+        stale_version: i64,
+    ) -> Result<()> {
+        // 与断代同策略：先备份整库（VACUUM INTO 生成一致快照，含 -wal 已提交数据）。
+        // 迁移本身不删数据，但改名/删除字段不可逆，仍要留还原点。
+        let backup = match backup_before_schema_change(connection, path, stale_version) {
+            Ok(Some(backup)) => {
+                log::info!(
+                    "配置结构版本从 v{stale_version} 升级到 v{CONFIG_SCHEMA_VERSION}，将按字段映射表平滑迁移；旧库已备份到「{}」",
+                    backup.display()
+                );
+                Some(backup)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                log::warn!(
+                    "配置迁移前的旧库备份失败（步骤：复制旧配置库），迁移仍会继续，但旧值无法还原：{error:#}"
+                );
+                None
+            }
+        };
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = transaction.query_row(
+            "SELECT schema_version FROM config_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version >= CONFIG_SCHEMA_VERSION {
+            // 另一进程可能已完成迁移或断代；重新校验，绝不覆盖同版本保存的配置。
+            drop(transaction);
+            return Self::ensure_schema(connection, path);
+        }
+        if version != stale_version {
+            // 版本在取锁前被别的进程推进到另一个仍需迁移的旧版本：按实际版本重来。
+            drop(transaction);
+            return Self::ensure_schema(connection, path);
+        }
+        let timestamp = now_ms() as i64;
+        match Self::run_migration_transaction(&transaction, version, timestamp) {
+            Ok(outcome) => {
+                transaction.commit()?;
+                log::info!(
+                    "旧配置已平滑迁移到 v{CONFIG_SCHEMA_VERSION}（v{version} → v{CONFIG_SCHEMA_VERSION}）：{} 个段已改写、{} 个字段被改名或删除、{} 条历史快照已同步；用户其余设置、歌曲缓存与音频文件未受影响{}",
+                    outcome.rewritten_sections,
+                    outcome.changed_fields,
+                    outcome.migrated_revisions,
+                    backup
+                        .as_ref()
+                        .map(|backup| format!("；旧库备份「{}」", backup.display()))
+                        .unwrap_or_default(),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                // transaction 在此处 drop：未提交的写入全部回滚，原库保持 v{version}。
+                let backup_hint = backup
+                    .as_ref()
+                    .map(|backup| format!("，旧库备份在「{}」", backup.display()))
+                    .unwrap_or_default();
+                Err(error).with_context(|| {
+                    format!(
+                        "配置迁移 v{version} → v{CONFIG_SCHEMA_VERSION} 失败，已回滚本次事务，原配置保持不变{backup_hint}"
+                    )
+                })
+            }
+        }
+    }
+
+    /// 在写事务内执行迁移，返回统计；任何错误都由调用方回滚整个事务。
+    fn run_migration_transaction(
+        transaction: &rusqlite::Transaction,
+        from_version: i64,
+        timestamp: i64,
+    ) -> Result<MigrationOutcome> {
+        let revision: i64 = transaction.query_row(
+            "SELECT revision FROM config_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let before = read_sections_from(transaction)?;
+        // migrate_sections 以 BTreeMap 为契约（段顺序稳定、与 serde_json::Map 的
+        // 排序语义一致）；读写库时再转回 serde_json::Map。
+        let mut migrated: BTreeMap<String, Value> = before.clone().into_iter().collect();
+        migrations::migrate_sections(from_version, &mut migrated)?;
+        let sections: Map<String, Value> = migrated.into_iter().collect();
+        let changed_fields = changed_field_count(&before, &sections);
+
+        // 逐段写回；被剪掉的段直接删除，避免残留旧结构。
+        for (section, value) in &sections {
+            transaction.execute(
+                "INSERT OR REPLACE INTO config_sections (section, value_json, revision, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    section,
+                    serde_json::to_string(value)?,
+                    revision,
+                    timestamp
+                ],
+            )?;
+        }
+        for section in before.keys().filter(|key| !sections.contains_key(*key)) {
+            transaction.execute(
+                "DELETE FROM config_sections WHERE section = ?1",
+                rusqlite::params![section],
+            )?;
+        }
+
+        // 历史快照按同一张映射表迁移：否则回滚到迁移前的版本会遇到「字段已不存在」。
+        // 单条快照迁移失败只告警保留原样，不阻断本次升级。
+        let mut migrated_revisions = 0usize;
+        for (snapshot_revision, snapshot) in read_snapshot_rows(transaction)? {
+            let mut value: BTreeMap<String, Value> = match serde_json::from_str(&snapshot) {
+                Ok(value) => value,
+                Err(error) => {
+                    log::warn!(
+                        "配置迁移：历史快照 v{snapshot_revision} 不是可解析的段对象，保持原样（回滚到该版本会明确报错）：{error}"
+                    );
+                    continue;
+                }
+            };
+            match migrations::migrate_sections(from_version, &mut value) {
+                Ok(()) => {
+                    transaction.execute(
+                        "UPDATE config_revisions SET snapshot_json = ?1 WHERE revision = ?2",
+                        rusqlite::params![
+                            serde_json::to_string(&Value::Object(
+                                value.into_iter().collect::<Map<String, Value>>()
+                            ))?,
+                            snapshot_revision
+                        ],
+                    )?;
+                    migrated_revisions += 1;
+                }
+                Err(error) => log::warn!(
+                    "配置迁移：历史快照 v{snapshot_revision} 迁移失败，保持原样（回滚到该版本会明确报错）：{error:#}"
+                ),
+            }
+        }
+
+        transaction.execute(
+            "UPDATE config_meta SET schema_version = ?1, updated_at_ms = ?2 WHERE id = 1",
+            rusqlite::params![CONFIG_SCHEMA_VERSION, timestamp],
+        )?;
+        Ok(MigrationOutcome {
+            rewritten_sections: sections.len(),
+            changed_fields,
+            migrated_revisions,
+        })
     }
 
     /// 创建配置三表，并以 [`AppConfig::default()`] 写入初始配置（revision 1）。
@@ -576,6 +776,9 @@ impl ConfigStore {
 
     /// 加载完整业务配置：读全部 config_sections 组装 JSON，注入启动引导
     /// （http/logging/state.playback_state_path），解析相对路径并通过完整校验。
+    ///
+    /// **不做 schema 迁移**：迁移在 [`Self::open`] 的 `ensure_schema` 里已经完成，
+    /// 这里再迁移会重复改库、也会让只读路径（如 HTTP 展示）产生写入。
     pub fn load_full(&self) -> Result<AppConfig> {
         let sections = self.read_all_sections()?;
         let mut config = AppConfig::from_db_value(
@@ -819,20 +1022,7 @@ impl ConfigStore {
 
     /// 读取当前全部 config_sections。
     fn read_all_sections(&self) -> Result<Map<String, Value>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT section, value_json FROM config_sections")?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut sections = Map::new();
-        for row in rows {
-            let (section, text) = row?;
-            let value: Value = serde_json::from_str(&text)
-                .with_context(|| format!("解析配置段 {section} 失败"))?;
-            sections.insert(section, value);
-        }
-        Ok(sections)
+        read_sections_from(&self.connection)
     }
 
     /// 读取 config_meta 的当前 revision。
@@ -950,7 +1140,78 @@ fn now_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// 断代前把整库备份到同目录的 `.bak` 文件，返回备份路径。
+/// 从 `config_sections` 读取全部段；独立成函数供 [`ConfigStore`] 与迁移事务共用。
+fn read_sections_from(connection: &rusqlite::Connection) -> Result<Map<String, Value>> {
+    let mut statement = connection.prepare("SELECT section, value_json FROM config_sections")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut sections = Map::new();
+    for row in rows {
+        let (section, text) = row?;
+        let value: Value = serde_json::from_str(&text)
+            .with_context(|| format!("解析配置段 {section} 失败"))?;
+        sections.insert(section, value);
+    }
+    Ok(sections)
+}
+
+/// 读取全部历史快照 `(revision, snapshot_json)`，按 revision 升序。
+fn read_snapshot_rows(connection: &rusqlite::Connection) -> Result<Vec<(i64, String)>> {
+    let mut statement =
+        connection.prepare("SELECT revision, snapshot_json FROM config_revisions ORDER BY revision")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// 比较迁移前后的 sections，统计值发生变化的字段点路径数（只用于日志）。
+///
+/// 段内递归比较：对象按键递归、数组与标量整体比较；新增/删除的键各计一处。
+fn changed_field_count(before: &Map<String, Value>, after: &Map<String, Value>) -> usize {
+    fn walk(before: Option<&Value>, after: Option<&Value>) -> usize {
+        match (before, after) {
+            (Some(Value::Object(before)), Some(Value::Object(after))) => {
+                let mut count = before
+                    .keys()
+                    .filter(|key| !after.contains_key(*key))
+                    .count()
+                    + after
+                        .keys()
+                        .filter(|key| !before.contains_key(*key))
+                        .count();
+                for (key, before_value) in before {
+                    if let Some(after_value) = after.get(key) {
+                        count += walk(Some(before_value), Some(after_value));
+                    }
+                }
+                count
+            }
+            (Some(before), Some(after)) => usize::from(before != after),
+            (None, None) => 0,
+            _ => 1,
+        }
+    }
+    let mut count = before
+        .keys()
+        .filter(|key| !after.contains_key(*key))
+        .count()
+        + after
+            .keys()
+            .filter(|key| !before.contains_key(*key))
+            .count();
+    for (section, before_value) in before {
+        if let Some(after_value) = after.get(section) {
+            count += walk(Some(before_value), Some(after_value));
+        }
+    }
+    count
+}
+
+/// 改 schema 前把整库备份到同目录的 `.bak` 文件，返回备份路径。
+///
+/// 断代重置与平滑迁移共用：两者都会不可逆地改掉旧配置，先留还原点。
 ///
 /// 用 `VACUUM INTO` 而不是复制文件：库开着 WAL，直接复制主库文件会漏掉
 /// 还在 `-wal` 里没 checkpoint 的已提交数据；`VACUUM INTO` 由 SQLite 在
@@ -958,7 +1219,7 @@ fn now_ms() -> u64 {
 ///
 /// 返回 `Ok(None)` 表示库文件还不存在（全新库，没有可备份的内容）。
 /// 备份名带旧 schema 版本与时间戳，重复升级不会覆盖上一次的备份。
-fn backup_before_reset(
+fn backup_before_schema_change(
     connection: &rusqlite::Connection,
     path: &Path,
     stale_version: i64,
@@ -3683,6 +3944,334 @@ window:
         assert_eq!(store.load_full().unwrap().ocr.marker_search_width, 72);
         assert_eq!(store.load_full().unwrap().ocr.text_left_gap, 17);
         drop(store);
+        cleanup(&root);
+    }
+
+    /// 构造一份 v3 视图的 sections：把本轮改名/删除的字段还原成 v3 的键。
+    /// 用来喂给真实的「打开旧库 → 迁移」路径，而不是只测纯函数。
+    fn v3_sections_from_current(store: &ConfigStore) -> Map<String, Value> {
+        let mut sections = store.read_all_sections().unwrap();
+        {
+            let templates = sections["templates"].as_object_mut().unwrap();
+            let confirm = templates.remove("confirm_button").unwrap();
+            templates.insert("friend_confirm".into(), confirm);
+            templates.insert(
+                "paimon_menu_panel".into(),
+                json!("deps/assets/ui-paimon-menu-panel.png"),
+            );
+        }
+        {
+            let moderation = sections["moderation"].as_object_mut().unwrap();
+            let region = moderation.remove("confirm_button_region").unwrap();
+            moderation.insert("confirm_region".into(), region);
+        }
+        sections["screen"].as_object_mut().unwrap().insert(
+            "paimon_menu_rect".into(),
+            json!({"x": 152, "y": 358, "width": 92, "height": 92}),
+        );
+        let startup = sections["startup"].as_object_mut().unwrap();
+        startup.insert(
+            "wonderland_confirm_region".into(),
+            json!({"x": 900, "y": 650, "width": 500, "height": 250}),
+        );
+        startup["templates"].as_object_mut().unwrap().insert(
+            "wonderland_confirm".into(),
+            json!("deps/assets/startup-wonderland-confirm.png"),
+        );
+        // 真实 v3 库还没有本轮新增字段（例如 moderation.confirm_message_region
+        // 没有 serde 默认值）；迁移必须补齐，否则重开时 load_full 会 missing field。
+        for (section, key) in [
+            ("moderation", "confirm_message_region"),
+            ("screen", "secondary_chat_submit_rect"),
+            ("screen", "qianxing_f2_invite_rect"),
+            ("templates", "confirm_message_random_hall"),
+            ("templates", "confirm_message_return_teyvat"),
+            ("templates", "confirm_message_block"),
+            ("templates", "secondary_chat_submit"),
+            ("templates", "qianxing_f2_hall_list"),
+            ("templates", "qianxing_f2_invite_player"),
+            ("templates", "qianxing_exit_menu"),
+            ("templates", "qianxing_map_label"),
+            ("templates", "qianxing_profile_page_wishlist"),
+            ("templates", "qianxing_profile_page_wardrobe"),
+            ("templates", "teyvat_profile_adventure_rank"),
+            ("templates", "teyvat_profile_world_level"),
+            ("templates", "teyvat_profile_add_friend"),
+            ("templates", "qianxing_profile_domain_level"),
+            ("templates", "qianxing_profile_add_friend"),
+            ("templates", "qianxing_profile_view_profile"),
+        ] {
+            if let Some(object) = sections.get_mut(section).and_then(Value::as_object_mut) {
+                object.remove(key);
+            }
+        }
+        sections
+    }
+
+    /// 把 sections 与指定 schema 版本写回库（模拟上一版程序留下的库）。
+    fn write_sections_as_version(database_path: &Path, version: i64, sections: &Map<String, Value>) {
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        for (section, value) in sections {
+            connection
+                .execute(
+                    "UPDATE config_sections SET value_json = ?1 WHERE section = ?2",
+                    rusqlite::params![serde_json::to_string(value).unwrap(), section],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE config_meta SET schema_version = ?1 WHERE id = 1",
+                rusqlite::params![version],
+            )
+            .unwrap();
+    }
+
+    /// 读取 config_meta 的 schema 版本（独立连接）。
+    fn stored_schema_version(database_path: &Path) -> i64 {
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        connection
+            .query_row("SELECT schema_version FROM config_meta WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn v3_database_migrates_fields_in_place_and_keeps_user_settings() {
+        let (root, database_path) = temp_database("v3-migrate");
+        let bootstrap = test_bootstrap(&database_path);
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        // 先写入用户设置，再降级成 v3 视图，最后重开触发迁移。
+        let reply_data = BTreeMap::from([(
+            "@迁移保留".to_string(),
+            vec![StoredReply {
+                key: "answer".into(),
+                text: "survives migration".into(),
+            }],
+        )]);
+        assert_eq!(store.save_reply_templates(0, &reply_data).unwrap(), 1);
+        let mut sections = full_sections(&store);
+        sections["queue"]["max_size"] = json!(23);
+        sections["ai"]["api_key"] = json!("v3-secret");
+        store.save(1, sections).unwrap();
+        let mut v3 = v3_sections_from_current(&store);
+        v3["queue"]["max_size"] = json!(23);
+        v3["ai"]["api_key"] = json!("v3-secret");
+        // 用户自定义的确认按钮模板必须跨迁移保留（改名后仍是同一个值）。
+        v3["templates"]["friend_confirm"] = json!("custom/我的确认按钮.png");
+        let revision_before = store.current_revision().unwrap();
+        drop(store);
+        write_sections_as_version(&database_path, 3, &v3);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+
+        // 版本升到 4，配置不再被重置（revision 不变、用户设置还在）。
+        assert_eq!(stored_schema_version(&database_path), CONFIG_SCHEMA_VERSION);
+        assert_eq!(stored_schema_version(&database_path), 4);
+        assert_eq!(store.current_revision().unwrap(), revision_before);
+        assert_eq!(stored_section(&database_path, "queue")["max_size"], json!(23));
+        assert_eq!(
+            stored_section(&database_path, "ai")["api_key"],
+            json!("v3-secret")
+        );
+        // 旧键消失、新键有值。
+        let templates = stored_section(&database_path, "templates");
+        assert_eq!(
+            templates["confirm_button"],
+            json!("custom/我的确认按钮.png"),
+            "旧键的值必须搬到新键"
+        );
+        assert!(templates.get("friend_confirm").is_none());
+        assert!(templates.get("paimon_menu_panel").is_none());
+        let moderation = stored_section(&database_path, "moderation");
+        assert!(moderation.get("confirm_button_region").is_some());
+        assert!(moderation.get("confirm_region").is_none());
+        let screen = stored_section(&database_path, "screen");
+        assert!(screen.get("paimon_menu_rect").is_none());
+        let startup = stored_section(&database_path, "startup");
+        assert!(startup.get("wonderland_confirm_region").is_none());
+        assert!(
+            startup["templates"].get("wonderland_confirm").is_none(),
+            "startup.templates.wonderland_confirm 必须被删掉"
+        );
+        // 迁移后能正常加载，且回复模板不受影响。
+        let loaded = store.load_full().unwrap();
+        assert_eq!(loaded.queue.max_size, 23);
+        // load_full 会按 EXE 根目录解析相对路径，所以期望值是 root 下的绝对路径。
+        assert_eq!(
+            loaded.templates.confirm_button,
+            root.join("custom/我的确认按钮.png"),
+        );
+        assert_eq!(store.reply_templates().unwrap(), reply_data);
+        // 迁移前留下 .bak 备份。
+        assert_eq!(backup_files(database_path.parent().unwrap()).len(), 1);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn migration_prefers_the_new_key_when_both_are_present() {
+        let (root, database_path) = temp_database("v3-both-keys");
+        let bootstrap = test_bootstrap(&database_path);
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let mut v3 = v3_sections_from_current(&store);
+        // 旧键与新键同时存在：新键必须胜出。
+        v3["templates"]["confirm_button"] = json!("custom/新.png");
+        v3["templates"]["friend_confirm"] = json!("custom/旧.png");
+        drop(store);
+        write_sections_as_version(&database_path, 3, &v3);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        let templates = stored_section(&database_path, "templates");
+        assert_eq!(
+            templates["confirm_button"],
+            json!("custom/新.png"),
+            "两者都有时必须保留新键的值"
+        );
+        assert!(templates.get("friend_confirm").is_none(), "旧键仍要被删除");
+        assert_eq!(
+            store.load_full().unwrap().templates.confirm_button,
+            root.join("custom/新.png"),
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn current_schema_database_is_not_migrated_again() {
+        let (root, database_path) = temp_database("v4-no-remigrate");
+        let bootstrap = test_bootstrap(&database_path);
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let mut sections = full_sections(&store);
+        sections["templates"]["confirm_button"] = json!("custom/当前.png");
+        store.save(1, sections).unwrap();
+        let revision = store.current_revision().unwrap();
+        drop(store);
+
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        assert_eq!(stored_schema_version(&database_path), CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            store.current_revision().unwrap(),
+            revision,
+            "已是当前版本时不得触发迁移（revision 不能变）"
+        );
+        assert_eq!(
+            stored_section(&database_path, "templates")["confirm_button"],
+            json!("custom/当前.png")
+        );
+        assert!(
+            backup_files(database_path.parent().unwrap()).is_empty(),
+            "同版本打开不应产生备份"
+        );
+        drop(store);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn v2_database_without_a_migration_path_is_still_reset() {
+        let (root, database_path) = temp_database("v2-reset");
+        let bootstrap = test_bootstrap(&database_path);
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let mut sections = full_sections(&store);
+        sections["queue"]["max_size"] = json!(23);
+        store.save(1, sections).unwrap();
+        let mut v3 = v3_sections_from_current(&store);
+        v3["queue"]["max_size"] = json!(23);
+        drop(store);
+        // v2 没有迁移路径：即使它的键看起来像 v3，也必须走断代重置。
+        write_sections_as_version(&database_path, 2, &v3);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        assert_eq!(stored_schema_version(&database_path), CONFIG_SCHEMA_VERSION);
+        assert_eq!(store.current_revision().unwrap(), 1, "断代重置回到 revision 1");
+        let expected: Value = serde_json::from_str(
+            &serde_json::to_string(&AppConfig::default().to_db_value()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            Value::Object(store.read_all_sections().unwrap()),
+            expected,
+            "无迁移路径的旧版本仍按默认值重置"
+        );
+        assert!(
+            !store.load_full().unwrap().templates.confirm_button.as_os_str().is_empty()
+        );
+        assert_eq!(backup_files(database_path.parent().unwrap()).len(), 1);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_and_keeps_the_original_configuration() {
+        let (root, database_path) = temp_database("v3-migrate-failure");
+        let bootstrap = test_bootstrap(&database_path);
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let mut v3 = v3_sections_from_current(&store);
+        // 损坏的段：迁移末尾的结构校验必然失败。
+        v3.insert("queue".into(), json!("not-an-object"));
+        let before = v3.clone();
+        drop(store);
+        write_sections_as_version(&database_path, 3, &v3);
+
+        let error = ConfigStore::open(&database_path, &root, bootstrap.clone())
+            .expect_err("损坏的配置必须让迁移失败而不是静默重置");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("已回滚本次事务") && message.contains("原配置保持不变"),
+            "错误信息应说明回滚与原配置未变: {message}"
+        );
+        // 原库必须保持迁移前状态：版本仍是 3、sections 一字未改。
+        assert_eq!(stored_schema_version(&database_path), 3);
+        assert_eq!(stored_section(&database_path, "queue"), json!("not-an-object"));
+        assert_eq!(stored_section(&database_path, "templates"), before["templates"]);
+        assert_eq!(stored_section(&database_path, "screen"), before["screen"]);
+        // 备份仍然留下（迁移失败不删还原点）。
+        assert_eq!(backup_files(database_path.parent().unwrap()).len(), 1);
+
+        // 修好数据后重开能正常迁移，证明失败没有留下半写状态。
+        let mut fixed = before.clone();
+        fixed.insert(
+            "queue".into(),
+            AppConfig::default().to_db_value()["queue"].clone(),
+        );
+        write_sections_as_version(&database_path, 3, &fixed);
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        assert_eq!(stored_schema_version(&database_path), CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            stored_section(&database_path, "templates")["confirm_button"],
+            fixed["templates"]["friend_confirm"]
+        );
+        store.load_full().unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn migration_also_rewrites_history_snapshots_so_rollback_still_works() {
+        let (root, database_path) = temp_database("v3-migrate-snapshots");
+        let bootstrap = test_bootstrap(&database_path);
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        // 造一版旧结构快照（revision 1 就是初始化快照）。
+        let mut v3 = v3_sections_from_current(&store);
+        v3["templates"]["friend_confirm"] = json!("custom/旧快照.png");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE config_revisions SET snapshot_json = ?1 WHERE revision = 1",
+                rusqlite::params![serde_json::to_string(&Value::Object(v3.clone())).unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        store.connection.execute_batch("UPDATE config_meta SET schema_version = 3").unwrap();
+        drop(store);
+
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        // 迁移后，旧快照也必须能用当前结构解析（否则回滚到它必然报错）。
+        let revision = store.current_revision().unwrap();
+        let outcome = store.rollback(1, revision).unwrap();
+        assert_eq!(outcome.revision, revision + 1);
+        assert_eq!(
+            store.load_full().unwrap().templates.confirm_button,
+            root.join("custom/旧快照.png"),
+            "回滚到迁移前的快照仍要保留确认按钮模板"
+        );
         cleanup(&root);
     }
 }

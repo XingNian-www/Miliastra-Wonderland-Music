@@ -533,3 +533,33 @@ fn ai_route_error(error: anyhow::Error) -> AppError {
     }
     internal_error(error)
 }
+
+/// GET /ai/trace —— 最近 N 次实际发往 provider 的 AI 请求摘要。
+///
+/// 只读内存环形缓冲，不触发任何网络调用，也不改配置。正文按条读取，
+/// 列表只给摘要，避免一次把几十份提示词全塞给面板。
+pub(super) fn ai_trace_route(
+    _query: &[(String, String)],
+    _state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    Ok(crate::ai_trace::list_json())
+}
+
+/// GET /ai/trace/entry?id=N —— 单条请求的完整报文。
+///
+/// 返回 system prompt、messages（含 tool 消息）、tools、参数与原始 usage；
+/// 图片数据与密钥字段在入库时已脱敏。条目滚出内存后返回 404。
+pub(super) fn ai_trace_entry_route(
+    query: &[(String, String)],
+    _state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let raw = query_value(query, "id")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| bad_request("缺少 id 参数"))?;
+    let id: u64 = raw.parse().map_err(|_| bad_request("id 必须是正整数"))?;
+    crate::ai_trace::entry_json(id).ok_or_else(|| AppError {
+        status: 404,
+        message: format!("没有 id={id} 的 AI 请求记录（可能已滚出内存）"),
+    })
+}

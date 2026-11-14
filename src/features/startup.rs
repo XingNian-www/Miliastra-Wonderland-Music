@@ -34,7 +34,6 @@ pub struct StartupConfig {
     pub templates: StartupTemplateConfig,
     pub enter_game_text_region: RectConfig,
     pub wonderland_hall_ocr_region: RectConfig,
-    pub wonderland_confirm_region: RectConfig,
     pub main_ui_region: RectConfig,
     pub wonderland_map_star_region: RectConfig,
 }
@@ -67,7 +66,6 @@ impl Default for StartupConfig {
             templates: StartupTemplateConfig::default(),
             enter_game_text_region: RectConfig::default(),
             wonderland_hall_ocr_region: RectConfig::default(),
-            wonderland_confirm_region: RectConfig::default(),
             main_ui_region: RectConfig::default(),
             wonderland_map_star_region: RectConfig::default(),
         }
@@ -142,10 +140,6 @@ impl StartupConfig {
                 "startup.enter_game_text_region",
             ),
             (
-                self.wonderland_confirm_region,
-                "startup.wonderland_confirm_region",
-            ),
-            (
                 self.wonderland_hall_ocr_region,
                 "startup.wonderland_hall_ocr_region",
             ),
@@ -158,10 +152,6 @@ impl StartupConfig {
             validate_rect(rect, field)?;
         }
         for (path, field) in [
-            (
-                &self.templates.wonderland_confirm,
-                "startup.templates.wonderland_confirm",
-            ),
             (&self.templates.paimon_menu, "startup.templates.paimon_menu"),
             (
                 &self.templates.wonderland_map_star,
@@ -187,7 +177,6 @@ fn validate_threshold(value: f32, field: &str) -> Result<()> {
 #[serde(deny_unknown_fields)]
 pub struct StartupTemplateConfig {
     pub wonderland_map_star: PathBuf,
-    pub wonderland_confirm: PathBuf,
     pub paimon_menu: PathBuf,
 }
 
@@ -195,7 +184,6 @@ impl Default for StartupTemplateConfig {
     fn default() -> Self {
         Self {
             wonderland_map_star: PathBuf::new(),
-            wonderland_confirm: PathBuf::new(),
             paimon_menu: PathBuf::new(),
         }
     }

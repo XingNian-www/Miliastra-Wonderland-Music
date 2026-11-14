@@ -866,6 +866,20 @@ html.theme-transition body,html.theme-transition .panel,html.theme-transition .a
             <div id="aiChatMemoryBody"></div>
           </div>
         </details>
+
+        <details class="panel" open id="aiTracePanelWrap">
+          <summary class="panel-head">AI 实际请求（最近 <span id="aiTraceCount">0</span> 次）</summary>
+          <div class="panel-body">
+            <p class="config-field-hint">这里展示<b>真正发往 provider 的报文</b>：model / wire_api / system prompt / messages（含工具消息）/ tools / 参数 / token 用量与缓存命中。只保存在内存，进程重启即清空；API Key 与图片 base64 已脱敏。</p>
+            <div class="row" style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+              <button class="btn small" id="aiTraceRefresh" type="button" onclick="loadAiTrace()">刷新</button>
+              <span class="config-field-hint" id="aiTraceHint">未读取</span>
+            </div>
+            <div class="config-field-hint" id="aiTraceStats" style="margin:0 0 8px"></div>
+            <div id="aiTraceList" style="max-height:280px;overflow:auto"></div>
+            <div id="aiTraceDetail"></div>
+          </div>
+        </details>
       </div>
       <p class="command-foot">记忆只保存在本地统一数据库；「@忘记我」可让玩家清空自己的记忆。AI 给出的命令会按提问者本人权限复核后执行。</p>
     </section>
@@ -1458,7 +1472,7 @@ async function navigateTo(route,updateHash=true){
     if(!commandCatalog&&!commandCatalogLoading)loadCommandCatalog()
     if(!commandReplyCatalog&&!commandReplyLoading)loadCommandReplies()
   }
-  if(route==='aichat'){if(!aiChatData)loadAiChatSettings();if(!$('aiChatMemoryBody')||!$('aiChatMemoryBody').childElementCount)loadAiChatMemory()}
+  if(route==='aichat'){if(!aiChatData)loadAiChatSettings();if(!$('aiChatMemoryBody')||!$('aiChatMemoryBody').childElementCount)loadAiChatMemory();loadAiTrace()}
   if(route==='identity'){if(!identityData)loadIdentitySettings()}
 }
 /* ===== AI 聊天功能页 =====
@@ -1559,7 +1573,7 @@ async function loadAiChatMemory(){
 function aiSummaryEmptyNote(tokens){
   const values=aiChatData&&aiChatData.values?aiChatData.values:null
   const raw=values?Number(values.actor_token_budget):NaN
-  const budget=Number.isFinite(raw)&&raw>0?raw:16000
+  const budget=Number.isFinite(raw)&&raw>0?raw:96000
   const used=tokens||0
   const pct=Math.min(100,Math.round(used*100/budget))
   if(used>=budget*0.9){
@@ -1652,6 +1666,137 @@ async function deleteAiChatFact(name,fact){
     await viewAiChatActor(name)
   }catch(error){alert('删除失败：'+error.message)}
 }
+/* ===== AI 实际请求（最近 N 次报文） =====
+ * 只读展示：后端 /ai/trace 给摘要，/ai/trace/entry?id= 给单条完整报文。
+ * 所有动态文本一律经 esc() 或 textContent 落地，不拼进内联事件。
+ */
+let aiTraceEntries=[]
+
+function aiTracePercent(ratio){
+  if(ratio===null||ratio===undefined||!isFinite(ratio))return '—'
+  return (Math.round(Number(ratio)*1000)/10)+'%'
+}
+
+function aiTraceJson(value){
+  try{return JSON.stringify(value,null,2)}catch{return String(value)}
+}
+
+function aiTraceMessageText(message){
+  if(message===null||message===undefined)return ''
+  if(typeof message==='string')return message
+  const content=message.content
+  if(typeof content==='string')return content
+  if(Array.isArray(content)){
+    const parts=[]
+    for(const part of content){
+      if(part&&typeof part.text==='string')parts.push(part.text)
+      else if(part&&part.type==='image_url')parts.push('[图片已省略]')
+      else if(part&&part.type==='input_image')parts.push('[图片已省略]')
+      else parts.push(aiTraceJson(part))
+    }
+    return parts.join('\n')
+  }
+  // Responses 的 function_call / function_call_output / reasoning 等 item 没有 content。
+  const rest={...message}
+  delete rest.role
+  delete rest.content
+  if(message&&message.tool_calls)return aiTraceJson(message.tool_calls)
+  return Object.keys(rest).length?aiTraceJson(rest):''
+}
+
+function aiTraceBlock(title,text,open){
+  if(text===null||text===undefined||text==='')return ''
+  return '<details class="panel" style="margin:8px 0;padding:8px"'+(open?' open':'')+'>'
+    +'<summary style="cursor:pointer;font-weight:600">'+esc(title)+'</summary>'
+    +'<pre style="white-space:pre-wrap;word-break:break-word;margin:6px 0 0;max-height:320px;overflow:auto;font-family:var(--font-mono);font-size:var(--fs-tiny);line-height:var(--lh-tiny)">'+esc(text)+'</pre>'
+    +'</details>'
+}
+
+async function loadAiTrace(){
+  const list=$('aiTraceList'),hint=$('aiTraceHint'),stats=$('aiTraceStats'),count=$('aiTraceCount')
+  if(!list)return
+  list.innerHTML='<p class="config-field-hint">读取中…</p>'
+  try{
+    const data=await request('/ai/trace')
+    aiTraceEntries=data.entries||[]
+    if(count)count.textContent=String(data.count||0)
+    const s=data.stats||{}
+    if(stats)stats.textContent='最近 '+ (s.requests||0) +' 次请求 · 输入 '+ (s.promptTokens||0)
+      +' token · 缓存命中 '+ (s.cachedTokens||0) +' token · 总命中率 '+ aiTracePercent(s.cacheHitRatio)
+      +' · 不同稳定前缀 '+ (s.distinctPrefixes||0) +' 个（相同指纹 = system+tools 完全一致，可复用缓存）'
+    if(hint)hint.textContent='容量 '+ (data.capacity||0) +' 条，只存内存'
+    if(!aiTraceEntries.length){
+      list.innerHTML='<p class="config-field-hint">还没有 AI 请求。触发一次 AI 聊天后点「刷新」。</p>'
+      return
+    }
+    const rows=[]
+    for(const entry of aiTraceEntries){
+      const ok=entry.ok?'✓':'✗'
+      rows.push('<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;padding:5px 0;border-bottom:1px solid var(--border,#eee)">'
+        +'<span class="config-field-hint">#'+esc(entry.id)+'</span>'
+        +'<span class="config-field-hint">'+esc(entry.startedAt)+'</span>'
+        +'<span>'+ok+'</span>'
+        +'<strong class="ai-trace-model"></strong>'
+        +'<span class="config-field-hint">'+esc(entry.wireApi)+' · '+esc(entry.durationMs)+' ms · 输入 '+(entry.promptTokens??'—')+' / 命中 '+(entry.cachedTokens??'—')+'（'+aiTracePercent(entry.cacheHitRatio)+'） · '+esc(entry.messageCount)+' 条消息 · 稳定前缀 '+esc(entry.stablePrefixBytes)+' B · 尾部约 '+(entry.tailTokens??'—')+' token · 全量 '+esc(entry.requestBytes)+' B</span>'
+        +'<button class="btn small" data-ai-trace="'+esc(entry.id)+'" type="button">查看</button>'
+        +'</div>')
+    }
+    list.innerHTML=rows.join('')
+    // 模型名走 textContent，避免把 provider 返回值拼进 HTML。
+    list.querySelectorAll('.ai-trace-model').forEach((node,index)=>{
+      const entry=aiTraceEntries[index]
+      if(entry)node.textContent=entry.model||'（未命名模型）'
+    })
+    list.querySelectorAll('[data-ai-trace]').forEach(button=>{
+      button.addEventListener('click',()=>viewAiTrace(Number(button.dataset.aiTrace)))
+    })
+    // 首次打开/详情为空时直接展示最近一次，用户不用先点「查看」。
+    const detail=$('aiTraceDetail')
+    if(detail&&!detail.childElementCount)viewAiTrace(aiTraceEntries[0].id)
+  }catch(error){
+    list.innerHTML=''
+    if(hint)hint.textContent='读取失败'
+    if(stats)stats.textContent=''
+    list.innerHTML='<p class="config-message err">读取失败：'+esc(error.message)+'</p>'
+  }
+}
+
+async function viewAiTrace(id){
+  const el=$('aiTraceDetail')
+  if(!el)return
+  el.innerHTML='<p class="config-field-hint">读取 #'+esc(id)+' …</p>'
+  try{
+    const entry=await request('/ai/trace/entry?id='+encodeURIComponent(id))
+    const parts=[]
+    parts.push('<div class="panel" style="padding:8px;margin-top:8px">'
+      +'<div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">'
+      +'<strong>#'+esc(entry.id)+' '+esc(entry.model)+'</strong>'
+      +'<span class="config-field-hint">'+esc(entry.wireApi)+(entry.reasoning?' · reasoning='+esc(entry.reasoning):'')
+      +' · 耗时 '+esc(entry.durationMs)+' ms · '+(entry.ok?'成功':'失败')+'</span>'
+      +'</div>'
+      +'<div class="config-field-hint" style="margin-top:4px">开始 '+esc(entry.startedAt)
+      +' · 输入 '+(entry.promptTokens??'—')+' token · 输出 '+(entry.completionTokens??'—')
+      +' token · 缓存命中 '+(entry.cachedTokens??'—')+'（'+aiTracePercent(entry.cacheHitRatio)+'）'
+      +' · 稳定前缀 '+esc(entry.prefixFingerprint)+'（'+esc(entry.stablePrefixBytes)+' B） · 尾部约 '+(entry.tailTokens??'—')+' token</div>'
+      +(entry.error?'<p class="config-message err" style="margin:6px 0 0">'+esc(entry.error)+'</p>':'')
+      +'</div>')
+
+    parts.push(aiTraceBlock('请求参数（除 model/system/messages/tools）',aiTraceJson(entry.parameters),true))
+    parts.push(aiTraceBlock('system prompt',entry.system||'',true))
+    const messages=Array.isArray(entry.messages)?entry.messages:[]
+    const rendered=messages.map(message=>{
+      const role=message&&(message.role||message.type)||'item'
+      return '【'+role+'】\n'+aiTraceMessageText(message)
+    }).join('\n\n')
+    parts.push(aiTraceBlock('messages（'+messages.length+' 条，含工具调用/结果；不含 system）',rendered,true))
+    parts.push(aiTraceBlock('tools（'+(Array.isArray(entry.tools)?entry.tools.length:0)+' 个）',aiTraceJson(entry.tools)))
+    if(entry.usage)parts.push(aiTraceBlock('provider 原始 usage（含缓存字段）',aiTraceJson(entry.usage)))
+    el.innerHTML=parts.join('')
+  }catch(error){
+    el.innerHTML='<p class="config-message err">读取失败：'+esc(error.message)+'</p>'
+  }
+}
+
 async function loadAiChatSettings(){
   const status=$('aiChatStatusText')
   try{

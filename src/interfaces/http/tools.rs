@@ -48,7 +48,6 @@ pub(crate) enum WebToolTemplate {
     BlueMarker,
     YellowMarker,
     PinkMarker,
-    Friend,
     SecondaryBack,
     SecondaryHall,
     WorldWish,
@@ -60,8 +59,7 @@ pub(crate) enum WebToolTemplate {
     FriendMoreSettings,
     FriendBlockChat,
     FriendBlacklist,
-    FriendConfirm,
-    WonderlandConfirm,
+    ConfirmButton,
     PaimonMenu,
     WonderlandMapStar,
     Custom(String),
@@ -73,7 +71,6 @@ impl WebToolTemplate {
             "blue-marker" => Ok(Self::BlueMarker),
             "yellow-marker" => Ok(Self::YellowMarker),
             "pink-marker" => Ok(Self::PinkMarker),
-            "friend" => Ok(Self::Friend),
             "secondary-back" => Ok(Self::SecondaryBack),
             "secondary-hall" => Ok(Self::SecondaryHall),
             "world-wish" => Ok(Self::WorldWish),
@@ -85,8 +82,7 @@ impl WebToolTemplate {
             "friend-more-settings" => Ok(Self::FriendMoreSettings),
             "friend-block-chat" => Ok(Self::FriendBlockChat),
             "friend-blacklist" => Ok(Self::FriendBlacklist),
-            "friend-confirm" => Ok(Self::FriendConfirm),
-            "wonderland-confirm" => Ok(Self::WonderlandConfirm),
+            "confirm-button" => Ok(Self::ConfirmButton),
             "paimon-menu" => Ok(Self::PaimonMenu),
             "wonderland-map-star" => Ok(Self::WonderlandMapStar),
             custom if custom_templates.contains_key(custom) => Ok(Self::Custom(custom.to_string())),
@@ -99,7 +95,6 @@ impl WebToolTemplate {
             Self::BlueMarker => "蓝色聊天标志".to_string(),
             Self::YellowMarker => "黄色聊天标志".to_string(),
             Self::PinkMarker => "粉色聊天标志".to_string(),
-            Self::Friend => "好友按钮".to_string(),
             Self::SecondaryBack => "二级聊天返回按钮".to_string(),
             Self::SecondaryHall => "二级当前大厅".to_string(),
             Self::WorldWish => "祈愿".to_string(),
@@ -111,8 +106,7 @@ impl WebToolTemplate {
             Self::FriendMoreSettings => "好友更多设置".to_string(),
             Self::FriendBlockChat => "屏蔽聊天".to_string(),
             Self::FriendBlacklist => "拉黑".to_string(),
-            Self::FriendConfirm => "好友操作确认".to_string(),
-            Self::WonderlandConfirm => "千星确认按钮".to_string(),
+            Self::ConfirmButton => "确认按钮".to_string(),
             Self::PaimonMenu => "派蒙主界面".to_string(),
             Self::WonderlandMapStar => "千星地图入口".to_string(),
             Self::Custom(name) => format!("自定义模板: {name}"),
@@ -160,15 +154,4 @@ impl WebToolRequest {
 mod tests {
     use super::*;
 
-    #[test]
-    fn friend_is_the_only_web_name_for_the_primary_anchor() {
-        let templates = HashMap::new();
-
-        assert!(matches!(
-            WebToolTemplate::parse("friend", &templates).expect("friend template"),
-            WebToolTemplate::Friend
-        ));
-        assert!(WebToolTemplate::parse("group", &templates).is_err());
-        assert!(WebToolTemplate::parse("enter", &templates).is_err());
-    }
 }

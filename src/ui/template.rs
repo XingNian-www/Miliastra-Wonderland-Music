@@ -25,6 +25,69 @@ static DOWNSCALED_GRAY_TEMPLATE_CACHE: OnceLock<Mutex<HashMap<(PathBuf, u32), Ar
 /// 也就是说 min_score=0.80 时它几乎"匹配一切均匀区域"。
 const FLAT_TEMPLATE_STDDEV: f32 = 4.0;
 
+/// 透明模板的“平坦画面”防护。
+///
+/// 透明化会去掉与内容形成对比的底色；只剩白字/白图标时，纯色或大面积均匀区域上
+/// SAD 会接近 0，而分数又只除以 Σalpha，按 `1 - MAD/255` 就能拿到高分（实测
+/// `ui-secondary-hall` 0.944、`invite-enter-hall` 0.911、`confirm-button` 0.909，
+/// 均超过 0.90 阈值）。这里要求命中位置在模板 alpha 外接框内的画面标准差不得低于
+/// `max(2.0, 25% × 模板外接框标准差)`：纯色画面标准差为 0，直接拒绝；真实 UI
+/// 的文字/图标会把画面标准差撑起来。只对带 alpha 的模板生效。
+const FLAT_PATCH_STDDEV_FLOOR: f32 = 2.0;
+const FLAT_PATCH_STDDEV_RATIO: f32 = 0.25;
+
+/// 文字内容模板的最低对比度（前景中位灰度与背景中位灰度之差）。
+///
+/// 透明化后模板只剩字形，匹配分数不再被按钮底色/胶囊底撑高；但 SAD 只除以
+/// Σalpha，纯色画面仍可能拿到高分。这里用**极性无关**的灰度对比度判定：
+/// 深色字（暗前景/亮背景）与浅色字（亮前景/暗背景）都取绝对值。
+const TEXT_ANCHOR_MIN_CONTRAST: f32 = 40.0;
+/// 字形像素中，与背景灰度差 ≥ [`TEXT_ANCHOR_INK_DELTA`] 的比例下限。
+///
+/// 纯色/近纯色 patch 的 contrast 已经接近 0；ink 进一步挡掉“对比度高但只有
+/// 少数噪点像字”的误命中。std/edge 只记录不设硬门槛，避免误杀浅色小字。
+const TEXT_ANCHOR_MIN_INK: f64 = 0.5;
+const TEXT_ANCHOR_INK_DELTA: u8 = 30;
+
+/// 以**文字内容**为判据的模板文件名。
+///
+/// 这份清单是唯一的归类点：匹配器按文件名统一走
+/// [`text_anchor_quality_ok`]，调用方不需要逐个模板重复校验。
+/// 图标类模板（back/hall/submit/chat markers/friend-panel 图标/地图形状）
+/// 不在此列，保持原有 SAD 语义。
+const TEXT_TEMPLATE_FILE_NAMES: &[&str] = &[
+    "ui-main-menu-return.png",
+    "invite-enter-hall.png",
+    "invite-goto-hall.png",
+    "invite-view-star.png",
+    "invite-view-profile.png",
+    "teyvat-profile-add-friend.png",
+    "friend-block-chat.png",
+    "friend-blacklist.png",
+    "confirm-button.png",
+    "friend-search-panel.png",
+    "confirm-message-random-hall.png",
+    "confirm-message-return-teyvat.png",
+    "confirm-message-block.png",
+    "qianxing-f2-hall-list.png",
+    "qianxing-f2-invite-player.png",
+    "qianxing-exit-menu.png",
+    "teyvat-profile-adventure-rank.png",
+    "teyvat-profile-world-level.png",
+    "qianxing-profile-domain-level.png",
+    "qianxing-profile-add-friend.png",
+    "qianxing-profile-page-wishlist.png",
+    "qianxing-profile-page-wardrobe.png",
+];
+
+/// 该模板是否以文字内容为判据。
+pub(crate) fn is_text_template(template_path: &Path) -> bool {
+    template_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| TEXT_TEMPLATE_FILE_NAMES.contains(&name))
+}
+
 /// 已就近纯色告警过的模板路径。
 ///
 /// 模板缺陷是静态属性，只需提示一次；用集合而非 `OnceLock<bool>` 是因为
@@ -70,6 +133,21 @@ struct GrayTemplate {
     /// 灰度标准差，用于识别缺乏区分度的纯色模板。
     #[allow(dead_code)]
     gray_stddev: f32,
+    /// alpha 外接框与框内灰度标准差；透明模板的平坦画面防护用。
+    contrast: Option<ContrastBox>,
+    /// 是否启用平坦画面防护。`world-wish` / `startup-wonderland-map-star` 是既有的
+    /// 透明信号图（本轮明确不动它们），保持原行为。
+    guard_flat: bool,
+}
+
+/// alpha 外接框（含透明像素的原始 RGB）+ 框内灰度标准差。
+#[derive(Clone, Copy)]
+struct ContrastBox {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    stddev: f32,
 }
 
 pub(crate) fn find_template_hits(
@@ -89,12 +167,25 @@ pub(crate) fn find_template_hits(
     let base_x = search_rect.map(|rect| rect.x).unwrap_or(0);
     let base_y = search_rect.map(|rect| rect.y).unwrap_or(0);
     let matcher = GrayMatcher::from_template(&template);
-    Ok(gray_hits_in_gray(
+    let mut hits = gray_hits_in_gray(
         &haystack.to_luma8(),
         &matcher,
         threshold,
         (base_x, base_y),
-    ))
+    );
+    if is_text_template(template_path) {
+        for hit in &mut hits {
+            if !text_anchor_quality_ok_template(
+                image,
+                Rect::new(hit.x, hit.y, hit.width, hit.height),
+                template_path,
+            ) {
+                hit.quality_ok = false;
+            }
+        }
+        hits.retain(|hit| hit.quality_ok);
+    }
+    Ok(hits)
 }
 
 pub(crate) fn find_color_template_hit_groups(
@@ -146,6 +237,7 @@ fn find_color_template_hits_in_rgb(
                     width: template_rgb.width(),
                     height: template_rgb.height(),
                     score,
+                    quality_ok: true,
                 });
             }
         }
@@ -205,6 +297,12 @@ impl GrayTemplate {
             })
         };
         let gray_stddev = gray_stddev(&gray);
+        let contrast = template_contrast(&gray, &alpha);
+        let file_name = label.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let guard_flat = !matches!(
+            file_name,
+            "world-wish.png" | "startup-wonderland-map-star.png"
+        );
         if gray_stddev < FLAT_TEMPLATE_STDDEV {
             // 同一模板会被 build 两次（全分辨率与降采样版本），而模板有缺陷这件事
             // 是静态的：每帧重复告警只会把真正有用的日志挤出文件。
@@ -224,8 +322,51 @@ impl GrayTemplate {
             fully_opaque,
             gray_stddev,
             opaque,
+            contrast,
+            guard_flat,
         }
     }
+}
+
+/// 模板 alpha 外接框及框内（含透明像素原始 RGB）的灰度标准差。
+fn template_contrast(gray: &GrayImage, alpha: &GrayImage) -> Option<ContrastBox> {
+    let (width, height) = gray.dimensions();
+    let alpha_data = alpha.as_raw();
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            if alpha_data[(y * width + x) as usize] == 0 {
+                continue;
+            }
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if min_x == u32::MAX {
+        return None;
+    }
+    let (box_width, box_height) = (max_x - min_x + 1, max_y - min_y + 1);
+    let gray_data = gray.as_raw();
+    let (mut sum, mut sum_sq) = (0u64, 0u64);
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let value = gray_data[(y * width + x) as usize] as u64;
+            sum += value;
+            sum_sq += value * value;
+        }
+    }
+    let count = (box_width * box_height) as f64;
+    let mean = sum as f64 / count;
+    let variance = (sum_sq as f64 / count - mean * mean).max(0.0);
+    Some(ContrastBox {
+        x: min_x,
+        y: min_y,
+        width: box_width,
+        height: box_height,
+        stddev: variance.sqrt() as f32,
+    })
 }
 
 fn cached_gray_template(template_path: &Path) -> Result<Arc<GrayTemplate>> {
@@ -377,7 +518,7 @@ pub(crate) fn best_template_hit(
             candidate.score
         );
     }
-    Ok(candidate.filter(|candidate| candidate.score >= threshold))
+    Ok(candidate.filter(|candidate| candidate.quality_ok && candidate.score >= threshold))
 }
 
 /// 搜索区域的简短描述：给了区域就写几何，全图就写「整幅画面」。
@@ -400,6 +541,11 @@ pub(crate) fn template_exists(
 ) -> Result<bool> {
     if !threshold.is_finite() || threshold < 0.0 || threshold > 1.0 {
         return Ok(best_template_hit(image, search_rect, template_path, threshold)?.is_some());
+    }
+    // 文字模板必须走候选路径，才能对命中位置做内容质量校验。
+    if is_text_template(template_path) {
+        return Ok(best_template_candidate(image, search_rect, template_path)?
+            .is_some_and(|candidate| candidate.quality_ok && candidate.score >= threshold));
     }
     let haystack = match search_rect {
         Some(rect) => crop_canvas(image, rect)?,
@@ -439,9 +585,37 @@ pub(crate) fn best_template_candidate(
         sad: max_sad.saturating_add(1),
     });
 
+    if !patch_contrast_ok(&haystack_gray, &matcher, found.x, found.y) {
+        log::trace!(
+            "模板「{}」最优点 ({} , {}) 落在平坦画面，按透明模板防护拒绝",
+            template_path.display(),
+            found.x,
+            found.y
+        );
+        return Ok(None);
+    }
     let score = 1.0 - found.sad as f32 / max_sad as f32;
     let base_x = search_rect.map(|rect| rect.x).unwrap_or(0);
     let base_y = search_rect.map(|rect| rect.y).unwrap_or(0);
+    let quality_ok = text_anchor_quality_ok_template(
+        image,
+        Rect::new(
+            base_x + found.x as i32,
+            base_y + found.y as i32,
+            template.gray.width(),
+            template.gray.height(),
+        ),
+        template_path,
+    );
+    if !quality_ok {
+        log::trace!(
+            "模板「{}」命中 ({}, {}) 但文字内容质量不足，标记为拒绝候选（分数 {:.3}）",
+            template_path.display(),
+            base_x + found.x as i32,
+            base_y + found.y as i32,
+            score,
+        );
+    }
     Ok(Some(TemplateHit {
         kind: "template".to_string(),
         x: base_x + found.x as i32,
@@ -449,6 +623,7 @@ pub(crate) fn best_template_candidate(
         width: template.gray.width(),
         height: template.gray.height(),
         score,
+        quality_ok,
     }))
 }
 
@@ -498,16 +673,46 @@ pub(crate) fn best_template_candidate_downscaled(
         y: 0,
         sad: max_sad.saturating_add(1),
     });
+    if !patch_contrast_ok(&haystack_gray, &matcher, found.x, found.y) {
+        log::trace!(
+            "模板「{}」降采样最优点 ({} , {}) 落在平坦画面，按透明模板防护拒绝",
+            template_path.display(),
+            found.x,
+            found.y
+        );
+        return Ok(None);
+    }
     let score = 1.0 - found.sad as f32 / max_sad as f32;
     let base_x = search_rect.map(|rect| rect.x).unwrap_or(0);
     let base_y = search_rect.map(|rect| rect.y).unwrap_or(0);
+    let hit_x = base_x + found.x as i32 * scale as i32;
+    let hit_y = base_y + found.y as i32 * scale as i32;
+    let hit_width = template.gray.width() * scale;
+    let hit_height = template.gray.height() * scale;
+    // 质量校验用全分辨率模板的 alpha：降采样模板只有 1/scale 的字形细节，
+    // 拿它当 mask 会把边缘算进背景。`cached_gray_template` 已经缓存，无额外解码。
+    let quality_ok = text_anchor_quality_ok_template(
+        image,
+        Rect::new(hit_x, hit_y, hit_width, hit_height),
+        template_path,
+    );
+    if !quality_ok {
+        log::trace!(
+            "模板「{}」降采样命中 ({}, {}) 但文字内容质量不足，标记为拒绝候选（分数 {:.3}）",
+            template_path.display(),
+            hit_x,
+            hit_y,
+            score,
+        );
+    }
     Ok(Some(TemplateHit {
         kind: "template".to_string(),
-        x: base_x + found.x as i32 * scale as i32,
-        y: base_y + found.y as i32 * scale as i32,
-        width: template.gray.width() * scale,
-        height: template.gray.height() * scale,
+        x: hit_x,
+        y: hit_y,
+        width: hit_width,
+        height: hit_height,
         score,
+        quality_ok,
     }))
 }
 
@@ -532,6 +737,8 @@ pub(crate) struct GrayMatcher<'a> {
     alpha: Option<&'a GrayImage>,
     alpha_sum: u64,
     opaque: Option<OpaqueRect>,
+    /// 透明模板的平坦画面防护；不透明/豁免模板为 None。
+    contrast: Option<ContrastBox>,
 }
 
 impl<'a> GrayMatcher<'a> {
@@ -549,6 +756,7 @@ impl<'a> GrayMatcher<'a> {
                 height: gray.height(),
                 gray_sum,
             }),
+            contrast: None,
         }
     }
 
@@ -562,6 +770,11 @@ impl<'a> GrayMatcher<'a> {
             },
             alpha_sum: template.alpha_sum,
             opaque: template.opaque,
+            contrast: if template.fully_opaque || !template.guard_flat {
+                None
+            } else {
+                template.contrast
+            },
         }
     }
 
@@ -569,6 +782,305 @@ impl<'a> GrayMatcher<'a> {
     pub(crate) fn alpha_sum(&self) -> u64 {
         self.alpha_sum
     }
+}
+
+/// 命中位置是否具备足够的画面结构。
+///
+/// 只对带 alpha 的模板生效；不透明模板保持原有语义。取模板 alpha 外接框内的
+/// 画面灰度标准差，纯色画面为 0，必然被拒绝。
+fn patch_contrast_ok(haystack: &GrayImage, matcher: &GrayMatcher<'_>, x: u32, y: u32) -> bool {
+    if matcher.alpha.is_none() {
+        return true;
+    }
+    let Some(contrast) = matcher.contrast else {
+        return true;
+    };
+    // 退化模板（1×1/2×2 的沙盒断言）没有结构可要求，保持原语义。
+    if contrast.width * contrast.height < 4 {
+        return true;
+    }
+    if x + contrast.width > haystack.width() || y + contrast.height > haystack.height() {
+        return false;
+    }
+    let stride = haystack.width() as usize;
+    let data = haystack.as_raw();
+    let (mut sum, mut sum_sq) = (0u64, 0u64);
+    for row in 0..contrast.height {
+        let offset = (y + row) as usize * stride + (x + contrast.x) as usize;
+        for column in 0..contrast.width {
+            let value = data[offset + column as usize] as u64;
+            sum += value;
+            sum_sq += value * value;
+        }
+    }
+    let count = (contrast.width * contrast.height) as f64;
+    let mean = sum as f64 / count;
+    let variance = (sum_sq as f64 / count - mean * mean).max(0.0);
+    let required = (contrast.stddev * FLAT_PATCH_STDDEV_RATIO).max(FLAT_PATCH_STDDEV_FLOOR);
+    variance.sqrt() as f32 >= required
+}
+
+/// 文字质量测量结果。std/edge 只用于排障日志，不参与判定。
+#[derive(Clone, Copy, Debug)]
+struct TextAnchorMetrics {
+    contrast: f32,
+    ink: f64,
+    stddev: f32,
+    edge: f32,
+}
+
+/// 文字内容模板的命中质量校验（极性无关）。
+///
+/// `image` 是整帧，`hit` 是匹配器给出的命中矩形（绝对坐标），`template` 是模板原图。
+/// 模板带 alpha 时 alpha > 0 即字形 mask；不透明模板用 patch 边框的中位灰度估计背景，
+/// 再把与背景差 ≥ [`TEXT_ANCHOR_INK_DELTA`] 的像素当作字形。
+///
+/// 判定只用 contrast/ink：`contrast >= 40` 且 `ink >= 0.5`。纯色 patch 的对比度为 0，
+/// 直接返回 false；std/edge 仅作为辅助信号记录，不设硬门槛。
+pub(crate) fn text_anchor_quality_ok(
+    image: &DynamicImage,
+    hit: Rect,
+    template: &DynamicImage,
+) -> bool {
+    let template_gray = template.to_luma8();
+    let rgba = template.to_rgba8();
+    let alpha = GrayImage::from_raw(
+        rgba.width(),
+        rgba.height(),
+        rgba.pixels().map(|pixel| pixel[3]).collect(),
+    )
+    .unwrap_or_else(|| GrayImage::new(rgba.width(), rgba.height()));
+    text_anchor_quality_ok_gray(image, hit, &template_gray, &alpha).is_some()
+}
+
+/// 已缓存模板的入口：调用方不必为每帧重新解码模板。
+fn text_anchor_quality_ok_template(
+    image: &DynamicImage,
+    hit: Rect,
+    template_path: &Path,
+) -> bool {
+    if !is_text_template(template_path) {
+        return true;
+    }
+    let Ok(template) = cached_gray_template(template_path) else {
+        return false;
+    };
+    text_anchor_quality_ok_gray(image, hit, &template.gray, &template.alpha).is_some()
+}
+
+fn text_anchor_quality_ok_gray(
+    image: &DynamicImage,
+    hit: Rect,
+    template_gray: &GrayImage,
+    template_alpha: &GrayImage,
+) -> Option<TextAnchorMetrics> {
+    let metrics = text_anchor_metrics(image, hit, template_gray, template_alpha)?;
+    if metrics.contrast < TEXT_ANCHOR_MIN_CONTRAST || metrics.ink < TEXT_ANCHOR_MIN_INK {
+        log::trace!(
+            "文字质量校验拒绝：命中 {}×{} @({}, {})，对比度 {:.1}（要求不低于 {:.0}），字形覆盖率 {:.2}（要求不低于 {:.2}），画面标准差 {:.1}，水平边缘 {:.1}",
+            hit.width,
+            hit.height,
+            hit.x,
+            hit.y,
+            metrics.contrast,
+            TEXT_ANCHOR_MIN_CONTRAST,
+            metrics.ink,
+            TEXT_ANCHOR_MIN_INK,
+            metrics.stddev,
+            metrics.edge,
+        );
+        return None;
+    }
+    Some(metrics)
+}
+
+fn text_anchor_metrics(
+    image: &DynamicImage,
+    hit: Rect,
+    template_gray: &GrayImage,
+    template_alpha: &GrayImage,
+) -> Option<TextAnchorMetrics> {
+    if hit.width == 0 || hit.height == 0 || hit.x < 0 || hit.y < 0 {
+        return None;
+    }
+    let patch = crop_canvas(image, hit).ok()?.to_luma8();
+    let (patch_width, patch_height) = patch.dimensions();
+    if patch_width == 0 || patch_height == 0 {
+        return None;
+    }
+    let patch_data = patch.as_raw();
+    let glyph_mask: Vec<bool> = if template_alpha.as_raw().iter().all(|alpha| *alpha == 255) {
+        // 不透明模板：用 patch 边框的中位灰度当背景，再按差值估字形。
+        let background = border_median_gray(&patch);
+        patch_data
+            .iter()
+            .map(|value| value.abs_diff(background) >= TEXT_ANCHOR_INK_DELTA)
+            .collect()
+    } else {
+        let resized = if template_alpha.dimensions() == (patch_width, patch_height) {
+            std::borrow::Cow::Borrowed(template_alpha)
+        } else {
+            std::borrow::Cow::Owned(image::imageops::resize(
+                template_alpha,
+                patch_width,
+                patch_height,
+                FilterType::Triangle,
+            ))
+        };
+        // 同尺寸时 alpha > 0 即字形；缩放后把滤波产生的极低值当透明，避免把
+        // 整块 patch 都算进前景。
+        let threshold = if resized.dimensions() == template_alpha.dimensions() {
+            0
+        } else {
+            16
+        };
+        resized
+            .as_raw()
+            .iter()
+            .map(|alpha| *alpha > threshold)
+            .collect()
+    };
+
+    let mut glyph_values = Vec::new();
+    for (index, is_glyph) in glyph_mask.iter().enumerate() {
+        if *is_glyph {
+            glyph_values.push(patch_data[index]);
+        }
+    }
+    if glyph_values.len() < 8 {
+        return None;
+    }
+    // 背景取**字形邻域**的非字形像素，而不是整块 hit 的中位数：
+    // 文字模板虽然已经裁到字形 bbox，框内仍有透明像素，命中 patch 也可能跨到
+    // 卡片/菜单底色；整块中位数会被这些非字形灰度带偏。
+    // 邻域半径 4px 足够覆盖抗锯齿边缘，又不会跨到别的按钮。
+    let background = if let Some(mut values) =
+        glyph_neighborhood_background(&patch, &glyph_mask, 4)
+    {
+        median_u8(&mut values)
+    } else {
+        border_median_gray(&patch)
+    };
+    let foreground = median_u8(&mut glyph_values);
+
+    let contrast = foreground.abs_diff(background) as f32;
+    let ink = glyph_mask
+        .iter()
+        .enumerate()
+        .filter(|(index, is_glyph)| {
+            **is_glyph && patch_data[*index].abs_diff(background) >= TEXT_ANCHOR_INK_DELTA
+        })
+        .count() as f64
+        / glyph_mask.iter().filter(|is_glyph| **is_glyph).count() as f64;
+
+    let (stddev, edge) = patch_gray_stddev_and_edge(&patch);
+    Some(TextAnchorMetrics {
+        contrast,
+        ink,
+        stddev,
+        edge,
+    })
+}
+
+/// 字形邻域内的非字形像素灰度（半径 `radius`），用于估计局部背景。
+///
+/// 用积分图统计每个像素周围是否有字形，复杂度 O(width×height)，避免逐像素扫描
+/// 半径窗口。没有邻域背景（例如字形铺满整块）时返回 `None`。
+fn glyph_neighborhood_background(
+    patch: &GrayImage,
+    glyph_mask: &[bool],
+    radius: u32,
+) -> Option<Vec<u8>> {
+    let (width, height) = patch.dimensions();
+    let stride = width as usize + 1;
+    let mut integral = vec![0u32; stride * (height as usize + 1)];
+    for y in 0..height as usize {
+        let mut row_sum = 0u32;
+        for x in 0..width as usize {
+            row_sum += u32::from(glyph_mask[y * width as usize + x]);
+            integral[(y + 1) * stride + x + 1] = integral[y * stride + x + 1] + row_sum;
+        }
+    }
+    let box_sum = |x0: usize, y0: usize, x1: usize, y1: usize| -> u32 {
+        integral[y1 * stride + x1]
+            + integral[y0 * stride + x0]
+            - integral[y0 * stride + x1]
+            - integral[y1 * stride + x0]
+    };
+    let mut values = Vec::new();
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            if glyph_mask[y * width as usize + x] {
+                continue;
+            }
+            let x0 = x.saturating_sub(radius as usize);
+            let y0 = y.saturating_sub(radius as usize);
+            let x1 = (x + radius as usize + 1).min(width as usize);
+            let y1 = (y + radius as usize + 1).min(height as usize);
+            if box_sum(x0, y0, x1, y1) > 0 {
+                values.push(patch.as_raw()[y * width as usize + x]);
+            }
+        }
+    }
+    (!values.is_empty()).then_some(values)
+}
+
+fn median_u8(values: &mut [u8]) -> u8 {
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+fn border_median_gray(patch: &GrayImage) -> u8 {
+    let (width, height) = patch.dimensions();
+    let data = patch.as_raw();
+    let mut border = Vec::with_capacity((width as usize + height as usize) * 2);
+    for x in 0..width as usize {
+        border.push(data[x]);
+        border.push(data[(height as usize - 1) * width as usize + x]);
+    }
+    for y in 1..height as usize - 1 {
+        border.push(data[y * width as usize]);
+        border.push(data[y * width as usize + width as usize - 1]);
+    }
+    if border.is_empty() {
+        return 0;
+    }
+    median_u8(&mut border)
+}
+
+fn patch_gray_stddev_and_edge(patch: &GrayImage) -> (f32, f32) {
+    let data = patch.as_raw();
+    if data.is_empty() {
+        return (0.0, 0.0);
+    }
+    let count = data.len() as f64;
+    let mean = data.iter().map(|value| *value as f64).sum::<f64>() / count;
+    let variance = data
+        .iter()
+        .map(|value| {
+            let delta = *value as f64 - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / count;
+    let width = patch.width() as usize;
+    let height = patch.height() as usize;
+    let mut edge_sum = 0u64;
+    let mut edge_count = 0u64;
+    if width > 1 {
+        for y in 0..height {
+            for x in 0..width - 1 {
+                edge_sum += data[y * width + x].abs_diff(data[y * width + x + 1]) as u64;
+                edge_count += 1;
+            }
+        }
+    }
+    let edge = if edge_count == 0 {
+        0.0
+    } else {
+        edge_sum as f32 / edge_count as f32
+    };
+    (variance.sqrt() as f32, edge)
 }
 
 /// 一次匹配的最优位置。
@@ -1165,7 +1677,9 @@ fn gray_match_exists(haystack: &GrayImage, matcher: &GrayMatcher<'_>, threshold:
     };
     if let Some((x, y)) = gpu_best_position(haystack, matcher) {
         // GPU is only a hint. A rejected hint (or unavailable GPU) still scans CPU.
-        if sad_at(haystack, matcher, x, y, limit) <= limit {
+        if sad_at(haystack, matcher, x, y, limit) <= limit
+            && patch_contrast_ok(haystack, matcher, x, y)
+        {
             return true;
         }
     }
@@ -1196,7 +1710,9 @@ fn gray_match_exists(haystack: &GrayImage, matcher: &GrayMatcher<'_>, threshold:
                     continue;
                 }
             }
-            if sad_at(haystack, matcher, x, y, limit) <= limit {
+            if sad_at(haystack, matcher, x, y, limit) <= limit
+                && patch_contrast_ok(haystack, matcher, x, y)
+            {
                 return true;
             }
         }
@@ -1227,7 +1743,7 @@ fn gray_hits_in_gray(
         for x in 0..=(haystack.width() - matcher.gray.width()) {
             let sad = sad_at(haystack, matcher, x, y, max_allowed_sad);
             let score = 1.0 - sad as f32 / max_sad as f32;
-            if score >= threshold {
+            if score >= threshold && patch_contrast_ok(haystack, matcher, x, y) {
                 hits.push(TemplateHit {
                     kind: "template".to_string(),
                     x: base.0 + x as i32,
@@ -1235,6 +1751,7 @@ fn gray_hits_in_gray(
                     width: matcher.gray.width(),
                     height: matcher.gray.height(),
                     score,
+                    quality_ok: true,
                 });
             }
         }
@@ -2227,7 +2744,7 @@ fn main_sad(@builtin(global_invocation_id) gid: vec3<u32>) {
         let template = cached_gray_template(
             &templates
                 .iter()
-                .find(|path| path.file_name().is_some_and(|n| n == "friend-confirm.png"))
+                .find(|path| path.file_name().is_some_and(|n| n == "confirm-button.png"))
                 .cloned()
                 .unwrap_or_else(|| templates[0].clone()),
         )
@@ -2476,7 +2993,7 @@ fn main_sad(@builtin(global_invocation_id) gid: vec3<u32>) {
         for wanted in [
             "chat-marker-blue.png",
             "friend-panel.png",
-            "friend-confirm.png",
+            "confirm-button.png",
             "friend-blacklist.png",
         ] {
             let Some(path) = templates
@@ -2832,6 +3349,411 @@ fn main_sad(@builtin(global_invocation_id) gid: vec3<u32>) {
             image.width(),
             image.height(),
         )
+    }
+
+    /// 模板资产回归：去掉背景的模板必须真的有 alpha；文字模板必须裁到字形 bbox。
+    ///
+    /// 例外只有一类：模板本身就是色块/内容信号（聊天标记、world-wish、地图星）。
+    /// 图标模板仍按生产写死的尺寸做固定断言；文字模板的 canvas 由
+    /// `scripts/pure-text-templates.py` 裁到「字形 bbox + 2px 透明 padding」，
+    /// 搜索区已同步平移到新的模板原点。
+    #[test]
+    fn ui_template_assets_use_transparency_and_tight_crop() {
+        let dir = Path::new("assets");
+        let signal_templates = [
+            "chat-marker-blue.png",
+            "chat-marker-pink.png",
+            "chat-marker-yellow.png",
+            "world-wish.png",
+            "startup-wonderland-map-star.png",
+            "startup-paimon-menu.png",
+        ];
+        // 图标/信号模板仍由生产代码按这些宽高写死搜索区/偏移，尺寸不能改。
+        // 文字模板不在此列：它们的 canvas 就是字形 bbox + padding，搜索区按
+        // 「旧命中左上角 + 裁剪原点」平移，不再依赖固定 canvas 尺寸。
+        let fixed_dimensions = [("qianxing-map-label.png", 296u32, 68u32)];
+        let mut checked = 0usize;
+        for path in fixture_paths(dir) {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let image = image::open(&path).unwrap_or_else(|e| panic!("打不开 {}: {e}", path.display()));
+            for (fixed_name, width, height) in fixed_dimensions {
+                if name == fixed_name {
+                    assert_eq!(
+                        (image.width(), image.height()),
+                        (width, height),
+                        "模板 {name} 的尺寸被改了，必须同步搜索区/偏移或恢复原尺寸"
+                    );
+                }
+            }
+            if signal_templates.contains(&name.as_str()) {
+                continue;
+            }
+            let rgba = image.to_rgba8();
+            let total = (rgba.width() * rgba.height()) as f64;
+            let transparent = rgba.pixels().filter(|pixel| pixel[3] == 0).count() as f64 / total;
+            let opaque = rgba.pixels().filter(|pixel| pixel[3] == 255).count() as f64 / total;
+            assert!(
+                transparent >= 0.10,
+                "模板 {name} 只有 {:.1}% 透明像素：多余背景没有去掉",
+                transparent * 100.0
+            );
+            // 纯文字模板裁到 bbox 后不透明像素占比高（约 8–28%），但为兼容
+            // 早期未裁剪资产仍用更低的 0.2% 门槛：只要字形没有被误删即可。
+            let min_opaque = if is_text_template(&path) { 0.002 } else { 0.01 };
+            assert!(
+                opaque >= min_opaque,
+                "模板 {name} 只剩 {:.2}% 不透明像素：内容被误删",
+                opaque * 100.0
+            );
+            if is_text_template(&path) {
+                // 裁到字形 bbox：四边只剩小 padding。默认 2px；4× 下采样模板为了
+                // 让 canvas 宽高是倍数的整数倍（避免 floor 缩放误差）最多留 7px，
+                // 这也是“没有大片透明边”的上限。原图就贴边的模板该侧可以是 0。
+                let (width, height) = rgba.dimensions();
+                let (mut min_x, mut min_y, mut max_x, mut max_y) =
+                    (u32::MAX, u32::MAX, 0u32, 0u32);
+                for (x, y, pixel) in rgba.enumerate_pixels() {
+                    if pixel[3] == 0 {
+                        continue;
+                    }
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+                assert!(
+                    min_x <= 8 && min_y <= 8,
+                    "模板 {name} 左上留白 ({min_x},{min_y}) 超过 8px：没有裁到字形 bbox"
+                );
+                assert!(
+                    width - 1 - max_x <= 8 && height - 1 - max_y <= 8,
+                    "模板 {name} 右下留白 ({}, {}) 超过 8px：没有裁到字形 bbox",
+                    width - 1 - max_x,
+                    height - 1 - max_y
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 20, "只检查了 {checked} 张模板，assets 目录不完整");
+    }
+
+    /// 透明模板不能在纯色画面上拿高分。
+    ///
+    /// 透明化去掉对比底色后，只剩白字/白图标的模板在纯色区域上按 alpha 归一化 SAD
+    /// 会接近 0；`patch_contrast_ok` 必须把这些命中挡掉。用模板自身的加权平均灰度
+    /// 构造纯色帧（也就是最容易误命中它的那个颜色），阈值取比生产更低的 0.90。
+    #[test]
+    fn transparent_templates_reject_flat_backgrounds() {
+        let mut checked = 0usize;
+        for path in fixture_paths(Path::new("assets")) {
+            let rgba = image::open(&path)
+                .unwrap_or_else(|e| panic!("打不开 {}: {e}", path.display()))
+                .to_rgba8();
+            if rgba.pixels().all(|pixel| pixel[3] == 255) {
+                continue; // 不透明模板不在本次防护范围
+            }
+            let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            if matches!(file_name, "world-wish.png" | "startup-wonderland-map-star.png") {
+                continue; // 既有的透明信号图，本轮明确不改其行为
+            }
+            let (mut weighted, mut weight) = (0.0f64, 0.0f64);
+            for pixel in rgba.pixels() {
+                let luma = 0.299 * pixel[0] as f64 + 0.587 * pixel[1] as f64 + 0.114 * pixel[2] as f64;
+                let alpha = pixel[3] as f64 / 255.0;
+                weighted += luma * alpha;
+                weight += alpha;
+            }
+            if weight == 0.0 {
+                continue;
+            }
+            let mean = (weighted / weight).round().clamp(0.0, 255.0) as u8;
+            let (width, height) = rgba.dimensions();
+            let solid = RgbImage::from_pixel(width + 16, height + 16, Rgb([mean, mean, mean]));
+            let hit = best_template_hit(&DynamicImage::ImageRgb8(solid), None, &path, 0.90)
+                .unwrap_or_else(|e| panic!("匹配 {} 失败: {e}", path.display()));
+            assert!(
+                hit.is_none(),
+                "模板 {} 在纯色 {} 上仍命中：{:?}",
+                path.display(),
+                mean,
+                hit.map(|hit| (hit.x, hit.y, hit.score))
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20, "只检查了 {checked} 张透明模板");
+    }
+
+    /// 造一张“文字模板 + 对应画面”的合成夹具：白底深字或暗底亮字。
+    fn text_quality_fixture(
+        glyph_value: u8,
+        background_value: u8,
+        horizontal_glyphs: bool,
+    ) -> (DynamicImage, DynamicImage, Rect) {
+        let (width, height) = (40u32, 20u32);
+        let mut template = RgbaImage::from_pixel(width, height, Rgba([glyph_value; 4]));
+        for y in 0..height {
+            for x in 0..width {
+                // 透明背景不参与 SAD；字形是几条粗笔画。
+                let glyph = if horizontal_glyphs {
+                    (4..36).contains(&x) && (y / 4) % 2 == 0
+                } else {
+                    (4..16).contains(&y) && (x / 5) % 2 == 0
+                };
+                if glyph {
+                    template.put_pixel(x, y, Rgba([glyph_value, glyph_value, glyph_value, 255]));
+                } else {
+                    template.put_pixel(x, y, Rgba([glyph_value, glyph_value, glyph_value, 0]));
+                }
+            }
+        }
+        let mut patch = RgbImage::from_pixel(80, 50, Rgb([background_value; 3]));
+        for y in 0..height {
+            for x in 0..width {
+                let alpha = template.get_pixel(x, y)[3];
+                if alpha == 0 {
+                    continue;
+                }
+                patch.put_pixel(20 + x, 15 + y, Rgb([glyph_value; 3]));
+            }
+        }
+        (
+            DynamicImage::ImageRgba8(template),
+            DynamicImage::ImageRgb8(patch),
+            Rect::new(20, 15, width, height),
+        )
+    }
+
+    #[test]
+    fn text_anchor_quality_accepts_dark_and_light_text() {
+        // 深色字 / 亮底。
+        let (template, patch, hit) = text_quality_fixture(40, 230, false);
+        assert!(
+            text_anchor_quality_ok(&patch, hit, &template),
+            "深色字应通过文字质量校验"
+        );
+        // 浅色字 / 暗底：极性无关。
+        let (template, patch, hit) = text_quality_fixture(230, 40, false);
+        assert!(
+            text_anchor_quality_ok(&patch, hit, &template),
+            "浅色字应通过文字质量校验"
+        );
+    }
+
+    #[test]
+    fn text_anchor_quality_supports_opaque_template() {
+        // 不透明模板没有 alpha 字形 mask：用 patch 边框的中位背景估计字形。
+        let mut template = RgbImage::from_pixel(40, 20, Rgb([230; 3]));
+        for y in 4..16 {
+            for x in 0..40 {
+                if (x / 5) % 2 == 0 {
+                    template.put_pixel(x, y, Rgb([40; 3]));
+                }
+            }
+        }
+        let mut patch = RgbImage::from_pixel(80, 50, Rgb([230; 3]));
+        for y in 4..16 {
+            for x in 0..40 {
+                if (x / 5) % 2 == 0 {
+                    patch.put_pixel(20 + x, 15 + y, Rgb([40; 3]));
+                }
+            }
+        }
+        assert!(text_anchor_quality_ok(
+            &DynamicImage::ImageRgb8(patch),
+            Rect::new(20, 15, 40, 20),
+            &DynamicImage::ImageRgb8(template)
+        ));
+    }
+
+    #[test]
+    fn text_template_registry_covers_text_assets_only() {
+        for name in [
+            "ui-main-menu-return.png",
+            "invite-enter-hall.png",
+            "invite-goto-hall.png",
+            "invite-view-star.png",
+            "invite-view-profile.png",
+            "teyvat-profile-add-friend.png",
+            "friend-block-chat.png",
+            "friend-blacklist.png",
+            "confirm-button.png",
+            "friend-search-panel.png",
+            "qianxing-f2-hall-list.png",
+            "qianxing-f2-invite-player.png",
+            "qianxing-exit-menu.png",
+            "qianxing-profile-page-wishlist.png",
+            "qianxing-profile-page-wardrobe.png",
+        ] {
+            assert!(is_text_template(Path::new("assets").join(name).as_path()));
+        }
+        for name in [
+            "ui-secondary-back.png",
+            "ui-secondary-hall.png",
+            "ui-secondary-chat-submit.png",
+            "friend-panel.png",
+            "chat-marker-blue.png",
+            "qianxing-map-label.png",
+        ] {
+            assert!(!is_text_template(Path::new("assets").join(name).as_path()));
+        }
+    }
+
+    #[test]
+    fn text_anchor_quality_rejects_flat_patch() {
+        let (template, _, hit) = text_quality_fixture(40, 230, false);
+        let flat = DynamicImage::ImageRgb8(RgbImage::from_pixel(80, 50, Rgb([160; 3])));
+        assert!(
+            !text_anchor_quality_ok(&flat, hit, &template),
+            "纯色 patch 的 contrast 为 0，必须拒绝"
+        );
+    }
+
+    #[test]
+    fn text_anchor_quality_rejects_wrong_text_via_match_score() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-text-quality-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create temp dir");
+        // 文件名命中文字模板清单，确保走生产匹配 + 质量校验路径。
+        let path = directory.join("invite-goto-hall.png");
+        let (template, _, _) = text_quality_fixture(40, 230, false);
+        template.save(&path).expect("save template");
+
+        // 错误文字：同样的对比度/ink，但笔画方向完全不同，分数必须低于阈值。
+        let (_, correct_patch, _) = text_quality_fixture(40, 230, false);
+        let (_, wrong_patch, _) = text_quality_fixture(40, 230, true);
+        // `wrong_patch` 是横笔画；用竖笔画模板去匹配它。
+        let wrong_hit = best_template_hit(&wrong_patch, None, &path, 0.95)
+            .expect("match wrong text")
+            .is_none();
+        // 正确文字仍然命中。
+        let correct_hit = best_template_hit(&correct_patch, None, &path, 0.95)
+            .expect("match correct text")
+            .expect("correct text should hit");
+        assert!(wrong_hit, "方向不同的错误文字必须被分数拒绝");
+        assert!(correct_hit.score >= 0.99);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// 模板 × 真实帧的逐条打分导出（人工审计用，默认忽略）。
+    ///
+    /// 输入 TSV（制表符分隔，首行 `#` 注释）：
+    /// `模板路径 帧路径 x y w h 降采样 阈值 期望命中(1|0) 说明`。
+    /// 每条都用生产同一条 `best_template_candidate_downscaled`；`w/h = 0` 时整帧匹配。
+    /// 期望命中为 1 的条目必须 ≥ 阈值，为 0 的必须 < 阈值，否则测试失败。
+    /// 与画廊导出同一思路：只读真实帧、只调用生产匹配路径，不写死任何分数。
+    #[test]
+    #[ignore = "模板审计打分导出：需要 MILIASTRA_TEMPLATE_AUDIT / MILIASTRA_TEMPLATE_AUDIT_OUT"]
+    fn dump_template_audit_scores() {
+        let Ok(list_path) = std::env::var("MILIASTRA_TEMPLATE_AUDIT") else {
+            return;
+        };
+        let out_path =
+            std::env::var("MILIASTRA_TEMPLATE_AUDIT_OUT").expect("MILIASTRA_TEMPLATE_AUDIT_OUT");
+        let list = std::fs::read_to_string(&list_path)
+            .unwrap_or_else(|error| panic!("读不到 {list_path}: {error}"));
+        let mut output = String::new();
+        let mut failures = Vec::new();
+        let mut count = 0_usize;
+        for (line_number, line) in list.lines().enumerate() {
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let columns: Vec<&str> = line.split('\t').collect();
+            assert_eq!(
+                columns.len(),
+                10,
+                "模板审计清单第 {} 行列数不是 10: {line:?}",
+                line_number + 1
+            );
+            let template = columns[0];
+            let frame = columns[1];
+            let (x, y, w, h): (i32, i32, u32, u32) = (
+                columns[2].parse().expect("x"),
+                columns[3].parse().expect("y"),
+                columns[4].parse().expect("w"),
+                columns[5].parse().expect("h"),
+            );
+            let scale: u32 = columns[6].parse().expect("scale");
+            let threshold: f32 = columns[7].parse().expect("threshold");
+            let expect_hit = columns[8] == "1";
+            let note = columns[9];
+            let source = image::open(frame).unwrap_or_else(|error| panic!("打不开 {frame}: {error}"));
+            // 与生产/Gallery 一致：非 1920×1080 的帧先按 Triangle 缩放到规范画布。
+            let source = if source.width() == 1920 && source.height() == 1080 {
+                source
+            } else {
+                source.resize_exact(1920, 1080, FilterType::Triangle)
+            };
+            let region = if w == 0 || h == 0 {
+                None
+            } else {
+                Some(Rect::new(x, y, w, h))
+            };
+            let hit = best_template_candidate_downscaled(&source, region, Path::new(template), scale)
+                .unwrap_or_else(|error| panic!("匹配 {template} × {frame} 失败: {error}"));
+            let score = hit.as_ref().map(|hit| hit.score);
+            let quality_ok = hit.as_ref().is_some_and(|hit| hit.quality_ok);
+            // 命中几何用于校准搜索区：裁剪模板后原点会平移，必须按真实命中位置
+            // 算出新区域的期望左上角，不能只把旧区域宽高改小。
+            let hit_rect = hit.as_ref().map(|hit| {
+                serde_json::json!({
+                    "x": hit.x,
+                    "y": hit.y,
+                    "width": hit.width,
+                    "height": hit.height,
+                })
+            });
+            // 负样本“无候选”也算通过（平坦画面防护会直接拒绝，不返回分数）；
+            // 文字模板的候选即使分数过阈值，只要 quality_ok=false 也按不命中处理。
+            let passed = match (hit, expect_hit) {
+                (Some(hit), true) => hit.quality_ok && hit.score >= threshold,
+                (Some(hit), false) => !hit.quality_ok || hit.score < threshold,
+                (None, false) => true,
+                (None, true) => false,
+            };
+            if !passed {
+                failures.push(format!(
+                    "{template} × {frame} ({note}) 期望{} 阈值 {threshold:.3} 实际 {}（quality_ok={quality_ok}）",
+                    if expect_hit { "命中" } else { "不命中" },
+                    score.map(|score| format!("{score:.4}")).unwrap_or_else(|| "无候选".into()),
+                ));
+            }
+            output.push_str(
+                &serde_json::json!({
+                    "template": template,
+                    "frame": frame,
+                    "region": {"x": x, "y": y, "width": w, "height": h},
+                    "downscale": scale,
+                    "threshold": threshold,
+                    "expect_hit": expect_hit,
+                    "score": score,
+                    "quality_ok": quality_ok,
+                    "hit": hit_rect,
+                    "pass": passed,
+                    "note": note,
+                })
+                .to_string(),
+            );
+            output.push('\n');
+            count += 1;
+        }
+        std::fs::write(&out_path, output)
+            .unwrap_or_else(|error| panic!("写不到 {out_path}: {error}"));
+        println!("模板审计：{count} 条，失败 {} 条 -> {out_path}", failures.len());
+        for failure in &failures {
+            println!("  失败: {failure}");
+        }
+        assert!(failures.is_empty(), "模板审计存在未达预期条目");
     }
 
     /// 旧生产路径：crate 自由函数，每次调用都新建 wgpu 设备。

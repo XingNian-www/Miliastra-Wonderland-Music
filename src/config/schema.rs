@@ -826,6 +826,12 @@ fn screen_section() -> Vec<ConfigFieldSchema> {
             "二级大厅/面板界面模板检测区域",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "secondary_chat_submit_rect",
+            "二级聊天发送按钮区域",
+            FieldKind::Rect,
+            "二级聊天输入行「发送」圆钮的搜索区；与返回按钮一起判二级聊天",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "main_menu_rect",
             "奇域主菜单区域",
             FieldKind::Rect,
@@ -838,16 +844,16 @@ fn screen_section() -> Vec<ConfigFieldSchema> {
             "千星大厅底栏 👥 O 图标组的搜索区；提瓦特底栏没有这一组，用来把提瓦特的世界聊天气泡与千星聊天标记区分开",
         ),
         ConfigFieldSchema::db_idle_reload(
+            "qianxing_f2_invite_rect",
+            "F2 邀请玩家按钮区域",
+            FieldKind::Rect,
+            "F2 千星大厅页右下「邀请玩家」按钮的搜索区；左侧「大厅列表」锚点复用 hall_bar_rect",
+        ),
+        ConfigFieldSchema::db_idle_reload(
             "world_wish_rect",
             "主世界祈愿区域",
             FieldKind::Rect,
             "主世界右上角祈愿图标搜索区域，覆盖图标栏以适应横向位置变化；仅持续未知时探测",
-        ),
-        ConfigFieldSchema::db_idle_reload(
-            "paimon_menu_rect",
-            "派蒙菜单区域",
-            FieldKind::Rect,
-            "提瓦特派蒙菜单（ESC 系统菜单）「商城」袋状图标本体的搜索区；与二级聊天共用圆形返回按钮，靠它把派蒙菜单摘出来",
         ),
         ConfigFieldSchema::db_idle_reload(
             "hall_name_rect",
@@ -1123,12 +1129,6 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
             "粉色聊天标志模板，用于识别好友私聊命令",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "friend",
-            "好友按钮模板",
-            FieldKind::Path,
-            "一级聊天界面的好友按钮模板",
-        ),
-        ConfigFieldSchema::db_idle_reload(
             "secondary_back",
             "二级返回按钮模板",
             FieldKind::Path,
@@ -1139,6 +1139,84 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
             "二级大厅模板",
             FieldKind::Path,
             "二级大厅/面板界面模板",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "secondary_chat_submit",
+            "二级聊天发送按钮模板",
+            FieldKind::Path,
+            "二级聊天输入行「发送」圆钮；用来挡掉只有返回按钮的主菜单过渡帧",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "qianxing_f2_hall_list",
+            "F2 大厅列表按钮模板",
+            FieldKind::Path,
+            "F2 千星大厅页左下「大厅列表」按钮（图标+文字）",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "qianxing_f2_invite_player",
+            "F2 邀请玩家按钮模板",
+            FieldKind::Path,
+            "F2 千星大厅页右下「邀请玩家」按钮（图标+文字）",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "qianxing_exit_menu",
+            "千星退出菜单锚点",
+            FieldKind::Path,
+            "继续游戏/退出登录/退出桌面",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "qianxing_map_label",
+            "千星地图右下角锚点",
+            FieldKind::Path,
+            "右下角「千星奇域·大厅」文字 + 庙宇图标（不含 UID 与背景），千星地图首选判据",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "qianxing_profile_page_wishlist",
+            "个人资料页「心愿单」按钮模板",
+            FieldKind::Path,
+            "个人资料页右下角「心愿单」圆角按钮；必须与「衣橱」同时命中才判个人资料页",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "qianxing_profile_page_wardrobe",
+            "个人资料页「衣橱」按钮模板",
+            FieldKind::Path,
+            "个人资料页右下角「衣橱」圆角按钮；与「心愿单」成对判据，单命中不成立",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "teyvat_profile_adventure_rank",
+            "提瓦特资料卡「冒险等阶」锚点",
+            FieldKind::Path,
+            "提瓦特资料卡左页「冒险等阶」纯文字模板；与「世界等级」同时命中才判提瓦特资料卡",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "teyvat_profile_world_level",
+            "提瓦特资料卡「世界等级」锚点",
+            FieldKind::Path,
+            "提瓦特资料卡左页「世界等级」纯文字模板；与「冒险等阶」成对判据",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "teyvat_profile_add_friend",
+            "提瓦特资料卡「添加好友」锚点",
+            FieldKind::Path,
+            "提瓦特资料卡右下角深色「添加好友」按钮；命中=非好友，未命中=好友",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "qianxing_profile_domain_level",
+            "千星资料卡「奇域等级」锚点",
+            FieldKind::Path,
+            "千星资料卡上部「奇域等级」纯文字模板；命中即千星资料卡",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "qianxing_profile_add_friend",
+            "千星资料卡「添加好友」锚点",
+            FieldKind::Path,
+            "千星资料卡下部白色胶囊「添加好友」；命中=非好友",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "qianxing_profile_view_profile",
+            "千星资料卡「查看资料」锚点",
+            FieldKind::Path,
+            "千星资料卡下部白色胶囊「查看资料」；无「添加好友」但命中它=好友",
         ),
         ConfigFieldSchema::db_idle_reload(
             "main_menu",
@@ -1201,16 +1279,28 @@ fn templates_section() -> Vec<ConfigFieldSchema> {
             "更多设置里的拉黑按钮模板",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "friend_confirm",
+            "confirm_button",
             "确认按钮模板",
             FieldKind::Path,
-            "拉黑/屏蔽弹窗里的确认按钮模板",
+            "通用「确认」按钮模板；好友操作与启动流程共用",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "paimon_menu_panel",
-            "派蒙菜单锚点模板",
+            "confirm_message_random_hall",
+            "进入大厅文案模板",
             FieldKind::Path,
-            "派蒙菜单（ESC 系统菜单）专属锚点模板：「商城」袋状图标本体",
+            "确认弹窗「随机公共大厅」关键词模板；确认弹窗必须按钮+文案双命中",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "confirm_message_return_teyvat",
+            "离开大厅文案模板",
+            FieldKind::Path,
+            "确认弹窗「返回提瓦特」关键词模板",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "confirm_message_block",
+            "屏蔽玩家文案模板",
+            FieldKind::Path,
+            "确认弹窗「屏蔽吗」关键词模板",
         ),
         ConfigFieldSchema::db_idle_reload(
             "marker_threshold",
@@ -1352,10 +1442,16 @@ fn moderation_section() -> Vec<ConfigFieldSchema> {
             "拉黑按钮模板搜索区域",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "confirm_region",
+            "confirm_button_region",
             "确认按钮区域",
             FieldKind::Rect,
-            "拉黑/屏蔽弹窗确认按钮模板搜索区域",
+            "通用「确认」按钮模板搜索区域",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "confirm_message_region",
+            "确认弹窗文案区域",
+            FieldKind::Rect,
+            "确认弹窗提示文案行搜索区域；确认按钮与关键词文案必须同时命中",
         ),
     ]
 }
@@ -2159,7 +2255,7 @@ fn startup_section() -> Vec<ConfigFieldSchema> {
             "final_primary_timeout_ms",
             "主界面等待超时",
             int(1, MAX_TIMEOUT_MS),
-            "启动游戏结束时等待派蒙菜单模板的最长时间，单位毫秒",
+            "启动游戏结束时等待主菜单大世界模板的最长时间，单位毫秒",
         ),
         ConfigFieldSchema::db_idle_reload(
             "poll_ms",
@@ -2183,7 +2279,7 @@ fn startup_section() -> Vec<ConfigFieldSchema> {
             "template_threshold",
             "模板匹配阈值",
             float(0.0, 1.0),
-            "启动界面模板匹配阈值（例如派蒙菜单）；越高越严格",
+            "启动界面模板匹配阈值（例如主菜单大世界）；越高越严格",
         ),
         ConfigFieldSchema::db_idle_reload(
             "wonderland_confirm_threshold",
@@ -2198,16 +2294,10 @@ fn startup_section() -> Vec<ConfigFieldSchema> {
             "地图右下角星型入口模板（相对 EXE 根目录）",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "templates.wonderland_confirm",
-            "千星确认模板",
-            FieldKind::Path,
-            "千星弹窗“确认”按钮模板（相对 EXE 根目录）",
-        ),
-        ConfigFieldSchema::db_idle_reload(
             "templates.paimon_menu",
-            "派蒙菜单模板",
+            "主菜单大世界模板",
             FieldKind::Path,
-            "派蒙菜单模板；启动游戏完成判断使用（相对 EXE 根目录）",
+            "主菜单大世界模板；启动游戏完成判断使用（相对 EXE 根目录）",
         ),
         ConfigFieldSchema::db_idle_reload(
             "enter_game_text_region",
@@ -2222,16 +2312,10 @@ fn startup_section() -> Vec<ConfigFieldSchema> {
             "右侧千星大厅选项 OCR 区域",
         ),
         ConfigFieldSchema::db_idle_reload(
-            "wonderland_confirm_region",
-            "千星确认区域",
-            FieldKind::Rect,
-            "千星确认按钮模板区域",
-        ),
-        ConfigFieldSchema::db_idle_reload(
             "main_ui_region",
             "主界面区域",
             FieldKind::Rect,
-            "派蒙菜单/主界面模板区域",
+            "主菜单大世界/主界面模板区域",
         ),
         ConfigFieldSchema::db_idle_reload(
             "wonderland_map_star_region",
@@ -2777,7 +2861,7 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "actor_token_budget",
             "单人近期原文预算",
             int(1_000, 200_000),
-            "每个玩家的近期问答原文 token 上限；超出部分压缩进中期摘要",
+            "每个玩家的近期问答原文 token 上限；超过 82% 时把较早原文压进中期摘要（压到 15%），历史只追加不滑动",
         ),
         ConfigFieldSchema::db_live(
             "actor_summary_budget",
@@ -2849,7 +2933,7 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "answer_prompt",
             "回答模板",
             FieldKind::Text,
-            "可使用 {{keyword}}、{{question}}、{{facts}}、{{bot_history}}、{{commands}}；玩家历史按独立角色消息传输，{{history}} 仅作兼容占位",
+            "可使用 {{keyword}}、{{facts}}、{{summary}}、{{hall}}、{{bot_history}}、{{asker}}；玩家历史按独立角色消息传输（{{history}} 仅作兼容占位）。{{question}}、{{recent_actions}}、{{commands}} 由程序统一追加到末尾，模板里写不写都不会重复",
         ),
         ConfigFieldSchema::db_live(
             "extract_prompt",

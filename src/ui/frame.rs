@@ -181,6 +181,7 @@ mod tests {
             width: 20,
             height: 10,
             score: 0.98,
+            quality_ok: true,
         };
         let mut classification = UiStateClassification::with_evidence(
             UiStateKind::Primary,
@@ -251,6 +252,7 @@ mod tests {
                         width: 20,
                         height: 10,
                         score: 0.98,
+                        quality_ok: true,
                     }],
                 )),
                 "primary_chat_markers",

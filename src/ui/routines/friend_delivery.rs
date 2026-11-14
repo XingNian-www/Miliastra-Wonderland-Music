@@ -4,7 +4,7 @@ use miliastra_kernel::clock::{Clock, SystemClock};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use enigo::Key;
 use image::{DynamicImage, GenericImageView};
@@ -24,36 +24,18 @@ use crate::runtime::ui::{
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::locator::secondary_hall_search_rect;
-use crate::ui::template::best_template_hit;
 
 use super::state_observation::{
-    UiStateObservationConfig, UiStateSnapshot, capture_normalized_ui_state, observe_ui_state_once,
-    wait_for_stable_ui_kind, wait_for_stable_ui_kind_or_unknown,
+    UiStateObservationConfig, capture_normalized_ui_state, observe_ui_state_once,
+    wait_for_stable_ui_kind,
 };
+use super::residency::{ConversationRef, ResidencyTarget, SettleEnvironment};
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 
 const FRIEND_ROW_Y_TOLERANCE: i32 = 6;
 const MAX_FRIEND_LIST_DRAGS: usize = 2;
 const FRIEND_AVATAR_TEXT_OFFSET_X: i32 = 40;
 const FRIEND_DRAG_MAX_EDGE_INSET: i32 = 50;
-const PRIMARY_STABILITY_POLL_MS: u64 = 100;
-const PRIMARY_STABILITY_TIMEOUT_MS: u64 = 1_000;
-/// 状态驱动恢复：单次恢复最多按 Esc 的次数（超过即失败，不再继续试探）。
-const RECOVERY_MAX_ESC: u32 = 3;
-/// 无进展熔断：动作后连续两次观察到同一 (kind,label)，判定为没有进展。
-const RECOVERY_NO_PROGRESS_LIMIT: u32 = 2;
-/// 恢复循环的最大采样步数（防止异常状态机空转）。
-const RECOVERY_MAX_STEPS: u32 = 24;
-/// 诊断历史保留条数（失败原因里附带，便于现场回放）。
-const RECOVERY_HISTORY_LIMIT: usize = 12;
-/// 连续 Unknown 至少采样这么多次、且持续这么久，才允许判定"无证据"。
-const RECOVERY_UNKNOWN_MIN_SAMPLES: u32 = 3;
-const RECOVERY_UNKNOWN_WINDOW_MS: u64 = 600;
-/// Panel 必须连续确认这么多次（仍是 Panel）才允许按 Esc。
-const RECOVERY_PANEL_CONFIRM_SAMPLES: u32 = 2;
-/// Primary↔MainMenu 振荡：连续来回这么多次即熔断。
-const RECOVERY_OSCILLATION_LIMIT: u32 = 2;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UiResidencyTarget {
     Primary,
@@ -321,7 +303,8 @@ impl UiRoutine for EstablishResidencyRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let target = self.request.target;
         // 它本身就是恢复器：包装器不导航、不重复收尾（AssumeTarget + KeepCurrent）。
-        let spec = UiTaskSpec::new(target, FinishPolicy::KeepCurrent)
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.clone());
+        let spec = UiTaskSpec::new(target, FinishPolicy::KeepCurrent, environment)
             .with_entry(EntryPolicy::AssumeTarget);
         let task = UiTask::new(
             spec,
@@ -364,7 +347,12 @@ impl UiRoutine for EstablishResidencyExecution {
             .device()
             .ensure_ready(self.config.after_activate_ms)
             .map_err(|error| before_input_failure("prepare_residency", error))?;
-        restore_residency(context, &self.ocr, &self.config, self.target)
+        super::residency::settle_to(
+            context,
+            &SettleEnvironment::without_ocr(self.config.clone()),
+            ResidencyTarget::from(self.target),
+        )
+        .map(|_| ())
     }
 }
 
@@ -496,7 +484,7 @@ impl UiRoutine for CapturePrimaryFrameTask {
 /// `restore_primary` / `restore_secondary_hall` 两段导航。
 fn capture_primary_and_restore_with(
     context: &mut UiRoutineContext<'_>,
-    _ocr: &OcrRuntimeHandle,
+    ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
     capture: fn(
         &mut UiRoutineContext<'_>,
@@ -534,9 +522,8 @@ fn capture_primary_and_restore_with(
             InputCertainty::BeforeInput,
             "observe_capture_residency",
             format!(
-                "一级截图只支持一级或二级聊天界面；当前为{}（{}），不发送任何导航输入",
-                entry.kind.label(),
-                entry.kind.name()
+                "一级截图只支持千星大厅（一级大厅）或二级聊天界面；当前为{}，不发送任何导航输入",
+                entry.surface().chinese_name()
             ),
         );
         return CapturedPrimaryOutcome::Failed {
@@ -546,12 +533,15 @@ fn capture_primary_and_restore_with(
         };
     }
     let navigated = entry.kind == UiStateKind::Secondary;
-    // 目标一级；收尾回到入口（入口二级回二级，入口一级回一级；入口不可重建时退二级）。
+    // 目标一级；收尾回到入口（入口二级回二级会话，入口一级回一级；入口不可重建时退当前大厅）。
+    // 会话级恢复由唯一 residency 引擎负责，不再自己调 restore_secondary_hall。
+    let environment = SettleEnvironment::new(ocr.clone(), config.clone());
     let spec = UiTaskSpec::new(
-        UiResidencyTarget::Primary,
+        ResidencyTarget::Primary,
         FinishPolicy::RestoreEntry {
-            fallback: UiResidencyTarget::SecondaryCurrentHall,
+            fallback: ResidencyTarget::Secondary(ConversationRef::CurrentHall),
         },
+        environment,
     );
     let task = CapturePrimaryFrameTask {
         config: config.clone(),
@@ -559,14 +549,7 @@ fn capture_primary_and_restore_with(
         capture,
     };
     let outcome = UiTask::new(spec, task).execute(context);
-    let mut residency = outcome.residency.clone();
-    // 入口是二级会话时，包装器只保证回到"二级类型"；按固定 fallback 回到当前大厅
-    // （确定性、不点好友行），与旧 restore_secondary_hall 语义一致。
-    if navigated && matches!(residency, UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)) {
-        if let Err(failure) = restore_secondary_hall(context, _ocr, config) {
-            residency = UiResidencyOutcome::Failed(failure);
-        }
-    }
+    let residency = outcome.residency.clone();
     match outcome.output {
         Some(Ok(image)) => CapturedPrimaryOutcome::Captured {
             image,
@@ -698,7 +681,8 @@ impl UiRoutine for SendHallBatchRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let request = self.request;
         let ready_gated = request.ready.is_some();
-        let spec = hall_batch_task_spec(&request);
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.clone());
+        let spec = hall_batch_task_spec(&request, environment);
         let task = UiTask::new(
             spec,
             HallBatchExecution {
@@ -755,21 +739,26 @@ impl UiRoutine for SendHallBatchRoutine {
 /// - 邀请就绪（ready 闸门）：闸门与一级稳定确认必须先于任何导航，
 ///   所以用 `AssumeTarget` 让包装器不导航，由内层按邀请流程准备发送位置；
 ///   收尾仍交给包装器，取消时零输入。
-fn hall_batch_task_spec(request: &SendHallBatch) -> UiTaskSpec {
+fn hall_batch_task_spec(
+    request: &SendHallBatch,
+    environment: SettleEnvironment,
+) -> UiTaskSpec {
     if request.ready.is_some() {
         UiTaskSpec::new(
-            request.residency,
+            ResidencyTarget::from(request.residency),
             FinishPolicy::RestoreEntry {
-                fallback: request.residency,
+                fallback: ResidencyTarget::from(request.residency),
             },
+            environment,
         )
         .with_entry(EntryPolicy::AssumeTarget)
     } else {
         UiTaskSpec::new(
-            UiResidencyTarget::SecondaryCurrentHall,
+            ResidencyTarget::Secondary(ConversationRef::AnySecondary),
             FinishPolicy::RestoreEntry {
-                fallback: request.residency,
+                fallback: ResidencyTarget::from(request.residency),
             },
+            environment,
         )
     }
 }
@@ -929,6 +918,22 @@ impl FriendDeliveryRoutineConfig {
         self.timeout_ms
     }
 
+    pub(super) fn secondary_hall_search_region(&self) -> Rect {
+        self.secondary_hall_search_region
+    }
+
+    pub(super) fn secondary_hall_template(&self) -> &std::path::Path {
+        &self.secondary_hall_template
+    }
+
+    pub(super) fn template_threshold(&self) -> f32 {
+        self.template_threshold
+    }
+
+    pub(super) fn open_chat_ms(&self) -> u64 {
+        self.open_chat_ms
+    }
+
     pub(super) fn friend_list_region(&self) -> Rect {
         self.friend_list_region
     }
@@ -936,11 +941,6 @@ impl FriendDeliveryRoutineConfig {
     pub(super) fn friend_step_ms(&self) -> u64 {
         self.friend_step_ms
     }
-}
-
-/// 逻辑驻留是否为"当前大厅二级"（决定会话降级时是否回到大厅）。
-fn target_wants_current_hall(request: &SendFriendDeliveries) -> bool {
-    request.residency == UiResidencyTarget::SecondaryCurrentHall
 }
 
 struct SendFriendDeliveriesRoutine {
@@ -960,11 +960,13 @@ impl UiRoutine for SendFriendDeliveriesRoutine {
         let ocr = self.ocr.clone();
         let config = self.config.clone();
         // 好友投递在二级聊天里完成；收尾回到入口（入口不可重建时退逻辑驻留）。
+        let environment = SettleEnvironment::new(ocr.clone(), config.clone());
         let spec = UiTaskSpec::new(
-            UiResidencyTarget::SecondaryCurrentHall,
+            ResidencyTarget::Secondary(ConversationRef::AnySecondary),
             FinishPolicy::RestoreEntry {
-                fallback: request.residency,
+                fallback: ResidencyTarget::from(request.residency),
             },
+            environment,
         );
         let task = UiTask::new(
             spec,
@@ -1002,24 +1004,34 @@ impl UiRoutine for SendFriendDeliveriesRoutine {
                 outcomes
             }
         };
-        // 会话级恢复能力边界：包装器只保证 "在二级界面类型"，没有会话锚点。
-        // 入口是某个二级会话时，用**确定性的当前大厅**作为显式 fallback
-        // （不猜测、不点好友行），并标记 session_restore_degraded。
-        let mut residency = residency;
-        let session_restore_degraded = entry_was_secondary
-            && matches!(
-                residency,
-                UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
-            );
+        // 收尾由 `RestoreEntry` 带着**入口真实会话**完成：
+        // - 入口好友 A：恢复同一个好友（候选名 + 高亮行），而不是猜当前大厅；
+        // - 入口会话无法重建：引擎显式 fallback 当前大厅并置 degraded。
+        let session_restore_degraded = outcome
+            .finish
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.degraded)
+            || (entry_was_secondary
+                && matches!(
+                    residency,
+                    UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+                )
+                && outcome
+                    .finish
+                    .recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.settled_conversation.as_ref())
+                    == Some(&ConversationRef::CurrentHall)
+                && outcome
+                    .entry
+                    .as_ref()
+                    .and_then(|entry| entry.conversation.as_ref())
+                    .is_some_and(|conversation| *conversation != ConversationRef::CurrentHall));
         if session_restore_degraded {
             log::warn!(
-                "好友投递收尾只回到二级聊天界面类型，未确认回到入口的具体会话（会话级恢复尚无锚点），按固定 fallback 回到当前大厅"
+                "好友投递收尾未能回到入口的具体会话，已按明确 fallback 回到当前大厅（具体会话身份见入场识别），请重新确认当前会话"
             );
-            if target_wants_current_hall(&request_for_failure) {
-                if let Err(failure) = restore_secondary_hall(context, &ocr, &config) {
-                    residency = UiResidencyOutcome::Failed(failure);
-                }
-            }
         }
         SendFriendDeliveriesOutcome {
             deliveries,
@@ -1063,9 +1075,9 @@ enum PageSearch {
 }
 
 #[derive(Clone, Debug)]
-struct FriendOcrRow {
-    text: String,
-    point: Point,
+pub(super) struct FriendOcrRow {
+    pub(super) text: String,
+    pub(super) point: Point,
 }
 
 const FUZZY_FRIEND_MIN_SCORE: f32 = 0.55;
@@ -1264,7 +1276,11 @@ fn prepare_hall_batch_send_location(
     if let Some(gate) = ready {
         // 邀请就绪：闸门与一级稳定必须先于导航（包装器已用 AssumeTarget 跳过导航）。
         check_invite_ready_running(gate)?;
-        restore_primary(context, config)?;
+        super::residency::settle_to(
+            context,
+            &SettleEnvironment::without_ocr(config.clone()),
+            ResidencyTarget::Primary,
+        )?;
         confirm_invite_primary_stability(context, config, gate)?;
         if target == UiResidencyTarget::Primary {
             check_invite_ready_running(gate)?;
@@ -1282,8 +1298,13 @@ fn prepare_hall_batch_send_location(
         }
     }
     // 发送位置固定为"二级聊天的当前大厅"：索引/点击大厅行是会话级动作，
-    // 包装器的 kind 级导航不替代它（设计 §4 会话锚点尚未实现）。
-    restore_secondary_hall(context, ocr, config)
+    // 包装器的 kind 级导航不替代它；这里只做发送前置，不承担任务收尾。
+    super::residency::settle_to(
+        context,
+        &SettleEnvironment::without_ocr(config.clone()),
+        ResidencyTarget::Secondary(ConversationRef::CurrentHall),
+    )?;
+    Ok(())
 }
 
 fn retryable_certainty(certainty: InputCertainty) -> bool {
@@ -1618,7 +1639,12 @@ fn ensure_secondary_chat(
         .device()
         .ensure_ready(config.after_activate_ms)
         .map_err(|error| before_input_failure("prepare_friend_delivery", error))?;
-    settle_ui(context, config, UiResidencyTarget::SecondaryCurrentHall)?;
+    // 只要求"在二级"：调用方随后自行定位好友行/大厅行，避免每次切会话都点大厅。
+    super::residency::settle_to(
+        context,
+        &super::residency::SettleEnvironment::without_ocr(config.clone()),
+        ResidencyTarget::Secondary(ConversationRef::AnySecondary),
+    )?;
     Ok(())
 }
 
@@ -1722,7 +1748,7 @@ fn search_top_friend_candidate(
     Ok(best.point)
 }
 
-fn ocr_friend_rows(
+pub(super) fn ocr_friend_rows(
     ocr: &OcrRuntimeHandle,
     image: &DynamicImage,
     region: Rect,
@@ -1905,16 +1931,36 @@ fn confirm_friend_conversation(
     ))
 }
 
-fn selected_row_region(config: &FriendDeliveryRoutineConfig) -> Rect {
+/// 会话确认/观察共用的左侧侧栏扫描区：**返回按钮下方整条侧栏**。
+///
+/// 与 `observation::chat::passive::passive_sidebar_region` 同式：上界取返回按钮底边，
+/// 下界沿用好友列表配置底边，横向只保留列表两侧的边距。真实二级聊天帧里列表滚动
+/// 会把**选中的会话行**推到 `friend_list_region.y` 之上（实测选中行 y≈188–259 /
+/// 226–298）；只从列表配置区起点扫描时与高亮行最多重叠 18px，达不到 24px 的最小
+/// 行高，唯一高亮行会被漏判。这里只覆盖左侧侧栏（约 x=10..290, y=80..880），
+/// **不扩到聊天正文/输入框**。
+pub(crate) fn conversation_sidebar_region(friends: Rect, back: Rect) -> Rect {
+    let top = back.bottom();
     Rect::new(
-        config.friend_list_region.x.saturating_sub(70),
-        config.friend_list_region.y,
-        config.friend_list_region.width.saturating_add(110),
-        config.friend_list_region.height,
+        friends.x.saturating_sub(70),
+        top,
+        friends.width.saturating_add(110),
+        (friends.bottom() - top).max(0) as u32,
     )
 }
 
-fn point_in_rect(point: Point, rect: Rect) -> bool {
+pub(super) fn conversation_row_region(config: &FriendDeliveryRoutineConfig) -> Rect {
+    selected_row_region(config)
+}
+
+fn selected_row_region(config: &FriendDeliveryRoutineConfig) -> Rect {
+    conversation_sidebar_region(
+        config.friend_list_region,
+        config.screen.secondary_back_rect.into(),
+    )
+}
+
+pub(super) fn point_in_rect(point: Point, rect: Rect) -> bool {
     (rect.x..rect.right()).contains(&point.x) && (rect.y..rect.bottom()).contains(&point.y)
 }
 
@@ -1977,602 +2023,19 @@ fn highlighted_rows(image: &DynamicImage, region: Rect) -> Vec<Rect> {
         .collect()
 }
 
-/// 状态驱动恢复允许的下一步动作。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RecoveryAction {
-    /// 已到达目标稳定界面。
-    Done,
-    /// 只等待/重新采样，不发送任何输入。
-    Wait,
-    /// 按 Esc：仅用于已确认的二级、千星主菜单或稳定 Panel。
-    Escape,
-    /// 按 Return 打开二级聊天（目标为二级时）。
-    OpenChat,
-    /// 拒绝恢复：不给游戏发任何输入。
-    Reject(&'static str),
-}
-
-/// 恢复结果：成功到达目标时返回，供调用方与测试断言。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct RecoveryReport {
-    pub(super) target: UiResidencyTarget,
-    pub(super) settled_as: UiStateKind,
-    pub(super) esc_presses: u32,
-    pub(super) open_chat_presses: u32,
-    pub(super) resamples: u32,
-    pub(super) history: Vec<String>,
-}
-
-/// 恢复过程的累计状态（纯数据；决策函数可在无 UI 设备的单测里驱动）。
-#[derive(Default)]
-struct RecoveryProgress {
-    esc_presses: u32,
-    open_chat_presses: u32,
-    resamples: u32,
-    fresh_identity: Option<String>,
-    fresh_samples: u32,
-    unknown_samples: u32,
-    unknown_since: Option<Instant>,
-    loading_samples: u32,
-    loading_since: Option<Instant>,
-    panel_samples: u32,
-    pending_action_identity: Option<String>,
-    no_progress_streak: u32,
-    kind_tail: Vec<UiStateKind>,
-    history: Vec<String>,
-}
-
-impl RecoveryProgress {
-    fn record(&mut self, snapshot: &UiStateSnapshot, now: Instant) {
-        self.resamples = self.resamples.saturating_add(1);
-        self.history.push(snapshot.describe());
-        if self.history.len() > RECOVERY_HISTORY_LIMIT {
-            self.history.remove(0);
-        }
-
-        let identity = snapshot.identity();
-        let same_fresh = self.fresh_identity.as_deref() == Some(identity.as_str());
-        if same_fresh {
-            self.fresh_samples = self.fresh_samples.saturating_add(1);
-        } else {
-            self.fresh_identity = Some(identity.clone());
-            self.fresh_samples = 1;
-        }
-
-        // 动作后验证：同一 (kind,label) 反复出现即"无进展"。
-        if let Some(pending) = self.pending_action_identity.as_deref() {
-            if pending == identity.as_str() {
-                self.no_progress_streak = self.no_progress_streak.saturating_add(1);
-            } else {
-                self.no_progress_streak = 0;
-            }
-        }
-
-        match snapshot.kind {
-            UiStateKind::Unknown => {
-                self.unknown_samples = self.unknown_samples.saturating_add(1);
-                self.unknown_since.get_or_insert(now);
-            }
-            _ => {
-                self.unknown_samples = 0;
-                self.unknown_since = None;
-            }
-        }
-        match snapshot.kind {
-            UiStateKind::Loading => {
-                self.loading_samples = self.loading_samples.saturating_add(1);
-                self.loading_since.get_or_insert(now);
-            }
-            _ => {
-                self.loading_samples = 0;
-                self.loading_since = None;
-            }
-        }
-        if snapshot.kind == UiStateKind::Panel {
-            self.panel_samples = self.panel_samples.saturating_add(1);
-        } else {
-            self.panel_samples = 0;
-        }
-
-        if self.kind_tail.last().copied() != Some(snapshot.kind) {
-            self.kind_tail.push(snapshot.kind);
-            if self.kind_tail.len() > 6 {
-                self.kind_tail.remove(0);
-            }
-        }
-    }
-
-    /// 运行时与本次恢复的"新鲜稳定"双重确认：既要求跟踪器判稳定，
-    /// 也要求本次恢复自己连续采到 required_count 帧同一状态。
-    fn settled(&self, snapshot: &UiStateSnapshot) -> bool {
-        snapshot.runtime_stable && self.fresh_samples >= snapshot.required_count.max(1)
-    }
-
-    fn primary_main_menu_oscillations(&self) -> u32 {
-        let mut count = 0;
-        for pair in self.kind_tail.windows(2) {
-            if matches!(
-                (pair[0], pair[1]),
-                (UiStateKind::Primary, UiStateKind::MainMenu)
-                    | (UiStateKind::MainMenu, UiStateKind::Primary)
-            ) {
-                count += 1;
-            }
-        }
-        count
-    }
-}
-
-/// 纯决策：根据一次分类快照与累计进度，决定下一步动作。
-///
-/// 顺序与约束（本事故的核心）：
-/// - Primary 稳定即成功；Primary 未稳定只等，不按任何键；
-/// - Secondary 仅在目标为 Primary 时 Esc，且必须已确认稳定；
-/// - MainMenu 按 `final_rule` 区分：千星主菜单可 Esc，派蒙菜单**拒绝**；
-/// - Panel 需连续确认仍是 Panel 才 Esc；
-/// - Loading 只等待；
-/// - Unknown 先等待/重采样，连续无证据才失败，**绝不立刻盲按 Esc**；
-/// - GameGate / Overworld 直接拒绝。
-fn decide_recovery_step(
-    snapshot: &UiStateSnapshot,
-    target: UiResidencyTarget,
-    progress: &RecoveryProgress,
-) -> RecoveryAction {
-    if progress.no_progress_streak >= RECOVERY_NO_PROGRESS_LIMIT {
-        return RecoveryAction::Reject("恢复动作没有产生任何状态变化（无进展熔断）");
-    }
-    if progress.primary_main_menu_oscillations() >= RECOVERY_OSCILLATION_LIMIT {
-        return RecoveryAction::Reject("一级界面与主菜单反复来回（振荡熔断）");
-    }
-
-    match snapshot.kind {
-        UiStateKind::Primary => {
-            if !progress.settled(snapshot) {
-                return RecoveryAction::Wait;
-            }
-            match target {
-                UiResidencyTarget::Primary => RecoveryAction::Done,
-                UiResidencyTarget::SecondaryCurrentHall => RecoveryAction::OpenChat,
-            }
-        }
-        UiStateKind::Secondary => {
-            if !progress.settled(snapshot) {
-                return RecoveryAction::Wait;
-            }
-            match target {
-                UiResidencyTarget::SecondaryCurrentHall => RecoveryAction::Done,
-                UiResidencyTarget::Primary => {
-                    if progress.esc_presses < RECOVERY_MAX_ESC {
-                        RecoveryAction::Escape
-                    } else {
-                        RecoveryAction::Reject("按 Esc 次数已达上限，二级聊天仍未退出")
-                    }
-                }
-            }
-        }
-        UiStateKind::MainMenu => {
-            if snapshot.is_paimon_menu() {
-                // 派蒙菜单是提瓦特 ESC 系统菜单，不是千星大厅主菜单：
-                // 在这里按 Esc / Return 会把玩家推得更远，明确拒绝。
-                return RecoveryAction::Reject(
-                    "当前是派蒙菜单（ESC 系统菜单），不是千星大厅主菜单，拒绝发送导航输入",
-                );
-            }
-            if !progress.settled(snapshot) {
-                return RecoveryAction::Wait;
-            }
-            if progress.esc_presses < RECOVERY_MAX_ESC {
-                // 千星奇域主菜单：Esc 关闭浮层回到大厅（一级）。
-                RecoveryAction::Escape
-            } else {
-                RecoveryAction::Reject("按 Esc 次数已达上限，主菜单仍未关闭")
-            }
-        }
-        UiStateKind::Panel => {
-            // 面板抖动常见：必须连续确认仍是 Panel，才允许 Esc 关闭。
-            if progress.panel_samples < RECOVERY_PANEL_CONFIRM_SAMPLES
-                || !progress.settled(snapshot)
-            {
-                return RecoveryAction::Wait;
-            }
-            if progress.esc_presses < RECOVERY_MAX_ESC {
-                RecoveryAction::Escape
-            } else {
-                RecoveryAction::Reject("按 Esc 次数已达上限，残留面板仍未关闭")
-            }
-        }
-        UiStateKind::Loading => RecoveryAction::Wait,
-        UiStateKind::Unknown => {
-            let sustained = progress.unknown_samples >= RECOVERY_UNKNOWN_MIN_SAMPLES
-                && progress
-                    .unknown_since
-                    .is_some_and(|since| since.elapsed() >= Duration::from_millis(RECOVERY_UNKNOWN_WINDOW_MS));
-            if sustained {
-                RecoveryAction::Reject("界面持续无法识别且没有任何稳定证据，拒绝盲按 Esc")
-            } else {
-                RecoveryAction::Wait
-            }
-        }
-        UiStateKind::GameGate | UiStateKind::Overworld => {
-            RecoveryAction::Reject("登录入口或大世界不可恢复聊天驻留")
-        }
-    }
-}
-
-/// 恢复失败时的统一诊断：包含当前事实、动作次数与历史。
-fn recovery_failure(
-    stage: &'static str,
-    certainty: InputCertainty,
-    target: UiResidencyTarget,
-    snapshot: &UiStateSnapshot,
-    progress: &RecoveryProgress,
-    reason: &str,
-) -> UiRoutineFailure {
-    UiRoutineFailure::new(
-        certainty,
-        stage,
-        format!(
-            "状态驱动恢复中止（{reason}）：目标={target:?}；当前={}；Esc={} Return={} 采样={}；历史={}",
-            snapshot.describe(),
-            progress.esc_presses,
-            progress.open_chat_presses,
-            progress.resamples,
-            progress.history.join(" <- ")
-        ),
-    )
-}
-
-/// 统一状态驱动恢复入口：把界面安全地驱动到目标驻留界面。
-///
-/// 供 `restore_primary` / `ensure_secondary_chat` / `restore_secondary_hall` 复用。
-/// 原则：**只有已确认的状态才允许输入**；Unknown/Loading 只等待；主菜单按证据区分
-/// 千星（可 Esc）与派蒙（拒绝）；无进展或振荡立即熔断。
-/// 统一状态驱动恢复入口：把界面安全地驱动到目标驻留界面。
-///
-/// 供 `restore_primary` / `ensure_secondary_chat` / `restore_secondary_hall` 复用。
-/// 原则：**只有已确认的状态才允许输入**；Unknown/Loading 只等待；主菜单按证据区分
-/// 千星（可 Esc）与派蒙（拒绝）；无进展或振荡立即熔断。
-///
-/// `ocr` 目前不参与恢复决策（决策只依赖 UI 状态证据），保留参数是为了与
-/// 驻留恢复的统一入口签名一致，后续需要 OCR 佐证时无需再改调用方。
-pub(super) fn settle_to(
-    context: &mut UiRoutineContext<'_>,
-    _ocr: &OcrRuntimeHandle,
-    config: &FriendDeliveryRoutineConfig,
-    target: UiResidencyTarget,
-) -> std::result::Result<RecoveryReport, UiRoutineFailure> {
-    settle_ui(context, config, target)
-}
-
-fn settle_ui(
-    context: &mut UiRoutineContext<'_>,
-    config: &FriendDeliveryRoutineConfig,
-    target: UiResidencyTarget,
-) -> std::result::Result<RecoveryReport, UiRoutineFailure> {
-    let observation_config = config.state_observation();
-    let deadline = Instant::now() + Duration::from_millis(config.timeout_ms.max(1));
-    let mut progress = RecoveryProgress::default();
-    let mut action_taken = false;
-    let mut steps = 0_u32;
-
-    loop {
-        if steps >= RECOVERY_MAX_STEPS {
-            return Err(UiRoutineFailure::new(
-                InputCertainty::AfterInputUnknown,
-                match target {
-                    UiResidencyTarget::Primary => "confirm_primary_residency",
-                    UiResidencyTarget::SecondaryCurrentHall => "confirm_secondary_chat",
-                },
-                format!(
-                    "状态驱动恢复超过最大动作步数（{}）：目标={target:?}；Esc={} Return={}；历史={}",
-                    RECOVERY_MAX_STEPS,
-                    progress.esc_presses,
-                    progress.open_chat_presses,
-                    progress.history.join(" <- ")
-                ),
-            ));
-        }
-        let now = Instant::now();
-        // 输入前失败可安全重试；一旦按过键，结论只能是"动作后状态未知"。
-        let (stage, certainty) = if action_taken {
-            match target {
-                UiResidencyTarget::Primary => (
-                    "confirm_primary_residency",
-                    InputCertainty::AfterInputUnknown,
-                ),
-                UiResidencyTarget::SecondaryCurrentHall => (
-                    "confirm_secondary_chat",
-                    InputCertainty::AfterInputUnknown,
-                ),
-            }
-        } else {
-            match target {
-                UiResidencyTarget::Primary => {
-                    ("observe_primary_residency", InputCertainty::BeforeInput)
-                }
-                UiResidencyTarget::SecondaryCurrentHall => {
-                    ("observe_friend_delivery_start", InputCertainty::BeforeInput)
-                }
-            }
-        };
-
-        let snapshot = observe_ui_state_once(context, observation_config, stage, certainty)?;
-        progress.record(&snapshot, now);
-
-        // 超出本次恢复预算：按当前界面给出可操作的诊断；期间不按任何键。
-        if now >= deadline {
-            let reason = match snapshot.kind {
-                UiStateKind::Loading => "加载界面持续超出恢复预算",
-                UiStateKind::Unknown => "界面持续无法识别且没有任何稳定证据，拒绝盲按 Esc",
-                _ => "恢复未在时间预算内到达目标界面",
-            };
-            return Err(recovery_failure(
-                stage,
-                certainty,
-                target,
-                &snapshot,
-                &progress,
-                reason,
-            ));
-        }
-
-        match decide_recovery_step(&snapshot, target, &progress) {
-            RecoveryAction::Done => {
-                return Ok(RecoveryReport {
-                    target,
-                    settled_as: snapshot.kind,
-                    esc_presses: progress.esc_presses,
-                    open_chat_presses: progress.open_chat_presses,
-                    resamples: progress.resamples,
-                    history: progress.history,
-                });
-            }
-            RecoveryAction::Wait => {}
-            RecoveryAction::Escape => {
-                action_taken = true;
-                steps = steps.saturating_add(1);
-                let pre_action_identity = snapshot.identity();
-                context
-                    .device()
-                    .press_key(Key::Escape)
-                    .map_err(|error| after_input_failure("restore_residency", error))?;
-                progress.esc_presses = progress.esc_presses.saturating_add(1);
-                progress.pending_action_identity = Some(pre_action_identity);
-                wait_ms(
-                    context,
-                    config.poll_ms.max(10),
-                    "restore_residency_wait",
-                    InputCertainty::AfterInputUnknown,
-                )?;
-            }
-            RecoveryAction::OpenChat => {
-                action_taken = true;
-                steps = steps.saturating_add(1);
-                let pre_action_identity = snapshot.identity();
-                context
-                    .device()
-                    .press_key(Key::Return)
-                    .map_err(|error| after_input_failure("open_secondary_chat", error))?;
-                progress.open_chat_presses = progress.open_chat_presses.saturating_add(1);
-                progress.pending_action_identity = Some(pre_action_identity);
-                wait_ms(
-                    context,
-                    config.open_chat_ms,
-                    "open_secondary_chat",
-                    InputCertainty::AfterInputUnknown,
-                )?;
-            }
-            RecoveryAction::Reject(reason) => {
-                return Err(recovery_failure(
-                    stage,
-                    certainty,
-                    target,
-                    &snapshot,
-                    &progress,
-                    reason,
-                ));
-            }
-        }
-
-        wait_ms(
-            context,
-            config.poll_ms.max(10),
-            stage,
-            if action_taken {
-                InputCertainty::AfterInputUnknown
-            } else {
-                InputCertainty::BeforeInput
-            },
-        )?;
-    }
-}
-
-pub(super) fn restore_residency(
+/// 恢复指定好友会话（按候选名 + 高亮行确认，歧义不点击）。
+pub(super) fn restore_friend_conversation(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &FriendDeliveryRoutineConfig,
-    target: UiResidencyTarget,
-) -> std::result::Result<(), UiRoutineFailure> {
-    match target {
-        UiResidencyTarget::Primary => {
-            settle_to(context, ocr, config, target)?;
-            confirm_primary_residency(context, config)
-        }
-        UiResidencyTarget::SecondaryCurrentHall => restore_secondary_hall(context, ocr, config),
-    }
-}
-
-fn restore_primary(
-    context: &mut UiRoutineContext<'_>,
-    config: &FriendDeliveryRoutineConfig,
-) -> std::result::Result<(), UiRoutineFailure> {
-    // 状态驱动：只对已确认的二级/千星主菜单/稳定面板按 Esc；
-    // Unknown/Loading 只等待，主菜单按 final_rule 区分千星与派蒙。
-    settle_ui(context, config, UiResidencyTarget::Primary)?;
-    // 保留原有的"视觉驻留稳定"二次确认（好友按钮区域指纹不抖动）。
-    confirm_primary_residency(context, config)
-}
-
-pub(super) fn confirm_primary_residency(
-    context: &mut UiRoutineContext<'_>,
-    config: &FriendDeliveryRoutineConfig,
-) -> std::result::Result<(), UiRoutineFailure> {
-    wait_for_stable_ui_kind(
+    identity: impl Into<String>,
+    candidates: Vec<String>,
+) -> std::result::Result<super::residency::RecoveryReport, UiRoutineFailure> {
+    super::residency::settle_to(
         context,
-        config.state_observation(),
-        Some(UiStateKind::Primary),
-        config.timeout_ms,
-        "confirm_primary_residency",
-        InputCertainty::AfterInputUnknown,
-    )?;
-    confirm_primary_visual_stability(context, config)
-}
-
-fn confirm_primary_visual_stability(
-    context: &mut UiRoutineContext<'_>,
-    config: &FriendDeliveryRoutineConfig,
-) -> std::result::Result<(), UiRoutineFailure> {
-    let started = std::time::Instant::now();
-    let mut previous = None;
-    let mut confirmed_primary = false;
-    loop {
-        let image = capture_normalized(
-            context,
-            config,
-            "confirm_primary_residency",
-            InputCertainty::AfterInputUnknown,
-        )?;
-        let observation = context.latest_ui_state().ok_or_else(|| {
-            UiRoutineFailure::new(
-                InputCertainty::AfterInputUnknown,
-                "confirm_primary_residency",
-                "UI runtime has no configured template state classifier",
-            )
-        })?;
-        match observation {
-            UiStateObservation::Classified(state)
-                if state.stable_kind() == Some(UiStateKind::Primary) =>
-            {
-                confirmed_primary = true;
-                let current =
-                    rect_chat_change_fingerprint(&image, config.screen.friend_rect.into())
-                        .map_err(|error| {
-                            UiRoutineFailure::new(
-                                InputCertainty::AfterInputUnknown,
-                                "confirm_primary_stability",
-                                format!("{error:#}"),
-                            )
-                        })?;
-                if previous
-                    .as_ref()
-                    .is_some_and(|previous| page_matches(previous, &current, config))
-                {
-                    return Ok(());
-                }
-                previous = Some(current);
-            }
-            UiStateObservation::Classified(_) => previous = None,
-            UiStateObservation::Failed { reason, .. } => {
-                return Err(UiRoutineFailure::new(
-                    InputCertainty::AfterInputUnknown,
-                    "confirm_primary_residency",
-                    format!("template UI state classification failed: {reason}"),
-                ));
-            }
-        }
-        if started.elapsed() >= Duration::from_millis(PRIMARY_STABILITY_TIMEOUT_MS) {
-            if !confirmed_primary {
-                return Err(UiRoutineFailure::new(
-                    InputCertainty::AfterInputUnknown,
-                    "confirm_primary_residency",
-                    "primary residency did not become stable",
-                ));
-            }
-            log::warn!(
-                "一级界面驻留确认超时（步骤：确认一级界面驻留）：好友按钮区域持续变化 {}ms 未稳定，但此前已确认过一级界面，因此按已确认结果继续，本次投递不受影响",
-                PRIMARY_STABILITY_TIMEOUT_MS
-            );
-            return Ok(());
-        }
-        wait_ms(
-            context,
-            PRIMARY_STABILITY_POLL_MS,
-            "confirm_primary_residency",
-            InputCertainty::AfterInputUnknown,
-        )?;
-    }
-}
-
-fn restore_secondary_hall(
-    context: &mut UiRoutineContext<'_>,
-    _ocr: &OcrRuntimeHandle,
-    config: &FriendDeliveryRoutineConfig,
-) -> std::result::Result<(), UiRoutineFailure> {
-    ensure_secondary_chat(context, config)?;
-    // “当前大厅”固定在会话列表上方。模板命中后只点击一次，不用好友高亮和 OCR 做二次确认。
-    // 未命中时向列表顶部拖动（从最高头像往下拖），避免当前选中的好友私聊目标被误当成大厅。
-    let mut pages = Vec::<ChangeFingerprint>::new();
-    for drag_index in 0..=MAX_FRIEND_LIST_DRAGS {
-        let image = capture_normalized(
-            context,
-            config,
-            "locate_secondary_hall",
-            InputCertainty::AfterInputUnknown,
-        )?;
-        if let Some(hit) = best_template_hit(
-            &image,
-            Some(config.secondary_hall_search_region),
-            &config.secondary_hall_template,
-            config.template_threshold,
-        )
-        .map_err(|error| after_input_failure("locate_secondary_hall", error))?
-        {
-            let point = hit.center();
-            context
-                .device()
-                .click_point(point.x, point.y)
-                .map_err(|error| after_input_failure("select_secondary_hall", error))?;
-            wait_ms(
-                context,
-                config.click_ms,
-                "select_secondary_hall",
-                InputCertainty::AfterInputUnknown,
-            )?;
-            // 点击大厅条目不是进入二级的成功凭据，发送前重新确认。
-            wait_for_stable_ui_kind(
-                context,
-                config.state_observation(),
-                Some(UiStateKind::Secondary),
-                config.timeout_ms,
-                "confirm_secondary_hall_selection",
-                InputCertainty::AfterInputUnknown,
-            )?;
-            return Ok(());
-        }
-        let fingerprint = rect_chat_change_fingerprint(&image, config.friend_list_region)
-            .map_err(|error| after_input_failure("fingerprint_secondary_hall_list", error))?;
-        if pages
-            .iter()
-            .any(|page| page_matches(page, &fingerprint, config))
-        {
-            break;
-        }
-        pages.push(fingerprint);
-        if drag_index == MAX_FRIEND_LIST_DRAGS {
-            break;
-        }
-        let (from, to) = current_hall_restore_drag_points(config.friend_list_region);
-        context
-            .device()
-            .drag_point(from.x, from.y, to.x, to.y)
-            .map_err(|error| after_input_failure("drag_to_secondary_hall", error))?;
-        wait_friend_list_stable(context, config)?;
-    }
-    Err(UiRoutineFailure::new(
-        InputCertainty::AfterInputUnknown,
-        "restore_secondary_hall",
-        "current-hall template was not found after two drags toward the list top",
-    ))
+        &super::residency::SettleEnvironment::new(ocr.clone(), config.clone()),
+        ResidencyTarget::Secondary(ConversationRef::friend(identity, candidates)),
+    )
 }
 
 /// 在一屏好友列表里找**任意一个**候选名，返回所有命中行。
@@ -2583,7 +2046,7 @@ fn restore_secondary_hall(
 ///
 /// 同一屏命中多个**不同**候选时仍返回全部命中，由调用方判歧义——
 /// 悄悄挑一个等于赌运气点错人。
-fn matching_text_rows(
+pub(super) fn matching_text_rows(
     ocr: &OcrRuntimeHandle,
     image: &DynamicImage,
     region: Rect,
@@ -2981,6 +2444,8 @@ mod tests {
 
     use super::*;
     use crate::observation::chat::SECONDARY_TITLE_RECT;
+    use crate::ui::routines::residency::RECOVERY_NO_PROGRESS_LIMIT;
+    use crate::ui::template::best_template_hit;
 
     #[test]
     fn fuzzy_friend_candidate_score_accepts_lost_special_characters() {
@@ -3062,7 +2527,8 @@ mod tests {
             friend_panel: config.moderation.friend_panel_region.into(),
             friend_search_panel: config.moderation.search_panel_region.into(),
             friend_block_chat: config.moderation.block_chat_region.into(),
-            friend_confirm: config.moderation.confirm_region.into(),
+            confirm_button: config.moderation.confirm_button_region.into(),
+            confirm_message: config.moderation.confirm_message_region.into(),
             invite_view_star: config.invite.view_star_region.into(),
             invite_goto_hall: config.invite.goto_hall_region.into(),
             invite_enter_hall: config.invite.enter_hall_region.into(),
@@ -3170,6 +2636,7 @@ mod tests {
                 state: Arc::clone(&state),
                 friend_rows: Vec::new(),
                 hall_point: (-1, -1),
+                sidebar: conversation_sidebar(&config),
             },
             &config,
             1,
@@ -3215,6 +2682,9 @@ mod tests {
         state: Arc<Mutex<TestUiState>>,
         friend_rows: Vec<(i32, String)>,
         hall_point: (i32, i32),
+        /// 会话侧栏扫描区：用于清掉真实帧里自带的旧选中高亮（真实 UI 同一时刻只有一个
+        /// 会话行高亮），让合成帧只保留本次选中的那一行。
+        sidebar: Rect,
     }
 
     #[cfg(feature = "ocr-mnn")]
@@ -3244,10 +2714,13 @@ mod tests {
     impl UiDevice for RecordingDevice {
         fn capture(&mut self) -> Result<DynamicImage> {
             let mut frame = self.frame.clone();
+            // 真实截图自带旧选中行（大厅行/上一个好友行）。真实 UI 选中新会话时旧高亮会消失；
+            // 这里先清掉侧栏里已有的非模板高亮，避免合成出"两个高亮行"的假画面。
+            clear_sidebar_selection(&mut frame, self.sidebar);
             let selected_y = {
                 let state = self.state.lock().unwrap();
                 match &state.conversation {
-                    Conversation::Hall => Some(365),
+                    Conversation::Hall => Some(self.hall_point.1),
                     Conversation::Friend(friend) => self
                         .friend_rows
                         .iter()
@@ -3256,8 +2729,12 @@ mod tests {
                 }
             };
             if let Some(y) = selected_y {
+                // 大厅行的高亮要落在真实大厅行 y 上；但假设备不能再覆盖大厅模板像素
+                // （真实 UI 的高亮是半透明的，模板仍可见）。模板在 y 190..245 / x 10..75。
+                let overlap_template = y.abs_diff(222) <= 35;
+                let start_x = if overlap_template { 80 } else { 10 };
                 for row_y in (y - 35).max(0)..(y + 35) {
-                    for x in 10..290 {
+                    for x in start_x..290 {
                         frame.put_pixel(x, row_y as u32, image::Rgba([65, 73, 86, 255]));
                     }
                 }
@@ -3456,6 +2933,7 @@ mod tests {
                 (friend_list.y + 165, "乙".to_string()),
             ],
             hall_point,
+                sidebar: conversation_sidebar(&config),
         };
         let ocr_runtime = OcrRuntime::start(
             FriendOcrDevice {
@@ -3539,6 +3017,7 @@ mod tests {
                 state: state.clone(),
                 friend_rows: vec![(friend_list.y + 85, "萌萌".to_string())],
                 hall_point,
+                sidebar: conversation_sidebar(&config),
             },
             &config,
             4,
@@ -3610,6 +3089,7 @@ mod tests {
                 state: state.clone(),
                 friend_rows: Vec::new(),
                 hall_point,
+                sidebar: conversation_sidebar(&config),
             },
             &config,
             4,
@@ -3639,7 +3119,7 @@ mod tests {
             .wait()
             .unwrap();
 
-        assert_eq!(outcome.sent(), 2);
+        assert_eq!(outcome.sent(), 2, "status={:?} residency={:?}", outcome.status(), outcome.residency());
         assert!(matches!(outcome.status(), HallBatchStatus::Complete));
         assert!(matches!(
             outcome.residency(),
@@ -3717,6 +3197,7 @@ mod tests {
                 state: state.clone(),
                 friend_rows: vec![(friend_list.y + 85, "甲".to_string())],
                 hall_point,
+                sidebar: conversation_sidebar(&config),
             },
             &config,
             4,
@@ -3795,6 +3276,7 @@ mod tests {
                 state: state.clone(),
                 friend_rows: vec![(friend_list.y + 85, "甲".to_string())],
                 hall_point,
+                sidebar: conversation_sidebar(&config),
             },
             &config,
             4,
@@ -3878,7 +3360,12 @@ mod tests {
         type Output = std::result::Result<(), UiRoutineFailure>;
 
         fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-            restore_primary(context, &self.config)
+            super::super::residency::settle_to(
+                context,
+                &SettleEnvironment::without_ocr(self.config.clone()),
+                ResidencyTarget::Primary,
+            )
+            .map(|_| ())
         }
     }
 
@@ -3898,6 +3385,7 @@ mod tests {
     struct ScriptedStateDevice {
         frames: Vec<DynamicImage>,
         transitions: Vec<(usize, Key, usize)>,
+        click_transitions: Vec<(usize, usize)>,
         auto_advance: std::collections::HashMap<usize, usize>,
         shared: Arc<Mutex<ScriptedStateDeviceState>>,
     }
@@ -3912,6 +3400,7 @@ mod tests {
                 Self {
                     frames,
                     transitions: Vec::new(),
+                    click_transitions: Vec::new(),
                     auto_advance: std::collections::HashMap::new(),
                     shared: Arc::clone(&shared),
                 },
@@ -3926,6 +3415,11 @@ mod tests {
 
         fn on_key(mut self, from: usize, key: Key, to: usize) -> Self {
             self.transitions.push((from, key, to));
+            self
+        }
+
+        fn on_click(mut self, from: usize, to: usize) -> Self {
+            self.click_transitions.push((from, to));
             self
         }
     }
@@ -3950,7 +3444,17 @@ mod tests {
         }
 
         fn click_point(&mut self, x: i32, y: i32) -> Result<()> {
-            self.shared.lock().unwrap().clicks.push((x, y));
+            let mut state = self.shared.lock().unwrap();
+            state.clicks.push((x, y));
+            let from = state.state;
+            if let Some((_, to)) = self
+                .click_transitions
+                .iter()
+                .find(|(st, _)| *st == from)
+                .copied()
+            {
+                state.state = to;
+            }
             Ok(())
         }
 
@@ -4044,9 +3548,9 @@ mod tests {
         ui_runtime.shutdown().unwrap();
     }
 
-    /// 持续 Unknown：只重新采样，绝不盲按 Esc；失败诊断要带 rule/world/last_stable。
+    /// 持续 Unknown：先重采样，允许**一次**受控 Esc 探针；探针无效即失败。
     #[test]
-    fn persistent_unknown_fails_with_diagnostics_and_no_keys() {
+    fn persistent_unknown_probes_once_with_escape_then_fails_with_diagnostics() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let (device, state) =
             ScriptedStateDevice::new(vec![unknown_frame(&config)]);
@@ -4062,10 +3566,14 @@ mod tests {
             .unwrap()
             .expect_err("持续 Unknown 必须失败");
 
-        assert!(state.lock().unwrap().keys.is_empty(), "不允许盲按 Esc");
+        assert_eq!(
+            *state.lock().unwrap().keys,
+            [Key::Escape].to_vec(),
+            "持续 Unknown 只允许一次受控 Esc 探针，不允许连续盲按"
+        );
         let reason = failure.reason().to_string();
         assert!(
-            reason.contains("无法识别") || reason.contains("加载界面"),
+            reason.contains("Unknown") || reason.contains("无法识别") || reason.contains("加载界面"),
             "失败原因必须说明持续不可识别：{reason}"
         );
         assert!(reason.contains("rule="), "诊断必须带 final_rule：{reason}");
@@ -4073,7 +3581,7 @@ mod tests {
         ui_runtime.shutdown().unwrap();
     }
 
-    /// 千星主菜单：Esc 关闭浮层回到一级界面。
+    /// 主菜单千星：Esc 关闭浮层回到一级界面。
     #[test]
     fn wonderland_main_menu_is_escaped_back_to_primary() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -4092,13 +3600,13 @@ mod tests {
             .unwrap()
             .wait()
             .unwrap()
-            .expect("千星主菜单必须能通过 Esc 回到一级界面");
+            .expect("主菜单千星必须能通过 Esc 回到一级界面");
 
         assert_eq!(*state.lock().unwrap().keys, [Key::Escape].to_vec());
         ui_runtime.shutdown().unwrap();
     }
 
-    /// 派蒙菜单不是大厅菜单：明确拒绝，零输入。
+    /// 主菜单大世界不是大厅菜单：明确拒绝，零输入。
     #[test]
     fn paimon_menu_is_rejected_without_input() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -4114,12 +3622,12 @@ mod tests {
             .unwrap()
             .wait()
             .unwrap()
-            .expect_err("派蒙菜单必须被拒绝");
+            .expect_err("主菜单大世界必须被拒绝");
 
-        assert!(state.lock().unwrap().keys.is_empty(), "派蒙菜单不允许任何输入");
+        assert!(state.lock().unwrap().keys.is_empty(), "主菜单大世界不允许任何输入");
         assert!(
-            failure.reason().contains("派蒙"),
-            "必须说明是派蒙菜单：{}",
+            failure.reason().contains("主菜单大世界"),
+            "必须说明是主菜单大世界：{}",
             failure.reason()
         );
         ui_runtime.shutdown().unwrap();
@@ -4202,7 +3710,7 @@ mod tests {
         ui_runtime.shutdown().unwrap();
     }
 
-    /// 事故完整回放：二级 → Esc → Unknown（不得再 Esc）→ 千星主菜单 → Esc → 一级。
+    /// 事故完整回放：二级 → Esc → Unknown（不得再 Esc）→ 主菜单千星 → Esc → 一级。
     #[test]
     fn unknown_after_escape_then_main_menu_then_escape_reaches_primary() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -4231,12 +3739,12 @@ mod tests {
         assert_eq!(
             *state.lock().unwrap().keys,
             [Key::Escape, Key::Escape].to_vec(),
-            "只允许两次 Esc：一次退出二级、一次关闭千星主菜单"
+            "只允许两次 Esc：一次退出二级、一次关闭主菜单千星"
         );
         ui_runtime.shutdown().unwrap();
     }
 
-    /// 千星主菜单按 Esc 没反应（无进展）时，必须在 2 次后熔断，不能无限按。
+    /// 主菜单千星按 Esc 没反应（无进展）时，必须在 2 次后熔断，不能无限按。
     #[test]
     fn main_menu_without_progress_trips_the_breaker() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -4269,7 +3777,7 @@ mod tests {
         ui_runtime.shutdown().unwrap();
     }
 
-    /// 二次恢复：目标二级聊天时遇千星主菜单，必须先 Esc 回一级，再 Return 打开聊天。
+    /// 二次恢复：目标二级聊天时遇主菜单千星，必须先 Esc 回一级，再 Return 打开聊天。
     #[test]
     fn secondary_target_escapes_main_menu_first_then_returns() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -4436,7 +3944,7 @@ mod tests {
 
     /// 好友投递：入口是二级会话，收尾只能回到“二级类型”，必须显式标记会话级降级。
     #[test]
-    fn friend_delivery_from_secondary_reports_session_restore_fallback() {
+    fn friend_delivery_from_current_hall_returns_to_current_hall() {
         let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
@@ -4463,9 +3971,9 @@ mod tests {
             RecordingDevice {
                 frame,
                 state: state.clone(),
-                // 避开大厅行（y=365）的高亮区域，确保确认走的是好友行。
                 friend_rows: vec![(friend_list.y + 165, "乙".to_string())],
                 hall_point,
+                sidebar: conversation_sidebar(&config),
             },
             &config,
             4,
@@ -4494,28 +4002,17 @@ mod tests {
             .wait()
             .unwrap();
 
-        assert!(
-            outcome.is_complete(),
-            "消息送达且仍在二级，应视为完成: {:?}",
-            (
-                outcome.deliveries()[0].message_statuses(),
-                outcome.deliveries()[0].failure(),
-                outcome.residency()
-            )
-        );
-        assert!(matches!(
+        assert!(outcome.is_complete());
+        assert!(!outcome.session_restore_degraded(), "入口是当前大厅时不降级");
+        assert_eq!(
             outcome.residency(),
-            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
-        ));
-        assert!(
-            outcome.session_restore_degraded(),
-            "入口是二级会话时，包装器无法确认回到同一会话，必须显式标记降级"
+            &UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
         );
+        assert_eq!(state.lock().unwrap().conversation, Conversation::Hall);
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }
 
-    /// 截图例程的安全前置：入口 Unknown 时零按键失败（事故回放）。
     #[test]
     fn capture_from_unknown_entry_sends_no_input() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
@@ -4541,145 +4038,6 @@ mod tests {
         assert!(state.lock().unwrap().keys.is_empty(), "Unknown 入口不允许任何按键");
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
-    }
-
-    // ---- 决策函数的纯单测：不依赖真实帧，覆盖无法用夹具触发的情况 ----
-
-    fn snap(kind: UiStateKind, label: &str, rule: &str) -> UiStateSnapshot {
-        UiStateSnapshot {
-            kind,
-            label: label.to_string(),
-            final_rule: rule.to_string(),
-            world_guess: "unknown".to_string(),
-            last_stable_kind: Some(kind),
-            runtime_stable: true,
-            candidate_count: 2,
-            required_count: 2,
-        }
-    }
-
-    fn settled_progress(snapshot: &UiStateSnapshot) -> RecoveryProgress {
-        let mut progress = RecoveryProgress::default();
-        for _ in 0..snapshot.required_count.max(1) {
-            progress.record(snapshot, Instant::now());
-        }
-        progress
-    }
-
-    #[test]
-    fn recovery_decision_rejects_game_gate_and_overworld_without_input() {
-        for kind in [UiStateKind::GameGate, UiStateKind::Overworld] {
-            let snapshot = snap(kind, "gate", "game_gate_template");
-            let mut progress = settled_progress(&snapshot);
-            let action = decide_recovery_step(&snapshot, UiResidencyTarget::Primary, &mut progress);
-            assert!(
-                matches!(action, RecoveryAction::Reject(_)),
-                "{kind:?} 必须拒绝恢复，实际 {action:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn recovery_decision_unknown_waits_then_rejects_without_escape() {
-        let snapshot = snap(UiStateKind::Unknown, "unknown", "no_reliable_anchor");
-        let mut progress = settled_progress(&snapshot);
-        assert_eq!(
-            decide_recovery_step(&snapshot, UiResidencyTarget::Primary, &mut progress),
-            RecoveryAction::Wait,
-            "刚出现的 Unknown 只允许等待"
-        );
-        for _ in 0..RECOVERY_UNKNOWN_MIN_SAMPLES {
-            progress.record(&snapshot, Instant::now());
-        }
-        progress.unknown_since = Some(Instant::now() - Duration::from_millis(RECOVERY_UNKNOWN_WINDOW_MS + 50));
-        let action = decide_recovery_step(&snapshot, UiResidencyTarget::Primary, &mut progress);
-        assert!(
-            matches!(action, RecoveryAction::Reject(_)),
-            "持续 Unknown 必须失败而不是 Esc，实际 {action:?}"
-        );
-    }
-
-    #[test]
-    fn recovery_decision_paimon_menu_is_rejected_even_when_stable() {
-        let snapshot = snap(UiStateKind::MainMenu, "main_menu", "paimon_menu_panel_template");
-        let mut progress = settled_progress(&snapshot);
-        let action = decide_recovery_step(&snapshot, UiResidencyTarget::Primary, &mut progress);
-        assert!(matches!(action, RecoveryAction::Reject(_)), "派蒙菜单必须拒绝：{action:?}");
-        let action = decide_recovery_step(
-            &snapshot,
-            UiResidencyTarget::SecondaryCurrentHall,
-            &mut progress,
-        );
-        assert!(
-            matches!(action, RecoveryAction::Reject(_)),
-            "目标二级时派蒙菜单同样必须拒绝：{action:?}"
-        );
-    }
-
-    #[test]
-    fn recovery_decision_panel_requires_two_confirmations() {
-        let panel = snap(UiStateKind::Panel, "panel", "panel_template");
-        // 新鲜稳定已满足，但 Panel 只确认过一次：必须继续等到第二次确认。
-        let mut progress = RecoveryProgress {
-            fresh_identity: Some(panel.identity()),
-            fresh_samples: panel.required_count,
-            panel_samples: 1,
-            ..RecoveryProgress::default()
-        };
-        assert_eq!(
-            decide_recovery_step(&panel, UiResidencyTarget::Primary, &mut progress),
-            RecoveryAction::Wait
-        );
-        progress.record(&panel, Instant::now());
-        assert_eq!(
-            decide_recovery_step(&panel, UiResidencyTarget::Primary, &mut progress),
-            RecoveryAction::Escape
-        );
-    }
-
-    #[test]
-    fn recovery_decision_oscillation_trips_breaker() {
-        let primary = snap(UiStateKind::Primary, "primary", "primary_friend_template");
-        let menu = snap(UiStateKind::MainMenu, "main_menu", "main_menu_template");
-        let mut progress = RecoveryProgress::default();
-        progress.kind_tail = vec![
-            UiStateKind::Primary,
-            UiStateKind::MainMenu,
-            UiStateKind::Primary,
-            UiStateKind::MainMenu,
-        ];
-        let action = decide_recovery_step(&primary, UiResidencyTarget::Primary, &mut progress);
-        assert!(
-            matches!(action, RecoveryAction::Reject(_)),
-            "Primary↔MainMenu 振荡必须熔断：{action:?}"
-        );
-        let _ = menu;
-    }
-
-    #[test]
-    fn recovery_decision_no_progress_trips_breaker() {
-        let primary = snap(UiStateKind::Primary, "primary", "primary_friend_template");
-        let mut progress = settled_progress(&primary);
-        progress.pending_action_identity = Some(primary.identity());
-        for _ in 0..RECOVERY_NO_PROGRESS_LIMIT {
-            progress.record(&primary, Instant::now());
-        }
-        let action = decide_recovery_step(&primary, UiResidencyTarget::Primary, &mut progress);
-        assert!(
-            matches!(action, RecoveryAction::Reject(_)),
-            "动作后状态未变必须熔断：{action:?}"
-        );
-    }
-
-    #[test]
-    fn recovery_decision_loading_only_waits() {
-        let loading = snap(UiStateKind::Loading, "loading", "loading_dark");
-        let mut progress = settled_progress(&loading);
-        assert_eq!(
-            decide_recovery_step(&loading, UiResidencyTarget::Primary, &mut progress),
-            RecoveryAction::Wait,
-            "Loading 只能等待，不得发输入"
-        );
     }
 
     struct TransitionResidencyDevice {
@@ -4943,9 +4301,14 @@ mod tests {
         )
     }
 
-    /// 真实残留面板（大厅信息页）截图：状态机判为 Unknown，代表“非一级/二级”的残留界面。
+    /// 真实 Unknown 截图：状态机判为 `Unknown`（`no_reliable_anchor`），代表
+    /// “非一级/二级”的残留界面。原 `unknown-panel-1920x1080.png` 已按真值改为
+    /// F2 多人面板正样本，不能再拿来模拟 Unknown；这里改用同尺寸的真实过渡帧。
     fn unknown_frame(config: &AppConfig) -> DynamicImage {
-        load_real_frame("tests/fixtures/ui/unknown-panel-1920x1080.png", config)
+        load_real_frame(
+            "technical-docs/ui-state-evidence/loading-screens/after-x.jpg",
+            config,
+        )
     }
 
     fn load_real_frame(path: &str, config: &AppConfig) -> DynamicImage {
@@ -4988,7 +4351,7 @@ mod tests {
         }
     }
 
-    /// 用与例程 `restore_secondary_hall` **完全相同**的匹配，算出真实帧里"大厅行"的点击点。
+    /// 用与唯一恢复引擎 `residency::settle_to` **完全相同**的匹配，算出真实帧里"大厅行"的点击点。
     /// 之前用例按配置 rect 中心硬算固定点，换成真实帧后与例程实际命中位置不符，`hall_clicks` 收不到。
     fn hall_row_click_point(frame: &DynamicImage, config: &AppConfig) -> (i32, i32) {
         let routine = FriendDeliveryRoutineConfig::from_app(config);
@@ -5002,6 +4365,29 @@ mod tests {
         .expect("真实二级帧里应能定位到大厅行");
         let center = hit.center();
         (center.x, center.y)
+    }
+
+    /// 会话侧栏扫描区（与生产 `conversation_row_region` 同一几何）。
+    fn conversation_sidebar(config: &AppConfig) -> Rect {
+        conversation_row_region(&FriendDeliveryRoutineConfig::from_app(config))
+    }
+
+    /// 清掉真实帧里自带的旧选中行高亮：真实 UI 同一时刻只有一个会话行高亮，
+    /// 合成"选中另一个会话"的帧时不能把旧高亮也留下（否则会变成两个高亮行）。
+    /// 只清侧栏 x≥80 的亮像素，保留 x<80 的大厅模板列（模板在真实 UI 里始终可见）。
+    fn clear_sidebar_selection(frame: &mut DynamicImage, sidebar: Rect) {
+        let left = sidebar.x.max(80);
+        let right = sidebar.right().min(frame.width() as i32);
+        let bottom = sidebar.bottom().min(frame.height() as i32);
+        for y in sidebar.y.max(0)..bottom {
+            for x in left..right {
+                let [red, green, blue, _] = frame.get_pixel(x as u32, y as u32).0;
+                let luminance = (u16::from(red) + u16::from(green) + u16::from(blue)) / 3;
+                if luminance >= 50 {
+                    frame.put_pixel(x as u32, y as u32, image::Rgba([24, 28, 36, 255]));
+                }
+            }
+        }
     }
 
     #[test]
@@ -5031,9 +4417,9 @@ mod tests {
                 config.moderation.block_chat_region.into(),
             ),
             (
-                "friend-confirm",
-                config.templates.friend_confirm.clone(),
-                config.moderation.confirm_region.into(),
+                "confirm-button",
+                config.templates.confirm_button.clone(),
+                config.moderation.confirm_button_region.into(),
             ),
             (
                 "invite-view-star",
@@ -5155,7 +4541,7 @@ mod tests {
         fn press_key(&mut self, key: Key) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             state.keys.push(key);
-            if key == Key::Escape && state.view == CaptureResidencyView::SecondaryHallRow {
+            if key == Key::Escape && state.view != CaptureResidencyView::Primary {
                 state.view = CaptureResidencyView::Primary;
             } else if key == Key::Return && state.view == CaptureResidencyView::Primary {
                 let next = state.secondary_after_return;
@@ -5243,7 +4629,11 @@ mod tests {
         let hall_point = hall_row_click_point(&secondary_hall_row_frame(&config), &config);
         let state = state.lock().unwrap();
         assert_eq!(state.keys, [Key::Escape, Key::Return]);
-        assert_eq!(state.clicks, [hall_point], "必须点击「当前大厅」行返回驻守");
+        assert!(
+            state.clicks.len() <= 1 && state.clicks.iter().all(|click| *click == hall_point),
+            "只允许点击「当前大厅」行，实际：{:?}",
+            state.clicks
+        );
         drop(state);
 
         ui_runtime.shutdown().unwrap();
@@ -5433,19 +4823,27 @@ mod tests {
         let state = state.lock().unwrap();
         assert!(state.keys.contains(&Key::Escape));
         assert!(state.keys.contains(&Key::Return));
-        assert_eq!(state.clicks, [hall_point], "截图失败后仍必须点击当前大厅返回");
+        assert!(
+            state.clicks.len() <= 1 && state.clicks.iter().all(|click| *click == hall_point),
+            "只允许点击「当前大厅」行，实际：{:?}",
+            state.clicks
+        );
         drop(state);
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }
 
+    /// 入口观测只能确认“在二级”，不能声称具体是当前大厅；因此收尾目标退化为
+    /// `Secondary(Unknown)`：不强制点大厅行，也不因缺少大厅行而失败。
+    /// 需要会话级恢复的调用方必须显式声明 `ConversationRef::CurrentHall/Friend`。
     #[test]
-    fn restore_secondary_failure_is_reported_truthfully_with_captured_image() {
+    fn restore_to_secondary_kind_does_not_require_hall_row_when_entry_conversation_unknown() {
         let config = capture_test_config();
+        // 入口是二级但**没有任何可识别会话证据**（无大厅行模板、无高亮行）。
         let (device, state) = CaptureResidencyDevice::new(
             &config,
-            CaptureResidencyView::SecondaryHallRow,
+            CaptureResidencyView::SecondaryWithoutHallRow,
             CaptureResidencyView::SecondaryWithoutHallRow,
         );
         let ui_runtime = start_test_ui_runtime(device, &config, 4);
@@ -5472,19 +4870,525 @@ mod tests {
             outcome.failure().is_none(),
             "截图成功不应被记成截图失败"
         );
-        match outcome.residency() {
-            UiResidencyOutcome::Failed(failure) => {
-                assert_eq!(failure.stage(), "restore_secondary_hall");
-                assert_eq!(failure.certainty(), InputCertainty::AfterInputUnknown);
-            }
-            other => panic!("返回驻守失败必须如实回报，实际 {other:?}"),
-        }
+        assert_eq!(
+            outcome.residency(),
+            &UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
+            "入口会话识别不了时只保守恢复到二级类型（AnySecondary），不冒充当前大厅"
+        );
         let state = state.lock().unwrap();
-        assert!(state.drags >= 1, "找不到大厅行时必须尝试向列表顶部拖动");
-        assert!(state.clicks.is_empty(), "找不到大厅行时不许乱点");
+        assert_eq!(state.drags, 0, "会话身份未知时不应尝试拖动找大厅行");
+        assert!(state.clicks.is_empty(), "会话身份未知时不许乱点");
         drop(state);
 
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }
+
+    // ---- task-100：入口好友会话随 RestoreEntry 恢复 ----
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FriendListOcrMode {
+        Stable,
+        DropFriendAfterSend,
+        DuplicateFriendAfterSend,
+    }
+
+    struct DynamicFriendOcrDevice {
+        state: Arc<Mutex<TestUiState>>,
+        friend_list_size: (u32, u32),
+        mode: FriendListOcrMode,
+    }
+
+    impl OcrDevice for DynamicFriendOcrDevice {
+        fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            if (image.width(), image.height()) != self.friend_list_size {
+                return Ok(Vec::new());
+            }
+            let sent = self.state.lock().unwrap().send_attempts > 0;
+            let mut lines = vec![OcrLine {
+                text: "乙".to_string(),
+                confidence: 1.0,
+                bbox: Rect::new(5, 150, 80, 30),
+            }];
+            match self.mode {
+                FriendListOcrMode::Stable => {
+                    lines.push(OcrLine {
+                        text: "甲".to_string(),
+                        confidence: 1.0,
+                        bbox: Rect::new(5, 70, 80, 30),
+                    });
+                }
+                FriendListOcrMode::DropFriendAfterSend => {
+                    if !sent {
+                        lines.push(OcrLine {
+                            text: "甲".to_string(),
+                            confidence: 1.0,
+                            bbox: Rect::new(5, 70, 80, 30),
+                        });
+                    }
+                }
+                FriendListOcrMode::DuplicateFriendAfterSend => {
+                    lines.push(OcrLine {
+                        text: "甲".to_string(),
+                        confidence: 1.0,
+                        bbox: Rect::new(5, 70, 80, 30),
+                    });
+                    if sent {
+                        lines.push(OcrLine {
+                            text: "甲".to_string(),
+                            confidence: 1.0,
+                            bbox: Rect::new(5, 110, 80, 30),
+                        });
+                    }
+                }
+            }
+            Ok(lines)
+        }
+    }
+
+    fn entry_friend_test_config() -> AppConfig {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.open_chat_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.input.text_ms = 0;
+        config.timing.input.send_ms = 0;
+        config.timing.invite.step_ms = 0;
+        config.timing.workflow.default_timeout_ms = 5_000;
+        config.timing.workflow.default_poll_ms = 1;
+        config
+    }
+
+    fn entry_friend_delivery(
+        mode: FriendListOcrMode,
+    ) -> (
+        UiRuntime,
+        OcrRuntime,
+        Arc<Mutex<TestUiState>>,
+        SendFriendDeliveriesOutcome,
+    ) {
+        let config = entry_friend_test_config();
+        let friend_list = config.invite.friend_list_region;
+        let frame = secondary_hall_row_frame(&config);
+        let hall_point = hall_row_click_point(&frame, &config);
+        let state = Arc::new(Mutex::new(TestUiState {
+            conversation: Conversation::Friend("甲".to_string()),
+            pasted: Vec::new(),
+            selected_friends: Vec::new(),
+            hall_clicks: 0,
+            scrolls: 0,
+            send_attempts: 0,
+            fail_send_attempt: None,
+        }));
+        let ui_runtime = start_test_ui_runtime(
+            RecordingDevice {
+                frame,
+                state: state.clone(),
+                friend_rows: vec![
+                    (friend_list.y + 85, "甲".to_string()),
+                    (friend_list.y + 165, "乙".to_string()),
+                ],
+                hall_point,
+                sidebar: conversation_sidebar(&config),
+            },
+            &config,
+            4,
+        );
+        let ocr_runtime = OcrRuntime::start(
+            DynamicFriendOcrDevice {
+                state: state.clone(),
+                friend_list_size: (friend_list.width, friend_list.height),
+                mode,
+            },
+            4,
+        )
+        .unwrap();
+        let friend_ui = FriendDeliveryUi::new(
+            ui_runtime.handle(),
+            ocr_runtime.handle(),
+            FriendDeliveryRoutineConfig::from_app(&config),
+        );
+        let outcome = friend_ui
+            .submit(SendFriendDeliveries::new(
+                vec![FriendDelivery::new("乙", ["报名成功"])],
+                UiResidencyTarget::SecondaryCurrentHall,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        (ui_runtime, ocr_runtime, state, outcome)
+    }
+
+    #[test]
+    fn friend_delivery_returns_to_entry_friend_conversation() {
+        let (ui_runtime, ocr_runtime, state, outcome) =
+            entry_friend_delivery(FriendListOcrMode::Stable);
+
+        assert!(outcome.is_complete());
+        assert!(!outcome.session_restore_degraded(), "能回 A 时不应降级");
+        assert_eq!(
+            state.lock().unwrap().conversation,
+            Conversation::Friend("甲".to_string())
+        );
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn friend_delivery_entry_friend_gone_falls_back_to_current_hall() {
+        let (ui_runtime, ocr_runtime, state, outcome) =
+            entry_friend_delivery(FriendListOcrMode::DropFriendAfterSend);
+
+        assert!(outcome.session_restore_degraded(), "回不到 A 时必须标记降级");
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+        ));
+        assert_eq!(state.lock().unwrap().conversation, Conversation::Hall);
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn friend_delivery_ambiguous_entry_friend_falls_back_without_guessing() {
+        let config = entry_friend_test_config();
+        let frame = secondary_hall_row_frame(&config);
+        let hall_point = hall_row_click_point(&frame, &config);
+        let (ui_runtime, ocr_runtime, state, outcome) =
+            entry_friend_delivery(FriendListOcrMode::DuplicateFriendAfterSend);
+
+        assert!(outcome.session_restore_degraded());
+        let state = state.lock().unwrap();
+        assert_eq!(state.conversation, Conversation::Hall);
+        assert!(
+            !state.selected_friends.iter().any(|friend| friend == "甲"),
+            "歧义时不允许点好友行，实际选中的好友：{:?}",
+            state.selected_friends
+        );
+        assert!(
+            state.hall_clicks >= 1,
+            "必须点确定性的大厅行，实际 {} 次",
+            state.hall_clicks
+        );
+        let _ = hall_point;
+        drop(state);
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    struct SettleConversationRoutine {
+        target: ResidencyTarget,
+        config: FriendDeliveryRoutineConfig,
+        ocr: OcrRuntimeHandle,
+    }
+
+    impl sealed::UiRoutineSealed for SettleConversationRoutine {}
+
+    impl UiRoutine for SettleConversationRoutine {
+        type Output = std::result::Result<super::super::residency::RecoveryReport, UiRoutineFailure>;
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            super::super::residency::settle_to(
+                context,
+                &super::super::residency::SettleEnvironment::new(self.ocr, self.config),
+                self.target,
+            )
+        }
+    }
+
+    struct ConversationOcrDevice {
+        lines: Vec<OcrLine>,
+        friend_list_size: (u32, u32),
+    }
+
+    impl OcrDevice for ConversationOcrDevice {
+        fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            if (image.width(), image.height()) == self.friend_list_size {
+                return Ok(self.lines.clone());
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    fn paint_conversation_highlight(frame: &mut DynamicImage, region: Rect, y: i32) {
+        // 真实帧自带旧选中行；先清掉再画本次选中行，保持"只有一个高亮行"的真实语义。
+        clear_sidebar_selection(frame, region);
+        for row_y in (y - 35).max(0)..(y + 35) {
+            for x in region.x.max(0)..region.right().min(frame.width() as i32) {
+                frame.put_pixel(x as u32, row_y as u32, image::Rgba([65, 73, 86, 255]));
+            }
+        }
+    }
+
+    fn conversation_test_config() -> AppConfig {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.input.open_chat_ms = 0;
+        config.timing.workflow.default_timeout_ms = 5_000;
+        config.timing.workflow.default_poll_ms = 1;
+        config
+    }
+
+    #[test]
+    fn residency_restores_current_hall_from_friend_conversation() {
+        let config = conversation_test_config();
+        let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        let region = conversation_row_region(&routine_config);
+        let hall_y = hall_row_click_point(&secondary_hall_row_frame(&config), &config).1;
+        let mut friend_view = secondary_hall_row_frame(&config);
+        paint_conversation_highlight(&mut friend_view, region, config.invite.friend_list_region.y + 165);
+        // 点了大厅行后：模板保持完整（当前大厅），不再覆盖高亮以免改坏模板像素。
+        let hall_view = secondary_hall_row_frame(&config);
+        let _ = hall_y;
+
+        let (device, state) = ScriptedStateDevice::new(vec![friend_view, hall_view]);
+        let device = device.on_click(0, 1);
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+
+        let report = ui_runtime
+            .handle()
+            .submit(SettleConversationRoutine {
+                target: super::super::residency::ResidencyTarget::current_hall(),
+                config: routine_config,
+                ocr: ocr_runtime.handle(),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("必须从好友会话恢复到当前大厅");
+
+        assert!(!report.degraded);
+        assert_eq!(report.conversation_actions, 1, "只允许点一次大厅行");
+        assert!(matches!(
+            report.settled_conversation,
+            Some(super::super::residency::ConversationRef::CurrentHall)
+        ));
+        assert_eq!(state.lock().unwrap().clicks.len(), 1);
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn residency_restores_friend_conversation_by_highlighted_row() {
+        let config = conversation_test_config();
+        let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        let region = conversation_row_region(&routine_config);
+        let friend_list = config.invite.friend_list_region;
+        let row_y = friend_list.y + 165;
+        let mut frame = secondary_hall_row_frame(&config);
+        paint_conversation_highlight(&mut frame, region, row_y);
+
+        let (device, state) = ScriptedStateDevice::new(vec![frame]);
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(
+            ConversationOcrDevice {
+                lines: vec![OcrLine {
+                    text: "甲".to_string(),
+                    confidence: 1.0,
+                    bbox: Rect::new(5, row_y - friend_list.y - 15, 80, 30),
+                }],
+                friend_list_size: (friend_list.width, friend_list.height),
+            },
+            1,
+        )
+        .unwrap();
+
+        let report = ui_runtime
+            .handle()
+            .submit(SettleConversationRoutine {
+                target: super::super::residency::ResidencyTarget::Secondary(
+                    super::super::residency::ConversationRef::friend("甲", vec!["甲".to_string()]),
+                ),
+                config: routine_config,
+                ocr: ocr_runtime.handle(),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("高亮行就是目标好友时必须确认成功");
+
+        assert!(!report.degraded);
+        assert_eq!(report.conversation_actions, 0, "已在目标会话时不允许点击");
+        assert!(state.lock().unwrap().clicks.is_empty());
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    /// 只回答"唯一高亮行"这一 crop 的 OCR：用来证明真实好友帧（选中行在列表配置区
+    /// 上方 y≈226）在恢复时走的是高亮行补扫，而不是整列表 OCR / 滚动兜底。
+    struct SelectedRowOnlyOcrDevice {
+        row: Rect,
+        text: &'static str,
+    }
+
+    impl OcrDevice for SelectedRowOnlyOcrDevice {
+        fn recognize_lines(&mut self, image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            if (image.width(), image.height()) != (self.row.width, self.row.height) {
+                return Ok(Vec::new());
+            }
+            Ok(vec![OcrLine {
+                text: self.text.to_string(),
+                confidence: 1.0,
+                bbox: Rect::new(10, self.row.height as i32 / 2 - 15, 120, 30),
+            }])
+        }
+    }
+
+    #[test]
+    fn residency_restores_real_friend_conversation_selected_above_list_top() {
+        let config = conversation_test_config();
+        let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        let frame = secondary_frame(&config);
+        let region = conversation_row_region(&routine_config);
+        let row = highlighted_conversation_row(&frame, region)
+            .expect("真实好友帧必须有唯一高亮行（选中行 y≈226）");
+        assert!(
+            row.y < config.invite.friend_list_region.y,
+            "该回归只在选中行滚到列表配置区上方时才有意义：row={row:?}"
+        );
+
+        let (device, state) = ScriptedStateDevice::new(vec![frame]);
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(
+            SelectedRowOnlyOcrDevice {
+                row,
+                text: "甲",
+            },
+            1,
+        )
+        .unwrap();
+
+        let report = ui_runtime
+            .handle()
+            .submit(SettleConversationRoutine {
+                target: ResidencyTarget::Secondary(ConversationRef::friend(
+                    "甲",
+                    vec!["甲".to_string()],
+                )),
+                config: routine_config,
+                ocr: ocr_runtime.handle(),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("真实好友帧选中行在列表区上方时也必须确认目标会话，不能报未找到唯一的高亮会话行");
+
+        assert!(!report.degraded);
+        assert_eq!(report.conversation_actions, 0, "已在目标会话时不允许点击");
+        assert_eq!(
+            report.settled_conversation,
+            Some(ConversationRef::friend("甲", vec!["甲".to_string()]))
+        );
+        assert!(state.lock().unwrap().clicks.is_empty());
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn residency_ambiguous_friend_rows_fall_back_to_current_hall_without_guessing() {
+        let config = conversation_test_config();
+        let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        let region = conversation_row_region(&routine_config);
+        let friend_list = config.invite.friend_list_region;
+        let hall_y = hall_row_click_point(&secondary_hall_row_frame(&config), &config).1;
+        let mut friend_view = secondary_hall_row_frame(&config);
+        paint_conversation_highlight(&mut friend_view, region, friend_list.y + 85);
+        // 点了大厅行后：模板保持完整（当前大厅），不再覆盖高亮以免改坏模板像素。
+        let hall_view = secondary_hall_row_frame(&config);
+        let _ = hall_y;
+
+        let (device, state) = ScriptedStateDevice::new(vec![friend_view, hall_view]);
+        let device = device.on_click(0, 1);
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(
+            ConversationOcrDevice {
+                lines: vec![
+                    OcrLine {
+                        text: "甲".to_string(),
+                        confidence: 1.0,
+                        bbox: Rect::new(5, 85 - 15, 80, 30),
+                    },
+                    OcrLine {
+                        text: "甲".to_string(),
+                        confidence: 1.0,
+                        bbox: Rect::new(5, 165 - 15, 80, 30),
+                    },
+                ],
+                friend_list_size: (friend_list.width, friend_list.height),
+            },
+            1,
+        )
+        .unwrap();
+
+        let report = ui_runtime
+            .handle()
+            .submit(SettleConversationRoutine {
+                target: super::super::residency::ResidencyTarget::Secondary(
+                    super::super::residency::ConversationRef::friend("甲", vec!["甲".to_string()]),
+                ),
+                config: routine_config,
+                ocr: ocr_runtime.handle(),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("歧义时按明确 fallback 回当前大厅");
+
+        assert!(
+            report.degraded,
+            "好友会话未恢复必须标记降级: settled={:?} actions={}",
+            report.settled_conversation,
+            report.conversation_actions
+        );
+        assert!(matches!(
+            report.settled_conversation,
+            Some(super::super::residency::ConversationRef::CurrentHall)
+        ));
+        let clicks = state.lock().unwrap().clicks.clone();
+        assert_eq!(clicks.len(), 1, "只允许点击确定性的当前大厅行，实际 {clicks:?}");
+        let hall_point = hall_row_click_point(&secondary_hall_row_frame(&config), &config);
+        assert_eq!(clicks[0], hall_point, "fallback 只能点大厅行，不能猜好友行");
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn residency_missing_friend_row_falls_back_to_current_hall() {
+        let config = conversation_test_config();
+        let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
+        let region = conversation_row_region(&routine_config);
+        let hall_y = hall_row_click_point(&secondary_hall_row_frame(&config), &config).1;
+        let mut friend_view = secondary_hall_row_frame(&config);
+        paint_conversation_highlight(&mut friend_view, region, config.invite.friend_list_region.y + 85);
+        // 点了大厅行后：模板保持完整（当前大厅），不再覆盖高亮以免改坏模板像素。
+        let hall_view = secondary_hall_row_frame(&config);
+        let _ = hall_y;
+
+        let (device, state) = ScriptedStateDevice::new(vec![friend_view, hall_view]);
+        let device = device.on_click(0, 1);
+        let ui_runtime = start_test_ui_runtime(device, &config, 4);
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+
+        let report = ui_runtime
+            .handle()
+            .submit(SettleConversationRoutine {
+                target: super::super::residency::ResidencyTarget::Secondary(
+                    super::super::residency::ConversationRef::friend("甲", vec!["甲".to_string()]),
+                ),
+                config: routine_config,
+                ocr: ocr_runtime.handle(),
+            })
+            .unwrap()
+            .wait()
+            .unwrap()
+            .expect("找不到好友行时按明确 fallback 回当前大厅");
+
+        assert!(report.degraded);
+        assert_eq!(state.lock().unwrap().clicks.len(), 1);
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
 }

@@ -435,28 +435,31 @@ impl ApplicationRuntime {
                         .unwrap_or(0),
                 });
                 let tts_config = self.lifecycle.live_configs.snapshot().tts.clone();
-                let mut tools = if config.allow_commands {
-                    ai_chat::command_tools(&allowed)
-                } else {
-                    Vec::new()
-                };
-                let tts_tool_available = tts_config.enabled
+                // **tools 数组与 system prompt 必须同源，且只由配置决定**：
+                // 两者都是 provider 前缀缓存的一部分。以前 tools 还看
+                // 「这位玩家有没有可用命令」「TTS 播放器健康度」「模型图片能力」
+                // 这些运行期状态，任何一次抖动都会让整段前缀作废，并且会出现
+                // system 教模型调用 tools 里并不存在的函数。
+                // 运行期不可用时在工具回执里返回 unavailable（见 speak 分支），
+                // 不靠临时删工具来表达。
+                let speak_configured = tts_config.enabled
                     && tts_config.trigger_scope == crate::features::tts::TtsTriggerScope::AiChat
-                    && !tts_config.api_key.trim().is_empty()
-                    && self.business.tts.available();
-                if tts_tool_available {
+                    && !tts_config.api_key.trim().is_empty();
+                let look_configured = ai_chat::look_tool_available(&config);
+                let mut tools = Vec::new();
+                if config.allow_commands {
+                    tools.extend(ai_chat::command_tools());
+                }
+                if speak_configured {
                     tools.push(ai_chat::speak_tool_for_model(
                         &tts_config.model,
                         tts_config.max_chars,
                     ));
                 }
-                let vision_model = self.ai_chat_vision_model(&config);
-                let look_enabled = ai_chat::look_tool_available(&config)
-                    && config.vision.enabled
-                    && self.ai_chat_model_vision_capability(&vision_model) != Some(false);
-                if look_enabled {
+                if look_configured {
                     tools.push(ai_chat::look_tool());
                 }
+                let vision_model = self.ai_chat_vision_model(&config);
                 // 只有 auto/both 需要查主模型是否支持图片；tool 模式不为 auto 查。
                 // vision.model 仅给 look 子请求，主聊天始终用 ai_chat.model。
                 let main_model = self.ai_chat_main_model(&config);
@@ -468,12 +471,11 @@ impl ApplicationRuntime {
                     ) || config.vision.direct_to_main))
                     .then(|| self.ai_chat_model_supports_vision(&main_model))
                     .unwrap_or(false);
-                let command_enabled = config.allow_commands && !allowed.is_empty();
                 let system_prompt = ai_chat::response_system_prompt_with_tools(
                     &config,
-                    look_enabled,
-                    tts_tool_available,
-                    command_enabled,
+                    look_configured,
+                    speak_configured,
+                    config.allow_commands,
                 );
                 let ai_deadline = Instant::now() + self.business.ai_request_timeout;
                 let mut vision_image = if ai_chat::auto_image_enabled(&config, main_supports_vision) {
@@ -497,7 +499,7 @@ impl ApplicationRuntime {
                                 reasoning: config.reasoning,
                             },
                             &system_prompt,
-                            ai_chat::conversation_history(&context),
+                            ai_chat::conversation_history(&context, &actor_display),
                             &prompt,
                             tools.clone(),
                             vision_image.clone(),
@@ -639,35 +641,46 @@ impl ApplicationRuntime {
                                     }),
                                 }
                             } else if call.name == ai_chat::SPEAK_TOOL {
-                                match ai_chat::parse_speak_arguments_for_model(
-                                    &call.arguments,
-                                    &tts_config.model,
-                                ) {
-                                    Ok((text, options)) => {
-                                        log::info!(
-                                            "AI TTS：调用 speak 工具（text 字数 {}）",
-                                            text.chars().count()
-                                        );
-                                        if spoken.contains(&text) {
-                                            log::warn!("AI TTS：speak 参数拒绝（重复文本）");
-                                            serde_json::json!({"status":"rejected","reason":"同一回答内禁止重复朗读相同文本"})
-                                        } else {
-                                            // 先记下，等文字回复发送后再入队，避免语音抢在文字前。
-                                            spoken.insert(text.clone());
-                                            pending_speaks.push((text, options));
-                                            log::info!("AI TTS：speak 已入队");
+                                // tools 里声明了 speak（配置开启），但语音播放器
+                                // 此刻可能不可用；如实回 unavailable，让模型改用
+                                // 文字，而不是提示 queued 后静默失败。
+                                if !self.business.tts.available() {
+                                    log::warn!("AI TTS：speak 调用时语音不可用，已回 unavailable");
+                                    serde_json::json!({
+                                        "status":"unavailable",
+                                        "reason":"语音当前不可用，请只用文字回复，不要声称已朗读"
+                                    })
+                                } else {
+                                    match ai_chat::parse_speak_arguments_for_model(
+                                        &call.arguments,
+                                        &tts_config.model,
+                                    ) {
+                                        Ok((text, options)) => {
+                                            log::info!(
+                                                "AI TTS：调用 speak 工具（text 字数 {}）",
+                                                text.chars().count()
+                                            );
+                                            if spoken.contains(&text) {
+                                                log::warn!("AI TTS：speak 参数拒绝（重复文本）");
+                                                serde_json::json!({"status":"rejected","reason":"同一回答内禁止重复朗读相同文本"})
+                                            } else {
+                                                // 先记下，等文字回复发送后再入队，避免语音抢在文字前。
+                                                spoken.insert(text.clone());
+                                                pending_speaks.push((text, options));
+                                                log::info!("AI TTS：speak 已入队");
+                                                serde_json::json!({
+                                                    "status":"queued",
+                                                    "reason":"语音已排队，将在文字回复后播放；queued 不代表已播放"
+                                                })
+                                            }
+                                        }
+                                        Err(_) => {
+                                            log::warn!("AI TTS：speak 参数拒绝（Schema 或模型不支持）");
                                             serde_json::json!({
-                                                "status":"queued",
-                                                "reason":"语音已排队，将在文字回复后播放；queued 不代表已播放"
+                                                "status":"rejected",
+                                                "reason":"speak 参数不符合工具 Schema 或当前模型不支持"
                                             })
                                         }
-                                    }
-                                    Err(_) => {
-                                        log::warn!("AI TTS：speak 参数拒绝（Schema 或模型不支持）");
-                                        serde_json::json!({
-                                            "status":"rejected",
-                                            "reason":"speak 参数不符合工具 Schema 或当前模型不支持"
-                                        })
                                     }
                                 }
                             } else if call.name != ai_chat::COMMAND_TOOL {
@@ -1046,8 +1059,8 @@ impl ApplicationRuntime {
 
     /// 超过预算时把最旧的记忆压成摘要（后台线程，完全不阻塞正式任务）。
     ///
-    /// 分层（用户定的比例）：最远的 70% 压缩、20% 摘要、10% 最近原文完整保存。
-    /// 远期事实单独存，不参与压缩。
+    /// 原文 append-only，不按轮数滑窗；占用超过 82% 才压缩，一次压到 15%，
+    /// 最新一轮原文始终保留。摘要只是溢出阀门，远期事实单独存、不参与压缩。
     ///
     /// 压缩失败只记日志：回复已经发出，不该因为整理记忆而报错；
     /// 原文仍在库里，下一轮会再试。空摘要也不会覆盖旧摘要。

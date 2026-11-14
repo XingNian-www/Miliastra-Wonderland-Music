@@ -237,7 +237,7 @@ fn real_menus_and_known_secondary_panels_are_not_passive_chat() -> Result<()> {
         (
             "tests/fixtures/ui/menu-paimon-1920x1080.jpg",
             UiStateKind::MainMenu,
-            "paimon_menu_panel_template",
+            "paimon_menu_grid",
         ),
         (
             "technical-docs/ui-state-evidence/qianxing-ui-59/r10-now.jpg",

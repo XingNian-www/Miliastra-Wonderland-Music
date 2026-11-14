@@ -5,21 +5,32 @@
 //! 入口观测一次（兼作目标检查）→ 必要时导航 → 执行内层例程 →
 //! **finally** 统一走 `settle_to` 回到入口/指定界面。
 //!
-//! 本文件只提供核心状态机与基础动作表；hall / friend_delivery / invite /
-//! moderation / startup / custom_action 等例程的迁移在后续任务里做，本文件不替换它们。
+//! 恢复/收尾只调用 `residency::settle_to`（唯一引擎），本文件不再自带 settle 状态机；
+//! hall / friend_delivery / invite / moderation / startup / custom_action /
+//! secondary_unread 等例程都通过 `UiTaskSpec` 声明策略，不再各自实现收尾。
 //!
 //! 两条硬约束：
 //! - 收尾必须走显式 `finally`，不能用 `Drop`（worker panic 时上下文/设备不可用）。
 //! - 入口观测必须在**任何输入之前**；目标检查复用入口观测，不重复截图。
 
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use enigo::Key;
 
 use super::friend_delivery::{UiResidencyOutcome, UiResidencyTarget};
+use super::residency::{
+    ConversationRef, RecoveryReport, ResidencyTarget, SettleEnvironment, SettleOptions,
+    identify_conversation, settle_to, settle_to_with,
+};
+use super::state_observation::{SecondarySurface, UiSurface, surface_of};
 use crate::runtime::ui::{
     InputCertainty, UiRoutine, UiRoutineContext, UiRoutineFailure, UiStateKind, UiStateObservation,
 };
+
+/// 入口稳定观察轮询。
+const ENTRY_POLL: Duration = Duration::from_millis(100);
 
 /// 入口采集策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,39 +47,59 @@ pub(crate) enum EntryPolicy {
 }
 
 /// 收尾策略。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FinishPolicy {
     /// 回到入口界面；入口不可重建时退到 `fallback`。
-    RestoreEntry { fallback: UiResidencyTarget },
+    RestoreEntry { fallback: ResidencyTarget },
     /// 固定在某个驻留目标（值守基线类任务）。
-    Fixed(UiResidencyTarget),
-    /// 保持收尾时的界面，不做任何导航（调试/只读）。
+    Fixed(ResidencyTarget),
+    /// 任务结束后**不再导航**，也不承诺回到某个入口（启动链进游戏/进千星等）。
+    /// 与 `KeepCurrent` 的区别：Leave 是业务语义“离开前不安排收尾”，
+    /// KeepCurrent 只用于“恢复器本身不导航”的调试/诊断路径。
+    Leave,
+    /// 保持收尾时的界面，不做任何导航（恢复器/诊断路径）。
     KeepCurrent,
-    /// 由内层脚本自己声明/完成收尾，包装器不再动作。
+    /// 由内层脚本自己声明/完成收尾，包装器不再动作（CustomAction 的真实语义）。
     ScriptDeclared,
 }
 
-/// 一次 UI 任务的事务声明。
+/// 任务开始前的激活策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivationPolicy {
+    /// 不激活（默认）。
+    None,
+    /// 激活/等待前台 `wait_ms` 毫秒。
+    Activate { wait_ms: u64 },
+}
+
+/// 一次 UI 任务的事务声明。
+#[derive(Clone, Debug)]
 pub(crate) struct UiTaskSpec {
-    pub(crate) target: UiResidencyTarget,
+    pub(crate) target: ResidencyTarget,
     pub(crate) entry: EntryPolicy,
     pub(crate) finish: FinishPolicy,
-    pub(crate) activate: bool,
+    pub(crate) activation: ActivationPolicy,
     pub(crate) total_budget: Duration,
+    /// 唯一恢复引擎环境（transaction 不再自带恢复配置）。
+    pub(crate) environment: SettleEnvironment,
 }
 
 impl UiTaskSpec {
     /// 默认总预算：足够一次导航 + 内层例程 + 一次收尾。
     pub(crate) const DEFAULT_TOTAL_BUDGET: Duration = Duration::from_secs(8);
 
-    pub(crate) fn new(target: UiResidencyTarget, finish: FinishPolicy) -> Self {
+    pub(crate) fn new(
+        target: impl Into<ResidencyTarget>,
+        finish: FinishPolicy,
+        environment: SettleEnvironment,
+    ) -> Self {
         Self {
-            target,
+            target: target.into(),
             entry: EntryPolicy::Observe,
             finish,
-            activate: false,
+            activation: ActivationPolicy::None,
             total_budget: Self::DEFAULT_TOTAL_BUDGET,
+            environment,
         }
     }
 
@@ -77,8 +108,8 @@ impl UiTaskSpec {
         self
     }
 
-    pub(crate) fn with_activate(mut self, activate: bool) -> Self {
-        self.activate = activate;
+    pub(crate) fn with_activation(mut self, activation: ActivationPolicy) -> Self {
+        self.activation = activation;
         self
     }
 
@@ -94,9 +125,12 @@ impl UiTaskSpec {
 #[derive(Clone, Debug)]
 pub(crate) struct EntryUiState {
     pub(crate) kind: UiStateKind,
-    pub(crate) residency: Option<UiResidencyTarget>,
+    pub(crate) residency: Option<ResidencyTarget>,
+    /// 入口所在的会话（仅当调用方明确声明/可确认时才有值；观测到的 Secondary 不猜身份）。
+    pub(crate) conversation: Option<ConversationRef>,
+    pub(crate) overlays: Vec<String>,
     pub(crate) label: String,
-    /// 分类证据里的规则名；用于区分千星主菜单与派蒙菜单（两者 kind 都是 MainMenu）。
+    /// 分类证据里的规则名；用于区分主菜单千星与主菜单大世界（两者 kind 都是 MainMenu）。
     pub(crate) final_rule: String,
     pub(crate) frame_id: Option<u64>,
     pub(crate) observed_at: Instant,
@@ -109,10 +143,20 @@ impl EntryUiState {
         final_rule: String,
         frame_id: Option<u64>,
         observed_at: Instant,
+        conversation: Option<ConversationRef>,
     ) -> Self {
+        let residency = match kind {
+            UiStateKind::Primary => Some(ResidencyTarget::Primary),
+            UiStateKind::Secondary => Some(ResidencyTarget::Secondary(
+                conversation.clone().unwrap_or(ConversationRef::Unknown),
+            )),
+            _ => None,
+        };
         Self {
             kind,
-            residency: residency_for(kind),
+            residency,
+            conversation,
+            overlays: Vec::new(),
             label,
             final_rule,
             frame_id,
@@ -120,10 +164,15 @@ impl EntryUiState {
         }
     }
 
-    fn assumed(target: UiResidencyTarget) -> Self {
+    fn assumed(target: ResidencyTarget) -> Self {
         Self {
-            kind: kind_for(target),
-            residency: Some(target),
+            kind: kind_for(&target),
+            residency: Some(target.clone()),
+            conversation: match &target {
+                ResidencyTarget::Primary => None,
+                ResidencyTarget::Secondary(conversation) => Some(conversation.clone()),
+            },
+            overlays: Vec::new(),
             label: "assumed".to_string(),
             final_rule: String::new(),
             frame_id: None,
@@ -136,31 +185,60 @@ impl EntryUiState {
         self.residency.is_some()
     }
 
-    /// 入口是否允许被导航（Unknown/Loading/启动链界面不允许盲动作）。
-    pub(crate) fn may_navigate(&self) -> bool {
-        !matches!(
-            self.kind,
-            UiStateKind::Unknown
-                | UiStateKind::Loading
-                | UiStateKind::GameGate
-                | UiStateKind::Overworld
-        )
+    /// 入口可在恢复时重建的目标。
+    ///
+    /// 二级入口必须带上真实会话（`conversation` 为空时明确是 `Unknown`，
+    /// 表示"只保证在二级"），不允许把 Unknown 猜成当前大厅。
+    pub(crate) fn restore_target(&self) -> Option<ResidencyTarget> {
+        match &self.residency {
+            None => None,
+            Some(ResidencyTarget::Primary) => Some(ResidencyTarget::Primary),
+            // 观察到 Secondary 但识别不出会话：保守恢复到"二级类型"（AnySecondary，
+            // 明确不声明具体会话），不冒充 CurrentHall。
+            Some(ResidencyTarget::Secondary(_)) => Some(ResidencyTarget::Secondary(
+                self.conversation
+                    .clone()
+                    .unwrap_or(ConversationRef::AnySecondary),
+            )),
+        }
     }
 }
 
+/// 失败现场帧的证据：默认只有元数据；诊断开启时附带落盘路径。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FrameEvidence {
+    pub(crate) frame_id: Option<u64>,
+    pub(crate) captured_at: Option<Instant>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// `MILIASTRA_UI_DIAGNOSTICS=1` 时落盘到 `<exe>/deps/diagnostics`。
+    pub(crate) path: Option<PathBuf>,
+}
+
 /// 收尾结果。失败不抛异常，由调用方决定要不要重试（见 `UiTaskOutcome::safe_retry`）。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct FinishReport {
-    /// 是否进入了收尾阶段（KeepCurrent / ScriptDeclared / 无收尾义务时为 false）。
+    /// 是否进入了收尾阶段（Leave / ScriptDeclared / 无收尾义务时为 false）。
     pub(crate) attempted: bool,
-    /// 是否确认落到目标界面。
+    /// 是否确认落到目标界面（Leave 时表示“观察到的界面可作为聊天驻留”）。
     pub(crate) settled: bool,
-    pub(crate) target: Option<UiResidencyTarget>,
-    /// 收尾实际发出的输入动作数（Esc/Return 等）。
+    pub(crate) target: Option<ResidencyTarget>,
+    /// 收尾实际发出的输入动作数（由唯一恢复引擎报告）。
     pub(crate) actions: u32,
+    /// 声明 Leave：任务结束后不恢复入口，仅记录观察到的界面。
+    pub(crate) left: bool,
+    /// 脚本声明收尾（CustomAction）：包装器没有确认驻留，不能当 `settled`。
+    pub(crate) script_declared: bool,
     /// 入口不可重建而退到 `fallback`。
     pub(crate) fallback_used: bool,
     pub(crate) failure: Option<UiRoutineFailure>,
+    /// 唯一恢复引擎的完整报告（成功时）。
+    pub(crate) recovery: Option<RecoveryReport>,
+    /// 失败诊断（来自引擎失败报告）。
+    pub(crate) history: Vec<String>,
+    pub(crate) last_snapshot: Option<String>,
+    /// 失败/异常时的最近一帧证据（默认仅元数据，诊断开关开启才落盘）。
+    pub(crate) last_frame: Option<FrameEvidence>,
 }
 
 /// UI 任务统一返回值。
@@ -170,6 +248,8 @@ pub(crate) struct UiTaskOutcome<T> {
     pub(crate) entry: Option<EntryUiState>,
     /// 内层例程的输出；只要内层开始执行就有 `Some`（即使它返回 Err）。
     pub(crate) output: Option<T>,
+    /// 内层例程 panic 的失败（`InputCertainty::Panicked`）；仍会进入收尾。
+    pub(crate) output_failure: Option<UiRoutineFailure>,
     /// 内层根本没有开始执行时的原因（入口观测/目标导航失败）。
     pub(crate) entry_failure: Option<UiRoutineFailure>,
     pub(crate) finish: FinishReport,
@@ -220,6 +300,7 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
         let mut outcome = UiTaskOutcome {
             entry: None,
             output: None,
+            output_failure: None,
             entry_failure: None,
             finish: FinishReport::default(),
             residency: UiResidencyOutcome::Failed(failure(
@@ -237,11 +318,11 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
                 "ui_task_start",
                 "任务在开始前已取消",
             ));
-            return outcome;
+            return finish_outcome(outcome, context, started_epoch);
         }
 
-        if self.spec.activate
-            && let Err(error) = context.device().activate(0)
+        if let ActivationPolicy::Activate { wait_ms } = self.spec.activation
+            && let Err(error) = context.device().activate(wait_ms)
         {
             outcome.entry_failure = Some(failure(
                 InputCertainty::BeforeInput,
@@ -262,15 +343,20 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
             EntryPolicy::Passthrough => {
                 // 旁路：不观测、不导航；但若收尾策略要求固定目标，仍走统一收尾
                 // （例如邀请任务：入口不做任何导航，进新大厅后统一落到 Primary）。
-                outcome.output = Some(self.inner.execute(context));
-                outcome.finish = match self.spec.finish {
+                let (output, panic_failure) = execute_inner(self.inner, context);
+                outcome.output = output;
+                outcome.output_failure = panic_failure;
+                outcome.finish = match &self.spec.finish {
                     FinishPolicy::KeepCurrent | FinishPolicy::ScriptDeclared => {
-                        no_action_finish(self.spec.finish, outcome.entry.as_ref())
+                        no_action_finish(self.spec.finish.clone(), outcome.entry.as_ref())
                     }
-                    FinishPolicy::Fixed(_) | FinishPolicy::RestoreEntry { .. } => run_finish(
+                    FinishPolicy::Leave
+                    | FinishPolicy::Fixed(_)
+                    | FinishPolicy::RestoreEntry { .. } => run_finish(
                         context,
-                        self.spec.finish,
+                        self.spec.finish.clone(),
                         outcome.entry.as_ref(),
+                        &self.spec.environment,
                         deadline,
                     ),
                 };
@@ -278,13 +364,13 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
                 return finish_outcome(outcome, context, started_epoch);
             }
             EntryPolicy::AssumeTarget => {
-                outcome.entry = Some(EntryUiState::assumed(self.spec.target));
+                outcome.entry = Some(EntryUiState::assumed(self.spec.target.clone()));
             }
             EntryPolicy::Observe | EntryPolicy::RequireTarget => {
                 let entry_budget = entry_budget(deadline);
-                match observe_entry(context, entry_budget) {
+                match observe_entry(context, entry_budget, &self.spec.environment) {
                     Ok(entry) => {
-                        let matches_target = kind_matches(entry.kind, self.spec.target);
+                        let matches_target = kind_matches(entry.kind, &self.spec.target);
                         outcome.entry = Some(entry);
                         if self.spec.entry == EntryPolicy::RequireTarget && !matches_target {
                             let entry = outcome
@@ -296,7 +382,7 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
                                 "ui_task_entry",
                                 format!(
                                     "入口界面不满足任务前置要求（需要 {}，当前：{}）；未发送任何输入",
-                                    target_label(self.spec.target),
+                                    target_label(&self.spec.target),
                                     entry.label
                                 ),
                             ));
@@ -306,7 +392,34 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
                                     .clone()
                                     .expect("entry failure was just set"),
                             );
-                            return outcome;
+                            return finish_outcome(outcome, context, started_epoch);
+                        }
+                        if self.spec.entry == EntryPolicy::RequireTarget
+                            && let ResidencyTarget::Secondary(conversation) =
+                                &self.spec.target
+                            && *conversation != ConversationRef::Unknown
+                        {
+                            // 输入前无法从分类证据确认具体会话；保守拒绝，零按键。
+                            let entry = outcome
+                                .entry
+                                .as_ref()
+                                .expect("entry was just stored");
+                            outcome.entry_failure = Some(failure(
+                                InputCertainty::BeforeInput,
+                                "ui_task_entry",
+                                format!(
+                                    "入口会话无法在输入前确认（需要 {}；当前仅确认二级：{}）；未发送任何输入",
+                                    target_label(&self.spec.target),
+                                    entry.label
+                                ),
+                            ));
+                            outcome.residency = UiResidencyOutcome::Failed(
+                                outcome
+                                    .entry_failure
+                                    .clone()
+                                    .expect("entry failure was just set"),
+                            );
+                            return finish_outcome(outcome, context, started_epoch);
                         }
                         navigate_to_target = !matches_target;
                     }
@@ -318,7 +431,7 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
                                 .clone()
                                 .expect("entry failure was just set"),
                         );
-                        return outcome;
+                        return finish_outcome(outcome, context, started_epoch);
                     }
                 }
             }
@@ -326,8 +439,11 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
 
         // 目标检查复用入口观测：已在目标就不导航。
         if navigate_to_target && outcome.entry.is_some() {
-            let remaining = remaining_until(deadline);
-            if let Err(error) = settle_to(context, self.spec.target, remaining) {
+            if let Err(error) = settle_to(
+                context,
+                &self.spec.environment,
+                self.spec.target.clone(),
+            ) {
                 outcome.entry_failure = Some(error);
                 // 导航阶段可能已经发过输入（例如按了 Esc 才发现回不去），
                 // 不能当成“执行前失败”直接返回：仍要进入 finally 收尾。
@@ -335,16 +451,34 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
         }
 
         if outcome.entry_failure.is_none() {
-            outcome.output = Some(self.inner.execute(context));
+            let (output, panic_failure) = execute_inner(self.inner, context);
+            outcome.output = output;
+            outcome.output_failure = panic_failure;
         }
 
+        // 强制完成：例程已确认到达目标界面（主世界 / 千星），不再执行收尾导航，
+        // 也不让后续任务误以为还需要恢复驻留。这是用户要求的“检测到就无条件停”。
+        if context.is_force_finished() {
+            outcome.finish = FinishReport {
+                settled: true,
+                target: Some(self.spec.target.clone()),
+                ..FinishReport::default()
+            };
+            outcome.residency = UiResidencyOutcome::Confirmed(match &self.spec.target {
+                ResidencyTarget::Primary => UiResidencyTarget::Primary,
+                ResidencyTarget::Secondary(_) => UiResidencyTarget::SecondaryCurrentHall,
+            });
+            return finish_outcome(outcome, context, started_epoch);
+        }
         let input_epochs = context.input_epoch().saturating_sub(started_epoch);
-        let finish_obligation = input_epochs > 0 || outcome.output.is_some();
+        let finish_obligation =
+            input_epochs > 0 || outcome.output.is_some() || outcome.output_failure.is_some();
         if finish_obligation {
             outcome.finish = run_finish(
                 context,
-                self.spec.finish,
+                self.spec.finish.clone(),
                 outcome.entry.as_ref(),
+                &self.spec.environment,
                 deadline,
             );
             outcome.residency = finish_residency(&outcome.finish);
@@ -361,7 +495,73 @@ fn finish_outcome<T>(
     started_epoch: u64,
 ) -> UiTaskOutcome<T> {
     outcome.input_epoch = context.input_epoch().saturating_sub(started_epoch);
+    let failed = outcome.finish.failure.is_some()
+        || outcome.entry_failure.is_some()
+        || outcome.output_failure.is_some();
+    if failed && outcome.finish.last_frame.is_none() {
+        outcome.finish.last_frame = capture_failure_frame(context);
+    }
     outcome
+}
+
+fn diagnostics_enabled() -> bool {
+    std::env::var("MILIASTRA_UI_DIAGNOSTICS")
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+fn diagnostics_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(|parent| parent.join("deps").join("diagnostics"))
+}
+
+fn write_diagnostics_frame(
+    frame: &crate::runtime::ui::CapturedFrame,
+) -> Option<PathBuf> {
+    let directory = diagnostics_dir()?;
+    std::fs::create_dir_all(&directory).ok()?;
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    // 隐私：文件名只含时间与帧号，不含任何正文/UID/昵称。
+    let path = directory.join(format!("ui-{millis}-frame-{}.png", frame.id()));
+    frame.image().save(&path).ok()?;
+    Some(path)
+}
+
+/// 最近一帧的证据：元数据总是记录；只有诊断开关开启时才落盘 PNG。
+fn capture_failure_frame(context: &UiRoutineContext<'_>) -> Option<FrameEvidence> {
+    let frame = context.last_captured_frame()?;
+    let path = diagnostics_enabled()
+        .then(|| write_diagnostics_frame(&frame))
+        .flatten();
+    Some(FrameEvidence {
+        frame_id: Some(frame.id()),
+        captured_at: Some(frame.captured_at()),
+        width: frame.image().width(),
+        height: frame.image().height(),
+        path,
+    })
+}
+
+/// 内层例程执行：panic 不穿透包装器，转成 `InputCertainty::Panicked` 失败并继续收尾。
+fn execute_inner<R: UiRoutine>(
+    inner: R,
+    context: &mut UiRoutineContext<'_>,
+) -> (Option<R::Output>, Option<UiRoutineFailure>) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.execute(context))) {
+        Ok(output) => (Some(output), None),
+        Err(payload) => (
+            None,
+            Some(UiRoutineFailure::panicked("ui_task_panic", &*payload)),
+        ),
+    }
 }
 
 fn entry_budget(deadline: Instant) -> Duration {
@@ -376,32 +576,40 @@ fn remaining_until(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-fn kind_matches(kind: UiStateKind, target: UiResidencyTarget) -> bool {
+fn kind_matches(kind: UiStateKind, target: &ResidencyTarget) -> bool {
     match target {
-        UiResidencyTarget::Primary => kind == UiStateKind::Primary,
-        UiResidencyTarget::SecondaryCurrentHall => kind == UiStateKind::Secondary,
+        ResidencyTarget::Primary => kind == UiStateKind::Primary,
+        // 明确声明"在二级即可"的导航目标才按 kind 短路。
+        ResidencyTarget::Secondary(ConversationRef::AnySecondary) => {
+            kind == UiStateKind::Secondary
+        }
+        // 具体会话（当前大厅/好友/未识别）必须由恢复引擎校验，不能让"任意 Secondary"过关。
+        ResidencyTarget::Secondary(_) => false,
     }
 }
 
-fn residency_for(kind: UiStateKind) -> Option<UiResidencyTarget> {
+fn residency_for(kind: UiStateKind) -> Option<ResidencyTarget> {
     match kind {
-        UiStateKind::Primary => Some(UiResidencyTarget::Primary),
-        UiStateKind::Secondary => Some(UiResidencyTarget::SecondaryCurrentHall),
+        UiStateKind::Primary => Some(ResidencyTarget::Primary),
+        UiStateKind::Secondary => {
+            // 观测只能确认“在二级”；具体会话身份未知，不能冒充当前大厅。
+            Some(ResidencyTarget::Secondary(ConversationRef::Unknown))
+        }
         _ => None,
     }
 }
 
-fn kind_for(target: UiResidencyTarget) -> UiStateKind {
+fn kind_for(target: &ResidencyTarget) -> UiStateKind {
     match target {
-        UiResidencyTarget::Primary => UiStateKind::Primary,
-        UiResidencyTarget::SecondaryCurrentHall => UiStateKind::Secondary,
+        ResidencyTarget::Primary => UiStateKind::Primary,
+        ResidencyTarget::Secondary(_) => UiStateKind::Secondary,
     }
 }
 
-fn target_label(target: UiResidencyTarget) -> &'static str {
+fn target_label(target: &ResidencyTarget) -> String {
     match target {
-        UiResidencyTarget::Primary => "一级界面",
-        UiResidencyTarget::SecondaryCurrentHall => "二级当前大厅",
+        ResidencyTarget::Primary => "千星大厅（一级大厅）".to_string(),
+        ResidencyTarget::Secondary(conversation) => conversation.label(),
     }
 }
 
@@ -417,17 +625,32 @@ fn failure(
 fn observe_entry(
     context: &mut UiRoutineContext<'_>,
     budget: Duration,
+    environment: &SettleEnvironment,
 ) -> Result<EntryUiState, UiRoutineFailure> {
     let deadline = Instant::now() + budget;
     loop {
         let observed = observe_current(context, "ui_task_observe_entry")?;
         if observed.stable {
+            // 入口子型：二级聊天识别具体会话；F2 多人面板/千星地图/覆盖层按子型记录。
+            let conversation = match surface_of(observed.kind, &observed.label, &observed.final_rule)
+            {
+                UiSurface::Secondary(SecondarySurface::Chat) => {
+                    identify_conversation(context, environment)
+                }
+                UiSurface::Secondary(SecondarySurface::MultiplayerPanel) => {
+                    Some(ConversationRef::MultiplayerPanel)
+                }
+                UiSurface::Secondary(SecondarySurface::HallMap) => Some(ConversationRef::HallMap),
+                UiSurface::Overlay(overlay) => Some(ConversationRef::Overlay(overlay)),
+                _ => None,
+            };
             return Ok(EntryUiState::from_classification(
                 observed.kind,
                 observed.label,
                 observed.final_rule,
                 observed.frame_id,
                 observed.observed_at,
+                conversation,
             ));
         }
         if Instant::now() >= deadline {
@@ -484,164 +707,61 @@ fn observe_current(
     }
 }
 
-/// settle_to 的单步动作。
-enum SettleStep {
-    Press(Key),
-    Wait,
-}
-
-/// 统一恢复状态机：把当前界面恢复到 `target`。
-///
-/// 基础动作表（P1）：
-/// - `Primary` ← Secondary 一次 Esc；← Primary 直接成功；
-/// - `SecondaryCurrentHall` ← Primary 一次 Return；← Secondary 视为已在当前大厅
-///   （会话级确认留给后续 P0/迁移任务）；
-/// - `MainMenu`：千星主菜单 Esc；**派蒙菜单拒绝**（不是大厅菜单）；
-/// - `Panel` 一次 Esc；`Loading` 只等待；`Unknown` 不盲按 Esc，只等待自愈；
-/// - `GameGate`/`Overworld` 拒绝恢复，交给启动链。
-///
-/// 每次动作后都重新观测；同一 `(kind,label)` 连续两次没有变化就熔断失败。
-fn settle_to(
-    context: &mut UiRoutineContext<'_>,
-    target: UiResidencyTarget,
-    budget: Duration,
-) -> Result<UiResidencyTarget, UiRoutineFailure> {
-    let deadline = Instant::now() + budget;
-    let mut actions = 0u32;
-    let mut last_signature: Option<(UiStateKind, String)> = None;
-    let mut no_progress = 0u32;
-    loop {
-        let observed = observe_current(context, "ui_task_settle")?;
-        if kind_matches(observed.kind, target) {
-            return Ok(target);
-        }
-        if !observed.stable {
-            // 过渡态不动作：上一稳定状态可能就是目标，等它自愈（事故回放路径）。
-            if Instant::now() >= deadline {
-                return Err(failure(
-                    InputCertainty::BeforeInput,
-                    "ui_task_settle",
-                    format!("界面状态持续不稳定，未执行导航（当前：{}）", observed.label),
-                ));
-            }
-            context.wait_cancellable(SETTLE_POLL)?;
-            continue;
-        }
-        match next_settle_step(&observed, target)? {
-            SettleStep::Wait => {
-                if Instant::now() >= deadline {
-                    let certainty = if actions == 0 {
-                        InputCertainty::BeforeInput
-                    } else {
-                        InputCertainty::AfterInputUnknown
-                    };
-                    return Err(failure(
-                        certainty,
-                        "ui_task_settle",
-                        format!("等待界面自愈超时（当前：{}）", observed.label),
-                    ));
-                }
-                context.wait_cancellable(SETTLE_POLL)?;
-            }
-            SettleStep::Press(key) => {
-                if actions >= MAX_SETTLE_ACTIONS {
-                    return Err(failure(
-                        InputCertainty::AfterInputUnknown,
-                        "ui_task_settle",
-                        "收尾动作次数达到上限，界面仍未恢复",
-                    ));
-                }
-                if Instant::now() >= deadline {
-                    return Err(failure(
-                        InputCertainty::AfterInputUnknown,
-                        "ui_task_settle",
-                        "收尾预算耗尽，界面仍未恢复",
-                    ));
-                }
-                // 动手前先判“无进展”：同一 (kind,label) 连续第三次就不再按键，
-                // 保证 Unknown/Panel 振荡时 Esc 次数有界（最多 2 次同一状态）。
-                let signature = (observed.kind, observed.label.clone());
-                if last_signature.as_ref() == Some(&signature) {
-                    no_progress += 1;
-                    if no_progress >= 2 {
-                        return Err(failure(
-                            InputCertainty::AfterInputUnknown,
-                            "ui_task_settle",
-                            format!("界面无进展（{}），停止继续按键", observed.label),
-                        ));
-                    }
-                } else {
-                    last_signature = Some(signature);
-                    no_progress = 0;
-                }
-                context.device().press_key(key).map_err(|error| {
-                    failure(
-                        InputCertainty::AfterInputUnknown,
-                        "ui_task_settle",
-                        format!("收尾按键失败: {error:#}"),
-                    )
-                })?;
-                actions += 1;
-                context.wait_cancellable(SETTLE_POLL)?;
-            }
-        }
-    }
-}
-
-fn next_settle_step(
-    observed: &ObservedState,
-    target: UiResidencyTarget,
-) -> Result<SettleStep, UiRoutineFailure> {
-    use UiStateKind::{
-        GameGate, Loading, MainMenu, Overworld, Panel, Primary, Secondary, Unknown,
-    };
-    match observed.kind {
-        Primary => match target {
-            UiResidencyTarget::Primary => Ok(SettleStep::Wait),
-            UiResidencyTarget::SecondaryCurrentHall => Ok(SettleStep::Press(Key::Return)),
-        },
-        Secondary => match target {
-            UiResidencyTarget::Primary => Ok(SettleStep::Press(Key::Escape)),
-            UiResidencyTarget::SecondaryCurrentHall => Ok(SettleStep::Wait),
-        },
-        MainMenu => {
-            // 千星主菜单与派蒙菜单 kind 相同，只能靠证据规则区分。
-            if observed.final_rule == PAIMON_MENU_RULE {
-                Err(failure(
-                    InputCertainty::BeforeInput,
-                    "ui_task_settle",
-                    "派蒙菜单不是千星大厅菜单，拒绝按 Esc 当作大厅菜单恢复",
-                ))
-            } else {
-                Ok(SettleStep::Press(Key::Escape))
-            }
-        }
-        Panel => Ok(SettleStep::Press(Key::Escape)),
-        Loading => Ok(SettleStep::Wait),
-        // Unknown 不盲按 Esc：等它自愈（持续 Unknown 由超时报失败）。
-        Unknown => Ok(SettleStep::Wait),
-        GameGate | Overworld => Err(failure(
-            InputCertainty::BeforeInput,
-            "ui_task_settle",
-            format!("启动链界面（{}）拒绝自动恢复", observed.label),
-        )),
-    }
-}
-
 fn run_finish(
     context: &mut UiRoutineContext<'_>,
     policy: FinishPolicy,
     entry: Option<&EntryUiState>,
+    environment: &SettleEnvironment,
     deadline: Instant,
 ) -> FinishReport {
     let mut report = FinishReport::default();
+    if !context.in_finish_phase() {
+        context.begin_finish_phase(remaining_until(deadline));
+    }
     let target = match policy {
-        // 保持当前界面：不做导航，但要观测一次记录“收尾后实际在哪”，
-        // 否则会误报成入口驻留（例如入口一级、任务去了二级、KeepCurrent 后仍报一级）。
-        FinishPolicy::KeepCurrent => {
-            match observe_current(context, "ui_task_finish") {
+        FinishPolicy::ScriptDeclared => {
+            // CustomAction 的真实语义：脚本自己决定收尾，包装器不导航、不观测。
+            // 包装器无法确认脚本最后停在哪，绝不能把入口冒充成“已驻留”。
+            report.script_declared = true;
+            report.settled = false;
+            report.target = None;
+            return report;
+        }
+        FinishPolicy::Leave => {
+            // 不恢复入口，只如实记录离开时的界面（不承诺驻留）。
+            report.left = true;
+            return match observe_current(context, "ui_task_leave") {
                 Ok(observed) => {
                     report.target = residency_for(observed.kind);
+                    report.settled = report.target.is_some();
+                    if report.target.is_none() {
+                        report.failure = Some(failure(
+                            InputCertainty::BeforeInput,
+                            "ui_task_leave",
+                            format!(
+                                "任务声明 Leave：当前界面（{}）不是一级/二级聊天，不能作为聊天驻留结论",
+                                observed.label
+                            ),
+                        ));
+                    }
+                    report
+                }
+                Err(error) => {
+                    report.failure = Some(error);
+                    report
+                }
+            };
+        }
+        FinishPolicy::KeepCurrent => {
+            // 恢复器/诊断路径：保持当前界面，只观测一次记录实际驻留。
+            return match observe_current(context, "ui_task_finish") {
+                Ok(observed) => {
+                    // 入口/声明会话仍是同一界面类型时，保留已知会话；否则只按 kind
+                    // 推断（二级 -> Unknown，不冒充当前大厅）。
+                    report.target = match entry {
+                        Some(entry) if entry.kind == observed.kind => entry.restore_target(),
+                        _ => residency_for(observed.kind),
+                    };
                     report.settled = report.target.is_some();
                     if report.settled {
                         return report;
@@ -651,82 +771,123 @@ fn run_finish(
                         "ui_task_finish",
                         format!("保持当前界面，但当前界面不可作为驻留结论（{}）", observed.label),
                     ));
+                    report
                 }
-                Err(error) => report.failure = Some(error),
-            }
-            return report;
-        }
-        // 脚本自己声明完成收尾：不再观测、不再动作，沿用入口驻留结论。
-        FinishPolicy::ScriptDeclared => {
-            report.settled = true;
-            report.target = entry.and_then(|entry| entry.residency);
-            return report;
+                Err(error) => {
+                    report.failure = Some(error);
+                    report
+                }
+            };
         }
         FinishPolicy::Fixed(target) => target,
-        FinishPolicy::RestoreEntry { fallback } => match entry {
-            Some(entry) if entry.restorable() => {
-                entry.residency.expect("restorable entry has residency")
-            }
-            _ => {
-                report.fallback_used = true;
-                fallback
+        FinishPolicy::RestoreEntry { fallback } => {
+            let entry_target = entry.and_then(EntryUiState::restore_target);
+            // 二级界面（多人面板/地图）与覆盖层本身不可重建：显式走 fallback，并标记降级。
+            let entry_specific = entry_target
+                .as_ref()
+                .is_some_and(|target| matches!(target, ResidencyTarget::Secondary(conversation) if !conversation.is_chat()));
+            match entry_target {
+                Some(target) if !entry_specific => target,
+                _ => {
+                    report.fallback_used = true;
+                    fallback
+                }
             }
         },
     };
     report.attempted = true;
-    report.target = Some(target);
-    if !context.in_finish_phase() {
-        context.begin_finish_phase(remaining_until(deadline));
-    }
-    match settle_to(context, target, remaining_until(deadline)) {
-        Ok(settled) => {
+    report.target = Some(target.clone());
+    // fallback 是"入口会话无法重建"时的兜底：只做一次确定性导航，不再额外滚动列表。
+    let options = SettleOptions {
+        allow_conversation_scroll: !report.fallback_used,
+        ..SettleOptions::default()
+    };
+    match settle_to_with(context, environment, target, options) {
+        Ok(mut recovery) => {
             report.settled = true;
-            report.target = Some(settled);
+            // 入口子型（二级界面/覆盖层）不可重建时走 fallback：如实标记降级，
+            // 不把"回不到入口子界面"伪装成成功。
+            if report.fallback_used {
+                recovery.degraded = true;
+            }
+            report.target = Some(recovery.target.clone());
+            report.actions = recovery
+                .esc_presses
+                .saturating_add(recovery.open_chat_presses)
+                .saturating_add(recovery.conversation_actions);
+            report.last_snapshot = recovery.last_snapshot.clone();
+            report.history = recovery.history.clone();
+            report.recovery = Some(recovery);
+            report
         }
-        Err(error) => {
-            report.failure = Some(error);
+        Err(failure_report) => {
+            report.failure = Some(failure_report.failure);
+            report.last_snapshot = failure_report.last_snapshot.as_ref().map(|s| s.describe());
+            report.history = failure_report.history;
+            report.last_frame = failure_report
+                .frame
+                .as_ref()
+                .map(|image| frame_evidence_from_image(image, context));
+            report
         }
     }
-    report
 }
 
 fn no_action_finish(policy: FinishPolicy, entry: Option<&EntryUiState>) -> FinishReport {
+    let script_declared = matches!(policy, FinishPolicy::ScriptDeclared);
     let mut report = FinishReport {
-        settled: true,
+        settled: !script_declared,
+        script_declared,
         ..FinishReport::default()
     };
-    report.target = match policy {
-        FinishPolicy::Fixed(target) => Some(target),
-        FinishPolicy::RestoreEntry { fallback } => {
-            Some(entry.and_then(|entry| entry.residency).unwrap_or(fallback))
-        }
-        FinishPolicy::KeepCurrent | FinishPolicy::ScriptDeclared => {
-            entry.and_then(|entry| entry.residency)
+    report.left = matches!(policy, FinishPolicy::Leave);
+    report.target = if script_declared {
+        // 脚本自己收尾但未向包装器确认落点：报告“未知”，不冒充入口。
+        None
+    } else {
+        match policy {
+            FinishPolicy::Fixed(target) => Some(target),
+            FinishPolicy::RestoreEntry { fallback } => Some(
+                entry
+                    .and_then(EntryUiState::restore_target)
+                    .unwrap_or(fallback),
+            ),
+            FinishPolicy::Leave | FinishPolicy::KeepCurrent | FinishPolicy::ScriptDeclared => {
+                entry.and_then(EntryUiState::restore_target)
+            }
         }
     };
     report
 }
 
-fn no_action_residency(report: &FinishReport) -> UiResidencyOutcome {
-    match report.target {
-        Some(target) => UiResidencyOutcome::Confirmed(target),
-        None => UiResidencyOutcome::Failed(failure(
+fn finish_residency(report: &FinishReport) -> UiResidencyOutcome {
+    let Some(target) = report.target.clone() else {
+        if report.left {
+            return UiResidencyOutcome::Failed(failure(
+                InputCertainty::BeforeInput,
+                "ui_task_leave",
+                "任务声明 Leave：不恢复入口，也没有可确认的聊天驻留界面",
+            ));
+        }
+        return UiResidencyOutcome::Failed(failure(
             InputCertainty::BeforeInput,
             "ui_task_finish",
-            "旁路模式没有入口观测，未验证驻留",
-        )),
-    }
-}
-
-fn finish_residency(report: &FinishReport) -> UiResidencyOutcome {
+            "收尾策略未声明目标界面",
+        ));
+    };
     if report.settled {
-        return match report.target {
-            Some(target) => UiResidencyOutcome::Confirmed(target),
-            None => UiResidencyOutcome::Failed(failure(
-                InputCertainty::BeforeInput,
-                "ui_task_finish",
-                "收尾策略未声明目标界面",
-            )),
+        return match &target {
+            ResidencyTarget::Primary => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
+            ResidencyTarget::Secondary(conversation) if *conversation == ConversationRef::Unknown => {
+                UiResidencyOutcome::Failed(failure(
+                    InputCertainty::AfterInputUnknown,
+                    "ui_task_finish",
+                    "收尾只确认在二级，入口会话身份未知，不能声明为当前大厅",
+                ))
+            }
+            ResidencyTarget::Secondary(_) => {
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+            }
         };
     }
     let failure = report.failure.clone().unwrap_or_else(|| {
@@ -739,29 +900,59 @@ fn finish_residency(report: &FinishReport) -> UiResidencyOutcome {
     UiResidencyOutcome::Failed(failure)
 }
 
-/// 收尾等待粒度。与例程里的稳定观察轮询保持一致（100ms）。
-const SETTLE_POLL: Duration = Duration::from_millis(100);
-/// 入口稳定观察轮询。
-const ENTRY_POLL: Duration = Duration::from_millis(100);
-/// 单次收尾最多按键次数，防 Unknown↔MainMenu 振荡。
-const MAX_SETTLE_ACTIONS: u32 = 6;
-/// 派蒙菜单的证据规则名（`ui/state.rs` 的 `paimon_menu()`）。
-const PAIMON_MENU_RULE: &str = "paimon_menu_panel_template";
+fn frame_evidence_from_image(
+    image: &image::DynamicImage,
+    context: &UiRoutineContext<'_>,
+) -> FrameEvidence {
+    let frame = context.last_captured_frame();
+    FrameEvidence {
+        frame_id: frame.as_ref().map(|frame| frame.id()),
+        captured_at: frame.as_ref().map(|frame| frame.captured_at()),
+        width: image.width(),
+        height: image.height(),
+        path: diagnostics_enabled()
+            .then(|| write_diagnostics_image(image))
+            .flatten(),
+    }
+}
+
+fn write_diagnostics_image(image: &image::DynamicImage) -> Option<PathBuf> {
+    let directory = diagnostics_dir()?;
+    std::fs::create_dir_all(&directory).ok()?;
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    // 隐私：文件名只含时间，不含任何正文/UID/昵称。
+    let path = directory.join(format!("ui-{millis}.png"));
+    image.save(&path).ok()?;
+    Some(path)
+}
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use image::DynamicImage;
 
     use super::*;
+    use crate::config::AppConfig;
     use crate::runtime::ui::{
         UiDevice, UiRoutine, UiRoutineContext, UiRoutineFailure, UiStateClassification,
         UiStateClassifier, UiStateEvidence, UiStateKind, execute_routine_for_test,
         sealed::UiRoutineSealed,
     };
+    use crate::ui::routines::friend_delivery::{
+        FriendDeliveryRoutineConfig, UiResidencyTarget,
+    };
+    use crate::ui::routines::residency::{ConversationRef, ResidencyTarget, SettleEnvironment};
+
+    const CANVAS_WIDTH: u32 = 1920;
+    const CANVAS_HEIGHT: u32 = 1080;
 
     // ---- 测试替身 ----
 
@@ -769,7 +960,7 @@ mod tests {
     enum RecordedAction {
         Capture,
         Key(Key),
-        Activate,
+        Activate(u64),
     }
 
     #[derive(Default)]
@@ -778,22 +969,25 @@ mod tests {
     }
 
     impl RecordingDevice {
-        fn actions(&self) -> Vec<RecordedAction> {
-            self.actions.lock().unwrap().clone()
-        }
-
-        fn captures(&self) -> usize {
-            self.actions()
-                .iter()
-                .filter(|action| matches!(action, RecordedAction::Capture))
-                .count()
-        }
-
         fn keys(&self) -> Vec<Key> {
-            self.actions()
+            self.actions
+                .lock()
+                .unwrap()
                 .iter()
                 .filter_map(|action| match action {
                     RecordedAction::Key(key) => Some(*key),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn activations(&self) -> Vec<u64> {
+            self.actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|action| match action {
+                    RecordedAction::Activate(wait_ms) => Some(*wait_ms),
                     _ => None,
                 })
                 .collect()
@@ -803,21 +997,31 @@ mod tests {
     impl UiDevice for RecordingDevice {
         fn capture(&mut self) -> anyhow::Result<DynamicImage> {
             self.actions.lock().unwrap().push(RecordedAction::Capture);
-            Ok(DynamicImage::new_rgba8(16, 16))
+            Ok(DynamicImage::new_rgba8(CANVAS_WIDTH, CANVAS_HEIGHT))
+        }
+
+        fn activate(&mut self, wait_ms: u64) -> anyhow::Result<()> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(RecordedAction::Activate(wait_ms));
+            Ok(())
+        }
+
+        fn ensure_ready(&mut self, _after_activate_ms: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn ensure_foreground(&mut self) -> anyhow::Result<()> {
+            Ok(())
         }
 
         fn press_key(&mut self, key: Key) -> anyhow::Result<()> {
             self.actions.lock().unwrap().push(RecordedAction::Key(key));
             Ok(())
         }
-
-        fn activate(&mut self, _after_activate_ms: u64) -> anyhow::Result<()> {
-            self.actions.lock().unwrap().push(RecordedAction::Activate);
-            Ok(())
-        }
     }
 
-    /// 按脚本逐次返回分类结果；脚本耗尽后重复最后一个。
     struct ScriptedClassifier {
         states: Vec<UiStateClassification>,
         index: usize,
@@ -825,134 +1029,140 @@ mod tests {
 
     impl ScriptedClassifier {
         fn new(states: Vec<UiStateClassification>) -> Self {
-            assert!(!states.is_empty(), "classifier script must not be empty");
             Self { states, index: 0 }
         }
     }
 
     impl UiStateClassifier for ScriptedClassifier {
-        fn classify(
-            &mut self,
-            _image: &DynamicImage,
-        ) -> anyhow::Result<UiStateClassification> {
+        fn classify(&mut self, _image: &DynamicImage) -> anyhow::Result<UiStateClassification> {
             let index = self.index.min(self.states.len() - 1);
             self.index += 1;
             Ok(self.states[index].clone())
         }
     }
 
-    fn state(kind: UiStateKind, label: &str, final_rule: &str) -> UiStateClassification {
+    fn state_with_rule(kind: UiStateKind, label: &str, rule: &str) -> UiStateClassification {
         UiStateClassification::with_evidence(
             kind,
             label,
-            UiStateEvidence::new(Vec::new(), None, final_rule),
+            UiStateEvidence::new(Vec::new(), None, rule),
         )
     }
 
     fn primary() -> UiStateClassification {
-        state(UiStateKind::Primary, "一级界面", "primary")
+        state_with_rule(UiStateKind::Primary, "primary", "primary")
     }
 
     fn secondary() -> UiStateClassification {
-        state(UiStateKind::Secondary, "二级聊天", "secondary_back_template")
+        state_with_rule(UiStateKind::Secondary, "secondary", "secondary")
+    }
+
+    fn panel() -> UiStateClassification {
+        state_with_rule(UiStateKind::Panel, "panel", "panel")
+    }
+
+    fn loading() -> UiStateClassification {
+        state_with_rule(UiStateKind::Loading, "loading", "loading")
+    }
+
+    fn unknown() -> UiStateClassification {
+        state_with_rule(UiStateKind::Unknown, "unknown", "unknown")
     }
 
     fn main_menu() -> UiStateClassification {
-        state(UiStateKind::MainMenu, "主菜单", "main_menu_template")
+        state_with_rule(UiStateKind::MainMenu, "main_menu", "main_menu_template")
     }
 
     fn paimon_menu() -> UiStateClassification {
-        state(UiStateKind::MainMenu, "派蒙菜单", PAIMON_MENU_RULE)
+        state_with_rule(
+            UiStateKind::MainMenu,
+            "paimon_menu",
+            "paimon_menu_grid",
+        )
     }
 
-    fn uncertain(count: usize) -> Vec<UiStateClassification> {
-        vec![state(UiStateKind::Unknown, "无法识别的界面", "unknown"); count]
+    fn environment_with(timeout_ms: u64) -> SettleEnvironment {
+        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        config.timing.input.after_activate_ms = 0;
+        config.timing.input.open_chat_ms = 0;
+        config.timing.input.click_ms = 0;
+        config.timing.input.text_ms = 0;
+        config.timing.input.send_ms = 0;
+        config.timing.workflow.default_timeout_ms = timeout_ms;
+        config.timing.workflow.default_poll_ms = 20;
+        SettleEnvironment::without_ocr(FriendDeliveryRoutineConfig::from_app(&config))
     }
 
-    // ---- 内层例程 ----
+    fn environment() -> SettleEnvironment {
+        environment_with(2_000)
+    }
 
     struct Noop;
 
     impl UiRoutineSealed for Noop {}
 
     impl UiRoutine for Noop {
-        type Output = Result<(), UiRoutineFailure>;
+        type Output = ();
 
-        fn execute(self, _context: &mut UiRoutineContext<'_>) -> Self::Output {
-            Ok(())
-        }
+        fn execute(self, _context: &mut UiRoutineContext<'_>) -> Self::Output {}
     }
 
-    struct FailWithoutInput;
+    struct ForceFinish;
 
-    impl UiRoutineSealed for FailWithoutInput {}
+    impl UiRoutineSealed for ForceFinish {}
 
-    impl UiRoutine for FailWithoutInput {
-        type Output = Result<(), UiRoutineFailure>;
-
-        fn execute(self, _context: &mut UiRoutineContext<'_>) -> Self::Output {
-            Err(failure(
-                InputCertainty::BeforeInput,
-                "test_inner",
-                "内层例程在输入前失败",
-            ))
-        }
-    }
-
-    struct PressThenFail;
-
-    impl UiRoutineSealed for PressThenFail {}
-
-    impl UiRoutine for PressThenFail {
-        type Output = Result<(), UiRoutineFailure>;
+    impl UiRoutine for ForceFinish {
+        type Output = ();
 
         fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-            context
-                .device()
-                .press_key(Key::Return)
-                .map_err(|error| {
-                    UiRoutineFailure::new(
-                        InputCertainty::BeforeInput,
-                        "test_inner",
-                        format!("{error:#}"),
-                    )
-                })?;
-            Err(failure(
-                InputCertainty::AfterInputUnknown,
-                "test_inner",
-                "按下 Return 后结果未知",
-            ))
+            context.force_finish();
         }
     }
 
-    struct CancelThenOk {
-        cancelled: Arc<AtomicBool>,
+    struct Panics;
+
+    impl UiRoutineSealed for Panics {}
+
+    impl UiRoutine for Panics {
+        type Output = ();
+
+        fn execute(self, _context: &mut UiRoutineContext<'_>) -> Self::Output {
+            panic!("inner routine exploded");
+        }
     }
 
-    impl UiRoutineSealed for CancelThenOk {}
+    struct PressThenReturn;
 
-    impl UiRoutine for CancelThenOk {
-        type Output = Result<(), UiRoutineFailure>;
+    impl UiRoutineSealed for PressThenReturn {}
+
+    impl UiRoutine for PressThenReturn {
+        type Output = ();
 
         fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-            self.cancelled.store(true, Ordering::Release);
-            // 收尾阶段必须仍能等待：这里用一小段等待模拟导航后的稳定等待。
-            context.wait_cancellable(Duration::from_millis(10))?;
-            Ok(())
+            context.device().press_key(Key::Escape).unwrap();
         }
     }
 
-    // ---- 测试驱动 ----
+    struct CancelAfterStart(Arc<AtomicBool>);
 
-    fn run_task_with<D: UiDevice, R: UiRoutine>(
-        device: D,
+    impl UiRoutineSealed for CancelAfterStart {}
+
+    impl UiRoutine for CancelAfterStart {
+        type Output = ();
+
+        fn execute(self, _context: &mut UiRoutineContext<'_>) -> Self::Output {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn run_task_with<R: UiRoutine>(
         script: Vec<UiStateClassification>,
         spec: UiTaskSpec,
         inner: R,
         cancelled: Arc<AtomicBool>,
-    ) -> (UiTaskOutcome<R::Output>, D) {
+    ) -> (UiTaskOutcome<R::Output>, RecordingDevice) {
         let execution = execute_routine_for_test(
-            device,
+            RecordingDevice::default(),
             Some(Box::new(ScriptedClassifier::new(script))),
             2,
             cancelled,
@@ -961,194 +1171,71 @@ mod tests {
         (execution.output, execution.device)
     }
 
+    fn run(script: Vec<UiStateClassification>, spec: UiTaskSpec) -> (UiTaskOutcome<()>, RecordingDevice) {
+        run_task_with(script, spec, Noop, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn restore_primary_spec() -> UiTaskSpec {
+        UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::RestoreEntry {
+                fallback: ResidencyTarget::Primary,
+            },
+            environment(),
+        )
+    }
+
+    // ---- 入口 ----
+
     #[test]
     fn entry_is_observed_once_before_any_input() {
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            vec![primary()],
-            UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::KeepCurrent),
-            Noop,
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert_eq!(outcome.entry.as_ref().unwrap().kind, UiStateKind::Primary);
-        assert_eq!(outcome.input_epoch, 0);
+        let script = vec![primary(), primary(), primary(), primary()];
+        let (outcome, device) = run(script, restore_primary_spec());
         assert!(device.keys().is_empty());
-        // 入口稳定判定 2 帧；KeepCurrent 收尾再观测 1 帧记录实际界面。
-        // 关键是入口快照只采集**一次**，不会在目标检查和收尾里重复采入口。
-        assert_eq!(device.captures(), 3);
-    }
-
-    #[test]
-    fn primary_to_primary_has_no_actions() {
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            vec![primary()],
-            UiTaskSpec::new(
-                UiResidencyTarget::Primary,
-                FinishPolicy::Fixed(UiResidencyTarget::Primary),
-            ),
-            Noop,
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert!(device.keys().is_empty(), "已在目标界面不应按键");
+        let entry = outcome.entry.as_ref().expect("entry observed");
+        assert_eq!(entry.kind, UiStateKind::Primary);
+        assert!(entry.frame_id.is_some());
         assert!(outcome.finish.settled);
-        assert_eq!(outcome.input_epoch, 0);
-    }
-
-    #[test]
-    fn primary_to_secondary_uses_exactly_one_navigation() {
-        // 入口 2 帧 + 收尾前观测 1 帧；按 Return 后 2 帧稳定为二级。
-        let mut script = vec![primary(), primary(), primary()];
-        script.extend(vec![secondary(), secondary()]);
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            script,
-            UiTaskSpec::new(
-                UiResidencyTarget::SecondaryCurrentHall,
-                FinishPolicy::KeepCurrent,
-            ),
-            Noop,
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert_eq!(device.keys(), vec![Key::Return]);
-        assert_eq!(outcome.input_epoch, 1);
         assert!(matches!(
             outcome.residency(),
-            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
         ));
     }
 
     #[test]
-    fn transient_unknown_is_waited_out_without_pressing_keys() {
-        let mut script = uncertain(2);
-        script.extend(vec![primary(), primary()]);
-        let (outcome, device) = run_task_with(
+    fn entry_failure_before_input_is_safe_to_retry() {
+        struct Failing;
+        impl UiStateClassifier for Failing {
+            fn classify(&mut self, _image: &DynamicImage) -> anyhow::Result<UiStateClassification> {
+                anyhow::bail!("classifier unavailable");
+            }
+        }
+        let execution = execute_routine_for_test(
             RecordingDevice::default(),
-            script,
-            UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::KeepCurrent),
-            Noop,
+            Some(Box::new(Failing)),
+            2,
             Arc::new(AtomicBool::new(false)),
+            UiTask::new(restore_primary_spec(), Noop),
         );
-        assert!(device.keys().is_empty(), "Unknown 瞬态不允许盲按 Esc");
-        assert_eq!(outcome.entry.as_ref().unwrap().kind, UiStateKind::Primary);
-    }
-
-    #[test]
-    fn main_menu_escape_restores_primary() {
-        // 入口 2 帧 + 收尾前观测 1 帧；按 Esc 后 2 帧稳定回一级。
-        let mut script = vec![main_menu(), main_menu(), main_menu()];
-        script.extend(vec![primary(), primary()]);
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            script,
-            UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::KeepCurrent),
-            Noop,
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert_eq!(device.keys(), vec![Key::Escape]);
-        assert!(outcome.finish.settled);
-        assert_eq!(outcome.input_epoch, 1);
-    }
-
-    #[test]
-    fn paimon_menu_is_rejected_without_pressing_keys() {
-        let script = vec![paimon_menu()];
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            script,
-            UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::KeepCurrent),
-            Noop,
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert!(device.keys().is_empty());
+        let outcome = execution.output;
         assert!(outcome.entry_failure.is_some());
-        assert!(outcome.output.is_none());
-        assert!(outcome.safe_retry());
-    }
-
-    #[test]
-    fn loading_never_sends_input() {
-        let script = vec![state(UiStateKind::Loading, "加载界面", "loading")];
-        let spec = UiTaskSpec::new(
-            UiResidencyTarget::Primary,
-            FinishPolicy::Fixed(UiResidencyTarget::Primary),
-        )
-        .with_total_budget(Duration::from_millis(150));
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            script,
-            spec,
-            Noop,
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert!(device.keys().is_empty());
-        assert!(outcome.output.is_none());
-        assert!(!outcome.finish.settled);
-    }
-
-    #[test]
-    fn keep_current_finish_has_no_actions() {
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            vec![secondary()],
-            UiTaskSpec::new(
-                UiResidencyTarget::SecondaryCurrentHall,
-                FinishPolicy::KeepCurrent,
-            ),
-            Noop,
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert!(device.keys().is_empty());
-        assert!(outcome.finish.settled);
-        assert!(!outcome.finish.attempted);
-    }
-
-    #[test]
-    fn partial_input_disables_safe_retry() {
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            vec![primary()],
-            UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::KeepCurrent),
-            PressThenFail,
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert_eq!(device.keys(), vec![Key::Return]);
-        assert_eq!(outcome.input_epoch, 1);
-        assert!(!outcome.safe_retry(), "发过输入后结果不确定，禁止自动重试");
-    }
-
-    #[test]
-    fn failure_before_input_is_safe_to_retry() {
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            vec![primary()],
-            UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::KeepCurrent),
-            FailWithoutInput,
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert!(device.keys().is_empty());
         assert_eq!(outcome.input_epoch, 0);
-        assert!(outcome.safe_retry(), "没有发过输入时允许安全重试");
+        assert!(outcome.safe_retry());
+        assert!(execution.device.keys().is_empty());
     }
 
     #[test]
     fn require_target_rejects_secondary_without_pressing_keys() {
-        let mut script = vec![secondary(), secondary()];
-        script.extend(vec![primary(), primary()]);
+        let script = vec![secondary(); 6];
         let spec = UiTaskSpec::new(
-            UiResidencyTarget::Primary,
+            ResidencyTarget::Primary,
             FinishPolicy::RestoreEntry {
-                fallback: UiResidencyTarget::Primary,
+                fallback: ResidencyTarget::Primary,
             },
+            environment(),
         )
         .with_entry(EntryPolicy::RequireTarget);
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            script,
-            spec,
-            Noop,
-            Arc::new(AtomicBool::new(false)),
-        );
+        let (outcome, device) = run(script, spec);
         assert!(device.keys().is_empty(), "入口不满足时不允许任何按键");
         assert!(outcome.output.is_none());
         let failure = outcome.entry_failure.as_ref().expect("entry failure");
@@ -1157,22 +1244,378 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_still_settles_a_fixed_finish_target() {
-        // 邀请类任务：入口不观测/不导航，但结束后要统一落到 Primary（不回旧界面）。
-        let mut script = vec![secondary(), secondary()];
-        script.extend(vec![primary(), primary()]);
+    fn require_target_secondary_conversation_is_rejected_without_input() {
+        let script = vec![secondary(); 6];
         let spec = UiTaskSpec::new(
-            UiResidencyTarget::Primary,
-            FinishPolicy::Fixed(UiResidencyTarget::Primary),
+            ResidencyTarget::Secondary(ConversationRef::CurrentHall),
+            FinishPolicy::Fixed(ResidencyTarget::Secondary(ConversationRef::CurrentHall)),
+            environment(),
+        )
+        .with_entry(EntryPolicy::RequireTarget);
+        let (outcome, device) = run(script, spec);
+        assert!(device.keys().is_empty());
+        let failure = outcome.entry_failure.as_ref().expect("entry failure");
+        assert_eq!(failure.certainty(), InputCertainty::BeforeInput);
+    }
+
+    // ---- 恢复/收尾 ----
+
+    #[test]
+    fn primary_to_primary_has_no_actions() {
+        let script = vec![primary(); 4];
+        let (outcome, device) = run(script, restore_primary_spec());
+        assert!(device.keys().is_empty());
+        assert!(outcome.finish.attempted);
+    }
+
+    #[test]
+    fn secondary_to_primary_uses_exactly_one_escape() {
+        // 入口二级 -> 入口会话识别会额外消耗一帧 -> 导航 Esc 一次 -> 收尾已在 Primary。
+        let mut script = vec![secondary(); 5];
+        script.extend(vec![primary(); 10]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment(),
+        );
+        let (outcome, device) = run(script, spec);
+        assert_eq!(device.keys(), vec![Key::Escape]);
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn main_menu_escape_restores_primary() {
+        let mut script = vec![main_menu(); 2];
+        script.extend(vec![main_menu(); 2]);
+        script.extend(vec![primary(); 8]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::RestoreEntry {
+                fallback: ResidencyTarget::Primary,
+            },
+            environment(),
+        );
+        let (outcome, device) = run(script, spec);
+        assert_eq!(device.keys(), vec![Key::Escape]);
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn paimon_menu_is_rejected_without_pressing_keys() {
+        let script = vec![paimon_menu(); 10];
+        let (outcome, device) = run(script, restore_primary_spec());
+        assert!(device.keys().is_empty(), "主菜单大世界不得当作千星菜单按 Esc");
+        assert!(outcome.entry_failure.is_some() || outcome.finish.failure.is_some());
+    }
+
+    #[test]
+    fn loading_never_sends_input() {
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::RestoreEntry {
+                fallback: ResidencyTarget::Primary,
+            },
+            environment_with(200),
+        );
+        let script = vec![loading(); 40];
+        let (outcome, device) = run(script, spec);
+        assert!(device.keys().is_empty());
+        assert!(outcome.finish.failure.is_some() || outcome.entry_failure.is_some());
+    }
+
+    #[test]
+    fn transient_unknown_is_waited_out_without_pressing_keys() {
+        let mut script = vec![unknown(), unknown()];
+        script.extend(vec![primary(); 8]);
+        let (outcome, device) = run(script, restore_primary_spec());
+        assert!(device.keys().is_empty());
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn unknown_probe_is_bounded_to_one_escape() {
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment_with(2_000),
         )
         .with_entry(EntryPolicy::Passthrough);
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            script,
-            spec,
-            Noop,
-            Arc::new(AtomicBool::new(false)),
+        let script = vec![unknown(); 100];
+        let (_, device) = run(script, spec);
+        assert!(device.keys().len() <= 1, "Unknown 的受控 Esc 探针有界");
+        assert!(!device.keys().is_empty(), "持续 Unknown 应使用一次受控探针");
+    }
+
+    #[test]
+    fn panel_stack_uses_bounded_escape() {
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment_with(1_500),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let script = vec![panel(); 100];
+        let (outcome, device) = run(script, spec);
+        assert!(!device.keys().is_empty());
+        assert!(device.keys().len() <= 3, "Esc 必须是有界的");
+        assert!(!outcome.finish.settled);
+    }
+
+    #[test]
+    fn panel_closes_then_returns_primary() {
+        let mut script = vec![panel(); 4];
+        script.extend(vec![primary(); 8]);
+        let (outcome, device) = run(script, restore_primary_spec());
+        assert_eq!(device.keys(), vec![Key::Escape]);
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    // ---- task-103：二级界面/覆盖层 Esc 落点 ----
+
+    fn secondary_chat_label() -> UiStateClassification {
+        state_with_rule(UiStateKind::Secondary, "secondary:chat", "secondary_chat_anchor")
+    }
+
+    fn secondary_multiplayer_panel() -> UiStateClassification {
+        state_with_rule(
+            UiStateKind::Secondary,
+            "secondary:qianxing_panel",
+            "secondary_multimedia_panel_template",
+        )
+    }
+
+    fn secondary_hall_map() -> UiStateClassification {
+        state_with_rule(
+            UiStateKind::Secondary,
+            "secondary:qianxing_map",
+            "secondary_hall_map_template",
+        )
+    }
+
+    fn overlay(label: &'static str) -> UiStateClassification {
+        state_with_rule(UiStateKind::Panel, label, label)
+    }
+
+    #[test]
+    fn friend_conversation_escape_lands_on_primary_hall() {
+        // 用户确认：好友私聊 Esc -> 一级大厅（不是当前大厅）。
+        let mut script = vec![secondary_chat_label(); 2];
+        script.extend(vec![primary(); 10]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run(script, spec);
+        assert_eq!(device.keys(), vec![Key::Escape]);
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn multiplayer_panel_escape_lands_on_primary_hall() {
+        let mut script = vec![secondary_multiplayer_panel(); 2];
+        script.extend(vec![primary(); 10]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run(script, spec);
+        assert_eq!(device.keys(), vec![Key::Escape]);
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn hall_map_escape_lands_on_primary_hall() {
+        let mut script = vec![secondary_hall_map(); 2];
+        script.extend(vec![primary(); 10]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run(script, spec);
+        assert_eq!(device.keys(), vec![Key::Escape]);
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn overlay_on_primary_escapes_one_level_to_primary() {
+        let mut script = vec![overlay("panel:friend_list"); 2];
+        script.extend(vec![primary(); 10]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run(script, spec);
+        assert_eq!(device.keys(), vec![Key::Escape], "覆盖层只退一级");
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn overlay_on_secondary_escapes_one_level_to_secondary() {
+        let mut script = vec![overlay("panel:avatar_popup"); 2];
+        script.extend(vec![secondary_chat_label(); 8]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Secondary(ConversationRef::AnySecondary),
+            FinishPolicy::Fixed(ResidencyTarget::Secondary(ConversationRef::AnySecondary)),
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run(script, spec);
+        assert_eq!(device.keys(), vec![Key::Escape], "叠在二级上的覆盖层退一级回二级");
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+        ));
+    }
+
+    #[test]
+    fn overlay_is_not_a_restorable_target() {
+        let script = vec![overlay("panel:friend_list"); 8];
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Secondary(ConversationRef::Overlay(
+                crate::ui::routines::state_observation::OverlaySurface::FriendPanel,
+            ))),
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run(script, spec);
+        assert!(device.keys().is_empty(), "覆盖层不可重建，不应按键");
+        assert!(matches!(outcome.residency(), UiResidencyOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn entry_multiplayer_panel_falls_back_and_marks_degraded() {
+        // 入口是二级界面·多人面板：本身不可重建，显式 fallback 并标记降级。
+        let mut script = vec![secondary_multiplayer_panel(); 4];
+        script.extend(vec![primary(); 10]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::RestoreEntry {
+                fallback: ResidencyTarget::Primary,
+            },
+            environment(),
         );
+        let (outcome, device) = run(script, spec);
+        assert_eq!(device.keys(), vec![Key::Escape]);
+        assert!(outcome.finish.fallback_used, "不可重建入口必须走 fallback");
+        assert!(
+            outcome
+                .finish
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.degraded),
+            "回不到入口子界面时必须标记 degraded"
+        );
+    }
+
+    // ---- 策略 ----
+
+    #[test]
+    fn keep_current_finish_has_no_actions_but_reports_actual_residency() {
+        let mut script = vec![primary(), primary()];
+        script.extend(vec![secondary(); 6]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::KeepCurrent,
+            environment(),
+        );
+        let (outcome, device) = run(script, spec);
+        assert!(device.keys().is_empty());
+        assert!(outcome.finish.attempted == false);
+        assert!(
+            matches!(outcome.residency(), UiResidencyOutcome::Failed(_)),
+            "KeepCurrent 只观测到二级但无会话身份时，不能冒充当前大厅：{:?}",
+            outcome.residency()
+        );
+    }
+
+    #[test]
+    fn leave_does_not_navigate_and_reports_observed_interface() {
+        let script = vec![primary(); 4];
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Leave,
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run(script, spec);
+        assert!(device.keys().is_empty());
+        assert!(outcome.finish.left);
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn leave_from_overworld_is_reported_as_non_residency() {
+        struct OverwolrdClassifier;
+        impl UiStateClassifier for OverwolrdClassifier {
+            fn classify(&mut self, _image: &DynamicImage) -> anyhow::Result<UiStateClassification> {
+                Ok(state_with_rule(
+                    UiStateKind::Overworld,
+                    "overworld",
+                    "overworld",
+                ))
+            }
+        }
+        let spec = UiTaskSpec::new(ResidencyTarget::Primary, FinishPolicy::Leave, environment())
+            .with_entry(EntryPolicy::Passthrough);
+        let execution = execute_routine_for_test(
+            RecordingDevice::default(),
+            Some(Box::new(OverwolrdClassifier)),
+            2,
+            Arc::new(AtomicBool::new(false)),
+            UiTask::new(spec, Noop),
+        );
+        assert!(execution.device.keys().is_empty());
+        assert!(execution.output.finish.left);
+        assert!(execution.output.finish.failure.is_some());
+    }
+
+    #[test]
+    fn passthrough_still_settles_a_fixed_finish_target() {
+        let mut script = vec![secondary(), secondary()];
+        script.extend(vec![primary(); 8]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run(script, spec);
         assert_eq!(device.keys(), vec![Key::Escape]);
         assert!(outcome.entry.is_none());
         assert!(matches!(
@@ -1182,31 +1625,157 @@ mod tests {
     }
 
     #[test]
-    fn finish_still_runs_after_business_cancellation() {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        // 入口 2 帧 + 收尾前观测 1 帧；按 Esc 后 2 帧稳定回一级。
-        let mut script = vec![secondary(), secondary(), secondary()];
-        script.extend(vec![primary(), primary()]);
+    fn script_declared_finish_does_not_observe_or_press() {
+        let script = vec![secondary(); 6];
         let spec = UiTaskSpec::new(
-            UiResidencyTarget::SecondaryCurrentHall,
-            FinishPolicy::Fixed(UiResidencyTarget::Primary),
+            ResidencyTarget::Primary,
+            FinishPolicy::ScriptDeclared,
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) = run(script, spec);
+        assert!(device.keys().is_empty());
+        assert!(outcome.finish.script_declared);
+        assert!(
+            !outcome.finish.settled,
+            "脚本没有向包装器确认落点，不能伪造 settled"
         );
-        let (outcome, device) = run_task_with(
-            RecordingDevice::default(),
-            script,
-            spec,
-            CancelThenOk {
-                cancelled: Arc::clone(&cancelled),
-            },
-            Arc::clone(&cancelled),
+        assert!(outcome.finish.target.is_none(), "包装器不得替脚本声明目标");
+        assert!(
+            matches!(outcome.residency(), UiResidencyOutcome::Failed(_)),
+            "未确认收尾不能对外报 Confirmed(入口): {:?}",
+            outcome.residency()
         );
-        assert!(cancelled.load(Ordering::Acquire));
-        assert!(outcome.output.is_some(), "内层例程应已开始执行");
-        assert!(outcome.finish.settled, "取消后收尾仍必须执行并完成");
-        assert_eq!(device.keys(), vec![Key::Escape]);
-        assert!(matches!(
+    }
+
+    #[test]
+    fn assumed_secondary_conversation_is_carried_into_entry_state() {
+        let script = vec![secondary(); 8];
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Secondary(ConversationRef::CurrentHall),
+            FinishPolicy::KeepCurrent,
+            environment(),
+        )
+        .with_entry(EntryPolicy::AssumeTarget);
+        let (outcome, device) = run(script, spec);
+        assert!(device.keys().is_empty());
+        let entry = outcome.entry.as_ref().expect("assumed entry");
+        assert_eq!(
+            entry.conversation,
+            Some(ConversationRef::CurrentHall),
+            "调用方声明的会话必须进入 EntryUiState"
+        );
+        assert!(
+            matches!(
+                outcome.residency(),
+                UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+            ),
+            "residency={:?} finish={:?}",
             outcome.residency(),
+            outcome.finish
+        );
+    }
+
+    #[test]
+    fn activation_policy_passes_the_configured_wait() {
+        let script = vec![primary(); 4];
+        let spec = restore_primary_spec()
+            .with_activation(ActivationPolicy::Activate { wait_ms: 250 });
+        let (outcome, device) = run(script, spec);
+        assert_eq!(device.activations(), vec![250]);
+        assert!(outcome.finish.settled);
+    }
+
+    // ---- 异常/取消 ----
+
+    #[test]
+    fn inner_panic_is_reported_and_still_runs_finish() {
+        let script = vec![primary(); 8];
+        let (outcome, device) = run_task_with(
+            script,
+            restore_primary_spec(),
+            Panics,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(device.keys().is_empty());
+        assert!(outcome.output.is_none());
+        let failure = outcome.output_failure.as_ref().expect("panic failure");
+        assert_eq!(failure.certainty(), InputCertainty::Panicked);
+        assert!(outcome.finish.attempted);
+        assert!(outcome.finish.settled);
+        let frame = outcome
+            .finish
+            .last_frame
+            .as_ref()
+            .expect("失败必须带最近帧元数据");
+        assert!(frame.width > 0 && frame.height > 0);
+        assert!(frame.path.is_none(), "默认不开诊断，不允许落盘");
+    }
+
+    #[test]
+    /// 强制完成：例程已确认到达目标界面，收尾导航必须整段跳过。
+    #[test]
+    fn forced_finish_skips_finish_navigation() {
+        let (outcome, device) = run_task_with(
+            vec![primary()],
+            restore_primary_spec(),
+            ForceFinish,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(outcome.finish.settled);
+        assert!(!outcome.finish.attempted, "强制完成不应进入收尾阶段");
+        assert_eq!(outcome.finish.actions, 0);
+        assert!(matches!(
+            outcome.residency,
             UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
         ));
+    }
+
+    fn finish_still_runs_after_business_cancellation() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let script = vec![primary(); 8];
+        let (outcome, device) = run_task_with(
+            script,
+            restore_primary_spec(),
+            CancelAfterStart(cancelled.clone()),
+            cancelled,
+        );
+        assert!(device.keys().is_empty());
+        assert!(outcome.finish.attempted);
+        assert!(outcome.finish.settled);
+    }
+
+    #[test]
+    fn finish_timeout_is_reported_without_treating_failure_as_recovered() {
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment_with(200),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let mut script = vec![loading(); 40];
+        script.extend(vec![loading(); 20]);
+        let (outcome, device) = run(script, spec);
+        assert!(device.keys().is_empty());
+        assert!(outcome.finish.attempted);
+        assert!(!outcome.finish.settled);
+        assert!(outcome.finish.failure.is_some());
+        assert!(matches!(
+            outcome.residency(),
+            UiResidencyOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn partial_input_disables_safe_retry() {
+        let script = vec![primary(); 8];
+        let (outcome, _device) = run_task_with(
+            script,
+            restore_primary_spec(),
+            PressThenReturn,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(outcome.input_epoch, 1);
+        assert!(!outcome.safe_retry());
     }
 }

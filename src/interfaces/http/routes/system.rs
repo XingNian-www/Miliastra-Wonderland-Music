@@ -85,7 +85,6 @@ pub(super) fn tool_templates_route(
         json!({ "name": "blue-marker", "label": "蓝色聊天标志", "region": config.screen.chat_rect, "threshold": marker_threshold }),
         json!({ "name": "yellow-marker", "label": "黄色聊天标志", "region": config.screen.chat_rect, "threshold": marker_threshold }),
         json!({ "name": "pink-marker", "label": "粉色聊天标志", "region": config.screen.chat_rect, "threshold": marker_threshold }),
-        json!({ "name": "friend", "label": "好友按钮", "region": config.screen.friend_rect, "threshold": marker_threshold }),
         json!({ "name": "secondary-back", "label": "二级聊天返回按钮", "region": config.screen.secondary_back_rect, "threshold": marker_threshold }),
         json!({ "name": "secondary-hall", "label": "二级当前大厅", "region": config.screen.secondary_hall_rect, "threshold": marker_threshold }),
         json!({ "name": "world-wish", "label": "祈愿", "region": config.screen.world_wish_rect, "threshold": marker_threshold }),
@@ -97,8 +96,7 @@ pub(super) fn tool_templates_route(
         json!({ "name": "friend-more-settings", "label": "好友更多设置", "region": config.moderation.more_settings_region, "threshold": marker_threshold }),
         json!({ "name": "friend-block-chat", "label": "屏蔽聊天", "region": config.moderation.block_chat_region, "threshold": marker_threshold }),
         json!({ "name": "friend-blacklist", "label": "拉黑", "region": config.moderation.blacklist_region, "threshold": marker_threshold }),
-        json!({ "name": "friend-confirm", "label": "好友操作确认", "region": config.moderation.confirm_region, "threshold": marker_threshold }),
-        json!({ "name": "wonderland-confirm", "label": "千星确认按钮", "region": config.startup.wonderland_confirm_region, "threshold": config.startup.wonderland_confirm_threshold }),
+        json!({ "name": "confirm-button", "label": "确认按钮", "region": config.moderation.confirm_button_region, "threshold": marker_threshold }),
         json!({ "name": "paimon-menu", "label": "派蒙主界面", "region": config.startup.main_ui_region, "threshold": config.startup.template_threshold }),
         json!({ "name": "wonderland-map-star", "label": "千星地图入口", "region": config.startup.wonderland_map_star_region, "threshold": config.startup.template_threshold }),
     ];

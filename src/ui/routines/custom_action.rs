@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::friend_delivery::{FriendDeliveryRoutineConfig, UiResidencyTarget, restore_residency};
+use super::friend_delivery::FriendDeliveryRoutineConfig;
+use super::residency::{ConversationRef, ResidencyTarget, SettleEnvironment};
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 use crate::adapters::input::parse_key;
 use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
@@ -170,9 +171,13 @@ impl UiRoutine for CustomActionRoutine {
 ///
 /// 因此用 `ScriptDeclared` + `Passthrough`：不观测入口、不导航、不在脚本结束后
 /// 补 Esc/Return。默认语义就是“脚本跑完停在最后一步所在的界面”。
-fn custom_action_task_spec() -> UiTaskSpec {
-    UiTaskSpec::new(UiResidencyTarget::Primary, FinishPolicy::ScriptDeclared)
-        .with_entry(EntryPolicy::Passthrough)
+fn custom_action_task_spec(environment: SettleEnvironment) -> UiTaskSpec {
+    UiTaskSpec::new(
+        ResidencyTarget::Primary,
+        FinishPolicy::ScriptDeclared,
+        environment,
+    )
+    .with_entry(EntryPolicy::Passthrough)
 }
 
 fn task_not_started_failure(failure: Option<UiRoutineFailure>) -> UiRoutineFailure {
@@ -199,8 +204,10 @@ impl UiRoutine for CustomActionTask {
     type Output = CustomActionOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let environment =
+            SettleEnvironment::new(self.ocr.clone(), self.residency.clone());
         let outcome = UiTask::new(
-            custom_action_task_spec(),
+            custom_action_task_spec(environment),
             CustomActionRoutine {
                 request: self.request,
                 ocr: self.ocr,
@@ -291,11 +298,17 @@ fn execute_operation(
                     observation_failure(input_performed, "prepare_custom_residency", error)
                 })?;
             let target = match target {
-                WorkflowResidency::Primary => UiResidencyTarget::Primary,
-                WorkflowResidency::SecondaryCurrentHall => UiResidencyTarget::SecondaryCurrentHall,
+                WorkflowResidency::Primary => ResidencyTarget::Primary,
+                WorkflowResidency::SecondaryCurrentHall => {
+                    ResidencyTarget::Secondary(ConversationRef::CurrentHall)
+                }
             };
-            restore_residency(context, ocr, residency, target)
-                .map_err(|failure| preserve_input_certainty(input_performed, failure))?;
+            super::residency::settle_to(
+                context,
+                &SettleEnvironment::new(ocr.clone(), residency.clone()),
+                target,
+            )
+            .map_err(|failure| preserve_input_certainty(input_performed, failure))?;
             Ok(true)
         }
         WorkflowOperation::ReturnListenerResidency => Err(observation_reason(
@@ -791,6 +804,7 @@ mod tests {
 
     use super::*;
     use crate::config::AppConfig;
+    use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
 
@@ -1079,7 +1093,10 @@ mod tests {
     /// P1 迁移批次 3：自定义脚本自己声明收尾；包装器不得在脚本结束后补动作。
     #[test]
     fn custom_action_task_spec_is_script_declared() {
-        let spec = custom_action_task_spec();
+        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let spec = custom_action_task_spec(SettleEnvironment::without_ocr(
+            FriendDeliveryRoutineConfig::from_app(&config),
+        ));
         assert_eq!(spec.entry, EntryPolicy::Passthrough);
         assert_eq!(spec.finish, FinishPolicy::ScriptDeclared);
     }

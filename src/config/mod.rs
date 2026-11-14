@@ -308,10 +308,13 @@ impl Default for AppConfig {
                     height: 50,
                 },
                 search_panel_region: RectConfig {
-                    x: 1600,
-                    y: 100,
-                    width: 240,
-                    height: 90,
+                    // 纯文字「搜索」按钮：实测命中左上角恒为 (1657,126)
+                    // （1920×1080 夹具与 1440p 实机归一化后一致），四周各留 12px
+                    // 定位余量；旧 240×90 会把右侧无关按钮卷进来。
+                    x: 1645,
+                    y: 114,
+                    width: 74,
+                    height: 49,
                 },
                 search_input_point: PointConfig::new(1180, 135),
                 search_button_point: PointConfig::new(1680, 135),
@@ -322,22 +325,42 @@ impl Default for AppConfig {
                     height: 70,
                 },
                 block_chat_region: RectConfig {
-                    x: 1240,
-                    y: 130,
-                    width: 440,
-                    height: 505,
+                    // 纯文字「屏蔽聊天」：x 固定在 (≈1412)，y 随好友卡/列表行与
+                    // UI 缩放变化（1920 夹具 374、1440p 实机归一化 438）。区域按
+                    // 实测两档覆盖，横向只保留 12px 余量；原点与旧区域同余 4，
+                    // 保证 4× 下采样的采样相位不变。
+                    x: 1400,
+                    y: 362,
+                    width: 124,
+                    height: 112,
                 },
                 blacklist_region: RectConfig {
-                    x: 1240,
-                    y: 130,
-                    width: 440,
-                    height: 505,
+                    // 纯文字「加入黑名单」：位于「屏蔽聊天」下方一行，同样随
+                    // 好友卡/UI 缩放上下移动；实测两档左上角 (1400,506) 与 (1400,573)。
+                    x: 1388,
+                    y: 494,
+                    width: 146,
+                    height: 117,
                 },
-                confirm_region: RectConfig {
-                    x: 900,
-                    y: 700,
-                    width: 500,
-                    height: 100,
+                confirm_button_region: RectConfig {
+                    // 通用「确认」按钮：实测命中左上角恒为 (1148,740)（8 帧一致），
+                    // 区域只留 12px 余量；旧 500×100 会把按钮两侧的弹窗内容卷进来。
+                    // 原点与旧区域同余 4，4× 采样相位不变。
+                    x: 1140,
+                    y: 728,
+                    width: 81,
+                    height: 58,
+                },
+                confirm_message_region: RectConfig {
+                    // 确认弹窗提示文案行：2× 下采样实测命中左上角分别为
+                    // 「随机公共大厅」(850,488)、「返回提瓦特」(996,488)、
+                    // 「屏蔽吗」(1050,498)，右边界最大 1146、下边界 534。
+                    // 横放宽到 650–1270，覆盖玩家名变长导致关键词右移；
+                    // 纵留 460–550 的整行余量。
+                    x: 650,
+                    y: 460,
+                    width: 620,
+                    height: 90,
                 },
             },
             playback: PlaybackConfig::default(),
@@ -395,7 +418,6 @@ impl Default for AppConfig {
                     wonderland_map_star: PathBuf::from(
                         "deps/assets/startup-wonderland-map-star.png",
                     ),
-                    wonderland_confirm: PathBuf::from("deps/assets/startup-wonderland-confirm.png"),
                     paimon_menu: PathBuf::from("deps/assets/startup-paimon-menu.png"),
                 },
                 enter_game_text_region: RectConfig {
@@ -409,12 +431,6 @@ impl Default for AppConfig {
                     y: 0,
                     width: 640,
                     height: 1040,
-                },
-                wonderland_confirm_region: RectConfig {
-                    x: 900,
-                    y: 650,
-                    width: 500,
-                    height: 250,
                 },
                 main_ui_region: RectConfig {
                     x: 0,
@@ -445,22 +461,33 @@ impl Default for AppConfig {
                     height: 850,
                 },
                 view_star_region: RectConfig {
-                    x: 400,
+                    // 纯文字「查看千星奇域档案」：x 固定在 (≈508)（头像菜单总在
+                    // 聊天头像右侧同一列），横向收窄到文字宽度 + 12px；**纵向必须
+                    // 保留**整个聊天列，因为菜单跟着被点击的头像上下移动（实测
+                    // 1920 夹具 724、1440p 实机归一化 186，1654 帧实机扫描只出现
+                    // 这两档位置，两端都覆盖）。
+                    x: 498,
                     y: 80,
-                    width: 440,
+                    width: 217,
                     height: 860,
                 },
                 goto_hall_region: RectConfig {
-                    x: 700,
+                    // 同时服务「前往其大厅」(4×) 与「查看资料」(4×)：实测新左上角
+                    // 前往其大厅 (1012,572)、查看资料 (1024,628) 与 (788,568)。
+                    // 旧 500×300 是整块卡片区域；现在只覆盖右侧按钮列的两行按钮，
+                    // 横向仍留 236px 跨度以覆盖两种卡片版式；原点保持 4 的倍数。
+                    x: 780,
                     y: 560,
-                    width: 500,
-                    height: 300,
+                    width: 372,
+                    height: 112,
                 },
                 enter_hall_region: RectConfig {
-                    x: 700,
-                    y: 700,
-                    width: 500,
-                    height: 100,
+                    // 纯文字「进入该大厅」：大厅卡实测命中左上角 (906,740)，
+                    // 区域收窄到文字宽度 + 12px 余量；原点与旧区域同奇偶（2× 相位不变）。
+                    x: 896,
+                    y: 730,
+                    width: 164,
+                    height: 54,
                 },
             },
             friend_delivery: FriendDeliveryConfig::default(),
@@ -684,7 +711,10 @@ impl AppConfig {
                 self.moderation.blacklist_region,
                 "moderation.blacklist_region",
             ),
-            (self.moderation.confirm_region, "moderation.confirm_region"),
+            (
+                self.moderation.confirm_button_region,
+                "moderation.confirm_button_region",
+            ),
             (
                 self.startup.enter_game_text_region,
                 "startup.enter_game_text_region",
@@ -692,10 +722,6 @@ impl AppConfig {
             (
                 self.startup.wonderland_hall_ocr_region,
                 "startup.wonderland_hall_ocr_region",
-            ),
-            (
-                self.startup.wonderland_confirm_region,
-                "startup.wonderland_confirm_region",
             ),
             (self.startup.main_ui_region, "startup.main_ui_region"),
             (
@@ -823,9 +849,19 @@ impl AppConfig {
             &mut self.templates.blue_marker,
             &mut self.templates.yellow_marker,
             &mut self.templates.pink_marker,
-            &mut self.templates.friend,
             &mut self.templates.secondary_back,
             &mut self.templates.secondary_hall,
+            &mut self.templates.secondary_chat_submit,
+            &mut self.templates.qianxing_exit_menu,
+            &mut self.templates.qianxing_map_label,
+            &mut self.templates.qianxing_profile_page_wishlist,
+            &mut self.templates.qianxing_profile_page_wardrobe,
+            &mut self.templates.teyvat_profile_adventure_rank,
+            &mut self.templates.teyvat_profile_world_level,
+            &mut self.templates.teyvat_profile_add_friend,
+            &mut self.templates.qianxing_profile_domain_level,
+            &mut self.templates.qianxing_profile_add_friend,
+            &mut self.templates.qianxing_profile_view_profile,
             &mut self.templates.world_wish,
             &mut self.templates.invite_view_star,
             &mut self.templates.invite_goto_hall,
@@ -835,7 +871,10 @@ impl AppConfig {
             &mut self.templates.friend_more_settings,
             &mut self.templates.friend_block_chat,
             &mut self.templates.friend_blacklist,
-            &mut self.templates.friend_confirm,
+            &mut self.templates.confirm_button,
+            &mut self.templates.confirm_message_random_hall,
+            &mut self.templates.confirm_message_return_teyvat,
+            &mut self.templates.confirm_message_block,
             &mut self.playback.credential_directory,
             &mut self.playback.login_helper_executable,
             &mut self.logging.dir,
@@ -846,7 +885,6 @@ impl AppConfig {
             &mut self.idiom_chain.lexicon_path,
             &mut self.startup.exe_path,
             &mut self.startup.templates.wonderland_map_star,
-            &mut self.startup.templates.wonderland_confirm,
             &mut self.startup.templates.paimon_menu,
             &mut self.turtle_soup.question_bank_path,
             &mut self.turtle_soup.used_state_path,
@@ -1052,6 +1090,8 @@ fn validate_nonempty_path(path: &Path, field: &str) -> Result<()> {
 
 /// 配置 schema 声明（阶段 4a）：Web 配置页按此生成表单。
 pub(crate) mod ai;
+/// 配置 schema 平滑迁移：旧版本字段改名/删除按键搬运，替代断代重置。
+mod migrations;
 mod schema;
 pub(crate) use schema::*;
 
@@ -1106,6 +1146,11 @@ pub struct ScreenConfig {
     pub friend_rect: RectConfig,
     pub secondary_back_rect: RectConfig,
     pub secondary_hall_rect: RectConfig,
+    /// 二级聊天输入行右侧「发送」圆钮（深色圆底 + 黄色对勾）的搜索区。
+    /// 它是**聊天专属锚点**：主菜单、主菜单大世界、千星多人面板、千星地图都没有这个按钮，
+    /// 用来把只有左上圆形返回按钮的菜单/淡出过渡帧挡在 Secondary 之外。
+    #[serde(default = "default_secondary_chat_submit_rect")]
+    pub secondary_chat_submit_rect: RectConfig,
     /// 主菜单「返回提瓦特」按钮的搜索区。实测 (1690,1000) 205x60 可把主菜单
     /// 与其余 58 帧完全分开（见 technical-docs/ui-state-machine.md §35）。
     #[serde(default = "default_main_menu_rect")]
@@ -1113,17 +1158,21 @@ pub struct ScreenConfig {
     /// 大厅底栏 👥 O 图标组的搜索区。
     #[serde(default = "default_hall_bar_rect")]
     pub hall_bar_rect: RectConfig,
+    /// F2 千星大厅页右下「邀请玩家」按钮的搜索区。
+    /// 左下「大厅列表」按钮复用 `hall_bar_rect`（两者都在底栏）；
+    /// 只在这个窄区域里找右侧锚点，避免全帧或整条底栏匹配。
+    #[serde(default = "default_qianxing_f2_invite_rect")]
+    pub qianxing_f2_invite_rect: RectConfig,
+
+
     #[serde(default = "default_world_wish_rect")]
     pub world_wish_rect: RectConfig,
-    /// 派蒙菜单专属锚点的搜索区：「商城」袋状图标本体（约 x 158..238, y 364..444）。
-    /// 只在这个菜单出现，用来把派蒙菜单从"圆形返回按钮命中的二级"里摘出来。
-    #[serde(default = "default_paimon_menu_rect")]
-    pub paimon_menu_rect: RectConfig,
     pub hall_name_rect: RectConfig,
     pub hall_member_count_rect: RectConfig,
     pub hall_time_rect: RectConfig,
     pub hall_member_list_rect: RectConfig,
 }
+
 
 fn default_hall_bar_rect() -> RectConfig {
     // 底栏的横向位置会随聊天面板状态移动（实测同一模板在大厅帧上可出现在 x=180 或 x=369），
@@ -1139,6 +1188,18 @@ fn default_hall_bar_rect() -> RectConfig {
     }
 }
 
+fn default_qianxing_f2_invite_rect() -> RectConfig {
+    // 「邀请玩家」纯文字模板（旧 canvas 240x50，现裁到字形 113x28）。
+    // 28 帧（1920 与 1440p 归一化）实测命中左上角恒为 (1662,1003)，
+    // 因此区域只保留 12px 定位余量，不再覆盖整条底栏右侧；原点与旧区域同奇偶。
+    RectConfig {
+        x: 1650,
+        y: 993,
+        width: 140,
+        height: 54,
+    }
+}
+
 fn default_main_menu_rect() -> RectConfig {
     // 按「返回提瓦特」整串文字外扩约 8px：模板本身只有这串字（137x25，不含定位图标），
     // 搜索区必须能容纳整块模板，否则匹配器直接返回空、主菜单又会漏判。
@@ -1151,25 +1212,24 @@ fn default_main_menu_rect() -> RectConfig {
     }
 }
 
+fn default_secondary_chat_submit_rect() -> RectConfig {
+    // 模板是 52×52 的发送圆钮（深色圆底 + 黄色对勾）。实测在 round78-live.png /
+    // secondary-full.png / sec-fixture.jpg 上命中位置恒为 (958,984)（三帧完全一致），
+    // 因此搜索区只需 ±24px 余量；区域不能贴到画面底边（y+height ≤ 1080）。
+    RectConfig {
+        x: 930,
+        y: 950,
+        width: 150,
+        height: 124,
+    }
+}
+
 fn default_world_wish_rect() -> RectConfig {
     RectConfig {
         x: 1300,
         y: 0,
         width: 620,
         height: 110,
-    }
-}
-
-fn default_paimon_menu_rect() -> RectConfig {
-    // 模板是「商城」的**袋状图标本体**（80×80，高对比、信息密度高），只给 ±6px 余量。
-    // **必须收紧到图标本身**：模板匹配是 1:1 SAD，代价 ≈ 区域位置数 × 模板像素数。
-    // 早先用 596×140 的整行瓦片 + 640×175 区域，debug 下单帧要 ~1.2s；即便收到整块瓦片
-    // （143×128）也比图标大一倍多，而瓦片里大半是纯色底——那部分像素只花时间、不提供信息。
-    RectConfig {
-        x: 152,
-        y: 358,
-        width: 92,
-        height: 92,
     }
 }
 
@@ -1206,10 +1266,11 @@ impl Default for ScreenConfig {
                 width: 65,
                 height: 55,
             },
+            secondary_chat_submit_rect: default_secondary_chat_submit_rect(),
             main_menu_rect: default_main_menu_rect(),
             hall_bar_rect: default_hall_bar_rect(),
+            qianxing_f2_invite_rect: default_qianxing_f2_invite_rect(),
             world_wish_rect: default_world_wish_rect(),
-            paimon_menu_rect: default_paimon_menu_rect(),
             hall_name_rect: RectConfig {
                 x: 75,
                 y: 425,
@@ -1245,10 +1306,17 @@ impl ScreenConfig {
             (self.friend_rect, "screen.friend_rect"),
             (self.secondary_back_rect, "screen.secondary_back_rect"),
             (self.secondary_hall_rect, "screen.secondary_hall_rect"),
+            (
+                self.secondary_chat_submit_rect,
+                "screen.secondary_chat_submit_rect",
+            ),
             (self.main_menu_rect, "screen.main_menu_rect"),
             (self.hall_bar_rect, "screen.hall_bar_rect"),
+            (
+                self.qianxing_f2_invite_rect,
+                "screen.qianxing_f2_invite_rect",
+            ),
             (self.world_wish_rect, "screen.world_wish_rect"),
-            (self.paimon_menu_rect, "screen.paimon_menu_rect"),
             (self.hall_name_rect, "screen.hall_name_rect"),
             (self.hall_member_count_rect, "screen.hall_member_count_rect"),
             (self.hall_time_rect, "screen.hall_time_rect"),
@@ -1834,7 +1902,6 @@ pub struct TemplateConfig {
     pub blue_marker: PathBuf,
     pub yellow_marker: PathBuf,
     pub pink_marker: PathBuf,
-    pub friend: PathBuf,
     pub secondary_back: PathBuf,
     pub secondary_hall: PathBuf,
     /// 千星奇域主菜单右下角的「返回提瓦特」按钮。命中即判定当前在奇域主菜单，
@@ -1851,16 +1918,114 @@ pub struct TemplateConfig {
     pub friend_more_settings: PathBuf,
     pub friend_block_chat: PathBuf,
     pub friend_blacklist: PathBuf,
-    pub friend_confirm: PathBuf,
-    /// 提瓦特派蒙菜单（ESC 系统菜单）的**专属锚点**：「商城」的袋状图标本体（80×80）。
-    /// 圆形返回按钮与二级聊天共用，只靠它会把这个菜单误判成二级（见 `ui/state.rs`）。
-    #[serde(default = "default_paimon_menu_panel_template")]
-    pub paimon_menu_panel: PathBuf,
+    /// 通用「确认」按钮模板（65×34 纯文字「确认」），好友操作与启动流程共用。
+    pub confirm_button: PathBuf,
+    /// 确认弹窗文案关键词锚点（进入大厅 / 离开大厅 / 屏蔽玩家）。
+    /// 确认弹窗必须「确认按钮 + 文案」双命中；文案只保留关键词，不含整句。
+    #[serde(default = "default_confirm_message_random_hall_template")]
+    pub confirm_message_random_hall: PathBuf,
+    #[serde(default = "default_confirm_message_return_teyvat_template")]
+    pub confirm_message_return_teyvat: PathBuf,
+    #[serde(default = "default_confirm_message_block_template")]
+    pub confirm_message_block: PathBuf,
+    /// 二级聊天输入行右侧「发送」圆钮模板。与圆形返回按钮一起判二级：
+    /// 只靠返回按钮会把奇域主菜单的淡出过渡帧误判成二级聊天。
+    #[serde(default = "default_secondary_chat_submit_template")]
+    pub secondary_chat_submit: PathBuf,
+    /// F2 千星大厅页左下「大厅列表」按钮（图标 + 四字标签）。
+    #[serde(default = "default_qianxing_f2_hall_list_template")]
+    pub qianxing_f2_hall_list: PathBuf,
+    /// F2 千星大厅页右下「邀请玩家」按钮（+ 图标 + 四字标签）。
+    #[serde(default = "default_qianxing_f2_invite_player_template")]
+    pub qianxing_f2_invite_player: PathBuf,
+    /// 千星退出菜单锚点：只保留第一行「退出至登录界面」的单行纯文字模板。
+    #[serde(default = "default_qianxing_exit_menu_template")]
+    pub qianxing_exit_menu: PathBuf,
+    /// 千星地图右下角锚点：右下角「千星奇域·大厅」文字 + 庙宇图标 + 红色角标。
+    /// 只裁这一小段 UI（不含 UID、不含整条背景），是千星地图的**首选**判据；
+    /// 整屏暗青比例只在锚点没命中时作为后备。
+    #[serde(default = "default_qianxing_map_label_template")]
+    pub qianxing_map_label: PathBuf,
+    /// 个人资料页右下角「心愿单」三字形透明模板（bbox + 2px）。
+    /// 个人资料页必须**两个按钮同时命中**才算，单个按钮不算（避免同位置白色胶囊按钮误判）。
+    #[serde(default = "default_qianxing_profile_page_wishlist_template")]
+    pub qianxing_profile_page_wishlist: PathBuf,
+    /// 个人资料页右下角「衣橱」两字形透明模板（bbox + 2px），与「心愿单」成对使用。
+    #[serde(default = "default_qianxing_profile_page_wardrobe_template")]
+    pub qianxing_profile_page_wardrobe: PathBuf,
+    /// 提瓦特资料卡左页「冒险等阶」纯文字锚点。与「世界等级」**同时命中**才判
+    /// 提瓦特资料卡，避免其它米色面板误判。
+    #[serde(default = "default_teyvat_profile_adventure_rank_template")]
+    pub teyvat_profile_adventure_rank: PathBuf,
+    /// 提瓦特资料卡左页「世界等级」纯文字锚点（与「冒险等阶」成对）。
+    #[serde(default = "default_teyvat_profile_world_level_template")]
+    pub teyvat_profile_world_level: PathBuf,
+    /// 提瓦特资料卡右下角「添加好友」（深色按钮 + 白字）：命中即非好友；
+    /// 未命中则是好友。
+    #[serde(default = "default_teyvat_profile_add_friend_template")]
+    pub teyvat_profile_add_friend: PathBuf,
+    /// 千星资料卡上部「奇域等级」纯文字锚点：命中即千星资料卡。
+    #[serde(default = "default_qianxing_profile_domain_level_template")]
+    pub qianxing_profile_domain_level: PathBuf,
+    /// 千星资料卡下部白色胶囊「添加好友」（深色字）：命中即非好友。
+    #[serde(default = "default_qianxing_profile_add_friend_template")]
+    pub qianxing_profile_add_friend: PathBuf,
+    /// 千星资料卡下部白色胶囊「查看资料」（深色字）：无「添加好友」但命中它 → 好友。
+    #[serde(default = "default_qianxing_profile_view_profile_template")]
+    pub qianxing_profile_view_profile: PathBuf,
     pub marker_threshold: f32,
 }
 
-fn default_paimon_menu_panel_template() -> PathBuf {
-    PathBuf::from("deps/assets/ui-paimon-menu-panel.png")
+fn default_confirm_message_random_hall_template() -> PathBuf {
+    PathBuf::from("deps/assets/confirm-message-random-hall.png")
+}
+
+fn default_confirm_message_return_teyvat_template() -> PathBuf {
+    PathBuf::from("deps/assets/confirm-message-return-teyvat.png")
+}
+
+fn default_confirm_message_block_template() -> PathBuf {
+    PathBuf::from("deps/assets/confirm-message-block.png")
+}
+
+fn default_secondary_chat_submit_template() -> PathBuf {
+    PathBuf::from("deps/assets/ui-secondary-chat-submit.png")
+}
+
+fn default_qianxing_f2_hall_list_template() -> PathBuf {
+    PathBuf::from("deps/assets/qianxing-f2-hall-list.png")
+}
+
+fn default_qianxing_f2_invite_player_template() -> PathBuf {
+    PathBuf::from("deps/assets/qianxing-f2-invite-player.png")
+}
+
+
+fn default_qianxing_exit_menu_template() -> PathBuf { PathBuf::from("deps/assets/qianxing-exit-menu.png") }
+fn default_qianxing_map_label_template() -> PathBuf { PathBuf::from("deps/assets/qianxing-map-label.png") }
+fn default_qianxing_profile_page_wishlist_template() -> PathBuf {
+    PathBuf::from("deps/assets/qianxing-profile-page-wishlist.png")
+}
+fn default_qianxing_profile_page_wardrobe_template() -> PathBuf {
+    PathBuf::from("deps/assets/qianxing-profile-page-wardrobe.png")
+}
+fn default_teyvat_profile_adventure_rank_template() -> PathBuf {
+    PathBuf::from("deps/assets/teyvat-profile-adventure-rank.png")
+}
+fn default_teyvat_profile_world_level_template() -> PathBuf {
+    PathBuf::from("deps/assets/teyvat-profile-world-level.png")
+}
+fn default_teyvat_profile_add_friend_template() -> PathBuf {
+    PathBuf::from("deps/assets/teyvat-profile-add-friend.png")
+}
+fn default_qianxing_profile_domain_level_template() -> PathBuf {
+    PathBuf::from("deps/assets/qianxing-profile-domain-level.png")
+}
+fn default_qianxing_profile_add_friend_template() -> PathBuf {
+    PathBuf::from("deps/assets/qianxing-profile-add-friend.png")
+}
+fn default_qianxing_profile_view_profile_template() -> PathBuf {
+    PathBuf::from("deps/assets/invite-view-profile.png")
 }
 
 fn default_world_wish_template() -> PathBuf {
@@ -1881,7 +2046,6 @@ impl Default for TemplateConfig {
             blue_marker: PathBuf::from("deps/assets/chat-marker-blue.png"),
             yellow_marker: PathBuf::from("deps/assets/chat-marker-yellow.png"),
             pink_marker: PathBuf::from("deps/assets/chat-marker-pink.png"),
-            friend: PathBuf::from("deps/assets/ui-primary-friend.png"),
             secondary_back: PathBuf::from("deps/assets/ui-secondary-back.png"),
             secondary_hall: PathBuf::from("deps/assets/ui-secondary-hall.png"),
             main_menu: default_main_menu_template(),
@@ -1894,8 +2058,23 @@ impl Default for TemplateConfig {
             friend_more_settings: PathBuf::from("deps/assets/friend-more-settings.png"),
             friend_block_chat: PathBuf::from("deps/assets/friend-block-chat.png"),
             friend_blacklist: PathBuf::from("deps/assets/friend-blacklist.png"),
-            friend_confirm: PathBuf::from("deps/assets/friend-confirm.png"),
-            paimon_menu_panel: default_paimon_menu_panel_template(),
+            confirm_button: PathBuf::from("deps/assets/confirm-button.png"),
+            confirm_message_random_hall: default_confirm_message_random_hall_template(),
+            confirm_message_return_teyvat: default_confirm_message_return_teyvat_template(),
+            confirm_message_block: default_confirm_message_block_template(),
+            secondary_chat_submit: default_secondary_chat_submit_template(),
+            qianxing_f2_hall_list: default_qianxing_f2_hall_list_template(),
+            qianxing_f2_invite_player: default_qianxing_f2_invite_player_template(),
+            qianxing_exit_menu: default_qianxing_exit_menu_template(),
+            qianxing_map_label: default_qianxing_map_label_template(),
+            qianxing_profile_page_wishlist: default_qianxing_profile_page_wishlist_template(),
+            qianxing_profile_page_wardrobe: default_qianxing_profile_page_wardrobe_template(),
+            teyvat_profile_adventure_rank: default_teyvat_profile_adventure_rank_template(),
+            teyvat_profile_world_level: default_teyvat_profile_world_level_template(),
+            teyvat_profile_add_friend: default_teyvat_profile_add_friend_template(),
+            qianxing_profile_domain_level: default_qianxing_profile_domain_level_template(),
+            qianxing_profile_add_friend: default_qianxing_profile_add_friend_template(),
+            qianxing_profile_view_profile: default_qianxing_profile_view_profile_template(),
             marker_threshold: 0.9,
         }
     }
@@ -1909,7 +2088,7 @@ impl TemplateConfig {
                 "friend_panel",
                 "friend_search_panel",
                 "friend_block_chat",
-                "friend_confirm",
+                "confirm_button",
                 "invite_enter_hall",
                 "invite_goto_hall",
                 "invite_view_star",
@@ -1924,7 +2103,6 @@ impl TemplateConfig {
             (&self.blue_marker, "templates.blue_marker"),
             (&self.yellow_marker, "templates.yellow_marker"),
             (&self.pink_marker, "templates.pink_marker"),
-            (&self.friend, "templates.friend"),
             (&self.secondary_back, "templates.secondary_back"),
             (&self.secondary_hall, "templates.secondary_hall"),
             (&self.world_wish, "templates.world_wish"),
@@ -1936,8 +2114,65 @@ impl TemplateConfig {
             (&self.friend_more_settings, "templates.friend_more_settings"),
             (&self.friend_block_chat, "templates.friend_block_chat"),
             (&self.friend_blacklist, "templates.friend_blacklist"),
-            (&self.friend_confirm, "templates.friend_confirm"),
-            (&self.paimon_menu_panel, "templates.paimon_menu_panel"),
+            (&self.confirm_button, "templates.confirm_button"),
+            (
+                &self.confirm_message_random_hall,
+                "templates.confirm_message_random_hall",
+            ),
+            (
+                &self.confirm_message_return_teyvat,
+                "templates.confirm_message_return_teyvat",
+            ),
+            (
+                &self.confirm_message_block,
+                "templates.confirm_message_block",
+            ),
+            (
+                &self.secondary_chat_submit,
+                "templates.secondary_chat_submit",
+            ),
+            (
+                &self.qianxing_f2_hall_list,
+                "templates.qianxing_f2_hall_list",
+            ),
+            (
+                &self.qianxing_f2_invite_player,
+                "templates.qianxing_f2_invite_player",
+            ),
+            (&self.qianxing_exit_menu, "templates.qianxing_exit_menu"),
+            (&self.qianxing_map_label, "templates.qianxing_map_label"),
+            (
+                &self.qianxing_profile_page_wishlist,
+                "templates.qianxing_profile_page_wishlist",
+            ),
+            (
+                &self.qianxing_profile_page_wardrobe,
+                "templates.qianxing_profile_page_wardrobe",
+            ),
+            (
+                &self.teyvat_profile_adventure_rank,
+                "templates.teyvat_profile_adventure_rank",
+            ),
+            (
+                &self.teyvat_profile_world_level,
+                "templates.teyvat_profile_world_level",
+            ),
+            (
+                &self.teyvat_profile_add_friend,
+                "templates.teyvat_profile_add_friend",
+            ),
+            (
+                &self.qianxing_profile_domain_level,
+                "templates.qianxing_profile_domain_level",
+            ),
+            (
+                &self.qianxing_profile_add_friend,
+                "templates.qianxing_profile_add_friend",
+            ),
+            (
+                &self.qianxing_profile_view_profile,
+                "templates.qianxing_profile_view_profile",
+            ),
         ] {
             validate_nonempty_path(path, field)?;
         }
@@ -2629,7 +2864,7 @@ stale_timeout_ms: 7500
                 .as_ref()
                 .expect("OpenVINO 缓存"),
             &config.templates.blue_marker,
-            &config.templates.friend_confirm,
+            &config.templates.confirm_button,
             &config.playback.credential_directory,
             &config.playback.login_helper_executable,
             &config.logging.dir,
@@ -2638,7 +2873,6 @@ stale_timeout_ms: 7500
             &config.state.executed_commands_log_path,
             &config.song_dedup.history_path,
             &config.startup.templates.wonderland_map_star,
-            &config.startup.templates.wonderland_confirm,
             &config.startup.templates.paimon_menu,
             &config.turtle_soup.question_bank_path,
             &config.turtle_soup.used_state_path,
@@ -2751,7 +2985,7 @@ stale_timeout_ms: 7500
             startup.enter_game_timeout_ms
         );
 
-        // 进入千星：各子阶段之和。派蒙菜单等待走 timing.workflow.default_timeout_ms。
+        // 进入千星：各子阶段之和。主菜单大世界等待走 timing.workflow.default_timeout_ms。
         let star = u64::from(startup.wonderland_map_star_retries.max(1))
             * startup.wonderland_map_star_retry_ms.max(1);
         let hall = u64::from(startup.wonderland_hall_retries.max(1))
@@ -3059,8 +3293,8 @@ stale_timeout_ms: 7500
             ("ocr.backend_priority", |config| {
                 config.ocr.backend_priority = vec!["metal".to_string()];
             }),
-            ("templates.friend", |config| {
-                config.templates.friend = PathBuf::new();
+            ("templates.secondary_back", |config| {
+                config.templates.secondary_back = PathBuf::new();
             }),
             ("playback.credential_directory", |config| {
                 config.playback.credential_directory = PathBuf::new();
@@ -3331,10 +3565,9 @@ stale_timeout_ms: 7500
             "startup.wonderland_confirm_stable_timeout_ms",
             "startup.wonderland_confirm_threshold",
             "startup.wonderland_hall_ocr_region",
-            "startup.wonderland_confirm_region",
             "startup.wonderland_map_star_region",
             "startup.templates.wonderland_map_star",
-            "startup.templates.wonderland_confirm",
+            "startup.templates.paimon_menu",
         ] {
             let mut value: serde_norway::Value =
                 serde_norway::from_str(bundled_config_yaml()).expect("default config value");
@@ -3468,7 +3701,7 @@ friend_search_panel: search.png
 friend_more_settings: more.png
 friend_block_chat: block.png
 friend_blacklist: blacklist.png
-friend_confirm: confirm.png
+confirm_button: confirm.png
 marker_threshold: 0.9
 "#,
         )

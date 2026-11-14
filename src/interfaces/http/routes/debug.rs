@@ -410,7 +410,7 @@ pub(super) fn debug_ui_catalogue_route(
     );
 
     // 顺序与 GET /tools/templates 一致，便于互相对照。
-    let entries: [(&str, &str, crate::geometry::Rect, &std::path::Path, f32); 19] = [
+    let entries: [(&str, &str, crate::geometry::Rect, &std::path::Path, f32); 17] = [
         (
             "blue-marker",
             "蓝色聊天标志",
@@ -430,13 +430,6 @@ pub(super) fn debug_ui_catalogue_route(
             "粉色聊天标志",
             marker_region,
             &templates.pink_marker,
-            marker,
-        ),
-        (
-            "friend",
-            "好友按钮",
-            screen.friend_rect.into(),
-            &templates.friend,
             marker,
         ),
         (
@@ -517,18 +510,11 @@ pub(super) fn debug_ui_catalogue_route(
             marker,
         ),
         (
-            "friend-confirm",
-            "好友操作确认",
-            moderation.confirm_region.into(),
-            &templates.friend_confirm,
+            "confirm-button",
+            "确认按钮",
+            moderation.confirm_button_region.into(),
+            &templates.confirm_button,
             marker,
-        ),
-        (
-            "wonderland-confirm",
-            "千星确认按钮",
-            startup.wonderland_confirm_region.into(),
-            &startup.templates.wonderland_confirm,
-            startup.wonderland_confirm_threshold,
         ),
         (
             "paimon-menu",
@@ -575,7 +561,7 @@ pub(super) fn debug_ui_catalogue_route(
         // 用带候选的版本：**未命中时也要拿到得分**，否则"没命中"这个结论本身无法复核。
         let entry = match crate::ui::template::best_template_candidate(&image, Some(region), path) {
             Ok(Some(hit)) => {
-                let matched = hit.score >= threshold;
+                let matched = hit.quality_ok && hit.score >= threshold;
                 if matched {
                     matched_names.push(name);
                 }

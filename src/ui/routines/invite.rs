@@ -8,6 +8,7 @@ use super::friend_delivery::{
     capture_normalized, current_ui_is_primary, open_friend_conversation, send_current_chat_message,
     wait_ms,
 };
+use super::residency::{ResidencyTarget, SettleEnvironment};
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskOutcome, UiTaskSpec};
 #[cfg(test)]
 use crate::config::AppConfig;
@@ -237,7 +238,8 @@ impl UiRoutine for ExecuteInviteRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         // 邀请进的是**新大厅**：入口不再存在，收尾固定 Primary，不回旧界面。
         // 入口不做观测/导航（`Passthrough`），避免与内部“打开好友会话”叠加导航。
-        let spec = invite_task_spec(&self.config);
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.friend.clone());
+        let spec = invite_task_spec(&self.config, environment);
         let inner = InviteInner {
             request: self.request,
             ocr: self.ocr,
@@ -262,14 +264,18 @@ impl UiRoutine for ExecuteInviteRoutine {
 }
 
 /// 邀请任务的总预算：内部按钮/完成等待 + 收尾预留（一次 Primary 稳定观察）。
-fn invite_task_spec(config: &InviteRoutineConfig) -> UiTaskSpec {
+fn invite_task_spec(
+    config: &InviteRoutineConfig,
+    environment: SettleEnvironment,
+) -> UiTaskSpec {
     let total_ms = config
         .button_timeout_ms
         .saturating_add(config.completion_timeout_ms)
         .saturating_add(config.completion_timeout_ms.max(2_000));
     UiTaskSpec::new(
-        UiResidencyTarget::Primary,
-        FinishPolicy::Fixed(UiResidencyTarget::Primary),
+        ResidencyTarget::Primary,
+        FinishPolicy::Fixed(ResidencyTarget::Primary),
+        environment,
     )
     .with_entry(EntryPolicy::Passthrough)
     .with_total_budget(Duration::from_millis(total_ms))
@@ -619,7 +625,7 @@ mod tests {
 
     use anyhow::{Result, bail};
     use enigo::Key;
-    use image::{DynamicImage, GenericImage, Rgba};
+    use image::{DynamicImage, GenericImage, GenericImageView, Rgba};
 
     use super::*;
     use crate::config::{AppConfig, RectConfig};
@@ -959,6 +965,7 @@ mod tests {
     fn invite_frames(config: &AppConfig) -> InviteFrameSet {
         let (secondary, friend_avatar) = secondary_frame(config);
         let mut friend_frame = secondary.clone();
+        clear_previous_conversation_selection(&mut friend_frame, config);
         let friend_list = config.invite.friend_list_region;
         fill_rect(
             &mut friend_frame,
@@ -1044,6 +1051,27 @@ mod tests {
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
                 frame.put_pixel(x as u32, y as u32, color);
+            }
+        }
+    }
+
+    /// 清掉真实帧自带的旧选中会话行（真实 UI 同一时刻只有一个高亮行）。
+    ///
+    /// 会话侧栏扫描区覆盖返回按钮下方整条侧栏；如果直接在真实帧上再画一条高亮，
+    /// 会同时出现两条高亮行，唯一高亮行判定会如实返回 None（协议约定：多高亮不猜）。
+    /// 只清好友列表列 x≥80 的亮像素，保留 x<80 的大厅模板列。
+    fn clear_previous_conversation_selection(frame: &mut DynamicImage, config: &AppConfig) {
+        let friends: Rect = config.invite.friend_list_region.into();
+        let back: Rect = config.screen.secondary_back_rect.into();
+        let right = (friends.right() + 40).min(frame.width() as i32);
+        let bottom = friends.bottom().min(frame.height() as i32);
+        for y in back.bottom().max(0)..bottom {
+            for x in friends.x..right {
+                let [red, green, blue, _] = frame.get_pixel(x as u32, y as u32).0;
+                let luminance = (u16::from(red) + u16::from(green) + u16::from(blue)) / 3;
+                if luminance >= 50 {
+                    frame.put_pixel(x as u32, y as u32, Rgba([24, 28, 36, 255]));
+                }
             }
         }
     }

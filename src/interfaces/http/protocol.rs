@@ -707,6 +707,20 @@ const ROUTES: &[RouteSpec] = &[
         handler: ai_search_route,
     },
     RouteSpec {
+        path: "/ai/trace",
+        json: true,
+        // 只读：最近 N 次 AI 请求摘要（内存环形，不落盘）。
+        mutating: false,
+        handler: ai_trace_route,
+    },
+    RouteSpec {
+        path: "/ai/trace/entry",
+        json: true,
+        // 只读：单条请求的完整报文（system/messages/tools/usage，已脱敏）。
+        mutating: false,
+        handler: ai_trace_entry_route,
+    },
+    RouteSpec {
         path: "/history",
         json: true,
         mutating: false,
@@ -1514,6 +1528,9 @@ fn parse_json_body<T: DeserializeOwned>(
 fn push_history(request: &Request, result: &str, ok: bool, state: &HttpSharedState) {
     if request.path.starts_with("/tools/")
         || request.path.starts_with("/debug/read-only/")
+        // 请求报文详情本身就很大（system/messages/tools），不能塞进 30 条
+        // 接口历史环形缓冲，否则面板历史页会被几 MB 的提示词占满。
+        || request.path.starts_with("/ai/trace")
         || matches!(
             request.path.as_str(),
             "/history"

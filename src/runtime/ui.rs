@@ -279,6 +279,8 @@ pub enum InputCertainty {
     AfterInputUnknown,
     ConfirmedFailure,
     Cancelled,
+    /// 内层例程 panic：输入状态未知（可能已按键），包装器仍会尽力收尾。
+    Panicked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,6 +322,15 @@ impl UiRoutineFailure {
     pub fn reason(&self) -> &str {
         &self.reason
     }
+
+    /// 内层例程 panic 的统一失败：输入结果未知，包装器仍会尽力收尾。
+    pub(crate) fn panicked(stage: &'static str, payload: &(dyn std::any::Any + Send)) -> Self {
+        Self::new(
+            InputCertainty::Panicked,
+            stage,
+            panic_payload_text(payload),
+        )
+    }
 }
 
 impl InputCertainty {
@@ -333,6 +344,7 @@ impl InputCertainty {
             Self::AfterInputUnknown => "输入已发出但结果未知，需人工确认",
             Self::ConfirmedFailure => "已确认失败，游戏内无残留动作",
             Self::Cancelled => "已取消，当前操作未继续执行",
+            Self::Panicked => "执行中异常终止，输入结果未知，需人工确认",
         }
     }
 }
@@ -548,6 +560,8 @@ fn stage_label(stage: &'static str) -> &'static str {
         "ui_task_finish" => "收尾恢复入口界面",
         "ui_task_settle" => "统一恢复目标界面",
         "test_inner" => "事务包装器测试内层例程",
+        "ui_task_panic" => "UI 任务内层异常",
+        "ui_task_leave" => "任务声明离开界面",
         "restore_residency" => "恢复界面驻留",
         "restore_residency_wait" => "等待界面驻留恢复",
         _ => stage,
@@ -913,6 +927,20 @@ impl UiStateEvidence {
     /// 是为了不动现有十几个 `UiStateEvidence::new(...)` 调用点。
     pub fn with_world_probe(mut self, probe: UiWorldProbeEvidence) -> Self {
         self.world_probe = Some(probe);
+        self
+    }
+
+    /// 追加一条模板探针：用于"检测链已有证据 + 一条更具体的专属锚点"，
+    /// 而不是重建一份证据把世界判据/标记探针丢掉。
+    pub fn with_template_probe(mut self, probe: UiTemplateProbeEvidence) -> Self {
+        self.template_probes.push(probe);
+        self
+    }
+
+    /// 替换最终规则名。`final_rule` 是证据里唯一对外的“因为所以”，
+    /// 专属锚点命中时它必须换成锚点自己的名字，否则日志会把功劳记到通用判据上。
+    pub fn with_final_rule(mut self, rule: impl Into<String>) -> Self {
+        self.final_rule = rule.into();
         self
     }
 
@@ -1773,6 +1801,8 @@ pub struct UiRoutineContext<'a> {
     finish_phase: &'a FinishPhaseState,
     /// 单次操作内的截图失败去重；每次操作独立，不需要跨操作共享。
     failure_log: CaptureFailureLog,
+    /// 强制完成：任务已经到达目标界面（主世界 / 千星），立即结束，不再走收尾导航。
+    forced_finish: bool,
 }
 
 impl<'a> UiRoutineContext<'a> {
@@ -1798,6 +1828,7 @@ impl<'a> UiRoutineContext<'a> {
             input_epoch,
             finish_phase,
             failure_log: CaptureFailureLog::default(),
+            forced_finish: false,
         }
     }
 
@@ -1807,6 +1838,15 @@ impl<'a> UiRoutineContext<'a> {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// 标记任务已达成目标：包装器会跳过收尾导航，当前例程应尽快返回。
+    pub fn force_finish(&mut self) {
+        self.forced_finish = true;
+    }
+
+    pub fn is_force_finished(&self) -> bool {
+        self.forced_finish
     }
 
     pub fn wait_cancellable(
@@ -1904,6 +1944,14 @@ impl<'a> UiRoutineContext<'a> {
             .lock()
             .ok()
             .and_then(|state| state.clone())
+    }
+
+    /// 最近一次成功抓取的帧（含 id/时间戳）；失败诊断用，不会触发新截图。
+    pub(crate) fn last_captured_frame(&self) -> Option<Arc<CapturedFrame>> {
+        self.latest_frame
+            .lock()
+            .ok()
+            .and_then(|frame| frame.as_ref().map(Arc::clone))
     }
 
     /// 本次操作开始后**尝试过**的真实输入次数（不记录输入正文）。
@@ -3200,6 +3248,7 @@ mod tests {
                             width: 1,
                             height: 1,
                             score: 1.0,
+                            quality_ok: true,
                         }],
                     )),
                     "pixel_probe",

@@ -1122,6 +1122,25 @@ struct SearchState {
     include_minimized: bool,
     hidden_target_windows: u32,
     minimized_target_windows: u32,
+    visited_windows: u32,
+}
+
+/// 窗口枚举汇总日志的最小间隔：每帧都会枚举一次，逐帧输出会刷屏。
+const ENUM_LOG_INTERVAL_MS: u64 = 5_000;
+static LAST_ENUM_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn enum_log_due() -> bool {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_ENUM_LOG_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < ENUM_LOG_INTERVAL_MS {
+        return false;
+    }
+    LAST_ENUM_LOG_MS.store(now, Ordering::Relaxed);
+    true
 }
 
 fn find_window_by_process(target_process: &str) -> Result<ProcessWindow> {
@@ -1132,6 +1151,7 @@ fn find_window_by_process(target_process: &str) -> Result<ProcessWindow> {
         include_minimized: false,
         hidden_target_windows: 0,
         minimized_target_windows: 0,
+        visited_windows: 0,
     };
     find_window_by_process_with_state(&mut state)
 }
@@ -1144,6 +1164,7 @@ fn find_window_by_process_for_close(target_process: &str) -> Result<HWND> {
         include_minimized: true,
         hidden_target_windows: 0,
         minimized_target_windows: 0,
+        visited_windows: 0,
     };
     find_window_by_process_with_state(&mut state).map(|window| window.hwnd)
 }
@@ -1157,6 +1178,21 @@ fn find_window_by_process_with_state(state: &mut SearchState) -> Result<ProcessW
     };
     if state.found.is_none() {
         enum_result.context("EnumWindows failed")?;
+    }
+    if enum_log_due() {
+        match state.found {
+            Some(window) => log::debug!(
+                "窗口枚举完成：命中「{}」（pid {}），候选窗口 {} 个",
+                state.target_label,
+                window.process_id,
+                state.visited_windows
+            ),
+            None => log::debug!(
+                "窗口枚举完成：未命中「{}」，候选窗口 {} 个",
+                state.target_label,
+                state.visited_windows
+            ),
+        }
     }
     state.found.ok_or_else(|| {
         if state.hidden_target_windows > 0 || state.minimized_target_windows > 0 {
@@ -1184,8 +1220,9 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
 
     match process_name(process_id) {
         Ok(name) => {
-            // 每个候选窗口都会走到这里（逐窗口枚举），必须是 debug。
-            log::debug!("枚举到窗口，所属进程是「{name}」（进程号 {process_id}）");
+            // 逐窗口日志会每帧刷几十条，把环形缓冲刷满；这里只计数，
+            // 整轮枚举结束后按 5 秒节奏输出一条汇总。
+            state.visited_windows = state.visited_windows.saturating_add(1);
             if state
                 .targets
                 .iter()

@@ -4834,10 +4834,13 @@ mod tests {
             let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
             let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
             let c = classifier.classify_at(&image, Instant::now()).unwrap();
+            // 一级/二级命中时分类器会跳过世界探针（性能优先），这里直接算一次，
+            // 只验证世界判据本身的正反例能力，不依赖分类路径。
             let world = c
                 .evidence()
                 .world_probe()
-                .unwrap_or_else(|| panic!("{path} 应带世界探针证据"));
+                .cloned()
+                .unwrap_or_else(|| world_probe_evidence(&image));
             (world.guess().to_string(), world.count())
         };
 

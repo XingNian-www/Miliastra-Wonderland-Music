@@ -756,6 +756,17 @@ impl TemplateUiStateClassifier {
         .ok()
         .flatten()?;
         if !button.quality_ok || button.score < threshold {
+            // 只有分数接近阈值时才记一条：逐帧无条件打会刷屏，但确认弹窗
+            // 现场需要知道"按钮到底差多少、是不是质量门控拒绝"。
+            if button.score >= 0.80 {
+                log::debug!(
+                    "确认弹窗未成立：按钮 score={:.4} quality={} threshold={:.3} rect={:?}",
+                    button.score,
+                    button.quality_ok,
+                    threshold,
+                    panels.confirm_button
+                );
+            }
             return None;
         }
         let messages = [
@@ -784,6 +795,15 @@ impl TemplateUiStateClassifier {
                 continue;
             };
             if !message.quality_ok || message.score < CONFIRM_MESSAGE_MIN {
+                if message.score >= 0.90 {
+                    log::debug!(
+                        "确认弹窗文案未成立：label={} score={:.4} quality={} threshold={:.3}",
+                        label,
+                        message.score,
+                        message.quality_ok,
+                        CONFIRM_MESSAGE_MIN
+                    );
+                }
                 continue;
             }
             return Some(UiStateClassification::with_evidence(

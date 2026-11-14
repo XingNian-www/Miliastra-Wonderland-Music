@@ -41,8 +41,20 @@ fn classify_saved_frame(
     let templates =
         crate::ui::state::UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     // 分类器消耗一份模板；fallback 探针还要用，所以先克隆一份。
+    // 与生产/门禁走同一条面板接线：否则离线帧里的覆盖层会全部落回 Unknown，
+    // 离线复核与实机结论不一致（审计时踩到过）。
     let mut classifier =
-        crate::ui::state::TemplateUiStateClassifier::new(templates.clone(), config.screen.clone());
+        crate::ui::state::TemplateUiStateClassifier::new(templates.clone(), config.screen.clone())
+            .with_panel_regions(crate::ui::state::PanelRegions {
+                friend_panel: config.moderation.friend_panel_region.into(),
+                friend_search_panel: config.moderation.search_panel_region.into(),
+                friend_block_chat: config.moderation.block_chat_region.into(),
+                confirm_button: config.moderation.confirm_button_region.into(),
+                confirm_message: config.moderation.confirm_message_region.into(),
+                invite_view_star: config.invite.view_star_region.into(),
+                invite_goto_hall: config.invite.goto_hall_region.into(),
+                invite_enter_hall: config.invite.enter_hall_region.into(),
+            });
     let classification = classifier
         .classify_at(image, std::time::Instant::now())
         .map_err(|error| AppError {

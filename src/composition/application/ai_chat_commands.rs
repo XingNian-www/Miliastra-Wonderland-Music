@@ -471,12 +471,26 @@ impl ApplicationRuntime {
                     ) || config.vision.direct_to_main))
                     .then(|| self.ai_chat_model_supports_vision(&main_model))
                     .unwrap_or(false);
-                let system_prompt = ai_chat::response_system_prompt_with_tools(
-                    &config,
-                    look_configured,
-                    speak_configured,
-                    config.allow_commands,
-                );
+                let system_prompt = {
+                    let mut prompt = ai_chat::response_system_prompt_with_tools(
+                        &config,
+                        look_configured,
+                        speak_configured,
+                        config.allow_commands,
+                    );
+                    // 表情能力只通过 system prompt 告知；没有白名单就不提，
+                    // 避免模型编造不存在的标签。
+                    let emoji = self.lifecycle.live_configs.snapshot().emoji.clone();
+                    if emoji.ai_enabled {
+                        let catalog = crate::features::emoji::ai_prompt_catalog(&emoji.ai_allowed);
+                        prompt.push_str("\n\n");
+                        prompt.push_str(&catalog);
+                        prompt.push_str(
+                            "\n想发表情时只能从上面清单里选，并把标签原样写进回复；不要编造不存在的表情。",
+                        );
+                    }
+                    prompt
+                };
                 let ai_deadline = Instant::now() + self.business.ai_request_timeout;
                 let mut vision_image = if ai_chat::auto_image_enabled(&config, main_supports_vision) {
                     self.capture_ai_chat_vision_image(&config, Some(ai_deadline))
@@ -740,7 +754,16 @@ impl ApplicationRuntime {
                     &answer.rendered,
                     &known_remarks,
                 );
-                let rendered = &filtered_rendered;
+                // AI 表情白名单：关闭时剥离全部标签，开启时只保留白名单内标签。
+                let emoji_config = self.lifecycle.live_configs.snapshot().emoji.clone();
+                let (rendered_filtered, stripped_emoji) =
+                    crate::features::emoji::filter_ai_text(&filtered_rendered, &emoji_config);
+                if stripped_emoji > 0 {
+                    log::info!(
+                        "AI 回复表情已按白名单过滤：移除 {stripped_emoji} 个不在可用清单内的标签"
+                    );
+                }
+                let rendered = rendered_filtered.as_str();
                 let now_ms = command_now_ms();
                 // 事实抽取与记忆压缩**完全异步**：各自在后台线程里完成
                 // 「读库 → 调模型 → 写库」，正式任务发完回复立刻结束，不再等

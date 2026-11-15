@@ -8,6 +8,7 @@ pub(crate) mod command;
 pub(crate) mod command_access;
 pub(crate) mod command_catalog;
 pub(crate) mod custom_workflow;
+pub(crate) mod emoji;
 pub(crate) mod entertainment;
 pub(crate) mod friend_delivery;
 pub(crate) mod hall;

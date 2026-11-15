@@ -216,6 +216,7 @@ impl ResolvedApplicationConfig {
                 timeout_ms: app.timing.workflow.default_timeout_ms,
                 poll_ms: app.timing.workflow.default_poll_ms,
                 stable_count: app.resolve_stability_count(app.invite.friend_name_stable_count),
+                emoji: &app.emoji,
             });
         let hall = HallRoutineConfig::resolve(
             friend_delivery.clone(),

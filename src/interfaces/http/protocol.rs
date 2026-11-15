@@ -865,6 +865,12 @@ const ROUTES: &[RouteSpec] = &[
         handler: config_route,
     },
     RouteSpec {
+        path: "/emoji/catalog",
+        json: true,
+        mutating: false,
+        handler: emoji_catalog_route,
+    },
+    RouteSpec {
         path: "/config/visual",
         json: true,
         mutating: false,

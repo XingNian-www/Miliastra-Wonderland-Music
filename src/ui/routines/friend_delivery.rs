@@ -15,6 +15,9 @@ use crate::config::AppConfig;
 use crate::config::{
     InputTimingConfig, OcrConfig, OutputConfig, PointConfig, ScreenConfig, TemplateConfig,
 };
+use crate::features::emoji::{
+    EMOJI_TAB_TOTAL, EmojiConfig, EmojiSegment, EmojiTag, ParsedReply, parse_reply,
+};
 use crate::geometry::{Point, Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
@@ -834,6 +837,8 @@ pub(crate) struct FriendDeliveryRoutineConfig {
     stable_changed_ratio_threshold: f32,
     secondary_hall_template: PathBuf,
     template_threshold: f32,
+    emoji_enabled: bool,
+    emoji_capture_debug: bool,
 }
 
 pub(crate) struct FriendDeliveryRoutineConfigSource<'a> {
@@ -852,6 +857,7 @@ pub(crate) struct FriendDeliveryRoutineConfigSource<'a> {
     pub(crate) timeout_ms: u64,
     pub(crate) poll_ms: u64,
     pub(crate) stable_count: u32,
+    pub(crate) emoji: &'a EmojiConfig,
 }
 
 impl FriendDeliveryRoutineConfig {
@@ -882,6 +888,8 @@ impl FriendDeliveryRoutineConfig {
             stable_changed_ratio_threshold: source.ocr.change_pixel_threshold,
             secondary_hall_template: source.templates.secondary_hall.clone(),
             template_threshold: source.templates.marker_threshold,
+            emoji_enabled: source.emoji.enabled,
+            emoji_capture_debug: source.emoji.capture_debug,
         }
     }
 
@@ -903,6 +911,7 @@ impl FriendDeliveryRoutineConfig {
             timeout_ms: config.timing.workflow.default_timeout_ms,
             poll_ms: config.timing.workflow.default_poll_ms,
             stable_count: config.resolve_stability_count(config.invite.friend_name_stable_count),
+            emoji: &config.emoji,
         })
     }
 
@@ -1233,12 +1242,15 @@ fn execute_hall_batch(
                     break;
                 }
             }
-            match send_current_chat_message_guarded(
+            let send_result = send_chat_message_with_emoji(
                 context,
+                ocr,
                 config,
                 message,
+                request.residency,
                 request.ready.as_ref(),
-            ) {
+            );
+            match send_result {
                 Ok(()) => sent += 1,
                 Err(failure) => {
                     status = HallBatchStatus::Failed(failure);
@@ -2170,6 +2182,519 @@ pub(super) fn after_input_failure(stage: &'static str, error: anyhow::Error) -> 
 }
 
 pub(super) use super::state_observation::wait_ms;
+
+// ===================================================================
+// 二级聊天表情
+// ===================================================================
+
+/// 表情按钮在 1920×1080 设计分辨率下的位置。
+const EMOJI_BUTTON_DESIGN: Point = Point::new(907, 980);
+/// 表情栏页签行 ROI（设计分辨率）。红心锚点在这里检测。
+const EMOJI_TRAY_DESIGN: Rect = Rect::new(280, 840, 920, 100);
+/// 表情网格 ROI（设计分辨率）。只对这块做一次 OCR。
+const EMOJI_GRID_DESIGN: Rect = Rect::new(300, 220, 1300, 620);
+/// 第 1 个角色页签相对红心的 x 偏移（设计分辨率）。
+const EMOJI_TAB_FIRST_OFFSET_DESIGN: f32 = 110.0;
+/// 相邻角色页签的间距（设计分辨率）。
+const EMOJI_TAB_PITCH_DESIGN: f32 = 110.5;
+/// 打开表情栏后等待动画的时长。
+const EMOJI_PANEL_OPEN_WAIT_MS: u64 = 700;
+/// 点击页签后等待网格出现的时长。
+const EMOJI_GRID_WAIT_MS: u64 = 700;
+/// 点击表情后等待面板关闭的时长。
+const EMOJI_CLOSE_WAIT_MS: u64 = 1200;
+
+fn emoji_failure(stage: &'static str, code: &str) -> UiRoutineFailure {
+    UiRoutineFailure::new(InputCertainty::AfterInputUnknown, stage, code)
+}
+
+fn design_scale(image: &DynamicImage, expected_width: u32) -> f32 {
+    if expected_width == 0 {
+        return 1.0;
+    }
+    image.width() as f32 / expected_width as f32
+}
+
+fn scale_rect(rect: Rect, scale: f32) -> Rect {
+    Rect::new(
+        (rect.x as f32 * scale).round() as i32,
+        (rect.y as f32 * scale).round() as i32,
+        (rect.width as f32 * scale).round().max(1.0) as u32,
+        (rect.height as f32 * scale).round().max(1.0) as u32,
+    )
+}
+
+fn scale_point(point: Point, scale: f32) -> Point {
+    Point::new(
+        (point.x as f32 * scale).round() as i32,
+        (point.y as f32 * scale).round() as i32,
+    )
+}
+
+fn to_design(value: i32, scale: f32) -> i32 {
+    if scale <= 0.0 {
+        value
+    } else {
+        (value as f32 / scale).round() as i32
+    }
+}
+
+/// 一次性发送入口：允许表情时按标签拆段，否则保持原有纯文本行为。
+fn send_chat_message_with_emoji(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &FriendDeliveryRoutineConfig,
+    message: &str,
+    residency: UiResidencyTarget,
+    ready: Option<&InviteReadyGate>,
+) -> Result<(), UiRoutineFailure> {
+    let parsed = match parse_reply(message) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            // 语法错误不在发送层猜测：按原文本发送，配置面板保存时应已拦住。
+            log::warn!("表情标签解析失败，按纯文本发送：{error}");
+            return send_current_chat_message_guarded(context, config, message, ready);
+        }
+    };
+    if !parsed.has_emoji() {
+        return send_current_chat_message_guarded(context, config, message, ready);
+    }
+    // 表情只在二级当前聊天执行；关闭开关或在其它位置发送时，标签一律剥离，
+    // 避免把 `{表情包:...}` 这样的控制文本当成普通聊天发出去。
+    let emoji_allowed = config.emoji_enabled && residency == UiResidencyTarget::SecondaryCurrentHall;
+    send_parsed_segments(context, ocr, config, &parsed, ready, emoji_allowed)
+}
+
+fn send_parsed_segments(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &FriendDeliveryRoutineConfig,
+    parsed: &ParsedReply,
+    ready: Option<&InviteReadyGate>,
+    emoji_allowed: bool,
+) -> Result<(), UiRoutineFailure> {
+    let mut sent_text = false;
+    let mut first_emoji_failure: Option<UiRoutineFailure> = None;
+    for segment in &parsed.segments {
+        match segment {
+            EmojiSegment::Text(text) => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                // 文字失败仍然直接中止（与原发送语义一致）。
+                send_current_chat_message_guarded(context, config, text, ready)?;
+                sent_text = true;
+            }
+            EmojiSegment::Emoji(tag) => {
+                if !emoji_allowed {
+                    log::debug!(
+                        "表情标签已剥离（表情开关关闭或不在二级当前聊天）：页签 {}，候选 {} 个",
+                        tag.pack,
+                        tag.candidates.len()
+                    );
+                    continue;
+                }
+                if let Err(failure) = send_emoji_segment(context, ocr, config, tag, "send_emoji") {
+                    log::warn!(
+                        "表情发送失败（页签 {}，候选 {} 个，原因：{}），继续后续内容",
+                        tag.pack,
+                        tag.candidates.len(),
+                        failure.reason()
+                    );
+                    if first_emoji_failure.is_none() {
+                        first_emoji_failure = Some(failure);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(failure) = first_emoji_failure {
+        if !sent_text {
+            return Err(failure);
+        }
+    }
+    Ok(())
+}
+
+fn capture_emoji_frame(
+    context: &mut UiRoutineContext<'_>,
+    stage: &'static str,
+) -> Result<DynamicImage, UiRoutineFailure> {
+    let frame = context
+        .capture_frame()
+        .map_err(|error| after_input_failure(stage, error))?;
+    Ok(frame.image().clone())
+}
+
+fn save_emoji_debug(image: &DynamicImage, config: &FriendDeliveryRoutineConfig, label: &str) {
+    if !config.emoji_capture_debug {
+        return;
+    }
+    let directory = std::path::Path::new("deps/emoji-debug");
+    if let Err(error) = std::fs::create_dir_all(directory) {
+        log::warn!("创建表情调试截图目录失败：{error:#}");
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let path = directory.join(format!("{stamp}-{label}.png"));
+    match image.save(&path) {
+        Ok(()) => log::info!("表情调试截图已保存：{}", path.display()),
+        Err(error) => log::warn!("保存表情调试截图失败：{error:#}"),
+    }
+}
+
+/// 在页签行 ROI 内找收藏页红心。找不到就是失败，不做任何坐标兜底。
+fn find_emoji_heart(image: &DynamicImage, tray: Rect) -> Option<Point> {
+    let (width, height) = image.dimensions();
+    let x0 = tray.x.max(0) as u32;
+    let y0 = tray.y.max(0) as u32;
+    let x1 = tray.right().max(0) as u32;
+    let y1 = tray.bottom().max(0) as u32;
+    let x1 = x1.min(width);
+    let y1 = y1.min(height);
+    if x1 <= x0 + 8 || y1 <= y0 + 8 {
+        return None;
+    }
+    let region_width = (x1 - x0) as usize;
+    let region_height = (y1 - y0) as usize;
+    let mut mask = vec![false; region_width * region_height];
+    for y in 0..region_height {
+        for x in 0..region_width {
+            let pixel = image.get_pixel(x0 + x as u32, y0 + y as u32);
+            let [r, g, b, _] = pixel.0;
+            let (r, g, b) = (r as i32, g as i32, b as i32);
+            // 红心是深红/玫红：红通道高、绿蓝明显偏低。
+            // 橙色「+ 编辑」的绿通道通常 >140，会被 g<=115 排除。
+            mask[y * region_width + x] =
+                r >= 135 && g <= 115 && b <= 130 && r - g >= 55 && r - b >= 35;
+        }
+    }
+
+    let mut visited = vec![false; mask.len()];
+    let mut best: Option<(i32, i32, u32)> = None; // (center_x, center_y, area)
+    for start_y in 0..region_height {
+        for start_x in 0..region_width {
+            let start_index = start_y * region_width + start_x;
+            if !mask[start_index] || visited[start_index] {
+                continue;
+            }
+            let mut stack = vec![(start_x, start_y)];
+            visited[start_index] = true;
+            let mut area = 0_u32;
+            let (mut min_x, mut max_x) = (start_x, start_x);
+            let (mut min_y, mut max_y) = (start_y, start_y);
+            while let Some((cx, cy)) = stack.pop() {
+                area += 1;
+                min_x = min_x.min(cx);
+                max_x = max_x.max(cx);
+                min_y = min_y.min(cy);
+                max_y = max_y.max(cy);
+                for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    let nx = cx as i32 + dx;
+                    let ny = cy as i32 + dy;
+                    if nx < 0 || ny < 0 || nx >= region_width as i32 || ny >= region_height as i32
+                    {
+                        continue;
+                    }
+                    let index = ny as usize * region_width + nx as usize;
+                    if mask[index] && !visited[index] {
+                        visited[index] = true;
+                        stack.push((nx as usize, ny as usize));
+                    }
+                }
+            }
+            let component_width = (max_x - min_x + 1) as u32;
+            let component_height = (max_y - min_y + 1) as u32;
+            if area < 40 || component_width < 8 || component_height < 8 {
+                continue;
+            }
+            if component_width > 80 || component_height > 80 {
+                continue;
+            }
+            let fill = area as f32 / (component_width * component_height) as f32;
+            if fill < 0.18 {
+                continue;
+            }
+            let ratio = component_width as f32 / component_height as f32;
+            if !(0.55..=1.85).contains(&ratio) {
+                continue;
+            }
+            let center_x = x0 as i32 + (min_x + max_x) as i32 / 2;
+            let center_y = y0 as i32 + (min_y + max_y) as i32 / 2;
+            // 收藏页在最左侧；取最左的有效红色连通域，面积同档时取更大的。
+            match best {
+                None => best = Some((center_x, center_y, area)),
+                Some((best_x, _, best_area)) => {
+                    if center_x < best_x - 6 || (center_x <= best_x + 6 && area > best_area) {
+                        best = Some((center_x, center_y, area));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(x, y, _)| Point::new(x, y))
+}
+
+/// 以红心为原点推算页签中心；页签总数固定为 `EMOJI_TAB_TOTAL`。
+fn emoji_tab_center(heart: Point, pack: u32, scale: f32) -> Option<Point> {
+    if pack == 0 || pack > EMOJI_TAB_TOTAL {
+        return None;
+    }
+    if pack == 1 {
+        return Some(heart);
+    }
+    let offset = (EMOJI_TAB_FIRST_OFFSET_DESIGN
+        + (pack as f32 - 2.0) * EMOJI_TAB_PITCH_DESIGN)
+        * scale;
+    Some(Point::new(heart.x + offset.round() as i32, heart.y))
+}
+
+/// 在 OCR 结果里精确匹配候选；多命中视为歧义，拒绝点击。
+fn select_emoji_candidate(
+    lines: &[crate::runtime::ocr::OcrLine],
+    candidates: &[String],
+    offset: Point,
+    scale: f32,
+) -> Result<Option<Point>, &'static str> {
+    let mut matches: Vec<(String, Point)> = Vec::new();
+    for candidate in candidates {
+        let target = normalize_lock_text(candidate);
+        let hits: Vec<&crate::runtime::ocr::OcrLine> = lines
+            .iter()
+            .filter(|line| normalize_lock_text(&line.text) == target)
+            .collect();
+        if hits.len() > 1 {
+            return Err("emoji_ocr_ambiguous");
+        }
+        if let Some(hit) = hits.first() {
+            let center = hit.bbox.center();
+            matches.push((
+                candidate.clone(),
+                Point::new(
+                    to_design(offset.x + center.x, scale),
+                    to_design(offset.y + center.y, scale),
+                ),
+            ));
+        }
+    }
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    let index = if matches.len() == 1 {
+        0
+    } else {
+        rand::random::<usize>() % matches.len()
+    };
+    Ok(Some(matches[index].1))
+}
+
+fn close_emoji_panel(context: &mut UiRoutineContext<'_>, stage: &'static str) {
+    if let Err(error) = context.device().press_key(Key::Escape) {
+        log::warn!("关闭表情面板失败（阶段 {stage}）：{error:#}");
+    }
+}
+
+fn send_emoji_segment(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &FriendDeliveryRoutineConfig,
+    tag: &EmojiTag,
+    stage: &'static str,
+) -> Result<(), UiRoutineFailure> {
+    let expected_width = config.screen.expected_width;
+    let button_frame = capture_emoji_frame(context, stage)?;
+    let scale = design_scale(&button_frame, expected_width);
+    let button = scale_point(EMOJI_BUTTON_DESIGN, scale);
+    context
+        .device()
+        .click_point(button.x, button.y)
+        .map_err(|error| after_input_failure(stage, error))?;
+    wait_ms(
+        context,
+        EMOJI_PANEL_OPEN_WAIT_MS,
+        stage,
+        InputCertainty::AfterInputUnknown,
+    )?;
+
+    let panel_frame = capture_emoji_frame(context, stage)?;
+    save_emoji_debug(&panel_frame, config, "panel-open");
+    let tray = scale_rect(EMOJI_TRAY_DESIGN, scale);
+    let Some(heart) = find_emoji_heart(&panel_frame, tray) else {
+        close_emoji_panel(context, stage);
+        return Err(emoji_failure(stage, "emoji_anchor_not_found"));
+    };
+
+    if tag.pack > 1 {
+        let Some(tab) = emoji_tab_center(heart, tag.pack, scale) else {
+            close_emoji_panel(context, stage);
+            return Err(emoji_failure(stage, "emoji_pack_not_found"));
+        };
+        if tab.x < tray.x || tab.x > tray.right() || tab.y < tray.y || tab.y > tray.bottom() {
+            close_emoji_panel(context, stage);
+            return Err(emoji_failure(stage, "emoji_pack_not_found"));
+        }
+        context
+            .device()
+            .click_point(tab.x, tab.y)
+            .map_err(|error| after_input_failure(stage, error))?;
+        wait_ms(
+            context,
+            EMOJI_GRID_WAIT_MS,
+            stage,
+            InputCertainty::AfterInputUnknown,
+        )?;
+    }
+
+    let grid_frame = capture_emoji_frame(context, stage)?;
+    save_emoji_debug(&grid_frame, config, "pack-grid");
+    let grid = scale_rect(EMOJI_GRID_DESIGN, scale);
+    let crop = crop_canvas(&grid_frame, grid)
+        .map_err(|error| emoji_failure(stage, &format!("emoji_crop_failed: {error:#}")))?;
+    let lines = ocr
+        .recognize_lines(crop, OcrPriority::UiConfirmation)
+        .map_err(|error| emoji_failure(stage, &format!("emoji_ocr_failed: {error:#}")))?;
+    let pick = match select_emoji_candidate(&lines, &tag.candidates, Point::new(grid.x, grid.y), scale)
+    {
+        Ok(pick) => pick,
+        Err(code) => {
+            close_emoji_panel(context, stage);
+            return Err(emoji_failure(stage, code));
+        }
+    };
+    let Some(point) = pick else {
+        close_emoji_panel(context, stage);
+        return Err(emoji_failure(stage, "emoji_not_visible"));
+    };
+    context
+        .device()
+        .click_point(point.x, point.y)
+        .map_err(|error| after_input_failure(stage, error))?;
+    wait_ms(
+        context,
+        EMOJI_CLOSE_WAIT_MS,
+        stage,
+        InputCertainty::AfterInputUnknown,
+    )?;
+    let closed_frame = capture_emoji_frame(context, stage)?;
+    save_emoji_debug(&closed_frame, config, "after-send");
+    if find_emoji_heart(&closed_frame, tray).is_some() {
+        close_emoji_panel(context, stage);
+        return Err(emoji_failure(stage, "emoji_panel_not_closed"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod emoji_flow_tests {
+    use super::*;
+    use image::{Rgb, RgbImage};
+
+    fn frame_with_red_blob(center: (i32, i32), radius: i32) -> DynamicImage {
+        let mut image = RgbImage::from_pixel(1920, 1080, Rgb([20, 20, 30]));
+        for y in (center.1 - radius)..=(center.1 + radius) {
+            for x in (center.0 - radius)..=(center.0 + radius) {
+                let dx = x - center.0;
+                let dy = y - center.1;
+                if dx * dx + dy * dy <= radius * radius {
+                    image.put_pixel(x as u32, y as u32, Rgb([220, 60, 90]));
+                }
+            }
+        }
+        DynamicImage::ImageRgb8(image)
+    }
+
+    #[test]
+    fn finds_red_heart_in_tray() {
+        let image = frame_with_red_blob((424, 927), 12);
+        let heart = find_emoji_heart(&image, EMOJI_TRAY_DESIGN).expect("应找到红心");
+        assert!((heart.x - 424).abs() <= 3, "heart.x={}", heart.x);
+        assert!((heart.y - 927).abs() <= 3, "heart.y={}", heart.y);
+    }
+
+    #[test]
+    fn ignores_orange_plus_like_blob() {
+        let base = frame_with_red_blob((424, 927), 12).to_rgb8();
+        let mut rgb = base;
+        // 左侧「+ 编辑」的橙色图标：绿通道高，不应被当成红心。
+        for y in 880..920 {
+            for x in 300..340 {
+                rgb.put_pixel(x, y, Rgb([250, 170, 60]));
+            }
+        }
+        let heart = find_emoji_heart(&DynamicImage::ImageRgb8(rgb), EMOJI_TRAY_DESIGN)
+            .expect("应找到红心");
+        assert!((heart.x - 424).abs() <= 3, "heart.x={}", heart.x);
+    }
+
+    #[test]
+    fn missing_heart_returns_none() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(1920, 1080, Rgb([20, 20, 30])));
+        assert!(find_emoji_heart(&image, EMOJI_TRAY_DESIGN).is_none());
+    }
+
+    #[test]
+    fn tab_centers_follow_fixed_pitch() {
+        let heart = Point::new(424, 927);
+        let scale = 1.0;
+        let first = emoji_tab_center(heart, 2, scale).unwrap();
+        assert_eq!(first.x, 534);
+        let second = emoji_tab_center(heart, 3, scale).unwrap();
+        assert_eq!(second.x, 645); // 110.5 取整
+        let last = emoji_tab_center(heart, EMOJI_TAB_TOTAL, scale).unwrap();
+        // 固定间距近似值：实测 1088，这里按 110.5 的等比偏移得到 1087。
+        assert!((last.x - 1088).abs() <= 1, "last.x={}", last.x);
+        assert_eq!(last.y, 927);
+    }
+
+    #[test]
+    fn tab_center_rejects_out_of_range() {
+        let heart = Point::new(424, 927);
+        assert!(emoji_tab_center(heart, 0, 1.0).is_none());
+        assert!(emoji_tab_center(heart, EMOJI_TAB_TOTAL + 1, 1.0).is_none());
+    }
+
+    fn line(text: &str, x: i32, y: i32) -> crate::runtime::ocr::OcrLine {
+        crate::runtime::ocr::OcrLine {
+            text: text.to_string(),
+            confidence: 0.99,
+            bbox: Rect::new(x, y, 40, 20),
+        }
+    }
+
+    #[test]
+    fn selects_exact_candidate_center() {
+        let lines = vec![line("交给我吧", 100, 50), line("生气", 200, 50)];
+        let candidates = vec!["交给我吧".to_string(), "吃惊".to_string()];
+        let pick = select_emoji_candidate(&lines, &candidates, Point::new(300, 200), 1.0)
+            .unwrap()
+            .expect("应命中");
+        assert_eq!((pick.x, pick.y), (300 + 120, 200 + 60));
+    }
+
+    #[test]
+    fn rejects_ambiguous_candidate() {
+        let lines = vec![line("交给我吧", 100, 50), line("交给我吧", 200, 50)];
+        let candidates = vec!["交给我吧".to_string()];
+        assert_eq!(
+            select_emoji_candidate(&lines, &candidates, Point::new(0, 0), 1.0).unwrap_err(),
+            "emoji_ocr_ambiguous"
+        );
+    }
+
+    #[test]
+    fn returns_none_when_no_candidate_visible() {
+        let lines = vec![line("别的表情", 100, 50)];
+        let candidates = vec!["交给我吧".to_string()];
+        assert!(
+            select_emoji_candidate(&lines, &candidates, Point::new(0, 0), 1.0)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -7,401 +7,433 @@
 <script>try{if(!localStorage.getItem('miliastraTheme'))localStorage.setItem('miliastraTheme','dark');document.documentElement.dataset.theme=localStorage.getItem('miliastraTheme')}catch(e){document.documentElement.dataset.theme='dark'}</script>
 <style>
 *{box-sizing:border-box}
+/* 颜色与尺寸变量与 page.html 保持一致；主题键共用 miliastraTheme。 */
 :root{
   color-scheme:dark;
-  --bg-ground:#181817;
-  --bg-card:#1f1f1f;
-  --bg-input:#101010;
-  --bg-raised:#262626;
-  --fill-1:rgba(255,255,255,.06);
-  --fill-2:rgba(255,255,255,.11);
-  --sep-1:rgba(255,255,255,.1);
-  --sep-2:rgba(255,255,255,.055);
-  --text-1:rgba(255,255,255,.87);
-  --text-2:rgba(255,255,255,.56);
-  --text-3:rgba(255,255,255,.38);
-  --accent:#3d8bff;
-  --accent-soft:rgba(61,139,255,.14);
-  --ok:#3ad97a;
-  --ok-soft:rgba(58,217,122,.12);
-  --warn:#ffb02e;
-  --warn-soft:rgba(255,176,46,.12);
-  --danger:#ff5c66;
-  --danger-soft:rgba(255,92,102,.12);
-  --info:#52c7e0;
-  --info-soft:rgba(82,199,224,.12);
-  --inverse:#101010;
-  --primary-hover:rgba(255,255,255,.28);
-  --shadow:0 1px 2px rgba(0,0,0,.28);
-
-  /* 字体 */
+  --bg-ground:#181817;--bg-card:#1f1f1f;--bg-input:#101010;--bg-raised:#262626;
+  --fill-1:rgba(255,255,255,.06);--fill-2:rgba(255,255,255,.11);
+  --sep-1:rgba(255,255,255,.1);--sep-2:rgba(255,255,255,.055);
+  --text-1:rgba(255,255,255,.87);--text-2:rgba(255,255,255,.56);--text-3:rgba(255,255,255,.38);
+  --accent:#3d8bff;--accent-soft:rgba(61,139,255,.14);
+  --ok:#3ad97a;--warn:#ffb02e;--danger:#ff5c66;--danger-soft:rgba(255,92,102,.12);
+  --inverse:#101010;--primary-hover:rgba(255,255,255,.28);
+  --shadow:0 1px 2px rgba(0,0,0,.28);--backdrop:rgba(0,0,0,.6);
   --font-sans:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
   --font-mono:ui-monospace,SFMono-Regular,Consolas,monospace;
-  /* 字号 / 行高 */
-  --fs-h1:17px;--lh-h1:24px;
-  --fs-title:14px;--lh-title:20px;
-  --fs-body:14px;--lh-body:21px;
-  --fs-item:13px;--lh-item:19px;
-  --fs-meta:12px;--lh-meta:17px;
-  --fs-tiny:11px;--lh-tiny:16px;
-  /* 间距 (4px 基准) */
+  --fs-title:14px;--lh-title:20px;--fs-body:14px;--lh-body:21px;
+  --fs-meta:12px;--lh-meta:17px;--fs-tiny:11px;--lh-tiny:16px;
   --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;
-  /* 圆角 */
   --radius-s:8px;--radius-m:10px;--radius-l:12px;
-  /* 控件尺寸 */
-  --btn-h:32px;--btn-h-sm:26px;--ctl-h:28px;
-  --ic:16px;--ic-sm:14px;
+  --btn-h:32px;--ctl-h:28px;--ic:16px;
 }
 html[data-theme=light]{
   color-scheme:light;
-  --bg-ground:#f5f5f3;
-  --bg-card:#ffffff;
-  --bg-input:#fafaf8;
-  --bg-raised:#eeeeea;
-  --fill-1:rgba(0,0,0,.045);
-  --fill-2:rgba(0,0,0,.09);
-  --sep-1:rgba(0,0,0,.1);
-  --sep-2:rgba(0,0,0,.05);
-  --text-1:rgba(0,0,0,.86);
-  --text-2:rgba(0,0,0,.56);
-  --text-3:rgba(0,0,0,.4);
-  --accent:#2f6df0;
-  --accent-soft:rgba(47,109,240,.1);
-  --ok:#149a4b;
-  --ok-soft:rgba(20,154,75,.1);
-  --warn:#c9760a;
-  --warn-soft:rgba(201,118,10,.1);
-  --danger:#d93038;
-  --danger-soft:rgba(217,48,56,.1);
-  --info:#0e8fae;
-  --info-soft:rgba(14,143,174,.1);
-  --inverse:#ffffff;
-  --primary-hover:rgba(0,0,0,.16);
-  --shadow:0 1px 3px rgba(0,0,0,.06);
-
-  /* 字体 */
-  --font-sans:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
-  --font-mono:ui-monospace,SFMono-Regular,Consolas,monospace;
-  /* 字号 / 行高 */
-  --fs-h1:17px;--lh-h1:24px;
-  --fs-title:14px;--lh-title:20px;
-  --fs-body:14px;--lh-body:21px;
-  --fs-item:13px;--lh-item:19px;
-  --fs-meta:12px;--lh-meta:17px;
-  --fs-tiny:11px;--lh-tiny:16px;
-  /* 间距 (4px 基准) */
-  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;
-  /* 圆角 */
-  --radius-s:8px;--radius-m:10px;--radius-l:12px;
-  /* 控件尺寸 */
-  --btn-h:32px;--btn-h-sm:26px;--ctl-h:28px;
-  --ic:16px;--ic-sm:14px;
+  --bg-ground:#f5f5f3;--bg-card:#ffffff;--bg-input:#fafaf8;--bg-raised:#eeeeea;
+  --fill-1:rgba(0,0,0,.045);--fill-2:rgba(0,0,0,.09);
+  --sep-1:rgba(0,0,0,.1);--sep-2:rgba(0,0,0,.05);
+  --text-1:rgba(0,0,0,.86);--text-2:rgba(0,0,0,.56);--text-3:rgba(0,0,0,.4);
+  --accent:#2f6df0;--accent-soft:rgba(47,109,240,.1);
+  --ok:#149a4b;--warn:#c9760a;--danger:#d93038;--danger-soft:rgba(217,48,56,.1);
+  --inverse:#ffffff;--primary-hover:rgba(0,0,0,.16);
+  --shadow:0 1px 3px rgba(0,0,0,.06);--backdrop:rgba(0,0,0,.35);
 }
 
-/* ===== 基础 ===== */
+/* ===== 基础与布局 ===== */
 body{margin:0;background:var(--bg-ground);color:var(--text-1);font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body)}
 button,input,select,textarea{font:inherit}
+[hidden]{display:none!important}
 .shell{max-width:1320px;margin:0 auto;padding:0 var(--sp-5) var(--sp-5)}
-.topbar{display:grid;grid-template-columns:minmax(180px,220px) minmax(0,1fr) auto;align-items:stretch;position:sticky;top:0;z-index:5;background:var(--bg-ground);border-bottom:1px solid var(--sep-2);padding:var(--sp-3) 0 var(--sp-4);margin:0 0 var(--sp-5)}
-.brand{display:flex;align-items:center;padding:0 var(--sp-4);min-width:0}
-.brand h1{font-size:var(--fs-title);line-height:1;margin:0;font-weight:700;letter-spacing:.2px}
-.brand h1 span{font-weight:500;color:var(--text-2)}
-.status-chips{display:flex;flex-wrap:nowrap;align-items:center;gap:var(--sp-3);padding:0 var(--sp-4);border-left:1px solid var(--sep-2);min-width:0;overflow:hidden}
-.chip{display:inline-flex;align-items:center;gap:var(--sp-1);font-size:var(--fs-body);line-height:1;color:var(--text-2);white-space:nowrap;min-width:0;flex:0 1 auto}
-.chip .dot{width:6px;height:6px;border-radius:50%;background:var(--text-3);flex:none}
-.chip em{font-style:normal;font-weight:600;color:var(--text-1);overflow:hidden;text-overflow:ellipsis;max-width:120px;font-variant-numeric:tabular-nums}
-.chip[data-state=ok] .dot{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
-.chip[data-state=warn] .dot{background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
-.chip[data-state=err] .dot{background:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
-.chip[data-state=warn] em{color:var(--warn)}
+.topbar{display:flex;flex-wrap:wrap;align-items:center;gap:var(--sp-3) var(--sp-4);position:sticky;top:0;z-index:5;background:var(--bg-ground);border-bottom:1px solid var(--sep-2);padding:var(--sp-3) 0;margin:0 0 var(--sp-5)}
+.topbar h1{margin:0;font-size:var(--fs-title);line-height:var(--lh-title);font-weight:700;white-space:nowrap}
+.topbar h1 span{font-weight:500;color:var(--text-2)}
+.chip{display:inline-flex;align-items:center;gap:var(--sp-2);min-width:0;max-width:100%;font-size:var(--fs-meta);line-height:1;color:var(--text-2);background:var(--fill-1);border:1px solid var(--sep-2);border-radius:999px;padding:6px var(--sp-3)}
+.chip .dot{width:7px;height:7px;border-radius:50%;background:var(--text-3);flex:none}
+.chip em{font-style:normal;font-weight:600;color:var(--text-1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.chip[data-state=ok] .dot{background:var(--ok)}
+.chip[data-state=warn] .dot{background:var(--warn)}
+.chip[data-state=err] .dot{background:var(--danger)}
 .chip[data-state=err] em{color:var(--danger)}
-.top-actions{display:flex;flex-wrap:nowrap;align-items:center;gap:var(--sp-2);padding:0 var(--sp-4);border-left:1px solid var(--sep-2);white-space:nowrap}
-.top-actions .last-refresh{font-size:var(--fs-meta);color:var(--text-2);white-space:nowrap}
-.top-actions .sep{width:1px;height:20px;background:var(--sep-2)}
-.top-actions .btn{height:var(--ctl-h);border-color:transparent}
-.top-actions .access-token{height:var(--ctl-h);width:148px;flex:0 1 148px}
-.top-actions .theme-toggle{width:var(--ctl-h)}
-.top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:var(--sp-4);position:sticky;top:0;z-index:5;background:var(--bg-ground);border-bottom:1px solid var(--sep-2);padding:var(--sp-3) 0 var(--sp-4);margin:0 0 var(--sp-5)}
-.title{font-size:var(--fs-title);line-height:var(--lh-title);margin:0;font-weight:700;letter-spacing:.2px}
-.hint{margin:var(--sp-1) 0 0;color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta)}
-.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-5)}
-.panel{min-width:0}
+.top-actions{display:flex;align-items:center;gap:var(--sp-2);margin-left:auto;min-width:0}
+.top-actions .access-token{height:var(--ctl-h);width:168px}
+.top-actions .btn{height:var(--ctl-h)}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-4)}
+.panel{min-width:0;background:var(--bg-card);border:1px solid var(--sep-2);border-radius:var(--radius-l);padding:0 var(--sp-3) var(--sp-3);box-shadow:var(--shadow)}
 .wide{grid-column:1/-1}
-.head{position:relative;height:40px;display:flex;align-items:center;justify-content:space-between;padding:0 var(--sp-1);gap:var(--sp-2)}
-.head::after{content:"";position:absolute;left:0;right:0;bottom:0;height:1px;background:var(--sep-2)}
-.head h2{margin:0;font-size:var(--fs-title);line-height:var(--lh-title);font-weight:600}
+.task-area{display:grid;grid-template-columns:minmax(0,2fr) minmax(260px,1fr);gap:var(--sp-4)}
+.head{height:44px;display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2);padding:0 var(--sp-1);border-bottom:1px solid var(--sep-2)}
+.head h2{margin:0;font-size:var(--fs-title);line-height:var(--lh-title);font-weight:600;white-space:nowrap}
 .head small{color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
-.body{padding:var(--sp-4) var(--sp-1) 0;min-width:0}
+.body{padding:var(--sp-3) var(--sp-1) 0;min-width:0}
 .body>*+*{margin-top:var(--sp-3)}
 .row{display:flex;gap:var(--sp-2);align-items:center;min-width:0}
-.row+.row{margin-top:var(--sp-3)}
 .row>*{min-width:0}
 .row>input,.row>select{flex:1 1 auto}
-.row>.btn{flex:0 0 auto}
-.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2);min-width:0}
-.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--sp-2);min-width:0}
+.row>.btn,.row>.checkbox{flex:0 0 auto}
+.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2)}
 .stretch{width:100%}
+.hint{margin:0;color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);overflow-wrap:anywhere}
+.hint.err{color:var(--danger)}
 
 /* ===== 表单控件 ===== */
-input,select{width:100%;height:var(--btn-h);min-width:0;border:1px solid var(--sep-1);background:var(--bg-input);color:var(--text-1);border-radius:var(--radius-s);padding:0 var(--sp-2);outline:none;transition:border-color .2s ease,box-shadow .2s ease,background-color .2s ease}
+input,select{width:100%;height:var(--btn-h);min-width:0;border:1px solid var(--sep-1);background:var(--bg-input);color:var(--text-1);border-radius:var(--radius-s);padding:0 var(--sp-2);outline:none}
 input::placeholder{color:var(--text-3)}
-input:hover,select:hover{border-color:var(--text-3)}
 input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+input:disabled,select:disabled{opacity:.55;cursor:not-allowed}
 select{appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238d8d8d' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right var(--sp-2) center;padding-right:30px;cursor:pointer}
-
-/* ===== 按钮 ===== */
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--sp-1);height:var(--btn-h);min-width:0;padding:0 var(--sp-3);border:1px solid var(--sep-1);background:transparent;color:var(--text-1);border-radius:var(--radius-m);font-size:var(--fs-body);line-height:1;cursor:pointer;position:relative;overflow:hidden;transition:color .25s ease,border-color .25s ease,transform .12s ease}
-.btn::before{content:"";position:absolute;inset:0;background:var(--fill-1);opacity:0;transition:opacity .25s ease;pointer-events:none}
-.btn:hover::before{opacity:1}
-.btn:active::before{opacity:1;background:var(--fill-2)}
-.btn:active{transform:translateY(1px)}
-.btn:disabled{opacity:.45;cursor:not-allowed}
-.btn:disabled::before{display:none}
-.btn:focus-visible,a.btn:focus-visible,.task:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-a.btn{text-decoration:none}
-.primary{background:var(--text-1);color:var(--inverse);border-color:transparent;font-weight:600}
-.primary::before{background:var(--primary-hover)}
-.warn{background:var(--danger-soft);border-color:transparent;color:var(--danger)}
-.warn::before{background:var(--danger-soft)}
-.ghost{border-color:transparent;color:var(--text-2)}
-.btn svg{width:var(--ic);height:var(--ic);flex:none}
-
-/* ===== 输出与任务 ===== */
-.output{margin:0;min-height:280px;max-height:560px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--bg-input);color:var(--text-1);padding:var(--sp-3);font-family:var(--font-mono);font-size:var(--fs-meta);line-height:1.5;border:1px solid var(--sep-2);border-radius:var(--radius-m)}
-.task-list{display:flex;flex-direction:column;gap:var(--sp-1);max-height:180px;overflow:auto}
-.task{width:100%;background:var(--bg-input);border:1px solid var(--sep-2);color:var(--text-1);border-radius:var(--radius-s);padding:var(--sp-1) var(--sp-2);font-size:var(--fs-meta);line-height:var(--lh-meta);text-align:left;cursor:pointer;transition:background-color .2s ease}
-.task:hover{background:var(--bg-raised)}
-.state{color:var(--text-3);margin-right:var(--sp-1);font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
-.state.ok{color:var(--ok)}
-.state.err{color:var(--danger)}
-.checkbox{display:inline-flex;align-items:center;gap:var(--sp-2);color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);cursor:pointer;user-select:none}
-input[type=checkbox]{-webkit-appearance:none;appearance:none;width:34px;height:20px;box-sizing:border-box;flex:none;border:1px solid var(--sep-1);border-radius:999px;background:var(--fill-2);cursor:pointer;position:relative;transition:border-color .2s ease,background-color .2s ease,box-shadow .2s ease}
-input[type=checkbox]::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--text-2);box-shadow:var(--shadow);transition:transform .2s ease,background-color .2s ease}
-input[type=checkbox]:hover{border-color:var(--text-2)}
+.checkbox{display:inline-flex;align-items:center;gap:var(--sp-2);color:var(--text-2);font-size:var(--fs-meta);line-height:var(--lh-meta);cursor:pointer;user-select:none;white-space:nowrap}
+input[type=checkbox]{-webkit-appearance:none;appearance:none;width:34px;height:20px;flex:none;padding:0;border:1px solid var(--sep-1);border-radius:999px;background:var(--fill-2);cursor:pointer;position:relative}
+input[type=checkbox]::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--text-2);transition:transform .2s ease}
 input[type=checkbox]:checked{background:var(--accent);border-color:var(--accent)}
 input[type=checkbox]:checked::after{background:var(--inverse);transform:translateX(14px)}
-input[type=checkbox]:focus-visible{box-shadow:0 0 0 3px var(--accent-soft)}
-input[type=checkbox]:disabled{opacity:.45;cursor:not-allowed}
 
-.readonly-status{color:var(--text-2);white-space:pre-wrap;overflow-wrap:anywhere}
-.readonly-errors{min-height:0;max-height:160px;color:var(--danger)}
-.readonly-cards{display:grid;gap:var(--sp-3)}
-.readonly-card{border:1px solid var(--sep-1);border-radius:var(--radius-m);background:var(--bg-card);padding:var(--sp-3);min-width:0}
-.readonly-card>*+*{margin-top:var(--sp-2)}
-.readonly-card h3{margin:0;font-size:var(--fs-title);overflow-wrap:anywhere}
-.readonly-card .output{min-height:0;max-height:320px}
-.readonly-card img{display:block;max-width:100%;height:auto}
-.readonly-meta{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-2);font-size:var(--fs-meta)}
-
-/* ===== 主题切换 ===== */
+/* ===== 按钮 ===== */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--sp-1);height:var(--btn-h);min-width:0;padding:0 var(--sp-3);border:1px solid var(--sep-1);background:transparent;color:var(--text-1);border-radius:var(--radius-m);font-size:var(--fs-body);line-height:1;white-space:nowrap;cursor:pointer;text-decoration:none}
+.btn:hover{background:var(--fill-1)}
+.btn:active{background:var(--fill-2)}
+.btn:disabled{opacity:.45;cursor:not-allowed;background:transparent}
+.btn:focus-visible,.task:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.btn.small{height:var(--ctl-h);padding:0 var(--sp-2);font-size:var(--fs-meta)}
+.primary{background:var(--text-1);color:var(--inverse);border-color:transparent;font-weight:600}
+.primary:hover{background:var(--text-1);box-shadow:inset 0 0 0 99px var(--primary-hover)}
+.primary:disabled{background:var(--text-1)}
+.warn{background:var(--danger-soft);border-color:transparent;color:var(--danger)}
+.warn:hover,.warn:disabled{background:var(--danger-soft)}
 .theme-toggle{width:var(--ctl-h);padding:0;color:var(--text-2);flex:none}
 .theme-toggle svg{width:var(--ic);height:var(--ic)}
-.theme-toggle .sun{display:none}
+.theme-toggle .sun,html[data-theme=light] .theme-toggle .moon{display:none}
 html[data-theme=light] .theme-toggle .sun{display:block}
-html[data-theme=light] .theme-toggle .moon{display:none}
 
-@media(max-width:1200px){.status-chips{gap:var(--sp-2)}.chip{font-size:var(--fs-meta)}.chip em{max-width:96px}}
-@media(max-width:1050px){.topbar{grid-template-columns:1fr;padding:var(--sp-3) var(--sp-1) var(--sp-4)}.brand{padding:var(--sp-2) var(--sp-4);border-bottom:1px solid var(--sep-2)}.status-chips,.top-actions{flex-wrap:wrap;padding:var(--sp-3) var(--sp-4);border-left:none;border-top:1px solid var(--sep-2)}.top-actions{justify-content:flex-start}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:720px){body{overflow-x:hidden}.shell{padding:0 var(--sp-3) var(--sp-4)}.topbar{padding:var(--sp-3) var(--sp-1) var(--sp-4);margin-bottom:var(--sp-4)}.top-actions{gap:var(--sp-1)}.top-actions .access-token{width:160px;flex:1 1 160px}.grid{grid-template-columns:1fr;gap:var(--sp-4)}.wide{grid-column:auto}.row{flex-wrap:wrap}.row>.btn{flex:1 1 auto}.three{grid-template-columns:1fr}.two{grid-template-columns:1fr}}
+/* ===== 输出与任务 ===== */
+.output{margin:0;min-height:240px;max-height:520px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--bg-input);color:var(--text-1);padding:var(--sp-3);font-family:var(--font-mono);font-size:var(--fs-meta);line-height:1.5;border:1px solid var(--sep-2);border-radius:var(--radius-m)}
+.task-list{display:flex;flex-direction:column;gap:var(--sp-1);max-height:260px;overflow:auto;color:var(--text-2);font-size:var(--fs-meta)}
+.task{width:100%;display:flex;gap:var(--sp-2);align-items:baseline;background:var(--bg-input);border:1px solid var(--sep-2);color:var(--text-1);border-radius:var(--radius-s);padding:var(--sp-1) var(--sp-2);font-size:var(--fs-meta);line-height:var(--lh-meta);text-align:left;cursor:pointer}
+.task:hover{background:var(--bg-raised)}
+.task.active{border-color:var(--accent)}
+.task .label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.state{flex:none;color:var(--text-3);font-size:var(--fs-tiny);line-height:var(--lh-tiny)}
+.state.ok{color:var(--ok)}
+.state.err{color:var(--danger)}
+
+/* ===== 只读观测 ===== */
+.readonly-status{color:var(--text-2);font-size:var(--fs-meta);white-space:pre-wrap;overflow-wrap:anywhere}
+.readonly-errors{min-height:0;max-height:160px;color:var(--danger)}
+.readonly-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:var(--sp-3)}
+.readonly-card{border:1px solid var(--sep-1);border-radius:var(--radius-m);background:var(--bg-input);padding:var(--sp-3);min-width:0}
+.readonly-card>*+*{margin-top:var(--sp-2)}
+.readonly-card h3{margin:0;font-size:var(--fs-title);overflow-wrap:anywhere}
+.readonly-card .output{min-height:0;max-height:320px;background:var(--bg-card)}
+.readonly-card img{display:block;max-width:100%;height:auto}
+.readonly-card summary{cursor:pointer;color:var(--text-2);font-size:var(--fs-meta)}
+.readonly-meta{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-2);font-size:var(--fs-meta)}
+
+/* ===== 截图对话框 ===== */
+dialog{max-width:min(1200px,calc(100vw - 32px));max-height:calc(100vh - 32px);padding:0;border:1px solid var(--sep-1);border-radius:var(--radius-l);background:var(--bg-card);color:var(--text-1);box-shadow:0 12px 40px rgba(0,0,0,.4)}
+dialog::backdrop{background:var(--backdrop)}
+.dialog-head{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2);padding:var(--sp-2) var(--sp-3);border-bottom:1px solid var(--sep-2)}
+.dialog-head strong{font-size:var(--fs-title)}
+.dialog-body{overflow:auto;max-height:calc(100vh - 96px);background:#000}
+.dialog-body img{display:block;max-width:100%;height:auto;margin:0 auto}
+
+@media(max-width:1050px){.task-area{grid-template-columns:1fr}.top-actions{margin-left:0;width:100%}.top-actions .access-token{flex:1 1 auto;width:auto}}
+@media(max-width:720px){.shell{padding:0 var(--sp-3) var(--sp-4)}.grid{grid-template-columns:1fr;gap:var(--sp-3)}.wide{grid-column:auto}.row{flex-wrap:wrap}.row>.btn{flex:1 1 auto}.readonly-cards{grid-template-columns:1fr}.top-actions{flex-wrap:wrap}}
 </style>
 </head>
 <body>
 <div class="shell">
   <header class="topbar">
-    <div class="brand"><h1>Miliastra <span>高级控制</span></h1></div>
-    <div class="status-chips">
-      <span class="chip"><i class="dot"></i><span>状态</span><em id="state" aria-live="polite">等待任务</em></span>
-      <span class="chip"><i class="dot"></i><span>任务</span><em id="taskId" aria-live="polite">未开始</em></span>
-      <span class="chip"><i class="dot"></i><span>工具</span><em>OCR / 模板 / 输入</em></span>
+    <h1>Miliastra <span>高级控制</span></h1>
+    <span class="chip" id="stateChip"><i class="dot"></i><span>状态</span><em id="state" aria-live="polite">等待任务</em></span>
+    <div class="top-actions">
+      <button class="btn theme-toggle" type="button" onclick="toggleTheme()" title="切换日间 / 夜间模式" aria-label="切换日间 / 夜间模式"><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg></button>
+      <input class="access-token" id="accessToken" type="password" placeholder="访问令牌" aria-label="访问令牌" autocomplete="off">
+      <button class="btn" type="button" onclick="applyAccessToken()">应用令牌</button>
+      <a class="btn" href="/">监控面板</a>
     </div>
-    <div class="top-actions"><button class="btn theme-toggle" onclick="toggleTheme()" title="切换日间 / 夜间模式"><svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg><svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg></button><input class="access-token" id="accessToken" type="password" placeholder="访问令牌（自动记住）" oninput="storeAccessToken()" onchange="applyAccessToken()"><a class="btn" href="/">监控面板</a><button class="btn" onclick="loadTools()">刷新任务</button></div>
   </header>
   <main class="grid">
     <section class="panel">
       <div class="head"><h2>画面与识别</h2></div>
       <div class="body">
-        <div class="two"><button class="btn primary" onclick="run('/tools/ocr')">全屏 OCR</button><button class="btn" onclick="run('/tools/scan-chat')">扫描聊天</button></div>
-        <div class="row"><input id="ocrRect" placeholder="OCR 区域 x,y,width,height"><button class="btn" onclick="run('/tools/ocr',{rect:val('ocrRect')})">区域 OCR</button></div>
-        <div class="two"><button class="btn" onclick="run('/tools/ui-state')">检测 UI</button><button class="btn" onclick="run('/tools/hall-name')">大厅名称</button></div>
-        <div class="row"><button class="btn stretch" onclick="openScreenshot()">获取截图</button></div>
+        <div class="two"><button class="btn primary" data-tool onclick="run('/tools/ocr')">全屏 OCR</button><button class="btn" data-tool onclick="run('/tools/scan-chat')">扫描聊天</button></div>
+        <div class="row"><input id="ocrRect" placeholder="OCR 区域 x,y,width,height"><button class="btn" data-tool onclick="run('/tools/ocr',{rect:val('ocrRect')})">区域 OCR</button></div>
+        <div class="two"><button class="btn" data-tool onclick="run('/tools/ui-state')">检测 UI</button><button class="btn" data-tool onclick="run('/tools/hall-name')">大厅名称</button></div>
+        <button class="btn stretch" id="screenshotButton" type="button" onclick="openScreenshot()">获取截图</button>
       </div>
     </section>
     <section class="panel">
-      <div class="head"><h2>模板</h2></div>
+      <div class="head"><h2>模板匹配</h2></div>
       <div class="body">
-        <div class="row"><select id="template"><option value="blue-marker">蓝色聊天标志</option><option value="yellow-marker">黄色聊天标志</option><option value="pink-marker">粉色聊天标志</option><option value="friend">好友按钮</option><option value="secondary-back">二级聊天返回按钮</option><option value="secondary-hall">二级当前大厅</option></select></div>
-        <div class="row"><input id="templateRect" placeholder="匹配区域 x,y,width,height，留空全屏"><button class="btn" onclick="useConfiguredTemplateRegion()">读取配置区域</button></div>
-        <div class="row"><input id="threshold" placeholder="阈值，留空使用配置" inputmode="decimal"></div>
-        <div class="two"><button class="btn" onclick="matchTemplate(false)">匹配</button><button class="btn warn" onclick="matchTemplate(true)">匹配并点击</button></div>
+        <select id="template" aria-label="模板"><option value="">正在读取模板…</option></select>
+        <div class="row"><input id="templateRect" placeholder="匹配区域 x,y,width,height，留空全屏"><button class="btn" type="button" onclick="useConfiguredTemplateRegion()">读取配置区域</button></div>
+        <input id="threshold" placeholder="阈值，留空使用配置" inputmode="decimal" aria-label="阈值">
+        <div class="two"><button class="btn" data-tool onclick="matchTemplate(false)">匹配</button><button class="btn warn" data-tool onclick="matchTemplate(true)">匹配并点击</button></div>
       </div>
     </section>
     <section class="panel">
-      <div class="head"><h2>手动输入</h2></div>
+      <div class="head"><h2>手动输入</h2><small>会向游戏发送真实输入</small></div>
       <div class="body">
-        <div class="row"><input id="x" placeholder="x" inputmode="numeric"><input id="y" placeholder="y" inputmode="numeric"><button class="btn warn" onclick="clickPoint()">点击</button></div>
-        <div class="row"><input id="key" placeholder="按键，如 Escape / Return / F2"><button class="btn warn" onclick="sendKey()">发送</button></div>
+        <div class="row"><input id="x" placeholder="x" inputmode="numeric" aria-label="x 坐标"><input id="y" placeholder="y" inputmode="numeric" aria-label="y 坐标"><button class="btn warn" data-tool onclick="clickPoint()">点击</button></div>
+        <div class="row"><input id="key" placeholder="按键，如 Escape / Return / F2" aria-label="按键"><button class="btn warn" data-tool onclick="sendKey()">发送按键</button></div>
       </div>
     </section>
     <section class="panel">
       <div class="head"><h2>诊断</h2></div>
       <div class="body">
-        <button class="btn stretch" onclick="run('/tools/ocr-backends')">OCR 后端探测</button>
-        <div class="row"><input id="captureRounds" value="3" inputmode="numeric" placeholder="截图 API 轮数"><button class="btn warn" onclick="captureBenchmark()">截图性能</button></div>
-        <div class="row"><input id="changeSamples" value="10" inputmode="numeric" placeholder="变化采样次数"><button class="btn" onclick="sampleChatChanges()">聊天变化</button></div>
-        <div class="row"><input id="benchmarkRounds" value="3" inputmode="numeric" placeholder="面板基准轮数"><button class="btn warn" onclick="panelBenchmark()">面板基准</button></div>
-        <div class="row"><input id="aiKeyword" placeholder="AI 候选诊断关键词"><button class="btn" onclick="aiPreview()">诊断</button></div>
-        <label class="checkbox"><input id="aiAccompaniment" type="checkbox">优先伴奏</label>
+        <button class="btn stretch" data-tool onclick="run('/tools/ocr-backends')">OCR 后端探测</button>
+        <div class="row"><input id="captureRounds" value="3" inputmode="numeric" placeholder="截图 API 轮数" aria-label="截图 API 轮数"><button class="btn" data-tool onclick="captureBenchmark()">截图性能</button></div>
+        <div class="row"><input id="changeSamples" value="10" inputmode="numeric" placeholder="变化采样次数" aria-label="变化采样次数"><button class="btn" data-tool onclick="sampleChatChanges()">聊天变化</button></div>
+        <div class="row"><input id="benchmarkRounds" value="3" inputmode="numeric" placeholder="面板基准轮数" aria-label="面板基准轮数"><button class="btn" data-tool onclick="panelBenchmark()">面板基准</button></div>
+        <div class="row"><input id="aiKeyword" placeholder="AI 候选诊断关键词" aria-label="AI 候选诊断关键词"><label class="checkbox"><input id="aiAccompaniment" type="checkbox">优先伴奏</label><button class="btn" data-tool onclick="aiPreview()">AI 诊断</button></div>
       </div>
     </section>
+    <div class="wide task-area">
+      <section class="panel">
+        <div class="head"><h2>任务结果</h2><span class="row"><small id="taskId">未开始</small><button class="btn small" id="stopTrack" type="button" hidden onclick="stopTracking()">停止跟踪</button></span></div>
+        <div class="body"><pre class="output" id="result" aria-live="polite">等待任务</pre></div>
+      </section>
+      <section class="panel">
+        <div class="head"><h2>最近任务</h2><button class="btn small" type="button" onclick="loadTools()">刷新</button></div>
+        <div class="body"><div class="task-list" id="tasks">暂无任务</div></div>
+      </section>
+    </div>
     <section class="panel wide" id="readOnlyPanel" data-read-only>
-      <div class="head"><h2>用户沙盒 · 游戏状态观测</h2><small>主动读取 / 触发推送</small></div>
+      <div class="head"><h2>游戏状态只读观测</h2><small>不点击、不输入、不派发命令</small></div>
       <div class="body">
         <div class="row">
           <label class="checkbox"><input id="readOnlyEnabled" type="checkbox" disabled onchange="setReadOnlyMode()">启用只读观测</label>
-          <select id="readOnlyState" aria-label="只读状态" disabled onchange="setReadOnlyMode()"><option value="active">主动读取</option><option value="push">推送</option></select>
-          <button class="btn" id="readOnlyRefresh" onclick="loadReadOnlyMode()">刷新状态</button>
+          <select id="readOnlyState" aria-label="只读模式" disabled onchange="setReadOnlyMode()" style="max-width:180px"><option value="active">主动读取</option><option value="push">推送</option></select>
+          <button class="btn" id="readOnlyRefresh" type="button" onclick="loadReadOnlyMode()">刷新状态</button>
         </div>
-        <p class="hint">程序继续正常监听、点歌和播放。主动读取仅在点击时观察一次游戏状态；推送仅记录正常运行中触发的命令或流程。观测本身不点击、不输入、不派发命令。</p>
-        <div class="row"><input id="readOnlyLabel" aria-label="证据标签" maxlength="120" placeholder="证据标签（可选）"><button class="btn primary" id="readOnlyRead" disabled onclick="readOnlyReadOnce()">读取一次</button></div>
+        <p class="hint">程序继续正常监听、点歌和播放。主动读取只在点击时观察一次；推送只记录正常运行中触发的命令或流程。</p>
+        <div class="row"><input id="readOnlyLabel" aria-label="证据标签" maxlength="120" placeholder="证据标签（可选）"><button class="btn primary" id="readOnlyRead" type="button" disabled onclick="readOnlyReadOnce()">读取一次</button></div>
         <div class="readonly-status" id="readOnlyStatus" role="status">正在读取只读状态…</div>
         <div class="readonly-status" id="readOnlyGap" role="status" hidden></div>
-        <pre class="output readonly-errors" id="readOnlyErrors" role="log" aria-label="保留的只读错误" hidden></pre>
+        <div class="row" id="readOnlyErrorBox" hidden><pre class="output readonly-errors" id="readOnlyErrors" role="log" aria-label="只读错误记录" style="flex:1 1 auto"></pre><button class="btn small" type="button" onclick="readOnlyClearErrors()">清空</button></div>
         <div class="readonly-cards" id="readOnlyCards" aria-live="polite"></div>
       </div>
     </section>
-    <section class="panel wide">
-      <div class="head"><h2>任务结果</h2><small>最新输出</small></div>
-      <pre class="output" id="result">等待任务</pre>
-    </section>
-    <section class="panel">
-      <div class="head"><h2>最近任务</h2></div>
-      <div class="body"><div class="task-list" id="tasks">暂无任务</div></div>
-    </section>
   </main>
 </div>
+<dialog id="screenshotDialog" aria-labelledby="screenshotTitle">
+  <div class="dialog-head"><strong id="screenshotTitle">截图</strong><span class="row"><a class="btn small" id="screenshotDownload" download="screenshot.jpg">下载</a><button class="btn small" type="button" onclick="closeScreenshot()">关闭</button></span></div>
+  <div class="dialog-body"><img id="screenshotImage" alt="游戏截图"></div>
+</dialog>
 <script>
 const $=id=>document.getElementById(id)
 const val=id=>$(id).value.trim()
 const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
-let activeId=0
-let busy=false
-let taskPollGeneration=0
-let toolsLoadGeneration=0
-let templatesLoadGeneration=0
-let templateItems=[]
+const REQUEST_TIMEOUT_MS=30000
+const POLL_INTERVAL_MS=500,POLL_MAX_INTERVAL_MS=5000,POLL_MAX_FAILURES=5
 const taskStatusLabel={queued:'等待业务空闲',running:'执行中',completed:'已完成',failed:'失败'}
+// 后端未返回模板列表时使用的内置模板（与旧版页面一致）。
+const FALLBACK_TEMPLATES=[['blue-marker','蓝色聊天标志'],['yellow-marker','黄色聊天标志'],['pink-marker','粉色聊天标志'],['friend','好友按钮'],['secondary-back','二级聊天返回按钮'],['secondary-hall','二级当前大厅']]
+let activeId=0,tracking=false,taskPollGeneration=0,toolsLoadGeneration=0,templatesLoadGeneration=0
+let templateItems=[],screenshotBusy=false,screenshotUrl=null
+
+// ===== 令牌 =====
 function readTokenCookie(){const match=document.cookie.match(/(?:^|;\s*)miliastraAccessToken=([^;]*)/);if(!match)return '';try{return decodeURIComponent(match[1])}catch{return ''}}
 function writeTokenCookie(value){
-  if(value){document.cookie='miliastraAccessToken='+encodeURIComponent(value)+';path=/;max-age=31536000;SameSite=Strict'}
-  else{document.cookie='miliastraAccessToken=;path=/;max-age=0;SameSite=Strict'}
+  if(value)document.cookie='miliastraAccessToken='+encodeURIComponent(value)+';path=/;max-age=31536000;SameSite=Strict'
+  else document.cookie='miliastraAccessToken=;path=/;max-age=0;SameSite=Strict'
 }
 function accessToken(){
   const fromCookie=readTokenCookie();if(fromCookie)return fromCookie
-  const legacy=sessionStorage.getItem('miliastraAccessToken')||''
-  if(legacy){writeTokenCookie(legacy);sessionStorage.removeItem('miliastraAccessToken')}
+  let legacy='';try{legacy=sessionStorage.getItem('miliastraAccessToken')||'';if(legacy)sessionStorage.removeItem('miliastraAccessToken')}catch{}
+  if(legacy)writeTokenCookie(legacy)
   return legacy
 }
-function storeAccessToken(){const token=$('accessToken').value.trim();if(token!==readTokenCookie()){writeTokenCookie(token);readOnlyGeneration++;readOnlyCloseEvents();readOnlyLoaded=false;readOnlyModeBusy=false;$('readOnlyStatus').textContent='令牌已更改，应用后重新读取只读状态。';readOnlyControls()}else writeTokenCookie(token)}
-function applyAccessToken(){storeAccessToken();loadTemplates();loadTools();loadReadOnlyMode()}
-function requestHeaders(){const token=accessToken();return token?{'X-Miliastra-Token':token}:{}}
-async function request(url,method='GET'){
-  const r=await fetch(url,{method,cache:'no-store',headers:requestHeaders()})
-  const text=await r.text()
-  if(!r.ok){
-    let detail=''
-    try{const value=JSON.parse(text);if(value&&typeof value==='object')detail=value.message||value.error||''}catch{}
-    if(!detail&&text.trim()&&!/^<!doctype html/i.test(text.trim())&&!/^<html[\s>]/i.test(text.trim()))detail=text.trim()
-    throw new Error(detail||('HTTP '+r.status))
-  }
-  const trimmed=text.trim()
-  if(trimmed.startsWith('<'))return 'HTTP '+r.status
-  try{
-    const value=JSON.parse(text)
-    if(value&&typeof value==='object'&&value.ok===false)throw new Error(value.message||value.error||value.code||('HTTP '+r.status))
-    return value
-  }catch(error){
-    if(error instanceof Error&&error.message&&error.message!=='Unexpected end of JSON input'&&!/Unexpected token/.test(error.message))throw error
-    return text
-  }
+// 输入框只是草稿；按「应用令牌」或回车后才写入 Cookie 并重新读取。
+function applyAccessToken(){
+  writeTokenCookie(val('accessToken'))
+  readOnlyGeneration++;readOnlyCloseEvents();readOnlyModeBusy=false
+  loadTemplates();loadTools();loadReadOnlyMode()
+  setHeaderState('令牌已应用','neutral')
 }
+function requestHeaders(extra){const token=accessToken();return {...(token?{'X-Miliastra-Token':token}:{}),...(extra||{})}}
+
+// ===== 请求：超时覆盖响应头和正文读取 =====
+async function fetchWithTimeout(url,options={},timeoutMs=REQUEST_TIMEOUT_MS,read=r=>r.text()){
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs)
+  try{
+    const response=await fetch(url,{cache:'no-store',credentials:'same-origin',...options,signal:controller.signal})
+    return {response,body:await read(response)}
+  }catch(error){
+    if(error&&error.name==='AbortError')throw new Error('请求超时（'+Math.round(timeoutMs/1000)+' 秒）')
+    throw new Error('网络错误：'+(error&&error.message||error))
+  }finally{clearTimeout(timer)}
+}
+function errorDetail(text,status){
+  let detail=''
+  try{const value=JSON.parse(text);if(value&&typeof value==='object')detail=value.message||value.error||value.code||''}catch{}
+  const trimmed=String(text||'').trim()
+  if(!detail&&trimmed&&!/^<(!doctype|html)[\s>]/i.test(trimmed))detail=trimmed
+  if(status===401)return '访问令牌无效或缺失，请在右上角填写后点「应用令牌」'
+  return detail||('HTTP '+status)
+}
+async function request(url,method='GET'){
+  const {response:r,body:text}=await fetchWithTimeout(url,{method,headers:requestHeaders()})
+  if(!r.ok)throw new Error(errorDetail(text,r.status))
+  const trimmed=text.trim()
+  if(!trimmed||trimmed.startsWith('<'))return 'HTTP '+r.status
+  let value
+  try{value=JSON.parse(trimmed)}catch{return text}
+  if(value&&typeof value==='object'&&value.ok===false)throw new Error(value.message||value.error||value.code||('HTTP '+r.status))
+  return value
+}
+// 统一错误前缀：去掉后端消息里已带的「错误：」，只保留一层。
+function errorText(context,error){
+  const message=String(error&&error.message||error||'未知错误').replace(/^\s*错误\s*[:：]\s*/,'')
+  return (context||'错误')+'：'+message
+}
+
+// ===== 结果与状态 =====
 function setResult(text){$('result').textContent=typeof text==='string'?text:JSON.stringify(text,null,2)}
-function setHeaderState(text,state){const el=$('state');el.textContent=text;const chip=el.closest('.chip');if(chip)chip.dataset.state=state}
-function setBusy(value){busy=value;document.querySelectorAll('button').forEach(button=>{if(!button.closest('[data-read-only]'))button.disabled=value})}
+function setHeaderState(text,state){$('state').textContent=text;$('stateChip').dataset.state=state||'neutral'}
+function setTracking(value){
+  tracking=value
+  document.querySelectorAll('[data-tool]').forEach(button=>{button.disabled=value})
+  $('stopTrack').hidden=!value
+}
+function setTaskLabel(id){$('taskId').textContent=id?'任务 #'+id:'未开始';document.querySelectorAll('.task').forEach(el=>el.classList.toggle('active',Number(el.dataset.id)===id))}
 function params(values){const p=new URLSearchParams();for(const [k,v] of Object.entries(values||{})){if(v!==undefined&&v!==null&&String(v)!=='')p.set(k,v)}const s=p.toString();return s?'?'+s:''}
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms))
+function waitVisible(){return document.visibilityState==='visible'?Promise.resolve():new Promise(resolve=>{const on=()=>{if(document.visibilityState==='visible'){document.removeEventListener('visibilitychange',on);resolve()}};document.addEventListener('visibilitychange',on)})}
+
+// ===== 工具任务：提交与跟踪 =====
+// 一次只跟踪一个任务；可手动停止，连续读取失败按退避重试后停止，页面隐藏时暂停。
 async function run(path,values){
-  if(busy)return
+  if(tracking)return
   const generation=++taskPollGeneration
-  setBusy(true);setResult('任务已提交...')
+  setTracking(true);setResult('任务已提交…');setHeaderState('提交中','neutral')
+  let taskId=0
   try{
     const task=await request(path+params(values),'POST')
-    if(generation!==taskPollGeneration)return
-    const taskId=Number(task&&task.id)
+    taskId=Number(task&&task.id)
     if(!Number.isSafeInteger(taskId)||taskId<1)throw new Error('任务响应无效')
-    activeId=taskId;$('taskId').textContent='任务 #'+taskId;await pollTask(generation)
-  }catch(error){if(generation===taskPollGeneration){setResult('错误: '+error.message);setBusy(false)}}
-  if(generation===taskPollGeneration)await loadTools()
+  }catch(error){
+    if(generation===taskPollGeneration){setResult(errorText('提交失败',error));setHeaderState('提交失败','err');setTracking(false)}
+    return
+  }
+  if(generation!==taskPollGeneration){loadTools();return}
+  await trackTask(taskId,generation)
 }
-async function pollTask(generation=taskPollGeneration){
-  if(generation!==taskPollGeneration)return
+async function trackTask(id,generation){
+  activeId=id;setTaskLabel(id);setTracking(true)
+  let failures=0,delay=POLL_INTERVAL_MS
   try{
-    const task=await request('/tools/task?id='+encodeURIComponent(activeId))
-    if(generation!==taskPollGeneration)return
-     const label=taskStatusLabel[task.status]||task.status
-     setHeaderState('任务 #'+task.id+' '+label,task.status==='failed'?'err':task.status==='completed'?'ok':task.status==='running'?'ok':'neutral')
-     setResult(task.result||'等待执行...')
-     if(task.status==='queued'||task.status==='running'){setTimeout(()=>pollTask(generation),500);return}
-  }catch(error){if(generation!==taskPollGeneration)return;setResult('读取任务失败: '+error.message)}
-  if(generation!==taskPollGeneration)return
-  setBusy(false);loadTools()
+    while(generation===taskPollGeneration){
+      await waitVisible()
+      if(generation!==taskPollGeneration)return
+      let task
+      try{task=await request('/tools/task?id='+encodeURIComponent(id))}
+      catch(error){
+        if(generation!==taskPollGeneration)return
+        failures++
+        if(failures>=POLL_MAX_FAILURES){
+          setHeaderState('任务 #'+id+' 状态未知','err')
+          setResult(errorText('连续 '+failures+' 次读取任务失败，已停止跟踪；任务可能仍在执行，可在「最近任务」中重新查看',error))
+          return
+        }
+        delay=Math.min(POLL_MAX_INTERVAL_MS,delay*2)
+        setHeaderState('任务 #'+id+' 读取失败，'+Math.round(delay/1000*10)/10+' 秒后重试','warn')
+        await sleep(delay);continue
+      }
+      if(generation!==taskPollGeneration)return
+      failures=0;delay=POLL_INTERVAL_MS
+      const status=task&&task.status
+      setHeaderState('任务 #'+id+' '+(taskStatusLabel[status]||status||'未知'),status==='failed'?'err':status==='completed'?'ok':'warn')
+      setResult(task&&task.result?task.result:status==='failed'?'任务失败，未返回详情':status==='completed'?'任务完成，无输出':'等待执行…')
+      if(status!=='queued'&&status!=='running')return
+      await sleep(delay)
+    }
+  }finally{
+    if(generation===taskPollGeneration){setTracking(false);loadTools()}
+  }
 }
-function matchTemplate(click){const template=val('template');if(!template){setResult('错误: 请选择模板');return}run('/tools/template',{template,rect:val('templateRect'),threshold:val('threshold'),click:click?'1':''})}
-function clickPoint(){const x=val('x'),y=val('y');if(!x||!y){setResult('错误: 请输入 x 和 y 坐标');return}run('/tools/click',{x,y})}
-function sendKey(){const key=val('key');if(!key){setResult('错误: 请输入要发送的按键');return}run('/tools/key',{key})}
-function aiPreview(){const keyword=val('aiKeyword');if(!keyword){setResult('错误: 请输入 AI 候选诊断关键词');return}run('/tools/ai-preview',{keyword,preferAccompaniment:$('aiAccompaniment').checked?'1':''})}
+function stopTracking(){
+  if(!tracking)return
+  taskPollGeneration++;setTracking(false)
+  setHeaderState('已停止跟踪'+(activeId?' #'+activeId:''),'neutral')
+  if(activeId)setResult($('result').textContent+'\n\n（已停止跟踪；后台任务不会被取消）')
+  loadTools()
+}
+function inspectTask(id){
+  const taskId=Number(id)
+  if(!Number.isSafeInteger(taskId)||taskId<1){setResult('任务编号无效');return}
+  trackTask(taskId,++taskPollGeneration)
+}
+function requireInput(ok,message){if(!ok){setResult(message);setHeaderState('参数缺失','warn')}return ok}
+function matchTemplate(click){const template=val('template');if(!requireInput(template,'请选择模板'))return;run('/tools/template',{template,rect:val('templateRect'),threshold:val('threshold'),click:click?'1':''})}
+function clickPoint(){const x=val('x'),y=val('y');if(!requireInput(x&&y,'请输入 x 和 y 坐标'))return;run('/tools/click',{x,y})}
+function sendKey(){const key=val('key');if(!requireInput(key,'请输入要发送的按键'))return;run('/tools/key',{key})}
+function aiPreview(){const keyword=val('aiKeyword');if(!requireInput(keyword,'请输入 AI 候选诊断关键词'))return;run('/tools/ai-preview',{keyword,preferAccompaniment:$('aiAccompaniment').checked?'1':''})}
 function sampleChatChanges(){run('/tools/chat-change-samples',{samples:val('changeSamples')})}
 function panelBenchmark(){run('/tools/panel-benchmark',{rounds:val('benchmarkRounds')})}
 function captureBenchmark(){run('/tools/capture-benchmark',{rounds:val('captureRounds')})}
+
+// ===== 截图：页内对话框，不再弹新窗口 =====
 async function openScreenshot(){
-  if(busy)return
-  const preview=window.open('about:blank','_blank')
-  if(!preview){setResult('浏览器阻止了截图预览窗口');return}
-  setBusy(true);setResult('截图中...')
-  try{const r=await fetch('/screenshot?quality=88',{cache:'no-store',headers:requestHeaders()});if(!r.ok)throw new Error(await r.text()||('HTTP '+r.status));const url=URL.createObjectURL(await r.blob());preview.location.replace(url);setResult('截图已获取');setTimeout(()=>URL.revokeObjectURL(url),60000)}
-  catch(error){preview.close();setResult('错误: '+error.message)}
-  setBusy(false)
-}
-function renderTasks(items){const el=$('tasks');if(!Array.isArray(items)||!items.length){el.textContent='暂无任务';return}el.innerHTML=items.map(item=>'<button class="task" onclick="inspectTask('+Number(item.id)+')"><span class="state '+(item.status==='failed'?'err':item.status==='completed'?'ok':'')+'">'+esc(taskStatusLabel[item.status]||item.status)+'</span>#'+item.id+' '+esc(item.label)+'</button>').join('')}
-function inspectTask(id){if(busy)return;const taskId=Number(id);if(!Number.isSafeInteger(taskId)||taskId<1){setResult('错误: 任务编号无效');return}taskPollGeneration++;activeId=taskId;$('taskId').textContent='任务 #'+taskId;setBusy(true);pollTask(taskPollGeneration)}
-async function loadTemplates(){
-  const generation=++templatesLoadGeneration
+  if(screenshotBusy)return
+  screenshotBusy=true;$('screenshotButton').disabled=true;$('screenshotButton').textContent='截图中…'
   try{
-    const items=await request('/tools/templates')
-    if(generation!==templatesLoadGeneration)return templateItems
-    templateItems=Array.isArray(items)?items:[]
-    const selected=val('template')
-    $('template').innerHTML=templateItems.map(item=>'<option value="'+esc(item.name)+'">'+esc(item.label)+'</option>').join('')
-    if([...$('template').options].some(option=>option.value===selected))$('template').value=selected
-    return templateItems
-  }catch(error){if(generation===templatesLoadGeneration)setHeaderState('模板读取失败','err');return []}
+    const {response,body}=await fetchWithTimeout('/screenshot?quality=88',{headers:requestHeaders()},REQUEST_TIMEOUT_MS,r=>r.ok?r.blob():r.text())
+    if(!response.ok)throw new Error(errorDetail(body,response.status))
+    if(screenshotUrl)URL.revokeObjectURL(screenshotUrl)
+    screenshotUrl=URL.createObjectURL(body)
+    $('screenshotImage').src=screenshotUrl;$('screenshotDownload').href=screenshotUrl
+    $('screenshotTitle').textContent='截图 · '+new Date().toLocaleTimeString()
+    if(!$('screenshotDialog').open)$('screenshotDialog').showModal()
+  }catch(error){setResult(errorText('截图失败',error));setHeaderState('截图失败','err')}
+  finally{screenshotBusy=false;$('screenshotButton').disabled=false;$('screenshotButton').textContent='获取截图'}
 }
-async function useConfiguredTemplateRegion(){
-  try{
-    const items=await loadTemplates()
-    const item=items.find(item=>item.name===val('template'))
-    const region=item&&item.region
-    if(!region||!Number.isInteger(region.x)||!Number.isInteger(region.y)||!Number.isInteger(region.width)||!Number.isInteger(region.height)){throw new Error('所选模板没有配置固定匹配区域，请手动填写')}
-    $('templateRect').value=[region.x,region.y,region.width,region.height].join(',')
-    if(Number.isFinite(Number(item.threshold)))$('threshold').value=String(item.threshold)
-    setResult('已读取 '+item.label+' 的配置区域')
-  }catch(error){setResult('错误: '+error.message)}
+function closeScreenshot(){$('screenshotDialog').close()}
+$('screenshotDialog').addEventListener('click',event=>{if(event.target===$('screenshotDialog'))closeScreenshot()})
+$('screenshotDialog').addEventListener('close',()=>{$('screenshotImage').removeAttribute('src');$('screenshotDownload').removeAttribute('href');if(screenshotUrl){URL.revokeObjectURL(screenshotUrl);screenshotUrl=null}})
+
+// ===== 最近任务与模板 =====
+function renderTasks(items){
+  const el=$('tasks')
+  if(!Array.isArray(items)||!items.length){el.textContent='暂无任务';return}
+  el.innerHTML=items.map(item=>{
+    const id=Number(item.id),cls=item.status==='failed'?'err':item.status==='completed'?'ok':''
+    return '<button type="button" class="task'+(id===activeId?' active':'')+'" data-id="'+id+'" onclick="inspectTask('+id+')"><span class="state '+cls+'">'+esc(taskStatusLabel[item.status]||item.status)+'</span><span class="label">#'+id+' '+esc(item.label)+'</span></button>'
+  }).join('')
 }
 async function loadTools(){
   const generation=++toolsLoadGeneration
   try{
     const monitor=await request('/monitor')
-    if(generation!==toolsLoadGeneration)return
-    renderTasks(monitor&&monitor.webTools)
-  }catch(error){if(generation===toolsLoadGeneration)setHeaderState('任务读取失败','err')}
+    if(generation===toolsLoadGeneration)renderTasks(monitor&&monitor.webTools)
+  }catch(error){if(generation===toolsLoadGeneration)$('tasks').textContent=errorText('读取最近任务失败',error)}
+}
+let templatesError=null
+function renderTemplateOptions(items){
+  const select=$('template'),selected=select.value
+  select.innerHTML=items.map(([value,label])=>'<option value="'+esc(value)+'">'+esc(label)+'</option>').join('')
+  if([...select.options].some(option=>option.value===selected))select.value=selected
+}
+async function loadTemplates(){
+  const generation=++templatesLoadGeneration
+  try{
+    const items=await request('/tools/templates')
+    if(generation!==templatesLoadGeneration)return templateItems
+    templateItems=Array.isArray(items)?items:[];templatesError=null
+    renderTemplateOptions(templateItems.length?templateItems.map(item=>[item.name,item.label||item.name]):FALLBACK_TEMPLATES)
+    return templateItems
+  }catch(error){
+    if(generation===templatesLoadGeneration){templatesError=error;if(!templateItems.length)renderTemplateOptions(FALLBACK_TEMPLATES)}
+    throw error
+  }
+}
+async function useConfiguredTemplateRegion(){
+  let items
+  try{items=await loadTemplates()}catch(error){setResult(errorText('读取模板配置失败',error));return}
+  const item=items.find(item=>item.name===val('template'))
+  const region=item&&item.region
+  if(!region||![region.x,region.y,region.width,region.height].every(Number.isInteger)){setResult('所选模板没有配置固定匹配区域，请手动填写');return}
+  $('templateRect').value=[region.x,region.y,region.width,region.height].join(',')
+  if(Number.isFinite(Number(item.threshold)))$('threshold').value=String(item.threshold)
+  setResult('已读取 '+(item.label||item.name)+' 的配置区域')
 }
 // Read-only sandbox: separate from mutating tools and their polling lifecycle.
 let readOnlyMode={enabled:false,state:'active'}
@@ -410,10 +442,16 @@ let readOnlyGeneration=0,readOnlyEventSource=null,readOnlyLastEventId=0,readOnly
 const readOnlyCards=new Map()
 function readOnlyObject(value){return value!==null&&typeof value==='object'&&!Array.isArray(value)}
 function readOnlySummary(value){return JSON.stringify(value,(key,item)=>key==='imagePngBase64'?'[完整 PNG 已保留，可单独下载]':item,2)}
+const READONLY_ERROR_LIMIT=50
 function readOnlyError(context,error){
-  const el=$('readOnlyErrors');el.hidden=false
-  el.textContent+=(el.textContent?'\n':'')+new Date().toLocaleTimeString()+' '+context+': '+String(error&&error.message||error)
+  const el=$('readOnlyErrors'),box=$('readOnlyErrorBox')
+  box.hidden=false
+  const lines=el.textContent?el.textContent.split('\n'):[]
+  lines.push(new Date().toLocaleTimeString()+' '+context+'：'+String(error&&error.message||error))
+  el.textContent=lines.slice(-READONLY_ERROR_LIMIT).join('\n')
+  el.scrollTop=el.scrollHeight
 }
+function readOnlyClearErrors(){$('readOnlyErrors').textContent='';$('readOnlyErrorBox').hidden=true}
 async function readOnlyRequest(url,body){
   const options={method:body===undefined?'GET':'POST',cache:'no-store',credentials:'same-origin',headers:requestHeaders()}
   if(body!==undefined){options.headers={...options.headers,'Content-Type':'application/json'};options.body=JSON.stringify(body)}
@@ -673,8 +711,9 @@ async function readOnlyConnectEvents(){
   // EventSource 不能设自定义请求头，服务端也没有 Cookie 鉴权，令牌只能走查询参数。
   // 缺了它这条推送必然 401，而 EventSource 会无限自动重连。
   // Last-Event-ID 仍是 producer 游标；instance 变化触发 reset gap。
-  const source=new EventSource('/debug/read-only/events'+params({instance:readOnlyInstance,token:readTokenCookie()}));
-  readOnlyEventSource=source;readOnlyLastEventId=0
+  // Last-Event-ID 会丢弃 since 之前的事件，重连时带上已收到的序号，避免每次都从 0 重放并误报缺口。
+  const source=new EventSource('/debug/read-only/events'+params({instance:readOnlyInstance,token:accessToken(),since:readOnlyLastEventId}));
+  readOnlyEventSource=source
   for(const type of ['readonly.triggered','readonly.task.updated'])source.addEventListener(type,event=>{if(readOnlyEventSource===source)readOnlyHandleEvent(event,generation)})
   source.addEventListener('readonly.gap',event=>{
     if(readOnlyEventSource!==source||generation!==readOnlyGeneration)return
@@ -686,14 +725,20 @@ async function readOnlyConnectEvents(){
     }catch(error){readOnlyError('推送缺口格式无效',error)}
   })
   source.onopen=()=>{if(readOnlyEventSource===source)$('readOnlyStatus').textContent='专用推送已连接，等待命令 / 流程触发。'}
-  source.onerror=()=>{if(readOnlyEventSource===source){$('readOnlyStatus').textContent='推送连接中断，浏览器自动重连；有界证据可能过期。';readOnlyError('推送连接中断','将使用 Last-Event-ID 自动续传，已有证据保留')}}
+  let reportedError=false
+  source.onerror=()=>{if(readOnlyEventSource===source){$('readOnlyStatus').textContent='推送连接中断，浏览器自动重连；已收到的证据保留。';if(!reportedError){reportedError=true;readOnlyError('推送连接中断','将从序号 '+readOnlyLastEventId+' 自动续传')}}}
 }
 window.addEventListener('pagehide',()=>{readOnlyGeneration++;readOnlyCloseEvents();readOnlyModeBusy=false})
 window.addEventListener('pageshow',event=>{if(event.persisted)loadReadOnlyMode()})
-document.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.isComposing&&event.target.tagName==='INPUT'){const map={ocrRect:()=>run('/tools/ocr',{rect:val('ocrRect')}),x:clickPoint,y:clickPoint,key:sendKey,aiKeyword:aiPreview,threshold:()=>matchTemplate(false),templateRect:()=>matchTemplate(false),changeSamples:sampleChatChanges,benchmarkRounds:panelBenchmark};const action=map[event.target.id];if(action){event.preventDefault();action()}}})
-$('accessToken').value=accessToken()
+// 输入框回车即执行对应操作。
+const ENTER_ACTIONS={accessToken:applyAccessToken,ocrRect:()=>run('/tools/ocr',{rect:val('ocrRect')}),x:clickPoint,y:clickPoint,key:sendKey,aiKeyword:aiPreview,threshold:()=>matchTemplate(false),templateRect:()=>matchTemplate(false),changeSamples:sampleChatChanges,benchmarkRounds:panelBenchmark,captureRounds:captureBenchmark,readOnlyLabel:readOnlyReadOnce}
+document.addEventListener('keydown',event=>{if(event.key!=='Enter'||event.isComposing||event.target.tagName!=='INPUT')return;const action=ENTER_ACTIONS[event.target.id];if(action){event.preventDefault();action()}})
 function toggleTheme(){const t=document.documentElement.dataset.theme==='light'?'dark':'light';document.documentElement.dataset.theme=t;try{localStorage.setItem('miliastraTheme',t)}catch(e){}}
-loadTemplates()
+// 其他标签页切换主题时同步。
+window.addEventListener('storage',event=>{if(event.key==='miliastraTheme'&&(event.newValue==='light'||event.newValue==='dark'))document.documentElement.dataset.theme=event.newValue})
+$('accessToken').value=accessToken()
+renderTemplateOptions(FALLBACK_TEMPLATES)
+loadTemplates().catch(()=>{})
 loadTools()
 loadReadOnlyMode()
 </script>

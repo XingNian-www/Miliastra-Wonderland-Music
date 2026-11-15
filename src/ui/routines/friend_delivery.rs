@@ -2275,45 +2275,49 @@ fn send_parsed_segments(
     ready: Option<&InviteReadyGate>,
     emoji_allowed: bool,
 ) -> Result<(), UiRoutineFailure> {
-    let mut sent_text = false;
-    let mut first_emoji_failure: Option<UiRoutineFailure> = None;
+    // 文字先合并成**一条**消息，再按顺序补发表情。
+    //
+    // 表情点击即发送，无法与文字同条；如果按标签原位置拆文字，聊天里会出现
+    // 「哼，声音也放好了，」「示例玩家A听完快去睡。」这种无意义断行。因此把文字
+    // 全部拼成一条，表情统一挪到这条文字之后发送。
+    let mut text = String::new();
+    let mut tags: Vec<&EmojiTag> = Vec::new();
     for segment in &parsed.segments {
         match segment {
-            EmojiSegment::Text(text) => {
-                if text.trim().is_empty() {
-                    continue;
-                }
-                // 文字失败仍然直接中止（与原发送语义一致）。
-                send_current_chat_message_guarded(context, config, text, ready)?;
-                sent_text = true;
-            }
-            EmojiSegment::Emoji(tag) => {
-                if !emoji_allowed {
-                    log::debug!(
-                        "表情标签已剥离（表情开关关闭或不在二级当前聊天）：页签 {}，候选 {} 个",
-                        tag.pack,
-                        tag.candidates.len()
-                    );
-                    continue;
-                }
-                if let Err(failure) = send_emoji_segment(context, ocr, config, tag, "send_emoji") {
-                    log::warn!(
-                        "表情发送失败（页签 {}，候选 {} 个，原因：{}），继续后续内容",
-                        tag.pack,
-                        tag.candidates.len(),
-                        failure.reason()
-                    );
-                    if first_emoji_failure.is_none() {
-                        first_emoji_failure = Some(failure);
-                    }
-                }
+            EmojiSegment::Text(value) => text.push_str(value),
+            EmojiSegment::Emoji(tag) => tags.push(tag),
+        }
+    }
+    if !text.trim().is_empty() {
+        send_current_chat_message_guarded(context, config, &text, ready)?;
+    }
+    if !emoji_allowed {
+        if !tags.is_empty() {
+            log::debug!(
+                "表情标签已剥离（表情开关关闭或不在二级当前聊天）：{} 个",
+                tags.len()
+            );
+        }
+        return Ok(());
+    }
+    let mut first_emoji_failure: Option<UiRoutineFailure> = None;
+    for tag in tags {
+        if let Err(failure) = send_emoji_segment(context, ocr, config, tag, "send_emoji") {
+            log::warn!(
+                "表情发送失败（页签 {}，候选 {} 个，原因：{}）",
+                tag.pack,
+                tag.candidates.len(),
+                failure.reason()
+            );
+            if first_emoji_failure.is_none() {
+                first_emoji_failure = Some(failure);
             }
         }
     }
-    if let Some(failure) = first_emoji_failure {
-        if !sent_text {
-            return Err(failure);
-        }
+    if let Some(failure) = first_emoji_failure
+        && text.trim().is_empty()
+    {
+        return Err(failure);
     }
     Ok(())
 }

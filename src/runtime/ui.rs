@@ -1938,6 +1938,70 @@ impl<'a> UiRoutineContext<'a> {
         }
     }
 
+    /// 通用失败帧落盘：任何 UI 例程在失败点都可以调用一次。
+    ///
+    /// 目的：实机失败时只留一行错误文本，问题往往无法复核。这里把**失败当帧**
+    /// 连同阶段/原因/最近界面状态一起写到 `deps/logs/ui-failures/`（可用
+    /// `MILIASTRA_UI_FAILURE_DIR` 覆盖），文件名带时间戳与阶段，
+    /// 并配同名 `.json` 元数据。截图失败只记 WARN，绝不再抛错。
+    pub fn save_failure_frame(&mut self, stage: &str, detail: &str) {
+        let frame = match self.capture_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                log::warn!("UI 失败帧落盘跳过（阶段 {stage}）：抓帧失败：{error:#}");
+                return;
+            }
+        };
+        let dir = std::env::var_os("MILIASTRA_UI_FAILURE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("deps/logs/ui-failures"));
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            log::warn!("UI 失败帧落盘跳过（阶段 {stage}）：创建目录失败：{error:#}");
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let safe_stage: String = stage
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let base = dir.join(format!("{stamp}-{safe_stage}"));
+        let image_path = base.with_extension("png");
+        if let Err(error) = frame.image().save(&image_path) {
+            log::warn!(
+                "UI 失败帧落盘失败（阶段 {stage}）：写图片失败 {}：{error:#}",
+                image_path.display()
+            );
+            return;
+        }
+        let ui_state = frame
+            .ui_state()
+            .map(|state| state.to_string())
+            .or_else(|| self.latest_ui_state().map(|state| state.to_string()));
+        let meta = serde_json::json!({
+            "stage": stage,
+            "detail": detail,
+            "operationId": self.operation_id.0,
+            "uiState": ui_state,
+            "capturedAtMs": stamp,
+            "image": image_path.display().to_string(),
+        });
+        let meta_path = base.with_extension("json");
+        let _ = std::fs::write(
+            &meta_path,
+            serde_json::to_string_pretty(&meta).unwrap_or_else(|_| "{}".to_string()),
+        );
+        log::error!(
+            "UI 失败帧已保存：{}（阶段 {stage}，界面 {}，原因：{detail}）",
+            image_path.display(),
+            meta.get("uiState")
+                .and_then(|value| value.as_str())
+                .unwrap_or("-")
+        );
+    }
+
     pub fn latest_ui_state(&self) -> Option<UiStateObservation> {
         self.observation
             .latest_state

@@ -379,10 +379,41 @@ fn wait_template(
             return Ok(());
         }
         if Instant::now() >= deadline {
+            // 失败当帧落盘：把"那一刻画面里有没有目标"变成可复核证据。
+            // 只读探针即使被平坦背景拒绝，也要尝试取一次候选分数写进详情。
+            let detail = match crate::ui::template::best_template_candidate(
+                &image,
+                Some(region),
+                template,
+            ) {
+                Ok(Some(hit)) => format!(
+                    "required moderation template was not found before timeout: template={} region=({},{},{}x{}) score={:.4} quality={}",
+                    template.display(),
+                    region.x,
+                    region.y,
+                    region.width,
+                    region.height,
+                    hit.score,
+                    hit.quality_ok
+                ),
+                Ok(None) => format!(
+                    "required moderation template was not found before timeout: template={} region=({},{},{}x{}) candidate=None（平坦或尺寸不匹配）",
+                    template.display(),
+                    region.x,
+                    region.y,
+                    region.width,
+                    region.height
+                ),
+                Err(error) => format!(
+                    "required moderation template was not found before timeout: template={} probe_error={error:#}",
+                    template.display()
+                ),
+            };
+            context.save_failure_frame(stage, &detail);
             return Err(UiRoutineFailure::new(
                 InputCertainty::AfterInputUnknown,
                 stage,
-                "required moderation template was not found before timeout",
+                detail,
             ));
         }
         wait_ms(

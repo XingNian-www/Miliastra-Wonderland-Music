@@ -16,7 +16,8 @@ use crate::config::{
     InputTimingConfig, OcrConfig, OutputConfig, PointConfig, ScreenConfig, TemplateConfig,
 };
 use crate::features::emoji::{
-    EMOJI_TAB_TOTAL, EmojiConfig, EmojiSegment, EmojiTag, ParsedReply, parse_reply,
+    EMOJI_TAB_TOTAL, EmojiConfig, EmojiSegment, EmojiTag, ParsedReply, normalize_emoji_label,
+    parse_reply,
 };
 use crate::geometry::{Point, Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
@@ -2418,10 +2419,14 @@ fn select_emoji_candidate(
 ) -> Result<Option<Point>, &'static str> {
     let mut matches: Vec<(String, Point)> = Vec::new();
     for candidate in candidates {
-        let target = normalize_lock_text(candidate);
+        // 符号不参与比对：OCR 吃掉 `～ · ！` 时仍应命中同一张卡片。
+        let target = normalize_emoji_label(candidate);
+        if target.is_empty() {
+            continue;
+        }
         let hits: Vec<&crate::runtime::ocr::OcrLine> = lines
             .iter()
-            .filter(|line| normalize_lock_text(&line.text) == target)
+            .filter(|line| normalize_emoji_label(&line.text) == target)
             .collect();
         if hits.len() > 1 {
             return Err("emoji_ocr_ambiguous");
@@ -2799,6 +2804,7 @@ fn ordered_emoji_labels(lines: &[crate::runtime::ocr::OcrLine]) -> Vec<String> {
         .collect();
     ordered.sort_by_key(|line| (line.bbox.y / 24, line.bbox.x));
     let mut labels: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for line in ordered {
         let text = line.text.trim().to_string();
         if text.is_empty() {
@@ -2807,9 +2813,13 @@ fn ordered_emoji_labels(lines: &[crate::runtime::ocr::OcrLine]) -> Vec<String> {
         if EMOJI_GRID_NON_LABELS.contains(&text.as_str()) {
             continue;
         }
-        if !labels.contains(&text) {
-            labels.push(text);
+        // 去重按去符号后的键：`哼哼` 与 `哼哼～` 视为同一个表情。
+        let key = normalize_emoji_label(&text);
+        if key.is_empty() || seen.contains(&key) {
+            continue;
         }
+        seen.push(key);
+        labels.push(text);
     }
     labels
 }

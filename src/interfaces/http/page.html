@@ -587,6 +587,20 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .config-string-row{display:flex;gap:var(--sp-2);align-items:center}
 .config-string-row input{flex:1}
 .config-array{display:flex;flex-direction:column;gap:var(--sp-2)}
+/* 二级聊天表情：扫描结果目录（按页签分组） */
+.emoji-catalog{border:1px solid var(--sep-1);border-radius:var(--r-2);padding:var(--sp-3);background:var(--bg-2);margin-top:var(--sp-3)}
+.emoji-catalog-head{display:flex;flex-wrap:wrap;align-items:center;gap:var(--sp-2);justify-content:space-between}
+.emoji-catalog-head b{font-size:var(--fs-item)}
+.emoji-catalog-meta{font-size:var(--fs-tiny);color:var(--text-2)}
+.emoji-catalog-actions{display:flex;flex-wrap:wrap;gap:var(--sp-2);margin-top:var(--sp-2)}
+.emoji-pack{margin-top:var(--sp-3);border-top:1px solid var(--sep-2);padding-top:var(--sp-2)}
+.emoji-pack-head{display:flex;align-items:center;gap:var(--sp-2);margin-bottom:var(--sp-2)}
+.emoji-pack-head b{font-size:var(--fs-item)}
+.emoji-labels{display:flex;flex-wrap:wrap;gap:var(--sp-2)}
+.emoji-label{display:inline-flex;align-items:center;gap:4px;padding:3px var(--sp-2);border:1px solid var(--sep-1);border-radius:999px;background:var(--bg-1);font-size:var(--fs-tiny);cursor:pointer}
+.emoji-label input{margin:0}
+.emoji-label.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.emoji-catalog-empty{font-size:var(--fs-tiny);color:var(--text-2);margin-top:var(--sp-2)}
 .config-num-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--sp-2)}
 .config-num-row.two{grid-template-columns:repeat(2,minmax(0,1fr))}
 .config-num-row label{display:flex;flex-direction:column;gap:2px;font-size:var(--fs-tiny);color:var(--text-3)}
@@ -5025,6 +5039,116 @@ function configEffectSummary(fields){
   if(c.restart)tags.push('<span class="config-effect restart">重启生效 '+c.restart+'</span>')
   return tags.join('')
 }
+/* ===== 二级聊天表情：扫描全部页签 + 按页签展示 + 加入 AI 白名单 ===== */
+let emojiCatalogState={tabs:[],scannedAtMs:0,loading:false,scanning:false,error:''}
+function emojiCatalogAiEntries(){
+  const sec=configData&&configData.sections&&configData.sections.emoji
+  const list=sec&&Array.isArray(sec.ai_allowed)?sec.ai_allowed:[]
+  return new Set(list.map(String))
+}
+function showEmojiCatalogMessage(text,kind){
+  const el=$('emojiCatalogMessage')
+  if(!el)return
+  el.textContent=text||''
+  el.className='config-message'+(kind?' '+kind:'')+(text?'':' hidden')
+}
+function emojiCatalogHtml(){
+  if(emojiCatalogState.error)return '<div class="emoji-catalog"><div class="config-message err">'+esc(emojiCatalogState.error)+'</div></div>'
+  if(!emojiCatalogState.tabs.length)return '<div class="emoji-catalog"><div class="emoji-catalog-empty">还没有扫描结果。点「扫描全部页签」读取 1..6 页签的可见表情。</div></div>'
+  const aiSet=emojiCatalogAiEntries()
+  const packs=emojiCatalogState.tabs.map(tab=>{
+    const labels=(tab.labels||[]).map(label=>{
+      const entry=tab.pack+'|'+label
+      const on=aiSet.has(entry)
+      return '<label class="emoji-label'+(on?' on':'')+'"><input type="checkbox" data-emoji-entry="'+esc(entry)+'"'+(on?' checked':'')+' onchange="emojiLabelToggled(this)"><span>'+esc(label)+'</span></label>'
+    }).join('')
+    return '<div class="emoji-pack"><div class="emoji-pack-head"><b>页签 '+tab.pack+'</b><span class="emoji-catalog-meta">'+((tab.labels||[]).length)+' 条</span>'
+      +'<button type="button" class="btn small ghost" onclick="emojiSelectPack('+tab.pack+',true)">全选</button>'
+      +'<button type="button" class="btn small ghost" onclick="emojiSelectPack('+tab.pack+',false)">清空</button></div>'
+      +'<div class="emoji-labels">'+(labels||'<span class="emoji-catalog-meta">（空）</span>')+'</div></div>'
+  }).join('')
+  const time=emojiCatalogState.scannedAtMs?new Date(emojiCatalogState.scannedAtMs).toLocaleString():'-'
+  return '<div class="emoji-catalog">'
+    +'<div class="emoji-catalog-head"><b>全量表情目录</b><span class="emoji-catalog-meta">上次扫描：'+esc(time)+'</span></div>'
+    +'<div class="emoji-catalog-meta">页签 1 = 收藏，2..6 = 角色。第 7 个页签会把收藏页向左挤走并隐藏，所以只扫描 1..6。</div>'
+    +'<div class="emoji-catalog-actions">'
+    +'<button type="button" class="btn primary" onclick="scanEmojiCatalog()"'+(emojiCatalogState.scanning?' disabled':'')+'>'+(emojiCatalogState.scanning?'扫描中…':'扫描全部页签')+'</button>'
+    +'<button type="button" class="btn" onclick="emojiAddSelectedToAi()">加入勾选到 AI 白名单</button>'
+    +'<span class="emoji-catalog-meta">勾选只改动表单，需要再点页面底部「保存」</span>'
+    +'</div>'
+    +packs
+    +'</div>'
+}
+function renderEmojiCatalog(){
+  const host=$('emojiCatalogHost')
+  if(host)host.innerHTML=emojiCatalogHtml()
+}
+function emojiLabelToggled(input){
+  const label=input&&input.closest('.emoji-label')
+  if(label)label.classList.toggle('on',!!(input&&input.checked))
+}
+function emojiSelectPack(pack,checked){
+  const host=$('emojiCatalogHost')
+  if(!host)return
+  host.querySelectorAll('input[data-emoji-entry]').forEach(input=>{
+    if(String(input.dataset.emojiEntry).split('|')[0]===String(pack)){input.checked=checked;emojiLabelToggled(input)}
+  })
+}
+async function loadEmojiCatalog(){
+  emojiCatalogState.loading=true
+  try{
+    const data=await request('/emoji/scanned')
+    emojiCatalogState.error=''
+    if(data&&data.ok&&Array.isArray(data.tabs)){
+      emojiCatalogState.tabs=data.tabs
+      emojiCatalogState.scannedAtMs=data.scannedAtMs||0
+    }else{
+      emojiCatalogState.tabs=[];emojiCatalogState.scannedAtMs=0
+    }
+  }catch(e){
+    emojiCatalogState.error='读取表情目录失败：'+(e&&e.message||e)
+  }finally{
+    emojiCatalogState.loading=false
+    renderEmojiCatalog()
+  }
+}
+async function scanEmojiCatalog(){
+  if(emojiCatalogState.scanning)return
+  emojiCatalogState.scanning=true
+  showEmojiCatalogMessage('扫描中：会逐个点击 1..6 页签并 OCR，约 10 秒','ok')
+  renderEmojiCatalog()
+  try{
+    const data=await requestJson('/emoji/scan',{})
+    if(data&&data.ok&&Array.isArray(data.tabs)){
+      emojiCatalogState.tabs=data.tabs
+      emojiCatalogState.scannedAtMs=data.scannedAtMs||0
+      emojiCatalogState.error=''
+      showEmojiCatalogMessage('扫描完成，已保存到 deps/data/emoji-catalog.json','ok')
+    }else{
+      showEmojiCatalogMessage('扫描返回异常','err')
+    }
+  }catch(e){
+    showEmojiCatalogMessage('扫描失败：'+(e&&e.message||e),'err')
+  }finally{
+    emojiCatalogState.scanning=false
+    renderEmojiCatalog()
+  }
+}
+function emojiAddSelectedToAi(){
+  const host=$('emojiCatalogHost')
+  if(!host)return
+  const entries=[...host.querySelectorAll('input[data-emoji-entry]:checked')].map(input=>String(input.dataset.emojiEntry))
+  if(!entries.length){showEmojiCatalogMessage('先勾选要加入 AI 白名单的表情','err');return}
+  if(!syncConfigFormToData())return
+  const sec=configData.sections.emoji||(configData.sections.emoji={})
+  const list=Array.isArray(sec.ai_allowed)?sec.ai_allowed.slice():[]
+  let added=0
+  for(const entry of entries){if(!list.includes(entry)){list.push(entry);added++}}
+  sec.ai_allowed=list
+  configDirty.add('emoji')
+  renderConfigForm()
+  showConfigMessage('已加入 '+added+' 条到 AI 可用表情（尚未保存，请点保存）','ok')
+}
 function renderConfigForm(){
   const form=$('configForm')
   if(!form)return
@@ -5066,10 +5190,14 @@ function renderConfigForm(){
       +'超过「单条文本上限」的文本会被截断（truncated），不会完整朗读。'
       +'隐私：合成文本可能包含玩家昵称/聊天内容，会发送给所配置的 fish.audio，不写入磁盘。</div>')
   }
+  if(section.name==='emoji'){
+    parts.push('<div class="config-message hidden" id="emojiCatalogMessage"></div><div id="emojiCatalogHost"></div>')
+  }
   parts.push(configFieldsBlockHtml(section,visibleFields))
   parts.push('</div>')
   form.innerHTML=parts.join('')
   if(isAi)aiProviderBind()
+  if(section.name==='emoji'){renderEmojiCatalog();loadEmojiCatalog()}
   renderConfigSaveBar()
 }
 // 通用“分组卡片”渲染：同一 section 的字段按 schema group 紧凑排列。

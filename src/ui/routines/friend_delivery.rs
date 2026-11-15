@@ -2527,26 +2527,25 @@ fn send_emoji_segment(
         return Err(emoji_failure(stage, "emoji_anchor_not_found"));
     };
 
-    if tag.pack > 1 {
-        let Some(tab) = emoji_tab_center(heart, tag.pack, scale) else {
-            close_emoji_panel(context, stage);
-            return Err(emoji_failure(stage, "emoji_pack_not_found"));
-        };
-        if tab.x < tray.x || tab.x > tray.right() || tab.y < tray.y || tab.y > tray.bottom() {
-            close_emoji_panel(context, stage);
-            return Err(emoji_failure(stage, "emoji_pack_not_found"));
-        }
-        context
-            .device()
-            .click_point(tab.x, tab.y)
-            .map_err(|error| after_input_failure(stage, error))?;
-        wait_ms(
-            context,
-            EMOJI_GRID_WAIT_MS,
-            stage,
-            InputCertainty::AfterInputUnknown,
-        )?;
+    // 页签 1（收藏）也要点一次：面板会记住上次停留的页签，不能假设默认在收藏。
+    let Some(tab) = emoji_tab_center(heart, tag.pack, scale) else {
+        close_emoji_panel(context, stage);
+        return Err(emoji_failure(stage, "emoji_pack_not_found"));
+    };
+    if tab.x < tray.x || tab.x > tray.right() || tab.y < tray.y || tab.y > tray.bottom() {
+        close_emoji_panel(context, stage);
+        return Err(emoji_failure(stage, "emoji_pack_not_found"));
     }
+    context
+        .device()
+        .click_point(tab.x, tab.y)
+        .map_err(|error| after_input_failure(stage, error))?;
+    wait_ms(
+        context,
+        EMOJI_GRID_WAIT_MS,
+        stage,
+        InputCertainty::AfterInputUnknown,
+    )?;
 
     let grid_frame = capture_emoji_frame(context, stage)?;
     save_emoji_debug(&grid_frame, config, "pack-grid");

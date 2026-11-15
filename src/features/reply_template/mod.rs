@@ -672,6 +672,14 @@ pub(crate) fn render(
             rest = &after[close + 1..];
             continue;
         }
+        // 表情标签必须原样保留：它既不是变量，也不是 `{a|b}` 随机文案。
+        if crate::features::emoji::is_emoji_tag_body(name) {
+            out.push('{');
+            out.push_str(name);
+            out.push('}');
+            rest = &after[close + 1..];
+            continue;
+        }
         // \u968f\u673a\u9009\u9879\u6700\u5148\uff1a\u5b83\u4e0d\u4f9d\u8d56\u4efb\u4f55\u4e1a\u52a1\u4e0a\u4e0b\u6587\uff0c
         // \u800c\u4e14\u7528\u6237\u5199\u5728\u56de\u590d\u91cc\u5c31\u8981\u751f\u6548\u3002
         if let Some(choice) = pick_random_choice(name) {
@@ -1306,5 +1314,23 @@ mod tests {
         let rendered = render(spec, Some("歌单只给好友用哦"), &ReplyVars::new());
         assert_eq!(rendered.text, "歌单只给好友用哦");
         assert!(rendered.missing.is_empty());
+    }
+
+    #[test]
+    fn render_preserves_emoji_tags() {
+        let entry = command_reply_catalog()
+            .find(|entry| entry.id == "@状态")
+            .expect("应有状态命令");
+        let spec = entry.replies().next().expect("应有回复");
+        let vars = ReplyVars::new();
+        for text in [
+            "状态{表情包:2:交给我吧}",
+            "状态{表情包:2:交给我吧|生气}",
+            "{表情包:1:哈哈}",
+        ] {
+            let rendered = render(spec, Some(text), &vars);
+            assert_eq!(rendered.text, text, "表情标签必须原样保留");
+            assert!(rendered.missing.is_empty(), "表情标签不应记为缺失变量");
+        }
     }
 }

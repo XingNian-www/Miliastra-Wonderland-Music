@@ -27,6 +27,13 @@ pub const MAX_EMOJI_TEXT_CHARS: usize = 32;
 
 /// 标签前缀。只有完整匹配该前缀的 `{` 才按表情标签处理，其余 `{` 原样保留。
 const TAG_PREFIX: &str = "{表情包:";
+/// 花括号内的标签正文前缀（不含花括号）。
+const TAG_BODY_PREFIX: &str = "表情包:";
+
+/// 判断花括号内的正文是否属于表情标签，供回复模板渲染/校验时放行。
+pub fn is_emoji_tag_body(body: &str) -> bool {
+    body.starts_with(TAG_BODY_PREFIX)
+}
 
 /// 表情段配置。面板可编辑项只有这四项；区域/坐标等技术参数不进配置。
 #[derive(Clone, Debug, Serialize, Deserialize)]

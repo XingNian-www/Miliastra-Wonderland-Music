@@ -274,6 +274,11 @@ fn validate_reply_variables(text: &str) -> std::result::Result<(), String> {
             rest = &after[close + 1..];
             continue;
         }
+        // 表情标签不是回复变量：允许面板保存含标签的文案，渲染时原样保留。
+        if crate::features::emoji::is_emoji_tag_body(name) {
+            rest = &after[close + 1..];
+            continue;
+        }
         if name.trim() != name {
             return Err(format!(
                 "变量花括号内不能有空格，请写成 {{{}}}",
@@ -727,5 +732,21 @@ mod tests {
             validate_reply_variables(&format!("好{{{}}}", crate::features::ai_tag::AI_TAG)).is_ok(),
             "AI 标签应被接受"
         );
+    }
+
+    #[test]
+    fn reply_variables_accept_emoji_tags() {
+        for text in [
+            "状态{表情包:2:交给我吧}",
+            "状态{表情包:2:交给我吧|生气}",
+            "{表情包:1:哈哈}测试",
+        ] {
+            assert!(
+                validate_reply_variables(text).is_ok(),
+                "表情标签应被接受：{text}"
+            );
+        }
+        assert!(validate_reply_variables("{表情包:8:哈哈}").is_ok(), "渲染层放行，发送层校验序号");
+        assert!(validate_reply_variables("{未知变量}").is_err());
     }
 }

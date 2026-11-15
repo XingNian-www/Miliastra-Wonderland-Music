@@ -2189,8 +2189,9 @@ pub(super) use super::state_observation::wait_ms;
 
 /// 表情按钮在 1920×1080 设计分辨率下的位置。
 const EMOJI_BUTTON_DESIGN: Point = Point::new(907, 980);
-/// 表情栏页签行 ROI（设计分辨率）。红心锚点在这里检测。
-const EMOJI_TRAY_DESIGN: Rect = Rect::new(280, 840, 920, 100);
+/// 表情栏页签行 ROI（设计分辨率）。红心/齿轮模板在这里整块匹配，
+/// 高度必须覆盖图标完整高度：红心实测 y≈921..949，原来 840..940 会把它裁掉一半。
+const EMOJI_TRAY_DESIGN: Rect = Rect::new(280, 820, 920, 150);
 /// 表情网格 ROI（设计分辨率）。只对这块做一次 OCR。
 const EMOJI_GRID_DESIGN: Rect = Rect::new(332, 336, 832, 588);
 /// 第 1 个角色页签相对红心的 x 偏移（设计分辨率）。
@@ -2727,6 +2728,13 @@ fn scan_emoji_tabs(
     config: &FriendDeliveryRoutineConfig,
 ) -> Result<Vec<EmojiTabScan>, UiRoutineFailure> {
     const STAGE: &str = "scan_emoji_catalog";
+    // 扫描必须在二级当前聊天里进行：入口导航可能被过渡界面跳过，
+    // 这里再显式落一次驻留，避免在一级大厅里点空。
+    super::residency::settle_to(
+        context,
+        &SettleEnvironment::new(ocr.clone(), config.clone()),
+        ResidencyTarget::Secondary(ConversationRef::AnySecondary),
+    )?;
     let (heart, scale) = match open_emoji_panel_anchored(context, config, STAGE) {
         Ok(value) => value,
         Err(failure) => {

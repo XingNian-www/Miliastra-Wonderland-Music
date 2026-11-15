@@ -2811,6 +2811,13 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             order: 35,
             fields: with_section_prefix("tts", tts_section()),
         },
+        ConfigSectionSchema {
+            name: "emoji".to_string(),
+            label: "二级聊天表情".to_string(),
+            domain: Domain::Interaction,
+            order: 36,
+            fields: with_section_prefix("emoji", emoji_section()),
+        },
     ];
     // 统一补段内小节：声明点不必逐个手写 group。
     for section in &mut sections {
@@ -3075,6 +3082,35 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
 }
 
 /// `tts` 段：fish.audio 语音合成（仅 AI 聊天工具 speak 可触发）。
+fn emoji_section() -> Vec<ConfigFieldSchema> {
+    vec![
+        ConfigFieldSchema::db_idle_reload(
+            "enabled",
+            "启用表情发送",
+            FieldKind::Bool,
+            "开启后二级当前聊天支持 {表情包:页签:文字} 标签；关闭不影响文字发送",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "ai_enabled",
+            "允许 AI 回复使用表情",
+            FieldKind::Bool,
+            "开启后 AI 只能使用下面白名单里的表情；关闭时 AI 回复中的表情标签会被剥离",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "ai_allowed",
+            "AI 可用表情",
+            FieldKind::StringArray,
+            "每项格式 页签序号|表情文字，例如 2|交给我吧；页签 1=收藏，2..7=角色",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "capture_debug",
+            "保存表情调试截图",
+            FieldKind::Bool,
+            "默认关闭；开启后表情流程的完整截图落到 deps/emoji-debug（可能含聊天内容）",
+        ),
+    ]
+}
+
 fn tts_section() -> Vec<ConfigFieldSchema> {
     vec![
         ConfigFieldSchema::db_live(

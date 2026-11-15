@@ -227,6 +227,9 @@ pub struct AppConfig {
     /// 昵称身份映射；内嵌段可省略。
     #[serde(default)]
     pub identity: IdentityConfig,
+    /// 二级聊天表情；内嵌段可省略。
+    #[serde(default)]
+    pub emoji: crate::features::emoji::EmojiConfig,
     /// 酷狗设备信息（由用户填写，程序不再自动生成）；内嵌段可省略。
     #[serde(default)]
     pub kugou: KugouDeviceConfig,
@@ -289,6 +292,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             visual: visual::VisualConfig::default(),
+            emoji: crate::features::emoji::EmojiConfig::default(),
             command_access: crate::features::command_access::CommandAccessConfig::default(),
             chat_source: ChatSourceConfig::default(),
             window: WindowConfig::default(),
@@ -678,6 +682,7 @@ impl AppConfig {
         self.song_review.validate()?;
         self.turtle_soup.validate()?;
         self.identity.validate()?;
+        self.emoji.validate()?;
         self.kugou.validate()?;
         self.validate_ui_geometry()?;
         Ok(())

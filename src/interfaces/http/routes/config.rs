@@ -280,6 +280,30 @@ pub(super) fn config_route(
     .map_err(internal_error)
 }
 
+/// GET /emoji/catalog：表情能力与 AI 可用表情清单（只读）。
+///
+/// 面板与 AI 调试用；不触发任何游戏输入。
+pub(super) fn emoji_catalog_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let snapshot = state.live_configs.snapshot();
+    let emoji = &snapshot.emoji;
+    let allowed = crate::features::emoji::parse_ai_allowed(&emoji.ai_allowed).unwrap_or_default();
+    let list = allowed
+        .iter()
+        .map(|(pack, text)| json!({ "pack": pack, "text": text }))
+        .collect::<Vec<_>>();
+    serde_json::to_string(&json!({
+        "ok": true,
+        "enabled": emoji.enabled,
+        "aiEnabled": emoji.ai_enabled,
+        "allowed": list,
+        "catalog": crate::features::emoji::ai_prompt_catalog(&emoji.ai_allowed),
+    }))
+    .map_err(internal_error)
+}
+
 /// GET /config/schema：全部段与字段 schema（含内置默认值）。
 pub(super) fn config_schema_route(
     _query: &[(String, String)],

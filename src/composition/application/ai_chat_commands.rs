@@ -486,7 +486,7 @@ impl ApplicationRuntime {
                         prompt.push_str("\n\n");
                         prompt.push_str(&catalog);
                         prompt.push_str(
-                            "\n想发表情时只能从上面清单里选，并把标签原样写进回复；不要编造不存在的表情。",
+                            "\n想发表情时只能从上面清单里选，并把标签原样写进回复；不要编造不存在的表情。\n表情标签只能放在整条回复的末尾，不要插在句子中间，否则聊天里会被拆成多条消息。",
                         );
                     }
                     prompt

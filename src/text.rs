@@ -196,6 +196,27 @@ pub(crate) fn fit_chat_message(label: &str, message: &str) -> Vec<String> {
 }
 
 pub(crate) fn split_numbered_chat_message(label: &str, message: &str) -> Vec<String> {
+    // 标签必须先解析再换行：表情标签是原子消息，不能被宽度切分或截断。
+    // 只有含标签前缀时才走展开，普通文本零额外开销。
+    if message.contains("{表情包:") {
+        let parts = crate::features::emoji::expand_reply_for_sending(message);
+        if parts.len() > 1 {
+            return parts
+                .into_iter()
+                .flat_map(|piece| {
+                    if crate::features::emoji::is_tag_only_message(&piece) {
+                        vec![piece]
+                    } else {
+                        split_numbered_chat_message_raw(label, &piece)
+                    }
+                })
+                .collect();
+        }
+    }
+    split_numbered_chat_message_raw(label, message)
+}
+
+fn split_numbered_chat_message_raw(label: &str, message: &str) -> Vec<String> {
     let source = normalize_segment_source(message);
     let mut expected_total = 1usize;
     for _ in 0..16 {
@@ -507,5 +528,37 @@ mod punctuation_split_tests {
                 "带编号也不能超上限: {part:?}"
             );
         }
+    }
+
+    #[test]
+    fn split_keeps_emoji_tags_whole() {
+        let long = "测".repeat(200);
+        let message = format!("{long}{{表情包:2:交给我吧}}");
+        let parts = split_numbered_chat_message("", &message);
+        assert!(
+            parts.iter().any(|part| part == "{表情包:2:交给我吧}"),
+            "标签必须完整保留为一条: {parts:?}"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|part| !part.contains("{表情包:") || part == "{表情包:2:交给我吧}"),
+            "任何分段都不能包含残缺标签: {parts:?}"
+        );
+        assert!(
+            parts
+                .iter()
+                .filter(|part| !crate::features::emoji::is_tag_only_message(part))
+                .map(|part| part.chars().count())
+                .sum::<usize>()
+                == long.chars().count(),
+            "文字部分不能丢失"
+        );
+    }
+
+    #[test]
+    fn split_tag_only_message_is_untouched() {
+        let parts = split_numbered_chat_message("", "{表情包:1:哈哈}");
+        assert_eq!(parts, vec!["{表情包:1:哈哈}".to_string()]);
     }
 }

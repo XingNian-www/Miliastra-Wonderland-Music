@@ -396,6 +396,45 @@ pub fn serialize_parsed(parsed: &ParsedReply) -> String {
     output
 }
 
+/// 发送前展开：先解析标签，再交给换行/截断逻辑。
+///
+/// 返回顺序 = 合并后的文字（可空）+ 按出现顺序排列的表情标签消息。
+/// 标签消息本身很短，后续按宽度切分/截断时不会被切开或截掉。
+pub fn expand_reply_for_sending(input: &str) -> Vec<String> {
+    let Ok(parsed) = parse_reply(input) else {
+        return vec![input.to_string()];
+    };
+    if !parsed.has_emoji() {
+        return vec![input.to_string()];
+    }
+    let mut output = Vec::new();
+    let text = parsed.plain_text();
+    if !text.trim().is_empty() {
+        output.push(text);
+    }
+    for segment in &parsed.segments {
+        if let EmojiSegment::Emoji(tag) = segment {
+            output.push(serialize_parsed(&ParsedReply {
+                segments: vec![EmojiSegment::Emoji(tag.clone())],
+            }));
+        }
+    }
+    output
+}
+
+/// 判断一条消息是否“只由表情标签组成”（展开后的标签消息）。
+pub fn is_tag_only_message(text: &str) -> bool {
+    parse_reply(text)
+        .map(|parsed| {
+            parsed.has_emoji()
+                && parsed
+                    .segments
+                    .iter()
+                    .all(|segment| matches!(segment, EmojiSegment::Emoji(_)))
+        })
+        .unwrap_or(false)
+}
+
 /// AI 回复的表情过滤：`ai_enabled=false` 剥离全部标签；开启时只保留白名单内标签。
 ///
 /// 返回（过滤后的文本，被剥离的标签数）。解析失败时原样返回，不猜测。
@@ -715,6 +754,59 @@ mod tests {
             assert_eq!(normalize_emoji_label(raw), expected, "raw={raw}");
         }
         assert_eq!(normalize_emoji_label("好耶！"), normalize_emoji_label("好耶"));
+    }
+
+    #[test]
+    fn expand_puts_text_first_and_tags_after() {
+        let expanded = expand_reply_for_sending("哼，声音也放好了，{表情包:2:交给我吧}示例玩家A听完快去睡。");
+        assert_eq!(
+            expanded,
+            vec![
+                "哼，声音也放好了，示例玩家A听完快去睡。".to_string(),
+                "{表情包:2:交给我吧}".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_keeps_tags_away_from_wrapping() {
+        // 文字很长 + 标签在边界：标签必须保持完整、单独一条。
+        let long = "测".repeat(200);
+        let expanded = expand_reply_for_sending(&format!("{long}{{表情包:2:交给我吧}}"));
+        assert_eq!(expanded.len(), 2);
+        assert_eq!(expanded[0], long);
+        assert_eq!(expanded[1], "{表情包:2:交给我吧}");
+    }
+
+    #[test]
+    fn expand_is_idempotent_for_tag_only_messages() {
+        let expanded = expand_reply_for_sending("{表情包:2:交给我吧}");
+        assert_eq!(expanded, vec!["{表情包:2:交给我吧}".to_string()]);
+        let again: Vec<String> = expanded
+            .iter()
+            .flat_map(|piece| expand_reply_for_sending(piece))
+            .collect();
+        assert_eq!(again, expanded);
+    }
+
+    #[test]
+    fn expand_preserves_multiple_tags_order() {
+        let expanded = expand_reply_for_sending("前{表情包:1:哈哈}中{表情包:3:生气|吃惊}后");
+        assert_eq!(
+            expanded,
+            vec![
+                "前中后".to_string(),
+                "{表情包:1:哈哈}".to_string(),
+                "{表情包:3:生气|吃惊}".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_only_detection() {
+        assert!(is_tag_only_message("{表情包:2:交给我吧}"));
+        assert!(!is_tag_only_message("你好{表情包:2:交给我吧}"));
+        assert!(!is_tag_only_message("普通文字"));
     }
 
     #[test]

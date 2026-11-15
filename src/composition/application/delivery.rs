@@ -89,6 +89,12 @@ impl ApplicationRuntime {
                 self.lifecycle.running.clone(),
             );
         }
+        // 表情标签先解析成独立消息，再进入按宽度切分/截断的路径。
+        let emoji_parts = crate::features::emoji::expand_reply_for_sending(message);
+        if emoji_parts.len() > 1 {
+            let refs = emoji_parts.iter().map(String::as_str).collect::<Vec<_>>();
+            return self.reply_batch(&refs, 0);
+        }
         // 正文超宽时按显示宽度切段（复用 task-37 的 wrapped 入口）；
         // 必须单行的系统通告仍走原单条路径，保留 invite/microphone/colon 压缩语义。
         let delay_ms = self
@@ -133,14 +139,20 @@ impl ApplicationRuntime {
                     .live_configs
                     .identity
                     .replace_display_names(message);
-                if crate::text::chat_layout::is_single_line_notice(&mapped) {
-                    vec![mapped]
-                } else {
-                    crate::text::chat_layout::expand_chat_segments(
-                        &mapped,
-                        crate::text::chat_layout::MAX_SEGMENTS_PER_REPLY,
-                    )
-                }
+                // 先解析表情标签再换行：标签单独成条，永远不参与宽度切分/截断。
+                crate::features::emoji::expand_reply_for_sending(&mapped)
+                    .into_iter()
+                    .flat_map(|piece| {
+                        if crate::text::chat_layout::is_single_line_notice(&piece) {
+                            vec![piece]
+                        } else {
+                            crate::text::chat_layout::expand_chat_segments(
+                                &piece,
+                                crate::text::chat_layout::MAX_SEGMENTS_PER_REPLY,
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
         let expanded = crate::text::chat_layout::cap_chat_segments(

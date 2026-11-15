@@ -799,14 +799,16 @@ fn patch_contrast_ok(haystack: &GrayImage, matcher: &GrayMatcher<'_>, x: u32, y:
     if contrast.width * contrast.height < 4 {
         return true;
     }
-    if x + contrast.width > haystack.width() || y + contrast.height > haystack.height() {
+    if x + contrast.x + contrast.width > haystack.width()
+        || y + contrast.y + contrast.height > haystack.height()
+    {
         return false;
     }
     let stride = haystack.width() as usize;
     let data = haystack.as_raw();
     let (mut sum, mut sum_sq) = (0u64, 0u64);
     for row in 0..contrast.height {
-        let offset = (y + row) as usize * stride + (x + contrast.x) as usize;
+        let offset = (y + contrast.y + row) as usize * stride + (x + contrast.x) as usize;
         for column in 0..contrast.width {
             let value = data[offset + column as usize] as u64;
             sum += value;
@@ -2001,7 +2003,49 @@ fn compare_hits_top_left(left: &TemplateHit, right: &TemplateHit) -> Ordering {
 }
 
 #[cfg(test)]
+
 mod tests {
+    /// 回归：平坦画面防护必须按 alpha 外接框的 (x, y) 取样。
+    /// 曾经的实现漏了 `contrast.y`，凡是内容不在模板最顶端一行开始的模板
+    /// （如 `friend-more-settings.png` 的三个点在 y=20）都会取到空白行，
+    /// 把完美的 SAD=0 命中判成"平坦画面"而丢弃。
+    #[test]
+    fn patch_contrast_uses_contrast_origin() {
+        use image::{GrayImage, Luma};
+        // 模板：内容只在 y=5..7，其余透明。
+        let mut gray = GrayImage::from_pixel(8, 8, Luma([100]));
+        let mut alpha = GrayImage::from_pixel(8, 8, Luma([0]));
+        for y in 5..8 {
+            for x in 0..8 {
+                alpha.put_pixel(x, y, Luma([255]));
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                gray.put_pixel(x, y, Luma([100]));
+            }
+        }
+        let template = super::GrayTemplate::build(
+            gray,
+            alpha,
+            std::path::Path::new("synthetic-contrast-origin.png"),
+        );
+        let matcher = super::GrayMatcher::from_template(&template);
+        assert!(matcher.contrast.is_some(), "alpha 外接框应可用于平坦防护");
+        // 画面：y=0..4 平坦，y=5..7 有明显黑白交替结构（对应模板内容）。
+        let mut haystack = GrayImage::from_pixel(20, 20, Luma([250]));
+        for y in 5..8 {
+            for x in 0..20 {
+                let value = if (x + y) % 2 == 0 { 0 } else { 255 };
+                haystack.put_pixel(x, y, Luma([value]));
+            }
+        }
+        assert!(
+            super::patch_contrast_ok(&haystack, &matcher, 0, 0),
+            "必须按 contrast.y 取样；否则会误采 y=0 的平坦行并拒绝真实命中"
+        );
+    }
+
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

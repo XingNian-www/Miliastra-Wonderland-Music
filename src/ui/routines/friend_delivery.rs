@@ -2586,6 +2586,215 @@ fn send_emoji_segment(
     Ok(())
 }
 
+// ===================================================================
+// 网页端一次性解析全部页签（全量表情目录）
+// ===================================================================
+
+/// 单个页签的扫描结果。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EmojiTabScan {
+    pub pack: u32,
+    pub labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EmojiCatalogScanOutcome {
+    pub tabs: Vec<EmojiTabScan>,
+    pub failure: Option<String>,
+}
+
+/// 网页端“解析全部页签”入口（只在 HTTP 层使用）。
+pub(crate) struct EmojiCatalogUi {
+    runtime: UiRuntimeHandle,
+    ocr: OcrRuntimeHandle,
+    config: FriendDeliveryRoutineConfig,
+}
+
+impl EmojiCatalogUi {
+    pub(crate) fn new(
+        runtime: UiRuntimeHandle,
+        ocr: OcrRuntimeHandle,
+        config: FriendDeliveryRoutineConfig,
+    ) -> Self {
+        Self {
+            runtime,
+            ocr,
+            config,
+        }
+    }
+
+    pub(crate) fn submit(
+        &self,
+    ) -> std::result::Result<UiOperation<EmojiCatalogScanOutcome>, UiSubmitError> {
+        self.runtime.submit(EmojiCatalogRoutine {
+            ocr: self.ocr.clone(),
+            config: self.config.clone(),
+        })
+    }
+}
+
+struct EmojiCatalogRoutine {
+    ocr: OcrRuntimeHandle,
+    config: FriendDeliveryRoutineConfig,
+}
+
+impl sealed::UiRoutineSealed for EmojiCatalogRoutine {}
+
+impl UiRoutine for EmojiCatalogRoutine {
+    type Output = EmojiCatalogScanOutcome;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.clone());
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Secondary(ConversationRef::AnySecondary),
+            FinishPolicy::RestoreEntry {
+                fallback: ResidencyTarget::Secondary(ConversationRef::AnySecondary),
+            },
+            environment,
+        )
+        .with_total_budget(Duration::from_secs(60));
+        let task = UiTask::new(
+            spec,
+            EmojiCatalogExecution {
+                ocr: self.ocr,
+                config: self.config,
+            },
+        );
+        let outcome = task.execute(context);
+        match outcome.output {
+            Some(inner) => EmojiCatalogScanOutcome {
+                tabs: inner.tabs,
+                failure: inner.failure,
+            },
+            None => EmojiCatalogScanOutcome {
+                tabs: Vec::new(),
+                failure: Some(
+                    outcome
+                        .entry_failure
+                        .map(|failure| failure.reason().to_string())
+                        .unwrap_or_else(|| "表情目录扫描没有开始：入口导航失败".to_string()),
+                ),
+            },
+        }
+    }
+}
+
+struct EmojiCatalogExecution {
+    ocr: OcrRuntimeHandle,
+    config: FriendDeliveryRoutineConfig,
+}
+
+#[derive(Default)]
+struct EmojiCatalogInner {
+    tabs: Vec<EmojiTabScan>,
+    failure: Option<String>,
+}
+
+impl sealed::UiRoutineSealed for EmojiCatalogExecution {}
+
+impl UiRoutine for EmojiCatalogExecution {
+    type Output = EmojiCatalogInner;
+
+    fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+        match scan_emoji_tabs(context, &self.ocr, &self.config) {
+            Ok(tabs) => EmojiCatalogInner {
+                tabs,
+                failure: None,
+            },
+            Err(failure) => EmojiCatalogInner {
+                tabs: Vec::new(),
+                failure: Some(failure.reason().to_string()),
+            },
+        }
+    }
+}
+
+fn scan_emoji_tabs(
+    context: &mut UiRoutineContext<'_>,
+    ocr: &OcrRuntimeHandle,
+    config: &FriendDeliveryRoutineConfig,
+) -> Result<Vec<EmojiTabScan>, UiRoutineFailure> {
+    const STAGE: &str = "scan_emoji_catalog";
+    let expected_width = config.screen.expected_width;
+    let open_frame = capture_emoji_frame(context, STAGE)?;
+    let scale = design_scale(&open_frame, expected_width);
+    let button = scale_point(EMOJI_BUTTON_DESIGN, scale);
+    context
+        .device()
+        .click_point(button.x, button.y)
+        .map_err(|error| after_input_failure(STAGE, error))?;
+    wait_ms(
+        context,
+        EMOJI_PANEL_OPEN_WAIT_MS,
+        STAGE,
+        InputCertainty::AfterInputUnknown,
+    )?;
+
+    let panel_frame = capture_emoji_frame(context, STAGE)?;
+    save_emoji_debug(&panel_frame, config, "scan-panel-open");
+    let tray = scale_rect(EMOJI_TRAY_DESIGN, scale);
+    let Some(heart) = find_emoji_heart(&panel_frame, tray) else {
+        close_emoji_panel(context, STAGE);
+        return Err(emoji_failure(STAGE, "emoji_anchor_not_found"));
+    };
+
+    let grid = scale_rect(EMOJI_GRID_DESIGN, scale);
+    let mut tabs = Vec::with_capacity(EMOJI_TAB_TOTAL as usize);
+    for pack in 1..=EMOJI_TAB_TOTAL {
+        let Some(tab) = emoji_tab_center(heart, pack, scale) else {
+            close_emoji_panel(context, STAGE);
+            return Err(emoji_failure(STAGE, "emoji_pack_not_found"));
+        };
+        if tab.x < tray.x || tab.x > tray.right() || tab.y < tray.y || tab.y > tray.bottom() {
+            close_emoji_panel(context, STAGE);
+            return Err(emoji_failure(STAGE, "emoji_pack_not_found"));
+        }
+        context
+            .device()
+            .click_point(tab.x, tab.y)
+            .map_err(|error| after_input_failure(STAGE, error))?;
+        wait_ms(
+            context,
+            EMOJI_GRID_WAIT_MS,
+            STAGE,
+            InputCertainty::AfterInputUnknown,
+        )?;
+        let frame = capture_emoji_frame(context, STAGE)?;
+        save_emoji_debug(&frame, config, &format!("scan-pack-{pack}"));
+        let crop = crop_canvas(&frame, grid)
+            .map_err(|error| emoji_failure(STAGE, &format!("emoji_crop_failed: {error:#}")))?;
+        let lines = ocr
+            .recognize_lines(crop, OcrPriority::UiConfirmation)
+            .map_err(|error| emoji_failure(STAGE, &format!("emoji_ocr_failed: {error:#}")))?;
+        tabs.push(EmojiTabScan {
+            pack,
+            labels: ordered_emoji_labels(&lines),
+        });
+    }
+    close_emoji_panel(context, STAGE);
+    Ok(tabs)
+}
+
+/// OCR 行按“先上后下、同一行从左到右”排序，并对完全相同的文字去重。
+fn ordered_emoji_labels(lines: &[crate::runtime::ocr::OcrLine]) -> Vec<String> {
+    let mut ordered: Vec<&crate::runtime::ocr::OcrLine> = lines
+        .iter()
+        .filter(|line| !line.text.trim().is_empty())
+        .collect();
+    ordered.sort_by_key(|line| (line.bbox.y / 24, line.bbox.x));
+    let mut labels: Vec<String> = Vec::new();
+    for line in ordered {
+        let text = line.text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        if !labels.contains(&text) {
+            labels.push(text);
+        }
+    }
+    labels
+}
+
 #[cfg(test)]
 mod emoji_flow_tests {
     use super::*;
@@ -2684,6 +2893,22 @@ mod emoji_flow_tests {
     }
 
     #[test]
+    #[test]
+    fn ordered_labels_follow_grid_reading_order() {
+        let lines = vec![
+            line("第二行右", 300, 120),
+            line("第二行左", 100, 118),
+            line("第一行右", 300, 40),
+            line("第一行左", 100, 42),
+            line("第一行左", 105, 44), // 同行重复文字
+            line("   ", 0, 0),
+        ];
+        assert_eq!(
+            ordered_emoji_labels(&lines),
+            vec!["第一行左", "第一行右", "第二行左", "第二行右"]
+        );
+    }
+
     fn returns_none_when_no_candidate_visible() {
         let lines = vec![line("别的表情", 100, 50)];
         let candidates = vec!["交给我吧".to_string()];

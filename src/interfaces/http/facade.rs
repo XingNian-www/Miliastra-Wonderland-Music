@@ -43,6 +43,8 @@ pub(crate) struct ApplicationHttpCommandFacade {
     ///
     /// 只有生产装配点会填；测试里为 None，simulate_chat 会明确报错而不是静默无效。
     simulation: Option<ChatSimulation>,
+    /// 网页端表情目录扫描入口；同样只有生产装配点会填。
+    emoji_scan: Option<Arc<dyn Fn() -> Result<String, HttpCommandError> + Send + Sync>>,
 }
 
 /// 模拟聊天注入所需的共享句柄。
@@ -66,7 +68,17 @@ impl ApplicationHttpCommandFacade {
             tasks,
             custom_workflow,
             simulation: None,
+            emoji_scan: None,
         }
+    }
+
+    /// 装配网页端表情目录扫描（生产运行时提供，测试不装配）。
+    pub(crate) fn with_emoji_scan(
+        mut self,
+        scan: Arc<dyn Fn() -> Result<String, HttpCommandError> + Send + Sync>,
+    ) -> Self {
+        self.emoji_scan = Some(scan);
+        self
     }
 
     /// 生产装配：额外带上模拟聊天所需的链路句柄。
@@ -79,6 +91,7 @@ impl ApplicationHttpCommandFacade {
             tasks,
             custom_workflow,
             simulation: Some(simulation),
+            emoji_scan: None,
         }
     }
 
@@ -129,6 +142,15 @@ impl ApplicationHttpCommandFacade {
 }
 
 impl HttpCommandPort for ApplicationHttpCommandFacade {
+    fn emoji_scan(&self) -> Result<String, HttpCommandError> {
+        let Some(scan) = self.emoji_scan.as_ref() else {
+            return Err(HttpCommandError::internal(
+                "表情目录扫描未装配（仅生产运行时可用）",
+            ));
+        };
+        scan()
+    }
+
     /// 调试用：把一条模拟聊天消息注入观察链路，**只入队不等待**。
     ///
     /// 不阻塞是刻意的：点歌/歌单这类命令会在后台正式任务里打开决策窗口并等 20s，

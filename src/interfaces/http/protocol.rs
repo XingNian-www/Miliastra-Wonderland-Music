@@ -135,6 +135,10 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
         handler: commands_replies_save_route,
     },
     BodyRouteSpec {
+        path: "/emoji/scan",
+        handler: emoji_scan_route,
+    },
+    BodyRouteSpec {
         path: "/commands/policy",
         handler: commands_policy_save_route,
     },
@@ -869,6 +873,12 @@ const ROUTES: &[RouteSpec] = &[
         json: true,
         mutating: false,
         handler: emoji_catalog_route,
+    },
+    RouteSpec {
+        path: "/emoji/scanned",
+        json: true,
+        mutating: false,
+        handler: emoji_scanned_route,
     },
     RouteSpec {
         path: "/config/visual",

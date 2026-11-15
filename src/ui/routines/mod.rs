@@ -14,7 +14,8 @@ pub(crate) use custom_action::{CustomActionPlan, CustomActionUi};
 // 先在这里导出，避免接入方跨私有模块路径取类型。
 #[allow(unused_imports)]
 pub(crate) use friend_delivery::{
-    CapturedPrimaryOutcome, EstablishResidency, FriendDelivery, FriendDeliveryMessageStatus,
+    CapturedPrimaryOutcome, EmojiCatalogScanOutcome, EmojiCatalogUi, EmojiTabScan, EstablishResidency,
+    FriendDelivery, FriendDeliveryMessageStatus,
     FriendDeliveryRoutineConfig, FriendDeliveryRoutineConfigSource, FriendDeliveryUi,
     HallBatchStatus, HallBatchUi, ResidencyUi, SendFriendDeliveries, SendHallBatch,
     UiResidencyOutcome, UiResidencyTarget, highlighted_conversation_row,

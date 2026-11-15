@@ -930,12 +930,68 @@ impl ApplicationRuntime {
             identity: self.lifecycle.live_configs.identity.clone(),
             external_active: Arc::new(move || simulation_external.supplies_hall_messages()),
         };
+        // 网页端“解析全部页签”：用监听运行时的 UI 句柄与 OCR 直接驱动一次扫描。
+        let emoji_catalog_ui = crate::ui::routines::EmojiCatalogUi::new(
+            self.ui
+                .ui_runtime
+                .as_ref()
+                .ok_or_else(|| anyhow!("UI运行时尚未启动"))?
+                .handle(),
+            self.ui.ocr.clone(),
+            friend_delivery_routine_config(&self.lifecycle.config, &self.lifecycle.live_configs),
+        );
+        let emoji_scan: Arc<dyn Fn() -> Result<String, http::HttpCommandError> + Send + Sync> =
+            Arc::new(move || {
+                let operation = emoji_catalog_ui
+                    .submit()
+                    .map_err(|error| http::HttpCommandError::internal(format!("表情目录扫描提交失败：{error}")))?;
+                let outcome = operation
+                    .wait()
+                    .map_err(|error| http::HttpCommandError::internal(format!("表情目录扫描等待失败：{error}")))?;
+                if let Some(failure) = outcome.failure {
+                    return Err(http::HttpCommandError::internal(format!(
+                        "表情目录扫描失败：{failure}"
+                    )));
+                }
+                let scanned_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis())
+                    .unwrap_or(0);
+                let tabs = outcome.tabs;
+                let entries: Vec<String> = tabs
+                    .iter()
+                    .flat_map(|tab| {
+                        tab.labels
+                            .iter()
+                            .map(move |label| format!("{}|{}", tab.pack, label))
+                    })
+                    .collect();
+                let payload = serde_json::json!({
+                    "ok": true,
+                    "scannedAtMs": scanned_at_ms,
+                    "tabs": tabs,
+                    "entries": entries,
+                });
+                let text = serde_json::to_string_pretty(&payload)
+                    .map_err(|error| http::HttpCommandError::internal(format!("序列化表情目录失败：{error}")))?;
+                let path = std::path::Path::new("deps/data/emoji-catalog.json");
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        http::HttpCommandError::internal(format!("创建表情目录目录失败：{error}"))
+                    })?;
+                }
+                std::fs::write(path, &text).map_err(|error| {
+                    http::HttpCommandError::internal(format!("写入表情目录失败：{error}"))
+                })?;
+                Ok(text)
+            });
         let debug_command_port: Arc<dyn http::HttpCommandPort> =
             Arc::new(http_facade::ApplicationHttpCommandFacade::with_simulation(
                 formal_tasks.clone(),
                 self.business.custom_workflow.clone(),
                 simulation,
-            ));
+            )
+            .with_emoji_scan(emoji_scan.clone()));
         let config_store = self
             .lifecycle
             .config_store
@@ -958,18 +1014,21 @@ impl ApplicationRuntime {
             config_store,
             self.lifecycle.live_configs.clone(),
             http::HttpApplicationPorts::new(
-                Arc::new(http_facade::ApplicationHttpCommandFacade::with_simulation(
-                    formal_tasks.clone(),
-                    self.business.custom_workflow.clone(),
-                    http_facade::ChatSimulation {
-                        timeline: self.ui.chat_timeline.clone(),
-                        identity: self.lifecycle.live_configs.identity.clone(),
-                        external_active: {
-                            let external = self.lifecycle.external_chat.clone();
-                            Arc::new(move || external.supplies_hall_messages())
+                Arc::new(
+                    http_facade::ApplicationHttpCommandFacade::with_simulation(
+                        formal_tasks.clone(),
+                        self.business.custom_workflow.clone(),
+                        http_facade::ChatSimulation {
+                            timeline: self.ui.chat_timeline.clone(),
+                            identity: self.lifecycle.live_configs.identity.clone(),
+                            external_active: {
+                                let external = self.lifecycle.external_chat.clone();
+                                Arc::new(move || external.supplies_hall_messages())
+                            },
                         },
-                    },
-                )),
+                    )
+                    .with_emoji_scan(emoji_scan.clone()),
+                ),
                 formal_tasks.clone(),
                 formal_tasks,
                 Arc::new(HttpHallDetector {

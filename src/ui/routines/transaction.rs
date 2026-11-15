@@ -324,11 +324,13 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
         if let ActivationPolicy::Activate { wait_ms } = self.spec.activation
             && let Err(error) = context.device().activate(wait_ms)
         {
-            outcome.entry_failure = Some(failure(
+            let activate_failure = failure(
                 InputCertainty::BeforeInput,
                 "ui_task_activate",
                 format!("激活游戏窗口失败: {error:#}"),
-            ));
+            );
+            context.save_failure_frame(activate_failure.stage(), activate_failure.reason());
+            outcome.entry_failure = Some(activate_failure);
             outcome.residency = UiResidencyOutcome::Failed(
                 outcome
                     .entry_failure
@@ -344,6 +346,9 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
                 // 旁路：不观测、不导航；但若收尾策略要求固定目标，仍走统一收尾
                 // （例如邀请任务：入口不做任何导航，进新大厅后统一落到 Primary）。
                 let (output, panic_failure) = execute_inner(self.inner, context);
+                if let Some(failure) = &panic_failure {
+                    context.save_failure_frame(failure.stage(), failure.reason());
+                }
                 outcome.output = output;
                 outcome.output_failure = panic_failure;
                 outcome.finish = match &self.spec.finish {

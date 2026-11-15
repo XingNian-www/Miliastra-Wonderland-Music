@@ -593,10 +593,12 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .emoji-catalog-head b{font-size:var(--fs-item)}
 .emoji-catalog-meta{font-size:var(--fs-tiny);color:var(--text-2)}
 .emoji-catalog-actions{display:flex;flex-wrap:wrap;gap:var(--sp-2);margin-top:var(--sp-2)}
-.emoji-pack{margin-top:var(--sp-3);border-top:1px solid var(--sep-2);padding-top:var(--sp-2)}
-.emoji-pack-head{display:flex;align-items:center;gap:var(--sp-2);margin-bottom:var(--sp-2)}
-.emoji-pack-head b{font-size:var(--fs-item)}
-.emoji-labels{display:flex;flex-wrap:wrap;gap:var(--sp-2)}
+.emoji-pack{margin-top:var(--sp-2);border-top:1px solid var(--sep-2);padding-top:var(--sp-2)}
+.emoji-pack>summary{cursor:pointer;font-size:var(--fs-item);font-weight:600;color:var(--text-1);padding:2px 0}
+.emoji-pack-actions{display:flex;align-items:center;gap:var(--sp-2);margin:var(--sp-2) 0}
+.emoji-labels{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:6px;max-height:230px;overflow:auto;padding:2px 4px 2px 2px}
+.emoji-search{display:flex;align-items:center;gap:var(--sp-2);margin-top:var(--sp-2)}
+.emoji-search input{flex:1;min-width:160px}
 .emoji-label{display:inline-flex;align-items:center;gap:4px;padding:3px var(--sp-2);border:1px solid var(--sep-1);border-radius:999px;background:var(--bg-1);font-size:var(--fs-tiny);cursor:pointer}
 .emoji-label input{margin:0}
 .emoji-label.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
@@ -5041,6 +5043,7 @@ function configEffectSummary(fields){
 }
 /* ===== 二级聊天表情：扫描全部页签 + 按页签展示 + 加入 AI 白名单 ===== */
 let emojiCatalogState={tabs:[],scannedAtMs:0,loading:false,scanning:false,error:''}
+let emojiCatalogFilter=''
 function emojiCatalogAiEntries(){
   const sec=configData&&configData.sections&&configData.sections.emoji
   const list=sec&&Array.isArray(sec.ai_allowed)?sec.ai_allowed:[]
@@ -5052,20 +5055,38 @@ function showEmojiCatalogMessage(text,kind){
   el.textContent=text||''
   el.className='config-message'+(kind?' '+kind:'')+(text?'':' hidden')
 }
+function emojiStripSymbols(text){
+  // 与后端 normalize_emoji_label 对齐：只保留字母/数字/汉字，便于搜索时忽略符号。
+  return String(text==null?'':text).toLowerCase().replace(/[\s\p{P}\p{S}]+/gu,'')
+}
+function emojiCatalogFilterChanged(input){
+  emojiCatalogFilter=String(input&&input.value||'').trim()
+  renderEmojiCatalog()
+}
 function emojiCatalogHtml(){
   if(emojiCatalogState.error)return '<div class="emoji-catalog"><div class="config-message err">'+esc(emojiCatalogState.error)+'</div></div>'
   if(!emojiCatalogState.tabs.length)return '<div class="emoji-catalog"><div class="emoji-catalog-empty">还没有扫描结果。点「扫描全部页签」读取 1..6 页签的可见表情。</div></div>'
   const aiSet=emojiCatalogAiEntries()
+  const query=emojiCatalogFilter.toLowerCase()
+  const queryStripped=emojiStripSymbols(emojiCatalogFilter)
+  const matchLabel=label=>{
+    if(!query)return true
+    const text=String(label)
+    if(text.toLowerCase().includes(query))return true
+    return queryStripped!==''&&emojiStripSymbols(text).includes(queryStripped)
+  }
   const packs=emojiCatalogState.tabs.map(tab=>{
-    const labels=(tab.labels||[]).map(label=>{
+    const all=(tab.labels||[])
+    const visible=all.filter(matchLabel)
+    const labels=visible.map(label=>{
       const entry=tab.pack+'|'+label
       const on=aiSet.has(entry)
       return '<label class="emoji-label'+(on?' on':'')+'"><input type="checkbox" data-emoji-entry="'+esc(entry)+'"'+(on?' checked':'')+' onchange="emojiLabelToggled(this)"><span>'+esc(label)+'</span></label>'
     }).join('')
-    return '<div class="emoji-pack"><div class="emoji-pack-head"><b>页签 '+tab.pack+'</b><span class="emoji-catalog-meta">'+((tab.labels||[]).length)+' 条</span>'
-      +'<button type="button" class="btn small ghost" onclick="emojiSelectPack('+tab.pack+',true)">全选</button>'
-      +'<button type="button" class="btn small ghost" onclick="emojiSelectPack('+tab.pack+',false)">清空</button></div>'
-      +'<div class="emoji-labels">'+(labels||'<span class="emoji-catalog-meta">（空）</span>')+'</div></div>'
+    return '<details class="emoji-pack"'+(query?' open':'')+'><summary>页签 '+tab.pack+' <span class="emoji-catalog-meta">'+all.length+' 条'+(query?'，匹配 '+visible.length:'')+'</span></summary>'
+      +'<div class="emoji-pack-actions"><button type="button" class="btn small ghost" onclick="emojiSelectPack('+tab.pack+',true)">全选本页签</button>'
+      +'<button type="button" class="btn small ghost" onclick="emojiSelectPack('+tab.pack+',false)">清空本页签</button></div>'
+      +'<div class="emoji-labels">'+(labels||'<span class="emoji-catalog-meta">（无可显示的表情）</span>')+'</div></details>'
   }).join('')
   const time=emojiCatalogState.scannedAtMs?new Date(emojiCatalogState.scannedAtMs).toLocaleString():'-'
   return '<div class="emoji-catalog">'
@@ -5074,18 +5095,26 @@ function emojiCatalogHtml(){
     +'<div class="emoji-catalog-actions">'
     +'<button type="button" class="btn primary" onclick="scanEmojiCatalog()"'+(emojiCatalogState.scanning?' disabled':'')+'>'+(emojiCatalogState.scanning?'扫描中…':'扫描全部页签')+'</button>'
     +'<button type="button" class="btn" onclick="emojiAddSelectedToAi()">加入勾选到 AI 白名单</button>'
-    +'<span class="emoji-catalog-meta">勾选只改动表单，需要再点页面底部「保存」</span>'
+    +'<span class="emoji-catalog-meta">已勾选 <b id="emojiSelectedCount">0</b> 条；改动需再点页面底部「保存」</span>'
     +'</div>'
+    +'<div class="emoji-search"><input type="text" placeholder="搜索表情文字（忽略符号）" value="'+esc(emojiCatalogFilter)+'" oninput="emojiCatalogFilterChanged(this)"></div>'
     +packs
     +'</div>'
 }
 function renderEmojiCatalog(){
   const host=$('emojiCatalogHost')
-  if(host)host.innerHTML=emojiCatalogHtml()
+  if(host){host.innerHTML=emojiCatalogHtml();emojiUpdateSelectedCount()}
+}
+function emojiUpdateSelectedCount(){
+  const host=$('emojiCatalogHost')
+  const el=$('emojiSelectedCount')
+  if(!host||!el)return
+  el.textContent=String(host.querySelectorAll('input[data-emoji-entry]:checked').length)
 }
 function emojiLabelToggled(input){
   const label=input&&input.closest('.emoji-label')
   if(label)label.classList.toggle('on',!!(input&&input.checked))
+  emojiUpdateSelectedCount()
 }
 function emojiSelectPack(pack,checked){
   const host=$('emojiCatalogHost')
@@ -5093,6 +5122,7 @@ function emojiSelectPack(pack,checked){
   host.querySelectorAll('input[data-emoji-entry]').forEach(input=>{
     if(String(input.dataset.emojiEntry).split('|')[0]===String(pack)){input.checked=checked;emojiLabelToggled(input)}
   })
+  emojiUpdateSelectedCount()
 }
 async function loadEmojiCatalog(){
   emojiCatalogState.loading=true

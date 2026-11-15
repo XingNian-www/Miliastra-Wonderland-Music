@@ -290,6 +290,17 @@ fn push_text(segments: &mut Vec<EmojiSegment>, text: &str) {
     }
 }
 
+/// 表情文字归一化：先做全角/半角与空白归一，再**只保留字母、数字、汉字**。
+///
+/// OCR 经常吃掉或误识别标点（`哼哼～`→`哼哼`、`唔·`→`唔`、`出货吧！`→`出货吧`），
+/// 因此表情标签比对不看符号。两边同时归一后比较，多命中仍按歧义拒绝。
+pub fn normalize_emoji_label(text: &str) -> String {
+    crate::text::normalize_comparison_text(text)
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
 /// 校验面板里的 AI 白名单配置项，返回结构化列表（保持配置顺序）。
 pub fn parse_ai_allowed(entries: &[String]) -> Result<Vec<(u32, String)>, EmojiTagError> {
     let mut allowed = Vec::new();
@@ -689,6 +700,21 @@ mod tests {
             ..EmojiConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn normalize_emoji_label_ignores_symbols() {
+        for (raw, expected) in [
+            ("哼哼～", "哼哼"),
+            ("唔·", "唔"),
+            ("出货吧！", "出货吧"),
+            ("好耶……", "好耶"),
+            (" 交给我吧 ", "交给我吧"),
+            ("ＯＫ", "ok"),
+        ] {
+            assert_eq!(normalize_emoji_label(raw), expected, "raw={raw}");
+        }
+        assert_eq!(normalize_emoji_label("好耶！"), normalize_emoji_label("好耶"));
     }
 
     #[test]

@@ -2197,6 +2197,10 @@ const EMOJI_GRID_DESIGN: Rect = Rect::new(332, 336, 832, 588);
 const EMOJI_TAB_FIRST_OFFSET_DESIGN: f32 = 110.0;
 /// 相邻角色页签的间距（设计分辨率）。
 const EMOJI_TAB_PITCH_DESIGN: f32 = 110.5;
+/// 收藏红心在 1920 设计分辨率下的期望 x；仅用于校验锚点没选到角色头像。
+const EMOJI_HEART_EXPECTED_X_DESIGN: i32 = 424;
+/// 允许的锚点横向偏差（设计分辨率）。
+const EMOJI_HEART_X_TOLERANCE_DESIGN: i32 = 70;
 /// 打开表情栏后等待动画的时长。
 const EMOJI_PANEL_OPEN_WAIT_MS: u64 = 700;
 /// 点击页签后等待网格出现的时长。
@@ -2424,11 +2428,12 @@ fn find_emoji_heart(image: &DynamicImage, tray: Rect) -> Option<Point> {
             }
             let center_x = x0 as i32 + (min_x + max_x) as i32 / 2;
             let center_y = y0 as i32 + (min_y + max_y) as i32 / 2;
-            // 收藏页在最左侧；取最左的有效红色连通域，面积同档时取更大的。
+            // 收藏页红心是整行里面积最大的红色块；角色头像上的红色装饰通常更小。
+            // 面积相同再取更靠左的，避免多个头像同时有红点时选到右侧。
             match best {
                 None => best = Some((center_x, center_y, area)),
                 Some((best_x, _, best_area)) => {
-                    if center_x < best_x - 6 || (center_x <= best_x + 6 && area > best_area) {
+                    if area > best_area || (area == best_area && center_x < best_x) {
                         best = Some((center_x, center_y, area));
                     }
                 }
@@ -2497,6 +2502,56 @@ fn close_emoji_panel(context: &mut UiRoutineContext<'_>, stage: &'static str) {
     }
 }
 
+/// 打开表情面板并校验红心锚点。
+///
+/// 失败常见于两点：面板没打开（点到聊天里的红色元素）或面板本来开着、第一次点按钮
+/// 又把它关掉。这里最多重试一次，仍不对就明确失败，不做坐标兜底。
+fn open_emoji_panel_anchored(
+    context: &mut UiRoutineContext<'_>,
+    config: &FriendDeliveryRoutineConfig,
+    stage: &'static str,
+) -> Result<(Point, f32), UiRoutineFailure> {
+    let expected_width = config.screen.expected_width;
+    let mut last_scale = 1.0_f32;
+    for attempt in 0..2 {
+        let frame = capture_emoji_frame(context, stage)?;
+        let scale = design_scale(&frame, expected_width);
+        last_scale = scale;
+        let button = scale_point(EMOJI_BUTTON_DESIGN, scale);
+        context
+            .device()
+            .click_point(button.x, button.y)
+            .map_err(|error| after_input_failure(stage, error))?;
+        wait_ms(
+            context,
+            EMOJI_PANEL_OPEN_WAIT_MS,
+            stage,
+            InputCertainty::AfterInputUnknown,
+        )?;
+        let panel_frame = capture_emoji_frame(context, stage)?;
+        save_emoji_debug(&panel_frame, config, "panel-open");
+        let tray = scale_rect(EMOJI_TRAY_DESIGN, scale);
+        let Some(heart) = find_emoji_heart(&panel_frame, tray) else {
+            log::debug!("表情面板打开后未找到红心锚点（第 {} 次尝试）", attempt + 1);
+            continue;
+        };
+        let expected = (EMOJI_HEART_EXPECTED_X_DESIGN as f32 * scale).round() as i32;
+        let tolerance = (EMOJI_HEART_X_TOLERANCE_DESIGN as f32 * scale).round() as i32;
+        if (heart.x - expected).abs() > tolerance {
+            log::debug!(
+                "表情面板红心锚点位置异常：heart=({},{}) expected_x={}（第 {} 次尝试）",
+                heart.x,
+                heart.y,
+                expected,
+                attempt + 1
+            );
+            continue;
+        }
+        return Ok((heart, scale));
+    }
+    Err(emoji_failure(stage, "emoji_anchor_not_found"))
+}
+
 fn send_emoji_segment(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
@@ -2504,28 +2559,14 @@ fn send_emoji_segment(
     tag: &EmojiTag,
     stage: &'static str,
 ) -> Result<(), UiRoutineFailure> {
-    let expected_width = config.screen.expected_width;
-    let button_frame = capture_emoji_frame(context, stage)?;
-    let scale = design_scale(&button_frame, expected_width);
-    let button = scale_point(EMOJI_BUTTON_DESIGN, scale);
-    context
-        .device()
-        .click_point(button.x, button.y)
-        .map_err(|error| after_input_failure(stage, error))?;
-    wait_ms(
-        context,
-        EMOJI_PANEL_OPEN_WAIT_MS,
-        stage,
-        InputCertainty::AfterInputUnknown,
-    )?;
-
-    let panel_frame = capture_emoji_frame(context, stage)?;
-    save_emoji_debug(&panel_frame, config, "panel-open");
-    let tray = scale_rect(EMOJI_TRAY_DESIGN, scale);
-    let Some(heart) = find_emoji_heart(&panel_frame, tray) else {
-        close_emoji_panel(context, stage);
-        return Err(emoji_failure(stage, "emoji_anchor_not_found"));
+    let (heart, scale) = match open_emoji_panel_anchored(context, config, stage) {
+        Ok(value) => value,
+        Err(failure) => {
+            close_emoji_panel(context, stage);
+            return Err(failure);
+        }
     };
+    let tray = scale_rect(EMOJI_TRAY_DESIGN, scale);
 
     // 页签 1（收藏）也要点一次：面板会记住上次停留的页签，不能假设默认在收藏。
     let Some(tab) = emoji_tab_center(heart, tag.pack, scale) else {
@@ -2747,29 +2788,14 @@ fn scan_emoji_tabs(
     config: &FriendDeliveryRoutineConfig,
 ) -> Result<Vec<EmojiTabScan>, UiRoutineFailure> {
     const STAGE: &str = "scan_emoji_catalog";
-    let expected_width = config.screen.expected_width;
-    let open_frame = capture_emoji_frame(context, STAGE)?;
-    let scale = design_scale(&open_frame, expected_width);
-    let button = scale_point(EMOJI_BUTTON_DESIGN, scale);
-    context
-        .device()
-        .click_point(button.x, button.y)
-        .map_err(|error| after_input_failure(STAGE, error))?;
-    wait_ms(
-        context,
-        EMOJI_PANEL_OPEN_WAIT_MS,
-        STAGE,
-        InputCertainty::AfterInputUnknown,
-    )?;
-
-    let panel_frame = capture_emoji_frame(context, STAGE)?;
-    save_emoji_debug(&panel_frame, config, "scan-panel-open");
-    let tray = scale_rect(EMOJI_TRAY_DESIGN, scale);
-    let Some(heart) = find_emoji_heart(&panel_frame, tray) else {
-        close_emoji_panel(context, STAGE);
-        return Err(emoji_failure(STAGE, "emoji_anchor_not_found"));
+    let (heart, scale) = match open_emoji_panel_anchored(context, config, STAGE) {
+        Ok(value) => value,
+        Err(failure) => {
+            close_emoji_panel(context, STAGE);
+            return Err(failure);
+        }
     };
-
+    let tray = scale_rect(EMOJI_TRAY_DESIGN, scale);
     let grid = scale_rect(EMOJI_GRID_DESIGN, scale);
     let mut tabs = Vec::with_capacity(EMOJI_TAB_TOTAL as usize);
     for pack in 1..=EMOJI_TAB_TOTAL {

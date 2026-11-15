@@ -2192,7 +2192,7 @@ const EMOJI_BUTTON_DESIGN: Point = Point::new(907, 980);
 /// 表情栏页签行 ROI（设计分辨率）。红心锚点在这里检测。
 const EMOJI_TRAY_DESIGN: Rect = Rect::new(280, 840, 920, 100);
 /// 表情网格 ROI（设计分辨率）。只对这块做一次 OCR。
-const EMOJI_GRID_DESIGN: Rect = Rect::new(300, 220, 1300, 620);
+const EMOJI_GRID_DESIGN: Rect = Rect::new(332, 336, 832, 588);
 /// 第 1 个角色页签相对红心的 x 偏移（设计分辨率）。
 const EMOJI_TAB_FIRST_OFFSET_DESIGN: f32 = 110.0;
 /// 相邻角色页签的间距（设计分辨率）。
@@ -2775,6 +2775,9 @@ fn scan_emoji_tabs(
     Ok(tabs)
 }
 
+/// 网格里的非表情文字：收藏为空时的「编辑」卡片等。
+const EMOJI_GRID_NON_LABELS: &[&str] = &["编辑"];
+
 /// OCR 行按“先上后下、同一行从左到右”排序，并对完全相同的文字去重。
 fn ordered_emoji_labels(lines: &[crate::runtime::ocr::OcrLine]) -> Vec<String> {
     let mut ordered: Vec<&crate::runtime::ocr::OcrLine> = lines
@@ -2786,6 +2789,9 @@ fn ordered_emoji_labels(lines: &[crate::runtime::ocr::OcrLine]) -> Vec<String> {
     for line in ordered {
         let text = line.text.trim().to_string();
         if text.is_empty() {
+            continue;
+        }
+        if EMOJI_GRID_NON_LABELS.contains(&text.as_str()) {
             continue;
         }
         if !labels.contains(&text) {

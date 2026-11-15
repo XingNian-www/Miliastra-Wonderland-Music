@@ -2709,6 +2709,38 @@ impl UiRoutine for EmojiCatalogExecution {
     }
 }
 
+/// 网格是否真的打开了：只看网格 ROI 里白色卡片像素占比。
+///
+/// 收藏页为空时点页签只会停在页签行，上方仍然是聊天画面；这时 OCR 会把聊天正文
+/// 当成表情标签，因此必须先判定网格是否存在。
+fn emoji_grid_visible(image: &DynamicImage, grid: Rect) -> bool {
+    const WHITE_THRESHOLD: u8 = 200;
+    const MIN_WHITE_RATIO: f32 = 0.2;
+    let (width, height) = image.dimensions();
+    let x0 = grid.x.max(0) as u32;
+    let y0 = grid.y.max(0) as u32;
+    let x1 = grid.right().max(0) as u32;
+    let y1 = grid.bottom().max(0) as u32;
+    let x1 = x1.min(width);
+    let y1 = y1.min(height);
+    if x1 <= x0 || y1 <= y0 {
+        return false;
+    }
+    let mut white = 0_u64;
+    let mut total = 0_u64;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let [red, green, blue, _] = image.get_pixel(x, y).0;
+            let luma = (u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1000;
+            if luma >= u32::from(WHITE_THRESHOLD) {
+                white += 1;
+            }
+            total += 1;
+        }
+    }
+    total > 0 && (white as f32 / total as f32) >= MIN_WHITE_RATIO
+}
+
 fn scan_emoji_tabs(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
@@ -2761,6 +2793,14 @@ fn scan_emoji_tabs(
         )?;
         let frame = capture_emoji_frame(context, STAGE)?;
         save_emoji_debug(&frame, config, &format!("scan-pack-{pack}"));
+        if !emoji_grid_visible(&frame, grid) {
+            // 收藏为空时只有页签行，没有网格：不 OCR，直接记空。
+            tabs.push(EmojiTabScan {
+                pack,
+                labels: Vec::new(),
+            });
+            continue;
+        }
         let crop = crop_canvas(&frame, grid)
             .map_err(|error| emoji_failure(STAGE, &format!("emoji_crop_failed: {error:#}")))?;
         let lines = ocr
@@ -2899,6 +2939,15 @@ mod emoji_flow_tests {
     }
 
     #[test]
+    #[test]
+    fn grid_visibility_uses_white_card_ratio() {
+        let bright = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 40, Rgb([240, 240, 240])));
+        let dark = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 40, Rgb([30, 40, 50])));
+        let grid = Rect::new(5, 5, 20, 20);
+        assert!(emoji_grid_visible(&bright, grid));
+        assert!(!emoji_grid_visible(&dark, grid));
+    }
+
     #[test]
     fn ordered_labels_follow_grid_reading_order() {
         let lines = vec![

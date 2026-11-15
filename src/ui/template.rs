@@ -627,6 +627,54 @@ pub(crate) fn best_template_candidate(
     }))
 }
 
+/// 用内存里的模板图片做同样的灰度 SAD 匹配（不读磁盘、不走模板缓存）。
+///
+/// 用途：代码自带的小图标锚点（如表情面板的红心/齿轮）。这类模板属于 UI 结构，
+/// 不交给用户配置；同时避免为一次匹配写临时文件。
+pub(crate) fn best_embedded_template_candidate(
+    image: &DynamicImage,
+    search_rect: Rect,
+    template_image: &DynamicImage,
+) -> Result<Option<TemplateHit>> {
+    let haystack = crop_canvas(image, search_rect)?;
+    let rgba = template_image.to_rgba8();
+    let gray = DynamicImage::ImageRgba8(rgba.clone()).to_luma8();
+    let alpha = GrayImage::from_raw(
+        rgba.width(),
+        rgba.height(),
+        rgba.pixels().map(|pixel| pixel[3]).collect(),
+    )
+    .expect("RGBA alpha plane must have the same dimensions");
+    let template = GrayTemplate::build(gray, alpha, Path::new("<embedded-emoji-anchor>"));
+    if template.gray.width() > haystack.width() || template.gray.height() > haystack.height() {
+        return Ok(None);
+    }
+    let haystack_gray = haystack.to_luma8();
+    let max_sad = template.alpha_sum;
+    if max_sad == 0 {
+        return Ok(None);
+    }
+    let matcher = GrayMatcher::from_template(&template);
+    let found = best_gray_match(&haystack_gray, &matcher).unwrap_or(GrayMatch {
+        x: 0,
+        y: 0,
+        sad: max_sad.saturating_add(1),
+    });
+    if !patch_contrast_ok(&haystack_gray, &matcher, found.x, found.y) {
+        return Ok(None);
+    }
+    let score = 1.0 - found.sad as f32 / max_sad as f32;
+    Ok(Some(TemplateHit {
+        kind: "template".to_string(),
+        x: search_rect.x + found.x as i32,
+        y: search_rect.y + found.y as i32,
+        width: template.gray.width(),
+        height: template.gray.height(),
+        score,
+        quality_ok: true,
+    }))
+}
+
 /// 与 [`best_template_candidate`] 同样的灰度 SAD，但**先按整数倍降采样再匹配**。
 ///
 /// 用途：区域/模板都很大的探针（代价 ≈ 候选位置数 × 模板像素数）。两个维度同时除以
@@ -3411,6 +3459,10 @@ fn main_sad(@builtin(global_invocation_id) gid: vec3<u32>) {
             "world-wish.png",
             "startup-wonderland-map-star.png",
             "startup-paimon-menu.png",
+            // 表情栏锚点：直接从实机截图裁下的图标块（红心/齿轮），不透明是刻意的；
+            // 匹配走 best_embedded_template_candidate，并带平坦画面防护。
+            "emoji-tray-heart.png",
+            "emoji-tray-gear.png",
         ];
         // 图标/信号模板仍由生产代码按这些宽高写死搜索区/偏移，尺寸不能改。
         // 文字模板不在此列：它们的 canvas 就是字形 bbox + padding，搜索区按

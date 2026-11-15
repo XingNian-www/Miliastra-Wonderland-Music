@@ -3100,7 +3100,7 @@ fn emoji_section() -> Vec<ConfigFieldSchema> {
             "ai_allowed",
             "AI 可用表情",
             FieldKind::StringArray,
-            "每项格式 页签序号|表情文字，例如 2|交给我吧；页签 1=收藏，2..7=角色",
+            "每项格式 页签序号|表情文字，例如 2|交给我吧；页签 1=收藏，2..6=角色；第 7 个页签会把收藏页挤走并隐藏，不支持",
         ),
         ConfigFieldSchema::db_idle_reload(
             "capture_debug",

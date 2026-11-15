@@ -16,8 +16,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 页签总数是固定的：1 收藏 + 6 角色。用户明确要求按固定值校验，不做动态检测。
-pub const EMOJI_TAB_TOTAL: u32 = 7;
+/// 页签总数固定为 6：1 收藏 + 5 角色。
+///
+/// 用户 2026-11-15 明确：**不要点第 7 个页签**——点击第 7 个表情包会让收藏页签
+/// 被整体向左挤动并隐藏，红心锚点随即失效。因此上限按 6 校验，扫描也只扫 1..=6。
+pub const EMOJI_TAB_TOTAL: u32 = 6;
 /// 同一条回复里最多允许的表情标签数。
 pub const MAX_EMOJI_TAGS: usize = 4;
 /// 单个标签最多允许的候选数。
@@ -535,6 +538,14 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn rejects_seventh_pack() {
+        assert!(matches!(
+            parse_reply("{表情包:7:哈哈}").unwrap_err(),
+            EmojiTagError::PackOutOfRange { pack: 7 }
+        ));
+    }
+
     fn rejects_too_many_candidates() {
         let candidates = (0..=MAX_EMOJI_CANDIDATES)
             .map(|index| format!("c{index}"))
@@ -567,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_six_character_tabs() {
+    fn accepts_all_supported_packs() {
         for pack in 1..=EMOJI_TAB_TOTAL {
             let input = format!("{{表情包:{pack}:哈哈}}");
             assert!(parse_reply(&input).is_ok(), "pack {pack} 应合法");

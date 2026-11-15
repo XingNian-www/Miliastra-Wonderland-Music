@@ -2197,10 +2197,6 @@ const EMOJI_GRID_DESIGN: Rect = Rect::new(332, 336, 832, 588);
 const EMOJI_TAB_FIRST_OFFSET_DESIGN: f32 = 110.0;
 /// 相邻角色页签的间距（设计分辨率）。
 const EMOJI_TAB_PITCH_DESIGN: f32 = 110.5;
-/// 收藏红心在 1920 设计分辨率下的期望 x；仅用于校验锚点没选到角色头像。
-const EMOJI_HEART_EXPECTED_X_DESIGN: i32 = 424;
-/// 允许的锚点横向偏差（设计分辨率）。
-const EMOJI_HEART_X_TOLERANCE_DESIGN: i32 = 70;
 /// 打开表情栏后等待动画的时长。
 const EMOJI_PANEL_OPEN_WAIT_MS: u64 = 700;
 /// 点击页签后等待网格出现的时长。
@@ -2350,97 +2346,52 @@ fn save_emoji_debug(image: &DynamicImage, config: &FriendDeliveryRoutineConfig, 
     }
 }
 
-/// 在页签行 ROI 内找收藏页红心。找不到就是失败，不做任何坐标兜底。
-fn find_emoji_heart(image: &DynamicImage, tray: Rect) -> Option<Point> {
-    let (width, height) = image.dimensions();
-    let x0 = tray.x.max(0) as u32;
-    let y0 = tray.y.max(0) as u32;
-    let x1 = tray.right().max(0) as u32;
-    let y1 = tray.bottom().max(0) as u32;
-    let x1 = x1.min(width);
-    let y1 = y1.min(height);
-    if x1 <= x0 + 8 || y1 <= y0 + 8 {
-        return None;
-    }
-    let region_width = (x1 - x0) as usize;
-    let region_height = (y1 - y0) as usize;
-    let mut mask = vec![false; region_width * region_height];
-    for y in 0..region_height {
-        for x in 0..region_width {
-            let pixel = image.get_pixel(x0 + x as u32, y0 + y as u32);
-            let [r, g, b, _] = pixel.0;
-            let (r, g, b) = (r as i32, g as i32, b as i32);
-            // 红心是深红/玫红：红通道高、绿蓝明显偏低。
-            // 橙色「+ 编辑」的绿通道通常 >140，会被 g<=115 排除。
-            mask[y * region_width + x] =
-                r >= 135 && g <= 115 && b <= 130 && r - g >= 55 && r - b >= 35;
-        }
-    }
+/// 表情栏固定锚点模板：左侧齿轮与收藏页红心（1920 基线裁图，随画面等比缩放）。
+const EMOJI_GEAR_TEMPLATE: &[u8] = include_bytes!("../../../assets/emoji-tray-gear.png");
+const EMOJI_HEART_TEMPLATE: &[u8] = include_bytes!("../../../assets/emoji-tray-heart.png");
+/// 红心中心相对齿轮中心的偏移（1920 基线实测）。
+const EMOJI_GEAR_TO_HEART_DX_DESIGN: i32 = 94;
+const EMOJI_GEAR_TO_HEART_DY_DESIGN: i32 = -2;
+/// 锚点模板匹配阈值。
+const EMOJI_ANCHOR_THRESHOLD: f32 = 0.9;
 
-    let mut visited = vec![false; mask.len()];
-    let mut best: Option<(i32, i32, u32)> = None; // (center_x, center_y, area)
-    for start_y in 0..region_height {
-        for start_x in 0..region_width {
-            let start_index = start_y * region_width + start_x;
-            if !mask[start_index] || visited[start_index] {
-                continue;
-            }
-            let mut stack = vec![(start_x, start_y)];
-            visited[start_index] = true;
-            let mut area = 0_u32;
-            let (mut min_x, mut max_x) = (start_x, start_x);
-            let (mut min_y, mut max_y) = (start_y, start_y);
-            while let Some((cx, cy)) = stack.pop() {
-                area += 1;
-                min_x = min_x.min(cx);
-                max_x = max_x.max(cx);
-                min_y = min_y.min(cy);
-                max_y = max_y.max(cy);
-                for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-                    let nx = cx as i32 + dx;
-                    let ny = cy as i32 + dy;
-                    if nx < 0 || ny < 0 || nx >= region_width as i32 || ny >= region_height as i32
-                    {
-                        continue;
-                    }
-                    let index = ny as usize * region_width + nx as usize;
-                    if mask[index] && !visited[index] {
-                        visited[index] = true;
-                        stack.push((nx as usize, ny as usize));
-                    }
-                }
-            }
-            let component_width = (max_x - min_x + 1) as u32;
-            let component_height = (max_y - min_y + 1) as u32;
-            if area < 40 || component_width < 8 || component_height < 8 {
-                continue;
-            }
-            if component_width > 80 || component_height > 80 {
-                continue;
-            }
-            let fill = area as f32 / (component_width * component_height) as f32;
-            if fill < 0.18 {
-                continue;
-            }
-            let ratio = component_width as f32 / component_height as f32;
-            if !(0.55..=1.85).contains(&ratio) {
-                continue;
-            }
-            let center_x = x0 as i32 + (min_x + max_x) as i32 / 2;
-            let center_y = y0 as i32 + (min_y + max_y) as i32 / 2;
-            // 收藏页红心是整行里面积最大的红色块；角色头像上的红色装饰通常更小。
-            // 面积相同再取更靠左的，避免多个头像同时有红点时选到右侧。
-            match best {
-                None => best = Some((center_x, center_y, area)),
-                Some((best_x, _, best_area)) => {
-                    if area > best_area || (area == best_area && center_x < best_x) {
-                        best = Some((center_x, center_y, area));
-                    }
-                }
-            }
-        }
+fn load_scaled_template(bytes: &[u8], scale: f32) -> Option<DynamicImage> {
+    let template = image::load_from_memory(bytes).ok()?;
+    if (scale - 1.0).abs() <= 0.01 {
+        return Some(template);
     }
-    best.map(|(x, y, _)| Point::new(x, y))
+    let width = (template.width() as f32 * scale).round().max(1.0) as u32;
+    let height = (template.height() as f32 * scale).round().max(1.0) as u32;
+    Some(template.resize_exact(
+        width,
+        height,
+        image::imageops::FilterType::Triangle,
+    ))
+}
+
+/// 用模板匹配找表情栏锚点：优先红心，找不到再退回齿轮 + 固定偏移。
+///
+/// 两种模板都是 UI 结构图（不是颜色阈值），匹配失败就是失败，不做坐标兜底。
+fn find_emoji_anchor(image: &DynamicImage, tray: Rect, scale: f32) -> Option<Point> {
+    if let Some(template) = load_scaled_template(EMOJI_HEART_TEMPLATE, scale)
+        && let Ok(Some(hit)) =
+            crate::ui::template::best_embedded_template_candidate(image, tray, &template)
+        && hit.score >= EMOJI_ANCHOR_THRESHOLD
+    {
+        return Some(hit.rect().center());
+    }
+    if let Some(template) = load_scaled_template(EMOJI_GEAR_TEMPLATE, scale)
+        && let Ok(Some(hit)) =
+            crate::ui::template::best_embedded_template_candidate(image, tray, &template)
+        && hit.score >= EMOJI_ANCHOR_THRESHOLD
+    {
+        let gear = hit.rect().center();
+        return Some(Point::new(
+            gear.x + (EMOJI_GEAR_TO_HEART_DX_DESIGN as f32 * scale).round() as i32,
+            gear.y + (EMOJI_GEAR_TO_HEART_DY_DESIGN as f32 * scale).round() as i32,
+        ));
+    }
+    None
 }
 
 /// 以红心为原点推算页签中心；页签总数固定为 `EMOJI_TAB_TOTAL`。
@@ -2531,22 +2482,10 @@ fn open_emoji_panel_anchored(
         let panel_frame = capture_emoji_frame(context, stage)?;
         save_emoji_debug(&panel_frame, config, "panel-open");
         let tray = scale_rect(EMOJI_TRAY_DESIGN, scale);
-        let Some(heart) = find_emoji_heart(&panel_frame, tray) else {
+        let Some(heart) = find_emoji_anchor(&panel_frame, tray, scale) else {
             log::debug!("表情面板打开后未找到红心锚点（第 {} 次尝试）", attempt + 1);
             continue;
         };
-        let expected = (EMOJI_HEART_EXPECTED_X_DESIGN as f32 * scale).round() as i32;
-        let tolerance = (EMOJI_HEART_X_TOLERANCE_DESIGN as f32 * scale).round() as i32;
-        if (heart.x - expected).abs() > tolerance {
-            log::debug!(
-                "表情面板红心锚点位置异常：heart=({},{}) expected_x={}（第 {} 次尝试）",
-                heart.x,
-                heart.y,
-                expected,
-                attempt + 1
-            );
-            continue;
-        }
         return Ok((heart, scale));
     }
     Err(emoji_failure(stage, "emoji_anchor_not_found"))
@@ -2620,7 +2559,7 @@ fn send_emoji_segment(
     )?;
     let closed_frame = capture_emoji_frame(context, stage)?;
     save_emoji_debug(&closed_frame, config, "after-send");
-    if find_emoji_heart(&closed_frame, tray).is_some() {
+    if find_emoji_anchor(&closed_frame, tray, scale).is_some() {
         close_emoji_panel(context, stage);
         return Err(emoji_failure(stage, "emoji_panel_not_closed"));
     }
@@ -2870,49 +2809,43 @@ fn ordered_emoji_labels(lines: &[crate::runtime::ocr::OcrLine]) -> Vec<String> {
 #[cfg(test)]
 mod emoji_flow_tests {
     use super::*;
-    use image::{Rgb, RgbImage};
+    use image::{Rgb, RgbImage, Rgba, RgbaImage};
 
-    fn frame_with_red_blob(center: (i32, i32), radius: i32) -> DynamicImage {
-        let mut image = RgbImage::from_pixel(1920, 1080, Rgb([20, 20, 30]));
-        for y in (center.1 - radius)..=(center.1 + radius) {
-            for x in (center.0 - radius)..=(center.0 + radius) {
-                let dx = x - center.0;
-                let dy = y - center.1;
-                if dx * dx + dy * dy <= radius * radius {
-                    image.put_pixel(x as u32, y as u32, Rgb([220, 60, 90]));
-                }
-            }
-        }
-        DynamicImage::ImageRgb8(image)
+    fn dark_frame() -> RgbaImage {
+        RgbaImage::from_pixel(1920, 1080, image::Rgba([20, 20, 30, 255]))
+    }
+
+    fn overlay_template(bytes: &[u8], x: i64, y: i64) -> DynamicImage {
+        let mut base = dark_frame();
+        let template = image::load_from_memory(bytes)
+            .expect("模板可解码")
+            .to_rgba8();
+        image::imageops::overlay(&mut base, &template, x, y);
+        DynamicImage::ImageRgba8(base)
     }
 
     #[test]
-    fn finds_red_heart_in_tray() {
-        let image = frame_with_red_blob((424, 927), 12);
-        let heart = find_emoji_heart(&image, EMOJI_TRAY_DESIGN).expect("应找到红心");
-        assert!((heart.x - 424).abs() <= 3, "heart.x={}", heart.x);
-        assert!((heart.y - 927).abs() <= 3, "heart.y={}", heart.y);
+    fn finds_heart_anchor_by_template() {
+        let image = overlay_template(EMOJI_HEART_TEMPLATE, 400, 900);
+        let heart = find_emoji_anchor(&image, EMOJI_TRAY_DESIGN, 1.0).expect("应找到红心锚点");
+        // 模板 36×28，中心在 (400+18, 900+14)
+        assert!((heart.x - 418).abs() <= 2, "heart.x={}", heart.x);
+        assert!((heart.y - 914).abs() <= 2, "heart.y={}", heart.y);
     }
 
     #[test]
-    fn ignores_orange_plus_like_blob() {
-        let base = frame_with_red_blob((424, 927), 12).to_rgb8();
-        let mut rgb = base;
-        // 左侧「+ 编辑」的橙色图标：绿通道高，不应被当成红心。
-        for y in 880..920 {
-            for x in 300..340 {
-                rgb.put_pixel(x, y, Rgb([250, 170, 60]));
-            }
-        }
-        let heart = find_emoji_heart(&DynamicImage::ImageRgb8(rgb), EMOJI_TRAY_DESIGN)
-            .expect("应找到红心");
-        assert!((heart.x - 424).abs() <= 3, "heart.x={}", heart.x);
+    fn falls_back_to_gear_template() {
+        let image = overlay_template(EMOJI_GEAR_TEMPLATE, 300, 900);
+        let heart = find_emoji_anchor(&image, EMOJI_TRAY_DESIGN, 1.0).expect("应退回齿轮锚点");
+        // 齿轮 40×40 中心 (320,920)，加偏移 (94,-2)
+        assert!((heart.x - 414).abs() <= 3, "heart.x={}", heart.x);
+        assert!((heart.y - 918).abs() <= 3, "heart.y={}", heart.y);
     }
 
     #[test]
-    fn missing_heart_returns_none() {
-        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(1920, 1080, Rgb([20, 20, 30])));
-        assert!(find_emoji_heart(&image, EMOJI_TRAY_DESIGN).is_none());
+    fn missing_anchor_returns_none() {
+        let image = DynamicImage::ImageRgba8(dark_frame());
+        assert!(find_emoji_anchor(&image, EMOJI_TRAY_DESIGN, 1.0).is_none());
     }
 
     #[test]
@@ -2924,8 +2857,8 @@ mod emoji_flow_tests {
         let second = emoji_tab_center(heart, 3, scale).unwrap();
         assert_eq!(second.x, 645); // 110.5 取整
         let last = emoji_tab_center(heart, EMOJI_TAB_TOTAL, scale).unwrap();
-        // 固定间距近似值：实测 1088，这里按 110.5 的等比偏移得到 1087。
-        assert!((last.x - 1088).abs() <= 1, "last.x={}", last.x);
+        // 页签上限 6：最后一个角色页签中心 ≈ 976。
+        assert!((last.x - 976).abs() <= 1, "last.x={}", last.x);
         assert_eq!(last.y, 927);
     }
 

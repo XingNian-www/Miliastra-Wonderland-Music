@@ -120,6 +120,8 @@ pub(crate) trait HttpCommandPort: Send + Sync {
     ///
     /// 只注入聊天链路，不点鼠标、不截图。
     fn simulate_chat(&self, role: String, text: String) -> Result<String, HttpCommandError>;
+    /// 网页端专用：一次性扫描全部表情页签，返回 JSON 并落盘全量目录。
+    fn emoji_scan(&self) -> Result<String, HttpCommandError>;
     fn list_workflows(&self) -> Result<String, HttpCommandError>;
     fn run_workflow(&self, name: String, args: String) -> Result<String, HttpCommandError>;
 }

@@ -1473,6 +1473,31 @@ impl Drop for ConsoleReplyContextGuard {
     }
 }
 
+/// 统一构造好友投递/大厅批量/表情扫描共用的例程配置。
+///
+/// 运行态初始化与 HTTP 监听运行时都要用同一份口径，避免两处各写一份后漂移。
+pub(super) fn friend_delivery_routine_config(
+    app: &AppConfig,
+    live_configs: &LiveConfigs,
+) -> FriendDeliveryRoutineConfig {
+    FriendDeliveryRoutineConfig::resolve(FriendDeliveryRoutineConfigSource {
+        screen: &app.screen,
+        templates: &app.templates,
+        ocr: &app.ocr,
+        output: &app.output,
+        input_timing: &app.timing.input,
+        auto_retry_count: live_configs.friend_delivery_auto_retry_count.clone(),
+        send_enabled: live_configs.output_send_enabled.clone(),
+        friend_list_region: app.invite.friend_list_region.into(),
+        fuzzy_friend_match: app.invite.fuzzy_friend_match,
+        friend_step_ms: app.timing.invite.step_ms,
+        timeout_ms: app.timing.workflow.default_timeout_ms,
+        poll_ms: app.timing.workflow.default_poll_ms,
+        stable_count: app.resolve_stability_count(app.invite.friend_name_stable_count),
+        emoji: &app.emoji,
+    })
+}
+
 impl ApplicationRuntime {
     pub(crate) fn new(
         config: ResolvedApplicationConfig,

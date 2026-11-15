@@ -280,6 +280,44 @@ pub(super) fn config_route(
     .map_err(internal_error)
 }
 
+/// 全量表情目录落盘路径（相对进程工作目录，与其它 deps 数据一致）。
+fn emoji_catalog_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("deps/data/emoji-catalog.json")
+}
+
+/// POST /emoji/scan：网页端专用，一次性扫描全部页签并落盘全量目录。
+pub(super) fn emoji_scan_route(
+    _body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    state
+        .application
+        .commands
+        .emoji_scan()
+        .map_err(|error| AppError {
+            status: error.status,
+            message: error.message,
+        })
+}
+
+/// GET /emoji/scanned：读取上次扫描落盘的全量目录（只读）。
+pub(super) fn emoji_scanned_route(
+    _query: &[(String, String)],
+    _state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let path = emoji_catalog_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(serde_json::json!({ "ok": true, "catalog": null }).to_string())
+        }
+        Err(error) => Err(internal_error(anyhow!(
+            "读取表情目录失败 {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 /// GET /emoji/catalog：表情能力与 AI 可用表情清单（只读）。
 ///
 /// 面板与 AI 调试用；不触发任何游戏输入。

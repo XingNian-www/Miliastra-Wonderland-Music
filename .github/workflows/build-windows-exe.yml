@@ -15,6 +15,7 @@ on:
     paths:
       - Cargo.toml
       - .github/workflows/build-windows-exe.yml
+      - web/**
 
 permissions:
   contents: write
@@ -363,6 +364,20 @@ jobs:
             Write-Warning '未找到 lld-link，回退默认 MSVC 链接器'
             "lld_link=" >> $env:GITHUB_OUTPUT
           }
+
+      - name: 安装 Node（前端构建）
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建 Vue 面板（web/dist）
+        shell: pwsh
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
 
       - name: 编译 Release EXE
         run: |

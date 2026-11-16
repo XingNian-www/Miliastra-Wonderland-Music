@@ -12,6 +12,7 @@
 !/examples/
 !/scripts/
 !/src/
+!/web/
 !/vendor/
 
 # GitHub 只保留安装/使用类用户文档(docs/ 内,跟随发布)。
@@ -53,3 +54,7 @@
 
 # Linux 版 MNN 仅为本地测试运行时，不入库；Windows 版仍随 vendor/mnn/3.6.0/windows-x64 保留。
 /vendor/mnn/3.6.0/linux-x64/
+
+# 前端工程：依赖与构建产物不入库（CI 构建 web/dist 后由 build.rs 嵌入）
+web/node_modules/
+web/dist/

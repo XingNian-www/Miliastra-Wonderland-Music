@@ -1386,7 +1386,26 @@ fn handle_request(
         return Ok(body_response(
             StatusCode::OK,
             "text/html; charset=utf-8",
+            crate::interfaces::http::panel::index_html().unwrap_or(PAGE).to_string(),
+            cors_headers(&request, &state.config.http.host, state.config.http.port),
+        ));
+    }
+    if request.path == "/legacy" && request.query.is_empty() {
+        return Ok(body_response(
+            StatusCode::OK,
+            "text/html; charset=utf-8",
             PAGE.to_string(),
+            cors_headers(&request, &state.config.http.host, state.config.http.port),
+        ));
+    }
+    if let Some((body, mime)) = crate::interfaces::http::panel::asset(&request.path) {
+        if request.method != "GET" {
+            return Err(method_not_allowed("静态资源仅支持GET请求"));
+        }
+        return Ok(body_response(
+            StatusCode::OK,
+            mime,
+            body.to_string(),
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
@@ -1743,7 +1762,8 @@ fn sanitized_query(query: &[(String, String)]) -> HashMap<String, String> {
 
 fn requires_access_token(config: &crate::config::HttpConfig, path: &str) -> bool {
     !config.access_token.trim().is_empty()
-        && !matches!(path, "/" | "/tools" | "/favicon.ico" | "/health")
+        && !matches!(path, "/" | "/legacy" | "/tools" | "/favicon.ico" | "/health")
+        && !path.starts_with("/assets/")
 }
 
 fn has_valid_access_token(request: &Request, expected: &str) -> bool {

@@ -23,7 +23,7 @@ export default defineConfig({
     port: 5173,
     // 生产环境同源；开发时把面板会调用到的接口前缀全部代理到本机面板端口。
     proxy: {
-      '^/(health|status|monitor|history|clear-history|state|queue|search|searchPlay|searchSource|play|pause|volume|skip-next|skip-prev|player|playback|operator|commands|config|debug|decisions|identity|tasks|emoji|ai|tts|tools|events|legacy)(/|\\?|$)': {
+      '^/(health|status|monitor|history|clear-history|state|queue|search|searchPlay|searchSource|play|pause|volume|skip-next|skip-prev|player|playback|operator|commands|config|debug|decisions|identity|tasks|emoji|ai|tts|tools|events)(/|\\?|$)': {
         target: 'http://127.0.0.1:18888',
         changeOrigin: true,
       },

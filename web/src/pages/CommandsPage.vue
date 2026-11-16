@@ -1,7 +1,7 @@
 <template>
   <div id="page-commands">
     <h1 class="page-title">命令面板</h1>
-    <p class="page-subtitle">聊天命令目录、回复覆盖与权限策略；修改后统一保存</p>
+    <p class="page-subtitle">聊天命令目录、回复覆盖与权限策略；权限与回复分别保存</p>
 
     <div class="command-status">
       <span class="chip" :data-state="catalogState">
@@ -9,6 +9,9 @@
       </span>
       <span class="chip"><span>默认平台</span><em>{{ platformLabel(defaultSourceValue) || '—' }}</em></span>
       <span class="config-field-hint">{{ catalogMeta }}</span>
+      <span v-if="policyDirtyCount || replyDirtyCount" class="config-dirty">
+        未保存：权限 {{ policyDirtyCount }} · 回复 {{ replyDirtyCount }}
+      </span>
       <button class="btn small" :disabled="catalogLoading || saving" @click="refreshCatalog">刷新目录</button>
     </div>
 
@@ -279,7 +282,7 @@
       <span class="config-field-hint">{{ policyNotice || replyNotice }}</span>
     </div>
     <p class="config-field-hint">
-      最低权限按普通用户 → 好友 → 管理员 → 主人逐级包含；来源与权限分开；修改后统一保存。
+      最低权限按普通用户 → 好友 → 管理员 → 主人逐级包含；来源与权限分开；权限与回复各有独立保存按钮。
     </p>
   </div>
 </template>

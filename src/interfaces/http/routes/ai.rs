@@ -137,7 +137,11 @@ pub(super) fn apply_ai_model_overrides(
         config.responses_endpoint = value;
     }
     if let Some(value) = overrides.api_key {
-        config.api_key = value;
+        // 面板回传的 secret 掩码不是真实密钥：视为“沿用已保存值”，
+        // 否则会把 •••••• 当 key 发给上游，得到 500「内部错误」。
+        if value.trim() != crate::config::SECRET_MASK {
+            config.api_key = value;
+        }
     }
     if let Some(value) = overrides.http_proxy {
         config.http_proxy = value;
@@ -199,7 +203,9 @@ pub(super) struct TtsModelsOverrides {
 pub(super) fn tts_catalog_overrides(
     overrides: TtsModelsOverrides,
 ) -> crate::features::tts::TtsCatalogOverrides {
-    let mut api_key = overrides.api_key;
+    let mut api_key = overrides
+        .api_key
+        .filter(|value| value.trim() != crate::config::SECRET_MASK);
     // 换 endpoint 时不能把已保存的 key 发到新地址；明确清空，走 fallback。
     if overrides.endpoint.is_some() && api_key.is_none() {
         api_key = Some(String::new());
@@ -339,11 +345,8 @@ pub(super) fn ai_vision_status_body_route(
         .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
         .load_full()
         .map_err(internal_error)?;
-    let model_override = apply_ai_vision_status_overrides(
-        &mut config.ai,
-        &mut config.ai_chat,
-        overrides,
-    );
+    let model_override =
+        apply_ai_vision_status_overrides(&mut config.ai, &mut config.ai_chat, overrides);
     let model = model_override.unwrap_or_else(|| ai_vision_model(&config.ai_chat, &config.ai));
     let payload = if !config.ai_chat.vision.enabled {
         disabled_vision_status_payload(
@@ -427,12 +430,7 @@ pub(super) fn vision_status_payload(
                 "模型 API 未返回图片能力字段，能力未知",
             ),
         },
-        Err(_) => (
-            false,
-            "unknown",
-            "unknown",
-            "查询模型能力失败，能力未知",
-        ),
+        Err(_) => (false, "unknown", "unknown", "查询模型能力失败，能力未知"),
     };
     let capture_scope = match capture_scope {
         crate::features::ai_chat::VisionCaptureScope::PrimaryScreen => "primary_screen",
@@ -460,7 +458,10 @@ pub(super) fn model_list_error(error: ModelListError) -> AppError {
             status: 400,
             message,
         },
-        ModelListError::Request(message) => internal_error(anyhow!(message)),
+        ModelListError::Request(message) => AppError {
+            status: 400,
+            message: format!("获取模型列表失败：{message}"),
+        },
     }
 }
 
@@ -604,4 +605,55 @@ pub(super) fn ai_trace_entry_route(
         status: 404,
         message: format!("没有 id={id} 的 AI 请求记录（可能已滚出内存）"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_overrides_treat_secret_mask_as_unchanged() {
+        let mut config = crate::config::ai::AiConfig::default();
+        config.api_key = "saved-real-key".into();
+        apply_ai_model_overrides(
+            &mut config,
+            AiModelsOverrides {
+                provider: Some("deepseek".into()),
+                endpoint: Some(String::new()),
+                responses_endpoint: Some(String::new()),
+                api_key: Some(crate::config::SECRET_MASK.into()),
+                http_proxy: Some(String::new()),
+                wire_api: None,
+            },
+        );
+        assert_eq!(config.api_key, "saved-real-key", "掩码不能覆盖已保存密钥");
+        assert_eq!(config.provider, "deepseek");
+    }
+
+    #[test]
+    fn model_overrides_apply_real_key() {
+        let mut config = crate::config::ai::AiConfig::default();
+        config.api_key = "old".into();
+        apply_ai_model_overrides(
+            &mut config,
+            AiModelsOverrides {
+                provider: None,
+                endpoint: None,
+                responses_endpoint: None,
+                api_key: Some("new-key".into()),
+                http_proxy: None,
+                wire_api: None,
+            },
+        );
+        assert_eq!(config.api_key, "new-key");
+    }
+
+    #[test]
+    fn tts_overrides_drop_secret_mask() {
+        let overrides = tts_catalog_overrides(TtsModelsOverrides {
+            endpoint: None,
+            api_key: Some(crate::config::SECRET_MASK.into()),
+        });
+        assert!(overrides.api_key.is_none(), "掩码不应作为 TTS 查询密钥");
+    }
 }

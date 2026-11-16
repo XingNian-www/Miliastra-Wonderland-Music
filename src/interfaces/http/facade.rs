@@ -1268,9 +1268,7 @@ impl crate::interfaces::http::HttpDebugPort for ApplicationHttpDebugFacade {
         Ok(())
     }
     fn window_available(&self) -> Result<bool, HttpCommandError> {
-        if !self.enabled() {
-            return Err(HttpCommandError::bad_request("请先启用调试模式"));
-        }
+        // 只读能力：可用性检查不会向游戏发输入，不要求调试模式。
         self.runtime
             .submit_external(crate::debug_sandbox_runner::LiveAvailabilityRoutine)
             .map_err(|e| HttpCommandError::internal(format!("{e:#}")))?
@@ -1279,9 +1277,7 @@ impl crate::interfaces::http::HttpDebugPort for ApplicationHttpDebugFacade {
             .map_err(|e| HttpCommandError::internal(format!("{e:#}")))
     }
     fn ui_state_detail(&self) -> Result<String, HttpCommandError> {
-        if !self.enabled() {
-            return Err(HttpCommandError::bad_request("请先启用调试模式"));
-        }
+        // 只读能力：界面判定只观察，不要求调试模式。
         let detail = self
             .runtime
             .submit_external(UiStateDetailRoutine)
@@ -1293,9 +1289,7 @@ impl crate::interfaces::http::HttpDebugPort for ApplicationHttpDebugFacade {
     }
 
     fn capture(&self) -> Result<Arc<image::DynamicImage>, HttpCommandError> {
-        if !self.enabled() {
-            return Err(HttpCommandError::bad_request("请先启用调试模式"));
-        }
+        // 只读能力：截图不改游戏状态，不要求调试模式。
         let _g = self
             .operation
             .lock()

@@ -3554,7 +3554,10 @@ fn command_panel_explains_default_song_source_semantics() {
     );
     // 平台选项必须来自接口 catalog.songPlatforms，不能硬编码。
     assert!(page.contains("songPlatforms"), "默认平台选项必须由接口提供");
-    assert!(!page.contains("<option value=\"bilibili\""), "不能硬编码 B站选项");
+    assert!(
+        !page.contains("<option value=\"bilibili\""),
+        "不能硬编码 B站选项"
+    );
 }
 
 #[test]
@@ -4175,7 +4178,9 @@ fn ai_vision_status_route_registered_and_shape_degrades_without_guessing() {
         "plain-model",
         &scope,
         true,
-        Err(ModelListError::Request("secret-key must not leak".to_string())),
+        Err(ModelListError::Request(
+            "secret-key must not leak".to_string(),
+        )),
     );
     assert_eq!(failed["supports_image"], false);
     assert_eq!(failed["source"], "unknown");
@@ -4239,7 +4244,10 @@ fn tts_models_route_registered_and_overrides_distinguish_missing_from_empty() {
     let endpoint_only: TtsModelsOverrides =
         serde_json::from_str(r#"{"endpoint":"https://other.example"}"#).expect("endpoint");
     let endpoint_only = tts_catalog_overrides(endpoint_only);
-    assert_eq!(endpoint_only.endpoint.as_deref(), Some("https://other.example"));
+    assert_eq!(
+        endpoint_only.endpoint.as_deref(),
+        Some("https://other.example")
+    );
     assert_eq!(endpoint_only.api_key.as_deref(), Some(""));
 
     let state = test_state();
@@ -4253,8 +4261,8 @@ fn tts_models_route_registered_and_overrides_distinguish_missing_from_empty() {
 
 #[test]
 fn tts_catalog_errors_map_to_actionable_statuses() {
-    use crate::features::tts::TtsCatalogError;
     use super::ai_routes::tts_catalog_error;
+    use crate::features::tts::TtsCatalogError;
 
     let auth = tts_catalog_error(TtsCatalogError::Auth("bad key".to_string()));
     assert_eq!(auth.status, 401);
@@ -4297,10 +4305,15 @@ fn model_list_config_errors_are_client_errors() {
     assert_eq!(error.status, 400);
     assert!(error.message.contains("ai.endpoint"));
 
-    // 上游/网络失败不能把内部细节回给浏览器。
+    // 上游/网络失败要给用户可读的 4xx（模型列表是用户主动触发，500「内部错误」
+    // 只会让人以为服务坏了），但消息只带固定前缀与 provider 返回的简短原因。
     let error = model_list_error(ModelListError::Request("connect timeout".to_string()));
-    assert_eq!(error.status, 500);
-    assert_eq!(error.message, "内部错误");
+    assert_eq!(error.status, 400);
+    assert!(
+        error.message.contains("获取模型列表失败"),
+        "{}",
+        error.message
+    );
 }
 
 #[test]

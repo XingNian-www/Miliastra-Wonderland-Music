@@ -10,7 +10,9 @@
           <span>未保存</span>
           <em :class="{ 'config-dirty': dirtyCount > 0 }">{{ dirtyCount }} 段</em>
         </span>
-        <span class="config-field-hint" style="margin-left: auto">上次保存：{{ savedAt || '—' }}</span>
+        <span class="config-field-hint" style="margin-left: auto">
+          隐藏 identity / ai / ai_chat / tts / command_access（各有独立页）{{ savedAt ? ' · 本次保存 ' + savedAt : '' }}
+        </span>
       </div>
 
       <div class="config-layout">
@@ -252,7 +254,7 @@ import {
   toast,
 } from '../store.js'
 import FieldControl from '../components/FieldControl.vue'
-import { f32Text } from '../util/format.js'
+import { f32Text, friendlyError } from '../util/format.js'
 import FieldError from '../components/FieldError.vue'
 import EmojiCatalog from '../components/EmojiCatalog.vue'
 
@@ -1019,7 +1021,7 @@ onMounted(async () => {
       selectInitialSection()
     }
   } catch (error) {
-    if (!handleAuth(error)) loadError.value = `载入配置失败：${error.message || error}`
+    if (!handleAuth(error)) loadError.value = `载入配置失败：${friendlyError(error)}`
   } finally {
     loading.value = false
   }

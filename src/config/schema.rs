@@ -79,7 +79,12 @@ pub enum FieldKind {
 /// （`get_path` 找不到即跳过）天然兼容，无需特殊处理。
 ///
 /// `store.rs` 的 `SECRET_PATHS` 引用本常量，禁止在别处重复定义。
-pub const SECRET_PATHS: &[&str] = &["http.access_token", "ai.api_key", "chat_source.token", "tts.api_key"];
+pub const SECRET_PATHS: &[&str] = &[
+    "http.access_token",
+    "ai.api_key",
+    "chat_source.token",
+    "tts.api_key",
+];
 
 /// 配置字段 schema：路径、中文名、类型、生效级别、来源与提示。
 #[derive(Clone, Debug)]
@@ -3351,14 +3356,18 @@ pub fn normalize_default_numbers(value: &mut Value) {
             if number.is_i64() || number.is_u64() {
                 return;
             }
-            let Some(current) = number.as_f64() else { return };
+            let Some(current) = number.as_f64() else {
+                return;
+            };
             let as_f32 = current as f32;
             if !as_f32.is_finite() {
                 return;
             }
             for precision in 1..=9 {
                 let candidate = format!("{as_f32:.precision$}", precision = precision);
-                let Ok(parsed) = candidate.parse::<f64>() else { continue };
+                let Ok(parsed) = candidate.parse::<f64>() else {
+                    continue;
+                };
                 if parsed as f32 == as_f32 {
                     if parsed.to_bits() != current.to_bits() {
                         if let Some(replacement) = serde_json::Number::from_f64(parsed) {
@@ -4025,7 +4034,11 @@ mod tests {
     fn default_numbers_use_shortest_f32_representation() {
         let json = default_config_json();
         let value = &json["ocr"]["min_confidence"];
-        assert_eq!(value.as_f64().unwrap(), 0.9, "0.8999999761581421 应显示为 0.9");
+        assert_eq!(
+            value.as_f64().unwrap(),
+            0.9,
+            "0.8999999761581421 应显示为 0.9"
+        );
         let value = &json["startup"]["stable_changed_ratio_threshold"];
         assert_eq!(value.as_f64().unwrap(), 0.01);
         let value = &json["custom_workflows"]["default_threshold"];

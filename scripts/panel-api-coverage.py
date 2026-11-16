@@ -24,7 +24,7 @@ def frontend_calls() -> set[str]:
     used: set[str] = set()
     for path in list(WEB.rglob("*.vue")) + list(WEB.rglob("*.js")):
         text = path.read_text(encoding="utf-8")
-        for match in re.findall(r"[`'\"](/[a-z][a-z0-9_/-]*)[`'\"?#$]", text):
+        for match in re.findall(r"[`'\"](/[A-Za-z][A-Za-z0-9_/-]*)[`'\"?#$}]", text):
             used.add(match)
     return used
 
@@ -32,7 +32,19 @@ def frontend_calls() -> set[str]:
 def main() -> int:
     routes = rust_routes()
     used = frontend_calls()
-    missing = [route for route in routes if route not in used and not route.startswith("/assets/") and route != "/legacy"]
+    # 独立工具页（/tools）内的工具接口由 tools.html 调用；Vue 侧通过 iframe 进入。
+    tools_page_loaded = "/tools" in used
+    covered_by_tools = tools_page_loaded
+
+    def covered(route: str) -> bool:
+        if route in used:
+            return True
+        if covered_by_tools and route.startswith("/tools/"):
+            return True
+        # 协议特判的二进制/静态入口，不在路由表匹配范围内。
+        return route in {"/assets", "/legacy"}
+
+    missing = [route for route in routes if not covered(route)]
     report = {
         "routes": len(routes),
         "covered": len(routes) - len(missing),

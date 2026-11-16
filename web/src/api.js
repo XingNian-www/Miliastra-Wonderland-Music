@@ -54,7 +54,7 @@ export async function requestJson(path, body) {
   try {
     return JSON.parse(text)
   } catch {
-    return text
+    throw new Error(`响应不是 JSON（${path}）：${text.slice(0, 120)}`)
   }
 }
 
@@ -63,6 +63,6 @@ export async function getJson(path) {
   try {
     return JSON.parse(text)
   } catch {
-    return text
+    throw new Error(`响应不是 JSON（${path}）：${text.slice(0, 120)}`)
   }
 }

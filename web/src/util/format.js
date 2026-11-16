@@ -52,3 +52,45 @@ export function sameValue(a, b) {
   }
   return false
 }
+
+const PLAYER_STATE_LABELS = {
+  playing: '播放中',
+  paused: '已暂停',
+  stopped: '已停止',
+  idle: '空闲',
+  requested_song_playing: '点歌播放中',
+  requested_song_queued: '点歌排队中',
+  external_playing: '外部播放中',
+  buffering: '缓冲中',
+  failed: '失败',
+}
+
+export function playerStateLabel(value) {
+  const raw = String(value == null ? '' : value)
+  return PLAYER_STATE_LABELS[raw] || raw || '未知'
+}
+
+// 后端把 secret 字段显示成掩码；回传这些值会被当成真实密钥。
+export const SECRET_MASK = '••••••'
+
+export function stripSecretMask(value) {
+  if (Array.isArray(value)) return value.map(stripSecretMask)
+  if (value && typeof value === 'object') {
+    const result = {}
+    for (const [key, item] of Object.entries(value)) {
+      if (typeof item === 'string' && item === SECRET_MASK) continue
+      result[key] = stripSecretMask(item)
+    }
+    return result
+  }
+  return value
+}
+
+export function friendlyError(error) {
+  const message = String(error && error.message ? error.message : error || '')
+  if (!message) return '未知错误'
+  if (/Failed to fetch|NetworkError|Load failed|ERR_CONNECTION|ERR_NETWORK/i.test(message)) {
+    return '无法连接后端：请检查面板地址与程序是否在运行'
+  }
+  return message
+}

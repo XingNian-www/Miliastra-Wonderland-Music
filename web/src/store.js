@@ -1,5 +1,6 @@
 import { reactive } from 'vue'
-import { AuthError, getJson, readToken, requestJson, writeToken } from './api.js'
+import { AuthError, clearToken, getJson, readToken, request, requestJson, writeToken } from './api.js'
+import { friendlyError } from './util/format.js'
 
 export const state = reactive({
   token: readToken(),
@@ -15,6 +16,9 @@ export const state = reactive({
   health: null,
   lastRefresh: '',
   autoRefresh: true,
+  needsToken: false,
+  monitor: null,
+  connectionError: '',
 })
 
 export function toast(text, kind = '') {
@@ -42,12 +46,17 @@ export function clearDirty() {
 export function setToken(token) {
   writeToken(token)
   state.token = readToken()
+  state.needsToken = false
+  state.autoRefresh = true
 }
 
 export function handleAuth(error) {
   if (error instanceof AuthError) {
+    clearToken()
     state.token = ''
-    toast('访问令牌无效或已过期，请到「设置」页填入令牌', 'err')
+    state.needsToken = true
+    state.autoRefresh = false
+    toast('访问令牌无效或已过期，已暂停自动刷新；请到「设置」页填入令牌', 'err')
     return true
   }
   return false
@@ -70,18 +79,41 @@ export async function loadConfig(force = false) {
   }
 }
 
-export async function loadStatus() {
+let lastStatusAt = 0
+let statusInflight = null
+
+export async function loadStatus(force = false) {
+  const now = Date.now()
+  if (!force && now - lastStatusAt < 2000) return
+  if (statusInflight) return statusInflight
+  statusInflight = (async () => {
+  lastStatusAt = Date.now()
   try {
-    state.health = await getJson('/health')
+    state.health = (await request('/health')) || null
   } catch (error) {
-    if (!handleAuth(error)) state.health = null
+    if (!handleAuth(error)) {
+      state.health = null
+      state.connectionError = friendlyError(error)
+    }
   }
   try {
     state.player = await getJson('/status')
+    state.needsToken = false
   } catch (error) {
     if (!handleAuth(error)) state.player = null
   }
+  try {
+    state.monitor = await getJson('/monitor')
+    state.connectionError = ''
+  } catch (error) {
+    if (!handleAuth(error)) {
+      state.monitor = null
+      state.connectionError = friendlyError(error)
+    }
+  }
   state.lastRefresh = new Date().toLocaleTimeString()
+  })().finally(() => { statusInflight = null })
+  return statusInflight
 }
 
 export async function saveSections(sections, after) {

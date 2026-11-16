@@ -33,7 +33,7 @@
 
 <script setup>
 import { onMounted, ref } from 'vue'
-import { clearToken, readToken } from '../api.js'
+import { clearToken, readToken, request } from '../api.js'
 import { loadStatus, setToken, state } from '../store.js'
 
 const tokenDraft = ref('')
@@ -52,16 +52,20 @@ function applyTheme() {
 
 async function saveToken() {
   setToken(tokenDraft.value)
-  tokenMessage.value = '已保存，正在测试…'
+  tokenMessage.value = '已保存，正在验证令牌…'
   try {
-    await loadStatus()
-    tokenMessage.value = '连接正常'
+    // /health 不需要 token；必须用一个受保护接口验证令牌是否真的有效。
+    await request('/config/schema')
+    tokenMessage.value = '令牌有效，已恢复自动刷新'
+    state.autoRefresh = true
+    await loadStatus(true)
   } catch (error) {
-    tokenMessage.value = `连接失败：${error.message || error}`
+    tokenMessage.value = `令牌验证失败：${error.message || error}`
   }
 }
 
 function clear() {
+  if (!window.confirm('清除本机保存的访问令牌？清除后需要重新填写。')) return
   clearToken()
   state.token = ''
   tokenDraft.value = ''

@@ -50,7 +50,7 @@
 
     <div class="config-group-card">
       <div class="config-group-head">
-        模板路径 <code>templates</code>
+        模板路径 <code>templates</code>（路径中的 / 或 \ 都会在运行时解析）
         <span class="config-domain-count">{{ templateEntries.length }}</span>
       </div>
       <p class="config-field-hint">

@@ -22,6 +22,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { requestJson } from '../api.js'
+import { stripSecretMask } from '../util/format.js'
 import { toast } from '../store.js'
 import FieldControl from './FieldControl.vue'
 
@@ -47,7 +48,7 @@ async function fetchModels() {
   loading.value = true
   error.value = ''
   try {
-    const data = await requestJson('/ai/models', props.overrides || {})
+    const data = await requestJson('/ai/models', stripSecretMask(props.overrides || {}))
     const list = Array.isArray(data && data.models) ? data.models.filter((item) => typeof item === 'string' && item) : []
     if (!list.length) throw new Error('服务端未返回模型')
     models.value = list

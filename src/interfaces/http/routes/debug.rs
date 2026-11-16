@@ -1063,6 +1063,8 @@ pub(super) fn debug_state_route(
         // 调试模式开启时会拦下游戏内输入：这里由**端口自身的开关**派生，
         // 不读进程级全局（全局会被并行测试互相污染，得出的值不可复现）。
         "gameInputAllowed": !debug_port(state)?.enabled(),
+        // 只读观察开关与状态：截图/界面判定等接口不需要调试模式也能用。
+        "readOnly": crate::debug_read_only::observer().state_snapshot(),
         "commands": ATOMIC_COMMAND_NAMES,
     })
     .to_string())

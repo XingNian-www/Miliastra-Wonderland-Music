@@ -17,7 +17,7 @@
 
       <div class="config-layout">
         <!-- 左侧段导航：按 domain 分组 + 搜索 -->
-        <aside class="config-sidebar" aria-label="配置段导航">
+        <aside class="config-sidebar" aria-label="配置段导航" title="窄屏可左右滑动查看更多配置段">
           <input
             v-model="searchText"
             type="text"

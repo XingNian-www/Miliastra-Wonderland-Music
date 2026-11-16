@@ -247,7 +247,9 @@ onMounted(load)
 .ai-memory-section { margin-top: var(--sp-3); }
 .ai-memory-section h3 { margin: 0 0 var(--sp-2); font-size: var(--fs-title); color: var(--text-1); }
 .ai-memory-summary { background: var(--bg-raised); border-radius: var(--radius-m); padding: var(--sp-2) var(--sp-3); margin: var(--sp-2) 0; }
-.ai-memory-summary pre, .ai-memory-lines { white-space: pre-wrap; word-break: break-word; margin: var(--sp-1) 0 0; font-family: var(--font-mono); font-size: var(--fs-tiny); line-height: var(--lh-tiny); max-height: 220px; overflow: auto; }
+.ai-memory-summary pre, .ai-memory-lines {
+  max-height: 320px;
+  overflow-y: auto; white-space: pre-wrap; word-break: break-word; margin: var(--sp-1) 0 0; font-family: var(--font-mono); font-size: var(--fs-tiny); line-height: var(--lh-tiny); max-height: 220px; overflow: auto; }
 .ai-memory-summary-head { display: flex; gap: var(--sp-2); justify-content: space-between; align-items: baseline; flex-wrap: wrap; }
 .ai-memory-lines { background: var(--bg-raised); border-radius: var(--radius-m); padding: var(--sp-2) var(--sp-3); }
 .ai-memory-line { padding: 3px 0; border-bottom: 1px solid var(--sep-2); }

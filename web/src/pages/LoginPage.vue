@@ -216,10 +216,15 @@ function refreshInfo(item) {
   if (item.lastRefreshError) parts.push(item.lastRefreshError)
   return parts.join(' · ')
 }
+let lastReport = { at: 0, text: '' }
 function report(error) {
   if (handleAuth(error)) return false
-  actionText.value = `错误：${error?.message || error}`
-  toast(actionText.value, 'err')
+  const text = `错误：${error?.message || error}`
+  const now = Date.now()
+  if (text === lastReport.text && now - lastReport.at < 30000) return false
+  lastReport = { at: now, text }
+  actionText.value = text
+  toast(text, 'err')
   return false
 }
 async function loadProviders() {
@@ -233,8 +238,9 @@ async function loadProviders() {
 async function loadKugouStatus() {
   try {
     kugou.value = await getJson('/player/kugou/status')
-  } catch {
+  } catch (error) {
     kugou.value = null
+    report(error)
   }
 }
 async function loadLoginStatus() {
@@ -249,8 +255,9 @@ async function loadAccounts() {
   await Promise.all(['qqmusic', 'netease', 'kugou', 'bilibili'].map(async (provider) => {
     try {
       next[provider] = await getJson(`/player/account/status?provider=${encodeURIComponent(provider)}`)
-    } catch {
+    } catch (error) {
       next[provider] = null
+      report(error)
     }
   }))
   accounts.value = next

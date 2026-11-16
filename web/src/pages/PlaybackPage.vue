@@ -165,53 +165,6 @@
       </div>
     </section>
 
-    <section class="panel playback-cache-tracks-panel">
-      <div class="panel-head">
-        <h2>磁盘缓存歌曲</h2>
-        <small>{{ cacheTotal }} 首</small>
-      </div>
-      <div class="panel-body">
-        <select v-model="cacheSort" aria-label="缓存歌曲排序" @change="resetCachePage">
-          <option value="last_used:desc">最近使用（新→旧）</option>
-          <option value="last_used:asc">最近使用（旧→新）</option>
-          <option value="requested_play_count:desc">点歌次数（多→少）</option>
-          <option value="play_count:desc">播放次数（多→少）</option>
-          <option value="cache_hit_count:desc">缓存命中（多→少）</option>
-          <option value="bytes:desc">文件大小（大→小）</option>
-        </select>
-        <div class="cache-track-list">
-          <div
-            v-for="(track, index) in cacheTracks"
-            :key="(track.source || 'unknown') + '/' + (track.id || index)"
-            class="cache-track-item"
-            :class="{ orphan: !track.source }"
-          >
-            <div>
-              <b>{{ cacheTitle(track) }}</b>
-              <span class="cache-track-source">{{ sourceLabel(track.source) }}</span>
-              <div class="controls" style="margin-top:6px">
-                <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="playCached(track)">播放</button>
-                <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="invalidateCached(track)">仅清缓存</button>
-                <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="deleteCached(track)">删除歌曲</button>
-                <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="resetTrackStats(track)">清零统计</button>
-              </div>
-            </div>
-            <div class="cache-track-meta">
-              {{ formatBytes(track.bytes) }} · 最近使用 {{ formatDate(track.lastUsedAtMs) }} · {{ track.complete ? '已缓存' : '未完整' }}
-              · 播放 {{ track.playCount ?? 0 }}（点歌 {{ track.requestedPlayCount ?? 0 }} / 池 {{ track.poolPlayCount ?? 0 }}）
-              · 命中 {{ track.cacheHitCount ?? 0 }} · 失败 {{ track.failureCount ?? 0 }}
-              <template v-if="track.lastFailureCode"> · 最近失败 {{ track.lastFailureCode }}</template>
-            </div>
-          </div>
-          <div v-if="!cacheTracks.length" class="empty-hint">暂无磁盘缓存歌曲</div>
-        </div>
-        <div class="controls">
-          <button class="btn ghost" :disabled="busy || cacheOffset <= 0" @click="changeCachePage(-1)">上一页</button>
-          <button class="btn ghost" :disabled="busy || cacheOffset + cacheLimit >= cacheTotal" @click="changeCachePage(1)">下一页</button>
-        </div>
-      </div>
-    </section>
-
     <section class="panel playback-history-panel">
       <div class="panel-head">
         <h2>播放历史</h2>
@@ -274,6 +227,53 @@
         <div class="config-field-hint">删除单曲请在上方待播队列逐条操作；清空需要确认。</div>
       </div>
     </section>
+    <section class="panel playback-cache-tracks-panel">
+      <div class="panel-head">
+        <h2>磁盘缓存歌曲</h2>
+        <small>{{ cacheTotal }} 首</small>
+      </div>
+      <div class="panel-body">
+        <select v-model="cacheSort" aria-label="缓存歌曲排序" @change="resetCachePage">
+          <option value="last_used:desc">最近使用（新→旧）</option>
+          <option value="last_used:asc">最近使用（旧→新）</option>
+          <option value="requested_play_count:desc">点歌次数（多→少）</option>
+          <option value="play_count:desc">播放次数（多→少）</option>
+          <option value="cache_hit_count:desc">缓存命中（多→少）</option>
+          <option value="bytes:desc">文件大小（大→小）</option>
+        </select>
+        <div class="cache-track-list">
+          <div
+            v-for="(track, index) in cacheTracks"
+            :key="(track.source || 'unknown') + '/' + (track.id || index)"
+            class="cache-track-item"
+            :class="{ orphan: !track.source }"
+          >
+            <div>
+              <b>{{ cacheTitle(track) }}</b>
+              <span class="cache-track-source">{{ sourceLabel(track.source) }}</span>
+              <div class="controls" style="margin-top:6px">
+                <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="playCached(track)">播放</button>
+                <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="invalidateCached(track)">仅清缓存</button>
+                <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="deleteCached(track)">删除歌曲</button>
+                <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="resetTrackStats(track)">清零统计</button>
+              </div>
+            </div>
+            <div class="cache-track-meta">
+              {{ formatBytes(track.bytes) }} · 最近使用 {{ formatDate(track.lastUsedAtMs) }} · {{ track.complete ? '已缓存' : '未完整' }}
+              · 播放 {{ track.playCount ?? 0 }}（点歌 {{ track.requestedPlayCount ?? 0 }} / 池 {{ track.poolPlayCount ?? 0 }}）
+              · 命中 {{ track.cacheHitCount ?? 0 }} · 失败 {{ track.failureCount ?? 0 }}
+              <template v-if="track.lastFailureCode"> · 最近失败 {{ track.lastFailureCode }}</template>
+            </div>
+          </div>
+          <div v-if="!cacheTracks.length" class="empty-hint">暂无磁盘缓存歌曲</div>
+        </div>
+        <div class="controls">
+          <button class="btn ghost" :disabled="busy || cacheOffset <= 0" @click="changeCachePage(-1)">上一页</button>
+          <button class="btn ghost" :disabled="busy || cacheOffset + cacheLimit >= cacheTotal" @click="changeCachePage(1)">下一页</button>
+        </div>
+      </div>
+    </section>
+
   </div>
 </template>
 
@@ -403,10 +403,15 @@ function candidateKey(item, index) {
   return key.provider && key.id ? `${key.provider}/${key.id}` : `${item.text || 'candidate'}-${index}`
 }
 
+let lastReport = { at: 0, text: '' }
 function report(error) {
   if (handleAuth(error)) return
-  actionText.value = `错误：${error?.message || error}`
-  toast(actionText.value, 'err')
+  const text = `错误：${error?.message || error}`
+  const now = Date.now()
+  if (text === lastReport.text && now - lastReport.at < 30000) return
+  lastReport = { at: now, text }
+  actionText.value = text
+  toast(text, 'err')
 }
 function setBusy(value) {
   busy.value = value
@@ -452,7 +457,9 @@ async function loadPlayMode() {
   try {
     const value = await getJson('/playback/mode')
     if (value?.mode) playMode.value = value.mode
-  } catch {}
+  } catch (error) {
+    report(error)
+  }
 }
 async function loadInsights() {
   try {

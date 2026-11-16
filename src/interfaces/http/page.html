@@ -599,6 +599,12 @@ html[data-theme=light] .theme-toggle .moon{display:none}
 .emoji-labels{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:6px;max-height:230px;overflow:auto;padding:2px 4px 2px 2px}
 .emoji-search{display:flex;align-items:center;gap:var(--sp-2);margin-top:var(--sp-2)}
 .emoji-search input{flex:1;min-width:160px}
+.emoji-allow-chips{display:flex;flex-wrap:wrap;gap:6px;max-height:180px;overflow:auto;padding:2px}
+.emoji-allow-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 6px 2px 8px;border:1px solid var(--sep-1);border-radius:999px;background:var(--bg-1);font-size:var(--fs-tiny)}
+.emoji-allow-chip code{font-family:var(--font-mono);color:var(--text-2)}
+.emoji-allow-chip button{border:0;background:transparent;color:var(--danger);cursor:pointer;font-size:var(--fs-item);line-height:1;padding:0 2px}
+.emoji-allow-add{display:flex;gap:var(--sp-2);margin-top:var(--sp-2)}
+.emoji-allow-add input{flex:1;min-width:160px}
 .emoji-label{display:inline-flex;align-items:center;gap:4px;padding:3px var(--sp-2);border:1px solid var(--sep-1);border-radius:999px;background:var(--bg-1);font-size:var(--fs-tiny);cursor:pointer}
 .emoji-label input{margin:0}
 .emoji-label.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
@@ -4931,6 +4937,9 @@ function configControlHtml(field,value,sectionName,idPrefix){
     const options=values.map(item=>'<option value="'+esc(item.value)+'"'+(String(value)===item.value?' selected':'')+'>'+esc(item.label)+'</option>').join('')
     return '<select id="'+id+'" data-cfg="'+path+'"'+disabledAttr+parentAttr+'>'+placeholder+options+'</select>'
   }
+  if(kind==='stringArray'&&path==='emoji.ai_allowed'){
+    return emojiAllowlistEditor(path,value,id)
+  }
   if(kind==='stringArray'){
     const items=Array.isArray(value)?value:[]
     const rows=items.map(item=>'<div class="config-string-row" data-cfg-row><input type="text" data-cfg="'+path+'" data-cfg-array="1" value="'+esc(String(item))+'"><button type="button" class="btn small ghost" onclick="configArrayRemove(this)">删除</button></div>').join('')
@@ -5455,6 +5464,37 @@ function onConfigFormChange(e){
   }
   el.dataset.cfgTouched='1'
   markConfigDirty(String(path).split('.')[0])
+}
+// 表情 AI 白名单专用编辑器：已选表情用紧凑 chips 展示，避免几十行竖排输入框。
+function emojiAllowlistEditor(path,value,id){
+  const items=Array.isArray(value)?value:[]
+  const chips=items.map(item=>'<span class="emoji-allow-chip"><code>'+esc(String(item))+'</code><input type="hidden" data-cfg="'+esc(path)+'" data-cfg-array="1" value="'+esc(String(item))+'"><button type="button" title="移除" onclick="emojiAllowRemove(this)">×</button></span>').join('')
+  return '<div class="config-array" id="'+esc(id)+'" style="max-width:100%">'
+    +'<div class="emoji-allow-chips">'+(chips||'<span class="config-field-hint">还没有选择表情，可在下方「全量表情目录」勾选后加入</span>')+'</div>'
+    +'<div class="emoji-allow-add"><input type="text" id="'+esc(id)+'-new" placeholder="手动添加：页签序号|表情文字，如 2|交给我吧"><button type="button" class="btn small" onclick="emojiAllowAdd('+esc(JSON.stringify(path))+')">添加</button></div>'
+    +'</div>'
+}
+function emojiAllowAdd(path){
+  const id=configControlId(path)
+  const box=document.getElementById(id)
+  const input=document.getElementById(id+'-new')
+  if(!box||!input)return
+  const value=input.value.trim()
+  if(!value)return
+  const chips=box.querySelector('.emoji-allow-chips')
+  if(chips){const hint=chips.querySelector('.config-field-hint');if(hint)hint.remove()}
+  const chip=document.createElement('span')
+  chip.className='emoji-allow-chip'
+  chip.innerHTML='<code>'+esc(value)+'</code><input type="hidden" data-cfg="'+esc(path)+'" data-cfg-array="1" value="'+esc(value)+'"><button type="button" title="移除" onclick="emojiAllowRemove(this)">×</button>'
+  chips.appendChild(chip)
+  input.value=''
+  markConfigDirty('emoji')
+}
+function emojiAllowRemove(button){
+  const chip=button.closest('.emoji-allow-chip')
+  if(!chip)return
+  chip.remove()
+  markConfigDirty('emoji')
 }
 function configArrayAdd(path){
   const box=document.getElementById(configControlId(path))

@@ -2537,6 +2537,13 @@ fn field_group(section: &str, path: &str) -> Option<&'static str> {
             | "stable_frame_count"
             | "settle_ms",
         ) => Some("稳定判定"),
+        // AI 聊天：协议块 / 工具描述 / 长文本提示词各自成节。
+        ("ai_chat", "protocols") => Some("正文协议"),
+        ("ai_chat", "tool_descriptions") => Some("工具描述"),
+        ("ai_chat", "tool_prompts") => Some("工具提示词"),
+        ("ai_chat", "vision") => Some("识图"),
+        ("ai_chat", "ai_reply") => Some("AI 回复"),
+        ("ai_chat", "summary_prompt" | "vision_prompt") => Some("长文本提示词"),
         _ => None,
     }
 }

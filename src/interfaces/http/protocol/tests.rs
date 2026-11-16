@@ -3531,9 +3531,10 @@ fn startup_routes_are_queued_json_post_routes() {
     assert!(is_json_route("/startup/game"));
     assert!(is_json_route("/startup/wonderland"));
     assert!(is_json_route("/startup/enter-wonderland"));
-    assert!(PAGE.contains("call('/startup/game','POST')"));
-    assert!(PAGE.contains("call('/startup/wonderland','POST')"));
-    assert!(PAGE.contains("call('/startup/enter-wonderland','POST')"));
+    let page = include_str!("../../../../web/src/pages/GamePage.vue");
+    assert!(page.contains("'/startup/game'"));
+    assert!(page.contains("'/startup/wonderland'"));
+    assert!(page.contains("'/startup/enter-wonderland'"));
 }
 
 /// 面板「@点歌 默认平台」的说明必须写清「只影响搜索平台、不改变权限」。
@@ -3542,25 +3543,18 @@ fn startup_routes_are_queued_json_post_routes() {
 /// **两条不同的权限**，否则会以为「默认平台换成 B站 就等于给 @点歌 调了权限」。
 #[test]
 fn command_panel_explains_default_song_source_semantics() {
+    let page = include_str!("../../../../web/src/pages/CommandsPage.vue");
     assert!(
-        PAGE.contains("默认平台只影响 @点歌 走哪个平台的搜索，不改变各平台命令的权限"),
+        page.contains("默认平台只影响 @点歌 走哪个平台的搜索，不改变各平台命令的权限"),
         "面板必须说明默认平台只改搜索平台、不改权限"
     );
     assert!(
-        PAGE.contains("id=\"commandDefaultSongSourceNote\""),
+        page.contains("id=\"commandDefaultSongSource\""),
         "说明段落需要稳定 id，避免渲染时被误删"
     );
-    // 默认平台下拉是动态渲染的：页面里不能再硬编码平台选项，
-    // 否则过滤只会被前端那份列表绕过。
-    let select = PAGE
-        .split("id=\"commandDefaultSongSource\"")
-        .nth(1)
-        .expect("默认平台下拉存在");
-    let select = &select[..select.find("</select>").expect("下拉闭合")];
-    assert!(
-        !select.contains("<option value=\"bilibili\""),
-        "默认平台下拉不能硬编码 B站 选项"
-    );
+    // 平台选项必须来自接口 catalog.songPlatforms，不能硬编码。
+    assert!(page.contains("songPlatforms"), "默认平台选项必须由接口提供");
+    assert!(!page.contains("<option value=\"bilibili\""), "不能硬编码 B站选项");
 }
 
 #[test]

@@ -109,7 +109,6 @@ use uuid::Uuid;
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
-const PAGE: &str = include_str!("page.html");
 const TOOLS_PAGE: &str = include_str!("tools.html");
 
 type RouteHandler =
@@ -1383,18 +1382,16 @@ fn handle_request(
     enforce_method(&request, state)?;
 
     if request.path == "/" && request.query.is_empty() {
+        let Some(index) = crate::interfaces::http::panel::index_html() else {
+            return Err(AppError {
+                status: 503,
+                message: "面板未构建：请在 web/ 下执行 npm run build 后重新编译".to_string(),
+            });
+        };
         return Ok(body_response(
             StatusCode::OK,
             "text/html; charset=utf-8",
-            crate::interfaces::http::panel::index_html().unwrap_or(PAGE).to_string(),
-            cors_headers(&request, &state.config.http.host, state.config.http.port),
-        ));
-    }
-    if request.path == "/legacy" && request.query.is_empty() {
-        return Ok(body_response(
-            StatusCode::OK,
-            "text/html; charset=utf-8",
-            PAGE.to_string(),
+            index.to_string(),
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
@@ -1762,7 +1759,7 @@ fn sanitized_query(query: &[(String, String)]) -> HashMap<String, String> {
 
 fn requires_access_token(config: &crate::config::HttpConfig, path: &str) -> bool {
     !config.access_token.trim().is_empty()
-        && !matches!(path, "/" | "/legacy" | "/tools" | "/favicon.ico" | "/health")
+        && !matches!(path, "/" | "/tools" | "/favicon.ico" | "/health")
         && !path.starts_with("/assets/")
 }
 

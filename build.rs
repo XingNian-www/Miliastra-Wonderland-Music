@@ -45,7 +45,7 @@ fn generate_panel_assets() {
     if !dist.join("index.html").exists() {
         // 没有前端产物（本地只跑 Rust 测试/调试）时生成空表，HTTP 面板回退旧页面；
         // 发布流程必须先 `npm run build`，CI 已内置。
-        println!("cargo:warning=web/dist 不存在：面板将回退旧页面，发布前请构建前端");
+        println!("cargo:warning=web/dist 不存在：面板将不可用，发布前请构建前端（cd web && npm run build）");
         std::fs::write(
             &out,
             "pub(crate) const PANEL_INDEX: Option<&str> = None;\npub(crate) static PANEL_ASSETS: &[(&str, &str, &str)] = &[];\n",

@@ -3325,7 +3325,52 @@ pub(crate) fn config_effect_for_path(path: &str) -> Option<Effect> {
 
 /// 内置默认配置的完整 JSON（AppConfig::default() 序列化，含 http/logging/state）。
 pub fn default_config_json() -> Value {
-    serde_json::to_value(AppConfig::default()).expect("AppConfig 序列化不应失败")
+    let mut value = serde_json::to_value(AppConfig::default()).expect("AppConfig 序列化不应失败");
+    normalize_default_numbers(&mut value);
+    value
+}
+
+/// 把 f32 默认值还原成人类可读的最短十进制。
+///
+/// `AppConfig` 里很多阈值是 f32，序列化成 f64 会变成 0.8999999761581421；
+/// 面板「默认值」展示和用户手填的 0.9 对比时会被误判成改过。这里用最短
+/// f32 表示（0.9）替换，只在回读成 f32 仍等价时生效。
+pub fn normalize_default_numbers(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                normalize_default_numbers(item);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_default_numbers(item);
+            }
+        }
+        Value::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                return;
+            }
+            let Some(current) = number.as_f64() else { return };
+            let as_f32 = current as f32;
+            if !as_f32.is_finite() {
+                return;
+            }
+            for precision in 1..=9 {
+                let candidate = format!("{as_f32:.precision$}", precision = precision);
+                let Ok(parsed) = candidate.parse::<f64>() else { continue };
+                if parsed as f32 == as_f32 {
+                    if parsed.to_bits() != current.to_bits() {
+                        if let Some(replacement) = serde_json::Number::from_f64(parsed) {
+                            *number = replacement;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 与 [`default_config_json`] 相同，但 audio_cache 替换为启用后的默认对象：
@@ -3974,5 +4019,18 @@ mod tests {
             vec!["visual", "screen", "stability", "templates", "moderation"],
             "整段被档案接管的段列表变化了"
         );
+    }
+
+    #[test]
+    fn default_numbers_use_shortest_f32_representation() {
+        let json = default_config_json();
+        let value = &json["ocr"]["min_confidence"];
+        assert_eq!(value.as_f64().unwrap(), 0.9, "0.8999999761581421 应显示为 0.9");
+        let value = &json["startup"]["stable_changed_ratio_threshold"];
+        assert_eq!(value.as_f64().unwrap(), 0.01);
+        let value = &json["custom_workflows"]["default_threshold"];
+        assert_eq!(value.as_f64().unwrap(), 0.9);
+        // 整数不受影响。
+        assert_eq!(json["http"]["port"].as_i64().is_some(), true);
     }
 }

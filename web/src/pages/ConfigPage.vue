@@ -252,6 +252,7 @@ import {
   toast,
 } from '../store.js'
 import FieldControl from '../components/FieldControl.vue'
+import { f32Text } from '../util/format.js'
 import FieldError from '../components/FieldError.vue'
 import EmojiCatalog from '../components/EmojiCatalog.vue'
 
@@ -583,9 +584,17 @@ function effectClass(field) {
 }
 
 function defaultText(field) {
+  const readable = (value) => {
+    if (typeof value === 'number') return Number(f32Text(value))
+    if (Array.isArray(value)) return value.map(readable)
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, readable(item)]))
+    }
+    return value
+  }
   let text
   if (typeof field.default === 'string') text = field.default
-  else text = JSON.stringify(field.default)
+  else text = JSON.stringify(readable(field.default))
   if (text == null) text = String(field.default)
   return text.length > 48 ? `${text.slice(0, 48)}…` : text
 }

@@ -184,7 +184,7 @@ watch(
   () => props.modelValue,
   (value) => {
     if (value === lastNumberEmitted) return
-    numberText.value = value == null ? '' : String(value)
+    numberText.value = value == null ? '' : (kind.value === 'float' ? f32Text(value) : String(value))
   },
   { immediate: true },
 )

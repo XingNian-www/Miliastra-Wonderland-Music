@@ -66,7 +66,7 @@
           <span><code>{{ entry.key }}</code></span>
           <input
             type="text"
-            :value="entry.value"
+            :value="typeof entry.value === 'number' ? f32Text(entry.value) : entry.value"
             :disabled="disabled"
             spellcheck="false"
             @change="setText(['templates', entry.key], $event, false)"
@@ -180,6 +180,7 @@
 </template>
 
 <script setup>
+import { f32Text } from '../util/format.js'
 import { computed, reactive } from 'vue'
 
 const props = defineProps({

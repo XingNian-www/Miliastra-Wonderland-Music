@@ -1098,6 +1098,8 @@ pub(crate) mod ai;
 /// 配置 schema 平滑迁移：旧版本字段改名/删除按键搬运，替代断代重置。
 mod migrations;
 mod schema;
+pub(crate) use schema::default_config_json;
+pub(crate) use schema::normalize_default_numbers;
 pub(crate) use schema::*;
 
 /// SQLite 配置中心：配置持久化存储（阶段 2），阶段 3 起由启动流程消费。

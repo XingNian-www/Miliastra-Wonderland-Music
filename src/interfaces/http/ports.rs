@@ -442,6 +442,18 @@ pub(crate) trait HttpAiPort: Send + Sync {
     fn forget_hall(&self) -> Result<String>;
     /// 用当前抽取规则重放该玩家全部历史问答，重建事实表。
     fn rebuild_facts(&self, actor: &str) -> Result<String>;
+
+    /// 装配预览：用给定配置（可含未保存草稿）拼出 system/tail/tools，不调用模型。
+    ///
+    /// 默认实现返回未装配，测试夹具不必实现。
+    fn chat_preview(
+        &self,
+        _config: &crate::config::AppConfig,
+        _asker: &str,
+        _question: &str,
+    ) -> Result<String> {
+        Err(anyhow::anyhow!("装配预览未装配（仅生产运行时可用）"))
+    }
 }
 
 #[derive(Clone)]

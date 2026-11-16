@@ -242,6 +242,19 @@ impl ConfigFieldSchema {
         }
     }
 
+    /// 与 [`Self::db_live`] 相同，但带面板分组标题。
+    fn db_live_grouped(
+        path: &str,
+        label: &str,
+        kind: FieldKind,
+        hint: &str,
+        group: &'static str,
+    ) -> Self {
+        let mut field = Self::db_live(path, label, kind, hint);
+        field.group = Some(group);
+        field
+    }
+
     /// 数据库可编辑、保存后等待播放器闲置再自动重载的字段。
     fn db_playback_idle_reload(path: &str, label: &str, kind: FieldKind, hint: &str) -> Self {
         Self {
@@ -3077,6 +3090,83 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "超时秒数",
             FieldKind::Int { min: 1, max: 120 },
             "超过该时长按失败处理，AI回复 留空继续发送",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "protocols.memory",
+            "记忆与回复规范",
+            FieldKind::Text,
+            "留空用内置；讲「记忆只是参考资料、回答要简短」",
+            "正文协议",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "protocols.identity",
+            "身份与归属规范",
+            FieldKind::Text,
+            "留空用内置；讲「本轮只有一个人在说话、别人的名字不算你的」",
+            "正文协议",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "protocols.time",
+            "时间规范",
+            FieldKind::Text,
+            "留空用内置",
+            "正文协议",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "protocols.action",
+            "动作规范",
+            FieldKind::Text,
+            "留空用内置",
+            "正文协议",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "protocols.reply",
+            "回复格式（JSON 契约）",
+            FieldKind::Text,
+            "必须保留 \"action\" 与 \"text\" 两个键名，否则回复会被丢弃",
+            "正文协议",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "protocols.tool",
+            "工具调用协议",
+            FieldKind::Text,
+            "留空用内置；不要写「禁止调用工具」这类否定",
+            "正文协议",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "tool_descriptions.look",
+            "look 工具描述",
+            FieldKind::Text,
+            "进 tools 数组的短描述；留空用内置",
+            "工具描述",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "tool_descriptions.speak",
+            "speak 工具描述",
+            FieldKind::Text,
+            "进 tools 数组的短描述；留空用内置；模型相关的示例后缀由代码追加",
+            "工具描述",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "tool_descriptions.command",
+            "命令工具描述",
+            FieldKind::Text,
+            "进 tools 数组的短描述；留空用内置",
+            "工具描述",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "summary_prompt",
+            "记忆压缩提示词",
+            FieldKind::Text,
+            "可用 {{previous}}、{{records}}；留空用内置",
+            "长文本提示词",
+        ),
+        ConfigFieldSchema::db_live_grouped(
+            "vision_prompt",
+            "视觉子模型提示词",
+            FieldKind::Text,
+            "可用 {{question}}、{{instruction}}；留空用内置",
+            "长文本提示词",
         ),
     ]
 }

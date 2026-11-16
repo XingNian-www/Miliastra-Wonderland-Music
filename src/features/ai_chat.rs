@@ -381,6 +381,53 @@ pub(crate) fn encode_vision_image(
     None
 }
 
+/// 可配置的正文协议块；空字符串回退内置常量。
+///
+/// 默认全空 = 与改前逐字节一致。面板保存空串表示“用内置默认”，
+/// 不是“删掉这段协议”。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiChatProtocols {
+    pub memory: String,
+    pub identity: String,
+    pub time: String,
+    pub action: String,
+    pub reply: String,
+    pub tool: String,
+}
+
+impl Default for AiChatProtocols {
+    fn default() -> Self {
+        Self {
+            memory: String::new(),
+            identity: String::new(),
+            time: String::new(),
+            action: String::new(),
+            reply: String::new(),
+            tool: String::new(),
+        }
+    }
+}
+
+/// 工具 schema 的短描述；进 tools 数组，与 system 里的 `tool_prompts.*` 分工。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiChatToolDescriptions {
+    pub look: String,
+    pub speak: String,
+    pub command: String,
+}
+
+impl Default for AiChatToolDescriptions {
+    fn default() -> Self {
+        Self {
+            look: String::new(),
+            speak: String::new(),
+            command: String::new(),
+        }
+    }
+}
+
 /// `ai_chat` 配置段。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -446,6 +493,18 @@ pub struct AiChatConfig {
     /// `{AI回复}` 标签的生成参数。
     #[serde(default)]
     pub ai_reply: AiReplyConfig,
+    /// 正文协议块；空串回退内置常量。
+    #[serde(default)]
+    pub protocols: AiChatProtocols,
+    /// 工具 schema 短描述；空串回退内置。
+    #[serde(default)]
+    pub tool_descriptions: AiChatToolDescriptions,
+    /// 记忆压缩提示词；空回退内置。支持 `{{previous}}` / `{{records}}`。
+    #[serde(default)]
+    pub summary_prompt: String,
+    /// 视觉子模型提示词；空回退内置。支持 `{{question}}` / `{{instruction}}`。
+    #[serde(default)]
+    pub vision_prompt: String,
 }
 
 /// 各工具独立提示词；空字符串回退内置默认。
@@ -650,6 +709,10 @@ impl Default for AiChatConfig {
             vision: AiChatVisionConfig::default(),
             tool_prompts: AiChatToolPrompts::default(),
             ai_reply: AiReplyConfig::default(),
+            protocols: AiChatProtocols::default(),
+            tool_descriptions: AiChatToolDescriptions::default(),
+            summary_prompt: String::new(),
+            vision_prompt: String::new(),
         }
     }
 }
@@ -679,6 +742,58 @@ impl AiChatConfig {
                 if self.vision.timeout_ms == 0 {
                     anyhow::bail!("ai_chat.vision.timeout_ms 必须大于 0");
                 }
+            }
+        }
+        self.validate_prompts()?;
+        Ok(())
+    }
+
+    /// 可配置提示词的保存时校验。
+    ///
+    /// 错误消息必须以 `ai_chat.<路径>` 开头，才能被面板解析成字段级错误。
+    fn validate_prompts(&self) -> Result<()> {
+        let reply = self.protocols.reply.trim();
+        if !reply.is_empty() {
+            let has_key = |key: &str| {
+                reply.contains(&format!("\"{key}\"")) || reply.contains(&format!("'{key}'"))
+            };
+            if !has_key("action") || !has_key("text") {
+                anyhow::bail!(
+                    "ai_chat.protocols.reply 必须同时包含 \"action\" 与 \"text\" 两个键名，否则回复会被整条丢弃"
+                );
+            }
+            if reply.chars().count() > 2_000 {
+                anyhow::bail!("ai_chat.protocols.reply 不能超过 2000 个字符");
+            }
+        }
+        let tool = self.protocols.tool.trim();
+        if !tool.is_empty() {
+            for forbidden in ["禁止调用工具", "不要调用工具", "不要使用工具", "只能文字回复"] {
+                if tool.contains(forbidden) {
+                    anyhow::bail!(
+                        "ai_chat.protocols.tool 含禁用表述「{forbidden}」，会让点歌/识图/语音全部失效"
+                    );
+                }
+            }
+        }
+        for (path, value) in [
+            ("ai_chat.protocols.memory", &self.protocols.memory),
+            ("ai_chat.protocols.identity", &self.protocols.identity),
+            ("ai_chat.protocols.time", &self.protocols.time),
+            ("ai_chat.protocols.action", &self.protocols.action),
+            ("ai_chat.tool_descriptions.look", &self.tool_descriptions.look),
+            ("ai_chat.tool_descriptions.speak", &self.tool_descriptions.speak),
+            ("ai_chat.tool_descriptions.command", &self.tool_descriptions.command),
+            ("ai_chat.summary_prompt", &self.summary_prompt),
+            ("ai_chat.vision_prompt", &self.vision_prompt),
+        ] {
+            if value.chars().count() > 4_000 {
+                anyhow::bail!("{path} 不能超过 4000 个字符");
+            }
+            let supports_placeholder =
+                matches!(path, "ai_chat.summary_prompt" | "ai_chat.vision_prompt");
+            if !supports_placeholder && value.contains("{{") {
+                anyhow::bail!("{path} 不支持占位符（只有 summary_prompt / vision_prompt 支持）");
             }
         }
         Ok(())
@@ -912,8 +1027,8 @@ fn default_summary_prompt() -> String {
 }
 
 /// 组装压缩提示词：旧摘要 + 新溢出原文。
-pub(crate) fn summary_prompt(previous: &str, records: &str) -> String {
-    default_summary_prompt()
+pub(crate) fn summary_prompt(config: &AiChatConfig, previous: &str, records: &str) -> String {
+    configured_tool_prompt(&config.summary_prompt, &default_summary_prompt())
         .replace(
             "{{previous}}",
             if previous.trim().is_empty() {
@@ -2311,12 +2426,18 @@ pub(crate) const VISION_NAVIGATION_TIMEOUT_MS: u64 = 12_000;
 pub(crate) const LOOK_TOOL: &str = "look";
 
 /// `look` 工具定义：按需查看当前一级大厅截图；instruction 可选。
-pub(crate) fn look_tool() -> serde_json::Value {
+const DEFAULT_LOOK_TOOL_DESCRIPTION: &str = "查看当前一级大厅截图，由视觉子模型返回文字转述。主模型是否另收到原图取决于 ai_chat.vision.direct_to_main/当前配置；若本轮已直接收到图，应结合图判断，不要因 look 文案否认画面。主模型的用户本轮问题会一并传给视觉子模型。instruction 写清要从画面拿什么，可省略；示例：instruction=提取聊天区域里的文字。";
+
+pub(crate) fn look_tool(config: &AiChatConfig) -> serde_json::Value {
+    let description = configured_tool_prompt(
+        &config.tool_descriptions.look,
+        DEFAULT_LOOK_TOOL_DESCRIPTION,
+    );
     serde_json::json!({
         "type": "function",
         "function": {
             "name": LOOK_TOOL,
-            "description": "查看当前一级大厅截图，由视觉子模型返回文字转述。主模型是否另收到原图取决于 ai_chat.vision.direct_to_main/当前配置；若本轮已直接收到图，应结合图判断，不要因 look 文案否认画面。主模型的用户本轮问题会一并传给视觉子模型。instruction 写清要从画面拿什么，可省略；示例：instruction=提取聊天区域里的文字。",
+            "description": description,
             // instruction 是可选参数，strict:true 会要求 required 覆盖所有字段；
             // 这里关掉 strict，保留“可选 instruction”语义。
             "strict": false,
@@ -2369,12 +2490,14 @@ pub(crate) fn look_system_prompt() -> &'static str {
 pub(crate) const SPEAK_TOOL: &str = "speak";
 
 /// `speak` 工具定义（未知模型安全默认，只暴露 text）。
-pub(crate) fn speak_tool(max_chars: usize) -> serde_json::Value {
-    speak_tool_for_model("", max_chars)
-}
+const DEFAULT_SPEAK_TOOL_DESCRIPTION: &str = "让 BOT 用语音说出文本。text 用自然口语，不要 Markdown/URL/命令。";
 
 /// 按当前 TTS 模型能力生成 `speak` 工具 schema；不支持的参数不暴露。
-pub(crate) fn speak_tool_for_model(model: &str, max_chars: usize) -> serde_json::Value {
+pub(crate) fn speak_tool_for_model(
+    model: &str,
+    max_chars: usize,
+    config: &AiChatConfig,
+) -> serde_json::Value {
     let model = if model.trim().is_empty() {
         DEFAULT_TTS_MODEL
     } else {
@@ -2472,7 +2595,10 @@ pub(crate) fn speak_tool_for_model(model: &str, max_chars: usize) -> serde_json:
         "type": "function",
         "function": {
             "name": SPEAK_TOOL,
-            "description": format!("让 BOT 用语音说出文本。text 用自然口语，不要 Markdown/URL/命令。{example}"),
+            "description": format!(
+                "{}{example}",
+                configured_tool_prompt(&config.tool_descriptions.speak, DEFAULT_SPEAK_TOOL_DESCRIPTION)
+            ),
             // text 必填、emotion/style/speed/volume_db 可选；strict:true 要求所有
             // properties 都在 required 里，否则部分 OpenAI 兼容端点会整包 400。
             "strict": false,
@@ -2582,12 +2708,16 @@ pub(crate) fn parse_speak_arguments_for_model(
 /// 变化）都产生不同的前缀，provider 的前缀缓存全部失效。可用命令仍在
 /// `build_prompt` 的尾部（`{{commands}}` 与系统补充段）逐轮给出，
 /// 权限复核也始终在执行前做。
-pub(crate) fn command_tools() -> Vec<serde_json::Value> {
+const DEFAULT_COMMAND_TOOL_DESCRIPTION: &str = "以当前提问者身份执行一条游戏命令。可用命令以用户消息末尾「这位玩家当前可用的命令」为准，只能使用其中列出的命令；不要编造列表外的命令。回执 status=handled 即表示命令已执行完成、业务结果已确认；此时必须直接告知玩家已完成，禁止说「能不能成功看平台反馈」或让玩家自行查证。";
+
+pub(crate) fn command_tools(config: &AiChatConfig) -> Vec<serde_json::Value> {
+    let description =
+        configured_tool_prompt(&config.tool_descriptions.command, DEFAULT_COMMAND_TOOL_DESCRIPTION);
     vec![serde_json::json!({
         "type": "function",
         "function": {
             "name": COMMAND_TOOL,
-            "description": "以当前提问者身份执行一条游戏命令。可用命令以用户消息末尾「这位玩家当前可用的命令」为准，只能使用其中列出的命令；不要编造列表外的命令。回执 status=handled 即表示命令已执行完成、业务结果已确认；此时必须直接告知玩家已完成，禁止说「能不能成功看平台反馈」或让玩家自行查证。",
+            "description": description,
             "strict": true,
             "parameters": {
                 "type": "object",
@@ -2608,6 +2738,160 @@ fn configured_tool_prompt(custom: &str, default: &str) -> String {
     }
 }
 
+/// 提示词块：装配预览与真实请求共用的最小单元。
+#[derive(Clone, Debug)]
+pub(crate) struct PromptBlock {
+    pub(crate) name: &'static str,
+    pub(crate) kind: PromptBlockKind,
+    /// 来源：配置路径（动态）或 `code(常量名)`（内置默认）。
+    pub(crate) source: std::borrow::Cow<'static, str>,
+    pub(crate) text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptBlockKind {
+    System,
+    Tail,
+}
+
+fn protocol_block(
+    name: &'static str,
+    config_path: &'static str,
+    code_name: &'static str,
+    custom: &str,
+    default: &'static str,
+) -> PromptBlock {
+    let custom = custom.trim();
+    let (text, source) = if custom.is_empty() {
+        (default.to_string(), std::borrow::Cow::Owned(format!("code({code_name})")))
+    } else {
+        (custom.to_string(), std::borrow::Cow::Borrowed(config_path))
+    };
+    PromptBlock {
+        name,
+        kind: PromptBlockKind::System,
+        source,
+        text,
+    }
+}
+
+/// system prompt 的块列表；拼接规则 = 各块 `text` 用单换行连接。
+pub(crate) fn response_system_prompt_parts(
+    config: &AiChatConfig,
+    look_enabled: bool,
+    speak_enabled: bool,
+    command_enabled: bool,
+) -> Vec<PromptBlock> {
+    let persona = if config.system_prompt.trim().is_empty() {
+        default_system_prompt()
+    } else {
+        config.system_prompt.clone()
+    };
+    let mut parts = vec![PromptBlock {
+        name: "人设",
+        kind: PromptBlockKind::System,
+        source: if config.system_prompt.trim().is_empty() {
+            std::borrow::Cow::Borrowed("code(default_system_prompt)")
+        } else {
+            std::borrow::Cow::Borrowed("ai_chat.system_prompt")
+        },
+        text: persona,
+    }];
+    parts.push(protocol_block(
+        "记忆与回复规范",
+        "ai_chat.protocols.memory",
+        "MEMORY_PROTOCOL",
+        &config.protocols.memory,
+        MEMORY_PROTOCOL,
+    ));
+    parts.push(protocol_block(
+        "身份与归属规范",
+        "ai_chat.protocols.identity",
+        "IDENTITY_PROTOCOL",
+        &config.protocols.identity,
+        IDENTITY_PROTOCOL,
+    ));
+    parts.push(protocol_block(
+        "时间规范",
+        "ai_chat.protocols.time",
+        "TIME_PROTOCOL",
+        &config.protocols.time,
+        TIME_PROTOCOL,
+    ));
+    parts.push(protocol_block(
+        "回复格式",
+        "ai_chat.protocols.reply",
+        "REPLY_PROTOCOL",
+        &config.protocols.reply,
+        REPLY_PROTOCOL,
+    ));
+    parts.push(protocol_block(
+        "动作规范",
+        "ai_chat.protocols.action",
+        "ACTION_PROTOCOL",
+        &config.protocols.action,
+        ACTION_PROTOCOL,
+    ));
+    parts.push(protocol_block(
+        "工具调用协议",
+        "ai_chat.protocols.tool",
+        "TOOL_PROTOCOL",
+        &config.protocols.tool,
+        TOOL_PROTOCOL,
+    ));
+    for (enabled, name, path, code_name, custom, default) in [
+        (
+            look_enabled,
+            "look 工具提示词",
+            "ai_chat.tool_prompts.look",
+            "default_look_tool_prompt",
+            &config.tool_prompts.look,
+            "default_look_tool_prompt",
+        ),
+        (
+            speak_enabled,
+            "speak 工具提示词",
+            "ai_chat.tool_prompts.speak",
+            "default_speak_tool_prompt",
+            &config.tool_prompts.speak,
+            "default_speak_tool_prompt",
+        ),
+        (
+            command_enabled,
+            "命令工具提示词",
+            "ai_chat.tool_prompts.command",
+            "default_command_tool_prompt",
+            &config.tool_prompts.command,
+            "default_command_tool_prompt",
+        ),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let default_text = match code_name {
+            "default_look_tool_prompt" => default_look_tool_prompt(),
+            "default_speak_tool_prompt" => default_speak_tool_prompt(),
+            _ => default_command_tool_prompt(),
+        };
+        let custom = custom.trim();
+        let (text, source) = if custom.is_empty() {
+            (
+                default_text,
+                std::borrow::Cow::Owned(format!("code({default})")),
+            )
+        } else {
+            (custom.to_string(), std::borrow::Cow::Borrowed(path))
+        };
+        parts.push(PromptBlock {
+            name,
+            kind: PromptBlockKind::System,
+            source,
+            text,
+        });
+    }
+    parts
+}
+
 /// 只注入当前实际暴露工具的提示词；未暴露的工具不出现。
 pub(crate) fn response_system_prompt_with_tools(
     config: &AiChatConfig,
@@ -2615,36 +2899,11 @@ pub(crate) fn response_system_prompt_with_tools(
     speak_enabled: bool,
     command_enabled: bool,
 ) -> String {
-    let persona = if config.system_prompt.trim().is_empty() {
-        default_system_prompt()
-    } else {
-        config.system_prompt.clone()
-    };
-    let mut prompt = format!(
-        "{persona}\n{MEMORY_PROTOCOL}\n{IDENTITY_PROTOCOL}\n{TIME_PROTOCOL}\n{REPLY_PROTOCOL}\n{ACTION_PROTOCOL}\n{TOOL_PROTOCOL}"
-    );
-    if look_enabled {
-        prompt.push('\n');
-        prompt.push_str(&configured_tool_prompt(
-            &config.tool_prompts.look,
-            &default_look_tool_prompt(),
-        ));
-    }
-    if speak_enabled {
-        prompt.push('\n');
-        prompt.push_str(&configured_tool_prompt(
-            &config.tool_prompts.speak,
-            &default_speak_tool_prompt(),
-        ));
-    }
-    if command_enabled {
-        prompt.push('\n');
-        prompt.push_str(&configured_tool_prompt(
-            &config.tool_prompts.command,
-            &default_command_tool_prompt(),
-        ));
-    }
-    prompt
+    response_system_prompt_parts(config, look_enabled, speak_enabled, command_enabled)
+        .into_iter()
+        .map(|block| block.text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 只给 look 视觉子请求使用的备注↔昵称对照；空表返回 None。
@@ -3023,7 +3282,7 @@ mod tests {
         let second = response_system_prompt_with_tools(&config, true, true, true);
         assert_eq!(first, second, "同一配置下 system prompt 必须逐字节稳定");
         let tools =
-            serde_json::to_string(&[command_tools(), vec![speak_tool(160), look_tool()]]).unwrap();
+            serde_json::to_string(&[command_tools(&AiChatConfig::default()), vec![speak_tool_for_model("", 160, &AiChatConfig::default()), look_tool(&AiChatConfig::default())]]).unwrap();
         let stable_tokens = estimate_tokens(&first) + estimate_tokens(&tools);
         // --nocapture 时可复核具体量级：system 与 tools 分别多少 token。
         println!(
@@ -3738,7 +3997,7 @@ mod tests {
 
     #[test]
     fn native_tool_schema_and_arguments_keep_hash_commands_separate_from_display() {
-        let tools = command_tools();
+        let tools = command_tools(&AiChatConfig::default());
         assert_eq!(tools[0]["function"]["name"], COMMAND_TOOL);
         assert_eq!(
             tools[0]["function"]["parameters"]["additionalProperties"],
@@ -3751,7 +4010,7 @@ mod tests {
         assert!(!description.contains("@点歌"));
         assert!(!description.contains("#提示"));
         assert_eq!(
-            serde_json::to_string(&command_tools()).unwrap(),
+            serde_json::to_string(&command_tools(&AiChatConfig::default())).unwrap(),
             serde_json::to_string(&tools).unwrap(),
             "同一配置下工具 schema 必须逐字节稳定"
         );
@@ -4382,6 +4641,101 @@ mod tests {
         assert_eq!(prompt.matches("回答必须简短").count(), 1, "实际: {prompt}");
     }
 
+    #[test]
+    fn custom_protocols_replace_builtins() {
+        let mut config = config();
+        config.protocols.memory = "自定义记忆规范".into();
+        config.protocols.identity = "自定义身份规范".into();
+        config.protocols.time = "自定义时间规范".into();
+        config.protocols.action = "自定义动作规范".into();
+        config.protocols.reply = "必须输出 {\"action\":\"…\",\"text\":\"…\"}".into();
+        config.protocols.tool = "自定义工具协议".into();
+        let prompt = response_system_prompt_with_tools(&config, false, false, false);
+        for needle in [
+            "自定义记忆规范",
+            "自定义身份规范",
+            "自定义时间规范",
+            "自定义动作规范",
+            "自定义工具协议",
+        ] {
+            assert!(prompt.contains(needle), "缺少自定义协议 {needle}: {prompt}");
+        }
+        for builtin in [
+            "记忆与回复规范",
+            "身份与归属规范",
+            "时间规范：",
+            "动作规范：",
+            "工具调用协议：",
+        ] {
+            assert!(!prompt.contains(builtin), "内置协议未替换 {builtin}: {prompt}");
+        }
+    }
+
+    #[test]
+    fn empty_protocols_keep_builtin_exactly() {
+        let config = config();
+        let prompt = response_system_prompt_with_tools(&config, false, false, false);
+        assert!(prompt.contains(MEMORY_PROTOCOL));
+        assert!(prompt.contains(IDENTITY_PROTOCOL));
+        assert!(prompt.contains(TIME_PROTOCOL));
+        assert!(prompt.contains(REPLY_PROTOCOL));
+        assert!(prompt.contains(ACTION_PROTOCOL));
+        assert!(prompt.contains(TOOL_PROTOCOL));
+    }
+
+    #[test]
+    fn reply_protocol_requires_action_and_text_keys() {
+        let mut config = AiChatConfig::default();
+        config.protocols.reply = "直接回复纯文本即可".into();
+        let message = config.validate().unwrap_err().to_string();
+        assert!(message.contains("ai_chat.protocols.reply"), "message={message}");
+        config.protocols.reply = "请输出 {\"action\":\"动作\",\"text\":\"台词\"}".into();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tool_protocol_rejects_negative_phrasing() {
+        let mut config = AiChatConfig::default();
+        config.protocols.tool = "不要调用工具，只能文字回复".into();
+        let message = config.validate().unwrap_err().to_string();
+        assert!(message.contains("ai_chat.protocols.tool"), "message={message}");
+    }
+
+    #[test]
+    fn prompt_placeholder_restrictions() {
+        let mut config = AiChatConfig::default();
+        config.protocols.memory = "含 {{previous}} 占位符".into();
+        assert!(config.validate().is_err(), "协议块不支持占位符");
+        config.protocols.memory = String::new();
+        config.summary_prompt = "旧摘要：{{previous}}\n新增：{{records}}".into();
+        assert!(config.validate().is_ok(), "summary_prompt 允许占位符");
+    }
+
+    #[test]
+    fn custom_summary_prompt_substitutes_placeholders() {
+        let mut config = AiChatConfig::default();
+        config.summary_prompt = "旧：{{previous}}\n新：{{records}}".into();
+        let prompt = summary_prompt(&config, "", "记录A");
+        assert_eq!(prompt, "旧：（暂无）\n新：记录A");
+        let prompt = summary_prompt(&config, "旧摘要", "记录B");
+        assert_eq!(prompt, "旧：旧摘要\n新：记录B");
+    }
+
+    #[test]
+    fn tool_descriptions_are_configurable() {
+        let mut config = AiChatConfig::default();
+        config.tool_descriptions.look = "自定义 look 描述".into();
+        config.tool_descriptions.command = "自定义命令描述".into();
+        config.tool_descriptions.speak = "自定义 speak 前缀".into();
+        let look = look_tool(&config);
+        assert_eq!(look["function"]["description"], "自定义 look 描述");
+        let command = command_tools(&config);
+        assert_eq!(command[0]["function"]["description"], "自定义命令描述");
+        let speak = speak_tool_for_model("s1", 120, &config);
+        let description = speak["function"]["description"].as_str().unwrap();
+        assert!(description.starts_with("自定义 speak 前缀"), "{description}");
+    }
+
     /// 动作定界符（星号）不能被清洗掉。
     ///
     /// 剥掉后动作与台词粘成一句（`猫耳一抖哼，`），既难读，
@@ -4696,14 +5050,14 @@ mod tests {
 
     #[test]
     fn speak_tool_schema_varies_by_model_capabilities() {
-        let s1 = speak_tool_for_model("s1", 120);
+        let s1 = speak_tool_for_model("s1", 120, &AiChatConfig::default());
         let s1_props = s1["function"]["parameters"]["properties"].as_object().unwrap();
         assert!(s1_props.contains_key("emotion"));
         assert!(!s1_props.contains_key("style"));
         assert!(s1_props.contains_key("speed"));
         assert!(s1_props.contains_key("volume_db"));
 
-        let s2 = speak_tool_for_model("s2.1-pro", 120);
+        let s2 = speak_tool_for_model("s2.1-pro", 120, &AiChatConfig::default());
         let s2_props = s2["function"]["parameters"]["properties"].as_object().unwrap();
         assert!(s2_props.contains_key("emotion"));
         assert!(s2_props.contains_key("style"));
@@ -4715,7 +5069,7 @@ mod tests {
             .unwrap()
             .contains("laughing nervously"), "S2 工具描述缺少示例");
 
-        let drama = speak_tool_for_model("drama-3", 120);
+        let drama = speak_tool_for_model("drama-3", 120, &AiChatConfig::default());
         let drama_props = drama["function"]["parameters"]["properties"]
             .as_object()
             .unwrap();
@@ -4724,7 +5078,7 @@ mod tests {
             assert!(drama_text.contains(needle), "Drama text 描述缺少 {needle}");
         }
 
-        let unknown = speak_tool_for_model("unknown-model", 120);
+        let unknown = speak_tool_for_model("unknown-model", 120, &AiChatConfig::default());
         let unknown_props = unknown["function"]["parameters"]["properties"]
             .as_object()
             .unwrap();
@@ -4805,7 +5159,7 @@ mod tests {
 
     #[test]
     fn look_tool_schema_and_parser_are_optional_instruction() {
-        let tool = look_tool();
+        let tool = look_tool(&AiChatConfig::default());
         assert_eq!(tool["function"]["name"], LOOK_TOOL);
         assert_eq!(tool["function"]["strict"], false);
         assert_eq!(
@@ -4843,7 +5197,7 @@ mod tests {
 
     #[test]
     fn speak_tool_schema_and_argument_parser_are_strict() {
-        let tool = speak_tool(120);
+        let tool = speak_tool_for_model("", 120, &AiChatConfig::default());
         assert_eq!(tool["function"]["name"], SPEAK_TOOL);
         assert_eq!(tool["function"]["parameters"]["properties"]["text"]["maxLength"], 120);
         assert_eq!(tool["function"]["strict"], false, "可选字段不能配 strict:true");

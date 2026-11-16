@@ -1,4 +1,46 @@
 use super::*;
+use serde_json::Value;
+
+/// POST /ai/chat/preview：装配预览（dry-run）。
+pub(super) fn ai_chat_preview_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let body: Value = parse_json_body(body, "装配预览请求")?;
+    let asker = body
+        .get("asker")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("预览玩家");
+    let question = body
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("（预览问题）");
+    let sections = body
+        .get("sections")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let store = state
+        .config_store
+        .lock()
+        .map_err(|_| internal_error(anyhow::anyhow!("配置存储锁已损坏")))?;
+    let config = store
+        .preview_candidate(&sections)
+        .map_err(|error| AppError {
+            status: 400,
+            message: error.to_string(),
+        })?;
+    drop(store);
+    state
+        .application
+        .ai
+        .chat_preview(&config, asker, question)
+        .map_err(ai_route_error)
+}
 
 pub(super) fn ai_recognize_route(
     query: &[(String, String)],

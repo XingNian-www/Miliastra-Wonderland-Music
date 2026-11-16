@@ -401,8 +401,47 @@ pub fn match_catalog() -> Value {
 }
 
 pub fn differences(before: &VisualProfile, after: &VisualProfile) -> Result<Vec<Value>> {
-    fn walk(a: &Value, b: &Value, path: &str, out: &mut Vec<Value>) {
+    /// 保存值与生效值的“等价”判定：忽略路径解析与浮点精度。
+    ///
+    /// - 模板/资源路径：保存值是相对路径，生效值可能已被解析成绝对路径；
+    ///   分隔符也可能不同（Windows `\\` vs `/`）。
+    /// - 数字：保存值来自 JSON（f64），运行时可能经过 f32，末位精度不同。
+    ///
+    /// 这些不是配置没生效；不过滤会让面板永远显示几十项“差异”，误导用户。
+    fn equivalent(a: &Value, b: &Value) -> bool {
         if a == b {
+            return true;
+        }
+        match (a, b) {
+            (Value::Number(a), Value::Number(b)) => {
+                let (Some(a), Some(b)) = (a.as_f64(), b.as_f64()) else {
+                    return false;
+                };
+                let diff = (a - b).abs();
+                diff <= f64::EPSILON.max(a.abs().max(b.abs()) * 1e-6)
+            }
+            (Value::String(a), Value::String(b)) => {
+                let (a, b) = (a.replace('\\', "/"), b.replace('\\', "/"));
+                if a == b {
+                    return true;
+                }
+                // 只有看起来像路径的字符串才做后缀等价；普通文本必须精确相等。
+                let looks_like_path = |text: &str| text.contains('/');
+                if !looks_like_path(&a) || !looks_like_path(&b) {
+                    return false;
+                }
+                let a = a.trim_end_matches('/');
+                let b = b.trim_end_matches('/');
+                // "deps/assets/x.png" 与 "C:/.../deps/assets/x.png"
+                b.ends_with(a) && b.as_bytes()[b.len() - a.len() - 1] == b'/'
+                    || a.ends_with(b) && a.as_bytes()[a.len() - b.len() - 1] == b'/'
+            }
+            _ => false,
+        }
+    }
+
+    fn walk(a: &Value, b: &Value, path: &str, out: &mut Vec<Value>) {
+        if equivalent(a, b) {
             return;
         }
         if let (Some(a), Some(b)) = (a.as_object(), b.as_object()) {
@@ -540,5 +579,38 @@ mod tests {
         let mut v = serde_json::to_value(p).unwrap();
         v["unknown"] = json!(true);
         assert!(serde_json::from_value::<VisualProfile>(v).is_err());
+    }
+
+    #[test]
+    fn differences_ignore_path_normalization_and_float_noise() {
+        let current = serde_json::to_value(AppConfig::default()).unwrap();
+        let mut saved = VisualProfile::export(&current).unwrap();
+        let mut effective = saved.clone();
+        saved
+            .templates
+            .insert("confirm_button".into(), "deps/assets/confirm-button.png".into());
+        effective.templates.insert(
+            "confirm_button".into(),
+            "C:\\Users\\XingNian\\Desktop\\5.1\\deps\\assets\\confirm-button.png".into(),
+        );
+        saved.chat_geometry.insert(
+            "change_pixel_threshold".into(),
+            json!(0.029999999329447743_f64),
+        );
+        effective.chat_geometry.insert(
+            "change_pixel_threshold".into(),
+            json!(0.029999999329447746_f64),
+        );
+        assert!(
+            differences(&saved, &effective).unwrap().is_empty(),
+            "路径解析/浮点精度不应算配置差异"
+        );
+
+        effective
+            .templates
+            .insert("confirm_button".into(), "deps/assets/other.png".into());
+        let diffs = differences(&saved, &effective).unwrap();
+        assert_eq!(diffs.len(), 1, "真实路径变化必须报告: {diffs:?}");
+        assert_eq!(diffs[0]["path"], "/templates/confirm_button");
     }
 }

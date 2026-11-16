@@ -75,22 +75,49 @@ fn sanitize_look_context(value: &str) -> String {
 }
 
 /// look 子请求 prompt：把用户本轮问题与主模型 instruction 一起交给视觉子模型。
-fn build_look_vision_prompt(question: &str, instruction: Option<&str>) -> String {
+fn build_look_vision_prompt(
+    config: &crate::features::ai_chat::AiChatConfig,
+    question: &str,
+    instruction: Option<&str>,
+) -> String {
     let question = sanitize_look_context(question);
-    if question.is_empty() {
-        return "请简要描述当前一级大厅画面。".to_string();
-    }
     let instruction = instruction
         .map(sanitize_look_context)
         .filter(|instruction| !instruction.is_empty());
-    match instruction {
-        Some(instruction) => format!(
-            "用户本轮问题：{question}\n视觉子任务：{instruction}\n只提取回答该问题所需的信息。"
-        ),
-        None => format!(
-            "用户本轮问题：{question}\n请查看当前画面，提取回答该问题所需的信息。"
-        ),
+
+    // 未配置时走原有分支，保证默认行为逐字节一致。
+    if config.vision_prompt.trim().is_empty() {
+        if question.is_empty() {
+            return "请简要描述当前一级大厅画面。".to_string();
+        }
+        return match instruction {
+            Some(instruction) => format!(
+                "用户本轮问题：{question}\n视觉子任务：{instruction}\n只提取回答该问题所需的信息。"
+            ),
+            None => format!(
+                "用户本轮问题：{question}\n请查看当前画面，提取回答该问题所需的信息。"
+            ),
+        };
     }
+
+    let template = config.vision_prompt.clone();
+    let question = if question.is_empty() {
+        "请简要描述当前一级大厅画面。"
+    } else {
+        question.as_str()
+    };
+    let mut rendered = template
+        .replace("{{question}}", question)
+        .replace("{{instruction}}", instruction.as_deref().unwrap_or(""));
+    // instruction 为空时，把因占位符变空的行整行去掉，避免留下“视觉子任务：”空行。
+    if instruction.is_none() {
+        rendered = rendered
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    rendered
 }
 
 impl ApplicationRuntime {
@@ -298,7 +325,7 @@ impl ApplicationRuntime {
         if remaining.is_zero() {
             return serde_json::json!({"status":"unavailable","reason":"look 已超过总期限"});
         }
-        let prompt = build_look_vision_prompt(question, instruction);
+        let prompt = build_look_vision_prompt(config, question, instruction);
         let max_tokens = config.max_tokens.clamp(64, 800);
         let mut session = match crate::config::ai::ToolSession::with_history_options_and_image(
             &self.business.ai_connection,
@@ -448,16 +475,17 @@ impl ApplicationRuntime {
                 let look_configured = ai_chat::look_tool_available(&config);
                 let mut tools = Vec::new();
                 if config.allow_commands {
-                    tools.extend(ai_chat::command_tools());
+                    tools.extend(ai_chat::command_tools(&config));
                 }
                 if speak_configured {
                     tools.push(ai_chat::speak_tool_for_model(
                         &tts_config.model,
                         tts_config.max_chars,
+                        &config,
                     ));
                 }
                 if look_configured {
-                    tools.push(ai_chat::look_tool());
+                    tools.push(ai_chat::look_tool(&config));
                 }
                 let vision_model = self.ai_chat_vision_model(&config);
                 // 只有 auto/both 需要查主模型是否支持图片；tool 模式不为 auto 查。
@@ -1284,7 +1312,7 @@ fn summarize_memory_with(
     timeout: std::time::Duration,
 ) -> Result<String> {
     let records = plan.records.join("\n");
-    let prompt = crate::features::ai_chat::summary_prompt(&plan.previous_summary, &records);
+    let prompt = crate::features::ai_chat::summary_prompt(config, &plan.previous_summary, &records);
     // **必须走纯文本通道**：摘要要的是一段自然语言，
     // 而 request_json 会强制 response_format=JsonObject。真机上表现为
     // 每次压缩都 400 invalid_request_error，原文因此永远压不掉、
@@ -1625,28 +1653,37 @@ mod tests {
     #[test]
     fn look_vision_prompt_includes_user_question_and_instruction() {
         let with_instruction =
-            build_look_vision_prompt("画面里有人说话吗", Some("提取聊天区域文字"));
+            build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), "画面里有人说话吗", Some("提取聊天区域文字"));
         assert!(with_instruction.contains("用户本轮问题：画面里有人说话吗"));
         assert!(with_instruction.contains("视觉子任务：提取聊天区域文字"));
         assert!(with_instruction.contains("只提取回答该问题所需的信息"));
 
-        let without_instruction = build_look_vision_prompt("现在大厅发生了什么", None);
+        let mut custom = crate::features::ai_chat::AiChatConfig::default();
+        custom.vision_prompt = "用户问：{{question}}\n{{instruction}}\n只提取所需信息。".into();
+        let with_instruction = build_look_vision_prompt(&custom, "画面里有人吗", Some("数人数"));
+        assert!(with_instruction.contains("用户问：画面里有人吗"), "{with_instruction}");
+        assert!(with_instruction.contains("数人数"), "{with_instruction}");
+        let without = build_look_vision_prompt(&custom, "画面里有人吗", None);
+        assert!(!without.contains("\n\n"), "空 instruction 不能留下空行: {without}");
+        assert!(without.contains("只提取所需信息"), "{without}");
+
+        let without_instruction = build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), "现在大厅发生了什么", None);
         assert!(without_instruction.contains("用户本轮问题：现在大厅发生了什么"));
         assert!(without_instruction.contains("提取回答该问题所需的信息"));
         assert!(!without_instruction.contains("视觉子任务："));
 
         assert_eq!(
-            build_look_vision_prompt("  ", Some("看画面")),
+            build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), "  ", Some("看画面")),
             "请简要描述当前一级大厅画面。"
         );
 
-        let controlled = build_look_vision_prompt("问题\u{7}正文", Some("指令\u{7}内容"));
+        let controlled = build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), "问题\u{7}正文", Some("指令\u{7}内容"));
         assert!(!controlled.contains('\u{7}'));
         assert!(controlled.contains("问题正文"));
         assert!(controlled.contains("指令内容"));
 
         let long_question = "问".repeat(LOOK_CONTEXT_MAX_CHARS + 50);
-        let long = build_look_vision_prompt(&long_question, None);
+        let long = build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), &long_question, None);
         assert!(long.chars().count() < LOOK_CONTEXT_MAX_CHARS + 100);
     }
 

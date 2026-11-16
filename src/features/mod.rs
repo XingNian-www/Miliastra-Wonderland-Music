@@ -1,5 +1,6 @@
 pub(crate) mod administration;
 pub(crate) mod ai_chat;
+pub(crate) mod ai_chat_preview;
 pub(crate) mod ai_tag;
 pub(crate) mod card_games;
 pub(crate) mod chat_text;

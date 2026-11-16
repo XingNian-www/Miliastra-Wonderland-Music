@@ -864,6 +864,26 @@ impl ConfigStore {
         }
     }
 
+    /// 用候选 sections 组装完整配置，但**不写库、不 bump revision**。
+    ///
+    /// 与 [`ConfigStore::save`] 同一合并/校验路径，供装配预览使用；
+    /// 合并基准是当前库配置，未提交的段沿用已保存值。
+    pub fn preview_candidate(
+        &self,
+        sections: &Map<String, Value>,
+    ) -> anyhow::Result<AppConfig> {
+        let current_sections = self.read_all_sections()?;
+        let mut merged = merge_sections(&current_sections, sections);
+        let mut forced_cleared = BTreeSet::new();
+        apply_secret_clear_markers(&mut merged, &mut forced_cleared);
+        retain_secret_fields(&mut merged, &current_sections, &forced_cleared);
+        normalize_path_fields(&mut merged, &self.executable_root, false);
+        let mut config = self.build_config(&merged)?;
+        config.command_access.sanitize_deprecated_overrides();
+        config.validate()?;
+        Ok(config)
+    }
+
     /// 保存配置：候选段整段替换（并集覆盖），完整校验通过后单事务写入。
     ///
     /// `sections` 为**整段替换**语义：提交段覆盖该段全部字段（提交段中缺失的

@@ -139,6 +139,10 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
         handler: emoji_scan_route,
     },
     BodyRouteSpec {
+        path: "/ai/chat/preview",
+        handler: ai_chat_preview_route,
+    },
+    BodyRouteSpec {
         path: "/commands/policy",
         handler: commands_policy_save_route,
     },

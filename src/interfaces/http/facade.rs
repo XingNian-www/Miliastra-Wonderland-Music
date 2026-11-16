@@ -1402,6 +1402,20 @@ impl ApplicationHttpAiFacade {
 }
 
 impl HttpAiPort for ApplicationHttpAiFacade {
+    fn chat_preview(
+        &self,
+        config: &crate::config::AppConfig,
+        asker: &str,
+        question: &str,
+    ) -> Result<String> {
+        crate::features::ai_chat_preview::render_chat_preview(
+            config,
+            self.memory.as_deref(),
+            asker,
+            question,
+        )
+    }
+
     fn recognize(&self, query: &[(String, String)]) -> Result<String> {
         self.client.recognize_with_query(query)
     }

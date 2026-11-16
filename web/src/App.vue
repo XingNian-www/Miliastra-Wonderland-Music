@@ -1,7 +1,7 @@
 <template>
   <nav class="app-nav" aria-label="功能导航">
     <div class="nav-brand">Miliastra<span>远程监控</span></div>
-    <div class="nav-links">
+    <div class="nav-links" title="窄屏可左右滑动查看更多入口">
       <button
         v-for="route in routes"
         :key="route.key"

@@ -50,7 +50,7 @@
 <script setup>
 import { computed, reactive, ref } from 'vue'
 import { readToken } from '../api.js'
-import { getJson, requestJson } from '../api.js'
+import { getJson, request, requestJson } from '../api.js'
 import { handleAuth, state, toast } from '../store.js'
 
 const tabKey = ref('readonly')
@@ -73,11 +73,11 @@ const tabs = [
     hint: 'GET 请求，不触发游戏输入；不需要调试模式。',
     items: [
       item('运行状态', 'GET', '/debug/state'),
-      item('界面判定', 'GET', '/debug/ui-state'),
+      item('界面判定', 'GET', '/debug/ui-state', { query: [q('image', '可选：图片路径')] }),
       item('窗口信息', 'GET', '/debug/window'),
       item('任务队列', 'GET', '/debug/tasks'),
       item('运行记录列表', 'GET', '/debug/runs'),
-      item('界面目录', 'GET', '/debug/ui-catalogue'),
+      item('界面目录', 'GET', '/debug/ui-catalogue', { query: [q('image', '可选：图片路径')] }),
       item('只读观察摘要', 'GET', '/debug/read-only/summary'),
       item('只读观察条目', 'GET', '/debug/read-only/entries', { query: [q('since', '游标'), q('limit', '1..50'), q('taskId', '可选')] }),
       item('只读观察模式', 'GET', '/debug/read-only/mode'),
@@ -159,6 +159,12 @@ async function run(item) {
       return
     }
     const url = buildUrl(item)
+    if (item.path === '/debug/events') {
+      // SSE 文本流：不要按 JSON 解析。
+      const text = await request(url)
+      resultOf[key] = { status: 'OK（SSE 文本）', text }
+      return
+    }
     const value = item.method === 'GET'
       ? await getJson(url)
       : await requestJson(url, parseBody(item.body))

@@ -186,6 +186,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { getJson, request } from '../api.js'
+import { playerStateLabel } from '../util/format.js'
 import { loadStatus, state, toast } from '../store.js'
 
 const monitor = ref(null)
@@ -270,10 +271,11 @@ const playerTitle = computed(() => {
 const playerStateText = computed(() => {
   const value = player.value
   if (!value) return '未知'
-  return value.state || value.transport || '空闲'
+  const raw = value.status || value.state || value.transport || 'idle'
+  return playerStateLabel(raw)
 })
 const playerQueueLabel = computed(() => {
-  const queue = player.value?.queue
+  const queue = state.monitor?.queue
   return Array.isArray(queue) ? `${queue.length} 首` : '—'
 })
 const runtimeHallLabel = computed(() => {
@@ -382,7 +384,8 @@ async function refresh(manual = false) {
   loading.value = true
   refreshError.value = ''
   try {
-    monitor.value = await getJson('/monitor')
+    await loadStatus()
+    monitor.value = state.monitor
   } catch (error) {
     refreshError.value = `读取 /monitor 失败：${error.message || error}`
   } finally {
@@ -412,7 +415,24 @@ async function action(label, path) {
   return ok
 }
 
+const HIGH_RISK_ACTIONS = new Set(['启动游戏', '进入千星', '启动并进入', '禁用命令'])
+
+async function openScreenshot() {
+  try {
+    const token = readToken()
+    const response = await fetch('/screenshot', { headers: token ? { 'X-Miliastra-Token': token } : {} })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 60_000)
+  } catch (error) {
+    toast(`截图失败：${error.message || error}`, 'err')
+  }
+}
+
 function runAction(label, path) {
+  if (HIGH_RISK_ACTIONS.has(label) && !window.confirm(`确认执行「${label}」？这会真实操作游戏。`)) return
   return action(label, path)
 }
 

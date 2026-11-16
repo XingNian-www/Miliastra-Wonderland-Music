@@ -1,7 +1,5 @@
 //! HTTP sandbox sessions use simulated fixtures or the injected live UI runtime.
-use crate::debug_sandbox::{
-    AtomicCommand, SandboxFixture, SandboxLimits, SandboxRun, SandboxTask,
-};
+use crate::debug_sandbox::{AtomicCommand, SandboxFixture, SandboxLimits, SandboxRun, SandboxTask};
 use crate::debug_sandbox_journal::SandboxJournal;
 use crate::debug_sandbox_runner::{
     DebugSandboxRunner, LiveExecutor, OcrTextRecognizer, ReadOnlyExecutor, SandboxExecutor,
@@ -539,8 +537,14 @@ impl DebugHttpService {
             .map_err(error)
     }
     pub fn execute_direct(&self, command: AtomicCommand) -> Result<SandboxRun, HttpCommandError> {
-        if !crate::debug_read_only::observer().enabled() && !crate::debug_mode::enabled() {
-            return Err(error("请先启用调试模式"));
+        // 只读能力放宽：Capture 不改变游戏状态，不需要调试模式，也不需要观察开关。
+        // 其它命令仍要求「只读观察」或「完全控制」之一，避免误触输入。
+        let passive = matches!(command, AtomicCommand::Capture);
+        if !passive
+            && !crate::debug_read_only::observer().enabled()
+            && !crate::debug_mode::enabled()
+        {
+            return Err(error("请先启用调试模式（截图等只读命令除外）"));
         }
         let runtime = self
             .runtime
@@ -566,7 +570,9 @@ impl DebugHttpService {
         let run_id = {
             let mut runners = self.runners.lock().map_err(error)?;
             self.ensure_session_capacity(&mut runners)?;
-            let run = if crate::debug_read_only::observer().enabled() {
+            let read_only = crate::debug_read_only::observer().enabled()
+                || (passive && !crate::debug_mode::enabled());
+            let run = if read_only {
                 let mut runner = self.runner(self.read_only_executor(runtime));
                 let run = runner.start_snapshot(task, Vec::new()).map_err(error)?;
                 runners.insert(run.run_id.clone(), SandboxSession::ReadOnly(runner));
@@ -1675,6 +1681,52 @@ mod tests {
             })
             .unwrap();
         assert_eq!(run.task_version, 2);
+    }
+
+    #[test]
+    fn capture_runs_without_debug_mode_or_observer() {
+        use crate::runtime::ui::UiDevice;
+        struct NoScreenshot;
+        impl UiDevice for NoScreenshot {
+            fn capture(&mut self) -> anyhow::Result<image::DynamicImage> {
+                anyhow::bail!("unexpected screenshot")
+            }
+            fn close_window(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        struct RestoreDebugMode(bool);
+        impl Drop for RestoreDebugMode {
+            fn drop(&mut self) {
+                crate::debug_mode::set_enabled(self.0);
+            }
+        }
+        let runtime = crate::runtime::ui::UiRuntime::start(NoScreenshot, 2).unwrap();
+        let _restore = RestoreDebugMode(crate::debug_mode::set_enabled(false));
+        let observer = crate::debug_read_only::observer();
+        let previous_observer = observer.enabled();
+        observer.set_enabled_state(false, crate::debug_read_only::ReadOnlyState::Active);
+        let service = DebugHttpService::new(Some(runtime.handle()));
+
+        // 只读截图不需要调试模式：命令应真的进入执行器（失败原因是截图失败，
+        // 而不是“请先启用调试模式”）。
+        let run = service
+            .execute_direct(AtomicCommand::Capture)
+            .expect("capture 不应被调试模式挡住");
+        assert_eq!(run.status, SandboxStatus::Failed);
+        assert!(
+            run.results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("截图失败"),
+            "{:?}",
+            run.results[0].error
+        );
+        observer.set_enabled_state(
+            previous_observer,
+            crate::debug_read_only::ReadOnlyState::Active,
+        );
     }
 
     #[test]

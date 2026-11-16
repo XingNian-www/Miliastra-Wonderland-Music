@@ -158,6 +158,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { requestJson } from '../api.js'
 import { clearDirty, nestedCloneSet, nestedGet, saveSections, state, loadConfig, toast } from '../store.js'
+import { stripSecretMask } from '../util/format.js'
 import FieldControl from '../components/FieldControl.vue'
 import FieldError from '../components/FieldError.vue'
 import AiMemoryPanel from '../components/AiMemoryPanel.vue'
@@ -438,7 +439,7 @@ async function loadTtsCatalog() {
   ttsCatalog.loading = true
   ttsCatalog.error = ''
   try {
-    const data = await requestJson('/tts/models', ttsOverrides())
+    const data = await requestJson('/tts/models', stripSecretMask(ttsOverrides()))
     if (!data || typeof data !== 'object') throw new Error('返回格式无效')
     ttsCatalog.models = Array.isArray(data.models) ? data.models.filter((item) => typeof item === 'string' && item) : []
     ttsCatalog.voices = Array.isArray(data.voices) ? data.voices : []

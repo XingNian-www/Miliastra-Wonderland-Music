@@ -586,9 +586,10 @@ mod tests {
         let current = serde_json::to_value(AppConfig::default()).unwrap();
         let mut saved = VisualProfile::export(&current).unwrap();
         let mut effective = saved.clone();
-        saved
-            .templates
-            .insert("confirm_button".into(), "deps/assets/confirm-button.png".into());
+        saved.templates.insert(
+            "confirm_button".into(),
+            "deps/assets/confirm-button.png".into(),
+        );
         effective.templates.insert(
             "confirm_button".into(),
             "C:\\Users\\XingNian\\Desktop\\5.1\\deps\\assets\\confirm-button.png".into(),

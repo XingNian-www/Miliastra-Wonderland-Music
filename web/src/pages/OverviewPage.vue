@@ -1,13 +1,20 @@
 <template>
   <h1 class="page-title">总览</h1>
   <p class="page-subtitle">实时状态、正在播放与最近命令</p>
-  <div v-if="state.health === null" class="loading-card">正在连接后端…</div>
+  <div v-if="state.connectionError && state.health === null" class="panel" style="margin:0 24px 16px">
+    <div class="panel-body">
+      <p class="config-message err">{{ state.connectionError }}</p>
+      <button class="btn small" @click="retryConnection">重试连接</button>
+      <button class="btn small ghost" @click="go('settings')">检查令牌/地址</button>
+    </div>
+  </div>
+  <div v-else-if="state.health === null" class="loading-card">正在连接后端…</div>
   <div class="page-grid overview-layout">
     <div class="panel overview-now-playing">
-      <div class="panel-head"><h2>正在播放</h2><small>{{ player?.status || '未知' }}</small></div>
+      <div class="panel-head"><h2>正在播放</h2><small>{{ playerStateLabel(player?.status) }}</small></div>
       <div class="panel-body">
         <div class="now-playing-title">{{ track?.name || track?.metadata?.title || '无歌曲' }}</div>
-        <div class="config-field-hint">{{ artists }}{{ track?.albumName ? ' · ' + track.albumName : '' }}</div>
+        <div class="config-field-hint">{{ artists }}{{ album ? ' · ' + album : '' }}</div>
         <div class="now-playing-progress">
           <div class="progress-track"><div class="progress-fill" :style="{ width: percent + '%' }"></div></div>
           <div class="config-field-hint">{{ timeText(progress) }} / {{ timeText(duration) }}</div>
@@ -43,8 +50,9 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { getJson } from '../api.js'
+import { playerStateLabel } from '../util/format.js'
 import { navigateTo } from '../router.js'
-import { state } from '../store.js'
+import { loadStatus, state, toast } from '../store.js'
 
 const player = ref(null)
 const monitor = ref(null)
@@ -52,6 +60,7 @@ const track = computed(() => player.value?.currentTrack || null)
 const progress = computed(() => Number(player.value?.progress || 0))
 const duration = computed(() => Number(player.value?.duration || 0))
 const percent = computed(() => (duration.value > 0 ? Math.min(100, (progress.value / duration.value) * 100) : 0))
+const album = computed(() => player.value?.albumName || track.value?.metadata?.album || '')
 const artists = computed(() => {
   const list = track.value?.metadata?.artists || []
   return Array.isArray(list) && list.length ? list.join(' / ') : (player.value?.singer || '')
@@ -75,12 +84,17 @@ function timeText(seconds) {
 function go(route) {
   navigateTo(route)
 }
+function retryConnection() {
+  refresh()
+}
 async function refresh() {
   try {
-    const [status, mon] = await Promise.allSettled([getJson('/status'), getJson('/monitor')])
-    if (status.status === 'fulfilled') player.value = status.value
-    if (mon.status === 'fulfilled') monitor.value = mon.value
-  } catch {}
+    await loadStatus(true)
+    player.value = state.player
+    monitor.value = state.monitor
+  } catch (error) {
+    if (!state.needsToken) toast(`读取状态失败：${error.message || error}`, 'err')
+  }
 }
 
 let timer = null

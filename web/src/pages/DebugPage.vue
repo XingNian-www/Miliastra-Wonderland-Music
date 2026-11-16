@@ -38,7 +38,10 @@
         <div v-if="images[itemKey(item)]" style="margin-top:8px">
           <img :src="images[itemKey(item)]" style="max-width:100%;border-radius:8px" alt="debug screenshot" />
         </div>
-        <pre v-if="resultOf[itemKey(item)]?.text" class="debug-result">{{ resultOf[itemKey(item)].text }}</pre>
+        <details v-if="resultOf[itemKey(item)]?.text" style="margin-top:8px">
+          <summary class="config-field-hint">响应 JSON（点击展开）</summary>
+          <pre class="debug-result">{{ resultOf[itemKey(item)].text }}</pre>
+        </details>
       </div>
     </section>
   </div>
@@ -48,9 +51,12 @@
 import { computed, reactive, ref } from 'vue'
 import { readToken } from '../api.js'
 import { getJson, requestJson } from '../api.js'
-import { toast } from '../store.js'
+import { handleAuth, state, toast } from '../store.js'
 
 const tabKey = ref('readonly')
+const WRITE_PATHS = new Set([
+  '/debug/run','/debug/run/all','/debug/run/step','/debug/run/cancel','/debug/run/status','/debug/run/replay','/debug/mode','/decisions/submit',
+])
 const busy = ref(null)
 const resultOf = reactive({})
 const images = reactive({})
@@ -64,7 +70,7 @@ const tabs = [
   {
     key: 'readonly',
     label: '只读诊断',
-    hint: 'GET 请求，不触发游戏输入。',
+    hint: 'GET 请求，不触发游戏输入；不需要调试模式。',
     items: [
       item('运行状态', 'GET', '/debug/state'),
       item('界面判定', 'GET', '/debug/ui-state'),
@@ -73,41 +79,45 @@ const tabs = [
       item('运行记录列表', 'GET', '/debug/runs'),
       item('界面目录', 'GET', '/debug/ui-catalogue'),
       item('只读观察摘要', 'GET', '/debug/read-only/summary'),
-      item('只读观察条目', 'GET', '/debug/read-only/entries', { query: [q('cursor'), q('limit')] }),
+      item('只读观察条目', 'GET', '/debug/read-only/entries', { query: [q('since', '游标'), q('limit', '1..50'), q('taskId', '可选')] }),
+      item('只读观察模式', 'GET', '/debug/read-only/mode'),
     ],
   },
   {
     key: 'capture',
     label: '截图',
-    hint: '截图接口返回图片；这里用带 token 的 fetch 显示。',
+    hint: '截图是只读操作，不需要调试模式。',
     items: [item('当前画面截图', 'GET', '/debug/screenshot')],
   },
   {
     key: 'read',
     label: '主动读取',
-    hint: '只读观察模式下可用；mode 切换会改变运行模式。',
+    hint: '只读读取不需要调试模式；切 mode 会改变观察状态（不向游戏发输入）。',
     items: [
       item('读取区域/OCR', 'POST', '/debug/read-only/read', { body: '{"label":"debug","rect":{"x":0,"y":0,"width":800,"height":600},"ocr":true}' }),
       item('切换只读模式', 'POST', '/debug/read-only/mode', { body: '{"enabled":true,"state":"active"}' }),
-      item('读取证据', 'GET', '/debug/read-only/evidence', { query: [q('id'), q('section'), q('cursor')] }),
-      item('模拟聊天', 'POST', '/debug/simulate-chat', { body: '{"text":"[测试玩家]：你好"}' }),
+      item('读取证据', 'GET', '/debug/read-only/evidence', { query: [q('id', '证据ID'), q('section', 'metadata/ocr/parameters/history/image'), q('cursor')] }),
+      item('证据原图', 'GET', '/debug/read-only/image', { query: [q('id', '证据ID')] }),
+      item('模拟聊天', 'POST', '/debug/simulate-chat', { body: '{"role":"user","text":"[测试玩家]：你好"}' }),
     ],
   },
   {
     key: 'write',
     label: '命令与运行',
-    hint: '这些会真的操作游戏或调试执行器，确认后再执行。',
+    hint: '只有这些输入类命令需要调试模式；确认后再执行。',
     items: [
       item('调试命令', 'POST', '/debug/command', { body: '{"command":"click","x":100,"y":200}' }),
-      item('运行调试任务', 'POST', '/debug/run', { body: '{}' }),
-      item('运行全部', 'GET', '/debug/run/all'),
-      item('单步', 'GET', '/debug/run/step'),
-      item('取消', 'GET', '/debug/run/cancel'),
-      item('运行状态', 'GET', '/debug/run/status'),
-      item('运行证据', 'GET', '/debug/run/evidence', { query: [q('id')] }),
-      item('回放', 'GET', '/debug/run/replay', { query: [q('id')] }),
+      item('保存调试任务', 'POST', '/debug/tasks', { body: '{}' }),
+      item('运行调试任务', 'POST', '/debug/run', { body: '{"taskId":"demo","mode":"simulated"}' }),
+      item('运行全部', 'POST', '/debug/run/all', { query: [q('runId', '运行ID')] }),
+      item('单步', 'POST', '/debug/run/step', { query: [q('runId', '运行ID')] }),
+      item('取消', 'POST', '/debug/run/cancel', { query: [q('runId', '运行ID')] }),
+      item('运行状态', 'POST', '/debug/run/status', { query: [q('id', '运行ID')] }),
+      item('运行证据', 'GET', '/debug/run/evidence', { query: [q('id', '运行ID'), q('index', '步骤序号')] }),
+      item('回放', 'POST', '/debug/run/replay', { query: [q('id', '运行ID')] }),
+      item('调试事件回放', 'GET', '/debug/events', { query: [q('since', '游标'), q('limit', '1..50')] }),
       item('调试模式', 'GET', '/debug/mode', { query: [q('enabled', 'true 或 false')] }),
-      item('决策提交', 'POST', '/decisions/submit', { body: '{}' }),
+      item('决策提交', 'POST', '/decisions/submit', { query: [q('id', '决策ID'), q('action', 'confirm/skip/switch_source/ai')] }),
     ],
   },
 ]
@@ -127,23 +137,31 @@ function buildUrl(item) {
 
 async function run(item) {
   const key = itemKey(item)
-  const write = item.method === 'POST' || item.path.startsWith('/debug/run') || item.path === '/debug/mode' || item.path === '/decisions/submit'
+  const write = item.method === 'POST' || WRITE_PATHS.has(item.path)
   if (write && !window.confirm(`确认执行 ${item.method} ${item.path}？`)) return
   busy.value = item
   resultOf[key] = { status: '', text: '' }
   try {
     if (item.path === '/debug/screenshot') {
       const response = await fetch(item.path, { headers: { 'X-Miliastra-Token': readToken() } })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      if (!response.ok) {
+        if (response.status === 401) {
+          state.needsToken = true
+          state.autoRefresh = false
+          throw new Error('访问令牌无效或已过期，请到设置页重新填写')
+        }
+        throw new Error(`HTTP ${response.status}`)
+      }
       const blob = await response.blob()
       if (images[key]) URL.revokeObjectURL(images[key])
       images[key] = URL.createObjectURL(blob)
       resultOf[key] = { status: `图片 ${Math.round(blob.size / 1024)} KB`, text: '' }
       return
     }
+    const url = buildUrl(item)
     const value = item.method === 'GET'
-      ? await getJson(buildUrl(item))
-      : await requestJson(item.path, parseBody(item.body))
+      ? await getJson(url)
+      : await requestJson(url, parseBody(item.body))
     resultOf[key] = { status: 'OK', text: JSON.stringify(value, null, 2) }
   } catch (error) {
     resultOf[key] = { status: '失败', text: String(error && error.message || error) }
@@ -166,7 +184,7 @@ function parseBody(text) {
 
 <style scoped>
 .debug-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
-.debug-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; padding: 0 24px 24px; align-items: start; }
+.debug-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 12px; padding: 0 24px 24px; align-items: start; }
 .debug-params { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
 .debug-param { display: flex; align-items: center; gap: 6px; font-size: var(--fs-tiny); }
 .debug-param input { width: 140px; }

@@ -7,5 +7,5 @@
       <a class="btn small" href="/tools" target="_blank" rel="noreferrer">在新窗口打开</a>
     </div>
   </div>
-  <iframe class="legacy-frame" src="/tools" style="height:calc(100vh - 220px)"></iframe>
+  <iframe ref="frame" class="legacy-frame" src="/tools" style="height:calc(100vh - 220px)" @load="onLoad"></iframe>
 </template>

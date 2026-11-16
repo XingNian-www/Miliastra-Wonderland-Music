@@ -69,7 +69,7 @@
 
 <script setup>
 import { ref } from 'vue'
-import { getJson } from '../api.js'
+import { request } from '../api.js'
 import { toast } from '../store.js'
 
 const mode = ref('recognize')
@@ -142,7 +142,7 @@ async function run() {
   loading.value = true
   const started = performance.now()
   try {
-    result.value = await getJson(path)
+    result.value = await request(path, 'POST')
     elapsed.value = Math.round(performance.now() - started)
   } catch (e) {
     error.value = `调用失败：${e.message || e}`

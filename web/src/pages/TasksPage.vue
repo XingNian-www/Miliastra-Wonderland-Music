@@ -125,9 +125,6 @@
             <button class="btn small ghost" type="button" :disabled="!currentExport.length" @click="exportCurrent">
               导出 JSON
             </button>
-            <button v-if="tab === 'history'" class="btn small warn" type="button" :disabled="!history.length" @click="clearHistory">
-              清空接口记录
-            </button>
           </div>
         </div>
         <div class="panel-body">
@@ -156,7 +153,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { getJson, request, requestJson } from '../api.js'
-import { handleAuth, toast } from '../store.js'
+import { handleAuth, loadStatus, state, toast } from '../store.js'
 
 const STATUS_LABELS = {
   queued: '等待',
@@ -251,7 +248,8 @@ function queryText(query) {
 
 async function loadMonitor() {
   try {
-    const data = await getJson('/monitor')
+    await loadStatus()
+    const data = state.monitor
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('/monitor 响应格式不正确')
     monitor.value = data
     return true

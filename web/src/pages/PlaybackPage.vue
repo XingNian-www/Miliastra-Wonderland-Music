@@ -51,7 +51,6 @@
           <button class="btn" :disabled="busy" @click="action('/skip-prev')">上一首</button>
           <button class="btn" :disabled="busy" @click="action('/skip-next')">下一首</button>
           <button class="btn" :disabled="busy" @click="refreshAll">刷新状态</button>
-          <button class="btn ghost" :disabled="busy || !queue.length" @click="clearQueue">清空队列</button>
         </div>
 
         <div class="volume-control">
@@ -281,6 +280,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { getJson, requestJson } from '../api.js'
+import { loadStatus as refreshStoreStatus, state as storeState } from '../store.js'
 import { handleAuth, state, toast } from '../store.js'
 
 const player = ref(state.player || null)
@@ -378,7 +378,7 @@ function formatDate(ms) {
 function formatBytes(value) {
   let number = Number(value)
   if (!Number.isFinite(number) || number < 0) return '未知'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
   let index = 0
   while (number >= 1024 && index < units.length - 1) { number /= 1024; index += 1 }
   return `${index === 0 ? Math.round(number) : number.toFixed(number >= 10 ? 1 : 2)} ${units[index]}`
@@ -429,7 +429,8 @@ async function action(path) {
 }
 async function loadStatus() {
   try {
-    const value = await getJson('/status')
+    await refreshStoreStatus(true)
+    const value = storeState.player
     player.value = value
     state.player = value
     lastUpdated.value = new Date().toLocaleTimeString()

@@ -27,7 +27,6 @@ fn main() {
     }
 }
 
-
 /// 把 web/dist 打平成 Rust 静态表，供 HTTP 路由直接返回。
 ///
 /// 生成文件写入 OUT_DIR，主 crate 用 include! 引入；不使用第三方嵌入库，
@@ -45,7 +44,9 @@ fn generate_panel_assets() {
     if !dist.join("index.html").exists() {
         // 没有前端产物（本地只跑 Rust 测试/调试）时生成空表，HTTP 面板回退旧页面；
         // 发布流程必须先 `npm run build`，CI 已内置。
-        println!("cargo:warning=web/dist 不存在：面板将不可用，发布前请构建前端（cd web && npm run build）");
+        println!(
+            "cargo:warning=web/dist 不存在：面板将不可用，发布前请构建前端（cd web && npm run build）"
+        );
         std::fs::write(
             &out,
             "pub(crate) const PANEL_INDEX: Option<&str> = None;\npub(crate) static PANEL_ASSETS: &[(&str, &str, &str)] = &[];\n",
@@ -62,7 +63,9 @@ fn generate_panel_assets() {
     let mut entries: Vec<String> = Vec::new();
     let mut stack = vec![dist.join("assets")];
     while let Some(dir) = stack.pop() {
-        let Ok(read) = std::fs::read_dir(&dir) else { continue };
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for item in read.flatten() {
             let path = item.path();
             if path.is_dir() {

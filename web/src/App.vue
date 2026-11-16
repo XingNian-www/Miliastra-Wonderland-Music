@@ -20,8 +20,8 @@
         <span class="chip"><i class="dot"></i><span>服务</span><em>{{ serviceState }}</em></span>
         <span class="chip"><i class="dot"></i><span>播放</span><em>{{ playerState }}</em></span>
         <span class="chip"><i class="dot"></i><span>队列</span><em>{{ queueState }}</em></span>
-        <span class="chip"><i class="dot"></i><span>监听</span><em>一级值守</em></span>
-        <span class="chip"><i class="dot"></i><span>大厅</span><em>—</em></span>
+        <span class="chip"><i class="dot"></i><span>监听</span><em>{{ listenerMode }}</em></span>
+        <span class="chip"><i class="dot"></i><span>大厅</span><em>{{ hallState }}</em></span>
       </div>
       <div class="top-actions">
         <span class="last-refresh">{{ state.lastRefresh || '等待刷新' }}</span>
@@ -30,6 +30,11 @@
         <button class="btn" @click="toggleRefresh">{{ state.autoRefresh ? '暂停刷新' : '继续刷新' }}</button>
       </div>
     </header>
+
+    <div v-if="state.needsToken" class="token-banner" role="alert">
+      <span>访问令牌无效或缺失，接口暂时不可用。</span>
+      <button class="btn small" @click="navigateTo('settings')">前往设置页填入令牌</button>
+    </div>
 
     <div v-if="state.message.text" class="config-message" :class="state.message.kind" style="margin: 8px 24px 0">
       {{ state.message.text }}
@@ -83,20 +88,31 @@ const pageComponent = computed(() => {
   }
 })
 
-const serviceState = computed(() => (state.health ? '运行中' : '未知'))
+const serviceState = computed(() => {
+  if (state.needsToken) return '未授权'
+  if (state.connectionError) return '离线'
+  return state.health ? '运行中' : '未知'
+})
 const playerState = computed(() => {
   const track = state.player?.currentTrack?.metadata?.title
   return track || (state.player ? '空闲' : '未知')
 })
 const queueState = computed(() => {
-  const queue = state.player?.queue
+  const queue = state.monitor?.queue
   if (Array.isArray(queue)) return `${queue.length} 首`
   return '—'
+})
+const listenerMode = computed(() => state.monitor?.chatListener?.mode || '—')
+const hallState = computed(() => {
+  const listener = state.monitor?.chatListener
+  if (!listener) return '—'
+  if (listener.unreadTaskPending) return '有挂起任务'
+  return listener.hallRoundRequired ? '需要轮询' : '正常'
 })
 
 let timer = null
 function tick() {
-  if (!state.autoRefresh) return
+  if (!state.autoRefresh || state.needsToken) return
   loadStatus()
 }
 function toggleRefresh() {

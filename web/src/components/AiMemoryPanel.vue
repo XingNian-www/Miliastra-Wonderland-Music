@@ -18,6 +18,9 @@
             <strong>摘要</strong>
             <pre>{{ hall.summary }}</pre>
           </div>
+          <p v-if="hall.count && hall.count > (hall.lines || []).length" class="config-field-hint">
+            接口返回最近 {{ (hall.lines || []).length }} 条原文，共 {{ hall.count }} 条；更早内容只保留在摘要里。
+          </p>
           <div v-if="(hall.lines || []).length" class="ai-memory-lines">
             <div v-for="(line, index) in hall.lines" :key="index" class="ai-memory-line">
               <strong>{{ line.speaker }}</strong>：{{ line.text }}

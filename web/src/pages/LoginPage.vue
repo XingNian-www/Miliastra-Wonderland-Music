@@ -177,9 +177,16 @@ function completeness(item) {
 function account(provider) {
   return accounts.value[provider] || null
 }
+function maskUserId(value) {
+  const text = String(value == null ? '' : value)
+  if (text.length <= 4) return '****'
+  return `${text.slice(0, 2)}****${text.slice(-2)}`
+}
 function accountName(provider) {
   const info = account(provider)
-  return info?.nickname || info?.userId || '未知'
+  if (info?.nickname) return info.nickname
+  if (info?.userId != null) return `ID ${maskUserId(info.userId)}`
+  return '未知'
 }
 function loginMethod(provider) {
   const method = account(provider)?.loginMethod

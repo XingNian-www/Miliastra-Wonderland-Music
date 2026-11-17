@@ -81,7 +81,7 @@ pub(crate) fn render_chat_preview(
     let (context, hall) = match memory {
         Some(memory) => (
             memory.context(asker)?,
-            memory.hall_context()?,
+            memory.hall_context(asker)?,
         ),
         None => (
             ChatContext {
@@ -191,24 +191,55 @@ mod tests {
     fn preview_merges_bot_lines_into_a_single_hall_block() {
         use crate::features::ai_chat::HallSpeakerRole;
         let config = AppConfig::default();
-        let memory = AiChatMemory::from_connection(rusqlite::Connection::open_in_memory().unwrap())
-            .unwrap();
+        let memory =
+            AiChatMemory::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        // 只放「其他人」的大厅行：当前预览玩家是甲，自己的行应被受众过滤。
         memory
-            .record_hall_line("甲", "有人也喜欢晴天吗", HallSpeakerRole::Player, 10_000, 1)
+            .record_hall_line(
+                "乙",
+                "有人也喜欢晴天吗",
+                HallSpeakerRole::Player,
+                "乙",
+                10_000,
+                1,
+            )
             .unwrap();
         memory
             .record_hall_line(
                 "橘子",
                 "尾巴轻摆：今天想听什么",
                 HallSpeakerRole::Bot,
+                "乙",
                 10_000,
                 2,
             )
             .unwrap();
+        // 甲自己的提问与 BOT 对甲的回复只在个人 messages，不应出现在 hall。
+        memory
+            .record_hall_line(
+                "甲",
+                "我自己的问题",
+                HallSpeakerRole::Player,
+                "甲",
+                10_000,
+                3,
+            )
+            .unwrap();
+        memory
+            .record_hall_line("橘子", "对甲的回答", HallSpeakerRole::Bot, "甲", 10_000, 4)
+            .unwrap();
         let payload = render_chat_preview(&config, Some(&memory), "甲", "你好").unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         let tail = value["tail"].as_str().unwrap();
-        assert!(tail.contains("[甲]：有人也喜欢晴天吗"), "tail: {tail}");
+        assert!(tail.contains("[乙]：有人也喜欢晴天吗"), "tail: {tail}");
+        assert!(
+            !tail.contains("[甲]：我自己的问题"),
+            "自己的 hall 行应被过滤: {tail}"
+        );
+        assert!(
+            !tail.contains("对甲的回答"),
+            "BOT 对当前玩家的回复应被过滤: {tail}"
+        );
         assert_eq!(
             tail.matches("你（橘子）：尾巴轻摆：今天想听什么").count(),
             1,

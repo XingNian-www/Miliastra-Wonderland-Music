@@ -72,12 +72,12 @@
           </tr>
           <tr>
             <td><code>{{ braces('hall') }}</code></td>
-            <td>大厅共享记忆：统一包含玩家与机器人自己的历史。玩家行 <code>[昵称]：内容</code>，机器人自己的行 <code>你（角色名）：内容</code></td>
+            <td>大厅共享记忆：其他玩家的发言与 BOT 对他人的回复。玩家行 <code>[昵称]：内容</code>，BOT 行 <code>你（角色名）：内容</code>；当前玩家自己的问答不在其中</td>
             <td><code>[其他玩家]：今天有什么推荐<br>你（示例角色）：示例回复</code></td>
           </tr>
           <tr>
             <td><code>{{ braces('history') }}</code></td>
-            <td>较早的对话历史占位；个人历史默认不注入，开启 ai_chat.inject_actor_history 后才作为独立消息提供</td>
+            <td>较早的对话历史占位；个人问答历史默认作为独立消息提供（可用 ai_chat.inject_actor_history 关闭）</td>
             <td><code>示例玩家：示例消息</code></td>
           </tr>
           <tr class="ai-tag-deprecated">

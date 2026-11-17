@@ -852,7 +852,7 @@ mod tests {
             ("ai_chat.min_access", json!("owner")),
             ("ai_chat.actor_token_budget", json!(123_456)),
             ("ai_chat.actor_summary_budget", json!(23_456)),
-            ("ai_chat.inject_actor_history", json!(true)),
+            ("ai_chat.inject_actor_history", json!(false)),
             ("ai_chat.hall_token_budget", json!(234_567)),
             ("ai_chat.hall_summary_budget", json!(34_567)),
             ("ai_chat.bot_token_budget", json!(45_678)),

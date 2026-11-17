@@ -51,6 +51,12 @@ pub(crate) const ACTOR_SUMMARY_BUDGET: usize = 4_000;
 /// turns 仍按 96K 落库预算完整保留；但默认注入个人历史后，若把全部原文都
 /// 塞进 messages，小上下文模型会 400、大模型也会显著增加费用与首 token 延迟。
 /// 12K 覆盖线上当前最大约 10.7K，超出时从最旧裁剪、至少保留最近 1 轮。
+///
+/// 发布说明素材（不改协议）：
+/// - hall 摘要是全局单份，无法按受众拆分，可能含当前玩家早期问答；
+/// - <32K context 的模型不建议把本预算开大（默认 12K 已接近其安全上限）；
+/// - 本预算 schema 允许 1K..200K，但上限不等于建议值，过大仍可能触发
+///   provider context length / 费用与首 token 延迟上升。
 pub(crate) const ACTOR_HISTORY_INJECT_TOKEN_BUDGET: usize = 12_000;
 /// 大厅**近期原文**预算：32K token，全局共用。
 ///
@@ -1714,13 +1720,24 @@ impl AiChatMemory {
             );
             transaction.execute(&sql, rusqlite::params_from_iter(aliases.iter()))?
         };
+        // legacy BOT 行没有 actor_key，无法归属；遗忘时保守清空（隐私优先）。
+        let legacy_bot_hall = transaction.execute(
+            "DELETE FROM ai_chat_hall_turns WHERE actor_key = '' AND role = 'bot'",
+            [],
+        )?;
         let actor_names =
             transaction.execute("DELETE FROM ai_chat_actor_names WHERE actor = ?1", [actor])?;
         // legacy 表：功能已废弃、不再读取，但磁盘留存完整回答；遗忘时直接清空。
         let bot_lines = transaction.execute("DELETE FROM ai_chat_bot_lines", [])?;
 
-        let removed_before_summary =
-            facts + turns + actor_summaries + hall + legacy_hall + actor_names + bot_lines;
+        let removed_before_summary = facts
+            + turns
+            + actor_summaries
+            + hall
+            + legacy_hall
+            + legacy_bot_hall
+            + actor_names
+            + bot_lines;
         // hall 摘要无法按人拆分；只有确有删除时才整体清空，避免无谓清掉
         // 所有人的中期大厅上下文。
         let hall_summary = if removed_before_summary > 0 {
@@ -1739,7 +1756,7 @@ impl AiChatMemory {
             crate::ai_trace::clear();
             // 审计只记数量，不记昵称/正文/key。
             log::info!(
-                "AI 记忆遗忘级联：facts {facts}、turns {turns}、个人摘要 {actor_summaries}、大厅行 {hall}+{legacy_hall}、曾用名 {actor_names}、legacy bot 行 {bot_lines}、大厅摘要 {hall_summary}；trace 已清空"
+                "AI 记忆遗忘级联：facts {facts}、turns {turns}、个人摘要 {actor_summaries}、大厅行 {hall}+{legacy_hall}、legacy BOT hall 行 {legacy_bot_hall}、曾用名 {actor_names}、legacy bot 表 {bot_lines}、大厅摘要 {hall_summary}；trace 已清空"
             );
         }
         Ok(removed > 0)
@@ -2523,18 +2540,40 @@ fn injected_turns(turns: &[StoredTurn], budget: usize) -> &[StoredTurn] {
     if turns.is_empty() {
         return turns;
     }
+    let cost = |turn: &StoredTurn| {
+        estimate_tokens(&turn.question) + estimate_tokens(&turn.answer)
+    };
+    let total: usize = turns.iter().map(cost).sum();
+    if total <= budget {
+        return turns;
+    }
+    // 先取最近一段「能放进 budget」的 turns；第一轮无条件保留。
     let mut used = 0usize;
     let mut start = turns.len();
     for turn in turns.iter().rev() {
-        let cost = estimate_tokens(&turn.question) + estimate_tokens(&turn.answer);
-        // 第一轮（最新的）无条件保留，避免极小预算把历史清空。
+        let cost = cost(turn);
         if start < turns.len() && used.saturating_add(cost) > budget {
             break;
         }
         used = used.saturating_add(cost);
         start -= 1;
     }
-    &turns[start..]
+    // 超预算时一次性折半：丢掉更旧的一半，剩下 ≤ budget/2，至少 1 轮。
+    // 不要每轮只滑一条——那会让 messages 的第一条历史每轮变化，前缀缓存
+    // 整段失效。折半后新的 turn 会先追加，直到再次超预算才整体变一次。
+    let selected = &turns[start..];
+    let target = budget / 2;
+    let mut half_used = 0usize;
+    let mut half_start = selected.len();
+    for turn in selected.iter().rev() {
+        let cost = cost(turn);
+        if half_start < selected.len() && half_used.saturating_add(cost) > target {
+            break;
+        }
+        half_used = half_used.saturating_add(cost);
+        half_start -= 1;
+    }
+    &selected[half_start..]
 }
 
 /// 按时间顺序恢复角色化的个人会话，绝不把全局发言冒充该玩家的历史。
@@ -4178,6 +4217,21 @@ mod tests {
                     [],
                 )
                 .unwrap();
+            // legacy BOT 行没有 actor 归属：遗忘时也保守清掉。
+            connection
+                .execute(
+                    "INSERT INTO ai_chat_hall_turns(speaker, text, tokens, added_at, role, actor_key)
+                     VALUES ('橘子', '升级前的BOT回复', 6, 5, 'bot', '')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO ai_chat_hall_turns(speaker, text, tokens, added_at, role, actor_key)
+                     VALUES ('橘子', '别人的BOT回复', 6, 6, 'bot', 'key-b')",
+                    [],
+                )
+                .unwrap();
             connection
                 .execute(
                     "INSERT INTO ai_chat_summaries(scope, summary, tokens, updated_at)
@@ -4188,6 +4242,15 @@ mod tests {
         }
         assert!(memory.forget("uuid-x", "旧甲").unwrap());
         assert!(memory.context("旧甲").unwrap().facts.is_empty());
+        let hall = memory.hall_context("").unwrap();
+        let texts: Vec<&str> = hall
+            .lines
+            .iter()
+            .map(|(_, text, _)| text.as_str())
+            .collect();
+        assert!(!texts.contains(&"升级前的BOT回复"), "legacy BOT 行必须清掉");
+        assert!(texts.contains(&"别人的BOT回复"), "有归属的 BOT 行不能误删");
+        assert!(!texts.contains(&"升级前的发言"), "legacy 玩家行必须清掉");
         assert!(
             !memory.forget("uuid-x", "旧甲").unwrap(),
             "第二次遗忘不应再有删除"
@@ -4848,6 +4911,31 @@ mod tests {
             injected_conversation_history(&config, &context, "甲").len(),
             2
         );
+
+        // 一次折半：7×100 token 超 500 预算 → 先取最近 5 轮（500），
+        // 再丢掉更旧的一半到 2 轮（200 ≤ 250），而不是每轮只滑一条。
+        let many: Vec<StoredTurn> = (0..7)
+            .map(|index| StoredTurn {
+                asker: "甲".into(),
+                question: "问".repeat(50) + &index.to_string(),
+                answer: "答".repeat(50),
+            })
+            .collect();
+        let context = ChatContext {
+            facts: Vec::new(),
+            summary: None,
+            turns: many.clone(),
+        };
+        config.actor_history_token_budget = 500;
+        let first = injected_conversation_history(&config, &context, "甲");
+        assert_eq!(first.len(), 4, "折半后只保留最近 2 轮: {first:?}");
+        assert!(first[0]["content"].as_str().unwrap().contains("问"));
+        // 保留的是最近两轮（第 5、6 条），旧的一半被一次丢掉。
+        assert!(first[0]["content"].as_str().unwrap().ends_with('5'));
+        assert!(first[2]["content"].as_str().unwrap().ends_with('6'));
+        // 同一输入重复调用结果稳定（不会逐轮再滑）。
+        let again = injected_conversation_history(&config, &context, "甲");
+        assert_eq!(first, again);
     }
 
     #[test]

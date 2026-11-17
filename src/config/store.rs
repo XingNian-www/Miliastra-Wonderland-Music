@@ -220,11 +220,86 @@ impl ConfigStore {
         })?;
         Self::ensure_schema(&mut connection, database_path)?;
         Self::ensure_reply_schema(&connection)?;
+        Self::migrate_legacy_answer_prompt(&mut connection)?;
         Ok(Self {
             connection,
             executable_root: executable_root.to_path_buf(),
             bootstrap,
         })
+    }
+
+    /// 一次性迁移旧版 `ai_chat.answer_prompt`：只在模板仍含 `{{bot_history}}`
+    /// 时动手，避免覆盖用户自定义模板。
+    ///
+    /// `{{bot_history}}` 已并入 `{{hall}}`；迁移删除该行/占位，并把旧 hall
+    /// 文案换成按受众拆分后的说明。写回沿用配置库的 revision/快照路径，保证
+    /// 面板历史版本仍可回滚。
+    fn migrate_legacy_answer_prompt(connection: &mut rusqlite::Connection) -> Result<()> {
+        let stored = connection
+            .query_row(
+                "SELECT value_json FROM config_sections WHERE section = 'ai_chat'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        let mut section: Value = serde_json::from_str(&stored)
+            .context("解析 ai_chat 配置段失败（answer_prompt 迁移）")?;
+        let Some(prompt) = section.get("answer_prompt").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let migrated = migrate_answer_prompt_text(prompt);
+        if migrated == prompt {
+            return Ok(());
+        }
+        if !section.is_object() {
+            return Ok(());
+        }
+        let revision: i64 = connection.query_row(
+            "SELECT revision FROM config_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let next_revision = revision + 1;
+        let timestamp = now_ms() as i64;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut sections = read_sections_from(&transaction)?;
+        section["answer_prompt"] = Value::String(migrated);
+        sections.insert("ai_chat".to_string(), section.clone());
+        transaction.execute(
+            "UPDATE config_sections SET value_json = ?1, revision = ?2, updated_at_ms = ?3
+             WHERE section = 'ai_chat'",
+            rusqlite::params![
+                serde_json::to_string(&section)?,
+                next_revision,
+                timestamp
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO config_revisions (revision, snapshot_json, created_at_ms)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                next_revision,
+                serde_json::to_string(&Value::Object(sections))?,
+                timestamp
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE config_meta SET revision = ?1, updated_at_ms = ?2 WHERE id = 1",
+            rusqlite::params![next_revision, timestamp],
+        )?;
+        transaction.execute(
+            "DELETE FROM config_revisions WHERE revision <= ?1",
+            rusqlite::params![next_revision - 50],
+        )?;
+        transaction.commit()?;
+        log::info!(
+            "旧配置 ai_chat.answer_prompt 已迁移：移除 {{{{bot_history}}}} 并更新大厅/历史说明"
+        );
+        Ok(())
     }
 
     /// 当前命令回复存储的独立 revision。
@@ -1158,6 +1233,61 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// 旧 `answer_prompt` 的文本迁移（纯函数，便于单测）。
+///
+/// 只处理已知旧默认片段，再做兜底：
+/// - 旧「对话历史通过独立消息提供」→ 新的默认注入说明；
+/// - 旧 hall 长说明 → 按受众拆分后的说明；
+/// - 含 `{{bot_history}}` 的行整行删除（自定义模板也只删这一行/占位）。
+fn migrate_answer_prompt_text(prompt: &str) -> String {
+    const NEW_HISTORY: &str =
+        "个人问答历史默认作为独立消息提供（可在 ai_chat.inject_actor_history 关闭）。";
+    const NEW_HALL: &str =
+        "大厅共享记忆（其他玩家的发言，以及你对他人的回复；你自己的提问与回复不在其中）：{{hall}}";
+    let mut text = prompt.to_string();
+    for (old, new) in [
+        ("对话历史通过独立消息提供。", NEW_HISTORY),
+        (
+            "对话历史由配置决定是否作为独立消息提供（默认不注入，以大厅共享记忆为准）。",
+            NEW_HISTORY,
+        ),
+        (
+            "大厅近期机器人发言（仅供避免重复，不代表对当前玩家说过）：{{bot_history}}",
+            "",
+        ),
+        (
+            "大厅共享记忆（所有人的发言；你自己说过的话只经机器人历史提供，这里不重复）：{{hall}}",
+            NEW_HALL,
+        ),
+        (
+            "大厅共享记忆（所有人的发言，含你自己此前的回复；你自己的话用「你（角色名）：」标出）：{{hall}}",
+            NEW_HALL,
+        ),
+    ] {
+        if text.contains(old) {
+            text = text.replace(old, new);
+        }
+    }
+    if text.contains("{{bot_history}}") {
+        let had_line =
+            text.contains('\n') && text.lines().any(|line| line.contains("{{bot_history}}"));
+        if had_line {
+            let trailing_newline = text.ends_with('\n');
+            text = text
+                .lines()
+                .filter(|line| !line.contains("{{bot_history}}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if trailing_newline {
+                text.push('\n');
+            }
+        } else {
+            text = text.replace("{{bot_history}}", "");
+        }
+    }
+    text
 }
 
 /// 从 `config_sections` 读取全部段；独立成函数供 [`ConfigStore`] 与迁移事务共用。
@@ -2938,6 +3068,55 @@ mod tests {
             "window 与 screen 不一致必须被拒绝: {error}"
         );
         assert_eq!(stored_revision(&database_path), 1, "交叉校验失败不得写库");
+        cleanup(&root);
+    }
+
+    /// 旧 answer_prompt 含 {{bot_history}} 时在 open 阶段一次性迁移；自定义
+    /// 模板（不含该占位）不动。
+    #[test]
+    fn legacy_bot_history_answer_prompt_is_migrated_on_open() {
+        let (root, database_path) = temp_database("answer-prompt-migrate");
+        let bootstrap = test_bootstrap(&database_path);
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let old_prompt = "关于当前玩家的事实：{{facts}}更早的对话摘要：{{summary}}\
+对话历史通过独立消息提供。\
+大厅近期机器人发言（仅供避免重复，不代表对当前玩家说过）：{{bot_history}}\
+大厅共享记忆（所有人的发言；你自己说过的话只经机器人历史提供，这里不重复）：{{hall}}";
+        let mut sections = full_sections(&store);
+        sections["ai_chat"]["answer_prompt"] = json!(old_prompt);
+        store.save(1, sections).unwrap();
+        drop(store);
+
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        let prompt = store.load_full().unwrap().ai_chat.answer_prompt;
+        assert!(!prompt.contains("{{bot_history}}"), "{prompt}");
+        assert!(!prompt.contains("大厅近期机器人发言"), "{prompt}");
+        assert!(prompt.contains("其他玩家的发言"), "{prompt}");
+        assert!(
+            prompt.contains("个人问答历史默认作为独立消息提供"),
+            "{prompt}"
+        );
+        assert_eq!(store.current_revision().unwrap(), 3, "迁移应写回一版");
+        drop(store);
+
+        // 再次打开不应重复迁移/继续涨 revision。
+        let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+        assert_eq!(store.current_revision().unwrap(), 3);
+        drop(store);
+
+        // 自定义模板（不含 bot_history）保持原样。
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        let mut sections = full_sections(&store);
+        sections["ai_chat"]["answer_prompt"] = json!("自定义 {{facts}} 与 {{hall}}");
+        store.save(3, sections).unwrap();
+        drop(store);
+        let store =
+            ConfigStore::open(&database_path, &root, test_bootstrap(&database_path)).unwrap();
+        assert_eq!(
+            store.load_full().unwrap().ai_chat.answer_prompt,
+            "自定义 {{facts}} 与 {{hall}}"
+        );
+        drop(store);
         cleanup(&root);
     }
 

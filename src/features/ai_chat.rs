@@ -2536,6 +2536,13 @@ pub(crate) fn injected_conversation_history(
 }
 
 /// 从 turns 尾部（最近）向前挑出注入预算内的连续一段，至少保留 1 轮。
+/// 注入历史的边界块大小：边界按绝对 turn 位置每 8 轮跳一次。
+///
+/// messages 前缀缓存要求「第一条历史」尽量稳定。若每轮只滑一条，边界每轮
+/// 变化，整段消息前缀都会失效；这里把 raw_start 向上取整到 8 的倍数，追加
+/// 新 turn 时边界多数轮保持不变，只在跨块时跳一次。
+const INJECT_BOUNDARY_CHUNK: usize = 8;
+
 fn injected_turns(turns: &[StoredTurn], budget: usize) -> &[StoredTurn] {
     if turns.is_empty() {
         return turns;
@@ -2547,33 +2554,23 @@ fn injected_turns(turns: &[StoredTurn], budget: usize) -> &[StoredTurn] {
     if total <= budget {
         return turns;
     }
-    // 先取最近一段「能放进 budget」的 turns；第一轮无条件保留。
+    // 先按预算算 raw_start（最近的连续一段，第一轮无条件保留）。
     let mut used = 0usize;
-    let mut start = turns.len();
+    let mut raw_start = turns.len();
     for turn in turns.iter().rev() {
         let cost = cost(turn);
-        if start < turns.len() && used.saturating_add(cost) > budget {
+        if raw_start < turns.len() && used.saturating_add(cost) > budget {
             break;
         }
         used = used.saturating_add(cost);
-        start -= 1;
+        raw_start -= 1;
     }
-    // 超预算时一次性折半：丢掉更旧的一半，剩下 ≤ budget/2，至少 1 轮。
-    // 不要每轮只滑一条——那会让 messages 的第一条历史每轮变化，前缀缓存
-    // 整段失效。折半后新的 turn 会先追加，直到再次超预算才整体变一次。
-    let selected = &turns[start..];
-    let target = budget / 2;
-    let mut half_used = 0usize;
-    let mut half_start = selected.len();
-    for turn in selected.iter().rev() {
-        let cost = cost(turn);
-        if half_start < selected.len() && half_used.saturating_add(cost) > target {
-            break;
-        }
-        half_used = half_used.saturating_add(cost);
-        half_start -= 1;
-    }
-    &selected[half_start..]
+    // 绝对位置量化：向上取整到 8 轮块；clamp 到 len-1 保证至少保留最新 1 轮。
+    // 只可能比 raw_start 更旧（丢更多），因此成本一定 ≤ budget。
+    let rounded =
+        ((raw_start + INJECT_BOUNDARY_CHUNK - 1) / INJECT_BOUNDARY_CHUNK) * INJECT_BOUNDARY_CHUNK;
+    let start = rounded.min(turns.len() - 1);
+    &turns[start..]
 }
 
 /// 按时间顺序恢复角色化的个人会话，绝不把全局发言冒充该玩家的历史。
@@ -4912,8 +4909,8 @@ mod tests {
             2
         );
 
-        // 一次折半：7×100 token 超 500 预算 → 先取最近 5 轮（500），
-        // 再丢掉更旧的一半到 2 轮（200 ≤ 250），而不是每轮只滑一条。
+        // 绝对位置量化：7 轮超预算时 raw_start=3 → ceil(3/8)*8=8 →
+        // clamp 到 len-1=6，只保留最新 1 轮；成本 ≤ budget。
         let many: Vec<StoredTurn> = (0..7)
             .map(|index| StoredTurn {
                 asker: "甲".into(),
@@ -4928,14 +4925,49 @@ mod tests {
         };
         config.actor_history_token_budget = 500;
         let first = injected_conversation_history(&config, &context, "甲");
-        assert_eq!(first.len(), 4, "折半后只保留最近 2 轮: {first:?}");
+        assert_eq!(first.len(), 2, "量化边界应只保留最新 1 轮: {first:?}");
         assert!(first[0]["content"].as_str().unwrap().contains("问"));
-        // 保留的是最近两轮（第 5、6 条），旧的一半被一次丢掉。
-        assert!(first[0]["content"].as_str().unwrap().ends_with('5'));
-        assert!(first[2]["content"].as_str().unwrap().ends_with('6'));
-        // 同一输入重复调用结果稳定（不会逐轮再滑）。
+        assert!(first[0]["content"].as_str().unwrap().ends_with('6'));
+        // 同一输入重复调用结果稳定。
         let again = injected_conversation_history(&config, &context, "甲");
         assert_eq!(first, again);
+    }
+
+    /// 连续 append 8 轮：量化边界最多跳一次，且裁剪后仍不超预算。
+    #[test]
+    fn injected_boundary_is_stable_across_appends() {
+        let mut turns: Vec<StoredTurn> = (0..40)
+            .map(|_| StoredTurn {
+                asker: "甲".into(),
+                question: "问".repeat(100),
+                answer: String::new(),
+            })
+            .collect();
+        let budget = 1_200usize;
+        let mut starts = Vec::new();
+        for _ in 0..=8 {
+            let kept = injected_turns(&turns, budget);
+            let start = turns.len() - kept.len();
+            let cost: usize = kept
+                .iter()
+                .map(|turn| {
+                    estimate_tokens(&turn.question) + estimate_tokens(&turn.answer)
+                })
+                .sum();
+            assert!(cost <= budget, "裁剪成本 {cost} 超过预算 {budget}");
+            starts.push(start);
+            turns.push(StoredTurn {
+                asker: "甲".into(),
+                question: "问".repeat(100),
+                answer: String::new(),
+            });
+        }
+        let mut distinct = starts.clone();
+        distinct.dedup();
+        assert!(
+            distinct.len() <= 2,
+            "8 次 append 边界最多变 1 次: {starts:?}"
+        );
     }
 
     #[test]

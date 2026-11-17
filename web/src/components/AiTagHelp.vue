@@ -1,7 +1,7 @@
 <template>
   <section class="panel" style="margin-top:12px">
     <div class="panel-head">
-      <h2>AI 标签示例</h2>
+      <h2>AI 标签与变量示例</h2>
       <small>标签原样写进回复才会生效；写错会被当成普通文字</small>
     </div>
     <div class="panel-body ai-tag-help">
@@ -32,7 +32,7 @@
       </div>
 
       <div class="ai-tag-row">
-        <code>哼，算你识相喵。{表情包:2:傲娇}</code>
+        <code>示例回复文字。{表情包:2:傲娇}</code>
         <div>
           <b>完整示例</b>
           <p>文字照常发送，表情作为单独一条紧随其后；标签缺失或写错不会中断文字。</p>
@@ -53,37 +53,37 @@
           <tr>
             <td><code>{{ braces('keyword') }}</code></td>
             <td>全局点歌关键词 / 角色名，来自 <code>ai_chat.keyword</code></td>
-            <td><code>橘子</code></td>
+            <td><code>示例角色</code></td>
           </tr>
           <tr>
             <td><code>{{ braces('asker') }}</code></td>
             <td>本轮说话人的游戏昵称</td>
-            <td><code>示例玩家D</code></td>
+            <td><code>示例玩家</code></td>
           </tr>
           <tr>
             <td><code>{{ braces('facts') }}</code></td>
             <td>当前玩家的事实记忆（面板「AI 记忆」里维护）</td>
-            <td><code>- 名字：示例玩家D  - 喜欢：橘子</code></td>
+            <td><code>- 名字：示例玩家<br>- 喜欢：示例物品</code></td>
           </tr>
           <tr>
             <td><code>{{ braces('summary') }}</code></td>
             <td>与该玩家更早对话的压缩摘要</td>
-            <td><code>昨天聊过留学和晚安</code></td>
+            <td><code>之前聊过某个话题</code></td>
           </tr>
           <tr>
             <td><code>{{ braces('hall') }}</code></td>
             <td>大厅共享记忆：最近其他玩家/机器人发言，逐行 <code>[昵称]：内容</code></td>
-            <td><code>[示例玩家I]：橘子会啃陈皮吗</code></td>
+            <td><code>[其他玩家]：今天有什么推荐</code></td>
           </tr>
           <tr>
             <td><code>{{ braces('bot_history') }}</code></td>
             <td>机器人自己最近在大厅说过的话（只用于避免重复，不代表对当前玩家说）</td>
-            <td><code>你（橘子）：哼，才不是喵</code></td>
+            <td><code>你（示例角色）：示例回复</code></td>
           </tr>
           <tr>
             <td><code>{{ braces('history') }}</code></td>
             <td>较早的对话历史文本（正常由独立消息提供，模板里一般留空）</td>
-            <td><code>玩家：晚安 橘子</code></td>
+            <td><code>示例玩家：示例消息</code></td>
           </tr>
           <tr class="ai-tag-deprecated">
             <td><code>{{ braces('question') }}</code> <code>{{ braces('recent_actions') }}</code> <code>{{ braces('commands') }}</code></td>

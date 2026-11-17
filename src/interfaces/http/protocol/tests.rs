@@ -2910,7 +2910,8 @@ fn web_tool_routes_are_queued_json_post_routes() {
     }
     assert!(!is_mutating_route("/tools/task"));
     assert!(is_json_route("/tools/task"));
-    assert!(TOOLS_PAGE.contains("Miliastra 高级控制"));
+    let tools_page = include_str!("../../../../web/src/pages/ToolsPage.vue");
+    assert!(tools_page.contains("高级控制"));
 }
 
 #[test]
@@ -3088,7 +3089,8 @@ fn web_tool_templates_expose_configured_fixed_regions() {
             "template threshold mismatch: {name}"
         );
     }
-    assert!(TOOLS_PAGE.contains("useConfiguredTemplateRegion"));
+    let tools_page = include_str!("../../../../web/src/pages/ToolsPage.vue");
+    assert!(tools_page.contains("读取配置区域"));
 }
 
 #[test]

@@ -109,7 +109,6 @@ use uuid::Uuid;
 
 const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
-const TOOLS_PAGE: &str = include_str!("tools.html");
 
 type RouteHandler =
     fn(&[(String, String)], &HttpSharedState) -> std::result::Result<String, AppError>;
@@ -1406,17 +1405,6 @@ fn handle_request(
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
-    if request.path == "/tools" && request.query.is_empty() {
-        if request.method != "GET" {
-            return Err(method_not_allowed("工具页面仅支持GET请求"));
-        }
-        return Ok(body_response(
-            StatusCode::OK,
-            "text/html; charset=utf-8",
-            TOOLS_PAGE.to_string(),
-            cors_headers(&request, &state.config.http.host, state.config.http.port),
-        ));
-    }
     if request.path == "/favicon.ico" {
         return Ok(empty_response(
             StatusCode::NO_CONTENT,
@@ -1759,7 +1747,7 @@ fn sanitized_query(query: &[(String, String)]) -> HashMap<String, String> {
 
 fn requires_access_token(config: &crate::config::HttpConfig, path: &str) -> bool {
     !config.access_token.trim().is_empty()
-        && !matches!(path, "/" | "/tools" | "/favicon.ico" | "/health")
+        && !matches!(path, "/" | "/favicon.ico" | "/health")
         && !path.starts_with("/assets/")
 }
 
@@ -1808,7 +1796,7 @@ fn enforce_method(
     }
     if matches!(
         request.path.as_str(),
-        "/" | "/tools"
+        "/"
             | "/screenshot"
             | "/hall-screenshot"
             | "/debug/screenshot"

@@ -608,3 +608,41 @@ input[type="checkbox"] { width: 34px; height: 20px; flex: none; }
   color: var(--text-2);
 }
 .config-group-card > .config-group-head:first-child { border-radius: 0; }
+
+/* ---------- 命令保存条 / 任务详情 / 命令选中 ---------- */
+.command-savebar {
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: rgba(11, 13, 18, 0.92);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--sep-1);
+  border-radius: var(--radius-m);
+}
+.command-item.selected { background: rgba(91, 140, 255, 0.06); border-radius: 10px; }
+.command-head { cursor: pointer; }
+.task-item.selected { border-color: rgba(91, 140, 255, 0.5); background: var(--accent-soft); }
+.task-detail-panel { position: sticky; top: 76px; align-self: start; }
+@media (max-width: 900px) {
+  .task-detail-panel { position: static; }
+}
+
+/* 视觉档案右栏吸顶 */
+.visual-side { position: sticky; top: 76px; max-height: calc(100vh - 96px); overflow: auto; height: auto !important; }
+
+/* 工具页：左侧工具卡 + 右侧固定结果 */
+.tools-layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; align-items: start; padding: 0 22px; }
+.tools-layout .tools-grid { padding: 0; }
+.tools-side { position: sticky; top: 76px; display: flex; flex-direction: column; gap: 10px; }
+.tools-side .panel { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28); }
+.tools-side .tools-output { min-height: 96px; max-height: 220px; }
+@media (max-width: 1100px) {
+  .tools-layout { grid-template-columns: 1fr; }
+  .tools-side { position: static; }
+}

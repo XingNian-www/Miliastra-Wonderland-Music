@@ -2,53 +2,65 @@
   <h1 class="page-title">调试沙盒</h1>
   <p class="page-subtitle">只读诊断、截图、主动读取与调试命令；写操作都会二次确认</p>
 
-  <div class="panel" style="margin:0 24px 16px">
-    <div class="panel-body">
-      <div class="debug-tabs">
-        <button v-for="tab in tabs" :key="tab.key" class="btn small" :class="{ primary: tabKey === tab.key }" @click="tabKey = tab.key">{{ tab.label }}</button>
+  <div class="debug-layout">
+    <aside class="panel debug-nav">
+      <div class="panel-body">
+        <div class="debug-tabs">
+          <button v-for="tab in tabs" :key="tab.key" class="btn small" :class="{ primary: tabKey === tab.key }" @click="tabKey = tab.key">{{ tab.label }}</button>
+        </div>
+        <p class="config-field-hint">{{ currentTab.hint }}</p>
+        <div class="debug-endpoints">
+          <button
+            v-for="item in currentTab.items"
+            :key="item.path + item.method"
+            type="button"
+            class="debug-endpoint"
+            :class="{ active: activeItem && itemKey(activeItem) === itemKey(item) }"
+            @click="activeKey = itemKey(item)"
+          >
+            <span class="debug-endpoint-label">{{ item.label }}</span>
+            <span class="config-field-hint">{{ item.method }} {{ item.path }}</span>
+          </button>
+        </div>
       </div>
-      <p class="config-field-hint">{{ currentTab.hint }}</p>
-    </div>
-  </div>
+    </aside>
 
-  <div class="debug-grid">
-    <section v-for="item in currentTab.items" :key="item.path + item.method" class="panel">
+    <section v-if="activeItem" class="panel debug-runner">
       <div class="panel-head">
-        <h2>{{ item.label }}</h2>
-        <span class="config-effect">{{ item.method }} {{ item.path }}</span>
+        <h2>{{ activeItem.label }}</h2>
+        <span class="config-effect">{{ activeItem.method }} {{ activeItem.path }}</span>
       </div>
       <div class="panel-body">
-        <div v-if="item.query && item.query.length" class="debug-params">
-          <label v-for="param in item.query" :key="param.key" class="debug-param">
+        <div v-if="activeItem.query && activeItem.query.length" class="debug-params">
+          <label v-for="param in activeItem.query" :key="param.key" class="debug-param">
             <span>{{ param.key }}</span>
             <input v-model="param.value" :placeholder="param.placeholder || ''" />
           </label>
         </div>
         <textarea
-          v-if="item.method === 'POST'"
-          v-model="item.body"
-          class="config-textarea"
-          style="width:100%;min-height:70px;font-family:monospace"
+          v-if="activeItem.method === 'POST'"
+          v-model="activeItem.body"
+          class="config-textarea debug-body"
           placeholder='请求体 JSON，例如 {"command":"click","x":10,"y":20}'
         ></textarea>
-        <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
-          <button class="btn small" :disabled="busy === item" @click="run(item)">{{ busy === item ? '执行中…' : '执行' }}</button>
-          <span v-if="resultOf[itemKey(item)]?.status" class="config-field-hint">{{ resultOf[itemKey(item)].status }}</span>
+        <div class="debug-run-actions">
+          <button class="btn small" :disabled="busy === activeItem" @click="run(activeItem)">{{ busy === activeItem ? '执行中…' : '执行' }}</button>
+          <span v-if="resultOf[itemKey(activeItem)]?.status" class="config-field-hint">{{ resultOf[itemKey(activeItem)].status }}</span>
+          <span style="flex:1"></span>
+          <button v-if="resultOf[itemKey(activeItem)]?.text" class="btn small ghost" type="button" @click="clearResult(activeItem)">清空结果</button>
         </div>
-        <div v-if="images[itemKey(item)]" style="margin-top:8px">
-          <img :src="images[itemKey(item)]" style="max-width:100%;border-radius:8px" alt="debug screenshot" />
+        <div v-if="images[itemKey(activeItem)]" class="debug-image">
+          <img :src="images[itemKey(activeItem)]" alt="debug screenshot" />
         </div>
-        <details v-if="resultOf[itemKey(item)]?.text" style="margin-top:8px">
-          <summary class="config-field-hint">响应 JSON（点击展开）</summary>
-          <pre class="debug-result">{{ resultOf[itemKey(item)].text }}</pre>
-        </details>
+        <pre v-if="resultOf[itemKey(activeItem)]?.text" class="debug-result">{{ resultOf[itemKey(activeItem)].text }}</pre>
+        <p v-else class="config-field-hint">还没有响应；点「执行」后结果固定显示在这里。</p>
       </div>
     </section>
   </div>
 </template>
 
 <script setup>
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { readToken } from '../api.js'
 import { getJson, request, requestJson } from '../api.js'
 import { handleAuth, state, toast } from '../store.js'
@@ -58,6 +70,7 @@ const WRITE_PATHS = new Set([
   '/debug/run','/debug/run/all','/debug/run/step','/debug/run/cancel','/debug/run/status','/debug/run/replay','/debug/mode','/decisions/submit',
 ])
 const busy = ref(null)
+const activeKey = ref('')
 const resultOf = reactive({})
 const images = reactive({})
 
@@ -123,8 +136,23 @@ const tabs = [
 ]
 
 const currentTab = computed(() => tabs.find((tab) => tab.key === tabKey.value) || tabs[0])
+const activeItem = computed(() => currentTab.value.items.find((item) => itemKey(item) === activeKey.value) || currentTab.value.items[0] || null)
+
+watch(
+  () => tabKey.value,
+  () => {
+    activeKey.value = currentTab.value.items.length ? itemKey(currentTab.value.items[0]) : ''
+  },
+  { immediate: true },
+)
 
 function itemKey(item) { return `${item.method} ${item.path}` }
+
+function clearResult(item) {
+  const key = itemKey(item)
+  resultOf[key] = { status: '', text: '' }
+  delete images[key]
+}
 
 function buildUrl(item) {
   const params = new URLSearchParams()
@@ -188,6 +216,37 @@ function parseBody(text) {
 }
 </script>
 
+<style scoped>
+.debug-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+.debug-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 12px; padding: 0 24px 24px; align-items: start; }
+.debug-params { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.debug-param { display: flex; align-items: center; gap: 6px; font-size: var(--fs-tiny); }
+.debug-param input { width: 140px; }
+.debug-result { margin: 8px 0 0; max-height: 280px; overflow: auto; background: var(--bg-1); border-radius: 8px; padding: 8px; font-size: var(--fs-tiny); white-space: pre-wrap; word-break: break-all; }
+</style>
+<style scoped>
+.debug-layout { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); gap: 12px; padding: 0 22px 24px; align-items: start; }
+.debug-nav { position: sticky; top: 76px; }
+.debug-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.debug-endpoints { display: flex; flex-direction: column; gap: 3px; max-height: calc(100vh - 260px); overflow: auto; margin-top: 8px; }
+.debug-endpoint { display: flex; flex-direction: column; gap: 1px; width: 100%; text-align: left; padding: 6px 9px; border: 1px solid transparent; border-radius: 8px; background: rgba(255, 255, 255, 0.02); color: var(--text-1); cursor: pointer; }
+.debug-endpoint:hover { background: rgba(255, 255, 255, 0.05); }
+.debug-endpoint.active { border-color: rgba(91, 140, 255, 0.5); background: var(--accent-soft); }
+.debug-endpoint-label { font-size: 12px; }
+.debug-endpoint .config-field-hint { font-size: 10.5px; }
+.debug-runner { position: sticky; top: 76px; }
+.debug-params { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin-bottom: 8px; }
+.debug-param { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--text-2); }
+.debug-body { width: 100%; min-height: 80px; font-family: var(--font-mono); }
+.debug-run-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.debug-image img { max-width: 100%; border-radius: 8px; margin-top: 8px; }
+.debug-result { margin: 10px 0 0; max-height: calc(100vh - 340px); overflow: auto; background: var(--bg-1); border-radius: 8px; padding: 10px; font-size: 11.5px; white-space: pre-wrap; word-break: break-all; }
+@media (max-width: 900px) {
+  .debug-layout { grid-template-columns: 1fr; padding: 0 16px 24px; }
+  .debug-nav, .debug-runner { position: static; }
+  .debug-endpoints { max-height: 240px; }
+}
+</style>
 <style scoped>
 .debug-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
 .debug-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 12px; padding: 0 24px 24px; align-items: start; }

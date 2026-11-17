@@ -3,7 +3,7 @@
   <p class="page-subtitle">音乐平台登录、账号凭据与酷狗 VIP 状态</p>
 
   <div class="page-grid">
-    <section class="panel wide">
+    <section id="loginSessionPanel" class="panel wide">
       <div class="panel-head">
         <h2>登录会话</h2>
         <small>{{ loginMeta }}</small>
@@ -277,8 +277,10 @@ async function startLogin(provider) {
   actionText.value = `正在发起 ${providerLabel(provider)} 登录…`
   try {
     await requestJson('/player/login/start', { provider })
-    actionText.value = '登录请求已提交'
+    actionText.value = '登录请求已提交，二维码/阶段在页面顶部「登录会话」'
+    toast('登录请求已提交，请查看顶部登录会话', 'ok')
     await loadAll()
+    document.getElementById('loginSessionPanel')?.scrollIntoView({ block: 'start', behavior: 'smooth' })
   } catch (error) {
     report(error)
   } finally {

@@ -200,7 +200,7 @@ import { loadStatus, state, toast } from '../store.js'
 
 const monitor = ref(null)
 const loading = ref(false)
-const busy = ref('')
+const busy = ref(false)
 const refreshError = ref('')
 const chatText = ref('')
 const usePrefix = ref(true)
@@ -409,7 +409,7 @@ async function refresh(manual = false) {
 
 async function action(label, path) {
   if (busy.value) return false
-  busy.value = label
+  busy.value = true
   let ok = false
   try {
     const text = await request(path, 'POST')
@@ -418,7 +418,7 @@ async function action(label, path) {
   } catch (error) {
     toast(`${label}失败：${error.message || error}`, 'err')
   } finally {
-    busy.value = ''
+    busy.value = false
     await refresh()
   }
   return ok

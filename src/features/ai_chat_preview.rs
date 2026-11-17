@@ -45,7 +45,8 @@ fn block_json(block: &PromptBlock) -> serde_json::Value {
 pub(crate) fn render_chat_preview(
     config: &AppConfig,
     memory: Option<&AiChatMemory>,
-    asker: &str,
+    asker_display: &str,
+    asker_key: &str,
     question: &str,
 ) -> anyhow::Result<String> {
     let chat = &config.ai_chat;
@@ -80,8 +81,8 @@ pub(crate) fn render_chat_preview(
 
     let (context, hall) = match memory {
         Some(memory) => (
-            memory.context(asker)?,
-            memory.hall_context(asker)?,
+            memory.context(asker_key)?,
+            memory.hall_context(asker_key)?,
         ),
         None => (
             ChatContext {
@@ -102,7 +103,7 @@ pub(crate) fn render_chat_preview(
         question,
         context: &context,
         allowed_commands: &allowed_commands,
-        asker,
+        asker: asker_display,
         hall: &hall,
         now_unix,
     });
@@ -176,7 +177,7 @@ mod tests {
             && config.tts.trigger_scope == crate::features::tts::TtsTriggerScope::AiChat
             && !config.tts.api_key.trim().is_empty();
         let expected = ai_chat::response_system_prompt_with_tools(chat, look, speak, chat.allow_commands);
-        let payload = render_chat_preview(&config, None, "预览玩家", "问题").unwrap();
+        let payload = render_chat_preview(&config, None, "预览玩家", "预览玩家", "问题").unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["system"].as_str().unwrap(), expected);
         assert!(value["tail"].as_str().unwrap().contains("问题"));
@@ -228,7 +229,7 @@ mod tests {
         memory
             .record_hall_line("橘子", "对甲的回答", HallSpeakerRole::Bot, "甲", 10_000, 4)
             .unwrap();
-        let payload = render_chat_preview(&config, Some(&memory), "甲", "你好").unwrap();
+        let payload = render_chat_preview(&config, Some(&memory), "甲", "甲", "你好").unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         let tail = value["tail"].as_str().unwrap();
         assert!(tail.contains("[乙]：有人也喜欢晴天吗"), "tail: {tail}");
@@ -256,10 +257,40 @@ mod tests {
         assert!(!tail.contains("大厅近期机器人发言"), "独立 Bot 块已删除: {tail}");
     }
 
+    /// 预览必须用 canonical key 查记忆，display 只用于 asker 文案。
+    #[test]
+    fn preview_resolves_memory_key_separately_from_display_name() {
+        let config = AppConfig::default();
+        let memory =
+            AiChatMemory::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        memory
+            .add_fact("uuid-甲", "只属于 UUID 玩家的事实", 1)
+            .unwrap();
+        let payload =
+            render_chat_preview(&config, Some(&memory), "显示昵称", "uuid-甲", "问题").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let tail = value["tail"].as_str().unwrap();
+        assert!(tail.contains("只属于 UUID 玩家的事实"), "tail: {tail}");
+        assert!(
+            tail.contains("本轮说话人：显示昵称"),
+            "askser 文案用 display: {tail}"
+        );
+        // 用 display 当 key 查不到该记忆，证明两者已分离。
+        let payload =
+            render_chat_preview(&config, Some(&memory), "显示昵称", "显示昵称", "问题").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            !value["tail"]
+                .as_str()
+                .unwrap()
+                .contains("只属于 UUID 玩家的事实")
+        );
+    }
+
     #[test]
     fn preview_reports_draft_and_warnings() {
         let config = AppConfig::default();
-        let payload = render_chat_preview(&config, None, "预览玩家", "问题").unwrap();
+        let payload = render_chat_preview(&config, None, "预览玩家", "预览玩家", "问题").unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["draft"], true);
         assert!(!value["warnings"].as_array().unwrap().is_empty());

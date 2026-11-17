@@ -537,13 +537,21 @@ pub(crate) fn entry_json(id: u64) -> Option<String> {
     serde_json::to_string(&entry).ok()
 }
 
-/// 测试辅助：清空全局环形缓冲并重置 id。
-#[cfg(test)]
-pub(crate) fn clear_for_tests() {
+/// 清空完整请求报文（内存环形缓冲）。
+///
+/// 由 `@忘记我` 的遗忘级联调用：trace 里含 system/messages/tools 原文，
+/// 无法按 actor 过滤，只能保守全清；这是一个低频隐私操作。
+pub(crate) fn clear() {
     if let Ok(mut store) = store().lock() {
         store.entries.clear();
         store.next_id = 1;
     }
+}
+
+/// 测试辅助：清空全局环形缓冲并重置 id。
+#[cfg(test)]
+pub(crate) fn clear_for_tests() {
+    clear();
 }
 
 #[cfg(test)]

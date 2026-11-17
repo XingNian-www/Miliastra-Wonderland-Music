@@ -77,7 +77,7 @@
           </tr>
           <tr>
             <td><code>{{ braces('history') }}</code></td>
-            <td>较早的对话历史占位；个人问答历史默认作为独立消息提供（可用 ai_chat.inject_actor_history 关闭）</td>
+            <td>较早的对话历史占位；默认注入个人问答历史，hall 只含其他玩家/对别人回复；关闭 ai_chat.inject_actor_history 后个人历史不注入</td>
             <td><code>示例玩家：示例消息</code></td>
           </tr>
           <tr class="ai-tag-deprecated">

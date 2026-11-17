@@ -386,7 +386,10 @@ impl ApplicationRuntime {
         let actor = self.canonical_actor_name(&parsed.username);
         match command {
             ai_chat::AiChatCommand::Forget => {
-                let removed = self.business.ai_chat_memory.forget(&actor)?;
+                let removed = self
+                    .business
+                    .ai_chat_memory
+                    .forget(&actor, &parsed.username)?;
                 // 在途的后台抽取/压缩是在这次删除之前入队的，照常提交会把刚忘掉的
                 // 记忆再写回来；推进代际让它们提交前自己作废。
                 self.business

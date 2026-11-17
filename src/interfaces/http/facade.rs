@@ -1402,10 +1402,21 @@ impl HttpAiPort for ApplicationHttpAiFacade {
         asker: &str,
         question: &str,
     ) -> Result<String> {
+        // 与真实请求同一套身份：asker 可能是昵称或 UUID，必须解析成记忆键；
+        // 展示名只用于 asker 文案，不能拿去查记忆/过滤 hall。
+        let key = self.resolve_key(asker);
+        let display = self
+            .display_name
+            .as_deref()
+            .map(|display_name| display_name(&key))
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| asker.to_owned());
         crate::features::ai_chat_preview::render_chat_preview(
             config,
             self.memory.as_deref(),
-            asker,
+            &display,
+            &key,
             question,
         )
     }
@@ -1507,9 +1518,9 @@ impl HttpAiPort for ApplicationHttpAiFacade {
     fn forget_actor(&self, actor: &str) -> Result<String> {
         let memory = self.memory()?;
         let key = self.resolve_key(actor);
-        let mut removed = memory.forget(&key)?;
+        let mut removed = memory.forget(&key, actor)?;
         // 旧行可能直接存在显示名之下；原样删只命中字面量行，不会误删别人。
-        if key != actor && memory.forget(actor)? {
+        if key != actor && memory.forget(actor, actor)? {
             removed = true;
         }
         // 在途抽取看到的是删除前的 facts，提交时会把它们写回来。

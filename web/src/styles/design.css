@@ -595,3 +595,16 @@ input[type="checkbox"] { width: 34px; height: 20px; flex: none; }
   .play-mode-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .playback-player-panel .controls { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
+
+/* 分组标题不做浮动：sticky 偏移在新顶栏下会悬在内容中间，且圆角被裁 */
+.config-group-head {
+  position: static !important;
+  top: auto !important;
+  background: transparent !important;
+  border-bottom: 1px solid var(--sep-1);
+  padding: 10px 12px 8px;
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
+  color: var(--text-2);
+}
+.config-group-card > .config-group-head:first-child { border-radius: 0; }

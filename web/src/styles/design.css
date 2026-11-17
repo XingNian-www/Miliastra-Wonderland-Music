@@ -537,3 +537,32 @@ input[type="checkbox"] { width: 34px; height: 20px; flex: none; }
 .overview-layout .panel-body { display: flex; flex-direction: column; }
 .overview-layout .overview-now-playing .panel-body,
 .overview-layout .overview-quick .panel-body { flex: 1 1 auto; }
+
+/* ---------- 网格卡片统一拉伸（同行底边对齐） ---------- */
+.page-grid,
+.tools-grid,
+.debug-grid,
+.playback-layout,
+.visual-layout,
+.command-workspace {
+  align-items: stretch !important;
+}
+.page-grid > .panel,
+.tools-grid > .panel,
+.debug-grid > .panel,
+.playback-layout > .panel,
+.visual-layout > * > .panel,
+.command-workspace > * > .panel {
+  height: 100%;
+}
+.tools-grid > .panel .panel-body,
+.debug-grid > .panel .panel-body,
+.page-grid > .panel .panel-body {
+  flex: 1 1 auto;
+}
+
+/* 视觉档案：左右列同高，右列最后一张卡撑满 */
+.visual-layout { align-items: stretch !important; }
+.visual-main, .visual-side { height: 100%; }
+.visual-side { display: flex; flex-direction: column; gap: 12px; }
+.visual-side > .config-group-card:last-child { flex: 1 1 auto; }

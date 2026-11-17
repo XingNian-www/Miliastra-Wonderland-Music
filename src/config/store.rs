@@ -1242,6 +1242,10 @@ fn now_ms() -> u64 {
 /// - 旧 hall 长说明 → 按受众拆分后的说明；
 /// - 含 `{{bot_history}}` 的行整行删除（自定义模板也只删这一行/占位）。
 fn migrate_answer_prompt_text(prompt: &str) -> String {
+    // 只在模板确实还引用被删除的变量时迁移；不含占位的自定义模板一律不改写。
+    if !prompt.contains("{{bot_history}}") {
+        return prompt.to_string();
+    }
     const NEW_HISTORY: &str =
         "个人问答历史默认作为独立消息提供（可在 ai_chat.inject_actor_history 关闭）。";
     const NEW_HALL: &str =
@@ -3069,6 +3073,16 @@ mod tests {
         );
         assert_eq!(stored_revision(&database_path), 1, "交叉校验失败不得写库");
         cleanup(&root);
+    }
+
+    /// 反向门禁：没有 {{bot_history}} 的模板即使含旧 hall/history 片段也
+    /// 一律不改写（避免覆盖用户自定义）。
+    #[test]
+    fn answer_prompt_without_bot_history_is_never_rewritten() {
+        let custom = "对话历史通过独立消息提供。\
+大厅共享记忆（所有人的发言；你自己说过的话只经机器人历史提供，这里不重复）：{{hall}}\
+自定义结尾";
+        assert_eq!(migrate_answer_prompt_text(custom), custom);
     }
 
     /// 旧 answer_prompt 含 {{bot_history}} 时在 open 阶段一次性迁移；自定义

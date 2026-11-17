@@ -66,7 +66,6 @@
         </div>
 
         <div v-if="actionText" class="result">{{ actionText }}</div>
-        <div v-else class="result">播放器状态每秒自动刷新；控制命令会即时反馈。</div>
       </div>
     </section>
 
@@ -419,6 +418,22 @@ async function action(path) {
     setBusy(false)
   }
 }
+let playerRefreshing = false
+async function refreshPlayer() {
+  if (playerRefreshing) return
+  playerRefreshing = true
+  try {
+    const value = await getJson('/status')
+    player.value = value
+    state.player = value
+    lastUpdated.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+  } catch (error) {
+    report(error)
+  } finally {
+    playerRefreshing = false
+  }
+}
+
 async function loadStatus() {
   try {
     await refreshStoreStatus(true)
@@ -736,10 +751,16 @@ async function cacheAction(path) {
   }
 }
 
+let playerTimer = null
+
 onMounted(() => {
   refreshAll()
   loadLeaderboard()
+  playerTimer = setInterval(refreshPlayer, 1000)
   timer = setInterval(refreshAll, 5000)
 })
-onBeforeUnmount(() => clearInterval(timer))
+onBeforeUnmount(() => {
+  clearInterval(timer)
+  clearInterval(playerTimer)
+})
 </script>

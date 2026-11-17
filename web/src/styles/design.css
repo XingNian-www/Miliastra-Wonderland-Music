@@ -566,3 +566,32 @@ input[type="checkbox"] { width: 34px; height: 20px; flex: none; }
 .visual-main, .visual-side { height: 100%; }
 .visual-side { display: flex; flex-direction: column; gap: 12px; }
 .visual-side > .config-group-card:last-child { flex: 1 1 auto; }
+
+@media (max-width: 720px) {
+  #configForm .config-group-card .config-field-foot { padding-left: 0; }
+}
+
+/* ---------- 审计收尾：顶栏/命令面板/播放/总览/游戏 ---------- */
+.topbar .brand h1 { display: none; }
+.topbar .brand .page-crumb {
+  margin-left: 0;
+  padding-left: 0;
+  border-left: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+}
+.command-reply-nav { align-content: start !important; }
+.command-groups { align-content: start !important; }
+.playback-request-panel .panel-body > .controls {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.game-page .controls > .btn { min-width: 76px; }
+@media (max-width: 1279px) and (min-width: 700px) {
+  .overview-layout > .panel:last-child { grid-column: 1 / -1; }
+}
+@media (max-width: 600px) {
+  .play-mode-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .playback-player-panel .controls { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}

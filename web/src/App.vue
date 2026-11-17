@@ -134,9 +134,15 @@ function tick() {
 function toggleRefresh() {
   state.autoRefresh = !state.autoRefresh
 }
+function applyTheme(theme) {
+  const isLight = theme === 'light'
+  document.documentElement.dataset.theme = isLight ? 'light' : 'dark'
+  document.body.classList.toggle('light', isLight)
+  localStorage.setItem('miliastraTheme', isLight ? 'light' : 'dark')
+}
+
 function toggleTheme() {
-  document.body.classList.toggle('light')
-  localStorage.setItem('miliastraTheme', document.body.classList.contains('light') ? 'light' : 'dark')
+  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light')
 }
 
 function onHashChange() {
@@ -144,7 +150,7 @@ function onHashChange() {
 }
 
 onMounted(() => {
-  if (localStorage.getItem('miliastraTheme') === 'light') document.body.classList.add('light')
+  applyTheme(localStorage.getItem('miliastraTheme') === 'light' ? 'light' : 'dark')
   applyRoute(routeFromHash())
   window.addEventListener('hashchange', onHashChange)
   tick()

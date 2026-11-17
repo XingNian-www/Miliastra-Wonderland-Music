@@ -2,31 +2,41 @@
   <nav class="app-nav" aria-label="功能导航">
     <div class="nav-brand">Miliastra<span>远程监控</span></div>
     <div class="nav-links" title="窄屏可左右滑动查看更多入口">
-      <button
-        v-for="route in routes"
-        :key="route.key"
-        class="nav-link"
-        :class="{ active: currentRoute === route.key }"
-        @click="navigateTo(route.key)"
-      >
-        {{ route.label }}
-      </button>
+      <template v-for="group in navGroups" :key="group">
+        <div class="nav-group">{{ group }}</div>
+        <button
+          v-for="route in routes.filter((item) => item.group === group)"
+          :key="route.key"
+          class="nav-link"
+          :class="{ active: currentRoute === route.key }"
+          @click="navigateTo(route.key)"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" v-html="route.icon"></svg>
+          {{ route.label }}
+        </button>
+      </template>
     </div>
   </nav>
   <div class="shell">
     <header class="topbar">
-      <div class="brand"><h1>Miliastra <span>远程监控</span></h1></div>
+      <div class="brand" style="display:flex;align-items:baseline">
+        <h1>Miliastra <span>远程监控</span></h1>
+        <span class="page-crumb">{{ currentLabel }}</span>
+      </div>
       <div class="status-chips">
-        <span class="chip"><i class="dot"></i><span>服务</span><em>{{ serviceState }}</em></span>
-        <span class="chip"><i class="dot"></i><span>播放</span><em>{{ playerState }}</em></span>
+        <span class="chip" :data-state="serviceTone"><i class="dot"></i><span>服务</span><em>{{ serviceState }}</em></span>
+        <span class="chip" :data-state="playerTone"><i class="dot"></i><span>播放</span><em>{{ playerState }}</em></span>
         <span class="chip"><i class="dot"></i><span>队列</span><em>{{ queueState }}</em></span>
-        <span class="chip"><i class="dot"></i><span>监听</span><em>{{ listenerMode }}</em></span>
-        <span class="chip"><i class="dot"></i><span>大厅</span><em>{{ hallState }}</em></span>
+        <span class="chip" :data-state="listenerTone"><i class="dot"></i><span>监听</span><em>{{ listenerMode }}</em></span>
+        <span class="chip" :data-state="hallTone"><i class="dot"></i><span>大厅</span><em>{{ hallState }}</em></span>
       </div>
       <div class="top-actions">
         <span class="last-refresh">{{ state.lastRefresh || '等待刷新' }}</span>
         <span class="sep"></span>
-        <button class="btn theme-toggle" title="切换日间 / 夜间模式" @click="toggleTheme">◐</button>
+        <button class="btn theme-toggle" title="切换日间 / 夜间模式" @click="toggleTheme">
+          <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        </button>
         <button class="btn" @click="toggleRefresh">{{ state.autoRefresh ? '暂停刷新' : '继续刷新' }}</button>
       </div>
     </header>
@@ -50,7 +60,7 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted } from 'vue'
-import { ROUTES, applyRoute, currentRoute, navigateTo, routeFromHash } from './router.js'
+import { NAV_GROUPS, ROUTES, applyRoute, currentRoute, navigateTo, routeFromHash } from './router.js'
 import { loadStatus, state } from './store.js'
 import ConfigPage from './pages/ConfigPage.vue'
 import AiConfigPage from './pages/AiConfigPage.vue'
@@ -68,6 +78,12 @@ import VisualPage from './pages/VisualPage.vue'
 import DebugPage from './pages/DebugPage.vue'
 
 const routes = ROUTES
+const navGroups = NAV_GROUPS
+const currentLabel = computed(() => ROUTES.find((item) => item.key === currentRoute.value)?.label || '')
+const serviceTone = computed(() => (state.needsToken ? 'err' : state.connectionError ? 'err' : state.health ? 'ok' : 'warn'))
+const playerTone = computed(() => (state.player?.status === 'playing' ? 'ok' : state.player ? 'warn' : ''))
+const listenerTone = computed(() => (state.monitor ? 'ok' : ''))
+const hallTone = computed(() => { const listener = state.monitor?.chatListener; if (!listener) return ''; return listener.unreadTaskPending || listener.hallRoundRequired ? 'warn' : 'ok' })
 const pageComponent = computed(() => {
   switch (currentRoute.value) {
     case 'config': return ConfigPage

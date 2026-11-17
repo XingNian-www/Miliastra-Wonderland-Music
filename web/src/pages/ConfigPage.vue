@@ -15,6 +15,11 @@
         </span>
       </div>
 
+      <div v-if="activeSection === 'visual'" class="config-message" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span>画布、模板区域、阈值等完整视觉参数在「视觉档案」页集中编辑；这里只改档案名称等基础字段。</span>
+        <button class="btn small" type="button" @click="openVisual">打开视觉档案</button>
+      </div>
+
       <div class="config-layout">
         <!-- 左侧段导航：按 domain 分组 + 搜索 -->
         <aside class="config-sidebar" aria-label="配置段导航" title="窄屏可左右滑动查看更多配置段">
@@ -255,6 +260,7 @@ import {
 } from '../store.js'
 import FieldControl from '../components/FieldControl.vue'
 import { f32Text, friendlyError } from '../util/format.js'
+import { navigateTo } from '../router.js'
 import FieldError from '../components/FieldError.vue'
 import EmojiCatalog from '../components/EmojiCatalog.vue'
 
@@ -583,6 +589,10 @@ function effectLabel(field) {
 
 function effectClass(field) {
   return EFFECT_CLASSES[field.effect] || EFFECT_CLASSES.restart
+}
+
+function openVisual() {
+  navigateTo('visual')
 }
 
 function defaultText(field) {

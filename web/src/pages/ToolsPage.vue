@@ -64,15 +64,15 @@
         <div class="panel-body tools-body">
           <button class="btn stretch" :disabled="tracking" @click="runTool('/tools/ocr-backends')">OCR 后端探测</button>
           <div class="tools-row">
-            <input v-model.number="captureRounds" inputmode="numeric" />
+            <input v-model.number="captureRounds" inputmode="numeric" placeholder="截图 API 轮数" aria-label="截图 API 轮数" />
             <button class="btn" :disabled="tracking" @click="runTool('/tools/capture-benchmark', { rounds: captureRounds })">截图性能</button>
           </div>
           <div class="tools-row">
-            <input v-model.number="changeSamples" inputmode="numeric" />
+            <input v-model.number="changeSamples" inputmode="numeric" placeholder="变化采样次数" aria-label="变化采样次数" />
             <button class="btn" :disabled="tracking" @click="runTool('/tools/chat-change-samples', { samples: changeSamples })">聊天变化</button>
           </div>
           <div class="tools-row">
-            <input v-model.number="benchmarkRounds" inputmode="numeric" />
+            <input v-model.number="benchmarkRounds" inputmode="numeric" placeholder="面板基准轮数" aria-label="面板基准轮数" />
             <button class="btn" :disabled="tracking" @click="runTool('/tools/panel-benchmark', { rounds: benchmarkRounds })">面板基准</button>
           </div>
           <div class="tools-row">
@@ -135,7 +135,7 @@
         </div>
         <p v-if="readOnlyStatus" class="config-field-hint">{{ readOnlyStatus }}</p>
         <div class="tools-row">
-          <input v-model.number="evidenceLimit" inputmode="numeric" style="max-width:120px" />
+          <input v-model.number="evidenceLimit" inputmode="numeric" placeholder="条数" aria-label="证据条数" style="max-width:120px" />
           <button class="btn small" @click="loadEvidenceEntries">读取证据列表</button>
           <button class="btn small ghost" @click="clearEvidence">清空</button>
         </div>

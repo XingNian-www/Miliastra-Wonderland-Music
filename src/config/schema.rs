@@ -2902,6 +2902,12 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "每个玩家的中期摘要 token 上限；摘要滚动覆盖，不是硬截断",
         ),
         ConfigFieldSchema::db_live(
+            "inject_actor_history",
+            "注入个人问答历史",
+            FieldKind::Bool,
+            "开启后把该玩家历史问答作为 messages 前缀发送：占用上下文，但保留跨大厅长尾（已滚出大厅窗口的旧问答）。默认关闭——近期对话已由大厅共享记忆覆盖。",
+        ),
+        ConfigFieldSchema::db_live(
             "hall_token_budget",
             "大厅近期原文预算",
             int(1_000, 400_000),
@@ -2965,7 +2971,7 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "answer_prompt",
             "回答模板",
             FieldKind::Text,
-            "可使用 {{keyword}}、{{facts}}、{{summary}}、{{hall}}、{{bot_history}}、{{asker}}；玩家历史按独立角色消息传输（{{history}} 仅作兼容占位）。{{question}}、{{recent_actions}}、{{commands}} 由程序统一追加到末尾，模板里写不写都不会重复",
+            "可使用 {{keyword}}、{{facts}}、{{summary}}、{{hall}}、{{asker}}；{{hall}} 同时包含机器人自己的历史回复（显示为「你（角色名）：内容」）。玩家历史默认不注入，开启 inject_actor_history 后才作为独立角色消息传输（{{history}} 仅作兼容占位）；{{question}}、{{recent_actions}}、{{commands}} 由程序统一追加到末尾，模板里写不写都不会重复",
         ),
         ConfigFieldSchema::db_live(
             "extract_prompt",

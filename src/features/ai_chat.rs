@@ -60,13 +60,6 @@ pub(crate) const HALL_SUMMARY_BUDGET: usize = 4_000;
 /// 机器人自身输出预算：32K token，全局共用。
 pub(crate) const BOT_TOKEN_BUDGET: usize = 32_000;
 
-/// 组装提示词时读取 bot_lines 的**读取**预算。
-///
-/// 之前直接把 bot_token_budget（32000，那是**落库裁剪**预算）当读取窗口传给
-/// context()，等于每题注入最多 32K token 的跨玩家、无归属的 BOT 回答，
-/// 而 max_tokens 只有 600、目标输出 160 字符。落库预算与读取窗口本该分开。
-pub(crate) const BOT_HISTORY_READ_BUDGET: usize = 800;
-
 /// 组装提示词时读取大厅原文（`ai_chat_hall_turns`）的**读取**预算。
 ///
 /// 与 `HALL_TOKEN_BUDGET`（32000，那是**保留**预算）区分开：
@@ -77,6 +70,13 @@ pub(crate) const BOT_HISTORY_READ_BUDGET: usize = 800;
 /// 需要足够长才能接住「刚才谁说了什么」，但不必把整张表塞进提示词。
 /// 摘要（4K）已承担更早的大厅信息，读取侧只补最近原文。
 const HALL_READ_BUDGET: usize = 4_000;
+/// 大厅上下文里 Bot 行最多保留的条数（近期）。
+///
+/// Bot 自述已经并入 hall 一条通道，但线上有约 130 条历史回答（≈3.5K token）。
+/// 全量注入既贵、又让模型按旧模板复读；这里与 token 预算取先到者。
+pub(crate) const HALL_BOT_READ_MAX_LINES: usize = 6;
+/// 大厅上下文里 Bot 行最多使用的 token 数（与条数取先到者）。
+pub(crate) const HALL_BOT_READ_TOKEN_BUDGET: usize = 800;
 /// 压缩**触发**水位：原文占用超过预算的这个百分比才压缩。
 ///
 /// 迟滞（hysteresis）是这套分层的关键：触发与回落必须是两个不同的水位，
@@ -449,6 +449,12 @@ pub struct AiChatConfig {
     /// 单人**中期摘要** token 预算。
     #[serde(default = "default_actor_summary_budget")]
     pub actor_summary_budget: usize,
+    /// 是否把该玩家的历史问答作为独立 messages 前缀注入。
+    ///
+    /// 默认关闭：大厅上下文已覆盖近期对话，默认注入会与 hall 重复；
+    /// 开启用于保留跨大厅长尾（历史上问过、但已滚出大厅窗口的内容）。
+    #[serde(default)]
+    pub inject_actor_history: bool,
     /// 大厅**近期原文** token 预算（全局共用，记录所有人在大厅说的话）。
     #[serde(default = "default_hall_budget")]
     pub hall_token_budget: usize,
@@ -477,7 +483,7 @@ pub struct AiChatConfig {
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
     /// 回答模板；可用 {{keyword}}、{{facts}}、{{summary}}、{{hall}}、
-    /// {{bot_history}}、{{asker}}。{{question}}、{{recent_actions}}、{{commands}}
+    /// {{asker}}。{{question}}、{{recent_actions}}、{{commands}}
     /// 由代码统一追加到尾部，模板里的同名占位符会展开为空（只保留兼容）。
     #[serde(default = "default_answer_prompt")]
     pub answer_prompt: String,
@@ -695,6 +701,7 @@ impl Default for AiChatConfig {
             _legacy_bot_name: String::new(),
             actor_token_budget: ACTOR_TOKEN_BUDGET,
             actor_summary_budget: ACTOR_SUMMARY_BUDGET,
+            inject_actor_history: false,
             hall_token_budget: HALL_TOKEN_BUDGET,
             hall_summary_budget: HALL_SUMMARY_BUDGET,
             bot_token_budget: BOT_TOKEN_BUDGET,
@@ -953,9 +960,8 @@ fn default_answer_prompt() -> String {
     [
         "关于当前玩家的事实：{{facts}}",
         "更早的对话摘要（压缩后的旧记忆，越靠后越新）：{{summary}}",
-        "对话历史通过独立消息提供。",
-        "大厅近期机器人发言（仅供避免重复，不代表对当前玩家说过）：{{bot_history}}",
-        "大厅共享记忆（所有人的发言；你自己说过的话只经机器人历史提供，这里不重复）：{{hall}}",
+        "对话历史由配置决定是否作为独立消息提供（默认不注入，以大厅共享记忆为准）。",
+        "大厅共享记忆（所有人的发言，含你自己此前的回复；你自己的话用「你（角色名）：」标出）：{{hall}}",
     ]
     .join("")
 }
@@ -1166,7 +1172,6 @@ pub(crate) struct ChatContext {
     pub(crate) facts: Vec<String>,
     pub(crate) summary: Option<String>,
     pub(crate) turns: Vec<StoredTurn>,
-    pub(crate) bot_history: Vec<String>,
 }
 
 /// 大厅共享记忆快照：所有人最近说过的话 + 滚动压缩的大厅摘要。
@@ -1333,7 +1338,7 @@ impl AiChatMemory {
     ///
     /// 预算维护靠压缩与 `prune_actor`，读取侧只做异常保护：压缩把落库量
     /// 长期压在 82% 以下，所以正常情况下读取结果就是全表、逐轮只追加一条。
-    pub(crate) fn context(&self, actor: &str, bot_budget: usize) -> Result<ChatContext> {
+    pub(crate) fn context(&self, actor: &str) -> Result<ChatContext> {
         let connection = self.connection()?;
         let facts = connection
             .prepare(
@@ -1367,7 +1372,6 @@ impl AiChatMemory {
             .skip(start)
             .map(|(turn, _)| turn)
             .collect::<Vec<_>>();
-        let bot_history = bot_lines_within(&connection, bot_budget)?;
         let summary = connection
             .query_row(
                 "SELECT summary FROM ai_chat_summaries WHERE scope = ?1",
@@ -1380,7 +1384,6 @@ impl AiChatMemory {
             facts,
             summary,
             turns,
-            bot_history,
         })
     }
 
@@ -1388,28 +1391,56 @@ impl AiChatMemory {
     ///
     /// 只读**最近**若干条：原来这条 SQL 没有 LIMIT，会全表读取——大厅每次
     /// 问答写 2 行，几百轮后单次请求就要塞进上万 token，而目标输出只有 160 字符。
-    /// 落库预算（32000 是**保留**预算）与读取窗口是两回事，和 bot_history 同理。
+    /// 落库预算（32000 是**保留**预算）与读取窗口是两回事，和多人对局的其它窗口同理。
     pub(crate) fn hall_context(&self) -> Result<HallContext> {
         let connection = self.connection()?;
-        // 从最新往回取，凑够读取预算就停，再反转成旧→新。
+        // 从最新往回取：玩家行按 HALL_READ_BUDGET，Bot 行按条数/ token
+        // 双预算单独截断，再反转成旧→新。
         let mut lines = Vec::new();
-        let mut used = 0usize;
+        let mut used_player = 0usize;
+        let mut player_lines = 0usize;
+        let mut bot_used = 0usize;
+        let mut bot_lines = 0usize;
         {
             let mut stmt = connection.prepare(
                 "SELECT speaker, text, role, tokens FROM ai_chat_hall_turns ORDER BY id DESC",
             )?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
-                let tokens: i64 = row.get(3)?;
-                // 至少保留最新一条，否则极小预算会把大厅上下文清空。
-                if !lines.is_empty() && used + tokens as usize > HALL_READ_BUDGET {
-                    break;
-                }
-                used += tokens as usize;
+                let tokens: usize = row.get::<_, i64>(3)?.max(0) as usize;
                 let speaker: String = row.get(0)?;
                 let text: String = row.get(1)?;
                 let role: String = row.get(2)?;
-                lines.push((speaker, text, HallSpeakerRole::from_str(&role)));
+                let role = HallSpeakerRole::from_str(&role);
+                let keep = match role {
+                    // 玩家行仍走整个 HALL_READ_BUDGET；至少保留最新一条，
+                    // 否则极小预算会把大厅上下文清空。
+                    HallSpeakerRole::Player => {
+                        if player_lines == 0 || used_player + tokens <= HALL_READ_BUDGET {
+                            player_lines += 1;
+                            used_player += tokens;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    // Bot 行独立限流：条数与 token 取先到者，避免 130 条自述
+                    // 把大厅读窗口占满、或每轮多付数千 token。
+                    HallSpeakerRole::Bot => {
+                        if bot_lines < HALL_BOT_READ_MAX_LINES
+                            && bot_used + tokens <= HALL_BOT_READ_TOKEN_BUDGET
+                        {
+                            bot_lines += 1;
+                            bot_used += tokens;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if keep {
+                    lines.push((speaker, text, role));
+                }
             }
         }
         lines.reverse();
@@ -1551,7 +1582,9 @@ impl AiChatMemory {
         Ok(())
     }
 
-    /// 记录机器人自己说过的内容，按全局预算淘汰。
+    /// **legacy**：机器人历史已并入 `ai_chat_hall_turns`（role=bot），本表与
+    /// 写入函数只为兼容旧数据保留，运行时不再调用；不要再用它作为提示词通道。
+    #[allow(dead_code)]
     pub(crate) fn record_bot_line(&self, text: &str, budget: usize, now_ms: i64) -> Result<()> {
         let text = text.trim();
         if text.is_empty() {
@@ -1940,25 +1973,6 @@ impl AiChatMemory {
     }
 }
 
-fn bot_lines_within(connection: &Connection, budget: usize) -> Result<Vec<String>> {
-    let mut stmt =
-        connection.prepare("SELECT text, tokens FROM ai_chat_bot_lines ORDER BY id DESC")?;
-    let mut rows = stmt.query([])?;
-    let mut out = Vec::new();
-    let mut used = 0usize;
-    while let Some(row) = rows.next()? {
-        let text: String = row.get(0)?;
-        let tokens: i64 = row.get(1)?;
-        if used + tokens as usize > budget {
-            break;
-        }
-        used += tokens as usize;
-        out.push(text);
-    }
-    out.reverse();
-    Ok(out)
-}
-
 /// 按单人预算淘汰最旧的**对话原文**。
 ///
 /// 只动 turns：facts 有自己的预算（[prune_facts]）。以前两者共用一个池，
@@ -2214,13 +2228,24 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
             input.context.facts.join("；")
         )
     };
-    let history = "（历史已作为独立对话消息提供）";
+    let history = if input.config.inject_actor_history {
+        "（历史已作为独立对话消息提供）"
+    } else {
+        "（历史默认不注入，以大厅共享记忆为准）"
+    };
     // 除了原文，再单独列出「最近用过哪些开场动作」。
     //
     // 只给原文时模型看不到自己上次用了什么，只看到一大段几乎相同的文本，
     // 反而更容易继续套同一个模板（线上 63 条里 41 条同一个开头）。
     let recent_actions = {
-        let openings = recent_openings(&input.context.bot_history, 6);
+        let bot_lines: Vec<String> = input
+            .hall
+            .lines
+            .iter()
+            .filter(|(_, _, role)| matches!(role, HallSpeakerRole::Bot))
+            .map(|(_, text, _)| text.clone())
+            .collect();
+        let openings = recent_openings(&bot_lines, 6);
         if openings.is_empty() {
             "（暂无）".to_string()
         } else {
@@ -2229,11 +2254,6 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
                 openings.join("、")
             )
         }
-    };
-    let bot_history = if input.context.bot_history.is_empty() {
-        "（暂无）".to_string()
-    } else {
-        input.context.bot_history.join("｜")
     };
     let commands = if input.allowed_commands.is_empty() {
         // 空列表不等于「没有这个功能」：@邀请 这类命令存在但当前玩家无权限。
@@ -2247,12 +2267,11 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
     } else {
         input.asker.trim().to_string()
     };
-    // 大厅共享记忆分两段：摘要（中期）在前，玩家原文（近期）在后。
+    // 大厅共享记忆分两段：摘要（中期）在前，原文（近期）在后。
     //
-    // BOT 自己的发言在这里**过滤掉**：同一批 BOT 输出还会经 `bot_history`
-    // 单独注入一次；两边都渲染等于让模型把同一条自述读两遍，既白占 token，
-    // 又容易把自己的猜测当成玩家说过的话。hall 只保留摘要与玩家行，
-    // BOT 历史只走 `bot_history` 一条通道（模型侧仍能靠 bot_history 避免重复）。
+    // 全文只有这一条大厅通道：玩家行用 `[昵称]：`（与问题行同一套身份标记，
+    // 裸名字容易被当成正文里的普通词），BOT 自己的历史行用 `你（角色名）：`
+    // 明示是模型此前的输出，避免它把自己的猜测当成玩家说过的话。
     let mut hall_parts = Vec::new();
     if let Some(summary) = input.hall.summary.as_deref() {
         hall_parts.push(format!("【较早的大厅对话摘要】{summary}"));
@@ -2262,12 +2281,10 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
             .hall
             .lines
             .iter()
-            .filter(|(_, _, role)| matches!(role, HallSpeakerRole::Player))
-            // 玩家名用方括号括起来，与 `[昵称]:内容` 同一套写法。
-            // 裸名字（`某玩家：...`）和正文里的普通词长得一样，模型分不清
-            // 哪段是说话人、哪段是内容里提到的别人，容易出现「把 A 的话
-            // 记到 B 头上」。方括号是显式的身份标记。
-            .map(|(speaker, text, _)| format!("[{speaker}]：{text}"))
+            .map(|(speaker, text, role)| match role {
+                HallSpeakerRole::Player => format!("[{speaker}]：{text}"),
+                HallSpeakerRole::Bot => format!("你（{speaker}）：{text}"),
+            })
             .collect::<Vec<_>>();
         if !recent.is_empty() {
             hall_parts.push(format!(
@@ -2316,7 +2333,6 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
         ("question", empty),
         ("facts", facts.as_str()),
         ("history", history),
-        ("bot_history", bot_history.as_str()),
         ("recent_actions", empty),
         ("commands", empty),
         ("asker", asker.as_str()),
@@ -2378,6 +2394,23 @@ fn render_template(template: &str, vars: &[(&str, &str)], fallback: String) -> S
     }
     output.push_str(rest);
     output
+}
+
+/// 按配置决定是否注入个人历史问答。
+///
+/// 默认关闭：个人 turns 与大厅上下文高度重复，且线上 median ≈1K、max 10.7K
+/// token；turns 仍保留在库里供面板/重建事实/`@忘记我` 使用，只是不再默认拼进
+/// messages 前缀。开启后用于保留已滚出大厅窗口的跨大厅长尾。
+pub(crate) fn injected_conversation_history(
+    config: &AiChatConfig,
+    context: &ChatContext,
+    actor_display: &str,
+) -> Vec<serde_json::Value> {
+    if config.inject_actor_history {
+        conversation_history(context, actor_display)
+    } else {
+        Vec::new()
+    }
 }
 
 /// 按时间顺序恢复角色化的个人会话，绝不把全局发言冒充该玩家的历史。
@@ -3269,7 +3302,7 @@ mod tests {
             .apply_compression(&plan, "旧摘要内容", 2_000, 1)
             .unwrap();
         memory.apply_compression(&plan, "   ", 2_000, 2).unwrap();
-        let context = memory.context("甲", 1_000).unwrap();
+        let context = memory.context("甲").unwrap();
         assert_eq!(context.summary.as_deref(), Some("旧摘要内容"));
     }
 
@@ -3318,7 +3351,7 @@ mod tests {
                     index as i64,
                 )
                 .unwrap();
-            let context = memory.context("甲", 1_000).unwrap();
+            let context = memory.context("甲").unwrap();
             let current: Vec<(String, String)> = context
                 .turns
                 .iter()
@@ -3342,7 +3375,7 @@ mod tests {
             previous = current;
         }
         // 历史变长不影响提示词尾部：问题行仍然最后、且只出现一次。
-        let context = memory.context("甲", 1_000).unwrap();
+        let context = memory.context("甲").unwrap();
         let config = config();
         let prompt = build_prompt(&PromptInput {
             config: &config,
@@ -3415,7 +3448,7 @@ mod tests {
             tokens[expected_start..].iter().sum::<usize>() <= ACTOR_READ_TOKEN_BUDGET,
             "保留段不能超读取预算"
         );
-        let context = memory.context("甲", 1_000).unwrap();
+        let context = memory.context("甲").unwrap();
         assert_eq!(context.turns.len(), questions.len() - expected_start);
         assert_eq!(
             context.turns.first().unwrap().question, questions[expected_start],
@@ -3442,7 +3475,7 @@ mod tests {
         memory
             .record_turn("甲", &huge, "答", 1_000_000, 99)
             .unwrap();
-        let context = memory.context("甲", 1_000).unwrap();
+        let context = memory.context("甲").unwrap();
         assert_eq!(
             context.turns.len(),
             ACTOR_READ_MIN_TURNS,
@@ -3481,7 +3514,7 @@ mod tests {
             .apply_compression(&plan, "压缩后的摘要", ACTOR_SUMMARY_BUDGET, 3)
             .unwrap();
         let remaining: usize = memory
-            .context("甲", 1_000)
+            .context("甲")
             .unwrap()
             .turns
             .iter()
@@ -3518,7 +3551,7 @@ mod tests {
                 .unwrap();
         }
         let total_before: usize = memory
-            .context("甲", 1_000)
+            .context("甲")
             .unwrap()
             .turns
             .iter()
@@ -3537,7 +3570,7 @@ mod tests {
             .apply_compression(&plan, "压缩后的摘要", 1_000, 2)
             .unwrap();
         let remaining: usize = {
-            let context = memory.context("甲", 1_000).unwrap();
+            let context = memory.context("甲").unwrap();
             context
                 .turns
                 .iter()
@@ -3568,7 +3601,7 @@ mod tests {
                 .record_turn("甲", &question, &answer, 1_000, index)
                 .unwrap();
         }
-        let context = memory.context("甲", 1_000).unwrap();
+        let context = memory.context("甲").unwrap();
         assert_eq!(
             context.turns.len(),
             14,
@@ -3604,7 +3637,7 @@ mod tests {
         memory
             .apply_compression(&plan, "压缩后的摘要", 1_000, 99)
             .unwrap();
-        let context = memory.context("甲", 1_000).unwrap();
+        let context = memory.context("甲").unwrap();
         assert_eq!(
             context.facts,
             vec!["事实一".to_string(), "事实二".to_string()],
@@ -3630,7 +3663,7 @@ mod tests {
                 .add_fact("甲", &format!("事实{index}"), index as i64)
                 .unwrap();
         }
-        let context = memory.context("甲", 10_000).unwrap();
+        let context = memory.context("甲").unwrap();
         assert_eq!(
             context.facts.len(),
             MAX_FACTS_PER_ACTOR,
@@ -3689,6 +3722,37 @@ mod tests {
         assert_eq!(memory.hall_stats().unwrap().0, 40, "读取不能删库里的行");
     }
 
+    /// Bot 行并入 hall 后仍有独立预算：最近 6 条且 ≤800 token，取先到者；
+    /// 玩家行不受影响，仍按 HALL_READ_BUDGET 读取。
+    #[test]
+    fn hall_context_caps_bot_lines_without_eating_player_budget() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let bot_line = "中".repeat(150);
+        for index in 0..10 {
+            memory
+                .record_hall_line("橘子", &bot_line, HallSpeakerRole::Bot, 1_000_000, index as i64)
+                .unwrap();
+        }
+        let player_line = "啊".repeat(1_000);
+        for index in 0..10 {
+            memory
+                .record_hall_line("甲", &player_line, HallSpeakerRole::Player, 1_000_000, 100 + index)
+                .unwrap();
+        }
+        let context = memory.hall_context().unwrap();
+        let bots = context
+            .lines
+            .iter()
+            .filter(|(_, _, role)| matches!(role, HallSpeakerRole::Bot))
+            .count();
+        let players = context.lines.len() - bots;
+        // 150 token × 6 条 = 900 > 800，因此按 token 预算只保留 5 条。
+        assert_eq!(bots, 5, "Bot 行应按 800 token 上限截断: {context:?}");
+        // 玩家行仍按 4K 预算保留最近的 4 条（1000 token/条）。
+        assert_eq!(players, 4, "玩家行不应被 Bot 行挤掉: {context:?}");
+        assert_eq!(memory.hall_stats().unwrap().0, 20, "读取不能删库里的行");
+    }
+
     /// 摘要硬上限：面板上的 summary_budget 必须真的生效。
     #[test]
     fn summary_is_clipped_to_its_configured_budget() {
@@ -3707,7 +3771,7 @@ mod tests {
         memory
             .apply_compression(&plan, &long_summary, 40, 2)
             .unwrap();
-        let stored = memory.context("甲", 10_000).unwrap().summary.unwrap();
+        let stored = memory.context("甲").unwrap().summary.unwrap();
         assert!(
             estimate_tokens(&stored) <= 40,
             "摘要应被裁到预算内，实际 {} token",
@@ -3916,7 +3980,6 @@ mod tests {
                 question: "推荐一首歌".to_string(),
                 answer: "试试晴天".to_string(),
             }],
-            bot_history: vec!["试试晴天".to_string()],
         };
         let allowed = vec!["@点歌".to_string(), "@暂停".to_string()];
         let prompt = build_prompt(&PromptInput {
@@ -3952,7 +4015,6 @@ mod tests {
                     answer: "第二答".into(),
                 },
             ],
-            bot_history: vec!["对其他玩家的回复".into()],
         };
         assert_eq!(
             conversation_history(&context, "甲"),
@@ -4207,7 +4269,7 @@ mod tests {
             .record_turn("甲", "问题一", "回答一", 10_000, 1)
             .unwrap();
         memory.add_fact("甲", "喜欢晴天", 2).unwrap();
-        let context = memory.context("甲", 10_000).unwrap();
+        let context = memory.context("甲").unwrap();
         assert_eq!(context.turns.len(), 1);
         assert_eq!(context.facts, vec!["喜欢晴天".to_string()]);
 
@@ -4217,33 +4279,42 @@ mod tests {
 
         // 预算收紧到只够一轮：最旧的一轮被淘汰，最新一轮保留。
         memory.record_turn("甲", "问题二", "回答二", 2, 4).unwrap();
-        let context = memory.context("甲", 10_000).unwrap();
+        let context = memory.context("甲").unwrap();
         assert_eq!(context.turns.len(), 1, "只保留最新一轮");
         assert_eq!(context.turns[0].question, "问题二");
 
         assert!(memory.forget("甲").unwrap(), "仍有记忆可清空");
-        let context = memory.context("甲", 10_000).unwrap();
+        let context = memory.context("甲").unwrap();
         assert!(context.turns.is_empty());
         assert!(context.facts.is_empty());
         assert!(!memory.forget("甲").unwrap(), "第二次清空不再有内容");
     }
 
+    /// 默认不注入个人 turns；开关打开后才作为 messages 注入。
     #[test]
-    fn bot_lines_are_pruned_to_the_global_budget() {
-        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
-
-        // 每条「第N条」≈3 token；预算 6 只容得下最近两条。
-        for index in 0..5 {
-            memory
-                .record_bot_line(&format!("第{index}条"), 6, index)
-                .unwrap();
-        }
-        let context = memory.context("甲", 6).unwrap();
-        assert_eq!(context.bot_history.len(), 2, "{:?}", context.bot_history);
-        // 保留的是最新的内容。
+    fn actor_history_is_injected_only_when_configured() {
+        let context = ChatContext {
+            facts: vec!["偏好".into()],
+            summary: None,
+            turns: vec![StoredTurn {
+                asker: "甲".into(),
+                question: "第一问".into(),
+                answer: "第一答".into(),
+            }],
+        };
+        let mut config = config();
+        assert!(!config.inject_actor_history, "默认必须关闭个人历史注入");
+        assert!(
+            injected_conversation_history(&config, &context, "甲").is_empty(),
+            "关闭时不得生成历史 messages"
+        );
+        config.inject_actor_history = true;
         assert_eq!(
-            context.bot_history,
-            vec!["第3条".to_string(), "第4条".to_string()]
+            injected_conversation_history(&config, &context, "甲"),
+            vec![
+                serde_json::json!({"role":"user","content":"[甲]:第一问"}),
+                serde_json::json!({"role":"assistant","content":"第一答"}),
+            ]
         );
     }
 
@@ -4254,11 +4325,11 @@ mod tests {
         memory.add_fact("乙", "只属于乙", 2).unwrap();
 
         assert_eq!(
-            memory.context("甲", 10_000).unwrap().facts,
+            memory.context("甲").unwrap().facts,
             vec!["只属于甲".to_string()]
         );
         assert_eq!(
-            memory.context("乙", 10_000).unwrap().facts,
+            memory.context("乙").unwrap().facts,
             vec!["只属于乙".to_string()]
         );
     }
@@ -4483,7 +4554,6 @@ mod tests {
             facts: Vec::new(),
             summary: Some("旧摘要内容".to_string()),
             turns: Vec::new(),
-            bot_history: Vec::new(),
         };
         let hall = HallContext {
             summary: Some("大厅摘要".to_string()),
@@ -4512,14 +4582,26 @@ mod tests {
     #[test]
     fn recent_actions_are_listed_so_the_model_can_avoid_repeating() {
         let config = config();
-        let context = ChatContext {
-            facts: Vec::new(),
+        let context = ChatContext::default();
+        // 动作只从大厅的 Bot 行派生：BOT 历史并入 hall 后不能再读独立通道。
+        let hall = HallContext {
             summary: None,
-            turns: Vec::new(),
-            bot_history: vec![
-                "猫耳一抖，别扭地别过脸：哼，第一个回答".to_string(),
-                "猫耳一抖，把头扭开：第二个回答".to_string(),
-                "尾巴轻摆：第三个回答".to_string(),
+            lines: vec![
+                (
+                    "橘子".to_string(),
+                    "猫耳一抖，别扭地别过脸：哼，第一个回答".to_string(),
+                    HallSpeakerRole::Bot,
+                ),
+                (
+                    "橘子".to_string(),
+                    "猫耳一抖，把头扭开：第二个回答".to_string(),
+                    HallSpeakerRole::Bot,
+                ),
+                (
+                    "橘子".to_string(),
+                    "尾巴轻摆：第三个回答".to_string(),
+                    HallSpeakerRole::Bot,
+                ),
             ],
         };
         let prompt = build_prompt(&PromptInput {
@@ -4528,7 +4610,7 @@ mod tests {
             context: &context,
             allowed_commands: &[],
             asker: "甲",
-            hall: &HallContext::default(),
+            hall: &hall,
             now_unix: TEST_NOW_UNIX,
         });
         assert!(
@@ -4559,7 +4641,6 @@ mod tests {
             facts: Vec::new(),
             summary: None,
             turns: Vec::new(),
-            bot_history: vec!["猫耳一抖：你好呀".to_string()],
         };
         let prompt = build_prompt(&PromptInput {
             config: &config(),
@@ -4865,15 +4946,15 @@ mod tests {
         assert!(prompt.contains("本轮说话人：甲"), "必须重申说话人");
     }
 
-    /// BOT 自己的大厅发言只经 `bot_history` 注入一次，hall 里不再重复。
+    /// Bot 行只在大厅上下文出现一次，格式为「你（角色名）：内容」；
+    /// 不再有独立的 bot_history 块，默认模板也不再引用它。
     #[test]
-    fn bot_hall_lines_are_not_duplicated_with_bot_history() {
+    fn bot_hall_line_is_rendered_once_and_not_injected_separately() {
         let config = config();
         let context = ChatContext {
             facts: Vec::new(),
             summary: None,
             turns: Vec::new(),
-            bot_history: vec!["尾巴轻摆：你老点古风".to_string()],
         };
         let hall = HallContext {
             summary: None,
@@ -4901,16 +4982,15 @@ mod tests {
         });
         // 玩家名带方括号：与问题行的 [昵称]:内容 同一套身份标记。
         assert!(prompt.contains("[甲]：我喜欢古风"), "实际: {prompt}");
-        // BOT 行已从 hall 过滤，只保留 bot_history 那一份。
+        // Bot 行用「你（角色名）：」标出，且整段提示词只出现一次。
         assert_eq!(
-            prompt.matches("你老点古风").count(),
+            prompt.matches("你（橘子）：你老点古风").count(),
             1,
-            "BOT 发言只能出现一次，实际: {prompt}"
+            "Bot 行只能在大厅上下文出现一次，实际: {prompt}"
         );
-        assert!(
-            !prompt.contains("你（橘子"),
-            "hall 不再渲染 BOT 自述行，实际: {prompt}"
-        );
+        // 独立的 bot_history 通道已删除：默认模板/展开里都不该再有这个块。
+        assert!(!prompt.contains("大厅近期机器人发言"), "实际: {prompt}");
+        assert!(!prompt.contains("bot_history"), "实际: {prompt}");
     }
     /// 时间行必须走代码追加通道：线上是手写旧模板，占位符不会展开。
     ///
@@ -5232,11 +5312,6 @@ mod tests {
             ],
             summary: Some("玩家甲上周聊过演唱会，说想去看。".to_string()),
             turns: Vec::new(),
-            bot_history: vec![
-                "猫耳一抖，别扭地别过脸：哼，又是你啊".to_string(),
-                "尾巴轻摆：今天想听什么".to_string(),
-                "歪头：这首歌我记得".to_string(),
-            ],
         };
         let hall = HallContext {
             summary: Some("大家在聊周杰伦和演唱会。".to_string()),
@@ -5293,9 +5368,9 @@ mod tests {
         );
         assert_eq!(prompt.matches("@点歌").count(), 1, "命令清单只出现一次");
         assert_eq!(
-            prompt.matches("尾巴轻摆：今天想听什么").count(),
+            prompt.matches("你（橘子）：尾巴轻摆：今天想听什么").count(),
             1,
-            "BOT 发言只经 bot_history 注入一次，实际: {prompt}"
+            "Bot 行只能在大厅上下文出现一次，实际: {prompt}"
         );
     }
 }

@@ -40,7 +40,7 @@
 
     <div class="panel overview-quick">
       <div class="panel-head"><h2>快捷入口</h2></div>
-      <div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px">
+      <div class="panel-body overview-quick-grid">
         <button v-for="item in quick" :key="item.route" class="btn" @click="go(item.route)">{{ item.label }}</button>
       </div>
     </div>

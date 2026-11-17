@@ -11,7 +11,7 @@
             <button class="btn primary" :disabled="tracking" @click="runTool('/tools/ocr')">全屏 OCR</button>
             <button class="btn" :disabled="tracking" @click="runTool('/tools/scan-chat')">扫描聊天</button>
           </div>
-          <div class="tools-row">
+          <div class="tools-grid-row">
             <input v-model="ocrRect" placeholder="OCR 区域 x,y,width,height" />
             <button class="btn" :disabled="tracking" @click="runTool('/tools/ocr', { rect: ocrRect })">区域 OCR</button>
           </div>
@@ -32,7 +32,7 @@
             <option value="">（选择模板）</option>
             <option v-for="item in templates" :key="item.name || item[0]" :value="item.name || item[0]">{{ item.label || item[1] || item.name || item[0] }}</option>
           </select>
-          <div class="tools-row">
+          <div class="tools-grid-row">
             <input v-model="templateRect" placeholder="匹配区域 x,y,width,height，留空全屏" />
             <button class="btn small ghost" type="button" @click="useConfiguredTemplateRegion">读取配置区域</button>
           </div>
@@ -47,12 +47,12 @@
       <section class="panel">
         <div class="panel-head"><h2>手动输入</h2><small>会向游戏发送真实输入</small></div>
         <div class="panel-body tools-body">
-          <div class="tools-row">
-            <input v-model="clickX" placeholder="x" inputmode="numeric" />
-            <input v-model="clickY" placeholder="y" inputmode="numeric" />
+          <div class="tools-xyz">
+            <input v-model="clickX" placeholder="x" inputmode="numeric" aria-label="x 坐标" />
+            <input v-model="clickY" placeholder="y" inputmode="numeric" aria-label="y 坐标" />
             <button class="btn warn" :disabled="tracking" @click="clickPoint">点击</button>
           </div>
-          <div class="tools-row">
+          <div class="tools-grid-row">
             <input v-model="keyName" placeholder="按键，如 Escape / Return / F2" />
             <button class="btn warn" :disabled="tracking" @click="sendKey">发送按键</button>
           </div>
@@ -63,19 +63,19 @@
         <div class="panel-head"><h2>诊断</h2></div>
         <div class="panel-body tools-body">
           <button class="btn stretch" :disabled="tracking" @click="runTool('/tools/ocr-backends')">OCR 后端探测</button>
-          <div class="tools-row">
+          <div class="tools-grid-row">
             <input v-model.number="captureRounds" inputmode="numeric" placeholder="截图 API 轮数" aria-label="截图 API 轮数" />
             <button class="btn" :disabled="tracking" @click="runTool('/tools/capture-benchmark', { rounds: captureRounds })">截图性能</button>
           </div>
-          <div class="tools-row">
+          <div class="tools-grid-row">
             <input v-model.number="changeSamples" inputmode="numeric" placeholder="变化采样次数" aria-label="变化采样次数" />
             <button class="btn" :disabled="tracking" @click="runTool('/tools/chat-change-samples', { samples: changeSamples })">聊天变化</button>
           </div>
-          <div class="tools-row">
+          <div class="tools-grid-row">
             <input v-model.number="benchmarkRounds" inputmode="numeric" placeholder="面板基准轮数" aria-label="面板基准轮数" />
             <button class="btn" :disabled="tracking" @click="runTool('/tools/panel-benchmark', { rounds: benchmarkRounds })">面板基准</button>
           </div>
-          <div class="tools-row">
+          <div class="tools-ai-row">
             <input v-model="aiKeyword" placeholder="AI 候选诊断关键词" />
             <label class="tools-check"><input v-model="aiAccompaniment" type="checkbox" />优先伴奏</label>
             <button class="btn" :disabled="tracking" @click="aiPreview">AI 诊断</button>

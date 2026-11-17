@@ -530,3 +530,10 @@ input[type="checkbox"] { width: 34px; height: 20px; flex: none; }
   .app-nav { position: fixed; inset: 0 auto 0 0; height: 100vh; overflow-y: auto; }
   .shell { margin-left: 236px; }
 }
+
+/* 总览三张卡片同高：底边对齐，不留锯齿 */
+.overview-layout { align-items: stretch !important; }
+.overview-layout > .panel { height: 100%; }
+.overview-layout .panel-body { display: flex; flex-direction: column; }
+.overview-layout .overview-now-playing .panel-body,
+.overview-layout .overview-quick .panel-body { flex: 1 1 auto; }

@@ -845,3 +845,33 @@ body.light {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* 开关：固定尺寸，避免被行内输入框的 flex 规则拉长 */
+input[type="checkbox"] {
+  width: 36px;
+  min-width: 36px;
+  height: 20px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  border: 1px solid var(--sep-1);
+  background: var(--bg-3);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+input[type="checkbox"]::after {
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  background: #f2f1ec;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: none;
+}
+input[type="checkbox"]:checked::after {
+  background: #fff;
+  transform: translateX(16px);
+}
+.tools-check { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }

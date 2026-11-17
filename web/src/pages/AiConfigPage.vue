@@ -144,6 +144,7 @@
       </div>
 
       <AiPromptPanel v-if="!loading && !loadError" :sections="sections" />
+      <AiTagHelp />
     </div>
 
     <AiMemoryPanel v-else-if="tab === 'memory'" />
@@ -166,6 +167,7 @@ import AiTracePanel from '../components/AiTracePanel.vue'
 import AiPromptPanel from '../components/AiPromptPanel.vue'
 import AiModelPicker from '../components/AiModelPicker.vue'
 import AiToolPlayground from '../components/AiToolPlayground.vue'
+import AiTagHelp from '../components/AiTagHelp.vue'
 
 const mainTabs = [
   { key: 'config', label: '配置' },

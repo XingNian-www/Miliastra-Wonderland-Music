@@ -36,15 +36,21 @@ MEASURE = r"""
   const rows = new Map();
   for (const card of cards) {
     const r = card.getBoundingClientRect();
-    const key = Math.round(r.top / 6);
-    if (!rows.has(key)) rows.set(key, []);
-    rows.get(key).push({ el: card, r });
+    // 只比较同一父容器里的卡片；左右两栏各自纵向堆叠不算同行
+    const parent = card.parentElement;
+    const key = String([...rows.keys()].length) + ':' + Math.round(r.top / 6);
+    let bucket = [...rows.entries()].find(([, group]) => group.parent === parent && Math.abs(group.top - r.top) < 6);
+    if (!bucket) {
+      bucket = [parent, { parent, top: r.top, items: [] }];
+      rows.set(bucket[0] === null ? key : `${key}`, bucket[1]);
+    }
+    bucket[1].items.push({ el: card, r });
   }
   for (const [key, group] of rows) {
-    if (group.length < 2) continue;
-    const bottoms = group.map((g) => Math.round(g.r.bottom));
+    if (!group.items || group.items.length < 2) continue;
+    const bottoms = group.items.map((g) => Math.round(g.r.bottom));
     if (Math.max(...bottoms) - Math.min(...bottoms) > 2) {
-      out.unevenCards.push({ row: key, label: group.map((g) => (g.el.className || '').split(' ')[0]), bottoms });
+      out.unevenCards.push({ row: key, label: group.items.map((g) => (g.el.className || '').split(' ')[0]), bottoms });
     }
   }
 
@@ -83,6 +89,7 @@ MEASURE = r"""
 
   // 配置字段：label / control / side 是否同一垂直中心
   for (const field of document.querySelectorAll('#configForm .config-field')) {
+    if (field.clientWidth < 600) continue; // 窄屏字段纵向堆叠是预期，不做基线比较
     const label = field.querySelector('.config-field-label');
     const control = field.querySelector('.config-field-control');
     const side = field.querySelector('.config-field-side');

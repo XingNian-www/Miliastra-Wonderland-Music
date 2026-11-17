@@ -355,3 +355,178 @@ code, pre, .config-field-path { font-family: var(--font-mono); }
 body.light .theme-toggle .sun { display: block; }
 body.light .theme-toggle .moon { display: none; }
 .theme-toggle svg { width: 16px; height: 16px; }
+
+/* ---------- 控件与按钮对齐（统一高度/等宽） ---------- */
+.btn,
+.button,
+button.btn {
+  height: 32px;
+  min-height: 32px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  white-space: nowrap;
+}
+.btn.small {
+  height: 26px;
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.btn.stretch { width: 100%; }
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+select {
+  height: 32px;
+  min-height: 32px;
+  padding: 0 10px;
+}
+textarea { height: auto; min-height: 72px; padding: 8px 10px; }
+input[type="range"] { min-width: 120px; }
+input[type="checkbox"] { width: 34px; height: 20px; flex: none; }
+
+.two > .btn,
+.three > .btn,
+.tools-two > .btn,
+.controls > .btn,
+.tools-row > .btn { flex: 0 0 auto; }
+.two > .btn,
+.three > .btn,
+.tools-two > .btn { flex: 1 1 0; min-width: 0; }
+.controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tools-row { align-items: center; }
+.tools-body .btn { min-height: 32px; }
+
+/* 播放页模式/控制行：等宽三列，避免换行后长短不齐 */
+.play-mode-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  align-items: center;
+}
+.play-mode-row .play-mode-label { grid-column: 1 / -1; margin: 0 0 2px; }
+.play-mode-row .btn { width: 100%; }
+
+/* 总览快捷入口：等宽两列 */
+.overview-quick .panel-body { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.overview-quick .btn { width: 100%; }
+
+/* 顶栏按钮与状态条对齐 */
+.top-actions { display: flex; align-items: center; gap: 8px; }
+.top-actions .btn { height: 30px; min-height: 30px; }
+.tokens-row, .toolbar, .config-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+@media (max-width: 600px) {
+  .play-mode-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .overview-quick .panel-body { grid-template-columns: 1fr; }
+}
+
+/* ---------- 收紧空白（密度） ---------- */
+.page-section { padding: 20px 24px 28px; }
+.page-title { margin-bottom: 2px; }
+.page-subtitle { margin-bottom: 14px; font-size: 12px; }
+.panel-head { padding: 10px 14px; }
+.panel-body { padding: 12px 14px; }
+.page-grid { gap: 12px; }
+.config-status { padding: 9px 12px; margin-bottom: 12px; }
+.config-layout { gap: 12px; }
+.config-group-card { margin-bottom: 10px; }
+#configForm .config-group-card .config-field { padding: 8px 12px; column-gap: 12px; }
+#configForm .config-group-card .config-field-foot { padding-left: calc(200px + 12px); }
+.config-savebar { padding: 8px 12px; }
+.config-message { padding: 10px 12px; }
+
+/* 配置控件填满列宽，避免右侧大片留白 */
+#configForm .config-group-card .config-field[data-kind=path] .config-field-control input[type=text],
+#configForm .config-group-card .config-field[data-kind=string] .config-field-control input[type=text],
+#configForm .config-group-card .config-field[data-kind=secret] .config-field-control input[type=password],
+#configForm .config-group-card .config-field[data-kind=number] .config-field-control input[type=number],
+#configForm .config-group-card .config-field[data-kind=enum] .config-field-control select {
+  max-width: 100%;
+  width: 100%;
+}
+#configForm .config-group-card .config-field-control { width: 100%; }
+
+/* 空队列/空列表不再撑大 */
+.playback-queue-panel .queue-list { min-height: 64px; max-height: 240px; }
+.empty-hint { padding: 14px 10px; }
+.panel-body > .empty-hint { padding: 10px; }
+.playback-history-panel .panel-body, .playback-leaderboard-panel .panel-body { min-height: 0; }
+
+/* 工具页卡片更紧凑 */
+.tools-grid, .tools-wide { gap: 10px; padding: 0 24px 10px; }
+.tools-body { gap: 6px; }
+.tools-output { max-height: 260px; }
+.tools-evidence { max-height: 320px; }
+
+/* AI 配置页字段行更紧凑 */
+.ai-config-body .config-field-control { width: 100%; }
+.ai-config-body .config-field-control input,
+.ai-config-body .config-field-control select { width: 100%; max-width: 100%; }
+
+/* 总览：卡片内文字紧凑 */
+.overview-layout .panel-body { padding: 12px 14px; }
+.overview-stat { padding: 3px 0; }
+
+/* 保存条与工具栏贴底但更薄 */
+.config-toolbar { gap: 6px; }
+
+/* ---------- 行内控件对齐（工具/总览） ---------- */
+.tools-grid-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.tools-xyz {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.tools-ai-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+.overview-quick-grid {
+  display: grid !important;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px !important;
+}
+.overview-quick-grid .btn { width: 100%; }
+.playback-player-panel .controls > .btn { flex: 1 1 0; min-width: 0; }
+.playback-request-panel > .panel-body > .controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
+.playback-request-panel > .panel-body > .controls .btn { width: 100%; }
+
+@media (max-width: 600px) {
+  .tools-xyz { grid-template-columns: 1fr 1fr; }
+  .tools-xyz .btn { grid-column: 1 / -1; }
+  .tools-ai-row { grid-template-columns: 1fr; }
+  .overview-quick-grid { grid-template-columns: 1fr; }
+}
+
+/* ---------- 更紧凑、去掉右侧大片留白 ---------- */
+.shell { max-width: none; }
+.page-section { padding: 16px 22px 26px; max-width: 1680px; }
+.page-title { font-size: 21px; }
+.page-subtitle { margin: 0 0 12px; }
+.playback-queue-panel .queue-list { min-height: 0; }
+.overview-quick-grid .btn:last-child:nth-child(odd) { grid-column: 1 / -1; }
+.panel { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28); }
+.panel-body { padding: 11px 13px; }
+.config-status { padding: 8px 11px; }
+.config-group-card { margin-bottom: 8px; }
+#configForm .config-group-card .config-field { padding: 7px 11px; }
+.config-savebar { padding: 7px 11px; }
+.tools-grid, .tools-wide { padding: 0 22px 8px; }
+
+/* ---------- 宽屏居中，避免内容被拉成一条空带 ---------- */
+.page-section { max-width: 1480px; margin: 0 auto; }
+.topbar { max-width: 1480px; margin: 0 auto; }
+@media (min-width: 1600px) {
+  .app-nav { position: fixed; inset: 0 auto 0 0; height: 100vh; overflow-y: auto; }
+  .shell { margin-left: 236px; }
+}

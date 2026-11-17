@@ -456,7 +456,8 @@ onBeforeUnmount(() => {
 .tools-body { display: flex; flex-direction: column; gap: 8px; }
 .tools-two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .tools-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.tools-row input { flex: 1 1 140px; min-width: 100px; }
+.tools-row input:not([type="checkbox"]):not([type="radio"]) { flex: 1 1 140px; min-width: 100px; }
+.tools-row input[type="checkbox"] { flex: 0 0 auto; width: 36px; min-width: 36px; }
 .tools-check { display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-tiny); }
 .tools-output { margin: 0; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all; background: var(--bg-1); padding: 8px; border-radius: 8px; font-size: var(--fs-tiny); }
 .tools-task { display: flex; gap: 8px; width: 100%; text-align: left; background: var(--bg-1); border: 1px solid var(--sep-1); border-radius: 8px; padding: 6px 8px; cursor: pointer; font-size: var(--fs-tiny); }

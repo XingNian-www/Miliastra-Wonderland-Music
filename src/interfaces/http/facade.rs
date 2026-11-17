@@ -1486,7 +1486,8 @@ impl HttpAiPort for ApplicationHttpAiFacade {
 
     fn memory_hall(&self) -> Result<String> {
         let memory = self.memory()?;
-        let hall = memory.hall_context()?;
+        // 面板要全量视图：actor_key 传空串表示不过滤受众。
+        let hall = memory.hall_context("")?;
         let (count, tokens) = memory.hall_stats()?;
         let lines = hall
             .lines

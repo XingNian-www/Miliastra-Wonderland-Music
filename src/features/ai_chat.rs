@@ -451,9 +451,10 @@ pub struct AiChatConfig {
     pub actor_summary_budget: usize,
     /// 是否把该玩家的历史问答作为独立 messages 前缀注入。
     ///
-    /// 默认关闭：大厅上下文已覆盖近期对话，默认注入会与 hall 重复；
-    /// 开启用于保留跨大厅长尾（历史上问过、但已滚出大厅窗口的内容）。
-    #[serde(default)]
+    /// 默认开启以保信息：hall 按受众过滤后，当前玩家自己的提问/BOT 回复
+    /// 不再出现在大厅上下文，只能靠个人 messages 保留；关闭后只保留
+    /// facts/摘要/大厅上下文，跨大厅长尾会丢失。
+    #[serde(default = "default_true")]
     pub inject_actor_history: bool,
     /// 大厅**近期原文** token 预算（全局共用，记录所有人在大厅说的话）。
     #[serde(default = "default_hall_budget")]
@@ -701,7 +702,7 @@ impl Default for AiChatConfig {
             _legacy_bot_name: String::new(),
             actor_token_budget: ACTOR_TOKEN_BUDGET,
             actor_summary_budget: ACTOR_SUMMARY_BUDGET,
-            inject_actor_history: false,
+            inject_actor_history: true,
             hall_token_budget: HALL_TOKEN_BUDGET,
             hall_summary_budget: HALL_SUMMARY_BUDGET,
             bot_token_budget: BOT_TOKEN_BUDGET,
@@ -960,8 +961,8 @@ fn default_answer_prompt() -> String {
     [
         "关于当前玩家的事实：{{facts}}",
         "更早的对话摘要（压缩后的旧记忆，越靠后越新）：{{summary}}",
-        "对话历史由配置决定是否作为独立消息提供（默认不注入，以大厅共享记忆为准）。",
-        "大厅共享记忆（所有人的发言，含你自己此前的回复；你自己的话用「你（角色名）：」标出）：{{hall}}",
+        "个人问答历史默认作为独立消息提供（可在 ai_chat.inject_actor_history 关闭）。",
+        "大厅共享记忆（其他玩家的发言，以及你对他人的回复；你自己的提问与回复不在其中）：{{hall}}",
     ]
     .join("")
 }
@@ -1282,7 +1283,9 @@ impl AiChatMemory {
                  text     TEXT    NOT NULL,
                  tokens   INTEGER NOT NULL,
                  added_at INTEGER NOT NULL,
-                 role     TEXT    NOT NULL DEFAULT 'player'
+                 role     TEXT    NOT NULL DEFAULT 'player',
+                 -- 受众 key：玩家行=提问者，BOT 行=回复对象；空串为旧库遗留。
+                 actor_key TEXT   NOT NULL DEFAULT ''
              );
              -- 改名历史：actor 是按昵称存的，玩家改名后旧事实会变成孤儿行。
              -- 这张表让「这个人用过哪些名字」成为结构事实，而不是靠模型从
@@ -1295,17 +1298,23 @@ impl AiChatMemory {
                  PRIMARY KEY (actor, name)
              );",
         )?;
-        // 老库补 role 列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+        // 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
         // 用 PRAGMA 判断而不是 prepare，空表时 prepare 也会成功。
-        let has_role = connection
+        let columns = connection
             .prepare("PRAGMA table_info(ai_chat_hall_turns)")?
             .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .iter()
-            .any(|name| name == "role");
-        if !has_role {
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !columns.iter().any(|name| name == "role") {
             connection.execute(
                 "ALTER TABLE ai_chat_hall_turns ADD COLUMN role TEXT NOT NULL DEFAULT 'player'",
+                [],
+            )?;
+        }
+        // 方案 A：大厅按受众拆分。旧行 actor_key 空串，hall_context 仍返回，
+        // 避免升级后旧数据凭空消失；新行才带上提问者/回复对象 key。
+        if !columns.iter().any(|name| name == "actor_key") {
+            connection.execute(
+                "ALTER TABLE ai_chat_hall_turns ADD COLUMN actor_key TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
         }
@@ -1392,10 +1401,18 @@ impl AiChatMemory {
     /// 只读**最近**若干条：原来这条 SQL 没有 LIMIT，会全表读取——大厅每次
     /// 问答写 2 行，几百轮后单次请求就要塞进上万 token，而目标输出只有 160 字符。
     /// 落库预算（32000 是**保留**预算）与读取窗口是两回事，和多人对局的其它窗口同理。
-    pub(crate) fn hall_context(&self) -> Result<HallContext> {
+    ///
+    /// 方案 A：按受众过滤，当前 actor 的提问/BOT 对 TA 的回复不进 hall（个人
+    /// messages 已有）；`actor_key` 传空串表示不过滤（面板全量视图）。
+    pub(crate) fn hall_context(&self, actor_key: &str) -> Result<HallContext> {
         let connection = self.connection()?;
         // 从最新往回取：玩家行按 HALL_READ_BUDGET，Bot 行按条数/ token
         // 双预算单独截断，再反转成旧→新。
+        //
+        // 受众过滤：当前玩家的提问与 BOT 对他的回复只走个人 messages，不再
+        // 在 hall 重复；其他人的发言/对别人的回复仍共享。`actor_key=''` 是
+        // 升级前的旧行，没有归属信息，继续返回（否则升级即丢历史）；参数传
+        // 空串表示面板要全量视图。
         let mut lines = Vec::new();
         let mut used_player = 0usize;
         let mut player_lines = 0usize;
@@ -1403,9 +1420,10 @@ impl AiChatMemory {
         let mut bot_lines = 0usize;
         {
             let mut stmt = connection.prepare(
-                "SELECT speaker, text, role, tokens FROM ai_chat_hall_turns ORDER BY id DESC",
+                "SELECT speaker, text, role, tokens FROM ai_chat_hall_turns
+                 WHERE actor_key <> ?1 OR actor_key = '' ORDER BY id DESC",
             )?;
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query([actor_key])?;
             while let Some(row) = rows.next()? {
                 let tokens: usize = row.get::<_, i64>(3)?.max(0) as usize;
                 let speaker: String = row.get(0)?;
@@ -1631,7 +1649,26 @@ impl AiChatMemory {
             "DELETE FROM ai_chat_summaries WHERE scope = ?1",
             [Self::actor_scope(actor)],
         )?;
-        Ok(facts + turns + summary > 0)
+        // 大厅行按受众 key 级联：玩家自己的提问 + BOT 对他的回复都不再保留。
+        let hall_lines = connection.execute(
+            "DELETE FROM ai_chat_hall_turns WHERE actor_key = ?1",
+            [actor],
+        )?;
+        // 大厅摘要无法按人拆分，必须整体清空；否则被遗忘者的内容仍会通过
+        // hall summary 进入提示词。清空后由后续轮次重新压缩生成。
+        let hall_summary = connection.execute(
+            "DELETE FROM ai_chat_summaries WHERE scope = ?1",
+            [Self::hall_scope()],
+        )?;
+        if hall_lines > 0 || hall_summary > 0 {
+            // 审计只记数量，不记昵称/正文/key，避免把被遗忘者重新写进日志。
+            log::info!(
+                "AI 记忆遗忘级联：删除大厅记录 {hall_lines} 条，清空大厅摘要 {hall_summary} 项"
+            );
+        }
+        // TODO: ai_trace 目前只有测试用的 clear_for_tests，没有生产清空入口；
+        // 本轮按需求不扩大 trace 模块结构，遗忘暂不清请求记录，后续另开接口。
+        Ok(facts + turns + summary + hall_lines + hall_summary > 0)
     }
 
     /// 记录大厅里的一句话（所有人在大厅说的，全局共享）。
@@ -1640,14 +1677,15 @@ impl AiChatMemory {
     /// 个人记忆是长久的，跟着具体的人走。
     /// 记录大厅里的一句话。
     ///
-    /// `role` 区分玩家发言与 BOT 自己的发言：BOT 的旧话会同时进 bot_lines，
-    /// 下一轮又被当成上下文读回来——复读自己的猜测是「三轮后变成确定事实」
-    /// 那条事故的同源路径。只加标记、不删内容，符合「大厅保留完整对话」。
+    /// `role` 区分玩家发言与 BOT 自己的发言；`actor_key` 记录受众：玩家行是
+    /// 提问者 key，BOT 行是回复对象 key。`hall_context` 据此避免当前玩家的
+    /// 问答在个人 messages 与 hall 里重复；空串是旧库遗留行，仍对所有人可见。
     pub(crate) fn record_hall_line(
         &self,
         speaker: &str,
         text: &str,
         role: HallSpeakerRole,
+        actor_key: &str,
         budget: usize,
         now_ms: i64,
     ) -> Result<()> {
@@ -1658,8 +1696,8 @@ impl AiChatMemory {
         let tokens = estimate_tokens(text);
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO ai_chat_hall_turns(speaker, text, tokens, added_at, role)              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![speaker, text, tokens as i64, now_ms, role.as_str()],
+            "INSERT INTO ai_chat_hall_turns(speaker, text, tokens, added_at, role, actor_key)              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![speaker, text, tokens as i64, now_ms, role.as_str(), actor_key.trim()],
         )?;
         prune_hall_hard_cap(&connection, budget)?;
         Ok(())
@@ -2231,7 +2269,7 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
     let history = if input.config.inject_actor_history {
         "（历史已作为独立对话消息提供）"
     } else {
-        "（历史默认不注入，以大厅共享记忆为准）"
+        "（历史未注入：已配置关闭 inject_actor_history，仅以大厅共享记忆为准）"
     };
     // 除了原文，再单独列出「最近用过哪些开场动作」。
     //
@@ -3684,12 +3722,13 @@ mod tests {
                     "甲",
                     &format!("第{index}条大厅发言，内容足够长"),
                     HallSpeakerRole::Player,
+                    "",
                     budget,
                     index as i64,
                 )
                 .unwrap();
         }
-        let context = memory.hall_context().unwrap();
+        let context = memory.hall_context("").unwrap();
         assert!(!context.lines.is_empty(), "至少要保留最新一条");
         assert!(
             context.lines.len() < 40,
@@ -3708,10 +3747,17 @@ mod tests {
         let line = "中".repeat(1_000);
         for index in 0..40 {
             memory
-                .record_hall_line("甲", &line, HallSpeakerRole::Player, 1_000_000, index as i64)
+                .record_hall_line(
+                    "甲",
+                    &line,
+                    HallSpeakerRole::Player,
+                    "",
+                    1_000_000,
+                    index as i64,
+                )
                 .unwrap();
         }
-        let context = memory.hall_context().unwrap();
+        let context = memory.hall_context("").unwrap();
         assert_eq!(
             context.lines.len(),
             HALL_READ_BUDGET / 1_000,
@@ -3730,16 +3776,30 @@ mod tests {
         let bot_line = "中".repeat(150);
         for index in 0..10 {
             memory
-                .record_hall_line("橘子", &bot_line, HallSpeakerRole::Bot, 1_000_000, index as i64)
+                .record_hall_line(
+                    "橘子",
+                    &bot_line,
+                    HallSpeakerRole::Bot,
+                    "",
+                    1_000_000,
+                    index as i64,
+                )
                 .unwrap();
         }
         let player_line = "啊".repeat(1_000);
         for index in 0..10 {
             memory
-                .record_hall_line("甲", &player_line, HallSpeakerRole::Player, 1_000_000, 100 + index)
+                .record_hall_line(
+                    "甲",
+                    &player_line,
+                    HallSpeakerRole::Player,
+                    "",
+                    1_000_000,
+                    100 + index,
+                )
                 .unwrap();
         }
-        let context = memory.hall_context().unwrap();
+        let context = memory.hall_context("").unwrap();
         let bots = context
             .lines
             .iter()
@@ -3751,6 +3811,186 @@ mod tests {
         // 玩家行仍按 4K 预算保留最近的 4 条（1000 token/条）。
         assert_eq!(players, 4, "玩家行不应被 Bot 行挤掉: {context:?}");
         assert_eq!(memory.hall_stats().unwrap().0, 20, "读取不能删库里的行");
+    }
+
+    /// 旧库升级：没有 actor_key 列的表要能自动 ALTER 补列，且旧行继续可读。
+    #[test]
+    fn legacy_hall_table_is_migrated_and_keeps_old_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        // 模拟 75cb8e7 之前的旧表：无 actor_key（role 也先不加，验证两列都能补）。
+        connection
+            .execute_batch(
+                "CREATE TABLE ai_chat_hall_turns (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     speaker TEXT NOT NULL,
+                     text TEXT NOT NULL,
+                     tokens INTEGER NOT NULL,
+                     added_at INTEGER NOT NULL
+                 );
+                 INSERT INTO ai_chat_hall_turns(speaker, text, tokens, added_at)
+                 VALUES ('旧玩家', '升级前的发言', 6, 1);",
+            )
+            .unwrap();
+        let memory = AiChatMemory::from_connection(connection).unwrap();
+        let columns = {
+            let connection = memory.connection.lock().unwrap();
+            connection
+                .prepare("PRAGMA table_info(ai_chat_hall_turns)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(columns.iter().any(|name| name == "actor_key"));
+        assert!(columns.iter().any(|name| name == "role"));
+        // 旧行 actor_key 走默认空串：任何玩家的 hall 都能看到，不会升级即丢。
+        let context = memory.hall_context("任意-key").unwrap();
+        assert_eq!(context.lines.len(), 1);
+        assert_eq!(context.lines[0].1, "升级前的发言");
+        assert_eq!(context.lines[0].2, HallSpeakerRole::Player);
+    }
+
+    /// 方案 A 的受众互补：A 自己的提问/BOT 对 A 的回复只进个人 messages；
+    /// 在 B 的 hall 里仍能看到（同样 B 的也不出现在 A 的 hall）。
+    #[test]
+    fn hall_context_filters_current_actor_but_keeps_others_complementary() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        memory
+            .record_hall_line(
+                "甲",
+                "甲的问题",
+                HallSpeakerRole::Player,
+                "key-a",
+                1_000_000,
+                1,
+            )
+            .unwrap();
+        memory
+            .record_hall_line(
+                "橘子",
+                "对甲的回答",
+                HallSpeakerRole::Bot,
+                "key-a",
+                1_000_000,
+                2,
+            )
+            .unwrap();
+        memory
+            .record_hall_line(
+                "乙",
+                "乙的问题",
+                HallSpeakerRole::Player,
+                "key-b",
+                1_000_000,
+                3,
+            )
+            .unwrap();
+        memory
+            .record_hall_line(
+                "橘子",
+                "对乙的回答",
+                HallSpeakerRole::Bot,
+                "key-b",
+                1_000_000,
+                4,
+            )
+            .unwrap();
+        memory
+            .record_hall_line(
+                "丙",
+                "旧库无归属行",
+                HallSpeakerRole::Player,
+                "",
+                1_000_000,
+                5,
+            )
+            .unwrap();
+
+        let a = memory.hall_context("key-a").unwrap();
+        let a_texts: Vec<&str> = a.lines.iter().map(|(_, text, _)| text.as_str()).collect();
+        assert!(!a_texts.contains(&"甲的问题"), "A 的提问不应在 A 的 hall");
+        assert!(
+            !a_texts.contains(&"对甲的回答"),
+            "BOT 对 A 的回复不应在 A 的 hall"
+        );
+        assert!(a_texts.contains(&"乙的问题"), "其他人的提问必须共享");
+        assert!(a_texts.contains(&"对乙的回答"), "BOT 对别人的回复必须共享");
+        assert!(a_texts.contains(&"旧库无归属行"), "旧库空 key 行必须保留");
+
+        let b = memory.hall_context("key-b").unwrap();
+        let b_texts: Vec<&str> = b.lines.iter().map(|(_, text, _)| text.as_str()).collect();
+        assert!(!b_texts.contains(&"乙的问题"));
+        assert!(!b_texts.contains(&"对乙的回答"));
+        assert!(b_texts.contains(&"甲的问题"));
+        assert!(b_texts.contains(&"对甲的回答"));
+
+        let all = memory.hall_context("").unwrap();
+        assert_eq!(all.lines.len(), 5, "面板空 key 应拿到全量视图");
+    }
+
+    /// 遗忘级联：删除该 actor 的大厅行 + 清空大厅摘要；别人的行保留。
+    #[test]
+    fn forgetting_an_actor_cascades_to_hall_rows_and_hall_summary() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        memory.add_fact("key-a", "甲的旧事实", 1).unwrap();
+        memory
+            .record_turn("key-a", "甲的问题", "甲的回答", 100_000, 2)
+            .unwrap();
+        memory
+            .record_hall_line(
+                "甲",
+                "甲的问题",
+                HallSpeakerRole::Player,
+                "key-a",
+                1_000_000,
+                3,
+            )
+            .unwrap();
+        memory
+            .record_hall_line(
+                "橘子",
+                "对甲的回答",
+                HallSpeakerRole::Bot,
+                "key-a",
+                1_000_000,
+                4,
+            )
+            .unwrap();
+        memory
+            .record_hall_line(
+                "乙",
+                "乙的问题",
+                HallSpeakerRole::Player,
+                "key-b",
+                1_000_000,
+                5,
+            )
+            .unwrap();
+        {
+            let connection = memory.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO ai_chat_summaries(scope, summary, tokens, updated_at)
+                     VALUES ('hall', '含甲内容的大厅摘要', 20, 6)",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(memory.forget("key-a").unwrap());
+        let context = memory.context("key-a").unwrap();
+        assert!(context.facts.is_empty());
+        assert!(context.turns.is_empty());
+        let hall = memory.hall_context("").unwrap();
+        let texts: Vec<&str> = hall
+            .lines
+            .iter()
+            .map(|(_, text, _)| text.as_str())
+            .collect();
+        assert!(!texts.contains(&"甲的问题"), "被遗忘者的大厅提问必须删除");
+        assert!(!texts.contains(&"对甲的回答"), "BOT 对 TA 的回复必须删除");
+        assert!(texts.contains(&"乙的问题"), "别人的大厅行不能被误删");
+        assert!(hall.summary.is_none(), "大厅摘要必须整体清空");
     }
 
     /// 摘要硬上限：面板上的 summary_budget 必须真的生效。
@@ -4290,9 +4530,9 @@ mod tests {
         assert!(!memory.forget("甲").unwrap(), "第二次清空不再有内容");
     }
 
-    /// 默认不注入个人 turns；开关打开后才作为 messages 注入。
+    /// 方案 A：默认注入个人 turns（保信息）；显式关闭后 messages 为空。
     #[test]
-    fn actor_history_is_injected_only_when_configured() {
+    fn actor_history_is_injected_by_default_and_can_be_disabled() {
         let context = ChatContext {
             facts: vec!["偏好".into()],
             summary: None,
@@ -4303,18 +4543,18 @@ mod tests {
             }],
         };
         let mut config = config();
-        assert!(!config.inject_actor_history, "默认必须关闭个人历史注入");
-        assert!(
-            injected_conversation_history(&config, &context, "甲").is_empty(),
-            "关闭时不得生成历史 messages"
-        );
-        config.inject_actor_history = true;
+        assert!(config.inject_actor_history, "默认必须开启个人历史注入");
         assert_eq!(
             injected_conversation_history(&config, &context, "甲"),
             vec![
                 serde_json::json!({"role":"user","content":"[甲]:第一问"}),
                 serde_json::json!({"role":"assistant","content":"第一答"}),
             ]
+        );
+        config.inject_actor_history = false;
+        assert!(
+            injected_conversation_history(&config, &context, "甲").is_empty(),
+            "关闭时不得生成历史 messages"
         );
     }
 

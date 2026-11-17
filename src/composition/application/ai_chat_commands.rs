@@ -446,7 +446,7 @@ impl ApplicationRuntime {
                 let actor_display = self.actor_display_name(&actor);
                 // 大厅共享记忆：所有人最近说的 + 滚动摘要。
                 // 个人记忆只属于提问者，大厅上下文是所有人在同一空间里共享的。
-                let hall = self.business.ai_chat_memory.hall_context()?;
+                let hall = self.business.ai_chat_memory.hall_context(&actor)?;
                 let allowed = self.ai_chat_allowed_commands(parsed);
                 let prompt = ai_chat::build_prompt(&ai_chat::PromptInput {
                     config: &config,
@@ -851,6 +851,7 @@ impl ApplicationRuntime {
                         &actor_display,
                         question,
                         crate::features::ai_chat::HallSpeakerRole::Player,
+                        &actor,
                         config.hall_token_budget,
                         now_ms,
                     )?;
@@ -860,6 +861,7 @@ impl ApplicationRuntime {
                         &self.bot_display_name(),
                         rendered,
                         crate::features::ai_chat::HallSpeakerRole::Bot,
+                        &actor,
                         config.hall_token_budget,
                         now_ms,
                     )?;

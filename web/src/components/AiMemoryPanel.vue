@@ -9,107 +9,118 @@
       <div v-if="loading" class="loading-card">正在读取记忆…</div>
 
       <template v-else>
-        <div class="ai-memory-section">
-          <h3>大厅共享记忆</h3>
-          <p class="config-field-hint">
-            原文 {{ hall.count || 0 }} 条，约 {{ hall.tokens || 0 }} token
-          </p>
-          <div v-if="hall.summary" class="ai-memory-summary">
-            <strong>摘要</strong>
-            <pre>{{ hall.summary }}</pre>
-          </div>
-          <p v-if="hall.count && hall.count > (hall.lines || []).length" class="config-field-hint">
-            接口返回最近 {{ (hall.lines || []).length }} 条原文，共 {{ hall.count }} 条；更早内容只保留在摘要里。
-          </p>
-          <div v-if="(hall.lines || []).length" class="ai-memory-lines">
-            <div v-for="(line, index) in hall.lines" :key="index" class="ai-memory-line">
-              <strong>{{ line.speaker }}</strong>：{{ line.text }}
+        <details class="ai-memory-section ai-hall-details">
+          <summary>
+            <span>大厅共享记忆</span>
+            <span class="config-field-hint">{{ hall.count || 0 }} 条 · 约 {{ hall.tokens || 0 }} token</span>
+          </summary>
+          <div class="ai-hall-body">
+            <div v-if="hall.summary" class="ai-memory-summary">
+              <strong>摘要</strong>
+              <pre>{{ hall.summary }}</pre>
             </div>
+            <p v-if="hall.count && hall.count > (hall.lines || []).length" class="config-field-hint">
+              接口返回最近 {{ (hall.lines || []).length }} 条原文，共 {{ hall.count }} 条；更早内容只保留在摘要里。
+            </p>
+            <div v-if="(hall.lines || []).length" class="ai-memory-lines">
+              <div v-for="(line, index) in hall.lines" :key="index" class="ai-memory-line">
+                <strong>{{ line.speaker }}</strong>：{{ line.text }}
+              </div>
+            </div>
+            <p v-else class="config-field-hint">（暂无大厅记忆）</p>
+            <button class="btn small danger" type="button" :disabled="acting" @click="clearHall">清空大厅记忆</button>
           </div>
-          <p v-else class="config-field-hint">（暂无大厅记忆）</p>
-          <button class="btn small danger" type="button" :disabled="acting" @click="clearHall">
-            清空大厅记忆
-          </button>
-        </div>
+        </details>
 
         <div class="ai-memory-section">
           <h3>个人记忆</h3>
           <p v-if="!actors.length" class="config-field-hint">（还没有任何玩家记忆）</p>
-          <div v-else class="ai-actor-list">
-            <div
-              v-for="actor in actors"
-              :key="actor.key || actor.actor"
-              class="ai-actor-row"
-              :class="{ selected: selectedKey === (actor.key || actor.actor) }"
-            >
-              <div class="ai-actor-main">
-                <strong>{{ actor.actor || '未命名玩家' }}</strong>
-                <span class="config-field-hint">
-                  事实 {{ actor.facts || 0 }} 条 / 对话 {{ actor.turns || 0 }} 轮 / 约 {{ actor.tokens || 0 }} token
-                </span>
-              </div>
-              <div class="ai-actor-actions">
-                <button class="btn small" type="button" @click="viewActor(actor)">查看</button>
-                <button class="btn small danger" type="button" @click="deleteActor(actor)">删除</button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="detail || detailLoading" class="ai-memory-section ai-memory-detail">
-          <div class="ai-memory-detail-head">
-            <h3>{{ detail ? (detail.actor || detail.key || '玩家记忆') : '读取中…' }}</h3>
-            <div class="ai-memory-detail-actions">
-              <button
-                v-if="detail && detail.found !== false"
-                class="btn small"
-                type="button"
-                :disabled="acting"
-                @click="rebuildFacts"
-              >
-                重建事实
-              </button>
-              <button v-if="detail" class="btn small ghost" type="button" @click="detail = null">收起</button>
-            </div>
-          </div>
-          <div v-if="detailLoading" class="loading-card">正在读取玩家记忆…</div>
-          <template v-else-if="detail">
-            <div v-if="detail.found === false" class="config-message err">
-              没有这个玩家的记忆（可能已被删除）。
-            </div>
-            <template v-else>
-              <div class="ai-memory-summary">
-                <div class="ai-memory-summary-head">
-                  <strong>中期摘要</strong>
-                  <span class="config-field-hint">
-                    {{ detail.summary ? `已生成 · 约 ${String(detail.summary).length} 字` : '未生成（原文未超预算）' }}
+          <div v-else class="ai-memory-layout">
+            <aside class="ai-memory-actors">
+              <input v-model="search" placeholder="搜索玩家昵称…" aria-label="搜索玩家" />
+              <div class="ai-actor-list">
+                <div
+                  v-for="actor in filteredActors"
+                  :key="actor.key || actor.actor"
+                  class="ai-actor-row"
+                  :class="{ selected: selectedKey === (actor.key || actor.actor) }"
+                  role="button"
+                  tabindex="0"
+                  @click="viewActor(actor)"
+                  @keydown.enter.prevent="viewActor(actor)"
+                  @keydown.space.prevent="viewActor(actor)"
+                >
+                  <span class="ai-actor-main">
+                    <strong>{{ actor.actor || '未命名玩家' }}</strong>
+                    <span class="config-field-hint">事实 {{ actor.facts || 0 }} · 对话 {{ actor.turns || 0 }} 轮 · {{ actor.tokens || 0 }} token</span>
+                  </span>
+                  <span class="ai-actor-actions">
+                    <button class="btn small danger" type="button" @click.stop="deleteActor(actor)">删除</button>
                   </span>
                 </div>
-                <pre v-if="detail.summary">{{ detail.summary }}</pre>
-                <p v-else class="config-field-hint">这一层还没有摘要，事实与近期对话就是当前记忆。</p>
+                <p v-if="!filteredActors.length" class="config-field-hint">没有匹配的玩家</p>
               </div>
+            </aside>
 
-              <div class="ai-memory-facts">
-                <strong>事实</strong>
-                <p v-if="!(detail.facts || []).length" class="config-field-hint">（暂无事实）</p>
-                <div v-for="(fact, index) in detail.facts || []" :key="index" class="ai-fact-row">
-                  <span>{{ fact }}</span>
-                  <button class="btn small danger" type="button" @click="deleteFact(fact)">删除</button>
-                </div>
-              </div>
-
-              <div v-if="(detail.turns || []).length" class="ai-memory-turns">
-                <strong>近期对话</strong>
-                <div class="ai-turn-list">
-                  <div v-for="(turn, index) in detail.turns" :key="index" class="ai-turn-row">
-                    <span class="config-field-hint">[{{ turn.asker }}]</span>
-                    {{ turn.question }}
-                    <div class="ai-turn-answer">↳ {{ turn.answer }}</div>
+            <div ref="detailBox" class="ai-memory-detail-wrap">
+              <div v-if="!detail && !detailLoading" class="empty-hint">从左侧选择玩家查看记忆</div>
+              <template v-else>
+                <div class="ai-memory-detail-head">
+                  <h3>{{ detail ? (detail.actor || detail.key || '玩家记忆') : '读取中…' }}</h3>
+                  <div class="ai-memory-detail-actions">
+                    <button
+                      v-if="detail && detail.found !== false"
+                      class="btn small"
+                      type="button"
+                      :disabled="acting"
+                      @click="rebuildFacts"
+                    >
+                      重建事实
+                    </button>
+                    <button v-if="detail" class="btn small ghost" type="button" @click="detail = null">收起</button>
                   </div>
                 </div>
-              </div>
-            </template>
-          </template>
+                <div v-if="detailLoading" class="loading-card">正在读取玩家记忆…</div>
+                <template v-else-if="detail">
+                  <div v-if="detail.found === false" class="config-message err">
+                    没有这个玩家的记忆（可能已被删除）。
+                  </div>
+                  <template v-else>
+                    <div class="ai-memory-summary">
+                      <div class="ai-memory-summary-head">
+                        <strong>中期摘要</strong>
+                        <span class="config-field-hint">
+                          {{ detail.summary ? `已生成 · 约 ${String(detail.summary).length} 字` : '未生成（原文未超预算）' }}
+                        </span>
+                      </div>
+                      <pre v-if="detail.summary">{{ detail.summary }}</pre>
+                      <p v-else class="config-field-hint">这一层还没有摘要，事实与近期对话就是当前记忆。</p>
+                    </div>
+
+                    <div class="ai-memory-facts">
+                      <strong>事实</strong>
+                      <p v-if="!(detail.facts || []).length" class="config-field-hint">（暂无事实）</p>
+                      <div v-for="(fact, index) in detail.facts || []" :key="index" class="ai-fact-row">
+                        <span>{{ fact }}</span>
+                        <button class="btn small danger" type="button" @click="deleteFact(fact)">删除</button>
+                      </div>
+                    </div>
+
+                    <div v-if="(detail.turns || []).length" class="ai-memory-turns">
+                      <strong>近期对话</strong>
+                      <div class="ai-turn-list">
+                        <div v-for="(turn, index) in detail.turns" :key="index" class="ai-turn-row">
+                          <span class="config-field-hint">[{{ turn.asker }}]</span>
+                          {{ turn.question }}
+                          <div class="ai-turn-answer">↳ {{ turn.answer }}</div>
+                        </div>
+                      </div>
+                    </div>
+                  </template>
+                </template>
+              </template>
+            </div>
+          </div>
         </div>
       </template>
     </div>
@@ -117,7 +128,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { getJson, requestJson } from '../api.js'
 import { toast } from '../store.js'
 
@@ -129,6 +140,13 @@ const hall = ref({})
 const detail = ref(null)
 const detailLoading = ref(false)
 const selectedKey = ref('')
+const search = ref('')
+const detailBox = ref(null)
+const filteredActors = computed(() => {
+  const keyword = search.value.trim().toLowerCase()
+  if (!keyword) return actors.value
+  return actors.value.filter((item) => `${item.actor || ''} ${item.key || ''}`.toLowerCase().includes(keyword))
+})
 
 async function load() {
   loading.value = true
@@ -164,6 +182,10 @@ async function viewActor(actor) {
     selectedKey.value = ''
   } finally {
     detailLoading.value = false
+  }
+  if (window.innerWidth < 900) {
+    await nextTick()
+    detailBox.value?.scrollIntoView({ block: 'start', behavior: 'smooth' })
   }
 }
 
@@ -265,4 +287,33 @@ onMounted(load)
 .ai-turn-list { max-height: 240px; overflow: auto; }
 .ai-turn-row { padding: 3px 0; border-bottom: 1px solid var(--sep-2); }
 .ai-turn-answer { opacity: .8; padding-left: var(--sp-2); }
+</style>
+<style scoped>
+.ai-memory-section { margin-top: 12px; }
+.ai-memory-section h3 { margin: 0 0 6px; font-size: 13px; }
+.ai-hall-details { border: 1px solid var(--sep-2); border-radius: 10px; padding: 8px 12px; background: rgba(255, 255, 255, 0.015); }
+.ai-hall-details > summary { cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 10px; font-weight: 600; font-size: 13px; }
+.ai-hall-body { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.ai-memory-layout { display: grid; grid-template-columns: minmax(220px, 300px) minmax(0, 1fr); gap: 12px; align-items: start; }
+.ai-memory-actors { display: flex; flex-direction: column; gap: 6px; position: sticky; top: 76px; }
+.ai-memory-actors > input { width: 100%; }
+.ai-actor-list { display: flex; flex-direction: column; gap: 4px; max-height: calc(100vh - 220px); overflow: auto; }
+.ai-actor-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; text-align: left; padding: 7px 9px; border: 1px solid transparent; border-radius: 9px; background: rgba(255, 255, 255, 0.02); color: var(--text-1); cursor: pointer; }
+.ai-actor-row:hover { background: rgba(255, 255, 255, 0.05); }
+.ai-actor-row.selected { border-color: rgba(91, 140, 255, 0.5); background: var(--accent-soft); }
+.ai-actor-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.ai-actor-main strong { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
+.ai-actor-actions { display: flex; gap: 4px; flex: none; }
+.ai-actor-actions .btn { height: 24px; min-height: 24px; padding: 0 8px; font-size: 11px; }
+.ai-memory-detail-wrap { min-height: 220px; border: 1px solid var(--sep-2); border-radius: 10px; padding: 12px; background: rgba(255, 255, 255, 0.01); }
+.ai-memory-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.ai-memory-detail-head h3 { margin: 0; }
+.ai-memory-detail-actions { display: flex; gap: 6px; }
+.ai-memory-detail-wrap .is { margin: 0; }
+@media (max-width: 900px) {
+  .ai-memory-layout { grid-template-columns: 1fr; }
+  .ai-memory-actors { position: static; }
+  .ai-actor-list { max-height: 260px; }
+  .ai-memory-detail-wrap { min-height: 0; }
+}
 </style>

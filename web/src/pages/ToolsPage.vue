@@ -3,6 +3,7 @@
     <h1 class="page-title">高级控制</h1>
     <p class="page-subtitle">OCR、模板匹配、手动输入与只读观测；写操作会真实操作游戏</p>
 
+    <div class="tools-layout">
     <div class="tools-grid">
       <section class="panel">
         <div class="panel-head"><h2>画面与识别</h2></div>
@@ -84,7 +85,7 @@
       </section>
     </div>
 
-    <div class="tools-wide">
+    <aside class="tools-side">
       <section class="panel">
         <div class="panel-head">
           <h2>任务结果</h2>
@@ -115,6 +116,7 @@
           </button>
         </div>
       </section>
+    </aside>
     </div>
 
     <section class="panel tools-wide">

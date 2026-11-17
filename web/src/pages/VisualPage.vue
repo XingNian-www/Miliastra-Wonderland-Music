@@ -109,6 +109,9 @@
             </div>
           </template>
 
+        </section>
+
+        <aside class="visual-side">
           <div class="config-group-card">
             <div class="config-group-head">
               预览差异
@@ -138,9 +141,6 @@
               JSON.stringify(preview.differences, null, 2)
             }}</pre>
           </div>
-        </section>
-
-        <aside class="visual-side">
           <div class="config-group-card">
             <div class="config-group-head">档案状态</div>
             <dl class="visual-facts">

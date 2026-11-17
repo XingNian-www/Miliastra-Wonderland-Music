@@ -94,9 +94,9 @@
               v-for="item in group.commands"
               :key="itemKey(item)"
               class="command-item"
-              :class="{ 'hidden-command': item.hidden && showHidden, disabled: item.enabled === false }"
+              :class="{ 'hidden-command': item.hidden && showHidden, disabled: item.enabled === false, selected: isSelected(item) }"
             >
-              <div class="command-head">
+              <div class="command-head" @click="selectCommand(item)">
                 <div class="command-title">
                   <button
                     type="button"
@@ -261,7 +261,7 @@
       </section>
     </div>
 
-    <div class="row wrap" style="margin-top: 12px">
+    <div class="command-savebar row wrap">
       <button class="btn primary" type="button" :disabled="saving || !policyDirtyCount" @click="savePolicy">
         {{ savingPolicy ? '保存中…' : `保存权限与平台（${policyDirtyCount}）` }}
       </button>

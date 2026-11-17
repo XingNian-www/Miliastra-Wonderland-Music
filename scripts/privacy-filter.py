@@ -20,7 +20,9 @@ nickname 与账号 UID，命中后统一替换成稳定代号（玩家A、玩家
   python3 scripts/privacy-filter.py --check report.md
 选项：
   --fields nickname,real_nickname,note,uid   参与替换的字段（默认全选）
-  --prefix 玩家                              代号前缀
+  --prefix 示例玩家                          代号前缀（代码扫描默认用「示例玩家」）
+  --repo                                     不给 paths 时扫描仓库代码（src、web/src、scripts、technical-docs）
+  --mode code|text                            code 用「示例玩家A」这类中性代号；text 用「玩家A」
   --keep-uid                                 保留 UID 原样（不参与替换）
 """
 import argparse
@@ -33,6 +35,9 @@ from pathlib import Path
 
 DEFAULT_SOURCE = os.environ.get("MILIASTRA_PANEL_URL", "http://192.168.31.119:18888")
 DEFAULT_TOKEN = os.environ.get("MILIASTRA_PANEL_TOKEN", "")
+REPO_CODE_ROOTS = ["src", "web/src", "scripts", "technical-docs"]
+CODE_SUFFIXES = {".rs", ".vue", ".js", ".ts", ".mjs", ".py", ".md", ".toml", ".json", ".html", ".css", ".yml", ".yaml", ".sh"}
+SKIP_PARTS = {"node_modules", "target", "dist", ".git", ".cargo", "__pycache__"}
 
 
 def fetch_mappings(source, token, timeout=15):
@@ -99,14 +104,14 @@ def build_alias_map(mappings, fields, prefix):
     for index, mapping in enumerate(mappings):
         if not isinstance(mapping, dict):
             continue
-        label = f"{prefix}{code_for(index)}"
+        label = f"{prefix}{code_for(index)}" if prefix else code_for(index)
         aliases = aliases_of(mapping, fields)
         if not aliases:
             continue
         entries.append((label, aliases))
         for text, _kind in aliases:
             alias_to_label.setdefault(text, label)
-    # 长别名优先，避免「星」先替换掉「示例玩家A」
+    # 长别名优先：短名字先匹配会吃掉长名字的一部分
     ordered = sorted(alias_to_label.items(), key=lambda item: len(item[0]), reverse=True)
     return ordered
 
@@ -150,7 +155,9 @@ def sanitize(text, pattern, alias_to_label):
     return pattern.sub(replace, text), sum(counts.values())
 
 
-def iter_targets(paths):
+def iter_targets(paths, repo=False):
+    if repo and not paths:
+        paths = REPO_CODE_ROOTS
     for raw in paths:
         if raw == "-":
             yield Path("<stdin>")
@@ -158,21 +165,28 @@ def iter_targets(paths):
         path = Path(raw)
         if path.is_dir():
             for child in sorted(path.rglob("*")):
-                if child.is_file():
-                    yield child
+                if not child.is_file():
+                    continue
+                if any(part in SKIP_PARTS for part in child.parts):
+                    continue
+                if child.suffix.lower() not in CODE_SUFFIXES:
+                    continue
+                yield child
         else:
             yield path
 
 
 def main():
     parser = argparse.ArgumentParser(description="按身份映射替换文本中的真实昵称/备注/UID")
-    parser.add_argument("paths", nargs="+", help="文件/目录，- 表示 stdin")
+    parser.add_argument("paths", nargs="*", help="文件/目录，- 表示 stdin；配合 --repo 可省略")
     parser.add_argument("--source", default=DEFAULT_SOURCE, help="面板地址（默认环境变量 MILIASTRA_PANEL_URL）")
     parser.add_argument("--token", default=DEFAULT_TOKEN, help="访问令牌（默认环境变量 MILIASTRA_PANEL_TOKEN）")
     parser.add_argument("--mappings", help="离线身份映射 JSON（/config/section?name=identity 的响应）")
     parser.add_argument("--fields", default="nickname,real_nickname,note,uid", help="参与替换的字段，逗号分隔")
     parser.add_argument("--keep-uid", action="store_true", help="不替换 UID")
-    parser.add_argument("--prefix", default="玩家", help="代号前缀，默认「玩家」")
+    parser.add_argument("--prefix", default=None, help="代号前缀；默认 code 模式「示例玩家」，text 模式「玩家」")
+    parser.add_argument("--repo", action="store_true", help="不给 paths 时扫描仓库代码目录")
+    parser.add_argument("--mode", choices=["code", "text"], default="code", help="code=中性示例代号；text=玩家A")
     parser.add_argument("--write", action="store_true", help="原地写回（.bak 备份）")
     parser.add_argument("--check", action="store_true", help="仅检查；有命中时退出码 1")
     args = parser.parse_args()
@@ -180,6 +194,10 @@ def main():
     fields = {item.strip() for item in args.fields.split(",") if item.strip()}
     if args.keep_uid:
         fields.discard("uid")
+    if args.prefix is None:
+        args.prefix = "示例玩家" if args.mode == "code" else "玩家"
+    if args.repo and not args.paths:
+        args.paths = list(REPO_CODE_ROOTS)
 
     mappings = load_mappings(args)
     alias_to_label = build_alias_map(mappings, fields, args.prefix)
@@ -191,7 +209,7 @@ def main():
 
     total = 0
     changed_files = 0
-    for path in iter_targets(args.paths):
+    for path in iter_targets(args.paths, repo=args.repo):
         try:
             if str(path) == "<stdin>":
                 text = sys.stdin.read()

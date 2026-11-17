@@ -85,7 +85,7 @@
             <button class="btn" :disabled="busy" @click="runAction('大厅时间', '/operator/hall-time')">大厅时间</button>
             <button class="btn" :disabled="busy" @click="runAction('启用命令', '/operator/commands?enabled=1')">启用命令</button>
             <button class="btn warn" :disabled="busy" @click="runAction('禁用命令', '/operator/commands?enabled=0')">禁用命令</button>
-            <a class="btn ghost" href="/screenshot" target="_blank" rel="noopener">查看截图</a>
+            <button class="btn ghost" type="button" :disabled="Boolean(screenshotUrl)" @click="openScreenshot">查看截图</button>
           </div>
           <div class="row" style="margin-top:12px">
             <input v-model="idleExitMinutes" class="config-input" inputmode="numeric" placeholder="15-1440 分钟" aria-label="闲置退出分钟" />
@@ -180,6 +180,15 @@
     <p class="config-field-hint" style="margin-top:12px">
       每 5 秒刷新 /monitor 与 /status；发送与按钮操作只负责入队，实际执行以游戏值守任务为准。
     </p>
+    <div v-if="screenshotUrl" class="screenshot-modal" @click.self="closeScreenshot">
+      <div class="screenshot-modal-body">
+        <div class="screenshot-modal-actions">
+          <a class="btn small" :href="screenshotUrl" download="screenshot.jpg">下载</a>
+          <button class="btn small" @click="closeScreenshot">关闭</button>
+        </div>
+        <img :src="screenshotUrl" alt="游戏截图" />
+      </div>
+    </div>
   </div>
 </template>
 
@@ -417,18 +426,26 @@ async function action(label, path) {
 
 const HIGH_RISK_ACTIONS = new Set(['启动游戏', '进入千星', '启动并进入', '禁用命令'])
 
+const screenshotUrl = ref('')
+
 async function openScreenshot() {
   try {
     const token = readToken()
     const response = await fetch('/screenshot', { headers: token ? { 'X-Miliastra-Token': token } : {} })
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const blob = await response.blob()
-    const url = URL.createObjectURL(blob)
-    window.open(url, '_blank', 'noopener')
-    setTimeout(() => URL.revokeObjectURL(url), 60_000)
+    if (!response.ok) {
+      if (response.status === 401) throw new Error('访问令牌无效或已过期，请到设置页重新填写')
+      throw new Error(`HTTP ${response.status}`)
+    }
+    if (screenshotUrl.value) URL.revokeObjectURL(screenshotUrl.value)
+    screenshotUrl.value = URL.createObjectURL(await response.blob())
   } catch (error) {
     toast(`截图失败：${error.message || error}`, 'err')
   }
+}
+
+function closeScreenshot() {
+  if (screenshotUrl.value) URL.revokeObjectURL(screenshotUrl.value)
+  screenshotUrl.value = ''
 }
 
 function runAction(label, path) {
@@ -484,4 +501,8 @@ onBeforeUnmount(() => {
 .game-page :deep(.panel-body) { display: block; }
 .game-page .wide { grid-column: 1 / -1; }
 .game-page .switch-line { font-size: 13px; color: var(--text-2); white-space: nowrap; }
+.screenshot-modal { position: fixed; inset: 0; z-index: 120; background: rgba(0, 0, 0, 0.72); display: flex; align-items: center; justify-content: center; }
+.screenshot-modal-body { max-width: 92vw; max-height: 92vh; background: var(--bg-1); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.screenshot-modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.screenshot-modal-body img { max-width: 86vw; max-height: 78vh; object-fit: contain; }
 </style>

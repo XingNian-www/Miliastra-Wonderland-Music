@@ -53,6 +53,7 @@
             v-for="task in tasks"
             :key="task.id"
             class="task-item"
+            :class="{ selected: selectedId === task.id }"
             role="button"
             tabindex="0"
             @click="selectedId = task.id"
@@ -76,7 +77,11 @@
         </div>
       </div>
 
-      <div v-if="selectedTask" class="panel">
+      <div v-if="!selectedTask" class="panel task-detail-panel">
+        <div class="panel-head"><h2>任务详情</h2></div>
+        <div class="panel-body"><p class="config-field-hint">选择左侧任务查看详情</p></div>
+      </div>
+      <div v-else class="panel task-detail-panel">
         <div class="panel-head">
           <h2>任务详情</h2>
           <small>#{{ selectedTask.id }}</small>
@@ -195,6 +200,15 @@ const tasks = computed(() => {
 const activeCount = computed(() => tasks.value.filter((task) => task.status === 'queued' || task.status === 'running').length)
 const queuedTasks = computed(() => tasks.value.filter((task) => task.status === 'queued'))
 const selectedTask = computed(() => tasks.value.find((task) => task.id === selectedId.value) || null)
+
+watch(
+  tasks,
+  (list) => {
+    if (list.some((task) => task.id === selectedId.value)) return
+    selectedId.value = list.length ? list[0].id : null
+  },
+  { immediate: true },
+)
 const logs = computed(() => (Array.isArray(monitor.value?.logs) ? monitor.value.logs : []))
 const commands = computed(() => (Array.isArray(monitor.value?.commands) ? monitor.value.commands : []))
 const logsText = computed(() => (logs.value.length ? logs.value.join('\n') : '暂无日志'))

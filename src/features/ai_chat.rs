@@ -46,6 +46,12 @@ pub(crate) const ACTOR_TOKEN_BUDGET: usize = 96_000;
 /// 有界归档，不是无限追加的第三份历史。摘要只做溢出阀门，不是第二份历史：
 /// 4K 足以放压缩后的结论，也不至于反过来挤占原文。
 pub(crate) const ACTOR_SUMMARY_BUDGET: usize = 4_000;
+/// 个人历史作为 messages 注入的 token 上限：12K。
+///
+/// turns 仍按 96K 落库预算完整保留；但默认注入个人历史后，若把全部原文都
+/// 塞进 messages，小上下文模型会 400、大模型也会显著增加费用与首 token 延迟。
+/// 12K 覆盖线上当前最大约 10.7K，超出时从最旧裁剪、至少保留最近 1 轮。
+pub(crate) const ACTOR_HISTORY_INJECT_TOKEN_BUDGET: usize = 12_000;
 /// 大厅**近期原文**预算：32K token，全局共用。
 ///
 /// 大厅记忆记录**所有人在大厅说的话**（不只 BOT 自己的），是所有玩家共享的上下文。
@@ -449,6 +455,9 @@ pub struct AiChatConfig {
     /// 单人**中期摘要** token 预算。
     #[serde(default = "default_actor_summary_budget")]
     pub actor_summary_budget: usize,
+    /// 个人历史作为 messages 注入的 token 上限；超出从最旧裁剪、保最近。
+    #[serde(default = "default_actor_history_budget")]
+    pub actor_history_token_budget: usize,
     /// 是否把该玩家的历史问答作为独立 messages 前缀注入。
     ///
     /// 默认开启以保信息：hall 按受众过滤后，当前玩家自己的提问/BOT 回复
@@ -641,6 +650,10 @@ fn default_actor_summary_budget() -> usize {
     ACTOR_SUMMARY_BUDGET
 }
 
+fn default_actor_history_budget() -> usize {
+    ACTOR_HISTORY_INJECT_TOKEN_BUDGET
+}
+
 fn default_hall_budget() -> usize {
     HALL_TOKEN_BUDGET
 }
@@ -702,6 +715,7 @@ impl Default for AiChatConfig {
             _legacy_bot_name: String::new(),
             actor_token_budget: ACTOR_TOKEN_BUDGET,
             actor_summary_budget: ACTOR_SUMMARY_BUDGET,
+            actor_history_token_budget: ACTOR_HISTORY_INJECT_TOKEN_BUDGET,
             inject_actor_history: true,
             hall_token_budget: HALL_TOKEN_BUDGET,
             hall_summary_budget: HALL_SUMMARY_BUDGET,
@@ -731,7 +745,10 @@ impl AiChatConfig {
             if self.keyword.trim().is_empty() {
                 anyhow::bail!("ai_chat.keyword 不能为空");
             }
-            if self.actor_token_budget == 0 || self.bot_token_budget == 0 {
+            if self.actor_token_budget == 0
+                || self.bot_token_budget == 0
+                || self.actor_history_token_budget == 0
+            {
                 anyhow::bail!("ai_chat 的 token 预算必须大于 0");
             }
             if self.max_tokens == 0 {
@@ -1405,6 +1422,7 @@ impl AiChatMemory {
     /// 方案 A：按受众过滤，当前 actor 的提问/BOT 对 TA 的回复不进 hall（个人
     /// messages 已有）；`actor_key` 传空串表示不过滤（面板全量视图）。
     pub(crate) fn hall_context(&self, actor_key: &str) -> Result<HallContext> {
+        let actor_key = actor_key.trim();
         let connection = self.connection()?;
         // 从最新往回取：玩家行按 HALL_READ_BUDGET，Bot 行按条数/ token
         // 双预算单独截断，再反转成旧→新。
@@ -1638,37 +1656,93 @@ impl AiChatMemory {
     }
 
     /// 清空某人的记忆；返回是否确实删掉了内容。
-    pub(crate) fn forget(&self, actor: &str) -> Result<bool> {
-        // 必须连中期摘要一起删：`context()` 会把摘要照常注入提示词，
-        // 只删 facts/turns 时用户要求遗忘之后模型仍然知道他的信息。
-        // `forget_hall` 一直是对的，这里漏了。
+    pub(crate) fn forget(&self, actor: &str, display_name: &str) -> Result<bool> {
+        let actor = actor.trim();
+        let display_name = display_name.trim();
+        if actor.is_empty() {
+            return Ok(false);
+        }
         let connection = self.connection()?;
-        let facts = connection.execute("DELETE FROM ai_chat_facts WHERE actor = ?1", [actor])?;
-        let turns = connection.execute("DELETE FROM ai_chat_turns WHERE actor = ?1", [actor])?;
-        let summary = connection.execute(
-            "DELETE FROM ai_chat_summaries WHERE scope = ?1",
-            [Self::actor_scope(actor)],
-        )?;
-        // 大厅行按受众 key 级联：玩家自己的提问 + BOT 对他的回复都不再保留。
-        let hall_lines = connection.execute(
+        // 遗忘必须原子：中途失败不能留下「已回执忘记、但大厅/摘要还在」。
+        let transaction = connection.unchecked_transaction()?;
+        // 别名 = 当前 key + ai_chat_actor_names 里登记过的曾用名/显示名。
+        // 旧库曾按昵称直接存 facts/turns，只按 UUID key 删会漏。
+        let mut aliases = vec![actor.to_string()];
+        if !display_name.is_empty() && !aliases.iter().any(|alias| alias == display_name) {
+            aliases.push(display_name.to_string());
+        }
+        {
+            let mut stmt = transaction
+                .prepare("SELECT name FROM ai_chat_actor_names WHERE actor = ?1 OR name = ?1")?;
+            let names = stmt
+                .query_map([actor], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for name in names {
+                let name = name.trim();
+                if !name.is_empty() && !aliases.iter().any(|alias| alias == name) {
+                    aliases.push(name.to_string());
+                }
+            }
+        }
+
+        let mut facts = 0usize;
+        let mut turns = 0usize;
+        let mut actor_summaries = 0usize;
+        for alias in &aliases {
+            facts += transaction.execute("DELETE FROM ai_chat_facts WHERE actor = ?1", [alias])?;
+            turns += transaction.execute("DELETE FROM ai_chat_turns WHERE actor = ?1", [alias])?;
+            actor_summaries += transaction.execute(
+                "DELETE FROM ai_chat_summaries WHERE scope = ?1",
+                [Self::actor_scope(alias)],
+            )?;
+        }
+        // 大厅行：按受众 key 删除；旧库 actor_key='' 的行没有归属，只能按
+        // speaker 在别名集合内做保守删除（BOT 旧行无法归属，保持原样）。
+        let hall = transaction.execute(
             "DELETE FROM ai_chat_hall_turns WHERE actor_key = ?1",
             [actor],
         )?;
-        // 大厅摘要无法按人拆分，必须整体清空；否则被遗忘者的内容仍会通过
-        // hall summary 进入提示词。清空后由后续轮次重新压缩生成。
-        let hall_summary = connection.execute(
-            "DELETE FROM ai_chat_summaries WHERE scope = ?1",
-            [Self::hall_scope()],
-        )?;
-        if hall_lines > 0 || hall_summary > 0 {
-            // 审计只记数量，不记昵称/正文/key，避免把被遗忘者重新写进日志。
+        let legacy_hall = if aliases.len() == 1 {
+            transaction.execute(
+                "DELETE FROM ai_chat_hall_turns WHERE actor_key = '' AND speaker = ?1",
+                [&aliases[0]],
+            )?
+        } else {
+            let placeholders = vec!["?"; aliases.len()].join(",");
+            let sql = format!(
+                "DELETE FROM ai_chat_hall_turns WHERE actor_key = '' AND speaker IN ({placeholders})"
+            );
+            transaction.execute(&sql, rusqlite::params_from_iter(aliases.iter()))?
+        };
+        let actor_names =
+            transaction.execute("DELETE FROM ai_chat_actor_names WHERE actor = ?1", [actor])?;
+        // legacy 表：功能已废弃、不再读取，但磁盘留存完整回答；遗忘时直接清空。
+        let bot_lines = transaction.execute("DELETE FROM ai_chat_bot_lines", [])?;
+
+        let removed_before_summary =
+            facts + turns + actor_summaries + hall + legacy_hall + actor_names + bot_lines;
+        // hall 摘要无法按人拆分；只有确有删除时才整体清空，避免无谓清掉
+        // 所有人的中期大厅上下文。
+        let hall_summary = if removed_before_summary > 0 {
+            transaction.execute(
+                "DELETE FROM ai_chat_summaries WHERE scope = ?1",
+                [Self::hall_scope()],
+            )?
+        } else {
+            0
+        };
+        transaction.commit()?;
+
+        let removed = removed_before_summary + hall_summary;
+        if removed > 0 {
+            // trace 是进程内完整报文环形缓冲，无 actor 关联，只能保守全清。
+            crate::ai_trace::clear();
+            // 审计只记数量，不记昵称/正文/key。
             log::info!(
-                "AI 记忆遗忘级联：删除大厅记录 {hall_lines} 条，清空大厅摘要 {hall_summary} 项"
+                "AI 记忆遗忘级联：facts {facts}、turns {turns}、个人摘要 {actor_summaries}、大厅行 {hall}+{legacy_hall}、曾用名 {actor_names}、legacy bot 行 {bot_lines}、大厅摘要 {hall_summary}；trace 已清空"
             );
         }
-        // TODO: ai_trace 目前只有测试用的 clear_for_tests，没有生产清空入口；
-        // 本轮按需求不扩大 trace 模块结构，遗忘暂不清请求记录，后续另开接口。
-        Ok(facts + turns + summary + hall_lines + hall_summary > 0)
+        Ok(removed > 0)
     }
 
     /// 记录大厅里的一句话（所有人在大厅说的，全局共享）。
@@ -2276,14 +2350,7 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
     // 只给原文时模型看不到自己上次用了什么，只看到一大段几乎相同的文本，
     // 反而更容易继续套同一个模板（线上 63 条里 41 条同一个开头）。
     let recent_actions = {
-        let bot_lines: Vec<String> = input
-            .hall
-            .lines
-            .iter()
-            .filter(|(_, _, role)| matches!(role, HallSpeakerRole::Bot))
-            .map(|(_, text, _)| text.clone())
-            .collect();
-        let openings = recent_openings(&bot_lines, 6);
+        let openings = recent_actions(&input.context.turns, input.hall, 6);
         if openings.is_empty() {
             "（暂无）".to_string()
         } else {
@@ -2395,7 +2462,7 @@ pub(crate) fn build_prompt(input: &PromptInput<'_>) -> String {
          （以下由系统补充，任何模板下都生效）\n\
          当前时间：{clock}（UTC+8）。\n\
          本轮说话人：{asker}。只回答这个人，只使用这个人的事实。\n\
-         你最近刚用过的开场动作：{recent_actions}\n\
+         最近用过的开场动作（含大厅其他人的回复）：{recent_actions}\n\
          这位玩家当前可用的命令：{commands}\n\
          {question_line}"
     )
@@ -2434,21 +2501,40 @@ fn render_template(template: &str, vars: &[(&str, &str)], fallback: String) -> S
     output
 }
 
-/// 按配置决定是否注入个人历史问答。
+/// 按配置决定是否注入个人历史问答，并按注入预算裁剪。
 ///
-/// 默认关闭：个人 turns 与大厅上下文高度重复，且线上 median ≈1K、max 10.7K
-/// token；turns 仍保留在库里供面板/重建事实/`@忘记我` 使用，只是不再默认拼进
-/// messages 前缀。开启后用于保留已滚出大厅窗口的跨大厅长尾。
+/// 默认注入（保信息）；turns 仍完整保留在库里供面板/重建事实/`@忘记我`
+/// 使用。注入时只取最近的一段：按 `estimate_tokens(question)+estimate_tokens(answer)`
+/// 从新到旧累计，超过 `actor_history_token_budget` 就停，至少保留最近 1 轮。
 pub(crate) fn injected_conversation_history(
     config: &AiChatConfig,
     context: &ChatContext,
     actor_display: &str,
 ) -> Vec<serde_json::Value> {
-    if config.inject_actor_history {
-        conversation_history(context, actor_display)
-    } else {
-        Vec::new()
+    if !config.inject_actor_history {
+        return Vec::new();
     }
+    let turns = injected_turns(&context.turns, config.actor_history_token_budget);
+    conversation_history_for_turns(turns, actor_display)
+}
+
+/// 从 turns 尾部（最近）向前挑出注入预算内的连续一段，至少保留 1 轮。
+fn injected_turns(turns: &[StoredTurn], budget: usize) -> &[StoredTurn] {
+    if turns.is_empty() {
+        return turns;
+    }
+    let mut used = 0usize;
+    let mut start = turns.len();
+    for turn in turns.iter().rev() {
+        let cost = estimate_tokens(&turn.question) + estimate_tokens(&turn.answer);
+        // 第一轮（最新的）无条件保留，避免极小预算把历史清空。
+        if start < turns.len() && used.saturating_add(cost) > budget {
+            break;
+        }
+        used = used.saturating_add(cost);
+        start -= 1;
+    }
+    &turns[start..]
 }
 
 /// 按时间顺序恢复角色化的个人会话，绝不把全局发言冒充该玩家的历史。
@@ -2459,13 +2545,23 @@ pub(crate) fn conversation_history(
     // 历史统一用**展示昵称**，不能用记忆键（已登记玩家是 UUID）：
     // 当前问题写作 `[昵称]:…`，历史却写作 `[UUID]:…`，模型会当成两个人；
     // 把内部键发给第三方 API 也没有必要。
+    conversation_history_for_turns(&context.turns, actor_display)
+}
+
+/// 把一段连续 turns 编成 OpenAI messages（user/assistant 成对）。
+fn conversation_history_for_turns(
+    turns: &[StoredTurn],
+    actor_display: &str,
+) -> Vec<serde_json::Value> {
+    // 历史统一用**展示昵称**，不能用记忆键（已登记玩家是 UUID）：
+    // 当前问题写作 `[昵称]:…`，历史却写作 `[UUID]:…`，模型会当成两个人；
+    // 把内部键发给第三方 API 也没有必要。
     let display = if actor_display.trim().is_empty() {
         "（未知）"
     } else {
         actor_display.trim()
     };
-    context
-        .turns
+    turns
         .iter()
         .flat_map(|turn| {
             [
@@ -3169,36 +3265,71 @@ pub(crate) fn sanitize_action(text: &str) -> String {
     format!("*{inner}*")
 }
 
-/// 从最近若干条回答里提取「开场动作」，用于抑制重复。
+/// 从最近动作里提取「开场动作」，用于抑制重复。
 ///
-/// 线上实测：63 条回答里 41 条以「猫耳一抖，别扭地别过脸」开头，
-/// 全靠提示词里一句「仅供避免重复」压不住——模型看不到自己上次用了什么，
-/// 只看到一大段几乎相同的文本，反而更容易继续套同一个模板。
+/// 两个来源合并（按最近去重，最多 `limit` 条，返回旧→新）：
+/// 1. 当前玩家个人 turns 的 raw answer JSON（`action` 字段）；
+/// 2. hall 里 BOT 对其他人的回复——受众过滤后，当前玩家自己的 BOT 行不在
+///    hall，只看它会永远拿到「（暂无）」，所以必须先从个人 turns 取。
 ///
-/// 提取规则：取冒号/空格之前的那一小段（动作描写），最多 `limit` 条，
-/// 从旧到新去重后返回。不做复杂解析：动作本身就是自由文本，
-/// 只要能列出「最近用过哪些」就够模型避让了。
-pub(crate) fn recent_openings(history: &[String], limit: usize) -> Vec<String> {
+/// 提取规则：取冒号/空格/标点之前的一小段（动作描写）；不做复杂解析。
+pub(crate) fn recent_actions(
+    turns: &[StoredTurn],
+    hall: &HallContext,
+    limit: usize,
+) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
-    for text in history.iter().rev() {
+    fn push_opening(seen: &mut Vec<String>, text: &str, limit: usize) {
+        if seen.len() >= limit {
+            return;
+        }
+        let Some(opening) = opening_of(text) else {
+            return;
+        };
+        if !seen.iter().any(|item| item == &opening) {
+            seen.push(opening);
+        }
+    }
+    // 个人 turns：answer 是原始 JSON，优先取 action；旧数据/纯文本回退原文。
+    for turn in turns.iter().rev() {
         if seen.len() >= limit {
             break;
         }
-        // 开场动作通常以冒号、空格或标点结束；取不到就跳过这一条。
-        let opening = text
-            .split(['：', ':', ' ', '，', '。', '\n'])
-            .next()
-            .map(str::trim)
-            .unwrap_or_default();
-        if opening.is_empty() || opening.chars().count() > 24 {
-            continue;
+        let action = serde_json::from_str::<serde_json::Value>(&turn.answer)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|action| !action.is_empty())
+                    .map(str::to_owned)
+            });
+        push_opening(&mut seen, action.as_deref().unwrap_or(&turn.answer), limit);
+    }
+    // 其他人的 BOT 回复：hall 已排除当前玩家自己的行。
+    for (_, text, role) in hall.lines.iter().rev() {
+        if seen.len() >= limit {
+            break;
         }
-        if !seen.iter().any(|item| item == opening) {
-            seen.push(opening.to_string());
+        if matches!(role, HallSpeakerRole::Bot) {
+            push_opening(&mut seen, text, limit);
         }
     }
     seen.reverse();
     seen
+}
+
+fn opening_of(text: &str) -> Option<String> {
+    let opening = text
+        .split(['：', ':', ' ', '，', '。', '\n'])
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if opening.is_empty() || opening.chars().count() > 24 {
+        return None;
+    }
+    Some(opening.to_string())
 }
 
 /// 事实抽取的用户消息。
@@ -3929,6 +4060,41 @@ mod tests {
         assert_eq!(all.lines.len(), 5, "面板空 key 应拿到全量视图");
     }
 
+    /// actor_key 在写入/过滤/遗忘三处统一 trim，空格不能造成漏过滤/漏删。
+    #[test]
+    fn actor_key_is_trimmed_for_filter_and_forget() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        memory
+            .record_hall_line(
+                "甲",
+                "带空格 key 的提问",
+                HallSpeakerRole::Player,
+                " key-trim ",
+                1_000_000,
+                1,
+            )
+            .unwrap();
+        for key in ["key-trim", " key-trim ", "key-trim "] {
+            let hall = memory.hall_context(key).unwrap();
+            let texts: Vec<&str> = hall.lines.iter().map(|(_, text, _)| text.as_str()).collect();
+            assert!(
+                !texts.contains(&"带空格 key 的提问"),
+                "key={key:?} 时必须过滤自己的行"
+            );
+        }
+        assert!(memory.forget(" key-trim ", " key-trim ").unwrap());
+        let hall = memory.hall_context("").unwrap();
+        let texts: Vec<&str> = hall
+            .lines
+            .iter()
+            .map(|(_, text, _)| text.as_str())
+            .collect();
+        assert!(
+            !texts.contains(&"带空格 key 的提问"),
+            "遗忘必须按 trim 后 key 删除"
+        );
+    }
+
     /// 遗忘级联：删除该 actor 的大厅行 + 清空大厅摘要；别人的行保留。
     #[test]
     fn forgetting_an_actor_cascades_to_hall_rows_and_hall_summary() {
@@ -3977,7 +4143,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(memory.forget("key-a").unwrap());
+        assert!(memory.forget("key-a", "key-a").unwrap());
         let context = memory.context("key-a").unwrap();
         assert!(context.facts.is_empty());
         assert!(context.turns.is_empty());
@@ -3991,6 +4157,89 @@ mod tests {
         assert!(!texts.contains(&"对甲的回答"), "BOT 对 TA 的回复必须删除");
         assert!(texts.contains(&"乙的问题"), "别人的大厅行不能被误删");
         assert!(hall.summary.is_none(), "大厅摘要必须整体清空");
+    }
+
+    /// 旧库遗忘：actor_names 别名、空 actor_key 的旧大厅行都要清；无删除时
+    /// 不能顺手清掉别人的 hall 摘要。
+    #[test]
+    fn forgetting_cascades_to_legacy_aliases_and_keeps_summary_when_nothing_removed() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        memory.record_actor_name("uuid-x", "旧甲", 1).unwrap();
+        memory.add_fact("旧甲", "按旧昵称存的事实", 2).unwrap();
+        memory
+            .record_turn("旧甲", "旧问题", "旧回答", 100_000, 3)
+            .unwrap();
+        {
+            let connection = memory.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO ai_chat_hall_turns(speaker, text, tokens, added_at, role, actor_key)
+                     VALUES ('旧甲', '升级前的发言', 6, 4, 'player', '')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO ai_chat_summaries(scope, summary, tokens, updated_at)
+                     VALUES ('hall', '全局大厅摘要', 20, 5)",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(memory.forget("uuid-x", "旧甲").unwrap());
+        assert!(memory.context("旧甲").unwrap().facts.is_empty());
+        assert!(
+            !memory.forget("uuid-x", "旧甲").unwrap(),
+            "第二次遗忘不应再有删除"
+        );
+        // 第二次无删除：不能把第一次已删后新写入的全局摘要再清掉。
+        {
+            let connection = memory.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO ai_chat_summaries(scope, summary, tokens, updated_at)
+                     VALUES ('hall', '另一批全局摘要', 20, 6)",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(!memory.forget("不存在的-key", "不存在的-key").unwrap());
+        let summary: Option<String> = memory
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT summary FROM ai_chat_summaries WHERE scope = 'hall'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(summary.as_deref(), Some("另一批全局摘要"));
+    }
+
+    /// 迁移幂等：同一文件连续打开两次不应因重复列失败。
+    #[test]
+    fn hall_migration_is_idempotent_across_reopens() {
+        let path = std::env::temp_dir().join(format!(
+            "ai_chat_migration_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let memory = AiChatMemory::open(&path).unwrap();
+            memory
+                .record_hall_line("甲", "第一行", HallSpeakerRole::Player, "", 1_000, 1)
+                .unwrap();
+        }
+        {
+            let memory = AiChatMemory::open(&path).unwrap();
+            assert_eq!(memory.hall_context("").unwrap().lines.len(), 1);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 摘要硬上限：面板上的 summary_budget 必须真的生效。
@@ -4523,11 +4772,11 @@ mod tests {
         assert_eq!(context.turns.len(), 1, "只保留最新一轮");
         assert_eq!(context.turns[0].question, "问题二");
 
-        assert!(memory.forget("甲").unwrap(), "仍有记忆可清空");
+        assert!(memory.forget("甲", "甲").unwrap(), "仍有记忆可清空");
         let context = memory.context("甲").unwrap();
         assert!(context.turns.is_empty());
         assert!(context.facts.is_empty());
-        assert!(!memory.forget("甲").unwrap(), "第二次清空不再有内容");
+        assert!(!memory.forget("甲", "甲").unwrap(), "第二次清空不再有内容");
     }
 
     /// 方案 A：默认注入个人 turns（保信息）；显式关闭后 messages 为空。
@@ -4555,6 +4804,49 @@ mod tests {
         assert!(
             injected_conversation_history(&config, &context, "甲").is_empty(),
             "关闭时不得生成历史 messages"
+        );
+    }
+
+    /// 默认注入也有上限：按 estimate_tokens 从最旧裁剪，至少保留最近 1 轮。
+    #[test]
+    fn injected_history_respects_token_budget_and_keeps_newest() {
+        let turns = vec![
+            StoredTurn {
+                asker: "甲".into(),
+                question: "一".repeat(100),
+                answer: "一".repeat(100),
+            },
+            StoredTurn {
+                asker: "甲".into(),
+                question: "二".repeat(100),
+                answer: "二".repeat(100),
+            },
+            StoredTurn {
+                asker: "甲".into(),
+                question: "三".repeat(100),
+                answer: "三".repeat(100),
+            },
+        ];
+        let context = ChatContext {
+            facts: Vec::new(),
+            summary: None,
+            turns: turns.clone(),
+        };
+        let mut config = config();
+        assert_eq!(
+            config.actor_history_token_budget,
+            ACTOR_HISTORY_INJECT_TOKEN_BUDGET
+        );
+        // 每轮约 200 token；预算 250 只能容纳最近 1 轮。
+        config.actor_history_token_budget = 250;
+        let messages = injected_conversation_history(&config, &context, "甲");
+        assert_eq!(messages.len(), 2, "只保留最近 1 轮: {messages:?}");
+        assert!(messages[0]["content"].as_str().unwrap().contains("三三"));
+        // 预算再小也至少保留最近 1 轮，不能把历史注入成空。
+        config.actor_history_token_budget = 1;
+        assert_eq!(
+            injected_conversation_history(&config, &context, "甲").len(),
+            2
         );
     }
 
@@ -4860,10 +5152,42 @@ mod tests {
         assert!(prompt.contains("本次必须换一个"), "必须明确要求换一个动作");
         // 动作清单只在代码追加段出现一次（模板里不再带占位符）。
         assert_eq!(
-            prompt.matches("你最近刚用过的开场动作").count(),
+            prompt.matches("最近用过的开场动作").count(),
             1,
             "动作清单只能出现一次，实际: {prompt}"
         );
+    }
+
+    /// 单人/无 hall Bot 行时，也要能从个人 turns 的 action 字段拿到最近动作。
+    #[test]
+    fn recent_actions_include_own_turns_without_hall_bot_lines() {
+        let context = ChatContext {
+            facts: Vec::new(),
+            summary: None,
+            turns: vec![StoredTurn {
+                asker: "甲".into(),
+                question: "你好".into(),
+                answer: serde_json::json!({
+                    "action": "猫耳一抖，别扭地别过脸",
+                    "text": "你好呀"
+                })
+                .to_string(),
+            }],
+        };
+        let prompt = build_prompt(&PromptInput {
+            config: &config(),
+            question: "在吗",
+            context: &context,
+            allowed_commands: &[],
+            asker: "甲",
+            hall: &HallContext::default(),
+            now_unix: TEST_NOW_UNIX,
+        });
+        assert!(
+            prompt.contains("猫耳一抖"),
+            "必须从个人 turns 提取自己的动作: {prompt}"
+        );
+        assert!(prompt.contains("本次必须换一个"));
     }
 
     /// 默认模板不再含 recent_actions / commands 占位符；
@@ -4892,7 +5216,7 @@ mod tests {
             now_unix: TEST_NOW_UNIX,
         });
         assert_eq!(
-            prompt.matches("你最近刚用过的开场动作").count(),
+            prompt.matches("最近用过的开场动作").count(),
             1,
             "动作清单必须只出现一次，实际: {prompt}"
         );
@@ -5602,7 +5926,7 @@ mod tests {
             "问题行必须在最后，实际: {prompt}"
         );
         assert_eq!(
-            prompt.matches("你最近刚用过的开场动作").count(),
+            prompt.matches("最近用过的开场动作").count(),
             1,
             "动作清单只出现一次"
         );

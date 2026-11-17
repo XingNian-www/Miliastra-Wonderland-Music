@@ -2902,10 +2902,16 @@ fn ai_chat_section() -> Vec<ConfigFieldSchema> {
             "每个玩家的中期摘要 token 上限；摘要滚动覆盖，不是硬截断",
         ),
         ConfigFieldSchema::db_live(
+            "actor_history_token_budget",
+            "个人历史注入预算",
+            int(1_000, 200_000),
+            "个人历史作为 messages 注入的 token 上限；超出从最旧裁剪、保最近；默认 12000",
+        ),
+        ConfigFieldSchema::db_live(
             "inject_actor_history",
             "注入个人问答历史",
             FieldKind::Bool,
-            "开启后把该玩家历史问答作为 messages 前缀发送：默认开启以保留跨大厅长尾（已滚出大厅窗口的旧问答）；关闭后仅保留 facts/摘要/大厅上下文。",
+            "默认注入个人问答历史，hall 只含其他玩家/对别人回复；关闭后个人历史不注入，仅保留 facts/摘要/大厅上下文。",
         ),
         ConfigFieldSchema::db_live(
             "hall_token_budget",

@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::config::AppConfig;
 use crate::features::ai_chat::{
-    self, AiChatMemory, BOT_HISTORY_READ_BUDGET, ChatContext, HallContext, PromptBlock,
+    self, AiChatMemory, ChatContext, HallContext, PromptBlock,
     PromptBlockKind, PromptInput,
 };
 
@@ -80,7 +80,7 @@ pub(crate) fn render_chat_preview(
 
     let (context, hall) = match memory {
         Some(memory) => (
-            memory.context(asker, BOT_HISTORY_READ_BUDGET)?,
+            memory.context(asker)?,
             memory.hall_context()?,
         ),
         None => (
@@ -88,7 +88,6 @@ pub(crate) fn render_chat_preview(
                 facts: Vec::new(),
                 summary: None,
                 turns: Vec::new(),
-                bot_history: Vec::new(),
             },
             HallContext::default(),
         ),
@@ -184,6 +183,46 @@ mod tests {
         assert!(value["tools"].is_array());
         assert!(value["blocks"].as_array().unwrap().len() >= 7);
         assert_eq!(value["ok"], true);
+    }
+
+    /// 预览必须只有一条大厅上下文：Bot 行并入 `{{hall}}`，不再有独立
+    /// bot_history 块，也不会在 tail 里出现两次。
+    #[test]
+    fn preview_merges_bot_lines_into_a_single_hall_block() {
+        use crate::features::ai_chat::HallSpeakerRole;
+        let config = AppConfig::default();
+        let memory = AiChatMemory::from_connection(rusqlite::Connection::open_in_memory().unwrap())
+            .unwrap();
+        memory
+            .record_hall_line("甲", "有人也喜欢晴天吗", HallSpeakerRole::Player, 10_000, 1)
+            .unwrap();
+        memory
+            .record_hall_line(
+                "橘子",
+                "尾巴轻摆：今天想听什么",
+                HallSpeakerRole::Bot,
+                10_000,
+                2,
+            )
+            .unwrap();
+        let payload = render_chat_preview(&config, Some(&memory), "甲", "你好").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let tail = value["tail"].as_str().unwrap();
+        assert!(tail.contains("[甲]：有人也喜欢晴天吗"), "tail: {tail}");
+        assert_eq!(
+            tail.matches("你（橘子）：尾巴轻摆：今天想听什么").count(),
+            1,
+            "Bot 行只能出现一次: {tail}"
+        );
+        assert_eq!(tail.matches("【最近的大厅对话】").count(), 1);
+        let blocks = value["blocks"].as_array().unwrap();
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block["name"].as_str().unwrap_or("").contains("bot_history")),
+            "blocks 不应再有 bot_history 块: {blocks:?}"
+        );
+        assert!(!tail.contains("大厅近期机器人发言"), "独立 Bot 块已删除: {tail}");
     }
 
     #[test]

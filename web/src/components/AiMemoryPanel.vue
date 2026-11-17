@@ -23,7 +23,8 @@
               接口返回最近 {{ (hall.lines || []).length }} 条原文，共 {{ hall.count }} 条；更早内容只保留在摘要里。
             </p>
             <div v-if="(hall.lines || []).length" class="ai-memory-lines">
-              <div v-for="(line, index) in hall.lines" :key="index" class="ai-memory-line">
+              <div v-for="(line, index) in hall.lines" :key="index" class="ai-memory-line" :class="{ 'ai-memory-line-bot': line.role === 'bot' }">
+                <span class="ai-memory-role" :class="{ bot: line.role === 'bot' }">{{ line.role === 'bot' ? 'BOT' : '玩家' }}</span>
                 <strong>{{ line.speaker }}</strong>：{{ line.text }}
               </div>
             </div>
@@ -275,6 +276,9 @@ onMounted(load)
 .ai-memory-summary-head { display: flex; gap: var(--sp-2); justify-content: space-between; align-items: baseline; flex-wrap: wrap; }
 .ai-memory-lines { background: var(--bg-raised); border-radius: var(--radius-m); padding: var(--sp-2) var(--sp-3); }
 .ai-memory-line { padding: 3px 0; border-bottom: 1px solid var(--sep-2); }
+.ai-memory-line-bot { background: rgba(91, 140, 255, 0.06); }
+.ai-memory-role { display: inline-block; font-size: 10px; line-height: 1; padding: 2px 5px; margin-right: 6px; border-radius: 999px; background: var(--fill-2); color: var(--text-3); }
+.ai-memory-role.bot { background: var(--accent-soft); color: var(--accent); }
 .ai-actor-list { display: flex; flex-direction: column; gap: var(--sp-1); }
 .ai-actor-row { display: flex; gap: var(--sp-2); align-items: center; justify-content: space-between; padding: var(--sp-2); border: 1px solid var(--sep-2); border-radius: var(--radius-m); background: var(--bg-card); }
 .ai-actor-row.selected { border-color: var(--accent); }

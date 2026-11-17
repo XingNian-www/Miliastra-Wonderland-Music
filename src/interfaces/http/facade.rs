@@ -1447,16 +1447,16 @@ impl HttpAiPort for ApplicationHttpAiFacade {
     fn memory_actor(&self, actor: &str) -> Result<String> {
         let memory = self.memory()?;
         let key = self.resolve_key(actor);
-        // 用读取预算而不是 usize::MAX：后者会让 bot_lines 全表扫，
-        // 而结果在面板里根本用不到（面板只展示 facts/turns/summary）。
+        // 记忆面板只展示 facts/turns/summary；这里按正常读取路径取，
+        // 不再为面板额外读取已废弃的 bot_lines。
         let mut context =
-            memory.context(&key, crate::features::ai_chat::BOT_HISTORY_READ_BUDGET)?;
+            memory.context(&key)?;
         // 老库有按昵称直接存的孤儿行（见 ai_chat_actor_names 的建表注释）。
         // 解析后的键查空时按原文再试一次，否则那些历史会凭空消失。
         let mut used = key.clone();
         if context.facts.is_empty() && context.turns.is_empty() && context.summary.is_none() {
             let legacy =
-                memory.context(actor, crate::features::ai_chat::BOT_HISTORY_READ_BUDGET)?;
+                memory.context(actor)?;
             if !legacy.facts.is_empty() || !legacy.turns.is_empty() || legacy.summary.is_some() {
                 used = actor.to_owned();
                 context = legacy;

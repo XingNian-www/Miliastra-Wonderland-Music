@@ -437,7 +437,7 @@ impl ApplicationRuntime {
                     .ai_chat_memory
                     // 用**读取**预算而不是落库预算：后者是 32000，当读取窗口用
                     // 等于每题注入 32K token 的跨玩家、无归属回答。
-                    .context(&actor, crate::features::ai_chat::BOT_HISTORY_READ_BUDGET)?;
+                    .context(&actor)?;
                 // 记忆键是 UUID，不可读；给模型看的名字必须换回显示昵称。
                 //
                 // 曾经这里另外按 UID 反查一次名字，与 `actor` 各走一条链，
@@ -541,7 +541,11 @@ impl ApplicationRuntime {
                                 reasoning: config.reasoning,
                             },
                             &system_prompt,
-                            ai_chat::conversation_history(&context, &actor_display),
+                            ai_chat::injected_conversation_history(
+                                &config,
+                                &context,
+                                &actor_display,
+                            ),
                             &prompt,
                             tools.clone(),
                             vision_image.clone(),
@@ -602,7 +606,7 @@ impl ApplicationRuntime {
                             anyhow::ensure!(!rendered.is_empty(), "AI 未返回最终回复");
                             // 三个消费者要的不是同一份东西：
                             // - 发送给玩家：渲染文本（`*动作* 台词`）
-                            // - conversation_history：原始 JSON（few-shot 一致，
+                            // - injected_conversation_history：原始 JSON（few-shot 一致，
                             //   否则模型在历史里看到散文，就不会再按格式输出）
                             // - 事实抽取：渲染文本（不能把 JSON 语法当玩家信息）
                             let raw = if reply.action.is_empty() && reply.text.is_empty() {
@@ -839,11 +843,6 @@ impl ApplicationRuntime {
                         question,
                         &answer.raw,
                         config.actor_token_budget,
-                        now_ms,
-                    )?;
-                    self.business.ai_chat_memory.record_bot_line(
-                        rendered,
-                        config.bot_token_budget,
                         now_ms,
                     )?;
                     // 大厅共享记忆：写入的是「谁说了什么」。

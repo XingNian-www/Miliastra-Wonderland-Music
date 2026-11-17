@@ -214,19 +214,6 @@
       </div>
     </section>
 
-    <section class="panel playback-queue-ops-panel">
-      <div class="panel-head">
-        <h2>队列操作</h2>
-        <small>待播队列</small>
-      </div>
-      <div class="panel-body">
-        <div class="controls">
-          <button class="btn" :disabled="busy" @click="loadQueue">刷新队列</button>
-          <button class="btn warn" :disabled="busy || !queue.length" @click="clearQueue">清空队列</button>
-        </div>
-        <div class="config-field-hint">删除单曲请在上方待播队列逐条操作；清空需要确认。</div>
-      </div>
-    </section>
     <section class="panel playback-cache-tracks-panel">
       <div class="panel-head">
         <h2>磁盘缓存歌曲</h2>

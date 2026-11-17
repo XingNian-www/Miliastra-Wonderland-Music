@@ -42,7 +42,7 @@
 
     <div v-if="loading && !monitor" class="loading-card">正在读取任务与日志…</div>
     <div v-else class="page-grid">
-      <div class="panel">
+      <div class="panel task-queue-panel">
         <div class="panel-head">
           <h2>任务队列</h2>
           <small>{{ tasks.length }} 条</small>

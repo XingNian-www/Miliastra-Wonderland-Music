@@ -1,7 +1,7 @@
 <template>
   <div class="entertainment-page">
     <h1 class="page-title">娱乐玩法</h1>
-    <p class="page-subtitle">海龟汤与谁是卧底对局管理</p>
+    <p class="page-subtitle">海龟汤、谁是卧底对局管理，以及数字炸弹/成语接龙/塔罗/卡牌玩法动态</p>
 
     <div class="tabs" role="tablist" aria-label="娱乐玩法">
       <button class="tab" :class="{ active: tab === 'turtle' }" type="button" @click="tab = 'turtle'">
@@ -11,6 +11,10 @@
       <button class="tab" :class="{ active: tab === 'undercover' }" type="button" @click="tab = 'undercover'">
         谁是卧底
         <span class="tab-meta">{{ undercoverMeta }}</span>
+      </button>
+      <button class="tab" :class="{ active: tab === 'other' }" type="button" @click="tab = 'other'">
+        其他玩法
+        <span class="tab-meta">{{ otherGameLogs.length }} 条动态</span>
       </button>
     </div>
 
@@ -111,6 +115,60 @@
       </div>
     </div>
 
+    <div v-show="tab === 'other'" class="page-grid">
+      <div class="panel">
+        <div class="panel-head"><h2>数字炸弹</h2><small>{{ otherConfig.number_bomb?.enabled ? '已启用' : '未启用' }}</small></div>
+        <div class="panel-body">
+          <div class="turtle-stats">
+            <div class="turtle-stat"><span>范围</span><strong>{{ rangeText }}</strong></div>
+            <div class="turtle-stat"><span>人数</span><strong>{{ playersText }}</strong></div>
+            <div class="turtle-stat"><span>回合超时</span><strong>{{ timeoutText }}</strong></div>
+            <div class="turtle-stat"><span>上限</span><strong>{{ otherConfig.number_bomb?.upper_bound_cap ?? '—' }}</strong></div>
+          </div>
+          <p class="config-field-hint">命令 @数字炸弹；配置在「配置中心 → 娱乐玩法」修改。</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>成语接龙</h2><small>{{ otherConfig.idiom_chain?.enabled ? '已启用' : '未启用' }}</small></div>
+        <div class="panel-body">
+          <div class="turtle-stats">
+            <div class="turtle-stat"><span>词库</span><strong>{{ lexiconText }}</strong></div>
+            <div class="turtle-stat"><span>空闲超时</span><strong>{{ idiomIdleText }}</strong></div>
+            <div class="turtle-stat"><span>历史保留</span><strong>{{ otherConfig.idiom_chain?.history_limit ?? '—' }}</strong></div>
+            <div class="turtle-stat"><span>允许中断</span><strong>{{ otherConfig.idiom_chain?.allow_anyone_stop ? '是' : '否' }}</strong></div>
+          </div>
+          <p class="config-field-hint">命令 @接龙 / @接龙结束；词库缺失时会在日志里报错。</p>
+        </div>
+      </div>
+
+      <div class="panel wide">
+        <div class="panel-head"><h2>塔罗 / 卡牌</h2><small>命令玩法</small></div>
+        <div class="panel-body">
+          <p class="config-field-hint">塔罗（@抽牌 / @重抽 / @解读）与卡牌对局没有独立开关，随命令与权限开放；运行情况见下方动态。</p>
+          <div class="turtle-stats">
+            <div class="turtle-stat"><span>塔罗动态</span><strong>{{ tarotLogs.length }}</strong></div>
+            <div class="turtle-stat"><span>卡牌动态</span><strong>{{ cardLogs.length }}</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel wide">
+        <div class="panel-head">
+          <h2>最近玩法动态</h2>
+          <small>来自 /monitor.logs，最多 50 条</small>
+        </div>
+        <div class="panel-body">
+          <div v-if="!otherGameLogs.length" class="config-field-hint">最近日志中没有数字炸弹 / 成语接龙 / 塔罗 / 卡牌相关记录。</div>
+          <div v-else class="history" style="max-height:320px">
+            <div v-for="(line, index) in otherGameLogs" :key="index" class="history-item">
+              <div class="history-result">{{ line }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <p class="config-field-hint" style="margin-top:12px">
       每 5 秒刷新一次对局状态；开始/结束只提交控制意图，实际播报与游戏内流程以值守任务为准。
     </p>
@@ -134,6 +192,40 @@ const newSurface = ref('')
 const newBottom = ref('')
 const turtle = ref({})
 const undercover = ref({})
+const monitorRaw = ref(null)
+const otherConfig = ref({})
+
+const rangeText = computed(() => {
+  const cfg = otherConfig.value.number_bomb || {}
+  return cfg.min == null && cfg.max == null ? '—' : `${cfg.min ?? '?'} ~ ${cfg.max ?? '?'}`
+})
+const playersText = computed(() => {
+  const cfg = otherConfig.value.number_bomb || {}
+  return cfg.min_players == null ? '—' : `${cfg.min_players} ~ ${cfg.max_players ?? '?'} 人`
+})
+const timeoutText = computed(() => {
+  const seconds = Number(otherConfig.value.number_bomb?.turn_timeout_seconds || 0)
+  return seconds ? `${seconds}s` : '—'
+})
+const lexiconText = computed(() => {
+  const path = String(otherConfig.value.idiom_chain?.lexicon_path || '')
+  return path ? path.split(/[\\/]/).pop() : '—'
+})
+const idiomIdleText = computed(() => {
+  const seconds = Number(otherConfig.value.idiom_chain?.idle_timeout_seconds || 0)
+  return seconds ? `${seconds}s` : '—'
+})
+const gameLogPattern = /数字炸弹|炸弹|成语接龙|接龙|塔罗|抽牌|重抽|解读|卡牌|发牌|出牌/i
+const otherGameLogs = computed(() => {
+  const logs = Array.isArray(monitorRaw.value?.logs) ? monitorRaw.value.logs : []
+  return logs
+    .map((item) => (typeof item === 'string' ? item : item?.text || item?.line || ''))
+    .filter((line) => line && gameLogPattern.test(line))
+    .slice(-50)
+    .reverse()
+})
+const tarotLogs = computed(() => otherGameLogs.value.filter((line) => /塔罗|抽牌|重抽|解读/.test(line)))
+const cardLogs = computed(() => otherGameLogs.value.filter((line) => /卡牌|发牌|出牌/.test(line)))
 
 const turtleEnabled = computed(() => turtle.value?.enabled === true)
 const turtleActive = computed(() => Boolean(turtle.value?.phase) && turtle.value.phase !== 'idle')
@@ -202,6 +294,7 @@ async function refresh(manual = false) {
   loadError.value = ''
   try {
     const monitor = await getJson('/monitor')
+    monitorRaw.value = monitor
     turtle.value = monitor?.turtleSoup || {}
     undercover.value = monitor?.undercover || {}
     loaded.value = true
@@ -287,6 +380,15 @@ function endUndercover() {
 
 let timer = null
 onMounted(() => {
+  getJson('/config')
+    .then((config) => {
+      const sections = config?.sections || {}
+      otherConfig.value = {
+        number_bomb: sections.number_bomb || {},
+        idiom_chain: sections.idiom_chain || {},
+      }
+    })
+    .catch(() => {})
   refresh()
   timer = setInterval(() => {
     if (!document.hidden) refresh()

@@ -650,3 +650,193 @@ input[type="checkbox"] { width: 34px; height: 20px; flex: none; }
 /* 任务：队列内部滚动，详情吸顶不再被拉伸 */
 .page-grid > .task-detail-panel { height: auto !important; max-height: calc(100vh - 96px); overflow: auto; }
 .task-queue-panel .panel-body { max-height: 540px; overflow: auto; }
+
+/* ============ 主题 v2：暖灰 + 松石绿，平面控件 ============ */
+:root {
+  --bg-0: #0c0d0f;
+  --bg-1: #141619;
+  --bg-2: #191c20;
+  --bg-3: #1f2328;
+  --panel-bg: #141619;
+  --nav-bg: #101214;
+  --topbar-bg: rgba(12, 13, 15, 0.86);
+  --input-bg: #1b1e23;
+  --savebar-bg: rgba(12, 13, 15, 0.94);
+  --text-1: #e9e7e2;
+  --text-2: #a6a29a;
+  --text-3: #6d6a63;
+  --sep-1: rgba(255, 255, 255, 0.09);
+  --sep-2: rgba(255, 255, 255, 0.055);
+  --accent: #4f9d8b;
+  --accent-soft: rgba(79, 157, 139, 0.16);
+  --ok: #5fbf8a;
+  --warn: #d9a441;
+  --danger: #d96c6c;
+  --radius-s: 7px;
+  --radius-m: 10px;
+  --radius-l: 12px;
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.22);
+}
+
+body.light {
+  --bg-0: #f2f0ea;
+  --bg-1: #fbfaf6;
+  --bg-2: #f0ede6;
+  --bg-3: #e7e3da;
+  --panel-bg: #fbfaf6;
+  --nav-bg: #ece9e2;
+  --topbar-bg: rgba(242, 240, 234, 0.92);
+  --input-bg: #ffffff;
+  --savebar-bg: rgba(242, 240, 234, 0.95);
+  --text-1: #242622;
+  --text-2: #5f615a;
+  --text-3: #8d8f86;
+  --sep-1: rgba(36, 38, 34, 0.13);
+  --sep-2: rgba(36, 38, 34, 0.07);
+  --accent: #2f7c6c;
+  --accent-soft: rgba(47, 124, 108, 0.12);
+  --ok: #2f8f5b;
+  --warn: #a87316;
+  --danger: #b34a4a;
+  --shadow-1: 0 1px 2px rgba(30, 30, 25, 0.06);
+}
+
+body {
+  background: radial-gradient(1100px 500px at 20% -10%, rgba(79, 157, 139, 0.07), transparent 60%), var(--bg-0);
+}
+body.light {
+  background: radial-gradient(1100px 500px at 20% -10%, rgba(47, 124, 108, 0.05), transparent 60%), var(--bg-0);
+}
+
+.app-nav {
+  background: var(--nav-bg);
+  border-right: 1px solid var(--sep-1);
+}
+.nav-link.active {
+  background: var(--accent-soft);
+  border-color: rgba(79, 157, 139, 0.35);
+  color: var(--text-1);
+}
+.nav-link.active svg { color: var(--accent); }
+.nav-link.active::before { background: var(--accent); }
+
+.topbar { background: var(--topbar-bg); border-bottom: 1px solid var(--sep-1); }
+.page-subtitle, .config-field-hint, .empty-hint { color: var(--text-3); }
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--sep-1);
+  border-radius: var(--radius-l);
+  box-shadow: var(--shadow-1);
+}
+.panel-head { background: transparent; border-bottom: 1px solid var(--sep-2); }
+
+input, select, textarea {
+  background: var(--input-bg);
+  border: 1px solid var(--sep-1);
+  border-radius: var(--radius-s);
+  color: var(--text-1);
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* 平面按钮：去掉旧主题的渐变、发光和伪元素填充层 */
+.btn,
+.top-actions .btn,
+.command-savebar .btn {
+  height: 30px;
+  min-height: 30px;
+  padding: 0 11px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--sep-1);
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: 12.5px;
+  font-weight: 500;
+  box-shadow: none;
+  overflow: visible;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.btn::before { display: none !important; content: none !important; }
+.btn:hover { background: var(--bg-3); border-color: var(--sep-1); }
+.btn:active { transform: translateY(1px); }
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: none;
+}
+.btn.primary:hover { background: #57a996; border-color: #57a996; }
+body.light .btn.primary { color: #fff; }
+.btn.warn {
+  background: rgba(217, 164, 65, 0.12);
+  border-color: rgba(217, 164, 65, 0.38);
+  color: #e3bf7c;
+}
+body.light .btn.warn { color: var(--warn); }
+.btn.warn:hover { background: rgba(217, 164, 65, 0.2); }
+.btn.danger {
+  background: rgba(217, 108, 108, 0.12);
+  border-color: rgba(217, 108, 108, 0.4);
+  color: #eba3a3;
+}
+body.light .btn.danger { color: var(--danger); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
+.btn.ghost:hover { background: var(--bg-2); color: var(--text-1); }
+.btn.small { height: 25px; min-height: 25px; padding: 0 9px; font-size: 11.5px; }
+.btn:disabled { opacity: 0.4; }
+
+.tabs {
+  background: var(--bg-2);
+  border: 1px solid var(--sep-1);
+  border-radius: var(--radius-m);
+  padding: 3px;
+}
+.tab { color: var(--text-2); border-radius: 7px; }
+.tab:hover { background: var(--bg-3); color: var(--text-1); }
+.tab.active {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: none;
+}
+body.light .tab.active { color: #fff; }
+
+.chip { background: var(--bg-2); border-color: var(--sep-1); }
+.config-status { background: var(--bg-2); border-color: var(--sep-1); }
+.config-sidebar { background: var(--bg-2); border-color: var(--sep-1); }
+.config-group-card { background: var(--bg-1); border-color: var(--sep-1); }
+.command-savebar, .config-savebar { background: var(--savebar-bg); border-color: var(--sep-1); }
+.command-item.selected, .task-item.selected, .ai-actor-row.selected, .ai-trace-row.selected, .debug-endpoint.active {
+  background: var(--accent-soft);
+  border-color: rgba(79, 157, 139, 0.45);
+}
+.modal, .tools-modal, .screenshot-modal { background: rgba(0, 0, 0, 0.66); }
+
+/* 主题 v2 细化：提高表面层次与按钮可识别度 */
+:root {
+  --bg-0: #0e1012;
+  --bg-1: #171a1e;
+  --bg-2: #1d2126;
+  --bg-3: #242930;
+  --panel-bg: #171a1e;
+  --nav-bg: #111315;
+  --topbar-bg: rgba(14, 16, 18, 0.88);
+  --input-bg: #1b1f24;
+  --sep-1: rgba(255, 255, 255, 0.1);
+  --sep-2: rgba(255, 255, 255, 0.06);
+}
+body.light {
+  --bg-0: #f2f0ea;
+  --bg-1: #fcfbf8;
+  --bg-2: #f1eee7;
+  --bg-3: #e8e4db;
+  --panel-bg: #fcfbf8;
+}
+.btn.ghost { border-color: var(--sep-1); background: transparent; }
+.btn.ghost:hover { background: var(--bg-2); }
+.btn:focus-visible, .tab:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

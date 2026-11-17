@@ -352,7 +352,9 @@ code, pre, .config-field-path { font-family: var(--font-mono); }
 /* 日/夜主题切换图标 */
 .theme-toggle .sun { display: none; }
 .theme-toggle .moon { display: block; }
+html[data-theme="light"] .theme-toggle .sun,
 body.light .theme-toggle .sun { display: block; }
+html[data-theme="light"] .theme-toggle .moon,
 body.light .theme-toggle .moon { display: none; }
 .theme-toggle svg { width: 16px; height: 16px; }
 
@@ -678,6 +680,7 @@ input[type="checkbox"] { width: 34px; height: 20px; flex: none; }
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.22);
 }
 
+html[data-theme="light"],
 body.light {
   --bg-0: #f2f0ea;
   --bg-1: #fbfaf6;
@@ -704,6 +707,7 @@ body.light {
 body {
   background: radial-gradient(1100px 500px at 20% -10%, rgba(79, 157, 139, 0.07), transparent 60%), var(--bg-0);
 }
+html[data-theme="light"],
 body.light {
   background: radial-gradient(1100px 500px at 20% -10%, rgba(47, 124, 108, 0.05), transparent 60%), var(--bg-0);
 }
@@ -769,20 +773,20 @@ input:focus, select:focus, textarea:focus {
   box-shadow: none;
 }
 .btn.primary:hover { background: #57a996; border-color: #57a996; }
-body.light .btn.primary { color: #fff; }
+html[data-theme="light"] .btn.primary, body.light .btn.primary { color: #fff; }
 .btn.warn {
   background: rgba(217, 164, 65, 0.12);
   border-color: rgba(217, 164, 65, 0.38);
   color: #e3bf7c;
 }
-body.light .btn.warn { color: var(--warn); }
+html[data-theme="light"] .btn.warn, body.light .btn.warn { color: var(--warn); }
 .btn.warn:hover { background: rgba(217, 164, 65, 0.2); }
 .btn.danger {
   background: rgba(217, 108, 108, 0.12);
   border-color: rgba(217, 108, 108, 0.4);
   color: #eba3a3;
 }
-body.light .btn.danger { color: var(--danger); }
+html[data-theme="light"] .btn.danger, body.light .btn.danger { color: var(--danger); }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
 .btn.ghost:hover { background: var(--bg-2); color: var(--text-1); }
 .btn.small { height: 25px; min-height: 25px; padding: 0 9px; font-size: 11.5px; }
@@ -801,7 +805,7 @@ body.light .btn.danger { color: var(--danger); }
   color: #fff;
   box-shadow: none;
 }
-body.light .tab.active { color: #fff; }
+html[data-theme="light"] .tab.active, body.light .tab.active { color: #fff; }
 
 .chip { background: var(--bg-2); border-color: var(--sep-1); }
 .config-status { background: var(--bg-2); border-color: var(--sep-1); }
@@ -827,6 +831,7 @@ body.light .tab.active { color: #fff; }
   --sep-1: rgba(255, 255, 255, 0.1);
   --sep-2: rgba(255, 255, 255, 0.06);
 }
+html[data-theme="light"],
 body.light {
   --bg-0: #f2f0ea;
   --bg-1: #fcfbf8;

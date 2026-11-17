@@ -190,7 +190,10 @@
       <section class="command-reply-editor" aria-label="命令回复编辑">
         <template v-if="selectedEntry">
           <div class="row wrap" style="justify-content: space-between; align-items: baseline">
-            <h3>{{ selectedEntry.name || selectedEntry.id }} 回复</h3>
+            <h3>
+              {{ selectedEntry.name || selectedEntry.id }} 回复
+              <span v-if="!selectedVisible" class="config-dirty" title="当前命令被搜索或来源筛选隐藏">不在当前筛选</span>
+            </h3>
             <button class="btn small ghost" type="button" :disabled="saving || replyLoading" @click="refreshReplies">刷新回复目录</button>
           </div>
           <p class="config-field-hint">
@@ -461,6 +464,10 @@ function matches(item) {
     .toLowerCase()
   return haystack.includes(query)
 }
+
+const selectedVisible = computed(() =>
+  visibleGroups.value.some((group) => group.commands.some((item) => isSelected(item))),
+)
 
 const visibleGroups = computed(() =>
   (catalog.value?.groups || [])

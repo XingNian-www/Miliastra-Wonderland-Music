@@ -646,3 +646,7 @@ input[type="checkbox"] { width: 34px; height: 20px; flex: none; }
   .tools-layout { grid-template-columns: 1fr; }
   .tools-side { position: static; }
 }
+
+/* 任务：队列内部滚动，详情吸顶不再被拉伸 */
+.page-grid > .task-detail-panel { height: auto !important; max-height: calc(100vh - 96px); overflow: auto; }
+.task-queue-panel .panel-body { max-height: 540px; overflow: auto; }

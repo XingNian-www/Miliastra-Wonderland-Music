@@ -503,6 +503,41 @@ async function reload() {
   await load(true)
 }
 
+// 按 schema 把草稿里的数字字段规整成 number。
+// 后端对 int/float 严格反序列化，字符串会直接 400 invalid type；
+// 配置中心有 coerceField，这里此前没有，导致 AI 页数值改不动/存不回。
+function coerceNumberValue(field, value) {
+  const kind = field.kind ? field.kind.type : 'string'
+  if (kind !== 'int' && kind !== 'float') return value
+  if (value === null || value === undefined) return value
+  if (typeof value === 'number') return value
+  const text = String(value).trim()
+  if (text === '') return field.nullable === true ? null : value
+  const number = Number(text)
+  return Number.isFinite(number) ? number : value
+}
+
+function normalizedSection(name) {
+  const section = schemaSection(name)
+  const source = clone(sections[name])
+  if (!section) return source
+  for (const field of section.fields || []) {
+    const segments = String(field.path).split('.').slice(1)
+    if (!segments.length) continue
+    let cursor = source
+    let ok = true
+    for (const segment of segments.slice(0, -1)) {
+      if (cursor == null || typeof cursor !== 'object') { ok = false; break }
+      cursor = cursor[segment]
+    }
+    if (!ok || cursor == null || typeof cursor !== 'object') continue
+    const key = segments[segments.length - 1]
+    if (!(key in cursor)) continue
+    cursor[key] = coerceNumberValue(field, cursor[key])
+  }
+  return source
+}
+
 async function save() {
   if (saving.value || !dirtySections.value.length) return
   const firstError = Object.keys(localErrors.value)[0]
@@ -512,7 +547,7 @@ async function save() {
     return
   }
   const payload = {}
-  for (const name of dirtySections.value) payload[name] = clone(sections[name])
+  for (const name of dirtySections.value) payload[name] = normalizedSection(name)
   saving.value = true
   try {
     let response = null

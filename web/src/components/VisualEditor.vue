@@ -17,7 +17,7 @@
           <input
             type="number"
             step="1"
-            :value="draft.schema_version"
+            :value="f32Text(draft.schema_version)"
             :disabled="disabled"
             @change="setNumber(['schema_version'], $event)"
           />
@@ -27,7 +27,7 @@
           <input
             type="number"
             step="1"
-            :value="draft.canvas && draft.canvas.width"
+            :value="f32Text(draft.canvas && draft.canvas.width)"
             :disabled="disabled"
             @change="setNumber(['canvas', 'width'], $event)"
           />
@@ -37,7 +37,7 @@
           <input
             type="number"
             step="1"
-            :value="draft.canvas && draft.canvas.height"
+            :value="f32Text(draft.canvas && draft.canvas.height)"
             :disabled="disabled"
             @change="setNumber(['canvas', 'height'], $event)"
           />
@@ -69,7 +69,7 @@
             :value="typeof entry.value === 'number' ? f32Text(entry.value) : entry.value"
             :disabled="disabled"
             spellcheck="false"
-            @change="setText(['templates', entry.key], $event, false)"
+            @change="setTemplateValue(entry.key, $event)"
           />
         </label>
       </div>
@@ -124,7 +124,7 @@
             v-else-if="typeof entry.value === 'number'"
             type="number"
             step="any"
-            :value="entry.value"
+            :value="f32Text(entry.value)"
             :disabled="disabled"
             @change="setNumber([section.key, entry.key], $event)"
           />
@@ -284,6 +284,27 @@ function setNumberArray(path, event) {
   setNested(path, numbers)
   notify()
 }
+// 模板字段混着路径（字符串）与阈值（数字）：
+// 阈值在档案里是 number，按文本提交会变成字符串，后端 as_f64 校验直接失败。
+function setTemplateValue(key, event) {
+  const original = (props.draft.templates || {})[key]
+  const raw = String(event.target.value ?? '').trim()
+  if (typeof original === 'number') {
+    const number = Number(raw)
+    if (!Number.isFinite(number)) {
+      markInvalid(`templates.${key}`, true)
+      return
+    }
+    setNested(['templates', key], number)
+    markInvalid(`templates.${key}`, false)
+    notify()
+    return
+  }
+  setNested(['templates', key], raw)
+  markInvalid(`templates.${key}`, false)
+  notify()
+}
+
 function setText(path, event, nullable = true) {
   let text = String(event.target.value ?? '')
   if (nullable && text === '') text = ''

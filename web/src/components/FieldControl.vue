@@ -148,6 +148,7 @@
 
 <script setup>
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { f32Text } from '../util/format.js'
 
 const props = defineProps({
   field: { type: Object, required: true },
@@ -189,23 +190,43 @@ watch(
   { immediate: true },
 )
 
+// 数字字段在草稿里必须是 number，不能是字符串：
+// 后端按 f32/u32 严格反序列化，提交 "0.85" 会直接 400 invalid type。
+// 输入过程中保留字符串（"1." / "-" 这类半成品），这里只在能解析时上抛数字。
 function onNumberInput(event) {
   const element = event.target
   if (element.validity && element.validity.badInput) return
   const raw = element.value
   numberText.value = raw
-  const value = raw === '' ? (props.field.nullable ? null : '') : raw
-  lastNumberEmitted = value
-  emit('update:modelValue', value)
+  if (raw.trim() === '') {
+    // 清空：nullable 字段上抛 null（后端只接受 null，不接受 ""）；
+        // 非 nullable 仍抛空串，让父级校验报「不能为空」而不是静默存 null。
+    const value = props.field.nullable ? null : ''
+    lastNumberEmitted = value
+    emit('update:modelValue', value)
+    return
+  }
+  const number = Number(raw)
+  if (!Number.isFinite(number)) return
+  lastNumberEmitted = number
+  emit('update:modelValue', number)
 }
 
 function onNumberChange(event) {
   const element = event.target
-  if (!element.validity || !element.validity.badInput) return
-  const value = props.field.nullable ? null : ''
-  numberText.value = ''
-  lastNumberEmitted = value
-  emit('update:modelValue', value)
+  if (element.validity && element.validity.badInput) {
+    const value = props.field.nullable ? null : ''
+    numberText.value = ''
+    lastNumberEmitted = value
+    emit('update:modelValue', value)
+    return
+  }
+  // change 时再规整一次显示：避免 "0.9000" 这类冗余小数留在输入框里。
+  const raw = element.value
+  if (raw.trim() === '') return
+  const number = Number(raw)
+  if (!Number.isFinite(number)) return
+  numberText.value = kind.value === 'float' ? f32Text(number) : String(number)
 }
 
 function onBoolChange(event) {

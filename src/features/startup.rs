@@ -26,6 +26,15 @@ pub struct StartupConfig {
     pub wonderland_transition_timeout_ms: u64,
     pub wonderland_confirm_stable_timeout_ms: u64,
     pub final_primary_timeout_ms: u64,
+    /// 加载界面停留超过这个时长就重启游戏。0 或未启用时不动作。
+    ///
+    /// 必须带字段级默认值：这是 7.6.2 新增的键，存量库（schema_version=4）
+    /// 里没有它，而 `ensure_schema` 版本相同不做迁移。裸缺省会直接让
+    /// `serde_json::from_value` 报 missing field，导致**程序启动即失败**。
+    #[serde(default = "default_loading_restart_timeout_ms")]
+    pub loading_restart_timeout_ms: u64,
+    #[serde(default)]
+    pub restart_game_on_loading: bool,
     pub poll_ms: u64,
     pub stable_mean_threshold: f32,
     pub stable_changed_ratio_threshold: f32,
@@ -36,6 +45,11 @@ pub struct StartupConfig {
     pub wonderland_hall_ocr_region: RectConfig,
     pub main_ui_region: RectConfig,
     pub wonderland_map_star_region: RectConfig,
+}
+
+/// 「加载界面过久」的默认判定时长：60 秒（用户明确要求）。
+fn default_loading_restart_timeout_ms() -> u64 {
+    60_000
 }
 
 impl Default for StartupConfig {
@@ -58,6 +72,8 @@ impl Default for StartupConfig {
             wonderland_transition_timeout_ms: 0,
             wonderland_confirm_stable_timeout_ms: 0,
             final_primary_timeout_ms: 0,
+            loading_restart_timeout_ms: 0,
+            restart_game_on_loading: false,
             poll_ms: 0,
             stable_mean_threshold: 0.0,
             stable_changed_ratio_threshold: 0.0,
@@ -75,6 +91,9 @@ impl Default for StartupConfig {
 impl StartupConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_threshold(self.template_threshold, "startup.template_threshold")?;
+        if self.restart_game_on_loading && self.loading_restart_timeout_ms == 0 {
+            bail!("startup.loading_restart_timeout_ms 在启用加载超时重启时不能为 0");
+        }
         validate_threshold(
             self.wonderland_confirm_threshold,
             "startup.wonderland_confirm_threshold",
@@ -210,6 +229,9 @@ impl StartupSource {
     pub const AUTOMATIC_UI: Self = Self("界面自动识别");
     /// 来自调试沙盒的显式调用。独立标注，便于在任务记录里与自动化触发区分开。
     pub const DEBUG_SANDBOX: Self = Self("调试沙盒");
+    /// 自动恢复：失联重启 / 加载超时重启。与玩家手动点的启动区分开，
+    /// 便于在日志与任务记录里看出"这次重开是程序自己决定的"。
+    pub const AUTO_RECOVERY: Self = Self("自动恢复");
 
     pub const fn new(label: &'static str) -> Self {
         Self(label)

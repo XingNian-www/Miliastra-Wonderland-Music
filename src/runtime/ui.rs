@@ -491,6 +491,8 @@ fn stage_label(stage: &'static str) -> &'static str {
         "focus_game_window" => "激活游戏窗口",
         "parse_game_args" => "解析游戏启动参数",
         "confirm_enter_game" => "确认已进入游戏",
+        "close_game_for_loading_restart" => "加载过久关闭游戏准备重启",
+        "restart_game_on_loading_unavailable" => "无法自动重启游戏（缺少拉起路径）",
         "observe_enter_game" => "观察进入游戏后的界面",
         "locate_startup_template" => "定位启动流程模板",
         "ensure_wonderland_window" => "确认千星窗口可用",

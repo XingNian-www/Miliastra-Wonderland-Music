@@ -397,6 +397,14 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         self.pause_automatically("idle_exit", "闲置退出")
     }
 
+    /// 自动重启游戏前暂停：与闲置退出同一语义（不让重启后自动续播）。
+    ///
+    /// 单独一个入口而不是复用 idle_exit，是为了让 `/control/outcomes` 与日志里
+    /// 能区分「闲置退出关游戏」和「自动恢复重启游戏」两种暂停来源。
+    pub(crate) fn pause_for_auto_restart(&self) -> Result<String> {
+        self.pause_automatically("auto_restart", "自动重启游戏")
+    }
+
     pub(crate) fn pause_for_hall_expiry(&self) -> Result<String> {
         // 立即阻止自动推进，等待正在加载的操作完成后再暂停会话。
         //

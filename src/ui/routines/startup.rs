@@ -26,6 +26,12 @@ use enigo::Key;
 
 const TEMPLATE_STABLE_HITS: u32 = 2;
 
+/// 「加载界面过久」在一次启动任务内最多重开几次游戏。
+///
+/// 只重试一次：真的起不来（DLL 注入失败、游戏损坏）时反复重开只会把玩家
+/// 卡在无限重启里，宁可放弃并如实报错，让人能看见问题。
+const LOADING_RESTART_MAX_ATTEMPTS: u8 = 1;
+
 struct TemplateAbsence<'a> {
     template: &'a Path,
     region: Rect,
@@ -166,6 +172,10 @@ pub(crate) struct StartupUiConfig {
     pub(crate) wonderland_transition_timeout_ms: u64,
     pub(crate) wonderland_confirm_stable_timeout_ms: u64,
     pub(crate) final_primary_timeout_ms: u64,
+    /// 加载界面停留超过这个时长就重启游戏；0 = 关闭该功能。
+    pub(crate) loading_restart_timeout_ms: u64,
+    /// 是否启用「加载界面过久自动重启游戏」。
+    pub(crate) restart_game_on_loading: bool,
     pub(crate) poll_ms: u64,
     pub(crate) stable_mean_threshold: f32,
     pub(crate) stable_changed_ratio_threshold: f32,
@@ -468,6 +478,46 @@ fn force_finish_if_kind(context: &mut UiRoutineContext<'_>, kinds: &[UiStateKind
     false
 }
 
+/// 等待游戏窗口真正消失；超时返回 false。
+///
+/// `close_window` 返回错误时不能想当然认为"已经关了"：它也可能是
+/// `PostMessage(WM_CLOSE)` 发出但窗口没在超时内退出。只有 `ensure_window`
+/// 报错才说明窗口确实不在了。
+fn wait_game_window_gone(
+    context: &mut UiRoutineContext<'_>,
+    config: &StartupRoutineConfig,
+) -> Result<bool, UiRoutineFailure> {
+    const WINDOW_GONE_WAIT_MS: u64 = 5_000;
+    let deadline = Instant::now() + Duration::from_millis(WINDOW_GONE_WAIT_MS);
+    while Instant::now() < deadline {
+        if context.device().ensure_window().is_err() {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(context.device().ensure_window().is_err())
+}
+
+/// 「进入游戏」阶段的观测预算。
+///
+/// 平时就是 `enter_game_timeout_ms`；开启「加载过久重启」时至少要能看到
+/// 加载阈值那一刻，否则判定条件永远不成立（见调用处注释）。
+fn enter_game_budget(config: &StartupRoutineConfig) -> Duration {
+    let base = config.startup.enter_game_timeout_ms;
+    if !config.startup.restart_game_on_loading || config.startup.loading_restart_timeout_ms == 0 {
+        return Duration::from_millis(base);
+    }
+    // 首段必须**严格活过**「加载阈值 + 一次轮询」：只取到阈值那一刻会与循环
+    // 条件 `Instant::now() < deadline` 打平，判定永远赶不上触发
+    //（默认 45s 期限 vs 60s 阈值时更极端：连阈值都到不了）。
+    // 用户明确要求默认阈值为 60 秒，因此这个阶段的观测窗口必须容得下它。
+    let needed = config
+        .startup
+        .loading_restart_timeout_ms
+        .saturating_add(config.startup.poll_ms.max(1));
+    Duration::from_millis(base.max(needed))
+}
+
 fn execute_enter_game(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
@@ -482,7 +532,21 @@ fn execute_enter_game(
         return Ok(EnterGameEffect::WindowReady);
     }
 
-    let deadline = Instant::now() + Duration::from_millis(config.startup.enter_game_timeout_ms);
+    // 加载界面过久的自愈：必须在**启动流程内部**判，因为这段期间主循环拿不到
+    // 扫描租约（UI 例程独占界面），主循环根本看不到 Loading 状态。
+    //
+    // 做法：
+    //   1. 观察到 Loading 就记下起点；
+    //   2. 超过阈值就关闭游戏并重新拉起（走与首次启动完全相同的
+    //      `ensure_game_window`，因此桥注入路径自然复用，不会绕过 DLL 注入）；
+    //   3. 只在本次任务内重试一次，避免自我循环成无限重开。
+    let mut loading_since: Option<Instant> = None;
+    let mut loading_restarts = 0_u8;
+    // 观测窗口必须**容得下**加载阈值：默认 enter_game_timeout_ms=45s、
+    // 加载阈值=60s，若直接用前者当期限，循环 45 秒就退出，`since.elapsed()`
+    // 永远到不了 60 秒——功能即使打开也永不触发。开启该功能时把首段期限
+    // 放宽到「加载阈值 + 一次轮询」，保证至少有机会命中。
+    let mut deadline = Instant::now() + enter_game_budget(config);
     let mut paimon_streak = 0_u32;
     let mut clicked = false;
     while Instant::now() < deadline {
@@ -496,6 +560,79 @@ fn execute_enter_game(
                 InputCertainty::BeforeInput
             },
         )?;
+        // 「加载界面过久」判定必须放在**抓帧之后**：`latest_ui_state()` 读的是
+        // 最近一次抓帧分类的结果，抓帧前读拿到的是上一轮（甚至启动前）的旧状态，
+        // 会拿错误的状态去判 60 秒超时。这里刚捕获完，分类已同步更新。
+        if config.startup.restart_game_on_loading
+            && config.startup.loading_restart_timeout_ms > 0
+            && loading_restarts < LOADING_RESTART_MAX_ATTEMPTS
+        {
+            let is_loading = context.latest_ui_state().is_some_and(|observation| {
+                matches!(
+                    observation,
+                    crate::runtime::ui::UiStateObservation::Classified(state)
+                        if state.stable_kind() == Some(UiStateKind::Loading)
+                )
+            });
+            if is_loading {
+                let since = *loading_since.get_or_insert_with(Instant::now);
+                let timeout = Duration::from_millis(config.startup.loading_restart_timeout_ms);
+                if since.elapsed() >= timeout {
+                    // 只认聊天桥：反作弊只允许「创建游戏进程的一方」注入 DLL，
+                    // 本进程用 `device().launch_game()` 直接拉起来的进程拿不到注入，
+                    // 等于把一个没有聊天源的游戏重新跑起来（用户明确禁止这条路径）。
+                    if config.startup.external_launcher.is_none() {
+                        return Err(UiRoutineFailure::new(
+                            InputCertainty::BeforeInput,
+                            "restart_game_on_loading_unavailable",
+                            "界面卡在加载，但当前没有可用的自动拉起路径：必须启用外部聊天源并打开「自动启动 Miliastra-Wonderland-ChatBridge」才能自动重启游戏（只有聊天桥能创建可注入的游戏进程）。已放弃自动重启以免游戏无法恢复",
+                        ));
+                    }
+                    loading_restarts += 1;
+                    log::warn!(
+                        "启动游戏时界面停在加载界面已 {} 秒（判定阈值 {} 秒），重启游戏重试（第 {} 次）",
+                        since.elapsed().as_secs(),
+                        timeout.as_secs(),
+                        loading_restarts
+                    );
+                    // 关闭失败不算致命：加载卡死的常见形态正是游戏已经崩溃、
+                    // 窗口不复存在，那种情况下"关不掉"恰恰等于"已经关了"。
+                    // 但这必须**核实**：若窗口其实还在，`ensure_game_window`
+                    // 会直接复用旧窗口并返回成功，于是"重启"实际没发生，
+                    // 却已经消耗掉唯一一次重开机会（假重启）。
+                    if let Err(error) = context.device().close_window() {
+                        log::warn!(
+                            "加载过久重启时关闭游戏窗口失败，核实窗口是否已消失：{error:#}"
+                        );
+                        let gone = wait_game_window_gone(context, config)?;
+                        if !gone {
+                            return Err(UiRoutineFailure::new(
+                                InputCertainty::AfterInputUnknown,
+                                "restart_game_on_loading_unavailable",
+                                "界面卡在加载，但关闭游戏失败且窗口仍然存在；继续重开会复用旧进程（等于没有重启），已放弃自动重启",
+                            ));
+                        }
+                    }
+                    // 与首次启动同一路径：开着外部聊天源时由桥重新创建进程并注入 DLL。
+                    ensure_game_window(context, config)?;
+                    context
+                        .device()
+                        .focus(config.residency.after_activate_ms)
+                        .map_err(|error| before_input_failure("focus_game_window", error))?;
+                    // 截止时间顺延一个完整周期：重开游戏要重新走一遍加载，
+                    // 沿用旧截止时间会把这次重试直接判成超时失败。
+                    deadline =
+                        Instant::now() + Duration::from_millis(config.startup.enter_game_timeout_ms);
+                    loading_since = None;
+                    paimon_streak = 0;
+                    clicked = false;
+                    continue;
+                }
+            } else {
+                // 离开加载界面就清零，短加载不会累积成误判。
+                loading_since = None;
+            }
+        }
         // 用户要求：只要检测到主世界就无条件停止，完成。
         if force_finish_if_kind(context, &[UiStateKind::Overworld]) {
             return Ok(EnterGameEffect::Entered);
@@ -552,6 +689,16 @@ fn execute_enter_game(
             },
         )?;
     }
+    // 诊断：重开过一次之后仍然没进游戏，与"从头就没进去"是两回事，
+    // 日志里必须能区分，否则排查时看不出自动重启到底有没有生效。
+    let reason = if loading_restarts > 0 {
+        format!(
+            "paimon menu template did not become stable before timeout（已自动重启游戏 {} 次仍未进入，加载界面可能持续卡死）",
+            loading_restarts
+        )
+    } else {
+        "paimon menu template did not become stable before timeout".to_string()
+    };
     Err(UiRoutineFailure::new(
         if clicked {
             InputCertainty::AfterInputUnknown
@@ -559,7 +706,7 @@ fn execute_enter_game(
             InputCertainty::ConfirmedFailure
         },
         "confirm_enter_game",
-        "paimon menu template did not become stable before timeout",
+        reason,
     ))
 }
 
@@ -572,14 +719,28 @@ fn ensure_game_window_via_chat_api(
     config: &StartupRoutineConfig,
     chat_source: &crate::config::ChatSourceConfig,
 ) -> Result<(), UiRoutineFailure> {
-    crate::runtime::chat_source::launcher::ensure_running(chat_source, &config.target_process)
-        .map_err(|error| {
-            UiRoutineFailure::new(
-                InputCertainty::BeforeInput,
-                "launch_chat_api",
-                format!("{error:#}"),
-            )
-        })?;
+    // `Ok(false)` 表示桥没有真的被拉起（已监听 / 退避中 / 等待游戏退出 /
+    // 退出码 4 已永久停止）。这时不能盲等窗口——那会白等满
+    // `launch_retries × launch_wait_ms`（默认 60 秒）才超时，日志里只看到
+    // 一句"窗口一直没出现"，看不出真正原因是桥没启动。
+    let launched = crate::runtime::chat_source::launcher::ensure_running(
+        chat_source,
+        &config.target_process,
+    )
+    .map_err(|error| {
+        UiRoutineFailure::new(
+            InputCertainty::BeforeInput,
+            "launch_chat_api",
+            format!("{error:#}"),
+        )
+    })?;
+    if !launched {
+        return Err(UiRoutineFailure::new(
+            InputCertainty::BeforeInput,
+            "launch_chat_api",
+            "Miliastra-Wonderland-ChatBridge 未被启动（已在监听、处于启动退避，或上次以「链路丢失」结束而停止自动重启）；请确认游戏已退出、聊天桥可正常启动",
+        ));
+    }
     for _ in 0..config.startup.launch_retries.max(1) {
         wait_ms(
             context,
@@ -1424,6 +1585,8 @@ mod tests {
                 wonderland_transition_timeout_ms: startup.wonderland_transition_timeout_ms,
                 wonderland_confirm_stable_timeout_ms: startup.wonderland_confirm_stable_timeout_ms,
                 final_primary_timeout_ms: startup.final_primary_timeout_ms,
+                loading_restart_timeout_ms: startup.loading_restart_timeout_ms,
+                restart_game_on_loading: startup.restart_game_on_loading,
                 poll_ms: 1,
                 stable_mean_threshold: startup.stable_mean_threshold,
                 stable_changed_ratio_threshold: startup.stable_changed_ratio_threshold,
@@ -1448,6 +1611,38 @@ mod tests {
             FriendDeliveryRoutineConfig::from_app(app),
             app.window.target_process.clone(),
         )
+    }
+
+    /// 开启「加载过久重启」时，观测窗口必须容得下阈值；否则判定永远不成立。
+    ///
+    /// 这是真实踩过的坑：默认 `enter_game_timeout_ms=45s` 而阈值 `60s`，
+    /// 循环先到 45 秒就退出，功能即使打开也永不触发。
+    #[test]
+    fn loading_restart_budget_covers_the_threshold() {
+        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut config = test_startup_config(&app);
+        config.startup.restart_game_on_loading = true;
+        config.startup.loading_restart_timeout_ms = 60_000;
+        config.startup.enter_game_timeout_ms = 45_000;
+        config.startup.poll_ms = 1_000;
+
+        let budget = enter_game_budget(&config);
+        assert!(
+            budget >= Duration::from_millis(61_000),
+            "观测窗口必须严格超过阈值（含一次轮询），当前 {budget:?}"
+        );
+    }
+
+    /// 关闭该功能时预算保持原样，不影响既有「每阶段一分钟」的分配。
+    #[test]
+    fn loading_restart_budget_is_untouched_when_disabled() {
+        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut config = test_startup_config(&app);
+        config.startup.restart_game_on_loading = false;
+        config.startup.loading_restart_timeout_ms = 60_000;
+        config.startup.enter_game_timeout_ms = 45_000;
+
+        assert_eq!(enter_game_budget(&config), Duration::from_millis(45_000));
     }
 
     #[test]

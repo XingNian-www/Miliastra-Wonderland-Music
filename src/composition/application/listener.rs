@@ -2,6 +2,7 @@ use super::secondary_chat::{
     SecondaryHallCommandTracker, SecondaryListenerRoundState, SecondaryObservationOutcome,
 };
 use super::*;
+use super::tasks::GameRelaunch;
 use crate::observation::chat::{ChatIdentity, ChatScope, SourceId};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,20 @@ const SECONDARY_UI_MISMATCH_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 持续失败类 warn 的重复间隔（与 [SECONDARY_UI_MISMATCH_WARN_INTERVAL] 同值同语义）。
 const LOOP_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 自动重启游戏的最小间隔。
+///
+/// 重启后游戏还要重新过加载界面，这段时间里失联判定和加载超时都可能再次成立；
+/// 没有这个冷却就会变成「重启 → 立刻又判失联 → 再重启」的死循环，把玩家卡死在
+/// 反复重开游戏里。5 分钟足够走完一次冷启动进世界。
+const AUTO_GAME_RESTART_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// 关掉游戏后等待聊天桥重新拉起的上限。
+///
+/// 桥拉起游戏要先等旧游戏进程彻底退出，再注入新进程；正常十几秒完成。
+/// 两分钟还没成，说明是 DLL 缺失/游戏损坏这类硬失败，继续等没有意义。
+const BRIDGE_RELAUNCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 
 /// 该告警这次是否应当真的写 warn。
 ///
@@ -1252,6 +1267,144 @@ impl ApplicationRuntime {
         Ok(())
     }
 
+    /// 外部聊天源失联后「自动重启游戏」的守卫。
+    ///
+    /// 只在**确实需要**时才动手，并受 [`AUTO_GAME_RESTART_COOLDOWN`] 冷却保护——
+    /// 重启后游戏还要重新过一遍加载，没有冷却会立刻再次命中条件，形成无限重开。
+    ///
+    /// 触发条件（三个都满足）：
+    /// - `chat_source.disconnect_action == restart_game`；
+    /// - 失联时长超过 `chat_source.lease_timeout_ms`（面板上的「失联回落阈值」，
+    ///   与回落 OCR 共用同一条判定线，不另设第二套计时）；
+    /// - 此前**确实连上过**：从未连上属于桥没起来，重启游戏无效
+    ///   （见 [`ExternalChatState::lost_for`]）。
+    ///
+    /// 「加载界面过久」的重启不在这里：那段期间 UI 例程独占界面、主循环拿不到
+    /// 扫描租约，根本看不到 Loading 状态，所以它实现在启动流程内部
+    /// （见 `ui::routines::startup::execute_enter_game`）。
+    fn poll_auto_game_restart(
+        &self,
+        live_config: &crate::config::AppConfig,
+        last_auto_restart_at: &mut Option<Instant>,
+        no_relaunch_warned: &mut Option<Instant>,
+        awaiting_bridge_relaunch: &mut Option<Instant>,
+    ) -> Result<()> {
+        // 冷却期内什么都不判：状态也一并重置，避免冷却结束后拿冷却前的旧起点
+        // 立刻判定（那样等于冷却形同虚设）。
+        let cooling_down = last_auto_restart_at
+            .is_some_and(|at| at.elapsed() < AUTO_GAME_RESTART_COOLDOWN);
+
+        // 走桥的重启：关闭游戏后由这里显式请桥拉起（桥自己创建游戏进程并注入 DLL）。
+        //
+        // 注意**不能**把「桥还在监听」当成已拉起：游戏刚关掉的那段时间桥进程
+        // 仍然活着、端口仍被占用，但它不会自己去创建游戏进程——只有
+        // `ensure_running` 被调用（且过了它内部的停止/退避闸门）才会重新
+        // 拉起游戏并注入 DLL。所以这里持续重试，直到拿到 `Ok(true)`。
+        if let Some(waited_since) = *awaiting_bridge_relaunch {
+            let chat_source = &live_config.chat_source;
+            if !chat_source.enabled || !chat_source.auto_start {
+                log::warn!(
+                    "自动重启游戏中止：外部聊天源或「自动启动聊天桥」已被关闭，没有任何路径能把游戏重新拉起来；如需恢复请手动启动游戏"
+                );
+                *awaiting_bridge_relaunch = None;
+            } else if waited_since.elapsed() >= BRIDGE_RELAUNCH_TIMEOUT {
+                // 桥一直不肯拉起（DLL 缺失、游戏文件损坏、闸门永久卡住等）：
+                // 放弃等待并留一条明确的失败日志，而不是无声地无限重试。
+                log::error!(
+                    "自动重启游戏失败：等待 Miliastra-Wonderland-ChatBridge 重新拉起游戏超过 {} 秒，已停止重试；请检查聊天桥与游戏是否可正常启动",
+                    BRIDGE_RELAUNCH_TIMEOUT.as_secs()
+                );
+                *awaiting_bridge_relaunch = None;
+            } else {
+                match crate::runtime::chat_source::launcher::ensure_running(
+                    chat_source,
+                    &live_config.window.target_process,
+                ) {
+                    Ok(true) => {
+                        log::info!(
+                            "自动重启游戏：已请 Miliastra-Wonderland-ChatBridge 重新拉起游戏并注入 DLL"
+                        );
+                        *awaiting_bridge_relaunch = None;
+                    }
+                    Ok(false) => {
+                        // 桥仍在监听、或处于停止/退避闸门中。下一轮继续试：
+                        // 游戏退干净后桥会自己退出，届时 ensure_running 才会真正拉起。
+                        // 留一条节流日志：否则"一直在等"在日志里是完全静默的，
+                        // 出问题时看不出卡在哪一步。
+                        if loop_failure_warn_due(no_relaunch_warned, Instant::now()) {
+                            log::warn!(
+                                "自动重启游戏：已等待聊天桥重新拉起游戏 {} 秒，桥此刻未拉起（仍在监听或处于退避/等待游戏退出状态），将继续重试",
+                                waited_since.elapsed().as_secs()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "自动重启游戏：拉起 Miliastra-Wonderland-ChatBridge 失败，下一轮重试：{error:#}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 冷却只挡「再次触发重启」，不挡「等待桥把游戏拉起来」——后者要立刻处理，
+        // 否则刚重启完就进冷却，桥永远不会被请求拉起。
+        if cooling_down {
+            return Ok(());
+        }
+
+        // 暂停值守、任务执行中都不该重开游戏：那会打断玩家主动发起的操作。
+        if self.lifecycle.paused.load(AtomicOrdering::SeqCst)
+            || !self.business.task_engine.is_idle()?
+        {
+            return Ok(());
+        }
+
+        // ---- 守卫 1：外部聊天源失联超过回落阈值 ----
+        //
+        // 阈值复用 `lease_timeout_ms`（面板上的「失联回落阈值」）：它本来就是
+        // 「多久没消息就认为外部源不可用」的判定线，重启游戏只是这条线的另一个
+        // 后续动作，不需要第二套计时。
+        let chat_source = &live_config.chat_source;
+        if chat_source.enabled
+            && chat_source.disconnect_action
+                == crate::config::ChatSourceDisconnectAction::RestartGame
+            && let Some(lost) = self.lifecycle.external_chat.lost_for()
+        {
+            let threshold = Duration::from_millis(chat_source.lease_timeout_ms);
+            if lost >= threshold {
+                // 关闭与启动是两个动作：先只看能不能拉起，不能就根本不关，
+                // 避免把玩家关在一个回不来的状态里。
+                let mode = self.game_relaunch_mode(live_config, true);
+                if mode == GameRelaunch::None {
+                    if loop_failure_warn_due(no_relaunch_warned, Instant::now()) {
+                        log::warn!(
+                            "外部聊天源已失联 {} 秒，但当前没有可用的自动拉起路径（需要 chat_source.auto_start），不重启游戏；本条在问题持续期间最多每分钟重复一次",
+                            lost.as_secs()
+                        );
+                    }
+                    return Ok(());
+                }
+                log::warn!(
+                    "外部聊天源已失联 {} 秒（失联回落阈值 {} 秒），按配置选择「自动重启游戏」而非回落 OCR",
+                    lost.as_secs(),
+                    threshold.as_secs()
+                );
+                self.close_game_for_restart(
+                    "外部聊天源失联超过回落阈值",
+                    &self.lifecycle.external_chat,
+                );
+                self.request_game_relaunch(mode)?;
+                *awaiting_bridge_relaunch =
+                    (mode == GameRelaunch::ViaChatBridge).then(Instant::now);
+                *last_auto_restart_at = Some(Instant::now());
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
     fn poll_hall_expiry(
         &self,
         pause_applied: &mut bool,
@@ -1371,6 +1524,15 @@ impl ApplicationRuntime {
         let mut hall_expiry_notice_sent = false;
         let mut hall_expiry_check_after = Instant::now();
         let mut shared_backlog = std::collections::VecDeque::new();
+        // 自动重启游戏的两个守卫：
+        // - last_auto_restart_at 是冷却，避免反复重开；
+        // - loading_since/loading_samples 是「确实停在加载界面」的连续样本计数。
+        let mut last_auto_restart_at: Option<Instant> = None;
+        let mut auto_restart_no_relaunch_warned_at: Option<Instant> = None;
+        // 自动重启走桥时：关闭游戏后要**显式**请桥重新拉起。
+        // 不能只依赖外部聊天线程的重连循环——桥可能还连着 WS（游戏没了但进程还在），
+        // 那样线程不会重连，ensure_running 永远不会被调用，游戏就一直关着。
+        let mut awaiting_bridge_relaunch: Option<Instant> = None;
         log::info!("自动化扫描已启动，开始按界面状态轮询");
         while self.lifecycle.running.load(AtomicOrdering::SeqCst) {
             self.poll_hall_expiry(
@@ -2040,6 +2202,17 @@ impl ApplicationRuntime {
                         target_missing_backoff =
                             next_target_missing_backoff(target_missing_backoff);
                     }
+                    // **必须在抓帧失败分支也判一次**：游戏崩溃 / 窗口消失是
+                    // 「失联后需要重启游戏」最常见的形态，而这时抓帧会持续失败，
+                    // 只在成功分支判等于把这个场景整个漏掉。
+                    // 这里读的是外部聊天源的失联计时（与界面无关），
+                    // 玩家主动退出游戏由闲置退出抑制位挡住（见 maybe_idle_exit）。
+                    self.poll_auto_game_restart(
+                        &live_config,
+                        &mut last_auto_restart_at,
+                        &mut auto_restart_no_relaunch_warned_at,
+                        &mut awaiting_bridge_relaunch,
+                    )?;
                     continue;
                 }
             }
@@ -2058,6 +2231,14 @@ impl ApplicationRuntime {
             }
             drop(scan_lease.take());
             self.forward_completion_advances(completion_subscriber)?;
+            // 自动恢复守卫：读本轮刚判出的界面状态与外部聊天源状态，不发输入、
+            // 不抢扫描租约（此时已 drop），真正重启动作走正式任务队列。
+            self.poll_auto_game_restart(
+                &live_config,
+                &mut last_auto_restart_at,
+                &mut auto_restart_no_relaunch_warned_at,
+                &mut awaiting_bridge_relaunch,
+            )?;
             self.maybe_idle_exit()?;
             self.maybe_reload_config_when_idle();
             self.poll_playlist_import_completions()?;

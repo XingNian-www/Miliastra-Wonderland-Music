@@ -718,6 +718,10 @@ startup:
   wonderland_confirm_stable_timeout_ms: 3000
   # 启动游戏结束时等待主菜单大世界模板的最长时间，单位毫秒
   final_primary_timeout_ms: 10000
+  # 停在加载界面过久时自动重启游戏（默认关闭）
+  restart_game_on_loading: false
+  # 停在加载界面超过这个时长就重启游戏，单位毫秒
+  loading_restart_timeout_ms: 60000
   poll_ms: 1000
   # 像素稳定平均差阈值
   stable_mean_threshold: 2.0
@@ -1067,3 +1071,5 @@ chat_source:
   auto_start: false
   executable: ""
   self_uid: 0
+  # 失联超过「失联回落阈值」后的动作：fallback_ocr（回落 OCR）或 restart_game（自动重启游戏）
+  disconnect_action: fallback_ocr

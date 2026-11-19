@@ -10,6 +10,44 @@ struct ReloadIdleState {
     http_operations_idle: bool,
 }
 
+/// 自动恢复时「启动游戏」这一半由谁负责。
+///
+/// 拆开关闭与启动两个动作的原因：**游戏必须由聊天桥创建进程，DLL 才能注入**。
+/// 反作弊只允许「创建游戏进程的一方」注入，所以启用外部聊天源时启动这一步
+/// 不能由本进程 `Command::new` 硬拉——那会得到一个没有聊天源的游戏进程，
+/// 失联判定随后会再次成立，形成「重开 → 没聊天源 → 再重开」的死循环。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GameRelaunch {
+    /// 由 Miliastra-Wonderland-ChatBridge 拉起（`chat_source.auto_start` 时
+    /// 外部聊天源线程每轮重连都会 `ensure_running`，桥自己创建游戏进程并注入）。
+    ViaChatBridge,
+    /// 由启动流程按 `startup.exe_path` / 注册表查找后拉起。
+    ViaStartupLaunch,
+    /// 没有任何可用的自动拉起路径：不要关游戏，否则就再也回不来了。
+    None,
+}
+
+/// 判定「启动游戏」由谁负责（纯函数，便于单测）。
+///
+/// 优先级：聊天桥（唯一能注入 DLL 的路径）> 启动流程直接拉起 > 不可用。
+/// `for_chat_source` 为真时**只接受**聊天桥路径：聊天源失联是因为注入的
+/// 链路断了，直接拉 exe 得到的新进程没有聊天源，重启只会无限循环。
+pub(super) fn game_relaunch_mode_for(
+    config: &crate::config::AppConfig,
+    for_chat_source: bool,
+) -> GameRelaunch {
+    if config.chat_source.enabled && config.chat_source.auto_start {
+        return GameRelaunch::ViaChatBridge;
+    }
+    if for_chat_source {
+        return GameRelaunch::None;
+    }
+    if config.startup.enabled && config.startup.launch_game {
+        return GameRelaunch::ViaStartupLaunch;
+    }
+    GameRelaunch::None
+}
+
 impl ReloadIdleState {
     const fn background_idle(self, requires_playback_idle: bool) -> bool {
         self.task_engine_idle
@@ -208,6 +246,78 @@ impl ApplicationRuntime {
         Ok(true)
     }
 
+    /// 判断当前配置能不能把游戏重新拉起来（**只看配置，不产生副作用**）。
+    ///
+    /// `for_chat_source` 区分两种触发来源：聊天源失联时必须走桥注入路径，
+    /// 直接拉 exe 会得到一个没有聊天源的进程。
+    pub(super) fn game_relaunch_mode(
+        &self,
+        config: &crate::config::AppConfig,
+        for_chat_source: bool,
+    ) -> GameRelaunch {
+        game_relaunch_mode_for(config, for_chat_source)
+    }
+
+    /// 「重启游戏」的**第一步：只关闭**。
+    ///
+    /// 暂停播放、关闭游戏窗口并清掉失联计时。不在这里启动游戏——
+    /// 启动交给 [`Self::request_game_relaunch`]，避免本进程绕过聊天桥硬拉进程。
+    pub(super) fn close_game_for_restart(
+        &self,
+        reason: &'static str,
+        external_chat: &crate::composition::application::external_chat::ExternalChatState,
+    ) {
+        log::warn!("自动重启游戏第 1 步：关闭游戏（原因：{reason}），先暂停播放器");
+        self.abort_entertainment_for_context_loss("自动重启游戏");
+        if let Err(error) = self.playback.player.pause_for_auto_restart() {
+            // 播放状态已置为「用户暂停」，自动推进不会再继续；
+            // 这里失败的只是播放器后端的暂停 RPC，所以不会"自行恢复播放"。
+            log::error!(
+                "自动重启游戏前暂停播放器后端失败（播放状态已是暂停，不会自动续播；仅后端 RPC 未成功）：{error:#}"
+            );
+        }
+        self.update_monitor_playback_controller();
+        match self.ui.game_ui.close_window() {
+            Ok(()) => log::info!("已关闭游戏窗口（原因：{reason}），等待自动拉起"),
+            Err(error) => {
+                // 窗口可能已经因为崩溃自己没了；那正好，继续走拉起流程即可。
+                // 也不能直接当成功：若窗口其实还在，拉起会复用旧进程（等于没重启）。
+                log::warn!(
+                    "关闭游戏窗口失败（步骤：自动重启游戏第 1 步），游戏窗口可能已自行消失，继续尝试重新拉起：{error:#}"
+                );
+            }
+        }
+        self.invalidate_latest_frame();
+        // 失联起点清零：重启后再从零计时，避免用旧起点立刻再次触发。
+        external_chat.clear_loss();
+    }
+
+    /// 「重启游戏」的**第二步：请既有的自动拉起机制重新启动游戏**。
+    ///
+    /// 不自建启动逻辑：走桥时由外部聊天源线程的 `ensure_running` 拉起桥，
+    /// 桥再创建游戏进程并注入 DLL；不走桥时才排队一次启动流程任务。
+    pub(super) fn request_game_relaunch(&self, mode: GameRelaunch) -> Result<()> {
+        match mode {
+            GameRelaunch::ViaChatBridge => {
+                log::warn!(
+                    "自动重启游戏第 2 步：由 Miliastra-Wonderland-ChatBridge 重新拉起游戏并注入 DLL（本进程不直接启动游戏进程，否则拿不到注入）"
+                );
+                Ok(())
+            }
+            GameRelaunch::ViaStartupLaunch => {
+                let task = StartupTask::start_game(StartupSource::AUTO_RECOVERY);
+                log::warn!("自动重启游戏第 2 步：排队执行启动流程：{}", task.label());
+                self.push_pending_task(PendingTask::Startup(task))
+            }
+            GameRelaunch::None => {
+                log::warn!(
+                    "自动重启游戏已放弃：当前配置没有可用的自动拉起路径（需要 chat_source.auto_start 或 startup.launch_game），关掉游戏后将无法自动恢复"
+                );
+                Ok(())
+            }
+        }
+    }
+
     pub(super) fn maybe_idle_exit(&self) -> Result<()> {
         let Some(timeout) = self.business.business.claim_idle_exit(Instant::now())? else {
             return Ok(());
@@ -223,6 +333,11 @@ impl ApplicationRuntime {
             log::info!("闲置退出已暂停播放器，避免退出后自动恢复播放或继续出队");
         }
         self.update_monitor_playback_controller();
+        // 主动关游戏：抑制「失联后重启游戏」判定，否则回落阈值一到就会把
+        // 刚被闲置退出关掉的游戏重新拉起来，闲置退出等于没做。
+        self.lifecycle
+            .external_chat
+            .suppress_restart_after_intentional_close();
         match self.ui.game_ui.close_window() {
             Ok(()) => self.invalidate_latest_frame(),
             Err(error) => {
@@ -733,6 +848,78 @@ pub(super) fn write_executed_command_fields(
         .with_context(|| format!("open command log {}", path.display()))?;
     file.write_all(line.as_bytes())
         .with_context(|| format!("write command log {}", path.display()))
+}
+
+#[cfg(test)]
+mod recovery_restart_tests {
+    use super::{GameRelaunch, game_relaunch_mode_for};
+    use crate::config::{AppConfig, ChatSourceDisconnectAction};
+
+    /// 聊天源失联且开了 auto_start：必须走桥（只有桥能注入 DLL）。
+    #[test]
+    fn chat_source_loss_relaunches_via_chat_bridge_when_auto_start() {
+        let mut config = AppConfig::default();
+        config.chat_source.enabled = true;
+        config.chat_source.auto_start = true;
+        assert_eq!(
+            game_relaunch_mode_for(&config, true),
+            GameRelaunch::ViaChatBridge
+        );
+    }
+
+    /// 聊天源失联但没开 auto_start：没有任何注入路径，**不许**关游戏。
+    /// 否则重启出来的进程没有聊天源，失联判定会再次成立 → 无限重开。
+    #[test]
+    fn chat_source_loss_refuses_to_restart_without_injection_path() {
+        let mut config = AppConfig::default();
+        config.chat_source.enabled = true;
+        config.chat_source.auto_start = false;
+        config.startup.enabled = true;
+        config.startup.launch_game = true; // 有启动路径也不能用：那会绕过 Dll 注入
+        assert_eq!(game_relaunch_mode_for(&config, true), GameRelaunch::None);
+    }
+
+    /// 加载超时重启（非聊天源场景）可以走启动流程直接拉起。
+    #[test]
+    fn loading_timeout_relaunches_via_startup_launch_when_configured() {
+        let mut config = AppConfig::default();
+        config.startup.enabled = true;
+        config.startup.launch_game = true;
+        assert_eq!(
+            game_relaunch_mode_for(&config, false),
+            GameRelaunch::ViaStartupLaunch
+        );
+    }
+
+    /// 加载超时但既没开启动流程也没开桥：不关游戏。
+    #[test]
+    fn loading_timeout_refuses_to_restart_without_any_launch_path() {
+        let config = AppConfig::default();
+        assert_eq!(game_relaunch_mode_for(&config, false), GameRelaunch::None);
+    }
+
+    /// 开着 auto_start 时优先走桥，即使同时配了 startup.launch_game。
+    #[test]
+    fn chat_bridge_wins_over_direct_launch() {
+        let mut config = AppConfig::default();
+        config.chat_source.enabled = true;
+        config.chat_source.auto_start = true;
+        config.startup.enabled = true;
+        config.startup.launch_game = true;
+        assert_eq!(
+            game_relaunch_mode_for(&config, false),
+            GameRelaunch::ViaChatBridge
+        );
+    }
+
+    /// 默认动作必须是回落 OCR：这是历史行为，不能让升级后的用户游戏被动重启。
+    #[test]
+    fn default_disconnect_action_is_fallback_ocr() {
+        assert_eq!(
+            AppConfig::default().chat_source.disconnect_action,
+            ChatSourceDisconnectAction::FallbackOcr
+        );
+    }
 }
 
 #[cfg(test)]

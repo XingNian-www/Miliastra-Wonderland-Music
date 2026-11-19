@@ -167,6 +167,12 @@ impl ExternalChatState {
         self.inner.active.load(Ordering::Acquire)
     }
 
+    /// 仅供测试：把状态置成"已接管"，用于验证依赖该信号的决策分支。
+    #[cfg(test)]
+    pub(crate) fn mark_active_for_test(&self) {
+        self.set_active(true);
+    }
+
     /// 外部源是否正在为大厅提供消息。
     ///
     /// 与 [`Self::is_active`] 同义，但语义更窄、更贴近调用点意图：

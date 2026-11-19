@@ -200,6 +200,15 @@ fn chat_source_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Text,
             "miliastra-wonderland-chatbridge.exe 的完整路径；留空则依次查找 BOT 目录及其上一级的 deps/bin、Miliastra-Wonderland-ChatBridge 目录，以及解压出的带版本号发布目录",
         ),
+        ConfigFieldSchema::db_live(
+            "disconnect_action",
+            "失联超过回落阈值后",
+            enum_of(&[
+                ("fallback_ocr", "回落 OCR 识别（默认）"),
+                ("restart_game", "自动重启游戏"),
+            ]),
+            "外部聊天源「已经连上过」之后失联（DLL/游戏链路断了），超过上面的「失联回落阈值」仍未重连时做什么：回落 OCR 只是换回截图识别（默认）；自动重启游戏会关闭当前游戏再由聊天桥重新拉起并注入 DLL。从未连上过的启动失败（桥没起来）不会触发；注意程序无法区分「游戏崩溃」和「你手动退出游戏」，开启后手动退出也会被自动重开，需要手动退出时请先关掉这个选项",
+        ),
         ConfigFieldSchema::db_idle_reload(
             "self_uid",
             "本机账号 UID",
@@ -2274,6 +2283,21 @@ fn startup_section() -> Vec<ConfigFieldSchema> {
             "主界面等待超时",
             int(1, MAX_TIMEOUT_MS),
             "启动游戏结束时等待主菜单大世界模板的最长时间，单位毫秒",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "restart_game_on_loading",
+            "加载过久自动重启游戏",
+            FieldKind::Bool,
+            "界面长时间停在加载界面时自动重启游戏重试，默认关闭。需要先启用上面的「启用启动流程」；正常游戏里的传送加载一般只有几秒，不会碰到这个超时",
+        ),
+        ConfigFieldSchema::db_idle_reload(
+            "loading_restart_timeout_ms",
+            "加载超时",
+            FieldKind::Int {
+                min: 10_000,
+                max: 600_000,
+            },
+            "停在加载界面超过这个时长就重启游戏，单位毫秒；默认 60000（60 秒）",
         ),
         ConfigFieldSchema::db_idle_reload(
             "poll_ms",

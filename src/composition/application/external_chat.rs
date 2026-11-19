@@ -107,6 +107,19 @@ struct ExternalChatInner {
     host_boot_id: std::sync::Mutex<Option<u64>>,
     /// 是否已经用掉"首次遇到一级聊天界面时自动切二级"的机会。
     initial_secondary_switch_done: AtomicBool,
+    /// 是否**曾经**成功接管过（握手成功且 /health 确认游戏已接入）。
+    ///
+    /// 「连上过又失联」与「从来没连上」是两件事：前者说明游戏/DLL 链路中途断了，
+    /// 重启游戏有意义；后者是桥本身没起来，重启游戏只会白打断玩家。
+    ever_connected: AtomicBool,
+    /// 失联起始时刻（毫秒时间戳）；0 表示当前没在失联。
+    lost_since_ms: AtomicU64,
+    /// 是否暂停「失联后重启游戏」的判定。
+    ///
+    /// 闲置退出会**主动**关闭游戏：那一刻聊天源必然跟着断开，如果不抑制，
+    /// 回落阈值一到就会把刚被闲置退出关掉的游戏重新拉起来，闲置退出形同虚设。
+    /// 重新连上（游戏被重新启动并接入）时自动解除，无需人工干预。
+    restart_suppressed: AtomicBool,
     /// 最近一次**完整** `/friends` 快照写入身份映射的时间（毫秒）；0=从未。
     friends_snapshot_at_ms: AtomicU64,
     /// 旧桥 404 只 debug 一次。
@@ -181,7 +194,75 @@ impl ExternalChatState {
         self.is_active().then_some(sequence)
     }
 
+    /// 外部源已连续失联多久；未失联或从未连上过则返回 None。
+    ///
+    /// 只回答「连上过、现在断了、断了多久」，不做任何等待或副作用：
+    /// 是否重启游戏由主循环按配置决定（线程所有权在 ApplicationRuntime 手上）。
+    pub(crate) fn lost_for(&self) -> Option<std::time::Duration> {
+        if self.inner.restart_suppressed.load(Ordering::Acquire)
+            || !self.inner.ever_connected.load(Ordering::Acquire)
+            || self.is_active()
+        {
+            return None;
+        }
+        let since = self.inner.lost_since_ms.load(Ordering::Acquire);
+        (since != 0).then(|| {
+            std::time::Duration::from_millis(now_millis().saturating_sub(since).max(1))
+        })
+    }
+
+    /// 新一次成功握手就解除抑制。
+    ///
+    /// 不必等到"完全接管"：闲置退出关掉游戏后，玩家手动重开时桥会重新握手，
+    /// 那一刻就说明游戏回来了。若只在 `set_active(true)` 解除，一旦桥没接上
+    /// （DLL 未注入 / 桥没运行），抑制会**永久**生效，把失联重启能力整体关死。
+    pub(crate) fn lift_restart_suppression(&self) {
+        self.inner.restart_suppressed.store(false, Ordering::Release);
+        // 解除时如果**仍然**失联（握手成功但游戏还没真正接回来），必须立刻
+        // 重新起算：抑制期间把 lost_since_ms 清成了 0，而后续不再有新的
+        // `set_active(false)` 来写这个值，失联判定会永久失效。
+        if self.inner.ever_connected.load(Ordering::Acquire)
+            && !self.is_active()
+            && self.inner.lost_since_ms.load(Ordering::Acquire) == 0
+        {
+            self.inner
+                .lost_since_ms
+                .store(now_millis(), Ordering::Release);
+        }
+    }
+
+    /// 主动关掉游戏之后抑制「失联重启」判定（闲置退出用）。
+    ///
+    /// 与 [`Self::clear_loss`] 的区别：`clear_loss` 只是重新计时（下一次失联还会
+    /// 触发），这里是**彻底不判**，直到聊天源重新连上。
+    pub(crate) fn suppress_restart_after_intentional_close(&self) {
+        self.inner.restart_suppressed.store(true, Ordering::Release);
+        self.inner.lost_since_ms.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn restart_suppressed(&self) -> bool {
+        self.inner.restart_suppressed.load(Ordering::Acquire)
+    }
+
+    /// 重启游戏后清掉失联起点：下一次判定重新计时，不会因为旧的起点立刻又触发。
+    pub(crate) fn clear_loss(&self) {
+        self.inner.lost_since_ms.store(0, Ordering::Release);
+    }
+
     fn set_active(&self, active: bool) {
+        if active {
+            self.inner.ever_connected.store(true, Ordering::Release);
+            self.inner.lost_since_ms.store(0, Ordering::Release);
+            // 重新连上说明游戏已经回来了（手动或自动拉起），解除闲置退出的抑制。
+            self.inner.restart_suppressed.store(false, Ordering::Release);
+        } else if self.inner.ever_connected.load(Ordering::Acquire)
+            && self.inner.lost_since_ms.load(Ordering::Acquire) == 0
+        {
+            // 只记第一次失联的时刻：反复 set_active(false) 不能把起点一直往后推。
+            self.inner
+                .lost_since_ms
+                .store(now_millis(), Ordering::Release);
+        }
         if self.inner.active.swap(active, Ordering::AcqRel) != active {
             log::info!(
                 "外部聊天源{}，{}",
@@ -620,6 +701,14 @@ fn run(
                             // H1：宿主重启后消息序号从 1 重新开始。先判断并重置
                             // 旧水位，否则新消息会被「序号 ≤ 旧水位」当成启动前历史
                             // 整批丢弃，而 active=true 又关掉 OCR —— 永久静默失聪。
+                            // 握手成功本身就是"游戏回来了"的信号：解除闲置退出的
+                            // 抑制，不必等到完全接管（桥可能还没确认 gameConnected）。
+                            if state.restart_suppressed() {
+                                state.lift_restart_suppression();
+                                log::info!(
+                                    "外部聊天源重新握手成功，解除闲置退出留下的「不自动重启游戏」抑制"
+                                );
+                            }
                             let handshake = state.apply_handshake(last_sequence, boot_id);
                             if handshake == HandshakeAction::HostRestarted {
                                 state.bump_epoch();
@@ -1636,6 +1725,107 @@ mod tests {
         // 之后的 301 才执行，200..300 全部丢弃——避免一次性重放大量命令。
         assert!(301 > state.watermark());
         assert!(300 <= state.watermark());
+    }
+
+    /// 失联判定的三条前提必须是「连上过 + 现在断了 + 没被闲置退出抑制」。
+    #[test]
+    fn lost_for_requires_a_previous_connection_and_respects_suppression() {
+        let state = ExternalChatState::default();
+        // 从没连上过：不算失联（桥没起来，重启游戏没有意义）。
+        assert!(state.lost_for().is_none());
+
+        state.set_active(true);
+        assert!(state.lost_for().is_none(), "在线时不算失联");
+
+        state.set_active(false);
+        assert!(
+            state.lost_for().is_some(),
+            "连上过又断开，必须能报出失联时长"
+        );
+
+        // 闲置退出主动关游戏：抑制后不再报告失联，避免把游戏重新拉起来。
+        state.suppress_restart_after_intentional_close();
+        assert!(state.lost_for().is_none(), "主动关游戏后不得再判失联");
+        assert!(state.restart_suppressed());
+
+        // 重新连上要自动解除抑制。
+        state.set_active(true);
+        assert!(!state.restart_suppressed());
+    }
+
+    /// 失联判定只在「连上过 + 断开满阈值」时成立；从没连上过一律不成立。
+    ///
+    /// 这条守的是「桥没起来」与「注入后链路断了」的区分：前者重启游戏无效。
+    #[test]
+    fn lost_threshold_only_applies_after_a_real_connection() {
+        use std::time::Duration;
+
+        let threshold = Duration::from_millis(30_000);
+        let state = ExternalChatState::default();
+        // 从未连上：即使长时间没有任何消息，也不该被判定为"需要重启游戏"。
+        assert!(state.lost_for().is_none_or(|lost| lost < threshold));
+
+        // 真的接管过一次（/health 确认游戏接入）：立刻置上"连过"。
+        state.set_active(true);
+        assert!(state.lost_for().is_none(), "在线时不算失联");
+
+        // 断线（健康检查显示游戏断开）：立刻进入失联计时，但要**满阈值**才升级。
+        state.set_active(false);
+        let lost = state.lost_for().expect("连过又断开必须能报出失联");
+        assert!(lost < threshold, "刚断开时还不该超过阈值：{lost:?}");
+    }
+
+    /// 抑制必须在"新一次握手"时就能解除，而不是等完全接管。
+    ///
+    /// 否则一次闲置退出可能把「失联就重启」永久关死：玩家手动重开游戏后，
+    /// 若桥没接上（DLL 未注入 / 桥没运行），`set_active(true)` 永远不执行，
+    /// 抑制就一直在。
+    #[test]
+    fn suppression_can_be_lifted_by_a_handshake_without_full_takeover() {
+        let state = ExternalChatState::default();
+        state.set_active(true); // 曾经连上过
+        state.set_active(false); // 链路断了，记下失联起点
+        state.suppress_restart_after_intentional_close(); // 闲置退出关游戏：抑制 + 清起点
+        assert!(state.restart_suppressed());
+        assert!(state.lost_for().is_none(), "抑制期间不判失联");
+
+        // 只是握手成功，还没接管（set_active 未被调用）。
+        state.lift_restart_suppression();
+        assert!(!state.restart_suppressed(), "握手后必须解除抑制");
+        // 解除后若确实仍处于失联，必须能重新报告——否则抑制会把
+        // "失联就重启"永久关死（起点被清零且后续没人再写）。
+        assert!(
+            state.lost_for().is_some(),
+            "解除抑制后应重新判得失联（起点要在解除时补回来）"
+        );
+    }
+
+    /// 失联期间重新接管要清掉失联起点，否则下一次判定会拿旧起点立刻触发。
+    #[test]
+    fn reconnect_clears_the_loss_timer() {
+        let state = ExternalChatState::default();
+        state.set_active(true);
+        state.set_active(false);
+        assert!(state.lost_for().is_some());
+        state.set_active(true);
+        assert!(state.lost_for().is_none(), "重新接管后不该继续报失联");
+        assert!(!state.restart_suppressed(), "重新接管要解除闲置退出的抑制");
+    }
+
+    /// 反复 set_active(false) 不能把失联起点一直往后推。
+    #[test]
+    fn repeated_inactive_updates_keep_the_first_loss_timestamp() {
+        let state = ExternalChatState::default();
+        state.set_active(true);
+        state.set_active(false);
+        let first = state.lost_for().expect("失联");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        state.set_active(false);
+        let second = state.lost_for().expect("失联");
+        assert!(
+            second >= first + std::time::Duration::from_millis(20),
+            "失联时长必须继续增长（起点不能被重置）：first={first:?} second={second:?}"
+        );
     }
 
     #[test]

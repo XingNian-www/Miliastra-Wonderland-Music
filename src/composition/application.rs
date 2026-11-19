@@ -276,6 +276,8 @@ impl ResolvedApplicationConfig {
                     .startup
                     .wonderland_confirm_stable_timeout_ms,
                 final_primary_timeout_ms: app.startup.final_primary_timeout_ms,
+                loading_restart_timeout_ms: app.startup.loading_restart_timeout_ms,
+                restart_game_on_loading: app.startup.restart_game_on_loading,
                 poll_ms: app.startup.poll_ms,
                 stable_mean_threshold: app.startup.stable_mean_threshold,
                 stable_changed_ratio_threshold: app.startup.stable_changed_ratio_threshold,

@@ -129,9 +129,11 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "startup.enabled",
     "startup.enter_game",
     "startup.enter_wonderland",
-    // 外部聊天源：仅连接参数实时，其余（开关/url/token/自动启动/路径/uid）保留旧值。
+    // 外部聊天源：仅连接参数与失联重启两项实时，
+    // 其余（开关/url/token/自动启动/路径/uid）保留旧值。
     "chat_source.reconnect_ms",
     "chat_source.lease_timeout_ms",
+    "chat_source.disconnect_action",
     // task-28：task-27 已完成接线（消费方读 live 快照）。
     "ai_chat.cooldown_seconds",
     "moderation.stable_vote_samples",
@@ -478,6 +480,7 @@ impl LiveConfigs {
         let mut chat_source = effective.chat_source.clone();
         chat_source.reconnect_ms = config.chat_source.reconnect_ms;
         chat_source.lease_timeout_ms = config.chat_source.lease_timeout_ms;
+        chat_source.disconnect_action = config.chat_source.disconnect_action;
         effective.chat_source = chat_source;
         // tts：只实时 Live 字段；endpoint/api_key 保留旧值（IdleReload）。
         let mut tts = config.tts.clone();
@@ -1001,6 +1004,7 @@ mod tests {
             ("timing.decision.poll_ms", json!(2_100)),
             ("chat_source.reconnect_ms", json!(4_321)),
             ("chat_source.lease_timeout_ms", json!(54_321)),
+            ("chat_source.disconnect_action", json!("restart_game")),
         ];
         for (path, value) in &live_values {
             assert_ne!(

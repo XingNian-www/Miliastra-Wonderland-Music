@@ -278,56 +278,114 @@ pub(crate) fn is_listening(url: &str) -> bool {
 }
 
 /// 定位 ChatBridge 可执行文件。
+///
+/// 搜索策略（用户要求：**直接递归扫描 bin 路径与同级路径**，不再猜目录名）：
+///   1. 先看 `chat_source.executable` 手填值；
+///   2. 否则从 BOT 自己的可执行文件所在目录出发，递归扫描该目录的
+///      `bin` 子目录（发布包把依赖统一放 deps/bin）**以及它的每个同级目录**
+///      （用户常把解压出来的带版本号发布包放在 BOT 旁边，目录名不可预知）。
+///
+/// 递归有深度上限与结果上限：解压目录里常有成千上万个文件，无界递归会在
+/// 每次重连时卡住调用线程（这条路径在外部聊天源的重连循环里）。
 fn locate_executable(config: &ChatSourceConfig) -> Option<PathBuf> {
     let explicit = config.executable.trim();
     if !explicit.is_empty() {
         let path = PathBuf::from(explicit);
-        return path.is_file().then_some(path);
+        if path.is_file() {
+            return Some(path);
+        }
+        // 手填值无效时继续走自动扫描，但必须留痕：否则用户会以为填的路径生效了，
+        // 实际跑起来的是扫描到的另一份 exe，排查时完全看不出。
     }
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let parent = exe_dir.parent()?.to_path_buf();
-    // 常见布局：发布包统一放 deps/bin（与 login_helper 一致），
-    // 其次是 BOT 目录旁的解压目录，或与 BOT 同级的同名目录。
-    // 发布包目录名带版本号（Miliastra-Wonderland-ChatBridge-v0.1.0-win-x64），
-    // 解压后目录名无法预知，所以额外扫描父目录下已解压的发布包目录。
-    let mut candidates = vec![
-        exe_dir.join("deps").join("bin").join(CHATBRIDGE_EXE),
-        exe_dir
-            .join("Miliastra-Wonderland-ChatBridge")
-            .join(CHATBRIDGE_EXE),
-        exe_dir.join(CHATBRIDGE_EXE),
-        parent.join("deps").join("bin").join(CHATBRIDGE_EXE),
-        parent
-            .join("Miliastra-Wonderland-ChatBridge")
-            .join(CHATBRIDGE_EXE),
-    ];
-    candidates.extend(published_candidates(&parent));
-    candidates.into_iter().find(|path| path.is_file())
+    let parent = exe_dir.parent().map(Path::to_path_buf);
+    search_roots(&exe_dir, parent.as_deref())
+        .into_iter()
+        .find_map(|root| find_chatbridge_under(&root))
 }
 
-/// 扫描目录下一层，找出解压出来的发布包目录里的可执行文件。
+/// 待扫描的根目录：自己的目录、它的 `bin` 子目录、以及每个同级目录。
 ///
-/// 发布包目录名带版本号（Miliastra-Wonderland-ChatBridge-v0.1.0-win-x64），
-/// 用户通常是整个解压到 BOT 旁边，写死目录名会漏掉。
-fn published_candidates(parent: &std::path::Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return Vec::new();
+/// 顺序即优先级：越靠近 BOT 自己的目录越可能是用户刚放下的那份。
+fn search_roots(exe_dir: &Path, parent: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push = |path: PathBuf| {
+        if path.is_dir() && !roots.contains(&path) {
+            roots.push(path);
+        }
     };
-    let mut found: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("Miliastra-Wonderland-ChatBridge")
-        })
-        .map(|entry| entry.path().join(CHATBRIDGE_EXE))
-        .filter(|path| path.is_file())
-        .collect();
-    // 目录顺序来自文件系统，不稳定；排序让"多个版本都存在"时的选择可复现。
-    found.sort();
-    found
+    push(exe_dir.to_path_buf());
+    // `deps/bin`：发布包的依赖布局（与 login_helper 一致）。
+    push(exe_dir.join("deps").join("bin"));
+    // 同级路径：既包括 exe_dir 的 `bin`，也包括父目录下的每个同级目录。
+    push(exe_dir.join("bin"));
+    if let Some(parent) = parent {
+        // 不把 parent 本身当扫描根：那会连磁盘上整层目录树一起递归，
+        // 而这条路径在外部聊天源的重连循环里，卡顿会直接影响收消息。
+        // 只扫 parent 的直接子目录（含它们的 bin/）。
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            let mut siblings: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path())
+                .collect();
+            // read_dir 顺序不稳定：排序让"多份都存在"时的选择可复现。
+            siblings.sort();
+            for sibling in siblings {
+                push(sibling.clone());
+                push(sibling.join("bin"));
+            }
+        }
+    }
+    roots
+}
+
+/// 在 `root` 下递归找 ChatBridge 可执行文件。
+///
+/// 先看自身，再按名字排序的广度优先递归：浅层命中优先（用户手放的通常在外层），
+/// 同时限制深度与访问量，避免在大目录里长时间阻塞调用线程。
+fn find_chatbridge_under(root: &Path) -> Option<PathBuf> {
+    const MAX_DEPTH: usize = 6;
+    const MAX_ENTRIES: usize = 20_000;
+
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0_usize)]);
+    let mut visited = 0_usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = Vec::new();
+        for entry in entries.filter_map(Result::ok) {
+            visited += 1;
+            if visited > MAX_ENTRIES {
+                // 超预算就放弃本次扫描（此时还没命中，等价于没找到）。
+                return None;
+            }
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_file())
+                && path.file_name().is_some_and(|name| {
+                    name.eq_ignore_ascii_case(CHATBRIDGE_EXE)
+                })
+            {
+                // 浅层优先（BFS）：第一个命中的就是最优。
+                return Some(path);
+            }
+            // 跳过与发布包无关的超大目录：预算有限，进去只会拖慢扫描。
+            let skip = path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                matches!(
+                    name.as_ref(),
+                    "target" | "node_modules" | ".git" | ".svn" | "__pycache__" | "obj"
+                )
+            });
+            if !skip && depth < MAX_DEPTH && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                children.push(path);
+            }
+        }
+        children.sort();
+        queue.extend(children.into_iter().map(|child| (child, depth + 1)));
+    }
+    None
 }
 
 /// ChatBridge 的 stdout/stderr 日志路径：放在可执行文件旁边，与它自己的
@@ -694,20 +752,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 同级目录里解压出来的发布包（目录名带版本号、还可能再嵌一层）必须被递归找到。
     #[test]
-    fn published_candidates_accepts_versioned_release_dir() {
+    fn recursive_scan_finds_chatbridge_in_a_sibling_release_dir() {
         let root = std::env::temp_dir().join(format!(
-            "miliastra-chatbridge-published-{}",
+            "miliastra-chatbridge-recursive-{}",
             std::process::id()
         ));
+        let bot = root.join("bot");
         let release = root.join("Miliastra-Wonderland-ChatBridge-v0.1.0-win-x64");
-        std::fs::create_dir_all(&release).expect("建发布目录");
-        let exe = release.join(CHATBRIDGE_EXE);
+        let nested = release.join("runtimes").join("win-x64");
+        std::fs::create_dir_all(&bot).expect("建 bot 目录");
+        std::fs::create_dir_all(&nested).expect("建嵌套目录");
+        let exe = nested.join(CHATBRIDGE_EXE);
         std::fs::write(&exe, b"stub").expect("写占位 exe");
 
-        let found = published_candidates(&root);
+        let roots = search_roots(&bot, Some(&root));
+        let found = roots.iter().find_map(|dir| find_chatbridge_under(dir));
 
-        assert_eq!(found, vec![exe]);
+        assert_eq!(found, Some(exe), "应递归扫到同级发布包内的可执行文件");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `bin` 子目录（含 exe 同级的 bin 与 deps/bin）也在扫描范围内。
+    #[test]
+    fn recursive_scan_covers_bin_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "miliastra-chatbridge-bin-{}",
+            std::process::id()
+        ));
+        let bot = root.join("bot");
+        let deps_bin = bot.join("deps").join("bin");
+        std::fs::create_dir_all(&deps_bin).expect("建 deps/bin");
+        let exe = deps_bin.join(CHATBRIDGE_EXE);
+        std::fs::write(&exe, b"stub").expect("写占位 exe");
+
+        let roots = search_roots(&bot, Some(&root));
+        assert!(
+            roots.contains(&deps_bin),
+            "deps/bin 必须在扫描根里：{roots:?}"
+        );
+        assert_eq!(
+            roots.iter().find_map(|dir| find_chatbridge_under(dir)),
+            Some(exe)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 文件名大小写不敏感：Windows 上用户可能改成大写，仍应命中。
+    #[test]
+    fn recursive_scan_matches_filename_case_insensitively() {
+        let root = std::env::temp_dir().join(format!(
+            "miliastra-chatbridge-case-{}",
+            std::process::id()
+        ));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("建 bin");
+        let exe = bin.join("Miliastra-Wonderland-ChatBridge.EXE");
+        std::fs::write(&exe, b"stub").expect("写占位 exe");
+
+        assert_eq!(find_chatbridge_under(&root), Some(exe));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 找不到时必须返回 None，而不是 panic 或返回目录。
+    #[test]
+    fn recursive_scan_returns_none_when_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "miliastra-chatbridge-empty-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("建空目录");
+        assert_eq!(find_chatbridge_under(&root), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

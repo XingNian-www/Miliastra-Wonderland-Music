@@ -62,6 +62,26 @@ pub struct ChatSourceConfig {
     /// 填错会导致自己的发言被当成玩家命令。
     #[serde(default)]
     pub self_uid: u32,
+    /// 失联超过 `lease_timeout_ms` 之后做什么。
+    ///
+    /// 两个选项都要求「此前确实连上过」：从没连上过说明是桥本身没起来，
+    /// 重启游戏毫无作用，反而会打断玩家。
+    #[serde(default)]
+    pub disconnect_action: ChatSourceDisconnectAction,
+}
+
+/// 外部聊天源失联后要执行的动作。
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatSourceDisconnectAction {
+    /// 回落到 OCR 聊天识别（默认，历史行为）。
+    #[default]
+    FallbackOcr,
+    /// 自动重启游戏：关闭当前游戏，再交给自动拉起机制重新启动。
+    ///
+    /// 适用场景是「DLL 注入后链路断了」：只有让聊天桥重新创建游戏进程才会
+    /// 重新注入 DLL，光等重连是恢复不了的。
+    RestartGame,
 }
 
 fn default_chat_source_url() -> String {
@@ -87,6 +107,7 @@ impl Default for ChatSourceConfig {
             auto_start: false,
             executable: String::new(),
             self_uid: 0,
+            disconnect_action: ChatSourceDisconnectAction::FallbackOcr,
         }
     }
 }
@@ -120,6 +141,15 @@ impl ChatSourceConfig {
         }
         if self.lease_timeout_ms == 0 {
             bail!("chat_source.lease_timeout_ms 不能为 0");
+        }
+        if self.disconnect_action == ChatSourceDisconnectAction::RestartGame && !self.auto_start {
+            // 只有聊天桥能创建可注入的游戏进程；没开自动启动就没有任何
+            // 「关掉之后还能拉起来」的路径。保存期就挡住，而不是等到失联时
+            // 才发现选了个永远不生效的选项（那时只会留一条告警然后放弃）。
+            bail!(
+                "chat_source.disconnect_action 选择「自动重启游戏」时必须同时开启 chat_source.auto_start，\
+                 否则没有任何可用来自动拉起游戏的路径（只有 Miliastra-Wonderland-ChatBridge 能创建可注入的进程）"
+            );
         }
         if self.auto_start && self.self_uid == 0 {
             bail!(
@@ -413,6 +443,10 @@ impl Default for AppConfig {
                 wonderland_transition_timeout_ms: 4000,
                 wonderland_confirm_stable_timeout_ms: 3000,
                 final_primary_timeout_ms: 10000,
+                // 默认 60s：正常冷启动进世界一般 15~40s，超过一分钟还停在加载
+                // 界面基本就是卡死，此时重启游戏比继续等更有效。
+                loading_restart_timeout_ms: 60_000,
+                restart_game_on_loading: false,
                 poll_ms: 1000,
                 stable_mean_threshold: 2.0,
                 stable_changed_ratio_threshold: 0.01,
@@ -2638,6 +2672,34 @@ stale_timeout_ms: 7500
         assert_eq!(runtime.observation.transport_stable_samples, 2);
     }
 
+    /// **7.6.2 回归守卫（必须）**：存量库（schema_version=4）的 startup 段没有
+    /// 本轮新增的两个键，反序列化必须能补齐默认值。
+    ///
+    /// 裸缺省会让 `serde_json::from_value` 报 `missing field`，而
+    /// `ensure_schema` 在版本号相同时不做迁移 → 升级后**程序无法启动**。
+    /// 单测一度全绿，是因为测试只走已更新的 `test.full.yaml`，没覆盖这条老库路径。
+    #[test]
+    fn startup_section_without_the_new_restart_keys_still_loads() {
+        let mut value = default_config_json();
+        let startup = value
+            .get_mut("startup")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("默认配置必须有 startup 段");
+        startup.remove("loading_restart_timeout_ms");
+        startup.remove("restart_game_on_loading");
+
+        let config: AppConfig =
+            serde_json::from_value(value).expect("缺新键的老配置必须仍能反序列化");
+
+        // 缺键必须补成「功能关闭 + 默认 60 秒」，而不是 u64 的 0
+        //（0 会低于 schema 下限，且开了开关就会立刻触发重启）。
+        assert!(!config.startup.restart_game_on_loading, "缺键时必须默认关闭");
+        assert_eq!(
+            config.startup.loading_restart_timeout_ms, 60_000,
+            "缺键必须补成 60 秒默认值，而不是 0"
+        );
+    }
+
     #[test]
     fn default_app_config_passes_startup_validation() {
         let config: AppConfig =
@@ -2652,6 +2714,38 @@ stale_timeout_ms: 7500
         AppConfig::default()
             .validate()
             .expect("默认配置必须能通过完整校验");
+    }
+
+    /// 「自动重启游戏」必须配 auto_start：否则失联时没有任何拉起路径，
+    /// 选了也永远不生效。保存期就该拦住，而不是失联后只留一条告警。
+    #[test]
+    fn restart_game_disconnect_action_requires_auto_start() {
+        let mut config = AppConfig::default();
+        config.chat_source.enabled = true;
+        config.chat_source.token = "t".to_string();
+        config.chat_source.disconnect_action = ChatSourceDisconnectAction::RestartGame;
+        config.chat_source.auto_start = false;
+        assert!(
+            config.validate().is_err(),
+            "restart_game + 未开 auto_start 必须校验失败"
+        );
+
+        // 开了 auto_start 并填了 self_uid 才能通过。
+        config.chat_source.auto_start = true;
+        config.chat_source.self_uid = 1;
+        config.validate().expect("restart_game + auto_start 应当通过");
+    }
+
+    /// 默认动作是回落 OCR：升级后不能让用户游戏被动重启。
+    #[test]
+    fn default_disconnect_action_keeps_fallback_ocr() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.chat_source.disconnect_action,
+            ChatSourceDisconnectAction::FallbackOcr
+        );
+        // 默认关闭时整段 validate 不检查（enabled=false 提前返回）。
+        config.validate().expect("默认配置必须合法");
     }
 
     #[test]
@@ -2990,6 +3084,15 @@ stale_timeout_ms: 7500
             startup.enter_game_timeout_ms <= ONE_MINUTE_MS,
             "进入游戏阶段上限 {}ms 超过一分钟",
             startup.enter_game_timeout_ms
+        );
+
+        // 加载过久重启：开关打开时，这个阶段的实际观测窗口会被
+        // `enter_game_budget` 放宽到「阈值 + 一次轮询」，所以阈值本身
+        // 不套用「阶段不超过一分钟」这条（用户明确要求默认 60 秒）。
+        // 这里只守住它不为 0，避免"启用但立即触发"这种配置。
+        assert!(
+            startup.loading_restart_timeout_ms > 0,
+            "加载超时阈值必须大于 0"
         );
 
         // 进入千星：各子阶段之和。主菜单大世界等待走 timing.workflow.default_timeout_ms。

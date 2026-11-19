@@ -79,9 +79,40 @@ impl CustomWorkflowConfig {
             for step in &workflow.steps {
                 validate_configured_step(step)?;
             }
+            // 脚本第一步行事在**当前界面**上（包装器是 Passthrough：不观测、
+            // 不导航）。二级值守时界面停在二级聊天，若首个会发输入的步骤没有
+            // 前置驻留保证，按键就会落在完全错位的界面上——这类失败不会报错，
+            // 只会表现为"按了没反应"或误触。
+            //
+            // 这里只告警不拒绝：带驻留步骤是推荐写法（内置工作流都有），
+            // 但用户可能有依赖固定界面的既有脚本，硬拒会让升级后配置直接失效。
+            if workflow_has_input_before_residency(workflow) {
+                log::warn!(
+                    "自定义工作流「{}」在第一个界面驻留步骤之前就会发送输入（按键/点击/文本）；\
+                     二级值守时界面可能不是脚本预期的界面，建议在开头加一个 `ensure_primary` 或 `ensure_current_hall` 步骤",
+                    workflow.name.trim()
+                );
+            }
         }
         Ok(())
     }
+}
+
+/// 首个会发输入的步骤是否出现在任何驻留步骤之前。
+///
+/// "会发输入" = 除纯等待/条件判定之外的步骤；"驻留步骤" = `ensure_primary` /
+/// `ensure_current_hall` / `return_primary`。用于给用户一条可操作的告警，
+/// 不参与合法性判定。
+fn workflow_has_input_before_residency(workflow: &CustomWorkflowDefinition) -> bool {
+    for step in &workflow.steps {
+        match step.step_type.trim() {
+            "ensure_primary" | "ensure_current_hall" | "return_primary" => return false,
+            // 不发输入的步骤：等待、条件、日志之类不改变界面状态。
+            "wait" | "sleep" | "log" => continue,
+            _ => return true,
+        }
+    }
+    false
 }
 
 fn validate_configured_step(step: &CustomWorkflowStep) -> Result<()> {

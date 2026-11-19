@@ -550,6 +550,13 @@ impl ModerationTaskPort for ModerationTaskContext {
     fn sync_listener_state(&self) {}
 }
 
+/// 让 `TemporaryPrimaryHold` 能作为投票期的驻留句柄使用。
+///
+/// 注意：投票阶段**已经不再**需要一级驻留（见 `prepare_vote_hold`，它返回
+/// `NoPrimaryHold`），当前唯一的实际持有者是 `execute_action`，那里用的是
+/// 具体类型而非 trait 对象。保留这个实现是为了让"投票持有驻留"这种接法
+/// 在接口层面依然成立，避免将来想恢复时被类型挡住；**不要**据此认为投票
+/// 现在会占用一级界面。
 impl ModerationPrimaryHold for TemporaryPrimaryHold {
     fn release(&mut self) {
         TemporaryPrimaryHold::release(self);
@@ -570,6 +577,29 @@ impl ModerationCommandPort for ApplicationRuntime {
     }
 
     fn prepare_vote_hold(&mut self) -> Result<Box<dyn ModerationPrimaryHold>> {
+        // 投票是否需要一级界面，**取决于票从哪来**：
+        //
+        // 1. 外部聊天源接管时：完全不需要。此时观察线程在两条布局分支上都
+        //    直接 `external-skip` 返回，**不发布任何帧**（见 `shared_observer`），
+        //    投票靠 `hall_watermark()` + socket 队列（`ModerationVoteContext::open`
+        //    走 `from_external_watermark`），与界面停在哪里无关。这种情况下切一级
+        //    纯属打断玩家的二级聊天视图，还会因为切界面失败（加载/弹窗）让整场
+        //    投票直接作废——这是纯粹的损失。
+        //
+        // 2. 纯 OCR 时：仍然需要一级驻留。投票的基线来自**屏幕上能看到的聊天区**：
+        //    `open` 必须先等到一份新鲜快照（`fresh_snapshot`），而快照由观察线程
+        //    按当前可见布局发布。若二级值守正停在**好友会话**，屏上没有大厅聊天区，
+        //    大厅票永远进不来，连基线都建不起来，投票会以「等待共享聊天管理投票
+        //    基线超时」直接按未通过处理。这里的目标不是身份（身份已按映射判定），
+        //    而是"让大厅聊天区出现在屏幕上"。
+        //
+        // 注意返回的 hold 必须是**类型化占位**而不是 `None`：`execute_result`
+        // 用 `hold.is_none()` 判断是不是"管理员直执行"，返回 None 会让投票通过
+        // 被误当成直执行，绕过 CAS 并改写大厅文案。
+        if self.lifecycle.external_chat.supplies_hall_messages() {
+            log::debug!("外部聊天源接管中，管理投票不需要切到一级界面（票由 socket 推送提供）");
+            return Ok(Box::new(NoPrimaryHold));
+        }
         let mut hold = TemporaryPrimaryHold::new(self.business.business.clone())?;
         if let Err(error) =
             self.establish_ui_residency(UiResidency::Primary, ResidencyPurpose::ListenerModeSwitch)
@@ -579,6 +609,17 @@ impl ModerationCommandPort for ApplicationRuntime {
         }
         Ok(Box::new(hold))
     }
+}
+
+/// 不需要界面驻留的占位实现（投票阶段用）。
+///
+/// 投票只读聊天时间线，不碰游戏界面；保留这个类型是为了满足
+/// [`ModerationPrimaryHold`] 的接口，同时让"投票没有占用一级界面"这件事
+/// 在类型层面显式可见。
+struct NoPrimaryHold;
+
+impl ModerationPrimaryHold for NoPrimaryHold {
+    fn release(&mut self) {}
 }
 
 impl ModerationExecutionPort for ApplicationRuntime {
@@ -591,6 +632,52 @@ impl ModerationExecutionPort for ApplicationRuntime {
             command::ModerationAction::Blacklist => ModerationUiAction::Blacklist,
             command::ModerationAction::BlockChat => ModerationUiAction::BlockChat,
         };
+        // 管理 UI 事务要求入口是**稳定一级大厅**（`UiTaskSpec: RequireTarget`，
+        // 不满足时零按键拒绝），而执行动作确实需要在管理界面里搜索/点击。
+        //
+        // 二级值守时界面停在二级聊天，而管理员直达路径（`hold: None`，见
+        // `reserve_direct_blacklist`）不经过投票流程，没人切过界面，于是必然在
+        // 入口检查处失败——这就是「管理员拉黑必定失败」的根因。
+        //
+        // 投票路径虽然在某些情形下也会切一级（纯 OCR 且未接管时），但那是它的
+        // 副作用，不能作为执行的保证：外部源接管时投票免驻留（见
+        // `prepare_vote_hold`），界面就还停在二级。所以**必须在这里**自己建立
+        // 一级驻留，这是唯一保证管理界面可用的地方。
+        //
+        // `hold` 在函数返回时 Drop，界面随后恢复到执行前的值守模式。
+        //
+        // 失败分类很重要：这里的失败都发生在**业务输入之前**（还没进管理事务，
+        // 一个键都没按），目标账号状态确定没变。因此按 `Ok(false)`「确认未执行」
+        // 上报，让玩家看到"流程出错、可重试"；不能走 `Err` 通道——那条通道的
+        // 文案是「执行结果未知，请勿重复操作」，会把可安全重试的导航失败
+        // 升级成禁止重放，管理员只能人工确认。
+        let mut hold = match TemporaryPrimaryHold::new(self.business.business.clone()) {
+            Ok(hold) => hold,
+            Err(error) => {
+                log::error!(
+                    "{} UID{} 未执行（步骤：准备管理界面驻留），一个按键都没发出，目标账号状态没有变化，可以重试：{error:#}",
+                    command.action.label(),
+                    command.uid
+                );
+                return Ok(false);
+            }
+        };
+        if let Err(error) = self.establish_ui_residency(
+            UiResidency::Primary,
+            ResidencyPurpose::ListenerModeSwitch,
+        ) {
+            hold.release();
+            log::error!(
+                "{} UID{} 未执行（步骤：把界面切到一级大厅），导航阶段没有进入管理界面，目标账号状态没有变化，可以重试：{error:#}",
+                command.action.label(),
+                command.uid
+            );
+            return Ok(false);
+        }
+        // 记下执行前的值守模式：管理事务收尾按入口（一级）归位，而逻辑模式
+        // 可能仍是二级值守。若不显式切回，界面会停在一级，等主循环 5 秒一次的
+        // 驻留恢复轮询才发现不一致——玩家会看到自己的二级聊天视图莫名跳回一级。
+        let previous = self.active_ui_residency().ok();
         let outcome = self
             .ui
             .moderation_ui
@@ -598,6 +685,14 @@ impl ModerationExecutionPort for ApplicationRuntime {
             .context("提交管理 UI 事务")?
             .wait()
             .context("等待管理 UI 事务")?;
+        if let Some(previous) = previous {
+            match self.establish_ui_residency(previous, ResidencyPurpose::ListenerModeSwitch) {
+                Ok(()) => log::debug!("管理操作完成，界面已切回执行前的值守模式"),
+                Err(error) => log::warn!(
+                    "管理操作已完成，但把界面切回执行前的值守模式失败；主循环会在下一次驻留检查时重试：{error:#}"
+                ),
+            }
+        }
         moderation_action_result(command, outcome.effect(), outcome.residency())
     }
 
@@ -860,6 +955,39 @@ impl ApplicationRuntime {
         match moderation.execute_result(task, self)? {
             ModerationResultExecution::Completed => Ok(PendingTaskExecution::Completed),
         }
+    }
+}
+
+#[cfg(test)]
+mod vote_hold_tests {
+    /// 外部源模式下的占位驻留必须是纯空操作。
+    ///
+    /// 外部聊天源接管时观察线程两条布局分支都 `external-skip` 直接返回、
+    /// 不发布帧，票完全靠 socket 队列 + `hall_watermark` 提供，
+    /// 与界面停在哪里无关。`NoPrimaryHold` 必须什么都不做：
+    /// 一旦有人在里面加了导航，"投票不打断玩家视图"就悄悄失效了。
+    #[test]
+    fn no_primary_hold_never_navigates_and_is_idempotent() {
+        use crate::features::moderation::ModerationPrimaryHold;
+        let mut hold = super::NoPrimaryHold;
+        ModerationPrimaryHold::release(&mut hold);
+        ModerationPrimaryHold::release(&mut hold);
+    }
+
+    /// 外部源在线时投票免驻留，离线时必须驻留。
+    ///
+    /// 这条守的是**纯 OCR 部署的正确性**：投票基线来自屏幕上可见的聊天区，
+    /// 二级值守若停在好友会话，屏上没有大厅聊天区，大厅票永远进不来，
+    /// 连基线都建不起来 → 投票会以「基线超时」按未通过处理。
+    /// 所以「免驻留」只能建立在"票来自 socket"这个前提上，不能无条件放开。
+    #[test]
+    fn vote_hold_follows_the_chat_source() {
+        let state = crate::composition::application::external_chat::ExternalChatState::default();
+        // 从未连上：票来自 OCR，必须驻留。
+        assert!(!state.supplies_hall_messages());
+        // 接管后：票来自 socket，不需要驻留。
+        state.mark_active_for_test();
+        assert!(state.supplies_hall_messages());
     }
 }
 

@@ -758,18 +758,20 @@ impl TemplateUiStateClassifier {
         if confirm_probe_log_due() {
             match &button_candidate {
                 Ok(Some(hit)) => log::debug!(
-                    "确认弹窗按钮候选 score={:.4} quality={} threshold={:.3} scale={} region={:?}",
+                    "确认弹窗按钮候选：在{}里找到「确认」按钮，命中位置 ({}, {}) 为 {}×{}，相似度 {:.4}（阈值 {:.3}），{}",
+                    confirm_region_label(panels.confirm_button, button_scale),
+                    hit.x,
+                    hit.y,
+                    hit.width,
+                    hit.height,
                     hit.score,
-                    hit.quality_ok,
                     threshold,
-                    button_scale,
-                    panels.confirm_button
+                    text_match_quality_label(hit.quality_ok)
                 ),
                 Ok(None) => log::debug!(
-                    "确认弹窗按钮无候选 scale={} region={:?} template={:?}",
-                    button_scale,
-                    panels.confirm_button,
-                    self.templates.confirm_button_template
+                    "确认弹窗按钮无候选：在{}里没有找到「确认」按钮，模板「{}」；本帧按没有确认弹窗处理",
+                    confirm_region_label(panels.confirm_button, button_scale),
+                    self.templates.confirm_button_template.display()
                 ),
                 Err(error) => log::debug!("确认弹窗按钮探针失败：{error:#}"),
             }
@@ -780,11 +782,14 @@ impl TemplateUiStateClassifier {
             // 现场需要知道"按钮到底差多少、是不是质量门控拒绝"。
             if button.score >= 0.80 {
                 log::debug!(
-                    "确认弹窗未成立：按钮 score={:.4} quality={} threshold={:.3} rect={:?}",
+                    "确认弹窗未成立：按钮在 ({}, {}) 的 {}×{} 处相似度只有 {:.4}（要求不低于 {:.3}），{}；本帧继续按其它面板判据分类",
+                    button.x,
+                    button.y,
+                    button.width,
+                    button.height,
                     button.score,
-                    button.quality_ok,
                     threshold,
-                    panels.confirm_button
+                    text_match_reject_label(button.quality_ok)
                 );
             }
             return None;
@@ -817,11 +822,12 @@ impl TemplateUiStateClassifier {
             if !message.quality_ok || message.score < CONFIRM_MESSAGE_MIN {
                 if message.score >= 0.90 {
                     log::debug!(
-                        "确认弹窗文案未成立：label={} score={:.4} quality={} threshold={:.3}",
-                        label,
+                        "确认弹窗文案未成立：「{}」在 {}里的相似度只有 {:.4}（要求不低于 {:.3}），{}；本帧不按该子类型分类",
+                        confirm_message_keyword(label),
+                        confirm_region_label(panels.confirm_message, CONFIRM_MESSAGE_SCALE),
                         message.score,
-                        message.quality_ok,
-                        CONFIRM_MESSAGE_MIN
+                        CONFIRM_MESSAGE_MIN,
+                        text_match_reject_label(message.quality_ok)
                     );
                 }
                 continue;
@@ -3119,6 +3125,51 @@ fn confirm_probe_log_due() -> bool {
 
 pub(crate) const CONFIRM_MESSAGE_MIN: f32 = 0.95;
 pub(crate) const CONFIRM_MESSAGE_SCALE: u32 = 2;
+
+/// 确认弹窗诊断日志里的搜索区：位置与尺寸，外加这次实际按几倍下采样在找。
+///
+/// `Rect` 没有 `Display`，直接 `{:?}` 会在日志里留下 `Rect { x: 1, y: 2, ... }`。
+/// 倍数必须写进去：同一块区域在 1× 与 1/2 下的坐标单位不同，只看数字会误判位置。
+///
+/// 返回的是一整段以「搜索区」起头的描述，调用点直接放在「在……里」中间即可，
+/// 不要在前面再写「搜索区」。
+fn confirm_region_label(region: Rect, scale: u32) -> String {
+    format!(
+        "搜索区 ({}, {}) {}×{}（按 {} 倍下采样匹配）",
+        region.x, region.y, region.width, region.height, scale
+    )
+}
+
+/// 文字模板命中的内容质量结论（`TemplateHit::quality_ok`）。
+fn text_match_quality_label(quality_ok: bool) -> &'static str {
+    if quality_ok {
+        "文字内容质量校验通过"
+    } else {
+        "文字内容质量校验未通过"
+    }
+}
+
+/// 确认弹窗锚点不成立的原因：质量门槛与分数门槛是两回事，必须分别说清。
+fn text_match_reject_label(quality_ok: bool) -> &'static str {
+    if quality_ok {
+        "原因是相似度未达阈值，不是文字内容质量不足"
+    } else {
+        "原因是文字内容质量不足，分数再高也不会采纳"
+    }
+}
+
+/// 确认弹窗文案子类型的业务语言。
+///
+/// 三个子类型由命中的关键词模板决定；标签是内部英文标识，直接写进日志
+/// 会让读日志的人看不出是哪句文案。
+fn confirm_message_keyword(label: &str) -> &str {
+    match label {
+        "panel:confirm_block_player" => "屏蔽玩家",
+        "panel:confirm_enter_hall" => "进入随机大厅",
+        "panel:confirm_leave_hall" => "离开大厅",
+        _ => label,
+    }
+}
 
 /// 解析冻结参考，返回 `(x, y, width, height)` 与**参考本体的字节切片**。
 ///

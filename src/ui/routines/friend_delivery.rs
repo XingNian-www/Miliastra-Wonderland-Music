@@ -15,16 +15,16 @@ use crate::config::AppConfig;
 use crate::config::{
     InputTimingConfig, OcrConfig, OutputConfig, PointConfig, ScreenConfig, TemplateConfig,
 };
-use crate::features::emoji::{
-    EMOJI_TAB_TOTAL, EmojiConfig, EmojiSegment, EmojiTag, ParsedReply, normalize_emoji_label,
-    parse_reply,
-};
 use crate::geometry::{Point, Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure,
     UiRoutineProgressStage, UiRuntimeHandle, UiStateKind, UiStateObservation, UiSubmitError,
     sealed,
+};
+use crate::text::emoji::{
+    EMOJI_TAB_TOTAL, EmojiConfig, EmojiSegment, EmojiTag, ParsedReply, normalize_emoji_label,
+    parse_reply,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::locator::secondary_hall_search_rect;

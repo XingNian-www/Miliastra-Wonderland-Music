@@ -261,7 +261,10 @@ mod tests {
         let many = artists(60);
         for budget in [8, 16, 24, 40] {
             let text = chat_artists(&many, budget);
-            assert!(display_width(&text) <= budget, "budget={budget} text={text}");
+            assert!(
+                display_width(&text) <= budget,
+                "budget={budget} text={text}"
+            );
             assert!(text.contains("等60位"), "budget={budget} text={text}");
         }
         let small = chat_artists(&artists(2), 2);
@@ -271,24 +274,13 @@ mod tests {
     #[test]
     fn chat_candidate_line_is_one_line_and_never_drops_the_index() {
         let title = "夜".repeat(73); // 146 显示宽度
-        let line = chat_candidate_line(
-            3,
-            &title,
-            &artists(60),
-            Some("04:12"),
-            CHAT_LAYOUT_BUDGET,
-        );
+        let line = chat_candidate_line(3, &title, &artists(60), Some("04:12"), CHAT_LAYOUT_BUDGET);
         assert!(display_width(&line) <= CHAT_LAYOUT_BUDGET, "{line}");
         assert!(line.starts_with("3. 夜"), "序号与歌名开头必须保留：{line}");
         assert!(!line.contains('\n'));
 
-        let ascii = chat_candidate_line(
-            1,
-            &"A".repeat(160),
-            &artists(10),
-            None,
-            CHAT_LAYOUT_BUDGET,
-        );
+        let ascii =
+            chat_candidate_line(1, &"A".repeat(160), &artists(10), None, CHAT_LAYOUT_BUDGET);
         assert!(display_width(&ascii) <= CHAT_LAYOUT_BUDGET, "{ascii}");
         assert!(ascii.starts_with("1. A"));
         for index in 1..=5 {
@@ -311,16 +303,24 @@ mod tests {
 
     #[test]
     fn single_line_notices_are_recognized() {
-        assert!(is_single_line_notice("甲邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过"));
+        assert!(is_single_line_notice(
+            "甲邀请BOT前往大厅,30s内@邀请确认@邀请拒绝,默认通过"
+        ));
         assert!(is_single_line_notice("甲 执行了切换麦克风状态！"));
         assert!(is_single_line_notice("你的位置：A；你的词语：苹果"));
         assert!(is_single_line_notice("@点歌搜索到:晴天,@确认@跳过@选择"));
         // @状态 行（含音量、以播放状态前缀开头）保持单行。
-        assert!(is_single_line_notice("播放:晴天 - 周杰伦 (1:05/3:05) 音量80  点歌人"));
-        assert!(is_single_line_notice("[某人的歌单] 暂停:晴天 (1:05/3:05) 音量80"));
+        assert!(is_single_line_notice(
+            "播放:晴天 - 周杰伦 (1:05/3:05) 音量80  点歌人"
+        ));
+        assert!(is_single_line_notice(
+            "[某人的歌单] 暂停:晴天 (1:05/3:05) 音量80"
+        ));
         // 歌词/控制台是 prose：必须走自动换行，不能进单行压缩。
         assert!(!is_single_line_notice("歌词: 第一句歌词，第二句歌词。"));
-        assert!(!is_single_line_notice("[控制台]: 这是一段很长的控制台输出文本。"));
+        assert!(!is_single_line_notice(
+            "[控制台]: 这是一段很长的控制台输出文本。"
+        ));
         // 普通 prose 提到「音量」不应被误判为 @状态 行。
         assert!(!is_single_line_notice("这个玩法会显示音量 80 之类的信息"));
         assert!(!is_single_line_notice("这是一段很长的普通玩法说明文字"));
@@ -332,9 +332,11 @@ mod tests {
         assert!(!is_single_line_notice(&lyrics));
         let segments = expand_chat_segments(&lyrics, MAX_SEGMENTS_PER_REPLY);
         assert!(segments.len() > 1, "长歌词必须分段：{segments:?}");
-        assert!(segments
-            .iter()
-            .all(|segment| display_width(segment) <= CHAT_LAYOUT_BUDGET + 2));
+        assert!(
+            segments
+                .iter()
+                .all(|segment| display_width(segment) <= CHAT_LAYOUT_BUDGET + 2)
+        );
         assert!(segments[0].starts_with("歌词:"));
 
         let console = format!("[控制台]: {}", "这是一段很长的控制台输出文本。".repeat(12));
@@ -356,13 +358,15 @@ mod tests {
     #[test]
     fn expand_chat_segments_splits_lines_caps_and_is_idempotent() {
         assert!(expand_chat_segments("   \n  ", 6).is_empty());
-        let long = "这是很长的一段歌词内容，用来验证超过聊天宽度时的自动换行与段数上限。".repeat(12);
+        let long =
+            "这是很长的一段歌词内容，用来验证超过聊天宽度时的自动换行与段数上限。".repeat(12);
         let segments = expand_chat_segments(&long, MAX_SEGMENTS_PER_REPLY);
         assert!(segments.len() <= MAX_SEGMENTS_PER_REPLY);
         assert!(segments.len() > 1);
-        assert!(segments
-            .iter()
-            .all(|segment| !segment.contains('\n') && display_width(segment) <= CHAT_LAYOUT_BUDGET + 2));
+        assert!(
+            segments.iter().all(|segment| !segment.contains('\n')
+                && display_width(segment) <= CHAT_LAYOUT_BUDGET + 2)
+        );
         assert!(
             segments.last().unwrap().contains(TRUNCATED_MARKER),
             "超过上限时最后一段必须带截断标记"

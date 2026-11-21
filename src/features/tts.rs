@@ -904,8 +904,11 @@ impl Drop for TtsRuntime {
         if worker.thread.is_finished() {
             let _ = worker.thread.join();
         } else {
-            // 不阻塞退出；worker 会在当前 HTTP/播放结束后看到 stop 并退出。
-            log::warn!("TTS worker 未在关停时立即结束，已放弃 join 以避免阻塞退出");
+            // 不阻塞退出：语音线程会在当前 HTTP 请求或播放结束后自行看到停止标志并退出。
+            // 不 join 意味着退出时可能还有一段语音在播，这条日志要让人知道这一点。
+            log::warn!(
+                "TTS 关停未等语音线程结束（步骤：发送停止信号后回收线程）：线程仍在处理当前语音请求或播放，已放弃等待以免拖慢退出；程序退出时这段语音可能播不完"
+            );
             drop(worker.thread);
         }
     }

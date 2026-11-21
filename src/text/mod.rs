@@ -1,16 +1,21 @@
-//! 共享文本工具：OCR 归一化、比较键、显示宽度与聊天分片。
+//! 共享文本工具：OCR 归一化、比较键、显示宽度、聊天分片与表情标签。
 //!
 //! 归一化只在这里实现一份，命令锁、聊天比较与身份匹配都必须复用；
 //! 约束见 technical-docs/MUST_READ.md 第 1 节。
+//!
+//! 本层是**叶子层**：只依赖标准库与 serde，不依赖 `config`/`features`/`ui`，
+//! 因此凡是“纯文本语义”（归一化、比较键、排版、表情标签语法）都住在这里，
+//! 供上层任意层复用。
 
 pub(crate) mod chat_layout;
+/// 二级聊天表情标签的纯文本语法与数据模型（解析、归一化、AI 白名单校验）。
+pub(crate) mod emoji;
 
 /// 命令路由与已执行命令去重共用的 OCR 尾部噪声字符。
 pub(crate) const OCR_TRAILING_NOISE: &[char] = &[
     '，', ',', '。', '.', '！', '!', '？', '?', '、', '；', ';', '：', ':', '·', '…', '~', '～',
     '—', '」', '』', '”', '’', '）', ')', '】', ']', ' ', '\t', '　',
 ];
-
 
 /// 归一化聊天文本：**只做不丢信息的修正**，且**空白一律丢弃**。
 ///
@@ -199,12 +204,12 @@ pub(crate) fn split_numbered_chat_message(label: &str, message: &str) -> Vec<Str
     // 标签必须先解析再换行：表情标签是原子消息，不能被宽度切分或截断。
     // 只有含标签前缀时才走展开，普通文本零额外开销。
     if message.contains("{表情包:") {
-        let parts = crate::features::emoji::expand_reply_for_sending(message);
+        let parts = emoji::expand_reply_for_sending(message);
         if parts.len() > 1 {
             return parts
                 .into_iter()
                 .flat_map(|piece| {
-                    if crate::features::emoji::is_tag_only_message(&piece) {
+                    if emoji::is_tag_only_message(&piece) {
                         vec![piece]
                     } else {
                         split_numbered_chat_message_raw(label, &piece)
@@ -333,8 +338,6 @@ mod tests {
         );
         assert_eq!(extract_json_object("完全没有 JSON"), None);
     }
-
-
 
     #[test]
     fn comparison_text_ignores_width_case_whitespace_and_punctuation() {
@@ -548,7 +551,7 @@ mod punctuation_split_tests {
         assert!(
             parts
                 .iter()
-                .filter(|part| !crate::features::emoji::is_tag_only_message(part))
+                .filter(|part| !emoji::is_tag_only_message(part))
                 .map(|part| part.chars().count())
                 .sum::<usize>()
                 == long.chars().count(),

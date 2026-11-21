@@ -1,0 +1,282 @@
+name: Linux 质量门禁（Quality Gate）
+
+# 产品只支持 Windows（src/main.rs 对非 Windows 目标就是 compile_error!），这里**只**验证库目标，
+# 与 build-windows-*.yml 的发版构建完全独立：互不触发、互不依赖。
+#
+# 触发：每次 push / pull_request 都跑，不做发版路径过滤。
+# 现有发版工作流只在“版本号提交”时触发，普通代码提交此前没有任何自动检查，这里补上这一环。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 最小权限：只读仓库内容。工作流不需要 token 写入或发布能力。
+permissions:
+  contents: read
+
+# 同一分支的新运行取代旧运行：push 按分支名分组，PR 按 PR 号分组。
+# 既避免同分支并发跑多份门禁互相拖慢，也避免旧提交的绿灯盖住新提交。
+concurrency:
+  group: quality-gate-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Cargo.lock 里有 git 依赖（rust-paddle-ocr 锁定在 tag v2.3.1）：走 git CLI 拉取，
+  # Swatinem/rust-cache 的 git 依赖缓存才能命中。
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+jobs:
+  # ===========================================================================
+  # 门禁一：前端构建
+  #
+  # 必须独立成 job，不要和 Rust 门禁挤进同一个脚本：GitHub Actions 的 `run:` 以
+  # `bash -e` + `set -eo pipefail` 执行，`cd web && npm ci && npm run build` 之后
+  # 如不显式 cd 回来，同一脚本里后面的 `cargo ...` 会继续在 web/ 下执行，
+  # 直接报 "could not find Cargo.toml"。分开写也让 Rust job 在前端失败时直接跳过。
+  # ===========================================================================
+  web-build:
+    name: 前端构建（web/dist）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          # 门禁只读当前提交，不需要历史。
+          fetch-depth: 1
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          # 与 build-windows-exe.yml 保持一致，避免本地与发版构建出现 Node 版本差异。
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖并构建面板
+        # working-directory 优于在脚本里 cd：每一步起点明确，不会把当前目录泄漏给后续步骤。
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: 校验产物
+        # build.rs 以 web/dist/index.html 作为“面板产物就绪”的唯一判据；
+        # 缺它就是发布出没有面板的 exe。把判据前移到这里，失败信息更直接。
+        run: |
+          test -f web/dist/index.html
+          ls -la web/dist
+
+  # ===========================================================================
+  # 门禁二：仓库脚本（分层方向 / 日志文案 / 入库边界）
+  #
+  # 三个检查都只读 src/、web/src/、scripts/、technical-docs/，不碰网络、不碰工具链，
+  # 因此单独成一个 job 与 Rust 门禁并发跑，反馈更快。
+  # ===========================================================================
+  repo-scripts:
+    name: 代码规范与脚本门禁
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONIOENCODING: utf-8
+      # 不往仓库里写 __pycache__（这些都是单文件脚本，字节码缓存没有收益）。
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: 分层方向检查
+        # 只允许上层依赖下层；规则在 scripts/layer-policy.json，违规时退出码 1 并打印反向边。
+        run: python3 scripts/check-layers.py
+
+      - name: 日志文案检查
+        # 禁止 {:?} 调试格式、字段堆砌、全英文消息等；规则见 technical-docs/logging-style.md。
+        run: python3 scripts/check-log-style.py
+
+      # 隐私扫描不放在这个 job：见 rust-gate 末尾“隐私扫描”一步的说明。
+      - name: 入库边界检查（technical-docs 不得入库）
+        # technical-docs/ 整个目录被 .gitignore 忽略（隐私红线：测试图与真实帧只本地保留）。
+        # 这里确认它没有被误加进索引；命中即失败。
+        run: |
+          if git ls-files --error-unmatch technical-docs >/dev/null 2>&1; then
+            echo "::error::technical-docs/ 不应被提交（隐私红线：测试图与真实帧只本地保留）"
+            exit 1
+          fi
+          echo "technical-docs/ 未纳入索引，符合预期"
+
+  # ===========================================================================
+  # 门禁三：Rust（格式 / 检查 / 单测）+ 隐私扫描
+  #
+  # 两处“全局唯一”的配置集中在这里：
+  #
+  # 1) CARGO_HOME 沙箱。仓库内的 .cargo/config.toml 用 [env] 把 FFMPEG_DIR / MNN_*
+  #    钉到 vendor/ffmpeg/8.1/windows-x64（Windows 预编译库）。cargo 会忽略
+  #    $CARGO_HOME/config.toml，所以让缓存目录充当 CARGO_HOME：路径固定可缓存，
+  #    同时干净地屏蔽仓库内的 Windows 专用 [env]，让 ffmpeg-sys-next 走 pkg-config
+  #    找系统 libav*。任何 `--config` 参数都做不到这一点（cargo 的优先级是
+  #    环境变量 > 仓库内配置 > --config）。
+  #    `--no-default-features` 关掉两个 OCR 后端，Linux 因此完全不需要 MNN / OpenVINO / nasm。
+  #
+  # 2) lld 链接。链接阶段是 Rust 门禁最慢的一环，统一换成 lld。RUSTFLAGS 只在 job 级设置，
+  #    所有 cargo 调用看到同一组参数。rustup 默认工具链自带 rust-lld，GitHub 的 Ubuntu 基础
+  #    镜像也有 ld.lld；`校验系统依赖` 一步会显式确认它的存在。
+  # ===========================================================================
+  rust-gate:
+    name: Rust 门禁（fmt / check / test）
+    runs-on: ubuntu-latest
+    # 本地实测（Linux、--lib、--test-threads=1）：冷编译约 2.5 分钟，2332 个用例一轮 417 秒，
+    # 整个 job 冷启动约 12 分钟；rust-cache 命中后编译阶段基本消失。45 分钟的余量足够覆盖
+    # runner 抖动与串行用例变慢，又不至于让真卡死的运行占满赛道。
+    timeout-minutes: 45
+    needs: web-build
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=lld
+      # 临时 CARGO_HOME（见上方第 1 点）。固定路径保证缓存键与目录稳定。
+      CARGO_HOME: /opt/quality-gate/cargo-home
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          # 门禁用不到历史：cargo fmt/check/test 与隐私扫描都只看当前工作树。
+          fetch-depth: 1
+
+      # ---- 工具链 ----------------------------------------------------------
+      # 不给 toolchain 输入：仓库里有 rust-toolchain.toml（channel = 1.96.0，
+      # components = rustfmt, clippy）。rustup 会按它自动安装并锁定版本，
+      # CI 里不必重复写一遍版本号（写死反而会在改钉版本时悄悄失配）。
+      # 注意：这里与 build-windows-*.yml 的 `dtolnay/rust-toolchain@1.96.0` 不同，是有意的：
+      # 门禁的版本来源只认 rust-toolchain.toml，钉版本时两个工作流会一起跟随。
+      - name: 安装 Rust（按 rust-toolchain.toml 钉版本）
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 校验 Rust 版本与组件
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          pinned=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+          [ -n "$pinned" ] || { echo "::error::rust-toolchain.toml 里没有 channel"; exit 1; }
+          rustc --version | grep -q "^rustc $pinned " \
+            || { echo "::error::rust-toolchain.toml 钉定的版本没有生效"; exit 1; }
+          for component in rustfmt clippy; do
+            rustup component list --installed | grep -qx "$component" \
+              || { echo "::error::缺少 $component 组件"; exit 1; }
+          done
+
+      # ---- Linux 系统依赖 ---------------------------------------------------
+      # 逐个确认过的清单（不是照搬）：
+      #   - cpal -> alsa：编译期需要 libasound2-dev（pkg-config 探针），所有 target 都会编，
+      #     `--lib` 也躲不掉；libasound2（运行时）随之装上；
+      #   - ffmpeg-next -> ffmpeg-sys-next 9.0：`--no-default-features` 只关掉 OCR，
+      #     miliastra-playback 仍依赖它；找不到系统 ffmpeg 时 build.rs 直接 exit(1)；
+      #   - ffmpeg-sys-next -> bindgen 0.72：需要 libclang（预编译产物即可，不必装 clang 本体）；
+      #   - aws-lc-sys（rustls 底层加密库，默认 target 也会编）：构建阶段用 cmake；
+      #   - enigo 0.6 在 Linux 上是纯 Rust（不链接 libxdo）：不装 libxdo-dev。
+      # 是否齐全用显式探针验证，避免 apt 失败或空 apt-get update 时静默放过。
+      - name: 安装 Linux 构建依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            cmake \
+            libclang-dev \
+            libasound2-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswresample-dev
+
+      - name: 校验系统依赖
+        run: |
+          set -euo pipefail
+          command -v pkg-config
+          command -v cmake
+          command -v ld.lld
+          pkg-config --exists alsa
+          pkg-config --exists libavcodec libavformat libavutil libswresample
+          echo "libclang=$(ls /usr/lib/llvm-*/lib/libclang.so* | head -n 1)"
+
+      # ---- 缓存 -------------------------------------------------------------
+      # 缓存键由 action 自动组合：Rust 版本、锁文件哈希、环境与 RUSTFLAGS 等；
+      # 额外的 key 前缀只用来隔离本工作流的缓存，不与 build-windows-* 混用。
+      - name: 缓存 Cargo 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 显式列出两个目录，不依赖 action 对 CARGO_HOME 的隐式推导。
+          workspaces: |
+            . -> target
+            /opt/quality-gate/cargo-home
+          key: linux-quality-gate
+
+      # ---- 前端产物 ---------------------------------------------------------
+      # build.rs 读 web/dist/index.html 生成 panel_assets.rs 并 include_str! 进库：
+      # 产物缺失时只打一条 cargo:warning 并回退空表，**构建照样通过** —— 本地实测确认：
+      # 缺产物时 cargo check 退出码 0，panel_assets.rs 只占 2 行，面板静默消失。
+      # 真到发版才会发现，所以必须先让 web/dist 就绪，再跑任何 cargo 命令。
+      # 这里重新构建而不是从 web-build 传 artifact：让 Rust job 自包含，
+      # 用十几秒的 vite build 换掉一整套 upload/download-artifact，失败原因也更直观。
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端产物（web/dist）
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: 校验前端产物
+        run: test -f web/dist/index.html
+
+      # ---- Rust 门禁 --------------------------------------------------------
+      - name: 格式检查（cargo fmt --all --check）
+        run: cargo fmt --all --check
+
+      - name: 编译检查（cargo check --workspace --lib --no-default-features）
+        # 这里**故意不加** `-D warnings`：
+        # 本仓库 --lib 下仍有约 2,995 条告警（根因是 src/main.rs 对非 Windows 是
+        # compile_error!，二进制目标在 Linux 编不出来，很多 pub(crate) 接口只被它使用）。
+        # 现在加 -D warnings 会让门禁第一天就红，而且是几千条噪音。
+        # 待 Wave 4 把告警清零后，再在这一步追加 `-D warnings` 升级为硬失败。
+        #
+        # 不加 `-D warnings` 不是“放松”：面板产物缺失时 build.rs 只会发一条 cargo:warning，
+        # 编译照样成功 —— 这正是必须在 test 之前显式“校验前端产物”的原因（见上一大步）。
+        run: cargo check --locked --workspace --lib --no-default-features
+
+      - name: 单测（cargo test --lib --no-default-features）
+        # `-- --test-threads=1` 是仓库既定用法（存在进程级 static），必须保留；
+        # 它只让单测之间串行，不影响本步骤之前的前端构建与工具链准备。
+        run: cargo test --locked --lib --no-default-features -- --test-threads=1
+
+      # ---- 隐私扫描（需要远端身份映射，单独守卫）-----------------------------
+      - name: 隐私扫描（scripts/privacy-filter.py --repo --check）
+        # 必须在 cargo 之后：`--repo` 的扫描面包含 technical-docs/（本地工作树，带真实帧与报告），
+        # 那是最可能命中的地方，也正是隐私红线最在意的地方。
+        #
+        # 这个脚本的映射只能从远端面板取（未配置时的默认地址是内网），GitHub 托管 runner
+        # 访问不到，因此它实际有两条结局，不能笼统地“跑一下就算过”：
+        #   - 退出码 1：可能是真有命中，也可能是取不到映射（后者是未捕获的 URLError
+        #     traceback，而不是脚本文档里写的“退出码 2”——本地实测如此）；
+        #   - 退出码 2：映射取到了但为空。
+        # 所以只有“完全没有任何面板配置”时才显式跳过并告警，绝不冒充“零命中”。
+        # 一旦配置了 MILIASTRA_PANEL_URL，失败就是真失败（红灯），不掩盖任何命中。
+        env:
+          MILIASTRA_PANEL_URL: ${{ secrets.MILIASTRA_PANEL_URL }}
+          MILIASTRA_PANEL_TOKEN: ${{ secrets.MILIASTRA_PANEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MILIASTRA_PANEL_URL:-}" ]; then
+            echo "::warning title=隐私扫描未执行::仓库未配置 MILIASTRA_PANEL_URL Secret，runner 访问不到内网面板；本次提交未做隐私扫描，本地仍须跑 scripts/privacy-filter.py --repo --check"
+            exit 0
+          fi
+          python3 scripts/privacy-filter.py --repo --check

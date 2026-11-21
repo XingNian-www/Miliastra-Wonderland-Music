@@ -63,6 +63,37 @@ fn vision_navigation_budget(deadline: Option<Instant>) -> Duration {
     }
 }
 
+/// 一次截图有没有为取一级整帧而离开过当前界面。
+///
+/// 这一个布尔值决定了排查方向：没导航，说明失败发生在「当前界面本来就截不到」；
+/// 导航过，说明失败前后游戏里已经按过键，界面可能停在一级，得看后面的驻留结果。
+fn vision_navigation_label(navigated: bool) -> &'static str {
+    if navigated {
+        "本次为取一级整帧、从二级界面导航过去"
+    } else {
+        "本次未离开当前界面"
+    }
+}
+
+/// 截图之后实际停在哪：把驻留结果译成业务语言，并写明还能不能继续。
+///
+/// `UiResidencyOutcome` 的 `Debug` 会打出内部结构（甚至整条失败对象），
+/// 读日志的人既看不懂也定位不到步骤；这里只保留「停稳在哪」与「没停稳的原因」。
+fn vision_residency_label(residency: &crate::ui::routines::UiResidencyOutcome) -> String {
+    use crate::ui::routines::{UiResidencyOutcome, UiResidencyTarget};
+    match residency {
+        UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary) => {
+            "游戏界面停在千星大厅（一级大厅）".to_string()
+        }
+        UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall) => {
+            "游戏界面已回到二级大厅当前会话".to_string()
+        }
+        UiResidencyOutcome::Failed(failure) => {
+            format!("未确认停稳，恢复驻留时{failure}")
+        }
+    }
+}
+
 const LOOK_CONTEXT_MAX_CHARS: usize = 500;
 
 fn sanitize_look_context(value: &str) -> String {
@@ -205,21 +236,33 @@ impl ApplicationRuntime {
         let outcome = match operation.wait_timeout(budget) {
             Ok(outcome) => outcome,
             Err(error) => {
+                // 超时与「UI 运行时提前结束」是两种原因，日志里必须分开写：
+                // 前者说明截图流程确实没跑完，后者说明结果根本没被回传。
+                let cause = if error.disconnected() {
+                    "UI 运行时没有回传截图结果就停止了（可能已崩溃或操作被丢弃）"
+                } else {
+                    "等待超时"
+                };
                 log::warn!(
-                    "AI 聊天导航截图等待超时（budget={budget:?}）：{error:?}；不假定已返回驻守"
+                    "AI 聊天截图中断（步骤：等待一级截图流程回传结果）：{cause}，本次最多等了 {} 毫秒；由于不知道游戏界面是否已停在千星大厅（一级大厅），本轮按未截图处理，不附带图片",
+                    budget.as_millis()
                 );
                 return VisionCapture::failed(
-                    format!("导航截图等待超时：{error:?}"),
+                    format!("等待一级截图流程回传结果失败：{cause}"),
                     "wait_timeout",
                     false,
                 );
             }
         };
         let navigated = outcome.navigated();
-        let residency = format!("{:?}", outcome.residency());
+        // 存可读描述而不是 `Debug`：它会被拼进日志，也会原样回给模型当 unavailable 原因，
+        // 两处都不该出现内部结构。
+        let residency = vision_residency_label(outcome.residency());
         if let Some(failure) = outcome.failure() {
             log::warn!(
-                "AI 聊天导航截图失败（navigated={navigated} residency={residency}）：{failure}"
+                "AI 聊天截图失败（步骤：导航到千星大厅（一级大厅）并抓取整帧，{}）：{failure}；{}，本轮不附带截图，改用纯文本回复",
+                vision_navigation_label(navigated),
+                residency
             );
             return VisionCapture::failed(failure.to_string(), residency, navigated);
         }
@@ -228,7 +271,9 @@ impl ApplicationRuntime {
             crate::ui::routines::UiResidencyOutcome::Confirmed(_)
         ) {
             log::warn!(
-                "AI 聊天截图成功但返回驻守失败（navigated={navigated} residency={residency}）；按失败降级，不留下二级界面丢失"
+                "AI 聊天截图已取到画面，但收尾时没有确认界面停稳（步骤：截完一级整帧后返回驻守界面，{}）：{}；为避免在未知界面上继续操作，本轮按截图失败处理，改用纯文本回复",
+                vision_navigation_label(navigated),
+                residency
             );
             return VisionCapture::failed(
                 "截图成功但返回驻守失败",
@@ -238,7 +283,9 @@ impl ApplicationRuntime {
         }
         let Some(image) = outcome.image() else {
             log::warn!(
-                "AI 聊天导航截图没有图像（navigated={navigated} residency={residency}）"
+                "AI 聊天截图没有拿到画面（步骤：截取一级整帧，{}）：截图流程既没报错也没给出图像，{}；本轮不附带截图，改用纯文本回复",
+                vision_navigation_label(navigated),
+                residency
             );
             return VisionCapture::failed("没有截图图像", residency, navigated);
         };
@@ -251,11 +298,11 @@ impl ApplicationRuntime {
         match encoded {
             Some(image) => {
                 log::debug!(
-                    "AI 聊天截图已编码：{}x{} bytes={} navigated={} residency={} elapsed_ms={}",
+                    "AI 聊天截图已编码为 JPEG：{}×{}，{} 字节，{}，{}，从提交到编码完成 {} 毫秒",
                     image.width(),
                     image.height(),
                     image.byte_len(),
-                    navigated,
+                    vision_navigation_label(navigated),
                     residency,
                     started.elapsed().as_millis()
                 );
@@ -308,10 +355,12 @@ impl ApplicationRuntime {
             let capture = self.capture_ai_chat_vision_image(config, Some(deadline));
             let Some(image) = capture.image else {
                 log::warn!(
-                    "look 截图失败（navigated={} residency={} failure={:?}）",
-                    capture.navigated,
-                    capture.residency,
-                    capture.failure
+                    "AI 识图：look 拿不到截图（步骤：截图与导航），原因：{}，{}；本次 look 返回 unavailable，由模型改用文字回答",
+                    capture
+                        .failure
+                        .as_deref()
+                        .unwrap_or("截图流程没有给出失败原因"),
+                    capture.residency
                 );
                 return serde_json::json!({
                     "status":"unavailable",

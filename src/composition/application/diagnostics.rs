@@ -43,8 +43,7 @@ impl AppServices {
             }
             WebToolRequest::HallName => {
                 let frame = self.latest_frame()?;
-                let image =
-                    crop_canvas(&frame, self.shared.config.screen.hall_name_rect.into())?;
+                let image = crop_canvas(&frame, self.shared.config.screen.hall_name_rect.into())?;
                 Ok(self.ui.ocr.merged_text(
                     image,
                     self.shared.config.ocr.same_line_y_tolerance,
@@ -68,24 +67,18 @@ impl AppServices {
                     _ => self.shared.config.templates.marker_threshold,
                 };
                 let path = match &template {
-                    WebToolTemplate::BlueMarker => {
-                        self.shared.config.templates.blue_marker.clone()
-                    }
+                    WebToolTemplate::BlueMarker => self.shared.config.templates.blue_marker.clone(),
                     WebToolTemplate::YellowMarker => {
                         self.shared.config.templates.yellow_marker.clone()
                     }
-                    WebToolTemplate::PinkMarker => {
-                        self.shared.config.templates.pink_marker.clone()
-                    }
+                    WebToolTemplate::PinkMarker => self.shared.config.templates.pink_marker.clone(),
                     WebToolTemplate::SecondaryBack => {
                         self.shared.config.templates.secondary_back.clone()
                     }
                     WebToolTemplate::SecondaryHall => {
                         self.shared.config.templates.secondary_hall.clone()
                     }
-                    WebToolTemplate::WorldWish => {
-                        self.shared.config.templates.world_wish.clone()
-                    }
+                    WebToolTemplate::WorldWish => self.shared.config.templates.world_wish.clone(),
                     WebToolTemplate::InviteViewStar => {
                         self.shared.config.templates.invite_view_star.clone()
                     }
@@ -275,10 +268,8 @@ impl AppServices {
         for index in 1..=samples {
             sleep(Duration::from_millis(interval_ms));
             let frame = self.latest_frame()?;
-            let current = rect_chat_change_fingerprint(
-                &frame,
-                self.shared.config.screen.chat_rect.into(),
-            )?;
+            let current =
+                rect_chat_change_fingerprint(&frame, self.shared.config.screen.chat_rect.into())?;
             let stats = change_stats(&previous, &current);
             let changed = stats.mean_abs_diff >= self.shared.config.ocr.change_mean_threshold
                 || stats.changed_ratio >= self.shared.config.ocr.change_pixel_threshold;
@@ -402,8 +393,7 @@ impl AppServices {
             let changed = from_baseline.mean_abs_diff
                 >= self.shared.config.ocr.change_mean_threshold
                 || from_baseline.changed_ratio >= self.shared.config.ocr.change_pixel_threshold;
-            let stable = from_previous.mean_abs_diff
-                < self.shared.config.ocr.change_mean_threshold
+            let stable = from_previous.mean_abs_diff < self.shared.config.ocr.change_mean_threshold
                 && from_previous.changed_ratio < self.shared.config.ocr.change_pixel_threshold;
 
             if changed && stable {
@@ -483,8 +473,9 @@ mod ui_state_tests {
     #[test]
     fn web_tool_ui_state_reads_the_observation_from_the_shared_handle() {
         // 稳定样本数 1：第一帧就产生稳定分类，测试不必等第二次截图。
-        let runtime = UiRuntime::start_with_state_classifier(BlankDevice, 4, AlwaysPrimaryClassifier, 1)
-            .expect("启动 UI 运行时");
+        let runtime =
+            UiRuntime::start_with_state_classifier(BlankDevice, 4, AlwaysPrimaryClassifier, 1)
+                .expect("启动 UI 运行时");
         let handle = runtime.handle();
         let game_ui = GameUi::runtime(handle.clone());
 
@@ -519,21 +510,107 @@ mod ui_state_tests {
         );
         let game_ui = GameUi::runtime(handle.clone());
 
-        let error = capture_ui_state_diagnostic(&game_ui, &handle)
-            .expect_err("没有观察时必须返回错误");
+        let error =
+            capture_ui_state_diagnostic(&game_ui, &handle).expect_err("没有观察时必须返回错误");
         assert!(
             error.to_string().contains("尚未产生模板状态观察"),
             "错误文案要保留既有口径，实际：{error}"
         );
 
         // 截图本身仍然成功：失败的是「没有观察」，不是「读不到画面」。
-        assert!(
-            game_ui.capture().is_ok(),
-            "截图分支不应因为缺少观察而失败"
-        );
+        assert!(game_ui.capture().is_ok(), "截图分支不应因为缺少观察而失败");
         // 让运行时关闭时不与仍在排队的截图竞争。
         std::thread::sleep(Duration::from_millis(10));
         runtime.shutdown().expect("关闭 UI 运行时");
+    }
+
+    /// 分类失败与「还没扫过」是两件事：前者必须**成功返回**诊断文本。
+    ///
+    /// 这是面板诊断里最容易混淆的一处：分类器出错时 `latest_ui_state` 里是
+    /// [`UiStateObservation::Failed`]，不是 `None`。若 `capture_ui_state_diagnostic`
+    /// 把它当成「没有观察」，面板只会收到一句「尚未产生模板状态观察」，
+    /// 真实原因（例如模板文件缺失）被完全掩盖，排查时无从下手。
+    ///
+    /// 因此这里逐条锁死语义：有观察（哪怕是失败观察）就必须 `Ok`，
+    /// 且文本里带得出分类器给出的原因。
+    #[test]
+    fn web_tool_ui_state_reports_a_classification_failure_instead_of_hiding_it() {
+        struct FailingClassifier;
+
+        impl crate::runtime::ui::UiStateClassifier for FailingClassifier {
+            fn classify(&mut self, _image: &DynamicImage) -> Result<UiStateClassification> {
+                anyhow::bail!("模板文件缺失")
+            }
+        }
+
+        let runtime = UiRuntime::start_with_state_classifier(BlankDevice, 4, FailingClassifier, 1)
+            .expect("启动 UI 运行时");
+        let handle = runtime.handle();
+        let game_ui = GameUi::runtime(handle.clone());
+
+        let diagnostic = capture_ui_state_diagnostic(&game_ui, &handle)
+            .expect("有失败观察时必须如实返回诊断文本，而不是报「没有观察」");
+        assert!(
+            diagnostic.contains("ui-state-error"),
+            "失败观察的诊断必须以 ui-state-error 开头，实际：{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("模板文件缺失"),
+            "分类失败原因必须原样带出，实际：{diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("尚未产生模板状态观察"),
+            "失败观察不能被误报成「还没有观察」，实际：{diagnostic}"
+        );
+        assert!(
+            matches!(
+                handle.latest_ui_state(),
+                Some(UiStateObservation::Failed { .. })
+            ),
+            "分类失败必须落成失败观察，面板才能区分缺证据与缺模板"
+        );
+
+        runtime.shutdown().expect("关闭 UI 运行时");
+    }
+
+    /// 接线锁定：`WebToolRequest::UiState` 只允许读**共享**的两个句柄。
+    ///
+    /// 类型层面已经堵死了老缺陷的一半：`AppServices` 里根本没有 `owned` 字段，
+    /// 读不到主循环独占的 `UiRuntime`。但「再加一个字段把运行时塞回共享服务」
+    /// 这种回退是能通过编译的，所以这里把派发点的实参写成断言：
+    ///
+    /// - 必须调 `capture_ui_state_diagnostic(&self.ui.game_ui, &self.ui.ui_handle)`；
+    /// - 不允许出现 `ui_runtime`（拥有型运行时在任务上下文里恒不可用）。
+    ///
+    /// 源码级断言不是风格洁癖：这条分支曾经就是「面板永远报没有观察」的根因，
+    /// 而它的回归不会产生任何编译错误或运行时 panic，只有面板功能静默失效。
+    #[test]
+    fn web_tool_ui_state_dispatch_reads_only_the_shared_handles() {
+        const SOURCE: &str = include_str!("diagnostics.rs");
+        let arm = SOURCE
+            .split("WebToolRequest::UiState =>")
+            .nth(1)
+            .expect("派发点必须保留 UiState 分支");
+        let arm = &arm[..arm.find('}').expect("分支必须是一条表达式")];
+        assert!(
+            arm.contains("capture_ui_state_diagnostic(&self.ui.game_ui, &self.ui.ui_handle)"),
+            "UiState 必须读取共享的 game_ui 与 ui_handle，实际分支：{arm}"
+        );
+
+        // 注释里**必须**留着旧字段名（那是这条缺陷的由来），所以只检查代码行。
+        // 待查词本身也要拼出来：写成字面量会让本测试自己的这一行成为命中项。
+        let forbidden = concat!("ui_", "runtime");
+        let offenders: Vec<&str> = SOURCE
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| line.contains(forbidden))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "诊断模块的代码不得引用拥有型运行时（它在正式任务上下文里不可用，\
+旧实现正是因此让 /tools/ui-state 必然失败）：{offenders:?}"
+        );
     }
 
     /// 截图失败必须原样冒泡：面板要能看到真实原因，而不是被「没有观察」掩盖。
@@ -547,19 +624,15 @@ mod ui_state_tests {
             }
         }
 
-        let runtime = UiRuntime::start_with_state_classifier(
-            FailingDevice,
-            4,
-            AlwaysPrimaryClassifier,
-            1,
-        )
-        .expect("启动 UI 运行时");
+        let runtime =
+            UiRuntime::start_with_state_classifier(FailingDevice, 4, AlwaysPrimaryClassifier, 1)
+                .expect("启动 UI 运行时");
         let handle = runtime.handle();
         let game_ui = GameUi::runtime(handle.clone());
 
         // 直接走生产函数：失败原因必须冒泡，不能静默变成「没有观察」。
-        let error = capture_ui_state_diagnostic(&game_ui, &handle)
-            .expect_err("截图失败时必须返回错误");
+        let error =
+            capture_ui_state_diagnostic(&game_ui, &handle).expect_err("截图失败时必须返回错误");
         let text = format!("{error:#}");
         assert!(
             text.contains("simulated capture failure"),

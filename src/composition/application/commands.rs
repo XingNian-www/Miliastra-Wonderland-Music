@@ -75,10 +75,7 @@ fn required_message(required: IdentityRole) -> &'static str {
 ///
 /// 注意用 `role_of_sender` 现场解析，不用 `parsed.role` 快照：队列等待期间
 /// 身份映射可能已经变化，执行期必须读当前值（与 `command_is_disabled` 同口径）。
-fn playlist_command_allows_friend(
-    runtime: &AppServices,
-    parsed: &RoutedCommand,
-) -> bool {
+fn playlist_command_allows_friend(runtime: &AppServices, parsed: &RoutedCommand) -> bool {
     let snapshot = runtime.shared.live_configs.snapshot();
     // 现场解析，不用 parsed.role 快照：队列等待期间身份映射可能已经变化。
     let role = runtime
@@ -537,9 +534,7 @@ impl AppServices {
             ModuleCommand::Tarot(command) => self.execute_tarot_intent(parsed, command),
             ModuleCommand::Playlist(command) => self.execute_playlist_intent(parsed, command),
             ModuleCommand::Undercover(command) => self.execute_undercover_intent(parsed, command),
-            ModuleCommand::NumberBomb(command) => {
-                self.execute_number_bomb_intent(parsed, command)
-            }
+            ModuleCommand::NumberBomb(command) => self.execute_number_bomb_intent(parsed, command),
             ModuleCommand::Invite(command) => self.execute_invite_intent(parsed, command),
             ModuleCommand::Moderation(command) => self.execute_moderation_intent(parsed, command),
             ModuleCommand::CustomWorkflow(command) => {
@@ -846,17 +841,13 @@ impl AppServices {
         // 备注串是屏幕显示名、真实昵称是聊天桥给的资料包昵称，两者都可能在
         // 好友列表上出现，所以候选名要一起给。
         if let Some(account) = parsed.account.as_ref() {
-            let names = self
-                .shared
-                .live_configs
-                .identity
-                .friend_search_names(
-                    &parsed.username,
-                    parsed
-                        .account
-                        .as_ref()
-                        .map(|account| (account.game.as_str(), account.uid.as_str())),
-                );
+            let names = self.shared.live_configs.identity.friend_search_names(
+                &parsed.username,
+                parsed
+                    .account
+                    .as_ref()
+                    .map(|account| (account.game.as_str(), account.uid.as_str())),
+            );
             if !names.is_empty() {
                 // 不打印真实 UID：它是玩家标识（MUST_READ §9）。
                 log::info!(
@@ -1235,7 +1226,11 @@ fn detect_public_hall(hall_ui: &HallUi) -> Result<Option<HallObservation>> {
             // 判定规则见 HallRoutine：大厅名归一化后与「公共大厅」逐字相等。
             log::debug!(
                 "公共大厅判定：{}（依据：识别到的大厅名为「{}」，与「公共大厅」归一化比对{}）",
-                if *is_public { "是公共大厅" } else { "不是公共大厅" },
+                if *is_public {
+                    "是公共大厅"
+                } else {
+                    "不是公共大厅"
+                },
                 info.name,
                 if *is_public { "一致" } else { "不一致" }
             );
@@ -1304,7 +1299,7 @@ mod tests {
     use super::*;
     use crate::composition::application::listener::CommandGate;
     use crate::features::command::CommandAuthority;
-    use crate::features::command_access::{catalog_policy, CommandPermission};
+    use crate::features::command_access::{CommandPermission, catalog_policy};
 
     /// 构造一个走真实 CommandEnvelope::new 的视频信封（与路由测试同形）。
     fn access_envelope(message_type: &str, command: &str) -> CommandEnvelope {
@@ -1467,10 +1462,7 @@ mod tests {
                 "execute_command 与拦截点文案漂移：{role:?}",
             );
             // 且等于玩家应当看到的字面量
-            assert_eq!(
-                from_execute, expected,
-                "玩家可见文案被意外改写：{role:?}",
-            );
+            assert_eq!(from_execute, expected, "玩家可见文案被意外改写：{role:?}",);
         }
     }
 

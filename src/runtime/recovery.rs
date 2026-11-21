@@ -681,7 +681,12 @@ mod tests {
         let start = Instant::now();
         recovery.begin_loading_watch(1);
 
-        recovery.observe_loading_state(start, true, secs(60), 1);
+        // 这一帧只用来建立加载起点：未到阈值，必须仍在等待而不是触发。
+        let started = recovery.observe_loading_state(start, true, secs(60), 1);
+        let LoadingStuckDecision::Waiting { elapsed } = started else {
+            panic!("刚进入加载界面不能立刻触发重启：{started:?}");
+        };
+        assert_eq!(elapsed, Duration::ZERO);
         let decision = recovery.observe_loading_state(start + secs(60), true, secs(60), 1);
         let LoadingStuckDecision::TriggerRestart {
             attempt,
@@ -762,7 +767,14 @@ mod tests {
             panic!("失联超过阈值且可拉起时必须允许重启：{external:?}");
         };
 
-        recovery.observe_loading_state(start, true, secs(60), 1);
+        // 先建立加载起点；这一帧本身还不能触发（互斥虽被占，但计时也刚起步）。
+        assert!(
+            matches!(
+                recovery.observe_loading_state(start, true, secs(60), 1),
+                LoadingStuckDecision::Waiting { .. }
+            ),
+            "刚进入加载界面时只能等待"
+        );
         let blocked = recovery.observe_loading_state(start + secs(120), true, secs(60), 1);
         assert!(
             matches!(blocked, LoadingStuckDecision::Waiting { .. }),
@@ -788,7 +800,14 @@ mod tests {
         let start = Instant::now();
         recovery.begin_loading_watch(1);
 
-        recovery.observe_loading_state(start, true, secs(60), 1);
+        // 建立加载起点：刚开窗时只能等待，不能立刻消耗预算。
+        assert!(
+            matches!(
+                recovery.observe_loading_state(start, true, secs(60), 1),
+                LoadingStuckDecision::Waiting { .. }
+            ),
+            "刚进入加载界面时只能等待"
+        );
         let first = recovery.observe_loading_state(start + secs(60), true, secs(60), 1);
         let LoadingStuckDecision::TriggerRestart { lease, .. } = first else {
             panic!("第一次必须触发：{first:?}");
@@ -810,7 +829,14 @@ mod tests {
         // 下一次启动任务是独立预算，不能被上一次的计数泄漏限制。
         recovery.begin_loading_watch(1);
         assert_eq!(recovery.loading_restart_attempts(), 0);
-        recovery.observe_loading_state(start + secs(200), true, secs(60), 1);
+        // 新一轮的起点帧同样只能等待，随后一帧才应拿到完整预算。
+        assert!(
+            matches!(
+                recovery.observe_loading_state(start + secs(200), true, secs(60), 1),
+                LoadingStuckDecision::Waiting { .. }
+            ),
+            "新一轮开窗的第一帧不能立刻触发"
+        );
         let next = recovery.observe_loading_state(start + secs(260), true, secs(60), 1);
         assert!(
             matches!(
@@ -829,7 +855,14 @@ mod tests {
         let start = Instant::now();
         recovery.begin_loading_watch(1);
 
-        recovery.observe_loading_state(start, true, secs(60), 1);
+        // 建立加载起点：这一帧只是计时开始，不能触发。
+        assert!(
+            matches!(
+                recovery.observe_loading_state(start, true, secs(60), 1),
+                LoadingStuckDecision::Waiting { .. }
+            ),
+            "刚进入加载界面时只能等待"
+        );
         let decision = recovery.observe_loading_state(start + secs(60), true, secs(60), 1);
         let LoadingStuckDecision::TriggerRestart { lease, .. } = decision else {
             panic!("到达阈值必须触发：{decision:?}");
@@ -1092,7 +1125,14 @@ mod tests {
         let start = Instant::now();
         recovery.begin_loading_watch(1);
 
-        recovery.observe_loading_state(start, true, secs(1), 1);
+        // 建立加载起点：1 秒阈值下这一帧仍是零耗时，不能触发。
+        assert!(
+            matches!(
+                recovery.observe_loading_state(start, true, secs(1), 1),
+                LoadingStuckDecision::Waiting { .. }
+            ),
+            "刚进入加载界面时只能等待"
+        );
         let first = recovery.observe_loading_state(start + secs(1), true, secs(1), 1);
         let LoadingStuckDecision::TriggerRestart { lease: first, .. } = first else {
             panic!("第一次必须触发：{first:?}");

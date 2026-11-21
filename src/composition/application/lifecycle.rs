@@ -1,5 +1,5 @@
-use super::*;
 use super::ShutdownReason;
+use super::*;
 use crate::RunOutcome;
 use crate::runtime::ui::panic_payload_text;
 
@@ -15,7 +15,9 @@ fn committed_run_result(result: Result<()>, reason: ShutdownReason) -> Result<Ru
     match (result, reason) {
         (Err(error), ShutdownReason::ConfigReload | ShutdownReason::ConfigReloadWithStartup) => {
             // 任务引擎停止接收工作后，进程替代不可逆。即使最后一次转发失败，也要保留看门狗交接信息。
-            log::error!("配置重载已提交，但关停收尾出错（步骤：提交重载后关停各子系统），部分子系统可能没有干净退出：{error:#}");
+            log::error!(
+                "配置重载已提交，但关停收尾出错（步骤：提交重载后关停各子系统），部分子系统可能没有干净退出：{error:#}"
+            );
             Ok(match reason {
                 ShutdownReason::ConfigReload => RunOutcome::Reload,
                 ShutdownReason::ConfigReloadWithStartup => RunOutcome::ReloadWithStartup,
@@ -24,7 +26,9 @@ fn committed_run_result(result: Result<()>, reason: ShutdownReason) -> Result<Ru
         }
         (Err(error), ShutdownReason::UserExit) => {
             // 并发收尾失败不能把用户明确退出变成看门狗错误恢复，重新启动刚被用户停止的进程。
-            log::error!("用户退出已提交，但关停收尾出错（步骤：提交退出后关停各子系统），部分子系统可能没有干净退出：{error:#}");
+            log::error!(
+                "用户退出已提交，但关停收尾出错（步骤：提交退出后关停各子系统），部分子系统可能没有干净退出：{error:#}"
+            );
             Ok(RunOutcome::Stopped)
         }
         (result, ShutdownReason::Running) => result.map(|()| RunOutcome::Stopped),
@@ -84,7 +88,9 @@ impl ApplicationRuntime {
                 Ok(runtime) => self.owned.hotkeys = Some(runtime),
                 // 热键被占用时降级继续运行:退出热键失效,但主流程不受影响。
                 Err(error) => {
-                    log::error!("全局热键注册失败（步骤：注册热键），程序继续运行，但暂停与退出热键本次不可用：{error:#}")
+                    log::error!(
+                        "全局热键注册失败（步骤：注册热键），程序继续运行，但暂停与退出热键本次不可用：{error:#}"
+                    )
                 }
             }
             deferred_chat_sender = Some(self.start_deferred_chat_sender());
@@ -96,17 +102,33 @@ impl ApplicationRuntime {
             )
         })();
         drop(shared_chat_observer.take());
+        // 外部聊天源必须在观察线程**停稳之后**才关：外部源线程退出路径会
+        // `set_active(false)`，此时若观察线程还在跑，它会在关停那一瞬间判定
+        // 「外部源不再接管」而回落到 OCR 扫描——关停期平白多一次截图与识别，
+        // 日志里还会出现误导性的 OCR 噪音。先 join 观察线程，外部源状态就一直
+        // 保持到没有读侧为止。
+        if let Some(external_chat_workers) = self.owned.external_chat_workers.take() {
+            let started = external_chat_workers.started();
+            external_chat_workers.shutdown();
+            if started > 0 {
+                log::info!("外部聊天源后台线程已全部退出（共 {started} 条）");
+            }
+        }
         self.shared.running.store(false, AtomicOrdering::SeqCst);
         if let Err(error) = self.business.task_engine.wake() {
             log::debug!("关停时唤醒任务引擎等待线程失败：{error}");
         }
         if let Err(error) = self.business.background_commands.stop_all() {
-            log::error!("后台命令线程关闭失败（步骤：关停后台命令），可能有命令线程残留，进程退出时会被系统强制回收：{error:#}");
+            log::error!(
+                "后台命令线程关闭失败（步骤：关停后台命令），可能有命令线程残留，进程退出时会被系统强制回收：{error:#}"
+            );
         }
         if let Some(hotkeys) = self.owned.hotkeys.take()
             && let Err(error) = hotkeys.shutdown()
         {
-            log::error!("全局热键线程关闭失败（步骤：关停热键监听），热键可能占用到进程结束：{error:#}");
+            log::error!(
+                "全局热键线程关闭失败（步骤：关停热键监听），热键可能占用到进程结束：{error:#}"
+            );
         }
         if let Some(http_server) = self.owned.http_server.take()
             && let Err(error) = http_server.shutdown()
@@ -140,7 +162,9 @@ impl ApplicationRuntime {
                     "正式任务运行时未在关闭宽限期内结束（步骤：关停正式任务），本次停止等待并继续关闭其他运行时，该任务线程会被强制断开，可能残留未完成的写操作"
                 ),
                 Ok(_) => log::info!("正式任务运行时已正常关闭"),
-                Err(error) => log::error!("正式任务运行时关闭失败（步骤：关停正式任务），可能有任务线程残留：{error:#}"),
+                Err(error) => log::error!(
+                    "正式任务运行时关闭失败（步骤：关停正式任务），可能有任务线程残留：{error:#}"
+                ),
             }
         }
         self.persist_current_chat_listener_mode();
@@ -162,15 +186,21 @@ impl ApplicationRuntime {
                     report.detached()
                 ),
                 Ok(_) => log::info!("UI 运行时已正常关闭"),
-                Err(error) => log::error!("UI 运行时关闭失败（步骤：关停界面运行时），窗口或后台线程可能残留：{error}"),
+                Err(error) => log::error!(
+                    "UI 运行时关闭失败（步骤：关停界面运行时），窗口或后台线程可能残留：{error}"
+                ),
             }
         }
         if let Some(ocr_runtime) = self.owned.ocr_runtime.take() {
             match ocr_runtime.shutdown() {
                 Ok(report) if report.timed_out => {
-                    log::warn!("OCR 运行时关闭等待超时（步骤：等待推理线程退出），底层推理线程已脱离管理，进程退出时会被强制回收");
+                    log::warn!(
+                        "OCR 运行时关闭等待超时（步骤：等待推理线程退出），底层推理线程已脱离管理，进程退出时会被强制回收"
+                    );
                 }
-                Err(error) => log::error!("OCR 运行时关闭失败（步骤：关停文字识别），推理线程可能残留：{error:#}"),
+                Err(error) => log::error!(
+                    "OCR 运行时关闭失败（步骤：关停文字识别），推理线程可能残留：{error:#}"
+                ),
                 _ => {}
             }
         }
@@ -185,7 +215,9 @@ impl ApplicationRuntime {
         if let Some(native_playback) = self.owned.native_playback_runtime.take()
             && let Err(error) = native_playback.shutdown()
         {
-            log::error!("原生播放器关闭失败（步骤：关停原生播放器），音频设备可能仍被占用：{error:#}");
+            log::error!(
+                "原生播放器关闭失败（步骤：关停原生播放器），音频设备可能仍被占用：{error:#}"
+            );
         }
         if let Some(openai_runtime) = self.owned.openai_runtime.take() {
             openai_runtime.shutdown();

@@ -105,11 +105,7 @@ impl SongRequestPort for AppServicesPort<'_> {
 
     fn local_recommend(&self) -> bool {
         // 本地推荐策略在 b8605a5 从 ai 段迁到了 song_ai 段（点歌专属）。
-        self.shared
-            .live_configs
-            .snapshot()
-            .song_ai
-            .local_recommend
+        self.shared.live_configs.snapshot().song_ai.local_recommend
     }
 
     fn local_recommend_min_score(&self) -> f64 {

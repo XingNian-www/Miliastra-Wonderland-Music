@@ -9,8 +9,7 @@ use anyhow::{Context, Result};
 use super::formal_task::FormalTaskClient;
 use super::{
     AppServices, AppServicesPort, PendingTask, PendingTaskExecution, ResidencyPurpose,
-    TemporaryPrimaryHold,
-    UiResidency,
+    TemporaryPrimaryHold, UiResidency,
 };
 use crate::features::command::{ModuleCommand, RoutedCommand};
 use crate::features::identity::{IdentityAccess, IdentityRole};
@@ -663,10 +662,9 @@ impl ModerationExecutionPort for AppServicesPort<'_> {
                 return Ok(false);
             }
         };
-        if let Err(error) = self.establish_ui_residency(
-            UiResidency::Primary,
-            ResidencyPurpose::ListenerModeSwitch,
-        ) {
+        if let Err(error) =
+            self.establish_ui_residency(UiResidency::Primary, ResidencyPurpose::ListenerModeSwitch)
+        {
             hold.release();
             log::error!(
                 "{} UID{} 未执行（步骤：把界面切到一级大厅），导航阶段没有进入管理界面，目标账号状态没有变化，可以重试：{error:#}",
@@ -847,8 +845,7 @@ impl AppServices {
                 config.moderation.required_vote_margin,
             );
         }
-        let requester_role =
-            moderation_requester_role(&self.shared.live_configs.identity, parsed);
+        let requester_role = moderation_requester_role(&self.shared.live_configs.identity, parsed);
         let mut port = self.port();
         match moderation.start(command, requester_role, &mut port)? {
             ModerationStart::Duplicate => Ok(false),

@@ -3019,17 +3019,27 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        assert!(!session_body(&session, false).to_string().contains("image_url"));
+        assert!(
+            !session_body(&session, false)
+                .to_string()
+                .contains("image_url")
+        );
         session.attach_image(image_attachment());
         let attached = session_body(&session, false);
         assert!(attached.to_string().contains("image_url"));
         assert_eq!(
-            session.image_anchor.and_then(|index| session.history.get(index)),
+            session
+                .image_anchor
+                .and_then(|index| session.history.get(index)),
             session.history.last(),
             "图片锚点应指向当前 user 消息"
         );
         session.drop_image();
-        assert!(!session_body(&session, false).to_string().contains("image_url"));
+        assert!(
+            !session_body(&session, false)
+                .to_string()
+                .contains("image_url")
+        );
     }
 
     #[test]

@@ -975,7 +975,11 @@ mod tests {
             "tts.endpoint",
             json!("https://should-not-apply.example"),
         );
-        set_json_path(&mut changed_value, "tts.api_key", json!("should-not-apply-key"));
+        set_json_path(
+            &mut changed_value,
+            "tts.api_key",
+            json!("should-not-apply-key"),
+        );
         let changed: AppConfig =
             serde_json::from_value(changed_value.clone()).expect("改动配置反序列化");
 

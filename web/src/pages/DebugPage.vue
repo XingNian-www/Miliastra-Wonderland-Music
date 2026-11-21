@@ -61,9 +61,8 @@
 
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
-import { readToken } from '../api.js'
-import { getJson, request, requestJson } from '../api.js'
-import { handleAuth, state, toast } from '../store.js'
+import { fetchBlob, fetchRaw, getJson, requestJson } from '../api.js'
+import { handleAuth, toast } from '../store.js'
 
 const tabKey = ref('readonly')
 const WRITE_PATHS = new Set([
@@ -171,16 +170,7 @@ async function run(item) {
   resultOf[key] = { status: '', text: '' }
   try {
     if (item.path === '/debug/screenshot') {
-      const response = await fetch(item.path, { headers: { 'X-Miliastra-Token': readToken() } })
-      if (!response.ok) {
-        if (response.status === 401) {
-          state.needsToken = true
-          state.autoRefresh = false
-          throw new Error('访问令牌无效或已过期，请到设置页重新填写')
-        }
-        throw new Error(`HTTP ${response.status}`)
-      }
-      const blob = await response.blob()
+      const blob = await fetchBlob(item.path)
       if (images[key]) URL.revokeObjectURL(images[key])
       images[key] = URL.createObjectURL(blob)
       resultOf[key] = { status: `图片 ${Math.round(blob.size / 1024)} KB`, text: '' }
@@ -189,7 +179,7 @@ async function run(item) {
     const url = buildUrl(item)
     if (item.path === '/debug/events') {
       // SSE 文本流：不要按 JSON 解析。
-      const text = await request(url)
+      const text = await fetchRaw(url)
       resultOf[key] = { status: 'OK（SSE 文本）', text }
       return
     }
@@ -199,7 +189,7 @@ async function run(item) {
     resultOf[key] = { status: 'OK', text: JSON.stringify(value, null, 2) }
   } catch (error) {
     resultOf[key] = { status: '失败', text: String(error && error.message || error) }
-    toast(`调试接口失败：${error.message || error}`, 'err')
+    if (!handleAuth(error)) toast(`调试接口失败：${error.message || error}`, 'err')
   } finally {
     busy.value = null
   }

@@ -1,5 +1,5 @@
-use super::*;
 use super::moderation::wait_for_chat_baseline;
+use super::*;
 
 impl ChatDecisionReader {
     /// 与 `read_messages` 同一套基线/新鲜度去重规则，但保留观察 id：
@@ -583,9 +583,7 @@ impl AppServices {
         P: Fn(&str) -> bool,
     {
         let deadline = Instant::now()
-            + Duration::from_millis(super::live_decision_timeout_ms(
-                &self.shared.live_configs,
-            ));
+            + Duration::from_millis(super::live_decision_timeout_ms(&self.shared.live_configs));
         self.begin_chat_decision_reader_until(scope, accepts_message_type, is_decision, deadline)
     }
 

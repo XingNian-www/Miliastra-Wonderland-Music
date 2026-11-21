@@ -28,11 +28,7 @@ fn is_image_rejection(error: &anyhow::Error) -> bool {
     image_related && (status || text.contains("invalid") || text.contains("unsupported"))
 }
 
-fn should_retry_without_image(
-    had_image: bool,
-    retry_done: bool,
-    error: &anyhow::Error,
-) -> bool {
+fn should_retry_without_image(had_image: bool, retry_done: bool, error: &anyhow::Error) -> bool {
     had_image && !retry_done && is_image_rejection(error)
 }
 
@@ -58,7 +54,9 @@ impl VisionCapture {
 fn vision_navigation_budget(deadline: Option<Instant>) -> Duration {
     let navigation = Duration::from_millis(crate::features::ai_chat::VISION_NAVIGATION_TIMEOUT_MS);
     match deadline {
-        Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(navigation),
+        Some(deadline) => deadline
+            .saturating_duration_since(Instant::now())
+            .min(navigation),
         None => navigation,
     }
 }
@@ -125,9 +123,7 @@ fn build_look_vision_prompt(
             Some(instruction) => format!(
                 "用户本轮问题：{question}\n视觉子任务：{instruction}\n只提取回答该问题所需的信息。"
             ),
-            None => format!(
-                "用户本轮问题：{question}\n请查看当前画面，提取回答该问题所需的信息。"
-            ),
+            None => format!("用户本轮问题：{question}\n请查看当前画面，提取回答该问题所需的信息。"),
         };
     }
 
@@ -275,11 +271,7 @@ impl AppServices {
                 vision_navigation_label(navigated),
                 residency
             );
-            return VisionCapture::failed(
-                "截图成功但返回驻守失败",
-                residency,
-                navigated,
-            );
+            return VisionCapture::failed("截图成功但返回驻守失败", residency, navigated);
         }
         let Some(image) = outcome.image() else {
             log::warn!(
@@ -331,7 +323,10 @@ impl AppServices {
     ) -> serde_json::Value {
         log::info!(
             "AI 识图：调用 look 工具（instruction 字数 {}）",
-            instruction.map(str::chars).map(Iterator::count).unwrap_or(0)
+            instruction
+                .map(str::chars)
+                .map(Iterator::count)
+                .unwrap_or(0)
         );
         let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
@@ -394,12 +389,7 @@ impl AppServices {
                 return serde_json::json!({"status":"unavailable","reason":"视觉请求不可用"});
             }
         };
-        match session.request(
-            &self.business.ai_chat_openai,
-            max_tokens,
-            remaining,
-            false,
-        ) {
+        match session.request(&self.business.ai_chat_openai, max_tokens, remaining, false) {
             Ok(reply) => {
                 let text = reply.text.trim();
                 if text.is_empty() {
@@ -572,7 +562,8 @@ impl AppServices {
                     prompt
                 };
                 let ai_deadline = Instant::now() + self.business.ai_request_timeout;
-                let mut vision_image = if ai_chat::auto_image_enabled(&config, main_supports_vision) {
+                let mut vision_image = if ai_chat::auto_image_enabled(&config, main_supports_vision)
+                {
                     self.capture_ai_chat_vision_image(&config, Some(ai_deadline))
                         .image
                 } else {
@@ -773,7 +764,9 @@ impl AppServices {
                                             }
                                         }
                                         Err(_) => {
-                                            log::warn!("AI TTS：speak 参数拒绝（Schema 或模型不支持）");
+                                            log::warn!(
+                                                "AI TTS：speak 参数拒绝（Schema 或模型不支持）"
+                                            );
                                             serde_json::json!({
                                                 "status":"rejected",
                                                 "reason":"speak 参数不符合工具 Schema 或当前模型不支持"
@@ -875,15 +868,15 @@ impl AppServices {
                     self.reply_batch(&refs, 0)?;
                     // 文字回复已发送后再入队语音，保证顺序。
                     for (text, options) in pending_speaks.drain(..) {
-                        let text = crate::features::identity::redact_remark_strings(
-                            &text,
-                            &known_remarks,
-                        );
+                        let text =
+                            crate::features::identity::redact_remark_strings(&text, &known_remarks);
                         if text.is_empty() {
                             continue;
                         }
                         if let Err(error) =
-                            self.business.tts.enqueue_with_options(&tts_config, &text, options)
+                            self.business
+                                .tts
+                                .enqueue_with_options(&tts_config, &text, options)
                         {
                             log::warn!("AI 语音入队失败（文字回复已发送）：{error}");
                         }
@@ -1697,16 +1690,18 @@ mod tests {
         assert!(primary.residency.contains("Primary"));
         assert!(primary.failure.is_some());
 
-        let secondary_return_failed =
-            VisionCapture::failed("返回驻守失败", "Failed", true);
+        let secondary_return_failed = VisionCapture::failed("返回驻守失败", "Failed", true);
         assert!(secondary_return_failed.navigated);
         assert_eq!(secondary_return_failed.residency, "Failed");
     }
 
     #[test]
     fn look_vision_prompt_includes_user_question_and_instruction() {
-        let with_instruction =
-            build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), "画面里有人说话吗", Some("提取聊天区域文字"));
+        let with_instruction = build_look_vision_prompt(
+            &crate::features::ai_chat::AiChatConfig::default(),
+            "画面里有人说话吗",
+            Some("提取聊天区域文字"),
+        );
         assert!(with_instruction.contains("用户本轮问题：画面里有人说话吗"));
         assert!(with_instruction.contains("视觉子任务：提取聊天区域文字"));
         assert!(with_instruction.contains("只提取回答该问题所需的信息"));
@@ -1714,29 +1709,51 @@ mod tests {
         let mut custom = crate::features::ai_chat::AiChatConfig::default();
         custom.vision_prompt = "用户问：{{question}}\n{{instruction}}\n只提取所需信息。".into();
         let with_instruction = build_look_vision_prompt(&custom, "画面里有人吗", Some("数人数"));
-        assert!(with_instruction.contains("用户问：画面里有人吗"), "{with_instruction}");
+        assert!(
+            with_instruction.contains("用户问：画面里有人吗"),
+            "{with_instruction}"
+        );
         assert!(with_instruction.contains("数人数"), "{with_instruction}");
         let without = build_look_vision_prompt(&custom, "画面里有人吗", None);
-        assert!(!without.contains("\n\n"), "空 instruction 不能留下空行: {without}");
+        assert!(
+            !without.contains("\n\n"),
+            "空 instruction 不能留下空行: {without}"
+        );
         assert!(without.contains("只提取所需信息"), "{without}");
 
-        let without_instruction = build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), "现在大厅发生了什么", None);
+        let without_instruction = build_look_vision_prompt(
+            &crate::features::ai_chat::AiChatConfig::default(),
+            "现在大厅发生了什么",
+            None,
+        );
         assert!(without_instruction.contains("用户本轮问题：现在大厅发生了什么"));
         assert!(without_instruction.contains("提取回答该问题所需的信息"));
         assert!(!without_instruction.contains("视觉子任务："));
 
         assert_eq!(
-            build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), "  ", Some("看画面")),
+            build_look_vision_prompt(
+                &crate::features::ai_chat::AiChatConfig::default(),
+                "  ",
+                Some("看画面")
+            ),
             "请简要描述当前一级大厅画面。"
         );
 
-        let controlled = build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), "问题\u{7}正文", Some("指令\u{7}内容"));
+        let controlled = build_look_vision_prompt(
+            &crate::features::ai_chat::AiChatConfig::default(),
+            "问题\u{7}正文",
+            Some("指令\u{7}内容"),
+        );
         assert!(!controlled.contains('\u{7}'));
         assert!(controlled.contains("问题正文"));
         assert!(controlled.contains("指令内容"));
 
         let long_question = "问".repeat(LOOK_CONTEXT_MAX_CHARS + 50);
-        let long = build_look_vision_prompt(&crate::features::ai_chat::AiChatConfig::default(), &long_question, None);
+        let long = build_look_vision_prompt(
+            &crate::features::ai_chat::AiChatConfig::default(),
+            &long_question,
+            None,
+        );
         assert!(long.chars().count() < LOOK_CONTEXT_MAX_CHARS + 100);
     }
 
@@ -1752,5 +1769,4 @@ mod tests {
             &anyhow::anyhow!("HTTP 500 model not found")
         ));
     }
-
 }

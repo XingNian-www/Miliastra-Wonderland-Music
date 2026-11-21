@@ -32,23 +32,27 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { clearToken, readToken, request } from '../api.js'
-import { loadStatus, setToken, state } from '../store.js'
+import { loadStatus, setToken, setTheme, state, theme } from '../store.js'
 
 const tokenDraft = ref('')
 const tokenMessage = ref('')
-const light = ref(false)
 
-onMounted(() => {
-  tokenDraft.value = readToken()
-  light.value = document.body.classList.contains('light')
+// 主题只有一份状态（store.theme），这里只是它的复选视图。
+const light = computed({
+  get: () => theme.mode === 'light',
+  set: (value) => setTheme(value ? 'light' : 'dark'),
 })
 
 function applyTheme() {
-  document.body.classList.toggle('light', light.value)
-  localStorage.setItem('miliastraTheme', light.value ? 'light' : 'dark')
+  // v-model 已经写入 store，这里只需要确认 DOM 属性与 store 一致。
+  setTheme(light.value ? 'light' : 'dark')
 }
+
+onMounted(() => {
+  tokenDraft.value = readToken()
+})
 
 async function saveToken() {
   setToken(tokenDraft.value)

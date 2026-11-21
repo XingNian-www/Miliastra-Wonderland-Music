@@ -61,7 +61,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted } from 'vue'
 import { NAV_GROUPS, ROUTES, applyRoute, currentRoute, navigateTo, routeFromHash } from './router.js'
-import { loadStatus, state } from './store.js'
+import { initTheme, loadStatus, state, toggleTheme as flipTheme } from './store.js'
 import ConfigPage from './pages/ConfigPage.vue'
 import AiConfigPage from './pages/AiConfigPage.vue'
 import SettingsPage from './pages/SettingsPage.vue'
@@ -134,15 +134,8 @@ function tick() {
 function toggleRefresh() {
   state.autoRefresh = !state.autoRefresh
 }
-function applyTheme(theme) {
-  const isLight = theme === 'light'
-  document.documentElement.dataset.theme = isLight ? 'light' : 'dark'
-  document.body.classList.toggle('light', isLight)
-  localStorage.setItem('miliastraTheme', isLight ? 'light' : 'dark')
-}
-
 function toggleTheme() {
-  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light')
+  flipTheme()
 }
 
 function onHashChange() {
@@ -150,7 +143,7 @@ function onHashChange() {
 }
 
 onMounted(() => {
-  applyTheme(localStorage.getItem('miliastraTheme') === 'light' ? 'light' : 'dark')
+  initTheme()
   applyRoute(routeFromHash())
   window.addEventListener('hashchange', onHashChange)
   tick()

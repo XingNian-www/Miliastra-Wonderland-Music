@@ -5,13 +5,16 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 
-use super::{
-    CardGameDeadlineKind, CardGameFriendBatchOutcome, CardGameReplyTemplate, LandlordCommand,
-    LandlordConfig, LandlordGame, LandlordOutcome, LandlordPrivateDelivery,
+use super::commands::LandlordCommand;
+use super::config::LandlordConfig;
+use super::deadline::CardGameDeadlineKind;
+use super::landlord::LandlordGame;
+use super::outcome::{
+    CardGameFriendBatchOutcome, CardGameReplyTemplate, LandlordOutcome, LandlordPrivateDelivery,
 };
 use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, EntertainmentState};
 use crate::features::friend_delivery::{
-    FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
+    FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome,
 };
 use miliastra_kernel::identity::{BusinessOperationId, SessionGeneration};
 
@@ -599,13 +602,7 @@ impl CardGameService {
             ensure_operation_capacity(&self.state)?;
             match command {
                 LandlordCommand::Start | LandlordCommand::RunFastStart => (
-                    self.begin_start_in_state(
-                        entertainment,
-                        player,
-                        player_display,
-                        command,
-                        now,
-                    )?,
+                    self.begin_start_in_state(entertainment, player, player_display, command, now)?,
                     false,
                 ),
                 LandlordCommand::Join => {
@@ -648,12 +645,10 @@ impl CardGameService {
                         Self::release_active_card_game(entertainment);
                         return Err(error);
                     }
-                    let outcome = self.state.game.handle_with_display(
-                        player,
-                        player_display,
-                        command,
-                        now,
-                    );
+                    let outcome =
+                        self.state
+                            .game
+                            .handle_with_display(player, player_display, command, now);
                     let action = outcome.action;
                     let Some(message) = outcome.private_reply else {
                         return Ok(CardGameCommandStart::Completed(CardGameCompletion {

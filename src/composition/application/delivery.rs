@@ -107,17 +107,15 @@ impl AppServices {
         if crate::text::chat_layout::is_single_line_notice(message) {
             return match residency {
                 UiResidency::Primary => self.ui.chat_output.send_for_command(message),
-                UiResidency::SecondaryCurrentHall => {
-                    self.ui.chat_output.send_current_chat(message)
-                }
+                UiResidency::SecondaryCurrentHall => self.ui.chat_output.send_current_chat(message),
             };
         }
         match residency {
             UiResidency::Primary => self.ui.chat_output.send_wrapped(message, delay_ms),
-            UiResidency::SecondaryCurrentHall => {
-                self.ui.chat_output
-                    .send_current_chat_wrapped(message, delay_ms)
-            }
+            UiResidency::SecondaryCurrentHall => self
+                .ui
+                .chat_output
+                .send_current_chat_wrapped(message, delay_ms),
         }
     }
 

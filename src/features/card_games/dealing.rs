@@ -2,7 +2,12 @@
 //!
 //! 从 `card_games.rs` 拆出：只关心「怎么发牌、怎么显示」，不涉及出牌规则与对局状态机。
 
-use super::*;
+use super::cards::{Card, Rank};
+use super::landlord::{CardGameVariant, Player};
+use super::outcome::LandlordPrivateDelivery;
+use super::reply_helpers::{keyed_reply, reply};
+use super::rng::SplitMix64;
+use crate::features::reply_template::{ReplyVars, card_games as templates};
 
 pub(super) fn deal(rng: &mut SplitMix64) -> ([Vec<Card>; 3], Vec<Card>) {
     let mut deck = Vec::with_capacity(54);

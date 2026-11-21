@@ -21,6 +21,46 @@ export const state = reactive({
   connectionError: '',
 })
 
+/* ============================================================================
+ * 主题：唯一入口
+ * 面板只有两种主题，也只有一个选择器 `html[data-theme="light"]`（见 tokens.css）。
+ * 任何地方都不要再去操作 body.classList —— 历史上那套 `body.light` 已删除。
+ * ========================================================================== */
+const THEME_KEY = 'miliastraTheme'
+
+export const theme = reactive({ mode: 'dark' })
+
+export function currentTheme() {
+  return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'
+}
+
+export function setTheme(mode) {
+  const next = mode === 'light' ? 'light' : 'dark'
+  document.documentElement.dataset.theme = next
+  theme.mode = next
+  try {
+    localStorage.setItem(THEME_KEY, next)
+  } catch (error) {
+    /* 隐私模式下存储不可用时只影响记忆，不影响本次显示 */
+  }
+  return next
+}
+
+export function toggleTheme() {
+  return setTheme(currentTheme() === 'light' ? 'dark' : 'light')
+}
+
+/** 从 localStorage 恢复主题；首帧前调用，避免闪一下再切换。 */
+export function initTheme() {
+  let stored = ''
+  try {
+    stored = localStorage.getItem(THEME_KEY) || ''
+  } catch (error) {
+    stored = ''
+  }
+  return setTheme(stored === 'light' ? 'light' : 'dark')
+}
+
 export function toast(text, kind = '') {
   state.message = { text: text || '', kind }
   if (text) {

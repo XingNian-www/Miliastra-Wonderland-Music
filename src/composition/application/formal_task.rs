@@ -240,7 +240,8 @@ impl AppServices {
         source: &RoutedCommand,
     ) -> Result<()> {
         // Queued alone emits evidence inside FormalTaskClient; Duplicate stays silent.
-        self.formal_tasks()?.enqueue_with_command_source(task, source)?;
+        self.formal_tasks()?
+            .enqueue_with_command_source(task, source)?;
         Ok(())
     }
 }

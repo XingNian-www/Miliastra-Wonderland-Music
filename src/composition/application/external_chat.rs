@@ -237,9 +237,8 @@ impl ExternalChatState {
             return None;
         }
         let since = self.inner.lost_since_ms.load(Ordering::Acquire);
-        (since != 0).then(|| {
-            std::time::Duration::from_millis(now_millis().saturating_sub(since).max(1))
-        })
+        (since != 0)
+            .then(|| std::time::Duration::from_millis(now_millis().saturating_sub(since).max(1)))
     }
 
     /// 新一次成功握手就解除抑制。
@@ -248,7 +247,9 @@ impl ExternalChatState {
     /// 那一刻就说明游戏回来了。若只在 `set_active(true)` 解除，一旦桥没接上
     /// （DLL 未注入 / 桥没运行），抑制会**永久**生效，把失联重启能力整体关死。
     pub(crate) fn lift_restart_suppression(&self) {
-        self.inner.restart_suppressed.store(false, Ordering::Release);
+        self.inner
+            .restart_suppressed
+            .store(false, Ordering::Release);
         // 解除时如果**仍然**失联（握手成功但游戏还没真正接回来），必须立刻
         // 重新起算：抑制期间把 lost_since_ms 清成了 0，而后续不再有新的
         // `set_active(false)` 来写这个值，失联判定会永久失效。
@@ -285,7 +286,9 @@ impl ExternalChatState {
             self.inner.ever_connected.store(true, Ordering::Release);
             self.inner.lost_since_ms.store(0, Ordering::Release);
             // 重新连上说明游戏已经回来了（手动或自动拉起），解除闲置退出的抑制。
-            self.inner.restart_suppressed.store(false, Ordering::Release);
+            self.inner
+                .restart_suppressed
+                .store(false, Ordering::Release);
         } else if self.inner.ever_connected.load(Ordering::Acquire)
             && self.inner.lost_since_ms.load(Ordering::Acquire) == 0
         {
@@ -603,7 +606,7 @@ impl ExternalChatState {
 ///
 /// 为什么不是一个裸 `AtomicBool` 加轮询：这些线程的等待周期以**分钟**计
 /// （昵称预扫与好友快照都是 60 秒一次）。只置标志的话，`join` 要等到下一次
-/// 轮询才会返回，进程退出会卡住一分钟以上，被迫改用 `detach` 又会留下孤儿线程。
+/// 轮询才会返回，进程退出会卡住一分钟以上，放弃等待又会留下孤儿线程。
 /// 因此这里用「条件变量」：置标志后立刻唤醒所有等待者，等待方毫秒级返回。
 ///
 /// 标志位本身是原子量而不是锁里的字段：WS 读循环要在**每次短读之间**无成本地问
@@ -737,21 +740,6 @@ impl ExternalChatWorkers {
     /// 已启动的后台线程数（`empty()` 为 0）。
     pub(crate) fn started(&self) -> usize {
         self.workers.len()
-    }
-
-    /// 放手不管：不发停止信号，也不等待，线程继续运行。
-    ///
-    /// 这是给「尚未接入关停接线」的过渡调用点用的：丢弃 [`JoinHandle`] 只会让它
-    /// 脱离管理，线程本身照常运行——与没有句柄可等时的历史行为完全一致。
-    ///
-    /// 与 [`Drop`] 的区别必须是明确的：`Drop` 会**发停止信号**让线程退出，
-    /// 而过渡调用点要的是线程继续工作，只是这一次没人等它。
-    // TODO(Wave 1b): 接入 lifecycle.rs 后与 spawn 包装一起移除
-    pub(crate) fn detach(mut self) {
-        // 置成已关闭，避免 Drop 兜底把刚刚启动的线程立刻停掉。
-        self.closed = true;
-        // 丢弃句柄即脱离管理；线程继续运行，进程退出时由系统回收。
-        self.workers.clear();
     }
 
     /// 只发出停止信号：置标志并唤醒所有等待者，**不阻塞**调用方。
@@ -894,30 +882,6 @@ pub(crate) fn spawn_managed(
         handle,
     });
     Ok((state, ExternalChatWorkers::new(shutdown, workers)))
-}
-
-/// 启动外部聊天线程，只返回共享状态。
-///
-/// 过渡期的薄包装：线程照常运行，但没有可等待的句柄（与接入关停接线之前完全一致）。
-/// 关停语义只有一个入口——[`spawn_managed`] 返回的 [`ExternalChatWorkers`]。
-// TODO(Wave 1b): 接入 lifecycle.rs 后移除
-pub(crate) fn spawn(
-    timeline: ChatTimeline,
-    config: ChatSourceConfig,
-    identity_access: Option<crate::features::identity::IdentityAccess>,
-    config_store: Option<crate::config::SharedConfigStore>,
-    live_configs: crate::config::LiveConfigs,
-) -> Result<ExternalChatState> {
-    let (state, workers) = spawn_managed(
-        timeline,
-        config,
-        identity_access,
-        config_store,
-        live_configs,
-    )?;
-    // 必须是 detach 而不是 drop：Drop 会发出停止信号，刚启动的线程会被立刻停掉。
-    workers.detach();
-    Ok(state)
 }
 
 /// 消息消费线程一次投递所需的全部依赖。
@@ -1356,10 +1320,8 @@ fn deliver(delivery: &DeliveryContext<'_>, messages: Vec<ExternalChatMessage>) {
             let incomplete = identity_access
                 .as_ref()
                 .and_then(|identity| {
-                    identity.resolve_account(
-                        miliastra_kernel::chat_source::GAME_GENSHIN,
-                        uid.as_str(),
-                    )
+                    identity
+                        .resolve_account(miliastra_kernel::chat_source::GAME_GENSHIN, uid.as_str())
                 })
                 .is_none_or(|resolved| resolved.real_nickname.trim().is_empty());
             let covered_by_recent_snapshot = state.friends_snapshot_recent()
@@ -1380,7 +1342,9 @@ fn deliver(delivery: &DeliveryContext<'_>, messages: Vec<ExternalChatMessage>) {
     for uid in lookups {
         // 补查线程没起来或已退出：解除在途标记，避免该 UID 永久不再补查。
         // 队列不存在时两种情况一样——把在途标记退回去即可，消息照常投递。
-        let queued = names.as_ref().is_some_and(|names| names.send(uid.clone()).is_ok());
+        let queued = names
+            .as_ref()
+            .is_some_and(|names| names.send(uid.clone()).is_ok());
         if !queued {
             state.finish_name_lookup(&uid, None, None);
         }
@@ -1503,8 +1467,7 @@ fn apply_friend_snapshot(
             }
         }
         let all_absent = present == 0;
-        let all_present_without_remark =
-            absent == 0 && present > 0 && all_present_explicit_null;
+        let all_present_without_remark = absent == 0 && present > 0 && all_present_explicit_null;
         if (all_absent || all_present_without_remark)
             && identity.clear_remark_for_identity(mapping.id)
         {
@@ -1675,19 +1638,13 @@ fn apply_sender_names(
 ) -> bool {
     let mut changed = false;
     if let Some(name) = names.name.as_deref() {
-        changed |= identity.record_real_nickname(
-            miliastra_kernel::chat_source::GAME_GENSHIN,
-            uid,
-            name,
-        );
+        changed |=
+            identity.record_real_nickname(miliastra_kernel::chat_source::GAME_GENSHIN, uid, name);
     }
     // `/names` 只写不删：remark 为空/缺失都不清缓存，删除只由 `/friends complete` 做。
     if let Some(remark) = names.remark.as_deref() {
-        changed |= identity.set_account_remark(
-            miliastra_kernel::chat_source::GAME_GENSHIN,
-            uid,
-            remark,
-        );
+        changed |=
+            identity.set_account_remark(miliastra_kernel::chat_source::GAME_GENSHIN, uid, remark);
     }
     changed
 }
@@ -2313,9 +2270,17 @@ mod tests {
             accounts: Vec::new(),
         };
         // remark 可手填/占位，空值也正常；只有真实昵称缺失才需要贪婪补查。
-        assert!(!needs_greedy_name_refresh(&mapping("abcd1234", "真名甲", true)));
+        assert!(!needs_greedy_name_refresh(&mapping(
+            "abcd1234",
+            "真名甲",
+            true
+        )));
         assert!(!needs_greedy_name_refresh(&mapping("", "真名甲", true)));
-        assert!(!needs_greedy_name_refresh(&mapping("abcd1234", "真名甲", false)));
+        assert!(!needs_greedy_name_refresh(&mapping(
+            "abcd1234",
+            "真名甲",
+            false
+        )));
         assert!(needs_greedy_name_refresh(&mapping("abcd1234", "", true)));
     }
 
@@ -2382,20 +2347,32 @@ mod tests {
         assert_eq!(mappings.len(), 2, "不能自动创建未登记 UID");
         let first = mappings
             .iter()
-            .find(|mapping| mapping.accounts.iter().any(|account| account.uid == "10001"))
+            .find(|mapping| {
+                mapping
+                    .accounts
+                    .iter()
+                    .any(|account| account.uid == "10001")
+            })
             .unwrap();
         assert_eq!(first.real_nickname, "新真名甲");
         assert_eq!(first.remark, "新备注甲");
         let absent = mappings
             .iter()
-            .find(|mapping| mapping.accounts.iter().any(|account| account.uid == "10002"))
+            .find(|mapping| {
+                mapping
+                    .accounts
+                    .iter()
+                    .any(|account| account.uid == "10002")
+            })
             .unwrap();
         assert!(absent.remark.is_empty(), "complete 快照缺席者清备注");
         assert_eq!(absent.real_nickname, "旧真名乙", "保留真实昵称/身份");
-        assert!(!identity
-            .ai_name_pairs()
-            .iter()
-            .any(|pair| pair.left() == "旧备注乙"));
+        assert!(
+            !identity
+                .ai_name_pairs()
+                .iter()
+                .any(|pair| pair.left() == "旧备注乙")
+        );
 
         // complete=false：列表内 remark:null 也不清，缺席者更不动。
         let identity = identity_with_remark("10003");
@@ -2507,12 +2484,20 @@ mod tests {
         let null_only = mappings.iter().find(|m| m.id == ids[null_only]).unwrap();
         assert!(null_only.remark.is_empty(), "全部出现且都 null 才清");
         assert_eq!(
-            mappings.iter().find(|m| m.id == ids[other_game]).unwrap().remark,
+            mappings
+                .iter()
+                .find(|m| m.id == ids[other_game])
+                .unwrap()
+                .remark,
             "旧缓存丙",
             "其他游戏账号跳过"
         );
         assert_eq!(
-            mappings.iter().find(|m| m.id == ids[no_accounts]).unwrap().remark,
+            mappings
+                .iter()
+                .find(|m| m.id == ids[no_accounts])
+                .unwrap()
+                .remark,
             "旧缓存丁",
             "无账号映射跳过"
         );
@@ -2535,7 +2520,11 @@ mod tests {
             "Owner 缺席也由完整快照清空"
         );
         assert_eq!(
-            mappings.iter().find(|m| m.id == ids[missing_remark_field]).unwrap().remark,
+            mappings
+                .iter()
+                .find(|m| m.id == ids[missing_remark_field])
+                .unwrap()
+                .remark,
             "旧缓存戊",
             "remark 字段缺失不得当 null 清"
         );
@@ -2671,7 +2660,10 @@ mod tests {
         };
         let stats = apply_friend_snapshot(&identity, &snapshot);
         assert_eq!(stats.matched, 3);
-        assert_eq!(stats.cleared_absent, 3, "admin null、缺席 admin、friend null 清空");
+        assert_eq!(
+            stats.cleared_absent, 3,
+            "admin null、缺席 admin、friend null 清空"
+        );
         let mappings = identity.snapshot().mappings;
         let by_uid = |uid: &str| {
             mappings
@@ -3154,70 +3146,6 @@ mod tests {
         assert!(!state.is_active());
         assert_eq!(workers.started(), 0, "未启用时不得起任何线程");
         workers.shutdown();
-    }
-
-    /// `spawn` 包装必须让线程**继续运行**，不能一返回就停掉它们。
-    ///
-    /// 这是 Wave 1a 过渡期最容易踩的坑：包装里若直接 `drop(workers)`，
-    /// `Drop` 的兜底停止信号会把刚启动的外部聊天源立刻关掉，
-    /// 表现为「功能静默失效」，而且没有任何报错。
-    #[test]
-    fn spawn_wrapper_keeps_workers_running_instead_of_stopping_them() {
-        let (state, workers) = spawn_managed(
-            ChatTimeline::new(),
-            unreachable_chat_source_config(),
-            None,
-            None,
-            crate::config::LiveConfigs::default(),
-        )
-        .expect("主连接线程应能启动");
-        let flag = workers.shutdown.flag();
-        // 模拟 `spawn` 内部的做法：拿走句柄并放手，不发停止信号。
-        workers.detach();
-        assert!(!state.is_active());
-        assert!(
-            !flag.load(Ordering::Acquire),
-            "detach 不得发出停止信号，否则刚启动的线程会被立刻停掉"
-        );
-    }
-
-    /// `spawn` 包装返回的状态可以正常查询，且线程仍在运行（未被 Drop 兜底停掉）。
-    #[test]
-    fn spawn_wrapper_leaves_the_source_running() {
-        let state = spawn(
-            ChatTimeline::new(),
-            unreachable_chat_source_config(),
-            None,
-            None,
-            crate::config::LiveConfigs::default(),
-        )
-        .expect("主连接线程应能启动");
-        // 端点不可达：不接管 OCR，但线程仍在重连循环里活着。
-        assert!(!state.is_active());
-        thread::sleep(Duration::from_millis(100));
-        assert!(
-            !state.is_active(),
-            "不可达端点在 100 毫秒内不应变成接管状态"
-        );
-    }
-
-    /// 未启用外部源时，`spawn` 包装也返回一份可用的空状态。
-    #[test]
-    fn spawn_wrapper_stays_compatible_when_disabled() {
-        let config = ChatSourceConfig {
-            enabled: false,
-            ..ChatSourceConfig::default()
-        };
-        let state = spawn(
-            ChatTimeline::new(),
-            config,
-            None,
-            None,
-            crate::config::LiveConfigs::default(),
-        )
-        .expect("未启用外部源不是错误");
-        assert!(!state.is_active());
-        assert!(!should_skip_ocr(&state));
     }
 
     /// 一份指向必然连不上的端点的外部聊天源配置。

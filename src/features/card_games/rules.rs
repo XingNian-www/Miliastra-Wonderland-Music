@@ -3,7 +3,12 @@
 //! 从 `card_games.rs` 拆出：纯函数式规则判定（顺子/连对/飞机/炸弹…），
 //! 与对局状态机解耦，便于单独覆盖边界牌型。
 
-use super::*;
+use std::collections::BTreeMap;
+
+use super::cards::{Card, Rank, rank_from_value};
+use super::landlord::CardGameVariant;
+use super::reply_helpers::reply;
+use crate::features::reply_template::{ReplyVars, card_games as templates};
 
 pub(super) fn parse_cards(text: &str) -> Result<Vec<Rank>, String> {
     let compact = text

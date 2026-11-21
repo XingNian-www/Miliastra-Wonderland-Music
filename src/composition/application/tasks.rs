@@ -328,7 +328,9 @@ impl AppServices {
         );
         self.abort_entertainment_for_context_loss("闲置退出即将关闭游戏");
         if let Err(error) = self.playback.player.pause_for_idle_exit() {
-            log::error!("闲置退出时暂停播放器失败（步骤：闲置退出前暂停播放），播放可能自行继续，退出后仍可能出队：{error:#}");
+            log::error!(
+                "闲置退出时暂停播放器失败（步骤：闲置退出前暂停播放），播放可能自行继续，退出后仍可能出队：{error:#}"
+            );
         } else {
             log::info!("闲置退出已暂停播放器，避免退出后自动恢复播放或继续出队");
         }
@@ -341,7 +343,9 @@ impl AppServices {
         match self.ui.game_ui.close_window() {
             Ok(()) => self.invalidate_latest_frame(),
             Err(error) => {
-                log::error!("关闭目标游戏窗口失败（步骤：闲置退出关闭游戏），游戏窗口可能仍然打开：{error:#}");
+                log::error!(
+                    "关闭目标游戏窗口失败（步骤：闲置退出关闭游戏），游戏窗口可能仍然打开：{error:#}"
+                );
             }
         }
         Ok(())
@@ -360,7 +364,8 @@ impl AppServices {
             || !self.shared.live_configs.has_pending_reload()
         {
             self.shared
-                .http_reload.draining()
+                .http_reload
+                .draining()
                 .store(false, AtomicOrdering::SeqCst);
             return false;
         }
@@ -369,13 +374,16 @@ impl AppServices {
             return false;
         }
         *reload_check_after = now + CONFIG_RELOAD_IDLE_CHECK_INTERVAL;
-        let preliminary_requires_playback_idle = self.shared.live_configs
+        let preliminary_requires_playback_idle = self
+            .shared
+            .live_configs
             .pending_reload_requires_playback_idle();
         let preliminary_idle = match self.reload_idle_state() {
             Ok(idle) => idle,
             Err(error) => {
                 self.shared
-                    .http_reload.draining()
+                    .http_reload
+                    .draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("读取闲置重载状态失败，本轮保持运行：{error:#}");
                 return false;
@@ -385,20 +393,23 @@ impl AppServices {
             == ReloadDrainReadiness::Unsafe
         {
             self.shared
-                .http_reload.draining()
+                .http_reload
+                .draining()
                 .store(false, AtomicOrdering::SeqCst);
             return false;
         }
         // 先关闭新的 HTTP 写操作准入，再复查现有请求，避免在读取到 0 后又有
         // 登录、保存或播放器操作进入并被关停打断。
         self.shared
-            .http_reload.draining()
+            .http_reload
+            .draining()
             .store(true, AtomicOrdering::SeqCst);
         let idle = match self.reload_idle_state() {
             Ok(idle) => idle,
             Err(error) => {
                 self.shared
-                    .http_reload.draining()
+                    .http_reload
+                    .draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("进入 HTTP 排空后复查重载状态失败，本轮保持运行：{error:#}");
                 return false;
@@ -407,7 +418,8 @@ impl AppServices {
         match idle.drain_readiness(preliminary_requires_playback_idle) {
             ReloadDrainReadiness::Unsafe => {
                 self.shared
-                    .http_reload.draining()
+                    .http_reload
+                    .draining()
                     .store(false, AtomicOrdering::SeqCst);
                 return false;
             }
@@ -417,13 +429,16 @@ impl AppServices {
 
         // blocker 归零后，所有已获准的保存请求都已完成；此时重新读取累计字段的
         // 最严格屏障，避免并发保存把普通重载升级为播放器重载后仍沿用旧判断。
-        let requires_playback_idle = self.shared.live_configs
+        let requires_playback_idle = self
+            .shared
+            .live_configs
             .pending_reload_requires_playback_idle();
         let mut idle = match self.reload_idle_state() {
             Ok(idle) => idle,
             Err(error) => {
                 self.shared
-                    .http_reload.draining()
+                    .http_reload
+                    .draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("HTTP 排空后复查重载状态失败，本轮保持运行：{error:#}");
                 return false;
@@ -432,7 +447,8 @@ impl AppServices {
         match idle.drain_readiness(requires_playback_idle) {
             ReloadDrainReadiness::Unsafe => {
                 self.shared
-                    .http_reload.draining()
+                    .http_reload
+                    .draining()
                     .store(false, AtomicOrdering::SeqCst);
                 return false;
             }
@@ -443,7 +459,8 @@ impl AppServices {
             Ok(status) => status,
             Err(error) => {
                 self.shared
-                    .http_reload.draining()
+                    .http_reload
+                    .draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("配置重载前刷新播放器状态失败，本轮保持运行：{error:#}");
                 return false;
@@ -453,7 +470,8 @@ impl AppServices {
             Ok(idle) => idle,
             Err(error) => {
                 self.shared
-                    .http_reload.draining()
+                    .http_reload
+                    .draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("刷新播放器状态后复查重载条件失败，本轮保持运行：{error:#}");
                 return false;
@@ -461,14 +479,16 @@ impl AppServices {
         };
         if !idle.is_idle(requires_playback_idle) {
             self.shared
-                .http_reload.draining()
+                .http_reload
+                .draining()
                 .store(false, AtomicOrdering::SeqCst);
             return false;
         }
         // 在封存任务引擎前预留重载结果。用户退出记录的优先级更高，因此可以在此声明前后覆盖它。
         if !self.shared.shutdown.try_claim_config_reload() {
             self.shared
-                .http_reload.draining()
+                .http_reload
+                .draining()
                 .store(false, AtomicOrdering::SeqCst);
             return false;
         }
@@ -478,14 +498,16 @@ impl AppServices {
             Ok(false) => {
                 self.shared.shutdown.release_config_reload_claim();
                 self.shared
-                    .http_reload.draining()
+                    .http_reload
+                    .draining()
                     .store(false, AtomicOrdering::SeqCst);
                 return false;
             }
             Err(error) => {
                 self.shared.shutdown.release_config_reload_claim();
                 self.shared
-                    .http_reload.draining()
+                    .http_reload
+                    .draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("重载关停前原子锁定任务引擎失败，本轮保持运行：{error}");
                 return false;
@@ -536,7 +558,8 @@ impl AppServices {
         let login_helper_idle = !self.playback.login_helper.status().active;
         let http_operations_idle = self
             .shared
-            .http_reload.blockers()
+            .http_reload
+            .blockers()
             .load(AtomicOrdering::SeqCst)
             == 0;
         Ok(ReloadIdleState {
@@ -639,7 +662,9 @@ impl AppServices {
                 Ok(PendingTaskExecution::Completed)
             }
             Err(error) => {
-                log::error!("待处理任务失败（步骤：执行待处理任务「{label}」），该任务已放弃，不会自动重试：{error:#}");
+                log::error!(
+                    "待处理任务失败（步骤：执行待处理任务「{label}」），该任务已放弃，不会自动重试：{error:#}"
+                );
                 Err(error)
             }
         }
@@ -676,7 +701,9 @@ impl AppServices {
             }
             Err(error) => {
                 let command_ms = elapsed_ms(command_started);
-                log::error!("命令执行失败（步骤：执行命令「{command_log}」），这条命令没有生效，玩家不会收到执行结果：{error:#}");
+                log::error!(
+                    "命令执行失败（步骤：执行命令「{command_log}」），这条命令没有生效，玩家不会收到执行结果：{error:#}"
+                );
                 log::info!(target: "timing",
                     "命令执行耗时: command={} success=false total={}ms",
                     command_log,

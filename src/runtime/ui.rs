@@ -325,11 +325,7 @@ impl UiRoutineFailure {
 
     /// 内层例程 panic 的统一失败：输入结果未知，包装器仍会尽力收尾。
     pub(crate) fn panicked(stage: &'static str, payload: &(dyn std::any::Any + Send)) -> Self {
-        Self::new(
-            InputCertainty::Panicked,
-            stage,
-            panic_payload_text(payload),
-        )
+        Self::new(InputCertainty::Panicked, stage, panic_payload_text(payload))
     }
 }
 
@@ -1400,7 +1396,6 @@ impl UiObservationRuntime {
         })
     }
 }
-
 
 /// 把线程 panic 载荷转成可读文本。
 ///
@@ -2991,7 +2986,9 @@ impl CaptureFailureLog {
         let reason = format!("{error:#}");
         if !self.should_report(error) {
             // 同样的失败连续发生：细节留在 debug，不刷主日志。
-            log::debug!("界面运行时按需截图再次失败，失败原因与上一次相同，本条不重复告警：{reason}");
+            log::debug!(
+                "界面运行时按需截图再次失败，失败原因与上一次相同，本条不重复告警：{reason}"
+            );
             return;
         }
         // 游戏窗口不存在是预期状态：游戏没开而已，不是程序错误。
@@ -3171,7 +3168,6 @@ mod tests {
         }
     }
 
-
     /// 失败信息必须说清「哪一步 + 能不能重试 + 为什么」，且面向中文读者。
     ///
     /// 这个 `Display` 会被 composition 层的错误链直接 `to_string()` 后写进日志
@@ -3193,8 +3189,14 @@ mod tests {
             text.contains("输入前失败，可安全重试"),
             "必须说明可以安全重试，实际：{text}"
         );
-        assert!(text.contains("没有找到唯一稳定"), "原因应原样带出，实际：{text}");
-        assert!(!text.contains("locate_friend"), "不应把内部步骤标识写进正文：{text}");
+        assert!(
+            text.contains("没有找到唯一稳定"),
+            "原因应原样带出，实际：{text}"
+        );
+        assert!(
+            !text.contains("locate_friend"),
+            "不应把内部步骤标识写进正文：{text}"
+        );
         assert!(
             !text.contains("{:?}") && !text.contains("UI routine failed"),
             "不得退回英文/调试格式：{text}"
@@ -3223,10 +3225,17 @@ mod tests {
     /// - `before_input_failure("s") / after_input_failure("s") / input_failure("s")`
     /// - `observation_failure(.., "s") / observation_reason(.., "s")`
     /// - `stage: "s"`（结构体字面量）
+    ///
+    /// `friend_delivery` 已拆成「模块根 + 子目录」，模块根只保留配置与事务包装，
+    /// 绝大部分步骤标识现在写在子文件里——所以三个子模块必须各自进扫描表，
+    /// 只读模块根会让拆出去的 stage 全部逃出这条守卫（新增子文件同样要补）。
     #[test]
     fn every_stage_identifier_in_source_has_a_chinese_label() {
         let sources = [
             include_str!("../ui/routines/friend_delivery.rs"),
+            include_str!("../ui/routines/friend_delivery/navigation.rs"),
+            include_str!("../ui/routines/friend_delivery/delivery.rs"),
+            include_str!("../ui/routines/friend_delivery/emoji_panel.rs"),
             include_str!("../ui/routines/invite.rs"),
             include_str!("../ui/routines/startup.rs"),
             include_str!("../ui/routines/custom_action.rs"),

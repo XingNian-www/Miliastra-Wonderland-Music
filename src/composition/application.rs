@@ -440,7 +440,8 @@ pub(crate) struct BusinessServices {
     /// 抽取是 read-modify-write，两次并发会让 remove 失效、新旧事实并存；
     /// 压缩并发会让窄计划覆盖宽计划写出的摘要。冷却门在提问开始时判定，
     /// 而抽取在回复生成后才启动，8s 冷却短于 10s 抽取超时，重叠是常态。
-    pub(super) ai_chat_maintenance_inflight: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
+    pub(super) ai_chat_maintenance_inflight:
+        std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
     pub(super) ai_chat_gate: std::sync::Arc<crate::features::ai_chat::TriggerGate>,
     pub(super) ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
     pub(super) ai_connection: crate::config::ai::AiConfig,
@@ -485,6 +486,13 @@ pub(crate) struct SharedLifecycleServices {
     /// HTTP 重载闸门：只在 HTTP 服务启动时才有真实句柄，
     /// 未启动时是本地占位（计数恒 0、排空恒 false），语义上仍然是「当前没有 HTTP 操作」。
     pub(super) http_reload: HttpReloadGates,
+    /// 进程内唯一一份游戏健康与恢复协调器。
+    ///
+    /// 外部源失联重启（主循环）、加载卡死重启（启动链）、驻留 Esc 探针
+    /// （驻留恢复）原本各自计时与计数，三处会互相打架：一个触发源正在关游戏时
+    /// 另一个也在判定该关。放进这里之后，凡是需要「同一份冷却、互斥与观测」的
+    /// 例程都拿这一份 clone（内部是 `Arc`），不是各建一个 `default()`。
+    pub(super) recovery: crate::runtime::recovery::GameRecoveryCoordinator,
 }
 
 /// HTTP 重载排空闸门的两个共享句柄。
@@ -824,6 +832,12 @@ pub(crate) struct OwnedRuntimes {
     pub(super) formal_task_runtime: Option<FormalTaskRuntime>,
     pub(super) http_server: Option<http::HttpServer>,
     pub(super) openai_runtime: Option<OpenAiRuntime>,
+    /// 外部聊天源四条后台线程的句柄与停止信号。
+    ///
+    /// 与 [`SharedLifecycleServices::external_chat`] 的分工是硬边界：那边只有
+    /// 可克隆的**共享状态**（是否接管 OCR、序号水位），这边是全进程唯一一份
+    /// **所有权**。观察线程读状态，关停序列等线程退出，两者不可能互相替代。
+    pub(super) external_chat_workers: Option<external_chat::ExternalChatWorkers>,
 }
 
 /// 正式任务执行所需的窄上下文。
@@ -1589,7 +1603,9 @@ impl ApplicationRuntime {
             )
             .context("启动原生播放器")?;
         let native_playback = native_playback_runtime.handle();
-        let tts_runtime = Arc::new(crate::features::tts::TtsRuntime::new(native_playback.clone()));
+        let tts_runtime = Arc::new(crate::features::tts::TtsRuntime::new(
+            native_playback.clone(),
+        ));
         // 登录超时每次登录会话开始时读取 live 快照（task-33 注册后即热更新）。
         let live_timeout_source: Arc<dyn Fn() -> u64 + Send + Sync> = {
             let live_configs = live_configs.clone();
@@ -1723,8 +1739,8 @@ impl ApplicationRuntime {
                     friend_panel: config.moderation.friend_panel_region.into(),
                     friend_search_panel: config.moderation.search_panel_region.into(),
                     friend_block_chat: config.moderation.block_chat_region.into(),
-                        confirm_button: config.moderation.confirm_button_region.into(),
-            confirm_message: config.moderation.confirm_message_region.into(),
+                    confirm_button: config.moderation.confirm_button_region.into(),
+                    confirm_message: config.moderation.confirm_message_region.into(),
                     invite_view_star: config.invite.view_star_region.into(),
                     invite_goto_hall: config.invite.goto_hall_region.into(),
                     invite_enter_hall: config.invite.enter_hall_region.into(),
@@ -1738,30 +1754,46 @@ impl ApplicationRuntime {
         )?;
         let ui_handle = ui_runtime.handle();
         let game_ui = GameUi::runtime(ui_handle.clone());
+        // 进程内唯一一份恢复协调器：启动链（加载卡死重启）、驻留恢复（Unknown 起点
+        // 与 Esc 探针预算）、外部源失联重启（主循环）必须共享同一份冷却与互斥，
+        // 否则三个触发源会各按各的计时器同时决定「该关游戏了」。
+        //
+        // 只在这里 `default()` 一次；下游一律接收 clone（内部 `Arc`），
+        // 任何模块自己再造一份都会让互斥失效，因此没有「未接线」这种状态。
+        let recovery = crate::runtime::recovery::GameRecoveryCoordinator::default();
+        // 驻留恢复例程本身就是恢复器：它发起的每一次采样（入口识别 / 会话级收尾 /
+        // 一级截图往返）都必须记进这一份协调器，否则「同一个触发源正在恢复」这件事
+        // 对启动链与主循环不可见，冷却与互斥只对那个例程自己成立。
         let residency_ui = ResidencyUi::new(
             ui_handle.clone(),
             ocr.clone(),
             friend_delivery_config.clone(),
-        );
+        )
+        .with_recovery(recovery.clone());
         let hall_ui = HallUi::new(ui_handle.clone(), ocr.clone(), hall_config);
         let moderation_ui = ModerationUi::new(ui_handle.clone(), moderation_config);
-        let startup_ui = StartupUi::new(ui_handle.clone(), ocr.clone(), startup_config);
+        let startup_ui = StartupUi::new(ui_handle.clone(), ocr.clone(), startup_config)
+            .with_recovery(recovery.clone());
         let secondary_unread_ui = SecondaryUnreadUi::new(
             ui_handle.clone(),
             ocr.clone(),
             secondary_unread_config,
             chat_timeline.clone(),
         );
+        // 好友投递 / 大厅批量发送同样在事务包装器里做会话级恢复（入口 → 二级聊天 →
+        // 回到入口），与 `residency_ui` 是同一类触发源，共用同一份协调器。
         let friend_delivery_ui = FriendDeliveryUi::new(
             ui_handle.clone(),
             ocr.clone(),
             friend_delivery_config.clone(),
-        );
+        )
+        .with_recovery(recovery.clone());
         let hall_batch_ui = HallBatchUi::new(
             ui_handle.clone(),
             ocr.clone(),
             friend_delivery_config.clone(),
-        );
+        )
+        .with_recovery(recovery.clone());
         let invite_ui = InviteUi::new(ui_handle.clone(), ocr.clone(), invite_config);
         let custom_action_ui = CustomActionUi::new(
             ui_handle.clone(),
@@ -1903,7 +1935,9 @@ impl ApplicationRuntime {
         // 快照，否则下次 apply 会把新映射抹掉。必须在 live_configs 被
         // move 进共享服务之前取出来。
         let external_live_configs = live_configs.clone();
-        let external_chat = external_chat::spawn(
+        // 启动失败时也要交出一份可用的空句柄：观察线程与 UI 侧只认「有没有状态」，
+        // 关停序列只认「有没有线程可等」，两者都不该为了一个失败分支出现 `Option`。
+        let (external_chat, external_chat_workers) = external_chat::spawn_managed(
             chat_timeline_for_external,
             chat_source_config,
             Some(external_identity_access),
@@ -1912,7 +1946,10 @@ impl ApplicationRuntime {
         )
         .unwrap_or_else(|error| {
             log::error!("外部聊天源启动失败，继续走 OCR：{error:#}");
-            external_chat::ExternalChatState::default()
+            (
+                external_chat::ExternalChatState::default(),
+                external_chat::ExternalChatWorkers::empty(),
+            )
         });
         let services = Arc::new(AppServices {
             ui: UiServices {
@@ -1991,6 +2028,7 @@ impl ApplicationRuntime {
                 monitor,
                 // HTTP 服务启动后换成真实句柄（`start_http_server`）。
                 http_reload: HttpReloadGates::detached(),
+                recovery,
             },
         });
         Ok(Self {
@@ -2005,6 +2043,7 @@ impl ApplicationRuntime {
                 formal_task_runtime: None,
                 http_server: None,
                 openai_runtime: Some(openai_runtime),
+                external_chat_workers: Some(external_chat_workers),
             },
         })
     }

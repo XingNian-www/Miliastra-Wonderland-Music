@@ -187,14 +187,18 @@ impl Drop for BackgroundCommandManagerInner {
         let state = match self.state.get_mut() {
             Ok(state) => state,
             Err(error) => {
-                log::error!("后台命令状态已损坏（步骤：关闭时读取命令状态），无法确认线程是否已退出，仍尝试关闭，可能残留线程");
+                log::error!(
+                    "后台命令状态已损坏（步骤：关闭时读取命令状态），无法确认线程是否已退出，仍尝试关闭，可能残留线程"
+                );
                 error.into_inner()
             }
         };
         for (name, command) in state.drain() {
             command.stop.store(true, AtomicOrdering::SeqCst);
             if command.worker.join().is_err() {
-                log::error!("后台命令「{name}」的线程关闭时崩溃（步骤：等待线程退出），该命令未能正常收尾");
+                log::error!(
+                    "后台命令「{name}」的线程关闭时崩溃（步骤：等待线程退出），该命令未能正常收尾"
+                );
             }
         }
     }
@@ -402,7 +406,9 @@ impl AppServices {
         thread::spawn(move || {
             log::info!("延迟聊天发送线程已启动");
             if let Err(error) = sender.run() {
-                log::error!("延迟聊天发送线程异常退出（步骤：发送队列循环），后续排队中的回复不会再发出，需要重启程序：{error:#}");
+                log::error!(
+                    "延迟聊天发送线程异常退出（步骤：发送队列循环），后续排队中的回复不会再发出，需要重启程序：{error:#}"
+                );
             }
         })
     }
@@ -594,9 +600,7 @@ impl DeferredChatSender {
                     .business
                     .turtle_soup_delivery_is_current(batch.turtle_soup)
             {
-                log::debug!(
-                    "延迟聊天分段批次所属的海龟汤会话已失效，跳过这一批消息的发送"
-                );
+                log::debug!("延迟聊天分段批次所属的海龟汤会话已失效，跳过这一批消息的发送");
                 drop(sending);
                 continue;
             }
@@ -612,9 +616,7 @@ impl DeferredChatSender {
                                 "延迟聊天发送队列已满，已丢弃一条较早的普通回复，玩家会少收到一句；本条在问题持续期间最多每分钟重复一次"
                             );
                         } else {
-                            log::debug!(
-                                "延迟聊天发送队列仍然已满，继续丢弃较早的普通回复"
-                            );
+                            log::debug!("延迟聊天发送队列仍然已满，继续丢弃较早的普通回复");
                         }
                     }
                     EnqueueOutcome::Rejected => {
@@ -623,9 +625,7 @@ impl DeferredChatSender {
                                 "延迟聊天目标未激活且队列已满，当前回复已丢弃，玩家收不到这句；本条在问题持续期间最多每分钟重复一次"
                             );
                         } else {
-                            log::debug!(
-                                "延迟聊天目标仍未激活且队列已满，继续丢弃当前回复"
-                            );
+                            log::debug!("延迟聊天目标仍未激活且队列已满，继续丢弃当前回复");
                         }
                     }
                     EnqueueOutcome::Added => {}
@@ -666,7 +666,9 @@ impl DeferredChatSender {
                     };
                     drop(sending);
                     if let Err(error) = result {
-                        log::error!("延迟聊天回复发送失败（步骤：发送普通回复），本条已丢弃不会重试，玩家收不到这句：{error:#}");
+                        log::error!(
+                            "延迟聊天回复发送失败（步骤：发送普通回复），本条已丢弃不会重试，玩家收不到这句：{error:#}"
+                        );
                     }
                 }
                 DeferredChatItem::Batch(mut batch) => {
@@ -738,7 +740,9 @@ impl DeferredChatSender {
                     let all_sent = match batch.mark_sent(sent) {
                         Ok(all_sent) => all_sent,
                         Err(error) => {
-                            log::error!("海龟汤批量发送进度无效（步骤：读取批量发送进度），该批消息可能没有全部送达：{error:#}");
+                            log::error!(
+                                "海龟汤批量发送进度无效（步骤：读取批量发送进度），该批消息可能没有全部送达：{error:#}"
+                            );
                             self.business.turtle_soup_delivery_failure(delivery, &error);
                             continue;
                         }
@@ -980,7 +984,9 @@ impl PlaybackMonitorPort for PlaybackMonitorWorker {
                 background_key: None,
                 formal_epoch: None,
             }) {
-                log::warn!("回报播放失败状态失败（步骤：把播放失败同步给界面与监控），面板可能仍显示播放中：{error:#}");
+                log::warn!(
+                    "回报播放失败状态失败（步骤：把播放失败同步给界面与监控），面板可能仍显示播放中：{error:#}"
+                );
             }
         }
         Ok(decision)
@@ -1070,9 +1076,7 @@ mod tests {
             "窗口过后仍在失败必须再 warn，否则日志里只剩一次、看不出持续故障"
         );
         // 重新 warn 之后窗口重新计时。
-        assert!(!gate.should_warn(
-            start + REPEAT_WARN_INTERVAL + Duration::from_millis(1)
-        ));
+        assert!(!gate.should_warn(start + REPEAT_WARN_INTERVAL + Duration::from_millis(1)));
         assert!(gate.should_warn(start + REPEAT_WARN_INTERVAL * 2));
     }
 

@@ -41,11 +41,11 @@ impl AppServices {
             username: command_username(parsed).to_string(),
             user_command: parsed.user_command.clone(),
         };
-        let outcome = self
-            .playback
-            .playback_application
-            .clone()
-            .execute_command(&context, command, &mut self.port());
+        let outcome = self.playback.playback_application.clone().execute_command(
+            &context,
+            command,
+            &mut self.port(),
+        );
         // Playback commands are synchronous, but a reply/logging error may follow a
         // player-side effect. Record the dispatch either way; failed means the handler
         // returned an error, whose side effects may be partial.
@@ -241,7 +241,9 @@ fn automatic_advance_allowed(live_configs: &crate::config::LiveConfigs) -> bool 
 fn playback_outcome_label(result: &PlaybackResult) -> String {
     use crate::features::playback::PlaybackOutcome;
     match result.outcome() {
-        PlaybackOutcome::Success if result.source_switched() => "（已切换音源后播放成功）".to_string(),
+        PlaybackOutcome::Success if result.source_switched() => {
+            "（已切换音源后播放成功）".to_string()
+        }
         PlaybackOutcome::Success => String::new(),
         PlaybackOutcome::ItemScopedFailure => format!(
             "（本条点歌失败，已跳过并继续下一项；原因：{}）",

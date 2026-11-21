@@ -163,7 +163,7 @@
 
 <script setup>
 import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { getJson, readToken, request, requestJson } from '../api.js'
+import { fetchBlob, getJson, request, requestJson } from '../api.js'
 import { handleAuth, toast } from '../store.js'
 
 const tracking = ref(false)
@@ -329,14 +329,9 @@ async function openScreenshot() {
   if (screenshotBusy.value) return
   screenshotBusy.value = true
   try {
-    const token = readToken()
-    const response = await fetch('/screenshot?quality=88', { headers: token ? { 'X-Miliastra-Token': token } : {} })
-    if (!response.ok) {
-      if (response.status === 401) throw new Error('访问令牌无效或已过期，请到设置页重新填写')
-      throw new Error(`HTTP ${response.status}`)
-    }
+    const blob = await fetchBlob('/screenshot?quality=88')
     if (screenshotUrl.value) URL.revokeObjectURL(screenshotUrl.value)
-    screenshotUrl.value = URL.createObjectURL(await response.blob())
+    screenshotUrl.value = URL.createObjectURL(blob)
   } catch (error) {
     report(error, '截图失败')
   } finally {

@@ -45,6 +45,8 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "song_dedup.max_count",
     "friend_delivery.auto_retry_count",
     "state.executed_commands_log_path",
+    // 诊断存档：一个开关，保存即生效（落盘点读进程级原子位）。
+    "diagnostics.ui_frames",
     "output.send_enabled",
     "matching.min_song_name_score",
     "matching.short_chinese_song_max_miss",
@@ -243,6 +245,9 @@ impl Default for LiveConfigs {
 impl LiveConfigs {
     /// 从完整配置初始化全部值（启动时创建一次）。
     pub fn from_config(config: &AppConfig) -> Self {
+        // 启动时就把诊断开关同步到进程级原子位：否则每次重启都要等到
+        // 用户再保存一次配置才会生效。
+        crate::ui_diagnostics::set_enabled(config.diagnostics.ui_frames);
         Self {
             effective: EffectiveConfig::new(config),
             pending_reload: Arc::new(Mutex::new(PendingReload::default())),
@@ -440,6 +445,10 @@ impl LiveConfigs {
         effective.friend_delivery.auto_retry_count = config.friend_delivery.auto_retry_count;
         effective.state.executed_commands_log_path =
             config.state.executed_commands_log_path.clone();
+        // 诊断存档是进程级开关：这里刷新一次，落盘点只读那一个位，
+        // 避免为了一个诊断开关把 AppConfig 穿过整条 UI 调用链。
+        crate::ui_diagnostics::set_enabled(config.diagnostics.ui_frames);
+        effective.diagnostics = config.diagnostics.clone();
         effective.output.send_enabled = config.output.send_enabled;
         effective.matching = config.matching.clone();
         effective.custom_workflows = config.custom_workflows.clone();

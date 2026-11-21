@@ -211,7 +211,8 @@ pub(crate) struct FrameEvidence {
     pub(crate) captured_at: Option<Instant>,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    /// `MILIASTRA_UI_DIAGNOSTICS=1` 时落盘到 `<exe>/deps/diagnostics`。
+    /// 面板「诊断存档」开启（`diagnostics.ui_frames`）时落盘到
+    /// `<exe>/deps/diagnostics`；开关由 `crate::ui_diagnostics` 统一持有。
     pub(crate) path: Option<PathBuf>,
 }
 
@@ -509,20 +510,14 @@ fn finish_outcome<T>(
     outcome
 }
 
+// 开关与目录都由 `crate::ui_diagnostics` 统一持有：面板可改、保存即生效。
+// 不再读环境变量——排查问题不该要求用户去改启动脚本。
 fn diagnostics_enabled() -> bool {
-    std::env::var("MILIASTRA_UI_DIAGNOSTICS")
-        .map(|value| {
-            let value = value.trim();
-            value == "1" || value.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false)
+    crate::ui_diagnostics::enabled()
 }
 
 fn diagnostics_dir() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()?
-        .parent()
-        .map(|parent| parent.join("deps").join("diagnostics"))
+    crate::ui_diagnostics::directory()
 }
 
 fn write_diagnostics_frame(

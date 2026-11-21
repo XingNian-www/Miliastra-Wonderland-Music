@@ -200,6 +200,9 @@ pub struct AppConfig {
     /// 状态段由启动引导（BootstrapConfig）提供，配置库 JSON 中可缺失。
     #[serde(default)]
     pub state: StateConfig,
+    /// UI 诊断存档；内嵌段可省略（默认关闭）。
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
     /// 点歌队列；内嵌段可省略。
     #[serde(default)]
     pub queue: QueueConfig,
@@ -402,6 +405,7 @@ impl Default for AppConfig {
             logging: LoggingConfig::default(),
             tui: TuiConfig::default(),
             state: StateConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             queue: QueueConfig::default(),
             song_dedup: SongDedupConfig::default(),
             idiom_chain: IdiomChainConfig::default(),
@@ -697,6 +701,7 @@ impl AppConfig {
         self.logging.validate()?;
         self.tui.validate()?;
         self.state.validate()?;
+        self.diagnostics.validate()?;
         self.hotkeys.validate()?;
         self.queue.validate()?;
         self.song_dedup.validate()?;
@@ -2442,6 +2447,33 @@ impl TuiConfig {
     }
 }
 
+/// UI 诊断存档：把界面识别时的画面落盘，便于事后复核「当时到底是黑屏、
+/// 冻结帧，还是没建模的新界面」。
+///
+/// 与 `deps/logs/ui-failures`（失败帧）的分工：
+/// - 失败帧：**始终开启**，只在例程失败那一刻写一张，是故障证据；
+/// - 本段：默认关闭，按需打开，用来抓**过程帧**（频率更高）。
+///   混在一起会让故障证据被海量过程帧淹没。
+///
+/// 只保留一个开关，不给目录/频率之类的参数：那些是内部实现细节，
+/// 暴露到面板只会让用户困惑——配置应该只保留最基础的数据。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsConfig {
+    /// 是否把 UI 过程帧落盘（固定写到 `<exe>/deps/diagnostics`）。
+    ///
+    /// 默认关闭：无人看管时会持续占磁盘。排查「界面持续无法识别」时开一段时间。
+    #[serde(default)]
+    pub ui_frames: bool,
+}
+
+impl DiagnosticsConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        // 纯布尔开关，没有跨字段约束。
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateConfig {
@@ -2678,6 +2710,32 @@ stale_timeout_ms: 7500
     /// 裸缺省会让 `serde_json::from_value` 报 `missing field`，而
     /// `ensure_schema` 在版本号相同时不做迁移 → 升级后**程序无法启动**。
     /// 单测一度全绿，是因为测试只走已更新的 `test.full.yaml`，没覆盖这条老库路径。
+    /// **老库兼容（必须）**：7.6.2 及更早的配置里没有 `diagnostics` 段，
+    /// 反序列化必须能靠 serde 默认值补齐，否则升级后程序直接起不来。
+    #[test]
+    fn config_without_the_diagnostics_section_still_loads() {
+        let mut value = default_config_json();
+        let removed = value
+            .as_object_mut()
+            .expect("默认配置必须是对象")
+            .remove("diagnostics");
+        assert!(removed.is_some(), "默认配置里应有 diagnostics 段");
+
+        let config: AppConfig =
+            serde_json::from_value(value).expect("缺 diagnostics 的老配置必须仍能反序列化");
+        assert!(
+            !config.diagnostics.ui_frames,
+            "缺段时必须默认关闭，不能默默开始占磁盘"
+        );
+    }
+
+    /// 诊断存档默认关闭：无人看管时持续写盘是不可接受的默认行为。
+    #[test]
+    fn diagnostics_defaults_to_off() {
+        assert!(!AppConfig::default().diagnostics.ui_frames);
+        assert!(!DiagnosticsConfig::default().ui_frames);
+    }
+
     #[test]
     fn startup_section_without_the_new_restart_keys_still_loads() {
         let mut value = default_config_json();

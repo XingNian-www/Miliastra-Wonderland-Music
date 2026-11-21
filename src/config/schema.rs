@@ -790,6 +790,15 @@ fn tui_section() -> Vec<ConfigFieldSchema> {
 }
 
 /// state 段：状态文件路径（playback_state_path 由统一数据库路径注入，不进 schema）。
+fn diagnostics_section() -> Vec<ConfigFieldSchema> {
+    vec![ConfigFieldSchema::db_live(
+        "ui_frames",
+        "保存界面识别画面",
+        FieldKind::Bool,
+        "开启后把界面识别时的画面存到程序目录 deps/diagnostics，用于排查「界面持续无法识别」这类问题（存的是画面，文件名不含正文/昵称/UID）。默认关闭：无人看管时会持续占磁盘，排查完请记得关掉。失败帧（deps/logs/ui-failures）不受此开关影响，始终保存",
+    )]
+}
+
 fn state_section() -> Vec<ConfigFieldSchema> {
     vec![
         ConfigFieldSchema::db_idle_reload(
@@ -2719,6 +2728,13 @@ pub fn config_sections() -> Vec<ConfigSectionSchema> {
             domain: Domain::System,
             order: 13,
             fields: with_section_prefix("state", state_section()),
+        },
+        ConfigSectionSchema {
+            name: "diagnostics".to_string(),
+            label: "诊断存档".to_string(),
+            domain: Domain::System,
+            order: 44,
+            fields: with_section_prefix("diagnostics", diagnostics_section()),
         },
         ConfigSectionSchema {
             name: "queue".to_string(),

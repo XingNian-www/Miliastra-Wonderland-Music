@@ -32,6 +32,7 @@ mod privacy;
 mod test_support;
 mod text;
 mod ui;
+pub(crate) mod ui_diagnostics;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -449,6 +449,10 @@ state:
   # 最终执行命令记录路径
   executed_commands_log_path: data/executed-commands.log
 
+diagnostics:
+  # 保存界面识别画面，用于排查「界面持续无法识别」（默认关闭）
+  ui_frames: false
+
 queue:
   # 队列最大长度
   max_size: 5

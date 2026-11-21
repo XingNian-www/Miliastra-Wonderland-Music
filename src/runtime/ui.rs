@@ -1943,9 +1943,12 @@ impl<'a> UiRoutineContext<'a> {
     /// 通用失败帧落盘：任何 UI 例程在失败点都可以调用一次。
     ///
     /// 目的：实机失败时只留一行错误文本，问题往往无法复核。这里把**失败当帧**
-    /// 连同阶段/原因/最近界面状态一起写到 `deps/logs/ui-failures/`（可用
-    /// `MILIASTRA_UI_FAILURE_DIR` 覆盖），文件名带时间戳与阶段，
-    /// 并配同名 `.json` 元数据。截图失败只记 WARN，绝不再抛错。
+    /// 连同阶段/原因/最近界面状态一起写到 `<exe>/deps/logs/ui-failures/`，
+    /// 文件名带时间戳与阶段，并配同名 `.json` 元数据。截图失败只记 WARN，
+    /// 绝不再抛错。
+    ///
+    /// 目录是固定的：这个存档**始终开启**，是故障证据，不需要开关、也不该
+    /// 让用户去配路径。需要更细的过程帧时用面板的「诊断存档」。
     pub fn save_failure_frame(&mut self, stage: &str, detail: &str) {
         let frame = match self.capture_frame() {
             Ok(frame) => frame,
@@ -1954,9 +1957,7 @@ impl<'a> UiRoutineContext<'a> {
                 return;
             }
         };
-        let dir = std::env::var_os("MILIASTRA_UI_FAILURE_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("deps/logs/ui-failures"));
+        let dir = ui_failure_directory();
         if let Err(error) = std::fs::create_dir_all(&dir) {
             log::warn!("UI 失败帧落盘跳过（阶段 {stage}）：创建目录失败：{error:#}");
             return;
@@ -2586,6 +2587,20 @@ impl Drop for FrameDemandSubscription {
 ///
 /// 供 `ui/routines/transaction` 等跨模块单测构造 `UiRoutineContext`（生产上用
 /// `TypedUiJob::execute`）。返回的输出与本次操作的输入尝试计数。
+/// 失败帧存档目录：`<exe>/deps/logs/ui-failures`。
+///
+/// 固定路径、始终启用：这是故障证据，不是可选项。解析不到 exe 目录时
+/// 退回当前工作目录下的相对路径，保证"能存下来"优先于"存得漂亮"。
+fn ui_failure_directory() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("deps")
+        .join("logs")
+        .join("ui-failures")
+}
+
 #[cfg(test)]
 pub(crate) struct TestRoutineExecution<D, T> {
     pub(crate) output: T,

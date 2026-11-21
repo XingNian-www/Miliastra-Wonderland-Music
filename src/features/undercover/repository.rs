@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+use miliastra_kernel::StateStore;
 use serde::{Deserialize, Serialize};
 
 use super::{UndercoverWordPair, normalized_word_component, unordered_word_key};
-use miliastra_contracts::StateStore;
 
 #[derive(Clone)]
 pub(crate) struct UndercoverBankStore {

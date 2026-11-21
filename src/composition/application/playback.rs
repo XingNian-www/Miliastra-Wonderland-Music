@@ -6,9 +6,9 @@ use miliastra_playback::PlayableTrack;
 
 use crate::features::playback::{
     BackgroundLyricsScope, PlaybackCommandContext, PlaybackCommandPort, PlaybackExecutionPort,
-    PlaybackPickedCandidate, PlaybackResult, PlaybackSearchFailure, PlaybackVerification,
-    QueueRemoval,
+    PlaybackResult, PlaybackSearchFailure, PlaybackVerification, QueueRemoval,
 };
+use crate::features::song_request::PickedCandidate;
 
 fn immediate_playback_evidence(
     command: &PlaybackCommand,
@@ -28,7 +28,7 @@ fn immediate_playback_evidence(
 
 impl AppServices {
     pub(super) fn stop_background_lyrics_output(&self) -> Result<bool> {
-        self.business.background_commands.stop("lyrics")
+        self.business.background_lyrics.stop()
     }
 
     pub(super) fn execute_playback_intent(
@@ -302,17 +302,12 @@ impl PlaybackExecutionPort for AppServicesPort<'_> {
         keyword: &str,
         source: &str,
         prefer_accompaniment: bool,
-    ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+    ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure> {
+        // 搜索层已经把「选中项 + 候选列表 + 展示文案」放在同一个结构里，
+        // 这里不再拆开重组：播放侧直接复用，换源与 `@N` 重选读到的是同一份快照。
         self.playback
             .player_search
             .search_and_pick(keyword, source, prefer_accompaniment)
-            .map(|picked| {
-                picked.map(|picked| PlaybackPickedCandidate {
-                    track: picked.candidate.playable_track(),
-                    text: picked.candidate.text,
-                    candidate_snapshot: picked.candidate_snapshot,
-                })
-            })
             .map_err(playback_search_failure)
     }
 
@@ -486,7 +481,7 @@ impl PlaybackCommandPort for AppServicesPort<'_> {
         scope: BackgroundLyricsScope,
     ) -> Result<bool> {
         workers::start_background_lyrics(
-            &self.business.background_commands,
+            &self.business.background_lyrics,
             self.playback.player.clone(),
             self.business.task_engine.clone(),
             self.shared.running.clone(),

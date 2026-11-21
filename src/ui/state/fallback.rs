@@ -8,7 +8,7 @@ use crate::runtime::ocr::OcrPriority;
 use crate::runtime::ocr::OcrRuntimeHandle;
 use crate::runtime::ui::UiStateClassification;
 use crate::runtime::ui::UiStateEvidence;
-use crate::runtime::ui::UiStateKind as RuntimeUiStateKind;
+use crate::runtime::ui::UiStateKind;
 use crate::ui::template::best_template_candidate;
 use anyhow::Result;
 use image::DynamicImage;
@@ -33,7 +33,7 @@ pub(super) struct GameFallbackState {
     pub(super) required_count: u32,
     pub(super) unknown_since: Option<Instant>,
     pub(super) retry_after: Option<Instant>,
-    pub(super) candidate: Option<RuntimeUiStateKind>,
+    pub(super) candidate: Option<UiStateKind>,
     pub(super) candidate_count: u32,
     pub(super) confirmed: Option<UiStateClassification>,
 }
@@ -79,7 +79,7 @@ impl GameFallbackState {
                 return Err(error);
             }
         };
-        if observation.kind() == RuntimeUiStateKind::Unknown {
+        if observation.kind() == UiStateKind::Unknown {
             self.candidate = None;
             self.candidate_count = 0;
             self.confirmed = None;
@@ -108,7 +108,7 @@ impl GameFallbackState {
         } else {
             self.retry_after = None;
             Ok(UiStateClassification::with_evidence(
-                RuntimeUiStateKind::Unknown,
+                UiStateKind::Unknown,
                 "unknown:game_probe",
                 observation.evidence().clone(),
             ))
@@ -138,7 +138,7 @@ pub(super) fn probe_game_state(
         && find_enter_game_text(&game_entry.ocr, image, game_entry.gate_region)?.is_some()
     {
         return Ok(UiStateClassification::new(
-            RuntimeUiStateKind::GameGate,
+            UiStateKind::GameGate,
             "game_gate",
         ));
     }
@@ -176,15 +176,15 @@ pub(super) fn probe_game_state(
         && qianxing_map_label_via_ocr(&game_entry.ocr, image, region)?
     {
         return Ok(UiStateClassification::new(
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "secondary:qianxing_map",
         ));
     }
     Ok(UiStateClassification::with_evidence(
         if world_is_teyvat {
-            RuntimeUiStateKind::Overworld
+            UiStateKind::Overworld
         } else {
-            RuntimeUiStateKind::Unknown
+            UiStateKind::Unknown
         },
         if world_is_teyvat {
             "overworld"

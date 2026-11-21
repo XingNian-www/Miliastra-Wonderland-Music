@@ -27,7 +27,7 @@ use crate::features::entertainment::{AcquireOutcome, EntertainmentKind, Entertai
 use crate::features::reply_template::ReplyTemplate;
 use crate::features::reply_template::{ReplyVars, turtle_soup as templates};
 use crate::text::normalize_comparison_text;
-use miliastra_contracts::StateStore;
+use miliastra_kernel::StateStore;
 use miliastra_kernel::ai::OpenAiRuntimeHandle;
 use miliastra_kernel::clock::{Clock, Delay};
 use miliastra_kernel::identity::SessionGeneration;
@@ -1993,7 +1993,6 @@ impl TurtleSoupWorker {
         }
     }
 
-
     fn call_ai_once(
         &self,
         job: &TurtleSoupJob,
@@ -3588,22 +3587,22 @@ mod tests {
             participants: HashMap::new(),
             question_count: 0,
         };
-        let messages = settlement_messages(
-            &session,
-            &SettlementReason::Friend("显示名甲".to_string()),
-        );
+        let messages =
+            settlement_messages(&session, &SettlementReason::Friend("显示名甲".to_string()));
         let rendered = messages
             .iter()
             .map(|message| message.render_default())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("显示名甲"), "结算文案应写玩家名: {rendered}");
+        assert!(
+            rendered.contains("显示名甲"),
+            "结算文案应写玩家名: {rendered}"
+        );
         assert!(
             !rendered.contains("00000000-0000-4000-8000"),
             "结算文案不得含内部键: {rendered}"
         );
     }
-
 
     #[test]
     fn snapshot_elapsed_time_uses_the_injected_clock() {

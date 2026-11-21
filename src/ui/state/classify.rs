@@ -17,8 +17,8 @@ use super::hall::{
     HALL_BAR_WHITE_NEAR, hall_bar_looks_like_hall_keys, hall_bar_signature,
     hall_bar_signature_with_threshold,
 };
-use super::kind::UiState;
 use super::paimon::paimon_menu_grid_structure;
+use super::result::UiState;
 use super::sampling::loading_rule;
 
 #[cfg(test)]

@@ -357,47 +357,39 @@ pub(crate) trait HttpHallPort: Send + Sync {
     fn capture_hall_screenshot(&self) -> Result<Arc<DynamicImage>>;
 }
 
+/// 播放器端口：状态、缓存维护、播放位置、播放模式与搜索。
+///
+/// **全部方法都是必选的**，这里不提供任何"静默空操作"的默认实现。
+/// 以前 `cache_stats` / `cached_tracks` / `reset_track_statistics` /
+/// `invalidate_track_cache` / `seek` / `play_mode` / `set_play_mode` 都有返回
+/// `Ok((None, vec![]))` / `Ok(false)` / `Ok(())` / `Ok(0)` 的默认实现：
+/// 生产实现漏接一个方法时，接口会"成功"但什么都没做，面板与调用方都看不出异常。
+/// 现在漏接是编译错误；每个实现者必须显式回答"这个能力到底有没有接线"。
 pub(crate) trait HttpPlayerPort: Send + Sync {
     fn status(&self) -> Result<PlayerStatus>;
+    /// 批量查询音频缓存总览与逐曲状态；未启用缓存时返回 `None` 与空状态列表。
     fn cache_stats(
         &self,
-        _keys: &[TrackKey],
-    ) -> Result<(Option<AudioCacheStats>, Vec<AudioCacheTrackStatus>)> {
-        Ok((None, Vec::new()))
-    }
-    /// 分页查询磁盘缓存歌曲列表；默认实现返回空页（播放器未接入缓存时）。
-    /// `sort`/`ascending` 透传给播放器的元数据索引。
+        keys: &[TrackKey],
+    ) -> Result<(Option<AudioCacheStats>, Vec<AudioCacheTrackStatus>)>;
+    /// 分页查询磁盘缓存歌曲列表；`sort`/`ascending` 透传给播放器的元数据索引。
     fn cached_tracks(
         &self,
         offset: usize,
         limit: usize,
         sort: CacheTrackSortKey,
         ascending: bool,
-    ) -> Result<CachedTrackPage> {
-        let _ = (sort, ascending);
-        Ok(CachedTrackPage::empty(offset, limit))
-    }
-    /// 清零单曲统计；默认实现表示未接入播放器缓存。
-    fn reset_track_statistics(&self, _key: &TrackKey) -> Result<bool> {
-        Ok(false)
-    }
-    /// 删除指定曲目的磁盘音频缓存（下次播放重新下载）；默认实现表示未接入。
-    fn invalidate_track_cache(&self, _key: &TrackKey) -> Result<bool> {
-        Ok(false)
-    }
-    /// 跳转到指定播放位置（秒）；默认实现表示未接入。
-    fn seek(&self, _position_seconds: f64) -> Result<()> {
-        Ok(())
-    }
+    ) -> Result<CachedTrackPage>;
+    /// 清零单曲统计（保留缓存与元数据）；返回是否真的清掉了一行。
+    fn reset_track_statistics(&self, key: &TrackKey) -> Result<bool>;
+    /// 删除指定曲目的磁盘音频缓存（下次播放重新下载）；返回是否真的删掉了。
+    fn invalidate_track_cache(&self, key: &TrackKey) -> Result<bool>;
+    /// 跳转到指定播放位置（秒）。
+    fn seek(&self, position_seconds: f64) -> Result<()>;
     /// 当前播放模式：0=顺序 1=单曲循环 2=随机。
-    fn play_mode(&self) -> Result<u8> {
-        Ok(0)
-    }
+    fn play_mode(&self) -> Result<u8>;
     /// 设置播放模式（0=顺序 1=单曲循环 2=随机）。
-    fn set_play_mode(&self, mode: u8) -> Result<()> {
-        let _ = mode;
-        Ok(())
-    }
+    fn set_play_mode(&self, mode: u8) -> Result<()>;
     fn search_text(&self, keyword: &str, source: &str) -> Result<String, HttpPlayerSearchError>;
     fn search_candidates(
         &self,
@@ -514,11 +506,26 @@ pub(crate) trait HttpLoginPort: Send + Sync {
     fn kugou_upgrade_vip(&self) -> Result<KugouListenReport, HttpLoginError>;
 }
 
-pub(crate) trait HttpAiPort: Send + Sync {
+/// AI 点歌端口：识歌、歌曲身份匹配与候选挑选。
+///
+/// 这三个方法都是**对模型的一次问答**，输入是 HTTP 查询参数，输出是模型回答的
+/// 文本；它们不碰聊天记忆、不碰提示词装配，因此与 [`HttpAiMemoryPort`] 正交。
+pub(crate) trait HttpAiMusicPort: Send + Sync {
     fn recognize(&self, query: &[(String, String)]) -> Result<String>;
     fn match_song(&self, query: &[(String, String)]) -> Result<String>;
     fn pick(&self, query: &[(String, String)]) -> Result<String>;
+}
 
+/// AI 聊天记忆端口：记忆库查询/删改、历史重建与提示词装配预览。
+///
+/// 这一组方法共享同一份「聊天记忆」事实源与同一条提示词装配链路，和点歌无关。
+/// 拆成两个端口后，装配点必须分别回答「点歌能力接了吗」「记忆能力接了吗」；
+/// 混在一个 `HttpAiPort` 里时，只要实现了其中一半，另一半就悄悄缺位，
+/// 边界形同虚设。
+///
+/// **全部方法都是必选的**：`chat_preview` 以前带一个静态返回"未装配"的默认
+/// 实现，会让漏接线的生产装配在运行期只表现为一句功能错误，而不是编译失败。
+pub(crate) trait HttpAiMemoryPort: Send + Sync {
     /// 列出所有有记忆的玩家及其规模。
     fn memory_actors(&self) -> Result<String>;
     /// 读取某个玩家的完整记忆（事实 + 摘要 + 原文）。
@@ -533,18 +540,13 @@ pub(crate) trait HttpAiPort: Send + Sync {
     fn forget_hall(&self) -> Result<String>;
     /// 用当前抽取规则重放该玩家全部历史问答，重建事实表。
     fn rebuild_facts(&self, actor: &str) -> Result<String>;
-
     /// 装配预览：用给定配置（可含未保存草稿）拼出 system/tail/tools，不调用模型。
-    ///
-    /// 默认实现返回未装配，测试夹具不必实现。
     fn chat_preview(
         &self,
-        _config: &crate::config::AppConfig,
-        _asker: &str,
-        _question: &str,
-    ) -> Result<String> {
-        Err(anyhow::anyhow!("装配预览未装配（仅生产运行时可用）"))
-    }
+        config: &crate::config::AppConfig,
+        asker: &str,
+        question: &str,
+    ) -> Result<String>;
 }
 
 #[derive(Clone)]
@@ -556,7 +558,8 @@ pub(crate) struct HttpApplicationPorts {
     pub debug: Option<Arc<dyn HttpDebugPort>>,
     pub player: Arc<dyn HttpPlayerPort>,
     pub login: Arc<dyn HttpLoginPort>,
-    pub ai: Arc<dyn HttpAiPort>,
+    pub ai_music: Arc<dyn HttpAiMusicPort>,
+    pub ai_memory: Arc<dyn HttpAiMemoryPort>,
 }
 
 impl HttpApplicationPorts {
@@ -568,7 +571,8 @@ impl HttpApplicationPorts {
         hall: Arc<dyn HttpHallPort>,
         player: Arc<dyn HttpPlayerPort>,
         login: Arc<dyn HttpLoginPort>,
-        ai: Arc<dyn HttpAiPort>,
+        ai_music: Arc<dyn HttpAiMusicPort>,
+        ai_memory: Arc<dyn HttpAiMemoryPort>,
     ) -> Self {
         Self {
             commands,
@@ -578,7 +582,8 @@ impl HttpApplicationPorts {
             debug: None,
             player,
             login,
-            ai,
+            ai_music,
+            ai_memory,
         }
     }
 }

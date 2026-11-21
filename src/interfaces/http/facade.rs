@@ -26,9 +26,9 @@ use crate::features::song_request::{AiClient, SongCommand, SongSource};
 use crate::features::undercover::UndercoverCommand;
 use crate::interfaces::chat::ConsoleCommandIntent;
 use crate::interfaces::http::{
-    HttpAiPort, HttpCommandError, HttpCommandPort, HttpLoginError, HttpLoginErrorView,
-    HttpLoginPort, HttpLoginQrCodeView, HttpLoginStatus, HttpPlayerPort, HttpPlayerSearchError,
-    HttpProviderView, HttpTaskPort, PlayTrackRequest,
+    HttpAiMemoryPort, HttpAiMusicPort, HttpCommandError, HttpCommandPort, HttpLoginError,
+    HttpLoginErrorView, HttpLoginPort, HttpLoginQrCodeView, HttpLoginStatus, HttpPlayerPort,
+    HttpPlayerSearchError, HttpProviderView, HttpTaskPort, PlayTrackRequest,
 };
 use crate::runtime::business::{BusinessMutationIntent, BusinessMutationOutcome};
 use crate::runtime::chat_listener::ChatListenerMode;
@@ -751,6 +751,11 @@ fn is_bilibili_bvid(value: &str) -> bool {
     bilibili_is_bvid(value)
 }
 
+/// 生产播放器端口：状态、搜索、缓存维护、播放位置与播放模式。
+///
+/// **逐条显式接线**：`HttpPlayerPort` 上不再有"返回空结果"的默认实现，
+/// 因此这里的每一条方法都必须回答"能力到底接到哪里"，漏接是编译错误。
+/// 当前所有能力都由真实的播放器句柄承担，没有一条退化成空操作。
 #[derive(Clone)]
 pub(crate) struct ApplicationHttpPlayerFacade {
     backend: PlayerRuntimeBackend,
@@ -777,10 +782,12 @@ impl ApplicationHttpPlayerFacade {
 }
 
 impl HttpPlayerPort for ApplicationHttpPlayerFacade {
+    /// 播放器运行态快照（由播放器后端持有，不经过播放队列）。
     fn status(&self) -> Result<PlayerStatus> {
         self.backend.status()
     }
 
+    /// 缓存总览 + 逐曲状态；缓存未启用时播放器自身返回 `None`，这里不伪造。
     fn cache_stats(
         &self,
         keys: &[TrackKey],
@@ -788,6 +795,7 @@ impl HttpPlayerPort for ApplicationHttpPlayerFacade {
         Ok(self.playback.cache_stats(keys)?)
     }
 
+    /// 磁盘缓存分页；排序键与方向原样透传给播放器的元数据索引。
     fn cached_tracks(
         &self,
         offset: usize,
@@ -800,10 +808,13 @@ impl HttpPlayerPort for ApplicationHttpPlayerFacade {
             .cached_tracks(offset, limit, sort, ascending)?)
     }
 
+    /// 清零单曲统计；是否真的有一行被清掉由播放器回答，不由这里假定。
     fn reset_track_statistics(&self, key: &TrackKey) -> Result<bool> {
         Ok(self.playback.reset_track_statistics(key)?)
     }
 
+    /// 删除磁盘缓存。播放器的删除接口是"成功即已删除"的语义，
+    /// 所以这里在成功时回答 `true`，失败时把原因原样上抛。
     fn invalidate_track_cache(&self, key: &TrackKey) -> Result<bool> {
         self.playback
             .invalidate_audio_cache(key)
@@ -811,16 +822,20 @@ impl HttpPlayerPort for ApplicationHttpPlayerFacade {
             .map_err(anyhow::Error::from)
     }
 
+    /// 跳转到指定秒数；位置合法性由路由层判定，这里只转发。
     fn seek(&self, position_seconds: f64) -> Result<()> {
         self.playback
             .seek(position_seconds)
             .map_err(anyhow::Error::from)
     }
 
+    /// 读取与 `PlaybackApplication` 共享的播放模式（0=顺序 1=单曲循环 2=随机）。
     fn play_mode(&self) -> Result<u8> {
         Ok(self.play_mode.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// 写入共享播放模式。越界值在这里拒绝：面板契约只有 0/1/2，
+    /// 其它值必须表现为错误，不能被静默吞掉。
     fn set_play_mode(&self, mode: u8) -> Result<()> {
         if mode > 2 {
             anyhow::bail!("播放模式只允许 0(顺序)/1(单曲循环)/2(随机)");
@@ -1384,9 +1399,48 @@ impl crate::interfaces::http::HttpDebugPort for ApplicationHttpDebugFacade {
     }
 }
 
+/// 生产 AI 点歌端口：识歌、歌曲身份匹配、候选挑选。
+///
+/// 只持有一个 `AiClient`——三次调用都是"把查询参数交给模型、把回答原样交回"，
+/// 不需要记忆库、不需要身份映射，也不该拿到它们。这正是把它和
+/// [`ApplicationHttpAiMemoryFacade`] 拆成两个端口的理由：
+/// 点歌链路看不到记忆，记忆链路也看不到模型问答的原始出口。
 #[derive(Clone)]
-pub(crate) struct ApplicationHttpAiFacade {
+pub(crate) struct ApplicationHttpAiMusicFacade {
     client: AiClient,
+}
+
+impl ApplicationHttpAiMusicFacade {
+    pub(crate) fn new(client: AiClient) -> Self {
+        Self { client }
+    }
+}
+
+impl HttpAiMusicPort for ApplicationHttpAiMusicFacade {
+    /// 识歌：查询参数直接转成模型请求，回答原样返回给调用方。
+    fn recognize(&self, query: &[(String, String)]) -> Result<String> {
+        self.client.recognize_with_query(query)
+    }
+
+    /// 歌曲身份匹配（点歌名 → 结构化身份）。
+    fn match_song(&self, query: &[(String, String)]) -> Result<String> {
+        self.client.match_with_query(query)
+    }
+
+    /// 从候选里挑一首。
+    fn pick(&self, query: &[(String, String)]) -> Result<String> {
+        self.client.pick_with_query(query)
+    }
+}
+
+/// 生产 AI 聊天记忆端口：记忆库查询/删改、历史重建与装配预览。
+///
+/// 与点歌端口正交：这里没有任何模型问答出口，模型只出现在
+/// [`Self::rebuild_facts`] 注入的重建闭包里（那是 composition 侧的职责）。
+/// 记忆库与身份映射都是 `Option`：测试装配可以只接一部分能力，
+/// 但每个缺失能力都返回**明确的未装配错误**，绝不退化成"成功但没做事"。
+#[derive(Clone)]
+pub(crate) struct ApplicationHttpAiMemoryFacade {
     /// 记忆库句柄。为 None 时（测试装配）记忆接口返回明确的未装配错误。
     memory: Option<std::sync::Arc<crate::features::ai_chat::AiChatMemory>>,
     /// 历史重跑清洗：给定玩家名，用新规则重放其全部问答并重建事实表。
@@ -1410,18 +1464,7 @@ pub(crate) struct ApplicationHttpAiFacade {
     generation: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
-impl ApplicationHttpAiFacade {
-    pub(crate) fn new(client: AiClient) -> Self {
-        Self {
-            client,
-            memory: None,
-            rebuild: None,
-            display_name: None,
-            memory_key: None,
-            generation: None,
-        }
-    }
-
+impl ApplicationHttpAiMemoryFacade {
     /// 面板删改记忆后作废在途维护任务。没装配代际时什么也不做（测试装配）。
     fn invalidate_pending_memory_tasks(&self) {
         if let Some(generation) = &self.generation {
@@ -1429,9 +1472,8 @@ impl ApplicationHttpAiFacade {
         }
     }
 
-    /// 生产装配：额外带上记忆库，供面板查询与删改。
+    /// 生产装配：记忆库 + 重建闭包 + 身份映射 + 维护代际。
     pub(crate) fn with_memory(
-        client: AiClient,
         memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
         rebuild: std::sync::Arc<dyn Fn(&str) -> anyhow::Result<usize> + Send + Sync>,
         display_name: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
@@ -1439,7 +1481,6 @@ impl ApplicationHttpAiFacade {
         generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
-            client,
             memory: Some(memory),
             rebuild: Some(rebuild),
             display_name: Some(display_name),
@@ -1474,15 +1515,17 @@ impl ApplicationHttpAiFacade {
     }
 }
 
-impl HttpAiPort for ApplicationHttpAiFacade {
+impl HttpAiMemoryPort for ApplicationHttpAiMemoryFacade {
+    /// 装配预览：用给定配置（可含未保存草稿）拼出 system/tail/tools，不调用模型。
+    ///
+    /// 身份规则与真实请求完全一致：asker 可能是昵称或 UUID，必须解析成记忆键；
+    /// 展示名只用于 asker 文案，不能拿去查记忆或过滤 hall。
     fn chat_preview(
         &self,
         config: &crate::config::AppConfig,
         asker: &str,
         question: &str,
     ) -> Result<String> {
-        // 与真实请求同一套身份：asker 可能是昵称或 UUID，必须解析成记忆键；
-        // 展示名只用于 asker 文案，不能拿去查记忆/过滤 hall。
         let key = self.resolve_key(asker);
         let display = self
             .display_name
@@ -1500,18 +1543,7 @@ impl HttpAiPort for ApplicationHttpAiFacade {
         )
     }
 
-    fn recognize(&self, query: &[(String, String)]) -> Result<String> {
-        self.client.recognize_with_query(query)
-    }
-
-    fn match_song(&self, query: &[(String, String)]) -> Result<String> {
-        self.client.match_with_query(query)
-    }
-
-    fn pick(&self, query: &[(String, String)]) -> Result<String> {
-        self.client.pick_with_query(query)
-    }
-
+    /// 列出所有有记忆的玩家：`key` 是身份（进 SQL），`actor` 是标签（只给人看）。
     fn memory_actors(&self) -> Result<String> {
         let actors = self.memory()?.list_actors()?;
         // key 是身份（进 SQL），actor 是标签（只给人看）。
@@ -1539,14 +1571,12 @@ impl HttpAiPort for ApplicationHttpAiFacade {
         let key = self.resolve_key(actor);
         // 记忆面板只展示 facts/turns/summary；这里按正常读取路径取，
         // 不再为面板额外读取已废弃的 bot_lines。
-        let mut context =
-            memory.context(&key)?;
+        let mut context = memory.context(&key)?;
         // 老库有按昵称直接存的孤儿行（见 ai_chat_actor_names 的建表注释）。
         // 解析后的键查空时按原文再试一次，否则那些历史会凭空消失。
         let mut used = key.clone();
         if context.facts.is_empty() && context.turns.is_empty() && context.summary.is_none() {
-            let legacy =
-                memory.context(actor)?;
+            let legacy = memory.context(actor)?;
             if !legacy.facts.is_empty() || !legacy.turns.is_empty() || legacy.summary.is_some() {
                 used = actor.to_owned();
                 context = legacy;

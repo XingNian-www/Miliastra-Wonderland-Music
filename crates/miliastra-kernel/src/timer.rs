@@ -453,6 +453,43 @@ impl Display for TimerSubmitError {
 
 impl Error for TimerSubmitError {}
 
+/// 计时器事件的投递目标。
+///
+/// 计时器线程只负责「时间到了」，把事件交给谁是使用方的决定。这里只声明
+/// **一次投递**的语义：成功表示对方已接手这一条事件，失败表示对方已经
+/// 不再接收，计时器线程随即准备退出。
+///
+/// 之所以让调用方自己实现，而不是固定成一条 `mpsc::sync_channel`：事件
+/// 常常还要再往下游投递一次（例如业务运行时的事件入口），若强制先经过
+/// 一条中间通道，就必须额外起一个纯转发的线程把两级接起来。直接实现这个
+/// trait 就能让计时器线程**直接**投给最终接收方，省掉那层线程与通道。
+pub trait TimerEventSink<T: DeadlineIdentity> {
+    /// 投递一条事件。返回 `Err(())` 表示接收方已停止，计时器线程应当退出。
+    ///
+    /// 实现必须真实表达背压：有界队列满时在这里阻塞，而不是丢弃事件。
+    fn deliver(&mut self, event: TimerRuntimeEvent<T>) -> Result<(), ()>;
+}
+
+/// 把事件写进一条有界同步通道的 [`TimerEventSink`]。
+///
+/// 通道满时阻塞在 `send` 上，因此计时器线程天然跟随下游的消费速度，
+/// 不会为了「保持响应」而丢事件。接收端全部 drop 之后投递返回错误。
+pub struct ChannelEventSink<T: DeadlineIdentity> {
+    sender: SyncSender<TimerRuntimeEvent<T>>,
+}
+
+impl<T: DeadlineIdentity> ChannelEventSink<T> {
+    pub const fn new(sender: SyncSender<TimerRuntimeEvent<T>>) -> Self {
+        Self { sender }
+    }
+}
+
+impl<T: DeadlineIdentity> TimerEventSink<T> for ChannelEventSink<T> {
+    fn deliver(&mut self, event: TimerRuntimeEvent<T>) -> Result<(), ()> {
+        self.sender.send(event).map_err(|_| ())
+    }
+}
+
 enum TimerCommand<T: DeadlineIdentity> {
     Schedule(DeadlineSchedule<T>),
     Reschedule(DeadlineSchedule<T>),
@@ -542,27 +579,92 @@ pub struct TimerRuntime<T: DeadlineIdentity> {
     worker: Option<JoinHandle<()>>,
 }
 
+/// 尚未绑定事件出口的计时器运行时。
+///
+/// 计时器的命令通道与「是否接受命令」状态在 [`TimerRuntime::prepare`] 时就已经
+/// 就绪，工作线程则要等到 [`TimerRuntimeStarter::start`] 拿到事件出口才开始跑。
+/// 这个两段式接口对应组合根的一段真实空档：计时器句柄必须在业务运行时**构造之前**
+/// 交出去，而业务运行时的事件入口只有**构造之后**才能取得。
+///
+/// 两段之间的语义是明确的：
+///
+/// - 未启动期间提交的命令留在有界命令队列里，并发上限不变，满了照旧报
+///   [`TimerSubmitError::QueueFull`]，绝不会静默丢弃；
+/// - 未启动期间丢弃 starter，命令通道随之关闭，已发出的句柄立即报
+///   [`TimerSubmitError::RuntimeStopped`]，不会有线程被遗忘。
+pub struct TimerRuntimeStarter<T: DeadlineIdentity> {
+    channel: Arc<TimerChannel<T>>,
+    commands: Receiver<TimerCommand<T>>,
+}
+
+impl<T: DeadlineIdentity> TimerRuntimeStarter<T> {
+    /// 命令句柄。可以先把句柄交出去，稍后再绑定事件出口。
+    pub fn handle(&self) -> TimerRuntimeHandle<T> {
+        TimerRuntimeHandle {
+            channel: self.channel.clone(),
+        }
+    }
+
+    /// 绑定事件出口并启动计时器工作线程。
+    pub fn start<S>(self, sink: S) -> Result<TimerRuntime<T>, TimerRuntimeStartError>
+    where
+        S: TimerEventSink<T> + Send + 'static,
+    {
+        let Self { channel, commands } = self;
+        let worker = thread::Builder::new()
+            .name("timer-runtime".to_string())
+            .spawn(move || run_timer_runtime(commands, sink))
+            .map_err(TimerRuntimeStartError::Spawn)?;
+        Ok(TimerRuntime {
+            handle: TimerRuntimeHandle { channel },
+            worker: Some(worker),
+        })
+    }
+}
+
 impl<T: DeadlineIdentity> TimerRuntime<T> {
-    pub fn start(
+    /// 只建立命令通道，不启动工作线程。
+    ///
+    /// 拿到 [`TimerRuntimeStarter`] 后可以先分发 [`TimerRuntimeStarter::handle`]，
+    /// 等事件出口就绪再 [`TimerRuntimeStarter::start`]。
+    pub fn prepare(
         queue_capacity: usize,
-        events: SyncSender<TimerRuntimeEvent<T>>,
-    ) -> Result<Self, TimerRuntimeStartError> {
+    ) -> Result<TimerRuntimeStarter<T>, TimerRuntimeStartError> {
         if queue_capacity == 0 {
             return Err(TimerRuntimeStartError::ZeroQueueCapacity);
         }
-        let (command_sender, command_receiver) = mpsc::sync_channel(queue_capacity);
+        let (command_sender, commands) = mpsc::sync_channel(queue_capacity);
         let channel = Arc::new(TimerChannel {
             sender: command_sender,
             accepting: Mutex::new(true),
         });
-        let worker = thread::Builder::new()
-            .name("timer-runtime".to_string())
-            .spawn(move || run_timer_runtime(command_receiver, events))
-            .map_err(TimerRuntimeStartError::Spawn)?;
-        Ok(Self {
-            handle: TimerRuntimeHandle { channel },
-            worker: Some(worker),
-        })
+        Ok(TimerRuntimeStarter { channel, commands })
+    }
+
+    /// 以一条有界同步通道作为事件出口启动计时器。
+    ///
+    /// 这是最常用的形态，等价于
+    /// `start_with_sink(queue_capacity, ChannelEventSink::new(events))`。
+    pub fn start(
+        queue_capacity: usize,
+        events: SyncSender<TimerRuntimeEvent<T>>,
+    ) -> Result<Self, TimerRuntimeStartError> {
+        Self::start_with_sink(queue_capacity, ChannelEventSink::new(events))
+    }
+
+    /// 以任意 [`TimerEventSink`] 作为事件出口启动计时器。
+    ///
+    /// `queue_capacity` 约束的是**命令**通道：投递截止时间/取消请求的那一侧。
+    /// 事件出口的缓冲策略由 `sink` 自己决定——通道实现自带容量，直投实现
+    /// 则直接沿用下游入口的背压。
+    pub fn start_with_sink<S>(
+        queue_capacity: usize,
+        sink: S,
+    ) -> Result<Self, TimerRuntimeStartError>
+    where
+        S: TimerEventSink<T> + Send + 'static,
+    {
+        Self::prepare(queue_capacity)?.start(sink)
     }
 
     pub fn handle(&self) -> TimerRuntimeHandle<T> {
@@ -596,10 +698,10 @@ impl<T: DeadlineIdentity> Drop for TimerRuntime<T> {
     }
 }
 
-fn run_timer_runtime<T: DeadlineIdentity>(
-    commands: Receiver<TimerCommand<T>>,
-    events: SyncSender<TimerRuntimeEvent<T>>,
-) {
+fn run_timer_runtime<T: DeadlineIdentity, S>(commands: Receiver<TimerCommand<T>>, mut sink: S)
+where
+    S: TimerEventSink<T>,
+{
     let mut core = TimerCore::new();
     loop {
         let now = Instant::now();
@@ -609,8 +711,8 @@ fn run_timer_runtime<T: DeadlineIdentity>(
             Err(_) => unreachable!("draining an open timer core cannot fail"),
         };
         for event in due {
-            if events
-                .send(TimerRuntimeEvent::DeadlineExpired(event))
+            if sink
+                .deliver(TimerRuntimeEvent::DeadlineExpired(event))
                 .is_err()
             {
                 core.close();
@@ -646,8 +748,8 @@ fn run_timer_runtime<T: DeadlineIdentity>(
                     command: TimerCommandKind::Schedule,
                     result,
                 };
-                if events
-                    .send(TimerRuntimeEvent::CommandCompleted(completed))
+                if sink
+                    .deliver(TimerRuntimeEvent::CommandCompleted(completed))
                     .is_err()
                 {
                     core.close();
@@ -668,8 +770,8 @@ fn run_timer_runtime<T: DeadlineIdentity>(
                     command: TimerCommandKind::Reschedule,
                     result,
                 };
-                if events
-                    .send(TimerRuntimeEvent::CommandCompleted(completed))
+                if sink
+                    .deliver(TimerRuntimeEvent::CommandCompleted(completed))
                     .is_err()
                 {
                     core.close();
@@ -687,8 +789,8 @@ fn run_timer_runtime<T: DeadlineIdentity>(
                     command: TimerCommandKind::Cancel,
                     result,
                 };
-                if events
-                    .send(TimerRuntimeEvent::CommandCompleted(completed))
+                if sink
+                    .deliver(TimerRuntimeEvent::CommandCompleted(completed))
                     .is_err()
                 {
                     core.close();
@@ -932,6 +1034,104 @@ mod tests {
             .unwrap();
 
         assert_eq!(core.drain_expired(deadline).unwrap().len(), 2);
+    }
+
+    /// 直投出口：把事件记进一个共享列表，用来断言「计时器线程直接投递」。
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        events: std::sync::Arc<std::sync::Mutex<Vec<TimerRuntimeEvent<Token>>>>,
+    }
+
+    impl super::TimerEventSink<Token> for RecordingSink {
+        fn deliver(&mut self, event: TimerRuntimeEvent<Token>) -> Result<(), ()> {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+            Ok(())
+        }
+    }
+
+    fn wait_for_events(sink: &RecordingSink, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let recorded = sink
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            if recorded >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "定时器直投出口没有收到预期的事件：期望 {expected} 条，实际 {recorded} 条"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn start_with_sink_delivers_events_straight_to_a_custom_sink() {
+        let sink = RecordingSink::default();
+        let runtime = TimerRuntime::start_with_sink(8, sink.clone()).unwrap();
+        let handle = runtime.handle();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        handle.schedule(schedule(token(1), 1, 0, deadline)).unwrap();
+        handle.schedule(schedule(token(2), 2, 0, deadline)).unwrap();
+
+        // 两条命令完成 + 两条到期，全部经同一个 sink，中间没有任何转发线程。
+        wait_for_events(&sink, 4);
+        runtime.shutdown().unwrap();
+
+        let recorded = sink
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let expired = recorded
+            .iter()
+            .filter_map(|event| match event {
+                TimerRuntimeEvent::DeadlineExpired(event) => Some(event.token().id()),
+                TimerRuntimeEvent::CommandCompleted(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expired, vec![1, 2]);
+    }
+
+    #[test]
+    fn prepare_keeps_commands_queued_until_the_sink_is_attached() {
+        let starter = TimerRuntime::<Token>::prepare(2).unwrap();
+        let handle = starter.handle();
+        // 还没有工作线程：前两条命令进有界队列，第三条照旧报满。
+        handle
+            .schedule(schedule(token(1), 1, 0, Instant::now()))
+            .unwrap();
+        handle
+            .schedule(schedule(token(2), 2, 0, Instant::now()))
+            .unwrap();
+        assert_eq!(
+            handle.schedule(schedule(token(3), 3, 0, Instant::now())),
+            Err(TimerSubmitError::QueueFull)
+        );
+
+        let sink = RecordingSink::default();
+        let runtime = starter.start(sink.clone()).unwrap();
+        wait_for_events(&sink, 2);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn dropping_an_unstarted_starter_stops_the_handles_it_handed_out() {
+        let starter = TimerRuntime::<Token>::prepare(2).unwrap();
+        let handle = starter.handle();
+
+        drop(starter);
+
+        assert!(matches!(
+            handle.schedule(schedule(token(1), 1, 0, Instant::now())),
+            Err(TimerSubmitError::RuntimeStopped)
+        ));
     }
 
     #[test]

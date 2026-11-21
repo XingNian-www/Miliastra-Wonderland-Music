@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+use miliastra_kernel::StateStore;
 use serde::{Deserialize, Serialize};
 
 use super::{TurtleSoupPuzzle, parse_question_bank};
-use miliastra_contracts::StateStore;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

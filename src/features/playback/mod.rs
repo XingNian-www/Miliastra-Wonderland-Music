@@ -727,7 +727,7 @@ impl PlaybackService {
         pool_max_size: usize,
         song_dedup: Arc<RwLock<SongDedupConfig>>,
         wall_clock: Arc<dyn WallClock>,
-        store: Arc<dyn miliastra_contracts::StateStore>,
+        store: Arc<dyn miliastra_kernel::StateStore>,
     ) -> Result<Self> {
         let request_state = RequestStateStore::load(playback_state_path, store.clone())?;
         let mut queue = PersistentQueue::from_request_store(request_state.clone(), queue_max_size)?;
@@ -1175,8 +1175,8 @@ fn observation_requires_persist(
 
 pub(crate) use application::{
     LyricTracker, PlaybackApplication, PlaybackApplicationConfig, PlaybackCommandContext,
-    PlaybackCommandPort, PlaybackExecutionPort, PlaybackMonitorPort, PlaybackPickedCandidate,
-    PlaybackResult, PlaybackSearchFailure, PlaybackSelection, PlaybackWorkload,
+    PlaybackCommandPort, PlaybackExecutionPort, PlaybackMonitorPort, PlaybackResult,
+    PlaybackSearchFailure, PlaybackSelection, PlaybackWorkload,
 };
 
 #[cfg(test)]

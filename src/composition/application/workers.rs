@@ -1,6 +1,5 @@
 use super::*;
 use miliastra_playback::TrackKey;
-use std::collections::HashMap;
 
 use crate::features::playback::{
     BackgroundLyricsScope, LyricTracker, PauseReason, PlaybackMonitorPort, PlaybackWorkload,
@@ -47,134 +46,138 @@ impl RepeatWarn {
     }
 }
 
-pub(super) struct BackgroundCommandManager {
-    inner: Arc<BackgroundCommandManagerInner>,
+/// 后台歌词输出的唯一托管任务。
+///
+/// 进程里同时只允许一条后台歌词线程：`@歌词` 重复触发时第二次调用返回
+/// `Ok(false)`，调用方据此回「已经在发送」。这个约束是**一条任务**上的约束，
+/// 不是一张命令注册表——原先用 `HashMap<String, ...>` 按名字登记，实际只有
+/// `"lyrics"` 一个键，字符串既没有第二个取值也没有外部来源，只会让
+/// 「查表是否为空」冒充「任务是否在跑」，把状态判断绕了一圈。
+///
+/// 现在的形状与真实约束一一对应：一个 `Mutex<Option<RunningBackgroundLyrics>>`
+/// 表达「至多一条在跑」，`stop` 与 `reap` 都只作用于这一条，线程名固定。
+///
+/// 并发语义与原来一致：启动前先 `reap` 回收自然结束的线程；判断与登记在
+/// 同一把锁里完成（`spawn` 也在锁内），并发触发时只有一条线程会被创建。
+/// `Drop` 兜底停掉仍在跑的那条，绝不留下野线程。
+pub(super) struct BackgroundLyricsWorker {
+    inner: Arc<BackgroundLyricsWorkerInner>,
 }
 
-struct BackgroundCommandManagerInner {
-    state: Mutex<HashMap<String, BackgroundCommandState>>,
+struct BackgroundLyricsWorkerInner {
+    /// 至多一条在跑的歌词线程。`None` 表示当前没有。
+    task: Mutex<Option<RunningBackgroundLyrics>>,
 }
 
-struct BackgroundCommandState {
+struct RunningBackgroundLyrics {
     stop: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
 }
 
-impl BackgroundCommandManager {
+/// 后台歌词线程的名字。固定值，因为进程里只有这一条。
+const BACKGROUND_LYRICS_THREAD_NAME: &str = "background-lyrics";
+
+impl BackgroundLyricsWorker {
     pub(super) fn new() -> Self {
         Self {
-            inner: Arc::new(BackgroundCommandManagerInner {
-                state: Mutex::new(HashMap::new()),
+            inner: Arc::new(BackgroundLyricsWorkerInner {
+                task: Mutex::new(None),
             }),
         }
     }
 
-    pub(super) fn start<F>(&self, name: &str, worker: F) -> Result<bool>
-    where
-        F: FnOnce(Arc<AtomicBool>) + Send + 'static,
-    {
-        self.reap_finished()?;
-        {
-            let state = self
-                .inner
-                .state
-                .lock()
-                .map_err(|_| anyhow!("后台命令状态锁已损坏"))?;
-            if state.contains_key(name) {
-                return Ok(false);
-            }
-        }
+    /// 启动后台歌词线程；已经有一条在跑时返回 `Ok(false)`。
+    pub(super) fn start(&self, request: BackgroundLyricsRequest) -> Result<bool> {
+        self.start_spawn(move |stop| request.run(stop))
+    }
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let thread_name = format!("background-command-{name}");
-        let worker = thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || worker(thread_stop))
-            .map_err(|error| anyhow!("启动后台命令线程失败: {error}"))?;
-
-        let mut state = self
+    /// 启动线程的公共骨架：只关心「至多一条」与停止信号，不关心任务是什么。
+    ///
+    /// 单测用它注入不需要整条播放器链路的任务体；生产路径经 [`Self::start`]。
+    ///
+    /// **判断与插入在同一把锁里**，`spawn` 也在锁内完成。这样「是否已有任务」
+    /// 与「登记新任务」之间没有空档，并发触发时只会有一条线程被真正创建；
+    /// 若先把锁放掉再 spawn，两个调用者会同时看到「空闲」而各起一条，后到的那条
+    /// 只能原地停掉——它已经跑起来了，日志里会留下一次并非真实的启动记录。
+    /// `spawn` 只花几微秒，被锁挡住的是同一时刻的其他启动请求，不是歌词线程本身。
+    fn start_spawn(&self, run: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> Result<bool> {
+        self.reap()?;
+        let mut task = self
             .inner
-            .state
+            .task
             .lock()
-            .map_err(|_| anyhow!("后台命令状态锁已损坏"))?;
-        if state.contains_key(name) {
-            stop.store(true, AtomicOrdering::SeqCst);
-            drop(state);
-            let _ = worker.join();
+            .map_err(|_| anyhow!("后台歌词任务状态锁已损坏"))?;
+        if task.is_some() {
             return Ok(false);
         }
-        state.insert(name.to_string(), BackgroundCommandState { stop, worker });
-        log::info!("后台命令「{name}」已启动");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let spawned = thread::Builder::new()
+            .name(BACKGROUND_LYRICS_THREAD_NAME.to_string())
+            .spawn(move || run(thread_stop))
+            .map_err(|error| anyhow!("启动后台歌词线程失败: {error}"))?;
+        *task = Some(RunningBackgroundLyrics {
+            stop,
+            worker: spawned,
+        });
+        drop(task);
+        log::info!("后台歌词监听线程已启动");
         Ok(true)
     }
 
-    fn reap_finished(&self) -> Result<()> {
+    /// 回收已经自然结束的线程，并把退出信息记进日志。
+    ///
+    /// 有单次时长（`@歌词 N秒`）的任务会自己退出；不回收就会一直占着
+    /// 「在跑」的位置，下一次 `@歌词` 永远起不来。
+    fn reap(&self) -> Result<()> {
         let finished = {
-            let mut state = self
+            let mut task = self
                 .inner
-                .state
+                .task
                 .lock()
-                .map_err(|_| anyhow!("后台命令状态锁已损坏"))?;
-            let finished_names = state
-                .iter()
-                .filter(|(_, command)| command.worker.is_finished())
-                .map(|(name, _)| name.clone())
-                .collect::<Vec<_>>();
-            finished_names
-                .into_iter()
-                .filter_map(|name| state.remove(&name).map(|command| (name, command)))
-                .collect::<Vec<_>>()
+                .map_err(|_| anyhow!("后台歌词任务状态锁已损坏"))?;
+            match task.as_ref() {
+                Some(running) if running.worker.is_finished() => task.take(),
+                _ => None,
+            }
         };
-        for (name, command) in finished {
-            command
+        if let Some(finished) = finished {
+            finished
                 .worker
                 .join()
-                .map_err(|_| anyhow!("后台命令线程 panic: {name}"))?;
-            log::info!("后台命令「{name}」已自然结束");
+                .map_err(|_| anyhow!("后台歌词线程 panic"))?;
+            log::info!("后台歌词监听线程已自然结束");
         }
         Ok(())
     }
 
-    pub(super) fn stop(&self, name: &str) -> Result<bool> {
-        let Some(command) = self
+    /// 请求停止并等待线程退出；当前没有在跑的任务时返回 `Ok(false)`。
+    pub(super) fn stop(&self) -> Result<bool> {
+        let Some(running) = self
             .inner
-            .state
+            .task
             .lock()
-            .map_err(|_| anyhow!("后台命令状态锁已损坏"))?
-            .remove(name)
+            .map_err(|_| anyhow!("后台歌词任务状态锁已损坏"))?
+            .take()
         else {
             return Ok(false);
         };
-        command.stop.store(true, AtomicOrdering::SeqCst);
-        command
+        running.stop.store(true, AtomicOrdering::SeqCst);
+        running
             .worker
             .join()
-            .map_err(|_| anyhow!("后台命令线程 panic: {name}"))?;
-        log::info!("后台命令「{name}」已停止");
+            .map_err(|_| anyhow!("后台歌词线程 panic"))?;
+        log::info!("后台歌词监听线程已停止");
         Ok(true)
     }
 
+    /// 停机路径：确保线程已退出。没有任务时同样返回 `Ok(())`。
     pub(super) fn stop_all(&self) -> Result<()> {
-        let commands = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| anyhow!("后台命令状态锁已损坏"))?
-            .drain()
-            .collect::<Vec<_>>();
-        let mut first_error = None;
-        for (name, command) in commands {
-            command.stop.store(true, AtomicOrdering::SeqCst);
-            if command.worker.join().is_err() && first_error.is_none() {
-                first_error = Some(anyhow!("后台命令线程 panic: {name}"));
-            }
-        }
-        first_error.map_or(Ok(()), Err)
+        self.stop().map(|_| ())
     }
 }
 
-impl Clone for BackgroundCommandManager {
+impl Clone for BackgroundLyricsWorker {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -182,30 +185,56 @@ impl Clone for BackgroundCommandManager {
     }
 }
 
-impl Drop for BackgroundCommandManagerInner {
+impl Drop for BackgroundLyricsWorkerInner {
     fn drop(&mut self) {
-        let state = match self.state.get_mut() {
-            Ok(state) => state,
+        let task = match self.task.get_mut() {
+            Ok(task) => task,
             Err(error) => {
                 log::error!(
-                    "后台命令状态已损坏（步骤：关闭时读取命令状态），无法确认线程是否已退出，仍尝试关闭，可能残留线程"
+                    "后台歌词任务状态已损坏（步骤：关闭时读取任务状态），无法确认线程是否已退出，仍尝试关闭，可能残留线程"
                 );
                 error.into_inner()
             }
         };
-        for (name, command) in state.drain() {
-            command.stop.store(true, AtomicOrdering::SeqCst);
-            if command.worker.join().is_err() {
-                log::error!(
-                    "后台命令「{name}」的线程关闭时崩溃（步骤：等待线程退出），该命令未能正常收尾"
-                );
-            }
+        let Some(running) = task.take() else {
+            return;
+        };
+        running.stop.store(true, AtomicOrdering::SeqCst);
+        if running.worker.join().is_err() {
+            log::error!("后台歌词线程关闭时崩溃（步骤：等待线程退出），该次歌词输出未能正常收尾");
         }
     }
 }
 
+/// 一次后台歌词请求的全部依赖。
+///
+/// 字段刻意保持私有：调用方只能经 [`start_background_lyrics`] 构造它，
+/// 因此「哪些东西属于后台歌词任务」这件事只有一处定义。
+pub(super) struct BackgroundLyricsRequest {
+    player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
+    task_engine: TaskEngineHandle,
+    running: Arc<AtomicBool>,
+    poll: Duration,
+    duration: Option<Duration>,
+    scope: BackgroundLyricsScope,
+}
+
+impl BackgroundLyricsRequest {
+    fn run(self, stop: Arc<AtomicBool>) {
+        run_background_lyrics(
+            self.player,
+            self.task_engine,
+            self.running,
+            stop,
+            self.poll,
+            self.duration,
+            self.scope,
+        );
+    }
+}
+
 pub(super) fn start_background_lyrics(
-    manager: &BackgroundCommandManager,
+    worker: &BackgroundLyricsWorker,
     player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
     task_engine: TaskEngineHandle,
     running: Arc<AtomicBool>,
@@ -213,8 +242,13 @@ pub(super) fn start_background_lyrics(
     duration: Option<Duration>,
     scope: BackgroundLyricsScope,
 ) -> Result<bool> {
-    manager.start("lyrics", move |stop| {
-        run_background_lyrics(player, task_engine, running, stop, poll, duration, scope);
+    worker.start(BackgroundLyricsRequest {
+        player,
+        task_engine,
+        running,
+        poll,
+        duration,
+        scope,
     })
 }
 
@@ -1038,6 +1072,7 @@ fn suppress_automatic_advance_for_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 
     /// 首次必须 warn：抑制不能把故障的第一条痕迹也吞掉。
@@ -1203,37 +1238,157 @@ mod tests {
             .expect("waiting worker exits after final wake");
     }
 
+    /// 只为测试准备的后台歌词任务体：不碰播放器，只按控制信号跑完。
+    ///
+    /// 真实 [`BackgroundLyricsRequest`] 需要整条播放器链路，这里验证的是
+    /// 「至多一条线程」这层生命周期，两者互不干扰。
+    /// 等到条件成立；超时直接失败，避免用例在坏实现上挂死。
+    fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !condition() {
+            assert!(Instant::now() < deadline, "{what}（等待超时）");
+            thread::yield_now();
+        }
+    }
+
+    /// 等到后台线程真正结束，而不只是任务体置了标志。
+    fn wait_until_worker_exits(worker: &BackgroundLyricsWorker, finished: &AtomicBool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            worker.reap().expect("reap finished worker");
+            let running = worker
+                .inner
+                .task
+                .lock()
+                .expect("task state")
+                .as_ref()
+                .is_some_and(|task| !task.worker.is_finished());
+            if !running {
+                assert!(finished.load(AtomicOrdering::SeqCst), "任务体应当已经跑完");
+                return;
+            }
+            assert!(Instant::now() < deadline, "后台歌词线程未在预期时间内退出");
+            thread::yield_now();
+        }
+    }
+
+    struct TestLyricsTask {
+        started: Arc<AtomicUsize>,
+        finished: Arc<AtomicBool>,
+        hold: bool,
+    }
+
+    impl BackgroundLyricsWorker {
+        fn start_test_task(&self, task: TestLyricsTask) -> Result<bool> {
+            self.start_spawn(move |stop| {
+                task.started.fetch_add(1, AtomicOrdering::SeqCst);
+                while task.hold && !stop.load(AtomicOrdering::SeqCst) {
+                    thread::yield_now();
+                }
+                task.finished.store(true, AtomicOrdering::SeqCst);
+            })
+        }
+    }
+
     #[test]
-    fn finished_background_workers_are_reaped_before_restarting_same_name() {
-        let manager = BackgroundCommandManager::new();
+    fn finished_background_lyrics_worker_is_reaped_before_restart() {
+        let worker = BackgroundLyricsWorker::new();
+        let started = Arc::new(AtomicUsize::new(0));
         let finished = Arc::new(AtomicBool::new(false));
-        let worker_finished = Arc::clone(&finished);
 
         assert!(
-            manager
-                .start("timed-lyrics", move |_| {
-                    worker_finished.store(true, AtomicOrdering::SeqCst);
+            worker
+                .start_test_task(TestLyricsTask {
+                    started: Arc::clone(&started),
+                    finished: Arc::clone(&finished),
+                    hold: false,
                 })
-                .expect("start timed worker")
+                .expect("start one-shot worker")
         );
 
-        while !finished.load(AtomicOrdering::SeqCst) {
+        // 任务体置位 `finished` 与线程真正退出之间有一小段窗口，`reap` 认的是
+        // 后者（`JoinHandle::is_finished`）。这里等到线程确实结束再重启，
+        // 与生产路径「下一次 `@歌词` 先 reap 再启动」的时序一致。
+        wait_until_worker_exits(&worker, &finished);
+
+        // 一次性任务自己退出后必须能被回收，否则下次 `@歌词` 永远起不来。
+        assert!(
+            worker
+                .start_test_task(TestLyricsTask {
+                    started: Arc::clone(&started),
+                    finished: Arc::clone(&finished),
+                    hold: true,
+                })
+                .expect("restart after one-shot worker")
+        );
+        // 线程是异步调度的：`start` 返回只代表已登记，任务体要等被调度才计数。
+        wait_until(
+            || started.load(AtomicOrdering::SeqCst) == 2,
+            "重启的线程应当跑起来",
+        );
+        assert!(worker.stop().expect("stop restarted worker"));
+    }
+
+    #[test]
+    fn concurrent_start_of_background_lyrics_keeps_exactly_one_thread() {
+        let worker = BackgroundLyricsWorker::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let requests = 8;
+        let mut handles = Vec::with_capacity(requests);
+        for _ in 0..requests {
+            let worker = worker.clone();
+            let started = Arc::clone(&started);
+            let finished = Arc::clone(&finished);
+            handles.push(thread::spawn(move || {
+                worker
+                    .start_test_task(TestLyricsTask {
+                        started,
+                        finished,
+                        hold: true,
+                    })
+                    .expect("start background lyrics")
+            }));
+        }
+        let accepted = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("start thread"))
+            .filter(|started| *started)
+            .count();
+
+        assert_eq!(
+            accepted, 1,
+            "并发触发只应成功启动一条后台歌词线程，实际 {accepted} 条"
+        );
+        assert_eq!(started.load(AtomicOrdering::SeqCst), 1);
+        assert!(worker.stop().expect("stop the single worker"));
+        assert!(!worker.stop().expect("second stop is a no-op"));
+    }
+
+    #[test]
+    fn dropping_background_lyrics_worker_stops_the_running_thread() {
+        let worker = BackgroundLyricsWorker::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let other = worker.clone();
+
+        assert!(
+            worker
+                .start_test_task(TestLyricsTask {
+                    started: Arc::clone(&started),
+                    finished: Arc::clone(&finished),
+                    hold: true,
+                })
+                .expect("start held worker")
+        );
+        while started.load(AtomicOrdering::SeqCst) == 0 {
             thread::yield_now();
         }
 
-        let restarted = (0..100).find_map(|_| {
-            let started = manager
-                .start("timed-lyrics", |_| {})
-                .expect("restart after timed worker");
-            if started {
-                Some(())
-            } else {
-                thread::yield_now();
-                None
-            }
-        });
-        assert!(restarted.is_some());
-        manager.stop("timed-lyrics").expect("stop restarted worker");
+        drop(worker);
+        drop(other);
+        // 最后一个句柄消失时 `Drop` 必须兜底停掉线程，而不是把它留成野线程。
+        assert!(finished.load(AtomicOrdering::SeqCst));
     }
 
     #[test]

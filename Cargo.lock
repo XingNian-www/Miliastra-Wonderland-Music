@@ -2614,13 +2614,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "miliastra-contracts"
-version = "0.1.0"
-dependencies = [
- "anyhow",
-]
-
-[[package]]
 name = "miliastra-kernel"
 version = "0.1.0"
 dependencies = [
@@ -2704,7 +2697,6 @@ dependencies = [
  "image",
  "imageproc",
  "log",
- "miliastra-contracts",
  "miliastra-kernel",
  "miliastra-login-protocol",
  "miliastra-playback",

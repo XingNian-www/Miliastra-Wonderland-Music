@@ -489,23 +489,34 @@ impl Drop for FriendBusinessSuppression {
 }
 
 impl ChatTimeline {
-    /// 某条已见消息在当前账本里的交付状态；用于把“未判为新增”细分为可排查的原因。
-    pub(crate) fn business_delivery_state(
+    /// 某条已见消息在**这份快照视角下**的交付状态；用于把“未判为新增”细分为可排查的原因。
+    ///
+    /// 判据与 [`Self::is_business_pending_at`] 是同一套围栏核验。为什么必须先判围栏再判
+    /// 账本：被更新修订推进的围栏挡住的旧快照，账本里那一条仍然是 `pending`（新修订
+    /// 还要交付），若按账本报成“仅排队未派发”，排查方向会被引向“业务链路没跑”，
+    /// 而真实原因是“这份修订已经被更新修订取代了”。
+    ///
+    /// 所以出参按“这份快照能不能消费”排序，而不是按账本内部字段：
+    /// 已认领 > 被围栏挡住 > 仅排队 > 等待修订 > 未入账。
+    pub(crate) fn business_delivery_state_at(
         &self,
         id: &ObservedChatMessageId,
+        captured_at: Instant,
     ) -> Result<BusinessDeliveryState> {
         let state = self.lock()?;
-        Ok(if state.ledger.pending.contains(id) {
-            BusinessDeliveryState::Pending
-        } else if state.ledger.claimed.contains(id) {
-            BusinessDeliveryState::Claimed
-        } else if state.ledger.ignored_revisions.contains_key(id) {
-            BusinessDeliveryState::IgnoredRevision
-        } else if state.ledger.revision_delivery_fences.contains_key(id) {
-            BusinessDeliveryState::Fenced
-        } else {
-            BusinessDeliveryState::NotTracked
-        })
+        Ok(
+            if snapshot_precedes_delivery_fence(&state, id, captured_at) {
+                BusinessDeliveryState::Fenced
+            } else if state.ledger.claimed.contains(id) {
+                BusinessDeliveryState::Claimed
+            } else if state.ledger.pending.contains(id) {
+                BusinessDeliveryState::Pending
+            } else if state.ledger.ignored_revisions.contains_key(id) {
+                BusinessDeliveryState::IgnoredRevision
+            } else {
+                BusinessDeliveryState::NotTracked
+            },
+        )
     }
 
     /// 这条消息是否首次被记为“命令未执行”；true 表示应当打日志（同一实例只打一次）。
@@ -1421,11 +1432,30 @@ impl ChatTimeline {
         Ok(true)
     }
 
-    pub(crate) fn is_business_pending(&self, id: &ObservedChatMessageId) -> Result<bool> {
+    /// 账本探针：这条 id 现在还在不在待处理队列。**不核验修订围栏。**
+    ///
+    /// 它回答的是「业务链路有没有取走它」，而不是「这份快照该不该交付」。
+    /// 两者只有在存在围栏时才会分叉，而分叉时按账本作答恰好是错的——
+    /// 旧排队 OCR 看到 `true` 会去消费一条已被更新修订取代的气泡。
+    ///
+    /// 因此**决定是否交付某份快照时一律用 [`Self::is_business_pending_at`]**；
+    /// 这里只留给「等待消费进度」这类与快照无关的观察。
+    pub(crate) fn is_business_pending_in_ledger(&self, id: &ObservedChatMessageId) -> Result<bool> {
         Ok(self.lock()?.ledger.pending.contains(id))
     }
 
+    /// 旧名保留给既有测试：它就是 [`Self::is_business_pending_in_ledger`]。
+    ///
+    /// 刻意收在 `cfg(test)`：生产代码若还能调到无围栏的待处理判定，
+    /// 读侧绕开围栏这件事就会再次悄悄长回来。
+    #[cfg(test)]
+    pub(crate) fn is_business_pending(&self, id: &ObservedChatMessageId) -> Result<bool> {
+        self.is_business_pending_in_ledger(id)
+    }
+
     /// 快照消费同时核对修订时间，旧排队 OCR 不能抢先消费较新的有效修订。
+    ///
+    /// 这是**读侧唯一的交付判定**：持有 `captured_at` 的路径都必须走它。
     pub(crate) fn is_business_pending_at(
         &self,
         id: &ObservedChatMessageId,
@@ -1468,8 +1498,35 @@ impl ChatTimeline {
         }))
     }
 
+    /// 无快照时间的**永久确认**：确认这条消息已处理，同一 id 不再交付。
+    ///
+    /// 语义边界：它**不核验修订围栏**，因为没有 `captured_at` 可比。仅适用于
+    /// 「消息刚从自己的队列里读出来、且队列没有随消息携带捕获时刻」的读者；
+    /// 目前只有点歌确认窗口那一条（见 `composition::application::playback`）。
+    ///
+    /// **凡是持有快照 `captured_at` 的读/确认路径必须用
+    /// [`Self::acknowledge_business_at`]**：用无时间的永久确认，旧快照会把
+    /// 更新的有效修订永久吞掉，表现为「OCR 修正后的命令再也没有派发」。
     pub(crate) fn acknowledge_business(&self, id: &ObservedChatMessageId) -> Result<bool> {
         let mut state = self.lock()?;
+        Ok(acknowledge_business_locked(&mut state, id))
+    }
+
+    /// 带修订围栏核验的永久确认：捕获时间不早于交付围栏时才算数。
+    ///
+    /// 围栏由**更新的修订**推进（未识别修订被纠正、未读提升、迟到的忽略提交）。
+    /// 旧快照拿的是已经被取代的正文，让它确认就会永久吞掉更新修订的派发资格，
+    /// 所以这里直接拒绝：返回 `false` 表示本次确认未生效，消息仍留在待处理队列里，
+    /// 等捕获时间不早于围栏的那份快照来消费。
+    pub(crate) fn acknowledge_business_at(
+        &self,
+        id: &ObservedChatMessageId,
+        captured_at: Instant,
+    ) -> Result<bool> {
+        let mut state = self.lock()?;
+        if snapshot_precedes_delivery_fence(&state, id, captured_at) {
+            return Ok(false);
+        }
         Ok(acknowledge_business_locked(&mut state, id))
     }
 
@@ -1495,9 +1552,13 @@ impl ChatTimeline {
 
     /// 一级大厅命令路径的"真正派发成功"完成点：确认已处理，并用被派发消息自身的
     /// 文本与锚点写入命令锁。调用方必须只在成功派发点调用它；被禁用/被跳过的
-    /// 路径只调 `acknowledge_business`，未路由修订使用 `acknowledge_ignored`。
+    /// 路径只确认，不写锁；未路由修订使用 `acknowledge_ignored`。
     ///
     /// 锚点由来源决定：OCR 传 `Screen { y }`，外部源传 `Sequence { after }`。
+    ///
+    /// 无快照时间版本。**不核验修订围栏**，只适用于「派发决策与消息读取之间
+    /// 没有跨帧等待」的路径：命令在入队那一刻就已经是该 id 的最新修订。
+    /// 持有快照 `captured_at` 的路径请用 [`Self::acknowledge_command_at_revision`]。
     pub(crate) fn acknowledge_command_at(
         &self,
         id: &ObservedChatMessageId,
@@ -1505,6 +1566,28 @@ impl ChatTimeline {
         anchor: LockAnchor,
     ) -> Result<bool> {
         let mut state = self.lock()?;
+        let found = acknowledge_business_locked(&mut state, id);
+        record_command_lock_locked(&mut state, &id.chat, text, anchor);
+        Ok(found)
+    }
+
+    /// 带修订围栏核验的命令成功确认：旧快照既不能确认，也不能写命令锁。
+    ///
+    /// 为什么不只是「跳过确认、照写锁」：命令锁只用来抑制**同一屏幕位置上
+    /// 同一条已执行命令**。旧快照的正文已被更新修订取代（哪怕只是 OCR 修正），
+    /// 把它的文本写进锁等于给一条从未被执行过的命令留下墓碑——真正的修订版本
+    /// 随后派发时会被这把锁挡住，命令永久丢失。因此围栏前置，锁也不写。
+    pub(crate) fn acknowledge_command_at_revision(
+        &self,
+        id: &ObservedChatMessageId,
+        captured_at: Instant,
+        text: &str,
+        anchor: LockAnchor,
+    ) -> Result<bool> {
+        let mut state = self.lock()?;
+        if snapshot_precedes_delivery_fence(&state, id, captured_at) {
+            return Ok(false);
+        }
         let found = acknowledge_business_locked(&mut state, id);
         record_command_lock_locked(&mut state, &id.chat, text, anchor);
         Ok(found)
@@ -2264,7 +2347,7 @@ mod tests {
             reopened.messages[1].is_new,
             "有交叠时命令应判新；当前状态={:?}",
             shared
-                .business_delivery_state(&reopened.messages[1].id)
+                .business_delivery_state_at(&reopened.messages[1].id, reopened.captured_at)
                 .unwrap()
         );
     }
@@ -2452,7 +2535,7 @@ mod tests {
             reopened.messages[0].is_new,
             "无交叠重开后好友命令必须判新；当前状态={:?}",
             shared
-                .business_delivery_state(&reopened.messages[0].id)
+                .business_delivery_state_at(&reopened.messages[0].id, reopened.captured_at)
                 .unwrap()
         );
     }
@@ -2639,6 +2722,238 @@ mod tests {
                 message.raw_sender.as_deref(),
             )
             .unwrap()
+    }
+
+    /// 构造一条「已被更新修订推进围栏」的消息，返回 (id, 旧快照时间, 新快照时间)。
+    ///
+    /// 复现路径：一条未识别身份的气泡先被忽略（记成 `ignored_revisions`），随后同一
+    /// 气泡被 OCR 补出可识别身份。身份修订会清掉忽略记录、把
+    /// `revision_delivery_fences` 推到**修订帧的捕获时刻**并重新入队——此后任何
+    /// 早于该时刻的快照都不该再消费或确认这条消息。
+    ///
+    /// 修正必须是「同一气泡的识别增强」：气泡 id 由跨帧对齐决定，只有正文逐字节
+    /// 相同时才复用同一个 id（见 `Tracker::observe`）。整段换字会生成新 id，
+    /// 那样测的就是两条独立消息，围栏根本用不上。
+    fn fenced_revision(
+        shared: &ChatTimeline,
+        text: &str,
+    ) -> (ObservedChatMessageId, Instant, Instant) {
+        let stale = publish(shared, vec![input(text, 40)]);
+        assert!(
+            ignore_revision(shared, &stale, 0),
+            "未识别身份的气泡先被忽略"
+        );
+        let corrected = publish(shared, vec![identified(text)]);
+        let id = corrected.messages[0].id.clone();
+        assert_eq!(id, stale.messages[0].id, "身份修订必须落在同一个气泡 id 上");
+        assert!(
+            shared.is_business_pending_in_ledger(&id).unwrap(),
+            "有效身份修订必须重新进入待处理队列，否则本测试没有可围栏的对象"
+        );
+        assert_eq!(
+            {
+                let state = shared.inner.state.lock().unwrap();
+                state.ledger.revision_delivery_fences.get(&id).copied()
+            },
+            Some(corrected.captured_at),
+            "身份修订必须把交付围栏推到修订帧的捕获时刻"
+        );
+        (id, stale.captured_at, corrected.captured_at)
+    }
+
+    /// 把一条消息的发送者设为「甲」：让同一气泡的正文获得可识别身份。
+    fn identified(text: &str) -> RecognizedChatMessage {
+        RecognizedChatMessage {
+            sender: Some("甲".into()),
+            ..input(text, 40)
+        }
+    }
+
+    /// 红线：旧快照的待处理判定必须被围栏挡住，不能把更新修订当作自己的交付资格。
+    ///
+    /// 这是 `is_business_pending` 收窄成账本探针的直接理由：账本里那一条确实是
+    /// `pending`（新修订还要交付），但**旧快照无权回答它**。若旧快照据此派发，
+    /// 派发的会是已被取代的旧正文；若据此确认，更新修订会被永久吞掉。
+    #[test]
+    fn stale_snapshot_cannot_treat_a_fenced_revision_as_pending() {
+        let shared = ChatTimeline::new();
+        let (id, stale_at, corrected_at) = fenced_revision(&shared, "#加入");
+
+        // 账本视角：这条 id 确实还在队列里。
+        assert!(
+            shared.is_business_pending_in_ledger(&id).unwrap(),
+            "新修订仍待派发，账本必须如实报告"
+        );
+        // 快照视角：旧捕获时刻被围栏挡住，新捕获时刻放行。
+        assert!(
+            !shared.is_business_pending_at(&id, stale_at).unwrap(),
+            "旧快照不得把更新修订当作自己的交付资格"
+        );
+        assert!(
+            shared.is_business_pending_at(&id, corrected_at).unwrap(),
+            "围栏之后捕获的快照必须能消费这条修订"
+        );
+        // 排查口径跟着同一套判据：旧快照报「被交付栅栏挡住」，而不是「仅排队未派发」。
+        assert_eq!(
+            shared.business_delivery_state_at(&id, stale_at).unwrap(),
+            BusinessDeliveryState::Fenced
+        );
+        assert_eq!(
+            shared
+                .business_delivery_state_at(&id, corrected_at)
+                .unwrap(),
+            BusinessDeliveryState::Pending
+        );
+    }
+
+    /// 红线：旧快照的永久确认必须被围栏挡住，且**不得**把后续修订吞掉。
+    ///
+    /// 误吞的机制：`acknowledge_business` 无条件写 `claimed` 墓碑并清掉围栏。
+    /// 旧快照一旦成功，更新修订从此既不在 `pending` 也无围栏可查——
+    /// 表现为「OCR 修正后的命令再也没有派发」，日志里连原因都看不到。
+    #[test]
+    fn stale_snapshot_permanent_ack_is_rejected_and_keeps_the_newer_revision_deliverable() {
+        let shared = ChatTimeline::new();
+        // 「@点哥」是「@点歌」的典型 OCR 误读；修订帧补出昵称后整条气泡才可被识别。
+        let (id, stale_at, corrected_at) = fenced_revision(&shared, "@点哥 晴天");
+
+        assert!(
+            !shared.acknowledge_business_at(&id, stale_at).unwrap(),
+            "旧快照的永久确认必须被围栏拒绝"
+        );
+        // 拒绝必须是**无副作用**的：更新修订仍可交付，且仍未被认领。
+        assert!(
+            shared.is_business_pending_at(&id, corrected_at).unwrap(),
+            "被拒绝的旧确认不得吞掉更新修订"
+        );
+        assert_eq!(
+            shared
+                .business_delivery_state_at(&id, corrected_at)
+                .unwrap(),
+            BusinessDeliveryState::Pending
+        );
+
+        // 围栏之后的确认照常生效，并把墓碑留给同一 id 的后续帧。
+        assert!(
+            shared.acknowledge_business_at(&id, corrected_at).unwrap(),
+            "围栏之后的永久确认必须生效"
+        );
+        assert!(!shared.is_business_pending_at(&id, corrected_at).unwrap());
+        assert_eq!(
+            shared
+                .business_delivery_state_at(&id, corrected_at)
+                .unwrap(),
+            BusinessDeliveryState::Claimed
+        );
+    }
+
+    /// 红线：旧快照的命令成功确认既不能确认，也不能写命令锁。
+    ///
+    /// 只跳过确认、照样写锁同样是错的：命令锁只抑制「同屏幕位置同一条已执行命令」。
+    /// 给一条从未执行的旧正文留下墓碑，会让真正的修正版本在重建后被这把锁挡住——
+    /// 命令永久丢失，且日志只会说「已执行过」。
+    #[test]
+    fn stale_snapshot_command_ack_writes_no_success_lock() {
+        let shared = ChatTimeline::new();
+        let (id, stale_at, corrected_at) = fenced_revision(&shared, "@点歌 晴天");
+        let stale_text = "@点歌 晴天";
+        let corrected_text = "@点歌 晴天";
+        let anchor = LockAnchor::Screen { y: 40 };
+
+        assert!(
+            !shared
+                .acknowledge_command_at_revision(&id, stale_at, stale_text, anchor)
+                .unwrap(),
+            "旧快照不得确认命令成功"
+        );
+        assert!(
+            shared
+                .command_lock_texts_for_test(&ChatIdentity::PrimaryHall)
+                .is_empty(),
+            "旧快照不得写命令锁：否则修正版本会被自己旧文本的墓碑挡住"
+        );
+        assert!(
+            shared.is_business_pending_at(&id, corrected_at).unwrap(),
+            "更新修订必须仍然可交付"
+        );
+
+        // 围栏之后的成功确认照常确认并写锁。
+        assert!(
+            shared
+                .acknowledge_command_at_revision(&id, corrected_at, corrected_text, anchor)
+                .unwrap()
+        );
+        assert!(
+            shared
+                .command_lock_texts_for_test(&ChatIdentity::PrimaryHall)
+                .contains(&normalize_command_lock_text(corrected_text)),
+            "围栏之后的成功命令必须写锁"
+        );
+    }
+
+    /// 未读提升推进的围栏与修订围栏是两套来源，读侧必须都认。
+    ///
+    /// 提升写的是 `unread_delivery_fences`，身份修订写的是 `revision_delivery_fences`；
+    /// 任何一处漏判，对应来源的旧快照就能绕过围栏。提升刻意采用**最新一次真实 OCR**
+    /// 的捕获时刻（而不是传入的那份快照），所以排在提升前、已被更晚画面取代的排队帧
+    /// 必须被挡住。
+    #[test]
+    fn unread_promotion_fence_also_blocks_older_snapshots() {
+        let shared = ChatTimeline::new();
+        let friend_chat = ChatIdentity::Friend(Arc::from("observed name"));
+        let mut first_view = vec![input("旧消息", 10), input("@点歌 晴天", 40)];
+        for message in &mut first_view {
+            message.message_type = "pink".into();
+        }
+        let baseline = shared
+            .publish(Instant::now(), friend_chat.clone(), first_view)
+            .unwrap();
+        let id = baseline.messages[1].id.clone();
+        let stale_at = baseline.captured_at;
+        assert!(baseline.messages.iter().all(|message| !message.is_new));
+        assert!(
+            shared
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .unread_baseline
+                .contains(&id),
+            "首屏粉色历史应进入未读基线"
+        );
+        // 再推一帧更晚的真实 OCR：提升会采用**它**的捕获时刻作为围栏。
+        let mut later = vec![input("旧消息", 10), input("@点歌 晴天", 40)];
+        for message in &mut later {
+            message.message_type = "pink".into();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        shared.publish(Instant::now(), friend_chat, later).unwrap();
+        let promoted_at = {
+            let state = shared.inner.state.lock().unwrap();
+            let latest_at = state
+                .screen
+                .latest
+                .as_ref()
+                .map(|latest| latest.captured_at)
+                .expect("screen latest");
+            assert!(latest_at > stale_at, "必须存在比基线更晚的画面");
+            latest_at
+        };
+        assert!(shared.deliver_unread_baseline(&baseline, &id).unwrap());
+
+        assert!(
+            !shared.is_business_pending_at(&id, stale_at).unwrap(),
+            "提升之前的排队帧不得消费被提升的那条"
+        );
+        assert!(
+            !shared.acknowledge_business_at(&id, stale_at).unwrap(),
+            "提升之前的排队帧不得永久确认被提升的那条"
+        );
+        assert!(
+            shared.is_business_pending_at(&id, promoted_at).unwrap(),
+            "提升时刻本身的快照是这份资格修订的合法读者"
+        );
     }
 
     #[test]

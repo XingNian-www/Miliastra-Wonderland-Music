@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-
-use miliastra_contracts::StateStore;
+use miliastra_kernel::StateStore;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::HALL_EXPIRING_WARNING_MINUTES;

@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use miliastra_kernel::StateStore;
 use miliastra_playback::{PlayableTrack, TrackKey};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::PlaybackStateUpdate;
 use super::queue::QueueItem;
-use miliastra_contracts::StateStore;
 
 /// 点播会话唯一的持久化快照。
 ///

@@ -1,9 +1,0 @@
-[package]
-name = "miliastra-contracts"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-publish = false
-
-[dependencies]
-anyhow = { workspace = true }

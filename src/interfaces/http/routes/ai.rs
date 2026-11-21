@@ -37,7 +37,7 @@ pub(super) fn ai_chat_preview_route(
     drop(store);
     state
         .application
-        .ai
+        .ai_memory
         .chat_preview(&config, asker, question)
         .map_err(ai_route_error)
 }
@@ -48,7 +48,7 @@ pub(super) fn ai_recognize_route(
 ) -> std::result::Result<String, AppError> {
     state
         .application
-        .ai
+        .ai_music
         .recognize(query)
         .map_err(ai_route_error)
 }
@@ -59,7 +59,7 @@ pub(super) fn ai_match_route(
 ) -> std::result::Result<String, AppError> {
     state
         .application
-        .ai
+        .ai_music
         .match_song(query)
         .map_err(ai_route_error)
 }
@@ -68,7 +68,11 @@ pub(super) fn ai_pick_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    state.application.ai.pick(query).map_err(ai_route_error)
+    state
+        .application
+        .ai_music
+        .pick(query)
+        .map_err(ai_route_error)
 }
 
 pub(super) fn ai_search_route(
@@ -470,7 +474,11 @@ pub(super) fn ai_memory_actors_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    state.application.ai.memory_actors().map_err(ai_route_error)
+    state
+        .application
+        .ai_memory
+        .memory_actors()
+        .map_err(ai_route_error)
 }
 
 /// GET /ai/memory/actor?name=… —— 读取某个玩家的完整记忆。
@@ -481,7 +489,7 @@ pub(super) fn ai_memory_actor_route(
     let actor = normalize_required_text(query_value(query, "name"), "name")?;
     state
         .application
-        .ai
+        .ai_memory
         .memory_actor(&actor)
         .map_err(ai_route_error)
 }
@@ -491,7 +499,11 @@ pub(super) fn ai_memory_hall_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    state.application.ai.memory_hall().map_err(ai_route_error)
+    state
+        .application
+        .ai_memory
+        .memory_hall()
+        .map_err(ai_route_error)
 }
 
 /// 记忆接口的请求体。
@@ -523,7 +535,7 @@ pub(super) fn ai_memory_forget_actor_route(
     let actor = normalize_required_text(Some(target.name.as_str()), "name")?;
     state
         .application
-        .ai
+        .ai_memory
         .forget_actor(&actor)
         .map_err(ai_route_error)
 }
@@ -538,7 +550,7 @@ pub(super) fn ai_memory_delete_fact_route(
     let fact = normalize_required_text(Some(target.fact.as_str()), "fact")?;
     state
         .application
-        .ai
+        .ai_memory
         .delete_fact(&actor, &fact)
         .map_err(ai_route_error)
 }
@@ -548,7 +560,11 @@ pub(super) fn ai_memory_forget_hall_route(
     _body: &[u8],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    state.application.ai.forget_hall().map_err(ai_route_error)
+    state
+        .application
+        .ai_memory
+        .forget_hall()
+        .map_err(ai_route_error)
 }
 
 /// POST /ai/memory/rebuild —— 用新规则重放历史，重建某个玩家的事实表。
@@ -560,7 +576,7 @@ pub(super) fn ai_memory_rebuild_route(
     let actor = normalize_required_text(Some(target.name.as_str()), "name")?;
     state
         .application
-        .ai
+        .ai_memory
         .rebuild_facts(&actor)
         .map_err(ai_route_error)
 }

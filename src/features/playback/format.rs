@@ -66,7 +66,11 @@ fn status_vars(status: &PlayerStatus, requester: &str, title: String) -> ReplyVa
 }
 
 pub(crate) fn format_status(status: &PlayerStatus) -> String {
-    format_status_with_budget(status, status.requester.trim(), crate::text::chat_layout::CHAT_LAYOUT_BUDGET)
+    format_status_with_budget(
+        status,
+        status.requester.trim(),
+        crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+    )
 }
 
 /// `@状态` 一行排版：曲名（含歌手）让位给前缀/进度/音量/点歌人后缀，整行 ≤ budget。
@@ -190,7 +194,6 @@ pub(crate) fn song_title(name: &str, singer: &str) -> String {
     format!("{} - {}", name, singer)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{PlayerStatus, format_status, format_status_with_mode};
@@ -272,10 +275,7 @@ mod tests {
             rendered.starts_with("[示例玩家的歌单] "),
             "前缀应使用展示名: {rendered}"
         );
-        assert!(
-            !rendered.contains(uuid),
-            "输出不得含身份 UUID: {rendered}"
-        );
+        assert!(!rendered.contains(uuid), "输出不得含身份 UUID: {rendered}");
         // 反例守卫：若将来有人把内部键直接传进来，这行会立刻暴露问题。
         let leaked = format_status_with_mode(&status, Some(&internal_key));
         assert!(

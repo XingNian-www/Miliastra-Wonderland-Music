@@ -11,7 +11,8 @@ use crate::runtime::ocr::OcrLine;
 use crate::runtime::ocr::OcrRuntime;
 use crate::runtime::ui::UiEvidenceRect;
 use crate::runtime::ui::UiStateClassification;
-use crate::runtime::ui::UiStateKind as RuntimeUiStateKind;
+use crate::runtime::ui::UiStateClassifier;
+use crate::runtime::ui::UiStateKind;
 use crate::ui::frame::Canvas;
 use crate::ui::frame::resize_to_canvas;
 use crate::ui::template::best_template_candidate_downscaled;
@@ -37,13 +38,12 @@ use super::classify::*;
 use super::diagnostic::*;
 use super::fallback::*;
 use super::hall::*;
-use super::kind::*;
 use super::paimon::*;
 use super::qianxing::*;
+use super::regions::*;
+use super::result::*;
 use super::sampling::*;
 use super::world::*;
-
-use crate::runtime::ui::UiStateClassifier;
 
 #[cfg(test)]
 /// `game_gate` / `panel:<label>`；负样本写 `!<同上>`。
@@ -318,7 +318,7 @@ fn report_diagnostic_probes(
     templates: &ResolvedUiTemplateArgs,
     panels: PanelRegions,
     screen: &config::ScreenConfig,
-    kind: RuntimeUiStateKind,
+    kind: UiStateKind,
 ) -> Vec<serde_json::Value> {
     let threshold = templates.chat_templates.marker_threshold;
     let mut values = Vec::new();
@@ -450,10 +450,7 @@ fn report_diagnostic_probes(
     // Panel / Unknown 才是 refine_panel 的候选分支，照常实测。
     let anchor_threshold = threshold.max(0.95);
     let measure_anchors = std::env::var_os("MILIASTRA_REPORT_FULL_PROBES").is_some()
-        || matches!(
-            kind,
-            RuntimeUiStateKind::Panel | RuntimeUiStateKind::Unknown
-        );
+        || matches!(kind, UiStateKind::Panel | UiStateKind::Unknown);
     let qianxing_cases: [(&str, &PathBuf, Rect, u32); 1] = [(
         "panel:qianxing_page(exit)",
         &templates.qianxing_exit_menu_template,
@@ -528,12 +525,12 @@ fn report_diagnostic_probes(
     values
 }
 
-fn game_classification(kind: RuntimeUiStateKind) -> UiStateClassification {
+fn game_classification(kind: UiStateKind) -> UiStateClassification {
     UiStateClassification::new(
         kind,
         match kind {
-            RuntimeUiStateKind::GameGate => "game_gate",
-            RuntimeUiStateKind::Overworld => "overworld",
+            UiStateKind::GameGate => "game_gate",
+            UiStateKind::Overworld => "overworld",
             _ => "unknown",
         },
     )
@@ -542,14 +539,12 @@ fn game_classification(kind: RuntimeUiStateKind) -> UiStateClassification {
 fn observe_game(
     fallback: &mut GameFallbackState,
     now: Instant,
-    kind: RuntimeUiStateKind,
+    kind: UiStateKind,
 ) -> UiStateClassification {
     fallback
-        .observe_unknown(
-            now,
-            game_classification(RuntimeUiStateKind::Unknown),
-            || Ok(game_classification(kind)),
-        )
+        .observe_unknown(now, game_classification(UiStateKind::Unknown), || {
+            Ok(game_classification(kind))
+        })
         .expect("game fallback observation")
 }
 
@@ -561,32 +556,32 @@ fn game_fallback_delays_probes_confirms_real_results_and_cools_down() {
         let result = fallback
             .observe_unknown(
                 now + Duration::from_millis(elapsed),
-                game_classification(RuntimeUiStateKind::Unknown),
+                game_classification(UiStateKind::Unknown),
                 || panic!("supplemental probes must wait for sustained unknown"),
             )
             .unwrap();
-        assert_eq!(result.kind(), RuntimeUiStateKind::Unknown);
+        assert_eq!(result.kind(), UiStateKind::Unknown);
     }
     let first = observe_game(
         &mut fallback,
         now + Duration::from_secs(5),
-        RuntimeUiStateKind::Overworld,
+        UiStateKind::Overworld,
     );
-    assert_eq!(first.kind(), RuntimeUiStateKind::Unknown);
+    assert_eq!(first.kind(), UiStateKind::Unknown);
     assert_eq!(first.label(), "unknown:game_probe");
     let confirmed_at = now + Duration::from_millis(5010);
     assert_eq!(
-        observe_game(&mut fallback, confirmed_at, RuntimeUiStateKind::Overworld).kind(),
-        RuntimeUiStateKind::Overworld
+        observe_game(&mut fallback, confirmed_at, UiStateKind::Overworld).kind(),
+        UiStateKind::Overworld
     );
     let cached = fallback
         .observe_unknown(
             now + Duration::from_secs(8),
-            game_classification(RuntimeUiStateKind::Unknown),
+            game_classification(UiStateKind::Unknown),
             || panic!("confirmed game state must not re-run OCR every frame"),
         )
         .unwrap();
-    assert_eq!(cached.kind(), RuntimeUiStateKind::Overworld);
+    assert_eq!(cached.kind(), UiStateKind::Overworld);
     assert_eq!(
         fallback.candidate_count, 2,
         "cache does not count as a real probe"
@@ -594,15 +589,15 @@ fn game_fallback_delays_probes_confirms_real_results_and_cools_down() {
 
     let missed_at = confirmed_at + GAME_STATE_PROBE_INTERVAL;
     assert_eq!(
-        observe_game(&mut fallback, missed_at, RuntimeUiStateKind::Unknown).kind(),
-        RuntimeUiStateKind::Unknown
+        observe_game(&mut fallback, missed_at, UiStateKind::Unknown).kind(),
+        UiStateKind::Unknown
     );
     assert!(fallback.confirmed.is_none());
     assert!(
         fallback
             .observe_unknown(
                 missed_at + Duration::from_secs(1),
-                game_classification(RuntimeUiStateKind::Unknown),
+                game_classification(UiStateKind::Unknown),
                 || panic!("a missed probe also starts the cooldown"),
             )
             .is_ok()
@@ -613,47 +608,47 @@ fn game_fallback_delays_probes_confirms_real_results_and_cools_down() {
 fn game_fallback_revokes_changed_or_failed_results_and_bounds_unstable_probes() {
     let mut fallback = GameFallbackState::new(2);
     let now = Instant::now();
-    observe_game(&mut fallback, now, RuntimeUiStateKind::GameGate);
+    observe_game(&mut fallback, now, UiStateKind::GameGate);
     observe_game(
         &mut fallback,
         now + Duration::from_secs(5),
-        RuntimeUiStateKind::GameGate,
+        UiStateKind::GameGate,
     );
     observe_game(
         &mut fallback,
         now + Duration::from_secs(6),
-        RuntimeUiStateKind::GameGate,
+        UiStateKind::GameGate,
     );
     let changed_at = now + Duration::from_secs(11);
-    let changed = observe_game(&mut fallback, changed_at, RuntimeUiStateKind::Overworld);
+    let changed = observe_game(&mut fallback, changed_at, UiStateKind::Overworld);
     assert_eq!(changed.label(), "unknown:game_probe");
     assert!(fallback.confirmed.is_none());
     let flapped = observe_game(
         &mut fallback,
         changed_at + Duration::from_millis(10),
-        RuntimeUiStateKind::GameGate,
+        UiStateKind::GameGate,
     );
     assert_eq!(flapped.label(), "unknown");
     assert!(
         fallback
             .observe_unknown(
                 changed_at + Duration::from_secs(1),
-                game_classification(RuntimeUiStateKind::Unknown),
+                game_classification(UiStateKind::Unknown),
                 || panic!("alternating candidates must not cause OCR on every frame"),
             )
             .is_ok()
     );
 
     let retry_at = now + Duration::from_secs(17);
-    observe_game(&mut fallback, retry_at, RuntimeUiStateKind::Overworld);
+    observe_game(&mut fallback, retry_at, UiStateKind::Overworld);
     observe_game(
         &mut fallback,
         retry_at + Duration::from_millis(10),
-        RuntimeUiStateKind::Overworld,
+        UiStateKind::Overworld,
     );
     let failed = fallback.observe_unknown(
         retry_at + Duration::from_secs(6),
-        game_classification(RuntimeUiStateKind::Unknown),
+        game_classification(UiStateKind::Unknown),
         || anyhow::bail!("OCR unavailable"),
     );
     assert!(failed.is_err());
@@ -800,11 +795,7 @@ fn main_menu_is_classified_before_secondary_back() {
         let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
         let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
         let c = classifier.classify_at(&image, Instant::now()).unwrap();
-        assert_eq!(
-            c.kind(),
-            RuntimeUiStateKind::Secondary,
-            "{path} 必须仍是二级聊天"
-        );
+        assert_eq!(c.kind(), UiStateKind::Secondary, "{path} 必须仍是二级聊天");
     }
     // 负样本：这些界面里没有「返回提瓦特」按钮，一条都不许被判成主菜单。
     // 收紧搜索区之后重跑，确认窄区域没有把负样本拉上来。
@@ -850,7 +841,7 @@ fn main_menu_is_classified_before_secondary_back() {
             invite_enter_hall: config.invite.enter_hall_region.into(),
         });
     let c = classifier.classify_at(&fixture, Instant::now()).unwrap();
-    assert_eq!(c.kind(), RuntimeUiStateKind::Secondary);
+    assert_eq!(c.kind(), UiStateKind::Secondary);
 }
 
 /// 主菜单落的是 Unknown，连续两帧就会触发游戏态回退。回退探针是 world_wish，
@@ -912,7 +903,7 @@ fn teyvat_world_chat_is_not_the_hall() {
     ] {
         assert_eq!(
             classify(name),
-            RuntimeUiStateKind::Primary,
+            UiStateKind::Primary,
             "{name} 是千星大厅，近白占比够，不许被否决"
         );
     }
@@ -924,7 +915,7 @@ fn teyvat_world_chat_is_not_the_hall() {
     ] {
         assert_ne!(
             classify(name),
-            RuntimeUiStateKind::Primary,
+            UiStateKind::Primary,
             "{name} 不是千星大厅，不许判成 primary"
         );
     }
@@ -964,7 +955,7 @@ fn loading_screens_are_classified_as_loading() {
         let (kind, rule, (dark, _white, dominant)) = classify_with_rule(&path);
         assert_eq!(
             kind,
-            RuntimeUiStateKind::Loading,
+            UiStateKind::Loading,
             "{path} 是黑底加载界面，必须判成 loading 而不是 unknown"
         );
         assert_eq!(rule, "loading_dark_screen", "{path} 应走黑底那条规则");
@@ -983,7 +974,7 @@ fn loading_screens_are_classified_as_loading() {
     ] {
         let path = format!("technical-docs/ui-state-evidence/{name}");
         let (kind, rule, (_dark, white, dominant)) = classify_with_rule(&path);
-        assert_eq!(kind, RuntimeUiStateKind::Loading, "{path} 是白底加载界面");
+        assert_eq!(kind, UiStateKind::Loading, "{path} 是白底加载界面");
         assert_eq!(rule, "loading_white_screen", "{path} 应走白底那条规则");
         white_floor = white_floor.min(white);
         white_consistency_floor = white_consistency_floor.min(dominant);
@@ -1214,11 +1205,7 @@ fn world_probe_never_guesses_a_world_outside_hud_states() {
         let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
         let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
         let c = classifier.classify_at(&image, Instant::now()).unwrap();
-        assert_ne!(
-            c.kind(),
-            RuntimeUiStateKind::Primary,
-            "{path} 不该被判成千星大厅"
-        );
+        assert_ne!(c.kind(), UiStateKind::Primary, "{path} 不该被判成千星大厅");
         let Some(world) = c.evidence().world_probe() else {
             // 落在 unknown 回退路径上的帧，证据被回退结果替换掉了，
             // 这里没有世界探针可查——但下面的用例覆盖了这条路径不缺判。
@@ -1552,7 +1539,7 @@ fn qianxing_map_anchor_classifies_as_secondary_hall_map() {
         let classification = classifier.classify_at(&image, Instant::now()).unwrap();
         assert_eq!(
             classification.kind(),
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "{path} 必须归到 Secondary，实际 {}",
             classification.kind().name()
         );
@@ -1715,7 +1702,7 @@ fn no_real_screen_is_classified_as_loading() {
             .kind();
         assert_ne!(
             kind,
-            RuntimeUiStateKind::Loading,
+            UiStateKind::Loading,
             "{path} 是真实游戏画面，不许被判成 loading"
         );
     }
@@ -1736,7 +1723,7 @@ fn chat_markers_need_the_hall_bottom_bar_to_mean_the_hall() {
         let c = classifier.classify_at(&image, Instant::now()).unwrap();
         assert_ne!(
             c.kind(),
-            RuntimeUiStateKind::Primary,
+            UiStateKind::Primary,
             "{path} 是提瓦特，不许判成千星大厅"
         );
     }
@@ -1757,7 +1744,7 @@ fn chat_markers_need_the_hall_bottom_bar_to_mean_the_hall() {
         let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
         let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
         let c = classifier.classify_at(&image, Instant::now()).unwrap();
-        assert_eq!(c.kind(), RuntimeUiStateKind::Primary, "{path} 仍是千星大厅");
+        assert_eq!(c.kind(), UiStateKind::Primary, "{path} 仍是千星大厅");
     }
 }
 
@@ -1780,7 +1767,7 @@ fn hub_menu_never_falls_through_to_overworld_after_unknown_grace() {
                 .unwrap();
             assert_ne!(
                 c.kind(),
-                RuntimeUiStateKind::Overworld,
+                UiStateKind::Overworld,
                 "{path} 第 {i} 帧被回退误报成 overworld"
             );
         }
@@ -1813,7 +1800,7 @@ fn probe_game_state_rejects_world_wish_hits_outside_teyvat() {
         let probed = probe_game_state_without_entry(&image, &templates, &config.screen).unwrap();
         assert_ne!(
             probed.kind(),
-            RuntimeUiStateKind::Overworld,
+            UiStateKind::Overworld,
             "{path} 站在千星大厅里，回退探针不该把它判成大世界"
         );
         assert_ne!(
@@ -2021,7 +2008,7 @@ fn f2_hall_page_bottom_buttons_classify_secondary_multiplayer_panel() {
         let classification = classify(&image);
         assert_eq!(
             classification.kind(),
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "{path} 应判 Secondary，实际 {}/{}",
             classification.kind().name(),
             classification.label()
@@ -2128,7 +2115,7 @@ fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grac
                 .classify_at(&secondary, now + Duration::from_secs(elapsed))
                 .unwrap()
                 .kind(),
-            RuntimeUiStateKind::Secondary
+            UiStateKind::Secondary
         );
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -2137,7 +2124,7 @@ fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grac
             .classify_at(&world, now + Duration::from_secs(20))
             .unwrap()
             .kind(),
-        RuntimeUiStateKind::Unknown
+        UiStateKind::Unknown
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -2152,7 +2139,7 @@ fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grac
             .classify_at(&world, now + Duration::from_secs(26))
             .unwrap()
             .kind(),
-        RuntimeUiStateKind::GameGate,
+        UiStateKind::GameGate,
         "gate OCR has priority over the wish template"
     );
     assert_eq!(
@@ -2160,7 +2147,7 @@ fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grac
             .classify_at(&world, now + Duration::from_secs(27))
             .unwrap()
             .kind(),
-        RuntimeUiStateKind::GameGate
+        UiStateKind::GameGate
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     *text.lock().unwrap() = String::new();
@@ -2197,7 +2184,7 @@ fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grac
             .classify_at(&secondary, now + Duration::from_secs(33))
             .unwrap()
             .kind(),
-        RuntimeUiStateKind::Secondary
+        UiStateKind::Secondary
     );
     assert!(classifier.game_fallback.confirmed.is_none());
     assert_eq!(
@@ -2205,7 +2192,7 @@ fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grac
             .classify_at(&world, now + Duration::from_secs(34))
             .unwrap()
             .kind(),
-        RuntimeUiStateKind::Unknown
+        UiStateKind::Unknown
     );
     // 仍然是 4：第 34 秒还在同一次冷却期内，第 33 秒那帧是 secondary 直接返回。
     assert_eq!(calls.load(Ordering::SeqCst), 4);
@@ -2239,12 +2226,12 @@ fn pixel_identical_unknown_cache_hit_advances_fallback_time() {
     let cached = classifier
         .classify_at(&image, Instant::now() - GAME_STATE_PROBE_INTERVAL)
         .unwrap();
-    assert_eq!(cached.kind(), RuntimeUiStateKind::Unknown);
+    assert_eq!(cached.kind(), UiStateKind::Unknown);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let candidate = classifier.classify_cached(&image, &cached).unwrap();
     assert_eq!(candidate.label(), "unknown:game_probe");
     let confirmed = classifier.classify_cached(&image, &candidate).unwrap();
-    assert_eq!(confirmed.kind(), RuntimeUiStateKind::GameGate);
+    assert_eq!(confirmed.kind(), UiStateKind::GameGate);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     // A known fallback result must still be revalidated after its cooldown.
     classifier.game_fallback.retry_after = Some(Instant::now() - Duration::from_secs(1));
@@ -2300,7 +2287,7 @@ fn fixed_scrolled_friend_list_uses_the_back_anchor_for_secondary_state() {
             .expect("detect fixed secondary-chat screenshot");
 
         assert_eq!(state.to_string(), "secondary:chat");
-        assert_eq!(state.runtime_kind(), RuntimeUiStateKind::Secondary);
+        assert_eq!(state.kind, UiStateKind::Secondary);
     }
 
     let mut classifier = TemplateUiStateClassifier::new(templates, config.screen.clone());
@@ -2523,7 +2510,7 @@ fn overworld_requires_hud_and_one_to_four_bottom_keys() {
                 .classify_at(&image, Instant::now())
                 .unwrap()
                 .kind(),
-            RuntimeUiStateKind::Overworld,
+            UiStateKind::Overworld,
             "{count} 个白键的提瓦特帧应判 Overworld"
         );
     }
@@ -2564,7 +2551,7 @@ fn overworld_requires_hud_and_one_to_four_bottom_keys() {
                 .classify_at(&image, Instant::now())
                 .unwrap()
                 .kind(),
-            RuntimeUiStateKind::Overworld,
+            UiStateKind::Overworld,
             "{path} 应判成 Overworld"
         );
     }
@@ -2617,7 +2604,7 @@ fn overworld_requires_hud_and_one_to_four_bottom_keys() {
         let classification = classifier.classify_at(&image, Instant::now()).unwrap();
         assert_ne!(
             classification.kind(),
-            RuntimeUiStateKind::Overworld,
+            UiStateKind::Overworld,
             "{path} 不得判成 Overworld（{}）",
             classification.label()
         );
@@ -2643,7 +2630,7 @@ fn secondary_chat_requires_the_send_anchor() {
         let classification = classifier.classify_at(&image, Instant::now()).unwrap();
         assert_eq!(
             classification.kind(),
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "{path} 是真实的二级聊天，必须判 Secondary（实际 {}）",
             classification.label()
         );
@@ -2663,7 +2650,7 @@ fn secondary_chat_requires_the_send_anchor() {
         let classification = classifier.classify_at(&image, Instant::now()).unwrap();
         assert_ne!(
             classification.kind(),
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "{path} 是主菜单淡出帧，只有返回按钮，不得判成二级聊天"
         );
     }
@@ -2719,7 +2706,7 @@ fn panel_fixtures_are_labelled_by_their_own_anchor() {
         let classification = classifier.classify_at(&image, Instant::now()).unwrap();
         assert_eq!(
             classification.kind(),
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "{path} 应判为 panel，实际是 {}",
             classification.kind().name()
         );
@@ -2778,7 +2765,7 @@ fn confirm_dialogs_are_classified_by_button_and_message() {
         let classification = classifier.classify_at(&image, Instant::now()).unwrap();
         assert_eq!(
             classification.kind(),
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "{path} 应判为 panel，实际是 {}",
             classification.kind().name()
         );
@@ -2875,7 +2862,7 @@ fn paimon_menu_is_detected_by_layout_independent_grid() {
         let classification = classifier.classify_at(&image, Instant::now()).unwrap();
         assert_eq!(
             classification.kind(),
-            RuntimeUiStateKind::MainMenu,
+            UiStateKind::MainMenu,
             "{path} 被误判成 {}",
             classification.label()
         );
@@ -3028,7 +3015,7 @@ fn friend_list_new_variant_is_panel_and_old_layout_still_works() {
         let classification = classify(path);
         assert_eq!(
             classification.kind(),
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "{path} 应为 Panel"
         );
         assert_eq!(
@@ -3041,35 +3028,35 @@ fn friend_list_new_variant_is_panel_and_old_layout_still_works() {
     for (path, kind) in [
         (
             "technical-docs/ui-state-evidence/hall-page.png",
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
         ),
         (
             "technical-docs/ui-state-evidence/qianxing-ui-59/after-fix-f2.jpg",
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
         ),
         (
             "technical-docs/ui-state-evidence/wonderland-menu.png",
-            RuntimeUiStateKind::MainMenu,
+            UiStateKind::MainMenu,
         ),
         (
             "technical-docs/ui-state-evidence/round78-live.png",
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
         ),
         (
             "technical-docs/ui-state-evidence/full-hall.jpg",
-            RuntimeUiStateKind::Primary,
+            UiStateKind::Primary,
         ),
         (
             "technical-docs/ui-state-evidence/loading-screen.jpg",
-            RuntimeUiStateKind::Loading,
+            UiStateKind::Loading,
         ),
         (
             "technical-docs/ui-state-evidence/loading-screens/after-x.jpg",
-            RuntimeUiStateKind::Unknown,
+            UiStateKind::Unknown,
         ),
         (
             "tests/fixtures/ui/menu-paimon-1920x1080.jpg",
-            RuntimeUiStateKind::MainMenu,
+            UiStateKind::MainMenu,
         ),
     ] {
         let classification = classify(path);
@@ -3101,19 +3088,19 @@ const TRANSITIONAL_WHITELIST: [&str; 4] = [
 /// 超出即失败——防止分类器悄悄变慢导致提交前门禁不可用。
 const CORPUS_GATE_MAX_TOTAL_MS: u128 = 900_000;
 
-fn expected_kind_for_manifest_label(label: &str) -> Option<RuntimeUiStateKind> {
+fn expected_kind_for_manifest_label(label: &str) -> Option<UiStateKind> {
     if label.starts_with("覆盖层") {
-        return Some(RuntimeUiStateKind::Panel);
+        return Some(UiStateKind::Panel);
     }
-    let table: [(&str, RuntimeUiStateKind); 8] = [
-        ("千星大厅", RuntimeUiStateKind::Primary),
-        ("二级聊天", RuntimeUiStateKind::Secondary),
-        ("二级界面", RuntimeUiStateKind::Secondary),
-        ("主菜单千星", RuntimeUiStateKind::MainMenu),
-        ("主菜单大世界", RuntimeUiStateKind::MainMenu),
-        ("加载界面", RuntimeUiStateKind::Loading),
-        ("提瓦特大世界", RuntimeUiStateKind::Overworld),
-        ("登录入口", RuntimeUiStateKind::GameGate),
+    let table: [(&str, UiStateKind); 8] = [
+        ("千星大厅", UiStateKind::Primary),
+        ("二级聊天", UiStateKind::Secondary),
+        ("二级界面", UiStateKind::Secondary),
+        ("主菜单千星", UiStateKind::MainMenu),
+        ("主菜单大世界", UiStateKind::MainMenu),
+        ("加载界面", UiStateKind::Loading),
+        ("提瓦特大世界", UiStateKind::Overworld),
+        ("登录入口", UiStateKind::GameGate),
     ];
     table
         .iter()
@@ -3221,22 +3208,22 @@ fn gate_overlay_from_label(label: &str) -> GateSurface {
 }
 
 /// 镜像 `state_observation::surface_of`（kind/label/final_rule → surface）。
-fn gate_predicted_surface(kind: RuntimeUiStateKind, label: &str, final_rule: &str) -> GateSurface {
+fn gate_predicted_surface(kind: UiStateKind, label: &str, final_rule: &str) -> GateSurface {
     match kind {
-        RuntimeUiStateKind::Primary => GateSurface::PrimaryHall,
-        RuntimeUiStateKind::Secondary => gate_secondary_from_label(label),
-        RuntimeUiStateKind::Panel => gate_overlay_from_label(label),
-        RuntimeUiStateKind::MainMenu => {
+        UiStateKind::Primary => GateSurface::PrimaryHall,
+        UiStateKind::Secondary => gate_secondary_from_label(label),
+        UiStateKind::Panel => gate_overlay_from_label(label),
+        UiStateKind::MainMenu => {
             if final_rule == "paimon_menu_grid" {
                 GateSurface::PaimonMenu
             } else {
                 GateSurface::WonderlandMainMenu
             }
         }
-        RuntimeUiStateKind::Loading => GateSurface::Loading,
-        RuntimeUiStateKind::Overworld => GateSurface::Overworld,
-        RuntimeUiStateKind::GameGate => GateSurface::GameGate,
-        RuntimeUiStateKind::Unknown => GateSurface::Unknown,
+        UiStateKind::Loading => GateSurface::Loading,
+        UiStateKind::Overworld => GateSurface::Overworld,
+        UiStateKind::GameGate => GateSurface::GameGate,
+        UiStateKind::Unknown => GateSurface::Unknown,
     }
 }
 
@@ -3395,7 +3382,7 @@ fn corpus_manifest_confirmed_classification_gate() {
                     classification.label(),
                     classification.evidence().final_rule(),
                 );
-                if expected_kind == RuntimeUiStateKind::GameGate {
+                if expected_kind == UiStateKind::GameGate {
                     // GameGate 判据依赖 Windows OpenVINO OCR（enter_game 文本）；
                     // Linux 离线不能给可信 predicted：单列"OCR 依赖"清单，逐条打印+计数，
                     // 不计为通过、也不混进 Linux mismatch 断言。Windows/带 OCR 环境另行核验。
@@ -3552,7 +3539,7 @@ fn task121_overlay_loading_and_bright_map_regressions() {
         let classification = classify(path);
         assert_eq!(
             classification.kind(),
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "{path} 应是覆盖层，实际 {}",
             classification.label()
         );
@@ -3560,23 +3547,23 @@ fn task121_overlay_loading_and_bright_map_regressions() {
     // 亮底加载变体（正中 spinner）。
     assert_eq!(
         classify("technical-docs/ui-state-evidence/cold-to-qianxing-59/001-t000.jpg").kind(),
-        RuntimeUiStateKind::Loading
+        UiStateKind::Loading
     );
     // 千星大厅内漫游 HUD：底栏 8 个混合高度白键（Enter/Alt+N 长条 + 图标方键），
     // 中心线对齐 → Primary（而不是靠改标签绕过）。
     assert_eq!(
         classify("technical-docs/ui-state-evidence/final-frame.jpg").kind(),
-        RuntimeUiStateKind::Primary
+        UiStateKind::Primary
     );
     // HUD 完全隐藏的千星大厅场景：没有任何界面判据，保持 Unknown（manifest not_state）。
     assert_eq!(
         classify("technical-docs/ui-state-evidence/hud-hidden.png").kind(),
-        RuntimeUiStateKind::Unknown
+        UiStateKind::Unknown
     );
     // 亮底千星地图变体。
     assert_eq!(
         classify("technical-docs/ui-state-evidence/map-screen.png").kind(),
-        RuntimeUiStateKind::Secondary
+        UiStateKind::Secondary
     );
     // manifest 误标（实为主菜单大世界）。
     for path in [
@@ -3586,7 +3573,7 @@ fn task121_overlay_loading_and_bright_map_regressions() {
     ] {
         assert_eq!(
             classify(path).kind(),
-            RuntimeUiStateKind::MainMenu,
+            UiStateKind::MainMenu,
             "{path} 实为主菜单大世界"
         );
     }
@@ -3594,43 +3581,43 @@ fn task121_overlay_loading_and_bright_map_regressions() {
     for (path, kind) in [
         (
             "technical-docs/ui-state-evidence/loading-screens/ac-012.jpg",
-            RuntimeUiStateKind::Overworld,
+            UiStateKind::Overworld,
         ),
         (
             "technical-docs/ui-state-evidence/exit-to-teyvat-56/01-hub-menu.jpg",
-            RuntimeUiStateKind::MainMenu,
+            UiStateKind::MainMenu,
         ),
         (
             "technical-docs/ui-state-evidence/transition-to-overworld/02-hub-menu.jpg",
-            RuntimeUiStateKind::MainMenu,
+            UiStateKind::MainMenu,
         ),
         (
             "technical-docs/ui-state-evidence/qianxing-ui-59/r20sub/r1c3-c3-team.jpg",
-            RuntimeUiStateKind::MainMenu,
+            UiStateKind::MainMenu,
         ),
         (
             "technical-docs/ui-state-evidence/team-finder.png",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
         ),
         (
             "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r0c2-qiyu-collect.jpg",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
         ),
         (
             "technical-docs/ui-state-evidence/full-hall.jpg",
-            RuntimeUiStateKind::Primary,
+            UiStateKind::Primary,
         ),
         (
             "technical-docs/ui-state-evidence/round78-live.png",
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
         ),
         (
             "technical-docs/ui-state-evidence/loading-screen.jpg",
-            RuntimeUiStateKind::Loading,
+            UiStateKind::Loading,
         ),
         (
             "tests/fixtures/ui/menu-paimon-1920x1080.jpg",
-            RuntimeUiStateKind::MainMenu,
+            UiStateKind::MainMenu,
         ),
     ] {
         assert_eq!(classify(path).kind(), kind, "{path} kind 回归");
@@ -4121,7 +4108,7 @@ fn task126_surface_validation_sets() {
         let c = classify(&ev(p));
         assert_eq!(
             c.kind(),
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "{p} 应判 Secondary，实际 {}/{}",
             c.kind().name(),
             c.label()
@@ -4190,7 +4177,7 @@ fn task126_surface_validation_sets() {
         let c = classify(&ev(p));
         assert_eq!(
             c.kind(),
-            RuntimeUiStateKind::Unknown,
+            UiStateKind::Unknown,
             "{p} 是非常规入口的特典活动页，应丢弃为 Unknown，实际 {}/{}",
             c.kind().name(),
             c.label()
@@ -4255,13 +4242,10 @@ fn task126_surface_validation_sets() {
         );
     }
     // 大厅/二级不得被千星锚点抢判（kind 级）
-    assert_eq!(
-        classify(&ev("full-hall.jpg")).kind(),
-        RuntimeUiStateKind::Primary
-    );
+    assert_eq!(classify(&ev("full-hall.jpg")).kind(), UiStateKind::Primary);
     assert_eq!(
         classify(&ev("round78-live.png")).kind(),
-        RuntimeUiStateKind::Secondary
+        UiStateKind::Secondary
     );
 }
 
@@ -4390,7 +4374,7 @@ fn profile_page_frame_is_panel_profile_page() {
     let image = image::open(PROFILE_PAGE_FRAME)
         .unwrap_or_else(|error| panic!("打不开 {PROFILE_PAGE_FRAME}: {error}"));
     let classification = classifier.classify_at(&image, Instant::now()).unwrap();
-    assert_eq!(classification.kind(), RuntimeUiStateKind::Panel);
+    assert_eq!(classification.kind(), UiStateKind::Panel);
     assert_eq!(classification.label(), "panel:profile_page");
     assert_eq!(classification.evidence().final_rule(), "panel:profile_page");
     // 两个按钮模板都必须作为证据出现并达到阈值（分数量自生产探针，不写死）。
@@ -4450,79 +4434,79 @@ fn profile_page_does_not_steal_existing_panels() {
         // 档案卡 / 大厅卡 / 更多设置 / 好友面板 / 搜索页 / 头像弹窗（提瓦特面板）
         (
             "tests/fixtures/ui/panel-archive-card-1920x1080.jpg",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:qianxing_profile_friend",
         ),
         // 同位置、同尺寸的「另存为 / 保存」对话框（最难的负样本，实测 0.9552）
         (
             "technical-docs/ui-state-evidence/qianxing-ui-59/r17-好友.jpg",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:qianxing_page",
         ),
         (
             "tests/fixtures/ui/panel-hall-card-1920x1080.jpg",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:hall_card",
         ),
         (
             "tests/fixtures/ui/panel-more-settings-1920x1080.jpg",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:more_settings",
         ),
         (
             "tests/fixtures/ui/panel-friend-list-1920x1080.jpg",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:friend_list",
         ),
         (
             "tests/fixtures/ui/panel-add-friend-1920x1080.jpg",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:add_friend",
         ),
         (
             "tests/fixtures/ui/panel-avatar-popup-1920x1080.jpg",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:avatar_popup",
         ),
         // 主菜单千星（返回提瓦特）
         (
             "tests/fixtures/ui/main-menu-wonderland-1920x1080.png",
-            RuntimeUiStateKind::MainMenu,
+            UiStateKind::MainMenu,
             "",
         ),
         // 千星 F2 多人面板 / 千星地图（底栏区域同样有白色胶囊按钮）
         (
             "technical-docs/ui-state-evidence/qianxing-ui-59/qxf2-from-hall.jpg",
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "secondary:qianxing_panel",
         ),
         (
             "technical-docs/ui-state-evidence/qianxing-ui-59/qxmap-a.jpg",
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "secondary:qianxing_map",
         ),
         // 千星 Other 覆盖页（个人资料页的最近邻：同版式、同关闭按钮）
         (
             "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r0c3-my-qiyu.jpg",
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:qianxing_page",
         ),
         // 非常规入口的特典活动页：已从 UI 状态模型丢弃，必须是 Unknown，
         // 也不能被个人资料页判据误判。
         (
             "technical-docs/ui-state-evidence/qianxing-ui-59/r18sub/r3c1-special-event.jpg",
-            RuntimeUiStateKind::Unknown,
+            UiStateKind::Unknown,
             "",
         ),
         // 大厅 + 二级聊天
         (
             "technical-docs/ui-state-evidence/full-hall.jpg",
-            RuntimeUiStateKind::Primary,
+            UiStateKind::Primary,
             "",
         ),
         (
             "technical-docs/ui-state-evidence/round78-live.png",
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "",
         ),
     ];
@@ -4646,7 +4630,7 @@ fn profile_card_four_way_classification() {
     ] {
         let image = image::open(path).unwrap_or_else(|error| panic!("打不开 {path}: {error}"));
         let classification = classifier.classify_at(&image, Instant::now()).unwrap();
-        assert_eq!(classification.kind(), RuntimeUiStateKind::Panel, "{path}");
+        assert_eq!(classification.kind(), UiStateKind::Panel, "{path}");
         assert_eq!(
             classification.label(),
             label,

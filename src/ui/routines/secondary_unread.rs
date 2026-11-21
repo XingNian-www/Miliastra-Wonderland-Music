@@ -2,17 +2,17 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::friend_delivery::{
-    FriendDeliveryRoutineConfig, UiResidencyOutcome, after_input_failure,
-    before_input_failure, capture_normalized, wait_ms,
+    FriendDeliveryRoutineConfig, UiResidencyOutcome, after_input_failure, before_input_failure,
+    capture_normalized, wait_ms,
 };
+use super::residency::{ConversationRef, ResidencyTarget, SettleEnvironment};
+use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 use crate::observation::chat::{
     ChatIdentity, ChatTimeline, ChatTimelineSnapshot, FriendUnreadLayout, ObservedChatMessageId,
     UnreadFriendHit, find_unread_friend_hits, latest_incoming_fingerprint,
     unread_hit_still_visible,
 };
 use crate::runtime::ocr::OcrRuntimeHandle;
-use super::residency::{ConversationRef, ResidencyTarget, SettleEnvironment};
-use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
@@ -210,8 +210,7 @@ impl UiRoutine for ProcessSecondaryUnreadTask {
     type Output = ProcessSecondaryUnreadOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment =
-            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
         let outcome = UiTask::new(
             process_secondary_unread_task_spec(environment),
             ProcessSecondaryUnreadRoutine {
@@ -319,9 +318,13 @@ fn process_unread(
             // 初始红点清场（进入二级值守时那一次）：只建立基线、清红点，历史一律不执行。
             // 必须在"提升最后一条命令"之前返回；清场全程还持有好友业务抑制
             // （execute 里的 suppress_friend_business），两层都不允许它派发任何命令。
+            //
+            // 确认带本快照的 `captured_at`：清场是「这一屏看到的历史都不执行」，
+            // 不是「这个 id 从此作废」。会话在后续帧里若把某条气泡修正成新命令，
+            // 那次修正会推进修订围栏，无时间的永久 ACK 会把它一起吞掉。
             for message in &snapshot.messages {
                 chat_timeline
-                    .acknowledge_business(&message.id)
+                    .acknowledge_business_at(&message.id, snapshot.captured_at)
                     .map_err(|error| after_input_failure("discard_secondary_unread", error))?;
             }
             return Ok(SecondaryUnreadEffect::Discarded);
@@ -339,16 +342,20 @@ fn process_unread(
                 // 不在首屏基线里：要么这条气泡已按常规路径交付过（成功命令锁或永久 ACK），
                 // 要么它从未进过基线，此时不会有任何派发。如实记录以区分这两种情况，
                 // 不在这里自行发明"再读一次"的规则。
+                //
+                // 判据必须带本快照的 `captured_at`：这份修订若已被更新的修订推进围栏，
+                // 账本里那一条仍是待处理的（新修订还要交付），只查账本会说"仍在队列里"，
+                // 让排查误以为是消费端卡住了。
                 log::warn!(
                     "二级好友未读提升未生效（步骤：提升未读消息）：好友「{}」的这条气泡不在首屏基线内，无法据此派发命令；该气泡可能已按常规路径交付过（{}）",
                     friend_name,
                     if chat_timeline
-                        .is_business_pending(&message.id)
+                        .is_business_pending_at(&message.id, snapshot.captured_at)
                         .unwrap_or(false)
                     {
-                        "当前仍在待处理队列中"
+                        "这份修订仍在待处理队列中，等待业务链路消费"
                     } else {
-                        "当前不在待处理队列中"
+                        "这份修订不再等待派发：已被消费，或已被更新的修订取代"
                     }
                 );
             }
@@ -429,6 +436,10 @@ fn latest_unread_message(
 /// 值守循环的业务订阅者里。UI 事务若在提升后立刻恢复大厅，这条唯一候选就没有后续帧，
 /// 可能一直没人消费——用户规则是"进入有未读的会话读取最后发送的那条命令"，
 /// 而不是"提升了却不用"。超时不当作失败：消费方可能已按常规路径处理过同一气泡。
+///
+/// 这里问的是**消费进度**，不是"这份快照该不该交付"：提升刚把围栏推到本次修订，
+/// 任何能消费它的读者捕获时间都不会早于围栏，所以按账本作答与按围栏作答结果相同；
+/// 而账本探针语义更直白——「这条 id 还被待处理队列占着吗」。
 fn wait_promoted_unread_consumed(
     context: &mut UiRoutineContext<'_>,
     chat_timeline: &ChatTimeline,
@@ -440,7 +451,7 @@ fn wait_promoted_unread_consumed(
         .map_err(|error| after_input_failure("refresh_secondary_unread", error))?;
     loop {
         if !chat_timeline
-            .is_business_pending(id)
+            .is_business_pending_in_ledger(id)
             .map_err(|error| after_input_failure("confirm_secondary_unread", error))?
         {
             return Ok(());
@@ -687,7 +698,12 @@ mod tests {
         let delivery = listener.read().unwrap();
         assert_eq!(delivery[0].messages[0].id, selected.id);
         assert_eq!(delivery[0].messages.len(), 1);
-        assert!(shared.acknowledge_business(&selected.id).unwrap());
+        // 消费确认必须带快照时间：提升刚把围栏推到本次修订，同一帧的确认应当生效。
+        assert!(
+            shared
+                .acknowledge_business_at(&selected.id, snapshot.captured_at)
+                .unwrap()
+        );
         assert!(
             !shared
                 .deliver_unread_baseline(&snapshot, &selected.id)
@@ -735,8 +751,17 @@ mod tests {
                 .deliver_unread_baseline(&snapshot, &visible.id)
                 .unwrap()
         );
-        assert!(!shared.is_business_pending(&visible.id).unwrap());
-        assert!(!shared.acknowledge_business(&visible.id).unwrap());
+        assert!(
+            !shared
+                .is_business_pending_at(&visible.id, snapshot.captured_at)
+                .unwrap()
+        );
+        // 抑制期间共享观察已把它永久 ACK；本帧时间不早于围栏，所以这里如实返回 false。
+        assert!(
+            !shared
+                .acknowledge_business_at(&visible.id, snapshot.captured_at)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -863,10 +888,8 @@ mod tests {
     /// 收尾固定在这里且只由包装器 Fixed 的唯一引擎执行一次。
     #[test]
     fn secondary_unread_task_spec_is_fixed_to_current_hall() {
-        let config = AppConfig::load(std::path::Path::new(
-            "tests/fixtures/config.full.yaml",
-        ))
-        .unwrap();
+        let config =
+            AppConfig::load(std::path::Path::new("tests/fixtures/config.full.yaml")).unwrap();
         let spec = process_secondary_unread_task_spec(SettleEnvironment::without_ocr(
             FriendDeliveryRoutineConfig::from_app(&config),
         ));

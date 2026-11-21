@@ -2,12 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use miliastra_kernel::StateStore;
+use miliastra_kernel::clock::WallClock;
 use miliastra_playback::TrackKey;
 use serde::{Deserialize, Serialize};
 
 use super::SongDedupConfig;
-use miliastra_contracts::StateStore;
-use miliastra_kernel::clock::WallClock;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SongDedupCandidate {

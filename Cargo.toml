@@ -4,7 +4,6 @@ members = [
   "crates/miliastra-login-helper",
   "crates/miliastra-login-protocol",
   "crates/miliastra-playback",
-  "crates/miliastra-contracts",
   "crates/miliastra-kernel",
 ]
 resolver = "3"
@@ -26,7 +25,6 @@ ocr-openvino = ["dep:imageproc", "dep:openvino", "dep:openvino-sys"]
 [workspace.dependencies]
 anyhow = "1"
 async-openai = { version = "0.41.1", default-features = false }
-miliastra-contracts = { path = "crates/miliastra-contracts" }
 miliastra-kernel = { path = "crates/miliastra-kernel" }
 miliastra-login-protocol = { path = "crates/miliastra-login-protocol" }
 miliastra-playback = { path = "crates/miliastra-playback" }
@@ -40,7 +38,6 @@ uuid = "1"
 
 [dependencies]
 anyhow = { workspace = true }
-miliastra-contracts = { workspace = true }
 miliastra-kernel = { workspace = true }
 async-openai = { workspace = true, features = ["byot", "chat-completion", "middleware", "responses", "rustls"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }

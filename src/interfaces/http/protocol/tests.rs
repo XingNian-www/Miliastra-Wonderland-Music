@@ -34,8 +34,9 @@ use crate::features::turtle_soup::{TurtleSoupAppendReceipt, TurtleSoupSnapshot};
 use crate::features::undercover::UndercoverSnapshot;
 use crate::interfaces::http::facade::ApplicationHttpCommandFacade;
 use crate::interfaces::http::{
-    HttpAiPort, HttpDebugPort, HttpHallPort, HttpLoginPort, HttpLoginQrCodeView, HttpLoginStatus,
-    HttpPlayerPort, HttpProviderView, HttpQueryPort, HttpTaskPort,
+    HttpAiMemoryPort, HttpAiMusicPort, HttpDebugPort, HttpHallPort, HttpLoginPort,
+    HttpLoginQrCodeView, HttpLoginStatus, HttpPlayerPort, HttpProviderView, HttpQueryPort,
+    HttpTaskPort,
 };
 use crate::runtime::chat_listener::ChatListenerState;
 use crate::runtime::player_io::SearchCandidate;
@@ -1715,17 +1716,34 @@ impl HttpHallPort for RecordingHttpPort {
     }
 }
 
+/// 播放器端口替身：**逐条显式实现** `HttpPlayerPort` 的每一个方法。
+///
+/// 端口本身不再提供"静默成功"的默认实现，所以这里的每个方法都必须回答
+/// "这次调用到底做了什么"；路由测试才能据此断言参数真的转发到了播放器，
+/// 而不是被一个默认实现悄悄吞掉。
+///
+/// 记录字段全部用 `Arc<Mutex<_>>`：`Clone` 出来的副本共享同一份记录，
+/// 于是"把端口交给面板"和"事后断言调用"可以是两个句柄、同一份事实。
+#[derive(Clone)]
 struct HttpTestPlayerPort {
     fail: bool,
     status: PlayerStatus,
-    play_mode: Mutex<u8>,
+    play_mode: Arc<Mutex<u8>>,
+    /// 播放位置跳转最后一次收到的秒数；`None` 表示从未被调用。
+    seeked_position: Arc<Mutex<Option<f64>>>,
+    /// 被清零统计 / 被删除磁盘缓存的曲目，按调用顺序记录。
+    reset_keys: Arc<Mutex<Vec<TrackKey>>>,
+    invalidated_keys: Arc<Mutex<Vec<TrackKey>>>,
 }
 
 impl HttpTestPlayerPort {
     fn successful() -> Self {
         Self {
             fail: false,
-            play_mode: Mutex::new(0),
+            play_mode: Arc::new(Mutex::new(0)),
+            seeked_position: Arc::new(Mutex::new(None)),
+            reset_keys: Arc::new(Mutex::new(Vec::new())),
+            invalidated_keys: Arc::new(Mutex::new(Vec::new())),
             status: PlayerStatus {
                 status: String::new(),
                 current_uri: String::new(),
@@ -1752,10 +1770,27 @@ impl HttpTestPlayerPort {
 
     fn with_status(status: PlayerStatus) -> Self {
         Self {
-            fail: false,
             status,
-            play_mode: Mutex::new(0),
+            ..Self::successful()
         }
+    }
+
+    /// 最后一次跳转到的秒数（未被调用时为 `None`）。
+    fn seeked_position(&self) -> Option<f64> {
+        *self.seeked_position.lock().expect("seeked position")
+    }
+
+    /// 被要求清零统计的曲目（按调用顺序）。
+    fn reset_keys(&self) -> Vec<TrackKey> {
+        self.reset_keys.lock().expect("reset keys").clone()
+    }
+
+    /// 被要求删除磁盘缓存的曲目（按调用顺序）。
+    fn invalidated_keys(&self) -> Vec<TrackKey> {
+        self.invalidated_keys
+            .lock()
+            .expect("invalidated keys")
+            .clone()
     }
 
     fn fail_if_requested(&self) -> std::result::Result<(), HttpPlayerSearchError> {
@@ -1898,6 +1933,27 @@ impl HttpPlayerPort for HttpTestPlayerPort {
             limit,
             tracks: tracks.into_iter().skip(offset).take(limit).collect(),
         })
+    }
+
+    fn reset_track_statistics(&self, key: &TrackKey) -> Result<bool> {
+        self.reset_keys
+            .lock()
+            .expect("reset keys")
+            .push(key.clone());
+        Ok(true)
+    }
+
+    fn invalidate_track_cache(&self, key: &TrackKey) -> Result<bool> {
+        self.invalidated_keys
+            .lock()
+            .expect("invalidated keys")
+            .push(key.clone());
+        Ok(true)
+    }
+
+    fn seek(&self, position_seconds: f64) -> Result<()> {
+        *self.seeked_position.lock().expect("seeked position") = Some(position_seconds);
+        Ok(())
     }
 
     fn search_text(
@@ -2073,9 +2129,30 @@ impl HttpLoginPort for HttpTestLoginPort {
     }
 }
 
-struct HttpTestAiPort;
+/// AI 点歌端口替身：只回答三次模型问答，不碰记忆。
+struct HttpTestAiMusicPort;
 
-impl HttpAiPort for HttpTestAiPort {
+impl HttpAiMusicPort for HttpTestAiMusicPort {
+    fn recognize(&self, _query: &[(String, String)]) -> Result<String> {
+        Ok("test recognition".to_string())
+    }
+
+    fn match_song(&self, _query: &[(String, String)]) -> Result<String> {
+        Ok("test match".to_string())
+    }
+
+    fn pick(&self, _query: &[(String, String)]) -> Result<String> {
+        Ok("test pick".to_string())
+    }
+}
+
+/// AI 聊天记忆端口替身：只回答记忆库查询/删改与装配预览，不碰点歌。
+///
+/// `chat_preview` 也显式实现：端口不再提供"未装配"的默认实现，
+/// 测试必须自己给出一个合法的预览正文，否则无法断言路由行为。
+struct HttpTestAiMemoryPort;
+
+impl HttpAiMemoryPort for HttpTestAiMemoryPort {
     fn memory_actors(&self) -> Result<String> {
         Ok(r#"{"actors":[]}"#.to_string())
     }
@@ -2104,16 +2181,13 @@ impl HttpAiPort for HttpTestAiPort {
         Ok(format!(r#"{{"ok":true,"actor":"{actor}","facts":0}}"#))
     }
 
-    fn recognize(&self, _query: &[(String, String)]) -> Result<String> {
-        Ok("test recognition".to_string())
-    }
-
-    fn match_song(&self, _query: &[(String, String)]) -> Result<String> {
-        Ok("test match".to_string())
-    }
-
-    fn pick(&self, _query: &[(String, String)]) -> Result<String> {
-        Ok("test pick".to_string())
+    fn chat_preview(
+        &self,
+        _config: &crate::config::AppConfig,
+        asker: &str,
+        question: &str,
+    ) -> Result<String> {
+        Ok(serde_json::json!({ "asker": asker, "question": question }).to_string())
     }
 }
 
@@ -3552,6 +3626,146 @@ fn playback_cache_tracks_contract_over_real_http_and_clamps_limit() {
     server.shutdown().expect("shutdown HTTP server");
 }
 
+/// `HttpPlayerPort` 没有静默默认实现之后，每条维护型路由都必须真的把参数
+/// 送到端口上。这条测试同时锁住三件事：
+/// 1. `/playback/seek` 的秒数原样下发；
+/// 2. `/playback/statistics/reset` 只清统计、不碰磁盘缓存；
+/// 3. `/playback/cache/invalidate` 删的是同一个 `TrackKey`，不是"空 key"。
+#[test]
+fn playback_maintenance_routes_forward_arguments_to_the_real_port() {
+    let port = HttpTestPlayerPort::successful();
+    let state = test_state_with_shared_player_port(Arc::new(port.clone()), "test-access-token");
+
+    let seek: Value = serde_json::from_str(
+        &playback_seek_route(&[("position".to_string(), "42.5".to_string())], &state)
+            .expect("seek route"),
+    )
+    .expect("seek JSON");
+    assert_eq!(seek["ok"], true);
+    assert_eq!(port.seeked_position(), Some(42.5));
+
+    let reset: Value = serde_json::from_str(
+        &playback_statistics_reset_route(
+            &[
+                ("provider".to_string(), "qqmusic".to_string()),
+                ("id".to_string(), "song-a".to_string()),
+            ],
+            &state,
+        )
+        .expect("statistics reset route"),
+    )
+    .expect("statistics reset JSON");
+    assert_eq!(reset["reset"], true);
+    assert_eq!(
+        port.reset_keys(),
+        [TrackKey::new(ProviderId::QqMusic, "song-a").expect("track key")]
+    );
+    assert!(
+        port.invalidated_keys().is_empty(),
+        "清零统计不得顺手删磁盘缓存"
+    );
+
+    let invalidated: Value = serde_json::from_str(
+        &playback_cache_invalidate_route(
+            &[
+                ("provider".to_string(), "netease".to_string()),
+                ("id".to_string(), "123456".to_string()),
+            ],
+            &state,
+        )
+        .expect("cache invalidate route"),
+    )
+    .expect("cache invalidate JSON");
+    assert_eq!(invalidated["removed"], true);
+    assert_eq!(
+        port.invalidated_keys(),
+        [TrackKey::new(ProviderId::Netease, "123456").expect("track key")]
+    );
+}
+
+/// 播放模式读写走的是同一个共享句柄，且越界值被拒绝而不是被静默接收。
+///
+/// 旧实现在端口层返回 `Ok(0)` / `Ok(())`，写坏值也会"成功"；
+/// 现在请求必须真的落到端口上，非法模式必须报错。
+#[test]
+fn playback_mode_round_trips_through_the_port_and_rejects_unknown_values() {
+    let port = HttpTestPlayerPort::successful();
+    let state = test_state_with_shared_player_port(Arc::new(port.clone()), "test-access-token");
+
+    let initial: Value =
+        serde_json::from_str(&playback_mode_route(&[], &state).expect("mode read"))
+            .expect("mode JSON");
+    assert_eq!(initial["mode"], "sequential");
+
+    let changed: Value = serde_json::from_str(
+        &playback_mode_route(&[("mode".to_string(), "shuffle".to_string())], &state)
+            .expect("mode write"),
+    )
+    .expect("mode write JSON");
+    assert_eq!(changed["ok"], true);
+    assert_eq!(changed["mode"], "shuffle");
+    assert_eq!(*port.play_mode.lock().expect("play mode"), 2);
+
+    let rejected = playback_mode_route(&[("mode".to_string(), "loop".to_string())], &state)
+        .expect_err("unknown mode rejected");
+    assert_eq!(rejected.status, 400);
+    assert_eq!(
+        *port.play_mode.lock().expect("play mode"),
+        2,
+        "被拒绝的写入不能改变共享播放模式"
+    );
+}
+
+/// AI 点歌与 AI 聊天记忆是两个独立端口：点歌路由只碰 `ai_music`，
+/// 记忆路由只碰 `ai_memory`。
+///
+/// 这条测试的价值不在"返回值对不对"（替身的返回值是常量），而在**接线方向**：
+/// 有人把两条链路的端口接反、或者让其中一条少接一个实现时，
+/// 对应分支会直接编译失败或在这里拿到错误的那份回答。
+#[test]
+fn ai_routes_use_the_music_port_and_the_memory_port_separately() {
+    let state = test_state();
+
+    for (route, expected) in [
+        ("recognize", "test recognition"),
+        ("match", "test match"),
+        ("pick", "test pick"),
+    ] {
+        let body = match route {
+            "recognize" => ai_recognize_route(&[], &state),
+            "match" => ai_match_route(&[], &state),
+            _ => ai_pick_route(&[], &state),
+        }
+        .expect("music route");
+        assert_eq!(body, expected, "{route} 必须由点歌端口回答");
+    }
+
+    // 记忆侧：四个只读/删改路由都来自记忆端口替身，shape 与生产实现一致。
+    let actors: Value =
+        serde_json::from_str(&ai_memory_actors_route(&[], &state).expect("actors route"))
+            .expect("actors JSON");
+    assert_eq!(actors["actors"], json!([]));
+
+    let hall: Value = serde_json::from_str(&ai_memory_hall_route(&[], &state).expect("hall route"))
+        .expect("hall JSON");
+    assert_eq!(hall["count"], 0);
+
+    let forgotten: Value =
+        serde_json::from_str(&ai_memory_forget_hall_route(&[], &state).expect("forget hall route"))
+            .expect("forget hall JSON");
+    assert_eq!(forgotten["ok"], true);
+
+    // 装配预览现在也是必选方法：替身给出确定的预览正文，路由原样透传。
+    let preview_body =
+        serde_json::json!({ "asker": "预览玩家", "question": "预览问题" }).to_string();
+    let preview: Value = serde_json::from_str(
+        &ai_chat_preview_route(preview_body.as_bytes(), &state).expect("preview route"),
+    )
+    .expect("preview JSON");
+    assert_eq!(preview["asker"], "预览玩家");
+    assert_eq!(preview["question"], "预览问题");
+}
+
 #[test]
 fn remote_song_routes_are_queued_json_post_routes() {
     assert!(is_mutating_route("/searchPlay"));
@@ -3588,19 +3802,28 @@ fn startup_routes_are_queued_json_post_routes() {
 /// **两条不同的权限**，否则会以为「默认平台换成 B站 就等于给 @点歌 调了权限」。
 #[test]
 fn command_panel_explains_default_song_source_semantics() {
-    let page = include_str!("../../../../web/src/pages/CommandsPage.vue");
+    // 面板拆分后，「默认平台」控件落在 CommandDefaultSource.vue，说明段落在 CommandsPage.vue；
+    // 合并扫描两者确保拆分前后契约不变。
+    let combined = format!(
+        "{}\n{}",
+        include_str!("../../../../web/src/pages/CommandsPage.vue"),
+        include_str!("../../../../web/src/components/commands/CommandDefaultSource.vue"),
+    );
     assert!(
-        page.contains("默认平台只影响 @点歌 走哪个平台的搜索，不改变各平台命令的权限"),
+        combined.contains("默认平台只影响 @点歌 走哪个平台的搜索，不改变各平台命令的权限"),
         "面板必须说明默认平台只改搜索平台、不改权限"
     );
     assert!(
-        page.contains("id=\"commandDefaultSongSource\""),
+        combined.contains("id=\"commandDefaultSongSource\""),
         "说明段落需要稳定 id，避免渲染时被误删"
     );
     // 平台选项必须来自接口 catalog.songPlatforms，不能硬编码。
-    assert!(page.contains("songPlatforms"), "默认平台选项必须由接口提供");
     assert!(
-        !page.contains("<option value=\"bilibili\""),
+        combined.contains("songPlatforms"),
+        "默认平台选项必须由接口提供"
+    );
+    assert!(
+        !combined.contains("<option value=\"bilibili\""),
         "不能硬编码 B站选项"
     );
 }
@@ -4492,6 +4715,17 @@ fn test_state_with_player_port_and_bootstrap_token(
     player: impl HttpPlayerPort + 'static,
     access_token: &str,
 ) -> HttpTestState {
+    test_state_with_shared_player_port(Arc::new(player), access_token)
+}
+
+/// 把播放器端口以 `Arc<dyn HttpPlayerPort>` 交给面板，返回测试状态。
+///
+/// 单独留一个入口是给"注入一个可继续观察的替身"用的：调用方自己保留
+/// `Arc`，测试结束后再断言端口收到了哪些调用，不必去猜路由做了什么。
+fn test_state_with_shared_player_port(
+    player: Arc<dyn HttpPlayerPort>,
+    access_token: &str,
+) -> HttpTestState {
     let mut config: AppConfig =
         serde_norway::from_str(crate::config::bundled_config_yaml()).expect("default config");
     // 配置中心的 bootstrap 注入值：非空时用于验证 http.access_token 脱敏。
@@ -4544,9 +4778,10 @@ fn test_state_with_player_port_and_bootstrap_token(
                 recording.clone(),
                 recording.clone(),
                 recording.clone(),
-                Arc::new(player),
+                player,
                 login.clone(),
-                Arc::new(HttpTestAiPort),
+                Arc::new(HttpTestAiMusicPort),
+                Arc::new(HttpTestAiMemoryPort),
             ),
         ),
         recording,

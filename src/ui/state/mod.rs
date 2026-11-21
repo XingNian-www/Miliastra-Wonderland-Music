@@ -14,11 +14,12 @@ mod classify;
 mod diagnostic;
 mod fallback;
 mod hall;
-mod kind;
 mod paimon;
 mod panels;
 mod profiles;
 mod qianxing;
+mod regions;
+mod result;
 mod sampling;
 mod world;
 
@@ -34,7 +35,7 @@ pub(crate) use args::{ResolvedUiTemplateArgs, UiTemplateArgs};
 pub(crate) use classifier::TemplateUiStateClassifier;
 pub(crate) use diagnostic::{CONFIRM_MESSAGE_MIN, CONFIRM_MESSAGE_SCALE};
 pub(crate) use fallback::{find_enter_game_text, probe_game_state_without_entry};
-pub(crate) use kind::PanelRegions;
+pub(crate) use regions::PanelRegions;
 pub(crate) use world::world_is_teyvat;
 
 // 仅测试用，但**跨模块**：`ui::routines` 的几个测试夹具需要把有损 JPEG 底栏

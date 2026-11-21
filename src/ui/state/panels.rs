@@ -3,7 +3,7 @@
 use crate::geometry::Rect;
 use crate::runtime::ui::UiStateClassification;
 use crate::runtime::ui::UiStateEvidence;
-use crate::runtime::ui::UiStateKind as RuntimeUiStateKind;
+use crate::runtime::ui::UiStateKind;
 use crate::ui::template::best_template_candidate_downscaled;
 use image::DynamicImage;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use super::diagnostic::{
     confirm_probe_log_due, confirm_region_label, template_probe, text_match_quality_label,
     text_match_reject_label,
 };
-use super::kind::PanelRegions;
+use super::regions::PanelRegions;
 use super::sampling::{
     beige_panel_fraction, is_qianxing_overlay_close, overlay_close_white_fraction, screen_tone,
 };
@@ -129,7 +129,7 @@ impl TemplateUiStateClassifier {
                 continue;
             }
             return Some(UiStateClassification::with_evidence(
-                RuntimeUiStateKind::Panel,
+                UiStateKind::Panel,
                 label,
                 UiStateEvidence::new(
                     vec![
@@ -184,7 +184,7 @@ impl TemplateUiStateClassifier {
             && candidate.score >= block_min
         {
             return Some(UiStateClassification::with_evidence(
-                RuntimeUiStateKind::Panel,
+                UiStateKind::Panel,
                 "panel:more_settings",
                 UiStateEvidence::new(
                     vec![template_probe(
@@ -265,7 +265,7 @@ impl TemplateUiStateClassifier {
             let close_frac = overlay_close_white_fraction(image);
             if beige < 0.34 || close_frac > 0.5 {
                 return Some(UiStateClassification::with_evidence(
-                    RuntimeUiStateKind::Panel,
+                    UiStateKind::Panel,
                     "panel:qianxing_page",
                     UiStateEvidence::new(Vec::new(), None, "panel:qianxing_page"),
                 ));
@@ -290,7 +290,7 @@ impl TemplateUiStateClassifier {
                     && (hit.y - QIANXING_EXIT_MENU_ORIGIN.1).abs() <= QIANXING_EXIT_MENU_TOLERANCE
             }) {
                 return Some(UiStateClassification::with_evidence(
-                    RuntimeUiStateKind::Panel,
+                    UiStateKind::Panel,
                     "panel:qianxing_page",
                     UiStateEvidence::new(
                         vec![template_probe(
@@ -386,7 +386,7 @@ impl TemplateUiStateClassifier {
             };
             if candidate_matches(&candidate, case_threshold) {
                 return Some(UiStateClassification::with_evidence(
-                    RuntimeUiStateKind::Panel,
+                    UiStateKind::Panel,
                     label,
                     UiStateEvidence::new(
                         vec![template_probe(
@@ -414,7 +414,7 @@ impl TemplateUiStateClassifier {
                     && candidate.score >= threshold
                 {
                     return Some(UiStateClassification::with_evidence(
-                        RuntimeUiStateKind::Panel,
+                        UiStateKind::Panel,
                         label,
                         UiStateEvidence::new(
                             vec![template_probe(

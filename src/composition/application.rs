@@ -427,7 +427,7 @@ pub(crate) struct BusinessServices {
     pub(super) business: BusinessRuntimeHandle,
     pub(super) task_engine: TaskEngineHandle,
     pub(super) business_events: BusinessRuntimeEventSink,
-    pub(super) background_commands: workers::BackgroundCommandManager,
+    pub(super) background_lyrics: workers::BackgroundLyricsWorker,
     pub(super) ai: AiClient,
     // 记忆与冷却门是「全局唯一一份」的进程内状态：主循环与正式执行上下文必须共享同一实例，
     // 因此用 Arc 而不是 Clone（它们本身也不该被复制出第二份冷却账本）。
@@ -1547,7 +1547,7 @@ impl ApplicationRuntime {
             ai_request_timeout,
         } = config;
         let system_clock = Arc::new(SystemClock);
-        let state_store: Arc<dyn miliastra_contracts::StateStore> =
+        let state_store: Arc<dyn miliastra_kernel::StateStore> =
             Arc::new(crate::adapters::file_store::FsStateStore);
         let ocr_device = ProductionOcrDevice::new(ocr_args.clone())?;
         // 酷狗设备信息由用户在设置页填写：落盘后登录辅助进程与播放侧共用同一份标识。
@@ -1988,7 +1988,7 @@ impl ApplicationRuntime {
                 business,
                 task_engine,
                 business_events,
-                background_commands: workers::BackgroundCommandManager::new(),
+                background_lyrics: workers::BackgroundLyricsWorker::new(),
                 ai,
                 ai_chat_memory,
                 ai_chat_memory_generation: Arc::new(AtomicU64::new(0)),

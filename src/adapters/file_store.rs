@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-
-use miliastra_contracts::{AtomicFileStore, StateStore};
+use miliastra_kernel::{AtomicFileStore, StateStore};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 

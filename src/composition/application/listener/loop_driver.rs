@@ -335,8 +335,13 @@ impl AppServices {
                 Arc::new(http_facade::ApplicationHttpLoginFacade::new(
                     self.playback.login_helper.clone(),
                 )),
-                Arc::new(http_facade::ApplicationHttpAiFacade::with_memory(
+                // AI 点歌与 AI 聊天记忆是两个正交端口：
+                // 点歌只需要模型客户端，记忆需要记忆库 + 身份映射 + 维护代际。
+                // 这里分别装配，任何一个漏接都是编译错误而不是运行期静默失效。
+                Arc::new(http_facade::ApplicationHttpAiMusicFacade::new(
                     self.business.ai.clone(),
+                )),
+                Arc::new(http_facade::ApplicationHttpAiMemoryFacade::with_memory(
                     self.business.ai_chat_memory.clone(),
                     {
                         // 重跑清洗：闭包捕获可克隆的句柄，模型配置走实时快照，

@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::mpsc::{self, Receiver};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::business::{
     BusinessEvent, BusinessRuntime, BusinessRuntimeError, BusinessRuntimeEventSink,
@@ -9,17 +9,58 @@ use super::business::{
 };
 use super::deadline::{BusinessDeadlineEvent, BusinessDeadlineToken};
 use miliastra_kernel::timer::{
-    TimerRuntime, TimerRuntimeEvent, TimerRuntimeHandle, TimerRuntimeStartError, TimerShutdownError,
+    TimerEventSink, TimerRuntime, TimerRuntimeEvent, TimerRuntimeHandle, TimerRuntimeStartError,
+    TimerRuntimeStarter, TimerShutdownError,
 };
 
+/// 到期事件的转交计数。
+///
+/// 两个数刻意分开：`forwarded` 是真正交给业务运行时的条数，`discarded`
+/// 是业务运行时已经停掉之后、仍被计时器排空的条数。后者大于零说明关闭过程中
+/// 有一批截止时间已经无法生效——这正是排障时最需要看到的信息，不能和
+/// 「正常转交」混成一个数。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BusinessDeadlineBridgeSnapshot {
     forwarded_count: u64,
+    discarded_count: u64,
 }
 
 impl BusinessDeadlineBridgeSnapshot {
     pub(crate) const fn forwarded_count(self) -> u64 {
         self.forwarded_count
+    }
+
+    pub(crate) const fn discarded_count(self) -> u64 {
+        self.discarded_count
+    }
+}
+
+/// 计时器线程与停机方共享的投递账本。
+///
+/// 写入方是计时器线程，读取方是**已经 join 过它**的停机路径；`join` 本身
+/// 提供了 happens-before，因此这里用 `Relaxed` 就足够，不必为可见性多付
+/// 一次内存栅栏。计数只增不减，所以也不需要锁。
+#[derive(Debug, Default)]
+struct DeadlineDeliveryLedger {
+    forwarded: AtomicU64,
+    discarded: AtomicU64,
+}
+
+impl DeadlineDeliveryLedger {
+    fn record_forwarded(&self) {
+        self.forwarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_discarded(&self) {
+        self.discarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 读取当前计数。调用方必须已经停止（`join`）计时器线程。
+    fn snapshot(&self) -> BusinessDeadlineBridgeSnapshot {
+        BusinessDeadlineBridgeSnapshot {
+            forwarded_count: self.forwarded.load(Ordering::Relaxed),
+            discarded_count: self.discarded.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -27,7 +68,6 @@ impl BusinessDeadlineBridgeSnapshot {
 pub(crate) enum BusinessRuntimeGroupStartError {
     Timer(TimerRuntimeStartError),
     Business(BusinessRuntimeError),
-    BridgeSpawn(std::io::Error),
 }
 
 impl Display for BusinessRuntimeGroupStartError {
@@ -35,12 +75,6 @@ impl Display for BusinessRuntimeGroupStartError {
         match self {
             Self::Timer(error) => write!(formatter, "failed to start deadline timer: {error}"),
             Self::Business(error) => write!(formatter, "failed to start business runtime: {error}"),
-            Self::BridgeSpawn(error) => {
-                write!(
-                    formatter,
-                    "failed to start business deadline bridge: {error}"
-                )
-            }
         }
     }
 }
@@ -50,45 +84,21 @@ impl Error for BusinessRuntimeGroupStartError {
         match self {
             Self::Timer(error) => Some(error),
             Self::Business(error) => Some(error),
-            Self::BridgeSpawn(error) => Some(error),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BusinessDeadlineBridgeShutdownError {
-    BusinessRuntimeStopped {
-        forwarded_count: u64,
-        discarded_count: u64,
-    },
-    WorkerPanicked,
-}
-
-impl Display for BusinessDeadlineBridgeShutdownError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BusinessRuntimeStopped {
-                forwarded_count,
-                discarded_count,
-            } => write!(
-                formatter,
-                "business runtime stopped after {forwarded_count} deadline events were forwarded; \
-                 {discarded_count} later events were drained without delivery"
-            ),
-            Self::WorkerPanicked => formatter.write_str("business deadline bridge worker panicked"),
-        }
-    }
-}
-
-impl Error for BusinessDeadlineBridgeShutdownError {}
-
+/// 计时器关闭阶段的收尾结果。
+///
+/// 业务运行时先于计时器停下时，剩下的到期事件已经无处可投。这不算计时器
+/// 故障，而是一次**有损关闭**：必须把丢弃条数带回给调用方，让日志能说清
+/// 「多少条截止时间没能生效」，而不是笼统报一句失败。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BusinessDeadlineRuntimeShutdownError {
     Timer(TimerShutdownError),
-    Bridge(BusinessDeadlineBridgeShutdownError),
-    TimerAndBridge {
-        timer: TimerShutdownError,
-        bridge: BusinessDeadlineBridgeShutdownError,
+    DestinationStopped {
+        forwarded_count: u64,
+        discarded_count: u64,
     },
 }
 
@@ -96,10 +106,13 @@ impl Display for BusinessDeadlineRuntimeShutdownError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timer(error) => write!(formatter, "deadline timer shutdown failed: {error}"),
-            Self::Bridge(error) => write!(formatter, "deadline bridge shutdown failed: {error}"),
-            Self::TimerAndBridge { timer, bridge } => write!(
+            Self::DestinationStopped {
+                forwarded_count,
+                discarded_count,
+            } => write!(
                 formatter,
-                "deadline timer and bridge shutdown failed: timer={timer}; bridge={bridge}"
+                "business runtime stopped after {forwarded_count} deadline events were forwarded; \
+                 {discarded_count} later events were drained without delivery"
             ),
         }
     }
@@ -107,83 +120,83 @@ impl Display for BusinessDeadlineRuntimeShutdownError {
 
 impl Error for BusinessDeadlineRuntimeShutdownError {}
 
-struct BusinessDeadlineBridge {
-    worker: Option<
-        JoinHandle<Result<BusinessDeadlineBridgeSnapshot, BusinessDeadlineBridgeShutdownError>>,
-    >,
-}
-
-impl BusinessDeadlineBridge {
-    fn start(
-        events: Receiver<TimerRuntimeEvent<BusinessDeadlineToken>>,
-        business: BusinessRuntimeEventSink,
-    ) -> Result<Self, std::io::Error> {
-        let worker = thread::Builder::new()
-            .name("business-deadline-bridge".to_string())
-            .spawn(move || run_business_deadline_bridge(events, business))?;
-        Ok(Self {
-            worker: Some(worker),
-        })
-    }
-
-    fn join(
-        &mut self,
-    ) -> Result<BusinessDeadlineBridgeSnapshot, BusinessDeadlineBridgeShutdownError> {
-        let Some(worker) = self.worker.take() else {
-            return Ok(BusinessDeadlineBridgeSnapshot::default());
-        };
-        worker
-            .join()
-            .map_err(|_| BusinessDeadlineBridgeShutdownError::WorkerPanicked)?
-    }
-}
-
-fn run_business_deadline_bridge(
-    events: Receiver<TimerRuntimeEvent<BusinessDeadlineToken>>,
+/// 计时器到期事件直投业务运行时的出口。
+///
+/// 这个实现就是取代 `business-deadline-bridge` 线程的全部内容：计时器线程每产出
+/// 一条事件，就在这里同步投给业务运行时的事件入口。没有中间通道，也就没有
+/// 「为了把两级通道接起来而必须存在的转发线程」，以及随之而来的第二份队列。
+///
+/// 投递语义与原先经 `mpsc::sync_channel` 转发时逐字等价：
+///
+/// - [`BusinessRuntimeEventSink::submit`] 在业务队列满时阻塞，因此计时器线程
+///   跟着等，事件不丢——这条背压是刻意保留的；
+/// - 业务运行时停下之后，`submit` 立刻失败。此后每一条事件都计入丢弃，
+///   计时器线程**继续排空**而不是立刻退出：丢弃条数要反映真实积压量，
+///   否则日志只能说「丢了一条」，看不出还压着多少。
+///
+/// 正因为要「继续排空」，这个 sink 永远返回 `Ok`：`Err` 在
+/// [`TimerEventSink`] 里的含义是「接收方已停止，计时器可以收尾」，而这里
+/// 计时器还没到收尾的时候——它要陪业务运行时一起走完关闭流程。
+struct BusinessDeadlineSink {
     business: BusinessRuntimeEventSink,
-) -> Result<BusinessDeadlineBridgeSnapshot, BusinessDeadlineBridgeShutdownError> {
-    let mut snapshot = BusinessDeadlineBridgeSnapshot::default();
-    let mut destination_stopped = false;
-    let mut discarded_count = 0_u64;
-    while let Ok(event) = events.recv() {
-        if destination_stopped {
-            discarded_count = discarded_count.saturating_add(1);
-            continue;
+    ledger: Arc<DeadlineDeliveryLedger>,
+    destination_stopped: bool,
+}
+
+impl BusinessDeadlineSink {
+    fn new(business: BusinessRuntimeEventSink, ledger: Arc<DeadlineDeliveryLedger>) -> Self {
+        Self {
+            business,
+            ledger,
+            destination_stopped: false,
         }
-        let event = BusinessDeadlineEvent::from(event);
-        if business.submit(BusinessEvent::Timer(event)).is_err() {
-            destination_stopped = true;
-            discarded_count = discarded_count.saturating_add(1);
-            continue;
-        }
-        snapshot.forwarded_count = snapshot.forwarded_count.saturating_add(1);
-    }
-    if destination_stopped {
-        Err(
-            BusinessDeadlineBridgeShutdownError::BusinessRuntimeStopped {
-                forwarded_count: snapshot.forwarded_count,
-                discarded_count,
-            },
-        )
-    } else {
-        Ok(snapshot)
     }
 }
 
-/// 在业务运行时创建前持有计时器；事件桥接连接前即可注入其句柄。
+impl TimerEventSink<BusinessDeadlineToken> for BusinessDeadlineSink {
+    fn deliver(&mut self, event: TimerRuntimeEvent<BusinessDeadlineToken>) -> Result<(), ()> {
+        if self.destination_stopped {
+            self.ledger.record_discarded();
+            return Ok(());
+        }
+        let routed = BusinessDeadlineEvent::from(event);
+        if self.business.submit(BusinessEvent::Timer(routed)).is_err() {
+            // 下游状态不会恢复，不必再为后续事件重复探测。
+            self.destination_stopped = true;
+            self.ledger.record_discarded();
+            return Ok(());
+        }
+        self.ledger.record_forwarded();
+        Ok(())
+    }
+}
+
+/// 在业务运行时创建前持有计时器；事件出口连接前即可注入其句柄。
+///
+/// 组合根有一段真实的顺序约束：计时器句柄必须在业务运行时**构造之前**交出去
+/// （构造参数里就带着它），而业务运行时的事件入口只有**构造之后**才能取得。
+/// 两段式启动正好落在这个顺序上——[`Self::start`] 只建命令通道并交出句柄，
+/// [`Self::build_with`] 拿到业务运行时之后再把事件出口接上去，计时器工作线程
+/// 此刻才真正开跑。
+///
+/// 两段之间的语义是明确的：
+///
+/// - 未启动期间提交的命令留在有界命令队列里，并发上限不变，满了照旧报
+///   [`miliastra_kernel::timer::TimerSubmitError::QueueFull`]，绝不静默丢弃；
+/// - 未启动期间丢弃 builder，命令通道随之关闭，已发出的句柄立即报
+///   `RuntimeStopped`，不会有线程被落下。
 pub(crate) struct BusinessRuntimeGroupBuilder {
-    timer: Option<TimerRuntime<BusinessDeadlineToken>>,
-    events: Option<Receiver<TimerRuntimeEvent<BusinessDeadlineToken>>>,
+    timer: Option<TimerRuntimeStarter<BusinessDeadlineToken>>,
+    ledger: Arc<DeadlineDeliveryLedger>,
 }
 
 impl BusinessRuntimeGroupBuilder {
     pub(crate) fn start(queue_capacity: usize) -> Result<Self, BusinessRuntimeGroupStartError> {
-        let (event_sender, events) = mpsc::sync_channel(queue_capacity);
-        let timer = TimerRuntime::start(queue_capacity, event_sender)
-            .map_err(BusinessRuntimeGroupStartError::Timer)?;
+        let timer =
+            TimerRuntime::prepare(queue_capacity).map_err(BusinessRuntimeGroupStartError::Timer)?;
         Ok(Self {
             timer: Some(timer),
-            events: Some(events),
+            ledger: Arc::new(DeadlineDeliveryLedger::default()),
         })
     }
 
@@ -194,48 +207,6 @@ impl BusinessRuntimeGroupBuilder {
             .handle()
     }
 
-    fn attach(
-        self,
-        business: BusinessRuntime,
-    ) -> Result<BusinessRuntimeGroup, BusinessRuntimeGroupStartError> {
-        self.attach_with_bridge(business, BusinessDeadlineBridge::start)
-    }
-
-    fn attach_with_bridge(
-        mut self,
-        business: BusinessRuntime,
-        start_bridge: impl FnOnce(
-            Receiver<TimerRuntimeEvent<BusinessDeadlineToken>>,
-            BusinessRuntimeEventSink,
-        ) -> Result<BusinessDeadlineBridge, std::io::Error>,
-    ) -> Result<BusinessRuntimeGroup, BusinessRuntimeGroupStartError> {
-        let event_sink = business.event_sink();
-        let Some(events) = self.events.take() else {
-            return Err(BusinessRuntimeGroupStartError::BridgeSpawn(
-                std::io::Error::other("deadline timer event receiver already consumed"),
-            ));
-        };
-        let Some(timer) = self.timer.take() else {
-            return Err(BusinessRuntimeGroupStartError::BridgeSpawn(
-                std::io::Error::other("deadline timer runtime already consumed"),
-            ));
-        };
-        let bridge = match start_bridge(events, event_sink) {
-            Ok(bridge) => bridge,
-            Err(error) => {
-                cleanup_failed_attach(timer, business);
-                return Err(BusinessRuntimeGroupStartError::BridgeSpawn(error));
-            }
-        };
-        Ok(BusinessRuntimeGroup {
-            deadlines: Some(BusinessDeadlineRuntime {
-                timer: Some(timer),
-                bridge: Some(bridge),
-            }),
-            business: Some(business),
-        })
-    }
-
     pub(crate) fn build_with(
         self,
         build: impl FnOnce() -> Result<BusinessRuntime, BusinessRuntimeError>,
@@ -243,61 +214,92 @@ impl BusinessRuntimeGroupBuilder {
         let business = build().map_err(BusinessRuntimeGroupStartError::Business)?;
         self.attach(business)
     }
+
+    fn attach(
+        mut self,
+        business: BusinessRuntime,
+    ) -> Result<BusinessRuntimeGroup, BusinessRuntimeGroupStartError> {
+        let starter = self
+            .timer
+            .take()
+            .expect("deadline timer starter is consumed exactly once");
+        self.attach_with(business, starter, TimerRuntimeStarter::start)
+    }
+
+    /// 允许注入「绑定事件出口并启动线程」这一步，单测可以在这里强制启动失败。
+    fn attach_with(
+        self,
+        business: BusinessRuntime,
+        starter: TimerRuntimeStarter<BusinessDeadlineToken>,
+        start_timer: impl FnOnce(
+            TimerRuntimeStarter<BusinessDeadlineToken>,
+            BusinessDeadlineSink,
+        )
+            -> Result<TimerRuntime<BusinessDeadlineToken>, TimerRuntimeStartError>,
+    ) -> Result<BusinessRuntimeGroup, BusinessRuntimeGroupStartError> {
+        let sink = BusinessDeadlineSink::new(business.event_sink(), Arc::clone(&self.ledger));
+        let timer = match start_timer(starter, sink) {
+            Ok(timer) => timer,
+            Err(error) => {
+                cleanup_failed_attach(business);
+                return Err(BusinessRuntimeGroupStartError::Timer(error));
+            }
+        };
+        Ok(BusinessRuntimeGroup {
+            deadlines: Some(BusinessDeadlineRuntime {
+                timer: Some(timer),
+                ledger: Arc::clone(&self.ledger),
+            }),
+            business: Some(business),
+        })
+    }
 }
 
 impl Drop for BusinessRuntimeGroupBuilder {
     fn drop(&mut self) {
-        self.events.take();
-        if let Some(timer) = self.timer.take() {
-            let _ = timer.shutdown();
-        }
+        // 两段式启动里还没有工作线程，丢弃 starter 就是关闭命令通道：
+        // 已交出去的句柄会立刻看到 `RuntimeStopped`，不会有线程被落下。
+        self.timer.take();
     }
 }
 
-fn cleanup_failed_attach(timer: TimerRuntime<BusinessDeadlineToken>, business: BusinessRuntime) {
+fn cleanup_failed_attach(business: BusinessRuntime) {
     if let Err(error) = business.prepare_shutdown() {
-        log::error!("业务期限 bridge 启动失败后的业务静默关闭失败：{error}");
+        log::error!("业务期限启动失败后的业务静默关闭失败：{error}");
     }
     if let Err(error) = business.shutdown() {
-        log::error!("业务期限 bridge 启动失败后的业务运行时关闭失败：{error}");
-    }
-    if let Err(error) = timer.shutdown() {
-        log::error!("业务期限 bridge 启动失败后的计时运行时关闭失败：{error}");
+        log::error!("业务期限启动失败后的业务运行时关闭失败：{error}");
     }
 }
 
-/// 持有唯一业务计时器及其事件桥接，确保停机顺序一致。
+/// 持有唯一业务计时器，确保停机顺序一致。
+///
+/// 计时器线程本身就是事件投递者，所以这里只有一个要 join 的线程，
+/// 也不存在「先排空桥接、再停计时器」的两段排空。
 struct BusinessDeadlineRuntime {
     timer: Option<TimerRuntime<BusinessDeadlineToken>>,
-    bridge: Option<BusinessDeadlineBridge>,
+    ledger: Arc<DeadlineDeliveryLedger>,
 }
 
 impl BusinessDeadlineRuntime {
     fn stop(
         &mut self,
     ) -> Result<BusinessDeadlineBridgeSnapshot, BusinessDeadlineRuntimeShutdownError> {
-        self.stop_with()
-    }
-
-    fn stop_with(
-        &mut self,
-    ) -> Result<BusinessDeadlineBridgeSnapshot, BusinessDeadlineRuntimeShutdownError> {
-        let timer_result = self.timer.take().map(TimerRuntime::shutdown).transpose();
-        let bridge_result = self
-            .bridge
-            .as_mut()
-            .map(BusinessDeadlineBridge::join)
-            .transpose();
-        self.bridge.take();
-        match (timer_result, bridge_result) {
-            (Ok(_), Ok(Some(snapshot))) => Ok(snapshot),
-            (Ok(_), Ok(None)) => Ok(BusinessDeadlineBridgeSnapshot::default()),
-            (Err(timer), Ok(_)) => Err(BusinessDeadlineRuntimeShutdownError::Timer(timer)),
-            (Ok(_), Err(bridge)) => Err(BusinessDeadlineRuntimeShutdownError::Bridge(bridge)),
-            (Err(timer), Err(bridge)) => {
-                Err(BusinessDeadlineRuntimeShutdownError::TimerAndBridge { timer, bridge })
-            }
+        let Some(timer) = self.timer.take() else {
+            return Ok(BusinessDeadlineBridgeSnapshot::default());
+        };
+        timer
+            .shutdown()
+            .map_err(BusinessDeadlineRuntimeShutdownError::Timer)?;
+        // join 已经完成，账本里是最终值。
+        let snapshot = self.ledger.snapshot();
+        if snapshot.discarded_count() > 0 {
+            return Err(BusinessDeadlineRuntimeShutdownError::DestinationStopped {
+                forwarded_count: snapshot.forwarded_count(),
+                discarded_count: snapshot.discarded_count(),
+            });
         }
+        Ok(snapshot)
     }
 }
 
@@ -362,7 +364,8 @@ impl Display for BusinessRuntimeGroupShutdownError {
 
 impl Error for BusinessRuntimeGroupShutdownError {}
 
-/// 将业务工作线程与唯一计时器及桥接一起持有。停机先静默业务状态并停止外部工作线程，再排空计时器桥接，最后退出工作线程。
+/// 将业务工作线程与唯一计时器一起持有。停机先静默业务状态并停止外部工作线程，
+/// 再停计时器线程（它同时是事件投递者），最后退出工作线程。
 pub(crate) struct BusinessRuntimeGroup {
     deadlines: Option<BusinessDeadlineRuntime>,
     business: Option<BusinessRuntime>,
@@ -400,7 +403,7 @@ impl BusinessRuntimeGroup {
         let (deadline_snapshot, deadline_error) = match self
             .deadlines
             .take()
-            .map(|mut deadlines| deadlines.stop_with())
+            .map(|mut deadlines| deadlines.stop())
             .transpose()
         {
             Ok(snapshot) => (snapshot.unwrap_or_default(), None),
@@ -478,6 +481,19 @@ mod tests {
             SessionGeneration::INITIAL,
             Instant::now(),
         )
+    }
+
+    /// 独立搭一套「计时器 + 直投出口」，便于直接观察账本与关闭结果。
+    fn direct_delivery(
+        events: BusinessRuntimeEventSink,
+    ) -> (
+        TimerRuntime<BusinessDeadlineToken>,
+        Arc<DeadlineDeliveryLedger>,
+    ) {
+        let ledger = Arc::new(DeadlineDeliveryLedger::default());
+        let sink = BusinessDeadlineSink::new(events, Arc::clone(&ledger));
+        let timer = TimerRuntime::start_with_sink(8, sink).unwrap();
+        (timer, ledger)
     }
 
     #[test]
@@ -559,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn real_bridge_channels_forward_each_expiration_exactly_once_before_shutdown() {
+    fn timer_thread_delivers_each_expiration_exactly_once_without_a_bridge_thread() {
         let business_runtime = business_runtime(8);
         let timer_owner = BusinessRuntimeGroupBuilder::start(8).unwrap();
         let timer = timer_owner.handle();
@@ -593,10 +609,11 @@ mod tests {
         });
         let snapshot = result_receiver
             .recv_timeout(Duration::from_secs(2))
-            .expect("two-phase shutdown must drain timer events without deadlocking")
+            .expect("shutdown must drain timer events without deadlocking")
             .unwrap();
 
         assert_eq!(snapshot.deadlines().forwarded_count(), 8);
+        assert_eq!(snapshot.deadlines().discarded_count(), 0);
         assert_eq!(snapshot.business().timer_counts().card_game(), 1);
         assert_eq!(snapshot.business().timer_counts().undercover(), 1);
         assert_eq!(snapshot.business().timer_counts().turtle_soup(), 1);
@@ -609,36 +626,83 @@ mod tests {
         );
     }
 
+    /// 直投改造的核心断言：进程里只有计时器线程在投递到期事件，
+    /// 不存在 `business-deadline-bridge` 这层纯转发线程。
+    ///
+    /// 线程名只在 Linux 的 `/proc/self/task/<tid>/comm` 上可读，
+    /// 因此这条用例只在 Linux 生效；Windows 侧由「事件恰好投递一次」
+    /// 那几条用例间接覆盖同一语义。
+    #[cfg(target_os = "linux")]
     #[test]
-    fn shutdown_reports_a_destination_stopped_before_expiration_delivery() {
+    fn no_bridge_thread_is_spawned_for_deadline_delivery() {
+        fn thread_names() -> Vec<String> {
+            let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+                return Vec::new();
+            };
+            entries
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| std::fs::read_to_string(entry.path().join("comm")).ok())
+                .map(|name| name.trim().to_string())
+                .collect()
+        }
+
+        // Linux /proc/self/task/*/comm 最多保留 15 字节，且新线程在 spawn 返回后
+        // 才执行 prctl(PR_SET_NAME)；短轮询等待计时器线程完成命名，避免并行调度下的竞态。
+        let before = thread_names()
+            .into_iter()
+            .filter(|name| name.starts_with("business-deadli"))
+            .count();
+        let business_runtime = business_runtime(4);
+        let timer_owner = BusinessRuntimeGroupBuilder::start(4).unwrap();
+        let runtime_group = timer_owner.attach(business_runtime).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut names = thread_names();
+        while !names.iter().any(|name| name == "timer-runtime") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+            names = thread_names();
+        }
+        let timers = names.iter().filter(|name| *name == "timer-runtime").count();
+        let bridges = names
+            .iter()
+            .filter(|name| name.starts_with("business-deadli"))
+            .count();
+
+        assert!(timers >= 1, "启动业务运行时组后应当有计时器线程：{names:?}");
+        assert_eq!(
+            bridges, before,
+            "计时器应当直接把事件投给业务运行时，不应再起转发线程：{names:?}"
+        );
+        runtime_group.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_reports_discarded_expirations_after_the_business_runtime_stopped() {
         let business_runtime = business_runtime(8);
-        let event_sink = business_runtime.event_sink();
-        let (event_sender, events) = mpsc::sync_channel(8);
-        let timer_runtime = TimerRuntime::start(8, event_sender).unwrap();
-        let timer = timer_runtime.handle();
-        let mut bridge = BusinessDeadlineBridge::start(events, event_sink).unwrap();
+        let (timer, ledger) = direct_delivery(business_runtime.event_sink());
+        let timer_handle = timer.handle();
         business_runtime.shutdown().unwrap();
         for id in [1, 2, 3] {
-            timer
+            timer_handle
                 .schedule(schedule(
                     CardGameDeadlineToken::new(id, CardGameDeadlineKind::TurnExpiry),
                     id,
                 ))
                 .unwrap();
         }
-        timer_runtime.shutdown().unwrap();
+        let mut deadlines = BusinessDeadlineRuntime {
+            timer: Some(timer),
+            ledger,
+        };
 
         assert!(matches!(
-            bridge.join(),
-            Err(
-                BusinessDeadlineBridgeShutdownError::BusinessRuntimeStopped {
-                    forwarded_count: 0,
-                    discarded_count: 6,
-                }
-            )
+            deadlines.stop(),
+            Err(BusinessDeadlineRuntimeShutdownError::DestinationStopped {
+                forwarded_count: 0,
+                discarded_count: 6,
+            })
         ));
         assert!(matches!(
-            timer.schedule(schedule(
+            timer_handle.schedule(schedule(
                 CardGameDeadlineToken::new(4, CardGameDeadlineKind::TurnExpiry),
                 4,
             )),
@@ -689,7 +753,7 @@ mod tests {
                 }
             }
         }
-        let (dropped_sender, dropped_receiver) = mpsc::sync_channel(1);
+        let (dropped_sender, dropped_receiver) = std::sync::mpsc::sync_channel(1);
 
         thread::spawn(move || {
             drop(runtime_group);
@@ -713,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn unattached_saturated_timer_owner_drops_receiver_before_joining_worker() {
+    fn unattached_saturated_timer_owner_drops_commands_before_joining_worker() {
         let timer_owner = BusinessRuntimeGroupBuilder::start(1).unwrap();
         let timer = timer_owner.handle();
         timer
@@ -722,36 +786,15 @@ mod tests {
                 1,
             ))
             .unwrap();
-        let submit_by = Instant::now() + Duration::from_secs(1);
-        loop {
-            match timer.schedule(DeadlineSchedule::new(
-                BusinessDeadlineToken::from(CardGameDeadlineToken::new(
-                    2,
-                    CardGameDeadlineKind::TurnExpiry,
-                )),
-                BusinessOperationId::new(2),
-                SessionGeneration::INITIAL,
-                Instant::now() + Duration::from_secs(60),
-            )) {
-                Ok(()) => break,
-                Err(TimerSubmitError::QueueFull) => {
-                    assert!(
-                        Instant::now() < submit_by,
-                        "timer worker did not take token 1"
-                    );
-                    thread::yield_now();
-                }
-                Err(TimerSubmitError::RuntimeStopped) => panic!("timer stopped unexpectedly"),
-            }
-        }
+        // 两段式启动：还没有工作线程消费命令队列，所以第二条命令立刻打满容量。
         assert!(matches!(
             timer.schedule(schedule(
-                CardGameDeadlineToken::new(3, CardGameDeadlineKind::TurnExpiry),
-                3,
+                CardGameDeadlineToken::new(2, CardGameDeadlineKind::TurnExpiry),
+                2,
             )),
             Err(TimerSubmitError::QueueFull)
         ));
-        let (dropped_sender, dropped_receiver) = mpsc::sync_channel(1);
+        let (dropped_sender, dropped_receiver) = std::sync::mpsc::sync_channel(1);
 
         thread::spawn(move || {
             drop(timer_owner);
@@ -760,11 +803,11 @@ mod tests {
 
         dropped_receiver
             .recv_timeout(Duration::from_secs(1))
-            .expect("unattached owner must close its event receiver before joining timer");
+            .expect("unattached owner must close its command channel before joining timer");
         assert!(matches!(
             timer.schedule(schedule(
-                CardGameDeadlineToken::new(4, CardGameDeadlineKind::TurnExpiry),
-                4,
+                CardGameDeadlineToken::new(3, CardGameDeadlineKind::TurnExpiry),
+                3,
             )),
             Err(TimerSubmitError::RuntimeStopped)
         ));
@@ -772,23 +815,25 @@ mod tests {
 
     #[test]
     fn failed_attach_cleanup_stops_business_then_timer_handles() {
-        let timer_owner = BusinessRuntimeGroupBuilder::start(2).unwrap();
+        let mut timer_owner = BusinessRuntimeGroupBuilder::start(2).unwrap();
         let timer = timer_owner.handle();
         let business_runtime = business_runtime(2);
         let business = business_runtime.handle();
+        let starter = timer_owner
+            .timer
+            .take()
+            .expect("deadline timer starter is consumed exactly once");
 
-        let error = match timer_owner
-            .attach_with_bridge(business_runtime, |_events, _event_sink| {
-                Err(std::io::Error::other("forced bridge spawn failure"))
-            }) {
-            Ok(_) => panic!("injected bridge failure should fail attachment"),
+        let error = match timer_owner.attach_with(business_runtime, starter, |_starter, _sink| {
+            Err(TimerRuntimeStartError::Spawn(std::io::Error::other(
+                "forced timer spawn failure",
+            )))
+        }) {
+            Ok(_) => panic!("injected timer failure should fail attachment"),
             Err(error) => error,
         };
 
-        assert!(matches!(
-            error,
-            BusinessRuntimeGroupStartError::BridgeSpawn(_)
-        ));
+        assert!(matches!(error, BusinessRuntimeGroupStartError::Timer(_)));
         assert!(matches!(
             timer.schedule(schedule(
                 CardGameDeadlineToken::new(1, CardGameDeadlineKind::TurnExpiry),
@@ -804,7 +849,7 @@ mod tests {
 
     #[test]
     fn application_timer_reports_queue_full_without_bypassing_the_bounded_channel() {
-        let (event_sender, events) = mpsc::sync_channel(1);
+        let (event_sender, events) = std::sync::mpsc::sync_channel(1);
         let runtime = TimerRuntime::<BusinessDeadlineToken>::start(1, event_sender).unwrap();
         let timer = runtime.handle();
         timer
@@ -884,7 +929,7 @@ mod tests {
 
     #[test]
     fn command_routing_preserves_current_and_previous_schedule_correlation() {
-        let (event_sender, events) = mpsc::sync_channel(4);
+        let (event_sender, events) = std::sync::mpsc::sync_channel(4);
         let runtime = TimerRuntime::<BusinessDeadlineToken>::start(4, event_sender).unwrap();
         let timer = runtime.handle();
         let token = BusinessDeadlineToken::from(CardGameDeadlineToken::new(
@@ -953,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn command_errors_cross_the_bridge_with_no_waitable_ack_to_drop() {
+    fn command_errors_reach_the_business_runtime_without_a_waitable_ack_to_drop() {
         let business_runtime = business_runtime(8);
         let timer_owner = BusinessRuntimeGroupBuilder::start(8).unwrap();
         let timer = timer_owner.handle();
@@ -1048,6 +1093,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.deadlines().forwarded_count(), DEADLINE_COUNT * 2);
+        assert_eq!(snapshot.deadlines().discarded_count(), 0);
         assert_eq!(
             snapshot.business().timer_counts().command_completed(),
             DEADLINE_COUNT

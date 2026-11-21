@@ -230,7 +230,10 @@ pub(in crate::composition::application) fn acknowledge_unrecognized_primary_mess
         )?;
     } else {
         // 仅粉色首屏历史永久消费；蓝色首屏的未识别文本仍可由有效修订交付。
-        chat_timeline.acknowledge_business(&observed.id)?;
+        //
+        // 必须带快照时间：这条气泡在后续帧里可能被 OCR 修正成一条真命令，
+        // 那次修正会推进修订围栏；用无时间的永久 ACK 会把修正后的命令永久吞掉。
+        chat_timeline.acknowledge_business_at(&observed.id, captured_at)?;
     }
     Ok(())
 }
@@ -241,6 +244,11 @@ pub(in crate::composition::application) fn acknowledge_unrecognized_primary_mess
 /// 缺陷 6：`message_text` / `message_y` 任一缺失就**不写锁**并 warn，绝不用
 /// `unwrap_or_default` 退化成空串/0——空文本会静默不写锁，y=0 则会命中任何
 /// `y <= 28` 的同文本气泡，把无关命令错误抑制掉。
+///
+/// 时间基准取自**命令自身捕获的观察时刻**（`observation.captured_at`），
+/// 而不是调用时刻：命令从被观察到成功派发之间会先在待处理队列里等，
+/// 期间同一气泡可能被 OCR 修正。围栏比较必须用观察时刻，否则新修订反而会被
+/// 迟到的那份伪装成“更新”的快照通过。
 pub(in crate::composition::application) fn acknowledge_primary_command(
     chat_timeline: &crate::observation::chat::ChatTimeline,
     command: &RoutedCommand,
@@ -249,6 +257,9 @@ pub(in crate::composition::application) fn acknowledge_primary_command(
     let Some(message_id) = command.observation.message_id.as_ref() else {
         return Ok(());
     };
+    // 控制台/测试构造的命令没有快照时间：这类命令不存在「同一气泡的更新修订」，
+    // 只能走无围栏的兼容入口（见 ChatTimeline 两个 API 的语义边界说明）。
+    let captured_at = command.observation.captured_at;
     let acknowledged = if write_lock {
         // 用被派发消息自身捕获的文本与锚点，绝不回头查当前 tracker。
         match (
@@ -259,9 +270,15 @@ pub(in crate::composition::application) fn acknowledge_primary_command(
                 .filter(|text| !text.trim().is_empty()),
             command.observation.lock_anchor,
         ) {
-            (Some(text), Some(anchor)) => {
-                chat_timeline.acknowledge_command_at(message_id, text, anchor)?
-            }
+            (Some(text), Some(anchor)) => match captured_at {
+                Some(captured_at) => chat_timeline.acknowledge_command_at_revision(
+                    message_id,
+                    captured_at,
+                    text,
+                    anchor,
+                )?,
+                None => chat_timeline.acknowledge_command_at(message_id, text, anchor)?,
+            },
             // 文本或锚点任一缺失：不再打印它们本身（缺的就是不可信内容），
             // 只说明缺了什么、后果如何。
             (_text, _anchor) => {
@@ -269,16 +286,34 @@ pub(in crate::composition::application) fn acknowledge_primary_command(
                     "命令锁未写入：这条命令的观察缺少可信文本或屏幕锚点（所属聊天区：{}），本轮只确认、不写锁，下次重整画面后会重新判定",
                     chat_identity_label(&message_id.chat),
                 );
-                chat_timeline.acknowledge_business(message_id)?
+                acknowledge_business_observation(chat_timeline, message_id, captured_at)?
             }
         }
     } else {
-        chat_timeline.acknowledge_business(message_id)?
+        acknowledge_business_observation(chat_timeline, message_id, captured_at)?
     };
     if !acknowledged {
-        log::debug!("一级命令完成处理时，该消息已滚出当前画面，本次确认未生效");
+        log::debug!(
+            "一级命令完成处理时，这条修订已不在待处理队列，或已被更新的修订推进围栏取代，本次确认未生效（所属聊天区：{}）",
+            chat_identity_label(&message_id.chat)
+        );
     }
     Ok(())
+}
+
+/// 确认一条业务消息已处理，时间基准是它**被观察到的时刻**。
+///
+/// `captured_at` 为 `None` 只出现在控制台/测试构造的观察里；真实聊天观察总是
+/// 带着快照时间，因此真实路径一律核验修订围栏。
+fn acknowledge_business_observation(
+    chat_timeline: &crate::observation::chat::ChatTimeline,
+    message_id: &crate::observation::chat::ObservedChatMessageId,
+    captured_at: Option<Instant>,
+) -> Result<bool> {
+    match captured_at {
+        Some(captured_at) => chat_timeline.acknowledge_business_at(message_id, captured_at),
+        None => chat_timeline.acknowledge_business(message_id),
+    }
 }
 
 /// 二级/好友命令派发的唯一提交点：只有真正作为命令派发成功才写命令锁。
@@ -502,9 +537,10 @@ impl AppServices {
                                 log::info!(
                                     "命令未执行：二级消息未判为新增追加（交付状态：{}，聊天区：{}）「{}」",
                                     delivery_state_label(
-                                        self.ui
-                                            .chat_timeline
-                                            .business_delivery_state(&message.id)?
+                                        self.ui.chat_timeline.business_delivery_state_at(
+                                            &message.id,
+                                            snapshot.captured_at,
+                                        )?
                                     ),
                                     chat_identity_label(chat),
                                     compact_for_log(&message.text)
@@ -578,9 +614,10 @@ impl AppServices {
                                 log::info!(
                                     "命令未执行：二级命令认领失败（已被基线或先前轮次消费，或本条修订被否决；交付状态：{}）「{}」",
                                     delivery_state_label(
-                                        self.ui
-                                            .chat_timeline
-                                            .business_delivery_state(&message.id)?
+                                        self.ui.chat_timeline.business_delivery_state_at(
+                                            &message.id,
+                                            snapshot.captured_at,
+                                        )?
                                     ),
                                     compact_for_log(&message.text)
                                 );
@@ -652,6 +689,10 @@ impl AppServices {
                     // 但必须留痕：这里是**永久 ACK**，一旦确认同一 id 不再交付。
                     // 二级面板昵称 OCR 失败时（高亮行读不出名字 → Unknown），屏上的
                     // `@点歌晴天` 会被这样静默吞掉，用户和日志都看不到任何证据。
+                    //
+                    // 确认必须带本帧 `captured_at`：这些身份虽然「从不派发业务」，
+                    // 但同一气泡在后续帧里可能被识别出真实身份而改走大厅分支，
+                    // 那次认出会推进修订围栏。无时间的永久 ACK 会把它永久吞掉。
                     for message in snapshot.messages {
                         if command::looks_like_command(&message.text)
                             && self.ui.chat_timeline.note_not_executed_log(&message.id)?
@@ -666,7 +707,9 @@ impl AppServices {
                                 compact_for_log(&message.text)
                             );
                         }
-                        self.ui.chat_timeline.acknowledge_business(&message.id)?;
+                        self.ui
+                            .chat_timeline
+                            .acknowledge_business_at(&message.id, snapshot.captured_at)?;
                     }
                 }
             }
@@ -914,7 +957,7 @@ impl AppServices {
                     let state = self
                         .ui
                         .chat_timeline
-                        .business_delivery_state(&observed.id)?;
+                        .business_delivery_state_at(&observed.id, captured_at)?;
                     log::info!(
                         "命令未执行：这条消息未判为新增追加（交付状态：{}，来源：{}），通常因为它是基线历史或画面不连续「{}」",
                         delivery_state_label(state),
@@ -1056,7 +1099,12 @@ impl AppServices {
                     seq,
                     parsed_command.raw
                 );
-                self.ui.chat_timeline.acknowledge_business(&observed.id)?;
+                // 邀请去重是「这条观察已被处理」的永久结论，仍要带本帧时间：
+                // 同一气泡的后续修订（例如 OCR 把它修正成另一条邀请命令）会推进
+                // 修订围栏，旧确认不能让那份修订失效。
+                self.ui
+                    .chat_timeline
+                    .acknowledge_business_at(&observed.id, captured_at)?;
                 continue;
             }
             if matches!(

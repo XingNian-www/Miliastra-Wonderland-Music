@@ -9,7 +9,7 @@ use miliastra_playback::{PlayableTrack, ProviderId, TrackKey};
 
 use crate::features::reply_template::playback as playback_templates;
 use crate::features::reply_template::{self, ReplyTemplate, ReplyVars};
-use crate::features::song_request::SearchCandidate;
+use crate::features::song_request::{PickedCandidate, SearchCandidate};
 use crate::text::{MAX_CHAT_WIDTH, char_width, display_width};
 
 use super::matcher::same_song_query;
@@ -25,13 +25,6 @@ pub(crate) struct PlaybackCommandContext {
     pub(crate) message_type: String,
     pub(crate) username: String,
     pub(crate) user_command: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PlaybackPickedCandidate {
-    pub(crate) text: String,
-    pub(crate) track: PlayableTrack,
-    pub(crate) candidate_snapshot: Vec<SearchCandidate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -389,7 +382,7 @@ pub(crate) trait PlaybackExecutionPort {
         keyword: &str,
         source: &str,
         prefer_accompaniment: bool,
-    ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure>;
+    ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure>;
     fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool>;
     fn play_and_verify(&mut self, request: &PlaybackRequest) -> Result<PlaybackVerification>;
     fn is_track_unavailable_error(&self, _error: &anyhow::Error) -> bool {
@@ -1567,12 +1560,12 @@ impl PlaybackApplication {
                     return Ok(completion);
                 }
             };
-            log::debug!("平台搜索命中：把「{}」解析为可播放音源", picked.text);
+            log::debug!("平台搜索命中：把「{}」解析为可播放音源", picked.keyword());
             let mut resolved = selection.clone();
-            resolved.keyword = picked.text;
+            resolved.keyword = picked.keyword().to_string();
             resolved.source = source.to_string();
-            resolved.track = Some(picked.track);
-            resolved.candidate_snapshot = picked.candidate_snapshot;
+            resolved.track = Some(picked.playable_track());
+            resolved.candidate_snapshot = picked.snapshot().to_vec();
             return self.run_request(&requested, &resolved.request(), purpose, port);
         }
         self.run_request(&requested, &requested, purpose, port)
@@ -2312,7 +2305,7 @@ mod tests {
             _keyword: &str,
             _source: &str,
             _prefer_accompaniment: bool,
-        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+        ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure> {
             unreachable!("queued items already have URIs")
         }
 
@@ -2396,7 +2389,7 @@ mod tests {
             _keyword: &str,
             _source: &str,
             _prefer_accompaniment: bool,
-        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+        ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure> {
             unreachable!("the queued item already has a URI")
         }
 
@@ -3156,7 +3149,7 @@ mod tests {
             _keyword: &str,
             _source: &str,
             _prefer_accompaniment: bool,
-        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+        ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure> {
             unreachable!("navigation target already has a URI")
         }
 
@@ -3431,7 +3424,7 @@ mod tests {
             _keyword: &str,
             _source: &str,
             _prefer_accompaniment: bool,
-        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+        ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure> {
             unreachable!("source switch uses the candidate snapshot")
         }
         fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool> {
@@ -3477,7 +3470,7 @@ mod tests {
             _keyword: &str,
             _source: &str,
             _prefer_accompaniment: bool,
-        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+        ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure> {
             unreachable!("fallback uses the saved snapshot without searching again")
         }
         fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool> {
@@ -3736,7 +3729,7 @@ mod tests {
             _keyword: &str,
             _source: &str,
             _prefer_accompaniment: bool,
-        ) -> std::result::Result<Option<PlaybackPickedCandidate>, PlaybackSearchFailure> {
+        ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure> {
             unreachable!("this port is only used for reply assertions")
         }
         fn song_dedup_limited(&mut self, _request: &PlaybackRequest) -> Result<bool> {

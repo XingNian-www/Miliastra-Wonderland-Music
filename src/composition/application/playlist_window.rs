@@ -112,12 +112,24 @@ fn acknowledge_playlist_decision(
 ) -> Result<()> {
     let observation = envelope.observation();
     if let Some(id) = &observation.message_id {
+        // 决策窗口收到的是**快照**消息，`captured_at` 就是那条消息的捕获时刻。
+        // 它必须参与围栏核验：窗口独占期间同一气泡仍会被 OCR 继续观察，一旦
+        // 修正出更晚的修订（推进交付围栏），这份旧快照的成功确认与命令锁
+        // 都不能作数，否则修正后的命令会被自己的旧文本墓碑永久挡住。
         match (
             changed,
+            observation.captured_at,
             observation.message_text.as_deref(),
             observation.lock_anchor,
         ) {
-            (true, Some(text), Some(anchor)) if !text.trim().is_empty() => {
+            (true, Some(captured_at), Some(text), Some(anchor)) if !text.trim().is_empty() => {
+                shared.acknowledge_command_at_revision(id, captured_at, text, anchor)?;
+            }
+            (_, Some(captured_at), _, _) => {
+                shared.acknowledge_business_at(id, captured_at)?;
+            }
+            // 控制台/测试构造的信封没有捕获时刻：不存在跨帧修订，走兼容入口。
+            (true, None, Some(text), Some(anchor)) if !text.trim().is_empty() => {
                 shared.acknowledge_command_at(id, text, anchor)?;
             }
             _ => {
@@ -133,6 +145,7 @@ impl ChatDecisionReader {
         &mut self,
         shared: &crate::observation::chat::ChatTimeline,
         message: &ChatTimelineMessage,
+        captured_at: Instant,
     ) -> Result<bool> {
         let chat_message = ChatMessage {
             message_type: message.message_type.clone(),
@@ -145,7 +158,10 @@ impl ChatDecisionReader {
         }
         self.seen.insert((message.id.clone(), message.text.clone()));
         // Consume before releasing the exclusive dispatch gate; success later adds a lock.
-        shared.acknowledge_business(&message.id)?;
+        //
+        // 用这条消息自己的快照时间：窗口读到它时可能已有一份更新的修订在排队，
+        // 永久消费那份旧快照会连带吞掉更新修订的派发资格。
+        shared.acknowledge_business_at(&message.id, captured_at)?;
         Ok(true)
     }
 
@@ -376,7 +392,7 @@ impl AppServices {
                     );
                     continue;
                 };
-                if !reader.accept_playlist_message(&self.ui.chat_timeline, &message)? {
+                if !reader.accept_playlist_message(&self.ui.chat_timeline, &message, captured_at)? {
                     log::info!(
                         "命令未执行：歌单决策已被基线或已消费否决，忽略这条决策「{}」（屏幕纵坐标 {}）",
                         crate::privacy::redacted_chat_text(&message.text),
@@ -637,23 +653,29 @@ mod tests {
             )
             .unwrap();
         let fresh = session.reader.read_playlist_messages().unwrap();
-        let message = &fresh[0].0;
-        assert!(shared.is_business_pending(&message.id).unwrap());
+        let (message, captured_at) = (&fresh[0].0, fresh[0].1);
+        assert!(
+            shared
+                .is_business_pending_at(&message.id, captured_at)
+                .unwrap()
+        );
         assert!(
             session
                 .reader
-                .accept_playlist_message(&shared, message)
+                .accept_playlist_message(&shared, message, captured_at)
                 .unwrap()
         );
         assert!(
             !session
                 .reader
-                .accept_playlist_message(&shared, message)
+                .accept_playlist_message(&shared, message, captured_at)
                 .unwrap()
         );
         let cleanup = session.finish_observation();
         assert!(
-            !shared.is_business_pending(&message.id).unwrap(),
+            !shared
+                .is_business_pending_at(&message.id, captured_at)
+                .unwrap(),
             "backlog control consumed before release"
         );
         assert!(

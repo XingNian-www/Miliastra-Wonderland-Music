@@ -1333,7 +1333,10 @@ struct RequestContextGuard(Option<(String, String)>);
 
 impl RequestContextGuard {
     fn enter(method: &str, path: &str) -> Self {
-        let previous = CURRENT_REQUEST.with(|slot| slot.borrow_mut().replace((method.to_string(), path.to_string())));
+        let previous = CURRENT_REQUEST.with(|slot| {
+            slot.borrow_mut()
+                .replace((method.to_string(), path.to_string()))
+        });
         Self(previous)
     }
 }
@@ -1796,8 +1799,7 @@ fn enforce_method(
     }
     if matches!(
         request.path.as_str(),
-        "/"
-            | "/screenshot"
+        "/" | "/screenshot"
             | "/hall-screenshot"
             | "/debug/screenshot"
             | "/debug/state"

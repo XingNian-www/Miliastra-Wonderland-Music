@@ -3,7 +3,7 @@
 use crate::geometry::Rect;
 use crate::runtime::ui::UiStateClassification;
 use crate::runtime::ui::UiStateEvidence;
-use crate::runtime::ui::UiStateKind as RuntimeUiStateKind;
+use crate::runtime::ui::UiStateKind;
 use crate::ui::template::best_template_candidate_downscaled;
 use image::DynamicImage;
 
@@ -98,7 +98,7 @@ impl TemplateUiStateClassifier {
             return None;
         }
         Some(UiStateClassification::with_evidence(
-            RuntimeUiStateKind::Secondary,
+            UiStateKind::Secondary,
             "secondary:qianxing_panel",
             UiStateEvidence::new(
                 vec![
@@ -145,7 +145,7 @@ impl TemplateUiStateClassifier {
             return None;
         }
         Some(UiStateClassification::with_evidence(
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:avatar_popup",
             UiStateEvidence::new(
                 vec![template_probe(
@@ -212,7 +212,7 @@ impl TemplateUiStateClassifier {
             return None;
         }
         Some(UiStateClassification::with_evidence(
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             "panel:profile_page",
             UiStateEvidence::new(
                 vec![
@@ -304,7 +304,7 @@ impl TemplateUiStateClassifier {
                 "panel:teyvat_profile_friend"
             };
             return Some(UiStateClassification::with_evidence(
-                RuntimeUiStateKind::Panel,
+                UiStateKind::Panel,
                 label,
                 UiStateEvidence::new(
                     vec![
@@ -359,7 +359,7 @@ impl TemplateUiStateClassifier {
         if add.as_ref().is_some_and(|hit| hit_matches(hit, action_min)) {
             let label = "panel:qianxing_profile_nonfriend";
             return Some(UiStateClassification::with_evidence(
-                RuntimeUiStateKind::Panel,
+                UiStateKind::Panel,
                 label,
                 UiStateEvidence::new(
                     vec![
@@ -399,7 +399,7 @@ impl TemplateUiStateClassifier {
             None => return None,
         };
         Some(UiStateClassification::with_evidence(
-            RuntimeUiStateKind::Panel,
+            UiStateKind::Panel,
             label,
             UiStateEvidence::new(
                 vec![

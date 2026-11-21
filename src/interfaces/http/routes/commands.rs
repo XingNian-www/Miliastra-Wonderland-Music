@@ -746,7 +746,10 @@ mod tests {
                 "表情标签应被接受：{text}"
             );
         }
-        assert!(validate_reply_variables("{表情包:8:哈哈}").is_ok(), "渲染层放行，发送层校验序号");
+        assert!(
+            validate_reply_variables("{表情包:8:哈哈}").is_ok(),
+            "渲染层放行，发送层校验序号"
+        );
         assert!(validate_reply_variables("{未知变量}").is_err());
     }
 }

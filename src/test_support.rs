@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use miliastra_contracts::{AtomicFileStore, StateStore};
+use miliastra_kernel::{AtomicFileStore, StateStore};
 
 /// 测试使用的最小文件状态存储，不属于稳定 crate API。
 #[derive(Debug)]

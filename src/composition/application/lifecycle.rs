@@ -118,9 +118,9 @@ impl ApplicationRuntime {
         if let Err(error) = self.business.task_engine.wake() {
             log::debug!("关停时唤醒任务引擎等待线程失败：{error}");
         }
-        if let Err(error) = self.business.background_commands.stop_all() {
+        if let Err(error) = self.business.background_lyrics.stop_all() {
             log::error!(
-                "后台命令线程关闭失败（步骤：关停后台命令），可能有命令线程残留，进程退出时会被系统强制回收：{error:#}"
+                "后台歌词线程关闭失败（步骤：关停后台歌词），可能有线程残留，进程退出时会被系统强制回收：{error:#}"
             );
         }
         if let Some(hotkeys) = self.owned.hotkeys.take()
@@ -171,8 +171,11 @@ impl ApplicationRuntime {
         if let Some(business_runtime) = self.owned.business_runtime.take() {
             match business_runtime.shutdown() {
                 Ok(snapshot) => log::info!(
-                    "业务运行时组已正常关闭，其中 {} 条期限已转交给后续流程",
+                    "业务运行时组已正常关闭，其中 {} 条期限已交给业务运行时处理",
                     snapshot.deadlines().forwarded_count()
+                ),
+                Err(error) if error.deadline_error().is_some() => log::warn!(
+                    "业务运行时组关闭时丢弃了部分期限（步骤：先停业务运行时再停计时器），这些截止时间不会再生效：{error:#}"
                 ),
                 Err(error) => log::error!(
                     "业务运行时组关闭失败（步骤：依次关停准备阶段与期限处理），可能有业务线程残留、未提交的期限不会再生效：{error:#}"

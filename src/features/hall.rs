@@ -16,7 +16,7 @@ use crate::features::command::{
 };
 use crate::features::reply_template::{ReplyVars, hall as templates};
 use crate::text::normalize_comparison_text;
-use miliastra_contracts::StateStore;
+use miliastra_kernel::StateStore;
 use miliastra_kernel::clock::{Clock, WallClock};
 
 pub(crate) const HALL_EXPIRING_WARNING_MINUTES: u32 = 10;
@@ -941,9 +941,11 @@ mod tests {
         assert!(port.toggled);
         let rendered = &port.rendered[0].1;
         assert!(rendered.contains("显示名甲"), "通告应用显示名: {rendered}");
-        assert!(!rendered.contains("900000001"), "通告不应出现 UID: {rendered}");
+        assert!(
+            !rendered.contains("900000001"),
+            "通告不应出现 UID: {rendered}"
+        );
     }
-
 
     #[test]
     fn hall_detection_replies_through_the_current_template_keys() {

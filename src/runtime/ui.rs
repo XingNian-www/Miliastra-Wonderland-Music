@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use enigo::{Button, Key};
 use image::DynamicImage;
+use serde::Serialize;
 
 pub trait UiDevice: Send + 'static {
     fn capture(&mut self) -> Result<DynamicImage>;
@@ -614,7 +615,8 @@ impl CapturedFrame {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UiStateKind {
     Primary,
     Secondary,
@@ -3874,6 +3876,42 @@ mod tests {
                 "primary:test",
             ))
         }
+    }
+
+    /// `Serialize` 的 JSON 值必须与 [`UiStateKind::name`] 逐字一致。
+    ///
+    /// 这两个表示会被不同的消费者读取：`name()` 喂给事件与查询接口，
+    /// `Serialize` 喂给 `ui::state` 里 `UiState` 的离线证据导出。它们一旦漂移，
+    /// 同一帧在两个地方就会显示成两个名字，而且没有任何编译错误提醒。
+    ///
+    /// 变体必须**逐个**列出（而不是遍历全部 + 只断言格式）：新增变体时这份
+    /// 清单不跟着改，本测试不会发现新名字写错——但那正是本测试要挡的事，
+    /// 所以下面还会有一条断言把变体总数钉住。
+    #[test]
+    fn ui_state_kind_serializes_to_its_canonical_name() {
+        let cases = [
+            (UiStateKind::Primary, "primary"),
+            (UiStateKind::Secondary, "secondary"),
+            (UiStateKind::MainMenu, "main_menu"),
+            (UiStateKind::GameGate, "game_gate"),
+            (UiStateKind::Overworld, "overworld"),
+            (UiStateKind::Loading, "loading"),
+            (UiStateKind::Panel, "panel"),
+            (UiStateKind::Unknown, "unknown"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.name(), expected, "规范名：{kind:?}");
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String(expected.to_string()),
+                "序列化值必须与规范名一致：{kind:?}"
+            );
+        }
+        assert_eq!(
+            cases.len(),
+            8,
+            "UiStateKind 的变体数变了：新增变体必须同时补进本测试的清单与 name()"
+        );
     }
 
     struct CapturingRoutine {

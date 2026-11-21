@@ -457,7 +457,7 @@ enum UndercoverContinuation {
 }
 
 impl UndercoverRuntimeService {
-    pub fn new(config: UndercoverConfig, store: Arc<dyn miliastra_contracts::StateStore>) -> Self {
+    pub fn new(config: UndercoverConfig, store: Arc<dyn miliastra_kernel::StateStore>) -> Self {
         let bank = UndercoverBankStore::new(
             config.word_bank_path.clone(),
             config.used_state_path.clone(),
@@ -512,16 +512,15 @@ impl UndercoverRuntimeService {
             }
         }
         let result = match command {
-            UndercoverCommand::CreateSingle | UndercoverCommand::CreateDouble => self
-                .begin_create(
-                    entertainment,
-                    player,
-                    player_display,
-                    source,
-                    command,
-                    now,
-                    operation_id,
-                ),
+            UndercoverCommand::CreateSingle | UndercoverCommand::CreateDouble => self.begin_create(
+                entertainment,
+                player,
+                player_display,
+                source,
+                command,
+                now,
+                operation_id,
+            ),
             UndercoverCommand::Join => self.begin_join(
                 entertainment,
                 player,
@@ -1010,7 +1009,10 @@ impl UndercoverRuntimeService {
                 now,
             } => match result {
                 UndercoverEffectResult::KeyedFriendVerify(Ok(true)) => {
-                    if let Err(error) = self.game.create_with_display(&player, &player_display, mode, now) {
+                    if let Err(error) =
+                        self.game
+                            .create_with_display(&player, &player_display, mode, now)
+                    {
                         return self
                             .begin_error(
                                 key,
@@ -1626,7 +1628,10 @@ mod runtime_tests {
             panic!("create should wait for friend verification");
         };
         let UndercoverEffect::KeyedFriendVerify { player, .. } = &verification.effect else {
-            panic!("expected keyed friend verify, got {:?}", verification.effect);
+            panic!(
+                "expected keyed friend verify, got {:?}",
+                verification.effect
+            );
         };
         // 投递层只按展示名反查好友候选；传身份键会退回拿 UUID 搜好友列表，必然落空。
         assert_eq!(player, display);

@@ -948,8 +948,10 @@ struct MainWorkerContext {
 /// 主连接线程：自动拉起 ChatBridge → 建立 WS → 消费事件 → 断线重连。
 ///
 /// 每个等待点都必须能被停止信号打断，因此这里**没有**裸 `thread::sleep`：
-/// 自动拉起与建连这类可能耗时数百毫秒的阻塞调用之间，都用 [`ExternalChatShutdown::wait`]
-/// 来等退避间隔；已连上时由 WS 的 3 秒读超时把控制权交回循环顶部。
+/// 重连退避用 [`ExternalChatShutdown::wait`]；已连上时由 WS 读等待的分片
+/// （见 [`crate::runtime::chat_source::ws`]）把控制权交回循环顶部，停止信号一到
+/// 下一次分片检查就返回。剩下两类阻塞「整段」调用是 HTTP 健康检查与断线补拉，
+/// 各有 2 秒 / 10 秒超时，无法中途打断，因此排在最长的关停路径上。
 fn run(
     shutdown: &ExternalChatShutdown,
     config: &ChatSourceConfig,

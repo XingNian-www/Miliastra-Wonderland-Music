@@ -251,15 +251,106 @@ fn default_debug_mode() -> String {
     "simulated".into()
 }
 
-pub(crate) trait HttpDebugPort: Send + Sync {
-    fn sandbox(&self) -> &crate::debug_http_service::DebugHttpService;
+/// HTTP 运行请求 → debug 层的领域请求。
+///
+/// 协议 DTO 留在接口层（serde 的 camelCase / deny_unknown_fields 是线上契约），
+/// debug 层只接收自己的 `DebugRunRequest`，不反向依赖 HTTP 类型。
+impl From<HttpDebugRunRequest> for crate::debug_http_service::DebugRunRequest {
+    fn from(request: HttpDebugRunRequest) -> Self {
+        Self {
+            task_id: request.task_id,
+            mode: request.mode,
+            expected_version: request.expected_version,
+            assertions: request.assertions,
+            fixture: request.fixture,
+        }
+    }
+}
 
+/// debug 领域错误 → HTTP 命令错误：种类决定状态码，原因原文透传。
+///
+/// 沙盒服务此前用 `HttpCommandError` 直接表达失败（几乎都是 400），
+/// 这里保持逐字节一致的状态码与错误文案；新增的 not_found/conflict/internal
+/// 只是把原本混在 400 里的语义留出了扩展位，当前行为不变。
+impl From<crate::debug_http_service::DebugServiceError> for HttpCommandError {
+    fn from(error: crate::debug_http_service::DebugServiceError) -> Self {
+        use crate::debug_http_service::DebugServiceErrorKind;
+        let status = match error.kind() {
+            DebugServiceErrorKind::BadRequest => 400,
+            DebugServiceErrorKind::NotFound => 404,
+            DebugServiceErrorKind::Conflict => 409,
+            DebugServiceErrorKind::Internal => 500,
+        };
+        Self {
+            status,
+            message: error.message().to_owned(),
+        }
+    }
+}
+
+/// 调试端口：完全控制/只读观察的全部能力。
+///
+/// **不再向下游泄漏 `DebugHttpService` 具体类型**——以前 `sandbox()` 把整个
+/// 服务对象交出去，接口层可以直接调它的任意方法，端口边界形同虚设。
+/// 现在每个沙盒操作都是一个语义明确的端口方法；调试端口的实现者必须显式接线，
+/// 这里不提供任何"静默成功"的默认实现，否则漏接线会在生产里悄悄变成空操作。
+pub(crate) trait HttpDebugPort: Send + Sync {
     fn enabled(&self) -> bool;
     fn set_enabled(&self, enabled: bool) -> Result<(), HttpCommandError>;
     fn capture(&self) -> Result<Arc<DynamicImage>, HttpCommandError>;
     fn window_available(&self) -> Result<bool, HttpCommandError>;
     /// 只读界面状态详情：当前分类结果 + 判别证据。未分类时如实报告，不伪造状态。
     fn ui_state_detail(&self) -> Result<String, HttpCommandError>;
+
+    /// 切换只读观察的四态开关（关闭 / active / push / control）。
+    fn set_read_only_mode(
+        &self,
+        enabled: bool,
+        state: crate::debug_read_only::ReadOnlyState,
+    ) -> Result<serde_json::Value, HttpCommandError>;
+    /// 只读主动读取一帧并记录证据。
+    fn read_active(
+        &self,
+        request: crate::debug_http_service::ReadOnlyReadRequest,
+    ) -> Result<serde_json::Value, HttpCommandError>;
+    /// 只读状态摘要：只读缓存，不抓帧、不推理、不发布事件。
+    fn read_only_summary(&self) -> serde_json::Value;
+
+    /// 保存（或覆盖）一个沙盒任务，返回任务 id 的调试表示。
+    fn save(&self, task: crate::debug_sandbox::SandboxTask) -> Result<String, HttpCommandError>;
+    /// 直接执行一条原子命令（不建任务、不建运行记录）。
+    fn execute_direct(
+        &self,
+        command: crate::debug_sandbox::AtomicCommand,
+    ) -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError>;
+    /// 按领域请求启动一次运行。
+    fn start(
+        &self,
+        request: crate::debug_http_service::DebugRunRequest,
+    ) -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError>;
+    /// 以源运行的夹具与断言重放该任务。
+    fn replay(&self, source_id: &str)
+    -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError>;
+    /// 单步推进（all=false）或推进到结束（all=true）。
+    fn advance(
+        &self,
+        id: &str,
+        all: bool,
+    ) -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError>;
+    /// 运行的聚合状态快照（`{ run, task }`，或归档记录）。
+    fn status_snapshot(&self, id: &str) -> Result<serde_json::Value, HttpCommandError>;
+    /// 取消运行。
+    fn cancel(&self, id: &str) -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError>;
+    /// 取某次运行的证据；`index` 可选，用于只取某一步。
+    fn evidence(
+        &self,
+        id: &str,
+        index: Option<usize>,
+    ) -> Result<Vec<serde_json::Value>, HttpCommandError>;
+    /// 列出已保存的沙盒任务。
+    fn tasks(&self) -> Result<Vec<crate::debug_sandbox::SandboxTask>, HttpCommandError>;
+    /// 列出已知的运行记录（含已归档的）。
+    fn runs(&self) -> Result<Vec<serde_json::Value>, HttpCommandError>;
 }
 
 pub(crate) trait HttpHallPort: Send + Sync {
@@ -489,5 +580,54 @@ impl HttpApplicationPorts {
             login,
             ai,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::debug_http_service::{DebugRunRequest, DebugServiceError};
+
+    /// 领域错误 → HTTP 错误的映射必须保住原有的状态码与文案：
+    /// 线上协议里状态码是契约，文案是调用方与日志能看到的唯一解释。
+    #[test]
+    fn debug_service_error_maps_to_the_same_http_status_and_message() {
+        for (error, status) in [
+            (DebugServiceError::bad_request("bad"), 400u16),
+            (DebugServiceError::not_found("gone"), 404),
+            (DebugServiceError::conflict("stale"), 409),
+            (DebugServiceError::internal("boom"), 500),
+        ] {
+            let message = error.message().to_owned();
+            let mapped: HttpCommandError = error.into();
+            assert_eq!(mapped.status, status);
+            assert_eq!(mapped.message, message);
+        }
+    }
+
+    /// 沙盒服务此前所有失败都是 400，文案原样透传；这条断言锁住"行为等价"。
+    #[test]
+    fn bad_request_keeps_the_original_message_verbatim() {
+        let mapped: HttpCommandError = DebugServiceError::bad_request("任务不存在").into();
+        assert_eq!(mapped.status, 400);
+        assert_eq!(mapped.message, "任务不存在");
+        assert_eq!(mapped.to_string(), "任务不存在");
+    }
+
+    /// HTTP 运行请求 → 领域请求是逐字段搬运，不丢字段、不改默认值的落地结果。
+    #[test]
+    fn http_debug_run_request_converts_field_by_field() {
+        let request: HttpDebugRunRequest = serde_json::from_value(serde_json::json!({
+            "taskId": "t1",
+            "expectedVersion": 7,
+            "fixture": {"width": 2, "height": 2, "rgba": [1, 2, 3, 255]},
+        }))
+        .unwrap();
+        let domain: DebugRunRequest = request.into();
+        assert_eq!(domain.task_id, "t1");
+        assert_eq!(domain.mode, "simulated");
+        assert_eq!(domain.expected_version, Some(7));
+        assert!(domain.assertions.is_empty());
+        assert!(domain.fixture.is_some());
     }
 }

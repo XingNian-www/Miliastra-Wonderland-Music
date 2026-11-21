@@ -1,5 +1,21 @@
 use super::*;
 use sha2::Digest;
+
+/// 测试辅助：把可失败的沙盒操作原样转发给内置的 `DebugHttpService`。
+///
+/// 刻意用宏而不是给 `HttpDebugPort` 加默认实现：生产端口必须逐条显式接线，
+/// 默认实现会让漏接的端口在运行期静默变成"接口成功、但什么都没做"。
+/// 领域错误到 HTTP 错误的映射由 `From<DebugServiceError>` 统一承担。
+macro_rules! forward_test_sandbox {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)+) => {
+        $(
+            fn $name(&self, $($arg: $ty),*) -> Result<$ret, HttpCommandError> {
+                self.sandbox.$name($($arg),*).map_err(Into::into)
+            }
+        )+
+    };
+}
+
 #[path = "bridge_contract_tests.rs"]
 mod readonly_bridge_contract_tests;
 use std::fs;
@@ -34,10 +50,6 @@ struct HttpTestDebugPort {
 }
 
 impl HttpDebugPort for HttpTestDebugPort {
-    fn sandbox(&self) -> &crate::debug_http_service::DebugHttpService {
-        &self.sandbox
-    }
-
     fn enabled(&self) -> bool {
         false
     }
@@ -52,6 +64,37 @@ impl HttpDebugPort for HttpTestDebugPort {
     }
     fn ui_state_detail(&self) -> Result<String, HttpCommandError> {
         Err(HttpCommandError::bad_request("test device unavailable"))
+    }
+
+    fn read_only_summary(&self) -> Value {
+        self.sandbox.read_only_summary()
+    }
+
+    forward_test_sandbox! {
+        set_read_only_mode(
+            enabled: bool,
+            state: crate::debug_read_only::ReadOnlyState
+        ) -> serde_json::Value;
+        read_active(
+            request: crate::debug_http_service::ReadOnlyReadRequest
+        ) -> serde_json::Value;
+        save(task: crate::debug_sandbox::SandboxTask) -> String;
+        execute_direct(
+            command: crate::debug_sandbox::AtomicCommand
+        ) -> crate::debug_sandbox::SandboxRun;
+        start(
+            request: crate::debug_http_service::DebugRunRequest
+        ) -> crate::debug_sandbox::SandboxRun;
+        replay(source_id: &str) -> crate::debug_sandbox::SandboxRun;
+        advance(id: &str, all: bool) -> crate::debug_sandbox::SandboxRun;
+        status_snapshot(id: &str) -> serde_json::Value;
+        cancel(id: &str) -> crate::debug_sandbox::SandboxRun;
+        evidence(
+            id: &str,
+            index: Option<usize>
+        ) -> Vec<serde_json::Value>;
+        tasks() -> Vec<crate::debug_sandbox::SandboxTask>;
+        runs() -> Vec<serde_json::Value>;
     }
 }
 

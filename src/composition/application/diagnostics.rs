@@ -39,14 +39,7 @@ impl AppServices {
                 .map_err(|error| anyhow!(error))
             }
             WebToolRequest::UiState => {
-                // 先主动截一帧：截图例程会给 `latest_ui_state` 写入新的分类结果，
-                // 面板因此看到的是「此刻」的界面状态，而不是上一次扫描留下的旧值。
-                self.ui.game_ui.capture()?;
-                self.ui
-                    .ui_handle
-                    .latest_ui_state()
-                    .map(|state| state.diagnostic())
-                    .ok_or_else(|| anyhow!("UI runtime 尚未产生模板状态观察"))
+                capture_ui_state_diagnostic(&self.ui.game_ui, &self.ui.ui_handle)
             }
             WebToolRequest::HallName => {
                 let frame = self.latest_frame()?;
@@ -424,5 +417,155 @@ impl AppServices {
             previous = current;
         }
         Ok(None)
+    }
+}
+
+/// 读取「此刻的界面状态」诊断文本。
+///
+/// **这是 `GET /tools/ui-state` 的唯一实现**（[`WebToolRequest::UiState`] 直接指向它）。
+/// 修复前它读的是 `UiBundle.ui_runtime`——那个字段只属于主循环，在正式任务上下文里
+/// 恒为 `None`，于是面板永远收到「UI runtime 尚未产生模板状态观察」。
+///
+/// 现在依赖被显式限制成两个**始终真实接线**的句柄：
+/// - `game_ui`：走 UI 队列的截图前端（会让界面状态观察随帧推进）；
+/// - `ui_handle`：界面状态观察的读侧句柄，与拥有的 `UiRuntime` 共享同一份状态。
+///
+/// 先主动截一帧，面板看到的就是「此刻」的状态，而不是上一次扫描留下的旧值。
+/// 还没产生过任何观察时诚实返回错误：面板要能区分「还没扫过」与「状态正常」。
+fn capture_ui_state_diagnostic(game_ui: &GameUi, ui_handle: &UiRuntimeHandle) -> Result<String> {
+    game_ui.capture()?;
+    ui_handle
+        .latest_ui_state()
+        .map(|state| state.diagnostic())
+        .ok_or_else(|| anyhow!("UI runtime 尚未产生模板状态观察"))
+}
+
+#[cfg(test)]
+mod ui_state_tests {
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use image::DynamicImage;
+
+    use super::capture_ui_state_diagnostic;
+    use crate::runtime::ui::{
+        UiDevice, UiRuntime, UiStateClassification, UiStateKind, UiStateObservation,
+    };
+    use crate::ui::atoms::GameUi;
+
+    /// 固定输出「一级界面」的分类器：让观察结果可预期，测试不依赖模板匹配。
+    struct AlwaysPrimaryClassifier;
+
+    impl crate::runtime::ui::UiStateClassifier for AlwaysPrimaryClassifier {
+        fn classify(&mut self, _image: &DynamicImage) -> Result<UiStateClassification> {
+            Ok(UiStateClassification::new(
+                UiStateKind::Primary,
+                "primary:regression",
+            ))
+        }
+    }
+
+    /// 空设备：截图永远成功，返回固定尺寸的空白图。
+    struct BlankDevice;
+
+    impl UiDevice for BlankDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            Ok(DynamicImage::new_rgba8(16, 16))
+        }
+    }
+
+    /// `GET /tools/ui-state` 回归：正式接线下的共享句柄必须读到真实观察。
+    ///
+    /// 缺陷背景：旧实现读 `UiBundle.ui_runtime`（拥有的运行时）。正式任务上下文
+    /// 没有它，于是 `GET /tools/ui-state` **必然**报「UI runtime 尚未产生模板状态观察」。
+    /// 这条测试按生产接线的真实路径驱动：`UiRuntime` 产生观察 →
+    /// 通过它的克隆句柄（`UiServices::ui_handle` 持有的正是同一份）读取。
+    #[test]
+    fn web_tool_ui_state_reads_the_observation_from_the_shared_handle() {
+        // 稳定样本数 1：第一帧就产生稳定分类，测试不必等第二次截图。
+        let runtime = UiRuntime::start_with_state_classifier(BlankDevice, 4, AlwaysPrimaryClassifier, 1)
+            .expect("启动 UI 运行时");
+        let handle = runtime.handle();
+        let game_ui = GameUi::runtime(handle.clone());
+
+        let diagnostic =
+            capture_ui_state_diagnostic(&game_ui, &handle).expect("共享句柄必须读到界面状态");
+        assert!(
+            diagnostic.contains("primary:regression"),
+            "诊断文本应来自真实分类器输出，实际：{diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("尚未产生模板状态观察"),
+            "共享句柄路径不允许再报「尚未产生模板状态观察」，实际：{diagnostic}"
+        );
+        // 截图确实推进了观察：句柄上的观察与截出来的帧对得上。
+        let observation: UiStateObservation = handle.latest_ui_state().expect("观察必须存在");
+        assert!(matches!(observation, UiStateObservation::Classified(_)));
+
+        runtime.shutdown().expect("关闭 UI 运行时");
+    }
+
+    /// 还没产生观察时仍要诚实报错，不能拿默认值冒充「状态正常」。
+    ///
+    /// 没有分类器的运行时永远不写 `latest_ui_state`：这正是面板在极早期调用时
+    /// 会遇到的真实情形。错误文案必须能让面板区分「还没扫过」与「状态正常」。
+    #[test]
+    fn web_tool_ui_state_reports_honestly_before_any_observation_exists() {
+        let runtime = UiRuntime::start(BlankDevice, 4).expect("启动 UI 运行时");
+        let handle = runtime.handle();
+        assert!(
+            handle.latest_ui_state().is_none(),
+            "无分类器的运行时不应产生界面状态观察"
+        );
+        let game_ui = GameUi::runtime(handle.clone());
+
+        let error = capture_ui_state_diagnostic(&game_ui, &handle)
+            .expect_err("没有观察时必须返回错误");
+        assert!(
+            error.to_string().contains("尚未产生模板状态观察"),
+            "错误文案要保留既有口径，实际：{error}"
+        );
+
+        // 截图本身仍然成功：失败的是「没有观察」，不是「读不到画面」。
+        assert!(
+            game_ui.capture().is_ok(),
+            "截图分支不应因为缺少观察而失败"
+        );
+        // 让运行时关闭时不与仍在排队的截图竞争。
+        std::thread::sleep(Duration::from_millis(10));
+        runtime.shutdown().expect("关闭 UI 运行时");
+    }
+
+    /// 截图失败必须原样冒泡：面板要能看到真实原因，而不是被「没有观察」掩盖。
+    #[test]
+    fn web_tool_ui_state_surfaces_the_capture_failure() {
+        struct FailingDevice;
+
+        impl UiDevice for FailingDevice {
+            fn capture(&mut self) -> Result<DynamicImage> {
+                anyhow::bail!("simulated capture failure")
+            }
+        }
+
+        let runtime = UiRuntime::start_with_state_classifier(
+            FailingDevice,
+            4,
+            AlwaysPrimaryClassifier,
+            1,
+        )
+        .expect("启动 UI 运行时");
+        let handle = runtime.handle();
+        let game_ui = GameUi::runtime(handle.clone());
+
+        // 直接走生产函数：失败原因必须冒泡，不能静默变成「没有观察」。
+        let error = capture_ui_state_diagnostic(&game_ui, &handle)
+            .expect_err("截图失败时必须返回错误");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("simulated capture failure"),
+            "截图失败原因必须冒泡，实际：{text}"
+        );
+
+        runtime.shutdown().expect("关闭 UI 运行时");
     }
 }

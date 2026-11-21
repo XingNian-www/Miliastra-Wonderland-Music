@@ -1246,9 +1246,6 @@ impl crate::runtime::ui::UiRoutine for DebugAtomicRoutine {
     }
 }
 impl crate::interfaces::http::HttpDebugPort for ApplicationHttpDebugFacade {
-    fn sandbox(&self) -> &crate::debug_http_service::DebugHttpService {
-        &self.sandbox
-    }
     fn enabled(&self) -> bool {
         crate::debug_mode::enabled()
     }
@@ -1302,6 +1299,88 @@ impl crate::interfaces::http::HttpDebugPort for ApplicationHttpDebugFacade {
             .wait_timeout(std::time::Duration::from_secs(30))
             .map_err(|e| HttpCommandError::internal(format!("{e:#}")))?
             .map_err(|e| HttpCommandError::internal(format!("{e:#}")))
+    }
+
+    // 以下沙盒操作直接转发给 debug 层的服务对象。
+    //
+    // 每一条都是显式接线：`HttpDebugPort` 上不提供返回空结果的默认实现，
+    // 否则生产装配漏掉某一项时接口会静默变成空操作，而调用方只会看到"成功但没数据"。
+    fn set_read_only_mode(
+        &self,
+        enabled: bool,
+        state: crate::debug_read_only::ReadOnlyState,
+    ) -> Result<serde_json::Value, HttpCommandError> {
+        self.sandbox
+            .set_read_only_mode(enabled, state)
+            .map_err(Into::into)
+    }
+
+    fn read_active(
+        &self,
+        request: crate::debug_http_service::ReadOnlyReadRequest,
+    ) -> Result<serde_json::Value, HttpCommandError> {
+        self.sandbox.read_active(request).map_err(Into::into)
+    }
+
+    fn read_only_summary(&self) -> serde_json::Value {
+        self.sandbox.read_only_summary()
+    }
+
+    fn save(&self, task: crate::debug_sandbox::SandboxTask) -> Result<String, HttpCommandError> {
+        self.sandbox.save(task).map_err(Into::into)
+    }
+
+    fn execute_direct(
+        &self,
+        command: crate::debug_sandbox::AtomicCommand,
+    ) -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError> {
+        self.sandbox.execute_direct(command).map_err(Into::into)
+    }
+
+    fn start(
+        &self,
+        request: crate::debug_http_service::DebugRunRequest,
+    ) -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError> {
+        self.sandbox.start(request).map_err(Into::into)
+    }
+
+    fn replay(
+        &self,
+        source_id: &str,
+    ) -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError> {
+        self.sandbox.replay(source_id).map_err(Into::into)
+    }
+
+    fn advance(
+        &self,
+        id: &str,
+        all: bool,
+    ) -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError> {
+        self.sandbox.advance(id, all).map_err(Into::into)
+    }
+
+    fn status_snapshot(&self, id: &str) -> Result<serde_json::Value, HttpCommandError> {
+        self.sandbox.status_snapshot(id).map_err(Into::into)
+    }
+
+    fn cancel(&self, id: &str) -> Result<crate::debug_sandbox::SandboxRun, HttpCommandError> {
+        self.sandbox.cancel(id).map_err(Into::into)
+    }
+
+    fn evidence(
+        &self,
+        id: &str,
+        index: Option<usize>,
+    ) -> Result<Vec<serde_json::Value>, HttpCommandError> {
+        self.sandbox.evidence(id, index).map_err(Into::into)
+    }
+
+    fn tasks(&self) -> Result<Vec<crate::debug_sandbox::SandboxTask>, HttpCommandError> {
+        self.sandbox.tasks().map_err(Into::into)
+    }
+
+    fn runs(&self) -> Result<Vec<serde_json::Value>, HttpCommandError> {
+        self.sandbox.runs().map_err(Into::into)
     }
 }
 

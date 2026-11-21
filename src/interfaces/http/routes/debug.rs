@@ -661,13 +661,6 @@ pub(super) fn debug_window_route(
 // **若你手头有原始版本，请以原始版本为准。**
 // ============================================================================
 
-/// 取调试沙盒服务；与 `debug_port` 一样，未接线时如实报错。
-fn debug_service(
-    state: &HttpSharedState,
-) -> Result<&crate::debug_http_service::DebugHttpService, AppError> {
-    Ok(debug_port(state)?.sandbox())
-}
-
 /// 运行类路由的参数名是 `runId`（与运行对象字段一致）。
 /// 历史上也出现过 `id`，两者都接受，避免老客户端静默失效。
 fn run_id_query(query: &[(String, String)]) -> Result<String, AppError> {
@@ -704,7 +697,7 @@ pub(super) fn debug_read_only_mode_set_route(
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
     let request = parse_json_body::<ReadOnlyModeRequest>(body, "只读模式")?;
-    let mode = debug_service(state)?
+    let mode = debug_port(state)?
         .set_read_only_mode(request.enabled, request.state)
         .map_err(command_error)?;
     Ok(json!({"ok":true,"mode":mode}).to_string())
@@ -713,7 +706,7 @@ pub(super) fn debug_read_only_mode_route(
     _: &[(String, String)],
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
-    let _ = debug_service(state)?;
+    let _ = debug_port(state)?;
     Ok(json!({"ok":true,"mode":crate::debug_read_only::observer().state_snapshot()}).to_string())
 }
 pub(super) fn debug_read_only_read_route(
@@ -722,7 +715,7 @@ pub(super) fn debug_read_only_read_route(
 ) -> Result<String, AppError> {
     let request =
         parse_json_body::<crate::debug_http_service::ReadOnlyReadRequest>(body, "只读读取")?;
-    let evidence = debug_service(state)?
+    let evidence = debug_port(state)?
         .read_active(request)
         .map_err(command_error)?;
     Ok(json!({"ok":true,"evidence":evidence}).to_string())
@@ -745,7 +738,7 @@ pub(super) fn debug_read_only_evidence_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
-    let _ = debug_service(state)?;
+    let _ = debug_port(state)?;
     let id = required_query(query, "id")?;
     if query_value(query, "instance")
         .is_some_and(|expected| expected != crate::debug_read_only::observer().instance())
@@ -808,7 +801,7 @@ pub(super) fn debug_read_only_entries_route(
     query: &[(String, String)],
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
-    let _ = debug_service(state)?;
+    let _ = debug_port(state)?;
     let since = query_value(query, "since")
         .unwrap_or("0")
         .parse::<u64>()
@@ -871,14 +864,14 @@ pub(super) fn debug_read_only_summary_route(
     _: &[(String, String)],
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
-    Ok(json!({"ok":true,"summary":debug_service(state)?.read_only_summary()}).to_string())
+    Ok(json!({"ok":true,"summary":debug_port(state)?.read_only_summary()}).to_string())
 }
 
 pub(super) fn debug_read_only_image_response(
     request: &Request,
     state: &HttpSharedState,
 ) -> Result<Response, AppError> {
-    let _ = debug_service(state)?;
+    let _ = debug_port(state)?;
     let id = required_query(&request.query, "id")?;
     let (bytes, metadata) = crate::debug_read_only::observer()
         .read_image(&id)
@@ -933,7 +926,7 @@ pub(super) fn debug_tasks_route(
     _: &[(String, String)],
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
-    let tasks = debug_service(state)?.tasks().map_err(command_error)?;
+    let tasks = debug_port(state)?.tasks().map_err(command_error)?;
     Ok(json!({ "ok": true, "tasks": tasks }).to_string())
 }
 
@@ -942,7 +935,7 @@ pub(super) fn debug_runs_route(
     _: &[(String, String)],
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
-    let runs = debug_service(state)?.runs().map_err(command_error)?;
+    let runs = debug_port(state)?.runs().map_err(command_error)?;
     Ok(json!({ "ok": true, "runs": runs }).to_string())
 }
 
@@ -953,7 +946,7 @@ pub(super) fn debug_run_evidence_route(
 ) -> Result<String, AppError> {
     let id = run_id_query(query)?;
     let index = query_value(query, "index").and_then(|value| value.parse::<usize>().ok());
-    let evidence = debug_service(state)?
+    let evidence = debug_port(state)?
         .evidence(&id, index)
         .map_err(command_error)?;
     Ok(json!({ "ok": true, "evidence": evidence }).to_string())
@@ -965,7 +958,7 @@ pub(super) fn debug_run_replay_route(
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
     let id = run_id_query(query)?;
-    let run = debug_service(state)?.replay(&id).map_err(command_error)?;
+    let run = debug_port(state)?.replay(&id).map_err(command_error)?;
     // `sourceRunId` 是重放的来源，调用方靠它把新运行与源运行对上。
     Ok(json!({ "ok": true, "sourceRunId": id, "run": run }).to_string())
 }
@@ -976,7 +969,7 @@ pub(super) fn debug_run_step_route(
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
     let id = run_id_query(query)?;
-    let run = debug_service(state)?
+    let run = debug_port(state)?
         .advance(&id, false)
         .map_err(command_error)?;
     Ok(json!({ "ok": true, "run": run }).to_string())
@@ -988,7 +981,7 @@ pub(super) fn debug_run_all_route(
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
     let id = run_id_query(query)?;
-    let run = debug_service(state)?
+    let run = debug_port(state)?
         .advance(&id, true)
         .map_err(command_error)?;
     Ok(json!({ "ok": true, "run": run }).to_string())
@@ -1002,7 +995,7 @@ pub(super) fn debug_run_status_route(
     let id = run_id_query(query)?;
     // 快照本身就已经是 `{ run, task, ... }` 的形状，**不要再包一层**，
     // 否则调用方按 `status.run` 取值只会拿到 null。
-    let snapshot = debug_service(state)?
+    let snapshot = debug_port(state)?
         .status_snapshot(&id)
         .map_err(command_error)?;
     Ok(snapshot.to_string())
@@ -1014,7 +1007,7 @@ pub(super) fn debug_run_cancel_route(
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
     let id = run_id_query(query)?;
-    let run = debug_service(state)?.cancel(&id).map_err(command_error)?;
+    let run = debug_port(state)?.cancel(&id).map_err(command_error)?;
     Ok(json!({ "ok": true, "run": run }).to_string())
 }
 
@@ -1094,7 +1087,7 @@ pub(super) fn debug_task_save_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let task = parse_json_body::<crate::debug_sandbox::SandboxTask>(body, "沙盒任务")?;
-    let id = debug_service(state)?.save(task).map_err(command_error)?;
+    let id = debug_port(state)?.save(task).map_err(command_error)?;
     Ok(json!({ "ok": true, "taskId": id }).to_string())
 }
 
@@ -1103,10 +1096,11 @@ pub(super) fn debug_run_start_route(
     body: &[u8],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
+    // 协议 DTO 在边界处转成 debug 层的领域请求：debug 不认识 HTTP 类型。
     let request =
         parse_json_body::<crate::interfaces::http::HttpDebugRunRequest>(body, "运行请求")?;
-    let run = debug_service(state)?
-        .start(request)
+    let run = debug_port(state)?
+        .start(request.into())
         .map_err(command_error)?;
     Ok(json!({ "ok": true, "run": run }).to_string())
 }
@@ -1117,7 +1111,7 @@ pub(super) fn debug_command_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let command = parse_json_body::<HttpDebugCommand>(body, "原子命令")?;
-    let run = debug_service(state)?
+    let run = debug_port(state)?
         .execute_direct(command.into_atomic())
         .map_err(command_error)?;
     // `captured` 表示这条命令是否真的抓了帧（由结果里的 frameSequence 判定）；
@@ -1186,7 +1180,7 @@ pub(super) fn debug_events_response(
                 .unwrap_or(0),
         );
     let bus = if request.path == "/debug/read-only/events" {
-        let _ = debug_service(state)?;
+        let _ = debug_port(state)?;
         crate::debug_read_only::observer().bus()
     } else {
         crate::debug_events::bus()

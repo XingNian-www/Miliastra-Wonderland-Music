@@ -36,6 +36,10 @@
     [
       "config",
       "interfaces"
+    ],
+    [
+      "debug",
+      "interfaces"
     ]
   ],
   "allow_files": []

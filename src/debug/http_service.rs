@@ -6,11 +6,92 @@ use crate::debug_sandbox_runner::{
     SimulatedExecutor, StepAssertion,
 };
 use crate::debug_sandbox_store::DebugSandboxStore;
-use crate::interfaces::http::{HttpCommandError, HttpDebugRunRequest};
 use crate::runtime::ui::UiRuntimeHandle;
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Mutex;
+
+/// 调试沙盒服务失败的种类。**纯领域分类**，不含 HTTP 状态码——
+/// 状态码由 HTTP 边界层映射，debug 层不认识 HTTP。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DebugServiceErrorKind {
+    /// 调用方给的参数/状态不合法（原 HTTP 400）。
+    BadRequest,
+    /// 请求的运行、任务或证据不存在（原 HTTP 404）。
+    NotFound,
+    /// 版本冲突等可重试的并发冲突（原 HTTP 409）。
+    Conflict,
+    /// 服务内部故障（原 HTTP 500）。
+    Internal,
+}
+
+/// 调试沙盒服务的领域错误：**种类 + 可读原因**。
+///
+/// 以前这里直接借用 HTTP 边界的错误类型，于是 `debug -> 接口层`
+/// 成了一条反向依赖；现在错误属于 debug 层，HTTP 边界通过 `From` 映射成同样的
+/// 状态码与错误 JSON，线上协议一个字都不变。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DebugServiceError {
+    kind: DebugServiceErrorKind,
+    message: String,
+}
+
+impl DebugServiceError {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            kind: DebugServiceErrorKind::BadRequest,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            kind: DebugServiceErrorKind::NotFound,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            kind: DebugServiceErrorKind::Conflict,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self {
+            kind: DebugServiceErrorKind::Internal,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> DebugServiceErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for DebugServiceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DebugServiceError {}
+
+/// 启动一次沙盒运行的**领域请求**：HTTP 层解析出的 DTO 在边界处转换成本类型，
+/// debug 层不再依赖任何 HTTP 边界类型。
+#[derive(Clone, Debug)]
+pub(crate) struct DebugRunRequest {
+    pub task_id: String,
+    pub mode: String,
+    pub expected_version: Option<u32>,
+    pub assertions: Vec<StepAssertion>,
+    pub fixture: Option<SandboxFixture>,
+}
 
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -348,7 +429,7 @@ impl DebugHttpService {
         &self,
         enabled: bool,
         state: crate::debug_read_only::ReadOnlyState,
-    ) -> Result<serde_json::Value, HttpCommandError> {
+    ) -> Result<serde_json::Value, DebugServiceError> {
         let runners = self.runners.lock().map_err(error)?;
         if enabled
             && runners
@@ -372,7 +453,7 @@ impl DebugHttpService {
     pub(crate) fn read_active(
         &self,
         request: ReadOnlyReadRequest,
-    ) -> Result<serde_json::Value, HttpCommandError> {
+    ) -> Result<serde_json::Value, DebugServiceError> {
         let observer = crate::debug_read_only::observer();
         if !observer.enabled() || observer.state() != crate::debug_read_only::ReadOnlyState::Active
         {
@@ -522,11 +603,11 @@ impl DebugHttpService {
         Ok(service)
     }
 }
-fn error(e: impl std::fmt::Display) -> HttpCommandError {
-    HttpCommandError::bad_request(e.to_string())
+fn error(e: impl std::fmt::Display) -> DebugServiceError {
+    DebugServiceError::bad_request(e.to_string())
 }
 impl DebugHttpService {
-    pub fn save(&self, task: SandboxTask) -> Result<String, HttpCommandError> {
+    pub fn save(&self, task: SandboxTask) -> Result<String, DebugServiceError> {
         self.store
             .save_task_with(task, |task| {
                 self.journal
@@ -536,7 +617,7 @@ impl DebugHttpService {
             .map(|v| format!("{v:?}"))
             .map_err(error)
     }
-    pub fn execute_direct(&self, command: AtomicCommand) -> Result<SandboxRun, HttpCommandError> {
+    pub fn execute_direct(&self, command: AtomicCommand) -> Result<SandboxRun, DebugServiceError> {
         // 只读能力放宽：Capture 不改变游戏状态，不需要调试模式，也不需要观察开关。
         // 其它命令仍要求「只读观察」或「完全控制」之一，避免误触输入。
         let passive = matches!(command, AtomicCommand::Capture);
@@ -595,7 +676,7 @@ impl DebugHttpService {
         self.advance(&run_id, true)
     }
 
-    pub fn start(&self, r: HttpDebugRunRequest) -> Result<SandboxRun, HttpCommandError> {
+    pub fn start(&self, r: DebugRunRequest) -> Result<SandboxRun, DebugServiceError> {
         let task = self
             .store
             .task(&r.task_id)
@@ -688,7 +769,7 @@ impl DebugHttpService {
     fn ensure_session_capacity(
         &self,
         runners: &mut HashMap<String, SandboxSession>,
-    ) -> Result<(), HttpCommandError> {
+    ) -> Result<(), DebugServiceError> {
         let completed: Vec<_> = runners
             .keys()
             .filter_map(|id| match self.store.run(id) {
@@ -719,7 +800,7 @@ impl DebugHttpService {
         Ok(())
     }
 
-    pub fn replay(&self, source_id: &str) -> Result<SandboxRun, HttpCommandError> {
+    pub fn replay(&self, source_id: &str) -> Result<SandboxRun, DebugServiceError> {
         let cached = self
             .recipes
             .lock()
@@ -756,7 +837,7 @@ impl DebugHttpService {
         Ok(run)
     }
 
-    pub fn advance(&self, id: &str, all: bool) -> Result<SandboxRun, HttpCommandError> {
+    pub fn advance(&self, id: &str, all: bool) -> Result<SandboxRun, DebugServiceError> {
         let mut runners = self.runners.lock().map_err(error)?;
         let session = match runners.get_mut(id) {
             Some(session) => session,
@@ -821,7 +902,7 @@ impl DebugHttpService {
         id: &str,
         run: &SandboxRun,
         session: &SandboxSession,
-    ) -> Result<(), HttpCommandError> {
+    ) -> Result<(), DebugServiceError> {
         let evidence = evidence_values(session.evidence(id).map_err(error)?).map_err(error)?;
         if let Some(journal) = &self.journal {
             let task = self.store.run_task(id).map_err(error)?;
@@ -862,7 +943,7 @@ impl DebugHttpService {
         Ok(())
     }
 
-    fn archive_record_fits(record: &serde_json::Value) -> Result<bool, HttpCommandError> {
+    fn archive_record_fits(record: &serde_json::Value) -> Result<bool, DebugServiceError> {
         let json = serde_json::to_string(record).map_err(error)?;
         Ok(json.len() <= crate::debug_sandbox_journal::MAX_RECORD_BYTES)
     }
@@ -870,7 +951,7 @@ impl DebugHttpService {
     /// Drops archived frame images newest-first until the record fits the archive limit.
     /// Command, result and assertion metadata is preserved so the audit trail stays intact,
     /// and each affected entry is marked with `imageDropped` instead of silently losing data.
-    fn drop_archived_frames(record: &mut serde_json::Value) -> Result<usize, HttpCommandError> {
+    fn drop_archived_frames(record: &mut serde_json::Value) -> Result<usize, DebugServiceError> {
         let mut dropped = 0usize;
         while !Self::archive_record_fits(record)? {
             let removed = {
@@ -979,7 +1060,7 @@ impl DebugHttpService {
     /// 既避免"缩小和丢帧同时生效"，也不谎报缩小过。
     fn downscale_archived_frames(
         record: &mut serde_json::Value,
-    ) -> Result<usize, HttpCommandError> {
+    ) -> Result<usize, DebugServiceError> {
         const SCALES: [f64; 3] = [0.5, 0.25, 0.125];
         let originals = Self::archived_frames(record);
         if originals.is_empty() {
@@ -1016,7 +1097,7 @@ impl DebugHttpService {
         Ok(0)
     }
 
-    pub fn status_snapshot(&self, id: &str) -> Result<serde_json::Value, HttpCommandError> {
+    pub fn status_snapshot(&self, id: &str) -> Result<serde_json::Value, DebugServiceError> {
         if let Some(run) = self.store.run(id).map_err(error)? {
             return Ok(
                 serde_json::json!({"run":run,"task":self.store.run_task(id).map_err(error)?}),
@@ -1026,13 +1107,13 @@ impl DebugHttpService {
             .ok_or_else(|| error("运行不存在或归档已过期"))
     }
 
-    fn archived_run(&self, id: &str) -> Result<Option<SandboxRun>, HttpCommandError> {
+    fn archived_run(&self, id: &str) -> Result<Option<SandboxRun>, DebugServiceError> {
         self.archived_record(id)?
             .map(|record| serde_json::from_value(record["run"].clone()).map_err(error))
             .transpose()
     }
 
-    fn archived_record(&self, id: &str) -> Result<Option<serde_json::Value>, HttpCommandError> {
+    fn archived_record(&self, id: &str) -> Result<Option<serde_json::Value>, DebugServiceError> {
         self.journal
             .as_ref()
             .map(|journal| journal.load(id).map_err(error))
@@ -1044,7 +1125,7 @@ impl DebugHttpService {
         &self,
         id: &str,
         index: Option<usize>,
-    ) -> Result<Vec<serde_json::Value>, HttpCommandError> {
+    ) -> Result<Vec<serde_json::Value>, DebugServiceError> {
         let runners = self.runners.lock().map_err(error)?;
         let values = if let Some(session) = runners.get(id) {
             evidence_values(session.evidence(id).map_err(error)?).map_err(error)?
@@ -1063,11 +1144,11 @@ impl DebugHttpService {
             .collect())
     }
 
-    pub fn tasks(&self) -> Result<Vec<SandboxTask>, HttpCommandError> {
+    pub fn tasks(&self) -> Result<Vec<SandboxTask>, DebugServiceError> {
         self.store.tasks().map_err(error)
     }
 
-    pub fn runs(&self) -> Result<Vec<serde_json::Value>, HttpCommandError> {
+    pub fn runs(&self) -> Result<Vec<serde_json::Value>, DebugServiceError> {
         let current = self.store.runs().map_err(error)?;
         let current_ids: std::collections::HashSet<_> =
             current.iter().map(|run| run.run_id.as_str()).collect();
@@ -1088,7 +1169,7 @@ impl DebugHttpService {
         Ok(runs)
     }
 
-    pub fn run_task(&self, id: &str) -> Result<SandboxTask, HttpCommandError> {
+    pub fn run_task(&self, id: &str) -> Result<SandboxTask, DebugServiceError> {
         if self.store.run(id).map_err(error)?.is_some() {
             return self.store.run_task(id).map_err(error);
         }
@@ -1098,14 +1179,14 @@ impl DebugHttpService {
         serde_json::from_value(record["task"].clone()).map_err(error)
     }
 
-    pub fn status(&self, id: &str) -> Result<SandboxRun, HttpCommandError> {
+    pub fn status(&self, id: &str) -> Result<SandboxRun, DebugServiceError> {
         match self.store.run(id).map_err(error)? {
             Some(run) => Ok(run),
             None => self.archived_run(id)?.ok_or_else(|| error("运行不存在")),
         }
     }
 
-    pub fn cancel(&self, id: &str) -> Result<SandboxRun, HttpCommandError> {
+    pub fn cancel(&self, id: &str) -> Result<SandboxRun, DebugServiceError> {
         // Cancellation only marks shared store state, so it remains responsive while a live UI command waits.
         self.store.cancel_run(id).map_err(error)
     }
@@ -1371,8 +1452,8 @@ mod tests {
         }
     }
 
-    fn request() -> HttpDebugRunRequest {
-        HttpDebugRunRequest {
+    fn request() -> DebugRunRequest {
+        DebugRunRequest {
             task_id: "http-task".into(),
             mode: "simulated".into(),
             expected_version: Some(1),
@@ -1412,7 +1493,7 @@ mod tests {
             })
             .unwrap();
         let run = service
-            .start(HttpDebugRunRequest {
+            .start(DebugRunRequest {
                 task_id: "live-service-smoke".into(),
                 mode: "live".into(),
                 expected_version: Some(1),
@@ -1500,7 +1581,7 @@ mod tests {
             })
             .unwrap();
         let run = service
-            .start(HttpDebugRunRequest {
+            .start(DebugRunRequest {
                 task_id: "cancel-before-live-capture".into(),
                 mode: "live".into(),
                 expected_version: Some(1),
@@ -1524,7 +1605,7 @@ mod tests {
         }));
         service.save(task()).unwrap();
         let run = service
-            .start(HttpDebugRunRequest {
+            .start(DebugRunRequest {
                 assertions: vec![StepAssertion {
                     index: 0,
                     assertion: crate::debug_sandbox_runner::SandboxAssertion::OcrContains {
@@ -1557,7 +1638,7 @@ mod tests {
             let service = DebugHttpService::with_journal(None, &path).unwrap();
             service.save(task()).unwrap();
             let run = service
-                .start(HttpDebugRunRequest {
+                .start(DebugRunRequest {
                     assertions: vec![StepAssertion {
                         index: 0,
                         assertion: crate::debug_sandbox_runner::SandboxAssertion::Dimensions {
@@ -1631,7 +1712,7 @@ mod tests {
         let service = DebugHttpService::default();
         service.save(task()).unwrap();
         let original = service
-            .start(HttpDebugRunRequest {
+            .start(DebugRunRequest {
                 assertions: vec![StepAssertion {
                     index: 0,
                     assertion: crate::debug_sandbox_runner::SandboxAssertion::Dimensions {
@@ -1675,7 +1756,7 @@ mod tests {
         assert!(service.start(request()).is_err());
         assert!(service.runs().unwrap().is_empty());
         let run = service
-            .start(HttpDebugRunRequest {
+            .start(DebugRunRequest {
                 expected_version: None,
                 ..request()
             })
@@ -1933,7 +2014,7 @@ mod tests {
         ));
         service.advance(&run.run_id, true).unwrap();
         service
-            .start(HttpDebugRunRequest {
+            .start(DebugRunRequest {
                 expected_version: Some(2),
                 ..request()
             })

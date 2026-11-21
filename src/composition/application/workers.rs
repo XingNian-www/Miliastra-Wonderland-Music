@@ -365,15 +365,20 @@ impl ApplicationRuntime {
             return Ok(());
         }
         let services = Arc::clone(&self.services);
+        // 客户端必须在**工作线程启动之前**接线：`FormalTaskRuntime::start` 会在
+        // 返回前就 spawn 任务循环，队列里已有的任务可能立刻开跑。若等到返回后再
+        // `attach`，那一小段窗口里 `AppServices::formal_tasks()` 会报「尚未启动」。
         let runtime = FormalTaskRuntime::start(
             self.business.business.clone(),
             self.business.task_engine.clone(),
             Arc::clone(&self.shared.running),
             Arc::clone(&self.shared.paused),
             self.shared.live_configs.clone(),
-            move |client| FormalTaskExecutionContext::new(Arc::clone(&services), client),
+            move |client| {
+                services.attach_formal_tasks(client);
+                FormalTaskExecutionContext::new(services)
+            },
         )?;
-        self.services.attach_formal_tasks(runtime.client());
         self.owned.formal_task_runtime = Some(runtime);
         Ok(())
     }

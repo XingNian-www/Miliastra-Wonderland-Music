@@ -826,37 +826,18 @@ pub(crate) struct OwnedRuntimes {
     pub(super) openai_runtime: Option<OpenAiRuntime>,
 }
 
-impl OwnedRuntimes {
-    fn empty() -> Self {
-        Self {
-            hotkeys: None,
-            ui_runtime: None,
-            ocr_runtime: None,
-            player_runtime: None,
-            native_playback_runtime: None,
-            business_runtime: None,
-            formal_task_runtime: None,
-            http_server: None,
-            openai_runtime: None,
-        }
-    }
-}
-
 /// 正式任务执行所需的窄上下文。
 ///
-/// 只剩两件事：共享服务集合（与主循环同一个 `Arc`）和已接线的正式任务客户端。
-/// 任务执行直接落在 [`AppServices`] 上，不再反向构造一份假的 `ApplicationRuntime`。
+/// 只剩一件事：共享服务集合（与主循环同一个 `Arc`）。
+/// 任务执行直接落在 [`AppServices`] 上，不再反向构造一份假的 `ApplicationRuntime`；
+/// 原先复制的 55+ 个字段与硬填的 9 个 `None` 全部消失。
 pub(crate) struct FormalTaskExecutionContext {
     services: Arc<AppServices>,
-    formal_tasks: FormalTaskClient,
 }
 
 impl FormalTaskExecutionContext {
-    fn new(services: Arc<AppServices>, formal_tasks: FormalTaskClient) -> Self {
-        Self {
-            services,
-            formal_tasks,
-        }
+    const fn new(services: Arc<AppServices>) -> Self {
+        Self { services }
     }
 
     fn execute_pending_task(&self, task: PendingTask) -> Result<PendingTaskExecution> {

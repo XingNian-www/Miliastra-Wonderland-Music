@@ -1315,10 +1315,6 @@ fn parse_model_list(body: &str) -> Result<Vec<String>> {
 /// 模型列表是一次短请求，单独建 client 以套用代理与 User-Agent。
 ///
 /// reqwest 默认不发 User-Agent，部分网关会因此直接 403。
-fn build_model_list_client(proxy: &str) -> Result<reqwest::blocking::Client> {
-    build_model_list_client_with_timeout(proxy, std::time::Duration::from_secs(20))
-}
-
 fn build_model_list_client_with_timeout(
     proxy: &str,
     timeout: std::time::Duration,

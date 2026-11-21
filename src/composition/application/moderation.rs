@@ -1281,14 +1281,8 @@ mod tests {
         let shared = ChatTimeline::new();
         let publisher = shared.clone();
         let publish_frames = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while publisher.pending_refresh().unwrap().is_none() {
-                assert!(
-                    Instant::now() < deadline,
-                    "initial vote refresh was not requested"
-                );
-                thread::sleep(Duration::from_millis(2));
-            }
+            // 等投票侧真的请求了刷新：事件驱动（时间线条件变量），不是睡一会儿再看。
+            wait_for_vote_refresh(&publisher);
             // 只给二级面板：它就是同一个大厅容器。
             publisher
                 .publish(
@@ -1566,17 +1560,20 @@ mod tests {
         assert!(port.context.running.load(AtomicOrdering::SeqCst));
     }
 
+    /// 等到投票侧请求了一次新的截图（或最多 2 秒，超时判失败）。
+    ///
+    /// **不能**自己发刷新请求当探针：探针本身就是一个待答复的刷新请求，会让
+    /// 「已发起」判据立刻为真，并抢在投票侧之前把时间线状态搅乱。所以这里只
+    /// 观察、不请求——靠时间线的条件变量（`request_refresh` 在同一把锁上通知）
+    /// 做短分片等待，事件一到就返回，而不是固定睡眠轮询。
     fn wait_for_vote_refresh(shared: &ChatTimeline) {
         let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if shared.pending_refresh().unwrap().is_some() {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "vote did not request a fresh frame"
-            );
-            thread::sleep(Duration::from_millis(1));
+        while shared.pending_refresh().unwrap().is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "vote did not request a fresh frame");
+            // 观察者挂在时间线的条件变量上：任何一次状态变化（请求刷新、发布快照）
+            // 都会把它唤醒，醒来重新判定。
+            let _ = shared.wait_for_snapshot(u64::MAX, remaining.min(Duration::from_millis(5)));
         }
     }
 
@@ -1749,6 +1746,7 @@ mod tests {
             (port, result)
         });
         let test_deadline = Instant::now() + Duration::from_secs(2);
+        let probe = shared.request_refresh().unwrap();
         let mut gaps = 0;
         while !worker.is_finished() && Instant::now() < test_deadline {
             if shared.pending_refresh().unwrap().is_some() {
@@ -1760,9 +1758,16 @@ mod tests {
                     )
                     .unwrap();
                 gaps += 1;
-            } else {
-                thread::sleep(Duration::from_millis(1));
+                continue;
             }
+            // 没有待答复的刷新请求：挂在时间线的条件变量上等下一次变化，而不是
+            // 每毫秒空转一次。探针请求自己也会产生一个「待答复」状态，所以只在
+            // 它被答案之前复用它。
+            let remaining = test_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = shared.wait_for_snapshot(probe, remaining.min(Duration::from_millis(50)));
         }
         let finished_on_deadline = worker.is_finished();
         // Clean up a regression that accidentally extends the deadline on each gap.

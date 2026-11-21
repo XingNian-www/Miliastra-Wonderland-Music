@@ -1071,7 +1071,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cache.live_limits().max_bytes, 1024);
-        assert_eq!(cache.live_limits().seek_wait_timeout, Duration::from_millis(222));
+        assert_eq!(
+            cache.live_limits().seek_wait_timeout,
+            Duration::from_millis(222)
+        );
 
         // 模拟配置热更新：只改 provider 来源值，不重建实例。
         *shared.lock().unwrap() = CacheLiveLimits {
@@ -1080,8 +1083,14 @@ mod tests {
             seek_wait_timeout: Duration::from_millis(444),
         };
         assert_eq!(cache.live_limits().max_bytes, 2048);
-        assert_eq!(cache.live_limits().request_timeout, Duration::from_millis(333));
-        assert_eq!(cache.live_limits().seek_wait_timeout, Duration::from_millis(444));
+        assert_eq!(
+            cache.live_limits().request_timeout,
+            Duration::from_millis(333)
+        );
+        assert_eq!(
+            cache.live_limits().seek_wait_timeout,
+            Duration::from_millis(444)
+        );
     }
 
     /// 未注入 provider 时，默认 provider 取启动配置值。
@@ -1100,8 +1109,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cache.live_limits().max_bytes, 4096);
-        assert_eq!(cache.live_limits().request_timeout, Duration::from_millis(55));
-        assert_eq!(cache.live_limits().seek_wait_timeout, Duration::from_millis(66));
+        assert_eq!(
+            cache.live_limits().request_timeout,
+            Duration::from_millis(55)
+        );
+        assert_eq!(
+            cache.live_limits().seek_wait_timeout,
+            Duration::from_millis(66)
+        );
     }
 
     #[test]

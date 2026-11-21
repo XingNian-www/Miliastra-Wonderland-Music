@@ -215,7 +215,9 @@ impl ProductionOcrDevice {
                 Instant::now() + OCR_REBUILD_RETRY_INTERVAL;
             return;
         }
-        log::info!("OCR 引擎已连续运行超过 1 小时，开始后台重建；重建期间识别由旧引擎继续服务，不受影响");
+        log::info!(
+            "OCR 引擎已连续运行超过 1 小时，开始后台重建；重建期间识别由旧引擎继续服务，不受影响"
+        );
         let started = Instant::now();
         let args = self.args.clone();
         let engine = self.engine.clone();

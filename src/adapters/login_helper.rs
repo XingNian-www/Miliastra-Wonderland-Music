@@ -717,11 +717,7 @@ impl LoginHelperManager {
                 return Err(error);
             }
         };
-        let spawned = match self
-            .inner
-            .launcher
-            .spawn(provider, &profile, login_timeout)
-        {
+        let spawned = match self.inner.launcher.spawn(provider, &profile, login_timeout) {
             Ok(spawned) => spawned,
             Err(_) => {
                 let _ = self.inner.playback.cancel_login(session.session_id);
@@ -2263,10 +2259,16 @@ mod tests {
             Arc::new(test_kugou_device_config),
         );
         // 注入 provider 时优先取实时值，而不是固定的 9s。
-        assert_eq!(manager.inner.effective_timeout(), Duration::from_millis(1_234));
+        assert_eq!(
+            manager.inner.effective_timeout(),
+            Duration::from_millis(1_234)
+        );
         // 模拟配置热更新：只改来源值，无需重建管理器。
         *live.lock().unwrap() = 45_678;
-        assert_eq!(manager.inner.effective_timeout(), Duration::from_millis(45_678));
+        assert_eq!(
+            manager.inner.effective_timeout(),
+            Duration::from_millis(45_678)
+        );
     }
 
     /// 测试用设备信息：模拟用户在设置页填写的酷狗设备。

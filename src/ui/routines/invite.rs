@@ -264,10 +264,7 @@ impl UiRoutine for ExecuteInviteRoutine {
 }
 
 /// 邀请任务的总预算：内部按钮/完成等待 + 收尾预留（一次 Primary 稳定观察）。
-fn invite_task_spec(
-    config: &InviteRoutineConfig,
-    environment: SettleEnvironment,
-) -> UiTaskSpec {
+fn invite_task_spec(config: &InviteRoutineConfig, environment: SettleEnvironment) -> UiTaskSpec {
     let total_ms = config
         .button_timeout_ms
         .saturating_add(config.completion_timeout_ms)
@@ -319,24 +316,31 @@ fn execute_invite(
     {
         failure = Some(error);
     } else {
-        let notification_failed =
-            match send_current_chat_message(context, &config.friend, &request.notification) {
-                Ok(()) => {
-                    notification = InviteNotificationOutcome::Sent;
-                    false
-                }
-                Err(error) => {
-                    // 只打印**首个**候选名：`recipients` 是好友列表匹配名
-                    // （备注 + 游戏内昵称）的候选集，逐个打印既泄露过多玩家标识，
-                    // 也不符合日志「够定位就够」的原则。首个候选就是实际用于搜索的名字。
-                    log::warn!(
-                        "邀请流程继续（步骤：填写通知）：向好友发送邀请通知消息失败，目标为好友列表中的「{}」，改为直接打开好友会话尝试邀请；通知未送达，对方不会提前收到入厅提示：{error}",
-                        request.recipients.first().map(String::as_str).unwrap_or("未知")
-                    );
-                    notification = InviteNotificationOutcome::Failed(error);
-                    true
-                }
-            };
+        let notification_failed = match send_current_chat_message(
+            context,
+            &config.friend,
+            &request.notification,
+        ) {
+            Ok(()) => {
+                notification = InviteNotificationOutcome::Sent;
+                false
+            }
+            Err(error) => {
+                // 只打印**首个**候选名：`recipients` 是好友列表匹配名
+                // （备注 + 游戏内昵称）的候选集，逐个打印既泄露过多玩家标识，
+                // 也不符合日志「够定位就够」的原则。首个候选就是实际用于搜索的名字。
+                log::warn!(
+                    "邀请流程继续（步骤：填写通知）：向好友发送邀请通知消息失败，目标为好友列表中的「{}」，改为直接打开好友会话尝试邀请；通知未送达，对方不会提前收到入厅提示：{error}",
+                    request
+                        .recipients
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("未知")
+                );
+                notification = InviteNotificationOutcome::Failed(error);
+                true
+            }
+        };
 
         if notification_failed {
             // 通知没发出去时只允许**一次**重开会话；显式计数便于测试与日志定位。

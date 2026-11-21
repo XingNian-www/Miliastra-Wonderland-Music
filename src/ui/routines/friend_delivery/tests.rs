@@ -41,8 +41,6 @@ use crate::runtime::recovery::GameRecoveryCoordinator;
 use crate::runtime::ui::{
     InputCertainty, UiRoutine, UiRoutineContext, UiRoutineFailure, UiStateKind, sealed,
 };
-use crate::text::normalize_comparison_text as normalize_lock_text;
-
 fn ready_failure() -> UiRoutineFailure {
     UiRoutineFailure::new(
         InputCertainty::ConfirmedFailure,
@@ -465,7 +463,7 @@ fn fixed_secondary_chat_fixture_proves_stable_friend_row_and_title_first_identit
                 &handle,
                 &image,
                 region,
-                &[normalize_lock_text(&expected[0])],
+                &[crate::text::normalize_comparison_text(&expected[0])],
             )
             .expect("locate exact friend row")
         })

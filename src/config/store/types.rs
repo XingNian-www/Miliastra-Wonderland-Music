@@ -11,10 +11,6 @@
 //! 错误枚举实现 `From<rusqlite::Error>` / `From<serde_json::Error>`，让读写路径
 //! 里满地的 `?` 直接冒泡到这里，不必到处 `.map_err`。
 
-use anyhow::{Result, bail};
-
-use super::ConfigStore;
-
 /// 持久化的命令回复模板。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredReply {

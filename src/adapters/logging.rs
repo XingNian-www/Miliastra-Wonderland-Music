@@ -169,9 +169,8 @@ impl FileLogger {
             return;
         }
         let prefix = format_prefix_at(log::Level::Warn, SystemTime::now());
-        let _ = std::io::stderr().write_all(
-            format!("{prefix} {message}；同类错误在 60 秒内不再重复\n").as_bytes(),
-        );
+        let _ = std::io::stderr()
+            .write_all(format!("{prefix} {message}；同类错误在 60 秒内不再重复\n").as_bytes());
     }
 
     /// 兜底输出是否应当真正发生（节流判定）。
@@ -371,8 +370,8 @@ fn cleanup_old_daily_logs(log_dir: &Path, today: i64, retain_days: u32) -> Resul
         return Ok(());
     }
     let oldest_day = today - i64::from(retain_days.saturating_sub(1));
-    for entry in fs::read_dir(log_dir)
-        .with_context(|| format!("读取日志目录「{}」", log_dir.display()))?
+    for entry in
+        fs::read_dir(log_dir).with_context(|| format!("读取日志目录「{}」", log_dir.display()))?
     {
         let entry =
             entry.with_context(|| format!("读取日志目录「{}」中的条目", log_dir.display()))?;
@@ -527,11 +526,26 @@ mod tests {
         let at = UNIX_EPOCH + std::time::Duration::from_secs(1_793_319_423);
         // 4 字符级别靠 `{:<5}` 补齐，所以前缀本身可能以**对齐用**的单个空格结尾；
         // 5 字符级别（ERROR/DEBUG/TRACE）则完全没有尾随空格。
-        assert_eq!(format_prefix_at(log::Level::Info, at), "[10-30 08:17:03] INFO ");
-        assert_eq!(format_prefix_at(log::Level::Warn, at), "[10-30 08:17:03] WARN ");
-        assert_eq!(format_prefix_at(log::Level::Error, at), "[10-30 08:17:03] ERROR");
-        assert_eq!(format_prefix_at(log::Level::Debug, at), "[10-30 08:17:03] DEBUG");
-        assert_eq!(format_prefix_at(log::Level::Trace, at), "[10-30 08:17:03] TRACE");
+        assert_eq!(
+            format_prefix_at(log::Level::Info, at),
+            "[10-30 08:17:03] INFO "
+        );
+        assert_eq!(
+            format_prefix_at(log::Level::Warn, at),
+            "[10-30 08:17:03] WARN "
+        );
+        assert_eq!(
+            format_prefix_at(log::Level::Error, at),
+            "[10-30 08:17:03] ERROR"
+        );
+        assert_eq!(
+            format_prefix_at(log::Level::Debug, at),
+            "[10-30 08:17:03] DEBUG"
+        );
+        assert_eq!(
+            format_prefix_at(log::Level::Trace, at),
+            "[10-30 08:17:03] TRACE"
+        );
         // 真正的不变量：**级别字段固定 5 字符宽，前缀里最多只有对齐用的填充**。
         // 若再额外补一个空格（旧实现的写法），拼接后正文会比预期右移一列。
         let stamps = "[10-30 08:17:03] ".len();
@@ -601,8 +615,16 @@ mod tests {
                 !prefix.contains("] :") && !prefix.contains("]["),
                 "前缀残留旧分隔符: {prefix:?}"
             );
-            assert_eq!(prefix.matches('[').count(), 1, "只应有一个方括号开始: {prefix:?}");
-            assert_eq!(prefix.matches(']').count(), 1, "只应有一个方括号结束: {prefix:?}");
+            assert_eq!(
+                prefix.matches('[').count(),
+                1,
+                "只应有一个方括号开始: {prefix:?}"
+            );
+            assert_eq!(
+                prefix.matches(']').count(),
+                1,
+                "只应有一个方括号结束: {prefix:?}"
+            );
             // 拼上正文后，级别与正文之间始终是两个空格（级别不足 5 字符时补齐）。
             // 注意：这个空格由**拼接层**提供，前缀本身不带尾随空格。
             let line = format!("{prefix} 点歌成功：晴天（QQ音乐）");
@@ -617,8 +639,14 @@ mod tests {
     #[test]
     fn fallback_prefix_matches_the_main_format() {
         let prefix = format_prefix_at(log::Level::Warn, SystemTime::now());
-        assert!(prefix.contains("] WARN"), "兜底前缀应含对齐后的 WARN: {prefix:?}");
-        assert!(!prefix.contains("[WARN ]"), "不得残留旧硬编码前缀: {prefix:?}");
+        assert!(
+            prefix.contains("] WARN"),
+            "兜底前缀应含对齐后的 WARN: {prefix:?}"
+        );
+        assert!(
+            !prefix.contains("[WARN ]"),
+            "不得残留旧硬编码前缀: {prefix:?}"
+        );
         // 兜底与主路径都用「前缀 + 一个空格 + 正文」，正文列必须相同。
         let text = "日志文件锁已损坏，本条日志未写入文件";
         assert_eq!(
@@ -639,7 +667,10 @@ mod tests {
         let configured = LevelFilter::Trace;
         assert_eq!(target_level("wgpu_core", configured), LevelFilter::Warn);
         assert_eq!(target_level("naga", configured), LevelFilter::Warn);
-        assert_eq!(target_level("some_other_crate", configured), LevelFilter::Warn);
+        assert_eq!(
+            target_level("some_other_crate", configured),
+            LevelFilter::Warn
+        );
         assert_eq!(
             target_level("miliastra_wonderland_music::runtime::monitor", configured),
             LevelFilter::Trace,
@@ -666,10 +697,7 @@ mod tests {
         assert!(fallback_allowed(None, start), "首次必须放行");
 
         let just_after = start + Duration::from_millis(1);
-        assert!(
-            !fallback_allowed(Some(start), just_after),
-            "窗口内必须抑制"
-        );
+        assert!(!fallback_allowed(Some(start), just_after), "窗口内必须抑制");
 
         let almost = start + FALLBACK_THROTTLE - Duration::from_millis(1);
         assert!(

@@ -395,6 +395,32 @@ impl FormalTaskRuntime {
         post_settle: Duration,
         coordinator: Option<UiCoordinator>,
     ) -> Result<Self> {
+        Self::start_without_application_observed(
+            business,
+            task_engine,
+            running,
+            paused,
+            post_settle,
+            coordinator,
+        )
+        .map(|(runtime, _waited)| runtime)
+    }
+
+    /// 测试专用启动入口：额外返回「主循环进入等待」的观察者。
+    ///
+    /// 返回值里的 [`TaskLoopGate`] 由主循环在**进入等待之前**打开；
+    /// [`TaskLoopGate::wait_boundary`] 条件等待到比给定现场更晚的那一次进入等待。
+    /// 用它取代「睡一会儿赌线程已经跑到等待」的固定睡眠：打开与等待走同一个
+    /// 条件变量，不会丢通知。
+    #[cfg(test)]
+    fn start_without_application_observed(
+        business: BusinessRuntimeHandle,
+        task_engine: TaskEngineHandle,
+        running: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
+        post_settle: Duration,
+        coordinator: Option<UiCoordinator>,
+    ) -> Result<(Self, TaskLoopGate)> {
         let client = FormalTaskClient::new(
             FormalTaskExecutionHandle {
                 context: Weak::new(),
@@ -402,15 +428,44 @@ impl FormalTaskRuntime {
             business.clone(),
             task_engine.clone(),
         );
-        Self::start_worker(
-            task_engine,
-            running,
-            paused,
-            PostSettleConfig::Fixed(post_settle),
-            client,
-            None,
-            coordinator,
-        )
+        let gate = TaskLoopGate::default();
+        let hook_gate = gate.clone();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_engine = task_engine.clone();
+        let worker_stop = Arc::clone(&stop_requested);
+        let (finished_sender, finished) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("formal-task-runtime".to_string())
+            .spawn(move || {
+                log::info!("正式任务运行时已启动");
+                let hook = move |boundary| hook_gate.open(boundary);
+                if let Err(error) = run_task_loop(
+                    worker_engine,
+                    running,
+                    paused,
+                    worker_stop,
+                    PostSettleConfig::Fixed(post_settle),
+                    &hook,
+                    coordinator,
+                ) {
+                    log::error!(
+                        "正式任务运行时异常退出（步骤：正式任务主循环取任务并执行），此后不再有正式任务被执行；已入队的点歌/管理/邀请等任务会一直停在待处理，玩家看到的表现是「命令没反应」：{error:#}"
+                    );
+                }
+                let _ = finished_sender.send(());
+            })
+            .map_err(|error| anyhow!("启动正式任务运行时失败: {error}"))?;
+        Ok((
+            Self {
+                client,
+                context: None,
+                task_engine,
+                stop_requested,
+                worker: Some(worker),
+                finished,
+            },
+            gate,
+        ))
     }
 
     fn start_worker(
@@ -436,6 +491,7 @@ impl FormalTaskRuntime {
                     paused,
                     worker_stop,
                     post_settle,
+                    &|_| {},
                     coordinator,
                 ) {
                     log::error!(
@@ -464,11 +520,23 @@ impl FormalTaskRuntime {
     }
 
     #[cfg(test)]
-    fn shutdown_with_timeout(mut self, timeout: Duration) -> Result<FormalTaskShutdownReport> {
-        self.stop(timeout)
+    fn shutdown_with_timeout_and_grace(
+        mut self,
+        timeout: Duration,
+        join_grace: Duration,
+    ) -> Result<FormalTaskShutdownReport> {
+        self.stop_with_grace(timeout, join_grace)
     }
 
     fn stop(&mut self, timeout: Duration) -> Result<FormalTaskShutdownReport> {
+        self.stop_with_grace(timeout, FORMAL_TASK_JOIN_GRACE)
+    }
+
+    fn stop_with_grace(
+        &mut self,
+        timeout: Duration,
+        join_grace: Duration,
+    ) -> Result<FormalTaskShutdownReport> {
         let Some(worker) = self.worker.take() else {
             return Ok(FormalTaskShutdownReport::default());
         };
@@ -494,7 +562,7 @@ impl FormalTaskRuntime {
             Err(RecvTimeoutError::Timeout) => {
                 // stop_requested 已置位，任务线程完成当前任务后即退出；
                 // 宽限等待后仍超时才分离线程，避免 shutdown 无限阻塞。
-                let joined = self.finished.recv_timeout(FORMAL_TASK_JOIN_GRACE).is_ok();
+                let joined = self.finished.recv_timeout(join_grace).is_ok();
                 if joined {
                     let _ = worker.join();
                 } else {
@@ -522,15 +590,117 @@ impl Drop for FormalTaskRuntime {
     }
 }
 
+/// 主循环即将进入等待时的现场：第几轮空闲、以及它要等的 generation。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskLoopBoundary {
+    rounds: u64,
+    generation: u64,
+}
+
+/// 主循环「即将进入等待」时调用的钩子。
+///
+/// 生产路径是空操作；`#[cfg(test)]` 下的入口会把它接到 [`TaskLoopGate`] 上，
+/// 让测试在**确定时刻**观察「循环已经停下、等下一次唤醒」，而不是固定睡眠。
+type TaskLoopIdleHook = dyn Fn(TaskLoopBoundary) + Send + Sync;
+
+/// 正式任务主循环「进入等待」的测试闸门（生产路径不创建）。
+///
+/// 主循环进入 `wait_for_change` 之前调用 [`Self::open`]，把这一轮的现场写进状态
+/// 并通知；测试用 [`Self::wait_boundary`] 条件等到「比某个旧现场更晚的现场」。
+/// 比较的是快照里的轮次与 generation，所以「先入队、之后才进入等待」这种先后
+/// 颠倒不会被误判成「已经开始等」。
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct TaskLoopGate {
+    inner: Arc<TaskLoopGateState>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TaskLoopGateState {
+    /// 主循环最近一次即将进入等待的现场；`None` 表示还没进入过等待。
+    pending: std::sync::Mutex<Option<TaskLoopBoundary>>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl TaskLoopGate {
+    /// 主循环侧：报告「我要等 generation 变化了」。
+    fn open(&self, boundary: TaskLoopBoundary) {
+        let mut pending = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending = Some(boundary);
+        self.inner.changed.notify_all();
+    }
+
+    /// 测试侧：等到一个「轮次与 generation 都超过 `after`」的进入等待现场。
+    ///
+    /// 超时返回 None（主循环已退出或实现回归），由调用方断言。
+    fn wait_boundary(
+        &self,
+        after: TaskLoopBoundary,
+        timeout: Duration,
+    ) -> Option<TaskLoopBoundary> {
+        let started = Instant::now();
+        let mut pending = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            // 只要「比基线更晚」即可：generation 可能没变（入队前的空闲轮次），
+            // 轮次必然前进；因此判据是轮次严格大于基线的轮次。
+            if let Some(boundary) = *pending
+                && boundary.rounds > after.rounds
+            {
+                return Some(boundary);
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return None;
+            }
+            pending = self
+                .inner
+                .changed
+                .wait_timeout(pending, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// 「还没等到任何一次空闲边界」的基线：任何真实边界（轮次 >= 1）都比它晚。
+    const fn no_boundary_yet() -> TaskLoopBoundary {
+        TaskLoopBoundary {
+            rounds: 0,
+            generation: 0,
+        }
+    }
+
+    /// 最近一次即将等待的现场（测试侧立即读）。
+    fn pending(&self) -> Option<TaskLoopBoundary> {
+        *self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 fn run_task_loop(
     task_engine: TaskEngineHandle,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     post_settle: PostSettleConfig,
+    idle_hook: &TaskLoopIdleHook,
     coordinator: Option<UiCoordinator>,
 ) -> Result<()> {
     let mut generation = task_engine.generation()?;
+    // 空闲轮次计数：每次真正进入等待前 +1，作为「又空转了一圈」的单调证据。
+    let mut idle_rounds = 0u64;
     while running.load(AtomicOrdering::SeqCst) && !stop_requested.load(AtomicOrdering::SeqCst) {
         if !paused.load(AtomicOrdering::SeqCst)
             && let Some(task) = task_engine.take_next_formal()?
@@ -558,6 +728,11 @@ fn run_task_loop(
             generation = task_engine.generation()?;
             continue;
         }
+        idle_rounds += 1;
+        idle_hook(TaskLoopBoundary {
+            rounds: idle_rounds,
+            generation,
+        });
         generation = task_engine.wait_for_change(generation)?;
     }
     Ok(())
@@ -1087,13 +1262,25 @@ mod tests {
         fn cancel(self: Box<Self>) {}
     }
 
+    /// 「响应取消」的任务体：长跑期间不断检查取消标志，看到就立刻报告并退出。
+    ///
+    /// 旧实现自旋 250 毫秒来猜「关停应该已经发生了」；现在没有猜测：任务体在
+    /// 收到取消之前一直运行，测试确保它跑起来之后再发起关停，因此「看到取消」
+    /// 就是关停真的把取消请求送达了运行中的任务。检查之间只让出 CPU（yield），
+    /// 不睡觉，也不会无限跑下去——测试会断言它必须在期限内完成。
     struct ObserveShutdownCancellation {
         started: mpsc::Sender<()>,
         observed: Arc<AtomicBool>,
     }
 
+    /// 「关停时超时」用例的任务体：一直运行到取消到来，**不自己观测**取消标志。
+    ///
+    /// 旧实现睡 500 毫秒模拟「慢任务」；现在没有睡眠也没有猜测：任务体运行到
+    /// 关停真正把取消送达为止（`cancel()` 会把它叫醒），因此它测的是
+    /// 「关停请求能被送达正在执行的任务」这条契约本身。
     struct IgnoreShutdownCancellation {
         started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
     }
 
     impl FormalTaskWork for IgnoreShutdownCancellation {
@@ -1102,8 +1289,12 @@ mod tests {
             _cancellation: FormalTaskCancellationToken,
         ) -> FormalTaskExecutionOutcome {
             self.started.send(()).expect("start observer");
-            thread::sleep(Duration::from_millis(500));
-            FormalTaskExecutionOutcome::Completed(Ok("late completion".to_string()))
+            match self.release.recv_timeout(Duration::from_secs(5)) {
+                Ok(()) => FormalTaskExecutionOutcome::Canceled("shutdown reached task".to_string()),
+                Err(_) => FormalTaskExecutionOutcome::Completed(Err(anyhow!(
+                    "shutdown cancellation never reached the running task"
+                ))),
+            }
         }
 
         fn cancel(self: Box<Self>) {}
@@ -1115,22 +1306,39 @@ mod tests {
             cancellation: FormalTaskCancellationToken,
         ) -> FormalTaskExecutionOutcome {
             self.started.send(()).expect("start observer");
-            let deadline = Instant::now() + Duration::from_millis(250);
-            while Instant::now() < deadline {
-                if cancellation.is_requested() {
-                    self.observed.store(true, Ordering::SeqCst);
-                    return FormalTaskExecutionOutcome::Canceled(
-                        "shutdown cancellation observed".to_string(),
-                    );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cancellation.is_requested() {
+                if Instant::now() >= deadline {
+                    return FormalTaskExecutionOutcome::Completed(Err(anyhow!(
+                        "shutdown cancellation was not observed"
+                    )));
                 }
                 thread::yield_now();
             }
-            FormalTaskExecutionOutcome::Completed(Err(anyhow!(
-                "shutdown cancellation was not observed"
-            )))
+            self.observed.store(true, Ordering::SeqCst);
+            FormalTaskExecutionOutcome::Canceled("shutdown cancellation observed".to_string())
         }
 
         fn cancel(self: Box<Self>) {}
+    }
+
+    /// 启动一个可观察「主循环进入等待」的正式任务运行时。
+    #[cfg(test)]
+    fn runtime_with_gate(
+        business: BusinessRuntimeHandle,
+        task_engine: TaskEngineHandle,
+        post_settle: Duration,
+        coordinator: Option<UiCoordinator>,
+    ) -> (FormalTaskRuntime, TaskLoopGate) {
+        FormalTaskRuntime::start_without_application_observed(
+            business,
+            task_engine,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            post_settle,
+            coordinator,
+        )
+        .expect("formal task runtime")
     }
 
     fn business_runtime() -> (BusinessRuntime, TaskEngineHandle) {
@@ -1210,14 +1418,18 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("formal task execution");
 
+        // 任务刚跑完：后置结算窗口还开着，界面租约必须继续占着。
         assert!(!coordinator.scan_may_run());
-        thread::sleep(Duration::from_millis(50));
-        assert!(!coordinator.scan_may_run());
+        // 窗口结束后必须自己放开。用条件等待（最长 1 秒，远小于 150ms 的窗口），
+        // 不再先盲睡 50ms；只要契约成立，这里就会在窗口结束的瞬间返回。
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !coordinator.scan_may_run() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
+        while !coordinator.scan_may_run() {
+            assert!(
+                Instant::now() < deadline,
+                "后置结算窗口结束后界面租约必须释放"
+            );
+            thread::yield_now();
         }
-        assert!(coordinator.scan_may_run());
 
         task_runtime
             .shutdown()
@@ -1229,15 +1441,15 @@ mod tests {
     fn formal_task_runtime_requests_cancellation_from_the_running_task_on_shutdown() {
         let (business_runtime, task_engine) = business_runtime();
         let business = business_runtime.handle();
-        let task_runtime = FormalTaskRuntime::start_without_application(
-            business.clone(),
-            task_engine.clone(),
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-            Duration::ZERO,
-            None,
-        )
-        .expect("formal task runtime");
+        let (task_runtime, gate) =
+            runtime_with_gate(business.clone(), task_engine.clone(), Duration::ZERO, None);
+        // 先让主循环停在「空闲等待」上：确定事件，不靠睡眠推测。随后入队，
+        // 主循环被 `wait_for_change` 唤醒执行任务；任务体在取消到达前一直运行。
+        assert!(
+            gate.wait_boundary(TaskLoopGate::no_boundary_yet(), Duration::from_secs(2))
+                .is_some(),
+            "主循环应当先停在空闲等待上"
+        );
         let (started, start) = mpsc::channel();
         let observed = Arc::new(AtomicBool::new(false));
         task_engine
@@ -1267,22 +1479,26 @@ mod tests {
     fn formal_task_runtime_shutdown_has_a_time_limit_when_work_ignores_cancellation() {
         let (business_runtime, task_engine) = business_runtime();
         let business = business_runtime.handle();
-        let task_runtime = FormalTaskRuntime::start_without_application(
-            business.clone(),
-            task_engine.clone(),
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-            Duration::ZERO,
-            None,
-        )
-        .expect("formal task runtime");
+        let (task_runtime, gate) =
+            runtime_with_gate(business.clone(), task_engine.clone(), Duration::ZERO, None);
+        // 等主循环先停在空闲等待上：这样入队的任务一定会被 `wait_for_change`
+        // 唤醒执行，测试拿到的「任务已开始」就不再依赖调度时序。
+        assert!(
+            gate.wait_boundary(TaskLoopGate::no_boundary_yet(), Duration::from_secs(2))
+                .is_some(),
+            "主循环应当先停在空闲等待上"
+        );
         let (started, start) = mpsc::channel();
+        let (release, release_worker) = mpsc::channel();
         task_engine
             .enqueue_formal(FormalTaskSubmission::new(
                 "ignore shutdown",
                 None,
                 false,
-                Box::new(IgnoreShutdownCancellation { started }),
+                Box::new(IgnoreShutdownCancellation {
+                    started,
+                    release: release_worker,
+                }),
             ))
             .expect("enqueue formal task");
         start
@@ -1291,12 +1507,18 @@ mod tests {
         let shutdown_started = Instant::now();
 
         let report = task_runtime
-            .shutdown_with_timeout(Duration::from_millis(20))
+            .shutdown_with_timeout_and_grace(Duration::from_millis(20), Duration::from_millis(20))
             .expect("bounded formal task runtime shutdown");
 
+        // 有界关停：任务不配合时，调用方最多等到「超时 + 宽限」就必须返回。
         assert!(report.timed_out());
-        // 超时后先给任务 FORMAL_TASK_JOIN_GRACE 宽限收尾，再放弃线程。
-        assert!(shutdown_started.elapsed() < FORMAL_TASK_JOIN_GRACE + Duration::from_millis(500));
+        assert!(
+            shutdown_started.elapsed() < Duration::from_millis(500),
+            "关停必须在有界时间内返回，实际 {:?}",
+            shutdown_started.elapsed()
+        );
+        // 关停已经把取消请求送达正在执行的任务；放行让它收尾，避免留下分离线程。
+        release.send(()).expect("放行仍在执行的任务体");
         business_runtime.shutdown().expect("business shutdown");
     }
 }

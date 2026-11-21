@@ -432,8 +432,6 @@ fn capture_ui_state_diagnostic(game_ui: &GameUi, ui_handle: &UiRuntimeHandle) ->
 
 #[cfg(test)]
 mod ui_state_tests {
-    use std::time::Duration;
-
     use anyhow::Result;
     use image::DynamicImage;
 
@@ -519,9 +517,15 @@ mod ui_state_tests {
 
         // 截图本身仍然成功：失败的是「没有观察」，不是「读不到画面」。
         assert!(game_ui.capture().is_ok(), "截图分支不应因为缺少观察而失败");
-        // 让运行时关闭时不与仍在排队的截图竞争。
-        std::thread::sleep(Duration::from_millis(10));
-        runtime.shutdown().expect("关闭 UI 运行时");
+        // 直接关闭即可：`UiRuntime::shutdown` 自己会发出停止信号并 join 工作线程，
+        // 不存在「还在排队的截图」这种需要先睡一会儿的竞争——那次睡眠只是掩盖了
+        // 关停路径本身的确定性。
+        let report = runtime.shutdown().expect("关闭 UI 运行时");
+        assert!(
+            !report.timed_out(),
+            "关停不应超时：工作线程必须能被停止信号唤醒"
+        );
+        assert!(!report.detached(), "关停不应留下脱管的工作线程");
     }
 
     /// 分类失败与「还没扫过」是两件事：前者必须**成功返回**诊断文本。

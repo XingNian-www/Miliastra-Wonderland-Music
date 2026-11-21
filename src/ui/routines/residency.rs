@@ -36,12 +36,10 @@ use super::state_observation::{
     observe_ui_state_once, wait_ms,
 };
 use crate::geometry::Point;
-use crate::ui::template::{best_template_candidate, best_template_hit};
 use crate::runtime::ocr::OcrRuntimeHandle;
 use crate::runtime::recovery::{GameRecoveryCoordinator, ResidencyRejection};
-use crate::runtime::ui::{
-    InputCertainty, UiRoutineContext, UiRoutineFailure, UiStateKind,
-};
+use crate::runtime::ui::{InputCertainty, UiRoutineContext, UiRoutineFailure, UiStateKind};
+use crate::ui::template::best_template_hit;
 
 // ---- 对外常量：调用方与测试共享同一套有界预算 ----
 
@@ -521,7 +519,9 @@ fn decide_recovery_step(
         return RecoveryAction::Reject("恢复动作没有产生任何状态变化（无进展熔断）".to_string());
     }
     if progress.primary_main_menu_oscillations() >= RECOVERY_OSCILLATION_LIMIT {
-        return RecoveryAction::Reject("千星大厅（一级大厅）与主菜单反复来回（振荡熔断）".to_string());
+        return RecoveryAction::Reject(
+            "千星大厅（一级大厅）与主菜单反复来回（振荡熔断）".to_string(),
+        );
     }
 
     let surface = snapshot.surface();
@@ -551,7 +551,9 @@ fn decide_recovery_step(
                         // 好友私聊/当前大厅按 Esc 都退到一级大厅（用户确认语义）。
                         RecoveryAction::Escape
                     } else {
-                        RecoveryAction::Reject("按 Esc 次数已达上限，二级聊天仍未退出一级大厅".to_string())
+                        RecoveryAction::Reject(
+                            "按 Esc 次数已达上限，二级聊天仍未退出一级大厅".to_string(),
+                        )
                     }
                 }
                 ResidencyTarget::Secondary(conversation) if conversation.is_chat() => {
@@ -573,7 +575,9 @@ fn decide_recovery_step(
                     if progress.esc_presses < RECOVERY_MAX_ESC {
                         RecoveryAction::Escape // F2 多人面板 Esc -> 一级大厅
                     } else {
-                        RecoveryAction::Reject("按 Esc 次数已达上限，二级界面·多人面板仍未关闭".to_string())
+                        RecoveryAction::Reject(
+                            "按 Esc 次数已达上限，二级界面·多人面板仍未关闭".to_string(),
+                        )
                     }
                 }
                 ResidencyTarget::Secondary(ConversationRef::MultiplayerPanel) => {
@@ -583,7 +587,9 @@ fn decide_recovery_step(
                     if progress.esc_presses < RECOVERY_MAX_ESC {
                         RecoveryAction::Escape
                     } else {
-                        RecoveryAction::Reject("按 Esc 次数已达上限，无法离开二级界面·多人面板".to_string())
+                        RecoveryAction::Reject(
+                            "按 Esc 次数已达上限，无法离开二级界面·多人面板".to_string(),
+                        )
                     }
                 }
                 ResidencyTarget::Secondary(conversation) => RecoveryAction::Reject(format!(
@@ -601,7 +607,9 @@ fn decide_recovery_step(
                     if progress.esc_presses < RECOVERY_MAX_ESC {
                         RecoveryAction::Escape // 千星地图 Esc -> 一级大厅
                     } else {
-                        RecoveryAction::Reject("按 Esc 次数已达上限，二级界面·千星地图仍未关闭".to_string())
+                        RecoveryAction::Reject(
+                            "按 Esc 次数已达上限，二级界面·千星地图仍未关闭".to_string(),
+                        )
                     }
                 }
                 ResidencyTarget::Secondary(ConversationRef::HallMap) => RecoveryAction::Done,
@@ -609,7 +617,9 @@ fn decide_recovery_step(
                     if progress.esc_presses < RECOVERY_MAX_ESC {
                         RecoveryAction::Escape
                     } else {
-                        RecoveryAction::Reject("按 Esc 次数已达上限，无法离开二级界面·千星地图".to_string())
+                        RecoveryAction::Reject(
+                            "按 Esc 次数已达上限，无法离开二级界面·千星地图".to_string(),
+                        )
                     }
                 }
                 ResidencyTarget::Secondary(conversation) => RecoveryAction::Reject(format!(
@@ -653,23 +663,29 @@ fn decide_recovery_step(
             }
         }
         UiSurface::PaimonMenu => RecoveryAction::Reject(
-            "落到主菜单大世界（ESC 系统菜单），不是千星界面，立即停止并交回启动链".to_string()),
+            "落到主菜单大世界（ESC 系统菜单），不是千星界面，立即停止并交回启动链".to_string(),
+        ),
         UiSurface::Loading => RecoveryAction::Wait,
-        UiSurface::Overworld => RecoveryAction::Reject(
-            "当前是提瓦特大世界，不在千星界面内，交回启动链".to_string()),
+        UiSurface::Overworld => {
+            RecoveryAction::Reject("当前是提瓦特大世界，不在千星界面内，交回启动链".to_string())
+        }
         UiSurface::GameGate => RecoveryAction::Reject(
-            "当前是登录入口（Game Gate），不在游戏内，交回启动链".to_string()),
+            "当前是登录入口（Game Gate），不在游戏内，交回启动链".to_string(),
+        ),
         UiSurface::Unknown => {
             if !progress.unknown_sustained() {
                 return RecoveryAction::Wait;
             }
             if progress.unknown_escape_probe {
                 return RecoveryAction::Reject(
-                    "受控 Esc 探针之后界面仍然是无法识别（Unknown）且无任何稳定证据，停止继续按键".to_string());
+                    "受控 Esc 探针之后界面仍然是无法识别（Unknown）且无任何稳定证据，停止继续按键"
+                        .to_string(),
+                );
             }
             if progress.unknown_escape_used || !options.allow_unknown_escape {
                 return RecoveryAction::Reject(
-                    "界面持续无法识别且没有可用证据，受控 Esc 预算已用尽或不允许探针".to_string());
+                    "界面持续无法识别且没有可用证据，受控 Esc 预算已用尽或不允许探针".to_string(),
+                );
             }
             if progress.esc_presses < RECOVERY_MAX_ESC {
                 RecoveryAction::Escape
@@ -789,7 +805,10 @@ pub(crate) fn settle_to_with(
 
         // 目标界面已确认：二级聊天需要再确认会话；二级界面/覆盖层/一级直接按表面判定。
         if target_satisfied(&target, &snapshot) && progress.settled(&snapshot) {
-            match target.conversation().filter(|conversation| conversation.is_chat()) {
+            match target
+                .conversation()
+                .filter(|conversation| conversation.is_chat())
+            {
                 None => {
                     let settled = target.conversation().cloned();
                     return Ok(build_report(
@@ -980,7 +999,10 @@ fn settle_conversation(
 ) -> std::result::Result<ConversationOutcome, String> {
     // 调用方明确声明"任意二级"（导航目标）：kind 已确认，直接成功。
     if *conversation == ConversationRef::AnySecondary {
-        return Ok(ConversationOutcome::Settled(false, Some(ConversationRef::AnySecondary)));
+        return Ok(ConversationOutcome::Settled(
+            false,
+            Some(ConversationRef::AnySecondary),
+        ));
     }
     // Unknown 不能直接当成功：只确认“在二级”无法证明会话，强制按当前大厅
     // 证据确认，确认不了就失败（不冒充 SecondaryCurrentHall）。
@@ -1000,14 +1022,20 @@ fn settle_conversation(
             steps,
         )
         .map(|outcome| match outcome {
-            ConversationOutcome::Settled(_, settled) => {
-                ConversationOutcome::Settled(true, settled)
-            }
+            ConversationOutcome::Settled(_, settled) => ConversationOutcome::Settled(true, settled),
             other => other,
         });
     }
     let clicked = progress.conversation_actions > 0;
-    let step = match conversation_step(context, ocr, config, conversation, clicked, progress, options) {
+    let step = match conversation_step(
+        context,
+        ocr,
+        config,
+        conversation,
+        clicked,
+        progress,
+        options,
+    ) {
         Ok(step) => step,
         Err(failure) => return Err(failure.reason().to_string()),
     };
@@ -1052,12 +1080,15 @@ fn settle_conversation(
         }
         ConversationStep::Unavailable(reason) => {
             if let Some(fallback) = hall_fallback(conversation, options) {
-                let point =
-                    match conversation_step(context, ocr, config, &fallback, clicked, progress, options)
-                    {
+                let point = match conversation_step(
+                    context, ocr, config, &fallback, clicked, progress, options,
+                ) {
                     Ok(ConversationStep::Navigate(point)) => point,
                     Ok(ConversationStep::Satisfied) => {
-                        return Ok(ConversationOutcome::Settled(true, Some(ConversationRef::CurrentHall)));
+                        return Ok(ConversationOutcome::Settled(
+                            true,
+                            Some(ConversationRef::CurrentHall),
+                        ));
                     }
                     Ok(ConversationStep::Continue) => return Ok(ConversationOutcome::Continue),
                     Ok(ConversationStep::Unavailable(reason)) => {
@@ -1193,19 +1224,16 @@ fn conversation_step(
                 .iter()
                 .map(|candidate| crate::text::normalize_comparison_text(candidate))
                 .collect::<Vec<_>>();
-            let mut matches = matching_text_rows(
-                ocr,
-                &image,
-                config.friend_list_region(),
-                &targets,
-            )
-            .map_err(|failure| {
-                UiRoutineFailure::new(
-                    failure.certainty(),
-                    "restore_residency_conversation",
-                    failure.reason(),
-                )
-            })?;
+            let mut matches =
+                matching_text_rows(ocr, &image, config.friend_list_region(), &targets).map_err(
+                    |failure| {
+                        UiRoutineFailure::new(
+                            failure.certainty(),
+                            "restore_residency_conversation",
+                            failure.reason(),
+                        )
+                    },
+                )?;
             let Some(highlighted) = super::friend_delivery::highlighted_conversation_row(
                 &image,
                 conversation_row_region(config),
@@ -1216,7 +1244,10 @@ fn conversation_step(
             };
             // 选中的会话行可能滚到列表配置区上方（真实好友帧 y≈226/188）：
             // 整列表 OCR 看不到它，只补扫这条**唯一高亮行本身**再判是否已在目标会话。
-            if !matches.iter().any(|point| point_in_rect(*point, highlighted)) {
+            if !matches
+                .iter()
+                .any(|point| point_in_rect(*point, highlighted))
+            {
                 matches.extend(
                     matching_text_rows(ocr, &image, highlighted, &targets).map_err(|failure| {
                         UiRoutineFailure::new(
@@ -1251,8 +1282,7 @@ fn conversation_step(
                 return Ok(ConversationStep::Navigate(*point));
             }
             // 当前列表没看到目标：允许轻量向下/向上滚动查找（有界）。
-            let Some(point) = locate_friend_row_with_scroll(context, ocr, config, &targets)?
-            else {
+            let Some(point) = locate_friend_row_with_scroll(context, ocr, config, &targets)? else {
                 return Ok(ConversationStep::Unavailable(
                     "会话列表中找不到目标好友行".to_string(),
                 ));
@@ -1260,11 +1290,11 @@ fn conversation_step(
             Ok(ConversationStep::Navigate(point))
         }
         ConversationRef::AnySecondary | ConversationRef::Unknown => Ok(ConversationStep::Satisfied),
-        ConversationRef::MultiplayerPanel | ConversationRef::HallMap | ConversationRef::Overlay(_) => {
-            Ok(ConversationStep::Unavailable(
-                "目标不是二级聊天会话，不能按会话级恢复".to_string(),
-            ))
-        }
+        ConversationRef::MultiplayerPanel
+        | ConversationRef::HallMap
+        | ConversationRef::Overlay(_) => Ok(ConversationStep::Unavailable(
+            "目标不是二级聊天会话，不能按会话级恢复".to_string(),
+        )),
     }
 }
 
@@ -1319,7 +1349,10 @@ fn locate_friend_row_with_scroll(
 
 fn stage_names(target_kind: UiStateKind, action_taken: bool) -> (&'static str, InputCertainty) {
     match (target_kind, action_taken) {
-        (UiStateKind::Primary, true) => ("confirm_primary_residency", InputCertainty::AfterInputUnknown),
+        (UiStateKind::Primary, true) => (
+            "confirm_primary_residency",
+            InputCertainty::AfterInputUnknown,
+        ),
         (UiStateKind::Primary, false) => ("observe_primary_residency", InputCertainty::BeforeInput),
         (_, true) => ("confirm_secondary_chat", InputCertainty::AfterInputUnknown),
         (_, false) => ("observe_friend_delivery_start", InputCertainty::BeforeInput),
@@ -1363,13 +1396,12 @@ fn build_failure(
         ResidencyTarget::Primary => "confirm_primary_residency",
         ResidencyTarget::Secondary(_) => "confirm_secondary_chat",
     };
-    let certainty = if progress.esc_presses + progress.open_chat_presses + progress.conversation_actions
-        > 0
-    {
-        InputCertainty::AfterInputUnknown
-    } else {
-        InputCertainty::BeforeInput
-    };
+    let certainty =
+        if progress.esc_presses + progress.open_chat_presses + progress.conversation_actions > 0 {
+            InputCertainty::AfterInputUnknown
+        } else {
+            InputCertainty::BeforeInput
+        };
     let snapshot_text = last_snapshot
         .as_ref()
         .map(UiStateSnapshot::describe)
@@ -1421,7 +1453,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
-    use image::{DynamicImage, GenericImage, GenericImageView};
+    use image::{DynamicImage, GenericImage};
 
     use super::*;
     use crate::config::AppConfig;
@@ -1472,7 +1504,10 @@ mod tests {
             let snapshot = snap(kind, "gate", "game_gate_template");
             let progress = settled(&snapshot);
             let action = decide(&snapshot, UiStateKind::Primary, &progress);
-            assert!(matches!(action, RecoveryAction::Reject(_)), "{kind:?} 必须拒绝：{action:?}");
+            assert!(
+                matches!(action, RecoveryAction::Reject(_)),
+                "{kind:?} 必须拒绝：{action:?}"
+            );
         }
     }
 
@@ -1482,14 +1517,20 @@ mod tests {
         let snapshot = snap(UiStateKind::Unknown, "unknown", "no_reliable_anchor");
         let mut progress = settled(&snapshot);
         // 瞬失：只等待，不按键。
-        assert_eq!(decide(&snapshot, UiStateKind::Primary, &progress), RecoveryAction::Wait);
+        assert_eq!(
+            decide(&snapshot, UiStateKind::Primary, &progress),
+            RecoveryAction::Wait
+        );
         for _ in 0..RECOVERY_UNKNOWN_MIN_SAMPLES {
             progress.record(&snapshot, Instant::now(), &recovery);
         }
         progress.unknown_since =
             Some(Instant::now() - Duration::from_millis(RECOVERY_UNKNOWN_WINDOW_MS + 50));
         // 持续无证据：允许一次受控 Esc 探针（不是盲按）。
-        assert_eq!(decide(&snapshot, UiStateKind::Primary, &progress), RecoveryAction::Escape);
+        assert_eq!(
+            decide(&snapshot, UiStateKind::Primary, &progress),
+            RecoveryAction::Escape
+        );
         // 探针之后仍是 Unknown：停止。
         progress.unknown_escape_used = true;
         progress.unknown_escape_probe = true;
@@ -1520,14 +1561,20 @@ mod tests {
         let snapshot = snap(UiStateKind::MainMenu, "main_menu", "paimon_menu_grid");
         let progress = settled(&snapshot);
         let action = decide(&snapshot, UiStateKind::Secondary, &progress);
-        assert!(matches!(action, RecoveryAction::Reject(_)), "主菜单大世界必须拒绝：{action:?}");
+        assert!(
+            matches!(action, RecoveryAction::Reject(_)),
+            "主菜单大世界必须拒绝：{action:?}"
+        );
     }
 
     #[test]
     fn recovery_decision_wonderland_menu_escapes() {
         let snapshot = snap(UiStateKind::MainMenu, "main_menu", "main_menu_template");
         let progress = settled(&snapshot);
-        assert_eq!(decide(&snapshot, UiStateKind::Primary, &progress), RecoveryAction::Escape);
+        assert_eq!(
+            decide(&snapshot, UiStateKind::Primary, &progress),
+            RecoveryAction::Escape
+        );
     }
 
     #[test]
@@ -1539,21 +1586,34 @@ mod tests {
             panel_samples: 1,
             ..RecoveryProgress::default()
         };
-        assert_eq!(decide(&panel, UiStateKind::Primary, &progress), RecoveryAction::Wait);
+        assert_eq!(
+            decide(&panel, UiStateKind::Primary, &progress),
+            RecoveryAction::Wait
+        );
         progress.record(&panel, Instant::now(), &recovery());
-        assert_eq!(decide(&panel, UiStateKind::Primary, &progress), RecoveryAction::Escape);
+        assert_eq!(
+            decide(&panel, UiStateKind::Primary, &progress),
+            RecoveryAction::Escape
+        );
     }
 
     #[test]
     fn recovery_decision_loading_only_waits() {
         let loading = snap(UiStateKind::Loading, "loading", "loading_dark_screen");
         let progress = settled(&loading);
-        assert_eq!(decide(&loading, UiStateKind::Primary, &progress), RecoveryAction::Wait);
+        assert_eq!(
+            decide(&loading, UiStateKind::Primary, &progress),
+            RecoveryAction::Wait
+        );
     }
 
     #[test]
     fn recovery_decision_secondary_escape_is_bounded() {
-        let secondary = snap(UiStateKind::Secondary, "secondary:chat", "secondary_back_template");
+        let secondary = snap(
+            UiStateKind::Secondary,
+            "secondary:chat",
+            "secondary_back_template",
+        );
         let mut progress = settled(&secondary);
         progress.esc_presses = RECOVERY_MAX_ESC;
         assert!(matches!(
@@ -1565,7 +1625,7 @@ mod tests {
     #[test]
     fn recovery_decision_oscillation_and_no_progress_trip_breaker() {
         let primary = snap(UiStateKind::Primary, "primary", "primary_friend_template");
-        let mut progress = RecoveryProgress {
+        let progress = RecoveryProgress {
             kind_tail: vec![
                 UiStateKind::Primary,
                 UiStateKind::MainMenu,
@@ -1592,7 +1652,11 @@ mod tests {
 
     #[test]
     fn recovery_decision_friend_chat_escapes_to_primary_hall() {
-        let world = snap(UiStateKind::Secondary, "secondary:chat", "secondary_chat_anchor");
+        let world = snap(
+            UiStateKind::Secondary,
+            "secondary:chat",
+            "secondary_chat_anchor",
+        );
         let progress = settled(&world);
         assert_eq!(
             decide_recovery_step(
@@ -1614,7 +1678,11 @@ mod tests {
             "secondary:qianxing_map",
             "secondary:hall_map",
         ] {
-            let snapshot = snap(UiStateKind::Secondary, label, "secondary_interface_template");
+            let snapshot = snap(
+                UiStateKind::Secondary,
+                label,
+                "secondary_interface_template",
+            );
             let progress = settled(&snapshot);
             assert_eq!(
                 decide_recovery_step(
@@ -1670,11 +1738,7 @@ mod tests {
 
     #[test]
     fn recovery_decision_paimon_menu_does_not_escape_to_overworld_blindly() {
-        let paimon = snap(
-            UiStateKind::MainMenu,
-            "paimon_menu",
-            "paimon_menu_grid",
-        );
+        let paimon = snap(UiStateKind::MainMenu, "paimon_menu", "paimon_menu_grid");
         let progress = settled(&paimon);
         assert!(
             matches!(
@@ -1716,8 +1780,7 @@ mod tests {
 
     // ==== 真实二级聊天帧：会话确认扫描区（左侧侧栏整条）====
 
-    const SCROLLED_FRIEND_FRAME: &str =
-        "tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg";
+    const SCROLLED_FRIEND_FRAME: &str = "tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg";
     const HALL_ROW_FRAME: &str = "tests/fixtures/ui/secondary-with-hall-row-1920x1080.png";
 
     fn fixture_config() -> AppConfig {
@@ -1729,8 +1792,13 @@ mod tests {
     }
 
     fn real_frame(path: &str) -> DynamicImage {
-        let image = image::open(path).unwrap_or_else(|error| panic!("打不开真实帧 {path}: {error}"));
-        assert_eq!((image.width(), image.height()), (1920, 1080), "{path} 尺寸必须与配置画布一致");
+        let image =
+            image::open(path).unwrap_or_else(|error| panic!("打不开真实帧 {path}: {error}"));
+        assert_eq!(
+            (image.width(), image.height()),
+            (1920, 1080),
+            "{path} 尺寸必须与配置画布一致"
+        );
         image
     }
 
@@ -1787,12 +1855,7 @@ mod tests {
         let back: Rect = config.screen.secondary_back_rect.into();
         let region = conversation_row_region(&routine);
         assert_eq!(
-            (
-                region.x,
-                region.y,
-                region.width,
-                region.height
-            ),
+            (region.x, region.y, region.width, region.height),
             (10, 80, 280, 800),
             "会话确认扫描区必须覆盖左侧侧栏整条（返回按钮下方）"
         );
@@ -1865,7 +1928,10 @@ mod tests {
                 assert_eq!(identity, "甲");
                 assert_eq!(candidates, vec!["甲".to_string()]);
                 let anchor = row_anchor.expect("必须带行锚点");
-                assert!(point_in_rect(crate::geometry::Point::new(anchor.0, anchor.1), row));
+                assert!(point_in_rect(
+                    crate::geometry::Point::new(anchor.0, anchor.1),
+                    row
+                ));
             }
             other => panic!("真实好友帧必须判 Friend，实际 {other:?}"),
         }
@@ -1920,7 +1986,10 @@ mod tests {
 
         // 多高亮：真实大厅帧已有的高亮行 + 再画一条侧栏高亮。
         let mut multiple = real_frame(HALL_ROW_FRAME);
-        fill_rect(&mut multiple, Rect::new(region.x.max(0), 600, region.width, 70));
+        fill_rect(
+            &mut multiple,
+            Rect::new(region.x.max(0), 600, region.width, 70),
+        );
         assert!(
             unique(&multiple, region).is_none(),
             "出现两个高亮行时必须判 None（不猜）"
@@ -1949,11 +2018,12 @@ mod conversation_substate_evidence {
 
     use super::*;
     use crate::config::AppConfig;
-    use crate::ui::frame::{Canvas, resize_to_canvas};
     use crate::geometry::Rect;
+    use crate::ui::frame::{Canvas, resize_to_canvas};
     use crate::ui::routines::friend_delivery::{
         conversation_row_region, highlighted_conversation_row,
     };
+    use crate::ui::template::best_template_candidate;
 
     fn rect_json(rect: Rect) -> serde_json::Value {
         serde_json::json!({"x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height})
@@ -1995,14 +2065,20 @@ mod conversation_substate_evidence {
                 continue;
             }
             let columns: Vec<&str> = line.split('\t').collect();
-            assert_eq!(columns.len(), 2, "会话证据清单第 {} 行列数不是 2", line_number + 1);
+            assert_eq!(
+                columns.len(),
+                2,
+                "会话证据清单第 {} 行列数不是 2",
+                line_number + 1
+            );
             let (surface_key, frame) = (columns[0], columns[1]);
-            let source = image::open(frame).unwrap_or_else(|error| panic!("打不开 {frame}: {error}"));
+            let source =
+                image::open(frame).unwrap_or_else(|error| panic!("打不开 {frame}: {error}"));
             let normalized = resize_to_canvas(&source, &canvas, None);
             let image = normalized.as_ref().unwrap_or(&source);
 
-            let hall_candidate = best_template_candidate(image, Some(hall_search), hall_template)
-                .unwrap();
+            let hall_candidate =
+                best_template_candidate(image, Some(hall_search), hall_template).unwrap();
             let hall_hit = hall_candidate
                 .clone()
                 .filter(|candidate| candidate.quality_ok && candidate.score >= threshold);

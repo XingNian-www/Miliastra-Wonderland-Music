@@ -1,3 +1,11 @@
+// `private_interfaces`：本文件的 effect/outcome 枚举把玩法内部的模板载体放进 `pub`
+// 字段（成语是 `ReplyTemplate`/`ReplyVars`，卡牌与卧底是各自的 reply 类型）。这些载体
+// 只在 crate 内构造与消费，对外只交成品文案，因此保持 `pub(crate)`；字段所在的枚举
+// 因为 `composition` 投递层按 `pub` 路径引用而仍是 `pub`。这是当前分层的有意状态：
+// 收窄枚举要连带改 `composition` 的再导出面，放宽载体则是无谓扩大对外 API。
+// 既有对外路径不变，故就地放行，并在载体定义处（如 `outcome.rs`）说明来由。
+#![allow(private_interfaces)]
+
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;

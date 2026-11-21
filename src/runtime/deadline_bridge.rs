@@ -333,16 +333,11 @@ pub(crate) struct BusinessRuntimeGroupShutdownError {
 }
 
 impl BusinessRuntimeGroupShutdownError {
-    pub(crate) const fn prepare_error(&self) -> Option<&BusinessRuntimeError> {
-        self.prepare.as_ref()
-    }
-
+    /// 只有「计时器关闭阶段有损」这一类需要在日志里单独措辞（见
+    /// [`crate::composition::application::lifecycle`] 的关停序列），
+    /// 因此只暴露这一个分类入口；准备阶段/收尾阶段的错误由 `Display` 整体承载。
     pub(crate) const fn deadline_error(&self) -> Option<&BusinessDeadlineRuntimeShutdownError> {
         self.deadlines.as_ref()
-    }
-
-    pub(crate) const fn finish_error(&self) -> Option<&BusinessRuntimeError> {
-        self.finish.as_ref()
     }
 }
 

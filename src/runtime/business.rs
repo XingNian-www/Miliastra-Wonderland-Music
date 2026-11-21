@@ -36,11 +36,11 @@ use crate::features::moderation::{
     ModerationWorkflowKey, ModerationWorkflowLedger, ModerationWorkflowRegistry,
     ModerationWorkflowToken,
 };
+#[cfg(test)]
+use crate::features::number_bomb::NumberBombConfig;
 use crate::features::number_bomb::{
     NumberBombCommand, NumberBombCommandOutcome, NumberBombService, NumberBombTimeout,
 };
-#[cfg(test)]
-use crate::features::number_bomb::NumberBombConfig;
 use crate::features::playback::{
     ActivePlaybackIdentity, ExternalPlaybackObservation, PlaybackMutationIntent,
     PlaybackMutationOutcome, PlaybackObservation, PlaybackRuntimeState, PlaybackService,
@@ -1985,7 +1985,8 @@ impl BusinessRuntimeHandle {
         })
     }
 
-    #[allow(dead_code)]
+    // Linux 非测试库构建下，本方法只从 Windows 生产入口可达；生产与测试构建仍然检查。
+    #[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
     pub(crate) fn stabilize_turtle_soup_secondary(
         &self,
         observations: Vec<SecondaryOcrObservation>,
@@ -1998,7 +1999,8 @@ impl BusinessRuntimeHandle {
         })
     }
 
-    #[allow(dead_code)]
+    // Linux 非测试库构建下，本方法只从 Windows 生产入口可达；生产与测试构建仍然检查。
+    #[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
     pub(crate) fn clear_turtle_soup_secondary_stability(&self) -> Result<(), BusinessRuntimeError> {
         self.send_request(RuntimeMessage::TurtleSoup(
             TurtleSoupRuntimeMessage::ClearSecondary,
@@ -2208,7 +2210,9 @@ impl TurtleSoupAiCompletionPort for TurtleSoupBusinessEventPort {
             .sink
             .submit(BusinessEvent::TurtleSoupAiCompleted(completion))
         {
-            log::debug!("业务运行时已停止，本次海龟汤 AI 裁决结果被丢弃，不影响已结束的对局：{error}");
+            log::debug!(
+                "业务运行时已停止，本次海龟汤 AI 裁决结果被丢弃，不影响已结束的对局：{error}"
+            );
         }
     }
 }
@@ -3379,8 +3383,8 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         clock.as_ref(),
                     ) {
                         log::error!(
-                    "业务运行时处理计时事件失败（步骤：分发计时到期事件），该次定时动作未执行，玩法状态可能停在等待中：{error}"
-                );
+                            "业务运行时处理计时事件失败（步骤：分发计时到期事件），该次定时动作未执行，玩法状态可能停在等待中：{error}"
+                        );
                     }
                 }
                 BusinessEvent::TurtleSoupAiCompleted(completion) => {
@@ -3391,8 +3395,8 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                         clock.as_ref(),
                     ) {
                         log::error!(
-                    "海龟汤 AI 裁决已应用，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时：{error}"
-                );
+                            "海龟汤 AI 裁决已应用，但同步期限失败（步骤：写回阶段截止时间），本局可能提前判为超时：{error}"
+                        );
                     }
                 }
                 other => snapshot.apply(other),
@@ -3436,8 +3440,8 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     entertainment.handle_card_game(message, timer.as_ref(), clock.as_ref())
                 {
                     log::error!(
-                    "业务运行时处理牌局消息失败（步骤：分发牌局消息），该条消息对应的牌局动作未执行：{error}"
-                );
+                        "业务运行时处理牌局消息失败（步骤：分发牌局消息），该条消息对应的牌局动作未执行：{error}"
+                    );
                 }
             }
             RuntimeMessage::Undercover(message) => {
@@ -3445,8 +3449,8 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     entertainment.handle_undercover(message, timer.as_ref(), clock.as_ref())
                 {
                     log::error!(
-                    "业务运行时处理谁是卧底消息失败（步骤：分发卧底消息），该条消息对应的动作未执行：{error}"
-                );
+                        "业务运行时处理谁是卧底消息失败（步骤：分发卧底消息），该条消息对应的动作未执行：{error}"
+                    );
                 }
             }
             RuntimeMessage::UndercoverSnapshot(response) => {
@@ -3455,8 +3459,8 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             RuntimeMessage::NumberBomb(message) => {
                 if let Err(error) = entertainment.handle_number_bomb(message) {
                     log::error!(
-                    "业务运行时处理数字炸弹消息失败（步骤：分发数字炸弹命令或超时），该条消息对应的动作未执行：{error}"
-                );
+                        "业务运行时处理数字炸弹消息失败（步骤：分发数字炸弹命令或超时），该条消息对应的动作未执行：{error}"
+                    );
                 }
             }
             RuntimeMessage::TurtleSoup(message) => {
@@ -3467,8 +3471,8 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                     clock.as_ref(),
                 ) {
                     log::error!(
-                    "业务运行时处理海龟汤消息失败（步骤：分发海龟汤消息），该条消息对应的动作未执行：{error}"
-                );
+                        "业务运行时处理海龟汤消息失败（步骤：分发海龟汤消息），该条消息对应的动作未执行：{error}"
+                    );
                 }
             }
             RuntimeMessage::RefreshTurtleSoup {
@@ -3674,13 +3678,7 @@ fn handle_card_game_message(
             response,
         } => {
             let result = card_games
-                .begin_command_with_display(
-                    entertainment,
-                    &player,
-                    &player_display,
-                    &command,
-                    now,
-                )
+                .begin_command_with_display(entertainment, &player, &player_display, &command, now)
                 .map_err(card_game_operation_failed)
                 .and_then(|result| {
                     sync_card_game_deadline(

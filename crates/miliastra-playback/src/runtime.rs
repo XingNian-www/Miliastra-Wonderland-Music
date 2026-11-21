@@ -771,16 +771,18 @@ fn run_runtime_thread(
             }
         };
         let audio_cache = match audio_cache_config {
-            Some(config) if config.enabled => match crate::cache::AudioCache::spawn_with_limits(config, cache_limits).await {
-                Ok(cache) => {
-                    tracing::info!("音频数据缓存已启用");
-                    Some(cache)
+            Some(config) if config.enabled => {
+                match crate::cache::AudioCache::spawn_with_limits(config, cache_limits).await {
+                    Ok(cache) => {
+                        tracing::info!("音频数据缓存已启用");
+                        Some(cache)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "音频数据缓存启动失败，本次运行不启用缓存");
+                        None
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "音频数据缓存启动失败，本次运行不启用缓存");
-                    None
-                }
-            },
+            }
             _ => None,
         };
         let core = PlaybackCore::new_with_registry(
@@ -3390,7 +3392,10 @@ mod tests {
             handle.set_duck_gain(30),
             Err(PlaybackError::RuntimeStopped)
         ));
-        assert!(started.elapsed() < Duration::from_secs(1), "停机后必须快速失败");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "停机后必须快速失败"
+        );
     }
 
     #[test]

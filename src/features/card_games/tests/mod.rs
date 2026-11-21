@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use miliastra_kernel::clock::{Clock, ManualClock};
 
-use super::cards::{Card, Rank, find_player, player_key};
+use super::cards::{Card, Rank, player_key};
 use super::dealing::{deal, format_play};
 use super::landlord::{
     ActiveTimer, Bidding, BiddingPhase, CardGameVariant, GameState, LastPlay, Player, Playing,

@@ -1318,11 +1318,11 @@ fn request_from_axum(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) 
     }
 }
 
-/// 当前线程正在处理的请求，供只在深处做错误构造的代码取「哪个接口」。
-///
-/// HTTP 路由按线程串行处理请求，用线程局部保存即可把上下文带到
-/// `internal_error` 这类拿不到 `Request` 的构造点，避免给 `AppError`
-/// 加字段而波及全部 49 处字面量初始化。
+// 当前线程正在处理的请求，供只在深处做错误构造的代码取「哪个接口」。
+//
+// HTTP 路由按线程串行处理请求，用线程局部保存即可把上下文带到
+// `internal_error` 这类拿不到 `Request` 的构造点，避免给 `AppError`
+// 加字段而波及全部 49 处字面量初始化。
 thread_local! {
     static CURRENT_REQUEST: std::cell::RefCell<Option<(String, String)>> =
         const { std::cell::RefCell::new(None) };

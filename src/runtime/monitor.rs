@@ -14,9 +14,7 @@ use crate::runtime::business::{BusinessOperationalSnapshot, BusinessStateSink};
 use crate::runtime::decision::DecisionSnapshot;
 use crate::runtime::scheduler::{DiagnosticTaskSnapshot, FormalTaskSnapshot};
 use crate::runtime::task_engine::{TaskEngineProjection, TaskEngineStateSink};
-use crate::runtime::ui::{
-    UiRoutineProgress, UiRoutineProgressSink, UiRoutineProgressStage,
-};
+use crate::runtime::ui::{UiRoutineProgress, UiRoutineProgressSink, UiRoutineProgressStage};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -692,10 +690,7 @@ mod tests {
     #[test]
     fn monitor_snapshot_holds_truncated_log_lines() {
         let monitor = MonitorShared::new(20);
-        MonitorLogSink::push(
-            &monitor.log_sink(),
-            format!("第一条\n{}", "长".repeat(400)),
-        );
+        MonitorLogSink::push(&monitor.log_sink(), format!("第一条\n{}", "长".repeat(400)));
         let snapshot = monitor.snapshot();
         assert_eq!(snapshot.logs.len(), 2, "多行日志仍按行拆开");
         assert_eq!(snapshot.logs[0], "第一条");

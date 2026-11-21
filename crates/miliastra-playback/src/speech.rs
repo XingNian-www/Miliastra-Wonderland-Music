@@ -130,9 +130,7 @@ impl SpeechAudio {
 /// 解析 WAV（RIFF/WAVE）。仅支持 `audio_format` = 1 (PCM16) 或 3 (IEEE float32)。
 fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err(SpeechError::Decode(
-            "not a RIFF/WAVE file".to_owned(),
-        ));
+        return Err(SpeechError::Decode("not a RIFF/WAVE file".to_owned()));
     }
     let mut pos = 12usize;
     let mut fmt: Option<(u16, u16, u32, u16)> = None; // (format, channels, sample_rate, bits)
@@ -159,9 +157,7 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
             if id == b"data" && size >= STREAMING_SIZE_SENTINEL {
                 bytes.len()
             } else {
-                return Err(SpeechError::Decode(
-                    "wav chunk is truncated".to_owned(),
-                ));
+                return Err(SpeechError::Decode("wav chunk is truncated".to_owned()));
             }
         } else {
             declared_end
@@ -169,9 +165,7 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
         let body = &bytes[body_start..body_end];
         if id == b"fmt " {
             if body.len() < 16 {
-                return Err(SpeechError::Decode(
-                    "wav fmt chunk too short".to_owned(),
-                ));
+                return Err(SpeechError::Decode("wav fmt chunk too short".to_owned()));
             }
             let audio_format = u16::from_le_bytes([body[0], body[1]]);
             let channels = u16::from_le_bytes([body[2], body[3]]);
@@ -184,11 +178,9 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
         // chunk 以偶数字节对齐。
         pos = body_end + (size & 1);
     }
-    let (audio_format, channels, sample_rate, bits) = fmt.ok_or_else(|| {
-        SpeechError::Decode("wav is missing fmt chunk".to_owned())
-    })?;
-    let data =
-        data.ok_or_else(|| SpeechError::Decode("wav is missing data chunk".to_owned()))?;
+    let (audio_format, channels, sample_rate, bits) =
+        fmt.ok_or_else(|| SpeechError::Decode("wav is missing fmt chunk".to_owned()))?;
+    let data = data.ok_or_else(|| SpeechError::Decode("wav is missing data chunk".to_owned()))?;
     if channels == 0 || sample_rate == 0 {
         return Err(SpeechError::Decode(
             "wav has invalid channels/sample_rate".to_owned(),
@@ -210,7 +202,7 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, SpeechError> {
         (format, bits) => {
             return Err(SpeechError::UnsupportedFormat(format!(
                 "wav audio_format={format}, bits={bits} not supported (need PCM16 or F32)"
-            )))
+            )));
         }
     };
     // 真实截断的严格边界：剩余数据必须能组成整数个帧（不能靠 clamp 静默吞掉半帧）。
@@ -265,8 +257,9 @@ fn prepare_for_device(input: &PcmAudio, target_rate: u32, target_channels: u16) 
     let out_frames = if input.sample_rate == target_rate || input.sample_rate == 0 {
         frames
     } else {
-        ((frames as f64) * f64::from(target_rate) / f64::from(input.sample_rate)).round().max(1.0)
-            as usize
+        ((frames as f64) * f64::from(target_rate) / f64::from(input.sample_rate))
+            .round()
+            .max(1.0) as usize
     };
     let mut interleaved = vec![0.0_f32; out_frames * out_channels];
     if input.sample_rate == target_rate || input.sample_rate == 0 {
@@ -370,7 +363,10 @@ impl SpeechBuffer {
             return;
         }
         {
-            let mut queue = self.samples.lock().unwrap_or_else(|error| error.into_inner());
+            let mut queue = self
+                .samples
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             queue.extend(pcm);
         }
         self.playing.store(true, Ordering::Release);
@@ -379,7 +375,10 @@ impl SpeechBuffer {
 
     fn stop(&self) {
         {
-            let mut queue = self.samples.lock().unwrap_or_else(|error| error.into_inner());
+            let mut queue = self
+                .samples
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             queue.clear();
         }
         if self.playing.swap(false, Ordering::AcqRel) {
@@ -475,7 +474,9 @@ impl SpeechPlayer {
     /// 停止当前语音（清空缓冲），不影响音乐。
     pub fn stop(&self) -> Result<(), SpeechError> {
         let sender = self.tx.lock().unwrap_or_else(|error| error.into_inner());
-        sender.send(SpeechCommand::Stop).map_err(|_| SpeechError::Closed)
+        sender
+            .send(SpeechCommand::Stop)
+            .map_err(|_| SpeechError::Closed)
     }
 
     /// 当前是否正在输出语音。流错误/线程退出后恒为 false（健康回落）。
@@ -738,8 +739,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        PcmAudio, SpeechAudio, SpeechBuffer, SpeechError, SpeechHealth, SpeechOutput,
-        SpeechPlayer, Supervisor, decode_wav, prepare_for_device,
+        PcmAudio, SpeechAudio, SpeechBuffer, SpeechError, SpeechHealth, SpeechOutput, SpeechPlayer,
+        Supervisor, decode_wav, prepare_for_device,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -884,7 +885,10 @@ mod tests {
 
     #[test]
     fn wav_corruption_is_decode_error_not_unsupported() {
-        assert!(matches!(decode_wav(b"not a wav"), Err(SpeechError::Decode(_))));
+        assert!(matches!(
+            decode_wav(b"not a wav"),
+            Err(SpeechError::Decode(_))
+        ));
         // 截断的 chunk → Decode
         let mut bytes = wav_pcm16_mono(16_000, &[0, 1]);
         bytes.truncate(20);
@@ -1013,10 +1017,12 @@ mod tests {
         player.supervisor.fail("simulated cpal stream error");
         wait_until(|| !player.is_alive());
         assert!(matches!(player.health(), SpeechHealth::Degraded { .. }));
-        assert!(player
-            .last_error()
-            .unwrap()
-            .contains("simulated cpal stream error"));
+        assert!(
+            player
+                .last_error()
+                .unwrap()
+                .contains("simulated cpal stream error")
+        );
         assert!(!player.is_speaking());
         // 降级后 speak 返回 Closed，不会永久等待。
         let error = player

@@ -1,5 +1,4 @@
 use super::*;
-use sha2::Digest;
 
 /// 测试辅助：把可失败的沙盒操作原样转发给内置的 `DebugHttpService`。
 ///
@@ -196,7 +195,7 @@ fn debug_http_state_lists_all_atomic_commands() {
 #[test]
 fn debug_command_accepts_task_model_shape_and_legacy_shape() {
     use crate::debug_sandbox::AtomicCommand;
-    use crate::interfaces::http::HttpDebugCommand;
+    use crate::interfaces::http::ports::HttpDebugCommand;
 
     let cases: [(serde_json::Value, AtomicCommand); 6] = [
         // 与任务模型一致：单元变体就是裸字符串，结构变体是单键对象。
@@ -534,6 +533,7 @@ fn debug_http_read_only_actual_frame_mnn_evidence() {
     use crate::debug_read_only::{ReadOnlyState, observer};
     use crate::runtime::ocr::{OcrArgs, OcrPriority, OcrRuntime, ProductionOcrDevice};
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
+    use sha2::Digest;
     struct Restore(bool, ReadOnlyState);
     impl Drop for Restore {
         fn drop(&mut self) {

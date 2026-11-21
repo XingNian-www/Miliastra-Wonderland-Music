@@ -36,6 +36,4 @@ mod tests;
 
 // ── 对外符号：保持 `listener::*` 的既有路径不变 ──────────────────────────────
 pub(in crate::composition::application) use chat_routing::CommandGate;
-pub(in crate::composition::application) use loop_driver::{
-    load_persisted_chat_listener_mode, persist_chat_listener_mode,
-};
+pub(in crate::composition::application) use loop_driver::load_persisted_chat_listener_mode;

@@ -204,8 +204,7 @@ impl UiRoutine for CustomActionTask {
     type Output = CustomActionOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment =
-            SettleEnvironment::new(self.ocr.clone(), self.residency.clone());
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.residency.clone());
         let outcome = UiTask::new(
             custom_action_task_spec(environment),
             CustomActionRoutine {
@@ -804,9 +803,9 @@ mod tests {
 
     use super::*;
     use crate::config::AppConfig;
-    use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
+    use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
 
     struct EmptyOcr;
 

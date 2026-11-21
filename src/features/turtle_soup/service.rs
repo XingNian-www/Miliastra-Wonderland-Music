@@ -33,8 +33,6 @@ use miliastra_kernel::clock::{Clock, Delay};
 use miliastra_kernel::identity::SessionGeneration;
 
 const RECENT_JUDGMENT_LIMIT: usize = 30;
-const OPENAI_DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const OPENAI_DEFAULT_MODEL: &str = "gpt-5.6";
 const DEFAULT_AI_MAX_TOKENS: u32 = 1_024;
 const DEFAULT_BATCH_MAX_PARTS: usize = 32;
 const DEFAULT_NICKNAME_STABLE_COUNT: usize = 0;

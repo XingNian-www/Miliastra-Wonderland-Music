@@ -1894,11 +1894,11 @@ mod tests {
 
     use super::{
         ControlDispatch, ControlDispatchOutcome, FastObservationCancelStatus,
-        FastObservationDemandStatus, ObservationWaitOutcome, PickedCandidate, PlayerControl,
-        PlayerControlPort, PlayerLane, PlayerLaneError, PlayerObservationPort,
-        PlayerObservationReadError, PlayerOperationReceiveError, PlayerLiveTuning,
-        PlayerLiveTuningProvider, PlayerRuntime, PlayerRuntimeConfig, PlayerRuntimeConfigError,
-        PlayerSearch, PlayerSearchClient, LatestObservationStore,
+        FastObservationDemandStatus, LatestObservationStore, ObservationWaitOutcome,
+        PickedCandidate, PlayerControl, PlayerControlPort, PlayerLane, PlayerLaneError,
+        PlayerLiveTuning, PlayerLiveTuningProvider, PlayerObservationPort,
+        PlayerObservationReadError, PlayerOperationReceiveError, PlayerRuntime,
+        PlayerRuntimeConfig, PlayerRuntimeConfigError, PlayerSearch, PlayerSearchClient,
         PlayerSearchClientError, PlayerSearchError, PlayerSearchOutcome, PlayerSearchPort,
         SearchCandidate,
     };
@@ -2861,10 +2861,17 @@ mod tests {
                 .unwrap(),
             FastObservationCancelStatus::NotActive
         );
+        // 自动到期：等到「需求真的过期」的那一刻，而不是睡一个猜出来的时长。
+        //
+        // 需求到期会把观察节奏从快节奏（25ms）切回普通节奏（500ms）：过期之后，
+        // 直到下一次普通采样之前都不会再有发布。因此「过期后一段时间内没有新发布」
+        // 就是需求已不再生效的直接证据——用一次带硬超时的条件等待拿到它，
+        // 不需要固定睡眠 120ms。
         let automatic_id = BusinessOperationId::new(25);
+        let automatic_expiry = Instant::now() + Duration::from_millis(70);
         assert_eq!(
             handle
-                .request_fast_observation(automatic_id, Instant::now() + Duration::from_millis(70))
+                .request_fast_observation(automatic_id, automatic_expiry)
                 .unwrap()
                 .wait_timeout(Duration::from_secs(1))
                 .unwrap()
@@ -2872,7 +2879,22 @@ mod tests {
                 .unwrap(),
             FastObservationDemandStatus::Active
         );
-        thread::sleep(Duration::from_millis(120));
+        // 到期时刻之前必须仍是快节奏（否则说明需求过早失效）。
+        assert!(
+            Instant::now() <= automatic_expiry,
+            "测试自身不应落后于到期时刻"
+        );
+        // 用一次 `sleep_until` 等「到期」这一时刻：它等的是真实时间点，
+        // 而不是「猜需求大概已经过期」。
+        thread::sleep(automatic_expiry.saturating_duration_since(Instant::now()));
+        let settled_revision = handle.latest_observation_revision();
+        assert!(
+            matches!(
+                handle.wait_for_observation_after(settled_revision, Duration::from_millis(120)),
+                ObservationWaitOutcome::TimedOut
+            ),
+            "需求过期后必须回落到普通节奏（过期后 120ms 内不应再有快节奏发布）"
+        );
         assert_eq!(
             handle
                 .cancel_fast_observation(automatic_id)

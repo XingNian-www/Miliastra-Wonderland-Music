@@ -435,10 +435,6 @@ impl ResolvedSongRequest {
         }
     }
 
-    pub(crate) fn dedup_reject_message(&self) -> String {
-        format!("{}近期已播放过,请稍后再点", self.keyword)
-    }
-
     fn final_command(&self, action: &str) -> String {
         self.final_command_for_playback(action, &self.playback_request())
     }
@@ -2226,11 +2222,12 @@ fn candidate_choice_line(index: usize, candidate: &SearchCandidate) -> String {
 
 fn decision_track_line(prefix: &str, suffix: &str, candidate: &SearchCandidate) -> String {
     let budget = crate::text::chat_layout::CHAT_LAYOUT_BUDGET
-        .saturating_sub(
-            crate::text::display_width(prefix) + crate::text::display_width(suffix),
-        )
+        .saturating_sub(crate::text::display_width(prefix) + crate::text::display_width(suffix))
         .max(8);
-    format!("{prefix}{}{suffix}", candidate_display_label(candidate, budget))
+    format!(
+        "{prefix}{}{suffix}",
+        candidate_display_label(candidate, budget)
+    )
 }
 
 fn request_display_label(request: &ResolvedSongRequest, budget: usize) -> String {
@@ -3910,17 +3907,18 @@ mod tests {
         for index in 1..=5 {
             let line = candidate_choice_line(index, &candidate);
             assert!(
-                crate::text::display_width(&line)
-                    <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+                crate::text::display_width(&line) <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
                 "候选行超过预算：{line}"
             );
-            assert!(line.starts_with(&format!("{index}. ")), "序号不可截：{line}");
+            assert!(
+                line.starts_with(&format!("{index}. ")),
+                "序号不可截：{line}"
+            );
             assert!(!line.contains('\n'));
         }
         let prompt = decision_track_line("@点歌搜索到:", ",@确认@跳过@选择", &candidate);
         assert!(
-            crate::text::display_width(&prompt)
-                <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+            crate::text::display_width(&prompt) <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
             "首条提示超过预算：{prompt}"
         );
         assert!(prompt.contains("歌手0"), "歌手应保留可辨识前缀：{prompt}");
@@ -3960,10 +3958,12 @@ mod tests {
             prompt.starts_with("搜索到:"),
             "改前=好友大厅玩家:搜索到:…；改后=搜索到:…：{prompt}"
         );
-        assert!(!prompt.contains("好友"), "大厅结果不该出现好友前缀：{prompt}");
         assert!(
-            crate::text::display_width(&prompt)
-                <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+            !prompt.contains("好友"),
+            "大厅结果不该出现好友前缀：{prompt}"
+        );
+        assert!(
+            crate::text::display_width(&prompt) <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
             "结果行必须兼容 78 列预算：{prompt}"
         );
         // 展示文案改动不能碰队列 keyword / 去重身份。
@@ -3994,8 +3994,7 @@ mod tests {
         );
         assert_eq!(prompt.matches(':').count(), 1, "只能有一个冒号：{prompt}");
         assert!(
-            crate::text::display_width(&prompt)
-                <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+            crate::text::display_width(&prompt) <= crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
             "结果行必须兼容 78 列预算：{prompt}"
         );
         assert_eq!(port.played.borrow()[0].keyword, "晴天 - 周杰伦");

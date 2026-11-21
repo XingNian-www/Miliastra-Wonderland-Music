@@ -667,8 +667,7 @@ fn json_string(value: &Value, key: &str) -> String {
 }
 
 fn model_reply_json_object(reply: &str) -> Result<String> {
-    crate::text::extract_json_object(reply)
-        .ok_or_else(|| anyhow::anyhow!("AI返回无效JSON"))
+    crate::text::extract_json_object(reply).ok_or_else(|| anyhow::anyhow!("AI返回无效JSON"))
 }
 
 fn validate_recognize_json(text: &str) -> Result<()> {

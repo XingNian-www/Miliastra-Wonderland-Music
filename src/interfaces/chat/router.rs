@@ -146,7 +146,9 @@ pub(crate) const HASH_START_HANDLERS: &[ChatHandler] = &[
     handler(
         ChatCommandModule::NumberBomb,
         NumberBombCommand::claims_start_chat,
-        |envelope| route_number_bomb(envelope).map(|matched| matched.map(ModuleCommand::NumberBomb)),
+        |envelope| {
+            route_number_bomb(envelope).map(|matched| matched.map(ModuleCommand::NumberBomb))
+        },
     ),
     handler(
         ChatCommandModule::Administration,
@@ -511,7 +513,10 @@ mod tarot_routing_tests {
 
         let active = Some(EntertainmentKind::NumberBomb);
         for (text, expected) in [
-            ("#加入", crate::features::number_bomb::NumberBombCommand::Join),
+            (
+                "#加入",
+                crate::features::number_bomb::NumberBombCommand::Join,
+            ),
             (
                 "#开始",
                 crate::features::number_bomb::NumberBombCommand::StartGame,
@@ -528,7 +533,10 @@ mod tarot_routing_tests {
                 "#重来",
                 crate::features::number_bomb::NumberBombCommand::Retry,
             ),
-            ("#42", crate::features::number_bomb::NumberBombCommand::Guess(42)),
+            (
+                "#42",
+                crate::features::number_bomb::NumberBombCommand::Guess(42),
+            ),
         ] {
             let routed = router
                 .route(&envelope("blue", text), active)
@@ -752,7 +760,8 @@ fn role_for_envelope(
     // 日志里绝不出现备注串原文：remark 是 OCR 匹配键，落进日志等于把
     // 「可以被改成一样的名字」泄露出去了（见 identity.rs 的 player_name 注释）。
     // 只用 player_name()：显示名 → 真实昵称 → 占位「玩家」，不会外泄内部键。
-    if envelope.account().is_none() && matches!(resolved.role, IdentityRole::Admin | IdentityRole::Owner)
+    if envelope.account().is_none()
+        && matches!(resolved.role, IdentityRole::Admin | IdentityRole::Owner)
     {
         log::warn!(
             "高权限身份仅凭昵称解析出来（角色为{}，身份显示名「{}」）：这条消息没有可信 UID，昵称可以被改名冒充；仅记录线索，本次判定不变",
@@ -983,11 +992,7 @@ mod tests {
                 let ModuleCommand::SongRequest(song) = routed.command else {
                     panic!("expected song");
                 };
-                assert_eq!(
-                    song.source.as_str(),
-                    source,
-                    "@点歌 的搜索仍须走默认平台"
-                );
+                assert_eq!(song.source.as_str(), source, "@点歌 的搜索仍须走默认平台");
             }
         }
 

@@ -3294,7 +3294,7 @@ mod tests {
     #[test]
     fn discard_publishes_to_decisions_before_routine_ack_without_business_race() {
         let shared = ChatTimeline::new();
-        let baseline = friend(&shared, vec![input("history", 10)]);
+        friend(&shared, vec![input("history", 10)]);
         let business = shared.subscribe().unwrap();
         let decision = shared.subscribe().unwrap();
         let guard = shared.suppress_friend_business().unwrap();

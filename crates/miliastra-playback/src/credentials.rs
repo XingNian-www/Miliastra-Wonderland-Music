@@ -1489,8 +1489,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        CredentialError, CredentialStore, DAILY_REFRESH_INTERVAL_MS, ProviderCredential,
-        REFRESH_STATE_FILE, epoch_ms, qq_refresh_key_is_wechat, qq_refresh_ready,
+        CredentialStore, DAILY_REFRESH_INTERVAL_MS, ProviderCredential, REFRESH_STATE_FILE,
+        epoch_ms, qq_refresh_key_is_wechat, qq_refresh_ready,
     };
 
     #[test]

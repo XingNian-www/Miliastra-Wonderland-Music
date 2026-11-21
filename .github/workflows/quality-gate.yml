@@ -69,9 +69,9 @@ jobs:
           ls -la web/dist
 
   # ===========================================================================
-  # 门禁二：仓库脚本（分层方向 / 日志文案 / 入库边界）
+  # 门禁二：仓库脚本（分层方向 / 日志文案 / 面板 API 覆盖 / 入库边界）
   #
-  # 三个检查都只读 src/、web/src/、scripts/、technical-docs/，不碰网络、不碰工具链，
+  # 全部只读 src/、web/src/、scripts/，不碰网络、不碰工具链，
   # 因此单独成一个 job 与 Rust 门禁并发跑，反馈更快。
   # ===========================================================================
   repo-scripts:
@@ -95,6 +95,22 @@ jobs:
       - name: 日志文案检查
         # 禁止 {:?} 调试格式、字段堆砌、全英文消息等；规则见 technical-docs/logging-style.md。
         run: python3 scripts/check-log-style.py
+
+      - name: 面板 API 覆盖率
+        # 解析 src/interfaces/http/protocol.rs 的路由表 vs web/src 里的 URL 字面量。
+        # 脚本约定“退出码恒 0，仅用于报告”，所以这里显式把「未覆盖 > 0」判成失败：
+        # 面板字段是前后端冻结契约，路由加了却没人调，等于面板功能静默缺失。
+        run: |
+          set -euo pipefail
+          report=$(python3 scripts/panel-api-coverage.py)
+          printf '%s\n' "$report"
+          missing=$(printf '%s\n' "$report" | sed -n 's/.*未覆盖 \([0-9][0-9]*\) 个.*/\1/p' | tail -n 1)
+          [ -n "$missing" ] || { echo "::error::无法从 panel-api-coverage.py 输出解析未覆盖数，脚本输出格式可能已变"; exit 1; }
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::面板 API 覆盖率未满：$missing 条 Rust 路由前端未调用（路由表与 web/src 不同步）"
+            python3 scripts/panel-api-coverage.py --json
+            exit 1
+          fi
 
       # 隐私扫描不放在这个 job：见 rust-gate 末尾“隐私扫描”一步的说明。
       - name: 入库边界检查（technical-docs 不得入库）
@@ -242,16 +258,36 @@ jobs:
       - name: 格式检查（cargo fmt --all --check）
         run: cargo fmt --all --check
 
-      - name: 编译检查（cargo check --workspace --lib --no-default-features）
-        # 这里**故意不加** `-D warnings`：
-        # 本仓库 --lib 下仍有约 2,995 条告警（根因是 src/main.rs 对非 Windows 是
-        # compile_error!，二进制目标在 Linux 编不出来，很多 pub(crate) 接口只被它使用）。
-        # 现在加 -D warnings 会让门禁第一天就红，而且是几千条噪音。
-        # 待 Wave 4 把告警清零后，再在这一步追加 `-D warnings` 升级为硬失败。
-        #
-        # 不加 `-D warnings` 不是“放松”：面板产物缺失时 build.rs 只会发一条 cargo:warning，
-        # 编译照样成功 —— 这正是必须在 test 之前显式“校验前端产物”的原因（见上一大步）。
-        run: cargo check --locked --workspace --lib --no-default-features
+      - name: 编译检查（cargo check --workspace --lib --no-default-features，零警告门禁）
+        # Wave 4 已将 5 个工作区 crate 的 Linux 非测试库构建告警全部清零（src/lib.rs 仅对
+        # all(not(windows), not(test)) 放过 Windows-only 生产入口的 dead_code，其余告警与
+        # Windows 构建均严格检查）。这里通过 JSON 诊断精确统计工作区 crate 的 compiler-message
+        # warning，在不改动 job 级 RUSTFLAGS（避免破坏 cargo test 缓存复用）的前提下强制 0 警告。
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --lib --no-default-features --message-format=json-diagnostic-rendered-ansi \
+            | python3 -c '
+          import json, sys
+          warnings = []
+          for line in sys.stdin:
+              line = line.strip()
+              if not line.startswith("{"):
+                  continue
+              event = json.loads(line)
+              if event.get("reason") != "compiler-message":
+                  continue
+              msg = event.get("message") or {}
+              rendered = msg.get("rendered") or ""
+              if msg.get("level") == "warning":
+                  warnings.append(rendered)
+                  sys.stderr.write(rendered)
+              elif msg.get("level") == "error":
+                  sys.stderr.write(rendered)
+          if warnings:
+              sys.stderr.write(f"::error::workspace --lib 编译存在 {len(warnings)} 条告警，门禁要求零警告\n")
+              sys.exit(1)
+          print("workspace --lib 编译检查通过：0 警告")
+          '
 
       - name: 单测（cargo test --lib --no-default-features）
         # `-- --test-threads=1` 是仓库既定用法（存在进程级 static），必须保留；

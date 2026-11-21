@@ -149,8 +149,3 @@ impl WebToolRequest {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}

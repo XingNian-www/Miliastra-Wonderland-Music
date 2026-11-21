@@ -9,8 +9,7 @@ use serde_json::json;
 
 use crate::config::AppConfig;
 use crate::features::ai_chat::{
-    self, AiChatMemory, ChatContext, HallContext, PromptBlock,
-    PromptBlockKind, PromptInput,
+    self, AiChatMemory, ChatContext, HallContext, PromptBlock, PromptBlockKind, PromptInput,
 };
 
 fn estimate_tokens(chars: usize) -> usize {
@@ -56,12 +55,8 @@ pub(crate) fn render_chat_preview(
         && !config.tts.api_key.trim().is_empty();
     let command_enabled = chat.allow_commands;
 
-    let mut system_parts = ai_chat::response_system_prompt_parts(
-        chat,
-        look_enabled,
-        speak_enabled,
-        command_enabled,
-    );
+    let mut system_parts =
+        ai_chat::response_system_prompt_parts(chat, look_enabled, speak_enabled, command_enabled);
     if config.emoji.ai_enabled && !config.emoji.ai_allowed.is_empty() {
         let catalog = crate::features::emoji::ai_prompt_catalog(&config.emoji.ai_allowed);
         system_parts.push(PromptBlock {
@@ -80,10 +75,7 @@ pub(crate) fn render_chat_preview(
         .join("\n");
 
     let (context, hall) = match memory {
-        Some(memory) => (
-            memory.context(asker_key)?,
-            memory.hall_context(asker_key)?,
-        ),
+        Some(memory) => (memory.context(asker_key)?, memory.hall_context(asker_key)?),
         None => (
             ChatContext {
                 facts: Vec::new(),
@@ -119,7 +111,6 @@ pub(crate) fn render_chat_preview(
         tools.push("look");
     }
     let tools_json = serde_json::to_string(&tools)?;
-
 
     let system_chars = system.chars().count();
     let tail_chars = tail.chars().count();
@@ -176,7 +167,8 @@ mod tests {
         let speak = config.tts.enabled
             && config.tts.trigger_scope == crate::features::tts::TtsTriggerScope::AiChat
             && !config.tts.api_key.trim().is_empty();
-        let expected = ai_chat::response_system_prompt_with_tools(chat, look, speak, chat.allow_commands);
+        let expected =
+            ai_chat::response_system_prompt_with_tools(chat, look, speak, chat.allow_commands);
         let payload = render_chat_preview(&config, None, "预览玩家", "预览玩家", "问题").unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["system"].as_str().unwrap(), expected);
@@ -254,7 +246,10 @@ mod tests {
                 .any(|block| block["name"].as_str().unwrap_or("").contains("bot_history")),
             "blocks 不应再有 bot_history 块: {blocks:?}"
         );
-        assert!(!tail.contains("大厅近期机器人发言"), "独立 Bot 块已删除: {tail}");
+        assert!(
+            !tail.contains("大厅近期机器人发言"),
+            "独立 Bot 块已删除: {tail}"
+        );
     }
 
     /// 预览必须用 canonical key 查记忆，display 只用于 asker 文案。
@@ -295,6 +290,11 @@ mod tests {
         assert_eq!(value["draft"], true);
         assert!(!value["warnings"].as_array().unwrap().is_empty());
         assert!(value["totals"]["stablePrefixBytes"].as_u64().unwrap() > 0);
-        assert!(!value["totals"]["prefixFingerprint"].as_str().unwrap().is_empty());
+        assert!(
+            !value["totals"]["prefixFingerprint"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

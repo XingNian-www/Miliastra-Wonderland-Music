@@ -14,7 +14,10 @@ mod lifecycle;
 mod listener;
 mod moderation;
 mod playback;
-#[allow(dead_code)]
+// Linux 非测试库构建下，本模块的条目只从 Windows 生产入口 `run()` 可达；
+// 生产（Windows）与测试（`cfg(test)`）构建仍然逐条检查 `dead_code`。
+// 口径与理由见 `src/lib.rs` 顶部「跨平台 dead_code 口径」。
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
 mod secondary_chat;
 mod shared_observer;
 mod song_request_port;
@@ -67,8 +70,8 @@ use crate::features::playback::{
     QueueItem, SongDedupCandidate, has_restorable_playback_progress,
 };
 use crate::features::song_request::{
-    AiClient, ResolvedSongRequest, SongCommand, SongRequestApplication, SongRequestContext,
-    SongRequestDecision, SongReviewClient,
+    AiClient, ResolvedSongRequest, SongRequestApplication, SongRequestContext, SongRequestDecision,
+    SongReviewClient,
 };
 use crate::features::startup::{StartupService, StartupSource, StartupTask, StartupTaskKind};
 use crate::features::turtle_soup::{
@@ -87,8 +90,7 @@ use crate::observation::chat::{
     ChatScanTelemetry, ChatScanTelemetrySink, CompletionAdvanceSubscriber, ObservedFrame,
     PrimaryObservedMessage, ResolvedTemplateArgs, SecondaryChatIdentity, SecondaryChatObservation,
     SecondaryHallBubble, SecondaryObservedMessage, TemplateArgs, UnreadFriendHit,
-    count_chat_markers, find_unread_friend_hits, hall_bubble_sequence_is_retained_prefix,
-    hall_bubble_sequence_overlap, latest_incoming_fingerprint, prepare_chat_scan,
+    count_chat_markers, find_unread_friend_hits, latest_incoming_fingerprint, prepare_chat_scan,
     prepare_chat_scan_with_markers, recognize_prepared_chat,
 };
 use crate::observation::decision::DecisionScreenLock;
@@ -563,7 +565,7 @@ enum ShutdownReason {
 }
 
 #[derive(Clone, Debug)]
-struct ShutdownState {
+pub(in crate::composition) struct ShutdownState {
     reason: Arc<AtomicU8>,
 }
 
@@ -674,7 +676,7 @@ impl ReloadStartupActions {
 /// 正式任务通过重建的应用 facade 执行，因此该状态必须与所属运行时分开共享。
 /// 单个子进程生命周期内成功动作只增不减；失败动作保持未完成，由监听器冷却后重试。
 #[derive(Clone, Debug, Default)]
-struct ReloadStartupGate {
+pub(in crate::composition) struct ReloadStartupGate {
     required: Arc<AtomicU8>,
     completed: Arc<AtomicU8>,
 }
@@ -864,7 +866,7 @@ impl FormalTaskExecutionContext {
 }
 
 #[derive(Clone)]
-struct BusinessPlaybackStateAdapter {
+pub(in crate::composition) struct BusinessPlaybackStateAdapter {
     business: BusinessRuntimeHandle,
 }
 
@@ -1003,7 +1005,7 @@ impl PlaybackStatePort for BusinessPlaybackStateAdapter {
 }
 
 #[derive(Clone)]
-struct WindowDetectionSignal {
+pub(in crate::composition) struct WindowDetectionSignal {
     inner: Arc<(Mutex<u64>, Condvar)>,
 }
 
@@ -2150,6 +2152,11 @@ fn secondary_hall_sequence_delta(
     previous: Option<&[SecondaryHallBubble]>,
     current: &[SecondaryHallBubble],
 ) -> SecondaryHallSequenceDelta {
+    // 只被本文件的单测使用：放在函数内导入，生产构建不引入未用的导入。
+    use crate::observation::chat::{
+        hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap,
+    };
+
     let Some(previous) = previous else {
         return SecondaryHallSequenceDelta::EstablishBaseline;
     };

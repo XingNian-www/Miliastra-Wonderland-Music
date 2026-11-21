@@ -60,7 +60,7 @@ impl RepeatWarn {
 /// 并发语义与原来一致：启动前先 `reap` 回收自然结束的线程；判断与登记在
 /// 同一把锁里完成（`spawn` 也在锁内），并发触发时只有一条线程会被创建。
 /// `Drop` 兜底停掉仍在跑的那条，绝不留下野线程。
-pub(super) struct BackgroundLyricsWorker {
+pub(crate) struct BackgroundLyricsWorker {
     inner: Arc<BackgroundLyricsWorkerInner>,
 }
 
@@ -1195,12 +1195,18 @@ mod tests {
     fn long_worker_wait_stops_promptly_after_shutdown_signal() {
         let running = Arc::new(AtomicBool::new(true));
         let shutdown = Arc::clone(&running);
+        // 就位信号：worker 已经在 `interruptible_sleep` 里开始等待（或还没，都不影响
+        // 结论），主线程拿到信号后再置停止标志——不再固定睡 20ms 去猜它跑起来了。
+        let (entered_tx, entered_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
+            let _ = entered_tx.send(());
             interruptible_sleep(Duration::from_secs(60), || {
                 shutdown.load(AtomicOrdering::SeqCst)
             })
         });
-        thread::sleep(Duration::from_millis(20));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("interruptible wait worker started");
         running.store(false, AtomicOrdering::SeqCst);
 
         assert!(!worker.join().expect("interruptible wait worker"));

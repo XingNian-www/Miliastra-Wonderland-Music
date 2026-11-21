@@ -5,6 +5,10 @@
 //! - 占位符形如 {歌名}；渲染顺序是先渲染模板，再把已渲染的变量值填入。
 //! - AI 生成文本只作为变量值注入，绝不参与模板解析，避免 AI 输出里的花括号被误当占位符。
 //! - 未知占位符原样保留（便于排查）；已知但缺失的变量替换为空串并上报。
+//!
+//! 可见性口径：`ReplyTemplate` / `ReplyVars` 是 **crate 内部**的渲染契约（只有
+//! `features` 与 `composition` 两层构造它们，面向前端的只是渲染后的文本与模板键），
+//! 因此是 `pub(crate)`。
 
 use std::collections::BTreeMap;
 
@@ -724,12 +728,8 @@ pub(crate) fn render(
 /// 因此不会被误删。
 ///
 /// 新增条目时务必逐字复制旧默认值（含标点与空格），否则匹配不上、等于没登记。
-const LEGACY_DEFAULTS: &[(&str, &[&str])] = &[
-    (
-        "song.queue.added",
-        &["{前缀}({当前}/{上限}): {歌名}"],
-    ),
-];
+const LEGACY_DEFAULTS: &[(&str, &[&str])] =
+    &[("song.queue.added", &["{前缀}({当前}/{上限}): {歌名}"])];
 
 /// 该 key 在库里存的值是否只是某个历史默认值。
 fn is_legacy_default(key: &str, text: &str) -> bool {
@@ -1267,7 +1267,11 @@ mod tests {
     /// 线上玩家看到的仍是旧形态，根因就在这里。
     #[test]
     fn stored_override_ignores_a_row_that_still_holds_the_old_default() {
-        let stored = stored_under("@QQ点歌", "song.queue.added", "{前缀}({当前}/{上限}): {歌名}");
+        let stored = stored_under(
+            "@QQ点歌",
+            "song.queue.added",
+            "{前缀}({当前}/{上限}): {歌名}",
+        );
         assert_eq!(stored_override(&stored, "song.queue.added"), None);
     }
 

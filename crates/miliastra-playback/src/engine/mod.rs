@@ -46,6 +46,8 @@ pub(crate) enum EngineCommand {
     /// `PlaybackSnapshot.volume`、不发布快照、不落库，因此 `@状态`/状态栏
     /// 显示的音量保持不变（符合「不回显示」）。
     /// 目前由上层（task-49 TTS 编排）通过引擎命令通道构造；本 crate 内暂无调用点。
+    // 保留：`SetDuckGain` 是上层 TTS 编排写入的引擎命令契约；本 crate 内没有构造点
+    // （定义处注释已说明），因此这里的 allow 是**跨 crate 契约**而不是遗留噪音。
     #[allow(dead_code)]
     SetDuckGain {
         gain: u8,

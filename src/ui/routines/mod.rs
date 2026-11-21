@@ -14,11 +14,11 @@ pub(crate) use custom_action::{CustomActionPlan, CustomActionUi};
 // 先在这里导出，避免接入方跨私有模块路径取类型。
 #[allow(unused_imports)]
 pub(crate) use friend_delivery::{
-    CapturedPrimaryOutcome, EmojiCatalogScanOutcome, EmojiCatalogUi, EmojiTabScan, EstablishResidency,
-    FriendDelivery, FriendDeliveryMessageStatus,
-    FriendDeliveryRoutineConfig, FriendDeliveryRoutineConfigSource, FriendDeliveryUi,
-    HallBatchStatus, HallBatchUi, ResidencyUi, SendFriendDeliveries, SendHallBatch,
-    UiResidencyOutcome, UiResidencyTarget, highlighted_conversation_row,
+    CapturedPrimaryOutcome, EmojiCatalogScanOutcome, EmojiCatalogUi, EmojiTabScan,
+    EstablishResidency, FriendDelivery, FriendDeliveryMessageStatus, FriendDeliveryRoutineConfig,
+    FriendDeliveryRoutineConfigSource, FriendDeliveryUi, HallBatchStatus, HallBatchUi, ResidencyUi,
+    SendFriendDeliveries, SendHallBatch, UiResidencyOutcome, UiResidencyTarget,
+    highlighted_conversation_row,
 };
 pub(crate) use hall::{
     DetectPublicHall, DetectPublicHallEffect, HallRoutineConfig, HallUi, ReadHallInfo,
@@ -41,16 +41,16 @@ pub(crate) use residency::{
     ConversationRef, RecoveryFailure, RecoveryReport, ResidencyTarget, SettleEnvironment,
     SettleOptions, settle_to,
 };
-#[allow(unused_imports)]
-pub(crate) use transaction::{
-    EntryPolicy, EntryUiState, FinishPolicy, FinishReport, UiTask, UiTaskOutcome, UiTaskSpec,
-};
 pub(crate) use startup::{
     EnterGame, EnterGameEffect, EnterWonderland, EnterWonderlandEffect, StartupRoutineConfig,
     StartupUi, StartupUiConfig, StartupUiTemplates,
+};
+#[allow(unused_imports)]
+pub(crate) use transaction::{
+    EntryPolicy, EntryUiState, FinishPolicy, FinishReport, UiTask, UiTaskOutcome, UiTaskSpec,
 };
 
 // 仅测试用的重导出：`src/ui/state.rs` 的证据画廊诊断需要把真实分类结果映射成
 // `UiSurface`，而 `state_observation` 模块本身对兄弟模块私有。生产路径不引用它。
 #[cfg(test)]
-pub(crate) use state_observation::{UiSurface as TestUiSurface, surface_of as test_surface_of};
+pub(crate) use state_observation::surface_of as test_surface_of;

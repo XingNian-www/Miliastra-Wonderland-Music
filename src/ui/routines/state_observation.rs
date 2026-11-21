@@ -67,19 +67,6 @@ pub(super) fn wait_for_stable_ui_kind(
     )
 }
 
-pub(super) fn wait_for_stable_ui_kind_or_unknown(
-    context: &mut UiRoutineContext<'_>,
-    config: UiStateObservationConfig,
-    expected: Option<UiStateKind>,
-    timeout_ms: u64,
-    stage: &'static str,
-    certainty: InputCertainty,
-) -> Result<UiStateKind, UiRoutineFailure> {
-    wait_for_stable_ui_kind_internal(
-        context, config, expected, timeout_ms, stage, certainty, true,
-    )
-}
-
 fn wait_for_stable_ui_kind_internal(
     context: &mut UiRoutineContext<'_>,
     config: UiStateObservationConfig,
@@ -190,16 +177,6 @@ impl UiStateSnapshot {
             self.candidate_count,
             self.required_count
         )
-    }
-
-    /// 是否为千星奇域主菜单（由「返回提瓦特」模板判出）。
-    pub(super) fn is_wonderland_main_menu(&self) -> bool {
-        self.kind == UiStateKind::MainMenu && self.final_rule == "main_menu_template"
-    }
-
-    /// 是否为主菜单大世界（ESC 系统菜单）：它复用主菜单状态，但绝不是大厅菜单。
-    pub(super) fn is_paimon_menu(&self) -> bool {
-        self.kind == UiStateKind::MainMenu && self.final_rule == "paimon_menu_grid"
     }
 }
 
@@ -473,9 +450,13 @@ mod tests {
     #[test]
     fn secondary_labels_map_to_full_surface_names() {
         assert_eq!(
-            snapshot(UiStateKind::Secondary, "secondary:chat", "secondary_chat_anchor")
-                .surface()
-                .chinese_name(),
+            snapshot(
+                UiStateKind::Secondary,
+                "secondary:chat",
+                "secondary_chat_anchor"
+            )
+            .surface()
+            .chinese_name(),
             "二级聊天"
         );
         // 兼容 task-102 前后两种界面 label 命名。
@@ -495,18 +476,9 @@ mod tests {
             ("panel:friend_list", "覆盖层·好友面板"),
             ("panel:add_friend", "覆盖层·搜索页"),
             ("panel:more_settings", "覆盖层·更多设置"),
-            (
-                "panel:confirm_enter_hall",
-                "覆盖层·确认弹窗·进入随机大厅",
-            ),
-            (
-                "panel:confirm_leave_hall",
-                "覆盖层·确认弹窗·离开大厅",
-            ),
-            (
-                "panel:confirm_block_player",
-                "覆盖层·确认弹窗·屏蔽玩家",
-            ),
+            ("panel:confirm_enter_hall", "覆盖层·确认弹窗·进入随机大厅"),
+            ("panel:confirm_leave_hall", "覆盖层·确认弹窗·离开大厅"),
+            ("panel:confirm_block_player", "覆盖层·确认弹窗·屏蔽玩家"),
             ("panel:archive_card", "覆盖层·档案卡"),
             (
                 "panel:teyvat_profile_nonfriend",
@@ -534,11 +506,7 @@ mod tests {
     fn main_menu_branches_are_distinguished_by_return_to_teyvat_rule() {
         let wonderland = snapshot(UiStateKind::MainMenu, "main_menu", "main_menu_template");
         assert_eq!(wonderland.surface(), UiSurface::WonderlandMainMenu);
-        let paimon = snapshot(
-            UiStateKind::MainMenu,
-            "main_menu",
-            "paimon_menu_grid",
-        );
+        let paimon = snapshot(UiStateKind::MainMenu, "main_menu", "paimon_menu_grid");
         assert_eq!(paimon.surface(), UiSurface::PaimonMenu);
         // 主菜单千星与主菜单大世界共用返回按钮；判据永远不能靠商城按钮之外的模糊规则冒充。
         assert_ne!(
@@ -556,9 +524,13 @@ mod tests {
             "加载界面"
         );
         assert_eq!(
-            snapshot(UiStateKind::Overworld, "overworld", "overworld_world_criterion")
-                .surface()
-                .chinese_name(),
+            snapshot(
+                UiStateKind::Overworld,
+                "overworld",
+                "overworld_world_criterion"
+            )
+            .surface()
+            .chinese_name(),
             "提瓦特大世界"
         );
         assert_eq!(

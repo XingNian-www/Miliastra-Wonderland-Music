@@ -1284,13 +1284,31 @@ mod tests {
         let (mut service, mut entertainment) = service();
         let now = now();
         service
-            .handle_command(&mut entertainment, "p1", "甲", &NumberBombCommand::Start, now)
+            .handle_command(
+                &mut entertainment,
+                "p1",
+                "甲",
+                &NumberBombCommand::Start,
+                now,
+            )
             .unwrap();
         service
-            .handle_command(&mut entertainment, "p2", "乙", &NumberBombCommand::Join, now)
+            .handle_command(
+                &mut entertainment,
+                "p2",
+                "乙",
+                &NumberBombCommand::Join,
+                now,
+            )
             .unwrap();
         service
-            .handle_command(&mut entertainment, "p1", "甲", &NumberBombCommand::StartGame, now)
+            .handle_command(
+                &mut entertainment,
+                "p1",
+                "甲",
+                &NumberBombCommand::StartGame,
+                now,
+            )
             .unwrap();
 
         // 猜 63（保持原样）后下界收窄为 64：区间里的 64 必须显示成 064。

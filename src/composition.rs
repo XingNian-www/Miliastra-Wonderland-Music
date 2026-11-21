@@ -74,7 +74,11 @@ pub(crate) fn run(config_path: &Path) -> Result<RunOutcome> {
         "HTTP/Web 面板监听 {}:{}，面板{}",
         app_config.http.host,
         app_config.http.port,
-        if app_config.http.enabled { "已启用" } else { "已禁用" }
+        if app_config.http.enabled {
+            "已启用"
+        } else {
+            "已禁用"
+        }
     );
     log::info!(
         "原生播放器凭据目录 {}, 登录助手可执行文件 {}",

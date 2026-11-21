@@ -6,6 +6,8 @@ use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
     capture_normalized, friend_list_drag_points, wait_ms,
 };
+use super::residency::{ResidencyTarget, SettleEnvironment};
+use super::transaction::{ActivationPolicy, FinishPolicy, UiTask, UiTaskSpec};
 #[cfg(test)]
 use crate::config::AppConfig;
 use crate::config::{HallTimingConfig, OcrConfig, ScreenConfig};
@@ -14,10 +16,6 @@ use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
-};
-use super::residency::{ResidencyTarget, SettleEnvironment};
-use super::transaction::{
-    ActivationPolicy, EntryPolicy, FinishPolicy, UiTask, UiTaskSpec,
 };
 use crate::text::normalize_comparison_text as normalize_lock_text;
 use crate::ui::locator::{
@@ -223,9 +221,7 @@ impl UiRoutine for ReadHallInfoRoutine {
                 Ok((info, screenshot)) => (ReadHallInfoEffect::Read(info), Some(screenshot)),
                 Err(failure) => (ReadHallInfoEffect::Failed(failure), None),
             };
-        if opened
-            && let Err(error) = close_hall_page(context)
-        {
+        if opened && let Err(error) = close_hall_page(context) {
             log::warn!("关闭大厅信息页失败，交给 UiTask 收尾恢复界面：{error}");
         }
         ReadHallInfoOutcome {
@@ -258,9 +254,7 @@ impl UiRoutine for DetectPublicHallRoutine {
             }
             Err(failure) => DetectPublicHallEffect::Failed(failure),
         };
-        if opened
-            && let Err(error) = close_hall_page(context)
-        {
+        if opened && let Err(error) = close_hall_page(context) {
             log::warn!("关闭大厅信息页失败，交给 UiTask 收尾恢复界面：{error}");
         }
         DetectPublicHallOutcome {
@@ -359,7 +353,9 @@ fn read_hall_info_transaction(
                 );
             }
         }
-        Ok(None) => log::debug!("大厅成员人数识别未得到结果，跳过成员列表滚动，按单屏内容继续读取大厅信息"),
+        Ok(None) => {
+            log::debug!("大厅成员人数识别未得到结果，跳过成员列表滚动，按单屏内容继续读取大厅信息")
+        }
         Err(failure) => log::warn!(
             "大厅成员人数识别失败（步骤：读取大厅成员人数），跳过成员列表滚动，成员列表可能显示不全；大厅名称与剩余时间仍会照常读取：{failure}"
         ),
@@ -556,8 +552,7 @@ impl UiRoutine for ReadHallInfoTask {
     type Output = ReadHallInfoOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment =
-            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
         let activate_wait_ms = self.config.residency.after_activate_ms;
         let outcome = UiTask::new(
             hall_task_spec(environment, activate_wait_ms),
@@ -603,8 +598,7 @@ impl UiRoutine for DetectPublicHallTask {
     type Output = DetectPublicHallOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment =
-            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
         let activate_wait_ms = self.config.residency.after_activate_ms;
         let outcome = UiTask::new(
             hall_task_spec(environment, activate_wait_ms),
@@ -649,8 +643,7 @@ impl UiRoutine for ToggleMicrophoneTask {
     type Output = ToggleMicrophoneOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment =
-            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
         let activate_wait_ms = self.config.residency.after_activate_ms;
         let outcome = UiTask::new(
             hall_task_spec(environment, activate_wait_ms),
@@ -1095,7 +1088,10 @@ mod tests {
             "{:?}",
             outcome.residency()
         );
-        assert_eq!(*keys.lock().unwrap(), [Key::Escape, Key::Unicode('n'), Key::Return]);
+        assert_eq!(
+            *keys.lock().unwrap(),
+            [Key::Escape, Key::Unicode('n'), Key::Return]
+        );
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }

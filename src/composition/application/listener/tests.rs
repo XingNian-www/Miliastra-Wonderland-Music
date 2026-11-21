@@ -10,7 +10,7 @@ use super::chat_routing::{
     chat_listener_mode_dispatch, complete_secondary_claim,
 };
 use super::display::{normalize_chat_text, ui_state_display_label};
-use super::loop_driver::{chat_listener_mode_path, screen_size_warning_enabled};
+use super::loop_driver::screen_size_warning_enabled;
 use super::recovery_guard::{automatic_startup_task, game_location_probe_blocks_residency};
 use super::*;
 

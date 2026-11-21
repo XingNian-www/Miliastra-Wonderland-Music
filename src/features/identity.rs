@@ -256,10 +256,6 @@ impl AiNamePair {
             .as_deref()
             .unwrap_or_else(|| self.real_nickname.trim())
     }
-
-    pub(crate) fn is_remark(&self) -> bool {
-        self.remark.is_some()
-    }
 }
 
 /// 末端脱敏：只删除完整的已知 remark 字符串，不按单字模糊删除。
@@ -375,9 +371,7 @@ impl IdentityAccess {
                     display_name: display,
                 }
             };
-            let cost = pair.left().chars().count()
-                + pair.effective_display().chars().count()
-                + 32;
+            let cost = pair.left().chars().count() + pair.effective_display().chars().count() + 32;
             if total_chars.saturating_add(cost) > AI_NAME_PAIR_TOTAL_CHARS {
                 break;
             }
@@ -812,7 +806,10 @@ impl IdentityAccess {
     /// 显示名与真实昵称都允许重名，猜错就是把私聊发给另一个人。
     #[allow(clippy::result_unit_err)]
     fn resolve_by_any_name(&self, name: &str) -> std::result::Result<Option<ResolvedIdentity>, ()> {
-        fn count(mappings: &[IdentityMapping], predicate: impl Fn(&IdentityMapping) -> bool) -> usize {
+        fn count(
+            mappings: &[IdentityMapping],
+            predicate: impl Fn(&IdentityMapping) -> bool,
+        ) -> usize {
             mappings.iter().filter(|mapping| predicate(mapping)).count()
         }
         let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
@@ -1139,7 +1136,10 @@ mod tests {
         assert_eq!(names, vec!["玩家丙".to_string()], "搜索名应只含备注串");
         // 软件显示名只做文案，**不能**拿去搜好友列表。
         assert!(!names.iter().any(|name| name == "厅主"), "显示名不参与搜索");
-        assert!(!names.iter().any(|name| name == "900000001"), "UID 不参与搜索");
+        assert!(
+            !names.iter().any(|name| name == "900000001"),
+            "UID 不参与搜索"
+        );
     }
 
     /// 未登记的 UID 拿不到任何候选名：调用方应回退到信封主语并在进 UI 前告警。
@@ -1161,7 +1161,10 @@ mod tests {
         // 未登记玩家：屏幕上看到的名字可以原样展示。
         assert_eq!(access.player_name("陌生人", None), "陌生人");
         // 内部键不行：UID 与 UUID 对玩家没有意义，换成占位。
-        assert_eq!(access.player_name("900000001", None), PLAYER_NAME_PLACEHOLDER);
+        assert_eq!(
+            access.player_name("900000001", None),
+            PLAYER_NAME_PLACEHOLDER
+        );
         assert_eq!(
             access.player_name("00000000-0000-4000-8000-000000000001", None),
             PLAYER_NAME_PLACEHOLDER
@@ -1182,7 +1185,10 @@ mod tests {
             accounts: Vec::new(),
         });
         let access = IdentityAccess::new(config);
-        assert!(access.resolve("abcd1234").is_some(), "存下来的空白不该影响匹配");
+        assert!(
+            access.resolve("abcd1234").is_some(),
+            "存下来的空白不该影响匹配"
+        );
         // 输入侧仍精确：多一个尾空格就不匹配（既有语义）。
         assert!(access.resolve("abcd1234 ").is_none());
     }
@@ -1308,15 +1314,24 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.remark, "甲", "旧 nickname 读进 remark");
         assert_eq!(legacy.display_name, "显示名甲", "旧 note 读进 display_name");
-        assert!(legacy.remark_from_chatbridge, "旧 remark_sourced 读进新标记");
+        assert!(
+            legacy.remark_from_chatbridge,
+            "旧 remark_sourced 读进新标记"
+        );
         assert!(legacy.real_nickname.is_empty(), "旧配置没有真实昵称");
 
         let without_display: IdentityMapping = serde_json::from_str(
             r#"{"nickname":"甲","id":"00000000-0000-0000-0000-000000000001","role":"friend"}"#,
         )
         .unwrap();
-        assert!(without_display.display_name.is_empty(), "缺 display_name 按空串处理");
-        assert!(without_display.real_nickname.is_empty(), "缺 real_nickname 按空串处理");
+        assert!(
+            without_display.display_name.is_empty(),
+            "缺 display_name 按空串处理"
+        );
+        assert!(
+            without_display.real_nickname.is_empty(),
+            "缺 real_nickname 按空串处理"
+        );
 
         let invalid_id = serde_json::from_str::<IdentityMapping>(
             r#"{"nickname":"甲","id":"invalid","role":"friend"}"#,
@@ -1524,10 +1539,12 @@ mod tests {
             "手填备注",
             "API 未覆盖前手填值保留"
         );
-        assert!(handfilled_access
-            .ai_name_pairs()
-            .iter()
-            .any(|pair| pair.left() == "手填备注"));
+        assert!(
+            handfilled_access
+                .ai_name_pairs()
+                .iter()
+                .any(|pair| pair.left() == "手填备注")
+        );
         assert!(handfilled_access.clear_account_remark("genshin", "20001"));
         assert!(handfilled_access.snapshot().mappings[0].remark.is_empty());
 
@@ -1620,7 +1637,6 @@ mod tests {
         assert_eq!(access.memory_key("陌生人"), "陌生人");
     }
 
-
     /// 归属专用解析：note（游戏真名）能解析出 UUID，但**不返回角色**。
     ///
     /// 实机故障：`@歌单` 窗口里 `@1`~`@5` 选歌失败，日志显示
@@ -1700,8 +1716,8 @@ mod tests {
             "UID 未登记时不得回退昵称或 note"
         );
     }
+
     /// 好友列表候选名以显示昵称为先。
-    #[test]
     #[test]
     fn search_names_resolve_by_identity_key_not_just_names() {
         let mut config = IdentityConfig::default();
@@ -1721,9 +1737,11 @@ mod tests {
         let by_key = access.friend_search_names(&id.to_string(), None);
         assert_eq!(by_key, vec!["示例备注B".to_owned(), "真名甲".to_owned()]);
         assert!(access.friend_search_names("", None).is_empty());
-        assert!(access
-            .friend_search_names("00000000-0000-4000-8000-0000000000ff", None)
-            .is_empty());
+        assert!(
+            access
+                .friend_search_names("00000000-0000-4000-8000-0000000000ff", None)
+                .is_empty()
+        );
     }
 
     #[test]

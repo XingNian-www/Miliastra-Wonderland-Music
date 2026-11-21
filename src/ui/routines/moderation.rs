@@ -3,16 +3,18 @@ use std::time::{Duration, Instant};
 
 use enigo::Key;
 
+#[cfg(test)]
+use super::friend_delivery::UiResidencyTarget;
 use super::friend_delivery::{
-    FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
-    before_input_failure, capture_normalized, wait_ms,
+    FriendDeliveryRoutineConfig, UiResidencyOutcome, after_input_failure, before_input_failure,
+    capture_normalized, wait_ms,
 };
 use super::residency::{ResidencyTarget, SettleEnvironment};
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskOutcome, UiTaskSpec};
 use crate::geometry::{Point, Rect};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
-    UiStateObservation, UiSubmitError, sealed,
+    UiSubmitError, sealed,
 };
 use crate::ui::template::{best_template_hit, template_exists};
 
@@ -180,8 +182,10 @@ impl UiRoutine for ExecuteModerationRoutine {
             request: self.request,
             config: self.config,
         };
-        let outcome: UiTaskOutcome<ModerationEffect> =
-            UiRoutine::execute(UiTask::new(moderation_task_spec(environment), inner), context);
+        let outcome: UiTaskOutcome<ModerationEffect> = UiRoutine::execute(
+            UiTask::new(moderation_task_spec(environment), inner),
+            context,
+        );
         let effect = outcome.output.unwrap_or_else(|| {
             ModerationEffect::Failed(outcome.entry_failure.clone().unwrap_or_else(|| {
                 UiRoutineFailure::new(
@@ -514,7 +518,10 @@ fn recoverable_panel_candidate(
         (&config.more_settings_template, config.more_settings_region),
         (&config.blacklist_template, config.blacklist_region),
         (&config.block_chat_template, config.block_chat_region),
-        (&config.confirm_button_template, config.confirm_button_region),
+        (
+            &config.confirm_button_template,
+            config.confirm_button_region,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -531,20 +538,19 @@ fn recoverable_panel_candidate(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
 
     use image::DynamicImage;
 
     use super::*;
-    use crate::runtime::ui::{
-        UiDevice, UiRoutine, UiRoutineContext, UiRoutineFailure, UiStateClassification,
-        UiStateClassifier, UiStateEvidence, UiStateKind, execute_routine_for_test,
-        sealed::UiRoutineSealed,
-    };
     use crate::config::AppConfig;
+    use crate::runtime::ui::{
+        UiDevice, UiRoutine, UiRoutineContext, UiStateClassification, UiStateClassifier,
+        UiStateEvidence, UiStateKind, execute_routine_for_test, sealed::UiRoutineSealed,
+    };
     use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
-    use crate::ui::routines::transaction::{FinishPolicy, UiTask, UiTaskOutcome};
+    use crate::ui::routines::transaction::{UiTask, UiTaskOutcome};
     use std::path::Path;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -596,10 +602,7 @@ mod tests {
     }
 
     impl UiStateClassifier for ScriptedClassifier {
-        fn classify(
-            &mut self,
-            _image: &DynamicImage,
-        ) -> anyhow::Result<UiStateClassification> {
+        fn classify(&mut self, _image: &DynamicImage) -> anyhow::Result<UiStateClassification> {
             let index = self.index.min(self.states.len() - 1);
             self.index += 1;
             Ok(self.states[index].clone())
@@ -661,7 +664,10 @@ mod tests {
         // 管理操作只允许从一级界面开始；二级（玩家会话）上必须零按键拒绝。
         let script = vec![state(UiStateKind::Secondary); 4];
         let (outcome, device) = run_task(script);
-        assert!(device.keys().is_empty(), "入口不满足时不允许按 Esc 退出玩家会话");
+        assert!(
+            device.keys().is_empty(),
+            "入口不满足时不允许按 Esc 退出玩家会话"
+        );
         assert!(outcome.output.is_none());
         let failure = outcome.entry_failure.as_ref().expect("entry failure");
         assert_eq!(failure.certainty(), InputCertainty::BeforeInput);
@@ -683,7 +689,10 @@ mod tests {
     fn panel_closes_then_returns_primary() {
         let mut script = vec![state(UiStateKind::Primary), state(UiStateKind::Primary)];
         script.extend(vec![state(UiStateKind::Panel), state(UiStateKind::Panel)]);
-        script.extend(vec![state(UiStateKind::Primary), state(UiStateKind::Primary)]);
+        script.extend(vec![
+            state(UiStateKind::Primary),
+            state(UiStateKind::Primary),
+        ]);
         let (outcome, device) = run_task(script);
         assert_eq!(device.keys(), vec![enigo::Key::Escape]);
         assert!(matches!(

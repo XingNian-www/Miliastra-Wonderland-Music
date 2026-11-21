@@ -167,7 +167,9 @@ impl ConfigStore {
     }
 
     /// 在写事务内执行迁移，返回统计；任何错误都由调用方回滚整个事务。
-    pub(super) fn run_migration_transaction(
+    ///
+    /// 收口在 `upgrade` 内部：迁移统计只用于本模块的日志，对外只暴露「失败会回滚」。
+    fn run_migration_transaction(
         transaction: &rusqlite::Transaction,
         from_version: i64,
         timestamp: i64,

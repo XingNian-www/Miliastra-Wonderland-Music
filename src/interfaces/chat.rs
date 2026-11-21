@@ -27,7 +27,6 @@ use crate::features::undercover::UndercoverCommand;
 
 mod router;
 
-pub(crate) use crate::features::command::ChatCommandModule;
 pub(crate) use router::ChatCommandRouter;
 
 #[derive(Clone, Debug)]

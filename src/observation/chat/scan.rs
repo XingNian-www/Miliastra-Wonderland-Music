@@ -1,6 +1,7 @@
 //! Stateless per-frame chat recognition. Message identity belongs to the timeline.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
@@ -15,22 +16,90 @@ use crate::ui::template::{TemplateHit, dedupe_hits, find_color_template_hit_grou
 
 const CHAT_SCAN_RESULT_LOG_TARGET: &str = "chat_scan_result";
 
-/// 上一次写入 info 的扫描结果，用于抑制内容未变化时的重复记录。
-static LAST_LOGGED_SCAN_RESULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-/// 记录本次扫描结果并返回是否需要以 info 级别输出。
+/// 进程级去重器与它当前的「窗口」编号。
 ///
-/// 聊天扫描是每秒一次级别的循环，逐次打印整段气泡文本会让文件日志按扫描次数膨胀；
-/// 只有内容真的变化时才值得留一条可追溯记录。
-fn remember_scan_result_for_log(scan_result: &str) -> bool {
-    let mut last = LAST_LOGGED_SCAN_RESULT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if last.as_deref() == Some(scan_result) {
-        return false;
+/// 测试每取一次新的窗口就推进会窗口编号：去重器随即丢弃旧内容、从空窗口重新开始，
+/// 用例之间因此互不串味；生产路径的窗口编号永远是 0。
+static SCAN_LOG_DEDUP: OnceLock<(ScanLogDedup, std::sync::atomic::AtomicU64)> = OnceLock::new();
+
+fn scan_log_dedup() -> (&'static ScanLogDedup, u64) {
+    let (dedup, window) =
+        SCAN_LOG_DEDUP.get_or_init(|| (ScanLogDedup::new(), std::sync::atomic::AtomicU64::new(0)));
+    (dedup, window.load(std::sync::atomic::Ordering::Acquire))
+}
+
+/// 扫描结果日志的进程级去重器。
+///
+/// 为什么是进程级：抑制的是**日志**的重复，而日志文件是进程级的——同一进程里
+/// 所有扫描（大厅观察线程、`/tools/scan-chat` 诊断）写同一个文件，各自各记一份
+/// 会让同一段文本重复出现。
+///
+/// 为什么不挂在调用方：扫描层是刻意无状态的（见模块文档），调用方（观察线程、
+/// 诊断服务）也不该为了日志去持有可变状态；把抑制器做成入参又等于让每个调用点
+/// 自己定义日志语义。去重只需要「上次记过什么」这一份事实，进程内共享才是它的
+/// 真实语义。
+struct ScanLogDedup {
+    /// 比较与落账在同一个临界区里完成：两帧同时到达时，恰好一帧判定为「有变化」。
+    last: std::sync::Mutex<Option<String>>,
+    /// 上一次落账时的窗口编号（生产恒为 0）。
+    window: std::sync::atomic::AtomicU64,
+}
+
+impl ScanLogDedup {
+    const fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(None),
+            window: std::sync::atomic::AtomicU64::new(0),
+        }
     }
-    *last = Some(scan_result.to_owned());
-    true
+
+    /// 记录一次扫描结果，返回它是不是「自上次记录以来第一次出现」。
+    fn record(&self, scan_result: &str, window: u64) -> bool {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 窗口号变化表示「换了一份新的去重窗口」：旧内容必须丢弃，不能让它把
+        // 新窗口里的第一帧误判成「与上次相同」。
+        if self.window.load(std::sync::atomic::Ordering::Acquire) != window {
+            self.window
+                .store(window, std::sync::atomic::Ordering::Release);
+            *last = None;
+        }
+        if last.as_deref() == Some(scan_result) {
+            return false;
+        }
+        *last = Some(scan_result.to_owned());
+        true
+    }
+}
+
+/// 记录本次扫描结果，返回它是否应该以「有变化」的文案记录。
+///
+/// 聊天扫描是每秒一次级别的循环，逐次打印整段气泡文本会让文件日志按扫描次数
+/// 膨胀；只有内容真的变化时才值得留一条可追溯记录。
+//
+// 调用方在 `composition`（大厅观察线程与 `/tools/scan-chat` 诊断）；那一层当前
+// 无法参与构建时这里看起来“没人用”，但删掉会让真正的接线断开，因此显式标注意图。
+#[cfg_attr(not(test), allow(dead_code))]
+fn remember_scan_result_for_log(scan_result: &str) -> bool {
+    let (dedup, window) = scan_log_dedup();
+    dedup.record(scan_result, window)
+}
+
+/// 开一份全新的去重窗口，返回去重器与窗口编号（测试用）。
+///
+/// 用例因此从「进程刚启动、还没记录过任何扫描」的状态开始，不会读到别的用例
+/// 留下的内容；它仍然覆盖真实的全局路径——并发用例在同一把锁上竞争。
+#[cfg(test)]
+fn fresh_scan_log_dedup() -> (&'static ScanLogDedup, u64) {
+    let (dedup, _) =
+        SCAN_LOG_DEDUP.get_or_init(|| (ScanLogDedup::new(), std::sync::atomic::AtomicU64::new(0)));
+    let next = dedup
+        .window
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        + 1;
+    (dedup, next)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -499,13 +568,71 @@ mod tests {
 
     #[test]
     fn scan_result_log_recorded_only_when_content_changes() {
-        // 内容未变时不重复写 info，变化后重新记录一次。
-        assert!(remember_scan_result_for_log("scan-dedup-a"));
-        assert!(!remember_scan_result_for_log("scan-dedup-a"));
-        assert!(remember_scan_result_for_log("scan-dedup-b"));
-        assert!(!remember_scan_result_for_log("scan-dedup-b"));
-        assert!(remember_scan_result_for_log(""));
-        assert!(!remember_scan_result_for_log(""));
+        // 生产入口固定落在进程级去重器上。这里开一份全新窗口，从「进程刚启动、
+        // 还没记录过任何扫描」开始断言，不会读到别的用例留下的内容。
+        let (dedup, window) = fresh_scan_log_dedup();
+        // 内容未变时不重复写，变化后重新记录一次。
+        assert!(dedup.record("scan-dedup-a", window));
+        assert!(!dedup.record("scan-dedup-a", window));
+        assert!(dedup.record("scan-dedup-b", window));
+        assert!(!dedup.record("scan-dedup-b", window));
+        // 内容变回旧值同样算「有变化」：日志要能反映此刻屏幕上的内容。
+        assert!(dedup.record("scan-dedup-a", window));
+        assert!(!dedup.record("scan-dedup-a", window));
+
+        // 空内容也是合法结果：空大厅必须记录一次，之后不重复。
+        assert!(dedup.record("", window));
+        assert!(!dedup.record("", window));
+
+        // 换一份新窗口等价于「进程重开」：同样的内容重新算作第一次。
+        // 这正是用例之间互不串味的来源。
+        let (fresh, next_window) = fresh_scan_log_dedup();
+        assert!(next_window > window, "开新窗口必须推进窗口编号");
+        assert!(fresh.record("scan-dedup-a", next_window));
+        assert!(!fresh.record("scan-dedup-a", next_window));
+
+        // 生产入口与去重器是同一份状态：连续两次上报同一内容，第一次算变化、
+        // 第二次必须被抑制——否则观察线程与诊断服务会各自记一份相同的文本。
+        let first = remember_scan_result_for_log("scan-prod-entry");
+        assert!(first, "生产入口第一次上报新内容必须记录");
+        assert!(
+            !remember_scan_result_for_log("scan-prod-entry"),
+            "生产入口连续两次上报同一内容必须只记一次"
+        );
+    }
+
+    /// 并发扫描时，「同样的内容」只能有一次被判定为「有变化」。
+    ///
+    /// 生产里大厅观察线程与 `/tools/scan-chat` 诊断会同时扫描；若比较与落账
+    /// 不在同一个临界区，同一段文本会被两条日志各记一次。这里让 8 个线程同时
+    /// 报同一个全新内容，恰好一个线程拿到 true。
+    #[test]
+    fn concurrent_scan_results_record_a_shared_payload_exactly_once() {
+        let (dedup, window) = fresh_scan_log_dedup();
+        let barrier = std::sync::Barrier::new(8);
+        let recorded = std::sync::Mutex::new(Vec::<bool>::new());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let recorded = &recorded;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let changed = dedup.record("scan-concurrent", window);
+                    recorded
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(changed);
+                });
+            }
+        });
+        let recorded = recorded
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            recorded.iter().filter(|changed| **changed).count(),
+            1,
+            "同一内容并发上报时只能记一次：{recorded:?}"
+        );
     }
 
     #[test]

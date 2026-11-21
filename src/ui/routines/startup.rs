@@ -5,8 +5,8 @@ use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
     before_input_failure, capture_normalized, wait_ms,
 };
-use super::state_observation::wait_for_stable_ui_kind;
 use super::residency::{ResidencyTarget, SettleEnvironment};
+use super::state_observation::wait_for_stable_ui_kind;
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskSpec};
 use crate::adapters::game_path::resolve_game_executable;
 use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
@@ -376,8 +376,7 @@ impl UiRoutine for EnterGameTask {
     type Output = EnterGameOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment =
-            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
         let outcome = UiTask::new(
             enter_game_task_spec(environment),
             EnterGameRoutine {
@@ -409,8 +408,7 @@ impl UiRoutine for EnterWonderlandTask {
     type Output = EnterWonderlandOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment =
-            SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
         let outcome = UiTask::new(
             enter_wonderland_task_spec(environment),
             EnterWonderlandRoutine {
@@ -503,7 +501,7 @@ fn force_finish_if_kind(context: &mut UiRoutineContext<'_>, kinds: &[UiStateKind
 /// 报错才说明窗口确实不在了。
 fn wait_game_window_gone(
     context: &mut UiRoutineContext<'_>,
-    config: &StartupRoutineConfig,
+    _config: &StartupRoutineConfig,
 ) -> Result<bool, UiRoutineFailure> {
     const WINDOW_GONE_WAIT_MS: u64 = 5_000;
     let deadline = Instant::now() + Duration::from_millis(WINDOW_GONE_WAIT_MS);
@@ -633,9 +631,7 @@ fn execute_enter_game(
                     // 会直接复用旧窗口并返回成功，于是"重启"实际没发生，
                     // 却已经消耗掉唯一一次重开机会（假重启）。
                     if let Err(error) = context.device().close_window() {
-                        log::warn!(
-                            "加载过久重启时关闭游戏窗口失败，核实窗口是否已消失：{error:#}"
-                        );
+                        log::warn!("加载过久重启时关闭游戏窗口失败，核实窗口是否已消失：{error:#}");
                         let gone = wait_game_window_gone(context, config)?;
                         if !gone {
                             return Err(UiRoutineFailure::new(
@@ -656,8 +652,8 @@ fn execute_enter_game(
                     lease.complete_restart(Instant::now());
                     // 截止时间顺延一个完整周期：重开游戏要重新走一遍加载，
                     // 沿用旧截止时间会把这次重试直接判成超时失败。
-                    deadline =
-                        Instant::now() + Duration::from_millis(config.startup.enter_game_timeout_ms);
+                    deadline = Instant::now()
+                        + Duration::from_millis(config.startup.enter_game_timeout_ms);
                     paimon_streak = 0;
                     clicked = false;
                     continue;
@@ -755,17 +751,15 @@ fn ensure_game_window_via_chat_api(
     // 退出码 4 已永久停止）。这时不能盲等窗口——那会白等满
     // `launch_retries × launch_wait_ms`（默认 60 秒）才超时，日志里只看到
     // 一句"窗口一直没出现"，看不出真正原因是桥没启动。
-    let launched = crate::runtime::chat_source::launcher::ensure_running(
-        chat_source,
-        &config.target_process,
-    )
-    .map_err(|error| {
-        UiRoutineFailure::new(
-            InputCertainty::BeforeInput,
-            "launch_chat_api",
-            format!("{error:#}"),
-        )
-    })?;
+    let launched =
+        crate::runtime::chat_source::launcher::ensure_running(chat_source, &config.target_process)
+            .map_err(|error| {
+                UiRoutineFailure::new(
+                    InputCertainty::BeforeInput,
+                    "launch_chat_api",
+                    format!("{error:#}"),
+                )
+            })?;
     if !launched {
         return Err(UiRoutineFailure::new(
             InputCertainty::BeforeInput,
@@ -1392,11 +1386,7 @@ fn wait_confirm_button(
             config.startup.wonderland_confirm_threshold,
         )
         .map_err(|error| {
-            UiRoutineFailure::new(
-                certainty,
-                "locate_wonderland_confirm",
-                format!("{error:#}"),
-            )
+            UiRoutineFailure::new(certainty, "locate_wonderland_confirm", format!("{error:#}"))
         })?
         else {
             wait_ms(
@@ -1414,11 +1404,7 @@ fn wait_confirm_button(
             CONFIRM_MESSAGE_SCALE,
         )
         .map_err(|error| {
-            UiRoutineFailure::new(
-                certainty,
-                "locate_wonderland_confirm",
-                format!("{error:#}"),
-            )
+            UiRoutineFailure::new(certainty, "locate_wonderland_confirm", format!("{error:#}"))
         })?;
         let subtype_ok = message
             .as_ref()
@@ -1551,8 +1537,8 @@ mod tests {
 
     use crate::config::AppConfig;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
-    use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
     use crate::runtime::ui::{UiDevice, UiRuntime};
+    use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
     use anyhow::Result;
     use image::DynamicImage;
 
@@ -1821,9 +1807,8 @@ mod tests {
     #[test]
     fn startup_tasks_declare_leave_and_primary_finish() {
         let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
-        let environment = SettleEnvironment::without_ocr(
-            FriendDeliveryRoutineConfig::from_app(&config),
-        );
+        let environment =
+            SettleEnvironment::without_ocr(FriendDeliveryRoutineConfig::from_app(&config));
         let game = enter_game_task_spec(environment.clone());
         assert_eq!(game.entry, EntryPolicy::Passthrough);
         assert_eq!(

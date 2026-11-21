@@ -1328,7 +1328,6 @@ fn normalize_name(text: &str) -> String {
     text.trim().to_ascii_lowercase()
 }
 
-
 fn joined_command(command: &str, args: &str) -> String {
     if args.is_empty() {
         command.to_string()
@@ -1641,11 +1640,19 @@ mod tests {
         let completion = service.execute(&invocation, &mut port).unwrap();
 
         assert_eq!(completion, WorkflowCompletion::Completed);
-        let sent = port.events.join("
-");
-        assert!(sent.contains("显示名甲 请求执行"), "确认文案应用显示名: {sent}");
+        let sent = port.events.join(
+            "
+",
+        );
+        assert!(
+            sent.contains("显示名甲 请求执行"),
+            "确认文案应用显示名: {sent}"
+        );
         assert!(!sent.contains("900000001"), "文案不应出现 UID: {sent}");
-        assert!(sent.contains("完成 显示名甲"), "用户名变量应用显示名: {sent}");
+        assert!(
+            sent.contains("完成 显示名甲"),
+            "用户名变量应用显示名: {sent}"
+        );
     }
 
     #[test]

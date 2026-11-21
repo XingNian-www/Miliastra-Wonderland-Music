@@ -20,8 +20,12 @@
 //! [`thread::sleep`]：进程退出时不会留下在后台空转的孤儿线程。
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+#[cfg(test)]
+#[cfg(test)]
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -89,6 +93,43 @@ fn now_millis() -> u64 {
         .unwrap_or_default()
 }
 
+/// 单调时钟读数的量化步长（毫秒）。
+///
+/// 冷却与 TTL 都以毫秒为单位；把单调读数按毫秒量化后比较，语义与毫秒时间戳一致，
+/// 但**不依赖进程启动后的绝对时间点**。因此单测不必真的等：「从现在开始算的
+/// 30 秒冷却」可以注入成「几毫秒的冷却」，等待多久完全由测试决定。
+const MONOTONIC_STEP_MS: u64 = 1;
+
+/// 单调时钟读数（毫秒，自量化步长起算）。
+fn monotonic_millis() -> u64 {
+    now_millis_since_marker(0)
+}
+
+/// 单调时钟读数（毫秒），保证结果至少是 `steps` 个量化步长。
+fn now_millis_since_marker(steps: u64) -> u64 {
+    let offset = Duration::from_millis(MONOTONIC_STEP_MS.saturating_mul(steps.saturating_add(1)));
+    (offset + Instant::now().elapsed())
+        .as_millis()
+        .max(1)
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// 冷却窗口：从现在起 `window_ms` 毫秒内不再排队。
+fn cooldown_from_now(window_ms: u64, now: u64) -> u64 {
+    now.saturating_add(window_ms.max(MONOTONIC_STEP_MS))
+}
+
+/// 主动补查里"还缺真实昵称"时的重试窗口；不完整返回 `u64::MAX` 表示改用
+/// 成功后的长 TTL（见 [`ExternalChatState::prime_name_lookup_within`]）。
+fn incomplete_retry_ms(incomplete: bool) -> u64 {
+    if incomplete {
+        NAME_PRIME_INCOMPLETE_MS
+    } else {
+        u64::MAX
+    }
+}
+
 /// 一次握手对本地水位的影响。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HandshakeAction {
@@ -106,7 +147,6 @@ pub(crate) struct ExternalChatState {
     inner: Arc<ExternalChatInner>,
 }
 
-#[derive(Default)]
 struct ExternalChatInner {
     /// 昵称 → 游戏 UID。外部源每条消息都带 UID，这里缓存下来供歌单等
     /// 需要"按人定位"的功能使用。程序重启后为空，此时歌单退化到 name: 键。
@@ -149,6 +189,45 @@ struct ExternalChatInner {
     friends_snapshot_at_ms: AtomicU64,
     /// 旧桥 404 只 debug 一次。
     friends_unsupported: AtomicBool,
+    /// 「补查线程回到等待」代际（测试用）：每处理完一条队列消息就推进一次。
+    #[cfg(test)]
+    name_lookup_idle_epoch: AtomicU64,
+    /// 与上一个代际配对的条件等待（测试用）；生产路径不存在。
+    ///
+    /// 自己带锁：等待方在锁内读代际、再在同一个锁上等待，等待方与通知方
+    /// 不会在「读代际」与「进入等待」之间丢通知。
+    #[cfg(test)]
+    name_lookup_idle: Condvar,
+    #[cfg(test)]
+    name_lookup_idle_gate: Mutex<()>,
+}
+
+impl Default for ExternalChatInner {
+    fn default() -> Self {
+        Self {
+            nick_to_uid: Mutex::new(HashMap::new()),
+            name_lookups: Mutex::new(NameLookups::default()),
+            active: AtomicBool::new(false),
+            last_sequence: AtomicU64::new(0),
+            watermark: AtomicU64::new(0),
+            watermark_set: AtomicBool::new(false),
+            last_seen_ms: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            host_boot_id: Mutex::new(None),
+            initial_secondary_switch_done: AtomicBool::new(false),
+            ever_connected: AtomicBool::new(false),
+            lost_since_ms: AtomicU64::new(0),
+            restart_suppressed: AtomicBool::new(false),
+            friends_snapshot_at_ms: AtomicU64::new(0),
+            friends_unsupported: AtomicBool::new(false),
+            #[cfg(test)]
+            name_lookup_idle_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            name_lookup_idle: Condvar::new(),
+            #[cfg(test)]
+            name_lookup_idle_gate: Mutex::new(()),
+        }
+    }
 }
 
 /// 一次补查的结果。
@@ -172,7 +251,10 @@ struct NameLookups {
     /// 带时间戳是必需的：备注是玩家在游戏里随时能改的，一次查到就永久
     /// 缓存会让「后设的备注」永远进不来。超过 TTL 后允许重查。
     resolved: std::collections::HashMap<String, ResolvedNames>,
-    /// UID → 允许再次补查的毫秒时间戳（在途与失败冷却共用）。
+    /// UID → 允许再次补查的时刻（单调毫秒；在途与失败冷却共用）。
+    ///
+    /// 单调而非墙钟：冷却窗口是「从现在开始算多久」，不该被系统时间跳变影响，
+    /// 也让等待多久完全由调用方决定（见 [`ExternalChatState::prime_name_lookup_within`]）。
     next_attempt_ms: std::collections::HashMap<String, u64>,
 }
 
@@ -272,6 +354,15 @@ impl ExternalChatState {
         self.inner.lost_since_ms.store(0, Ordering::Release);
     }
 
+    /// 失联起点（毫秒时间戳）；当前没在失联为 None。
+    ///
+    /// 供测试断言「起点没有被重复调用往后推」——比拿两次失联时长相减更直接，
+    /// 也让用例不必真的等一段时间。
+    pub(crate) fn loss_started_ms(&self) -> Option<u64> {
+        let since = self.inner.lost_since_ms.load(Ordering::Acquire);
+        (since != 0).then_some(since)
+    }
+
     pub(crate) fn restart_suppressed(&self) -> bool {
         self.inner.restart_suppressed.load(Ordering::Acquire)
     }
@@ -336,9 +427,17 @@ impl ExternalChatState {
 
     /// 已补查到的昵称；没有或已过期就返回 None。
     pub(crate) fn cached_name(&self, uid: &str) -> Option<String> {
+        self.cached_name_within(uid, NAME_CACHE_TTL_MS)
+    }
+
+    /// 同 [`Self::cached_name`]，但 TTL 由调用方给出。
+    ///
+    /// 生产只有一个 TTL（[`NAME_CACHE_TTL_MS`]）；参数化是为了让单测能注入
+    /// 毫秒级 TTL，验证「过期后必须重新放行」而不必真的等十分钟。
+    pub(crate) fn cached_name_within(&self, uid: &str, ttl_ms: u64) -> Option<String> {
         let lookups = self.name_lookups();
         let resolved = lookups.resolved.get(uid.trim())?;
-        if now_millis().saturating_sub(resolved.fetched_at_ms) >= NAME_CACHE_TTL_MS {
+        if now_millis().saturating_sub(resolved.fetched_at_ms) >= ttl_ms {
             return None;
         }
         resolved.name.clone()
@@ -349,30 +448,48 @@ impl ExternalChatState {
     /// 返回 false 表示 TTL 内已有结果、正在补查，或处于失败冷却中。
     /// 结果过期后必须放行——否则玩家后设的备注永远进不来。
     pub(crate) fn begin_name_lookup(&self, uid: &str) -> bool {
+        self.begin_name_lookup_within(uid, NAME_CACHE_TTL_MS, NAME_LOOKUP_IN_FLIGHT_MS)
+    }
+
+    /// 同 [`Self::begin_name_lookup`]，冷却窗口由调用方给出（单测注入毫秒级窗口）。
+    pub(crate) fn begin_name_lookup_within(
+        &self,
+        uid: &str,
+        result_ttl_ms: u64,
+        in_flight_ms: u64,
+    ) -> bool {
+        self.reserve_name_lookup(uid, result_ttl_ms, in_flight_ms)
+            .is_some()
+    }
+
+    /// 同上，但返回本次申请登记在途标记的时刻；被拒绝时返回 None。
+    fn reserve_name_lookup(&self, uid: &str, result_ttl_ms: u64, in_flight_ms: u64) -> Option<u64> {
         let uid = uid.trim();
         if uid.is_empty() {
-            return false;
+            return None;
         }
         let now = now_millis();
+        let attempts_now = monotonic_millis();
         let mut lookups = self.name_lookups();
         if lookups
             .resolved
             .get(uid)
-            .is_some_and(|resolved| now.saturating_sub(resolved.fetched_at_ms) < NAME_CACHE_TTL_MS)
+            .is_some_and(|resolved| now.saturating_sub(resolved.fetched_at_ms) < result_ttl_ms)
         {
-            return false;
+            return None;
         }
         if lookups
             .next_attempt_ms
             .get(uid)
-            .is_some_and(|next| *next > now)
+            .is_some_and(|next| *next > attempts_now)
         {
-            return false;
+            return None;
         }
-        lookups
-            .next_attempt_ms
-            .insert(uid.to_string(), now + NAME_LOOKUP_IN_FLIGHT_MS);
-        true
+        lookups.next_attempt_ms.insert(
+            uid.to_string(),
+            cooldown_from_now(in_flight_ms, attempts_now),
+        );
+        Some(attempts_now)
     }
 
     /// 主动补查的排队申请（按身份映射表扫描用）。
@@ -382,35 +499,52 @@ impl ExternalChatState {
     /// 而不是"成功查过就等 10 分钟"，否则 /names 当时返回 null 的玩家
     /// 要等很久才会被再补一次。
     pub(crate) fn prime_name_lookup(&self, uid: &str, incomplete: bool) -> bool {
-        let uid = uid.trim();
-        if uid.is_empty() {
-            return false;
-        }
-        let now = now_millis();
-        let window = if incomplete {
-            NAME_PRIME_INCOMPLETE_MS
+        self.prime_name_lookup_within(uid, incomplete_retry_ms(incomplete), NAME_CACHE_TTL_MS)
+    }
+
+    /// 同 [`Self::prime_name_lookup`]，成功 TTL 由调用方给出。
+    pub(crate) fn prime_name_lookup_within(
+        &self,
+        uid: &str,
+        incomplete_retry_ms: u64,
+        complete_ttl_ms: u64,
+    ) -> bool {
+        let window = if incomplete_retry_ms < u64::MAX {
+            incomplete_retry_ms
         } else {
-            NAME_CACHE_TTL_MS
+            complete_ttl_ms
         };
-        let mut lookups = self.name_lookups();
-        if lookups
-            .resolved
-            .get(uid)
-            .is_some_and(|resolved| now.saturating_sub(resolved.fetched_at_ms) < window)
+        self.reserve_name_lookup(uid, window, NAME_LOOKUP_IN_FLIGHT_MS)
+            .is_some()
+    }
+
+    /// 补查线程处理完一条队列消息：推进「已回到等待」代际（测试用）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn announce_name_lookup_idle(&self) {
+        #[cfg(test)]
         {
-            return false;
+            let _gate = self
+                .inner
+                .name_lookup_idle_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.inner
+                .name_lookup_idle_epoch
+                .fetch_add(1, Ordering::AcqRel);
+            self.inner.name_lookup_idle.notify_all();
         }
-        if lookups
+    }
+
+    /// 该 UID 当前是否仍处于补查冷却（含失败冷却）。
+    ///
+    /// 给测试做**条件等待**用：等到冷却真的结束，而不是靠固定睡眠猜时长。
+    pub(crate) fn name_lookup_cooling_down(&self, uid: &str) -> bool {
+        let uid = uid.trim();
+        let attempts_now = monotonic_millis();
+        self.name_lookups()
             .next_attempt_ms
             .get(uid)
-            .is_some_and(|next| *next > now)
-        {
-            return false;
-        }
-        lookups
-            .next_attempt_ms
-            .insert(uid.to_string(), now + NAME_LOOKUP_IN_FLIGHT_MS);
-        true
+            .is_some_and(|next| *next > attempts_now)
     }
 
     /// 登记补查结果。
@@ -433,9 +567,11 @@ impl ExternalChatState {
         let remark = clean(remark);
         let mut lookups = self.name_lookups();
         if name.is_none() && remark.is_none() {
-            lookups
-                .next_attempt_ms
-                .insert(uid.to_string(), now_millis() + NAME_LOOKUP_RETRY_MS);
+            let attempts_now = monotonic_millis();
+            lookups.next_attempt_ms.insert(
+                uid.to_string(),
+                cooldown_from_now(NAME_LOOKUP_RETRY_MS, attempts_now),
+            );
             return;
         }
         lookups.resolved.insert(
@@ -447,6 +583,40 @@ impl ExternalChatState {
             },
         );
         lookups.next_attempt_ms.remove(uid);
+    }
+
+    /// 「补查线程回到等待」的当前代际（只给测试用：见 [`Self::wait_for_name_lookup_idle`]）。
+    #[cfg(test)]
+    pub(crate) fn name_lookup_idle_epoch(&self) -> u64 {
+        self.inner.name_lookup_idle_epoch.load(Ordering::Acquire)
+    }
+
+    /// 等到补查线程处理完当前这一段，返回处理后的新代际；超时返回 None。
+    ///
+    /// 补查线程是串行的：队列里排着好几个 UID 时，前一条的结果与下一条的申请之间
+    /// 有窗口。测试必须等「这一段真的处理完」才能断言结果，否则会偶发读到中间态。
+    /// 代际与条件下变量都只在 `#[cfg(test)]` 下存在，生产路径没有任何额外开销。
+    #[cfg(test)]
+    pub(crate) fn wait_for_name_lookup_idle(
+        &self,
+        observed_epoch: u64,
+        timeout: Duration,
+    ) -> Option<u64> {
+        let gate = self
+            .inner
+            .name_lookup_idle_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (gate, _) = self
+            .inner
+            .name_lookup_idle
+            .wait_timeout_while(gate, timeout, |()| {
+                self.name_lookup_idle_epoch() == observed_epoch
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(gate);
+        let epoch = self.name_lookup_idle_epoch();
+        (epoch != observed_epoch).then_some(epoch)
     }
 
     fn name_lookups(&self) -> MutexGuard<'_, NameLookups> {
@@ -624,8 +794,14 @@ struct ShutdownInner {
     requested: Arc<AtomicBool>,
     /// 与 `requested` 配对的条件变量。锁只保护「等待」这件事本身，
     /// 不参与标志判定，所以 `request` 之后不存在「读到旧值」的窗口。
+    ///
+    /// 同一个条件变量也承担「停止请求已发出」的通知：需要等到某一时刻的观察者
+    /// （测试就是这种观察者）注册后与等待者排队，避免固定睡眠去猜时序。
     woke: Mutex<()>,
     changed: Condvar,
+    /// 正在 `changed` 上等待的线程数（测试用），用来区分「被唤醒」与「请求先到」。
+    #[cfg(test)]
+    waiters: AtomicUsize,
 }
 
 impl Default for ExternalChatShutdown {
@@ -635,8 +811,42 @@ impl Default for ExternalChatShutdown {
                 requested: Arc::new(AtomicBool::new(false)),
                 woke: Mutex::new(()),
                 changed: Condvar::new(),
+                #[cfg(test)]
+                waiters: AtomicUsize::new(0),
             }),
         }
+    }
+}
+
+impl ShutdownInner {
+    /// 等一次「停止请求」或「等待者数量变化」，或超时。
+    ///
+    /// 参数化 `done` 让 [`ExternalChatShutdown::request`] 之外的两类观察
+    /// （停止等待、测试里的就位/唤醒观察）共用同一段等待逻辑。
+    fn wait_on_changed<'a>(
+        &'a self,
+        gate: MutexGuard<'a, ()>,
+        timeout: Duration,
+        done: impl Fn() -> bool,
+    ) -> MutexGuard<'a, ()> {
+        self.changed
+            .wait_timeout_while(gate, timeout, |()| !done())
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+    }
+
+    /// 让等待者数量增减一次，并在**持锁**时通知观察者。
+    ///
+    /// 持锁改计数、持锁通知是标准用法：观察者若在「读计数」与「进入等待」之间
+    /// 错过了这次变化，它下一次进入等待时仍会重新读计数，不会永久睡死。
+    #[cfg(test)]
+    fn shift_waiters(&self, delta: isize) {
+        if delta > 0 {
+            self.waiters.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.waiters.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.changed.notify_all();
     }
 }
 
@@ -672,21 +882,99 @@ impl ExternalChatShutdown {
         self.inner.changed.notify_all();
     }
 
+    /// 当前在条件变量上等待的线程数（测试用：用来观察「被真的唤醒」）。
+    #[cfg(test)]
+    pub(crate) fn waiters(&self) -> usize {
+        self.inner.waiters.load(Ordering::Acquire)
+    }
+
+    /// 条件等待到至少有一个等待者就位；超时返回 false。
+    #[cfg(test)]
+    pub(crate) fn wait_for_waiter(&self, timeout: Duration) -> bool {
+        self.wait_for_waiter_count(timeout, |count| count > 0)
+    }
+
+    /// 条件等待到没有等待者；超时返回 false。
+    #[cfg(test)]
+    pub(crate) fn wait_for_no_waiter(&self, timeout: Duration) -> bool {
+        self.wait_for_waiter_count(timeout, |count| count == 0)
+    }
+
+    /// 在停止条件变量上等一个等待者计数的条件成立。
+    ///
+    /// `request` 与等待者进出都以同一个条件变量通知，所以这里不会错过任何一次变化；
+    /// 计数本身只是乐观判据，最终结论仍由外层断言给出。
+    #[cfg(test)]
+    fn wait_for_waiter_count(&self, timeout: Duration, done: impl Fn(usize) -> bool) -> bool {
+        let started = Instant::now();
+        let mut gate = self.gate();
+        loop {
+            if done(self.waiters()) {
+                return true;
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+            gate = self
+                .inner
+                .wait_on_changed(gate, remaining, || done(self.waiters()));
+        }
+    }
+
+    /// 等到停止请求已经发出；`request` 从未到来则等满 `timeout` 后返回 false。
+    ///
+    /// 与 [`Self::wait`] 的区别：`wait` 回答「此刻是否已停止」，这里回答
+    /// 「从现在起是否等到了一次停止请求」。测试用它等「关停信号已经出膛」，
+    /// 而不是睡一段时间猜它出膛了——两者在慢机器上的结论完全不同。
+    ///
+    /// 观察者同样持锁、同样在这个条件变量上排队，所以不会错过一次在等待开始前
+    /// 刚发出的请求，也不会漏掉一次比别的等待者晚很多才发出的请求。
+    pub(crate) fn wait_for_request(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        let mut gate = self.gate();
+        while !self.is_requested() {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+            gate = self
+                .inner
+                .wait_on_changed(gate, remaining, || self.is_requested());
+        }
+        drop(gate);
+        true
+    }
+
     /// 最多等 `timeout`，返回「醒来时是否已请求停止」。
     ///
     /// 已经请求过停止时**立刻**返回 `true`，不进入等待；否则睡到超时或被 `request`
     /// 唤醒为止。调用方在返回 `true` 后应立即退出本次循环——这就是全部退出判据。
     pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
         let gate = self.gate();
         if self.is_requested() {
             return true;
         }
-        drop(
-            self.inner
-                .changed
-                .wait_timeout_while(gate, timeout, |()| !self.is_requested())
-                .unwrap_or_else(PoisonError::into_inner),
-        );
+        #[cfg(test)]
+        self.inner.shift_waiters(1);
+        let mut gate = self
+            .inner
+            .wait_on_changed(gate, timeout, || self.is_requested());
+        // 条件变量允许虚假唤醒：醒来后仍要重新核对超时与停止标志，
+        // 不能一醒就下结论（否则一次无关的唤醒会让线程误以为「该退了」）。
+        while !self.is_requested() {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            gate = self
+                .inner
+                .wait_on_changed(gate, remaining, || self.is_requested());
+        }
+        #[cfg(test)]
+        self.inner.shift_waiters(-1);
+        drop(gate);
         self.is_requested()
     }
 }
@@ -698,6 +986,101 @@ impl ExternalChatShutdown {
 struct NamedWorker {
     name: &'static str,
     handle: JoinHandle<()>,
+}
+
+/// 线程进入长等待前的「已就位」握手（生产为空操作）。
+#[cfg(not(test))]
+fn announce_worker_ready(_name: &'static str) {}
+
+/// 线程进入长等待前的「已就位」握手：由测试启动的线程向监听方发一次信号。
+#[cfg(test)]
+fn announce_worker_ready(name: &'static str) {
+    if let Some(sender) = test_worker_ready::take(name) {
+        let _ = sender.send(());
+    }
+}
+
+/// 测试侧的「线程已进入长等待」登记表。
+///
+/// 键是（线程名, 槽位）：同名线程可能被多个用例同时启动，只按线程名登记会让一个
+/// 用例的监听被另一个用例的线程取走。每个用例登记时独占一个槽位，用完归还，
+/// 因此并行执行也互不串味。
+#[cfg(test)]
+mod test_worker_ready {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, mpsc};
+
+    type Key = (&'static str, usize);
+
+    fn table() -> &'static Mutex<HashMap<Key, mpsc::Sender<()>>> {
+        static TABLE: OnceLock<Mutex<HashMap<Key, mpsc::Sender<()>>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// 登记一次监听，返回接收端与下个空闲槽位。
+    pub(super) fn watch(name: &'static str) -> (mpsc::Receiver<()>, usize) {
+        let (sender, receiver) = mpsc::channel();
+        let mut table = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = 0;
+        while table.contains_key(&(name, slot)) {
+            slot += 1;
+        }
+        table.insert((name, slot), sender);
+        (receiver, slot)
+    }
+
+    /// 线程侧取走自己的信号端（一次性）。
+    pub(super) fn take(name: &'static str) -> Option<mpsc::Sender<()>> {
+        let mut table = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = (0..=64).find(|slot| table.contains_key(&(name, *slot)))?;
+        table.remove(&(name, slot))
+    }
+
+    /// 用例结束归还槽位；没被线程取走的监听一并清理。
+    pub(super) fn release(name: &'static str, slot: usize) {
+        table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(name, slot));
+    }
+}
+
+/// 一个用例对某条线程「已就位」的独占监听，Drop 时归还槽位。
+#[cfg(test)]
+struct TestWorkerReadySlot {
+    name: &'static str,
+    slot: usize,
+    listener: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl TestWorkerReadySlot {
+    fn watch(name: &'static str) -> Self {
+        let (listener, slot) = test_worker_ready::watch(name);
+        Self {
+            name,
+            slot,
+            listener,
+        }
+    }
+
+    /// 等到线程报告就位；超时直接失败并指明是哪条线程。
+    fn wait(&self, timeout: Duration) {
+        self.listener
+            .recv_timeout(timeout)
+            .unwrap_or_else(|_| panic!("线程「{}」未在 {timeout:?} 内进入等待", self.name));
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestWorkerReadySlot {
+    fn drop(&mut self) {
+        test_worker_ready::release(self.name, self.slot);
+    }
 }
 
 /// 外部聊天源全部后台线程的句柄与停止信号。
@@ -726,6 +1109,12 @@ impl ExternalChatWorkers {
             workers: Vec::new(),
             closed: false,
         }
+    }
+
+    /// 测试用：拿到内部停止信号，以便直接等「停止请求已发出」。
+    #[cfg(test)]
+    pub(crate) fn shutdown_token(&self) -> ExternalChatShutdown {
+        self.shutdown.clone()
     }
 
     /// 由四条线程的停止信号与句柄组装。
@@ -875,6 +1264,7 @@ pub(crate) fn spawn_managed(
                     names: main_names,
                 },
             );
+            announce_worker_ready("external-chat");
         })
         .map_err(|error| anyhow::anyhow!("启动外部聊天线程失败: {error}"))?;
     workers.push(NamedWorker {
@@ -966,6 +1356,7 @@ fn run(
                     "外部聊天源初始化失败（步骤：建立 WebSocket 连接），{} 毫秒后重试；重试期间外部聊天源没有接管，聊天仍由 OCR 识别，外部源独有的消息（含备注名）拿不到：{error:#}",
                     reconnect.as_millis()
                 );
+                announce_worker_ready("external-chat");
                 if shutdown.wait(reconnect) {
                     break;
                 }
@@ -1069,6 +1460,7 @@ fn run(
                     reset_after_source_change(&timeline);
                     // 退避等待同样可被停止信号打断：等待本身就是「还能不能再连」的判据，
                     // 返回 true 时外层循环顶部会立刻收尾，不会再多建一条连接。
+                    announce_worker_ready("external-chat");
                     let _ = shutdown.wait(reconnect);
                     break;
                 }
@@ -1542,6 +1934,7 @@ fn spawn_friends_snapshot(
                     log::debug!("好友快照拉取失败，本次不写回身份映射：{error}");
                 }
             }
+            announce_worker_ready("external-chat-friends");
             if worker_shutdown.wait(FRIENDS_SNAPSHOT_INTERVAL) {
                 break;
             }
@@ -1583,6 +1976,7 @@ fn spawn_name_priming(
                 }
                 // 完整好友快照 60 秒内已覆盖名字信息：跳过逐 UID 轮询，避免双频请求。
                 if state.friends_snapshot_recent() {
+                    announce_worker_ready("external-chat-names-prime");
                     if worker_shutdown.wait(NAME_PRIME_INTERVAL) {
                         break;
                     }
@@ -1611,6 +2005,7 @@ fn spawn_name_priming(
                 if queued > 0 {
                     log::debug!("主动补查：本轮排入 {queued} 个账号的名称查询");
                 }
+                announce_worker_ready("external-chat-names-prime");
                 if worker_shutdown.wait(NAME_PRIME_INTERVAL) {
                     break;
                 }
@@ -1657,12 +2052,28 @@ struct NameResolver {
     worker: NamedWorker,
 }
 
-/// 后台昵称补查线程；起不来时返回 `None`（缺昵称的消息按未知发送者处理）。
+/// 等下一个待补查 UID；停止请求到达时立即返回 `None`。
 ///
 /// 不能用 `for uid in receiver`：那会在队列空时无限阻塞，停止信号来了也醒不过来，
 /// `join` 只能等到有下一条消息——而没有新消息正是关停时的常态。
-/// 改成带超时的 `recv_timeout`：每次循环都回来看一眼停止标志。
-/// 超时没有副作用，醒来继续等即可。
+/// 这里把「排队」和「停止」合成一个等待：队列来消息就处理，停止信号一到就返回，
+/// 不再靠 200 毫秒轮询上限去猜。空闲时被唤醒的代价只是一次重新检查。
+fn recv_name_until_stopped(
+    receiver: &std::sync::mpsc::Receiver<String>,
+    shutdown: &ExternalChatShutdown,
+) -> Option<String> {
+    loop {
+        if shutdown.is_requested() {
+            return None;
+        }
+        if let Ok(uid) = receiver.try_recv() {
+            return Some(uid);
+        }
+        if shutdown.wait(NAME_RESOLVER_POLL_INTERVAL) {
+            return None;
+        }
+    }
+}
 fn spawn_name_resolver(
     state: ExternalChatState,
     shutdown: &ExternalChatShutdown,
@@ -1679,23 +2090,22 @@ fn spawn_name_resolver(
         .name("external-chat-names".into())
         .spawn(move || {
             loop {
-                match receiver.recv_timeout(NAME_RESOLVER_POLL_INTERVAL) {
-                    Ok(uid) => resolve_one_name(
-                        &state,
-                        identity_access.as_ref(),
-                        config_store.as_ref(),
-                        &live_configs,
-                        &http_base,
-                        &token,
-                        &uid,
-                    ),
-                    Err(RecvTimeoutError::Timeout) => {
-                        if worker_shutdown.is_requested() {
-                            break;
-                        }
+                announce_worker_ready("external-chat-names");
+                match recv_name_until_stopped(&receiver, &worker_shutdown) {
+                    Some(uid) => {
+                        resolve_one_name(
+                            &state,
+                            identity_access.as_ref(),
+                            config_store.as_ref(),
+                            &live_configs,
+                            &http_base,
+                            &token,
+                            &uid,
+                        );
+                        state.announce_name_lookup_idle();
                     }
-                    // 全部发送端已释放：不会再有人排队，本线程任务完成。
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    // 停止请求或全部发送端已释放：不会再有人排队，本线程任务完成。
+                    None => break,
                 }
             }
         });
@@ -2223,18 +2633,28 @@ mod tests {
     }
 
     /// 反复 set_active(false) 不能把失联起点一直往后推。
+    ///
+    /// 判据是「起点没被重写」，不需要真的走一段墙钟时间：直接读上报的起点，
+    /// 再插一次 `set_active(false)`，起点必须一模一样。时间只作为兜底——若实测
+    /// 确实过了 1 毫秒，失联时长自然也该跟着涨。
     #[test]
     fn repeated_inactive_updates_keep_the_first_loss_timestamp() {
         let state = ExternalChatState::default();
         state.set_active(true);
         state.set_active(false);
+        let first_since = state.loss_started_ms().expect("失联起点");
         let first = state.lost_for().expect("失联");
-        std::thread::sleep(std::time::Duration::from_millis(30));
+
         state.set_active(false);
+        assert_eq!(
+            state.loss_started_ms(),
+            Some(first_since),
+            "重复的 set_active(false) 不得把失联起点往后推"
+        );
         let second = state.lost_for().expect("失联");
         assert!(
-            second >= first + std::time::Duration::from_millis(20),
-            "失联时长必须继续增长（起点不能被重置）：first={first:?} second={second:?}"
+            second >= first,
+            "失联时长不能倒退：first={first:?} second={second:?}"
         );
     }
 
@@ -2558,12 +2978,18 @@ mod tests {
     #[test]
     fn identity_persist_lock_serializes_writers() {
         let guard = identity_persist_guard();
+        // 「写者已尝试取锁」由屏障给出：各方都到齐后写者才开始抢锁，
+        // 不再靠睡一小会儿猜它已经跑起来了。
+        let attempted = Arc::new(std::sync::Barrier::new(2));
         let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_attempted = Arc::clone(&attempted);
         let worker = thread::spawn(move || {
+            worker_attempted.wait();
             let _guard = identity_persist_guard();
             let _ = sender.send(());
         });
-        thread::sleep(Duration::from_millis(20));
+        attempted.wait();
+        // 此刻写者已经发起取锁，而锁在测试手上：它只可能停在等锁上。
         assert!(
             receiver.try_recv().is_err(),
             "持锁期间另一个写者不能进入持久化临界区"
@@ -2742,6 +3168,9 @@ mod tests {
     // 这些用例共用一条判据：**墙钟时间上界**。调度器抖动在毫秒级，而上界都设在
     // 数百毫秒到 1 秒，既不会因机器慢而偶发失败，也足以区分「被信号唤醒」与
     // 「睡满 60 秒周期」这两种实现。
+    //
+    // 「线程是否已经进入等待」不再靠睡眠猜：工厂函数在长等待前自查一次
+    // [`test_worker_ready`] 登记表，测试据此拿到确定信号（见下面的 `worker_ready`）。
     // ---------------------------------------------------------------------
 
     /// 等待上界：比 60 秒周期小两个数量级，慢机器也留足余量。
@@ -2750,22 +3179,60 @@ mod tests {
     /// 单个停止等待的上界：验证「被唤醒」而不是「恰好到点」。
     const WAKE_BOUND: Duration = Duration::from_millis(100);
 
+    /// 登记对某条后台线程「已进入长等待」的独占监听。
+    ///
+    /// 必须在启动线程**之前**登记；返回的槽位在 Drop 时归还，因此并行执行的
+    /// 用例即使启动同名线程也各拿各的信号。
+    fn worker_ready(name: &'static str) -> super::TestWorkerReadySlot {
+        super::TestWorkerReadySlot::watch(name)
+    }
+
+    /// 等一条线程的就位信号（最多 `PROMPT_BOUND`）。
+    fn wait_ready(listener: &super::TestWorkerReadySlot) {
+        listener.wait(PROMPT_BOUND);
+    }
+
+    /// 等一个条件成立，最多 `PROMPT_BOUND`；超时直接失败。
+    ///
+    /// 替代「睡一小会儿再看一眼」的固定睡眠：条件一成立就返回，慢机器上也不会
+    /// 因调度抖动判错。轮询间隔只影响响应速度，不决定结论。
+    fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + PROMPT_BOUND;
+        while !condition() {
+            assert!(Instant::now() < deadline, "{what}（等待超时）");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn shutdown_token_wakes_wait_timeout_immediately() {
         let shutdown = ExternalChatShutdown::default();
         assert!(!shutdown.is_requested());
 
         // 后台线程按 60 秒等待；停止请求必须让它立刻返回，而不是睡满周期。
+        //
+        // 时序用**等待者计数**钉死，不靠固定睡眠：只有在确认等待者真的已经在
+        // 条件变量上之后才请求。条件等待带硬超时（1 秒 ≪ 60 秒），因此
+        // 「计数永不到达」或「唤醒没生效」都会在 1 秒内失败而不是挂死。
         let waiter = shutdown.clone();
         let handle = thread::spawn(move || {
             let started = Instant::now();
             let stopped = waiter.wait(Duration::from_secs(60));
             (stopped, started.elapsed())
         });
-        // 给等待线程一点时间真正进入等待（否则测的是「请求先于等待」的快路径）。
-        thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        let arrived = shutdown.wait_for_waiter(WAKE_BOUND);
+        eprintln!("DIAG wait_for_waiter={:?} arrived={arrived}", t0.elapsed());
+        assert!(
+            arrived,
+            "等待线程必须先在条件变量上就位，否则测到的只是「请求先于等待」的快路径"
+        );
         let requested_at = Instant::now();
         shutdown.request();
+        assert!(
+            shutdown.wait_for_no_waiter(WAKE_BOUND),
+            "请求发出后等待者必须已被唤醒（而不是睡满 60 秒）"
+        );
         let (stopped, elapsed) = handle.join().expect("等待线程不应崩溃");
         assert!(stopped, "request 之后 wait 必须报告已停止");
         assert!(
@@ -2831,6 +3298,11 @@ mod tests {
             identity_config_with_account("700000001"),
         );
         let mut workers = Vec::new();
+        let readiness = [
+            worker_ready("external-chat-names"),
+            worker_ready("external-chat-names-prime"),
+            worker_ready("external-chat-friends"),
+        ];
 
         // 预扫线程：配置里有一个账号，正常情况下会先扫一轮再等 60 秒。
         let resolver = spawn_name_resolver(
@@ -2871,8 +3343,10 @@ mod tests {
             "三条定期线程都应启动（补查、预扫、好友快照）"
         );
 
-        // 让它们真正跑到第一次 60 秒等待里，否则测到的只是启动瞬间。
-        thread::sleep(Duration::from_millis(150));
+        // 等三条线程各自报告「已进入 60 秒等待」：这是下一轮判断的起点，不再靠睡眠猜。
+        for listener in &readiness {
+            wait_ready(listener);
+        }
         assert!(!shutdown.is_requested());
 
         let started = Instant::now();
@@ -2894,6 +3368,7 @@ mod tests {
             identity_config_with_account("700000002"),
         );
         let mut workers = Vec::new();
+        let ready = worker_ready("external-chat-friends");
         if let Some(worker) = spawn_friends_snapshot(
             state,
             &shutdown,
@@ -2906,7 +3381,8 @@ mod tests {
             workers.push(worker);
         }
         let workers = ExternalChatWorkers::new(shutdown.clone(), workers);
-        thread::sleep(Duration::from_millis(100));
+        // 线程已进入 60 秒等待：此时请求停止才谈得上「不阻塞」。
+        wait_ready(&ready);
 
         let started = Instant::now();
         workers.request_shutdown();
@@ -2955,6 +3431,7 @@ mod tests {
     #[test]
     fn spawn_managed_with_unreachable_endpoint_exits_and_joins_promptly() {
         let started = Instant::now();
+        let ready = worker_ready("external-chat");
         let (state, workers) = spawn_managed(
             ChatTimeline::new(),
             unreachable_chat_source_config(),
@@ -2972,8 +3449,8 @@ mod tests {
             "未提供身份句柄时只起补查线程与主连接线程"
         );
 
-        // 让主线程真正进入「连接失败 → 退避等待」，退避间隔配成 30 秒。
-        thread::sleep(Duration::from_millis(200));
+        // 等主线程真正进入「连接失败 → 退避等待」：退避间隔配成 30 秒。
+        wait_ready(&ready);
         let shutdown_started = Instant::now();
         workers.shutdown();
         let elapsed = shutdown_started.elapsed();
@@ -2997,10 +3474,9 @@ mod tests {
     fn connected_idle_websocket_read_is_interrupted_by_shutdown() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
         let port = listener.local_addr().expect("本地地址").port();
-        // 握手完成的信号：由 mock 服务端在 accept_async 返回后置位，
-        // 保证「客户端确实连上了」而不是靠睡眠猜。
-        let handshaken = Arc::new(AtomicBool::new(false));
-        let server_handshaken = handshaken.clone();
+        // 握手完成的信号：由 mock 服务端在 accept_async 返回后发出，
+        // 测试在接收端等它——「客户端确实连上了」是事件，不是靠睡眠猜出来的。
+        let (handshake_tx, handshake_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3016,7 +3492,7 @@ mod tests {
                 let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
                     return;
                 };
-                server_handshaken.store(true, Ordering::Release);
+                let _ = handshake_tx.send(());
                 // 握手后保持静默，直到客户端关闭（测试收尾时）。
                 while socket.next().await.is_some() {}
             });
@@ -3033,14 +3509,9 @@ mod tests {
         // 同前：没有身份句柄时是补查线程 + 主连接线程。
         assert_eq!(workers.started(), 2);
 
-        let connected_by = Instant::now() + PROMPT_BOUND;
-        while Instant::now() < connected_by && !handshaken.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            handshaken.load(Ordering::Acquire),
-            "mock 端点必须在 {PROMPT_BOUND:?} 内完成 WS 握手"
-        );
+        handshake_rx
+            .recv_timeout(PROMPT_BOUND)
+            .unwrap_or_else(|_| panic!("mock 端点必须在 {PROMPT_BOUND:?} 内完成 WS 握手"));
 
         let shutdown_started = Instant::now();
         workers.shutdown();
@@ -3062,8 +3533,7 @@ mod tests {
     fn messages_arriving_after_idle_slices_are_still_delivered() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
         let port = listener.local_addr().expect("本地地址").port();
-        let handshaken = Arc::new(AtomicBool::new(false));
-        let server_handshaken = handshaken.clone();
+        let (handshake_tx, handshake_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3078,8 +3548,11 @@ mod tests {
                 let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
                     return;
                 };
-                server_handshaken.store(true, Ordering::Release);
+                let _ = handshake_tx.send(());
                 // 先静默一阵：客户端会在同一段读等待里跨过多个 100 毫秒分片。
+                // 这里睡的是 mock **服务端**的定时器：它定义的是「消息何时到达」这个
+                // 真实业务时序（客户端跨分片空闲），不是测试在等某个条件成立，
+                // 因此保留——条件等待改的只是测试主线程侧的固定睡眠。
                 tokio::time::sleep(Duration::from_millis(350)).await;
                 // 用公开占位值构造一条大厅消息，不含任何真实玩家数据。
                 let frame = r#"{"type":"message","message":{"id":42,"ts":1,"channel":"current_hall","hallId":1,"hallType":16,"from":{"uid":900000001,"name":"示例玩家"},"to":null,"text":"@状态"}}"#;
@@ -3105,21 +3578,15 @@ mod tests {
         )
         .expect("主连接线程应能启动");
 
-        let connected_by = Instant::now() + PROMPT_BOUND;
-        while Instant::now() < connected_by && !handshaken.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(handshaken.load(Ordering::Acquire), "mock 端点必须完成握手");
+        handshake_rx
+            .recv_timeout(PROMPT_BOUND)
+            .expect("mock 端点必须完成握手");
 
-        // 消息在 350 毫秒后才发：期间读等待跨了多个分片。
-        let delivered_by = Instant::now() + PROMPT_BOUND;
-        while Instant::now() < delivered_by && state.last_sequence() == 0 {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            state.last_sequence(),
-            42,
-            "空闲多个分片之后到达的消息必须照常投递，序号要推进到 42"
+        // 消息在静默期之后才发：期间读等待跨了多个分片。条件一成立（序号推进到
+        // 42）立刻返回，不再固定睡 10ms 反复试；超时判失败并给出实际序号。
+        wait_until(
+            || state.last_sequence() == 42,
+            "空闲多个分片之后到达的消息必须照常投递",
         );
 
         workers.shutdown();

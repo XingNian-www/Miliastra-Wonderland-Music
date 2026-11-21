@@ -1,3 +1,30 @@
+//! 千星奇域音乐播放器：业务内核、UI 校验层与组合根。
+//!
+//! # 跨平台 `dead_code` 口径（Wave 4-A）
+//!
+//! 产品**只支持 Windows**：生产入口是 [`run`]，它只在 `target_os = "windows"` 下编译
+//! （Linux 上 `src/main.rs` 直接 `compile_error!`）。Linux 只用于库检查与单测，
+//! 即 `cargo check --lib --no-default-features` / `cargo test --lib --no-default-features`。
+//!
+//! 于是 Linux 的库构建里，**只有**从 `run()` 与 Windows 适配层
+//! （[`adapters::windows`]）可达的那一大片生产代码成了「不可达」，rustc 会对其中
+//! 每一项单独报 `dead_code`（含结构体字段、枚举变体、trait 方法）。它们不是死代码：
+//! 逐个用 `#[allow(dead_code)]` 注解会污染上千处定义，还会把「真死代码」也一起盖住。
+//!
+//! 这里的口径按**平台**切一刀，而不是按 crate 全局：
+//!
+//! | 构建 | `dead_code` | 说明 |
+//! |---|---|---|
+//! | Windows 生产构建 | **不放过** | 生产入口真实存在，任何死代码都必须现场修掉 |
+//! | Linux 非测试库构建 | 整体放过 | 见下方 `cfg_attr`，覆盖 Windows-only 生产路径 |
+//! | Linux **测试** 构建 | **不放过** | 单测可见 `#[cfg(test)]` 项，真死代码必须在这里报出来 |
+//!
+//! 因此 Linux 侧的真死代码由「test 构建 0 告警」兜底，Windows 侧由 Windows 构建兜底；
+//! 本注解只吃掉「只有 Windows 生产路径才需要」的那一类，范围是 `not(windows) and not(test)`。
+//! 逐条复核工具：`python3 scripts/dead-code-audit.py <cargo-check.jsonl>`。
+#![cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
+// 注：`allow` 的 `reason` 属性尚未稳定（`lint_reasons`），原因写在上面这段文档注释里。
+
 mod adapters;
 mod ai_trace;
 mod change_detection;
@@ -39,6 +66,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod observation;
 
 pub mod runtime;
+
+/// 带退避的重试循环（供 AI 审核与海龟汤判定共用）。
+pub(crate) mod retry;
 
 /// 看门狗子进程用于正常配置重载的退出码。
 pub const CONFIG_RELOAD_EXIT_CODE: u8 = 75;
@@ -175,9 +205,8 @@ pub fn watchdog_restart_ms(config_path: &std::path::Path) -> anyhow::Result<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    #[cfg(windows)]
     #[cfg(windows)]
     #[test]
     fn default_configuration_is_next_to_the_supplied_executable() {
@@ -204,9 +233,8 @@ mod tests {
         );
         assert_ne!(RunOutcome::Reload.exit_code(), 0);
         assert_ne!(
-            RunOutcome::ReloadWithStartup.exit_code(),
-            RunOutcome::Reload.exit_code()
+            RunOutcome::Reload.exit_code(),
+            RunOutcome::ReloadWithStartup.exit_code()
         );
     }
 }
-pub mod retry;

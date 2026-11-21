@@ -85,7 +85,6 @@ impl ChatSendTarget {
             Self::CurrentChat => "当前聊天",
         }
     }
-
 }
 
 /// 发送前的提交记录：**只写数量，不写正文**。
@@ -118,11 +117,7 @@ struct ChatSendReport<'a> {
 }
 
 impl<'a> ChatSendReport<'a> {
-    fn new(
-        target: ChatSendTarget,
-        outcome: &'a ChatBatchSendOutcome,
-        total: usize,
-    ) -> Self {
+    fn new(target: ChatSendTarget, outcome: &'a ChatBatchSendOutcome, total: usize) -> Self {
         Self {
             target,
             total,
@@ -277,15 +272,6 @@ impl ChatOutput {
         }
     }
 
-    /// 结束捕获并取回期间发出的全部回复。
-    fn take_captured(&self) -> Vec<String> {
-        self.capture
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .unwrap_or_default()
-    }
-
     fn enabled(&self) -> bool {
         *self
             .enabled
@@ -325,7 +311,8 @@ impl ChatOutput {
         let message = fit_chat_message(message);
         self.record_captured(&message);
         let messages = [message];
-        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, 0).into_result(1)
+        self.send_batch_logged(ChatSendTarget::PrimaryHall, &messages, 0)
+            .into_result(1)
     }
 
     pub fn send_current_chat(&self, message: &str) -> Result<()> {
@@ -550,7 +537,9 @@ impl ChatOutput {
             }
             HallBatchStatus::Complete => match residency_failure {
                 // 消息全部送达、只有收尾失败：投递结果仍是成功，驻留失败单独记录。
-                Some(failure) => ChatBatchSendOutcome::delivered_but_residency_failed(sent, failure),
+                Some(failure) => {
+                    ChatBatchSendOutcome::delivered_but_residency_failed(sent, failure)
+                }
                 None => ChatBatchSendOutcome::complete(sent),
             },
         }
@@ -791,7 +780,10 @@ mod tests {
                 display_width(segment) <= MAX_CHAT_WIDTH,
                 "每段都不能超过 80：{segment}"
             );
-            assert!(!segment.starts_with("1/"), "玩法文本不允许加编号：{segment}");
+            assert!(
+                !segment.starts_with("1/"),
+                "玩法文本不允许加编号：{segment}"
+            );
         }
         assert_eq!(segments.join(""), long, "按原顺序拼接必须还原原文");
 
@@ -882,7 +874,11 @@ mod tests {
         let lines = ChatSendReport::new(ChatSendTarget::PrimaryHall, &outcome, 4).lines();
         assert_eq!(lines.len(), 1, "全失败只报一条 error: {lines:?}");
         assert_eq!(lines[0].0, log::Level::Error);
-        assert!(lines[0].1.contains("发送 0/4 条回复全部失败"), "{}", lines[0].1);
+        assert!(
+            lines[0].1.contains("发送 0/4 条回复全部失败"),
+            "{}",
+            lines[0].1
+        );
         assert!(lines[0].1.contains("玩家看不到"), "{}", lines[0].1);
         assert!(lines[0].1.contains("一级大厅不可用"), "{}", lines[0].1);
     }
@@ -893,7 +889,8 @@ mod tests {
     /// 必须在 info 之外补一条 warn。
     #[test]
     fn delivered_but_residency_failed_still_warns() {
-        let outcome = ChatBatchSendOutcome::delivered_but_residency_failed(3, anyhow!("恢复驻留超时"));
+        let outcome =
+            ChatBatchSendOutcome::delivered_but_residency_failed(3, anyhow!("恢复驻留超时"));
         let lines = ChatSendReport::new(ChatSendTarget::PrimaryHall, &outcome, 3).lines();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(lines[0].0, log::Level::Info);
@@ -907,7 +904,8 @@ mod tests {
     /// 投递成功但收尾失败：整体结果必须仍是“送达成功”，不能当未送达触发重发。
     #[test]
     fn delivered_but_residency_failed_is_still_a_delivery_success() {
-        let outcome = ChatBatchSendOutcome::delivered_but_residency_failed(2, anyhow!("恢复驻留超时"));
+        let outcome =
+            ChatBatchSendOutcome::delivered_but_residency_failed(2, anyhow!("恢复驻留超时"));
         assert!(outcome.into_result(2).is_ok());
     }
 
@@ -923,8 +921,7 @@ mod tests {
             assert_eq!(level, log::Level::Debug);
             assert_eq!(text, format!("向{label}提交 1 条回复"));
 
-            let lines =
-                ChatSendReport::new(target, &ChatBatchSendOutcome::complete(1), 1).lines();
+            let lines = ChatSendReport::new(target, &ChatBatchSendOutcome::complete(1), 1).lines();
             assert_eq!(lines.len(), 1);
             assert_eq!(lines[0].0, log::Level::Info);
             assert_eq!(lines[0].1, format!("已在{label}发送 1/1 条回复"));

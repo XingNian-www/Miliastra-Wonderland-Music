@@ -67,7 +67,6 @@ impl RecoveryTrigger {
     ///
     /// 内部枚举值不能直接进日志（日志规范禁止 `{:?}`），调用点统一走这里，
     /// 免得同一件事在三个模块里各写一份译名。
-    #[allow(dead_code)] // Wave 1b：listener.rs 的恢复日志接入后即被调用。
     pub(crate) fn chinese_name(self) -> &'static str {
         match self {
             Self::ExternalChatDisconnect => "外部聊天源失联",
@@ -459,7 +458,6 @@ impl GameRecoveryCoordinator {
     ///
     /// 本方法是 Wave 1b 的接口准备，当前生产路径由 `listener.rs` 自己的局部
     /// 冷却实现，行为与它逐条等价。
-    #[allow(dead_code)] // Wave 1b：listener.rs 接入后即被调用。
     pub(crate) fn evaluate_external_disconnect_restart(
         &self,
         now: Instant,
@@ -534,7 +532,6 @@ impl GameRecoveryCoordinator {
     ///
     /// 现有实现里「等待聊天桥重新拉起」与「没有自动拉起路径」共用同一个计时槽，
     /// 接入时沿用同一槽位即可保持逐条等价。
-    #[allow(dead_code)] // Wave 1b：listener.rs 接入后即被调用。
     pub(crate) fn should_warn_no_relaunch(&self, now: Instant, warn_interval: Duration) -> bool {
         let mut state = self.lock();
         if state
@@ -615,13 +612,11 @@ impl GameRecoveryCoordinator {
     // ---- 只读健康快照 ----
 
     /// 取当前健康快照；「持续无法识别多久」按调用方给的 `now` 现算。
-    #[allow(dead_code)] // Wave 1b：listener.rs 的诊断与告警接入后即被调用。
     pub(crate) fn health_snapshot(&self, now: Instant) -> RecoveryHealthSnapshot {
         self.lock().snapshot(now)
     }
 
     /// [`Self::health_snapshot`] 的便捷包装：用当前时刻取快照。
-    #[allow(dead_code)] // Wave 1b：同上。
     pub(crate) fn health_snapshot_now(&self) -> RecoveryHealthSnapshot {
         self.health_snapshot(Instant::now())
     }

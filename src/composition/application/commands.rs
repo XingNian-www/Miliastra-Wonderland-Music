@@ -840,7 +840,7 @@ impl AppServices {
         // 这里用 UID 反查出可以匹配的名字。之所以是多个：
         // 备注串是屏幕显示名、真实昵称是聊天桥给的资料包昵称，两者都可能在
         // 好友列表上出现，所以候选名要一起给。
-        if let Some(account) = parsed.account.as_ref() {
+        if parsed.account.is_some() {
             let names = self.shared.live_configs.identity.friend_search_names(
                 &parsed.username,
                 parsed
@@ -1299,7 +1299,7 @@ mod tests {
     use super::*;
     use crate::composition::application::listener::CommandGate;
     use crate::features::command::CommandAuthority;
-    use crate::features::command_access::{CommandPermission, catalog_policy};
+    use crate::features::command_access::catalog_policy;
 
     /// 构造一个走真实 CommandEnvelope::new 的视频信封（与路由测试同形）。
     fn access_envelope(message_type: &str, command: &str) -> CommandEnvelope {

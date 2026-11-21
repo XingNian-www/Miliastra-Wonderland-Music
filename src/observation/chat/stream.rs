@@ -403,7 +403,6 @@ impl Drop for ChatObservationExclusiveGuard {
 #[cfg(test)]
 mod dispatch_lease_tests {
     use super::*;
-    use crate::observation::chat::{ChatTimeline, RecognizedChatMessage};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         mpsc,

@@ -759,7 +759,7 @@ impl PlaybackApplication {
         &self,
         port: &mut P,
     ) -> Result<usize> {
-        let mut queue = port.playback_queue()?;
+        let queue = port.playback_queue()?;
         // 先在锁内算出**要补哪些歌**，再出锁逐条入队。
         //
         // 原实现在锁内直接调 `port.enqueue_playlist_item` 落盘：

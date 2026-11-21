@@ -1,7 +1,11 @@
 pub(crate) mod scan;
 mod scan_gate;
 pub(crate) use scan_gate::PassiveScanGate;
-#[allow(dead_code)]
+// 新鲜度判定只被 `timeline` 与实机截图回归使用；Linux 非测试构建看不到消费方。
+// Linux 非测试库构建下，本模块的条目只从 Windows 生产入口 `run()` 可达；
+// 生产（Windows）与测试（`cfg(test)`）构建仍然逐条检查 `dead_code`。
+// 口径与理由见 `src/lib.rs` 顶部「跨平台 dead_code 口径」。
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
 pub(crate) mod freshness;
 pub(crate) use freshness::ViewAbsence;
 
@@ -10,12 +14,22 @@ pub(crate) use miliastra_kernel::chat_source::ExternalChatMessage;
 mod passive;
 mod secondary_hall_vision;
 mod secondary_unread_vision;
-#[allow(dead_code)]
+// 聊天事件分发与时间线只由 `composition` 的观察线程驱动（Windows 生产入口）。
+// Linux 非测试库构建下，本模块的条目只从 Windows 生产入口 `run()` 可达；
+// 生产（Windows）与测试（`cfg(test)`）构建仍然逐条检查 `dead_code`。
+// 口径与理由见 `src/lib.rs` 顶部「跨平台 dead_code 口径」。
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
 mod stream;
-#[allow(dead_code)]
+// Linux 非测试库构建下，本模块的条目只从 Windows 生产入口 `run()` 可达；
+// 生产（Windows）与测试（`cfg(test)`）构建仍然逐条检查 `dead_code`。
+// 口径与理由见 `src/lib.rs` 顶部「跨平台 dead_code 口径」。
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
 mod timeline;
 pub(crate) use timeline::*;
-#[allow(dead_code)]
+// Linux 非测试库构建下，本模块的条目只从 Windows 生产入口 `run()` 可达；
+// 生产（Windows）与测试（`cfg(test)`）构建仍然逐条检查 `dead_code`。
+// 口径与理由见 `src/lib.rs` 顶部「跨平台 dead_code 口径」。
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
 mod visual;
 
 use std::collections::BTreeMap;
@@ -46,9 +60,8 @@ pub(crate) use stream::{
     SecondaryObservedMessage,
 };
 pub(crate) use visual::{
-    SecondaryChatIdentity, SecondaryHallBubble, hall_bubble_sequence_is_retained_prefix,
-    hall_bubble_sequence_overlap, latest_incoming_bubble_rect, latest_incoming_fingerprint,
-    secondary_hall_bubbles,
+    SecondaryChatIdentity, SecondaryHallBubble, latest_incoming_bubble_rect,
+    latest_incoming_fingerprint, secondary_hall_bubbles,
 };
 
 // 单元测试（composition::application::shared_observer 等）需要这些纯函数；
@@ -57,6 +70,11 @@ pub(crate) use visual::{
 pub(crate) use passive::{
     hash_region, passive_secondary_identity, passive_sender, recognize_passive_hall,
 };
+
+// 大厅气泡序列的重合判定目前只有 `composition` 的单测在用（生产路径已由
+// [`PassiveScanGate`] 的阈值判据接管），因此只在测试构建里重导出。
+#[cfg(test)]
+pub(crate) use visual::{hall_bubble_sequence_is_retained_prefix, hall_bubble_sequence_overlap};
 
 #[cfg(test)]
 pub(crate) use visual::SECONDARY_TITLE_RECT;

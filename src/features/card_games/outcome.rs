@@ -2,6 +2,12 @@
 //!
 //! 从 `card_games.rs` 拆出：`LandlordOutcome` 是状态机与投递层之间的唯一契约，
 //! `CardGameReplyTemplate` 负责保留模板 key 以便用户覆盖。
+//!
+//! 可见性口径：`CardGameReplyTemplate` 与 `LandlordPrivateDelivery` 只供 crate 内的
+//! `composition` 投递层构造/消费（对外只是成品文案），因此都是 `pub(crate)`；
+//! 它们承载的 `ReplyTemplate` / `ReplyVars` 同样是 crate 内部类型。历史上这两个类型
+//! 声明为 `pub` 并再导出，导致 rustc 提示「类型比字段更私有」。这里就地收口到
+//! `pub(crate)`，而不是放宽 reply_template 的对外 API。
 
 use crate::features::reply_template::ReplyVars;
 
@@ -17,7 +23,7 @@ pub struct LandlordOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CardGameReplyTemplate {
+pub(crate) enum CardGameReplyTemplate {
     Template {
         spec: &'static crate::features::reply_template::ReplyTemplate,
         vars: ReplyVars,
@@ -35,14 +41,15 @@ pub enum CardGameReplyTemplate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LandlordPrivateDelivery {
+pub(crate) struct LandlordPrivateDelivery {
     pub player: String,
     pub message: String,
     pub template: Option<CardGameReplyTemplate>,
 }
 
+/// 好友批量投递的结果：只有 crate 内的投递层消费（见 [`LandlordPrivateDelivery`]）。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CardGameFriendBatchOutcome {
+pub(crate) enum CardGameFriendBatchOutcome {
     Complete,
     Failed {
         retryable: Vec<LandlordPrivateDelivery>,

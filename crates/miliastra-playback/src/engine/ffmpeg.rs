@@ -1859,7 +1859,10 @@ mod tests {
             &worker_tx,
         )
         .unwrap();
-        assert_eq!(state.snapshot.volume, 60, "SetVolume 应当修改 snapshot.volume");
+        assert_eq!(
+            state.snapshot.volume, 60,
+            "SetVolume 应当修改 snapshot.volume"
+        );
     }
 
     /// SetDuckGain 不得发布快照（否则 Web/monitor 会看到音量变化）；
@@ -1924,7 +1927,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, EngineError::Rejected(_)));
-        assert_eq!(output.duck.load(Ordering::Acquire), 100, "非法值不得改动 duck");
+        assert_eq!(
+            output.duck.load(Ordering::Acquire),
+            100,
+            "非法值不得改动 duck"
+        );
     }
 
     fn active_state(session: SessionRef, engine_state: EngineState) -> ActorState {

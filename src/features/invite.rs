@@ -212,8 +212,7 @@ pub enum InviteStart {
 }
 
 pub struct InviteExecution {
-    username: String,
-    /// 好友列表可匹配名（UID 反查得到），空则回退到 `username`。
+    /// 好友列表可匹配名（UID 反查得到），空则回退到信封主语。
     recipients: Vec<String>,
     display_name: String,
     password: Option<String>,
@@ -300,7 +299,6 @@ impl InviteService {
         }
         let recipients = request.recipients();
         InviteStart::Ready(InviteExecution {
-            username: request.username,
             recipients,
             display_name: request.display_name,
             password: request.password,
@@ -310,7 +308,6 @@ impl InviteService {
 
 impl InviteExecution {
     pub fn run(self, port: &dyn InviteExecutionPort) -> Result<bool> {
-        let username = self.username;
         let recipients = self.recipients;
         let display_name = self.display_name;
         let password = self.password;

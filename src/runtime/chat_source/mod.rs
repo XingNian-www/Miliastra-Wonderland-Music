@@ -473,10 +473,8 @@ mod tests {
         .unwrap();
         assert!(parse_friend_snapshot(&duplicate).is_err());
 
-        let ok_false: serde_json::Value = serde_json::from_str(
-            r#"{"ok":false,"complete":false,"friends":[]}"#,
-        )
-        .unwrap();
+        let ok_false: serde_json::Value =
+            serde_json::from_str(r#"{"ok":false,"complete":false,"friends":[]}"#).unwrap();
         assert!(parse_friend_snapshot(&ok_false).is_err());
         let ok_string: serde_json::Value =
             serde_json::from_str(r#"{"ok":"true","complete":false,"friends":[]}"#).unwrap();

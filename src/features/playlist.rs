@@ -524,17 +524,6 @@ impl PlaylistApplication {
         Ok(merged)
     }
 
-    /// 按候选键查总数：与 [`Self::items_for`] 用同一个"第一个命中"规则。
-    pub(crate) fn count_for(&self, candidates: &[String]) -> Result<usize> {
-        for key in candidates {
-            let count = self.count(key)?;
-            if count > 0 {
-                return Ok(count);
-            }
-        }
-        Ok(0)
-    }
-
     pub(crate) fn items(&self, owner: &str) -> Result<Vec<PlayableTrack>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -2054,7 +2043,10 @@ mod tests {
         // 抽到的曲子必须**进入队列**（`enqueue_next` 在 FakePlayback 里记成 "queued:<key>"），
         // 而不是只回一句推荐文案。这与 @歌单 窗口里 @1~@5 选歌走同一条路径。
         assert_eq!(
-            port.played.iter().filter(|e| e.starts_with("queued:")).count(),
+            port.played
+                .iter()
+                .filter(|e| e.starts_with("queued:"))
+                .count(),
             1,
             "随机抽取的曲目必须入队: {:?}",
             port.played

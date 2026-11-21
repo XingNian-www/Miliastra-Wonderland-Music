@@ -378,7 +378,7 @@ fn v6_2_0_database_upgrades_by_resetting_config_and_keeping_cache() {
         .unwrap();
     drop(store);
 
-    let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+    let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
 
     // 配置回到默认值（断代），版本号进到当前值。
     let expected: Value =
@@ -621,7 +621,7 @@ fn deprecated_song_override_in_an_old_database_loads_and_is_dropped() {
         .unwrap();
     drop(store);
 
-    let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+    let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
     let loaded = store
         .load_full()
         .expect("老库里的 @点歌 override 不能让加载失败");
@@ -648,7 +648,7 @@ fn deprecated_song_override_in_an_old_database_loads_and_is_dropped() {
 fn schema_tolerates_added_fields_but_rejects_removed_ones() {
     let (root, database_path) = temp_database("strict-current");
     let bootstrap = test_bootstrap(&database_path);
-    let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+    let store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
     let original = store.read_all_sections().unwrap();
     let mut missing_section = original.clone();
     missing_section.remove("state");
@@ -2125,7 +2125,7 @@ fn v3_database_migrates_fields_in_place_and_keeps_user_settings() {
     drop(store);
     write_sections_as_version(&database_path, 3, &v3);
 
-    let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+    let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
 
     // 版本升到 4，配置不再被重置（revision 不变、用户设置还在）。
     assert_eq!(stored_schema_version(&database_path), CONFIG_SCHEMA_VERSION);
@@ -2185,7 +2185,7 @@ fn migration_prefers_the_new_key_when_both_are_present() {
     drop(store);
     write_sections_as_version(&database_path, 3, &v3);
 
-    let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+    let store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
     let templates = stored_section(&database_path, "templates");
     assert_eq!(
         templates["confirm_button"],
@@ -2244,7 +2244,7 @@ fn v2_database_without_a_migration_path_is_still_reset() {
     // v2 没有迁移路径：即使它的键看起来像 v3，也必须走断代重置。
     write_sections_as_version(&database_path, 2, &v3);
 
-    let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+    let store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
     assert_eq!(stored_schema_version(&database_path), CONFIG_SCHEMA_VERSION);
     assert_eq!(
         store.current_revision().unwrap(),
@@ -2312,7 +2312,7 @@ fn failed_migration_rolls_back_and_keeps_the_original_configuration() {
         AppConfig::default().to_db_value()["queue"].clone(),
     );
     write_sections_as_version(&database_path, 3, &fixed);
-    let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+    let store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
     assert_eq!(stored_schema_version(&database_path), CONFIG_SCHEMA_VERSION);
     assert_eq!(
         stored_section(&database_path, "templates")["confirm_button"],
@@ -2326,7 +2326,7 @@ fn failed_migration_rolls_back_and_keeps_the_original_configuration() {
 fn migration_also_rewrites_history_snapshots_so_rollback_still_works() {
     let (root, database_path) = temp_database("v3-migrate-snapshots");
     let bootstrap = test_bootstrap(&database_path);
-    let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+    let store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
     // 造一版旧结构快照（revision 1 就是初始化快照）。
     let mut v3 = v3_sections_from_current(&store);
     v3["templates"]["friend_confirm"] = json!("custom/旧快照.png");

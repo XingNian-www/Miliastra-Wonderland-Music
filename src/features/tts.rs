@@ -221,8 +221,7 @@ impl TtsConfig {
 }
 
 /// 官方文档列出的固定 TTS 推理模型（没有公开的独立列表端点，故内置 fallback）。
-pub const TTS_FALLBACK_MODELS: &[&str] =
-    &["s1", "s2-pro", "s2.1-pro", "s2.1-pro-free", "drama-3"];
+pub const TTS_FALLBACK_MODELS: &[&str] = &["s1", "s2-pro", "s2.1-pro", "s2.1-pro-free", "drama-3"];
 
 /// 模型/音色列表来源。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,7 +457,10 @@ pub(crate) fn speak_prosody_body(
     if let Some(speed) = options.speed.filter(|_| capabilities.supports_speed) {
         prosody.insert("speed".to_string(), json!(speed));
     }
-    if let Some(volume) = options.volume_db.filter(|_| capabilities.supports_volume_db) {
+    if let Some(volume) = options
+        .volume_db
+        .filter(|_| capabilities.supports_volume_db)
+    {
         prosody.insert("volume".to_string(), json!(volume));
     }
     (!prosody.is_empty()).then_some(Value::Object(prosody))
@@ -592,7 +594,10 @@ pub fn fetch_catalog(
     let truncated = serde_json::from_str::<Value>(&body)
         .ok()
         .map(|value| {
-            value.get("has_more").and_then(Value::as_bool).unwrap_or(false)
+            value
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
                 || value
                     .get("total")
                     .and_then(Value::as_u64)
@@ -707,8 +712,8 @@ pub(crate) fn duck_gain_steps(from: u8, to: u8, steps: u32) -> Vec<u8> {
     let steps = steps.max(1);
     (1..=steps)
         .map(|step| {
-            let value = i32::from(from)
-                + (i32::from(to) - i32::from(from)) * step as i32 / steps as i32;
+            let value =
+                i32::from(from) + (i32::from(to) - i32::from(from)) * step as i32 / steps as i32;
             value.clamp(0, 100) as u8
         })
         .collect()
@@ -1003,61 +1008,50 @@ fn synthesize_and_speak(
         return Err(TtsError::Player(error.to_string()));
     }
     // 等待语音线程真正开始，再等它结束；同时监听 health，设备异常立即停等恢复 duck。
+    //
+    // 两个等待循环每轮只问 [`TtsWaitState::next`] 一个纯函数问题：现在该做什么、
+    // 下一次最早何时再看。超时、停止、健康判定全在那一处，因此不需要真实音频设备
+    // 就能单测。轮询间隔自适应：刚提交时 5ms（尽快确认「已开始播放」），之后 20ms；
+    // 上限 50ms，避免慢设备上过密的查询。所有等待都受 `wait_limit` 兜底。
     let mut health = player.subscribe_health();
-    let started = Instant::now();
-    while !player.is_speaking() && started.elapsed() < Duration::from_millis(500) {
-        if stop.load(Ordering::Acquire) {
-            let _ = player.stop();
-            duck.restore();
-            return Ok(());
-        }
-        match health.borrow_and_update().clone() {
-            SpeechHealth::Healthy => {}
-            SpeechHealth::Degraded { reason } => {
-                log::warn!("TTS 播放器降级（{reason}），停止等待并恢复 duck");
+    let deadline = Instant::now() + wait_limit;
+    let mut started_playing = false;
+    loop {
+        let state = TtsWaitState {
+            now: Instant::now(),
+            deadline,
+            started_playing,
+            speaking: player.is_speaking(),
+            stop_requested: stop.load(Ordering::Acquire),
+            health: health.borrow_and_update().clone(),
+        };
+        match state.next() {
+            TtsWaitStep::Finished => break,
+            TtsWaitStep::Stop => {
                 let _ = player.stop();
-                let _ = player.restart();
+                break;
+            }
+            TtsWaitStep::StopBeforeStart => {
+                // 还没开始播放就收到停止：本段语音直接放弃，duck 必须恢复。
+                let _ = player.stop();
                 duck.restore();
                 return Ok(());
             }
-            SpeechHealth::Closed => {
-                log::warn!("TTS 播放器已关闭，停止等待并恢复 duck");
-                duck.restore();
-                return Ok(());
-            }
-        }
-        if started.elapsed() > wait_limit {
-            log::warn!("TTS 等待播放启动超过上界（{wait_limit:?}），停止本段语音");
-            let _ = player.stop();
-            duck.restore();
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    while player.is_speaking() {
-        if stop.load(Ordering::Acquire) {
-            let _ = player.stop();
-            break;
-        }
-        match health.borrow_and_update().clone() {
-            SpeechHealth::Healthy => {}
-            SpeechHealth::Degraded { reason } => {
-                log::warn!("TTS 播放器降级（{reason}），停止播放并恢复 duck");
+            TtsWaitStep::RestartPlayer => {
                 let _ = player.stop();
                 let _ = player.restart();
                 break;
             }
-            SpeechHealth::Closed => {
-                log::warn!("TTS 播放器已关闭，停止播放并恢复 duck");
-                break;
+            TtsWaitStep::AbandonBeforeStart => {
+                // 播放器已关闭且从未开始播放：没有 duck 需要恢复以外的事情要做。
+                duck.restore();
+                return Ok(());
+            }
+            TtsWaitStep::Poll { interval } => {
+                started_playing |= state.speaking;
+                thread::sleep(interval);
             }
         }
-        if started.elapsed() > wait_limit {
-            log::warn!("TTS 播放超过上界（{wait_limit:?}），停止本段语音");
-            let _ = player.stop();
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
     }
     duck.restore();
     log::info!(
@@ -1065,6 +1059,97 @@ fn synthesize_and_speak(
         audio_duration.as_secs_f64()
     );
     Ok(())
+}
+
+/// 语音等待的轮询步长：刚提交时密、之后稀。
+const TTS_START_POLL: Duration = Duration::from_millis(5);
+const TTS_PLAYING_POLL: Duration = Duration::from_millis(20);
+const TTS_MAX_POLL: Duration = Duration::from_millis(50);
+
+/// 一次等待判定的输入，全部来自外部可观察状态。
+struct TtsWaitState {
+    now: Instant,
+    /// 本段语音允许等待到的绝对时刻（按音频时长 + 收尾余量算）。
+    deadline: Instant,
+    /// 是否已经确认过「播放器开始播放」。确认之前是「等开始」，之后是「等结束」。
+    started_playing: bool,
+    speaking: bool,
+    stop_requested: bool,
+    health: SpeechHealth,
+}
+
+/// 一次等待判定的结论。每个分支都对应调用方一个明确动作。
+#[derive(Debug, PartialEq, Eq)]
+enum TtsWaitStep {
+    /// 本段语音已经播完，可以收尾。
+    Finished,
+    /// 已经开始播放：停止并收尾。
+    Stop,
+    /// 还没开始播放就被要求停止：放弃本段并恢复 duck。
+    StopBeforeStart,
+    /// 播放器降级：停掉、尝试 restart，然后收尾。
+    RestartPlayer,
+    /// 还没开始播放播放器就关闭了：放弃本段并恢复 duck。
+    AbandonBeforeStart,
+    /// 继续等，`interval` 之后再查一次。
+    Poll { interval: Duration },
+}
+
+impl TtsWaitState {
+    /// 下一步该做什么。
+    ///
+    /// 优先级刻意固定为「停止 → 健康 → 超时 → 是否仍在播放」，与旧实现逐分支等价：
+    /// 停止信号必须最先生效；设备异常要立刻停等（不能等满超时）；超时是兜底；
+    /// 最后才是「还在放就继续等」。
+    fn next(&self) -> TtsWaitStep {
+        if self.stop_requested {
+            return if self.started_playing {
+                TtsWaitStep::Stop
+            } else {
+                TtsWaitStep::StopBeforeStart
+            };
+        }
+        match &self.health {
+            SpeechHealth::Healthy => {}
+            SpeechHealth::Degraded { .. } => {
+                return if self.started_playing {
+                    TtsWaitStep::RestartPlayer
+                } else {
+                    // 从未开始播放：没有「播到一半」需要打断，直接放弃。
+                    TtsWaitStep::AbandonBeforeStart
+                };
+            }
+            SpeechHealth::Closed => {
+                return if self.started_playing {
+                    TtsWaitStep::Stop
+                } else {
+                    TtsWaitStep::AbandonBeforeStart
+                };
+            }
+        }
+        if self.now > self.deadline {
+            return if self.started_playing {
+                TtsWaitStep::Stop
+            } else {
+                TtsWaitStep::AbandonBeforeStart
+            };
+        }
+        if self.started_playing && !self.speaking {
+            return TtsWaitStep::Finished;
+        }
+        let interval = if self.started_playing {
+            TTS_PLAYING_POLL
+        } else {
+            TTS_START_POLL
+        };
+        let remaining = self.deadline.saturating_duration_since(self.now);
+        TtsWaitStep::Poll {
+            interval: interval
+                .min(remaining)
+                .max(Duration::from_millis(1))
+                .min(TTS_MAX_POLL),
+        }
+    }
 }
 
 struct DuckGuard {
@@ -1254,10 +1339,7 @@ mod tests {
             tts_play_wait_limit(Duration::from_secs(45)),
             Duration::from_secs(47)
         );
-        assert_eq!(
-            tts_play_wait_limit(Duration::ZERO),
-            Duration::from_secs(3)
-        );
+        assert_eq!(tts_play_wait_limit(Duration::ZERO), Duration::from_secs(3));
         assert!(!TtsRuntime::disabled().available());
     }
 
@@ -1291,7 +1373,11 @@ mod tests {
         assert_eq!(decoded, config);
         assert!(build_tts_client(&config, Duration::from_secs(1)).is_ok());
 
-        for proxy in ["http://127.0.0.1:7890", "https://proxy.example:8443", "socks5://127.0.0.1:1080"] {
+        for proxy in [
+            "http://127.0.0.1:7890",
+            "https://proxy.example:8443",
+            "socks5://127.0.0.1:1080",
+        ] {
             let mut config = TtsConfig::default();
             config.http_proxy = proxy.to_string();
             config.validate().expect("合法代理");
@@ -1326,7 +1412,10 @@ mod tests {
     fn tts_text_truncation_and_url_are_safe() {
         assert_eq!(truncate_tts_text("  你好世界  ", 2), "你好");
         assert_eq!(truncate_tts_text("", 10), "");
-        assert_eq!(tts_url("https://api.fish.audio/"), "https://api.fish.audio/v1/tts");
+        assert_eq!(
+            tts_url("https://api.fish.audio/"),
+            "https://api.fish.audio/v1/tts"
+        );
         assert_eq!(
             tts_url("https://gateway.example/v1/tts"),
             "https://gateway.example/v1/tts"
@@ -1389,7 +1478,11 @@ mod tests {
         assert_eq!(voices[0].state, "trained");
         assert_eq!(voices[1].id, "voice-b");
         assert_eq!(voices[1].title, "voice-b");
-        assert!(parse_voice_catalog(r#"{"total":0,"items":[]}"#).unwrap().is_empty());
+        assert!(
+            parse_voice_catalog(r#"{"total":0,"items":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
         assert!(parse_voice_catalog("not json").is_err());
         assert!(parse_voice_catalog(r#"{"total":0}"#).is_err());
         assert!(parse_voice_catalog(r#"{"items":[{"title":"无 id"}]}"#).is_err());
@@ -1401,7 +1494,10 @@ mod tests {
         assert_eq!(catalog.source, TtsCatalogSource::Fallback);
         assert_eq!(catalog.model_source, TtsCatalogSource::Fallback);
         for model in ["s1", "s2-pro", "s2.1-pro", "s2.1-pro-free", "drama-3"] {
-            assert!(catalog.models.iter().any(|item| item == model), "缺少 {model}");
+            assert!(
+                catalog.models.iter().any(|item| item == model),
+                "缺少 {model}"
+            );
         }
         assert!(catalog.voices.is_empty());
     }
@@ -1486,6 +1582,106 @@ mod tests {
             "[温柔] [laugh] 你好"
         );
         assert!(speak_prosody_body(&options, &s2).is_none());
+    }
+
+    /// 等待判定表：把「该等到哪一刻、遇到什么先退出」从音频设备里抽出来单测。
+    ///
+    /// 这几条守的是最容易在重构中悄悄改变的顺序：停止信号最先生效、设备异常
+    /// 不等超时、超时是兜底、播完立刻收尾——旧实现靠两个手写循环保证，
+    /// 现在全部由 [`TtsWaitState::next`] 一张表决定。
+    #[test]
+    fn tts_wait_steps_follow_stop_health_timeout_then_playback_order() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(5);
+        let state = |started_playing, speaking, stop_requested, health| TtsWaitState {
+            now,
+            deadline,
+            started_playing,
+            speaking,
+            stop_requested,
+            health,
+        };
+
+        // 还没开始：继续等，且用最短的启动轮询。
+        assert_eq!(
+            state(false, false, false, SpeechHealth::Healthy).next(),
+            TtsWaitStep::Poll {
+                interval: TTS_START_POLL
+            }
+        );
+        // 已开始且仍在放：用播放轮询。
+        assert_eq!(
+            state(true, true, false, SpeechHealth::Healthy).next(),
+            TtsWaitStep::Poll {
+                interval: TTS_PLAYING_POLL
+            }
+        );
+        // 播完立刻收尾，不必等到超时。
+        assert_eq!(
+            state(true, false, false, SpeechHealth::Healthy).next(),
+            TtsWaitStep::Finished
+        );
+        // 停止信号优先于其它一切。
+        assert_eq!(
+            state(true, true, true, SpeechHealth::Healthy).next(),
+            TtsWaitStep::Stop
+        );
+        assert_eq!(
+            state(false, false, true, SpeechHealth::Healthy).next(),
+            TtsWaitStep::StopBeforeStart
+        );
+        // 设备降级：开始过就重启，没开始过就放弃，都不等超时。
+        let degraded = SpeechHealth::Degraded {
+            reason: "device busy".to_string(),
+        };
+        assert_eq!(
+            state(true, true, false, degraded.clone()).next(),
+            TtsWaitStep::RestartPlayer
+        );
+        assert_eq!(
+            state(false, false, false, degraded).next(),
+            TtsWaitStep::AbandonBeforeStart
+        );
+        // 播放器关闭：同样不等超时。
+        assert_eq!(
+            state(true, true, false, SpeechHealth::Closed).next(),
+            TtsWaitStep::Stop
+        );
+        assert_eq!(
+            state(false, false, false, SpeechHealth::Closed).next(),
+            TtsWaitStep::AbandonBeforeStart
+        );
+    }
+
+    /// 超时是兜底：到点之后无论是否仍在播放都不再等，且轮询间隔永不越界。
+    #[test]
+    fn tts_wait_poll_interval_is_bounded_by_the_deadline() {
+        let now = Instant::now();
+        let near_deadline = TtsWaitState {
+            now,
+            deadline: now + Duration::from_millis(2),
+            started_playing: false,
+            speaking: false,
+            stop_requested: false,
+            health: SpeechHealth::Healthy,
+        };
+        match near_deadline.next() {
+            TtsWaitStep::Poll { interval } => {
+                assert!(interval <= Duration::from_millis(2), "不得越过截止时刻");
+                assert!(!interval.is_zero(), "轮询必须有正步长，不能忙等");
+            }
+            other => panic!("应继续等待，实际 {other:?}"),
+        }
+
+        let past_deadline = TtsWaitState {
+            now,
+            deadline: now - Duration::from_millis(1),
+            started_playing: true,
+            speaking: true,
+            stop_requested: false,
+            health: SpeechHealth::Healthy,
+        };
+        assert_eq!(past_deadline.next(), TtsWaitStep::Stop);
     }
 
     #[test]

@@ -1,7 +1,5 @@
 use super::*;
-use crate::features::command_access::{
-    CommandAccessConfig, CommandPermission, CommandPolicy, catalog_policy,
-};
+use crate::features::command_access::{CommandPermission, CommandPolicy, catalog_policy};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -358,7 +356,6 @@ pub(super) fn commands_catalog_route(
             .map(|(value, label)| json!({"value":value,"label":label}))
             .collect::<Vec<_>>()
     );
-    let defaults = CommandAccessConfig::default();
     if let Some(groups) = view["groups"].as_array_mut() {
         for group in groups {
             if let Some(commands) = group["commands"].as_array_mut() {

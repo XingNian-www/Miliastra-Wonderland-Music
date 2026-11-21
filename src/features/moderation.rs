@@ -432,7 +432,11 @@ impl ModerationService {
     }
 
     /// 用实时配置刷新投票阈值；下一次投票判定即生效（不需要重建服务或重启）。
-    pub(crate) fn update_vote_thresholds(&self, stable_vote_samples: u32, required_vote_margin: i32) {
+    pub(crate) fn update_vote_thresholds(
+        &self,
+        stable_vote_samples: u32,
+        required_vote_margin: i32,
+    ) {
         let mut thresholds = self
             .live_thresholds
             .write()

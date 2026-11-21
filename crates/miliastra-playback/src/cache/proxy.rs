@@ -384,13 +384,12 @@ async fn serve_streaming(
                     return serve_complete_chunked(inner, stream, hash, start).await;
                 }
                 // 等待下载推进后再试。
-                let progressed =
-                    wait_for_bytes(
-                        handle,
-                        start as usize + 1,
-                        (inner.limits)().seek_wait_timeout,
-                    )
-                        .await;
+                let progressed = wait_for_bytes(
+                    handle,
+                    start as usize + 1,
+                    (inner.limits)().seek_wait_timeout,
+                )
+                .await;
                 if !progressed {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,

@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use async_openai::types::responses::{
-    CreateResponse, CreateResponseArgs, OutputItem, OutputMessageContent, Response,
-    ResponseFormatJsonSchema, Status, Tool, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
+    CreateResponse, CreateResponseArgs, Response, ResponseFormatJsonSchema, Tool,
+    ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
 };
 use miliastra_playback::TrackKey;
 use serde::{Deserialize, Serialize};
@@ -400,8 +400,6 @@ fn response_output_text(value: &Response) -> Result<String> {
     }
     Ok(parts.texts.join(""))
 }
-
-
 
 fn model_reply_json_object(reply: &str) -> Result<String> {
     crate::text::extract_json_object(reply)

@@ -19,27 +19,15 @@ mod system;
 mod ui;
 
 pub(crate) use aggregate::{AppConfig, BootstrapConfig, MAX_REPLY_OVERRIDE_CHARS};
-pub(crate) use general::StateConfig;
-pub(crate) use general::resolve_stability_count;
 pub(crate) use general::{
     HotkeyConfig, OutputConfig, PointConfig, RectConfig, ScreenConfig, WindowConfig,
 };
-pub(crate) use general::{StabilityConfig, WindowCaptureMethod, parse_hotkey_virtual_code};
+pub(crate) use paths::normalize_native_path_string;
 pub(crate) use paths::validate_rect;
-pub(crate) use paths::{
-    normalize_native_path, normalize_native_path_string, normalize_separators_text,
-};
-pub(crate) use paths::{
-    resolve_optional_path, resolve_path, resolve_path_with_default, validate_nonempty_path,
-    validate_point_in_canvas, validate_rect_in_canvas, validate_unit_interval,
-};
-pub(crate) use playback::{AudioCacheFileConfig, PlaybackConfig};
-// 这些结构体只在 crate 内部经 `AppConfig` 或模块路径使用；`mod.rs` 只重导出
-// 需要跨文件引用的类型，其余按需经 `types::<域>::Xxx` 访问，避免制造
-// 「重导出了但没人用」的死代码告警。
+#[cfg(test)]
+pub(crate) use playback::AudioCacheFileConfig;
 pub(crate) use system::{HttpConfig, KugouDeviceConfig, LoggingConfig, TuiConfig};
 pub(crate) use ui::{
-    ChatScanTimingConfig, ChatSourceConfig, ChatSourceDisconnectAction, CommandTimingConfig,
-    DecisionTimingConfig, ExternalTimingConfig, HallTimingConfig, InputTimingConfig, OcrConfig,
-    OpenVinoConfig, TemplateConfig, TimingConfig,
+    ChatSourceConfig, ChatSourceDisconnectAction, HallTimingConfig, InputTimingConfig, OcrConfig,
+    TemplateConfig, TimingConfig,
 };

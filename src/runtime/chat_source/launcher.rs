@@ -363,9 +363,9 @@ fn find_chatbridge_under(root: &Path) -> Option<PathBuf> {
             }
             let path = entry.path();
             if entry.file_type().is_ok_and(|kind| kind.is_file())
-                && path.file_name().is_some_and(|name| {
-                    name.eq_ignore_ascii_case(CHATBRIDGE_EXE)
-                })
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(CHATBRIDGE_EXE))
             {
                 // 浅层优先（BFS）：第一个命中的就是最优。
                 return Some(path);
@@ -777,10 +777,8 @@ mod tests {
     /// `bin` 子目录（含 exe 同级的 bin 与 deps/bin）也在扫描范围内。
     #[test]
     fn recursive_scan_covers_bin_directories() {
-        let root = std::env::temp_dir().join(format!(
-            "miliastra-chatbridge-bin-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("miliastra-chatbridge-bin-{}", std::process::id()));
         let bot = root.join("bot");
         let deps_bin = bot.join("deps").join("bin");
         std::fs::create_dir_all(&deps_bin).expect("建 deps/bin");
@@ -802,10 +800,8 @@ mod tests {
     /// 文件名大小写不敏感：Windows 上用户可能改成大写，仍应命中。
     #[test]
     fn recursive_scan_matches_filename_case_insensitively() {
-        let root = std::env::temp_dir().join(format!(
-            "miliastra-chatbridge-case-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("miliastra-chatbridge-case-{}", std::process::id()));
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).expect("建 bin");
         let exe = bin.join("Miliastra-Wonderland-ChatBridge.EXE");
@@ -818,10 +814,8 @@ mod tests {
     /// 找不到时必须返回 None，而不是 panic 或返回目录。
     #[test]
     fn recursive_scan_returns_none_when_absent() {
-        let root = std::env::temp_dir().join(format!(
-            "miliastra-chatbridge-empty-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("miliastra-chatbridge-empty-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("建空目录");
         assert_eq!(find_chatbridge_under(&root), None);
         let _ = std::fs::remove_dir_all(&root);
@@ -870,7 +864,10 @@ mod tests {
         );
         assert_eq!(state.stop, Some(StopMode::WaitGameExit));
         // 游戏退出后解除等待，下一次调用才允许启动。
-        assert_eq!(gate_launch(&mut state, now, Some(false)), LaunchGate::Launch);
+        assert_eq!(
+            gate_launch(&mut state, now, Some(false)),
+            LaunchGate::Launch
+        );
         assert_eq!(state.stop, None);
     }
 
@@ -900,10 +897,16 @@ mod tests {
         state.stop = Some(StopMode::LinkLost);
         let now = Instant::now();
         // 先确认游戏仍在运行：停止态继续，并记住确实看到过游戏。
-        assert_eq!(gate_launch(&mut state, now, Some(true)), LaunchGate::LinkLost);
+        assert_eq!(
+            gate_launch(&mut state, now, Some(true)),
+            LaunchGate::LinkLost
+        );
         assert!(state.link_lost_game_seen);
         // 玩家照提示退出游戏：游戏进程消失后解除停止态并允许重试。
-        assert_eq!(gate_launch(&mut state, now, Some(false)), LaunchGate::Launch);
+        assert_eq!(
+            gate_launch(&mut state, now, Some(false)),
+            LaunchGate::Launch
+        );
         assert_eq!(state.stop, None);
         assert!(!state.link_lost_game_seen);
     }
@@ -928,7 +931,10 @@ mod tests {
         let mut state = LaunchState::new();
         let now = Instant::now();
         state.next_attempt = Some(now + Duration::from_secs(30));
-        assert_eq!(gate_launch(&mut state, now, Some(false)), LaunchGate::Backoff);
+        assert_eq!(
+            gate_launch(&mut state, now, Some(false)),
+            LaunchGate::Backoff
+        );
         assert_eq!(
             gate_launch(&mut state, now + Duration::from_secs(31), Some(false)),
             LaunchGate::Launch

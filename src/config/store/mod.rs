@@ -34,7 +34,9 @@
 //! ├─ ensure_reply_schema：命令回复两表（与配置 revision 独立）
 //! └─ apply_content_migrations：旧文案改写；无差异则不写库、不涨 revision
 //! ```
-
+//!
+//! 可见性口径：迁移只经 [`ConfigStore::open`] 这一个入口发生，迁移统计
+//! （`upgrade::MigrationOutcome`）收在 [`upgrade`] 内部，不外泄到其它子模块。
 mod codec;
 mod replies;
 mod sqlite;
@@ -45,12 +47,15 @@ mod upgrade;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use codec::{SECRET_CLEAR_MARKER, SECRET_MASK, mask_secrets};
+pub(crate) use codec::{SECRET_MASK, mask_secrets};
 pub(crate) use sqlite::{CONFIG_SCHEMA_VERSION, SharedConfigStore};
 pub(crate) use types::{
-    ConfigFieldError, ConfigFieldErrors, ConfigRevisionInfo, ConfigSaveError, ConfigSaveOutcome,
-    StoredReply,
+    ConfigFieldError, ConfigRevisionInfo, ConfigSaveError, ConfigSaveOutcome, StoredReply,
 };
+// `ConfigFieldErrors` 只作为 [`ConfigSaveError::Other`] 的 downcast 目标被测试取用，
+// 生产路径不直接构造它，因此只在测试构建里重导出。
+#[cfg(test)]
+pub(crate) use types::ConfigFieldErrors;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -61,8 +66,6 @@ use serde_json::{Map, Value};
 
 use super::AppConfig;
 use super::BootstrapConfig;
-use super::migrations;
-use super::schema::SECRET_PATHS;
 
 use codec::{
     apply_secret_clear_markers, collect_changed_paths, force_retain_secret_fields, merge_sections,
@@ -230,7 +233,7 @@ impl ConfigStore {
     ///
     /// secret 字段（ai.api_key 等）提交值为 null、空字符串或 [`SECRET_MASK`]
     /// （Web 页面回传的掩码）时保留当前值；提交值等于 JSON 对象
-    /// `{"__clear__": true}`（[`SECRET_CLEAR_MARKER`]）时清除该字段（写入空串）；
+    /// `{"__clear__": true}`（`codec::SECRET_CLEAR_MARKER`）时清除该字段（写入空串）；
     /// base_revision 与库中当前版本不一致时拒绝写入。
     pub fn save(
         &mut self,

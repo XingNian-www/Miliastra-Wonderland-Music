@@ -24,8 +24,11 @@ pub use service::{
 };
 
 /// A reply that stays raw or keyed until the composition delivery boundary.
+///
+/// 只在 crate 内使用：`composition` 的投递层在边界上把它渲染成成品文案，
+/// 对外不暴露模板键与变量，因此与 [`ReplyTemplate`] / [`ReplyVars`] 同为 `pub(crate)`。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UndercoverReply {
+pub(crate) enum UndercoverReply {
     Raw(String),
     Keyed {
         spec: &'static ReplyTemplate,
@@ -87,8 +90,10 @@ impl UndercoverReply {
 }
 
 /// One private message, retaining the recipient beside its unresolved reply.
+///
+/// 与 [`UndercoverReply`] 同为 crate 内部类型：投递层在边界上渲染成成品文案。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UndercoverFriendDelivery {
+pub(crate) struct UndercoverFriendDelivery {
     pub recipient: String,
     pub reply: UndercoverReply,
 }
@@ -583,9 +588,7 @@ impl UndercoverGame {
         if lobby.players.len() >= self.config.max_players.clamp(4, 11) {
             bail!("谁是卧底房间已满");
         }
-        lobby
-            .players
-            .push(Player::lobby(player, player_display));
+        lobby.players.push(Player::lobby(player, player_display));
         lobby.last_activity = now;
         Ok(())
     }
@@ -608,7 +611,9 @@ impl UndercoverGame {
         if words.civilian.trim().is_empty() || words.undercover.trim().is_empty() {
             bail!("谁是卧底词语不能为空");
         }
-        if crate::text::player_match_key(&words.civilian) == crate::text::player_match_key(&words.undercover) {
+        if crate::text::player_match_key(&words.civilian)
+            == crate::text::player_match_key(&words.undercover)
+        {
             bail!("平民词和卧底词不能相同");
         }
 
@@ -1678,7 +1683,6 @@ fn settlement_lines(game: &Playing, winner: Winner) -> Vec<UndercoverReply> {
 fn player_key(value: &str) -> String {
     crate::text::player_match_key(value)
 }
-
 
 pub(super) fn normalized_word_component(value: &str) -> String {
     crate::text::word_match_key(value)

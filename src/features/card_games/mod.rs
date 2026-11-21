@@ -41,8 +41,9 @@ pub use deadline::{CardGameDeadlineKind, CardGameDeadlineModule, CardGameDeadlin
 #[allow(unused_imports)]
 pub use landlord::LandlordGame;
 #[allow(unused_imports)]
-pub use outcome::{
-    CardGameFriendBatchOutcome, CardGameReplyTemplate, LandlordOutcome, LandlordPrivateDelivery,
+pub use outcome::LandlordOutcome;
+pub(crate) use outcome::{
+    CardGameFriendBatchOutcome, CardGameReplyTemplate, LandlordPrivateDelivery,
 };
 pub use service::{
     CardGameApplication, CardGameCancel, CardGameCommandStart, CardGameEffectClaim,

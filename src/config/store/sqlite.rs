@@ -25,10 +25,7 @@ use crate::config::AppConfig;
 use crate::config::migrations;
 
 use super::ConfigStore;
-use super::tables::{
-    CONFIG_TABLES, META_COLUMNS, REVISIONS_COLUMNS, SECTIONS_COLUMNS,
-    config_meta_constraints_match, table_structure_matches,
-};
+use super::tables::{config_meta_constraints_match, table_structure_matches};
 
 /// 配置数据库 schema 版本；与请求状态快照版本及缓存 user_version 完全独立。
 ///

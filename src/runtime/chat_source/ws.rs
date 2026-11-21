@@ -1,5 +1,7 @@
 //! WebSocket 实现：连接 `chat-api` 的 `/stream`，把推送转成事件。
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -21,6 +23,16 @@ const TOKEN_HEADER: &str = "x-miliastra-token";
 /// 刷新。服务端 30 秒一次 Ping，3 秒的轮询不会打断它。
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 读等待的分片长度：决定停止信号最多被拖多久才发现。
+///
+/// 单次 `READ_TIMEOUT` 是 3 秒，若只在它到期后才检查停止标志，关停要等满一整个
+/// 分片——已连接但长时间没有消息正是关闭时的常态。切成 100 毫秒的小段后，
+/// 停止信号最多延后一个分片，`join` 保持在亚秒级。
+///
+/// 分片只影响**检查频率**，不影响超时语义：累计到 `READ_TIMEOUT` 才判定为读超时，
+/// 因此「超时」与「连接已关」仍然严格分开（把超时当关闭会导致每 3 秒重连一次）。
+const READ_SLICE: Duration = Duration::from_millis(100);
+
 pub(crate) struct WebSocketChatSource {
     name: String,
     url: String,
@@ -31,6 +43,9 @@ pub(crate) struct WebSocketChatSource {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     >,
+    /// 上层线程的停止标志。Some 时读等待按 [`READ_SLICE`] 分片，每片之间问一次；
+    /// None 时退化为原来的整段 3 秒等待（供不关心关停时序的调用方使用）。
+    interrupt: Option<Arc<AtomicBool>>,
 }
 
 impl WebSocketChatSource {
@@ -46,7 +61,22 @@ impl WebSocketChatSource {
             token,
             runtime,
             connection: None,
+            interrupt: None,
         })
+    }
+
+    /// 挂上停止标志：置位后下一次读等待最多再等一个 [`READ_SLICE`] 就返回。
+    ///
+    /// 只影响「等待怎么被打断」，不改变任何事件语义——被打断时与读超时一样返回
+    /// `Ok(None)`，连接保持不动，由调用方决定退出还是继续。
+    pub(crate) fn set_interrupt(&mut self, flag: Arc<AtomicBool>) {
+        self.interrupt = Some(flag);
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
     fn connect(&mut self) -> Result<()> {
@@ -93,16 +123,34 @@ impl ChatSource for WebSocketChatSource {
             TimedOut,
             Closed,
         }
+        let interrupt = self.interrupt.clone();
         let read: Result<Read> = self.runtime.block_on(async {
-            match tokio::time::timeout(READ_TIMEOUT, stream.next()).await {
-                // 流结束：对端真的关了。
-                Err(_) => Ok(Read::TimedOut),
-                Ok(None) => Ok(Read::Closed),
-                Ok(Some(Ok(message))) => Ok(Read::Message(message)),
-                Ok(Some(Err(WsError::ConnectionClosed | WsError::AlreadyClosed))) => {
-                    Ok(Read::Closed)
+            // 分片等待：每片之间检查停止标志，累计到 READ_TIMEOUT 才算读超时。
+            let started = tokio::time::Instant::now();
+            loop {
+                let slice = READ_TIMEOUT.saturating_sub(started.elapsed());
+                if slice.is_zero() {
+                    return Ok(Read::TimedOut);
                 }
-                Ok(Some(Err(error))) => Err(anyhow::anyhow!(error.to_string())),
+                let slice = slice.min(READ_SLICE);
+                match tokio::time::timeout(slice, stream.next()).await {
+                    // 本片没有消息：先看是否该停止，再决定是否继续等。
+                    Err(_) => {
+                        if interrupt
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire))
+                        {
+                            return Ok(Read::TimedOut);
+                        }
+                    }
+                    // 流结束：对端真的关了。
+                    Ok(None) => return Ok(Read::Closed),
+                    Ok(Some(Ok(message))) => return Ok(Read::Message(message)),
+                    Ok(Some(Err(WsError::ConnectionClosed | WsError::AlreadyClosed))) => {
+                        return Ok(Read::Closed);
+                    }
+                    Ok(Some(Err(error))) => return Err(anyhow::anyhow!(error.to_string())),
+                }
             }
         });
         match read {

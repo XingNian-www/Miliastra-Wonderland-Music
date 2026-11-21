@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 
 use super::formal_task::FormalTaskClient;
 use super::{
-    ApplicationRuntime, PendingTask, PendingTaskExecution, ResidencyPurpose, TemporaryPrimaryHold,
+    AppServices, AppServicesPort, PendingTask, PendingTaskExecution, ResidencyPurpose,
+    TemporaryPrimaryHold,
     UiResidency,
 };
 use crate::features::command::{ModuleCommand, RoutedCommand};
@@ -563,7 +564,7 @@ impl ModerationPrimaryHold for TemporaryPrimaryHold {
     }
 }
 
-impl ModerationCommandPort for ApplicationRuntime {
+impl ModerationCommandPort for AppServicesPort<'_> {
     fn send_hall(&mut self, message: &str) -> Result<()> {
         self.reply(message)
     }
@@ -596,7 +597,7 @@ impl ModerationCommandPort for ApplicationRuntime {
         // 注意返回的 hold 必须是**类型化占位**而不是 `None`：`execute_result`
         // 用 `hold.is_none()` 判断是不是"管理员直执行"，返回 None 会让投票通过
         // 被误当成直执行，绕过 CAS 并改写大厅文案。
-        if self.lifecycle.external_chat.supplies_hall_messages() {
+        if self.shared.external_chat.supplies_hall_messages() {
             log::debug!("外部聊天源接管中，管理投票不需要切到一级界面（票由 socket 推送提供）");
             return Ok(Box::new(NoPrimaryHold));
         }
@@ -622,7 +623,7 @@ impl ModerationPrimaryHold for NoPrimaryHold {
     fn release(&mut self) {}
 }
 
-impl ModerationExecutionPort for ApplicationRuntime {
+impl ModerationExecutionPort for AppServicesPort<'_> {
     fn send_hall(&mut self, message: &str) -> Result<()> {
         self.reply(message)
     }
@@ -803,12 +804,12 @@ fn reauthorize_moderation_result(
     false
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     /// 聊天观察线程只接管租约并入队，不发送消息、不执行任何游戏 UI。
     pub(super) fn enqueue_direct_blacklist(&self, parsed: &RoutedCommand) -> Result<bool> {
         let Some(start) = prepare_direct_blacklist(
             &self.business.moderation,
-            &self.lifecycle.live_configs.identity,
+            &self.shared.live_configs.identity,
             parsed,
         )?
         else {
@@ -832,7 +833,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn execute_moderation_with_vote(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &command::ModerationCommand,
     ) -> Result<bool> {
@@ -840,15 +841,16 @@ impl ApplicationRuntime {
         // 投票阈值（stable_vote_samples / required_vote_margin）每次命令入口从实时配置读取，
         // 保存后下一条管理命令即按新阈值判定；不重建服务、不影响进行中的播放/游戏。
         {
-            let config = self.lifecycle.live_configs.snapshot();
+            let config = self.shared.live_configs.snapshot();
             moderation.update_vote_thresholds(
                 config.moderation.stable_vote_samples,
                 config.moderation.required_vote_margin,
             );
         }
         let requester_role =
-            moderation_requester_role(&self.lifecycle.live_configs.identity, parsed);
-        match moderation.start(command, requester_role, self)? {
+            moderation_requester_role(&self.shared.live_configs.identity, parsed);
+        let mut port = self.port();
+        match moderation.start(command, requester_role, &mut port)? {
             ModerationStart::Duplicate => Ok(false),
             ModerationStart::Ready(task) => {
                 // 这条「立即执行」路径**故意不绑 direct_account、也不复查**：它同步执行，
@@ -856,7 +858,8 @@ impl ApplicationRuntime {
                 // （start 内部的 reserve_direct_blacklist 不 bind，direct_account 恒为 None）。
                 // 若将来把它改成异步入队，必须同时补 bind_direct_sender 与
                 // reauthorize_moderation_result，否则会变成「未绑定 = 复查必 false」的静默取消。
-                moderation.execute_result(task, self)?;
+                let mut port = self.port();
+                moderation.execute_result(task, &mut port)?;
                 Ok(true)
             }
             ModerationStart::Started(work) => {
@@ -877,22 +880,22 @@ impl ApplicationRuntime {
             .lock()
             .map_err(|_| anyhow::anyhow!("管理投票线程句柄锁已损坏"))?;
         let vote_context = ModerationVoteContext {
-            running: Arc::clone(&self.lifecycle.running),
+            running: Arc::clone(&self.shared.running),
             chat_timeline: self.ui.chat_timeline.clone(),
             baseline_timeout: Duration::from_millis(super::live_decision_timeout_ms(
-                &self.lifecycle.live_configs,
+                &self.shared.live_configs,
             )),
             // 投票永远属于「当前所在大厅」这个业务容器，与屏幕桶、消息来源无关。
             vote_scope: self.ui.chat_timeline.current_hall_scope()?,
-            identity: self.lifecycle.live_configs.identity.clone(),
+            identity: self.shared.live_configs.identity.clone(),
             // 外部源在线时先用序号水位建基线，避免安静大厅等不到帧而开不了投票。
             // 用一次性快照而非两次原子读：分开读会得到「在线 + 旧水位」这种
             // 不存在的组合，那会让整场投票用错的水位单位。
-            external_floor: self.lifecycle.external_chat.hall_watermark(),
+            external_floor: self.shared.external_chat.hall_watermark(),
         };
         let task_context = ModerationTaskContext {
-            running: Arc::clone(&self.lifecycle.running),
-            formal_tasks: self.business.formal_tasks.clone(),
+            running: Arc::clone(&self.shared.running),
+            formal_tasks: self.formal_tasks.get().cloned(),
             source_command: source.clone(),
         };
         let moderation = self.business.moderation.clone();
@@ -944,15 +947,16 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn execute_moderation_vote_result(
-        &mut self,
+        &self,
         mut task: ModerationResultTask,
     ) -> Result<PendingTaskExecution> {
-        if !reauthorize_moderation_result(&self.lifecycle.live_configs.identity, &mut task) {
+        if !reauthorize_moderation_result(&self.shared.live_configs.identity, &mut task) {
             log::warn!("管理员拉黑任务因发起者权限已失效而取消");
             return Ok(PendingTaskExecution::Completed);
         }
         let moderation = self.business.moderation.clone();
-        match moderation.execute_result(task, self)? {
+        let mut port = self.port();
+        match moderation.execute_result(task, &mut port)? {
             ModerationResultExecution::Completed => Ok(PendingTaskExecution::Completed),
         }
     }

@@ -25,7 +25,7 @@ mod workers;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -111,13 +111,13 @@ use crate::runtime::ocr::{
 };
 use crate::runtime::player_io::{
     PlayerLiveTuning, PlayerLiveTuningProvider, PlayerRuntime, PlayerRuntimeConfig,
-    PlayerSearchClient, PlayerSearchClientError,
+    PlayerRuntimeHandle, PlayerSearchClient, PlayerSearchClientError,
 };
 use crate::runtime::scheduler::FormalTaskEnqueueOutcome;
 use crate::runtime::task_engine::TaskEngineHandle;
 use crate::runtime::ui::{
-    FrameDemand, FrameDemandSubscription, FramePublication, UiCoordinator, UiRuntime, UiStateKind,
-    UiStateObservation,
+    FrameDemand, FrameDemandSubscription, FramePublication, UiCoordinator, UiRuntime,
+    UiRuntimeHandle, UiStateKind, UiStateObservation,
 };
 use crate::ui::atoms::GameUi;
 use crate::ui::chat_output::{ChatBatchSendOutcome, ChatBatchSendStatus, ChatOutput};
@@ -375,80 +375,174 @@ fn receive_observation_frame(
     }
 }
 
-struct UiBundle {
-    coordinator: UiCoordinator,
-    ocr_args: ResolvedOcrArgs,
-    chat_templates: ResolvedTemplateArgs,
-    hotkeys: Option<hotkeys::HotkeyRuntime>,
-    game_ui: GameUi,
-    residency_ui: ResidencyUi,
-    hall_ui: HallUi,
-    moderation_ui: ModerationUi,
-    startup_ui: StartupUi,
-    secondary_unread_ui: SecondaryUnreadUi,
-    friend_delivery_ui: FriendDeliveryUi,
-    invite_ui: InviteUi,
-    custom_action_ui: CustomActionUi,
-    ui_runtime: Option<UiRuntime>,
-    chat_output: ChatOutput,
-    ocr: OcrRuntimeHandle,
-    ocr_runtime: Option<OcrRuntime>,
-    latest_frame: Arc<Mutex<LatestFrameCache>>,
-    window_detection_signal: WindowDetectionSignal,
-    chat_baseline_primed: Arc<AtomicBool>,
-    chat_observations: ChatObservationShared,
-    chat_timeline: crate::observation::chat::ChatTimeline,
+/// 界面侧的共享服务：UI 例程、截图缓存与聊天观察总线。
+///
+/// **这些字段全部是真实接线的可克隆句柄**。正式任务执行器与主循环共用同一个
+/// [`AppServices`] 实例（同一个 `Arc`），因此不存在「某个上下文里没接线」的
+/// 状态——`ui_handle` 在 [`ApplicationRuntime::new`] 创建 `UiRuntime` 时立即注入，
+/// 不是 `Option`，也不必再从「拥有的运行时」里反向取一次句柄。
+pub(crate) struct UiServices {
+    /// 界面设备独占协调器：正式任务持租约时主循环不扫描。
+    pub(super) coordinator: UiCoordinator,
+    /// UI runtime 的克隆句柄：截图、界面状态观察、帧需求都走它。
+    ///
+    /// `ApplicationRuntime` 自己持有的 [`UiRuntime`] 只用于关停，
+    /// 任何「读状态」的调用点都必须用这个句柄，而不是 `owned.ui_runtime`。
+    pub(super) ui_handle: UiRuntimeHandle,
+    pub(super) ocr_args: ResolvedOcrArgs,
+    pub(super) chat_templates: ResolvedTemplateArgs,
+    pub(super) game_ui: GameUi,
+    pub(super) residency_ui: ResidencyUi,
+    pub(super) hall_ui: HallUi,
+    pub(super) moderation_ui: ModerationUi,
+    pub(super) startup_ui: StartupUi,
+    pub(super) secondary_unread_ui: SecondaryUnreadUi,
+    pub(super) friend_delivery_ui: FriendDeliveryUi,
+    pub(super) invite_ui: InviteUi,
+    pub(super) custom_action_ui: CustomActionUi,
+    pub(super) chat_output: ChatOutput,
+    pub(super) ocr: OcrRuntimeHandle,
+    pub(super) latest_frame: Arc<Mutex<LatestFrameCache>>,
+    pub(super) window_detection_signal: WindowDetectionSignal,
+    pub(super) chat_baseline_primed: Arc<AtomicBool>,
+    pub(super) chat_observations: ChatObservationShared,
+    pub(super) chat_timeline: crate::observation::chat::ChatTimeline,
 }
 
-struct PlaybackBundle {
-    player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
-    playback_application: PlaybackApplication,
-    player_search: PlayerSearchClient,
-    player_runtime: Option<PlayerRuntime>,
-    native_playback: PlaybackHandle,
-    login_helper: LoginHelperManager,
-    native_playback_runtime: Option<NativePlaybackRuntime>,
+/// 播放侧的共享服务。
+pub(crate) struct PlaybackServices {
+    pub(super) player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
+    pub(super) playback_application: PlaybackApplication,
+    pub(super) player_search: PlayerSearchClient,
+    /// 播放器运行时的克隆句柄：面板的播放控制与状态查询直接用它。
+    ///
+    /// 播放器的**所有权**（关停）只在 [`OwnedRuntimes::player_runtime`]。
+    pub(super) player_runtime: PlayerRuntimeHandle,
+    pub(super) native_playback: PlaybackHandle,
+    pub(super) login_helper: LoginHelperManager,
 }
 
-struct BusinessBundle {
-    business: BusinessRuntimeHandle,
-    task_engine: TaskEngineHandle,
-    business_events: BusinessRuntimeEventSink,
-    business_runtime: Option<BusinessRuntimeGroup>,
-    formal_task_runtime: Option<FormalTaskRuntime>,
-    formal_tasks: Option<FormalTaskClient>,
-    background_commands: workers::BackgroundCommandManager,
-    ai: AiClient,
-    // 记忆与冷却门是「全局唯一一份」的进程内状态：facade 与正式执行上下文必须共享同一实例，
+/// 业务垂直模块与它们的运行时端口。
+pub(crate) struct BusinessServices {
+    pub(super) business: BusinessRuntimeHandle,
+    pub(super) task_engine: TaskEngineHandle,
+    pub(super) business_events: BusinessRuntimeEventSink,
+    pub(super) background_commands: workers::BackgroundCommandManager,
+    pub(super) ai: AiClient,
+    // 记忆与冷却门是「全局唯一一份」的进程内状态：主循环与正式执行上下文必须共享同一实例，
     // 因此用 Arc 而不是 Clone（它们本身也不该被复制出第二份冷却账本）。
-    ai_chat_memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
+    pub(super) ai_chat_memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
     /// 记忆维护代际：@忘记我 / 面板重建会自增；后台抽取/压缩提交前比较，
     /// 不一致就丢弃结果，避免在途任务把刚清除的记忆写回来。
-    ai_chat_memory_generation: std::sync::Arc<AtomicU64>,
+    pub(super) ai_chat_memory_generation: std::sync::Arc<AtomicU64>,
     /// 记忆维护单飞键：同一 actor 的抽取、同一 scope 的压缩不能并发。
     ///
     /// 抽取是 read-modify-write，两次并发会让 remove 失效、新旧事实并存；
     /// 压缩并发会让窄计划覆盖宽计划写出的摘要。冷却门在提问开始时判定，
     /// 而抽取在回复生成后才启动，8s 冷却短于 10s 抽取超时，重叠是常态。
-    ai_chat_maintenance_inflight: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
-    ai_chat_gate: std::sync::Arc<crate::features::ai_chat::TriggerGate>,
-    ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
-    ai_connection: crate::config::ai::AiConfig,
-    ai_request_timeout: std::time::Duration,
-    tts: Arc<crate::features::tts::TtsRuntime>,
-    song_requests: SongRequestApplication,
-    card_games: CardGameApplication,
-    administration_application: AdministrationApplication,
-    hall_application: HallApplication,
-    idiom_chain_application: IdiomChainApplication,
-    tarot_application: crate::features::tarot::TarotApplication,
-    playlist_application: crate::features::playlist::PlaylistApplication,
-    turtle_soup_application: TurtleSoupApplication,
-    undercover_game: UndercoverApplication,
-    moderation: ModerationService,
-    moderation_workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
-    startup: StartupService,
-    custom_workflow: CustomWorkflowService,
+    pub(super) ai_chat_maintenance_inflight: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
+    pub(super) ai_chat_gate: std::sync::Arc<crate::features::ai_chat::TriggerGate>,
+    pub(super) ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
+    pub(super) ai_connection: crate::config::ai::AiConfig,
+    pub(super) ai_request_timeout: std::time::Duration,
+    pub(super) tts: Arc<crate::features::tts::TtsRuntime>,
+    pub(super) song_requests: SongRequestApplication,
+    pub(super) card_games: CardGameApplication,
+    pub(super) administration_application: AdministrationApplication,
+    pub(super) hall_application: HallApplication,
+    pub(super) idiom_chain_application: IdiomChainApplication,
+    pub(super) tarot_application: crate::features::tarot::TarotApplication,
+    pub(super) playlist_application: crate::features::playlist::PlaylistApplication,
+    pub(super) turtle_soup_application: TurtleSoupApplication,
+    pub(super) undercover_game: UndercoverApplication,
+    pub(super) moderation: ModerationService,
+    pub(super) moderation_workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    pub(super) startup: StartupService,
+    pub(super) custom_workflow: CustomWorkflowService,
+}
+
+/// 跨上下文共享的生命周期开关与配置句柄。
+///
+/// 这些值必须**跨上下文是同一份**：正式任务执行器读到的暂停位、接管状态、
+/// 配置快照，就是主循环写的那一份。因此全部用 `Arc`/共享句柄，且没有任何
+/// `Option`——「没接线」不是一种合法状态。
+pub(crate) struct SharedLifecycleServices {
+    /// 启动期冻结配置：只读，用于路径、模板与需要启动口径的判定。
+    pub(super) config: AppConfig,
+    /// 热更新共享句柄集合：HTTP 保存成功后 apply，各消费方持同一份。
+    pub(super) live_configs: LiveConfigs,
+    /// 配置中心共享句柄；HTTP 面板保存与正式任务读取回复模板共用。
+    pub(super) config_store: crate::config::SharedConfigStore,
+    /// 外部聊天源共享状态：观察线程据此决定是否跳过 OCR 聊天识别，
+    /// 决策窗口据此决定走序号水位还是屏幕基线。
+    pub(super) external_chat: external_chat::ExternalChatState,
+    pub(super) running: Arc<AtomicBool>,
+    pub(super) paused: Arc<AtomicBool>,
+    pub(super) shutdown: ShutdownState,
+    pub(super) reload_startup: ReloadStartupGate,
+    pub(super) console_reply_context: Arc<AtomicBool>,
+    pub(super) monitor: MonitorShared,
+    /// HTTP 重载闸门：只在 HTTP 服务启动时才有真实句柄，
+    /// 未启动时是本地占位（计数恒 0、排空恒 false），语义上仍然是「当前没有 HTTP 操作」。
+    pub(super) http_reload: HttpReloadGates,
+}
+
+/// HTTP 重载排空闸门的两个共享句柄。
+///
+/// 与 [`SharedLifecycleServices`] 里的其余字段不同，它们在 HTTP 服务**启动时**
+/// 才会被 `HttpSharedState` 的真实句柄替换；启动前用等价的本地占位，
+/// 因此调用点不需要判断 `Option`，也就不会把「尚未启动」误读成「放行」。
+#[derive(Clone, Debug)]
+pub(crate) struct HttpReloadGates {
+    inner: Arc<Mutex<HttpReloadGatesInner>>,
+}
+
+#[derive(Debug)]
+struct HttpReloadGatesInner {
+    blockers: Arc<AtomicUsize>,
+    draining: Arc<AtomicBool>,
+    attached: bool,
+}
+
+impl HttpReloadGates {
+    fn detached() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HttpReloadGatesInner {
+                blockers: Arc::new(AtomicUsize::new(0)),
+                draining: Arc::new(AtomicBool::new(false)),
+                attached: false,
+            })),
+        }
+    }
+
+    /// 当前「在途 HTTP 写操作」计数。面板未启动时是本地占位（恒 0）。
+    pub(super) fn blockers(&self) -> Arc<AtomicUsize> {
+        self.lock().blockers.clone()
+    }
+
+    /// 当前「正在为配置重载排空」标志。面板未启动时是本地占位（恒 false）。
+    pub(super) fn draining(&self) -> Arc<AtomicBool> {
+        self.lock().draining.clone()
+    }
+
+    /// 面板是否已经启动（真实闸门是否已登记）。
+    pub(super) fn is_attached(&self) -> bool {
+        self.lock().attached
+    }
+
+    /// 登记 HTTP 面板的真实闸门句柄。
+    fn attach(&self, blockers: Arc<AtomicUsize>, draining: Arc<AtomicBool>) {
+        let mut inner = self.lock();
+        inner.blockers = blockers;
+        inner.draining = draining;
+        inner.attached = true;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HttpReloadGatesInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -612,230 +706,165 @@ impl ReloadStartupGate {
     }
 }
 
-struct LifecycleBundle {
-    config: AppConfig,
-    /// 热更新共享句柄集合（阶段 7）：HTTP 保存成功后 apply，
-    /// HTTP 服务与各消费方持有同一份 Arc。
-    live_configs: LiveConfigs,
-    http_server: Option<http::HttpServer>,
-    http_reload_blockers: Arc<AtomicUsize>,
-    http_reload_draining: Arc<AtomicBool>,
-    openai_runtime: Option<OpenAiRuntime>,
-    running: Arc<AtomicBool>,
-    shutdown: ShutdownState,
-    reload_startup: ReloadStartupGate,
-    reload_check_after: Instant,
-    paused: Arc<AtomicBool>,
-    console_reply_context: Arc<AtomicBool>,
-    monitor: MonitorShared,
-    /// 配置中心共享句柄；正式运行时由 ApplicationRuntime::new 注入，
-    /// 正式任务执行上下文（facade 重建）中不持有（HTTP 服务不在其中）。
-    config_store: Option<crate::config::SharedConfigStore>,
-    /// 外部聊天源共享状态：观察线程据此决定是否跳过 OCR 聊天识别。
-    external_chat: crate::composition::application::external_chat::ExternalChatState,
+/// 进程内唯一一份共享服务集合，由 [`ApplicationRuntime`] 与正式任务执行上下文
+/// 通过 `Arc<AppServices>` 零复制共享。
+///
+/// 分工是硬边界：
+/// - **这里**只放可克隆的句柄与共享状态，以及「执行一次任务/一次面板请求」；
+/// - **拥有的运行时**（UI/OCR/播放器/业务/正式任务/HTTP/OpenAI 线程与进程句柄）
+///   只属于 [`OwnedRuntimes`]，`AppServices` 里一个都不出现，
+///   所以不可能出现「重建一份假句柄继续跑」的旧模式。
+pub(crate) struct AppServices {
+    pub(super) ui: UiServices,
+    pub(super) playback: PlaybackServices,
+    pub(super) business: BusinessServices,
+    /// 正式任务执行端（提交 + 执行两侧共用同一个客户端）。
+    ///
+    /// 通过 [`OnceLock`] 在 [`ApplicationRuntime::start_formal_task_runtime`]
+    /// 里接线一次：读侧用 [`AppServices::formal_tasks`] 拿到 `Result`，
+    /// 而不是在各处各自解释一个 `Option::None`。
+    pub(super) formal_tasks: OnceLock<FormalTaskClient>,
+    pub(super) shared: SharedLifecycleServices,
 }
 
+impl SharedLifecycleServices {
+    /// 向 HTTP 服务登记真实的排空闸门句柄。
+    pub(super) fn adopt_http_reload_gates(
+        &self,
+        blockers: Arc<AtomicUsize>,
+        draining: Arc<AtomicBool>,
+    ) {
+        self.http_reload.attach(blockers, draining);
+    }
+}
+
+/// 端口适配器：把只读的 [`AppServices`] 交给签名仍是 `&mut self` 的端口 trait。
+///
+/// 端口 trait 的旧签名要求可变借用，但这些实现只读共享句柄。用一个一次性的
+/// 可变句柄表达「本次调用独占这个端口对象」，既不改动各 `features` 模块的
+/// 公开契约，也不引入任何内部可变性。`Deref` 让实现体继续用 `self.ui.x`
+/// 这样的自然写法。
+pub(crate) struct AppServicesPort<'a> {
+    services: &'a AppServices,
+}
+
+impl<'a> AppServicesPort<'a> {
+    const fn new(services: &'a AppServices) -> Self {
+        Self { services }
+    }
+}
+
+impl std::ops::Deref for AppServicesPort<'_> {
+    type Target = AppServices;
+
+    fn deref(&self) -> &Self::Target {
+        self.services
+    }
+}
+
+impl AppServices {
+    /// 取得本服务的端口适配器（配合 `&mut self.port()` 传给端口参数）。
+    pub(super) const fn port(&self) -> AppServicesPort<'_> {
+        AppServicesPort::new(self)
+    }
+
+    /// 已接线的正式任务客户端。
+    ///
+    /// 返回 `Result` 而不是 `Option`：调用方要么拿到可用客户端，要么得到一个
+    /// 说明「正式任务运行时还没启动」的错误，不需要各自编造提示语。
+    pub(super) fn formal_tasks(&self) -> Result<&FormalTaskClient> {
+        self.formal_tasks
+            .get()
+            .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))
+    }
+
+    /// 接线正式任务客户端；重复接线是编程错误，直接忽略后一次并记日志。
+    fn attach_formal_tasks(&self, client: FormalTaskClient) {
+        if self.formal_tasks.set(client).is_err() {
+            log::error!(
+                "正式任务客户端被重复接线（步骤：启动正式任务运行时），后一次接线已忽略；本次启动可能有两个正式任务运行时"
+            );
+        }
+    }
+}
+
+/// 顶层装配与生命周期宿主。
+///
+/// 只做两件事：
+/// 1. 在 [`ApplicationRuntime::new`] 里把每个子系统接好线，产出唯一的
+///    [`AppServices`]；
+/// 2. 在 [`ApplicationRuntime::run`] 里启动/关停**拥有型**运行时与控制线程。
+///
+/// 所有「执行一个任务/一次面板请求」的方法都实现在 [`AppServices`] 上；
+/// `Deref` 让 `runtime.execute_command(..)` 这类调用零样板转发。
 pub(crate) struct ApplicationRuntime {
-    ui: UiBundle,
-    playback: PlaybackBundle,
-    business: BusinessBundle,
-    lifecycle: LifecycleBundle,
+    services: Arc<AppServices>,
+    owned: OwnedRuntimes,
+}
+
+impl std::ops::Deref for ApplicationRuntime {
+    type Target = AppServices;
+
+    fn deref(&self) -> &Self::Target {
+        &self.services
+    }
+}
+
+/// `ApplicationRuntime` 代为管理的**拥有型**运行时。
+///
+/// 每个字段的生命周期都由 [`ApplicationRuntime::run`] 的关停序列独占：
+/// 创建时装入，关停时 `take()` 并 shutdown。任务执行侧永远看不到这些值。
+pub(crate) struct OwnedRuntimes {
+    pub(super) hotkeys: Option<hotkeys::HotkeyRuntime>,
+    pub(super) ui_runtime: Option<UiRuntime>,
+    pub(super) ocr_runtime: Option<OcrRuntime>,
+    pub(super) player_runtime: Option<PlayerRuntime>,
+    pub(super) native_playback_runtime: Option<NativePlaybackRuntime>,
+    pub(super) business_runtime: Option<BusinessRuntimeGroup>,
+    pub(super) formal_task_runtime: Option<FormalTaskRuntime>,
+    pub(super) http_server: Option<http::HttpServer>,
+    pub(super) openai_runtime: Option<OpenAiRuntime>,
+}
+
+impl OwnedRuntimes {
+    fn empty() -> Self {
+        Self {
+            hotkeys: None,
+            ui_runtime: None,
+            ocr_runtime: None,
+            player_runtime: None,
+            native_playback_runtime: None,
+            business_runtime: None,
+            formal_task_runtime: None,
+            http_server: None,
+            openai_runtime: None,
+        }
+    }
 }
 
 /// 正式任务执行所需的窄上下文。
 ///
-/// 这里只保留 `PendingTask` 各变体及其下游命令实际使用的可克隆端口和服务；
-/// 各运行时所有权、HTTP 服务、热键等生命周期资源仍只属于 `ApplicationRuntime`。
+/// 只剩两件事：共享服务集合（与主循环同一个 `Arc`）和已接线的正式任务客户端。
+/// 任务执行直接落在 [`AppServices`] 上，不再反向构造一份假的 `ApplicationRuntime`。
 pub(crate) struct FormalTaskExecutionContext {
-    coordinator: UiCoordinator,
-    ui: FormalTaskUiContext,
-    playback: FormalTaskPlaybackContext,
-    business: FormalTaskBusinessContext,
-    lifecycle: FormalTaskLifecycleContext,
-}
-
-struct FormalTaskUiContext {
-    ocr_args: ResolvedOcrArgs,
-    chat_templates: ResolvedTemplateArgs,
-    game_ui: GameUi,
-    residency_ui: ResidencyUi,
-    hall_ui: HallUi,
-    moderation_ui: ModerationUi,
-    startup_ui: StartupUi,
-    secondary_unread_ui: SecondaryUnreadUi,
-    friend_delivery_ui: FriendDeliveryUi,
-    invite_ui: InviteUi,
-    custom_action_ui: CustomActionUi,
-    chat_output: ChatOutput,
-    ocr: OcrRuntimeHandle,
-    latest_frame: Arc<Mutex<LatestFrameCache>>,
-    window_detection_signal: WindowDetectionSignal,
-    chat_baseline_primed: Arc<AtomicBool>,
-    chat_observations: ChatObservationShared,
-    chat_timeline: crate::observation::chat::ChatTimeline,
-}
-
-struct FormalTaskPlaybackContext {
-    player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
-    playback_application: PlaybackApplication,
-    player_search: PlayerSearchClient,
-    native_playback: PlaybackHandle,
-    login_helper: LoginHelperManager,
-}
-
-struct FormalTaskBusinessContext {
-    business: BusinessRuntimeHandle,
-    task_engine: TaskEngineHandle,
-    business_events: BusinessRuntimeEventSink,
+    services: Arc<AppServices>,
     formal_tasks: FormalTaskClient,
-    background_commands: workers::BackgroundCommandManager,
-    ai: AiClient,
-    ai_chat_memory: std::sync::Arc<crate::features::ai_chat::AiChatMemory>,
-    ai_chat_memory_generation: std::sync::Arc<AtomicU64>,
-    ai_chat_maintenance_inflight: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
-    ai_chat_gate: std::sync::Arc<crate::features::ai_chat::TriggerGate>,
-    ai_chat_openai: miliastra_kernel::ai::OpenAiRuntimeHandle,
-    ai_connection: crate::config::ai::AiConfig,
-    ai_request_timeout: std::time::Duration,
-    tts: Arc<crate::features::tts::TtsRuntime>,
-    song_requests: SongRequestApplication,
-    card_games: CardGameApplication,
-    administration_application: AdministrationApplication,
-    hall_application: HallApplication,
-    idiom_chain_application: IdiomChainApplication,
-    tarot_application: crate::features::tarot::TarotApplication,
-    playlist_application: crate::features::playlist::PlaylistApplication,
-    turtle_soup_application: TurtleSoupApplication,
-    undercover_game: UndercoverApplication,
-    moderation: ModerationService,
-    moderation_workers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
-    startup: StartupService,
-    custom_workflow: CustomWorkflowService,
-}
-
-struct FormalTaskLifecycleContext {
-    config: AppConfig,
-    config_store: crate::config::SharedConfigStore,
-    /// 外部聊天源的共享状态。
-    ///
-    /// **必须来自真身**，不能用 ExternalChatState::default()：那是全新的空状态，
-    /// active 恒为 false。决策窗口在 facade 里读不到接管状态就会走 OCR 慢路径，
-    /// 而外部源接管期间观察线程不发布帧——点歌/歌单窗口必然等满 20s 后报
-    /// 「等待共享聊天确认基线超时」。
-    external_chat: crate::composition::application::external_chat::ExternalChatState,
-    /// 热更新共享句柄集合：正式任务上下文（facade 重建）与 HTTP 服务共享同一份。
-    live_configs: LiveConfigs,
-    running: Arc<AtomicBool>,
-    reload_startup: ReloadStartupGate,
-    paused: Arc<AtomicBool>,
-    console_reply_context: Arc<AtomicBool>,
-    monitor: MonitorShared,
-}
-
-struct FormalTaskExecutionFacade {
-    application: ApplicationRuntime,
 }
 
 impl FormalTaskExecutionContext {
-    fn facade(&self) -> FormalTaskExecutionFacade {
-        FormalTaskExecutionFacade {
-            application: ApplicationRuntime {
-                ui: UiBundle {
-                    coordinator: self.coordinator.clone(),
-                    ocr_args: self.ui.ocr_args.clone(),
-                    chat_templates: self.ui.chat_templates.clone(),
-                    hotkeys: None,
-                    game_ui: self.ui.game_ui.clone(),
-                    residency_ui: self.ui.residency_ui.clone(),
-                    hall_ui: self.ui.hall_ui.clone(),
-                    moderation_ui: self.ui.moderation_ui.clone(),
-                    startup_ui: self.ui.startup_ui.clone(),
-                    secondary_unread_ui: self.ui.secondary_unread_ui.clone(),
-                    friend_delivery_ui: self.ui.friend_delivery_ui.clone(),
-                    invite_ui: self.ui.invite_ui.clone(),
-                    custom_action_ui: self.ui.custom_action_ui.clone(),
-                    ui_runtime: None,
-                    chat_output: self.ui.chat_output.clone(),
-                    ocr: self.ui.ocr.clone(),
-                    ocr_runtime: None,
-                    latest_frame: self.ui.latest_frame.clone(),
-                    window_detection_signal: self.ui.window_detection_signal.clone(),
-                    chat_baseline_primed: self.ui.chat_baseline_primed.clone(),
-                    chat_observations: self.ui.chat_observations.clone(),
-                    chat_timeline: self.ui.chat_timeline.clone(),
-                },
-                playback: PlaybackBundle {
-                    player: self.playback.player.clone(),
-                    playback_application: self.playback.playback_application.clone(),
-                    player_search: self.playback.player_search.clone(),
-                    player_runtime: None,
-                    native_playback: self.playback.native_playback.clone(),
-                    login_helper: self.playback.login_helper.clone(),
-                    native_playback_runtime: None,
-                },
-                business: BusinessBundle {
-                    business: self.business.business.clone(),
-                    task_engine: self.business.task_engine.clone(),
-                    business_events: self.business.business_events.clone(),
-                    business_runtime: None,
-                    formal_task_runtime: None,
-                    formal_tasks: Some(self.business.formal_tasks.clone()),
-                    background_commands: self.business.background_commands.clone(),
-                    ai: self.business.ai.clone(),
-                    ai_chat_memory: self.business.ai_chat_memory.clone(),
-                    ai_chat_memory_generation: self.business.ai_chat_memory_generation.clone(),
-                    ai_chat_maintenance_inflight: self
-                        .business
-                        .ai_chat_maintenance_inflight
-                        .clone(),
-                    ai_chat_gate: self.business.ai_chat_gate.clone(),
-                    ai_chat_openai: self.business.ai_chat_openai.clone(),
-                    ai_connection: self.business.ai_connection.clone(),
-                    ai_request_timeout: self.business.ai_request_timeout,
-                    tts: self.business.tts.clone(),
-                    song_requests: self.business.song_requests.clone(),
-                    card_games: self.business.card_games.clone(),
-                    administration_application: self.business.administration_application,
-                    hall_application: self.business.hall_application,
-                    idiom_chain_application: self.business.idiom_chain_application,
-                    tarot_application: self.business.tarot_application.clone(),
-                    playlist_application: self.business.playlist_application.clone(),
-                    turtle_soup_application: self.business.turtle_soup_application,
-                    undercover_game: self.business.undercover_game.clone(),
-                    moderation: self.business.moderation.clone(),
-                    moderation_workers: self.business.moderation_workers.clone(),
-                    startup: self.business.startup,
-                    custom_workflow: self.business.custom_workflow.clone(),
-                },
-                lifecycle: LifecycleBundle {
-                    config: self.lifecycle.config.clone(),
-                    live_configs: self.lifecycle.live_configs.clone(),
-                    http_server: None,
-                    http_reload_blockers: Arc::new(AtomicUsize::new(0)),
-                    http_reload_draining: Arc::new(AtomicBool::new(false)),
-                    openai_runtime: None,
-                    running: self.lifecycle.running.clone(),
-                    shutdown: ShutdownState::new(),
-                    reload_startup: self.lifecycle.reload_startup.clone(),
-                    reload_check_after: Instant::now(),
-                    paused: self.lifecycle.paused.clone(),
-                    console_reply_context: self.lifecycle.console_reply_context.clone(),
-                    monitor: self.lifecycle.monitor.clone(),
-                    config_store: Some(self.lifecycle.config_store.clone()),
-                    // facade 不启动观察线程，但**命令执行发生在这里**，决策窗口要读
-                    // 接管状态。必须是真身那份（Arc 共享），否则恒为 false。
-                    external_chat: self.lifecycle.external_chat.clone(),
-                },
-            },
+    fn new(services: Arc<AppServices>, formal_tasks: FormalTaskClient) -> Self {
+        Self {
+            services,
+            formal_tasks,
         }
     }
 
     fn execute_pending_task(&self, task: PendingTask) -> Result<PendingTaskExecution> {
-        self.facade().application.execute_pending_task(task)
+        self.services.execute_pending_task(task)
     }
 
     fn execute_web_tool_request(&self, request: WebToolRequest) -> Result<String> {
-        self.facade().application.execute_web_tool_request(request)
+        self.services.execute_web_tool_request(request)
     }
 }
 
@@ -1754,7 +1783,7 @@ impl ApplicationRuntime {
         );
         let invite_ui = InviteUi::new(ui_handle.clone(), ocr.clone(), invite_config);
         let custom_action_ui = CustomActionUi::new(
-            ui_handle,
+            ui_handle.clone(),
             ocr.clone(),
             running.clone(),
             config.screen.expected_width,
@@ -1889,12 +1918,29 @@ impl ApplicationRuntime {
         // 切不进去只是保持原模式，不影响消息接收。
         // 这里只置位 pending_mode；真正的界面切换由 "值守请求自愈" 在
         // 主导航循环里入队执行（见 reconcile_pending_listener_mode）。
-        Ok(Self {
-            ui: UiBundle {
+        // spawn 需要自己那份 LiveConfigs：自动注册身份后要同步 effective
+        // 快照，否则下次 apply 会把新映射抹掉。必须在 live_configs 被
+        // move 进共享服务之前取出来。
+        let external_live_configs = live_configs.clone();
+        let external_chat = external_chat::spawn(
+            chat_timeline_for_external,
+            chat_source_config,
+            Some(external_identity_access),
+            Some(config_store.clone()),
+            external_live_configs,
+        )
+        .unwrap_or_else(|error| {
+            log::error!("外部聊天源启动失败，继续走 OCR：{error:#}");
+            external_chat::ExternalChatState::default()
+        });
+        let services = Arc::new(AppServices {
+            ui: UiServices {
                 coordinator: UiCoordinator::new(),
+                // 界面状态观察的唯一读侧句柄：创建运行时后立刻取出，
+                // 正式任务执行器与面板工具共用同一份，不再依赖「拥有的运行时」。
+                ui_handle,
                 ocr_args,
                 chat_templates,
-                hotkeys: None,
                 game_ui,
                 residency_ui,
                 hall_ui,
@@ -1904,32 +1950,26 @@ impl ApplicationRuntime {
                 friend_delivery_ui,
                 invite_ui,
                 custom_action_ui,
-                ui_runtime: Some(ui_runtime),
                 chat_output,
                 ocr,
-                ocr_runtime: Some(ocr_runtime),
                 latest_frame: Arc::new(Mutex::new(LatestFrameCache::default())),
                 window_detection_signal: WindowDetectionSignal::new(),
                 chat_baseline_primed: Arc::new(AtomicBool::new(false)),
                 chat_observations,
                 chat_timeline,
             },
-            playback: PlaybackBundle {
+            playback: PlaybackServices {
                 player,
                 playback_application,
                 player_search,
-                player_runtime: Some(player_runtime),
+                player_runtime: player_runtime.handle(),
                 native_playback,
                 login_helper,
-                native_playback_runtime: Some(native_playback_runtime),
             },
-            business: BusinessBundle {
+            business: BusinessServices {
                 business,
                 task_engine,
                 business_events,
-                business_runtime: Some(business_runtime),
-                formal_task_runtime: None,
-                formal_tasks: None,
                 background_commands: workers::BackgroundCommandManager::new(),
                 ai,
                 ai_chat_memory,
@@ -1956,38 +1996,34 @@ impl ApplicationRuntime {
                 startup: StartupService::new(),
                 custom_workflow,
             },
-            lifecycle: {
-                // spawn 需要自己那份 LiveConfigs：自动注册身份后要同步 effective
-                // 快照，否则下次 apply 会把新映射抹掉。必须在 live_configs 被
-                // move 进 LifecycleBundle 之前取出来。
-                let external_live_configs = live_configs.clone();
-                LifecycleBundle {
-                    config,
-                    live_configs,
-                    http_server: None,
-                    http_reload_blockers: Arc::new(AtomicUsize::new(0)),
-                    http_reload_draining: Arc::new(AtomicBool::new(false)),
-                    openai_runtime: Some(openai_runtime),
-                    running,
-                    shutdown: ShutdownState::new(),
-                    reload_startup: ReloadStartupGate::default(),
-                    reload_check_after: Instant::now(),
-                    paused: Arc::new(AtomicBool::new(false)),
-                    console_reply_context: Arc::new(AtomicBool::new(false)),
-                    monitor,
-                    config_store: Some(config_store.clone()),
-                    external_chat: external_chat::spawn(
-                        chat_timeline_for_external,
-                        chat_source_config,
-                        Some(external_identity_access),
-                        Some(config_store),
-                        external_live_configs,
-                    )
-                    .unwrap_or_else(|error| {
-                        log::error!("外部聊天源启动失败，继续走 OCR：{error:#}");
-                        external_chat::ExternalChatState::default()
-                    }),
-                }
+            formal_tasks: OnceLock::new(),
+            shared: SharedLifecycleServices {
+                config,
+                live_configs,
+                config_store,
+                external_chat,
+                running,
+                paused: Arc::new(AtomicBool::new(false)),
+                shutdown: ShutdownState::new(),
+                reload_startup: ReloadStartupGate::default(),
+                console_reply_context: Arc::new(AtomicBool::new(false)),
+                monitor,
+                // HTTP 服务启动后换成真实句柄（`start_http_server`）。
+                http_reload: HttpReloadGates::detached(),
+            },
+        });
+        Ok(Self {
+            services,
+            owned: OwnedRuntimes {
+                hotkeys: None,
+                ui_runtime: Some(ui_runtime),
+                ocr_runtime: Some(ocr_runtime),
+                player_runtime: Some(player_runtime),
+                native_playback_runtime: Some(native_playback_runtime),
+                business_runtime: Some(business_runtime),
+                formal_task_runtime: None,
+                http_server: None,
+                openai_runtime: Some(openai_runtime),
             },
         })
     }

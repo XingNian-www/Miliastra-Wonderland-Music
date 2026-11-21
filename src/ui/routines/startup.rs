@@ -12,6 +12,7 @@ use crate::adapters::game_path::resolve_game_executable;
 use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
 use crate::geometry::{Point, Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
+use crate::runtime::recovery::{GameRecoveryCoordinator, LoadingStuckDecision};
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiStateKind, UiSubmitError, sealed,
@@ -107,6 +108,12 @@ pub(crate) struct StartupUi {
     runtime: UiRuntimeHandle,
     ocr: OcrRuntimeHandle,
     config: StartupRoutineConfig,
+    /// 进程级共享的恢复协调器（见 `runtime::recovery`）。
+    ///
+    /// 默认自建一份，等价于原先「加载重启计数只活在这一个例程里」；
+    /// `with_recovery` 注入同一实例后，加载卡死与外部源失联重启、驻留 Esc 探针
+    /// 共享冷却与互斥（Wave 1b 在进程装配处注入）。
+    recovery: GameRecoveryCoordinator,
 }
 
 impl StartupUi {
@@ -119,7 +126,14 @@ impl StartupUi {
             runtime,
             ocr,
             config,
+            recovery: GameRecoveryCoordinator::default(),
         }
+    }
+
+    /// 用进程级共享的恢复协调器替换默认实例。
+    pub(crate) fn with_recovery(mut self, recovery: GameRecoveryCoordinator) -> Self {
+        self.recovery = recovery;
+        self
     }
 
     pub(crate) fn submit_enter_game(
@@ -130,6 +144,7 @@ impl StartupUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
+            recovery: self.recovery.clone(),
         })
     }
 
@@ -222,6 +237,7 @@ struct EnterGameRoutine {
     request: EnterGame,
     ocr: OcrRuntimeHandle,
     config: StartupRoutineConfig,
+    recovery: GameRecoveryCoordinator,
 }
 
 impl sealed::UiRoutineSealed for EnterGameRoutine {}
@@ -249,7 +265,7 @@ impl UiRoutine for EnterGameRoutine {
                 }
             }
         }
-        let effect = match execute_enter_game(context, &self.ocr, &config) {
+        let effect = match execute_enter_game(context, &self.ocr, &config, &self.recovery) {
             Ok(effect) => effect,
             Err(failure) => EnterGameEffect::Failed(failure),
         };
@@ -351,6 +367,7 @@ struct EnterGameTask {
     request: EnterGame,
     ocr: OcrRuntimeHandle,
     config: StartupRoutineConfig,
+    recovery: GameRecoveryCoordinator,
 }
 
 impl sealed::UiRoutineSealed for EnterGameTask {}
@@ -367,6 +384,7 @@ impl UiRoutine for EnterGameTask {
                 request: self.request,
                 ocr: self.ocr,
                 config: self.config,
+                recovery: self.recovery,
             },
         )
         .execute(context);
@@ -522,6 +540,7 @@ fn execute_enter_game(
     context: &mut UiRoutineContext<'_>,
     ocr: &OcrRuntimeHandle,
     config: &StartupRoutineConfig,
+    recovery: &GameRecoveryCoordinator,
 ) -> Result<EnterGameEffect, UiRoutineFailure> {
     ensure_game_window(context, config)?;
     context
@@ -536,14 +555,18 @@ fn execute_enter_game(
     // 扫描租约（UI 例程独占界面），主循环根本看不到 Loading 状态。
     //
     // 做法：
-    //   1. 观察到 Loading 就记下起点；
+    //   1. 观察到 Loading 就把起点交给恢复协调器（`loading_since` 原先住在这里）；
     //   2. 超过阈值就关闭游戏并重新拉起（走与首次启动完全相同的
     //      `ensure_game_window`，因此桥注入路径自然复用，不会绕过 DLL 注入）；
-    //   3. 只在本次任务内重试一次，避免自我循环成无限重开。
-    let mut loading_since: Option<Instant> = None;
-    let mut loading_restarts = 0_u8;
+    //   3. 只在本次任务内重试 `LOADING_RESTART_MAX_ATTEMPTS` 次，避免自我循环成
+    //      无限重开；预算由协调器持有，其它触发源（Wave 1b 的外部源失联重启）
+    //      也看同一份互斥，不会同时关游戏。
+    //
+    // 时间语义与原先逐条等价：起点是「第一次观察到加载界面」的时刻，离开加载
+    // 界面立即清零，重启真正完成时清零（重开要重新走一遍加载）。
+    recovery.begin_loading_watch(LOADING_RESTART_MAX_ATTEMPTS);
     // 观测窗口必须**容得下**加载阈值：默认 enter_game_timeout_ms=45s、
-    // 加载阈值=60s，若直接用前者当期限，循环 45 秒就退出，`since.elapsed()`
+    // 加载阈值=60s，若直接用前者当期限，循环 45 秒就退出，计时
     // 永远到不了 60 秒——功能即使打开也永不触发。开启该功能时把首段期限
     // 放宽到「加载阈值 + 一次轮询」，保证至少有机会命中。
     let mut deadline = Instant::now() + enter_game_budget(config);
@@ -563,10 +586,7 @@ fn execute_enter_game(
         // 「加载界面过久」判定必须放在**抓帧之后**：`latest_ui_state()` 读的是
         // 最近一次抓帧分类的结果，抓帧前读拿到的是上一轮（甚至启动前）的旧状态，
         // 会拿错误的状态去判 60 秒超时。这里刚捕获完，分类已同步更新。
-        if config.startup.restart_game_on_loading
-            && config.startup.loading_restart_timeout_ms > 0
-            && loading_restarts < LOADING_RESTART_MAX_ATTEMPTS
-        {
+        if config.startup.restart_game_on_loading && config.startup.loading_restart_timeout_ms > 0 {
             let is_loading = context.latest_ui_state().is_some_and(|observation| {
                 matches!(
                     observation,
@@ -574,13 +594,26 @@ fn execute_enter_game(
                         if state.stable_kind() == Some(UiStateKind::Loading)
                 )
             });
-            if is_loading {
-                let since = *loading_since.get_or_insert_with(Instant::now);
-                let timeout = Duration::from_millis(config.startup.loading_restart_timeout_ms);
-                if since.elapsed() >= timeout {
+            let timeout = Duration::from_millis(config.startup.loading_restart_timeout_ms);
+            match recovery.observe_loading_state(
+                Instant::now(),
+                is_loading,
+                timeout,
+                LOADING_RESTART_MAX_ATTEMPTS,
+            ) {
+                // 不在加载界面 / 未到阈值 / 预算已用尽：继续正常观测，不干预。
+                LoadingStuckDecision::NotLoading
+                | LoadingStuckDecision::Waiting { .. }
+                | LoadingStuckDecision::BudgetExhausted { .. } => {}
+                LoadingStuckDecision::TriggerRestart {
+                    attempt,
+                    elapsed,
+                    lease,
+                } => {
                     // 只认聊天桥：反作弊只允许「创建游戏进程的一方」注入 DLL，
                     // 本进程用 `device().launch_game()` 直接拉起来的进程拿不到注入，
                     // 等于把一个没有聊天源的游戏重新跑起来（用户明确禁止这条路径）。
+                    // 放弃时租约随作用域归还，且这次没有真正重启，不消耗重开预算。
                     if config.startup.external_launcher.is_none() {
                         return Err(UiRoutineFailure::new(
                             InputCertainty::BeforeInput,
@@ -588,12 +621,11 @@ fn execute_enter_game(
                             "界面卡在加载，但当前没有可用的自动拉起路径：必须启用外部聊天源并打开「自动启动 Miliastra-Wonderland-ChatBridge」才能自动重启游戏（只有聊天桥能创建可注入的游戏进程）。已放弃自动重启以免游戏无法恢复",
                         ));
                     }
-                    loading_restarts += 1;
                     log::warn!(
                         "启动游戏时界面停在加载界面已 {} 秒（判定阈值 {} 秒），重启游戏重试（第 {} 次）",
-                        since.elapsed().as_secs(),
+                        elapsed.as_secs(),
                         timeout.as_secs(),
-                        loading_restarts
+                        attempt
                     );
                     // 关闭失败不算致命：加载卡死的常见形态正是游戏已经崩溃、
                     // 窗口不复存在，那种情况下"关不掉"恰恰等于"已经关了"。
@@ -619,18 +651,17 @@ fn execute_enter_game(
                         .device()
                         .focus(config.residency.after_activate_ms)
                         .map_err(|error| before_input_failure("focus_game_window", error))?;
+                    // 重启**确实完成**之后才记账：预算消耗、加载计时清零都在这里，
+                    // 同时把这次重启报到协调器，供其它触发源共享冷却与健康汇报。
+                    lease.complete_restart(Instant::now());
                     // 截止时间顺延一个完整周期：重开游戏要重新走一遍加载，
                     // 沿用旧截止时间会把这次重试直接判成超时失败。
                     deadline =
                         Instant::now() + Duration::from_millis(config.startup.enter_game_timeout_ms);
-                    loading_since = None;
                     paimon_streak = 0;
                     clicked = false;
                     continue;
                 }
-            } else {
-                // 离开加载界面就清零，短加载不会累积成误判。
-                loading_since = None;
             }
         }
         // 用户要求：只要检测到主世界就无条件停止，完成。
@@ -691,6 +722,7 @@ fn execute_enter_game(
     }
     // 诊断：重开过一次之后仍然没进游戏，与"从头就没进去"是两回事，
     // 日志里必须能区分，否则排查时看不出自动重启到底有没有生效。
+    let loading_restarts = recovery.loading_restart_attempts();
     let reason = if loading_restarts > 0 {
         format!(
             "paimon menu template did not become stable before timeout（已自动重启游戏 {} 次仍未进入，加载界面可能持续卡死）",

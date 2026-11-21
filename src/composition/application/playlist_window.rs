@@ -183,19 +183,19 @@ impl ChatDecisionReader {
     }
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     fn playlist_window_active(
         &self,
         reader: &ChatDecisionReader,
         deadline: Instant,
     ) -> Result<bool> {
-        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) || Instant::now() >= deadline {
+        if !self.shared.running.load(AtomicOrdering::SeqCst) || Instant::now() >= deadline {
             return Ok(false);
         }
-        if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+        if self.shared.paused.load(AtomicOrdering::SeqCst) {
             return Err(anyhow!("运行已暂停，已结束歌单窗口"));
         }
-        if self.lifecycle.live_configs.has_pending_reload() {
+        if self.shared.live_configs.has_pending_reload() {
             return Err(anyhow!("配置重载待处理，已结束歌单窗口"));
         }
         let mode = self.business.business.chat_listener_snapshot()?;
@@ -206,7 +206,7 @@ impl ApplicationRuntime {
     }
 
     fn apply_playlist_window_decision(
-        &mut self,
+        &self,
         application: &PlaylistApplication,
         owner: &str,
         command: &PlaylistCommand,
@@ -247,7 +247,7 @@ impl ApplicationRuntime {
         self.reply_batch(&rendered.iter().map(String::as_str).collect::<Vec<_>>(), 0)
     }
 
-    pub(super) fn execute_playlist_window(&mut self, parsed: &RoutedCommand) -> Result<()> {
+    pub(super) fn execute_playlist_window(&self, parsed: &RoutedCommand) -> Result<()> {
         // 歌单只属于已登记身份的玩家：没有 UUID 就没有歌单窗口。
         let Some(owner) = self.playlist_owner_key(&parsed.username, parsed.account.as_ref()) else {
             log::info!(
@@ -259,7 +259,7 @@ impl ApplicationRuntime {
                 crate::features::reply_template::REPLY_SONG[0].default,
                 &crate::features::reply_template::ReplyVars::new(),
             );
-            return ApplicationRuntime::reply(self, &text);
+            return AppServices::reply(self, &text);
         };
         let candidates = vec![owner.clone()];
         let application = self.business.playlist_application.clone();
@@ -419,13 +419,13 @@ impl ApplicationRuntime {
                 }
             }
             reader.wait_for_input(
-                super::live_decision_poll_ms(&self.lifecycle.live_configs),
+                super::live_decision_poll_ms(&self.shared.live_configs),
                 deadline.saturating_duration_since(Instant::now()),
             )?;
         }
         drop(session);
-        if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
-            ApplicationRuntime::reply(self, "推荐已超时关闭,重新发送@歌单可再次推荐.")?;
+        if self.shared.running.load(AtomicOrdering::SeqCst) {
+            AppServices::reply(self, "推荐已超时关闭,重新发送@歌单可再次推荐.")?;
         }
         Ok(())
     }

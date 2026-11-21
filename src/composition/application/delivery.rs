@@ -12,7 +12,7 @@ pub(super) fn missing_vars_label(missing: &[String]) -> String {
         .join("、")
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     /// 渲染一条歌单回复；带 key 的条目在此处才查用户覆盖与静音。
     ///
     /// 返回 Vec 是因为静音会让整条回复消失（零条消息）。
@@ -59,13 +59,13 @@ impl ApplicationRuntime {
 
     fn reply_with_ready_gate(&self, message: &str, invite_ready: bool) -> Result<()> {
         let mapped = self
-            .lifecycle
+            .shared
             .live_configs
             .identity
             .replace_display_names(message);
         let prefixed;
         let message = if self
-            .lifecycle
+            .shared
             .console_reply_context
             .load(AtomicOrdering::SeqCst)
             && !mapped.starts_with("[控制台]:")
@@ -86,7 +86,7 @@ impl ApplicationRuntime {
             return self.ui.chat_output.send_invite_ready(
                 message,
                 target,
-                self.lifecycle.running.clone(),
+                self.shared.running.clone(),
             );
         }
         // 表情标签先解析成独立消息，再进入按宽度切分/截断的路径。
@@ -98,7 +98,7 @@ impl ApplicationRuntime {
         // 正文超宽时按显示宽度切段（复用 task-37 的 wrapped 入口）；
         // 必须单行的系统通告仍走原单条路径，保留 invite/microphone/colon 压缩语义。
         let delay_ms = self
-            .lifecycle
+            .shared
             .live_configs
             .snapshot()
             .timing
@@ -123,7 +123,7 @@ impl ApplicationRuntime {
 
     pub(super) fn reply_batch(&self, messages: &[&str], _delay_ms: u64) -> Result<()> {
         let delay_ms = self
-            .lifecycle
+            .shared
             .live_configs
             .snapshot()
             .timing
@@ -135,7 +135,7 @@ impl ApplicationRuntime {
             .iter()
             .flat_map(|message| {
                 let mapped = self
-                    .lifecycle
+                    .shared
                     .live_configs
                     .identity
                     .replace_display_names(message);
@@ -308,7 +308,7 @@ impl ApplicationRuntime {
         match self.generate_ai_reply(spec.key, &out.text) {
             Ok(text) => {
                 let text = text.trim();
-                match self.lifecycle.live_configs.snapshot().ai_chat.ai_reply.mode {
+                match self.shared.live_configs.snapshot().ai_chat.ai_reply.mode {
                     // 补充：保留模板，只把标签换成那句话。
                     crate::features::ai_chat::AiReplyMode::Append => {
                         out.text = out.text.replace(&tag, text);
@@ -335,7 +335,7 @@ impl ApplicationRuntime {
     ///
     /// 失败只记 debug：回复本身不该因为 AI 挂掉而不发。
     fn generate_ai_reply(&self, spec_key: &str, template: &str) -> Result<String> {
-        let snapshot = self.lifecycle.live_configs.snapshot();
+        let snapshot = self.shared.live_configs.snapshot();
         let config = snapshot.ai_chat.clone();
         if !config.enabled {
             anyhow::bail!("AI 聊天未启用");
@@ -363,7 +363,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn command_reply_text(&self, key: &str) -> Option<String> {
-        let store = self.lifecycle.config_store.as_ref()?.lock().ok()?;
+        let store = self.shared.config_store.lock().ok()?;
         let replies = store.reply_templates().ok()?;
         crate::features::reply_template::stored_override(&replies, key)
     }
@@ -372,10 +372,7 @@ impl ApplicationRuntime {
         let Some(entry) = crate::features::reply_template::command_reply_entry_for_key(key) else {
             return false;
         };
-        let Some(store) = self.lifecycle.config_store.as_ref() else {
-            return false;
-        };
-        let Ok(store) = store.lock() else {
+        let Ok(store) = self.shared.config_store.lock() else {
             return false;
         };
         let Ok(replies) = store.reply_templates() else {
@@ -419,7 +416,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn update_monitor_playback_controller(&self) {
-        self.lifecycle
+        self.shared
             .monitor
             .publish(MonitorEvent::PlaybackController(
                 self.playback.player.snapshot(),
@@ -427,8 +424,8 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn update_monitor_operational_state(&self) {
-        self.lifecycle.monitor.publish(MonitorEvent::ScannerPaused(
-            self.lifecycle.paused.load(AtomicOrdering::SeqCst),
+        self.shared.monitor.publish(MonitorEvent::ScannerPaused(
+            self.shared.paused.load(AtomicOrdering::SeqCst),
         ));
     }
 
@@ -436,7 +433,7 @@ impl ApplicationRuntime {
         let mapped = messages
             .iter()
             .map(|message| {
-                self.lifecycle
+                self.shared
                     .live_configs
                     .identity
                     .replace_display_names(message)
@@ -444,7 +441,7 @@ impl ApplicationRuntime {
             .collect::<Vec<_>>();
         let refs = mapped.iter().map(String::as_str).collect::<Vec<_>>();
         let delay = self
-            .lifecycle
+            .shared
             .live_configs
             .snapshot()
             .timing
@@ -514,7 +511,7 @@ impl ApplicationRuntime {
     }
 }
 
-impl CardGameDeliveryPort for ApplicationRuntime {
+impl CardGameDeliveryPort for AppServicesPort<'_> {
     fn verify_friend(&self, player: &str, message: &str) -> Result<bool> {
         self.send_unique_friend_message(player, message)
     }
@@ -616,7 +613,7 @@ impl CardGameDeliveryPort for ApplicationRuntime {
     }
 }
 
-impl UndercoverDeliveryPort for ApplicationRuntime {
+impl UndercoverDeliveryPort for AppServicesPort<'_> {
     fn verify_friend(&self, player: &str, message: &str) -> Result<bool> {
         self.send_stable_unique_friend_message(player, message)
     }

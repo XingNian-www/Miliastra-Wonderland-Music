@@ -30,21 +30,16 @@ impl Drop for SharedChatObserverGuard {
 
 impl ApplicationRuntime {
     pub(super) fn start_shared_chat_observer(&self) -> Result<SharedChatObserverGuard> {
-        let ui = self
-            .ui
-            .ui_runtime
-            .as_ref()
-            .context("UI runtime unavailable for shared observer")?
-            .handle();
-        let config = self.lifecycle.config.clone();
-        let live_configs = self.lifecycle.live_configs.clone();
+        let ui = self.ui.ui_handle.clone();
+        let config = self.shared.config.clone();
+        let live_configs = self.shared.live_configs.clone();
         let ocr = self.ui.ocr.clone();
         let templates = self.ui.chat_templates.clone();
-        let monitor = self.lifecycle.monitor.clone();
+        let monitor = self.shared.monitor.clone();
         let timeline = self.ui.chat_timeline.clone();
-        let external_chat = self.lifecycle.external_chat.clone();
-        let running = Arc::clone(&self.lifecycle.running);
-        let draining = Arc::clone(&self.lifecycle.http_reload_draining);
+        let external_chat = self.shared.external_chat.clone();
+        let running = Arc::clone(&self.shared.running);
+        let draining = Arc::clone(&self.shared.http_reload.draining());
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let initial_interval = live_configs.snapshot().timing.loop_idle_ms.max(1);
@@ -151,7 +146,7 @@ impl ApplicationRuntime {
                         hash_time = finish_observer_stage(&mut stage_started);
                         let now = Instant::now();
                         // 变化门控阈值每次从当前 live 快照取（保存配置后下一帧即生效），
-                        // 不能退回启动期冻结的 `self.lifecycle.config` 副本。
+                        // 不能退回启动期冻结的 `self.shared.config` 副本。
                         let (change_mean_threshold, change_pixel_threshold) =
                             chat_change_thresholds(&live);
                         let scan_due = gate.scan_due(
@@ -611,7 +606,7 @@ mod tests {
     ///
     /// 生产读取点在观察循环里传 `&live`（`live_configs.snapshot()`）；
     /// 这里直接证明该纯函数使用传入配置的 `ocr.change_*`，且 LiveConfigs
-    /// 的快照携带被保存后的新值——若有人改回读 `self.lifecycle.config`，
+    /// 的快照携带被保存后的新值——若有人改回读 `self.shared.config`，
     /// 该读取点就不再经过此函数，需同步修改本测试。
     #[test]
     fn chat_change_thresholds_read_the_current_live_snapshot() {

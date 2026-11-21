@@ -11,6 +11,7 @@ pub(crate) mod monitor;
 pub(crate) mod ocr;
 pub mod player;
 pub mod player_io;
+pub(crate) mod recovery;
 pub(crate) mod scheduler;
 pub(crate) mod task_engine;
 pub use miliastra_kernel::timer;

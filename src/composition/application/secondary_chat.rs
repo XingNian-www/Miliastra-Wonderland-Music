@@ -341,9 +341,9 @@ pub(super) struct SecondaryListenerRoundState<'a> {
     pub(super) identity: &'a mut Option<SecondaryChatIdentity>,
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     pub(super) fn run_secondary_listener_round(
-        &mut self,
+        &self,
         image: &DynamicImage,
         state: SecondaryListenerRoundState<'_>,
         allow_hall_recovery: bool,
@@ -358,9 +358,9 @@ impl ApplicationRuntime {
             return Ok(SecondaryListenerRoundOutcome::default());
         }
         let unread_layout = crate::observation::chat::FriendUnreadLayout::resolve(
-            self.lifecycle.config.screen.expected_width,
-            self.lifecycle.config.screen.expected_height,
-            self.lifecycle.config.invite.friend_list_region.into(),
+            self.shared.config.screen.expected_width,
+            self.shared.config.screen.expected_height,
+            self.shared.config.invite.friend_list_region.into(),
         );
         // 身份判定的依据按来源分开，不再用「外部源是否开着」猜：
         //
@@ -383,7 +383,7 @@ impl ApplicationRuntime {
         });
         // 外部源在线就说明它随时可能交付大厅消息；身份按"大厅"对待，
         // 否则二级轮次既不敢派发也会反复排队恢复大厅。
-        let external_supplies_hall = self.lifecycle.external_chat.supplies_hall_messages();
+        let external_supplies_hall = self.shared.external_chat.supplies_hall_messages();
         let (observed_identity, scanned) = if ocr_confirms_secondary || external_supplies_hall {
             (SecondaryChatIdentity::CurrentHall, true)
         } else {
@@ -518,7 +518,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn execute_secondary_unread_task(
-        &mut self,
+        &self,
         hit: UnreadFriendHit,
         discard_only: bool,
     ) -> Result<()> {
@@ -561,7 +561,7 @@ impl ApplicationRuntime {
         completion.finish()
     }
 
-    pub(super) fn execute_restore_secondary_hall_task(&mut self) -> Result<()> {
+    pub(super) fn execute_restore_secondary_hall_task(&self) -> Result<()> {
         let result = self.establish_ui_residency(
             UiResidency::SecondaryCurrentHall,
             ResidencyPurpose::IndependentRecovery("恢复二级当前大厅任务"),
@@ -584,7 +584,7 @@ impl ApplicationRuntime {
     {
         let deadline = Instant::now()
             + Duration::from_millis(super::live_decision_timeout_ms(
-                &self.lifecycle.live_configs,
+                &self.shared.live_configs,
             ));
         self.begin_chat_decision_reader_until(scope, accepts_message_type, is_decision, deadline)
     }
@@ -605,9 +605,9 @@ impl ApplicationRuntime {
             self.ui
                 .chat_observations
                 .begin_exclusive_until(deadline, || {
-                    !self.lifecycle.running.load(AtomicOrdering::SeqCst)
-                        || self.lifecycle.paused.load(AtomicOrdering::SeqCst)
-                        || self.lifecycle.live_configs.has_pending_reload()
+                    !self.shared.running.load(AtomicOrdering::SeqCst)
+                        || self.shared.paused.load(AtomicOrdering::SeqCst)
+                        || self.shared.live_configs.has_pending_reload()
                 })?;
         let listener_mode = self.business.business.chat_listener_snapshot()?.mode;
         // 基线匹配按**来源**分流：
@@ -617,7 +617,7 @@ impl ApplicationRuntime {
         // - 外部源路径：消息没有屏幕，外部大厅恒被映射成 SecondaryHall。
         //   若仍按 chat 匹配，一级值守下窗口会一直等 PrimaryHall 而永远等不到，
         //   表现就是「等待共享聊天确认基线超时」。改按业务范围（scope）匹配。
-        let external_active = self.lifecycle.external_chat.supplies_hall_messages();
+        let external_active = self.shared.external_chat.supplies_hall_messages();
         let expected_chat = if scope == ChatDecisionScope::CurrentHall
             && self.active_ui_residency()? == UiResidency::SecondaryCurrentHall
         {
@@ -627,7 +627,7 @@ impl ApplicationRuntime {
         };
         let chat = expected_chat;
         // 先取水位再订阅：反过来的话，两步之间到达的消息会落在水位之内被当成历史。
-        let external_floor = external_active.then(|| self.lifecycle.external_chat.last_sequence());
+        let external_floor = external_active.then(|| self.shared.external_chat.last_sequence());
         let subscriber = self.ui.chat_timeline.subscribe()?;
         // 外部源在线时**不等快照**，直接用服务端序号水位建基线。
         //
@@ -672,13 +672,13 @@ impl ApplicationRuntime {
             &self.ui.chat_timeline,
             deadline,
             || {
-                if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                if !self.shared.running.load(AtomicOrdering::SeqCst) {
                     return Err(anyhow!("运行已停止，已结束确认窗口"));
                 }
-                if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+                if self.shared.paused.load(AtomicOrdering::SeqCst) {
                     return Err(anyhow!("运行已暂停，已结束确认窗口"));
                 }
-                if self.lifecycle.live_configs.has_pending_reload() {
+                if self.shared.live_configs.has_pending_reload() {
                     return Err(anyhow!("配置重载待处理，已结束确认窗口"));
                 }
                 let mode = self.business.business.chat_listener_snapshot()?;
@@ -690,7 +690,7 @@ impl ApplicationRuntime {
             |snapshot| {
                 // 每轮重新判断来源：窗口打开期间外部源可能才刚连上（或刚好断线），
                 // 用入口处的一次快照会让后面这半段永远走错分支，一路空转到超时。
-                if self.lifecycle.external_chat.supplies_hall_messages() {
+                if self.shared.external_chat.supplies_hall_messages() {
                     // 外部源：只看业务范围。外部帧没有屏幕桶（chat 恒为 None），
                     // 按屏幕桶匹配会让窗口永远等不到基线。
                     snapshot.scope.is_hall()
@@ -797,7 +797,7 @@ impl ApplicationRuntime {
     ) -> Result<Vec<ChatMessage>> {
         let wait_until = Instant::now() + remaining;
         let result = (|| {
-            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            if !self.shared.running.load(AtomicOrdering::SeqCst) {
                 return Ok(Vec::new());
             }
             let messages = self.poll_chat_decision_reader(reader)?;
@@ -808,19 +808,19 @@ impl ApplicationRuntime {
                 configured_ms,
                 wait_until.saturating_duration_since(Instant::now()),
             )?;
-            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            if !self.shared.running.load(AtomicOrdering::SeqCst) {
                 return Ok(Vec::new());
             }
             self.poll_chat_decision_reader(reader)
         })();
-        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+        if !self.shared.running.load(AtomicOrdering::SeqCst) {
             return Ok(Vec::new());
         }
         if let Err(error) = &result {
             log::error!(
                 "确认窗口读取失败（步骤：等待玩家在确认窗口内回复），本轮拿不到任何回复；已提示玩家窗口结束，可稍后重试：{error:#}"
             );
-            if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            if self.shared.running.load(AtomicOrdering::SeqCst) {
                 if let Err(reply_error) =
                     self.reply("确认窗口已结束：无法继续读取聊天，请稍后重试。")
                 {
@@ -837,10 +837,10 @@ impl ApplicationRuntime {
         &self,
         reader: &mut ChatDecisionReader,
     ) -> Result<Vec<ChatMessage>> {
-        if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+        if self.shared.paused.load(AtomicOrdering::SeqCst) {
             return Err(anyhow!("运行已暂停，已结束确认窗口"));
         }
-        if self.lifecycle.live_configs.has_pending_reload() {
+        if self.shared.live_configs.has_pending_reload() {
             return Err(anyhow!("配置重载待处理，已结束确认窗口"));
         }
         let snapshot = self.business.business.chat_listener_snapshot()?;
@@ -860,7 +860,7 @@ impl ApplicationRuntime {
     ) -> Result<Vec<(ChatMessage, crate::observation::chat::ObservedChatMessageId)>> {
         let wait_until = Instant::now() + remaining;
         let result = (|| {
-            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            if !self.shared.running.load(AtomicOrdering::SeqCst) {
                 return Ok(Vec::new());
             }
             let messages = self.poll_chat_decision_reader_with_ids(reader)?;
@@ -871,19 +871,19 @@ impl ApplicationRuntime {
                 configured_ms,
                 wait_until.saturating_duration_since(Instant::now()),
             )?;
-            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            if !self.shared.running.load(AtomicOrdering::SeqCst) {
                 return Ok(Vec::new());
             }
             self.poll_chat_decision_reader_with_ids(reader)
         })();
-        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+        if !self.shared.running.load(AtomicOrdering::SeqCst) {
             return Ok(Vec::new());
         }
         if let Err(error) = &result {
             log::error!(
                 "确认窗口读取失败（步骤：等待玩家在确认窗口内回复），本轮拿不到任何回复；已提示玩家窗口结束，可稍后重试：{error:#}"
             );
-            if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            if self.shared.running.load(AtomicOrdering::SeqCst) {
                 if let Err(reply_error) =
                     self.reply("确认窗口已结束：无法继续读取聊天，请稍后重试。")
                 {
@@ -900,10 +900,10 @@ impl ApplicationRuntime {
         &self,
         reader: &mut ChatDecisionReader,
     ) -> Result<Vec<(ChatMessage, crate::observation::chat::ObservedChatMessageId)>> {
-        if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+        if self.shared.paused.load(AtomicOrdering::SeqCst) {
             return Err(anyhow!("运行已暂停，已结束确认窗口"));
         }
-        if self.lifecycle.live_configs.has_pending_reload() {
+        if self.shared.live_configs.has_pending_reload() {
             return Err(anyhow!("配置重载待处理，已结束确认窗口"));
         }
         let snapshot = self.business.business.chat_listener_snapshot()?;
@@ -918,10 +918,10 @@ impl ApplicationRuntime {
         text: &str,
         accepts_turtle_questions: bool,
     ) -> Result<SecondaryHallMessageClassification> {
-        let access_config = self.lifecycle.live_configs.snapshot();
+        let access_config = self.shared.live_configs.snapshot();
         let router = ChatCommandRouter::with_access(
             &self.business.custom_workflow,
-            &self.lifecycle.live_configs.identity,
+            &self.shared.live_configs.identity,
             &access_config.command_access,
         );
         let active_entertainment = self.business.business.active_entertainment()?;
@@ -986,10 +986,10 @@ impl ApplicationRuntime {
             } else {
                 secondary_hall_actor_key(message_sender.as_deref(), account.as_ref())
             };
-            let access_config = self.lifecycle.live_configs.snapshot();
+            let access_config = self.shared.live_configs.snapshot();
             let router = ChatCommandRouter::with_access(
                 &self.business.custom_workflow,
-                &self.lifecycle.live_configs.identity,
+                &self.shared.live_configs.identity,
                 &access_config.command_access,
             );
             if message_type == "blue" {
@@ -1083,7 +1083,7 @@ impl ApplicationRuntime {
                     // 提问里的玩家名走统一展示链（显示名 → 真实昵称 → 占位）：
                     // OCR 拿到的只是屏幕名（备注串或真实昵称），直接渲染会把
                     // 随机备注串打到大厅。player_key 仍是原始屏幕名，匹配不受影响。
-                    question.player = self.lifecycle.live_configs.identity.player_name(
+                    question.player = self.shared.live_configs.identity.player_name(
                         &question.player,
                         account
                             .as_ref()

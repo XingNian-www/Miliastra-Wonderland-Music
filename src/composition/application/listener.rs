@@ -228,7 +228,7 @@ fn game_location_probe_blocks_residency(observation: Option<&UiStateObservation>
 
 /// 命令在**拦截点**被挡下的具体原因。
 ///
-/// 拦截点在入队/派发之前（[\`ApplicationRuntime::command_gate\`]），
+/// 拦截点在入队/派发之前（[\`AppServices::command_gate\`]），
 /// 命令走不到 \`execute_command\`，所以文案必须在这里出；
 /// 只有把原因结构化，才能对玩家说清「是面板关了」还是「你权限不够」。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -809,7 +809,7 @@ fn complete_secondary_claim(
     }
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     fn poll_playlist_import_completions(&self) -> Result<()> {
         for messages in self
             .business
@@ -828,7 +828,7 @@ impl ApplicationRuntime {
 
     fn persist_listener_mode_best_effort(&self, mode: ChatListenerMode) {
         if let Err(error) =
-            persist_chat_listener_mode(&self.lifecycle.config.state.playback_state_path, mode)
+            persist_chat_listener_mode(&self.shared.config.state.playback_state_path, mode)
         {
             log::error!(
                 "保存聊天值守模式失败（步骤：写入值守模式状态文件），本次选择未落盘，进程重启后会回到上一次保存的值：{error:#}"
@@ -900,60 +900,47 @@ impl ApplicationRuntime {
         };
         // 告警开关每次读 live 快照（保存后下一次调用即生效），不缓存启动值。
         let warn_on_size_mismatch =
-            screen_size_warning_enabled(&self.lifecycle.live_configs.snapshot());
+            screen_size_warning_enabled(&self.shared.live_configs.snapshot());
         if warn_on_size_mismatch
-            && (frame.width() != self.lifecycle.config.screen.expected_width
-                || frame.height() != self.lifecycle.config.screen.expected_height)
+            && (frame.width() != self.shared.config.screen.expected_width
+                || frame.height() != self.shared.config.screen.expected_height)
         {
             log::warn!(
                 "截图尺寸与预期不一致：实际 {}x{}，预期 {}x{}。模板匹配可能失准，程序继续运行，建议核对游戏窗口分辨率",
                 frame.width(),
                 frame.height(),
-                self.lifecycle.config.screen.expected_width,
-                self.lifecycle.config.screen.expected_height
+                self.shared.config.screen.expected_width,
+                self.shared.config.screen.expected_height
             );
         }
         Ok(())
     }
 
-    pub(super) fn start_http_server(&mut self) -> Result<()> {
-        if !self.lifecycle.config.http.enabled {
-            return Ok(());
-        }
-        if self.lifecycle.http_server.is_some() {
+    /// 组装并启动 Web 面板。
+    ///
+    /// 面板只拿共享服务里的句柄（正式任务客户端、UI 句柄、OCR、播放器后端），
+    /// 因此这一步不需要 `&self`；启动成功后把面板真实的排空闸门登记回
+    /// 共享服务，配置空闲重载据此判断「是否还有 HTTP 写操作在途」。
+    pub(super) fn start_http_server(&self) -> Result<http::HttpServer> {
+        if self.shared.http_reload.is_attached() {
             return Err(anyhow!("HTTP/Web 面板已经启动"));
         }
-        let player_runtime = self
-            .playback
-            .player_runtime
-            .as_ref()
-            .ok_or_else(|| anyhow!("播放器运行时尚未启动"))?
-            .handle();
-        let formal_tasks = Arc::new(
-            self.business
-                .formal_tasks
-                .clone()
-                .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?,
-        );
+        let formal_tasks = Arc::new(self.formal_tasks()?.clone());
         // 调试沙盒复用与公开 HTTP 完全相同的播放控制入队路径，不另造旁路：
         // 这样"沙盒里能做的"和"API 能做的"永远一致，不会各自漂移。
         // 模拟聊天注入需要真身的链路句柄：timeline 决定消息进哪条队列，
         // identity 决定按什么角色授权，external 决定决策窗口走快路径还是 OCR。
-        let simulation_external = self.lifecycle.external_chat.clone();
+        let simulation_external = self.shared.external_chat.clone();
         let simulation = http_facade::ChatSimulation {
             timeline: self.ui.chat_timeline.clone(),
-            identity: self.lifecycle.live_configs.identity.clone(),
+            identity: self.shared.live_configs.identity.clone(),
             external_active: Arc::new(move || simulation_external.supplies_hall_messages()),
         };
         // 网页端“解析全部页签”：用监听运行时的 UI 句柄与 OCR 直接驱动一次扫描。
         let emoji_catalog_ui = crate::ui::routines::EmojiCatalogUi::new(
-            self.ui
-                .ui_runtime
-                .as_ref()
-                .ok_or_else(|| anyhow!("UI运行时尚未启动"))?
-                .handle(),
+            self.ui.ui_handle.clone(),
             self.ui.ocr.clone(),
-            friend_delivery_routine_config(&self.lifecycle.config, &self.lifecycle.live_configs),
+            friend_delivery_routine_config(&self.shared.config, &self.shared.live_configs),
         );
         let emoji_scan: Arc<dyn Fn() -> Result<String, http::HttpCommandError> + Send + Sync> =
             Arc::new(move || {
@@ -1007,27 +994,23 @@ impl ApplicationRuntime {
                 simulation,
             )
             .with_emoji_scan(emoji_scan.clone()));
-        let config_store = self
-            .lifecycle
-            .config_store
-            .clone()
-            .ok_or_else(|| anyhow!("配置中心存储尚未初始化"))?;
-        let http_config = self.lifecycle.config.http.clone();
+        let config_store = self.shared.config_store.clone();
+        let http_config = self.shared.config.http.clone();
         let mut http_state = http::HttpSharedState::new(
             http::HttpInterfaceConfig::new(
                 http_config,
-                self.lifecycle.config.screen.clone(),
-                self.lifecycle.config.templates.clone(),
-                self.lifecycle.config.moderation.clone(),
-                self.lifecycle.config.startup.clone(),
-                self.lifecycle.config.invite.clone(),
-                self.lifecycle.config.timing.clone(),
-                self.lifecycle.config.custom_workflows.clone(),
+                self.shared.config.screen.clone(),
+                self.shared.config.templates.clone(),
+                self.shared.config.moderation.clone(),
+                self.shared.config.startup.clone(),
+                self.shared.config.invite.clone(),
+                self.shared.config.timing.clone(),
+                self.shared.config.custom_workflows.clone(),
             ),
-            self.lifecycle.monitor.clone(),
+            self.shared.monitor.clone(),
             self.ui.latest_frame.clone(),
             config_store,
-            self.lifecycle.live_configs.clone(),
+            self.shared.live_configs.clone(),
             http::HttpApplicationPorts::new(
                 Arc::new(
                     http_facade::ApplicationHttpCommandFacade::with_simulation(
@@ -1035,9 +1018,9 @@ impl ApplicationRuntime {
                         self.business.custom_workflow.clone(),
                         http_facade::ChatSimulation {
                             timeline: self.ui.chat_timeline.clone(),
-                            identity: self.lifecycle.live_configs.identity.clone(),
+                            identity: self.shared.live_configs.identity.clone(),
                             external_active: {
-                                let external = self.lifecycle.external_chat.clone();
+                                let external = self.shared.external_chat.clone();
                                 Arc::new(move || external.supplies_hall_messages())
                             },
                         },
@@ -1050,7 +1033,7 @@ impl ApplicationRuntime {
                     hall_ui: self.ui.hall_ui.clone(),
                 }),
                 Arc::new(http_facade::ApplicationHttpPlayerFacade::new(
-                    PlayerRuntimeBackend::new(player_runtime),
+                    PlayerRuntimeBackend::new(self.playback.player_runtime.clone()),
                     self.playback.player_search.clone(),
                     self.playback.native_playback.clone(),
                     self.playback.playback_application.play_mode_handle(),
@@ -1068,7 +1051,7 @@ impl ApplicationRuntime {
                         let openai = self.business.ai_chat_openai.clone();
                         let connection = self.business.ai_connection.clone();
                         let timeout = self.business.ai_request_timeout;
-                        let live_configs = self.lifecycle.live_configs.clone();
+                        let live_configs = self.shared.live_configs.clone();
                         let generation = self.business.ai_chat_memory_generation.clone();
                         Arc::new(move |actor: &str| {
                             // 重建是权威结果：先推进代际作废在途的抽取/压缩提交，
@@ -1078,7 +1061,7 @@ impl ApplicationRuntime {
                             let config = live_configs.snapshot().ai_chat.clone();
                             let display = live_configs.identity.player_name_for_key(actor);
                             let result =
-                                crate::composition::application::ApplicationRuntime::rebuild_facts_with(
+                                crate::composition::application::AppServices::rebuild_facts_with(
                                     &memory,
                                     &openai,
                                     &connection,
@@ -1093,12 +1076,12 @@ impl ApplicationRuntime {
                     },
                     {
                         // 记忆键是 UUID，面板要显示成人能认的名字。
-                        let identity = self.lifecycle.live_configs.identity.clone();
+                        let identity = self.shared.live_configs.identity.clone();
                         Arc::new(move |key: &str| identity.player_name_for_key(key))
                     },
                     {
                         // 反向：面板/bookmark 传的是名字，查库要的是键。
-                        let identity = self.lifecycle.live_configs.identity.clone();
+                        let identity = self.shared.live_configs.identity.clone();
                         Arc::new(move |name: &str| identity.memory_key(name))
                     },
                     // 面板删改记忆要能作废在途的抽取/压缩，必须共享同一份代际。
@@ -1107,13 +1090,9 @@ impl ApplicationRuntime {
             ),
         );
         http_state.set_debug_port(Arc::new(http_facade::ApplicationHttpDebugFacade::new(
-            self.ui
-                .ui_runtime
-                .as_ref()
-                .ok_or_else(|| anyhow!("UI运行时尚未启动"))?
-                .handle(),
+            self.ui.ui_handle.clone(),
             self.ui.ocr.clone(),
-            &self.lifecycle.config.state.playback_state_path,
+            &self.shared.config.state.playback_state_path,
             Arc::new({
                 let business = self.business.business.clone();
                 move || {
@@ -1152,20 +1131,21 @@ impl ApplicationRuntime {
             }),
             debug_command_port,
         )?));
-        self.lifecycle.http_reload_blockers = http_state.active_reload_blockers.clone();
-        self.lifecycle.http_reload_draining = http_state.reload_draining.clone();
+        let reload_blockers = http_state.active_reload_blockers.clone();
+        let reload_draining = http_state.reload_draining.clone();
         let server = http::start(http_state)?;
-        self.lifecycle.http_server = Some(server);
-        Ok(())
+        self.shared
+            .adopt_http_reload_gates(reload_blockers, reload_draining);
+        Ok(server)
     }
 
     pub(super) fn start_hotkeys(&self) -> Result<hotkeys::HotkeyRuntime> {
         let task_engine = self.business.task_engine.clone();
-        let shutdown = self.lifecycle.shutdown.clone();
+        let shutdown = self.shared.shutdown.clone();
         hotkeys::start(
-            &self.lifecycle.config.hotkeys,
-            Arc::clone(&self.lifecycle.running),
-            Arc::clone(&self.lifecycle.paused),
+            &self.shared.config.hotkeys,
+            Arc::clone(&self.shared.running),
+            Arc::clone(&self.shared.paused),
             Arc::new(move || shutdown.request_user_exit()),
             Arc::new(move || {
                 if let Err(error) = task_engine.wake() {
@@ -1183,7 +1163,7 @@ impl ApplicationRuntime {
         {
             return Ok(false);
         }
-        if !self.lifecycle.reload_startup.required_actions().is_empty() {
+        if !self.shared.reload_startup.required_actions().is_empty() {
             return Ok(false);
         }
         if !self.require_reload_startup_automation()? {
@@ -1201,7 +1181,7 @@ impl ApplicationRuntime {
         config_reload_child: bool,
         retry_after: &mut Instant,
     ) -> Result<()> {
-        let missing = !self.lifecycle.reload_startup.missing_actions().is_empty();
+        let missing = !self.shared.reload_startup.missing_actions().is_empty();
         let now = Instant::now();
         if !replacement_startup_retry_due(
             config_reload_child,
@@ -1235,10 +1215,10 @@ impl ApplicationRuntime {
         reason: &str,
     ) -> Result<()> {
         let now = Instant::now();
-        let paused = self.lifecycle.paused.load(AtomicOrdering::SeqCst);
-        let startup_gate_active = !self.lifecycle.reload_startup.required_actions().is_empty();
+        let paused = self.shared.paused.load(AtomicOrdering::SeqCst);
+        let startup_gate_active = !self.shared.reload_startup.required_actions().is_empty();
         let startup_actions_available =
-            !ReloadStartupActions::from_startup_config(&self.lifecycle.config).is_empty();
+            !ReloadStartupActions::from_startup_config(&self.shared.config).is_empty();
         if config_reload_child
             && !crate::config_reload_child_ready()
             && !startup_gate_active
@@ -1354,7 +1334,7 @@ impl ApplicationRuntime {
         }
 
         // 暂停值守、任务执行中都不该重开游戏：那会打断玩家主动发起的操作。
-        if self.lifecycle.paused.load(AtomicOrdering::SeqCst)
+        if self.shared.paused.load(AtomicOrdering::SeqCst)
             || !self.business.task_engine.is_idle()?
         {
             return Ok(());
@@ -1369,7 +1349,7 @@ impl ApplicationRuntime {
         if chat_source.enabled
             && chat_source.disconnect_action
                 == crate::config::ChatSourceDisconnectAction::RestartGame
-            && let Some(lost) = self.lifecycle.external_chat.lost_for()
+            && let Some(lost) = self.shared.external_chat.lost_for()
         {
             let threshold = Duration::from_millis(chat_source.lease_timeout_ms);
             if lost >= threshold {
@@ -1392,7 +1372,7 @@ impl ApplicationRuntime {
                 );
                 self.close_game_for_restart(
                     "外部聊天源失联超过回落阈值",
-                    &self.lifecycle.external_chat,
+                    &self.shared.external_chat,
                 );
                 self.request_game_relaunch(mode)?;
                 *awaiting_bridge_relaunch =
@@ -1433,7 +1413,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn run_scan_loop(
-        &mut self,
+        &self,
         shared_subscriber: crate::observation::chat::ChatTimelineSubscriber,
     ) -> Result<()> {
         let mut completion_subscriber = self
@@ -1459,23 +1439,18 @@ impl ApplicationRuntime {
     // 共享 OCR 重构后，这些扫描状态只写不读；保留 `allow` 以消除噪音，待确认无后续用途再删。
     #[allow(unused_variables, unused_mut, unused_assignments)]
     fn run_scan_loop_inner(
-        &mut self,
+        &self,
         completion_subscriber: &mut CompletionAdvanceSubscriber,
         shared_subscriber: &crate::observation::chat::ChatTimelineSubscriber,
     ) -> Result<()> {
         let template_args = self.ui.chat_templates.clone();
         let canvas = Canvas {
-            width: self.lifecycle.config.screen.expected_width,
-            height: self.lifecycle.config.screen.expected_height,
+            width: self.shared.config.screen.expected_width,
+            height: self.shared.config.screen.expected_height,
             resize: true,
         };
-        let ui_handle = self
-            .ui
-            .ui_runtime
-            .as_ref()
-            .context("UI runtime 在扫描循环启动前已停止")?
-            .handle();
-        let initial_live_config = self.lifecycle.live_configs.snapshot();
+        let ui_handle = self.ui.ui_handle.clone();
+        let initial_live_config = self.shared.live_configs.snapshot();
         let mut frame_demand_ms = initial_live_config.timing.loop_idle_ms.max(1);
         let mut frame_demand = FrameDemand::new(Duration::from_millis(frame_demand_ms))
             .context("创建聊天观察帧需求")?;
@@ -1527,6 +1502,8 @@ impl ApplicationRuntime {
         // 自动重启游戏的两个守卫：
         // - last_auto_restart_at 是冷却，避免反复重开；
         // - loading_since/loading_samples 是「确实停在加载界面」的连续样本计数。
+        // 配置空闲重载的检查节流时钟：属于本循环的进度状态，不放共享服务。
+        let mut reload_check_after = Instant::now();
         let mut last_auto_restart_at: Option<Instant> = None;
         let mut auto_restart_no_relaunch_warned_at: Option<Instant> = None;
         // 自动重启走桥时：关闭游戏后要**显式**请桥重新拉起。
@@ -1534,13 +1511,13 @@ impl ApplicationRuntime {
         // 那样线程不会重连，ensure_running 永远不会被调用，游戏就一直关着。
         let mut awaiting_bridge_relaunch: Option<Instant> = None;
         log::info!("自动化扫描已启动，开始按界面状态轮询");
-        while self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+        while self.shared.running.load(AtomicOrdering::SeqCst) {
             self.poll_hall_expiry(
                 &mut hall_expiry_pause_applied,
                 &mut hall_expiry_notice_sent,
                 &mut hall_expiry_check_after,
             );
-            let live_config = self.lifecycle.live_configs.snapshot();
+            let live_config = self.shared.live_configs.snapshot();
             if automatic_startup_pending
                 && self.ui.coordinator.scan_may_run()
                 && self.business.task_engine.is_idle()?
@@ -1591,8 +1568,8 @@ impl ApplicationRuntime {
                 secondary_identity = None;
                 unresolved_ui_since = None;
                 self.maybe_idle_exit()?;
-                self.maybe_reload_config_when_idle();
-                if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                self.maybe_reload_config_when_idle(&mut reload_check_after);
+                if !self.shared.running.load(AtomicOrdering::SeqCst) {
                     continue;
                 }
                 sleep(
@@ -1626,7 +1603,7 @@ impl ApplicationRuntime {
                 last_scan_boundary = scan_boundary;
             }
             let mut scan_lease = Some(scan_lease);
-            if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+            if self.shared.paused.load(AtomicOrdering::SeqCst) {
                 drop(scan_lease.take());
                 if let Some(subscription) = frame_subscription.take()
                     && let Err(error) = subscription.cancel()
@@ -1637,8 +1614,8 @@ impl ApplicationRuntime {
                 }
                 unresolved_ui_since = None;
                 self.maybe_idle_exit()?;
-                self.maybe_reload_config_when_idle();
-                if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                self.maybe_reload_config_when_idle(&mut reload_check_after);
+                if !self.shared.running.load(AtomicOrdering::SeqCst) {
                     continue;
                 }
                 sleep(
@@ -1745,12 +1722,12 @@ impl ApplicationRuntime {
                                     }),
                                 );
                             }
-                            self.lifecycle.monitor.publish(MonitorEvent::UiState(
+                            self.shared.monitor.publish(MonitorEvent::UiState(
                                 ui_state_display_label(ui_state.as_str()),
                             ))
                         }
                         Err(_) => self
-                            .lifecycle
+                            .shared
                             .monitor
                             .publish(MonitorEvent::UiState("界面检测失败".to_string())),
                     }
@@ -2103,8 +2080,8 @@ impl ApplicationRuntime {
                 Ok(None) => {
                     // A receive timeout is a normal polling tick, not a capture failure.
                     drop(scan_lease.take());
-                    self.maybe_reload_config_when_idle();
-                    if !woken_by_snapshot && self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                    self.maybe_reload_config_when_idle(&mut reload_check_after);
+                    if !woken_by_snapshot && self.shared.running.load(AtomicOrdering::SeqCst) {
                         self.maybe_activate_reload_startup_after_ui_grace(
                             config_reload_child,
                             self.business.task_engine.is_idle()?,
@@ -2130,7 +2107,7 @@ impl ApplicationRuntime {
                     if !target_missing {
                         self.abort_entertainment_for_context_loss("目标游戏窗口已关闭或不可用");
                     }
-                    self.lifecycle
+                    self.shared
                         .monitor
                         .publish(MonitorEvent::UiState("目标窗口不可用".to_string()));
                     primary_visible = false;
@@ -2161,8 +2138,8 @@ impl ApplicationRuntime {
                     );
                     target_missing = true;
                     self.maybe_idle_exit()?;
-                    self.maybe_reload_config_when_idle();
-                    if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+                    self.maybe_reload_config_when_idle(&mut reload_check_after);
+                    if !self.shared.running.load(AtomicOrdering::SeqCst) {
                         continue;
                     }
                     if self.activate_reload_startup_fallback("目标窗口不可用")? {
@@ -2179,7 +2156,7 @@ impl ApplicationRuntime {
                             &mut hall_expiry_check_after,
                         );
                         let now = Instant::now();
-                        if !self.lifecycle.running.load(AtomicOrdering::SeqCst)
+                        if !self.shared.running.load(AtomicOrdering::SeqCst)
                             || now >= window_retry_at
                         {
                             break false;
@@ -2240,9 +2217,9 @@ impl ApplicationRuntime {
                 &mut awaiting_bridge_relaunch,
             )?;
             self.maybe_idle_exit()?;
-            self.maybe_reload_config_when_idle();
+            self.maybe_reload_config_when_idle(&mut reload_check_after);
             self.poll_playlist_import_completions()?;
-            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            if !self.shared.running.load(AtomicOrdering::SeqCst) {
                 continue;
             }
             let ready_snapshot = self.business.business.chat_listener_snapshot()?;
@@ -2251,10 +2228,10 @@ impl ApplicationRuntime {
                 listener_ready_evidence,
                 &ready_snapshot,
                 ready_task_busy,
-                self.lifecycle.paused.load(AtomicOrdering::SeqCst),
-                self.lifecycle.running.load(AtomicOrdering::SeqCst),
+                self.shared.paused.load(AtomicOrdering::SeqCst),
+                self.shared.running.load(AtomicOrdering::SeqCst),
             );
-            let startup_ready = self.lifecycle.reload_startup.is_satisfied();
+            let startup_ready = self.shared.reload_startup.is_satisfied();
             if replacement_ready_allowed(listener_ready, startup_ready)
                 && crate::mark_config_reload_child_ready()?
             {
@@ -2288,7 +2265,7 @@ impl ApplicationRuntime {
     }
 
     fn consume_shared_chat_snapshots(
-        &mut self,
+        &self,
         subscriber: &crate::observation::chat::ChatTimelineSubscriber,
         backlog: &mut std::collections::VecDeque<crate::observation::chat::ChatTimelineSnapshot>,
     ) -> Result<()> {
@@ -2301,7 +2278,7 @@ impl ApplicationRuntime {
         //
         // 取走并丢弃等于「暂停期间的消息确实不处理」，符合暂停语义；恢复后
         // 靠 OCR 冷基线重建观察状态。积压一并清掉，避免恢复瞬间暴发式补跑历史命令。
-        if self.lifecycle.paused.load(AtomicOrdering::SeqCst) {
+        if self.shared.paused.load(AtomicOrdering::SeqCst) {
             let discarded = subscriber.read()?.len().saturating_add(backlog.len());
             backlog.clear();
             if discarded > 0 {
@@ -2343,7 +2320,7 @@ impl ApplicationRuntime {
     }
 
     fn consume_shared_chat_snapshot(
-        &mut self,
+        &self,
         snapshot: crate::observation::chat::ChatTimelineSnapshot,
         listener_mode: ChatListenerMode,
     ) -> Result<()> {
@@ -2666,7 +2643,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn dispatch_chat_observations(
-        &mut self,
+        &self,
         dispatches: Vec<ChatObservationDispatch>,
     ) -> Result<SecondaryObservationOutcome> {
         if crate::debug_mode::enabled() {
@@ -2732,7 +2709,7 @@ impl ApplicationRuntime {
         ocr_name: &str,
         account: Option<&crate::features::command::CommandAccount>,
     ) -> String {
-        self.lifecycle.live_configs.identity.player_name(
+        self.shared.live_configs.identity.player_name(
             ocr_name,
             account.map(|account| (account.game.as_str(), account.uid.as_str())),
         )
@@ -2740,12 +2717,12 @@ impl ApplicationRuntime {
 
     /// 记忆归属键：已登记玩家用 UUID，未登记退回显示昵称。
     pub(super) fn canonical_actor_name(&self, ocr_name: &str) -> String {
-        self.lifecycle.live_configs.identity.memory_key(ocr_name)
+        self.shared.live_configs.identity.memory_key(ocr_name)
     }
 
     /// 记忆键对应的展示名（BOT 称呼、面板、日志用）。
     pub(super) fn actor_display_name(&self, actor_key: &str) -> String {
-        self.lifecycle
+        self.shared
             .live_configs
             .identity
             .player_name_for_key(actor_key)
@@ -2778,7 +2755,7 @@ impl ApplicationRuntime {
             },
             None => crate::features::identity::IdentityHint::Nickname(subject),
         };
-        let identity = &self.lifecycle.live_configs.identity;
+        let identity = &self.shared.live_configs.identity;
         let uuid = identity.resolve_hint(hint).map(|resolved| resolved.id);
         // 兜底：`resolve_hint` 只认 nickname（那是**授权**口径，不能放宽），
         // 而外部聊天源给的发送者名字常常是 **真实昵称（玩家自设）**——
@@ -2824,16 +2801,16 @@ impl ApplicationRuntime {
     }
 
     fn handle_scan_messages(
-        &mut self,
+        &self,
         captured_at: Instant,
         observed_messages: Vec<PrimaryObservedMessage>,
     ) -> Result<()> {
         let active_entertainment = self.business.business.active_entertainment()?;
         let accepts_turtle_questions = self.business.business.turtle_soup_accepts_questions()?;
-        let access_config = self.lifecycle.live_configs.snapshot();
+        let access_config = self.shared.live_configs.snapshot();
         let command_router = ChatCommandRouter::with_access(
             &self.business.custom_workflow,
-            &self.lifecycle.live_configs.identity,
+            &self.shared.live_configs.identity,
             &access_config.command_access,
         );
         if observed_messages.is_empty() {
@@ -3079,7 +3056,7 @@ impl ApplicationRuntime {
         captured_at: Instant,
         lock_anchor: crate::observation::chat::LockAnchor,
     ) -> Result<()> {
-        let config = self.lifecycle.live_configs.snapshot().ai_chat.clone();
+        let config = self.shared.live_configs.snapshot().ai_chat.clone();
         // 大厅消息没有独立 sender 字段，昵称在文本行首，与命令信封共用同一套切分。
         //
         // 拆不出昵称时退回账号 UID：外部聊天源的昵称可能为 null（API 文档 §5），
@@ -3108,7 +3085,7 @@ impl ApplicationRuntime {
                 // 权限判定放在触发之后：先确认这句话确实是在叫机器人，
                 // 再判断叫的人有没有资格，避免把普通闲聊记成「越权」。
                 let role = self
-                    .lifecycle
+                    .shared
                     .live_configs
                     .identity
                     .role_of_sender(&sender, account);
@@ -3166,7 +3143,7 @@ impl ApplicationRuntime {
         // 触发期放行、执行期 role=None，命令被静默丢弃。
         routed.account = account.cloned();
         routed.role = self
-            .lifecycle
+            .shared
             .live_configs
             .identity
             .role_of_sender(&sender, routed.account.as_ref());
@@ -3210,7 +3187,7 @@ impl ApplicationRuntime {
         if command.message_type == "控制台" {
             return Ok(CommandGate::Allowed);
         }
-        let snapshot = self.lifecycle.live_configs.snapshot();
+        let snapshot = self.shared.live_configs.snapshot();
         let (_, policy) = crate::features::command_access::resolve_with_active(
             &snapshot.command_access,
             command,
@@ -3219,7 +3196,7 @@ impl ApplicationRuntime {
         // 与路由期同一判定：有账号按 UID，否则按昵称。只按昵称会让外部源的
         // 管理员命令「路由放行、执行拒绝」——昵称是随机 OCR 匹配键，查不到 UID 绑定。
         let role = self
-            .lifecycle
+            .shared
             .live_configs
             .identity
             .role_of_sender(&command.username, command.account.as_ref());
@@ -3275,7 +3252,7 @@ impl ApplicationRuntime {
                 // 两者都不解析这段文本，因此统一措辞是安全的。
                 let message = format!("值守模式查询：当前为{}{}", snapshot.mode.label(), pending);
                 log::info!("「{}」{}", parsed.username, message);
-                self.lifecycle
+                self.shared
                     .monitor
                     .publish(MonitorEvent::Command(format!(
                         "{} -> {}",
@@ -3379,7 +3356,7 @@ impl ApplicationRuntime {
                 false
             }
         };
-        let clock_active = !self.lifecycle.paused.load(AtomicOrdering::SeqCst) && scheduler_idle;
+        let clock_active = !self.shared.paused.load(AtomicOrdering::SeqCst) && scheduler_idle;
         if let Err(error) = self
             .business
             .business
@@ -3558,7 +3535,7 @@ impl ApplicationRuntime {
         Ok(handled)
     }
 
-    pub(super) fn execute_console_chat_task(&mut self, text: String, prefix: String) -> Result<()> {
+    pub(super) fn execute_console_chat_task(&self, text: String, prefix: String) -> Result<()> {
         let message = format!("{}{}", prefix, text);
         self.reply(&message)
     }
@@ -3579,7 +3556,7 @@ impl ApplicationRuntime {
     /// 准入条件除了「一级界面」，还要求外部源已接管、当前不是二级、没有正在
     /// 进行的切换，避免与启动自动化抢 UI 事务。
     fn maybe_switch_to_secondary(&self, ui_state: &str) -> Result<()> {
-        if !self.lifecycle.external_chat.supplies_hall_messages() {
+        if !self.shared.external_chat.supplies_hall_messages() {
             return Ok(());
         }
         let snapshot = self.business.business.chat_listener_snapshot()?;
@@ -3587,7 +3564,7 @@ impl ApplicationRuntime {
             return Ok(());
         }
         if !self
-            .lifecycle
+            .shared
             .external_chat
             .claim_initial_secondary_switch()
         {
@@ -3650,7 +3627,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn execute_set_chat_listener_mode(
-        &mut self,
+        &self,
         target: ChatListenerMode,
     ) -> Result<()> {
         self.abort_entertainment_for_context_loss("聊天值守模式即将切换");
@@ -3680,7 +3657,7 @@ impl ApplicationRuntime {
 mod tests {
     /// 回归（Live 化批次4b）：尺寸不符告警开关取自 live 快照，不是启动期缓存。
     ///
-    /// 生产读取点传 `&self.lifecycle.live_configs.snapshot()`；本测试证明该纯函数
+    /// 生产读取点传 `&self.shared.live_configs.snapshot()`；本测试证明该纯函数
     /// 使用传入配置的值、且 LiveConfigs 快照携带被保存后的新值。
     #[test]
     fn screen_size_warning_flag_reads_the_current_live_snapshot() {

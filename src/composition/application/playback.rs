@@ -26,13 +26,13 @@ fn immediate_playback_evidence(
     }
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     pub(super) fn stop_background_lyrics_output(&self) -> Result<bool> {
         self.business.background_commands.stop("lyrics")
     }
 
     pub(super) fn execute_playback_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &PlaybackCommand,
     ) -> Result<()> {
@@ -45,7 +45,7 @@ impl ApplicationRuntime {
             .playback
             .playback_application
             .clone()
-            .execute_command(&context, command, self);
+            .execute_command(&context, command, &mut self.port());
         // Playback commands are synchronous, but a reply/logging error may follow a
         // player-side effect. Record the dispatch either way; failed means the handler
         // returned an error, whose side effects may be partial.
@@ -59,20 +59,20 @@ impl ApplicationRuntime {
         outcome
     }
 
-    pub(super) fn execute_advance_queue_task(&mut self, reason: &'static str) -> Result<()> {
-        if !automatic_advance_allowed(&self.lifecycle.live_configs) {
+    pub(super) fn execute_advance_queue_task(&self, reason: &'static str) -> Result<()> {
+        if !automatic_advance_allowed(&self.shared.live_configs) {
             log::debug!("配置重载待处理，跳过自动下一曲（原因：{reason}）");
             return Ok(());
         }
         self.playback
             .playback_application
             .clone()
-            .consume_queue_after_monitor(reason, self)
+            .consume_queue_after_monitor(reason, &mut self.port())
             .map(|_| ())
     }
 
     pub(super) fn play_request_confirmed(
-        &mut self,
+        &self,
         request: &ResolvedSongRequest,
     ) -> Result<PlaybackResult> {
         let selection = request.playback_selection();
@@ -80,7 +80,7 @@ impl ApplicationRuntime {
             .playback
             .playback_application
             .clone()
-            .play_confirmed(&selection, self)?;
+            .play_confirmed(&selection, &mut self.port())?;
         // 写成句子而不是字段堆砌：维护者要能一眼读出「请求了什么、最后播了什么、
         // 有没有换源、失败原因是什么」，而不是对着 key=value 逐个翻译。
         let actual_uri = result
@@ -104,7 +104,7 @@ impl ApplicationRuntime {
     /// allow_local 为 false 时 @本地 与未开放的 @换源/@AI 一样被忽略，
     /// 不会中断本次点歌，而是继续等待其他确认命令。
     pub(super) fn prompt_and_wait_for_decision_batch(
-        &mut self,
+        &self,
         messages: &[String],
         allow_switch_source: bool,
         allow_ai: bool,
@@ -112,7 +112,8 @@ impl ApplicationRuntime {
         timeout_confirms: bool,
     ) -> Result<SongRequestDecision> {
         let reader = self.begin_song_decision_reader()?;
-        self.reply_batch(messages, 0)?;
+        let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+        self.reply_batch(&refs, 0)?;
         self.wait_for_decision_with_reader(
             reader,
             allow_switch_source,
@@ -133,7 +134,7 @@ impl ApplicationRuntime {
     }
 
     fn wait_for_decision_with_reader(
-        &mut self,
+        &self,
         mut reader: ChatDecisionReader,
         allow_switch_source: bool,
         allow_ai: bool,
@@ -141,7 +142,7 @@ impl ApplicationRuntime {
         timeout_confirms: bool,
     ) -> Result<SongRequestDecision> {
         let timeout =
-            Duration::from_millis(super::live_decision_timeout_ms(&self.lifecycle.live_configs));
+            Duration::from_millis(super::live_decision_timeout_ms(&self.shared.live_configs));
         let map_web_decision = |decision| match decision {
             DecisionAction::Confirm => SongRequestDecision::Confirm,
             DecisionAction::Skip => SongRequestDecision::Skip,
@@ -155,13 +156,13 @@ impl ApplicationRuntime {
             timeout,
         )?;
         let deadline = Instant::now() + timeout;
-        while self.lifecycle.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
+        while self.shared.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
             let messages = self.wait_for_chat_decision_messages_with_ids(
                 &mut reader,
-                super::live_decision_poll_ms(&self.lifecycle.live_configs),
+                super::live_decision_poll_ms(&self.shared.live_configs),
                 deadline.saturating_duration_since(Instant::now()),
             )?;
-            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            if !self.shared.running.load(AtomicOrdering::SeqCst) {
                 return Ok(SongRequestDecision::Stopped);
             }
             if let Some(decision) = web_decision.wait(Duration::ZERO)? {
@@ -220,7 +221,7 @@ impl ApplicationRuntime {
         if let Some(decision) = web_decision.wait(Duration::from_millis(0))? {
             return Ok(map_web_decision(decision));
         }
-        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+        if !self.shared.running.load(AtomicOrdering::SeqCst) {
             Ok(SongRequestDecision::Stopped)
         } else if timeout_confirms {
             Ok(SongRequestDecision::Timeout)
@@ -254,17 +255,17 @@ fn playback_outcome_label(result: &PlaybackResult) -> String {
     }
 }
 
-impl PlaybackExecutionPort for ApplicationRuntime {
+impl PlaybackExecutionPort for AppServicesPort<'_> {
     /// 把歌单归属键（`id:<uuid>`）翻译成玩家看得懂的名字。
     ///
     /// 归属键是内部标识，泄露到文案里玩家会看到一长串 UUID。
     /// 这里能拿到身份映射，所以翻译放在这一层；features 层只声明需求。
     fn playlist_owner_display(&self, owner: &str) -> String {
-        super::playlist_owner_display(&self.lifecycle.live_configs.identity, owner)
+        super::playlist_owner_display(&self.shared.live_configs.identity, owner)
     }
 
     fn reply(&mut self, message: &str) -> Result<()> {
-        ApplicationRuntime::reply(self, message)
+        AppServices::reply(self, message)
     }
 
     fn render_reply(
@@ -287,7 +288,7 @@ impl PlaybackExecutionPort for ApplicationRuntime {
         if text.is_empty() {
             return Ok(());
         }
-        ApplicationRuntime::reply(self, &text)
+        AppServices::reply(self, &text)
     }
 
     fn update_monitor(&mut self) {
@@ -336,7 +337,7 @@ impl PlaybackExecutionPort for ApplicationRuntime {
     }
 
     fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
-        ApplicationRuntime::playback_queue(self)
+        AppServices::playback_queue(self)
     }
 
     fn enqueue_playlist_item(&mut self, item: QueueItem) -> Result<bool> {
@@ -379,7 +380,7 @@ impl PlaybackExecutionPort for ApplicationRuntime {
     }
 
     fn automatic_queue_advance_allowed(&mut self) -> Result<bool> {
-        Ok(automatic_advance_allowed(&self.lifecycle.live_configs))
+        Ok(automatic_advance_allowed(&self.shared.live_configs))
     }
 
     fn preload_track(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<()> {
@@ -390,10 +391,10 @@ impl PlaybackExecutionPort for ApplicationRuntime {
     }
 }
 
-impl PlaybackCommandPort for ApplicationRuntime {
+impl PlaybackCommandPort for AppServicesPort<'_> {
     fn reply_batch(&mut self, messages: &[String], delay_ms: u64) -> Result<()> {
         let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
-        ApplicationRuntime::reply_batch(self, &refs, delay_ms)
+        AppServices::reply_batch(self, &refs, delay_ms)
     }
 
     fn log_executed(
@@ -456,7 +457,7 @@ impl PlaybackCommandPort for ApplicationRuntime {
     }
 
     fn should_stop_continuous_lyrics(&mut self) -> Result<bool> {
-        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+        if !self.shared.running.load(AtomicOrdering::SeqCst) {
             return Ok(true);
         }
         if self
@@ -486,10 +487,10 @@ impl PlaybackCommandPort for ApplicationRuntime {
             &self.business.background_commands,
             self.playback.player.clone(),
             self.business.task_engine.clone(),
-            self.lifecycle.running.clone(),
+            self.shared.running.clone(),
             Duration::from_millis(
                 *self
-                    .lifecycle
+                    .shared
                     .live_configs
                     .monitor_status_ms
                     .read()

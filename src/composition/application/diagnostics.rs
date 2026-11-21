@@ -1,8 +1,12 @@
 use super::*;
 
-impl ApplicationRuntime {
-    pub(super) fn execute_web_tool_request(&mut self, request: WebToolRequest) -> Result<String> {
-        let live_config = self.lifecycle.live_configs.snapshot();
+impl AppServices {
+    /// 执行一次网页面板发起的工具调用。
+    ///
+    /// 只有 [`&AppServices`](AppServices)：所需句柄要么在共享服务里，要么由
+    /// `UiServices::ui_handle` 提供，没有任何需要「反向重建运行时」的部分。
+    pub(super) fn execute_web_tool_request(&self, request: WebToolRequest) -> Result<String> {
+        let live_config = self.shared.live_configs.snapshot();
         match request {
             WebToolRequest::Ocr { rect } => {
                 let frame = self.latest_frame()?;
@@ -23,7 +27,7 @@ impl ApplicationRuntime {
                 let prepared = prepare_chat_scan(
                     &frame,
                     &self.ui.chat_templates,
-                    self.lifecycle.config.screen.chat_rect.into(),
+                    self.shared.config.screen.chat_rect.into(),
                 )?;
                 serde_json::to_string_pretty(&recognize_prepared_chat(
                     &self.ui.ocr,
@@ -35,21 +39,22 @@ impl ApplicationRuntime {
                 .map_err(|error| anyhow!(error))
             }
             WebToolRequest::UiState => {
+                // 先主动截一帧：截图例程会给 `latest_ui_state` 写入新的分类结果，
+                // 面板因此看到的是「此刻」的界面状态，而不是上一次扫描留下的旧值。
                 self.ui.game_ui.capture()?;
                 self.ui
-                    .ui_runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.handle().latest_ui_state())
+                    .ui_handle
+                    .latest_ui_state()
                     .map(|state| state.diagnostic())
                     .ok_or_else(|| anyhow!("UI runtime 尚未产生模板状态观察"))
             }
             WebToolRequest::HallName => {
                 let frame = self.latest_frame()?;
                 let image =
-                    crop_canvas(&frame, self.lifecycle.config.screen.hall_name_rect.into())?;
+                    crop_canvas(&frame, self.shared.config.screen.hall_name_rect.into())?;
                 Ok(self.ui.ocr.merged_text(
                     image,
-                    self.lifecycle.config.ocr.same_line_y_tolerance,
+                    self.shared.config.ocr.same_line_y_tolerance,
                     OcrPriority::Diagnostic,
                 )?)
             }
@@ -61,65 +66,65 @@ impl ApplicationRuntime {
             } => {
                 let frame = self.latest_frame()?;
                 let default_threshold = match &template {
-                    WebToolTemplate::WorldWish => self.lifecycle.config.templates.marker_threshold,
-                    WebToolTemplate::PaimonMenu => self.lifecycle.config.startup.template_threshold,
+                    WebToolTemplate::WorldWish => self.shared.config.templates.marker_threshold,
+                    WebToolTemplate::PaimonMenu => self.shared.config.startup.template_threshold,
                     WebToolTemplate::WonderlandMapStar => {
-                        self.lifecycle.config.startup.template_threshold
+                        self.shared.config.startup.template_threshold
                     }
                     WebToolTemplate::Custom(_) => live_config.custom_workflows.default_threshold,
-                    _ => self.lifecycle.config.templates.marker_threshold,
+                    _ => self.shared.config.templates.marker_threshold,
                 };
                 let path = match &template {
                     WebToolTemplate::BlueMarker => {
-                        self.lifecycle.config.templates.blue_marker.clone()
+                        self.shared.config.templates.blue_marker.clone()
                     }
                     WebToolTemplate::YellowMarker => {
-                        self.lifecycle.config.templates.yellow_marker.clone()
+                        self.shared.config.templates.yellow_marker.clone()
                     }
                     WebToolTemplate::PinkMarker => {
-                        self.lifecycle.config.templates.pink_marker.clone()
+                        self.shared.config.templates.pink_marker.clone()
                     }
                     WebToolTemplate::SecondaryBack => {
-                        self.lifecycle.config.templates.secondary_back.clone()
+                        self.shared.config.templates.secondary_back.clone()
                     }
                     WebToolTemplate::SecondaryHall => {
-                        self.lifecycle.config.templates.secondary_hall.clone()
+                        self.shared.config.templates.secondary_hall.clone()
                     }
                     WebToolTemplate::WorldWish => {
-                        self.lifecycle.config.templates.world_wish.clone()
+                        self.shared.config.templates.world_wish.clone()
                     }
                     WebToolTemplate::InviteViewStar => {
-                        self.lifecycle.config.templates.invite_view_star.clone()
+                        self.shared.config.templates.invite_view_star.clone()
                     }
                     WebToolTemplate::InviteGotoHall => {
-                        self.lifecycle.config.templates.invite_goto_hall.clone()
+                        self.shared.config.templates.invite_goto_hall.clone()
                     }
                     WebToolTemplate::InviteEnterHall => {
-                        self.lifecycle.config.templates.invite_enter_hall.clone()
+                        self.shared.config.templates.invite_enter_hall.clone()
                     }
                     WebToolTemplate::FriendPanel => {
-                        self.lifecycle.config.templates.friend_panel.clone()
+                        self.shared.config.templates.friend_panel.clone()
                     }
                     WebToolTemplate::FriendSearchPanel => {
-                        self.lifecycle.config.templates.friend_search_panel.clone()
+                        self.shared.config.templates.friend_search_panel.clone()
                     }
                     WebToolTemplate::FriendMoreSettings => {
-                        self.lifecycle.config.templates.friend_more_settings.clone()
+                        self.shared.config.templates.friend_more_settings.clone()
                     }
                     WebToolTemplate::FriendBlockChat => {
-                        self.lifecycle.config.templates.friend_block_chat.clone()
+                        self.shared.config.templates.friend_block_chat.clone()
                     }
                     WebToolTemplate::FriendBlacklist => {
-                        self.lifecycle.config.templates.friend_blacklist.clone()
+                        self.shared.config.templates.friend_blacklist.clone()
                     }
                     WebToolTemplate::ConfirmButton => {
-                        self.lifecycle.config.templates.confirm_button.clone()
+                        self.shared.config.templates.confirm_button.clone()
                     }
                     WebToolTemplate::PaimonMenu => {
-                        self.lifecycle.config.startup.templates.paimon_menu.clone()
+                        self.shared.config.startup.templates.paimon_menu.clone()
                     }
                     WebToolTemplate::WonderlandMapStar => self
-                        .lifecycle
+                        .shared
                         .config
                         .startup
                         .templates
@@ -140,7 +145,7 @@ impl ApplicationRuntime {
                     let point = hit.center();
                     self.ui
                         .game_ui
-                        .ensure_ready(self.lifecycle.config.timing.input.after_activate_ms)?;
+                        .ensure_ready(self.shared.config.timing.input.after_activate_ms)?;
                     self.ui
                         .game_ui
                         .click_point(PointConfig::new(point.x, point.y))?;
@@ -159,8 +164,8 @@ impl ApplicationRuntime {
                 }
             }
             WebToolRequest::Click { x, y } => {
-                let width = self.lifecycle.config.screen.expected_width as i32;
-                let height = self.lifecycle.config.screen.expected_height as i32;
+                let width = self.shared.config.screen.expected_width as i32;
+                let height = self.shared.config.screen.expected_height as i32;
                 if !(0..width).contains(&x) || !(0..height).contains(&y) {
                     return Err(anyhow!(
                         "坐标超出画布范围: x=0..{} y=0..{}",
@@ -171,7 +176,7 @@ impl ApplicationRuntime {
                 self.ensure_web_tool_input_still_idle()?;
                 self.ui
                     .game_ui
-                    .ensure_ready(self.lifecycle.config.timing.input.after_activate_ms)?;
+                    .ensure_ready(self.shared.config.timing.input.after_activate_ms)?;
                 self.ui.game_ui.click_point(PointConfig::new(x, y))?;
                 Ok(format!("已点击坐标: {x},{y}"))
             }
@@ -180,7 +185,7 @@ impl ApplicationRuntime {
                 self.ensure_web_tool_input_still_idle()?;
                 self.ui
                     .game_ui
-                    .ensure_ready(self.lifecycle.config.timing.input.after_activate_ms)?;
+                    .ensure_ready(self.shared.config.timing.input.after_activate_ms)?;
                 self.ui.game_ui.press_key(key)?;
                 Ok("按键已发送".to_string())
             }
@@ -268,7 +273,7 @@ impl ApplicationRuntime {
     fn sample_web_tool_chat_changes(&self, samples: u32, interval_ms: u64) -> Result<String> {
         let baseline = self.latest_frame()?;
         let mut previous =
-            rect_chat_change_fingerprint(&baseline, self.lifecycle.config.screen.chat_rect.into())?;
+            rect_chat_change_fingerprint(&baseline, self.shared.config.screen.chat_rect.into())?;
         let mut lines = vec![format!(
             "采样次数={} 间隔={}ms，区域为一级聊天区",
             samples, interval_ms
@@ -279,16 +284,16 @@ impl ApplicationRuntime {
             let frame = self.latest_frame()?;
             let current = rect_chat_change_fingerprint(
                 &frame,
-                self.lifecycle.config.screen.chat_rect.into(),
+                self.shared.config.screen.chat_rect.into(),
             )?;
             let stats = change_stats(&previous, &current);
-            let changed = stats.mean_abs_diff >= self.lifecycle.config.ocr.change_mean_threshold
-                || stats.changed_ratio >= self.lifecycle.config.ocr.change_pixel_threshold;
+            let changed = stats.mean_abs_diff >= self.shared.config.ocr.change_mean_threshold
+                || stats.changed_ratio >= self.shared.config.ocr.change_pixel_threshold;
             let markers = if changed {
                 let (blue, yellow, pink) = count_chat_markers(
                     &frame,
                     &self.ui.chat_templates,
-                    self.lifecycle.config.screen.chat_rect,
+                    self.shared.config.screen.chat_rect,
                 )?;
                 format!(" 蓝={} 黄={} 粉={}", blue, yellow, pink)
             } else {
@@ -311,11 +316,11 @@ impl ApplicationRuntime {
         self.ensure_web_tool_input_still_idle()?;
         self.ui
             .game_ui
-            .ensure_ready(self.lifecycle.config.timing.input.after_activate_ms)?;
+            .ensure_ready(self.shared.config.timing.input.after_activate_ms)?;
         let mut open_times = Vec::new();
         let mut close_times = Vec::new();
         let mut failures = 0u32;
-        let detect_rect = web_tool_panel_response_rect(&self.lifecycle.config);
+        let detect_rect = web_tool_panel_response_rect(&self.shared.config);
 
         for _ in 0..rounds {
             self.ensure_web_tool_input_still_idle()?;
@@ -402,11 +407,11 @@ impl ApplicationRuntime {
             let from_baseline = change_stats(baseline, &current);
             let from_previous = change_stats(&previous, &current);
             let changed = from_baseline.mean_abs_diff
-                >= self.lifecycle.config.ocr.change_mean_threshold
-                || from_baseline.changed_ratio >= self.lifecycle.config.ocr.change_pixel_threshold;
+                >= self.shared.config.ocr.change_mean_threshold
+                || from_baseline.changed_ratio >= self.shared.config.ocr.change_pixel_threshold;
             let stable = from_previous.mean_abs_diff
-                < self.lifecycle.config.ocr.change_mean_threshold
-                && from_previous.changed_ratio < self.lifecycle.config.ocr.change_pixel_threshold;
+                < self.shared.config.ocr.change_mean_threshold
+                && from_previous.changed_ratio < self.shared.config.ocr.change_pixel_threshold;
 
             if changed && stable {
                 stable_count += 1;

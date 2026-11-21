@@ -2,7 +2,15 @@
 """面板 API 覆盖率：解析 Rust 路由表 vs web/src 实际调用。
 
 用法：python3 scripts/panel-api-coverage.py [--json]
-退出码：0；仅用于报告。"""
+退出码：0；仅用于报告。
+
+口径（2026-11-21 校订）：
+  - 前端已 Vue 3 + Vite 化，入口是 `web/src/pages/ToolsPage.vue` 等 SPA 页面；
+    旧的单文件 `page.html` 与 `/legacy` 回退页已删除，不再有 iframe 内嵌的 `tools.html`。
+  - 「高级控制」页（hash 路由 `#tools`）直接 fetch `/tools/*`，因此这些路由由静态扫描
+    `web/src` 自然覆盖，不需要 `covered_by_tools` 这类整页放行分支。
+  - 仅 `/assets` 是协议特判的静态入口（编译期嵌入 web/dist），不在路由表里。
+"""
 import json
 import re
 import sys
@@ -32,17 +40,12 @@ def frontend_calls() -> set[str]:
 def main() -> int:
     routes = rust_routes()
     used = frontend_calls()
-    # 独立工具页（/tools）内的工具接口由 tools.html 调用；Vue 侧通过 iframe 进入。
-    tools_page_loaded = "/tools" in used
-    covered_by_tools = tools_page_loaded
 
     def covered(route: str) -> bool:
         if route in used:
             return True
-        if covered_by_tools and route.startswith("/tools/"):
-            return True
-        # 协议特判的二进制/静态入口，不在路由表匹配范围内。
-        return route in {"/assets", "/legacy"}
+        # 协议特判的嵌入静态入口（web/dist），不在路由表匹配范围内。
+        return route in {"/assets"}
 
     missing = [route for route in routes if not covered(route)]
     report = {

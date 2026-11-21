@@ -3,8 +3,10 @@
 
 用法：
   MILIASTRA_PANEL_TOKEN=xxx python3 scripts/panel-layout-audit.py --out /tmp/layout-audit [--routes a,b]
-前置：web/dist 已构建；本地静态服务注入 token 与远端 base。
+前置：web/dist 已构建（缺 <dist>/index.html 时打印中文提示并以退出码 2 结束，不抛栈）；
+      本地静态服务注入 token 与远端 base。
 输出：report.json + 每路由截图 + 控制台汇总。
+退出码：0 = 正常跑完；2 = 缺前端产物或参数错误。
 """
 import argparse
 import http.server
@@ -153,6 +155,29 @@ def run_chromium(url, screenshot, width, timeout=60):
         return ""
 
 
+def require_dist(dist):
+    """确认前端产物存在；缺失时给出中文提示并返回错误文案。
+
+    面板已改成 Vue + Vite（`web/`），`build.rs` 只嵌入 `web/dist`；没有产物时
+    面板根本不存在，继续跑只会抛 FileNotFoundError 栈。这里提前挡住。
+    """
+    index = dist / "index.html"
+    if index.is_file():
+        return None
+    if not dist.exists():
+        reason = f"前端产物目录不存在：{dist}"
+    elif not dist.is_dir():
+        reason = f"前端产物路径不是目录：{dist}"
+    else:
+        reason = f"前端产物不完整：缺少 {index}"
+    return (
+        f"{reason}\n"
+        "面板布局审计需要已构建的前端：请先在 web/ 下构建，再重跑本脚本。\n"
+        "  cd web && npm install && npm run build\n"
+        "（构建后 web/dist/index.html 应存在；也可用 --dist 指向其他已构建目录。）"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://192.168.31.119:18888")
@@ -165,6 +190,10 @@ def main():
     args = parser.parse_args()
 
     dist = Path(args.dist).resolve()
+    missing = require_dist(dist)
+    if missing:
+        print(missing, file=sys.stderr)
+        return 2
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     index = (dist / "index.html").read_text(encoding="utf-8")

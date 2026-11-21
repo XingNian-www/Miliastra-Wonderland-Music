@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
-use super::{ApplicationRuntime, FormalTaskExecutionContext, PendingTask, PendingTaskExecution};
+use super::{AppServices, FormalTaskExecutionContext, PendingTask, PendingTaskExecution};
 use crate::config::LiveConfigs;
 use crate::features::command::RoutedCommand;
 use crate::features::hall::HallRuntimeState;
@@ -66,7 +66,7 @@ impl FormalTaskExecutionHandle {
             )));
         };
         if cancellation.is_requested() {
-            task.cancel(&context.business.business);
+            task.cancel(&context.services.business.business);
             return FormalTaskExecutionOutcome::Canceled(
                 "任务在开始执行前收到取消请求".to_string(),
             );
@@ -233,19 +233,14 @@ impl FormalTaskClient {
     }
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     pub(super) fn push_pending_task_with_command_source(
         &self,
         task: PendingTask,
         source: &RoutedCommand,
     ) -> Result<()> {
-        let tasks = self
-            .business
-            .formal_tasks
-            .as_ref()
-            .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?;
         // Queued alone emits evidence inside FormalTaskClient; Duplicate stays silent.
-        tasks.enqueue_with_command_source(task, source)?;
+        self.formal_tasks()?.enqueue_with_command_source(task, source)?;
         Ok(())
     }
 }
@@ -374,7 +369,7 @@ impl FormalTaskRuntime {
         };
         let client = FormalTaskClient::new(handle, business.clone(), task_engine.clone());
         let execution_context = build_context(client.clone());
-        let coordinator = execution_context.coordinator.clone();
+        let coordinator = execution_context.services.ui.coordinator.clone();
         *context
             .context
             .lock()

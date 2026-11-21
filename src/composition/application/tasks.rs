@@ -200,9 +200,9 @@ fn apply_hall_expiry_pause(
     Ok(())
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     pub(super) fn reload_aware_wait(&self, requested: Duration) -> Duration {
-        reload_poll_wait(requested, self.lifecycle.live_configs.has_pending_reload())
+        reload_poll_wait(requested, self.shared.live_configs.has_pending_reload())
     }
 
     pub(super) fn record_command_activity(&self, observed_at: Instant) -> Result<()> {
@@ -335,7 +335,7 @@ impl ApplicationRuntime {
         self.update_monitor_playback_controller();
         // 主动关游戏：抑制「失联后重启游戏」判定，否则回落阈值一到就会把
         // 刚被闲置退出关掉的游戏重新拉起来，闲置退出等于没做。
-        self.lifecycle
+        self.shared
             .external_chat
             .suppress_restart_after_intentional_close();
         match self.ui.game_ui.close_window() {
@@ -347,150 +347,151 @@ impl ApplicationRuntime {
         Ok(())
     }
 
-    pub(super) fn maybe_reload_config_when_idle(&mut self) {
-        if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
-            return;
+    /// 空闲时执行待处理的配置重载。
+    ///
+    /// 返回本轮是否已经把 `running` 置为 false（即重载已提交、主循环应当退出）。
+    /// `reload_check_after` 是重载检查自身的节流时钟，属于**这次调用方的循环状态**，
+    /// 因此由调用方持有并传进来，共享服务里不存任何「某项检查的进度」。
+    pub(super) fn maybe_reload_config_when_idle(&self, reload_check_after: &mut Instant) -> bool {
+        if !self.shared.running.load(AtomicOrdering::SeqCst) {
+            return false;
         }
-        if self.lifecycle.paused.load(AtomicOrdering::SeqCst)
-            || !self.lifecycle.live_configs.has_pending_reload()
+        if self.shared.paused.load(AtomicOrdering::SeqCst)
+            || !self.shared.live_configs.has_pending_reload()
         {
-            self.lifecycle
-                .http_reload_draining
+            self.shared
+                .http_reload.draining()
                 .store(false, AtomicOrdering::SeqCst);
-            return;
+            return false;
         }
         let now = Instant::now();
-        if now < self.lifecycle.reload_check_after {
-            return;
+        if now < *reload_check_after {
+            return false;
         }
-        self.lifecycle.reload_check_after = now + CONFIG_RELOAD_IDLE_CHECK_INTERVAL;
-        let preliminary_requires_playback_idle = self
-            .lifecycle
-            .live_configs
+        *reload_check_after = now + CONFIG_RELOAD_IDLE_CHECK_INTERVAL;
+        let preliminary_requires_playback_idle = self.shared.live_configs
             .pending_reload_requires_playback_idle();
         let preliminary_idle = match self.reload_idle_state() {
             Ok(idle) => idle,
             Err(error) => {
-                self.lifecycle
-                    .http_reload_draining
+                self.shared
+                    .http_reload.draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("读取闲置重载状态失败，本轮保持运行：{error:#}");
-                return;
+                return false;
             }
         };
         if preliminary_idle.drain_readiness(preliminary_requires_playback_idle)
             == ReloadDrainReadiness::Unsafe
         {
-            self.lifecycle
-                .http_reload_draining
+            self.shared
+                .http_reload.draining()
                 .store(false, AtomicOrdering::SeqCst);
-            return;
+            return false;
         }
         // 先关闭新的 HTTP 写操作准入，再复查现有请求，避免在读取到 0 后又有
         // 登录、保存或播放器操作进入并被关停打断。
-        self.lifecycle
-            .http_reload_draining
+        self.shared
+            .http_reload.draining()
             .store(true, AtomicOrdering::SeqCst);
         let idle = match self.reload_idle_state() {
             Ok(idle) => idle,
             Err(error) => {
-                self.lifecycle
-                    .http_reload_draining
+                self.shared
+                    .http_reload.draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("进入 HTTP 排空后复查重载状态失败，本轮保持运行：{error:#}");
-                return;
+                return false;
             }
         };
         match idle.drain_readiness(preliminary_requires_playback_idle) {
             ReloadDrainReadiness::Unsafe => {
-                self.lifecycle
-                    .http_reload_draining
+                self.shared
+                    .http_reload.draining()
                     .store(false, AtomicOrdering::SeqCst);
-                return;
+                return false;
             }
-            ReloadDrainReadiness::WaitingForHttp => return,
+            ReloadDrainReadiness::WaitingForHttp => return false,
             ReloadDrainReadiness::Ready => {}
         }
 
         // blocker 归零后，所有已获准的保存请求都已完成；此时重新读取累计字段的
         // 最严格屏障，避免并发保存把普通重载升级为播放器重载后仍沿用旧判断。
-        let requires_playback_idle = self
-            .lifecycle
-            .live_configs
+        let requires_playback_idle = self.shared.live_configs
             .pending_reload_requires_playback_idle();
         let mut idle = match self.reload_idle_state() {
             Ok(idle) => idle,
             Err(error) => {
-                self.lifecycle
-                    .http_reload_draining
+                self.shared
+                    .http_reload.draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("HTTP 排空后复查重载状态失败，本轮保持运行：{error:#}");
-                return;
+                return false;
             }
         };
         match idle.drain_readiness(requires_playback_idle) {
             ReloadDrainReadiness::Unsafe => {
-                self.lifecycle
-                    .http_reload_draining
+                self.shared
+                    .http_reload.draining()
                     .store(false, AtomicOrdering::SeqCst);
-                return;
+                return false;
             }
-            ReloadDrainReadiness::WaitingForHttp => return,
+            ReloadDrainReadiness::WaitingForHttp => return false,
             ReloadDrainReadiness::Ready => {}
         }
         let refreshed_status = match self.refresh_playback_state_for_reload() {
             Ok(status) => status,
             Err(error) => {
-                self.lifecycle
-                    .http_reload_draining
+                self.shared
+                    .http_reload.draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("配置重载前刷新播放器状态失败，本轮保持运行：{error:#}");
-                return;
+                return false;
             }
         };
         idle = match self.reload_idle_state_with_status(Some(&refreshed_status)) {
             Ok(idle) => idle,
             Err(error) => {
-                self.lifecycle
-                    .http_reload_draining
+                self.shared
+                    .http_reload.draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("刷新播放器状态后复查重载条件失败，本轮保持运行：{error:#}");
-                return;
+                return false;
             }
         };
         if !idle.is_idle(requires_playback_idle) {
-            self.lifecycle
-                .http_reload_draining
+            self.shared
+                .http_reload.draining()
                 .store(false, AtomicOrdering::SeqCst);
-            return;
+            return false;
         }
         // 在封存任务引擎前预留重载结果。用户退出记录的优先级更高，因此可以在此声明前后覆盖它。
-        if !self.lifecycle.shutdown.try_claim_config_reload() {
-            self.lifecycle
-                .http_reload_draining
+        if !self.shared.shutdown.try_claim_config_reload() {
+            self.shared
+                .http_reload.draining()
                 .store(false, AtomicOrdering::SeqCst);
-            return;
+            return false;
         }
         // 空闲检查与停止接单必须在任务引擎的同一把锁内完成，避免新任务落入两者之间。
         match self.business.task_engine.begin_shutdown_if_idle() {
             Ok(true) => {}
             Ok(false) => {
-                self.lifecycle.shutdown.release_config_reload_claim();
-                self.lifecycle
-                    .http_reload_draining
+                self.shared.shutdown.release_config_reload_claim();
+                self.shared
+                    .http_reload.draining()
                     .store(false, AtomicOrdering::SeqCst);
-                return;
+                return false;
             }
             Err(error) => {
-                self.lifecycle.shutdown.release_config_reload_claim();
-                self.lifecycle
-                    .http_reload_draining
+                self.shared.shutdown.release_config_reload_claim();
+                self.shared
+                    .http_reload.draining()
                     .store(false, AtomicOrdering::SeqCst);
                 log::warn!("重载关停前原子锁定任务引擎失败，本轮保持运行：{error}");
-                return;
+                return false;
             }
         }
-        let fields = match self.lifecycle.live_configs.begin_reload() {
+        let fields = match self.shared.live_configs.begin_reload() {
             Some(fields) => fields,
             None => {
                 // 任务引擎已经不可逆地停止接单；即使内部待重载标记出现异常，
@@ -500,13 +501,14 @@ impl ApplicationRuntime {
             }
         };
         if reload_fields_require_startup(&fields) {
-            self.lifecycle.shutdown.require_startup_after_reload();
+            self.shared.shutdown.require_startup_after_reload();
         }
         log::info!(
             "运行环境已闲置，开始配置重载关停（需要重载的配置项：{}）",
             fields.into_iter().collect::<Vec<_>>().join("、")
         );
-        self.lifecycle.running.store(false, AtomicOrdering::SeqCst);
+        self.shared.running.store(false, AtomicOrdering::SeqCst);
+        true
     }
 
     fn reload_idle_state(&self) -> Result<ReloadIdleState> {
@@ -533,8 +535,8 @@ impl ApplicationRuntime {
             .all(thread::JoinHandle::is_finished);
         let login_helper_idle = !self.playback.login_helper.status().active;
         let http_operations_idle = self
-            .lifecycle
-            .http_reload_blockers
+            .shared
+            .http_reload.blockers()
             .load(AtomicOrdering::SeqCst)
             == 0;
         Ok(ReloadIdleState {
@@ -573,10 +575,12 @@ impl ApplicationRuntime {
             .map_err(anyhow::Error::from)
     }
 
-    pub(super) fn execute_pending_task(
-        &mut self,
-        task: PendingTask,
-    ) -> Result<PendingTaskExecution> {
+    /// 在一个正式任务工作线程上执行一条待处理任务。
+    ///
+    /// 只用 `&self`：任务的全部副作用都落在共享句柄（业务运行时、UI 例程、
+    /// 播放器、配置快照）上，执行方不需要拥有任何运行时，
+    /// 也不需要一份「重建出来的应用壳」。
+    pub(super) fn execute_pending_task(&self, task: PendingTask) -> Result<PendingTaskExecution> {
         let label = task.label();
         let result = match task {
             PendingTask::Command(pending) => self
@@ -590,9 +594,10 @@ impl ApplicationRuntime {
                 .map(|_| PendingTaskExecution::Completed),
             PendingTask::Startup(task) => {
                 let kind = task.kind();
-                let result = self.business.startup.execute(task, self);
+                let mut port = self.port();
+                let result = self.business.startup.execute(task, &mut port);
                 if result.is_ok() {
-                    self.lifecycle.reload_startup.record_success(kind);
+                    self.shared.reload_startup.record_success(kind);
                 }
                 result.map(|_| PendingTaskExecution::Completed)
             }
@@ -615,12 +620,18 @@ impl ApplicationRuntime {
             } => self
                 .execute_turtle_soup_question(*question, observed_at)
                 .map(|_| PendingTaskExecution::Completed),
-            PendingTask::CardGameEffect(effect) => effect
-                .execute(self)
-                .map(|_| PendingTaskExecution::Completed),
-            PendingTask::UndercoverEffect(effect) => effect
-                .execute(self)
-                .map(|_| PendingTaskExecution::Completed),
+            PendingTask::CardGameEffect(effect) => {
+                let mut port = self.port();
+                effect
+                    .execute(&mut port)
+                    .map(|_| PendingTaskExecution::Completed)
+            }
+            PendingTask::UndercoverEffect(effect) => {
+                let mut port = self.port();
+                effect
+                    .execute(&mut port)
+                    .map(|_| PendingTaskExecution::Completed)
+            }
         };
         match result {
             Ok(PendingTaskExecution::Completed) => {
@@ -634,7 +645,7 @@ impl ApplicationRuntime {
         }
     }
 
-    pub(super) fn execute_pending_command(&mut self, pending: PendingCommand) -> Result<()> {
+    pub(super) fn execute_pending_command(&self, pending: PendingCommand) -> Result<()> {
         let command_log = private_safe_command_log(&pending.routed);
         log::debug!(
             "开始执行待处理命令：{}（命令锁：{}）",
@@ -647,7 +658,7 @@ impl ApplicationRuntime {
         );
         let _console_reply_context = if pending.routed.message_type == "控制台" {
             Some(ConsoleReplyContextGuard::new(Arc::clone(
-                &self.lifecycle.console_reply_context,
+                &self.shared.console_reply_context,
             )))
         } else {
             None
@@ -697,9 +708,9 @@ impl ApplicationRuntime {
         user_command: &str,
         final_command: &str,
     ) -> Result<()> {
-        let live_config = self.lifecycle.live_configs.snapshot();
+        let live_config = self.shared.live_configs.snapshot();
         write_executed_command_fields(
-            &self.lifecycle.monitor,
+            &self.shared.monitor,
             &live_config.state.executed_commands_log_path,
             message_type,
             username,
@@ -722,12 +733,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn push_pending_task(&self, task: PendingTask) -> Result<()> {
-        let tasks = self
-            .business
-            .formal_tasks
-            .clone()
-            .ok_or_else(|| anyhow!("正式任务执行运行时尚未启动"))?;
-        match tasks.enqueue(task)? {
+        match self.formal_tasks()?.enqueue(task)? {
             FormalTaskEnqueueOutcome::Queued(_) => Ok(()),
             FormalTaskEnqueueOutcome::Duplicate => {
                 log::debug!("正式任务已在待执行范围内，跳过重复入队");
@@ -738,15 +744,15 @@ impl ApplicationRuntime {
 
     pub(super) fn enqueue_startup_task_if_enabled(&self) -> Result<()> {
         self.enqueue_startup_actions(ReloadStartupActions::from_startup_config(
-            &self.lifecycle.config,
+            &self.shared.config,
         ))
     }
 
     pub(super) fn require_reload_startup_automation(&self) -> Result<bool> {
         let actions = self
-            .lifecycle
+            .shared
             .reload_startup
-            .require_from_config(&self.lifecycle.config);
+            .require_from_config(&self.shared.config);
         if actions.is_empty() {
             return Ok(false);
         }
@@ -755,7 +761,7 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn enqueue_reload_startup_tasks_if_needed(&self) -> Result<bool> {
-        let missing = self.lifecycle.reload_startup.missing_actions();
+        let missing = self.shared.reload_startup.missing_actions();
         if missing.is_empty() {
             return Ok(false);
         }

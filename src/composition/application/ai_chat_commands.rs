@@ -151,7 +151,7 @@ fn build_look_vision_prompt(
     rendered
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     /// 当前视觉请求使用的模型名：优先 `ai_chat.vision.model`，否则沿用聊天模型。
     fn ai_chat_vision_model(&self, config: &crate::features::ai_chat::AiChatConfig) -> String {
         let configured = config.vision.model.trim();
@@ -192,7 +192,7 @@ impl ApplicationRuntime {
 
     /// 只随图片附件发送的备注↔昵称对照；无有效对照返回 None。
     fn ai_name_context(&self) -> Option<String> {
-        let pairs = self.lifecycle.live_configs.identity.ai_name_pairs();
+        let pairs = self.shared.live_configs.identity.ai_name_pairs();
         crate::features::ai_chat::format_ai_name_pairs(&pairs)
     }
 
@@ -426,7 +426,7 @@ impl ApplicationRuntime {
     /// AI 聊天：关键词触发已在上游转成 `AiChatCommand::Ask`；
     /// `Forget` 来自 @忘记我。AI 产出的命令按**提问者本人权限**复核后执行。
     pub(super) fn execute_ai_chat_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &crate::features::ai_chat::AiChatCommand,
     ) -> Result<()> {
@@ -451,7 +451,7 @@ impl ApplicationRuntime {
                     &crate::features::reply_template::ReplyVars::new(),
                 );
                 let _ = removed;
-                return ApplicationRuntime::reply(self, &text);
+                return AppServices::reply(self, &text);
             }
             ai_chat::AiChatCommand::Ask { question } => {
                 let question = question.trim();
@@ -464,12 +464,12 @@ impl ApplicationRuntime {
                         crate::features::reply_template::AI_CHAT_TOO_LONG.default,
                         &crate::features::reply_template::ReplyVars::new(),
                     );
-                    return ApplicationRuntime::reply(self, &text);
+                    return AppServices::reply(self, &text);
                 }
                 if !self.business.ai.enabled() {
                     return Ok(());
                 }
-                let config = self.lifecycle.live_configs.snapshot().ai_chat.clone();
+                let config = self.shared.live_configs.snapshot().ai_chat.clone();
                 if !config.enabled {
                     return Ok(());
                 }
@@ -513,7 +513,7 @@ impl ApplicationRuntime {
                         .map(|elapsed| elapsed.as_secs())
                         .unwrap_or(0),
                 });
-                let tts_config = self.lifecycle.live_configs.snapshot().tts.clone();
+                let tts_config = self.shared.live_configs.snapshot().tts.clone();
                 // **tools 数组与 system prompt 必须同源，且只由配置决定**：
                 // 两者都是 provider 前缀缓存的一部分。以前 tools 还看
                 // 「这位玩家有没有可用命令」「TTS 播放器健康度」「模型图片能力」
@@ -560,7 +560,7 @@ impl ApplicationRuntime {
                     );
                     // 表情能力只通过 system prompt 告知；没有白名单就不提，
                     // 避免模型编造不存在的标签。
-                    let emoji = self.lifecycle.live_configs.snapshot().emoji.clone();
+                    let emoji = self.shared.live_configs.snapshot().emoji.clone();
                     if emoji.ai_enabled {
                         let catalog = crate::features::emoji::ai_prompt_catalog(&emoji.ai_allowed);
                         prompt.push_str("\n\n");
@@ -829,17 +829,17 @@ impl ApplicationRuntime {
                             crate::features::reply_template::AI_CHAT_UNAVAILABLE.default,
                             &crate::features::reply_template::ReplyVars::new(),
                         );
-                        return ApplicationRuntime::reply(self, &text);
+                        return AppServices::reply(self, &text);
                     }
                 };
                 // 末端防泄露：只删除完整 remark 字符串，display_name/real_nickname 不动。
-                let known_remarks = self.lifecycle.live_configs.identity.remark_texts();
+                let known_remarks = self.shared.live_configs.identity.remark_texts();
                 let filtered_rendered = crate::features::identity::redact_remark_strings(
                     &answer.rendered,
                     &known_remarks,
                 );
                 // AI 表情白名单：关闭时剥离全部标签，开启时只保留白名单内标签。
-                let emoji_config = self.lifecycle.live_configs.snapshot().emoji.clone();
+                let emoji_config = self.shared.live_configs.snapshot().emoji.clone();
                 let (rendered_filtered, stripped_emoji) =
                     crate::features::emoji::filter_ai_text(&filtered_rendered, &emoji_config);
                 if stripped_emoji > 0 {
@@ -936,11 +936,11 @@ impl ApplicationRuntime {
     fn ai_chat_allowed_commands(&self, parsed: &RoutedCommand) -> Vec<String> {
         let catalog = crate::features::command_catalog::all_specs();
         let mut names = Vec::new();
-        let snapshot = self.lifecycle.live_configs.snapshot();
+        let snapshot = self.shared.live_configs.snapshot();
         // 与路由期同一判定：有账号按 UID，否则按昵称；
         // 身份命中**覆盖**，未命中退回来源下界。
         let actor = crate::features::command_access::actor_permission_with_floor(
-            self.lifecycle
+            self.shared
                 .live_configs
                 .identity
                 .role_of_sender(&parsed.username, parsed.account.as_ref()),
@@ -1074,7 +1074,7 @@ impl ApplicationRuntime {
     /// BOT 的回答，而 BOT 的回答又会被下一轮抽取当上下文——形成自我强化闭环，
     /// 只靠后续对话很难自行洗掉。历史原文都在库里，直接重跑最干净。
     ///
-    /// 做成不依赖 `self` 的关联函数：HTTP 面板要用它，而面板拿不到 `&mut self`。
+    /// 做成不依赖 `self` 的关联函数：HTTP 面板要用它，而面板拿不到 `&self`。
     /// 所需句柄都可克隆，由调用方捕获进闭包。
     pub(crate) fn rebuild_facts_with(
         memory: &crate::features::ai_chat::AiChatMemory,
@@ -1147,10 +1147,10 @@ impl ApplicationRuntime {
     /// 优先用配置的 `chat_source.self_uid` 反查（玩家给 BOT 的备注名最自然），
     /// 查不到才退回固定称呼。避免写成 UID —— 那对模型毫无意义。
     fn bot_display_name(&self) -> String {
-        let self_uid = self.lifecycle.config.chat_source.self_uid;
+        let self_uid = self.shared.config.chat_source.self_uid;
         if self_uid != 0 {
             let uid = self_uid.to_string();
-            let names = self.lifecycle.live_configs.identity.friend_search_names(
+            let names = self.shared.live_configs.identity.friend_search_names(
                 &uid,
                 Some((miliastra_kernel::chat_source::GAME_GENSHIN, uid.as_str())),
             );
@@ -1270,7 +1270,7 @@ impl ApplicationRuntime {
 
     /// 执行 AI 给出的命令：复用正常路由与执行链路，身份仍是提问者本人。
     fn run_ai_chat_command(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &str,
     ) -> Result<serde_json::Value> {
@@ -1278,10 +1278,10 @@ impl ApplicationRuntime {
             return Ok(serde_json::json!({"status":"rejected","reason":"命令无法解析"}));
         };
         let active = self.business.business.active_entertainment()?;
-        let access_config = self.lifecycle.live_configs.snapshot();
+        let access_config = self.shared.live_configs.snapshot();
         let router = crate::interfaces::chat::ChatCommandRouter::with_access(
             &self.business.custom_workflow,
-            &self.lifecycle.live_configs.identity,
+            &self.shared.live_configs.identity,
             &access_config.command_access,
         );
         let Some(routed) = router.route(&request, active) else {

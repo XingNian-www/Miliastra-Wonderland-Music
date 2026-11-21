@@ -356,29 +356,36 @@ fn interruptible_sleep(duration: Duration, mut keep_running: impl FnMut() -> boo
 }
 
 impl ApplicationRuntime {
+    /// 启动正式任务工作线程，并把它的客户端接线回共享服务。
+    ///
+    /// 这一步是**唯一**同时需要「拥有的运行时」和「共享服务」的地方：
+    /// 线程句柄归 [`OwnedRuntimes`] 关停，客户端进入 [`AppServices::formal_tasks`]。
     pub(super) fn start_formal_task_runtime(&mut self) -> Result<()> {
-        if self.business.formal_task_runtime.is_some() {
+        if self.owned.formal_task_runtime.is_some() {
             return Ok(());
         }
+        let services = Arc::clone(&self.services);
         let runtime = FormalTaskRuntime::start(
             self.business.business.clone(),
             self.business.task_engine.clone(),
-            Arc::clone(&self.lifecycle.running),
-            Arc::clone(&self.lifecycle.paused),
-            self.lifecycle.live_configs.clone(),
-            |client| self.formal_task_execution_context(client),
+            Arc::clone(&self.shared.running),
+            Arc::clone(&self.shared.paused),
+            self.shared.live_configs.clone(),
+            move |client| FormalTaskExecutionContext::new(Arc::clone(&services), client),
         )?;
-        self.business.formal_tasks = Some(runtime.client());
-        self.business.formal_task_runtime = Some(runtime);
+        self.services.attach_formal_tasks(runtime.client());
+        self.owned.formal_task_runtime = Some(runtime);
         Ok(())
     }
+}
 
+impl AppServices {
     pub(super) fn start_deferred_chat_sender(&self) -> thread::JoinHandle<()> {
         let sender = DeferredChatSender {
-            config_store: self.lifecycle.config_store.clone(),
-            live_configs: self.lifecycle.live_configs.clone(),
-            running: Arc::clone(&self.lifecycle.running),
-            paused: Arc::clone(&self.lifecycle.paused),
+            config_store: self.shared.config_store.clone(),
+            live_configs: self.shared.live_configs.clone(),
+            running: Arc::clone(&self.shared.running),
+            paused: Arc::clone(&self.shared.paused),
             task_engine: self.business.task_engine.clone(),
             business: self.business.business.clone(),
             chat_output: self.ui.chat_output.clone(),
@@ -397,7 +404,8 @@ impl ApplicationRuntime {
 }
 
 struct DeferredChatSender {
-    config_store: Option<crate::config::SharedConfigStore>,
+    /// 配置中心共享句柄：延迟发送也要读命令面板的覆盖与静音。
+    config_store: crate::config::SharedConfigStore,
     live_configs: LiveConfigs,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -417,23 +425,17 @@ struct DeferredChatSender {
 
 /// 读取命令面板保存的覆盖文案；与立即发送路径共用同一查询语义。
 fn command_reply_override(
-    config_store: Option<&crate::config::SharedConfigStore>,
+    config_store: &crate::config::SharedConfigStore,
     key: &str,
 ) -> Option<String> {
-    let store = config_store?.lock().ok()?;
+    let store = config_store.lock().ok()?;
     let replies = store.reply_templates().ok()?;
     crate::features::reply_template::stored_override(&replies, key)
 }
 
 /// 该 key 是否被命令面板静音；与立即发送路径共用同一判定。
-fn command_reply_is_muted(
-    config_store: Option<&crate::config::SharedConfigStore>,
-    key: &str,
-) -> bool {
-    let Some(store) = config_store else {
-        return false;
-    };
-    let Ok(store) = store.lock() else {
+fn command_reply_is_muted(config_store: &crate::config::SharedConfigStore, key: &str) -> bool {
+    let Ok(store) = config_store.lock() else {
         return false;
     };
     let Ok(replies) = store.reply_templates() else {
@@ -451,11 +453,11 @@ impl DeferredChatSender {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> Option<String> {
-        if command_reply_is_muted(self.config_store.as_ref(), spec.key) {
+        if command_reply_is_muted(&self.config_store, spec.key) {
             return None;
         }
         // 覆盖只来自命令面板保存的行；配置中心不再提供回复文案入口。
-        let override_text = command_reply_override(self.config_store.as_ref(), spec.key);
+        let override_text = command_reply_override(&self.config_store, spec.key);
         let rendered =
             crate::features::reply_template::render(spec, override_text.as_deref(), vars);
         if !rendered.missing.is_empty() {
@@ -847,106 +849,23 @@ impl DeferredChatSender {
     }
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     pub(super) fn start_playback_monitor(&self) -> thread::JoinHandle<()> {
         let monitor = PlaybackMonitorWorker {
             application: self.playback.playback_application.clone(),
             player: self.playback.player.clone(),
             business: self.business.business.clone(),
             task_engine: self.business.task_engine.clone(),
-            formal_tasks: self.business.formal_tasks.clone(),
-            live_configs: self.lifecycle.live_configs.clone(),
-            running: Arc::clone(&self.lifecycle.running),
-            paused: Arc::clone(&self.lifecycle.paused),
-            monitor: self.lifecycle.monitor.clone(),
+            formal_tasks: self.formal_tasks.get().cloned(),
+            live_configs: self.shared.live_configs.clone(),
+            running: Arc::clone(&self.shared.running),
+            paused: Arc::clone(&self.shared.paused),
+            monitor: self.shared.monitor.clone(),
         };
         thread::spawn(move || {
             log::info!("播放监控线程已启动");
             monitor.run();
         })
-    }
-
-    // 正式执行器是唯一可调度全部垂直模块的工作线程。
-    fn formal_task_execution_context(
-        &self,
-        formal_tasks: FormalTaskClient,
-    ) -> FormalTaskExecutionContext {
-        FormalTaskExecutionContext {
-            coordinator: self.ui.coordinator.clone(),
-            ui: FormalTaskUiContext {
-                ocr_args: self.ui.ocr_args.clone(),
-                chat_templates: self.ui.chat_templates.clone(),
-                game_ui: self.ui.game_ui.clone(),
-                residency_ui: self.ui.residency_ui.clone(),
-                hall_ui: self.ui.hall_ui.clone(),
-                moderation_ui: self.ui.moderation_ui.clone(),
-                startup_ui: self.ui.startup_ui.clone(),
-                secondary_unread_ui: self.ui.secondary_unread_ui.clone(),
-                friend_delivery_ui: self.ui.friend_delivery_ui.clone(),
-                invite_ui: self.ui.invite_ui.clone(),
-                custom_action_ui: self.ui.custom_action_ui.clone(),
-                chat_output: self.ui.chat_output.clone(),
-                ocr: self.ui.ocr.clone(),
-                latest_frame: self.ui.latest_frame.clone(),
-                window_detection_signal: self.ui.window_detection_signal.clone(),
-                chat_baseline_primed: self.ui.chat_baseline_primed.clone(),
-                chat_observations: self.ui.chat_observations.clone(),
-                chat_timeline: self.ui.chat_timeline.clone(),
-            },
-            playback: FormalTaskPlaybackContext {
-                player: self.playback.player.clone(),
-                playback_application: self.playback.playback_application.clone(),
-                player_search: self.playback.player_search.clone(),
-                native_playback: self.playback.native_playback.clone(),
-                login_helper: self.playback.login_helper.clone(),
-            },
-            business: FormalTaskBusinessContext {
-                business: self.business.business.clone(),
-                task_engine: self.business.task_engine.clone(),
-                business_events: self.business.business_events.clone(),
-                formal_tasks,
-                background_commands: self.business.background_commands.clone(),
-                ai: self.business.ai.clone(),
-                ai_chat_memory: self.business.ai_chat_memory.clone(),
-                ai_chat_memory_generation: self.business.ai_chat_memory_generation.clone(),
-                ai_chat_maintenance_inflight: self.business.ai_chat_maintenance_inflight.clone(),
-                ai_chat_gate: self.business.ai_chat_gate.clone(),
-                ai_chat_openai: self.business.ai_chat_openai.clone(),
-                ai_connection: self.business.ai_connection.clone(),
-                ai_request_timeout: self.business.ai_request_timeout,
-                tts: self.business.tts.clone(),
-                song_requests: self.business.song_requests.clone(),
-                card_games: self.business.card_games.clone(),
-                administration_application: self.business.administration_application,
-                hall_application: self.business.hall_application,
-                idiom_chain_application: self.business.idiom_chain_application,
-                tarot_application: self.business.tarot_application.clone(),
-                playlist_application: self.business.playlist_application.clone(),
-                turtle_soup_application: self.business.turtle_soup_application,
-                undercover_game: self.business.undercover_game.clone(),
-                moderation: self.business.moderation.clone(),
-                moderation_workers: self.business.moderation_workers.clone(),
-                startup: self.business.startup,
-                custom_workflow: self.business.custom_workflow.clone(),
-            },
-            lifecycle: FormalTaskLifecycleContext {
-                config: self.lifecycle.config.clone(),
-                // 命令执行发生在这个上下文里，决策窗口必须能读到真实的接管状态。
-                external_chat: self.lifecycle.external_chat.clone(),
-                config_store: self
-                    .lifecycle
-                    .config_store
-                    .as_ref()
-                    .expect("formal tasks require config store")
-                    .clone(),
-                live_configs: self.lifecycle.live_configs.clone(),
-                running: self.lifecycle.running.clone(),
-                reload_startup: self.lifecycle.reload_startup.clone(),
-                paused: self.lifecycle.paused.clone(),
-                console_reply_context: self.lifecycle.console_reply_context.clone(),
-                monitor: self.lifecycle.monitor.clone(),
-            },
-        }
     }
 
     pub(super) fn playback_queue(&self) -> Result<Vec<QueueItem>> {
@@ -1219,12 +1138,12 @@ mod tests {
             .with("秒数", "12")
             .with("人数", "3")
             .with("提问数", "2");
-        let override_text = command_reply_override(Some(&store), spec.key).unwrap();
+        let override_text = command_reply_override(&store, spec.key).unwrap();
         assert_eq!(
             crate::features::reply_template::render(&spec, Some(&override_text), &vars).text,
             "状态=进行中/12/3/2"
         );
-        assert!(!command_reply_is_muted(Some(&store), spec.key));
+        assert!(!command_reply_is_muted(&store, spec.key));
         std::fs::remove_dir_all(root).unwrap();
     }
 

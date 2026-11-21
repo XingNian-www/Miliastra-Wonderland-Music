@@ -6,7 +6,7 @@ use crate::features::song_request::{
     SongRequestContext, SongRequestDecision, SongRequestPort, SongSearchFailure,
 };
 
-impl SongRequestPort for ApplicationRuntime {
+impl SongRequestPort for AppServicesPort<'_> {
     fn song_ai_command_allowed(
         &self,
         username: &str,
@@ -17,12 +17,12 @@ impl SongRequestPort for ApplicationRuntime {
         if console {
             return true;
         }
-        let snapshot = self.lifecycle.live_configs.snapshot();
+        let snapshot = self.shared.live_configs.snapshot();
         // 与路由期**完全同一口径**：有账号按 UID，否则按昵称；
         // 身份命中就覆盖，未命中退回来源下界（粉色好友→Friend，蓝色大厅→User）。
         // 少了 floor 就会出现「路由放行、执行拒绝」，用户看到的是权限不够。
         let actor = crate::features::command_access::actor_permission_with_floor(
-            self.lifecycle
+            self.shared
                 .live_configs
                 .identity
                 .role_of_sender(username, account),
@@ -49,9 +49,9 @@ impl SongRequestPort for ApplicationRuntime {
         let Some(id) = source.permission_id() else {
             return false;
         };
-        let snapshot = self.lifecycle.live_configs.snapshot();
+        let snapshot = self.shared.live_configs.snapshot();
         let actor = crate::features::command_access::actor_permission_with_floor(
-            self.lifecycle
+            self.shared
                 .live_configs
                 .identity
                 .role_of_sender(username, account),
@@ -62,7 +62,7 @@ impl SongRequestPort for ApplicationRuntime {
     }
 
     fn reply(&self, message: &str) -> Result<()> {
-        ApplicationRuntime::reply(self, message)
+        AppServices::reply(self, message)
     }
 
     fn reply_template(
@@ -81,7 +81,7 @@ impl SongRequestPort for ApplicationRuntime {
         allow_local: bool,
         default_confirm: bool,
     ) -> Result<SongRequestDecision> {
-        ApplicationRuntime::prompt_and_wait_for_decision_batch(
+        AppServices::prompt_and_wait_for_decision_batch(
             self,
             messages,
             allow_switch_source,
@@ -105,7 +105,7 @@ impl SongRequestPort for ApplicationRuntime {
 
     fn local_recommend(&self) -> bool {
         // 本地推荐策略在 b8605a5 从 ai 段迁到了 song_ai 段（点歌专属）。
-        self.lifecycle
+        self.shared
             .live_configs
             .snapshot()
             .song_ai
@@ -113,7 +113,7 @@ impl SongRequestPort for ApplicationRuntime {
     }
 
     fn local_recommend_min_score(&self) -> f64 {
-        self.lifecycle
+        self.shared
             .live_configs
             .snapshot()
             .song_ai
@@ -176,7 +176,7 @@ impl SongRequestPort for ApplicationRuntime {
     }
 
     fn playback_queue(&self) -> Result<Vec<QueueItem>> {
-        ApplicationRuntime::playback_queue(self)
+        AppServices::playback_queue(self)
     }
 
     fn queue_contains(&self, item: QueueItem) -> Result<bool> {

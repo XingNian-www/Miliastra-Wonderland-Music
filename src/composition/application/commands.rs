@@ -76,13 +76,13 @@ fn required_message(required: IdentityRole) -> &'static str {
 /// 注意用 `role_of_sender` 现场解析，不用 `parsed.role` 快照：队列等待期间
 /// 身份映射可能已经变化，执行期必须读当前值（与 `command_is_disabled` 同口径）。
 fn playlist_command_allows_friend(
-    runtime: &ApplicationRuntime,
+    runtime: &AppServices,
     parsed: &RoutedCommand,
 ) -> bool {
-    let snapshot = runtime.lifecycle.live_configs.snapshot();
+    let snapshot = runtime.shared.live_configs.snapshot();
     // 现场解析，不用 parsed.role 快照：队列等待期间身份映射可能已经变化。
     let role = runtime
-        .lifecycle
+        .shared
         .live_configs
         .identity
         .role_of_sender(&parsed.username, parsed.account.as_ref());
@@ -113,15 +113,17 @@ pub(super) struct DeferredIdiomChainPort {
     live_configs: LiveConfigs,
     /// 延迟发送也要读命令面板的覆盖，否则同一条接龙文案在"立即发送"和
     /// "延迟发送"两条路径上行为不同，用户会以为改了没反应。
-    config_store: Option<crate::config::SharedConfigStore>,
+    ///
+    /// 非 `Option`：配置中心在启动装配时就一定存在，没有「可能没有」这种状态。
+    config_store: crate::config::SharedConfigStore,
 }
 
 /// 个人歌单的播放侧适配：读取当前播放曲目、直接播放收藏曲目。
 struct PlaylistRuntimePlaybackPort<'a> {
-    runtime: &'a mut ApplicationRuntime,
+    runtime: &'a AppServices,
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     /// 上下文丢失（换大厅/进千星/进入游戏）：结束个人歌单模式并清理残留自动项。
     pub(super) fn end_personal_playlist_for_context_loss(&self, reason: &str) -> Result<()> {
         let application = self.playback.playback_application.clone();
@@ -151,7 +153,8 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
 
     fn play(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<()> {
         let application = self.runtime.playback.playback_application.clone();
-        application.play_structured_track(track, self.runtime)
+        let mut port = self.runtime.port();
+        application.play_structured_track(track, &mut port)
     }
 
     fn enqueue_next(&mut self, track: &miliastra_playback::PlayableTrack) -> Result<bool> {
@@ -174,12 +177,14 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
         tracks: Vec<miliastra_playback::PlayableTrack>,
     ) -> Result<crate::features::playback::PersonalPlaylistStart> {
         let application = self.runtime.playback.playback_application.clone();
-        application.start_personal_playlist(owner, tracks, self.runtime)
+        let mut port = self.runtime.port();
+        application.start_personal_playlist(owner, tracks, &mut port)
     }
 
     fn stop_playlist(&mut self) -> Result<bool> {
         let application = self.runtime.playback.playback_application.clone();
-        application.stop_personal_playlist(self.runtime)
+        let mut port = self.runtime.port();
+        application.stop_personal_playlist(&mut port)
     }
 
     fn playlist_mode_owner(&self) -> Option<String> {
@@ -191,7 +196,7 @@ impl crate::features::playlist::PlaylistPlaybackPort for PlaylistRuntimePlayback
 
     /// 归属键 `id:<uuid>` 是内部标识，翻译成展示名后才能给玩家看。
     fn playlist_owner_display(&self, owner: &str) -> String {
-        super::playlist_owner_display(&self.runtime.lifecycle.live_configs.identity, owner)
+        super::playlist_owner_display(&self.runtime.shared.live_configs.identity, owner)
     }
 
     fn extend_playlist_tracks(
@@ -224,7 +229,7 @@ struct DeferredCardGamePort {
 }
 
 struct TurtleSoupCommandPort<'a> {
-    runtime: &'a ApplicationRuntime,
+    runtime: &'a AppServices,
     business: BusinessRuntimeHandle,
     task_engine: TaskEngineHandle,
 }
@@ -297,8 +302,8 @@ impl IdiomChainDeferredPort for DeferredIdiomChainPort {
     ) -> Result<IdiomDeliveryOutcome> {
         let stored = self
             .config_store
-            .as_ref()
-            .and_then(|store| store.lock().ok())
+            .lock()
+            .ok()
             .and_then(|store| store.reply_templates().ok());
         if let Some(stored) = &stored {
             if crate::features::reply_template::is_muted(stored, template.spec.key) {
@@ -439,13 +444,13 @@ impl AdministrationImmediatePort for ImmediateAdministrationPort {
     }
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     pub(super) fn deferred_idiom_chain_port(&self) -> DeferredIdiomChainPort {
         DeferredIdiomChainPort {
             business: self.business.business.clone(),
             task_engine: self.business.task_engine.clone(),
-            live_configs: self.lifecycle.live_configs.clone(),
-            config_store: self.lifecycle.config_store.clone(),
+            live_configs: self.shared.live_configs.clone(),
+            config_store: self.shared.config_store.clone(),
         }
     }
 
@@ -458,21 +463,22 @@ impl ApplicationRuntime {
     }
 
     pub(super) fn immediate_administration_port(&self) -> ImmediateAdministrationPort {
-        let live_config = self.lifecycle.live_configs.snapshot();
+        let live_config = self.shared.live_configs.snapshot();
         ImmediateAdministrationPort {
             business: self.business.business.clone(),
             task_engine: self.business.task_engine.clone(),
-            monitor: self.lifecycle.monitor.clone(),
+            monitor: self.shared.monitor.clone(),
             executed_commands_log_path: live_config.state.executed_commands_log_path.clone(),
         }
     }
 
-    pub(super) fn maybe_warn_hall_expiring(&mut self) -> Result<bool> {
+    pub(super) fn maybe_warn_hall_expiring(&self) -> Result<bool> {
         let application = self.business.hall_application;
-        application.maybe_warn_expiring(self)
+        let mut port = self.port();
+        application.maybe_warn_expiring(&mut port)
     }
 
-    pub(super) fn execute_command(&mut self, parsed: &RoutedCommand) -> Result<()> {
+    pub(super) fn execute_command(&self, parsed: &RoutedCommand) -> Result<()> {
         // 队列等待期间权限/开关可能变化，执行时再次读取当前策略。
         if self.command_is_disabled(parsed)? {
             log::info!(
@@ -499,7 +505,7 @@ impl ApplicationRuntime {
             // 文案**不另写一份**：直接复用拦截点的单一来源 `CommandGate::message()`，
             // 否则同一个原因会有两张表，改一处就会漂移。
             let message = required_message(required);
-            return ApplicationRuntime::reply(self, message);
+            return AppServices::reply(self, message);
         }
         match &parsed.command {
             ModuleCommand::SongRequest(command) => {
@@ -514,10 +520,11 @@ impl ApplicationRuntime {
                     account: parsed.account.clone(),
                     authority: parsed.authority,
                 };
+                let mut port = self.port();
                 self.business
                     .song_requests
                     .clone()
-                    .execute(&context, command, self)
+                    .execute(&context, command, &mut port)
             }
             ModuleCommand::Playback(command) => self.execute_playback_intent(parsed, command),
             ModuleCommand::Hall(command) => self.execute_hall_intent(parsed, command),
@@ -543,13 +550,14 @@ impl ApplicationRuntime {
     }
 
     fn execute_tarot_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &crate::features::tarot::TarotCommand,
     ) -> Result<()> {
         if matches!(command, crate::features::tarot::TarotCommand::Help) {
             self.log_executed_command(parsed, "tarot")?;
-            return self.send_command_reply_batch(
+            let mut port = self.port();
+            return port.send_command_reply_batch(
                 "#塔罗牌帮助",
                 &crate::features::reply_template::tarot::HELP,
                 &crate::features::reply_template::ReplyVars::new(),
@@ -577,7 +585,7 @@ impl ApplicationRuntime {
     }
 
     fn execute_playlist_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &crate::features::playlist::PlaylistCommand,
     ) -> Result<()> {
@@ -596,14 +604,15 @@ impl ApplicationRuntime {
                 crate::features::reply_template::REPLY_SONG[0].default,
                 &crate::features::reply_template::ReplyVars::new(),
             );
-            return ApplicationRuntime::reply(self, &text);
+            return AppServices::reply(self, &text);
         }
         if matches!(command, crate::features::playlist::PlaylistCommand::Open) {
             return self.execute_playlist_window(parsed);
         }
         if matches!(command, crate::features::playlist::PlaylistCommand::Help) {
             self.log_executed_command(parsed, "playlist help")?;
-            return self.send_command_reply_batch(
+            let mut port = self.port();
+            return port.send_command_reply_batch(
                 "@歌单帮助",
                 &crate::features::reply_template::HELP_PLAYLIST,
                 &crate::features::reply_template::ReplyVars::new(),
@@ -621,7 +630,7 @@ impl ApplicationRuntime {
                 crate::features::reply_template::REPLY_SONG[0].default,
                 &crate::features::reply_template::ReplyVars::new(),
             );
-            return ApplicationRuntime::reply(self, &text);
+            return AppServices::reply(self, &text);
         };
         let now = Instant::now();
         let now_epoch = std::time::SystemTime::now()
@@ -653,7 +662,7 @@ impl ApplicationRuntime {
         self.reply_batch(&messages, 0)
     }
 
-    fn execute_hall_intent(&mut self, parsed: &RoutedCommand, command: &HallCommand) -> Result<()> {
+    fn execute_hall_intent(&self, parsed: &RoutedCommand, command: &HallCommand) -> Result<()> {
         let context = HallCommandContext {
             message_type: parsed.message_type.clone(),
             username: command_username(parsed).to_string(),
@@ -661,11 +670,12 @@ impl ApplicationRuntime {
             user_command: parsed.user_command.clone(),
         };
         let application = self.business.hall_application;
-        application.execute(&context, command, self)
+        let mut port = self.port();
+        application.execute(&context, command, &mut port)
     }
 
     fn execute_administration_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &AdministrationCommand,
     ) -> Result<()> {
@@ -677,17 +687,18 @@ impl ApplicationRuntime {
         let application = self.business.administration_application;
         // 帮助分批发送间隔是既有 Live 字段：每次执行时取实时快照，避免用启动副本。
         let help_batch_ms = self
-            .lifecycle
+            .shared
             .live_configs
             .snapshot()
             .timing
             .command
             .help_batch_ms;
-        application.execute(&context, command, self, help_batch_ms)
+        let mut port = self.port();
+        application.execute(&context, command, &mut port, help_batch_ms)
     }
 
     fn execute_idiom_chain_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &idiom_chain::IdiomChainCommand,
     ) -> Result<()> {
@@ -697,13 +708,14 @@ impl ApplicationRuntime {
             let application = self.business.idiom_chain_application;
             // 解释批次间隔同样读实时快照（既有 Live 字段，不使用启动副本）。
             let help_batch_ms = self
-                .lifecycle
+                .shared
                 .live_configs
                 .snapshot()
                 .timing
                 .command
                 .help_batch_ms;
-            application.execute_explanation(&player, command, observed_at, self, help_batch_ms)
+            let mut port = self.port();
+            application.execute_explanation(&player, command, observed_at, &mut port, help_batch_ms)
         } else {
             log::debug!("成语接龙命令已按正式队列顺序处理，回复进入延迟聊天队列");
             let mut port = self.deferred_idiom_chain_port();
@@ -728,14 +740,17 @@ impl ApplicationRuntime {
         let player = self.canonical_actor_name(&parsed.username);
         let player_display = self.mapped_actor_name(&parsed.username, parsed.account.as_ref());
         match card_game_effect_lane(command) {
-            CardGameEffectLane::Formal => self.business.card_games.execute_command_with_display(
-                &player,
-                &player_display,
-                command,
-                observed_at,
-                CardGameEffectLane::Formal,
-                self,
-            ),
+            CardGameEffectLane::Formal => {
+                let mut port = self.port();
+                self.business.card_games.execute_command_with_display(
+                    &player,
+                    &player_display,
+                    command,
+                    observed_at,
+                    CardGameEffectLane::Formal,
+                    &mut port,
+                )
+            }
             CardGameEffectLane::Deferred => {
                 let port = DeferredCardGamePort {
                     task_engine: self.business.task_engine.clone(),
@@ -753,7 +768,7 @@ impl ApplicationRuntime {
     }
 
     fn execute_turtle_soup_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &turtle_soup::TurtleSoupCommand,
     ) -> Result<()> {
@@ -813,7 +828,7 @@ impl ApplicationRuntime {
     }
 
     fn execute_invite_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         invite: &crate::features::invite::InviteCommand,
     ) -> Result<()> {
@@ -832,7 +847,7 @@ impl ApplicationRuntime {
         // 好友列表上出现，所以候选名要一起给。
         if let Some(account) = parsed.account.as_ref() {
             let names = self
-                .lifecycle
+                .shared
                 .live_configs
                 .identity
                 .friend_search_names(
@@ -864,11 +879,12 @@ impl ApplicationRuntime {
             InviteStart::Ready(execution) => execution,
         };
         self.log_executed_command(parsed, &format!("invite {}", invite.username))?;
-        execution.run(self).map(|_| ())
+        let mut port = self.port();
+        execution.run(&mut port).map(|_| ())
     }
 
     fn execute_moderation_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &crate::features::moderation::ModerationCommand,
     ) -> Result<()> {
@@ -881,7 +897,7 @@ impl ApplicationRuntime {
     }
 
     fn execute_custom_workflow_intent(
-        &mut self,
+        &self,
         parsed: &RoutedCommand,
         command: &crate::features::custom_workflow::CustomWorkflowCommand,
     ) -> Result<()> {
@@ -921,13 +937,14 @@ impl ApplicationRuntime {
         // 身份键（可能为 UUID）只用于比较/查找/记账；渲染与好友投递必须用展示名。
         let player = self.canonical_actor_name(&parsed.username);
         let player_display = self.mapped_actor_name(&parsed.username, parsed.account.as_ref());
+        let mut port = self.port();
         self.business.undercover_game.execute_command_with_display(
             &player,
             &player_display,
             source,
             command,
             command_observed_at(parsed),
-            self,
+            &mut port,
         )
     }
 
@@ -960,7 +977,7 @@ fn configure_idle_exit(business: &BusinessRuntimeHandle, minutes: u32) -> Result
     Ok(())
 }
 
-impl IdiomChainExplanationPort for ApplicationRuntime {
+impl IdiomChainExplanationPort for AppServicesPort<'_> {
     fn explain(
         &mut self,
         player: &str,
@@ -997,7 +1014,7 @@ impl IdiomChainExplanationPort for ApplicationRuntime {
     }
 }
 
-impl AdministrationImmediatePort for ApplicationRuntime {
+impl AdministrationImmediatePort for AppServicesPort<'_> {
     fn set_commands_enabled(&mut self, enabled: bool) -> Result<()> {
         self.business
             .business
@@ -1026,11 +1043,11 @@ impl AdministrationImmediatePort for ApplicationRuntime {
     }
 
     fn configure_idle_exit(&mut self, minutes: u32) -> Result<()> {
-        ApplicationRuntime::configure_idle_exit(self, minutes)
+        AppServices::configure_idle_exit(self, minutes)
     }
 
     fn record_command_activity(&mut self) -> Result<()> {
-        ApplicationRuntime::record_command_activity(self, Instant::now())
+        AppServices::record_command_activity(self, Instant::now())
     }
 
     fn log_executed(
@@ -1047,7 +1064,7 @@ impl AdministrationImmediatePort for ApplicationRuntime {
     }
 }
 
-impl AdministrationApplicationPort for ApplicationRuntime {
+impl AdministrationApplicationPort for AppServicesPort<'_> {
     fn send_command_reply_batch(
         &mut self,
         command_id: &str,
@@ -1057,11 +1074,13 @@ impl AdministrationApplicationPort for ApplicationRuntime {
     ) -> Result<()> {
         // 帮助是单条模板、多行内容。命令面板的覆盖按该模板的 key 查，
         // 多行由发送路径拆成多条消息——不再有"逐行模板数组"这一层。
-        let stored = if let Some(store) = self.lifecycle.config_store.as_ref() {
-            let store = store.lock().map_err(|_| anyhow!("命令回复存储锁已损坏"))?;
+        let stored = {
+            let store = self
+                .shared
+                .config_store
+                .lock()
+                .map_err(|_| anyhow!("命令回复存储锁已损坏"))?;
             store.reply_templates()?.get(command_id).cloned()
-        } else {
-            None
         };
         let override_text = stored
             .as_ref()
@@ -1087,7 +1106,7 @@ impl AdministrationApplicationPort for ApplicationRuntime {
         self.reply_batch(&refs, delay_ms)
     }
     fn send_hall(&mut self, message: &str) -> Result<()> {
-        ApplicationRuntime::reply(self, message)
+        AppServices::reply(self, message)
     }
 
     fn send_hall_template(
@@ -1112,7 +1131,7 @@ impl AdministrationApplicationPort for ApplicationRuntime {
     }
 }
 
-impl HallDetectionPort for ApplicationRuntime {
+impl HallDetectionPort for AppServicesPort<'_> {
     fn detect_public_hall(&mut self) -> Result<Option<HallObservation>> {
         detect_public_hall(&self.ui.hall_ui)
     }
@@ -1132,9 +1151,9 @@ impl HallDetectionPort for ApplicationRuntime {
     }
 }
 
-impl HallApplicationPort for ApplicationRuntime {
+impl HallApplicationPort for AppServicesPort<'_> {
     fn reply(&mut self, message: &str) -> Result<()> {
-        ApplicationRuntime::reply(self, message)
+        AppServices::reply(self, message)
     }
 
     fn reply_template(
@@ -1236,9 +1255,9 @@ fn detect_public_hall(hall_ui: &HallUi) -> Result<Option<HallObservation>> {
     }))
 }
 
-impl HallMaintenancePort for ApplicationRuntime {
+impl HallMaintenancePort for AppServicesPort<'_> {
     fn executor_is_idle(&mut self) -> Result<bool> {
-        ApplicationRuntime::executor_is_idle(self)
+        AppServices::executor_is_idle(self)
     }
 
     fn hall_expiring_warning_sent(&mut self) -> Result<bool> {
@@ -1258,7 +1277,7 @@ impl HallMaintenancePort for ApplicationRuntime {
     }
 
     fn reply(&mut self, message: &str) -> Result<()> {
-        ApplicationRuntime::reply(self, message)
+        AppServices::reply(self, message)
     }
 
     fn reply_template(

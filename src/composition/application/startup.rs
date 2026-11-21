@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, anyhow};
 
-use super::ApplicationRuntime;
+use super::AppServicesPort;
 use crate::features::startup::StartupExecutionPort;
 use crate::ui::routines::{
     EnterGame, EnterGameEffect, EnterWonderland, EnterWonderlandEffect, UiResidencyOutcome,
 };
 
-impl StartupExecutionPort for ApplicationRuntime {
+impl StartupExecutionPort for AppServicesPort<'_> {
     fn invalidate_chat_context(&self, reason: &'static str) {
         self.abort_entertainment_for_context_loss(reason);
     }

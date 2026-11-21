@@ -38,6 +38,7 @@ use super::state_observation::{
 use crate::geometry::Point;
 use crate::ui::template::{best_template_candidate, best_template_hit};
 use crate::runtime::ocr::OcrRuntimeHandle;
+use crate::runtime::recovery::{GameRecoveryCoordinator, ResidencyRejection};
 use crate::runtime::ui::{
     InputCertainty, UiRoutineContext, UiRoutineFailure, UiStateKind,
 };
@@ -190,6 +191,12 @@ pub(crate) struct SettleEnvironment {
     /// 恢复好友会话时需要；一级/当前大厅路径不需要 OCR。
     ocr: Option<OcrRuntimeHandle>,
     config: FriendDeliveryRoutineConfig,
+    /// 进程级共享的恢复协调器（见 `runtime::recovery`）。
+    ///
+    /// 默认自建一份，等价于原先「Unknown 起点与 Esc 探针预算只活在这一次恢复
+    /// 调用里」；`with_recovery` 注入同一实例后，恢复观测与其它触发源共享一份
+    /// 健康状态（Wave 1b 在进程装配处注入）。
+    recovery: GameRecoveryCoordinator,
 }
 
 impl SettleEnvironment {
@@ -197,12 +204,23 @@ impl SettleEnvironment {
         Self {
             ocr: Some(ocr),
             config,
+            recovery: GameRecoveryCoordinator::default(),
         }
     }
 
     /// 不需要 OCR 的恢复（一级 / 当前大厅）：仍走同一入口与环境类型。
     pub(crate) fn without_ocr(config: FriendDeliveryRoutineConfig) -> Self {
-        Self { ocr: None, config }
+        Self {
+            ocr: None,
+            config,
+            recovery: GameRecoveryCoordinator::default(),
+        }
+    }
+
+    /// 用进程级共享的恢复协调器替换默认实例。
+    pub(crate) fn with_recovery(mut self, recovery: GameRecoveryCoordinator) -> Self {
+        self.recovery = recovery;
+        self
     }
 
     pub(crate) fn ocr(&self) -> Option<&OcrRuntimeHandle> {
@@ -211,6 +229,11 @@ impl SettleEnvironment {
 
     pub(crate) fn config(&self) -> &FriendDeliveryRoutineConfig {
         &self.config
+    }
+
+    /// 当前环境使用的恢复协调器。
+    pub(crate) fn recovery(&self) -> &GameRecoveryCoordinator {
+        &self.recovery
     }
 }
 
@@ -356,6 +379,11 @@ struct RecoveryProgress {
     fresh_identity: Option<String>,
     fresh_samples: u32,
     unknown_samples: u32,
+    /// **本轮**恢复调用内的持续无法识别起点。
+    ///
+    /// 判定必须用这一份：受控 Esc 探针的触发条件是「本轮连续多帧无法识别且已过
+    /// 时间窗」，跨恢复调用累计会让探针在后续调用里提前获准（那会凭空多按一次
+    /// Esc）。统一协调器里的持续时长只用于健康汇报，不参与按键决策。
     unknown_since: Option<Instant>,
     /// 受控 Esc 探针是否已用过（Unknown 只允许一次）。
     unknown_escape_used: bool,
@@ -374,7 +402,17 @@ struct RecoveryProgress {
 }
 
 impl RecoveryProgress {
-    fn record(&mut self, snapshot: &UiStateSnapshot, now: Instant) {
+    /// 记录一次采样。
+    ///
+    /// 采样同时喂给统一协调器：跨恢复会话的「持续无法识别时长」由它持有，
+    /// 诊断出口因此不必再从日志复原现场；但**是否允许探针仍只看本轮窗口**，
+    /// 见 `unknown_since` 与 `unknown_sustained`。
+    fn record(
+        &mut self,
+        snapshot: &UiStateSnapshot,
+        now: Instant,
+        recovery: &GameRecoveryCoordinator,
+    ) {
         self.resamples = self.resamples.saturating_add(1);
         self.history.push(snapshot.describe());
         if self.history.len() > RECOVERY_HISTORY_LIMIT {
@@ -407,6 +445,8 @@ impl RecoveryProgress {
             // 离开 Unknown 后，探针标记只用于本轮判断；预算保留。
             self.unknown_escape_probe = false;
         }
+        // 统一观测：只记录「持续无法识别多久」，不改变任何按键决策。
+        recovery.observe_ui_kind(now, snapshot.kind == UiStateKind::Unknown);
         if snapshot.kind == UiStateKind::Loading {
             self.loading_since.get_or_insert(now);
         } else {
@@ -640,6 +680,27 @@ fn decide_recovery_step(
     }
 }
 
+/// 把一次拒绝归类，供统一健康态统计。
+///
+/// 只做分类，不参与判定；分类口径与 `decide_recovery_step` 的拒绝分支一一对应：
+/// 「探针之后仍然无法识别」与「探针预算已用尽／不允许探针」是两条独立分支，
+/// 其余拒绝（熔断、目标不可重建、Esc 次数上限等）归到 `Other`。
+fn rejection_of(
+    snapshot: &UiStateSnapshot,
+    progress: &RecoveryProgress,
+    options: SettleOptions,
+) -> ResidencyRejection {
+    if snapshot.kind != UiStateKind::Unknown {
+        return ResidencyRejection::Other;
+    }
+    if progress.unknown_escape_probe {
+        return ResidencyRejection::UnknownProbeIneffective;
+    }
+    if progress.unknown_escape_used || !options.allow_unknown_escape {
+        return ResidencyRejection::UnknownEscapeBudgetExhausted;
+    }
+    ResidencyRejection::Other
+}
 
 /// 会话确认/导航结果。
 enum ConversationStep {
@@ -672,6 +733,7 @@ pub(crate) fn settle_to_with(
 ) -> std::result::Result<RecoveryReport, RecoveryFailure> {
     let ocr = env.ocr();
     let config = env.config();
+    let recovery = env.recovery().clone();
     let observation_config = config.state_observation();
     let target_kind = target.kind();
     let deadline = Instant::now() + Duration::from_millis(config.timeout_ms().max(1));
@@ -706,7 +768,7 @@ pub(crate) fn settle_to_with(
                 });
             }
         };
-        progress.record(&snapshot, now);
+        progress.record(&snapshot, now, &recovery);
 
         if now >= deadline {
             let reason = match snapshot.kind {
@@ -730,7 +792,9 @@ pub(crate) fn settle_to_with(
             match target.conversation().filter(|conversation| conversation.is_chat()) {
                 None => {
                     let settled = target.conversation().cloned();
-                    return Ok(build_report(target, snapshot, settled, false, progress));
+                    return Ok(build_report(
+                        &recovery, target, snapshot, settled, false, progress,
+                    ));
                 }
                 Some(conversation) => {
                     match settle_conversation(
@@ -745,6 +809,7 @@ pub(crate) fn settle_to_with(
                     ) {
                         Ok(ConversationOutcome::Settled(degraded, settled_conversation)) => {
                             return Ok(build_report(
+                                &recovery,
                                 target,
                                 snapshot,
                                 settled_conversation,
@@ -789,7 +854,9 @@ pub(crate) fn settle_to_with(
             RecoveryAction::Done => {
                 // 表面确认但会话尚未确认的路径应在上面处理；到这里的 Done 只可能是
                 // 无需会话确认的目标（一级大厅/二级界面/AnySecondary）。
-                return Ok(build_report(target, snapshot, None, false, progress));
+                return Ok(build_report(
+                    &recovery, target, snapshot, None, false, progress,
+                ));
             }
             RecoveryAction::Wait => {}
             RecoveryAction::Escape => {
@@ -810,6 +877,9 @@ pub(crate) fn settle_to_with(
                 if snapshot.kind == UiStateKind::Unknown {
                     progress.unknown_escape_used = true;
                     progress.unknown_escape_probe = true;
+                    // 受控 Esc 探针的消耗报到协调器：全局健康态里能直接看到
+                    // 「探针用了几次、之后是否仍然无法识别」，不必再从日志复原。
+                    recovery.record_unknown_escape_probe(now);
                 }
                 progress.pending_action_identity = Some(pre_action_identity);
                 wait_ms(
@@ -857,6 +927,8 @@ pub(crate) fn settle_to_with(
                 })?;
             }
             RecoveryAction::Reject(reason) => {
+                recovery
+                    .record_residency_rejected(now, rejection_of(&snapshot, &progress, options));
                 return Err(build_failure(
                     context,
                     config,
@@ -1255,12 +1327,15 @@ fn stage_names(target_kind: UiStateKind, action_taken: bool) -> (&'static str, I
 }
 
 fn build_report(
+    recovery: &GameRecoveryCoordinator,
     target: ResidencyTarget,
     snapshot: UiStateSnapshot,
     settled_conversation: Option<ConversationRef>,
     degraded: bool,
     progress: RecoveryProgress,
 ) -> RecoveryReport {
+    // 恢复成功落定：把本轮按下的 Esc 次数并进全局健康态（只记账，不改行为）。
+    recovery.record_residency_settled(Instant::now(), progress.esc_presses);
     RecoveryReport {
         target,
         settled_as: snapshot.kind,
@@ -1366,10 +1441,15 @@ mod tests {
         }
     }
 
+    fn recovery() -> GameRecoveryCoordinator {
+        GameRecoveryCoordinator::default()
+    }
+
     fn settled(snapshot: &UiStateSnapshot) -> RecoveryProgress {
+        let recovery = recovery();
         let mut progress = RecoveryProgress::default();
         for _ in 0..snapshot.required_count.max(1) {
-            progress.record(snapshot, Instant::now());
+            progress.record(snapshot, Instant::now(), &recovery);
         }
         progress
     }
@@ -1398,12 +1478,13 @@ mod tests {
 
     #[test]
     fn recovery_decision_unknown_waits_then_uses_one_controlled_escape() {
+        let recovery = recovery();
         let snapshot = snap(UiStateKind::Unknown, "unknown", "no_reliable_anchor");
         let mut progress = settled(&snapshot);
         // 瞬失：只等待，不按键。
         assert_eq!(decide(&snapshot, UiStateKind::Primary, &progress), RecoveryAction::Wait);
         for _ in 0..RECOVERY_UNKNOWN_MIN_SAMPLES {
-            progress.record(&snapshot, Instant::now());
+            progress.record(&snapshot, Instant::now(), &recovery);
         }
         progress.unknown_since =
             Some(Instant::now() - Duration::from_millis(RECOVERY_UNKNOWN_WINDOW_MS + 50));
@@ -1421,8 +1502,10 @@ mod tests {
     #[test]
     fn recovery_decision_unknown_never_escapes_without_sustain_window() {
         let snapshot = snap(UiStateKind::Unknown, "unknown", "no_reliable_anchor");
+        let recovery = recovery();
         let mut progress = RecoveryProgress::default();
-        progress.record(&snapshot, Instant::now());
+        progress.record(&snapshot, Instant::now(), &recovery);
+        // 时间窗已经成立，但本次恢复不允许探针：仍然只能等待。
         let strict = decide_recovery_step(
             &snapshot,
             &ResidencyTarget::Primary,
@@ -1457,7 +1540,7 @@ mod tests {
             ..RecoveryProgress::default()
         };
         assert_eq!(decide(&panel, UiStateKind::Primary, &progress), RecoveryAction::Wait);
-        progress.record(&panel, Instant::now());
+        progress.record(&panel, Instant::now(), &recovery());
         assert_eq!(decide(&panel, UiStateKind::Primary, &progress), RecoveryAction::Escape);
     }
 
@@ -1499,7 +1582,7 @@ mod tests {
         let mut progress = settled(&primary);
         progress.pending_action_identity = Some(primary.identity());
         for _ in 0..RECOVERY_NO_PROGRESS_LIMIT {
-            progress.record(&primary, Instant::now());
+            progress.record(&primary, Instant::now(), &recovery());
         }
         assert!(matches!(
             decide(&primary, UiStateKind::Primary, &progress),

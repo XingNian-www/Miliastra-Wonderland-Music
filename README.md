@@ -60,14 +60,18 @@ Miliastra Wonderland Music 是一个面向 Windows 的原神/千星奇域点歌�
 
 ## 用户文档
 
+完整导航见 [文档导航](docs/index.md)。常用入口：
+
 - [用户使用指南](docs/user-guide.md)：安装、配置、常用命令、好友操作、歌词、队列和故障排查。
 - [外部聊天源（ChatBridge）](docs/user-guide.md#13-外部聊天源chatbridge)：可选的第三方消息源，含配置方法与风险说明。
+- [个人歌单](docs/playlist.md)：昵称归属、20 秒独占选择、重抽周期与收藏管理。
 - [成语接龙](docs/idiom-chain.md)：玩法、命令和词库配置。
 - [海龟汤](docs/turtle-soup.md)：开局、提问、长答案和题库配置。
 - [斗地主与跑得快](docs/card-games.md)：组局、抢地主、出牌、手牌查询和投递重试。
 - [谁是卧底](docs/undercover.md)：报名、发言、投票和词库配置。
 - [数字炸弹](docs/number-bomb.md)：轮流猜数字、区间收窄和上限随人数增长。
 - [Web 面板使用](docs/web-tools.md)：状态面板、远程控制和高级工具。
+- [沙盒只读模式](docs/sandbox-read-only.md)：主动读取、仅命令/流程触发推送、原图与复现证据下载。
 - [平台登录](docs/login-qr-feasibility.md)：登录步骤、凭据和环境要求。
 
 ## 交流群

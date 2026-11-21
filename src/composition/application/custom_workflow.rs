@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, Instant};
 
-use super::{ApplicationRuntime, ChatDecisionScope};
+use super::{AppServices, AppServicesPort, ChatDecisionScope};
 use crate::features::command::RoutedCommand;
 use crate::features::custom_workflow::{
     CustomWorkflowCommand, CustomWorkflowExecutionPort, CustomWorkflowInvocation,
@@ -28,9 +28,9 @@ enum ChatDecisionWait<T> {
     Stopped,
 }
 
-impl ApplicationRuntime {
+impl AppServices {
     pub(super) fn execute_custom_workflow(
-        &mut self,
+        &self,
         command: &CustomWorkflowCommand,
         parsed: &RoutedCommand,
     ) -> Result<()> {
@@ -42,7 +42,8 @@ impl ApplicationRuntime {
             user_command: parsed.user_command.clone(),
         };
         let service = self.business.custom_workflow.clone();
-        service.execute(&invocation, self).map(|_| ())
+        let mut port = self.port();
+        service.execute(&invocation, &mut port).map(|_| ())
     }
 
     fn wait_for_chat_decision<T, A, P>(
@@ -68,7 +69,7 @@ impl ApplicationRuntime {
                 parse_decision(text).is_some()
             })?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        while self.lifecycle.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
+        while self.shared.running.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
             let messages = self
                 .wait_for_chat_decision_messages(
                     &mut reader,
@@ -76,7 +77,7 @@ impl ApplicationRuntime {
                     deadline.saturating_duration_since(Instant::now()),
                 )
                 .with_context(|| format!("{label}读取失败"))?;
-            if !self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+            if !self.shared.running.load(AtomicOrdering::SeqCst) {
                 return Ok(ChatDecisionWait::Stopped);
             }
             for message in messages {
@@ -91,7 +92,7 @@ impl ApplicationRuntime {
                 }
             }
         }
-        if self.lifecycle.running.load(AtomicOrdering::SeqCst) {
+        if self.shared.running.load(AtomicOrdering::SeqCst) {
             Ok(ChatDecisionWait::Timeout)
         } else {
             Ok(ChatDecisionWait::Stopped)
@@ -142,7 +143,7 @@ impl ApplicationRuntime {
     }
 
     fn wait_for_invite_decision(&self) -> Result<Option<bool>> {
-        let live_config = self.lifecycle.live_configs.snapshot();
+        let live_config = self.shared.live_configs.snapshot();
         match self.wait_for_chat_decision(
             "邀请确认",
             live_config.timing.invite.confirm_timeout_ms,
@@ -211,7 +212,7 @@ impl ApplicationRuntime {
         let mut raw_grouped = Vec::<(String, Vec<String>)>::new();
         for message in messages {
             let display_message = self
-                .lifecycle
+                .shared
                 .live_configs
                 .identity
                 .replace_display_names(message.message());
@@ -221,7 +222,7 @@ impl ApplicationRuntime {
             // 换不回来（未登记玩家）时退回收件人本身，行为与以前一致。
             // 同名歧义时该函数返回空表，宁可在 UI 前失败，也不发给另一个人。
             let search_names = self
-                .lifecycle
+                .shared
                 .live_configs
                 .identity
                 .friend_search_names(message.recipient(), None);
@@ -349,7 +350,7 @@ impl ApplicationRuntime {
     }
 }
 
-impl CustomWorkflowExecutionPort for ApplicationRuntime {
+impl CustomWorkflowExecutionPort for AppServicesPort<'_> {
     fn send_hall(&mut self, message: &str) -> Result<()> {
         self.reply(message)
     }
@@ -424,13 +425,13 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
             WorkflowCapability::SendHall { message } => self.reply(&message),
             WorkflowCapability::SendCurrentChat { message } => {
                 let message = self
-                    .lifecycle
+                    .shared
                     .live_configs
                     .identity
                     .replace_display_names(&message);
                 // 与 reply 的 prose 路径一致：超宽自动换行，短文本仍是单条。
                 let delay_ms = self
-                    .lifecycle
+                    .shared
                     .live_configs
                     .snapshot()
                     .timing
@@ -464,7 +465,7 @@ impl CustomWorkflowExecutionPort for ApplicationRuntime {
     }
 }
 
-impl InviteExecutionPort for ApplicationRuntime {
+impl InviteExecutionPort for AppServicesPort<'_> {
     fn is_public_hall(&self) -> Result<bool> {
         self.check_public_hall()
     }
@@ -503,7 +504,7 @@ impl InviteExecutionPort for ApplicationRuntime {
                 password.map(str::to_string),
                 fit_chat_message(
                     &self
-                        .lifecycle
+                        .shared
                         .live_configs
                         .identity
                         .replace_display_names(notification),

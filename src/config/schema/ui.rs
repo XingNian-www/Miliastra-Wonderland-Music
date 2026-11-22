@@ -849,8 +849,8 @@ pub(super) fn startup_section() -> Vec<ConfigFieldSchema> {
         //
         // 与同段的 `launch_game` 同一档：`startup.*` 一旦改动，`tasks.rs` 的
         // `reload_fields_require_startup` 会把重载升级成 `ConfigReloadWithStartup`，
-        // 也就是「闲置时重载并重新走启动流程」——效果等同重启，而面板文案如实写
-        // 「任务结束后重载」。
+        // 也就是「空闲后整程序重启并重新走启动流程」——面板文案写的是
+        // 「空闲后整程序重启」，与真实语义一致。
         //
         // 说明：审计决策写的是「改为 `Restart`」。这里没有照抄，因为把 `source: Db`
         // 的字段声明成 `Effect::Restart` 会直接违反 `schema/mod.rs` 的
@@ -862,7 +862,7 @@ pub(super) fn startup_section() -> Vec<ConfigFieldSchema> {
             "enter_game",
             "自动进入游戏",
             FieldKind::Bool,
-            "持续未知时 OCR 检测到“点击进入”，确认大门界面后自动进入游戏；任务结束后重载子进程时生效",
+            "持续未知时 OCR 检测到“点击进入”，确认大门界面后自动进入游戏；空闲后整程序重启时生效",
         ),
         ConfigFieldSchema::db_live(
             "enter_wonderland",

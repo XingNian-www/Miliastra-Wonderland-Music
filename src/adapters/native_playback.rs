@@ -1,6 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use std::time::Duration;
 
 use miliastra_playback::{
@@ -15,55 +13,43 @@ use crate::runtime::player_io::{
     PlayerObservationPort, PlayerObservationReadError, PlayerSearchError, PlayerSearchPort,
 };
 
+mod volume_smoother;
+
+use self::volume_smoother::VolumeSmoother;
+
 /// 音量渐变总步数（线性插值，防爆音）。
 const VOLUME_SMOOTH_STEPS: u8 = 8;
 
 #[derive(Clone)]
 pub(crate) struct NativePlaybackAdapter {
     playback: PlaybackHandle,
-    /// 每个平滑步进之间的等待时间，来自 timing.external.volume_smooth_step_ms。
-    volume_smooth_step_ms: u64,
-    /// 渐变代际：新命令自增，旧渐变线程据此退出，避免多次命令互相打架。
-    volume_smooth_generation: Arc<AtomicU64>,
+    /// 音量渐变的代际 worker：一条常驻线程，新目标只更新代际，不新起线程。
+    volume_smooth: Arc<VolumeSmoother>,
 }
 
 impl NativePlaybackAdapter {
     pub(crate) fn new(playback: PlaybackHandle, volume_smooth_step_ms: u64) -> Self {
+        let apply_playback = playback.clone();
+        let current_playback = playback.clone();
         Self {
             playback,
-            volume_smooth_step_ms,
-            volume_smooth_generation: Arc::new(AtomicU64::new(0)),
+            volume_smooth: VolumeSmoother::new(
+                volume_smooth_step_ms,
+                move |volume| apply_playback.set_volume(volume).is_ok(),
+                move || {
+                    current_playback
+                        .snapshot()
+                        .map(|snapshot| snapshot.volume)
+                        .ok()
+                },
+            ),
         }
     }
 
-    /// 异步音量渐变：立即确认命令，后台线程按步进间隔逐步逼近目标音量。
+    /// 异步音量渐变：立即确认命令，由代际 worker 按步进间隔逐步逼近目标音量。
     fn set_volume_smoothed(&self, target: u8) -> ControlDispatch {
-        let my_generation = self
-            .volume_smooth_generation
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        let generation = Arc::clone(&self.volume_smooth_generation);
-        let playback = self.playback.clone();
-        let step_ms = self.volume_smooth_step_ms;
-        match thread::Builder::new()
-            .name("volume-smooth".to_string())
-            .spawn(move || {
-                let current = playback
-                    .snapshot()
-                    .map(|snapshot| snapshot.volume)
-                    .unwrap_or(target);
-                for next in volume_smooth_sequence(current, target) {
-                    if generation.load(Ordering::Relaxed) != my_generation {
-                        // 已有更新的音量命令接管渐变。
-                        return;
-                    }
-                    if playback.set_volume(next).is_err() {
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(step_ms));
-                }
-            }) {
-            Ok(_) => ControlDispatch::immediate(ControlDispatchOutcome::acknowledged("ok")),
+        match self.volume_smooth.request(target) {
+            Ok(()) => ControlDispatch::immediate(ControlDispatchOutcome::acknowledged("ok")),
             // 渐变线程创建失败:不能静默假装音量已生效。
             Err(error) => ControlDispatch::immediate(ControlDispatchOutcome::rejected(format!(
                 "音量渐变线程创建失败: {error}"

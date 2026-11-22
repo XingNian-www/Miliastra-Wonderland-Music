@@ -60,17 +60,17 @@ pub enum ConfigSource {
     Bootstrap,
 }
 
-/// 生效级别：保存后立即生效 / 运行态闲置时重载 / 播放器闲置时重载 /
+/// 生效级别：保存后立即生效 / 空闲时整程序重启 / 播放器空闲时整程序重启 /
 /// 人工重启生效。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Effect {
     /// 保存后立即生效
     Live,
-    /// 保存后等待运行态闲置，再由看门狗重载子进程。
+    /// 保存后等待运行态空闲；随后整个子进程以退出码 75（`CONFIG_RELOAD_EXIT_CODE`）退出，由 `main.rs` 的看门狗重新拉起（不是只重载组件）。
     IdleReload,
-    /// 保存后等待运行态闲置，且播放器已闲置或处于可安全恢复的用户暂停状态，
-    /// 再由看门狗重载子进程。
+    /// 保存后等待运行态空闲，且播放器已闲置或处于可安全恢复的用户暂停状态，
+    /// 再按 `IdleReload` 的方式重启整个子进程。
     PlaybackIdleReload,
     /// 只能在人工重启后生效（用于 config.yaml 启动引导字段）。
     Restart,

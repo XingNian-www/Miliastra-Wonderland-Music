@@ -41,4 +41,4 @@ idiom_chain:
   allow_anyone_stop: false
 ```
 
-词库随发布包放在 `deps/assets/idioms.txt`，通常不需要修改。通过配置中心调整超时或结束权限，保存后会在当前任务结束后自动重载。
+词库随发布包放在 `deps/assets/idioms.txt`，通常不需要修改。通过配置中心调整超时或结束权限，保存后会在运行态空闲时整程序重启（子进程退出并由守护进程拉起，期间短暂不可用）。

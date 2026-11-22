@@ -598,7 +598,7 @@ pub(super) fn tts_section() -> Vec<ConfigFieldSchema> {
             "api_key",
             "fish API Key",
             FieldKind::Secret,
-            "fish.audio API key，只以 Authorization Bearer 发送；保存后需重载子进程生效",
+            "fish.audio API key，只以 Authorization Bearer 发送；空闲后整程序重启时生效",
         ),
         ConfigFieldSchema::db_live(
             "model",

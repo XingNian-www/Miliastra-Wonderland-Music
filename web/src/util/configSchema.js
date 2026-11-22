@@ -22,8 +22,10 @@ export const DOMAIN_LABELS = {
 
 export const EFFECT_LABELS = {
   live: '立即生效',
-  idleReload: '任务结束后重载',
-  playbackIdleReload: '播放结束/暂停后重载',
+  // 真实语义是「空闲后整个子进程退出、由守护进程重新拉起」（退出码 75），
+  // 不是「任务结束后再重载某个组件」，也不是热更新配置。文案必须让用户知道会中断。
+  idleReload: '空闲后整程序重启（子进程退出并由守护进程拉起）',
+  playbackIdleReload: '播放结束/暂停后整程序重启',
   restart: '重启生效',
 }
 
@@ -171,10 +173,10 @@ export function saveSummary(response, revision) {
     parts.push(`立即生效 ${response.appliedLiveFields.length} 项`)
   }
   if (response && Array.isArray(response.runtimeReloadFields) && response.runtimeReloadFields.length) {
-    parts.push(`任务结束后重载 ${response.runtimeReloadFields.length} 项`)
+    parts.push(`空闲后整程序重启 ${response.runtimeReloadFields.length} 项`)
   }
   if (response && Array.isArray(response.playbackReloadFields) && response.playbackReloadFields.length) {
-    parts.push(`播放结束/暂停后重载 ${response.playbackReloadFields.length} 项`)
+    parts.push(`播放结束/暂停后整程序重启 ${response.playbackReloadFields.length} 项`)
   }
   if (response && response.restartRequired) parts.push('部分字段需重启生效')
   return parts.join('；')

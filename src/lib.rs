@@ -40,9 +40,8 @@ mod input_gate;
 pub(crate) use debug::debug_events;
 #[allow(dead_code)]
 pub(crate) use debug::debug_http_service;
-// 进程级输入闸门：原住在 debug/ 下叫 debug_mode，但它服务所有输入路径
-// （runtime 17 次、adapters 17 次、ui、interfaces），不是调试专属。
-// 提到根级后，runtime→debug 的最大一条反边消失；保留别名供既有调用点。
+// 进程级输入闸门：原住在 debug/ 下叫 debug_mode，但它服务所有输入路径（runtime 17 次、ui、interfaces），
+// 不是调试专属；adapters 已在 W2 改直连 input_gate。提到根级后 runtime→debug 的最大一条反边消失。
 #[allow(dead_code)]
 pub(crate) use debug::debug_read_only;
 #[allow(dead_code)]
@@ -51,6 +50,7 @@ pub(crate) use debug::debug_sandbox_journal;
 #[allow(dead_code)]
 pub(crate) use debug::debug_sandbox_runner;
 pub(crate) use debug::debug_sandbox_store;
+// adapters 已改直连 `crate::input_gate`（W2）；此别名仅供 runtime/debug 侧过渡使用，W7 收口。
 pub(crate) use input_gate as debug_mode;
 mod features;
 mod interfaces;

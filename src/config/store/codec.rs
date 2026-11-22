@@ -235,6 +235,25 @@ pub(super) fn normalize_path_fields(
     }
 }
 
+/// 只规范化**指定段**里的路径字段（定向写入用）。
+///
+/// 与 [`normalize_path_fields`] 的区别：未提交的段根本不参与遍历，因此后台定向
+/// 写入（如自动建身份只写 `identity`）不会顺手把其它段的相对路径重写成绝对路径，
+/// 也不会改动它们的分隔符。
+pub(super) fn normalize_section_path_fields(
+    section: &str,
+    value: &mut Value,
+    executable_root: &Path,
+) {
+    // 复用整段实现：把单段包成只含该段的根映射，路径前缀自然只命中本段。
+    let mut wrapper = Map::new();
+    wrapper.insert(section.to_string(), value.clone());
+    normalize_path_fields(&mut wrapper, executable_root, false);
+    if let Some(normalized) = wrapper.remove(section) {
+        *value = normalized;
+    }
+}
+
 /// 应用 secret 清除标记：候选值等于 JSON 对象 `{"__clear__": true}`
 /// （[`SECRET_CLEAR_MARKER`]）时，把 merged 中该路径写为空字符串，并记入
 /// `forced_cleared` 集合（[`retain_secret_fields`] 跳过该路径，防止保留规则

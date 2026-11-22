@@ -138,12 +138,12 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn press_key(&mut self, key: Key) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::press_key(key, &self.window)
     }
 
     fn key_down(&mut self, key: Key) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         window::ensure_foreground(&self.window)?;
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         self.held.press_key(key);
@@ -151,7 +151,7 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn key_up(&mut self, key: Key) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         window::ensure_foreground(&self.window)?;
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         enigo.key(key, Direction::Release).context("release key")?;
@@ -160,17 +160,17 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn click_point(&mut self, x: i32, y: i32) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::click_game_point(PointConfig::new(x, y), &self.window)
     }
 
     fn click_button(&mut self, button: Button) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::click_game_button(button, &self.window)
     }
 
     fn mouse_down(&mut self, button: Button) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         window::ensure_foreground(&self.window)?;
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         self.held.press_button(button);
@@ -180,7 +180,7 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn mouse_up(&mut self, button: Button) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         window::ensure_foreground(&self.window)?;
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         enigo
@@ -191,12 +191,12 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn scroll_point(&mut self, x: i32, y: i32, length: i32) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::scroll_game_point(PointConfig::new(x, y), length, &self.window)
     }
 
     fn drag_point(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::drag_game_point(
             PointConfig::new(from_x, from_y),
             PointConfig::new(to_x, to_y),
@@ -205,17 +205,17 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn activate(&mut self, after_activate_ms: u64) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::activate_game(&self.window, after_activate_ms)
     }
 
     fn focus(&mut self, after_activate_ms: u64) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::focus_game(&self.window, after_activate_ms)
     }
 
     fn ensure_ready(&mut self, after_activate_ms: u64) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::ensure_game_ready_for_input(&self.window, after_activate_ms)
     }
 
@@ -236,12 +236,12 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn paste_text(&mut self, text: &str, clipboard_hold_ms: u64) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::paste_text(text, &self.window, clipboard_hold_ms)
     }
 
     fn input_text(&mut self, text: &str, input_settle_ms: u64) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         window::ensure_foreground(&self.window)?;
         let mut enigo = Enigo::new(&Settings::default()).context("create enigo")?;
         enigo.text(text).context("input message text")?;
@@ -250,7 +250,7 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn hold_key(&mut self, key: Key, duration: Duration, running: Arc<AtomicBool>) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         input::hold_key(key, duration, &self.window, || {
             running.load(Ordering::SeqCst)
         })
@@ -261,7 +261,7 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn close_window(&mut self) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         window::close_game(&self.window)
     }
 
@@ -291,7 +291,7 @@ impl UiDevice for WindowsUiDevice {
     }
 
     fn launch_game(&mut self, executable: &Path, args: &[String]) -> Result<()> {
-        crate::debug_mode::require_input()?;
+        crate::input_gate::require_input()?;
         let mut command = ProcessCommand::new(executable);
         if let Some(parent) = executable
             .parent()

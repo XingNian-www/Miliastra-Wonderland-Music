@@ -40,19 +40,6 @@
     },
     {
       "source": "adapters",
-      "target": "debug",
-      "kind": "design",
-      "issue": null,
-      "expires": null,
-      "files": [
-        {
-          "path": "src/adapters/windows/device.rs",
-          "count": 17
-        }
-      ]
-    },
-    {
-      "source": "adapters",
       "target": "features",
       "kind": "design",
       "issue": null,
@@ -65,6 +52,19 @@
         {
           "path": "src/adapters/player.rs",
           "count": 1
+        }
+      ]
+    },
+    {
+      "source": "adapters",
+      "target": "input_gate",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/adapters/windows/device.rs",
+          "count": 17
         }
       ]
     },
@@ -1992,12 +1992,16 @@
       "pub_items": 8
     },
     "src/adapters/native_playback.rs": {
-      "lines": 508,
+      "lines": 494,
       "pub_items": 2
     },
     "src/adapters/player.rs": {
       "lines": 425,
       "pub_items": 2
+    },
+    "src/adapters/native_playback/volume_smoother.rs": {
+      "lines": 229,
+      "pub_items": 3
     },
     "src/adapters/windows/clipboard.rs": {
       "lines": 225,
@@ -2052,7 +2056,7 @@
       "pub_items": 1
     },
     "src/composition/application/external_chat.rs": {
-      "lines": 3661,
+      "lines": 3834,
       "pub_items": 52
     },
     "src/composition/application/formal_task.rs": {
@@ -2172,12 +2176,12 @@
       "pub_items": 8
     },
     "src/config/store/codec.rs": {
-      "lines": 362,
-      "pub_items": 16
+      "lines": 381,
+      "pub_items": 17
     },
     "src/config/store/mod.rs": {
-      "lines": 576,
-      "pub_items": 16
+      "lines": 734,
+      "pub_items": 17
     },
     "src/config/store/replies.rs": {
       "lines": 155,
@@ -2764,8 +2768,8 @@
       "pub_items": 30
     },
     "src/runtime/player_io.rs": {
-      "lines": 3424,
-      "pub_items": 84
+      "lines": 3542,
+      "pub_items": 85
     },
     "src/runtime/recovery.rs": {
       "lines": 1198,
@@ -2818,6 +2822,10 @@
     "src/runtime/ocr/openvino.rs": {
       "lines": 1512,
       "pub_items": 5
+    },
+    "src/runtime/player_io/control_lane.rs": {
+      "lines": 519,
+      "pub_items": 12
     },
     "src/test_support/corpus.rs": {
       "lines": 138,

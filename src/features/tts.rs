@@ -1910,13 +1910,7 @@ mod tests {
             let _ = started_tx.send(());
         });
         let _ = started_rx.recv();
-        for _ in 0..1_000 {
-            if thread.is_finished() {
-                break;
-            }
-            thread::yield_now();
-        }
-        assert!(thread.is_finished(), "测试线程必须已经结束");
+        wait_until_finished(&thread);
 
         let runtime = TtsRuntime {
             playback: None,
@@ -1949,14 +1943,20 @@ mod tests {
         }
     }
 
+    /// 有截止时间的等待：固定次数 `yield_now` 在并行全量测试的高负载下会提前耗尽，
+    /// 线程还没退出就断言，属于测试等待原语用错而非逻辑错误。
     fn wait_until_finished(handle: &JoinHandle<()>) {
-        for _ in 0..1_000 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
             if handle.is_finished() {
                 return;
             }
-            thread::yield_now();
+            assert!(
+                Instant::now() < deadline,
+                "等待测试线程退出超时（2 秒）：后台线程迟迟没有结束，无法继续验证重建语义"
+            );
+            thread::sleep(Duration::from_millis(1));
         }
-        panic!("测试线程必须已经结束");
     }
 
     /// 回归（A4-P2）：线程 panic 退出后重建必须清零泄漏的待处理计数。

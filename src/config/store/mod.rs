@@ -47,6 +47,10 @@ mod upgrade;
 #[cfg(test)]
 mod tests;
 
+/// W2/D5：`save_sections_subset` 的回归测试（定向写入的段级隔离与 CAS）。
+#[cfg(test)]
+mod subset_tests;
+
 pub(crate) use codec::{SECRET_MASK, mask_secrets};
 pub(crate) use sqlite::{CONFIG_SCHEMA_VERSION, SharedConfigStore};
 pub(crate) use types::{
@@ -69,7 +73,7 @@ use super::BootstrapConfig;
 
 use codec::{
     apply_secret_clear_markers, collect_changed_paths, force_retain_secret_fields, merge_sections,
-    normalize_path_fields, retain_secret_fields,
+    normalize_path_fields, normalize_section_path_fields, retain_secret_fields,
 };
 use sqlite::{now_ms, read_sections_from};
 use types::{field_errors_from_anyhow, field_errors_from_message};
@@ -255,6 +259,138 @@ impl ConfigStore {
         })
     }
 
+    /// 定向写入：只替换给定段，其余段在 `config_sections` 中**逐字节保持原样**。
+    ///
+    /// 与 [`Self::save`] 的差异（供后台事件使用，如自动建身份只写 `identity`）：
+    /// - 不把当前快照重新序列化后整份回写，因此不会把其它段里已存的相对路径
+    ///   顺手写成绝对路径（`load_full` 解析后的值只用于校验，不回写）；
+    /// - 路径规范化只作用于**本次提交的段**；
+    /// - `record_history = false` 时不新增 `config_revisions` 历史行，但 revision
+    ///   仍然 +1 并用 `base_revision` 做 CAS——后台事件不该挤占用户的 50 版历史窗口；
+    /// - 历史快照（仅 `record_history = true`）仍记录**完整**合并结果，回滚语义不变。
+    ///
+    /// 校验与 [`Self::save`] 同一路径：用「当前段 + 提交段」组装完整配置做结构与业务
+    /// 校验，失败时不写任何行。`base_revision` 过期返回 [`ConfigSaveError::Conflict`]。
+    pub fn save_sections_subset(
+        &mut self,
+        base_revision: u64,
+        sections: &[(&str, Value)],
+        record_history: bool,
+    ) -> std::result::Result<ConfigSaveOutcome, ConfigSaveError> {
+        // 与 save 相同：Immediate 事务先取写锁，合并基准必须在事务内读取。
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current_sections = read_sections_from(&transaction)?;
+
+        let mut submitted = Map::new();
+        for (section, value) in sections {
+            // 注入段（http/logging）由启动引导提供，不落库。
+            if matches!(*section, "http" | "logging") {
+                continue;
+            }
+            let mut value = value.clone();
+            // 只规范化本次写入的段：未提交段不参与遍历，保持原值。
+            normalize_section_path_fields(section, &mut value, &self.executable_root);
+            submitted.insert((*section).to_string(), value);
+        }
+        // `state.playback_state_path` 由统一数据库路径注入，不落库（与 save 一致）。
+        if let Some(state) = submitted.get_mut("state").and_then(Value::as_object_mut) {
+            state.remove("playback_state_path");
+        }
+
+        // 合并基准含全部当前段，secret 协议必须在这份完整映射上跑：
+        // 直接在「只含提交段」的局部映射上跑会为了让 secret 路径存在而凭空建出
+        // 缺字段的段（如只带 api_key、没有 provider 的 ai），整段替换后校验必炸。
+        let mut merged = merge_sections(&current_sections, &submitted);
+        let mut forced_cleared = BTreeSet::new();
+        apply_secret_clear_markers(&mut merged, &mut forced_cleared);
+        retain_secret_fields(&mut merged, &current_sections, &forced_cleared);
+        // 只把提交段的最终值取回来：未提交段（以及 secret 保留在其中的副本）
+        // 不参与写入。
+        let mut final_sections = Map::new();
+        for section in submitted.keys() {
+            if let Some(value) = merged.get(section) {
+                final_sections.insert(section.clone(), value.clone());
+            }
+        }
+        // 落库前清理已废弃命令覆盖项；只影响提交段，不碰未提交段。
+        sanitize_deprecated_overrides_in_merged(&mut final_sections);
+        for (section, value) in &final_sections {
+            merged.insert(section.clone(), value.clone());
+        }
+
+        let mut config = match AppConfig::from_db_value(
+            Value::Object(merged.clone()),
+            &self.bootstrap,
+            &self.executable_root,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                return Err(ConfigSaveError::Other(
+                    field_errors_from_message(&error.to_string()).into(),
+                ));
+            }
+        };
+        // 与 load_full 同一口径：历史库里的废弃条目不应让定向写入失败。
+        config.command_access.sanitize_deprecated_overrides();
+        if let Err(error) = config.validate() {
+            return Err(ConfigSaveError::Other(
+                field_errors_from_anyhow(&error).into(),
+            ));
+        }
+
+        let timestamp = now_ms() as i64;
+        let stored_revision: i64 =
+            transaction.query_row("SELECT revision FROM config_meta WHERE id = 1", [], |row| {
+                row.get(0)
+            })?;
+        if stored_revision as u64 != base_revision {
+            return Err(ConfigSaveError::Conflict);
+        }
+        let next_revision = stored_revision as u64 + 1;
+        // 只写提交段：未提交段的 value_json / revision / updated_at_ms 全部不动。
+        for (section, section_value) in &final_sections {
+            transaction.execute(
+                "INSERT OR REPLACE INTO config_sections (section, value_json, revision, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    section,
+                    serde_json::to_string(section_value)?,
+                    next_revision as i64,
+                    timestamp
+                ],
+            )?;
+        }
+        if record_history {
+            // 快照仍是完整配置（过滤掉注入段），回滚才有完整语义。
+            transaction.execute(
+                "INSERT INTO config_revisions (revision, snapshot_json, created_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    next_revision as i64,
+                    serde_json::to_string(&Value::Object(merged))?,
+                    timestamp
+                ],
+            )?;
+            trim_revision_history(&transaction)?;
+        }
+        transaction.execute(
+            "UPDATE config_meta SET revision = ?1, updated_at_ms = ?2 WHERE id = 1",
+            rusqlite::params![next_revision as i64, timestamp],
+        )?;
+        transaction.commit()?;
+        let mut changed_fields = Vec::new();
+        for (section, value) in &final_sections {
+            let before = current_sections.get(section).unwrap_or(&Value::Null);
+            collect_changed_paths(before, value, section, &mut changed_fields);
+        }
+        Ok(ConfigSaveOutcome {
+            revision: next_revision,
+            changed_fields,
+        })
+    }
+
     /// 事务内的公共写入路径：在 `BEGIN IMMEDIATE` 之后读取合并基准，由 `prepare`
     /// 基于**同一事务视图**的 sections 产出待写入的完整配置，再校验、比对
     /// `base_revision`、写段 + 快照 + meta。
@@ -337,11 +473,12 @@ impl ConfigStore {
             "UPDATE config_meta SET revision = ?1, updated_at_ms = ?2 WHERE id = 1",
             rusqlite::params![next_revision as i64, timestamp],
         )?;
-        // 只保留最近 50 版历史快照,防止配置库无限膨胀。
-        transaction.execute(
-            "DELETE FROM config_revisions WHERE revision <= ?1",
-            rusqlite::params![next_revision as i64 - 50],
-        )?;
+        // 只保留最近 50 条历史快照，防止配置库无限膨胀。
+        //
+        // 按**快照行数**裁剪而不是按 revision 差值：定向写入（record_history=false）
+        // 只涨 revision 不写快照，若仍按 `revision - 50` 裁剪，后台事件会继续
+        // 把用户的历史窗口挤掉。
+        trim_revision_history(&transaction)?;
         transaction.commit()?;
         // 计算变更字段点路径（候选 vs 当前）。
         let mut changed_fields = Vec::new();
@@ -455,6 +592,12 @@ impl ConfigStore {
     }
 }
 
+/// 历史窗口大小：`config_revisions` 最多保留最近这么多条快照。
+///
+/// 按**行数**而不是 revision 差值计算：定向写入不写历史行（只涨 revision），
+/// 窗口仍应保有 50 条用户可回滚的快照。
+const CONFIG_HISTORY_LIMIT: i64 = 50;
+
 /// 从待落库的 sections 里删掉已废弃命令的覆盖项（B04-P1-4）。
 ///
 /// 与 `CommandAccessConfig::sanitize_deprecated_overrides`（类型化配置）同源：
@@ -477,6 +620,21 @@ fn sanitize_deprecated_overrides_in_merged(merged: &mut Map<String, Value>) {
             );
         }
     }
+}
+
+/// 裁剪 `config_revisions`：只保留最近 [`CONFIG_HISTORY_LIMIT`] 条快照。
+///
+/// 用行数窗口而不是 `revision <= 当前 - 50`：后者在「只涨 revision、不写快照」的
+/// 定向写入之后仍会把用户的历史快照按 revision 号删掉。
+fn trim_revision_history(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM config_revisions
+          WHERE revision NOT IN (
+              SELECT revision FROM config_revisions ORDER BY revision DESC LIMIT ?1
+          )",
+        rusqlite::params![CONFIG_HISTORY_LIMIT],
+    )?;
+    Ok(())
 }
 
 /// B04-P1-4 的回归测试放在 `mod.rs` 内联：本批修复只允许改三个文件，

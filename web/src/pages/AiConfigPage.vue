@@ -375,10 +375,11 @@ function defaultText(field) {
   return String(field.default)
 }
 
+// 与 web/src/util/configSchema.js 的 EFFECT_LABELS 保持一致（W6 计划合并为单一来源）。
 const EFFECT_LABELS = {
   live: '立即生效',
-  idleReload: '任务结束后重载',
-  playbackIdleReload: '播放结束/暂停后重载',
+  idleReload: '空闲后整程序重启',
+  playbackIdleReload: '播放结束/暂停后整程序重启',
   restart: '重启生效',
 }
 const EFFECT_CLASSES = {

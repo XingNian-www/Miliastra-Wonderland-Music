@@ -1596,13 +1596,19 @@ fn identity_persist_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// 把内存里的身份映射整体写回配置库的 `identity` 段。
+/// 把内存里的身份映射写回配置库的 `identity` 段。
 ///
 /// 自动为好友 UID 建身份时调用。不写库的话，这条映射只活在当前进程：
 /// 面板看不到、用户无法调权限，而且任何一次配置重载都会用库里的旧值
 /// 把它冲掉（`LiveConfigs::apply` 里 `identity.replace(config.identity)`）。
 ///
-/// 只更新 `identity` 段，其余段保持原值——避免与正在编辑的其他配置打架。
+/// **定向写入**：只替换 `identity` 段，其余段在库里逐字节保持原样。
+/// 旧实现 `load_full().to_db_value()` 会把 `load_full` 解析出的**绝对路径**
+/// 连同 37 段一起写回（55 个 `FieldKind::Path` 字段逐步绝对化，换盘/换目录即失效），
+/// 每次自动建身份还会吃掉一个 50 版历史窗口的版本。现在用
+/// [`crate::config::ConfigStore::save_sections_subset`]：
+/// - 只写 identity 段，路径规范化也只作用于这一段；
+/// - `record_history=false`：revision 仍 +1（CAS），但不新增历史快照行。
 fn persist_identity(
     store: &crate::config::SharedConfigStore,
     live_configs: &crate::config::LiveConfigs,
@@ -1619,19 +1625,13 @@ fn persist_identity(
     let mut guard = store
         .lock()
         .map_err(|_| anyhow::anyhow!("配置库锁被毒化"))?;
-    let mut sections = guard
-        .load_full()
-        .map_err(|error| anyhow::anyhow!("读取配置失败: {error}"))?
-        .to_db_value()
-        .as_object()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("配置根不是对象"))?;
-    sections.insert("identity".to_string(), serde_json::to_value(snapshot)?);
     let revision = guard
         .current_revision()
         .map_err(|error| anyhow::anyhow!("读取配置版本失败: {error}"))?;
+    let identity_section = serde_json::to_value(snapshot)
+        .map_err(|error| anyhow::anyhow!("序列化身份映射失败: {error}"))?;
     guard
-        .save(revision, sections)
+        .save_sections_subset(revision, &[("identity", identity_section)], false)
         .map_err(|error| anyhow::anyhow!("保存身份映射失败: {error}"))?;
     Ok(())
 }
@@ -3657,5 +3657,178 @@ mod tests {
                 accounts: vec![crate::features::identity::GameAccount::new(uid)],
             });
         config
+    }
+
+    /// 建一个真实临时配置库（默认配置落库），返回共享句柄、根目录与数据库路径。
+    #[cfg(test)]
+    fn identity_persist_store(
+        name: &str,
+    ) -> (
+        crate::config::SharedConfigStore,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use crate::config::{BootstrapConfig, ConfigStore, HttpConfig, LoggingConfig};
+        let root =
+            std::env::temp_dir().join(format!("identity-persist-{name}-{}", uuid::Uuid::new_v4()));
+        let database_path = root.join("deps/data/playback.sqlite3");
+        std::fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+        let bootstrap = BootstrapConfig {
+            database_path: database_path.clone(),
+            http: HttpConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        let store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        (Arc::new(Mutex::new(store)), root, database_path)
+    }
+
+    /// 独立连接读取全部 `config_sections`（不借助被测代码的读取路径）。
+    #[cfg(test)]
+    fn read_stored_sections(
+        database_path: &std::path::Path,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT section, value_json FROM config_sections")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap();
+        let mut sections = serde_json::Map::new();
+        for row in rows {
+            let (section, text) = row.unwrap();
+            sections.insert(section, serde_json::from_str(&text).unwrap());
+        }
+        sections
+    }
+
+    /// 独立连接读取 config_meta.revision。
+    #[cfg(test)]
+    fn read_stored_revision(database_path: &std::path::Path) -> u64 {
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        let revision: i64 = connection
+            .query_row("SELECT revision FROM config_meta WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        revision as u64
+    }
+
+    /// 独立连接读取 config_revisions 行数。
+    #[cfg(test)]
+    fn read_stored_history_count(database_path: &std::path::Path) -> i64 {
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM config_revisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    /// 按点路径读取 JSON 值（与 store 的同名工具同语义，测试内自持）。
+    #[cfg(test)]
+    fn lookup_json_path<'a>(
+        root: &'a serde_json::Map<String, serde_json::Value>,
+        path: &str,
+    ) -> Option<&'a serde_json::Value> {
+        let segments = path.split('.').collect::<Vec<_>>();
+        let mut current = root;
+        for (index, segment) in segments.iter().enumerate() {
+            let value = current.get(*segment)?;
+            if index == segments.len() - 1 {
+                return Some(value);
+            }
+            current = value.as_object()?;
+        }
+        None
+    }
+
+    /// W2/D5 回归：自动建身份只写 `identity` 段，不得把其它段的相对路径绝对化。
+    #[test]
+    fn identity_persist_keeps_relative_paths() {
+        use crate::config::{FieldKind, config_sections};
+        use crate::features::identity::{IdentityAccess, IdentityConfig};
+
+        let (store, root, database_path) = identity_persist_store("relative-paths");
+        let config = store.lock().unwrap().load_full().unwrap();
+        let live = crate::config::LiveConfigs::from_config(&config);
+        let identity = IdentityAccess::new(IdentityConfig::default());
+        assert!(
+            identity
+                .ensure_identity_for_account(
+                    miliastra_kernel::chat_source::GAME_GENSHIN,
+                    "100000001",
+                    Some("示例玩家甲"),
+                )
+                .is_some(),
+            "占位账号首次出现时应自动建立身份"
+        );
+        persist_identity(&store, &live, &identity).expect("身份定向写入必须成功");
+
+        let sections = read_stored_sections(&database_path);
+        let mut checked = 0usize;
+        for section in config_sections() {
+            for field in section.fields {
+                if field.kind != FieldKind::Path {
+                    continue;
+                }
+                let Some(text) = lookup_json_path(&sections, &field.path).and_then(|v| v.as_str())
+                else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    !std::path::Path::new(text).is_absolute(),
+                    "定向写身份不得把 {} 写成绝对路径: {text}",
+                    field.path
+                );
+            }
+        }
+        // 55 个 `FieldKind::Path` 声明里，落库且有值的 52 个必须全部参与断言；
+        // 其余为空默认值或仅由启动引导提供（logging.dir）。
+        assert!(
+            checked >= 50,
+            "参与断言的 Path 字段过少（{checked}），测试覆盖不足"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// W2/D5 回归：后台自动建身份不能挤占 50 版历史窗口。
+    #[test]
+    fn identity_persist_does_not_consume_history() {
+        use crate::features::identity::{IdentityAccess, IdentityConfig};
+
+        let (store, root, database_path) = identity_persist_store("no-history");
+        let config = store.lock().unwrap().load_full().unwrap();
+        let live = crate::config::LiveConfigs::from_config(&config);
+        let identity = IdentityAccess::new(IdentityConfig::default());
+        identity.ensure_identity_for_account(
+            miliastra_kernel::chat_source::GAME_GENSHIN,
+            "100000002",
+            Some("示例玩家乙"),
+        );
+
+        let revision_before = read_stored_revision(&database_path);
+        let history_before = read_stored_history_count(&database_path);
+        persist_identity(&store, &live, &identity).expect("身份定向写入必须成功");
+
+        assert_eq!(
+            read_stored_revision(&database_path),
+            revision_before + 1,
+            "revision 仍必须 +1（CAS 基线要前进）"
+        );
+        assert_eq!(
+            read_stored_history_count(&database_path),
+            history_before,
+            "自动建身份不得新增 config_revisions 历史行"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

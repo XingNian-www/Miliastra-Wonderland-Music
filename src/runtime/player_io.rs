@@ -11,6 +11,12 @@ use super::player::{PlayerObservation, PlayerObservationConfig, PlayerObserver, 
 use miliastra_kernel::clock::{Clock, SystemClock};
 use miliastra_kernel::identity::{BusinessOperationId, BusinessOperationIdAllocator};
 
+mod control_lane;
+
+use self::control_lane::{
+    CompletionSubmitError, ControlCancellationHandle, ControlCompletionJob, ControlCompletionLane,
+};
+
 const FAST_OBSERVATION_INTERVAL_LIMIT: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -435,6 +441,7 @@ pub enum PlayerOperationReceiveError {
     TimedOut(PlayerLane),
     RuntimeStopped(PlayerLane),
     AlreadyCompleted(PlayerLane),
+    InProgress(PlayerLane),
 }
 
 impl Display for PlayerOperationReceiveError {
@@ -453,14 +460,27 @@ impl Display for PlayerOperationReceiveError {
                     "player {lane} operation result was already received"
                 )
             }
+            Self::InProgress(lane) => {
+                write!(
+                    formatter,
+                    "player {lane} operation is already being awaited"
+                )
+            }
         }
     }
 }
 
 impl Error for PlayerOperationReceiveError {}
 
+/// 取回一次控制回执后放弃等待时的排空窗口：取消送达后迟到回执通常很快到达，
+/// 排空把它消费掉，避免留在通道里被误当作“待取结果”。
+const CONTROL_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
 enum PlayerOperationState<T> {
+    /// 回执通道还在 operation 手里，等待者尚未取走。
     Pending(Receiver<T>),
+    /// 回执通道已被某个等待者取走：等待期间**不持有 state 锁**。
+    Awaiting,
     Completed,
     Disconnected,
 }
@@ -469,6 +489,11 @@ pub struct PlayerOperation<T> {
     operation_id: BusinessOperationId,
     lane: PlayerLane,
     state: Mutex<PlayerOperationState<T>>,
+    /// 控制操作的等待超时（由 [`PlayerRuntimeHandle::with_control_wait_timeout`] 配置）。
+    /// `None`（默认）表示无限等待，保持既有行为。
+    timeout: Option<Duration>,
+    /// 控制操作的取消句柄：超时/放弃时把取消送到端口侧，并排空迟到回执。
+    cancellation: Option<Arc<ControlCancellationHandle>>,
 }
 
 impl<T> PlayerOperation<T> {
@@ -477,6 +502,23 @@ impl<T> PlayerOperation<T> {
             operation_id,
             lane,
             state: Mutex::new(PlayerOperationState::Pending(response)),
+            timeout: None,
+            cancellation: None,
+        }
+    }
+
+    fn control(
+        operation_id: BusinessOperationId,
+        response: Receiver<T>,
+        timeout: Option<Duration>,
+        cancellation: Arc<ControlCancellationHandle>,
+    ) -> Self {
+        Self {
+            operation_id,
+            lane: PlayerLane::Control,
+            state: Mutex::new(PlayerOperationState::Pending(response)),
+            timeout,
+            cancellation: Some(cancellation),
         }
     }
 
@@ -484,73 +526,158 @@ impl<T> PlayerOperation<T> {
         self.operation_id
     }
 
+    /// 等待回执。
+    ///
+    /// 未配置超时时（默认）一直等；配置了超时则等价于
+    /// [`Self::wait_timeout`] + 超时置取消 + 排空迟到回执，与 UI 侧语义一致。
     pub fn wait(&self) -> Result<T, PlayerOperationReceiveError> {
-        let mut state = self.lock_state();
-        let result = match &*state {
-            PlayerOperationState::Pending(response) => response.recv(),
-            PlayerOperationState::Completed => {
-                return Err(PlayerOperationReceiveError::AlreadyCompleted(self.lane));
-            }
-            PlayerOperationState::Disconnected => {
-                return Err(PlayerOperationReceiveError::RuntimeStopped(self.lane));
-            }
-        };
-        match result {
-            Ok(result) => {
-                *state = PlayerOperationState::Completed;
-                Ok(result)
-            }
-            Err(_) => {
-                *state = PlayerOperationState::Disconnected;
-                Err(PlayerOperationReceiveError::RuntimeStopped(self.lane))
-            }
+        match self.timeout {
+            None => self.wait_unbounded(),
+            Some(timeout) => match self.wait_timeout(timeout) {
+                Err(PlayerOperationReceiveError::TimedOut(lane)) => {
+                    self.cancel_and_drain();
+                    Err(PlayerOperationReceiveError::TimedOut(lane))
+                }
+                settled => settled,
+            },
         }
     }
 
     pub fn wait_timeout(&self, timeout: Duration) -> Result<T, PlayerOperationReceiveError> {
-        let mut state = self.lock_state();
-        let result = match &*state {
-            PlayerOperationState::Pending(response) => response.recv_timeout(timeout),
-            PlayerOperationState::Completed => {
-                return Err(PlayerOperationReceiveError::AlreadyCompleted(self.lane));
-            }
-            PlayerOperationState::Disconnected => {
-                return Err(PlayerOperationReceiveError::RuntimeStopped(self.lane));
-            }
-        };
-        match result {
+        let receiver = self.take_receiver()?;
+        match receiver.recv_timeout(timeout) {
             Ok(result) => {
-                *state = PlayerOperationState::Completed;
+                self.settle(PlayerOperationState::Completed);
                 Ok(result)
             }
-            Err(RecvTimeoutError::Timeout) => Err(PlayerOperationReceiveError::TimedOut(self.lane)),
+            Err(RecvTimeoutError::Timeout) => {
+                self.restore(receiver);
+                Err(PlayerOperationReceiveError::TimedOut(self.lane))
+            }
             Err(RecvTimeoutError::Disconnected) => {
-                *state = PlayerOperationState::Disconnected;
+                self.settle(PlayerOperationState::Disconnected);
                 Err(PlayerOperationReceiveError::RuntimeStopped(self.lane))
             }
         }
     }
 
     pub fn try_result(&self) -> Result<Option<T>, PlayerOperationReceiveError> {
-        let mut state = self.lock_state();
-        let result = match &*state {
-            PlayerOperationState::Pending(response) => response.try_recv(),
-            PlayerOperationState::Completed => {
-                return Err(PlayerOperationReceiveError::AlreadyCompleted(self.lane));
-            }
-            PlayerOperationState::Disconnected => {
-                return Err(PlayerOperationReceiveError::RuntimeStopped(self.lane));
+        enum Polled<T> {
+            Value(T),
+            Disconnected,
+        }
+        // `try_recv` 不阻塞，锁内完成即可；但不能在借用 state 的同时改写它。
+        let polled = {
+            let state = self.lock_state();
+            match &*state {
+                PlayerOperationState::Pending(response) => match response.try_recv() {
+                    Ok(result) => Polled::Value(result),
+                    Err(TryRecvError::Empty) => return Ok(None),
+                    Err(TryRecvError::Disconnected) => Polled::Disconnected,
+                },
+                PlayerOperationState::Awaiting => {
+                    return Err(PlayerOperationReceiveError::InProgress(self.lane));
+                }
+                PlayerOperationState::Completed => {
+                    return Err(PlayerOperationReceiveError::AlreadyCompleted(self.lane));
+                }
+                PlayerOperationState::Disconnected => {
+                    return Err(PlayerOperationReceiveError::RuntimeStopped(self.lane));
+                }
             }
         };
-        match result {
-            Ok(result) => {
-                *state = PlayerOperationState::Completed;
+        match polled {
+            Polled::Value(result) => {
+                self.settle(PlayerOperationState::Completed);
                 Ok(Some(result))
             }
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => {
-                *state = PlayerOperationState::Disconnected;
+            Polled::Disconnected => {
+                self.settle(PlayerOperationState::Disconnected);
                 Err(PlayerOperationReceiveError::RuntimeStopped(self.lane))
+            }
+        }
+    }
+
+    fn wait_unbounded(&self) -> Result<T, PlayerOperationReceiveError> {
+        let receiver = self.take_receiver()?;
+        match receiver.recv() {
+            Ok(result) => {
+                self.settle(PlayerOperationState::Completed);
+                Ok(result)
+            }
+            Err(_) => {
+                self.settle(PlayerOperationState::Disconnected);
+                Err(PlayerOperationReceiveError::RuntimeStopped(self.lane))
+            }
+        }
+    }
+
+    /// 把回执通道从 `state` 锁里取出：等待期间不持锁，别的线程随时能读状态。
+    fn take_receiver(&self) -> Result<Receiver<T>, PlayerOperationReceiveError> {
+        let mut state = self.lock_state();
+        match std::mem::replace(&mut *state, PlayerOperationState::Awaiting) {
+            PlayerOperationState::Pending(receiver) => Ok(receiver),
+            previous => {
+                let error = match &previous {
+                    PlayerOperationState::Awaiting => {
+                        PlayerOperationReceiveError::InProgress(self.lane)
+                    }
+                    PlayerOperationState::Completed => {
+                        PlayerOperationReceiveError::AlreadyCompleted(self.lane)
+                    }
+                    PlayerOperationState::Disconnected | PlayerOperationState::Pending(_) => {
+                        PlayerOperationReceiveError::RuntimeStopped(self.lane)
+                    }
+                };
+                *state = previous;
+                Err(error)
+            }
+        }
+    }
+
+    /// 超时后把通道放回 `Pending`，让后续 `wait`/`try_result` 还能取到结果。
+    fn restore(&self, receiver: Receiver<T>) {
+        let mut state = self.lock_state();
+        if matches!(&*state, PlayerOperationState::Awaiting) {
+            *state = PlayerOperationState::Pending(receiver);
+        }
+    }
+
+    fn settle(&self, next: PlayerOperationState<T>) {
+        *self.lock_state() = next;
+    }
+
+    /// 放弃等待：先置取消，再排空迟到回执（不把回执留在通道里）。
+    fn cancel_and_drain(&self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+        let receiver = {
+            let mut state = self.lock_state();
+            match std::mem::replace(&mut *state, PlayerOperationState::Awaiting) {
+                PlayerOperationState::Pending(receiver) => receiver,
+                previous => {
+                    *state = previous;
+                    return;
+                }
+            }
+        };
+        let started_at = Instant::now();
+        loop {
+            let remaining = CONTROL_CANCEL_DRAIN_TIMEOUT.saturating_sub(started_at.elapsed());
+            match receiver.recv_timeout(remaining) {
+                Ok(_) => {
+                    self.settle(PlayerOperationState::Completed);
+                    return;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.restore(receiver);
+                    return;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.settle(PlayerOperationState::Disconnected);
+                    return;
+                }
             }
         }
     }
@@ -858,6 +985,8 @@ struct ControlRequest {
     operation_id: BusinessOperationId,
     control: PlayerControl,
     response: SyncSender<ControlOperationResult>,
+    /// 等待方（超时/关停）据此把取消送到端口侧，并标记“不要在放弃之后才执行”。
+    cancellation: Arc<ControlCancellationHandle>,
 }
 
 enum ControlCommand {
@@ -895,27 +1024,42 @@ pub struct PlayerRuntimeHandle {
     control: Arc<RuntimeLane<ControlCommand>>,
     search: Arc<RuntimeLane<SearchCommand>>,
     latest_observation: Arc<LatestObservationStore>,
+    /// 控制命令等待回执的超时。`None`（默认）= 无限等待，保持既有行为；
+    /// 只有显式配置才启用“超时置取消”。
+    control_wait_timeout: Option<Duration>,
 }
 
 impl PlayerRuntimeHandle {
+    /// 显式启用控制命令超时（默认不启用）。
+    ///
+    /// 使用方（composition）在把 handle 交给 `PlayerRuntimeBackend` 之前调用即可；
+    /// 已提交的操作不受影响。
+    pub fn with_control_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.control_wait_timeout = Some(timeout);
+        self
+    }
+
     pub fn submit_control(
         &self,
         operation_id: BusinessOperationId,
         control: PlayerControl,
     ) -> Result<ControlOperation, PlayerLaneError> {
         let (response, receiver) = mpsc::sync_channel(1);
+        let cancellation = Arc::new(ControlCancellationHandle::new());
         self.control.try_submit(
             ControlCommand::Dispatch(ControlRequest {
                 operation_id,
                 control,
                 response,
+                cancellation: Arc::clone(&cancellation),
             }),
             PlayerLane::Control,
         )?;
-        Ok(PlayerOperation::new(
+        Ok(PlayerOperation::control(
             operation_id,
-            PlayerLane::Control,
             receiver,
+            self.control_wait_timeout,
+            cancellation,
         ))
     }
 
@@ -1104,7 +1248,8 @@ impl PlayerSearchClientError {
             PlayerOperationReceiveError::RuntimeStopped(PlayerLane::Search) => Self::RuntimeStopped,
             PlayerOperationReceiveError::TimedOut(_)
             | PlayerOperationReceiveError::RuntimeStopped(_)
-            | PlayerOperationReceiveError::AlreadyCompleted(_) => {
+            | PlayerOperationReceiveError::AlreadyCompleted(_)
+            | PlayerOperationReceiveError::InProgress(_) => {
                 Self::UnexpectedOutcome("pending search result")
             }
         }
@@ -1200,63 +1345,7 @@ pub struct PlayerRuntime {
     observation_worker: Option<JoinHandle<()>>,
     control_worker: Option<JoinHandle<()>>,
     search_worker: Option<JoinHandle<()>>,
-    control_completions: Arc<ControlCompletionWorkers>,
-}
-
-#[derive(Default)]
-struct ControlCompletionWorkers {
-    workers: Mutex<Vec<ControlCompletionWorker>>,
-    panicked: AtomicBool,
-}
-
-struct ControlCompletionWorker {
-    worker: JoinHandle<()>,
-    cancellation: Option<ControlCancellation>,
-}
-
-impl ControlCompletionWorkers {
-    fn register(&self, worker: JoinHandle<()>, cancellation: Option<ControlCancellation>) {
-        let mut workers = self
-            .workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut index = 0;
-        while index < workers.len() {
-            if workers[index].worker.is_finished() {
-                let finished = workers.swap_remove(index);
-                if finished.worker.join().is_err() {
-                    self.panicked.store(true, Ordering::Release);
-                }
-            } else {
-                index += 1;
-            }
-        }
-        workers.push(ControlCompletionWorker {
-            worker,
-            cancellation,
-        });
-    }
-
-    fn cancel_and_join(&self) -> bool {
-        let mut workers = std::mem::take(
-            &mut *self
-                .workers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for completion in &mut workers {
-            if !completion.worker.is_finished()
-                && let Some(cancellation) = completion.cancellation.take()
-            {
-                cancellation();
-            }
-        }
-        let mut panicked = self.panicked.swap(false, Ordering::AcqRel);
-        for completion in workers {
-            panicked |= completion.worker.join().is_err();
-        }
-        panicked
-    }
+    control_completions: Arc<ControlCompletionLane>,
 }
 
 impl PlayerRuntime {
@@ -1357,7 +1446,12 @@ impl PlayerRuntime {
             clock,
             tuning.clone(),
         ));
-        let control_completions = Arc::new(ControlCompletionWorkers::default());
+        // 单条 completion lane：线程数与控制命令数无关（有界队列在 start 里创建）。
+        let control_completions = ControlCompletionLane::start(config.control_queue_capacity)
+            .map_err(|source| PlayerRuntimeStartError::Spawn {
+                lane: PlayerLane::Control,
+                source,
+            })?;
 
         let worker_observation = Arc::clone(&observation);
         let worker_latest = Arc::clone(&latest_observation);
@@ -1374,9 +1468,13 @@ impl PlayerRuntime {
                     tuning.clone(),
                 );
             })
-            .map_err(|source| PlayerRuntimeStartError::Spawn {
-                lane: PlayerLane::Observation,
-                source,
+            .map_err(|source| {
+                // observation lane 起不来时，completion lane 也已创建：一并收掉，不留常驻线程。
+                let _ = control_completions.cancel_and_join();
+                PlayerRuntimeStartError::Spawn {
+                    lane: PlayerLane::Observation,
+                    source,
+                }
             })?;
 
         let worker_control = Arc::clone(&control);
@@ -1396,6 +1494,7 @@ impl PlayerRuntime {
                 latest_observation.close();
                 observation.begin_shutdown(ObservationCommand::Shutdown);
                 let _ = observation_worker.join();
+                let _ = control_completions.cancel_and_join();
                 return Err(PlayerRuntimeStartError::Spawn {
                     lane: PlayerLane::Control,
                     source,
@@ -1429,6 +1528,7 @@ impl PlayerRuntime {
                 control,
                 search,
                 latest_observation,
+                control_wait_timeout: None,
             },
             observation_worker: Some(observation_worker),
             control_worker: Some(control_worker),
@@ -1706,7 +1806,7 @@ fn run_control_lane(
     mut port: impl PlayerControlPort,
     receiver: Receiver<ControlCommand>,
     lane: Arc<RuntimeLane<ControlCommand>>,
-    completions: Arc<ControlCompletionWorkers>,
+    completions: Arc<ControlCompletionLane>,
 ) {
     loop {
         let command = match receiver.recv() {
@@ -1720,6 +1820,11 @@ fn run_control_lane(
         }
         match command {
             ControlCommand::Dispatch(request) => {
+                // 等待方已放弃（超时/关停）：不要等排队之后才把命令送进播放器。
+                if request.cancellation.is_cancelled() {
+                    complete_control_cancelled(request);
+                    continue;
+                }
                 let started_at = Instant::now();
                 match port.dispatch(&request.control) {
                     ControlDispatch::Immediate(outcome) => {
@@ -1728,15 +1833,15 @@ fn run_control_lane(
                     ControlDispatch::Deferred {
                         completion,
                         cancellation,
-                    } => {
-                        spawn_control_completion(
+                    } => submit_control_completion(
+                        ControlCompletionJob {
                             request,
                             completion,
                             cancellation,
                             started_at,
-                            &completions,
-                        );
-                    }
+                        },
+                        &completions,
+                    ),
                 }
             }
             ControlCommand::Shutdown => {
@@ -1747,33 +1852,30 @@ fn run_control_lane(
     }
 }
 
-fn spawn_control_completion(
-    request: ControlRequest,
-    completion: ControlCompletion,
-    cancellation: Option<ControlCancellation>,
-    started_at: Instant,
-    completions: &ControlCompletionWorkers,
-) {
-    let fallback_response = request.response.clone();
-    let fallback_control = request.control.clone();
-    let operation_id = request.operation_id;
-    match thread::Builder::new()
-        .name("player-control-completion".to_owned())
-        .spawn(move || complete_control_request(request, completion(), started_at))
-    {
-        Ok(worker) => completions.register(worker, cancellation),
-        Err(error) => {
-            let _ = fallback_response.send(ControlOperationResult {
-                operation_id,
-                control: fallback_control,
-                outcome: ControlDispatchOutcome::outcome_unknown(format!(
-                    "failed to start control completion worker: {error}"
-                )),
-                started_at: Some(started_at),
-                finished_at: Instant::now(),
-            });
+/// 把 deferred 补全放进单条 completion lane；队列满/关停时显式回执，不静默丢弃。
+fn submit_control_completion(job: ControlCompletionJob, completions: &ControlCompletionLane) {
+    let Err((reason, job)) = completions.submit(job) else {
+        return;
+    };
+    let outcome = match reason {
+        CompletionSubmitError::Stopping => {
+            ControlDispatchOutcome::not_sent("player runtime shut down before control completion")
         }
-    }
+        CompletionSubmitError::QueueFull => ControlDispatchOutcome::outcome_unknown(
+            "player control completion queue is full; outcome unknown",
+        ),
+    };
+    complete_control_request(job.request, outcome, job.started_at);
+}
+
+fn complete_control_cancelled(request: ControlRequest) {
+    let _ = request.response.send(ControlOperationResult {
+        operation_id: request.operation_id,
+        control: request.control,
+        outcome: ControlDispatchOutcome::not_sent("player control was cancelled before dispatch"),
+        started_at: None,
+        finished_at: Instant::now(),
+    });
 }
 
 fn complete_control_request(
@@ -2115,8 +2217,11 @@ mod tests {
             match control {
                 PlayerControl::Play(_, _) => {
                     let release = self.release.take().expect("one deferred play");
-                    self.started.send(()).unwrap();
+                    // 信号必须在 completion 真正开始执行时才发：dispatch 返回时作业还
+                    // 没进 completion lane，提前发信号会让 shutdown 先 drain 掉它。
+                    let started = self.started.clone();
                     ControlDispatch::deferred(move || {
+                        started.send(()).unwrap();
                         release
                             .recv_timeout(FAKE_PORT_BLOCK_TIMEOUT)
                             .expect("deferred play release timed out");
@@ -2479,6 +2584,20 @@ mod tests {
         runtime.shutdown().unwrap();
     }
 
+    /// 等一条控制操作的回执（最多 5 秒）；超时或状态异常直接失败，绝不挂死。
+    fn wait_until_result<T>(operation: &super::PlayerOperation<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match operation.try_result() {
+                Ok(Some(result)) => return result,
+                Ok(None) => {}
+                Err(error) => panic!("控制操作等待失败：{error:?}"),
+            }
+            assert!(Instant::now() < deadline, "控制操作回执等待超时");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn shutdown_waits_for_an_accepted_deferred_completion() {
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
@@ -2498,7 +2617,7 @@ mod tests {
             .submit_control(
                 BusinessOperationId::new(16),
                 PlayerControl::Play(
-                    crate::features::playback::test_track(
+                    test_track(
                         "miliastra://track/qqmusic/shutdown-deferred",
                         "shutdown deferred",
                     ),
@@ -2506,28 +2625,27 @@ mod tests {
                 ),
             )
             .unwrap();
-        started_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        // `started` 来自 completion 本体：等到它时作业已在 in-flight 槽里，不会被 drain。
+        let wait = Duration::from_secs(5);
+        started_receiver.recv_timeout(wait).unwrap();
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
         let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
+            let _ = entered_sender.send(());
             let _ = shutdown_sender.send(runtime.shutdown());
         });
-
-        assert_eq!(
-            shutdown_receiver.recv_timeout(Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        );
+        // 先确认工作线程已进入 `shutdown()`，再判定它尚未返回。
+        entered_receiver.recv_timeout(wait).unwrap();
+        // 补全未放行前 shutdown 必须始终不返回；确认窗口只可能抓到错误的提前返回。
+        let confirmed_at = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < confirmed_at {
+            assert_eq!(shutdown_receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+            thread::sleep(Duration::from_millis(1));
+        }
         release_sender.send(()).unwrap();
-        shutdown_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .unwrap();
+        shutdown_receiver.recv_timeout(wait).unwrap().unwrap();
         assert_eq!(
-            operation
-                .wait_timeout(Duration::from_secs(1))
-                .unwrap()
-                .outcome,
+            wait_until_result(&operation).outcome,
             ControlDispatchOutcome::rejected_with_code("track is unavailable", "track_unavailable",)
         );
     }
